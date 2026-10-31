@@ -56,9 +56,9 @@ Linux and macOS. Tick a milestone off here and move on in `status.md`.
 
 Improvements after v0.1.0, requested by the owner. Same rule: done only when every criterion holds and CI is green.
 
-- [ ] **Reader hot path without per-record allocation**
+- [ ] **Reader hot path without per-record allocation** (code merged and reviewed; recorded benchmarks pending)
   - Neither reader allocates per record; the zero-copy reader still validates every record before any slice into the
-    mapping exists. Cross-provider review of the `mmap.rs` change.
+    mapping exists. Cross-provider review of the `mmap.rs` change (GPT-6.1 Sol: approved, one doc nit fixed).
   - Replay benchmarks re-run on the owner's Mac and the OrbStack VM, recorded in `docs/benchmarks.md`.
 - [ ] **Durable-only reads** (ADR 0010)
   - `ReaderConfig::durable_only`: readers return only records covered by the checkpoint marker. `tail` and `export`

@@ -5,6 +5,9 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## Unreleased
 
+- Readers validate records without a per-record allocation: the safe reader in place in its `pread` buffer, the
+  zero-copy reader from an atomic copy into a reused buffer (still before any slice into the mapping exists).
+
 ## [0.1.0] - 2026-10-31
 
 First release. Not yet published to crates.io.
