@@ -5,6 +5,8 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## Unreleased
 
+- Fix: with `RecoveryPolicy::Fail`, a sealed segment whose successor has an invalid header is now refused instead
+  of quarantined (found by the new `recover_dir` fuzz target, which runs writer recovery on generated directories).
 - Python: add a dependency-free, read-only format v1 journal decoder and JSONL CLI in `python/`.
 - Docs: an operations guide (`docs/operations.md`): segment size, checkpoint interval, disk space, archiving, recovery.
 - CLI: `tail --decode market-demo` (text summary or the JSON `decoded` object, as in `export`).
