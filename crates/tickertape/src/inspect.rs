@@ -58,6 +58,30 @@ pub fn list_segments(dir: impl AsRef<Path>) -> Result<Vec<SegmentInfo>> {
         .collect()
 }
 
+/// Reads the current checkpoint marker without taking the writer lock or modifying the journal.
+///
+/// Returns `Ok(None)` when `checkpoint` is missing or neither slot is valid. A truncated marker may still
+/// contain a valid slot. This is an observation of the marker, not validation of the position it describes.
+///
+/// # Errors
+///
+/// [`Error::Io`] if the marker cannot be opened or read for a reason other than a missing file.
+pub fn read_checkpoint(dir: impl AsRef<Path>) -> Result<Option<format::CheckpointSlot>> {
+    use std::io::Read;
+
+    let path = dir.as_ref().join(journal::CHECKPOINT_FILE);
+    let file = match File::open(&path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(Error::io("open checkpoint", &path, e)),
+    };
+    let mut bytes = Vec::new();
+    file.take(format::CHECKPOINT_FILE_LEN as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|e| Error::io("read checkpoint", &path, e))?;
+    Ok(format::decode_checkpoint(&bytes))
+}
+
 /// How a segment ends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -243,4 +267,31 @@ fn scan_file(path: &Path, base: u64) -> Result<format::ScanResult> {
         format::SEGMENT_HEADER_LEN as u64,
         base,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checkpoint_missing_invalid_valid_and_truncated() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(read_checkpoint(dir.path()).unwrap(), None);
+        let path = dir.path().join("checkpoint");
+        std::fs::write(&path, [0; 64]).unwrap();
+        assert_eq!(read_checkpoint(dir.path()).unwrap(), None);
+        let slot = format::CheckpointSlot {
+            generation: 2,
+            next_seq: 7,
+            segment_base_seq: 0,
+            offset: 512,
+        };
+        std::fs::write(&path, format::encode_checkpoint_slot(&slot)).unwrap();
+        assert_eq!(read_checkpoint(dir.path()).unwrap(), Some(slot));
+        std::fs::write(&path, [0; 63]).unwrap();
+        assert_eq!(read_checkpoint(dir.path()).unwrap(), None);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(matches!(read_checkpoint(dir.path()), Err(Error::Io { .. })));
+    }
 }
