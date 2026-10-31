@@ -12,6 +12,10 @@ readme = "README.md"
 keywords = ["journal", "mmap", "event-log", "trading", "ipc"]
 categories = ["database-implementations", "filesystem", "finance"]
 
+[features]
+# Test-only failure points (see src/fault.rs). Not part of the stable API; never enable in production.
+fault-injection = []
+
 [dependencies]
 libc = "0.2"
 thiserror = "2"

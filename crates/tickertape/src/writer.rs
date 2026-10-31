@@ -276,6 +276,8 @@ impl Writer {
             return Err(Error::SequenceExhausted);
         }
         // 1. Data.
+        crate::fault::inject(crate::fault::Point::CheckpointSync)
+            .map_err(|e| Error::io("sync segment", &self.active.path, e))?;
         for seg in &self.dirty {
             if let Some(map) = &seg.map {
                 map.sync_range(seg.from, seg.to - seg.from)
@@ -425,12 +427,10 @@ fn take_lock(dir: &Path) -> Result<File> {
             pid,
         });
     }
-    file.set_len(0)
-        .map_err(|e| Error::io("write lock file", &path, e))?;
-    file.write_all_at(std::process::id().to_string().as_bytes(), 0)
-        .map_err(|e| Error::io("write lock file", &path, e))?;
-    file.flush()
-        .map_err(|e| Error::io("write lock file", &path, e))?;
+    // The PID is informational only, so failing to record it (e.g. on a full disk) must not stop the writer.
+    let _ = file
+        .set_len(0)
+        .and_then(|()| file.write_all_at(std::process::id().to_string().as_bytes(), 0));
     Ok(file)
 }
 
@@ -451,7 +451,9 @@ fn create_segment(dir: &Path, base: u64, size: u64) -> Result<(File, PathBuf)> {
         .open(&tmp)
         .map_err(|e| Error::io("create segment", &tmp, e))?;
     let prepared = (|| {
-        mmap::preallocate(&file, size).map_err(|e| Error::io("preallocate segment", &tmp, e))?;
+        crate::fault::inject(crate::fault::Point::Preallocate)
+            .and_then(|()| mmap::preallocate(&file, size))
+            .map_err(|e| Error::io("preallocate segment", &tmp, e))?;
         let header = format::encode_segment_header(&SegmentHeader {
             segment_size: size,
             base_seq: base,
@@ -460,7 +462,9 @@ fn create_segment(dir: &Path, base: u64, size: u64) -> Result<(File, PathBuf)> {
         file.write_all_at(&header, 0)
             .map_err(|e| Error::io("write segment header", &tmp, e))?;
         mmap::sync_data(&file).map_err(|e| Error::io("sync segment", &tmp, e))?;
-        fs::hard_link(&tmp, &path).map_err(|e| Error::io("publish segment", &path, e))
+        crate::fault::inject(crate::fault::Point::Link)
+            .and_then(|()| fs::hard_link(&tmp, &path))
+            .map_err(|e| Error::io("publish segment", &path, e))
     })();
     if let Err(e) = prepared {
         let _ = fs::remove_file(&tmp);
@@ -540,7 +544,9 @@ impl Recovery<'_> {
             .map_err(|e| Error::io("read checkpoint marker", &path, e))?;
         let checkpoint = format::decode_checkpoint(&contents);
         if len < format::CHECKPOINT_FILE_LEN as u64 {
-            file.set_len(format::CHECKPOINT_FILE_LEN as u64)
+            // Preallocated, not sparse, so that writing a slot never needs new blocks (a full disk must not make
+            // checkpoints fail).
+            mmap::preallocate(&file, format::CHECKPOINT_FILE_LEN as u64)
                 .map_err(|e| Error::io("create checkpoint marker", &path, e))?;
             mmap::sync_data(&file).map_err(|e| Error::io("sync checkpoint marker", &path, e))?;
         }
