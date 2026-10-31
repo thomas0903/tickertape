@@ -10,5 +10,13 @@ publish = false
 [dependencies]
 tickertape.workspace = true
 
+[[bin]]
+name = "demo-producer"
+path = "src/bin/demo-producer.rs"
+
+[[bin]]
+name = "demo-consumer"
+path = "src/bin/demo-consumer.rs"
+
 [lints]
 workspace = true
