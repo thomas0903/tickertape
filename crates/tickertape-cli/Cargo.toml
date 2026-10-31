@@ -15,6 +15,8 @@ categories = ["command-line-utilities", "finance"]
 [[bin]]
 name = "tickertape"
 path = "src/main.rs"
+# The binary shares its name with the library crate; documenting both would collide (cargo issue 6313).
+doc = false
 
 [dependencies]
 tickertape.workspace = true

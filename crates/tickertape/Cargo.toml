@@ -13,6 +13,7 @@ keywords = ["journal", "mmap", "event-log", "trading", "ipc"]
 categories = ["database-implementations", "filesystem", "finance"]
 
 [dependencies]
+thiserror = "2"
 
 [lints]
 workspace = true
