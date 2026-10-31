@@ -424,3 +424,42 @@ fn invalid_config_is_rejected() {
         Err(Error::InvalidConfig(_))
     ));
 }
+
+#[test]
+fn verify_reports_intact_and_corrupt_journals() {
+    use tickertape::inspect::{self, SegmentEnd};
+    let dir = tempfile::tempdir().unwrap();
+    let mut w = Writer::open(dir.path(), small_config()).unwrap();
+    append_n(&mut w, 1200);
+    let report = inspect::verify(dir.path()).unwrap();
+    assert!(report.problems.is_empty(), "{:?}", report.problems);
+    assert_eq!(report.records, 1200);
+    assert_eq!((report.first_seq, report.last_seq), (Some(0), Some(1199)));
+    assert!(report.segments.len() > 2);
+    let (last, rest) = report.segments.split_last().unwrap();
+    assert!(rest.iter().all(|s| s.end == SegmentEnd::Sealed));
+    assert_eq!(last.end, SegmentEnd::Open);
+    assert_eq!(
+        inspect::list_segments(dir.path()).unwrap().len(),
+        report.segments.len()
+    );
+    drop(w);
+
+    // Corrupt a record in the middle segment.
+    let segs = segments(dir.path());
+    let (_, middle) = &segs[1];
+    let flip = format::SEGMENT_HEADER_LEN as u64 + 20; // inside the first record's header fields
+    let f = open_raw(middle);
+    let mut b = [0u8];
+    f.read_exact_at(&mut b, flip).unwrap();
+    f.write_all_at(&[b[0] ^ 1], flip).unwrap();
+    let report = inspect::verify(dir.path()).unwrap();
+    assert!(
+        report
+            .problems
+            .iter()
+            .any(|p| p.path == *middle && p.offset == 64),
+        "{:?}",
+        report.problems
+    );
+}
