@@ -9,5 +9,16 @@
 /// units do not imply nanosecond accuracy. Returns 0 if the clock is before the epoch, which the record format treats
 /// as "not set".
 pub fn realtime_ns() -> u64 {
-    todo!("M2")
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn realtime_is_after_2020() {
+        assert!(super::realtime_ns() > 1_577_836_800_000_000_000);
+    }
 }

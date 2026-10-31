@@ -109,7 +109,23 @@ impl Error {
     ///
     /// Appends that fail this way leave the journal consistent and can be retried once space is available.
     pub fn is_storage_full(&self) -> bool {
-        todo!("M2")
+        matches!(self, Error::Io { source, .. } if crate::mmap::is_storage_full(source))
+    }
+
+    pub(crate) fn io(op: &'static str, path: impl Into<PathBuf>, source: io::Error) -> Error {
+        Error::Io {
+            op,
+            path: path.into(),
+            source,
+        }
+    }
+
+    pub(crate) fn corrupt(path: impl Into<PathBuf>, offset: u64, reason: CorruptReason) -> Error {
+        Error::Corrupt {
+            path: path.into(),
+            offset,
+            reason,
+        }
     }
 }
 

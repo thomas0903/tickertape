@@ -13,7 +13,11 @@ keywords = ["journal", "mmap", "event-log", "trading", "ipc"]
 categories = ["database-implementations", "filesystem", "finance"]
 
 [dependencies]
+libc = "0.2"
 thiserror = "2"
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tempfile = "3"

@@ -47,6 +47,8 @@ mod config;
 mod error;
 pub mod format;
 pub mod inspect;
+mod journal;
+mod mmap;
 mod reader;
 mod record;
 mod writer;
