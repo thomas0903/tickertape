@@ -397,6 +397,48 @@ fn disconnected_segment_is_quarantined() {
 }
 
 #[test]
+fn fail_policy_refuses_invalid_successor_header() {
+    // Found by the `recover_dir` fuzz target: a sealed segment names a successor whose header is invalid and nothing
+    // follows it. `Quarantine` moves the successor away and recreates it; `Fail` must refuse and leave it in place
+    // (format.md → Recovery, step 5), not quarantine it.
+    let dir = tempfile::tempdir().unwrap();
+    let mut w = Writer::open(dir.path(), small_config()).unwrap();
+    append_n(&mut w, 3);
+    drop(w);
+    let (_, first) = segments(dir.path()).pop().unwrap();
+    let (end, _) = end_of_records(&first);
+    let raw = open_raw(&first);
+    raw.write_all_at(&format::seal_crc(3).to_le_bytes(), end + 4)
+        .unwrap();
+    raw.write_all_at(&format::SEAL_MARKER.to_le_bytes(), end)
+        .unwrap();
+    let successor = create_raw_segment(dir.path(), 3, SMALL_SEGMENT);
+    open_raw(&successor).write_all_at(b"X", 0).unwrap(); // damages the magic
+    let before = std::fs::read(&successor).unwrap();
+
+    match Writer::open(dir.path(), small_config().recovery(RecoveryPolicy::Fail)) {
+        Err(Error::Corrupt { .. }) => {}
+        other => panic!("expected a corruption error, got {other:?}"),
+    }
+    assert_eq!(std::fs::read(&successor).unwrap(), before);
+    assert!(!dir.path().join("quarantine").exists());
+
+    let w = Writer::open(dir.path(), small_config()).unwrap();
+    assert!(
+        matches!(
+            &w.recovery_report().actions[..],
+            [
+                RecoveryAction::QuarantinedSegment { .. },
+                RecoveryAction::CompletedRoll { .. }
+            ]
+        ),
+        "{:?}",
+        w.recovery_report()
+    );
+    assert_eq!(w.next_seq(), 3);
+}
+
+#[test]
 fn missing_middle_segment_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let mut w = Writer::open(dir.path(), small_config()).unwrap();
