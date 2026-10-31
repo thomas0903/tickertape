@@ -672,7 +672,8 @@ impl Recovery<'_> {
                                 continue;
                             }
                             Err(Error::Corrupt { .. } | Error::UnsupportedVersion { .. })
-                                if !later_exists =>
+                                if !later_exists
+                                    && self.config.recovery == RecoveryPolicy::Quarantine =>
                             {
                                 let path = journal::segment_path(self.dir, seq);
                                 self.quarantine_segment(
