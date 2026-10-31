@@ -31,9 +31,9 @@ pub struct SegmentInfo {
 ///
 /// # Errors
 ///
-/// [`Error::NotFound`](crate::Error::NotFound) if there are none; [`Error::Corrupt`](crate::Error::Corrupt) or
-/// [`Error::UnsupportedVersion`](crate::Error::UnsupportedVersion) for an invalid header;
-/// [`Error::Io`](crate::Error::Io).
+/// [`Error::NotFound`] if there are none; [`Error::Corrupt`] or
+/// [`Error::UnsupportedVersion`] for an invalid header;
+/// [`Error::Io`].
 pub fn list_segments(dir: impl AsRef<Path>) -> Result<Vec<SegmentInfo>> {
     let dir = dir.as_ref();
     let segments = journal::list_segments(dir)?;
@@ -124,7 +124,7 @@ pub struct Problem {
 ///
 /// # Errors
 ///
-/// [`Error::NotFound`](crate::Error::NotFound) or [`Error::Io`](crate::Error::Io). Corruption is reported in
+/// [`Error::NotFound`] or [`Error::Io`]. Corruption is reported in
 /// [`VerifyReport::problems`], not as an error.
 pub fn verify(dir: impl AsRef<Path>) -> Result<VerifyReport> {
     let dir = dir.as_ref();
