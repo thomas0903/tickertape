@@ -16,7 +16,7 @@ Linux and macOS. Tick a milestone off here and move on in `status.md`.
   - ADRs: record format, publication protocol, durability levels, segment rolling, reader API (borrowed vs copy-out).
   - A cross-provider review of the spec, with the findings addressed.
   - The owner approves the spec. M2 does not start before that.
-- [ ] **M2: Writer and in-process reader**
+- [x] **M2: Writer and in-process reader** (done 2026-10-31)
   - Append, sequence numbers, checksums, file lock, `checkpoint()`; a reader in the same process reads back what was written.
   - Round-trip property tests and the Miri run on the format code pass. A fuzz target exists.
 - [ ] **M3: Cross-process live tailing**
