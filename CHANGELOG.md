@@ -6,6 +6,7 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 ## Unreleased
 
 - Python: add a dependency-free, read-only format v1 journal decoder and JSONL CLI in `python/`.
+- Docs: an operations guide (`docs/operations.md`): segment size, checkpoint interval, disk space, archiving, recovery.
 - CLI: `tail --decode market-demo` (text summary or the JSON `decoded` object, as in `export`).
 - Spec: `docs/format.md` now states that reserved header bytes must be zero, which checkpoint slot wins on equal
   generations, and that short marker files are checked slot by slot (all already true of the Rust decoder).

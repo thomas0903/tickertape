@@ -73,6 +73,8 @@ python3 -c "import duckdb; print(duckdb.sql(\"SELECT kind, count(*), min(seq), m
 ```
 
 CLI reference, exit codes and the JSONL and Parquet schemas: [`docs/cli.md`](docs/cli.md).
+Choosing segment sizes and checkpoint intervals, archiving old segments and what to do after a crash:
+[`docs/operations.md`](docs/operations.md).
 For direct, read-only access from Python without dependencies, see [`python/`](python/README.md).
 
 ## Guarantees, in short
