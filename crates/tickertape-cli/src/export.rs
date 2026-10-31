@@ -5,9 +5,38 @@ use std::path::Path;
 
 use tickertape::{Reader, ReaderConfig};
 
-use crate::{ExportArgs, ExportFormat, Failure, Result, output};
+use crate::{Decoder, ExportArgs, ExportFormat, Failure, Result, output, parquet_export};
+
+pub(crate) fn help() -> String {
+    format!(
+        r#"{}
+
+Parquet (Snappy, at most 100,000 rows per row group; requires --output FILE):
+{}
+
+Timestamps are raw unsigned nanoseconds since the Unix epoch; 0 = not set.
+
+--decode market-demo adds these optional Parquet columns:
+{}
+JSONL adds a decoded object with the same fields (null for unknown/invalid payloads).
+kind: trade|book; side: buy|sell (trade), bid|ask (book); action: upsert|delete (book).
+trade_id is null for books; action is null for trades. price and qty = signed fixed-point raw / 1e8.
+Schema 1: 32 bytes, little-endian: instrument_id u32 @0; side u8 @4 (1 buy, 2 sell); 3 zero bytes @5; price i64 @8; qty i64 @16; trade_id u64 @24.
+Schema 2: 24 bytes, little-endian: instrument_id u32 @0; side u8 @4 (1 bid, 2 ask); action u8 @5 (1 upsert, 2 delete); 2 zero bytes @6; price i64 @8; qty i64 @16.
+Unknown schema ids, wrong lengths, invalid tags or nonzero reserved bytes decode to null.
+Corruption finalizes the valid prefix before exit 2. Inclusive ranges and startup snapshot apply to both formats."#,
+        crate::RECORD_SCHEMA,
+        parquet_export::SCHEMA,
+        parquet_export::DECODED_SCHEMA,
+    )
+}
 
 pub(crate) fn run(args: ExportArgs, stdout: &mut dyn Write) -> Result<()> {
+    if matches!(args.format, ExportFormat::Parquet) && args.output == Path::new("-") {
+        return Err(Failure::usage(
+            "Parquet requires --output <FILE>; stdout (-) is not supported",
+        ));
+    }
     if args.from.zip(args.to).is_some_and(|(from, to)| to < from) {
         return Err(Failure::usage(
             "--to must be greater than or equal to --from",
@@ -35,15 +64,19 @@ pub(crate) fn run(args: ExportArgs, stdout: &mut dyn Write) -> Result<()> {
     match args.format {
         ExportFormat::Jsonl => {
             if args.output == Path::new("-") {
-                jsonl(&mut reader, count, stdout)?;
+                jsonl(&mut reader, count, stdout, args.decode)?;
             } else {
                 let file = destination(&args.dir, &args.output)?;
                 let mut out = BufWriter::new(file);
-                let result = jsonl(&mut reader, count, &mut out);
+                let result = jsonl(&mut reader, count, &mut out, args.decode);
                 out.flush()
                     .map_err(|e| output::io_error("flush export file", e))?;
                 result?;
             }
+        }
+        ExportFormat::Parquet => {
+            let file = destination(&args.dir, &args.output)?;
+            parquet_export::write(&mut reader, count, file, args.decode)?;
         }
     }
     if let Some(error) = terminal {
@@ -60,11 +93,16 @@ fn open(args: &ExportArgs) -> Result<Reader> {
     Ok(reader)
 }
 
-/// The JSONL backend; future formats get a separate backend and a new match arm in `run`.
-fn jsonl(reader: &mut Reader, count: u64, out: &mut dyn Write) -> Result<()> {
+/// Emit the captured record count, with optional payload decoding.
+fn jsonl(
+    reader: &mut Reader,
+    count: u64,
+    out: &mut dyn Write,
+    decoder: Option<Decoder>,
+) -> Result<()> {
     for _ in 0..count {
         match reader.try_next()? {
-            Some(record) => output::record(out, &record)?,
+            Some(record) => output::export_record(out, &record, decoder)?,
             None => {
                 return Err(Failure::usage(
                     "journal changed during export: captured records are no longer available",
@@ -191,6 +229,7 @@ mod tests {
             ExportArgs {
                 dir: dir.path().into(),
                 format: ExportFormat::Jsonl,
+                decode: None,
                 output: "-".into(),
                 from: None,
                 to: None,

@@ -1,4 +1,4 @@
-# Command-line interface (M5)
+# Command-line interface (M5–M6)
 
 Install/build the `tickertape-cli` package; its binary is `tickertape`. Commands use the public library API,
 open journals read-only, and never take the writer lock. Paths may name a journal with an active writer.
@@ -23,13 +23,17 @@ Errors and recovery warnings go to stderr. JSON results go to stdout (or the sel
 - `verify <DIR> [--json]`: checksum scan and chain validation, totals and every problem. Both inspect and verify
   return 2 when the scan reports problems. On a live journal the scan describes observations during the scan,
   not an atomic snapshot.
-- `export <DIR> --format jsonl [--output <FILE>|-] [--from <SEQ>] [--to <SEQ>]`: writes records from the
-  inclusive range; stdout is the default and `--output -` also selects stdout. The output file is created or
+- `export <DIR> --format jsonl|parquet [--output <FILE>|-] [--from <SEQ>] [--to <SEQ>]
+  [--decode market-demo]`: writes records from the
+  inclusive range; JSONL defaults to stdout and `--output -` also selects stdout for JSONL. The output file is created or
   truncated, but a path naming an existing journal entry (including via symlinks/hard links), or any path inside
   the journal, is rejected. `--to` must not precede `--from`.
   A first safe-reader pass captures the committed end, then a second pass emits those records, never following
   subsequent appends. Corruption encountered in the selected startup scan is reported after the valid prefix
-  has been written. An empty journal exports no records. No Parquet format is available in M5.
+  has been written. An empty journal exports no records. Parquet requires a file destination (missing
+  `--output` or `-` returns 1). Parquet uses Snappy compression
+  and row groups of at most 100,000 records. On corruption the valid prefix is finalized as a readable file
+  before returning 2. Both formats share the startup scan and inclusive range semantics.
 
 ## Machine-readable contracts
 
@@ -74,3 +78,64 @@ journal may contain valid records in later segments; totals do not imply a conti
 header. `end_seq` is exclusive, after the last valid record in that segment (or its filename's base sequence if
 none). `used_bytes` includes header and seal when validated; it is zero for an invalid header. `used_percent`
 is `100 * used_bytes / size_bytes`. `unknown` reserves handling of future library end states.
+
+### Parquet (`export --format parquet`)
+
+The base schema is exactly:
+
+```text
+message tickertape_record {
+  required int64 seq (INTEGER(64,false));
+  required int32 schema_id (INTEGER(32,false));
+  required int64 venue_ts_ns (INTEGER(64,false));
+  required int64 local_ts_ns (INTEGER(64,false));
+  required binary payload;
+}
+```
+
+Unsigned integer annotations preserve every bit of u64/u32 values. Timestamps are raw unsigned nanoseconds
+since the Unix epoch, with 0 meaning not set. They are not Parquet timestamp logical types, whose signed range
+cannot represent all u64 values. In DuckDB 2.0.0 (exercised by `duckdb_parquet_export`), convert values within
+BIGINT's range with:
+
+```sql
+SELECT seq, make_timestamp_ns(local_ts_ns::BIGINT) AS local_time
+FROM read_parquet('events.parquet');
+```
+
+### Market demo decoder (`export --decode market-demo`)
+
+Decoding is opt-in for JSONL and Parquet and never changes the original payload. Parquet appends these flat
+columns in order, all optional:
+
+```text
+optional binary kind (UTF8);
+optional int32 instrument_id (INTEGER(32,false));
+optional binary side (UTF8);
+optional double price;
+optional double qty;
+optional int64 trade_id (INTEGER(64,false));
+optional binary action (UTF8);
+```
+
+JSONL appends a `"decoded"` key after `payload_b64`: either `null` or an object with keys `kind`,
+`instrument_id`, `side`, `price`, `qty`, `trade_id`, `action` in that order. For example:
+
+```json
+{"kind":"trade","instrument_id":7,"side":"buy","price":123.5,"qty":2.0,"trade_id":42,"action":null}
+```
+
+`kind` is `trade` or `book`. Trades have `buy`/`sell` sides, a u64 `trade_id`, and null `action`. Book updates
+have `bid`/`ask` sides, `upsert`/`delete` actions, and null `trade_id`. Unknown schema ids, wrong payload lengths,
+unknown side/action values, or nonzero reserved bytes are not decodable: the JSON object and all decoded Parquet
+columns are null. These records still export successfully.
+
+The producer layout is little-endian:
+
+| Schema id | Length | Fields at byte offsets |
+| --- | --- | --- |
+| 1 (trade) | 32 bytes | instrument_id u32 @0; side u8 @4 (1 buy, 2 sell); three zero bytes @5; price i64 @8; qty i64 @16; trade_id u64 @24 |
+| 2 (book) | 24 bytes | instrument_id u32 @0; side u8 @4 (1 bid, 2 ask); action u8 @5 (1 upsert, 2 delete); two zero bytes @6; price i64 @8; qty i64 @16 |
+
+Price and quantity are signed fixed-point integers (value × 10^8); decoded doubles are `raw as f64 / 1e8`.
+Large fixed-point integers can lose precision in the decoded doubles; raw payload bytes remain lossless.

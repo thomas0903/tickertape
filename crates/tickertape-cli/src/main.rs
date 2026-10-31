@@ -2,6 +2,7 @@
 
 mod export;
 mod output;
+mod parquet_export;
 mod report;
 mod tail;
 
@@ -35,7 +36,7 @@ enum Command {
     #[command(after_help = report::VERIFY_HELP)]
     Verify(ReportArgs),
     /// Export records through the committed end observed in a startup scan
-    #[command(after_help = RECORD_SCHEMA)]
+    #[command(after_help = export::help())]
     Export(ExportArgs),
 }
 
@@ -82,12 +83,15 @@ struct ReportArgs {
 struct ExportArgs {
     /// Journal directory (opened read-only; no writer lock)
     dir: PathBuf,
-    /// Output format: JSONL records with base64 payloads
+    /// Output format: JSONL with base64 payloads, or Snappy Parquet
     #[arg(long, value_enum)]
     format: ExportFormat,
-    /// Output file (created/truncated), or - for stdout; must be outside the journal
+    /// Output file outside journal (created/truncated); JSONL defaults to -; Parquet requires a file
     #[arg(long, value_name = "FILE", default_value = "-")]
     output: PathBuf,
+    /// Decode a known payload schema into additional fields (both formats)
+    #[arg(long, value_enum)]
+    decode: Option<Decoder>,
     /// First sequence number to export, inclusive
     #[arg(long, value_name = "SEQ")]
     from: Option<u64>,
@@ -99,6 +103,25 @@ struct ExportArgs {
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum ExportFormat {
     Jsonl,
+    Parquet,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum Decoder {
+    MarketDemo,
+}
+
+impl Decoder {
+    fn decode(
+        self,
+        record: &tickertape::Record<'_>,
+    ) -> Option<tickertape_cli::market_demo::Decoded> {
+        match self {
+            Self::MarketDemo => {
+                tickertape_cli::market_demo::decode(record.schema_id, record.payload)
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
