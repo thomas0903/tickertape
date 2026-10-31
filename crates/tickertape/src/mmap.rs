@@ -223,26 +223,40 @@ impl MapRo {
     /// reference into the mapping. Sound whatever other processes do to these bytes (at worst the copy is torn),
     /// which is why readers validate a record from this copy before [`MapRo::committed_bytes`] may be used on it.
     /// `None` if the 8-byte words covering the range are not all inside the mapping.
+    #[cfg(test)]
     pub(crate) fn copy_atomic(&self, offset: u64, len: u64) -> Option<Vec<u8>> {
+        let mut out = Vec::new();
+        let range = self.copy_atomic_into(offset, len, &mut out)?;
+        out.truncate(range.end);
+        out.drain(..range.start);
+        Some(out)
+    }
+
+    /// Like [`MapRo::copy_atomic`], but copies into `out` (reusing its allocation) and returns the range of `out`
+    /// that holds `[offset, offset + len)`. `out` receives whole 8-byte words, so the range may start a few bytes in.
+    pub(crate) fn copy_atomic_into(
+        &self,
+        offset: u64,
+        len: u64,
+        out: &mut Vec<u8>,
+    ) -> Option<std::ops::Range<usize>> {
         let start = offset & !7;
         let end = offset.checked_add(len)?;
         let word_end = end.checked_add(7)? & !7;
         checked_range(self.len, start, word_end - start)?;
-        let mut out = Vec::with_capacity((word_end - start) as usize);
-        let mut at = start as usize;
-        while (at as u64) < word_end {
+        out.clear();
+        out.reserve((word_end - start) as usize);
+        let base = self.ptr.as_ptr();
+        out.extend((start..word_end).step_by(8).flat_map(|at| {
             // SAFETY: `at` is 8-aligned (the mapping is page-aligned) and `[at, at + 8)` is inside the mapping
             // (checked above), which lives as long as `self`. The reference comes from a pointer cast and is used
             // only for an 8-byte `Relaxed` load, which `std::sync::atomic` documents as permitted on read-only memory
             // on x86-64 and aarch64; atomic loads never form a data race.
-            let word = unsafe { &*self.ptr.as_ptr().add(at).cast::<AtomicU64>() };
-            out.extend_from_slice(&word.load(Ordering::Relaxed).to_le_bytes());
-            at += 8;
-        }
+            let word = unsafe { &*base.add(at as usize).cast::<AtomicU64>() };
+            word.load(Ordering::Relaxed).to_le_bytes()
+        }));
         let skip = (offset - start) as usize;
-        out.drain(..skip);
-        out.truncate(len as usize);
-        Some(out)
+        Some(skip..skip + len as usize)
     }
 
     /// Shared access to `[offset, offset + len)`. `None` if out of bounds.
@@ -250,7 +264,7 @@ impl MapRo {
     /// # Safety
     ///
     /// The bytes must belong to a committed record that has already been validated (length, CRC, sequence) from a
-    /// [`MapRo::copy_atomic`] copy taken after observing its non-zero commit word, and no process may modify them
+    /// [`MapRo::copy_atomic_into`] copy taken after observing its non-zero commit word, and no process may modify them
     /// while the returned slice lives. This is `Reader::open_mapped`'s safety contract; the tickertape writer never
     /// modifies committed bytes. Validating first means a corrupted length can't make the slice cover bytes the
     /// writer is still appending to (barring a CRC collision, about 2^-32 per corrupted record).

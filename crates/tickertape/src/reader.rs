@@ -57,6 +57,8 @@ pub struct Reader {
     /// `pread` buffer: bytes of `seg` starting at file offset `buf_start`.
     buf: Vec<u8>,
     buf_start: u64,
+    /// Scratch buffer for the zero-copy reader's atomic validation copy, reused across records.
+    scratch: Vec<u8>,
     /// When the reader started waiting at an empty slot.
     waiting_since: Option<Instant>,
 }
@@ -136,6 +138,7 @@ impl Reader {
             skip_until: *base,
             buf: Vec::new(),
             buf_start: 0,
+            scratch: Vec::new(),
             waiting_since: None,
         })
     }
@@ -325,11 +328,18 @@ impl Reader {
             let Some(word) = map.commit_word(offset) else {
                 return Ok(SlotOutcome::Invalid(CorruptReason::BadLength(0)));
             };
-            // Validate from an atomic copy: no reference into the mapping exists until the record has passed
-            // validation (`materialize`), so a corrupted length can't make a slice cover bytes still being written.
-            return Ok(classify(word, offset, size, expected, |off, len| {
-                map.copy_atomic(off, len)
-            }));
+            // Validate from an atomic copy into a reused scratch buffer: no reference into the mapping exists until
+            // the record has passed validation (`materialize`), so a corrupted length can't make a slice cover bytes
+            // still being written.
+            let pending = classify(word, offset, size);
+            let len = pending_len(pending);
+            let bytes = if len == 0 {
+                None
+            } else {
+                map.copy_atomic_into(offset + 4, len, &mut self.scratch)
+                    .and_then(|range| self.scratch.get(range))
+            };
+            return Ok(finish(pending, word, expected, bytes));
         }
 
         // pread path (ADR 0003): observe the commit word, fence, then use body bytes read after the fence.
@@ -370,12 +380,14 @@ impl Reader {
         if frame_end > self.buf_start + self.buf.len() as u64 && frame_end <= size {
             self.fill_buf(offset, word)?;
         }
-        let (buf, buf_start) = (&self.buf, self.buf_start);
-        Ok(classify(word, offset, size, expected, |off, len| {
-            let start = usize::try_from(off.checked_sub(buf_start)?).ok()?;
-            let end = start.checked_add(usize::try_from(len).ok()?)?;
-            buf.get(start..end).map(<[u8]>::to_vec)
-        }))
+        // Validate in place in the pread buffer (no copy, no allocation).
+        let pending = classify(word, offset, size);
+        let len = pending_len(pending);
+        let bytes = (offset + 4)
+            .checked_sub(self.buf_start)
+            .and_then(|start| usize::try_from(start).ok())
+            .and_then(|start| self.buf.get(start..start.checked_add(len as usize)?));
+        Ok(finish(pending, word, expected, bytes))
     }
 
     /// Fills the `pread` buffer from `offset`: at least the frame of commit word `word`, normally a whole chunk,
@@ -450,15 +462,21 @@ fn open_segment(dir: &Path, base: u64, mapped: bool) -> Result<OpenSegment> {
 }
 
 /// Validates a slot given its already observed commit word. `bytes(off, len)` returns bytes of that frame.
-fn classify(
-    word: u32,
-    offset: u64,
-    size: u64,
-    expected: u64,
-    bytes: impl Fn(u64, u64) -> Option<Vec<u8>>,
-) -> SlotOutcome {
+/// What the commit word alone says about a slot; the bytes it covers are checked by [`finish`].
+#[derive(Debug, Clone, Copy)]
+enum Pending {
+    /// Fully classified already.
+    Done(SlotOutcome),
+    /// A seal: check the 4-byte CRC at `offset + 4`.
+    Seal,
+    /// A record: validate the body `[offset + 4, offset + word)`.
+    Record { body_len: u64 },
+}
+
+/// Classifies a slot from its (already observed) commit word, checking only bounds.
+fn classify(word: u32, offset: u64, size: u64) -> Pending {
     if word == 0 {
-        return SlotOutcome::Empty;
+        return Pending::Done(SlotOutcome::Empty);
     }
     if word == format::SEAL_MARKER {
         // An empty segment is never sealed, and a seal at the first slot would point back at its own segment.
@@ -467,23 +485,42 @@ fn classify(
                 .checked_add(format::SEAL_LEN as u64)
                 .is_none_or(|end| end > size)
         {
-            return SlotOutcome::Invalid(CorruptReason::BadSeal);
+            return Pending::Done(SlotOutcome::Invalid(CorruptReason::BadSeal));
         }
-        return match bytes(offset + 4, 4) {
-            Some(crc) if crc[..] == format::seal_crc(expected).to_le_bytes() => SlotOutcome::Seal,
-            _ => SlotOutcome::Invalid(CorruptReason::BadSeal),
-        };
+        return Pending::Seal;
     }
     if (word as usize) < format::RECORD_HEADER_LEN || !format::record_fits(size, offset, word) {
-        return SlotOutcome::Invalid(CorruptReason::BadLength(word));
+        return Pending::Done(SlotOutcome::Invalid(CorruptReason::BadLength(word)));
     }
-    let body_len = u64::from(word) - format::COMMIT_WORD_LEN as u64;
-    let Some(body) = bytes(offset + format::COMMIT_WORD_LEN as u64, body_len) else {
-        return SlotOutcome::Invalid(CorruptReason::BadLength(word));
-    };
-    match format::decode_record_body(word, &body, expected) {
-        Ok((header, _)) => SlotOutcome::Record { header, len: word },
-        Err(reason) => SlotOutcome::Invalid(reason),
+    Pending::Record {
+        body_len: u64::from(word) - format::COMMIT_WORD_LEN as u64,
+    }
+}
+
+/// The length of the bytes after the commit word that [`finish`] needs for a pending slot.
+fn pending_len(pending: Pending) -> u64 {
+    match pending {
+        Pending::Done(_) => 0,
+        Pending::Seal => 4,
+        Pending::Record { body_len } => body_len,
+    }
+}
+
+/// Finishes classifying a slot, given the bytes after its commit word (`None` if they couldn't be read).
+fn finish(pending: Pending, word: u32, expected: u64, bytes: Option<&[u8]>) -> SlotOutcome {
+    match (pending, bytes) {
+        (Pending::Done(outcome), _) => outcome,
+        (Pending::Seal, Some(crc)) if crc == format::seal_crc(expected).to_le_bytes() => {
+            SlotOutcome::Seal
+        }
+        (Pending::Seal, _) => SlotOutcome::Invalid(CorruptReason::BadSeal),
+        (Pending::Record { .. }, None) => SlotOutcome::Invalid(CorruptReason::BadLength(word)),
+        (Pending::Record { .. }, Some(body)) => {
+            match format::decode_record_body(word, body, expected) {
+                Ok((header, _)) => SlotOutcome::Record { header, len: word },
+                Err(reason) => SlotOutcome::Invalid(reason),
+            }
+        }
     }
 }
 
