@@ -88,7 +88,12 @@ def read_checkpoint(path) -> Optional[Checkpoint]:
                     candidates.append(Checkpoint(*struct.unpack_from("<QQQQ", slot, 16)))
     except FileNotFoundError:
         return None
-    return max(candidates, key=lambda item: item.generation, default=None)
+    # Highest generation wins; on a tie (never written by tickertape) the slot at offset 65,536 wins, as in Rust.
+    best = None
+    for candidate in candidates:
+        if best is None or candidate.generation >= best.generation:
+            best = candidate
+    return best
 
 
 def _validate_header(header, path, file_size, base):
@@ -227,9 +232,10 @@ def read_journal(path, start_seq=None, end_seq=None, durable_only=False) -> Iter
         limit = durable_end if limit is None else min(limit, durable_end)
     if not segments or limit == 0:
         return
-    if segments[0][0] != 0:
-        raise CorruptJournal(segments[0][1], 0, "first segment must have base sequence zero")
-    expected = 0
+    # Like the Rust reader, start at the oldest segment present: operators may archive or delete old segments.
+    expected = segments[0][0]
+    if start_seq is not None and start_seq < expected:
+        raise ValueError(f"sequence {start_seq} is before the first available record {expected}")
     for index, (base, segment_path) in enumerate(segments):
         segment = _Segment(segment_path, base)
         offset = 64

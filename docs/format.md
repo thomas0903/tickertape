@@ -68,7 +68,8 @@ except by a repair (see "Recovery").
 The header is written before the segment becomes visible (see "Rolling") and is never modified.
 
 A segment is **rejected** (an error, not a silent skip) if: the magic differs; `format_version` is not supported
-(version 1 readers support exactly `1`); `header_len != 64`; `flags != 0`; `header_crc` doesn't match; `segment_size`
+(version 1 readers support exactly `1`); `header_len != 64`; `flags != 0`; any `reserved` byte is non-zero;
+`header_crc` doesn't match; `segment_size`
 breaks the constraints above or differs from the file size; or `base_seq` doesn't match the file name.
 
 ### Record (offset `P`, a multiple of 8)
@@ -139,7 +140,9 @@ creates the journal, before the first segment. Generations start at 1. A checkpo
 | 60 | 4 | `slot_crc` | CRC32C of bytes `[0, 60)` of the slot |
 
 The **current checkpoint** is the valid slot (magic, version, CRC, reserved fields zero) with the higher
-`generation`. If neither slot is valid, or the file is missing, there is no checkpoint. A slot is written only after
+`generation`; if both are valid with the same generation (which a tickertape writer never produces), the slot at
+offset 65,536 wins. Each slot is checked on its own, so a file too short for one slot can still hold a valid other
+slot. If neither slot is valid, or the file is missing, there is no checkpoint. A slot is written only after
 everything it describes is durable (see `crash-contract.md` → What `checkpoint()` does), so recovery can trust the
 journal before it. Readers ignore this file unless `ReaderConfig::durable_only(true)` is enabled: then only records
 with `seq < next_seq` are returned, and a missing or invalid marker covers no records (ADR

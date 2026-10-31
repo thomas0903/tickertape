@@ -302,6 +302,7 @@ pub fn decode_checkpoint(file: &[u8]) -> Option<CheckpointSlot> {
                 offset: read_u64(buf, 40)?,
             })
         })
+        // `max_by_key` returns the last of equal maxima: on a tie the slot at 65,536 wins (docs/format.md).
         .max_by_key(|slot| slot.generation)
 }
 
@@ -926,6 +927,13 @@ mod tests {
         file[..64].copy_from_slice(&second);
         file[65_536..65_600].copy_from_slice(&first);
         assert_eq!(decode_checkpoint(&file), Some(checkpoint(2)));
+        // Equal generations (never written by tickertape): the slot at 65,536 wins (docs/format.md).
+        let tie = CheckpointSlot {
+            next_seq: 99,
+            ..checkpoint(2)
+        };
+        file[65_536..65_600].copy_from_slice(&encode_checkpoint_slot(&tie));
+        assert_eq!(decode_checkpoint(&file), Some(tie));
     }
 
     #[test]

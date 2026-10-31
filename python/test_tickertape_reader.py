@@ -90,6 +90,7 @@ class FormatTests(unittest.TestCase):
         path = self.path / "checkpoint"
         for a, b, expected in ((slot(3, 10), slot(4, 20), 20),
                                (slot(5, 30), slot(4, 20), 30),
+                               (slot(4, 10), slot(4, 20), 20),  # tie: the slot at 65,536 wins, as in Rust
                                (bytes(64), bytes(64), None),
                                (slot(3, 10), slot(4, 20, version=2), 10),
                                (slot(3, 10, reserved=b"\1" * 6), slot(4, 20), 20),
@@ -202,7 +203,10 @@ class FormatTests(unittest.TestCase):
         self.write_segment(1)
         self.assert_corrupt(64, "empty slot")
         (self.path / f"{0:020}.tape").unlink()
-        self.assert_corrupt(0, "first segment")
+        # Old segments may be archived: like the Rust reader, start at the oldest segment present.
+        self.assertEqual(list(reader.read_journal(self.path)), [])
+        with self.assertRaises(ValueError):
+            list(reader.read_journal(self.path, start_seq=0))
 
     def test_retry_once_without_duplicates(self):
         self.write_segment(contents=frame(0) + frame(1))
