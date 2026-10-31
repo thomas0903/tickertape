@@ -14,6 +14,10 @@ categories = ["database-implementations", "filesystem", "finance"]
 
 [dependencies]
 thiserror = "2"
+crc32c = "0.6"
+
+[dev-dependencies]
+proptest = "1"
 
 [lints]
 workspace = true

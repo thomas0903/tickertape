@@ -139,6 +139,12 @@ pub enum CorruptReason {
         /// From the header.
         from_header: u64,
     },
+    /// A slot is misaligned, before the record area, or outside the segment.
+    #[error("invalid slot offset {0}")]
+    BadOffset(u64),
+    /// A record has no representable next sequence number.
+    #[error("record sequence numbers exhausted")]
+    SequenceExhausted,
     /// A record's length is out of range.
     #[error("record length {0} out of range")]
     BadLength(u32),
