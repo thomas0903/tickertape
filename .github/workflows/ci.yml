@@ -33,6 +33,20 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
+  long-tests:
+    name: long tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      # 1M-record cross-process run, kill loops and other #[ignore]d tests, in release mode.
+      - run: cargo test -p tickertape-tests --release --locked -- --ignored
+
   msrv:
     name: msrv
     runs-on: ubuntu-latest
