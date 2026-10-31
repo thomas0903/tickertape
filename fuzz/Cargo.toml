@@ -9,7 +9,9 @@ license = "MIT OR Apache-2.0"
 cargo-fuzz = true
 
 [dependencies]
+crc32c = "0.6"
 libfuzzer-sys = "0.4"
+tempfile = "3"
 tickertape = { path = "../crates/tickertape" }
 
 [workspace]
@@ -24,6 +26,13 @@ bench = false
 [[bin]]
 name = "decode_record"
 path = "fuzz_targets/decode_record.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "recover_dir"
+path = "fuzz_targets/recover_dir.rs"
 test = false
 doc = false
 bench = false
