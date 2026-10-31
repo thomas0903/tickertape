@@ -5,7 +5,7 @@ set -euo pipefail
 OUT="${1:?usage: benches/run-recorded.sh OUTDIR}"
 mkdir -p "$OUT"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/tt-bench.XXXXXX")"
-BIN=./target/release
+BIN="${CARGO_TARGET_DIR:-./target}/release"
 
 {
   echo "date_utc: $(date -u +%FT%TZ)"
