@@ -43,8 +43,10 @@ the same mechanism, published only after the next segment file exists, so reader
   `atomic::fence(Ordering::Acquire)` if the word is non-zero. Rust documents 4- and 8-byte `Relaxed` atomic loads as
   permitted on read-only memory on x86-64 and aarch64 ("Atomic accesses to read-only memory" in `std::sync::atomic`,
   present at our MSRV 1.85); `Acquire` loads are not, which is why the ordering comes from the fence. It checks bounds
-  from the commit word before touching the body, then validates the body and hands out a `&[u8]` covering exactly
-  the body. This is sound only while nobody modifies committed bytes, which is the caller's stated precondition
+  from the commit word, copies the frame out with `Relaxed` 8-byte atomic loads (no reference into the mapping),
+  validates the copy, and only then hands out a `&[u8]` covering exactly the payload. (Validating before any slice
+  exists was added after the M4 review: a corrupted length could otherwise make a slice cover bytes still being
+  written.) This is sound only while nobody modifies committed bytes, which is the caller's stated precondition
   (ADR 0006). The writer never modifies committed bytes: abandoned writes are zeroed before any later commit, and
   repairs of corrupt data replace the file instead of editing it (ADR 0007).
 - **Pure format code** works on precisely bounded slices: a record body, a seal CRC, a header. Whole-segment

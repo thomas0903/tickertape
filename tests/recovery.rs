@@ -463,3 +463,77 @@ fn verify_reports_intact_and_corrupt_journals() {
         report.problems
     );
 }
+
+#[test]
+fn self_referential_seal_is_rejected() {
+    // Review finding: a seal at the first slot names its own segment; following it used to loop forever.
+    let dir = tempfile::tempdir().unwrap();
+    let mut w = Writer::open(dir.path(), small_config()).unwrap();
+    append_n(&mut w, 3);
+    drop(w);
+    let path = create_raw_segment(dir.path(), 3, SMALL_SEGMENT);
+    // Seal segment 0 properly so readers move into segment 3, then put a seal for 3 at segment 3's first slot.
+    let (_, first) = segments(dir.path()).into_iter().next().unwrap();
+    let (end, _) = end_of_records(&first);
+    let raw = open_raw(&first);
+    raw.write_all_at(&format::seal_crc(3).to_le_bytes(), end + 4)
+        .unwrap();
+    raw.write_all_at(&format::SEAL_MARKER.to_le_bytes(), end)
+        .unwrap();
+    let raw = open_raw(&path);
+    raw.write_all_at(&format::seal_crc(3).to_le_bytes(), 68)
+        .unwrap();
+    raw.write_all_at(&format::SEAL_MARKER.to_le_bytes(), 64)
+        .unwrap();
+
+    let mut r = Reader::open(dir.path(), ReaderConfig::default()).unwrap();
+    for _ in 0..3 {
+        r.next_owned().unwrap().unwrap();
+    }
+    assert!(matches!(
+        r.try_next(),
+        Err(Error::Corrupt {
+            reason: CorruptReason::BadSeal,
+            offset: 64,
+            ..
+        })
+    ));
+    let w = Writer::open(dir.path(), small_config()).unwrap();
+    assert_eq!(w.next_seq(), 3);
+    assert!(
+        w.recovery_report()
+            .actions
+            .iter()
+            .any(|a| matches!(a, RecoveryAction::RepairedTail { .. }))
+    );
+}
+
+#[test]
+fn exhausted_sequence_number_is_rejected_by_readers() {
+    // Review finding: a checksummed record with seq u64::MAX overflowed the reader's counter.
+    let dir = tempfile::tempdir().unwrap();
+    let path = create_raw_segment(dir.path(), u64::MAX, SMALL_SEGMENT);
+    let len = format::frame_len(0).unwrap();
+    let mut body = vec![0u8; len as usize - 4];
+    format::encode_record_body(
+        &RecordHeader {
+            seq: u64::MAX,
+            schema_id: 0,
+            venue_ts_ns: 0,
+            local_ts_ns: 0,
+        },
+        &[],
+        &mut body,
+    );
+    let raw = open_raw(&path);
+    raw.write_all_at(&body, 68).unwrap();
+    raw.write_all_at(&len.to_le_bytes(), 64).unwrap();
+    let mut r = Reader::open(dir.path(), ReaderConfig::default()).unwrap();
+    assert!(matches!(
+        r.try_next(),
+        Err(Error::Corrupt {
+            reason: CorruptReason::SequenceExhausted,
+            ..
+        })
+    ));
+}

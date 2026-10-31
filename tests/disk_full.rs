@@ -170,12 +170,21 @@ fn real_small_filesystem() {
         "journal readable after disk full"
     );
     drop(w);
-    let w = Writer::open(
+    let mut w = Writer::open(
         &journal,
         tickertape::WriterConfig::default().segment_size(1024 * 1024),
     )
     .unwrap();
     assert_eq!(w.next_seq(), appended);
+    // Recovery of a cleanly stopped journal needs no new blocks. A checkpoint may or may not succeed on a completely
+    // full volume (APFS reports ENOSPC from fsync); if it fails, it must say so.
+    match w.checkpoint() {
+        Ok(()) => eprintln!("real_small_filesystem: checkpoint on the full volume succeeded"),
+        Err(e) => {
+            assert!(e.is_storage_full(), "checkpoint failed with {e}");
+            eprintln!("real_small_filesystem: checkpoint on the full volume failed: {e}");
+        }
+    }
     eprintln!("real_small_filesystem: {appended} records before ENOSPC");
 }
 
@@ -354,4 +363,32 @@ fn full_volume_then_write_into_preallocated_segment() {
         "writing into a preallocated segment on a full volume failed: {status:?}"
     );
     assert_eq!(read_all(&journal).len(), 60_000);
+}
+
+#[test]
+fn map_failure_during_roll_is_retried() {
+    // Review finding: a mapping failure after publishing the new segment used to make every retry fail with
+    // "already exists". Mapping now happens before the link.
+    let dir = tempfile::tempdir().unwrap();
+    let mut w = Writer::open(dir.path(), small_config()).unwrap();
+    let max = tickertape::format::max_payload_len(SMALL_SEGMENT) as usize;
+    let data = vec![3u8; max];
+    let rec = NewRecord {
+        schema_id: 0,
+        venue_ts_ns: 0,
+        local_ts_ns: 0,
+        payload: &data,
+    };
+    w.append(&rec).unwrap();
+    fault::fail_next(Point::MapSegment, 12 /* ENOMEM */);
+    assert!(matches!(
+        w.append(&rec),
+        Err(Error::Io {
+            op: "map segment",
+            ..
+        })
+    ));
+    assert_eq!(segments(dir.path()).len(), 1, "nothing published");
+    assert_eq!(w.append(&rec).unwrap(), 1);
+    assert_eq!(read_all(dir.path()).len(), 2);
 }

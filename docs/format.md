@@ -111,7 +111,8 @@ an error; records never span segments.
 | P+4 | 4 | `seal_crc` | CRC32C of the 4 bytes `FF FF FF FF` followed by `next_seq` as a `u64` |
 
 `next_seq` is the sequence number of the next record, which is the `base_seq` of the next segment. A seal is
-**valid** for an expected sequence number `S` if `seal_crc` matches `S`. A reader that finds a valid seal continues
+**valid** for an expected sequence number `S` if `seal_crc` matches `S` and it is not at offset 64 (an empty segment
+is never sealed, so a seal there would name its own segment). A reader that finds a valid seal continues
 at offset 64 of `{S:020}.tape`; an invalid seal is corruption.
 
 ## Checkpoint marker
@@ -160,9 +161,9 @@ nothing about when bytes reach the disk; see `crash-contract.md`.
 
 ### Abandoned writes
 
-If the writer starts writing a body and then does not commit it (a panic inside the caller's fill closure, or an I/O
-error), it zeroes every byte it may have written, makes that zeroing durable (`msync` + sync of the range), and only
-then continues. A body can contain bytes that look like a valid record for the next sequence number, so leftover
+If the writer starts writing a body and then does not commit it (a panic inside the caller's fill closure), it zeroes
+every byte it may have written and makes that zeroing durable (`msync`, a data sync and the platform barrier) before
+anything else is appended. If that fails, the writer refuses further appends; a new writer's recovery cleans up. A body can contain bytes that look like a valid record for the next sequence number, so leftover
 bytes must never remain past the end of a shorter record that is committed later.
 
 ## Rolling
@@ -228,8 +229,8 @@ segment), and aborting the repair with an error if any step fails:
 2. Bytes: write them to a new file `….partial` created with `O_EXCL`, sync it, then publish it with `link` to
    `{base_seq:020}-{offset:012}-{unix_ns}-{n}.bin` (`n` = 0, 1, … until a name is free; `link` never replaces), unlink
    the `.partial` name, and sync `quarantine/`.
-   Whole segments: sync the segment file's data, then `link` it to a free name in `quarantine/` (as above), unlink
-   its old name, and sync both directories.
+   Whole segments: sync the segment file's data, `link` it to a free name in `quarantine/` (as above), sync
+   `quarantine/` and apply the platform barrier, and only then unlink its old name and sync the journal directory.
 3. Apply the platform barrier (macOS: `F_FULLFSYNC`).
 
 An interrupted recovery leaves either the original or the preserved copy (or both); the next open redoes the
