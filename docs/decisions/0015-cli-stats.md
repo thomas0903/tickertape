@@ -1,4 +1,4 @@
-# 0014: Streaming CLI statistics
+# 0015: Streaming CLI statistics
 
 - **Status:** accepted
 - **Date:** 2026-11-01
