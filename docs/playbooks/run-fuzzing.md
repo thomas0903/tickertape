@@ -27,6 +27,7 @@ cargo +nightly fuzz run parse_segment -- -max_total_time=60
 cargo +nightly fuzz run parse_segment -- -max_total_time=600
 cargo +nightly fuzz run decode_record -- -max_total_time=600
 # recover_dir writes files and needs its seeds (run from fuzz/); -max_len keeps inputs small
+mkdir -p corpus/recover_dir
 cargo +nightly fuzz run recover_dir corpus/recover_dir seeds/recover_dir -- -max_total_time=600 -max_len=1024
 ```
 
