@@ -98,11 +98,11 @@ impl Writer {
     ///
     /// # Errors
     ///
-    /// - [`Error::Locked`](crate::Error::Locked) if another writer has the journal open.
-    /// - [`Error::InvalidConfig`](crate::Error::InvalidConfig) if `config.segment_size` breaks the format's limits.
-    /// - [`Error::Corrupt`](crate::Error::Corrupt) if the journal is damaged in a way recovery doesn't repair, or
-    ///   the tail is corrupt and the policy is [`RecoveryPolicy::Fail`](crate::RecoveryPolicy::Fail).
-    /// - [`Error::UnsupportedVersion`](crate::Error::UnsupportedVersion), [`Error::Io`](crate::Error::Io).
+    /// - [`Error::Locked`] if another writer has the journal open.
+    /// - [`Error::InvalidConfig`] if `config.segment_size` breaks the format's limits.
+    /// - [`Error::Corrupt`] if the journal is damaged in a way recovery doesn't repair, or
+    ///   the tail is corrupt and the policy is [`RecoveryPolicy::Fail`].
+    /// - [`Error::UnsupportedVersion`], [`Error::Io`].
     pub fn open(dir: impl AsRef<Path>, config: WriterConfig) -> Result<Writer> {
         format::validate_segment_size(config.segment_size).map_err(|r| {
             Error::InvalidConfig(format!("segment_size {}: {r}", config.segment_size))
@@ -166,11 +166,11 @@ impl Writer {
     ///
     /// # Errors
     ///
-    /// - [`Error::RecordTooLarge`](crate::Error::RecordTooLarge) if the payload can't fit in one segment, or doesn't
+    /// - [`Error::RecordTooLarge`] if the payload can't fit in one segment, or doesn't
     ///   fit in the current segment and that segment is still empty (see `docs/format.md` → Rolling).
-    /// - [`Error::SequenceExhausted`](crate::Error::SequenceExhausted) after `u64::MAX - 1`.
-    /// - [`Error::Io`](crate::Error::Io) if a roll fails, e.g. the disk is full
-    ///   ([`Error::is_storage_full`](crate::Error::is_storage_full)). The journal is unchanged and the call can be
+    /// - [`Error::SequenceExhausted`] after `u64::MAX - 1`.
+    /// - [`Error::Io`] if a roll fails, e.g. the disk is full
+    ///   ([`Error::is_storage_full`]). The journal is unchanged and the call can be
     ///   retried.
     pub fn append(&mut self, record: &NewRecord<'_>) -> Result<u64> {
         let payload = record.payload;
@@ -275,8 +275,8 @@ impl Writer {
     ///
     /// # Errors
     ///
-    /// [`Error::Io`](crate::Error::Io) if a sync call fails. The writer is then poisoned: every later call returns
-    /// [`Error::DurabilityLost`](crate::Error::DurabilityLost), because a failed sync can drop data that a retry
+    /// [`Error::Io`] if a sync call fails. The writer is then poisoned: every later call returns
+    /// [`Error::DurabilityLost`], because a failed sync can drop data that a retry
     /// would not rewrite. Appends keep working.
     pub fn checkpoint(&mut self) -> Result<()> {
         if self.poisoned {
