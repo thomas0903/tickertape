@@ -14,7 +14,8 @@ Think of it as a flight recorder for a trading system or any other latency-sensi
   Readers never slow the writer down.
 - Data lives in fixed-size **segment files** that roll over and are never deleted for you, so a journal can be
   inspected, copied and replayed after an incident or in tests.
-- The **`tickertape` CLI** tails, inspects and verifies journals, and exports them to JSONL or Parquet.
+- The **`tickertape` CLI** tails, inspects, verifies and summarizes journals (`stats`), and exports them to
+  JSONL or Parquet.
 
 ![tickertape architecture: a writer process appends to segment files and a checkpoint marker in one journal directory; safe and zero-copy reader processes and the CLI read them; the CLI exports Parquet or JSONL for DuckDB and Python](docs/figures/architecture.svg)
 

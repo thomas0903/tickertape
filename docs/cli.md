@@ -44,6 +44,22 @@ Errors and recovery warnings go to stderr. JSON results go to stdout (or the sel
   Tail and export use the durability guarantee and storage assumptions in [crash contract C13](crash-contract.md)
   and [ADR 0010](decisions/0010-durable-only-reads.md); if the writer never checkpoints, neither exposes records.
 
+- `stats <DIR> [--from <SEQ>] [--to <SEQ>] [--durable-only] [--json]`: summarize committed records
+  with totals, per-schema counts/shares/payload lengths, overall payload percentiles, separate venue/local
+  timestamp summaries, and the largest gap between consecutive local timestamps. Ranges are inclusive;
+  `--to` must not precede `--from`. One nonblocking startup scan accumulates the selected records once,
+  stopping at the first uncommitted slot or upper bound. Like export's capture scan, this observes the end
+  during scanning; it is not an atomic snapshot of a live writer. It never waits for future appends or rereads
+  records for output. `--durable-only` freezes the checkpoint's exclusive `next_seq` before the scan; no
+  valid checkpoint means an empty report. Corruption returns **2**, with **no stats output** (including no
+  valid-prefix report); input I/O errors return **1** with no stats output. Diagnostics go to stderr.
+  Text is compact and aligned; `--json` emits the object documented below.
+  Memory does not grow with record count: a fixed payload histogram, bounded timestamp sort chunks and
+  per-schema aggregates are retained, alongside the public reader's buffers and segment listing. Exact
+  second counts for unordered input spill to two anonymous temporary files outside the journal when needed;
+  temporary disk usage grows linearly with nonzero timestamp count. Temporary storage errors return **1**.
+  If `TMPDIR` resolves inside the journal, spilling fails without creating files there.
+
 ## Machine-readable contracts
 
 All JSON is UTF-8, compact, and ends with a newline. Integer fields are unsigned JSON numbers with their Rust
@@ -87,6 +103,49 @@ journal may contain valid records in later segments; totals do not imply a conti
 header. `end_seq` is exclusive, after the last valid record in that segment (or its filename's base sequence if
 none). `used_bytes` includes header and seal when validated; it is zero for an invalid header. `used_percent`
 is `100 * used_bytes / size_bytes`. `unknown` reserves handling of future library end states.
+
+### `stats --json`
+
+```text
+{"totals":{"records":u64,"first_seq":u64|null,"last_seq":u64|null,"payload_bytes":u64},
+ "schemas":[{"schema_id":u32,"records":u64,"share_percent":number,"payload_bytes":u64,
+ "min_payload_bytes":u64,"mean_payload_bytes":number,"max_payload_bytes":u64}, ...],
+ "payload_length":{"min_bytes":u64|null,"p50_bytes":u64|null,"p90_bytes":u64|null,
+ "p99_bytes":u64|null,"max_bytes":u64|null},
+ "venue_ts":TIME,"local_ts":TIME,
+ "largest_local_gap":{"gap_s":number,"from_seq":u64,"to_seq":u64}|null}
+
+TIME = {"records":u64,"min_ns":u64|null,"max_ns":u64|null,"min_utc":string|null,
+ "max_utc":string|null,"span_s":number|null,"mean_rate_per_s":number|null,
+ "busiest_second":{"records":u64,"start_ns":u64,"start_utc":string}|null,"decreases":u64}
+```
+
+`number` denotes a floating-point JSON number. Consumers should use field names, not object key order.
+`totals` covers all selected records; payload byte totals exclude record headers and alignment padding.
+`schemas` is sorted by numeric id, with `share_percent = 100 * schema records / total records` and
+`mean_payload_bytes = schema payload bytes / schema records`. All lengths describe opaque payloads.
+Overall min/max and schema min/mean/max use actual lengths. Percentiles use nearest-rank
+`ceil(percent * records / 100)`: exact integer lengths through **4096 bytes (4 KiB)**, then power-of-two
+bucket **upper bounds** (4097–8192 → 8192, 8193–16384 → 16384, etc.). The histogram is bounded; only the
+percentile rank within that histogram is exact above 4 KiB.
+
+For each timestamp field independently, zero means unset and is excluded from counts, extrema and buckets.
+`min_ns`/`max_ns` are unsigned Unix-epoch nanoseconds; UTC strings are RFC 3339 with nine fractional digits
+and `Z`, computed without locale or time-zone dependence. `span_s = (max_ns - min_ns) / 1e9`;
+`mean_rate_per_s = nonzero records / span_s`, or null when the span is zero or unavailable.
+`busiest_second` is always a **fixed UTC second**, `ts / 1e9`, not a sliding window, for ordered and unordered
+input alike. It counts every set timestamp in that bucket; `start_ns` is the inclusive second boundary and
+`start_utc` its UTC representation. Ties choose the earliest second.
+`decreases` counts adjacent selected record pairs with both timestamps nonzero and the second smaller;
+zero breaks adjacency, rather than comparing across missing timestamps. This definition also applies
+independently to local timestamps.
+
+`largest_local_gap` uses adjacent selected records with both local timestamps nonzero and the second at
+least the first. Its `gap_s` is the unsigned difference divided by 1e9; ties choose the first pair in sequence
+order. A zero gap is valid. It is null when no eligible pair exists. Gaps and decreases do not cross range bounds.
+An empty selection has zero totals, null sequence bounds, an empty schema array, null payload lengths,
+zero time counts/decreases, null time extrema/UTC/span/rate/busiest second, and a null local gap.
+A field with no set timestamps likewise has null time summaries and zero counts/decreases.
 
 ### Parquet (`export --format parquet`)
 

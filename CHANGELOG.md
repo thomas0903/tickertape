@@ -5,6 +5,8 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## Unreleased
 
+- CLI: add read-only `stats` with streaming range/checkpoint statistics, bounded payload percentiles, exact
+  UTC-second counts, and a documented `--json` schema.
 - Library: `Reader::records()`, an iterator of owned records committed so far (for `take`, `filter`, `collect`).
 - Fix: with `RecoveryPolicy::Fail`, a sealed segment whose successor has an invalid header is now refused instead
   of quarantined (found by the new `recover_dir` fuzz target, which runs writer recovery on generated directories).

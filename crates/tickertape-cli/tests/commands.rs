@@ -61,7 +61,7 @@ fn lines(bytes: &[u8]) -> Vec<Value> {
 #[test]
 fn help_contracts_and_usage_errors() {
     for (cmd, options) in [
-        (None, vec!["tail", "inspect", "verify", "export"]),
+        (None, vec!["tail", "inspect", "verify", "export", "stats"]),
         (
             Some("tail"),
             vec![
@@ -80,6 +80,24 @@ fn help_contracts_and_usage_errors() {
             vec!["--json", "checkpoint", "used_percent"],
         ),
         (Some("verify"), vec!["--json", "problems", "first_seq"]),
+        (
+            Some("stats"),
+            vec![
+                "--from",
+                "--to",
+                "--durable-only",
+                "--json",
+                "4096",
+                "upper bounds",
+                "nearest-rank",
+                "busiest_second",
+                "decreases",
+                "mean_rate_per_s",
+                "payload_bytes",
+                "no stats",
+                "startup scan",
+            ],
+        ),
         (
             Some("export"),
             vec![
@@ -367,6 +385,7 @@ fn commands_do_not_modify_journal_and_reject_export_into_it() {
         .collect();
     for args in [
         vec!["tail", "--no-follow"],
+        vec!["stats"],
         vec!["inspect"],
         vec!["verify"],
         vec!["export", "--format", "jsonl"],
@@ -409,6 +428,7 @@ fn empty_and_missing_journals() {
     let absent = dir.path().join("missing");
     for args in [
         vec!["tail", "--no-follow"],
+        vec!["stats"],
         vec!["inspect"],
         vec!["verify"],
         vec!["export", "--format", "jsonl"],
