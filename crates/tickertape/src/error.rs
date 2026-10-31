@@ -80,6 +80,24 @@ pub enum Error {
         max: usize,
     },
 
+    /// The writer is poisoned after a failed checkpoint; durability of earlier records can't be guaranteed.
+    ///
+    /// Appends still work. See `docs/crash-contract.md` → Errors are sticky.
+    #[error("an earlier checkpoint failed; durability can no longer be guaranteed for this writer")]
+    DurabilityLost,
+
+    /// The next sequence number would be `u64::MAX`.
+    #[error("sequence numbers exhausted")]
+    SequenceExhausted,
+
+    /// Writer recovery discarded records from this sequence number on (after a power loss or corruption), so the
+    /// reader's position no longer exists. Seek to a current position to continue.
+    #[error("records from sequence {seq} were discarded by writer recovery")]
+    Discarded {
+        /// The reader's position when it noticed.
+        seq: u64,
+    },
+
     /// A configuration value is out of range.
     #[error("invalid configuration: {0}")]
     InvalidConfig(String),

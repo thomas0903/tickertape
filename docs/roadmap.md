@@ -5,7 +5,7 @@ Linux and macOS. Tick a milestone off here and move on in `status.md`.
 
 ## v0.1.0
 
-- [ ] **M0: Repository and agent setup**
+- [x] **M0: Repository and agent setup** (done 2026-10-31; CI green on `main`)
   - `AGENTS.md`/`CLAUDE.md` in every lane; `docs/` (status, roadmap, ADR 0001, playbooks, research);
     `.agents/skills` with the `.claude/skills` symlink and a README with pins and licences; `.claude/settings.json`; `.gitignore`.
   - The workspace builds, and the full check passes with a placeholder test on macOS and on Linux (OrbStack VM).

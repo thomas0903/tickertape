@@ -15,11 +15,11 @@ pub struct NewRecord<'a> {
     pub payload: &'a [u8],
 }
 
-/// A committed, validated record, borrowed from a reader's mapping.
+/// A committed, validated record, borrowed from the [`Reader`](crate::Reader) that returned it.
 ///
-/// The payload points directly into the memory-mapped segment (zero-copy). It stays valid until the next call on
-/// the [`Reader`](crate::Reader) that returned it; the borrow checker enforces this. Use [`Record::to_owned`] to
-/// keep it longer. Soundness relies on committed bytes never changing; see `docs/crash-contract.md` → Known risks.
+/// The payload points into the reader's copy buffer ([`Reader::open`](crate::Reader::open)) or directly into the
+/// memory-mapped segment ([`Reader::open_mapped`](crate::Reader::open_mapped)). Either way it stays valid until the
+/// next call on that reader; the borrow checker enforces this. Use [`Record::to_owned`] to keep it longer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Record<'a> {
     /// Sequence number: the record's position in the journal, starting at 0, without gaps.
@@ -30,7 +30,7 @@ pub struct Record<'a> {
     pub venue_ts_ns: u64,
     /// As given to [`NewRecord::local_ts_ns`].
     pub local_ts_ns: u64,
-    /// The payload bytes, borrowed from the mapping.
+    /// The payload bytes, borrowed from the reader.
     pub payload: &'a [u8],
 }
 
