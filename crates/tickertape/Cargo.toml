@@ -15,9 +15,11 @@ categories = ["database-implementations", "filesystem", "finance"]
 [dependencies]
 libc = "0.2"
 thiserror = "2"
+crc32c = "0.6"
+
+[dev-dependencies]
+proptest = "1"
+tempfile = "3"
 
 [lints]
 workspace = true
-
-[dev-dependencies]
-tempfile = "3"
