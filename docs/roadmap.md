@@ -32,7 +32,7 @@ Linux and macOS. Tick a milestone off here and move on in `status.md`.
 - [x] **M5: CLI** (done 2026-10-31)
   - `tail` (follow live), `inspect` (headers, segment list, sequence range), `verify` (full checksum scan, non-zero
     exit on corruption), `export --format jsonl`. Each command has `assert_cmd` tests and `--help` text.
-- [ ] **M6: Parquet export and DuckDB**
+- [x] **M6: Parquet export and DuckDB** (done 2026-10-31)
   - `export --format parquet` with a documented schema (sequence, schema id, timestamps, payload as binary, plus an
     optional decoder hook for the example schema).
   - A CI test exports a sample journal and runs a DuckDB query on it, checking the row count and a sequence range.
