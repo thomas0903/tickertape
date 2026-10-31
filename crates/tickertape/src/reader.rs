@@ -274,8 +274,15 @@ impl Reader {
                         payload_at: self.offset + format::RECORD_HEADER_LEN as u64,
                         payload_len: len as usize - format::RECORD_HEADER_LEN,
                     };
+                    let Some(next_seq) = self.next_seq.checked_add(1) else {
+                        return Err(Error::corrupt(
+                            &self.seg.path,
+                            self.offset,
+                            CorruptReason::SequenceExhausted,
+                        ));
+                    };
                     self.offset += format::align8(u64::from(len));
-                    self.next_seq += 1;
+                    self.next_seq = next_seq;
                     return Ok(Some(found));
                 }
                 SlotOutcome::Seal => {
@@ -293,6 +300,9 @@ impl Reader {
                         }
                         Err(e) => return Err(e),
                     };
+                    // Recheck after opening the successor: if recovery replaced this segment in between, the
+                    // successor may belong to a different history.
+                    self.check_identity()?;
                     self.seg = next;
                     self.offset = format::SEGMENT_HEADER_LEN as u64;
                     self.buf.clear();
@@ -315,11 +325,10 @@ impl Reader {
             let Some(word) = map.commit_word(offset) else {
                 return Ok(SlotOutcome::Invalid(CorruptReason::BadLength(0)));
             };
+            // Validate from an atomic copy: no reference into the mapping exists until the record has passed
+            // validation (`materialize`), so a corrupted length can't make a slice cover bytes still being written.
             return Ok(classify(word, offset, size, expected, |off, len| {
-                // SAFETY: `classify` only asks for bytes inside the frame of the non-zero commit word just observed
-                // (after checking the frame fits in the segment), which `open_mapped`'s contract makes immutable.
-                let bytes = unsafe { map.committed_bytes(off, len) }?;
-                Some(bytes.to_vec())
+                map.copy_atomic(off, len)
             }));
         }
 
@@ -452,9 +461,11 @@ fn classify(
         return SlotOutcome::Empty;
     }
     if word == format::SEAL_MARKER {
-        if offset
-            .checked_add(format::SEAL_LEN as u64)
-            .is_none_or(|end| end > size)
+        // An empty segment is never sealed, and a seal at the first slot would point back at its own segment.
+        if offset == format::SEGMENT_HEADER_LEN as u64
+            || offset
+                .checked_add(format::SEAL_LEN as u64)
+                .is_none_or(|end| end > size)
         {
             return SlotOutcome::Invalid(CorruptReason::BadSeal);
         }

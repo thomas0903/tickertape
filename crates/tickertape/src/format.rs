@@ -384,9 +384,11 @@ pub fn read_slot<V: SegmentView + ?Sized>(
         .checked_add(COMMIT_WORD_LEN as u64)
         .ok_or(CorruptReason::BadOffset(offset))?;
     if len == SEAL_MARKER {
-        if offset
-            .checked_add(SEAL_LEN as u64)
-            .is_none_or(|end| end > segment.len())
+        // An empty segment is never sealed (a seal at the first slot would name its own segment).
+        if offset == SEGMENT_HEADER_LEN as u64
+            || offset
+                .checked_add(SEAL_LEN as u64)
+                .is_none_or(|end| end > segment.len())
         {
             return Err(CorruptReason::BadSeal);
         }
@@ -800,9 +802,18 @@ mod tests {
             Err(CorruptReason::BadChecksum)
         );
         seal(&mut image, 64, 7);
-        assert_eq!(read_slot(&image[..], 64, 7), Ok(Slot::Seal));
-        assert_eq!(read_slot(&image[..], 64, 8), Err(CorruptReason::BadSeal));
-        assert_eq!(read_slot(&image[..68], 64, 7), Err(CorruptReason::BadSeal));
+        assert_eq!(
+            read_slot(&image[..], 64, 7),
+            Err(CorruptReason::BadSeal),
+            "a seal at the first slot names its own segment"
+        );
+        seal(&mut image, 128, 7);
+        assert_eq!(read_slot(&image[..], 128, 7), Ok(Slot::Seal));
+        assert_eq!(read_slot(&image[..], 128, 8), Err(CorruptReason::BadSeal));
+        assert_eq!(
+            read_slot(&image[..132], 128, 7),
+            Err(CorruptReason::BadSeal)
+        );
     }
 
     #[test]
@@ -989,6 +1000,8 @@ mod tests {
                 offset = next;
             }
             let next_seq = base + records.len() as u64;
+            // A writer never seals an empty segment, and a seal at offset 64 is invalid.
+            let sealed = sealed && !records.is_empty();
             if sealed { seal(&mut image, offset, next_seq); }
             prop_assert_eq!(scan_segment(&image[..], 64, base), ScanResult { end_offset: offset as u64, next_seq, records: records.len() as u64, end: if sealed { ScanEnd::Seal } else { ScanEnd::Empty } });
             if !positions.is_empty() {

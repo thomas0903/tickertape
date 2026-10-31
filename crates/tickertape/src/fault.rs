@@ -12,6 +12,8 @@ use std::io;
 pub enum Point {
     /// Preallocating a new segment (as if the disk were full).
     Preallocate,
+    /// Mapping a new segment (before it is published).
+    MapSegment,
     /// Publishing a new segment with `link`.
     Link,
     /// Syncing segment data during `checkpoint()`.

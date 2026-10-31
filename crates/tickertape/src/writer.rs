@@ -44,6 +44,8 @@ pub struct Writer {
     checkpoint_file: File,
     generation: u64,
     poisoned: bool,
+    /// Set if an abandoned write's zeroing could not be made durable; see `append_with`.
+    appends_blocked: bool,
     report: RecoveryReport,
 }
 
@@ -130,8 +132,12 @@ impl Writer {
         let (checkpoint_file, checkpoint) = rec.open_checkpoint_file()?;
         let state = rec.recover(checkpoint)?;
         let mut dirty_dirs = rec.dirty_dirs;
-        // A new writer can't know whether directory entries made by earlier writers are durable.
+        // A new writer can't know whether directory entries made by earlier writers are durable, including the
+        // journal directory's own entry in its parent (an earlier writer may have died right after creating it).
         dirty_dirs.insert(dir.clone());
+        if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
+            dirty_dirs.insert(parent.to_path_buf());
+        }
 
         report.next_seq = state.next_seq;
         Ok(Writer {
@@ -147,6 +153,7 @@ impl Writer {
             checkpoint_file,
             generation: checkpoint.map_or(0, |c| c.generation),
             poisoned: false,
+            appends_blocked: false,
             report,
         })
     }
@@ -189,6 +196,13 @@ impl Writer {
     where
         F: FnOnce(&mut [u8]),
     {
+        if self.appends_blocked {
+            return Err(Error::io(
+                "append after an abandoned write could not be cleaned up durably",
+                &self.active.path,
+                io::Error::other("reopen the journal to recover"),
+            ));
+        }
         if self.next_seq == u64::MAX {
             return Err(Error::SequenceExhausted);
         }
@@ -231,14 +245,18 @@ impl Writer {
         let filled = panic::catch_unwind(AssertUnwindSafe(|| fill(&mut body[payload_start..])));
         if let Err(cause) = filled {
             body.fill(0);
+            // The zeroing must be durable (full platform barrier) before this space is reused.
             let synced = self
                 .active
                 .map
                 .sync_range(offset, u64::from(len))
-                .and_then(|()| mmap::sync_data(&self.active.file));
+                .and_then(|()| mmap::sync_data(&self.active.file))
+                .and_then(|()| mmap::full_barrier(&self.active.file));
             if synced.is_err() {
-                // The zeroing may not be durable, so stale bytes could resurface after a power loss.
+                // Stale bytes could resurface after a power loss and be read as a record after a shorter one,
+                // so this writer must not reuse the space: refuse further appends and checkpoints.
                 self.poisoned = true;
+                self.appends_blocked = true;
             }
             panic::resume_unwind(cause);
         }
@@ -272,7 +290,7 @@ impl Writer {
     }
 
     fn checkpoint_inner(&mut self) -> Result<()> {
-        if self.generation == u64::MAX - 1 {
+        if self.generation >= u64::MAX - 1 {
             return Err(Error::SequenceExhausted);
         }
         // 1. Data.
@@ -346,10 +364,8 @@ impl Writer {
     /// Rolls to a new segment (`docs/format.md` → Rolling).
     fn roll(&mut self) -> Result<()> {
         let next_base = self.next_seq;
-        let (file, path) = create_segment(&self.dir, next_base, self.config.segment_size)?;
+        let new = create_segment(&self.dir, next_base, self.config.segment_size)?;
         self.dirty_dirs.insert(self.dir.clone());
-        let map = MapRw::new(&file, self.config.segment_size as usize)
-            .map_err(|e| Error::io("map segment", &path, e))?;
         // After the link, the roll always completes: seal the old segment, then switch.
         let seal_at = self.offset;
         let crc = format::seal_crc(next_base).to_le_bytes();
@@ -362,13 +378,6 @@ impl Writer {
             .map
             .store_commit_word(seal_at, format::SEAL_MARKER)
             .ok_or_else(|| internal(&self.active.path, "seal out of bounds"))?;
-        let new = Segment {
-            base: next_base,
-            size: self.config.segment_size,
-            path,
-            file,
-            map,
-        };
         let old = std::mem::replace(&mut self.active, new);
         self.dirty.push(DirtySegment {
             file: old.file,
@@ -436,7 +445,7 @@ fn take_lock(dir: &Path) -> Result<File> {
 
 /// Creates and publishes a new segment (`docs/format.md` → Rolling, steps 2–3). Returns the open file (read-write)
 /// and its final path.
-fn create_segment(dir: &Path, base: u64, size: u64) -> Result<(File, PathBuf)> {
+fn create_segment(dir: &Path, base: u64, size: u64) -> Result<Segment> {
     let tmp = journal::tmp_path(dir, base);
     let path = journal::segment_path(dir, base);
     match fs::remove_file(&tmp) {
@@ -462,17 +471,33 @@ fn create_segment(dir: &Path, base: u64, size: u64) -> Result<(File, PathBuf)> {
         file.write_all_at(&header, 0)
             .map_err(|e| Error::io("write segment header", &tmp, e))?;
         mmap::sync_data(&file).map_err(|e| Error::io("sync segment", &tmp, e))?;
+        // Map before publishing, so that nothing fallible is left after the link (the publication point).
+        let len = usize::try_from(size)
+            .map_err(|_| Error::io("map segment", &tmp, io::Error::other("segment too large")))?;
+        let map = crate::fault::inject(crate::fault::Point::MapSegment)
+            .and_then(|()| MapRw::new(&file, len))
+            .map_err(|e| Error::io("map segment", &tmp, e))?;
         crate::fault::inject(crate::fault::Point::Link)
             .and_then(|()| fs::hard_link(&tmp, &path))
-            .map_err(|e| Error::io("publish segment", &path, e))
+            .map_err(|e| Error::io("publish segment", &path, e))?;
+        Ok(map)
     })();
-    if let Err(e) = prepared {
-        let _ = fs::remove_file(&tmp);
-        return Err(e);
-    }
+    let map = match prepared {
+        Ok(map) => map,
+        Err(e) => {
+            let _ = fs::remove_file(&tmp);
+            return Err(e);
+        }
+    };
     // Publication happened; a leftover temporary name is harmless and removed at the next open.
     let _ = fs::remove_file(&tmp);
-    Ok((file, path))
+    Ok(Segment {
+        base,
+        size,
+        path,
+        file,
+        map,
+    })
 }
 
 /// Opens an existing segment read-write, validates its header and maps it.
@@ -563,12 +588,11 @@ impl Recovery<'_> {
             if let Some(c) = checkpoint {
                 return Err(self.dangling(c));
             }
-            let (file, path) = create_segment(self.dir, 0, self.config.segment_size)?;
+            let active = create_segment(self.dir, 0, self.config.segment_size)?;
             journal::sync_dir(self.dir)?;
-            mmap::full_barrier(&file).map_err(|e| Error::io("full sync segment", &path, e))?;
-            drop(file);
+            mmap::full_barrier(&active.file)
+                .map_err(|e| Error::io("full sync segment", &active.path, e))?;
             self.report.actions.push(RecoveryAction::Created);
-            let active = open_segment(self.dir, 0)?;
             return Ok(RecoveredState {
                 active,
                 offset: format::SEGMENT_HEADER_LEN as u64,
@@ -630,6 +654,14 @@ impl Recovery<'_> {
                     break;
                 }
                 ScanEnd::Seal => {
+                    if visited.contains(&seq) {
+                        // A seal must lead forward; never revisit a segment.
+                        return Err(Error::corrupt(
+                            &seg.path,
+                            offset,
+                            CorruptReason::BrokenChain(seq),
+                        ));
+                    }
                     let later_exists = bases.range(seq.saturating_add(1)..).next().is_some();
                     if bases.contains(&seq) {
                         match open_segment(self.dir, seq) {
@@ -658,15 +690,14 @@ impl Recovery<'_> {
                         ));
                     }
                     // Crash or power loss during a roll: create the successor.
-                    let (file, path) = create_segment(self.dir, seq, self.config.segment_size)?;
+                    let next = create_segment(self.dir, seq, self.config.segment_size)?;
                     self.dirty_dirs.insert(self.dir.to_path_buf());
                     journal::sync_dir(self.dir)?;
-                    drop(file);
-                    self.report
-                        .actions
-                        .push(RecoveryAction::CompletedRoll { segment: path });
+                    self.report.actions.push(RecoveryAction::CompletedRoll {
+                        segment: next.path.clone(),
+                    });
                     dirty.push(inherited(seg));
-                    seg = open_segment(self.dir, seq)?;
+                    seg = next;
                     visited.insert(seq);
                     offset = format::SEGMENT_HEADER_LEN as u64;
                     break;
@@ -871,9 +902,11 @@ impl Recovery<'_> {
             .unwrap_or("segment")
             .to_string();
         let to = Self::link_free_name(&qdir, &stem, path)?;
+        // Make the preserved name durable before removing the original.
+        journal::sync_dir(&qdir)?;
+        mmap::full_barrier(&file).map_err(|e| Error::io("full sync segment", &to, e))?;
         fs::remove_file(path).map_err(|e| Error::io("remove quarantined segment", path, e))?;
         journal::sync_dir(self.dir)?;
-        journal::sync_dir(&qdir)?;
         mmap::full_barrier(&file).map_err(|e| Error::io("full sync segment", &to, e))?;
         self.dirty_dirs.insert(qdir);
         self.report
