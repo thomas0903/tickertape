@@ -36,7 +36,7 @@ Linux and macOS. Tick a milestone off here and move on in `status.md`.
   - `export --format parquet` with a documented schema (sequence, schema id, timestamps, payload as binary, plus an
     optional decoder hook for the example schema).
   - A CI test exports a sample journal and runs a DuckDB query on it, checking the row count and a sequence range.
-- [ ] **M7: Benchmarks**
+- [x] **M7: Benchmarks** (done 2026-10-31)
   - Append throughput; cross-process writer-to-reader *visible* latency (p50/p99/p99.9, coordinated omission handled);
     `checkpoint()` latency; warm vs cold pages; at least two record sizes.
   - `benchmarks.md` reports measured numbers only, with hardware, OS, kernel/filesystem and the exact command, on the
