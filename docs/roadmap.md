@@ -52,7 +52,7 @@ Linux and macOS. Tick a milestone off here and move on in `status.md`.
   - A `v0.1.0` tag is pushed to the private repo. `playbooks/release-checklist.md` has the exact publishing steps.
   - `docs/launch/feedback-post.md` holds a draft feedback request (r/rust, r/algotrading). Agents never post it.
 
-## v0.2 (in progress)
+## v0.2 (done on `main`, unreleased)
 
 Improvements after v0.1.0, requested by the owner. Same rule: done only when every criterion holds and CI is green.
 
