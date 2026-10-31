@@ -62,7 +62,7 @@ mod writer;
 
 pub use config::{Backoff, ReaderConfig, RecoveryPolicy, WriterConfig};
 pub use error::{CorruptReason, Error, Result};
-pub use reader::Reader;
+pub use reader::{Reader, Records};
 pub use record::{NewRecord, OwnedRecord, Record};
 pub use writer::{RecoveryAction, RecoveryReport, Writer};
 

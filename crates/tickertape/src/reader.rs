@@ -30,7 +30,8 @@ const VALIDATION_RETRIES: u32 = 3;
 ///   there. Memory-safe whatever other processes do to the files, and never receives `SIGBUS`.
 /// - [`Reader::open_mapped`] (`unsafe`, zero-copy): payloads point straight into a read-only mapping.
 ///
-/// `Reader` doesn't implement [`Iterator`], because returned records borrow from the reader. Loop with `while let`:
+/// `Reader` doesn't implement [`Iterator`], because returned records borrow from the reader. Loop with `while let`
+/// (zero allocations), or use [`Reader::records`] for an iterator of owned copies:
 ///
 /// ```no_run
 /// # use tickertape::{Reader, ReaderConfig};
@@ -227,6 +228,30 @@ impl Reader {
     /// As for [`Reader::try_next`].
     pub fn next_owned(&mut self) -> Result<Option<OwnedRecord>> {
         Ok(self.try_next()?.map(|r| r.to_owned()))
+    }
+
+    /// An iterator over the records committed so far, copied out of the reader, starting at the current position.
+    ///
+    /// It ends at the first slot with no committed record (it doesn't wait for more; call `records()` again later
+    /// or use [`Reader::next_timeout`] to follow live). After an error it yields that error once and ends; the
+    /// reader's position is where [`Reader::try_next`] left it, so you can handle the error and continue.
+    ///
+    /// ```no_run
+    /// # use tickertape::{Reader, ReaderConfig};
+    /// # fn main() -> tickertape::Result<()> {
+    /// let mut reader = Reader::open("/tmp/journal", ReaderConfig::default())?;
+    /// let trades: Vec<_> = reader
+    ///     .records()
+    ///     .filter(|r| r.as_ref().map_or(true, |r| r.schema_id == 1))
+    ///     .collect::<tickertape::Result<_>>()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn records(&mut self) -> Records<'_> {
+        Records {
+            reader: self,
+            done: false,
+        }
     }
 
     /// The sequence number of the next record this reader will return.
@@ -543,6 +568,34 @@ fn finish(pending: Pending, word: u32, expected: u64, bytes: Option<&[u8]>) -> S
             match format::decode_record_body(word, body, expected) {
                 Ok((header, _)) => SlotOutcome::Record { header, len: word },
                 Err(reason) => SlotOutcome::Invalid(reason),
+            }
+        }
+    }
+}
+
+/// Iterator returned by [`Reader::records`]: owned records committed so far.
+#[derive(Debug)]
+pub struct Records<'r> {
+    reader: &'r mut Reader,
+    done: bool,
+}
+
+impl Iterator for Records<'_> {
+    type Item = Result<OwnedRecord>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        match self.reader.next_owned() {
+            Ok(Some(record)) => Some(Ok(record)),
+            Ok(None) => {
+                self.done = true;
+                None
+            }
+            Err(e) => {
+                self.done = true;
+                Some(Err(e))
             }
         }
     }

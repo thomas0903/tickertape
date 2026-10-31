@@ -579,3 +579,33 @@ fn exhausted_sequence_number_is_rejected_by_readers() {
         })
     ));
 }
+
+#[test]
+fn records_iterator_yields_committed_records_and_stops() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut w = Writer::open(dir.path(), small_config()).unwrap();
+    append_n(&mut w, 700);
+    let mut r = Reader::open(dir.path(), ReaderConfig::default()).unwrap();
+    let first: Vec<_> = r
+        .records()
+        .take(10)
+        .collect::<tickertape::Result<_>>()
+        .unwrap();
+    assert_eq!(
+        first.iter().map(|x| x.seq).collect::<Vec<_>>(),
+        (0..10).collect::<Vec<_>>()
+    );
+    let rest: Vec<_> = r.records().collect::<tickertape::Result<_>>().unwrap();
+    assert_eq!(rest.len(), 690);
+    rest.iter().for_each(check_record);
+    assert_eq!(
+        r.records().count(),
+        0,
+        "ends at the current end without waiting"
+    );
+    append_n(&mut w, 5);
+    assert_eq!(
+        r.records().map(|x| x.unwrap().seq).collect::<Vec<_>>(),
+        (700..705).collect::<Vec<_>>()
+    );
+}
