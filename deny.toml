@@ -31,3 +31,9 @@ allow-wildcard-paths = true
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
+
+# Parquet -> ahash -> const-random requires tiny-keccak. Keep CC0 scoped to this crate.
+[[licenses.exceptions]]
+name = "tiny-keccak"
+version = "=2.0.2"
+allow = ["CC0-1.0"]

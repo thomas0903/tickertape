@@ -103,3 +103,24 @@ jobs:
             # The prebuilt cargo-fuzz is a musl binary and would default to the musl target.
             cargo +nightly fuzz run --target x86_64-unknown-linux-gnu "$target" -- -max_total_time=60
           done
+
+  duckdb:
+    name: duckdb (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        id: python
+        with:
+          python-version: '3.12'
+      - run: python -m pip install duckdb
+      - run: cargo test -p tickertape-cli --locked duckdb_parquet_export -- --nocapture
+        env:
+          TICKERTAPE_REQUIRE_DUCKDB: '1'
+          TICKERTAPE_PYTHON: ${{ steps.python.outputs.python-path }}
