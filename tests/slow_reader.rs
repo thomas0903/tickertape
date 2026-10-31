@@ -48,7 +48,13 @@ fn slow_reader_process_does_not_block_writer() {
         .spawn()
         .unwrap();
     std::thread::sleep(Duration::from_millis(50));
-    let mut w = Writer::open(&journal, small_config()).unwrap();
+    // Large enough that the writer never rolls: segment creation syncs a file, and on slow CI disks those syncs, not
+    // the reader, would dominate the writer's time.
+    let mut w = Writer::open(
+        &journal,
+        tickertape::WriterConfig::default().segment_size(8 * 1024 * 1024),
+    )
+    .unwrap();
     let started = Instant::now();
     for seq in 0..count {
         let data = tickertape_tests::payload(seq, tickertape_tests::bounded_len(seq, 64));
