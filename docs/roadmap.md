@@ -41,7 +41,7 @@ Linux and macOS. Tick a milestone off here and move on in `status.md`.
     `checkpoint()` latency; warm vs cold pages; at least two record sizes.
   - `benchmarks.md` reports measured numbers only, with hardware, OS, kernel/filesystem and the exact command, on the
     owner's Mac and on Linux (OrbStack VM, labelled as such). No comparisons with other tools.
-- [ ] **M8: Example application**
+- [x] **M8: Example application** (done 2026-10-31)
   - `examples/`: a producer of synthetic trades and order-book updates (documented schema), a live consumer process, an
     export-then-DuckDB step. The README shows the whole flow in under 10 commands.
 - [ ] **M9: Release readiness (v0.1.0)**
