@@ -1,6 +1,6 @@
 # Crash contract
 
-Status: **draft for M1 approval** (revised after the cross-provider review). This document says exactly what
+Status: **accepted** (M1, approved by the owner on 2026-10-31). This document says exactly what
 tickertape guarantees when things go wrong, on each supported platform, and which test checks each guarantee. A
 guarantee without a passing test is marked **untested**, and nothing is claimed beyond what is written here.
 Rationale: ADRs [0004](decisions/0004-durability-levels.md) and [0007](decisions/0007-checkpoint-marker-and-recovery.md).

@@ -1,6 +1,6 @@
 # 0002: Record format
 
-- **Status:** proposed (M1 approval gate)
+- **Status:** accepted (owner approval, 2026-10-31)
 - **Date:** 2026-10-31
 
 ## Context

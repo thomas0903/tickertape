@@ -10,7 +10,7 @@ Linux and macOS. Tick a milestone off here and move on in `status.md`.
     `.agents/skills` with the `.claude/skills` symlink and a README with pins and licences; `.claude/settings.json`; `.gitignore`.
   - The workspace builds, and the full check passes with a placeholder test on macOS and on Linux (OrbStack VM).
   - `origin` is set, `main` is pushed and CI is green on both platforms.
-- [ ] **M1: Specification** (owner approval gate)
+- [x] **M1: Specification** (owner approval gate; approved 2026-10-31)
   - `docs/format.md` (byte layout, versioning, alignment, endianness), `docs/crash-contract.md` (guarantees per
     platform and level), and the public API as documented Rust signatures (`Writer`, `Reader`, `Record`, config, errors).
   - ADRs: record format, publication protocol, durability levels, segment rolling, reader API (borrowed vs copy-out).

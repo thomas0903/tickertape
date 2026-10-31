@@ -1,6 +1,6 @@
 # 0003: Publication protocol and access to mapped memory
 
-- **Status:** proposed (M1 approval gate)
+- **Status:** accepted (owner approval, 2026-10-31)
 - **Date:** 2026-10-31 (revised twice after cross-provider reviews the same day)
 
 ## Context

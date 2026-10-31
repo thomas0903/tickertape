@@ -1,6 +1,6 @@
 # 0004: Durability levels: visible vs. durable
 
-- **Status:** proposed (M1 approval gate)
+- **Status:** accepted (owner approval, 2026-10-31)
 - **Date:** 2026-10-31 (revised after the cross-provider review the same day)
 
 ## Context

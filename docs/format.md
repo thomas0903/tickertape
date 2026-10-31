@@ -1,6 +1,6 @@
 # tickertape on-disk format, version 1
 
-Status: **draft for M1 approval** (revised after the cross-provider review). This document is normative: the code
+Status: **accepted** (M1, approved by the owner on 2026-10-31). This document is normative: the code
 must match it. Rationale: ADRs [0002](decisions/0002-record-format.md) (record format),
 [0003](decisions/0003-publication-protocol.md) (publication and memory access),
 [0005](decisions/0005-segment-rolling.md) (segments and rolling) and
