@@ -4,7 +4,7 @@
 records events, other processes on the same machine follow them live, and everything can be replayed later or
 exported to Parquet for DuckDB and Python.
 
-> Status: v0.1.0, not yet published to crates.io. Linux and macOS. The on-disk format is version 1.
+> Status: v0.2.0, not yet published to crates.io. Linux and macOS. The on-disk format is version 1.
 
 Think of it as a flight recorder for a trading system or any other latency-sensitive program:
 
@@ -86,6 +86,8 @@ The full statement, per platform and with the test for each claim, is [`docs/cra
   and macOS, with a live reader across all of them.
 - **Power loss is not claimed.** Durability after a checkpoint depends on the filesystem and drive honouring
   flushes; it is stated, not tested. Records after the last checkpoint may be lost, including ones readers saw.
+  Readers that must not act on such records can use `ReaderConfig::durable_only(true)` (CLI: `--durable-only`),
+  which only returns records covered by a checkpoint.
 - **Corruption is detected, never silently returned.** Every record is checked (length, CRC32C, sequence). Recovery
   preserves anything it removes in `quarantine/` and never edits bytes in place.
 - **Readers.** `Reader::open` reads with `pread` and is memory-safe whatever other processes do. Zero-copy

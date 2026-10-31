@@ -5,13 +5,18 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## Unreleased
 
+## [0.2.0] - 2026-11-01
+
+Not yet published to crates.io. The on-disk format is unchanged (version 1); v0.1.0 journals work as they are.
+
 - Readers validate records without a per-record allocation: the safe reader in place in its `pread` buffer, the
   zero-copy reader from an atomic copy into a reused buffer (still before any slice into the mapping exists).
 - Library: `ReaderConfig::durable_only(true)` waits for checkpoint coverage before returning records (ADR 0010, C13).
 - CLI: `tail --durable-only` and `export --durable-only` (JSONL and Parquet); export caps its snapshot at the
   checkpoint observed at startup.
-- Add the optional `binance-recorder` example (`--features live`) with exact fixed-point trade parsing,
+- Examples: add the optional `binance-recorder` example (`--features live`) with exact fixed-point trade parsing,
   periodic/final checkpoints and reconnect backoff; default examples remain synthetic and offline.
+- Repository: AI-agent tooling is no longer part of the repository (ADR 0012).
 
 ## [0.1.0] - 2026-10-31
 
@@ -39,4 +44,5 @@ First release. Not yet published to crates.io.
 - Snappy Parquet export with raw unsigned metadata, bounded row groups, and opt-in `--decode market-demo` columns
   (also a `decoded` object in JSONL). Default JSONL output is unchanged by `--decode`.
 
+[0.2.0]: https://github.com/thomas0903/tickertape/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/thomas0903/tickertape/releases/tag/v0.1.0
