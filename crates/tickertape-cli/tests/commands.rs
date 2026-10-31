@@ -438,7 +438,16 @@ fn tail_resumes_after_discarded_history() {
     assert!(first.starts_with("seq=0 "));
     drop(writer);
     corrupt(&dir, 64 + 40);
-    let mut writer = Writer::open(dir.path(), WriterConfig::default().segment_size(65536)).unwrap();
+    // Retry briefly: a child forked by a parallel test may still hold the dropped writer's lock until its exec.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut writer = loop {
+        match Writer::open(dir.path(), WriterConfig::default().segment_size(65536)) {
+            Err(tickertape::Error::Locked { .. }) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            other => break other.unwrap(),
+        }
+    };
     append(&mut writer, 0);
     append(&mut writer, 1);
     let mut rest = String::new();

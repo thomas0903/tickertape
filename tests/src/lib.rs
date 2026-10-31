@@ -184,3 +184,20 @@ impl Rng {
 pub fn kill_len(seq: u64) -> usize {
     bounded_len(seq, 512)
 }
+
+/// Opens a writer, retrying briefly while the lock is held.
+///
+/// Rust opens files with close-on-exec, but a child process forked by a test running in parallel holds a copy of
+/// every open descriptor until it calls `exec`, including a just-dropped writer's lock. Tests that drop a writer and
+/// immediately reopen the journal use this to ride out that window.
+pub fn reopen_writer(dir: &Path, config: WriterConfig) -> Writer {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match Writer::open(dir, config.clone()) {
+            Err(tickertape::Error::Locked { .. }) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            other => return other.expect("reopen writer"),
+        }
+    }
+}

@@ -29,7 +29,7 @@ fn second_writer_fails() {
 
     tickertape_tests::append_n(&mut first, 1);
     drop(first);
-    let reopened = Writer::open(dir.path(), small_config()).unwrap();
+    let reopened = tickertape_tests::reopen_writer(dir.path(), small_config());
     assert_eq!(reopened.next_seq(), 4);
 }
 
@@ -76,7 +76,7 @@ fn stale_lock_after_kill() {
     }
     child.kill().unwrap();
     child.wait().unwrap();
-    let w = Writer::open(&journal, small_config())
-        .expect("lock released by the OS when the holder died");
+    // The OS released the lock when the holder died (retrying only covers other tests' fork-to-exec windows).
+    let w = tickertape_tests::reopen_writer(&journal, small_config());
     assert_eq!(w.next_seq(), 100);
 }

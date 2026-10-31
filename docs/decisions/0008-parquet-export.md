@@ -1,7 +1,7 @@
-# ADR 0008: Parquet export and opt-in market demo decoding
+# 0008: Parquet export and opt-in market demo decoding
 
-- Status: accepted
-- Date: 2026-10-31
+- **Status:** accepted
+- **Date:** 2026-10-31
 
 ## Context
 
