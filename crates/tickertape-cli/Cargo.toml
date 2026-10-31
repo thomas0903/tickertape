@@ -9,6 +9,8 @@ repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
 readme = "README.md"
+# Agent instructions are for working on the repository, not for users of the crate.
+exclude = ["AGENTS.md", "CLAUDE.md"]
 keywords = ["journal", "mmap", "event-log", "trading", "cli"]
 categories = ["command-line-utilities", "finance"]
 
