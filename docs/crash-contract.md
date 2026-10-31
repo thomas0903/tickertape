@@ -18,8 +18,8 @@ APFS). Network filesystems, Windows and multiple writers are not supported.
 
 Visibility is not durability. A reader can see, and act on, a record that a later power loss erases, and the writer
 then reuses that sequence number for a different record. Applications that must never act on a record that could
-disappear should act only on records up to the writer's last checkpoint (communicated by the application; a
-durable-only read mode is on the "Later" list).
+disappear should open their readers with `ReaderConfig::durable_only(true)` (ADR 0010; CLI: `--durable-only`), which
+returns only records covered by the last successful checkpoint (C13).
 
 ### What `checkpoint()` does
 
@@ -79,6 +79,7 @@ committed.
 | C10 | Disk full while writing into an existing segment | On APFS, ext4 and tmpfs: no effect; segments are preallocated, so writing into them needs no new blocks. **On btrfs this does not hold**: with the volume full, the first write into a not-yet-written page of a preallocated segment kills the writer with `SIGBUS`; with copy-on-write disabled (`chattr +C`) the writer instead blocks inside the kernel's page-fault handler. Keep free space on btrfs volumes that hold journals | Measured: APFS (owner's Mac), ext4, btrfs and tmpfs (OrbStack VM, Linux 7.2.12) | `tests/disk_full.rs::full_volume_then_write_into_preallocated_segment` (`#[ignore]`d: needs a small volume; fails on btrfs as described) |
 | C11 | Corrupted bytes in a segment (storage error, outside modification) | Readers and `verify` detect corruption that breaks the CRC32C, length, sequence or chain checks and report it with the file and offset; they never return a record that fails validation. The writer quarantines (or, with `RecoveryPolicy::Fail`, refuses) a corrupt tail; it repairs by writing a new file, never by changing bytes a reader may have mapped | Linux, macOS | `tests/recovery.rs::malformed_checksum_is_quarantined_and_repaired`, `::malformed_length_is_rejected`; fuzz targets `parse_segment`, `decode_record` |
 | C12 | A checkpoint fails | The error is returned and the writer stays poisoned (`Error::DurabilityLost` on later checkpoints). See "Errors are sticky" | Linux, macOS | `tests/checkpoint.rs::poisoned_after_failure` (injected error) |
+| C13 | A durable-only reader (`ReaderConfig::durable_only`) | Returns only records with a sequence number below the checkpoint marker's `next_seq`, so (under the storage assumptions) never a record that a power loss can remove; it waits while the next record is not covered | Linux, macOS | `tests/durable_only.rs` (v0.2) — **not yet written**. Power loss itself: **untested** |
 
 ## Readers, the writer and memory safety
 

@@ -52,6 +52,21 @@ Linux and macOS. Tick a milestone off here and move on in `status.md`.
   - A `v0.1.0` tag is pushed to the private repo. `playbooks/release-checklist.md` has the exact publishing steps.
   - `docs/launch/feedback-post.md` holds a draft feedback request (r/rust, r/algotrading). Agents never post it.
 
+## v0.2 (in progress)
+
+Improvements after v0.1.0, requested by the owner. Same rule: done only when every criterion holds and CI is green.
+
+- [ ] **Reader hot path without per-record allocation**
+  - Neither reader allocates per record; the zero-copy reader still validates every record before any slice into the
+    mapping exists. Cross-provider review of the `mmap.rs` change.
+  - Replay benchmarks re-run on the owner's Mac and the OrbStack VM, recorded in `docs/benchmarks.md`.
+- [ ] **Durable-only reads** (ADR 0010)
+  - `ReaderConfig::durable_only`: readers return only records covered by the checkpoint marker. `tail` and `export`
+    get `--durable-only`. Crash contract entry with its test.
+- [ ] **Optional live feed recorder** (the M8 stretch goal)
+  - An example that records a public exchange trade feed (Binance, no API key) into a journal with the market-demo
+    schema. Not built by default; CI only builds it and never touches the network.
+
 ## Later (explicitly out of scope for v0.1)
 
 - Replication to other hosts, and networking of any kind.
