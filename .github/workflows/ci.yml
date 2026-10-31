@@ -105,6 +105,8 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
+      - name: Lint the fuzz crate (not a workspace member)
+        run: cargo clippy --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
       - name: Run each target for 60 seconds
         working-directory: fuzz
         run: |
