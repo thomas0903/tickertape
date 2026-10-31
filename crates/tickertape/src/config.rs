@@ -101,9 +101,34 @@ impl Default for Backoff {
 pub struct ReaderConfig {
     /// How to wait for new records.
     pub backoff: Backoff,
+    /// Return only records below the current checkpoint marker's `next_seq`. Default: false.
+    ///
+    /// Without a valid marker, no records are returned. See ADR 0010 (`docs/decisions/0010-durable-only-reads.md` in the
+    /// repository) and crash contract C13 (`docs/crash-contract.md`) for the durability guarantee and storage assumptions.
+    pub durable_only: bool,
 }
 
 impl ReaderConfig {
+    /// Sets whether to return only records covered by a checkpoint. Default: false.
+    ///
+    /// A record is returned only when its sequence number is below the checkpoint marker's `next_seq`.
+    /// A missing or invalid marker covers no records. At the boundary, `try_next` returns `None` without
+    /// consuming the record, and `next_timeout` polls until a checkpoint covers it or the timeout expires.
+    /// If the writer never checkpoints, this reader returns nothing.
+    ///
+    /// See ADR 0010 (`docs/decisions/0010-durable-only-reads.md` in the repository) and crash contract C13
+    /// (`docs/crash-contract.md`), including its storage assumptions. The marker is read from the file, never mapped, and cached until needed.
+    ///
+    /// ```
+    /// use tickertape::ReaderConfig;
+    /// let config = ReaderConfig::default().durable_only(true);
+    /// assert!(config.durable_only);
+    /// ```
+    pub fn durable_only(mut self, on: bool) -> Self {
+        self.durable_only = on;
+        self
+    }
+
     /// Sets the wait strategy.
     pub fn backoff(mut self, backoff: Backoff) -> Self {
         self.backoff = backoff;

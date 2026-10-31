@@ -44,21 +44,14 @@ pub(crate) fn run(args: ExportArgs, stdout: &mut dyn Write) -> Result<()> {
     }
     // Capture the selected committed prefix using only the safe reader. Keep an error so the second pass can
     // emit all records preceding corruption before returning it. Neither pass waits for later appends.
-    let mut snapshot = open(&args)?;
-    let mut count = 0_u64;
-    let terminal = loop {
-        match snapshot.try_next() {
-            Ok(Some(record)) if args.to.is_some_and(|to| record.seq > to) => break None,
-            Ok(Some(record)) => {
-                count += 1;
-                if args.to == Some(record.seq) {
-                    break None;
-                }
-            }
-            Ok(None) => break None,
-            Err(error) => break Some(error),
-        }
+    // Freeze checkpoint coverage before the scan: later checkpoints must not enlarge this export.
+    let end_seq = if args.durable_only {
+        Some(tickertape::inspect::read_checkpoint(&args.dir)?.map_or(0, |c| c.next_seq))
+    } else {
+        None
     };
+    let mut snapshot = open(&args)?;
+    let (count, terminal) = capture(&mut snapshot, args.to, end_seq);
     // Open the input before touching the destination, and reject output paths that alias journal files.
     let mut reader = open(&args)?;
     match args.format {
@@ -86,11 +79,40 @@ pub(crate) fn run(args: ExportArgs, stdout: &mut dyn Write) -> Result<()> {
 }
 
 fn open(args: &ExportArgs) -> Result<Reader> {
-    let mut reader = Reader::open(&args.dir, ReaderConfig::default())?;
+    let mut reader = Reader::open(
+        &args.dir,
+        ReaderConfig::default().durable_only(args.durable_only),
+    )?;
     if let Some(from) = args.from {
         reader.seek(from)?;
     }
     Ok(reader)
+}
+
+/// Capture a prefix without reading past the exclusive startup checkpoint boundary.
+fn capture(
+    reader: &mut Reader,
+    to: Option<u64>,
+    end_seq: Option<u64>,
+) -> (u64, Option<tickertape::Error>) {
+    let mut count = 0;
+    let terminal = loop {
+        if end_seq.is_some_and(|end| reader.position() >= end) {
+            break None;
+        }
+        match reader.try_next() {
+            Ok(Some(record)) if to.is_some_and(|to| record.seq > to) => break None,
+            Ok(Some(record)) => {
+                count += 1;
+                if to == Some(record.seq) {
+                    break None;
+                }
+            }
+            Ok(None) => break None,
+            Err(error) => break Some(error),
+        }
+    };
+    (count, terminal)
 }
 
 /// Emit the captured record count, with optional payload decoding.
@@ -208,6 +230,34 @@ mod tests {
     }
 
     #[test]
+    fn durable_snapshot_keeps_startup_checkpoint_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer =
+            Writer::open(dir.path(), WriterConfig::default().segment_size(65536)).unwrap();
+        let record = NewRecord {
+            schema_id: 1,
+            venue_ts_ns: 0,
+            local_ts_ns: 0,
+            payload: b"record",
+        };
+        writer.append(&record).unwrap();
+        writer.checkpoint().unwrap();
+        let end = tickertape::inspect::read_checkpoint(dir.path())
+            .unwrap()
+            .unwrap()
+            .next_seq;
+        let mut reader =
+            Reader::open(dir.path(), ReaderConfig::default().durable_only(true)).unwrap();
+        writer.append(&record).unwrap();
+        writer.checkpoint().unwrap();
+        let (count, terminal) = capture(&mut reader, None, Some(end));
+        assert_eq!(count, 1);
+        assert!(terminal.is_none());
+        // The reader can see the later checkpoint; only the fixed startup cap excludes it.
+        assert_eq!(reader.next_owned().unwrap().unwrap().seq, 1);
+    }
+
+    #[test]
     fn export_excludes_appends_after_startup_scan() {
         let dir = tempfile::tempdir().unwrap();
         let mut writer =
@@ -233,6 +283,7 @@ mod tests {
                 output: "-".into(),
                 from: None,
                 to: None,
+                durable_only: false,
             },
             &mut sink,
         )

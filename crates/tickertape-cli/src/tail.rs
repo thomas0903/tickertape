@@ -5,7 +5,10 @@ use tickertape::{Error, Reader, ReaderConfig};
 use crate::{Result, TailArgs, TailFormat, output};
 
 pub(crate) fn run(args: TailArgs, out: &mut dyn Write) -> Result<()> {
-    let mut reader = Reader::open(&args.dir, ReaderConfig::default())?;
+    let mut reader = Reader::open(
+        &args.dir,
+        ReaderConfig::default().durable_only(args.durable_only),
+    )?;
     if let Some(seq) = args.from {
         reader.seek(seq)?;
     }

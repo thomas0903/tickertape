@@ -386,3 +386,34 @@ assert con.execute('SELECT max(venue_ts_ns) FROM read_parquet(?)', [sys.argv[1]]
         String::from_utf8_lossy(&result.stderr)
     );
 }
+
+#[test]
+fn durable_only_parquet_export() {
+    let dir = journal(4);
+    let mut writer = Writer::open(dir.path(), WriterConfig::default().segment_size(65536)).unwrap();
+    let dest = TempDir::new().unwrap();
+    let file = dest.path().join("durable.parquet");
+    export(dir.path(), &file, &["--durable-only"]);
+    assert!(rows(&file).is_empty());
+    writer.checkpoint().unwrap();
+    writer
+        .append(&NewRecord {
+            schema_id: 0,
+            venue_ts_ns: 0,
+            local_ts_ns: 0,
+            payload: b"later",
+        })
+        .unwrap();
+    export(dir.path(), &file, &["--durable-only"]);
+    let records = rows(&file);
+    assert_eq!(records.len(), 4);
+    assert_eq!(records.last().unwrap().get_ulong(0).unwrap(), 3);
+    export(
+        dir.path(),
+        &file,
+        &["--durable-only", "--from", "3", "--to", "10"],
+    );
+    assert_eq!(rows(&file).len(), 1);
+    export(dir.path(), &file, &["--durable-only", "--from", "4"]);
+    assert!(rows(&file).is_empty());
+}

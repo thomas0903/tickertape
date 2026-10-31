@@ -52,6 +52,8 @@ pub struct Reader {
     offset: u64,
     /// Sequence number expected at `offset`.
     next_seq: u64,
+    /// Exclusive checkpoint boundary, refreshed only when durable-only reads reach it.
+    durable_next_seq: u64,
     /// Records before this are skipped (set by `seek`).
     skip_until: u64,
     /// `pread` buffer: bytes of `seg` starting at file offset `buf_start`.
@@ -135,6 +137,7 @@ impl Reader {
             seg,
             offset: format::SEGMENT_HEADER_LEN as u64,
             next_seq: *base,
+            durable_next_seq: 0,
             skip_until: *base,
             buf: Vec::new(),
             buf_start: 0,
@@ -178,6 +181,8 @@ impl Reader {
     /// Returns the next record if one is committed, without waiting.
     ///
     /// `Ok(None)` means there is no new record yet. Follows seals into the next segment transparently.
+    /// With [`ReaderConfig::durable_only`] enabled, records wait at the cursor until covered by a checkpoint;
+    /// a missing or invalid checkpoint marker covers no records.
     ///
     /// # Errors
     ///
@@ -194,7 +199,9 @@ impl Reader {
     }
 
     /// Returns the next record, polling with the configured [`Backoff`] until one is committed or
-    /// `timeout` passes (`None`: wait forever). `Ok(None)` means the timeout passed.
+    /// `timeout` passes (`None`: wait forever). `Ok(None)` means the timeout passed. With
+    /// [`ReaderConfig::durable_only`] enabled, also waits for checkpoint coverage, refreshing the marker at most
+    /// once per poll.
     ///
     /// # Errors
     ///
@@ -239,7 +246,17 @@ impl Reader {
 
     /// Finds the next record to return, moving the cursor past it (and past skipped records and seals).
     fn advance(&mut self) -> Result<Option<Found>> {
+        let mut refreshed = false;
         loop {
+            if self.config.durable_only && self.next_seq >= self.durable_next_seq {
+                if !refreshed {
+                    self.refresh_checkpoint()?;
+                    refreshed = true;
+                }
+                if self.next_seq >= self.durable_next_seq {
+                    return Ok(None);
+                }
+            }
             let Some(found) = self.next_slot()? else {
                 return Ok(None);
             };
@@ -247,6 +264,13 @@ impl Reader {
                 return Ok(Some(found));
             }
         }
+    }
+
+    /// Read the marker through ordinary file I/O (never a mapping); invalid or missing means no coverage.
+    fn refresh_checkpoint(&mut self) -> Result<()> {
+        self.durable_next_seq =
+            crate::inspect::read_checkpoint(&self.dir)?.map_or(0, |c| c.next_seq);
+        Ok(())
     }
 
     /// Reads and validates the slot at the cursor, following seals. Returns a record (cursor moved past it), or

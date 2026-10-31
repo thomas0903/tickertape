@@ -141,7 +141,9 @@ creates the journal, before the first segment. Generations start at 1. A checkpo
 The **current checkpoint** is the valid slot (magic, version, CRC, reserved fields zero) with the higher
 `generation`. If neither slot is valid, or the file is missing, there is no checkpoint. A slot is written only after
 everything it describes is durable (see `crash-contract.md` → What `checkpoint()` does), so recovery can trust the
-journal before it. Readers ignore this file.
+journal before it. Readers ignore this file unless `ReaderConfig::durable_only(true)` is enabled: then only records
+with `seq < next_seq` are returned, and a missing or invalid marker covers no records (ADR
+[0010](decisions/0010-durable-only-reads.md), crash contract C13).
 
 ## Publication
 

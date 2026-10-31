@@ -42,5 +42,9 @@ path = "checkpoint.rs"
 name = "slow_reader"
 path = "slow_reader.rs"
 
+[[test]]
+name = "durable_only"
+path = "durable_only.rs"
+
 [lints]
 workspace = true

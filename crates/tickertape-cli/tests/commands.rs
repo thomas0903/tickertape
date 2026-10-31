@@ -69,6 +69,7 @@ fn help_contracts_and_usage_errors() {
                 "--from-end",
                 "--count",
                 "--no-follow",
+                "--durable-only",
                 "--format",
                 "--timeout-secs",
                 "payload_b64",
@@ -90,6 +91,7 @@ fn help_contracts_and_usage_errors() {
                 "padding",
                 "parquet",
                 "--decode",
+                "--durable-only",
                 "market-demo",
                 "message tickertape_record",
                 "required int64 seq (INTEGER(64,false));",
@@ -476,4 +478,74 @@ fn export_rejects_dangling_symlink_into_journal() {
         .assert()
         .code(1);
     assert!(!target.exists());
+}
+
+#[test]
+fn durable_only_tail_and_jsonl_export() {
+    let (dir, mut writer) = journal(4);
+    let commands = [
+        vec!["tail", "--durable-only", "--no-follow", "--format", "json"],
+        vec!["export", "--durable-only", "--format", "jsonl"],
+    ];
+    for args in &commands {
+        assert!(output(args, &dir).is_empty());
+    }
+    writer.checkpoint().unwrap();
+    append(&mut writer, 4);
+    for args in &commands {
+        let records = lines(&output(args, &dir));
+        assert_eq!(records.len(), 4);
+        for (seq, record) in records.iter().enumerate() {
+            check_record(record, seq);
+        }
+    }
+    assert_eq!(
+        lines(&output(
+            &[
+                "tail",
+                "--durable-only",
+                "--format",
+                "json",
+                "--timeout-secs",
+                "0.01"
+            ],
+            &dir
+        ))
+        .len(),
+        4
+    );
+    assert!(
+        output(
+            &[
+                "export",
+                "--durable-only",
+                "--format",
+                "jsonl",
+                "--from",
+                "4"
+            ],
+            &dir
+        )
+        .is_empty()
+    );
+    let range = lines(&output(
+        &[
+            "export",
+            "--durable-only",
+            "--format",
+            "jsonl",
+            "--from",
+            "2",
+            "--to",
+            "10",
+        ],
+        &dir,
+    ));
+    assert_eq!(range.len(), 2);
+    check_record(&range[0], 2);
+    check_record(&range[1], 3);
+    writer.checkpoint().unwrap();
+    for args in &commands {
+        assert_eq!(lines(&output(args, &dir)).len(), 5);
+    }
 }
