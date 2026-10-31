@@ -22,14 +22,14 @@ Linux and macOS. Tick a milestone off here and move on in `status.md`.
 - [x] **M3: Cross-process live tailing** (done 2026-10-31)
   - An integration test spawns one writer and two reader processes. Both readers observe the identical, gap-free
     sequence of at least 1,000,000 records, including across a segment roll. A late reader replays from 0 and catches up.
-- [ ] **M4: Rolling, recovery and crash tests**
+- [x] **M4: Rolling, recovery and crash tests** (done 2026-10-31)
   - Size-based rolling with preallocated segments.
   - Tests: torn final record (restart resumes after the last valid record); malformed lengths and checksums rejected;
     a `kill -9` loop of at least 200 iterations at random points, each followed by open-and-verify with no corruption
     accepted; stale lock after a crash; a slow reader lagging the writer; disk-full and roll failures return clear errors.
   - The fuzz target runs for at least 10 minutes with no crash; the command is in `playbooks/run-fuzzing.md`.
   - The `unsafe` module has been reviewed by a second provider and the findings are addressed.
-- [ ] **M5: CLI**
+- [x] **M5: CLI** (done 2026-10-31)
   - `tail` (follow live), `inspect` (headers, segment list, sequence range), `verify` (full checksum scan, non-zero
     exit on corruption), `export --format jsonl`. Each command has `assert_cmd` tests and `--help` text.
 - [ ] **M6: Parquet export and DuckDB**
