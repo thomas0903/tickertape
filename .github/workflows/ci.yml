@@ -77,6 +77,16 @@ jobs:
       - run: cargo +nightly miri setup
       - run: cargo +nightly miri test -p tickertape --lib format
 
+  loom:
+    name: loom (protocol model)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain || rustup toolchain install
+      - run: cargo test -p tickertape --lib --release --locked protocol_model
+        env:
+          RUSTFLAGS: --cfg loom
+
   fuzz:
     name: fuzz smoke (60 s per target)
     runs-on: ubuntu-latest
