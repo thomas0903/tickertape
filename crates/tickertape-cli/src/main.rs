@@ -56,6 +56,9 @@ struct TailArgs {
     /// Stop at the current committed end instead of waiting for new records
     #[arg(long)]
     no_follow: bool,
+    /// Return only checkpointed records; wait for coverage (no valid checkpoint means no records)
+    #[arg(long)]
+    durable_only: bool,
     /// Text: metadata and first 32 payload bytes as hex; json: record JSONL
     #[arg(long, value_enum, default_value = "text")]
     format: TailFormat,
@@ -98,6 +101,9 @@ struct ExportArgs {
     /// Last sequence number to export, inclusive
     #[arg(long, value_name = "SEQ")]
     to: Option<u64>,
+    /// Export only records below the checkpoint's next_seq captured at startup (both formats; no valid checkpoint means no records)
+    #[arg(long)]
+    durable_only: bool,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]

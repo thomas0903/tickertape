@@ -10,13 +10,16 @@ Errors and recovery warnings go to stderr. JSON results go to stdout (or the sel
 ## Commands
 
 - `tail <DIR> [--from <SEQ> | --from-end] [--count <N>] [--no-follow] [--format text|json]
-  [--timeout-secs <S>]`: default starts at the oldest record and follows forever. `--from` includes SEQ;
+  [--timeout-secs <S>] [--durable-only]`: default starts at the oldest record and follows forever. `--from` includes SEQ;
   `--from-end` skips records observed in a startup scan. `--count 0` writes nothing. `--no-follow` stops when
   the reader reaches the current committed end. `--timeout-secs` accepts a nonnegative decimal number and stops
   after that many idle seconds; it resets after each record. Text shows sequence, schema, timestamps, payload
   length and the first 32 payload bytes as lowercase hex, followed by `…` when truncated. JSON is the record
   JSONL contract below. Each line is flushed for live consumers. After discarded history, tail warns and seeks
   to the sequence reported by the reader.
+  `--durable-only` returns only records below the current checkpoint marker's `next_seq` and waits for later
+  checkpoints using the usual idle timeout. With no valid checkpoint, it returns nothing until one appears;
+  `--no-follow` stops at that boundary and `--from-end` skips the checkpointed prefix observed at startup.
 - `inspect <DIR> [--json]`: checksum scan with per-segment metadata, totals, checkpoint and problems. Text
   displays creation time as RFC 3339 UTC, used bytes and percent. An invalid header has unavailable metadata.
   Missing/invalid checkpoint slots yield `none` in text or `null` in JSON; a checkpoint I/O error fails the command.
@@ -24,7 +27,7 @@ Errors and recovery warnings go to stderr. JSON results go to stdout (or the sel
   return 2 when the scan reports problems. On a live journal the scan describes observations during the scan,
   not an atomic snapshot.
 - `export <DIR> --format jsonl|parquet [--output <FILE>|-] [--from <SEQ>] [--to <SEQ>]
-  [--decode market-demo]`: writes records from the
+  [--decode market-demo] [--durable-only]`: writes records from the
   inclusive range; JSONL defaults to stdout and `--output -` also selects stdout for JSONL. The output file is created or
   truncated, but a path naming an existing journal entry (including via symlinks/hard links), or any path inside
   the journal, is rejected. `--to` must not precede `--from`.
@@ -34,6 +37,10 @@ Errors and recovery warnings go to stderr. JSON results go to stdout (or the sel
   `--output` or `-` returns 1). Parquet uses Snappy compression
   and row groups of at most 100,000 records. On corruption the valid prefix is finalized as a readable file
   before returning 2. Both formats share the startup scan and inclusive range semantics.
+  `--durable-only` additionally caps both formats at the checkpoint marker's exclusive `next_seq` observed before
+  the startup scan, even if the writer checkpoints again during export. With no valid marker the export is empty.
+  Tail and export use the durability guarantee and storage assumptions in [crash contract C13](crash-contract.md)
+  and [ADR 0010](decisions/0010-durable-only-reads.md); if the writer never checkpoints, neither exposes records.
 
 ## Machine-readable contracts
 
