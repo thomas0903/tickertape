@@ -216,11 +216,16 @@ Readers never modify a journal. Only the writer repairs it, on open, after takin
    | Commit word `0`, no such segment | Clean end, or a body the previous writer never committed (no reader ever saw it) | Zero any non-zero bytes in `[P, Z)` in place. This is the end of the chain |
    | Valid seal, successor missing, no segment with a larger `base_seq` | Crash or power loss during a roll | Create the successor (as in "Rolling"). This is the end of the chain |
    | Valid seal, successor missing, a segment with a larger `base_seq` exists | A segment in the middle of the chain is missing (deleted by someone, or lost) | **Refuse** under every policy: tickertape doesn't discard a large part of a journal on its own |
-   | Commit word non-zero, invalid record or seal | Not possible after a writer *process* crash. Power loss, storage corruption or outside modification | `Quarantine` (default): preserve `[P, Z)` in `quarantine/`, then **repair by replacement**: write a copy of `X` with `[P, Z)` zeroed to `X.tmp`, sync it, and `rename` it over `X`. `Fail`: refuse |
+   | Commit word non-zero, invalid record or seal | Not possible after a writer *process* crash. Power loss, storage corruption or outside modification | `Quarantine` (default): preserve `[P, Z)` in `quarantine/`, then **repair by replacement**: write a copy of `X` with `[P, Z)` zeroed to `X.tmp`, sync it, and `rename` it over `X`. `Fail`: refuse (see below) |
 
 5. **Disconnected segments.** Every segment in the recovery domain that the scan did not visit (whatever its
    `base_seq`, including one between visited segments) and every segment in the domain with an invalid header is
    not part of the valid chain. `Quarantine`: preserve it by moving it into `quarantine/`. `Fail`: refuse.
+
+   With `Fail`, a refusal never changes committed bytes and never moves a file. The steps above run in order,
+   though, so clean-ups that come before the corrupt position (removing temporary files, zeroing never-committed
+   bytes, writing a missing seal, creating a missing successor) may already have happened; they are the same ones a
+   writer process crash requires.
    Segments below the recovery domain were covered by an earlier checkpoint; files placed in the directory by other
    means are outside the contract.
 6. **Persist the repairs** before returning: every in-place zeroing, seal and new file is synced, and the journal

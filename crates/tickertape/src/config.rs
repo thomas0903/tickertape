@@ -13,7 +13,11 @@ pub enum RecoveryPolicy {
     /// appending after the last valid record. Nothing is ever deleted. The default.
     #[default]
     Quarantine,
-    /// Return [`Error::Corrupt`](crate::Error::Corrupt) from [`Writer::open`](crate::Writer::open) and change nothing.
+    /// Return [`Error::Corrupt`](crate::Error::Corrupt) from [`Writer::open`](crate::Writer::open) instead of
+    /// quarantining or repairing anything. Committed bytes are never changed and nothing is moved. Recovery may still
+    /// have done the clean-ups it performs before reaching the corrupt position, which a writer *process* crash also
+    /// requires: removing stale `*.tape.tmp` files, zeroing never-committed bytes after a segment's last record,
+    /// writing a missing seal, and creating a missing successor segment (`docs/format.md` → Recovery).
     Fail,
 }
 
