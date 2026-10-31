@@ -63,7 +63,7 @@ Improvements after v0.1.0, requested by the owner. Same rule: done only when eve
 - [x] **Durable-only reads** (ADR 0010; done 2026-10-31)
   - `ReaderConfig::durable_only`: readers return only records covered by the checkpoint marker. `tail` and `export`
     get `--durable-only`. Crash contract entry with its test.
-- [ ] **Optional live feed recorder** (the M8 stretch goal)
+- [x] **Optional live feed recorder** (the M8 stretch goal; ADR 0011; done 2026-10-31)
   - An example that records a public exchange trade feed (Binance, no API key) into a journal with the market-demo
     schema. Not built by default; CI only builds it and never touches the network.
 

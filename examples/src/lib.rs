@@ -8,6 +8,9 @@
 //! | 1 | trade | 32 bytes: `instrument_id u32 @0`, `side u8 @4` (1 buy, 2 sell), 3 zero bytes, `price i64 @8`, `qty i64 @16`, `trade_id u64 @24` |
 //! | 2 | book update | 24 bytes: `instrument_id u32 @0`, `side u8 @4` (1 bid, 2 ask), `action u8 @5` (1 upsert, 2 delete), 2 zero bytes, `price i64 @8`, `qty i64 @16` |
 
+#[cfg(any(feature = "live", test))]
+pub mod live;
+
 /// Schema id of trades.
 pub const TRADE: u32 = 1;
 /// Schema id of order-book updates.
