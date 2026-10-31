@@ -1,7 +1,7 @@
 # 0006: Reader API: safe copying reader, opt-in zero-copy
 
 - **Status:** proposed (M1 approval gate)
-- **Date:** 2026-10-31 (revised after the cross-provider review the same day)
+- **Date:** 2026-10-31 (revised twice after cross-provider reviews the same day)
 
 ## Context
 
@@ -22,8 +22,8 @@ from any sequence number and live tailing without wake-up primitives.
 Option 3. Both constructors return the same lending API: `try_next(&mut self) -> Result<Option<Record<'_>>>`, where
 the record borrows the reader until the next call (so it can't outlive a segment change).
 
-- `Reader::open(dir, config)`: safe. Copies each frame with atomic loads into a buffer the reader reuses, then
-  validates the copy (ADR 0003). Memory-safe whatever other processes do.
+- `Reader::open(dir, config)`: safe. Reads the files with `pread` (in chunks) into a buffer the reader owns and
+  validates the copy (ADR 0003). Memory-safe whatever other processes do, and immune to `SIGBUS`.
 - `unsafe Reader::open_mapped(dir, config)`: zero-copy. The payload slice points into the read-only mapping. Safety
   precondition: while the reader exists, no process other than a tickertape writer modifies the journal's segment
   files. A tickertape writer never modifies committed bytes (ADR 0007 repairs by replacing files).
@@ -35,8 +35,9 @@ Positioning and waiting:
 - `try_next` never blocks: `Ok(None)` means no new record yet. `next_timeout` polls with the configured `Backoff`
   (spin, yield, then sleep with exponential growth up to a cap) until a record arrives or the timeout passes.
 - Every record is validated (length, CRC, sequence) before it is returned. An invalid record is returned as
-  `Error::Corrupt` and the reader doesn't advance. Readers detect segment files replaced or removed by recovery
-  (`format.md` → What readers do about repairs).
+  `Error::Corrupt` and the reader doesn't advance. A reader that detects its segment file was replaced or removed by
+  recovery returns `Error::Discarded` and never continues at its old offset; the application calls `seek`, which only
+  lands on positions validated along the current chain (`format.md` → What readers do about repairs).
 
 ## Consequences
 

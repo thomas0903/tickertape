@@ -1,7 +1,7 @@
 # 0003: Publication protocol and access to mapped memory
 
 - **Status:** proposed (M1 approval gate)
-- **Date:** 2026-10-31 (revised after the cross-provider review the same day)
+- **Date:** 2026-10-31 (revised twice after cross-provider reviews the same day)
 
 ## Context
 
@@ -29,22 +29,28 @@ the same mechanism, published only after the next segment file exists, so reader
   covers exactly `[P+4, P+len)` (bytes no reader reads until the commit), and stores commit words through
   `AtomicU32::from_ptr` (valid: the memory is writable) with `Ordering::Release`. It never creates a reference that
   covers a commit word other processes may be loading, and never a whole-segment slice while readers may be active.
-- **Readers** map segments `PROT_READ`, `MAP_SHARED` (read-only file handle, so readers work without write
-  permission). They load a commit word with `Ordering::Relaxed` through a `&AtomicU32` made by casting the pointer,
-  then issue `atomic::fence(Ordering::Acquire)` if it is non-zero. Rust documents 4- and 8-byte `Relaxed` atomic loads
-  as permitted on read-only memory on x86-64 and aarch64 ("Atomic accesses to read-only memory" in `std::sync::atomic`,
-  present at our MSRV 1.85); `Acquire` loads are not, which is why the ordering comes from the fence. A relaxed load
-  that reads the value of a release store, followed by an acquire fence, synchronises with that store.
-- The **safe reader** (`Reader::open`) then copies the frame `[P, P + align8(len))` into its own buffer with
-  `Relaxed` 8-byte atomic loads (records are 8-aligned) and validates the copy. It never creates a reference into the
-  mapping, so other processes can't make it unsound.
-- The **zero-copy reader** (`unsafe Reader::open_mapped`) validates the body and hands out a `&[u8]` covering exactly
+- The **safe reader** (`Reader::open`) doesn't map anything. It reads the file with `pread` into a buffer it owns,
+  normally a chunk of many records at once. From Rust's point of view `pread` is an opaque system call that fills
+  our buffer, so no behaviour of other processes can make this reader unsound. To see a committed body, it relies on
+  ordering: it reads the commit word, issues `atomic::fence(Ordering::Acquire)` (a hardware barrier: `dmb ish` on
+  aarch64, which orders this thread's later loads, including those the kernel performs in the next `pread`), and only
+  then trusts body bytes read after the fence. Within a chunk, a record's body may have been copied before its commit
+  word; such a record fails its CRC, so the reader re-reads from that position before ever reporting corruption, and
+  reports `Error::Corrupt` only if the commit word is unchanged and the CRC still fails on a re-read after the fence.
+- The **zero-copy reader** (`unsafe Reader::open_mapped`) maps segments `PROT_READ`, `MAP_SHARED` (a read-only file
+  handle, so it works without write permission). It loads a commit word with `Ordering::Relaxed` through a
+  `&AtomicU32` made by casting the pointer (not `from_ptr`, which requires writable memory), then issues
+  `atomic::fence(Ordering::Acquire)` if the word is non-zero. Rust documents 4- and 8-byte `Relaxed` atomic loads as
+  permitted on read-only memory on x86-64 and aarch64 ("Atomic accesses to read-only memory" in `std::sync::atomic`,
+  present at our MSRV 1.85); `Acquire` loads are not, which is why the ordering comes from the fence. It checks bounds
+  from the commit word before touching the body, then validates the body and hands out a `&[u8]` covering exactly
   the body. This is sound only while nobody modifies committed bytes, which is the caller's stated precondition
   (ADR 0006). The writer never modifies committed bytes: abandoned writes are zeroed before any later commit, and
   repairs of corrupt data replace the file instead of editing it (ADR 0007).
 - **Pure format code** works on precisely bounded slices: a record body, a seal CRC, a header. Whole-segment
-  functions (scanning, fuzzing, Miri) take a `SegmentView` trait, implemented both by an in-memory image and by the
-  mapping wrapper, so they never require a slice over live memory.
+  functions (scanning, fuzzing, Miri) take a `SegmentView` trait whose methods are safe for every input
+  (bounds-checked, returning `None` when out of range). Its implementations are an in-memory image, the `pread`
+  reader (copies), and the writer's own mapping, which only the lock holder can construct (crate-private).
 
 **Cross-process assumption.** The Rust memory model formally describes threads in one process. We rely on the
 platform behaviour that atomic operations on the same naturally aligned location of a `MAP_SHARED` file mapping
@@ -53,7 +59,10 @@ where both mappings refer to the same physical page; it is what shared-memory IP
 
 ## Consequences
 
-- The safe reader pays one copy per record into a reused buffer; zero-copy is opt-in and `unsafe`.
+- The safe reader pays a copy per record and a system call per chunk; zero-copy is opt-in and `unsafe`.
+- The writer's API is safe. Its mappings could be modified by an outside process; Rust's standard library treats such
+  outside entities as beyond its safety guarantees (`std::os::unix::io`, "`/proc/self/mem` and similar OS
+  features"), and the crash contract documents the precondition.
 - No reader registration and no back-pressure: readers can't slow the writer; the writer can't see how far behind
   readers are. Readers busy-poll or back off (ADR 0006).
 - A `loom` model of the protocol (one writer, one reader, a few slots) is planned in M2 if it fits; the kill-loop and

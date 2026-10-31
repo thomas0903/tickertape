@@ -116,8 +116,14 @@ at offset 64 of `{S:020}.tape`; an invalid seal is corruption.
 
 ## Checkpoint marker
 
-`checkpoint` is an 8,192-byte file with two 64-byte **slots**, at offsets 0 and 4,096 (separate 4 KiB blocks, so that
-a torn write of one slot cannot damage the other). All other bytes are zero.
+`checkpoint` is a 131,072-byte file with two 64-byte **slots**, at offsets 0 and 65,536. All other bytes are zero.
+The slots are 64 KiB apart so that they fall in different filesystem blocks for every block size up to 64 KiB (the
+ext4 maximum), and a torn write of one slot is unlikely to damage the other; this assumes the storage's failure unit
+is no larger than that. If both slots are damaged anyway, recovery falls back to a full scan (tested).
+
+The writer creates the file (all zeros, so neither slot is valid), syncs it, and syncs the journal directory when it
+creates the journal, before the first segment. Generations start at 1. A checkpoint that would need generation
+`u64::MAX` fails.
 
 | Offset in slot | Size | Field | Value |
 |---|---|---|---|
@@ -144,8 +150,9 @@ The writer appends a record at `P` in this order:
    already zero (an invariant the writer maintains; see "Abandoned writes").
 2. **Release-store** `len` into the commit word at `P`.
 
-A reader at `P` loads the commit word with acquire semantics. `0` means "nothing yet". Any other value means the body
-is visible, so the reader validates and reads it. Committed bytes are never modified by a correctly working writer.
+A reader at `P` observes the commit word first and the body only afterwards, ordered as described in ADR 0003 (an
+acquire load from the mapping, or a `pread` followed by an acquire fence). `0` means "nothing yet". Any other value
+means the body is visible, so the reader reads and validates it. Committed bytes are never modified by a correctly working writer.
 
 A seal is published the same way (`seal_crc` first, then a release store of `0xFFFFFFFF`), and only after the next
 segment file is fully created and in place. This orders *visibility* between processes on the same host. It says
@@ -164,60 +171,86 @@ When the next record doesn't fit in the current segment's record area, the write
 
 1. If the current segment holds no record, the append fails with `RecordTooLarge` (rolling would need the same file
    name). This only happens when the configured segment size was raised since the segment was created.
-2. Create `{next_seq:020}.tape.tmp` (`O_CREAT | O_TRUNC`, so a retry reinitialises it), preallocate it to
-   `segment_size` (Linux: `fallocate`; macOS: `fcntl(F_PREALLOCATE)` then `ftruncate`), write the segment header with
-   `pwrite`, and `fdatasync` it.
+2. Remove any existing `{next_seq:020}.tape.tmp` name (`unlink`; it may be a leftover hard link to an already
+   published segment, which is unaffected), then create it with `O_CREAT | O_EXCL`, preallocate it to `segment_size`
+   (Linux: `fallocate`; macOS: `fcntl(F_PREALLOCATE)` then `ftruncate`), write the segment header with `pwrite`, and
+   `fdatasync` it. A temporary file is never truncated or reopened, so a published inode can't be damaged through it.
 3. Publish it under its final name **without replacing anything**: `link` the temporary file to
-   `{next_seq:020}.tape` (which fails if that name exists), then `unlink` the temporary name.
+   `{next_seq:020}.tape`, which fails if that name exists. **A successful `link` is the publication point.** Then
+   `unlink` the temporary name; if that fails, the leftover name is ignored (it is removed at the next open).
 4. Write the seal into the old segment at `P`.
 5. Append the record at offset 64 of the new segment.
 
-If step 2 or 3 fails (for example, the disk is full), the writer removes the temporary file, the append returns an
-error, the old segment stays unsealed and usable, and the next append retries the roll. A record larger than the
+If step 2 fails, or `link` fails (for example, the disk is full), the writer removes the temporary file, the append
+returns an error, the old segment stays unsealed and usable, and the next append retries the roll. After a successful
+`link` the roll always continues with steps 4 and 5; it is never retried from step 2. A record larger than the
 maximum payload for the configured segment size fails with `RecordTooLarge` without rolling.
 
 ## Recovery (writer open)
 
 Readers never modify a journal. Only the writer repairs it, on open, after taking the lock and before appending.
 
-1. **Remove stale temporary files** (`*.tape.tmp`). They were never segments.
-2. **Find the scan start.** With a current checkpoint, start at its (`segment_base_seq`, `offset`), expecting
-   `next_seq`; everything before is trusted. Without one, or if that segment is missing, start at offset 64 of the
-   oldest segment, expecting its `base_seq`.
-3. **Scan forward** through the chain, validating every record and seal: within a segment, record by record; at a
-   valid seal, into the segment named by the seal's sequence number. The scan stops at the first position `P` (in
-   segment `X`) that is not a valid record or a valid seal with an existing successor.
+1. **Remove stale temporary files** (`*.tape.tmp`). They are never segments (at most a second name for a published
+   one).
+2. **Find the scan start.** With a current checkpoint (see "Checkpoint marker"): its segment must exist and
+   its `offset` must be a multiple of 8 in `[64, segment_size - 8]`; otherwise the journal is **refused** with a
+   corruption error under every policy, because the history the marker vouches for is missing and recreating that
+   segment could make the stale marker look valid again. Recovery then starts there, expecting `next_seq`, and
+   trusts everything before. Without a current checkpoint, it starts at offset 64 of the oldest segment, expecting
+   that segment's `base_seq`. The **recovery domain** is the start segment and every segment with a larger
+   `base_seq`.
+3. **Scan forward** through the chain, validating every record and seal: record by record within a segment; at a
+   valid seal, into the segment it names. The scan stops at the first position `P` (in segment `X`, of size `Z`)
+   that is not a valid record and not a valid seal whose successor exists.
 4. **Classify what is at `P`:**
 
    | At `P` | Meaning | Action |
    |---|---|---|
-   | Commit word `0` | Clean end, or a body the previous writer never committed (no reader ever saw it) | Zero any non-zero bytes in `[P, Z)` in place, and sync them |
-   | Valid seal, successor missing | Crash or power loss during a roll | Create the successor (as in "Rolling"), continue in it |
-   | Commit word non-zero, invalid record or seal | Not possible after a writer *process* crash. Indicates power loss, storage corruption or outside modification | Policy `Quarantine` (default): copy `[P, Z)` to `quarantine/`, then **repair by replacement**: write a copy of `X` with `[P, Z)` zeroed to `X.tmp`, sync it, and `rename` it over `X`. Policy `Fail`: return a corruption error and change nothing |
+   | Commit word `0`, and a segment named `{next_seq:020}.tape` exists | The previous writer died between publishing the next segment and sealing this one | Zero any non-zero bytes in `[P, Z)` in place, write the seal, and continue scanning in that segment (step 3) |
+   | Commit word `0`, no such segment | Clean end, or a body the previous writer never committed (no reader ever saw it) | Zero any non-zero bytes in `[P, Z)` in place. This is the end of the chain |
+   | Valid seal, successor missing, no segment with a larger `base_seq` | Crash or power loss during a roll | Create the successor (as in "Rolling"). This is the end of the chain |
+   | Valid seal, successor missing, a segment with a larger `base_seq` exists | A segment in the middle of the chain is missing (deleted by someone, or lost) | **Refuse** under every policy: tickertape doesn't discard a large part of a journal on its own |
+   | Commit word non-zero, invalid record or seal | Not possible after a writer *process* crash. Power loss, storage corruption or outside modification | `Quarantine` (default): preserve `[P, Z)` in `quarantine/`, then **repair by replacement**: write a copy of `X` with `[P, Z)` zeroed to `X.tmp`, sync it, and `rename` it over `X`. `Fail`: refuse |
 
-5. **Check the rest of the directory.** If the scan ended in `X` with commit word `0` and a segment named
-   `{next_seq:020}.tape` exists, the previous writer crashed between steps 3 and 4 of a roll: seal `X` at `P`, then
-   continue scanning in that segment (back to step 3). Any *other* segment with `base_seq` greater than `X`'s is
-   disconnected from the valid chain (power loss or corruption): with `Quarantine`, move each into `quarantine/`
-   (rename); with `Fail`, return an error. A segment whose header is invalid is treated the same way.
-6. **Persist the repairs.** Every in-place zeroing, seal and new file is synced, and the journal directory (and
-   `quarantine/`) is synced after any create, rename or link, before the first new record is published.
+5. **Disconnected segments.** Every segment in the recovery domain that the scan did not visit (whatever its
+   `base_seq`, including one between visited segments) and every segment in the domain with an invalid header is
+   not part of the valid chain. `Quarantine`: preserve it by moving it into `quarantine/`. `Fail`: refuse.
+   Segments below the recovery domain were covered by an earlier checkpoint; files placed in the directory by other
+   means are outside the contract.
+6. **Persist the repairs** before returning: every in-place zeroing, seal and new file is synced, and the journal
+   directory (and `quarantine/`) is synced after any create, rename or link, with the platform barrier
+   (`crash-contract.md` → What `checkpoint()` does, steps 1–3).
 
-Quarantine files are created with exclusive create (never replacing a file) under a unique name
-`{base_seq:020}-{offset:012}-{unix_ns}.bin`, written as `….bin.partial`, synced, renamed to `.bin`, and the directory
-synced, before any destructive step. A `.partial` file left by an interrupted recovery is kept as evidence; the repair
-is simply redone.
+**Preserving data in `quarantine/`.** Before any destructive step (zeroing committed bytes, replacing or moving a
+segment), and aborting the repair with an error if any step fails:
 
-Every action is reported in the writer's `RecoveryReport`. Records before `P` are never modified. Recovery time is
-proportional to the data written since the last checkpoint.
+1. If `quarantine/` doesn't exist: create it, then sync the journal directory.
+2. Bytes: write them to a new file `….partial` created with `O_EXCL`, sync it, then publish it with `link` to
+   `{base_seq:020}-{offset:012}-{unix_ns}-{n}.bin` (`n` = 0, 1, … until a name is free; `link` never replaces), unlink
+   the `.partial` name, and sync `quarantine/`.
+   Whole segments: sync the segment file's data, then `link` it to a free name in `quarantine/` (as above), unlink
+   its old name, and sync both directories.
+3. Apply the platform barrier (macOS: `F_FULLFSYNC`).
+
+An interrupted recovery leaves either the original or the preserved copy (or both); the next open redoes the
+repair. Leftover `.partial` files are kept as evidence. Records before `P` are never modified.
+
+Every action is reported in the writer's `RecoveryReport`. Recovery work is: listing the directory; reading every
+record after the scan start (the data written since the last checkpoint); reading `[P, Z)` of the last segment to find
+non-zero bytes; and, only for repairs, copying the affected segment or tail.
 
 ### What readers do about repairs
 
-A repair replaces a segment file (new inode) or moves it into `quarantine/`. A reader that gets a validation error,
-or has been waiting at an empty slot for 100 ms or more, checks whether its segment's path still names the file it
-has mapped (same device and inode). If the path names a different file, the reader maps the new one and retries at
-the same offset; the bytes before that offset are identical. If the path no longer exists, the records from the
-reader's position on were discarded by recovery, and the reader returns an error saying so.
+A repair replaces a segment file with a new inode, or moves it into `quarantine/`. A reader checks that its
+segment's path still names the file it has open (same device and inode) when it gets a validation error, when it has
+waited at an empty slot for 100 ms or more, and before it follows a seal into the next segment. If the path names a
+different file or no file, the reader returns `Error::Discarded` and doesn't advance; it never continues at its old
+offset in the new file, because offsets after the repair point don't line up. The application calls `seek` to
+continue: `seek` scans the current chain from the start of a segment, so it only lands on validated positions.
+
+Until it checks, a reader may return records from a segment that recovery has just preserved and removed. Such
+records are like records lost to a power loss that a reader had already seen (`crash-contract.md` → C8). A reader
+never moves from a removed history into the repaired one without returning `Error::Discarded`.
 
 ## Versioning
 

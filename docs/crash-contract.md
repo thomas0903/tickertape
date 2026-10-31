@@ -35,6 +35,9 @@ checkpoint marker as dirty, including records an earlier writer appended but nev
 | 3. Barrier | (the `fdatasync`/`fsync` calls above already flush the device cache on filesystems mounted with barriers, the default) | `fcntl(F_FULLFSYNC)` on the last dirty segment, after all of the above. It asks the drive to flush its whole write cache, which covers the earlier writes and directory updates too |
 | 4. Marker | Write the next `checkpoint` slot with `pwrite`, then `fdatasync` it | Write the next `checkpoint` slot with `pwrite`, then `fcntl(F_FULLFSYNC)` on it |
 
+The marker file itself is created, synced, and its directory entry synced when the journal is created, so step 4
+only ever overwrites a slot in an existing file.
+
 The marker is written only after steps 1–3 succeed, so it never points past data that isn't durable. On macOS,
 plain `fsync` does not flush the drive's write cache; `F_FULLFSYNC` does, and is much slower. tickertape always uses
 it, and if it isn't supported (`ENOTSUP`), `checkpoint()` fails rather than claiming less.
@@ -53,8 +56,9 @@ The durable level holds only if: (a) the filesystem and drive honour the sync ca
 same block*. Records are small and packed, so a checkpointed record often shares a block with records appended
 after the checkpoint. Drives with power-loss protection, and filesystems with copy-on-write data blocks
 (btrfs, APFS), avoid in-place rewrites of durable blocks; ext4 and xfs in their default modes rewrite blocks in place
-and rely on the drive's sector-write atomicity. If (b) fails, recovery detects the damage by checksum and quarantines
-it (C11), but the checkpointed records in that block are lost.
+and rely on the drive's sector-write atomicity. If (b) fails, the checkpointed records in that block are lost.
+Recovery does not re-read data before the checkpoint marker, so it won't necessarily notice; readers and
+`tickertape verify` detect the damage by checksum when they reach it (C11).
 
 ## Guarantees by failure
 
@@ -76,26 +80,34 @@ committed.
 | C11 | Corrupted bytes in a segment (storage error, outside modification) | Readers and `verify` detect corruption that breaks the CRC32C, length, sequence or chain checks and report it with the file and offset; they never return a record that fails validation. The writer quarantines (or, with `RecoveryPolicy::Fail`, refuses) a corrupt tail; it repairs by writing a new file, never by changing bytes a reader may have mapped | Linux, macOS | `tests/recovery.rs::malformed_*` and fuzzing (M2, M4) — **not yet written** |
 | C12 | A checkpoint fails | The error is returned and the writer stays poisoned (`Error::DurabilityLost` on later checkpoints). See "Errors are sticky" | Linux, macOS | `tests/checkpoint.rs::poisoned_after_failure` (M4, injected error) — **not yet written** |
 
-## Readers and memory safety
+## Readers, the writer and memory safety
 
-- **`Reader::open` (safe, the default)** copies each record out of the mapping with atomic loads before validating
-  it, into a buffer the reader reuses. It is memory-safe whatever other processes do to the files; at worst it
-  reports corruption (or dies from `SIGBUS`, below).
+- **`Reader::open` (safe, the default)** doesn't map the files. It reads them with `pread` into a buffer it owns and
+  validates the copy, so it is memory-safe whatever other processes do to the files, and it can't receive `SIGBUS`.
+  At worst it reports corruption.
 - **`Reader::open_mapped` (`unsafe`, zero-copy)** hands out `&[u8]` slices pointing into the shared mapping. The caller
   promises that no process other than a tickertape writer modifies the journal's segment files while the reader
-  exists. A correct writer never modifies committed bytes, and repairs by writing new files, so this holds in normal
+  exists. A correct writer never modifies committed bytes and repairs by writing new files, so this holds in normal
   operation, including writer crashes and recovery.
+- **The writer** maps the segments it writes. Its API is safe, following the Rust standard library's position that
+  its safety guarantees "only cover what the program itself can do, and not what entities outside the program can
+  do to it" (`std::os::unix::io`, on `/proc/self/mem`). Another process writing into or truncating the files the
+  writer has mapped is such an outside entity, and can crash or corrupt the writer process.
 
 ## Known risks and limits
 
-- **SIGBUS.** Readers and the writer access segments through memory maps. If a segment file is truncated by another
-  process, or the storage returns an I/O error on a page fault, the process receives `SIGBUS` and dies. tickertape
-  does not catch it. Don't truncate or edit segment files while the journal is in use.
+- **SIGBUS.** The writer and `open_mapped` readers access segments through memory maps. If a segment file is
+  truncated by another process, or the storage returns an I/O error on a page fault, the process receives `SIGBUS`
+  and dies. tickertape does not catch it. Don't truncate or edit segment files while the journal is in use.
 - **Copy-on-write filesystems** (btrfs, APFS). Preallocation reserves space, but copy-on-write may still need new
   blocks on the first write into a block. `TODO(verify)`: whether a full btrfs or APFS volume can make writes into a
   preallocated segment fail, and how that surfaces (SIGBUS) — measure in M4.
-- **Readers after a repair.** A reader positioned inside a segment that recovery moved to `quarantine/` notices it
-  within about 100 ms of waiting and returns an error; it never silently follows a different history.
+- **Readers after a repair.** A reader whose segment recovery replaced or moved to `quarantine/` returns
+  `Error::Discarded` once it notices (on a validation error, after 100 ms of waiting, or at the next segment
+  boundary); it never silently continues into the repaired history. Until then it may return records that recovery
+  removed, like records lost to a power loss.
+- **Missing segments.** If the checkpoint marker's segment, or a segment in the middle of the chain, is missing,
+  the writer refuses to open (under every recovery policy) rather than discard history on its own.
 - **CRC32C** detects all burst errors up to 32 bits and most other corruption, not all of it. It is not a
   cryptographic integrity check.
 - **Clocks.** Timestamps are caller-supplied data. tickertape never orders or validates by timestamp.

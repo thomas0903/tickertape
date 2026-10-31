@@ -11,6 +11,10 @@ use crate::record::NewRecord;
 /// Holds an exclusive `flock` on `writer.lock` for as long as it lives; the OS releases it when the process exits
 /// or dies, so a crashed writer never leaves a stale lock. `Writer` is `Send` but not `Sync`: appends take `&mut self`.
 ///
+/// The writer maps the segments it writes. Another process writing into or truncating those files is outside the
+/// contract and can crash or corrupt this process (see `docs/crash-contract.md` → Readers, the writer and memory
+/// safety).
+///
 /// Dropping a writer does **not** checkpoint. Everything appended stays visible and survives the process exiting,
 /// but is durable only after [`Writer::checkpoint`]. See `docs/crash-contract.md`.
 #[derive(Debug)]

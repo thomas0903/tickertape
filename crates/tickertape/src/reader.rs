@@ -13,8 +13,8 @@ use crate::record::{OwnedRecord, Record};
 /// run at once. Each record is validated (length, CRC32C, sequence number) before it is returned.
 ///
 /// There are two ways to open one (ADR 0006):
-/// - [`Reader::open`] (safe): each record is copied out of the mapping, with atomic loads, into a buffer the reader
-///   reuses, and validated there. Memory-safe whatever other processes do to the files.
+/// - [`Reader::open`] (safe): reads the files with `pread` into a buffer the reader owns, and validates each record
+///   there. Memory-safe whatever other processes do to the files, and never receives `SIGBUS`.
 /// - [`Reader::open_mapped`] (`unsafe`, zero-copy): payloads point straight into the mapping.
 ///
 /// `Reader` doesn't implement [`Iterator`], because returned records borrow from the reader. Loop with `while let`:
@@ -55,8 +55,8 @@ impl Reader {
     /// While the returned reader exists, no process other than a tickertape [`Writer`](crate::Writer) may modify
     /// the journal's segment files (writing into them, truncating them, or replacing their contents through other
     /// tools). A tickertape writer never modifies bytes after committing them, including during crash recovery,
-    /// which repairs by replacing files (`docs/format.md` → Recovery). Truncation by another process makes the
-    /// process receive `SIGBUS` even with [`Reader::open`].
+    /// which repairs by replacing files (`docs/format.md` → Recovery). If a mapped file is truncated, the process
+    /// receives `SIGBUS`.
     ///
     /// # Errors
     ///
@@ -88,7 +88,8 @@ impl Reader {
     ///
     /// [`Error::Corrupt`](crate::Error::Corrupt) if the bytes at the cursor fail validation. The cursor doesn't move,
     /// so calling again retries the same position (which may succeed after a writer recovery).
-    /// [`Error::Discarded`](crate::Error::Discarded) if writer recovery removed the segment at the cursor.
+    /// [`Error::Discarded`](crate::Error::Discarded) if writer recovery replaced or removed the segment at the cursor;
+    /// call [`Reader::seek`] to continue on the current chain.
     /// [`Error::Io`](crate::Error::Io) if the next segment can't be opened.
     pub fn try_next(&mut self) -> Result<Option<Record<'_>>> {
         todo!("M2")

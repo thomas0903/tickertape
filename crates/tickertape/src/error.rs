@@ -90,9 +90,10 @@ pub enum Error {
     #[error("sequence numbers exhausted")]
     SequenceExhausted,
 
-    /// Writer recovery discarded records from this sequence number on (after a power loss or corruption), so the
-    /// reader's position no longer exists. Seek to a current position to continue.
-    #[error("records from sequence {seq} were discarded by writer recovery")]
+    /// Writer recovery replaced or removed the segment at the reader's position (after a power loss or corruption),
+    /// so records from this sequence number on may belong to a discarded history. Call
+    /// [`Reader::seek`](crate::Reader::seek) to continue on the current chain.
+    #[error("the segment at sequence {seq} was replaced or removed by writer recovery")]
     Discarded {
         /// The reader's position when it noticed.
         seq: u64,
@@ -158,7 +159,10 @@ pub enum CorruptReason {
     /// A seal's checksum doesn't match the expected next sequence number.
     #[error("invalid seal")]
     BadSeal,
-    /// A sealed segment's successor is missing, or doesn't start where the seal says.
+    /// A sealed segment's successor is missing while later segments exist, or doesn't start where the seal says.
     #[error("next segment {0} missing or inconsistent")]
     BrokenChain(u64),
+    /// The checkpoint marker points to a segment that doesn't exist, or to an impossible offset.
+    #[error("checkpoint marker points to missing segment {0} or an invalid offset")]
+    DanglingCheckpoint(u64),
 }

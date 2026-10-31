@@ -40,9 +40,9 @@ pub const MAX_SEGMENT_SIZE: u64 = 1 << 40;
 /// File name extension of segments.
 pub const SEGMENT_EXTENSION: &str = "tape";
 /// Size of the checkpoint marker file.
-pub const CHECKPOINT_FILE_LEN: usize = 8192;
-/// Offsets of the two checkpoint slots.
-pub const CHECKPOINT_SLOT_OFFSETS: [usize; 2] = [0, 4096];
+pub const CHECKPOINT_FILE_LEN: usize = 131_072;
+/// Offsets of the two checkpoint slots (64 KiB apart: different filesystem blocks for block sizes up to 64 KiB).
+pub const CHECKPOINT_SLOT_OFFSETS: [usize; 2] = [0, 65_536];
 /// Length of one checkpoint slot.
 pub const CHECKPOINT_SLOT_LEN: usize = 64;
 
@@ -185,10 +185,14 @@ pub fn decode_checkpoint(file: &[u8]) -> Option<CheckpointSlot> {
     todo!("M2")
 }
 
-/// Read access to one segment, implemented by an in-memory image (`[u8]`) and by the crate's mapping wrapper.
+/// Read access to one segment: an in-memory image (`[u8]`), the `pread`-based reader (which copies), or the
+/// writer's own mapping (crate-private, constructible only while holding the writer lock).
 ///
-/// Implementations for live mappings load commit words atomically and copy (or, for a writer that holds the lock,
-/// borrow) only bounded ranges, so the scanning code below never needs a slice over a live segment.
+/// Every method is safe for every argument: out-of-range or misaligned requests return `None`. Implementations must
+/// order reads so that bytes passed to `with_bytes` after a non-zero `commit_word` at the same record reflect at
+/// least everything written before that commit word was stored (ADR 0003). Implementations over live shared memory
+/// never hand out slices that another process may still write; they copy, unless (as for the writer) no other
+/// process writes the file.
 pub trait SegmentView {
     /// Total size in bytes.
     fn len(&self) -> u64;
@@ -196,10 +200,11 @@ pub trait SegmentView {
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
-    /// The commit word at `offset` (a multiple of 8, `offset + 4 <= len`), loaded with acquire semantics.
-    fn commit_word(&self, offset: u64) -> u32;
-    /// Calls `f` with the bytes `[offset, offset + len)`, which the caller guarantees are committed (immutable).
-    fn with_bytes<R>(&self, offset: u64, len: u64, f: impl FnOnce(&[u8]) -> R) -> R;
+    /// The commit word at `offset`, with acquire semantics. `None` unless `offset` is a multiple of 8 and
+    /// `offset + 4 <= len`.
+    fn commit_word(&self, offset: u64) -> Option<u32>;
+    /// Calls `f` with the bytes `[offset, offset + len)`. `None` if the range is out of bounds.
+    fn with_bytes<R>(&self, offset: u64, len: u64, f: impl FnOnce(&[u8]) -> R) -> Option<R>;
 }
 
 impl SegmentView for [u8] {
@@ -207,12 +212,12 @@ impl SegmentView for [u8] {
         <[u8]>::len(self) as u64
     }
 
-    fn commit_word(&self, offset: u64) -> u32 {
+    fn commit_word(&self, offset: u64) -> Option<u32> {
         let _ = offset;
         todo!("M2")
     }
 
-    fn with_bytes<R>(&self, offset: u64, len: u64, f: impl FnOnce(&[u8]) -> R) -> R {
+    fn with_bytes<R>(&self, offset: u64, len: u64, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
         let _ = (offset, len, f);
         todo!("M2")
     }
