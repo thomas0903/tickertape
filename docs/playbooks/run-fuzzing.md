@@ -30,6 +30,13 @@ cargo +nightly fuzz run decode_record -- -max_total_time=600
 Seed inputs are in `fuzz/seeds/<target>/` (committed). The working corpus (`fuzz/corpus/`) and crash artifacts
 (`fuzz/artifacts/`) are gitignored. Start a run with seeds: `cargo +nightly fuzz run parse_segment fuzz/corpus/parse_segment fuzz/seeds/parse_segment`.
 
+## Recorded runs
+
+| Date | Target | Commit | Machine | Duration | Executions | Result |
+|---|---|---|---|---|---|---|
+| 2026-10-31 | `parse_segment` | `96d23e0` | owner's Mac (Apple M4 Pro, macOS 27) | 601 s | 179,748,260 | no crash |
+| 2026-10-31 | `decode_record` | `96d23e0` | owner's Mac (Apple M4 Pro, macOS 27) | 601 s | 109,819,500 | no crash |
+
 ## When it finds a crash
 
 1. Minimise it: `cargo +nightly fuzz tmin parse_segment fuzz/artifacts/parse_segment/<crash-file>`.
