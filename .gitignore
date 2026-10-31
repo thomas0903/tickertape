@@ -1,0 +1,32 @@
+# OS / editors
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Secrets and local credentials
+.env
+.env.*
+!.env.example
+.mcp.json
+
+# Agent-local settings
+.claude/settings.local.json
+
+# Rust
+target/
+
+# Fuzzing: working corpus and crash artifacts stay local; seeds are committed
+fuzz/target/
+fuzz/corpus/
+fuzz/artifacts/
+fuzz/coverage/
+
+# Local journals and benchmark output
+*.ttseg
+/journals/
+/bench-results/
+
+# Python (DuckDB checks, examples)
+__pycache__/
+.venv/

@@ -1,0 +1,23 @@
+[package]
+name = "tickertape-cli"
+description = "Command-line tool to tail, inspect, verify and export tickertape journals"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme = "README.md"
+keywords = ["journal", "mmap", "event-log", "trading", "cli"]
+categories = ["command-line-utilities", "finance"]
+
+[[bin]]
+name = "tickertape"
+path = "src/main.rs"
+
+[dependencies]
+tickertape.workspace = true
+
+[lints]
+workspace = true

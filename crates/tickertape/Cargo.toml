@@ -1,0 +1,18 @@
+[package]
+name = "tickertape"
+description = "A local, append-only event journal on memory-mapped segment files, with live cross-process readers and replay"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme = "README.md"
+keywords = ["journal", "mmap", "event-log", "trading", "ipc"]
+categories = ["database-implementations", "filesystem", "finance"]
+
+[dependencies]
+
+[lints]
+workspace = true
