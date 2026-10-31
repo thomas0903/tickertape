@@ -5,6 +5,10 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## Unreleased
 
+- Library: `ReaderConfig::durable_only(true)` waits for checkpoint coverage before returning records (ADR 0010, C13).
+- CLI: `tail --durable-only` and `export --durable-only` (JSONL and Parquet); export caps its snapshot at the
+  checkpoint observed at startup.
+
 ## [0.1.0] - 2026-10-31
 
 First release. Not yet published to crates.io.
