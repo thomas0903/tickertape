@@ -124,3 +124,5 @@ jobs:
         env:
           TICKERTAPE_REQUIRE_DUCKDB: '1'
           TICKERTAPE_PYTHON: ${{ steps.python.outputs.python-path }}
+      # M8: the README quickstart, end to end (producer, live consumer, verify, Parquet export, DuckDB query).
+      - run: examples/quickstart.sh "${{ steps.python.outputs.python-path }}"
