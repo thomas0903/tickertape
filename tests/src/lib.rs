@@ -123,3 +123,25 @@ pub fn create_raw_segment(dir: &Path, base: u64, size: u64) -> PathBuf {
     file.write_all_at(&header, 0).unwrap();
     path
 }
+
+/// Payload length for `seq` bounded by `max` (inclusive), used by the cross-process tests.
+pub fn bounded_len(seq: u64, max: usize) -> usize {
+    ((seq * 37) % (max as u64 + 1)) as usize
+}
+
+/// FNV-1a over the record fields, chained across records: two readers that saw the same records in the same order
+/// produce the same digest.
+pub fn digest_step(digest: u64, seq: u64, schema_id: u32, payload: &[u8]) -> u64 {
+    let mut h = digest ^ 0xcbf2_9ce4_8422_2325;
+    let mut eat = |bytes: &[u8]| {
+        for &b in bytes {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+    };
+    eat(&seq.to_le_bytes());
+    eat(&schema_id.to_le_bytes());
+    eat(&(payload.len() as u64).to_le_bytes());
+    eat(payload);
+    h
+}

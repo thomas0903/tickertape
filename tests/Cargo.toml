@@ -22,5 +22,9 @@ path = "recovery.rs"
 name = "lock"
 path = "lock.rs"
 
+[[test]]
+name = "cross_process"
+path = "cross_process.rs"
+
 [lints]
 workspace = true
