@@ -5,6 +5,9 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## Unreleased
 
+- Add the optional `binance-recorder` example (`--features live`) with exact fixed-point trade parsing,
+  periodic/final checkpoints and reconnect backoff; default examples remain synthetic and offline.
+
 ## [0.1.0] - 2026-10-31
 
 First release. Not yet published to crates.io.
