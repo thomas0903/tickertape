@@ -12,11 +12,9 @@ fuzz_target!(|data: &[u8]| {
     let _ = scan_segment(data, 64, base_seq);
     let _ = read_slot(data, 64, base_seq);
     let _ = read_slot(data, SegmentView::len(data).saturating_sub(8), base_seq);
-    for bytes in data.chunks_exact(8).take(4) {
-        if let Ok(bytes) = <[u8; 8]>::try_from(bytes) {
-            let offset = u64::from_le_bytes(bytes);
-            let _ = read_slot(data, offset, base_seq);
-            let _ = read_slot(data, offset & !7, base_seq);
-        }
+    for bytes in data.as_chunks::<8>().0.iter().take(4) {
+        let offset = u64::from_le_bytes(*bytes);
+        let _ = read_slot(data, offset, base_seq);
+        let _ = read_slot(data, offset & !7, base_seq);
     }
 });
