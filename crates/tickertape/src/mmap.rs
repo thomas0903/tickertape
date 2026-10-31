@@ -219,10 +219,7 @@ impl MapRo {
         Some(value)
     }
 
-    /// Copies `[offset, offset + len)` out of the mapping using `Relaxed` 8-byte atomic loads, without creating any
-    /// reference into the mapping. Sound whatever other processes do to these bytes (at worst the copy is torn),
-    /// which is why readers validate a record from this copy before [`MapRo::committed_bytes`] may be used on it.
-    /// `None` if the 8-byte words covering the range are not all inside the mapping.
+    /// Test helper: [`MapRo::copy_atomic_into`] into a fresh `Vec` holding exactly `[offset, offset + len)`.
     #[cfg(test)]
     pub(crate) fn copy_atomic(&self, offset: u64, len: u64) -> Option<Vec<u8>> {
         let mut out = Vec::new();
@@ -232,8 +229,12 @@ impl MapRo {
         Some(out)
     }
 
-    /// Like [`MapRo::copy_atomic`], but copies into `out` (reusing its allocation) and returns the range of `out`
-    /// that holds `[offset, offset + len)`. `out` receives whole 8-byte words, so the range may start a few bytes in.
+    /// Copies `[offset, offset + len)` out of the mapping into `out` (reusing its allocation) using `Relaxed` 8-byte
+    /// atomic loads, without creating any reference into the mapping, and returns the range of `out` that holds the
+    /// requested bytes (`out` receives whole 8-byte words, so the range may start a few bytes in). Sound whatever
+    /// other processes do to these bytes (at worst the copy is torn), which is why readers validate a record from
+    /// this copy before [`MapRo::committed_bytes`] may be used on it. `None` if the 8-byte words covering the range
+    /// are not all inside the mapping.
     pub(crate) fn copy_atomic_into(
         &self,
         offset: u64,
