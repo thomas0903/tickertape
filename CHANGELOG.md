@@ -5,7 +5,9 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## Unreleased
 
-First release candidate (v0.1.0).
+## [0.1.0] - 2026-10-31
+
+First release. Not yet published to crates.io.
 
 ### Library (`tickertape`)
 
@@ -28,3 +30,5 @@ First release candidate (v0.1.0).
 - `tail` (follow live), `inspect`, `verify` (exit code 2 on corruption) and `export --format jsonl|parquet`.
 - Snappy Parquet export with raw unsigned metadata, bounded row groups, and opt-in `--decode market-demo` columns
   (also a `decoded` object in JSONL). Default JSONL output is unchanged by `--decode`.
+
+[0.1.0]: https://github.com/thomas0903/tickertape/releases/tag/v0.1.0

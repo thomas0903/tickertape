@@ -44,7 +44,7 @@ Linux and macOS. Tick a milestone off here and move on in `status.md`.
 - [x] **M8: Example application** (done 2026-10-31)
   - `examples/`: a producer of synthetic trades and order-book updates (documented schema), a live consumer process, an
     export-then-DuckDB step. The README shows the whole flow in under 10 commands.
-- [ ] **M9: Release readiness (v0.1.0)**
+- [x] **M9: Release readiness (v0.1.0)** (done 2026-10-31)
   - README (what, why, quickstart, guarantees, non-goals, factual comparison with alternatives, architecture figure).
   - `CONTRIBUTING.md`, `SECURITY.md`, `CHANGELOG.md`, complete crate metadata.
   - `cargo publish --dry-run` passes for both crates; `cargo deny` is clean; docs build without warnings.
