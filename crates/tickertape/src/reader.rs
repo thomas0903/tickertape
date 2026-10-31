@@ -95,9 +95,9 @@ impl Reader {
     ///
     /// # Errors
     ///
-    /// [`Error::NotFound`](crate::Error::NotFound) if `dir` has no segments (for example, the writer hasn't started),
-    /// [`Error::Corrupt`](crate::Error::Corrupt), [`Error::UnsupportedVersion`](crate::Error::UnsupportedVersion) if
-    /// the oldest segment's header is invalid, [`Error::Io`](crate::Error::Io).
+    /// [`Error::NotFound`] if `dir` has no segments (for example, the writer hasn't started),
+    /// [`Error::Corrupt`], [`Error::UnsupportedVersion`] if
+    /// the oldest segment's header is invalid, [`Error::Io`].
     pub fn open(dir: impl AsRef<Path>, config: ReaderConfig) -> Result<Reader> {
         Reader::open_inner(dir.as_ref(), config, false)
     }
@@ -151,8 +151,8 @@ impl Reader {
     ///
     /// # Errors
     ///
-    /// [`Error::SeqUnavailable`](crate::Error::SeqUnavailable) if `seq` is older than the oldest segment;
-    /// [`Error::Corrupt`](crate::Error::Corrupt) or [`Error::Io`](crate::Error::Io) while locating it.
+    /// [`Error::SeqUnavailable`] if `seq` is older than the oldest segment;
+    /// [`Error::Corrupt`] or [`Error::Io`] while locating it.
     pub fn seek(&mut self, seq: u64) -> Result<()> {
         let segments = journal::list_segments(&self.dir)?;
         let Some((first, _)) = segments.first() else {
@@ -181,11 +181,11 @@ impl Reader {
     ///
     /// # Errors
     ///
-    /// [`Error::Corrupt`](crate::Error::Corrupt) if the bytes at the cursor fail validation. The cursor doesn't move,
+    /// [`Error::Corrupt`] if the bytes at the cursor fail validation. The cursor doesn't move,
     /// so calling again retries the same position (which may succeed after a writer recovery).
-    /// [`Error::Discarded`](crate::Error::Discarded) if writer recovery replaced or removed the segment at the cursor;
+    /// [`Error::Discarded`] if writer recovery replaced or removed the segment at the cursor;
     /// call [`Reader::seek`] to continue on the current chain.
-    /// [`Error::Io`](crate::Error::Io) if the next segment can't be opened.
+    /// [`Error::Io`] if the next segment can't be opened.
     pub fn try_next(&mut self) -> Result<Option<Record<'_>>> {
         match self.advance()? {
             Some(found) => Ok(Some(self.materialize(found))),
@@ -193,7 +193,7 @@ impl Reader {
         }
     }
 
-    /// Returns the next record, polling with the configured [`Backoff`](crate::Backoff) until one is committed or
+    /// Returns the next record, polling with the configured [`Backoff`] until one is committed or
     /// `timeout` passes (`None`: wait forever). `Ok(None)` means the timeout passed.
     ///
     /// # Errors
