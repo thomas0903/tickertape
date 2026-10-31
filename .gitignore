@@ -10,8 +10,14 @@
 !.env.example
 .mcp.json
 
-# Agent-local settings
-.claude/settings.local.json
+# Local AI-agent tooling: kept in the agent kit inside .git, never committed
+AGENTS.md
+CLAUDE.md
+.agents/
+.claude/
+docs/status.md
+docs/playbooks/delegate-work.md
+docs/launch/
 
 # Rust
 target/

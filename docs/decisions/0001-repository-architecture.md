@@ -1,6 +1,6 @@
 # 0001: Repository architecture for an agent-driven Rust library
 
-- **Status:** accepted
+- **Status:** accepted; the parts about agent tooling are superseded by [0012](0012-agent-tooling-out-of-the-repository.md)
 - **Date:** 2026-10-31
 
 ## Context

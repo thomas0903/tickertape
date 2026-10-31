@@ -9,7 +9,7 @@ repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
 readme = "README.md"
-# Agent instructions are for working on the repository, not for users of the crate.
+# Local tooling files that may exist in a checkout; never part of the published crate.
 exclude = ["AGENTS.md", "CLAUDE.md"]
 keywords = ["journal", "mmap", "event-log", "trading", "ipc"]
 categories = ["database-implementations", "filesystem", "finance"]

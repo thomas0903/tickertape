@@ -1,20 +1,19 @@
 # Roadmap
 
 Milestones run in order. A milestone is done only when **every** exit criterion holds and `main` is green in CI on
-Linux and macOS. Tick a milestone off here and move on in `status.md`.
+Linux and macOS.
 
 ## v0.1.0
 
-- [x] **M0: Repository and agent setup** (done 2026-10-31; CI green on `main`)
-  - `AGENTS.md`/`CLAUDE.md` in every lane; `docs/` (status, roadmap, ADR 0001, playbooks, research);
-    `.agents/skills` with the `.claude/skills` symlink and a README with pins and licences; `.claude/settings.json`; `.gitignore`.
+- [x] **M0: Repository setup** (done 2026-10-31; CI green on `main`)
+  - Cargo workspace, licences, `docs/` (roadmap, ADR 0001, playbooks, research), CI and `.gitignore`.
   - The workspace builds, and the full check passes with a placeholder test on macOS and on Linux (OrbStack VM).
   - `origin` is set, `main` is pushed and CI is green on both platforms.
 - [x] **M1: Specification** (owner approval gate; approved 2026-10-31)
   - `docs/format.md` (byte layout, versioning, alignment, endianness), `docs/crash-contract.md` (guarantees per
     platform and level), and the public API as documented Rust signatures (`Writer`, `Reader`, `Record`, config, errors).
   - ADRs: record format, publication protocol, durability levels, segment rolling, reader API (borrowed vs copy-out).
-  - A cross-provider review of the spec, with the findings addressed.
+  - An independent review of the spec, with the findings addressed.
   - The owner approves the spec. M2 does not start before that.
 - [x] **M2: Writer and in-process reader** (done 2026-10-31)
   - Append, sequence numbers, checksums, file lock, `checkpoint()`; a reader in the same process reads back what was written.
@@ -50,15 +49,15 @@ Linux and macOS. Tick a milestone off here and move on in `status.md`.
   - `cargo publish --dry-run` passes for both crates; `cargo deny` is clean; docs build without warnings.
   - No `TODO(verify)` in the README or `docs/`; no secrets, absolute home paths or personal data in the repo.
   - A `v0.1.0` tag is pushed to the private repo. `playbooks/release-checklist.md` has the exact publishing steps.
-  - `docs/launch/feedback-post.md` holds a draft feedback request (r/rust, r/algotrading). Agents never post it.
+  - A draft feedback request for r/rust and r/algotrading exists (kept outside the repository).
 
 ## v0.2 (done on `main`, unreleased)
 
-Improvements after v0.1.0, requested by the owner. Same rule: done only when every criterion holds and CI is green.
+Improvements after v0.1.0. Same rule: done only when every criterion holds and CI is green.
 
 - [x] **Reader hot path without per-record allocation** (done 2026-10-31)
   - Neither reader allocates per record; the zero-copy reader still validates every record before any slice into the
-    mapping exists. Cross-provider review of the `mmap.rs` change (GPT-6.1 Sol: approved, one doc nit fixed).
+    mapping exists. Independent review of the `mmap.rs` change (approved; one doc nit fixed).
   - Replay benchmarks re-run on the owner's Mac and the OrbStack VM, recorded in `docs/benchmarks.md`.
 - [x] **Durable-only reads** (ADR 0010; done 2026-10-31)
   - `ReaderConfig::durable_only`: readers return only records covered by the checkpoint marker. `tail` and `export`

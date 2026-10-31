@@ -41,4 +41,4 @@ Seed inputs are in `fuzz/seeds/<target>/` (committed). The working corpus (`fuzz
 
 1. Minimise it: `cargo +nightly fuzz tmin parse_segment fuzz/artifacts/parse_segment/<crash-file>`.
 2. Add the minimised input as a regression unit test in `crates/tickertape` (a byte-array literal), and check it fails.
-3. Fix the bug, re-run the target, and record the run (target, duration, executions, result) in `docs/status.md`.
+3. Fix the bug, re-run the target, and record the run (target, duration, executions, result) in "Recorded runs" above.

@@ -134,5 +134,5 @@ the repository, and run each benchmark at least twice. Record:
   never bare-metal Linux. CI is smoke only. In the OrbStack VM use its own disk
   (`TMPDIR=$HOME/tmp`); `/tmp` is tmpfs and unsuitable for storage measurements.
 
-The orchestrator records measured results in `docs/benchmarks.md`, with their
+Maintainers record measured results in `docs/benchmarks.md`, with their
 provenance; this implementation adds no measured numbers to documentation.
