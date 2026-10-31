@@ -65,6 +65,9 @@ Seed inputs are in `fuzz/seeds/<target>/` (committed). The working corpus (`fuzz
 |---|---|---|---|---|---|---|
 | 2026-10-31 | `parse_segment` | `96d23e0` | owner's Mac (Apple M4 Pro, macOS 27) | 601 s | 179,748,260 | no crash |
 | 2026-10-31 | `decode_record` | `96d23e0` | owner's Mac (Apple M4 Pro, macOS 27) | 601 s | 109,819,500 | no crash |
+| 2026-11-01 | `recover_dir` | `d6c26c0` | Apple M4 Pro, macOS 27.0.1, `$TMPDIR` on APFS | 601 s | 111,394 (185/s) | no crash (earlier runs found the `Fail` bug fixed in `be94c8f`) |
+| 2026-11-01 | `parse_segment` | `d6c26c0` | Apple M4 Pro, macOS 27.0.1 | 61 s | 24,705,109 | no crash |
+| 2026-11-01 | `decode_record` | `d6c26c0` | Apple M4 Pro, macOS 27.0.1 | 61 s | 27,320,337 | no crash |
 
 ## When it finds a crash
 
