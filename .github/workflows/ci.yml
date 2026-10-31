@@ -46,6 +46,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # 1M-record cross-process run, kill loops and other #[ignore]d tests, in release mode.
       - run: cargo test -p tickertape-tests --release --locked -- --ignored
+      # Functional smoke only; never record CI timings as benchmark results.
+      - name: Benchmark tools smoke
+        run: |
+          cargo build -p tickertape-bench --release --bins --locked
+          target/release/tt-latency run --dir "$RUNNER_TEMP/tt-lat-smoke" --rate 20000 --count 20000 --payload 64 --reader mapped
+          target/release/tt-checkpoint --dir "$RUNNER_TEMP/tt-ckpt-smoke" --payload 64 --batch 100 --checkpoints 2 --segment-size 65536
 
   msrv:
     name: msrv
