@@ -90,5 +90,6 @@ jobs:
         working-directory: fuzz
         run: |
           for target in $(cargo +nightly fuzz list); do
-            cargo +nightly fuzz run "$target" -- -max_total_time=60
+            # The prebuilt cargo-fuzz is a musl binary and would default to the musl target.
+            cargo +nightly fuzz run --target x86_64-unknown-linux-gnu "$target" -- -max_total_time=60
           done
