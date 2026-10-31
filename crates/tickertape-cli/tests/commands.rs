@@ -549,3 +549,75 @@ fn durable_only_tail_and_jsonl_export() {
         assert_eq!(lines(&output(args, &dir)).len(), 5);
     }
 }
+
+#[test]
+fn tail_decodes_market_demo_records() {
+    use tickertape_cli::market_demo::{
+        Action, Book, BookSide, Trade, TradeSide, encode_book, encode_trade,
+    };
+    let dir = TempDir::new().unwrap();
+    let mut writer = Writer::open(dir.path(), WriterConfig::default().segment_size(65536)).unwrap();
+    let trade = encode_trade(Trade {
+        instrument_id: 7,
+        side: TradeSide::Buy,
+        price: 12_350_000_000,
+        qty: 200_000_000,
+        trade_id: 42,
+    });
+    let book = encode_book(Book {
+        instrument_id: 3,
+        side: BookSide::Ask,
+        action: Action::Delete,
+        price: 10_000_000_000,
+        qty: 0,
+    });
+    for (schema_id, payload) in [(1, &trade[..]), (2, &book[..]), (9, &b"opaque"[..])] {
+        writer
+            .append(&NewRecord {
+                schema_id,
+                venue_ts_ns: 0,
+                local_ts_ns: 0,
+                payload,
+            })
+            .unwrap();
+    }
+
+    let text = output(&["tail", "--no-follow", "--decode", "market-demo"], &dir);
+    let lines: Vec<&str> = std::str::from_utf8(&text).unwrap().lines().collect();
+    assert_eq!(lines.len(), 3);
+    assert!(
+        lines[0].ends_with(" decoded=trade instrument=7 side=buy price=123.5 qty=2 trade_id=42"),
+        "{}",
+        lines[0]
+    );
+    assert!(
+        lines[1].ends_with(" decoded=book instrument=3 side=ask price=100 qty=0 action=delete"),
+        "{}",
+        lines[1]
+    );
+    assert!(lines[2].ends_with(" decoded=-"), "{}", lines[2]);
+
+    let json = output(
+        &[
+            "tail",
+            "--no-follow",
+            "--format",
+            "json",
+            "--decode",
+            "market-demo",
+        ],
+        &dir,
+    );
+    let values: Vec<Value> = std::str::from_utf8(&json)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(values[0]["decoded"]["kind"], "trade");
+    assert_eq!(values[0]["decoded"]["price"], 123.5);
+    assert_eq!(values[1]["decoded"]["action"], "delete");
+    assert!(values[2]["decoded"].is_null());
+    // Without --decode, the JSON schema is unchanged (no "decoded" key).
+    let plain = output(&["tail", "--no-follow", "--format", "json"], &dir);
+    assert!(!std::str::from_utf8(&plain).unwrap().contains("decoded"));
+}

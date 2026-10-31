@@ -33,9 +33,9 @@ pub(crate) fn run(args: TailArgs, out: &mut dyn Write) -> Result<()> {
         match next {
             Ok(Some(record)) => {
                 match args.format {
-                    TailFormat::Text => output::text(out, &record)
+                    TailFormat::Text => output::text(out, &record, args.decode)
                         .map_err(|e| output::io_error("write tail output", e))?,
-                    TailFormat::Json => output::record(out, &record)?,
+                    TailFormat::Json => output::export_record(out, &record, args.decode)?,
                 }
                 out.flush()
                     .map_err(|e| output::io_error("flush tail output", e))?;

@@ -27,10 +27,6 @@ pub(crate) fn json(out: &mut dyn Write, value: &impl Serialize) -> Result<()> {
     writeln!(out).map_err(|e| io_error("write output newline", e))
 }
 
-pub(crate) fn record(out: &mut dyn Write, record: &Record<'_>) -> Result<()> {
-    export_record(out, record, None)
-}
-
 pub(crate) fn export_record(
     out: &mut dyn Write,
     record: &Record<'_>,
@@ -49,7 +45,11 @@ pub(crate) fn export_record(
     )
 }
 
-pub(crate) fn text(out: &mut dyn Write, record: &Record<'_>) -> io::Result<()> {
+pub(crate) fn text(
+    out: &mut dyn Write,
+    record: &Record<'_>,
+    decoder: Option<Decoder>,
+) -> io::Result<()> {
     write!(
         out,
         "seq={} schema={} venue_ts={} local_ts={} len={} payload=",
@@ -64,6 +64,23 @@ pub(crate) fn text(out: &mut dyn Write, record: &Record<'_>) -> io::Result<()> {
     }
     if record.payload.len() > 32 {
         write!(out, "…")?;
+    }
+    match decoder.map(|d| d.decode(record)) {
+        None => {}
+        Some(None) => write!(out, " decoded=-")?,
+        Some(Some(d)) => {
+            write!(
+                out,
+                " decoded={} instrument={} side={} price={} qty={}",
+                d.kind, d.instrument_id, d.side, d.price, d.qty
+            )?;
+            if let Some(id) = d.trade_id {
+                write!(out, " trade_id={id}")?;
+            }
+            if let Some(action) = d.action {
+                write!(out, " action={action}")?;
+            }
+        }
     }
     writeln!(out)
 }

@@ -10,13 +10,15 @@ Errors and recovery warnings go to stderr. JSON results go to stdout (or the sel
 ## Commands
 
 - `tail <DIR> [--from <SEQ> | --from-end] [--count <N>] [--no-follow] [--format text|json]
-  [--timeout-secs <S>] [--durable-only]`: default starts at the oldest record and follows forever. `--from` includes SEQ;
+  [--timeout-secs <S>] [--durable-only] [--decode market-demo]`: default starts at the oldest record and follows forever. `--from` includes SEQ;
   `--from-end` skips records observed in a startup scan. `--count 0` writes nothing. `--no-follow` stops when
   the reader reaches the current committed end. `--timeout-secs` accepts a nonnegative decimal number and stops
   after that many idle seconds; it resets after each record. Text shows sequence, schema, timestamps, payload
   length and the first 32 payload bytes as lowercase hex, followed by `…` when truncated. JSON is the record
   JSONL contract below. Each line is flushed for live consumers. After discarded history, tail warns and seeks
-  to the sequence reported by the reader.
+  to the sequence reported by the reader. `--decode market-demo` appends ` decoded=<kind> instrument=… side=…
+  price=… qty=…` (plus ` trade_id=…` or ` action=…`) to each text line, or ` decoded=-` when the record isn't a
+  market-demo event; with `--format json` it adds the same `decoded` object as `export --decode` (see below).
   `--durable-only` returns only records below the current checkpoint marker's `next_seq` and waits for later
   checkpoints using the usual idle timeout. With no valid checkpoint, it returns nothing until one appears;
   `--no-follow` stops at that boundary and `--from-end` skips the checkpointed prefix observed at startup.

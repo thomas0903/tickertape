@@ -62,6 +62,9 @@ struct TailArgs {
     /// Text: metadata and first 32 payload bytes as hex; json: record JSONL
     #[arg(long, value_enum, default_value = "text")]
     format: TailFormat,
+    /// Decode a known payload schema: adds a summary to text output and a "decoded" object to JSON (as in export)
+    #[arg(long, value_enum)]
+    decode: Option<Decoder>,
     /// Stop after S idle seconds (nonnegative decimal; reset after each record)
     #[arg(long, value_name = "S", value_parser = parse_timeout)]
     timeout_secs: Option<Duration>,
