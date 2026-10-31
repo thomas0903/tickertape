@@ -19,7 +19,7 @@ Linux and macOS. Tick a milestone off here and move on in `status.md`.
 - [x] **M2: Writer and in-process reader** (done 2026-10-31)
   - Append, sequence numbers, checksums, file lock, `checkpoint()`; a reader in the same process reads back what was written.
   - Round-trip property tests and the Miri run on the format code pass. A fuzz target exists.
-- [ ] **M3: Cross-process live tailing**
+- [x] **M3: Cross-process live tailing** (done 2026-10-31)
   - An integration test spawns one writer and two reader processes. Both readers observe the identical, gap-free
     sequence of at least 1,000,000 records, including across a segment roll. A late reader replays from 0 and catches up.
 - [ ] **M4: Rolling, recovery and crash tests**
