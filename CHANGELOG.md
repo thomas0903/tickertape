@@ -5,6 +5,8 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## Unreleased
 
+- Python: add a dependency-free, read-only format v1 journal decoder and JSONL CLI in `python/`.
+
 ## [0.2.0] - 2026-11-01
 
 Not yet published to crates.io. The on-disk format is unchanged (version 1); v0.1.0 journals work as they are.
