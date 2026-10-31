@@ -336,6 +336,20 @@ mod tests {
 
     const TRADE: &str = r#"{"e":"trade","s":"BTCUSDT","t":42,"p":"68420.12","q":"0.00123","T":1793400000123,"m":false}"#;
 
+    /// Accepts the next WebSocket connection, ignoring any other connection to the port (a local tool that probes
+    /// new listening ports with plain HTTP would otherwise fail the handshake and the test).
+    fn accept_websocket(listener: &TcpListener) -> tungstenite::WebSocket<std::net::TcpStream> {
+        loop {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            if let Ok(socket) = tungstenite::accept(stream) {
+                return socket;
+            }
+        }
+    }
+
     fn local_args(dir: &std::path::Path, listener: &TcpListener) -> Args {
         // Only tests bypass the CLI's wss requirement, for a loopback-only mock server.
         Args {
@@ -355,11 +369,7 @@ mod tests {
         let args = local_args(temp.path(), &listener);
         let server = std::thread::spawn(move || {
             for attempt in 0..2 {
-                let (stream, _) = listener.accept().unwrap();
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(5)))
-                    .unwrap();
-                let mut socket = tungstenite::accept(stream).unwrap();
+                let mut socket = accept_websocket(&listener);
                 if attempt == 0 {
                     socket.send(Message::Text("malformed".into())).unwrap();
                     socket
@@ -410,11 +420,7 @@ mod tests {
             let stop = Arc::new(AtomicBool::new(false));
             let signal_flag = Arc::clone(&stop);
             let server = std::thread::spawn(move || {
-                let (stream, _) = listener.accept().unwrap();
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(5)))
-                    .unwrap();
-                let mut socket = tungstenite::accept(stream).unwrap();
+                let mut socket = accept_websocket(&listener);
                 // Write one event, then idle. Final checkpoint must persist this incomplete batch.
                 socket.send(Message::Text(TRADE.into())).unwrap();
                 if signal {
