@@ -32,3 +32,51 @@ fn second_writer_fails() {
     let reopened = Writer::open(dir.path(), small_config()).unwrap();
     assert_eq!(reopened.next_seq(), 4);
 }
+
+/// C3: a writer killed with SIGKILL while holding the lock leaves no stale lock.
+#[test]
+fn stale_lock_after_kill() {
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    let dir = tempfile::tempdir().unwrap();
+    let journal = dir.path().join("journal");
+    let go = dir.path().join("never");
+    // The helper writer pauses (holding the lock) after 100 records, waiting for a file that never appears.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tt-writer"))
+        .args([
+            journal.to_str().unwrap(),
+            "1000",
+            "65536",
+            "16",
+            "100",
+            go.to_str().unwrap(),
+        ])
+        .spawn()
+        .unwrap();
+    // Wait until the child has written its 100 records (so it holds the lock and is paused).
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut reader = loop {
+        match tickertape::Reader::open(&journal, tickertape::ReaderConfig::default()) {
+            Ok(r) => break r,
+            Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+            Err(e) => panic!("writer never started: {e}"),
+        }
+    };
+    reader.seek(99).unwrap();
+    assert!(
+        reader
+            .next_timeout(Some(Duration::from_secs(60)))
+            .unwrap()
+            .is_some()
+    );
+    match Writer::open(&journal, small_config()) {
+        Err(tickertape::Error::Locked { pid, .. }) => assert_eq!(pid, Some(child.id())),
+        other => panic!("expected Locked while the child runs, got {other:?}"),
+    }
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let w = Writer::open(&journal, small_config())
+        .expect("lock released by the OS when the holder died");
+    assert_eq!(w.next_seq(), 100);
+}

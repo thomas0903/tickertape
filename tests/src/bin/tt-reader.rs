@@ -1,7 +1,7 @@
 //! Test helper: reads `count` records from a journal, live, checking that they are gap-free and that every payload
 //! is what `tt-writer` wrote. Prints `<records> <digest>` on success; exits non-zero on any mismatch.
 //!
-//! Usage: `tt-reader <dir> <count> <max_payload> <safe|mapped> [timeout_secs]`
+//! Usage: `tt-reader <dir> <count> <max_payload> <safe|mapped> [timeout_secs] [delay_us_per_record]`
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -21,6 +21,7 @@ fn main() {
     };
     let timeout = Duration::from_secs(args.get(5).map_or(300, |s| s.parse().expect("timeout")));
     let deadline = Instant::now() + timeout;
+    let delay = Duration::from_micros(args.get(6).map_or(0, |s| s.parse().expect("delay")));
 
     // The writer may not have created the journal yet.
     let mut reader = loop {
@@ -63,6 +64,9 @@ fn main() {
         }
         digest = digest_step(digest, rec.seq, rec.schema_id, rec.payload);
         expected += 1;
+        if !delay.is_zero() {
+            std::thread::sleep(delay);
+        }
     }
     println!("{expected} {digest:016x}");
 }

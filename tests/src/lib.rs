@@ -145,3 +145,42 @@ pub fn digest_step(digest: u64, seq: u64, schema_id: u32, payload: &[u8]) -> u64
     eat(payload);
     h
 }
+
+/// A small deterministic RNG (xorshift64*), so randomised tests can be replayed from a seed.
+#[derive(Debug, Clone)]
+pub struct Rng(u64);
+
+impl Rng {
+    /// Seeds from `TICKERTAPE_TEST_SEED` if set, else from the clock. Prints the seed so failures can be replayed.
+    pub fn from_env(test: &str) -> Rng {
+        let seed = std::env::var("TICKERTAPE_TEST_SEED")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| tickertape::clock::realtime_ns() | 1);
+        eprintln!("{test}: TICKERTAPE_TEST_SEED={seed}");
+        Rng::new(seed)
+    }
+
+    /// A generator with a fixed seed.
+    pub fn new(seed: u64) -> Rng {
+        Rng(seed.max(1))
+    }
+
+    /// The next 64 random bits.
+    pub fn next_u64(&mut self) -> u64 {
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
+    }
+
+    /// A number in `0..n` (n > 0).
+    pub fn below(&mut self, n: u64) -> u64 {
+        self.next_u64() % n
+    }
+}
+
+/// Payload length used by `tt-kill-writer` for `seq` (0..=512 bytes).
+pub fn kill_len(seq: u64) -> usize {
+    bounded_len(seq, 512)
+}
