@@ -6,7 +6,59 @@ these numbers are not guarantees: they describe two specific machines on one day
 what it doesn't, is in [`benches/README.md`](../benches/README.md); the methodology is ADR
 [0009](decisions/0009-benchmark-methodology.md).
 
-## 2026-10-31
+## 2026-10-31, after the reader change (v0.2 work, commit `a2d4530`)
+
+Same machines, filesystems, toolchain and command (`benches/run-recorded.sh`, plus a second Criterion invocation) as
+the v0.1.0 section below; both runs at commit `a2d4530`, where readers validate records without a per-record
+allocation. The writer did not change, so `checkpoint()` and roll latency are as in the v0.1.0 section (the raw
+output of this run is consistent with it and not repeated here).
+
+**Replay throughput** (warm page cache; millions of records per second, Criterion point estimates, two runs):
+
+| Benchmark | Mac run 1 | Mac run 2 | VM run 1 | VM run 2 | v0.1.0, same machines |
+|---|---|---|---|---|---|
+| replay, 64 B, safe reader | 43.3 | 43.6 | 35.1 | 35.3 | Mac 24.9–25.0, VM 28.9–29.0 |
+| replay, 64 B, zero-copy reader | 33.5 | 33.8 | 31.1 | 31.0 | Mac 22.1–22.4, VM 18.4–27.6 |
+| replay, 1,024 B, safe reader | 8.40 | 8.48 | 7.19 | 7.39 | Mac 6.19–6.74, VM 5.94–6.34 |
+| replay, 1,024 B, zero-copy reader | 7.25 | 7.25 | 6.49 | 6.49 | Mac 5.73–5.96, VM 2.57–5.43 |
+| append, 64 B (unchanged code) | 5.14 | 5.05 | 13.0 | 9.56 | Mac 3.52–5.64, VM 9.52–10.95 |
+| append, 1,024 B (unchanged code) | 0.53 | 0.66 | 4.78 | 4.84 | Mac 0.72–0.79, VM 4.60–4.90 |
+
+The zero-copy reader is still slower than the safe reader at replay: it validates from 8-byte atomic loads, which
+can't be vectorised, while the safe reader validates in place in its `pread` buffer. Append (unchanged code) again
+varies by more than 10 % between runs.
+
+**Cold page-cache replay, OrbStack VM** (guest page cache dropped; the host may still cache the VM disk): 64 B
+17,598,485 and 17,699,993 records/s (1,126 and 1,133 MB/s payload); 1,024 B 3,618,309 and 3,799,411 records/s
+(3,705 and 3,891 MB/s). Not measured on the Mac (needs root).
+
+**Writer-to-reader visible latency**, same parameters as below (100,000 records/s, 1,000,000 measured records, µs;
+"<1" = below the macOS clock's 1 µs resolution):
+
+| Machine | Run | Payload | Reader | p50 | p90 | p99 | p99.9 | p99.99 | max | Late sends |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Mac | 1 | 64 B | zero-copy | <1 | <1 | 47 | 264 | 1,402 | 1,833 | 14,385 |
+| Mac | 1 | 64 B | safe | 1.0 | 2.0 | 25 | 159 | 238 | 285 | 152 |
+| Mac | 1 | 1,024 B | zero-copy | <1 | 110 | 13,967 | 16,974 | 18,022 | 18,301 | 183,305 |
+| Mac | 1 | 1,024 B | safe | 2.0 | 98 | 27,869 | 49,185 | 53,510 | 54,297 | 72,278 |
+| Mac | 2 | 64 B | zero-copy | <1 | <1 | 70 | 275 | 2,443 | 3,432 | 20,129 |
+| Mac | 2 | 64 B | safe | 1.0 | 2.0 | 27 | 175 | 246 | 289 | 298 |
+| Mac | 2 | 1,024 B | zero-copy | <1 | 83 | 12,976 | 16,703 | 17,908 | 18,252 | 179,597 |
+| Mac | 2 | 1,024 B | safe | 2.0 | 97 | 21,250 | 25,575 | 27,099 | 27,591 | 74,837 |
+| VM | 1 | 64 B | zero-copy | 0.15 | 0.20 | 0.41 | 411 | 3,058 | 4,002 | 3,088 |
+| VM | 1 | 64 B | safe | 1.5 | 1.7 | 2.2 | 158 | 514 | 1,445 | 2,761 |
+| VM | 1 | 1,024 B | zero-copy | 0.35 | 0.48 | 647 | 39,879 | 48,529 | 49,480 | 26,325 |
+| VM | 1 | 1,024 B | safe | 1.7 | 2.5 | 52,429 | 138,019 | 146,538 | 147,587 | 34,618 |
+| VM | 2 | 64 B | zero-copy | 0.15 | 0.20 | 0.54 | 250 | 3,232 | 4,215 | 4,343 |
+| VM | 2 | 64 B | safe | 1.5 | 1.7 | 2.5 | 40 | 396 | 515 | 3,071 |
+| VM | 2 | 1,024 B | zero-copy | 0.35 | 0.41 | 136,970 | 223,478 | 232,260 | 233,177 | 37,704 |
+| VM | 2 | 1,024 B | safe | 1.8 | 4.5 | 337,379 | 424,673 | 433,324 | 434,373 | 77,397 |
+
+As before, medians stay at a few µs or below, and the tails at 1,024 B are dominated by the writer falling behind
+its schedule (late sends); in the VM those tails reached hundreds of milliseconds in run 2. The reader change did not
+change the medians.
+
+## 2026-10-31 (v0.1.0, commit `ff24fd1`)
 
 ### Environments
 
