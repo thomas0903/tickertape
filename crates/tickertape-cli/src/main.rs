@@ -4,6 +4,8 @@ mod export;
 mod output;
 mod parquet_export;
 mod report;
+mod stats;
+mod stats_seconds;
 mod tail;
 
 use std::fmt;
@@ -38,6 +40,9 @@ enum Command {
     /// Export records through the committed end observed in a startup scan
     #[command(after_help = export::help())]
     Export(ExportArgs),
+    /// Summarize records through the committed end observed in a startup scan
+    #[command(after_help = stats::HELP)]
+    Stats(StatsArgs),
 }
 
 #[derive(Debug, Args)]
@@ -107,6 +112,24 @@ struct ExportArgs {
     /// Export only records below the checkpoint's next_seq captured at startup (both formats; no valid checkpoint means no records)
     #[arg(long)]
     durable_only: bool,
+}
+
+#[derive(Debug, Args)]
+struct StatsArgs {
+    /// Journal directory (opened read-only; no writer lock)
+    dir: PathBuf,
+    /// First sequence number to include, inclusive
+    #[arg(long, value_name = "SEQ")]
+    from: Option<u64>,
+    /// Last sequence number to include, inclusive (must not precede --from)
+    #[arg(long, value_name = "SEQ")]
+    to: Option<u64>,
+    /// Include only records below the checkpoint's next_seq captured at startup
+    #[arg(long)]
+    durable_only: bool,
+    /// Emit one JSON object instead of aligned text (schema below)
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -194,6 +217,7 @@ fn run(cli: Cli) -> Result<()> {
         Command::Inspect(args) => report::inspect(args, &mut out)?,
         Command::Verify(args) => report::verify(args, &mut out)?,
         Command::Export(args) => export::run(args, &mut out)?,
+        Command::Stats(args) => stats::run(args, &mut out)?,
     }
     out.flush().map_err(|e| output::io_error("flush stdout", e))
 }

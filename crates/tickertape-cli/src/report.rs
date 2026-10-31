@@ -209,7 +209,7 @@ fn finish(report: &VerifyReport) -> Result<()> {
 }
 
 /// Gregorian calendar conversion from days since the Unix epoch, with no time-zone or locale dependence.
-fn rfc3339(ns: u64) -> String {
+pub(crate) fn rfc3339(ns: u64) -> String {
     let seconds = ns / 1_000_000_000;
     let mut days = seconds / 86_400;
     let mut year = 1970_u64;
