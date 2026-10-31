@@ -26,7 +26,8 @@ Spec: [`format.md`](../format.md).
 Option 1 with CRC32C. Fields: `len` (also the commit word), `crc`, `seq` (u64), `schema_id` (u32), `flags` (u32,
 reserved, must be 0), `venue_ts_ns` and `local_ts_ns` (u64 nanoseconds since the Unix epoch, 0 = unset), payload.
 The CRC covers `len` and every byte after the CRC field up to `len`, so a commit word that tears or is corrupted
-fails validation. The sequence number is stored in every record (redundant with position) so that gaps, replays and
+fails validation. `len` is at most `0xFFFFFFFE` (`0xFFFFFFFF` marks a seal), which caps payloads just under 4 GiB.
+The sequence number is stored in every record (redundant with position) so that gaps, replays and
 misplaced bytes are detected. Little-endian only, enforced at compile time; all supported targets are little-endian.
 Timestamps are unsigned because the epoch-nanosecond range of a `u64` reaches year 2554 and "unset" is clearer as 0
 than as a negative sentinel.

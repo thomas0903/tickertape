@@ -1,9 +1,10 @@
 # Crash contract
 
-Status: **draft for M1 approval**. This document says exactly what tickertape guarantees when things go wrong, on
-each supported platform, and which test checks each guarantee. A guarantee without a passing test is marked
-**untested**, and nothing here is claimed beyond what is written. Rationale: ADR
-[0004](decisions/0004-durability-levels.md). Byte-level details: [`format.md`](format.md).
+Status: **draft for M1 approval** (revised after the cross-provider review). This document says exactly what
+tickertape guarantees when things go wrong, on each supported platform, and which test checks each guarantee. A
+guarantee without a passing test is marked **untested**, and nothing is claimed beyond what is written here.
+Rationale: ADRs [0004](decisions/0004-durability-levels.md) and [0007](decisions/0007-checkpoint-marker-and-recovery.md).
+Byte-level details: [`format.md`](format.md).
 
 Supported: Linux (x86-64, aarch64) and macOS (aarch64), on a **local** filesystem (Linux: ext4, xfs, btrfs; macOS:
 APFS). Network filesystems, Windows and multiple writers are not supported.
@@ -13,60 +14,90 @@ APFS). Network filesystems, Windows and multiple writers are not supported.
 | Level | Reached when | What it means |
 |---|---|---|
 | **Visible** | `Writer::append` returns `Ok(seq)` | The record is in the shared page cache. Readers in other processes on the same host can read it, and it survives the *writer process* dying. It is **not** on stable storage |
-| **Durable** | `Writer::checkpoint` returns `Ok(())` | Every record appended before the call has been written to stable storage, as far as the OS and drive honour the sync calls listed below |
+| **Durable** | `Writer::checkpoint` returns `Ok(())` | Every record appended before the call is on stable storage, under the storage assumptions below |
 
-Visibility is not durability. A reader can see, and act on, a record that a later power loss erases. After such a
-power loss, the writer reuses those sequence numbers for new records. Consumers that must never act on a record that
-could disappear should act only on records up to the writer's last checkpoint (communicated by the application;
-a durable-only read mode is on the "Later" list).
+Visibility is not durability. A reader can see, and act on, a record that a later power loss erases, and the writer
+then reuses that sequence number for a different record. Applications that must never act on a record that could
+disappear should act only on records up to the writer's last checkpoint (communicated by the application; a
+durable-only read mode is on the "Later" list).
 
 ### What `checkpoint()` does
 
-| Platform | Calls, in order | Notes |
-|---|---|---|
-| Linux | `msync(MS_SYNC)` on the dirty range of each mapped segment written since the last checkpoint, then `fdatasync` on each such segment, then `fsync` on the journal directory if a segment was created since the last checkpoint | `fsync` makes the kernel issue a cache flush to the device if the filesystem is mounted with barriers (the default) |
-| macOS | `msync(MS_SYNC)` on the dirty range, then `fcntl(F_FULLFSYNC)` on each such segment, then `fcntl(F_FULLFSYNC)` on the journal directory (falling back to `fsync` if the directory doesn't support it) if a segment was created | On macOS, `fsync` does **not** ask the drive to flush its write cache; `F_FULLFSYNC` does. It is much slower |
+Everything written since the last successful checkpoint is "dirty": records and seals in every segment touched
+(including segments the writer has already rolled past, whose mappings it keeps until the checkpoint), files and
+directories created or renamed, and repairs made at open. A new writer treats everything after the current
+checkpoint marker as dirty, including records an earlier writer appended but never checkpointed.
 
-If any call fails, `checkpoint()` returns the error, and **nothing** about durability since the previous successful
-checkpoint may be assumed. Calling `checkpoint()` again retries. (On Linux, a failed `fsync` may have dropped the
-dirty pages; the error is reported, but the data may be lost even if a retry succeeds. See ADR 0004.)
+| Step | Linux | macOS |
+|---|---|---|
+| 1. Data | `msync(MS_SYNC)` on each dirty range, then `fdatasync` on each dirty segment | `msync(MS_SYNC)` on each dirty range, then `fsync` on each dirty segment |
+| 2. Names | `fsync` on the journal directory, `quarantine/`, and the parent of any directory the writer created, if any entry in them changed | `fsync` on the same directories |
+| 3. Barrier | (the `fdatasync`/`fsync` calls above already flush the device cache on filesystems mounted with barriers, the default) | `fcntl(F_FULLFSYNC)` on the last dirty segment, after all of the above. It asks the drive to flush its whole write cache, which covers the earlier writes and directory updates too |
+| 4. Marker | Write the next `checkpoint` slot with `pwrite`, then `fdatasync` it | Write the next `checkpoint` slot with `pwrite`, then `fcntl(F_FULLFSYNC)` on it |
+
+The marker is written only after steps 1–3 succeed, so it never points past data that isn't durable. On macOS,
+plain `fsync` does not flush the drive's write cache; `F_FULLFSYNC` does, and is much slower. tickertape always uses
+it, and if it isn't supported (`ENOTSUP`), `checkpoint()` fails rather than claiming less.
+
+**Errors are sticky.** If any step fails, `checkpoint()` returns the error and the writer becomes **poisoned**:
+every later `checkpoint()` fails with `Error::DurabilityLost`, while appends continue to work (visibility is
+unaffected). This is because on Linux a failed `fsync` can mark the dirty pages clean without writing them, so a
+later successful call proves nothing. A new writer opened in the same boot cannot detect this either: **after a
+checkpoint error, records written before it may not be durable even if a later writer's checkpoint succeeds.** Treat
+a checkpoint error as an incident.
+
+## Storage assumptions for durability
+
+The durable level holds only if: (a) the filesystem and drive honour the sync calls above (no lying write caches);
+(b) a sector or filesystem block that has been made durable is not damaged by an interrupted later write *to the
+same block*. Records are small and packed, so a checkpointed record often shares a block with records appended
+after the checkpoint. Drives with power-loss protection, and filesystems with copy-on-write data blocks
+(btrfs, APFS), avoid in-place rewrites of durable blocks; ext4 and xfs in their default modes rewrite blocks in place
+and rely on the drive's sector-write atomicity. If (b) fails, recovery detects the damage by checksum and quarantines
+it (C11), but the checkpointed records in that block are lost.
 
 ## Guarantees by failure
 
-"Committed" means the record's commit word was stored (see `format.md` → Publication); `append` returning `Ok` implies
+"Committed" means the record's commit word was stored (`format.md` → Publication); `append` returning `Ok` implies
 committed.
 
 | # | Failure | Guarantee | Platforms | Test |
 |---|---|---|---|---|
-| C1 | Writer process dies (`kill -9`, panic, abort) at any point | Every committed record is intact and readable after restart. A record being appended is either entirely present (committed) or entirely absent. The next writer resumes at the next sequence number with no gap and no duplicate | Linux, macOS | `tests/kill_loop.rs` (M4, ≥200 iterations) — **not yet written** |
-| C2 | Writer process dies with a partly written final record | The partial bytes are never visible to readers; the next writer zeroes them and overwrites the space | Linux, macOS | `tests/recovery.rs::torn_final_record` (M4) — **not yet written** |
+| C1 | Writer process dies (`kill -9`, panic, abort) at any point | Every committed record is intact and readable after restart. A record being appended is entirely present or entirely absent. The next writer continues at the next sequence number, with no gap and no duplicate | Linux, macOS | `tests/kill_loop.rs` (M4, ≥200 iterations) — **not yet written** |
+| C2 | Writer process dies with a partly written record, or the caller's fill closure panics | The partial bytes are never visible to readers. The writer (or the next one) zeroes them and makes the zeroing durable before committing anything after them, so no stale bytes can later pass as a record | Linux, macOS | `tests/recovery.rs::torn_final_record`, `::panic_in_fill_then_shorter_append` (M2/M4) — **not yet written** |
 | C3 | Writer process dies while holding the lock | The OS releases the `flock` when the process dies; a new writer can open immediately. No stale-lock cleanup is needed | Linux, macOS | `tests/lock.rs::stale_lock_after_kill` (M4) — **not yet written** |
-| C4 | Writer process dies during a roll | No committed record is lost. The next writer completes or redoes the roll (`format.md` → Recovery). Readers waiting at the end of the old segment continue once the seal is written | Linux, macOS | `tests/kill_loop.rs` with small segments (M4) — **not yet written** |
-| C5 | A second writer tries to open the same journal | It fails with `Error::Locked`, without touching any file | Linux, macOS | `tests/lock.rs` (M2) — **not yet written** |
-| C6 | A reader process dies, or is slow | No effect on the writer or other readers. The writer never waits for readers. A slow reader falls behind, and disk use grows; nothing is deleted | Linux, macOS | `tests/slow_reader.rs` (M4) — **not yet written** |
-| C7 | OS crash or power loss **after** a successful `checkpoint()` | Every record appended before that checkpoint is intact after reboot | Linux, macOS | **Untested.** Process-kill tests cannot show this. It depends on the filesystem and the drive honouring flushes |
-| C8 | OS crash or power loss, records **not** covered by a checkpoint | Any of these records may be lost, including records that readers already saw. Recovery keeps the longest valid prefix and never accepts a record that fails validation | Linux, macOS | Validation part: `tests/recovery.rs` and the fuzz targets (M4). Power-loss part: **untested** |
-| C9 | Disk full while creating a segment | `append` returns an error for which `Error::is_storage_full()` is true. The journal stays consistent and readable; a later `append` retries the roll | Linux, macOS | `tests/disk_full.rs` (M4, injected or small filesystem) — **not yet written** |
+| C4 | Writer process dies during a roll | No committed record is lost. The next writer completes the roll (`format.md` → Recovery). Readers waiting at the end of the old segment continue once the seal is written | Linux, macOS | `tests/kill_loop.rs` with small segments (M4) — **not yet written** |
+| C5 | A second writer tries to open the same journal | It fails with `Error::Locked` without touching any file | Linux, macOS | `tests/lock.rs::second_writer_fails` (M2) — **not yet written** |
+| C6 | A reader process dies, or is slow | No effect on the writer or other readers. The writer never waits for readers. A slow reader falls behind and disk use grows; nothing is deleted | Linux, macOS | `tests/slow_reader.rs` (M4) — **not yet written** |
+| C7 | OS crash or power loss **after** a successful `checkpoint()` | Every record appended before that checkpoint is intact after reboot, under the storage assumptions above, and unless a checkpoint has failed earlier in the same boot | Linux, macOS | **Untested.** Process-kill tests cannot show this |
+| C8 | OS crash or power loss, records **not** covered by a checkpoint | Any of them may be lost, including records readers already saw. Recovery keeps the longest valid chain starting at the last checkpoint, never accepts a record that fails validation, and moves (never deletes) anything after the first invalid position to `quarantine/` | Linux, macOS | Validation and quarantine: `tests/recovery.rs` and the fuzz targets (M4). Power loss itself: **untested** |
+| C9 | Disk full while creating a segment | `append` returns an error for which `Error::is_storage_full()` is true. The journal stays consistent and readable; a later `append` retries the roll | Linux, macOS | `tests/disk_full.rs` (M4, injected error or small filesystem) — **not yet written** |
 | C10 | Disk full while writing into an existing segment | Designed not to happen: segments are preallocated, so writes into them should need no new blocks on ext4 and xfs. On copy-on-write filesystems (btrfs, APFS) this is not guaranteed; see "Known risks". If it does happen, the process gets `SIGBUS` | Linux (ext4, xfs) | **Untested** |
-| C11 | Corrupted bytes in a segment (storage error, outside modification) | Readers and `verify` detect any corruption that breaks the CRC32C, length or sequence checks, and report it as an error with the file and offset; they never return a record that fails validation. The writer quarantines (or, with `RecoveryPolicy::Fail`, refuses) a corrupt tail rather than deleting it | Linux, macOS | `tests/recovery.rs::malformed_*` and fuzzing (M2, M4) — **not yet written** |
+| C11 | Corrupted bytes in a segment (storage error, outside modification) | Readers and `verify` detect corruption that breaks the CRC32C, length, sequence or chain checks and report it with the file and offset; they never return a record that fails validation. The writer quarantines (or, with `RecoveryPolicy::Fail`, refuses) a corrupt tail; it repairs by writing a new file, never by changing bytes a reader may have mapped | Linux, macOS | `tests/recovery.rs::malformed_*` and fuzzing (M2, M4) — **not yet written** |
+| C12 | A checkpoint fails | The error is returned and the writer stays poisoned (`Error::DurabilityLost` on later checkpoints). See "Errors are sticky" | Linux, macOS | `tests/checkpoint.rs::poisoned_after_failure` (M4, injected error) — **not yet written** |
+
+## Readers and memory safety
+
+- **`Reader::open` (safe, the default)** copies each record out of the mapping with atomic loads before validating
+  it, into a buffer the reader reuses. It is memory-safe whatever other processes do to the files; at worst it
+  reports corruption (or dies from `SIGBUS`, below).
+- **`Reader::open_mapped` (`unsafe`, zero-copy)** hands out `&[u8]` slices pointing into the shared mapping. The caller
+  promises that no process other than a tickertape writer modifies the journal's segment files while the reader
+  exists. A correct writer never modifies committed bytes, and repairs by writing new files, so this holds in normal
+  operation, including writer crashes and recovery.
 
 ## Known risks and limits
 
-- **SIGBUS.** Readers and the writer access segments through memory maps. If a segment file is truncated or deleted
-  and replaced by another process, or the storage returns an I/O error on a page fault, the process receives `SIGBUS`
-  and dies. tickertape does not catch it. Don't modify segment files while the journal is in use.
-- **Cooperating processes only.** The zero-copy reader API hands out `&[u8]` slices into shared mappings. That is sound
-  only while no process modifies committed bytes, which a correct writer never does. A malicious or buggy process
-  with write access to the files can break this. Readers that cannot trust the other processes should copy records
-  out (`Record::to_owned`) and treat the journal as untrusted input; validation still applies.
-- **Corrupt-tail recovery and live readers.** When the writer repairs a corrupt committed tail (C11, power loss only),
-  a reader that is reading that exact record at that moment can observe bytes changing. It reports a validation error
-  for that record, or, with probability about 2^-32 per occurrence, accepts torn bytes that happen to match the CRC.
+- **SIGBUS.** Readers and the writer access segments through memory maps. If a segment file is truncated by another
+  process, or the storage returns an I/O error on a page fault, the process receives `SIGBUS` and dies. tickertape
+  does not catch it. Don't truncate or edit segment files while the journal is in use.
 - **Copy-on-write filesystems** (btrfs, APFS). Preallocation reserves space, but copy-on-write may still need new
-  blocks on the first write. `TODO(verify)`: whether a full btrfs or APFS volume can make writes into a preallocated
-  segment fail, and how that surfaces (SIGBUS) — measure in M4.
+  blocks on the first write into a block. `TODO(verify)`: whether a full btrfs or APFS volume can make writes into a
+  preallocated segment fail, and how that surfaces (SIGBUS) — measure in M4.
+- **Readers after a repair.** A reader positioned inside a segment that recovery moved to `quarantine/` notices it
+  within about 100 ms of waiting and returns an error; it never silently follows a different history.
 - **CRC32C** detects all burst errors up to 32 bits and most other corruption, not all of it. It is not a
   cryptographic integrity check.
 - **Clocks.** Timestamps are caller-supplied data. tickertape never orders or validates by timestamp.
-- **Lock file on unusual filesystems.** `flock` works on local filesystems. On network filesystems it may silently
-  not exclude other hosts; they are not supported.
+- **`flock`** works on local filesystems. On network filesystems it may silently fail to exclude other hosts; they
+  are not supported.
