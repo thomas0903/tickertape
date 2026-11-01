@@ -11,7 +11,8 @@ Think of it as a flight recorder for a trading system or any other latency-sensi
 - One **writer** appends events: opaque payload bytes, a gap-free sequence number, a schema id and two timestamps
   you supply (for example exchange time and local receive time).
 - Any number of **readers**, in other processes, follow the journal live or **replay** it from any sequence number.
-  Readers never slow the writer down.
+  Readers never slow the writer down. A reader waiting for new records sleeps in the kernel and is woken when the
+  writer appends (futex on Linux, `os_sync_wait_on_address` on macOS 14.4+), and falls back to polling elsewhere.
 - Data lives in fixed-size **segment files** that roll over and are never deleted for you, so a journal can be
   inspected, copied and replayed after an incident or in tests.
 - The **`tickertape` CLI** tails, inspects, verifies and summarizes journals (`stats`), and exports them to
@@ -99,12 +100,11 @@ The full statement, per platform and with the test for each claim, is [`docs/cra
 - **Known limits.** A full btrfs volume can crash the writer with `SIGBUS` even inside preallocated segments; a
   checkpoint on a full APFS volume fails. See the crash contract's "Known risks".
 
-## Non-goals (for v0.1)
+## Non-goals
 
 Replication or any networking; multiple writers to one journal; Windows and network filesystems; live zero-copy
-readers in Python (use the Parquet export); typed zero-copy schemas (payloads are bytes plus a schema id); futex or
-eventfd wake-ups (readers poll with a configurable back-off); latency comparisons with other tools. The full list,
-and what may come later, is in [`docs/roadmap.md`](docs/roadmap.md).
+readers in Python (use the Parquet export); typed zero-copy schemas (payloads are bytes plus a schema id). The full
+list, and what may come later, is in [`docs/roadmap.md`](docs/roadmap.md).
 
 ## Alternatives
 

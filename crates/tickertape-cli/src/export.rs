@@ -81,7 +81,9 @@ pub(crate) fn run(args: ExportArgs, stdout: &mut dyn Write) -> Result<()> {
 fn open(args: &ExportArgs) -> Result<Reader> {
     let mut reader = Reader::open(
         &args.dir,
-        ReaderConfig::default().durable_only(args.durable_only),
+        ReaderConfig::default()
+            .durable_only(args.durable_only)
+            .notify(false),
     )?;
     if let Some(from) = args.from {
         reader.seek(from)?;
