@@ -25,7 +25,7 @@ BIN="${CARGO_TARGET_DIR:-./target}/release"
 cargo build --release -p tickertape-bench --bins
 # Delete each run's journal and flush the page cache's write-back before the next run: otherwise gigabytes written
 # by earlier runs are still being written back during later ones and distort them (seen on ext4, 2026-11-01).
-clean() { rm -rf "$WORK"/*; sync; }
+clean() { rm -rf "${WORK:?}"/*; sync; }
 for run in 1 2; do
   for payload in 64 1024; do
     for reader in mapped safe; do

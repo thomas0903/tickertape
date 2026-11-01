@@ -82,7 +82,8 @@ impl WriterConfig {
         self
     }
 
-    /// Sets whether to prefault from a background thread (see [`WriterConfig::prefault`]).
+    /// Sets whether to prepare the next segment in the background, and on macOS also prefault pages (see
+    /// [`WriterConfig::prefault`]).
     pub fn prefault(mut self, on: bool) -> Self {
         self.prefault = on;
         self
