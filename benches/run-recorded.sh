@@ -29,6 +29,10 @@ for run in 1 2; do
       $BIN/tt-latency run --dir "$WORK/lat-$run-$payload-$reader" --rate 100000 --count 1100000 --warmup 100000 \
         --payload "$payload" --reader "$reader" --json >> "$OUT/latency.jsonl"
     done
+    for wait in default sleep; do
+      $BIN/tt-latency run --dir "$WORK/lat-$run-$payload-safe-$wait" --rate 100000 --count 1100000 --warmup 100000 \
+        --payload "$payload" --reader safe --wait "$wait" --json >> "$OUT/latency.jsonl"
+    done
     $BIN/tt-checkpoint --dir "$WORK/ckpt-$run-$payload" --payload "$payload" --batch 1000 --checkpoints 200 \
       --segment-size 16777216 --json >> "$OUT/checkpoint.jsonl"
     $BIN/tt-latency run --dir "$WORK/cold-$run-$payload" --rate 1000000 --count 1000000 --payload "$payload" \

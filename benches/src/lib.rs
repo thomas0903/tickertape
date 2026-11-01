@@ -54,6 +54,11 @@ impl Options {
             .ok_or_else(|| format!("missing {key}").into())
     }
 
+    /// Returns an option's value, or `None` if absent.
+    pub fn optional(&self, key: &str) -> Option<&str> {
+        self.values.get(key).map(String::as_str)
+    }
+
     /// Parses an unsigned integer, using a default only if the option is absent.
     pub fn number(&self, key: &str, default: Option<u64>) -> Result<u64> {
         match self.values.get(key) {
