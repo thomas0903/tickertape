@@ -20,7 +20,15 @@ import time
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 TOOLS = ("tickertape", "chronicle", "aeron", "yaque", "queue-file", "plain-file")
-VERSIONS = {"tickertape": "0.2.0", "chronicle": "2026.8", "aeron": "1.54.0",
+def workspace_version():
+    """tickertape's version, from the workspace Cargo.toml (the adapter builds the library in this checkout)."""
+    for line in (Path(__file__).resolve().parent.parent / "Cargo.toml").read_text().splitlines():
+        if line.startswith("version = "):
+            return line.split('"')[1]
+    raise RuntimeError("no workspace version in Cargo.toml")
+
+
+VERSIONS = {"tickertape": workspace_version(), "chronicle": "2026.8", "aeron": "1.54.0",
             "yaque": "0.6.6", "queue-file": "2.0.0", "plain-file": "1 (suite)"}
 GUARANTEES = {
     "tickertape": {"kind": "journal", "process_crash": "validated published prefix; only checkpoint promises durability",
