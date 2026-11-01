@@ -1,4 +1,4 @@
-# 0023: No prefault advice on Linux
+# 0023: No prefault advice (and no spare segment) on Linux
 
 - **Status:** accepted (amends [0020](0020-background-prefault.md))
 - **Date:** 2026-11-01
@@ -55,3 +55,35 @@ milliseconds of stalls. The spare segment on its own is harmless and slightly im
   hardware (bare metal, xfs) first.
 - The Linux `MADV_POPULATE_WRITE` code is removed. `mmap::Advice::prefault` is a no-op off macOS.
 - Linux benchmarks must be re-recorded with these settings.
+
+## Amendment (same day): no spare segment on Linux either
+
+A second experiment on a fresh instance of the same type isolated one more factor and tested two more variants:
+- Formatting ext4 with `mkfs.ext4` defaults leaves inode-table initialisation running in the background
+  (`ext4lazyinit`) for several minutes after the first mount. The earliest runs on a freshly formatted disk had
+  tails of milliseconds to tens of milliseconds, which the experiment above partly mistook for configuration
+  effects.
+- Spares filled with zeros by `pwrite` were catastrophic: 200–400 ms p99 at 1,024 B and 100,000 records/s, from the
+  extra 128 MiB of writes per segment.
+- Spares allocated with `fallocate(FALLOC_FL_WRITE_ZEROES)` (Linux 6.17+), so that their extents are already
+  written, were no better than the plain spare.
+
+The second experiment reformatted with `-E lazy_itable_init=0,lazy_journal_init=0` and interleaved the
+configurations (A, B, C, A, B, C, …) over four rounds. Setup: 1,024 B, 100,000 records/s, zero-copy reader; values in
+µs.
+
+| Configuration | p99.9, four runs | p99.99, four runs | max |
+|---|---|---|---|
+| no spare (prefault off) | 71, 64, 71, 60 | 1,016, 936, 954, 975 | ≤ 1,239 |
+| spare segment (ADR 0022) | 63, 56, **26,018**, 65 | 854, 821, **34,603**, 825 | 35,521 |
+| `FALLOC_FL_WRITE_ZEROES` spare | 70, 72, 622, 71 | 979, 983, 5,951, 974 | 6,902 |
+
+On ext4 with NVMe, a synchronous roll costs about a millisecond. The spare's preallocation sync occasionally forced a
+journal commit that stalled the writer for tens of milliseconds.
+
+**Decision:** on Linux and other non-Apple systems the writer prepares no spare either. `WriterConfig::prefault` has
+no effect there. Its doc comment says so.
+
+**Benchmarks:** formatting must disable lazy initialisation for any ext4 volume that is benchmarked right after
+creation. The AWS provisioning script does this from now on.
+

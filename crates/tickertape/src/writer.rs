@@ -299,8 +299,14 @@ impl Writer {
         if let Some(prefault) = &mut self.prefault {
             prefault.advanced(self.offset);
         }
-        // Once the active segment is half full, prepare the next one off the writer's thread (ADR 0022).
-        if self.config.prefault && !self.spare_requested && self.offset >= self.active.size / 2 {
+        // Once the active segment is half full, prepare the next one off the writer's thread (ADR 0022). macOS only: on
+        // ext4 a synchronous roll costs about 1 ms, and the spare's preallocation sync occasionally stalled the writer
+        // for tens of milliseconds (ADR 0023).
+        if self.config.prefault
+            && cfg!(target_vendor = "apple")
+            && !self.spare_requested
+            && self.offset >= self.active.size / 2
+        {
             self.spare_requested = true;
             self.spare = crate::prefault::prepare_spare(&self.dir, self.config.segment_size);
         }

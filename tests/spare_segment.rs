@@ -1,4 +1,7 @@
-//! ADR 0022: the next segment is prepared in the background and published at roll.
+//! ADR 0022: the next segment is prepared in the background and published at roll (macOS only, ADR 0023).
+
+// The helpers below serve the macOS tests; Linux only runs `no_spare_on_linux`.
+#![cfg_attr(not(target_vendor = "apple"), allow(dead_code, unused_imports))]
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -104,6 +107,7 @@ fn fill_until_roll(w: &mut Writer, dir: &Path, rolls: usize) {
     }
 }
 
+#[cfg(target_vendor = "apple")]
 #[test]
 fn spare_is_prepared_at_half_full_and_published_at_roll() {
     let _serial = serial();
@@ -149,6 +153,7 @@ fn spare_is_prepared_at_half_full_and_published_at_roll() {
     assert_eq!(n, total);
 }
 
+#[cfg(target_vendor = "apple")]
 #[test]
 fn leftover_spare_is_removed_and_reported_at_open() {
     let _serial = serial();
@@ -167,6 +172,7 @@ fn leftover_spare_is_removed_and_reported_at_open() {
     );
 }
 
+#[cfg(target_vendor = "apple")]
 #[test]
 fn roll_falls_back_when_no_spare_can_be_prepared() {
     let _serial = serial();
@@ -185,6 +191,7 @@ fn roll_falls_back_when_no_spare_can_be_prepared() {
     assert_eq!(n, total);
 }
 
+#[cfg(target_vendor = "apple")]
 #[test]
 fn failed_spare_preparation_is_cleaned_up_and_the_roll_falls_back() {
     let _serial = serial();
@@ -214,6 +221,7 @@ fn failed_spare_preparation_is_cleaned_up_and_the_roll_falls_back() {
     }
 }
 
+#[cfg(target_vendor = "apple")]
 #[test]
 fn failed_header_write_discards_the_spare_and_creates_the_segment() {
     let _serial = serial();
@@ -235,6 +243,24 @@ fn failed_header_write_discards_the_spare_and_creates_the_segment() {
         prepared,
         "the failed spare was published"
     );
+    let total = w.next_seq();
+    drop(w);
+    assert_eq!(read_count(dir.path()), total);
+}
+
+#[cfg(not(target_vendor = "apple"))]
+#[test]
+fn no_spare_on_linux() {
+    // ADR 0023: on ext4 the spare occasionally stalled the writer, so other systems roll synchronously.
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let mut w = Writer::open(dir.path(), small_config()).unwrap();
+    for _ in 0..40 {
+        append(&mut w, 1024); // past half of the first segment
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(!dir.path().join(SPARE).exists());
+    fill_until_roll(&mut w, dir.path(), 2);
     let total = w.next_seq();
     drop(w);
     assert_eq!(read_count(dir.path()), total);

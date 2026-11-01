@@ -311,8 +311,9 @@ impl Drop for SmallVolume {
 /// Crash-contract C10 on the default path (ADR 0022): the writer prepares the next segment in the background, the
 /// volume then fills up, and the writer rolls into the prepared segment and keeps writing. A sparse or unsynced spare
 /// would fail here like an unpreallocated segment. Runs the writer in a child process, as above.
+#[cfg(target_vendor = "apple")] // spares are prepared only on macOS (ADR 0023)
 #[test]
-#[ignore = "needs hdiutil (macOS) or passwordless sudo (Linux); run with -- --ignored"]
+#[ignore = "needs hdiutil (macOS); run with -- --ignored"]
 fn full_volume_then_roll_into_prepared_spare() {
     use std::os::unix::fs::MetadataExt;
     use std::os::unix::process::ExitStatusExt;
