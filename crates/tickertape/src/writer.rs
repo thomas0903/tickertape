@@ -12,6 +12,7 @@ use crate::error::{CorruptReason, Error, Result};
 use crate::format::{self, CheckpointSlot, RecordHeader, ScanEnd, SegmentHeader, SegmentView};
 use crate::journal::{self, CHECKPOINT_FILE, LOCK_FILE, QUARANTINE_DIR};
 use crate::mmap::{self, MapRw};
+use crate::prefault::Prefaulter;
 use crate::record::NewRecord;
 
 /// The only process allowed to append to a journal.
@@ -44,6 +45,8 @@ pub struct Writer {
     checkpoint_file: File,
     /// The notify file, if enabled and available (ADR 0017).
     notify: Option<mmap::Notify>,
+    /// The background prefault thread, if enabled and started (ADR 0020).
+    prefault: Option<Prefaulter>,
     generation: u64,
     poisoned: bool,
     /// Set if an abandoned write's zeroing could not be made durable; see `append_with`.
@@ -143,6 +146,10 @@ impl Writer {
 
         report.next_seq = state.next_seq;
         let notify = open_notify(&dir, config.notify);
+        let prefault = config
+            .prefault
+            .then(|| Prefaulter::start(state.active.map.advice(), state.offset))
+            .flatten();
         Ok(Writer {
             dir,
             config,
@@ -155,6 +162,7 @@ impl Writer {
             dirty_dirs,
             checkpoint_file,
             notify,
+            prefault,
             generation: checkpoint.map_or(0, |c| c.generation),
             poisoned: false,
             appends_blocked: false,
@@ -272,6 +280,9 @@ impl Writer {
         self.offset = offset + format::align8(u64::from(len));
         if let Some(notify) = &self.notify {
             notify.publish();
+        }
+        if let Some(prefault) = &mut self.prefault {
+            prefault.advanced(self.offset);
         }
         self.next_seq = seq + 1;
         Ok(seq)
@@ -399,6 +410,9 @@ impl Writer {
         });
         self.offset = format::SEGMENT_HEADER_LEN as u64;
         self.active_dirty_from = self.offset;
+        if let Some(prefault) = &mut self.prefault {
+            prefault.switch(self.active.map.advice(), self.offset);
+        }
         if let Some(notify) = &self.notify {
             notify.publish();
         }

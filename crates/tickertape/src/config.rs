@@ -34,6 +34,10 @@ pub struct WriterConfig {
     /// Costs one atomic increment and one load per append, plus a wake-up system call when readers are blocked.
     /// Default: true.
     pub notify: bool,
+    /// Keep the pages ahead of the write position faulted in from a background thread (`tickertape-prefault`), so
+    /// that `append` rarely takes a page fault (ADR 0020). The thread only advises the kernel (`madvise`); it never
+    /// writes to the journal. Set to `false` for a writer that starts no threads. Default: true.
+    pub prefault: bool,
 }
 
 impl WriterConfig {
@@ -57,6 +61,12 @@ impl WriterConfig {
         self.notify = on;
         self
     }
+
+    /// Sets whether to prefault from a background thread (see [`WriterConfig::prefault`]).
+    pub fn prefault(mut self, on: bool) -> Self {
+        self.prefault = on;
+        self
+    }
 }
 
 impl Default for WriterConfig {
@@ -65,6 +75,7 @@ impl Default for WriterConfig {
             segment_size: Self::DEFAULT_SEGMENT_SIZE,
             recovery: RecoveryPolicy::default(),
             notify: true,
+            prefault: true,
         }
     }
 }

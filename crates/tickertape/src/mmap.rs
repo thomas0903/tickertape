@@ -15,6 +15,7 @@ use std::fs::File;
 use std::io;
 use std::os::fd::AsRawFd;
 use std::ptr::NonNull;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 use std::time::Duration;
 
@@ -104,22 +105,58 @@ fn msync(ptr: NonNull<u8>, map_len: usize, offset: u64, len: u64) -> io::Result<
     }
 }
 
+/// The address range of a writer mapping, unmapped when its last owner (the [`MapRw`] or an [`Advice`]) is dropped.
+#[derive(Debug)]
+struct Region {
+    ptr: NonNull<u8>,
+    len: usize,
+}
+
+// SAFETY: a `Region` is only an address range plus the duty to unmap it once. It never dereferences `ptr`: data
+// access goes through `MapRw`, whose borrows are tied to `&MapRw`/`&mut MapRw`, and `Advice` only passes the range to
+// `madvise`. Sharing or moving the range between threads is therefore like sharing an integer.
+unsafe impl Send for Region {}
+// SAFETY: as above.
+unsafe impl Sync for Region {}
+
+impl Drop for Region {
+    fn drop(&mut self) {
+        // SAFETY: the mapping was created by `map` with this length. Every reference into it borrows the `MapRw` that
+        // holds this region, and an `Advice` holds no references, so none can outlive the last owner's drop.
+        unsafe { unmap(self.ptr, self.len) }
+    }
+}
+
 /// The writer's read-write shared mapping of one segment file.
 #[derive(Debug)]
 pub(crate) struct MapRw {
     ptr: NonNull<u8>,
     len: usize,
+    /// Keeps the mapping alive; shared only with [`Advice`] handles, which never access the bytes.
+    region: Arc<Region>,
 }
 
-// SAFETY: `MapRw` owns its mapping exclusively within this process (it is never cloned and hands out borrows tied to
-// `&self`/`&mut self`), so moving it to another thread is like moving a `Vec<u8>`.
+// SAFETY: `MapRw` is the only owner in this process that accesses the mapping's bytes (it is never cloned and hands out
+// borrows tied to `&self`/`&mut self`; `Advice` handles never access the bytes), so moving it to another thread is like
+// moving a `Vec<u8>`.
 unsafe impl Send for MapRw {}
 
 impl MapRw {
     /// Maps the first `len` bytes of `file` (opened read-write) for reading and writing.
     pub(crate) fn new(file: &File, len: usize) -> io::Result<MapRw> {
         let ptr = map(file, len, libc::PROT_READ | libc::PROT_WRITE)?;
-        Ok(MapRw { ptr, len })
+        Ok(MapRw {
+            ptr,
+            len,
+            region: Arc::new(Region { ptr, len }),
+        })
+    }
+
+    /// A handle that can prefault this mapping from another thread and keeps it mapped while it lives (ADR 0020).
+    pub(crate) fn advice(&self) -> Advice {
+        Advice {
+            region: Arc::clone(&self.region),
+        }
     }
 
     /// The mapping's length.
@@ -179,11 +216,52 @@ impl MapRw {
     }
 }
 
-impl Drop for MapRw {
-    fn drop(&mut self) {
-        // SAFETY: the mapping was created by `map` with this length, and every reference into it borrows `self`, so
-        // none can outlive this drop.
-        unsafe { unmap(self.ptr, self.len) }
+/// Asks the kernel to fault in part of a writer mapping ahead of the writer (ADR 0020), from any thread. It never
+/// reads or writes the mapped bytes, and it keeps the mapping alive while it exists.
+#[derive(Debug, Clone)]
+pub(crate) struct Advice {
+    region: Arc<Region>,
+}
+
+impl Advice {
+    /// The mapping's length.
+    pub(crate) fn len(&self) -> u64 {
+        self.region.len as u64
+    }
+
+    /// Prefaults the pages covering `[offset, offset + len)`, clamped to the mapping: `MADV_WILLNEED` on macOS,
+    /// `MADV_POPULATE_WRITE` on Linux (an `InvalidInput` error before Linux 5.14), nothing elsewhere. Contents are
+    /// unchanged; on Linux the pages become dirty, so the kernel writes back their (zero) bytes.
+    pub(crate) fn prefault(&self, offset: u64, len: u64) -> io::Result<()> {
+        let map_len = self.region.len;
+        let page = page_size();
+        let start = usize::try_from(offset).unwrap_or(usize::MAX).min(map_len) / page * page;
+        let end = usize::try_from(offset.saturating_add(len))
+            .unwrap_or(usize::MAX)
+            .min(map_len);
+        if start >= end {
+            return Ok(());
+        }
+        #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
+        return Ok(());
+        #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+        {
+            #[cfg(target_vendor = "apple")]
+            let advice = libc::MADV_WILLNEED;
+            #[cfg(not(target_vendor = "apple"))]
+            let advice = libc::MADV_POPULATE_WRITE;
+            let ptr = self.region.ptr.as_ptr();
+            // SAFETY: `[start, end)` lies within the live mapping (clamped above; `start` is page-aligned, as is the
+            // mapping), which `self.region` keeps mapped for the duration of the call. Both advice values only affect
+            // which pages are resident and mapped: they never change the bytes' values, so they cannot conflict with
+            // the writer's concurrent access to the same pages.
+            let rc = unsafe { libc::madvise(ptr.add(start).cast(), end - start, advice) };
+            if rc != 0 {
+                Err(last_os_error())
+            } else {
+                Ok(())
+            }
+        }
     }
 }
 

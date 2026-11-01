@@ -5,6 +5,13 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## Unreleased
 
+- Performance: the writer prefaults the active segment from a background thread (ADR 0020;
+  `WriterConfig::prefault`, on by default). On APFS, first writes into preallocated pages were the writer's
+  bottleneck; appends no longer stall on them in steady state.
+- Performance: CRC32C uses the CPU instruction directly for records up to 512 bytes (ADR 0019), which speeds up
+  `append` and both readers for short records. Results are bit-identical; the format is unchanged.
+- Performance: the zero-copy reader copies records for validation with a plain word loop (faster replay).
+- Benchmarks: `tt-latency --wait spin|default|block|sleep` selects how the reader waits.
 - Library: reader wake-ups (ADR 0017). Blocked readers wait on a shared `notify` file (futex on Linux,
   `os_sync_wait_on_address` on macOS 14.4+) instead of sleeping; a new record wakes them within microseconds.
   On by default (`ReaderConfig::notify`, `WriterConfig::notify`); falls back to sleeping where unavailable.

@@ -20,6 +20,15 @@ draws conclusions from those two.
 For most uses the default is a reasonable start. Pick smaller segments (a few MiB) for low-volume journals you
 archive often, larger ones if roll latency matters and disk space doesn't.
 
+## Writer threads
+
+By default the writer starts one helper thread, `tickertape-prefault`, that keeps the next 8 MiB of the active segment
+faulted in (`madvise`), so `append` rarely waits for a page fault (ADR 0020). It never writes to the journal. On APFS
+this matters most: writing into a preallocated segment otherwise faults once per 16 KiB page, slowly. Set
+`WriterConfig::prefault(false)` if you pin threads and want the writer to start none; it then works exactly as
+before, faulting pages on first write. On Linux it uses `MADV_POPULATE_WRITE` (5.14 and later; older kernels stop
+the thread on first use).
+
 ## Choosing a checkpoint interval
 
 `Writer::checkpoint()` makes everything appended so far durable. Until then, records are visible and survive the

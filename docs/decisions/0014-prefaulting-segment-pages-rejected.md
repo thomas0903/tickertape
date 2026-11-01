@@ -1,6 +1,7 @@
 # 0014: Prefaulting segment pages (rejected)
 
-- **Status:** rejected
+- **Status:** rejected. Option 4, with `madvise` instead of writes, was later adopted after profiling:
+  [0020](0020-background-prefault.md)
 - **Date:** 2026-11-01
 
 ## Context
