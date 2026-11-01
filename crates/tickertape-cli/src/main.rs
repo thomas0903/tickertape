@@ -1,5 +1,6 @@
-//! Read-only command-line interface to tickertape journals.
+//! Command-line interface to tickertape journals.
 
+mod archive;
 mod export;
 mod output;
 mod parquet_export;
@@ -20,7 +21,7 @@ const EXIT_CODES: &str = "Exit codes: 0 success (including help, end of input or
 const RECORD_SCHEMA: &str = "Record JSONL schema (keys in order): {\"seq\":u64,\"schema_id\":u32,\"venue_ts_ns\":u64,\"local_ts_ns\":u64,\"payload_b64\":string}. payload_b64 is standard base64 with padding. One object per line.\n\nExit codes: 0 success (including help, end of input or idle timeout); 1 usage, I/O or missing journal; 2 corruption or unsupported journal format.";
 
 #[derive(Debug, Parser)]
-#[command(name = "tickertape", version, about = "Read-only tools for tickertape event journals", after_help = EXIT_CODES)]
+#[command(name = "tickertape", version, about = "Tools for tickertape event journals", after_help = EXIT_CODES)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -28,6 +29,9 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Archive or delete old sealed segments covered by a checkpoint (changes the journal)
+    #[command(after_help = archive::HELP)]
+    Archive(archive::ArchiveArgs),
     /// Follow committed records, starting at the oldest record by default
     #[command(after_help = RECORD_SCHEMA)]
     Tail(TailArgs),
@@ -213,6 +217,7 @@ fn run(cli: Cli) -> Result<()> {
     let stdout = io::stdout();
     let mut out = stdout.lock();
     match cli.command {
+        Command::Archive(args) => archive::run(args, &mut out)?,
         Command::Tail(args) => tail::run(args, &mut out)?,
         Command::Inspect(args) => report::inspect(args, &mut out)?,
         Command::Verify(args) => report::verify(args, &mut out)?,
