@@ -10,7 +10,7 @@ members = [
 exclude = ["fuzz", "compare"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 # MSRV. CI checks it in the `msrv` job; bump it only with a CHANGELOG entry.
 rust-version = "1.85"
@@ -20,7 +20,7 @@ homepage = "https://github.com/thomas0903/tickertape"
 authors = ["The tickertape contributors"]
 
 [workspace.dependencies]
-tickertape = { path = "crates/tickertape", version = "0.2.0" }
+tickertape = { path = "crates/tickertape", version = "0.3.0" }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
