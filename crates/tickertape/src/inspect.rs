@@ -259,14 +259,9 @@ pub fn verify(dir: impl AsRef<Path>) -> Result<VerifyReport> {
     Ok(report)
 }
 
-/// Scans a segment file from a private copy of its contents.
+/// Scans a segment file with bounded memory (`pread` windows; see [`journal::scan_file`]).
 fn scan_file(path: &Path, base: u64) -> Result<format::ScanResult> {
-    let image = std::fs::read(path).map_err(|e| Error::io("read segment", path, e))?;
-    Ok(format::scan_segment(
-        &image[..],
-        format::SEGMENT_HEADER_LEN as u64,
-        base,
-    ))
+    journal::scan_file(path, base)
 }
 
 #[cfg(test)]

@@ -1,10 +1,247 @@
 # Benchmarks
 
 Measured results only, recorded following [`playbooks/run-benchmark.md`](playbooks/run-benchmark.md). Every number
-below comes from the raw output of the commands listed with it. There are **no comparisons with other tools**, and
-these numbers are not guarantees: they describe two specific machines on one day. What each benchmark measures, and
-what it doesn't, is in [`benches/README.md`](../benches/README.md); the methodology is ADR
-[0009](decisions/0009-benchmark-methodology.md).
+below comes from the raw output of the commands listed with it. These numbers are not guarantees: they describe
+specific machines on specific days. What each benchmark measures, and what it doesn't, is in
+[`benches/README.md`](../benches/README.md) and, for the comparison with other tools, in
+[`compare/README.md`](../compare/README.md). The methodology is in ADRs [0009](decisions/0009-benchmark-methodology.md)
+and [0018](decisions/0018-competitive-benchmarks.md).
+
+**Linux results come first** because that is where tickertape is meant to run. The macOS results are secondary.
+
+## 2026-11-02, v0.3.0 on Linux (AWS) and macOS
+
+### Environments
+
+**Linux (primary).** An AWS EC2 `c6id.xlarge` in us-east-1. It is a Nitro **cloud VM, not bare metal**:
+- Intel Xeon Platinum 8375C (Ice Lake) at 2.9 GHz, 2 cores / 4 threads, 8 GiB of memory;
+- Ubuntu 24.04, kernel 7.0.0-1014-aws;
+- the journal directory on the instance's local NVMe disk, ext4, formatted with
+  `-E lazy_itable_init=0,lazy_journal_init=0` and mounted `noatime`;
+- rustc 1.99.1 and OpenJDK 21.0.12.1.
+
+A fresh instance was used for each recording.
+
+| Recording | Commit |
+|---|---|
+| tickertape's own benchmarks | `ce35edc` |
+| comparison | `cdfd744` (same library as `ce35edc`; only the comparison runner changed) |
+
+**macOS (secondary).** The owner's laptop:
+- Apple M4 Pro, 14 cores, 24 GiB of memory;
+- macOS 27.0.1, APFS on the internal SSD;
+- rustc 1.99.1 and Homebrew OpenJDK 21.0.13.0.3.
+
+| Recording | Commit |
+|---|---|
+| tickertape's own benchmarks | `c5be4be` |
+| comparison | `98ce513` |
+
+Both behave on macOS exactly as v0.3.0 does: the later changes affect only Linux and other non-Apple systems.
+The laptop was **not idle**. A system photo-analysis process (`mediaanalysisd`) used one to two cores throughout,
+and the load average was about 2.4 at the start. Run-to-run variance on the Mac is therefore much larger than on
+Linux, especially for append throughput.
+
+**Commands.**
+- Linux: `TMPDIR=/data/tmp CARGO_TARGET_DIR=/data/target benches/run-recorded.sh OUTDIR`, then
+  `JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64 TMPDIR=/data/tmp compare/run-all.sh OUTDIR`.
+- macOS: the same commands with `TMPDIR=$HOME/tmp` and Homebrew's JDK 21.
+
+Every configuration runs twice; ranges below are the two runs. Latency tools schedule sends at a fixed rate and
+measure from the **intended** send time (coordinated omission accounted for), as described in `benches/README.md`
+and `compare/README.md`.
+
+### Comparison with other tools, Linux
+
+What each tool promises differs, so the comparison is about mechanisms, not equivalent products.
+`compare/README.md` has the full mapping. In short:
+- **tickertape** and **Chronicle Queue** are persistent, replayable journals with independent readers.
+- **Aeron** IPC is an in-memory transport with no persistence or replay.
+- **yaque** is a consuming single-reader queue.
+- **queue-file** is a FIFO file that forbids concurrent processes, so it has no live latency result.
+- **plain file** is a length-prefixed file with no validation or recovery: a lower bound for "just write to a file".
+
+**Aeron's results on this machine are not representative.** Its media driver runs dedicated busy-spinning threads.
+With two client conductors and a busy-spinning writer and reader, that is more spinning threads than the four
+vCPUs. Aeron's latency here measures CPU oversubscription, not Aeron.
+
+**W1, append throughput** (million records/s; 1,000,000 × 64 B or 100,000 × 1,024 B):
+
+| Tool | 64 B | 1,024 B |
+|---|---|---|
+| **tickertape** | 18.57–18.67 | 2.35–2.37 |
+| chronicle | 3.49–3.76 | 0.90–0.98 |
+| yaque | 2.29 | 1.09 |
+| queue-file | 0.70 | 0.44 |
+| plain-file | 2.49–2.51 | 1.24–1.26 |
+
+**W3, warm replay** (million records/s, including open and validation, page cache warm):
+
+| Tool | Reader | 64 B | 1,024 B |
+|---|---|---|---|
+| **tickertape** | safe | 24.79–25.11 | 3.44–3.50 |
+| **tickertape** | mapped | 26.21–26.26 | 3.50–3.52 |
+| chronicle | default | 12.71–12.82 | 3.48–4.00 |
+| yaque | default | 19.27–19.71 | 4.18–4.27 |
+| queue-file | default | 1.15 | 0.97 |
+| plain-file | default | 3.83–3.84 | 2.64–2.66 |
+
+**W2, writer-to-reader latency** (µs, p50 / p99 / p99.9 / max over 1,000,000 records after 100,000 of warm-up; "late
+sends" counts sends that started more than 1 µs after their intended time). tickertape has two readers:
+- `safe` reads with `pread` and is memory-safe whatever other processes do;
+- `mapped` is the zero-copy reader.
+
+64 B at 10,000 records/s:
+
+| Tool | Reader | p50 | p99 | p99.9 | max | late sends |
+|---|---|---|---|---|---|---|
+| **tickertape** | safe | 2.6 | 3–3.1 | 20–21 | 581–608 | 79–164 |
+| **tickertape** | mapped | 0.3 | 0.6 | 16–17 | 623–936 | 102–121 |
+| chronicle | default | 0.5 | 0.7 | 2.6–7.8 | 676–5,636 | 390–666 |
+| aeron | default | 0.4 | 5,218–5,263 | 6,410–6,570 | 13,984–14,991 | 219,615–226,535 |
+| yaque | default | 1.4 | 3.8 | 7.6–7.7 | 2,062–3,021 | 193–239 |
+| plain-file | default | 1 | 3.2–10 | 6.5–12 | 2,501–2,988 | 184–110,083 |
+
+1,024 B at 10,000 records/s:
+
+| Tool | Reader | p50 | p99 | p99.9 | max | late sends |
+|---|---|---|---|---|---|---|
+| **tickertape** | safe | 3.2–3.3 | 16–19 | 26–32 | 1,265–5,464 | 647–110,441 |
+| **tickertape** | mapped | 1–1.1 | 2.6–11 | 42–45 | 1,337–1,390 | 563–110,543 |
+| chronicle | default | 0.6 | 2.6–2.9 | 51 | 1,332 | 857–4,900 |
+| aeron | default | 0.6 | 5,190–5,280 | 6,681–7,115 | 13,984–60,555 | 221,608–235,108 |
+| yaque | default | 1.8–1.9 | 6.4–6.5 | 4,637–4,768 | 17,646–17,777 | 205–547 |
+| plain-file | default | 1.4–1.5 | 4.8 | 6.4 | 617–1,411 | 128–162 |
+
+64 B at 100,000 records/s:
+
+| Tool | Reader | p50 | p99 | p99.9 | max | late sends |
+|---|---|---|---|---|---|---|
+| **tickertape** | safe | 2.6 | 9.7–12 | 20–21 | 93–142 | 13,049–15,623 |
+| **tickertape** | mapped | 0.3 | 6–10 | 26–28 | 85–101 | 15,922–18,087 |
+| chronicle | default | 0.4 | 11–12 | 38–47 | 783–3,795 | 38,758–39,477 |
+| aeron | default | 0.4 | 5,116–5,558 | 7,176–7,193 | 9,576–10,846 | 265,712–274,628 |
+| yaque | default | 1.4–1.5 | 6.8–11 | 11–16 | 214–227 | 15,106–15,591 |
+| plain-file | default | 0.9 | 7.2–8.9 | 13–14 | 220–1,252 | 13,886–15,547 |
+
+1,024 B at 100,000 records/s:
+
+| Tool | Reader | p50 | p99 | p99.9 | max | late sends |
+|---|---|---|---|---|---|---|
+| **tickertape** | safe | 3.2 | 19–20 | 31–32 | 485–1,528 | 19,764–23,340 |
+| **tickertape** | mapped | 1 | 29 | 62–70 | 1,280–1,467 | 37,820–39,154 |
+| chronicle | default | 0.5–0.6 | 34–36 | 76–142 | 1,655–2,443 | 58,761–60,137 |
+| aeron | default | 0.6 | 4,903–5,505 | 6,484–7,217 | 9,175–13,238 | 231,003–269,348 |
+| yaque | default | 1.9 | 11,084–12,132 | 22,462–22,856 | 24,379–24,412 | 18,635–19,468 |
+| plain-file | default | 1.3 | 11 | 17 | 111–135 | 19,730–23,728 |
+
+What the Linux comparison shows:
+
+**Append.** tickertape appends about 5× faster than Chronicle Queue at 64 B and about 2.5× at 1,024 B. It also beats
+the plain-file baseline, which needs one `write(2)` per record.
+
+**Replay.**
+- At 64 B tickertape is fastest: 24.8–26.3 million records/s, against yaque's 19.3–19.7 and Chronicle Queue's
+  12.7–12.8.
+- At 1,024 B yaque is faster (4.18–4.27), and Chronicle Queue (3.48–4.00) is level with tickertape (3.44–3.52).
+
+**Latency.**
+- Chronicle Queue has the lowest medians: 0.4–0.6 µs, against 0.3–1.1 µs for tickertape's zero-copy reader and
+  2.6–3.3 µs for its safe reader.
+- At 100,000 records/s, tickertape's tails (p99.9) beat Chronicle Queue's for both payload sizes: at 1,024 B, 31–70 µs
+  against 76–142 µs.
+- At 64 B and 10,000 records/s, Chronicle Queue's tail is lower: 2.6–7.8 µs against 16–21 µs.
+- The plain-file baseline and yaque have lower p99.9 in some cells. Neither validates records against corruption
+  or offers multi-reader replay, and yaque's 1,024 B tails reach milliseconds.
+
+### tickertape's own benchmarks, Linux
+
+`tt-latency` (writer-to-reader visible latency at 100,000 records/s; µs; two runs). On Linux `WriterConfig::prefault`
+has no effect (ADR 0023), so the `prefault` and `no-prefault` rows are the same configuration measured twice.
+
+| Payload | Reader | Wait | p50 | p99 | p99.9 | p99.99 | max |
+|---|---|---|---|---|---|---|---|
+| 64 B | mapped | spin | 0.28 | 8.3–8.4 | 27–31 | 42–141 | 200–693 |
+| 64 B | mapped | spin, `--no-prefault` | 0.28 | 4.2–7.7 | 28–30 | 46–47 | 233–302 |
+| 64 B | safe | spin | 2.6 | 13 | 20–21 | 29–34 | 98–191 |
+| 64 B | safe | default (blocks on the wake-up region) | 2.6 | 9.1–12 | 19–21 | 29–34 | 64–106 |
+| 64 B | safe | sleep (poll with back-off) | 2.5–2.6 | 8.5–9.0 | 20–21 | 30–35 | 105–285 |
+| 1,024 B | mapped | spin | 0.95–0.97 | 28–30 | 72–79 | 1,064–1,193 | 1,502–1,767 |
+| 1,024 B | mapped | spin, `--no-prefault` | 0.95–0.96 | 28 | 64–67 | 1,018–1,028 | 1,346–1,451 |
+| 1,024 B | safe | spin | 3.1 | 18–19 | 29 | 444–452 | 783–792 |
+| 1,024 B | safe | default | 3.1 | 18 | 28–30 | 377–431 | 697–759 |
+| 1,024 B | safe | sleep | 3.1 | 20–21 | 33–36 | 354–608 | 494–1,032 |
+
+`tt-checkpoint` (16 MiB segments, 1,000 records between checkpoints, 200 checkpoints):
+
+| Payload | `checkpoint()` p50 | p99 | Roll append | Other appends, p99.9 |
+|---|---|---|---|---|
+| 64 B | 0.32–0.33 ms | 0.42–0.47 ms | 0.27–0.29 ms (one roll) | 4.3–4.5 µs |
+| 1,024 B | 0.64 / 7.4 ms | 8.3 ms | p50 0.23–0.31 ms, max 0.34 ms (12 rolls) | 33–35 µs |
+
+The two 1,024 B runs differ in `checkpoint()` p50 (0.64 ms and 7.4 ms); both are shown.
+
+Criterion (point estimates):
+
+| Benchmark | Result |
+|---|---|
+| append, 64 B | 20.5 / 20.8 million records/s |
+| append, 1,024 B | 2.54 / 2.76 million records/s |
+| replay, 64 B, safe / zero-copy | 24.6 / 25.7 million records/s |
+| replay, 1,024 B, safe / zero-copy | 3.50 / 3.28 million records/s |
+
+The append rows are the `prefault` and `no-prefault` variants. Those are the same configuration on Linux, so their
+difference shows the noise: up to 9 %.
+
+Cold-cache replay (`tt-latency --cold`, page cache dropped with `drop_caches`, safe reader):
+- 64 B: 9.1 million records/s, 581–584 MB/s of payload.
+- 1,024 B: 0.54 million records/s, 553–555 MB/s.
+
+The NVMe instance store is the limit here.
+
+### macOS (secondary)
+
+Comparison (same suite and workloads, `98ce513`). Aeron has enough cores here, and its tails are low.
+
+W1 append and W3 warm replay (million records/s):
+
+| Tool | W1, 64 B | W1, 1,024 B | W3, 64 B | W3, 1,024 B |
+|---|---|---|---|---|
+| **tickertape** (safe / zero-copy for W3) | 10.74–11.03 | 0.96–0.98 | 51.78–53.25 / 47.52–49.32 | 7.47–7.55 / 6.63–6.65 |
+| chronicle | 10.38–10.60 | 4.02–4.12 | 28.64–38.37 | 3.26–3.62 |
+| yaque | 0.32–0.33 | 0.27 | 30.88–31.21 | 6.79–6.81 |
+| queue-file | 0.16 | 0.13 | 1.14–1.16 | 0.99–1.01 |
+| plain-file | 0.32–0.33 | 0.26–0.27 | 3.24–3.29 | 2.74–2.83 |
+
+W1 on this Mac varied far more between recordings than between the two runs of one recording. An earlier recording
+the same day, at `fef4be5` before the background segment preparation of ADR 0022, measured tickertape at 23.5–26.0
+million records/s at 64 B and 2.59–2.61 at 1,024 B. Treat the Mac W1 column as unreliable under background load.
+
+W2 at 100,000 records/s (µs, p50 / p99 / p99.9 / max):
+
+| Tool | 64 B | 1,024 B |
+|---|---|---|
+| **tickertape**, zero-copy | 0 / 0 / 5–8 / 74–77 | 0 / 2–3 / 1,922–2,255 / 3,844–4,649 |
+| **tickertape**, safe | 1 / 2–7 / 13–43 / 507–522 | 2 / 12–36 / 1,288–1,309 / 3,568–3,623 |
+| chronicle | 0 / 1 / 17–19 / 1,388–1,983 | 0 / 517–703 / 2,537–3,672 / 3,924–6,132 |
+| aeron (IPC, no persistence) | 0 / 1 / 66–120 / 728–1,663 | 0 / 1 / 88–94 / 769–1,249 |
+
+The Mac's `tt-latency` timer resolution is 1 µs, so "0" means below 1 µs. On APFS a roll still takes about 3.5 ms
+(the header sync), which dominates the 1,024 B tails.
+
+tickertape's own benchmarks on macOS:
+
+| Benchmark | With background work (`prefault(true)`) | Without (`prefault(false)`) |
+|---|---|---|
+| append, 64 B (Criterion) | 9.96 million records/s, 776 MiB/s | 1.89 million records/s, 305 MiB/s |
+| append, 1,024 B (Criterion) | 1.87 million records/s, 1.88 GiB/s | 0.65 million records/s, 612 MiB/s |
+| `tt-latency`, 64 B, zero-copy, p99.9 | 4–28 µs | 149–249 µs |
+| `tt-latency`, 1,024 B, zero-copy, p99.9 | 2.5–2.8 ms | 23–38 ms |
+
+Other macOS numbers:
+- Replay (Criterion): 55.4 / 50.9 million records/s at 64 B (safe / zero-copy), 8.34 / 7.21 at 1,024 B.
+- `checkpoint()` p50: 8.0–9.6 ms. It ends with `F_FULLFSYNC`, which flushes the drive's cache.
+- Roll appends: 3.3–3.7 ms.
 
 ## 2026-10-31, after the reader change (v0.2 work, commit `a2d4530`)
 

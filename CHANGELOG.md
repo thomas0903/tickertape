@@ -3,8 +3,42 @@
 All notable changes to `tickertape` and `tickertape-cli` are listed here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the crates follow [Semantic Versioning](https://semver.org/).
 
-## Unreleased
+## [0.3.0] - 2026-11-02
 
+Not yet published to crates.io. The on-disk format is unchanged (version 1); v0.1 and v0.2 journals work as they
+are. Two new files may appear in a journal directory:
+- `notify`, an 80-byte wake-up record;
+- on macOS, `next-segment.tmp`, the next segment prepared in the background.
+
+Format v1 readers ignore both.
+
+- Benchmarks: a comparison suite against Chronicle Queue, Aeron, yaque, queue-file and plain files (`compare/`,
+  ADR 0018), recorded on Linux (an AWS cloud VM) and macOS; results and caveats in `docs/benchmarks.md`.
+  `run-recorded.sh` and the comparison runner now sync between runs, so earlier runs' write-back can't distort
+  later ones.
+- Performance (macOS): the writer prefaults the active segment from a background thread (ADR 0020;
+  `WriterConfig::prefault`, on by default). On APFS, first writes into preallocated pages were the writer's
+  bottleneck; appends no longer stall on them in steady state. Not used on Linux, where the equivalent advice made
+  latency worse (ADR 0023).
+- Performance (macOS): the next segment is prepared (preallocated, synced, mapped and prefaulted) in the
+  background once the active one is half full (ADR 0022). A roll then only writes, syncs and links the header: on
+  APFS the writer's roll stall dropped from about 50 ms to about 5 ms. Part of `WriterConfig::prefault`. Not used on
+  Linux, where a synchronous roll costs about 1 ms on ext4 and the spare occasionally stalled the writer (ADR 0023).
+- Performance: CRC32C uses the CPU instruction directly for records up to 512 bytes (ADR 0019), which speeds up
+  `append` and both readers for short records. Results are bit-identical; the format is unchanged.
+- Performance: the zero-copy reader copies records for validation with a plain word loop (faster replay).
+- Benchmarks: `tt-latency --wait spin|default|block|sleep` selects how the reader waits.
+- Library: reader wake-ups (ADRs 0017, 0021). Blocked readers wait in a shared-memory region that the writer
+  creates and names in the journal's `notify` record (futex on a sealed memfd on Linux, `os_sync_wait_on_address`
+  on a POSIX shared-memory object on macOS 14.4+) instead of sleeping; a new record wakes them within
+  microseconds. The region can't shrink, so the safe reader still can't receive `SIGBUS`. On by default
+  (`ReaderConfig::notify`, `WriterConfig::notify`); readers poll where wake-ups are unavailable, including between
+  different users.
+- Library: add `retention::{Policy, Action, plan, apply}` for checkpoint-covered sealed prefixes, opt-in
+  `WriterConfig::retention`, `Writer::last_retention_error` and cumulative `Writer::retention_report`.
+  Retention errors never fail open, append or checkpoint. No on-disk format change.
+- CLI: add `archive` with move/delete, count/bytes/age limits, read-only `--dry-run` and a documented `--json`
+  schema. It is the only command that changes a journal. Existing archive files are never replaced.
 - CLI: add read-only `stats` with streaming range/checkpoint statistics, bounded payload percentiles, exact
   UTC-second counts, and a documented `--json` schema.
 - Library: `Reader::records()`, an iterator of owned records committed so far (for `take`, `filter`, `collect`).
@@ -55,5 +89,6 @@ First release. Not yet published to crates.io.
 - Snappy Parquet export with raw unsigned metadata, bounded row groups, and opt-in `--decode market-demo` columns
   (also a `decoded` object in JSONL). Default JSONL output is unchanged by `--decode`.
 
+[0.3.0]: https://github.com/thomas0903/tickertape/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/thomas0903/tickertape/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/thomas0903/tickertape/releases/tag/v0.1.0

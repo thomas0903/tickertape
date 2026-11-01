@@ -1,7 +1,11 @@
 # Command-line interface (M5–M6)
 
-Install/build the `tickertape-cli` package; its binary is `tickertape`. Commands use the public library API,
-open journals read-only, and never take the writer lock. Paths may name a journal with an active writer.
+Install/build the `tickertape-cli` package; its binary is `tickertape`. Commands use the public library API
+and never take the writer lock. **`archive` is the only command that changes a journal**; all other commands never
+write segments, the checkpoint marker or any other journal data. Paths may name a journal with an active writer.
+The one other write is that a following `tail`, while it waits for new records, registers itself as a waiter in the
+writer's shared-memory wake-up region (ADRs 0017, 0021), which is outside the journal directory and holds no
+journal data.
 
 All commands support `--help`. Exit codes: **0** success (including help, exhausted input, count reached or idle
 timeout), **1** usage, I/O or missing-journal error, **2** corrupt data or an unsupported journal format.
@@ -59,6 +63,21 @@ Errors and recovery warnings go to stderr. JSON results go to stdout (or the sel
   second counts for unordered input spill to two anonymous temporary files outside the journal when needed;
   temporary disk usage grows linearly with nonzero timestamp count. Temporary storage errors return **1**.
   If `TMPDIR` resolves inside the journal, spilling fails without creating files there.
+
+- `archive <DIR> (--to <DEST> | --delete) [--keep-segments N] [--max-bytes B] [--older-than DUR]
+  [--dry-run] [--json]`: requires at least one limit and exactly one action. Removes only a contiguous sealed
+  prefix strictly before the checkpoint segment, stopping at the first ineligible segment or error. Without a
+  valid checkpoint nothing is eligible. Limits combine with OR; counts and bytes include every segment, including
+  the active one, so checkpoint eligibility can prevent reaching the limit. Age uses the successor header's
+  creation time as seal time. `DUR` is a nonnegative integer followed by `d`, `h`, `m` or `s` (for example `30d`,
+  `12h`, `90m`, `3600s`). `B` is a nonnegative integer with an optional uppercase `K`, `M`, `G` or `T` suffix
+  multiplying by 1024, 1024², 1024³ or 1024⁴. Overflow is a usage error. `--dry-run` prints only the plan and
+  changes no files; otherwise the command applies the plan and reports removal counts. `--to` requires an
+  existing directory; moves never replace existing entries, even identical copies from an interrupted move.
+  Same-filesystem moves use a no-replace rename; `EXDEV` uses a synced copy before source removal. Earlier
+  removals remain in effect on failure. Exit **0** includes nothing to do, **1** is usage/I/O/conflict, **2** is
+  corruption where retention validates the checkpoint or candidate chain. See [operations](operations.md) for
+  interrupted-copy conflict resolution. No JSON output is produced on failure; diagnostics go to stderr.
 
 ## Machine-readable contracts
 
@@ -146,6 +165,22 @@ order. A zero gap is valid. It is null when no eligible pair exists. Gaps and de
 An empty selection has zero totals, null sequence bounds, an empty schema array, null payload lengths,
 zero time counts/decreases, null time extrema/UTC/span/rate/busiest second, and a null local gap.
 A field with no set timestamps likewise has null time summaries and zero counts/decreases.
+
+### `archive --json`
+
+```text
+{"dry_run":bool,
+ "segments":[{"file":string,"base_seq":u64,"size_bytes":u64,"sealed_unix_ns":u64,
+              "reasons":["max_segments"|"max_bytes"|"max_age", ...]}, ...],
+ "report":{"removed_segments":u64,"removed_bytes":u64,"already_removed_segments":u64}|null}
+```
+
+`segments` is the plan in removal order (oldest first). `file` is a basename. `size_bytes` is the full segment
+size; `sealed_unix_ns` is the successor's creation timestamp. `reasons` lists all limits requesting each removal
+in count, bytes, age order, evaluated after preceding planned removals. `report` is null for a dry run; otherwise
+it counts files and full bytes removed by this run, and planned files already absent at the oldest end due to a
+concurrent archiver. A successful empty plan yields an empty `segments` array and zero report counts (or null in
+a dry run). JSON numbers preserve their u64 interpretation; consumers should use field names.
 
 ### Parquet (`export --format parquet`)
 

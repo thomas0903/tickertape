@@ -66,15 +66,25 @@ Improvements after v0.1.0. Same rule: done only when every criterion holds and C
   - An example that records a public exchange trade feed (Binance, no API key) into a journal with the market-demo
     schema. Not built by default; CI only builds it and never touches the network.
 
-## v0.3 (in progress)
+## v0.3
 
 Owner decisions of 2026-11-01: build the former "Later" items below, benchmark against other tools, push performance.
 
-- [ ] **Retention and archiving** (ADR 0016): `retention` module, writer policy, `tickertape archive`, crash contract
-- [ ] **Reader wake-ups** (ADR 0017): notify file, futex / `os_sync_wait_on_address`, cross-provider review
-- [ ] **Comparison suite** (ADR 0018): Chronicle Queue, Aeron, yaque, queue-file, plain files; recorded results
-- [ ] **Performance work** driven by profiling and the comparison results
+- [x] **Retention and archiving** (ADR 0016): `retention` module, writer policy, `tickertape archive`, crash contract
+  C14
+- [x] **Reader wake-ups** (ADRs 0017, 0021): shared memory that can't shrink, futex / `os_sync_wait_on_address`
+- [x] **Comparison suite** (ADR 0018): Chronicle Queue, Aeron, yaque, queue-file and plain files; recorded on Linux
+  (AWS) and macOS
+- [x] **Performance work** (ADRs 0019, 0020, 0022, 0023): hardware CRC32C; on macOS, background prefaulting and a
+  prepared next segment; on Linux, neither, as measured
 - [ ] Release v0.3.0
+
+## Next (candidates, not commitments)
+
+- Bare-metal Linux runs (x86-64 and Graviton) once the EC2 vCPU quota allows, including xfs.
+- A Linux prefault scheme that doesn't dirty pages ahead of the writer, for example very small windows or
+  rate-adaptive prefaulting (ADR 0023).
+- Faster replay of large records (1 KiB replay trails yaque and Chronicle Queue on Linux).
 
 ## Later (explicitly out of scope for v0.1)
 

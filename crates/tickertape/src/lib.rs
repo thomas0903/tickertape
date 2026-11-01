@@ -44,6 +44,7 @@ compile_error!("tickertape supports Unix (Linux and macOS) only");
 
 pub mod clock;
 mod config;
+mod crc;
 mod error;
 #[cfg(feature = "fault-injection")]
 #[doc(hidden)]
@@ -54,10 +55,13 @@ pub mod format;
 pub mod inspect;
 mod journal;
 mod mmap;
+mod notify;
+mod prefault;
 #[cfg(all(test, loom))]
 mod protocol_model;
 mod reader;
 mod record;
+pub mod retention;
 mod writer;
 
 pub use config::{Backoff, ReaderConfig, RecoveryPolicy, WriterConfig};

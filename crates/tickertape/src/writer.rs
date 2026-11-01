@@ -12,6 +12,7 @@ use crate::error::{CorruptReason, Error, Result};
 use crate::format::{self, CheckpointSlot, RecordHeader, ScanEnd, SegmentHeader, SegmentView};
 use crate::journal::{self, CHECKPOINT_FILE, LOCK_FILE, QUARANTINE_DIR};
 use crate::mmap::{self, MapRw};
+use crate::prefault::{Prefaulter, Spare};
 use crate::record::NewRecord;
 
 /// The only process allowed to append to a journal.
@@ -42,11 +43,21 @@ pub struct Writer {
     /// Directories whose entries changed since the last checkpoint.
     dirty_dirs: BTreeSet<PathBuf>,
     checkpoint_file: File,
+    /// The wake-up region, if enabled and available (ADRs 0017 and 0021).
+    notify: Option<mmap::Notify>,
+    /// The background prefault thread, if enabled and started (ADR 0020).
+    prefault: Option<Prefaulter>,
+    /// The next segment being prepared in the background, if requested (ADR 0022).
+    spare: Option<std::thread::JoinHandle<io::Result<Spare>>>,
+    /// Whether a spare has been requested for the current active segment.
+    spare_requested: bool,
     generation: u64,
     poisoned: bool,
     /// Set if an abandoned write's zeroing could not be made durable; see `append_with`.
     appends_blocked: bool,
     report: RecoveryReport,
+    retention_report: crate::retention::Report,
+    last_retention_error: Option<Error>,
 }
 
 /// An open, mapped segment.
@@ -94,7 +105,9 @@ impl Writer {
     /// Takes the lock, then recovers the journal as described in `docs/format.md` → Recovery: validates the chain
     /// of records from the last checkpoint marker (or the oldest segment, if there is none) to the end, repairs or
     /// quarantines what is invalid, and syncs every repair before returning. What it did is in
-    /// [`Writer::recovery_report`]. Open time is proportional to the data written since the last checkpoint.
+    /// [`Writer::recovery_report`]. Open time is proportional to the data written since the last checkpoint,
+    /// plus any configured retention work. Retention runs after recovery and its errors are recorded separately
+    /// in [`Writer::last_retention_error`], without failing open.
     ///
     /// # Errors
     ///
@@ -140,7 +153,13 @@ impl Writer {
         }
 
         report.next_seq = state.next_seq;
-        Ok(Writer {
+        let notify = crate::notify::open_for_writer(&dir, config.notify);
+        // The helper only runs on macOS: on Linux, prefault advice made latency far worse at high byte rates (the
+        // pages it dirtied ahead were written back under the writer), so there only the spare is used (ADR 0023).
+        let prefault = (config.prefault && cfg!(target_vendor = "apple"))
+            .then(|| Prefaulter::start(state.active.map.advice(), state.offset))
+            .flatten();
+        let mut writer = Writer {
             dir,
             config,
             _lock: lock,
@@ -151,11 +170,19 @@ impl Writer {
             dirty: state.dirty,
             dirty_dirs,
             checkpoint_file,
+            notify,
+            prefault,
+            spare: None,
+            spare_requested: false,
             generation: checkpoint.map_or(0, |c| c.generation),
             poisoned: false,
             appends_blocked: false,
             report,
-        })
+            retention_report: crate::retention::Report::default(),
+            last_retention_error: None,
+        };
+        writer.run_retention();
+        Ok(writer)
     }
 
     /// Appends a record and returns its sequence number.
@@ -266,12 +293,31 @@ impl Writer {
             .store_commit_word(offset, len)
             .ok_or_else(|| internal(&self.active.path, "commit word out of bounds"))?;
         self.offset = offset + format::align8(u64::from(len));
+        if let Some(notify) = &self.notify {
+            notify.publish();
+        }
+        if let Some(prefault) = &mut self.prefault {
+            prefault.advanced(self.offset);
+        }
+        // Once the active segment is half full, prepare the next one off the writer's thread (ADR 0022). macOS only: on
+        // ext4 a synchronous roll costs about 1 ms, and the spare's preallocation sync occasionally stalled the writer
+        // for tens of milliseconds (ADR 0023).
+        if self.config.prefault
+            && cfg!(target_vendor = "apple")
+            && !self.spare_requested
+            && self.offset >= self.active.size / 2
+        {
+            self.spare_requested = true;
+            self.spare = crate::prefault::prepare_spare(&self.dir, self.config.segment_size);
+        }
         self.next_seq = seq + 1;
         Ok(seq)
     }
 
     /// Makes every record appended so far durable, using the platform's sync calls (see
     /// `docs/crash-contract.md` → What `checkpoint()` does). Blocks until they finish.
+    /// Configured retention then runs; its failures are recorded by [`Writer::last_retention_error`] and do not
+    /// change the successful checkpoint result or poison the writer.
     ///
     /// # Errors
     ///
@@ -285,6 +331,8 @@ impl Writer {
         let result = self.checkpoint_inner();
         if result.is_err() {
             self.poisoned = true;
+        } else {
+            self.run_retention();
         }
         result
     }
@@ -336,13 +384,17 @@ impl Writer {
             .map_err(|e| Error::io("sync checkpoint marker", &marker_path, e))?;
 
         self.generation = generation;
+        // Durable-only readers wait for the marker to move.
+        if let Some(notify) = &self.notify {
+            notify.publish();
+        }
         self.dirty.clear();
         self.dirty_dirs.clear();
         self.active_dirty_from = self.offset;
         Ok(())
     }
 
-    /// The sequence number the next append will get. Equals the number of records in the journal.
+    /// The sequence number the next append will get, including history already removed by retention.
     pub fn next_seq(&self) -> u64 {
         self.next_seq
     }
@@ -350,6 +402,29 @@ impl Writer {
     /// What recovery did when this writer opened the journal.
     pub fn recovery_report(&self) -> &RecoveryReport {
         &self.report
+    }
+
+    /// Cumulative successful retention removals since open, including partially failed runs.
+    pub fn retention_report(&self) -> &crate::retention::Report {
+        &self.retention_report
+    }
+
+    /// Most recent retention error since open. A later successful run does not clear it.
+    /// Retention errors never poison the writer or fail open, append or checkpoint.
+    pub fn last_retention_error(&self) -> Option<&Error> {
+        self.last_retention_error.as_ref()
+    }
+
+    fn run_retention(&mut self) {
+        let Some((policy, action)) = &self.config.retention else {
+            return;
+        };
+        let result = crate::retention::plan(&self.dir, policy).and_then(|plan| {
+            crate::retention::apply_into(&self.dir, &plan, action, &mut self.retention_report)
+        });
+        if let Err(error) = result {
+            self.last_retention_error = Some(error);
+        }
     }
 
     /// The journal directory.
@@ -364,7 +439,11 @@ impl Writer {
     /// Rolls to a new segment (`docs/format.md` → Rolling).
     fn roll(&mut self) -> Result<()> {
         let next_base = self.next_seq;
-        let new = create_segment(&self.dir, next_base, self.config.segment_size)?;
+        let new = match self.take_spare() {
+            Some(spare) => publish_spare(&self.dir, next_base, self.config.segment_size, spare)?,
+            None => create_segment(&self.dir, next_base, self.config.segment_size)?,
+        };
+        self.spare_requested = false;
         self.dirty_dirs.insert(self.dir.clone());
         // After the link, the roll always completes: seal the old segment, then switch.
         let seal_at = self.offset;
@@ -388,8 +467,76 @@ impl Writer {
         });
         self.offset = format::SEGMENT_HEADER_LEN as u64;
         self.active_dirty_from = self.offset;
+        if let Some(prefault) = &mut self.prefault {
+            prefault.switch(self.active.map.advice(), self.offset);
+        }
+        if let Some(notify) = &self.notify {
+            notify.publish();
+        }
         Ok(())
     }
+}
+
+impl Writer {
+    /// Waits for the spare being prepared, if any, and returns it if it is usable for this journal's segment size.
+    fn take_spare(&mut self) -> Option<Spare> {
+        match self.spare.take()?.join() {
+            Ok(Ok(spare)) if spare.size == self.config.segment_size => Some(spare),
+            Ok(Ok(_)) => {
+                let _ = fs::remove_file(self.dir.join(journal::SPARE_FILE));
+                None
+            }
+            // Preparing failed (it removed its own file) or the thread panicked: create the segment synchronously.
+            _ => None,
+        }
+    }
+}
+
+impl Drop for Writer {
+    fn drop(&mut self) {
+        // Don't leave a spare behind for the next writer's recovery to clean up.
+        if let Some(Ok(Ok(spare))) = self.spare.take().map(|h| h.join()) {
+            drop(spare);
+            let _ = fs::remove_file(self.dir.join(journal::SPARE_FILE));
+        }
+    }
+}
+
+/// Publishes a prepared spare as segment `base` (ADR 0022): write and sync its header, then link it into place, as
+/// [`create_segment`] does for a new file. If the header can't be written or synced, the spare is discarded and the
+/// segment is created synchronously instead; a failed link is reported like [`create_segment`]'s.
+fn publish_spare(dir: &Path, base: u64, size: u64, spare: Spare) -> Result<Segment> {
+    let spare_path = dir.join(journal::SPARE_FILE);
+    let path = journal::segment_path(dir, base);
+    let header = format::encode_segment_header(&SegmentHeader {
+        segment_size: size,
+        base_seq: base,
+        created_unix_ns: crate::clock::realtime_ns(),
+    });
+    let prepared = crate::fault::inject(crate::fault::Point::SpareHeader)
+        .and_then(|()| spare.file.write_all_at(&header, 0))
+        .and_then(|()| mmap::sync_data(&spare.file));
+    if prepared.is_err() {
+        drop(spare);
+        let _ = fs::remove_file(&spare_path);
+        return create_segment(dir, base, size);
+    }
+    if let Err(e) = crate::fault::inject(crate::fault::Point::Link)
+        .and_then(|()| fs::hard_link(&spare_path, &path))
+    {
+        drop(spare);
+        let _ = fs::remove_file(&spare_path);
+        return Err(Error::io("publish segment", &path, e));
+    }
+    // Publication happened; a leftover spare name is harmless and removed at the next open.
+    let _ = fs::remove_file(&spare_path);
+    Ok(Segment {
+        base,
+        size,
+        path,
+        file: spare.file,
+        map: spare.map,
+    })
 }
 
 /// An internal bounds check failed (a bug, reported as an error rather than a panic).
@@ -539,7 +686,11 @@ struct Recovery<'a> {
 
 impl Recovery<'_> {
     fn remove_tmp_files(&mut self) -> Result<()> {
-        for tmp in journal::list_tmp_files(self.dir)? {
+        let spare = self.dir.join(journal::SPARE_FILE);
+        let leftovers = journal::list_tmp_files(self.dir)?
+            .into_iter()
+            .chain(spare.symlink_metadata().is_ok().then_some(spare));
+        for tmp in leftovers {
             fs::remove_file(&tmp).map_err(|e| Error::io("remove temporary segment", &tmp, e))?;
             self.report
                 .actions

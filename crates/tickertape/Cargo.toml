@@ -22,6 +22,8 @@ fault-injection = []
 libc = "0.2"
 thiserror = "2"
 crc32c = "0.6"
+# Safe, atomic no-replace rename on Linux/macOS (MIT OR Apache-2.0 WITH LLVM-exception).
+rustix = { version = "1", features = ["fs"] }
 
 [dev-dependencies]
 proptest = "1"

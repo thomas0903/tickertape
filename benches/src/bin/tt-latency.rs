@@ -23,12 +23,20 @@ const HELP: &str = "tt-latency: cross-process writer-to-reader visible latency
 Usage: tt-latency run --dir <DIR> --rate <records/s> --count <N>
                      --payload <bytes> --reader safe|mapped
                      [--warmup <N>] [--segment-size <bytes>] [--json] [--cold]
+                     [--wait spin|default|block|sleep] [--no-prefault]
        tt-latency --help
 
 --dir must be new or empty; data is retained. --count includes --warmup (default 0),
 which must be smaller than count. Segment size defaults to 134217728 (128 MiB).
 The parent spawns itself as writer and reader, waits for both to be ready, and
-releases a shared future start time. Reader uses Backoff::busy_spin().
+releases a shared future start time.
+
+--wait sets how the reader waits for the next record (default spin):
+  spin     Backoff::busy_spin(), one core at 100 %
+  default  ReaderConfig::default(): 100 spins, 10 yields, then block on the notify file
+  block    no spins or yields: block on the notify file at once (kernel wake-up only)
+  sleep    Backoff::default() with notify off: spins, yields, then 10 us..1 ms sleeps
+--no-prefault starts the writer with WriterConfig::prefault(false) (no helper thread).
 
 Coordinated omission: record i is scheduled at t0 + floor(i * 1e9 / rate) using
 tickertape::clock::realtime_ns() on one host. local_ts_ns stores the INTENDED time,
@@ -39,7 +47,8 @@ is in microseconds. Visibility is measured after reader validation, not durabili
 Writer rate covers first append start through last append completion, including
 scheduled waits; late_records counts sends starting >1 us after their intended time
 (including warmup). Wall-clock jumps can distort results; backwards observations
-fail. No core pinning is performed. Both processes busy-poll and consume CPU.
+fail. No core pinning is performed. The writer busy-waits for its schedule; with
+--wait spin the reader also busy-polls.
 
 --cold: writer pre-writes, checkpoints and exits before a fresh reader is spawned.
 Tries Linux sudo -n sh -c 'echo 3 > /proc/sys/vm/drop_caches' or macOS sudo -n purge.
@@ -59,6 +68,8 @@ struct Config {
     count: u64,
     payload: usize,
     reader: String,
+    wait: String,
+    prefault: bool,
     warmup: u64,
     segment_size: u64,
     json: bool,
@@ -77,11 +88,12 @@ impl Config {
             "--reader",
             "--warmup",
             "--segment-size",
+            "--wait",
         ];
         if child {
             values.push("--control");
         }
-        let options = Options::parse(args, &values, &["--json", "--cold"])?;
+        let options = Options::parse(args, &values, &["--json", "--cold", "--no-prefault"])?;
         let rate = options.number("--rate", None)?;
         let count = options.number("--count", None)?;
         let warmup = options.number("--warmup", Some(0))?;
@@ -91,6 +103,10 @@ impl Config {
         let reader = options.required("--reader")?.to_owned();
         if reader != "safe" && reader != "mapped" {
             return Err("reader must be safe or mapped".into());
+        }
+        let wait = options.optional("--wait").unwrap_or("spin").to_owned();
+        if !["spin", "default", "block", "sleep"].contains(&wait.as_str()) {
+            return Err("wait must be spin, default, block or sleep".into());
         }
         let payload = options.number("--payload", None)?.try_into()?;
         let segment_size =
@@ -114,6 +130,8 @@ impl Config {
             count,
             payload,
             reader,
+            wait,
+            prefault: !options.flag("--no-prefault"),
             warmup,
             segment_size,
             json: options.flag("--json"),
@@ -243,7 +261,7 @@ fn run(config: &Config, args: &[String]) -> Result<()> {
     };
     let mut result = json!({"mode": if config.cold { "cold_replay" } else { "visible_latency" },
         "count": config.count, "rate": config.rate, "payload": config.payload, "reader": config.reader,
-        "warmup": config.warmup, "segment_size": config.segment_size});
+        "wait": config.wait, "prefault": config.prefault, "warmup": config.warmup, "segment_size": config.segment_size});
     if config.cold {
         result["replay"] = reader_result;
     } else {
@@ -255,12 +273,14 @@ fn run(config: &Config, args: &[String]) -> Result<()> {
         println!("{result}");
     } else {
         println!(
-            "mode={} count={} rate={} records/s payload={} B reader={} warmup={} segment_size={} B",
+            "mode={} count={} rate={} records/s payload={} B reader={} wait={} prefault={} warmup={} segment_size={} B",
             result["mode"],
             config.count,
             config.rate,
             config.payload,
             config.reader,
+            config.wait,
+            config.prefault,
             config.warmup,
             config.segment_size
         );
@@ -292,7 +312,9 @@ fn writer(config: &Config) -> Result<()> {
     let control = config.control.as_ref().ok_or("missing control directory")?;
     let mut writer = Writer::open(
         &config.dir,
-        WriterConfig::default().segment_size(config.segment_size),
+        WriterConfig::default()
+            .segment_size(config.segment_size)
+            .prefault(config.prefault),
     )?;
     let payload = vec![0x5a; config.payload];
     let deadline = Instant::now() + config.timeout;
@@ -345,7 +367,19 @@ fn reader(config: &Config) -> Result<()> {
     let control = config.control.as_ref().ok_or("missing control directory")?;
     let start = Instant::now();
     let deadline = start + config.timeout;
-    let reader_config = ReaderConfig::default().backoff(Backoff::busy_spin());
+    let reader_config = match config.wait.as_str() {
+        "spin" => ReaderConfig::default()
+            .backoff(Backoff::busy_spin())
+            .notify(false),
+        "block" => {
+            let mut backoff = Backoff::default();
+            backoff.spins = 0;
+            backoff.yields = 0;
+            ReaderConfig::default().backoff(backoff)
+        }
+        "sleep" => ReaderConfig::default().notify(false),
+        _ => ReaderConfig::default(),
+    };
     let mut reader = if config.reader == "mapped" {
         // SAFETY: only the tickertape writer modifies the journal; the run owns a fresh directory.
         unsafe { Reader::open_mapped(&config.dir, reader_config)? }

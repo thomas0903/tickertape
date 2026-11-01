@@ -30,6 +30,22 @@ pub struct WriterConfig {
     pub segment_size: u64,
     /// What to do with a corrupt tail on open. Default: [`RecoveryPolicy::Quarantine`].
     pub recovery: RecoveryPolicy,
+    /// Create a shared-memory wake-up region, named in the journal's `notify` record, so that blocked readers wake up
+    /// as soon as a record is published (ADRs 0017 and 0021).
+    /// Costs one atomic increment and one load per append, plus a wake-up system call when readers are blocked.
+    /// Default: true.
+    pub notify: bool,
+    /// On macOS, do segment work in the background, off the writer's thread (APFS makes both expensive):
+    /// - a helper thread (`tickertape-prefault`) keeps the pages ahead of the write position faulted in with
+    ///   `madvise`, so that `append` rarely takes a page fault (ADR 0020);
+    /// - once the active segment is half full, a short-lived thread (`tickertape-spare`) preallocates the next
+    ///   segment, so a roll only writes and links its header (ADR 0022).
+    ///
+    /// On Linux and other systems this setting has no effect: both made latency worse on ext4 (ADR 0023). These
+    /// threads never write records. Set to `false` for a writer that starts no threads on any platform. Default: true.
+    pub prefault: bool,
+    /// Optional retention policy and action, run after open and successful checkpoints. Default: none.
+    pub retention: Option<(crate::retention::Policy, crate::retention::Action)>,
 }
 
 impl WriterConfig {
@@ -42,9 +58,33 @@ impl WriterConfig {
         self
     }
 
+    /// Enables retention after open and every successful checkpoint.
+    /// Failures are recorded by [`Writer::last_retention_error`](crate::Writer::last_retention_error),
+    /// without failing open, appends or checkpoints. The archive directory must already exist.
+    pub fn retention(
+        mut self,
+        policy: crate::retention::Policy,
+        action: crate::retention::Action,
+    ) -> Self {
+        self.retention = Some((policy, action));
+        self
+    }
+
     /// Sets the recovery policy.
     pub fn recovery(mut self, policy: RecoveryPolicy) -> Self {
         self.recovery = policy;
+        self
+    }
+
+    /// Sets whether to wake blocked readers (see [`WriterConfig::notify`]).
+    pub fn notify(mut self, on: bool) -> Self {
+        self.notify = on;
+        self
+    }
+
+    /// Sets whether to do segment work in the background on macOS (see [`WriterConfig::prefault`]).
+    pub fn prefault(mut self, on: bool) -> Self {
+        self.prefault = on;
         self
     }
 }
@@ -54,6 +94,9 @@ impl Default for WriterConfig {
         WriterConfig {
             segment_size: Self::DEFAULT_SEGMENT_SIZE,
             recovery: RecoveryPolicy::default(),
+            notify: true,
+            prefault: true,
+            retention: None,
         }
     }
 }
@@ -100,7 +143,7 @@ impl Default for Backoff {
 }
 
 /// Reader settings.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ReaderConfig {
     /// How to wait for new records.
@@ -110,6 +153,23 @@ pub struct ReaderConfig {
     /// Without a valid marker, no records are returned. See ADR 0010 (`docs/decisions/0010-durable-only-reads.md` in the
     /// repository) and crash contract C13 (`docs/crash-contract.md`) for the durability guarantee and storage assumptions.
     pub durable_only: bool,
+    /// After the spin and yield phases of [`Backoff`], block on the writer's shared-memory wake-up region instead of
+    /// sleeping, so a new record wakes the reader immediately (ADRs 0017 and 0021). The region is found through the
+    /// journal's `notify` record, which the reader only reads. It can't shrink, so this never exposes a safe reader to
+    /// `SIGBUS`. Readers fall back to sleeping when there is no running writer, on macOS before 14.4, when the writer
+    /// runs as another user (or, on Linux, in another pid namespace), or if the platform's wait call fails.
+    /// Default: true.
+    pub notify: bool,
+}
+
+impl Default for ReaderConfig {
+    fn default() -> Self {
+        ReaderConfig {
+            backoff: Backoff::default(),
+            durable_only: false,
+            notify: true,
+        }
+    }
 }
 
 impl ReaderConfig {
@@ -130,6 +190,12 @@ impl ReaderConfig {
     /// ```
     pub fn durable_only(mut self, on: bool) -> Self {
         self.durable_only = on;
+        self
+    }
+
+    /// Sets whether to block on the wake-up region instead of sleeping (see [`ReaderConfig::notify`]).
+    pub fn notify(mut self, on: bool) -> Self {
+        self.notify = on;
         self
     }
 

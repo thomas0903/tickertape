@@ -17,6 +17,9 @@ use crate::record::{OwnedRecord, Record};
 const IDENTITY_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 /// Bytes the `pread` reader fetches at a time (more if a record is larger).
 const CHUNK: usize = 64 * 1024;
+/// Longest single block on the wake-up region when the writer maintains it (bounded so that a writer that died, or a
+/// missed wake-up, costs at most this much latency; the identity check also runs at least this often).
+const NOTIFY_MAX_WAIT: Duration = Duration::from_millis(100);
 /// Re-reads before a validation failure is reported as corruption (the copy may predate the commit).
 const VALIDATION_RETRIES: u32 = 3;
 
@@ -62,6 +65,8 @@ pub struct Reader {
     buf_start: u64,
     /// Scratch buffer for the zero-copy reader's atomic validation copy, reused across records.
     scratch: Vec<u8>,
+    /// The journal's wake-up region, if wake-ups are enabled (ADRs 0017 and 0021).
+    waker: Option<crate::notify::Waker>,
     /// When the reader started waiting at an empty slot.
     waiting_since: Option<Instant>,
 }
@@ -131,6 +136,7 @@ impl Reader {
             });
         };
         let seg = open_segment(dir, *base, mapped)?;
+        let waker = config.notify.then(|| crate::notify::Waker::new(dir));
         Ok(Reader {
             dir: dir.to_path_buf(),
             config,
@@ -143,6 +149,7 @@ impl Reader {
             buf: Vec::new(),
             buf_start: 0,
             scratch: Vec::new(),
+            waker,
             waiting_since: None,
         })
     }
@@ -189,7 +196,7 @@ impl Reader {
     ///
     /// [`Error::Corrupt`] if the bytes at the cursor fail validation. The cursor doesn't move,
     /// so calling again retries the same position (which may succeed after a writer recovery).
-    /// [`Error::Discarded`] if writer recovery replaced or removed the segment at the cursor;
+    /// [`Error::Discarded`] if writer recovery or retention replaced or removed the segment at the cursor;
     /// call [`Reader::seek`] to continue on the current chain.
     /// [`Error::Io`] if the next segment can't be opened.
     pub fn try_next(&mut self) -> Result<Option<Record<'_>>> {
@@ -217,8 +224,69 @@ impl Reader {
             if deadline.is_some_and(|d| Instant::now() >= d) {
                 return Ok(None);
             }
-            waiter.wait(deadline);
+            if waiter.in_blocking_phase() {
+                if let Some(blocked) = self.block(deadline) {
+                    if let Some(found) = blocked? {
+                        return Ok(Some(self.materialize(found)));
+                    }
+                    continue;
+                }
+            }
+            // Wake up for the next refresh of the wake-up record too, so a writer that starts while this reader
+            // polls (with a long `max_sleep`) is noticed within the refresh interval.
+            let refresh = self.waker.as_ref().map(crate::notify::Waker::refresh_due);
+            waiter.wait(earliest(deadline, refresh));
         }
+    }
+
+    /// Blocks on the journal's wake-up region, if there is one: `None` if the reader should poll instead.
+    fn block(&mut self, deadline: Option<Instant>) -> Option<Result<Option<Found>>> {
+        let waker = self.waker.as_mut()?;
+        waker.refresh_if_due();
+        // Never block past the next refresh: a writer that restarted can only wake readers on its new region.
+        let until = earliest(deadline, Some(waker.refresh_due()));
+        let (nonce, notify) = waker.take()?;
+        let (result, supported) = self.block_on(&notify, until);
+        if supported {
+            if let Some(waker) = self.waker.as_mut() {
+                waker.put((nonce, notify));
+            }
+        } else {
+            // The platform's wait call doesn't work here: poll from now on.
+            self.waker = None;
+        }
+        Some(result)
+    }
+
+    /// Blocks on the wake-up region until the writer publishes something or a timeout passes (event-count protocol,
+    /// ADR 0017): register as a waiter, check once more, then wait for the event counter to change. Returns whether
+    /// the platform's wait call is supported; if not, this call slept instead (bounded like a poll).
+    fn block_on(
+        &mut self,
+        notify: &crate::mmap::Notify,
+        deadline: Option<Instant>,
+    ) -> (Result<Option<Found>>, bool) {
+        let seen = notify.begin_wait();
+        let found = self.advance();
+        if !matches!(found, Ok(None)) {
+            notify.end_wait();
+            return (found, true);
+        }
+        let cap = if notify.writer_notifies() {
+            NOTIFY_MAX_WAIT
+        } else {
+            self.config.backoff.max_sleep
+        };
+        let wait = deadline.map_or(cap, |d| {
+            cap.min(d.saturating_duration_since(Instant::now()))
+        });
+        let mut supported = true;
+        if !wait.is_zero() && notify.wait(seen, wait) == crate::mmap::WaitOutcome::Unsupported {
+            supported = false;
+            std::thread::sleep(wait.min(self.config.backoff.max_sleep));
+        }
+        notify.end_wait();
+        (Ok(None), supported)
     }
 
     /// Like [`Reader::try_next`], but copies the record out of the reader.
@@ -617,6 +685,11 @@ impl Waiter {
         }
     }
 
+    /// True once the spin and yield phases are over (the point where a reader sleeps or blocks).
+    fn in_blocking_phase(&self) -> bool {
+        self.step >= u64::from(self.backoff.spins) + u64::from(self.backoff.yields)
+    }
+
     fn wait(&mut self, deadline: Option<Instant>) {
         let spins = u64::from(self.backoff.spins);
         let yields = u64::from(self.backoff.yields);
@@ -637,5 +710,89 @@ impl Waiter {
                 .max(self.backoff.min_sleep);
         }
         self.step = self.step.saturating_add(1);
+    }
+}
+
+/// The earlier of two optional instants (`None` means never).
+fn earliest(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+#[cfg(test)]
+mod wake_tests {
+    use super::*;
+    use crate::mmap::test_hooks::{FORCE_UNSUPPORTED, LOCK, WAITS};
+    use crate::{Writer, WriterConfig};
+
+    fn blocking(sleep: Duration) -> Backoff {
+        Backoff {
+            spins: 0,
+            yields: 0,
+            min_sleep: sleep,
+            max_sleep: sleep,
+        }
+    }
+
+    /// Resets the forced failure even if the test panics.
+    struct Unforce;
+    impl Drop for Unforce {
+        fn drop(&mut self) {
+            FORCE_UNSUPPORTED.store(false, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn idle_waits_block_instead_of_spinning() {
+        let _serial = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let _w = Writer::open(dir.path(), WriterConfig::default().segment_size(1 << 20)).unwrap();
+        let mut r = Reader::open(
+            dir.path(),
+            ReaderConfig::default().backoff(blocking(Duration::from_secs(10))),
+        )
+        .unwrap();
+        let before = WAITS.load(Ordering::SeqCst);
+        let started = Instant::now();
+        assert!(
+            r.next_timeout(Some(Duration::from_millis(350)))
+                .unwrap()
+                .is_none()
+        );
+        assert!(started.elapsed() >= Duration::from_millis(350));
+        // Each wait lasts up to the 100 ms cap (and the 100 ms record refresh): a handful, not a busy loop.
+        let waits = WAITS.load(Ordering::SeqCst) - before;
+        assert!((2..=20).contains(&waits), "{waits} waits in 350 ms");
+    }
+
+    #[test]
+    fn unsupported_waits_fall_back_to_sleeping() {
+        let _serial = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let _w = Writer::open(dir.path(), WriterConfig::default().segment_size(1 << 20)).unwrap();
+        let mut r = Reader::open(
+            dir.path(),
+            ReaderConfig::default().backoff(blocking(Duration::from_millis(20))),
+        )
+        .unwrap();
+        assert!(r.waker.is_some());
+        let _unforce = Unforce;
+        FORCE_UNSUPPORTED.store(true, Ordering::SeqCst);
+        let before = WAITS.load(Ordering::SeqCst);
+        let started = Instant::now();
+        assert!(
+            r.next_timeout(Some(Duration::from_millis(300)))
+                .unwrap()
+                .is_none()
+        );
+        assert!(started.elapsed() >= Duration::from_millis(300));
+        // One failed wait turns wake-ups off; the rest of the time the reader sleeps in 20 ms steps.
+        assert_eq!(WAITS.load(Ordering::SeqCst) - before, 1);
+        assert!(
+            r.waker.is_none(),
+            "wake-ups still on after an unsupported wait"
+        );
     }
 }

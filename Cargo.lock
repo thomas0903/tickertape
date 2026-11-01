@@ -1407,19 +1407,20 @@ dependencies = [
 
 [[package]]
 name = "tickertape"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "crc32c",
  "libc",
  "loom",
  "proptest",
+ "rustix",
  "tempfile",
  "thiserror",
 ]
 
 [[package]]
 name = "tickertape-bench"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "criterion",
  "hdrhistogram",
@@ -1430,7 +1431,7 @@ dependencies = [
 
 [[package]]
 name = "tickertape-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "assert_cmd",
  "base64",
@@ -1445,7 +1446,7 @@ dependencies = [
 
 [[package]]
 name = "tickertape-examples"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ctrlc",
  "serde_json",
@@ -1456,7 +1457,7 @@ dependencies = [
 
 [[package]]
 name = "tickertape-tests"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "tempfile",
  "tickertape",

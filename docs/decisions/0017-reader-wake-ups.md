@@ -1,6 +1,7 @@
 # 0017: Reader wake-ups instead of sleeping
 
-- **Status:** accepted (owner decision: build the "Later" items, 2026-11-01)
+- **Status:** accepted (owner decision: build the "Later" items, 2026-11-01); where the words live amended by
+  [0021](0021-notify-shared-memory.md)
 - **Date:** 2026-11-01
 
 ## Context
@@ -30,6 +31,11 @@ A small shared **notify file**, `<dir>/notify` (4,096 bytes, little-endian, crea
 
 The notify file carries no data: deleting it or its contents being wrong only affects latency, never correctness.
 Format version 1 readers ignore unknown files, so the format version doesn't change.
+
+**Amendment (implementation, same day):** the notify file also has a `u32` flag at offset 128 that the writer sets
+to 1 when it maintains the counter (0 when `WriterConfig::notify` is off). Readers block for at most 100 ms per wait
+when the flag is set, and at most `Backoff::max_sleep` otherwise. The writer also bumps the counter after a seal and
+after each successful checkpoint (durable-only readers wait for the marker to move).
 
 ## Consequences
 

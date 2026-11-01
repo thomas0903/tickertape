@@ -24,9 +24,16 @@ A journal is one directory. Only these names have a meaning; anything else is ig
 |---|---|
 | `{base_seq:020}.tape` | A segment. `base_seq` is the sequence number of its first record, zero-padded to 20 decimal digits so that lexicographic order equals numeric order, e.g. `00000000000001048576.tape` |
 | `{base_seq:020}.tape.tmp` | A segment being created or repaired by the writer. Never read by readers |
+| `next-segment.tmp` | The next segment, prepared in the background before it is needed (ADR 0022): preallocated, synced and all zeros. At roll the writer writes its header, syncs it and links it to `{base_seq:020}.tape`. Never read by readers |
 | `checkpoint` | The checkpoint marker: where the last successful checkpoint ended (see "Checkpoint marker") |
+| `notify` | Wake-up record (ADRs 0017, 0021): 80 bytes naming the running writer's shared-memory wake-up region (magic `TTNOTIFY`, version, kind, nonce, pid and descriptor on Linux or object name on macOS, journal directory identity, CRC32C; layout in ADR 0021). Readers only read it with `pread`; it is replaced by rename, never written in place. Carries no journal data; deleting it or damage to it only affects reader latency |
 | `writer.lock` | Lock file. The writer holds an exclusive `flock` on it while open and writes its PID (decimal ASCII) into it. The PID is informational; the lock is the authority |
 | `quarantine/` | Bytes and segments removed from the journal by recovery, kept so that nothing is silently destroyed. Never read by readers, never deleted by tickertape |
+
+Segments are never removed automatically unless a writer retention policy is configured.
+`tickertape archive` or `tickertape::retention` can remove a contiguous prefix of sealed segments strictly before
+the checkpoint segment; without a valid marker nothing is eligible (ADR [0016](decisions/0016-retention-and-archiving.md)).
+The checkpoint segment and everything after it remain. A retained journal can therefore begin above sequence 0.
 
 Sequence numbers start at 0 and increase by exactly 1 per record across the whole journal, including across
 segments. The first segment is `00000000000000000000.tape`. The largest sequence number a record can have is
@@ -196,8 +203,8 @@ maximum payload for the configured segment size fails with `RecordTooLarge` with
 
 Readers never modify a journal. Only the writer repairs it, on open, after taking the lock and before appending.
 
-1. **Remove stale temporary files** (`*.tape.tmp`). They are never segments (at most a second name for a published
-   one).
+1. **Remove stale temporary files** (`*.tape.tmp` and `next-segment.tmp`). They are never segments (at most a
+   second name for a published one).
 2. **Find the scan start.** With a current checkpoint (see "Checkpoint marker"): its segment must exist and
    its `offset` must be a multiple of 8 in `[64, segment_size - 8]`; otherwise the journal is **refused** with a
    corruption error under every policy, because the history the marker vouches for is missing and recreating that

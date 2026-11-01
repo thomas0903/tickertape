@@ -315,7 +315,9 @@ pub(crate) fn run(args: StatsArgs, out: &mut dyn Write) -> Result<()> {
     };
     let mut reader = Reader::open(
         &args.dir,
-        ReaderConfig::default().durable_only(args.durable_only),
+        ReaderConfig::default()
+            .durable_only(args.durable_only)
+            .notify(false),
     )?;
     if let Some(from) = args.from {
         reader.seek(from)?;

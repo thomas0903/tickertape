@@ -19,6 +19,14 @@ name = "recovery"
 path = "recovery.rs"
 
 [[test]]
+name = "wakeups"
+path = "wakeups.rs"
+
+[[test]]
+name = "spare_segment"
+path = "spare_segment.rs"
+
+[[test]]
 name = "lock"
 path = "lock.rs"
 
@@ -48,3 +56,7 @@ path = "durable_only.rs"
 
 [lints]
 workspace = true
+
+[[test]]
+name = "retention"
+path = "retention.rs"

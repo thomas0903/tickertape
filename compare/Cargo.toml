@@ -1,0 +1,30 @@
+[package]
+name = "tickertape-compare"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+tickertape = { path = "../crates/tickertape" }
+tickertape-bench = { path = "../benches" }
+hdrhistogram = { version = "=7.5.4", default-features = false }
+serde_json = "=1.0.149"
+yaque = "=0.6.6"
+queue-file = "=2.0.0"
+
+[[bin]]
+name = "compare-tickertape"
+path = "tickertape/main.rs"
+[[bin]]
+name = "compare-plain-file"
+path = "plain-file/main.rs"
+[[bin]]
+name = "compare-yaque"
+path = "yaque/main.rs"
+[[bin]]
+name = "compare-queue-file"
+path = "queue-file/main.rs"
+
+[dev-dependencies]
+tempfile = "=3.27.0"

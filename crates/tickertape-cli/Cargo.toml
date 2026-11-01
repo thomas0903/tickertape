@@ -1,6 +1,6 @@
 [package]
 name = "tickertape-cli"
-description = "Read-only tools to tail, inspect, verify, export and summarize tickertape journals"
+description = "Tools to tail, inspect, verify, export, summarize and archive tickertape journals"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

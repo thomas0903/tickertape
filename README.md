@@ -4,18 +4,19 @@
 records events, other processes on the same machine follow them live, and everything can be replayed later or
 exported to Parquet for DuckDB and Python.
 
-> Status: v0.2.0, not yet published to crates.io. Linux and macOS. The on-disk format is version 1.
+> Status: v0.3.0, not yet published to crates.io. Linux and macOS. The on-disk format is version 1.
 
 Think of it as a flight recorder for a trading system or any other latency-sensitive program:
 
 - One **writer** appends events: opaque payload bytes, a gap-free sequence number, a schema id and two timestamps
   you supply (for example exchange time and local receive time).
 - Any number of **readers**, in other processes, follow the journal live or **replay** it from any sequence number.
-  Readers never slow the writer down.
-- Data lives in fixed-size **segment files** that roll over and are never deleted for you, so a journal can be
-  inspected, copied and replayed after an incident or in tests.
+  Readers never slow the writer down. A reader waiting for new records sleeps in the kernel and is woken when the
+  writer appends (futex on Linux, `os_sync_wait_on_address` on macOS 14.4+), and falls back to polling elsewhere.
+- Data lives in fixed-size **segment files** that roll over. Segments are never deleted automatically unless
+  you configure a retention policy; `tickertape archive` can move or delete old, checkpoint-covered segments.
 - The **`tickertape` CLI** tails, inspects, verifies and summarizes journals (`stats`), and exports them to
-  JSONL or Parquet.
+  JSONL or Parquet. Its `archive` command is the only command that changes a journal.
 
 ![tickertape architecture: a writer process appends to segment files and a checkpoint marker in one journal directory; safe and zero-copy reader processes and the CLI read them; the CLI exports Parquet or JSONL for DuckDB and Python](docs/figures/architecture.svg)
 
@@ -30,8 +31,22 @@ readers, retained and replayable files, rolling, and easy inspection. tickertape
   survives a process crash or a power loss on each platform, and which test checks it;
 - a **transparent CLI** and **Parquet export**, so incident analysis happens in DuckDB, pandas or Polars.
 
-It does not try to win on raw latency. Measured numbers, with their hardware, are in
-[`docs/benchmarks.md`](docs/benchmarks.md).
+## Performance
+
+Measured on Linux against Chronicle Queue, Aeron, yaque, queue-file and plain files with the comparison suite in
+[`compare/`](compare/README.md). Full results, hardware and caveats are in [`docs/benchmarks.md`](docs/benchmarks.md).
+The machine was a small AWS cloud VM (`c6id.xlarge`, 2 cores / 4 threads, ext4 on NVMe), not bare metal:
+
+- **Append:** 18.6 million 64-byte records/s, about 5× Chronicle Queue; about 2.5× at 1,024 bytes.
+- **Replay:** fastest of the tools at 64 bytes (24.8–26.3 million records/s). At 1,024 bytes yaque is faster.
+- **Writer-to-reader latency, 100,000 records/s:** the p99.9 of tickertape's readers was 20–28 µs at 64 bytes and
+  31–70 µs at 1,024 bytes, below Chronicle Queue's (38–47 µs and 76–142 µs). Chronicle Queue has lower medians, and
+  a lower tail at 64 bytes and 10,000 records/s.
+
+These are two runs on one machine type, not guarantees. The tools also promise different things:
+- Aeron's IPC transport keeps nothing on disk;
+- yaque is a consuming single-reader queue;
+- the plain-file baseline has no validation or recovery.
 
 ## Quickstart
 
@@ -99,16 +114,16 @@ The full statement, per platform and with the test for each claim, is [`docs/cra
 - **Known limits.** A full btrfs volume can crash the writer with `SIGBUS` even inside preallocated segments; a
   checkpoint on a full APFS volume fails. See the crash contract's "Known risks".
 
-## Non-goals (for v0.1)
+## Non-goals
 
 Replication or any networking; multiple writers to one journal; Windows and network filesystems; live zero-copy
-readers in Python (use the Parquet export); typed zero-copy schemas (payloads are bytes plus a schema id); futex or
-eventfd wake-ups (readers poll with a configurable back-off); latency comparisons with other tools. The full list,
-and what may come later, is in [`docs/roadmap.md`](docs/roadmap.md).
+readers in Python (use the Parquet export); typed zero-copy schemas (payloads are bytes plus a schema id). The full
+list, and what may come later, is in [`docs/roadmap.md`](docs/roadmap.md).
 
 ## Alternatives
 
-A factual overview, not a benchmark. Check each project's own documentation for the current state.
+A factual overview; the measured comparison is in [`docs/benchmarks.md`](docs/benchmarks.md). Check each project's
+own documentation for the current state.
 
 | Project | What it is | Main difference from tickertape |
 |---|---|---|

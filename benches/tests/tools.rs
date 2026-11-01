@@ -76,6 +76,41 @@ fn latency_both_readers_and_warmup() {
 }
 
 #[test]
+fn latency_wait_modes_and_no_prefault() {
+    for (wait, prefault) in [("default", true), ("block", true), ("sleep", false)] {
+        let root = tempfile::tempdir().unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_tt-latency"))
+            .args(["run", "--dir"])
+            .arg(root.path().join("journal"))
+            .args([
+                "--rate",
+                "5000",
+                "--count",
+                "500",
+                "--payload",
+                "64",
+                "--reader",
+                "safe",
+                "--wait",
+                wait,
+                "--json",
+            ])
+            .args((!prefault).then_some("--no-prefault"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{wait}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["wait"], wait);
+        assert_eq!(result["prefault"], prefault);
+        assert_eq!(result["latency"]["count"], 500);
+    }
+}
+
+#[test]
 fn cold_replay_with_mock_purge_and_unavailable_purge() {
     use std::os::unix::fs::PermissionsExt;
     // Mock sudo so this test never requests privileges or changes the host cache.
@@ -172,6 +207,7 @@ fn invalid_inputs_fail_before_creating_a_journal() {
         vec!["--count", "0"],
         vec!["--warmup", "10"],
         vec!["--reader", "invalid"],
+        vec!["--wait", "invalid"],
         vec!["--segment-size", "1"],
     ] {
         let root = tempfile::tempdir().unwrap();
