@@ -247,16 +247,16 @@ impl MapRo {
         let word_end = end.checked_add(7)? & !7;
         checked_range(self.len, start, word_end - start)?;
         out.clear();
-        out.reserve((word_end - start) as usize);
+        out.resize((word_end - start) as usize, 0);
         let base = self.ptr.as_ptr();
-        out.extend((start..word_end).step_by(8).flat_map(|at| {
+        for (chunk, at) in out.chunks_exact_mut(8).zip((start..word_end).step_by(8)) {
             // SAFETY: `at` is 8-aligned (the mapping is page-aligned) and `[at, at + 8)` is inside the mapping
             // (checked above), which lives as long as `self`. The reference comes from a pointer cast and is used
             // only for an 8-byte `Relaxed` load, which `std::sync::atomic` documents as permitted on read-only memory
             // on x86-64 and aarch64; atomic loads never form a data race.
             let word = unsafe { &*base.add(at as usize).cast::<AtomicU64>() };
-            word.load(Ordering::Relaxed).to_le_bytes()
-        }));
+            chunk.copy_from_slice(&word.load(Ordering::Relaxed).to_le_bytes());
+        }
         let skip = (offset - start) as usize;
         Some(skip..skip + len as usize)
     }
