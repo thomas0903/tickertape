@@ -1,6 +1,6 @@
 # 0019: Hardware CRC32C for short records, in a second `unsafe` module
 
-- **Status:** accepted
+- **Status:** accepted; extended to every length by [0024](0024-three-lane-crc.md)
 - **Date:** 2026-11-01
 
 ## Context
