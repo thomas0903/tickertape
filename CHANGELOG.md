@@ -5,6 +5,12 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## Unreleased
 
+- Library: add `retention::{Policy, Action, plan, apply}` for checkpoint-covered sealed prefixes, opt-in
+  `WriterConfig::retention`, `Writer::last_retention_error` and cumulative `Writer::retention_report`.
+  Retention errors never fail open, append or checkpoint. No on-disk format change.
+- CLI: add `archive` with move/delete, count/bytes/age limits, read-only `--dry-run` and a documented `--json`
+  schema. It is the only command that changes a journal. Existing archive files are never replaced.
+
 - CLI: add read-only `stats` with streaming range/checkpoint statistics, bounded payload percentiles, exact
   UTC-second counts, and a documented `--json` schema.
 - Library: `Reader::records()`, an iterator of owned records committed so far (for `take`, `filter`, `collect`).
