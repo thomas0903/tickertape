@@ -220,6 +220,8 @@ fn failed_header_write_discards_the_spare_and_creates_the_segment() {
     let dir = tempfile::tempdir().unwrap();
     let mut w = Writer::open(dir.path(), small_config()).unwrap();
     wait_for_ready_spare(&mut w, dir.path());
+    // Keep the spare open: otherwise a filesystem may give the replacement the freed inode number (ext4 does).
+    let _hold = std::fs::File::open(dir.path().join(SPARE)).unwrap();
     let prepared = identity(&dir.path().join(SPARE));
     fault::fail_next(Point::SpareHeader, 5 /* EIO */);
     fill_until_roll(&mut w, dir.path(), 1);
