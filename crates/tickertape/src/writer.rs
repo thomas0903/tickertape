@@ -47,6 +47,8 @@ pub struct Writer {
     /// Set if an abandoned write's zeroing could not be made durable; see `append_with`.
     appends_blocked: bool,
     report: RecoveryReport,
+    retention_report: crate::retention::Report,
+    last_retention_error: Option<Error>,
 }
 
 /// An open, mapped segment.
@@ -94,7 +96,9 @@ impl Writer {
     /// Takes the lock, then recovers the journal as described in `docs/format.md` → Recovery: validates the chain
     /// of records from the last checkpoint marker (or the oldest segment, if there is none) to the end, repairs or
     /// quarantines what is invalid, and syncs every repair before returning. What it did is in
-    /// [`Writer::recovery_report`]. Open time is proportional to the data written since the last checkpoint.
+    /// [`Writer::recovery_report`]. Open time is proportional to the data written since the last checkpoint,
+    /// plus any configured retention work. Retention runs after recovery and its errors are recorded separately
+    /// in [`Writer::last_retention_error`], without failing open.
     ///
     /// # Errors
     ///
@@ -140,7 +144,7 @@ impl Writer {
         }
 
         report.next_seq = state.next_seq;
-        Ok(Writer {
+        let mut writer = Writer {
             dir,
             config,
             _lock: lock,
@@ -155,7 +159,11 @@ impl Writer {
             poisoned: false,
             appends_blocked: false,
             report,
-        })
+            retention_report: crate::retention::Report::default(),
+            last_retention_error: None,
+        };
+        writer.run_retention();
+        Ok(writer)
     }
 
     /// Appends a record and returns its sequence number.
@@ -272,6 +280,8 @@ impl Writer {
 
     /// Makes every record appended so far durable, using the platform's sync calls (see
     /// `docs/crash-contract.md` → What `checkpoint()` does). Blocks until they finish.
+    /// Configured retention then runs; its failures are recorded by [`Writer::last_retention_error`] and do not
+    /// change the successful checkpoint result or poison the writer.
     ///
     /// # Errors
     ///
@@ -285,6 +295,8 @@ impl Writer {
         let result = self.checkpoint_inner();
         if result.is_err() {
             self.poisoned = true;
+        } else {
+            self.run_retention();
         }
         result
     }
@@ -342,7 +354,7 @@ impl Writer {
         Ok(())
     }
 
-    /// The sequence number the next append will get. Equals the number of records in the journal.
+    /// The sequence number the next append will get, including history already removed by retention.
     pub fn next_seq(&self) -> u64 {
         self.next_seq
     }
@@ -350,6 +362,29 @@ impl Writer {
     /// What recovery did when this writer opened the journal.
     pub fn recovery_report(&self) -> &RecoveryReport {
         &self.report
+    }
+
+    /// Cumulative successful retention removals since open, including partially failed runs.
+    pub fn retention_report(&self) -> &crate::retention::Report {
+        &self.retention_report
+    }
+
+    /// Most recent retention error since open. A later successful run does not clear it.
+    /// Retention errors never poison the writer or fail open, append or checkpoint.
+    pub fn last_retention_error(&self) -> Option<&Error> {
+        self.last_retention_error.as_ref()
+    }
+
+    fn run_retention(&mut self) {
+        let Some((policy, action)) = &self.config.retention else {
+            return;
+        };
+        let result = crate::retention::plan(&self.dir, policy).and_then(|plan| {
+            crate::retention::apply_into(&self.dir, &plan, action, &mut self.retention_report)
+        });
+        if let Err(error) = result {
+            self.last_retention_error = Some(error);
+        }
     }
 
     /// The journal directory.

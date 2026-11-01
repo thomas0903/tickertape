@@ -18,6 +18,12 @@ pub enum Point {
     Link,
     /// Syncing segment data during `checkpoint()`.
     CheckpointSync,
+    /// Renaming a retention segment (inject EXDEV to exercise the copy path).
+    RetentionRename,
+    /// Syncing an archive copy before removing its source.
+    RetentionCopySync,
+    /// Syncing the destination directory after an archive rename or copy.
+    RetentionDestinationSync,
 }
 
 #[cfg(feature = "fault-injection")]

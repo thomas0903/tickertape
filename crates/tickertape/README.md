@@ -8,6 +8,7 @@ processes on the same machine follow them live or replay from any sequence numbe
 - Explicit crash contract, with the test for each guarantee:
   [`docs/crash-contract.md`](https://github.com/thomas0903/tickertape/blob/main/docs/crash-contract.md)
 - *Visible* (after `append`) is not *durable* (after `checkpoint()`); power-loss safety is not claimed.
+- Opt-in retention moves or deletes sealed segments strictly before the checkpoint segment.
 - Safe `pread`-based readers by default; zero-copy readers are an `unsafe` opt-in.
 
 The `tickertape` CLI (crate `tickertape-cli`) tails, verifies and exports journals to JSONL or Parquet.
