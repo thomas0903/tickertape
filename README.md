@@ -31,8 +31,22 @@ readers, retained and replayable files, rolling, and easy inspection. tickertape
   survives a process crash or a power loss on each platform, and which test checks it;
 - a **transparent CLI** and **Parquet export**, so incident analysis happens in DuckDB, pandas or Polars.
 
-It does not try to win on raw latency. Measured numbers, with their hardware, are in
-[`docs/benchmarks.md`](docs/benchmarks.md).
+## Performance
+
+Measured on Linux against Chronicle Queue, Aeron, yaque, queue-file and plain files with the comparison suite in
+[`compare/`](compare/README.md). Full results, hardware and caveats are in [`docs/benchmarks.md`](docs/benchmarks.md).
+The machine was a small AWS cloud VM (`c6id.xlarge`, 2 cores / 4 threads, ext4 on NVMe), not bare metal:
+
+- **Append:** 18.6 million 64-byte records/s, about 5× Chronicle Queue; about 2.5× at 1,024 bytes.
+- **Replay:** fastest of the tools at 64 bytes (24.8–26.3 million records/s). At 1,024 bytes yaque is faster.
+- **Writer-to-reader latency, 100,000 records/s:** the p99.9 of tickertape's readers was 20–28 µs at 64 bytes and
+  31–70 µs at 1,024 bytes, below Chronicle Queue's (38–47 µs and 76–142 µs). Chronicle Queue has lower medians, and
+  a lower tail at 64 bytes and 10,000 records/s.
+
+These are two runs on one machine type, not guarantees. The tools also promise different things:
+- Aeron's IPC transport keeps nothing on disk;
+- yaque is a consuming single-reader queue;
+- the plain-file baseline has no validation or recovery.
 
 ## Quickstart
 
@@ -108,7 +122,8 @@ list, and what may come later, is in [`docs/roadmap.md`](docs/roadmap.md).
 
 ## Alternatives
 
-A factual overview, not a benchmark. Check each project's own documentation for the current state.
+A factual overview; the measured comparison is in [`docs/benchmarks.md`](docs/benchmarks.md). Check each project's
+own documentation for the current state.
 
 | Project | What it is | Main difference from tickertape |
 |---|---|---|

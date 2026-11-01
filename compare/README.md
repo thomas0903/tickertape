@@ -142,7 +142,7 @@ power-loss guarantees**. Sync times alone establish no power-loss guarantee.
 
 | Tool / version | W1 | W2 | W3 | Final W1 operation |
 |---|---|---|---|---|
-| tickertape 0.2.0, current checkout | `Writer::append`, 128 MiB segments | existing `tt-latency`, `safe` and `mapped` | `Reader::try_next`, `safe` and `open_mapped` | `Writer::checkpoint`, data + durable marker |
+| tickertape, current checkout (0.3.0) | `Writer::append`, 128 MiB segments | existing `tt-latency`, `safe` and `mapped` | `Reader::try_next`, `safe` and `open_mapped` | `Writer::checkpoint`, data + durable marker |
 | Chronicle Queue 2026.8, Apache-2.0 OSS | appender `writingDocument`, raw bytes | two JVMs; tailer `readingDocument`, read primitives directly from mapped bytes | new tailer `toStart`, same raw document API | `ExcerptAppender.sync`, default `MS_ASYNC` **submission**, not fsync completion |
 | Aeron 1.54.0, Apache-2.0 | skipped | IPC publication `offer` / subscription `poll(256)`, two JVMs | skipped | none |
 | yaque 0.6.6 | unbounded `try_send`, 128 MiB segments | `Receiver::try_recv` + guard `commit`, no periodic state saves | non-consuming `QueueIter`, from initial saved queue head | none exposed; `try_send` flushes its user buffer to file per message, **not fsync** |

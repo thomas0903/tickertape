@@ -3,8 +3,19 @@
 All notable changes to `tickertape` and `tickertape-cli` are listed here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the crates follow [Semantic Versioning](https://semver.org/).
 
-## Unreleased
+## [0.3.0] - 2026-11-02
 
+Not yet published to crates.io. The on-disk format is unchanged (version 1); v0.1 and v0.2 journals work as they
+are. Two new files may appear in a journal directory:
+- `notify`, an 80-byte wake-up record;
+- on macOS, `next-segment.tmp`, the next segment prepared in the background.
+
+Format v1 readers ignore both.
+
+- Benchmarks: a comparison suite against Chronicle Queue, Aeron, yaque, queue-file and plain files (`compare/`,
+  ADR 0018), recorded on Linux (an AWS cloud VM) and macOS; results and caveats in `docs/benchmarks.md`.
+  `run-recorded.sh` and the comparison runner now sync between runs, so earlier runs' write-back can't distort
+  later ones.
 - Performance (macOS): the writer prefaults the active segment from a background thread (ADR 0020;
   `WriterConfig::prefault`, on by default). On APFS, first writes into preallocated pages were the writer's
   bottleneck; appends no longer stall on them in steady state. Not used on Linux, where the equivalent advice made
@@ -78,5 +89,6 @@ First release. Not yet published to crates.io.
 - Snappy Parquet export with raw unsigned metadata, bounded row groups, and opt-in `--decode market-demo` columns
   (also a `decoded` object in JSONL). Default JSONL output is unchanged by `--decode`.
 
+[0.3.0]: https://github.com/thomas0903/tickertape/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/thomas0903/tickertape/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/thomas0903/tickertape/releases/tag/v0.1.0
