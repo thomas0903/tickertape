@@ -29,6 +29,7 @@ backwards, at most three per run), Java dependency inventories, and a machine-re
 `skipped.json`. Any build, child,
 validation, timeout, or missing-tool failure fails the suite; missing measurements
 are never substituted with zero. Results already completed remain available.
+After every measurement the runner calls `sync`, so pending write-back never carries over into the next one.
 Each measurement owns a new directory under `$TMPDIR` (Python's normal temp-dir
 fallback otherwise), including fixtures and control files; only those owned
 scratch directories are removed afterward. No privileged cache purge or affinity

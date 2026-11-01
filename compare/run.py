@@ -110,7 +110,12 @@ def run_one(tool, workload, payload, reader, rate, repeat, out, env, quick, comm
     for attempt in range(1, CLOCK_RETRIES + 2):
         start = log.stat().st_size if log.exists() else 0
         try:
-            return run_attempt(tool, workload, payload, reader, rate, repeat, out, env, quick, commands)
+            try:
+                return run_attempt(tool, workload, payload, reader, rate, repeat, out, env, quick, commands)
+            finally:
+                # The measurement's scratch directory is gone by now; wait until the kernel has written back what it
+                # wrote, so the next measurement (often another tool) doesn't pay for it.
+                os.sync()
         except RuntimeError as error:
             with log.open("rb") as f:
                 f.seek(start)
