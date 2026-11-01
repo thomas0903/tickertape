@@ -23,17 +23,19 @@ archive often, larger ones if roll latency matters and disk space doesn't.
 
 ## Writer threads
 
-By default the writer starts one helper thread, `tickertape-prefault`, that keeps the next 8 MiB of the active segment
-faulted in (`madvise`), so `append` rarely waits for a page fault (ADR 0020). It never writes to the journal. On APFS
-this matters most: writing into a preallocated segment otherwise faults once per 16 KiB page, slowly. Set
-`WriterConfig::prefault(false)` if you pin threads and want the writer to start none; it then works exactly as
-before, faulting pages on first write. On Linux it uses `MADV_POPULATE_WRITE` (5.14 and later; older kernels stop
-the thread on first use).
+With `WriterConfig::prefault(true)`, the default, the writer moves segment work off its own thread:
 
-With prefaulting on, the writer also prepares the next segment in the background once the active one is half
-full (ADR 0022): a short-lived thread, `tickertape-spare`, creates, preallocates and syncs `next-segment.tmp`. The
-roll then only writes and syncs the header and links the file into place, instead of preallocating a whole segment
-on the writer's thread. The spare reserves one more segment's worth of disk space from that point on.
+- **The next segment (all platforms).** Once the active segment is half full (ADR 0022), a short-lived thread,
+  `tickertape-spare`, creates, preallocates and syncs `next-segment.tmp`. The roll then only writes and syncs the
+  header and links the file into place, instead of preallocating a whole segment on the writer's thread. The spare
+  reserves one more segment's worth of disk space from that point on.
+- **Page faults (macOS only).** A helper thread, `tickertape-prefault`, keeps the next 8 MiB of the active segment
+  faulted in with `madvise(MADV_WILLNEED)` (ADR 0020). On APFS, writing into a preallocated segment otherwise faults
+  once per 16 KiB page, slowly. On Linux the equivalent advice made latency far worse at high byte rates on ext4,
+  so the writer doesn't start this thread there (ADR 0023).
+
+Neither thread ever writes records. Set `prefault(false)` if you pin threads and want the writer to start none; it
+then faults pages on first write and preallocates each segment at the roll.
 
 ## Choosing a checkpoint interval
 

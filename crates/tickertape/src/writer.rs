@@ -154,8 +154,9 @@ impl Writer {
 
         report.next_seq = state.next_seq;
         let notify = crate::notify::open_for_writer(&dir, config.notify);
-        let prefault = config
-            .prefault
+        // The helper only runs on macOS: on Linux, prefault advice made latency far worse at high byte rates (the
+        // pages it dirtied ahead were written back under the writer), so there only the spare is used (ADR 0023).
+        let prefault = (config.prefault && cfg!(target_vendor = "apple"))
             .then(|| Prefaulter::start(state.active.map.advice(), state.offset))
             .flatten();
         let mut writer = Writer {
@@ -297,11 +298,11 @@ impl Writer {
         }
         if let Some(prefault) = &mut self.prefault {
             prefault.advanced(self.offset);
-            // Once the active segment is half full, prepare the next one off the writer's thread (ADR 0022).
-            if !self.spare_requested && self.offset >= self.active.size / 2 {
-                self.spare_requested = true;
-                self.spare = crate::prefault::prepare_spare(&self.dir, self.config.segment_size);
-            }
+        }
+        // Once the active segment is half full, prepare the next one off the writer's thread (ADR 0022).
+        if self.config.prefault && !self.spare_requested && self.offset >= self.active.size / 2 {
+            self.spare_requested = true;
+            self.spare = crate::prefault::prepare_spare(&self.dir, self.config.segment_size);
         }
         self.next_seq = seq + 1;
         Ok(seq)

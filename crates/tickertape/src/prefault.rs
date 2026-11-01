@@ -153,8 +153,8 @@ fn run(shared: &Shared) {
             .unwrap_or_else(|e| e.into_inner())
             .push(current.len());
         if let Err(e) = current.prefault(from, to - from) {
-            // Before Linux 5.14 the advice doesn't exist: stop for the rest of this writer's life. Other errors (for
-            // example a full btrfs volume) only mean the writer faults those pages itself.
+            // An unsupported advice stops the helper for the rest of this writer's life. Other errors only mean the
+            // writer faults those pages itself.
             if e.kind() == std::io::ErrorKind::InvalidInput {
                 return;
             }

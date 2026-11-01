@@ -1,6 +1,7 @@
 # 0020: Prefault the active segment from a background thread
 
-- **Status:** accepted (supersedes the rejection of option 4 in [0014](0014-prefaulting-segment-pages-rejected.md))
+- **Status:** accepted (supersedes the rejection of option 4 in [0014](0014-prefaulting-segment-pages-rejected.md));
+  limited to macOS by [0023](0023-no-prefault-advice-on-linux.md)
 - **Date:** 2026-11-01
 
 ## Context

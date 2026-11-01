@@ -229,9 +229,9 @@ impl Advice {
         self.region.len as u64
     }
 
-    /// Prefaults the pages covering `[offset, offset + len)`, clamped to the mapping: `MADV_WILLNEED` on macOS,
-    /// `MADV_POPULATE_WRITE` on Linux (an `InvalidInput` error before Linux 5.14), nothing elsewhere. Contents are
-    /// unchanged; on Linux the pages become dirty, so the kernel writes back their (zero) bytes.
+    /// Prefaults the pages covering `[offset, offset + len)`, clamped to the mapping: `MADV_WILLNEED` on macOS, nothing
+    /// elsewhere. Contents are unchanged. On Linux both `MADV_POPULATE_WRITE` and `MADV_WILLNEED` made writer latency
+    /// far worse at high byte rates on ext4 (ADR 0023), so this is deliberately a no-op there.
     pub(crate) fn prefault(&self, offset: u64, len: u64) -> io::Result<()> {
         let map_len = self.region.len;
         let page = page_size();
@@ -242,20 +242,17 @@ impl Advice {
         if start >= end {
             return Ok(());
         }
-        #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
+        #[cfg(not(target_vendor = "apple"))]
         return Ok(());
-        #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+        #[cfg(target_vendor = "apple")]
         {
-            #[cfg(target_vendor = "apple")]
-            let advice = libc::MADV_WILLNEED;
-            #[cfg(not(target_vendor = "apple"))]
-            let advice = libc::MADV_POPULATE_WRITE;
             let ptr = self.region.ptr.as_ptr();
             // SAFETY: `[start, end)` lies within the live mapping (clamped above; `start` is page-aligned, as is the
-            // mapping), which `self.region` keeps mapped for the duration of the call. Both advice values only affect
-            // which pages are resident and mapped: they never change the bytes' values, so they cannot conflict with
-            // the writer's concurrent access to the same pages.
-            let rc = unsafe { libc::madvise(ptr.add(start).cast(), end - start, advice) };
+            // mapping), which `self.region` keeps mapped for the duration of the call. MADV_WILLNEED only affects which
+            // pages are resident and mapped: it never changes the bytes' values, so it cannot conflict with the
+            // writer's concurrent access to the same pages.
+            let rc =
+                unsafe { libc::madvise(ptr.add(start).cast(), end - start, libc::MADV_WILLNEED) };
             if rc != 0 {
                 Err(last_os_error())
             } else {

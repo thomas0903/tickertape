@@ -35,9 +35,14 @@ pub struct WriterConfig {
     /// Costs one atomic increment and one load per append, plus a wake-up system call when readers are blocked.
     /// Default: true.
     pub notify: bool,
-    /// Keep the pages ahead of the write position faulted in from a background thread (`tickertape-prefault`), so
-    /// that `append` rarely takes a page fault (ADR 0020). The thread only advises the kernel (`madvise`); it never
-    /// writes to the journal. Set to `false` for a writer that starts no threads. Default: true.
+    /// Do segment work in the background, off the writer's thread:
+    /// - **All platforms:** once the active segment is half full, a short-lived thread (`tickertape-spare`)
+    ///   preallocates the next segment, so a roll only writes and links its header (ADR 0022).
+    /// - **macOS only:** a helper thread (`tickertape-prefault`) keeps the pages ahead of the write position faulted
+    ///   in with `madvise`, so that `append` rarely takes a page fault (ADR 0020). On Linux this made latency worse,
+    ///   so it isn't used there (ADR 0023).
+    ///
+    /// These threads never write records. Set to `false` for a writer that starts no threads. Default: true.
     pub prefault: bool,
     /// Optional retention policy and action, run after open and successful checkpoints. Default: none.
     pub retention: Option<(crate::retention::Policy, crate::retention::Action)>,
