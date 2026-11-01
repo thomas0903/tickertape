@@ -32,7 +32,7 @@ fn writer_publishes_a_notify_record() {
     let dir = tempfile::tempdir().unwrap();
     let w = Writer::open(dir.path(), small_config()).unwrap();
     let bytes = std::fs::read(dir.path().join("notify")).unwrap();
-    assert_eq!(bytes.len(), 64);
+    assert_eq!(bytes.len(), 80);
     assert_eq!(&bytes[..8], b"TTNOTIFY");
     drop(w);
     // A writer with wake-ups disabled removes the record, so readers poll.
@@ -239,4 +239,119 @@ fn deadline_below_the_cap_is_honoured() {
         );
         assert!(took < Duration::from_millis(90), "overslept: {took:?}");
     }
+}
+
+#[test]
+fn a_fifo_in_place_of_the_record_never_hangs() {
+    let dir = tempfile::tempdir().unwrap();
+    drop(Writer::open(dir.path(), small_config()).unwrap());
+    let notify = dir.path().join("notify");
+    std::fs::remove_file(&notify).unwrap();
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&notify)
+            .status()
+            .unwrap()
+            .success()
+    );
+    // Neither the reader's refresh nor the writer's clean-up may block on opening the FIFO.
+    let mut r = Reader::open(
+        dir.path(),
+        ReaderConfig::default().backoff(blocking(Duration::from_millis(20))),
+    )
+    .unwrap();
+    let started = Instant::now();
+    assert!(
+        r.next_timeout(Some(Duration::from_millis(300)))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "reader hung: {:?}",
+        started.elapsed()
+    );
+    let mut w = tickertape_tests::reopen_writer(dir.path(), small_config());
+    append(&mut w, 0);
+    assert_eq!(
+        r.next_timeout(Some(Duration::from_secs(5)))
+            .unwrap()
+            .unwrap()
+            .seq,
+        0
+    );
+}
+
+#[test]
+fn a_copied_record_does_not_disturb_another_journals_wake_ups() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    let mut wa = Writer::open(a.path(), small_config()).unwrap();
+    // Journal B starts with A's record; B's writer must not remove A's region when it cleans up.
+    std::fs::copy(a.path().join("notify"), b.path().join("notify")).unwrap();
+    let _wb = Writer::open(b.path(), small_config()).unwrap();
+    // A reader that opens A now must still attach to A's region and be woken promptly.
+    let path = a.path().to_path_buf();
+    let (tx, rx) = mpsc::channel::<Instant>();
+    let reader = std::thread::spawn(move || {
+        let mut r = Reader::open(
+            &path,
+            ReaderConfig::default().backoff(blocking(Duration::from_millis(400))),
+        )
+        .unwrap();
+        let mut delays = Vec::new();
+        for _ in 0..9 {
+            r.next_timeout(Some(Duration::from_secs(30)))
+                .unwrap()
+                .expect("record");
+            delays.push(Instant::now().saturating_duration_since(rx.recv().unwrap()));
+        }
+        delays.sort();
+        delays[delays.len() / 2]
+    });
+    for seq in 0..9 {
+        std::thread::sleep(Duration::from_millis(20));
+        let sent = Instant::now();
+        append(&mut wa, seq);
+        tx.send(sent).unwrap();
+    }
+    let median = reader.join().unwrap();
+    assert!(
+        median < Duration::from_millis(20),
+        "median delay {median:?}"
+    );
+}
+
+#[test]
+fn a_restarted_writer_is_noticed_within_the_refresh_interval() {
+    // The review's scenario: the old writer is gone (its flag cleared), the reader polls with 800 ms sleeps, and a
+    // new writer appends 60 ms later. The reader must re-read the record within 100 ms and be woken, not oversleep.
+    let dir = tempfile::tempdir().unwrap();
+    let w1 = Writer::open(dir.path(), small_config()).unwrap();
+    let mut r = Reader::open(
+        dir.path(),
+        ReaderConfig::default().backoff(blocking(Duration::from_millis(800))),
+    )
+    .unwrap();
+    drop(w1);
+    let path = dir.path().to_path_buf();
+    let writer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(60));
+        let mut w2 = tickertape_tests::reopen_writer(&path, small_config());
+        let sent = Instant::now();
+        append(&mut w2, 0);
+        (sent, w2)
+    });
+    let rec = r
+        .next_timeout(Some(Duration::from_secs(5)))
+        .unwrap()
+        .expect("record");
+    let got = Instant::now();
+    assert_eq!(rec.seq, 0);
+    let (sent, _w2) = writer.join().unwrap();
+    let delay = got.saturating_duration_since(sent);
+    assert!(
+        delay < Duration::from_millis(300),
+        "delivered {delay:?} after the append"
+    );
 }

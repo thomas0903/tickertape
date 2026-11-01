@@ -134,12 +134,19 @@ mod tests {
         }
     }
 
-    // Every Mac has the instruction (Apple silicon: CRC extension; Intel: SSE4.2), and so has every x86-64 CPU since
-    // about 2008. aarch64 Linux is not asserted: the CRC extension is optional before Armv8.1.
-    #[cfg(all(any(target_os = "macos", target_arch = "x86_64"), not(miri)))]
+    // Apple silicon always has the CRC extension. Elsewhere the hardware path must be used exactly when the CPU
+    // reports the feature (older x86-64 CPUs and feature-masked VMs legitimately take the fallback).
+    #[cfg(not(miri))]
     #[test]
-    fn hardware_path_is_used() {
-        assert!(hw::append(0, b"x").is_some());
+    fn hardware_path_is_used_when_available() {
+        let used = hw::append(0, b"x").is_some();
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        assert!(used);
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(used, std::arch::is_x86_feature_detected!("sse4.2"));
+        #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+        assert_eq!(used, std::arch::is_aarch64_feature_detected!("crc"));
+        let _ = used;
     }
 
     fn property_config() -> ProptestConfig {

@@ -418,12 +418,25 @@ impl Notify {
     /// Writer: creates a fresh region tagged with `nonce`, sets the writer flag, and returns it with its location.
     pub(crate) fn create(nonce: u64) -> io::Result<(Notify, NotifyLocation)> {
         let (file, location, name) = create_region(nonce)?;
-        file.set_len(NOTIFY_REGION_LEN as u64)?;
-        // Linux: seal only after sizing (F_SEAL_GROW would forbid the `set_len` above).
-        #[cfg(target_os = "linux")]
-        seal(&file)?;
+        let mapped = (|| {
+            file.set_len(NOTIFY_REGION_LEN as u64)?;
+            // Linux: seal only after sizing (F_SEAL_GROW would forbid the `set_len` above).
+            #[cfg(target_os = "linux")]
+            seal(&file)?;
+            MapRw::new(&file, NOTIFY_REGION_LEN)
+        })();
+        let map = match mapped {
+            Ok(map) => map,
+            Err(e) => {
+                // No record names the region yet, so nobody else could remove it later.
+                if let Some(name) = &name {
+                    unlink_region(name);
+                }
+                return Err(e);
+            }
+        };
         let notify = Notify {
-            map: MapRw::new(&file, NOTIFY_REGION_LEN)?,
+            map,
             owner: Some(Owner { file, name }),
         };
         notify
@@ -493,6 +506,13 @@ impl Notify {
 
     /// Reader: block until the event count differs from `seen`, a wake-up arrives, or `timeout` passes.
     pub(crate) fn wait(&self, seen: u32, timeout: Duration) -> WaitOutcome {
+        #[cfg(test)]
+        {
+            test_hooks::WAITS.fetch_add(1, Ordering::SeqCst);
+            if test_hooks::FORCE_UNSUPPORTED.load(Ordering::SeqCst) {
+                return WaitOutcome::Unsupported;
+            }
+        }
         wait_on(self.word(NOTIFY_EVENT), seen, timeout)
     }
 
@@ -524,6 +544,20 @@ impl Drop for Notify {
             unlink_region(name);
         }
     }
+}
+
+/// Test-only instrumentation of [`Notify::wait`].
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+
+    /// Calls to `Notify::wait`.
+    pub(crate) static WAITS: AtomicU64 = AtomicU64::new(0);
+    /// Makes every wait report `WaitOutcome::Unsupported`.
+    pub(crate) static FORCE_UNSUPPORTED: AtomicBool = AtomicBool::new(false);
+    /// Serialises the tests that use these hooks.
+    pub(crate) static LOCK: Mutex<()> = Mutex::new(());
 }
 
 /// Removes a macOS shared-memory name left by an earlier writer of the journal (best effort; nothing elsewhere).
@@ -1052,6 +1086,24 @@ mod tests {
             !reader.writer_notifies(),
             "a dropped writer clears its flag"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn notify_attach_rejects_an_unsealed_region() {
+        use std::os::fd::FromRawFd;
+        // SAFETY: test only; memfd_create returns a fresh descriptor or -1 (checked).
+        let fd = unsafe { libc::memfd_create(c"unsealed".as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(fd >= 0);
+        // SAFETY: `fd` is fresh and owned by nothing else.
+        let file = unsafe { File::from_raw_fd(fd) };
+        file.set_len(NOTIFY_REGION_LEN as u64).unwrap();
+        let location = NotifyLocation::Memfd {
+            pid: std::process::id(),
+            fd,
+        };
+        let err = Notify::attach(&location, 0).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
     }
 
     #[test]

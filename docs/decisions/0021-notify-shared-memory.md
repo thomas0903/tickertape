@@ -49,7 +49,7 @@ How it is created:
   sized. The writer removes the name (`shm_unlink`) when it is dropped. A crashed writer's name is removed by the
   next writer that opens the journal.
 
-**Record.** `<dir>/notify` becomes a 64-byte record, written to `notify.tmp` and renamed into place:
+**Record.** `<dir>/notify` becomes an 80-byte record, written to `notify.tmp` and renamed into place:
 
 | Bytes | Field |
 |---|---|
@@ -59,8 +59,13 @@ How it is created:
 | 16–23 | `u64` nonce |
 | 24–27 | `u32` writer pid |
 | 28–31 | `i32` descriptor (Linux) |
-| 32–59 | name, NUL-padded (macOS) |
-| 60–63 | CRC32C of bytes 0–59 |
+| 32–39, 40–47 | `u64` device and inode of the journal directory |
+| 48–75 | name, NUL-padded (macOS) |
+| 76–79 | CRC32C of bytes 0–75 |
+
+The record is opened non-blocking and must be a regular file, so a FIFO or device in its place can't make anyone
+hang. A writer removes a previous writer's macOS name only when the record carries this journal directory's
+device and inode, so a record copied from another journal can't make it remove that journal's region.
 
 **Readers.**
 - A reader reads the record with `pread` and validates it, then opens the region:

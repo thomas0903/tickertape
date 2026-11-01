@@ -29,6 +29,9 @@ pub(crate) struct Prefaulter {
 struct Shared {
     state: Mutex<State>,
     wake: Condvar,
+    /// Test only: the mapping length of each advice call, in order.
+    #[cfg(test)]
+    calls: Mutex<Vec<u64>>,
 }
 
 #[derive(Debug)]
@@ -56,6 +59,8 @@ impl Prefaulter {
                 stop: false,
             }),
             wake: Condvar::new(),
+            #[cfg(test)]
+            calls: Mutex::new(Vec::new()),
         });
         let helper = Arc::clone(&shared);
         let thread = std::thread::Builder::new()
@@ -138,6 +143,12 @@ fn run(shared: &Shared) {
                 None => return,
             }
         };
+        #[cfg(test)]
+        shared
+            .calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(current.len());
         if let Err(e) = current.prefault(from, to - from) {
             // Before Linux 5.14 the advice doesn't exist: stop for the rest of this writer's life. Other errors (for
             // example a full btrfs volume) only mean the writer faults those pages itself.
@@ -187,18 +198,43 @@ mod tests {
         advice.prefault(0, 1 << 20).unwrap();
     }
 
+    fn wait_for_call(shared: &Shared, len: u64) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !shared.calls.lock().unwrap().contains(&len) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no advice call for a {len}-byte mapping"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
     #[test]
     fn helper_follows_rolls_and_stops_on_drop() {
         let (_dir1, _file1, map1) = mapping(4 << 20);
-        let (_dir2, _file2, map2) = mapping(4 << 20);
+        let (_dir2, _file2, map2) = mapping(32 << 20);
         let mut prefaulter = Prefaulter::start(map1.advice(), 64).unwrap();
-        for offset in (64..4 << 20).step_by(4096) {
-            prefaulter.advanced(offset);
-        }
+        let shared = Arc::clone(&prefaulter.shared);
+        wait_for_call(&shared, 4 << 20);
         prefaulter.switch(map2.advice(), 64);
         drop(map1);
-        prefaulter.advanced(3 << 20);
+        wait_for_call(&shared, 32 << 20);
+        let before = shared.calls.lock().unwrap().len();
+        prefaulter.advanced(20 << 20); // past the first 8 MiB window: more advice for the new segment
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while shared.calls.lock().unwrap().len() == before {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "wake-up after advancing was ignored"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
         drop(prefaulter); // joins the thread
+        assert_eq!(
+            Arc::strong_count(&shared),
+            1,
+            "the helper thread still holds the state"
+        );
         assert!(map2.bytes(0, 64).unwrap().iter().all(|&b| b == 0));
     }
 }

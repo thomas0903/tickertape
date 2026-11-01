@@ -6,15 +6,15 @@
 
 use crate::journal::NOTIFY_FILE;
 use crate::mmap::{NOTIFY_NAME_LEN, Notify, NotifyLocation};
-use std::fs::{self, File};
+use std::fs;
 use std::hash::{BuildHasher, Hasher};
 use std::io;
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// Length of the `notify` record.
-pub(crate) const RECORD_LEN: usize = 64;
+pub(crate) const RECORD_LEN: usize = 80;
 const MAGIC: &[u8; 8] = b"TTNOTIFY";
 const VERSION: u32 = 1;
 const KIND_MEMFD: u32 = 1;
@@ -27,14 +27,20 @@ const REFRESH_INTERVAL: Duration = Duration::from_millis(100);
 pub(crate) struct NotifyRecord {
     pub(crate) nonce: u64,
     pub(crate) location: NotifyLocation,
+    /// Device and inode of the journal directory the writer had open: a record copied into another journal doesn't
+    /// let that journal's writer remove the region.
+    pub(crate) dir: (u64, u64),
 }
 
-/// Encodes a record (ADR 0021): magic, version, kind, nonce, pid, descriptor, name, CRC32C.
+/// Encodes a record (ADR 0021): magic, version, kind, nonce, pid, descriptor, journal directory identity, name,
+/// CRC32C.
 pub(crate) fn encode(record: &NotifyRecord) -> [u8; RECORD_LEN] {
     let mut buf = [0u8; RECORD_LEN];
     buf[0..8].copy_from_slice(MAGIC);
     buf[8..12].copy_from_slice(&VERSION.to_le_bytes());
     buf[16..24].copy_from_slice(&record.nonce.to_le_bytes());
+    buf[32..40].copy_from_slice(&record.dir.0.to_le_bytes());
+    buf[40..48].copy_from_slice(&record.dir.1.to_le_bytes());
     match record.location {
         NotifyLocation::Memfd { pid, fd } => {
             buf[12..16].copy_from_slice(&KIND_MEMFD.to_le_bytes());
@@ -43,11 +49,11 @@ pub(crate) fn encode(record: &NotifyRecord) -> [u8; RECORD_LEN] {
         }
         NotifyLocation::Shm { name } => {
             buf[12..16].copy_from_slice(&KIND_SHM.to_le_bytes());
-            buf[32..60].copy_from_slice(&name);
+            buf[48..76].copy_from_slice(&name);
         }
     }
-    let crc = crate::crc::crc32c(&buf[..60]);
-    buf[60..64].copy_from_slice(&crc.to_le_bytes());
+    let crc = crate::crc::crc32c(&buf[..76]);
+    buf[76..80].copy_from_slice(&crc.to_le_bytes());
     buf
 }
 
@@ -55,11 +61,14 @@ pub(crate) fn encode(record: &NotifyRecord) -> [u8; RECORD_LEN] {
 pub(crate) fn decode(buf: &[u8]) -> Option<NotifyRecord> {
     let buf: &[u8; RECORD_LEN] = buf.try_into().ok()?;
     let u32_at = |at: usize| u32::from_le_bytes([buf[at], buf[at + 1], buf[at + 2], buf[at + 3]]);
-    if &buf[0..8] != MAGIC || u32_at(8) != VERSION || u32_at(60) != crate::crc::crc32c(&buf[..60]) {
+    let u64_at = |at: usize| {
+        let mut b = [0u8; 8];
+        b.copy_from_slice(&buf[at..at + 8]);
+        u64::from_le_bytes(b)
+    };
+    if &buf[0..8] != MAGIC || u32_at(8) != VERSION || u32_at(76) != crate::crc::crc32c(&buf[..76]) {
         return None;
     }
-    let mut nonce = [0u8; 8];
-    nonce.copy_from_slice(&buf[16..24]);
     let location = match u32_at(12) {
         KIND_MEMFD => NotifyLocation::Memfd {
             pid: u32_at(24),
@@ -67,20 +76,29 @@ pub(crate) fn decode(buf: &[u8]) -> Option<NotifyRecord> {
         },
         KIND_SHM => {
             let mut name = [0u8; NOTIFY_NAME_LEN];
-            name.copy_from_slice(&buf[32..60]);
+            name.copy_from_slice(&buf[48..76]);
             NotifyLocation::Shm { name }
         }
         _ => return None,
     };
     Some(NotifyRecord {
-        nonce: u64::from_le_bytes(nonce),
+        nonce: u64_at(16),
         location,
+        dir: (u64_at(32), u64_at(40)),
     })
 }
 
-/// Reads the journal's record with `pread`; `None` if it is missing or invalid.
+/// Reads the journal's record with `pread`; `None` if it is missing, invalid or not a regular file. Opened
+/// non-blocking, so a FIFO or device put in its place can't make the caller hang.
 pub(crate) fn read_record(dir: &Path) -> Option<NotifyRecord> {
-    let file = File::open(dir.join(NOTIFY_FILE)).ok()?;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(dir.join(NOTIFY_FILE))
+        .ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
     let mut buf = [0u8; RECORD_LEN + 1];
     let n = file.read_at(&mut buf, 0).ok()?;
     decode(&buf[..n])
@@ -104,8 +122,12 @@ fn new_nonce() -> u64 {
 /// Writer, on open: removes what a previous writer left, then (if `enabled`) creates a fresh region and publishes its
 /// record. Any failure just disables wake-ups.
 pub(crate) fn open_for_writer(dir: &Path, enabled: bool) -> Option<Notify> {
+    let identity = fs::metadata(dir).ok().map(|m| (m.dev(), m.ino()));
     if let Some(old) = read_record(dir) {
-        crate::mmap::unlink_stale_region(&old.location);
+        // Only a region this journal's own earlier writer created: this writer holds the lock, so that writer is gone.
+        if Some(old.dir) == identity {
+            crate::mmap::unlink_stale_region(&old.location);
+        }
     }
     if !enabled {
         let _ = fs::remove_file(dir.join(NOTIFY_FILE));
@@ -113,7 +135,15 @@ pub(crate) fn open_for_writer(dir: &Path, enabled: bool) -> Option<Notify> {
     }
     let nonce = new_nonce();
     let (notify, location) = Notify::create(nonce).ok()?;
-    write_record(dir, &NotifyRecord { nonce, location }).ok()?;
+    write_record(
+        dir,
+        &NotifyRecord {
+            nonce,
+            location,
+            dir: identity?,
+        },
+    )
+    .ok()?;
     Some(notify)
 }
 
@@ -135,6 +165,12 @@ impl Waker {
         };
         waker.refresh();
         waker
+    }
+
+    /// When the record is next due to be re-read.
+    pub(crate) fn refresh_due(&self) -> Instant {
+        self.checked
+            .map_or_else(Instant::now, |t| t + REFRESH_INTERVAL)
     }
 
     /// Re-reads the record if [`REFRESH_INTERVAL`] has passed since the last time.
@@ -186,6 +222,7 @@ mod tests {
             let record = NotifyRecord {
                 nonce: 0x0102_0304_0506_0708,
                 location,
+                dir: (0x1111, 0x2222_3333),
             };
             let bytes = encode(&record);
             assert_eq!(decode(&bytes), Some(record));

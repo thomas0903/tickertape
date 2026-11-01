@@ -232,7 +232,10 @@ impl Reader {
                     continue;
                 }
             }
-            waiter.wait(deadline);
+            // Wake up for the next refresh of the wake-up record too, so a writer that starts while this reader
+            // polls (with a long `max_sleep`) is noticed within the refresh interval.
+            let refresh = self.waker.as_ref().map(crate::notify::Waker::refresh_due);
+            waiter.wait(earliest(deadline, refresh));
         }
     }
 
@@ -240,8 +243,10 @@ impl Reader {
     fn block(&mut self, deadline: Option<Instant>) -> Option<Result<Option<Found>>> {
         let waker = self.waker.as_mut()?;
         waker.refresh_if_due();
+        // Never block past the next refresh: a writer that restarted can only wake readers on its new region.
+        let until = earliest(deadline, Some(waker.refresh_due()));
         let (nonce, notify) = waker.take()?;
-        let (result, supported) = self.block_on(&notify, deadline);
+        let (result, supported) = self.block_on(&notify, until);
         if supported {
             if let Some(waker) = self.waker.as_mut() {
                 waker.put((nonce, notify));
@@ -705,5 +710,89 @@ impl Waiter {
                 .max(self.backoff.min_sleep);
         }
         self.step = self.step.saturating_add(1);
+    }
+}
+
+/// The earlier of two optional instants (`None` means never).
+fn earliest(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+#[cfg(test)]
+mod wake_tests {
+    use super::*;
+    use crate::mmap::test_hooks::{FORCE_UNSUPPORTED, LOCK, WAITS};
+    use crate::{Writer, WriterConfig};
+
+    fn blocking(sleep: Duration) -> Backoff {
+        Backoff {
+            spins: 0,
+            yields: 0,
+            min_sleep: sleep,
+            max_sleep: sleep,
+        }
+    }
+
+    /// Resets the forced failure even if the test panics.
+    struct Unforce;
+    impl Drop for Unforce {
+        fn drop(&mut self) {
+            FORCE_UNSUPPORTED.store(false, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn idle_waits_block_instead_of_spinning() {
+        let _serial = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let _w = Writer::open(dir.path(), WriterConfig::default().segment_size(1 << 20)).unwrap();
+        let mut r = Reader::open(
+            dir.path(),
+            ReaderConfig::default().backoff(blocking(Duration::from_secs(10))),
+        )
+        .unwrap();
+        let before = WAITS.load(Ordering::SeqCst);
+        let started = Instant::now();
+        assert!(
+            r.next_timeout(Some(Duration::from_millis(350)))
+                .unwrap()
+                .is_none()
+        );
+        assert!(started.elapsed() >= Duration::from_millis(350));
+        // Each wait lasts up to the 100 ms cap (and the 100 ms record refresh): a handful, not a busy loop.
+        let waits = WAITS.load(Ordering::SeqCst) - before;
+        assert!((2..=20).contains(&waits), "{waits} waits in 350 ms");
+    }
+
+    #[test]
+    fn unsupported_waits_fall_back_to_sleeping() {
+        let _serial = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let _w = Writer::open(dir.path(), WriterConfig::default().segment_size(1 << 20)).unwrap();
+        let mut r = Reader::open(
+            dir.path(),
+            ReaderConfig::default().backoff(blocking(Duration::from_millis(20))),
+        )
+        .unwrap();
+        assert!(r.waker.is_some());
+        let _unforce = Unforce;
+        FORCE_UNSUPPORTED.store(true, Ordering::SeqCst);
+        let before = WAITS.load(Ordering::SeqCst);
+        let started = Instant::now();
+        assert!(
+            r.next_timeout(Some(Duration::from_millis(300)))
+                .unwrap()
+                .is_none()
+        );
+        assert!(started.elapsed() >= Duration::from_millis(300));
+        // One failed wait turns wake-ups off; the rest of the time the reader sleeps in 20 ms steps.
+        assert_eq!(WAITS.load(Ordering::SeqCst) - before, 1);
+        assert!(
+            r.waker.is_none(),
+            "wake-ups still on after an unsupported wait"
+        );
     }
 }
