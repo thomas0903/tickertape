@@ -1,11 +1,14 @@
-//! Background prefaulting of the active segment (ADR 0020).
+//! Background prefaulting of the active segment (ADR 0020) and preparation of the next one (ADR 0022).
 //!
 //! One helper thread per writer keeps the pages ahead of the write position faulted in, so the writer's own stores
 //! rarely take a page fault. The helper only calls `madvise` through [`Advice`]; it never touches the mapped bytes.
 //! Everything here is a hint: if the thread can't start, falls behind or stops, the writer faults pages itself, as it
 //! would without prefaulting.
 
-use crate::mmap::Advice;
+use crate::mmap::{self, Advice, MapRw};
+use std::fs::{self, File, OpenOptions};
+use std::io;
+use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 
@@ -157,6 +160,54 @@ fn run(shared: &Shared) {
             }
         }
         done = to;
+    }
+}
+
+/// A preallocated, synced and mapped segment file that is not published yet (ADR 0022): all zeros, named
+/// [`crate::journal::SPARE_FILE`]. At roll the writer writes its header, syncs it and links it into place.
+#[derive(Debug)]
+pub(crate) struct Spare {
+    pub(crate) file: File,
+    pub(crate) map: MapRw,
+    pub(crate) size: u64,
+}
+
+/// Starts preparing a spare segment of `size` bytes in `dir` on a short-lived thread. `None` if the thread can't be
+/// spawned (the writer then creates the next segment itself, as without a spare).
+pub(crate) fn prepare_spare(dir: &Path, size: u64) -> Option<JoinHandle<io::Result<Spare>>> {
+    let dir = dir.to_path_buf();
+    std::thread::Builder::new()
+        .name("tickertape-spare".into())
+        .spawn(move || make_spare(&dir, size))
+        .ok()
+}
+
+fn make_spare(dir: &Path, size: u64) -> io::Result<Spare> {
+    let path = dir.join(crate::journal::SPARE_FILE);
+    match fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
+    let made = (|| {
+        let len = usize::try_from(size).map_err(|_| io::Error::other("segment too large"))?;
+        mmap::preallocate(&file, size)?;
+        mmap::sync_data(&file)?;
+        let map = MapRw::new(&file, len)?;
+        let _ = map.advice().prefault(0, WINDOW);
+        Ok(map)
+    })();
+    match made {
+        Ok(map) => Ok(Spare { file, map, size }),
+        Err(e) => {
+            let _ = fs::remove_file(&path);
+            Err(e)
+        }
     }
 }
 

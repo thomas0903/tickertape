@@ -8,6 +8,9 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 - Performance: the writer prefaults the active segment from a background thread (ADR 0020;
   `WriterConfig::prefault`, on by default). On APFS, first writes into preallocated pages were the writer's
   bottleneck; appends no longer stall on them in steady state.
+- Performance: the next segment is prepared (preallocated, synced, mapped and prefaulted) in the background once
+  the active one is half full (ADR 0022). A roll then only writes, syncs and links the header: on APFS the
+  writer's roll stall dropped from about 50 ms to about 5 ms. Part of `WriterConfig::prefault`.
 - Performance: CRC32C uses the CPU instruction directly for records up to 512 bytes (ADR 0019), which speeds up
   `append` and both readers for short records. Results are bit-identical; the format is unchanged.
 - Performance: the zero-copy reader copies records for validation with a plain word loop (faster replay).

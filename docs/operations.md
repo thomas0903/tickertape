@@ -8,9 +8,10 @@ draws conclusions from those two.
 
 `WriterConfig::segment_size` (default 128 MiB; a multiple of 64 KiB) trades these against each other:
 
-- **Rolls.** The append that fills a segment creates the next one: preallocate, write the header, sync, link. That
-  append takes milliseconds instead of microseconds (see "roll appends" in `benchmarks.md`). Larger segments roll
-  less often.
+- **Rolls.** The append that fills a segment publishes the next one: write and sync its header, then link it. With
+  the default `prefault(true)`, the next segment has been preallocated in the background (see "Writer threads");
+  otherwise the roll also preallocates and syncs a whole new file. Either way that append takes milliseconds
+  instead of microseconds (see "roll appends" in `benchmarks.md`). Larger segments roll less often.
 - **Largest record.** A record must fit in one segment: at most `segment_size - 112` bytes of payload.
 - **Disk reservation.** Every segment reserves its full size on disk when it is created, even if it is mostly empty.
 - **Open time.** When the writer opens, it reads the part of the newest segment after the last record to clean up
@@ -28,6 +29,11 @@ this matters most: writing into a preallocated segment otherwise faults once per
 `WriterConfig::prefault(false)` if you pin threads and want the writer to start none; it then works exactly as
 before, faulting pages on first write. On Linux it uses `MADV_POPULATE_WRITE` (5.14 and later; older kernels stop
 the thread on first use).
+
+With prefaulting on, the writer also prepares the next segment in the background once the active one is half
+full (ADR 0022): a short-lived thread, `tickertape-spare`, creates, preallocates and syncs `next-segment.tmp`. The
+roll then only writes and syncs the header and links the file into place, instead of preallocating a whole segment
+on the writer's thread. The spare reserves one more segment's worth of disk space from that point on.
 
 ## Choosing a checkpoint interval
 

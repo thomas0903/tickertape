@@ -23,6 +23,10 @@ name = "wakeups"
 path = "wakeups.rs"
 
 [[test]]
+name = "spare_segment"
+path = "spare_segment.rs"
+
+[[test]]
 name = "lock"
 path = "lock.rs"
 

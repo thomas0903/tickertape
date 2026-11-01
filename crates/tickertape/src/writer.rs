@@ -12,7 +12,7 @@ use crate::error::{CorruptReason, Error, Result};
 use crate::format::{self, CheckpointSlot, RecordHeader, ScanEnd, SegmentHeader, SegmentView};
 use crate::journal::{self, CHECKPOINT_FILE, LOCK_FILE, QUARANTINE_DIR};
 use crate::mmap::{self, MapRw};
-use crate::prefault::Prefaulter;
+use crate::prefault::{Prefaulter, Spare};
 use crate::record::NewRecord;
 
 /// The only process allowed to append to a journal.
@@ -47,6 +47,10 @@ pub struct Writer {
     notify: Option<mmap::Notify>,
     /// The background prefault thread, if enabled and started (ADR 0020).
     prefault: Option<Prefaulter>,
+    /// The next segment being prepared in the background, if requested (ADR 0022).
+    spare: Option<std::thread::JoinHandle<io::Result<Spare>>>,
+    /// Whether a spare has been requested for the current active segment.
+    spare_requested: bool,
     generation: u64,
     poisoned: bool,
     /// Set if an abandoned write's zeroing could not be made durable; see `append_with`.
@@ -167,6 +171,8 @@ impl Writer {
             checkpoint_file,
             notify,
             prefault,
+            spare: None,
+            spare_requested: false,
             generation: checkpoint.map_or(0, |c| c.generation),
             poisoned: false,
             appends_blocked: false,
@@ -291,6 +297,11 @@ impl Writer {
         }
         if let Some(prefault) = &mut self.prefault {
             prefault.advanced(self.offset);
+            // Once the active segment is half full, prepare the next one off the writer's thread (ADR 0022).
+            if !self.spare_requested && self.offset >= self.active.size / 2 {
+                self.spare_requested = true;
+                self.spare = crate::prefault::prepare_spare(&self.dir, self.config.segment_size);
+            }
         }
         self.next_seq = seq + 1;
         Ok(seq)
@@ -421,7 +432,11 @@ impl Writer {
     /// Rolls to a new segment (`docs/format.md` → Rolling).
     fn roll(&mut self) -> Result<()> {
         let next_base = self.next_seq;
-        let new = create_segment(&self.dir, next_base, self.config.segment_size)?;
+        let new = match self.take_spare() {
+            Some(spare) => publish_spare(&self.dir, next_base, self.config.segment_size, spare)?,
+            None => create_segment(&self.dir, next_base, self.config.segment_size)?,
+        };
+        self.spare_requested = false;
         self.dirty_dirs.insert(self.dir.clone());
         // After the link, the roll always completes: seal the old segment, then switch.
         let seal_at = self.offset;
@@ -453,6 +468,69 @@ impl Writer {
         }
         Ok(())
     }
+}
+
+impl Writer {
+    /// Waits for the spare being prepared, if any, and returns it if it is usable for this journal's segment size.
+    fn take_spare(&mut self) -> Option<Spare> {
+        match self.spare.take()?.join() {
+            Ok(Ok(spare)) if spare.size == self.config.segment_size => Some(spare),
+            Ok(Ok(_)) => {
+                let _ = fs::remove_file(self.dir.join(journal::SPARE_FILE));
+                None
+            }
+            // Preparing failed (it removed its own file) or the thread panicked: create the segment synchronously.
+            _ => None,
+        }
+    }
+}
+
+impl Drop for Writer {
+    fn drop(&mut self) {
+        // Don't leave a spare behind for the next writer's recovery to clean up.
+        if let Some(Ok(Ok(spare))) = self.spare.take().map(|h| h.join()) {
+            drop(spare);
+            let _ = fs::remove_file(self.dir.join(journal::SPARE_FILE));
+        }
+    }
+}
+
+/// Publishes a prepared spare as segment `base` (ADR 0022): write and sync its header, then link it into place, as
+/// [`create_segment`] does for a new file. If the header can't be written or synced, the spare is discarded and the
+/// segment is created synchronously instead; a failed link is reported like [`create_segment`]'s.
+fn publish_spare(dir: &Path, base: u64, size: u64, spare: Spare) -> Result<Segment> {
+    let spare_path = dir.join(journal::SPARE_FILE);
+    let path = journal::segment_path(dir, base);
+    let header = format::encode_segment_header(&SegmentHeader {
+        segment_size: size,
+        base_seq: base,
+        created_unix_ns: crate::clock::realtime_ns(),
+    });
+    let prepared = spare
+        .file
+        .write_all_at(&header, 0)
+        .and_then(|()| mmap::sync_data(&spare.file));
+    if prepared.is_err() {
+        drop(spare);
+        let _ = fs::remove_file(&spare_path);
+        return create_segment(dir, base, size);
+    }
+    if let Err(e) = crate::fault::inject(crate::fault::Point::Link)
+        .and_then(|()| fs::hard_link(&spare_path, &path))
+    {
+        drop(spare);
+        let _ = fs::remove_file(&spare_path);
+        return Err(Error::io("publish segment", &path, e));
+    }
+    // Publication happened; a leftover spare name is harmless and removed at the next open.
+    let _ = fs::remove_file(&spare_path);
+    Ok(Segment {
+        base,
+        size,
+        path,
+        file: spare.file,
+        map: spare.map,
+    })
 }
 
 /// An internal bounds check failed (a bug, reported as an error rather than a panic).
@@ -602,7 +680,11 @@ struct Recovery<'a> {
 
 impl Recovery<'_> {
     fn remove_tmp_files(&mut self) -> Result<()> {
-        for tmp in journal::list_tmp_files(self.dir)? {
+        let spare = self.dir.join(journal::SPARE_FILE);
+        let leftovers = journal::list_tmp_files(self.dir)?
+            .into_iter()
+            .chain(spare.symlink_metadata().is_ok().then_some(spare));
+        for tmp in leftovers {
             fs::remove_file(&tmp).map_err(|e| Error::io("remove temporary segment", &tmp, e))?;
             self.report
                 .actions

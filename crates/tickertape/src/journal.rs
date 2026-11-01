@@ -14,6 +14,8 @@ pub(crate) const LOCK_FILE: &str = "writer.lock";
 pub(crate) const CHECKPOINT_FILE: &str = "checkpoint";
 /// Name of the notify record (ADRs 0017 and 0021).
 pub(crate) const NOTIFY_FILE: &str = "notify";
+/// Name of the prepared, not yet published next segment (ADR 0022).
+pub(crate) const SPARE_FILE: &str = "next-segment.tmp";
 /// Name of the quarantine directory.
 pub(crate) const QUARANTINE_DIR: &str = "quarantine";
 /// Suffix of temporary segment files.

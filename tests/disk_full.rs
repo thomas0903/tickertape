@@ -20,7 +20,9 @@ fn big_record(seq: u64) -> Vec<u8> {
 #[test]
 fn injected_enospc_on_roll_is_reported_and_retried() {
     let dir = tempfile::tempdir().unwrap();
-    let mut w = Writer::open(dir.path(), small_config()).unwrap();
+    // The failure is injected into synchronous segment creation; without the prefault helper no spare
+    // segment is prepared in the background (ADR 0022), so the roll takes that path.
+    let mut w = Writer::open(dir.path(), small_config().prefault(false)).unwrap();
     fill_first_segment(&mut w, dir.path());
     let before_segments = segments(dir.path()).len();
 
@@ -370,7 +372,9 @@ fn map_failure_during_roll_is_retried() {
     // Review finding: a mapping failure after publishing the new segment used to make every retry fail with
     // "already exists". Mapping now happens before the link.
     let dir = tempfile::tempdir().unwrap();
-    let mut w = Writer::open(dir.path(), small_config()).unwrap();
+    // The failure is injected into synchronous segment creation; without the prefault helper no spare
+    // segment is prepared in the background (ADR 0022), so the roll takes that path.
+    let mut w = Writer::open(dir.path(), small_config().prefault(false)).unwrap();
     let max = tickertape::format::max_payload_len(SMALL_SEGMENT) as usize;
     let data = vec![3u8; max];
     let rec = NewRecord {
