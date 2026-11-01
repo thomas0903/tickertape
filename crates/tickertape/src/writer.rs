@@ -43,7 +43,7 @@ pub struct Writer {
     /// Directories whose entries changed since the last checkpoint.
     dirty_dirs: BTreeSet<PathBuf>,
     checkpoint_file: File,
-    /// The notify file, if enabled and available (ADR 0017).
+    /// The wake-up region, if enabled and available (ADRs 0017 and 0021).
     notify: Option<mmap::Notify>,
     /// The background prefault thread, if enabled and started (ADR 0020).
     prefault: Option<Prefaulter>,
@@ -145,7 +145,7 @@ impl Writer {
         }
 
         report.next_seq = state.next_seq;
-        let notify = open_notify(&dir, config.notify);
+        let notify = crate::notify::open_for_writer(&dir, config.notify);
         let prefault = config
             .prefault
             .then(|| Prefaulter::start(state.active.map.advice(), state.offset))
@@ -423,28 +423,6 @@ impl Writer {
 /// An internal bounds check failed (a bug, reported as an error rather than a panic).
 fn internal(path: &Path, what: &'static str) -> Error {
     Error::io(what, path, io::Error::other("internal bounds check failed"))
-}
-
-/// Opens (creating and preallocating if needed) the notify file and records whether this writer maintains it. Any
-/// failure just disables wake-ups: they only affect latency, never correctness (ADR 0017).
-fn open_notify(dir: &Path, enabled: bool) -> Option<mmap::Notify> {
-    let path = dir.join(journal::NOTIFY_FILE);
-    if !enabled && !path.exists() {
-        return None;
-    }
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&path)
-        .ok()?;
-    if file.metadata().ok()?.len() < mmap::NOTIFY_FILE_LEN {
-        mmap::preallocate(&file, mmap::NOTIFY_FILE_LEN).ok()?;
-    }
-    let notify = mmap::Notify::new(&file).ok()?;
-    notify.set_writer_notifies(enabled);
-    enabled.then_some(notify)
 }
 
 /// Creates `dir` and missing ancestors; returns the directories that were created, outermost first.

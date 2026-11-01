@@ -17,7 +17,7 @@ use crate::record::{OwnedRecord, Record};
 const IDENTITY_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 /// Bytes the `pread` reader fetches at a time (more if a record is larger).
 const CHUNK: usize = 64 * 1024;
-/// Longest single block on the notify file when the writer maintains it (bounded so that a writer that died, or a
+/// Longest single block on the wake-up region when the writer maintains it (bounded so that a writer that died, or a
 /// missed wake-up, costs at most this much latency; the identity check also runs at least this often).
 const NOTIFY_MAX_WAIT: Duration = Duration::from_millis(100);
 /// Re-reads before a validation failure is reported as corruption (the copy may predate the commit).
@@ -65,8 +65,8 @@ pub struct Reader {
     buf_start: u64,
     /// Scratch buffer for the zero-copy reader's atomic validation copy, reused across records.
     scratch: Vec<u8>,
-    /// The journal's notify file, if wake-ups are enabled and available (ADR 0017).
-    notify: Option<crate::mmap::Notify>,
+    /// The journal's wake-up region, if wake-ups are enabled (ADRs 0017 and 0021).
+    waker: Option<crate::notify::Waker>,
     /// When the reader started waiting at an empty slot.
     waiting_since: Option<Instant>,
 }
@@ -136,11 +136,7 @@ impl Reader {
             });
         };
         let seg = open_segment(dir, *base, mapped)?;
-        let notify = if config.notify {
-            open_notify(dir)
-        } else {
-            None
-        };
+        let waker = config.notify.then(|| crate::notify::Waker::new(dir));
         Ok(Reader {
             dir: dir.to_path_buf(),
             config,
@@ -153,7 +149,7 @@ impl Reader {
             buf: Vec::new(),
             buf_start: 0,
             scratch: Vec::new(),
-            notify,
+            waker,
             waiting_since: None,
         })
     }
@@ -229,9 +225,7 @@ impl Reader {
                 return Ok(None);
             }
             if waiter.in_blocking_phase() {
-                if let Some(notify) = self.notify.take() {
-                    let blocked = self.block_on(&notify, deadline);
-                    self.notify = Some(notify);
+                if let Some(blocked) = self.block(deadline) {
                     if let Some(found) = blocked? {
                         return Ok(Some(self.materialize(found)));
                     }
@@ -242,18 +236,36 @@ impl Reader {
         }
     }
 
-    /// Blocks on the notify file until the writer publishes something or a timeout passes (event-count protocol,
-    /// ADR 0017): register as a waiter, check once more, then wait for the event counter to change.
+    /// Blocks on the journal's wake-up region, if there is one: `None` if the reader should poll instead.
+    fn block(&mut self, deadline: Option<Instant>) -> Option<Result<Option<Found>>> {
+        let waker = self.waker.as_mut()?;
+        waker.refresh_if_due();
+        let (nonce, notify) = waker.take()?;
+        let (result, supported) = self.block_on(&notify, deadline);
+        if supported {
+            if let Some(waker) = self.waker.as_mut() {
+                waker.put((nonce, notify));
+            }
+        } else {
+            // The platform's wait call doesn't work here: poll from now on.
+            self.waker = None;
+        }
+        Some(result)
+    }
+
+    /// Blocks on the wake-up region until the writer publishes something or a timeout passes (event-count protocol,
+    /// ADR 0017): register as a waiter, check once more, then wait for the event counter to change. Returns whether
+    /// the platform's wait call is supported; if not, this call slept instead (bounded like a poll).
     fn block_on(
         &mut self,
         notify: &crate::mmap::Notify,
         deadline: Option<Instant>,
-    ) -> Result<Option<Found>> {
+    ) -> (Result<Option<Found>>, bool) {
         let seen = notify.begin_wait();
         let found = self.advance();
         if !matches!(found, Ok(None)) {
             notify.end_wait();
-            return found;
+            return (found, true);
         }
         let cap = if notify.writer_notifies() {
             NOTIFY_MAX_WAIT
@@ -263,11 +275,13 @@ impl Reader {
         let wait = deadline.map_or(cap, |d| {
             cap.min(d.saturating_duration_since(Instant::now()))
         });
-        if !wait.is_zero() {
-            notify.wait(seen, wait);
+        let mut supported = true;
+        if !wait.is_zero() && notify.wait(seen, wait) == crate::mmap::WaitOutcome::Unsupported {
+            supported = false;
+            std::thread::sleep(wait.min(self.config.backoff.max_sleep));
         }
         notify.end_wait();
-        Ok(None)
+        (Ok(None), supported)
     }
 
     /// Like [`Reader::try_next`], but copies the record out of the reader.
@@ -531,16 +545,6 @@ impl Reader {
             payload,
         }
     }
-}
-
-/// Opens the journal's notify file read-write for wake-ups; `None` if it's missing or not writable (readers then poll).
-fn open_notify(dir: &Path) -> Option<crate::mmap::Notify> {
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(dir.join(journal::NOTIFY_FILE))
-        .ok()?;
-    crate::mmap::Notify::new(&file).ok()
 }
 
 fn open_segment(dir: &Path, base: u64, mapped: bool) -> Result<OpenSegment> {

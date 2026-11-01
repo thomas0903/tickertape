@@ -55,6 +55,7 @@ pub mod format;
 pub mod inspect;
 mod journal;
 mod mmap;
+mod notify;
 mod prefault;
 #[cfg(all(test, loom))]
 mod protocol_model;

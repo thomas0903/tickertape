@@ -12,7 +12,7 @@ use crate::format::{self, SegmentHeader};
 pub(crate) const LOCK_FILE: &str = "writer.lock";
 /// Name of the checkpoint marker file.
 pub(crate) const CHECKPOINT_FILE: &str = "checkpoint";
-/// Name of the notify file (ADR 0017).
+/// Name of the notify record (ADRs 0017 and 0021).
 pub(crate) const NOTIFY_FILE: &str = "notify";
 /// Name of the quarantine directory.
 pub(crate) const QUARANTINE_DIR: &str = "quarantine";

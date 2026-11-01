@@ -1,6 +1,7 @@
 # 0017: Reader wake-ups instead of sleeping
 
-- **Status:** accepted (owner decision: build the "Later" items, 2026-11-01)
+- **Status:** accepted (owner decision: build the "Later" items, 2026-11-01); where the words live amended by
+  [0021](0021-notify-shared-memory.md)
 - **Date:** 2026-11-01
 
 ## Context

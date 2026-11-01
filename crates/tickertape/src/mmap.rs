@@ -363,33 +363,99 @@ impl Drop for MapRo {
     }
 }
 
-/// Size of the notify file (ADR 0017).
-pub(crate) const NOTIFY_FILE_LEN: u64 = 4096;
+/// Size of the shared notify region (ADRs 0017 and 0021).
+const NOTIFY_REGION_LEN: usize = 4096;
 const NOTIFY_EVENT: u64 = 0;
 const NOTIFY_WAITERS: u64 = 64;
 const NOTIFY_WRITER_FLAG: u64 = 128;
+const NOTIFY_NONCE_LO: u64 = 192;
+const NOTIFY_NONCE_HI: u64 = 200;
+/// Length of a macOS shared-memory object name, `/tickertape.` plus 16 hex digits.
+pub(crate) const NOTIFY_NAME_LEN: usize = 28;
 
-/// The shared notify file (ADR 0017): an event counter the writer increments after each publication, a count of
-/// readers blocked on it, and a flag saying whether the attached writer maintains the counter. Mapped read-write by
-/// the writer and by readers (readers must update the waiter count). Its contents never affect correctness, only
-/// latency: every wait has a timeout.
+/// Where a writer's notify region lives (ADR 0021), as recorded in the journal's `notify` file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NotifyLocation {
+    /// Linux: a sealed memfd, reachable as `/proc/<pid>/fd/<fd>` while the writer runs.
+    Memfd { pid: u32, fd: i32 },
+    /// macOS: a POSIX shared-memory object.
+    Shm { name: [u8; NOTIFY_NAME_LEN] },
+}
+
+/// How a wait on the notify region ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WaitOutcome {
+    /// Woken, timed out, interrupted, or the counter had already changed: the caller re-checks.
+    Returned,
+    /// The platform call is unavailable or failed for good (for example blocked by a seccomp policy): stop waiting
+    /// on the region and poll instead.
+    Unsupported,
+}
+
+/// The wake-up words (ADR 0017) in a 4,096-byte shared region that the kernel won't let anyone shrink (ADR 0021):
+/// an event counter the writer increments after each publication, a count of readers blocked on it, a flag saying
+/// whether the attached writer maintains the counter, and a nonce that ties the region to the journal's record.
+/// Because the backing can't shrink, no access to the mapping can raise `SIGBUS`, whatever other processes do. Its
+/// contents never affect correctness, only latency: every wait has a timeout.
 #[derive(Debug)]
 pub(crate) struct Notify {
     map: MapRw,
+    /// Set for the writer's own region: cleared and removed again when dropped.
+    owner: Option<Owner>,
+}
+
+#[derive(Debug)]
+struct Owner {
+    /// Only held: on Linux it keeps the memfd reachable through `/proc/<pid>/fd/<fd>`.
+    #[allow(dead_code)]
+    file: File,
+    /// macOS: the object's name, unlinked on drop.
+    #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
+    name: Option<[u8; NOTIFY_NAME_LEN]>,
 }
 
 impl Notify {
-    /// Maps the first [`NOTIFY_FILE_LEN`] bytes of `file`, which must be opened read-write and at least that long.
-    pub(crate) fn new(file: &File) -> io::Result<Notify> {
-        if file.metadata()?.len() < NOTIFY_FILE_LEN {
+    /// Writer: creates a fresh region tagged with `nonce`, sets the writer flag, and returns it with its location.
+    pub(crate) fn create(nonce: u64) -> io::Result<(Notify, NotifyLocation)> {
+        let (file, location, name) = create_region(nonce)?;
+        file.set_len(NOTIFY_REGION_LEN as u64)?;
+        // Linux: seal only after sizing (F_SEAL_GROW would forbid the `set_len` above).
+        #[cfg(target_os = "linux")]
+        seal(&file)?;
+        let notify = Notify {
+            map: MapRw::new(&file, NOTIFY_REGION_LEN)?,
+            owner: Some(Owner { file, name }),
+        };
+        notify
+            .word(NOTIFY_NONCE_LO)
+            .store(nonce as u32, Ordering::SeqCst);
+        notify
+            .word(NOTIFY_NONCE_HI)
+            .store((nonce >> 32) as u32, Ordering::SeqCst);
+        notify.word(NOTIFY_WRITER_FLAG).store(1, Ordering::SeqCst);
+        Ok((notify, location))
+    }
+
+    /// Reader: maps the region at `location` if it can't shrink, is at least 4,096 bytes and carries `nonce`.
+    pub(crate) fn attach(location: &NotifyLocation, nonce: u64) -> io::Result<Notify> {
+        let file = open_region(location)?;
+        if file.metadata()?.len() < NOTIFY_REGION_LEN as u64 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "notify file too short",
+                "notify region too short",
             ));
         }
-        Ok(Notify {
-            map: MapRw::new(file, NOTIFY_FILE_LEN as usize)?,
-        })
+        let notify = Notify {
+            map: MapRw::new(&file, NOTIFY_REGION_LEN)?,
+            owner: None,
+        };
+        if notify.nonce() != nonce {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "notify region belongs to another writer",
+            ));
+        }
+        Ok(notify)
     }
 
     fn word(&self, offset: u64) -> &AtomicU32 {
@@ -399,13 +465,12 @@ impl Notify {
             .unwrap_or_else(|| unreachable!("notify offsets are in bounds"))
     }
 
-    /// Writer: records whether this writer bumps the counter, so readers know how long they may block.
-    pub(crate) fn set_writer_notifies(&self, on: bool) {
-        self.word(NOTIFY_WRITER_FLAG)
-            .store(u32::from(on), Ordering::SeqCst);
+    fn nonce(&self) -> u64 {
+        u64::from(self.word(NOTIFY_NONCE_LO).load(Ordering::SeqCst))
+            | u64::from(self.word(NOTIFY_NONCE_HI).load(Ordering::SeqCst)) << 32
     }
 
-    /// Reader: whether the attached (or last attached) writer bumps the counter.
+    /// Reader: whether the writer that created the region still maintains the counter.
     pub(crate) fn writer_notifies(&self) -> bool {
         self.word(NOTIFY_WRITER_FLAG).load(Ordering::SeqCst) != 0
     }
@@ -427,8 +492,8 @@ impl Notify {
     }
 
     /// Reader: block until the event count differs from `seen`, a wake-up arrives, or `timeout` passes.
-    pub(crate) fn wait(&self, seen: u32, timeout: Duration) {
-        wait_on(self.word(NOTIFY_EVENT), seen, timeout);
+    pub(crate) fn wait(&self, seen: u32, timeout: Duration) -> WaitOutcome {
+        wait_on(self.word(NOTIFY_EVENT), seen, timeout)
     }
 
     /// Reader: unregister as a waiter (never below zero, in case the count was reset).
@@ -449,18 +514,210 @@ impl Notify {
     }
 }
 
+impl Drop for Notify {
+    fn drop(&mut self) {
+        let Some(owner) = &self.owner else { return };
+        // Tell waiting readers that nobody maintains the counter any more, and wake them so they notice.
+        self.word(NOTIFY_WRITER_FLAG).store(0, Ordering::SeqCst);
+        self.publish();
+        if let Some(name) = &owner.name {
+            unlink_region(name);
+        }
+    }
+}
+
+/// Removes a macOS shared-memory name left by an earlier writer of the journal (best effort; nothing elsewhere).
+pub(crate) fn unlink_stale_region(location: &NotifyLocation) {
+    if let NotifyLocation::Shm { name } = location {
+        unlink_region(name);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn create_region(_nonce: u64) -> io::Result<(File, NotifyLocation, Option<[u8; NOTIFY_NAME_LEN]>)> {
+    use std::os::fd::FromRawFd;
+    // SAFETY: memfd_create with a NUL-terminated name and valid flags has no memory-safety preconditions; it returns
+    // a new descriptor or -1.
+    let fd = unsafe {
+        libc::memfd_create(
+            c"tickertape-notify".as_ptr(),
+            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+        )
+    };
+    if fd < 0 {
+        return Err(last_os_error());
+    }
+    // SAFETY: `fd` is a freshly created descriptor that nothing else owns.
+    let file = unsafe { File::from_raw_fd(fd) };
+    Ok((
+        file,
+        NotifyLocation::Memfd {
+            pid: std::process::id(),
+            fd,
+        },
+        None,
+    ))
+}
+
+/// Seals the memfd so that nobody can shrink, grow or unseal it (ADR 0021).
+#[cfg(target_os = "linux")]
+fn seal(file: &File) -> io::Result<()> {
+    let seals = libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_SEAL;
+    // SAFETY: F_ADD_SEALS takes an integer argument and has no memory-safety preconditions.
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_ADD_SEALS, seals) } != 0 {
+        return Err(last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn open_region(location: &NotifyLocation) -> io::Result<File> {
+    let NotifyLocation::Memfd { pid, fd } = location else {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "notify region of another platform",
+        ));
+    };
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(format!("/proc/{pid}/fd/{fd}"))?;
+    // SAFETY: F_GET_SEALS takes no argument and has no memory-safety preconditions.
+    let seals = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GET_SEALS) };
+    if seals < 0 || seals & libc::F_SEAL_SHRINK == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "notify region can shrink",
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(target_os = "linux")]
+fn unlink_region(_name: &[u8; NOTIFY_NAME_LEN]) {}
+
+/// A NUL-terminated copy of a shared-memory name.
+#[cfg(target_vendor = "apple")]
+fn c_name(name: &[u8; NOTIFY_NAME_LEN]) -> io::Result<std::ffi::CString> {
+    std::ffi::CString::new(
+        name.iter()
+            .copied()
+            .take_while(|&b| b != 0)
+            .collect::<Vec<u8>>(),
+    )
+    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad notify region name"))
+}
+
+#[cfg(target_vendor = "apple")]
+fn create_region(nonce: u64) -> io::Result<(File, NotifyLocation, Option<[u8; NOTIFY_NAME_LEN]>)> {
+    use std::os::fd::FromRawFd;
+    let mut name = [0u8; NOTIFY_NAME_LEN];
+    name.copy_from_slice(format!("/tickertape.{nonce:016x}").as_bytes());
+    let c = c_name(&name)?;
+    // SAFETY: shm_open with a NUL-terminated name, flags and a mode (passed as the promoted C `unsigned int` the
+    // variadic signature expects) has no memory-safety preconditions; it returns a new descriptor or -1. (macOS
+    // rejects O_CLOEXEC here; `set_cloexec` sets it afterwards.)
+    let fd = unsafe {
+        libc::shm_open(
+            c.as_ptr(),
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
+            0o600 as libc::c_uint,
+        )
+    };
+    if fd < 0 {
+        return Err(last_os_error());
+    }
+    // SAFETY: `fd` is a freshly created descriptor that nothing else owns.
+    let file = unsafe { File::from_raw_fd(fd) };
+    if let Err(e) = set_cloexec(&file) {
+        unlink_region(&name);
+        return Err(e);
+    }
+    Ok((file, NotifyLocation::Shm { name }, Some(name)))
+}
+
+#[cfg(target_vendor = "apple")]
+fn open_region(location: &NotifyLocation) -> io::Result<File> {
+    use std::os::fd::FromRawFd;
+    let NotifyLocation::Shm { name } = location else {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "notify region of another platform",
+        ));
+    };
+    if !name.starts_with(b"/tickertape.") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "bad notify region name",
+        ));
+    }
+    let c = c_name(name)?;
+    // SAFETY: as in `create_region`; without O_CREAT the mode is ignored.
+    let fd = unsafe { libc::shm_open(c.as_ptr(), libc::O_RDWR, 0 as libc::c_uint) };
+    if fd < 0 {
+        return Err(last_os_error());
+    }
+    // SAFETY: `fd` is a freshly opened descriptor that nothing else owns. Once sized, a POSIX shared-memory object
+    // can't be resized on macOS (`ftruncate` fails with EINVAL; `notify_region_cannot_shrink` checks this), so the
+    // size checked by the caller is permanent.
+    let file = unsafe { File::from_raw_fd(fd) };
+    set_cloexec(&file)?;
+    Ok(file)
+}
+
+/// Sets `FD_CLOEXEC`, so child processes don't inherit the descriptor.
+#[cfg(target_vendor = "apple")]
+fn set_cloexec(file: &File) -> io::Result<()> {
+    // SAFETY: F_SETFD with an integer flag on a valid descriptor has no memory-safety preconditions.
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
+        return Err(last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(target_vendor = "apple")]
+fn unlink_region(name: &[u8; NOTIFY_NAME_LEN]) {
+    if !name.starts_with(b"/tickertape.") {
+        return;
+    }
+    if let Ok(c) = c_name(name) {
+        // SAFETY: shm_unlink with a NUL-terminated name has no memory-safety preconditions; existing mappings stay
+        // valid.
+        unsafe { libc::shm_unlink(c.as_ptr()) };
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+fn create_region(_nonce: u64) -> io::Result<(File, NotifyLocation, Option<[u8; NOTIFY_NAME_LEN]>)> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "no notify region on this platform",
+    ))
+}
+
+#[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+fn open_region(_location: &NotifyLocation) -> io::Result<File> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "no notify region on this platform",
+    ))
+}
+
+#[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+fn unlink_region(_name: &[u8; NOTIFY_NAME_LEN]) {}
+
 /// Blocks while `word == expected`, for at most `timeout` (spurious returns are fine; callers re-check).
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn wait_on(word: &AtomicU32, expected: u32, timeout: Duration) {
+#[cfg(target_os = "linux")]
+fn wait_on(word: &AtomicU32, expected: u32, timeout: Duration) -> WaitOutcome {
     let ts = libc::timespec {
         tv_sec: libc::time_t::try_from(timeout.as_secs()).unwrap_or(libc::time_t::MAX),
         tv_nsec: timeout.subsec_nanos() as libc::c_long,
     };
-    // SAFETY: FUTEX_WAIT (shared, i.e. without FUTEX_PRIVATE_FLAG, because the word lives in a MAP_SHARED file
-    // mapping used by several processes) reads the 4-byte aligned word at `word`'s address, which stays mapped for the
-    // duration of the call because `word` borrows the mapping; `ts` lives on our stack. The kernel only compares and
-    // sleeps; it never writes the word.
-    unsafe {
+    // SAFETY: FUTEX_WAIT (shared, i.e. without FUTEX_PRIVATE_FLAG, because the word lives in a MAP_SHARED mapping used
+    // by several processes) reads the 4-byte aligned word at `word`'s address, which stays mapped for the duration of
+    // the call because `word` borrows the mapping; `ts` lives on our stack. The kernel only compares and sleeps; it
+    // never writes the word.
+    let rc = unsafe {
         libc::syscall(
             libc::SYS_futex,
             word.as_ptr(),
@@ -469,12 +726,19 @@ fn wait_on(word: &AtomicU32, expected: u32, timeout: Duration) {
             &ts as *const libc::timespec,
             std::ptr::null::<u32>(),
             0u32,
-        );
+        )
+    };
+    if rc == 0 {
+        return WaitOutcome::Returned;
+    }
+    match io::Error::last_os_error().raw_os_error() {
+        Some(libc::EAGAIN | libc::EINTR | libc::ETIMEDOUT) => WaitOutcome::Returned,
+        _ => WaitOutcome::Unsupported,
     }
 }
 
 /// Wakes every thread blocked in [`wait_on`] on `word`, in any process.
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(target_os = "linux")]
 fn wake_all(word: &AtomicU32) {
     // SAFETY: FUTEX_WAKE only uses the address as a key (shared futex, see `wait_on`); `word` is mapped while borrowed.
     unsafe {
@@ -534,15 +798,14 @@ mod os_sync {
 }
 
 #[cfg(target_vendor = "apple")]
-fn wait_on(word: &AtomicU32, expected: u32, timeout: Duration) {
+fn wait_on(word: &AtomicU32, expected: u32, timeout: Duration) -> WaitOutcome {
     let Some((wait, _)) = os_sync::functions() else {
-        std::thread::sleep(timeout.min(Duration::from_millis(1)));
-        return;
+        return WaitOutcome::Unsupported;
     };
     let ns = u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX).max(1);
     // SAFETY: the address is the 4-byte aligned word, mapped while `word` is borrowed; size 4 matches; the shared flag
     // matches the wake side; the kernel only compares the value and sleeps.
-    unsafe {
+    let rc = unsafe {
         wait(
             word.as_ptr().cast(),
             u64::from(expected),
@@ -550,7 +813,14 @@ fn wait_on(word: &AtomicU32, expected: u32, timeout: Duration) {
             os_sync::SHARED,
             os_sync::CLOCK_MACH_ABSOLUTE_TIME,
             ns,
-        );
+        )
+    };
+    if rc >= 0 {
+        return WaitOutcome::Returned;
+    }
+    match io::Error::last_os_error().raw_os_error() {
+        Some(libc::ETIMEDOUT | libc::EINTR) => WaitOutcome::Returned,
+        _ => WaitOutcome::Unsupported,
     }
 }
 
@@ -564,12 +834,12 @@ fn wake_all(word: &AtomicU32) {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
-fn wait_on(_word: &AtomicU32, _expected: u32, timeout: Duration) {
-    std::thread::sleep(timeout.min(Duration::from_millis(1)));
+#[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+fn wait_on(_word: &AtomicU32, _expected: u32, _timeout: Duration) -> WaitOutcome {
+    WaitOutcome::Unsupported
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+#[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
 fn wake_all(_word: &AtomicU32) {}
 
 /// Tries to take an exclusive `flock` without blocking. `Ok(false)` if another process holds it.
@@ -758,6 +1028,45 @@ mod tests {
         assert_eq!(ro.commit_word(131064), Some(0));
         sync_all(&file).unwrap();
         full_barrier(&file).unwrap();
+    }
+
+    #[test]
+    fn notify_region_attach_checks_the_nonce_and_sees_publications() {
+        let (owner, location) = Notify::create(0x1234_5678_9abc_def0).unwrap();
+        assert!(Notify::attach(&location, 1).is_err(), "wrong nonce");
+        let reader = Notify::attach(&location, 0x1234_5678_9abc_def0).unwrap();
+        assert!(reader.writer_notifies());
+        let seen = reader.begin_wait();
+        owner.publish();
+        // The counter moved, so the wait returns at once instead of after 10 s.
+        let started = std::time::Instant::now();
+        assert_eq!(
+            reader.wait(seen, Duration::from_secs(10)),
+            WaitOutcome::Returned
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        reader.end_wait();
+        reader.end_wait(); // never below zero
+        drop(owner);
+        assert!(
+            !reader.writer_notifies(),
+            "a dropped writer clears its flag"
+        );
+    }
+
+    #[test]
+    fn notify_region_cannot_shrink() {
+        let (owner, location) = Notify::create(7).unwrap();
+        let file = &owner.owner.as_ref().unwrap().file;
+        assert!(file.set_len(0).is_err(), "owner's descriptor");
+        assert!(file.set_len(1).is_err());
+        let other = open_region(&location).unwrap();
+        assert!(
+            other.set_len(0).is_err(),
+            "another descriptor for the same region"
+        );
+        // macOS rounds the object up to a whole page (16 KiB on Apple silicon).
+        assert!(other.metadata().unwrap().len() >= NOTIFY_REGION_LEN as u64);
     }
 
     #[test]

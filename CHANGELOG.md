@@ -12,9 +12,12 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   `append` and both readers for short records. Results are bit-identical; the format is unchanged.
 - Performance: the zero-copy reader copies records for validation with a plain word loop (faster replay).
 - Benchmarks: `tt-latency --wait spin|default|block|sleep` selects how the reader waits.
-- Library: reader wake-ups (ADR 0017). Blocked readers wait on a shared `notify` file (futex on Linux,
-  `os_sync_wait_on_address` on macOS 14.4+) instead of sleeping; a new record wakes them within microseconds.
-  On by default (`ReaderConfig::notify`, `WriterConfig::notify`); falls back to sleeping where unavailable.
+- Library: reader wake-ups (ADRs 0017, 0021). Blocked readers wait in a shared-memory region that the writer
+  creates and names in the journal's `notify` record (futex on a sealed memfd on Linux, `os_sync_wait_on_address`
+  on a POSIX shared-memory object on macOS 14.4+) instead of sleeping; a new record wakes them within
+  microseconds. The region can't shrink, so the safe reader still can't receive `SIGBUS`. On by default
+  (`ReaderConfig::notify`, `WriterConfig::notify`); readers poll where wake-ups are unavailable, including between
+  different users.
 - CLI: add read-only `stats` with streaming range/checkpoint statistics, bounded payload percentiles, exact
   UTC-second counts, and a documented `--json` schema.
 - Library: `Reader::records()`, an iterator of owned records committed so far (for `take`, `filter`, `collect`).

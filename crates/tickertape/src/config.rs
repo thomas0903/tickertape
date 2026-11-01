@@ -30,7 +30,8 @@ pub struct WriterConfig {
     pub segment_size: u64,
     /// What to do with a corrupt tail on open. Default: [`RecoveryPolicy::Quarantine`].
     pub recovery: RecoveryPolicy,
-    /// Maintain the notify file so that blocked readers wake up as soon as a record is published (ADR 0017).
+    /// Create a shared-memory wake-up region, named in the journal's `notify` record, so that blocked readers wake up
+    /// as soon as a record is published (ADRs 0017 and 0021).
     /// Costs one atomic increment and one load per append, plus a wake-up system call when readers are blocked.
     /// Default: true.
     pub notify: bool,
@@ -132,9 +133,12 @@ pub struct ReaderConfig {
     /// Without a valid marker, no records are returned. See ADR 0010 (`docs/decisions/0010-durable-only-reads.md` in the
     /// repository) and crash contract C13 (`docs/crash-contract.md`) for the durability guarantee and storage assumptions.
     pub durable_only: bool,
-    /// After the spin and yield phases of [`Backoff`], block on the journal's notify file instead of sleeping, so a
-    /// new record wakes the reader immediately (ADR 0017). Needs write access to `<dir>/notify`; without it, or on
-    /// macOS before 14.4, the reader falls back to sleeping. Default: true.
+    /// After the spin and yield phases of [`Backoff`], block on the writer's shared-memory wake-up region instead of
+    /// sleeping, so a new record wakes the reader immediately (ADRs 0017 and 0021). The region is found through the
+    /// journal's `notify` record, which the reader only reads. It can't shrink, so this never exposes a safe reader to
+    /// `SIGBUS`. Readers fall back to sleeping when there is no running writer, on macOS before 14.4, when the writer
+    /// runs as another user (or, on Linux, in another pid namespace), or if the platform's wait call fails.
+    /// Default: true.
     pub notify: bool,
 }
 
@@ -169,7 +173,7 @@ impl ReaderConfig {
         self
     }
 
-    /// Sets whether to block on the notify file instead of sleeping (see [`ReaderConfig::notify`]).
+    /// Sets whether to block on the wake-up region instead of sleeping (see [`ReaderConfig::notify`]).
     pub fn notify(mut self, on: bool) -> Self {
         self.notify = on;
         self

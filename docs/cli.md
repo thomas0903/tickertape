@@ -3,7 +3,8 @@
 Install/build the `tickertape-cli` package; its binary is `tickertape`. Commands use the public library API,
 never write segments, the checkpoint marker or any other journal data, and never take the writer lock. Paths may
 name a journal with an active writer. The one write is that a following `tail`, while it waits for new records,
-registers itself as a waiter in the journal's `notify` file (ADR 0017), which holds no journal data.
+registers itself as a waiter in the writer's shared-memory wake-up region (ADRs 0017, 0021), which is outside the
+journal directory and holds no journal data.
 
 All commands support `--help`. Exit codes: **0** success (including help, exhausted input, count reached or idle
 timeout), **1** usage, I/O or missing-journal error, **2** corrupt data or an unsupported journal format.
