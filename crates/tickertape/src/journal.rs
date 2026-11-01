@@ -144,3 +144,117 @@ pub(crate) fn sync_dir(dir: &Path) -> Result<()> {
     let f = open_dir(dir)?;
     crate::mmap::sync_all(&f).map_err(|e| Error::io("sync directory", dir, e))
 }
+
+/// Window size for [`scan_file`].
+const SCAN_WINDOW: usize = 1 << 20;
+
+/// A [`format::SegmentView`] over a segment file read with `pread` in windows, so that scanning a segment needs memory
+/// for one window (or one record, if larger), never the whole file. An I/O error makes the view return `None`; the
+/// error is kept and reported by [`scan_file`].
+struct PreadView<'f> {
+    file: &'f File,
+    len: u64,
+    /// The bytes at `[window.0, window.0 + window.1.len())`.
+    window: std::cell::RefCell<(u64, Vec<u8>)>,
+    error: std::cell::RefCell<Option<std::io::Error>>,
+}
+
+impl PreadView<'_> {
+    /// Makes `[offset, offset + len)` (already checked against the file length) available in the window.
+    fn fill(&self, offset: u64, len: u64) -> bool {
+        let mut window = self.window.borrow_mut();
+        let (start, buf) = &mut *window;
+        if offset >= *start && offset + len <= *start + buf.len() as u64 {
+            return true;
+        }
+        let want = len.max(SCAN_WINDOW as u64).min(self.len - offset);
+        buf.resize(want as usize, 0);
+        match self.file.read_exact_at(buf, offset) {
+            Ok(()) => {
+                *start = offset;
+                true
+            }
+            Err(e) => {
+                buf.clear();
+                self.error.borrow_mut().get_or_insert(e);
+                false
+            }
+        }
+    }
+}
+
+impl format::SegmentView for PreadView<'_> {
+    fn len(&self) -> u64 {
+        self.len
+    }
+
+    fn commit_word(&self, offset: u64) -> Option<u32> {
+        if offset % format::RECORD_ALIGN as u64 != 0 {
+            return None;
+        }
+        self.with_bytes(offset, format::COMMIT_WORD_LEN as u64, |b| {
+            u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+        })
+    }
+
+    fn with_bytes<R>(&self, offset: u64, len: u64, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
+        if offset.checked_add(len)? > self.len || !self.fill(offset, len) {
+            return None;
+        }
+        let window = self.window.borrow();
+        let at = (offset - window.0) as usize;
+        Some(f(&window.1[at..at + len as usize]))
+    }
+}
+
+/// Scans a segment file from its first record slot, expecting `base` there, reading it with `pread` in bounded
+/// windows (the file is never mapped, so other processes can't affect memory safety).
+pub(crate) fn scan_file(path: &Path, base: u64) -> Result<format::ScanResult> {
+    let file = File::open(path).map_err(|e| Error::io("open segment", path, e))?;
+    let len = file
+        .metadata()
+        .map_err(|e| Error::io("stat segment", path, e))?
+        .len();
+    let view = PreadView {
+        file: &file,
+        len,
+        window: std::cell::RefCell::new((0, Vec::new())),
+        error: std::cell::RefCell::new(None),
+    };
+    let scan = format::scan_segment(&view, format::SEGMENT_HEADER_LEN as u64, base);
+    if let Some(e) = view.error.into_inner() {
+        return Err(Error::io("read segment", path, e));
+    }
+    Ok(scan)
+}
+
+#[cfg(test)]
+mod scan_tests {
+    use super::*;
+    use crate::{NewRecord, Writer, WriterConfig};
+
+    #[test]
+    fn windowed_scan_matches_an_in_memory_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w =
+            Writer::open(dir.path(), WriterConfig::default().segment_size(4 << 20)).unwrap();
+        // 1,000-byte payloads straddle the 1 MiB window boundaries; enough records to seal the first segment.
+        let payload = vec![7u8; 1000];
+        for _ in 0..5000 {
+            w.append(&NewRecord {
+                schema_id: 1,
+                venue_ts_ns: 0,
+                local_ts_ns: 0,
+                payload: &payload,
+            })
+            .unwrap();
+        }
+        drop(w);
+        for (base, path) in list_segments(dir.path()).unwrap() {
+            let image = fs::read(&path).unwrap();
+            let expected =
+                format::scan_segment(&image[..], format::SEGMENT_HEADER_LEN as u64, base);
+            assert_eq!(scan_file(&path, base).unwrap(), expected, "segment {base}");
+        }
+    }
+}

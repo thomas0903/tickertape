@@ -90,10 +90,10 @@ pub enum Error {
     #[error("sequence numbers exhausted")]
     SequenceExhausted,
 
-    /// Writer recovery replaced or removed the segment at the reader's position (after a power loss or corruption),
+    /// Writer recovery replaced or removed the segment, or retention removed it, at the reader's position,
     /// so records from this sequence number on may belong to a discarded history. Call
     /// [`Reader::seek`](crate::Reader::seek) to continue on the current chain.
-    #[error("the segment at sequence {seq} was replaced or removed by writer recovery")]
+    #[error("the segment at sequence {seq} was replaced or removed by recovery or retention")]
     Discarded {
         /// The reader's position when it noticed.
         seq: u64,

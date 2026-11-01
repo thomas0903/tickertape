@@ -39,6 +39,8 @@ pub struct WriterConfig {
     /// that `append` rarely takes a page fault (ADR 0020). The thread only advises the kernel (`madvise`); it never
     /// writes to the journal. Set to `false` for a writer that starts no threads. Default: true.
     pub prefault: bool,
+    /// Optional retention policy and action, run after open and successful checkpoints. Default: none.
+    pub retention: Option<(crate::retention::Policy, crate::retention::Action)>,
 }
 
 impl WriterConfig {
@@ -48,6 +50,18 @@ impl WriterConfig {
     /// Sets the size of new segment files. Checked by [`Writer::open`](crate::Writer::open).
     pub fn segment_size(mut self, bytes: u64) -> Self {
         self.segment_size = bytes;
+        self
+    }
+
+    /// Enables retention after open and every successful checkpoint.
+    /// Failures are recorded by [`Writer::last_retention_error`](crate::Writer::last_retention_error),
+    /// without failing open, appends or checkpoints. The archive directory must already exist.
+    pub fn retention(
+        mut self,
+        policy: crate::retention::Policy,
+        action: crate::retention::Action,
+    ) -> Self {
+        self.retention = Some((policy, action));
         self
     }
 
@@ -77,6 +91,7 @@ impl Default for WriterConfig {
             recovery: RecoveryPolicy::default(),
             notify: true,
             prefault: true,
+            retention: None,
         }
     }
 }

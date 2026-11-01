@@ -61,6 +61,7 @@ mod prefault;
 mod protocol_model;
 mod reader;
 mod record;
+pub mod retention;
 mod writer;
 
 pub use config::{Backoff, ReaderConfig, RecoveryPolicy, WriterConfig};

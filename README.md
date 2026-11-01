@@ -13,10 +13,10 @@ Think of it as a flight recorder for a trading system or any other latency-sensi
 - Any number of **readers**, in other processes, follow the journal live or **replay** it from any sequence number.
   Readers never slow the writer down. A reader waiting for new records sleeps in the kernel and is woken when the
   writer appends (futex on Linux, `os_sync_wait_on_address` on macOS 14.4+), and falls back to polling elsewhere.
-- Data lives in fixed-size **segment files** that roll over and are never deleted for you, so a journal can be
-  inspected, copied and replayed after an incident or in tests.
+- Data lives in fixed-size **segment files** that roll over. Segments are never deleted automatically unless
+  you configure a retention policy; `tickertape archive` can move or delete old, checkpoint-covered segments.
 - The **`tickertape` CLI** tails, inspects, verifies and summarizes journals (`stats`), and exports them to
-  JSONL or Parquet.
+  JSONL or Parquet. Its `archive` command is the only command that changes a journal.
 
 ![tickertape architecture: a writer process appends to segment files and a checkpoint marker in one journal directory; safe and zero-copy reader processes and the CLI read them; the CLI exports Parquet or JSONL for DuckDB and Python](docs/figures/architecture.svg)
 

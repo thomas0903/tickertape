@@ -29,6 +29,11 @@ A journal is one directory. Only these names have a meaning; anything else is ig
 | `writer.lock` | Lock file. The writer holds an exclusive `flock` on it while open and writes its PID (decimal ASCII) into it. The PID is informational; the lock is the authority |
 | `quarantine/` | Bytes and segments removed from the journal by recovery, kept so that nothing is silently destroyed. Never read by readers, never deleted by tickertape |
 
+Segments are never removed automatically unless a writer retention policy is configured.
+`tickertape archive` or `tickertape::retention` can remove a contiguous prefix of sealed segments strictly before
+the checkpoint segment; without a valid marker nothing is eligible (ADR [0016](decisions/0016-retention-and-archiving.md)).
+The checkpoint segment and everything after it remain. A retained journal can therefore begin above sequence 0.
+
 Sequence numbers start at 0 and increase by exactly 1 per record across the whole journal, including across
 segments. The first segment is `00000000000000000000.tape`. The largest sequence number a record can have is
 `u64::MAX - 1`; an append beyond it fails.

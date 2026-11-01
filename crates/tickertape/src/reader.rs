@@ -196,7 +196,7 @@ impl Reader {
     ///
     /// [`Error::Corrupt`] if the bytes at the cursor fail validation. The cursor doesn't move,
     /// so calling again retries the same position (which may succeed after a writer recovery).
-    /// [`Error::Discarded`] if writer recovery replaced or removed the segment at the cursor;
+    /// [`Error::Discarded`] if writer recovery or retention replaced or removed the segment at the cursor;
     /// call [`Reader::seek`] to continue on the current chain.
     /// [`Error::Io`] if the next segment can't be opened.
     pub fn try_next(&mut self) -> Result<Option<Record<'_>>> {
