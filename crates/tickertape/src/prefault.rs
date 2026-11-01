@@ -196,8 +196,10 @@ fn make_spare(dir: &Path, size: u64) -> io::Result<Spare> {
         .open(&path)?;
     let made = (|| {
         let len = usize::try_from(size).map_err(|_| io::Error::other("segment too large"))?;
+        crate::fault::inject_background(crate::fault::Point::SparePreallocate)?;
         mmap::preallocate(&file, size)?;
         mmap::sync_data(&file)?;
+        crate::fault::inject_background(crate::fault::Point::SpareMap)?;
         let map = MapRw::new(&file, len)?;
         let _ = map.advice().prefault(0, WINDOW);
         Ok(map)

@@ -506,9 +506,8 @@ fn publish_spare(dir: &Path, base: u64, size: u64, spare: Spare) -> Result<Segme
         base_seq: base,
         created_unix_ns: crate::clock::realtime_ns(),
     });
-    let prepared = spare
-        .file
-        .write_all_at(&header, 0)
+    let prepared = crate::fault::inject(crate::fault::Point::SpareHeader)
+        .and_then(|()| spare.file.write_all_at(&header, 0))
         .and_then(|()| mmap::sync_data(&spare.file));
     if prepared.is_err() {
         drop(spare);

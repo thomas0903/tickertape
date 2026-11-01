@@ -308,6 +308,106 @@ impl Drop for SmallVolume {
     }
 }
 
+/// Crash-contract C10 on the default path (ADR 0022): the writer prepares the next segment in the background, the
+/// volume then fills up, and the writer rolls into the prepared segment and keeps writing. A sparse or unsynced spare
+/// would fail here like an unpreallocated segment. Runs the writer in a child process, as above.
+#[test]
+#[ignore = "needs hdiutil (macOS) or passwordless sudo (Linux); run with -- --ignored"]
+fn full_volume_then_roll_into_prepared_spare() {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::process::ExitStatusExt;
+
+    let Some(vol) = SmallVolume::create(16) else {
+        eprintln!(
+            "full_volume_then_roll_into_prepared_spare: skipped, no small filesystem available"
+        );
+        return;
+    };
+    let journal = vol.path.join("journal");
+    let segment = 4 * 1024 * 1024u64;
+    let control = tempfile::tempdir().unwrap(); // outside the small volume: it must stay writable
+    let go = control.path().join("go");
+    // Pause well past the middle of the first segment, where the spare has been requested.
+    let (pause_at, count) = (35_000u64, 60_000u64);
+    let child = std::process::Command::new(env!("CARGO_BIN_EXE_tt-writer"))
+        .args([
+            journal.to_str().unwrap(),
+            &count.to_string(),
+            &segment.to_string(),
+            "64",
+            &pause_at.to_string(),
+            go.to_str().unwrap(),
+        ])
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let spare = journal.join("next-segment.tmp");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !std::fs::metadata(&spare)
+        .is_ok_and(|m| m.len() == segment && m.blocks() * 512 >= segment)
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no prepared spare appeared"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let mut filler = std::fs::File::create(vol.path.join("filler")).unwrap();
+    let chunk = vec![0xEEu8; 64 * 1024];
+    loop {
+        use std::io::Write;
+        if filler
+            .write_all(&chunk)
+            .and_then(|()| filler.sync_all())
+            .is_err()
+        {
+            break;
+        }
+    }
+    std::fs::write(&go, b"").unwrap();
+    let output = child.wait_with_output().unwrap();
+    let status = output.status;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    eprintln!(
+        "full_volume_then_roll_into_prepared_spare: writer exit status {status:?} (signal {:?})",
+        status.signal()
+    );
+    // Never a signal (SIGBUS) or a hang. Writing into the prepared segment needs no new blocks; only publishing it
+    // needs a directory entry, which a completely full volume may refuse: that is C9's reported storage-full error.
+    assert_eq!(status.signal(), None, "writer killed by a signal: {stderr}");
+    let records = read_all(&journal);
+    for (i, r) in records.iter().enumerate() {
+        assert_eq!(r.seq, i as u64);
+    }
+    if status.success() {
+        assert_eq!(records.len(), count as usize);
+        let segments = std::fs::read_dir(&journal)
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".tape")
+            })
+            .count();
+        assert_eq!(
+            segments, 2,
+            "the writer should have rolled exactly once, into the spare"
+        );
+    } else {
+        assert!(
+            stderr.contains("StorageFull"),
+            "failed with something other than storage full: {stderr}"
+        );
+        assert!(
+            records.len() as u64 >= pause_at,
+            "lost records: {}",
+            records.len()
+        );
+    }
+}
+
 /// Measures crash-contract C10: a writer appending into an already preallocated segment after the volume has
 /// filled up. Runs the writer in a child process so that a SIGBUS shows up as a signal instead of killing the test.
 ///
