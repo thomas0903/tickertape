@@ -29,6 +29,8 @@ for run in 1 2; do
       $BIN/tt-latency run --dir "$WORK/lat-$run-$payload-$reader" --rate 100000 --count 1100000 --warmup 100000 \
         --payload "$payload" --reader "$reader" --json >> "$OUT/latency.jsonl"
     done
+    $BIN/tt-latency run --dir "$WORK/lat-$run-$payload-mapped-noprefault" --rate 100000 --count 1100000 --warmup 100000 \
+      --payload "$payload" --reader mapped --no-prefault --json >> "$OUT/latency.jsonl"
     for wait in default sleep; do
       $BIN/tt-latency run --dir "$WORK/lat-$run-$payload-safe-$wait" --rate 100000 --count 1100000 --warmup 100000 \
         --payload "$payload" --reader safe --wait "$wait" --json >> "$OUT/latency.jsonl"

@@ -76,8 +76,8 @@ fn latency_both_readers_and_warmup() {
 }
 
 #[test]
-fn latency_wait_modes() {
-    for wait in ["default", "block", "sleep"] {
+fn latency_wait_modes_and_no_prefault() {
+    for (wait, prefault) in [("default", true), ("block", true), ("sleep", false)] {
         let root = tempfile::tempdir().unwrap();
         let output = Command::new(env!("CARGO_BIN_EXE_tt-latency"))
             .args(["run", "--dir"])
@@ -95,6 +95,7 @@ fn latency_wait_modes() {
                 wait,
                 "--json",
             ])
+            .args((!prefault).then_some("--no-prefault"))
             .output()
             .unwrap();
         assert!(
@@ -104,6 +105,7 @@ fn latency_wait_modes() {
         );
         let result: Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(result["wait"], wait);
+        assert_eq!(result["prefault"], prefault);
         assert_eq!(result["latency"]["count"], 500);
     }
 }

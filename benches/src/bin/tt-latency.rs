@@ -23,7 +23,7 @@ const HELP: &str = "tt-latency: cross-process writer-to-reader visible latency
 Usage: tt-latency run --dir <DIR> --rate <records/s> --count <N>
                      --payload <bytes> --reader safe|mapped
                      [--warmup <N>] [--segment-size <bytes>] [--json] [--cold]
-                     [--wait spin|default|block|sleep]
+                     [--wait spin|default|block|sleep] [--no-prefault]
        tt-latency --help
 
 --dir must be new or empty; data is retained. --count includes --warmup (default 0),
@@ -36,6 +36,7 @@ releases a shared future start time.
   default  ReaderConfig::default(): 100 spins, 10 yields, then block on the notify file
   block    no spins or yields: block on the notify file at once (kernel wake-up only)
   sleep    Backoff::default() with notify off: spins, yields, then 10 us..1 ms sleeps
+--no-prefault starts the writer with WriterConfig::prefault(false) (no helper thread).
 
 Coordinated omission: record i is scheduled at t0 + floor(i * 1e9 / rate) using
 tickertape::clock::realtime_ns() on one host. local_ts_ns stores the INTENDED time,
@@ -68,6 +69,7 @@ struct Config {
     payload: usize,
     reader: String,
     wait: String,
+    prefault: bool,
     warmup: u64,
     segment_size: u64,
     json: bool,
@@ -91,7 +93,7 @@ impl Config {
         if child {
             values.push("--control");
         }
-        let options = Options::parse(args, &values, &["--json", "--cold"])?;
+        let options = Options::parse(args, &values, &["--json", "--cold", "--no-prefault"])?;
         let rate = options.number("--rate", None)?;
         let count = options.number("--count", None)?;
         let warmup = options.number("--warmup", Some(0))?;
@@ -129,6 +131,7 @@ impl Config {
             payload,
             reader,
             wait,
+            prefault: !options.flag("--no-prefault"),
             warmup,
             segment_size,
             json: options.flag("--json"),
@@ -258,7 +261,7 @@ fn run(config: &Config, args: &[String]) -> Result<()> {
     };
     let mut result = json!({"mode": if config.cold { "cold_replay" } else { "visible_latency" },
         "count": config.count, "rate": config.rate, "payload": config.payload, "reader": config.reader,
-        "wait": config.wait, "warmup": config.warmup, "segment_size": config.segment_size});
+        "wait": config.wait, "prefault": config.prefault, "warmup": config.warmup, "segment_size": config.segment_size});
     if config.cold {
         result["replay"] = reader_result;
     } else {
@@ -270,13 +273,14 @@ fn run(config: &Config, args: &[String]) -> Result<()> {
         println!("{result}");
     } else {
         println!(
-            "mode={} count={} rate={} records/s payload={} B reader={} wait={} warmup={} segment_size={} B",
+            "mode={} count={} rate={} records/s payload={} B reader={} wait={} prefault={} warmup={} segment_size={} B",
             result["mode"],
             config.count,
             config.rate,
             config.payload,
             config.reader,
             config.wait,
+            config.prefault,
             config.warmup,
             config.segment_size
         );
@@ -308,7 +312,9 @@ fn writer(config: &Config) -> Result<()> {
     let control = config.control.as_ref().ok_or("missing control directory")?;
     let mut writer = Writer::open(
         &config.dir,
-        WriterConfig::default().segment_size(config.segment_size),
+        WriterConfig::default()
+            .segment_size(config.segment_size)
+            .prefault(config.prefault),
     )?;
     let payload = vec![0x5a; config.payload];
     let deadline = Instant::now() + config.timeout;
