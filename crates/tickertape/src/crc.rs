@@ -96,15 +96,20 @@ macro_rules! three_lane_crc {
             tables
         }
 
-        /// Feeds `data` to the raw (already inverted) CRC register `crc`.
+        /// Feeds `data` to the raw (already inverted) CRC register `crc`. Without `tables` (inputs too short for a
+        /// three-lane block), only the serial loop runs.
         #[target_feature(enable = $feature)]
         #[allow(unused_unsafe)]
-        unsafe fn update(mut crc: u32, mut data: &[u8], tables: &super::ShiftTables) -> u32 {
-            for (table, lane) in tables.iter().zip(super::LANES) {
-                while data.len() >= 3 * lane {
-                    let (a, rest) = data.split_at(lane);
-                    let (b, rest) = rest.split_at(lane);
-                    let (c, rest) = rest.split_at(lane);
+        unsafe fn update(
+            mut crc: u32,
+            mut data: &[u8],
+            tables: Option<&super::ShiftTables>,
+        ) -> u32 {
+            for (table, lane) in tables.into_iter().flatten().zip(super::LANES) {
+                let mut blocks = data.chunks_exact(3 * lane);
+                for block in &mut blocks {
+                    let (a, rest) = block.split_at(lane);
+                    let (b, c) = rest.split_at(lane);
                     let (mut c0, mut c1, mut c2) = (crc, 0u32, 0u32);
                     for ((x, y), z) in a
                         .chunks_exact(8)
@@ -120,8 +125,8 @@ macro_rules! three_lane_crc {
                     }
                     // Lane b started from zero: the register after a and b is a's register advanced over b, XOR b's.
                     crc = super::shift(table, super::shift(table, c0) ^ c1) ^ c2;
-                    data = rest;
                 }
+                data = blocks.remainder();
             }
             let mut words = data.chunks_exact(8);
             for w in &mut words {
@@ -148,7 +153,8 @@ mod hw {
         if !std::arch::is_aarch64_feature_detected!("crc") {
             return None;
         }
-        let tables = tables();
+        // Short inputs never reach a three-lane block, so they don't need (or build) the tables.
+        let tables = (data.len() >= 3 * super::LANES[1]).then(tables);
         // SAFETY: `update` only requires the `crc` target feature, which the CPU has (checked just above).
         Some(!unsafe { update(!crc, data, tables) })
     }
@@ -181,7 +187,8 @@ mod hw {
         if !std::arch::is_x86_feature_detected!("sse4.2") {
             return None;
         }
-        let tables = tables();
+        // Short inputs never reach a three-lane block, so they don't need (or build) the tables.
+        let tables = (data.len() >= 3 * super::LANES[1]).then(tables);
         // SAFETY: `update` only requires the `sse4.2` target feature, which the CPU has (checked just above).
         Some(!unsafe { update(!crc, data, tables) })
     }
@@ -227,13 +234,21 @@ mod tests {
 
     #[test]
     fn every_length_through_the_lane_sizes_matches_the_crate() {
-        // Every length through two full rounds of both lane sizes, and every serial tail.
-        let data: Vec<u8> = (0..2 * 3 * (256 + 64) as u32 + 64)
-            .map(|i| (i * 131 + 7) as u8)
+        // Every length through two full rounds of both lane sizes plus every serial tail, at all eight offsets.
+        // Pseudorandom bytes, so that no two lanes hold the same data (a lane swap must change the result).
+        const MAX: usize = 2 * 3 * (256 + 64) + 64;
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let data: Vec<u8> = (0..MAX + 7)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
             .collect();
         let step = if cfg!(miri) { 61 } else { 1 };
-        for len in (0..data.len()).step_by(step) {
-            for start in 0..8.min(data.len() - len) {
+        for len in (0..=MAX).step_by(step) {
+            for start in 0..8 {
                 let slice = &data[start..start + len];
                 assert_eq!(
                     crc32c(slice),

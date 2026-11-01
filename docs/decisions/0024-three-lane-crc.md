@@ -34,10 +34,13 @@ the time. This profiling is exploratory, not a recorded benchmark.
 `shift` is four lookups in a 4 × 256 table per lane size. The CRC update is linear over GF(2), so advancing any
 register over a fixed number of zero bytes is the XOR of the advanced bytes. The tables are built once, at first use,
 by running the CRC instruction itself over zero bytes. That takes microseconds and needs no hand-written constants.
+Inputs shorter than one three-lane block of 64-byte lanes (192 bytes) use only the serial loop and never build the
+tables (8 KiB).
 The crate stays as the fallback on CPUs without the instruction and under Miri.
 
 Correctness is checked against the crate:
-- for every length up to two full rounds of both lane sizes (1,984 bytes), at eight starting offsets;
+- for every length from 0 to 1,984 bytes (two full rounds of both lane sizes plus every tail), at all eight
+  starting offsets, with pseudorandom data so that no two lanes are equal;
 - by a property test on random data up to 5,000 bytes with random initial values;
 - by the RFC 3720 check values.
 
