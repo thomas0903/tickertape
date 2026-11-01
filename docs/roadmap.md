@@ -81,10 +81,13 @@ Owner decisions of 2026-11-01: build the former "Later" items below, benchmark a
 
 ## Next (candidates, not commitments)
 
-- Bare-metal Linux runs (x86-64 and Graviton) once the EC2 vCPU quota allows, including xfs.
-- A Linux prefault scheme that doesn't dirty pages ahead of the writer, for example very small windows or
-  rate-adaptive prefaulting (ADR 0023).
-- Faster replay of large records (1 KiB replay trails yaque and Chronicle Queue on Linux).
+- **Linux prefaulting, again.** In an unrecorded experiment on bare metal (`z1d.metal`, 11-second runs),
+  `MADV_POPULATE_WRITE` cut tickertape's tail latency by about an order of magnitude, with no stalls. On a small cloud
+  VM it caused stalls of 100 ms and more once background write-back was running (ADR 0023). A recorded long run on
+  bare metal, with write-back active, must decide whether it can be the Linux default.
+- **Faster replay of large records.** At 1,024 B, Chronicle Queue replays 5.0–5.5 million records/s on bare metal
+  against tickertape's 3.0.
+- **Graviton bare metal** (`c7gd.metal`), to cover aarch64 Linux servers.
 
 ## Later (explicitly out of scope for v0.1)
 
