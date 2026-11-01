@@ -39,3 +39,47 @@ class ResultTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ClockRetryTests(unittest.TestCase):
+    def run_with(self, failures):
+        import json
+        import tempfile
+        from pathlib import Path
+        import run
+        calls = []
+
+        def attempt(*args):
+            out = args[6]
+            calls.append(1)
+            if len(calls) <= len(failures):
+                with (out / "children.log").open("a") as log:
+                    log.write(failures[len(calls) - 1] + "\n")
+                raise RuntimeError("child exited 1; see children.log")
+            return "ok"
+
+        original = run.run_attempt
+        run.run_attempt = attempt
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                out = Path(tmp)
+                try:
+                    result = run.run_one("yaque", "W2", 64, "default", 10000, 2, out, {}, False, None)
+                except RuntimeError:
+                    result = None
+                retries = out / "retries.jsonl"
+                logged = [json.loads(line) for line in retries.read_text().splitlines()] if retries.exists() else []
+        finally:
+            run.run_attempt = original
+        return result, len(calls), logged
+
+    def test_clock_steps_are_retried_and_recorded(self):
+        result, calls, logged = self.run_with(["yaque: wall clock moved backwards"] * 2)
+        self.assertEqual((result, calls), ("ok", 3))
+        self.assertEqual([r["attempt"] for r in logged], [1, 2])
+        self.assertEqual(logged[0]["label"], "yaque-W2-64-default-10000-2")
+
+    def test_other_failures_and_too_many_clock_steps_stop_the_suite(self):
+        self.assertEqual(self.run_with(["validation failed"])[:2], (None, 1))
+        result, calls, logged = self.run_with(["wall clock moved backwards"] * 4)
+        self.assertEqual((result, calls, len(logged)), (None, 4, 3))

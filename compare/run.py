@@ -90,7 +90,33 @@ def parse_result(path):
     return json.loads(lines[0])
 
 
+CLOCK_STEP = "wall clock moved backwards"
+CLOCK_RETRIES = 3
+
+
 def run_one(tool, workload, payload, reader, rate, repeat, out, env, quick, commands):
+    """Runs one measurement. A latency run that saw the wall clock step backwards (an NTP adjustment; latency is
+    measured against intended wall-clock send times) is invalid: it is discarded and measured again, at most
+    CLOCK_RETRIES times, and each discarded attempt is recorded in retries.jsonl. Any other failure stops the suite."""
+    log = out / "children.log"
+    for attempt in range(1, CLOCK_RETRIES + 2):
+        start = log.stat().st_size if log.exists() else 0
+        try:
+            return run_attempt(tool, workload, payload, reader, rate, repeat, out, env, quick, commands)
+        except RuntimeError as error:
+            with log.open("rb") as f:
+                f.seek(start)
+                new = f.read().decode("utf-8", "replace")
+            if CLOCK_STEP not in new or attempt > CLOCK_RETRIES:
+                raise
+            label = f"{tool}-{workload}-{payload}-{reader}-{rate}-{repeat}"
+            with (out / "retries.jsonl").open("a") as f:
+                f.write(json.dumps({"label": label, "attempt": attempt, "reason": CLOCK_STEP,
+                                    "error": str(error)}) + "\n")
+            print(f"{label}: discarded attempt {attempt} ({CLOCK_STEP}); retrying", file=sys.stderr, flush=True)
+
+
+def run_attempt(tool, workload, payload, reader, rate, repeat, out, env, quick, commands):
     mode = {"W1": "append", "W2": "visible_latency", "W3": "warm_replay"}[workload]
     count = (1_000_000 if payload == 64 else 100_000)
     warmup = 100_000 if workload == "W2" else 0

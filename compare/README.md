@@ -24,7 +24,8 @@ OUTDIR must be new or empty. The runner builds release binaries and Java project
 once, then executes every implemented tool × workload × payload × reader × rate
 **twice**, sequentially. W1 has one tickertape writer, not one duplicate per reader.
 It emits **92 result lines in 15 JSONL files**, `environment.txt`, `commands.txt`,
-`build.log`, `children.log`, Java dependency inventories, and a machine-readable
+`build.log`, `children.log`, `retries.jsonl` (latency runs discarded and repeated because the wall clock stepped
+backwards, at most three per run), Java dependency inventories, and a machine-readable
 `skipped.json`. Any build, child,
 validation, timeout, or missing-tool failure fails the suite; missing measurements
 are never substituted with zero. Results already completed remain available.
