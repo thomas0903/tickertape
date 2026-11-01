@@ -131,7 +131,7 @@ pub fn encode_segment_header(header: &SegmentHeader) -> [u8; SEGMENT_HEADER_LEN]
     put(&mut buf, 16, &header.segment_size.to_le_bytes());
     put(&mut buf, 24, &header.base_seq.to_le_bytes());
     put(&mut buf, 32, &header.created_unix_ns.to_le_bytes());
-    let crc = crc32c::crc32c(&buf[..60]);
+    let crc = crate::crc::crc32c(&buf[..60]);
     put(&mut buf, 60, &crc.to_le_bytes());
     buf
 }
@@ -155,7 +155,7 @@ pub fn decode_segment_header(
     if read_u32(buf, 12) != Some(0) || buf[40..60].iter().any(|&b| b != 0) {
         return Err(bad("non-zero reserved fields"));
     }
-    if read_u32(buf, 60) != Some(crc32c::crc32c(&buf[..60])) {
+    if read_u32(buf, 60) != Some(crate::crc::crc32c(&buf[..60])) {
         return Err(bad("header checksum mismatch"));
     }
     let segment_size = read_u64(buf, 16).ok_or(bad("missing segment size"))?;
@@ -259,8 +259,8 @@ pub fn decode_record_body(
 
 /// The `seal_crc` value for a seal announcing `next_seq`.
 pub fn seal_crc(next_seq: u64) -> u32 {
-    crc32c::crc32c_append(
-        crc32c::crc32c(&SEAL_MARKER.to_le_bytes()),
+    crate::crc::crc32c_append(
+        crate::crc::crc32c(&SEAL_MARKER.to_le_bytes()),
         &next_seq.to_le_bytes(),
     )
 }
@@ -274,7 +274,7 @@ pub fn encode_checkpoint_slot(slot: &CheckpointSlot) -> [u8; CHECKPOINT_SLOT_LEN
     put(&mut buf, 24, &slot.next_seq.to_le_bytes());
     put(&mut buf, 32, &slot.segment_base_seq.to_le_bytes());
     put(&mut buf, 40, &slot.offset.to_le_bytes());
-    let crc = crc32c::crc32c(&buf[..60]);
+    let crc = crate::crc::crc32c(&buf[..60]);
     put(&mut buf, 60, &crc.to_le_bytes());
     buf
 }
@@ -291,7 +291,7 @@ pub fn decode_checkpoint(file: &[u8]) -> Option<CheckpointSlot> {
             if buf[..8] != CHECKPOINT_MAGIC
                 || read_u16(buf, 8) != Some(FORMAT_VERSION)
                 || buf[10..16].iter().chain(&buf[48..60]).any(|&b| b != 0)
-                || read_u32(buf, 60) != Some(crc32c::crc32c(&buf[..60]))
+                || read_u32(buf, 60) != Some(crate::crc::crc32c(&buf[..60]))
             {
                 return None;
             }
@@ -545,7 +545,7 @@ fn put(buf: &mut [u8], offset: u64, bytes: &[u8]) {
 }
 
 fn record_crc(len: u32, fields_and_payload: &[u8]) -> u32 {
-    crc32c::crc32c_append(crc32c::crc32c(&len.to_le_bytes()), fields_and_payload)
+    crate::crc::crc32c_append(crate::crc::crc32c(&len.to_le_bytes()), fields_and_payload)
 }
 
 #[cfg(test)]

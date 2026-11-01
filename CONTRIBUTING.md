@@ -9,8 +9,9 @@ welcome.
   change to either needs a short design record in `docs/decisions/` (copy `_template.md`), in the same pull request.
 - **Spec, then tests, then code.** Write down the behaviour (rustdoc, spec section or ADR), add tests that fail
   without the change, then implement. `docs/playbooks/add-feature.md` has the checklist.
-- **`unsafe` lives in one module.** Only `crates/tickertape/src/mmap.rs` may contain `unsafe` code, and every
-  `unsafe` block needs a `// SAFETY:` comment. Changes there get extra review.
+- **`unsafe` lives in two modules.** Only `crates/tickertape/src/mmap.rs` (mappings and system calls) and
+  `crates/tickertape/src/crc.rs` (CPU intrinsics, ADR 0019) may contain `unsafe` code, and every `unsafe` block needs
+  a `// SAFETY:` comment. Changes there get extra review.
 - **No unverified claims.** Numbers in docs come from recorded runs (`docs/playbooks/run-benchmark.md`); guarantees
   name the test that checks them.
 

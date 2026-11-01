@@ -44,6 +44,7 @@ compile_error!("tickertape supports Unix (Linux and macOS) only");
 
 pub mod clock;
 mod config;
+mod crc;
 mod error;
 #[cfg(feature = "fault-injection")]
 #[doc(hidden)]
