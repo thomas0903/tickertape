@@ -33,17 +33,18 @@ readers, retained and replayable files, rolling, and easy inspection. tickertape
 
 ## Performance
 
-Measured on Linux against Chronicle Queue, Aeron, yaque, queue-file and plain files with the comparison suite in
+Measured against Chronicle Queue, Aeron, yaque, queue-file and plain files with the comparison suite in
 [`compare/`](compare/README.md). Full results, hardware and caveats are in [`docs/benchmarks.md`](docs/benchmarks.md).
-The machine was a small AWS cloud VM (`c6id.xlarge`, 2 cores / 4 threads, ext4 on NVMe), not bare metal:
+The machine was bare-metal Linux: an AWS `z1d.metal` (Xeon Platinum 8151), ext4 on local NVMe, every process bound to
+one socket.
 
-- **Append:** 18.6 million 64-byte records/s, about 5× Chronicle Queue; about 2.5× at 1,024 bytes.
-- **Replay:** fastest of the tools at 64 bytes (24.8–26.3 million records/s). At 1,024 bytes yaque is faster.
-- **Writer-to-reader latency, 100,000 records/s:** the p99.9 of tickertape's readers was 20–28 µs at 64 bytes and
-  31–70 µs at 1,024 bytes, below Chronicle Queue's (38–47 µs and 76–142 µs). Chronicle Queue has lower medians, and
-  a lower tail at 64 bytes and 10,000 records/s.
+- **Append:** 17.1 million 64-byte records/s, 3.6× Chronicle Queue; 1.3× at 1,024 bytes.
+- **Replay:** fastest of the tools at 64 bytes (23.8 million records/s). At 1,024 bytes Chronicle Queue is faster.
+- **Writer-to-reader latency, 100,000 records/s:** tickertape's `pread` reader has a p99.9 of 20 µs at 64 bytes and
+  31 µs at 1,024 bytes, below Chronicle Queue's (36–37 µs and 48–52 µs). Aeron's in-memory IPC has the lowest tails.
+  Chronicle Queue has a lower tail at 64 bytes and 10,000 records/s.
 
-These are two runs on one machine type, not guarantees. The tools also promise different things:
+These are two runs on one machine, not guarantees. The tools also promise different things:
 - Aeron's IPC transport keeps nothing on disk;
 - yaque is a consuming single-reader queue;
 - the plain-file baseline has no validation or recovery.
