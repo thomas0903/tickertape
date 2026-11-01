@@ -410,7 +410,8 @@ fn commands_do_not_modify_journal_and_reject_export_into_it() {
     for (path, bytes) in before {
         assert_eq!(fs::read(path).unwrap(), bytes);
     }
-    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 6);
+    // Segments, checkpoint marker, lock file and the notify file (ADR 0017); nothing added by the commands.
+    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 7);
 }
 
 #[test]

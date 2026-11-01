@@ -42,6 +42,8 @@ pub struct Writer {
     /// Directories whose entries changed since the last checkpoint.
     dirty_dirs: BTreeSet<PathBuf>,
     checkpoint_file: File,
+    /// The notify file, if enabled and available (ADR 0017).
+    notify: Option<mmap::Notify>,
     generation: u64,
     poisoned: bool,
     /// Set if an abandoned write's zeroing could not be made durable; see `append_with`.
@@ -140,6 +142,7 @@ impl Writer {
         }
 
         report.next_seq = state.next_seq;
+        let notify = open_notify(&dir, config.notify);
         Ok(Writer {
             dir,
             config,
@@ -151,6 +154,7 @@ impl Writer {
             dirty: state.dirty,
             dirty_dirs,
             checkpoint_file,
+            notify,
             generation: checkpoint.map_or(0, |c| c.generation),
             poisoned: false,
             appends_blocked: false,
@@ -266,6 +270,9 @@ impl Writer {
             .store_commit_word(offset, len)
             .ok_or_else(|| internal(&self.active.path, "commit word out of bounds"))?;
         self.offset = offset + format::align8(u64::from(len));
+        if let Some(notify) = &self.notify {
+            notify.publish();
+        }
         self.next_seq = seq + 1;
         Ok(seq)
     }
@@ -336,6 +343,10 @@ impl Writer {
             .map_err(|e| Error::io("sync checkpoint marker", &marker_path, e))?;
 
         self.generation = generation;
+        // Durable-only readers wait for the marker to move.
+        if let Some(notify) = &self.notify {
+            notify.publish();
+        }
         self.dirty.clear();
         self.dirty_dirs.clear();
         self.active_dirty_from = self.offset;
@@ -388,6 +399,9 @@ impl Writer {
         });
         self.offset = format::SEGMENT_HEADER_LEN as u64;
         self.active_dirty_from = self.offset;
+        if let Some(notify) = &self.notify {
+            notify.publish();
+        }
         Ok(())
     }
 }
@@ -395,6 +409,28 @@ impl Writer {
 /// An internal bounds check failed (a bug, reported as an error rather than a panic).
 fn internal(path: &Path, what: &'static str) -> Error {
     Error::io(what, path, io::Error::other("internal bounds check failed"))
+}
+
+/// Opens (creating and preallocating if needed) the notify file and records whether this writer maintains it. Any
+/// failure just disables wake-ups: they only affect latency, never correctness (ADR 0017).
+fn open_notify(dir: &Path, enabled: bool) -> Option<mmap::Notify> {
+    let path = dir.join(journal::NOTIFY_FILE);
+    if !enabled && !path.exists() {
+        return None;
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .ok()?;
+    if file.metadata().ok()?.len() < mmap::NOTIFY_FILE_LEN {
+        mmap::preallocate(&file, mmap::NOTIFY_FILE_LEN).ok()?;
+    }
+    let notify = mmap::Notify::new(&file).ok()?;
+    notify.set_writer_notifies(enabled);
+    enabled.then_some(notify)
 }
 
 /// Creates `dir` and missing ancestors; returns the directories that were created, outermost first.

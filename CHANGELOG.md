@@ -5,6 +5,9 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## Unreleased
 
+- Library: reader wake-ups (ADR 0017). Blocked readers wait on a shared `notify` file (futex on Linux,
+  `os_sync_wait_on_address` on macOS 14.4+) instead of sleeping; a new record wakes them within microseconds.
+  On by default (`ReaderConfig::notify`, `WriterConfig::notify`); falls back to sleeping where unavailable.
 - CLI: add read-only `stats` with streaming range/checkpoint statistics, bounded payload percentiles, exact
   UTC-second counts, and a documented `--json` schema.
 - Library: `Reader::records()`, an iterator of owned records committed so far (for `take`, `filter`, `collect`).

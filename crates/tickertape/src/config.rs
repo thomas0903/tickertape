@@ -30,6 +30,10 @@ pub struct WriterConfig {
     pub segment_size: u64,
     /// What to do with a corrupt tail on open. Default: [`RecoveryPolicy::Quarantine`].
     pub recovery: RecoveryPolicy,
+    /// Maintain the notify file so that blocked readers wake up as soon as a record is published (ADR 0017).
+    /// Costs one atomic increment and one load per append, plus a wake-up system call when readers are blocked.
+    /// Default: true.
+    pub notify: bool,
 }
 
 impl WriterConfig {
@@ -47,6 +51,12 @@ impl WriterConfig {
         self.recovery = policy;
         self
     }
+
+    /// Sets whether to wake blocked readers (see [`WriterConfig::notify`]).
+    pub fn notify(mut self, on: bool) -> Self {
+        self.notify = on;
+        self
+    }
 }
 
 impl Default for WriterConfig {
@@ -54,6 +64,7 @@ impl Default for WriterConfig {
         WriterConfig {
             segment_size: Self::DEFAULT_SEGMENT_SIZE,
             recovery: RecoveryPolicy::default(),
+            notify: true,
         }
     }
 }
@@ -100,7 +111,7 @@ impl Default for Backoff {
 }
 
 /// Reader settings.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ReaderConfig {
     /// How to wait for new records.
@@ -110,6 +121,20 @@ pub struct ReaderConfig {
     /// Without a valid marker, no records are returned. See ADR 0010 (`docs/decisions/0010-durable-only-reads.md` in the
     /// repository) and crash contract C13 (`docs/crash-contract.md`) for the durability guarantee and storage assumptions.
     pub durable_only: bool,
+    /// After the spin and yield phases of [`Backoff`], block on the journal's notify file instead of sleeping, so a
+    /// new record wakes the reader immediately (ADR 0017). Needs write access to `<dir>/notify`; without it, or on
+    /// macOS before 14.4, the reader falls back to sleeping. Default: true.
+    pub notify: bool,
+}
+
+impl Default for ReaderConfig {
+    fn default() -> Self {
+        ReaderConfig {
+            backoff: Backoff::default(),
+            durable_only: false,
+            notify: true,
+        }
+    }
 }
 
 impl ReaderConfig {
@@ -130,6 +155,12 @@ impl ReaderConfig {
     /// ```
     pub fn durable_only(mut self, on: bool) -> Self {
         self.durable_only = on;
+        self
+    }
+
+    /// Sets whether to block on the notify file instead of sleeping (see [`ReaderConfig::notify`]).
+    pub fn notify(mut self, on: bool) -> Self {
+        self.notify = on;
         self
     }
 

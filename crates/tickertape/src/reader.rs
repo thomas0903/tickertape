@@ -17,6 +17,9 @@ use crate::record::{OwnedRecord, Record};
 const IDENTITY_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 /// Bytes the `pread` reader fetches at a time (more if a record is larger).
 const CHUNK: usize = 64 * 1024;
+/// Longest single block on the notify file when the writer maintains it (bounded so that a writer that died, or a
+/// missed wake-up, costs at most this much latency; the identity check also runs at least this often).
+const NOTIFY_MAX_WAIT: Duration = Duration::from_millis(100);
 /// Re-reads before a validation failure is reported as corruption (the copy may predate the commit).
 const VALIDATION_RETRIES: u32 = 3;
 
@@ -62,6 +65,8 @@ pub struct Reader {
     buf_start: u64,
     /// Scratch buffer for the zero-copy reader's atomic validation copy, reused across records.
     scratch: Vec<u8>,
+    /// The journal's notify file, if wake-ups are enabled and available (ADR 0017).
+    notify: Option<crate::mmap::Notify>,
     /// When the reader started waiting at an empty slot.
     waiting_since: Option<Instant>,
 }
@@ -131,6 +136,11 @@ impl Reader {
             });
         };
         let seg = open_segment(dir, *base, mapped)?;
+        let notify = if config.notify {
+            open_notify(dir)
+        } else {
+            None
+        };
         Ok(Reader {
             dir: dir.to_path_buf(),
             config,
@@ -143,6 +153,7 @@ impl Reader {
             buf: Vec::new(),
             buf_start: 0,
             scratch: Vec::new(),
+            notify,
             waiting_since: None,
         })
     }
@@ -217,8 +228,46 @@ impl Reader {
             if deadline.is_some_and(|d| Instant::now() >= d) {
                 return Ok(None);
             }
+            if waiter.in_blocking_phase() {
+                if let Some(notify) = self.notify.take() {
+                    let blocked = self.block_on(&notify, deadline);
+                    self.notify = Some(notify);
+                    if let Some(found) = blocked? {
+                        return Ok(Some(self.materialize(found)));
+                    }
+                    continue;
+                }
+            }
             waiter.wait(deadline);
         }
+    }
+
+    /// Blocks on the notify file until the writer publishes something or a timeout passes (event-count protocol,
+    /// ADR 0017): register as a waiter, check once more, then wait for the event counter to change.
+    fn block_on(
+        &mut self,
+        notify: &crate::mmap::Notify,
+        deadline: Option<Instant>,
+    ) -> Result<Option<Found>> {
+        let seen = notify.begin_wait();
+        let found = self.advance();
+        if !matches!(found, Ok(None)) {
+            notify.end_wait();
+            return found;
+        }
+        let cap = if notify.writer_notifies() {
+            NOTIFY_MAX_WAIT
+        } else {
+            self.config.backoff.max_sleep
+        };
+        let wait = deadline.map_or(cap, |d| {
+            cap.min(d.saturating_duration_since(Instant::now()))
+        });
+        if !wait.is_zero() {
+            notify.wait(seen, wait);
+        }
+        notify.end_wait();
+        Ok(None)
     }
 
     /// Like [`Reader::try_next`], but copies the record out of the reader.
@@ -484,6 +533,16 @@ impl Reader {
     }
 }
 
+/// Opens the journal's notify file read-write for wake-ups; `None` if it's missing or not writable (readers then poll).
+fn open_notify(dir: &Path) -> Option<crate::mmap::Notify> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(dir.join(journal::NOTIFY_FILE))
+        .ok()?;
+    crate::mmap::Notify::new(&file).ok()
+}
+
 fn open_segment(dir: &Path, base: u64, mapped: bool) -> Result<OpenSegment> {
     let path = journal::segment_path(dir, base);
     let file = File::open(&path).map_err(|e| Error::io("open segment", &path, e))?;
@@ -615,6 +674,11 @@ impl Waiter {
             step: 0,
             sleep: backoff.min_sleep,
         }
+    }
+
+    /// True once the spin and yield phases are over (the point where a reader sleeps or blocks).
+    fn in_blocking_phase(&self) -> bool {
+        self.step >= u64::from(self.backoff.spins) + u64::from(self.backoff.yields)
     }
 
     fn wait(&mut self, deadline: Option<Instant>) {

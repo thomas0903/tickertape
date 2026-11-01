@@ -16,6 +16,7 @@ use std::io;
 use std::os::fd::AsRawFd;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
+use std::time::Duration;
 
 /// Checks that `[offset, offset + len)` lies inside a mapping of `map_len` bytes. Returns the range end.
 fn checked_range(map_len: usize, offset: u64, len: u64) -> Option<usize> {
@@ -283,6 +284,215 @@ impl Drop for MapRo {
         unsafe { unmap(self.ptr, self.len) }
     }
 }
+
+/// Size of the notify file (ADR 0017).
+pub(crate) const NOTIFY_FILE_LEN: u64 = 4096;
+const NOTIFY_EVENT: u64 = 0;
+const NOTIFY_WAITERS: u64 = 64;
+const NOTIFY_WRITER_FLAG: u64 = 128;
+
+/// The shared notify file (ADR 0017): an event counter the writer increments after each publication, a count of
+/// readers blocked on it, and a flag saying whether the attached writer maintains the counter. Mapped read-write by
+/// the writer and by readers (readers must update the waiter count). Its contents never affect correctness, only
+/// latency: every wait has a timeout.
+#[derive(Debug)]
+pub(crate) struct Notify {
+    map: MapRw,
+}
+
+impl Notify {
+    /// Maps the first [`NOTIFY_FILE_LEN`] bytes of `file`, which must be opened read-write and at least that long.
+    pub(crate) fn new(file: &File) -> io::Result<Notify> {
+        if file.metadata()?.len() < NOTIFY_FILE_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "notify file too short",
+            ));
+        }
+        Ok(Notify {
+            map: MapRw::new(file, NOTIFY_FILE_LEN as usize)?,
+        })
+    }
+
+    fn word(&self, offset: u64) -> &AtomicU32 {
+        // The offsets are constants inside the 4,096-byte mapping and 8-aligned, so `word` never fails.
+        self.map
+            .word(offset)
+            .unwrap_or_else(|| unreachable!("notify offsets are in bounds"))
+    }
+
+    /// Writer: records whether this writer bumps the counter, so readers know how long they may block.
+    pub(crate) fn set_writer_notifies(&self, on: bool) {
+        self.word(NOTIFY_WRITER_FLAG)
+            .store(u32::from(on), Ordering::SeqCst);
+    }
+
+    /// Reader: whether the attached (or last attached) writer bumps the counter.
+    pub(crate) fn writer_notifies(&self) -> bool {
+        self.word(NOTIFY_WRITER_FLAG).load(Ordering::SeqCst) != 0
+    }
+
+    /// Writer, after publishing a record, seal or checkpoint: bump the event counter and wake blocked readers if
+    /// any. Sequentially consistent, pairing with [`Notify::begin_wait`] (event-count protocol, ADR 0017).
+    pub(crate) fn publish(&self) {
+        let event = self.word(NOTIFY_EVENT);
+        event.fetch_add(1, Ordering::SeqCst);
+        if self.word(NOTIFY_WAITERS).load(Ordering::SeqCst) != 0 {
+            wake_all(event);
+        }
+    }
+
+    /// Reader, before its final check: register as a waiter and return the current event count.
+    pub(crate) fn begin_wait(&self) -> u32 {
+        self.word(NOTIFY_WAITERS).fetch_add(1, Ordering::SeqCst);
+        self.word(NOTIFY_EVENT).load(Ordering::SeqCst)
+    }
+
+    /// Reader: block until the event count differs from `seen`, a wake-up arrives, or `timeout` passes.
+    pub(crate) fn wait(&self, seen: u32, timeout: Duration) {
+        wait_on(self.word(NOTIFY_EVENT), seen, timeout);
+    }
+
+    /// Reader: unregister as a waiter (never below zero, in case the count was reset).
+    pub(crate) fn end_wait(&self) {
+        let waiters = self.word(NOTIFY_WAITERS);
+        let mut current = waiters.load(Ordering::SeqCst);
+        while current != 0 {
+            match waiters.compare_exchange_weak(
+                current,
+                current - 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+}
+
+/// Blocks while `word == expected`, for at most `timeout` (spurious returns are fine; callers re-check).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn wait_on(word: &AtomicU32, expected: u32, timeout: Duration) {
+    let ts = libc::timespec {
+        tv_sec: libc::time_t::try_from(timeout.as_secs()).unwrap_or(libc::time_t::MAX),
+        tv_nsec: timeout.subsec_nanos() as libc::c_long,
+    };
+    // SAFETY: FUTEX_WAIT (shared, i.e. without FUTEX_PRIVATE_FLAG, because the word lives in a MAP_SHARED file
+    // mapping used by several processes) reads the 4-byte aligned word at `word`'s address, which stays mapped for the
+    // duration of the call because `word` borrows the mapping; `ts` lives on our stack. The kernel only compares and
+    // sleeps; it never writes the word.
+    unsafe {
+        libc::syscall(
+            libc::SYS_futex,
+            word.as_ptr(),
+            libc::FUTEX_WAIT,
+            expected,
+            &ts as *const libc::timespec,
+            std::ptr::null::<u32>(),
+            0u32,
+        );
+    }
+}
+
+/// Wakes every thread blocked in [`wait_on`] on `word`, in any process.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn wake_all(word: &AtomicU32) {
+    // SAFETY: FUTEX_WAKE only uses the address as a key (shared futex, see `wait_on`); `word` is mapped while borrowed.
+    unsafe {
+        libc::syscall(
+            libc::SYS_futex,
+            word.as_ptr(),
+            libc::FUTEX_WAKE,
+            i32::MAX,
+            std::ptr::null::<libc::timespec>(),
+            std::ptr::null::<u32>(),
+            0u32,
+        );
+    }
+}
+
+/// macOS 14.4+ `os_sync_wait_on_address_with_timeout` / `os_sync_wake_by_address_all`, looked up at run time so that
+/// the library still runs (polling) on older systems.
+#[cfg(target_vendor = "apple")]
+mod os_sync {
+    use std::sync::OnceLock;
+
+    pub(super) type WaitFn =
+        unsafe extern "C" fn(*mut libc::c_void, u64, libc::size_t, u32, u32, u64) -> libc::c_int;
+    pub(super) type WakeFn =
+        unsafe extern "C" fn(*mut libc::c_void, libc::size_t, u32) -> libc::c_int;
+    /// `OS_SYNC_WAIT_ON_ADDRESS_SHARED` and `OS_SYNC_WAKE_BY_ADDRESS_SHARED` (`<os/os_sync_wait_on_address.h>`).
+    pub(super) const SHARED: u32 = 0x1;
+    /// `OS_CLOCK_MACH_ABSOLUTE_TIME` (`<os/clock.h>`).
+    pub(super) const CLOCK_MACH_ABSOLUTE_TIME: u32 = 32;
+
+    pub(super) fn functions() -> Option<(WaitFn, WakeFn)> {
+        static FUNCTIONS: OnceLock<Option<(WaitFn, WakeFn)>> = OnceLock::new();
+        *FUNCTIONS.get_or_init(|| {
+            // SAFETY: dlsym with RTLD_DEFAULT and NUL-terminated names has no preconditions; a null result means the
+            // symbol doesn't exist (macOS before 14.4).
+            let wait = unsafe {
+                libc::dlsym(
+                    libc::RTLD_DEFAULT,
+                    c"os_sync_wait_on_address_with_timeout".as_ptr(),
+                )
+            };
+            // SAFETY: as above.
+            let wake =
+                unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"os_sync_wake_by_address_all".as_ptr()) };
+            if wait.is_null() || wake.is_null() {
+                return None;
+            }
+            // SAFETY: the symbols have exactly these C signatures in the macOS SDK header named above.
+            Some(unsafe {
+                (
+                    std::mem::transmute::<*mut libc::c_void, WaitFn>(wait),
+                    std::mem::transmute::<*mut libc::c_void, WakeFn>(wake),
+                )
+            })
+        })
+    }
+}
+
+#[cfg(target_vendor = "apple")]
+fn wait_on(word: &AtomicU32, expected: u32, timeout: Duration) {
+    let Some((wait, _)) = os_sync::functions() else {
+        std::thread::sleep(timeout.min(Duration::from_millis(1)));
+        return;
+    };
+    let ns = u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX).max(1);
+    // SAFETY: the address is the 4-byte aligned word, mapped while `word` is borrowed; size 4 matches; the shared flag
+    // matches the wake side; the kernel only compares the value and sleeps.
+    unsafe {
+        wait(
+            word.as_ptr().cast(),
+            u64::from(expected),
+            4,
+            os_sync::SHARED,
+            os_sync::CLOCK_MACH_ABSOLUTE_TIME,
+            ns,
+        );
+    }
+}
+
+#[cfg(target_vendor = "apple")]
+fn wake_all(word: &AtomicU32) {
+    if let Some((_, wake)) = os_sync::functions() {
+        // SAFETY: the address is only used as a key; size and flags match `wait_on`.
+        unsafe {
+            wake(word.as_ptr().cast(), 4, os_sync::SHARED);
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+fn wait_on(_word: &AtomicU32, _expected: u32, timeout: Duration) {
+    std::thread::sleep(timeout.min(Duration::from_millis(1)));
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+fn wake_all(_word: &AtomicU32) {}
 
 /// Tries to take an exclusive `flock` without blocking. `Ok(false)` if another process holds it.
 pub(crate) fn try_lock_exclusive(file: &File) -> io::Result<bool> {

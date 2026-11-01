@@ -25,6 +25,7 @@ A journal is one directory. Only these names have a meaning; anything else is ig
 | `{base_seq:020}.tape` | A segment. `base_seq` is the sequence number of its first record, zero-padded to 20 decimal digits so that lexicographic order equals numeric order, e.g. `00000000000001048576.tape` |
 | `{base_seq:020}.tape.tmp` | A segment being created or repaired by the writer. Never read by readers |
 | `checkpoint` | The checkpoint marker: where the last successful checkpoint ended (see "Checkpoint marker") |
+| `notify` | Wake-up file (ADR 0017): 4,096 bytes; a `u32` event counter at offset 0 that the writer increments after every publication, a `u32` count of blocked readers at offset 64, and a `u32` flag at offset 128 (1 = the writer maintains the counter). Carries no data; deleting it or damage to it only affects reader latency |
 | `writer.lock` | Lock file. The writer holds an exclusive `flock` on it while open and writes its PID (decimal ASCII) into it. The PID is informational; the lock is the authority |
 | `quarantine/` | Bytes and segments removed from the journal by recovery, kept so that nothing is silently destroyed. Never read by readers, never deleted by tickertape |
 
