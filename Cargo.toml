@@ -7,7 +7,7 @@ members = [
     "benches",
     "examples",
 ]
-exclude = ["fuzz"]
+exclude = ["fuzz", "compare"]
 
 [workspace.package]
 version = "0.2.0"
