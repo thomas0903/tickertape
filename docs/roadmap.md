@@ -66,6 +66,16 @@ Improvements after v0.1.0. Same rule: done only when every criterion holds and C
   - An example that records a public exchange trade feed (Binance, no API key) into a journal with the market-demo
     schema. Not built by default; CI only builds it and never touches the network.
 
+## v0.3 (in progress)
+
+Owner decisions of 2026-11-01: build the former "Later" items below, benchmark against other tools, push performance.
+
+- [ ] **Retention and archiving** (ADR 0016): `retention` module, writer policy, `tickertape archive`, crash contract
+- [ ] **Reader wake-ups** (ADR 0017): notify file, futex / `os_sync_wait_on_address`, cross-provider review
+- [ ] **Comparison suite** (ADR 0018): Chronicle Queue, Aeron, yaque, queue-file, plain files; recorded results
+- [ ] **Performance work** driven by profiling and the comparison results
+- [ ] Release v0.3.0
+
 ## Later (explicitly out of scope for v0.1)
 
 - Replication to other hosts, and networking of any kind.
@@ -73,8 +83,8 @@ Improvements after v0.1.0. Same rule: done only when every criterion holds and C
 - Windows support; network filesystems.
 - Live zero-copy readers in Python (Python reads exported Parquet, or a documented read-only decoder later).
 - Typed zero-copy schemas (rkyv/zerocopy). Payloads are opaque bytes plus a schema id.
-- Futex/eventfd wake-ups. Readers poll, with an optional sleep or backoff.
-- Any latency claim compared with Chronicle, Aeron or other tools.
+- ~~Futex/eventfd wake-ups~~ (moved into v0.3, ADR 0017).
+- ~~Any latency claim compared with other tools~~ (owner decision: comparison suite in v0.3, ADR 0018).
 - Daily (UTC) segment rolling, unless it fits after M4 without risk.
-- Retention policies or automatic segment deletion.
+- ~~Retention policies~~ (moved into v0.3, ADR 0016).
 - Publishing to crates.io (the owner asks for this as a separate task after v0.1.0 is reviewed).
