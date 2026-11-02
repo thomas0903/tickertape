@@ -154,9 +154,8 @@ impl Writer {
 
         report.next_seq = state.next_seq;
         let notify = crate::notify::open_for_writer(&dir, config.notify);
-        // The helper only runs on macOS: on Linux, prefault advice made latency far worse at high byte rates (the
-        // pages it dirtied ahead were written back under the writer), so there only the spare is used (ADR 0023).
-        let prefault = (config.prefault && cfg!(target_vendor = "apple"))
+        // The helper runs on macOS (ADR 0020) and Linux (ADR 0025); elsewhere it would have no advice to give.
+        let prefault = (config.prefault && cfg!(any(target_vendor = "apple", target_os = "linux")))
             .then(|| Prefaulter::start(state.active.map.advice(), state.offset))
             .flatten();
         let mut writer = Writer {
