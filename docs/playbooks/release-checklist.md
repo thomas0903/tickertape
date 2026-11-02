@@ -7,7 +7,7 @@ the dry run and the tag, then stop. Run `cargo publish` only as a deliberate dec
 
 1. `main` is green in CI on Linux and macOS, and `git status` is clean.
 2. Versions: set `version` in the workspace `Cargo.toml` (`[workspace.package]`) and the `tickertape` dependency
-   version in `crates/tickertape-cli/Cargo.toml` to the new version.
+   version in `[workspace.dependencies]` in the same file to the new version.
 3. `CHANGELOG.md`: move "Unreleased" to `## [X.Y.Z] - YYYY-MM-DD`, and add the compare link.
 4. Checks:
    ```bash

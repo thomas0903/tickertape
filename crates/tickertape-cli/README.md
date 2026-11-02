@@ -3,9 +3,10 @@
 Tools for [tickertape](https://github.com/thomas0903/tickertape) event journals.
 
 ```sh
-cargo run -p tickertape-cli -- --help
-# Or install the binary from this checkout:
-cargo install --path crates/tickertape-cli
+cargo install tickertape-cli --locked
+tickertape --help
+# Or run from a source checkout:
+# cargo run -p tickertape-cli -- --help
 
 tickertape tail ./journal --from 42 --format json --count 100
 tickertape tail ./journal --from-end --timeout-secs 5

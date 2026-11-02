@@ -5,7 +5,8 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [0.4.0] - 2026-11-02
 
-Not yet published to crates.io. The on-disk format is unchanged (version 1). Results on bare-metal Linux, against
+First public release on crates.io (both `tickertape` and `tickertape-cli`). Earlier versions were repository tags only.
+The on-disk format is unchanged (version 1). Results on bare-metal Linux, against
 v0.3.0 on the same machine type, are in `docs/benchmarks.md`: append is 57–69% faster, 1,024-byte replay is 60%
 faster, and latency tails are far lower.
 
@@ -21,7 +22,7 @@ faster, and latency tails are far lower.
 
 ## [0.3.0] - 2026-11-02
 
-Not yet published to crates.io. The on-disk format is unchanged (version 1); v0.1 and v0.2 journals work as they
+Repository tag only; not published to crates.io. The on-disk format is unchanged (version 1); v0.1 and v0.2 journals work as they
 are. Two new files may appear in a journal directory:
 - `notify`, an 80-byte wake-up record;
 - on macOS, `next-segment.tmp`, the next segment prepared in the background.
@@ -68,7 +69,7 @@ Format v1 readers ignore both.
 
 ## [0.2.0] - 2026-11-01
 
-Not yet published to crates.io. The on-disk format is unchanged (version 1); v0.1.0 journals work as they are.
+Repository tag only; not published to crates.io. The on-disk format is unchanged (version 1); v0.1.0 journals work as they are.
 
 - Readers validate records without a per-record allocation: the safe reader in place in its `pread` buffer, the
   zero-copy reader from an atomic copy into a reused buffer (still before any slice into the mapping exists).
@@ -81,7 +82,7 @@ Not yet published to crates.io. The on-disk format is unchanged (version 1); v0.
 
 ## [0.1.0] - 2026-10-31
 
-First release. Not yet published to crates.io.
+First release. Repository tag only; not published to crates.io.
 
 ### Library (`tickertape`)
 

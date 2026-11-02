@@ -51,7 +51,7 @@ Linux and macOS.
   - A `v0.1.0` tag is pushed to the private repo. `playbooks/release-checklist.md` has the exact publishing steps.
   - A draft feedback request for r/rust and r/algotrading exists (kept outside the repository).
 
-## v0.2 (done on `main`, unreleased)
+## v0.2 (included in the first public release, v0.4.0)
 
 Improvements after v0.1.0. Same rule: done only when every criterion holds and CI is green.
 
@@ -77,14 +77,14 @@ Owner decisions of 2026-11-01: build the former "Later" items below, benchmark a
   (AWS) and macOS
 - [x] **Performance work** (ADRs 0019, 0020, 0022, 0023): hardware CRC32C; on macOS, background prefaulting and a
   prepared next segment; on Linux, neither, as measured
-- [ ] Release v0.3.0
+- [x] Tag v0.3.0 (included in the first public release, v0.4.0)
 
 ## v0.4
 
 - [x] Three-lane hardware CRC32C for every record length (ADR 0024)
 - [x] Linux prefaulting with a 256 KiB `MADV_POPULATE_WRITE` window (ADR 0025)
 - [x] Bare-metal Linux benchmarks (AWS `z1d.metal`, ext4 and xfs)
-- [x] Release v0.4.0
+- [x] Release v0.4.0: repository made public, both crates published to crates.io, and GitHub release created (2026-11-02)
 
 ## Next (candidates, not commitments)
 
@@ -107,4 +107,4 @@ Owner decisions of 2026-11-01: build the former "Later" items below, benchmark a
 - ~~Any latency claim compared with other tools~~ (owner decision: comparison suite in v0.3, ADR 0018).
 - Daily (UTC) segment rolling, unless it fits after M4 without risk.
 - ~~Retention policies~~ (moved into v0.3, ADR 0016).
-- Publishing to crates.io (the owner asks for this as a separate task after v0.1.0 is reviewed).
+- ~~Publishing to crates.io~~ (done 2026-11-02 with the first public release, v0.4.0).

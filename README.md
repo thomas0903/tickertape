@@ -4,7 +4,7 @@
 records events, other processes on the same machine follow them live, and everything can be replayed later or
 exported to Parquet for DuckDB and Python.
 
-> Status: v0.4.0, not yet published to crates.io. Linux and macOS. The on-disk format is version 1.
+> Status: [v0.4.0](https://crates.io/crates/tickertape/0.4.0), published to crates.io. Linux and macOS. The on-disk format is version 1.
 
 Think of it as a flight recorder for a trading system or any other latency-sensitive program:
 
@@ -57,7 +57,16 @@ Under minutes of sustained high-rate writing, ext4 itself occasionally stalls wr
 
 ## Quickstart
 
-As a library (`cargo add tickertape` once it is published; until then, a path or git dependency):
+Add the library to your project, or install the CLI from crates.io:
+
+```bash
+cargo add tickertape
+cargo install tickertape-cli --locked
+```
+
+[API documentation](https://docs.rs/tickertape/0.4.0/tickertape/) · [CLI reference](docs/cli.md)
+
+As a library:
 
 ```rust
 use tickertape::{NewRecord, Reader, ReaderConfig, Writer, WriterConfig};

@@ -11,6 +11,12 @@ processes on the same machine follow them live or replay from any sequence numbe
 - Opt-in retention moves or deletes sealed segments strictly before the checkpoint segment.
 - Safe `pread`-based readers by default; zero-copy readers are an `unsafe` opt-in.
 
+```sh
+cargo add tickertape
+```
+
+[API documentation](https://docs.rs/tickertape/0.4.0/tickertape/)
+
 The `tickertape` CLI (crate `tickertape-cli`) tails, verifies and exports journals to JSONL or Parquet.
 See the [repository](https://github.com/thomas0903/tickertape) for the quickstart, examples and benchmarks.
 
