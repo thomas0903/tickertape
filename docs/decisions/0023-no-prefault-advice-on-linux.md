@@ -1,6 +1,7 @@
 # 0023: No prefault advice (and no spare segment) on Linux
 
-- **Status:** accepted (amends [0020](0020-background-prefault.md))
+- **Status:** accepted (amends [0020](0020-background-prefault.md)); the prefault-advice decision is superseded by
+  [0025](0025-linux-prefault-small-window.md), and the spare-segment amendment stands
 - **Date:** 2026-11-01
 
 ## Context

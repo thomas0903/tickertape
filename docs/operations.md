@@ -23,23 +23,25 @@ archive often, larger ones if roll latency matters and disk space doesn't.
 
 ## Writer threads
 
-On macOS, with `WriterConfig::prefault(true)` (the default), the writer moves segment work off its own thread.
-APFS makes both kinds of work expensive:
+With `WriterConfig::prefault(true)` (the default), the writer moves segment work off its own thread:
 
-- **Page faults.** A helper thread, `tickertape-prefault`, keeps the next 8 MiB of the active segment faulted in with
-  `madvise(MADV_WILLNEED)` (ADR 0020). Writing into a preallocated APFS segment otherwise faults once per 16 KiB
-  page, slowly.
-- **The next segment.** Once the active segment is half full, a short-lived thread, `tickertape-spare`, creates,
-  preallocates and syncs `next-segment.tmp` (ADR 0022). The roll then only writes and syncs the header and links the
-  file into place; preallocating and syncing a whole segment on APFS takes about 50 ms. The spare reserves one more
-  segment's worth of disk space from that point on.
+- **Page faults (Linux and macOS).** A helper thread, `tickertape-prefault`, keeps the pages just ahead of the write
+  position faulted in, so `append` rarely waits for a page fault.
+  - **Linux:** the next 256 KiB, with `MADV_POPULATE_WRITE` (ADR 0025; kernels before 5.14 stop the helper on first
+    use).
+  - **macOS:** the next 8 MiB, with `MADV_WILLNEED` (ADR 0020). On APFS, writing into a preallocated segment otherwise
+    faults once per 16 KiB page, slowly.
+- **The next segment (macOS only).** Once the active segment is half full, a short-lived thread, `tickertape-spare`,
+  creates, preallocates and syncs `next-segment.tmp` (ADR 0022). The roll then only writes and syncs the header and
+  links the file into place; preallocating and syncing a whole segment on APFS takes about 50 ms. The spare
+  reserves one more segment's worth of disk space from that point on. On Linux a synchronous roll costs about a
+  millisecond on ext4, and the spare occasionally stalled the writer, so Linux doesn't use it (ADR 0023).
 
-Neither thread ever writes records. On Linux the writer starts neither (ADR 0023). On ext4 both made latency worse:
-- the prefault advice caused 100-millisecond stalls at high byte rates;
-- the spare occasionally caused tens of milliseconds of stalls;
-- a synchronous roll there costs only about a millisecond.
+Neither thread ever writes records. Set `prefault(false)` if you pin threads and want a writer that starts none.
 
-Set `prefault(false)` if you want a writer that starts no threads on macOS either.
+**Sustained high byte rates on Linux.** Under steady write-back (minutes of writing, gigabytes of dirty pages), ext4
+itself occasionally stalls the writer for milliseconds, with or without prefaulting (ADR 0025). Plan disk
+throughput with headroom: a small cloud VM stalled for hundreds of milliseconds at about 100 MB/s sustained.
 
 ## Choosing a checkpoint interval
 

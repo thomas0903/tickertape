@@ -12,12 +12,21 @@ use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 
-/// How far past the write position the helper keeps pages prefaulted.
-pub(crate) const WINDOW: u64 = 8 << 20;
+/// How far past the write position the helper keeps pages prefaulted: 8 MiB of `MADV_WILLNEED` on macOS (ADR 0020),
+/// 256 KiB of `MADV_POPULATE_WRITE` on Linux (ADR 0025).
+pub(crate) const WINDOW: u64 = if cfg!(target_vendor = "apple") {
+    8 << 20
+} else {
+    256 << 10
+};
 /// How far the write position moves between wake-ups of the helper.
-const STEP: u64 = 1 << 20;
+const STEP: u64 = if cfg!(target_vendor = "apple") {
+    1 << 20
+} else {
+    64 << 10
+};
 /// The largest range advised in one call, so that a roll or shutdown is noticed quickly.
-const CHUNK: u64 = 1 << 20;
+const CHUNK: u64 = STEP;
 
 /// The writer's side: a handle on the helper thread, stopped and joined on drop.
 #[derive(Debug)]

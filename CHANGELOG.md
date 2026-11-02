@@ -5,6 +5,10 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## Unreleased
 
+- Performance (Linux): the writer prefaults again, with `MADV_POPULATE_WRITE` only 256 KiB ahead of the write position
+  (ADR 0025; `WriterConfig::prefault`, on by default). The stalls that turned it off in v0.3.0 came from other causes.
+  In experiments on bare metal and on a small cloud VM, the small window was never worse than no prefaulting, and it
+  cut p99 latency by a large factor.
 - Performance: CRC32C now runs three hardware CRC chains in parallel for long records (ADR 0024). This replaces the
   `crc32c` crate's x86 path, which wasn't inlined. Replay of 1,024-byte records is markedly faster (exploratory
   profiling on an AWS x86 VM: from about 274 to about 162 ns per record with the `pread` reader). Results are

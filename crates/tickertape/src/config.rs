@@ -35,14 +35,15 @@ pub struct WriterConfig {
     /// Costs one atomic increment and one load per append, plus a wake-up system call when readers are blocked.
     /// Default: true.
     pub notify: bool,
-    /// On macOS, do segment work in the background, off the writer's thread (APFS makes both expensive):
-    /// - a helper thread (`tickertape-prefault`) keeps the pages ahead of the write position faulted in with
-    ///   `madvise`, so that `append` rarely takes a page fault (ADR 0020);
-    /// - once the active segment is half full, a short-lived thread (`tickertape-spare`) preallocates the next
-    ///   segment, so a roll only writes and links its header (ADR 0022).
+    /// Do segment work in a background thread, off the writer's thread. That thread never writes records.
+    /// - **Linux:** a helper thread (`tickertape-prefault`) faults in the 256 KiB ahead of the write position with
+    ///   `MADV_POPULATE_WRITE`, so `append` rarely takes a page fault (ADR 0025). On kernels before 5.14 the helper
+    ///   stops on first use.
+    /// - **macOS:** the helper keeps 8 MiB ahead with `madvise(MADV_WILLNEED)` (ADR 0020). Once the active segment is
+    ///   half full, a short-lived thread (`tickertape-spare`) also preallocates the next segment, so a roll only
+    ///   writes and links its header (ADR 0022). That spare isn't used on Linux (ADR 0023).
     ///
-    /// On Linux and other systems this setting has no effect: both made latency worse on ext4 (ADR 0023). These
-    /// threads never write records. Set to `false` for a writer that starts no threads on any platform. Default: true.
+    /// Set to `false` for a writer that starts no threads. Default: true.
     pub prefault: bool,
     /// Optional retention policy and action, run after open and successful checkpoints. Default: none.
     pub retention: Option<(crate::retention::Policy, crate::retention::Action)>,
@@ -82,7 +83,7 @@ impl WriterConfig {
         self
     }
 
-    /// Sets whether to do segment work in the background on macOS (see [`WriterConfig::prefault`]).
+    /// Sets whether to do segment work in a background thread (see [`WriterConfig::prefault`]).
     pub fn prefault(mut self, on: bool) -> Self {
         self.prefault = on;
         self
