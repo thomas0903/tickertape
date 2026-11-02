@@ -1,0 +1,44 @@
+name: Bug report
+description: Report a reproducible problem with tickertape.
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For a possible vulnerability, use [private security reporting](https://github.com/thomas0903/tickertape/security/advisories/new).
+        Remove credentials, private market data and other sensitive information from examples and logs.
+  - type: input
+    id: version
+    attributes:
+      label: Version and installation
+      description: Crate version or git commit; for the CLI, include `tickertape --version` and how you installed it.
+      placeholder: tickertape 0.4.0, prebuilt Linux x86-64 archive
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Operating system, architecture and filesystem
+      description: Include the OS/kernel version, CPU architecture, filesystem, and whether the journal is on local storage, a container mount or a network share. For build errors, include `rustc -Vv`.
+      placeholder: Ubuntu 24.04, x86-64, ext4 on local NVMe
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: A minimal Rust example or exact CLI commands help. Include relevant writer/reader settings, segment size, checkpoint/retention policy, and whether another process was writing or recovering.
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Expected and actual behavior
+      description: Explain what you expected and what happened, including whether records were missing, duplicated or rejected.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Error output and diagnostics
+      description: Paste the complete error, backtrace or `tickertape verify` output if available. Work on a copy of the journal when investigating corruption.
+      render: text

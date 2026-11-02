@@ -3,6 +3,12 @@
 All notable changes to `tickertape` and `tickertape-cli` are listed here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the crates follow [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+- Release operations: add tag-driven Trusted Publishing, native Linux/macOS CLI archives with checksums,
+  registry/docs.rs verification, and a documented retry/backfill process.
+- Repository: add bug/feature issue forms, binary installation instructions and CI checks for release tooling.
+
 ## [0.4.0] - 2026-11-02
 
 First public release on crates.io (both `tickertape` and `tickertape-cli`). Earlier versions were repository tags only.

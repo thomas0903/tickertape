@@ -1,0 +1,22 @@
+name: Feature request
+description: Describe a use case or workflow that tickertape does not cover.
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do?
+      description: Describe the application, who needs this, and the problem you encounter.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: A small API or CLI example is useful. Mention OS, filesystem, durability or latency requirements when relevant.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Current workaround or alternatives
+      description: What do you use today, and what makes it difficult?

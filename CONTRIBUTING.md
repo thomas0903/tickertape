@@ -3,6 +3,10 @@
 Thanks for your interest. Bug reports, questions about the crash contract, and small focused pull requests are all
 welcome.
 
+Use the [bug report or feature request forms](https://github.com/thomas0903/tickertape/issues/new/choose).
+For bugs, a small reproduction plus the tickertape version, OS, CPU architecture and filesystem are especially useful.
+Report possible vulnerabilities privately as described in [`SECURITY.md`](SECURITY.md).
+
 ## Before you start
 
 - **Read the specs.** `docs/format.md` (byte layout) and `docs/crash-contract.md` (guarantees) are normative. A

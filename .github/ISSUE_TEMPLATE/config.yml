@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability privately
+    url: https://github.com/thomas0903/tickertape/security/advisories/new
+    about: Use private reporting for memory safety, unsafe recovery or other security issues.
+  - name: Documentation and quickstart
+    url: https://github.com/thomas0903/tickertape#quickstart
+    about: Installation, examples, guarantees and supported platforms.

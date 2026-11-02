@@ -36,3 +36,6 @@ fuzz/coverage/
 # Python (DuckDB checks, examples)
 __pycache__/
 .venv/
+
+# Local documentation research
+.firecrawl/

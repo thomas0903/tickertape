@@ -66,6 +66,9 @@ cargo install tickertape-cli --locked
 
 [API documentation](https://docs.rs/tickertape/0.4.0/tickertape/) · [CLI reference](docs/cli.md)
 
+Prebuilt CLI downloads for Linux and macOS are available from the
+[GitHub releases](https://github.com/thomas0903/tickertape/releases/latest); see [installation and checksums](docs/install.md).
+
 As a library:
 
 ```rust
