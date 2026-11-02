@@ -240,14 +240,27 @@ mod tests {
         (dir, file, map)
     }
 
+    /// Whether the platform supports the prefault advice: Linux before 5.14 rejects `MADV_POPULATE_WRITE` with
+    /// `EINVAL` (`InvalidInput`), which the helper treats as "stop" (ADR 0025).
+    fn supported(result: std::io::Result<()>) -> bool {
+        match result {
+            Ok(()) => true,
+            Err(e) if cfg!(target_os = "linux") && e.kind() == std::io::ErrorKind::InvalidInput => {
+                false
+            }
+            Err(e) => panic!("prefault failed: {e}"),
+        }
+    }
+
     #[test]
     fn prefault_keeps_contents_and_clamps_to_the_mapping() {
         let (_dir, _file, mut map) = mapping(1 << 20);
         map.bytes_mut(4096, 4).unwrap().copy_from_slice(b"abcd");
         let advice = map.advice();
-        advice.prefault(0, 1 << 30).unwrap();
-        advice.prefault(5000, 10).unwrap();
-        advice.prefault(2 << 20, 4096).unwrap();
+        if supported(advice.prefault(0, 1 << 30)) {
+            assert!(supported(advice.prefault(5000, 10)));
+            assert!(supported(advice.prefault(2 << 20, 4096)));
+        }
         assert_eq!(map.bytes(4096, 4).unwrap(), b"abcd");
         assert!(map.bytes(0, 4096).unwrap().iter().all(|&b| b == 0));
     }
@@ -257,7 +270,7 @@ mod tests {
         let (_dir, _file, map) = mapping(1 << 20);
         let advice = map.advice();
         drop(map);
-        advice.prefault(0, 1 << 20).unwrap();
+        supported(advice.prefault(0, 1 << 20));
     }
 
     fn wait_for_call(shared: &Shared, len: u64) {
@@ -278,11 +291,25 @@ mod tests {
         let mut prefaulter = Prefaulter::start(map1.advice(), 64).unwrap();
         let shared = Arc::clone(&prefaulter.shared);
         wait_for_call(&shared, 4 << 20);
+        if !supported(map1.advice().prefault(0, 4096)) {
+            // An unsupported advice stops the helper after its first call: the thread releases the state by itself.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while Arc::strong_count(&shared) > 2 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the helper kept running after EINVAL"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            drop(prefaulter);
+            assert_eq!(Arc::strong_count(&shared), 1);
+            return;
+        }
         prefaulter.switch(map2.advice(), 64);
         drop(map1);
         wait_for_call(&shared, 32 << 20);
         let before = shared.calls.lock().unwrap().len();
-        prefaulter.advanced(20 << 20); // past the first 8 MiB window: more advice for the new segment
+        prefaulter.advanced(20 << 20); // past the first window on any platform: more advice for the new segment
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while shared.calls.lock().unwrap().len() == before {
             assert!(

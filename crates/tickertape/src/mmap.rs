@@ -252,10 +252,11 @@ impl Advice {
             let advice = libc::MADV_POPULATE_WRITE;
             let ptr = self.region.ptr.as_ptr();
             // SAFETY: `[start, end)` lies within the live mapping (clamped above; `start` is page-aligned, as is the
-            // mapping), which `self.region` keeps mapped for the duration of the call. Both advice values only affect
-            // which pages are resident and mapped (POPULATE_WRITE faults them in writable, as a write would, without
-            // storing anything): they never change the bytes' values, so they cannot conflict with the writer's
-            // concurrent access to the same pages.
+            // mapping), which `self.region` keeps mapped for the duration of the call. MADV_WILLNEED only reads pages
+            // into the page cache. MADV_POPULATE_WRITE handles write faults for the range as a write would: it
+            // populates page tables, marks the pages dirty and may allocate filesystem blocks, but performs no memory
+            // store. Neither reads or writes the bytes from the program's point of view, so neither can conflict
+            // with the writer's concurrent access through `&mut` slices.
             let rc = unsafe { libc::madvise(ptr.add(start).cast(), end - start, advice) };
             if rc != 0 {
                 Err(last_os_error())
