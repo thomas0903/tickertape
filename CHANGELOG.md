@@ -3,6 +3,13 @@
 All notable changes to `tickertape` and `tickertape-cli` are listed here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the crates follow [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+- Performance: CRC32C now runs three hardware CRC chains in parallel for long records (ADR 0024). This replaces the
+  `crc32c` crate's x86 path, which wasn't inlined. Replay of 1,024-byte records is markedly faster (exploratory
+  profiling on an AWS x86 VM: from about 274 to about 162 ns per record with the `pread` reader). Results are
+  bit-identical.
+
 ## [0.3.0] - 2026-11-02
 
 Not yet published to crates.io. The on-disk format is unchanged (version 1); v0.1 and v0.2 journals work as they
