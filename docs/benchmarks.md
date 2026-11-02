@@ -10,6 +10,143 @@ and [0018](decisions/0018-competitive-benchmarks.md).
 **Linux results come first** because that is where tickertape is meant to run, and **bare metal comes first** among
 them. The cloud-VM and macOS results are secondary.
 
+## 2026-11-02, v0.4.0 on bare-metal Linux (AWS `z1d.metal`)
+
+The primary results for v0.4.0, recorded at `c9ec640`, the code released as v0.4.0. The environment and commands are
+those of the v0.3.0 bare-metal section below, on a fresh `z1d.metal`, every process bound to NUMA node 0.
+
+Two changes since v0.3.0 drive the differences:
+- CRC32C runs three hardware chains in parallel for long records (ADR 0024);
+- Linux prefaults 256 KiB ahead of the writer with `MADV_POPULATE_WRITE` (ADR 0025).
+
+### Comparison with other tools
+
+**W1, append throughput** (million records/s):
+
+| Tool | 64 B | 1,024 B |
+|---|---|---|
+| **tickertape** | 26.68–26.92 | 3.12–3.22 |
+| chronicle | 4.75–4.76 | 1.42–1.44 |
+| yaque | 1.10 | 0.70–0.71 |
+| queue-file | 0.31 | 0.23 |
+| plain-file | 1.12 | 0.72 |
+
+**W3, warm replay** (million records/s):
+
+| Tool | Reader | 64 B | 1,024 B |
+|---|---|---|---|
+| **tickertape** | safe | 22.03–22.12 | 4.77–4.98 |
+| **tickertape** | mapped | 23.04–23.10 | 4.49–4.70 |
+| chronicle | default | 18.78–20.37 | 5.00–5.28 |
+| yaque | default | 16.41–16.42 | 3.52–3.53 |
+| queue-file | default | 0.45 | 0.42 |
+| plain-file | default | 1.39 | 1.24 |
+
+**W2, writer-to-reader latency** (µs; tickertape's `safe` reader uses `pread`, `mapped` is the zero-copy reader).
+
+64 B at 10,000 records/s:
+
+| Tool | Reader | p50 | p99 | p99.9 | max | late sends |
+|---|---|---|---|---|---|---|
+| **tickertape** | safe | 3.4–3.5 | 4 | 4.2–4.4 | 62–324 | 266–282 |
+| **tickertape** | mapped | 0.3–0.4 | 0.5 | 2.1 | 258–300 | 216–240 |
+| chronicle | default | 0.5 | 0.6–0.7 | 3–3.9 | 435–454 | 353–479 |
+| aeron | default | 0.3 | 2.6–2.9 | 15–18 | 5,190–5,243 | 220–415 |
+| yaque | default | 2 | 4–4.9 | 6.8–7.4 | 3,369–3,463 | 119–142 |
+| plain-file | default | 1.8 | 3.9–4.2 | 7.3–8.8 | 3,434–3,506 | 244–531 |
+
+1,024 B at 10,000 records/s:
+
+| Tool | Reader | p50 | p99 | p99.9 | max | late sends |
+|---|---|---|---|---|---|---|
+| **tickertape** | safe | 3.8 | 4.3 | 16–26 | 622–652 | 1,536–2,410 |
+| **tickertape** | mapped | 0.7 | 2.3 | 20–21 | 1,283–1,290 | 1,964–2,024 |
+| chronicle | default | 0.6 | 2.5 | 47–48 | 453–454 | 680–749 |
+| aeron | default | 0.4 | 2.7 | 5 | 306–351 | 251–271 |
+| yaque | default | 2.5 | 8.4–8.5 | 7,725–7,782 | 20,251–20,283 | 154–156 |
+| plain-file | default | 2.2–2.3 | 6.6–6.7 | 8.2–8.3 | 554–2,736 | 130–325 |
+
+64 B at 100,000 records/s:
+
+| Tool | Reader | p50 | p99 | p99.9 | max | late sends |
+|---|---|---|---|---|---|---|
+| **tickertape** | safe | 3.4–3.5 | 4–4.9 | 4.3–6.3 | 360–470 | 75–270 |
+| **tickertape** | mapped | 0.3 | 0.5 | 0.5–1.8 | 24–48 | 31–191 |
+| chronicle | default | 0.4 | 0.5–0.6 | 36–37 | 636–740 | 6,341–6,350 |
+| aeron | default | 0.3 | 0.5–1.7 | 92–133 | 1,783–1,821 | 920–11,713 |
+| yaque | default | 1.8 | 3.9–4.2 | 7.8–8 | 178–182 | 240–344 |
+| plain-file | default | 1.7 | 3.9–4.2 | 7.1–7.2 | 181–182 | 214–11,224 |
+
+1,024 B at 100,000 records/s:
+
+| Tool | Reader | p50 | p99 | p99.9 | max | late sends |
+|---|---|---|---|---|---|---|
+| **tickertape** | safe | 3.8 | 4.4–5.3 | 7.4–9.2 | 678–781 | 656–1,043 |
+| **tickertape** | mapped | 0.7 | 1–1.2 | 36–76 | 1,374–1,407 | 668–707 |
+| chronicle | default | 0.4–0.5 | 37–41 | 48–55 | 620–642 | 49,424–51,697 |
+| aeron | default | 0.3–0.4 | 0.7 | 0.8 | 170–390 | 1,687–1,731 |
+| yaque | default | 2.3–2.4 | 8,241–8,278 | 19,055–19,087 | 20,398–20,447 | 3,041–3,090 |
+| plain-file | default | 2.1 | 6.7 | 34–38 | 123–338 | 1,670–1,757 |
+
+What changed against v0.3.0 on the same machine type, and where tickertape now stands:
+
+**Append.** 26.7–26.9 million records/s at 64 B (v0.3.0: 17.1–17.3), 5.6× Chronicle Queue. At 1,024 B,
+3.1–3.2 million records/s (v0.3.0: 1.9), 2.2× Chronicle Queue.
+
+**Replay.**
+- 64 B: tickertape is fastest, 22.0–23.1 against Chronicle Queue's 18.8–20.4.
+- 1,024 B: 4.8–5.0 million records/s with the `safe` reader (v0.3.0: 3.0), close to Chronicle Queue's 5.0–5.3.
+  Chronicle Queue checks no checksum; tickertape validates every record.
+
+**Latency.** At 64 B, tickertape's zero-copy reader has the lowest p99.9 of all tools measured, Aeron's in-memory
+IPC included:
+- 2.1 µs at 10,000 records/s;
+- 0.5–1.8 µs at 100,000 records/s, against 36–37 µs for Chronicle Queue and 92–133 µs for Aeron.
+
+At 1,024 B, Aeron IPC (which persists nothing) has the lowest tails: p99.9 0.8–5 µs. tickertape comes next and well
+ahead of Chronicle Queue:
+- 16–26 µs against 47–48 µs at 10,000 records/s;
+- 7.4–9.2 µs (`safe` reader) against 48–55 µs at 100,000 records/s.
+
+Late sends at 1,024 B and 100,000 records/s fell from about 28,000 to about 700 for the zero-copy reader.
+
+### tickertape's own benchmarks
+
+All at 100,000 records/s; µs; ext4 / xfs; ranges over two runs. On Linux `prefault` now enables the 256 KiB
+`MADV_POPULATE_WRITE` helper, so the `--no-prefault` rows show the effect directly.
+
+| Payload | Reader, wait | p50 | p99 | p99.9 | p99.99 | max |
+|---|---|---|---|---|---|---|
+| 64 B | mapped, spin | 0.31–0.35 / 0.31–0.32 | 0.47–0.50 / 0.45 | 1.7–2.0 / 0.49–1.4 | 31–158 / 5.9–7.0 | 278–399 / 45–392 |
+| 64 B | mapped, spin, `--no-prefault` | 0.32 / 0.32 | 0.47–1.2 / 0.46 | 31–34 / 24–28 | 69–245 / 42–154 | 328–351 / 367–387 |
+| 64 B | safe, spin | 3.4 / 3.5 | 4.7–4.8 / 4.1–4.7 | 5.7–6.1 / 4.4–6.2 | 14–47 / 10–11 | 187–364 / 31–35 |
+| 64 B | safe, default (blocks on the wake-up region) | 3.4 / 3.5 | 4.0 / 4.2–4.9 | 4.4–6.0 / 5.8–6.2 | 11–255 / 33–183 | 28–370 / 357–362 |
+| 1,024 B | mapped, spin | 0.69–0.71 / 0.69–0.70 | 2.1–2.2 / 1.2–2.0 | 110–243 / 10–11 | 1,202–1,295 / 997–1,003 | 1,529–1,586 / 1,217–1,236 |
+| 1,024 B | mapped, spin, `--no-prefault` | 0.65–0.67 / 0.67–0.68 | 31 / 23 | 97–122 / 39–41 | 1,184–1,209 / 1,032–1,034 | 1,346–1,443 / 1,230–1,248 |
+| 1,024 B | safe, spin | 3.8 / 3.9 | 4.4–4.5 / 5.4–5.6 | 6.9–9.3 / 7.2–9.1 | 520–534 / 337 | 635–696 / 456–470 |
+| 1,024 B | safe, default | 3.8 / 3.9 | 5.4–5.9 / 4.5–4.8 | 14–18 / 7.5–9.6 | 633–639 / 347–350 | 766–804 / 466–497 |
+
+What these rows show:
+- **Prefaulting helps at 64 B on both filesystems**, cutting the zero-copy reader's p99.9 by more than 15×.
+- **At 1,024 B it cuts p99 from 23–31 µs to 1.2–2.2 µs.** The zero-copy reader's p99.9 at 1,024 B is the exception
+  on ext4: 110–243 µs with prefaulting against 97–122 µs without. On xfs prefaulting helps there too.
+
+Other results, ext4 / xfs:
+- **`tt-checkpoint`** (16 MiB segments, 1,000 records per checkpoint):
+  - `checkpoint()` p50 is 0.84 / 0.71–0.73 ms at 64 B and 1.8 / 1.6 ms at 1,024 B. In v0.3.0 it was 0.38 / 0.34 and
+    1.3 / 1.1 ms: the pages prefaulted ahead are dirty, so the file sync also writes them out.
+  - Roll appends take 0.19–0.73 ms.
+- **Criterion:**
+  - append: 25.5 / 24.9 million records/s at 64 B and 4.15 / 4.65 at 1,024 B; with prefaulting off, 16.2 / 19.3
+    and 3.27 / 4.16;
+  - replay: 21.6 / 21.5 (safe) and 23.1 / 23.3 (zero-copy) at 64 B; 4.97 / 4.92 and 4.27 / 4.18 at 1,024 B.
+- **Cold-cache replay:** 8.9–9.0 million records/s at 64 B; 1.79–1.83 million records/s at 1,024 B, which is
+  1.84–1.87 GB/s of payload.
+
+**Steady state.** All of these runs last about 11 seconds. In 5-minute experiments at 1,024 B and 100,000 records/s
+(ADR 0025), ext4 write-back occasionally stalled the writer for milliseconds (p99.99 about 8–12 ms) with or without
+prefaulting. The comparison suite does not measure steady state yet, for any tool.
+
 ## 2026-11-02, v0.3.0 on bare-metal Linux (AWS `z1d.metal`)
 
 The primary results for v0.3.0. They were recorded at the release tag (`e81e6b8`) with the same commands as the

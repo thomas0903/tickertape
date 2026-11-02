@@ -3,12 +3,17 @@
 All notable changes to `tickertape` and `tickertape-cli` are listed here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the crates follow [Semantic Versioning](https://semver.org/).
 
-## Unreleased
+## [0.4.0] - 2026-11-02
+
+Not yet published to crates.io. The on-disk format is unchanged (version 1). Results on bare-metal Linux, against
+v0.3.0 on the same machine type, are in `docs/benchmarks.md`: append is 57–69% faster, 1,024-byte replay is 60%
+faster, and latency tails are far lower.
 
 - Performance (Linux): the writer prefaults again, with `MADV_POPULATE_WRITE` only 256 KiB ahead of the write position
   (ADR 0025; `WriterConfig::prefault`, on by default). The stalls that turned it off in v0.3.0 came from other causes.
   In experiments on bare metal and on a small cloud VM, the small window was never worse than no prefaulting, and it
-  cut p99 latency by a large factor.
+  cut p99 latency by a large factor. The cost: `checkpoint()` also writes out the dirty pages prefaulted ahead (on bare
+  metal, p50 0.38 → 0.84 ms at 64 B).
 - Performance: CRC32C now runs three hardware CRC chains in parallel for long records (ADR 0024). This replaces the
   `crc32c` crate's x86 path, which wasn't inlined. Replay of 1,024-byte records is markedly faster (exploratory
   profiling on an AWS x86 VM: from about 274 to about 162 ns per record with the `pread` reader). Results are
@@ -100,6 +105,7 @@ First release. Not yet published to crates.io.
 - Snappy Parquet export with raw unsigned metadata, bounded row groups, and opt-in `--decode market-demo` columns
   (also a `decoded` object in JSONL). Default JSONL output is unchanged by `--decode`.
 
+[0.4.0]: https://github.com/thomas0903/tickertape/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/thomas0903/tickertape/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/thomas0903/tickertape/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/thomas0903/tickertape/releases/tag/v0.1.0

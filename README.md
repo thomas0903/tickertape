@@ -4,7 +4,7 @@
 records events, other processes on the same machine follow them live, and everything can be replayed later or
 exported to Parquet for DuckDB and Python.
 
-> Status: v0.3.0, not yet published to crates.io. Linux and macOS. The on-disk format is version 1.
+> Status: v0.4.0, not yet published to crates.io. Linux and macOS. The on-disk format is version 1.
 
 Think of it as a flight recorder for a trading system or any other latency-sensitive program:
 
@@ -36,18 +36,24 @@ readers, retained and replayable files, rolling, and easy inspection. tickertape
 Measured against Chronicle Queue, Aeron, yaque, queue-file and plain files with the comparison suite in
 [`compare/`](compare/README.md). Full results, hardware and caveats are in [`docs/benchmarks.md`](docs/benchmarks.md).
 The machine was bare-metal Linux: an AWS `z1d.metal` (Xeon Platinum 8151), ext4 on local NVMe, every process bound to
-one socket.
+one socket. Results for v0.4.0:
 
-- **Append:** 17.1 million 64-byte records/s, 3.6× Chronicle Queue; 1.3× at 1,024 bytes.
-- **Replay:** fastest of the tools at 64 bytes (23.8 million records/s). At 1,024 bytes Chronicle Queue is faster.
-- **Writer-to-reader latency, 100,000 records/s:** tickertape's `pread` reader has a p99.9 of 20 µs at 64 bytes and
-  31 µs at 1,024 bytes, below Chronicle Queue's (36–37 µs and 48–52 µs). Aeron's in-memory IPC has the lowest tails.
-  Chronicle Queue has a lower tail at 64 bytes and 10,000 records/s.
+- **Append:** 26.7 million 64-byte records/s, 5.6× Chronicle Queue; 2.2× at 1,024 bytes.
+- **Replay:** fastest of the tools at 64 bytes (23.1 million records/s). At 1,024 bytes it is close to Chronicle
+  Queue (4.8–5.0 against 5.0–5.3 million records/s), while validating a checksum on every record.
+- **Writer-to-reader latency, 100,000 records/s:**
+  - 64 bytes: the zero-copy reader's p99.9 was 0.5–1.8 µs, the lowest of all tools measured. Chronicle Queue's
+    was 36–37 µs and Aeron IPC's 92–133 µs.
+  - 1,024 bytes: tickertape's p99.9 was 7.4–9.2 µs, against Chronicle Queue's 48–55 µs. Aeron's in-memory IPC was
+    lower, at 0.8 µs.
 
-These are two runs on one machine, not guarantees. The tools also promise different things:
+These are two runs of about 11 seconds on one machine, not guarantees. The tools also promise different things:
 - Aeron's IPC transport keeps nothing on disk;
 - yaque is a consuming single-reader queue;
 - the plain-file baseline has no validation or recovery.
+
+Under minutes of sustained high-rate writing, ext4 itself occasionally stalls writers for milliseconds
+([`docs/operations.md`](docs/operations.md)).
 
 ## Quickstart
 

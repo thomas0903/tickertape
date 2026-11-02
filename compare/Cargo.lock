@@ -598,7 +598,7 @@ dependencies = [
 
 [[package]]
 name = "tickertape"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "crc32c",
  "libc",
@@ -608,7 +608,7 @@ dependencies = [
 
 [[package]]
 name = "tickertape-bench"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "hdrhistogram",
  "serde_json",

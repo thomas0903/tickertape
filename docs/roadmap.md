@@ -79,14 +79,21 @@ Owner decisions of 2026-11-01: build the former "Later" items below, benchmark a
   prepared next segment; on Linux, neither, as measured
 - [ ] Release v0.3.0
 
+## v0.4
+
+- [x] Three-lane hardware CRC32C for every record length (ADR 0024)
+- [x] Linux prefaulting with a 256 KiB `MADV_POPULATE_WRITE` window (ADR 0025)
+- [x] Bare-metal Linux benchmarks (AWS `z1d.metal`, ext4 and xfs)
+- [x] Release v0.4.0
+
 ## Next (candidates, not commitments)
 
-- **Linux prefaulting, again.** In an unrecorded experiment on bare metal (`z1d.metal`, 11-second runs),
-  `MADV_POPULATE_WRITE` cut tickertape's tail latency by about an order of magnitude, with no stalls. On a small cloud
-  VM it caused stalls of 100 ms and more once background write-back was running (ADR 0023). A recorded long run on
-  bare metal, with write-back active, must decide whether it can be the Linux default.
-- **Faster replay of large records.** At 1,024 B, Chronicle Queue replays 5.0–5.5 million records/s on bare metal
-  against tickertape's 3.0.
+- **Steady-state benchmarks.** Minutes-long runs in the comparison suite, for every tool. Under sustained write-back
+  ext4 stalls writers for milliseconds (ADR 0025); how other tools fare there is unmeasured.
+- **Zero-copy validation without a copy.** Compute the CRC directly from the atomic loads, so the zero-copy reader
+  stops copying each record into a scratch buffer.
+- **Cheaper checkpoints with prefaulting.** Sync only the written range, not the prefaulted dirty pages, if the
+  platform allows it.
 - **Graviton bare metal** (`c7gd.metal`), to cover aarch64 Linux servers.
 
 ## Later (explicitly out of scope for v0.1)
