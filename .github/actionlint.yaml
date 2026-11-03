@@ -1,0 +1,7 @@
+# actionlint v1.7.12 does not recognize GitHub's cache access control yet.
+# https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#cache-mode
+# Remove this exception when actionlint supports cache-mode.
+paths:
+  .github/workflows/release.yml:
+    ignore:
+      - '^unexpected key "cache-mode" for "workflow" section\.'
