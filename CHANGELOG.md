@@ -5,6 +5,8 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
+- Docs: define the path to v1.0 around sustained performance, optional eBPF diagnostics, reader/checkpoint
+  optimization, ARM measurements, interoperability, replay/recovery at scale and explicit stability/release gates.
 - Release operations: add tag-driven Trusted Publishing, native Linux/macOS CLI archives with checksums,
   registry/docs.rs verification, and a documented retry/backfill process.
 - Repository: add bug/feature issue forms, binary installation instructions and CI checks for release tooling.
