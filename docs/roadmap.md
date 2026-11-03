@@ -86,22 +86,106 @@ Owner decisions of 2026-11-01: build the former "Later" items below, benchmark a
 - [x] Bare-metal Linux benchmarks (AWS `z1d.metal`, ext4 and xfs)
 - [x] Release v0.4.0: repository made public, both crates published to crates.io, and GitHub release created (2026-11-02)
 
-## Next (candidates, not commitments)
+## Path to v1.0
 
-- **Steady-state benchmarks.** Minutes-long runs in the comparison suite, for every tool. Under sustained write-back
-  ext4 stalls writers for milliseconds (ADR 0025); how other tools fare there is unmeasured.
-- **Zero-copy validation without a copy.** Compute the CRC directly from the atomic loads, so the zero-copy reader
-  stops copying each record into a scratch buffer.
-- **Cheaper checkpoints with prefaulting.** Sync only the written range, not the prefaulted dirty pages, if the
-  platform allows it.
-- **Graviton bare metal** (`c7gd.metal`), to cover aarch64 Linux servers.
+Owner direction of 2026-11-03: make tickertape the default local, replayable event journal that libraries in
+different languages and frameworks can integrate. Priorities are predictable sustained performance, a small core,
+easy integration and a dependable compatibility contract. This does not require replacing networking transports,
+databases or every kind of queue.
+
+The milestones below define the work before v1.0. Intermediate releases can ship completed improvements; their
+version numbers and dates are not fixed. Performance changes must preserve validation, memory safety and the crash
+contract. An optimization investigation can close with a documented, measured decision that the proposed change
+does not help or cannot preserve those guarantees; such a decision must be explicit in the roadmap and its ADR.
+
+### Next release: sustained performance
+
+- [ ] **Make sustained performance the next release's main objective.**
+  - Establish reproducible workloads for bursty and sustained traffic, periodic checkpoints, segment rolls,
+    multiple readers and a reader falling behind. Include datasets larger than RAM.
+  - Report append throughput, visible and durable-only reader latency, checkpoint/roll latency, CPU usage and
+    reader lag. Record p50/p99/p99.9/p99.99 and maxima for latency, with the workload's durability and wait settings.
+  - Publish the remaining bottlenecks and supported operating envelope, including overload behavior, rather than
+    treating a short peak-throughput result as evidence of sustainable capacity.
+- [ ] **Sustained-load comparison benchmarks.**
+  - Extend the comparison suite with repeated runs of at least 10 minutes per configuration for every compatible
+    tool, covering both existing payload sizes and rates below and near sustainable storage throughput.
+  - Cover steady write-back and repeated rolls on Linux ext4/xfs; record macOS results separately. Separate
+    visibility-only workloads from periodic durability workloads and document unequal guarantees or unsupported cases.
+  - Preserve raw results, environment, exact commands, achieved rates and late sends. Investigate the ext4 stalls
+    observed in ADR 0025 and publish comparisons without coordinated omission or hidden dropped records.
+- [ ] **Performance diagnostics with eBPF.**
+  - Add a reproducible Linux diagnostic playbook using existing eBPF tools to investigate scheduler delays,
+    page faults, filesystem/write-back stalls and block I/O during the sustained workloads.
+  - Correlate traces with application latency and checkpoint/roll events; record tool/kernel requirements and
+    tracing overhead, and confirm performance conclusions with tracing disabled.
+  - Keep diagnostics optional: the library and CLI must work without eBPF, elevated tracing permissions or a
+    collector. Kernel-event recording and XDP/AF_XDP ingestion remain separate proposals.
+- [ ] **Remove the mapped reader's validation copy.**
+  - Compute CRC and validate record fields directly from atomic loads, eliminating the per-record scratch copy
+    while retaining validation before creating any borrowed slice into the mapping.
+  - Preserve corruption detection and publication ordering; review the safety argument and run the relevant
+    concurrency, corruption and crash checks. Record replay and live-reader results on x86-64 and aarch64.
+- [ ] **Cheaper checkpoints with prefaulting.**
+  - Measure how much prefaulted, unwritten dirty data contributes to checkpoint cost on each platform. The current
+    implementation already restricts `msync` to written ranges, then performs file-wide sync/barrier operations.
+  - Investigate reducing the remaining flush work without weakening data-before-marker ordering or the crash
+    contract. Record before/after checkpoint and durable-only reader latency, or document platform limitations.
+- [ ] **Finish eliminating avoidable work.**
+  - Profile append, both readers, notification and serialization paths under the sustained workloads; document
+    allocations, copies and synchronization that remain on those paths.
+  - Evaluate batched append and batched notifications with explicit publication, partial-failure and latency
+    semantics. Ship changes supported by measurements; document rejected approaches and their tradeoffs.
+  - Exercise the existing `append_with` API in integration examples so encoders can write directly into a record.
+- [ ] **ARM server measurements.**
+  - Run correctness/crash checks and the sustained comparison suite on bare-metal aarch64 Linux, targeting
+    Graviton (`c7gd.metal`), alongside the existing x86-64 and macOS evidence.
+  - Record CPU, kernel, filesystem, storage, affinity, CRC implementation and commands; resolve architecture-specific
+    correctness failures and explain material performance differences before claiming cross-architecture results.
+
+### Following milestones: adoption and scale
+
+- [ ] **Build a small interoperability layer.**
+  - Provide a C ABI with documented ownership, record lifetimes, errors, threading, durability and versioning, plus
+    a C/C++ example. Keep bindings and framework adapters outside the core crate.
+  - Provide installable Python bindings with batch operations and explicit copy/lifetime behavior. Preserve the
+    dependency-free read-only decoder; live zero-copy Python access is not required.
+  - Ship one complete integration with an external library/framework, selected and named before implementation,
+    demonstrating recording, live consumption, replay and export.
+  - Add cross-language fixtures that verify payloads, metadata, checksums, sequence boundaries and durable-only
+    behavior. Validate installation and a documented end-to-end example for each delivered binding.
+- [ ] **Make replay and recovery excellent at scale.**
+  - Measure startup, seek, catch-up, replay and crash recovery across many segments and journals larger than RAM,
+    including retention, archived history and missing/corrupt segments. Publish dataset sizes and resource usage.
+  - Implement rebuildable sparse indexes if measured seek costs justify them; indexes must never bypass required
+    validation or allow stale positions after recovery/replacement.
+  - Address measured bottlenecks while keeping memory bounded and preserving the rule that recovery does not
+    silently discard committed history. Record regression workloads and remaining limits.
+
+### v1.0 readiness
+
+- [ ] **Work toward a dependable 1.0 contract.**
+  - Review and document the supported Rust API, delivered binding APIs/ABI, CLI machine-readable output, on-disk
+    format compatibility and upgrade policy. Resolve known breaking changes before declaring those surfaces stable.
+  - Add compatibility fixtures for previously released format-v1 journals and longer-running crash, corruption,
+    retention and concurrency tests on supported platforms, including aarch64 Linux.
+  - Provide inexpensive operational metrics for reader lag, checkpoint age, storage headroom and retention
+    failures, with documented sampling costs and no mandatory telemetry service.
+  - Exercise release/installation/upgrade instructions and the external integration against a release candidate.
+    Complete the release checklist and publish guarantees, measured operating limits and known issues.
+
+**v1.0 release gate:** all milestones above are complete under their stated criteria, CI is green on Linux and
+macOS, the aarch64 checks pass, and no known unresolved issue violates the published safety, corruption-detection,
+durability or compatibility contract. Completing the feature list makes v1.0 a release candidate; satisfying this
+gate makes it ready to release. Universal adoption and being fastest in every workload are not release criteria.
 
 ## Later (explicitly out of scope for v0.1)
 
 - Replication to other hosts, and networking of any kind.
 - Multiple writers to the same journal.
 - Windows support; network filesystems.
-- Live zero-copy readers in Python (Python reads exported Parquet, or a documented read-only decoder later).
+- Live zero-copy readers in Python (the planned bindings use explicit copy/batch semantics; the read-only decoder
+  and Parquet export remain available).
 - Typed zero-copy schemas (rkyv/zerocopy). Payloads are opaque bytes plus a schema id.
 - ~~Futex/eventfd wake-ups~~ (moved into v0.3, ADR 0017).
 - ~~Any latency claim compared with other tools~~ (owner decision: comparison suite in v0.3, ADR 0018).
