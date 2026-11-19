@@ -207,6 +207,15 @@ whose marker names its own segment (the caught-up case) never makes it.
 `tests/durable_only.rs::durable_only_reader_at_a_removed_segment_end_with_an_empty_successor_is_discarded` covers the
 safe and the zero-copy reader, with A in place and removed.
 
+The probe of the slot at the cursor reads the file, never the safe reader's buffer (found by review). The buffer can
+hold a record past the checkpoint that recovery later zeroed in place (storage damage emptied its commit word), where
+the new writer's roll then wrote A's seal; the marker names B at the cursor, so it never moves past it and the buffer
+is never discarded. Probed from the buffer, that record hid the seal on every call: the reader never moved to B and
+reported `Discarded` once retention removed A, although it had polled while A was current. Nothing else reads the
+buffer while the reader waits at the checkpoint: records at the cursor are read only after a marker moves past it,
+which discards the buffer first. The zero-copy reader reads the mapping, which shows the current bytes.
+`tests/durable_only.rs::durable_only_reader_sees_a_seal_written_over_a_buffered_record` covers both readers.
+
 ### Cost
 
 The check is one `stat` of the segment path, made only when a refreshed marker moves past the cursor, that is at most

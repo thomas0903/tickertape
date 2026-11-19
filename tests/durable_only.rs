@@ -654,6 +654,91 @@ fn durable_only_reader_at_a_removed_segment_end_with_an_empty_successor_is_disca
     }
 }
 
+/// The same boundary when the safe reader's buffer holds a record recovery removed in place (found by review). A
+/// short record 3, never checkpointed, still fits in segment 0 after three large checkpointed ones; the reader buffers
+/// it while reading 0..3. Storage damage empties its commit word, recovery zeroes it in place (segment 0 keeps its
+/// identity), and the new writer rolls to segment 3 for a large record whose fill panics, sealing segment 0 where
+/// record 3 was, and checkpoints (the marker names segment 3, at the reader's cursor). The reader must see the seal now
+/// on disk at its cursor and move to segment 3. Before the fix, the safe reader probed the slot from its buffer, saw
+/// the removed record 3 there on every poll, never moved, and reported `Error::Discarded` once retention removed
+/// segment 0 although it had polled while segment 0 was current. The mapped reader (which reads the mapping) is the
+/// control.
+#[test]
+fn durable_only_reader_sees_a_seal_written_over_a_buffered_record() {
+    for mapped in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = Writer::open(dir.path(), small_config()).unwrap();
+        let payload = vec![0; 20_000];
+        let record = NewRecord {
+            schema_id: 1,
+            venue_ts_ns: 0,
+            local_ts_ns: 0,
+            payload: &payload,
+        };
+        for _ in 0..3 {
+            writer.append(&record).unwrap();
+        }
+        writer.checkpoint().unwrap();
+        let short = NewRecord {
+            payload: &payload[..100],
+            ..record
+        };
+        writer.append(&short).unwrap(); // Record 3, not checkpointed, in segment 0.
+        drop(writer);
+        assert_eq!(segments(dir.path()).len(), 1);
+        let mut reader = open(dir.path(), mapped);
+        for seq in 0..3 {
+            assert_eq!(reader.next_owned().unwrap().unwrap().seq, seq);
+        }
+        assert!(reader.try_next().unwrap().is_none());
+
+        zero_commit_word(dir.path(), 3);
+        let mut writer = reopen_writer(dir.path(), small_config());
+        assert_eq!(writer.next_seq(), 3);
+        assert!(
+            writer
+                .recovery_report()
+                .actions
+                .iter()
+                .any(|a| matches!(a, RecoveryAction::ZeroedUncommitted { .. }))
+        );
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = writer.append_with(&record, payload.len(), |_| panic!("fill failed"));
+        }));
+        assert!(panicked.is_err());
+        assert_eq!(
+            segments(dir.path()).iter().map(|s| s.0).collect::<Vec<_>>(),
+            [0, 3]
+        );
+        writer.checkpoint().unwrap();
+        let marker = tickertape::inspect::read_checkpoint(dir.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!((marker.segment_base_seq, marker.next_seq), (3, 3));
+
+        // Segment 0 is still in place: the reader follows its seal to segment 3 and keeps it after the removal.
+        assert!(reader.try_next().unwrap().is_none());
+        let plan = retention::plan(dir.path(), &Policy::default().max_segments(1)).unwrap();
+        retention::apply(dir.path(), &plan, &Action::Delete).unwrap();
+        assert_eq!(
+            segments(dir.path()).iter().map(|s| s.0).collect::<Vec<_>>(),
+            [3]
+        );
+        // Past the identity-check interval, so a reader still holding segment 0 would check it now.
+        std::thread::sleep(Duration::from_millis(150));
+        match reader.try_next() {
+            Ok(None) => {}
+            other => panic!("mapped {mapped}: {:?}", other.map(|r| r.map(|r| r.seq))),
+        }
+
+        writer.append(&record).unwrap();
+        writer.checkpoint().unwrap();
+        let read = reader.next_owned().unwrap().unwrap();
+        assert_eq!((read.seq, read.payload.len()), (3, payload.len()));
+        assert!(reader.try_next().unwrap().is_none());
+    }
+}
+
 /// A `stat` that fails other than with "not found" (here `EACCES`) at the identity check after reading a marker that
 /// moved past the cursor is an I/O error, and the reader doesn't apply that marker: the next call reads the marker
 /// again and checks again. Had it applied the marker, the replacement below would go unnoticed and the reader would

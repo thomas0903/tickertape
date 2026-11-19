@@ -427,7 +427,10 @@ impl Reader {
             return Ok(());
         }
         self.superseded_checked = Some(now);
-        match self.read_slot(false)? {
+        // `fresh`: the safe reader reads the slot from the file, not its buffer. The buffer can hold a record past the
+        // checkpoint that recovery has since zeroed in place and that the seal now covers; probed from the buffer, it
+        // would hide the seal on every call. The mapping shows the current bytes anyway.
+        match self.read_slot(true)? {
             SlotOutcome::Seal => self.follow_seal(),
             _ => self.check_identity(),
         }
