@@ -410,8 +410,9 @@ impl MapRo {
         // requirement. Unlike the atomic references used during validation, this `&[u8]` asserts that the bytes do
         // not change while it lives, and the reader reads them with ordinary loads. That holds by the caller's
         // contract: the record passed validation, so its frame is the one the writer published with its `Release`
-        // store (which happens before these reads, through the reader's `Acquire` fence), and nobody modifies
-        // committed bytes afterwards.
+        // store (which happens before these reads, through the reader's `Acquire` fence), and on an intact
+        // publication chain nobody modifies committed bytes afterwards (ADR 0027 → "Which loads can race" names the
+        // exception: recovery zeroing published records in place after storage damage emptied a commit word).
         Some(unsafe { std::slice::from_raw_parts(self.ptr.as_ptr().add(start), end - start) })
     }
 }

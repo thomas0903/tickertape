@@ -550,7 +550,8 @@ impl Reader {
         let payload: &[u8] = match &self.seg.map {
             Some(map) => {
                 // SAFETY: the payload is part of a record validated after observing its non-zero commit word;
-                // `open_mapped`'s contract makes it immutable while the reader exists.
+                // on an intact publication chain `open_mapped`'s contract makes it immutable while the reader
+                // exists (ADR 0027 → "Which loads can race" names the exception).
                 unsafe { map.committed_bytes(found.payload_at, found.payload_len as u64) }
                     .unwrap_or(&[])
             }

@@ -46,8 +46,8 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   deterministic test checks that a complete but unpublished record stays invisible; differential tests recompute the
   CRC after damage so the sequence and flag checks are reached; the corruption matrix covers records long enough for
   the three-lane CRC; tests check that the word-fed CRC takes the hardware path and the three-lane blocks; Miri runs
-  `MapRo`'s loads over an anonymous mapping; `--cfg tickertape_force_soft_crc` runs the suite on tickertape's CRC fallback (the `crc32c` crate still uses
-  the CPU instruction where it has one).
+  `MapRo`'s loads over an anonymous mapping; `--cfg tickertape_force_soft_crc` runs the suite on tickertape's CRC
+  fallback (the `crc32c` crate still uses the CPU instruction where it has one).
 - Benchmarks: the test of a lagging reader under retention no longer depends on machine speed (it failed on
   macOS CI runners), and `tt-sustained` readers retry a seek when retention removes the segment they were about to
   open.
