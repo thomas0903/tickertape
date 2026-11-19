@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import inspect
+import os
+import pickle
 import re
 import struct
 from pathlib import Path
@@ -14,7 +17,8 @@ from helpers import SMALL_SEGMENT, append_pattern, pattern_tuple
 
 from conftest import REPO
 
-ERROR_RS = REPO / "crates" / "tickertape" / "src" / "error.rs"
+CORE_SRC = REPO / "crates" / "tickertape" / "src"
+ERROR_RS = CORE_SRC / "error.rs"
 
 
 def enum_variants(source: str, name: str) -> list[str]:
@@ -24,8 +28,10 @@ def enum_variants(source: str, name: str) -> list[str]:
     return re.findall(r"^    ([A-Z][A-Za-z0-9]*)\b", body, re.MULTILINE)
 
 
-def test_every_rust_variant_is_mapped() -> None:
-    """Fails when the core crate gains an `Error` or `CorruptReason` variant that the bindings don't map."""
+def test_every_rust_variant_is_listed() -> None:
+    """Fails when the core crate gains an `Error` or `CorruptReason` variant that the bindings don't list.
+
+    The Rust unit tests in `src/errors.rs` check that every listed variant converts to the listed class or code."""
     source = ERROR_RS.read_text()
     errors = enum_variants(source, "Error")
     reasons = enum_variants(source, "CorruptReason")
@@ -39,6 +45,20 @@ def test_every_rust_variant_is_mapped() -> None:
         assert issubclass(cls, tt.TickertapeError)
         assert cls.__module__ == "tickertape"
     assert len(set(mapped_reasons.values())) == len(mapped_reasons)
+
+
+def test_every_rust_enum_variant_of_the_reports_is_listed() -> None:
+    """The same for `RecoveryAction` (`RecoveryAction.kind`) and `SegmentEnd` (`SegmentReport.end`); the Rust unit
+    tests in `src/reports.rs` check the conversion of every listed variant."""
+    actions = enum_variants((CORE_SRC / "writer.rs").read_text(), "RecoveryAction")
+    ends = enum_variants((CORE_SRC / "inspect.rs").read_text(), "SegmentEnd")
+    assert len(actions) >= 7 and len(ends) >= 3, "the parser no longer understands the sources"
+    assert sorted(actions) == sorted(dict(_native.RECOVERY_ACTIONS)), "update RECOVERY_ACTIONS in src/reports.rs"
+    assert sorted(ends) == sorted(dict(_native.SEGMENT_ENDS)), "update SEGMENT_ENDS in src/reports.rs"
+    # Every code is documented where the named tuple field is declared.
+    source = Path(tt._inspect.__file__).read_text()
+    for _, code in _native.RECOVERY_ACTIONS + _native.SEGMENT_ENDS:
+        assert f'``"{code}"``' in source, code
 
 
 def test_hierarchy_matches_builtins() -> None:
@@ -138,10 +158,13 @@ def test_fail_policy_refuses_corrupt_tail(journal: Path) -> None:
     with pytest.raises(tt.CorruptJournalError):
         tt.Writer(journal, recovery="fail")
     with tt.Writer(journal) as w:  # the default policy quarantines the tail
-        kinds = [a["kind"] for a in w.recovery_report["actions"]]
+        kinds = [a.kind for a in w.recovery_report.actions]
         assert "repaired_tail" in kinds
-        repaired = [a for a in w.recovery_report["actions"] if a["kind"] == "repaired_tail"][0]
-        assert repaired["reason"] == "bad_checksum" and Path(repaired["quarantine_file"]).exists()
+        repaired = [a for a in w.recovery_report.actions if a.kind == "repaired_tail"][0]
+        assert isinstance(repaired, tt.RecoveryAction)
+        assert repaired.reason == "bad_checksum" and repaired.quarantine_file is not None
+        assert repaired.quarantine_file.exists() and repaired.segment == segment
+        assert repaired.offset is not None and repaired.length is not None and repaired.file is None
         assert w.next_seq == 4
 
 
@@ -171,3 +194,70 @@ def test_exception_messages_and_attributes(journal: Path) -> None:
         assert raised.value.length == SMALL_SEGMENT and raised.value.max < SMALL_SEGMENT
         assert "exceeds the maximum" in str(raised.value)
         assert repr(raised.value).startswith("RecordTooLargeError(")
+
+
+def sample_value(annotation: object) -> object:
+    """A distinctive value of the annotated type."""
+    text = str(annotation)
+    if "Path" in text:
+        return Path("/journal/00000000000000000000.tape")
+    if "dict" in text:
+        return {"expected": 5, "found": 7}
+    if "bool" in text:
+        return True
+    if "str" in text:
+        return "a value"
+    return 12345
+
+
+def test_every_exception_survives_pickle_with_its_attributes() -> None:
+    for name in tt._errors.__all__:
+        cls = getattr(tt, name)
+        fields: dict[str, object] = {}
+        for klass in reversed(cls.__mro__):
+            if klass.__module__ == "tickertape":
+                for attr, annotation in inspect.get_annotations(klass).items():
+                    if attr != "message":
+                        fields[attr] = sample_value(annotation)
+        if issubclass(cls, OSError):
+            fields.update(errno=28, strerror=os.strerror(28), filename=Path("/journal"))
+        original = cls("message text", **fields)
+        original.add_note("a note")
+        copy = pickle.loads(pickle.dumps(original))
+        assert type(copy) is cls and str(copy) == "message text" and copy.message == "message text"
+        for attr, value in fields.items():
+            assert getattr(copy, attr) == value, (name, attr)
+        assert copy.__notes__ == ["a note"]
+        if issubclass(cls, OSError):
+            assert (copy.errno, copy.strerror, copy.filename) == (28, os.strerror(28), Path("/journal"))
+
+
+def test_real_io_error_survives_pickle_and_has_the_os_message(journal: Path) -> None:
+    with pytest.raises(tt.JournalIOError) as raised:
+        tt.Reader(journal / "missing")
+    error = raised.value
+    assert error.errno is not None and error.strerror == os.strerror(error.errno)
+    assert "os error" not in error.strerror
+    copy = pickle.loads(pickle.dumps(error))
+    assert (copy.errno, copy.strerror, copy.filename, copy.op, copy.storage_full, str(copy)) == (
+        error.errno, error.strerror, error.filename, error.op, error.storage_full, str(error))
+
+
+def test_seek_that_fails_keeps_the_held_back_error(journal: Path) -> None:
+    with tt.Writer(journal, segment_size=SMALL_SEGMENT, retention=tt.Retention.delete(max_segments=2)) as w:
+        append_pattern(w, 2000)
+        w.checkpoint()
+    segments = tt.list_segments(journal)
+    first, last = segments[0].base_seq, segments[-1]
+    assert first > 0
+    bad = record_offsets(last.path)[5]
+    corrupt_byte(last.path, bad + 8)
+    with tt.Reader(journal) as r:
+        r.seek(last.base_seq)
+        assert len(r.read_many(100)) == 5  # the error at the sixth record is held back
+        with pytest.raises(tt.SeqUnavailableError):
+            r.seek(0)
+        corrupt_byte(last.path, bad + 8)  # repaired: a retry would now succeed
+        with pytest.raises(tt.CorruptJournalError):
+            r.read_many(100)  # the failed seek did not discard the held-back error
+        assert r.read_many(1)[0].seq == last.base_seq + 5

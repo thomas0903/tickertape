@@ -9,7 +9,9 @@
 mod config;
 mod errors;
 mod inspect;
+mod owner;
 mod reader;
+mod reports;
 mod writer;
 
 use pyo3::prelude::*;
@@ -25,6 +27,8 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?;
     m.add("ERROR_VARIANTS", errors::ERROR_VARIANTS.to_vec())?;
     m.add("CORRUPT_REASONS", errors::CORRUPT_REASONS.to_vec())?;
+    m.add("RECOVERY_ACTIONS", reports::RECOVERY_ACTIONS.to_vec())?;
+    m.add("SEGMENT_ENDS", reports::SEGMENT_ENDS.to_vec())?;
     m.add_class::<writer::Writer>()?;
     m.add_class::<reader::Reader>()?;
     m.add_class::<reader::Record>()?;

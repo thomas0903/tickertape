@@ -5,9 +5,9 @@ use std::path::PathBuf;
 
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
-use tickertape::inspect::{self, SegmentEnd, SegmentInfo};
+use tickertape::inspect::{self, SegmentInfo};
 
-use crate::errors;
+use crate::{errors, reports};
 
 fn segment_info<'py>(py: Python<'py>, s: &SegmentInfo) -> PyResult<Bound<'py, PyTuple>> {
     (
@@ -55,18 +55,14 @@ pub fn verify(py: Python<'_>, path: PathBuf) -> PyResult<Py<PyDict>> {
     let segments = PyList::empty(py);
     for s in &report.segments {
         let info = s.info.as_ref().map(|i| segment_info(py, i)).transpose()?;
-        let end = match s.end {
-            SegmentEnd::Sealed => "sealed",
-            SegmentEnd::Open => "open",
-            SegmentEnd::Damaged => "damaged",
-            _ => "unknown",
-        };
+        let end = reports::segment_end(s.end);
         segments.append((&s.path, info, s.records, s.end_seq, s.used_bytes, end))?;
     }
     dict.set_item("segments", segments)?;
     let problems = PyList::empty(py);
     for p in &report.problems {
-        let (code, details) = errors::reason_fields(py, &p.reason)?;
+        let (code, details) = errors::reason_fields(&p.reason);
+        let details = errors::fields_to_dict(py, &details)?;
         problems.append((&p.path, p.offset, code, details, p.reason.to_string()))?;
     }
     dict.set_item("problems", problems)?;

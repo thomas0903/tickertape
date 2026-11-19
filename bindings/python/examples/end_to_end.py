@@ -19,6 +19,9 @@ import tickertape as tt
 
 TRADE, QUOTE = 1, 2
 TRADE_FORMAT = "<qq"  # price in hundredths, quantity: an application-defined payload layout
+# The segment size is fixed when a journal is created (later opens reuse it), so pass it at the first open: the
+# default of 128 MiB would preallocate far more than this example needs.
+SEGMENT_SIZE = 1 << 20
 
 # A live follower, run as a separate process: it waits for records as the writer appends them.
 FOLLOWER = textwrap.dedent("""
@@ -39,7 +42,7 @@ FOLLOWER = textwrap.dedent("""
 
 def write(journal: Path, follower: subprocess.Popen[str]) -> int:
     trades = 0
-    with tt.Writer(journal, segment_size=1 << 20) as writer:
+    with tt.Writer(journal, segment_size=SEGMENT_SIZE) as writer:
         assert follower.stdout is not None and follower.stdout.readline().strip() == "following"
         for second in range(5):
             payloads, schemas, venue = [], [], []
@@ -88,7 +91,7 @@ def analyse(batch: tt.RecordBatch) -> None:
 
 def main() -> None:
     journal = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(tempfile.mkdtemp()) / "journal"
-    tt.Writer(journal).close()  # create the journal so the follower can open it
+    tt.Writer(journal, segment_size=SEGMENT_SIZE).close()  # create the journal so the follower can open it
     follower = subprocess.Popen([sys.executable, "-c", FOLLOWER, str(journal)], stdout=subprocess.PIPE, text=True)
     trades = write(journal, follower)
     out, _ = follower.communicate(timeout=60)

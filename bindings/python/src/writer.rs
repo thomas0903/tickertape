@@ -1,6 +1,7 @@
 //! `tickertape.Writer`.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use pyo3::buffer::PyBuffer;
@@ -8,11 +9,13 @@ use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::pybacked::PyBackedBytes;
 use pyo3::sync::MutexExt;
-use pyo3::types::{PyDict, PyList, PyRange};
-use tickertape::{NewRecord, RecoveryAction, WriterConfig};
+use pyo3::types::{PyByteArray, PyBytes, PyInt, PyList, PyMemoryView, PyRange, PyString, PyTuple};
+use tickertape::{NewRecord, WriterConfig};
 
 use crate::config::{self, Retention};
 use crate::errors;
+use crate::owner::Owner;
+use crate::reports;
 
 /// Locks a mutex without holding the GIL while waiting (no deadlock with a thread that holds the lock and needs
 /// the GIL), ignoring poisoning: every guarded value stays consistent between calls into the core crate.
@@ -22,8 +25,9 @@ pub fn lock<'a, T>(py: Python<'_>, mutex: &'a Mutex<T>) -> MutexGuard<'a, T> {
         .unwrap_or_else(PoisonError::into_inner)
 }
 
-/// A payload extracted from Python: `bytes` are borrowed without copying (they are immutable); other buffers
-/// (`bytearray`, `memoryview`, NumPy arrays, ...) are copied once, because they may change while the GIL is released.
+/// A payload extracted from Python: `bytes` are borrowed without copying (they are immutable); other buffers of
+/// unsigned bytes (`bytearray`, `memoryview`, `array('B')`, `uint8` NumPy arrays, ...) are copied once, because they
+/// may change while the GIL is released. Buffers of other item types (`array('b')`, `int8` arrays, ...) are refused.
 enum Payload {
     Shared(PyBackedBytes),
     Copied(Vec<u8>),
@@ -58,11 +62,13 @@ enum Column<T> {
 }
 
 impl<T: Copy + for<'a, 'py> FromPyObject<'a, 'py>> Column<T> {
+    /// Reads one value, or exactly `len` values from an iterable. Stops at the first value beyond `len`, so an
+    /// endless iterator fails instead of filling memory.
     fn extract(obj: &Bound<'_, PyAny>, name: &str, len: usize) -> PyResult<Column<T>> {
         if let Ok(value) = obj.extract::<T>() {
             return Ok(Column::All(value));
         }
-        if obj.is_instance_of::<pyo3::types::PyInt>() {
+        if obj.is_instance_of::<PyInt>() {
             // An int out of range: report the overflow, not a type error.
             return obj.extract::<T>().map(Column::All).map_err(Into::into);
         }
@@ -70,6 +76,11 @@ impl<T: Copy + for<'a, 'py> FromPyObject<'a, 'py>> Column<T> {
         for item in obj.try_iter().map_err(|_| {
             PyTypeError::new_err(format!("{name} must be an int or a sequence of ints"))
         })? {
+            if values.len() == len {
+                return Err(PyValueError::new_err(format!(
+                    "{name} has more values than the {len} payloads"
+                )));
+            }
             values.push(item?.extract::<T>().map_err(Into::into)?);
         }
         if values.len() != len {
@@ -89,103 +100,108 @@ impl<T: Copy + for<'a, 'py> FromPyObject<'a, 'py>> Column<T> {
     }
 }
 
+/// Refuses a `payloads` argument that is itself one payload: `str` or any bytes-like object (iterating it would
+/// yield ints or characters, and an empty one would silently append nothing).
+fn check_payloads_container(payloads: &Bound<'_, PyAny>) -> PyResult<()> {
+    if payloads.is_instance_of::<PyList>() || payloads.is_instance_of::<PyTuple>() {
+        return Ok(());
+    }
+    let single = payloads.is_instance_of::<PyString>()
+        || payloads.is_instance_of::<PyBytes>()
+        || payloads.is_instance_of::<PyByteArray>()
+        || payloads.is_instance_of::<PyMemoryView>()
+        || payloads
+            .py()
+            .import("builtins")?
+            .getattr("memoryview")?
+            .call1((payloads,))
+            .is_ok();
+    if single {
+        return Err(PyTypeError::new_err(format!(
+            "append_many takes an iterable of payloads, not a single {} (use append for one payload, or pass \
+             iter(...) to append the rows of an array)",
+            payloads.get_type().name()?
+        )));
+    }
+    Ok(())
+}
+
 /// The single writer of a journal directory. Takes the journal's lock; a second writer gets `LockedError`.
+///
+/// Locking: the core writer sits in a mutex, taken without the GIL and never held while Python code runs (errors and
+/// reports are converted to Python objects after it is released). `closed` is a separate flag, readable without the
+/// lock. A handle used in another process than the one that opened it (a child created by `fork`) raises
+/// `UsedAfterForkError` and never touches the shared journal state there, not even to close.
 #[pyclass(frozen, module = "tickertape")]
 #[derive(Debug)]
 pub struct Writer {
     inner: Mutex<Option<tickertape::Writer>>,
+    closed: AtomicBool,
+    owner: Owner,
     path: PathBuf,
 }
 
 impl Writer {
-    fn with<R>(
-        &self,
-        py: Python<'_>,
-        f: impl FnOnce(&mut tickertape::Writer) -> PyResult<R>,
-    ) -> PyResult<R> {
+    /// Runs `f` on the open core writer, with the mutex held and the GIL held. `f` must not run Python code.
+    fn with<R>(&self, py: Python<'_>, f: impl FnOnce(&mut tickertape::Writer) -> R) -> PyResult<R> {
+        self.owner.check(py, "Writer")?;
+        if self.closed.load(Ordering::Acquire) {
+            return Err(errors::closed("writer"));
+        }
         let mut guard = lock(py, &self.inner);
         match guard.as_mut() {
-            Some(writer) => f(writer),
+            Some(writer) => Ok(f(writer)),
             None => Err(errors::closed("writer")),
+        }
+    }
+
+    /// Like `with`, but with the GIL released while `f` runs.
+    fn with_detached<R: Send>(
+        &self,
+        py: Python<'_>,
+        f: impl FnOnce(&mut tickertape::Writer) -> R + Send,
+    ) -> PyResult<R> {
+        self.owner.check(py, "Writer")?;
+        if self.closed.load(Ordering::Acquire) {
+            return Err(errors::closed("writer"));
+        }
+        py.detach(|| {
+            let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+            guard.as_mut().map(f)
+        })
+        .ok_or_else(|| errors::closed("writer"))
+    }
+}
+
+impl Drop for Writer {
+    fn drop(&mut self) {
+        if self.owner.is_foreign() {
+            // A copy made by fork(): its helper threads don't exist here, and the mappings and lock belong to the
+            // parent. Leak it; the process exit releases what this copy holds.
+            let inner = self.inner.get_mut().unwrap_or_else(PoisonError::into_inner);
+            std::mem::forget(inner.take());
         }
     }
 }
 
-fn recovery_report(py: Python<'_>, report: &tickertape::RecoveryReport) -> PyResult<Py<PyDict>> {
-    let dict = PyDict::new(py);
-    dict.set_item("next_seq", report.next_seq)?;
-    dict.set_item("scanned_from_seq", report.scanned_from_seq)?;
-    dict.set_item("had_checkpoint", report.had_checkpoint)?;
-    let actions = PyList::empty(py);
-    for action in &report.actions {
-        let a = PyDict::new(py);
-        match action {
-            RecoveryAction::Created => a.set_item("kind", "created")?,
-            RecoveryAction::ZeroedUncommitted {
-                segment,
-                offset,
-                len,
-            } => {
-                a.set_item("kind", "zeroed_uncommitted")?;
-                a.set_item("segment", segment)?;
-                a.set_item("offset", offset)?;
-                a.set_item("len", len)?;
-            }
-            RecoveryAction::RepairedTail {
-                segment,
-                offset,
-                len,
-                quarantine_file,
-                reason,
-            } => {
-                a.set_item("kind", "repaired_tail")?;
-                a.set_item("segment", segment)?;
-                a.set_item("offset", offset)?;
-                a.set_item("len", len)?;
-                a.set_item("quarantine_file", quarantine_file)?;
-                a.set_item("reason", errors::reason_fields(py, reason)?.0)?;
-            }
-            RecoveryAction::QuarantinedSegment {
-                segment,
-                quarantine_file,
-                reason,
-            } => {
-                a.set_item("kind", "quarantined_segment")?;
-                a.set_item("segment", segment)?;
-                a.set_item("quarantine_file", quarantine_file)?;
-                a.set_item("reason", errors::reason_fields(py, reason)?.0)?;
-            }
-            RecoveryAction::Sealed { segment } => {
-                a.set_item("kind", "sealed")?;
-                a.set_item("segment", segment)?;
-            }
-            RecoveryAction::CompletedRoll { segment } => {
-                a.set_item("kind", "completed_roll")?;
-                a.set_item("segment", segment)?;
-            }
-            RecoveryAction::RemovedTemp { file } => {
-                a.set_item("kind", "removed_temp")?;
-                a.set_item("file", file)?;
-            }
-            other => {
-                a.set_item("kind", "unknown")?;
-                a.set_item("description", format!("{other:?}"))?;
-            }
-        }
-        actions.append(a)?;
-    }
-    dict.set_item("actions", actions)?;
-    Ok(dict.unbind())
+/// Converts a core result after the writer's lock has been released.
+fn convert<T>(py: Python<'_>, result: Result<T, tickertape::Error>) -> PyResult<T> {
+    result.map_err(|e| errors::to_py(py, &e))
 }
 
 #[pymethods]
 impl Writer {
     /// Opens (creating if needed) the journal in `path` for writing and recovers it. Releases the GIL meanwhile.
     #[new]
-    #[pyo3(signature = (
-        path, *, segment_size=WriterConfig::DEFAULT_SEGMENT_SIZE, recovery="quarantine", notify=true, prefault=true,
-        retention=None
-    ))]
+    #[pyo3(
+        signature = (
+            path, *, segment_size=WriterConfig::DEFAULT_SEGMENT_SIZE, recovery="quarantine", notify=true,
+            prefault=true, retention=None
+        ),
+        // Spelled out so that `inspect.signature` shows the default size (DEFAULT_SEGMENT_SIZE, checked by a test).
+        text_signature = "(path, *, segment_size=134217728, recovery='quarantine', notify=True, prefault=True, \
+                          retention=None)"
+    )]
     fn new(
         py: Python<'_>,
         path: PathBuf,
@@ -204,11 +220,14 @@ impl Writer {
             config = config.retention(r.policy.clone(), r.action.clone());
         }
         let open_path = path.clone();
-        let writer = py
-            .detach(move || tickertape::Writer::open(open_path, config))
-            .map_err(|e| errors::to_py(py, &e))?;
+        let writer = convert(
+            py,
+            py.detach(move || tickertape::Writer::open(open_path, config)),
+        )?;
         Ok(Writer {
             inner: Mutex::new(Some(writer)),
+            closed: AtomicBool::new(false),
+            owner: Owner::current(),
             path,
         })
     }
@@ -224,22 +243,23 @@ impl Writer {
         venue_ts_ns: u64,
         local_ts_ns: u64,
     ) -> PyResult<u64> {
+        self.owner.check(py, "Writer")?;
         let payload = Payload::extract(payload)?;
-        self.with(py, |w| {
+        let result = self.with(py, |w| {
             w.append(&NewRecord {
                 schema_id,
                 venue_ts_ns,
                 local_ts_ns,
                 payload: payload.as_slice(),
             })
-            .map_err(|e| errors::to_py(py, &e))
-        })
+        })?;
+        convert(py, result)
     }
 
     /// Appends a batch with one call across the language boundary and returns the range of assigned sequence
-    /// numbers. All arguments are checked before anything is appended. If an append fails part-way, raises
-    /// `BatchAppendError`: records `[0, appended)` are committed (with sequence numbers starting at `first_seq`),
-    /// the rest are not, and the underlying error is its `__cause__`.
+    /// numbers. All arguments are converted and checked before anything is appended. If an append fails part-way,
+    /// raises `BatchAppendError`: records `[0, appended)` are committed (with sequence numbers starting at
+    /// `first_seq`), the rest are not, and the underlying error is its `__cause__`.
     #[pyo3(signature = (payloads, *, schema_id=None, venue_ts_ns=None, local_ts_ns=None))]
     fn append_many<'py>(
         &self,
@@ -249,11 +269,8 @@ impl Writer {
         venue_ts_ns: Option<&Bound<'py, PyAny>>,
         local_ts_ns: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyRange>> {
-        if payloads.is_instance_of::<pyo3::types::PyBytes>() {
-            return Err(PyTypeError::new_err(
-                "append_many takes an iterable of payloads, not a single bytes object",
-            ));
-        }
+        self.owner.check(py, "Writer")?;
+        check_payloads_container(payloads)?;
         let mut items = Vec::new();
         for item in payloads.try_iter()? {
             items.push(Payload::extract(&item?)?);
@@ -270,10 +287,8 @@ impl Writer {
         let venue = column(venue_ts_ns, "venue_ts_ns")?;
         let local = column(local_ts_ns, "local_ts_ns")?;
 
-        let mut guard = lock(py, &self.inner);
-        let writer = guard.as_mut().ok_or_else(|| errors::closed("writer"))?;
-        let first = writer.next_seq();
-        let (appended, failure) = py.detach(|| {
+        let (first, appended, failure) = self.with_detached(py, |writer| {
+            let first = writer.next_seq();
             for (i, payload) in items.iter().enumerate() {
                 let record = NewRecord {
                     schema_id: schema_ids.get(i),
@@ -282,12 +297,11 @@ impl Writer {
                     payload: payload.as_slice(),
                 };
                 if let Err(e) = writer.append(&record) {
-                    return (i, Some(e));
+                    return (first, i, Some(e));
                 }
             }
-            (items.len(), None)
-        });
-        drop(guard);
+            (first, items.len(), None)
+        })?;
         if let Some(err) = failure {
             return Err(errors::batch_append(
                 py,
@@ -296,31 +310,35 @@ impl Writer {
                 (appended > 0).then_some(first),
             ));
         }
-        let end = first + appended as u64;
-        PyRange::new(py, first as isize, end as isize).or_else(|_| {
+        // The writer assigned `appended` consecutive numbers from `first`, so this cannot overflow.
+        let end = u64::try_from(appended)
+            .ok()
+            .and_then(|n| first.checked_add(n))
+            .ok_or_else(|| PyValueError::new_err("sequence number range overflows"))?;
+        match (isize::try_from(first), isize::try_from(end)) {
+            (Ok(start), Ok(stop)) => Ok(PyRange::new(py, start, stop)?),
             // Beyond isize: build the range from Python ints.
-            py.import("builtins")?
+            _ => Ok(py
+                .import("builtins")?
                 .getattr("range")?
                 .call1((first, end))?
-                .cast_into::<PyRange>()
-                .map_err(Into::into)
-        })
+                .cast_into::<PyRange>()?),
+        }
     }
 
     /// Makes every record appended so far durable (see `docs/crash-contract.md`). Blocks until the sync calls
     /// finish, with the GIL released. After a failure the writer is poisoned: later checkpoints raise
-    /// `DurabilityLostError`, appends keep working.
+    /// `DurabilityLostError`, appends keep working. Records appended before a failed checkpoint may not be durable
+    /// even if a writer opened later in the same boot checkpoints successfully.
     fn checkpoint(&self, py: Python<'_>) -> PyResult<()> {
-        let mut guard = lock(py, &self.inner);
-        let writer = guard.as_mut().ok_or_else(|| errors::closed("writer"))?;
-        py.detach(|| writer.checkpoint())
-            .map_err(|e| errors::to_py(py, &e))
+        let result = self.with_detached(py, tickertape::Writer::checkpoint)?;
+        convert(py, result)
     }
 
     /// The sequence number the next append will get.
     #[getter]
     fn next_seq(&self, py: Python<'_>) -> PyResult<u64> {
-        self.with(py, |w| Ok(w.next_seq()))
+        self.with(py, |w| w.next_seq())
     }
 
     /// The journal directory.
@@ -329,50 +347,49 @@ impl Writer {
         self.path.clone()
     }
 
-    /// True after `close()`.
+    /// True after `close()`. Never blocks.
     #[getter]
-    fn closed(&self, py: Python<'_>) -> bool {
-        lock(py, &self.inner).is_none()
+    fn closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
     }
 
-    /// What recovery did when this writer opened the journal, as a dict.
+    /// What recovery did when this writer opened the journal, as a `RecoveryReport`.
     #[getter]
-    fn recovery_report(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
-        self.with(py, |w| recovery_report(py, w.recovery_report()))
+    fn recovery_report<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let report = self.with(py, |w| w.recovery_report().clone())?;
+        reports::recovery_report(py, &report)
     }
 
-    /// Cumulative retention removals since open, as a dict.
+    /// Cumulative retention removals since open, as a `RetentionReport`.
     #[getter]
-    fn retention_report(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
-        self.with(py, |w| {
-            let r = w.retention_report();
-            let dict = PyDict::new(py);
-            dict.set_item("removed_segments", r.removed_segments)?;
-            dict.set_item("removed_bytes", r.removed_bytes)?;
-            dict.set_item("already_removed_segments", r.already_removed_segments)?;
-            Ok(dict.unbind())
-        })
+    fn retention_report<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let report = self.with(py, |w| w.retention_report().clone())?;
+        reports::retention_report(py, &report)
     }
 
     /// The most recent retention error since open, as an exception instance (not raised), or `None`.
     #[getter]
     fn last_retention_error(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
-        self.with(py, |w| {
-            Ok(w.last_retention_error()
-                .map(|e| errors::to_py(py, e).into_value(py).into_any()))
-        })
+        let spec = self.with(py, |w| w.last_retention_error().map(errors::describe))?;
+        Ok(spec.map(|s| s.into_py(py).into_value(py).into_any()))
     }
 
     /// Releases the lock and closes the journal files, without a checkpoint: records appended since the last
-    /// checkpoint stay visible but are not made durable. Calling it again does nothing.
+    /// checkpoint stay visible but are not made durable. Calling it again does nothing. In a child created by
+    /// `fork`, it only marks this copy closed and touches nothing the parent owns.
     fn close(&self, py: Python<'_>) {
+        self.closed.store(true, Ordering::Release);
+        if self.owner.is_foreign() {
+            return;
+        }
         let writer = lock(py, &self.inner).take();
         // Dropping joins helper threads; don't hold the GIL meanwhile.
         py.detach(move || drop(writer));
     }
 
     fn __enter__(slf: Bound<'_, Self>) -> PyResult<Bound<'_, Self>> {
-        if slf.get().closed(slf.py()) {
+        slf.get().owner.check(slf.py(), "Writer")?;
+        if slf.get().closed() {
             return Err(errors::closed("writer"));
         }
         Ok(slf)
@@ -380,14 +397,24 @@ impl Writer {
 
     /// Closes the writer (see `close()`); does not checkpoint and does not suppress exceptions.
     #[pyo3(signature = (*_args))]
-    fn __exit__(&self, py: Python<'_>, _args: &Bound<'_, pyo3::types::PyTuple>) {
+    fn __exit__(&self, py: Python<'_>, _args: &Bound<'_, PyTuple>) {
         self.close(py);
     }
 
-    fn __repr__(&self, py: Python<'_>) -> String {
-        let state = match lock(py, &self.inner).as_ref() {
-            Some(w) => format!("next_seq={}", w.next_seq()),
-            None => "closed".to_string(),
+    /// Never blocks: shows `next_seq` only when no other call holds the writer.
+    fn __repr__(&self) -> String {
+        let state = if self.owner.is_foreign() {
+            format!("opened in process {}", self.owner.pid())
+        } else if self.closed() {
+            "closed".to_string()
+        } else {
+            match self.inner.try_lock() {
+                Ok(guard) => guard.as_ref().map_or_else(
+                    || "closed".to_string(),
+                    |w| format!("next_seq={}", w.next_seq()),
+                ),
+                Err(_) => "busy".to_string(),
+            }
         };
         format!(
             "<tickertape.Writer {:?} {state}>",

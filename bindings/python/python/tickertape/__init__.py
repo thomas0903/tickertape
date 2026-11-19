@@ -8,6 +8,9 @@ https://github.com/thomas0903/tickertape/blob/main/docs/crash-contract.md.
 Records returned to Python are copies: each payload is an ordinary ``bytes`` object that stays valid after the reader
 moves on. The bindings use the core crate's safe ``pread`` reader; the zero-copy mapped reader is not exposed.
 
+Handles belong to the process that opened them: in a child created by ``fork()`` they raise
+:class:`UsedAfterForkError`. Open them after forking, or use the ``spawn`` start method of :mod:`multiprocessing`.
+
 For read-only access without installing anything, the repository also has a dependency-free decoder,
 ``python/tickertape_reader.py``.
 """
@@ -28,10 +31,14 @@ from ._errors import (
     StorageFullError,
     TickertapeError,
     UnsupportedVersionError,
+    UsedAfterForkError,
 )
 from ._inspect import (
     Checkpoint,
     Problem,
+    RecoveryAction,
+    RecoveryReport,
+    RetentionReport,
     SegmentInfo,
     SegmentReport,
     VerifyReport,
@@ -76,7 +83,10 @@ __all__ = [
     "Record",
     "RecordBatch",
     "RecordTooLargeError",
+    "RecoveryAction",
+    "RecoveryReport",
     "Retention",
+    "RetentionReport",
     "SegmentInfo",
     "SegmentReport",
     "SeqUnavailableError",
@@ -84,6 +94,7 @@ __all__ = [
     "StorageFullError",
     "TickertapeError",
     "UnsupportedVersionError",
+    "UsedAfterForkError",
     "VerifyReport",
     "Writer",
     "__version__",

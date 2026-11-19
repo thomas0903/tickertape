@@ -2,6 +2,12 @@
 
 from __future__ import annotations
 
+import array
+import datetime
+import inspect
+import itertools
+import math
+import sys
 import threading
 import time
 from pathlib import Path
@@ -9,7 +15,7 @@ from pathlib import Path
 import pytest
 
 import tickertape as tt
-from helpers import SMALL_SEGMENT, append_pattern, as_tuples, pattern_tuple
+from helpers import SMALL_SEGMENT, append_pattern, as_tuples, pattern_tuple, synthetic_journal
 
 
 def test_round_trip_and_metadata(journal: Path) -> None:
@@ -69,7 +75,7 @@ def test_try_next_returns_none_at_end_and_follows_appends(journal: Path) -> None
         assert record is not None and record.payload == b"a"
         assert r.try_next() is None
         assert r.position == 1
-        # Iteration stops at the current end and continues from there later.
+        # Iteration stops at the current end; a new iterator continues from there later.
         assert list(r) == []
         w.append(b"b")
         assert [x.payload for x in r] == [b"b"]
@@ -297,7 +303,7 @@ def test_seek_before_first_available_record(journal: Path) -> None:
         append_pattern(w, 2000)
         w.checkpoint()
         assert w.last_retention_error is None
-        assert w.retention_report["removed_segments"] > 0
+        assert w.retention_report.removed_segments > 0
     first = tt.list_segments(journal)[0].base_seq
     assert first > 0
     with tt.Reader(journal) as r:
@@ -312,10 +318,13 @@ def test_seek_before_first_available_record(journal: Path) -> None:
 def test_recovery_report_and_config_objects(journal: Path, tmp_path: Path) -> None:
     with tt.Writer(journal, recovery="fail", notify=False, prefault=False) as w:
         report = w.recovery_report
-        assert report["actions"] == [{"kind": "created"}]
+        assert isinstance(report, tt.RecoveryReport)
+        assert report.actions == [tt.RecoveryAction("created")]
+        assert (report.next_seq, report.scanned_from_seq, report.had_checkpoint) == (0, 0, False)
+        assert w.retention_report == tt.RetentionReport(0, 0, 0)
         assert w.path == journal
     with tt.Writer(journal) as w:
-        assert w.recovery_report["actions"] == []
+        assert w.recovery_report.actions == []
     backoff = tt.Backoff(spins=1, yields=2, min_sleep=0.0001, max_sleep=0.01)
     assert (backoff.spins, backoff.yields, backoff.min_sleep, backoff.max_sleep) == (1, 2, 0.0001, 0.01)
     assert tt.Backoff() == tt.Backoff() and tt.Backoff.busy_spin().yields == 0
@@ -347,3 +356,237 @@ def test_module_metadata() -> None:
     assert tt.FORMAT_VERSION == 1
     assert tt.DEFAULT_SEGMENT_SIZE == 128 * 1024 * 1024
     assert "bad_checksum" in tt.CORRUPT_REASONS
+
+
+@pytest.mark.parametrize("base", [2**63 - 1, 2**63, 2**64 - 4])
+def test_append_many_range_beyond_isize(tmp_path: Path, base: int) -> None:
+    """The returned range is built from Python ints when the numbers don't fit in a C ssize_t."""
+    journal = tmp_path / "journal"
+    synthetic_journal(journal, base)
+    with tt.Writer(journal) as w:
+        assert w.next_seq == base
+        assert w.append_many([b"a"]) == range(base, base + 1)
+        assert w.append_many([]) == range(base + 1, base + 1)
+        assert w.append_many([b"b", b"c"]) == range(base + 1, base + 3)
+        assert w.next_seq == base + 3
+    with tt.Reader(journal) as r:
+        assert [x.seq for x in r] == [base, base + 1, base + 2]
+
+
+def test_append_many_rejects_a_single_payload_as_container(journal: Path) -> None:
+    with tt.Writer(journal) as w:
+        for single in (b"", b"ab", bytearray(), bytearray(b"ab"), memoryview(b""), memoryview(b"ab"), "", "ab",
+                       array.array("B"), array.array("B", b"ab")):
+            with pytest.raises(TypeError, match="iterable of payloads"):
+                w.append_many(single)  # type: ignore[arg-type]
+        assert w.next_seq == 0
+
+
+def test_append_many_stops_reading_an_endless_metadata_column(journal: Path) -> None:
+    with tt.Writer(journal) as w:
+        started = time.monotonic()
+        with pytest.raises(ValueError, match="schema_id has more values than the 1 payloads"):
+            w.append_many([b"a"], schema_id=itertools.count())
+        with pytest.raises(ValueError, match="venue_ts_ns has more values than the 2 payloads"):
+            w.append_many([b"a", b"b"], venue_ts_ns=iter(range(3)))
+        assert time.monotonic() - started < 1
+        assert w.next_seq == 0
+
+
+def test_payload_buffers_must_be_unsigned_bytes(journal: Path) -> None:
+    with tt.Writer(journal) as w:
+        assert w.append(array.array("B", b"ok")) == 0
+        with pytest.raises(TypeError, match="unsigned bytes"):
+            w.append(array.array("b", b"no"))
+        with pytest.raises(TypeError, match="unsigned bytes"):
+            w.append(array.array("I", [1]))
+
+
+def later(delay: float, action: object) -> threading.Thread:
+    """Runs `action()` in a thread after `delay` seconds."""
+    def run() -> None:
+        time.sleep(delay)
+        action()  # type: ignore[operator]
+    thread = threading.Thread(target=run)
+    thread.start()
+    return thread
+
+
+FOREVER = [None, math.inf, 1e19, 1e300, float(sys.maxsize), sys.maxsize, 2**64, 10**400,
+           datetime.timedelta.max]
+
+
+@pytest.mark.parametrize("timeout", FOREVER, ids=repr)
+def test_timeouts_too_large_to_represent_wait_forever(journal: Path, timeout: object) -> None:
+    with tt.Writer(journal) as w:
+        r = tt.Reader(journal)
+        thread = later(0.15, lambda: w.append_many([b"a", b"b", b"c"]))
+        record = r.next(timeout=timeout)  # type: ignore[arg-type]
+        thread.join()
+        assert record is not None and record.seq == 0
+        assert len(r.read_many(1, timeout=timeout)) == 1  # type: ignore[arg-type]
+        assert len(r.read_batch(1, timeout=timeout)) == 1  # type: ignore[arg-type]
+        thread = later(0.1, lambda: w.append(b"d"))
+        assert [x.seq for x in r.read_many(10, timeout=timeout)] == [3]  # type: ignore[arg-type]
+        thread.join()
+
+
+def test_timeouts_accept_numbers_and_timedelta(journal: Path) -> None:
+    with tt.Writer(journal):
+        r = tt.Reader(journal)
+        for timeout in (datetime.timedelta(milliseconds=60), 0.06):
+            started = time.monotonic()
+            assert r.next(timeout=timeout) is None
+            assert r.read_many(1, timeout=timeout) == []
+            assert len(r.read_batch(1, timeout=timeout)) == 0
+            assert time.monotonic() - started >= 0.17
+        for no_wait in (0, 0.0, datetime.timedelta(0)):
+            assert r.next(timeout=no_wait) is None
+        for bad in (-1, -0.5, -(2**70), math.nan, -math.inf, datetime.timedelta(seconds=-1)):
+            with pytest.raises(ValueError, match="non-negative"):
+                r.next(timeout=bad)
+            with pytest.raises(ValueError, match="non-negative"):
+                r.read_batch(1, timeout=bad)
+        with pytest.raises(TypeError, match="timeout must be"):
+            r.next(timeout="1")  # type: ignore[arg-type]
+
+
+def test_backoff_sleeps_are_range_checked_and_huge_sleeps_do_not_panic(journal: Path) -> None:
+    for bad in ({"min_sleep": 3601, "max_sleep": 3601}, {"max_sleep": 1e19}, {"min_sleep": -1}, {"max_sleep": math.inf}):
+        with pytest.raises(ValueError):
+            tt.Backoff(**bad)
+    longest = tt.Backoff(spins=0, yields=0, min_sleep=3600, max_sleep=3600)
+    assert longest.max_sleep == 3600.0
+    with tt.Writer(journal, notify=False):
+        r = tt.Reader(journal, notify=False, backoff=longest)
+        started = time.monotonic()
+        assert r.next(timeout=0.2) is None  # waits in 50 ms slices, doubling a 3600 s sleep each time
+        assert time.monotonic() - started < 2
+
+
+def test_reader_is_an_iterable_with_sticky_iterators(journal: Path) -> None:
+    with tt.Writer(journal) as w:
+        r = tt.Reader(journal)
+        assert not hasattr(r, "__next__")
+        with pytest.raises(TypeError):
+            next(r)  # type: ignore[call-overload]
+        w.append(b"a")
+        it = iter(r)
+        assert iter(it) is it and it is not iter(r)
+        assert next(it).payload == b"a"
+        with pytest.raises(StopIteration):
+            next(it)
+        w.append(b"b")
+        with pytest.raises(StopIteration):
+            next(it)  # an exhausted iterator stays exhausted
+        assert r.position == 1
+        assert [x.payload for x in r] == [b"b"]  # a new iterator continues from the reader's cursor
+        r.close()
+        with pytest.raises(ValueError, match="closed reader"):
+            iter(r)
+
+
+def test_signatures_show_the_real_defaults() -> None:
+    def default(function: object, name: str) -> object:
+        return inspect.signature(function).parameters[name].default  # type: ignore[arg-type]
+
+    assert default(tt.Reader.next, "timeout") is None
+    assert default(tt.Reader.read_many, "timeout") == 0
+    assert default(tt.Reader.read_batch, "timeout") == 0
+    assert str(inspect.signature(tt.Reader.read_many)).endswith("max_records, *, timeout=0)")
+    assert str(inspect.signature(tt.Reader.next)).endswith("timeout=None)")
+    assert "..." not in str(inspect.signature(tt.Writer.append_many))
+    assert default(tt.Writer, "segment_size") == tt.DEFAULT_SEGMENT_SIZE
+    assert default(tt.Writer, "recovery") == "quarantine"
+
+
+def test_equality_and_hashing() -> None:
+    assert tt.Backoff().__eq__(1) is NotImplemented
+    assert tt.Backoff() == tt.Backoff() and tt.Backoff() != tt.Backoff.busy_spin()
+    assert tt.Backoff() != (100, 10) and hash(tt.Backoff()) == hash(tt.Backoff())
+    assert len({tt.Backoff(), tt.Backoff(), tt.Backoff.busy_spin()}) == 2
+    a, b = tt.Retention.delete(max_segments=2), tt.Retention.delete(max_segments=2)
+    assert a == b and hash(a) == hash(b) and a.__eq__("x") is NotImplemented
+    assert a != tt.Retention.delete(max_segments=3) and a != tt.Retention.archive("/tmp", max_segments=2)
+    assert tt.Retention.archive("/a", max_age=1) == tt.Retention.archive("/a", max_age=1.0)
+    assert len({a, b, tt.Retention.delete()}) == 2
+
+
+def test_record_equality_with_other_types(journal: Path) -> None:
+    with tt.Writer(journal) as w:
+        w.append(b"a")
+    with tt.Reader(journal) as r:
+        record = r.try_next()
+    assert record is not None
+    assert record.__eq__(record.as_tuple()) is NotImplemented
+    assert record != record.as_tuple()
+    assert record == tt.Reader(journal).try_next()
+
+
+def test_reports_are_named_tuples(journal: Path) -> None:
+    with tt.Writer(journal, segment_size=SMALL_SEGMENT, retention=tt.Retention.delete(max_segments=2)) as w:
+        append_pattern(w, 2000)
+        w.checkpoint()
+        report = w.retention_report
+        assert isinstance(report, tt.RetentionReport) and isinstance(report, tuple)
+        assert report.removed_segments > 0 and report.removed_bytes == report.removed_segments * SMALL_SEGMENT
+        assert report.already_removed_segments == 0
+    with tt.Writer(journal) as w:
+        recovery = w.recovery_report
+        assert recovery.had_checkpoint and recovery.next_seq == 2000 and recovery.scanned_from_seq == 2000
+        assert recovery._fields == ("next_seq", "scanned_from_seq", "had_checkpoint", "actions")
+    assert tt.RecoveryAction._fields == ("kind", "segment", "offset", "length", "quarantine_file", "reason", "file")
+    assert tt.RecoveryReport.__module__ == tt.RetentionReport.__module__ == "tickertape._inspect"
+
+
+def test_two_threads_share_one_writer(journal: Path) -> None:
+    with tt.Writer(journal) as w:
+        def appender(tag: bytes) -> None:
+            for i in range(500):
+                if i % 2:
+                    w.append(tag + str(i).encode())
+                else:
+                    w.append_many([tag + str(i).encode()])
+
+        threads = [threading.Thread(target=appender, args=(tag,)) for tag in (b"a", b"b")]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        assert w.next_seq == 1000
+    with tt.Reader(journal) as r:
+        records = list(r)
+    assert [x.seq for x in records] == list(range(1000))
+    for tag in (b"a", b"b"):
+        mine = [x.payload for x in records if x.payload.startswith(tag)]
+        assert mine == [tag + str(i).encode() for i in range(500)]
+
+
+def test_two_threads_share_one_reader(journal: Path) -> None:
+    """Each record is returned to exactly one caller, in order within each caller."""
+    with tt.Writer(journal, segment_size=SMALL_SEGMENT) as w:
+        r = tt.Reader(journal)
+        seen: dict[str, list[int]] = {"next": [], "many": []}
+
+        def consume(kind: str) -> None:
+            while sum(map(len, seen.values())) < 3000:
+                if kind == "next":
+                    record = r.next(timeout=0.05)
+                    if record is not None:
+                        seen[kind].append(record.seq)
+                else:
+                    seen[kind].extend(x.seq for x in r.read_many(37, timeout=0.05))
+
+        threads = [threading.Thread(target=consume, args=(kind,)) for kind in seen]
+        for thread in threads:
+            thread.start()
+        for _ in range(30):
+            append_pattern(w, 100)
+            time.sleep(0.002)
+        for thread in threads:
+            thread.join(30)
+            assert not thread.is_alive()
+    assert sorted(seen["next"] + seen["many"]) == list(range(3000))
+    for seqs in seen.values():
+        assert seqs == sorted(seqs)
+    assert seen["next"] and seen["many"]

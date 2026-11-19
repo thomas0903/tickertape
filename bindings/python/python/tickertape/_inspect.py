@@ -1,7 +1,7 @@
-"""Read-only inspection: checkpoint marker, segment list and full verification.
+"""Read-only inspection (checkpoint marker, segment list, full verification) and the writer's reports.
 
-None of these take the writer lock or modify files, so they are safe to run while a writer is active. Against a live
-journal, results describe a moment in time.
+The inspection functions never take the writer lock or modify files, so they are safe to run while a writer is
+active. Against a live journal, results describe a moment in time.
 """
 
 from __future__ import annotations
@@ -73,6 +73,49 @@ class VerifyReport(NamedTuple):
     def ok(self) -> bool:
         """True if no problems were found."""
         return not self.problems
+
+
+class RecoveryAction(NamedTuple):
+    """One repair performed when a :class:`Writer` opened the journal. Fields that don't apply to ``kind`` are
+    ``None``."""
+
+    kind: str
+    """``"created"``, ``"zeroed_uncommitted"``, ``"repaired_tail"``, ``"quarantined_segment"``, ``"sealed"``,
+    ``"completed_roll"`` or ``"removed_temp"``."""
+    segment: Optional[Path] = None
+    """The segment concerned (for ``"quarantined_segment"``, where it was)."""
+    offset: Optional[int] = None
+    """First affected byte offset (``"zeroed_uncommitted"``, ``"repaired_tail"``)."""
+    length: Optional[int] = None
+    """Number of bytes zeroed or removed (``"zeroed_uncommitted"``, ``"repaired_tail"``)."""
+    quarantine_file: Optional[Path] = None
+    """Where the removed bytes or segment went (``"repaired_tail"``, ``"quarantined_segment"``)."""
+    reason: Optional[str] = None
+    """Why, as a :attr:`CorruptJournalError.reason` code (``"repaired_tail"``, ``"quarantined_segment"``)."""
+    file: Optional[Path] = None
+    """The removed temporary file (``"removed_temp"``)."""
+
+
+class RecoveryReport(NamedTuple):
+    """What recovery found and did when a :class:`Writer` opened the journal (:attr:`Writer.recovery_report`)."""
+
+    next_seq: int
+    """Sequence number of the next record after recovery."""
+    scanned_from_seq: int
+    """Where validation started: the checkpoint marker's ``next_seq``, or the oldest segment's ``base_seq``."""
+    had_checkpoint: bool
+    """Whether a valid checkpoint marker was found."""
+    actions: list[RecoveryAction]
+    """Every repair, in order. Empty for a cleanly closed journal."""
+
+
+class RetentionReport(NamedTuple):
+    """Cumulative retention removals since the writer opened (:attr:`Writer.retention_report`)."""
+
+    removed_segments: int
+    removed_bytes: int
+    already_removed_segments: int
+    """Segments that were already gone when retention tried to remove them (removed by someone else)."""
 
 
 def read_checkpoint(path: PathLike) -> Optional[Checkpoint]:

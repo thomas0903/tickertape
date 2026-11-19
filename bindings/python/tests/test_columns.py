@@ -53,6 +53,39 @@ def test_empty_batch(journal: Path) -> None:
     assert "empty" in repr(batch)
 
 
+def test_batches_iterate_and_refuse_slices(journal: Path) -> None:
+    write(journal, 5)
+    with tt.Reader(journal) as r:
+        batch = r.read_batch(10)
+    records = [record for record in batch]  # mypy --strict accepts iteration (__iter__ is declared)
+    assert [x.seq for x in records] == list(range(5)) and records == batch.records()
+    it = iter(batch)
+    assert iter(it) is it and len(list(it)) == 5 and list(it) == []
+    with pytest.raises(TypeError, match="does not support slicing"):
+        batch[1:3]  # type: ignore[index]
+    with pytest.raises(IndexError):
+        batch[2**100]
+    assert batch[-5].seq == 0 and batch[4].seq == 4
+
+
+def test_empty_batch_conversions(journal: Path) -> None:
+    write(journal, 1)
+    with tt.Reader(journal) as r:
+        r.seek(1)
+        batch = r.read_batch(10)
+    assert list(batch) == []
+    np = pytest.importorskip("numpy")
+    columns = batch.to_numpy()
+    assert sorted(columns) == sorted(["seq", "schema_id", "venue_ts_ns", "local_ts_ns", "payload"])
+    assert all(len(column) == 0 for column in columns.values()) and columns["seq"].dtype == np.dtype("<u8")
+    pa = pytest.importorskip("pyarrow")
+    table = batch.to_arrow()
+    assert table.num_rows == 0 and table.schema.field("payload").type == pa.large_binary()
+    pytest.importorskip("pandas")
+    frame = batch.to_pandas()
+    assert len(frame) == 0 and list(frame.columns) == ["seq", "schema_id", "venue_ts_ns", "local_ts_ns", "payload"]
+
+
 def test_numpy_arrays_share_and_outlive_the_batch(journal: Path) -> None:
     np = pytest.importorskip("numpy")
     write(journal, 100)

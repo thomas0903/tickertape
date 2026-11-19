@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import base64
 import json
+import struct
+import time
 from collections.abc import Iterable
+from pathlib import Path
 from typing import Any
 
 import tickertape as tt
+import tickertape_reader
 
 SMALL_SEGMENT = 65536
 """The Rust tests' `SMALL_SEGMENT`: small enough that a few hundred records roll segments."""
@@ -52,3 +56,17 @@ def jsonl(records: Iterable[tuple[int, int, int, int, bytes]]) -> bytes:
         lines.append(json.dumps({"seq": seq, "schema_id": schema_id, "venue_ts_ns": venue, "local_ts_ns": local,
                                  "payload_b64": base64.b64encode(payload).decode("ascii")}, separators=(",", ":")))
     return b"".join(line.encode() + b"\n" for line in lines)
+
+
+def synthetic_journal(path: Path, base_seq: int, segment_size: int = 1 << 20) -> None:
+    """A journal whose only segment starts at `base_seq` (an empty segment, as the writer would create it).
+
+    Lets tests reach sequence numbers near 2**63 and 2**64 without appending that many records. The header layout is
+    in docs/format.md; the CRC32C comes from the dependency-free decoder.
+    """
+    path.mkdir(parents=True)
+    header = b"TICKTAPE" + struct.pack("<HHIQQQ", 1, 64, 0, segment_size, base_seq, time.time_ns()) + bytes(20)
+    header += struct.pack("<I", tickertape_reader._crc32c_python(header))
+    with (path / f"{base_seq:020}.tape").open("wb") as f:
+        f.write(header)
+        f.truncate(segment_size)
