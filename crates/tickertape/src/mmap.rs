@@ -1128,8 +1128,8 @@ pub(crate) mod forked {
         unsafe { libc::_exit(status) }
     }
 
-    /// Makes `signal` interrupt blocking calls in this (forked child) process instead of terminating it: installs a
-    /// handler that does nothing, without `SA_RESTART`.
+    /// Makes `signal` interrupt blocking calls in this process, and in children forked from it afterwards, instead of
+    /// terminating it: installs a handler that does nothing, without `SA_RESTART`.
     pub(crate) fn interrupt_on(signal: libc::c_int) {
         extern "C" fn ignore(_: libc::c_int) {}
         // SAFETY: a zeroed `sigaction` is valid (empty mask, no flags); the handler is async-signal-safe (it does
@@ -1543,7 +1543,11 @@ mod tests {
         let path = dir.path().join("lock");
         let locked = File::create(&path).unwrap();
         assert!(try_lock_exclusive(&locked).unwrap());
-        let child = forked::fork(|| forked::interrupt_on(libc::SIGUSR1)).unwrap();
+        // Installed before the fork, so the child has the handler from its first instruction: a signal that arrived
+        // before the child had installed it itself would terminate the child and release the lock. Nothing sends
+        // this signal to the test process, where the handler stays installed.
+        forked::interrupt_on(libc::SIGUSR1);
+        let child = forked::fork(|| {}).unwrap();
         drop(locked);
         let other = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(50));
