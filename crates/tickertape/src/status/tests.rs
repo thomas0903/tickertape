@@ -1560,6 +1560,31 @@ fn only_what_a_beacon_writer_could_write_is_a_beacon() {
         assert!(beacon::decode(&bad).is_none(), "byte {at} = {value}");
     }
 
+    // Round 4, item 3: every report has a slot offset of at least the header's length and a non-zero segment size (a
+    // reader always has an open segment whose header it validated), and one cut mixes at most one of those disjoint
+    // fields, so a file with both zero is no mix of reports: here the magic, the version, a valid pid and zeros
+    // elsewhere (before the fix, a beacon). Either field alone may be zero or small, as a mix can make it.
+    for report in [&first, &second] {
+        assert!(u64::from_le_bytes(report[48..56].try_into().unwrap()) >= 64);
+        assert_ne!(report[64..72], [0; 8]);
+    }
+    let mut zeros = [0u8; BEACON_LEN];
+    zeros[..20].copy_from_slice(&first[..20]);
+    zeros[12..16].fill(0);
+    assert!(!beacon::beacon_file(&zeros));
+    for (field, value) in [(48, 0u64), (48, 56), (64, 0)] {
+        let mut mix = first;
+        mix[field..field + 8].copy_from_slice(&value.to_le_bytes());
+        assert!(beacon::beacon_file(&mix), "field {field} = {value}");
+        let mut both = mix;
+        let other = if field == 48 { 64 } else { 48 };
+        both[other..other + 8].fill(0);
+        assert!(
+            !beacon::beacon_file(&both),
+            "field {field} = {value} and {other} zero"
+        );
+    }
+
     // At a beacon's name, the 0xff file is refused and kept; as a leftover temporary file, it stays.
     let reader = Reader::open(dir.path(), ReaderConfig::default()).unwrap();
     let beacons = tempfile::tempdir().unwrap();

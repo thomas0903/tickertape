@@ -492,6 +492,11 @@ fn u64_at(b: &[u8; BEACON_LEN], at: usize) -> u64 {
 ///   size (bytes 53 to 55 zero).
 /// - The segment size is a multiple of 64 KiB (bytes 64 and 65 zero) and at most 2^40 (byte 69 at most 1, bytes 70
 ///   and 71 zero).
+/// - Round 4: the slot's offset is at least the segment header's length, **or** the segment size is not zero. Every
+///   report has both (a reader always has an open segment whose header it validated, and its offset never goes below
+///   the header), and the two fields are disjoint, so one cut can mix at most one of them: the other comes intact
+///   from a report. A mix can still give either one alone a value no report has (a mixed size can be zero), so
+///   neither is required on its own.
 fn well_formed(b: &[u8; BEACON_LEN]) -> bool {
     let zero = |range: std::ops::Range<usize>| b[range].iter().all(|&x| x == 0);
     let pid = u32_at(b, 16);
@@ -507,6 +512,7 @@ fn well_formed(b: &[u8; BEACON_LEN]) -> bool {
         && b[69] <= 1
         && zero(70..72)
         && zero(96..CRC_AT)
+        && (u64_at(b, 48) >= crate::format::SEGMENT_HEADER_LEN as u64 || u64_at(b, 64) != 0)
 }
 
 /// Whether `b` is a beacon file's contents, possibly torn: [`well_formed`], whatever the checksum says. Every byte a
