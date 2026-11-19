@@ -199,7 +199,9 @@ tickertape status /data/journal --format prometheus --watch 15s \
 ```
 
 With `--watch`, a sample that fails replaces the file with `tickertape_up 0` and the watch goes on; a one-shot run
-does the same before it exits with an error. `--watch` with Prometheus output needs `--output` (several expositions
+does the same before it exits with an error. The file must not lie inside the journal, its `quarantine/` or the beacon
+directory; if `status` can't establish that replacing it is safe, it leaves the file alone and warns on standard
+error, so keep the timestamp alert below. `--watch` with Prometheus output needs `--output` (several expositions
 in one stream are not valid). The `journal` label is the canonical path of the journal directory.
 
 Example alert expressions:

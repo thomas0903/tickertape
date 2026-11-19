@@ -335,10 +335,21 @@ with `--watch`, which goes on sampling and picks the journal up once it exists).
   repeated expositions in one stream are not a valid exposition.
 - **`--output`** writes each sample to a new, uniquely named temporary file in the destination directory, created
   with `O_CREAT | O_EXCL` (it never follows a symlink or opens an existing file), and renames it over the target; the
-  temporary file is removed on every error. The target must be outside the journal and the beacon directory, and,
-  checked before every replacement, must not be a file that an entry of the journal directory names, following
-  symlinks (a segment or the marker may be a symlink to a file outside the journal, which the rename would replace). A one-shot sample that fails
-  still replaces the file (with `tickertape_up 0`), so a collector never keeps serving a stale healthy sample.
+  temporary file is removed on every error. Checked before every replacement, the target must not lie inside a
+  directory the journal uses (the journal directory, `quarantine/`, the beacon directory), compared as given and with
+  symlinks resolved on both sides (round 3: a `quarantine/` that is a symlink to another directory, which recovery
+  accepts, holds evidence too), and must not be a file that an entry of the journal directory or of `quarantine/`
+  reaches, following symlinks or by hard link (a segment, the marker or a quarantined file may be a symlink to a file
+  outside the journal, which the rename would replace). The archive directory of `tickertape archive` is not
+  recorded anywhere `status` can see, so it is not checked. A sample that fails still replaces the file (with
+  `tickertape_up 0`), so a collector never keeps serving a stale healthy sample. **Decision (round 3):** when the
+  journal can't be walked (unreadable, not a directory, a symlink loop), the sample has failed too; the check then
+  decides from what it can establish without the walk: the target is not inside those directories by path, and is
+  not the file the failed sample's error names. If so, `tickertape_up 0` is written and a watch goes on. If even that
+  can't be established (a beacon directory that can't be resolved, a target that can't be `stat`ed, a successful
+  sample whose journal can't be walked a moment later), nothing is written, the reason goes to standard error every
+  time, and a watch goes on; a one-shot status exits 1. Before this, the check's own walk failed first and left a
+  stale `tickertape_up 1` file.
 
 ## Compatibility
 

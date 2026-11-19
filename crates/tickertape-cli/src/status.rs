@@ -2,7 +2,7 @@
 
 use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{ErrorKind, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -171,8 +171,29 @@ pub(crate) fn run(args: StatusArgs, out: &mut dyn Write) -> Result<()> {
         if print {
             match &output {
                 Some(path) => {
-                    check_output(&journal, &readers_dir, path)?;
-                    replace_file(path, text.as_bytes())?;
+                    match check_output(&journal, &readers_dir, path, sampled.as_ref().err()) {
+                        OutputCheck::Safe => replace_file(path, text.as_bytes())?,
+                        OutputCheck::Refused => {
+                            return Err(Failure::usage(format!(
+                                "status output {} is a file the journal or its beacon directory uses",
+                                path.display()
+                            )));
+                        }
+                        // Not written this time; a watch goes on, and a one-shot status fails after reporting.
+                        OutputCheck::Unknown(why) => {
+                            let message = format!(
+                                "status output {} not written: can't establish that it is not a file the journal uses ({why})",
+                                path.display()
+                            );
+                            let _ = writeln!(
+                                std::io::stderr().lock(),
+                                "tickertape: warning: {message}"
+                            );
+                            if args.watch.is_none() && sampled.is_ok() {
+                                return Err(Failure { code: 1, message });
+                            }
+                        }
+                    }
                 }
                 None => {
                     if taken > 0 && format == StatusFormat::Text {
@@ -258,43 +279,140 @@ fn destination(journal: &Path, path: &Path) -> Result<PathBuf> {
     Ok(parent.join(name))
 }
 
-/// Refuses to replace `dest` if that could change what a sample reads, checked before every replacement because the
-/// journal can change between samples. `dest` must not be in the beacon directory, and must not be a file that an
-/// entry of the journal directory names, following symlinks: a segment or the marker may be a symlink to a file
-/// outside the journal, which renaming over `dest` would replace. Hard links count too (renaming over one would not
-/// change the journal's file, but the alias is refused, as `export` refuses it).
-fn check_output(journal: &Path, readers_dir: &Path, dest: &Path) -> Result<()> {
-    let refuse = || {
-        Failure::usage(format!(
-            "status output {} is a file the journal or its beacon directory uses",
-            dest.display()
-        ))
+/// Whether `--output` may be replaced now ([`check_output`]).
+#[derive(Debug, PartialEq, Eq)]
+enum OutputCheck {
+    /// Replacing the destination can't replace anything the journal uses.
+    Safe,
+    /// The destination is (or is inside) something the journal uses: never written.
+    Refused,
+    /// Whether the destination is something the journal uses could not be established, for this reason: it is not
+    /// written this time, and the reason goes to standard error.
+    Unknown(String),
+}
+
+/// Refuses to replace `dest` if that could replace something a journal uses, checked before every replacement because
+/// the journal can change between samples. `dest` must not lie inside the journal directory, its `quarantine/` or the
+/// beacon directory, compared both as given and with symlinks resolved on both sides (a `quarantine/` that is a
+/// symlink to another directory holds evidence too). And it must not be a file that an entry of the journal directory
+/// or of `quarantine/` reaches, following symlinks: a segment, the marker or a quarantined file may be a symlink to a
+/// file outside the journal, which renaming over `dest` would replace. Hard links count too (renaming over one would
+/// not change the journal's file, but the alias is refused, as `export` refuses it). The archive directory of
+/// `tickertape archive` is not known to `status` (nothing in the journal records it), so it can't be checked.
+///
+/// `failed` is the error of the sample about to be reported, if it failed. When the journal can't be walked (it is
+/// unreadable, not a directory, or a symlink loop) the sample has failed too, and the check decides from what it can
+/// still establish (round 3): `dest` is not inside those directories by path, and is not the file the failed sample
+/// names in its error. Then the failure report (`tickertape_up 0`) is written, so a collector never keeps a stale
+/// healthy sample. If that can't be established either, the result is [`OutputCheck::Unknown`].
+fn check_output(
+    journal: &Path,
+    readers_dir: &Path,
+    dest: &Path,
+    failed: Option<&tickertape::Error>,
+) -> OutputCheck {
+    let Some(parent) = dest.parent() else {
+        return OutputCheck::Unknown("the output has no parent directory".into());
     };
-    if let Ok(readers) = fs::canonicalize(readers_dir) {
-        if dest.parent().is_some_and(|p| p.starts_with(&readers)) {
-            return Err(refuse());
+    let quarantine = journal.join("quarantine");
+    let readers_dir =
+        std::path::absolute(readers_dir).unwrap_or_else(|_| readers_dir.to_path_buf());
+    for dir in [journal, &quarantine, &readers_dir] {
+        if parent.starts_with(dir) || dest == dir {
+            return OutputCheck::Refused;
+        }
+        match fs::canonicalize(dir) {
+            Ok(resolved) if parent.starts_with(&resolved) || dest == resolved => {
+                return OutputCheck::Refused;
+            }
+            Ok(_) => {}
+            // Nothing there, a file where a directory component should be, or a symlink loop: nothing inside it.
+            Err(e) if names_nothing(&e) => {}
+            // A journal that can't be walked fails the sample; the path check above is what can be established.
+            Err(_) if failed.is_some() && dir.starts_with(journal) => {}
+            Err(e) => {
+                return OutputCheck::Unknown(format!("can't resolve {}: {e}", dir.display()));
+            }
         }
     }
-    // Nothing to replace yet.
-    let Ok(target) = fs::metadata(dest) else {
-        return Ok(());
+    // The file that renaming over `dest` would unlink, and (if `dest` is a symlink) the one it names.
+    let mut targets = Vec::new();
+    for meta in [fs::symlink_metadata(dest), fs::metadata(dest)] {
+        match meta {
+            Ok(m) => targets.push((m.dev(), m.ino())),
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
+            Err(e) => return OutputCheck::Unknown(format!("can't stat the output: {e}")),
+        }
+    }
+    if targets.is_empty() {
+        // Nothing to replace yet.
+        return OutputCheck::Safe;
+    }
+    let reaches = |path: &Path| -> std::io::Result<bool> {
+        match fs::metadata(path) {
+            Ok(m) => Ok(targets.contains(&(m.dev(), m.ino()))),
+            // Vanished, a dangling symlink or a symlink loop: reaches no file.
+            Err(e) if names_nothing(&e) => Ok(false),
+            Err(e) => Err(e),
+        }
     };
-    let entries = match fs::read_dir(journal) {
-        Ok(entries) => entries,
-        // No journal, so nothing of it to replace (the sample reports it missing).
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(output::io_error("list journal directory", e)),
-    };
-    for entry in entries {
-        let entry = entry.map_err(|e| output::io_error("list journal directory", e))?;
-        // `metadata` follows symlinks: the file a sample reads through this name.
-        if fs::metadata(entry.path())
-            .is_ok_and(|m| m.dev() == target.dev() && m.ino() == target.ino())
+    match walk_journal(journal, &quarantine, &reaches) {
+        Ok(true) => OutputCheck::Refused,
+        Ok(false) => OutputCheck::Safe,
+        // The sample failed too. A file its error names that can't be stat'ed either (a symlink loop) is no file the
+        // sample identified.
+        Err(_)
+            if failed
+                .and_then(error_path)
+                .is_some_and(|p| reaches(p).unwrap_or(false)) =>
         {
-            return Err(refuse());
+            OutputCheck::Refused
+        }
+        Err(_) if failed.is_some() => OutputCheck::Safe,
+        Err(walk) => OutputCheck::Unknown(walk),
+    }
+}
+
+/// Whether an entry of the journal directory or of its `quarantine/` reaches a file for which `reaches` holds. An
+/// error says why that couldn't be established. A missing journal or `quarantine/` has no entries.
+fn walk_journal(
+    journal: &Path,
+    quarantine: &Path,
+    reaches: &dyn Fn(&Path) -> std::io::Result<bool>,
+) -> std::result::Result<bool, String> {
+    for dir in [journal, quarantine] {
+        let entries = match fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(e) if names_nothing(&e) => continue,
+            Err(e) => return Err(format!("can't list {}: {e}", dir.display())),
+        };
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("can't list {}: {e}", dir.display()))?;
+            match reaches(&entry.path()) {
+                Ok(true) => return Ok(true),
+                Ok(false) => {}
+                Err(e) => return Err(format!("can't stat {}: {e}", entry.path().display())),
+            }
         }
     }
-    Ok(())
+    Ok(false)
+}
+
+/// Whether a path that failed to resolve with `e` names no file or directory at all: it doesn't exist, a component is
+/// not a directory, or it is a symlink loop.
+fn names_nothing(e: &std::io::Error) -> bool {
+    matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory)
+        || e.raw_os_error() == Some(libc::ELOOP)
+}
+
+/// The file a failed sample names in its error, if any.
+fn error_path(error: &tickertape::Error) -> Option<&Path> {
+    match error {
+        tickertape::Error::Io { path, .. }
+        | tickertape::Error::Corrupt { path, .. }
+        | tickertape::Error::UnsupportedVersion { path, .. } => Some(path),
+        _ => None,
+    }
 }
 
 /// The `n`th candidate temporary name for replacing `path`, in the same directory.

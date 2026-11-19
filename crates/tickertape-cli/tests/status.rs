@@ -1008,3 +1008,227 @@ fn unusable_readers_directory() {
     assert_eq!(v["head"]["next_seq"], 3);
     drop(writer);
 }
+
+/// The value of `tickertape_up` in an --output file.
+fn up_in(path: &std::path::Path) -> f64 {
+    let text = fs::read_to_string(path).unwrap();
+    let samples = check_exposition(&text);
+    let up: Vec<_> = samples
+        .iter()
+        .filter(|(name, _, _)| name == "tickertape_up")
+        .collect();
+    assert_eq!(up.len(), 1, "{text}");
+    up[0].2
+}
+
+fn is_root() -> bool {
+    // SAFETY: geteuid has no preconditions.
+    unsafe { libc::geteuid() == 0 }
+}
+
+/// Round 3, item 1: a journal that can't be walked (unreadable, not a directory, a symlink loop) fails the sample,
+/// and the --output file that held a healthy sample is replaced by `tickertape_up 0`, once (exit 1) and in a watch,
+/// which goes on (exit 0 after its samples). Before the fix, the output check's walk of the journal failed first: the
+/// command exited 1 and left `tickertape_up 1` in place, and a watch exited.
+#[test]
+fn output_reports_a_journal_that_cant_be_walked() {
+    let _serial = serial();
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("j");
+    let outdir = tempfile::tempdir().unwrap();
+    let target = outdir.path().join("t.prom");
+    let healthy = |target: &std::path::Path| {
+        let mut writer = Writer::open(&path, WriterConfig::default().segment_size(65536)).unwrap();
+        writer
+            .append(&NewRecord {
+                schema_id: 1,
+                venue_ts_ns: 0,
+                local_ts_ns: 0,
+                payload: b"x",
+            })
+            .unwrap();
+        writer.checkpoint().unwrap();
+        drop(writer);
+        command()
+            .args([
+                "status",
+                path.to_str().unwrap(),
+                "--format",
+                "prometheus",
+                "--output",
+            ])
+            .arg(target)
+            .assert()
+            .code(0);
+        assert_eq!(up_in(target), 1.0);
+    };
+    type Step = Box<dyn Fn()>;
+    let mut cases: Vec<(&str, Step, Step)> = Vec::new();
+    let p = path.clone();
+    cases.push((
+        "not a directory",
+        Box::new(move || {
+            fs::rename(&p, p.with_extension("away")).unwrap();
+            fs::write(&p, b"a file").unwrap();
+        }),
+        Box::new({
+            let p = path.clone();
+            move || {
+                fs::remove_file(&p).unwrap();
+                fs::rename(p.with_extension("away"), &p).unwrap();
+            }
+        }),
+    ));
+    let p = path.clone();
+    cases.push((
+        "symlink loop",
+        Box::new(move || {
+            fs::rename(&p, p.with_extension("away")).unwrap();
+            std::os::unix::fs::symlink(&p, &p).unwrap();
+        }),
+        Box::new({
+            let p = path.clone();
+            move || {
+                fs::remove_file(&p).unwrap();
+                fs::rename(p.with_extension("away"), &p).unwrap();
+            }
+        }),
+    ));
+    if !is_root() {
+        use std::os::unix::fs::PermissionsExt;
+        let p = path.clone();
+        cases.push((
+            "unreadable",
+            Box::new(move || fs::set_permissions(&p, fs::Permissions::from_mode(0o000)).unwrap()),
+            Box::new({
+                let p = path.clone();
+                move || fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap()
+            }),
+        ));
+    }
+    for (case, break_it, repair) in &cases {
+        for watch in [false, true] {
+            healthy(&target);
+            break_it();
+            let mut cmd = command();
+            cmd.args([
+                "status",
+                path.to_str().unwrap(),
+                "--format",
+                "prometheus",
+                "--output",
+            ])
+            .arg(&target);
+            if watch {
+                cmd.args(["--watch", "10ms", "--samples", "3"]);
+            }
+            let out = cmd.output().unwrap();
+            repair();
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(
+                out.status.code(),
+                Some(if watch { 0 } else { 1 }),
+                "{case}, watch {watch}: {stderr}"
+            );
+            assert_eq!(up_in(&target), 0.0, "{case}, watch {watch}: {stderr}");
+            assert!(
+                !stderr.contains("not written"),
+                "{case}, watch {watch}: {stderr}"
+            );
+        }
+    }
+    assert_eq!(fs::read_dir(outdir.path()).unwrap().count(), 1);
+}
+
+/// Round 3, item 1 (c): when it can't be established that the destination is not something the journal uses (here
+/// the beacon directory chosen with --readers-dir can't be resolved), nothing is written, the reason goes to standard
+/// error every time, and a watch goes on; a one-shot status exits 1.
+#[test]
+fn output_not_established_is_reported_and_the_watch_goes_on() {
+    use std::os::unix::fs::PermissionsExt;
+    if is_root() {
+        return;
+    }
+    let _serial = serial();
+    let (dir, writer) = journal(2, true);
+    drop(writer);
+    let locked = tempfile::tempdir().unwrap();
+    let readers = locked.path().join("sub").join("readers");
+    fs::create_dir_all(&readers).unwrap();
+    fs::set_permissions(locked.path().join("sub"), fs::Permissions::from_mode(0o000)).unwrap();
+    let outdir = tempfile::tempdir().unwrap();
+    let target = outdir.path().join("t.prom");
+    fs::write(&target, b"previous").unwrap();
+    let run = |watch: bool| {
+        let mut cmd = command();
+        cmd.args([
+            "status",
+            dir.path().to_str().unwrap(),
+            "--format",
+            "prometheus",
+        ])
+        .arg("--readers-dir")
+        .arg(&readers)
+        .arg("--output")
+        .arg(&target);
+        if watch {
+            cmd.args(["--watch", "10ms", "--samples", "3"]);
+        }
+        cmd.output().unwrap()
+    };
+    let watched = run(true);
+    let once = run(false);
+    fs::set_permissions(locked.path().join("sub"), fs::Permissions::from_mode(0o755)).unwrap();
+    let stderr = String::from_utf8_lossy(&watched.stderr);
+    assert_eq!(watched.status.code(), Some(0), "{stderr}");
+    assert_eq!(stderr.matches("not written").count(), 3, "{stderr}");
+    assert_eq!(once.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&once.stderr).contains("not written"));
+    assert_eq!(fs::read(&target).unwrap(), b"previous");
+}
+
+/// Round 3, item 2: `--output` never replaces quarantined evidence: not a file in a `quarantine/` that is a symlink
+/// to another directory (before the fix the check compared the output with the directory only, and replaced the
+/// file), not a new file in that directory, and not a file a quarantine entry reaches through a symlink or a hard
+/// link.
+#[test]
+fn output_never_replaces_quarantined_evidence() {
+    let _serial = serial();
+    let (dir, writer) = journal(2, true);
+    drop(writer);
+    let elsewhere = tempfile::tempdir().unwrap();
+    let evidence = elsewhere.path().join("evidence");
+    fs::create_dir(&evidence).unwrap();
+    std::os::unix::fs::symlink(&evidence, dir.path().join("quarantine")).unwrap();
+    let kept = evidence.join("00000000000000000000.tape.0");
+    fs::write(&kept, b"repaired-away bytes").unwrap();
+    // A quarantine entry that is a symlink to a file outside, and one hard-linked to a file outside.
+    let linked_target = elsewhere.path().join("linked");
+    fs::write(&linked_target, b"evidence through a symlink").unwrap();
+    std::os::unix::fs::symlink(&linked_target, evidence.join("x.1")).unwrap();
+    let hard = elsewhere.path().join("hard");
+    fs::write(&hard, b"evidence through a hard link").unwrap();
+    fs::hard_link(&hard, evidence.join("x.2")).unwrap();
+    let fresh = evidence.join("new.prom");
+    for victim in [&kept, &linked_target, &hard, &fresh] {
+        let before = fs::read(victim).ok();
+        for watch in [false, true] {
+            let mut cmd = command();
+            cmd.args([
+                "status",
+                dir.path().to_str().unwrap(),
+                "--format",
+                "prometheus",
+                "--output",
+            ])
+            .arg(victim);
+            if watch {
+                cmd.args(["--watch", "10ms", "--samples", "1"]);
+            }
+            cmd.assert().code(1).stderr(predicate::str::contains(
+                "the journal or its beacon directory uses",
+            ));
+            assert_eq!(fs::read(victim).ok(), before, "{}", victim.display());
+        }
+    }
+}

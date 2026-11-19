@@ -104,9 +104,14 @@ Errors and recovery warnings go to stderr. JSON results go to stdout (or the sel
   that fails is reported (a JSON line with `error`, a text `error` line, or `tickertape_up 0`) and the watch goes on.
   `--output` writes each sample to a new, uniquely named temporary file in the same directory (created exclusively,
   never following a symlink) and renames it over `FILE`, so a node_exporter textfile collector never reads a partial
-  file; `FILE` must be outside the journal and the beacon directory, and must not be a file that the journal's
-  entries name through symlinks (checked before every replacement). A one-shot sample that fails still replaces
-  `FILE` with `tickertape_up 0`.
+  file. Checked before every replacement, `FILE` must not lie inside the journal directory, its `quarantine/` or the
+  beacon directory (compared as given and with symlinks resolved, so a `quarantine/` that is a symlink to another
+  directory is covered), and must not be a file that an entry of the journal directory or of `quarantine/` reaches
+  through a symlink or a hard link (the archive directory of `archive` is not known to `status`). A sample that fails
+  still replaces `FILE` with `tickertape_up 0`, also when the journal can't be listed at all (unreadable, not a
+  directory, a symlink loop): the check then relies on the paths and on the file the error names. When the check
+  can't establish that `FILE` is safe to replace (for example a `--readers-dir` that can't be resolved), `FILE` is
+  not written, a warning goes to standard error every time, and a watch goes on (a one-shot status exits 1).
   `--watch` with `--format prometheus` needs `--output`. Thresholds (`DUR` and `B` as for `archive`):
   `--max-checkpoint-age` is breached when records are uncovered and the checkpoint's estimated age is above `DUR` or
   unknown, or there is no checkpoint (an idle, fully checkpointed journal and an empty one are healthy);
