@@ -587,8 +587,11 @@ impl Reader {
     fn materialize(&self, found: Found) -> Record<'_> {
         let payload: &[u8] = match &self.seg.map {
             Some(map) => {
-                // SAFETY: the payload is part of a record validated after observing its non-zero commit word;
-                // `open_mapped`'s contract makes it immutable while the reader exists.
+                // SAFETY: the payload is part of a record validated after observing its non-zero commit word.
+                // Under `open_mapped`'s contract only a tickertape writer changes the file, and a writer changes
+                // committed bytes in one case only: recovery zeroing records that storage damage made look
+                // uncommitted, which that contract names. Outside that case the bytes are immutable while the
+                // reader exists.
                 unsafe { map.committed_bytes(found.payload_at, found.payload_len as u64) }
                     .unwrap_or(&[])
             }

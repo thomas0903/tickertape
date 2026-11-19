@@ -61,10 +61,16 @@ fn resume(reader: &mut Reader, seq: u64) -> Result<()> {
         match reader.seek(target) {
             Ok(()) => return Ok(()),
             Err(Error::SeqUnavailable { first, .. }) if first > target => {
-                warn(format_args!(
-                    "records {seq} to {} were removed before tail read them; continuing at sequence {first}",
-                    first - 1
-                ))?;
+                if first - 1 == seq {
+                    warn(format_args!(
+                        "record {seq} was removed before tail read it; continuing at sequence {first}"
+                    ))?;
+                } else {
+                    warn(format_args!(
+                        "records {seq} to {} were removed before tail read them; continuing at sequence {first}",
+                        first - 1
+                    ))?;
+                }
                 target = first;
             }
             Err(error) => return Err(error.into()),

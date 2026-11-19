@@ -174,7 +174,8 @@ a retention removal from a repair (option 5).
 The check is one `stat` of the segment path, made only when a refreshed marker moves past the cursor, that is at most
 once per checkpoint the reader observes, after reading the 128 KiB marker file, which costs more. A durable-only
 reader that keeps up with a writer checkpointing after every record makes one per record; otherwise it is amortised
-over the records a checkpoint covers. It is never on the per-record path.
+over the records a checkpoint covers. It is never on the per-record path. When the check passes, the safe reader also
+discards its read buffer, so its next read is one commit-word `pread` and a buffer refill, at the same frequency.
 
 ## Consequences
 

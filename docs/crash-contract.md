@@ -90,8 +90,10 @@ journal; the durability and restart guarantees below apply to retained history.
   At worst it reports corruption.
 - **`Reader::open_mapped` (`unsafe`, zero-copy)** hands out `&[u8]` slices pointing into the shared mapping. The caller
   promises that no process other than a tickertape writer modifies the journal's segment files while the reader
-  exists. A correct writer never modifies committed bytes and repairs by writing new files, so this holds in normal
-  operation, including writer crashes and recovery. Each record is first validated from a copy made with atomic
+  exists. A correct writer never modifies committed bytes, and recovery repairs a corrupt tail by writing a new file,
+  so this holds in normal operation, including writer crashes and recovery. The one exception follows storage damage:
+  records whose commit word the damage emptied look uncommitted, and recovery zeroes them in place (see "Readers
+  after a repair" below), so a slice a zero-copy reader already holds for such a record can change. Each record is first validated from a copy made with atomic
   loads, and a slice into the mapping is created only after it passes, so a corrupted length cannot make a slice
   cover bytes the writer is still appending (except through a CRC collision on corrupted data, about 2^-32).
 - **The writer** maps the segments it writes. Its API is safe, following the Rust standard library's position that
