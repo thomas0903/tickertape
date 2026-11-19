@@ -201,11 +201,14 @@ tickertape status /data/journal --format prometheus --watch 15s \
 With `--watch`, a sample that fails replaces the file with `tickertape_up 0` and the watch goes on; a one-shot run does
 the same before it exits with an error. The file must not lie inside the journal, its `quarantine/` or the beacon
 directory, and `status` replaces an existing file only if it is an earlier output of `status` (in any format) or an
-empty regular file, and no entry of the journal links to it; anything else, including a symlink, is refused on standard
-error and stops a watch with exit code 1 (remove the file, or choose another path). A write that fails (a full disk, a
+empty regular file, and it finds no entry of the journal that links to it (when it cannot list the journal's
+directories, a file that starts like a status output is still replaced: that is what lets a failed sample report
+`tickertape_up 0`); anything else, including a symlink, is refused on standard error and stops a watch with exit
+code 1 (remove the file, or choose another path). A write that fails (a full disk, a
 directory that became read-only) stops a watch with exit code 1 too, so keep the timestamp alert below. Give `--output`
-a path in a directory only the monitoring job writes to (such as the textfile directory above): `status` can't tell a
-file another process puts there between its check and its rename from its own. `--watch` with Prometheus output needs
+a path in a directory only the monitoring job writes to (such as the textfile directory above), and never link to
+that file from inside the journal: `status` can't tell a file another process puts there between its check and its
+rename from its own, and it can't see a link from a journal directory it can't list. `--watch` with Prometheus output needs
 `--output` (several expositions in one stream are not valid). The `journal` label is the canonical path of the journal
 directory.
 

@@ -447,8 +447,13 @@ with `--watch`, which goes on sampling and picks the journal up once it exists).
   When the journal's directories can't be listed, a file outside the journal that starts with one of the three
   prefixes is taken for an earlier status output even if a journal entry points to it. And the check and the rename
   are not one atomic step, so a file another process puts at the target's name in between is replaced. An operator
-  avoids both by giving `--output` a path in a directory that only the monitoring job writes to, such as the
-  node_exporter textfile directory.
+  avoids the second by giving `--output` a path in a directory that only the monitoring job writes to, such as the
+  node_exporter textfile directory, and the first by never linking to the output file from inside the journal (a
+  link from a journal directory can exist whoever writes to the output's directory, and `status` cannot see it
+  while that directory can't be listed). The walk runs before every replacement, so on every sample of a watch: it
+  lists the journal directory, `quarantine/` and the beacon directory, and `stat`s an entry only if it is a symlink,
+  or if the output file has more than one hard link (a file with one name can be reached only through a symlink),
+  so its cost is that of listing those directories.
 
 ## Compatibility
 

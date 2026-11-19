@@ -471,7 +471,7 @@ fn check_output(places: &JournalPlaces, dest: &Destination) -> std::result::Resu
     if n > 0 && !is_status_output(&head[..n]) {
         return Err(refuse.into());
     }
-    match reached_from(&places.listed, (meta.dev(), meta.ino())) {
+    match reached_from(&places.listed, (meta.dev(), meta.ino()), meta.nlink() > 1) {
         Ok(None) => Ok(()),
         Ok(Some(entry)) => Err(format!(
             "it is {} and the journal reaches it through {} (choose another path)",
@@ -495,7 +495,16 @@ fn check_output(places: &JournalPlaces, dest: &Destination) -> std::result::Resu
 /// isn't a directory or is a symlink loop has no entries. Every entry that can be visited is, past any directory that
 /// can't be listed and any entry that can't be `stat`ed (round 5), so a match is reported before an error: `Err` (why
 /// the first directory couldn't be listed or entry couldn't be `stat`ed) only when no entry visited reaches the file.
-fn reached_from(dirs: &[PathBuf], id: (u64, u64)) -> std::result::Result<Option<PathBuf>, String> {
+///
+/// This runs before every replacement, so with a watch on every sample. `hard_linked` says whether the file has more
+/// than one name: if it has only one, no other directory entry is that file, so only symlinks can reach it, and
+/// entries the directory listing says are not symlinks are skipped without a `stat` (the listing gives the type on
+/// the file systems tickertape supports; where it does not, the entry is `stat`ed).
+fn reached_from(
+    dirs: &[PathBuf],
+    id: (u64, u64),
+    hard_linked: bool,
+) -> std::result::Result<Option<PathBuf>, String> {
     let mut first_error = None;
     for dir in dirs {
         let entries = match fs::read_dir(dir) {
@@ -507,13 +516,17 @@ fn reached_from(dirs: &[PathBuf], id: (u64, u64)) -> std::result::Result<Option<
             }
         };
         for entry in entries {
-            let path = match entry {
-                Ok(entry) => entry.path(),
+            let entry = match entry {
+                Ok(entry) => entry,
                 Err(e) => {
                     first_error.get_or_insert_with(|| format!("can't list {}: {e}", dir.display()));
                     break;
                 }
             };
+            if !hard_linked && entry.file_type().is_ok_and(|t| !t.is_symlink()) {
+                continue;
+            }
+            let path = entry.path();
             match fs::metadata(&path) {
                 Ok(m) if (m.dev(), m.ino()) == id => return Ok(Some(path)),
                 Ok(_) => {}
