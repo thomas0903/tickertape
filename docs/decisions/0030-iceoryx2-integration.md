@@ -228,9 +228,13 @@ gigabytes, and found a few more integrity gaps. Nothing was released; the layout
 - **The memory limits are checked against measurements.** Three rounds in a row a reviewer found an iceoryx2
   allocation the budget did not count, by reading further into upstream. `integrations/iceoryx2/tests/allocation.rs`
   now creates ports of representative shapes on a real iceoryx2 node and asserts that every estimate is at least the
-  heap (counting allocator) and shared memory (object sizes) it measures; the README lists the shapes and which
-  test backs each worst case. The limits are described as what they are: caps on the settings this tool hands to
-  iceoryx2, with upper estimates of what iceoryx2 0.10.0 then allocates.
+  heap (counting allocator) and shared memory (object sizes) it measures; the README lists the shapes. Round 6
+  made the test's reach exact: it shows that no term is missing and, by measuring each per-item cost at two sizes,
+  bounds every per-item coefficient at small shapes; the figures at the caps are the formulas evaluated at the caps,
+  not measurements. Heap that iceoryx2 takes with `malloc` directly does not pass through the counting allocator;
+  its only users on these paths, the subscriber's two lists, are in the formula from upstream's source. The limits
+  are described as what they are: caps on the settings this tool hands to iceoryx2, with upper estimates of what
+  iceoryx2 0.10.0 then allocates.
 - **The recorder's heap is bounded by `max_publishers`.** A subscriber's connection to a publisher with a growing
   data segment allocates a 255-entry segment table (about 302 KB) when it is created, including for publishers that
   connect after the subscriber exists, which it cannot decline. The heap check counts one for every connection slot
