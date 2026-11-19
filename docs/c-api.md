@@ -282,6 +282,15 @@ They behave like `errno`: successful calls leave them unchanged, so read them ri
 UTF-8: a file name that is not valid UTF-8 appears with its invalid bytes replaced (U+FFFD), so do not parse paths
 out of it.
 
+The corruption reasons are the `tickertape_corrupt_reason` values in the header, one for each core `CorruptReason`;
+new reasons get new values and existing values never change. A reason's detail (a sequence number, a length, a
+segment) is in the message only. Two reasons concern an empty commit word followed by committed records (ADR 0035):
+`TICKERTAPE_CORRUPT_EMPTY_COMMIT_WORD` (14; the message names the sequence number the evidence carries: a later
+record's, a final seal's next sequence number or a later segment's base) and `TICKERTAPE_CORRUPT_UNCHECKED_TAIL`
+(15; the search stopped at its work bound before it could decide, and the writer treats the bytes as committed
+history all the same). `tickertape_verify` reports both as `first_problem_reason`; a writer opened with
+`TICKERTAPE_RECOVERY_FAIL` returns `TICKERTAPE_E_CORRUPT` with them.
+
 **Binding authors:** the state is per **operating-system thread**. A runtime that can move a task to another OS
 thread between two foreign calls (Go goroutines, Java virtual threads) can read another thread's state, or none. Read
 the details on the same OS thread, in the same foreign call sequence as the failing call: in Go, call through a small C

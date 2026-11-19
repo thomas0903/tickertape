@@ -221,6 +221,12 @@ static void test_versions_and_names(void) {
     CHECK(strcmp(tickertape_status_name(TICKERTAPE_E_DISCARDED), "TICKERTAPE_E_DISCARDED") == 0);
     CHECK(strcmp(tickertape_status_name(-999), "TICKERTAPE_UNKNOWN_STATUS") == 0);
     CHECK(strcmp(tickertape_corrupt_reason_name(TICKERTAPE_CORRUPT_BAD_SEAL), "TICKERTAPE_CORRUPT_BAD_SEAL") == 0);
+    CHECK(TICKERTAPE_CORRUPT_DANGLING_CHECKPOINT == 13 && TICKERTAPE_CORRUPT_EMPTY_COMMIT_WORD == 14 &&
+          TICKERTAPE_CORRUPT_UNCHECKED_TAIL == 15);
+    CHECK(strcmp(tickertape_corrupt_reason_name(TICKERTAPE_CORRUPT_EMPTY_COMMIT_WORD),
+                 "TICKERTAPE_CORRUPT_EMPTY_COMMIT_WORD") == 0);
+    CHECK(strcmp(tickertape_corrupt_reason_name(TICKERTAPE_CORRUPT_UNCHECKED_TAIL),
+                 "TICKERTAPE_CORRUPT_UNCHECKED_TAIL") == 0);
     CHECK(tickertape_realtime_ns() > 1600000000000000000ull);
     CHECK(sizeof(tickertape_record) == 48);
     CHECK(sizeof(tickertape_new_record) == 40);

@@ -246,6 +246,19 @@ enum tickertape_corrupt_reason
    */
   TICKERTAPE_CORRUPT_DANGLING_CHECKPOINT = 13,
   /**
+   * A commit word reads 0, but records were committed after it (storage damage; ADR 0035). The error message
+   * names the sequence number the evidence carries: a later valid record's, the next sequence number of a seal
+   * that ends the segment, or the base of a later segment.
+   */
+  TICKERTAPE_CORRUPT_EMPTY_COMMIT_WORD = 14,
+  /**
+   * A commit word reads 0, and the bytes after it were too costly to check completely (the search for committed
+   * records stopped at its work bound; ADR 0035). Inconclusive, but treated like
+   * `TICKERTAPE_CORRUPT_EMPTY_COMMIT_WORD`: the writer preserves the bytes or refuses. The error message names the
+   * sequence number in the header where the search stopped.
+   */
+  TICKERTAPE_CORRUPT_UNCHECKED_TAIL = 15,
+  /**
    * A reason this version of the C ABI has no specific code for.
    */
   TICKERTAPE_CORRUPT_UNKNOWN = 255,
