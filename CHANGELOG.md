@@ -10,8 +10,9 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   - `tickertape::status::status(dir)` and `status::Sampler` sample a journal from any process: the writer's head,
     the checkpoint marker (validated as the writer validates it) and an estimate of its age from the marker's
     modification time, what a power loss would remove now (exposure), storage headroom in bytes and estimated segment
-    rolls, and the writer's PID. Whether the sample verified the chain from the checkpoint to the head is reported. A
-    `Sampler` resumes its scan where it stopped, keyed by segment identity, and measures append rates and an estimated
+    rolls, and the writer's PID. Whether the sample verified the chain from the checkpoint to the head is reported; a
+    break it confirms is corruption, and a healthy but unverified sample says so. A `Sampler` resumes its scan where it
+    stopped only with proof that the segment is the same, unchanged file, and measures append rates and an estimated
     time until the volume is full.
   - `Writer::metrics()` (head, checkpoint age by the monotonic clock, uncheckpointed records and bytes, poisoned
     flag, retention failure count), `Reader::cursor()` and `Status::lag()` for in-process reader lag.
@@ -24,9 +25,11 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
     `tickertape_status_timestamp_seconds` show staleness), `--output` (atomic replace through an exclusively created
     temporary file, for a node_exporter textfile collector), and health thresholds (`--max-checkpoint-age`,
     `--min-headroom`, `--min-headroom-segments`, `--max-reader-lag`) that exit with code 3; a journal the sample
-    finds corrupt (or the writer would refuse) exits with 2.
-  - `export --output` no longer fails when an entry in the journal directory disappears during its alias check (a
-    reader beacon dropped meanwhile) or a subdirectory can't be listed. v0.4.0 failed transiently in those cases.
+    finds corrupt (or the writer would refuse) exits with 2. A journal missing at start-up is reported as a failed
+    sample (`tickertape_up 0`).
+  - `export --output` no longer fails when a reader beacon disappears during its alias check or `readers/` can't be
+    listed (another user's). v0.4.0 failed transiently in those cases. Everywhere else in the journal the check still
+    fails closed.
   - `rustix` now also enables its `process` feature (for `kill(pid, 0)`); no new crates.
 - Benchmarks: the test of a lagging reader under retention no longer depends on machine speed (it failed on
   macOS CI runners), and `tt-sustained` readers retry a seek when retention removes the segment they were about to

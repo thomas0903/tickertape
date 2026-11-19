@@ -247,7 +247,8 @@ a dry run). JSON numbers preserve their u64 interpretation; consumers should use
              "pid":u32|null,
              "next_seq":u64|null,"durable_only":bool|null,"seek_pending":bool|null,
              "lag_records":u64|null,"lag_bytes":u64|null,
-             "lag_unknown_reason":"segment_gone"|"other_history"|"segment_unreadable"|"checkpoint_unusable"|null,
+             "lag_unknown_reason":"segment_gone"|"other_history"|"segment_unreadable"|"checkpoint_unusable"|
+                                   "ahead_of_sample"|null,
              "unread_age_s":number|null,"oldest_unread_local_ts_ns":u64|null,
              "updated_unix_ns":u64|null,"update_age_s":number|null}, ...],
  "health":{"ok":bool,"corrupt":bool,"verified":bool,
@@ -259,7 +260,9 @@ With `--watch`, a sample that fails is the line
 `{"schema_version":1,"journal":string,"sampled_unix_ns":u64,"error":{"code":"not_found"|"corrupt"|"unsupported_version"|"io","message":string}}`.
 
 `schema_version` is 1. Fields may be added without changing it; removing a field or changing its meaning bumps it.
-With `--watch`, each sample is one line. `journal` is the canonical absolute path of the journal directory. Times
+With `--watch`, each sample is one line. `journal` is the canonical absolute path of the journal directory (if the
+directory doesn't exist when the command starts, the absolute path as given: the samples fail with `not_found`, a
+one-shot `--output` file gets `tickertape_up 0`, and a watch goes on sampling). Times
 ending in `_unix_ns` are nanoseconds since the Unix epoch by the observer's wall clock (or, for `updated_unix_ns`,
 the reader's), except `last_local_ts_ns`, `oldest_local_ts_ns` and `oldest_unread_local_ts_ns`, which are records'
 caller-supplied `local_ts_ns` (null if unset). Durations ending in `_s` are seconds. `null` means the value could
@@ -329,7 +332,7 @@ and `tickertape_up 0`. `--watch` needs `--output` with this format.
 | `tickertape_append_records_per_second` | With `--watch`, from the second sample |
 | `tickertape_writer_alive` | 1 if the PID in `writer.lock` exists (best effort) |
 | `tickertape_readers_dir_usable` | 0 if the beacon directory exists but couldn't be listed |
-| `tickertape_reader_live`, `tickertape_reader_lag_records`, `tickertape_reader_lag_bytes`, `tickertape_reader_unread_age_seconds`, `tickertape_reader_update_age_seconds` | Per reader beacon (`reader_live` is 1 or 0, absent for `uncertain`, `invalid` and `unreadable` beacons; lag metrics are absent when the lag is unknown) |
+| `tickertape_reader_live`, `tickertape_reader_lag_records`, `tickertape_reader_lag_bytes`, `tickertape_reader_unread_age_seconds`, `tickertape_reader_update_age_seconds` | Per reader beacon (`reader_live` is 1 for `live`, 0 for `stale`, and absent for `uncertain`, `invalid`, `unreadable` and `changing` beacons, so alert with `unless tickertape_reader_live == 0` rather than `and tickertape_reader_live == 1` to count `uncertain` ones as `--max-reader-lag` does; lag metrics are absent when the lag is unknown) |
 
 ### Parquet (`export --format parquet`)
 

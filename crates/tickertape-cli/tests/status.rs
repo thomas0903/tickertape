@@ -586,6 +586,79 @@ fn watch_output_file_and_samples() {
     drop(writer);
 }
 
+/// Round 2, C1: a journal that is missing when the command starts goes through failure reporting: a one-shot sample
+/// replaces the --output file with `tickertape_up 0` (never leaving a stale healthy one), and a watch reports every
+/// failed sample and goes on, picking the journal up once it exists.
+#[test]
+fn missing_journal_at_start_is_reported() {
+    let _serial = serial();
+    let (dir, writer) = journal(3, true);
+    drop(writer);
+    let outdir = tempfile::tempdir().unwrap();
+    let target = outdir.path().join("t.prom");
+    command()
+        .args([
+            "status",
+            dir.path().to_str().unwrap(),
+            "--format",
+            "prometheus",
+            "--output",
+        ])
+        .arg(&target)
+        .assert()
+        .code(0);
+    assert!(
+        fs::read_to_string(&target)
+            .unwrap()
+            .contains("tickertape_up{")
+    );
+    let moved = outdir.path().join("moved");
+    fs::rename(dir.path(), &moved).unwrap();
+    command()
+        .args([
+            "status",
+            dir.path().to_str().unwrap(),
+            "--format",
+            "prometheus",
+            "--output",
+        ])
+        .arg(&target)
+        .assert()
+        .code(1);
+    let text = fs::read_to_string(&target).unwrap();
+    let samples = check_exposition(&text);
+    let up: Vec<_> = samples
+        .iter()
+        .filter(|(name, _, _)| name == "tickertape_up")
+        .collect();
+    assert_eq!(up.len(), 1, "{text}");
+    assert_eq!(up[0].2, 0.0, "{text}");
+
+    let out = command()
+        .args([
+            "status",
+            dir.path().to_str().unwrap(),
+            "--json",
+            "--watch",
+            "10ms",
+            "--samples",
+            "2",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let lines: Vec<Value> = String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 2);
+    for line in &lines {
+        assert_eq!(line["error"]["code"], "not_found", "{line}");
+    }
+    fs::rename(&moved, dir.path()).unwrap();
+}
+
 /// Round 2, B2: a missing middle segment that the sample can't see (it doesn't read the segments between an older
 /// checkpoint and the head) exits 0 but says "unverified" in the JSON and the text; with every segment gone and a
 /// valid checkpoint, the sample reports a dangling checkpoint as the writer does (exit 2).

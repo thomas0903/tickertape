@@ -450,6 +450,9 @@ pub enum LagUnknown {
     SegmentUnreadable,
     /// A durable-only reader, and the checkpoint marker can't be used ([`CheckpointStatus::problem`]).
     CheckpointUnusable,
+    /// The cursor's segment is newer than every segment the sample listed: the writer created it after the sample
+    /// (take a new sample).
+    AheadOfSample,
 }
 
 impl LagUnknown {
@@ -460,6 +463,7 @@ impl LagUnknown {
             LagUnknown::OtherHistory => "other_history",
             LagUnknown::SegmentUnreadable => "segment_unreadable",
             LagUnknown::CheckpointUnusable => "checkpoint_unusable",
+            LagUnknown::AheadOfSample => "ahead_of_sample",
         }
     }
 }
@@ -577,7 +581,8 @@ pub struct WriterMetrics {
 pub struct Thresholds {
     /// Breached if records are (or may be) uncovered and the checkpoint's estimated age is greater than this or
     /// unknown, or there is no checkpoint. An idle journal whose records are all covered is healthy however old its
-    /// checkpoint is, and so is an empty journal.
+    /// checkpoint is, and so is an empty journal. An age unknown because the marker was rewritten during every read
+    /// ([`AgeUnknown::Changing`]: a writer checkpointing very often) is not a breach.
     pub max_checkpoint_age: Option<Duration>,
     /// Breached if fewer bytes than this are available on the volume.
     pub min_headroom_bytes: Option<u64>,
@@ -676,11 +681,7 @@ impl Status {
     ///
     /// [`LagUnknown`] if the lag can't be established.
     pub fn lag(&self, cursor: &Cursor) -> std::result::Result<Lag, LagUnknown> {
-        let file = self
-            .files
-            .iter()
-            .find(|f| f.base == cursor.position.segment_base_seq)
-            .ok_or(LagUnknown::SegmentGone)?;
+        let file = self.listed(cursor.position.segment_base_seq)?;
         if file.file != cursor.file {
             return Err(LagUnknown::OtherHistory);
         }
@@ -690,6 +691,17 @@ impl Status {
             cursor.seek_pending,
             cursor.durable_only,
         )
+    }
+
+    /// The listed segment `base`; if there is none, why: gone, or created after the sample.
+    fn listed(&self, base: u64) -> std::result::Result<&SegFile, LagUnknown> {
+        self.files.iter().find(|f| f.base == base).ok_or_else(|| {
+            if self.files.last().is_some_and(|f| base > f.base) {
+                LagUnknown::AheadOfSample
+            } else {
+                LagUnknown::SegmentGone
+            }
+        })
     }
 
     fn lag_from(
@@ -746,7 +758,12 @@ impl Status {
             out.push(Breach::ChainBroken);
         }
         if let Some(max) = thresholds.max_checkpoint_age {
-            if self.exposure.records != Some(0)
+            // A marker rewritten during every read was checkpointed moments ago: its age is unknown but tiny.
+            let just_written = self.checkpoint.is_some_and(|c| {
+                c.problem.is_none() && c.age_unknown == Some(AgeUnknown::Changing)
+            });
+            if !just_written
+                && self.exposure.records != Some(0)
                 && self.exposure.estimated_age.is_none_or(|age| age > max)
             {
                 out.push(Breach::CheckpointAge);
@@ -786,26 +803,29 @@ impl Status {
 /// it is taken (retention or recovery moved it), the sample is retried, up to 3 attempts. Every file is opened
 /// non-blocking and must be a regular file, so a FIFO or device in the journal can't hang it.
 ///
-/// **Cost** of one call, in system calls:
+/// **Cost** of one call, in system calls, on the normal path (every `open` is followed by a `close`; a `readdir` pass
+/// is `open`, `fstat`, two `getdents64` and `close`; ADR 0032 → "Sampling cost" also lists the retries):
 ///
-/// - the journal directory: one `readdir` pass and one `stat` per segment file;
-/// - the checkpoint marker: `open`, then `fstat`, up to two 64-byte `pread`s and `fstat` again (repeated, at most
-///   3 times, while its metadata changes under the read);
-/// - the newest segment: `open`, `fstat`, a 64-byte header `pread`, and a `pread` scan in 1 MiB windows **from the
-///   checkpoint position if the marker points into it, otherwise from its start**, so at most one segment. If the
-///   scan ends at a seal whose successor exists (the writer rolled meanwhile), the directory is listed again and
-///   the new newest segment scanned instead, up to 16 times;
-/// - the checkpoint's segment and the oldest segment, if they are not the newest: `open`, `fstat` and a header
-///   `pread` each;
+/// - the journal directory: a `readdir` pass and one `stat` per segment file;
+/// - the checkpoint marker: `open`, three `fstat`s and two 64-byte `pread`s (the reads are repeated, at most 3 times,
+///   while its metadata changes; the listing and the marker are read again, at most 3 times, if the marker names a
+///   segment the listing lacks);
+/// - the newest segment: `open`, three `fstat`s, a 64-byte header `pread`, and a `pread` scan in 1 MiB windows
+///   **from the checkpoint position if the marker points into it, otherwise from its start**, so at most one segment.
+///   If the scan ends at a seal (an `lstat` of the successor) whose successor exists (the writer rolled meanwhile),
+///   the directory is listed and the marker read again and the new newest segment scanned instead, up to 16 times;
+/// - the checkpoint's segment and the oldest segment, if they are not the newest: `open`, three `fstat`s and a
+///   header `pread` each;
 /// - with uncovered records whose first one wasn't passed by the scan: one record lookup in the checkpoint's
 ///   segment (one `pread` of 4 KiB, or of the whole record if it is larger, since it is validated; following one
-///   seal costs an `open`, `fstat` and another lookup);
-/// - `statvfs` on the directory, `lstat` of `next-segment.tmp`, `open` and a `read` of `writer.lock`, and
-///   `kill(pid, 0)`;
-/// - the beacon directory: one `readdir` pass, and per beacon `open`, `fstat`, one or two 129-byte `pread`s, two
-///   `flock`s (probe and release) and an `lstat` (more if the file is replaced while it is read); per beacon whose
-///   segment isn't already open, `open`, `fstat` and a header `pread`; and per lagging beacon, one record lookup;
-/// - one monotonic and one wall-clock read.
+///   seal costs an `open`, three `fstat`s, a header `pread` and another lookup);
+/// - `statvfs` on the directory, `lstat` of `next-segment.tmp`, `open`, `fstat` and two `read`s of `writer.lock`,
+///   and `kill(pid, 0)`;
+/// - the beacon directory: a `readdir` pass, and per beacon `open`, `fstat`, two `pread`s (129 bytes, then the end
+///   of the file), one `flock` (held) or two (free: probe and release) and an `lstat` (more if the file is replaced
+///   or fails its checksum while it is read); per beacon whose segment isn't already open, `open`, three `fstat`s
+///   and a header `pread`; and per lagging beacon, one record lookup;
+/// - one monotonic and one wall-clock read (no system call where the vDSO provides them).
 ///
 /// No file stays open after the call. Use a [`Sampler`] to sample repeatedly: it scans only what was appended since
 /// its previous sample.
@@ -1694,12 +1714,12 @@ fn reader_status(
         .checked_sub(report.updated_unix_ns)
         .map(Duration::from_nanos);
     let base = report.position.segment_base_seq;
-    let identity = match status.files.iter().find(|f| f.base == base) {
-        None => Err(LagUnknown::SegmentGone),
-        Some(f) if f.file != payload.segment_file || f.size != payload.segment_size => {
+    let identity = match status.listed(base) {
+        Err(reason) => Err(reason),
+        Ok(f) if f.file != payload.segment_file || f.size != payload.segment_size => {
             Err(LagUnknown::OtherHistory)
         }
-        Some(_) => match open.get(dir, base) {
+        Ok(_) => match open.get(dir, base) {
             Ok(seg)
                 if seg.id.file == payload.segment_file
                     && seg.id.size == payload.segment_size

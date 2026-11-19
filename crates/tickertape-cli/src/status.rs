@@ -101,8 +101,12 @@ pub(crate) fn run(args: StatusArgs, out: &mut dyn Write) -> Result<()> {
     thresholds.min_headroom_bytes = args.min_headroom;
     thresholds.min_headroom_segments = args.min_headroom_segments;
     thresholds.max_reader_lag = args.max_reader_lag;
-    // The canonical path, so that `./j` and `/abs/j` are the same series and the same JSON value.
+    // The canonical path, so that `./j` and `/abs/j` are the same series and the same JSON value. If it can't be
+    // resolved (the journal is missing or unreadable), the absolute path as given: the sample then fails and is
+    // reported like any failed sample (`tickertape_up 0` in an --output file, an error line with --watch, which goes
+    // on and samples again).
     let journal = fs::canonicalize(&args.dir)
+        .or_else(|_| std::path::absolute(&args.dir))
         .map_err(|e| output::io_error("resolve journal directory", e))?;
     let output = args
         .output
@@ -218,6 +222,10 @@ fn json_line(text: &mut String, value: &impl Serialize) -> Result<()> {
 fn error_code(error: &tickertape::Error) -> &'static str {
     match error {
         tickertape::Error::NotFound { .. } => "not_found",
+        // The journal directory itself is missing.
+        tickertape::Error::Io { source, .. } if source.kind() == std::io::ErrorKind::NotFound => {
+            "not_found"
+        }
         tickertape::Error::Corrupt { .. } => "corrupt",
         tickertape::Error::UnsupportedVersion { .. } => "unsupported_version",
         _ => "io",

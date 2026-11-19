@@ -1010,6 +1010,77 @@ fn lag_needs_the_same_segment_file() {
     assert_eq!(s.lag(&reader.cursor()), Err(LagUnknown::SegmentGone));
 }
 
+/// Round 2, C3: a cursor in a segment the writer created after the sample has an unknown lag (ahead of the sample),
+/// not a removed segment.
+#[test]
+fn lag_of_a_cursor_ahead_of_the_sample() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut writer = Writer::open(dir.path(), config()).unwrap();
+    let per = records_per_segment(1000);
+    append(&mut writer, per - 1, 1000, 0);
+    let s = status(dir.path()).unwrap();
+    append(&mut writer, 3, 1000, 0);
+    let mut reader = Reader::open(dir.path(), ReaderConfig::default()).unwrap();
+    for _ in 0..per + 1 {
+        reader.try_next().unwrap().unwrap();
+    }
+    assert_eq!(reader.cursor().position.segment_base_seq, per);
+    assert_eq!(s.lag(&reader.cursor()), Err(LagUnknown::AheadOfSample));
+    assert_eq!(LagUnknown::AheadOfSample.code(), "ahead_of_sample");
+    let s = status(dir.path()).unwrap();
+    assert_eq!(s.lag(&reader.cursor()).unwrap().records, 1);
+}
+
+/// Round 2, C3: a checkpoint age unknown because the marker was rewritten during every read (a writer checkpointing
+/// very often) doesn't breach `max_checkpoint_age`: it means the checkpoint is very recent. Other unknown ages do.
+#[test]
+fn a_marker_changing_under_the_read_is_not_an_old_checkpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut writer = Writer::open(dir.path(), config()).unwrap();
+    append(&mut writer, 2, 10, 0);
+    writer.checkpoint().unwrap();
+    append(&mut writer, 1, 10, 0);
+    let t = Thresholds::default().max_checkpoint_age(HOUR);
+    let mut s = status(dir.path()).unwrap();
+    assert_eq!(s.exposure.records, Some(1));
+    let c = s.checkpoint.as_mut().unwrap();
+    c.estimated_age = None;
+    c.age_unknown = Some(AgeUnknown::Changing);
+    s.exposure.estimated_age = None;
+    assert!(s.breaches(&t).is_empty());
+    s.checkpoint.as_mut().unwrap().age_unknown = Some(AgeUnknown::InFuture);
+    assert_eq!(s.breaches(&t), vec![Breach::CheckpointAge]);
+}
+
+/// Round 2, C3: a creator checks the file it opened at the name, then `lstat`s the name before replacing it. If the
+/// name was replaced meanwhile (outside the protocol), the new file was never checked, so it checks again: a
+/// non-beacon file put there is refused, never renamed over.
+#[cfg(feature = "fault-injection")]
+#[test]
+fn takeover_rechecks_a_replaced_name() {
+    use crate::fault::{Pause, on_pause};
+    let dir = tempfile::tempdir().unwrap();
+    let mut writer = Writer::open(dir.path(), config()).unwrap();
+    append(&mut writer, 3, 10, 0);
+    let reader = Reader::open(dir.path(), ReaderConfig::default()).unwrap();
+    let path = stale_beacon(ReaderBeacon::create(dir.path(), "r", &reader).unwrap());
+    let precious = dir.path().join("precious");
+    fs::write(&precious, b"not a beacon").unwrap();
+    let (name, replacement) = (path.clone(), precious.clone());
+    let mut done = false;
+    on_pause(Some(Box::new(move |p| {
+        if p == Pause::CreatorOpenedExisting && !done {
+            done = true;
+            fs::rename(&replacement, &name).unwrap();
+        }
+    })));
+    let result = ReaderBeacon::create(dir.path(), "r", &reader);
+    on_pause(None);
+    let err = result.unwrap_err();
+    assert!(matches!(err, Error::InvalidConfig(_)), "{err}");
+    assert_eq!(fs::read(&path).unwrap(), b"not a beacon");
+}
+
 #[test]
 fn footprint_cases() {
     let file = |base, size| SegFile {
