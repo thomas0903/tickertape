@@ -23,8 +23,8 @@ use crate::record::NewRecord;
 /// copy of its descriptor closes, so a crashed writer never leaves a stale lock; but a child the process forked keeps
 /// a copy until it calls `exec` or exits, for its whole life if it never execs (crash contract C3). A forked child
 /// must neither use nor drop an inherited writer: if it drops one, the lock stays with the parent, but the writer's
-/// other clean-up still runs in the child, where stopping the helper threads (which do not exist there) can stall it
-/// and clearing the wake-up region disturbs the parent's readers. `Writer` is `Send` but not `Sync`: appends take
+/// other clean-up still runs in the child, where stopping the prefault helper (whose thread does not exist there)
+/// can stall it and clearing the wake-up region disturbs the parent's readers. `Writer` is `Send` but not `Sync`: appends take
 /// `&mut self`.
 ///
 /// The writer maps the segments it writes. Another process writing into or truncating those files is outside the
