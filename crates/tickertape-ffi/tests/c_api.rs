@@ -1658,13 +1658,18 @@ fn at_namespace_scope(text: &str) -> bool {
             }
             '{' => {
                 let h = head.trim_start();
-                // `extern "C" {` is a linkage block; `extern "C" int f() {` is a function body.
-                open.push(
-                    h.starts_with("namespace ")
-                        || h.trim_end() == "namespace"
-                        || h.starts_with("inline namespace ")
-                        || h.trim_end() == "extern \"C\"",
-                );
+                // `extern "C" {` is a linkage block; `extern "C" int f() {` is a function body. A namespace head may
+                // go on with a name or with attributes (`namespace [[deprecated]] n {`). The check is for this
+                // header: a spelling it does not recognise is reported, which is the safe direction.
+                let namespace = h
+                    .strip_prefix("inline ")
+                    .unwrap_or(h)
+                    .trim_start()
+                    .strip_prefix("namespace")
+                    .is_some_and(|rest| {
+                        !rest.starts_with(|c: char| c.is_alphanumeric() || c == '_')
+                    });
+                open.push(namespace || h.trim_end() == "extern \"C\"");
                 head.clear();
             }
             '}' => {
@@ -1809,6 +1814,26 @@ fn language_level_comparison_reports_changed_definitions() {
         problems[0].contains("not at namespace scope"),
         "{problems:?}"
     );
+    // A declaration added inside a namespace whose head has attributes or no name.
+    for head in [
+        "namespace[[deprecated]] old {",
+        "namespace {",
+        "inline namespace v2 {",
+    ] {
+        let ns = lines(&[(1, head), (2, "int a;"), (4, "}")]);
+        let mut more = ns.clone();
+        more.insert(2, (3, "int b;".to_owned()));
+        assert_eq!(
+            standard_dependent_definitions(&ns, &more),
+            Vec::<String>::new(),
+            "{head}"
+        );
+    }
+    // A name that merely starts with `namespace` is not a namespace head.
+    let class = lines(&[(1, "struct namespace_like {"), (2, "int a;"), (4, "};")]);
+    let mut more = class.clone();
+    more.insert(2, (3, "int b;".to_owned()));
+    assert_eq!(standard_dependent_definitions(&class, &more).len(), 1);
     // A statement added to a function with C linkage, which is not a linkage block.
     let c_function = lines(&[
         (1, "extern \"C\" inline int f(int n) {"),

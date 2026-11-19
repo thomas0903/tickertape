@@ -131,11 +131,12 @@ GCC and Clang (the Itanium C++ ABI: Linux, macOS):
   `v1_noexcept::Writer`). Where a binding type is in a function's **parameter list**, it is part of the symbol's
   name, so a function declared as `bool is_open(const tickertape::Writer &)` in a shared header is a different
   function in each mode: defining it in a `-fno-exceptions` unit and calling it from an exceptions unit is a link
-  error (undefined reference), when the call is a direct call by name of a C++ function (a function template's
-  symbol also encodes its return type, so a binding type anywhere in its signature has the same effect). A binding
-  type is not part of the symbol's name where it appears only in a non-template function's **return type**, in a
-  data member or a global, or in an `extern "C"` function, whose name carries no types; and a call through a virtual
-  function or a function pointer is not resolved by name at all (a round-3 reviewer linked an interface with a
+  error (undefined reference), when the call is a direct call by name of an ordinary C++ function. Nothing more is
+  claimed: a binding type is not part of the symbol's name where it appears only in a non-template function's
+  **return type**, in a data member or a global, or in an `extern "C"` function, whose name carries no types; what
+  a function template's symbol encodes depends on how the type appears in it (a deduced return type or a trailing
+  `requires` clause can leave it out); and a call through a virtual function or a function pointer is not resolved
+  by name at all (a round-3 reviewer linked an interface with a
   virtual `feed(tickertape::Writer &)` implemented without exceptions and called with them). Such a crossing links,
   and is undefined behaviour. The rule is that binding types do not cross the boundary; the link error is a help for
   the commonest
@@ -316,8 +317,9 @@ names is a named `Status`), and `-Wswitch` makes a new enumerator break the test
   specialising it (`template <> inline constexpr bool tickertape::enable_borrowed_bytes<MyView> = true;`), at C++17
   as well, at namespace scope in the header that defines the type, before any use that instantiates the primary
   template. Within one translation unit a missing specialisation selects the deleted overload and a late one is
-  "specialization after instantiation", both compile errors; but a program in which one unit sees the
-  specialisation and another uses the type without it is ill-formed with no diagnostic required, which is why it
+  "specialization after instantiation", both compile errors; but a program in which one unit instantiates the
+  trait for the type with the specialisation in sight and another instantiates it without (by passing an rvalue of
+  the type to `new_record`) is ill-formed with no diagnostic required, which is why it
   belongs in the type's own header. Round 2 picked up `std::ranges::enable_borrowed_range` automatically in C++20, which made the header's
   definition depend on the standard (**Language level**); the binding no longer consults it, so a C++20 type that
   opts only into it (or `std::ranges::subrange`) is refused unless it also specialises `enable_borrowed_bytes`. For

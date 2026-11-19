@@ -107,11 +107,12 @@ GCC and Clang each unit keeps its own behaviour:
   different type from one built without. If a header of yours declares `void feed(tickertape::Writer &)`, defining
   it in a `-fno-exceptions` component and calling it from an application built with exceptions fails to link
   (undefined reference to `feed(tickertape::v1::Writer&)`). The link error only helps with the commonest case, a
-  binding type in the **parameter list** of a C++ function that is called directly by its name (or anywhere in a
-  function template's signature, whose symbol also encodes the return type). A binding type is not part of the
-  symbol's name when it appears only in a non-template function's **return type**
-  (`tickertape::Writer open_feed();`), in a data member or a global, or in an `extern "C"` function (whose name
-  carries no types); and a call through a virtual function or a function pointer is not resolved by name at all (an
+  binding type in the **parameter list** of an ordinary C++ function that is called directly by its name. Do not
+  rely on it anywhere else: a binding type is often not part of the symbol's name, for example when it appears only
+  in a non-template function's **return type** (`tickertape::Writer open_feed();`), in a data member or a global,
+  or in an `extern "C"` function (whose name carries no types); what a function template's symbol encodes depends
+  on how the type appears in it; and a call through a virtual function or a function pointer is not resolved by
+  name at all (an
   interface such as `struct Sink { virtual bool feed(tickertape::Writer &) = 0; };` implemented in one mode and
   called from the other links). Such a crossing links, and is undefined behaviour. Do not let binding types cross the
   boundary at all; pass C
@@ -251,8 +252,9 @@ tt::Writer writer = tt::Writer::open("/data/journal", options).value();
   copy, so **the payload must be a named object** (an lvalue) that outlives the append, or a view: an rvalue is
   accepted only if `tt::enable_borrowed_bytes<T>` is true for its type, which it is for `std::basic_string_view` and
   `std::span`. For a view type of your own, specialise it (at any language level) at namespace scope in the header
-  that defines the type, so that every translation unit sees it before its first use (a program in which one unit
-  uses the type with the specialisation and another without it is ill-formed, and a compiler need not say so):
+  that defines the type, so that every translation unit sees it before anything that asks the trait about the type
+  (a program in which one unit passes an rvalue of the type to `new_record` with the specialisation in sight and
+  another does so without it is ill-formed, and a compiler need not say so):
 
   ```cpp
   template <> inline constexpr bool tickertape::enable_borrowed_bytes<MyView> = true;

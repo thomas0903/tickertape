@@ -17,7 +17,8 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   copies without throwing (moving one copies it, so a moved-from exception keeps its error). An exception thrown by a
   fill never crosses the C ABI: it is rethrown after the aborted append, nested inside the library error if the
   clean-up failed, and destroying or moving the writer inside its own fill is defined. Negative timeouts do not wait
-  (unlike C), and integral durations are converted to nanoseconds exactly, rounded up; a negative or
+  (unlike C), and integral durations are converted to nanoseconds exactly, rounded up (for every period the
+  standard library can convert to nanoseconds; a more extreme one does not compile); a negative or
   NaN retention age is an error. With GCC and Clang, units built with and without exceptions or debug checks can be
   linked into one program, and binding types cannot be passed between units built in different exception modes: the
   inline namespace is `tickertape::v1` with exceptions and `tickertape::v1_noexcept` without, so every definition the

@@ -109,11 +109,12 @@
 //   tickertape::Writer. What remains shared between modes is standard-library code over built-in and standard types
 //   (std::string, std::optional<std::uint64_t>, ...), as in any program that mixes modes: that is as safe as the
 //   toolchain's standard library makes it. Binding types must not cross a boundary between exception modes (pass C
-//   handles or plain data). A binding type in the parameter list of a C++ function called directly by name (or
-//   anywhere in a function template's signature, return type included) is part of the symbol's name and makes such
-//   a crossing a link error. It is not part of the name in a non-template function's return type, in a data member
-//   or global, or in an extern "C" function (whose name carries no types), and a call through a virtual function or
-//   a function pointer is not resolved by name at all: those crossings link and are undefined behaviour.
+//   handles or plain data). A binding type in the parameter list of an ordinary C++ function called directly by
+//   name is part of the symbol's name and makes such a crossing a link error. That is a help in the commonest case
+//   and nothing to rely on: elsewhere a binding type is often not part of the name (for example a non-template
+//   function's return type, a data member or global, an extern "C" function, whose name carries no types), and a
+//   call through a virtual function or a function pointer is not resolved by name at all. Those crossings link and
+//   are undefined behaviour.
 // - Debug-check mode: the types are shared, so that debug and release units can exchange them. The inline functions
 //   whose behaviour depends on the mode are declared TICKERTAPE_HPP_MODE_DEPENDENT, which gives them a different
 //   symbol in each mode (GCC's and Clang's abi_tag). A test fails if a function that mentions a debug-check macro,
