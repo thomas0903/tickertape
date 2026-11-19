@@ -14,8 +14,26 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   exit 1 and `export stopped at sequence N: records N to M were removed from the journal (by retention or archiving)
   before export read them` (`record N was ... read it` for one), after the records before N (a Parquet file is
   finalized, as on corruption). The check that the output file is not a journal file no longer fails (exit 1, "stat
-  journal entry") on a segment removed while it walks the directory; it skips that entry unless the inode number in
-  its directory entry is the output's.
+  journal entry") on a segment removed while it walks the directory; it skips that entry unless the directory that
+  listed it is on the output's filesystem and the inode number in its directory entry is the output's.
+- Fix: `tickertape export` could exit 0 with records from a different history: if recovery replaced records the
+  startup scan had counted and the writer appended others with the same sequence numbers before the writing pass
+  read them (crash contract C8, C11), the writing pass exported the other records. Both passes now compute a
+  fingerprint of the records they read (sequence number, schema id, timestamps, payload length and bytes); when they
+  differ, export exits 1 with `journal changed during export: the records read differ from those the startup scan
+  counted; the output is not a consistent export`, after writing what the writing pass read (a Parquet file is
+  finalized).
+- Fix: `tickertape export` no longer creates or truncates the destination when it finds the failure before writing
+  the first record: a startup scan that failed before counting a record, and a first record that is gone by the time
+  the writing pass reads it (with `--durable-only`, retention after the writing pass's `seek`), used to leave an empty
+  file (or an empty Parquet file) with exit 1. The writing pass now reads its first record before opening the
+  destination.
+- Fix: `tickertape export --to T` with `T` below the oldest record read a record outside the range, so retention at
+  that moment turned an empty export (exit 0) into exit 1 naming records outside it; it now checks `--to` before
+  reading. With `--durable-only`, a checkpoint marker that became missing or invalid during the startup scan ended
+  the scan early and exported fewer records (or none) with exit 0; that is now exit 1 with `journal changed during
+  export: the checkpoint marker no longer covers records it covered when export started`, before the destination is
+  opened.
 - C++ binding (ADR 0036, `docs/cpp-api.md`): `crates/tickertape-ffi/include/tickertape.hpp`, a header-only C++17
   wrapper over the C ABI, shipped and installed (`cargo cinstall`) next to `tickertape.h`. It covers the whole C ABI:
   move-only `Writer`, `Reader`, option builders and `RecordBatch`; copying, zero-copy (a lambda) and batch appends

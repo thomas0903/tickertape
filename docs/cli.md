@@ -51,19 +51,38 @@ Errors and recovery warnings go to stderr. JSON results go to stdout (or the sel
   inclusive range; JSONL defaults to stdout and `--output -` also selects stdout for JSONL. The output file is created or
   truncated, but a path naming an existing journal entry (including via symlinks/hard links), or any path inside
   the journal, is rejected (an entry that retention removes while this check walks the directory is skipped, unless
-  the inode number in its directory entry is the output file's). `--to` must not precede `--from`.
-  A first safe-reader pass captures the committed end, then a second pass, starting at the record the first started
-  at, emits those records, never following subsequent appends. Under retention or archiving (crash contract C14),
-  a segment that recovery replaced or retention removed after a pass had read it loses nothing: the pass continues
-  at that position on the current chain. Records removed before a pass read them end the export with exit 1 and
-  `export stopped at sequence N: records N to M were removed from the journal (by retention or archiving) before
-  export read them`, after the records before N that the second pass had reached (a Parquet file is finalized). Corruption encountered in the selected startup scan is reported after the valid prefix
-  has been written. An empty journal exports no records. Parquet requires a file destination (missing
+  its directory is on the output file's filesystem and the inode number in its directory entry is the output file's).
+  `--to` must not precede `--from`.
+  A first safe-reader pass, the startup scan, counts the selected records. It stops at `--to`, at the first empty
+  slot it sees, or, with `--durable-only`, at the checkpoint bound described below; without `--to`, a visible scan
+  therefore also counts records the writer appends while it runs, for as long as the writer stays ahead of it. A
+  second pass, starting at the record the first started at, emits exactly the counted records, never following later
+  appends. Both passes compute a fingerprint of the records they read (sequence number, schema id, both timestamps,
+  payload length and bytes). If the second pass read different records than the scan counted (recovery replaced
+  records the scan had read and the writer appended others with the same sequence numbers; crash contract C8, C11),
+  the export ends with exit 1 and `journal changed during export: the records read differ from those the startup
+  scan counted; the output is not a consistent export`, after writing what the second pass read (a Parquet file is
+  finalized). Under retention or archiving (crash contract C14), a segment that retention removed after a pass had
+  read it loses nothing: the pass continues at that position on the current chain. It does the same after recovery
+  replaced the segment; records recovery replaced there are reported by the fingerprint check. Records removed before
+  a pass read them end the export with exit 1 and `export stopped at sequence N: records N to M were removed from the
+  journal (by retention or archiving) before export read them`. If the second pass finds fewer records than the scan
+  counted, it ends with exit 1 and `journal changed during export: captured records are no longer available`.
+  The destination is not created or truncated when the failure is found before the first record is written: a
+  startup scan that fails before counting a record reports its failure without opening the destination, and the
+  second pass reads its first record before opening it. A failure found after that leaves the records written before
+  it in the output, finalizes a Parquet file as a readable file, and exits 1 (2 for corruption or an unsupported
+  journal format, as below).
+  Corruption encountered in the selected startup scan is reported after the valid prefix has been written. An empty
+  journal or an empty selection exports no records, with exit 0. Parquet requires a file destination (missing
   `--output` or `-` returns 1). Parquet uses Snappy compression
   and row groups of at most 100,000 records. On corruption the valid prefix is finalized as a readable file
   before returning 2. Both formats share the startup scan and inclusive range semantics.
   `--durable-only` additionally caps both formats at the checkpoint marker's exclusive `next_seq` observed before
   the startup scan, even if the writer checkpoints again during export. With no valid marker the export is empty.
+  If the marker then stops covering records below that bound (it becomes missing or invalid) before the scan reaches
+  the bound or `--to`, whichever is lower, the export ends with exit 1 and `journal changed during export: the
+  checkpoint marker no longer covers records it covered when export started`, without opening the destination.
   Tail and export use the durability guarantee and storage assumptions in [crash contract C13](crash-contract.md)
   and [ADR 0010](decisions/0010-durable-only-reads.md); if the writer never checkpoints, neither exposes records.
 

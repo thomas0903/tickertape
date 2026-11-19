@@ -97,8 +97,9 @@ mod tests {
     /// Retention overtakes a durable-only tail four times in a row: each time the tail has sought to the oldest
     /// segment, retention removes it before the tail confirms that the segment is in place (after reading the
     /// checkpoint marker, ADR 0034), so the tail gets `Error::Discarded` and resumes again without returning a record
-    /// (warning on standard error each time, with the records skipped). Each resume follows a removal, so the loop
-    /// doesn't spin on its own: once retention stops, the tail returns the records still there and ends.
+    /// (warning on standard error each time, with the records skipped). Here each resume follows a removal (a
+    /// recovery that replaces the segment causes one too), so once retention stops, the tail returns the records still
+    /// there and ends.
     #[test]
     fn durable_only_tail_resumes_once_per_removal() {
         let dir = tempfile::tempdir().unwrap();
