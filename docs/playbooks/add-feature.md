@@ -13,7 +13,10 @@
    intrinsics) with `// SAFETY:` comments. The C ABI crate `crates/tickertape-ffi` is the one scoped exception (ADR
    0028): its `unsafe` blocks stay small, each has a `// SAFETY:` comment, and each `unsafe extern "C" fn` has a
    `# Safety` section. A feature that should reach C callers also needs the C function, a C test in
-   `crates/tickertape-ffi/tests/c/`, a regenerated header and an entry in `docs/c-api.md`.
+   `crates/tickertape-ffi/tests/c/`, a regenerated header and an entry in `docs/c-api.md`, and a decision for the
+   C++ binding (ADR 0036): wrap it in `include/tickertape.hpp` with a test in `tests/cpp/`, and list it in
+   `CPP_WRAPPED` in `tests/c_api.rs`, or list it in `CPP_NOT_WRAPPED` and ADR 0036 with the reason (the test fails
+   otherwise; a new status code or corruption reason needs a C++ enumerator in the same way).
 5. **Full check.** Run every command in `CONTRIBUTING.md` → "The checks CI runs", and the test suite on Linux too
    (`test-on-linux.md`).
 6. **Review.** Re-read your own diff. If the change touches `mmap.rs`, recovery, the format or the crash contract, get

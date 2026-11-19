@@ -1,6 +1,6 @@
 [package]
 name = "tickertape-ffi"
-description = "C ABI for tickertape: a shared and static library plus a C99/C++11 header (ADR 0028)"
+description = "C ABI for tickertape: a shared and static library plus a C99/C++11 header (ADR 0028) and a C++17 binding (ADR 0036)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -53,7 +53,8 @@ subdirectory = false
 generation = false
 
 [package.metadata.capi.install.include]
-asset = [{ from = "include/tickertape.h" }]
+# The C header, and the header-only C++ binding over it (ADR 0036).
+asset = [{ from = "include/tickertape.h" }, { from = "include/tickertape.hpp" }]
 
 [package.metadata.capi.pkg_config]
 name = "tickertape"
