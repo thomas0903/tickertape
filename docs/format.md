@@ -321,6 +321,22 @@ position. It would return a record that is not in the journal only if the new hi
 checksum and the expected sequence number at that position (ADR
 [0034](decisions/0034-durable-only-reads-check-segment-identity.md) → In-place repairs).
 
+An in-place repair can also remove a seal: when storage damage empties a seal's marker and its successor no longer
+opens, recovery zeroes what is left of the seal in place and moves the successor into `quarantine/` (crash contract
+C11, the known gap; ADR 0035 → Damage around a seal; then step 5). A reader may have read the seal before,
+and the safe reader may still hold it in its buffer. So a reader at a seal whose successor is missing while its own
+segment is still in place reads the slot again from the file before it reports a broken chain. If the seal is gone,
+it reads the slot as it is now: it waits there (`Ok(None)`) or returns the new history's record, without
+`Error::Discarded`, like any reader across an in-place repair. (In the repair named above the zeroing starts at the
+seal's own slot, so the reader's position starts a record of the new history. Where a repair that removed a seal began
+earlier in the segment, at an empty commit word with no committed history found after it, the reader's position can
+fall inside a new record, and it then waits or reports corruption there as described above.) If the seal is there, a
+live writer stored it only after linking its successor, so the reader tries the successor once more and reports
+`CorruptReason::BrokenChain` only if it is still missing. Such a report can be transient, and a later call then
+follows the successor: for example while a recovery replaces a successor whose header is damaged (it keeps the
+seal, moves that successor into `quarantine/` and then creates a new one), or after a power loss that kept the seal
+but not the successor's directory entry, until a writer opens and creates the successor.
+
 Until it checks, a visible reader may return records from a segment that recovery has just preserved and removed.
 Such records are like records lost to a power loss that a reader had already seen (`crash-contract.md` → C8). A
 durable-only reader never does (C13). A reader never moves from a removed history into the repaired one without

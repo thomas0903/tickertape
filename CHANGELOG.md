@@ -69,6 +69,19 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   and a library of another version is refused. Tested on Linux x86-64, Linux arm64 and macOS in a new CI job, including
   the cross-language fixtures and the released-format fixtures. Not published to Maven Central yet; the coordinates
   `io.github.thomas0903:tickertape` await the owner's confirmation.
+- Fixed: a visible reader no longer reports `CorruptReason::BrokenChain` for a seal that is no longer in the file.
+  When recovery repairs a tail in place, a seal can go with it while the successor is moved to `quarantine/`. The
+  safe reader could still hold the seal in its read buffer (a zero-copy reader could load it just before the damage
+  or the repair), follow it, find no successor while its own segment kept its identity, and report a broken chain on
+  a healthy journal on every call, until the new writer rolled to the same base again or the application seeked. A
+  reader at a seal whose successor it does not find now reads the slot again from the file, and reports a broken
+  chain only if the seal is still there and the successor is still missing at a second attempt. Found by
+  `reader_retention_stress::durable_readers_under_repairs` on CI (arm64 Linux and macOS, three times in one night),
+  where one zeroed commit word in a sealed segment caused such a repair; with ADR 0035 recovery replaces that
+  segment instead. In-place repairs that remove a seal remain (one is a seal's marker emptied in front of a
+  successor that no longer opens; another is a zeroed stretch from a record through the seal), and the reader now
+  handles them. A failed refill of the safe reader's buffer also drops the buffer, so the next call reads from the
+  file.
 - Library: dropping a `Writer` now releases the journal lock explicitly (`flock(LOCK_UN)`), after its helper threads
   have stopped and readers have been told it has gone, and so does a `Writer::open` that fails after taking the lock.
   Until now the lock was released only when the last copy of its descriptor closed, and a child that another thread
