@@ -230,8 +230,9 @@ read-only checks; the writer's report is about `X`, where the chain ends. So in 
 (only the seal's CRC word left, or other bytes with no higher-base segment) the writer and `verify` agree on the
 reason and the position. They do not in the two it leaves alone: with other bytes and a higher-base segment the
 writer reports `EmptyCommitWord` for that segment's base at `P` where `verify` reports `BrokenChain`, and with
-nothing non-zero after `P` a refusing writer reports `BrokenChain` at the successor's offset 0 where `verify` reports
-it at `P`.
+nothing non-zero after `P` a refusing writer reports `BrokenChain` at offset 0 of the first disconnected segment
+(that successor, unless a segment with a lower base is disconnected too, which is then named) where `verify`
+reports `BrokenChain` for the expected sequence number at `P`.
 
 `verify` reports `BrokenChain` at `P` in every case of this paragraph where the search of `X` finds nothing, and a
 problem at the successor only when it fails `verify`'s own read-only checks (a segment the writer cannot open
@@ -439,8 +440,8 @@ time it takes to read the tail. A repair costs writing the quarantine copy and t
 - What `Fail` does not promise: it does not change the bytes of the corruption it reports, nor anything after them in
   that segment, and moves no file, but the open is not read-only. Before scanning it creates the lock file if it is
   missing and writes its PID into it (best effort), removes stale temporary names (`*.tape.tmp`, the prepared spare),
-  and creates the checkpoint file if it is missing (a marker shorter than its full length is left as it is: only a
-  successful checkpoint extends it), so a refused open can still have changed those files. When it refuses, the changes recovery made earlier in the scan stay in
+  and creates the checkpoint file if it is missing (an open leaves a marker shorter than its full length as it is),
+  so a refused open can still have changed those files. When it refuses, the changes recovery made earlier in the scan stay in
   place: the clean-ups a process crash needs (a zeroed torn tail, a seal written for a crash between publishing a
   successor and sealing, for example in segment `X` when the corruption is in its successor, a created missing
   successor), and the zeroing at an empty commit word where the search completed without evidence, which after
