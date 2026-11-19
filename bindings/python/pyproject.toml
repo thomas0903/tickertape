@@ -51,6 +51,8 @@ locked = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+# Journals preallocate their segments (128 MiB by default): keep temporary directories only for failed tests.
+tmp_path_retention_policy = "failed"
 
 [tool.mypy]
 strict = true
