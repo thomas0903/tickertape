@@ -172,8 +172,10 @@ The Linux libraries are built for glibc.
   - `appendWith` whose filler uses `set`, `setByte`, `put(byte[])`, `put(MemorySegment)` (native or heap), or
     `put(ByteBuffer)` of a heap buffer, or of a direct or read-only heap buffer that is the same as in the previous
     `put` of its kind. The writer remembers the last direct and the last read-only buffer (one of each, so
-    alternating the two is fine), and keeps them reachable until others replace them or it is closed; the first copy
-    from another buffer of a kind allocates a small object.
+    alternating the two is fine), and keeps them reachable until others replace them or it is closed (close a
+    writer you are done with: the `Cleaner` is a backstop, and it cannot free an unclosed writer that a remembered
+    buffer's own clean-up action refers back to); the first copy from another buffer of a kind allocates a small
+    object.
   - `AppendBatch.add` with a `byte[]`, a native or heap `MemorySegment`, or a direct or heap `ByteBuffer`, while the
     batch does not grow; a batch that grows allocates, so size it up front or let it grow once and reuse it. For a
     direct buffer this holds only up to a payload capacity of `Integer.MAX_VALUE - 8` bytes (above it, each such

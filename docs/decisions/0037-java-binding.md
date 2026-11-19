@@ -215,8 +215,12 @@ records, or records encoded field by field). Both allocate nothing per record.
   reaches the payload buffer; so the writer keeps its cache (`BufferCache`) itself and lends it to the payload buffer
   only for the length of each `appendWith`, and `close()` drops it. A dropped writer and its cached buffer then form at
   most a cycle the collector frees (the first version kept the cache in the payload buffer, where it kept a dropped
-  writer, and its journal's lock, for ever; `LifetimeTest` covers both this and a reader's view). A view's cache is
-  reachable only from the view, whose reader or batch no global root reaches. CI pins Temurin `25.0.5`, which
+  writer, and its journal's lock, for ever; `LifetimeTest` covers both this and a reader's view). One case is left,
+  and it is the caller's own root, not the binding's: a remembered buffer whose memory belongs to an automatic arena
+  (`Arena.ofAuto()`) with a clean-up action that refers to the writer. The JDK's cleaner holds that action until the
+  arena is unreachable, so an unclosed writer that still remembers such a buffer is not collected; `close()` drops
+  the cache and ends it. A view's cache is reachable only from the view, whose reader or batch no global root
+  reaches. CI pins Temurin `25.0.5`, which
   resolves to 25.0.5+8 on Linux and to the macOS-only respin 25.0.5.1+2 on macOS; the test no longer depends on which.
 
 **Value types.** A C struct that carries `struct_size` is designed to grow: later versions append fields
