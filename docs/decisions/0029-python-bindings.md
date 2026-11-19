@@ -113,6 +113,14 @@ requests or branches. The one-time setup is in `docs/playbooks/release-checklist
 
 ## Consequences
 
+- Relation to [ADR 0031](0031-bindings-and-install-channels.md) (accepted the same day). Its criteria for a delivered
+  binding are met as follows: the record and replay surface, mapped errors, documented ownership, the shared
+  cross-language fixtures, a runnable example, and an install test of every built wheel on every supported platform.
+  Its version rule ties bindings to the C ABI's version; these bindings use the Rust API, so their version follows
+  the workspace version (checked by `release.py prepare`) and they declare no C ABI dependency. Wheels carry
+  maturin's CycloneDX SBOM. With Trusted Publishing, the PyPI publish action uploads PEP 740 attestations by default.
+  The CLI wheel that ADR 0031 also plans for PyPI can be added to `python-wheels.yml` later, with its own pending
+  publisher.
 - Python users can write, follow live and replay journals, and hand batches to NumPy, pandas, pyarrow or DuckDB.
 - Each release must bump `bindings/python/Cargo.toml` and refresh its lockfile along with the workspace.
 - A second lockfile to keep up to date; CI runs `cargo deny` on it too.
