@@ -1014,6 +1014,127 @@ pub(crate) fn try_lock_exclusive(file: &File) -> io::Result<bool> {
     }
 }
 
+/// Releases the `flock` held through `file`'s open file description.
+///
+/// The lock belongs to the description, not the descriptor: closing the descriptor releases it only once every copy
+/// is closed, and a child forked by any thread holds a copy until it calls `exec` or exits. Unlocking releases it at
+/// once, for every process sharing the description, so only the process that took the lock may call this.
+pub(crate) fn unlock(file: &File) -> io::Result<()> {
+    // SAFETY: flock on a valid descriptor has no memory-safety preconditions.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(last_os_error())
+    }
+}
+
+/// Test helper: a forked child that has not called `exec`, holding copies of all of this process's descriptors.
+#[cfg(test)]
+pub(crate) mod forked {
+    use std::fs::File;
+    use std::io::{self, Write};
+    use std::os::unix::io::FromRawFd;
+    use std::sync::Mutex;
+
+    /// Held by tests while their forked child exists, and by tests that rely on closing a descriptor to release a
+    /// lock (the child holds a copy of every descriptor this process had at the fork).
+    pub(crate) static LOCK: Mutex<()> = Mutex::new(());
+
+    /// A forked child. It runs a closure, then waits until it is released (or this process exits), then exits.
+    #[derive(Debug)]
+    pub(crate) struct Child {
+        pid: libc::pid_t,
+        release: Option<File>,
+    }
+
+    /// Forks; the child calls `in_child` (on its copy of this process's memory), then blocks reading a pipe until
+    /// [`Child::wait`] or the handle's drop releases it, or until this process exits, and leaves with `_exit`: status
+    /// 0, or 101 if `in_child` panicked. The child never returns into the test harness and runs no exit handlers.
+    ///
+    /// The child of a multithreaded process may call only async-signal-safe functions. Waiting does (`close`,
+    /// `read`, `_exit`); `in_child` is the caller's responsibility (allocating relies on the system allocator
+    /// reinitialising its locks in the child, which glibc's and macOS's do).
+    pub(crate) fn fork(in_child: impl FnOnce()) -> io::Result<Child> {
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: `fds` is a valid array of two descriptors for `pipe` to fill.
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+            return Err(super::last_os_error());
+        }
+        let [read_fd, write_fd] = fds;
+        for fd in fds {
+            // SAFETY: fcntl on a descriptor we just created. Close-on-exec keeps the pipe out of other tests' children
+            // once they exec (they could inherit it before the flag is set; that only delays their EOF, not ours).
+            unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+        }
+        // SAFETY: `fork` has no memory-safety preconditions. The child below only runs `in_child` (see the function
+        // documentation) and async-signal-safe calls, and leaves with `_exit` without returning.
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            let err = super::last_os_error();
+            // SAFETY: both descriptors are ours and still open.
+            unsafe {
+                libc::close(read_fd);
+                libc::close(write_fd);
+            }
+            return Err(err);
+        }
+        if pid == 0 {
+            let status = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(in_child)) {
+                Ok(()) => 0,
+                Err(_) => 101,
+            };
+            let mut byte = 0_u8;
+            // SAFETY: the child's own copies of the pipe. Closing the write end first lets `read` see EOF if the parent
+            // dies, so the child never outlives it for long; `_exit` leaves without unwinding or running exit
+            // handlers.
+            unsafe {
+                libc::close(write_fd);
+                libc::read(read_fd, (&raw mut byte).cast(), 1);
+                libc::_exit(status);
+            }
+        }
+        // SAFETY: the parent's copy of the read end, which it does not use.
+        unsafe { libc::close(read_fd) };
+        Ok(Child {
+            pid,
+            // SAFETY: `write_fd` is open and owned by nothing else in this process.
+            release: Some(unsafe { File::from_raw_fd(write_fd) }),
+        })
+    }
+
+    impl Child {
+        /// Releases the child and returns its exit status (`None` if it did not exit normally).
+        pub(crate) fn wait(mut self) -> Option<i32> {
+            self.reap()
+        }
+
+        fn reap(&mut self) -> Option<i32> {
+            let mut release = self.release.take()?;
+            let _ = release.write_all(&[1]);
+            drop(release);
+            let mut status = 0;
+            loop {
+                // SAFETY: waits for our own child; `status` is a valid out-pointer.
+                let rc = unsafe { libc::waitpid(self.pid, &mut status, 0) };
+                if rc == self.pid {
+                    break;
+                }
+                if rc < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                    return None;
+                }
+            }
+            libc::WIFEXITED(status).then(|| libc::WEXITSTATUS(status))
+        }
+    }
+
+    impl Drop for Child {
+        fn drop(&mut self) {
+            self.reap();
+        }
+    }
+}
+
 /// Reserves disk blocks for the first `len` bytes of `file` and sets its size to `len`, so that later writes into
 /// that range don't need new blocks (modulo copy-on-write filesystems; see the crash contract).
 pub(crate) fn preallocate(file: &File, len: u64) -> io::Result<()> {
@@ -1278,6 +1399,7 @@ mod tests {
 
     #[test]
     fn lock_is_exclusive_across_handles() {
+        let _forked = forked::LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("lock");
         let a = File::create(&path).unwrap();
@@ -1289,6 +1411,25 @@ mod tests {
         );
         drop(a);
         assert!(try_lock_exclusive(&b).unwrap());
+    }
+
+    /// Closing one descriptor of a locked open file description keeps the lock while another descriptor of it is
+    /// open (as in a child forked before `exec`); `unlock` releases it for all of them.
+    #[test]
+    fn unlock_releases_a_lock_that_a_copied_descriptor_still_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lock");
+        let a = File::create(&path).unwrap();
+        let copy = a.try_clone().unwrap();
+        let other = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        assert!(try_lock_exclusive(&a).unwrap());
+        drop(a);
+        assert!(
+            !try_lock_exclusive(&other).unwrap(),
+            "the copy still holds the lock"
+        );
+        unlock(&copy).unwrap();
+        assert!(try_lock_exclusive(&other).unwrap());
     }
 
     #[test]

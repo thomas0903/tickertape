@@ -350,7 +350,8 @@ function catches panics and returns `TICKERTAPE_E_PANIC` (the library must be bu
   async-signal-safe functions until it calls `exec`, and opening a handle allocates memory: so a child opens its own
   handles only after `exec`, and a child that does not `exec` must not call any tickertape function. The library
   opens files with close-on-exec, so `exec` releases an inherited writer lock, but a child that neither execs nor
-  exits keeps the journal locked.
+  exits keeps the journal locked once the parent has exited. Closing the writer in the parent releases the lock even
+  while such a child exists.
 
 ## Inspection and retention
 

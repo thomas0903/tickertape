@@ -17,8 +17,12 @@ use crate::record::NewRecord;
 
 /// The only process allowed to append to a journal.
 ///
-/// Holds an exclusive `flock` on `writer.lock` for as long as it lives; the OS releases it when the process exits
-/// or dies, so a crashed writer never leaves a stale lock. `Writer` is `Send` but not `Sync`: appends take `&mut self`.
+/// Holds an exclusive `flock` on `writer.lock` for as long as it lives. Dropping the writer in the process that
+/// opened it releases the lock, after the writer's helper threads have stopped, so the journal can be reopened at
+/// once, by this or another process. If the process exits or dies instead, the OS releases the lock, so a crashed
+/// writer never leaves a stale lock; a child the process forked just before and that has not yet called `exec` (or
+/// exited) then holds it until it does. A forked child that drops its copy of a writer does not release the lock,
+/// which stays with the parent. `Writer` is `Send` but not `Sync`: appends take `&mut self`.
 ///
 /// The writer maps the segments it writes. Another process writing into or truncating those files is outside the
 /// contract and can crash or corrupt this process (see `docs/crash-contract.md` → Readers, the writer and memory
@@ -31,7 +35,9 @@ pub struct Writer {
     dir: PathBuf,
     config: WriterConfig,
     /// Holds the `flock` for the writer's lifetime.
-    _lock: File,
+    lock: File,
+    /// The process that took the lock: only it may unlock (a forked child shares the lock's open file description).
+    lock_pid: u32,
     active: Segment,
     /// Offset of the next record in `active`.
     offset: u64,
@@ -161,7 +167,8 @@ impl Writer {
         let mut writer = Writer {
             dir,
             config,
-            _lock: lock,
+            lock,
+            lock_pid: std::process::id(),
             active_dirty_from: state.active_dirty_from,
             offset: state.offset,
             next_seq: state.next_seq,
@@ -536,6 +543,16 @@ impl Drop for Writer {
         if let Some(Ok(Ok(spare))) = self.spare.take().map(|h| h.join()) {
             drop(spare);
             let _ = fs::remove_file(self.dir.join(journal::SPARE_FILE));
+        }
+        // Stop the helper and tell waiting readers that this writer has gone while it still holds the lock, so that a
+        // new writer never overlaps them.
+        drop(self.prefault.take());
+        drop(self.notify.take());
+        // Release the lock explicitly: closing the descriptor (when the fields drop) would not release it while a
+        // child forked by another thread still holds a copy of it before `exec`. Only in the process that took it: in a
+        // forked child the lock still protects the parent's writer. The remaining fields only unmap and close.
+        if self.lock_pid == std::process::id() {
+            let _ = mmap::unlock(&self.lock);
         }
     }
 }
@@ -1188,4 +1205,69 @@ pub enum RecoveryAction {
         /// The removed file.
         file: PathBuf,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mmap::forked;
+
+    fn append_one(writer: &mut Writer) {
+        writer
+            .append(&NewRecord {
+                schema_id: 1,
+                venue_ts_ns: 0,
+                local_ts_ns: 0,
+                payload: b"x",
+            })
+            .unwrap();
+    }
+
+    /// A child forked while the writer is open (here by this test; in practice by any thread spawning a process)
+    /// shares the lock's open file description until it calls `exec`. Dropping the writer must still release the
+    /// lock at once, so the journal can be reopened while that child exists.
+    #[test]
+    fn drop_releases_the_lock_while_a_forked_child_holds_a_copy() {
+        let _forked = forked::LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let config = WriterConfig::default().segment_size(1 << 20);
+        let mut writer = Writer::open(dir.path(), config.clone()).unwrap();
+        append_one(&mut writer);
+        let child = forked::fork(|| {}).unwrap();
+        drop(writer);
+        let reopened = Writer::open(dir.path(), config);
+        assert_eq!(child.wait(), Some(0));
+        assert_eq!(
+            reopened
+                .expect("the dropped writer's lock must not wait for the forked child")
+                .next_seq(),
+            1
+        );
+    }
+
+    /// A forked child that drops its copy of the writer must leave the lock with the parent, whose writer is still
+    /// open: unlocking the shared open file description would let a second writer in.
+    #[test]
+    fn a_forked_child_dropping_its_copy_keeps_the_parents_lock() {
+        let _forked = forked::LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        // No helper threads or wake-up region, which a child must not touch: only the lock is under test.
+        let config = WriterConfig::default()
+            .segment_size(1 << 20)
+            .prefault(false)
+            .notify(false);
+        let mut writer = Some(Writer::open(dir.path(), config.clone()).unwrap());
+        append_one(writer.as_mut().unwrap());
+        let child = forked::fork(|| drop(writer.take())).unwrap();
+        // The child has dropped its copy and exited, closing its descriptors.
+        assert_eq!(child.wait(), Some(0));
+        match Writer::open(dir.path(), config.clone()) {
+            Err(Error::Locked { pid, .. }) => assert_eq!(pid, Some(std::process::id())),
+            other => panic!("expected Locked while the parent's writer is open, got {other:?}"),
+        }
+        let mut writer = writer.unwrap();
+        append_one(&mut writer);
+        drop(writer);
+        assert_eq!(Writer::open(dir.path(), config).unwrap().next_seq(), 2);
+    }
 }

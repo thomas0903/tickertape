@@ -28,6 +28,11 @@ pub enum Error {
     },
 
     /// Another writer holds the journal's lock.
+    ///
+    /// A writer releases the lock when it is dropped in the process that opened it, or when that process exits or
+    /// dies. In the last two cases a child the process had just forked and that has not yet called `exec` or exited
+    /// keeps the lock until it does, so a writer opened right after the process ended can briefly see this error
+    /// (see `docs/crash-contract.md` → C3 and Known risks and limits).
     #[error("journal {} is locked by another writer (pid {pid:?})", dir.display())]
     Locked {
         /// The journal directory.
