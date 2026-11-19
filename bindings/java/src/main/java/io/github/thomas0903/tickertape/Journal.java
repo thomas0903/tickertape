@@ -27,7 +27,9 @@ public final class Journal {
     /**
      * Checks every segment in {@code dir}: every header, record and seal, and the chain between segments. Corruption
      * is reported in the result ({@link VerifyReport#problems()}), not thrown. Uncommitted bytes after the end of the
-     * newest segment are not a problem. The newest segment may grow during the scan.
+     * newest segment are not a problem. The newest segment may grow during the scan. A segment roll by an active writer
+     * during the scan can be reported as a {@link CorruptReason#BROKEN_CHAIN} problem that is not there (a limitation
+     * of the library's live scan), so verify again before treating that as corruption.
      *
      * @throws JournalNotFoundException if {@code dir} has no segments
      * @throws JournalIoException if reading fails (with {@code ENOENT} if {@code dir} does not exist)

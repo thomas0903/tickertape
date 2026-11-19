@@ -66,13 +66,16 @@ On the module path the module is `io.github.thomas0903.tickertape` and the flag 
 
 The first library found must be compatible or loading fails with an `UnsatisfiedLinkError` that says what was tried
 and why; the binding never falls back to a later candidate after a failure. `Tickertape.librarySource()` tells you
-where the library came from.
+where the library came from. So a natives JAR on the class path wins over `-Djava.library.path`, and
+`-Dtickertape.library.path=<file>` (or `Tickertape.loadLibrary`) selects one specific build over both, for example a
+library you built yourself.
 
 **The natives JAR.** `tickertape-<version>-natives-<platform>.jar` (`linux-x86_64`, `linux-aarch64`,
 `macos-aarch64`, `macos-x86_64`) carries the library and its SHA-256. The binding extracts it into a new directory
 with a random name that only the current user can read (under `java.io.tmpdir`, or `-Dtickertape.library.extractDir`
 if the temporary directory does not allow executable files), checks the hash, loads it, and deletes the file and the
-directory at once. Build it with:
+directory at once. If the extracted library fails to load although its hash matched (typically a `noexec` temporary
+directory), the error names `-Dtickertape.library.extractDir`. Build it with:
 
 ```bash
 bindings/java/scripts/stage-natives.sh target/release linux-x86_64
@@ -100,7 +103,7 @@ The Linux libraries are built for glibc.
 |---|---|---|
 | `Writer` | `Writer.open` | `close()` |
 | `Reader` | `Reader.open`, `Reader.openMappedUnsafe` | `close()` |
-| `RecordView` | returned by `tryNext`, `next`, `ReadBatch.get` | nothing to release; valid until the next call |
+| `RecordView` | returned by `tryNext`, `next`, `ReadBatch.get` | nothing to release; valid until the next call (reader) or read (batch) |
 | `AppendBatch`, `ReadBatch` | constructors | garbage collected (they own only memory) |
 
 - Writers and readers are `AutoCloseable`; use try-with-resources. `close()` is idempotent. A writer or reader that
@@ -111,16 +114,28 @@ The Linux libraries are built for glibc.
   reader is closed. Every accessor checks this and throws `IllegalStateException` on a view that is no longer valid.
   Copy what you need to keep: `copy()` (a `RecordCopy`), `payloadToArray()`, or `copyPayloadTo(byte[] | ByteBuffer |
   MemorySegment)`.
+- **Views read only memory the JVM keeps alive.** A reader's view reads the payload through a segment in the reader's
+  shared arena, which `close()` closes before it frees the reader; closing waits for an access in progress on any
+  thread, and every later access throws `IllegalStateException`. So `close()` from another thread is safe while a
+  consumer reads the current view (`CloseRaceTest` races the two, for both readers). A view also holds its reader or
+  batch strongly, so neither is garbage collected, or cleaned, while one of its views is still in use.
 - **Reading a payload in place.** Typed reads take a layout, as `MemorySegment` does:
   `view.get(ValueLayout.JAVA_LONG_UNALIGNED, 8)`. Payloads have no alignment guarantee, so use the `_UNALIGNED`
   layouts (in native byte order, or with `withOrder`). For code that needs a `MemorySegment`,
-  `view.withPayload(segment -> ...)` passes a read-only segment that is closed when the action returns, so it cannot
-  outlive the record; the action must not use the reader.
-- **Batches.** A `ReadBatch` holds the records of one `readBatch` call in its own memory; `get(i)` returns its one
-  reusable view, valid until the batch is filled again. An `AppendBatch` copies payloads in when they are added; reuse
-  it with `clear()`.
-- **Allocation.** Once warm, appends (all forms), `appendWith`, `appendBatch`, `tryNext`, a timed `next` that finds a
-  record, `readBatch` and the view accessors allocate nothing on the Java heap (`AllocationTest` checks this).
+  `view.withPayload(segment -> ...)` passes a read-only segment, confined to the calling thread, that is closed when
+  the action returns, so it cannot outlive the record. Meanwhile the reader refuses other calls, so the action must
+  not use the reader, and a `close()` from another thread waits for the action to return.
+- **Batches.** A `ReadBatch` holds the records of one `readBatch` call in its own memory. `get(i)` returns the batch's
+  view of record `i`: one view object per index, so `get(0)` and `get(1)` can be used side by side and never alias.
+  The first `get` of an index creates its view; every later read reuses it. All views are valid until the batch is
+  filled again (then they throw until `get` positions them again), and they stay readable after the reader is closed,
+  since the memory is the batch's. An `AppendBatch` copies payloads in when they are added; reuse it with `clear()`.
+- **Allocation.** Once warm, these allocate nothing on the Java heap: appends (all forms), `appendWith` (with every
+  `PayloadBuffer` writer except `segment()`, including `put(ByteBuffer)` from heap and direct buffers),
+  `appendBatch`, `tryNext`, `next()` and a timed `next` that find a record, `tryReadBatch` and a timed `readBatch`,
+  `ReadBatch.get` for an index used before, and the view accessors, including `copyPayloadTo` a heap or direct
+  `ByteBuffer`. `AllocationTest` measures each of these. `withPayload`, `PayloadBuffer.segment()` and the copying
+  methods that return new objects (`copy()`, `payloadToArray()`) allocate.
 
 ## Writing
 
@@ -150,7 +165,10 @@ try (Writer writer = Writer.open(Path.of("/data/journal"), options)) {
   nothing is committed, the writer zeroes and syncs the reserved bytes (slow, so aborting is for exceptional cases),
   and `appendWith` throws `FillAbortedException` with your exception as its cause. If that sync fails, it throws a
   `JournalIoException` instead: a storage incident, after which the writer refuses appends and checkpoints (see
-  [`c-api.md`](c-api.md#a-failed-clean-up-after-an-aborted-fill)). The filler must not call its writer.
+  [`c-api.md`](c-api.md#a-failed-clean-up-after-an-aborted-fill)). The filler must not call its writer. The
+  `PayloadBuffer` belongs to the filler's thread: on any other thread each of its methods (and its `segment()`) throws
+  `WrongThreadException`, and after the filler returns, `IllegalStateException`. Nothing a filler does, including
+  handing the buffer to another thread, can make an exception escape the upcall.
 - `appendBatch` appends an `AppendBatch` with one call into the library. Every record is checked first, so an argument
   error appends nothing; if an append fails part-way, the records before it stay appended and
   `BatchAppendException.appended()` says how many. Retry from that index.
@@ -206,6 +224,12 @@ if the thread was interrupted meanwhile: the interrupt status then stays set, an
 blocking call on an already interrupted thread throws before doing anything. `tryNext()` and `tryReadBatch()` never
 wait and ignore the interrupt status.
 
+The slice has two costs. A reader blocked with nothing to read returns to Java once per slice, about 100 times a
+second at 10 ms, and each new slice starts the library's back-off again (its spins and yields); and an interrupt or a
+close can take up to one slice to be noticed. The slice does not delay records: with `notify` on (the default) a new
+record wakes the waiting reader at once. A longer slice saves wake-ups and notices interrupts later; a shorter one the
+reverse.
+
 ## Durability
 
 The binding uses the crash contract's two levels ([`crash-contract.md`](crash-contract.md)):
@@ -247,7 +271,8 @@ Every error from the library is a `TickertapeException` (unchecked), with one su
 | `TickertapeException` | `UNKNOWN` | A code this binding does not know; `code()` has it |
 
 `status()` and `code()` give the status on every exception; `BatchAppendException` reports a partial batch append. The
-`Status` and `CorruptReason` enums carry the C values and names. Mistakes Java can detect itself are the usual
+`Status` and `CorruptReason` enums carry the C values and names. Both may gain constants in minor releases (as the C
+ABI may add codes and reasons), so a `switch` over them needs a `default` branch. Mistakes Java can detect itself are the usual
 `NullPointerException`, `IllegalArgumentException`, `IndexOutOfBoundsException` and `IllegalStateException` (a closed
 writer or reader, a view that is no longer valid, concurrent use), thrown before the library is called.
 
@@ -256,14 +281,33 @@ the same thread, so they are reliable on platform and virtual threads alike.
 
 ## Threading
 
-- A `Writer` or `Reader` is used by one thread at a time. It may be handed to another thread between calls, with the
-  usual happens-before (an executor, a lock, a queue). The binding checks this on every call with one atomic
-  compare-and-set: a call that finds the handle in use by another thread, or closed, throws `IllegalStateException`
-  and does nothing. So misuse is an exception, never a crashed JVM.
-- `close()` may be called from any thread. It waits for a call in progress to finish (a blocked read ends within one
-  wait slice), then frees the handle.
-- Views follow their reader: use them on the thread that is using the reader. The binding cannot detect another thread
-  closing or advancing the reader while you read a view.
+- A `Writer` or `Reader` is used by one thread at a time, and a reader's views with it. It may be handed to another
+  thread between calls, with the usual happens-before (an executor, a lock, a queue). The binding checks this on every
+  call with one atomic compare-and-set: a call that finds the handle in use by another thread, or closed, throws
+  `IllegalStateException` and does nothing.
+- `close()` may be called from any thread, also while another thread blocks in a read or reads the current view. It
+  waits for a call in progress to finish (a blocked read ends within one wait slice), ends every access to the
+  reader's views, then frees the handle. A second `close()` running at the same time waits for the first, so when any
+  `close()` returns the handle is freed and, for a writer, the journal can be opened again.
+
+What the binding turns into an exception, on any thread (`IllegalStateException` unless stated):
+
+- any call on a closed writer or reader, a call while another thread is inside a call on the same handle, and a call
+  (or `close()`) from inside a filler or a `withPayload` action into its own handle;
+- any use of a reader's view after the next call on the reader or after `close()`, including a `close()` on another
+  thread while the view is being read (the access in progress completes; every later one throws);
+- any use of a batch's view after the batch is filled again;
+- a `PayloadBuffer` or its `segment()` after the filler returned, or on another thread (`WrongThreadException`), and a
+  `withPayload` segment after the action returned, or on another thread (`WrongThreadException`).
+
+What it cannot detect, and is undefined:
+
+- reading a reader's view on one thread while another thread advances the same reader (a read or `seek`): the view
+  can show bytes of another record or of memory the reader has released, and with the mapped reader that can crash
+  the JVM. This breaks the one-thread-at-a-time rule above;
+- using an `AppendBatch` or a `ReadBatch` from two threads at once (they are not thread-safe);
+- breaking the mapped reader's precondition (see [Reading](#reading)): a truncated segment file kills the JVM with
+  `SIGBUS`.
 - Separate readers are independent and can run on separate threads and processes. `Journal`'s functions can be called
   from any thread, also while a writer is active.
 - A writer starts a background helper thread by default (prefaulting, and on macOS preparing the next segment);
@@ -276,7 +320,12 @@ the same thread, so they are reliable on platform and virtual threads alike.
 ## Inspection and retention
 
 - `Journal.verify(dir)` checks every segment and returns a `VerifyReport` (records, sequence range, problems and the
-  first one). Corruption is in the report, not thrown.
+  first one). Corruption is in the report, not thrown. Beside an active writer, a segment roll during the scan can be
+  reported as a `BROKEN_CHAIN` problem that is not there (a limitation of the library's live scan): verify again
+  before treating it as corruption.
+- `VerifyReport` and `RetentionReport` are final classes with accessor methods, not records, because their C structs
+  can gain fields in later versions; `Checkpoint`, `SegmentInfo` and `RecordCopy` are records, since their structs are
+  frozen.
 - `Journal.listSegments(dir)` lists the segments; `Journal.readCheckpoint(dir)` reads the checkpoint marker (empty if
   there is none).
 - Retention (ADR 0016) removes a sealed, checkpoint-covered prefix of old segments. Build `Retention.delete()` or

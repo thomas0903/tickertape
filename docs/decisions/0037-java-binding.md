@@ -40,9 +40,12 @@ written at the same time, so this one takes 0037.
 mapped segment; a reserve/commit pair does not exist (ADR 0028 explains why). So the choice is between exposing the
 callback, through an FFM upcall, and offering only copying appends.
 
-**Record views.** A view must not be readable after the reader moves on: for a mapped reader the memory may be unmapped
-(a crash, not an exception). FFM can enforce lifetimes only through arenas, and an arena per record allocates; a
-generation counter checked on every access allocates nothing but cannot cover a `MemorySegment` handed out.
+**Record views.** A view must not be readable after the reader moves on or is closed: for a mapped reader the memory
+may be unmapped (a crash, not an exception). FFM can enforce lifetimes only through arenas. An arena per record
+allocates. A generation counter checked on every access allocates nothing, but it cannot cover a `MemorySegment`
+handed out, and it cannot stop an access that has already passed the check when another thread closes the reader (the
+first review of this binding crashed the JVM that way). One shared arena per reader, closed before the reader is freed,
+allocates nothing per record and does cover that case: closing a shared arena waits for every access in progress.
 
 **Errors.** Checked (`IOException` subclasses, like `java.nio.file`) or unchecked (like Chronicle Queue and Aeron).
 
@@ -71,9 +74,9 @@ warns about; the warning is suppressed on the module declaration.
 - `WriterOptions`, `ReaderOptions` and `Retention` are immutable Java values (each setter returns a new value) that the
   binding turns into the C option builders inside `open` and frees at once, so no option handle has a Java lifetime.
   `ReaderOptions.waitSlice` is the binding's own option (see Interruption).
-- `Journal.verify`, `listSegments`, `readCheckpoint`, `applyRetention` (with dry run) return records (`VerifyReport`,
-  `SegmentInfo`, `Checkpoint`, `RetentionReport`). `Tickertape` has the versions, `loadLibrary(Path)`,
-  `librarySource()` and `realtimeNs()`.
+- `Journal.verify`, `listSegments`, `readCheckpoint`, `applyRetention` (with dry run) return value objects
+  (`VerifyReport`, `SegmentInfo`, `Checkpoint`, `RetentionReport`; see Value types). `Tickertape` has the versions,
+  `loadLibrary(Path)`, `librarySource()` and `realtimeNs()`.
 - Unsigned C fields are Java `long` and `int` with the same bits (as Aeron and Agrona do); the docs point to
   `Long.toUnsignedString` and `Integer.toUnsignedLong`.
 
@@ -90,14 +93,23 @@ differ. Not wrapped:
 | `tickertape_corrupt_reason_name` | `CorruptReason.cName()`, likewise. |
 
 **Zero-copy append: the callback, through one upcall stub per writer.** `appendWith` takes a `PayloadFiller`, a
-functional interface whose `fill(PayloadBuffer)` may throw. The writer creates its upcall stub on first use (bound to the
-writer, in an automatic arena) and reuses it. The upcall target catches every `Throwable` and returns non-zero, so
-nothing ever unwinds through native frames (an exception escaping an FFM upcall terminates the JVM); after the call,
-`appendWith` throws `FillAbortedException` with the filler's exception as its cause (an `Error` is rethrown as it is),
-or, if the abort's clean-up failed, the library's `JournalIoException` with the filler's exception as its cause. The
-`PayloadBuffer` is one object per writer, valid only while the filler runs: it writes through checked offsets into the
-mapped bytes, and `segment()` hands out a `MemorySegment` whose confined arena closes when the filler returns. A call
-into the writer from inside the filler is refused by the binding's guard (see Threads), which aborts the append.
+functional interface whose `fill(PayloadBuffer)` may throw. The writer creates its upcall stub on first use and reuses
+it. The stub is bound to a small context object (the filler of the append in progress, what it threw, the payload
+buffer) that never references the writer, and lives in a shared arena that the writer's handle closes right after the
+C writer is freed, by `close()` or by the Cleaner. An upcall stub keeps its target reachable from a global root until
+its arena closes, so a stub bound to the writer (the first version) kept every writer that had used `appendWith`
+alive forever: never cleaned, its journal locked for the life of the process. The upcall target runs everything, the
+payload buffer's clean-up included, inside a catch of `Throwable`, records what it caught inside another, and returns
+non-zero; so nothing ever unwinds through native frames (an exception escaping an FFM upcall terminates the JVM).
+After the call, `appendWith` throws `FillAbortedException` with the filler's exception as its cause (an `Error` is
+rethrown as it is), or, if the abort's clean-up failed, the library's `JournalIoException` with the filler's exception
+as its cause. The `PayloadBuffer` is one object per writer, valid only on the thread running the filler and only while
+it runs: it records that thread when the fill begins, and every method throws `WrongThreadException` on any other
+thread and `IllegalStateException` after the filler returned. It writes through checked offsets into the mapped bytes,
+and `segment()` hands out a `MemorySegment` whose confined arena, created on the filler's thread, closes when the
+filler returns. (Without the thread check, `segment()` called on a helper thread created the arena there, and the
+upcall's clean-up then failed to close it, which ended the JVM.) A call into the writer from inside the filler is
+refused by the binding's guard (see Threads), which aborts the append.
 
 We measured the upcall informally (`UpcallCostTest`, run on request; not under the benchmark rules, so no numbers here):
 it adds a fixed cost per append, of the same order as a small copying append. So `append` stays the default for small
@@ -111,29 +123,66 @@ records, or records encoded field by field). Both allocate nothing per record.
   while its call is still in the library.
 - `next` and friends return a `RecordView`: the **same object every time** (no allocation per record), valid until the
   next call on the reader other than `position()`, or until close. Validity is a generation counter that every reader
-  call advances; every accessor checks it and throws `IllegalStateException` on a stale view. Typed reads
-  (`get(ValueLayout.OfLong, offset)` and so on), bulk copies and the metadata go through a segment over the whole
-  address space at `address + offset`, after bounds and generation checks, so no segment object is created per record.
-  A view never hands out a long-lived `MemorySegment`: `withPayload(action)` gives the action a read-only segment in a
-  confined arena that closes when the action returns, and holds the reader's guard meanwhile, so the action cannot
-  move the reader. The one case the checks cannot catch is another thread closing or advancing the reader *while* this
-  thread reads a view; that breaks the threading rule below and is documented.
-- `ReadBatch` and `AppendBatch` own their native memory (automatic arenas: the garbage collector frees it); a batch's
-  views are valid until the batch is filled again. The copying API: `RecordView.copy()` (a `RecordCopy` record),
-  `payloadToArray()`, and `copyPayloadTo` a `byte[]`, `ByteBuffer` or `MemorySegment`.
-- After warm-up, `append` (all forms), `appendWith`, `appendBatch`, `tryNext`, a timed `next` that finds a record,
-  `readBatch` and the view accessors allocate nothing. `AllocationTest` checks this with the thread's allocated-bytes
-  counter around 50,000 operations of each.
+  call advances; every accessor checks it and throws `IllegalStateException` on a stale view.
+- **Every view access goes through memory whose lifetime the JVM enforces.** Each reader has one shared arena and one
+  segment over the whole address space in it (`MemorySegment.NULL.reinterpret(Long.MAX_VALUE, arena, null)`). Typed
+  reads (`get(ValueLayout.OfLong, offset)` and so on), bulk copies and the metadata read through that segment at
+  `address + offset`, after bounds and generation checks, so no segment object is created per record. `close()` waits
+  until no call is in progress and moves the handle to `CLOSING` (every call is refused from then on), advances the
+  generation, closes the arena, and only then calls `tickertape_reader_close`; the Cleaner closes the arena before the
+  C close too. Closing a shared arena is a thread-local handshake with every thread: an access in progress completes
+  first, and every later access, on any thread, throws `IllegalStateException`. (Closing refuses only while a segment
+  of the arena is passed to a downcall, which the binding never does; it retries anyway.) So closing a reader from
+  another thread while a consumer reads its view is safe, which the guide's shutdown pattern needs. The cost is on
+  close, not on reads: one handshake per closed reader. Reads add a liveness check of the arena next to the bounds
+  check, which the JIT can hoist out of loops.
+- A view holds its owner (reader or batch) strongly, and every accessor ends with
+  `Reference.reachabilityFence(this)`, so an owner cannot be collected or cleaned while one of its views is in use; a
+  batch's view reads through the batch's own buffer segment, whose scope is checked. (The first version's batch views
+  held only the generation counter: once the batch was unreachable, the collector freed the payload memory under a
+  view that still reported itself valid.)
+- A view never hands out a long-lived `MemorySegment`: `withPayload(action)` gives the action a read-only segment in a
+  confined arena that closes when the action returns, and for a reader's view holds the reader's guard meanwhile, so
+  the action cannot move the reader and `close()` waits for it. The one misuse the binding cannot catch is another
+  thread *advancing* the reader while this thread reads its view (the reader may release or unmap that memory inside
+  the call); that breaks the threading rule below and is documented as undefined.
+- `ReadBatch` and `AppendBatch` own their native memory (automatic arenas: the garbage collector frees it).
+  `ReadBatch.get(i)` returns the batch's view of record `i`: **one view object per index**, created on the first
+  `get` of that index and reused for it by every later read, so views of different records never alias and a warm
+  batch allocates nothing. We preferred this to one reusable view per batch (where `get(1)` silently re-pointed the
+  view that `get(0)` returned), to a fresh view per `get` (an allocation per record), and to per-index accessors on the
+  batch (a second copy of the view API). A batch's views are valid until the batch is filled again. The copying API:
+  `RecordView.copy()` (a `RecordCopy` record), `payloadToArray()`, and `copyPayloadTo` a `byte[]`, `ByteBuffer` or
+  `MemorySegment`.
+- After warm-up, `append` (all forms), `appendWith` (with the `PayloadBuffer` writers other than `segment()`),
+  `appendBatch`, `tryNext`, `next()` and a timed `next` that find a record, `tryReadBatch` and a timed `readBatch`,
+  `ReadBatch.get` of an index used before, and the view accessors (including `copyPayloadTo` a heap or direct
+  `ByteBuffer`) allocate nothing. `AllocationTest` measures each of these with the thread's allocated-bytes counter
+  around 50,000 operations.
+
+**Value types.** A C struct that carries `struct_size` is designed to grow: later versions append fields
+(`tickertape_verify_report`, `tickertape_retention_report`). Its Java type is a **final class with accessor methods
+and no public constructor** (`VerifyReport`, `RetentionReport`), with `equals`, `hashCode` and `toString` over every
+value, so a new field becomes a new accessor without breaking source or binary compatibility. A record would not allow
+that: a new component changes its canonical constructor and its deconstruction pattern. Structs without `struct_size`
+are frozen from 1.0 (`tickertape_checkpoint`, `tickertape_segment_info`, `tickertape_record`), and their Java types
+may be records (`Checkpoint`, `SegmentInfo`; `RecordCopy` is the binding's own copy of a record); a struct added later
+follows the same rule. `Status` and `CorruptReason` may gain constants in minor releases, as the C ABI may add codes
+and reasons; their documentation says so, and that a `switch` over them needs a `default` branch (an unknown value
+maps to `UNKNOWN` until the binding knows it). `InspectionTest` checks the class and record split.
 
 **Threads.** A writer or reader is used by one thread at a time and may be handed to another thread between calls
 (the C rule, ADR 0028). The binding enforces this cheaply: every call enters the handle's guard with one
 compare-and-set (`IDLE` to `BUSY`) and leaves with a release store. A call that finds the handle busy (another thread
 is inside a call, or a filler or payload action calls back into its own handle) or closed throws
-`IllegalStateException` without reaching the library, so use after close, double close and concurrent use are
-exceptions, never undefined behaviour, and the C ABI's `TICKERTAPE_E_BUSY` is unreachable. `close()` may be called
+`IllegalStateException` without reaching the library, so use after close, double close and concurrent calls are
+exceptions, not undefined behaviour, and the C ABI's `TICKERTAPE_E_BUSY` is unreachable. `close()` may be called
 from any thread: it requests the close, waits for a call in progress to finish (a blocked read notices within one wait
-slice and throws `IllegalStateException`), then frees the handle exactly once; closing from inside the handle's own
-filler is refused. Separate handles, and `Journal`'s functions, are independent and can run on any threads. `fork()`
+slice and throws `IllegalStateException`), moves the handle to `CLOSING`, frees it exactly once (for a reader, after
+closing its views' arena), and then marks it `CLOSED`. A `close()` that finds the handle `CLOSING` waits for `CLOSED`,
+so every `close()` returns after the C handle is freed and a writer's journal can be reopened at once (the first
+version let the second closer return while the first was still inside the C close). Closing from inside the handle's
+own filler is refused. `docs/java-api.md` lists exactly which misuse throws and which is undefined. Separate handles, and `Journal`'s functions, are independent and can run on any threads. `fork()`
 does not arise in Java.
 
 **Interruption and blocking.** A blocking read never passes `TICKERTAPE_WAIT_FOREVER` to the library. It waits in
@@ -141,7 +190,9 @@ slices of at most `waitSlice` (default 10 ms) and, between slices that returned 
 `Thread.interrupted()` (throwing `InterruptedException`) and the close request. A slice that returns a record returns
 it at once, even if an interrupt arrived during the slice; the interrupt status then stays set for the caller, and the
 next blocking call throws. So an exception from a read means nothing was consumed, and an interrupt is noticed within
-one slice of waiting (validation and file I/O after a seek are not interrupted, as in C). A blocking call on an already
+one slice of waiting (validation and file I/O after a seek are not interrupted, as in C). The slice costs about 100
+returns to Java per second per idle blocked reader at 10 ms (each restarting the library's back-off), and up to one
+slice to notice an interrupt or a close; it does not delay records, which wake a notified reader at once. A blocking call on an already
 interrupted thread throws before doing anything; `tryNext` never waits and ignores the interrupt status. The
 interruption test interrupts a follower every 0.2 ms while a writer appends 20,000 records and checks that every
 record arrives exactly once and in order.
@@ -181,9 +232,12 @@ library under `META-INF/tickertape/native/<platform>/` with its SHA-256 in a `.s
 package, so the resource is visible from the class path and the module path alike. The binding extracts it into a new
 directory that `Files.createTempDirectory` names randomly, with owner-only permissions (under `java.io.tmpdir`, or
 `tickertape.library.extractDir`), checks the extracted file's SHA-256 against the JAR's, loads it, and deletes the file
-and the directory at once (the loaded mapping stays valid). A missing or wrong hash refuses the library. The natives
+and the directory at once (the loaded mapping stays valid). A missing or wrong hash refuses the library; a library
+whose hash matched but which fails to load (a `noexec` temporary directory) gets an error that names
+`tickertape.library.extractDir`. The natives
 JAR is preferred over `java.library.path` because it is built for exactly this binding version, while the default
-library path may hold an unrelated installed copy; an explicit path or property beats both. The natives JARs are
+library path may hold an unrelated installed copy; an explicit path or property beats both, which is how a user selects
+a specific build. The natives JARs are
 built locally and in CI (`mvn -Pnatives package` after `scripts/stage-natives.sh`); publishing them is not part of this
 decision's implementation. The Linux natives are for glibc; musl comes later with ADR 0031's musl builds.
 
@@ -205,10 +259,14 @@ rule does not force.
   every status and corruption reason against the header; errors produced through the library (missing directory with
   `ENOENT`, empty directory, lock, configuration, record too large, partial batch, corruption with its reason and an
   unmoved cursor, retention and a sequence it removed, retention errors); lifetimes (use after close, views after the
-  next call, payload segments after their scope, batches refilled, the Cleaner releasing a forgotten writer);
+  next call, payload segments after their scope, batches refilled and their views not aliasing, views keeping a
+  collected batch's memory and a forgotten reader alive, the Cleaner releasing a forgotten writer with and without
+  `appendWith`, a closed writer becoming unreachable); the close race (a consumer reading a view while another thread
+  closes the reader, 200 times for each reader kind); the payload buffer refusing other threads;
   interruption (latency, no lost or duplicated records under constant interrupts, already-interrupted threads, close
   from another thread, virtual threads); threading (concurrent use refused, handles moved through an executor,
-  readers on several threads, inspection beside a writer); allocation; library loading in fresh JVMs (natives JAR
+  readers on several threads, inspection beside a writer, two threads closing a writer together and reopening it);
+  allocation; library loading in fresh JVMs (natives JAR
   extraction and clean-up, wrong or missing hash, `java.library.path`, nothing found, a file that is not the library,
   the module path with and without the native-access flag); the example; and the cross-language fixtures: a journal
   written from Java (every append form) reads back identically through the C ABI test program, the Rust CLI's `verify`
@@ -216,7 +274,9 @@ rule does not force.
   writer live, and every released-format fixture in `tests/compat/` reads back in Java with the manifest's stream
   digests (safe and mapped readers, visible and durable-only) and is recovered and continued by a Java writer.
 - CI: a new job `java binding (<os>)` on Linux x86-64, Linux arm64 and macOS builds the library, the CLI and the C
-  programs, runs the tests with JDK 25 (Temurin, pinned), builds the natives JAR, and runs the example from the two
+  programs, resolves every Maven plugin and dependency up front (`dependency:go-offline`, retried with `-U` because
+  Maven Central once answered "not found" for an existing plugin; the tests themselves are never retried), runs the
+  tests with JDK 25 (Temurin, pinned), builds the natives JAR, and runs the example from the two
   built JARs only, on the class path and the module path, failing on any warning (the install test ADR 0031 asks for).
 - New docs: `docs/java-api.md`, `bindings/java/README.md`, the example `bindings/java/examples/Example.java`.
 - Each release must keep the binding's version equal to the library's (the test fails otherwise), and a new C function

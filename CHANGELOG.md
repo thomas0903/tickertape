@@ -8,9 +8,14 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 - Java binding (ADR 0037, `docs/java-api.md`): `bindings/java`, a Maven project (JDK 25, module
   `io.github.thomas0903.tickertape`, no runtime dependencies) over the C ABI with the Foreign Function and Memory API
   and no JNI. It covers the writer (copying, zero-copy and batch appends, checkpoint), the safe and mapped readers
-  (try, timed and blocking next, batch reads, seek, durable-only), inspection and retention. Use after close and
-  concurrent use of a handle throw instead of crashing; blocking reads honour `Thread.interrupt()` and a close from
-  another thread without losing records; record views are reused and checked, and the hot paths allocate nothing.
+  (try, timed and blocking next, batch reads, seek, durable-only), inspection and retention. Use after close,
+  concurrent calls on a handle, a stale record view and a payload buffer used on another thread throw instead of
+  crashing; closing a reader from another thread is safe while a view is being read (views read through the reader's
+  shared arena, which close ends first); blocking reads honour `Thread.interrupt()` and a close from another thread
+  without losing records; record views are reused and checked, keep their memory alive, and the hot paths allocate
+  nothing. What remains undefined (another thread advancing a reader while its view is read, sharing a batch between
+  threads, the mapped reader's precondition) is listed in the guide. Reports from growable C structs are classes, not
+  records, so they can gain fields after 1.0.
   Every C status and corruption reason has its own exception or constant, checked against the header. The library is
   found by explicit path, system property, a natives JAR (extracted privately and hash-checked) or the library path,
   and a library of another version is refused. Tested on Linux x86-64, Linux arm64 and macOS in a new CI job, including
