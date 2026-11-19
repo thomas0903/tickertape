@@ -340,7 +340,8 @@ fn check_output(
     for meta in [fs::symlink_metadata(dest), fs::metadata(dest)] {
         match meta {
             Ok(m) => targets.push((m.dev(), m.ino())),
-            Err(e) if e.kind() == ErrorKind::NotFound => {}
+            // Missing, or a symlink that names nothing (dangling, or a loop): no file there.
+            Err(e) if names_nothing(&e) => {}
             Err(e) => return OutputCheck::Unknown(format!("can't stat the output: {e}")),
         }
     }

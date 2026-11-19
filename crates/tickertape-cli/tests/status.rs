@@ -1171,6 +1171,21 @@ fn output_reports_a_journal_that_cant_be_walked() {
         }
     }
     assert_eq!(fs::read_dir(outdir.path()).unwrap().count(), 1);
+    // An output that is itself a symlink loop names no file: it is replaced.
+    fs::remove_file(&target).unwrap();
+    std::os::unix::fs::symlink(&target, &target).unwrap();
+    command()
+        .args([
+            "status",
+            path.to_str().unwrap(),
+            "--format",
+            "prometheus",
+            "--output",
+        ])
+        .arg(&target)
+        .assert()
+        .code(0);
+    assert_eq!(up_in(&target), 1.0);
 }
 
 /// Round 3, item 1 (c): when it can't be established that the destination is not something the journal uses (here
