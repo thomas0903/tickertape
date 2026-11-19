@@ -1149,17 +1149,15 @@ impl Soak {
             (path, 0, how)
         };
         *self.c.injected.entry(kind).or_default() += 1;
-        // Readers and `verify` detect it (C11): the first problem is at the damaged position.
-        let report = inspect::verify(&self.journal).unwrap();
-        let first = report
-            .problems
-            .first()
-            .unwrap_or_else(|| panic!("verify missed a {kind}"));
-        assert_eq!(first.path, target, "verify: {kind}: {:?}", report.problems);
+        // `verify` reports it at the damaged position (C11). It may also report a crash state that precedes it (an
+        // unsealed segment whose successor exists, which the next writer seals), and problems after it.
         // A damaged format_version byte is reported at offset 8, other header damage at 0.
+        let report = inspect::verify(&self.journal).unwrap();
         assert!(
-            first.offset == offset || (offset == 0 && first.offset == 8),
-            "verify: {kind}: {:?}",
+            report.problems.iter().any(|p| p.path == target
+                && (p.offset == offset || (offset == 0 && p.offset == 8))),
+            "verify missed a {kind} in {} at {offset}: {:?}",
+            target.display(),
             report.problems
         );
         self.c.detected_by_verify += 1;
