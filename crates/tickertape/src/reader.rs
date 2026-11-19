@@ -63,8 +63,6 @@ pub struct Reader {
     /// `pread` buffer: bytes of `seg` starting at file offset `buf_start`.
     buf: Vec<u8>,
     buf_start: u64,
-    /// Scratch buffer for the zero-copy reader's atomic validation copy, reused across records.
-    scratch: Vec<u8>,
     /// The journal's wake-up region, if wake-ups are enabled (ADRs 0017 and 0021).
     waker: Option<crate::notify::Waker>,
     /// When the reader started waiting at an empty slot.
@@ -148,7 +146,6 @@ impl Reader {
             skip_until: *base,
             buf: Vec::new(),
             buf_start: 0,
-            scratch: Vec::new(),
             waker,
             waiting_since: None,
         })
@@ -445,18 +442,10 @@ impl Reader {
             let Some(word) = map.commit_word(offset) else {
                 return Ok(SlotOutcome::Invalid(CorruptReason::BadLength(0)));
             };
-            // Validate from an atomic copy into a reused scratch buffer: no reference into the mapping exists until
-            // the record has passed validation (`materialize`), so a corrupted length can't make a slice cover bytes
-            // still being written.
-            let pending = classify(word, offset, size);
-            let len = pending_len(pending);
-            let bytes = if len == 0 {
-                None
-            } else {
-                map.copy_atomic_into(offset + 4, len, &mut self.scratch)
-                    .and_then(|range| self.scratch.get(range))
-            };
-            return Ok(finish(pending, word, expected, bytes));
+            // Validate straight from `Relaxed` atomic loads of the mapping (ADR 0027): no reference into the mapping
+            // exists until the record has passed validation (`materialize`), so a corrupted length can't make a slice
+            // cover bytes still being written, and nothing is copied.
+            return Ok(read_mapped(map, word, offset, size, expected));
         }
 
         // pread path (ADR 0003): observe the commit word, fence, then use body bytes read after the fence.
@@ -578,7 +567,36 @@ fn open_segment(dir: &Path, base: u64, mapped: bool) -> Result<OpenSegment> {
     })
 }
 
-/// Validates a slot given its already observed commit word. `bytes(off, len)` returns bytes of that frame.
+/// Finishes classifying a slot of a mapped segment, given its observed commit word (the zero-copy reader, ADR 0027).
+/// Every byte is read with a `Relaxed` atomic load, each at most once; the results are those [`finish`] gives for
+/// the same bytes.
+fn read_mapped(map: &MapRo, word: u32, offset: u64, size: u64, expected: u64) -> SlotOutcome {
+    match classify(word, offset, size) {
+        Pending::Done(outcome) => outcome,
+        Pending::Seal => match offset.checked_add(4).and_then(|at| map.load_u32(at)) {
+            Some(crc) if crc == format::seal_crc(expected) => SlotOutcome::Seal,
+            _ => SlotOutcome::Invalid(CorruptReason::BadSeal),
+        },
+        Pending::Record { .. } => {
+            // The CRC field at P+4, and the words of [P+8, P+align8(len)): in bounds, since `classify` checked
+            // that the record fits.
+            let crc = offset.checked_add(4).and_then(|at| map.load_u32(at));
+            let words = offset
+                .checked_add(8)
+                .and_then(|at| map.words(at, (format::align8(u64::from(word)) - 8) / 8));
+            match (crc, words) {
+                (Some(crc), Some(words)) => {
+                    match format::decode_record_words(word, crc, words, expected) {
+                        Ok(header) => SlotOutcome::Record { header, len: word },
+                        Err(reason) => SlotOutcome::Invalid(reason),
+                    }
+                }
+                _ => SlotOutcome::Invalid(CorruptReason::BadLength(word)),
+            }
+        }
+    }
+}
+
 /// What the commit word alone says about a slot; the bytes it covers are checked by [`finish`].
 #[derive(Debug, Clone, Copy)]
 enum Pending {

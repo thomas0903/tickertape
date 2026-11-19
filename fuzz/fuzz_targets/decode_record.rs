@@ -9,7 +9,17 @@ fuzz_target!(|data: &[u8]| {
         data.get(4..12).map(<[u8; 8]>::try_from),
         data.get(12..),
     ) {
-        let _ = decode_record_body(u32::from_le_bytes(commit), body, u64::from_le_bytes(seq));
+        let (commit, seq) = (u32::from_le_bytes(commit), u64::from_le_bytes(seq));
+        let by_body = decode_record_body(commit, body, seq).map(|(header, _)| header);
+        // The zero-copy reader's word-by-word decoder must agree exactly (ADR 0027). The hook exists only in
+        // fuzzing builds (`cargo fuzz` sets `--cfg fuzzing`).
+        #[cfg(fuzzing)]
+        if let Some(by_words) =
+            tickertape::format::decode_record_words_for_fuzzing(commit, body, seq)
+        {
+            assert_eq!(by_words, by_body);
+        }
+        let _ = by_body;
     }
     let _ = decode_checkpoint(data);
     if let Some(body) = data.get(12..) {

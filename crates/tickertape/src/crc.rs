@@ -8,8 +8,14 @@
 //!
 //! The `crc32c` crate is the fallback without the instruction and under Miri. Results are bit-identical.
 //!
+//! [`crc32c_append_parts`] computes the same CRC over words loaded one at a time from shared memory
+//! ([`SharedWords`]), so the zero-copy reader can check a record without copying it first (ADR 0027): on the
+//! hardware path each 8-byte atomic load feeds the CRC instruction directly.
+//!
 //! This is the only module besides `mmap` that contains `unsafe`: calls to CPU intrinsics, which take values, not
 //! pointers, each after the feature check that makes it sound.
+
+use crate::mmap::SharedWords;
 
 /// The CRC32C of `data`.
 pub(crate) fn crc32c(data: &[u8]) -> u32 {
@@ -22,6 +28,37 @@ pub(crate) fn crc32c_append(crc: u32, data: &[u8]) -> u32 {
         Some(crc) => crc,
         None => crc32c::crc32c_append(crc, data),
     }
+}
+
+/// Continues `crc` over `head`, then the bytes of `words` (word `i` is bytes `[8i, 8i + 8)`, little-endian), then
+/// `tail`: the same value as [`crc32c_append`] over the concatenation. Each word is loaded exactly once.
+pub(crate) fn crc32c_append_parts(
+    crc: u32,
+    head: &[u8],
+    words: SharedWords<'_>,
+    tail: &[u8],
+) -> u32 {
+    match hw::append_parts(crc, head, words, tail) {
+        Some(crc) => crc,
+        None => soft_append_parts(crc, head, words, tail),
+    }
+}
+
+/// [`crc32c_append_parts`] without the CPU instruction: the words go through a small stack buffer, 256 bytes at a
+/// time, into the `crc32c` crate. This is the only path that copies, and only into that buffer.
+fn soft_append_parts(crc: u32, head: &[u8], words: SharedWords<'_>, tail: &[u8]) -> u32 {
+    let mut crc = crc32c::crc32c_append(crc, head);
+    let mut buf = [0u8; 256];
+    let (chunks, rest) = words.chunks_exact(buf.len() / 8);
+    for chunk in chunks.chain(std::iter::once(rest)) {
+        let mut filled = 0;
+        for (dest, word) in buf.chunks_exact_mut(8).zip(chunk.iter()) {
+            dest.copy_from_slice(&word.to_le_bytes());
+            filled += 8;
+        }
+        crc = crc32c::crc32c_append(crc, &buf[..filled]);
+    }
+    crc32c::crc32c_append(crc, tail)
 }
 
 /// Bytes per lane in the three-lane loop: long blocks first, then short ones (ADR 0024).
@@ -72,7 +109,8 @@ macro_rules! three_lane_crc {
         fn tables() -> &'static super::ShiftTables {
             static TABLES: std::sync::OnceLock<Box<super::ShiftTables>> =
                 std::sync::OnceLock::new();
-            // SAFETY: only reached from `append`, after it checked that the CPU has the feature `build_tables` needs.
+            // SAFETY: only reached from `append` and `append_parts`, after they checked that the CPU has the feature
+            // `build_tables` needs.
             TABLES.get_or_init(|| unsafe { build_tables() })
         }
 
@@ -139,6 +177,81 @@ macro_rules! three_lane_crc {
             }
             crc
         }
+
+        /// As `update`, over words loaded one at a time from shared memory: each load feeds the CRC instruction
+        /// directly, with the same three-lane blocks (in words) and the same serial tail.
+        #[target_feature(enable = $feature)]
+        #[allow(unused_unsafe)]
+        unsafe fn update_words(
+            mut crc: u32,
+            mut words: crate::mmap::SharedWords<'_>,
+            tables: Option<&super::ShiftTables>,
+        ) -> u32 {
+            for (table, lane) in tables.into_iter().flatten().zip(super::LANES) {
+                let lane = lane / 8;
+                let (blocks, rest) = words.chunks_exact(3 * lane);
+                for block in blocks {
+                    // Each block holds exactly three lanes, so both splits succeed.
+                    let Some((a, rest)) = block.split_at_checked(lane) else {
+                        continue;
+                    };
+                    let Some((b, c)) = rest.split_at_checked(lane) else {
+                        continue;
+                    };
+                    let (mut c0, mut c1, mut c2) = (crc, 0u32, 0u32);
+                    for ((x, y), z) in a.iter().zip(b.iter()).zip(c.iter()) {
+                        // SAFETY: compiled with, and only called on CPUs that have, the feature.
+                        unsafe {
+                            c0 = step(c0, x);
+                            c1 = step(c1, y);
+                            c2 = step(c2, z);
+                        }
+                    }
+                    crc = super::shift(table, super::shift(table, c0) ^ c1) ^ c2;
+                }
+                words = rest;
+            }
+            for w in words.iter() {
+                // SAFETY: as above.
+                crc = unsafe { step(crc, w) };
+            }
+            crc
+        }
+
+        /// `update` over `head`, then `update_words` over `words`, then `update` over `tail`, in one function
+        /// compiled with the feature.
+        #[target_feature(enable = $feature)]
+        #[allow(unused_unsafe)]
+        unsafe fn update_parts(
+            crc: u32,
+            head: &[u8],
+            words: crate::mmap::SharedWords<'_>,
+            tail: &[u8],
+            tables: Option<&super::ShiftTables>,
+        ) -> u32 {
+            // SAFETY: all three require only the feature, which this function is compiled with and only called with.
+            unsafe {
+                let crc = update(crc, head, None);
+                let crc = update_words(crc, words, tables);
+                update(crc, tail, None)
+            }
+        }
+
+        /// `None` if the CPU lacks the feature; otherwise [`super::crc32c_append_parts`].
+        pub(super) fn append_parts(
+            crc: u32,
+            head: &[u8],
+            words: crate::mmap::SharedWords<'_>,
+            tail: &[u8],
+        ) -> Option<u32> {
+            if !detected() {
+                return None;
+            }
+            // Short runs never reach a three-lane block, so they don't need (or build) the tables.
+            let tables = (words.len() * 8 >= 3 * super::LANES[1]).then(tables);
+            // SAFETY: `update_parts` only requires the target feature, which the CPU has (checked just above).
+            Some(!unsafe { update_parts(!crc, head, words, tail, tables) })
+        }
     };
 }
 
@@ -148,9 +261,15 @@ mod hw {
 
     three_lane_crc!("crc");
 
+    /// Whether the CPU has the CRC extension (std caches the answer).
+    #[inline]
+    fn detected() -> bool {
+        std::arch::is_aarch64_feature_detected!("crc")
+    }
+
     /// `None` if the CPU lacks the CRC extension.
     pub(super) fn append(crc: u32, data: &[u8]) -> Option<u32> {
-        if !std::arch::is_aarch64_feature_detected!("crc") {
+        if !detected() {
             return None;
         }
         // Short inputs never reach a three-lane block, so they don't need (or build) the tables.
@@ -182,9 +301,15 @@ mod hw {
 
     three_lane_crc!("sse4.2");
 
+    /// Whether the CPU has SSE4.2 (std caches the answer).
+    #[inline]
+    fn detected() -> bool {
+        std::arch::is_x86_feature_detected!("sse4.2")
+    }
+
     /// `None` if the CPU lacks SSE4.2.
     pub(super) fn append(crc: u32, data: &[u8]) -> Option<u32> {
-        if !std::arch::is_x86_feature_detected!("sse4.2") {
+        if !detected() {
             return None;
         }
         // Short inputs never reach a three-lane block, so they don't need (or build) the tables.
@@ -214,6 +339,15 @@ mod hw {
 #[cfg(any(miri, not(any(target_arch = "aarch64", target_arch = "x86_64"))))]
 mod hw {
     pub(super) fn append(_crc: u32, _data: &[u8]) -> Option<u32> {
+        None
+    }
+
+    pub(super) fn append_parts(
+        _crc: u32,
+        _head: &[u8],
+        _words: crate::mmap::SharedWords<'_>,
+        _tail: &[u8],
+    ) -> Option<u32> {
         None
     }
 }
@@ -259,6 +393,57 @@ mod tests {
         }
     }
 
+    /// `bytes` as atomic words (zero-padded to a whole word), as they would be read from a mapping.
+    fn atomics(bytes: &[u8]) -> Vec<std::sync::atomic::AtomicU64> {
+        bytes
+            .chunks(8)
+            .map(|c| {
+                let mut w = [0u8; 8];
+                w[..c.len()].copy_from_slice(c);
+                std::sync::atomic::AtomicU64::new(u64::from_le_bytes(w))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn parts_match_the_crate_for_every_word_count() {
+        // Every word count through two full rounds of both lane sizes plus every serial tail (the three-lane
+        // thresholds are 24 and 96 words), with heads and tails of several lengths, on both paths.
+        const MAX_WORDS: usize = (2 * 3 * (256 + 64) + 64) / 8 + 1;
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let data: Vec<u8> = (0..MAX_WORDS * 8 + 64)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect();
+        let step = if cfg!(miri) { 23 } else { 1 };
+        for n in (0..=MAX_WORDS).step_by(step) {
+            for (head, tail) in [(0, 0), (36, 0), (36, 1), (36, 7), (3, 5)] {
+                let h = &data[..head];
+                let w = &data[head..head + 8 * n];
+                let t = &data[head + 8 * n..head + 8 * n + tail];
+                let words = atomics(w);
+                let words = SharedWords::new(&words);
+                let whole = &data[..head + 8 * n + tail];
+                let init = n as u32 ^ 0x5a5a_5a5a;
+                let expected = crc32c::crc32c_append(init, whole);
+                assert_eq!(
+                    crc32c_append_parts(init, h, words, t),
+                    expected,
+                    "{n} words, head {head}, tail {tail}"
+                );
+                assert_eq!(
+                    soft_append_parts(init, h, words, t),
+                    expected,
+                    "software path: {n} words, head {head}, tail {tail}"
+                );
+            }
+        }
+    }
+
     // Apple silicon always has the CRC extension. Elsewhere the hardware path must be used exactly when the CPU
     // reports the feature (older x86-64 CPUs and feature-masked VMs legitimately take the fallback).
     #[cfg(not(miri))]
@@ -290,6 +475,16 @@ mod tests {
         #[test]
         fn matches_the_crate(init in any::<u32>(), data in proptest::collection::vec(any::<u8>(), 0..5000)) {
             prop_assert_eq!(crc32c_append(init, &data), crc32c::crc32c_append(init, &data));
+        }
+
+        #[test]
+        fn parts_match_one_pass(init in any::<u32>(), data in proptest::collection::vec(any::<u8>(), 0..5000), cuts in any::<(usize, usize)>()) {
+            let head = cuts.0 % (data.len() + 1);
+            let words = (data.len() - head) / 8;
+            let n = cuts.1 % (words + 1);
+            let atoms = atomics(&data[head..head + 8 * n]);
+            let parts = crc32c_append_parts(init, &data[..head], SharedWords::new(&atoms), &data[head + 8 * n..]);
+            prop_assert_eq!(parts, crc32c::crc32c_append(init, &data));
         }
 
         #[test]
