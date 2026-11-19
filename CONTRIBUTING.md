@@ -62,6 +62,15 @@ otherwise hides on every machine that has the CRC instruction:
 `RUSTFLAGS="--cfg tickertape_force_soft_crc" cargo test --workspace --all-features`. This compiles out tickertape's
 own hardware path only; the `crc32c` crate it falls back to still picks its hardware implementation on capable CPUs.
 
+Changes to `crates/tickertape/src/reader.rs` or `crates/tickertape/src/format.rs` need the `replay` benchmark run
+before and after on the same machine (`cargo bench -p tickertape-bench --bench replay`, on the base commit and on
+the change), with both sets of figures in the pull request description. The readers' per-record path is short enough
+that a change elsewhere in these files can change how the compiler builds it: an unrelated change once made small
+records markedly slower to replay without touching the per-record code. The size and signature checks next to
+`SlotOutcome` in `reader.rs` catch only the record header moving back into the values that path returns; no test
+catches a slowdown. These figures are informal and belong in the pull request, not in the docs
+(`docs/playbooks/run-benchmark.md` describes recorded runs).
+
 CI runs these on Linux x86-64 and macOS, and the tests, long tests and fuzz smoke on aarch64 Linux too.
 `cargo test --workspace` includes the format-v1 compatibility fixtures (`tests/compat/README.md`), which check the
 CLI and the Python decoder too and need `python3` in CI. A weekly workflow (`.github/workflows/soak.yml`) runs the
