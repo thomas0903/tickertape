@@ -570,16 +570,21 @@ impl Reader {
                 // The seal may no longer be in this file, which kept its identity. The `pread` buffer can hold a seal
                 // that recovery has since zeroed in place, quarantining the successor (a seal whose marker storage
                 // damage emptied, with a successor that no longer opens: crash contract C11, ADR 0035 → Damage around
-                // a seal); a mapped reader can load the seal just before that repair. Read the slot again from the file (dropping the buffer, which would show the stale seal
-                // again): if the seal is gone, return to the caller, which reads that slot as it is now.
+                // a seal); a mapped reader can load the seal just before that repair. Read the slot again from the
+                // file: if the seal is gone, return to the caller, which reads that slot as it is now. The re-read
+                // skips the buffer anyway; the buffer is dropped for the caller's sake, because a re-read that finds
+                // an empty word does not refill it, and the caller's next read would take the stale seal from it
+                // again and come back here without end.
                 self.buf.clear();
                 crate::fault::hook(crate::fault::Point::ReaderSealReread);
                 if !matches!(self.read_slot(true)?, SlotOutcome::Seal) {
                     return Ok(());
                 }
-                // The seal is in the file now. A writer stores a seal only after linking the successor, so a
+                // The seal is in the file now. A live writer stores a seal only after linking the successor, so a
                 // successor linked since the first attempt (a writer that recovered in between and rolled again)
-                // opens now. Missing while this segment is still in place, it is a broken chain.
+                // opens now. Missing while this segment is still in place, it is a broken chain. (One report can
+                // still be transient: a recovery that replaces a successor whose header is damaged keeps the seal,
+                // moves that successor to quarantine and then creates a new one; the next call follows it.)
                 match open_segment(&self.dir, self.next_seq, self.mapped) {
                     Ok(next) => next,
                     Err(e) if e.is_not_found() => {

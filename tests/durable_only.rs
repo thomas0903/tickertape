@@ -985,7 +985,9 @@ fn visible_reader_does_not_follow_a_seal_an_in_place_repair_removed() {
             let config = ReaderConfig::default().notify(false);
             let mut reader = if mapped {
                 // SAFETY: only the tickertape writer modifies segment files in this test, apart from the damage
-                // injected while no writer runs (to bytes the reader has not validated and does not hold).
+                // injected while no writer runs. That damage touches bytes the reader has not read or, in the case
+                // at the seal, the seal's words, which the mapped reader read with atomic loads and holds no
+                // reference to; it never touches a payload the reader has lent out.
                 unsafe { Reader::open_mapped(dir.path(), config) }.unwrap()
             } else {
                 Reader::open(dir.path(), config).unwrap()

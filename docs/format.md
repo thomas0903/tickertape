@@ -347,9 +347,14 @@ word `0`, no committed history, no such segment that opens", then step 5). A rea
 and the safe reader may still hold it in its buffer. So a reader at a seal whose successor is missing while its own
 segment is still in place reads the slot again from the file before it reports a broken chain. If the seal is gone,
 it reads the slot as it is now: it waits there (`Ok(None)`) or returns the new history's record, without
-`Error::Discarded`, like any reader across an in-place repair. If the seal is there, a writer stored it only after
-linking its successor, so the reader tries the successor once more and reports `CorruptReason::BrokenChain` only if it
-is still missing.
+`Error::Discarded`, like any reader across an in-place repair. (In the repair named above the zeroing starts at the
+seal's own slot, so the reader's position starts a record of the new history. Where a repair that removed a seal began
+earlier in the segment, at an empty commit word with no committed history found after it, the reader's position can
+fall inside a new record, and it then waits or reports corruption there as described above.) If the seal is there, a
+live writer stored it only after linking its successor, so the reader tries the successor once more and reports
+`CorruptReason::BrokenChain` only if it is still missing. One such report can be transient: a recovery that replaces
+a successor whose header is damaged keeps the seal, moves that successor into `quarantine/` and then creates a new
+one, and a reader whose two attempts both fall in between follows the new successor on its next call.
 
 Until it checks, a visible reader may return records from a segment that recovery has just preserved and removed.
 Such records are like records lost to a power loss that a reader had already seen (`crash-contract.md` → C8). A

@@ -173,7 +173,9 @@ journal; the durability and restart guarantees below apply to retained history.
   place removed it after the reader read it, or while the safe reader held it in its buffer (the seal's marker
   emptied by storage damage and its successor no longer opening; `format.md` → What readers do about repairs): the
   journal is healthy, and the reader reads the slot as it is now, waiting there or continuing in the new history
-  (`tests/durable_only.rs::visible_reader_does_not_follow_a_seal_an_in_place_repair_removed`).
+  (`tests/durable_only.rs::visible_reader_does_not_follow_a_seal_an_in_place_repair_removed`); where the repair began
+  earlier in the segment than the seal, its position may fall inside a record of the new history, as for any reader
+  across an in-place repair (C11).
 - **CRC32C** detects all burst errors up to 32 bits and most other corruption, not all of it. It is not a
   cryptographic integrity check.
 - **Clocks.** Timestamps are caller-supplied data. tickertape never orders or validates by timestamp.
