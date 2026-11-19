@@ -557,8 +557,8 @@ fn spare_segment_and_headroom() {
 /// Finding 13: a sealed head has no writable bytes left in the time estimate.
 #[test]
 /// The estimate from fixed figures (round 3, item 10: two `statvfs` calls in a row could see different free space
-/// while other tests wrote, which made this test fail once), plus the same relation through `statvfs` itself, re-read
-/// until two readings agree.
+/// while other tests wrote, which made this test fail once), plus the same relation through `statvfs` itself, checked
+/// within a single reading.
 fn time_to_full_of_a_sealed_head() {
     let rates = Rates {
         interval: Duration::from_secs(1),
@@ -602,18 +602,23 @@ fn time_to_full_of_a_sealed_head() {
         None
     );
 
-    // Through `statvfs`: the sealed head's estimate is its rolls, read until the free space holds still between two
-    // samples (other tests write meanwhile).
+    // Through `statvfs` (round 4, item 4): the roll count and the sealed head's estimate follow from the one reading
+    // they were computed from, so other tests writing meanwhile can't make this fail (before, it needed two identical
+    // readings within 100 attempts).
     let dir = tempfile::tempdir().unwrap();
     drop(Writer::open(dir.path(), config()).unwrap());
-    let consistent = (0..100).find_map(|_| {
-        let first = storage(dir.path(), &head, Some(rates)).unwrap();
-        let second = storage(dir.path(), &head, Some(rates)).unwrap();
-        (first == second).then_some(second)
-    });
-    let sealed = consistent.expect("the free space never held still over two statvfs calls");
-    let rolls = sealed.estimated_rolls_left as f64;
-    assert_eq!(sealed.estimated_time_to_full.unwrap().as_secs_f64(), rolls);
+    let sealed = storage(dir.path(), &head, Some(rates)).unwrap();
+    assert!(sealed.next_segment_size >= SEG);
+    assert_eq!(
+        sealed.estimated_rolls_left,
+        sealed.available_bytes / sealed.next_segment_size
+    );
+    let expected = (sealed.estimated_rolls_left * sealed.next_segment_size) as f64 / (SEG as f64);
+    let estimate = sealed.estimated_time_to_full.unwrap().as_secs_f64();
+    assert!(
+        (estimate - expected).abs() <= expected * 1e-9 + 1e-6,
+        "{estimate} vs {expected}"
+    );
 }
 
 #[test]
