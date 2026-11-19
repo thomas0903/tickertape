@@ -863,6 +863,44 @@ fn cpp_header() -> String {
     read_text(&manifest_dir().join("include/tickertape.hpp"))
 }
 
+/// C or C++ source without its comments, and with string and character literals emptied, so that a name in a
+/// comment or a message does not count as code.
+fn strip_comments(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let next = chars.get(i + 1).copied();
+        if c == '/' && next == Some('/') {
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
+            }
+        } else if c == '/' && next == Some('*') {
+            i += 2;
+            while i < chars.len() && !(chars[i] == '*' && chars.get(i + 1) == Some(&'/')) {
+                if chars[i] == '\n' {
+                    out.push('\n');
+                }
+                i += 1;
+            }
+            i += 2;
+        } else if c == '"' || c == '\'' {
+            out.push(c);
+            i += 1;
+            while i < chars.len() && chars[i] != c {
+                i += if chars[i] == '\\' { 2 } else { 1 };
+            }
+            out.push(c);
+            i += 1;
+        } else {
+            out.push(c);
+            i += 1;
+        }
+    }
+    out
+}
+
 /// The names of the functions `tickertape.h` declares (one per declaration line inside `extern "C"`).
 fn c_functions(header: &str) -> Vec<String> {
     header
@@ -1004,7 +1042,8 @@ const CPP_NOT_WRAPPED: &[(&str, &str)] = &[(
 fn cpp_binding_decides_about_every_c_function() {
     let functions = c_functions(&c_header());
     assert!(functions.len() > 40, "parsed only {functions:?}");
-    let cpp = cpp_header();
+    // Without comments: a function named in a comment is not called.
+    let cpp = strip_comments(&cpp_header());
     let adr = read_text(&repo_root().join("docs/decisions/0036-cpp-binding.md"));
     for name in &functions {
         let wrapped = CPP_WRAPPED.iter().any(|(c, _)| c == name);
@@ -1033,6 +1072,192 @@ fn cpp_binding_decides_about_every_c_function() {
         assert!(
             functions.iter().any(|f| f == name),
             "{name} is listed but tickertape.h does not declare it"
+        );
+    }
+}
+
+/// What the C++ binding does with a field of a C struct.
+enum FieldUse {
+    /// The binding reads or writes it: `.field` must appear in tickertape.hpp's code.
+    Used(&'static str),
+    /// Deliberately not used, for the reason given.
+    Unused(&'static str),
+}
+
+/// Every field of every struct `tickertape.h` defines, with the binding's decision. A field added to a C struct
+/// fails `cpp_binding_decides_about_every_c_struct_field` until it is listed here (and wrapped, or not, on purpose).
+const C_STRUCT_FIELDS: &[(&str, &[(&str, FieldUse)])] = {
+    use FieldUse::{Unused, Used};
+    &[
+        (
+            "tickertape_verify_report",
+            &[
+                ("struct_size", Used("set to the struct's size by verify()")),
+                ("segments", Used("VerifyReport::segments")),
+                ("records", Used("VerifyReport::records")),
+                (
+                    "first_seq",
+                    Used("VerifyReport::first_seq, when records > 0"),
+                ),
+                ("last_seq", Used("VerifyReport::last_seq, when records > 0")),
+                ("problems", Used("VerifyReport::problems")),
+                (
+                    "first_problem_base_seq",
+                    Used("VerifyReport::Problem::segment_base_seq"),
+                ),
+                (
+                    "first_problem_offset",
+                    Used("VerifyReport::Problem::offset"),
+                ),
+                (
+                    "first_problem_reason",
+                    Used("VerifyReport::Problem::reason"),
+                ),
+                ("reserved", Unused("always 0")),
+            ],
+        ),
+        (
+            "tickertape_segment_info",
+            &[
+                ("base_seq", Used("SegmentInfo::base_seq")),
+                ("segment_size", Used("SegmentInfo::segment_size")),
+                ("created_unix_ns", Used("SegmentInfo::created_unix_ns")),
+                ("format_version", Used("SegmentInfo::format_version")),
+                ("reserved", Unused("always 0")),
+            ],
+        ),
+        (
+            "tickertape_checkpoint",
+            &[
+                ("generation", Used("Checkpoint::generation")),
+                ("next_seq", Used("Checkpoint::next_seq")),
+                ("segment_base_seq", Used("Checkpoint::segment_base_seq")),
+                ("offset", Used("Checkpoint::offset")),
+            ],
+        ),
+        (
+            "tickertape_retention_report",
+            &[
+                (
+                    "struct_size",
+                    Used("set to the struct's size by detail::retention"),
+                ),
+                (
+                    "removed_segments",
+                    Used("RetentionReport::removed_segments"),
+                ),
+                ("removed_bytes", Used("RetentionReport::removed_bytes")),
+                (
+                    "already_removed_segments",
+                    Used("RetentionReport::already_removed_segments"),
+                ),
+            ],
+        ),
+        (
+            "tickertape_record",
+            &[
+                ("seq", Used("RecordView::seq")),
+                ("venue_ts_ns", Used("RecordView::venue_ts_ns")),
+                ("local_ts_ns", Used("RecordView::local_ts_ns")),
+                ("payload", Used("RecordView::data, as_string_view")),
+                ("payload_len", Used("RecordView::size, Error::needed_size")),
+                ("schema_id", Used("RecordView::schema_id")),
+                ("reserved", Unused("always 0")),
+            ],
+        ),
+        (
+            "tickertape_new_record",
+            &[
+                ("payload", Used("NewRecord's constructor and data()")),
+                ("payload_len", Used("NewRecord's constructor and size()")),
+                (
+                    "venue_ts_ns",
+                    Used("NewRecord's constructor and venue_ts_ns()"),
+                ),
+                (
+                    "local_ts_ns",
+                    Used("NewRecord's constructor and local_ts_ns()"),
+                ),
+                ("schema_id", Used("NewRecord's constructor and schema_id()")),
+                ("reserved", Unused("set to 0 by NewRecord's constructor")),
+            ],
+        ),
+    ]
+};
+
+/// The fields of each struct that `tickertape.h` defines (`typedef struct name { ... } name;`), in order.
+fn c_struct_fields(header: &str) -> Vec<(String, Vec<String>)> {
+    let code = strip_comments(header);
+    let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let mut structs = Vec::new();
+    let mut rest = code.as_str();
+    while let Some(at) = rest.find("typedef struct ") {
+        let after = &rest[at + "typedef struct ".len()..];
+        let name: String = after.chars().take_while(|&c| is_ident(c)).collect();
+        let body = after[name.len()..].trim_start();
+        rest = after;
+        let Some(body) = body.strip_prefix('{') else {
+            continue; // `typedef struct name name;`: an opaque handle
+        };
+        let body = &body[..body.find('}').unwrap()];
+        let fields = body
+            .split(';')
+            .map(str::trim)
+            .filter(|declaration| !declaration.is_empty())
+            .map(|declaration| {
+                declaration
+                    .rsplit(|c: char| !is_ident(c))
+                    .next()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect();
+        structs.push((name, fields));
+    }
+    structs
+}
+
+/// Fails when a field is added to (or removed from) a C struct without a decision about the C++ binding.
+#[test]
+fn cpp_binding_decides_about_every_c_struct_field() {
+    let structs = c_struct_fields(&c_header());
+    assert!(structs.len() >= 6, "parsed only {structs:?}");
+    let cpp = strip_comments(&cpp_header());
+    for (name, fields) in &structs {
+        let decided = C_STRUCT_FIELDS
+            .iter()
+            .find(|(s, _)| s == name)
+            .unwrap_or_else(|| panic!("{name}: add its fields to C_STRUCT_FIELDS"))
+            .1;
+        let listed: Vec<&str> = decided.iter().map(|(field, _)| *field).collect();
+        assert_eq!(
+            fields, &listed,
+            "{name}: the fields in tickertape.h and in C_STRUCT_FIELDS differ; decide what the C++ binding does \
+             with each new field"
+        );
+        for (field, use_) in decided.iter() {
+            match use_ {
+                FieldUse::Used(how) => {
+                    let member = format!(".{field}");
+                    let used = cpp.match_indices(&member).any(|(at, _)| {
+                        !cpp[at + member.len()..]
+                            .starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+                    });
+                    assert!(
+                        used,
+                        "{name}.{field} is listed as used ({how}) but tickertape.hpp never uses it"
+                    );
+                }
+                FieldUse::Unused(why) => {
+                    assert!(!why.is_empty(), "{name}.{field}: say why it is unused")
+                }
+            }
+        }
+    }
+    for (name, _) in C_STRUCT_FIELDS {
+        assert!(
+            structs.iter().any(|(s, _)| s == name),
+            "{name} is listed but tickertape.h does not define it"
         );
     }
 }
