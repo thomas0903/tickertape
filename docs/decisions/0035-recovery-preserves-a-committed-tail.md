@@ -46,12 +46,14 @@ these counts:
 1. **A later record.** An 8-byte-aligned `Q > P` holding a record that validates completely (length in range and
    inside the record area, CRC32C, flags zero) whose sequence number `T` satisfies `S < T <= S + floor((Q - P) / 40)`:
    records `S` to `T - 1` must fit between `P` and `Q`, and every frame is at least 40 bytes.
-2. **A final seal.** A valid seal for a `T` in the same range that is the last non-zero item in `X`. (When record `S`
-   is the last before a seal, the seal is the only thing after it.)
+2. **A final seal.** A valid seal for a `T` in the same range, and at most `SEAL_SEARCH_RECORDS` (128) above `S`,
+   that is the last non-zero item in `X`. (When record `S` is the last before a seal, the seal is the only thing
+   after it.)
 3. **A later segment.** A segment file whose base is greater than `S`, if `X` holds any non-zero byte after `P`.
    (Without non-zero bytes there is nothing to preserve, and the existing rule for disconnected segments applies.)
-   Except when the successor for exactly `S` exists and has not been entered yet, and the non-zero bytes end within
-   a seal at `P` (`[P+4, P+8)`): see "Damage around a seal" below.
+
+None of these is consulted when the successor for exactly `S` exists, has not been entered yet and opens: `P` is
+then where `X`'s seal belongs and the chain continues in that successor (see "Damage around a seal" below).
 
 If none is found, `P` is a torn append (or a clean end) and is handled exactly as before.
 
@@ -61,7 +63,8 @@ fits and covers every non-zero byte after `P` (`L` from the end of the last non-
 a torn append whose body was completely written, and any candidate lies inside its payload: recovery treats `P` as a
 torn append. A writer killed after storing the CRC and before the commit store leaves exactly this. It does not cover
 a body torn in the middle (no CRC yet, or a CRC the bytes don't match yet), or a payload ending in more than 63 zero
-bytes (its length lies outside the range tried): those stay evidence, the conservative side. Every length tried can
+bytes (its length lies outside the range tried): those stay evidence, the conservative side, and with a candidate
+inside them they are the process-crash exception below. Every length tried can
 match by chance (`2^-32` each), and a chance match would hide real evidence, so the range is kept to 64 lengths, and
 a frame whose CRC also matches for a length that ends where the first candidate starts is not covered: that is a
 complete record followed by the next one, which is what a zeroed commit word in front of committed records leaves.
@@ -76,16 +79,26 @@ into place with a shift (`crc::x8n`) instead of a new pass.
 **False positives** (a torn append judged to be damage). A slot of random bytes passes only if its length is in
 range (at most `Z / 2^32`), its flags are zero (`2^-32`), its sequence number falls in a window of at most `Z / 40`
 values (`2^-42` for a 128 MiB segment) and its CRC matches (`2^-32`): below `2^-106` per slot, below `2^-82` over the
-`2^24` slots of a 128 MiB segment. A final seal needs the marker (`2^-32`) and a CRC match within the window. Frames
+`2^24` slots of a 128 MiB segment. A final seal needs the marker at the last aligned eight non-zero bytes and a CRC
+match for one of the next sequence numbers tried. Payloads make the marker likely (it is `ff ff ff ff`, an all-ones
+or `-1` field), so the CRC is the bound that matters: at most `SEAL_SEARCH_RECORDS` (128) numbers are tried, each a
+`2^-32` chance, so **at most `2^-25` (about 1 in 34 million) per torn append whose payload, as far as it was written,
+ends in a seal marker at an aligned position**, and `2^-57` for a payload of random bytes. Review round 2 measured the
+uncapped window (every number the space allows, `(Q - P) / 40`): about 1 in 1,280 such crashes for a 128 MiB tail
+and 9.5% at 16 GiB, each a refusal under `Fail` after a plain process crash. The cap gives up only a final seal more
+than 128 records after the empty word with the successor segment lost too: with the successor present, evidence (3)
+covers a damaged run of any length before a seal. 128 covers a zeroed 4 KiB block of minimal 40-byte records (102).
+Frames
 copied into a payload are different: the record CRC covers nothing that identifies a journal, so **any payload that
 contains an 8-byte-aligned, CRC-valid frame whose sequence number falls in the window** passes, whichever journal the
-frame came from. The window rules out frames whose sequence number is at or below `S` or too far ahead for its
+frame came from, and so does a payload that ends with the eight bytes of a seal for a `T` in the window (a seal copied
+from a journal, or bytes that happen to form one), as evidence (2). The window rules out frames whose sequence number is at or below `S` or too far ahead for its
 position, which removes stale copies of this journal's earlier records, but a frame from another journal with a small
 sequence number passes near the start of a journal, and so does any frame when one journal's payloads carry raw
 frames read from another (an archiver, a relay, a test that embeds journals). Reproduced (review round 1): journal A
 holds records 0 to 19, journal B records 0 to 2, and B's writer is killed while filling record 3's payload with A's
 raw frames; A's records 4 onwards are in B's window. If the writer dies while writing such a payload, and its body
-was not completely written (above), recovery preserves the torn bytes in `quarantine/` and replaces the segment
+was not completely written or its payload ends in more than 63 zero bytes (above), recovery preserves the torn bytes in `quarantine/` and replaces the segment
 (`Quarantine`; readers at the end get `Error::Discarded`; nothing is lost) or **refuses to open after a plain process
 crash** (`Fail`). No rule on these bytes can remove this: a torn payload holding such frames is byte for byte the same
 as committed records behind a damaged commit word. Nothing is lost either way, so it stays on the conservative side,
@@ -93,7 +106,7 @@ and the exception is stated where the contract promises that a crash needs no hu
 rustdoc, `operations.md`). An operator whose `Fail` writer refuses with `EmptyCommitWord` after a known process crash
 checks the frame at the reported offset: if it has the expected sequence number and the frames after it lie inside
 its payload, it is a torn append, and opening once with `Quarantine` preserves those bytes and continues
-(`tests/committed_tail.rs::payload_holding_another_journals_frames`; `tests/recovery.rs::panic_in_fill_then_shorter_append`
+(`tests/committed_tail.rs::payload_holding_another_journals_frames`, `::payload_ending_in_a_seal_for_the_next_record`; `tests/recovery.rs::panic_in_fill_then_shorter_append`
 builds one from this journal's own frames, but panics instead of being killed, so its bytes are zeroed before recovery
 sees them).
 
@@ -108,9 +121,16 @@ loss) zeroes whole blocks, headers included, and the first intact record after t
 zero the tail); at each 8-byte position up to that byte, a commit-word load and, if the length is in range, a 16-byte
 header read; CRC32C for candidates whose header passes, at most twice the length `Z - P` in total (beyond that the
 search stops and reports the tail as committed history, which only bytes made of this journal's own record headers
-can cause); for a final seal at most `(Q - P) / 40` CRCs of 12 bytes; and at the first candidate, once, CRC32C over
+can cause); for a final seal at most 128 CRCs of 12 bytes, counted in the same bound (which is raised by those
+1,536 bytes); and at the first candidate, once, CRC32C over
 the frame at `P` up to the last non-zero byte and up to the candidate (at most twice `Z - P` more) plus 72 shifts. It
-runs once per recovery, at the one empty slot where the scan stops, and in `verify`.
+runs once per recovery, at the one empty slot where the scan stops, and in `verify`. When the bound stops the search
+before a candidate is decided, nothing was proven: the tail is still treated as committed history (only this
+journal's own record headers can cause it, and a torn append leaves one header at most), but it is reported as
+`CorruptReason::UncheckedTail(seq)`, not `EmptyCommitWord`, with the sequence number in the header where the search
+stopped. Memory is bounded too: `verify` reads with `pread` into a 1 MiB window, and every read, including the CRC32C
+of a candidate or a scanned record with a large length, goes in pieces of at most that size, so a damaged length never
+allocates more (review round 2); the writer reads its own mapping and is unchanged.
 
 ### Damage around a seal
 
@@ -119,9 +139,26 @@ Review round 1 reproduced a regression: with the seal's 4-byte marker zeroed (it
 following segment, evidence (3) fired (a segment based above `S`, a non-zero tail), the tail was quarantined and every
 later segment then quarantined as disconnected (861 of 1,200 records removed; `Fail` refused). Before this change the
 same bytes took the branch for a crash between publishing a successor and sealing, which rewrites the seal and keeps
-everything. They are also exactly what that crash leaves: `write_seal` stores the CRC word, then the marker. So
-evidence (3) does not count when the successor for exactly `S` exists and has not been entered, and the non-zero bytes
-end within `[P+4, P+8)`. The shapes next to it, each decided explicitly and tested under both policies
+everything. They are also exactly what that crash leaves: `write_seal` stores the CRC word, then the marker.
+
+Review round 2 found the same failure one byte away, and found that the outcome depended on when recovery was
+interrupted: 50 records in segments based 0, 18 and 36, segment 0's seal marker zeroed and one stray non-zero byte
+just past the seal. The tail then ended outside the seal, the segment based 36 counted as evidence, and recovery
+replaced segment 0 and quarantined both successors (18 records kept); interrupted after the rename, the next open
+found an empty tail, wrote the seal and kept all 50. So the successor comes first: **when the segment for exactly
+`S` exists, has not been entered and opens, `P` is where `X`'s seal belongs**, whatever follows `P`, and no evidence
+is consulted. If nothing but the seal's CRC word follows `P`, it is the crash (or a zeroed marker): the word is
+zeroed and the seal written, as before. If anything else follows, no crash left it (a roll writes nothing after the
+seal, and records `S` onwards are in the successor), and it is not records of `X` either (they would repeat the
+successor's sequence numbers): it is damage around the seal, not missing history. `Quarantine` preserves `[P, Z)` and
+replaces `X` exactly as any repair does (`RepairedTail`, reason `BadSeal`), then writes the seal and continues into the
+successor in the same open; `Fail` refuses with `BadSeal` at `P` without changing a byte. The repair leaves `X` ending
+at `P`, which is where an interrupted repair leaves the next open, and that open takes the same branch and writes the
+same seal, so every path gives the same journal (`::crash_in_the_middle_of_a_seal_repair`, uninterrupted and
+interrupted at both fault points). This cannot lose records the previous code kept: everything in `X` before `P` and
+every segment are kept, and the bytes after `P` are preserved. Nor can it refuse or quarantine what a process crash
+leaves, which is at most the CRC word. A successor that exists but does not open is handled as before (the chain
+ends at `P`). The shapes, each decided explicitly and tested under both policies
 (`tests/committed_tail.rs::damage_around_a_seal_is_resealed_or_preserved_never_lost`, with three later segments and
 with exactly one):
 
@@ -130,6 +167,7 @@ with exactly one):
 | Seal marker zeroed, CRC word intact, several later segments | None (the exception) | Seal written again, every record kept, as for the crash |
 | Seal marker zeroed, exactly one later segment | None (no segment above `S`) | The same |
 | Seal marker and CRC word zeroed | None (nothing non-zero) | The same |
+| Seal marker zeroed and other bytes after it, successor opens (any number of later segments) | Not consulted | `Quarantine`: the bytes after `P` preserved (`BadSeal`), seal written again, every record kept; `Fail` refuses. Before round 2: with later segments, segment 0's tail and every later segment were quarantined; with one, the bytes were zeroed in place without being preserved, under both policies |
 | Seal intact, record `S - 1`'s commit word zeroed | (2), the final seal for `S` | Corruption at record `S - 1`: `Quarantine` preserves the tail and every later segment (the chain can't continue past a lost record), `Fail` refuses |
 | Record `S - 1`'s commit word and the seal marker zeroed | (3): the successor is for `S`, not `S - 1`, so the exception does not apply | The same. A crash never leaves this: rolling needs record `S - 1` committed |
 | Record `S - 1`'s commit word and the whole seal zeroed | (3) alone | The same |
@@ -193,7 +231,10 @@ frame (a payload that holds frames, the accepted false positive) is written befo
 waits 50 ms once, as it already did for invalid records, and reads the word again before reporting. The loop is
 bounded: after 8
 rounds (a writer appending faster than `verify` can search) it stops and reports the segment as open at the last
-record it reached, which is what it reports for anything appended after it returns; never a problem. Only the newest
+record it reached, which is what it reports for anything appended after it returns; never a problem. A scan that
+continues from `P` can catch the writer mid-append at the new end as the first scan can, so an invalid record there
+gets the same one 50 ms retry; the first scan and the continued scans share that one retry per segment (review
+round 2; `inspect::tests::follow_loop_retries_a_record_caught_mid_append`). Only the newest
 segment needs this: the writer appends only there, and the empty word of a segment it has just rolled from only ever
 becomes a seal marker, with nothing written after it that could be evidence. No other reader-side function uses the
 evidence search (`list_segments`, `status` and the readers never call it), and writer recovery holds the lock.
@@ -213,6 +254,8 @@ stand in for a crash there (`::crash_in_the_middle_of_a_repair`):
   either copy can be deleted.
 - After the rename, before the later segments are handled: `X` already ends at `P` with zeros after it, so the next
   recovery finds no evidence in `X`, ends the chain at `P`, and quarantines the later segments as disconnected.
+- For damage around a seal (above), after the rename the next recovery finds `X` ending at `P` with the successor
+  waiting, writes the seal and continues, which is what the uninterrupted repair does next.
 
 Either way, every removed byte is in `quarantine/` once the next recovery completes, and the journal keeps records
 before `P`.
@@ -253,7 +296,14 @@ time it takes to read the tail. A repair costs writing the quarantine copy and t
 
 - New `CorruptReason::EmptyCommitWord(seq)` (the enum is `#[non_exhaustive]`); `seq` is the sequence number the
   evidence carries: a later record's, a final seal's next sequence number, or a later segment's base.
-  `inspect::verify` and `tickertape verify` report it at the empty word, in the newest segment too.
+  `inspect::verify` and `tickertape verify` report it at the empty word, in the newest segment too, from evidence in
+  the segment itself. Where only a later segment proves that history exists (the commit word and the seal both
+  zeroed, nothing valid left in the segment), the writer reports `EmptyCommitWord` but `verify` reports the
+  segment's end as `BrokenChain` (it does not weigh later segments against an empty word); either way the problem is
+  reported at the same position.
+- New `CorruptReason::UncheckedTail(seq)` for a search stopped by its work bound (above). The C ABI maps both
+  (`TICKERTAPE_CORRUPT_EMPTY_COMMIT_WORD` = 14, `TICKERTAPE_CORRUPT_UNCHECKED_TAIL` = 15), with the sequence number in
+  the error message.
 - `verify` now reads the whole remaining tail of the newest segment, where before it stopped at the end of the
   records. `tickertape verify` on one 128 MiB segment (release build, warm page cache, APFS, Apple M4 Pro, median of 5
   runs of the process): empty segment 9.2 ms before, 21 ms after; half full (64,000 records of 1 KB) 16.1 ms before,
@@ -261,8 +311,14 @@ time it takes to read the tail. A repair costs writing the quarantine copy and t
 - `Fail` now refuses states it used to "clean up" by zeroing, because those bytes were committed. After a power loss
   that wrote pages back out of order, records after the checkpoint are preserved in `quarantine/` (or the open is
   refused) instead of zeroed; C8 allowed losing them either way.
-- `Fail` can refuse after a plain process crash in one case: a torn payload holding frames in the window (above).
-  C1, C2, the `RecoveryPolicy` rustdoc and `operations.md` state it, with what an operator does.
+- `Fail` can refuse after a plain process crash in one case: a torn payload holding frames, or ending with a seal,
+  in the window (above). C1, C2, the `RecoveryPolicy` rustdoc and `operations.md` state it, with what an operator
+  does.
+- What `Fail` does not promise: it never changes the bytes of the corruption it refuses, nor anything after it, but
+  open still records its PID in the lock file and removes stale temporary names (`*.tape.tmp`, the prepared spare)
+  before scanning, and the clean-ups a process crash needs that come before the corrupt position in the scan stay
+  in place when it refuses: a zeroed torn tail, a seal written for a crash between publishing a successor and
+  sealing (for example in segment `X` when the corruption is in its successor), a created missing successor.
 - Spec: [`format.md`](../format.md) → Recovery (the table and steps), [`crash-contract.md`](../crash-contract.md)
   (C1, C2, C8, C11, readers and memory safety), [`operations.md`](../operations.md) (checking a journal, after a
   crash), [`cli.md`](../cli.md) (`verify`). Tests: `tests/committed_tail.rs`, `tests/kill_loop.rs::kill_inside_fill`,

@@ -220,29 +220,31 @@ Readers never modify a journal. Only the writer repairs it, on open, after takin
 3. **Scan forward** through the chain, validating every record and seal: record by record within a segment; at a
    valid seal, into the segment it names. The scan stops at the first position `P` (in segment `X`, of size `Z`)
    that is not a valid record and not a valid seal whose successor exists.
-4. **Classify what is at `P`.** At a commit word `0`, first look for **committed history** after it (ADR 0035), where
-   `S` is the expected sequence number: (a) an 8-byte-aligned `Q > P` holding a record that is valid for some
-   sequence number `T` with `S < T <= S + floor((Q - P) / 40)` (records `S` to `T - 1` must fit between, at least 40
-   bytes each); (b) a valid seal for such a `T` that is the last non-zero item in `X`; or (c) a segment with a
+4. **Classify what is at `P`.** At a commit word `0` where `S` is the expected sequence number, if the segment named
+   `{S:020}.tape` exists, has not been scanned yet and has a valid header, `P` is where `X`'s seal belongs (second
+   row below; ADR 0035, "Damage around a seal"). Otherwise first look for **committed history** after `P`: (a) an
+   8-byte-aligned `Q > P` holding a record that is valid for some sequence number `T` with
+   `S < T <= S + floor((Q - P) / 40)` (records `S` to `T - 1` must fit between, at least 40 bytes each); (b) a valid
+   seal for such a `T`, with `T <= S + 128`, that is the last non-zero item in `X`; or (c) a segment with a
    `base_seq` greater than `S`, when `[P+4, Z)` holds any non-zero byte, except when the segment named
-   `{S:020}.tape` exists and has not been scanned yet and every non-zero byte lies in `[P+4, P+8)` (a seal's CRC word:
-   what a crash between publishing that segment and sealing `X` leaves, and what a zeroed seal marker leaves; the
-   second row below rewrites the seal). Candidates (a) and (b) do not count when they lie inside a **completely
+   `{S:020}.tape` exists (without a valid header) and every non-zero byte lies in `[P+4, P+8)`. Candidates (a) and
+   (b) do not count when they lie inside a **completely
    written torn frame** at `P`: its sequence number field is `S`, its flags are zero, and its stored CRC matches for a
    frame length `L` that fits with `end <= P + L <= end + 63`, where `end` is the end of the last non-zero byte after
    `P`, and does not also match for a length `L'` with `P + align8(L')` at the first candidate. A writer process crash
    never leaves committed history, with one exception: a payload that holds an 8-byte-aligned, CRC-valid frame whose
-   sequence number falls in the window of (a), when the crash interrupted it before the body was complete (or the
-   payload ends in more than 63 zero bytes). No rule can tell those bytes from damage; they are preserved (or `Fail`
+   sequence number falls in the window of (a), or ends with a valid seal as in (b), when the crash interrupted it
+   before the body was complete (or the payload ends in more than 63 zero bytes). No rule can tell those bytes from damage; they are preserved (or `Fail`
    refuses) and nothing is lost. Otherwise the bytes of a torn append lie inside the one frame being written, and a
    segment with base `B` exists only once record `B - 1` was committed. The search reads only; its work is bounded
-   (ADR 0035), and if candidate records would need CRC32C over more than twice `Z - P` bytes it stops and counts the
-   tail as committed history.
+   (ADR 0035), and if candidate records would need CRC32C over more than twice `Z - P` bytes (plus the bounded seal
+   search) it stops and counts the tail as committed history, reported as `UncheckedTail` because nothing was
+   proven.
 
    | At `P` | Meaning | Action |
    |---|---|---|
-   | Commit word `0`, committed history after it | Storage damage, power loss or outside modification hid committed records behind an empty commit word | Corruption, as in the last row, reported as `EmptyCommitWord(T)`: `Quarantine` preserves `[P, Z)` and repairs by replacement; `Fail` refuses before anything in `X` is changed |
-   | Commit word `0`, no committed history, and a segment named `{next_seq:020}.tape` exists | The previous writer died between publishing the next segment and sealing this one | Zero any non-zero bytes in `[P, Z)` in place, write the seal, and continue scanning in that segment (step 3) |
+   | Commit word `0`, committed history after it | Storage damage, power loss or outside modification hid committed records behind an empty commit word | Corruption, as in the last row, reported as `EmptyCommitWord(T)` (or `UncheckedTail`): `Quarantine` preserves `[P, Z)` and repairs by replacement; `Fail` refuses before anything in `X` is changed |
+   | Commit word `0`, and a segment named `{next_seq:020}.tape` exists, has not been scanned and has a valid header | The previous writer died between publishing the next segment and sealing this one (then at most the seal's CRC word follows `P`), or the seal was damaged | If nothing outside `[P+4, P+8)` is non-zero: zero any non-zero bytes in `[P, Z)` in place. Otherwise (damage, never a crash): `Quarantine` preserves `[P, Z)` and repairs by replacement as in the last row (`BadSeal`), `Fail` refuses. Then write the seal and continue scanning in that segment (step 3) |
    | Commit word `0`, no committed history, no such segment | Clean end, or a body the previous writer never committed (no reader ever saw it) | Zero any non-zero bytes in `[P, Z)` in place. This is the end of the chain |
    | Valid seal, successor missing, no segment with a larger `base_seq` | Crash or power loss during a roll | Create the successor (as in "Rolling"). This is the end of the chain |
    | Valid seal, successor missing, a segment with a larger `base_seq` exists | A segment in the middle of the chain is missing (deleted by someone, or lost) | **Refuse** under every policy: tickertape doesn't discard a large part of a journal on its own |

@@ -9,8 +9,8 @@ use std::time::Duration;
 /// A writer *process* crash never produces this (see `docs/crash-contract.md`, C1/C2), with one exception; otherwise
 /// only power loss, storage errors or outside modification do. The exception: a crash while a payload was being
 /// written that contains an 8-byte-aligned, checksum-valid record frame whose sequence number falls in the window
-/// recovery checks (for example raw frames copied from another journal), when the payload was not completely
-/// written. Recovery cannot tell those bytes from committed records behind a damaged commit word and reports
+/// recovery checks (for example raw frames copied from another journal), or that ends with a valid seal for such a
+/// sequence number, when the payload was not completely written (or ends in more than 63 zero bytes). Recovery cannot tell those bytes from committed records behind a damaged commit word and reports
 /// [`CorruptReason::EmptyCommitWord`](crate::CorruptReason::EmptyCommitWord); nothing is lost (ADR 0035). Uncommitted
 /// partial records, with nothing committed after them, are always cleaned up, whatever the policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -27,8 +27,9 @@ pub enum RecoveryPolicy {
     /// empty commit word are checked for committed records before any of them is zeroed (damage after which nothing
     /// valid remains can't be told from a torn append and is zeroed like one, ADR 0035). Recovery may still have done
     /// the clean-ups it performs before reaching the corrupt position, which a writer *process* crash also requires:
-    /// removing stale `*.tape.tmp` files, zeroing never-committed bytes after a segment's last record, writing a
-    /// missing seal, and creating a missing successor segment (`docs/format.md` → Recovery).
+    /// removing stale `*.tape.tmp` files (and the prepared spare), zeroing never-committed bytes after a segment's
+    /// last record, writing a missing seal (which can be the seal in front of a corrupt successor), and creating a
+    /// missing successor segment (`docs/format.md` → Recovery). Opening also records the PID in the lock file.
     ///
     /// After a plain process crash this refuses only in the exception above (`EmptyCommitWord` at the start of the
     /// record being written, whose payload holds the frames that count as evidence). To continue, check the frame at

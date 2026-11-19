@@ -9,13 +9,19 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   the checkpoint. It used to take the empty commit word for the end of the journal and zero everything after it,
   under `RecoveryPolicy::Fail` too, changing bytes that zero-copy readers had borrowed. Recovery now checks the
   bytes after an empty commit word for committed history (a later record that validates with a sequence number its
-  position allows, a final seal, or a later segment) and treats it as corruption: `Quarantine` preserves the tail in
-  `quarantine/` and replaces the segment, `Fail` refuses without changing a byte. Torn appends are still zeroed in
-  place. New `CorruptReason::EmptyCommitWord`, which `verify` also reports (ADR 0035); `verify` and `inspect` now
-  read the unwritten rest of the newest segment. Damage after which no record validates and no final seal or later
-  segment remains (such as the newest records' commit words zeroed) remains indistinguishable from a torn append. A
-  torn payload holding valid frames from another journal, with sequence numbers in the window, is preserved (or
-  refused under `Fail`) even after a plain process crash.
+  position allows, a final seal for one of the next 128 sequence numbers, or a later segment) and treats it as
+  corruption: `Quarantine` preserves the tail in `quarantine/` and replaces the segment, `Fail` refuses without
+  changing the corrupt bytes or anything after them (an open under `Fail` still records its PID, removes stale
+  temporary files and keeps the crash clean-ups that come before the corruption, such as a seal written in front of
+  a corrupt successor). Torn appends are still zeroed in place. New `CorruptReason::EmptyCommitWord`, and
+  `CorruptReason::UncheckedTail` when the search stops at its work bound before deciding, both also reported by
+  `verify` and mapped in the C ABI (`TICKERTAPE_CORRUPT_EMPTY_COMMIT_WORD`, `TICKERTAPE_CORRUPT_UNCHECKED_TAIL`)
+  (ADR 0035); `verify` and `inspect` now read the unwritten rest of the newest segment, in bounded memory whatever
+  length a damaged slot claims. A damaged seal whose successor segment exists is rewritten and every record kept;
+  bytes after it are preserved first. Damage after which no record validates and no final seal or later segment
+  remains (such as the newest records' commit words zeroed) remains indistinguishable from a torn append. A torn
+  payload holding valid frames from another journal, or ending with a valid seal, with sequence numbers in the window,
+  is preserved (or refused under `Fail`) even after a plain process crash.
 - C ABI (ADR 0028, `docs/c-api.md`): a new workspace crate, `crates/tickertape-ffi`, builds `libtickertape` as a
   shared and a static library with a committed, cbindgen-generated C99/C++11 header (`include/tickertape.h`, checked
   for drift in CI) and cargo-c metadata for installation with a pkg-config file. It covers the writer (append,
