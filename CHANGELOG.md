@@ -5,6 +5,16 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
+- C ABI (ADR 0028, `docs/c-api.md`): a new workspace crate, `crates/tickertape-ffi`, builds `libtickertape` as a
+  shared and a static library with a committed, cbindgen-generated C99/C++11 header (`include/tickertape.h`, checked
+  for drift in CI) and cargo-c metadata for installation with a pkg-config file. It covers the writer (append,
+  zero-copy append through a callback, batch append, checkpoint), the safe and mapped readers (seek, try-next and
+  timed next, copy-out and batch reads, durable-only), options, `verify`, segment listing, the checkpoint marker and
+  retention, with stable error codes, per-thread error details and no panics across the boundary. Not published to
+  crates.io and not stable before 1.0 (`TICKERTAPE_ABI_VERSION` 0). Examples in `examples/c/`, including a C++11
+  RAII wrapper. The core crate is unchanged.
+- Repository: `unsafe` code is now also allowed in `crates/tickertape-ffi`, as a scoped extension of the rule (ADR
+  0028). The release tooling refuses workspace members that it does not release unless they have `publish = false`.
 - Docs: define the path to v1.0 around sustained performance, optional eBPF diagnostics, reader/checkpoint
   optimization, ARM measurements, interoperability, replay/recovery at scale and explicit stability/release gates.
 - Docs: v1.0 scope decisions of 2026-11-19. The external integration is an iceoryx2 recorder and replayer

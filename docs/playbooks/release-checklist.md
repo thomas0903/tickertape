@@ -44,7 +44,10 @@ single-maintainer repository. Administrators are subject to the checks; force pu
    gitleaks git --redact --no-banner
    ```
 
-   Each crate must include both licences and its README, and exclude local agent tooling. Dry-running both packages
+   Each crate must include both licences and its README, and exclude local agent tooling. Other workspace members
+   (tests, benches, examples and the C ABI crate `tickertape-ffi`) have `publish = false`; the release script refuses
+   a member that is neither released nor marked so. Releases do not ship the C library yet (ADR 0028); if the C ABI
+   changed incompatibly, check that `TICKERTAPE_ABI_VERSION` was bumped and the changelog says so. Dry-running both packages
    together requires Cargo 1.90+. The release scripts require Python 3.11+; CI selects Python 3.12.
 4. Merge the release preparation pull request and wait for all CI jobs on the resulting `main` commit to pass.
 5. Confirm the owner has authorized publishing that exact version, then tag that commit:

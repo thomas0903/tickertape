@@ -13,9 +13,12 @@ Report possible vulnerabilities privately as described in [`SECURITY.md`](SECURI
   change to either needs a short design record in `docs/decisions/` (copy `_template.md`), in the same pull request.
 - **Spec, then tests, then code.** Write down the behaviour (rustdoc, spec section or ADR), add tests that fail
   without the change, then implement. `docs/playbooks/add-feature.md` has the checklist.
-- **`unsafe` lives in two modules.** Only `crates/tickertape/src/mmap.rs` (mappings and system calls) and
-  `crates/tickertape/src/crc.rs` (CPU intrinsics, ADR 0019) may contain `unsafe` code, and every `unsafe` block needs
-  a `// SAFETY:` comment. Changes there get extra review.
+- **`unsafe` lives in two modules, plus the C ABI crate.** In the core crate only `crates/tickertape/src/mmap.rs`
+  (mappings and system calls) and `crates/tickertape/src/crc.rs` (CPU intrinsics, ADR 0019) may contain `unsafe`
+  code. The C ABI crate `crates/tickertape-ffi` cannot avoid it (raw pointers from C, exported symbols), so it is a
+  deliberate, scoped exception (ADR 0028): keep each block small, and document each `unsafe extern "C" fn`'s contract
+  in a `# Safety` section (it is copied into the header). Every `unsafe` block needs a `// SAFETY:` comment. Changes
+  there get extra review. FFI code never goes into the core crate.
 - **No unverified claims.** Numbers in docs come from recorded runs (`docs/playbooks/run-benchmark.md`); guarantees
   name the test that checks them.
 
@@ -31,7 +34,15 @@ cargo deny check
 cargo test -p tickertape-tests --release -- --ignored        # long tests: 1M records, 250-kill loop
 cargo +nightly miri test -p tickertape --lib format          # Miri on the format code
 RUSTFLAGS="--cfg loom" cargo test -p tickertape --lib --release protocol_model
+cargo +nightly miri test -p tickertape-ffi --lib pure_         # Miri on the C ABI's argument handling
+TICKERTAPE_FFI_SANITIZE=1 cargo test -p tickertape-ffi         # C/C++ tests under ASan and UBSan
+cbindgen --config crates/tickertape-ffi/cbindgen.toml --crate tickertape-ffi \
+    --output crates/tickertape-ffi/include/tickertape.h && git diff --exit-code   # header drift (cbindgen 0.29.4)
 ```
+
+`cargo test --workspace` compiles and runs C and C++ programs, so it needs a C/C++ compiler; it also runs the
+Python decoder if `python3` is available. On Linux, CI also runs the C programs under Valgrind
+(`TICKERTAPE_FFI_VALGRIND=1`).
 
 On macOS, run the Linux checks in a VM or container too (`docs/playbooks/test-on-linux.md`), and keep test journals
 on a local filesystem (not tmpfs or a shared folder) when you test durability behaviour.
