@@ -3,10 +3,12 @@
 
 use std::io::{BufRead, BufReader, Read};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use tickertape::{Reader, ReaderConfig, RecoveryAction, Writer, WriterConfig};
-use tickertape_tests::{Rng, kill_len, payload, read_all, segments};
+use tickertape_tests::{Rng, kill_len, mixed_len, payload, read_all, segments};
 
 const KILL_WRITER: &str = env!("CARGO_BIN_EXE_tt-kill-writer");
 const SEGMENT: u64 = 64 * 1024;
@@ -138,4 +140,121 @@ fn kill_loop_short() {
 #[ignore = "long: 250 kills; run with --release -- --ignored"]
 fn kill_loop_250() {
     kill_loop(250);
+}
+
+/// A zero-copy reader validating records **while** the writer fills and publishes them (ADR 0027): a thread polls
+/// without sleeping while writer processes append records of mixed sizes (up to 3,199 bytes, so every CRC path
+/// including the three-lane loop runs on live data), roll 64 KiB segments, and are killed and restarted. The reader
+/// must never report an error and must return exactly the records each writer published, in order.
+fn live_mapped_reader(iterations: u32) {
+    let mut rng = Rng::from_env("live_mapped_reader");
+    let dir = tempfile::tempdir().unwrap();
+    let journal = dir.path().join("journal");
+    // The sequence number the reader stops at (set once the last writer is gone), and how far it has got.
+    let stop_at = Arc::new(AtomicU64::new(u64::MAX));
+    let progress = Arc::new(AtomicU64::new(0));
+    let reader = {
+        let (journal, stop_at, progress) = (journal.clone(), stop_at.clone(), progress.clone());
+        std::thread::spawn(move || {
+            let mut reader = loop {
+                // SAFETY: only tickertape writers (killed and recovered here) modify the journal, and they never
+                // modify committed bytes, including during recovery.
+                match unsafe { Reader::open_mapped(&journal, ReaderConfig::default()) } {
+                    Ok(reader) => break reader,
+                    Err(_) if stop_at.load(Ordering::SeqCst) == u64::MAX => {
+                        std::thread::yield_now()
+                    }
+                    Err(e) => panic!("open: {e}"),
+                }
+            };
+            let mut empty_polls = 0_u64;
+            loop {
+                let expected = reader.position();
+                match reader.try_next() {
+                    Ok(Some(rec)) => {
+                        assert_eq!(rec.seq, expected);
+                        assert_eq!(rec.schema_id, (rec.seq % 7) as u32);
+                        assert_eq!(rec.venue_ts_ns, rec.seq * 10);
+                        assert_eq!(rec.local_ts_ns, rec.seq * 10 + 1);
+                        assert!(
+                            rec.payload == payload(rec.seq, mixed_len(rec.seq)),
+                            "payload of {}",
+                            rec.seq
+                        );
+                        progress.store(rec.seq + 1, Ordering::SeqCst);
+                    }
+                    Ok(None) => {
+                        if reader.position() >= stop_at.load(Ordering::SeqCst) {
+                            return empty_polls;
+                        }
+                        empty_polls += 1;
+                        std::hint::spin_loop();
+                    }
+                    Err(e) => panic!("live mapped reader at {expected}: {e}"),
+                }
+            }
+        })
+    };
+
+    let mut read_while_live = 0;
+    for i in 0..iterations {
+        let before = progress.load(Ordering::SeqCst);
+        let mut child = Command::new(KILL_WRITER)
+            .args([
+                journal.to_str().unwrap(),
+                &SEGMENT.to_string(),
+                &rng.next_u64().to_string(),
+                "mixed",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn writer");
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        if i % 3 == 2 {
+            // Sometimes during open and recovery.
+            std::thread::sleep(Duration::from_micros(rng.below(10_000)));
+        } else {
+            let mut line = String::new();
+            stdout.read_line(&mut line).unwrap();
+            std::thread::sleep(Duration::from_micros(rng.below(20_000)));
+        }
+        child.kill().expect("SIGKILL");
+        child.wait().unwrap();
+        if progress.load(Ordering::SeqCst) > before {
+            read_while_live += 1;
+        }
+    }
+    // Recover once more, then let the reader catch up to exactly what recovery kept.
+    let next = Writer::open(&journal, WriterConfig::default().segment_size(SEGMENT))
+        .expect("recovery")
+        .next_seq();
+    stop_at.store(next, Ordering::SeqCst);
+    let empty_polls = reader.join().expect("live mapped reader failed");
+    assert_eq!(progress.load(Ordering::SeqCst), next);
+    let segs = segments(&journal).len();
+    eprintln!(
+        "live_mapped_reader: {iterations} kills, {next} records, {segs} segments, \
+         {read_while_live} writers read while live, {empty_polls} empty polls"
+    );
+    assert!(segs >= 4, "only {segs} segments: too few rolls");
+    assert!(
+        read_while_live > iterations / 3,
+        "the reader kept up with only {read_while_live} of {iterations} writers"
+    );
+    assert!(
+        empty_polls > 0,
+        "the reader never waited at an unpublished slot"
+    );
+}
+
+#[test]
+fn live_mapped_reader_short() {
+    live_mapped_reader(12);
+}
+
+#[test]
+#[ignore = "long: 120 kills; run with --release -- --ignored"]
+fn live_mapped_reader_120() {
+    live_mapped_reader(120);
 }

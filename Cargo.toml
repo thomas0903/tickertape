@@ -24,7 +24,7 @@ tickertape = { path = "crates/tickertape", version = "0.4.0" }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)", "cfg(fuzzing)"] }
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)", "cfg(fuzzing)", "cfg(tickertape_force_soft_crc)"] }
 missing_debug_implementations = "warn"
 rust_2018_idioms = { level = "warn", priority = -1 }
 

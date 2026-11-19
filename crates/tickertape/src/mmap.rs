@@ -6,10 +6,11 @@
 //! - [`MapRw`]: the writer's `PROT_READ | PROT_WRITE`, `MAP_SHARED` mapping. Commit words are stored with
 //!   `Release` and loaded with `Acquire` through `AtomicU32::from_ptr` (the memory is writable, as `from_ptr`
 //!   requires). Body bytes are written through `&mut [u8]` slices of exactly the uncommitted range.
-//! - [`MapRo`]: the zero-copy reader's `PROT_READ`, `MAP_SHARED` mapping. Commit words are loaded with `Relaxed`
-//!   (documented as permitted on read-only memory for 4-byte loads on x86-64 and aarch64), followed by an `Acquire`
-//!   fence. Record bodies are validated from `Relaxed` 4- and 8-byte atomic loads ([`SharedWords`], ADR 0027).
-//!   Committed bytes are handed out only through an `unsafe fn`, whose contract is `Reader::open_mapped`'s.
+//! - [`MapRo`]: the zero-copy reader's `PROT_READ`, `MAP_SHARED` mapping, used only on targets where
+//!   `core::sync::atomic` documents 4- and 8-byte `Relaxed` loads as permitted on read-only memory
+//!   ([`MAPPED_READS`]: x86-64 and aarch64). Commit words are loaded with `Relaxed`, followed by an `Acquire` fence.
+//!   Record bodies are validated from `Relaxed` 4- and 8-byte atomic loads ([`SharedWords`], ADR 0027). Committed
+//!   bytes are handed out only through an `unsafe fn`, whose contract is `Reader::open_mapped`'s.
 //! - File-level calls: `flock`, preallocation, `fdatasync`/`fsync`/`F_FULLFSYNC`, `msync`, `pread`.
 
 use std::fs::File;
@@ -268,7 +269,19 @@ impl Advice {
     }
 }
 
+/// Whether this target maps segments for reading (the zero-copy reader). Only x86-64 and aarch64: there
+/// `core::sync::atomic` ("Atomic accesses to read-only memory") documents `Relaxed` loads of up to 8 bytes as
+/// permitted on read-only memory, and they are plain single load instructions. On 32-bit targets the limit is 4 bytes
+/// (an 8-byte atomic load on i686 without SSE is a locked compare-exchange, which faults on a read-only page), so
+/// `Reader::open_mapped` reads with `pread` there instead (ADR 0027 → Supported targets).
+pub(crate) const MAPPED_READS: bool = cfg!(any(target_arch = "x86_64", target_arch = "aarch64"));
+
 /// A zero-copy reader's read-only shared mapping of one segment file.
+///
+/// Reads before validation go only through [`MapRo::commit_word`], [`MapRo::load_u32`] and [`MapRo::words`], all
+/// `Relaxed` atomic loads through references that assert no immutability. What makes those loads sound, and the one
+/// case in which they are not covered by Rust's memory model (a commit word whose length is damaged), is set out in
+/// ADR 0027 → "Which loads can race".
 #[derive(Debug)]
 pub(crate) struct MapRo {
     ptr: NonNull<u8>,
@@ -279,8 +292,15 @@ pub(crate) struct MapRo {
 unsafe impl Send for MapRo {}
 
 impl MapRo {
-    /// Maps the first `len` bytes of `file` (which may be opened read-only) for reading.
+    /// Maps the first `len` bytes of `file` (which may be opened read-only) for reading. `Unsupported` on targets
+    /// without [`MAPPED_READS`], where nothing may be loaded atomically from a read-only mapping.
     pub(crate) fn new(file: &File, len: usize) -> io::Result<MapRo> {
+        if !MAPPED_READS {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "read-only mappings are not used on this target",
+            ));
+        }
         let ptr = map(file, len, libc::PROT_READ)?;
         Ok(MapRo { ptr, len })
     }
@@ -292,7 +312,9 @@ impl MapRo {
         let off = checked_word(self.len, offset)?;
         // SAFETY: aligned and in bounds (checked); the mapping lives as long as `self`. The reference is created by a
         // pointer cast, not `AtomicU32::from_ptr` (which requires writable memory), and is used only for a 4-byte
-        // `Relaxed` load, which `std::sync::atomic` documents as permitted on read-only memory on x86-64 and aarch64.
+        // `Relaxed` load, which `core::sync::atomic` documents as permitted on read-only memory on the targets that
+        // map segments for reading (`MAPPED_READS`; `new` refuses elsewhere). The writer accesses commit words only
+        // with 4-byte atomic stores (ADR 0003), so this load races with no store and is never mixed-size.
         let word = unsafe { &*self.ptr.as_ptr().add(off).cast::<AtomicU32>() };
         let value = word.load(Ordering::Relaxed);
         if value != 0 {
@@ -301,37 +323,60 @@ impl MapRo {
         Some(value)
     }
 
-    /// Loads the 4 bytes at `offset` (a multiple of 4) with a `Relaxed` atomic load, without creating any reference
-    /// that outlives the load. Sound whatever other processes do to these bytes (at worst the value is stale or
-    /// garbage). `None` if misaligned or out of bounds.
+    /// Loads the 4 bytes at `offset` (a multiple of 4) with one `Relaxed` atomic load, without creating any
+    /// reference that outlives the load. The reader uses it for the CRC field at `P+4` of a record or seal whose
+    /// non-zero commit word at `P` it has just observed. `None` if misaligned or out of bounds.
     pub(crate) fn load_u32(&self, offset: u64) -> Option<u32> {
         if offset % 4 != 0 {
             return None;
         }
         checked_range(self.len, offset, 4)?;
-        // SAFETY: `offset` is 4-aligned (the mapping is page-aligned) and `[offset, offset + 4)` is inside the mapping
-        // (checked above), which lives as long as `self`. The reference comes from a pointer cast and is used only for
-        // a 4-byte `Relaxed` load, which `std::sync::atomic` documents as permitted on read-only memory on x86-64 and
-        // aarch64; atomic loads never form a data race.
+        // SAFETY: memory. `offset` is 4-aligned, as `AtomicU32` requires (the mapping is page-aligned), and
+        // `[offset, offset + 4)` is inside the mapping (checked above), which stays mapped while `self` lives. The
+        // temporary `&AtomicU32` comes from a pointer cast (`AtomicU32::from_ptr` requires writable memory), lives
+        // only for this statement, and is used for one 4-byte `Relaxed` load: `core::sync::atomic` ("Atomic accesses
+        // to read-only memory") permits exactly that on read-only memory on the targets that map segments for reading
+        // (`MAPPED_READS`; `new` refuses elsewhere). `AtomicU32` is an `UnsafeCell`, so the reference asserts nothing
+        // about the bytes staying unchanged.
+        // Races. The reader's two uses load `[P+4, P+8)` after observing the commit word at `P`: the writer stored
+        // those 4 bytes before its `Release` store of that word, which the reader's `Acquire` fence synchronises
+        // with, and never stores to them again, so this load races with no store. That holds even when the length in
+        // the commit word is damaged, because `[P+4, P+8)` lies before the next slot (ADR 0027 → "Which loads can
+        // race").
         let word = unsafe { &*self.ptr.as_ptr().add(offset as usize).cast::<AtomicU32>() };
         Some(word.load(Ordering::Relaxed))
     }
 
     /// The `count` 8-byte words starting at `offset` (a multiple of 8), readable only through `Relaxed` atomic loads
-    /// (ADR 0027). Readers validate a record from these loads before [`MapRo::committed_bytes`] may be used on it.
-    /// `None` if misaligned or out of bounds.
+    /// (ADR 0027). The reader asks for the words of `[P+8, P+align8(len))` of a record whose commit word at `P` holds
+    /// `len`, and validates the record from them before [`MapRo::committed_bytes`] may be used on it. `None` if
+    /// misaligned or out of bounds.
     pub(crate) fn words(&self, offset: u64, count: u64) -> Option<SharedWords<'_>> {
         if offset % 8 != 0 {
             return None;
         }
         let end = checked_range(self.len, offset, count.checked_mul(8)?)?;
         let start = offset as usize;
-        // SAFETY: `start` is 8-aligned (the mapping is page-aligned), as `AtomicU64` requires, and `[start, end)` is
-        // inside the mapping (checked above), which stays mapped for the returned lifetime because it borrows `self`.
-        // `AtomicU64` contains an `UnsafeCell`, so the slice asserts nothing about the bytes being unchanging, and
-        // atomic loads never form a data race with what other processes do. The memory is read-only, so the slice
-        // must only ever be used for 8-byte `Relaxed` loads, which `std::sync::atomic` documents as permitted on
-        // read-only memory on x86-64 and aarch64; `SharedWords` keeps it private and offers nothing else.
+        // SAFETY: memory. `start` is 8-aligned, as `AtomicU64` requires (the mapping is page-aligned), and
+        // `[start, end)` is inside the mapping (checked above, with the multiplication overflow-checked), which stays
+        // mapped for the returned lifetime because it borrows `self`. The `&[AtomicU64]` is a reference, but one to
+        // `UnsafeCell`s: it asserts nothing about the bytes staying unchanged, unlike a `&[u8]`, which is only formed
+        // after validation (`committed_bytes`). The memory is read-only, so the slice may only be used for 8-byte
+        // `Relaxed` loads, which `core::sync::atomic` ("Atomic accesses to read-only memory") permits on read-only
+        // memory on the targets that map segments for reading (`MAPPED_READS`; `new` refuses elsewhere).
+        // `SharedWords` keeps the slice private and offers nothing else.
+        // Races. For a record published by the protocol, the writer stored every byte of `[P+8, P+align8(len))`
+        // (padding was zero beforehand) before its `Release` store of the commit word, which the reader's `Acquire`
+        // fence synchronises with, and never stores to them again; the words end at the next slot's commit word and
+        // never cover another record's commit word. So the loads race with no store and overlap no atomic access of
+        // another size. If the length in the commit word is damaged, the words can reach past the writer's current
+        // slot, where a live writer is storing body bytes (non-atomic) and the next commit word (a 4-byte atomic).
+        // That is a data race, and a mixed-size access, in Rust's memory model when the writer is in this process,
+        // and outside the model when it is another process. The code then relies on each load being one aligned
+        // 8-byte load instruction on these targets, which cannot fault inside the mapping and returns some mixture of
+        // old and new bytes; the compiler may not split, repeat or invent an atomic load; and no reference asserting
+        // immutability exists. The CRC then rejects the frame except with probability about 2^-32. The copying reader
+        // before ADR 0027 loaded the same bytes the same way. A known limitation: ADR 0027 → "Which loads can race".
         let words = unsafe {
             std::slice::from_raw_parts(
                 self.ptr.as_ptr().add(start).cast::<AtomicU64>(),
@@ -345,16 +390,21 @@ impl MapRo {
     ///
     /// # Safety
     ///
-    /// The bytes must belong to a committed record that has already been validated (length, CRC, sequence) from
-    /// `Relaxed` atomic loads ([`MapRo::load_u32`], [`MapRo::words`]) made after observing its non-zero commit word,
-    /// and no process may modify them while the returned slice lives. This is `Reader::open_mapped`'s safety
-    /// contract; the tickertape writer never modifies committed bytes. Validating first means a corrupted length
+    /// The bytes must belong to a committed record that has already been validated (length, CRC, sequence, flags)
+    /// from `Relaxed` atomic loads ([`MapRo::load_u32`], [`MapRo::words`]) made after observing its non-zero commit
+    /// word, and no process may modify them while the returned slice lives. This is `Reader::open_mapped`'s safety
+    /// contract; the tickertape writer never modifies committed bytes. Validating first means a damaged length
     /// can't make the slice cover bytes the writer is still appending to (barring a CRC collision, about 2^-32 per
-    /// corrupted record).
+    /// damaged record).
     pub(crate) unsafe fn committed_bytes(&self, offset: u64, len: u64) -> Option<&[u8]> {
         let end = checked_range(self.len, offset, len)?;
         let start = offset as usize;
-        // SAFETY: in bounds (checked), readable for `self`'s lifetime, and immutable per the caller's contract.
+        // SAFETY: memory: in bounds (checked) and readable for `self`'s lifetime; `u8` has no alignment or validity
+        // requirement. Unlike the atomic references used during validation, this `&[u8]` asserts that the bytes do
+        // not change while it lives, and the reader reads them with ordinary loads. That holds by the caller's
+        // contract: the record passed validation, so its frame is the one the writer published with its `Release`
+        // store (which happens before these reads, through the reader's `Acquire` fence), and nobody modifies
+        // committed bytes afterwards.
         Some(unsafe { std::slice::from_raw_parts(self.ptr.as_ptr().add(start), end - start) })
     }
 }
@@ -367,8 +417,10 @@ impl Drop for MapRo {
 }
 
 /// A run of 8-byte words that may live in a read-only shared mapping, readable only through 8-byte `Relaxed` atomic
-/// loads (ADR 0027). It never exposes a reference to the words, so it is sound whatever other processes do to them:
-/// at worst a load returns a stale or torn-across-words value, which validation then rejects.
+/// loads (ADR 0027). It never exposes a reference to the words, and each load is one atomic load of one word. Over
+/// a published record no store races with these loads; over a frame whose length is damaged they may overlap bytes
+/// a live writer is storing (see [`MapRo::words`] and ADR 0027 → "Which loads can race"), and validation then rejects
+/// the mixture of old and new bytes they return.
 ///
 /// Built over a mapping by [`MapRo::words`], or over ordinary memory by [`SharedWords::new`] (tests and fuzzing, so
 /// that the validation code also runs under Miri). Words are little-endian like everything on disk (the crate
@@ -1047,10 +1099,108 @@ pub(crate) fn is_storage_full(err: &io::Error) -> bool {
     matches!(err.raw_os_error(), Some(code) if code == libc::ENOSPC || code == libc::EDQUOT)
 }
 
+/// A read-only mapping that isn't backed by a file, for tests that also run under Miri.
+#[cfg(test)]
+impl MapRo {
+    /// An anonymous private mapping holding `bytes` (zero-padded to whole pages), made read-only where segments are
+    /// mapped for reading ([`MAPPED_READS`]) and outside Miri (which doesn't model page protection).
+    fn anonymous(bytes: &[u8]) -> MapRo {
+        let page = page_size();
+        let len = bytes.len().max(1).div_ceil(page) * page;
+        // SAFETY: an anonymous private mapping with a null hint and a non-zero length has no memory-safety
+        // preconditions; it returns fresh memory that nothing aliases, or MAP_FAILED (checked).
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(ptr, libc::MAP_FAILED, "{}", last_os_error());
+        let ptr = NonNull::new(ptr.cast::<u8>()).expect("mmap returned null");
+        // SAFETY: the fresh mapping is writable, at least `bytes.len()` long, and no reference into it exists yet.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.as_ptr(), bytes.len()) };
+        if MAPPED_READS && !cfg!(miri) {
+            // SAFETY: changes the protection of exactly this fresh mapping; no reference into it exists yet.
+            let rc = unsafe { libc::mprotect(ptr.as_ptr().cast(), len, libc::PROT_READ) };
+            assert_eq!(rc, 0, "{}", last_os_error());
+        }
+        MapRo { ptr, len }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// The reader's loads, bounds and alignment on a mapping that also exists under Miri (where file mappings don't):
+    /// Miri checks the pointer arithmetic of `load_u32`, `words` and `committed_bytes`; natively the memory is
+    /// read-only, so any access other than a plain load would fault.
+    #[test]
+    fn map_ro_loads_validate_a_record_on_anonymous_memory() {
+        use crate::format::{self, RecordHeader};
+        let payload: Vec<u8> = (0..203_u32).map(|i| (i * 13 + 5) as u8).collect();
+        let header = RecordHeader {
+            seq: 9,
+            schema_id: 3,
+            venue_ts_ns: 11,
+            local_ts_ns: 12,
+        };
+        let len = format::frame_len(payload.len()).unwrap();
+        let mut image = vec![0u8; 64 + format::align8(u64::from(len)) as usize + 16];
+        // The record at offset 64, then the next slot (empty) and a word of non-zero bytes after it.
+        let body = &mut image[68..64 + len as usize];
+        format::write_record_fields(&header, body);
+        body[36..].copy_from_slice(&payload);
+        format::finish_record_body(len, body);
+        image[64..68].copy_from_slice(&len.to_le_bytes());
+        let end = image.len();
+        image[end - 8..].copy_from_slice(&[0xa5; 8]);
+        let map = MapRo::anonymous(&image);
+        let size = map.len;
+
+        assert_eq!(map.commit_word(64), Some(len));
+        let crc = map.load_u32(68).unwrap();
+        assert_eq!(crc.to_le_bytes(), image[68..72]);
+        let words = map
+            .words(72, (format::align8(u64::from(len)) - 8) / 8)
+            .unwrap();
+        assert_eq!(format::decode_record_words(len, crc, words, 9), Ok(header));
+        // SAFETY: the record was validated just above and nothing modifies this memory.
+        let bytes = unsafe { map.committed_bytes(104, payload.len() as u64) }.unwrap();
+        assert_eq!(bytes, &payload[..]);
+        let next = 64 + format::align8(u64::from(len));
+        assert_eq!(map.commit_word(next), Some(0));
+        assert_eq!(
+            map.words(next + 8, 1).unwrap().get(0),
+            Some(0xa5a5_a5a5_a5a5_a5a5)
+        );
+
+        // Bounds and alignment at the end of the mapping.
+        let last = size as u64;
+        assert!(map.load_u32(last - 4).is_some());
+        assert!(map.load_u32(last).is_none());
+        assert!(map.load_u32(last - 2).is_none(), "misaligned");
+        assert!(map.load_u32(u64::MAX - 3).is_none());
+        assert_eq!(map.words(last - 8, 1).map(|w| w.len()), Some(1));
+        assert!(map.words(last - 8, 2).is_none());
+        assert!(map.words(last, 0).is_some_and(|w| w.len() == 0));
+        assert!(map.words(last + 8, 0).is_none());
+        assert!(map.words(4, 1).is_none(), "misaligned");
+        assert!(map.words(8, u64::MAX / 4).is_none(), "overflowing length");
+        assert!(map.words(u64::MAX - 7, 1).is_none(), "overflowing end");
+        let all = map.words(0, last / 8).unwrap();
+        assert_eq!(all.len() as u64, last / 8);
+        assert_eq!(all.get(8), Some(u64::from(len) | u64::from(crc) << 32));
+        assert_eq!(all.iter().count() as u64, last / 8);
+        assert!(map.commit_word(last - 4).is_none());
+        // SAFETY: out-of-bounds requests return None without touching memory.
+        assert!(unsafe { map.committed_bytes(last - 1, 2) }.is_none());
+    }
 
     fn temp_file(len: u64) -> (tempfile::TempDir, File) {
         let dir = tempfile::tempdir().unwrap();

@@ -208,14 +208,22 @@ fn align8(n: u64) -> u64 {
     format::align8(n)
 }
 
-/// A journal of three 64 KiB segments (two sealed) with varied payload lengths, closed cleanly.
+/// Payload lengths at and around the CRC's three-lane thresholds (192 and 768 bytes of payload words) and well past
+/// them, so that corruption also lands in records the three-lane loop validates.
+const LANE_LENS: [usize; 7] = [191, 192, 767, 768, 800, 1300, 2000];
+
+/// A journal of three 64 KiB segments (two sealed) with varied payload lengths, closed cleanly. Records 10 to 16 have
+/// the payload lengths in [`LANE_LENS`].
 fn base_journal(root: &Path) -> (PathBuf, Vec<usize>) {
     let journal = root.join("base");
     let mut writer = Writer::open(&journal, small_config()).unwrap();
     let mut lens = Vec::new();
     let mut seq = 0u64;
     while segments(&journal).len() < 3 || lens.len() < 400 {
-        let len = ((seq * 131) % 700) as usize;
+        let len = match seq.checked_sub(10) {
+            Some(i) if (i as usize) < LANE_LENS.len() => LANE_LENS[i as usize],
+            _ => ((seq * 131) % 700) as usize,
+        };
         append(&mut writer, len);
         lens.push(len);
         seq += 1;
@@ -305,19 +313,33 @@ fn every_corruption_class_is_reported_identically() {
     let before_seal = *middle.last().unwrap();
     let segment_start = middle[0];
     let tail = *last.last().unwrap();
+    let lane_records: Vec<(String, Placed)> = LANE_LENS
+        .iter()
+        .map(|&n| {
+            let placed = *first
+                .iter()
+                .find(|p| p.len as usize == n + format::RECORD_HEADER_LEN)
+                .unwrap();
+            (format!("payload {n}"), placed)
+        })
+        .collect();
 
-    type Damage = Box<dyn Fn(&Path, Placed)>;
+    type Damage = Box<dyn Fn(&Path, Placed) + Send + Sync>;
     type Case = (String, PathBuf, Placed, Damage, Expect);
     let mut cases: Vec<Case> = Vec::new();
     let mut add = |name: String, path: &PathBuf, placed: Placed, f: Damage, e: Expect| {
         cases.push((name, path.clone(), placed, f, e));
     };
-    for (label, path, placed) in [
-        ("mid", &segs[0].1, mid),
-        ("before-seal", &segs[1].1, before_seal),
-        ("segment-start", &segs[1].1, segment_start),
-        ("tail", &segs[segs.len() - 1].1, tail),
-    ] {
+    let mut targets: Vec<(String, &PathBuf, Placed)> = vec![
+        ("mid".into(), &segs[0].1, mid),
+        ("before-seal".into(), &segs[1].1, before_seal),
+        ("segment-start".into(), &segs[1].1, segment_start),
+        ("tail".into(), &segs[segs.len() - 1].1, tail),
+    ];
+    for (label, placed) in &lane_records {
+        targets.push((label.clone(), &segs[0].1, *placed));
+    }
+    for (label, path, placed) in targets {
         let seq = placed.header.seq;
         let bad = |s: u64| Expect::Corrupt(s, |_| true);
         // Commit word states.
@@ -357,9 +379,25 @@ fn every_corruption_class_is_reported_identically() {
         );
         // Every byte of the CRC field and the header fields, and payload bytes at each end and at word boundaries.
         let body_len = placed.len as usize - 4;
-        let mut positions: Vec<usize> = (0..36).collect();
-        for p in [36, 37, 43, 44, 45, body_len - 9, body_len - 8, body_len - 1] {
-            if p >= 36 && p < body_len {
+        // Every header byte for the first four targets; the records at the lane lengths add only a sample of them,
+        // since the header is checked the same way whatever the length, and concentrate on the payload.
+        let mut positions: Vec<usize> = if label.starts_with("payload") {
+            vec![0, 3, 4, 11, 12, 16, 19, 20, 35]
+        } else {
+            (0..36).collect()
+        };
+        // Payload bytes: the first and last ones, word boundaries, the three-lane thresholds and block boundaries
+        // (a short block is 3 x 64 bytes, a long one 3 x 256), and every 64th byte of long payloads, so each lane of
+        // each block is hit.
+        let mut payload_bytes = vec![0, 1, 7, 8, 9, 63, 64, 191, 192, 193, 255, 256, 511, 512];
+        payload_bytes.extend([767, 768, 769, 959, 960, 1535, 1536]);
+        payload_bytes.extend((0..body_len).step_by(64));
+        for p in payload_bytes.into_iter().map(|p| 36 + p).chain([
+            body_len.saturating_sub(9),
+            body_len - 8,
+            body_len - 1,
+        ]) {
+            if p >= 36 && p < body_len && !positions.contains(&p) {
                 positions.push(p);
             }
         }
@@ -396,12 +434,30 @@ fn every_corruption_class_is_reported_identically() {
             Box::new(|f, at| rewrite_with_valid_crc(f, at, |b| b[4] ^= 1)),
             Expect::Corrupt(seq, |r| matches!(r, CorruptReason::BadSequence { .. })),
         );
+        // Each flag byte, lowest and highest bit, so no flag byte can be ignored.
+        for byte in 16..20 {
+            for bit in [0x01_u8, 0x80] {
+                add(
+                    format!("{label}: flag byte {byte} = {bit:#04x}, valid CRC"),
+                    path,
+                    placed,
+                    Box::new(move |f, at| rewrite_with_valid_crc(f, at, |b| b[byte] = bit)),
+                    Expect::Corrupt(seq, |r| matches!(r, CorruptReason::BadFlags)),
+                );
+            }
+        }
+        // Both a wrong sequence number and a flag: the sequence number is checked first, by both readers.
         add(
-            format!("{label}: flags, valid CRC"),
+            format!("{label}: wrong seq and flags, valid CRC"),
             path,
             placed,
-            Box::new(|f, at| rewrite_with_valid_crc(f, at, |b| b[19] = 0x80)),
-            Expect::Corrupt(seq, |r| matches!(r, CorruptReason::BadFlags)),
+            Box::new(|f, at| {
+                rewrite_with_valid_crc(f, at, |b| {
+                    b[4] ^= 1;
+                    b[17] = 0x10;
+                })
+            }),
+            Expect::Corrupt(seq, |r| matches!(r, CorruptReason::BadSequence { .. })),
         );
         // Torn: the commit word is there but the end of the body, or all of it, is not.
         add(
@@ -466,12 +522,13 @@ fn every_corruption_class_is_reported_identically() {
         }),
     );
 
-    for (i, (name, path, placed, corrupt, expect)) in cases.into_iter().enumerate() {
+    let run = |i: usize, (name, path, placed, corrupt, expect): &Case| {
+        let (placed, expect) = (*placed, *expect);
         let dir = copy_journal(&base, root.path(), &format!("case{i}"));
         let file = dir.join(path.file_name().unwrap());
         corrupt(&file, placed);
         let trace = both(&dir);
-        check_expect(&trace, expect, total, &name);
+        check_expect(&trace, expect, total, name);
         if let Expect::Corrupt(_, reason) = expect {
             // Re-read the typed error from the mapped reader (the trace keeps only its text).
             // SAFETY: nothing modifies the journal while this reader exists.
@@ -489,7 +546,21 @@ fn every_corruption_class_is_reported_identically() {
             }
         }
         fs::remove_dir_all(&dir).unwrap();
-    }
+    };
+    // Each case works on its own copy of the journal, so they run on several threads.
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let workers = std::thread::available_parallelism().map_or(4, |n| n.get().min(8));
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(case) = cases.get(i) else { break };
+                    run(i, case);
+                }
+            });
+        }
+    });
 }
 
 /// Builds a journal from `lens`, applies `damage` (segment index, offset in the file, XOR mask, or zero a range),
@@ -535,4 +606,85 @@ proptest! {
             check_contents(&mapped, &lens);
         }
     }
+}
+
+/// A record that is complete in the mapping (header, payload and CRC all written) but whose commit word is not yet
+/// stored is invisible to both readers, however often they poll; once the writer stores the commit word, they return
+/// exactly that record. Covers every CRC path (lengths through the three-lane thresholds) and rolls, where the hook
+/// runs after the old segment's seal and with the new segment's first slot still empty.
+#[test]
+fn a_complete_but_unpublished_record_stays_invisible_until_its_commit_word() {
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let journal = dir.path().join("j");
+    let mut writer = Writer::open(&journal, small_config()).unwrap();
+    append(&mut writer, 10);
+    // SAFETY: only the tickertape writer modifies the journal, and it never modifies committed bytes.
+    let mapped = Rc::new(RefCell::new(
+        unsafe { Reader::open_mapped(&journal, ReaderConfig::default()) }.unwrap(),
+    ));
+    let safe = Rc::new(RefCell::new(
+        Reader::open(&journal, ReaderConfig::default()).unwrap(),
+    ));
+    for reader in [&mapped, &safe] {
+        assert_eq!(reader.borrow_mut().next_owned().unwrap().unwrap().seq, 0);
+        assert!(reader.borrow_mut().try_next().unwrap().is_none());
+    }
+
+    let lens = [0, 5, 191, 192, 767, 768, 800, 2000, 4000];
+    for round in 0..8 {
+        for len in lens {
+            let seq = writer.next_seq();
+            let segment_count = segments(&journal).len();
+            let ran = Rc::new(Cell::new(false));
+            let (m, sf, r, j) = (mapped.clone(), safe.clone(), ran.clone(), journal.clone());
+            tickertape::fault::before_next_publish(move || {
+                // The record really is complete: at the first slot without a valid record in the active segment,
+                // the commit word is still zero and the body validates against the length about to be stored.
+                let (_, path) = segments(&j).pop().unwrap();
+                let (_, at) = walk(&path);
+                let frame = format::frame_len(len).unwrap();
+                assert_eq!(read_at(&path, at, 4), [0; 4], "seq {seq}: commit word");
+                let body = read_at(&path, at + 4, frame as usize - 4);
+                let decoded = format::decode_record_body(frame, &body, seq).map(|(h, _)| h.seq);
+                assert_eq!(
+                    decoded,
+                    Ok(seq),
+                    "seq {seq}: body not complete before publication"
+                );
+                for _ in 0..200 {
+                    assert!(
+                        m.borrow_mut().try_next().unwrap().is_none(),
+                        "mapped reader saw unpublished record {seq}"
+                    );
+                    assert!(
+                        sf.borrow_mut().try_next().unwrap().is_none(),
+                        "safe reader saw unpublished record {seq}"
+                    );
+                }
+                r.set(true);
+            });
+            append(&mut writer, len);
+            assert!(ran.get(), "round {round}, seq {seq}: the hook didn't run");
+            let rolled = segments(&journal).len() > segment_count;
+            for (kind, reader) in [("mapped", &mapped), ("safe", &safe)] {
+                let rec = reader
+                    .borrow_mut()
+                    .next_owned()
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("{kind} reader: record {seq} missing"));
+                let (schema_id, venue_ts_ns, local_ts_ns, data) = record_for(seq, len);
+                assert_eq!(
+                    (rec.seq, rec.schema_id, rec.venue_ts_ns, rec.local_ts_ns),
+                    (seq, schema_id, venue_ts_ns, local_ts_ns),
+                    "{kind} reader, seq {seq} (rolled: {rolled})"
+                );
+                assert_eq!(rec.payload, data, "{kind} reader, seq {seq}");
+                assert!(reader.borrow_mut().try_next().unwrap().is_none());
+            }
+        }
+    }
+    assert!(segments(&journal).len() >= 2, "the test must cover a roll");
 }

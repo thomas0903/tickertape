@@ -185,6 +185,18 @@ pub fn kill_len(seq: u64) -> usize {
     bounded_len(seq, 512)
 }
 
+/// Payload length used by `tt-kill-writer` in `mixed` mode: short records, records at the CRC's three-lane thresholds
+/// (192 and 768 bytes of payload words) and records of 800 to 3,199 bytes, so a zero-copy reader validates every CRC
+/// path while the writer appends.
+pub fn mixed_len(seq: u64) -> usize {
+    const LANE_EDGES: [usize; 6] = [191, 192, 767, 768, 769, 800];
+    match seq % 4 {
+        0 => LANE_EDGES[(seq / 4 % 6) as usize],
+        1 => 800 + ((seq * 37) % 2400) as usize,
+        _ => bounded_len(seq, 512),
+    }
+}
+
 /// Opens a writer, retrying briefly while the lock is held.
 ///
 /// Rust opens files with close-on-exec, but a child process forked by a test running in parallel holds a copy of

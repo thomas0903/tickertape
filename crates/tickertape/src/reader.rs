@@ -112,24 +112,35 @@ impl Reader {
     /// without copying.
     ///
     /// Each record is validated (length, CRC32C, sequence number, flags) from atomic loads of the mapping before any
-    /// slice into it is created, so a corrupted length can't make a payload cover bytes the writer is still
-    /// appending (barring a CRC collision, about 2^-32 per corrupted record). The checks, their order and the errors
+    /// slice into it is created, so a damaged length can't make a payload cover bytes the writer is still
+    /// appending (barring a CRC collision, about 2^-32 per damaged record). The checks, their order and the errors
     /// are those of [`Reader::open`] (ADR 0027).
+    ///
+    /// Segments are mapped only on x86-64 and aarch64. On other targets this opens the same reader as
+    /// [`Reader::open`] (same API and results; payloads borrow from a buffer the reader owns and nothing is mapped),
+    /// because the atomic loads used for validation are not documented as working on read-only memory there.
     ///
     /// # Safety
     ///
     /// While the returned reader exists, no process other than a tickertape [`Writer`](crate::Writer) may modify
     /// the journal's segment files (writing into them, truncating them, or replacing their contents through other
-    /// tools). A tickertape writer never modifies bytes after committing them, including during crash recovery,
-    /// which repairs by replacing files (`docs/format.md` → Recovery). A returned payload is the bytes that were
+    /// tools). A tickertape writer never modifies committed bytes, including during crash recovery, which only
+    /// zeroes never-committed bytes and writes seals in place, at or after the first empty slot, and otherwise
+    /// replaces or moves whole files (`docs/format.md` → Recovery). A returned payload is the bytes that were
     /// validated only because nothing modifies them afterwards. If a mapped file is truncated, the process receives
     /// `SIGBUS`.
+    ///
+    /// Known limitation: if storage damage enlarges the length in an earlier record's commit word while no writer
+    /// runs, and a writer then appends after it, validating that record can load bytes the writer is storing at
+    /// that moment. Rust's memory model doesn't cover this (it is a data race if the writer runs in the same
+    /// process). The loads return a mixture of old and new bytes and the CRC rejects the record except with
+    /// probability about 2^-32, as in every earlier release (ADR 0027 → "Which loads can race").
     ///
     /// # Errors
     ///
     /// As for [`Reader::open`].
     pub unsafe fn open_mapped(dir: impl AsRef<Path>, config: ReaderConfig) -> Result<Reader> {
-        Reader::open_inner(dir.as_ref(), config, true)
+        Reader::open_inner(dir.as_ref(), config, crate::mmap::MAPPED_READS)
     }
 
     fn open_inner(dir: &Path, config: ReaderConfig, mapped: bool) -> Result<Reader> {
