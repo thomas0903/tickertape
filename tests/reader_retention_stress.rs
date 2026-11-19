@@ -4,7 +4,8 @@
 //! A writer with 64 KiB segments checkpoints every 128 records with `max_segments(2)` retention, so the oldest
 //! segment disappears many times a second. Against it run safe and zero-copy readers: fast and slow followers, a
 //! durable-only follower, readers that `seek` near the oldest record in a tight loop, readers that reopen in a loop,
-//! and `inspect::list_segments`/`inspect::verify` in a loop. A few seconds in the default run; longer with
+//! and `inspect::list_segments`/`inspect::verify` in a loop. A few seconds in the default run (longer if a slow disk
+//! stalls checkpoints, until retention has removed segments and readers have seen both errors); one minute with
 //! `--ignored`. Replay a run with `TICKERTAPE_TEST_SEED`.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -15,8 +16,12 @@ use tickertape::retention::{Action, Policy};
 use tickertape::{Error, Reader, ReaderConfig, Writer, inspect};
 use tickertape_tests::{Rng, append_n, check_record, small_config};
 
-/// A reader that hasn't made progress for this long while the writer has is stuck.
+/// A reader that hasn't made progress for this long while the writer has is stuck. Time during which the writer
+/// itself makes no progress (a slow checkpoint) doesn't count.
 const STALL: Duration = Duration::from_secs(5);
+/// How long a run may continue past its duration until retention and both errors have been exercised (a slow
+/// disk can stall checkpoints, and so retention, for seconds).
+const GRACE: Duration = Duration::from_secs(60);
 
 #[test]
 fn readers_under_retention() {
@@ -86,6 +91,8 @@ struct Shared<'a> {
     /// `Error::Discarded` and `Error::SeqUnavailable` seen by all readers.
     discarded: &'a AtomicU64,
     unavailable: &'a AtomicU64,
+    /// Segments removed by the writer's retention so far.
+    removed: &'a AtomicU64,
 }
 
 /// Sets the stop flag when dropped, so that a panic on any thread ends the others too.
@@ -103,6 +110,7 @@ fn stress(duration: Duration) {
     let head = AtomicU64::new(0);
     let discarded = AtomicU64::new(0);
     let unavailable = AtomicU64::new(0);
+    let removed = AtomicU64::new(0);
     let progress: Vec<AtomicU64> = ROLES.iter().map(|_| AtomicU64::new(0)).collect();
     let mut rng = Rng::from_env("readers_under_retention");
     let config = small_config().retention(Policy::default().max_segments(2), Action::Delete);
@@ -116,9 +124,10 @@ fn stress(duration: Duration) {
         head: &head,
         discarded: &discarded,
         unavailable: &unavailable,
+        removed: &removed,
     };
 
-    let removed = thread::scope(|s| {
+    thread::scope(|s| {
         let _stop = StopOnDrop(&stop);
         let writer = s.spawn(|| {
             let _stop = StopOnDrop(&stop);
@@ -143,28 +152,44 @@ fn stress(duration: Duration) {
             });
         }
 
-        // Every reader must keep making progress while the writer does.
+        // Every reader must keep making progress while the writer does: count, per reader, the time without
+        // progress during which the writer's head moved.
         let started = Instant::now();
-        let mut last: Vec<(u64, Instant)> = progress.iter().map(|_| (0, started)).collect();
-        while started.elapsed() < duration && !stop.load(Ordering::SeqCst) {
+        let exercised = || {
+            removed.load(Ordering::SeqCst) >= 3
+                && discarded.load(Ordering::SeqCst) > 0
+                && unavailable.load(Ordering::SeqCst) > 0
+        };
+        let mut seen: Vec<u64> = progress.iter().map(|_| 0).collect();
+        let mut stalled = vec![Duration::ZERO; ROLES.len()];
+        let (mut last_head, mut last_sample) = (head.load(Ordering::SeqCst), started);
+        while (started.elapsed() < duration
+            || (!exercised() && started.elapsed() < duration + GRACE))
+            && !stop.load(Ordering::SeqCst)
+        {
             thread::sleep(Duration::from_millis(50));
             let now = Instant::now();
-            for (i, (seen, at)) in last.iter_mut().enumerate() {
+            let head_now = head.load(Ordering::SeqCst);
+            let writer_moved = head_now != last_head;
+            for (i, role) in ROLES.iter().enumerate() {
                 let p = progress[i].load(Ordering::SeqCst);
-                if p != *seen {
-                    *seen = p;
-                    *at = now;
+                if p != seen[i] {
+                    seen[i] = p;
+                    stalled[i] = Duration::ZERO;
+                } else if writer_moved {
+                    stalled[i] += now - last_sample;
                 }
                 assert!(
-                    now.duration_since(*at) < STALL,
-                    "{:?} made no progress for {STALL:?} (at {p})",
-                    ROLES[i]
+                    stalled[i] < STALL,
+                    "{role:?} made no progress for {STALL:?} while the writer did (at {p})"
                 );
             }
+            (last_head, last_sample) = (head_now, now);
         }
         stop.store(true, Ordering::SeqCst);
-        writer.join().expect("writer thread")
+        writer.join().expect("writer thread");
     });
+    let removed = removed.into_inner();
     let (discarded, unavailable) = (discarded.into_inner(), unavailable.into_inner());
     eprintln!(
         "readers_under_retention: {} records, {removed} segments removed, {discarded} discarded, \
@@ -175,15 +200,19 @@ fn stress(duration: Duration) {
             .map(|p| p.load(Ordering::SeqCst))
             .collect::<Vec<_>>()
     );
-    assert!(removed >= 3, "retention removed only {removed} segments");
+    assert!(
+        removed >= 3,
+        "retention removed only {removed} segments in {:?} (writer too slow on this disk?)",
+        duration + GRACE
+    );
     assert!(
         discarded > 0 && unavailable > 0,
         "readers never raced with retention"
     );
 }
 
-/// Appends and checkpoints (running retention) until stopped. Returns the number of segments retention removed.
-fn write(writer: &mut Writer, shared: &Shared<'_>) -> u64 {
+/// Appends and checkpoints (running retention) until stopped.
+fn write(writer: &mut Writer, shared: &Shared<'_>) {
     while !shared.stop.load(Ordering::SeqCst) {
         append_n(writer, 128);
         writer.checkpoint().unwrap();
@@ -191,8 +220,10 @@ fn write(writer: &mut Writer, shared: &Shared<'_>) -> u64 {
             panic!("retention failed: {e}");
         }
         shared.head.store(writer.next_seq(), Ordering::SeqCst);
+        shared
+            .removed
+            .store(writer.retention_report().removed_segments, Ordering::SeqCst);
     }
-    writer.retention_report().removed_segments
 }
 
 fn open(dir: &std::path::Path, mapped: bool, durable: bool) -> Reader {

@@ -687,3 +687,47 @@ fn verify_tolerates_a_roll_during_the_scan() {
     assert_eq!(report.last_seq, Some(5));
     tickertape::fault::clear();
 }
+
+#[test]
+fn verify_tolerates_retention_after_a_roll_during_the_scan() {
+    use tickertape::fault::Point;
+    // The writer seals the newest listed segment before verify scans it; then, before verify looks for the
+    // successor, it rolls again and retention removes the scanned segment and its successor. The missing successor
+    // isn't a broken chain: the segment that points to it is gone too.
+    let (dir, writer) = journal(true);
+    let writer = std::rc::Rc::new(std::cell::RefCell::new(writer));
+    let w = writer.clone();
+    at(Point::InspectOpen, 5, move || append(&mut w.borrow_mut()));
+    let (w, path) = (writer.clone(), dir.path().to_path_buf());
+    tickertape::fault::run_at(Point::InspectSeal, 0, move || {
+        let mut w = w.borrow_mut();
+        append(&mut w);
+        w.checkpoint().unwrap();
+        retain(&path, 1);
+    });
+    let report = tickertape::inspect::verify(dir.path()).unwrap();
+    assert!(report.problems.is_empty(), "{:?}", report.problems);
+    assert_eq!(segments(dir.path()).len(), 1);
+    // A sealed newest segment whose successor is missing while it is still in place is still a problem.
+    let (dir, writer) = journal(true);
+    let writer = std::rc::Rc::new(std::cell::RefCell::new(writer));
+    let w = writer.clone();
+    at(Point::InspectOpen, 5, move || append(&mut w.borrow_mut()));
+    let path = dir.path().to_path_buf();
+    tickertape::fault::run_at(Point::InspectSeal, 0, move || {
+        fs::remove_file(segments(&path)[6].1.clone()).unwrap()
+    });
+    let report = tickertape::inspect::verify(dir.path()).unwrap();
+    assert!(
+        matches!(
+            report.problems.as_slice(),
+            [tickertape::inspect::Problem {
+                reason: tickertape::CorruptReason::BrokenChain(6),
+                ..
+            }]
+        ),
+        "{:?}",
+        report.problems
+    );
+    tickertape::fault::clear();
+}
