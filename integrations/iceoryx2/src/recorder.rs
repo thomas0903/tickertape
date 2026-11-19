@@ -1173,11 +1173,13 @@ fn record_message(
     Ok(())
 }
 
-/// `SIGINT`/`SIGTERM` handlers that set the stop flag and this run's own `signalled` flag; a second signal exits at
-/// once (status 130 or 143).
+/// `SIGINT`/`SIGTERM` handling for one run: the first signal sets the stop flag and this run's own `signalled` flag;
+/// a second one exits at once (status 130 or 143). Signals are taken one at a time by a thread (signal-hook's
+/// iterator), so two signals arriving together can't both look like the first.
 pub(crate) struct Signals {
-    ids: Vec<signal_hook::SigId>,
-    /// Set by the handlers, so a stop by signal can be told from a stop flag. Belongs to this registration only.
+    handle: signal_hook::iterator::Handle,
+    thread: Option<std::thread::JoinHandle<()>>,
+    /// Set on the first signal, so a stop by signal can be told from a stop flag. Belongs to this registration only.
     pub(crate) signalled: Arc<AtomicBool>,
 }
 
@@ -1189,24 +1191,35 @@ impl Signals {
             path: PathBuf::new(),
             source,
         };
+        let mut signals = signal_hook::iterator::Signals::new([SIGINT, SIGTERM]).map_err(io)?;
+        let handle = signals.handle();
         let signalled = Arc::new(AtomicBool::new(false));
-        let mut ids = Vec::new();
-        for (sig, code) in [(SIGINT, 130), (SIGTERM, 143)] {
-            ids.push(
-                signal_hook::flag::register_conditional_shutdown(sig, code, Arc::clone(stop))
-                    .map_err(io)?,
-            );
-            ids.push(signal_hook::flag::register(sig, Arc::clone(stop)).map_err(io)?);
-            ids.push(signal_hook::flag::register(sig, Arc::clone(&signalled)).map_err(io)?);
-        }
-        Ok(Signals { ids, signalled })
+        let (seen, stop) = (Arc::clone(&signalled), Arc::clone(stop));
+        let thread = std::thread::Builder::new()
+            .name("tickertape-iox2-signals".into())
+            .spawn(move || {
+                for signal in signals.forever() {
+                    if seen.swap(true, Ordering::SeqCst) {
+                        signal_hook::low_level::exit(if signal == SIGINT { 130 } else { 143 });
+                    }
+                    stop.store(true, Ordering::SeqCst);
+                }
+                // `signals` is dropped here, which unregisters the handlers.
+            })
+            .map_err(io)?;
+        Ok(Signals {
+            handle,
+            thread: Some(thread),
+            signalled,
+        })
     }
 }
 
 impl Drop for Signals {
     fn drop(&mut self) {
-        for id in self.ids.drain(..) {
-            signal_hook::low_level::unregister(id);
+        self.handle.close();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
         }
     }
 }
