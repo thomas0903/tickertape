@@ -144,7 +144,8 @@ pub struct Problem {
 ///
 /// Uncommitted bytes after the end of the newest segment (left by a crashed writer, cleaned up by the next one) are
 /// not a problem. Anything that a reader would reject is, and so are states that only a crash leaves behind and the
-/// next writer repairs (a sealed newest segment without a successor, or an unsealed segment that has one).
+/// next writer repairs (a sealed newest segment without a successor, or an unsealed segment that has one), and
+/// committed records after an empty commit word ([`CorruptReason::EmptyCommitWord`], reported at the empty word).
 ///
 /// # Errors
 ///
@@ -216,10 +217,12 @@ pub fn verify(dir: impl AsRef<Path>) -> Result<VerifyReport> {
         });
 
         let mut scan = scan_file(&path, base)?;
-        if newest && matches!(scan.end, ScanEnd::Invalid(_)) {
+        let mut later = later_history(&path, &scan)?;
+        if newest && (matches!(scan.end, ScanEnd::Invalid(_)) || later.is_some()) {
             // A live writer may have been mid-append while we copied the file: look again before reporting.
             std::thread::sleep(Duration::from_millis(50));
             scan = scan_file(&path, base)?;
+            later = later_history(&path, &scan)?;
         }
         seg.records = scan.records;
         seg.end_seq = scan.next_seq;
@@ -241,6 +244,12 @@ pub fn verify(dir: impl AsRef<Path>) -> Result<VerifyReport> {
                     });
                 }
             }
+            // Committed records after an empty commit word: storage damage, not a torn append (ADR 0035).
+            ScanEnd::Empty if later.is_some() => report.problems.push(Problem {
+                path: path.clone(),
+                offset: scan.end_offset,
+                reason: CorruptReason::EmptyCommitWord(later.map_or(0, |h| h.seq())),
+            }),
             ScanEnd::Empty if newest => seg.end = SegmentEnd::Open,
             ScanEnd::Empty => report.problems.push(Problem {
                 path: path.clone(),
@@ -257,6 +266,14 @@ pub fn verify(dir: impl AsRef<Path>) -> Result<VerifyReport> {
         report.segments.push(seg);
     }
     Ok(report)
+}
+
+/// Committed history after the empty slot a scan ended at, if it ended at one ([`format::find_history_after_empty`]).
+fn later_history(path: &Path, scan: &format::ScanResult) -> Result<Option<format::LaterHistory>> {
+    if scan.end != ScanEnd::Empty {
+        return Ok(None);
+    }
+    journal::history_after_empty_in_file(path, scan.end_offset, scan.next_seq)
 }
 
 /// Scans a segment file with bounded memory (`pread` windows; see [`journal::scan_file`]).

@@ -785,7 +785,22 @@ impl Recovery<'_> {
             seq = scan.next_seq;
             match scan.end {
                 ScanEnd::Empty => {
-                    self.zero_uncommitted_tail(&mut seg, offset)?;
+                    let tail_end = format::nonzero_end(
+                        &RwView(&seg.map),
+                        offset + format::COMMIT_WORD_LEN as u64,
+                    );
+                    if let Some(found) = tail_end
+                        .and_then(|end| committed_after_empty(&seg, offset, seq, end, &bases))
+                    {
+                        // Not a torn append: storage damage hid committed records (ADR 0035).
+                        let reason = CorruptReason::EmptyCommitWord(found);
+                        if self.config.recovery == RecoveryPolicy::Fail {
+                            return Err(Error::corrupt(&seg.path, offset, reason));
+                        }
+                        seg = self.repair_tail(seg, offset, reason)?;
+                        break;
+                    }
+                    self.zero_uncommitted_tail(&mut seg, offset, tail_end)?;
                     if seq != seg.base && bases.contains(&seq) && !visited.contains(&seq) {
                         // Crash between publishing the next segment and sealing this one.
                         let next = match open_segment(self.dir, seq) {
@@ -902,20 +917,19 @@ impl Recovery<'_> {
         )
     }
 
-    /// Zeroes non-zero bytes after an uncommitted end at `offset` (commit word 0) and syncs them.
-    fn zero_uncommitted_tail(&mut self, seg: &mut Segment, offset: u64) -> Result<()> {
+    /// Zeroes non-zero bytes after an uncommitted end at `offset` (commit word 0), which end at `tail_end`
+    /// ([`format::nonzero_end`]), and syncs them.
+    fn zero_uncommitted_tail(
+        &mut self,
+        seg: &mut Segment,
+        offset: u64,
+        tail_end: Option<u64>,
+    ) -> Result<()> {
         let start = offset + format::COMMIT_WORD_LEN as u64;
-        if start >= seg.size {
-            return Ok(());
-        }
-        let last_nonzero = seg
-            .map
-            .bytes(start, seg.size - start)
-            .and_then(|tail| tail.iter().rposition(|&b| b != 0));
-        let Some(last) = last_nonzero else {
+        let Some(end) = tail_end.filter(|&end| end > start) else {
             return Ok(());
         };
-        let len = last as u64 + 1;
+        let len = end - start;
         seg.map
             .bytes_mut(start, len)
             .ok_or_else(|| Error::io("zero tail", &seg.path, io::Error::other("out of bounds")))?
@@ -1071,6 +1085,22 @@ impl Recovery<'_> {
     }
 }
 
+/// Committed history after an empty slot at `offset` of `seg`, where a scan expecting `seq` stopped and whose
+/// non-zero bytes end at `tail_end` (ADR 0035): a later record or final seal in the segment that validates with a
+/// sequence number its position allows, or a segment with a larger base than `seq`, which only exists if record
+/// `seq` was committed. Returns the sequence number the evidence carries. A torn append leaves none of these.
+fn committed_after_empty(
+    seg: &Segment,
+    offset: u64,
+    seq: u64,
+    tail_end: u64,
+    bases: &BTreeSet<u64>,
+) -> Option<u64> {
+    format::find_history_before(&RwView(&seg.map), offset, seq, tail_end)
+        .map(|found| found.seq())
+        .or_else(|| bases.range(seq.checked_add(1)?..).next().copied())
+}
+
 /// A segment inherited from an earlier writer: the next checkpoint syncs its file.
 fn inherited(seg: Segment) -> DirtySegment {
     DirtySegment {
@@ -1102,7 +1132,10 @@ pub struct RecoveryReport {
 pub enum RecoveryAction {
     /// The journal didn't exist and was created.
     Created,
-    /// Uncommitted bytes after the last record (a record being written when the previous writer died) were zeroed.
+    /// Uncommitted bytes after the last record (a record being written when the previous writer died) were zeroed in
+    /// place. Only done when nothing committed follows them, so no reader can have seen them (ADR 0035); if a valid
+    /// record, a final seal or a later segment follows, the tail is corrupt instead ([`RecoveryAction::RepairedTail`]
+    /// with [`CorruptReason::EmptyCommitWord`](crate::CorruptReason::EmptyCommitWord)).
     ZeroedUncommitted {
         /// The segment.
         segment: PathBuf,
@@ -1112,7 +1145,9 @@ pub enum RecoveryAction {
         len: u64,
     },
     /// A corrupt committed tail was copied to `quarantine`, and the segment was replaced by a copy with the tail
-    /// zeroed (never edited in place).
+    /// zeroed (never edited in place). The tail starts at an invalid record or seal, or at an empty commit word that
+    /// committed records follow ([`CorruptReason::EmptyCommitWord`](crate::CorruptReason::EmptyCommitWord)); the
+    /// records from there on leave the journal and are kept byte for byte in the quarantine file.
     RepairedTail {
         /// The segment.
         segment: PathBuf,

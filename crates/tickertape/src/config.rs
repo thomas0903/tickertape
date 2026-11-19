@@ -2,22 +2,28 @@
 
 use std::time::Duration;
 
-/// What the writer does on open when it finds a corrupt committed record at the end of the newest segment.
+/// What the writer does on open when it finds corruption after the last checkpoint: an invalid record or seal, or an
+/// empty commit word that committed records follow (a later valid record, a final seal or a later segment;
+/// [`CorruptReason::EmptyCommitWord`](crate::CorruptReason::EmptyCommitWord), ADR 0035).
 ///
 /// A writer *process* crash never produces this (see `docs/crash-contract.md`, C1/C2); only power loss, storage
-/// errors or outside modification do. Uncommitted partial records are always cleaned up, whatever the policy.
+/// errors or outside modification do. Uncommitted partial records, with nothing committed after them, are always
+/// cleaned up, whatever the policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum RecoveryPolicy {
-    /// Copy the invalid bytes to `quarantine/` in the journal directory, fsync the copy, then zero them and continue
-    /// appending after the last valid record. Nothing is ever deleted. The default.
+    /// Copy everything from the corrupt position to the end of its segment to `quarantine/` in the journal
+    /// directory, fsync the copy, then replace the segment by a copy with those bytes zeroed (never edited in place),
+    /// move later segments into `quarantine/`, and continue appending after the last valid record. Nothing is ever
+    /// deleted. The default.
     #[default]
     Quarantine,
     /// Return [`Error::Corrupt`](crate::Error::Corrupt) from [`Writer::open`](crate::Writer::open) instead of
-    /// quarantining or repairing anything. Committed bytes are never changed and nothing is moved. Recovery may still
-    /// have done the clean-ups it performs before reaching the corrupt position, which a writer *process* crash also
-    /// requires: removing stale `*.tape.tmp` files, zeroing never-committed bytes after a segment's last record,
-    /// writing a missing seal, and creating a missing successor segment (`docs/format.md` → Recovery).
+    /// quarantining or repairing anything. Committed bytes are never changed and nothing is moved; the bytes after an
+    /// empty commit word are checked for committed records before any of them is zeroed. Recovery may still have done
+    /// the clean-ups it performs before reaching the corrupt position, which a writer *process* crash also requires:
+    /// removing stale `*.tape.tmp` files, zeroing never-committed bytes after a segment's last record, writing a
+    /// missing seal, and creating a missing successor segment (`docs/format.md` → Recovery).
     Fail,
 }
 

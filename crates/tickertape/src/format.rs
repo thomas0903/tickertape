@@ -494,6 +494,160 @@ pub fn scan_segment<V: SegmentView + ?Sized>(
     }
 }
 
+/// Evidence, found by [`find_history_after_empty`], that an empty slot (commit word 0) is not where the committed
+/// part of a segment ends (`docs/format.md` → Recovery, ADR 0035).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaterHistory {
+    /// A record at `offset` that validates completely (length, CRC32C, flags) with sequence number `seq`, which is
+    /// above the empty slot's expected sequence number by no more than the records the space between them can hold.
+    Record {
+        /// Where the record starts.
+        offset: u64,
+        /// Its sequence number.
+        seq: u64,
+    },
+    /// A valid seal at `offset` announcing `next_seq` (in the same range), followed only by zeros.
+    Seal {
+        /// Where the seal starts.
+        offset: u64,
+        /// The sequence number it announces.
+        next_seq: u64,
+    },
+    /// So many slots carry headers of this journal's following records with bad checksums that checking them all
+    /// would exceed the work bound; `offset` and `seq` are those of the slot that exceeded it. Only bytes made of
+    /// this journal's own record headers can do this, and they are not a torn append's either way.
+    Unchecked {
+        /// The slot that exceeded the bound.
+        offset: u64,
+        /// The sequence number in its header.
+        seq: u64,
+    },
+}
+
+impl LaterHistory {
+    /// The sequence number this evidence carries.
+    pub fn seq(&self) -> u64 {
+        match *self {
+            LaterHistory::Record { seq, .. } | LaterHistory::Unchecked { seq, .. } => seq,
+            LaterHistory::Seal { next_seq, .. } => next_seq,
+        }
+    }
+}
+
+/// Chunk size for [`nonzero_end`].
+const ZERO_SCAN_CHUNK: u64 = 1 << 20;
+
+/// The end (exclusive) of the last non-zero byte in `[from, len)` of `segment`, or `None` if all of it is zero (or
+/// `from` is out of bounds). Reads backwards in 1 MiB chunks, so a windowed view never needs more than one chunk.
+pub fn nonzero_end<V: SegmentView + ?Sized>(segment: &V, from: u64) -> Option<u64> {
+    let mut end = segment.len();
+    while end > from {
+        let start = end.saturating_sub(ZERO_SCAN_CHUNK).max(from);
+        let last = segment.with_bytes(start, end - start, |chunk| {
+            // Eight bytes at a time keeps unoptimised builds fast.
+            let words = chunk.len() / 8 * 8;
+            let tail = chunk[words..].iter().rposition(|&b| b != 0);
+            tail.map(|i| words + i).or_else(|| {
+                chunk[..words]
+                    .chunks_exact(8)
+                    .rposition(|w| w != [0; 8])
+                    .and_then(|w| {
+                        chunk[w * 8..w * 8 + 8]
+                            .iter()
+                            .rposition(|&b| b != 0)
+                            .map(|i| w * 8 + i)
+                    })
+            })
+        })?;
+        if let Some(i) = last {
+            return Some(start + i as u64 + 1);
+        }
+        end = start;
+    }
+    None
+}
+
+/// Looks for committed history after an empty slot at `offset` (commit word 0) where a scan expecting
+/// `expected_seq` stopped, within the same segment (ADR 0035).
+///
+/// A torn append leaves non-zero bytes only inside the one frame being written, from `offset`, so the only way its
+/// bytes can contain a valid frame is through a payload that holds one. This returns evidence only for a frame or
+/// seal that also has a sequence number its position allows: a record at `Q` with sequence `T` such that
+/// `expected_seq < T <= expected_seq + (Q - offset) / 40` (every record is at least 40 bytes), or a seal in the same
+/// range that is the last non-zero item in the segment. The first such record is returned.
+///
+/// Work: one pass over `[offset, len)` to find its last non-zero byte, cheap header checks at each 8-byte position up
+/// to it, and CRC32C over at most twice the remaining segment length for candidate records (beyond that it returns
+/// [`LaterHistory::Unchecked`]), plus one CRC of 12 bytes per possible sequence number for a final seal.
+pub fn find_history_after_empty<V: SegmentView + ?Sized>(
+    segment: &V,
+    offset: u64,
+    expected_seq: u64,
+) -> Option<LaterHistory> {
+    let end = nonzero_end(segment, offset.checked_add(COMMIT_WORD_LEN as u64)?)?;
+    find_history_before(segment, offset, expected_seq, end)
+}
+
+/// [`find_history_after_empty`] with the end of the non-zero bytes after the empty commit word already known.
+pub(crate) fn find_history_before<V: SegmentView + ?Sized>(
+    segment: &V,
+    offset: u64,
+    expected_seq: u64,
+    end: u64,
+) -> Option<LaterHistory> {
+    let len = segment.len();
+    let budget = len.saturating_sub(offset).saturating_mul(2);
+    let mut spent = 0_u64;
+    // A record after the empty slot starts at least one minimal frame after it.
+    let mut q = offset.checked_add(RECORD_HEADER_LEN as u64)?;
+    while q < end {
+        let Some(word) = segment.commit_word(q) else {
+            break;
+        };
+        let max_records = (q - offset) / RECORD_HEADER_LEN as u64;
+        let in_range = |seq: u64| seq > expected_seq && seq - expected_seq <= max_records;
+        if word == SEAL_MARKER {
+            // Only a final seal: nothing non-zero after it.
+            if q.saturating_add(SEAL_LEN as u64) >= end {
+                let crc = segment
+                    .with_bytes(q + COMMIT_WORD_LEN as u64, 4, |b| read_u32(b, 0))
+                    .flatten();
+                let prefix = crate::crc::crc32c(&SEAL_MARKER.to_le_bytes());
+                let found = crc.and_then(|crc| {
+                    (1..=max_records)
+                        .filter_map(|k| expected_seq.checked_add(k))
+                        .find(|next| crate::crc::crc32c_append(prefix, &next.to_le_bytes()) == crc)
+                });
+                if let Some(next_seq) = found {
+                    if read_slot(segment, q, next_seq) == Ok(Slot::Seal) {
+                        return Some(LaterHistory::Seal {
+                            offset: q,
+                            next_seq,
+                        });
+                    }
+                }
+            }
+        } else if (RECORD_HEADER_LEN as u32..=MAX_FRAME_LEN).contains(&word)
+            && record_fits(len, q, word)
+        {
+            let fields = segment
+                .with_bytes(q + 8, 16, |b| (read_u64(b, 0), read_u32(b, 12)))
+                .and_then(|(seq, flags)| Some((seq?, flags?)));
+            if let Some((seq, 0)) = fields.filter(|(seq, _)| in_range(*seq)) {
+                spent = spent.saturating_add(u64::from(word));
+                if spent > budget {
+                    return Some(LaterHistory::Unchecked { offset: q, seq });
+                }
+                if matches!(read_slot(segment, q, seq), Ok(Slot::Record { .. })) {
+                    return Some(LaterHistory::Record { offset: q, seq });
+                }
+            }
+        }
+        q += RECORD_ALIGN as u64;
+    }
+    None
+}
+
 /// The file name of the segment whose first record is `base_seq`, e.g. `00000000000000000042.tape`.
 pub fn segment_file_name(base_seq: u64) -> String {
     format!("{base_seq:020}.{SEGMENT_EXTENSION}")
@@ -958,6 +1112,127 @@ mod tests {
         }
     }
 
+    #[test]
+    #[cfg_attr(miri, ignore = "scans megabytes")]
+    fn nonzero_end_finds_the_last_non_zero_byte() {
+        let mut image = vec![0u8; 3 << 20];
+        assert_eq!(nonzero_end(&image[..], 0), None);
+        assert_eq!(nonzero_end(&image[..], u64::MAX), None);
+        for at in [
+            0,
+            7,
+            8,
+            1 << 20,
+            (1 << 20) - 1,
+            (3 << 20) - 1,
+            (3 << 20) - 9,
+        ] {
+            image.fill(0);
+            image[at] = 1;
+            assert_eq!(nonzero_end(&image[..], 0), Some(at as u64 + 1), "{at}");
+            assert_eq!(nonzero_end(&image[..], at as u64 + 1), None, "{at}");
+        }
+        image[5] = 1;
+        assert_eq!(nonzero_end(&image[..], 6), Some((3 << 20) - 8));
+    }
+
+    /// A segment image with `n` records of varied lengths from offset 64, base 7. Returns it and the offsets.
+    fn records_image(n: usize) -> (Vec<u8>, Vec<usize>) {
+        let mut image = vec![0; 65_536];
+        let mut offsets = Vec::new();
+        let mut offset = 64;
+        for i in 0..n {
+            offsets.push(offset);
+            offset = append(
+                &mut image,
+                offset,
+                &record(7 + i as u64),
+                &vec![i as u8; (i * 37) % 200],
+            );
+        }
+        offsets.push(offset);
+        (image, offsets)
+    }
+
+    #[test]
+    fn history_after_a_zeroed_commit_word() {
+        let (mut image, offsets) = records_image(20);
+        // No history after the real end.
+        assert_eq!(
+            find_history_after_empty(&image[..], offsets[20] as u64, 27),
+            None
+        );
+        // A zeroed commit word hides the records after it; the first one is the evidence.
+        image[offsets[5]..offsets[5] + 4].fill(0);
+        assert_eq!(
+            find_history_after_empty(&image[..], offsets[5] as u64, 12),
+            Some(LaterHistory::Record {
+                offset: offsets[6] as u64,
+                seq: 13
+            })
+        );
+        // Wider damage: everything from record 5 up to the middle of record 9 zeroed.
+        image[offsets[5]..offsets[9] + 20].fill(0);
+        assert_eq!(
+            find_history_after_empty(&image[..], offsets[5] as u64, 12),
+            Some(LaterHistory::Record {
+                offset: offsets[10] as u64,
+                seq: 17
+            })
+        );
+        // Records whose sequence numbers are not after the expected one, or further ahead than the space between
+        // allows, are not evidence.
+        assert_eq!(
+            find_history_after_empty(&image[..], offsets[5] as u64, 26),
+            None
+        );
+        assert_eq!(
+            find_history_after_empty(&image[..], offsets[18] as u64, 0),
+            None
+        );
+        // The last record before a seal: the final seal is the evidence.
+        let (mut sealed, offsets) = records_image(3);
+        seal(&mut sealed, offsets[3], 10);
+        sealed[offsets[2]..offsets[2] + 4].fill(0);
+        assert_eq!(
+            find_history_after_empty(&sealed[..], offsets[2] as u64, 9),
+            Some(LaterHistory::Seal {
+                offset: offsets[3] as u64,
+                next_seq: 10
+            })
+        );
+        // A seal that is not the last non-zero item, or names a sequence number out of range, is not.
+        assert_eq!(
+            find_history_after_empty(&sealed[..], offsets[2] as u64, 10),
+            None
+        );
+        sealed[offsets[3] + 16] = 1;
+        assert_eq!(
+            find_history_after_empty(&sealed[..], offsets[2] as u64, 9),
+            None
+        );
+    }
+
+    #[test]
+    fn history_search_stops_at_its_work_bound() {
+        // Every slot after the empty one carries the header of the next record, claiming the largest length, with a
+        // bad checksum: checking them all would cost about (size / 8) * size bytes of CRC.
+        let mut image = vec![0u8; 65_536];
+        let mut q = 64 + 40;
+        while q + 48 <= 65_536 - 8 {
+            let len = (65_536 - 8 - q) as u32;
+            image[q..q + 4].copy_from_slice(&len.to_le_bytes());
+            image[q + 4..q + 8].copy_from_slice(&1_u32.to_le_bytes());
+            image[q + 8..q + 16].copy_from_slice(&8_u64.to_le_bytes());
+            q += 24;
+            q = q.div_ceil(8) * 8;
+        }
+        assert!(matches!(
+            find_history_after_empty(&image[..], 64, 7),
+            Some(LaterHistory::Unchecked { seq: 8, .. })
+        ));
+    }
+
     fn property_config() -> ProptestConfig {
         let mut config = ProptestConfig::with_cases(64);
         if cfg!(miri) {
@@ -1023,6 +1298,47 @@ mod tests {
                     prop_assert!(scan.end_offset <= start as u64);
                     prop_assert!(scan.records <= selected as u64);
                 }
+            }
+        }
+
+        #[test]
+        fn zeroed_commit_word_is_found_and_torn_bodies_are_not(
+            lens in prop::collection::vec(0_usize..600, 1..40),
+            damaged in any::<prop::sample::Index>(),
+            torn_len in 0_usize..3000,
+            torn_seed in any::<u64>(),
+        ) {
+            // Committed records with one commit word zeroed: found exactly when a record follows.
+            let mut image = vec![0; 65_536];
+            image[..64].copy_from_slice(&encode_segment_header(&SegmentHeader { base_seq: 7, ..header() }));
+            let mut offsets = Vec::new();
+            let mut offset = 64;
+            for (i, len) in lens.iter().enumerate() {
+                if offset + align8(40 + *len as u64) as usize > 65_536 - 8 { break; }
+                offsets.push(offset);
+                offset = append(&mut image, offset, &record(7 + i as u64), &vec![i as u8 ^ 0x5a; *len]);
+            }
+            let end = offset;
+            let k = damaged.index(offsets.len());
+            let mut copy = image.clone();
+            copy[offsets[k]..offsets[k] + 4].fill(0);
+            let found = find_history_after_empty(&copy[..], offsets[k] as u64, 7 + k as u64);
+            if k + 1 < offsets.len() {
+                prop_assert_eq!(found, Some(LaterHistory::Record { offset: offsets[k + 1] as u64, seq: 8 + k as u64 }));
+            } else {
+                prop_assert_eq!(found, None);
+            }
+            // A torn append after the end: the header of the next record and arbitrary payload bytes, never evidence.
+            let n = offsets.len() as u64;
+            let room = 65_536 - 8 - end;
+            if room >= 48 {
+                let len = 40 + torn_len.min(room - 40);
+                let mut x = torn_seed | 1;
+                let payload: Vec<u8> = (0..len - 40).map(|_| { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x as u8 }).collect();
+                let (_, body) = body(&record(7 + n), &payload);
+                let mut torn = image.clone();
+                torn[end + 4..end + len].copy_from_slice(&body);
+                prop_assert_eq!(find_history_after_empty(&torn[..], end as u64, 7 + n), None);
             }
         }
     }

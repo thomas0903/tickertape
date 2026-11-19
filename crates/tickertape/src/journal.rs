@@ -212,6 +212,23 @@ impl format::SegmentView for PreadView<'_> {
 /// Scans a segment file from its first record slot, expecting `base` there, reading it with `pread` in bounded
 /// windows (the file is never mapped, so other processes can't affect memory safety).
 pub(crate) fn scan_file(path: &Path, base: u64) -> Result<format::ScanResult> {
+    with_pread_view(path, |view| {
+        format::scan_segment(view, format::SEGMENT_HEADER_LEN as u64, base)
+    })
+}
+
+/// [`format::find_history_after_empty`] on a segment file, read with `pread` in bounded windows.
+pub(crate) fn history_after_empty_in_file(
+    path: &Path,
+    offset: u64,
+    expected_seq: u64,
+) -> Result<Option<format::LaterHistory>> {
+    with_pread_view(path, |view| {
+        format::find_history_after_empty(view, offset, expected_seq)
+    })
+}
+
+fn with_pread_view<R>(path: &Path, f: impl FnOnce(&PreadView<'_>) -> R) -> Result<R> {
     let file = File::open(path).map_err(|e| Error::io("open segment", path, e))?;
     let len = file
         .metadata()
@@ -223,11 +240,11 @@ pub(crate) fn scan_file(path: &Path, base: u64) -> Result<format::ScanResult> {
         window: std::cell::RefCell::new((0, Vec::new())),
         error: std::cell::RefCell::new(None),
     };
-    let scan = format::scan_segment(&view, format::SEGMENT_HEADER_LEN as u64, base);
+    let result = f(&view);
     if let Some(e) = view.error.into_inner() {
         return Err(Error::io("read segment", path, e));
     }
-    Ok(scan)
+    Ok(result)
 }
 
 #[cfg(test)]
