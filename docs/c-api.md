@@ -304,8 +304,9 @@ history all the same). `tickertape_verify` reports both as `first_problem_reason
 thread between two foreign calls (Go goroutines, Java virtual threads) can read another thread's state, or none. Read
 the details on the same OS thread, in the same foreign call sequence as the failing call: in Go, call through a small C
 function in the cgo preamble that makes the call and captures the code, message, OS error and corruption reason
-together (or hold `runtime.LockOSThread` across the call and the reads); in Java, read them in the same downcall
-sequence on a platform thread, or through such a C shim.
+together (or hold `runtime.LockOSThread` across the call and the reads); in Java, read them in the same sequence of
+downcalls, with no Java code in between that can block, as the Java binding does
+([ADR 0037](decisions/0037-java-binding.md)).
 
 | Code | Meaning |
 |---|---|
