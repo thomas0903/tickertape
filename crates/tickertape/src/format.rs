@@ -558,38 +558,48 @@ pub fn read_slot<V: SegmentView + ?Sized>(
 /// [`decode_record_body`] for a body longer than the view's [`SegmentView::max_piece`], already checked to lie inside
 /// the segment: the CRC32C is computed over pieces of at most that size (and at most 1 MiB), so a damaged length
 /// costs no allocation, and the header fields are decoded only once the CRC matches. Same result, same order of
-/// checks.
+/// checks. Every byte is read once: the header fields are copied out of the first piece the CRC covers, so the header
+/// returned is the one the CRC covered even if the file changes under a `pread` view between pieces.
 fn decode_record_in_pieces<V: SegmentView + ?Sized>(
     segment: &V,
     body_offset: u64,
     len: u32,
     expected_seq: u64,
 ) -> Result<RecordHeader, CorruptReason> {
+    const FIELDS: usize = RECORD_HEADER_LEN - 8;
     let bad_len = CorruptReason::BadLength(len);
+    // At least one header, so the first piece holds all the fields (the body after the CRC is at least `FIELDS`).
     let piece_len = segment.max_piece().clamp(RECORD_HEADER_LEN as u64, 1 << 20);
     let stored = segment
         .with_bytes(body_offset, 4, |b| read_u32(b, 0))
         .flatten()
         .ok_or(bad_len)?;
+    // The body as `decode_record_fields` expects it: the stored CRC, then the fields from the first piece.
+    let mut header = [0_u8; RECORD_HEADER_LEN - 4];
+    header[..4].copy_from_slice(&stored.to_le_bytes());
     let mut crc = crate::crc::crc32c(&len.to_le_bytes());
     let mut at = body_offset.checked_add(4).ok_or(bad_len)?;
     let mut left = u64::from(len) - 8;
+    let mut first = true;
     while left > 0 {
         let piece = left.min(piece_len);
         crc = segment
-            .with_bytes(at, piece, |bytes| crate::crc::crc32c_append(crc, bytes))
+            .with_bytes(at, piece, |bytes| {
+                if first {
+                    header[4..].copy_from_slice(bytes.get(..FIELDS)?);
+                }
+                Some(crate::crc::crc32c_append(crc, bytes))
+            })
+            .flatten()
             .ok_or(bad_len)?;
+        first = false;
         at += piece;
         left -= piece;
     }
     if crc != stored {
         return Err(CorruptReason::BadChecksum);
     }
-    segment
-        .with_bytes(body_offset, RECORD_HEADER_LEN as u64 - 4, |fields| {
-            decode_record_fields(len, fields, expected_seq)
-        })
-        .ok_or(bad_len)?
+    decode_record_fields(len, &header, expected_seq)
 }
 
 /// Where a forward scan of one segment stopped.
@@ -685,8 +695,8 @@ pub enum LaterHistory {
     },
     /// So many slots carry headers of this journal's following records with bad checksums that checking them all
     /// would exceed the work bound; `offset` and `seq` are those of the slot that exceeded it (for a final seal, the
-    /// expected sequence number plus one). Only bytes made of this journal's own record headers can do this, and they
-    /// are not a torn append's either way. Inconclusive: nothing was proven valid, so it is reported as
+    /// expected sequence number plus one). Only header-shaped bytes can do this, from damage or from a torn payload
+    /// that holds them (ADR 0035). Inconclusive: nothing was proven valid, so it is reported as
     /// [`CorruptReason::UncheckedTail`], not [`CorruptReason::EmptyCommitWord`].
     Unchecked {
         /// The slot that exceeded the bound.
@@ -1988,6 +1998,66 @@ mod tests {
             Some(LaterHistory::Record { seq: 9, .. })
         ));
         view.assert_bounded();
+    }
+
+    #[test]
+    #[cfg(not(miri))]
+    fn piecewise_validation_decodes_the_header_the_crc_covered() {
+        // Review round 3, item 1: a `pread` view rereads the file, which may change between two reads (a writer
+        // reusing the slot while `verify` or a scan runs). The header returned must come from the bytes the CRC
+        // covered: here the header fields change once they have been read, and a second read would see the new ones.
+        struct Changing<'a> {
+            before: &'a [u8],
+            after: &'a [u8],
+            fields: std::ops::Range<u64>,
+            reads: std::cell::Cell<u32>,
+        }
+        impl SegmentView for Changing<'_> {
+            fn len(&self) -> u64 {
+                self.before.len() as u64
+            }
+            fn commit_word(&self, offset: u64) -> Option<u32> {
+                self.before.commit_word(offset)
+            }
+            fn with_bytes<R>(
+                &self,
+                offset: u64,
+                len: u64,
+                f: impl FnOnce(&[u8]) -> R,
+            ) -> Option<R> {
+                let bytes = if self.reads.get() == 0 {
+                    self.before
+                } else {
+                    self.after
+                };
+                if offset < self.fields.end && offset.saturating_add(len) > self.fields.start {
+                    self.reads.set(self.reads.get() + 1);
+                }
+                bytes.with_bytes(offset, len, f)
+            }
+            fn max_piece(&self) -> u64 {
+                Metered::WINDOW
+            }
+        }
+        let (image, [_, r8, r9, _]) = image_with_a_long_record();
+        let mut after = image.clone();
+        after[r8 + 36] ^= 1; // Record 8's local timestamp.
+        let view = Changing {
+            before: &image,
+            after: &after,
+            fields: r8 as u64 + 8..r8 as u64 + RECORD_HEADER_LEN as u64,
+            reads: std::cell::Cell::new(0),
+        };
+        let expected = read_slot(&image[..], r8 as u64, 8);
+        assert!(
+            matches!(expected, Ok(Slot::Record { next_offset, .. }) if next_offset == r9 as u64)
+        );
+        assert_eq!(read_slot(&view, r8 as u64, 8), expected);
+        assert_eq!(
+            view.reads.get(),
+            1,
+            "the header fields were read more than once"
+        );
     }
 
     #[test]

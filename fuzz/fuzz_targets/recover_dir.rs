@@ -669,6 +669,17 @@ fn run(data: &[u8]) {
                     |a| matches!(a, RecoveryAction::Sealed { segment: s } if s == segment),
                 );
                 let zeros_from = if resealed {
+                    // The eight bytes are a valid seal for an existing later segment's base.
+                    let base = format::parse_segment_file_name(name).unwrap();
+                    assert!(
+                        before
+                            .keys()
+                            .filter_map(|n| format::parse_segment_file_name(n))
+                            .filter(|&b| b > base)
+                            .any(|b| format::read_slot(&new[..], offset as u64, b)
+                                == Ok(format::Slot::Seal)),
+                        "resealed with an invalid seal"
+                    );
                     offset + format::SEAL_LEN
                 } else {
                     offset

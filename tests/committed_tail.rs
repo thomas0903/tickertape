@@ -1043,6 +1043,89 @@ fn an_inconclusive_search_is_reported_as_unchecked() {
 }
 
 #[test]
+fn torn_payload_of_header_shaped_bytes_is_unchecked() {
+    // Review round 3, item 3: the process-crash exception for `UncheckedTail`. The writer of record 3 was killed
+    // while filling its payload: the header fields are written, the CRC is not, and the payload written so far holds
+    // four copies of a following record's header (sequence 4, flags zero, each claiming a frame to the end of the
+    // segment, bad checksums), as a payload that carries this journal's headers can. Their overlapping length claims
+    // exhaust the search's work budget although every candidate CRC fails, so the search stops undecided: `Fail`
+    // refuses with `UncheckedTail` and `Quarantine` preserves the torn bytes. Nothing is lost either way.
+    let base = tempfile::tempdir().unwrap();
+    let mut w = Writer::open(base.path(), small_config()).unwrap();
+    append_n(&mut w, 3);
+    drop(w);
+    let (_, seg) = segments(base.path()).pop().unwrap();
+    let name = seg.file_name().unwrap().to_owned();
+    let (_, p) = record_slots(&seg);
+    let size = fs::metadata(&seg).unwrap().len();
+    // Payload offset `i` is frame offset `40 + i`, so the copies are at 8-aligned frame offsets 40, 64, 88 and 112.
+    let mut payload = vec![0x5au8; 200];
+    for k in 0..4 {
+        let (i, q) = (24 * k, p + 40 + 24 * k as u64);
+        let claim = ((size - 8 - q) & !7) as u32;
+        payload[i..i + 4].copy_from_slice(&claim.to_le_bytes());
+        payload[i + 4..i + 8].copy_from_slice(&1_u32.to_le_bytes());
+        payload[i + 8..i + 16].copy_from_slice(&4_u64.to_le_bytes());
+        payload[i + 16..i + 24].fill(0); // Schema id 0 and flags zero.
+    }
+    let header = RecordHeader {
+        seq: 3,
+        schema_id: 3,
+        venue_ts_ns: 30,
+        local_ts_ns: 31,
+    };
+    let len = format::frame_len(payload.len()).unwrap();
+    let mut torn = vec![0u8; len as usize];
+    format::encode_record_body(&header, &payload, &mut torn[4..]);
+    torn[4..8].fill(0); // The CRC is stored after the fill.
+    torn.truncate(40 + 24 * 4 + 16); // Killed partway through the payload.
+    for policy in [RecoveryPolicy::Quarantine, RecoveryPolicy::Fail] {
+        let dir = copy_journal(base.path());
+        let path = dir.path().join(&name);
+        open_raw(&path).write_all_at(&torn, p).unwrap();
+        let damaged = fs::read(&path).unwrap();
+        let problems = inspect::verify(dir.path()).unwrap().problems;
+        assert!(
+            matches!(&problems[..], [inspect::Problem { offset, reason: CorruptReason::UncheckedTail(4), .. }] if *offset == p),
+            "{problems:?}"
+        );
+        let before = snapshot(dir.path());
+        match Writer::open(dir.path(), small_config().recovery(policy)) {
+            Ok(w) => {
+                assert_eq!(policy, RecoveryPolicy::Quarantine);
+                let actions = &w.recovery_report().actions;
+                let [
+                    RecoveryAction::RepairedTail {
+                        offset,
+                        quarantine_file,
+                        reason: CorruptReason::UncheckedTail(4),
+                        ..
+                    },
+                ] = &actions[..]
+                else {
+                    panic!("{actions:?}");
+                };
+                assert_eq!(*offset, p);
+                let kept = fs::read(quarantine_file).unwrap();
+                assert_eq!(kept[..torn.len()], torn[..], "the torn bytes are preserved");
+                assert!(fs::read(&path).unwrap()[..p as usize] == damaged[..p as usize]);
+                assert_eq!(w.next_seq(), 3);
+            }
+            Err(Error::Corrupt {
+                offset,
+                reason: CorruptReason::UncheckedTail(4),
+                ..
+            }) => {
+                assert_eq!(policy, RecoveryPolicy::Fail);
+                assert_eq!(offset, p);
+                assert!(snapshot(dir.path()) == before);
+            }
+            Err(e) => panic!("{policy:?}: {e}"),
+        }
+    }
+}
+
+#[test]
 fn crash_in_the_middle_of_a_repair() {
     // Review round 1, item 5: the repair of an empty commit word with committed records after it is interrupted
     // (an injected I/O error stands in for the crash) after the tail is preserved and before the repaired copy is
