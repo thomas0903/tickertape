@@ -49,6 +49,8 @@ pub enum Point {
     /// After `inspect::verify` finds the newest listed segment sealed, before it looks for the successor. Arm with
     /// [`run_at`].
     InspectSeal,
+    /// Syncing the zeroing of an abandoned write (a panicking `append_with` fill closure).
+    AbandonedWriteSync,
 }
 
 #[cfg(feature = "fault-injection")]
