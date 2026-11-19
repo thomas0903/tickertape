@@ -37,8 +37,9 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 cargo +1.85 check --workspace --all-features --all-targets   # MSRV
 cargo deny check
 cargo test -p tickertape-tests --release -- --ignored        # long tests: 1M records, 250-kill loop, 20 s soak
-cargo +nightly miri test -p tickertape --lib format          # Miri on the format code
+cargo +nightly miri test -p tickertape --lib -- format crc map_ro   # Miri: format, CRC, mapped loads
 RUSTFLAGS="--cfg loom" cargo test -p tickertape --lib --release protocol_model
+cargo check -p tickertape --all-features --target i686-unknown-linux-gnu   # 32-bit: no read-only mappings
 cargo +nightly miri test -p tickertape-ffi --lib pure_         # Miri on the C ABI's argument handling
 TICKERTAPE_FFI_SANITIZE=1 cargo test -p tickertape-ffi --features fault-injection   # C/C++ tests under ASan, UBSan
 cbindgen --config crates/tickertape-ffi/cbindgen.toml --crate tickertape-ffi \
@@ -53,6 +54,11 @@ go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12    # workflow lint
 `cargo test --workspace` compiles and runs C and C++ programs, so it needs a C/C++ compiler; it also runs the
 Python decoder if `python3` is available. On Linux, CI also runs the C programs under Valgrind
 (`TICKERTAPE_FFI_VALGRIND=1`).
+
+Changes to `crc.rs` should also pass the whole suite on tickertape's fallback path, which its hardware path
+otherwise hides on every machine that has the CRC instruction:
+`RUSTFLAGS="--cfg tickertape_force_soft_crc" cargo test --workspace --all-features`. This compiles out tickertape's
+own hardware path only; the `crc32c` crate it falls back to still picks its hardware implementation on capable CPUs.
 
 CI runs these on Linux x86-64 and macOS, and the tests, long tests and fuzz smoke on aarch64 Linux too.
 `cargo test --workspace` includes the format-v1 compatibility fixtures (`tests/compat/README.md`), which check the

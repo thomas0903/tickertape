@@ -2,19 +2,24 @@
 //! it is killed. Every 16 appends it prints the last sequence number whose `append` returned, so the test knows a
 //! lower bound of what was committed. It also checkpoints at random intervals.
 //!
-//! Usage: `tt-kill-writer <dir> <segment_size> <seed>`
+//! Usage: `tt-kill-writer <dir> <segment_size> <seed> [mixed]`. With `mixed`, payload lengths follow `mixed_len`
+//! (up to 3,199 bytes) instead of `kill_len` (up to 512 bytes).
 
 use std::io::Write;
 use std::path::PathBuf;
 
 use tickertape::{NewRecord, Writer, WriterConfig};
-use tickertape_tests::{Rng, kill_len, payload};
+use tickertape_tests::{Rng, kill_len, mixed_len, payload};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let dir = PathBuf::from(&args[1]);
     let segment_size: u64 = args[2].parse().expect("segment_size");
     let mut rng = Rng::new(args[3].parse().expect("seed"));
+    let len_of: fn(u64) -> usize = match args.get(4).map(String::as_str) {
+        Some("mixed") => mixed_len,
+        _ => kill_len,
+    };
 
     let mut writer = Writer::open(&dir, WriterConfig::default().segment_size(segment_size))
         .expect("open writer");
@@ -22,7 +27,7 @@ fn main() {
     let mut next_checkpoint = rng.below(2000);
     loop {
         let seq = writer.next_seq();
-        let data = payload(seq, kill_len(seq));
+        let data = payload(seq, len_of(seq));
         writer
             .append(&NewRecord {
                 schema_id: (seq % 7) as u32,

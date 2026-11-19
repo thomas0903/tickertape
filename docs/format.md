@@ -155,6 +155,14 @@ journal before it. Readers ignore this file unless `ReaderConfig::durable_only(t
 with `seq < next_seq` are returned, and a missing or invalid marker covers no records (ADR
 [0010](decisions/0010-durable-only-reads.md), crash contract C13).
 
+A slot describes the journal's **current** files: the segments that the segment paths named when it was written,
+and, because recovery never changes a record before the marker, the files those paths name at any later time. It says
+nothing about a file a reader opened earlier and that a repair has since replaced, nor about bytes after the
+previous marker that a reader read before this one was written, which a repair in place may have changed. A reader
+may therefore apply a marker to the segment it has open only if it has confirmed, after reading the marker, that the
+segment's path still names that file, and it must then read the records the marker newly covers from the file again
+(ADR [0034](decisions/0034-durable-only-reads-check-segment-identity.md); see "What readers do about repairs").
+
 ## Publication
 
 The writer appends a record at `P` in this order:
@@ -224,7 +232,7 @@ Readers never modify a journal. Only the writer repairs it, on open, after takin
    | At `P` | Meaning | Action |
    |---|---|---|
    | Commit word `0`, and a segment named `{next_seq:020}.tape` exists | The previous writer died between publishing the next segment and sealing this one | Zero any non-zero bytes in `[P, Z)` in place, write the seal, and continue scanning in that segment (step 3) |
-   | Commit word `0`, no such segment | Clean end, or a body the previous writer never committed (no reader ever saw it) | Zero any non-zero bytes in `[P, Z)` in place. This is the end of the chain |
+   | Commit word `0`, no such segment | Clean end, or a body the previous writer never committed (no reader ever saw it). Or storage damage that emptied a committed record's commit word: then this removes committed records in place (see "What readers do about repairs") | Zero any non-zero bytes in `[P, Z)` in place. This is the end of the chain |
    | Valid seal, successor missing, no segment with a larger `base_seq` | Crash or power loss during a roll | Create the successor (as in "Rolling"). This is the end of the chain |
    | Valid seal, successor missing, a segment with a larger `base_seq` exists | A segment in the middle of the chain is missing (deleted by someone, or lost) | **Refuse** under every policy: tickertape doesn't discard a large part of a journal on its own |
    | Commit word non-zero, invalid record or seal | Not possible after a writer *process* crash. Power loss, storage corruption or outside modification | `Quarantine` (default): preserve `[P, Z)` in `quarantine/`, then **repair by replacement**: write a copy of `X` with `[P, Z)` zeroed to `X.tmp`, sync it, and `rename` it over `X`. `Fail`: refuse (see below) |
@@ -270,9 +278,34 @@ different file or no file, the reader returns `Error::Discarded` and doesn't adv
 offset in the new file, because offsets after the repair point don't line up. The application calls `seek` to
 continue: `seek` scans the current chain from the start of a segment, so it only lands on validated positions.
 
-Until it checks, a reader may return records from a segment that recovery has just preserved and removed. Such
-records are like records lost to a power loss that a reader had already seen (`crash-contract.md` → C8). A reader
-never moves from a removed history into the repaired one without returning `Error::Discarded`.
+A durable-only reader also checks when a checkpoint marker it has just read moves past its cursor, after reading the
+marker and before it reads any record the marker newly covers. The order matters: recovery replaces files before the
+new writer's first checkpoint, so a successful check after the read shows that the open file was current after the
+marker was written, and so holds exactly the records the marker covers. A check before the read could pass just
+before a repair and a new checkpoint, and the reader would then apply the new marker to the old file (ADR
+[0034](decisions/0034-durable-only-reads-check-segment-identity.md) has the full argument). If the check fails, the
+reader returns `Error::Discarded` without applying the marker. This also applies when retention removed the segment:
+a durable-only reader may learn of it there rather than at the segment's end. If the check passes, the reader reads
+every record the marker newly covers from the file's current bytes: the safe reader discards whatever it had read
+into its buffer before, because bytes after a marker can change in place (below).
+
+Not every repair replaces the file. When storage damage empties the commit word of a committed record after the
+checkpoint, recovery takes it for the end of the records and zeroes it and everything after it in place (step 4,
+"Commit word `0`"), and the next writer appends a different history into the same file. The file keeps its identity,
+so readers can't notice. A durable-only reader is unaffected: it returned only records below a marker, which recovery
+keeps, and it reads the rest from the current bytes once a later marker is trusted; its position is a record
+boundary of the new history, so it simply reads on. A visible reader may return the removed records it had already
+read or buffered, and then continue at its old position in the new history without `Error::Discarded`. Where the
+records of the two histories line up it reads the new ones; otherwise its position falls inside a record, and it
+waits there (`Ok(None)`) or reports `Error::Corrupt` for bytes that aren't corrupt, until the application seeks to
+its position. It would return a record that is not in the journal only if the new history held a frame with a valid
+checksum and the expected sequence number at that position (ADR
+[0034](decisions/0034-durable-only-reads-check-segment-identity.md) → In-place repairs).
+
+Until it checks, a visible reader may return records from a segment that recovery has just preserved and removed.
+Such records are like records lost to a power loss that a reader had already seen (`crash-contract.md` → C8). A
+durable-only reader never does (C13). A reader never moves from a removed history into the repaired one without
+returning `Error::Discarded`, except across an in-place repair, which it can't notice (above).
 
 ## Versioning
 
