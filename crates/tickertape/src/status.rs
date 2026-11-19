@@ -240,14 +240,17 @@ pub enum AgeUnknown {
     /// checkpoint can't predate: the journal was copied without keeping times, or a clock was stepped.
     BeforeSegment,
     /// The marker file doesn't have its full length, so its modification time is the time it was cut, not of a
-    /// checkpoint.
+    /// checkpoint. A writer leaves a short marker short until its next checkpoint has succeeded, and extends it only
+    /// then.
     MarkerResized,
     /// The marker's metadata kept changing while it was read: a writer checkpointing very often. Not a breach of
     /// [`Thresholds::max_checkpoint_age`], since it means the marker was just written.
     Changing,
-    /// A writer found the marker short at open and extended it, setting its modification time to the Unix epoch, so
-    /// that the time it was cut short is not taken for a checkpoint's. The age is unknown until the next checkpoint.
-    MarkerExtended,
+    /// The marker's current slot has a generation of 2 or more, but the other slot doesn't hold the previous
+    /// generation, which every checkpoint leaves there: the marker lost bytes (it was cut, then extended, for example
+    /// by a v0.4.0 writer at open, or a slot write was torn), so its modification time is not known to be a
+    /// checkpoint's. Decided from the marker's contents, not its time.
+    OlderSlotLost,
 }
 
 impl AgeUnknown {
@@ -259,7 +262,7 @@ impl AgeUnknown {
             AgeUnknown::BeforeSegment => "modification_time_before_segment",
             AgeUnknown::MarkerResized => "marker_resized",
             AgeUnknown::Changing => "marker_changing",
-            AgeUnknown::MarkerExtended => "marker_extended",
+            AgeUnknown::OlderSlotLost => "older_slot_lost",
         }
     }
 }
@@ -1509,6 +1512,8 @@ struct Marker {
     modified_unix_ns: Option<u64>,
     /// The metadata kept changing over every attempt.
     changing: bool,
+    /// The current slot's generation is 2 or more and the other slot doesn't hold the generation before it.
+    older_slot_lost: bool,
 }
 
 /// What must not change while the marker is read.
@@ -1563,6 +1568,13 @@ fn read_marker(dir: &Path) -> Result<Option<Marker>> {
         };
         let marker = Marker {
             slot,
+            older_slot_lost: slot.is_some_and(|current| {
+                current.generation >= 2
+                    && !slots
+                        .iter()
+                        .flatten()
+                        .any(|s| s.generation == current.generation - 1)
+            }),
             len,
             modified_unix_ns: before
                 .modified()
@@ -1613,10 +1625,11 @@ fn checkpoint_status(
         Some(AgeUnknown::Changing)
     } else if marker.len != format::CHECKPOINT_FILE_LEN as u64 {
         Some(AgeUnknown::MarkerResized)
+    } else if marker.older_slot_lost {
+        Some(AgeUnknown::OlderSlotLost)
     } else {
         match marker.modified_unix_ns {
             None => Some(AgeUnknown::NoModificationTime),
-            Some(0) => Some(AgeUnknown::MarkerExtended),
             Some(m) if m > now_ns => Some(AgeUnknown::InFuture),
             Some(m) if created.is_some_and(|c| m.saturating_add(MTIME_SLACK_NS) < c) => {
                 Some(AgeUnknown::BeforeSegment)

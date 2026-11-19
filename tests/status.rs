@@ -422,3 +422,110 @@ fn beacons_respect_the_umask() {
     let s = status::status(&journal).unwrap();
     assert_eq!(reader(&s, "private").state, BeaconState::Live);
 }
+
+/// Round 3, item 7: "unknown checkpoint age" doesn't depend on a timestamp call. A marker that something cut short
+/// stays short (its age unknown) when a writer is killed right after opening the journal, and when a checkpoint
+/// fails, whether at the data barrier (nothing is written) or at the marker's own barrier (the slot is written, but
+/// the marker is extended only after that barrier succeeds). A checkpoint that succeeds extends it and the age is
+/// known. Before the fix, open extended the marker and set its time to the Unix epoch as a sentinel, which a writer
+/// killed between the two steps, a failing `set_modified` or a power loss lost.
+#[test]
+fn a_short_marker_stays_unknown_aged_until_a_checkpoint_succeeds() {
+    use tickertape::fault::{self, Point};
+    use tickertape::status::AgeUnknown;
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("checkpoint");
+    let full = tickertape::format::CHECKPOINT_FILE_LEN as u64;
+    let mut writer = Writer::open(dir.path(), small_config()).unwrap();
+    append_n(&mut writer, 2);
+    writer.checkpoint().unwrap();
+    // Generation 2 in the slot at offset 0, which survives a cut to 4096 bytes.
+    writer.checkpoint().unwrap();
+    append_n(&mut writer, 1);
+    drop(writer);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&marker)
+        .unwrap()
+        .set_len(4096)
+        .unwrap();
+    let len = || std::fs::metadata(&marker).unwrap().len();
+    let age = |dir: &Path| {
+        let c = status::status(dir).unwrap().checkpoint.unwrap();
+        (c.estimated_age, c.age_unknown)
+    };
+    assert_eq!(age(dir.path()), (None, Some(AgeUnknown::MarkerResized)));
+
+    // A writer killed right after opening (it waits before its first append for a file that never appears).
+    let never = dir.path().join("never");
+    let mut child = Guard(
+        Command::new(WRITER)
+            .arg(dir.path())
+            .args([
+                "1000",
+                &tickertape_tests::SMALL_SEGMENT.to_string(),
+                "100",
+                "3",
+            ])
+            .arg(&never)
+            .spawn()
+            .unwrap(),
+    );
+    let pid = child.0.id();
+    wait_until("the writer opened the journal", || {
+        status::status(dir.path()).is_ok_and(|s| s.writer.pid == Some(pid))
+    });
+    std::thread::sleep(Duration::from_millis(100));
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
+    assert_eq!(len(), 4096, "the writer extended the marker at open");
+    assert_eq!(age(dir.path()), (None, Some(AgeUnknown::MarkerResized)));
+
+    // A checkpoint that fails at its data barrier writes nothing.
+    let mut writer = Writer::open(dir.path(), small_config()).unwrap();
+    assert_eq!(len(), 4096);
+    append_n(&mut writer, 1);
+    fault::fail_next(Point::CheckpointSync, 5);
+    assert!(writer.checkpoint().is_err());
+    assert_eq!(len(), 4096);
+    assert_eq!(age(dir.path()), (None, Some(AgeUnknown::MarkerResized)));
+    drop(writer);
+
+    // A checkpoint that fails at the marker's barrier has written its slot (generation 3, at offset 65,536), but the
+    // marker is not extended: its age stays unknown.
+    let mut writer = Writer::open(dir.path(), small_config()).unwrap();
+    append_n(&mut writer, 1);
+    fault::fail_next(Point::CheckpointMarkerSync, 5);
+    assert!(writer.checkpoint().is_err());
+    assert!(len() < full, "{}", len());
+    let s = status::status(dir.path()).unwrap();
+    assert_eq!(s.checkpoint.unwrap().marker.generation, 3);
+    assert_eq!(
+        s.checkpoint.unwrap().age_unknown,
+        Some(AgeUnknown::MarkerResized)
+    );
+    drop(writer);
+
+    // The normal path: a checkpoint that succeeds extends the marker; the age is known.
+    let mut writer = Writer::open(dir.path(), small_config()).unwrap();
+    append_n(&mut writer, 1);
+    writer.checkpoint().unwrap();
+    assert_eq!(len(), full);
+    let (estimated, unknown) = age(dir.path());
+    assert_eq!(unknown, None);
+    assert!(
+        estimated.unwrap() < Duration::from_secs(60),
+        "{estimated:?}"
+    );
+    // With a full marker, a checkpoint that fails at its data barrier doesn't touch the marker's time.
+    let before = std::fs::metadata(&marker).unwrap().modified().unwrap();
+    append_n(&mut writer, 1);
+    fault::fail_next(Point::CheckpointSync, 5);
+    assert!(writer.checkpoint().is_err());
+    assert_eq!(
+        std::fs::metadata(&marker).unwrap().modified().unwrap(),
+        before
+    );
+    drop(writer);
+}

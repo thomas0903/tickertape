@@ -132,7 +132,9 @@ ext4 maximum), and a torn write of one slot is unlikely to damage the other; thi
 is no larger than that. If both slots are damaged anyway, recovery falls back to a full scan (tested).
 
 The writer creates the file (all zeros, so neither slot is valid), syncs it, and syncs the journal directory when it
-creates the journal, before the first segment. Generations start at 1. A checkpoint that would need generation
+creates the journal, before the first segment. A writer that finds an existing marker shorter than 131,072 bytes (something cut it)
+leaves it so at open, writes its checkpoints' slots into it, and extends it to its full length (zeros) after the first
+checkpoint whose slot and marker sync succeed. Readers accept a short marker (below). Generations start at 1. A checkpoint that would need generation
 `u64::MAX` fails.
 
 | Offset in slot | Size | Field | Value |

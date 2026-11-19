@@ -31,6 +31,9 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
     listed (another user's). v0.4.0 failed transiently in those cases. Everywhere else in the journal the check still
     fails closed.
   - `rustix` now also enables its `process` feature (for `kill(pid, 0)`); no new crates.
+  - A writer that finds the checkpoint marker cut short no longer extends it at open: it extends it after its next
+    checkpoint has succeeded, so that observers can't take the time of the cut or of the extension for a
+    checkpoint's (a short marker's age is reported unknown). Every reader already accepts a short marker.
   - C ABI: the new `Error::BeaconInUse` has its own status code, `TICKERTAPE_E_BEACON_IN_USE` (-18); no C function
     creates beacons yet.
 - Fix: readers racing with retention (the writer's policy or `tickertape archive`) no longer report a removed segment

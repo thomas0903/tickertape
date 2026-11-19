@@ -43,6 +43,9 @@ pub struct Writer {
     /// Directories whose entries changed since the last checkpoint.
     dirty_dirs: BTreeSet<PathBuf>,
     checkpoint_file: File,
+    /// The marker file is shorter than its full length (something cut it): it is extended after the next checkpoint's
+    /// marker barrier, never at open (ADR 0032 → Checkpoint age).
+    checkpoint_file_short: bool,
     /// The wake-up region, if enabled and available (ADRs 0017 and 0021).
     notify: Option<mmap::Notify>,
     /// The background prefault thread, if enabled and started (ADR 0020).
@@ -148,7 +151,7 @@ impl Writer {
             dirty_dirs: BTreeSet::new(),
         };
         rec.remove_tmp_files()?;
-        let (checkpoint_file, checkpoint) = rec.open_checkpoint_file()?;
+        let (checkpoint_file, checkpoint, checkpoint_file_short) = rec.open_checkpoint_file()?;
         let state = rec.recover(checkpoint)?;
         let mut dirty_dirs = rec.dirty_dirs;
         // A new writer can't know whether directory entries made by earlier writers are durable, including the
@@ -175,6 +178,7 @@ impl Writer {
             dirty: state.dirty,
             dirty_dirs,
             checkpoint_file,
+            checkpoint_file_short,
             notify,
             prefault,
             spare: None,
@@ -411,8 +415,21 @@ impl Writer {
         self.checkpoint_file
             .write_all_at(&bytes, at)
             .map_err(|e| Error::io("write checkpoint marker", &marker_path, e))?;
+        crate::fault::inject(crate::fault::Point::CheckpointMarkerSync)
+            .map_err(|e| Error::io("sync checkpoint marker", &marker_path, e))?;
         mmap::full_barrier(&self.checkpoint_file)
             .map_err(|e| Error::io("sync checkpoint marker", &marker_path, e))?;
+        // 5. A marker that something cut short is extended only now, after its slot is durable: observers take a
+        // full-length marker's modification time as the checkpoint's time (ADR 0032), so the extension must not
+        // happen before a checkpoint has succeeded (a short marker's age is unknown). Best effort: the checkpoint has
+        // succeeded, and a marker left short is still valid (each slot is read on its own); a later checkpoint tries
+        // again.
+        if self.checkpoint_file_short
+            && mmap::preallocate(&self.checkpoint_file, format::CHECKPOINT_FILE_LEN as u64).is_ok()
+            && mmap::sync_data(&self.checkpoint_file).is_ok()
+        {
+            self.checkpoint_file_short = false;
+        }
 
         self.generation = generation;
         self.checkpointed = Some(slot);
@@ -777,8 +794,9 @@ impl Recovery<'_> {
         Ok(())
     }
 
-    /// Opens (creating if needed) the checkpoint marker file and decodes the current checkpoint.
-    fn open_checkpoint_file(&mut self) -> Result<(File, Option<CheckpointSlot>)> {
+    /// Opens (creating if needed) the checkpoint marker file and decodes the current checkpoint. Also returns whether
+    /// an existing marker is shorter than its full length.
+    fn open_checkpoint_file(&mut self) -> Result<(File, Option<CheckpointSlot>, bool)> {
         let path = self.dir.join(CHECKPOINT_FILE);
         let existed = path.exists();
         let file = OpenOptions::new()
@@ -796,24 +814,20 @@ impl Recovery<'_> {
         file.read_exact_at(&mut contents, 0)
             .map_err(|e| Error::io("read checkpoint marker", &path, e))?;
         let checkpoint = format::decode_checkpoint(&contents);
-        if len < format::CHECKPOINT_FILE_LEN as u64 {
-            // Preallocated, not sparse, so that writing a slot never needs new blocks (a full disk must not make
-            // checkpoints fail).
+        if !existed {
+            // A new marker: preallocated, not sparse, so that writing a slot never needs new blocks (a full disk must
+            // not make checkpoints fail).
             mmap::preallocate(&file, format::CHECKPOINT_FILE_LEN as u64)
                 .map_err(|e| Error::io("create checkpoint marker", &path, e))?;
-            // Observers read the marker's modification time as the time of the last checkpoint (ADR 0032). A short
-            // marker's time is when it was cut, not a checkpoint's, and neither is the time of this extension: set it
-            // to the Unix epoch, which observers report as an unknown age until the next checkpoint writes a slot.
-            // Best effort; the time is informational.
-            if existed {
-                let _ = file.set_modified(std::time::UNIX_EPOCH);
-            }
             mmap::sync_data(&file).map_err(|e| Error::io("sync checkpoint marker", &path, e))?;
-        }
-        if !existed {
             journal::sync_dir(self.dir)?;
+            return Ok((file, checkpoint, false));
         }
-        Ok((file, checkpoint))
+        // An existing marker that something cut short is left short here: observers take a full-length marker's
+        // modification time as the time of the last checkpoint (ADR 0032), and the time of an extension is not that.
+        // The next checkpoint extends it after its slot is durable. Until then, a checkpoint writes its slot into
+        // the short file, which may need a new block.
+        Ok((file, checkpoint, len < format::CHECKPOINT_FILE_LEN as u64))
     }
 
     fn recover(&mut self, checkpoint: Option<CheckpointSlot>) -> Result<RecoveredState> {

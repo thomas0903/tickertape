@@ -237,9 +237,11 @@ fn unreliable_checkpoint_times_are_unknown() {
     assert!(s.breaches(&t).is_empty());
 }
 
-/// Finding 12, round 2 B4: a writer that extends a short marker at open doesn't make its age look known. The cut set
-/// the marker's modification time to the time of the cut (not a checkpoint's); the writer extends the marker and
-/// sets its time to the epoch, so the age stays unknown (and the threshold breached) until the next checkpoint.
+/// Finding 12, round 2 B4, round 3 item 7: a short marker's age stays unknown until a checkpoint succeeds. The cut set
+/// the marker's modification time to the time of the cut (not a checkpoint's). A writer opening the journal leaves it
+/// short (it no longer extends it at open, which needed a timestamp sentinel), and its next checkpoint extends it after
+/// the slot is durable, which makes the age known again. A marker that was cut and then extended by something else (a
+/// v0.4.0 writer extends at open) is recognised by its contents: the older slot is lost.
 #[test]
 fn reopening_with_a_short_marker_keeps_the_age_unknown() {
     let dir = tempfile::tempdir().unwrap();
@@ -251,33 +253,56 @@ fn reopening_with_a_short_marker_keeps_the_age_unknown() {
     append(&mut writer, 1, 10, 0);
     drop(writer);
     backdate_checkpoint(dir.path(), 0, 3 * HOUR);
+    let full = format::CHECKPOINT_FILE_LEN as u64;
     let t = Thresholds::default().max_checkpoint_age(HOUR);
+    let s = status(dir.path()).unwrap();
+    assert_eq!(s.checkpoint.unwrap().age_unknown, None);
+    assert_eq!(s.breaches(&t), vec![Breach::CheckpointAge]);
     // The cut refreshes the modification time, as truncating a file does.
     marker(dir.path()).set_len(4096).unwrap();
-    let s = status(dir.path()).unwrap();
-    assert_eq!(
-        s.checkpoint.unwrap().age_unknown,
-        Some(AgeUnknown::MarkerResized)
-    );
-    assert_eq!(s.breaches(&t), vec![Breach::CheckpointAge]);
+    let unknown = |dir: &Path, reason: AgeUnknown, uncovered: u64| {
+        let s = status(dir).unwrap();
+        let c = s.checkpoint.unwrap();
+        assert_eq!(c.marker.generation, 2);
+        assert_eq!(c.estimated_age, None);
+        assert_eq!(c.age_unknown, Some(reason));
+        assert_eq!(s.exposure.records, Some(uncovered));
+        assert_eq!(s.breaches(&t), vec![Breach::CheckpointAge]);
+    };
+    unknown(dir.path(), AgeUnknown::MarkerResized, 1);
 
+    // Opening leaves the marker short.
     let mut writer = Writer::open(dir.path(), config()).unwrap();
-    let meta = fs::metadata(dir.path().join("checkpoint")).unwrap();
-    assert_eq!(meta.len(), format::CHECKPOINT_FILE_LEN as u64);
-    let s = status(dir.path()).unwrap();
-    let c = s.checkpoint.unwrap();
-    assert_eq!(c.marker.generation, 2);
-    assert_eq!(c.estimated_age, None);
-    assert_eq!(c.age_unknown, Some(AgeUnknown::MarkerExtended));
-    assert_eq!(s.exposure.records, Some(1));
-    assert_eq!(s.breaches(&t), vec![Breach::CheckpointAge]);
+    assert_eq!(
+        fs::metadata(dir.path().join("checkpoint")).unwrap().len(),
+        4096
+    );
+    unknown(dir.path(), AgeUnknown::MarkerResized, 1);
 
-    // The next checkpoint makes the age known again.
+    // The next checkpoint extends it after its slot is durable, and the age is known again.
     append(&mut writer, 1, 10, 0);
     writer.checkpoint().unwrap();
     append(&mut writer, 1, 10, 0);
+    assert_eq!(
+        fs::metadata(dir.path().join("checkpoint")).unwrap().len(),
+        full
+    );
     let s = status(dir.path()).unwrap();
+    assert_eq!(s.checkpoint.unwrap().marker.generation, 3);
     assert!(s.checkpoint.unwrap().estimated_age.unwrap() < HOUR);
+    assert!(s.breaches(&t).is_empty());
+    drop(writer);
+
+    // Cut again (generation 3, in the slot at 65,536, is lost; generation 2 remains) and extended by something else:
+    // full length, but the current slot's predecessor is missing from the other slot.
+    marker(dir.path()).set_len(4096).unwrap();
+    marker(dir.path()).set_len(full).unwrap();
+    unknown(dir.path(), AgeUnknown::OlderSlotLost, 3);
+    // A writer's next checkpoint (generation 3 again, in the other slot) restores both slots.
+    let mut writer = Writer::open(dir.path(), config()).unwrap();
+    writer.checkpoint().unwrap();
+    let s = status(dir.path()).unwrap();
+    assert_eq!(s.checkpoint.unwrap().age_unknown, None);
     assert!(s.breaches(&t).is_empty());
 }
 

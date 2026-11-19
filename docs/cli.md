@@ -244,7 +244,7 @@ a dry run). JSON numbers preserve their u64 interpretation; consumers should use
                "modified_unix_ns":u64|null,"estimated_age_s":number|null,
                "age_unknown_reason":"no_modification_time"|"modification_time_in_future"|
                                     "modification_time_before_segment"|"marker_resized"|"marker_changing"|
-                                    "marker_extended"|null}|null,
+                                    "older_slot_lost"|null}|null,
  "exposure":{"records":u64|null,"bytes":u64|null,"estimated_age_s":number|null,"oldest_local_ts_ns":u64|null,
              "verified":bool},
  "storage":{"available_bytes":u64,"total_bytes":u64,"next_segment_size_bytes":u64,"spare_segment":bool,
@@ -291,10 +291,12 @@ not be established.
   the marker (its segment missing or with an invalid header, or an offset outside the record area); then `exposure`
   is unknown and `health.corrupt` is true. `modified_unix_ns` is the marker file's modification time and
   `estimated_age_s` the time since then, by the observer's clock at the end of the sample; null with
-  `age_unknown_reason` when the time is detectably unreliable (`marker_extended`: a writer extended a short marker
-  at open, so the age is unknown until its next checkpoint; `marker_changing`: the marker was rewritten during every
-  read, which `--max-checkpoint-age` doesn't count as a breach since it means a checkpoint just happened). It is
-  wrong if something else writes the file or a copy didn't keep times.
+  `age_unknown_reason` when the time is detectably unreliable (`marker_resized`: the marker is not at its full
+  length, because something cut it; a writer leaves it so until its next checkpoint succeeds, then extends it;
+  `older_slot_lost`: the other slot doesn't hold the generation before the current one, as every checkpoint leaves
+  it, so the marker lost bytes and was extended, for example by a v0.4.0 writer at open; `marker_changing`: the
+  marker was rewritten during every read, which `--max-checkpoint-age` doesn't count as a breach since it means a
+  checkpoint just happened). It is wrong if something else writes the file or a copy didn't keep times.
 - `exposure`: `records` not covered by the checkpoint (all records from the oldest segment if there is none); `bytes`
   are the segment-file footprint from the checkpoint position to the head (0 when no record is uncovered, null if a
   segment involved is missing); `estimated_age_s` is 0 with no uncovered records, otherwise the checkpoint's

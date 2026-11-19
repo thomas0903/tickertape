@@ -764,7 +764,12 @@ fn age_unknown_words(reason: tickertape::status::AgeUnknown) -> &'static str {
         AgeUnknown::NoModificationTime => "the filesystem reports no modification time",
         AgeUnknown::InFuture => "the marker's modification time is in the future",
         AgeUnknown::BeforeSegment => "the marker's modification time predates its segment",
-        AgeUnknown::MarkerResized => "the marker file was resized",
+        AgeUnknown::MarkerResized => {
+            "the marker file is not at its full length (cut; a writer extends it at its next checkpoint)"
+        }
+        AgeUnknown::OlderSlotLost => {
+            "the marker lost its older slot (cut and extended), so its time is not a checkpoint's"
+        }
         AgeUnknown::Changing => "the marker kept changing while read",
         _ => "unreliable modification time",
     }

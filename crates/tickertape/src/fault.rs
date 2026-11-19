@@ -23,6 +23,8 @@ pub enum Point {
     Link,
     /// Syncing segment data during `checkpoint()`.
     CheckpointSync,
+    /// Syncing the checkpoint marker after writing its slot, during `checkpoint()`.
+    CheckpointMarkerSync,
     /// Renaming a retention segment (inject EXDEV to exercise the copy path).
     RetentionRename,
     /// Syncing an archive copy before removing its source.
