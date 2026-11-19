@@ -305,6 +305,11 @@ fn pure_every_error_variant_has_a_code() {
             Error::InvalidConfig("x".into()),
             tickertape_status_code::TICKERTAPE_E_INVALID_CONFIG,
         ),
+        (
+            "BeaconInUse",
+            Error::BeaconInUse { path: path.clone() },
+            tickertape_status_code::TICKERTAPE_E_BEACON_IN_USE,
+        ),
     ];
     let names: BTreeSet<String> = samples.iter().map(|(n, _, _)| n.to_string()).collect();
     assert_eq!(
@@ -424,6 +429,16 @@ fn pure_every_corrupt_reason_has_a_code() {
             CorruptReason::DanglingCheckpoint(4),
             R::TICKERTAPE_CORRUPT_DANGLING_CHECKPOINT,
         ),
+        (
+            "EmptyCommitWord",
+            CorruptReason::EmptyCommitWord(4),
+            R::TICKERTAPE_CORRUPT_EMPTY_COMMIT_WORD,
+        ),
+        (
+            "UncheckedTail",
+            CorruptReason::UncheckedTail(4),
+            R::TICKERTAPE_CORRUPT_UNCHECKED_TAIL,
+        ),
     ];
     let names: BTreeSet<String> = samples.iter().map(|(n, _, _)| n.to_string()).collect();
     assert_eq!(
@@ -438,6 +453,39 @@ fn pure_every_corrupt_reason_has_a_code() {
             codes.insert(*expected as i32),
             "duplicate code for {variant}"
         );
+    }
+    // The sequence number an empty commit word's evidence carries reaches C in the message, as other reasons'
+    // details do.
+    for (reason, expected) in [
+        (
+            CorruptReason::EmptyCommitWord(123_456),
+            R::TICKERTAPE_CORRUPT_EMPTY_COMMIT_WORD,
+        ),
+        (
+            CorruptReason::UncheckedTail(123_457),
+            R::TICKERTAPE_CORRUPT_UNCHECKED_TAIL,
+        ),
+    ] {
+        let error = Error::Corrupt {
+            path: std::path::PathBuf::from("/j/00000000000000000000.tape"),
+            offset: 64,
+            reason,
+        };
+        let status = guard(|| Err(FfiError::from(&error)));
+        assert_eq!(status, code(tickertape_status_code::TICKERTAPE_E_CORRUPT));
+        assert_eq!(tickertape_last_error_corrupt_reason(), expected as i32);
+        let seq = match reason {
+            CorruptReason::EmptyCommitWord(seq) | CorruptReason::UncheckedTail(seq) => seq,
+            _ => unreachable!(),
+        };
+        assert!(
+            last_message().contains(&format!("sequence {seq}")),
+            "{}",
+            last_message()
+        );
+        let name =
+            unsafe { std::ffi::CStr::from_ptr(tickertape_corrupt_reason_name(expected as i32)) };
+        assert_eq!(name.to_str().unwrap(), format!("{expected:?}"));
     }
 }
 
@@ -1842,7 +1890,8 @@ fn report_struct_size_works_in_both_directions() {
 fn pure_unknown_status_is_far_from_the_assigned_codes() {
     assert_eq!(code(S::TICKERTAPE_E_UNKNOWN), -255);
     assert_eq!(name(-255), "TICKERTAPE_E_UNKNOWN");
-    assert_eq!(name(-18), "TICKERTAPE_UNKNOWN_STATUS");
+    assert_eq!(name(-18), "TICKERTAPE_E_BEACON_IN_USE");
+    assert_eq!(name(-19), "TICKERTAPE_UNKNOWN_STATUS");
 }
 
 #[test]

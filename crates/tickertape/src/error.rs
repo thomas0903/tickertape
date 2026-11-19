@@ -117,6 +117,14 @@ pub enum Error {
     /// A configuration value is out of range.
     #[error("invalid configuration: {0}")]
     InvalidConfig(String),
+
+    /// A reader beacon with this name is held by a running reader (or a process that inherited its descriptor), so
+    /// [`ReaderBeacon::create`](crate::status::ReaderBeacon::create) won't take the name.
+    #[error("reader beacon {} is held by a running reader", path.display())]
+    BeaconInUse {
+        /// The beacon file.
+        path: PathBuf,
+    },
 }
 
 impl Error {
@@ -198,7 +206,9 @@ pub enum CorruptReason {
     /// A reserved field is non-zero.
     #[error("reserved flags are non-zero")]
     BadFlags,
-    /// A seal's checksum doesn't match the expected next sequence number.
+    /// A seal is invalid: its checksum doesn't match the expected next sequence number, or it lies where a seal
+    /// can't. Writer recovery also reports it at the place of a missing seal in front of a successor segment that
+    /// opens, when non-zero bytes follow beyond the seal's eight bytes (`docs/crash-contract.md`, C11 (1)).
     #[error("invalid seal")]
     BadSeal,
     /// A sealed segment's successor is missing while later segments exist, or doesn't start where the seal says.
@@ -207,4 +217,22 @@ pub enum CorruptReason {
     /// The checkpoint marker points to a segment that doesn't exist, or to an impossible offset.
     #[error("checkpoint marker points to missing segment {0} or an invalid offset")]
     DanglingCheckpoint(u64),
+    /// A commit word reads 0 (no record), and recovery or `verify` found evidence of committed history after it
+    /// (`docs/crash-contract.md`, C11 (2); ADR 0035). The number is the sequence number the evidence carries: a later
+    /// valid record's, a final seal's next sequence number, or (writer recovery only; `verify` does not weigh other
+    /// segments) the base of a later segment. Usually storage damage, power loss or outside modification; a torn
+    /// payload left by a writer process crash can also cause it (`docs/crash-contract.md`, C1).
+    #[error("commit word is 0 but committed history follows it (sequence {0})")]
+    EmptyCommitWord(u64),
+    /// A commit word reads 0, and the search for committed history after it stopped at its work bound before it could
+    /// decide (`docs/crash-contract.md`, C11 (2); ADR 0035 → Work bound). Inconclusive, unlike
+    /// [`EmptyCommitWord`](Self::EmptyCommitWord): no record was proven valid, but recovery still treats the tail as
+    /// committed history (preserved, or refused with `RecoveryPolicy::Fail`). Storage damage can cause it, and so
+    /// can a torn payload left by a writer process crash (`docs/crash-contract.md`, C1). The number is the sequence
+    /// number in the header of the candidate record where the search stopped, or the expected sequence number plus
+    /// one when it stopped at a final seal.
+    #[error(
+        "commit word is 0 and the bytes after it were too costly to check completely (sequence {0}); treated as committed history"
+    )]
+    UncheckedTail(u64),
 }

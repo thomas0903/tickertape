@@ -32,6 +32,9 @@ pub const ERROR_VARIANTS: &[(&str, &str)] = &[
     ("SequenceExhausted", "SequenceExhaustedError"),
     ("Discarded", "DiscardedError"),
     ("InvalidConfig", "InvalidConfigError"),
+    // Raised only by `status::ReaderBeacon::create`, which the bindings do not expose: listed (as the base class) so
+    // that the variant check covers it.
+    ("BeaconInUse", "TickertapeError"),
 ];
 
 /// Every `tickertape::CorruptReason` variant and its stable string code (`CorruptJournalError.reason`).
@@ -49,6 +52,8 @@ pub const CORRUPT_REASONS: &[(&str, &str)] = &[
     ("BadSeal", "bad_seal"),
     ("BrokenChain", "broken_chain"),
     ("DanglingCheckpoint", "dangling_checkpoint"),
+    ("EmptyCommitWord", "empty_commit_word"),
+    ("UncheckedTail", "unchecked_tail"),
 ];
 
 /// A field value of an exception, owned by Rust until the exception is built.
@@ -201,6 +206,14 @@ pub fn reason_fields(reason: &CorruptReason) -> (&'static str, Fields) {
             d.push(("segment_base_seq", segment_base_seq.into()));
             "dangling_checkpoint"
         }
+        CorruptReason::EmptyCommitWord(seq) => {
+            d.push(("seq", seq.into()));
+            "empty_commit_word"
+        }
+        CorruptReason::UncheckedTail(seq) => {
+            d.push(("seq", seq.into()));
+            "unchecked_tail"
+        }
         // A variant added to the core crate after this mapping was written. The tests named in the module docs
         // fail until it is mapped; until then it is still reported, with this code.
         _ => "unknown",
@@ -288,6 +301,10 @@ pub fn describe(err: &Error) -> ErrorSpec {
             "DiscardedError"
         }
         Error::InvalidConfig(_) => "InvalidConfigError",
+        Error::BeaconInUse { path } => {
+            f.push(("path", path.as_path().into()));
+            "TickertapeError"
+        }
         // See `reason_fields`: reported as the base class until mapped.
         _ => "TickertapeError",
     };
@@ -395,6 +412,8 @@ mod tests {
             CorruptReason::BadSeal,
             CorruptReason::BrokenChain(9),
             CorruptReason::DanglingCheckpoint(10),
+            CorruptReason::EmptyCommitWord(11),
+            CorruptReason::UncheckedTail(12),
         ]
     }
 
@@ -429,6 +448,9 @@ mod tests {
             Error::SequenceExhausted,
             Error::Discarded { seq: 3 },
             Error::InvalidConfig("segment_size".into()),
+            Error::BeaconInUse {
+                path: "/j/readers/a.beacon".into(),
+            },
         ]
     }
 
