@@ -21,6 +21,41 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   and a library of another version is refused. Tested on Linux x86-64, Linux arm64 and macOS in a new CI job, including
   the cross-language fixtures and the released-format fixtures. Not published to Maven Central yet; the coordinates
   `io.github.thomas0903:tickertape` await the owner's confirmation.
+- Fix: readers racing with retention (the writer's policy or `tickertape archive`) no longer report a removed segment
+  as an error of the wrong kind. `Reader::seek` returned an I/O "not found" error when the segment it chose was
+  removed before it opened it; it now lists the segments again and returns `Error::SeqUnavailable` with the new
+  oldest sequence number. `Reader::open` and `Reader::open_mapped` likewise start at the oldest segment that remains.
+  A reader at a seal whose segment and successor were both removed returned `CorruptReason::BrokenChain`; it now
+  returns `Error::Discarded` (a missing successor while the reader's segment is still in place is still a broken
+  chain). `inspect::list_segments` and `inspect::verify` (CLI `inspect`, `verify`) skip segments removed while they
+  run instead of failing, and `verify` no longer reports a problem when the writer rolls during the scan. Readers and
+  inspection also list again when a directory listing of a live journal comes back empty (on btrfs a listing omits
+  segments created after it started, so concurrent retention could make it miss all of them). New
+  fault-injection hook points (`fault::run_at`) and a stress test with `max_segments(2)` retention cover this.
+- Fix: a durable-only reader (`ReaderConfig::durable_only`) could return records that were never checkpointed and
+  that recovery had moved to `quarantine/` (crash contract C13). When recovery replaced the segment the reader held
+  and the new writer checkpointed, the reader applied the new checkpoint marker to the old file it still had open.
+  A durable-only reader now confirms, after reading a marker that moves past its position, that its segment's path
+  still names the file it has open (one `stat`, never per record), and returns `Error::Discarded` otherwise
+  (ADR 0034). As a consequence, a durable-only reader overtaken by retention may get `Error::Discarded` when the
+  checkpoint moves past its position instead of at the end of the removed segment. New hook points
+  `ReaderCheckpoint` and `ReaderCheckpointIdentity`, deterministic tests and a stress test with corruption injected
+  between writer restarts cover this, and the soak test now fails on such a record instead of counting it.
+  A safe durable-only reader could also return such records from its read buffer when recovery removed them in
+  place, in a file that kept its identity (storage damage that emptied a commit word after the checkpoint); it now
+  discards that buffer when it applies a new marker, so it reads every newly covered record from the file again.
+  A durable-only reader waiting at the end of a segment that retention removed, with the checkpoint naming the next
+  segment but not yet past its position (the writer rolled and committed nothing there), returned `Ok(None)` for as
+  long as the writer stayed idle; it now returns `Error::Discarded` there, as a visible reader does.
+- Fix: `tickertape tail` exited with an error when the records at its position had been removed by retention, which
+  a `--durable-only` tail now learns of when the checkpoint moves past it. It continues at the oldest record still in
+  the journal and warns on standard error with the range it skipped.
+- Fix: a `stat` that failed with an error other than "not found" (`EACCES`, `EIO`) counted as the segment being
+  gone, so a reader could report `Error::Discarded` and `verify` could miss a broken chain. It is now an I/O error.
+- Fix: `verify` (CLI `verify`, `inspect`) scanned a state a running writer passes through again only once, after
+  50 ms, so a writer descheduled between linking a new segment and sealing the old one for longer made it report a
+  broken chain. It now scans again with growing pauses, up to 630 ms in all (new hook point `InspectRescan` between
+  those scans).
 - C ABI (ADR 0028, `docs/c-api.md`): a new workspace crate, `crates/tickertape-ffi`, builds `libtickertape` as a
   shared and a static library with a committed, cbindgen-generated C99/C++11 header (`include/tickertape.h`, checked
   for drift in CI) and cargo-c metadata for installation with a pkg-config file. It covers the writer (append,
@@ -41,9 +76,32 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   checkpoint. The test-only `fault-injection` feature gains `fault::Point::AbandonedWriteSync`.
 - Repository: `unsafe` code is now also allowed in `crates/tickertape-ffi`, as a scoped extension of the rule (ADR
   0028). The release tooling refuses workspace members that it does not release unless they have `publish = false`.
+- Performance: the zero-copy reader (`Reader::open_mapped`) no longer copies each record into a scratch buffer to
+  validate it. It computes the CRC32C straight from 8-byte atomic loads of the mapping, feeding each load to the CPU's
+  CRC instruction, and still validates every record before creating any slice into the mapping (ADR 0027). The same
+  records are accepted and rejected, with the same errors; the on-disk format and `open_mapped`'s safety contract are
+  unchanged.
+- Tests: the mapped and safe readers are checked against each other over every payload length up to 4,200 bytes, page
+  and segment boundaries, every corruption class and random damaged journals; the kill loop keeps a live zero-copy
+  reader across every crash; Miri also runs the CRC tests.
+- Platforms: `Reader::open_mapped` maps segments only on x86-64 and aarch64, where 8-byte atomic loads from read-only
+  memory are documented to work. On other targets it now reads with `pread`, like `Reader::open` (same API and
+  results; a frame too long for the address space is reported as an `Error::Io` with `ErrorKind::OutOfMemory`
+  instead of panicking). CI checks that the crate builds for `i686-unknown-linux-gnu`.
+- Docs: `open_mapped`'s rustdoc, ADR 0027 and the crash contract now state that the zero-copy reader's guarantees
+  hold for an intact publication chain, and when its loads can race with a writer: a commit word damaged on storage,
+  either a length enlarged (validation then loads bytes a live writer is storing) or a published record's word
+  zeroed (recovery can then zero that record and the published records after it in place, under a live reader), as
+  in every earlier release. A publication frontier, a separate follow-up, would close only the first.
+- Tests: a zero-copy reader polls while writer processes append records of mixed sizes, roll and are killed; a
+  deterministic test checks that a complete but unpublished record stays invisible; differential tests recompute the
+  CRC after damage so the sequence and flag checks are reached; the corruption matrix covers records long enough for
+  the three-lane CRC; tests check that the word-fed CRC takes the hardware path and the three-lane blocks; Miri runs
+  `MapRo`'s loads over an anonymous mapping; `--cfg tickertape_force_soft_crc` runs the suite on tickertape's CRC
+  fallback (the `crc32c` crate still uses the CPU instruction where it has one).
 - Benchmarks: the test of a lagging reader under retention no longer depends on machine speed (it failed on
-  macOS CI runners), and `tt-sustained` readers retry a seek when retention removes the segment they were about to
-  open.
+  macOS CI runners). `tt-sustained` readers no longer need to retry a seek when retention removes the segment they
+  were about to open: `Reader::seek` now lists again by itself.
 - Benchmarks: sustained workloads (ADR 0026). `tt-sustained` runs one writer and any mix of safe/mapped,
   visible/durable-only and lagging reader processes for a fixed duration (default 10 minutes) with steady, bursty or
   unpaced traffic, periodic checkpoints, segment rolls and writer retention, and reports latency percentiles, late

@@ -1,12 +1,15 @@
 //! Fault injection for tests (cargo feature `fault-injection`, not part of the stable API).
 //!
 //! A test arms a failure point on its own thread; the next time the writer reaches that point on the same thread,
-//! the operation fails with the given OS error instead of running. Without the feature, the injection points compile to
-//! nothing.
+//! the operation fails with the given OS error instead of running. A test can also run code at the moment a record
+//! is complete but not yet published ([`before_next_publish`]). Readers and inspection have hook points too, where a
+//! test can run an action of its own ([`run_at`]), for example removing files at exactly the moment a concurrent
+//! retention run could. Without the feature, the injection and hook points compile to nothing.
 
 use std::io;
 
-/// Places in the writer where a failure can be injected.
+/// Places in the writer where a failure can be injected ([`fail_next`], [`fail_next_background`]), and places in the
+/// readers and inspection where an action can run ([`run_at`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Point {
@@ -30,6 +33,26 @@ pub enum Point {
     SpareMap,
     /// Writing the spare's header when the writer publishes it at roll (arm with [`fail_next`]).
     SpareHeader,
+    /// After a reader lists the segments and before it opens the one it chose (`Reader::open`,
+    /// `Reader::open_mapped`, `Reader::seek`). Arm with [`run_at`].
+    ReaderOpen,
+    /// After a reader at a seal has checked that its segment is still in place and before it opens the successor.
+    /// Arm with [`run_at`].
+    ReaderSeal,
+    /// Before a durable-only reader reads the checkpoint marker. Arm with [`run_at`].
+    ReaderCheckpoint,
+    /// After a durable-only reader has read a checkpoint marker that moved past its cursor, before it checks that its
+    /// segment is still in place. Arm with [`run_at`].
+    ReaderCheckpointIdentity,
+    /// After inspection (`inspect::list_segments`, `inspect::verify`) lists the segments, before it opens each one.
+    /// Arm with [`run_at`].
+    InspectOpen,
+    /// After `inspect::verify` finds the newest listed segment sealed, before it looks for the successor. Arm with
+    /// [`run_at`].
+    InspectSeal,
+    /// In `inspect::verify`, after a scan found a segment in a state a running writer passes through and verify has
+    /// paused, before it scans that segment again. Arm with [`run_at`].
+    InspectRescan,
     /// Syncing the zeroing of an abandoned write (a panicking `append_with` fill closure).
     AbandonedWriteSync,
 }
@@ -39,10 +62,44 @@ mod armed {
     use super::Point;
     use std::cell::RefCell;
 
+    /// An action armed with [`super::run_at`]: the point, how many passes to let by first, and the action.
+    pub(super) type Hook = (Point, usize, Box<dyn FnOnce()>);
+
     thread_local! {
         pub(super) static ARMED: RefCell<Vec<(Point, i32)>> = const { RefCell::new(Vec::new()) };
+        pub(super) static HOOKS: RefCell<Vec<Hook>> = const { RefCell::new(Vec::new()) };
     }
 }
+
+/// Runs `action` on this thread when a reader or inspection reaches hook point `point` on this thread, after letting
+/// `skip` earlier passes through that point go by. Each armed action runs once.
+#[cfg(feature = "fault-injection")]
+pub fn run_at(point: Point, skip: usize, action: impl FnOnce() + 'static) {
+    armed::HOOKS.with(|h| h.borrow_mut().push((point, skip, Box::new(action))));
+}
+
+/// Called by readers and inspection at each hook point.
+#[cfg(feature = "fault-injection")]
+pub(crate) fn hook(point: Point) {
+    let action = armed::HOOKS.with(|h| {
+        let mut h = h.borrow_mut();
+        let i = h.iter().position(|(p, _, _)| *p == point)?;
+        if h[i].1 > 0 {
+            h[i].1 -= 1;
+            return None;
+        }
+        Some(h.remove(i).2)
+    });
+    // Run outside the borrow, so the action may arm further hooks.
+    if let Some(action) = action {
+        action();
+    }
+}
+
+/// Called by readers and inspection at each hook point (no-op without the `fault-injection` feature).
+#[cfg(not(feature = "fault-injection"))]
+#[inline(always)]
+pub(crate) fn hook(_point: Point) {}
 
 /// Makes the next operation at `point` on this thread fail with OS error `errno`.
 #[cfg(feature = "fault-injection")]
@@ -50,14 +107,16 @@ pub fn fail_next(point: Point, errno: i32) {
     armed::ARMED.with(|a| a.borrow_mut().push((point, errno)));
 }
 
-/// Disarms every failure point on this thread, and every background failure point.
+/// Disarms every failure point and hook on this thread (the publish hook too), and every background failure point.
 #[cfg(feature = "fault-injection")]
 pub fn clear() {
     armed::ARMED.with(|a| a.borrow_mut().clear());
+    armed::HOOKS.with(|h| h.borrow_mut().clear());
     background::ARMED
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clear();
+    publish::HOOK.with(|h| *h.borrow_mut() = None);
 }
 
 /// Makes the next operation at `point` on any of the writer's background threads fail with OS error `errno`.
@@ -112,3 +171,32 @@ pub(crate) fn inject(point: Point) -> io::Result<()> {
 pub(crate) fn inject(_point: Point) -> io::Result<()> {
     Ok(())
 }
+
+#[cfg(feature = "fault-injection")]
+mod publish {
+    use std::cell::RefCell;
+
+    thread_local! {
+        pub(super) static HOOK: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    }
+}
+
+/// Runs `hook` on this thread the next time the writer has written a whole record (header, payload and CRC) but not
+/// yet stored its commit word: the moment a reader must still see an empty slot.
+#[cfg(feature = "fault-injection")]
+pub fn before_next_publish(hook: impl FnOnce() + 'static) {
+    publish::HOOK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+}
+
+/// Called by the writer just before it stores a record's commit word.
+#[cfg(feature = "fault-injection")]
+pub(crate) fn pause_before_publish() {
+    if let Some(hook) = publish::HOOK.with(|h| h.borrow_mut().take()) {
+        hook();
+    }
+}
+
+/// Called by the writer just before it stores a record's commit word (no-op without the `fault-injection` feature).
+#[cfg(not(feature = "fault-injection"))]
+#[inline(always)]
+pub(crate) fn pause_before_publish() {}

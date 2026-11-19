@@ -320,9 +320,10 @@ What it cannot detect, and is undefined:
 ## Inspection and retention
 
 - `Journal.verify(dir)` checks every segment and returns a `VerifyReport` (records, sequence range, problems and the
-  first one). Corruption is in the report, not thrown. Beside an active writer, a segment roll during the scan can be
-  reported as a `BROKEN_CHAIN` problem that is not there (a limitation of the library's live scan): verify again
-  before treating it as corruption.
+  first one). Corruption is in the report, not thrown. Beside an active writer, a state the writer passes through (a
+  segment roll in progress) is scanned again for up to 630 ms before it is reported, so only a writer stalled there
+  for longer can make it report a problem that is not there (`BROKEN_CHAIN`); verify again to tell (see
+  [`operations.md`](operations.md)).
 - `VerifyReport` and `RetentionReport` are final classes with accessor methods, not records, because their C structs
   can gain fields in later versions; `Checkpoint`, `SegmentInfo` and `RecordCopy` are records, since their structs are
   frozen.

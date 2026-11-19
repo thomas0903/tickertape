@@ -13,6 +13,9 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[non_exhaustive]
 pub enum Error {
     /// An operating-system call failed.
+    ///
+    /// A reader also reports a read buffer it cannot allocate this way, with kind
+    /// [`OutOfMemory`](std::io::ErrorKind::OutOfMemory): a frame too large for the address space of a 32-bit target.
     #[error("{op} failed for {}: {source}", path.display())]
     Io {
         /// What tickertape was doing, e.g. `"preallocate segment"`.
@@ -115,6 +118,11 @@ impl Error {
     /// Appends that fail this way leave the journal consistent and can be retried once space is available.
     pub fn is_storage_full(&self) -> bool {
         matches!(self, Error::Io { source, .. } if crate::mmap::is_storage_full(source))
+    }
+
+    /// True for an I/O error saying a file or directory doesn't exist (`ENOENT`).
+    pub(crate) fn is_not_found(&self) -> bool {
+        matches!(self, Error::Io { source, .. } if source.kind() == io::ErrorKind::NotFound)
     }
 
     pub(crate) fn io(op: &'static str, path: impl Into<PathBuf>, source: io::Error) -> Error {
