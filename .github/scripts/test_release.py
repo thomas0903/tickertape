@@ -32,6 +32,23 @@ class ReleaseTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "dependency"):
                 release.validate_versions(root, "0.4.0")
 
+    def test_python_bindings_version_and_lockfile_follow_the_tag(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            release.validate_bindings_version(root, "0.5.0")  # older tags have no bindings
+            bindings = root / "bindings" / "python"
+            bindings.mkdir(parents=True)
+            (bindings / "Cargo.toml").write_text('[package]\nname="tickertape-python"\nversion="0.4.0"\n')
+            with self.assertRaisesRegex(ValueError, "Cargo.toml version"):
+                release.validate_bindings_version(root, "0.5.0")
+            (bindings / "Cargo.toml").write_text('[package]\nname="tickertape-python"\nversion="0.5.0"\n')
+            lock = '[[package]]\nname="tickertape"\nversion="{}"\n[[package]]\nname="tickertape-python"\nversion="0.5.0"\n'
+            (bindings / "Cargo.lock").write_text(lock.format("0.4.0"))
+            with self.assertRaisesRegex(ValueError, "stale"):
+                release.validate_bindings_version(root, "0.5.0")
+            (bindings / "Cargo.lock").write_text(lock.format("0.5.0"))
+            release.validate_bindings_version(root, "0.5.0")
+
     def test_ci_must_be_the_latest_main_push_for_this_commit(self):
         green = dict(head_sha="abc", head_branch="main", event="push", run_number=1,
                      status="completed", conclusion="success")

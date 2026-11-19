@@ -19,6 +19,8 @@ import urllib.request
 
 
 CRATES = ("tickertape", "tickertape-cli")
+# The Python bindings (ADR 0029): outside the workspace, versioned with it, published to PyPI by python-wheels.yml.
+BINDINGS = Path("bindings") / "python"
 TARGETS = (
     "x86_64-unknown-linux-gnu",
     "aarch64-unknown-linux-gnu",
@@ -63,6 +65,20 @@ def validate_versions(source, version):
             package = tomllib.load(file)["package"]
         if package["name"] != name or package["version"] != {"workspace": True}:
             raise ValueError(f"{name} must inherit the workspace version")
+    validate_bindings_version(source, version)
+
+
+def validate_bindings_version(source, version):
+    manifest = source / BINDINGS / "Cargo.toml"
+    if not manifest.exists():
+        return  # release tags from before the bindings existed
+    with manifest.open("rb") as file:
+        if tomllib.load(file)["package"]["version"] != version:
+            raise ValueError(f"{BINDINGS}/Cargo.toml version does not match the tag")
+    with (source / BINDINGS / "Cargo.lock").open("rb") as file:
+        locked = {package["name"]: package["version"] for package in tomllib.load(file)["package"]}
+    if locked.get("tickertape") != version or locked.get("tickertape-python") != version:
+        raise ValueError(f"{BINDINGS}/Cargo.lock is stale; run cargo update --workspace in {BINDINGS}")
 
 
 def require_green_ci(runs, sha):
