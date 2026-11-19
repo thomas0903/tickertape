@@ -70,8 +70,11 @@ pub enum tickertape_status_code {
     /// An internal error (a bug in tickertape) was caught. The handle involved is broken: later calls on it return
     /// this code; close it.
     TICKERTAPE_E_PANIC = -17,
+    /// A reader beacon with this name is held by a running reader (ADR 0032). The C ABI does not create beacons yet;
+    /// the code exists so that every core error has one.
+    TICKERTAPE_E_BEACON_IN_USE = -18,
     /// An error this version of the C ABI has no specific code for. Its value stays far from the assigned codes,
-    /// which later versions extend downwards from -17.
+    /// which later versions extend downwards from -18.
     TICKERTAPE_E_UNKNOWN = -255,
 }
 
@@ -187,6 +190,7 @@ pub(crate) fn status_of(error: &Error) -> S {
         Error::SequenceExhausted => S::TICKERTAPE_E_SEQUENCE_EXHAUSTED,
         Error::Discarded { .. } => S::TICKERTAPE_E_DISCARDED,
         Error::InvalidConfig(_) => S::TICKERTAPE_E_INVALID_CONFIG,
+        Error::BeaconInUse { .. } => S::TICKERTAPE_E_BEACON_IN_USE,
         _ => S::TICKERTAPE_E_UNKNOWN,
     }
 }
@@ -473,6 +477,7 @@ pub extern "C" fn tickertape_status_name(status: tickertape_status) -> *const c_
             TICKERTAPE_E_ABORTED,
             TICKERTAPE_E_BUSY,
             TICKERTAPE_E_PANIC,
+            TICKERTAPE_E_BEACON_IN_USE,
             TICKERTAPE_E_UNKNOWN,
         ]
     )

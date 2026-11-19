@@ -52,6 +52,9 @@ pub struct Writer {
     /// Directories whose entries changed since the last checkpoint.
     dirty_dirs: BTreeSet<PathBuf>,
     checkpoint_file: File,
+    /// The marker file is shorter than its full length (something cut it): it is extended after the next checkpoint's
+    /// marker barrier, never at open (ADR 0032 → Checkpoint age).
+    checkpoint_file_short: bool,
     /// The wake-up region, if enabled and available (ADRs 0017 and 0021).
     notify: Option<mmap::Notify>,
     /// The background prefault thread, if enabled and started (ADR 0020).
@@ -67,6 +70,12 @@ pub struct Writer {
     report: RecoveryReport,
     retention_report: crate::retention::Report,
     last_retention_error: Option<Error>,
+    /// Retention runs that failed since open.
+    retention_failures: u64,
+    /// The checkpoint marker's current slot as this writer last wrote it (or read it at open).
+    checkpointed: Option<CheckpointSlot>,
+    /// When this writer's last successful checkpoint finished.
+    last_checkpoint_at: Option<std::time::Instant>,
 }
 
 /// An open, mapped segment.
@@ -155,7 +164,7 @@ impl Writer {
             dirty_dirs: BTreeSet::new(),
         };
         rec.remove_tmp_files()?;
-        let (checkpoint_file, checkpoint) = rec.open_checkpoint_file()?;
+        let (checkpoint_file, checkpoint, checkpoint_file_short) = rec.open_checkpoint_file()?;
         let state = rec.recover(checkpoint)?;
         let mut dirty_dirs = rec.dirty_dirs;
         // A new writer can't know whether directory entries made by earlier writers are durable, including the
@@ -182,6 +191,7 @@ impl Writer {
             dirty: state.dirty,
             dirty_dirs,
             checkpoint_file,
+            checkpoint_file_short,
             notify,
             prefault,
             spare: None,
@@ -192,6 +202,9 @@ impl Writer {
             report,
             retention_report: crate::retention::Report::default(),
             last_retention_error: None,
+            retention_failures: 0,
+            checkpointed: checkpoint,
+            last_checkpoint_at: None,
         };
         writer.run_retention();
         Ok(writer)
@@ -415,10 +428,25 @@ impl Writer {
         self.checkpoint_file
             .write_all_at(&bytes, at)
             .map_err(|e| Error::io("write checkpoint marker", &marker_path, e))?;
+        crate::fault::inject(crate::fault::Point::CheckpointMarkerSync)
+            .map_err(|e| Error::io("sync checkpoint marker", &marker_path, e))?;
         mmap::full_barrier(&self.checkpoint_file)
             .map_err(|e| Error::io("sync checkpoint marker", &marker_path, e))?;
+        // 5. A marker that something cut short is extended only now, after its slot is durable: observers take a
+        // full-length marker's modification time as the checkpoint's time (ADR 0032), so the extension must not
+        // happen before a checkpoint has succeeded (a short marker's age is unknown). Best effort: the checkpoint has
+        // succeeded, and a marker left short is still valid (each slot is read on its own); a later checkpoint tries
+        // again.
+        if self.checkpoint_file_short
+            && mmap::preallocate(&self.checkpoint_file, format::CHECKPOINT_FILE_LEN as u64).is_ok()
+            && mmap::sync_data(&self.checkpoint_file).is_ok()
+        {
+            self.checkpoint_file_short = false;
+        }
 
         self.generation = generation;
+        self.checkpointed = Some(slot);
+        self.last_checkpoint_at = Some(std::time::Instant::now());
         // Durable-only readers wait for the marker to move.
         if let Some(notify) = &self.notify {
             notify.publish();
@@ -466,6 +494,33 @@ impl Writer {
         self.last_retention_error.as_ref()
     }
 
+    /// Operational metrics only the writer knows: the head, the last checkpoint and its age by the monotonic clock,
+    /// what the next checkpoint has to sync, whether the writer is poisoned, and retention failures (ADR 0032; see
+    /// [`crate::status`] for what other processes can observe).
+    ///
+    /// Cost: no system calls; one monotonic clock read, and a sum over the segments touched since the last
+    /// checkpoint. Nothing is added to [`Writer::append`].
+    pub fn metrics(&self) -> crate::status::WriterMetrics {
+        let dirty = self.dirty.iter().fold(0u64, |sum, seg| {
+            sum.saturating_add(seg.to.saturating_sub(seg.from))
+        });
+        crate::status::WriterMetrics {
+            head: crate::status::Position::new(self.next_seq, self.active.base, self.offset),
+            segment_size: self.active.size,
+            checkpoint: self.checkpointed,
+            since_checkpoint: self.last_checkpoint_at.map(|at| at.elapsed()),
+            // Without a marker, everything from where recovery started (the oldest retained segment) is uncovered.
+            uncheckpointed_records: self.next_seq.saturating_sub(
+                self.checkpointed
+                    .map_or(self.report.scanned_from_seq, |c| c.next_seq),
+            ),
+            uncheckpointed_bytes: dirty
+                .saturating_add(self.offset.saturating_sub(self.active_dirty_from)),
+            poisoned: self.poisoned,
+            retention_failures: self.retention_failures,
+        }
+    }
+
     fn run_retention(&mut self) {
         let Some((policy, action)) = &self.config.retention else {
             return;
@@ -475,6 +530,7 @@ impl Writer {
         });
         if let Err(error) = result {
             self.last_retention_error = Some(error);
+            self.retention_failures = self.retention_failures.saturating_add(1);
         }
     }
 
@@ -796,8 +852,9 @@ impl Recovery<'_> {
         Ok(())
     }
 
-    /// Opens (creating if needed) the checkpoint marker file and decodes the current checkpoint.
-    fn open_checkpoint_file(&mut self) -> Result<(File, Option<CheckpointSlot>)> {
+    /// Opens (creating if needed) the checkpoint marker file and decodes the current checkpoint. Also returns whether
+    /// an existing marker is shorter than its full length.
+    fn open_checkpoint_file(&mut self) -> Result<(File, Option<CheckpointSlot>, bool)> {
         let path = self.dir.join(CHECKPOINT_FILE);
         let existed = path.exists();
         let file = OpenOptions::new()
@@ -815,17 +872,20 @@ impl Recovery<'_> {
         file.read_exact_at(&mut contents, 0)
             .map_err(|e| Error::io("read checkpoint marker", &path, e))?;
         let checkpoint = format::decode_checkpoint(&contents);
-        if len < format::CHECKPOINT_FILE_LEN as u64 {
-            // Preallocated, not sparse, so that writing a slot never needs new blocks (a full disk must not make
-            // checkpoints fail).
+        if !existed {
+            // A new marker: preallocated, not sparse, so that writing a slot never needs new blocks (a full disk must
+            // not make checkpoints fail).
             mmap::preallocate(&file, format::CHECKPOINT_FILE_LEN as u64)
                 .map_err(|e| Error::io("create checkpoint marker", &path, e))?;
             mmap::sync_data(&file).map_err(|e| Error::io("sync checkpoint marker", &path, e))?;
-        }
-        if !existed {
             journal::sync_dir(self.dir)?;
+            return Ok((file, checkpoint, false));
         }
-        Ok((file, checkpoint))
+        // An existing marker that something cut short is left short here: observers take a full-length marker's
+        // modification time as the time of the last checkpoint (ADR 0032), and the time of an extension is not that.
+        // The next checkpoint extends it after its slot is durable. Until then, a checkpoint writes its slot into
+        // the short file, which may need a new block.
+        Ok((file, checkpoint, len < format::CHECKPOINT_FILE_LEN as u64))
     }
 
     fn recover(&mut self, checkpoint: Option<CheckpointSlot>) -> Result<RecoveredState> {
@@ -874,6 +934,8 @@ impl Recovery<'_> {
         }
         let mut visited = BTreeSet::new();
         let mut dirty = Vec::new();
+        // Where this writer's uncheckpointed data starts in `seg` (for `Writer::metrics`).
+        let mut seg_from = offset;
 
         loop {
             visited.insert(seg.base);
@@ -893,9 +955,10 @@ impl Recovery<'_> {
                         self.report.actions.push(RecoveryAction::Sealed {
                             segment: seg.path.clone(),
                         });
-                        dirty.push(inherited(seg));
+                        dirty.push(inherited(seg, seg_from, offset));
                         seg = next;
                         offset = format::SEGMENT_HEADER_LEN as u64;
+                        seg_from = offset;
                         continue;
                     }
                     break;
@@ -913,9 +976,10 @@ impl Recovery<'_> {
                     if bases.contains(&seq) {
                         match open_segment(self.dir, seq) {
                             Ok(next) => {
-                                dirty.push(inherited(seg));
+                                dirty.push(inherited(seg, seg_from, offset));
                                 seg = next;
                                 offset = format::SEGMENT_HEADER_LEN as u64;
+                                seg_from = offset;
                                 continue;
                             }
                             Err(Error::Corrupt { .. } | Error::UnsupportedVersion { .. })
@@ -944,7 +1008,7 @@ impl Recovery<'_> {
                     self.report.actions.push(RecoveryAction::CompletedRoll {
                         segment: next.path.clone(),
                     });
-                    dirty.push(inherited(seg));
+                    dirty.push(inherited(seg, seg_from, offset));
                     seg = next;
                     visited.insert(seq);
                     offset = format::SEGMENT_HEADER_LEN as u64;
@@ -1168,11 +1232,13 @@ impl Recovery<'_> {
     }
 }
 
-/// A segment inherited from an earlier writer: the next checkpoint syncs its file.
-fn inherited(seg: Segment) -> DirtySegment {
+/// A segment inherited from an earlier writer: the next checkpoint syncs its whole file. `[from, seal_at)` holds the
+/// records an earlier writer appended after the marker, followed by the seal at `seal_at`; the range only feeds
+/// [`Writer::metrics`] (`uncheckpointed_bytes`).
+fn inherited(seg: Segment, from: u64, seal_at: u64) -> DirtySegment {
     DirtySegment {
-        from: 0,
-        to: seg.size,
+        from,
+        to: seal_at + format::SEAL_LEN as u64,
         file: seg.file,
         map: None,
         path: seg.path,

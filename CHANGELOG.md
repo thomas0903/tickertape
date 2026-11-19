@@ -33,6 +33,38 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   copy of a writer (which it must not do) leaves the lock with the parent. A writer process that exits or dies
   without dropping its writer still leaves the lock with such a child until it execs or exits, for its whole life if
   it never execs (crash contract C3).
+- Operational metrics (ADR 0032), with no format change and nothing added to `append` or the reader's read path.
+  Values a sample can't establish are reported as unknown, never guessed, and estimates are named as such:
+  - `tickertape::status::status(dir)` and `status::Sampler` sample a journal from any process: the writer's head,
+    the checkpoint marker (validated as the writer validates it) and an estimate of its age from the marker's
+    modification time, what a power loss would remove now (exposure), storage headroom in bytes and estimated segment
+    rolls, and the writer's PID. Whether the sample verified the chain from the checkpoint to the head is reported; a
+    break it confirms is corruption, and a healthy but unverified sample says so. A `Sampler` resumes its scan where it
+    stopped only with proof that the segment is the same, unchanged file, and measures append rates and an estimated
+    time until the volume is full.
+  - `Writer::metrics()` (head, checkpoint age by the monotonic clock, uncheckpointed records and bytes, poisoned
+    flag, retention failure count), `Reader::cursor()` and `Status::lag()` for in-process reader lag.
+  - `status::ReaderBeacon`: an opt-in 128-byte file in `<dir>/readers/` that publishes a reader's position, the
+    identity of its segment and whether it is durable-only, for observers in other processes. Beacons are published
+    atomically under a directory lock, never replace anything but a stale beacon (`Error::BeaconInUse` for a live
+    one), and a held `flock` tells live readers from dead ones; the writer and retention never read beacons.
+  - CLI: `tickertape status <DIR>` with text, `--json` (`schema_version` 1) and `--format prometheus` output,
+    `--watch` (failed samples are reported and the watch continues; `tickertape_up` and
+    `tickertape_status_timestamp_seconds` show staleness), `--output` (atomic replace through an exclusively created
+    temporary file, for a node_exporter textfile collector; it replaces only an earlier status output or an empty
+    file, never a symlink or anything else), and health thresholds (`--max-checkpoint-age`,
+    `--min-headroom`, `--min-headroom-segments`, `--max-reader-lag`) that exit with code 3; a journal the sample
+    finds corrupt (or the writer would refuse) exits with 2. A journal missing at start-up is reported as a failed
+    sample (`tickertape_up 0`).
+  - `export --output` no longer fails when a reader beacon disappears during its alias check or `readers/` can't be
+    listed (another user's). v0.4.0 failed transiently in those cases. Everywhere else in the journal the check still
+    fails closed.
+  - `rustix` now also enables its `process` feature (for `kill(pid, 0)`); no new crates.
+  - A writer that finds the checkpoint marker cut short no longer extends it at open: it extends it after its next
+    checkpoint has succeeded, so that observers can't take the time of the cut or of the extension for a
+    checkpoint's (a short marker's age is reported unknown). Every reader already accepts a short marker.
+  - C ABI: the new `Error::BeaconInUse` has its own status code, `TICKERTAPE_E_BEACON_IN_USE` (-18); no C function
+    creates beacons yet.
 - Fix: readers racing with retention (the writer's policy or `tickertape archive`) no longer report a removed segment
   as an error of the wrong kind. `Reader::seek` returned an I/O "not found" error when the segment it chose was
   removed before it opened it; it now lists the segments again and returns `Error::SeqUnavailable` with the new

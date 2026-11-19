@@ -62,6 +62,7 @@ mod protocol_model;
 mod reader;
 mod record;
 pub mod retention;
+pub mod status;
 mod writer;
 
 pub use config::{Backoff, ReaderConfig, RecoveryPolicy, WriterConfig};
