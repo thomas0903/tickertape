@@ -21,6 +21,13 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   recovery policies (what recovery did earlier in the same scan stays). Only a segment that is invalid (`Error::Corrupt`) or of an unsupported version ends the chain there.
   Until now any failure to open it ended the chain: after a plain crash during a roll, a transient error could make
   `Quarantine` move that healthy segment and every later one to `quarantine/` (crash contract C11).
+- Internal: the readers decode a record's header straight into their own state and pass only a small tag and the
+  length along the per-record path; the rare outcomes (empty slot, seal, failed validation, checkpoint boundary) are
+  handled outside it. Behaviour is unchanged. This undoes a slowdown for small records that the recovery change
+  (ADR 0035) had brought in on the way to this release (no released version had it): the per-record code had not
+  changed, but the compiler had started to copy the decoded header through memory in a way the CPU could not
+  forward. `CONTRIBUTING.md` now asks for the `replay` benchmark before and after a change to the code that path is
+  built from.
 - C++ binding (ADR 0036, `docs/cpp-api.md`): `crates/tickertape-ffi/include/tickertape.hpp`, a header-only C++17
   wrapper over the C ABI, shipped and installed (`cargo cinstall`) next to `tickertape.h`. It covers the whole C ABI:
   move-only `Writer`, `Reader`, option builders and `RecordBatch`; copying, zero-copy (a lambda) and batch appends
