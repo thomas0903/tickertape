@@ -392,7 +392,7 @@ What the binding turns into an exception, on any thread (`IllegalStateException`
 - any call on a closed writer or reader, a call while another thread is inside a call on the same handle, and a call
   (or `close()`) from inside a filler or a `withPayload` action into its own handle;
 - any use of a reader's view after the next call on the reader or after `close()`, including a `close()` on another
-  thread while the view is being read (the access in progress completes; every later one throws);
+  thread while the view is being read (the access in progress finishes or throws; every later one throws);
 - any use of a batch's view after the batch is filled again, and reading into a batch while one of its views is
   inside `withPayload`;
 - a `PayloadBuffer` or its `segment()` after the filler returned, or on another thread (`WrongThreadException`), and a

@@ -15,8 +15,9 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   without losing records; record views are reused and checked, keep their memory alive, and the hot paths allocate
   nothing (checked with the JIT's escape analysis off too). A close refuses new calls from the moment it starts and
   takes over from the call in progress without a gap; closing a reader costs a handshake with every JVM thread, so
-  readers are meant to be long-lived. Path names the JVM cannot decode are refused instead of converted to a different
-  name. What remains undefined (another thread advancing a reader while its view is read, sharing a batch between
+  readers are meant to be long-lived. A path is passed to the library by the bytes the JDK holds for it (a relative
+  path stays relative), so a name the JVM cannot decode opens the journal of that name and not one of a similar
+  name; only the default file system is supported. What remains undefined (another thread advancing a reader while its view is read, sharing a batch between
   threads, the mapped reader's precondition) is listed in the guide. Reports from growable C structs are classes, not
   records, so they can gain fields after 1.0.
   Every C status and corruption reason has its own exception or constant, checked against the header. The library is

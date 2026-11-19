@@ -30,12 +30,26 @@ public enum CorruptReason {
     BAD_SEQUENCE(9),
     /** A reserved field is not zero. */
     BAD_FLAGS(10),
-    /** A seal's checksum does not match the expected next sequence number. */
+    /**
+     * A seal is invalid (its checksum does not match the expected next sequence number, or it lies where a seal
+     * cannot), or writer recovery found non-zero bytes beyond the place of a missing seal in front of a successor
+     * segment that opens.
+     */
     BAD_SEAL(11),
     /** A sealed segment's successor is missing while later segments exist, or does not start where the seal says. */
     BROKEN_CHAIN(12),
     /** The checkpoint marker points to a missing segment or an impossible offset. */
     DANGLING_CHECKPOINT(13),
+    /**
+     * A commit word reads 0, and recovery or verify found evidence of committed records after it (usually storage
+     * damage; {@code docs/crash-contract.md} C1 and C11).
+     */
+    EMPTY_COMMIT_WORD(14),
+    /**
+     * A commit word reads 0, and the search of the bytes after it stopped at its work bound: inconclusive, and
+     * treated like {@link #EMPTY_COMMIT_WORD}.
+     */
+    UNCHECKED_TAIL(15),
     /** A reason this binding has no specific constant for ({@code TICKERTAPE_CORRUPT_UNKNOWN}, or a newer one). */
     UNKNOWN(255);
 

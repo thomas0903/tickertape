@@ -265,7 +265,7 @@ class HeaderTest {
     @Test
     void everyCorruptReasonIsMapped() {
         Map<String, Integer> reasons = enumerators("tickertape_corrupt_reason");
-        assertTrue(reasons.size() >= 15, reasons.toString());
+        assertTrue(reasons.size() >= 17, reasons.toString());
         for (Map.Entry<String, Integer> e : reasons.entrySet()) {
             CorruptReason r = CorruptReason.of(e.getValue());
             assertEquals(e.getKey(), r.cName(), "no CorruptReason for " + e);
@@ -274,7 +274,8 @@ class HeaderTest {
         for (CorruptReason r : CorruptReason.values()) {
             assertTrue(reasons.containsKey(r.cName()), r + " is not in the header");
         }
-        assertEquals(CorruptReason.UNKNOWN, CorruptReason.of(14));
+        // A reason this binding does not know (a newer library).
+        assertEquals(CorruptReason.UNKNOWN, CorruptReason.of(16));
     }
 
     @Test
