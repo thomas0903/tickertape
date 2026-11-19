@@ -44,7 +44,10 @@
 //!   (iceoryx2 0.10's `ipc` service builds node ids as `UniqueSystemId`s, whose `pid` is the sender's host process
 //!   id; `UniqueNodeId::pid`), and refuses the sample, as a per-service failure, if it is this process's (the
 //!   recorder node's id, built the same way). Same-process publishers of such services can be recorded with the
-//!   typed recorder, which only accepts types without padding.
+//!   typed recorder, which only accepts types without padding. This relies on iceoryx2 handles not being used
+//!   across `fork`, as iceoryx2 requires: a child process that kept using a node or publisher inherited from its
+//!   parent would stamp the parent's process id, so a recorder started in that child would not recognise those
+//!   samples as its own.
 
 use iceoryx2::port::listener::Listener;
 use iceoryx2::port::publisher::Publisher;
@@ -158,11 +161,14 @@ fn raw_builder(
         .service_builder(name)
         .publish_subscribe::<[CustomPayloadMarker]>()
         .user_header::<CustomHeaderMarker>();
-    // SAFETY: (unsafe block 1) The type details passed `layout::validate_types` (power-of-two alignment of at most
-    // 4096, sizes that are multiples of it, a fixed-size user header, a non-zero slice element size, and a chunk
-    // layout that fits a Rust `Layout` for any element count a journal record can hold), so iceoryx2's unchecked
-    // chunk arithmetic can't overflow. They are read from the running service (recording) or recorded from one
-    // (replay), and iceoryx2 checks them against an existing service on open. This module only ever reads and writes
+    // SAFETY: (unsafe block 1) The type details passed `layout::validate_types` (power-of-two alignments of at most
+    // 4096, user and system header sizes that are multiples of their alignments, a payload size that need not be
+    // (iceoryx2's public `payload_alignment` raises a payload's alignment without changing its size; iceoryx2 then
+    // reserves the size rounded up to the alignment per element, which the validated chunk layout counts), a
+    // fixed-size user header, a non-zero slice element size, and a chunk layout that fits a Rust `Layout` for any
+    // element count a journal record can hold), so iceoryx2's unchecked chunk arithmetic can't overflow. They are
+    // read from the running service (recording) or recorded from one (replay), and iceoryx2 checks them against an
+    // existing service on open. This module only ever reads and writes
     // the samples as plain bytes, within the sizes the same details give (see `DynamicSource::drain` and
     // `DynamicSink::send`).
     unsafe {
@@ -220,8 +226,8 @@ impl SourceFactory for DynamicService {
             Err(e) => return Err(open_error(&self.name, e)),
         };
         let cfg = factory.static_config();
-        crate::typed::check_subscriber(node, &self.name, cfg)?;
         let buffer = buffer_size.min(cfg.subscriber_max_buffer_size()).max(1);
+        crate::typed::check_subscriber(node, &self.name, cfg, buffer, factory.dynamic_config())?;
         let subscriber = factory
             .subscriber_builder()
             .buffer_size(buffer)
@@ -279,7 +285,9 @@ impl Source for DynamicSource {
                 break;
             };
             // A sample from this process may hold uninitialised padding (module docs): refuse it before taking any
-            // byte view. The system header is written in full by iceoryx2's publisher.
+            // byte view. The system header is written in full by iceoryx2's publisher. The process id is the one
+            // the sending node was created in, so this holds only if iceoryx2 handles are not used across `fork`
+            // (a node or publisher inherited by a child process stamps its parent's id; module docs).
             let origin_pid = sample
                 .header()
                 .node_id()
@@ -402,7 +410,7 @@ fn sink(
         factory.static_config(),
         PUBLISHER_MAX_LOANED,
         strategy != AllocationStrategy::Static,
-        Some(initial),
+        initial,
     )?;
     let publisher = factory
         .publisher_builder()

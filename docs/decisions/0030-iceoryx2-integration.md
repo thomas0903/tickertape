@@ -169,8 +169,8 @@ gigabytes, and found a few more integrity gaps. Nothing was released; the layout
   exports of one journal differ in their header bytes, and the file can carry whatever was in that memory), and it
   takes any `Ok(n)` from `write` as complete, so a full volume could leave a short file that the export then linked
   into place and reported as a success. Upstream's *text* writer has the same short-write behaviour, so the
-  human-readable file is now written by this crate (byte for byte what upstream writes, checked against a file
-  upstream's recorder wrote) with complete, checked writes and a sync, under a uniquely named temporary file created
+  human-readable file is now written by this crate (byte for byte what upstream writes for ordinary names, checked
+  against a file upstream's recorder wrote; see round 4 for other names) with complete, checked writes and a sync, under a uniquely named temporary file created
   exclusively. The crate no longer depends on `iceoryx2-userland-record-and-replay`.
 - **Memory limits in force, before any port.** iceoryx2 0.10 preallocates per publisher, with unchecked arithmetic,
   one reference counter per sample for each of up to 255 data segments (growing strategies) on the heap and one chunk
@@ -194,3 +194,31 @@ gigabytes, and found a few more integrity gaps. Nothing was released; the layout
 - **Typed replay checks every registration** against its descriptor before the target is opened or a cached target
   reused, and the trust statements say that equal names, sizes and alignments don't establish compatible native
   representations.
+
+## Amendment: review round 4 (2026-11-20)
+
+- **The memory limits count every allocation a port and its connections make.** Round 3 bounded a publisher's
+  reference counters but not its connections: iceoryx2 0.10 gives every connection a used-chunk list of one byte per
+  sample for each of the publisher's data segments (so `max_subscribers × 255 × samples` bytes of shared memory for a
+  growing publisher), and a subscriber a heap slot per publisher and per expired connection it may keep. An existing
+  target with 1,024 subscribers passed round 3's check yet would have made the replay publisher request about 8 GiB.
+  The limits are now per port: 128 MiB of heap (reference counters, connection slots, history; slot sizes measured on
+  iceoryx2-internal types and counted with a margin), 512 MiB of connections (counted in 64 KiB pages, the largest
+  page size of the supported targets) and, for a publisher, the 1 GiB data segment. The heap limit was raised from
+  round 3's 64 MiB of counters so that services such as the publisher example (8 subscribers, buffers of 4,096) still
+  replay as slices.
+- **The recorder bounds what publishers advertise only where iceoryx2 lets it.** A subscriber's connection is sized
+  by the publisher's advertised sample count and data segments. Those are public in the service's dynamic
+  configuration, and the recorder checks them just before creating its subscriber, which is when it creates the
+  connections to the publishers already there. A later publisher creates its connections before it registers, and
+  iceoryx2 0.10 gives a subscriber no way to decline one, so the recorder can't bound those; the README says so,
+  with the one race in which the recorder itself creates such a connection.
+- **Typed replay accepts a raised payload alignment again.** A registered Rust type accepts a recorded alignment that
+  is a power of two not below its own (iceoryx2 accepts a service alignment above the type's); name and size must
+  still match. An existing or opened target still needs at least the recorded alignment.
+- **Exports**: the temporary file name no longer contains the destination's name (so a destination name of 255
+  bytes works), and the directory is synced after the link. The written file has upstream's bytes for names without
+  quotes, backslashes or control characters; other names are written as double-quoted TOML strings with `\uXXXX`
+  escapes where upstream's serialiser may choose short escapes or single quotes, which both parsers read alike.
+- **`fork`**: the same-process check compares process ids stamped by the sending node, so it relies on iceoryx2
+  handles not being used across `fork`, as iceoryx2 requires; stated where the precondition is.

@@ -34,23 +34,62 @@ pub(crate) fn default_strategy_grows(node: &Node<ipc::Service>) -> bool {
         != AllocationStrategy::Static
 }
 
-/// Checks what the recorder's subscriber of the service `display` will make iceoryx2 allocate, with the service's
-/// settings in force (`cfg`), before it is created: it connects to every publisher, sized by the samples each
-/// preallocates (assumed to use the node's default loaned samples) and their data segments (255 for a slice service,
-/// whose publishers grow their segments).
+/// The dynamic configuration of a publish-subscribe service (its publishers and subscribers).
+type PubSubDynamic = iceoryx2::service::dynamic_config::publish_subscribe::DynamicConfig<
+    <ipc::Service as iceoryx2::service::Service>::Bag,
+>;
+
+/// Checks what the recorder's subscriber of the service `display`, with a buffer of `buffer` samples, will make
+/// iceoryx2 allocate, with the service's settings in force (`cfg`), before it is created: its connection slots on the
+/// heap, and the connections it creates to the publishers present (`dynamic`), sized by what each of them advertises
+/// (see [`layout::subscriber_allocation`]); the service's types are validated too. Publishers created later create
+/// their connections to it themselves, before it can see them.
 pub(crate) fn check_subscriber(
     node: &Node<ipc::Service>,
     display: &str,
     cfg: &PubSubConfig,
+    buffer: usize,
+    dynamic: &PubSubDynamic,
 ) -> Result<(), Error> {
-    let growing = cfg.message_type_details().payload.variant() == IoxVariant::Dynamic
-        || default_strategy_grows(node);
-    let loaned = node
+    let unknown = Version {
+        major: 0,
+        minor: 0,
+        patch: 0,
+    };
+    let described = describe(cfg, unknown, 0);
+    layout::validate_types(
+        &described.payload,
+        &described.user_header,
+        &described.system_header,
+    )
+    .map_err(|e| Error::Unsupported {
+        service: display.to_string(),
+        reason: e.to_string(),
+    })?;
+    let expired = node
         .config()
         .defaults
         .publish_subscribe
-        .publisher_max_loaned_samples;
-    PortBudget::check(display, cfg, loaned, growing, None).map(|_| ())
+        .subscriber_expired_connection_buffer;
+    let mut publishers = Vec::new();
+    dynamic.list_publishers(|p| {
+        publishers.push(layout::AdvertisedPublisher {
+            samples: p.number_of_samples as u64,
+            segments: u64::from(p.max_number_of_segments),
+        });
+        CallbackProgression::Continue
+    });
+    layout::subscriber_allocation(
+        &described.settings,
+        expired as u64,
+        buffer as u64,
+        &publishers,
+    )
+    .map(|_| ())
+    .map_err(|e| Error::Unsupported {
+        service: display.to_string(),
+        reason: format!("the service's settings in force and its publishers: {e}"),
+    })
 }
 
 /// The slice length the replayer's slice publishers of the service `cfg` start with: room for about 4 KiB of
@@ -78,16 +117,15 @@ pub struct PortBudget {
 
 impl PortBudget {
     /// Checks the settings and types in force of the service `display` (`cfg`, from the port factory: what iceoryx2
-    /// opened or created, defaults included) for a port. A publisher has `max_loaned` loaned samples, a growing
-    /// allocation strategy (255 data segments) or a static one, and starts with `initial_elements` (its data segment
-    /// is checked too); for a subscriber pass `None` (it doesn't allocate the publishers' data segments) and whether
-    /// the publishers may use a growing strategy.
+    /// opened or created, defaults included) for a publisher with `max_loaned` loaned samples, a growing allocation
+    /// strategy (255 data segments) or a static one, that starts with `initial_elements` (its data segment is
+    /// checked too): its heap, its connections and its data segment (see [`layout::publisher_allocation`]).
     pub(crate) fn check(
         display: &str,
         cfg: &PubSubConfig,
         max_loaned: usize,
         growing: bool,
-        initial_elements: Option<usize>,
+        initial_elements: usize,
     ) -> Result<PortBudget, Error> {
         let unsupported = |reason: String| Error::Unsupported {
             service: display.to_string(),
@@ -106,16 +144,14 @@ impl PortBudget {
         )
         .map_err(|e| unsupported(e.to_string()))?;
         let allocation =
-            layout::port_allocation(&described.settings, max_loaned as u64, growing)
+            layout::publisher_allocation(&described.settings, max_loaned as u64, growing)
                 .map_err(|e| unsupported(format!("the service's settings in force: {e}")))?;
         let budget = PortBudget {
             allocation,
             chunk,
             element_size: described.payload.size,
         };
-        if let Some(n) = initial_elements {
-            budget.check_elements(display, n as u64)?;
-        }
+        budget.check_elements(display, initial_elements as u64)?;
         Ok(budget)
     }
 
@@ -382,7 +418,7 @@ impl<T: Debug + ZeroCopySend + IntoBytes + FromBytes + Immutable + 'static> Repl
             factory.static_config(),
             PUBLISHER_MAX_LOANED,
             default_strategy_grows(node),
-            Some(1),
+            1,
         )?;
         let publisher = factory
             .publisher_builder()
@@ -429,7 +465,7 @@ impl<T: Debug + ZeroCopySend + IntoBytes + FromBytes + Immutable + Copy + 'stati
             factory.static_config(),
             PUBLISHER_MAX_LOANED,
             true,
-            Some(initial),
+            initial,
         )?;
         let publisher = factory
             .publisher_builder()

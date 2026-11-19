@@ -234,8 +234,8 @@ impl<P: Recordable + ?Sized, H: RecordableHeader> SourceFactory for TypedService
             },
         )?;
         let cfg = service.static_config();
-        crate::typed::check_subscriber(node, &self.name, cfg)?;
         let buffer = buffer_size.min(cfg.subscriber_max_buffer_size()).max(1);
+        crate::typed::check_subscriber(node, &self.name, cfg, buffer, service.dynamic_config())?;
         let subscriber = service
             .subscriber_builder()
             .buffer_size(buffer)

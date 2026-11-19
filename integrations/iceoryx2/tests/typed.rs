@@ -435,3 +435,161 @@ fn data_of_journal(journal: &std::path::Path) -> Vec<u64> {
         })
         .collect()
 }
+
+/// Review round 4: a recorded `[u8; 64]` payload of a service whose payload alignment was raised to 64 replays,
+/// with the typed (safe) replayer, onto an existing target with the same override: the registered type's own
+/// alignment (1) is below the recorded one, which iceoryx2 accepts. Same bytes, same order.
+#[test]
+fn typed_replay_accepts_a_raised_payload_alignment() {
+    use iceoryx2::prelude::*;
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let journal = dir.path().join("j");
+    let service = unique("aligned");
+    let d = RawDescriptor::new(&service, RawType::fixed("[u8; 64]", 64, 64));
+    let payloads: Vec<[u8; 64]> = (0..3u8).map(|i| [i + 1; 64]).collect();
+    let mut records = vec![(tickertape_iceoryx2::layout::SCHEMA_DESCRIPTOR, d.bytes())];
+    records.extend(payloads.iter().map(|p| {
+        (
+            tickertape_iceoryx2::layout::SCHEMA_DATA,
+            raw_data(0, &[], p),
+        )
+    }));
+    append_records(&journal, 1 << 20, &records);
+
+    let node = NodeBuilder::new()
+        .signal_handling_mode(SignalHandlingMode::Disabled)
+        .create::<ipc::Service>()
+        .unwrap();
+    let target = format!("{}/{service}", unique("aligned-target"));
+    let factory = node
+        .service_builder(&ServiceName::new(&target).unwrap())
+        .publish_subscribe::<[u8; 64]>()
+        .payload_alignment(Alignment::new(64).unwrap())
+        .subscriber_max_buffer_size(16)
+        .create()
+        .unwrap();
+    let subscriber = factory
+        .subscriber_builder()
+        .buffer_size(16)
+        .create()
+        .unwrap();
+    let replayer = Replayer::builder(&journal)
+        .typed::<[u8; 64], ()>(&service)
+        .remap(tickertape_iceoryx2::replayer::Remap::default().rule(&service, &target))
+        .wait_for_subscribers(1, Duration::from_secs(20))
+        .linger(Duration::from_secs(2))
+        .handle_signals(false)
+        .build()
+        .unwrap();
+    let replay = std::thread::spawn(move || replayer.run());
+    // The subscriber connects to the replay publisher when it next receives; keep receiving while it lingers.
+    let mut got = Vec::new();
+    let started = std::time::Instant::now();
+    while got.len() < payloads.len() && started.elapsed() < Duration::from_secs(20) {
+        match subscriber.receive().unwrap() {
+            Some(sample) => {
+                assert_eq!((sample.payload().as_ptr() as usize) % 64, 0, "aligned");
+                got.push(*sample.payload());
+            }
+            None => std::thread::sleep(Duration::from_millis(1)),
+        }
+    }
+    let report = replay.join().unwrap().unwrap();
+    assert_eq!(report.messages, 3, "{report:?}");
+    assert_eq!(got, payloads);
+}
+
+/// Review round 4: an existing slice target with 1,024 subscribers, buffer 30 and 2 borrowed samples passes the
+/// sample count (32,770) and the reference counters (63.75 MiB), but its replay publisher's connections would take
+/// about 8 GiB of used-chunk lists (255 segments × 32,770 samples each): the typed replayer refuses it before the
+/// publisher exists.
+#[test]
+fn typed_replay_refuses_a_target_whose_connections_are_too_large() {
+    use iceoryx2::prelude::*;
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let journal = dir.path().join("j");
+    let service = unique("wide");
+    append_records(
+        &journal,
+        1 << 20,
+        &run_of(
+            &RawDescriptor::new(&service, RawType::slice("u8", 1, 1)),
+            0,
+            2,
+        ),
+    );
+    let node = NodeBuilder::new()
+        .signal_handling_mode(SignalHandlingMode::Disabled)
+        .create::<ipc::Service>()
+        .unwrap();
+    let target = format!("{}/{service}", unique("wide-target"));
+    let factory = node
+        .service_builder(&ServiceName::new(&target).unwrap())
+        .publish_subscribe::<[u8]>()
+        .max_subscribers(1024)
+        .subscriber_max_buffer_size(30)
+        .subscriber_max_borrowed_samples(2)
+        .create()
+        .unwrap();
+    let err = Replayer::builder(&journal)
+        .typed::<[u8], ()>(&service)
+        .remap(tickertape_iceoryx2::replayer::Remap::default().rule(&service, &target))
+        .handle_signals(false)
+        .build()
+        .unwrap()
+        .run()
+        .unwrap_err();
+    assert!(matches!(err, Error::Unsupported { .. }), "{err}");
+    assert!(
+        err.to_string()
+            .contains("connections to max_subscribers subscribers")
+            && err.to_string().contains("is 8589934592"),
+        "{err}"
+    );
+    assert_eq!(factory.dynamic_config().number_of_publishers(), 0);
+}
+
+/// Review round 4: the recorder's subscriber keeps a connection slot on the heap for each publisher and each
+/// borrowed sample it may hold after a publisher leaves; a service allowing 16,384 borrowed samples would take
+/// 128 MiB of them. The recorder refuses the service (reported, retried) before its subscriber exists.
+#[test]
+fn the_recorder_refuses_a_subscriber_over_the_heap_limit() {
+    use iceoryx2::prelude::*;
+    use std::sync::{Arc, Mutex};
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let journal = dir.path().join("j");
+    let service = unique("borrowed");
+    let node = NodeBuilder::new()
+        .signal_handling_mode(SignalHandlingMode::Disabled)
+        .create::<ipc::Service>()
+        .unwrap();
+    let factory = node
+        .service_builder(&ServiceName::new(&service).unwrap())
+        .publish_subscribe::<u64>()
+        .subscriber_max_borrowed_samples(16_384)
+        .create()
+        .unwrap();
+    let errors = Arc::new(Mutex::new(Vec::new()));
+    let report = {
+        let errors = Arc::clone(&errors);
+        Recorder::builder(&journal)
+            .typed(TypedService::<u64>::new(&service))
+            .on_error(move |_, e| errors.lock().unwrap().push(e.to_string()))
+            .max_duration(Duration::from_millis(300))
+            .handle_signals(false)
+            .build()
+            .unwrap()
+            .run()
+            .unwrap()
+    };
+    assert_eq!(report.messages, 0, "{report:?}");
+    let errors = errors.lock().unwrap();
+    assert!(
+        !errors.is_empty() && errors.iter().all(|e| e.contains("subscriber heap")),
+        "{errors:?}"
+    );
+    assert_eq!(factory.dynamic_config().number_of_subscribers(), 0);
+}

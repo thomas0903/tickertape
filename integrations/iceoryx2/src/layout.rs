@@ -225,26 +225,51 @@
 //! # Memory a port may make iceoryx2 allocate
 //!
 //! Not a decoding rule, but a limit the replayer and recorder apply before they create a publisher or subscriber
-//! ([`port_allocation`], [`PortAllocation::check_data_segment`]), to the settings *in force*: those of the service as
-//! opened or created (a recorded 0 means iceoryx2's default, from the node's configuration), not those recorded.
-//! iceoryx2 0.10 preallocates, per publisher, `samples = max_subscribers × (buffer + borrowed) + history + the
-//! publisher's loaned samples`, with unchecked arithmetic:
+//! ([`publisher_allocation`], [`subscriber_allocation`], [`PortAllocation::check_data_segment`]), to the settings
+//! *in force*: those of the service as opened or created (a recorded 0 means iceoryx2's default, from the node's
+//! configuration), not those recorded. These are all the allocations iceoryx2 0.10.0 makes, with unchecked
+//! arithmetic, when a publisher or subscriber and its connections are created (`port/publisher.rs`
+//! `Publisher::new`, `port/subscriber.rs` `Subscriber::new`, `port/details/{sender,receiver}.rs` `Connection::new`,
+//! `iceoryx2-cal/src/zero_copy_connection/common.rs` `SharedManagementData`). A publisher preallocates `samples =
+//! max_subscribers × (buffer + borrowed) + history + its loaned samples` (where `buffer` is
+//! `subscriber_max_buffer_size` and `borrowed` `subscriber_max_borrowed_samples`) and has `segments` data segments:
+//! 1 with a static allocation strategy (the replayer's for fixed-size payloads), [`GROWING_DATA_SEGMENTS`] (255) with
+//! a growing one (the replayer's power-of-two strategy for slices).
 //!
-//! - on the heap, one 8-byte reference counter per sample for each data segment the publisher may have: 1 with a
-//!   static allocation strategy (the replayer's for fixed-size payloads), [`GROWING_DATA_SEGMENTS`] (255) with a
-//!   growing one (the replayer's power-of-two strategy for slices, and what a subscriber of a slice service must
-//!   assume its publishers use). `samples` is at most [`MAX_SAMPLES_PER_PUBLISHER`] and `segments × samples × 8` at
-//!   most [`MAX_SAMPLE_STATE_BYTES`] (64 MiB): for slices, at most 32,896 samples (for example 8 subscribers with
-//!   buffers of up to 4,000), for fixed-size payloads the full 1,048,576;
-//! - in shared memory, one chunk per sample: `samples × chunk size` (for a growing strategy, the chunk size rounded
-//!   up to a power of two, as iceoryx2 grows it) at most [`MAX_DATA_SEGMENT_BYTES`] (1 GiB) and at most `isize::MAX`.
-//!   The replayer checks this when it creates a publisher (for the initial slice length) and, for slices, again
-//!   before each message that makes the segment grow. A subscriber doesn't allocate the publisher's data segment, so
-//!   the recorder checks only the sample count and the reference counters.
+//! A **publisher** allocates:
 //!
-//! So one replay target costs at most about 64 MiB of heap and 1 GiB (2 GiB while a grown segment replaces the
-//! previous one) of shared memory, whatever a journal says. Raising these limits later is compatible; lowering them
-//! would refuse recordings that replay today.
+//! - on the heap: an 8-byte reference counter per sample for each data segment (`segments × samples × 8`); a
+//!   connection slot per possible subscriber (`max_subscribers ×` [`PUBLISHER_HEAP_PER_SUBSCRIBER`]); a history
+//!   entry per `history` sample (`history ×` [`PUBLISHER_HEAP_PER_HISTORY_ENTRY`]); and a fixed part
+//!   ([`PUBLISHER_HEAP_FIXED_BYTES`], the 255 segment-state vectors and the resizable segment's bookkeeping). The
+//!   per-slot sizes are those of iceoryx2-internal types, measured (1,304 and 16 bytes on macOS and Linux aarch64) and counted
+//!   with a margin. In all at most [`MAX_PORT_HEAP_BYTES`] (128 MiB);
+//! - in shared memory, its data segment: one chunk per sample, `samples × chunk size` (for a growing strategy the
+//!   chunk size rounded up to a power of two, as iceoryx2 grows it) plus the alignment and the pool allocator's
+//!   index list (`4 × (samples + 1) + 3`), at most [`MAX_DATA_SEGMENT_BYTES`] (1 GiB) and at most `isize::MAX`;
+//! - in shared memory, one connection per subscriber (`max_subscribers ×` [`connection_bytes`]): a used-chunk list
+//!   of one byte per sample for each data segment (`segments × samples`), a submission queue (`8 × (buffer + 1) + 7`)
+//!   and a completion queue (`8 × (buffer + borrowed + 1) + 7`), plus fixed parts ([`CONNECTION_FIXED_BYTES`] and
+//!   [`CONNECTION_PER_SEGMENT_BYTES`] per segment), each connection rounded up to whole pages of
+//!   [`COUNTED_PAGE_BYTES`] (a connection is a shared-memory object of its own, written in full when it is created).
+//!   In all at most [`MAX_CONNECTION_BYTES`] (512 MiB).
+//!
+//! A **subscriber** allocates:
+//!
+//! - on the heap: a connection slot for each publisher it may connect to and each expired connection it may keep,
+//!   `(max(subscriber_expired_connection_buffer, borrowed) + max_publishers) ×` [`SUBSCRIBER_HEAP_PER_CONNECTION`]
+//!   (measured 3,680 to 3,824 bytes), plus [`SUBSCRIBER_HEAP_FIXED_BYTES`]; at most [`MAX_PORT_HEAP_BYTES`];
+//! - in shared memory, the connections it creates itself, sized by what each **publisher** advertises (its sample
+//!   count and data segments, not the subscriber's settings) and the subscriber's buffer: [`connection_bytes`] for
+//!   each, in all at most [`MAX_CONNECTION_BYTES`]. A subscriber creates the connections to the publishers that exist
+//!   when it is created; a publisher created later creates its connections to the subscribers that exist before it
+//!   registers (so before a subscriber can see its values), and the subscriber only maps them. A subscriber doesn't
+//!   allocate the publishers' data segments either; it maps them.
+//!
+//! So one replay target costs at most 128 MiB of heap and 1.5 GiB of shared memory (512 MiB of connections and a
+//! 1 GiB data segment; 2.5 GiB while a grown data segment replaces the previous one), and the recorder's subscriber
+//! of one service at most 128 MiB of heap and 512 MiB of connections it creates, whatever a journal says. Raising
+//! these limits later is compatible; lowering them would refuse recordings that replay today.
 
 use serde::Serialize;
 
@@ -301,12 +326,38 @@ pub const MAX_PORTS: u64 = 4_096;
 /// allocate](self#memory-a-port-may-make-iceoryx2-allocate)).
 pub const MAX_SAMPLES_PER_PUBLISHER: u64 = 1 << 20;
 /// The data segments iceoryx2 0.10 keeps track of per publisher with a growing (not static) allocation strategy: it
-/// allocates a reference counter per sample for each of them.
+/// allocates a reference counter per sample for each of them, and each connection a used-chunk list per segment.
 pub const GROWING_DATA_SEGMENTS: u64 = 255;
-/// The most heap a port's sample reference counters may take: `data segments × samples × 8` bytes.
-pub const MAX_SAMPLE_STATE_BYTES: u64 = 64 << 20;
-/// The most shared memory a publisher's data segment may take: `samples × chunk size` bytes.
+/// The most heap one publisher or subscriber may make iceoryx2 allocate.
+pub const MAX_PORT_HEAP_BYTES: u64 = 128 << 20;
+/// The most shared memory a publisher's data segment may take: `samples × chunk size` bytes and its bookkeeping.
 pub const MAX_DATA_SEGMENT_BYTES: u64 = 1 << 30;
+/// The most shared memory the connections a publisher or subscriber creates may take, in all.
+pub const MAX_CONNECTION_BYTES: u64 = 512 << 20;
+/// The page size connections and data segments are counted in: each is a shared-memory object of its own, so it
+/// takes whole pages; 64 KiB is the largest base page size of the supported targets (Linux aarch64 kernels can use
+/// 64 KiB pages; macOS aarch64 uses 16 KiB, x86-64 4 KiB).
+pub const COUNTED_PAGE_BYTES: u64 = 64 << 10;
+/// A connection's fixed parts (its management structure, its channel and the dynamic storage's header), counted
+/// with a margin (connections measured on Linux aarch64 had about 32 bytes per segment and 200 fixed bytes besides
+/// their lists and queues).
+pub const CONNECTION_FIXED_BYTES: u64 = 4096;
+/// A connection's bookkeeping per data segment besides its used-chunk list (a pointer, a capacity and a sample
+/// size), counted with a margin.
+pub const CONNECTION_PER_SEGMENT_BYTES: u64 = 64;
+/// A publisher's fixed heap: its segment-state vectors and the bookkeeping of its (resizable) data segment
+/// (measured about 330 KB with 255 segments on macOS and Linux aarch64), counted with a margin.
+pub const PUBLISHER_HEAP_FIXED_BYTES: u64 = 1 << 20;
+/// A publisher's heap per possible subscriber: one connection slot (an iceoryx2-internal type, measured 1,304 bytes
+/// on macOS and Linux aarch64), counted with a margin.
+pub const PUBLISHER_HEAP_PER_SUBSCRIBER: u64 = 2048;
+/// A publisher's heap per history sample (measured 16 bytes), counted with a margin.
+pub const PUBLISHER_HEAP_PER_HISTORY_ENTRY: u64 = 32;
+/// A subscriber's fixed heap besides its connection slots, counted with a margin.
+pub const SUBSCRIBER_HEAP_FIXED_BYTES: u64 = 1 << 20;
+/// A subscriber's heap per connection slot (an iceoryx2-internal type with the connection's handles, measured 3,680
+/// to 3,824 bytes on macOS and Linux aarch64), counted with a margin.
+pub const SUBSCRIBER_HEAP_PER_CONNECTION: u64 = 8192;
 /// The most queue slots between all publishers and subscribers, `max_publishers × max_subscribers ×
 /// (subscriber_max_buffer_size + subscriber_max_borrowed_samples)`, accepted.
 pub const MAX_CONNECTION_SLOTS: u64 = 1 << 32;
@@ -582,18 +633,24 @@ impl ChunkLayout {
     }
 }
 
-/// What a publisher or subscriber of a service makes iceoryx2 allocate, as checked by [`port_allocation`].
+/// What a publisher of a service makes iceoryx2 allocate, as checked by [`publisher_allocation`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PortAllocation {
-    /// Samples a publisher preallocates.
+    /// Samples the publisher preallocates.
     pub samples: u64,
     /// Data segments it may have: 1, or [`GROWING_DATA_SEGMENTS`].
     pub segments: u64,
+    /// Its heap, in bytes (at most [`MAX_PORT_HEAP_BYTES`]).
+    pub heap: u64,
+    /// The shared memory of its connections to `max_subscribers` subscribers, in bytes (at most
+    /// [`MAX_CONNECTION_BYTES`]).
+    pub connections: u64,
 }
 
 impl PortAllocation {
     /// Checks the shared memory of a data segment of chunks of `chunk_size` bytes aligned to `alignment`:
-    /// `samples × chunk size` (rounded up to a power of two for a growing strategy), plus the alignment, at most
+    /// `samples × chunk size` (rounded up to a power of two for a growing strategy), plus the alignment and the pool
+    /// allocator's index list (`4 × (samples + 1) + 3`), in whole [`COUNTED_PAGE_BYTES`] pages, at most
     /// [`MAX_DATA_SEGMENT_BYTES`] and `isize::MAX`. Returns that size.
     ///
     /// # Errors
@@ -608,6 +665,9 @@ impl PortAllocation {
         let bytes = chunk
             .and_then(|c| c.checked_mul(self.samples))
             .and_then(|b| b.checked_add(alignment))
+            .and_then(|b| b.checked_add(self.samples.checked_add(1)?.checked_mul(4)?))
+            .and_then(|b| b.checked_add(3))
+            .and_then(|b| b.checked_next_multiple_of(COUNTED_PAGE_BYTES))
             .unwrap_or(u64::MAX);
         let limit = MAX_DATA_SEGMENT_BYTES.min(isize::MAX as u64);
         if bytes > limit {
@@ -621,45 +681,184 @@ impl PortAllocation {
     }
 }
 
-/// Checks what a port of a service with these settings in force (as opened or created, no unknown zeros) makes
-/// iceoryx2 allocate, before it is created: the settings' own limits ([`ServiceSettings::validate`]), the samples a
-/// publisher preallocates with `max_loaned` loaned samples (at most [`MAX_SAMPLES_PER_PUBLISHER`]), and their
-/// reference counters (`segments × samples × 8` bytes, at most [`MAX_SAMPLE_STATE_BYTES`], where `segments` is 1, or
-/// [`GROWING_DATA_SEGMENTS`] if `growing`). See [memory a port may make iceoryx2
+/// The shared memory of one iceoryx2 zero-copy connection between a publisher with `samples` samples and
+/// `segments` data segments and a subscriber with a buffer of `buffer` samples and `borrowed` borrowed samples
+/// (iceoryx2 counts 0 as 1): the used-chunk lists `segments × samples`, the submission queue `8 × (buffer + 1) + 7`,
+/// the completion queue `8 × (buffer + borrowed + 1) + 7` and the fixed parts ([`CONNECTION_FIXED_BYTES`],
+/// [`CONNECTION_PER_SEGMENT_BYTES`] per segment), rounded up to whole [`COUNTED_PAGE_BYTES`] pages. `None` if that
+/// overflows.
+pub fn connection_bytes(samples: u64, segments: u64, buffer: u64, borrowed: u64) -> Option<u64> {
+    let (samples, segments) = (samples.max(1), segments.max(1));
+    let (buffer, borrowed) = (buffer.max(1), borrowed.max(1));
+    let used_chunk_lists = segments.checked_mul(samples)?;
+    let submission = buffer.checked_add(1)?.checked_mul(8)?.checked_add(7)?;
+    let completion = buffer
+        .checked_add(borrowed)?
+        .checked_add(1)?
+        .checked_mul(8)?
+        .checked_add(7)?;
+    let fixed = segments
+        .checked_mul(CONNECTION_PER_SEGMENT_BYTES)?
+        .checked_add(CONNECTION_FIXED_BYTES)?;
+    used_chunk_lists
+        .checked_add(submission)?
+        .checked_add(completion)?
+        .checked_add(fixed)?
+        .checked_next_multiple_of(COUNTED_PAGE_BYTES)
+}
+
+fn out_of_range(field: &'static str, value: Option<u64>, limit: u64) -> Result<u64, LayoutError> {
+    match value {
+        Some(v) if v <= limit => Ok(v),
+        _ => Err(LayoutError::OutOfRange {
+            field,
+            value: value.unwrap_or(u64::MAX),
+            limit,
+        }),
+    }
+}
+
+/// Checks what a publisher of a service with these settings in force (as opened or created, no unknown zeros) makes
+/// iceoryx2 allocate, before it is created: the settings' own limits ([`ServiceSettings::validate`]), the samples it
+/// preallocates with `max_loaned` loaned samples (at most [`MAX_SAMPLES_PER_PUBLISHER`]), its heap (reference
+/// counters for 1, or [`GROWING_DATA_SEGMENTS`] if `growing`, data segments, connection slots, history; at most
+/// [`MAX_PORT_HEAP_BYTES`]) and its connections to `max_subscribers` subscribers with the largest buffers the
+/// service allows (at most [`MAX_CONNECTION_BYTES`]); its data segment is checked separately
+/// ([`PortAllocation::check_data_segment`]). See [memory a port may make iceoryx2
 /// allocate](self#memory-a-port-may-make-iceoryx2-allocate).
 ///
 /// # Errors
 ///
 /// [`LayoutError::OutOfRange`] naming the first quantity over its limit.
-pub fn port_allocation(
+pub fn publisher_allocation(
     settings: &ServiceSettings,
     max_loaned: u64,
     growing: bool,
 ) -> Result<PortAllocation, LayoutError> {
     settings.validate()?;
-    let samples = settings
+    let s = settings;
+    let samples = s
         .max_subscribers
-        .checked_mul(settings.subscriber_max_buffer_size + settings.subscriber_max_borrowed_samples)
-        .and_then(|v| v.checked_add(settings.history_size))
-        .and_then(|v| v.checked_add(max_loaned))
-        .unwrap_or(u64::MAX);
-    if samples > MAX_SAMPLES_PER_PUBLISHER {
-        return Err(LayoutError::OutOfRange {
-            field: "samples a publisher preallocates",
-            value: samples,
-            limit: MAX_SAMPLES_PER_PUBLISHER,
-        });
-    }
+        .checked_mul(s.subscriber_max_buffer_size + s.subscriber_max_borrowed_samples)
+        .and_then(|v| v.checked_add(s.history_size))
+        .and_then(|v| v.checked_add(max_loaned));
+    let samples = out_of_range(
+        "samples a publisher preallocates",
+        samples,
+        MAX_SAMPLES_PER_PUBLISHER,
+    )?;
     let segments = if growing { GROWING_DATA_SEGMENTS } else { 1 };
-    let state = segments * samples * 8;
-    if state > MAX_SAMPLE_STATE_BYTES {
-        return Err(LayoutError::OutOfRange {
-            field: "sample reference counters (data segments × samples × 8 bytes)",
-            value: state,
-            limit: MAX_SAMPLE_STATE_BYTES,
-        });
+    let heap = segments
+        .checked_mul(samples)
+        .and_then(|v| v.checked_mul(8))
+        .and_then(|v| {
+            v.checked_add(
+                s.max_subscribers
+                    .checked_mul(PUBLISHER_HEAP_PER_SUBSCRIBER)?,
+            )
+        })
+        .and_then(|v| {
+            v.checked_add(
+                s.history_size
+                    .checked_mul(PUBLISHER_HEAP_PER_HISTORY_ENTRY)?,
+            )
+        })
+        .and_then(|v| v.checked_add(PUBLISHER_HEAP_FIXED_BYTES));
+    let heap = out_of_range(
+        "publisher heap (data segments × samples × 8 reference counters, subscriber slots, history)",
+        heap,
+        MAX_PORT_HEAP_BYTES,
+    )?;
+    let connections = connection_bytes(
+        samples,
+        segments,
+        s.subscriber_max_buffer_size,
+        s.subscriber_max_borrowed_samples,
+    )
+    .and_then(|c| c.checked_mul(s.max_subscribers));
+    let connections = out_of_range(
+        "connections to max_subscribers subscribers (data segments × samples used-chunk lists and queues each)",
+        connections,
+        MAX_CONNECTION_BYTES,
+    )?;
+    Ok(PortAllocation {
+        samples,
+        segments,
+        heap,
+        connections,
+    })
+}
+
+/// What a subscriber makes iceoryx2 allocate, as checked by [`subscriber_allocation`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SubscriberAllocation {
+    /// Its heap, in bytes (at most [`MAX_PORT_HEAP_BYTES`]).
+    pub heap: u64,
+    /// The shared memory of the connections it creates to the publishers present, in bytes (at most
+    /// [`MAX_CONNECTION_BYTES`]).
+    pub connections: u64,
+}
+
+/// What one publisher advertises in the service's dynamic configuration, and iceoryx2 sizes a subscriber's
+/// connection to it by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AdvertisedPublisher {
+    /// The samples it preallocates.
+    pub samples: u64,
+    /// Its data segments (1 to 255).
+    pub segments: u64,
+}
+
+/// Checks what a subscriber with a buffer of `buffer` samples, of a service with these settings in force, makes
+/// iceoryx2 allocate when it is created next to `publishers` (what each advertises), with the node's
+/// `expired_connection_buffer` (`subscriber_expired_connection_buffer`): its heap (connection slots, at most
+/// [`MAX_PORT_HEAP_BYTES`]), each publisher's sample count (at most [`MAX_SAMPLES_PER_PUBLISHER`]) and the
+/// connections it creates to them (at most [`MAX_CONNECTION_BYTES`] in all). See [memory a port may make iceoryx2
+/// allocate](self#memory-a-port-may-make-iceoryx2-allocate).
+///
+/// # Errors
+///
+/// [`LayoutError::OutOfRange`] naming the first quantity over its limit.
+pub fn subscriber_allocation(
+    settings: &ServiceSettings,
+    expired_connection_buffer: u64,
+    buffer: u64,
+    publishers: &[AdvertisedPublisher],
+) -> Result<SubscriberAllocation, LayoutError> {
+    settings.validate()?;
+    let s = settings;
+    let slots = expired_connection_buffer
+        .max(s.subscriber_max_borrowed_samples)
+        .checked_add(s.max_publishers);
+    let heap = slots
+        .and_then(|n| n.checked_mul(SUBSCRIBER_HEAP_PER_CONNECTION))
+        .and_then(|v| v.checked_add(SUBSCRIBER_HEAP_FIXED_BYTES));
+    let heap = out_of_range(
+        "subscriber heap ((max(expired connection buffer, borrowed) + max_publishers) connection slots)",
+        heap,
+        MAX_PORT_HEAP_BYTES,
+    )?;
+    let mut connections = Some(0u64);
+    for p in publishers {
+        out_of_range(
+            "samples a publisher advertises",
+            Some(p.samples),
+            MAX_SAMPLES_PER_PUBLISHER,
+        )?;
+        let one = connection_bytes(
+            p.samples,
+            p.segments,
+            buffer,
+            s.subscriber_max_borrowed_samples,
+        );
+        connections = connections.zip(one).and_then(|(a, b)| a.checked_add(b));
     }
-    Ok(PortAllocation { samples, segments })
+    let connections = out_of_range(
+        "connections to the publishers present (their data segments × samples used-chunk lists and queues each)",
+        connections,
+        MAX_CONNECTION_BYTES,
+    )?;
+    Ok(SubscriberAllocation { heap, connections })
 }
 
 /// Checks the three type details of a service and computes the iceoryx2 chunk they imply (see [Validity
@@ -1971,24 +2170,24 @@ mod tests {
             safe_overflow: true,
         };
         // iceoryx2's defaults: 8 × (2 + 2) + 0 + 2 loaned.
-        let small = port_allocation(&settings(8, 2, 2, 0), 2, true).unwrap();
-        assert_eq!(
-            small,
-            PortAllocation {
-                samples: 34,
-                segments: 255
-            }
-        );
-        // The publisher example's 4,096 buffers still fit for slices; the old limit doesn't.
-        assert!(port_allocation(&settings(8, 4096, 2, 0), 2, true).is_ok());
+        let small = publisher_allocation(&settings(8, 2, 2, 0), 2, true).unwrap();
+        assert_eq!((small.samples, small.segments), (34, 255));
+        assert_eq!(small.heap, 255 * 34 * 8 + 8 * 2048 + (1 << 20));
+        // 8 connections of 255 × 34 + 31 + 47 + 4,096 + 255 × 64 bytes, a 64 KiB page each.
+        assert_eq!(small.connections, 8 * 65_536);
+        // The publisher example's 4,096 buffers still fit for slices: 63.8 MiB of reference counters and 8.06 MiB
+        // of used-chunk lists per connection.
+        let example = publisher_allocation(&settings(8, 4096, 2, 0), 2, true).unwrap();
+        assert_eq!(example.samples, 32_786);
+        assert!(example.heap < MAX_PORT_HEAP_BYTES && example.connections < MAX_CONNECTION_BYTES);
         // The recorded product at the old limit, 2^24, and the new limit plus the loaned samples.
-        let err = port_allocation(&settings(256, 65_536, 0, 0), 2, false).unwrap_err();
+        let err = publisher_allocation(&settings(256, 65_536, 0, 0), 2, false).unwrap_err();
         assert!(
             err.to_string()
                 .contains("16777216, more than the limit of 1048576"),
             "{err}"
         );
-        let err = port_allocation(&settings(16, 65_536, 0, 0), 2, false).unwrap_err();
+        let err = publisher_allocation(&settings(16, 65_536, 0, 0), 2, false).unwrap_err();
         assert!(
             err.to_string()
                 .contains("samples a publisher preallocates is 1048578"),
@@ -1996,14 +2195,14 @@ mod tests {
         );
         // Zero (unknown) recorded settings next to 65,536 buffers and borrowed samples, as iceoryx2's defaults fill
         // them in (8 subscribers): 1,048,578 samples.
-        let err = port_allocation(&settings(8, 65_536, 65_536, 0), 2, true).unwrap_err();
+        let err = publisher_allocation(&settings(8, 65_536, 65_536, 0), 2, true).unwrap_err();
         assert!(err.to_string().contains("samples"), "{err}");
         // 500,000 samples were 1 GB of reference counters with 255 segments: refused for slices, fine for one
         // static segment.
         let s = settings(1, 65_536, 65_536, 65_536);
-        let err = port_allocation(&s, 2, true).unwrap_err();
+        let err = publisher_allocation(&s, 2, true).unwrap_err();
         assert!(err.to_string().contains("reference counters"), "{err}");
-        let fixed_size = port_allocation(&s, 2, false).unwrap();
+        let fixed_size = publisher_allocation(&s, 2, false).unwrap();
         assert_eq!(fixed_size.samples, 3 * 65_536 + 2);
         // samples × chunk: a valid fixed-size descriptor asking for terabytes is refused, with checked arithmetic.
         let big = validate_types(
@@ -2027,6 +2226,135 @@ mod tests {
             ..small
         };
         assert!(one.check_data_segment((16 << 20) + 1, 8).is_ok());
+    }
+
+    /// One connection's shared memory, term by term, in whole 64 KiB pages, with checked arithmetic.
+    #[test]
+    fn connection_bytes_formula() {
+        // 1 segment, 1 sample, buffer 1, borrowed 1: 1 + (8 × 2 + 7) + (8 × 3 + 7) + 4,096 + 64 = 4,208: one page.
+        assert_eq!(connection_bytes(1, 1, 1, 1), Some(65_536));
+        // iceoryx2 counts 0 as 1.
+        assert_eq!(connection_bytes(0, 0, 0, 0), Some(65_536));
+        // The used-chunk lists dominate: 255 segments × 32,770 samples = 8,356,350 bytes, plus 8 × 31 + 7,
+        // 8 × 33 + 7, 4,096 and 255 × 64: 8,377,292 bytes, 128 pages.
+        assert_eq!(connection_bytes(32_770, 255, 30, 2), Some(128 * 65_536));
+        // Exactly one page, and one byte more.
+        let base = 8 * 2 + 7 + 8 * 3 + 7 + 4096 + 64;
+        assert_eq!(connection_bytes(65_536 - base, 1, 1, 1), Some(65_536));
+        assert_eq!(
+            connection_bytes(65_536 - base + 1, 1, 1, 1),
+            Some(2 * 65_536)
+        );
+        // Overflow is None, not a wrapped value.
+        assert_eq!(connection_bytes(u64::MAX, 255, 1, 1), None);
+        assert_eq!(connection_bytes(1, 1, u64::MAX, 1), None);
+        assert_eq!(connection_bytes(1, 1, 1, u64::MAX), None);
+    }
+
+    /// The case review round 4 found: an existing slice target with 1,024 subscribers, buffer 30 and 2 borrowed
+    /// samples passes the sample count and the reference counters (32,770 samples, 63.75 MiB), but its publisher's
+    /// connections would take 1,024 × 8.0 MiB of used-chunk lists: refused.
+    #[test]
+    fn publisher_connections_are_bounded() {
+        let s = ServiceSettings {
+            history_size: 0,
+            subscriber_max_buffer_size: 30,
+            subscriber_max_borrowed_samples: 2,
+            max_publishers: 2,
+            max_subscribers: 1024,
+            max_nodes: 20,
+            safe_overflow: true,
+        };
+        let err = publisher_allocation(&s, 2, true).unwrap_err();
+        assert_eq!(
+            err,
+            LayoutError::OutOfRange {
+                field: "connections to max_subscribers subscribers (data segments × samples used-chunk lists and \
+                        queues each)",
+                value: 1024 * 128 * 65_536,
+                limit: MAX_CONNECTION_BYTES,
+            }
+        );
+        // The heap alone would have passed: 255 × 32,770 × 8 + 1,024 × 2,048 + 1 MiB.
+        const { assert!(255 * 32_770 * 8 + 1024 * 2048 + (1 << 20) < MAX_PORT_HEAP_BYTES) };
+        // With one static segment the same service fits: 1,024 connections of one page each.
+        let fixed = publisher_allocation(&s, 2, false).unwrap();
+        assert_eq!(fixed.connections, 1024 * 65_536);
+        assert_eq!(fixed.heap, 32_770 * 8 + 1024 * 2048 + (1 << 20));
+        // Heap: subscriber slots and history count too (4,096 subscribers, 65,536 history: 8 MiB + 2 MiB + 1 MiB
+        // besides the counters).
+        let many = ServiceSettings {
+            history_size: 65_536,
+            subscriber_max_buffer_size: 1,
+            subscriber_max_borrowed_samples: 1,
+            max_subscribers: 4096,
+            ..s
+        };
+        let a = publisher_allocation(&many, 2, false).unwrap();
+        assert_eq!(a.samples, 4096 * 2 + 65_536 + 2);
+        assert_eq!(
+            a.heap,
+            a.samples * 8 + 4096 * 2048 + 65_536 * 32 + (1 << 20)
+        );
+    }
+
+    /// A subscriber's heap (connection slots) and the connections it creates, sized by what each publisher
+    /// advertises.
+    #[test]
+    fn subscriber_allocation_formula() {
+        let s = ServiceSettings {
+            history_size: 0,
+            subscriber_max_buffer_size: 1024,
+            subscriber_max_borrowed_samples: 2,
+            max_publishers: 2,
+            max_subscribers: 8,
+            max_nodes: 20,
+            safe_overflow: true,
+        };
+        // No publisher yet: (max(128, 2) + 2) slots × 8 KiB + 1 MiB, no connections.
+        let a = subscriber_allocation(&s, 128, 1024, &[]).unwrap();
+        assert_eq!(a.heap, 130 * 8192 + (1 << 20));
+        assert_eq!(a.connections, 0);
+        // Borrowed samples above the expired-connection buffer take its place.
+        let borrowed = ServiceSettings {
+            subscriber_max_borrowed_samples: 1000,
+            ..s
+        };
+        let a = subscriber_allocation(&borrowed, 128, 1024, &[]).unwrap();
+        assert_eq!(a.heap, 1002 * 8192 + (1 << 20));
+        // 16,384 borrowed samples: 128 MiB of slots plus 1 MiB fixed, over 128 MiB.
+        let too_many = ServiceSettings {
+            subscriber_max_borrowed_samples: 16_384,
+            ..s
+        };
+        let err = subscriber_allocation(&too_many, 128, 1024, &[]).unwrap_err();
+        assert!(err.to_string().contains("subscriber heap"), "{err}");
+        // A huge expired-connection buffer from a configuration file can't overflow.
+        assert!(subscriber_allocation(&s, u64::MAX, 1024, &[]).is_err());
+        // Two publishers: a static one with 34 samples and a growing one with 32,786.
+        let p = |samples, segments| AdvertisedPublisher { samples, segments };
+        let a = subscriber_allocation(&s, 128, 1024, &[p(34, 1), p(32_786, 255)]).unwrap();
+        assert_eq!(
+            a.connections,
+            connection_bytes(34, 1, 1024, 2).unwrap()
+                + connection_bytes(32_786, 255, 1024, 2).unwrap()
+        );
+        // A publisher advertising more samples than any accepted service would make it allocate is refused, and
+        // so is a sum of connections over the limit (64 publishers of 8 MiB connections each).
+        let err = subscriber_allocation(&s, 128, 1024, &[p(MAX_SAMPLES_PER_PUBLISHER + 1, 1)])
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("samples a publisher advertises"),
+            "{err}"
+        );
+        let big = vec![p(32_786, 255); 64];
+        let err = subscriber_allocation(&s, 128, 1024, &big).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("connections to the publishers present"),
+            "{err}"
+        );
+        assert!(subscriber_allocation(&s, 128, 1024, &big[..60]).is_ok());
     }
 
     #[test]

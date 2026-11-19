@@ -573,8 +573,9 @@ fn replay_guards_against_feedback_with_a_live_writer() {
 /// What a replay target's publisher would make iceoryx2 allocate is bounded before the publisher exists (review
 /// round 3): a descriptor at the old per-publisher sample limit is malformed; zero (unknown) settings next to
 /// 65,536-sample buffers become iceoryx2's defaults (8 subscribers) and too many samples; a slice service counts
-/// 255 data segments of reference counters; an existing target is checked with its own settings, not the
-/// recording's. Nothing is sent, and the targets the replayer would have created don't remain.
+/// 255 data segments of reference counters, and (review round 4) a used-chunk list per data segment in each of its
+/// connections; an existing target is checked with its own settings, not the recording's. Nothing is sent, and the
+/// targets the replayer would have created don't remain.
 #[test]
 fn replay_bounds_what_a_target_allocates() {
     use iceoryx2::prelude::*;
@@ -594,7 +595,7 @@ fn replay_bounds_what_a_target_allocates() {
         .is_some()
     };
     // history, buffer, borrowed, publishers, subscribers, nodes
-    let cases: [(&str, [u64; 6], RawType, i32, &str); 3] = [
+    let cases: [(&str, [u64; 6], RawType, i32, &str); 4] = [
         (
             "old-limit",
             [0, 65_536, 0, 2, 256, 20],
@@ -611,10 +612,17 @@ fn replay_bounds_what_a_target_allocates() {
         ),
         (
             "slice-segments",
-            [0, 4_096, 2, 2, 9, 20],
+            [0, 4_096, 2, 2, 16, 20],
             RawType::slice("u8", 1, 1),
             1,
-            "sample reference counters",
+            "publisher heap (data segments × samples × 8 reference counters",
+        ),
+        (
+            "slice-connections",
+            [0, 30, 2, 2, 1024, 20],
+            RawType::slice("u8", 1, 1),
+            1,
+            "connections to max_subscribers subscribers",
         ),
     ];
     for (i, (what, settings, payload, code, expected)) in cases.into_iter().enumerate() {
@@ -658,6 +666,40 @@ fn replay_bounds_what_a_target_allocates() {
     assert_eq!(status.code(), Some(1), "{err}");
     assert!(
         err.contains("settings in force: subscriber_max_buffer_size is 100000"),
+        "{err}"
+    );
+    assert_eq!(target.dynamic_config().number_of_publishers(), 0);
+    // Review round 4: an existing slice target with 1,024 subscribers, buffer 30 and 2 borrowed samples passes the
+    // sample count (32,770) and the reference counters (63.75 MiB), but its publisher's connections would take
+    // about 8 GiB of used-chunk lists: refused before the publisher exists.
+    let journal = dir.path().join("existing-slice");
+    let service = unique("existing-slice");
+    append_records(
+        &journal,
+        SEGMENT,
+        &run_of(
+            &RawDescriptor::new(&service, RawType::slice("u8", 1, 1)),
+            0,
+            2,
+        ),
+    );
+    let prefix = format!("{}/", unique("wide-target"));
+    let target = node
+        .service_builder(&ServiceName::new(&format!("{prefix}{service}")).unwrap())
+        .publish_subscribe::<[u8]>()
+        .max_subscribers(1024)
+        .subscriber_max_buffer_size(30)
+        .subscriber_max_borrowed_samples(2)
+        .create()
+        .unwrap();
+    let (status, _, err) = run(
+        &cli(),
+        &["replay", journal.to_str().unwrap(), "--prefix", &prefix],
+        SECS(30),
+    );
+    assert_eq!(status.code(), Some(1), "{err}");
+    assert!(
+        err.contains("connections to max_subscribers subscribers") && err.contains("8589934592"),
         "{err}"
     );
     assert_eq!(target.dynamic_config().number_of_publishers(), 0);

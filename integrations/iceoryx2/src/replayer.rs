@@ -285,7 +285,13 @@ impl ReplayerBuilder {
             let factory =
                 P::open_service::<H>(node, &name, target, Create::Replay(descriptor.settings))?;
             let got = describe(factory.static_config(), service_version(node, &name), 0);
-            if let Some(diff) = type_difference(descriptor, &got.payload, &got.user_header, None) {
+            if let Some(diff) = type_difference(
+                descriptor,
+                &got.payload,
+                &got.user_header,
+                None,
+                AlignmentRule::ServiceAtLeastRecorded,
+            ) {
                 return Err(Error::Incompatible {
                     service: target.to_string(),
                     reason: format!("the registered Rust types don't match the recording: {diff}"),
@@ -737,7 +743,13 @@ fn check_registration(
     descriptor: &Descriptor,
 ) -> Result<(), Error> {
     match config.typed.get(&descriptor.service_name) {
-        Some(r) => match type_difference(descriptor, &r.payload, &r.user_header, None) {
+        Some(r) => match type_difference(
+            descriptor,
+            &r.payload,
+            &r.user_header,
+            None,
+            AlignmentRule::RecordedAtLeastRegistered,
+        ) {
             None => Ok(()),
             Some(diff) => Err(Error::Incompatible {
                 service: descriptor.service_name.clone(),
@@ -814,6 +826,7 @@ pub(crate) fn check_existing(
         &got.payload,
         &got.user_header,
         Some(&got.system_header),
+        AlignmentRule::ServiceAtLeastRecorded,
     ) {
         None => Ok(()),
         Some(diff) => Err(Error::Incompatible {
@@ -823,20 +836,39 @@ pub(crate) fn check_existing(
     }
 }
 
-/// Describes how the service's types differ from the recorded ones, or `None` if they are compatible (same
-/// variant, name and size; alignment at least the recorded one).
+/// Which alignments [`type_difference`] accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AlignmentRule {
+    /// A service (existing, or as opened) needs at least the recorded alignment: iceoryx2 places the recorded
+    /// values at that alignment.
+    ServiceAtLeastRecorded,
+    /// A registered Rust type accepts a recorded alignment that is a power of two not below its own: iceoryx2's
+    /// `payload_alignment` raises a service's payload alignment above the type's, and the type's values are valid
+    /// at any multiple of its alignment.
+    RecordedAtLeastRegistered,
+}
+
+/// Describes how the service's (or registered) types differ from the recorded ones, or `None` if they are
+/// compatible: same variant, name and size, and alignments as `rule` says.
 fn type_difference(
     recorded: &Descriptor,
     payload: &TypeInfo,
     user_header: &TypeInfo,
     system_header: Option<&TypeInfo>,
+    rule: AlignmentRule,
 ) -> Option<String> {
     let mut parts = Vec::new();
     let mut compare = |what: &str, want: &TypeInfo, got: &TypeInfo| {
+        let alignment_ok = match rule {
+            AlignmentRule::ServiceAtLeastRecorded => got.alignment >= want.alignment,
+            AlignmentRule::RecordedAtLeastRegistered => {
+                want.alignment.is_power_of_two() && want.alignment >= got.alignment
+            }
+        };
         if want.variant != got.variant
             || want.name != got.name
             || want.size != got.size
-            || got.alignment < want.alignment
+            || !alignment_ok
         {
             parts.push(format!(
                 "{what} is {:?} {} (size {}, alignment {}), recorded {:?} {} (size {}, alignment {})",
@@ -905,5 +937,87 @@ mod tests {
                 .unwrap(),
             "a"
         );
+    }
+
+    fn fixed(name: &str, size: u64, alignment: u64) -> TypeInfo {
+        TypeInfo {
+            variant: crate::layout::TypeVariant::FixedSize,
+            name: name.into(),
+            size,
+            alignment,
+        }
+    }
+
+    fn recorded(payload: TypeInfo) -> Descriptor {
+        Descriptor {
+            run_start_seq: 0,
+            run_start_unix_ns: 0,
+            imported: false,
+            iceoryx2_version: crate::layout::Version {
+                major: 0,
+                minor: 10,
+                patch: 0,
+            },
+            settings: crate::layout::ServiceSettings {
+                history_size: 0,
+                subscriber_max_buffer_size: 2,
+                subscriber_max_borrowed_samples: 2,
+                max_publishers: 2,
+                max_subscribers: 8,
+                max_nodes: 20,
+                safe_overflow: true,
+            },
+            recorder_buffer_size: 0,
+            counter: None,
+            payload,
+            user_header: fixed("()", 0, 1),
+            system_header: fixed("Header", 48, 8),
+            service_name: "s".into(),
+            recorder: String::new(),
+        }
+    }
+
+    /// Review round 4: a registered Rust type accepts a recorded payload alignment raised above its own (a
+    /// power of two), and nothing else that differs; a service (existing or opened) needs at least the recorded
+    /// alignment.
+    #[test]
+    fn alignment_rules() {
+        use AlignmentRule::*;
+        let header = fixed("()", 0, 1);
+        let differs = |recorded_payload: TypeInfo, other: TypeInfo, rule| {
+            type_difference(&recorded(recorded_payload), &other, &header, None, rule)
+        };
+        let bytes = |alignment| fixed("[u8; 64]", 64, alignment);
+        // Registered `[u8; 64]` (alignment 1), recorded with alignment 64: accepted (refused in round 3).
+        assert_eq!(
+            differs(bytes(64), bytes(1), RecordedAtLeastRegistered),
+            None
+        );
+        assert_eq!(differs(bytes(1), bytes(1), RecordedAtLeastRegistered), None);
+        // A recorded alignment below the registered type's, or not a power of two: refused.
+        let u64_type = |alignment| fixed("u64", 8, alignment);
+        assert!(differs(u64_type(4), u64_type(8), RecordedAtLeastRegistered).is_some());
+        assert!(differs(bytes(48), bytes(1), RecordedAtLeastRegistered).is_some());
+        // Name and size still have to match.
+        assert!(
+            differs(
+                bytes(64),
+                fixed("[i8; 64]", 64, 1),
+                RecordedAtLeastRegistered
+            )
+            .is_some()
+        );
+        assert!(
+            differs(
+                bytes(64),
+                fixed("[u8; 64]", 63, 1),
+                RecordedAtLeastRegistered
+            )
+            .is_some()
+        );
+        // A service: at least the recorded alignment.
+        assert_eq!(differs(bytes(64), bytes(64), ServiceAtLeastRecorded), None);
+        assert_eq!(differs(bytes(64), bytes(128), ServiceAtLeastRecorded), None);
+        assert!(differs(bytes(64), bytes(1), ServiceAtLeastRecorded).is_some());
     }
 }

@@ -133,7 +133,7 @@ pub struct ExportReport {
 /// Reads through the end of the journal as it is when the export gets there. The file is written, completely and
 /// synced, under a temporary name of its own next to `output` (created exclusively; concurrent exports never share
 /// one) and linked to `output` only when complete, so a failed export leaves no partial file and an existing file
-/// is never replaced.
+/// is never replaced; the directory is then synced, so the name survives a power loss once `export` returns.
 ///
 /// # Errors
 ///
@@ -186,6 +186,20 @@ pub fn export(
             path: output.to_path_buf(),
             source,
         })?;
+        // Then the temporary name goes, and the directory is synced so that the new name (and the removal) survive
+        // a power loss; before that, a power loss may lose the name, never leave a partial file under it.
+        let _ = std::fs::remove_file(&partial);
+        let dir = match output.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => Path::new("."),
+        };
+        std::fs::File::open(dir)
+            .and_then(|d| d.sync_all())
+            .map_err(|source| Error::Io {
+                op: "sync directory",
+                path: dir.to_path_buf(),
+                source,
+            })?;
         Ok(report)
     })();
     // Only this export's own temporary file is removed: its name is unique and it was created exclusively.
@@ -193,26 +207,32 @@ pub fn export(
     result
 }
 
-/// Creates a new, uniquely named temporary file next to `output`: `.<name>.partial-<pid>-<counter>-<time>`, created
-/// exclusively (retrying with another name if one exists), so two exports to one destination, in one process or
-/// several, never write or remove each other's file.
+/// The name of an export's temporary file: a short fixed prefix, the process id, a per-process counter and the
+/// time, never the destination's name, so that it fits a file name (at most 255 bytes) whatever the destination's
+/// length: at most 66 bytes.
+fn partial_name(counter: u64) -> String {
+    format!(
+        ".tt-iox2-export-{:x}-{counter:x}-{:x}.partial",
+        std::process::id(),
+        tickertape::clock::realtime_ns()
+    )
+}
+
+/// Creates a new, uniquely named temporary file in `output`'s directory ([`partial_name`]), created exclusively
+/// (retrying with another name if one exists), so two exports to one destination, in one process or several, never
+/// write or remove each other's file.
 fn create_partial(output: &Path) -> Result<(PathBuf, std::fs::File), Error> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let name = output
-        .file_name()
-        .ok_or_else(|| Error::Usage(format!("{} is not a file name", output.display())))?;
+    if output.file_name().is_none() {
+        return Err(Error::Usage(format!(
+            "{} is not a file name",
+            output.display()
+        )));
+    }
     let mut last = None;
     for _ in 0..100 {
-        let mut partial = std::ffi::OsString::from(".");
-        partial.push(name);
-        partial.push(format!(
-            ".partial-{}-{}-{}",
-            std::process::id(),
-            COUNTER.fetch_add(1, Ordering::Relaxed),
-            tickertape::clock::realtime_ns()
-        ));
-        let path = output.with_file_name(partial);
+        let path = output.with_file_name(partial_name(COUNTER.fetch_add(1, Ordering::Relaxed)));
         match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -1324,5 +1344,36 @@ mod tests {
                 .collect();
             assert!(left.is_empty(), "{left:?}");
         }
+    }
+
+    /// Review round 4: the temporary name doesn't grow with the destination's, so a destination whose name has the
+    /// longest length a file system takes (255 bytes) exports, next to it, without a "file name too long" error.
+    #[test]
+    fn a_destination_name_at_the_limit_exports() {
+        let (dir, journal) = journal(10);
+        let output = dir.path().join(format!("{}.iox2", "n".repeat(250)));
+        assert_eq!(output.file_name().unwrap().len(), 255);
+        export(&journal, &output, &ExportOptions::default()).unwrap();
+        let parsed = text::parse(&std::fs::read(&output).unwrap(), 65_536).unwrap();
+        assert_eq!(parsed.records.len(), 10);
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .filter(|n| n.len() > 200 || n.to_string_lossy().contains("partial"))
+            .collect();
+        assert_eq!(
+            names,
+            [output.file_name().unwrap()],
+            "only the destination remains"
+        );
+        // The longest temporary name: every number at its largest.
+        let longest = format!(
+            ".tt-iox2-export-{:x}-{:x}-{:x}.partial",
+            u32::MAX,
+            u64::MAX,
+            u64::MAX
+        );
+        assert_eq!(longest.len(), 66);
+        assert!(partial_name(u64::MAX).len() <= 66);
     }
 }
