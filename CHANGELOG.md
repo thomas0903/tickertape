@@ -7,6 +7,8 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 - Docs: define the path to v1.0 around sustained performance, optional eBPF diagnostics, reader/checkpoint
   optimization, ARM measurements, interoperability, replay/recovery at scale and explicit stability/release gates.
+- Dependencies: `cargo deny` ignores RUSTSEC-2026-0543 (chrono unmaintained). chrono reaches the CLI only through
+  parquet, which has no release without it; the library does not depend on it.
 - Release operations: add tag-driven Trusted Publishing, native Linux/macOS CLI archives with checksums,
   registry/docs.rs verification, and a documented retry/backfill process.
 - Repository: add bug/feature issue forms, binary installation instructions and CI checks for release tooling.
