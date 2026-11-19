@@ -429,13 +429,7 @@ fn replay_guards_against_feedback_with_a_live_writer() {
         let journal = journal.clone();
         let stop = std::sync::Arc::clone(&stop);
         std::thread::spawn(move || {
-            let mut w = tickertape::Writer::open(
-                &journal,
-                tickertape::WriterConfig::default()
-                    .segment_size(LIVE_SEGMENT)
-                    .prefault(false),
-            )
-            .unwrap();
+            let mut w = open_writer(&journal, LIVE_SEGMENT);
             let mut i = 0u64;
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                 w.append(&tickertape::NewRecord {

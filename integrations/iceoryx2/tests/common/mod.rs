@@ -468,16 +468,31 @@ pub fn raw_data(descriptor_seq: u64, header: &[u8], payload: &[u8]) -> Vec<u8> {
     .expect("encode data record")
 }
 
+/// Opens a writer, retrying for a while if the journal is locked. Other tests in the same process spawn child
+/// processes; a child forked while this process holds `writer.lock` shares the lock's open file until it execs
+/// (close-on-exec), so reopening a journal right after dropping its writer can briefly see `Locked` with our own PID.
+pub fn open_writer(dir: &Path, segment_size: u64) -> tickertape::Writer {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match tickertape::Writer::open(
+            dir,
+            tickertape::WriterConfig::default()
+                .segment_size(segment_size)
+                .prefault(false),
+        ) {
+            Ok(w) => return w,
+            Err(tickertape::Error::Locked { .. }) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10))
+            }
+            Err(e) => panic!("open writer: {e:?}"),
+        }
+    }
+}
+
 /// Appends records `(schema id, payload)` to the journal in `dir` (created with `segment_size` if new), with
 /// `local_ts_ns` 1 ms apart; returns their sequence numbers.
 pub fn append_records(dir: &Path, segment_size: u64, records: &[(u32, Vec<u8>)]) -> Vec<u64> {
-    let mut writer = tickertape::Writer::open(
-        dir,
-        tickertape::WriterConfig::default()
-            .segment_size(segment_size)
-            .prefault(false),
-    )
-    .expect("open writer");
+    let mut writer = open_writer(dir, segment_size);
     let base = 1_700_000_000_000_000_000u64 + writer.next_seq() * 1_000_000;
     let seqs = records
         .iter()
