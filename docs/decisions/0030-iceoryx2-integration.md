@@ -43,17 +43,19 @@ Ship **`tickertape-iceoryx2`**: a recorder and replayer for iceoryx2 publish/sub
 small command-line tool, in `integrations/iceoryx2/`, outside the Cargo workspace's core crates and versioned
 separately.
 
-- **Record.** One journal can hold several services. Each recording session starts with a service descriptor
-  record (service name, payload and user-header type details) under a reserved schema id; data records carry the
-  user header and payload. `local_ts_ns` is the receive time; `venue_ts_ns` comes from an optional extractor over
-  the user header.
+- **Record.** One journal can hold several services. Each recording run writes a service descriptor record
+  (service name, payload and user-header type details, service settings) under a reserved schema id before the
+  service's first message, and again at the start of every journal segment; data records carry the publisher id,
+  the user header and the payload. `local_ts_ns` is the receive time; `venue_ts_ns` comes from an optional extractor
+  over the user header.
 - **Live consumption.** Any tickertape reader, in any language with a binding, follows the journal with no
   iceoryx2 dependency.
 - **Replay.** Back onto iceoryx2 services, from any sequence number, at the recorded pace (scaled) or as fast as
   possible, with service names remapped by default so a replay cannot feed its own recorder. Late sends are
   reported.
-- **Export.** Parquet through the existing CLI, and iceoryx2's own recording file format in both directions, so
-  the integration works with upstream's tools instead of competing with them.
+- **Export.** Parquet through the existing CLI, and iceoryx2's own recording file format, so the integration works
+  with upstream's tools instead of competing with them: export to both representations, import of the
+  human-readable one (see the amendment below).
 - **Typed first.** A typed recorder uses only iceoryx2's public API. The recorder for services whose type is not
   known at compile time is behind a feature flag, because it depends on an internal upstream API.
 
@@ -70,3 +72,51 @@ Databento DBN is the runner-up and the intended next integration after v1.0.
   documentation must say so; the journal's own sequence numbers only prove that nothing recorded was lost.
 - The roadmap item names iceoryx2. The README's alternatives table already describes iceoryx2 as something that
   "could feed a tickertape recorder"; it should point to the integration once it exists.
+
+## Amendment: review round 1 (2026-11-19)
+
+Three reviews of the first implementation (pull request 13) reproduced memory-safety and integrity defects on the
+replay and import paths and asked for two format questions to be settled before the record layout is frozen.
+Nothing had been released, so the layout changed in place (still version 1). What was decided, and why:
+
+- **Nothing read is trusted until validated.** One function (`layout::validate_types`, with
+  `ServiceSettings::validate`) checks type sizes, alignments (a power of two up to 4096), the iceoryx2 chunk layout
+  they imply (checked arithmetic, accepted by `Layout::from_size_align`), a fixed-size user header, non-zero slice
+  elements and service settings against documented caps, before any value reaches iceoryx2, an allocation or
+  `unsafe` code: when a descriptor is decoded or encoded, when the recorder opens a service, when the replayer opens a
+  target and when a file is imported. The caps (history 65,536; buffers and borrowed samples 65,536; ports 4,096; and
+  two products) are far above realistic services and keep iceoryx2's own unchecked arithmetic from overflowing.
+- **Trust.** The bytes themselves can't be checked to be valid values of their types. Typed replay rebuilds every
+  value through `zerocopy::FromBytes` and stays safe; replay by recorded type details is `Replayer::run_dynamic`, an
+  `unsafe fn` whose contract is that the journal holds valid values (true for a recording of correct publishers that
+  hasn't been altered). The CLI keeps replaying without an extra flag, as upstream's tool does, and says "replay only
+  recordings you trust" in its help. The binary has one `unsafe` call for this, next to the scoped exception for
+  `src/dynamic.rs`.
+- **Import uses a parser of this crate's own**, reads and validates the whole file before appending anything, and
+  accepts only the human-readable representation. Upstream's readers are not meant for untrusted input (a panic on
+  multi-byte characters; the `iox2dump` reader treats file bytes as an initialised struct). `iox2dump` export stays.
+- **Repeated descriptors.** One descriptor per run did not survive retention: removing the segment that held it made
+  every reader abort for the whole journal. The recorder now follows the writer's segment rolls (the documented
+  format: record sizes, 8-byte alignment, segment size) and writes every open service's descriptor before the first
+  record of each new segment, so every retained segment decodes on its own. A rule by bytes appended (a descriptor
+  every quarter segment, say) would have left part of the oldest retained segment undecodable; following the rolls
+  leaves only records too large to share a segment with the descriptors. Readers skip, count and report records whose
+  descriptor is gone instead of aborting. "Session" became "recording run", and `session_id` became `run_start_seq`
+  (its value, the run's first sequence number, and its position are unchanged; the old name was flagged by code
+  scanning as sensitive data in logs).
+- **Growth rule.** The layout version changes only for incompatible changes. Flag bits 0 to 7 must be understood,
+  bits 8 to 15 may be ignored. Reserved fields are written as 0 and ignored. Extension entries (tag, length, bytes;
+  tag bit 15 = must understand) may follow a descriptor and a loss record, and sit between a data record's header and
+  its user header, whose start the data record now states. A version-1 reader keeps reading records written by later
+  compatible revisions.
+- **Publisher identity in data records: yes.** iceoryx2's sample origin (16 bytes) is in every data record. Loss
+  records already name publishers; without the id in data records, a reader can't attribute messages or check counters
+  of services with several publishers, and the recorder tracks counters per publisher anyway. The growth rule would
+  have allowed adding it later as an extension entry, but every recording made before that would have lacked it; 16
+  bytes per message (the data record header is now 40 bytes) is the price. Imported messages have id 0 (unknown).
+- **Checks against the descriptor.** A data record must have the descriptor's user header size and a payload of its
+  size (or whole elements); a loss record's counter width must be the descriptor's, and its kind must match the
+  modular distance between expected and received counters, so a wrapping four-byte counter is no loss.
+- **Exact pin.** iceoryx2 is pinned to `=0.10.0` while internal APIs are used; the weekly job against upstream is
+  informational.
+

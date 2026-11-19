@@ -16,8 +16,10 @@ Report possible vulnerabilities privately as described in [`SECURITY.md`](SECURI
 - **`unsafe` lives in two modules.** Only `crates/tickertape/src/mmap.rs` (mappings and system calls) and
   `crates/tickertape/src/crc.rs` (CPU intrinsics, ADR 0019) may contain `unsafe` code, and every `unsafe` block needs
   a `// SAFETY:` comment. Changes there get extra review. Outside the core crates, the iceoryx2 integration has
-  `unsafe` in exactly one module, `integrations/iceoryx2/src/dynamic.rs`, for iceoryx2 API that is only offered as
-  `unsafe` (services whose types are known only at run time); the same rules apply there.
+  `unsafe` code in exactly one module, `integrations/iceoryx2/src/dynamic.rs`, for iceoryx2 API that is only offered
+  as `unsafe` (services whose types are known only at run time); the crate denies `unsafe_code` everywhere else. Its
+  binary, `integrations/iceoryx2/src/main.rs`, has one `unsafe` call, which passes the user's trust in a recording on
+  to the `unsafe fn` `Replayer::run_dynamic`. The same rules apply to both.
 - **No unverified claims.** Numbers in docs come from recorded runs (`docs/playbooks/run-benchmark.md`); guarantees
   name the test that checks them.
 
@@ -44,11 +46,17 @@ Its checks, run from that directory:
 ```bash
 cargo fmt --check
 cargo clippy --all-targets --all-features --locked -- -D warnings
+cargo clippy --all-targets --locked -- -D warnings
 cargo clippy --all-targets --no-default-features --locked -- -D warnings
-cargo test --all-features --locked
+cargo install --locked iceoryx2-cli@0.10.0   # once; the upstream-tool test needs `iox2`
+TICKERTAPE_REQUIRE_IOX2=1 cargo test --all-features --locked
+cargo test --locked
+cargo test --no-default-features --locked
 cargo +1.89 check --all-features --all-targets --locked
 cargo-deny --manifest-path Cargo.toml --config ../../deny.toml --all-features check
 ```
+
+Run its cross-process tests in release mode too (`--release`), and on Linux as well as macOS.
 
 ## Pull requests
 
