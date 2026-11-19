@@ -564,10 +564,16 @@ human-readable file that `iox2 service replay` and the `iceoryx2-userland-record
 by this crate, with every write checked to be complete, synced, under a temporary name of its own in the
 destination's directory (a short fixed prefix and unique numbers, created exclusively, so concurrent exports never
 share one and any valid destination name works), and linked into place only when complete; an existing file is never
-replaced, and the directory that holds the name is synced after the link (opened again by the same path if that
-path now leads to another directory, say through a symbolic link switched meanwhile), so once the export reports
-success its name survives a power loss (before that, a power loss may lose the name, never leave a partial file under
-it). For service and type names
+replaced. A successful export has synced the file and the directory entry of its name, so both survive a power loss,
+**provided the path of the output directory was not re-pointed while the export ran** (a symbolic link on the way
+switched to another directory); before it returns, a power loss may lose the name, never leave a partial file under
+it. Without `openat`/`linkat` (not available without `unsafe` or another dependency) the export finds the directory
+by its path: it opens it before creating anything, remembering its device and inode, and looks it up again by the
+same path after the link. The same directory is synced and the export succeeds; a different directory (or none that
+opens) is a change the export can see, so it syncs every directory handle it holds and fails with an error saying
+that the file is complete but its name may not survive a power loss because the output directory changed during
+the export, whichever directory took the name. A change it can't see (re-pointed and back again between the two
+lookups) is outside what a path-based export can detect. For service and type names
 without quotes, backslashes or control characters the file has the same bytes upstream's recorder writes (a test
 compares them with a file it wrote); other names are written as double-quoted TOML strings with `\uXXXX` escapes for
 control characters, where upstream's serialiser may choose short escapes (`\n`) or single-quoted strings: different

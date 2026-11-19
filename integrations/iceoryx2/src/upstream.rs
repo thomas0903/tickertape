@@ -133,18 +133,31 @@ pub struct ExportReport {
 /// Reads through the end of the journal as it is when the export gets there. The file is written, completely and
 /// synced, under a temporary name of its own next to `output` (created exclusively; concurrent exports never share
 /// one) and linked to `output` only when complete, so a failed export leaves no partial file and an existing file
-/// is never replaced; the directory that holds the new name is then synced, so the name survives a power loss once
-/// `export` returns. The directory is opened once before anything is written, so a directory that can't be opened
-/// (write and search permission without read permission) fails the export before the file exists, and a retry can
-/// succeed; after the link it is opened again by the same path and that handle is synced, so that if the path now
-/// leads to another directory (a symbolic link switched meanwhile), the directory synced is the one that took the
-/// link.
+/// is never replaced.
+///
+/// A successful export has synced the file and the directory entry of its name, so both survive a power loss once
+/// `export` returns, **provided the path of the output directory was not re-pointed while the export ran** (a
+/// symbolic link on the way switched to another directory). The export finds the directory by its path, not by a
+/// handle bound to the file's creation (`openat`, `linkat`, which the standard library doesn't offer without
+/// `unsafe` or another dependency), so it opens the directory before anything is created, remembering its identity
+/// (device and inode), and looks it up again by the same path after the link:
+///
+/// - the same directory: it is synced, and the export succeeds;
+/// - a different directory, or one that can't be opened: every directory handle the export holds is synced, and
+///   the export fails with an [`Error::Io`] saying that the file is complete but its name may not survive a power
+///   loss, because the output directory changed during the export. Whichever directory took the name, this is
+///   never reported as success.
+///
+/// A change the export can't see (the path re-pointed and back again between the two lookups) is outside what a
+/// path-based export can detect. The early open also means a directory that can't be opened (write and search
+/// permission without read permission) fails the export before the file exists, so a retry can succeed.
 ///
 /// # Errors
 ///
 /// [`Error::Usage`] if the range holds several services and none was chosen, the chosen service isn't there, or
 /// its types changed between recording runs; [`Error::Upstream`] if the file exists; [`Error::Io`] if it can't be
-/// written; journal and layout errors as for [`info::scan`](crate::info::scan).
+/// written or synced, or if the output directory changed during the export (above); journal and layout errors as
+/// for [`info::scan`](crate::info::scan).
 pub fn export(
     journal: impl AsRef<Path>,
     output: impl AsRef<Path>,
@@ -181,11 +194,13 @@ pub fn export(
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => Path::new("."),
     };
-    let dir_handle = std::fs::File::open(dir).map_err(|source| Error::Io {
+    let open_error = |source| Error::Io {
         op: "open directory (to sync it)",
         path: dir.to_path_buf(),
         source,
-    })?;
+    };
+    let dir_handle = std::fs::File::open(dir).map_err(open_error)?;
+    let dir_id = dir_identity(&dir_handle).map_err(open_error)?;
     #[cfg(test)]
     tests::between_open_and_create();
     let (partial, file) = create_partial(output)?;
@@ -208,15 +223,9 @@ pub fn export(
         // Then the temporary name goes, and the directory is synced so that the new name (and the removal) survive
         // a power loss; before that, a power loss may lose the name, never leave a partial file under it.
         let _ = std::fs::remove_file(&partial);
-        // The directory that holds the name now is synced: if the path was switched to another directory after
-        // the handle above was opened (a symbolic link), the file and its name are in the new one (see
-        // `sync_dir`). If it can't be opened or synced now, the file is complete under its name, but the name may
-        // not survive a power loss, which the error says.
-        sync_dir(&dir_handle, dir).map_err(|source| Error::Io {
-            op: "sync directory (the exported file is complete, but its name may not survive a power loss)",
-            path: dir.to_path_buf(),
-            source,
-        })?;
+        #[cfg(test)]
+        tests::between_link_and_lookup();
+        sync_dir(&dir_handle, dir_id, dir)?;
         Ok(report)
     })();
     // Only this export's own temporary file is removed: its name is unique and it was created exclusively.
@@ -224,26 +233,64 @@ pub fn export(
     result
 }
 
-/// Syncs the directory the path `dir` leads to now: `early` (opened by that path before the export created
-/// anything) if it is still the same directory, by device and inode, and otherwise the directory opened again by
-/// that path. The hard link and this each resolve the path once, so a switch between the two can't be excluded
-/// without creating and linking relative to a directory handle (`openat`, `linkat`), which the standard library
-/// doesn't offer without `unsafe` or another dependency.
-fn sync_dir(early: &std::fs::File, dir: &Path) -> std::io::Result<()> {
+/// The identity of a directory: its device and inode on Unix; elsewhere there is none to compare, so [`sync_dir`]
+/// can't confirm that the directory is unchanged and reports it as changed.
+fn dir_identity(dir: &std::fs::File) -> std::io::Result<Option<(u64, u64)>> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        let (now, then) = (std::fs::metadata(dir)?, early.metadata()?);
-        if (now.dev(), now.ino()) == (then.dev(), then.ino()) {
-            #[cfg(test)]
-            tests::synced(early);
-            return early.sync_all();
+        let m = dir.metadata()?;
+        Ok(Some((m.dev(), m.ino())))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(None)
+    }
+}
+
+/// After the link: looks the directory up again by the path `dir` and syncs it if it is the directory `early` was
+/// opened on before the export created anything (identity `early_id`). Otherwise, if the path now leads to another
+/// directory or to none that can be opened, the name may be in either, so every handle held is synced and the
+/// export fails: it can't tell which directory took the name, so it never reports success (see [`export`]).
+fn sync_dir(early: &std::fs::File, early_id: Option<(u64, u64)>, dir: &Path) -> Result<(), Error> {
+    const CHANGED: &str = "sync directory (the exported file is complete, but its name may not survive a power \
+                           loss: the output directory changed during the export)";
+    let sync = |handle: &std::fs::File| {
+        #[cfg(test)]
+        tests::synced(handle);
+        handle.sync_all()
+    };
+    let changed = |source| Error::Io {
+        op: CHANGED,
+        path: dir.to_path_buf(),
+        source,
+    };
+    let now = match std::fs::File::open(dir) {
+        Ok(now) => now,
+        Err(source) => {
+            let _ = sync(early);
+            return Err(changed(source));
+        }
+    };
+    let now_id = dir_identity(&now);
+    match now_id {
+        Ok(Some(id)) if Some(id) == early_id => sync(early).map_err(|source| Error::Io {
+            op: "sync directory (the exported file is complete, but its name may not survive a power loss)",
+            path: dir.to_path_buf(),
+            source,
+        }),
+        other => {
+            let _ = sync(early);
+            let _ = sync(&now);
+            Err(changed(match other {
+                Err(source) => source,
+                _ => std::io::Error::other(
+                    "the path leads to a different directory than when the export started",
+                ),
+            }))
         }
     }
-    let handle = std::fs::File::open(dir)?;
-    #[cfg(test)]
-    tests::synced(&handle);
-    handle.sync_all()
 }
 
 /// The name of an export's temporary file: a short fixed prefix, the process id, a per-process counter and the
@@ -1292,18 +1339,30 @@ mod tests {
         (dir, path)
     }
 
+    /// A test-only hook: a function `export` runs once, on this thread, at one point.
+    type Hook = std::cell::RefCell<Option<Box<dyn FnOnce()>>>;
+
     thread_local! {
         /// Run once by `export`, on this thread, between opening the directory and creating the temporary file.
-        static BETWEEN_OPEN_AND_CREATE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
-            const { std::cell::RefCell::new(None) };
-        /// The device and inode of the last directory `export` synced on this thread.
-        static SYNCED: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
+        static BETWEEN_OPEN_AND_CREATE: Hook = const { std::cell::RefCell::new(None) };
+        /// Run once by `export`, on this thread, between the link and looking the directory up again.
+        static BETWEEN_LINK_AND_LOOKUP: Hook = const { std::cell::RefCell::new(None) };
+        /// The device and inode of each directory handle `export` synced on this thread, in order.
+        static SYNCED: std::cell::RefCell<Vec<(u64, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    fn run(hook: &'static std::thread::LocalKey<Hook>) {
+        if let Some(f) = hook.with(|h| h.borrow_mut().take()) {
+            f()
+        }
     }
 
     pub(super) fn between_open_and_create() {
-        if let Some(f) = BETWEEN_OPEN_AND_CREATE.with(|h| h.borrow_mut().take()) {
-            f()
-        }
+        run(&BETWEEN_OPEN_AND_CREATE)
+    }
+
+    pub(super) fn between_link_and_lookup() {
+        run(&BETWEEN_LINK_AND_LOOKUP)
     }
 
     #[cfg_attr(not(unix), allow(unused_variables))]
@@ -1312,7 +1371,7 @@ mod tests {
         {
             use std::os::unix::fs::MetadataExt;
             let m = dir.metadata().unwrap();
-            SYNCED.with(|s| s.set(Some((m.dev(), m.ino()))));
+            SYNCED.with(|s| s.borrow_mut().push((m.dev(), m.ino())));
         }
     }
 
@@ -1445,14 +1504,16 @@ mod tests {
         assert_eq!(report.messages, 10, "a retry succeeds");
     }
 
-    /// Review round 7: the output directory is reached through a symbolic link that is switched from directory A
-    /// to directory B after export opened the directory and before it created its temporary file. The file and its
-    /// name land in B, and B is the directory synced (round 5 synced A, the handle it opened first). A test hook
-    /// between the open and the create makes the switch deterministic; the directory synced is recorded by device
-    /// and inode.
+    /// Review rounds 7 and 8: the output directory is reached through a symbolic link, switched from directory A
+    /// to directory B while the export runs. Whichever of A and B holds the name, an export that sees a different
+    /// directory at the end than at the start syncs every directory handle it holds and fails with the error that
+    /// says the file is complete but its name may not survive a power loss; it never reports success. Round 7
+    /// returned success after a switch after the link (it synced B, with the name in A); round 6 did after a
+    /// switch before the create (it synced A, with the name in B). Test hooks make each switch deterministic; the
+    /// directories synced are recorded by device and inode.
     #[cfg(unix)]
     #[test]
-    fn the_directory_synced_is_the_one_that_holds_the_name() {
+    fn a_directory_switched_during_the_export_is_reported_never_success() {
         use std::os::unix::fs::MetadataExt;
         let (dir, journal) = journal(10);
         let (a, b, link) = (
@@ -1462,37 +1523,78 @@ mod tests {
         );
         std::fs::create_dir(&a).unwrap();
         std::fs::create_dir(&b).unwrap();
-        std::os::unix::fs::symlink(&a, &link).unwrap();
         let id = |p: &Path| {
             let m = std::fs::metadata(p).unwrap();
             (m.dev(), m.ino())
         };
-        let switch = {
+        let point = |to: &Path| {
+            let _ = std::fs::remove_file(&link);
+            std::os::unix::fs::symlink(to, &link).unwrap();
+        };
+        let switch_to_b = || {
             let (b, link) = (b.clone(), link.clone());
-            move || {
+            Box::new(move || {
                 std::fs::remove_file(&link).unwrap();
                 std::os::unix::fs::symlink(&b, &link).unwrap();
-            }
+            })
         };
-        BETWEEN_OPEN_AND_CREATE.with(|h| *h.borrow_mut() = Some(Box::new(switch)));
-        SYNCED.with(|s| s.set(None));
-        let report = export(&journal, link.join("x.iox2"), &ExportOptions::default()).unwrap();
-        assert_eq!(report.messages, 10);
-        assert!(
-            b.join("x.iox2").exists(),
-            "the file is in the directory the link leads to now"
-        );
+        let complete = |p: &Path| {
+            let parsed = text::parse(&std::fs::read(p).unwrap(), 65_536).unwrap();
+            assert_eq!(parsed.records.len(), 10, "{} is complete", p.display());
+        };
+        let changed = |err: Error| {
+            assert!(
+                matches!(&err, Error::Io { op, .. }
+                    if op.contains("may not survive a power loss") && op.contains("changed during the export")),
+                "{err}"
+            );
+        };
+
+        // A switch before the temporary file is created: the file and its name are in B.
+        point(&a);
+        BETWEEN_OPEN_AND_CREATE.with(|h| *h.borrow_mut() = Some(switch_to_b()));
+        SYNCED.with(|s| s.borrow_mut().clear());
+        changed(export(&journal, link.join("x.iox2"), &ExportOptions::default()).unwrap_err());
+        complete(&b.join("x.iox2"));
         assert!(!a.join("x.iox2").exists());
-        assert_eq!(
-            SYNCED.with(|s| s.get()),
-            Some(id(&b)),
-            "the directory synced is the one that holds the name (a is {:?})",
-            id(&a)
-        );
-        // Without a switch: the same directory, through the handle opened first.
-        SYNCED.with(|s| s.set(None));
-        export(&journal, link.join("y.iox2"), &ExportOptions::default()).unwrap();
-        assert_eq!(SYNCED.with(|s| s.get()), Some(id(&b)));
+        assert_eq!(SYNCED.with(|s| s.take()), [id(&a), id(&b)], "both handles");
+
+        // A switch after the link and before the second lookup: the file and its name are in A.
+        point(&a);
+        BETWEEN_LINK_AND_LOOKUP.with(|h| *h.borrow_mut() = Some(switch_to_b()));
+        changed(export(&journal, link.join("y.iox2"), &ExportOptions::default()).unwrap_err());
+        complete(&a.join("y.iox2"));
+        assert!(!b.join("y.iox2").exists());
+        assert_eq!(SYNCED.with(|s| s.take()), [id(&a), id(&b)], "both handles");
+
+        // The path leads to no directory after the link: the early handle is synced, and the export fails.
+        point(&a);
+        let dangling = {
+            let (gone, link) = (dir.path().join("gone"), link.clone());
+            Box::new(move || {
+                std::fs::remove_file(&link).unwrap();
+                std::os::unix::fs::symlink(&gone, &link).unwrap();
+            })
+        };
+        BETWEEN_LINK_AND_LOOKUP.with(|h| *h.borrow_mut() = Some(dangling));
+        changed(export(&journal, link.join("z.iox2"), &ExportOptions::default()).unwrap_err());
+        complete(&a.join("z.iox2"));
+        assert_eq!(SYNCED.with(|s| s.take()), [id(&a)]);
+
+        // Without a switch: success, and the one directory, which holds the name, is synced.
+        point(&a);
+        let report = export(&journal, link.join("w.iox2"), &ExportOptions::default()).unwrap();
+        assert_eq!(report.messages, 10);
+        complete(&a.join("w.iox2"));
+        assert_eq!(SYNCED.with(|s| s.take()), [id(&a)]);
+        for d in [&a, &b] {
+            let left: Vec<_> = std::fs::read_dir(d)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|n| n.contains("partial"))
+                .collect();
+            assert!(left.is_empty(), "{left:?}");
+        }
     }
 
     /// Review round 4: the temporary name doesn't grow with the destination's, so a destination whose name has the

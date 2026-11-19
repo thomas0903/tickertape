@@ -279,3 +279,25 @@ gigabytes, and found a few more integrity gaps. Nothing was released; the layout
   settings before opening a service holds for an existing replay target and for the recorder by name; the typed
   recorder opens the service and checks right after, which lists the nodes once, as the README says.)
 
+
+## Amendment: review round 8 (2026-11-20)
+
+- **An export reports success only when the output directory is the one it started with.** Round 7 synced the
+  directory the output path leads to after the link, which is wrong when the path is switched between the link and
+  that lookup (the name is in the old directory, the new one was synced), as round 5's early handle was wrong for a
+  switch before the create. Without `openat`/`linkat` neither handle is right in both cases, so the rule now is: the
+  directory is opened before anything is created, remembering its device and inode, and looked up again by the same
+  path after the link; the same directory is synced and the export succeeds; a different directory, or none that
+  can be opened, has every handle held synced, and the export fails with the error that says the file is complete
+  but its name may not survive a power loss, because the output directory changed during the export. The
+  durability promise (rustdoc, README) is conditional: a successful export has synced the file and its directory
+  entry **provided the path of the output directory was not re-pointed while the export ran**; a change export can
+  see is reported as that error, and a change it can't see (re-pointed and back between the two lookups) is outside
+  what a path-based export can detect.
+- **The measurement test compares like with like in two more slopes.** The late-publisher slope expects the
+  difference of `subscriber_heap` between the two states measured (8 and 32 of the slots holding a growing
+  publisher's segment table), so the slot cost, allocated up front in both, cancels on both sides. The
+  connection-count slope says the publisher's budget charges by capacity (`max_subscribers × connection_bytes`), so
+  its expected cost per connected subscriber is `connection_bytes` at the publisher's samples and segments (checked
+  to be the capacity-based charge per subscriber), with a lower bound from what each connection holds whatever the
+  rounding (its used-chunk lists and queues).

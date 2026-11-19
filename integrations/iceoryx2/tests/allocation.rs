@@ -622,19 +622,21 @@ fn subscriber_with_publishers_present(
 /// A subscriber created first, then `k` growing publishers, then a receive: the heap the publishers that came
 /// later cost it, against [`layout::subscriber_heap`] (the bound by `max_publishers`). The connections are created
 /// by the publishers.
-fn subscriber_with_later_publishers(nodes: &Nodes, kind: Kind, k: usize) -> Row {
+fn subscriber_with_later_publishers(nodes: &Nodes, kind: Kind, k: usize) -> (Row, ServiceSettings) {
     let svc = Svc::create(nodes, kind, &unique("sub-later"), Shape::small(0));
     let (sub, created) = kept(|| svc.subscriber(BUFFER));
     let pubs: Vec<_> = (0..k).map(|_| svc.publisher(true, SMALL_SLICE)).collect();
     let (_, connected) = kept(|| sub.drain());
-    let budget = layout::subscriber_heap(&settings_of(svc.cfg()), expired(nodes)).unwrap();
+    let settings = settings_of(svc.cfg());
+    let budget = layout::subscriber_heap(&settings, expired(nodes)).unwrap();
     drop((sub, pubs));
-    Row {
+    let row = Row {
         shape: format!("subscriber, then {k:>2} growing publishers, {kind:?}"),
         heap: (created + connected, budget),
         data: (0, 0),
         connections: (0, 0),
-    }
+    };
+    (row, settings)
 }
 
 /// A publisher (a slice one starting with `initial_len` elements) created next to `k` subscribers already present:
@@ -791,7 +793,7 @@ fn the_budget_covers_what_iceoryx2_allocates() {
     }
     for kind in [Kind::Fixed, Kind::Slice] {
         for k in [8, 32] {
-            subscriber_with_later_publishers(&nodes, kind, k).check();
+            subscriber_with_later_publishers(&nodes, kind, k).0.check();
         }
     }
     for kind in [Kind::Fixed, Kind::Slice] {
@@ -836,6 +838,10 @@ enum Bound {
     AtLeast(f64),
     /// The constant is deliberately generous (the text where it is used says by how much): the upper side only.
     Generous,
+    /// The constant is deliberately generous, and the measured cost per item must be at least this many bytes: a
+    /// floor iceoryx2's source gives for what each item holds whatever the rounding (the text where it is used says
+    /// which).
+    AtLeastBytes(f64),
 }
 
 /// For constants iceoryx2's source gives exactly (8-byte reference counters, a data segment's chunk and its 4-byte
@@ -882,6 +888,7 @@ impl Slope {
         let lower = match self.bound {
             Bound::AtLeast(f) => format!("≥ {f:.1} × constant"),
             Bound::Generous => "upper only".to_string(),
+            Bound::AtLeastBytes(b) => format!("≥ {b:.0} bytes"),
         };
         eprintln!(
             "| {:<80} | {:>6} → {:<6} | {:>10.1} | {:>10.1} | {:>5.2} | {:<18} |",
@@ -937,6 +944,16 @@ impl Slope {
                 self.constant
             );
         }
+        if let Bound::AtLeastBytes(b) = self.bound {
+            assert!(
+                diff >= b * n - allowance,
+                "{}: {per:.1} bytes per item measured ({:?} bytes at {:?} items), less than the {b:.0} each item \
+                 holds at least",
+                self.what,
+                self.measured,
+                self.items
+            );
+        }
     }
 }
 
@@ -966,22 +983,18 @@ fn per_item(items: (u64, u64), budget: (u64, u64)) -> f64 {
     (budget.1 as f64 - budget.0 as f64) / (items.1 - items.0) as f64
 }
 
-/// [`layout::subscriber_heap`] of a small shape with `max_publishers` and an expired-connection buffer of `expired`.
-fn subscriber_heap_at(max_publishers: usize, expired: u64) -> u64 {
-    let shape = Shape {
-        max_publishers,
-        ..Shape::small(0)
-    };
-    let settings = ServiceSettings {
-        history_size: shape.history as u64,
-        subscriber_max_buffer_size: shape.buffer as u64,
-        subscriber_max_borrowed_samples: 1,
-        max_publishers: shape.max_publishers as u64,
-        max_subscribers: shape.max_subscribers as u64,
-        max_nodes: 20,
-        safe_overflow: true,
-    };
-    layout::subscriber_heap(&settings, expired).unwrap()
+/// [`layout::subscriber_heap`] of `settings` (with an expired-connection buffer of `expired`) for the state in
+/// which `connected` of its connection slots hold a growing publisher's segment table. The budget doesn't depend on
+/// how many publishers are connected: it charges every slot as if it held one (it bounds later publishers, which
+/// the subscriber can't decline). So the state's figure is the budget less the table charge
+/// ([`layout::SUBSCRIBER_HEAP_PER_GROWING_PUBLISHER`]) of each slot that doesn't hold one. The slots themselves (and
+/// the `malloc`'d list entry of each) are in the budget whatever the state, as they are allocated with the
+/// subscriber, so the difference between two states leaves out their cost, as the measured difference does.
+fn subscriber_heap_connected(settings: &ServiceSettings, expired: u64, connected: u64) -> u64 {
+    let slots = expired.max(settings.subscriber_max_borrowed_samples) + settings.max_publishers;
+    assert!(connected <= settings.max_publishers);
+    layout::subscriber_heap(settings, expired).unwrap()
+        - (slots - connected) * layout::SUBSCRIBER_HEAP_PER_GROWING_PUBLISHER
 }
 
 /// For each quantity the budget charges per item, the measured cost per item at two values against the formula's
@@ -996,27 +1009,33 @@ fn each_per_item_constant_covers_the_measured_cost_per_item() {
     let shm = shm_allowance(page);
     slope_header();
 
-    // Subscriber heap per growing publisher that connects after it (8 and 32): the connection's segment table and
-    // slot, which the formula charges per `max_publishers` slot (`subscriber_heap` at 8 and 32 publishers, less the
-    // list entry iceoryx2 allocates with `malloc` directly, which this test can't see). The slot's own entry is
-    // allocated with the subscriber, so the measured cost per publisher is a little less than the charge.
+    // Subscriber heap per growing publisher that connects after it (8 and 32, one service shape): the view of its
+    // data segment and the segment table it allocates. Both subscribers allocate their connection slots (and the
+    // `malloc`'d list entries) up front, so their cost cancels from the measured difference; the formula's figure is
+    // `subscriber_heap` for the two states measured, 8 and 32 of the slots holding a growing publisher's table
+    // (`subscriber_heap_connected`), whose difference leaves the slot cost out too.
     let expired_default = expired(&nodes);
-    let later = per_item(
-        (8, 32),
-        (
-            subscriber_heap_at(8, expired_default),
-            subscriber_heap_at(32, expired_default),
-        ),
-    ) - layout::SUBSCRIBER_DIRECT_HEAP_PER_PUBLISHER as f64;
     for kind in [Kind::Fixed, Kind::Slice] {
-        let [a, b] = [8, 32].map(|k| subscriber_with_later_publishers(&nodes, kind, k));
+        let [(a, settings), (b, settings_b)] =
+            [8, 32].map(|k| subscriber_with_later_publishers(&nodes, kind, k));
+        assert_eq!(
+            settings, settings_b,
+            "the two states share one service shape"
+        );
         a.assert_within();
         b.assert_within();
+        let items = (8, 32);
         Slope {
             what: format!("subscriber heap per growing publisher connected later, {kind:?}"),
-            items: (8, 32),
+            items,
             measured: (a.heap.0, b.heap.0),
-            constant: later,
+            constant: per_item(
+                items,
+                (
+                    subscriber_heap_connected(&settings, expired_default, items.0),
+                    subscriber_heap_connected(&settings, expired_default, items.1),
+                ),
+            ),
             allowance: 0,
             bound: MEASURED,
         }
@@ -1233,12 +1252,19 @@ fn each_per_item_constant_covers_the_measured_cost_per_item() {
     }
     .check();
 
-    // Connection shared memory per connection: a publisher with 8 and 32 subscribers present. Each is counted as
-    // `connection_bytes`, in whole 64 KiB pages (the largest page size of the supported targets), while a small
-    // connection takes a few KiB (one or two 16 KiB pages on macOS): generous by 2× to 20× at these shapes, upper
-    // side only.
+    // Connection shared memory per connection: a publisher with 8 and 32 subscribers present, one service shape
+    // (34 subscribers allowed). The formula charges by capacity, not by connected subscribers: the publisher's budget
+    // is `max_subscribers × connection_bytes`, each connection sized by the publisher's samples and segments, which
+    // are the same in both states. So the formula's figure for k connected subscribers is k × `connection_bytes`
+    // (`one_connection`) at those samples and segments, and the expected difference is that per connection: the
+    // capacity-based charge per subscriber, as the assertion below checks. Each is counted in whole 64 KiB pages
+    // (the largest page size of the supported targets), while a small connection takes a few KiB (one or two
+    // 16 KiB pages on macOS): generous by 2× to 20× at these shapes. The lower side is what each connection holds
+    // whatever the rounding, from iceoryx2's source: its used-chunk lists (one byte per sample per segment) and its
+    // two queues of 8-byte entries (`connection_bytes` without the fixed parts, which are counted with a margin,
+    // or the rounding).
     for (kind, growing) in [(Kind::Fixed, false), (Kind::Slice, true)] {
-        let [(a, _, alloc), (b, _, _)] = [8, 32].map(|k| {
+        let [(a, _, alloc), (b, _, alloc_b)] = [8, 32].map(|k| {
             publisher_with_subscribers_present(
                 &nodes,
                 kind,
@@ -1248,17 +1274,27 @@ fn each_per_item_constant_covers_the_measured_cost_per_item() {
                 SMALL_SLICE,
             )
         });
+        assert_eq!(alloc, alloc_b, "the two states share one budget");
+        let items = (8, 32);
+        let one = one_connection(&alloc, BUFFER);
+        assert_eq!(
+            alloc.connections,
+            PORTS as u64 * one,
+            "the budget charges a connection per subscriber allowed"
+        );
+        let held = alloc.segments * alloc.samples
+            + (8 * (BUFFER as u64 + 1) + 7)
+            + (8 * (BUFFER as u64 + 2) + 7);
         Slope {
             what: format!(
                 "connections per connection (subscribers present), {} {kind:?}",
                 if growing { "growing" } else { "static" }
             ),
-            items: (8, 32),
+            items,
             measured: (a.connections.0, b.connections.0),
-            // The publisher's budget counts a connection for every subscriber the service allows.
-            constant: (alloc.connections / PORTS as u64) as f64,
+            constant: per_item(items, (items.0 * one, items.1 * one)),
             allowance: 0,
-            bound: Bound::Generous,
+            bound: Bound::AtLeastBytes(held as f64),
         }
         .check();
     }
