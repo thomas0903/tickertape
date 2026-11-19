@@ -29,7 +29,7 @@ use tickertape::{
     Error, NewRecord, OwnedRecord, Reader, ReaderConfig, RecoveryAction, Writer, inspect,
 };
 use tickertape_tests::{
-    Rng, append_n, check_record, corrupt_by_replacement, end_of_records, payload, payload_len,
+    Rng, append_n, check_record, corrupt_by_replacement, end_of_records, payload_len,
     reopen_writer, segments, small_config, zero_commit_word,
 };
 
@@ -388,9 +388,21 @@ fn durable_readers_under_repairs_long() {
 }
 
 /// The payload generation `generation` of the writer (the number of restarts before it) writes at `seq`, so that
-/// histories written by different generations differ.
+/// histories written by different generations differ. Every byte depends on the generation (a SplitMix64 step of the
+/// byte's position, keyed by `seq` and `generation`), so two generations' payloads at one sequence number agree only
+/// by chance, byte by byte; the length is [`payload_len`]`(seq)` in every generation.
 fn generation_payload(seq: u64, generation: u32) -> Vec<u8> {
-    payload(seq ^ (u64::from(generation) << 40), payload_len(seq))
+    let key = seq
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(u64::from(generation).wrapping_mul(0xD1B5_4A32_D192_ED03));
+    (0..payload_len(seq) as u64)
+        .map(|i| {
+            let mut z = key.wrapping_add((i + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            (z ^ (z >> 31)) as u8
+        })
+        .collect()
 }
 
 /// Appends `n` records of generation `generation` (its number is the schema id).
@@ -459,8 +471,10 @@ enum Restart {
     /// No repair: every file keeps its identity and every record.
     Clean,
     /// Recovery removed records in place after a commit word zeroed in the file, and the new writer began there: that
-    /// file keeps its identity, so readers can't notice (C11). Later segments, if any, were quarantined.
-    InPlace,
+    /// file keeps its identity, so readers can't notice (C11). Later segments, if any, were quarantined, unchanged.
+    /// `zeroed_end`: the base of the first segment after the one zeroed in place (`u64::MAX` if it was the newest),
+    /// so recovery changed bytes only of records below it.
+    InPlace { zeroed_end: u64 },
     /// Recovery began the new writer in a segment it replaced (a corrupt copy was renamed over it), or after
     /// quarantining segments: readers holding the old files notice, and must report `Error::Discarded` before they
     /// return records of the repaired history.
@@ -636,7 +650,7 @@ fn restart_loop(
         shared.window.fetch_add(1, Ordering::SeqCst);
         drop(writer);
         let damage = rng.below(8);
-        let (mut zeroed, mut replaced) = (false, false);
+        let (mut zeroed, mut replaced) = (None, false);
         if damage >= 2 {
             let marker = inspect::read_checkpoint(shared.dir)
                 .unwrap()
@@ -646,8 +660,13 @@ fn restart_loop(
             if end > marker.next_seq {
                 let seq = marker.next_seq + rng.below(end - marker.next_seq);
                 if damage < 4 {
+                    let zeroed_end = segments(shared.dir)
+                        .iter()
+                        .map(|s| s.0)
+                        .find(|&base| base > seq)
+                        .unwrap_or(u64::MAX);
                     zero_commit_word(shared.dir, seq);
-                    zeroed = true;
+                    zeroed = Some(zeroed_end);
                 } else {
                     corrupt_by_replacement(shared.dir, seq);
                     replaced = true;
@@ -665,7 +684,7 @@ fn restart_loop(
             shared.repairs.fetch_add(1, Ordering::SeqCst);
             replaced = true;
         }
-        if zeroed {
+        if zeroed.is_some() {
             assert!(
                 actions
                     .iter()
@@ -678,9 +697,9 @@ fn restart_loop(
         // A zeroed commit word is where recovery stopped and the new writer began, in place, even when recovery also
         // quarantined later segments (the zeroed word was in an older one).
         let restart = match (zeroed, replaced) {
-            (true, _) => Restart::InPlace,
-            (false, true) => Restart::Replaced,
-            (false, false) => Restart::Clean,
+            (Some(zeroed_end), _) => Restart::InPlace { zeroed_end },
+            (None, true) => Restart::Replaced,
+            (None, false) => Restart::Clean,
         };
         shared.restarts.lock().unwrap().push(restart);
         shared.starts.lock().unwrap().push(writer.next_seq());
@@ -754,9 +773,11 @@ fn visible_follow(shared: &Repairs<'_>, mapped: bool) {
         match reader.next_timeout(Some(Duration::from_millis(20))) {
             Ok(Some(record)) => {
                 let record = record.to_owned();
+                // Right after the copy: a restart that began later can't have changed it.
+                let copied = shared.window.load(Ordering::SeqCst);
                 assert_eq!(record.seq, expected, "mapped {mapped}");
                 if mapped {
-                    check_mapped_visible(shared, &record, window);
+                    check_mapped_visible(shared, &record, window..=copied);
                 } else {
                     check_generation(&record);
                 }
@@ -799,7 +820,8 @@ fn visible_follow(shared: &Repairs<'_>, mapped: bool) {
     }
 }
 
-/// Checks a record the zero-copy visible reader returned, read while `window` was the repair window.
+/// Checks a record the zero-copy visible reader returned: `windows` holds the repair window read before the read and
+/// the one read right after its payload was copied out.
 ///
 /// Its payload borrows the mapping, and the one change a tickertape writer makes to committed bytes is recovery
 /// zeroing, in place, the records after a commit word that storage damage emptied (C11): `docs/crash-contract.md`
@@ -807,32 +829,42 @@ fn visible_follow(shared: &Repairs<'_>, mapped: bool) {
 /// validation can come out of `to_owned` with its payload zeroed, wholly or in part (the copy races with the
 /// zeroing), or, if the copy is late enough, partly overwritten by the new history appended there, while its header
 /// fields, copied out during validation, are right. That is all the contract allows, and only for a record such a
-/// repair removed while the reader held it: one at or after the start of a generation that began during this read
-/// with an in-place repair. The safe reader, and durable-only readers of both kinds (which return only records below
+/// repair removed while the reader held it: one at or after the start, and in the segment zeroed, of a generation
+/// whose restart (with an in-place repair) overlapped the read, from before the read to the end of the copy. The
+/// safe reader, and durable-only readers of both kinds (which return only records below
 /// a marker, never zeroed in place: C13), get the full check.
-fn check_mapped_visible(shared: &Repairs<'_>, r: &OwnedRecord, window: u64) {
+fn check_mapped_visible(
+    shared: &Repairs<'_>,
+    r: &OwnedRecord,
+    windows: std::ops::RangeInclusive<u64>,
+) {
     if r.payload == generation_payload(r.seq, r.schema_id) {
         return check_generation(r);
     }
     assert_eq!(r.venue_ts_ns, r.seq * 10);
     assert_eq!(r.local_ts_ns, r.seq * 10 + 1);
-    // Wait for the restart in progress, if any, to record how it began. `restart_loop` checks `stop` only between
-    // restarts.
+    // Restart `k` (which makes generation `k + 1`) moves the window from `2k` to `2k + 1` when it begins and to
+    // `2k + 2` when it has recorded how it changed the files. The restart in progress when the read began, or else
+    // the next one, made generation `start / 2 + 1`; the last one that had begun when the copy ended made generation
+    // `end.div_ceil(2)`. Later restarts began after the copy and can't have changed it.
+    let since = (windows.start() / 2 + 1) as usize;
+    let until = windows.end().div_ceil(2) as usize;
+    // Wait for that last restart, if still in progress, to record how it began. `restart_loop` checks `stop` only
+    // between restarts.
     let deadline = Instant::now() + GRACE;
-    while shared.window.load(Ordering::SeqCst) % 2 == 1 && Instant::now() < deadline {
+    while shared.starts.lock().unwrap().len() <= until && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(1));
     }
-    // The restart in progress when the read began, or else the next one, made generation `window / 2 + 1`.
-    let since = (window / 2 + 1) as usize;
     let starts = shared.starts.lock().unwrap();
     let restarts = shared.restarts.lock().unwrap();
-    let generations: Vec<_> = (since..starts.len())
+    let generations: Vec<_> = (since..starts.len().min(until + 1))
         .map(|g| (g, starts[g], restarts[g]))
         .collect();
     assert!(
-        generations
-            .iter()
-            .any(|&(_, start, restart)| restart == Restart::InPlace && start <= r.seq),
+        generations.iter().any(|&(_, start, restart)| matches!(
+            restart,
+            Restart::InPlace { zeroed_end } if start <= r.seq && r.seq < zeroed_end
+        )),
         "zero-copy payload of {} (generation {}) changed, but no in-place repair removed it during the read \
          (generations since: {generations:?}): {:?}",
         r.seq,
