@@ -60,10 +60,13 @@ For the 1.0 release, and checked again for every later release that ships the C 
 
 1. In `crates/tickertape-ffi/src/lib.rs`, set `TICKERTAPE_ABI_VERSION` to 1 (only at 1.0; it changes again only
    with a major version that breaks the ABI), and regenerate the header.
-2. Freeze the ABI: copy the release's `crates/tickertape-ffi/include/tickertape.h` over
-   `crates/tickertape-ffi/abi/tickertape-baseline.h`, in the release preparation pull request. From then on CI fails
-   if a later change removes or changes a declaration from it; additions pass. Never edit the baseline to make CI
-   pass; a break needs a new major version and ABI version.
+2. Freeze the ABI, at 1.0 **and at every later stable release**: copy the release's
+   `crates/tickertape-ffi/include/tickertape.h` (the header as shipped) over
+   `crates/tickertape-ffi/abi/tickertape-baseline.h`, in the release preparation pull request, after the CI check
+   against the previous baseline has passed. From then on CI fails if a later change removes or changes a
+   declaration from it; additions pass. Refreshing it at every release matters: a baseline left at 1.0 would let a
+   function added in 1.1 be removed in 1.2. Never edit the baseline to make CI pass; a break needs a new major
+   version and ABI version.
 3. Build the packaged library as packagers will (`cargo cinstall --release -p tickertape-ffi --prefix /usr/local
    --destdir "$STAGE"`, or the release archive once it exists), and check its name in the files:
    - Linux: `readelf -d "$STAGE"/usr/local/lib/libtickertape.so.1* | grep SONAME` prints `libtickertape.so.1`, and

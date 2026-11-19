@@ -126,7 +126,9 @@ public:
 
     // Appends a record whose payload `fill(uint8_t *buf, size_t len)` writes in place (`buf` is NULL when `len` is
     // 0). If `fill` throws, nothing is committed and the exception propagates (aborting costs a sync; see
-    // tickertape_writer_append_with).
+    // tickertape_writer_append_with). If the writer's clean-up after that abort fails, this throws the library's
+    // Error instead (TICKERTAPE_E_IO: the writer refuses further appends), with the fill's exception nested inside
+    // it (std::rethrow_if_nested).
     //
     // `fill` must not call this Writer, and must not destroy, move from or move-assign it: closing the handle from
     // inside its own callback is refused with TICKERTAPE_E_BUSY, which the destructor cannot report, so the old
@@ -139,7 +141,17 @@ public:
         tickertape_status status = tickertape_writer_append_with(
             p_.get(), schema_id, venue_ts_ns, local_ts_ns, len,
             &trampoline<typename std::remove_reference<Fill>::type>, &ctx, &seq);
-        if (ctx.error) std::rethrow_exception(ctx.error);
+        if (ctx.error) {
+            if (status == TICKERTAPE_E_ABORTED || status >= 0) std::rethrow_exception(ctx.error);
+            // The clean-up failed: report the library error, which says the writer has stopped, with the fill's
+            // exception as its cause.
+            const Error library(status, tickertape_last_error_message());
+            try {
+                std::rethrow_exception(ctx.error);
+            } catch (...) {
+                std::throw_with_nested(library);
+            }
+        }
         check(status);
         return seq;
     }

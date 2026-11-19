@@ -64,8 +64,9 @@ fn new_record_layout_is_frozen() {
 /// the append. The callback must not keep `buf` after it returns, and must not call any function on the writer that
 /// invoked it (that returns `TICKERTAPE_E_BUSY`; closing it from here is refused the same way).
 ///
-/// The callback must return normally. A C++ exception that escapes it terminates the process (the library cannot
-/// catch foreign exceptions and aborts): catch every exception inside and return non-zero instead. Leaving it with
+/// The callback must return normally: catch every exception inside it and return non-zero instead. An exception
+/// that escapes it is unsupported: Rust leaves it unspecified whether such a foreign exception terminates the process
+/// (it did on the platforms tested) or is caught as an opaque error, with the exception lost. Leaving it with
 /// `longjmp` is undefined behaviour.
 #[allow(non_camel_case_types)]
 pub type tickertape_fill_fn =
@@ -184,8 +185,9 @@ pub unsafe extern "C" fn tickertape_writer_close(
 ///
 /// Errors: `TICKERTAPE_E_INVALID_ARGUMENT` (`payload` NULL with `payload_len` > 0, or `seq_out` overlapping the
 /// payload); `TICKERTAPE_E_RECORD_TOO_LARGE`; `TICKERTAPE_E_SEQUENCE_EXHAUSTED`; `TICKERTAPE_E_STORAGE_FULL` or
-/// `TICKERTAPE_E_IO` if a roll fails (the journal is unchanged and the call can be retried), or after a failed
-/// clean-up of an aborted fill (see `tickertape_writer_append_with`).
+/// `TICKERTAPE_E_IO` if a roll fails (the journal is unchanged and the call can be retried); `TICKERTAPE_E_IO`, whatever
+/// the OS error, for every append after a failed clean-up of an aborted fill (see `tickertape_writer_append_with`;
+/// retrying does not help).
 ///
 /// # Safety
 ///
@@ -234,11 +236,17 @@ pub unsafe extern "C" fn tickertape_writer_append(
 ///
 /// If `fill` returns non-zero, nothing is committed and this returns `TICKERTAPE_E_ABORTED`: the writer zeroes the
 /// buffer and syncs that zeroing to storage before returning (`docs/format.md` → Abandoned writes), so aborting is
-/// slow; use it only for exceptional cases. If that sync fails, this call returns `TICKERTAPE_E_IO` (or
-/// `TICKERTAPE_E_STORAGE_FULL`) with the OS error and a message saying the clean-up failed, instead of
-/// `TICKERTAPE_E_ABORTED`. The writer then refuses further appends (the same code and OS error, with a message
-/// that says why) and checkpoints (`TICKERTAPE_E_DURABILITY_LOST`): close it and reopen the journal, whose recovery
-/// cleans up.
+/// slow; use it only for exceptional cases.
+///
+/// If that sync fails, this call returns `TICKERTAPE_E_IO` instead of `TICKERTAPE_E_ABORTED`, with the OS error in
+/// `tickertape_last_error_os_code` and a message saying the clean-up failed. The code is `TICKERTAPE_E_IO` even when
+/// the OS error is `ENOSPC` or `EDQUOT`, because freeing space does not help. Treat it as a storage incident, like a
+/// failed checkpoint: the writer refuses every further append (`TICKERTAPE_E_IO`, the same OS error, a message that
+/// says why) and checkpoint (`TICKERTAPE_E_DURABILITY_LOST`), and the durability of everything appended since the
+/// last successful checkpoint is unknown. Closing the writer and reopening the journal gives a writer that accepts
+/// appends again, but no guarantee about that tail across a power loss: the zeroing may have reached only the page
+/// cache, and recovery cannot tell whether the disk still holds the stale bytes (`docs/crash-contract.md` → Errors
+/// are sticky).
 ///
 /// Errors: as for `tickertape_writer_append`, plus `TICKERTAPE_E_ABORTED`, and `TICKERTAPE_E_INVALID_ARGUMENT` if
 /// `fill` is NULL. `fill` is not called when the append fails before it.

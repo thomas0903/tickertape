@@ -30,7 +30,9 @@ pub enum tickertape_status_code {
     /// An operating-system call failed. `tickertape_last_error_os_code` returns its `errno`.
     TICKERTAPE_E_IO = -2,
     /// An operating-system call failed because the filesystem is full (`ENOSPC`, `EDQUOT`). An append that fails
-    /// this way leaves the journal consistent and can be retried once space is available.
+    /// this way leaves the journal consistent and can be retried once space is available. A failed clean-up of an
+    /// aborted fill, and every append the writer refuses after it, is `TICKERTAPE_E_IO` instead, whatever the OS
+    /// error: freeing space does not make that writer accept appends again.
     TICKERTAPE_E_STORAGE_FULL = -3,
     /// Another writer holds the journal's lock.
     TICKERTAPE_E_LOCKED = -4,
@@ -60,7 +62,7 @@ pub enum tickertape_status_code {
     /// A caller-provided buffer or array is too small. The function says what it reports about the size needed.
     TICKERTAPE_E_BUFFER_TOO_SMALL = -14,
     /// A fill callback returned non-zero; nothing was appended and the writer cleaned up. (If the clean-up fails, the
-    /// call returns `TICKERTAPE_E_IO` or `TICKERTAPE_E_STORAGE_FULL` instead; see `tickertape_writer_append_with`.)
+    /// call returns `TICKERTAPE_E_IO` instead; see `tickertape_writer_append_with`.)
     TICKERTAPE_E_ABORTED = -15,
     /// The handle is already inside a call on this thread, for example when a fill callback calls back into the
     /// writer that invoked it. Nothing was done.
@@ -209,11 +211,26 @@ pub(crate) fn corrupt_reason_of(reason: &CorruptReason) -> R {
     }
 }
 
+/// The `errno` behind an I/O error, or 0. Looks one level inside a wrapping error: the core wraps the OS error of a
+/// failed clean-up after an abandoned write (and of the appends refused after it) so that it never counts as
+/// storage-full, and `tickertape_last_error_os_code` still reports it.
+fn os_code_of(source: &std::io::Error) -> i32 {
+    source
+        .raw_os_error()
+        .or_else(|| {
+            source
+                .get_ref()
+                .and_then(|inner| inner.downcast_ref::<std::io::Error>())
+                .and_then(std::io::Error::raw_os_error)
+        })
+        .unwrap_or(0)
+}
+
 impl From<&Error> for FfiError {
     fn from(error: &Error) -> FfiError {
         let mut out = FfiError::new(status_of(error), error.to_string());
         match error {
-            Error::Io { source, .. } => out.os_code = source.raw_os_error().unwrap_or(0),
+            Error::Io { source, .. } => out.os_code = os_code_of(source),
             Error::Corrupt { reason, .. } => out.corrupt_reason = corrupt_reason_of(reason),
             _ => {}
         }

@@ -18,8 +18,11 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   C++11 RAII wrapper.
 - Library: `Writer::abandoned_write_error()` reports a failed clean-up after an abandoned write (a panicking
   `append_with` fill), which until now only showed as refused appends and checkpoints; those errors now carry the OS
-  error, and the `Error::DurabilityLost` message no longer blames a failed checkpoint in that case. The test-only
-  `fault-injection` feature gains `fault::Point::AbandonedWriteSync`.
+  error as the inner error of an `io::Error` of kind `Other`, so `Error::is_storage_full()` is false for them even
+  after `ENOSPC` (freeing space does not make the writer accept appends again), and the `Error::DurabilityLost`
+  message no longer blames a failed checkpoint in that case. A failed clean-up is a storage incident like a failed
+  checkpoint: reopening gives a usable writer but no durability guarantee for the records since the last successful
+  checkpoint. The test-only `fault-injection` feature gains `fault::Point::AbandonedWriteSync`.
 - Repository: `unsafe` code is now also allowed in `crates/tickertape-ffi`, as a scoped extension of the rule (ADR
   0028). The release tooling refuses workspace members that it does not release unless they have `publish = false`.
 - Benchmarks: the test of a lagging reader under retention no longer depends on machine speed (it failed on

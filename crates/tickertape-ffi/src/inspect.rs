@@ -218,7 +218,8 @@ pub unsafe extern "C" fn tickertape_verify(
 /// than the count, returns `TICKERTAPE_E_BUFFER_TOO_SMALL` with `*count_out` set and nothing written. The list can
 /// change between calls while a writer is active. Errors: `TICKERTAPE_E_NOT_FOUND` if there are no segments;
 /// `TICKERTAPE_E_CORRUPT` or `TICKERTAPE_E_UNSUPPORTED_VERSION` for an invalid header; `TICKERTAPE_E_IO`;
-/// `TICKERTAPE_E_INVALID_ARGUMENT` if `count_out` overlaps the `segments` array.
+/// `TICKERTAPE_E_INVALID_ARGUMENT` if `count_out` overlaps the `segments` array (nothing is written). Otherwise
+/// `*count_out` is set to 0 before any other check, and to the count once the segments are listed.
 ///
 /// # Safety
 ///
@@ -233,21 +234,25 @@ pub unsafe extern "C" fn tickertape_list_segments(
     count_out: *mut usize,
 ) -> tickertape_status {
     guard(|| {
-        // SAFETY: forwarded caller contract.
-        unsafe { args::write(count_out, 0, "count_out") }?;
+        if count_out.is_null() {
+            return Err(FfiError::null("count_out"));
+        }
+        // Overlaps first, before anything is written (a NULL pointer is an empty region).
+        args::disjoint(&[
+            Region::of(segments, capacity, "segments"),
+            Region::of(count_out, 1, "count_out"),
+        ])?;
+        // SAFETY: not NULL; the caller guarantees it is writable; it does not overlap `segments` (checked).
+        unsafe { count_out.write(0) };
         if segments.is_null() && capacity > 0 {
             return Err(FfiError::invalid(
                 "segments must not be NULL when capacity is not 0",
             ));
         }
-        args::disjoint(&[
-            Region::of(segments, capacity, "segments"),
-            Region::of(count_out, 1, "count_out"),
-        ])?;
         // SAFETY: forwarded caller contract.
         let dir = unsafe { args::path(dir, "dir") }?;
         let list = inspect::list_segments(dir)?;
-        // SAFETY: checked at the start that `count_out` is writable.
+        // SAFETY: checked at the start that `count_out` is writable and does not overlap `segments`.
         unsafe { count_out.write(list.len()) };
         if segments.is_null() {
             return Ok(S::TICKERTAPE_OK);

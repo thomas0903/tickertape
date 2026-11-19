@@ -253,6 +253,21 @@ static void test_misuse(const char *scratch) {
     CHECK_STATUS(tickertape_reader_read_batch(NULL, 0, &record, 1, NULL, 0, &count), TICKERTAPE_E_INVALID_ARGUMENT);
     CHECK(count == 0);
     CHECK_STATUS(tickertape_reader_close(NULL), TICKERTAPE_OK);
+    {
+        /* An overlap is rejected before anything is written: every slot keeps its non-zero sentinel. */
+        tickertape_record records[2], records_before[2];
+        tickertape_segment_info segments[2], segments_before[2];
+        memset(records, 0xA5, sizeof records);
+        memcpy(records_before, records, sizeof records);
+        CHECK_STATUS(tickertape_reader_read_batch(NULL, 0, records, 2, NULL, 0, &records[1].payload_len),
+                     TICKERTAPE_E_INVALID_ARGUMENT);
+        CHECK(memcmp(records, records_before, sizeof records) == 0);
+        memset(segments, 0xA5, sizeof segments);
+        memcpy(segments_before, segments, sizeof segments);
+        CHECK_STATUS(tickertape_list_segments(missing, segments, 2, (size_t *)&segments[1].segment_size),
+                     TICKERTAPE_E_INVALID_ARGUMENT);
+        CHECK(memcmp(segments, segments_before, sizeof segments) == 0);
+    }
 
     tickertape_writer_options_free(NULL);
     tickertape_reader_options_free(NULL);

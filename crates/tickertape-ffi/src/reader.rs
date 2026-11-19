@@ -459,9 +459,9 @@ pub unsafe extern "C" fn tickertape_reader_next_copy(
 /// persistent error (such as corruption) is returned again by the calls after that. No record handed out is ever
 /// lost to an error.
 ///
-/// `*count_out` is set to 0 first, also on errors and with `TICKERTAPE_NONE`. Returns
-/// `TICKERTAPE_E_INVALID_ARGUMENT` if any two of `records` (all `max_records` entries), `buf` and `count_out`
-/// overlap.
+/// If any two of `records` (all `max_records` entries), `buf` and `count_out` overlap, returns
+/// `TICKERTAPE_E_INVALID_ARGUMENT` and writes nothing. Otherwise `*count_out` is set to 0 first, also on other errors
+/// and with `TICKERTAPE_NONE`.
 ///
 /// # Safety
 ///
@@ -479,24 +479,29 @@ pub unsafe extern "C" fn tickertape_reader_read_batch(
     count_out: *mut usize,
 ) -> tickertape_status {
     guard(|| {
-        // SAFETY: forwarded caller contract.
-        unsafe { args::write(count_out, 0, "count_out") }?;
-        if records.is_null() {
-            return Err(FfiError::null("records"));
+        if count_out.is_null() {
+            return Err(FfiError::null("count_out"));
         }
-        if max_records == 0 {
-            return Err(FfiError::invalid("max_records must not be 0"));
-        }
-        if buf.is_null() && buf_len > 0 {
-            return Err(FfiError::invalid(
+        let checked = if records.is_null() {
+            Err(FfiError::null("records"))
+        } else if max_records == 0 {
+            Err(FfiError::invalid("max_records must not be 0"))
+        } else if buf.is_null() && buf_len > 0 {
+            Err(FfiError::invalid(
                 "buf must not be NULL when buf_len is not 0",
-            ));
-        }
+            ))
+        } else {
+            Ok(())
+        };
+        // Overlaps first, before anything is written (a NULL pointer is an empty region).
         args::disjoint(&[
             Region::of(records, max_records, "records"),
             Region::of(buf, buf_len, "buf"),
             Region::of(count_out, 1, "count_out"),
         ])?;
+        // SAFETY: not NULL; the caller guarantees it is writable; it overlaps neither `records` nor `buf` (checked).
+        unsafe { count_out.write(0) };
+        checked?;
         // SAFETY: forwarded caller contract.
         unsafe { handle(reader) }?.with(|state| {
             state.begin()?;

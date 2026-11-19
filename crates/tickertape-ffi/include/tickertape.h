@@ -97,7 +97,9 @@ enum tickertape_status_code
   TICKERTAPE_E_IO = -2,
   /**
    * An operating-system call failed because the filesystem is full (`ENOSPC`, `EDQUOT`). An append that fails
-   * this way leaves the journal consistent and can be retried once space is available.
+   * this way leaves the journal consistent and can be retried once space is available. A failed clean-up of an
+   * aborted fill, and every append the writer refuses after it, is `TICKERTAPE_E_IO` instead, whatever the OS
+   * error: freeing space does not make that writer accept appends again.
    */
   TICKERTAPE_E_STORAGE_FULL = -3,
   /**
@@ -151,7 +153,7 @@ enum tickertape_status_code
   TICKERTAPE_E_BUFFER_TOO_SMALL = -14,
   /**
    * A fill callback returned non-zero; nothing was appended and the writer cleaned up. (If the clean-up fails, the
-   * call returns `TICKERTAPE_E_IO` or `TICKERTAPE_E_STORAGE_FULL` instead; see `tickertape_writer_append_with`.)
+   * call returns `TICKERTAPE_E_IO` instead; see `tickertape_writer_append_with`.)
    */
   TICKERTAPE_E_ABORTED = -15,
   /**
@@ -538,8 +540,9 @@ typedef struct tickertape_record {
  * the append. The callback must not keep `buf` after it returns, and must not call any function on the writer that
  * invoked it (that returns `TICKERTAPE_E_BUSY`; closing it from here is refused the same way).
  *
- * The callback must return normally. A C++ exception that escapes it terminates the process (the library cannot
- * catch foreign exceptions and aborts): catch every exception inside and return non-zero instead. Leaving it with
+ * The callback must return normally: catch every exception inside it and return non-zero instead. An exception
+ * that escapes it is unsupported: Rust leaves it unspecified whether such a foreign exception terminates the process
+ * (it did on the platforms tested) or is caught as an opaque error, with the exception lost. Leaving it with
  * `longjmp` is undefined behaviour.
  */
 typedef int32_t (*tickertape_fill_fn)(void *user_data, uint8_t *buf, size_t len);
@@ -628,7 +631,8 @@ tickertape_status tickertape_verify(const char *dir, struct tickertape_verify_re
  * than the count, returns `TICKERTAPE_E_BUFFER_TOO_SMALL` with `*count_out` set and nothing written. The list can
  * change between calls while a writer is active. Errors: `TICKERTAPE_E_NOT_FOUND` if there are no segments;
  * `TICKERTAPE_E_CORRUPT` or `TICKERTAPE_E_UNSUPPORTED_VERSION` for an invalid header; `TICKERTAPE_E_IO`;
- * `TICKERTAPE_E_INVALID_ARGUMENT` if `count_out` overlaps the `segments` array.
+ * `TICKERTAPE_E_INVALID_ARGUMENT` if `count_out` overlaps the `segments` array (nothing is written). Otherwise
+ * `*count_out` is set to 0 before any other check, and to the count once the segments are listed.
  *
  * # Safety
  *
@@ -871,7 +875,7 @@ tickertape_status tickertape_retention_set_delete(struct tickertape_retention *r
  * # Safety
  *
  * `retention` must be NULL or live retention settings, not used by another thread during the call. `dir` must be
- * NULL or a NUL-terminated string.
+ * NULL or a NUL-terminated string that stays unmodified until the call returns.
  */
 tickertape_status tickertape_retention_set_move_to(struct tickertape_retention *retention, const char *dir);
 
@@ -1027,9 +1031,9 @@ tickertape_status tickertape_reader_next_copy(struct tickertape_reader *reader,
  * persistent error (such as corruption) is returned again by the calls after that. No record handed out is ever
  * lost to an error.
  *
- * `*count_out` is set to 0 first, also on errors and with `TICKERTAPE_NONE`. Returns
- * `TICKERTAPE_E_INVALID_ARGUMENT` if any two of `records` (all `max_records` entries), `buf` and `count_out`
- * overlap.
+ * If any two of `records` (all `max_records` entries), `buf` and `count_out` overlap, returns
+ * `TICKERTAPE_E_INVALID_ARGUMENT` and writes nothing. Otherwise `*count_out` is set to 0 first, also on other errors
+ * and with `TICKERTAPE_NONE`.
  *
  * # Safety
  *
@@ -1149,8 +1153,9 @@ tickertape_status tickertape_writer_close(struct tickertape_writer *writer);
  *
  * Errors: `TICKERTAPE_E_INVALID_ARGUMENT` (`payload` NULL with `payload_len` > 0, or `seq_out` overlapping the
  * payload); `TICKERTAPE_E_RECORD_TOO_LARGE`; `TICKERTAPE_E_SEQUENCE_EXHAUSTED`; `TICKERTAPE_E_STORAGE_FULL` or
- * `TICKERTAPE_E_IO` if a roll fails (the journal is unchanged and the call can be retried), or after a failed
- * clean-up of an aborted fill (see `tickertape_writer_append_with`).
+ * `TICKERTAPE_E_IO` if a roll fails (the journal is unchanged and the call can be retried); `TICKERTAPE_E_IO`, whatever
+ * the OS error, for every append after a failed clean-up of an aborted fill (see `tickertape_writer_append_with`;
+ * retrying does not help).
  *
  * # Safety
  *
@@ -1177,11 +1182,17 @@ tickertape_status tickertape_writer_append(struct tickertape_writer *writer,
  *
  * If `fill` returns non-zero, nothing is committed and this returns `TICKERTAPE_E_ABORTED`: the writer zeroes the
  * buffer and syncs that zeroing to storage before returning (`docs/format.md` → Abandoned writes), so aborting is
- * slow; use it only for exceptional cases. If that sync fails, this call returns `TICKERTAPE_E_IO` (or
- * `TICKERTAPE_E_STORAGE_FULL`) with the OS error and a message saying the clean-up failed, instead of
- * `TICKERTAPE_E_ABORTED`. The writer then refuses further appends (the same code and OS error, with a message
- * that says why) and checkpoints (`TICKERTAPE_E_DURABILITY_LOST`): close it and reopen the journal, whose recovery
- * cleans up.
+ * slow; use it only for exceptional cases.
+ *
+ * If that sync fails, this call returns `TICKERTAPE_E_IO` instead of `TICKERTAPE_E_ABORTED`, with the OS error in
+ * `tickertape_last_error_os_code` and a message saying the clean-up failed. The code is `TICKERTAPE_E_IO` even when
+ * the OS error is `ENOSPC` or `EDQUOT`, because freeing space does not help. Treat it as a storage incident, like a
+ * failed checkpoint: the writer refuses every further append (`TICKERTAPE_E_IO`, the same OS error, a message that
+ * says why) and checkpoint (`TICKERTAPE_E_DURABILITY_LOST`), and the durability of everything appended since the
+ * last successful checkpoint is unknown. Closing the writer and reopening the journal gives a writer that accepts
+ * appends again, but no guarantee about that tail across a power loss: the zeroing may have reached only the page
+ * cache, and recovery cannot tell whether the disk still holds the stale bytes (`docs/crash-contract.md` → Errors
+ * are sticky).
  *
  * Errors: as for `tickertape_writer_append`, plus `TICKERTAPE_E_ABORTED`, and `TICKERTAPE_E_INVALID_ARGUMENT` if
  * `fill` is NULL. `fill` is not called when the append fails before it.

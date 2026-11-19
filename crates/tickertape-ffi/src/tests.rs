@@ -1559,22 +1559,28 @@ fn pure_append_batch_reports_the_failing_record() {
 
 #[test]
 fn overlapping_arguments_are_rejected() {
+    // Every slot a rejected call could write holds a non-zero sentinel, and each rejected call must leave all of them
+    // unchanged: an overlap returns TICKERTAPE_E_INVALID_ARGUMENT before anything is written.
+    const WORD: u64 = 0xA5A5_A5A5_A5A5_A5A5;
     let j = Journal::new();
     let writer = j.writer(65_536);
     let alpha = b"alpha";
     // append_batch: an output inside the records array (it would zero a length before validation).
     let mut records = [new_record(alpha), new_record(alpha)];
     let inside = (&raw mut records[0].payload_len).cast::<usize>();
-    let status =
-        unsafe { tickertape_writer_append_batch(writer, records.as_ptr(), 2, inside, null_mut()) };
+    let mut first_seq = WORD;
+    let status = unsafe {
+        tickertape_writer_append_batch(writer, records.as_ptr(), 2, inside, &raw mut first_seq)
+    };
     assert_eq!(status, INVALID);
     assert!(last_message().contains("overlap"), "{}", last_message());
     assert_eq!(records[0].payload_len, 5, "the input is untouched");
+    assert_eq!(first_seq, WORD);
     // An output inside a payload.
-    let mut words = [0u64; 4];
+    let mut words = [WORD; 4];
     records[1].payload = words.as_ptr().cast();
     records[1].payload_len = size_of_val(&words);
-    let mut appended = 0usize;
+    let mut appended = WORD as usize;
     let status = unsafe {
         tickertape_writer_append_batch(
             writer,
@@ -1585,9 +1591,10 @@ fn overlapping_arguments_are_rejected() {
         )
     };
     assert_eq!(status, INVALID);
+    assert_eq!((appended, words), (WORD as usize, [WORD; 4]));
     // The two outputs overlapping each other.
     records[1] = new_record(alpha);
-    let mut both = 0u64;
+    let mut both = WORD;
     let status = unsafe {
         tickertape_writer_append_batch(
             writer,
@@ -1598,8 +1605,9 @@ fn overlapping_arguments_are_rejected() {
         )
     };
     assert_eq!(status, INVALID);
+    assert_eq!(both, WORD);
     // append: seq_out inside the payload.
-    let mut payload_words = [7u64; 2];
+    let mut payload_words = [WORD; 2];
     let status = unsafe {
         tickertape_writer_append(
             writer,
@@ -1612,22 +1620,55 @@ fn overlapping_arguments_are_rejected() {
         )
     };
     assert_eq!(status, INVALID);
+    assert_eq!(payload_words, [WORD; 2]);
     assert_eq!(next_seq(writer), 0, "nothing was appended");
 
     for seq in 0..4 {
         append(writer, seq);
     }
     let reader = j.reader(false, false);
-    let mut storage = [empty_record(); 4];
+    let sentinel = tickertape_record {
+        seq: WORD,
+        venue_ts_ns: WORD,
+        local_ts_ns: WORD,
+        payload: std::ptr::without_provenance(WORD as usize),
+        payload_len: WORD as usize,
+        schema_id: WORD as u32,
+        reserved: WORD as u32,
+    };
+    let unchanged = |records: &[tickertape_record]| {
+        records.iter().all(|r| {
+            (
+                r.seq,
+                r.venue_ts_ns,
+                r.local_ts_ns,
+                r.payload.addr(),
+                r.payload_len,
+                r.schema_id,
+                r.reserved,
+            ) == (
+                WORD,
+                WORD,
+                WORD,
+                WORD as usize,
+                WORD as usize,
+                WORD as u32,
+                WORD as u32,
+            )
+        })
+    };
+    let mut storage = [sentinel; 4];
     let base = storage.as_mut_ptr();
     // next_copy: record_out inside the copy buffer.
     let status = unsafe {
         tickertape_reader_next_copy(reader, 0, base.cast(), size_of_val(&storage), base.add(1))
     };
     assert_eq!(status, INVALID);
-    // read_batch: records inside the buffer, count_out inside the buffer, count_out inside records.
-    let mut buf = [0u64; 64];
-    let mut count = 0usize;
+    assert!(unchanged(&storage));
+    // read_batch: records inside the buffer (count_out separate), count_out inside the buffer, count_out inside
+    // records.
+    let mut buf = [WORD; 64];
+    let mut count = WORD as usize;
     let status = unsafe {
         tickertape_reader_read_batch(
             reader,
@@ -1640,6 +1681,8 @@ fn overlapping_arguments_are_rejected() {
         )
     };
     assert_eq!(status, INVALID);
+    assert_eq!(count, WORD as usize, "count_out is not written");
+    assert_eq!(buf, [WORD; 64]);
     let status = unsafe {
         tickertape_reader_read_batch(
             reader,
@@ -1652,6 +1695,8 @@ fn overlapping_arguments_are_rejected() {
         )
     };
     assert_eq!(status, INVALID);
+    assert_eq!(buf, [WORD; 64], "count_out inside buf is not written");
+    assert!(unchanged(&storage));
     let status = unsafe {
         tickertape_reader_read_batch(
             reader,
@@ -1664,9 +1709,21 @@ fn overlapping_arguments_are_rejected() {
         )
     };
     assert_eq!(status, INVALID);
+    assert!(
+        unchanged(&storage),
+        "count_out inside records is not written"
+    );
+    assert_eq!(buf, [WORD; 64]);
     assert_eq!(position(reader), 0, "nothing was read");
     // list_segments: count_out inside the array.
-    let mut segments = [tickertape_segment_info::default(); 2];
+    let filled = tickertape_segment_info {
+        base_seq: WORD,
+        segment_size: WORD,
+        created_unix_ns: WORD,
+        format_version: WORD as u32,
+        reserved: WORD as u32,
+    };
+    let mut segments = [filled; 2];
     let status = unsafe {
         tickertape_list_segments(
             j.c_dir.as_ptr(),
@@ -1676,6 +1733,27 @@ fn overlapping_arguments_are_rejected() {
         )
     };
     assert_eq!(status, INVALID);
+    assert!(
+        segments.iter().all(|s| (
+            s.base_seq,
+            s.segment_size,
+            s.created_unix_ns,
+            s.format_version,
+            s.reserved
+        ) == (WORD, WORD, WORD, WORD as u32, WORD as u32)),
+        "{segments:?}"
+    );
+    // The other argument errors still set the counts to 0 (documented), once the overlap checks pass.
+    let mut count = WORD as usize;
+    let status = unsafe {
+        tickertape_reader_read_batch(reader, 0, base, 0, buf.as_mut_ptr().cast(), 8, &mut count)
+    };
+    assert_eq!(status, INVALID);
+    assert_eq!(count, 0);
+    let mut count = WORD as usize;
+    let status = unsafe { tickertape_list_segments(j.c_dir.as_ptr(), null_mut(), 2, &mut count) };
+    assert_eq!(status, INVALID);
+    assert_eq!(count, 0);
     assert_eq!(unsafe { tickertape_reader_close(reader) }, OK);
     assert_eq!(unsafe { tickertape_writer_close(writer) }, OK);
 }
@@ -2142,6 +2220,49 @@ fn pure_append_batch_counts_each_commit_even_if_a_later_append_panics() {
 }
 
 #[test]
+fn pure_struct_size_fills_only_what_a_smaller_caller_has() {
+    // A later version of an extensible struct (40 bytes) whose minimum size, its size in the first stable release,
+    // is 24 bytes: a caller compiled against that release passes `struct_size` = 24.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Grown {
+        struct_size: u64,
+        a: u64,
+        b: u64,
+        added_later: u64,
+        added_even_later: u64,
+    }
+    const MIN: usize = 24;
+    const GUARD: u64 = 0xEEEE_EEEE_EEEE_EEEE;
+    let value = Grown {
+        struct_size: 0,
+        a: 1,
+        b: 2,
+        added_later: 3,
+        added_even_later: 4,
+    };
+    // The caller's struct at the minimum size, followed by guard words in the same (aligned) allocation.
+    let mut buffer = [GUARD; 8];
+    buffer[0] = MIN as u64;
+    let ptr = buffer.as_mut_ptr().cast::<Grown>();
+    let filled = unsafe { crate::args::struct_size(ptr, MIN, "report") }.unwrap();
+    assert_eq!(filled, MIN, "only the caller's bytes are filled");
+    unsafe { crate::args::write_struct(ptr, value, filled) };
+    assert_eq!(
+        buffer[..3],
+        [MIN as u64, 1, 2],
+        "struct_size comes back as the minimum"
+    );
+    assert!(buffer[3..].iter().all(|&word| word == GUARD), "{buffer:x?}");
+    // An allocation of exactly the minimum size: under Miri, any write past it is reported as undefined behaviour.
+    let mut tight = Box::new([MIN as u64, GUARD, GUARD]);
+    let ptr = tight.as_mut_ptr().cast::<Grown>();
+    let filled = unsafe { crate::args::struct_size(ptr, MIN, "report") }.unwrap();
+    unsafe { crate::args::write_struct(ptr, value, filled) };
+    assert_eq!(*tight, [MIN as u64, 1, 2]);
+}
+
+#[test]
 fn pure_with_ref_keeps_pointers_from_earlier_calls_valid() {
     // State stored inline, as a reader's buffer could be one day: a pointer handed out by one call must survive a
     // read-only call (as a record view survives `tickertape_reader_position`). Under Miri, creating a `&mut` to the
@@ -2159,6 +2280,19 @@ fn pure_with_ref_keeps_pointers_from_earlier_calls_valid() {
 #[cfg(feature = "fault-injection")]
 #[test]
 fn failed_cleanup_after_an_aborted_fill_is_reported() {
+    failed_cleanup_is_reported(5 /* EIO */);
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn failed_cleanup_on_a_full_volume_is_io_not_storage_full() {
+    // `fsync` can fail with ENOSPC on a full APFS volume (docs/crash-contract.md). `TICKERTAPE_E_STORAGE_FULL` means
+    // "retry once space is available", which never helps here: the writer refuses appends until it is reopened.
+    failed_cleanup_is_reported(28 /* ENOSPC */);
+}
+
+#[cfg(feature = "fault-injection")]
+fn failed_cleanup_is_reported(errno: i32) {
     use tickertape::fault::{self, Point};
     let j = Journal::new();
     let writer = j.writer(65_536);
@@ -2169,7 +2303,7 @@ fn failed_cleanup_after_an_aborted_fill_is_reported() {
         reentrant_status: OK,
         calls: 0,
     };
-    fault::fail_next(Point::AbandonedWriteSync, 5 /* EIO */);
+    fault::fail_next(Point::AbandonedWriteSync, errno);
     let status = unsafe {
         tickertape_writer_append_with(
             writer,
@@ -2183,21 +2317,24 @@ fn failed_cleanup_after_an_aborted_fill_is_reported() {
         )
     };
     assert_eq!(status, code(S::TICKERTAPE_E_IO), "not a clean abort");
-    assert_eq!(tickertape_last_error_os_code(), 5);
+    assert_eq!(tickertape_last_error_os_code(), errno);
     let message = last_message();
     assert!(
         message.contains("fill callback") && message.contains("zeroing"),
         "{message}"
     );
     // Later appends are refused with the same OS error, and say why.
-    let status = unsafe { tickertape_writer_append(writer, 1, 0, 0, null(), 0, null_mut()) };
-    assert_eq!(status, code(S::TICKERTAPE_E_IO));
-    assert_eq!(tickertape_last_error_os_code(), 5);
-    assert!(
-        last_message().contains("abandoned write"),
-        "{}",
-        last_message()
-    );
+    for _ in 0..3 {
+        let status = unsafe { tickertape_writer_append(writer, 1, 0, 0, null(), 0, null_mut()) };
+        assert_eq!(status, code(S::TICKERTAPE_E_IO));
+        assert_eq!(tickertape_last_error_code(), code(S::TICKERTAPE_E_IO));
+        assert_eq!(tickertape_last_error_os_code(), errno);
+        assert!(
+            last_message().contains("abandoned write"),
+            "{}",
+            last_message()
+        );
+    }
     let mut appended = 0;
     let empty = new_record(b"");
     assert_eq!(
@@ -2205,6 +2342,7 @@ fn failed_cleanup_after_an_aborted_fill_is_reported() {
         code(S::TICKERTAPE_E_IO)
     );
     assert_eq!(appended, 0);
+    assert_eq!(tickertape_last_error_os_code(), errno);
     // The checkpoint blames the clean-up, not an earlier checkpoint.
     assert_eq!(
         unsafe { tickertape_writer_checkpoint(writer) },

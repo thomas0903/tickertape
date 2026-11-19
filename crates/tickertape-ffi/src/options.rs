@@ -450,7 +450,7 @@ pub unsafe extern "C" fn tickertape_retention_set_delete(
 /// # Safety
 ///
 /// `retention` must be NULL or live retention settings, not used by another thread during the call. `dir` must be
-/// NULL or a NUL-terminated string.
+/// NULL or a NUL-terminated string that stays unmodified until the call returns.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tickertape_retention_set_move_to(
     retention: *mut tickertape_retention,
@@ -459,7 +459,7 @@ pub unsafe extern "C" fn tickertape_retention_set_move_to(
     guard(|| {
         // SAFETY: forwarded caller contract.
         let r = unsafe { object(retention, "retention") }?;
-        // SAFETY: the caller guarantees `dir` is NULL or NUL-terminated.
+        // SAFETY: the caller guarantees `dir` is NULL or NUL-terminated, and unmodified during the call.
         let dir = unsafe { args::path(dir, "dir") }?;
         r.action = Some(Action::MoveTo(dir.to_path_buf()));
         Ok(S::TICKERTAPE_OK)

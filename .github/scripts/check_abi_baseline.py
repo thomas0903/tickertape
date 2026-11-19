@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Checks that the C header keeps every frozen declaration of the ABI baseline (ADR 0028 -> Versioning).
 
-The baseline (crates/tickertape-ffi/abi/tickertape-baseline.h) is the header of the first stable release; before 1.0
-it declares nothing. Every declaration in it must still be in the current header, unchanged:
+The baseline (crates/tickertape-ffi/abi/tickertape-baseline.h) is the header of the latest stable release: the release
+checklist replaces it with the header as shipped at 1.0 and at every later stable release, so that a declaration added
+in 1.1 is frozen from 1.1 on (a baseline kept at 1.0 would let 1.2 remove it). Before 1.0 it declares nothing. Every
+declaration in it must still be in the current header, unchanged:
 
 - functions, typedefs and opaque types: the same declaration;
 - constants (#define): the same value, except the library version macros, which change with every release;

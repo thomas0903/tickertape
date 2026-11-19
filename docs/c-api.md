@@ -169,12 +169,15 @@ tickertape_writer_options_free(options);
   inside the mapped segment (NULL for an empty payload); you write the payload and return 0. Returning non-zero
   aborts the append (`TICKERTAPE_E_ABORTED`): nothing is committed, but the writer zeroes the buffer and syncs that to
   storage first (the format requires it), so aborting is slow. If that sync fails, the call returns
-  `TICKERTAPE_E_IO` (or `TICKERTAPE_E_STORAGE_FULL`) with the OS error instead, and the writer refuses further
-  appends and checkpoints until the journal is reopened. The callback runs on the calling thread, must not keep the
-  buffer, and must not call into the same writer (that, including closing it, returns `TICKERTAPE_E_BUSY`). It must
-  return normally: a C++ exception that escapes it terminates the process, and `longjmp` out of it is undefined
-  behaviour. In C++ catch every exception inside the callback (the wrapper's `append_with` does this and rethrows
-  after the call).
+  `TICKERTAPE_E_IO` with the OS error instead (even for `ENOSPC`), and the writer refuses further appends and
+  checkpoints: a storage incident, see [A failed clean-up](#a-failed-clean-up-after-an-aborted-fill). The callback
+  runs on the calling thread, must not keep the buffer, and must not call into the same writer (that, including
+  closing it, returns `TICKERTAPE_E_BUSY`). It must return normally. An exception that escapes it is unsupported:
+  Rust leaves it unspecified whether a foreign exception reaching its unwinding machinery terminates the process (it
+  did on the platforms tested) or is caught as an opaque error (the call would then fail with the exception lost),
+  so do not rely on either. `longjmp` out of the callback is undefined behaviour. In C++ catch every exception inside
+  the callback and return non-zero (the wrapper's `append_with` does this and rethrows after the call; if the
+  clean-up failed, it throws the library error instead, with your exception nested inside it).
 - `tickertape_writer_append_batch` appends an array of `tickertape_new_record`s in order. It checks every element
   first, so an argument error appends nothing (the message names the element's index). It then stops at the first
   failure and returns that error, with `*appended_out` records already appended (sequence numbers `*first_seq_out`
@@ -249,7 +252,9 @@ The C ABI uses the crash contract's two levels ([`crash-contract.md`](crash-cont
 | **Durable** | a later `tickertape_writer_checkpoint` returns `TICKERTAPE_OK` | The record is on stable storage, under the crash contract's storage assumptions |
 
 Closing a writer does not checkpoint. A failed checkpoint poisons the writer: later checkpoints return
-`TICKERTAPE_E_DURABILITY_LOST` while appends keep working; treat it as an incident.
+`TICKERTAPE_E_DURABILITY_LOST` while appends keep working; treat it as an incident. A failed clean-up of an aborted
+fill is the same kind of incident, and also stops appends (see
+[A failed clean-up](#a-failed-clean-up-after-an-aborted-fill)).
 
 Readers return visible records by default. A reader whose options have
 `tickertape_reader_options_set_durable_only(options, 1)` returns only durable records: those below the checkpoint
@@ -257,8 +262,8 @@ marker's `next_seq` (crash contract C13). It treats records after that as not wr
 keeps waiting) and returns nothing if there is no valid checkpoint marker. It never returns a record that a power
 loss can remove **under the crash contract's conditions**: the filesystem and drive honour the sync calls (no lying
 write caches); a block made durable is not damaged by an interrupted later write to the same block; and no
-checkpoint has failed earlier in the same boot (a failed sync can drop data that a later successful checkpoint, even
-by a new writer, does not detect). See
+checkpoint, and no clean-up of an aborted fill, has failed earlier in the same boot (a failed sync can drop data that
+a later successful checkpoint, even by a new writer, does not detect). See
 [`crash-contract.md`](crash-contract.md) → Storage assumptions for durability, and → Errors are sticky.
 
 ## Errors
@@ -269,7 +274,7 @@ Each failing call records, for the calling thread only, what went wrong:
 |---|---|
 | `tickertape_last_error_code()` | The status code (`TICKERTAPE_OK` if no call on this thread has failed) |
 | `tickertape_last_error_message()` | A description with the file and operation involved |
-| `tickertape_last_error_os_code()` | `errno` for `TICKERTAPE_E_IO` and `TICKERTAPE_E_STORAGE_FULL`, else 0 |
+| `tickertape_last_error_os_code()` | `errno` for `TICKERTAPE_E_IO` and `TICKERTAPE_E_STORAGE_FULL`, else 0 (also `ENOSPC` for an append refused after a failed clean-up, which is `TICKERTAPE_E_IO`) |
 | `tickertape_last_error_corrupt_reason()` | A `TICKERTAPE_CORRUPT_*` reason for `TICKERTAPE_E_CORRUPT`, else 0 |
 
 They behave like `errno`: successful calls leave them unchanged, so read them right after the call that failed.
@@ -288,7 +293,7 @@ sequence on a platform thread, or through such a C shim.
 |---|---|
 | `TICKERTAPE_E_INVALID_ARGUMENT` | NULL required pointer, value out of range, non-zero reserved field |
 | `TICKERTAPE_E_IO` | A system call failed (see `tickertape_last_error_os_code`) |
-| `TICKERTAPE_E_STORAGE_FULL` | A system call failed with `ENOSPC` or `EDQUOT`; a failed append can be retried later |
+| `TICKERTAPE_E_STORAGE_FULL` | A system call failed with `ENOSPC` or `EDQUOT`; a failed append can be retried later (never used for an append refused after a failed clean-up) |
 | `TICKERTAPE_E_LOCKED` | Another writer has the journal open |
 | `TICKERTAPE_E_CORRUPT` | Journal bytes failed validation; a reader's cursor does not move |
 | `TICKERTAPE_E_UNSUPPORTED_VERSION` | A segment has an unsupported format version |
@@ -305,6 +310,25 @@ sequence on a platform thread, or through such a C shim.
 | `TICKERTAPE_E_PANIC` | An internal error (a bug in tickertape) was caught; the handle is broken, close it |
 | `TICKERTAPE_E_UNKNOWN` (-255) | An error this ABI version has no code for |
 
+### A failed clean-up after an aborted fill
+
+When a fill callback aborts, the writer zeroes the abandoned bytes and syncs the zeroing. If that sync fails, the
+aborting `tickertape_writer_append_with` returns `TICKERTAPE_E_IO` instead of `TICKERTAPE_E_ABORTED`, with the OS
+error in `tickertape_last_error_os_code()` and a message saying the clean-up failed. The code is `TICKERTAPE_E_IO`
+even when the OS error is `ENOSPC` or `EDQUOT`: `TICKERTAPE_E_STORAGE_FULL` would invite a retry once space is
+available, and that never helps here.
+
+Treat it as a storage incident, in the same way as a failed checkpoint ([`crash-contract.md`](crash-contract.md) →
+Errors are sticky):
+
+- The writer refuses every later append (`TICKERTAPE_E_IO` with the same OS error and a message naming the cause)
+  and every checkpoint (`TICKERTAPE_E_DURABILITY_LOST`, whose message names the aborted fill).
+- The durability of everything appended since the last successful checkpoint is unknown.
+- Closing the writer and reopening the journal gives a writer that accepts appends again, but **no guarantee about
+  that tail across a power loss**, even if the new writer's checkpoints succeed. After a write-back failure the page
+  cache can hold the zeroed bytes as clean pages while the disk still holds the stale ones; recovery then reads zeros
+  and has no reason to rewrite them, so reopening does not establish that the clean-up reached the disk.
+
 Later versions may add codes; treat any unknown negative value as an error. No Rust panic ever unwinds into C: every
 function catches panics and returns `TICKERTAPE_E_PANIC` (the library must be built with Rust's default
 `panic = "unwind"`, which the crate enforces). The Rust panic message is also printed to standard error.
@@ -320,10 +344,13 @@ function catches panics and returns `TICKERTAPE_E_PANIC` (the library must be bu
   functions) can be called from any thread.
 - With the default options, a writer starts a background helper thread (prefaulting, and on macOS preparing the next
   segment); `tickertape_writer_options_set_prefault(options, 0)` gives a writer that starts no threads.
-- **`fork()`:** do not use or close handles created before a fork in the child; the child should open its own
-  handles or call `exec`. Two processes appending through one writer would corrupt the journal, and a writer's
-  helper threads do not exist in the child. The library opens files with close-on-exec, so `exec` releases an
-  inherited writer lock, but a child that neither execs nor exits keeps the journal locked.
+- **`fork()`:** do not use or close handles created before a fork in the child. Two processes appending through one
+  writer would corrupt the journal, and a writer's helper threads do not exist in the child. A child of a
+  multithreaded process (as a process with a writer usually is, through its helper thread) may call only
+  async-signal-safe functions until it calls `exec`, and opening a handle allocates memory: so a child opens its own
+  handles only after `exec`, and a child that does not `exec` must not call any tickertape function. The library
+  opens files with close-on-exec, so `exec` releases an inherited writer lock, but a child that neither execs nor
+  exits keeps the journal locked.
 
 ## Inspection and retention
 

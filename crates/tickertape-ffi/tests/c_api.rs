@@ -14,7 +14,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use tickertape::{NewRecord, Reader, ReaderConfig, Writer, WriterConfig};
@@ -169,6 +169,8 @@ fn static_libs() -> &'static [&'static str] {
 enum Link {
     Static,
     Shared,
+    /// No tickertape library: the program defines the C functions it uses itself (stubs).
+    None,
 }
 
 /// Compiles `sources` as language standard `std` (`c99`, `c++20`, ...) into the executable `out`.
@@ -198,16 +200,17 @@ fn compile(sources: &[PathBuf], std: &str, link: Link, extra_includes: &[PathBuf
         cmd.arg("-I").arg(include);
     }
     cmd.args(sources);
-    let libs = lib_dir();
     match link {
         Link::Static => {
-            cmd.arg(libs.join("libtickertape.a"));
+            cmd.arg(lib_dir().join("libtickertape.a"));
             cmd.args(static_libs());
         }
         Link::Shared => {
+            let libs = lib_dir();
             cmd.arg("-L").arg(libs).arg("-ltickertape");
             cmd.arg(format!("-Wl,-rpath,{}", libs.display()));
         }
+        Link::None => {}
     }
     cmd.arg("-o").arg(out);
     let output = cmd.output().expect("run the C compiler");
@@ -221,33 +224,61 @@ fn compile(sources: &[PathBuf], std: &str, link: Link, extra_includes: &[PathBuf
 
 /// The compiled programs, built once per test process.
 struct Programs {
-    _dir: tempfile::TempDir,
     /// `tests/c/test_api.c` as C99 (linked statically) and as C11 (linked dynamically).
     c_test: PathBuf,
     c11_test: PathBuf,
     /// `tests/cpp/test_wrapper.cpp` as C++11 and C++20.
     cpp_test: PathBuf,
     cpp20_test: PathBuf,
+    /// `tests/cpp/test_wrapper_stub.cpp` as C++11, with stubbed C functions instead of the library.
+    cpp_stub_test: PathBuf,
     writer: PathBuf,
     reader: PathBuf,
     example: PathBuf,
 }
 
+/// Owns the temporary directory with the compiled programs. A `static` is never dropped, so a `TempDir` kept in
+/// `Programs` would outlive the process and leave the programs behind (about 12 MB per run); `remove_programs`
+/// drops it when the process exits.
+static PROGRAMS_DIR: Mutex<Option<tempfile::TempDir>> = Mutex::new(None);
+
+extern "C" fn remove_programs() {
+    // `try_lock`: never block process exit. A poisoned lock still holds the directory.
+    let dir = match PROGRAMS_DIR.try_lock() {
+        Ok(mut dir) => dir.take(),
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner().take(),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    };
+    drop(dir);
+}
+
+unsafe extern "C" {
+    /// C's `atexit`: runs `callback` when the process exits normally (the test harness returns from `main` or
+    /// calls `exit`).
+    fn atexit(callback: extern "C" fn()) -> std::ffi::c_int;
+}
+
 fn programs() -> &'static Programs {
     static PROGRAMS: OnceLock<Programs> = OnceLock::new();
     PROGRAMS.get_or_init(|| {
-        let dir = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        *PROGRAMS_DIR.lock().unwrap() = Some(tmp);
+        // SAFETY: `remove_programs` is an `extern "C" fn()` that never unwinds (it only drops a `TempDir`, whose
+        // destructor ignores errors) and stays valid for the life of the process.
+        let registered = unsafe { atexit(remove_programs) };
+        assert_eq!(registered, 0, "atexit failed");
         let tests = manifest_dir().join("tests");
         let examples = repo_root().join("examples/c");
         let p = Programs {
-            c_test: dir.path().join("test_api"),
-            c11_test: dir.path().join("test_api_c11"),
-            cpp_test: dir.path().join("test_wrapper"),
-            cpp20_test: dir.path().join("test_wrapper_cpp20"),
-            writer: dir.path().join("writer"),
-            reader: dir.path().join("reader"),
-            example: dir.path().join("example"),
-            _dir: dir,
+            c_test: dir.join("test_api"),
+            c11_test: dir.join("test_api_c11"),
+            cpp_test: dir.join("test_wrapper"),
+            cpp20_test: dir.join("test_wrapper_cpp20"),
+            cpp_stub_test: dir.join("test_wrapper_stub"),
+            writer: dir.join("writer"),
+            reader: dir.join("reader"),
+            example: dir.join("example"),
         };
         let c_test = [tests.join("c/test_api.c")];
         let cpp_test = [tests.join("cpp/test_wrapper.cpp")];
@@ -256,6 +287,13 @@ fn programs() -> &'static Programs {
         compile(&c_test, "c11", Link::Shared, &[], &p.c11_test);
         compile(&cpp_test, "c++11", Link::Shared, wrapper, &p.cpp_test);
         compile(&cpp_test, "c++20", Link::Static, wrapper, &p.cpp20_test);
+        compile(
+            &[tests.join("cpp/test_wrapper_stub.cpp")],
+            "c++11",
+            Link::None,
+            wrapper,
+            &p.cpp_stub_test,
+        );
         compile(
             &[examples.join("writer.c")],
             "c99",
@@ -490,8 +528,17 @@ fn cpp_wrapper() {
     }
 }
 
-/// The header promises that a C++ exception escaping a fill callback terminates the process (it must never unwind
-/// through the library into the caller).
+/// The wrapper's `append_with` when the fill throws: a clean abort rethrows the fill's exception; a failed clean-up
+/// throws the library error with the fill's exception nested (stubbed C functions produce the failure).
+#[test]
+fn cpp_wrapper_reports_a_failed_cleanup_after_a_throwing_fill() {
+    run_ok(&mut command(&programs().cpp_stub_test));
+}
+
+/// Documents one platform's outcome, not a promise: an exception escaping a fill callback is unsupported, and Rust
+/// leaves it unspecified whether a foreign exception reaching `catch_unwind` aborts the process or is caught as an
+/// opaque error. On the platforms CI runs (Linux and macOS with the system C++ runtime) the process aborts; if a
+/// toolchain update changes that, update the docs' description of the observed behaviour, not the contract.
 #[test]
 fn cpp_exception_escaping_a_fill_callback_aborts() {
     use std::os::unix::process::ExitStatusExt;
