@@ -56,7 +56,7 @@ pub fn list_segments(dir: impl AsRef<Path>) -> Result<Vec<SegmentInfo>> {
 /// keep disappearing, and on the last one a missing file is reported as an I/O error.
 const LISTING_ATTEMPTS: u32 = 8;
 /// [`verify`] scans a segment that ends in a state a live writer passes through again after this pause, then after
-/// pauses twice as long as the one before, up to [`TRANSIENT_LAST_PAUSE`].
+/// pauses twice as long as the one before, up to [`TRANSIENT_LAST_PAUSE`] (one budget per segment: [`Rescans`]).
 const TRANSIENT_FIRST_PAUSE: Duration = Duration::from_millis(10);
 /// The longest of those pauses (10 + 20 + ... + 320 ms: 630 ms in all).
 const TRANSIENT_LAST_PAUSE: Duration = Duration::from_millis(320);
@@ -195,17 +195,30 @@ pub struct Problem {
 ///
 /// Uncommitted bytes after the end of the newest segment (left by a crashed writer, cleaned up by the next one) are
 /// not a problem. Anything that a reader would reject is, and so are states that only a crash leaves behind and the
-/// next writer repairs (a sealed newest segment without a successor, or an unsealed segment that has one).
+/// next writer repairs (a sealed newest segment without a successor, or an unsealed segment that has one), and
+/// evidence of committed records after an empty commit word ([`CorruptReason::EmptyCommitWord`], or
+/// [`CorruptReason::UncheckedTail`] when the search stops at its work bound, reported at the empty word).
 ///
 /// Against a live journal, the report describes the segments listed when the scan started, as the scan found them.
 /// A writer appending or rolling during the scan is not a problem: a segment that ends in a state a writer passes
 /// through (a record being written at the end of the newest segment, or an unsealed segment whose successor already
 /// exists, because a rolling writer links the successor just before it seals) is scanned again, after pauses of
-/// 10 ms doubling up to 320 ms (630 ms in all), until it no longer is. So with a writer running, a problem in the
+/// 10 ms doubling up to 320 ms (630 ms in all), until it no longer is. Nor are records the writer commits while
+/// `verify` looks for committed history after an empty commit word at the end of the newest segment: if that word is
+/// no longer empty, `verify` follows the writer and continues the scan from it (at most 8 times, then it describes
+/// the segment as open where it got to), and an invalid record at the new end is scanned again with the pauses the
+/// first scan left of those 630 ms (one budget per segment, never started again). If the word is still empty,
+/// `verify` gives the writer 50 ms once (it may be filling a record whose payload holds frames) and reads the word
+/// again before it reports [`CorruptReason::EmptyCommitWord`] (ADR 0035). So with a writer running, a problem in the
 /// report is real unless the writer stayed in such a state for that long (descheduled or stopped between two
-/// steps); run `verify` again to tell. A problem that is really there is always reported, only later. With no writer
-/// running every reported problem is real, and a journal a crash left in such a state takes those 630 ms longer to
-/// verify.
+/// steps), or took longer than those 50 ms to fill a record whose payload holds valid frames with nearby sequence
+/// numbers; run `verify` again to tell. A problem that is really there is always reported, only later. With no
+/// writer running every reported problem is in the files (it need not be storage damage: a record torn by a crash
+/// whose payload holds such frames is reported the same way, crash contract C1; and the next open need not meet
+/// it, since `verify` visits every retained segment and scans records in each segment whose header passes
+/// validation, while a writer's recovery scans records from the checkpoint onward, or from the oldest retained
+/// segment when neither checkpoint slot decodes), and a journal a crash left in such a state, or with an empty commit word in front of committed records at the end
+/// of the newest segment, takes those 630 ms or 50 ms longer to verify.
 /// Retention is not a problem either: a segment it removes before the scan reaches it is not an error, and since
 /// retention removes the oldest segments first, the report then starts at the oldest segment the scan could still
 /// open, leaving out the removed history and what was found in it.
@@ -311,13 +324,50 @@ fn verify_once(dir: &Path, last: bool) -> Result<Option<VerifyReport>> {
             ScanEnd::Empty => !newest,
             _ => false,
         };
-        // A writer descheduled in such a state stays in it: look again with growing pauses before reporting it.
-        let mut pause = TRANSIENT_FIRST_PAUSE;
-        while transient(scan.end) && pause <= TRANSIENT_LAST_PAUSE {
-            std::thread::sleep(pause);
-            crate::fault::hook(crate::fault::Point::InspectRescan);
+        // A writer descheduled in such a state stays in it: look again with growing pauses before reporting it. The
+        // pauses are one budget per segment, shared with the scans that follow a live writer below: see `Rescans`.
+        let mut rescans = Rescans::new();
+        while transient(scan.end) && rescans.pause() {
             scan = journal::scan_open(&file, &path, base)?;
-            pause *= 2;
+        }
+        let mut later = later_history(&file, &path, &scan)?;
+        let (mut follows, mut waited) = (0, false);
+        while newest && later.is_some() {
+            let mut word = journal::commit_word_open(&file, &path, scan.end_offset)?;
+            if word == 0 && !waited {
+                // A live writer may still be filling the record at the empty word with a payload that holds frames
+                // (the accepted false positive, ADR 0035): give it 50 ms to commit, once. A budget of its own, not
+                // `rescans`: this wait is for a different state, and what the rescans used must not shorten it.
+                waited = true;
+                pause(EMPTY_WORD_WAIT);
+                word = journal::commit_word_open(&file, &path, scan.end_offset)?;
+            }
+            if word == 0 {
+                break;
+            }
+            // The journal grew while we searched: a live writer committed the record at the empty word P and
+            // appended after it, and those records were the evidence. The writer stores P's commit word before it
+            // writes anything after P's frame, and evidence there includes a commit word stored after P's (a
+            // record's or a seal's, each with release ordering), so evidence a live writer appended always comes
+            // with a non-zero word at P; real damage at P stays zero. Continue the scan from P instead of reporting.
+            if follows == MAX_FOLLOWS {
+                // The writer keeps appending faster than we can search: stop here and describe the segment as open
+                // at the last record reached, as for anything appended after `verify` returns. Not corruption.
+                later = None;
+                break;
+            }
+            follows += 1;
+            let mut more = journal::scan_open_from(&file, &path, scan.end_offset, scan.next_seq)?;
+            // The same race as for the first scan, at the new end: the writer was mid-append there. These rescans
+            // take their pauses from the same budget as the first scan's (whatever it left), never a new one.
+            while matches!(more.end, ScanEnd::Invalid(_)) && rescans.pause() {
+                more = journal::scan_open_from(&file, &path, scan.end_offset, scan.next_seq)?;
+            }
+            scan = format::ScanResult {
+                records: scan.records + more.records,
+                ..more
+            };
+            later = later_history(&file, &path, &scan)?;
         }
         seg.records = scan.records;
         seg.end_seq = scan.next_seq;
@@ -344,6 +394,13 @@ fn verify_once(dir: &Path, last: bool) -> Result<Option<VerifyReport>> {
                     }
                 }
             }
+            // Evidence of committed records after an empty commit word, or a search stopped at its work bound: usually
+            // storage damage (ADR 0035; crash contract C1 has the exception).
+            ScanEnd::Empty if later.is_some() => report.problems.push(Problem {
+                path: path.clone(),
+                offset: scan.end_offset,
+                reason: later.map_or(CorruptReason::EmptyCommitWord(0), |h| h.reason()),
+            }),
             ScanEnd::Empty if newest => seg.end = SegmentEnd::Open,
             ScanEnd::Empty => report.problems.push(Problem {
                 path: path.clone(),
@@ -372,9 +429,237 @@ fn verify_once(dir: &Path, last: bool) -> Result<Option<VerifyReport>> {
     Ok(Some(report))
 }
 
+/// The pause [`verify`] gives a live writer that may still be filling the record at an empty commit word with a
+/// payload that holds frames (ADR 0035), once per segment, before it reports that word.
+const EMPTY_WORD_WAIT: Duration = Duration::from_millis(50);
+
+/// How many times [`verify`] follows a live writer past the end of the newest segment (see the loop there) before it
+/// stops and reports the end it reached as open.
+const MAX_FOLLOWS: u32 = 8;
+
+/// The rescans [`verify`] may make of one segment that a scan found in a state a live writer passes through: after
+/// [`TRANSIENT_FIRST_PAUSE`], then after pauses twice as long as the one before, up to [`TRANSIENT_LAST_PAUSE`] (630 ms
+/// in all).
+///
+/// How the retries compose. A segment has one such budget, used in this order: first by the rescans of its first scan
+/// (an invalid record at the end of the newest segment, or an unsealed segment whose successor exists), then by the
+/// rescans of an invalid record at the new end that the scans following a live writer meet (ADR 0035; newest segment
+/// only). Those take the next pause the first scan left and never start the schedule again, keeping ADR 0035's rule
+/// that the first and the continued scans share one retry per segment (now this schedule instead of a single 50 ms
+/// retry): whichever position a writer is caught at, one that stays mid-append for 630 ms is stalled, and a budget per
+/// follow would let `verify` sleep [`MAX_FOLLOWS`] times as long. The wait at an empty commit word in the follow loop
+/// ([`EMPTY_WORD_WAIT`], once) is a budget of its own: it is for a different state (a record still being filled, not
+/// one caught mid-append), and rescans that used the whole budget must not take it away.
+///
+/// So one attempt of `verify` sleeps at most 630 ms for each segment it lists other than the newest, and 680 ms for the
+/// newest (630 ms of rescans and the 50 ms wait), however many rounds the follow loop makes; it makes at most
+/// [`LISTING_ATTEMPTS`] attempts, more than one only when segments disappear under it. With no writer running, only a
+/// journal a crash left in such a state, or damaged, pays these pauses.
+struct Rescans {
+    next: Duration,
+}
+
+impl Rescans {
+    fn new() -> Self {
+        Rescans {
+            next: TRANSIENT_FIRST_PAUSE,
+        }
+    }
+
+    /// Makes the next pause and returns `true`, or returns `false` without pausing once the budget is spent.
+    fn pause(&mut self) -> bool {
+        if self.next > TRANSIENT_LAST_PAUSE {
+            return false;
+        }
+        pause(self.next);
+        self.next *= 2;
+        true
+    }
+}
+
+/// Gives a live writer `duration` to finish what [`verify`] caught it in the middle of, before `verify` reads the
+/// segment again. Every pause in `verify` goes through here, with both hooks: the test-only `tests::WAIT_HOOK` before
+/// the pause and the fault-injection hook point [`crate::fault::Point::InspectRescan`] after it.
+fn pause(duration: Duration) {
+    #[cfg(test)]
+    tests::WAIT_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook();
+        }
+    });
+    std::thread::sleep(duration);
+    crate::fault::hook(crate::fault::Point::InspectRescan);
+}
+
+/// Committed history after the empty slot a scan of the open segment `file` ended at, if it ended at one
+/// ([`format::find_history_after_empty`]).
+fn later_history(
+    file: &File,
+    path: &Path,
+    scan: &format::ScanResult,
+) -> Result<Option<format::LaterHistory>> {
+    if scan.end != ScanEnd::Empty {
+        return Ok(None);
+    }
+    journal::history_after_empty_open(file, path, scan.end_offset, scan.next_seq)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+    use std::os::unix::fs::FileExt;
+
+    thread_local! {
+        /// Runs at each of [`pause`]'s pauses on this thread, standing in for a live writer.
+        pub(super) static WAIT_HOOK: RefCell<Option<Box<dyn FnMut()>>> = RefCell::new(None);
+    }
+
+    #[test]
+    fn follow_loop_retries_a_record_caught_mid_append() {
+        // Review round 2, item 5. A live writer: verify finds the empty commit word of record 10 with record 11
+        // after it, and while it waits the writer commits record 10 and is caught in the middle of record 12 (its
+        // commit word stored in this simulation, its body not yet valid). The scan that follows must give the
+        // writer a rescan from the budget the first scan left (all of it here), not report a bad checksum on a
+        // healthy journal.
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = crate::Writer::open(
+            dir.path(),
+            crate::WriterConfig::default().segment_size(format::SEGMENT_SIZE_UNIT),
+        )
+        .unwrap();
+        for i in 0..13_u8 {
+            w.append(&crate::NewRecord {
+                schema_id: 1,
+                venue_ts_ns: 0,
+                local_ts_ns: 0,
+                payload: &[i; 50],
+            })
+            .unwrap();
+        }
+        drop(w);
+        let (_, path) = journal::list_segments(dir.path()).unwrap().pop().unwrap();
+        let full = std::fs::read(&path).unwrap();
+        let mut offsets = vec![format::SEGMENT_HEADER_LEN as u64];
+        for seq in 0..13 {
+            let at = *offsets.last().unwrap();
+            let Ok(format::Slot::Record { next_offset, .. }) =
+                format::read_slot(&full[..], at, seq)
+            else {
+                panic!("record {seq}");
+            };
+            offsets.push(next_offset);
+        }
+        let (r10, r12, end) = (
+            offsets[10] as usize,
+            offsets[12] as usize,
+            offsets[13] as usize,
+        );
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.write_all_at(&[0; 4], r10 as u64).unwrap();
+        file.write_all_at(&vec![0; end - r12], r12 as u64).unwrap();
+        let mut stage = 0;
+        let (full_hook, path_hook) = (full.clone(), path.clone());
+        WAIT_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path_hook)
+                    .unwrap();
+                match stage {
+                    0 => {
+                        file.write_all_at(&full_hook[r10..r10 + 4], r10 as u64)
+                            .unwrap();
+                        file.write_all_at(&full_hook[r12..r12 + 4], r12 as u64)
+                            .unwrap();
+                    }
+                    _ => file.write_all_at(&full_hook[r12..end], r12 as u64).unwrap(),
+                }
+                stage += 1;
+            }));
+        });
+        let report = verify(dir.path()).unwrap();
+        WAIT_HOOK.with(|hook| hook.borrow_mut().take());
+        assert!(report.problems.is_empty(), "{:?}", report.problems);
+        assert_eq!(report.records, 13);
+        assert_eq!(std::fs::read(&path).unwrap(), full);
+    }
+
+    #[test]
+    fn follow_loop_rescans_share_the_first_scans_budget() {
+        // The merge of the rescans with growing pauses and ADR 0035's follow loop: one budget of rescans per
+        // segment, used first by the first scan and then by the scans that follow a live writer, and the 50 ms wait
+        // at an empty commit word on top of it. The first scan finds record 5 mid-append and spends the whole budget
+        // (six pauses) before the writer finishes it; it then finds the empty commit word of record 10 with record 11
+        // after it. During the 50 ms wait the writer commits record 10 and is caught in the middle of record 12. The
+        // scan that follows has no rescan left, so it reports record 12: the budget was not started again.
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = crate::Writer::open(
+            dir.path(),
+            crate::WriterConfig::default().segment_size(format::SEGMENT_SIZE_UNIT),
+        )
+        .unwrap();
+        for i in 0..13_u8 {
+            w.append(&crate::NewRecord {
+                schema_id: 1,
+                venue_ts_ns: 0,
+                local_ts_ns: 0,
+                payload: &[i; 50],
+            })
+            .unwrap();
+        }
+        drop(w);
+        let (_, path) = journal::list_segments(dir.path()).unwrap().pop().unwrap();
+        let full = std::fs::read(&path).unwrap();
+        let mut offsets = vec![format::SEGMENT_HEADER_LEN as u64];
+        for seq in 0..13 {
+            let at = *offsets.last().unwrap();
+            let Ok(format::Slot::Record { next_offset, .. }) =
+                format::read_slot(&full[..], at, seq)
+            else {
+                panic!("record {seq}");
+            };
+            offsets.push(next_offset);
+        }
+        let [r5, r6, r10, r12, end] = [5, 6, 10, 12, 13].map(|i| offsets[i] as usize);
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.write_all_at(&vec![0; r6 - r5 - 4], r5 as u64 + 4)
+            .unwrap();
+        file.write_all_at(&[0; 4], r10 as u64).unwrap();
+        file.write_all_at(&vec![0; end - r12 - 4], r12 as u64 + 4)
+            .unwrap();
+        let pauses = std::rc::Rc::new(std::cell::Cell::new(0));
+        let (full_hook, path_hook, pauses_hook) = (full.clone(), path.clone(), pauses.clone());
+        WAIT_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path_hook)
+                    .unwrap();
+                pauses_hook.set(pauses_hook.get() + 1);
+                match pauses_hook.get() {
+                    // The last of the six rescans of the first scan: record 5 is complete.
+                    6 => file.write_all_at(&full_hook[r5..r6], r5 as u64).unwrap(),
+                    // The 50 ms wait at record 10's empty word: record 10 committed, record 12 mid-append.
+                    7 => file
+                        .write_all_at(&full_hook[r10..r10 + 4], r10 as u64)
+                        .unwrap(),
+                    _ => {}
+                }
+            }));
+        });
+        let report = verify(dir.path()).unwrap();
+        WAIT_HOOK.with(|hook| hook.borrow_mut().take());
+        assert_eq!(
+            pauses.get(),
+            7,
+            "six rescans, then the 50 ms wait, and no more"
+        );
+        assert_eq!(report.problems.len(), 1, "{:?}", report.problems);
+        assert_eq!(report.problems[0].offset, r12 as u64);
+        assert_eq!(report.problems[0].reason, CorruptReason::BadChecksum);
+        assert_eq!(report.records, 12);
+    }
 
     #[test]
     fn checkpoint_missing_invalid_valid_and_truncated() {

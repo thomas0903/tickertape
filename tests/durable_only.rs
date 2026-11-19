@@ -8,7 +8,7 @@ use tickertape::retention::{self, Action, Policy};
 use tickertape::{Error, NewRecord, OwnedRecord, Reader, ReaderConfig, RecoveryAction, Writer};
 use tickertape_tests::{
     append_n, check_record, corrupt_by_replacement, read_all, segments, small_config,
-    zero_commit_word,
+    zero_commit_word, zero_commit_words_from,
 };
 
 fn open(dir: &std::path::Path, mapped: bool) -> Reader {
@@ -422,9 +422,11 @@ fn second_repair_before_the_identity_check_is_discarded() {
     }
 }
 
-/// Storage damage zeroes the commit word of record `damaged`, which no checkpoint covers, in the segment file itself
-/// (C11). Recovery takes it for the end of the committed records and zeroes the rest of the segment in place: the
-/// file keeps its identity, so no identity check can see the repair. The next writer appends `checkpointed` records of
+/// Storage damage zeroes the commit words of record `damaged`, which no checkpoint covers, and of every record after
+/// it, in the segment file itself (C11): damage recovery can't tell from a torn append (ADR 0035; a single zeroed
+/// word with committed records after it would make it replace the file instead). Recovery takes it for the end of
+/// the committed records and zeroes the rest of the segment in place: the file keeps its identity, so no identity
+/// check can see the repair. The next writer appends `checkpointed` records of
 /// history `tag` into the same file, from `damaged` on, and checkpoints.
 fn repair_in_place(dir: &std::path::Path, damaged: u64, checkpointed: u64, tag: u32) {
     let identity = |path: &std::path::Path| {
@@ -434,7 +436,7 @@ fn repair_in_place(dir: &std::path::Path, damaged: u64, checkpointed: u64, tag: 
     };
     let path = segments(dir).pop().unwrap().1;
     let before = identity(&path);
-    zero_commit_word(dir, damaged);
+    zero_commit_words_from(dir, damaged);
     let mut writer = Writer::open(dir, small_config()).unwrap();
     assert_eq!(
         writer.next_seq(),
@@ -460,8 +462,8 @@ fn repair_in_place(dir: &std::path::Path, damaged: u64, checkpointed: u64, tag: 
 /// from `damaged` on in place and the new writer checkpoints a different history there (whose records have other
 /// lengths, so the old record boundaries fall inside new records). The reader must read every record the new marker
 /// covers from the current file: the kept records, then the new history, with no `Error::Discarded` (nothing it
-/// returned was removed) and no corruption report. The middle record (15) and the newest record (19) are damaged in
-/// turn; the reader waits at the checkpoint (10) or stops inside the coverage of a marker it already applied (13 of
+/// returned was removed) and no corruption report. The records from the middle one (15) on, and the newest record
+/// (19) alone, are damaged in turn; the reader waits at the checkpoint (10) or stops inside the coverage of a marker it already applied (13 of
 /// 0..15).
 #[test]
 fn durable_only_reader_rereads_the_tail_after_an_in_place_repair() {
