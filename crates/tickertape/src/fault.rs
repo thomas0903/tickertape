@@ -49,6 +49,10 @@ pub enum Point {
     /// After a reader at a seal has checked that its segment is still in place and before it opens the successor.
     /// Arm with [`run_at`].
     ReaderSeal,
+    /// After a reader at a seal found the successor missing while its segment is still in place, before it reads the
+    /// slot at the cursor again from the file (the seal may have come from bytes an in-place repair has since
+    /// zeroed). Arm with [`run_at`].
+    ReaderSealReread,
     /// Before a durable-only reader reads the checkpoint marker. Arm with [`run_at`].
     ReaderCheckpoint,
     /// After a durable-only reader has read a checkpoint marker that moved past its cursor, before it checks that its
