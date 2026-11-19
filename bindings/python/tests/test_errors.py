@@ -210,17 +210,23 @@ def sample_value(annotation: object) -> object:
     return 12345
 
 
+def sample_fields(cls: type[tt.TickertapeError]) -> dict[str, object]:
+    """A distinctive value for every documented attribute of `cls` except `message`."""
+    fields: dict[str, object] = {}
+    for klass in reversed(cls.__mro__):
+        if klass.__module__ == "tickertape":
+            for attr, annotation in inspect.get_annotations(klass).items():
+                if attr != "message":
+                    fields[attr] = sample_value(annotation)
+    if issubclass(cls, OSError):
+        fields.update(errno=28, strerror=os.strerror(28), filename=Path("/journal"))
+    return fields
+
+
 def test_every_exception_survives_pickle_with_its_attributes() -> None:
     for name in tt._errors.__all__:
         cls = getattr(tt, name)
-        fields: dict[str, object] = {}
-        for klass in reversed(cls.__mro__):
-            if klass.__module__ == "tickertape":
-                for attr, annotation in inspect.get_annotations(klass).items():
-                    if attr != "message":
-                        fields[attr] = sample_value(annotation)
-        if issubclass(cls, OSError):
-            fields.update(errno=28, strerror=os.strerror(28), filename=Path("/journal"))
+        fields = sample_fields(cls)
         original = cls("message text", **fields)
         original.add_note("a note")
         copy = pickle.loads(pickle.dumps(original))
@@ -230,6 +236,30 @@ def test_every_exception_survives_pickle_with_its_attributes() -> None:
         assert copy.__notes__ == ["a note"]
         if issubclass(cls, OSError):
             assert (copy.errno, copy.strerror, copy.filename) == (28, os.strerror(28), Path("/journal"))
+
+
+def test_pickle_tolerates_deleted_attributes() -> None:
+    """Deleting any attribute, on any exception class, does not break pickling; the copy lacks it too."""
+    checked = 0
+    for name in tt._errors.__all__:
+        cls = getattr(tt, name)
+        fields = sample_fields(cls)
+        for deleted in [*fields, "message"]:
+            original = cls("message text", **fields)
+            delattr(original, deleted)
+            copy = pickle.loads(pickle.dumps(original))
+            assert type(copy) is cls, (name, deleted)
+            if deleted in ("errno", "strerror", "filename"):
+                assert getattr(copy, deleted) is None, (name, deleted)  # OSError reads a deleted one as None
+            else:
+                assert not hasattr(copy, deleted), (name, deleted)
+            for attr, value in fields.items():
+                if attr != deleted:
+                    assert getattr(copy, attr) == value, (name, deleted, attr)
+            if deleted != "message":
+                assert copy.message == "message text"
+            checked += 1
+    assert checked > 2 * len(tt._errors.__all__)
 
 
 def test_pickle_keeps_the_current_attribute_values() -> None:

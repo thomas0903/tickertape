@@ -409,6 +409,27 @@ def test_append_many_propagates_the_metadata_iterators_own_exception(journal: Pa
         assert w.next_seq == 0
 
 
+def test_append_many_propagates_the_exception_of_a_metadata_objects_iter(journal: Path) -> None:
+    class Unreadable:
+        def __init__(self, error: BaseException) -> None:
+            self.error = error
+
+        def __iter__(self) -> Iterator[int]:
+            raise self.error
+
+    with tt.Writer(journal) as w:
+        for error in (KeyboardInterrupt(), RuntimeError("no values today"), TypeError("not like this")):
+            for name in ("schema_id", "venue_ts_ns", "local_ts_ns"):
+                with pytest.raises(type(error)) as caught:
+                    w.append_many([b"a", b"b"], **{name: Unreadable(error)})
+                assert caught.value is error
+        # An object that is not iterable at all still gets the TypeError that names the argument.
+        for value in (object(), 1.5):
+            with pytest.raises(TypeError, match="venue_ts_ns must be an int or a sequence of ints"):
+                w.append_many([b"a"], venue_ts_ns=value)  # type: ignore[arg-type]
+        assert w.next_seq == 0
+
+
 def test_closed_writer_consumes_nothing(journal: Path) -> None:
     consumed: list[int] = []
 
@@ -626,3 +647,31 @@ def test_two_threads_share_one_reader(journal: Path) -> None:
     for seqs in seen.values():
         assert seqs == sorted(seqs)
     assert seen["next"] and seen["many"]
+
+
+RETAINED_CAPACITY = 1 << 20  # `RETAINED_CAPACITY` in src/reader.rs
+
+
+@pytest.mark.parametrize("call", ["read_batch", "read_many", "next"])
+def test_an_idle_reader_does_not_keep_a_large_delivered_batch(journal: Path, call: str) -> None:
+    with tt.Writer(journal, segment_size=64 << 20) as w:
+        w.append_many([bytes([i % 251]) * 4096 for i in range(2048)])  # 8 MiB
+        w.append(b"z" * (4 << 20))  # one 4 MiB record
+        w.append_many([b"small"] * 300)
+    with tt.Reader(journal) as r:
+        capacity = getattr(r, "_staging_capacity_for_testing")  # a test hook, not in the stubs
+        if call == "next":
+            r.seek(2048)
+            record = r.next(timeout=0)
+            assert record is not None and len(record.payload) == 4 << 20
+        else:
+            got = getattr(r, call)(2048)
+            assert len(got) == 2048
+        assert capacity() <= RETAINED_CAPACITY
+        # Small reads keep their capacity for the next read.
+        r.seek(2049)
+        assert len(r.read_batch(100)) == 100
+        kept = capacity()
+        assert 0 < kept <= RETAINED_CAPACITY
+        assert len(r.read_batch(100)) == 100
+        assert capacity() == kept

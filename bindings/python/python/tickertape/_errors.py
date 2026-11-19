@@ -15,8 +15,12 @@ from pathlib import Path
 from typing import Any, Optional
 
 
-def _rebuild(cls: type[TickertapeError], message: str, fields: dict[str, Any]) -> TickertapeError:
-    return cls(message, **fields)
+def _rebuild(cls: type[TickertapeError], message: str, fields: dict[str, Any],
+             without_message: bool = False) -> TickertapeError:
+    error = cls(message, **fields)
+    if without_message:
+        del error.message
+    return error
 
 
 class TickertapeError(Exception):
@@ -37,14 +41,18 @@ class TickertapeError(Exception):
     def __reduce__(self) -> tuple[Any, ...]:
         # Rebuild from the current message and field values: OSError keeps errno, strerror and filename outside
         # __dict__, so the default reduction would lose them. Then restore anything else set on the instance (such as
-        # __notes__).
-        names = list(self._tickertape_fields)
+        # __notes__). An attribute the caller deleted stays deleted in the copy.
+        names = list(getattr(self, "_tickertape_fields", ()))
         if isinstance(self, OSError):
             names += [name for name in ("errno", "strerror", "filename") if name not in names]
-        fields = {name: getattr(self, name) for name in names}
+        missing = object()
+        fields = {name: value for name in names if (value := getattr(self, name, missing)) is not missing}
+        message = getattr(self, "message", missing)
+        if message is missing:
+            message = str(self.args[0]) if self.args else ""
         state = {key: value for key, value in self.__dict__.items()
                  if key not in fields and key not in ("message", "_tickertape_fields")}
-        return (_rebuild, (type(self), self.message, fields), state or None)
+        return (_rebuild, (type(self), message, fields, "message" not in self.__dict__), state or None)
 
 
 class JournalIOError(TickertapeError, OSError):
@@ -135,8 +143,10 @@ class UsedAfterForkError(TickertapeError):
     lock but not its helper threads, so using it could overwrite records or hang. Every method except ``close()``
     raises this in the child, before touching anything. ``close()``, ``with`` and garbage collection in the child
     release the child's copies of the descriptors and mappings, without unlocking, syncing, or changing any file, so
-    the journal can be reopened once the parent closes its writer. Open handles after forking, or use the ``spawn`` or
-    ``forkserver`` start method of :mod:`multiprocessing`.
+    the journal can be reopened once the parent closes its writer. A handle that another thread was using at the
+    moment of the fork is never released in the child: its descriptors stay open until the child exits or calls
+    ``exec``. Open handles after forking, or use the ``spawn`` or ``forkserver`` start method of
+    :mod:`multiprocessing`.
     """
 
     owner_pid: int

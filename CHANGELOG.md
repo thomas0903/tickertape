@@ -13,16 +13,19 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   platform for CPython 3.11+; a wheel workflow builds manylinux, musllinux and macOS wheels and an sdist, with a
   Trusted Publishing step that stays off until PyPI is configured. The pure-Python decoder in `python/` is unchanged.
   Handles refuse use in a forked child (`UsedAfterForkError`, also after process-id reuse), and closing them there
-  releases the child's copies of the descriptors and mappings, so the journal can be reopened while the child runs; a
-  waiting read holds its reader only for 50 ms slices, so signal handlers and other threads can use or close it; a
-  read delivers its records only once its Python result is complete, so a record staged when Ctrl-C arrives (also
-  while a large result is built) is returned by the next read; the writer's reports are named tuples; every exception
-  survives `pickle` with its current attribute values.
+  releases the child's copies of the descriptors and mappings, so the journal can be reopened while the child runs
+  (a handle that another thread was using at the fork is never released there); a waiting read holds its reader only
+  for 50 ms slices, so signal handlers and other threads can use or close it; a read delivers its records only once
+  its Python result is complete and no signal is pending, so a record staged when Ctrl-C arrives (also while a large
+  result is built, or while the read waits for another thread to deliver) is returned by the next read; an idle
+  reader keeps at most about 1 MiB of staging buffer; the writer's reports are named tuples; every exception survives
+  `pickle` with its current attribute values, also after an attribute was deleted.
 - Core: `Reader::next_timeout` no longer panics for a timeout too large to add to `Instant::now()` (it waits
   forever), and the reader's back-off no longer panics when doubling a sleep near `Duration::MAX`.
-- Core: new `Writer::release_after_fork`, only for a writer inherited across `fork`: closes the child's descriptors
-  and unmaps its mappings without unlocking the shared lock, syncing, touching the helper threads or changing any
-  file. Used by the Python bindings.
+- Core: new `Writer::release_after_fork`, only for a writer inherited across `fork` and only in the child: closes the
+  child's descriptors and unmaps its mappings without unlocking the shared lock, syncing, touching the helper threads
+  or changing any file. It frees heap memory, so it is not async-signal-safe; no call on the writer may be in
+  progress in another thread at the fork. Used by the Python bindings.
 - Release operations: `release.py prepare` also checks the Python bindings' version and lockfile against the tag, and
   resolves only `refs/tags/<tag>`, so a branch named like a release tag is refused; the release workflows check out
   the fully qualified tag. The release checklist adds a `v*` tag ruleset and required reviewers for `pypi`.

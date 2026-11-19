@@ -747,3 +747,183 @@ def test_fork_guard_survives_process_id_reuse(journal: Path) -> None:
     child, parent = map(json.loads, run_script(script, journal).splitlines())
     assert child == {"append": "refused", "try_next": "refused"}
     assert parent == [1, 0]
+
+
+# A signal arrives while a read that has built its result waits for the reader's lock to deliver it (another thread
+# holds the lock). The handler raises: the read must raise and deliver nothing, never deliver the records and lose
+# them when the handler runs after the call returns. The test hooks make the order deterministic: the read pauses
+# after building its result, the helper thread takes the lock, lets the read go on, waits until the read is queued
+# for the lock, raises the signal and releases the lock.
+SIGNAL_DURING_DELIVERY = """
+    import signal, sys, threading
+    import tickertape as tt
+
+    path, call, runs = sys.argv[1], sys.argv[2], int(sys.argv[3])
+    with tt.Writer(path, segment_size=1 << 20) as writer:
+        writer.append_many([i.to_bytes(4, "little") for i in range(runs + 10)])
+    reader = tt.Reader(path)
+    read = {
+        "try_next": reader.try_next,
+        "iter": lambda: next(iter(reader)),
+        "next": lambda: reader.next(timeout=5),
+        "read_many": lambda: reader.read_many(10),
+        "read_batch": lambda: reader.read_batch(10),
+    }[call]
+
+    class Interrupt(Exception):
+        pass
+
+    def handler(signum, frame):
+        raise Interrupt
+
+    signal.signal(signal.SIGUSR1, handler)
+    for expected in range(runs):
+        reader._arm_commit_race_for_testing()
+        raced = []
+        helper = threading.Thread(target=lambda: raced.append(reader._race_commit_for_testing(signal.SIGUSR1)))
+        helper.start()
+        try:
+            got = read()
+        except Interrupt:
+            pass
+        else:
+            print("returned", got)
+            sys.exit(1)
+        finally:
+            helper.join()
+        assert raced == [True], raced
+        # Nothing was delivered: the next read returns the records the interrupted one had built its result from.
+        assert reader.position == expected, (reader.position, expected)
+        record = reader.try_next()
+        assert record is not None and record.seq == expected, (record, expected)
+    print("ok")
+"""
+
+
+@pytest.mark.parametrize("call", ["try_next", "iter", "next", "read_many", "read_batch"])
+def test_signal_while_a_read_waits_to_deliver_consumes_nothing(journal: Path, call: str) -> None:
+    runs = int(os.environ.get("TICKERTAPE_DELIVERY_RUNS", "20"))
+    assert run_script(SIGNAL_DURING_DELIVERY, journal, call, runs, timeout=60 + runs).strip() == "ok"
+
+
+# A handle whose mutex was locked when the process forked (another thread was inside a call) may be half-updated in
+# the child. Closing or collecting it there must neither wait for the lock nor drop the value: the child's copies of
+# the descriptors stay open. A handle that was not busy is released as usual.
+FORKED_WHILE_BUSY = """
+    import gc, json, os, sys, warnings
+    import tickertape as tt
+
+    warnings.simplefilter("ignore", DeprecationWarning)  # "use of fork() may lead to deadlocks" (3.12+)
+    path = sys.argv[1]
+    writer = tt.Writer(path, segment_size=1 << 20)
+    writer.append(b"zero")
+    busy_reader = tt.Reader(path)
+    idle_reader = tt.Reader(path)
+    assert idle_reader.try_next().seq == 0 and busy_reader.try_next().seq == 0  # both have a segment open
+    # As if a thread had been inside a call on these two handles at the fork.
+    writer._lock_forever_for_testing()
+    busy_reader._lock_forever_for_testing()
+
+    def open_fds():
+        return len(os.listdir("/dev/fd"))
+
+    pid = os.fork()
+    if pid == 0:
+        results = {"refused": 0}
+        for call in (lambda: writer.append(b"child"), busy_reader.try_next, idle_reader.try_next):
+            try:
+                call()
+            except tt.UsedAfterForkError:
+                results["refused"] += 1
+        del call  # a bound method keeps its handle alive
+        writer.close()
+        busy_reader.close()
+        results["closed"] = writer.closed and busy_reader.closed
+        before = open_fds()
+        del writer
+        gc.collect()
+        results["writer"] = before - open_fds()
+        before = open_fds()
+        del busy_reader
+        gc.collect()
+        results["busy_reader"] = before - open_fds()
+        before = open_fds()
+        del idle_reader
+        gc.collect()
+        results["idle_reader"] = before - open_fds()
+        print(json.dumps(results), flush=True)
+        os._exit(0)
+    _, status = os.waitpid(pid, 0)
+    assert os.waitstatus_to_exitcode(status) == 0, status
+"""
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs fork")
+def test_handle_busy_at_fork_is_never_released_in_the_child(journal: Path) -> None:
+    result = json.loads(run_script(FORKED_WHILE_BUSY, journal))
+    assert result["refused"] == 3 and result["closed"] is True
+    assert result["writer"] == 0 and result["busy_reader"] == 0, result  # forgotten, not dropped
+    assert result["idle_reader"] >= 1, result  # the control: its segment descriptor was closed
+
+
+# Real threads are inside calls when the process forks: a read waiting for records, a read filling a large batch, and
+# a writer appending batches. Whatever each handle's state at the fork, the child must refuse to use it and close and
+# collect it without waiting.
+FORKED_DURING_CALLS = """
+    import gc, os, sys, threading, time, warnings
+    import tickertape as tt
+
+    warnings.simplefilter("ignore", DeprecationWarning)
+    path = sys.argv[1]
+    writer = tt.Writer(path, segment_size=64 << 20)
+    writer.append_many([b"x" * 1000] * 20_000)
+    waiting = tt.Reader(path)
+    filling = tt.Reader(path)
+    stop = threading.Event()
+
+    def wait_loop():
+        waiting.seek(writer.next_seq + 10**9)
+        while not stop.is_set():
+            waiting.next(timeout=0.5)
+
+    def fill_loop():
+        while not stop.is_set():
+            filling.seek(0)
+            filling.read_batch(20_000)
+
+    def append_loop():
+        while not stop.is_set():
+            writer.append_many([b"y" * 100] * 2000)
+            time.sleep(0.002)
+
+    threads = [threading.Thread(target=f) for f in (wait_loop, fill_loop, append_loop)]
+    for thread in threads:
+        thread.start()
+    statuses = []
+    for _ in range(5):
+        time.sleep(0.05)
+        pid = os.fork()
+        if pid == 0:
+            refused = 0
+            for call in (lambda: writer.append(b"c"), waiting.try_next, lambda: filling.read_many(1)):
+                try:
+                    call()
+                except tt.UsedAfterForkError:
+                    refused += 1
+            for handle in (writer, waiting, filling):
+                handle.close()
+            del writer, waiting, filling, handle, call
+            gc.collect()
+            os._exit(0 if refused == 3 else 3)
+        _, status = os.waitpid(pid, 0)
+        statuses.append(os.waitstatus_to_exitcode(status))
+    stop.set()
+    for thread in threads:
+        thread.join()
+    print(statuses)
+"""
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs fork")
+def test_fork_while_threads_are_inside_calls(journal: Path) -> None:
+    assert run_script(FORKED_DURING_CALLS, journal, timeout=60).strip() == "[0, 0, 0, 0, 0]"

@@ -17,14 +17,31 @@ use crate::errors;
 use crate::owner::Owner;
 use crate::reports;
 
-/// In a child created by `fork`: takes the value out of a handle's mutex without waiting. A mutex that was locked
-/// when the process forked stays locked here (the thread that held it exists only in the parent); its value is then
-/// left for the handle's `Drop`, which needs no lock.
-pub fn take_inherited<T>(mutex: &Mutex<Option<T>>) -> Option<T> {
+/// In a child created by `fork`: takes the value out of a handle's mutex without waiting. `Err(())` if the mutex is
+/// locked: it was locked when the process forked (another thread was inside a call), and stays locked here because
+/// that thread exists only in the parent. The value may then be half-updated, so it must never be used or dropped:
+/// `close()` leaves it in place, and the handle's `Drop` forgets it (see `forget_inherited`).
+pub fn take_inherited<T>(mutex: &Mutex<Option<T>>) -> Result<Option<T>, ()> {
     match mutex.try_lock() {
-        Ok(mut guard) => guard.take(),
-        Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner().take(),
-        Err(TryLockError::WouldBlock) => None,
+        Ok(mut guard) => Ok(guard.take()),
+        Err(TryLockError::Poisoned(poisoned)) => Ok(poisoned.into_inner().take()),
+        Err(TryLockError::WouldBlock) => Err(()),
+    }
+}
+
+/// In a handle's `Drop`, in a child created by `fork`: takes the value out of the mutex if the mutex can be taken,
+/// and otherwise (it was locked at the fork, see `take_inherited`) forgets the value without running its destructor,
+/// leaking what it holds. In practice a handle that was busy at the fork is never dropped in the child at all (the
+/// frame of the call that held the mutex keeps a reference to it); this keeps a half-updated value from being dropped
+/// if it ever is.
+pub fn forget_inherited<T>(mutex: &mut Mutex<Option<T>>) -> Option<T> {
+    match take_inherited(mutex) {
+        Ok(value) => value,
+        Err(()) => {
+            let inner = mutex.get_mut().unwrap_or_else(PoisonError::into_inner);
+            std::mem::forget(inner.take());
+            None
+        }
     }
 }
 
@@ -84,9 +101,7 @@ impl<T: Copy + for<'a, 'py> FromPyObject<'a, 'py>> Column<T> {
             return obj.extract::<T>().map(Column::All).map_err(Into::into);
         }
         let mut values = Vec::with_capacity(len);
-        for item in obj.try_iter().map_err(|_| {
-            PyTypeError::new_err(format!("{name} must be an int or a sequence of ints"))
-        })? {
+        for item in obj.try_iter().map_err(|e| not_iterable(obj, e, name))? {
             // The iterator's own exception comes first (it may be KeyboardInterrupt).
             let item = item?;
             if values.len() == len {
@@ -110,6 +125,21 @@ impl<T: Copy + for<'a, 'py> FromPyObject<'a, 'py>> Column<T> {
             Column::All(v) => *v,
             Column::Each(values) => values[i],
         }
+    }
+}
+
+/// The error for a metadata argument that `iter()` refused: the exception that its type's `__iter__` raised,
+/// unchanged (it may be `KeyboardInterrupt`), or a `TypeError` naming the argument if the type has no `__iter__` and
+/// so is not iterable at all (`iter()` never fails for a type with `__getitem__` alone).
+fn not_iterable(obj: &Bound<'_, PyAny>, error: PyErr, name: &str) -> PyErr {
+    let has_iter = obj
+        .get_type()
+        .getattr("__iter__")
+        .is_ok_and(|method| !method.is_none());
+    if has_iter {
+        error
+    } else {
+        PyTypeError::new_err(format!("{name} must be an int or a sequence of ints"))
     }
 }
 
@@ -145,7 +175,8 @@ fn check_payloads_container(payloads: &Bound<'_, PyAny>) -> PyResult<()> {
 /// reports are converted to Python objects after it is released). `closed` is a separate flag, readable without the
 /// lock. A handle used in another process than the one that opened it (a child created by `fork`) raises
 /// `UsedAfterForkError` and never touches the shared journal state there. Closing or dropping it there releases only
-/// that process's copies of the descriptors and mappings (`tickertape::Writer::release_after_fork`).
+/// that process's copies of the descriptors and mappings (`tickertape::Writer::release_after_fork`), unless another
+/// thread was inside a call at the fork: then nothing is released in that process (see `take_inherited`).
 #[pyclass(frozen, module = "tickertape")]
 #[derive(Debug)]
 pub struct Writer {
@@ -195,9 +226,9 @@ impl Drop for Writer {
     fn drop(&mut self) {
         if self.owner.is_foreign() {
             // A copy made by fork(): its helper threads don't exist here, and the lock, the files and the wake-up
-            // region belong to the parent. Release only this process's descriptors and mappings.
-            let inner = self.inner.get_mut().unwrap_or_else(PoisonError::into_inner);
-            if let Some(writer) = inner.take() {
+            // region belong to the parent. Release only this process's descriptors and mappings, and nothing at all
+            // if another thread was inside a call at the fork (the writer may be half-updated).
+            if let Some(writer) = forget_inherited(&mut self.inner) {
                 writer.release_after_fork();
             }
         }
@@ -397,11 +428,13 @@ impl Writer {
     /// Releases the lock and closes the journal files, without a checkpoint: records appended since the last
     /// checkpoint stay visible but are not made durable. Calling it again does nothing. In a child created by
     /// `fork`, it closes only this process's copies of the descriptors and mappings: the parent keeps the lock, and
-    /// nothing is synced, joined or removed.
+    /// nothing is synced, joined or removed; if another thread was using the writer at the fork, it releases nothing
+    /// there.
     fn close(&self, py: Python<'_>) {
         self.closed.store(true, Ordering::Release);
         if self.owner.is_foreign() {
-            if let Some(writer) = take_inherited(&self.inner) {
+            // A writer that was busy in another thread at the fork stays in place (see `take_inherited`).
+            if let Ok(Some(writer)) = take_inherited(&self.inner) {
                 writer.release_after_fork();
             }
             return;
@@ -419,6 +452,12 @@ impl Writer {
     /// Test only: pretends this handle was opened by process `pid` (to simulate process-id reuse after `fork`).
     fn _set_owner_pid_for_testing(&self, pid: u32) {
         self.owner.set_pid_for_testing(pid);
+    }
+
+    /// Test only: locks this handle's mutex and never unlocks it, as if a thread had been inside a call when the
+    /// process forked. In this process every later call that needs the lock then waits forever.
+    fn _lock_forever_for_testing(&self, py: Python<'_>) {
+        std::mem::forget(lock(py, &self.inner));
     }
 
     /// Closes the writer (see `close()`); does not checkpoint and does not suppress exceptions.
