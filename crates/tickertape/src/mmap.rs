@@ -536,6 +536,14 @@ impl Notify {
     }
 }
 
+impl Notify {
+    /// A copy inherited across `fork`: closes this process's descriptor and mapping without clearing the writer flag,
+    /// waking readers or removing the region, which still belong to the parent.
+    pub(crate) fn release_after_fork(mut self) {
+        self.owner = None;
+    }
+}
+
 impl Drop for Notify {
     fn drop(&mut self) {
         let Some(owner) = &self.owner else { return };

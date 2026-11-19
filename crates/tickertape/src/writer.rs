@@ -414,6 +414,25 @@ impl Writer {
         self.last_retention_error.as_ref()
     }
 
+    /// Releases this process's copy of a writer inherited across `fork`. **Only for a writer that a child process
+    /// inherited from the process that opened it**; in the process that opened it, drop the writer instead.
+    ///
+    /// Closes the child's copies of the writer's file descriptors and unmaps its mappings, so that the lock is held
+    /// only by the parent's descriptor again and the journal can be reopened once the parent closes its writer. It
+    /// does not unlock the lock file (the lock belongs to the open file description that parent and child share),
+    /// does not sync, does not remove or change any file or the wake-up region, and does not join or signal the
+    /// helper threads, which exist only in the parent. Their handles, the state they share, and what they hold
+    /// (such as a prepared spare segment and the prefault thread's reference to the active mapping) are leaked
+    /// until the child exits.
+    pub fn release_after_fork(mut self) {
+        std::mem::forget(self.spare.take());
+        std::mem::forget(self.prefault.take());
+        if let Some(notify) = self.notify.take() {
+            notify.release_after_fork();
+        }
+        // `Drop` finds no spare; the remaining fields only close descriptors and unmap.
+    }
+
     fn run_retention(&mut self) {
         let Some((policy, action)) = &self.config.retention else {
             return;
