@@ -93,6 +93,15 @@ different languages and frameworks can integrate. Priorities are predictable sus
 easy integration and a dependable compatibility contract. This does not require replacing networking transports,
 databases or every kind of queue.
 
+Owner decisions of 2026-11-19:
+
+- **More bindings and install channels** are part of v1.0 (ADR 0031). Windows stays out of scope.
+- **The external integration** is an iceoryx2 recorder and replayer (ADR 0030; the owner left the choice to the
+  maintainers).
+- **Cloud measurements run on Google Cloud**, not AWS: x86-64 and aarch64 (Google Axion) virtual machines with
+  local SSD. Bare metal is outside the project's quota and budget there, so new results are labelled as cloud
+  VMs and are not compared directly with the bare-metal v0.4.0 results.
+
 The milestones below define the work before v1.0. Intermediate releases can ship completed improvements; their
 version numbers and dates are not fixed. Performance changes must preserve validation, memory safety and the crash
 contract. An optimization investigation can close with a documented, measured decision that the proposed change
@@ -138,8 +147,9 @@ does not help or cannot preserve those guarantees; such a decision must be expli
     semantics. Ship changes supported by measurements; document rejected approaches and their tradeoffs.
   - Exercise the existing `append_with` API in integration examples so encoders can write directly into a record.
 - [ ] **ARM server measurements.**
-  - Run correctness/crash checks and the sustained comparison suite on bare-metal aarch64 Linux, targeting
-    Graviton (`c7gd.metal`), alongside the existing x86-64 and macOS evidence.
+  - Run correctness/crash checks and the sustained comparison suite on an aarch64 Linux server, targeting
+    Google Axion (`c4a` with local SSD), alongside the existing x86-64 and macOS evidence. (Until 2026-11-19 this
+    item named bare-metal Graviton, `c7gd.metal`.)
   - Record CPU, kernel, filesystem, storage, affinity, CRC implementation and commands; resolve architecture-specific
     correctness failures and explain material performance differences before claiming cross-architecture results.
 
@@ -150,10 +160,18 @@ does not help or cannot preserve those guarantees; such a decision must be expli
     a C/C++ example. Keep bindings and framework adapters outside the core crate.
   - Provide installable Python bindings with batch operations and explicit copy/lifetime behavior. Preserve the
     dependency-free read-only decoder; live zero-copy Python access is not required.
+  - Provide a header-only C++ wrapper and a Java binding (Foreign Function & Memory API), both over the C ABI
+    (ADR 0031). Go, Node.js and .NET wait until after v1.0.
   - Ship one complete integration with an external library/framework, selected and named before implementation,
-    demonstrating recording, live consumption, replay and export.
+    demonstrating recording, live consumption, replay and export: `tickertape-iceoryx2`, a recorder and replayer
+    for iceoryx2 publish/subscribe services (ADR 0030).
   - Add cross-language fixtures that verify payloads, metadata, checksums, sequence boundaries and durable-only
     behavior. Validate installation and a documented end-to-end example for each delivered binding.
+- [ ] **Make installation easy** (ADR 0031).
+  - Static musl builds of the CLI for Linux, cargo-binstall metadata, a Homebrew tap, PyPI wheels for the Python
+    bindings and for the CLI, a C library archive per platform, and Maven Central for the Java binding.
+  - Build provenance attestations with a software bill of materials for every released file.
+  - Every channel is tested at release by installing from it; a channel that isn't tested isn't announced.
 - [ ] **Make replay and recovery excellent at scale.**
   - Measure startup, seek, catch-up, replay and crash recovery across many segments and journals larger than RAM,
     including retention, archived history and missing/corrupt segments. Publish dataset sizes and resource usage.
