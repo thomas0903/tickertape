@@ -133,8 +133,11 @@ Never truncate or edit a segment in place while anything uses the journal: proce
 
 - `tickertape verify <dir>` checks every header, record and seal and exits with code 2 if anything is wrong; it is
   read-only and safe to run while the writer is active (records the writer commits while `verify` looks at the end
-  of the newest segment are followed, not reported; ADR 0035). It reads the whole newest segment, including the
-  unwritten part after the last record.
+  of the newest segment are followed, not reported; ADR 0035). One exception: if the writer takes longer than about
+  50 ms to fill a single record whose payload itself contains valid tickertape frames with nearby sequence numbers
+  (a journal that stores another journal's raw frames), `verify` can report that record as an empty commit word in
+  front of committed records while it is being written; a second run after the record is committed reports nothing.
+  `verify` reads the whole newest segment, including the unwritten part after the last record.
 - `tickertape inspect <dir>` lists segments, their sequence ranges and fill level, and the checkpoint marker.
 
 ## After a crash

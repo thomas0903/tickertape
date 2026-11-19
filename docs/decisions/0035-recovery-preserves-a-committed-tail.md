@@ -65,8 +65,11 @@ bytes (its length lies outside the range tried): those stay evidence, the conser
 match by chance (`2^-32` each), and a chance match would hide real evidence, so the range is kept to 64 lengths, and
 a frame whose CRC also matches for a length that ends where the first candidate starts is not covered: that is a
 complete record followed by the next one, which is what a zeroed commit word in front of committed records leaves.
-Hiding real evidence therefore needs damage to the frame at `P` beyond its commit word with its sequence number and
-flags intact, and then a chance match among 64 lengths (`2^-26`). The check runs once, at the first candidate:
+That rule protects when the first candidate is the record right after `P`. Hiding real evidence otherwise needs a
+chance match among 64 lengths (`2^-26`), in one of these shapes: the frame at `P` damaged beyond its commit word with
+its sequence number and flags intact; two consecutive commit words emptied, so that the first candidate is the
+record two after `P`; or a committed record at `P` whose own payload holds frames in the window, so that the first
+candidate lies inside it. The check runs once, at the first candidate:
 CRC32C over the frame up to the last non-zero byte and up to the first candidate, each length after the first moved
 into place with a shift (`crc::x8n`) instead of a new pass.
 

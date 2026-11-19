@@ -706,8 +706,9 @@ fn torn_frame_covers_tail<V: SegmentView + ?Sized>(
 }
 
 /// True if the record CRC `stored` of a frame at `offset` matches for some frame length in `lo..=hi` that is valid
-/// and fits in the segment. Reads `[offset + 8, offset + hi)` once: the CRC of the shortest length is computed in
-/// one pass, and each longer one by moving the length prefix's CRC past the bytes ([`crate::crc::x8n`]).
+/// and fits in the segment. Reads `[offset + 8, offset + hi)` once, at most 1 MiB at a time: the CRC of the shortest
+/// length is computed in one pass, and each longer one by moving the length prefix's CRC past the bytes
+/// ([`crate::crc::x8n`]).
 fn crc_matches_some_len<V: SegmentView + ?Sized>(
     segment: &V,
     offset: u64,
@@ -727,9 +728,22 @@ fn crc_matches_some_len<V: SegmentView + ?Sized>(
     if lo > hi {
         return false;
     }
-    let Some(mut crc) = segment.with_bytes(fields_at, lo - 8, crate::crc::crc32c) else {
-        return false;
-    };
+    // In bounded pieces: a `pread` view allocates a window as large as the range it is asked for, and this range
+    // can be most of a segment (`inspect::verify` reads segments that way).
+    const PIECE: u64 = 1 << 20;
+    let mut crc = 0;
+    let (mut at, mut left) = (fields_at, lo - 8);
+    while left > 0 {
+        let piece = left.min(PIECE);
+        let Some(next) =
+            segment.with_bytes(at, piece, |bytes| crate::crc::crc32c_append(crc, bytes))
+        else {
+            return false;
+        };
+        crc = next;
+        at += piece;
+        left -= piece;
+    }
     let mut shift = crate::crc::x8n(lo - 8);
     segment
         .with_bytes(fields_at + lo - 8, hi - lo, |more| {
@@ -1363,6 +1377,61 @@ mod tests {
             len,
             len + 100
         ));
+    }
+
+    /// A view that records the largest range it was asked for, as a `pread` view would have to allocate it.
+    struct Metered<'a> {
+        bytes: &'a [u8],
+        largest: std::cell::Cell<u64>,
+    }
+
+    impl SegmentView for Metered<'_> {
+        fn len(&self) -> u64 {
+            self.bytes.len() as u64
+        }
+
+        fn commit_word(&self, offset: u64) -> Option<u32> {
+            self.bytes.commit_word(offset)
+        }
+
+        fn with_bytes<R>(&self, offset: u64, len: u64, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
+            self.largest.set(self.largest.get().max(len));
+            self.bytes.with_bytes(offset, len, f)
+        }
+    }
+
+    #[test]
+    #[cfg(not(miri))]
+    fn crc_length_search_reads_long_frames_in_bounded_pieces() {
+        // A frame of about 3 MiB: `verify` meets this size when it weighs the tail after an empty commit word.
+        let mut image = vec![0u8; (3 << 20) + 4096];
+        let mut x = 0x9e37_79b9_7f4a_7c15_u64;
+        for b in &mut image[72..(3 << 20) + 1000] {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *b = x as u8;
+        }
+        let at = 64_u64;
+        let len = (3 << 20) + 936_u64;
+        let stored = record_crc(len as u32, &image[72..(at + len) as usize]);
+        let view = Metered {
+            bytes: &image,
+            largest: std::cell::Cell::new(0),
+        };
+        assert!(crc_matches_some_len(&view, at, stored, len - 40, len + 40));
+        assert!(!crc_matches_some_len(
+            &view,
+            at,
+            stored ^ 1,
+            len - 40,
+            len + 40
+        ));
+        assert!(
+            view.largest.get() <= 1 << 20,
+            "read {} bytes at once",
+            view.largest.get()
+        );
     }
 
     #[test]
