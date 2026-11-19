@@ -1658,10 +1658,12 @@ fn at_namespace_scope(text: &str) -> bool {
             }
             '{' => {
                 let h = head.trim_start();
+                // `extern "C" {` is a linkage block; `extern "C" int f() {` is a function body.
                 open.push(
-                    h.starts_with("namespace")
-                        || h.starts_with("inline namespace")
-                        || h.starts_with("extern \"C\""),
+                    h.starts_with("namespace ")
+                        || h.trim_end() == "namespace"
+                        || h.starts_with("inline namespace ")
+                        || h.trim_end() == "extern \"C\"",
                 );
                 head.clear();
             }
@@ -1802,6 +1804,20 @@ fn language_level_comparison_reports_changed_definitions() {
     let mut statement = lower.clone();
     statement.insert(11, (13, "(void)n;".to_owned()));
     let problems = standard_dependent_definitions(&lower, &statement);
+    assert_eq!(problems.len(), 1, "{problems:?}");
+    assert!(
+        problems[0].contains("not at namespace scope"),
+        "{problems:?}"
+    );
+    // A statement added to a function with C linkage, which is not a linkage block.
+    let c_function = lines(&[
+        (1, "extern \"C\" inline int f(int n) {"),
+        (3, "return n;"),
+        (4, "}"),
+    ]);
+    let mut c_statement = c_function.clone();
+    c_statement.insert(1, (2, "n = 0;".to_owned()));
+    let problems = standard_dependent_definitions(&c_function, &c_statement);
     assert_eq!(problems.len(), 1, "{problems:?}");
     assert!(
         problems[0].contains("not at namespace scope"),
@@ -2387,12 +2403,12 @@ fn defined_symbols(object: &Path) -> Option<Vec<String>> {
     let symbols = String::from_utf8_lossy(&output.stdout)
         .lines()
         .filter_map(|line| {
-            // "<address> <type> <name>" for a defined symbol; "<type> <name>" (U, w, v) for an undefined one.
+            // "<address> <type> <name>" for a defined symbol, whatever its type letter (GNU nm prints `u` for a
+            // defined unique global and `W`/`V` for defined weak ones); "<type> <name>" (U, w, v), with no address,
+            // for an undefined one.
             let fields: Vec<&str> = line.split_whitespace().collect();
             match fields.as_slice() {
-                [_, kind, name] if !matches!(*kind, "U" | "u" | "w" | "v") => {
-                    Some((*name).to_owned())
-                }
+                [_, kind, name] if *kind != "U" => Some((*name).to_owned()),
                 _ => None,
             }
         })

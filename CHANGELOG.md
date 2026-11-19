@@ -17,14 +17,15 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   copies without throwing (moving one copies it, so a moved-from exception keeps its error). An exception thrown by a
   fill never crosses the C ABI: it is rethrown after the aborted append, nested inside the library error if the
   clean-up failed, and destroying or moving the writer inside its own fill is defined. Negative timeouts do not wait
-  (unlike C), and integral durations are converted to nanoseconds exactly, rounded up, for every period; a negative or
+  (unlike C), and integral durations are converted to nanoseconds exactly, rounded up; a negative or
   NaN retention age is an error. With GCC and Clang, units built with and without exceptions or debug checks can be
   linked into one program, and binding types cannot be passed between units built in different exception modes: the
   inline namespace is `tickertape::v1` with exceptions and `tickertape::v1_noexcept` without, so every definition the
   header provides has a mode-specific symbol (and it instantiates no throwing standard-library function over only its
-  C types); a binding type in the parameter list of a function called directly by name makes a crossing a link error,
-  but one only in a return type, or passed through a virtual function, a function pointer or an `extern "C"`
-  function, links and is undefined, so the rule is not to cross. Standard-library code over standard types stays
+  C types); a binding type in the parameter list of a C++ function called directly by name makes a crossing a link
+  error, but one only in a non-template function's return type, in an `extern "C"` function, or passed through a
+  virtual function or a function pointer, links and is undefined, so the rule is not to cross. Standard-library code
+  over standard types stays
   shared, as in any program that mixes modes, and so does a container your own code instantiates over `NewRecord` or
   another C type: that is as safe as the toolchain's standard library makes it (CI runs the mixed-mode test with GCC
   and Clang on Linux and Apple Clang on macOS; Homebrew GCC on macOS was run by hand). The debug-check-dependent

@@ -4,10 +4,11 @@
 // TT_BOUNDARY_DEFINE (the definition) and once without (the caller), and links the two: in different exception modes
 // the link must fail; in the same mode (the control) it must succeed.
 //
-// The link error covers a binding type in the parameter list of a function called directly by name only. A binding
-// type that appears only in the return type of a non-template function (`tickertape::Writer make_writer();`), or in a
-// data member or global, is not part of the symbol's name, and a call through a virtual function, a function pointer
-// or an extern "C" function does not go by the name, so those crossings link and are undefined behaviour: the rule
+// The link error covers a binding type in the parameter list of a C++ function called directly by name only. A
+// binding type that appears only in the return type of a non-template function
+// (`tickertape::Writer make_writer();`), in a data member or global, or in an extern "C" function (whose name
+// carries no types) is not part of the symbol's name, and a call through a virtual function or a function pointer
+// is not resolved by name at all, so those crossings link and are undefined behaviour: the rule
 // is that binding types do not cross the boundary at all, and this link error is a help for the commonest case, not
 // a guarantee. Not tested, on purpose.
 #include "tickertape.hpp"

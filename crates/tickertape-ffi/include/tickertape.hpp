@@ -104,14 +104,16 @@
 //   tickertape::v1_noexcept when they are not, so every definition the header provides has a symbol of its own in
 //   each mode, including the exception handling a compiler generates inside it, and the header instantiates no
 //   standard-library function that an exception can pass through over only its C types (detail::Array holds those;
-//   what is left, std::data and std::size on a range given to append_batch, cannot throw). Code still writes
+//   what is left, std::data and std::size on a range given to append_batch, throws only what that range's own
+//   data() or size() throws). Code still writes
 //   tickertape::Writer. What remains shared between modes is standard-library code over built-in and standard types
 //   (std::string, std::optional<std::uint64_t>, ...), as in any program that mixes modes: that is as safe as the
 //   toolchain's standard library makes it. Binding types must not cross a boundary between exception modes (pass C
-//   handles or plain data). A binding type in the parameter list of a function called directly by name makes such a
-//   crossing a link error; one only in a non-template function's return type (or in a data member or global) is not
-//   part of the symbol's name, and a call through a virtual function, a function pointer or an extern "C" function
-//   does not go by the name, so those crossings link and are undefined behaviour.
+//   handles or plain data). A binding type in the parameter list of a C++ function called directly by name (or
+//   anywhere in a function template's signature, return type included) is part of the symbol's name and makes such
+//   a crossing a link error. It is not part of the name in a non-template function's return type, in a data member
+//   or global, or in an extern "C" function (whose name carries no types), and a call through a virtual function or
+//   a function pointer is not resolved by name at all: those crossings link and are undefined behaviour.
 // - Debug-check mode: the types are shared, so that debug and release units can exchange them. The inline functions
 //   whose behaviour depends on the mode are declared TICKERTAPE_HPP_MODE_DEPENDENT, which gives them a different
 //   symbol in each mode (GCC's and Clang's abi_tag). A test fails if a function that mentions a debug-check macro,
@@ -562,7 +564,8 @@ constexpr std::uintmax_t mul_div_ceil(std::uintmax_t a, std::uintmax_t b, std::u
 
 // `d` in whole nanoseconds, rounded up, as an Int (std::int64_t or std::uint64_t): 0 for a zero, negative or NaN
 // duration (callers for which that is wrong reject those first), and the largest Int for a duration that does not
-// fit. Integral counts are converted exactly, for every period, in integer arithmetic. Floating-point ones are
+// fit. Integral counts are converted exactly, in integer arithmetic, for every period that converts at all (a
+// period for which std::ratio_divide<Period, std::nano> overflows does not compile). Floating-point ones are
 // compared, before the cast, with 2^63 or 2^64, the first value Int cannot hold.
 template <class Int, class Rep, class Period>
 constexpr Int ceil_ns(std::chrono::duration<Rep, Period> d) noexcept {

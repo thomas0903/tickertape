@@ -107,12 +107,14 @@ GCC and Clang each unit keeps its own behaviour:
   different type from one built without. If a header of yours declares `void feed(tickertape::Writer &)`, defining
   it in a `-fno-exceptions` component and calling it from an application built with exceptions fails to link
   (undefined reference to `feed(tickertape::v1::Writer&)`). The link error only helps with the commonest case, a
-  binding type in the **parameter list** of a function that is called directly by its name: a binding type that
-  appears only in a non-template function's **return type** (`tickertape::Writer open_feed();`), or in a data member
-  or a global, is not part of the symbol's name, and a call through a virtual function, a function pointer or an
-  `extern "C"` function does not go by the symbol's name at all (an interface such as
-  `struct Sink { virtual bool feed(tickertape::Writer &) = 0; };` implemented in one mode and called from the other
-  links). Such a crossing links, and is undefined behaviour. Do not let binding types cross the boundary at all; pass C
+  binding type in the **parameter list** of a C++ function that is called directly by its name (or anywhere in a
+  function template's signature, whose symbol also encodes the return type). A binding type is not part of the
+  symbol's name when it appears only in a non-template function's **return type**
+  (`tickertape::Writer open_feed();`), in a data member or a global, or in an `extern "C"` function (whose name
+  carries no types); and a call through a virtual function or a function pointer is not resolved by name at all (an
+  interface such as `struct Sink { virtual bool feed(tickertape::Writer &) = 0; };` implemented in one mode and
+  called from the other links). Such a crossing links, and is undefined behaviour. Do not let binding types cross the
+  boundary at all; pass C
   handles (`writer.native_handle()`, used through the C API in `tickertape.h` on the other side) or plain data
   (sequence numbers, timestamps, payload bytes; `tickertape::NewRecord`, which is the C struct).
 - **Debug checks on or off.** Debug and release units share the types and can pass them freely; the few inline
@@ -158,8 +160,10 @@ What it does not change:
 - **Timeouts** are a `tickertape::Timeout`: `tickertape::no_wait` (the default), any `std::chrono` duration, or
   `tickertape::wait_forever`. **A zero or negative duration does not wait** (unlike the C ABI, where a negative
   timeout waits forever): a deadline that has passed returns at once. Durations are rounded up to whole nanoseconds;
-  integral counts are converted exactly for every period (integer arithmetic only, so a positive duration never
-  becomes 0 or comes out below its exact value), and anything longer than `INT64_MAX` nanoseconds, about 292 years,
+  integral counts are converted exactly (integer arithmetic only, so a positive duration never becomes 0 or comes
+  out below its exact value) for every period that converts at all (a period so extreme that
+  `std::ratio_divide<Period, std::nano>` overflows does not compile), and anything longer than `INT64_MAX`
+  nanoseconds, about 292 years,
   waits that long.
   A timeout bounds only the wait for a record; catching up after a seek and file I/O can take longer.
 - **Timestamps** are `std::uint64_t` nanoseconds that you choose; `tickertape::realtime_ns()` reads the wall clock.
@@ -246,8 +250,9 @@ tt::Writer writer = tt::Writer::open("/data/journal", options).value();
   `tt::new_record(schema_id, venue_ts_ns, local_ts_ns, data, size)`. A record keeps a pointer to its payload, not a
   copy, so **the payload must be a named object** (an lvalue) that outlives the append, or a view: an rvalue is
   accepted only if `tt::enable_borrowed_bytes<T>` is true for its type, which it is for `std::basic_string_view` and
-  `std::span`. For a view type of your own, specialise it (at any language level), in the header that defines the
-  type, so that every translation unit sees it before its first use:
+  `std::span`. For a view type of your own, specialise it (at any language level) at namespace scope in the header
+  that defines the type, so that every translation unit sees it before its first use (a program in which one unit
+  uses the type with the specialisation and another without it is ill-formed, and a compiler need not say so):
 
   ```cpp
   template <> inline constexpr bool tickertape::enable_borrowed_bytes<MyView> = true;

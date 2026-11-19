@@ -70,7 +70,9 @@ taken by a template that accepts any contiguous range of `char`/`unsigned char`/
 **Nothing the header defines depends on the language level.** A program may link a C++17 unit and a C++20 unit
 that both include the header, and each inline function, class, variable template and inline variable must then have
 one definition, token for token. **Rule:** a block conditional on the language standard or on a library
-feature-test macro may only add whole declarations (`as_span`, the `char8_t` specialisation of `detail::is_byte`, the
+feature-test macro may only add whole declarations (checked for the compilers and standard libraries the test
+matrix runs, since a feature-test macro is a property of the library in use: `as_span`, the `char8_t` specialisation
+of `detail::is_byte`, the
 `std::span` specialisation of `enable_borrowed_bytes`), at namespace scope (a member added to a class changes that
 class's definition); it never changes a definition that also exists at C++17.
 Round 2 broke this: under C++20 `detail::is_byte_view_v` gained an `|| std::ranges::enable_borrowed_range<...>` term,
@@ -111,7 +113,8 @@ GCC and Clang (the Itanium C++ ABI: Linux, macOS):
   namespace, so its functions are mode-specific; moving C handles uses `detail::take_handle` rather than
   `std::exchange` over a C pointer. Neither changes a public signature or a class's size or alignment (`RecordBatch`
   stays two pointers and four integers). What is left is `std::data` and `std::size` on a range of `NewRecord` given
-  to `append_batch`, which cannot throw.
+  to `append_batch`, which throw only what the range's own `data()` or `size()` throws (nothing, for the standard
+  containers and arrays).
 - **What remains shared between modes** is standard-library code over built-in and standard types (`std::string`,
   `std::optional<std::uint64_t>` and the like), which any program that mixes exception modes shares with or without
   this header, and a container that the user's code instantiates over the binding's C types
@@ -128,11 +131,14 @@ GCC and Clang (the Itanium C++ ABI: Linux, macOS):
   `v1_noexcept::Writer`). Where a binding type is in a function's **parameter list**, it is part of the symbol's
   name, so a function declared as `bool is_open(const tickertape::Writer &)` in a shared header is a different
   function in each mode: defining it in a `-fno-exceptions` unit and calling it from an exceptions unit is a link
-  error (undefined reference), when the call is a direct call by name. Where a binding type appears only in a
-  non-template function's **return type** (or in a data member or a global), it is not part of the symbol's name, and
-  a call through a virtual function, a function pointer or an `extern "C"` function does not go by the symbol's name
-  at all (a round-3 reviewer linked an interface with a virtual `feed(tickertape::Writer &)` implemented without
-  exceptions and called with them); such a crossing links, and is undefined behaviour. The rule is that binding types do not cross the boundary; the link error is a help for the commonest
+  error (undefined reference), when the call is a direct call by name of a C++ function (a function template's
+  symbol also encodes its return type, so a binding type anywhere in its signature has the same effect). A binding
+  type is not part of the symbol's name where it appears only in a non-template function's **return type**, in a
+  data member or a global, or in an `extern "C"` function, whose name carries no types; and a call through a virtual
+  function or a function pointer is not resolved by name at all (a round-3 reviewer linked an interface with a
+  virtual `feed(tickertape::Writer &)` implemented without exceptions and called with them). Such a crossing links,
+  and is undefined behaviour. The rule is that binding types do not cross the boundary; the link error is a help for
+  the commonest
   case, not a guarantee. Across such a boundary pass C handles (`native_handle()`, used through the C API on the
   other side) or plain data: `tickertape::NewRecord` is the C struct and is shared; sequence numbers, timestamps and
   payload bytes are plain values.
@@ -308,8 +314,11 @@ names is a named `Status`), and `-Wswitch` makes a new enumerator break the test
   the binding's own variable template `tickertape::enable_borrowed_bytes<T>` is true. It is `false` by default and
   `true` for `std::basic_string_view` and, where `std::span` exists, `std::span`; a user's own view type opts in by
   specialising it (`template <> inline constexpr bool tickertape::enable_borrowed_bytes<MyView> = true;`), at C++17
-  as well, in the header that defines the type (a unit that does not see the specialisation gets the deleted
-  overload, a compile error; one that sees it after a use gets "specialization after instantiation"). Round 2 picked up `std::ranges::enable_borrowed_range` automatically in C++20, which made the header's
+  as well, at namespace scope in the header that defines the type, before any use that instantiates the primary
+  template. Within one translation unit a missing specialisation selects the deleted overload and a late one is
+  "specialization after instantiation", both compile errors; but a program in which one unit sees the
+  specialisation and another uses the type without it is ill-formed with no diagnostic required, which is why it
+  belongs in the type's own header. Round 2 picked up `std::ranges::enable_borrowed_range` automatically in C++20, which made the header's
   definition depend on the standard (**Language level**); the binding no longer consults it, so a C++20 type that
   opts only into it (or `std::ranges::subrange`) is refused unless it also specialises `enable_borrowed_bytes`. For
   any other range type the rvalue overload is deleted,
@@ -349,7 +358,9 @@ and Valgrind).
 
 **Timeouts** are a `Timeout`: `no_wait` (the default), any `std::chrono::duration`, or `wait_forever`. Durations are
 rounded up to whole nanoseconds and saturate at `INT64_MAX` nanoseconds; the unsigned conversion for retention ages
-and back-off sleeps saturates at `UINT64_MAX`. **Integral counts are converted exactly, for every period**, in
+and back-off sleeps saturates at `UINT64_MAX`. **Integral counts are converted exactly, for every period that
+converts at all** (a period for which `std::ratio_divide<Period, std::nano>` overflows, such as
+`std::ratio<INTMAX_MAX, INTMAX_MAX - 1>`, is rejected at compile time by the standard library), in
 integer arithmetic (so `std::chrono::nanoseconds{9'200'000'000'000'000'000}` stays that value): a positive duration
 never becomes 0 and never comes out below its exact value. The count is split into whole periods and a remainder;
 where the period's `num * den` does not fit 64 bits, the remainder's share is computed with a 128-bit product where
