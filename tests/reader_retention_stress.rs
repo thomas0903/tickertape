@@ -29,8 +29,8 @@ use tickertape::{
     Error, NewRecord, OwnedRecord, Reader, ReaderConfig, RecoveryAction, Writer, inspect,
 };
 use tickertape_tests::{
-    Rng, append_n, check_record, corrupt_by_replacement, end_of_records, payload_len,
-    reopen_writer, segments, small_config, zero_commit_word,
+    Rng, append_n, check_record, corrupt_by_replacement, end_of_records, payload_len, segments,
+    small_config, zero_commit_word,
 };
 
 /// A reader that hasn't made progress for this long while the writer has is stuck. Time during which the writer
@@ -690,7 +690,7 @@ fn restart_loop(
                 }
             }
         }
-        writer = reopen_writer(shared.dir, config.clone());
+        writer = Writer::open(shared.dir, config.clone()).unwrap();
         let actions = &writer.recovery_report().actions;
         moved.extend(actions.iter().filter_map(|a| match a {
             RecoveryAction::RepairedTail { segment, .. }
