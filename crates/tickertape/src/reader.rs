@@ -555,7 +555,7 @@ impl Reader {
             Some(map) => {
                 // SAFETY: the payload is part of a record validated after observing its non-zero commit word;
                 // on an intact publication chain `open_mapped`'s contract makes it immutable while the reader
-                // exists (ADR 0027 → "Which loads can race" names the exception).
+                // exists (ADR 0027 → "Which loads can race" describes both cases after storage damage).
                 unsafe { map.committed_bytes(found.payload_at, found.payload_len as u64) }
                     .unwrap_or(&[])
             }
