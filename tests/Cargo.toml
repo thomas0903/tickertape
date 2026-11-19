@@ -60,3 +60,7 @@ workspace = true
 [[test]]
 name = "retention"
 path = "retention.rs"
+
+[[test]]
+name = "status"
+path = "status.rs"
