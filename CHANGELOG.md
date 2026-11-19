@@ -5,6 +5,14 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
+- Fixed: writer recovery no longer zeroes committed records in place when storage damage zeroes a commit word after
+  the checkpoint. It used to take the empty commit word for the end of the journal and zero everything after it,
+  under `RecoveryPolicy::Fail` too, changing bytes that zero-copy readers had borrowed. Recovery now checks the
+  bytes after an empty commit word for committed history (a later record that validates with a sequence number its
+  position allows, a final seal, or a later segment) and treats it as corruption: `Quarantine` preserves the tail in
+  `quarantine/` and replaces the segment, `Fail` refuses without changing a byte. Torn appends are still zeroed in
+  place. New `CorruptReason::EmptyCommitWord`, which `verify` also reports (ADR 0035). The newest record's commit
+  word zeroed with nothing after it remains indistinguishable from a torn append.
 - Benchmarks: the test of a lagging reader under retention no longer depends on machine speed (it failed on
   macOS CI runners), and `tt-sustained` readers retry a seek when retention removes the segment they were about to
   open.

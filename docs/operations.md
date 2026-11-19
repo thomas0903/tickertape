@@ -142,7 +142,9 @@ Never truncate or edit a segment in place while anything uses the journal: proce
   most a zeroed uncommitted tail, a completed seal or roll, and removed temporary files.
 - **Power loss or storage errors:** the writer validates the journal from the last checkpoint. Corrupt or
   disconnected data is moved to `quarantine/` (never deleted), or, with `RecoveryPolicy::Fail`, the writer refuses to
-  open so that a human can look first. Readers that had seen discarded records get `Error::Discarded`.
+  open so that a human can look first. That includes committed records hidden behind a zeroed commit word
+  (`EmptyCommitWord`): the quarantine file starts at the empty word and holds them byte for byte (ADR 0035).
+  Readers that had seen discarded records get `Error::Discarded`.
 - **Refused to open** (missing checkpoint segment or a gap in the chain): restore the missing segments from a copy,
   or move the affected segments aside knowingly. tickertape won't discard history on its own.
 

@@ -3,8 +3,9 @@
 Status: **accepted** (M1, approved by the owner on 2026-10-31). This document is normative: the code
 must match it. Rationale: ADRs [0002](decisions/0002-record-format.md) (record format),
 [0003](decisions/0003-publication-protocol.md) (publication and memory access),
-[0005](decisions/0005-segment-rolling.md) (segments and rolling) and
-[0007](decisions/0007-checkpoint-marker-and-recovery.md) (checkpoint marker and recovery).
+[0005](decisions/0005-segment-rolling.md) (segments and rolling),
+[0007](decisions/0007-checkpoint-marker-and-recovery.md) (checkpoint marker and recovery) and
+[0035](decisions/0035-recovery-preserves-a-committed-tail.md) (committed records after an empty commit word).
 
 ## Conventions
 
@@ -215,15 +216,27 @@ Readers never modify a journal. Only the writer repairs it, on open, after takin
 3. **Scan forward** through the chain, validating every record and seal: record by record within a segment; at a
    valid seal, into the segment it names. The scan stops at the first position `P` (in segment `X`, of size `Z`)
    that is not a valid record and not a valid seal whose successor exists.
-4. **Classify what is at `P`:**
+4. **Classify what is at `P`.** At a commit word `0`, first look for **committed history** after it (ADR 0035), where
+   `S` is the expected sequence number: (a) an 8-byte-aligned `Q > P` holding a record that is valid for some
+   sequence number `T` with `S < T <= S + floor((Q - P) / 40)` (records `S` to `T - 1` must fit between, at least 40
+   bytes each); (b) a valid seal for such a `T` that is the last non-zero item in `X`; or (c) a segment with a
+   `base_seq` greater than `S`, when `[P+4, Z)` holds any non-zero byte. A writer process crash never leaves any of
+   these: the bytes of a torn append lie inside the one frame being written, and a segment with base `B` exists only
+   once record `B - 1` was committed. The search reads only; its work is bounded (ADR 0035), and if candidate
+   records would need CRC32C over more than twice `Z - P` bytes it stops and counts the tail as committed history.
 
    | At `P` | Meaning | Action |
    |---|---|---|
-   | Commit word `0`, and a segment named `{next_seq:020}.tape` exists | The previous writer died between publishing the next segment and sealing this one | Zero any non-zero bytes in `[P, Z)` in place, write the seal, and continue scanning in that segment (step 3) |
-   | Commit word `0`, no such segment | Clean end, or a body the previous writer never committed (no reader ever saw it) | Zero any non-zero bytes in `[P, Z)` in place. This is the end of the chain |
+   | Commit word `0`, committed history after it | Storage damage, power loss or outside modification hid committed records behind an empty commit word | Corruption, as in the last row, reported as `EmptyCommitWord(T)`: `Quarantine` preserves `[P, Z)` and repairs by replacement; `Fail` refuses before anything in `X` is changed |
+   | Commit word `0`, no committed history, and a segment named `{next_seq:020}.tape` exists | The previous writer died between publishing the next segment and sealing this one | Zero any non-zero bytes in `[P, Z)` in place, write the seal, and continue scanning in that segment (step 3) |
+   | Commit word `0`, no committed history, no such segment | Clean end, or a body the previous writer never committed (no reader ever saw it) | Zero any non-zero bytes in `[P, Z)` in place. This is the end of the chain |
    | Valid seal, successor missing, no segment with a larger `base_seq` | Crash or power loss during a roll | Create the successor (as in "Rolling"). This is the end of the chain |
    | Valid seal, successor missing, a segment with a larger `base_seq` exists | A segment in the middle of the chain is missing (deleted by someone, or lost) | **Refuse** under every policy: tickertape doesn't discard a large part of a journal on its own |
    | Commit word non-zero, invalid record or seal | Not possible after a writer *process* crash. Power loss, storage corruption or outside modification | `Quarantine` (default): preserve `[P, Z)` in `quarantine/`, then **repair by replacement**: write a copy of `X` with `[P, Z)` zeroed to `X.tmp`, sync it, and `rename` it over `X`. `Fail`: refuse (see below) |
+
+   Bytes are zeroed in place only where no record was ever committed, so no reader can have seen them. The newest
+   record's commit word zeroed with nothing after it can't be told from an append killed just before its commit
+   store, and is zeroed like one.
 
 5. **Disconnected segments.** Every segment in the recovery domain that the scan did not visit (whatever its
    `base_seq`, including one between visited segments) and every segment in the domain with an invalid header is
@@ -255,7 +268,8 @@ repair. Leftover `.partial` files are kept as evidence. Records before `P` are n
 
 Every action is reported in the writer's `RecoveryReport`. Recovery work is: listing the directory; reading every
 record after the scan start (the data written since the last checkpoint); reading `[P, Z)` of the last segment to find
-non-zero bytes; and, only for repairs, copying the affected segment or tail.
+non-zero bytes and, up to the last of them, checking each 8-byte position for committed history (step 4); and, only
+for repairs, copying the affected segment or tail.
 
 ### What readers do about repairs
 
