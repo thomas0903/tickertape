@@ -5,10 +5,12 @@ use std::time::Duration;
 
 use tickertape::fault::Point;
 use tickertape::retention::{self, Action, Policy};
-use tickertape::{Error, NewRecord, OwnedRecord, Reader, ReaderConfig, RecoveryAction, Writer};
+use tickertape::{
+    Error, NewRecord, OwnedRecord, Reader, ReaderConfig, RecoveryAction, Writer, format,
+};
 use tickertape_tests::{
-    append_n, check_record, corrupt_by_replacement, read_all, segments, small_config,
-    zero_commit_word, zero_commit_words_from,
+    append_n, check_record, corrupt_by_replacement, locate_record, open_raw, read_all, segments,
+    small_config, zero_commit_word, zero_commit_words_from,
 };
 
 fn open(dir: &std::path::Path, mapped: bool) -> Reader {
@@ -891,5 +893,166 @@ fn visible_reader_after_a_repair_is_discarded_at_the_old_end() {
         assert_repaired_history(dir.path(), &records, 20..25);
         assert!(discarded.is_empty());
         assert!(records.iter().all(|r| r.schema_id == 99));
+    }
+}
+
+/// A journal of `small_config` segments whose segment 0 is sealed: records 0..100 checkpointed, then records up to 10
+/// past the roll, and the writer dropped. Returns the successor's base and the seal's offset in segment 0.
+fn sealed_journal(dir: &std::path::Path) -> (u64, u64) {
+    let mut writer = Writer::open(dir, small_config()).unwrap();
+    append_n(&mut writer, 100);
+    writer.checkpoint().unwrap();
+    while segments(dir).len() < 2 {
+        append_n(&mut writer, 1);
+    }
+    append_n(&mut writer, 10);
+    drop(writer);
+    let successor = segments(dir)[1].0;
+    let (path, offset) = locate_record(dir, successor - 1);
+    let image = std::fs::read(path).unwrap();
+    match format::read_slot(&image[..], offset, successor - 1) {
+        Ok(format::Slot::Record { next_offset, .. }) => (successor, next_offset),
+        other => panic!("record {}: {other:?}", successor - 1),
+    }
+}
+
+/// Storage damage zeroes segment 0's seal marker and the successor's header, so the successor no longer opens. The next
+/// writer's recovery can't tell the seal's leftover CRC word from a crash between publishing a successor and sealing
+/// with its header since damaged (ADR 0035 → Damage around a seal): it zeroes that word **in place**, so segment 0 keeps
+/// its identity and ends at the seal's place, and quarantines the successor as disconnected. The new writer begins
+/// there. A reader can't see this repair, and the journal it leaves is healthy.
+fn remove_seal_in_place(dir: &std::path::Path, successor: u64, seal: u64) -> Writer {
+    use std::os::unix::fs::{FileExt, MetadataExt};
+    let identity = |path: &std::path::Path| {
+        let meta = std::fs::metadata(path).unwrap();
+        (meta.dev(), meta.ino())
+    };
+    let segs = segments(dir);
+    let before = identity(&segs[0].1);
+    open_raw(&segs[0].1).write_all_at(&[0; 4], seal).unwrap();
+    open_raw(&segs[1].1).write_all_at(b"X", 0).unwrap(); // damages the magic
+    let writer = Writer::open(dir, small_config()).unwrap();
+    let actions = &writer.recovery_report().actions;
+    assert!(
+        matches!(
+            actions.as_slice(),
+            [
+                RecoveryAction::ZeroedUncommitted { offset, len: 4, .. },
+                RecoveryAction::QuarantinedSegment { .. },
+            ] if *offset == seal + 4
+        ),
+        "{actions:?}"
+    );
+    assert_eq!(writer.next_seq(), successor);
+    assert_eq!(segments(dir).len(), 1);
+    assert_eq!(identity(&segs[0].1), before, "repaired in place");
+    writer
+}
+
+/// Found by `reader_retention_stress::durable_readers_under_repairs_long` (CI, arm64 Linux, seed
+/// 1795100883310377747): a visible safe reader reported `Corrupt { BrokenChain }` on a healthy journal. It had read
+/// segment 0 into its buffer up to the seal; recovery then removed the seal in place and quarantined the successor,
+/// and the reader followed the seal it still held, found no successor while its segment was in place, and reported a
+/// broken chain on every call until the new writer happened to roll to the same base again (forever, if it never
+/// does). Before ADR 0035 one zeroed commit word in a sealed segment was enough; now one in-place repair that
+/// removes a seal is the one in [`remove_seal_in_place`] (another is a zeroed stretch from a record through the
+/// seal). A zero-copy reader reads the current bytes, but can load the seal just before the damage.
+///
+/// The seal it read is gone from the file, so it isn't corruption: the reader reads the slot again and waits there
+/// (`Ok(None)`), then continues in the new history, which kept the file's identity, without `Error::Discarded` (C11).
+/// Three moments: the repair before the reader reaches the seal (the safe reader has it buffered; the zero-copy
+/// reader sees the empty slot), after it read the seal and before it opens the successor, and the same with the new
+/// writer rolling again before the reader reads the slot again (the seal is back, and its successor opens).
+#[test]
+fn visible_reader_does_not_follow_a_seal_an_in_place_repair_removed() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum When {
+        BeforeTheSeal,
+        AtTheSeal,
+        AtTheSealThenRoll,
+    }
+    for when in [
+        When::BeforeTheSeal,
+        When::AtTheSeal,
+        When::AtTheSealThenRoll,
+    ] {
+        for mapped in [false, true] {
+            let case = format!("{when:?}, mapped {mapped}");
+            let dir = tempfile::tempdir().unwrap();
+            let (successor, seal) = sealed_journal(dir.path());
+            let config = ReaderConfig::default().notify(false);
+            let mut reader = if mapped {
+                // SAFETY: only the tickertape writer modifies segment files in this test, apart from the damage
+                // injected while no writer runs. That damage touches bytes the reader has not read or, in the case
+                // at the seal, the seal's words, which the mapped reader read with atomic loads and holds no
+                // reference to; it never touches a payload the reader has lent out.
+                unsafe { Reader::open_mapped(dir.path(), config) }.unwrap()
+            } else {
+                Reader::open(dir.path(), config).unwrap()
+            };
+            // The safe reader now holds segment 0 in its buffer, seal included.
+            for seq in 0..successor {
+                let record = reader.next_owned().unwrap().unwrap();
+                assert_eq!(record.seq, seq, "{case}");
+                check_record(&record);
+            }
+            let writer = Rc::new(RefCell::new(None));
+            let path = dir.path().to_path_buf();
+            if when == When::BeforeTheSeal {
+                *writer.borrow_mut() = Some(remove_seal_in_place(&path, successor, seal));
+            } else {
+                let (w, p) = (writer.clone(), path.clone());
+                at(Point::ReaderSeal, move || {
+                    *w.borrow_mut() = Some(remove_seal_in_place(&p, successor, seal));
+                });
+            }
+            if when != When::AtTheSealThenRoll {
+                // One call reads the slot again at most once. A reader that kept its stale buffer would come back
+                // to the buffered seal and re-read without end: fail instead of hanging.
+                tickertape::fault::run_at(Point::ReaderSealReread, 1, || {
+                    panic!("the reader read the seal's slot again twice in one call")
+                });
+            }
+            if when == When::AtTheSealThenRoll {
+                let w = writer.clone();
+                tickertape::fault::run_at(Point::ReaderSealReread, 0, move || {
+                    let mut w = w.borrow_mut();
+                    let writer = w.as_mut().expect("repaired at the seal");
+                    append_history(writer, 1, 99);
+                    assert_eq!(
+                        segments(&path).len(),
+                        2,
+                        "the new writer rolled to {successor}"
+                    );
+                });
+            }
+            let first = reader.try_next().map(|r| r.map(|r| r.to_owned()));
+            tickertape::fault::clear();
+            match (when, first) {
+                (When::AtTheSealThenRoll, Ok(Some(record))) => {
+                    assert_eq!((record.seq, record.schema_id), (successor, 99), "{case}");
+                }
+                (When::BeforeTheSeal | When::AtTheSeal, Ok(None)) => {
+                    assert!(reader.try_next().unwrap().is_none(), "{case}");
+                    let mut w = writer.borrow_mut();
+                    append_history(w.as_mut().expect("repaired"), 1, 99);
+                    let record = reader
+                        .next_timeout(Some(Duration::from_secs(5)))
+                        .unwrap()
+                        .expect("the new history's first record")
+                        .to_owned();
+                    assert_eq!((record.seq, record.schema_id), (successor, 99), "{case}");
+                }
+                (_, other) => panic!("{case}: {:?}", other.map(|r| r.map(|r| r.seq))),
+            }
+            // On in the new history, which the repair kept in segment 0's file: no `Error::Discarded`.
+            append_history(writer.borrow_mut().as_mut().unwrap(), 4, 99);
+            let (records, discarded) = drain(&mut reader, successor + 5);
+            assert!(discarded.is_empty(), "{case}: {discarded:?}");
+            assert!(records.iter().all(|r| r.schema_id == 99), "{case}");
+            assert_eq!(records.len(), 4, "{case}");
+        }
     }
 }
