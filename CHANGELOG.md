@@ -5,6 +5,15 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
+- Library: dropping a `Writer` now releases the journal lock explicitly (`flock(LOCK_UN)`), after its helper threads
+  have stopped and readers have been told it has gone, and so does a `Writer::open` that fails after taking the lock.
+  Until now the lock was released only when the last copy of its descriptor closed, and a child that another thread
+  had forked (for example to spawn a program) holds a copy until it calls `exec` or exits, so reopening the journal
+  right after dropping the writer or after a failed open, or handing it over to another process, could fail with
+  `Error::Locked` naming this process. Only the process that opened the writer unlocks: a forked child dropping its
+  copy of a writer (which it must not do) leaves the lock with the parent. A writer process that exits or dies
+  without dropping its writer still leaves the lock with such a child until it execs or exits, for its whole life if
+  it never execs (crash contract C3).
 - Fix: readers racing with retention (the writer's policy or `tickertape archive`) no longer report a removed segment
   as an error of the wrong kind. `Reader::seek` returned an I/O "not found" error when the segment it chose was
   removed before it opened it; it now lists the segments again and returns `Error::SeqUnavailable` with the new
