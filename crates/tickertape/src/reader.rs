@@ -106,7 +106,8 @@ struct Found {
 /// to load, twice per record. The per-record path now passes only a tag and a length, and the checks below keep it so.
 /// They catch the header (or anything as large) moving back into these values and a change of what the functions on
 /// the per-record path return; they cannot catch other ways in which a change makes the compiler slower here, so a
-/// change to this file or to `format.rs` needs the `replay` benchmark before and after (`CONTRIBUTING.md`).
+/// change to this file, to `format.rs` or to what this path inlines or returns (`error.rs`, `mmap.rs`, `crc.rs`)
+/// needs the `replay` benchmark before and after (`CONTRIBUTING.md`).
 #[derive(Debug, Clone, Copy)]
 enum SlotOutcome {
     Empty,
@@ -115,7 +116,11 @@ enum SlotOutcome {
     Invalid(CorruptReason),
 }
 
-const _: () = assert!(size_of::<SlotOutcome>() < size_of::<RecordHeader>());
+const _: () = assert!(
+    size_of::<SlotOutcome>() < size_of::<RecordHeader>(),
+    "SlotOutcome must stay smaller than RecordHeader: see the comment above it (a larger CorruptReason variant \
+     also trips this)"
+);
 const _: fn(&mut Reader, bool) -> Result<SlotOutcome> = Reader::read_slot;
 const _: fn(&mut Reader) -> Result<bool> = Reader::next_slot;
 const _: fn(&mut Reader) -> Result<bool> = Reader::advance;
