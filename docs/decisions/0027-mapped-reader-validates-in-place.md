@@ -1,7 +1,8 @@
 # 0027: The zero-copy reader validates records straight from atomic loads
 
 - **Status:** accepted (supersedes the zero-copy reader's validation copy in [0003](0003-publication-protocol.md))
-- **Date:** 2026-11-19
+- **Date:** 2026-11-19 (revised the same day after three independent reviews: the safety argument for damaged
+  lengths, supported targets, tests)
 
 ## Context
 
@@ -10,10 +11,10 @@ every record it first copied the frame out of the mapping with 8-byte `Relaxed` 
 (`MapRo::copy_atomic_into`), validated the copy (length, CRC32C, sequence number, flags), and only then created a
 `&[u8]` into the mapping for the payload. The copy was added after the M4 review, for two reasons that still hold:
 
-1. **No reference before validation.** Until a record is validated, its commit word is untrusted. A length corrupted
-   on disk could make a slice cover bytes the writer is appending at that moment. A `&[u8]` over bytes that another
-   thread or process writes concurrently is undefined behaviour (a data race through non-atomic reads, and a shared
-   reference that asserts its bytes don't change).
+1. **No reference asserting immutability before validation.** Until a record is validated, its commit word is
+   untrusted. A length damaged on disk could make a slice cover bytes the writer is appending at that moment. A
+   `&[u8]` over bytes that another thread or process writes concurrently is undefined behaviour (a data race through
+   non-atomic reads, and a shared reference that asserts its bytes don't change).
 2. **The checked bytes must be the used bytes.** A CRC computed over bytes that then change proves nothing about what
    is read afterwards. Validating a snapshot made the header values, the CRC input and the decision come from one
    set of loads.
@@ -28,9 +29,11 @@ Spec: [`format.md`](../format.md) → Publication; ADR 0003.
 
 - **Writer.** It writes the body `[P+4, P+len)` with ordinary stores, then stores `len` into the commit word at `P`
   with `Release`. The padding `[P+len, P+align8(len))` is already zero and never written; the next record starts at
-  `P+align8(len)`. After the release store the writer never modifies `[P, P+align8(len))` again: abandoned bodies are
-  zeroed (durably) before any later commit, and recovery repairs by writing a new file, never by editing a mapped one
-  (ADR 0007). This is the "committed bytes are immutable" guarantee.
+  `P+align8(len)`. After the release store the writer never modifies `[P, P+align8(len))` again. Abandoned bodies
+  are zeroed (durably) before any later commit. Recovery never modifies committed bytes either: in place, it only
+  zeroes never-committed bytes after the first empty slot (`zero_uncommitted_tail`) and writes a missing seal at
+  that slot (`write_seal`); every other repair replaces or moves a whole file (ADR 0007, `format.md` → Recovery).
+  This is the "committed bytes are immutable" guarantee.
 - **Reader, ordering.** It loads the commit word with a 4-byte `Relaxed` atomic load and, if it is non-zero, issues
   `fence(Acquire)`. If that load read the value of the writer's release store, the store synchronises with the fence,
   so every write the writer made before the store happens before every load the reader makes after the fence (fence
@@ -44,17 +47,79 @@ Spec: [`format.md`](../format.md) → Publication; ADR 0003.
 
   None of these overlaps the commit word, so there is no mixed-size access to it (the old copy loaded it again as
   half of an 8-byte word). The loads are unordered among themselves; they need no order, since one release store
-  published all of them. `Relaxed` 4- and 8-byte loads are the only atomic operations `std::sync::atomic` documents
+  published all of them. `Relaxed` 4- and 8-byte loads are the only atomic operations `core::sync::atomic` documents
   as allowed on read-only memory on x86-64 and aarch64 ("Atomic accesses to read-only memory", present at MSRV 1.85),
   which is why neither `Acquire` loads nor wider loads are used.
-- **The bad case.** If the commit word is corrupted so that the frame reaches bytes the writer is writing now, every
-  read is still an atomic load: no data race and no reference exist, and at worst a load returns a stale or torn
-  value. The CRC then fails, except for a collision (about 2^-32 per corrupted record, as before), and no slice is
-  created.
 
 `SharedWords` keeps the `&[AtomicU64]` it wraps private and offers only `Relaxed` loads, so no other operation can
-reach the read-only mapping. Over ordinary memory (`SharedWords::new`) the same code runs under Miri and in the
-fuzzer.
+reach the read-only mapping. That slice is a reference, but to `UnsafeCell`s: it asserts nothing about the bytes
+staying unchanged. No `&[u8]` or other reference that asserts immutability exists before validation succeeds; the
+payload's `&[u8]` is formed afterwards (`MapRo::committed_bytes`). Over ordinary memory (`SharedWords::new`) the same
+code runs under Miri and in the fuzzer, and a test runs `MapRo`'s own loads under Miri over an anonymous mapping.
+
+## Which loads can race
+
+**Records published by the protocol: no race and no mixed-size access.** For a record whose commit word holds the
+length the writer stored, the writer's release store of that word synchronises with the reader's acquire fence, so
+every writer store to the frame happens before every reader load of it, and the writer never stores to the frame
+again. The reader's loads stay inside `[P+4, P+align8(len))`: they end where the next slot's commit word begins and
+never touch another record's commit word, which the writer accesses only as a 4-byte atomic. The commit word at `P`
+itself is loaded as a 4-byte atomic too. The CRC field load at `P+4` (and a seal's CRC) is also safe in the case
+below, because `[P+4, P+8)` always lies before the next slot.
+
+**A frame whose length is damaged: a known limitation.** This case stays inside `open_mapped`'s contract:
+
+1. A writer appends up to offset `Q` in a segment and checkpoints.
+2. While nothing runs, storage damage enlarges the length in the commit word of an earlier record at `P`, so that
+   the claimed frame `[P, P+align8(len))` reaches past `Q`.
+3. A writer reopens. Recovery starts at the checkpoint and does not re-read what precedes it; the writer appends from
+   `Q`.
+4. A zero-copy reader replays from the segment start. At `P`, its 8-byte loads cover bytes the writer is filling
+   with ordinary (non-atomic) stores, and can cover a later record's commit word, which the writer stores as a 4-byte
+   atomic.
+
+An atomic load that races with a non-atomic store is a data race in Rust's memory model, and overlapping atomic
+accesses of different sizes are undefined as well; a reviewer confirmed both with Miri on a small model. When the
+writer is another process, which is the normal deployment, the accesses are outside the model altogether (ADR 0003
+already reasons about cross-process `MAP_SHARED` memory by analogy with threads). Here the implementation relies on
+facts below the language:
+
+- on x86-64 and aarch64 (the only targets that map segments for reading, below), an aligned 4- or 8-byte load is a
+  single instruction (`mov`, `ldr`) that cannot fault inside the mapping and returns some mixture of old and new bytes
+  of the word, never anything else;
+- the compiler may not split, repeat or invent an atomic load, so each word is read once, and the value validated is
+  the value fed to the CRC;
+- no `&[u8]` or other reference asserting immutability exists before validation, so nothing licenses the compiler to
+  assume the bytes are stable.
+
+The outcome: the CRC rejects the frame, except with probability about 2^-32 per attempt (a reader retries
+`VALIDATION_RETRIES` times before reporting corruption), as in every earlier release. A chance match that also passes
+the sequence and flag checks would hand out a slice over bytes that are still being written. **The copying reader
+before this decision had exactly the same exposure**, since it copied the same range with the same atomic loads; this
+decision does not introduce it, and it removes the old reader's one mixed-size load (the record's own commit word,
+loaded again as half of an 8-byte word).
+
+Closing it needs the reader's loads to be bounded by a publication boundary that is synchronised independently of
+the untrusted length: a shared frontier word that the writer advances on every append. That is a protocol change with
+its own design and measurements, so it is a separate follow-up (roadmap → "Remove the mapped reader's validation
+copy"), not part of this decision.
+
+**Can any of the exposure be removed at no cost?** No:
+
+- *A segment that has a successor.* It looks as if no writer store could race with a load in a segment that is no
+  longer the active one, but the existence of the successor doesn't establish that: the writer links the successor
+  first and only then writes the seal into the old segment (`Writer::roll`), and recovery after a crash between the
+  two zeroes the old segment's tail and writes the seal in place. Only an observed seal would prove the segment
+  finished, and the reader can't find the seal without walking the very lengths in question (or without a frontier).
+  Checking for a successor also costs a directory lookup, which can only be done per segment, not at the load.
+- *Clamping the frame.* Any bound on `len` that doesn't come from an independently synchronised word is either the
+  segment size, which is already checked, or derived from the same untrusted bytes.
+- *Ordering the CRC so that damaged frames fail early.* The CRC needs every word, and the header checks that could
+  fail first (sequence number, flags) come from the first words, which are committed bytes anyway; they can't stop
+  the loads past `Q`.
+
+Everything the reader can do cheaply already happens: lengths are checked against the segment before any load,
+every length step is overflow-checked, and the loads are atomic, aligned and inside the mapping.
 
 ## Computing the CRC without a slice
 
@@ -93,6 +158,15 @@ broken, is kept by loading each word once. The validation-before-slice order is 
 `open_mapped`, the crash contract and the on-disk format are therefore unchanged; their wording about "a copy" is
 updated.
 
+## Supported targets
+
+The argument rests on `core::sync::atomic`'s guarantee for `Relaxed` loads from read-only memory, which covers
+8-byte loads on x86-64 and aarch64 but only 4 bytes on 32-bit targets (on i686 without SSE an 8-byte atomic load is a
+locked compare-exchange, which faults on a read-only page). So segments are mapped for reading only on x86-64 and
+aarch64 (`mmap::MAPPED_READS`). Elsewhere `Reader::open_mapped` opens the `pread` reader instead: same API, same
+results, payloads borrowed from the reader's own buffer, and no read-only mapping at all (`MapRo::new` refuses). The
+crate still refuses big-endian and non-Unix targets. CI checks that the gate compiles for `i686-unknown-linux-gnu`.
+
 ## Truncation and `SIGBUS`
 
 Unchanged. The reader touches the same pages as before, `[P, P+align8(len))` for each record it validates (the copy
@@ -103,24 +177,29 @@ before and as any read of a returned payload would. The safe reader still never 
 
 1. **Keep the copy.** Sound and simple, but one extra pass per payload, and the zero-copy reader stays slower than the
    copying `pread` reader for long records.
-2. **`ptr::read_volatile` of each word.** Compiles to the same loads, but in Rust's memory model a volatile read that
-   races with a write is still a data race; it is only defined for memory outside the abstract machine (MMIO). The
-   corrupted-length case is exactly where the race could happen, so this would weaken the argument for no gain.
+2. **`ptr::read_volatile` of each word.** Compiles to the same loads, and in the damaged-length case it would be no
+   worse than the atomic loads chosen, since both are formally racy there. It is worse everywhere else: the standard
+   library documents which atomic loads work on read-only memory, and says nothing equivalent for volatile reads;
+   the compiler may not tear, split or repeat an atomic load, while a volatile read of a `u64` carries no
+   single-access guarantee; and atomic loads take part in the happens-before ordering on the valid path (the acquire
+   fence orders the writer's stores before them), whereas a non-atomic volatile read of bytes another thread wrote
+   is only ordered by that same fence and gains nothing.
 3. **Wider loads** (16-byte atomics, SIMD loads, inline assembly). `AtomicU128` is unstable; 16-byte and vector loads
    are not documented as allowed on read-only memory; assembly would add `unsafe` outside the two permitted modules.
    The CRC instruction consumes 8 bytes at a time anyway.
-4. **Form `&[u8]` first and use the existing slice CRC.** Undefined behaviour in the corrupted-length case; this is
-   what the M4 review removed.
+4. **Form `&[u8]` first and use the existing slice CRC.** A reference asserting immutability over bytes a writer may be
+   storing, in the damaged-length case, and non-atomic reads; this is what the M4 review removed.
 5. **A bounded staging copy**: copy 256 bytes at a time to the stack and run the slice CRC on it. Sound, and it keeps
    the copy in L1, but still a copy of every byte; the software fallback does this. Measured below for comparison.
 6. **CRC straight from 8-byte `Relaxed` atomic loads, each word loaded once** (chosen).
 
 ## Decision
 
-Option 6, as described above. `MapRo::copy_atomic_into` and the reader's scratch buffer are removed. Unsafe code:
-two new blocks in `mmap.rs` (`MapRo::load_u32`, a 4-byte load; `MapRo::words`, an `&[AtomicU64]` over a bounds-checked,
-8-aligned range wrapped in `SharedWords`), and target-feature functions in `crc.rs` that call the same intrinsics as
-before on values.
+Option 6, as described above, on x86-64 and aarch64; the `pread` reader on other targets. `MapRo::copy_atomic_into`
+and the reader's scratch buffer are removed. Unsafe code: two new blocks in `mmap.rs` (`MapRo::load_u32`, a 4-byte
+load; `MapRo::words`, an `&[AtomicU64]` over a bounds-checked, 8-aligned range wrapped in `SharedWords`), and
+target-feature functions in `crc.rs` that call the same intrinsics as before on values. The damaged-length case above
+is accepted as a known limitation, unchanged from earlier releases, until the publication-frontier follow-up.
 
 ## Measurements
 
@@ -158,12 +237,22 @@ sends on these machines. A difference of 5–40 ns per record is below what that
 - No extra pass over the payload in the zero-copy reader on CPUs with a CRC instruction.
 - Results are bit-identical with the `pread` reader, which is now checked directly:
   `tests/mapped_reader.rs` (every payload length from 0 to 4,200 bytes, page and segment boundaries, every corruption
-  class, a proptest over random damaged journals), unit tests comparing `decode_record_words` with
-  `decode_record_body` for every length through two rounds of both lane sizes, a word-level CRC test for every word
-  count on both paths, and a differential check in the `decode_record` fuzz target. The kill loop keeps a live
-  zero-copy reader across every crash, and the `loom` model gains a single-pass validation case (the load ordering
-  itself is unchanged).
-- The Miri job also runs the CRC tests (`cargo +nightly miri test -p tickertape --lib -- format crc`), which execute
-  the word decoder and the software fallback over `SharedWords` on ordinary memory. Miri cannot run the hardware path
-  or real mappings.
+  class on short records and on records at and past the three-lane thresholds, each flag bit and a wrong sequence
+  number together with a flag under a valid CRC, a proptest over random damaged journals), unit tests comparing
+  `decode_record_words` with `decode_record_body` for every length through two rounds of both lane sizes, with and
+  without a recomputed CRC after the damage (so the checks after the CRC are reached), a word-level CRC test for every
+  word count on both paths, and a differential check in the `decode_record` fuzz target, which also recomputes the
+  CRC and fills the padding with non-zero bytes. Tests also check that both CRC entry points take the hardware path
+  where the CPU has it and run the three-lane blocks for long inputs.
+- Live validation is tested too: a zero-copy reader polls continuously while writer processes append records of mixed
+  sizes (up to 3,199 bytes), roll, and are killed and restarted (`tests/kill_loop.rs::live_mapped_reader_*`); and a
+  deterministic test pauses the writer when a record is complete but unpublished and checks that both readers see
+  nothing until the commit word is stored, then exactly that record (`fault::before_next_publish`, test builds only).
+  The kill loop keeps a live zero-copy reader across every crash, and the `loom` model gains a single-pass validation
+  case (the load ordering itself is unchanged).
+- The Miri job also runs the CRC tests and `MapRo`'s loads over an anonymous mapping
+  (`cargo +nightly miri test -p tickertape --lib -- format crc map_ro`), which execute the word decoder, the software
+  fallback, and the pointer arithmetic, bounds and alignment of `MapRo::load_u32` and `MapRo::words`. Miri cannot run
+  the hardware path or file mappings. `RUSTFLAGS="--cfg tickertape_force_soft_crc"` builds only the software fallback,
+  so the whole suite can run on it.
 - `crc.rs` and `mmap.rs` changed, so this needs the independent review those modules require.

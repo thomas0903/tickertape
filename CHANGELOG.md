@@ -13,6 +13,17 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 - Tests: the mapped and safe readers are checked against each other over every payload length up to 4,200 bytes, page
   and segment boundaries, every corruption class and random damaged journals; the kill loop keeps a live zero-copy
   reader across every crash; Miri also runs the CRC tests.
+- Platforms: `Reader::open_mapped` maps segments only on x86-64 and aarch64, where 8-byte atomic loads from read-only
+  memory are documented to work. On other targets it now reads with `pread`, like `Reader::open` (same API and
+  results). CI checks that the crate builds for `i686-unknown-linux-gnu`.
+- Docs: `open_mapped`'s rustdoc, ADR 0027 and the crash contract now state precisely when the zero-copy reader's
+  validation loads can race with a writer (only for a record whose length was damaged on disk, as in every earlier
+  release) and what then happens; a publication frontier that closes this is a separate follow-up.
+- Tests: a zero-copy reader polls while writer processes append records of mixed sizes, roll and are killed; a
+  deterministic test checks that a complete but unpublished record stays invisible; differential tests recompute the
+  CRC after damage so the sequence and flag checks are reached; the corruption matrix covers records long enough for
+  the three-lane CRC; tests check that the word-fed CRC takes the hardware path and the three-lane blocks; Miri runs
+  `MapRo`'s loads over an anonymous mapping; `--cfg tickertape_force_soft_crc` runs the suite on the software CRC.
 - Docs: define the path to v1.0 around sustained performance, optional eBPF diagnostics, reader/checkpoint
   optimization, ARM measurements, interoperability, replay/recovery at scale and explicit stability/release gates.
 - Docs: v1.0 scope decisions of 2026-11-19. The external integration is an iceoryx2 recorder and replayer

@@ -29,9 +29,13 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 cargo +1.85 check --workspace --all-features --all-targets   # MSRV
 cargo deny check
 cargo test -p tickertape-tests --release -- --ignored        # long tests: 1M records, 250-kill loop
-cargo +nightly miri test -p tickertape --lib -- format crc   # Miri on the format and CRC code
+cargo +nightly miri test -p tickertape --lib -- format crc map_ro   # Miri: format, CRC, mapped loads
 RUSTFLAGS="--cfg loom" cargo test -p tickertape --lib --release protocol_model
+cargo check -p tickertape --all-features --target i686-unknown-linux-gnu   # 32-bit: no read-only mappings
 ```
+
+Changes to `crc.rs` should also pass the whole suite on the software CRC, which the instruction otherwise hides on
+every machine that has it: `RUSTFLAGS="--cfg tickertape_force_soft_crc" cargo test --workspace --all-features`.
 
 On macOS, run the Linux checks in a VM or container too (`docs/playbooks/test-on-linux.md`), and keep test journals
 on a local filesystem (not tmpfs or a shared folder) when you test durability behaviour.
