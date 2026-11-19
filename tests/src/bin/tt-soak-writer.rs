@@ -112,6 +112,7 @@ fn main() {
     let mut until_checkpoint = rng.below(200);
     let mut fault_armed = false;
     let mut since_stop_check = 0u32;
+    let parent = std::os::unix::process::parent_id();
     loop {
         // A phase: a burst without pauses, a steady stream with short pauses, or an idle gap.
         let (count, pause_us) = match rng.below(10) {
@@ -206,6 +207,9 @@ fn main() {
             since_stop_check += 1;
             if since_stop_check >= 64 {
                 since_stop_check = 0;
+                if std::os::unix::process::parent_id() != parent {
+                    return; // the soak test exited
+                }
                 if stop_file.exists() {
                     fault::clear();
                     writer.checkpoint().expect("final checkpoint");

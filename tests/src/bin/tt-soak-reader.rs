@@ -95,6 +95,7 @@ fn main() {
     let mut pending_seek: Option<u64> = None;
     let mut troubled_since: Option<Instant> = None;
     let mut last_stop_check = Instant::now();
+    let parent = std::os::unix::process::parent_id();
 
     loop {
         if let Some(target) = pending_seek {
@@ -142,6 +143,9 @@ fn main() {
                 troubled_since = None;
                 if last_stop_check.elapsed() > Duration::from_millis(200) {
                     last_stop_check = Instant::now();
+                    if std::os::unix::process::parent_id() != parent {
+                        log.fail("the soak test exited");
+                    }
                     // Re-read every time: the test may lower a target.
                     let stop_at: Option<u64> = std::fs::read_to_string(&stop_file)
                         .ok()
