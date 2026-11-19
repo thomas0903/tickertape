@@ -464,7 +464,7 @@ fn replay_guards_against_feedback_with_a_live_writer() {
     let appender = {
         let journal = journal.clone();
         let stop = std::sync::Arc::clone(&stop);
-        std::thread::spawn(move || {
+        std::thread::spawn(move || -> tickertape::Writer {
             let mut w = open_writer(&journal, LIVE_SEGMENT);
             let mut i = 0u64;
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
@@ -480,6 +480,7 @@ fn replay_guards_against_feedback_with_a_live_writer() {
                     std::thread::sleep(Duration::from_millis(1));
                 }
             }
+            w
         })
     };
     wait_until(SECS(10), "the appender to start", || count(&journal) > 1000);
@@ -501,25 +502,190 @@ fn replay_guards_against_feedback_with_a_live_writer() {
             "{args:?}: {err}"
         );
     }
-    let before = count(&journal);
-    let report = replay_json(
-        &journal,
-        &["--prefix", &format!("{}/", unique("elsewhere"))],
-    );
-    let after = count(&journal);
-    let messages = report["messages"].as_u64().unwrap();
-    assert!(messages + 2 >= before, "{messages} of {before}");
-    assert!(
-        report["last_seq"].as_u64().unwrap() < after,
-        "the replay stopped at the end observed at its start: {report}"
-    );
     let allowed = replay_json(
         &journal,
         &["--original-names", "--allow-live-targets", "--to", "7"],
     );
     assert_eq!(allowed["messages"], 6);
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    appender.join().unwrap();
+    // The writer stays open (a live writer); one more record is appended after the replay has started (its
+    // `on_start` runs after the end is captured, before the first record is read). The replay ends exactly at the
+    // record before it.
+    let writer = appender.join().unwrap();
+    let end = writer.next_seq();
+    let writer = std::sync::Arc::new(std::sync::Mutex::new(writer));
+    let report = {
+        use tickertape_iceoryx2::replayer::{Remap, Replayer};
+        let writer = std::sync::Arc::clone(&writer);
+        Replayer::builder(&journal)
+            .typed::<u64, ()>(&x)
+            .typed::<u64, ()>(&replayed_x)
+            .remap(Remap::default().prefix(format!("{}/", unique("elsewhere"))))
+            .handle_signals(false)
+            .on_start(move || {
+                let seq = writer
+                    .lock()
+                    .unwrap()
+                    .append(&tickertape::NewRecord {
+                        schema_id: SCHEMA_DATA,
+                        venue_ts_ns: 0,
+                        local_ts_ns: 1_800_000_000_000_000_000,
+                        payload: &raw_data(0, &[], &u64::MAX.to_le_bytes()),
+                    })
+                    .unwrap();
+                assert_eq!(seq, end);
+            })
+            .build()
+            .unwrap()
+            .run()
+            .unwrap()
+    };
+    assert_eq!(writer.lock().unwrap().next_seq(), end + 1, "appended");
+    assert_eq!(report.last_seq, Some(end - 1), "{report:?}");
+    assert_eq!(
+        report.messages + 2,
+        end,
+        "every data record before it: {report:?}"
+    );
+}
+
+/// What a replay target's publisher would make iceoryx2 allocate is bounded before the publisher exists (review
+/// round 3): a descriptor at the old per-publisher sample limit is malformed; zero (unknown) settings next to
+/// 65,536-sample buffers become iceoryx2's defaults (8 subscribers) and too many samples; a slice service counts
+/// 255 data segments of reference counters; an existing target is checked with its own settings, not the
+/// recording's. Nothing is sent, and the targets the replayer would have created don't remain.
+#[test]
+fn replay_bounds_what_a_target_allocates() {
+    use iceoryx2::prelude::*;
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let node = NodeBuilder::new()
+        .signal_handling_mode(SignalHandlingMode::Disabled)
+        .create::<ipc::Service>()
+        .unwrap();
+    let exists = |name: &str| {
+        ipc::Service::details(
+            &ServiceName::new(name).unwrap(),
+            node.config(),
+            MessagingPattern::PublishSubscribe,
+        )
+        .unwrap()
+        .is_some()
+    };
+    // history, buffer, borrowed, publishers, subscribers, nodes
+    let cases: [(&str, [u64; 6], RawType, i32, &str); 3] = [
+        (
+            "old-limit",
+            [0, 65_536, 0, 2, 256, 20],
+            u64_type(),
+            2,
+            "16777216, more than the limit of 1048576",
+        ),
+        (
+            "zero-and-65536",
+            [0, 65_536, 65_536, 0, 0, 0],
+            u64_type(),
+            1,
+            "samples a publisher preallocates is 1048578",
+        ),
+        (
+            "slice-segments",
+            [0, 4_096, 2, 2, 9, 20],
+            RawType::slice("u8", 1, 1),
+            1,
+            "sample reference counters",
+        ),
+    ];
+    for (i, (what, settings, payload, code, expected)) in cases.into_iter().enumerate() {
+        let journal = dir.path().join(format!("j{i}"));
+        let service = unique(what);
+        let mut d = RawDescriptor::new(&service, payload);
+        d.settings = settings;
+        d.recorder_buffer = 0;
+        append_records(&journal, SEGMENT, &run_of(&d, 0, 2));
+        let prefix = format!("{}/", unique("bounded"));
+        let (status, out, err) = run(
+            &cli(),
+            &["replay", journal.to_str().unwrap(), "--prefix", &prefix],
+            SECS(30),
+        );
+        assert_eq!(status.code(), Some(code), "{what}: {out} {err}");
+        assert!(err.contains(expected), "{what}: {err}");
+        assert!(!exists(&format!("{prefix}{service}")), "{what}");
+    }
+    // An existing target with the recorded types and a buffer above the limit: refused by its own settings, though
+    // the recording's are small.
+    let journal = dir.path().join("existing");
+    let service = unique("existing");
+    append_records(
+        &journal,
+        SEGMENT,
+        &run_of(&RawDescriptor::new(&service, u64_type()), 0, 2),
+    );
+    let prefix = format!("{}/", unique("big-target"));
+    let target = node
+        .service_builder(&ServiceName::new(&format!("{prefix}{service}")).unwrap())
+        .publish_subscribe::<u64>()
+        .subscriber_max_buffer_size(100_000)
+        .create()
+        .unwrap();
+    let (status, _, err) = run(
+        &cli(),
+        &["replay", journal.to_str().unwrap(), "--prefix", &prefix],
+        SECS(30),
+    );
+    assert_eq!(status.code(), Some(1), "{err}");
+    assert!(
+        err.contains("settings in force: subscriber_max_buffer_size is 100000"),
+        "{err}"
+    );
+    assert_eq!(target.dynamic_config().number_of_publishers(), 0);
+}
+
+/// Example binaries are found from test binaries in both of Cargo's layouts.
+#[test]
+fn examples_are_found_in_both_cargo_layouts() {
+    use std::path::PathBuf;
+    for (exe, profile) in [
+        ("/t/debug/deps/journal-0123", Some("/t/debug")),
+        (
+            "/t/debug/build/tickertape-iceoryx2/0123/out/journal-0123",
+            Some("/t/debug"),
+        ),
+        (
+            "/t/aarch64-unknown-linux-gnu/release/deps/journal-0123",
+            Some("/t/aarch64-unknown-linux-gnu/release"),
+        ),
+        (
+            "/t/aarch64-unknown-linux-gnu/release/build/tickertape-iceoryx2/0123/out/journal-0123",
+            Some("/t/aarch64-unknown-linux-gnu/release"),
+        ),
+        ("/t/debug/journal-0123", None),
+        ("/t/debug/x/tickertape-iceoryx2/0123/out/journal-0123", None),
+    ] {
+        assert_eq!(
+            profile_dir_of(Path::new(exe)),
+            profile.map(PathBuf::from),
+            "{exe}"
+        );
+    }
+    assert!(example("follow").exists());
+}
+
+/// Waits until the `u64` service `name` exists with a publisher.
+fn wait_for_u64_publisher(name: &str, timeout: Duration) {
+    use iceoryx2::prelude::*;
+    let node = NodeBuilder::new()
+        .signal_handling_mode(SignalHandlingMode::Disabled)
+        .create::<ipc::Service>()
+        .unwrap();
+    let service = ServiceName::new(name).unwrap();
+    wait_until(timeout, &format!("a publisher of {name}"), || {
+        node.service_builder(&service)
+            .publish_subscribe::<u64>()
+            .open()
+            .is_ok_and(|s| s.dynamic_config().number_of_publishers() > 0)
+    });
 }
 
 /// Speeds that can't be scheduled are usage errors, not panics.
@@ -621,18 +787,20 @@ fn signals_stop_cleanly_and_a_second_one_exits_at_once() {
 
     // Replay waiting for a subscriber that never comes: stopped, it sends nothing.
     let journal = dir.path().join("r");
+    let waits = unique("waits");
     append_records(
         &journal,
         SEGMENT,
-        &run_of(&RawDescriptor::new(&unique("waits"), u64_type()), 0, 3),
+        &run_of(&RawDescriptor::new(&waits, u64_type()), 0, 3),
     );
+    let prefix = format!("{}/", unique("waits-target"));
     let replay = Proc::spawn(
         &cli(),
         &[
             "replay",
             journal.to_str().unwrap(),
             "--prefix",
-            &format!("{}/", unique("waits-target")),
+            &prefix,
             "--wait-subscribers",
             "1",
             "--wait-timeout-secs",
@@ -641,6 +809,9 @@ fn signals_stop_cleanly_and_a_second_one_exits_at_once() {
         ],
     );
     replay.wait_for_output("tickertape-iox2: replaying", SECS(20));
+    // The "replaying" line comes before the publisher exists: signal only once it does, so the signal arrives
+    // while the replayer waits for subscribers.
+    wait_for_u64_publisher(&format!("{prefix}{waits}"), SECS(20));
     replay.signal("TERM");
     let (status, out, err) = replay.wait(SECS(20));
     assert!(status.success(), "{err}");

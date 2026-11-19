@@ -157,3 +157,40 @@ version 1. What was decided:
   merged (as the operating system merges pending signals), and the documentation now says so instead of promising
   that a second signal always exits.
 - **Every reader checks loss records** against their descriptor (`replay` and `export` did not).
+
+## Amendment: review round 3 (2026-11-19)
+
+The third reviews measured that a descriptor which passed validation could still make replay allocate tens of
+gigabytes, and found a few more integrity gaps. Nothing was released; the layout stays version 1. What was decided:
+
+- **Binary (`iox2dump`) export is removed**, so neither direction supports that representation (binary import was
+  removed in round 1). Two reasons, both in upstream's writer: it serialises the native memory image of its
+  `RecordHeader`, including alignment padding and unused `StaticString` capacity that it leaves uninitialised (two
+  exports of one journal differ in their header bytes, and the file can carry whatever was in that memory), and it
+  takes any `Ok(n)` from `write` as complete, so a full volume could leave a short file that the export then linked
+  into place and reported as a success. Upstream's *text* writer has the same short-write behaviour, so the
+  human-readable file is now written by this crate (byte for byte what upstream writes, checked against a file
+  upstream's recorder wrote) with complete, checked writes and a sync, under a uniquely named temporary file created
+  exclusively. The crate no longer depends on `iceoryx2-userland-record-and-replay`.
+- **Memory limits in force, before any port.** iceoryx2 0.10 preallocates per publisher, with unchecked arithmetic,
+  one reference counter per sample for each of up to 255 data segments (growing strategies) on the heap and one chunk
+  per sample in shared memory, and substitutes its defaults for settings left at 0. The replayer and the recorder now
+  read the settings the opened or created service actually has, and before creating a publisher or subscriber bound
+  the sample count (1,048,576, lowered from 16,777,216, which is also the validity rule for descriptors), the
+  reference counters (64 MiB) and, for publishers, the data segment (1 GiB, checked again before a slice message makes
+  it grow). The limits are documented with the worst case they allow; raising them later is compatible.
+- **The recorder by name refuses samples from its own process.** A same-process publisher of a padded type may leave
+  padding uninitialised, which the recorder can't read safely. iceoryx2 0.10 puts the sending node's id, which encodes
+  the host process id, into every sample's system header; the recorder compares it with its own before taking any
+  byte view and reports a match as a per-service failure. Preferred over making the entry point `unsafe`, because the
+  process id is reliably available and the check costs one comparison per sample.
+- **Payload alignment overrides are accepted.** iceoryx2's public `payload_alignment` gives a payload an alignment
+  above its size's (a `[u8]` aligned to 64 bytes). The payload's size no longer has to be a multiple of its alignment
+  (the headers' still do); chunk arithmetic uses the rounded stride, and a data record's payload stays `elements ×
+  size`, so no layout change was needed.
+- **Imports are stricter**: every record line and the empty line after the last record must end with a newline, as
+  upstream writes them (a truncated last line was accepted as a shorter message); an absolute time that overflows is
+  refused; service and type names go through iceoryx2's own constructors before the journal is opened.
+- **Typed replay checks every registration** against its descriptor before the target is opened or a cached target
+  reused, and the trust statements say that equal names, sizes and alignments don't establish compatible native
+  representations.

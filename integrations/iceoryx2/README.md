@@ -48,8 +48,10 @@ out of bounds. What can't be checked is whether the bytes are valid *values*: a 
 invalid bit patterns (`bool`, an enum) has undefined behaviour in its own safe code if they are not. tickertape's
 checksums detect accidental damage, not a journal or file written with wrong contents. So, as with upstream's own
 `iox2 service replay`: **replay only recordings you trust**, and import only files you trust (a replay publishes
-what was imported). The CLI says so in `replay --help` and `import --help`; the library makes the run-time-typed
-replay an `unsafe fn` (below).
+what was imported). Nor can equal type names, sizes and alignments, which is all iceoryx2 compares, establish that a
+subscriber's type has the recording publisher's native representation (field order, byte order, a type changed under
+the same name, another architecture). The CLI says so in `replay --help` and `import --help`; the library makes the
+run-time-typed replay an `unsafe fn` (below).
 
 ## Library
 
@@ -283,8 +285,11 @@ a service, and before importing a file.
 - Enumerations as in the tables: type variant 0 or 1; messaging pattern 1; safe overflow 0 or 1; counter location 0,
   1 or 2 with width 0 exactly when the location is 0 (otherwise 4 or 8) and offset 0 without a counter; loss kind 1
   or 2.
-- Each type: alignment a power of two from 1 to 4096; size a multiple of the alignment and at most 4,294,967,254 (the
-  largest tickertape record payload); name at most 256 bytes. The user header and system header are fixed-size. A
+- Each type: alignment a power of two from 1 to 4096; size at most 4,294,967,254 (the largest tickertape record
+  payload); name at most 256 bytes. The user header's and system header's sizes are multiples of their alignments;
+  the payload's need not be: iceoryx2's public `payload_alignment` raises a payload's alignment without changing its
+  size (a `[u8]` aligned to 64 has element size 1 and alignment 64). iceoryx2 then reserves the size rounded up to
+  the alignment (the *stride*) per element, but the payload bytes, and a data record's payload, are `elements × size`. The user header and system header are fixed-size. A
   slice's element size is not 0: every element count of zero-sized elements has the same bytes, so such services are
   refused. A data record with the user header and one element fits in a record.
 - The iceoryx2 chunk the types imply for the largest element count a record can hold (system header; user header
@@ -292,7 +297,7 @@ a service, and before importing a file.
   times the count; all rounded up to the largest alignment), computed without overflow, is a valid Rust `Layout`.
 - Service settings at most: `history_size` 65,536; `subscriber_max_buffer_size` and the recorder's buffer 65,536;
   `subscriber_max_borrowed_samples` 65,536; `max_publishers`, `max_subscribers` and `max_nodes` 4,096;
-  `max_subscribers × (buffer + borrowed) + history_size` (samples one publisher preallocates) 16,777,216;
+  `max_subscribers × (buffer + borrowed) + history_size` (samples one publisher preallocates) 1,048,576;
   `max_publishers × max_subscribers × (buffer + borrowed)` (queue slots) 4,294,967,296. These keep iceoryx2's own,
   unchecked arithmetic far from overflow; a running service outside them is refused (and retried) by the recorder.
 - Service name 1 to 255 bytes.
@@ -303,6 +308,30 @@ a service, and before importing a file.
   differ; the kind matches the distance rule.
 
 The normative description, with tests that pin every offset, is the rustdoc of [`src/layout.rs`](src/layout.rs).
+
+### Memory a replay target or a recorder subscriber may cost
+
+Not a decoding rule: a limit the replayer and the recorder apply before they create a publisher or subscriber, to the
+service's settings *in force*: those of the service as opened or created (a recorded 0 means iceoryx2's default, from
+the node's configuration), not the recorded ones. iceoryx2 0.10 preallocates, per publisher, `samples =
+max_subscribers × (buffer + borrowed) + history_size + loaned samples` (the replayer's publishers loan 2), with
+unchecked arithmetic:
+
+- **Heap:** an 8-byte reference counter per sample for each data segment a publisher may have: 1 with a static
+  allocation strategy (the replayer's, for fixed-size payloads), 255 with a growing one (the replayer's power-of-two
+  strategy for slices; a recorder subscriber of a slice service assumes its publishers grow too). Limits: `samples`
+  at most 1,048,576, and `segments × samples × 8` at most 64 MiB. For slices that is at most 32,896 samples (for
+  example 8 subscribers with buffers of up to 4,000, such as the 4,096 of the publisher example); for fixed-size
+  payloads the full 1,048,576.
+- **Shared memory:** a chunk per sample, `samples × chunk size` (for a growing strategy the chunk size rounded up to
+  a power of two, as iceoryx2 grows it), at most 1 GiB and at most `isize::MAX`, computed with checked arithmetic.
+  The replayer checks it when it creates a publisher (its first slice holds about 4 KiB) and, for slices, before each
+  larger message, which would make the segment grow; a message over the limit stops the replay with an error. A
+  subscriber doesn't allocate its publishers' data segments, so the recorder checks only the samples and counters.
+
+So one replay target costs at most about 64 MiB of heap and 1 GiB (2 GiB while a grown segment replaces the previous
+one) of shared memory, whatever a journal says. A target, or a service to record, over these limits is refused with
+the quantity and the limit. Raising them later is compatible; lowering them would refuse recordings that replay today.
 
 ## Behaviour and limits
 
@@ -341,8 +370,9 @@ The normative description, with tests that pin every offset, is the rustdoc of [
   these repeats are not reported as losses, but the counters in the recorded messages show them. Recovery after a
   crash zeroes the unused rest of the active segment; with the default 128 MiB segments that takes a moment, so
   `--segment-size` can be lowered for fast restarts.
-- **Replay** creates the target services with the recorded types and settings, or opens them if they exist; an existing
-  service with other types is refused, and so is a second recorded descriptor with other types for the same target (a
+- **Replay** creates the target services with the recorded types and settings, or opens them if they exist; a target
+  whose settings in force exceed the [memory limits](#memory-a-replay-target-or-a-recorder-subscriber-may-cost) is
+  refused before its publisher is created, and so is an existing service with other types, and so is a second recorded descriptor with other types for the same target (a
   type change between recording runs, or two `--map` rules onto one name). Names are prefixed with `replay/` by default
   so that a replay can't feed a recorder of the original service; `--original-names` replays onto the recorded names.
   While a writer (a recorder or an import) holds the journal, a target name that any descriptor in the journal names is
@@ -363,8 +393,11 @@ The normative description, with tests that pin every offset, is the rustdoc of [
   cleanly instead of ending the process; a `SIGINT` and a `SIGTERM` are never merged. When the run returns, and no
   other run in the process handles signals, both signals take their default action again (they end the process): the
   first run installs, for the rest of the process's life, an action that emulates the default whenever no run handles
-  signals. A handler the process installed before still runs first, so a process that handles these signals itself
-  should use `handle_signals(false)` and the stop flag.
+  signals. Handlers the process installs for these signals, before or after the first run, don't prevent that (one
+  installed before, or later through signal-hook, still runs, and then the process ends; one installed later with
+  `sigaction` directly replaces this action instead), and an inherited "ignore" disposition (`SIGINT` in a background
+  job of a non-interactive shell, or under `nohup`) is replaced too. So a process that handles or ignores these
+  signals itself should use `handle_signals(false)` and the stop flag.
 - **Seeking is by sequence number.** There is no seek by time yet (`--from` takes a sequence number).
 
 ### Known limitations
@@ -376,28 +409,36 @@ The normative description, with tests that pin every offset, is the rustdoc of [
   mapping, but the reference covers zero bytes: the Tree Borrows aliasing model accepts such accesses, Stacked Borrows
   doesn't, and Rust hasn't settled its model. Services without a user header never take this path. A supported API is
   in the requests drafted for upstream.
-- **A padded type published from the recorder's own process.** The `dynamic` recorder reads every byte of a sample.
-  Padding written by a publisher in the *same* process may be uninitialised in Rust's abstract machine, so don't
-  record padded types with the `dynamic` recorder from the process that publishes them (other processes, and the
-  typed recorder, are fine).
+- **The recorder by name refuses samples from its own process.** It reads every byte of a sample, and padding written
+  by a publisher in the *same* process may be uninitialised in Rust's abstract machine. So before it views any byte,
+  it compares the process id in the sending node's id (in the sample's system header; iceoryx2 0.10 builds node ids
+  from the host process id) with its own, and refuses a sample from its own process as a per-service failure
+  (reported and retried). Record such services from another process, or with the typed recorder, which only accepts
+  types without padding. Samples from other processes arrive as their publishers wrote them into shared memory.
 - **`iox2 service replay` 0.10 mis-sizes slices** whose elements are wider than one byte: it loans the byte count as
   an element count, so subscribers see too many elements, the extra ones unwritten. Exported files of fixed-size or
   byte-slice services replay correctly with it; replay others with `tickertape-iox2 replay`.
 
 ## iceoryx2 recording files
 
-`tickertape-iox2 export` writes one service (choose it with `--service` when the journal has several) to a file that
-`iox2 service replay` and the `iceoryx2-userland-record-and-replay` crate read, in either representation. The file
-is written under a temporary name and appears only when complete. `import` appends a **human-readable** file written by
-`iox2 service record` to a journal as a new recording run.
+`tickertape-iox2 export` writes one service (choose it with `--service` when the journal has several) to a
+human-readable file that `iox2 service replay` and the `iceoryx2-userland-record-and-replay` crate read. It is written
+by this crate (the same bytes upstream's recorder writes; a test compares them with a file it wrote), with every write
+checked to be complete, synced, under a temporary name of its own (created exclusively, so concurrent exports never
+share one), and linked into place only when complete; an existing file is never replaced. `import` appends a
+human-readable file written by `iox2 service record` to a journal as a new recording run. The `iox2dump` (binary)
+representation is not supported in either direction: upstream's writer puts the memory image of its header struct,
+uninitialised padding included, into the file and takes a short write as complete (ADR 0030, review round 3).
 
 - **Import is all or nothing and uses a parser of this crate's own.** Upstream's readers aren't meant for untrusted
   files (the text reader panics when a multi-byte character crosses a fixed byte index; the `iox2dump` reader treats
   file bytes as an initialised Rust struct and allocates from unvalidated lengths). The importer checks UTF-8 and
   ASCII, the file format version (1), the messaging pattern (publish-subscribe), the header's type details (validity
-  rules), every record's lengths against them, non-decreasing timestamps, and that the file doesn't end inside a
-  record, before it appends anything. `iox2dump` files can be exported but not imported, until that can be done with a
-  parser of this crate's own.
+  rules), the service and type names with iceoryx2's own constructors (as replay and export use them), every record's
+  lengths against the types, non-decreasing timestamps whose absolute time (`--start-unix-ns` plus the offset) fits in
+  64 bits, and that every line of every record, and the empty line after it, ends with a newline as upstream writes
+  them (a file cut anywhere is refused), before it appends anything. It holds the whole file, and all its decoded
+  messages, in memory while it does.
 - **Journal to file loses:** absolute time (only the offset from the first exported message remains, in whole
   milliseconds; timestamps that went backwards are raised to the previous one, and counted); recording-run boundaries;
   sequence numbers; publisher ids; `venue_ts_ns`; loss records; the service settings in the descriptors. The iceoryx2
@@ -430,7 +471,9 @@ is written under a temporary name and appears only when complete. `import` appen
   Against `main` it is expected to fail today: `WaitSetBuilder::new` became crate-private (it now takes the node's
   clock) and `Node::waitset_builder` replaces it (checked on 2026-11-19). Porting means creating the WaitSet with
   `node.waitset_builder()` in `src/recorder.rs`, re-checking every internal API `src/dynamic.rs` uses (and its safety
-  comments), and moving the exact pin, in one reviewed change.
+  comments), the allocation formulas behind the [memory limits](#memory-a-replay-target-or-a-recorder-subscriber-may-cost)
+  and the file format, updating `ICEORYX2_VERSION` in `src/upstream.rs`, and moving the exact pin, in one reviewed
+  change.
 
 ## Licence
 

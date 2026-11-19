@@ -404,9 +404,10 @@ fn replay(args: ReplayArgs, out: &mut dyn Write) -> Result<(), Error> {
     builder = builder.allow_live_targets(args.allow_live_targets);
     let replayer = builder.build()?;
     // SAFETY: Replaying a recording publishes its bytes as values of the recorded types. Running `replay` is the
-    // user's statement that they trust the recording; the help, the README and the crate docs say so ("replay only
-    // recordings you trust", as with upstream's `iox2 service replay`). Everything else (sizes, alignments, element
-    // counts, settings) is validated by the library.
+    // user's statement that they trust the recording, including that its subscribers' types have the recording
+    // publishers' native representation (equal names, sizes and alignments don't establish that); the help, the
+    // README and the crate docs say so ("replay only recordings you trust", as with upstream's `iox2 service
+    // replay`). Everything else (sizes, alignments, element counts, settings) is validated by the library.
     #[allow(unsafe_code)]
     let report = unsafe { replayer.run_dynamic() }?;
     let io = |e| Error::Io {

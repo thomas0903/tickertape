@@ -55,7 +55,7 @@ use crate::layout::{self, Decoded, Descriptor, TypeInfo};
 use crate::pacing::Pacer;
 pub use crate::pacing::{MAX_SPEED, MIN_SPEED, PacingReport};
 use crate::recorder::{Signals, describe, service_name, service_version};
-use crate::typed::{Create, ReplayableHeader};
+use crate::typed::{Create, PortBudget, ReplayableHeader, header_type};
 use crate::{Catalog, Error, Replayable};
 
 /// The default prefix for replayed service names.
@@ -192,7 +192,7 @@ pub struct ReplayerBuilder {
     to: Option<u64>,
     speed: Option<f64>,
     remap: Remap,
-    typed: HashMap<String, SinkFactory>,
+    typed: HashMap<String, Registered>,
     services: Option<HashSet<String>>,
     late_threshold: Duration,
     spin: Duration,
@@ -208,6 +208,14 @@ pub struct ReplayerBuilder {
 
 /// Called once a replay has started.
 type OnStart = Box<dyn FnOnce() + Send>;
+
+/// A service registered with [`ReplayerBuilder::typed`]: the type details iceoryx2 derives for its Rust types, and
+/// how to open its sink.
+struct Registered {
+    payload: TypeInfo,
+    user_header: TypeInfo,
+    factory: SinkFactory,
+}
 
 impl core::fmt::Debug for ReplayerBuilder {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -263,12 +271,15 @@ impl ReplayerBuilder {
     }
 
     /// Replays the recorded service `recorded` with payload type `P` and user header type `H`, using only
-    /// iceoryx2's public API. Refuses if the types don't match the recording.
+    /// iceoryx2's public API. Refuses if the types don't match the recording: every descriptor of `recorded` is
+    /// checked against `P` and `H` before its target is opened or reused.
     pub fn typed<P: Replayable + ?Sized, H: ReplayableHeader>(
         mut self,
         recorded: impl Into<String>,
     ) -> Self {
         let factory: SinkFactory = Box::new(|node, target, descriptor| {
+            // The registration was checked against `descriptor` before (check_registration), so nothing that
+            // doesn't match it creates the target.
             check_existing(node, target, descriptor)?;
             let name = service_name(target)?;
             let factory =
@@ -280,10 +291,22 @@ impl ReplayerBuilder {
                     reason: format!("the registered Rust types don't match the recording: {diff}"),
                 });
             }
-            let publisher = P::publisher::<H>(&factory)?;
-            Ok(Box::new(TypedSink { factory, publisher }))
+            let (publisher, budget) = P::publisher::<H>(node, &factory, target)?;
+            Ok(Box::new(TypedSink {
+                factory,
+                publisher,
+                budget,
+                target: target.to_string(),
+            }))
         });
-        self.typed.insert(recorded.into(), factory);
+        self.typed.insert(
+            recorded.into(),
+            Registered {
+                payload: P::payload_type(),
+                user_header: header_type::<H>(),
+                factory,
+            },
+        );
         self
     }
 
@@ -314,13 +337,16 @@ impl ReplayerBuilder {
     /// no final checkpoint. Signals of one kind that arrive before the thread has taken the previous one are merged
     /// into one (by the signal iterator, and by the operating system, which keeps at most one pending signal of each
     /// kind), so two of the same kind sent back to back can stop the run cleanly instead of ending the process; a
-    /// `SIGINT` and a `SIGTERM` are never merged. A handler the process installed before the first run still runs
-    /// first.
+    /// `SIGINT` and a `SIGTERM` are never merged.
     ///
     /// When the run returns, and no other run in the process is handling signals, `SIGINT` and `SIGTERM` end the
     /// process as their default action would: the first run installs, for the rest of the process's life, an action
-    /// that emulates the default whenever no run handles signals. So a process that handles these signals itself
-    /// should pass false and stop runs with the stop flag.
+    /// that emulates the default whenever no run handles signals. Handlers the process installs for these signals,
+    /// before or after the first run, don't prevent that: one installed before, or later through signal-hook, still
+    /// runs, and then the process ends (one installed later with `sigaction` directly replaces this action instead).
+    /// An inherited "ignore" disposition (`SIGINT` in a background job of a non-interactive shell, or under `nohup`)
+    /// is replaced too: after the first run, the signal ends the process. So a process that handles or ignores these
+    /// signals itself should pass false and stop runs with the stop flag.
     ///
     /// With false, the run leaves the process's signal handling alone.
     pub fn handle_signals(mut self, on: bool) -> Self {
@@ -329,14 +355,15 @@ impl ReplayerBuilder {
     }
 
     /// Before the first send to each service, waits until it has at least `count` subscribers, for at most
-    /// `timeout`. Without this, messages sent before a subscriber connects are only delivered through the
+    /// `timeout` (a timeout too large to add to the current time waits without a limit). Without this, messages sent before a subscriber connects are only delivered through the
     /// service's history, if it has one.
     pub fn wait_for_subscribers(mut self, count: usize, timeout: Duration) -> Self {
         self.wait_for_subscribers = Some((count, timeout));
         self
     }
 
-    /// Keeps the publishers open this long after the last message (default: not at all). A subscriber that hasn't
+    /// Keeps the publishers open this long after the last message (default: not at all; a duration too large to add
+    /// to the current time lingers until the stop flag or a signal). A subscriber that hasn't
     /// yet taken its first sample when a publisher closes can lose what was sent to it, so a replay that ends
     /// right after a burst should linger.
     pub fn linger(mut self, linger: Duration) -> Self {
@@ -486,14 +513,15 @@ impl Replayer {
             .create::<ipc::Service>()
             .map_err(|e| Error::iox("create node", e))?;
         let mut reader = Reader::open(&config.journal, ReaderConfig::default())?;
-        // The end now, and the names the journal is recording now (if a writer holds it): every service with a
-        // descriptor anywhere in the journal.
+        // The end now, and the names the journal is recording now (if a writer holds it, and live targets aren't
+        // allowed anyway): every service with a descriptor anywhere in the journal.
         let tail = crate::tail::read(&config.journal)?;
-        let live: BTreeSet<String> = if crate::tail::has_live_writer(&config.journal)? {
-            crate::catalog::service_names(&config.journal, tail.end_seq)?
-        } else {
-            BTreeSet::new()
-        };
+        let live: BTreeSet<String> =
+            if !config.allow_live_targets && crate::tail::has_live_writer(&config.journal)? {
+                crate::catalog::service_names(&config.journal, tail.end_seq)?
+            } else {
+                BTreeSet::new()
+            };
         let end = config.end_at_start.then_some(tail.end_seq);
         if let Some(from) = config.from {
             reader.seek(from)?;
@@ -582,6 +610,9 @@ impl Replayer {
                                 descriptor.service_name
                             )));
                         }
+                        // Every descriptor's registration is checked, also when its target is already open: a
+                        // cached sink must not carry a service registered with other types, or not at all.
+                        check_registration(&config, untyped.is_some(), &descriptor)?;
                         Some(match by_target.get(&target) {
                             Some(&i) => {
                                 check_same_types(
@@ -645,8 +676,8 @@ impl Replayer {
             report.first_seq.get_or_insert(seq);
         }
         if !targets.is_empty() && !config.linger.is_zero() {
-            let until = Instant::now() + config.linger;
-            while Instant::now() < until && !config.stop.load(Ordering::Relaxed) {
+            let until = crate::recorder::deadline_after(config.linger);
+            while until.is_none_or(|u| Instant::now() < u) && !config.stop.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(5).min(config.linger));
             }
         }
@@ -690,6 +721,31 @@ fn check_same_types(
     })
 }
 
+/// Checks a recorded service's registration before its target is opened or reused: a service registered with
+/// [`ReplayerBuilder::typed`] must have the registered types; an unregistered one needs an untyped sink
+/// (`Replayer::run_dynamic`).
+fn check_registration(
+    config: &ReplayerBuilder,
+    untyped: bool,
+    descriptor: &Descriptor,
+) -> Result<(), Error> {
+    match config.typed.get(&descriptor.service_name) {
+        Some(r) => match type_difference(descriptor, &r.payload, &r.user_header, None) {
+            None => Ok(()),
+            Some(diff) => Err(Error::Incompatible {
+                service: descriptor.service_name.clone(),
+                reason: format!("the registered Rust types don't match the recording: {diff}"),
+            }),
+        },
+        None if untyped => Ok(()),
+        None => Err(Error::Usage(format!(
+            "service \"{}\" (payload type {}) is not registered with ReplayerBuilder::typed; replaying services \
+             by their recorded type details needs Replayer::run_dynamic (feature `dynamic`)",
+            descriptor.service_name, descriptor.payload.name
+        ))),
+    }
+}
+
 fn open_sink(
     config: &mut ReplayerBuilder,
     untyped: Option<UntypedSink>,
@@ -698,7 +754,7 @@ fn open_sink(
     descriptor: &Descriptor,
 ) -> Result<Box<dyn Sink>, Error> {
     let sink = match (config.typed.get_mut(&descriptor.service_name), untyped) {
-        (Some(factory), _) => factory(node, target, descriptor)?,
+        (Some(registered), _) => (registered.factory)(node, target, descriptor)?,
         (None, Some(untyped)) => {
             check_existing(node, target, descriptor)?;
             untyped(node, target, descriptor)?
@@ -712,12 +768,12 @@ fn open_sink(
         }
     };
     if let Some((count, timeout)) = config.wait_for_subscribers {
-        let deadline = Instant::now() + timeout;
+        let deadline = crate::recorder::deadline_after(timeout);
         while sink.subscribers() < count {
             if config.stop.load(Ordering::Relaxed) {
                 break;
             }
-            if Instant::now() >= deadline {
+            if deadline.is_some_and(|d| Instant::now() >= d) {
                 return Err(Error::Usage(format!(
                     "service \"{target}\" has {} subscribers after {timeout:?}; waited for {count}",
                     sink.subscribers()
@@ -797,10 +853,13 @@ fn type_difference(
 struct TypedSink<P: Replayable + ?Sized, H: ReplayableHeader> {
     factory: iceoryx2::service::port_factory::publish_subscribe::PortFactory<ipc::Service, P, H>,
     publisher: Publisher<ipc::Service, P, H>,
+    budget: PortBudget,
+    target: String,
 }
 
 impl<P: Replayable + ?Sized, H: ReplayableHeader> Sink for TypedSink<P, H> {
     fn send(&mut self, user_header: &[u8], payload: &[u8]) -> Result<(), Error> {
+        self.budget.check_payload(&self.target, payload.len())?;
         P::send(&self.publisher, user_header, payload)
     }
 

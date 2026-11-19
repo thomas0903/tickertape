@@ -35,8 +35,10 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   element count and service setting read from a journal or file is validated before it reaches iceoryx2. Replays from
   any sequence number onto renamed services (`replay/` by default), as fast as possible or at the recorded pace with
   late-send reports, refusing type changes on one target and names the journal is recording live; typed replay is safe,
-  replay by recorded type details is an `unsafe fn`. Exports to iceoryx2's recording files and imports their
-  human-readable form with its own parser, all or nothing. A typed recorder and replayer use only iceoryx2's public API;
+  replay by recorded type details is an `unsafe fn`. Replay targets and recorder subscribers are refused before
+  their ports exist if the service's settings in force would make iceoryx2 allocate more than documented limits.
+  Exports to and imports from iceoryx2's human-readable recording files with a writer and parser of its own (imports
+  all or nothing; the binary representation is not supported). A typed recorder and replayer use only iceoryx2's public API;
   recording services by name (feature `dynamic`, used by the `tickertape-iox2` tool) uses API iceoryx2 marks internal,
   so iceoryx2 is pinned to `=0.10.0`. CI builds and tests it on Linux x86-64, Linux aarch64 and macOS, and weekly
   (informational) against the newest iceoryx2 release and upstream `main`.

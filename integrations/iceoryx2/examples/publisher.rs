@@ -2,7 +2,7 @@
 //!
 //! Usage: `publisher --service NAME [--kind tick|slice|bytes] [--size BYTES] [--count N] [--rate HZ]
 //! [--wait-subscribers N] [--wait-secs S] [--skip-every K] [--notify EVENT] [--buffer N] [--linger-ms MS]
-//! [--blocking]`
+//! [--blocking] [--payload-alignment N]`
 //!
 //! Sends `--count` messages (0: until killed) at `--rate` per second, on an absolute schedule. Each message has a
 //! `TickHeader` user header with a counter (0, 1, 2, ...) and the send time, and a payload derived from the
@@ -12,7 +12,8 @@
 //! service, it creates it with `subscriber_max_buffer_size` = `--buffer` (default 4096). With `--blocking` it
 //! requires the service without safe overflow (and creates it so), so a full subscriber buffer makes it wait
 //! (iceoryx2's default backpressure, retry until delivered) instead of dropping the oldest sample: delivery to
-//! subscribers that exist is exact. With `--count 0` it sends until SIGTERM or SIGINT.
+//! subscribers that exist is exact. With `--count 0` it sends until SIGTERM or SIGINT. `--payload-alignment N`
+//! raises the payload's alignment with iceoryx2's public `payload_alignment` (a `[u8]` keeps element size 1).
 
 use std::time::{Duration, Instant};
 
@@ -42,6 +43,7 @@ struct Args {
     buffer: usize,
     linger: Duration,
     blocking: bool,
+    payload_alignment: usize,
 }
 
 fn parse() -> Result<Args, String> {
@@ -58,6 +60,7 @@ fn parse() -> Result<Args, String> {
         buffer: 4096,
         linger: Duration::from_millis(300),
         blocking: false,
+        payload_alignment: 0,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -85,6 +88,9 @@ fn parse() -> Result<Args, String> {
             "--notify" => a.notify = Some(value()?),
             "--buffer" => a.buffer = value()?.parse().map_err(|_| "--buffer")?,
             "--blocking" => a.blocking = true,
+            "--payload-alignment" => {
+                a.payload_alignment = value()?.parse().map_err(|_| "--payload-alignment")?
+            }
             "--linger-ms" => {
                 a.linger = Duration::from_millis(value()?.parse().map_err(|_| "--linger-ms")?)
             }
@@ -98,12 +104,15 @@ fn parse() -> Result<Args, String> {
 }
 
 macro_rules! open_or_create {
-    ($node:expr, $name:expr, $payload:ty, $buffer:expr, $blocking:expr) => {{
+    ($node:expr, $name:expr, $payload:ty, $buffer:expr, $blocking:expr, $alignment:expr) => {{
         let make = || {
-            let b = $node
+            let mut b = $node
                 .service_builder($name)
                 .publish_subscribe::<$payload>()
                 .user_header::<TickHeader>();
+            if $alignment > 0 {
+                b = b.payload_alignment(Alignment::new($alignment).expect("a power of two"));
+            }
             if $blocking {
                 b.enable_safe_overflow(false)
             } else {
@@ -195,7 +204,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("sent {sent} failed {failed}");
     };
     if args.kind == Kind::Bytes {
-        let service = open_or_create!(node, &name, [u8], args.buffer, args.blocking);
+        let service = open_or_create!(
+            node,
+            &name,
+            [u8],
+            args.buffer,
+            args.blocking,
+            args.payload_alignment
+        );
         let publisher = service
             .publisher_builder()
             .initial_max_slice_len(args.size)
@@ -212,7 +228,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &|| service.dynamic_config().number_of_subscribers(),
         );
     } else if args.kind == Kind::Slice {
-        let service = open_or_create!(node, &name, [u32], args.buffer, args.blocking);
+        let service = open_or_create!(
+            node,
+            &name,
+            [u32],
+            args.buffer,
+            args.blocking,
+            args.payload_alignment
+        );
         let publisher = service
             .publisher_builder()
             .initial_max_slice_len(16)
@@ -229,7 +252,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &|| service.dynamic_config().number_of_subscribers(),
         );
     } else {
-        let service = open_or_create!(node, &name, Tick, args.buffer, args.blocking);
+        let service = open_or_create!(
+            node,
+            &name,
+            Tick,
+            args.buffer,
+            args.blocking,
+            args.payload_alignment
+        );
         let publisher = service.publisher_builder().create()?;
         start_send(
             &mut |counter, header| {

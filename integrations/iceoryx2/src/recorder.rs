@@ -234,6 +234,7 @@ impl<P: Recordable + ?Sized, H: RecordableHeader> SourceFactory for TypedService
             },
         )?;
         let cfg = service.static_config();
+        crate::typed::check_subscriber(node, &self.name, cfg)?;
         let buffer = buffer_size.min(cfg.subscriber_max_buffer_size()).max(1);
         let subscriber = service
             .subscriber_builder()
@@ -281,6 +282,11 @@ impl<P: Recordable + ?Sized, H: RecordableHeader> Source for TypedSource<P, H> {
             })
         })
     }
+}
+
+/// The instant `d` from now, or `None` if that can't be represented (`Duration::MAX`): no deadline.
+pub(crate) fn deadline_after(d: Duration) -> Option<Instant> {
+    Instant::now().checked_add(d)
 }
 
 pub(crate) fn service_name(name: &str) -> Result<ServiceName, Error> {
@@ -570,13 +576,16 @@ impl RecorderBuilder {
     /// no final checkpoint. Signals of one kind that arrive before the thread has taken the previous one are merged
     /// into one (by the signal iterator, and by the operating system, which keeps at most one pending signal of each
     /// kind), so two of the same kind sent back to back can stop the run cleanly instead of ending the process; a
-    /// `SIGINT` and a `SIGTERM` are never merged. A handler the process installed before the first run still runs
-    /// first.
+    /// `SIGINT` and a `SIGTERM` are never merged.
     ///
     /// When the run returns, and no other run in the process is handling signals, `SIGINT` and `SIGTERM` end the
     /// process as their default action would: the first run installs, for the rest of the process's life, an action
-    /// that emulates the default whenever no run handles signals. So a process that handles these signals itself
-    /// should pass false and stop runs with the stop flag.
+    /// that emulates the default whenever no run handles signals. Handlers the process installs for these signals,
+    /// before or after the first run, don't prevent that: one installed before, or later through signal-hook, still
+    /// runs, and then the process ends (one installed later with `sigaction` directly replaces this action instead).
+    /// An inherited "ignore" disposition (`SIGINT` in a background job of a non-interactive shell, or under `nohup`)
+    /// is replaced too: after the first run, the signal ends the process. So a process that handles or ignores these
+    /// signals itself should pass false and stop runs with the stop flag.
     ///
     /// With false, the run leaves the process's signal handling alone.
     pub fn handle_signals(mut self, on: bool) -> Self {
@@ -856,7 +865,7 @@ fn record(
             }
         }
         let pending = sources.iter().any(Option::is_none);
-        let retry_at = Instant::now() + config.retry_interval;
+        let retry_at = deadline_after(config.retry_interval);
 
         // Wait on a WaitSet built for the services open now; rebuild it when one opens or fails.
         let waitset = WaitSetBuilder::new()
@@ -923,7 +932,9 @@ fn record(
                 }
                 return Ok(reason);
             }
-            if failed.iter().any(|f| *f) || (pending && Instant::now() >= retry_at) {
+            if failed.iter().any(|f| *f)
+                || (pending && retry_at.is_some_and(|r| Instant::now() >= r))
+            {
                 break;
             }
         }
@@ -1397,6 +1408,14 @@ mod tests {
 
     /// Counters are compared modulo their width: a four-byte counter that wraps is not a loss; one that goes back
     /// is; a gap across the wrap counts the modular distance.
+    #[test]
+    fn deadlines_saturate_to_none() {
+        assert!(deadline_after(Duration::MAX).is_none());
+        assert!(deadline_after(Duration::from_secs(u64::MAX)).is_none());
+        let soon = deadline_after(Duration::from_millis(10)).unwrap();
+        assert!(soon > Instant::now() - Duration::from_secs(1));
+    }
+
     #[test]
     fn counters_use_modular_distance() {
         let dir = tempfile::tempdir().unwrap();

@@ -952,3 +952,134 @@ fn per_service_failures_do_not_stop_the_others() {
     let report: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(report["messages"], 0, "{out}");
 }
+
+/// iceoryx2's public `payload_alignment` gives a `[u8]` service an alignment of 64 with element size 1 (review round
+/// 3): the recorder by name records it, its export imports again, and a replay recreates the service with that
+/// alignment, delivering the same bytes to a subscriber.
+#[test]
+fn a_payload_alignment_override_records_exports_and_replays() {
+    use iceoryx2::prelude::*;
+    let _serial = serial();
+    const N: u64 = 20;
+    const SIZE: usize = 100;
+    let dir = tempfile::tempdir().unwrap();
+    let journal = dir.path().join("j");
+    let service = unique("aligned");
+    let publisher = blocking_publisher(
+        &service,
+        N,
+        500,
+        &[
+            "--kind",
+            "bytes",
+            "--size",
+            &SIZE.to_string(),
+            "--payload-alignment",
+            "64",
+        ],
+    );
+    let recorder = Proc::spawn(
+        &cli(),
+        &[
+            "record",
+            journal.to_str().unwrap(),
+            "--service",
+            &service,
+            "--counter",
+            "header:0:8",
+            "--json",
+        ],
+    );
+    let (status, _, err) = publisher.wait(SECS(60));
+    assert!(status.success(), "publisher: {err}");
+    recorder.signal("TERM");
+    let (status, out, err) = recorder.wait(SECS(20));
+    assert!(status.success(), "recorder: {out} {err}");
+    let recs = scan(&journal);
+    let Rec::Descriptor(_, d) = &recs[0] else {
+        panic!("descriptor first")
+    };
+    assert_eq!(
+        (d.payload.size, d.payload.alignment),
+        (1, 64),
+        "{:?}",
+        d.payload
+    );
+    let data = data_of(&recs);
+    assert_eq!(data.len() as u64, N);
+    for (i, (_, _, header, payload)) in data.iter().enumerate() {
+        assert_eq!(counter_of(header), i as u64);
+        let expected: Vec<u8> = (0..SIZE).map(|j| (i + j) as u8).collect();
+        assert_eq!(payload, &expected);
+    }
+
+    // Export, and import the file again (what upstream's recorder writes for this service).
+    let file = dir.path().join("aligned.iox2");
+    run_ok(
+        &cli(),
+        &[
+            "export",
+            journal.to_str().unwrap(),
+            "--output",
+            file.to_str().unwrap(),
+        ],
+        SECS(30),
+    );
+    assert!(
+        std::fs::read_to_string(&file)
+            .unwrap()
+            .contains("size = 1\nalignment = 64\n")
+    );
+    let imported = dir.path().join("imported");
+    run_ok(
+        &cli(),
+        &["import", file.to_str().unwrap(), imported.to_str().unwrap()],
+        SECS(30),
+    );
+    assert_eq!(data_of(&scan(&imported)).len() as u64, N);
+
+    // Replay onto a subscriber of the recreated service.
+    let target = format!("replay/{service}");
+    let replay = Proc::spawn(
+        &cli(),
+        &[
+            "replay",
+            journal.to_str().unwrap(),
+            "--wait-subscribers",
+            "1",
+            "--json",
+        ],
+    );
+    wait_for_service(&target, SECS(20));
+    let node = NodeBuilder::new()
+        .signal_handling_mode(SignalHandlingMode::Disabled)
+        .create::<ipc::Service>()
+        .unwrap();
+    let opened = node
+        .service_builder(&ServiceName::new(&target).unwrap())
+        .publish_subscribe::<[u8]>()
+        .user_header::<types::TickHeader>()
+        .open()
+        .unwrap();
+    let static_config = opened.static_config();
+    assert_eq!(static_config.message_type_details().payload.alignment(), 64);
+    let subscriber = opened
+        .subscriber_builder()
+        .buffer_size(64)
+        .create()
+        .unwrap();
+    let mut received = Vec::new();
+    let deadline = std::time::Instant::now() + SECS(30);
+    while (received.len() as u64) < N && std::time::Instant::now() < deadline {
+        match subscriber.receive().unwrap() {
+            Some(sample) => received.push(sample.payload().to_vec()),
+            None => std::thread::sleep(std::time::Duration::from_millis(1)),
+        }
+    }
+    let (status, out, err) = replay.wait(SECS(30));
+    assert!(status.success(), "replay: {out} {err}");
+    assert_eq!(received.len() as u64, N);
+    for (i, payload) in received.iter().enumerate() {
+        assert_eq!(payload, &data[i].3);
+    }
+}

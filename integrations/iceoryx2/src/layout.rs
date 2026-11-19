@@ -32,7 +32,7 @@
 //! Version 1 can grow without breaking version-1 readers:
 //!
 //! - **Layout version.** Changes only for incompatible changes. A reader rejects a version it doesn't know.
-//! - **Flags** (`u16` in every record). Bits 0 to 7 are *required*: a reader rejects a record with a required bit
+//! - **Flags** (`u16` in every descriptor, data and loss record; a filler has neither field). Bits 0 to 7 are *required*: a reader rejects a record with a required bit
 //!   it doesn't know. Bits 8 to 15 are *optional*: a reader ignores optional bits it doesn't know. Writers set only
 //!   bits defined for the version they write. Version 1 defines one bit: descriptor bit 0, `imported`.
 //! - **Reserved fields** are written as 0 and ignored by readers. A later revision may use one only for a meaning
@@ -78,8 +78,10 @@
 //!    descriptors starts the new segment, the recorder first appends a **filler record** taking exactly the space
 //!    left, if that descriptor would still fit there. If it wouldn't (less space left than that descriptor takes,
 //!    including less than the 40 bytes any record needs), the descriptor starts the new segment by itself and no
-//!    filler is written. A filler is therefore never smaller than a descriptor, and so never smaller than the smallest
-//!    record.
+//!    filler is written. Fillers therefore take at least as much space as a descriptor. A filler holds at most
+//!    tickertape's largest record payload, so in a segment larger than 4 GiB the space left can take several
+//!    fillers in a row (each but the last of the largest size whose frame is a multiple of 8, the last taking the
+//!    rest); otherwise it is one filler, never smaller than the smallest record.
 //!
 //! The space left is the segment size minus 8, minus the bytes in use: 64 for the header plus `align8(40 + payload
 //! length)` for each record. The recorder reads the newest segment when it opens the journal, then adds each record
@@ -93,8 +95,8 @@
 //! # Filler (`SCHEMA_FILLER`)
 //!
 //! A record whose payload is all zero bytes, of any length (0 up to tickertape's largest payload). It carries no
-//! data and names no descriptor. Readers skip it without looking at its payload; it is the last record of its
-//! segment. Version-1 readers written before fillers existed decode its schema id as an unknown reserved id and
+//! data and names no descriptor. Readers skip it without looking at its payload. Fillers are the last records of their
+//! segment (usually one; several in a row only in segments larger than 4 GiB). Version-1 readers written before fillers existed decode its schema id as an unknown reserved id and
 //! ignore it too, so fillers need no new layout version. `info` counts fillers separately from data
 //! (`filler_records`, `filler_bytes`).
 //!
@@ -192,8 +194,12 @@
 //!   inside its area; descriptor strings valid UTF-8; nothing missing.
 //! - Enumerations: type variant 0 or 1; messaging pattern 1; safe overflow 0 or 1; counter location 0, 1 or 2 with
 //!   width 0 exactly when the location is 0, otherwise 4 or 8, and offset 0 without a counter; loss kind 1 or 2.
-//! - Each type: alignment a power of two from 1 to [`MAX_ALIGNMENT`]; size a multiple of its alignment and at most
-//!   [`MAX_RECORD_PAYLOAD`]; name at most [`MAX_TYPE_NAME_LEN`] bytes. The user header and system header are
+//! - Each type: alignment a power of two from 1 to [`MAX_ALIGNMENT`]; size at most [`MAX_RECORD_PAYLOAD`]; name at
+//!   most [`MAX_TYPE_NAME_LEN`] bytes. The user header's and system header's sizes are multiples of their alignments;
+//!   the payload's need not be, because iceoryx2's public `payload_alignment` raises a payload's alignment without
+//!   changing its size (a `[u8]` aligned to 64 bytes has element size 1 and alignment 64): iceoryx2 then reserves
+//!   the element size rounded up to the alignment (the *stride*) per element, but the payload bytes, and so a data
+//!   record's payload, are `elements × size`. The user header and system header are
 //!   fixed-size. A dynamic payload's element size is not 0 (every element count of zero-sized elements has the same
 //!   bytes, so the count would be lost). A data record of the user header and one payload element fits in a
 //!   tickertape record.
@@ -204,7 +210,7 @@
 //! - Service settings at most: `history_size` [`MAX_HISTORY_SIZE`], `subscriber_max_buffer_size` and the recorder's
 //!   buffer [`MAX_BUFFER_SIZE`], `subscriber_max_borrowed_samples` [`MAX_BORROWED_SAMPLES`], `max_publishers`,
 //!   `max_subscribers` and `max_nodes` [`MAX_PORTS`]; `max_subscribers × (buffer + borrowed) + history` at most
-//!   [`MAX_SAMPLES_PER_PUBLISHER`]; `max_publishers × max_subscribers × (buffer + borrowed)` at most
+//!   [`MAX_SAMPLES_PER_PUBLISHER`] (1,048,576); `max_publishers × max_subscribers × (buffer + borrowed)` at most
 //!   [`MAX_CONNECTION_SLOTS`].
 //! - Service name 1 to [`MAX_SERVICE_NAME_LEN`] bytes.
 //! - Counter: `offset + width` at most the size of the part it is in (the user header, or one payload element).
@@ -215,6 +221,30 @@
 //!
 //! This crate's readers (`info`, `replay`, `export` and the `follow` example) apply every rule to every record they
 //! read, including loss records they don't otherwise use.
+//!
+//! # Memory a port may make iceoryx2 allocate
+//!
+//! Not a decoding rule, but a limit the replayer and recorder apply before they create a publisher or subscriber
+//! ([`port_allocation`], [`PortAllocation::check_data_segment`]), to the settings *in force*: those of the service as
+//! opened or created (a recorded 0 means iceoryx2's default, from the node's configuration), not those recorded.
+//! iceoryx2 0.10 preallocates, per publisher, `samples = max_subscribers × (buffer + borrowed) + history + the
+//! publisher's loaned samples`, with unchecked arithmetic:
+//!
+//! - on the heap, one 8-byte reference counter per sample for each data segment the publisher may have: 1 with a
+//!   static allocation strategy (the replayer's for fixed-size payloads), [`GROWING_DATA_SEGMENTS`] (255) with a
+//!   growing one (the replayer's power-of-two strategy for slices, and what a subscriber of a slice service must
+//!   assume its publishers use). `samples` is at most [`MAX_SAMPLES_PER_PUBLISHER`] and `segments × samples × 8` at
+//!   most [`MAX_SAMPLE_STATE_BYTES`] (64 MiB): for slices, at most 32,896 samples (for example 8 subscribers with
+//!   buffers of up to 4,000), for fixed-size payloads the full 1,048,576;
+//! - in shared memory, one chunk per sample: `samples × chunk size` (for a growing strategy, the chunk size rounded
+//!   up to a power of two, as iceoryx2 grows it) at most [`MAX_DATA_SEGMENT_BYTES`] (1 GiB) and at most `isize::MAX`.
+//!   The replayer checks this when it creates a publisher (for the initial slice length) and, for slices, again
+//!   before each message that makes the segment grow. A subscriber doesn't allocate the publisher's data segment, so
+//!   the recorder checks only the sample count and the reference counters.
+//!
+//! So one replay target costs at most about 64 MiB of heap and 1 GiB (2 GiB while a grown segment replaces the
+//! previous one) of shared memory, whatever a journal says. Raising these limits later is compatible; lowering them
+//! would refuse recordings that replay today.
 
 use serde::Serialize;
 
@@ -266,8 +296,17 @@ pub const MAX_BORROWED_SAMPLES: u64 = 65_536;
 /// The largest `max_publishers`, `max_subscribers` and `max_nodes` accepted.
 pub const MAX_PORTS: u64 = 4_096;
 /// The most samples one publisher of the service must preallocate, `max_subscribers × (subscriber_max_buffer_size +
-/// subscriber_max_borrowed_samples) + history_size`, accepted.
-pub const MAX_SAMPLES_PER_PUBLISHER: u64 = 1 << 24;
+/// subscriber_max_borrowed_samples) + history_size`, accepted; with the publisher's loaned samples added, also the
+/// most a port may have (see [memory a port may make iceoryx2
+/// allocate](self#memory-a-port-may-make-iceoryx2-allocate)).
+pub const MAX_SAMPLES_PER_PUBLISHER: u64 = 1 << 20;
+/// The data segments iceoryx2 0.10 keeps track of per publisher with a growing (not static) allocation strategy: it
+/// allocates a reference counter per sample for each of them.
+pub const GROWING_DATA_SEGMENTS: u64 = 255;
+/// The most heap a port's sample reference counters may take: `data segments × samples × 8` bytes.
+pub const MAX_SAMPLE_STATE_BYTES: u64 = 64 << 20;
+/// The most shared memory a publisher's data segment may take: `samples × chunk size` bytes.
+pub const MAX_DATA_SEGMENT_BYTES: u64 = 1 << 30;
 /// The most queue slots between all publishers and subscribers, `max_publishers × max_subscribers ×
 /// (subscriber_max_buffer_size + subscriber_max_borrowed_samples)`, accepted.
 pub const MAX_CONNECTION_SLOTS: u64 = 1 << 32;
@@ -522,12 +561,105 @@ impl core::fmt::Display for Version {
 pub struct ChunkLayout {
     /// Bytes before the payload: system header, user header, padding.
     pub headers_len: u64,
+    /// The space iceoryx2 reserves per payload element: the element size rounded up to the payload's alignment.
+    pub stride: u64,
     /// The largest alignment of the three parts, which the chunk has.
     pub alignment: u64,
     /// The most payload elements a data record can hold (1 for a fixed-size payload).
     pub max_elements: u64,
     /// The chunk size for `max_elements`.
     pub max_chunk_size: u64,
+}
+
+impl ChunkLayout {
+    /// The chunk size for `elements` payload elements (iceoryx2's `chunk_layout`), or `None` if it overflows.
+    pub fn size_for(&self, elements: u64) -> Option<u64> {
+        let unaligned = self
+            .stride
+            .checked_mul(elements)?
+            .checked_add(self.headers_len)?;
+        Some(unaligned.checked_add(self.alignment - 1)? & !(self.alignment - 1))
+    }
+}
+
+/// What a publisher or subscriber of a service makes iceoryx2 allocate, as checked by [`port_allocation`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PortAllocation {
+    /// Samples a publisher preallocates.
+    pub samples: u64,
+    /// Data segments it may have: 1, or [`GROWING_DATA_SEGMENTS`].
+    pub segments: u64,
+}
+
+impl PortAllocation {
+    /// Checks the shared memory of a data segment of chunks of `chunk_size` bytes aligned to `alignment`:
+    /// `samples × chunk size` (rounded up to a power of two for a growing strategy), plus the alignment, at most
+    /// [`MAX_DATA_SEGMENT_BYTES`] and `isize::MAX`. Returns that size.
+    ///
+    /// # Errors
+    ///
+    /// [`LayoutError::OutOfRange`] if it is larger, or overflows.
+    pub fn check_data_segment(&self, chunk_size: u64, alignment: u64) -> Result<u64, LayoutError> {
+        let chunk = if self.segments > 1 {
+            chunk_size.checked_next_power_of_two()
+        } else {
+            Some(chunk_size)
+        };
+        let bytes = chunk
+            .and_then(|c| c.checked_mul(self.samples))
+            .and_then(|b| b.checked_add(alignment))
+            .unwrap_or(u64::MAX);
+        let limit = MAX_DATA_SEGMENT_BYTES.min(isize::MAX as u64);
+        if bytes > limit {
+            return Err(LayoutError::OutOfRange {
+                field: "data segment (samples × chunk size)",
+                value: bytes,
+                limit,
+            });
+        }
+        Ok(bytes)
+    }
+}
+
+/// Checks what a port of a service with these settings in force (as opened or created, no unknown zeros) makes
+/// iceoryx2 allocate, before it is created: the settings' own limits ([`ServiceSettings::validate`]), the samples a
+/// publisher preallocates with `max_loaned` loaned samples (at most [`MAX_SAMPLES_PER_PUBLISHER`]), and their
+/// reference counters (`segments × samples × 8` bytes, at most [`MAX_SAMPLE_STATE_BYTES`], where `segments` is 1, or
+/// [`GROWING_DATA_SEGMENTS`] if `growing`). See [memory a port may make iceoryx2
+/// allocate](self#memory-a-port-may-make-iceoryx2-allocate).
+///
+/// # Errors
+///
+/// [`LayoutError::OutOfRange`] naming the first quantity over its limit.
+pub fn port_allocation(
+    settings: &ServiceSettings,
+    max_loaned: u64,
+    growing: bool,
+) -> Result<PortAllocation, LayoutError> {
+    settings.validate()?;
+    let samples = settings
+        .max_subscribers
+        .checked_mul(settings.subscriber_max_buffer_size + settings.subscriber_max_borrowed_samples)
+        .and_then(|v| v.checked_add(settings.history_size))
+        .and_then(|v| v.checked_add(max_loaned))
+        .unwrap_or(u64::MAX);
+    if samples > MAX_SAMPLES_PER_PUBLISHER {
+        return Err(LayoutError::OutOfRange {
+            field: "samples a publisher preallocates",
+            value: samples,
+            limit: MAX_SAMPLES_PER_PUBLISHER,
+        });
+    }
+    let segments = if growing { GROWING_DATA_SEGMENTS } else { 1 };
+    let state = segments * samples * 8;
+    if state > MAX_SAMPLE_STATE_BYTES {
+        return Err(LayoutError::OutOfRange {
+            field: "sample reference counters (data segments × samples × 8 bytes)",
+            value: state,
+            limit: MAX_SAMPLE_STATE_BYTES,
+        });
+    }
+    Ok(PortAllocation { samples, segments })
 }
 
 /// Checks the three type details of a service and computes the iceoryx2 chunk they imply (see [Validity
@@ -608,6 +740,7 @@ pub fn validate_types(
     core::alloc::Layout::from_size_align(size, align_usize).map_err(|_| overflow)?;
     Ok(ChunkLayout {
         headers_len,
+        stride,
         alignment,
         max_elements,
         max_chunk_size,
@@ -641,9 +774,10 @@ fn validate_type(info: &TypeInfo, what: &'static str) -> Result<(), LayoutError>
             limit: MAX_RECORD_PAYLOAD,
         });
     }
-    if !info.size.is_multiple_of(info.alignment) {
+    // A payload's alignment can be raised above its size's (iceoryx2's `payload_alignment`); headers are Rust types.
+    if what != "payload" && !info.size.is_multiple_of(info.alignment) {
         return Err(invalid(
-            "type size (it must be a multiple of the alignment)",
+            "header type size (it must be a multiple of the alignment)",
         ));
     }
     if info.name.len() > MAX_TYPE_NAME_LEN {
@@ -1715,7 +1849,14 @@ mod tests {
         );
         check(with(&|d| d.payload.alignment = 3), "power of two");
         check(with(&|d| d.payload.size = u64::MAX - 7), "payload size");
-        check(with(&|d| d.payload.size = 12), "multiple of the alignment");
+        check(
+            with(&|d| d.user_header = fixed("()", 12, 8)),
+            "multiple of the alignment",
+        );
+        check(
+            with(&|d| d.system_header = fixed("Header", 44, 8)),
+            "multiple of the alignment",
+        );
         check(
             with(&|d| d.user_header.variant = TypeVariant::Dynamic),
             "user header type",
@@ -1782,6 +1923,110 @@ mod tests {
             let name_len = u16::from_le_bytes([bytes[at + 2], bytes[at + 3]]);
             at += 24 + usize::from(name_len);
         }
+    }
+
+    /// iceoryx2's public `payload_alignment` gives a `[u8]` an alignment of 64 with element size 1: accepted, with a
+    /// stride of 64 per element (iceoryx2 reserves that much), while a record's payload stays `elements × 1` bytes.
+    #[test]
+    fn payload_alignment_overrides_are_accepted() {
+        let bytes = TypeInfo {
+            variant: TypeVariant::Dynamic,
+            name: "u8".into(),
+            size: 1,
+            alignment: 64,
+        };
+        let chunk = validate_types(&bytes, &fixed("()", 0, 1), &fixed("S", 48, 8)).unwrap();
+        assert_eq!(
+            (chunk.stride, chunk.headers_len, chunk.alignment),
+            (64, 64, 64)
+        );
+        assert_eq!(chunk.size_for(3), Some(64 + 3 * 64));
+        let mut d = sample_descriptor();
+        d.payload = bytes.clone();
+        let decoded = Descriptor::decode(&d.encode().unwrap()).unwrap();
+        assert_eq!(decoded.payload, bytes);
+        let data = DataRecord {
+            descriptor_seq: 7,
+            publisher_id: 0,
+            user_header: &[],
+            payload: &[1, 2, 3],
+        };
+        assert_eq!(data.check(&decoded), Ok(3));
+        // A fixed-size payload too (a 12-byte type aligned to 8).
+        d.payload = fixed("P", 12, 8);
+        assert!(Descriptor::decode(&d.encode().unwrap()).is_ok());
+    }
+
+    /// The memory a port makes iceoryx2 allocate is bounded before the port exists: the sample count, the reference
+    /// counters (255 data segments for a growing strategy) and the data segment.
+    #[test]
+    fn port_allocation_is_bounded() {
+        let settings = |subscribers, buffer, borrowed, history| ServiceSettings {
+            history_size: history,
+            subscriber_max_buffer_size: buffer,
+            subscriber_max_borrowed_samples: borrowed,
+            max_publishers: 2,
+            max_subscribers: subscribers,
+            max_nodes: 20,
+            safe_overflow: true,
+        };
+        // iceoryx2's defaults: 8 × (2 + 2) + 0 + 2 loaned.
+        let small = port_allocation(&settings(8, 2, 2, 0), 2, true).unwrap();
+        assert_eq!(
+            small,
+            PortAllocation {
+                samples: 34,
+                segments: 255
+            }
+        );
+        // The publisher example's 4,096 buffers still fit for slices; the old limit doesn't.
+        assert!(port_allocation(&settings(8, 4096, 2, 0), 2, true).is_ok());
+        // The recorded product at the old limit, 2^24, and the new limit plus the loaned samples.
+        let err = port_allocation(&settings(256, 65_536, 0, 0), 2, false).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("16777216, more than the limit of 1048576"),
+            "{err}"
+        );
+        let err = port_allocation(&settings(16, 65_536, 0, 0), 2, false).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("samples a publisher preallocates is 1048578"),
+            "{err}"
+        );
+        // Zero (unknown) recorded settings next to 65,536 buffers and borrowed samples, as iceoryx2's defaults fill
+        // them in (8 subscribers): 1,048,578 samples.
+        let err = port_allocation(&settings(8, 65_536, 65_536, 0), 2, true).unwrap_err();
+        assert!(err.to_string().contains("samples"), "{err}");
+        // 500,000 samples were 1 GB of reference counters with 255 segments: refused for slices, fine for one
+        // static segment.
+        let s = settings(1, 65_536, 65_536, 65_536);
+        let err = port_allocation(&s, 2, true).unwrap_err();
+        assert!(err.to_string().contains("reference counters"), "{err}");
+        let fixed_size = port_allocation(&s, 2, false).unwrap();
+        assert_eq!(fixed_size.samples, 3 * 65_536 + 2);
+        // samples × chunk: a valid fixed-size descriptor asking for terabytes is refused, with checked arithmetic.
+        let big = validate_types(
+            &fixed("P", 1 << 30, 8),
+            &fixed("()", 0, 1),
+            &fixed("S", 48, 8),
+        )
+        .unwrap();
+        let err = fixed_size
+            .check_data_segment(big.max_chunk_size, big.alignment)
+            .unwrap_err();
+        assert!(err.to_string().contains("data segment"), "{err}");
+        assert!(small.check_data_segment(u64::MAX, 8).is_err());
+        assert!(small.check_data_segment(1 << 62, 8).is_err());
+        // Growing segments are counted at the next power of two: 34 × 16 MiB fits, 34 × (16 MiB + 1) counts as
+        // 34 × 32 MiB and doesn't; with one static segment it does.
+        assert!(small.check_data_segment(16 << 20, 8).is_ok());
+        assert!(small.check_data_segment((16 << 20) + 1, 8).is_err());
+        let one = PortAllocation {
+            segments: 1,
+            ..small
+        };
+        assert!(one.check_data_segment((16 << 20) + 1, 8).is_ok());
     }
 
     #[test]

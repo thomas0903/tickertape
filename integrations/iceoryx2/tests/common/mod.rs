@@ -25,13 +25,27 @@ pub fn cli() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_tickertape-iox2"))
 }
 
-/// An example binary, built by `cargo test` next to the test executables.
+/// The profile directory (`<target-dir>/[<triple>/]<profile>`) of a test binary. Cargo has used two layouts for
+/// test binaries: `<profile>/deps/<name>-<hash>`, and (newer versions) `<profile>/build/<package>/<hash>/out/<name>-
+/// <hash>`; examples are in `<profile>/examples` in both.
+pub fn profile_dir_of(exe: &Path) -> Option<PathBuf> {
+    let name = |p: &Path| p.file_name().and_then(|n| n.to_str()).map(str::to_owned);
+    let dir = exe.parent()?;
+    match name(dir)?.as_str() {
+        "deps" => Some(dir.parent()?.to_path_buf()),
+        "out" => {
+            let build = dir.parent()?.parent()?.parent()?;
+            (name(build)? == "build").then(|| build.parent().map(Path::to_path_buf))?
+        }
+        _ => None,
+    }
+}
+
+/// An example binary, built by `cargo test` in the profile directory.
 pub fn example(name: &str) -> PathBuf {
     let exe = std::env::current_exe().expect("test executable path");
-    let dir = exe
-        .parent()
-        .and_then(Path::parent)
-        .expect("target directory");
+    let dir = profile_dir_of(&exe)
+        .unwrap_or_else(|| panic!("unknown Cargo layout for {}", exe.display()));
     let path = dir.join("examples").join(name);
     assert!(
         path.exists(),

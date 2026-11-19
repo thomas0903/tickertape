@@ -231,3 +231,207 @@ fn safe_replay_refuses_services_without_rust_types() {
         .unwrap();
     assert_eq!(report.messages, 2);
 }
+
+/// Every recorded service's registration is checked before its target is opened or reused (review round 3): two
+/// recorded `u64` services mapped onto one target don't share the first one's typed sink unless both are registered
+/// with matching types, and a registration that doesn't match the recording is refused before the target is
+/// created.
+#[test]
+fn every_registration_is_checked_before_a_target_is_opened_or_reused() {
+    use iceoryx2::prelude::*;
+    use tickertape_iceoryx2::replayer::Remap;
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let journal = dir.path().join("j");
+    let (a, b) = (unique("reg-a"), unique("reg-b"));
+    let u64_type = || RawType::fixed("u64", 8, 8);
+    let mut records = run_of(&RawDescriptor::new(&a, u64_type()), 0, 2);
+    records.extend(run_of(&RawDescriptor::new(&b, u64_type()), 3, 2));
+    append_records(&journal, 1 << 20, &records);
+    let target = unique("reg-target");
+    let remap = || Remap::default().rule(&a, &target).rule(&b, &target);
+    let replay = |builder: tickertape_iceoryx2::replayer::ReplayerBuilder| {
+        builder
+            .remap(remap())
+            .handle_signals(false)
+            .build()
+            .unwrap()
+            .run()
+    };
+    // Only `a` registered: `b` is refused, not sent through `a`'s sink.
+    let err = replay(Replayer::builder(&journal).typed::<u64, ()>(&a)).unwrap_err();
+    assert!(matches!(err, Error::Usage(_)), "{err}");
+    assert!(
+        err.to_string().contains(&b) && err.to_string().contains("not registered"),
+        "{err}"
+    );
+    // `b` registered as f64: refused, not ignored.
+    let err = replay(
+        Replayer::builder(&journal)
+            .typed::<u64, ()>(&a)
+            .typed::<f64, ()>(&b),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&err, Error::Incompatible { service, .. } if *service == b),
+        "{err}"
+    );
+    // `a` registered as f64: refused for the recorded service, before the target is opened (or created).
+    let err = replay(Replayer::builder(&journal).typed::<f64, ()>(&a)).unwrap_err();
+    assert!(
+        matches!(&err, Error::Incompatible { service, .. } if *service == a),
+        "{err}"
+    );
+    let node = NodeBuilder::new()
+        .signal_handling_mode(SignalHandlingMode::Disabled)
+        .create::<ipc::Service>()
+        .unwrap();
+    let details = ipc::Service::details(
+        &ServiceName::new(&target).unwrap(),
+        node.config(),
+        MessagingPattern::PublishSubscribe,
+    )
+    .unwrap();
+    assert!(details.is_none(), "the target was not created");
+    // Both registered with the recorded types: one target, both services.
+    let report = replay(
+        Replayer::builder(&journal)
+            .typed::<u64, ()>(&a)
+            .typed::<u64, ()>(&b),
+    )
+    .unwrap();
+    assert_eq!(report.messages, 4);
+    assert_eq!(report.services.len(), 1);
+}
+
+/// `Duration::MAX` for the subscriber wait, the linger time or the recorder's retry interval means "no limit", not
+/// a panic adding it to the current time (review round 3).
+#[test]
+fn caller_supplied_durations_never_overflow() {
+    use tickertape_iceoryx2::replayer::{Remap, ReplayEnd};
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let journal = dir.path().join("j");
+    let service = unique("durations");
+    let report = Recorder::builder(&journal)
+        .typed(TypedService::<u64>::new(&service))
+        .retry_interval(Duration::MAX)
+        .max_duration(Duration::from_millis(200))
+        .handle_signals(false)
+        .build()
+        .unwrap()
+        .run()
+        .unwrap();
+    assert_eq!(report.stop_reason, StopReason::MaxDuration);
+
+    let journal = dir.path().join("r");
+    append_records(
+        &journal,
+        1 << 20,
+        &run_of(
+            &RawDescriptor::new(&service, RawType::fixed("u64", 8, 8)),
+            0,
+            2,
+        ),
+    );
+    for wait in [true, false] {
+        let mut builder = Replayer::builder(&journal)
+            .typed::<u64, ()>(&service)
+            .remap(Remap::default().prefix(format!("{}/", unique("durations-target"))))
+            .linger(Duration::MAX)
+            .handle_signals(false);
+        if wait {
+            builder = builder.wait_for_subscribers(1, Duration::MAX);
+        }
+        let stop = builder.stop_flag();
+        let stopper = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+        let report = builder.build().unwrap().run().unwrap();
+        stopper.join().unwrap();
+        assert_eq!(report.messages, if wait { 0 } else { 2 }, "{report:?}");
+        if wait {
+            assert_eq!(report.end, ReplayEnd::StopFlag);
+        }
+    }
+}
+
+/// A padded `#[repr(C)]` type published through iceoryx2's typed API from the recorder's own process may leave its
+/// padding uninitialised, which the recorder by name must not read (review round 3): such samples are refused, per
+/// service, before any byte of them is viewed, and nothing is recorded.
+#[cfg(feature = "dynamic")]
+#[test]
+fn the_recorder_by_name_refuses_samples_from_its_own_process() {
+    use iceoryx2::prelude::*;
+    use std::sync::{Arc, Mutex};
+    use tickertape_iceoryx2::dynamic::DynamicService;
+
+    #[derive(Debug, Clone, Copy, ZeroCopySend)]
+    #[repr(C)]
+    struct Padded {
+        tag: u8,
+        // Seven bytes of padding before this field.
+        value: u64,
+    }
+
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let journal = dir.path().join("j");
+    let service = unique("same-process");
+    let node = NodeBuilder::new()
+        .signal_handling_mode(SignalHandlingMode::Disabled)
+        .create::<ipc::Service>()
+        .unwrap();
+    let factory = node
+        .service_builder(&ServiceName::new(&service).unwrap())
+        .publish_subscribe::<Padded>()
+        .create()
+        .unwrap();
+    let publisher = factory.publisher_builder().create().unwrap();
+    let errors = Arc::new(Mutex::new(Vec::new()));
+    let recorder = {
+        let errors = Arc::clone(&errors);
+        Recorder::builder(&journal)
+            .dynamic(DynamicService::new(&service))
+            .on_error(move |_, e| errors.lock().unwrap().push(e.to_string()))
+            .max_duration(Duration::from_millis(1500))
+            .handle_signals(false)
+            .build()
+            .unwrap()
+    };
+    let recording = std::thread::spawn(move || recorder.run().unwrap());
+    let started = std::time::Instant::now();
+    let mut i = 0u64;
+    while started.elapsed() < Duration::from_millis(1300) {
+        publisher
+            .loan_uninit()
+            .unwrap()
+            .write_payload(Padded { tag: 7, value: i })
+            .send()
+            .unwrap();
+        i += 1;
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let report = recording.join().unwrap();
+    assert_eq!(report.messages, 0, "{report:?}");
+    let errors = errors.lock().unwrap();
+    assert!(!errors.is_empty(), "{report:?}");
+    assert!(
+        errors.iter().all(|e| e.contains("recorder's own process")),
+        "{errors:?}"
+    );
+    assert!(report.services[0].errors >= 1, "{report:?}");
+    assert!(data_of_journal(&journal).is_empty());
+}
+
+#[cfg(feature = "dynamic")]
+fn data_of_journal(journal: &std::path::Path) -> Vec<u64> {
+    scan(journal)
+        .into_iter()
+        .filter_map(|r| match r {
+            Rec::Data { seq, .. } => Some(seq),
+            _ => None,
+        })
+        .collect()
+}

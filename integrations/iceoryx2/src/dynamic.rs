@@ -35,12 +35,16 @@
 //!   are permitted; under Stacked Borrows they are not. Rust has not settled its aliasing model, so this relies on
 //!   the more permissive one. A supported accessor is in the upstream requests drafted in the pull request.
 //!   Headers of size 0 are never accessed.
-//! - **Received bytes are initialised.** The recorder reads every payload and header byte as `u8`. Bytes written by
-//!   another process are bytes of a shared mapping this process didn't write, and are initialised for it. A
-//!   publisher in the *same* process that publishes a type with padding through iceoryx2's typed API may leave the
-//!   padding bytes uninitialised in Rust's abstract machine; reading them as `u8` is then undefined behaviour in
-//!   principle (upstream's recorder does the same). Don't record a padded type with this module from the process
-//!   that publishes it; the typed recorder, which only accepts types without padding, has no such case.
+//! - **Received bytes are initialised, because samples from this process are refused.** The recorder reads every
+//!   payload and header byte as `u8`. Bytes written by another process are bytes of a shared mapping this process
+//!   didn't write, and are initialised for it. A publisher in the *same* process that publishes a type with padding
+//!   through iceoryx2's typed API may leave the padding bytes uninitialised in Rust's abstract machine, and reading
+//!   them as `u8` would be undefined behaviour. So before either byte view is taken, the recorder reads the sample's
+//!   system header (a fully written iceoryx2 struct, no padding), takes the process id from the sending node's id
+//!   (iceoryx2 0.10's `ipc` service builds node ids as `UniqueSystemId`s, whose `pid` is the sender's host process
+//!   id; `UniqueNodeId::pid`), and refuses the sample, as a per-service failure, if it is this process's (the
+//!   recorder node's id, built the same way). Same-process publishers of such services can be recorded with the
+//!   typed recorder, which only accepts types without padding.
 
 use iceoryx2::port::listener::Listener;
 use iceoryx2::port::publisher::Publisher;
@@ -61,7 +65,7 @@ use crate::recorder::{
     open_listener, service_name, service_version, type_info,
 };
 use crate::replayer::{ReplayReport, Replayer, Sink};
-use crate::typed::{Create, open_or_create};
+use crate::typed::{Create, PUBLISHER_MAX_LOANED, PortBudget, initial_slice_len, open_or_create};
 
 type RawFactory = PortFactory<ipc::Service, [CustomPayloadMarker], CustomHeaderMarker>;
 type RawBuilder = PubSubBuilder<[CustomPayloadMarker], CustomHeaderMarker, ipc::Service>;
@@ -216,6 +220,7 @@ impl SourceFactory for DynamicService {
             Err(e) => return Err(open_error(&self.name, e)),
         };
         let cfg = factory.static_config();
+        crate::typed::check_subscriber(node, &self.name, cfg)?;
         let buffer = buffer_size.min(cfg.subscriber_max_buffer_size()).max(1);
         let subscriber = factory
             .subscriber_builder()
@@ -223,7 +228,13 @@ impl SourceFactory for DynamicService {
             .create()
             .map_err(|e| Error::iox("create subscriber", e))?;
         let described = describe(cfg, service_version(node, &name), buffer);
+        let own_pid = node
+            .id()
+            .pid::<ipc::Service>()
+            .map_err(|e| Error::iox("read the recorder node's process id", e))?;
         Ok(Opened::Ready(Box::new(DynamicSource {
+            name: self.name.clone(),
+            own_pid: i64::from(own_pid.value()),
             user_header_len: types.user_header.size(),
             subscriber,
             venue_ts_offset: self.venue_ts_offset,
@@ -234,6 +245,9 @@ impl SourceFactory for DynamicService {
 }
 
 struct DynamicSource {
+    name: String,
+    /// This process's id, as iceoryx2 puts it into node ids.
+    own_pid: i64,
     subscriber: Subscriber<ipc::Service, [CustomPayloadMarker], CustomHeaderMarker>,
     user_header_len: usize,
     venue_ts_offset: Option<u32>,
@@ -264,12 +278,30 @@ impl Source for DynamicSource {
             else {
                 break;
             };
+            // A sample from this process may hold uninitialised padding (module docs): refuse it before taking any
+            // byte view. The system header is written in full by iceoryx2's publisher.
+            let origin_pid = sample
+                .header()
+                .node_id()
+                .pid::<ipc::Service>()
+                .map(|p| i64::from(p.value()));
+            if origin_pid.as_ref().is_ok_and(|&p| p == self.own_pid) {
+                return Err(Error::Unsupported {
+                    service: self.name.clone(),
+                    reason: format!(
+                        "a publisher in the recorder's own process (pid {}) sent a sample; the recorder by name \
+                         refuses those, because padding a same-process publisher left uninitialised can't be read \
+                         safely (record such services with the typed recorder, or from another process)",
+                        self.own_pid
+                    ),
+                });
+            }
             let payload = sample.payload();
             // SAFETY: (unsafe block 2) For `[CustomPayloadMarker]` (a one-byte marker), iceoryx2 sizes the payload
             // slice in bytes: number of elements times the element size from the type details. The memory is the
             // sample's payload in shared memory, mapped read-only for this subscriber while `sample` lives, and
-            // this slice doesn't outlive `sample`. Bytes written by another process are initialised for this one;
-            // the exception, a padded type published from this same process, is in the module docs.
+            // this slice doesn't outlive `sample`. Bytes written by another process are initialised for this one,
+            // and samples from this process were refused just above (module docs).
             let payload = unsafe {
                 core::slice::from_raw_parts(payload.as_ptr().cast::<u8>(), payload.len())
             };
@@ -279,7 +311,8 @@ impl Source for DynamicSource {
                 let header: *const CustomHeaderMarker = sample.user_header();
                 // SAFETY: (unsafe block 3) iceoryx2 reserves `user_header_len` bytes (the size in the service's type
                 // details, validated when the service was opened) for the user header in every sample's chunk,
-                // starting at this address, initialised by the publisher, and alive as long as `sample`; the slice
+                // starting at this address, initialised by the publisher (another process: samples from this one
+                // were refused above), and alive as long as `sample`; the slice
                 // doesn't outlive it. The pointer comes from a reference to the zero-sized `CustomHeaderMarker`,
                 // which iceoryx2 derives from the chunk pointer; accessing the bytes beyond it relies on the Tree
                 // Borrows aliasing model, as the module docs explain, because iceoryx2 0.10 has no accessor that
@@ -318,7 +351,10 @@ impl Replayer {
     /// # Safety
     ///
     /// The payload and user header of every replayed message must be a valid value of the type its descriptor
-    /// advertises, for every subscriber of the target services. That holds when the journal was recorded from
+    /// advertises, for every subscriber of the target services. Equal type names, sizes and alignments, which is
+    /// all iceoryx2 and this function can compare, don't establish that a subscriber's type has the same native
+    /// representation as the recording publisher's (field order, byte order, enum discriminants, a type changed
+    /// under the same name, another architecture or compiler); the caller vouches for that too. That holds when the journal was recorded from
     /// correct publishers of those types and has not been altered since (tickertape's checksums detect accidental
     /// damage, not a journal written with wrong contents). A subscriber of a type with invalid bit patterns, such as
     /// `bool` or an enum, has undefined behaviour in its own safe code if this doesn't hold. Replay only recordings
@@ -352,17 +388,32 @@ fn sink(
         target,
         Create::Replay(descriptor.settings)
     )?;
-    let element = payload.size();
-    let publisher = match payload.variant() {
-        IoxVariant::FixedSize => factory.publisher_builder().create(),
-        IoxVariant::Dynamic => factory
-            .publisher_builder()
-            .initial_max_slice_len((4096 / element.max(1)).max(1))
-            .allocation_strategy(AllocationStrategy::PowerOfTwo)
-            .create(),
-    }
-    .map_err(|e| Error::iox("create publisher", e))?;
+    // What the publisher will allocate, from the service's settings and types in force (as opened or created,
+    // iceoryx2's defaults included), checked before it exists.
+    let (strategy, initial) = match payload.variant() {
+        IoxVariant::FixedSize => (AllocationStrategy::Static, 1),
+        IoxVariant::Dynamic => (
+            AllocationStrategy::PowerOfTwo,
+            initial_slice_len(factory.static_config()),
+        ),
+    };
+    let budget = PortBudget::check(
+        target,
+        factory.static_config(),
+        PUBLISHER_MAX_LOANED,
+        strategy != AllocationStrategy::Static,
+        Some(initial),
+    )?;
+    let publisher = factory
+        .publisher_builder()
+        .max_loaned_samples(PUBLISHER_MAX_LOANED)
+        .initial_max_slice_len(initial)
+        .allocation_strategy(strategy)
+        .create()
+        .map_err(|e| Error::iox("create publisher", e))?;
     Ok(Box::new(DynamicSink {
+        budget,
+        target: target.to_string(),
         descriptor: descriptor.clone(),
         variant: payload.variant(),
         user_header_len: user_header.size(),
@@ -372,6 +423,8 @@ fn sink(
 }
 
 struct DynamicSink {
+    budget: PortBudget,
+    target: String,
     factory: RawFactory,
     publisher: Publisher<ipc::Service, [CustomPayloadMarker], CustomHeaderMarker>,
     descriptor: Descriptor,
@@ -393,6 +446,8 @@ impl Sink for DynamicSink {
         if self.variant == IoxVariant::FixedSize && elements != 1 {
             return Err(Error::Usage("a fixed-size payload has one element".into()));
         }
+        // A larger slice than any before makes the publisher's data segment grow: bounded like its first one.
+        self.budget.check_payload(&self.target, payload.len())?;
         // SAFETY: (unsafe block 4) `loan_custom_payload` requires: a slice length other than 1 only for a dynamic
         // payload (checked just above), and that the sample be treated as `elements * element size` bytes, which is
         // `payload.len()` (checked by `check_message`), exactly what is written below.
