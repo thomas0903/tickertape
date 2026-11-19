@@ -164,8 +164,9 @@ jobs:
       # From 1.0, removing or changing a frozen declaration fails; additions pass (ADR 0028 -> Versioning).
       - name: ABI baseline check
         run: python3 .github/scripts/check_abi_baseline.py crates/tickertape-ffi/abi/tickertape-baseline.h crates/tickertape-ffi/include/tickertape.h
-      # Rust tests of the extern "C" functions (with the core's failure points), then the C99/C11 and C++11/C++20
-      # programs, examples and cross-language fixtures, compiled with AddressSanitizer and UBSan.
+      # Rust tests of the extern "C" functions (with the core's failure points), then the C99/C11 programs, the C++
+      # binding's programs (C++17, C++20, no exceptions; ADR 0036), examples and cross-language fixtures, compiled
+      # with AddressSanitizer and UBSan, and the binding's compile-only matrix (C++17/20/23 with g++ and clang++).
       - name: C ABI tests (AddressSanitizer, UBSan)
         run: cargo test -p tickertape-ffi --locked --features fault-injection
         env:
@@ -186,6 +187,10 @@ jobs:
           make -C examples/c
           cmake -S examples/c -B "$RUNNER_TEMP/examples"
           cmake --build "$RUNNER_TEMP/examples"
+          cmake -S crates/tickertape-ffi/tests/cmake -B "$RUNNER_TEMP/cmake-subdir"
+          cmake --build "$RUNNER_TEMP/cmake-subdir"
+          "$RUNNER_TEMP/cmake-subdir/example" "$RUNNER_TEMP/journal" record 3
+          "$RUNNER_TEMP/examples/example" "$RUNNER_TEMP/journal" replay
 
   msrv:
     name: msrv

@@ -5,17 +5,63 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
-- Fixed: a visible reader no longer reports `CorruptReason::BrokenChain` for a seal that writer recovery removed in
-  place after the reader had read it. The safe reader could still hold the seal in its read buffer (a zero-copy
-  reader could load it just before the repair), follow it, find the successor quarantined while its own segment kept
-  its identity, and report a broken chain on a healthy journal on every call, until the new writer rolled to the
-  same base again or the application seeked. A reader at a seal whose successor is missing now reads the slot again
-  from the file, and reports a broken chain only if the seal is still there and the successor still missing. Found
-  by `reader_retention_stress::durable_readers_under_repairs` on CI (arm64 Linux and macOS, three times in one
-  night), where one zeroed commit word in a sealed segment caused such a repair; with ADR 0035 recovery replaces
-  that segment instead, and the remaining
-  in-place repair that removes a seal needs two damaged places (a seal's marker emptied and its successor no longer
-  opening).
+- C++ binding (ADR 0036, `docs/cpp-api.md`): `crates/tickertape-ffi/include/tickertape.hpp`, a header-only C++17
+  wrapper over the C ABI, shipped and installed (`cargo cinstall`) next to `tickertape.h`. It covers the whole C ABI:
+  move-only `Writer`, `Reader`, option builders and `RecordBatch`; copying, zero-copy (a lambda) and batch appends
+  (`NewRecord` is the C struct `tickertape_new_record`, built with `tickertape::new_record`); checkpoint; seek; next
+  with `std::chrono` timeouts; durable-only reads; the zero-copy reader as `Reader::open_mapped_unsafe`; `RecordView`s
+  whose borrowed payload is checked in debug builds; copy-out (into any memory or a writable byte range) and batch
+  reads; verify, segment listing, the checkpoint marker and retention. Errors are values (`tickertape::result<T>`,
+  `[[nodiscard]]`, with a `Status`, message, OS error and corruption reason) whose `value()` throws, so it works with
+  and without `-fno-exceptions`; a temporary result or error never lends a reference, and `tickertape::Exception`
+  copies without throwing (moving one copies it, so a moved-from exception keeps its error). An exception thrown by a
+  fill never crosses the C ABI: it is rethrown after the aborted append, nested inside the library error if the
+  clean-up failed, and destroying or moving the writer inside its own fill is defined. Negative timeouts do not wait
+  (unlike C), and integral durations are converted to nanoseconds exactly, rounded up (for every period the
+  standard library can convert to nanoseconds; a more extreme one does not compile); a negative or
+  NaN retention age is an error. With GCC and Clang, units built with and without exceptions or debug checks can be
+  linked into one program, and binding types cannot be passed between units built in different exception modes: the
+  inline namespace is `tickertape::v1` with exceptions and `tickertape::v1_noexcept` without, so every definition the
+  header provides has a mode-specific symbol (and it instantiates no throwing standard-library function over only its
+  C types); a binding type in the parameter list of a C++ function called directly by name makes a crossing a link
+  error, but one only in a non-template function's return type, in an `extern "C"` function, or passed through a
+  virtual function or a function pointer, links and is undefined, so the rule is not to cross. Standard-library code
+  over standard types stays
+  shared, as in any program that mixes modes, and so does a container your own code instantiates over `NewRecord` or
+  another C type: that is as safe as the toolchain's standard library makes it (CI runs the mixed-mode test with GCC
+  and Clang on Linux and Apple Clang on macOS; Homebrew GCC on macOS was run by hand). The debug-check-dependent
+  functions carry an `abi_tag`.
+  `new_record` refuses temporaries that own their bytes at compile time; rvalue views are accepted where
+  `tickertape::enable_borrowed_bytes` is true (`std::basic_string_view`, `std::span`, and your own view types if you
+  specialise it), the same at every language level. Paths are passed directly; the parameter type is the internal
+  `tickertape::detail::PathArg`, which protects the documented call forms from a dangling temporary but not code that
+  names it. Nothing the header defines depends on the language level. Every translation unit of a program must use the
+  same release of the header; no class gains a data member within a major version. The header checks the C header's
+  version at compile time and the library's in every call that takes a journal path and in the option builders before
+  they allocate. Tested as C++17, C++20 and C++17 without exceptions under AddressSanitizer, UBSan and Valgrind,
+  compile-tested as C++17/20/23 with and without exceptions and `NDEBUG` with GCC and Clang under `-Wconversion
+  -Wshadow -Wpedantic`, with a layout pin for every class, `static_assert`s and compile-fail programs for the API's
+  compile-time properties, a check that the header's definitions are the same as C++17, C++20 and C++23, mixed-mode
+  link tests with every compiler (failing each allocation inside a binding function in turn, and an `nm` check that
+  the two exception modes define no common binding symbol), an allocation check for the hot path with a positive
+  control and cross-language fixtures; tests fail if a C function, struct field, status or corruption reason is added
+  without a decision for the binding. A CMake package (`tickertape::tickertape`, `tickertape::cpp`) serves
+  `find_package` and `add_subdirectory`. The C++11 example wrapper `examples/c/tickertape.hpp` is removed;
+  `examples/c/example.cpp` now records, follows live and replays with the binding, and the examples need C++17. On
+  macOS, link the static library with Apple's toolchain defaults or use the shared library (`docs/c-api.md`).
+- Fixed: a visible reader no longer reports `CorruptReason::BrokenChain` for a seal that is no longer in the file.
+  When recovery repairs a tail in place, a seal can go with it while the successor is moved to `quarantine/`. The
+  safe reader could still hold the seal in its read buffer (a zero-copy reader could load it just before the damage
+  or the repair), follow it, find no successor while its own segment kept its identity, and report a broken chain on
+  a healthy journal on every call, until the new writer rolled to the same base again or the application seeked. A
+  reader at a seal whose successor it does not find now reads the slot again from the file, and reports a broken
+  chain only if the seal is still there and the successor is still missing at a second attempt. Found by
+  `reader_retention_stress::durable_readers_under_repairs` on CI (arm64 Linux and macOS, three times in one night),
+  where one zeroed commit word in a sealed segment caused such a repair; with ADR 0035 recovery replaces that
+  segment instead. In-place repairs that remove a seal remain (one is a seal's marker emptied in front of a
+  successor that no longer opens; another is a zeroed stretch from a record through the seal), and the reader now
+  handles them. A failed refill of the safe reader's buffer also drops the buffer, so the next call reads from the
+  file.
 - Library: dropping a `Writer` now releases the journal lock explicitly (`flock(LOCK_UN)`), after its helper threads
   have stopped and readers have been told it has gone, and so does a `Writer::open` that fails after taking the lock.
   Until now the lock was released only when the last copy of its descriptor closed, and a child that another thread

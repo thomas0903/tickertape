@@ -332,9 +332,10 @@ seal's own slot, so the reader's position starts a record of the new history. Wh
 earlier in the segment, at an empty commit word with no committed history found after it, the reader's position can
 fall inside a new record, and it then waits or reports corruption there as described above.) If the seal is there, a
 live writer stored it only after linking its successor, so the reader tries the successor once more and reports
-`CorruptReason::BrokenChain` only if it is still missing. One such report can be transient: a recovery that replaces
-a successor whose header is damaged keeps the seal, moves that successor into `quarantine/` and then creates a new
-one, and a reader whose two attempts both fall in between follows the new successor on its next call.
+`CorruptReason::BrokenChain` only if it is still missing. Such a report can be transient, and a later call then
+follows the successor: for example while a recovery replaces a successor whose header is damaged (it keeps the
+seal, moves that successor into `quarantine/` and then creates a new one), or after a power loss that kept the seal
+but not the successor's directory entry, until a writer opens and creates the successor.
 
 Until it checks, a visible reader may return records from a segment that recovery has just preserved and removed.
 Such records are like records lost to a power loss that a reader had already seen (`crash-contract.md` → C8). A

@@ -260,9 +260,10 @@ impl Reader {
     /// call [`Reader::seek`] to continue on the current chain. A removal is never reported as corruption or as an
     /// I/O "not found" error.
     /// [`Error::Corrupt`] with [`CorruptReason::BrokenChain`] if the segment at the cursor is sealed and still in
-    /// place but the next segment is missing. The reader reads the seal again from the file first: a seal it had read
-    /// or buffered before a repair in place removed it (crash contract C11) is not followed, and the reader reads the
-    /// slot as it is now.
+    /// place but the next segment is missing. When the next segment is not found, the reader first reads the seal
+    /// again from the file: if the seal is gone (a repair in place can remove one the reader had read or buffered,
+    /// crash contract C11), it reads the slot as it is now; if it is still there, it tries the next segment once
+    /// more and reports the broken chain only if that misses too. A later call tries again.
     /// [`Error::Io`] if the next segment can't be opened, if checking whether the segment is still in place fails
     /// other than with "not found" (only that counts as a removal), or (with kind
     /// [`OutOfMemory`](std::io::ErrorKind::OutOfMemory)) if the read buffer for the frame at the cursor can't be
@@ -684,10 +685,12 @@ impl Reader {
             .min(self.seg.size.saturating_sub(offset));
         resize_buf(&mut self.buf, len)
             .map_err(|e| Error::io("allocate read buffer", &self.seg.path, e))?;
-        self.seg
-            .file
-            .read_exact_at(&mut self.buf, offset)
-            .map_err(|e| Error::io("read segment", &self.seg.path, e))?;
+        if let Err(e) = self.seg.file.read_exact_at(&mut self.buf, offset) {
+            // The buffer now holds whatever was read, under the previous `buf_start`: drop it, so that the next
+            // call reads from the file.
+            self.buf.clear();
+            return Err(Error::io("read segment", &self.seg.path, e));
+        }
         self.buf_start = offset;
         Ok(())
     }

@@ -954,9 +954,9 @@ fn remove_seal_in_place(dir: &std::path::Path, successor: u64, seal: u64) -> Wri
 /// segment 0 into its buffer up to the seal; recovery then removed the seal in place and quarantined the successor,
 /// and the reader followed the seal it still held, found no successor while its segment was in place, and reported a
 /// broken chain on every call until the new writer happened to roll to the same base again (forever, if it never
-/// does). Before ADR 0035 one zeroed commit word in a sealed segment was enough; now the only in-place repair that
-/// removes a seal is the one in [`remove_seal_in_place`]. A zero-copy reader reads the current bytes, but can load
-/// the seal just before the repair.
+/// does). Before ADR 0035 one zeroed commit word in a sealed segment was enough; now one in-place repair that
+/// removes a seal is the one in [`remove_seal_in_place`] (another is a zeroed stretch from a record through the
+/// seal). A zero-copy reader reads the current bytes, but can load the seal just before the damage.
 ///
 /// The seal it read is gone from the file, so it isn't corruption: the reader reads the slot again and waits there
 /// (`Ok(None)`), then continues in the new history, which kept the file's identity, without `Error::Discarded` (C11).
@@ -1006,6 +1006,13 @@ fn visible_reader_does_not_follow_a_seal_an_in_place_repair_removed() {
                 let (w, p) = (writer.clone(), path.clone());
                 at(Point::ReaderSeal, move || {
                     *w.borrow_mut() = Some(remove_seal_in_place(&p, successor, seal));
+                });
+            }
+            if when != When::AtTheSealThenRoll {
+                // One call reads the slot again at most once. A reader that kept its stale buffer would come back
+                // to the buffered seal and re-read without end: fail instead of hanging.
+                tickertape::fault::run_at(Point::ReaderSealReread, 1, || {
+                    panic!("the reader read the seal's slot again twice in one call")
                 });
             }
             if when == When::AtTheSealThenRoll {

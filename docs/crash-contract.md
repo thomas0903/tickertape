@@ -161,16 +161,20 @@ journal; the durability and restart guarantees below apply to retained history.
   [0034](decisions/0034-durable-only-reads-check-segment-identity.md) → In-place repairs).
 - **Missing segments.** If the checkpoint marker's segment, or a segment in the middle of the chain, is missing,
   the writer refuses to open (under every recovery policy) rather than discard history on its own. A reader that
-  reaches a seal whose successor is missing while its own segment is still in place, and still finds the seal when
-  it reads that slot again from the file, reports `CorruptReason::BrokenChain`
-  (`tests/retention.rs::missing_successor_with_segment_in_place_is_a_broken_chain`); if its own segment is gone too,
-  retention removed both and it reports `Error::Discarded` (C14). If the seal is gone from the file, a repair in
-  place removed it after the reader read it, or while the safe reader held it in its buffer (the seal's marker
-  emptied by storage damage and its successor no longer opening; `format.md` → What readers do about repairs): the
-  journal is healthy, and the reader reads the slot as it is now, waiting there or continuing in the new history
-  (`tests/durable_only.rs::visible_reader_does_not_follow_a_seal_an_in_place_repair_removed`); where the repair began
-  earlier in the segment than the seal, its position may fall inside a record of the new history, as for any reader
-  across an in-place repair (C11).
+  reaches a seal and does not find its successor, while its own segment is still in place, reads that slot again
+  from the file. If the seal is still there, it tries the successor once more, and reports
+  `CorruptReason::BrokenChain` only if that attempt misses too
+  (`tests/retention.rs::missing_successor_with_segment_in_place_is_a_broken_chain`); a later call tries again, and
+  succeeds once a recovery has put the successor in place. If its own segment is gone too, retention removed both
+  and it reports `Error::Discarded` (C14). If the seal is gone from the file, the reader can't tell why, and reads
+  the slot as it is now, like a reader that never read the seal: it waits there or continues with what is written
+  there next. That is what happens when a repair in place removed a seal after the reader read it, or while the
+  safe reader held it in its buffer (`format.md` → What readers do about repairs;
+  `tests/durable_only.rs::visible_reader_does_not_follow_a_seal_an_in_place_repair_removed`); where the repair began
+  earlier in the segment than the seal, the reader's position may fall inside a record of the new history, as for
+  any reader across an in-place repair (C11). The re-read happens only when the successor is not found: a successor
+  that a new history has created again at the same base opens at the first attempt, and the reader follows its
+  buffered seal into it, which C11 allows across an in-place repair.
 - **CRC32C** detects all burst errors up to 32 bits and most other corruption, not all of it. It is not a
   cryptographic integrity check.
 - **Clocks.** Timestamps are caller-supplied data. tickertape never orders or validates by timestamp.
