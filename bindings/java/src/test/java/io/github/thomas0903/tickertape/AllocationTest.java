@@ -64,6 +64,16 @@ class AllocationTest {
         return bytes;
     }
 
+    /** Measures each metadata accessor of {@code v} and {@code isValid()} on its own, summing into {@code sink}. */
+    private void measureMetadata(String what, RecordView v, long[] sink) throws Exception {
+        measure(what + " seq()", i -> sink[0] += v.seq());
+        measure(what + " schemaId()", i -> sink[0] += v.schemaId());
+        measure(what + " venueTsNs()", i -> sink[0] += v.venueTsNs());
+        measure(what + " localTsNs()", i -> sink[0] += v.localTsNs());
+        measure(what + " payloadLength()", i -> sink[0] += v.payloadLength());
+        measure(what + " isValid()", i -> sink[0] += v.isValid() ? 1 : 0);
+    }
+
     /** Measures {@code op} and records a failure naming it; every operation is measured before the test fails. */
     private void measure(String what, Op op) throws Exception {
         long bytes = allocated(op);
@@ -184,30 +194,34 @@ class AllocationTest {
     }
 
     /**
-     * The scratch-buffer condition is per source kind: a native segment is passed to the library as it is and does not
-     * count, so the first array append larger than every payload copied through the scratch buffer before allocates
-     * (the buffer grows) even after larger native-segment appends, and array appends up to that size allocate nothing
-     * afterwards. The writer's scratch buffer starts at 256 bytes.
+     * The scratch-buffer condition is its capacity, not the payloads seen before: a copied payload allocates nothing
+     * while it fits the buffer's current capacity, which starts at {@link Writer#SCRATCH_INITIAL_BYTES}, so a writer
+     * warmed with 64-byte arrays appends arrays of that full size without allocating. A native segment is passed to the
+     * library as it is and does not grow the buffer, so the first array append larger than the capacity allocates (the
+     * buffer grows) even after larger native-segment appends, and array appends up to that size allocate nothing
+     * afterwards.
      */
     @Test
-    void theScratchConditionCountsOnlyPayloadsCopiedThroughIt() throws Exception {
+    void theScratchConditionIsTheBuffersCapacity() throws Exception {
         WriterOptions options = WriterOptions.defaults().segmentSize(64L << 20).prefault(false);
         byte[] small = new byte[64];
-        byte[] large = new byte[512];
+        byte[] full = new byte[Writer.SCRATCH_INITIAL_BYTES];
+        byte[] large = new byte[2 * Writer.SCRATCH_INITIAL_BYTES];
         try (Writer w = Writer.open(tmp.resolve("s"), options); Arena arena = Arena.ofConfined()) {
             MemorySegment largeNative = arena.allocate(large.length);
             measure("append(byte[]) of 64 bytes", i -> w.append(1, i, i, small));
-            measure("append(native MemorySegment) of 512 bytes, after arrays of 64 bytes",
+            measure("append(byte[]) of the initial capacity, after arrays of 64 bytes", i -> w.append(1, i, i, full));
+            measure("append(native MemorySegment) larger than the initial capacity, after arrays",
                     i -> w.append(1, i, i, largeNative));
             long before = THREADS.getCurrentThreadAllocatedBytes();
             w.append(1, 0, 0, large);
             long first = THREADS.getCurrentThreadAllocatedBytes() - before;
             if (first < 16) {
-                failures.add("the first append(byte[]) of 512 bytes after native segments of 512 bytes allocated "
+                failures.add("the first append(byte[]) larger than the scratch capacity, after native segments of its size, allocated "
                         + first + " bytes, but the scratch buffer has to grow (the documented condition is wrong)");
             }
-            measure("append(byte[]) of 512 bytes, after the first", i -> w.append(1, i, i, large));
-            measure("append(byte[]) of 64 bytes, after one of 512", i -> w.append(1, i, i, small));
+            measure("append(byte[]) larger than the initial capacity, after the first", i -> w.append(1, i, i, large));
+            measure("append(byte[]) of 64 bytes, after a larger one", i -> w.append(1, i, i, small));
         }
         assertNoFailures();
     }
@@ -243,8 +257,7 @@ class AllocationTest {
                     });
                     r.seek(0);
                     RecordView v = r.tryNext();
-                    measure(kind + "view metadata", i -> sum[0] += v.seq() + v.schemaId() + v.venueTsNs()
-                            + v.localTsNs() + v.payloadLength() + (v.isValid() ? 1 : 0));
+                    measureMetadata(kind + "view", v, sum);
                     measure(kind + "view get(layout)", i -> sum[0] += v.get(ValueLayout.JAVA_LONG_UNALIGNED, i & 7));
                     measure(kind + "view getByte", i -> sum[0] += v.getByte(63));
                     measure(kind + "view copyPayloadTo(MemorySegment)", i -> v.copyPayloadTo(segmentOut, 0));
@@ -286,8 +299,7 @@ class AllocationTest {
                 // The warm-up gets every index once, so the measured calls are of indexes used before.
                 measure("ReadBatch.get of an index used before", i -> got[0] = rb.get(i & 63));
                 RecordView v = rb.get(1);
-                measure("batch view metadata", i -> seen[0] += v.seq() + v.schemaId() + v.venueTsNs()
-                        + v.localTsNs() + v.payloadLength() + (v.isValid() ? 1 : 0));
+                measureMetadata("batch view", v, seen);
                 measure("batch view get(layout)", i -> seen[0] += v.get(ValueLayout.JAVA_LONG_UNALIGNED, i & 7));
                 measure("batch view getByte", i -> seen[0] += v.getByte(63));
                 measure("batch view copyPayloadTo(MemorySegment)", i -> v.copyPayloadTo(segmentOut, 0));
