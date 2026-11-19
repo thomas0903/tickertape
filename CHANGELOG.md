@@ -5,6 +5,14 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
+- Python: installable bindings (`bindings/python/`, PyPI name `tickertape`, not yet published; ADR 0029). `Writer`
+  and `Reader` classes over the Rust library with batch appends and reads that cross the language boundary once,
+  explicit partial-failure reporting (`BatchAppendError`), columnar `RecordBatch` output for NumPy, pyarrow and pandas
+  (all optional), durable-only reads, interruptible waits that release the GIL, an exception for every error variant,
+  and type stubs. Records are copied into `bytes`; the zero-copy mapped reader is not exposed. One abi3 wheel per
+  platform for CPython 3.11+; a wheel workflow builds manylinux, musllinux and macOS wheels and an sdist, with a
+  Trusted Publishing step that stays off until PyPI is configured. The pure-Python decoder in `python/` is unchanged.
+- Release operations: `release.py prepare` also checks the Python bindings' version and lockfile against the tag.
 - Docs: define the path to v1.0 around sustained performance, optional eBPF diagnostics, reader/checkpoint
   optimization, ARM measurements, interoperability, replay/recovery at scale and explicit stability/release gates.
 - Docs: v1.0 scope decisions of 2026-11-19. The external integration is an iceoryx2 recorder and replayer

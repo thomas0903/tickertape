@@ -1,7 +1,8 @@
 # Playbook: release checklist
 
 Publishing a new version is a maintainer decision. Preparing a change does not authorize a release.
-After the owner authorizes that version, push its tag to start `.github/workflows/release.yml`.
+After the owner authorizes that version, push its tag to start `.github/workflows/release.yml` (crates, CLI archives)
+and `.github/workflows/python-wheels.yml` (Python wheels and sdist).
 
 ## One-time configuration
 
@@ -21,12 +22,41 @@ The workflow exchanges GitHub OIDC identity for a short-lived crates.io token. N
 stored as a repository secret. See the [crates.io setup documentation](https://crates.io/docs/trusted-publishing).
 New crate names still need an initial, explicitly authorized API-token publish before Trusted Publishing can be configured.
 
+### PyPI (Python bindings, ADR 0029)
+
+Until these steps are done, `python-wheels.yml` builds and smoke-tests the wheels and sdist and uploads them as
+workflow artefacts, but its `publish` job is skipped. Nothing reaches PyPI without all three.
+
+1. On [pypi.org](https://pypi.org/manage/account/publishing/), signed in as the maintainer (with 2FA), add a
+   **pending publisher** (it creates the project on the first upload, so no token is ever needed):
+
+   | Setting | Value |
+   |---|---|
+   | PyPI project name | `tickertape` (the `[project].name` in `bindings/python/pyproject.toml`) |
+   | Owner | `thomas0903` |
+   | Repository name | `tickertape` |
+   | Workflow name | `python-wheels.yml` |
+   | Environment name | `pypi` |
+
+   A pending publisher does not reserve the name; until the first upload, anyone can register it. To use another
+   name, change `[project].name` in `bindings/python/pyproject.toml` (the import name stays `tickertape`) and the
+   install instructions in `bindings/python/README.md` and `docs/python.md`.
+2. In the GitHub repository settings, create the environment `pypi`, allowing the `main` branch and tags matching `v*`
+   (as for `release`).
+3. Add the repository variable `PYPI_PUBLISHING` with the value `enabled` (Settings → Secrets and variables →
+   Actions → Variables). Delete it to switch publishing off again.
+
+See PyPI's [Trusted Publishing documentation](https://docs.pypi.org/trusted-publishers/).
+
 `main` requires pull requests and all CI checks, including release tooling. No approving review is required for this
 single-maintainer repository. Administrators are subject to the checks; force pushes and branch deletion are disabled.
 
 ## Prepare
 
-1. Set `[workspace.package].version` and `[workspace.dependencies].tickertape.version` in `Cargo.toml`.
+1. Set `[workspace.package].version` and `[workspace.dependencies].tickertape.version` in `Cargo.toml`, and
+   `[package].version` in `bindings/python/Cargo.toml`; then refresh the bindings' lockfile with
+   `cargo update --workspace --manifest-path bindings/python/Cargo.toml`. `release.py prepare` refuses a tag whose
+   versions or bindings lockfile disagree.
 2. Add a dated `## [X.Y.Z] - YYYY-MM-DD` section to `CHANGELOG.md`, and update its compare link.
 3. Check the packages and run the normal checks:
 
@@ -65,6 +95,12 @@ The tag workflow:
    then publishes it. Existing release notes are preserved.
 5. Verifies published package checksums and source commits, waits up to 15 minutes for both docs.rs builds, installs
    the CLI from crates.io, and downloads/checks/runs the Linux binary archive.
+
+The same tag starts `python-wheels.yml`, which runs the same `prepare` checks, builds manylinux and musllinux
+(x86-64, aarch64) and macOS (x86-64, arm64) wheels and an sdist, runs the end-to-end example with each, and, once
+PyPI is configured (above), uploads them with Trusted Publishing. Files already on PyPI are skipped, so a rerun
+completes a partial upload; PyPI files are immutable. To build wheels without publishing, dispatch it with any `ref`
+and `publish=false`. To publish an existing tag later, dispatch it from `main` with `ref=vX.Y.Z` and `publish=true`.
 
 Monitor the [release workflow](https://github.com/thomas0903/tickertape/actions/workflows/release.yml). Publication is
 complete only when its verification job passes. These are release checks, not timing benchmarks.
