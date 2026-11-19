@@ -104,11 +104,18 @@ The Linux libraries are built for glibc.
   macOS's `-Djdk.nio.path.useNormalizationFormD`, reaches the operating system as the JDK holds it. The binding reads
   those bytes from `Path.toUri()`, whose `file:` URI carries the absolute path's bytes percent-encoded one by one, and
   decodes them; it does not reconstruct them from `toString()`. What follows from that:
-  - the library receives the **absolute** path: a relative path is resolved as the JDK resolves it, against the
-    JVM's working directory, so paths in the library's error messages, and so in exceptions, are absolute; trailing
-    slashes are removed (except from the root);
-  - `toUri()` may `stat` the path once (to tell whether it is a directory), which happens when a journal is opened or
-    inspected, or a retention destination is set (`Retention.moveTo`), never per record.
+  - an absolute path is passed as its bytes; a relative path is passed **relative**, with its own bytes (the empty
+    path as `.`): the binding strips from the absolute bytes those of the JDK's default directory
+    (`Path.of("").toUri()`) and the separator after them, and passes the absolute bytes if that prefix does not match.
+    The library resolves a relative path against the process's working directory, which is the directory the JVM
+    started in and the one the JDK resolves relative paths against too: Java code cannot change it, and setting the
+    `user.dir` property, which the JDK does not support, moves neither (only native code that calls `chdir` does). A
+    journal reached by a short relative path from a deep working directory therefore opens even when its absolute path
+    would exceed the platform's path-length limit, as the JDK opens it. Trailing slashes are removed (except from the
+    root);
+  - `toUri()` may `stat` the path once (to tell whether it is a directory), and for a relative path the working
+    directory once more, which happens when a journal is opened or inspected, or a retention destination is set
+    (`Retention.moveTo`), never per record.
 
   The exact URI form is the default provider's behaviour on Linux and macOS, not something the `Path.toUri`
   specification fixes; the binding's tests pin it, and a URI not in that form is refused with
@@ -177,12 +184,16 @@ The Linux libraries are built for glibc.
   - `append` with a native `MemorySegment`, which is passed to the library as it is (no condition on its size).
   - `append` with a `byte[]`, a heap `MemorySegment`, or a direct, heap or read-only heap `ByteBuffer`, which are
     copied through the writer's scratch buffer: of a payload that fits the buffer's current capacity, which starts at
-    256 bytes (the constant `SCRATCH_INITIAL_BYTES` in `Writer.java`) and, when a copied payload does not fit, grows to the larger of that
-    payload and twice the capacity. So a writer warmed with 64-byte arrays appends 256-byte arrays without allocating. A native
-    segment is passed as it is and does not grow the buffer, so the first `byte[]` append larger than the capacity
-    allocates even after larger native-segment appends. One exception: after
-    a heap segment larger than `Integer.MAX_VALUE - 8` bytes, the next `ByteBuffer` append replaces the scratch buffer
-    with one of its own size.
+    256 bytes (the constant `SCRATCH_INITIAL_BYTES` in `Writer.java`). When a copied payload does not fit, the new
+    capacity is the larger of the payload and twice the old capacity, where the doubled figure is capped at
+    `Integer.MAX_VALUE - 8` bytes: with a capacity of 1,200,000,000 bytes, a 1,300,000,000-byte payload grows it to
+    `Integer.MAX_VALUE - 8` bytes, not 2,400,000,000. So a writer warmed with 64-byte arrays appends 256-byte arrays
+    without allocating. A native segment is passed as it is and does not grow the buffer, so the first `byte[]` append
+    larger than the capacity allocates even after larger native-segment appends. One exception: a copied payload above
+    the cap (a heap segment can be far above it; a `byte[]` or `ByteBuffer` only by the few bytes up to
+    `Integer.MAX_VALUE`) grows the buffer to exactly its size, which is too large to back a `ByteBuffer`, so the next
+    `ByteBuffer` append replaces the scratch buffer with one of that append's size (a `ByteBuffer` append above the cap
+    gets one in the same call).
   - `appendBatch`; `nextSeq()`.
   - `appendWith` whose filler uses `set`, `setByte`, `put(byte[])`, `put(MemorySegment)` (native or heap), or
     `put(ByteBuffer)` of a heap buffer, or of a direct or read-only heap buffer that is the same as in the previous

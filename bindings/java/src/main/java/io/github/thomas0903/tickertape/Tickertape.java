@@ -24,11 +24,14 @@ import java.util.Objects;
  * {@code file:} URI carries them percent-encoded. Three consequences:
  *
  * <ul>
- *   <li>The library receives the <b>absolute</b> path: a relative path is resolved as the JDK resolves it, against the
- *       JVM's working directory. Paths in the library's error messages, and so in the binding's exceptions, are
- *       absolute. Trailing slashes are removed (except from the root).
- *   <li>{@code toUri()} may {@code stat} the path once (to tell whether it is a directory). This happens when a journal
- *       is opened or inspected, or a retention destination is set, never per record.
+ *   <li>An absolute path is passed as its bytes. A relative path is passed relative, with its own bytes (the empty
+ *       path as {@code .}), and the library resolves it against the process's working directory. That is the
+ *       directory the JVM started in, against which the JDK resolves relative paths too: Java code cannot change it,
+ *       and setting the {@code user.dir} property, which the JDK does not support, moves neither (only native code
+ *       that calls {@code chdir} does). Trailing slashes are removed (except from the root).
+ *   <li>{@code toUri()} may {@code stat} the path once (to tell whether it is a directory), and for a relative path
+ *       the working directory once more. This happens when a journal is opened or inspected, or a retention
+ *       destination is set, never per record.
  *   <li>Only the default file system is supported; a path of any other ({@code FileSystems.newFileSystem}, a zip file
  *       system) throws {@link IllegalArgumentException}.
  * </ul>

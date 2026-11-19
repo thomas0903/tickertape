@@ -40,9 +40,13 @@ import java.util.Optional;
  * warm the appends allocate nothing on the Java heap under the conditions that {@code docs/java-api.md} &rarr;
  * Allocation lists (and that the binding's allocation test measures): among them, for an append whose payload is
  * copied through the scratch buffer (a {@code byte[]}, a heap {@link MemorySegment}, any {@link ByteBuffer}), a payload
- * that fits the buffer's current capacity, which starts at 256 bytes and, when such a payload does not fit, grows to
- * the larger of that payload and twice the capacity (a native segment is passed as it is and does not count), and for
- * {@link PayloadBuffer#put(long, ByteBuffer)} of a direct or read-only buffer, the same buffer as before.
+ * that fits the buffer's current capacity, and for {@link PayloadBuffer#put(long, ByteBuffer)} of a direct or
+ * read-only buffer, the same buffer as before. The capacity starts at 256 bytes. When a copied payload does not fit,
+ * the new capacity is the larger of the payload and twice the old capacity, where the doubled figure is capped at
+ * {@code Integer.MAX_VALUE - 8} bytes: with a capacity of 1,200,000,000 bytes, a 1,300,000,000-byte payload grows it
+ * to {@code Integer.MAX_VALUE - 8} bytes, not 2,400,000,000. A payload above the cap grows it to exactly the payload's
+ * size; a buffer that large cannot back a {@link ByteBuffer}, so the next {@code ByteBuffer} append replaces it with
+ * one of that append's size. A native segment is passed as it is and does not count.
  */
 @SuppressWarnings("restricted") // calls restricted java.lang.foreign methods; needs native access
 public final class Writer implements AutoCloseable {
@@ -237,6 +241,11 @@ public final class Writer implements AutoCloseable {
         }
     }
 
+    /**
+     * The scratch buffer, grown first if {@code length} does not fit: to the larger of {@code length} and twice the
+     * capacity, the doubled figure capped at {@code Integer.MAX_VALUE - 8}; above the cap, to exactly {@code length},
+     * with no {@code ByteBuffer} view (the {@code ByteBuffer} append then replaces it).
+     */
     private MemorySegment scratch(long length) {
         if (length > scratch.byteSize()) {
             long size = Math.max(length, Math.min(scratch.byteSize() * 2, Integer.MAX_VALUE - 8));

@@ -17,6 +17,7 @@ import java.nio.file.Files;
 import java.nio.file.InvalidPathException;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
@@ -109,12 +110,141 @@ class PathsTest {
         assertEquals(42, firstPayload(p));
     }
 
-    @Test
-    void aRelativePathBecomesAbsoluteAgainstTheWorkingDirectory() {
-        byte[] cwd = Paths.nativeBytes(Path.of(System.getProperty("user.dir")));
+    /**
+     * The bytes of {@code rel}'s absolute path after those of the working directory and the separator: the relative
+     * path's own bytes. Asserts that the absolute bytes start with the working directory's.
+     */
+    private static byte[] tailOfAbsolute(Path rel) {
+        byte[] cwd = Paths.nativeBytes(Path.of("").toAbsolutePath());
+        byte[] absolute = Paths.nativeBytes(rel.toAbsolutePath());
         assertEquals('/', cwd[0]);
-        assertArrayEquals(concat(cwd, utf8("/rel/journal")), Paths.nativeBytes(Path.of("rel/journal")));
-        assertArrayEquals(cwd, Paths.nativeBytes(Path.of("")));
+        assertArrayEquals(cwd, Arrays.copyOf(absolute, cwd.length), "the absolute bytes start with the working directory's");
+        int from = cwd.length == 1 ? 1 : cwd.length + 1;
+        return Arrays.copyOfRange(absolute, from, absolute.length);
+    }
+
+    /** {@code tmp} relative to the working directory, if both are ASCII (the relative path then holds {@code ..}). */
+    private Path tmpRelative() {
+        Path cwd = Path.of("").toAbsolutePath();
+        assumeTrue(StandardCharsets.US_ASCII.newEncoder().canEncode(cwd + tmp.toString()), "ASCII directories");
+        Path rel = cwd.relativize(tmp);
+        assertFalse(rel.isAbsolute(), rel.toString());
+        return rel;
+    }
+
+    @Test
+    void aRelativePathIsPassedRelative() {
+        assertArrayEquals(utf8("rel/journal"), Paths.nativeBytes(Path.of("rel/journal")));
+        assertArrayEquals(utf8("../rel/journal"), Paths.nativeBytes(Path.of("../rel/journal")));
+        assertArrayEquals(utf8("rel/../journal"), Paths.nativeBytes(Path.of("rel/../journal")));
+        assertArrayEquals(utf8("./journal"), Paths.nativeBytes(Path.of("./journal")));
+        for (String text : List.of("rel/journal", "../rel/journal", "rel/../journal", "./journal")) {
+            assertArrayEquals(tailOfAbsolute(Path.of(text)), Paths.nativeBytes(Path.of(text)), text);
+        }
+    }
+
+    /** The empty path is the working directory, an existing directory whose URI ends in a slash. */
+    @Test
+    void theEmptyPathIsPassedAsADot() {
+        assertTrue(Path.of("").toUri().getRawPath().endsWith("/"), Path.of("").toUri().toString());
+        assertArrayEquals(utf8("."), Paths.nativeBytes(Path.of("")));
+        assertArrayEquals(utf8("."), Paths.nativeBytes(Path.of(".")));
+    }
+
+    /** As {@link #anAccentedNameIsPassedAsTheJdkStoresIt}, relative: form C, or form D under macOS's property. */
+    @Test
+    void aRelativeAccentedNameIsPassedByItsOwnBytes() {
+        String name = "journal-café-中";
+        Path rel;
+        try {
+            rel = Path.of("rel", name);
+        } catch (InvalidPathException e) {
+            assumeTrue(false, "the file-system encoding cannot represent " + name + ": " + e.getMessage());
+            return;
+        }
+        byte[] bytes = Paths.nativeBytes(rel);
+        assertArrayEquals(tailOfAbsolute(rel), bytes);
+        if (MAC || "UTF-8".equals(System.getProperty("sun.jnu.encoding"))) {
+            assertArrayEquals(concat(utf8("rel/"), utf8(FORM_D ? "journal-cafe\u0301-\u4e2d" : name)), bytes);
+        }
+    }
+
+    @Test
+    void aRelativeNameContainingTheReplacementCharacterIsPassed() {
+        Path rel = Path.of("rel", "j�");
+        byte[] expected = {'r', 'e', 'l', '/', 'j', (byte) 0xEF, (byte) 0xBF, (byte) 0xBD};
+        assertArrayEquals(expected, Paths.nativeBytes(rel));
+        assertArrayEquals(tailOfAbsolute(rel), Paths.nativeBytes(rel));
+    }
+
+    @Test
+    void aJournalOpensThroughARelativePath() throws Exception {
+        Path rel = tmpRelative().resolve("journal-rel");
+        assertArrayEquals(utf8(rel.toString()), Paths.nativeBytes(rel));
+        journal(rel, 42);
+        assertEquals(List.of(HexFormat.of().formatHex(utf8("journal-rel"))), namesOnDisk());
+        assertEquals(42, firstPayload(tmp.resolve("journal-rel")));
+        assertEquals(42, firstPayload(rel));
+        assertEquals(1, Journal.verify(rel).records());
+    }
+
+    /**
+     * A forked JVM whose working directory is four bytes short of the platform's path-length limit opens
+     * {@code Path.of("journal")}, whose absolute path is over it, as the JDK does; the absolute path fails in the library
+     * with a name-too-long error. A fork, so that this JVM's working directory does not change.
+     */
+    @Test
+    void aShortRelativePathOpensFromAWorkingDirectoryNearThePathLengthLimit() throws Exception {
+        String os = System.getProperty("os.name");
+        assumeTrue(MAC || os.equals("Linux"), "a known path-length limit: " + os);
+        int limit = MAC ? 1024 : 4096; // PATH_MAX, including the NUL
+        int target = limit - 4;
+        Path deep = tmp.toRealPath(); // getcwd() in the child returns the real path
+        while (deep.toString().length() < target) {
+            int rest = target - deep.toString().length(); // a "/" and a name
+            int name = rest - 1 <= 200 ? rest - 1 : Math.min(200, rest - 3);
+            deep = deep.resolve("d".repeat(name));
+        }
+        assertEquals(target, deep.toString().length());
+        Files.createDirectories(deep);
+        Path program = tmp.resolve("Deep.java");
+        Files.writeString(program, """
+                import io.github.thomas0903.tickertape.*;
+                import java.nio.file.*;
+                public class Deep {
+                    public static void main(String[] args) throws Exception {
+                        Path rel = Path.of("journal");
+                        System.out.println("cwd " + Path.of("").toAbsolutePath().toString().length());
+                        try (Writer w = Writer.open(rel, WriterOptions.defaults().segmentSize(65_536).prefault(false))) {
+                            w.append(1, 0, 0, new byte[] {42});
+                        }
+                        try (Reader r = Reader.open(rel)) {
+                            System.out.println("payload " + r.tryNext().getByte(0));
+                        }
+                        System.out.println("records " + Journal.verify(rel).records());
+                        try {
+                            Reader.open(rel.toAbsolutePath()).close();
+                            System.out.println("absolute opened");
+                        } catch (TickertapeException e) {
+                            System.out.println("absolute " + e.getClass().getSimpleName());
+                        }
+                        // Through relative paths: the absolute ones are too long for the parent's clean-up.
+                        try (var files = Files.list(rel)) {
+                            for (Path f : files.toList()) {
+                                Files.delete(f);
+                            }
+                        }
+                        Files.delete(rel);
+                        System.out.println("deleted");
+                    }
+                }
+                """);
+        TestSupport.Result r = TestSupport.run(List.of(TestSupport.javaLauncher(), "--enable-native-access=ALL-UNNAMED",
+                "--illegal-native-access=deny", "-Dtickertape.library.path=" + TestSupport.LIBRARY.toAbsolutePath(),
+                "--class-path", TestSupport.CLASSES.toAbsolutePath().toString(), program.toString()), deep, 120);
+        assertEquals(0, r.exit(), "stdout:\n" + r.stdout() + "\nstderr:\n" + r.stderr());
+        assertEquals(List.of("cwd " + target, "payload 42", "records 1", "absolute JournalIoException", "deleted"),
+                TestSupport.lines(r.stdout()), r.stderr());
     }
 
     /** {@code toUri()} appends a slash to an existing directory; the bytes passed do not depend on it. */
@@ -254,6 +384,14 @@ class PathsTest {
         journal(bad, 42);
         assertEquals(42, firstPayload(bad));
         assertEquals(7, firstPayload(twin));
+
+        // Relative, the name keeps its own bytes, the tail of the absolute ones, and reaches the same journal.
+        Path relBad = tmpRelative().resolve(bad.getFileName());
+        byte[] relBytes = concat(utf8(tmpRelative().toString()), new byte[] {'/', 'j', (byte) 0xFF});
+        assertArrayEquals(relBytes, Paths.nativeBytes(relBad));
+        assertArrayEquals(tailOfAbsolute(relBad), Paths.nativeBytes(relBad));
+        assertEquals(42, firstPayload(relBad));
+        assertEquals(1, Journal.verify(relBad).records());
         try (Reader r = Reader.openMappedUnsafe(bad)) {
             assertEquals(42, r.tryNext().getByte(0));
         }

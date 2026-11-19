@@ -16,32 +16,57 @@ import java.util.Arrays;
  * URI rather than reconstructed from its text. For a path of the default file system on Unix and macOS,
  * {@link Path#toUri()} returns a URI whose raw path is the <b>absolute</b> path's bytes, percent-encoded byte by byte
  * (unreserved ASCII is left as it is; a {@code /} is appended when the path is an existing directory and does not
- * already end in one). The binding decodes {@code %XX} to that byte and every other character to its ASCII byte,
- * strips trailing slashes except for the root, and passes the result. So a name that is not valid in the file-system
- * encoding, a name in either Unicode normalization form, and a path that carries a trailing slash all reach the library
- * as the JDK holds them.
+ * already end in one). The binding decodes {@code %XX} to that byte and every other character to its ASCII byte. So a
+ * name that is not valid in the file-system encoding, a name in either Unicode normalization form, and a path that
+ * carries a trailing slash all reach the library as the JDK holds them.
+ *
+ * <p>An absolute path is passed as those bytes. A relative path is passed relative: the JDK forms its absolute path by
+ * joining the bytes of its default directory, a {@code /} and the relative path's own bytes, so the binding decodes the
+ * default directory's URI ({@code Path.of("").toUri()}) the same way and strips that prefix and the separator after it.
+ * An empty remainder is passed as {@code .}. If the prefix does not match, the absolute bytes are passed rather than a
+ * guess. Either way, trailing slashes are stripped except for the root.
  *
  * <p>The exact URI form is the default provider's behaviour, not part of the {@code Path.toUri} specification;
  * {@code PathsTest} pins it, and anything other than the expected form (a raw path that does not start with {@code /},
  * a character above U+007F, a malformed escape, an encoded NUL) is refused with {@link IllegalArgumentException} naming
  * the path rather than guessed at.
  *
- * <p>What callers see is documented once, on {@link Tickertape} &rarr; Paths: the library receives the absolute path (a
- * relative path is resolved against the JVM's working directory, as the JDK resolves it), {@code toUri()} may
- * {@code stat} the path once per conversion, and only the default file system is supported.
+ * <p>What callers see is documented once, on {@link Tickertape} &rarr; Paths.
  */
 final class Paths {
     private Paths() {}
 
+    /** The path the default directory has; a relative path is relative to it. */
+    private static final Path EMPTY = Path.of("");
+
     /**
-     * The bytes the operating system knows {@code p} by, made absolute, without trailing slashes (except for the root)
-     * and without the terminating NUL; throws {@link IllegalArgumentException} for a path that is not on the default
-     * file system or whose URI is not in the expected form (see the class documentation).
+     * The bytes the operating system knows {@code p} by: absolute for an absolute path, relative (or {@code .}) for a
+     * relative one, without trailing slashes (except for the root) and without the terminating NUL; throws
+     * {@link IllegalArgumentException} for a path that is not on the default file system or whose URI is not in the
+     * expected form (see the class documentation).
      */
     static byte[] nativeBytes(Path p) {
         if (p.getFileSystem() != FileSystems.getDefault()) {
             throw new IllegalArgumentException("not a path on the default file system: " + p);
         }
+        byte[] absolute = stripTrailingSlashes(uriBytes(p));
+        if (p.isAbsolute()) {
+            return absolute;
+        }
+        byte[] base = stripTrailingSlashes(uriBytes(EMPTY));
+        int from;
+        if (base.length == 1) { // the root: the JDK joins without a second separator
+            from = 1;
+        } else if (startsWith(absolute, base) && (absolute.length == base.length || absolute[base.length] == '/')) {
+            from = Math.min(base.length + 1, absolute.length);
+        } else {
+            return absolute;
+        }
+        return from == absolute.length ? new byte[] {'.'} : Arrays.copyOfRange(absolute, from, absolute.length);
+    }
+
+    /** The decoded raw path of {@code p.toUri()}: the absolute path's bytes, perhaps with a trailing slash. */
+    private static byte[] uriBytes(Path p) {
         String raw = p.toUri().getRawPath();
         if (raw == null || !raw.startsWith("/")) {
             throw unexpected(p, raw, "it is not an absolute path");
@@ -68,12 +93,19 @@ final class Paths {
             }
             out.write(b);
         }
-        byte[] bytes = out.toByteArray();
+        return out.toByteArray();
+    }
+
+    private static byte[] stripTrailingSlashes(byte[] bytes) {
         int length = bytes.length;
         while (length > 1 && bytes[length - 1] == '/') {
             length--;
         }
         return length == bytes.length ? bytes : Arrays.copyOf(bytes, length);
+    }
+
+    private static boolean startsWith(byte[] bytes, byte[] prefix) {
+        return bytes.length >= prefix.length && Arrays.equals(bytes, 0, prefix.length, prefix, 0, prefix.length);
     }
 
     private static IllegalArgumentException unexpected(Path p, String raw, String why) {

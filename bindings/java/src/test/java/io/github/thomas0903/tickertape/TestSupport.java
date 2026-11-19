@@ -115,7 +115,12 @@ final class TestSupport {
     record Result(int exit, String stdout, String stderr) {}
 
     static Result run(List<String> command, long timeoutSeconds) throws IOException, InterruptedException {
-        Process p = new ProcessBuilder(command).start();
+        return run(command, null, timeoutSeconds);
+    }
+
+    /** As {@link #run(List, long)}, in working directory {@code directory} (null: this process's). */
+    static Result run(List<String> command, Path directory, long timeoutSeconds) throws IOException, InterruptedException {
+        Process p = new ProcessBuilder(command).directory(directory == null ? null : directory.toFile()).start();
         var out = new java.io.ByteArrayOutputStream();
         var err = new java.io.ByteArrayOutputStream();
         Thread t1 = Thread.ofPlatform().start(() -> copy(p.getInputStream(), out));
