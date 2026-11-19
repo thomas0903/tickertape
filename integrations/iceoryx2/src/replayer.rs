@@ -172,10 +172,10 @@ pub struct ReplayReport {
     pub messages: u64,
     /// Data records skipped by the service filter.
     pub filtered: u64,
-    /// Data records skipped because the descriptor they name is no longer in the journal (retention or archiving
-    /// removed its segment).
+    /// Data and loss records skipped because the descriptor they name is no longer in the journal (retention or
+    /// archiving removed its segment).
     pub undescribed: u64,
-    /// Other records passed over (descriptors, loss records, fillers, other schemas).
+    /// Other records passed over (descriptors, loss records with their descriptor, fillers, other schemas).
     pub other_records: u64,
     /// Per target service.
     pub services: Vec<ReplayServiceReport>,
@@ -552,6 +552,10 @@ impl Replayer {
                 report.end = stopped();
                 break;
             }
+            // Don't read past the end captured at the start: nothing after it is replayed.
+            if end.is_some_and(|end| reader.position() >= end) {
+                break;
+            }
             let Some(record) = reader.try_next()? else {
                 break;
             };
@@ -575,10 +579,13 @@ impl Replayer {
                     Decoded::Data(data) => data,
                     Decoded::Loss(loss) => {
                         // Checked against its descriptor like everywhere else, though nothing is sent for it.
-                        if let Some(d) = catalog.resolve(seq, loss.descriptor_seq)? {
-                            loss.check(&d).map_err(layout_error)?;
+                        match catalog.resolve(seq, loss.descriptor_seq)? {
+                            Some(d) => {
+                                loss.check(&d).map_err(layout_error)?;
+                                report.other_records += 1;
+                            }
+                            None => report.undescribed += 1,
                         }
-                        report.other_records += 1;
                         continue;
                     }
                     Decoded::Filler(_) | Decoded::Other => {

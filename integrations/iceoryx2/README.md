@@ -120,9 +120,9 @@ the Unix epoch); `venue_ts_ns` is what an optional extractor read from the user 
 
 ### Growth rule
 
-- **Layout version** (in every record) changes only for incompatible changes. A reader rejects a version it doesn't
-  know.
-- **Flags** (`u16`, in every record): bits 0 to 7 are *required*, and a reader rejects a record with a required bit it
+- **Layout version** (in every descriptor, data and loss record; a filler has neither field) changes only for
+  incompatible changes. A reader rejects a version it doesn't know.
+- **Flags** (`u16`, in every descriptor, data and loss record): bits 0 to 7 are *required*, and a reader rejects a record with a required bit it
   doesn't know; bits 8 to 15 are *optional*, and a reader ignores those it doesn't know. Version 1 defines one bit:
   descriptor bit 0, `imported`.
 - **Reserved fields** are written as 0 and ignored by readers. A later revision may use one only for a meaning that
@@ -171,8 +171,10 @@ How the recorder does it, before each record that names a descriptor (and before
    first of those descriptors starts the new segment, the recorder first appends a **filler** that takes exactly the
    space left, when that descriptor would still fit there. When it wouldn't (less space left than the descriptor
    takes, including less than the 40 bytes any record needs), the descriptor starts the new segment by itself and no
-   filler is written. A filler is therefore never smaller than a descriptor, and never smaller than the smallest
-   record.
+   filler is written. Fillers therefore take at least as much space as a descriptor. A filler holds at most
+   tickertape's largest record payload, so in a segment larger than 4 GiB the space left can take several fillers in
+   a row (each but the last of the largest size whose frame is a multiple of 8, the last taking the rest); otherwise
+   it is one filler, never smaller than the smallest record.
 
 **Space left** is the segment size minus 8, minus the bytes in use: 64 for the header plus `align8(40 + payload
 length)` per record. The recorder reads the newest segment when it opens the journal and then adds every record it
@@ -184,7 +186,8 @@ exactly the space left stays in its segment; the next record, of any size, start
 ### Filler (`0x4932_0004`)
 
 A record whose payload is all zero bytes, of any length from 0 to tickertape's largest payload. It carries no data and
-names no descriptor; it is the last record of its segment. Readers skip it without looking at its payload. Version-1
+names no descriptor. Fillers are the last records of their segment (usually one; several in a row only in segments
+larger than 4 GiB). Readers skip them without looking at their payload. Version-1
 readers written before fillers existed see an unknown reserved schema id and ignore it as well, so fillers didn't need
 a new layout version. `info` reports fillers apart from data (`filler_records`, `filler_bytes`); the recorder's report
 counts those it wrote (`fillers`).

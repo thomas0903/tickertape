@@ -235,12 +235,28 @@ fn readers_skip_records_whose_descriptor_was_removed() {
     let service = unique("retained");
     let dir = tempfile::tempdir().unwrap();
     let journal = j(&dir);
-    // One descriptor, then enough data for several 64 KiB segments.
-    let first = run_of(&RawDescriptor::new(&service, u64_type()), 0, 3000);
+    // One descriptor, then enough data for several 64 KiB segments, ending with loss records (they name the same
+    // descriptor, so they are undescribed too once it is gone).
+    let mut first = run_of(&RawDescriptor::new(&service, u64_type()), 0, 3000);
+    const LOSSES: u64 = 3;
+    for i in 0..LOSSES {
+        let loss = tickertape_iceoryx2::layout::LossRecord {
+            kind: tickertape_iceoryx2::layout::LossKind::Gap,
+            width: 8,
+            descriptor_seq: 0,
+            publisher_id: 1,
+            expected: 10 * i,
+            received: 10 * i + 2,
+        };
+        first.push((
+            tickertape_iceoryx2::layout::SCHEMA_LOSS,
+            loss.encode().unwrap().to_vec(),
+        ));
+    }
     append_records(&journal, 65_536, &first);
     let mut second = RawDescriptor::new(&service, u64_type());
-    second.run_start_seq = 3001;
-    append_records(&journal, 65_536, &run_of(&second, 3001, 5));
+    second.run_start_seq = 3001 + LOSSES;
+    append_records(&journal, 65_536, &run_of(&second, 3001 + LOSSES, 5));
     let plan = tickertape::retention::plan(
         &journal,
         &tickertape::retention::Policy::default().max_segments(2),
@@ -256,14 +272,19 @@ fn readers_skip_records_whose_descriptor_was_removed() {
     ))
     .unwrap();
     let undescribed = info["undescribed_records"].as_u64().unwrap();
-    assert!(undescribed > 0, "{info}");
+    assert!(undescribed > LOSSES, "{info}");
     assert_eq!(info["services"][0]["messages"], 5, "{info}");
     assert_eq!(info["runs"].as_array().unwrap().len(), 1);
 
     let prefix = format!("{}/", unique("retained-target"));
     let report = replay_json(&journal, &["--prefix", &prefix]);
     assert_eq!(report["messages"], 5);
-    assert_eq!(report["undescribed"], undescribed);
+    // Loss records whose descriptor is gone are counted as undescribed by every reader, not as other records.
+    assert_eq!(report["undescribed"], undescribed, "{report}");
+    assert_eq!(
+        report["other_records"], 1,
+        "only the second descriptor: {report}"
+    );
 
     let out = dir.path().join("x.iox2");
     let export: serde_json::Value = serde_json::from_str(&run_ok(

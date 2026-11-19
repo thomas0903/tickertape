@@ -201,7 +201,7 @@ impl Journal {
             return Ok(());
         };
         let first = len_of(&self.slots, group[0]).expect("open");
-        if let Some(len) = self.mirror.filler_len(first) {
+        for len in self.mirror.filler_lens(first) {
             self.writer.append_with(
                 &NewRecord {
                     schema_id: SCHEMA_FILLER,

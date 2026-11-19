@@ -38,21 +38,18 @@ pub(crate) fn read(dir: &Path) -> Result<Tail, Error> {
         used: format::SEGMENT_HEADER_LEN as u64,
     };
     while let Some(record) = reader.try_next()? {
-        // A writer may roll while this reader runs (a live recorder); count only the newest segment we started in.
-        if record.seq != tail.end_seq {
-            break;
-        }
         let len = format::frame_len(record.payload.len()).ok_or_else(|| {
             Error::Usage(format!(
                 "record {} is larger than a tickertape frame",
                 record.seq
             ))
         })?;
-        let next = tail.used + format::align8(u64::from(len));
-        if next > tail.segment_size {
+        // A writer may roll while this reader runs (a live recorder): a record that doesn't fit in the newest
+        // segment (the writer's own rule, trailer included) is in the next one; count only the segment we started in.
+        if !format::record_fits(tail.segment_size, tail.used, len) {
             break;
         }
-        tail.used = next;
+        tail.used += format::align8(u64::from(len));
         tail.end_seq += 1;
     }
     Ok(tail)
@@ -150,17 +147,16 @@ impl SegmentMirror {
         (self.size - format::SEGMENT_TRAILER_LEN as u64).saturating_sub(self.used)
     }
 
-    /// If a record with a payload of `first` bytes would still go into the active segment: the payload length of a
-    /// record that takes exactly the space left, after which no record fits. `None` otherwise (`first` would start a
-    /// new segment by itself).
-    pub(crate) fn filler_len(&self, first: usize) -> Option<usize> {
+    /// If a record with a payload of `first` bytes would still go into the active segment: the payload lengths of
+    /// filler records that, appended in order, take exactly the space left, after which no record fits. Usually one;
+    /// in a segment larger than 4 GiB the space left can be more than one record holds, and then each filler but the
+    /// last has the largest payload whose frame is a multiple of 8. Empty if `first` would start a new segment by
+    /// itself.
+    pub(crate) fn filler_lens(&self, first: usize) -> Vec<usize> {
         if !self.fits(&[first]) {
-            return None;
+            return Vec::new();
         }
-        // `left` is a multiple of 8 (record sizes and the segment layout are) and at least the size of the record
-        // `first`, so at least a record header.
-        let len = self.left() - format::RECORD_HEADER_LEN as u64;
-        usize::try_from(len).ok()
+        filler_lens(self.left())
     }
 
     /// Records that a record with a payload of `payload_len` bytes was appended. Returns true if it started a new
@@ -179,10 +175,90 @@ impl SegmentMirror {
     }
 }
 
+/// The payload lengths of fillers that take exactly `left` bytes, a multiple of 8 and at least a record header: as
+/// few as possible, each at most the largest frame that is a multiple of 8, and none smaller than a record header.
+fn filler_lens(left: u64) -> Vec<usize> {
+    let header = format::RECORD_HEADER_LEN as u64;
+    // The largest frame a filler may have, rounded down to 8 so that the space after it stays a multiple of 8.
+    let max_frame = u64::from(format::MAX_FRAME_LEN) & !7;
+    let mut out = Vec::new();
+    let mut rest = left;
+    while rest >= header {
+        let frame = if rest <= max_frame {
+            rest
+        } else if rest - max_frame >= header {
+            max_frame
+        } else {
+            // Leave room for the last filler's header.
+            rest - header
+        };
+        match usize::try_from(frame - header) {
+            Ok(len) => out.push(len),
+            // Can't happen (a filler payload is below 4 GiB); stop rather than write a wrong amount.
+            Err(_) => return Vec::new(),
+        }
+        rest -= frame;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tickertape::{NewRecord, Writer, WriterConfig};
+
+    /// Fillers for any space left, up to segments far above 4 GiB: their frames add up to exactly that space, each
+    /// fits in a tickertape frame and in a 32-bit `usize`, and each is at least a record header.
+    #[test]
+    fn fillers_cover_any_space_left() {
+        let header = format::RECORD_HEADER_LEN as u64;
+        let max_payload = u64::from(format::MAX_FRAME_LEN) - header;
+        for left in [
+            header,
+            48,
+            65_536 - 72,
+            u64::from(format::MAX_FRAME_LEN) & !7,
+            (u64::from(format::MAX_FRAME_LEN) & !7) + 8,
+            (u64::from(format::MAX_FRAME_LEN) & !7) + header,
+            (u64::from(format::MAX_FRAME_LEN) & !7) + header + 8,
+            5 << 30,
+            (8 << 30) - 72,
+            format::MAX_SEGMENT_SIZE - 72,
+        ] {
+            let lens = filler_lens(left);
+            assert!(!lens.is_empty(), "{left}");
+            let mut total = 0u64;
+            for &len in &lens {
+                let len = len as u64;
+                assert!(
+                    len <= max_payload && len <= u64::from(u32::MAX),
+                    "{left}: {len}"
+                );
+                let frame = format::frame_len(len as usize).expect("fits a frame");
+                assert_eq!(format::align8(u64::from(frame)), u64::from(frame), "{left}");
+                total += u64::from(frame);
+            }
+            assert_eq!(total, left, "{left}: {lens:?}");
+            let expect = left.div_ceil(u64::from(format::MAX_FRAME_LEN) & !7);
+            assert!(lens.len() as u64 <= expect + 1, "{left}: {}", lens.len());
+        }
+        // Space left in a segment of 6 GiB, from a mirror.
+        let mirror = SegmentMirror {
+            size: 6 << 30,
+            used: format::SEGMENT_HEADER_LEN as u64,
+            new_segment_size: 6 << 30,
+        };
+        let lens = mirror.filler_lens(300);
+        assert_eq!(lens.len(), 2, "{lens:?}");
+        assert!(
+            SegmentMirror {
+                used: (6 << 30) - 64,
+                ..mirror
+            }
+            .filler_lens(300)
+            .is_empty()
+        );
+    }
 
     /// The mirror predicts every roll of a real writer: after each append, a fresh read of the newest segment agrees
     /// with it.
@@ -235,7 +311,7 @@ mod tests {
         assert_eq!(reopened.used, mirror.used);
     }
 
-    /// The space the mirror says is left is exactly what the real writer has left: a record of `filler_len` bytes
+    /// The space the mirror says is left is exactly what the real writer has left: a record of `filler_lens` bytes
     /// stays in the active segment, and after it even an empty record starts a new one. Checked at every offset a
     /// 64 KiB segment can reach in 8-byte steps near its end, and for `first` records that do and don't fit.
     #[test]
@@ -262,7 +338,7 @@ mod tests {
         for left in (0..=1_200u64).step_by(8) {
             // Room for this round: if little is left, fill it and roll to a new segment.
             if mirror.left() < 4_096 {
-                if let Some(rest) = mirror.filler_len(0) {
+                for rest in mirror.filler_lens(0) {
                     append(&mut writer, rest);
                     assert!(!mirror.appended(rest));
                 }
@@ -277,8 +353,8 @@ mod tests {
             assert!(!mirror.appended(pad));
             assert_eq!(mirror.left(), left);
             let start = segments(dir.path());
-            let filled = match mirror.filler_len(200) {
-                Some(len) => {
+            let filled = match mirror.filler_lens(200)[..] {
+                [len] => {
                     assert!(left >= format::align8(240), "{left}");
                     append(&mut writer, len);
                     assert!(!mirror.appended(len));
@@ -291,11 +367,12 @@ mod tests {
                     fillers += 1;
                     true
                 }
-                None => {
+                [] => {
                     assert!(left < format::align8(240), "{left}");
                     too_little += 1;
                     false
                 }
+                ref more => panic!("one filler fits a 64 KiB segment: {more:?}"),
             };
             append(&mut writer, 0);
             let rolled = mirror.appended(0);
