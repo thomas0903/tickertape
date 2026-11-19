@@ -171,6 +171,7 @@ journal; the durability and restart guarantees below apply to retained history.
   to run a program, but for its whole life for one that never execs (a pre-fork worker; Python `multiprocessing` with
   the fork start method), and the same holds for a grandchild. A new writer sees `Error::Locked` meanwhile (C3). A
   forked child must neither use nor drop an inherited writer. If it drops one, the explicit unlock is skipped and the
-  lock stays with the parent, but the writer's other clean-up still runs in the child: stopping the helper threads,
-  which do not exist there, can stall it, and clearing the wake-up region (and on macOS removing a prepared spare
-  segment) disturbs the parent's readers and writer.
+  lock stays with the parent, and the child closes its copy of the lock descriptor first and neither joins the
+  spare-segment thread nor removes a prepared spare. The rest of the writer's clean-up still runs in the child:
+  stopping the prefault helper, whose thread does not exist there, can stall it, and clearing the wake-up region
+  disturbs the parent's readers.

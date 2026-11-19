@@ -545,21 +545,23 @@ impl Writer {
 
 impl Drop for Writer {
     fn drop(&mut self) {
-        // Don't leave a spare behind for the next writer's recovery to clean up.
-        if let Some(Ok(Ok(spare))) = self.spare.take().map(|h| h.join()) {
-            drop(spare);
-            let _ = fs::remove_file(self.dir.join(journal::SPARE_FILE));
-        }
         // The order of what follows:
-        // - In the process that took the lock: stop the helper and tell waiting readers that this writer has gone
-        //   here, while the lock is still held, so that a new writer never overlaps them. Then the fields drop in
-        //   declaration order: first the lock guard, which unlocks explicitly and closes its descriptor, then the
-        //   others, which only unmap and close.
+        // - In the process that took the lock: join the spare-segment thread and remove a prepared spare (so the
+        //   next writer's recovery has nothing to clean up), stop the helper and tell waiting readers that this
+        //   writer has gone, all here, while the lock is still held, so that a new writer never overlaps them. Then
+        //   the fields drop in declaration order: first the lock guard, which unlocks explicitly and closes its
+        //   descriptor, then the others, which only unmap and close.
         // - In any other process (a forked child that dropped its copy, which it must not do): nothing is torn down
-        //   here. The lock guard drops first, without unlocking (the lock still protects the parent's writer), and
-        //   closes the child's copy of the descriptor before the later fields `notify` and `prefault` drop, since
-        //   joining the helper there can block forever and must not keep the journal locked once the parent has gone.
+        //   here. The spare belongs to the parent's writer and its thread does not exist in the child, so it is
+        //   neither joined nor removed. The lock guard drops first, without unlocking (the lock still protects the
+        //   parent's writer), and closes the child's copy of the descriptor before the later fields `notify` and
+        //   `prefault` drop, since joining the helper there can block forever and must not keep the journal locked
+        //   once the parent has gone.
         if self.lock.owned_here() {
+            if let Some(Ok(Ok(spare))) = self.spare.take().map(|h| h.join()) {
+                drop(spare);
+                let _ = fs::remove_file(self.dir.join(journal::SPARE_FILE));
+            }
             drop(self.prefault.take());
             drop(self.notify.take());
         }
