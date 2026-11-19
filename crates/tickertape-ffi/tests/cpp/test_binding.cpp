@@ -4,6 +4,7 @@
 //   test_binding <scratch-dir>                         the binding's behaviour
 //   test_binding <scratch-dir> throw-from-fill         lets an exception escape a raw C fill callback: must abort
 //   test_binding <scratch-dir> stale-view              reads a view after the next call: must abort (debug checks)
+//   test_binding <scratch-dir> stale-empty-span        as_span of a stale view of an empty record: must abort (C++20)
 //   test_binding write-fixture <dir>                   writes the cross-language fixture journal
 //   test_binding read-fixture <dir> <count> <durable>  reads a fixture journal written by another implementation
 //
@@ -211,6 +212,30 @@ static void timeouts() {
     static_assert(tt::Timeout(std::chrono::milliseconds(-5)).c_value() == 0, "a passed deadline does not wait");
     static_assert(tt::Timeout(std::chrono::milliseconds(3)).c_value() == 3000000, "milliseconds");
     static_assert(tt::Timeout(std::chrono::hours::max()).c_value() == INT64_MAX, "saturates");
+    // Integral counts are exact up to INT64_MAX nanoseconds; only longer durations saturate.
+    using std::chrono::nanoseconds;
+    using std::chrono::seconds;
+    static_assert(tt::Timeout(nanoseconds(1)).c_value() == 1, "1 ns");
+    static_assert(tt::Timeout(nanoseconds(9'200'000'000'000'000'000)).c_value() == 9'200'000'000'000'000'000,
+                  "a representable count is not saturated early");
+    static_assert(tt::Timeout(nanoseconds(INT64_MAX - 1)).c_value() == INT64_MAX - 1, "just below the cap");
+    static_assert(tt::Timeout(nanoseconds::max()).c_value() == INT64_MAX, "the cap itself");
+    static_assert(tt::Timeout(seconds(9'223'372'036)).c_value() == 9'223'372'036'000'000'000, "seconds below the cap");
+    static_assert(tt::Timeout(seconds(9'223'372'037)).c_value() == INT64_MAX, "seconds above the cap");
+    static_assert(tt::Timeout(std::chrono::duration<std::uint64_t, std::nano>(UINT64_MAX)).c_value() == INT64_MAX,
+                  "an unsigned count above the cap");
+    static_assert(tt::Timeout(std::chrono::duration<std::int64_t, std::pico>(1)).c_value() == 1,
+                  "a sub-nanosecond count rounds up");
+    static_assert(tt::Timeout(std::chrono::duration<std::int64_t, std::pico>(2001)).c_value() == 3, "rounds up");
+    static_assert(tt::Timeout(std::chrono::duration<std::int64_t, std::ratio<1, 3>>(1)).c_value() == 333333334,
+                  "a third of a second rounds up");
+    // Floating point: compared with 2^63 (the first value an int64 cannot hold) before the cast.
+    static_assert(tt::Timeout(std::chrono::duration<double, std::nano>(0.25)).c_value() == 1, "sub-nanosecond");
+    static_assert(tt::Timeout(std::chrono::duration<double, std::nano>(0x1p63 - 1024)).c_value() ==
+                      9'223'372'036'854'774'784,
+                  "the largest double below 2^63");
+    static_assert(tt::Timeout(std::chrono::duration<double, std::nano>(0x1p63)).c_value() == INT64_MAX, "2^63");
+    static_assert(tt::Timeout(std::chrono::duration<double>(1e300)).c_value() == INT64_MAX, "huge");
     CHECK(tt::Timeout(std::chrono::duration<double, std::nano>(1.5)).c_value() == 2);  // rounded up
     CHECK(tt::Timeout(std::chrono::duration<double>(std::nan(""))).c_value() == 0);
     CHECK(tt::Timeout(std::chrono::duration<double>(-1.0)).c_value() == 0);
@@ -260,15 +285,17 @@ static void surface(const std::string &root) {
     std::vector<std::string> texts;
     for (int i = 0; i < 10; i++) texts.push_back("batch " + std::to_string(i));
     std::vector<tt::NewRecord> batch;
-    for (const std::string &t : texts) batch.emplace_back(5, 100, 200, t);
+    for (const std::string &t : texts) batch.push_back(tt::new_record(5, 100, 200, t));
+    CHECK(batch[3].schema_id == 5 && batch[3].venue_ts_ns == 100 && batch[3].local_ts_ns == 200);
+    CHECK(batch[3].payload == reinterpret_cast<const std::uint8_t *>(texts[3].data()) && batch[3].payload_len == 7);
     {
         tt::BatchAppend appended = writer.append_batch(batch);
         MUST(appended.outcome);
         CHECK(appended.first_seq == 8 && appended.appended == 10);
     }
     {
-        const std::array<tt::NewRecord, 2> bad{tt::NewRecord(5, 0, 0, std::string_view("fine")),
-                                               tt::NewRecord(5, 0, 0, nullptr, 3)};
+        const std::array<tt::NewRecord, 2> bad{tt::new_record(5, 0, 0, std::string_view("fine")),
+                                               tt::new_record(5, 0, 0, nullptr, 3)};
         tt::BatchAppend appended = writer.append_batch(bad);
         CHECK_FAILS(appended.outcome, tt::Status::invalid_argument);
         CHECK(appended.appended == 0);
@@ -286,10 +313,13 @@ static void surface(const std::string &root) {
         CHECK(checkpoint.has_value() && checkpoint->next_seq == 18 && checkpoint->generation >= 1);
     }
 
-    // The safe reader, opened through every path type.
+    // The safe reader, opened through every path type, including temporaries, which live until the call returns.
     tt::Reader reader = MUST(tt::Reader::open(fs::path(dir)));
     MUST(tt::Reader::open(std::string_view(dir)).value().close());
     MUST(tt::Reader::open(dir.c_str()).value().close());
+    MUST(tt::Reader::open(fs::path(root) / "journal").value().close());
+    MUST(tt::Reader::open(root + "/journal").value().close());
+    CHECK(MUST(tt::list_segments(fs::path(root) / "journal")).size() == 1);
     const char *expected[] = {"view", "string", "vec", "ab", "pointer", "", "zero-copy", ""};
     for (std::uint64_t s = 0; s < 8; s++) {
         std::optional<tt::RecordView> r = MUST(reader.next());
@@ -324,6 +354,14 @@ static void surface(const std::string &root) {
         CHECK(!small && small.error().needed_size() == 7);
         std::optional<tt::RecordView> copied = MUST(reader.next_copy(buffer.data(), buffer.size()));
         CHECK(copied && copied->seq() == 10 && copied->data() == buffer.data() && text(*copied) == "batch 2");
+        // Untyped memory and writable byte ranges.
+        char chars[16];
+        copied = MUST(reader.next_copy(chars, sizeof chars));
+        CHECK(copied && copied->seq() == 11 && copied->data() == reinterpret_cast<std::uint8_t *>(chars));
+        std::array<std::byte, 16> bytes_out{};
+        copied = MUST(reader.next_copy(bytes_out));
+        CHECK(copied && copied->seq() == 12 && copied->data() == reinterpret_cast<std::uint8_t *>(bytes_out.data()) &&
+              text(*copied) == "batch 4");
     }
     // Seek back, and the end of the journal with each kind of timeout.
     MUST(reader.seek(17));
@@ -404,6 +442,25 @@ static void retention(const std::string &root) {
     CHECK(tt::detail::duration_ns(std::chrono::duration<double, std::nano>(0.25)) == 1);
     CHECK(tt::detail::duration_ns(std::chrono::duration<double, std::nano>(2.5)) == 3);
     CHECK(tt::detail::duration_ns(std::chrono::seconds(2)) == 2000000000u);
+    // Exact up to UINT64_MAX nanoseconds, then saturated; floating point compared with 2^64 before the cast.
+    static_assert(tt::detail::duration_ns(std::chrono::nanoseconds(1)) == 1, "1 ns");
+    static_assert(tt::detail::duration_ns(std::chrono::nanoseconds::max()) == INT64_MAX, "int64 counts are exact");
+    static_assert(tt::detail::duration_ns(std::chrono::duration<std::uint64_t, std::nano>(UINT64_MAX - 1)) ==
+                      UINT64_MAX - 1,
+                  "just below the cap");
+    static_assert(tt::detail::duration_ns(std::chrono::duration<std::uint64_t, std::micro>(18'446'744'073'709'551)) ==
+                      18'446'744'073'709'551'000u,
+                  "microseconds below the cap");
+    static_assert(tt::detail::duration_ns(std::chrono::duration<std::uint64_t, std::micro>(18'446'744'073'709'552)) ==
+                      UINT64_MAX,
+                  "microseconds above the cap");
+    static_assert(tt::detail::duration_ns(std::chrono::duration<double, std::nano>(0x1p64 - 2048)) ==
+                      18'446'744'073'709'549'568u,
+                  "the largest double below 2^64");
+    static_assert(tt::detail::duration_ns(std::chrono::duration<double, std::nano>(1.8e19)) ==
+                      18'000'000'000'000'000'000u,
+                  "not saturated early");
+    static_assert(tt::detail::duration_ns(std::chrono::duration<double, std::nano>(0x1p64)) == UINT64_MAX, "2^64");
     {
         tt::Retention zero;
         zero.max_age(std::chrono::seconds(0));
@@ -527,6 +584,10 @@ static void errors(const std::string &root) {
     CHECK(error.status() == tt::Status::storage_full && error.os_code() == 28);
     CHECK(error.name() == "TICKERTAPE_E_STORAGE_FULL");
     CHECK(error.to_string() == "TICKERTAPE_E_STORAGE_FULL: disk full");
+    // The message of a temporary error is returned by value: binding it to a reference keeps it alive.
+    const auto failing = [] { return tt::result<void>(tt::Error(tt::Status::busy, "a message too long for SSO")); };
+    const std::string &message = failing().error().message();
+    CHECK(message == "a message too long for SSO");
 }
 
 // What a fill callback may do to its own writer.
@@ -620,7 +681,7 @@ static void fill_callbacks(const std::string &root) {
         CHECK(lock_is_free());
     }
 
-#if TICKERTAPE_HPP_EXCEPTIONS
+#if defined(__cpp_exceptions)
     // A throwing fill: nothing is committed and the exception reaches the caller unchanged.
     {
         tt::Writer writer = MUST(tt::Writer::open(dir, small_segments()));
@@ -717,7 +778,7 @@ static void move_semantics(const std::string &root) {
     MUST(tt::plan_retention(dir, retention));
 }
 
-#if TICKERTAPE_HPP_EXCEPTIONS
+#if defined(__cpp_exceptions)
 static void exceptions(const std::string &root) {
     try {
         (void)tt::Reader::open(root + "/does-not-exist").value();
@@ -725,6 +786,15 @@ static void exceptions(const std::string &root) {
     } catch (const tt::Exception &e) {
         CHECK(e.status() == tt::Status::io && e.error().os_code() == ENOENT);
         CHECK(std::string(e.what()).find("TICKERTAPE_E_IO: ") == 0);
+    }
+    // Copies of an Exception share its Error (copying never throws).
+    try {
+        (void)tt::result<int>(tt::Error(tt::Status::locked, "held")).value();
+        CHECK(false);
+    } catch (const tt::Exception &e) {
+        const tt::Exception copy(e);
+        CHECK(&copy.error() == &e.error() && copy.status() == tt::Status::locked);
+        CHECK(std::string(copy.what()) == "TICKERTAPE_E_LOCKED: held");
     }
     try {
         tt::check_library().value();
@@ -767,7 +837,7 @@ static int write_fixture(const std::string &dir) {
             const std::uint64_t seq = block + 5 + i;
             payloads[i].resize(pattern_len(seq));
             pattern_fill(seq, payloads[i].data(), payloads[i].size());
-            batch[i] = tt::NewRecord(pattern_schema(seq), 1000000 + seq, 2000000 + 3 * seq, payloads[i]);
+            batch[i] = tt::new_record(pattern_schema(seq), 1000000 + seq, 2000000 + 3 * seq, payloads[i]);
         }
         tt::BatchAppend appended = writer.append_batch(batch);
         MUST(appended.outcome);
@@ -824,12 +894,12 @@ static int read_fixture(const std::string &dir, std::uint64_t count, std::uint64
 // ---- Death modes ----
 
 // A raw C fill callback that breaks the contract: the exception must not unwind through the library.
-#if TICKERTAPE_HPP_EXCEPTIONS
+#if defined(__cpp_exceptions)
 static std::int32_t throwing_fill(void *, std::uint8_t *, std::size_t) { throw std::runtime_error("escaped"); }
 #endif
 
 static int throw_from_fill(const std::string &dir) {
-#if TICKERTAPE_HPP_EXCEPTIONS
+#if defined(__cpp_exceptions)
     tt::Writer writer = MUST(tt::Writer::open(dir, small_segments()));
     try {
         (void)tickertape_writer_append_with(writer.native_handle(), 1, 0, 0, 8, &throwing_fill, nullptr, nullptr);
@@ -841,6 +911,26 @@ static int throw_from_fill(const std::string &dir) {
 #else
     (void)dir;
     std::printf("built without exceptions\n");
+#endif
+    return 0;
+}
+
+// C++20: as_span of a stale view whose record is empty must still be checked (it used to return before the check).
+static int stale_empty_span(const std::string &dir) {
+#if __cplusplus >= 202002L && defined(__cpp_lib_span)
+    tt::Writer writer = MUST(tt::Writer::open(dir, small_segments()));
+    MUST(writer.append(1, 0, 0, nullptr, 0));
+    MUST(writer.append(1, 0, 0, std::string_view("two")));
+    tt::Reader reader = MUST(tt::Reader::open(dir));
+    const tt::RecordView empty = *MUST(reader.next());
+    CHECK(empty.empty() && tt::as_span(empty).empty());
+    (void)MUST(reader.next());
+    std::printf("about to read a stale view\n");
+    std::fflush(stdout);
+    std::printf("not detected: %zu\n", tt::as_span(empty).size());  // must abort here
+#else
+    (void)dir;
+    std::printf("built without std::span\n");
 #endif
     return 0;
 }
@@ -870,8 +960,11 @@ int main(int argc, char **argv) {
     }
     if (argc == 3 && std::string(argv[2]) == "throw-from-fill") return throw_from_fill(std::string(argv[1]) + "/throw");
     if (argc == 3 && std::string(argv[2]) == "stale-view") return stale_view(std::string(argv[1]) + "/stale");
+    if (argc == 3 && std::string(argv[2]) == "stale-empty-span") {
+        return stale_empty_span(std::string(argv[1]) + "/stale-empty");
+    }
     if (argc != 2) {
-        std::fprintf(stderr, "usage: %s <scratch-dir> [throw-from-fill|stale-view] | write-fixture <dir> | "
+        std::fprintf(stderr, "usage: %s <scratch-dir> [throw-from-fill|stale-view|stale-empty-span] | write-fixture <dir> | "
                              "read-fixture <dir> <count> <durable_next>\n",
                      argv[0]);
         return 2;
@@ -885,7 +978,7 @@ int main(int argc, char **argv) {
     errors(root);
     fill_callbacks(root);
     move_semantics(root);
-#if TICKERTAPE_HPP_EXCEPTIONS
+#if defined(__cpp_exceptions)
     exceptions(root);
 #endif
     if (failures) {

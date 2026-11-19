@@ -9,6 +9,8 @@
 #include <filesystem>
 #include <string>
 #include <string_view>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 #if __cplusplus >= 202002L
@@ -17,6 +19,93 @@
 
 namespace tt = tickertape;
 using namespace std::chrono_literals;
+
+// The header's internal macros are gone after it (C8: they would leak into the includer's code).
+#if defined(TICKERTAPE_HPP_MODE_DEPENDENT) || defined(TICKERTAPE_HPP_DEBUG_CHECKS_TAG_) ||   \
+    defined(TICKERTAPE_HPP_EXCEPTIONS) || defined(TICKERTAPE_HPP_INLINE_NAMESPACE_) || \
+    defined(TICKERTAPE_HPP_EXCEPTIONS_TAG_)
+#error "tickertape.hpp leaks an internal macro"
+#endif
+#if !defined(TICKERTAPE_HPP_VERSION_NUMBER) || !defined(TICKERTAPE_HPP_ABI_VERSION) || !defined(TICKERTAPE_DEBUG_CHECKS)
+#error "tickertape.hpp must keep its public macros"
+#endif
+
+// ---- Compile-time properties of the API (ADR 0036) ----
+namespace properties {
+template <class T, class = void>
+struct has_const_rvalue_value : std::false_type {};
+template <class T>
+struct has_const_rvalue_value<T, std::void_t<decltype(std::declval<const T &&>().value())>> : std::true_type {};
+template <class T, class = void>
+struct has_const_rvalue_deref : std::false_type {};
+template <class T>
+struct has_const_rvalue_deref<T, std::void_t<decltype(*std::declval<const T &&>())>> : std::true_type {};
+template <class Bytes, class = void>
+struct makes_record : std::false_type {};
+template <class Bytes>
+struct makes_record<Bytes, std::void_t<decltype(tt::new_record(1, 2, 3, std::declval<Bytes>()))>> : std::true_type {};
+template <class Buffer, class = void>
+struct copies_into : std::false_type {};
+template <class Buffer>
+struct copies_into<Buffer, std::void_t<decltype(std::declval<tt::Reader &>().next_copy(std::declval<Buffer>()))>>
+    : std::true_type {};
+
+// A1: NewRecord is the C struct, so an array of them is an array of the C type.
+static_assert(std::is_same_v<tt::NewRecord, tickertape_new_record>, "NewRecord is tickertape_new_record");
+static_assert(std::is_same_v<decltype(tt::new_record(1, 2, 3, nullptr, 0)), tt::NewRecord>, "new_record()");
+static_assert(makes_record<std::string &>::value && makes_record<const std::vector<char> &>::value &&
+                  makes_record<std::string_view>::value && makes_record<std::array<std::byte, 2> &>::value,
+              "new_record takes lvalues of byte ranges and rvalue views");
+static_assert(!makes_record<std::string>::value && !makes_record<std::vector<std::uint8_t>>::value &&
+                  !makes_record<std::array<char, 4>>::value && !makes_record<const std::string>::value,
+              "new_record refuses rvalues that own their bytes");
+#if __cplusplus >= 202002L
+static_assert(makes_record<std::span<const char>>::value, "a span rvalue is a view");
+#endif
+
+// B1 (a): a payload type with a throwing move is refused (compile-fail test in tests/c_api.rs).
+static_assert(std::is_nothrow_move_constructible_v<tt::result<tt::Writer>> &&
+                  std::is_nothrow_move_constructible_v<tt::result<std::vector<tt::SegmentInfo>>>,
+              "results move without throwing");
+// B1 (b): result(const T&) only for copyable T.
+static_assert(!std::is_constructible_v<tt::result<tt::Writer>, const tt::Writer &>, "a Writer cannot be copied");
+static_assert(!std::is_constructible_v<tt::result<tt::Writer>, tt::Writer &>, "not from an lvalue either");
+static_assert(std::is_constructible_v<tt::result<tt::Writer>, tt::Writer &&>, "moved in");
+static_assert(std::is_constructible_v<tt::result<std::uint64_t>, const std::uint64_t &>, "copied in");
+// B1 (c): the converting constructors do not throw.
+static_assert(std::is_nothrow_constructible_v<tt::result<tt::Writer>, tt::Writer &&> &&
+                  std::is_nothrow_constructible_v<tt::result<tt::Writer>, tt::Error &&> &&
+                  std::is_nothrow_constructible_v<tt::result<std::uint64_t>, std::uint64_t &&> &&
+                  std::is_nothrow_constructible_v<tt::result<std::uint64_t>, const std::uint64_t &> &&
+                  std::is_nothrow_constructible_v<tt::result<void>, tt::Error &&>,
+              "noexcept converting constructors");
+// B1 (d): a const rvalue result hands out copies, never references, and nothing for a type it cannot copy.
+static_assert(std::is_same_v<decltype(std::declval<const tt::result<std::uint64_t> &&>().value()), std::uint64_t> &&
+                  std::is_same_v<decltype(*std::declval<const tt::result<std::uint64_t> &&>()), std::uint64_t> &&
+                  std::is_same_v<decltype(std::declval<const tt::result<std::uint64_t> &&>().error()), tt::Error> &&
+                  std::is_same_v<decltype(std::declval<const tt::result<void> &&>().error()), tt::Error>,
+              "const rvalue accessors return by value");
+static_assert(!has_const_rvalue_value<tt::result<tt::Writer>>::value &&
+                  !has_const_rvalue_deref<tt::result<tt::Writer>>::value,
+              "a const rvalue result<Writer> cannot hand out its Writer");
+static_assert(has_const_rvalue_value<tt::result<std::uint64_t>>::value, "detector works");
+// B1 (e): Error::message() on a temporary returns a string, not a reference into it.
+static_assert(std::is_same_v<decltype(std::declval<tt::Error &&>().message()), std::string> &&
+                  std::is_same_v<decltype(std::declval<const tt::Error &&>().message()), std::string> &&
+                  std::is_same_v<decltype(std::declval<const tt::Error &>().message()), const std::string &>,
+              "message() lends a reference only from an lvalue");
+// B2: copying an Exception never throws (as for every standard exception).
+static_assert(std::is_nothrow_copy_constructible_v<tt::Exception> && std::is_nothrow_copy_assignable_v<tt::Exception>,
+              "Exception copies without throwing");
+// B3: next_copy takes untyped memory and writable byte ranges.
+static_assert(copies_into<std::array<char, 8> &>::value && copies_into<std::vector<std::byte> &>::value &&
+                  copies_into<std::string &>::value,
+              "next_copy into a writable byte range");
+static_assert(!copies_into<const std::array<char, 8> &>::value && !copies_into<std::string_view &>::value,
+              "not into read-only memory");
+// B4: tickertape::PathArg no longer exists, so a variable of it cannot be declared (compile-fail test in
+// tests/c_api.rs); temporaries as path arguments are used in use_everything() below.
+}  // namespace properties
 
 std::uint64_t use_everything(const std::filesystem::path &dir);
 
@@ -30,6 +119,9 @@ std::uint64_t use_everything(const std::filesystem::path &dir) {
     retention.max_segments(3).max_bytes(1 << 30).max_age(24h).max_age(std::chrono::duration<double>(1.5));
     retention.delete_segments().move_to(dir / "archive").move_to("archive").move_to(std::string("a"));
     retention.move_to(std::string_view("b"));
+    // B4: temporaries as path arguments live until the call returns.
+    sum += tt::verify(std::filesystem::path(dir) / "journal").has_value() ? 1u : 0u;
+    sum += tt::list_segments(dir.string() + "/journal").has_value() ? 1u : 0u;
     tt::WriterOptions writer_options;
     writer_options.segment_size(1 << 20).recovery_policy(tt::RecoveryPolicy::fail).notify(true).prefault(false);
     writer_options.retention(retention).no_retention();
@@ -65,13 +157,14 @@ std::uint64_t use_everything(const std::filesystem::path &dir) {
     };
     const Functor functor;
     sum += writer.append_with(1, 2, 3, 0, functor).value_or(0);
-    std::vector<tt::NewRecord> records{tt::NewRecord(1, 2, 3, s), tt::NewRecord(1, 2, 3, v.data(), v.size())};
-    const std::array<tt::NewRecord, 1> fixed{tt::NewRecord()};
+    std::vector<tt::NewRecord> records{tt::new_record(1, 2, 3, s), tt::new_record(1, 2, 3, v.data(), v.size())};
+    records.push_back(tt::new_record(1, 2, 3, std::string_view("view")));
+    const std::array<tt::NewRecord, 1> fixed{tt::NewRecord{}};
     tt::BatchAppend batch = writer.append_batch(records);
     sum += batch.first_seq + batch.appended + (batch.outcome ? 1u : 0u);
     sum += writer.append_batch(fixed).appended + writer.append_batch(records.data(), records.size()).appended;
-    sum += records[0].schema_id() + records[0].venue_ts_ns() + records[0].local_ts_ns() + records[0].size();
-    sum += records[0].data() != nullptr ? 1u : 0u;
+    sum += records[0].schema_id + records[0].venue_ts_ns + records[0].local_ts_ns + records[0].payload_len;
+    sum += records[0].payload != nullptr ? 1u : 0u;
     writer.checkpoint().value();
     sum += writer.next_seq().value() + (writer.last_retention_error() ? 1u : 0u);
     sum += writer.native_handle() != nullptr ? 1u : 0u;
@@ -95,6 +188,9 @@ std::uint64_t use_everything(const std::filesystem::path &dir) {
     sum += reader.next(tt::wait_forever).value().has_value() ? 1u : 0u;
     std::array<std::uint8_t, 16> buffer{};
     if (auto r = reader.next_copy(buffer.data(), buffer.size(), 1ms); r && *r) sum += (*r)->size();
+    char chars[16];
+    if (auto r = reader.next_copy(chars, sizeof chars); r && *r) sum += (*r)->size();
+    if (auto r = reader.next_copy(buffer, 1ms); r && *r) sum += (*r)->size();
     tt::RecordBatch records_in(8, 1024);
     sum += reader.read_batch(records_in, 1ms).value_or(0) + records_in.size() + records_in.capacity();
     sum += records_in.buffer_size() + (records_in.empty() ? 1u : 0u);
@@ -130,5 +226,9 @@ std::uint64_t use_everything(const std::filesystem::path &dir) {
     sum += static_cast<std::uint64_t>(-static_cast<std::int32_t>(error.status()));
     const tt::Exception exception(error);
     sum += exception.error().message().size() + static_cast<std::uint64_t>(exception.status() == tt::Status::busy);
+    const tt::Exception copy(exception);
+    sum += copy.error().message().size() + std::move(failed).error().message().size();
+    const tt::result<std::uint64_t> const_value = std::uint64_t{7};
+    sum += std::move(const_value).value() + *std::move(const_value);
     return sum;
 }

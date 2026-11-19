@@ -1,13 +1,16 @@
 // The driver of the mixed-mode link test (see mixed_modes.hpp), built with exceptions. It does not include
 // tickertape.hpp, so every copy of the header's inline functions comes from the units. One behaviour per run:
 //
-//   exceptions pair (TT_MIXED_PAIR_EXCEPTIONS): exc-value, noexc-value, exc-fill <dir>, noexc-fill <dir>
+//   exceptions pair (TT_MIXED_PAIR_EXCEPTIONS): exc-value, noexc-value, exc-fill <dir>, noexc-fill <dir>,
+//                                               exc-alloc <dir>
 //   debug-check pair (TT_MIXED_PAIR_DEBUG_CHECKS): dbg-index, nodbg-index
 //
 // It prints what happened; a run that should abort aborts inside the unit.
 #include "mixed_modes.hpp"
 
 #include <cstdio>
+#include <cstdlib>
+#include <new>
 #include <stdexcept>
 #include <string>
 
@@ -15,6 +18,34 @@ void SharedFill::operator()(std::uint8_t *buf, std::size_t len) const {
     if (throw_now) throw std::runtime_error("the fill threw");
     if (len > 0) buf[0] = 1;
 }
+
+static int fail_at = 0;      // the allocation (counted from tt_fail_nth_allocation) that throws; 0: none
+static int allocations = 0;  // since tt_fail_nth_allocation
+static bool replaced = false;
+
+bool tt_fail_nth_allocation(int n) {
+    fail_at = n;
+    allocations = 0;
+    replaced = false;
+    ::operator delete(::operator new(1));  // never elided: tells whether this replacement is the one in use
+    allocations = 0;
+    return replaced;
+}
+
+void *operator new(std::size_t size) {
+    replaced = true;
+    if (fail_at > 0 && ++allocations == fail_at) {
+        fail_at = 0;
+        throw std::bad_alloc();
+    }
+    if (void *p = std::malloc(size ? size : 1)) return p;
+    throw std::bad_alloc();
+}
+// Not inlined: GCC's -Wmismatched-new-delete would otherwise see free() applied to the result of operator new once
+// the replacement operator delete is inlined into a caller.
+__attribute__((noinline)) static void release(void *p) noexcept { std::free(p); }
+void operator delete(void *p) noexcept { release(p); }
+void operator delete(void *p, std::size_t) noexcept { release(p); }
 
 int main(int argc, char **argv) {
     const std::string what = argc > 1 ? argv[1] : "";
@@ -36,6 +67,12 @@ int main(int argc, char **argv) {
     if (what == "noexc-fill") {
         const int r = noexc_nodbg_fill(dir, false);
         std::printf("%s\n", r == 1 ? "committed" : "failed");
+        return 0;
+    }
+    if (what == "exc-alloc") {
+        // The no-exceptions unit's copy of list_segments is in the program too (it is called here once).
+        if (noexc_nodbg_list_segments(dir) < 1) return 3;
+        std::printf("caught %d\n", exc_nodbg_list_segments(dir));
         return 0;
     }
 #elif defined(TT_MIXED_PAIR_DEBUG_CHECKS)

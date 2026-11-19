@@ -2,10 +2,11 @@
 // tests/c_api.rs in the compile-only matrix (every compiler, C++17/20/23, with and without exceptions and NDEBUG).
 //
 // ADR 0036 -> Versioning: within a major version no data member is added to (or removed from) any existing class,
-// because two components built against different header versions would then disagree about one type. Each
-// `Mirror` below lists a class's data members in order; if a static_assert fails, a class's layout changed. That
-// is allowed only in a new major version, together with a new inline namespace (v2). Do not "fix" a failure by
-// editing the mirror within a major version. A test in tests/c_api.rs fails if a public class is missing here.
+// so that rebuilding against a newer minor release never changes the size or alignment of your own types that
+// contain the binding's (the program itself must still use one release of the header throughout). Each `Mirror`
+// below lists a class's data members in order; if a static_assert fails, a class's layout changed. That is allowed
+// only in a new major version, together with a new inline namespace (v2). Do not "fix" a failure by editing the
+// mirror within a major version. A test in tests/c_api.rs fails if a public class is missing here.
 #include "tickertape.hpp"
 
 #include <cstddef>
@@ -25,10 +26,22 @@ namespace tt = tickertape;
                   #Type " changed its size or alignment: no data member may be added within a major version " \
                         "(ADR 0036 -> Versioning)")
 
-// The layout version is the inline namespace: tickertape::X is tickertape::v1::X.
+// The inline namespace carries the major version and the exception mode (ADR 0036 -> Mixing modes):
+// tickertape::X is tickertape::v1::X with exceptions and tickertape::v1_noexcept::X without.
+#if defined(__cpp_exceptions)
 static_assert(std::is_same_v<tt::Writer, tt::v1::Writer> && std::is_same_v<tt::Error, tt::v1::Error> &&
-                  std::is_same_v<tt::result<void>, tt::v1::result<void>>,
-              "the public types must live in the inline namespace tickertape::v1");
+                  std::is_same_v<tt::result<void>, tt::v1::result<void>> &&
+                  std::is_same_v<decltype(tt::no_wait), decltype(tt::v1::no_wait)>,
+              "with exceptions, the binding lives in the inline namespace tickertape::v1");
+#else
+static_assert(std::is_same_v<tt::Writer, tt::v1_noexcept::Writer> &&
+                  std::is_same_v<tt::Error, tt::v1_noexcept::Error> &&
+                  std::is_same_v<tt::result<void>, tt::v1_noexcept::result<void>> &&
+                  std::is_same_v<decltype(tt::no_wait), decltype(tt::v1_noexcept::no_wait)>,
+              "without exceptions, the binding lives in the inline namespace tickertape::v1_noexcept");
+#endif
+// NewRecord is the C struct itself (an alias), shared by both modes like any plain data.
+static_assert(std::is_same_v<tt::NewRecord, tickertape_new_record>, "NewRecord is tickertape_new_record");
 
 namespace mirror {
 struct Error {
@@ -39,7 +52,7 @@ struct Error {
     std::string message;
 };
 struct Exception : std::runtime_error {
-    tt::Error error;
+    std::shared_ptr<const tt::Error> error;
 };
 template <class T>
 struct Result {
@@ -47,11 +60,6 @@ struct Result {
 };
 struct ResultVoid {
     std::optional<tt::Error> error;
-};
-struct PathArg {
-    std::string owned;
-    const char *ptr;
-    bool has_nul;
 };
 struct Timeout {
     std::int64_t ns;
@@ -143,7 +151,6 @@ TT_PIN(tt::result<tt::VerifyReport>, mirror::Result<tt::VerifyReport>);
 TT_PIN(tt::result<std::vector<tt::SegmentInfo>>, mirror::Result<std::vector<tt::SegmentInfo>>);
 TT_PIN(tt::result<std::optional<tt::Checkpoint>>, mirror::Result<std::optional<tt::Checkpoint>>);
 TT_PIN(tt::result<tt::RetentionReport>, mirror::Result<tt::RetentionReport>);
-TT_PIN(tt::PathArg, mirror::PathArg);
 TT_PIN(tt::Timeout, mirror::Timeout);
 TT_PIN(tt::Timeout::Forever, mirror::Empty);
 TT_PIN(tt::Retention, mirror::Options);

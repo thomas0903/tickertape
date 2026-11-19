@@ -10,8 +10,11 @@
 //   std::bad_alloc, it throws only from `.value()` and from `Writer::append_with`, which rethrows what your fill
 //   function threw.
 // - `Writer`, `Reader`, `WriterOptions`, `ReaderOptions`, `Retention` and `RecordBatch` are move-only owners of one
-//   C handle each. A moved-from or default-constructed object is empty: destroying or assigning to it is safe, and
-//   calls on it fail with `Status::invalid_argument`.
+//   C handle (or buffer) each. A default-constructed `Writer` or `Reader` is empty; the option builders start with
+//   the defaults; `RecordBatch` has no default constructor. A moved-from object is empty: destroying or assigning to
+//   it is safe, and calls on it fail with `Status::invalid_argument`.
+// - Every translation unit of a program that includes this header must use the same release of it (ADR 0036 ->
+//   Versioning).
 // - `Reader::next` returns a `RecordView` that borrows the reader's memory: its payload is valid until the next call
 //   on the same reader (other than `position`), or until the reader is moved or destroyed. Debug builds check this.
 // - Visible is not durable: a record is visible to readers when an append returns, and durable only after a later
@@ -29,7 +32,6 @@
 #include "tickertape.h"
 
 #include <chrono>
-#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -40,6 +42,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <ratio>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -50,6 +53,9 @@
 
 #if __cplusplus >= 202002L && __has_include(<span>)
 #include <span>
+#endif
+#if __cplusplus >= 202002L && __has_include(<ranges>)
+#include <ranges>
 #endif
 
 // ---- Version ----
@@ -95,34 +101,41 @@
 #define TICKERTAPE_HPP_EXCEPTIONS 0
 #endif
 
-// Mixing modes (ADR 0036 -> Mixing modes). Every class has the same layout in every exception mode and debug-check
-// mode. The inline functions whose behaviour depends on either mode are declared TICKERTAPE_HPP_MODE_DEPENDENT,
-// which gives them a different symbol in each mode (GCC's and Clang's abi_tag), so the linker never substitutes
-// one translation unit's copy for another's built in a different mode. A test fails if a function that mentions
-// a mode macro, or calls such a function, lacks it. Other compilers (MSVC) get no tag: there, use one mode per
-// program.
+// Mixing modes (ADR 0036 -> Mixing modes).
+//
+// - Exception mode: everything below lives in the inline namespace tickertape::v1 when exceptions are enabled and
+//   tickertape::v1_noexcept when they are not. Every function, type and inline variable therefore has a symbol of
+//   its own in each mode, and no definition is shared between units built in different modes, including the
+//   exception handling a compiler generates inside any function. Code still writes tickertape::Writer. A binding
+//   type cannot be passed between units built in different exception modes: that is a link error, on purpose
+//   (pass C handles or plain data across such a boundary).
+// - Debug-check mode: the types are shared, so that debug and release units can exchange them. The inline functions
+//   whose behaviour depends on the mode are declared TICKERTAPE_HPP_MODE_DEPENDENT, which gives them a different
+//   symbol in each mode (GCC's and Clang's abi_tag). A test fails if a function that mentions a debug-check macro,
+//   or calls such a function, lacks it. Other compilers (MSVC) get no tag: there, use one mode per program.
 #if defined(__GNUC__) && !defined(_MSC_VER)
-#if TICKERTAPE_HPP_EXCEPTIONS
-#define TICKERTAPE_HPP_EXCEPTIONS_TAG_ "tickertape_exc"
-#else
-#define TICKERTAPE_HPP_EXCEPTIONS_TAG_ "tickertape_noexc"
-#endif
 #if TICKERTAPE_DEBUG_CHECKS
 #define TICKERTAPE_HPP_DEBUG_CHECKS_TAG_ "tickertape_dbg"
 #else
 #define TICKERTAPE_HPP_DEBUG_CHECKS_TAG_ "tickertape_nodbg"
 #endif
 #define TICKERTAPE_HPP_MODE_DEPENDENT \
-    __attribute__((abi_tag(TICKERTAPE_HPP_EXCEPTIONS_TAG_, TICKERTAPE_HPP_DEBUG_CHECKS_TAG_)))
+    __attribute__((abi_tag(TICKERTAPE_HPP_DEBUG_CHECKS_TAG_)))
 #else
 #define TICKERTAPE_HPP_MODE_DEPENDENT
 #endif
 
+#if TICKERTAPE_HPP_EXCEPTIONS
+#define TICKERTAPE_HPP_INLINE_NAMESPACE_ v1
+#else
+#define TICKERTAPE_HPP_INLINE_NAMESPACE_ v1_noexcept
+#endif
+
 namespace tickertape {
-// The types live in an inline namespace named after their layout version (ADR 0036 -> Versioning): within a major
-// version no class gains a data member, and a later layout gets a new namespace, so both can be in one program.
-// Do not forward-declare the header's classes; include it.
-inline namespace v1 {
+// The inline namespace carries the exception mode (above) and the major version. Do not forward-declare the
+// header's classes or name the inline namespace; include the header and write tickertape::X.
+inline namespace TICKERTAPE_HPP_INLINE_NAMESPACE_ {
+#undef TICKERTAPE_HPP_INLINE_NAMESPACE_
 
 // ---- Status codes ----
 
@@ -215,7 +228,11 @@ public:
     // For Status::buffer_too_small from Reader::next_copy and Reader::read_batch: the bytes the record needs.
     // Otherwise 0.
     std::size_t needed_size() const noexcept { return needed_size_; }
-    const std::string &message() const noexcept { return message_; }
+    // The library's message. On a temporary Error it returns the string by value, so that
+    // `const auto &m = writer.checkpoint().error().message();` never refers into a destroyed Error.
+    const std::string &message() const & noexcept { return message_; }
+    std::string message() && noexcept { return std::move(message_); }
+    std::string message() const && { return message_; }
     std::string_view name() const noexcept { return status_name(status_); }
     // "TICKERTAPE_E_IO: <message>".
     std::string to_string() const {
@@ -235,15 +252,18 @@ private:
     std::string message_;
 };
 
-// What result<T>::value() throws for an error. what() is Error::to_string().
+// What result<T>::value() throws for an error. what() is Error::to_string(). Copying it never throws (as for every
+// standard exception): the Error is shared between copies, not copied.
 class Exception : public std::runtime_error {
 public:
-    explicit Exception(Error error) : std::runtime_error(error.to_string()), error_(std::move(error)) {}
-    const Error &error() const noexcept { return error_; }
-    Status status() const noexcept { return error_.status(); }
+    explicit Exception(Error error)
+        : std::runtime_error(error.to_string()),
+          error_(std::shared_ptr<const Error>(std::make_shared<Error>(std::move(error)))) {}
+    const Error &error() const noexcept { return *error_; }
+    Status status() const noexcept { return error_->status(); }
 
 private:
-    Error error_;
+    std::shared_ptr<const Error> error_;
 };
 
 namespace detail {
@@ -253,7 +273,7 @@ namespace detail {
     std::abort();
 }
 
-[[noreturn]] TICKERTAPE_HPP_MODE_DEPENDENT inline void fail(const Error &error) {
+[[noreturn]] inline void fail(const Error &error) {
 #if TICKERTAPE_HPP_EXCEPTIONS
     throw Exception(error);
 #else
@@ -275,34 +295,46 @@ TICKERTAPE_HPP_MODE_DEPENDENT inline void debug_check(bool ok, const char *what)
 
 // A value or an Error, like C++23's std::expected (the header does not use std::expected so that its types are the
 // same at every language level). Discarding one is a compiler warning ([[nodiscard]]). On an rvalue result, value(),
-// operator* and error() return by value (moving out), so `for (auto &s : list_segments(dir).value())` and
-// `auto &&w = Writer::open(dir).value()` never refer into a destroyed temporary.
+// operator* and error() return by value (moving out, or copying out of a const rvalue; deleted for a const rvalue
+// whose T cannot be copied), so `for (auto &s : list_segments(dir).value())` and `auto &&w =
+// Writer::open(dir).value()` never refer into a destroyed temporary. T must be nothrow move-constructible, so that a
+// result always holds a value or an error (never neither).
 template <class T>
 class [[nodiscard]] result {
 public:
     static_assert(!std::is_same_v<std::remove_cv_t<T>, Error>, "result<Error> is not allowed");
     static_assert(!std::is_reference_v<T>, "result<T&> is not allowed");
+    static_assert(std::is_nothrow_move_constructible_v<T>,
+                  "result<T> needs a nothrow move-constructible T (a throwing move could leave it holding nothing)");
 
-    result(const T &value) : v_(std::in_place_index<0>, value) {}
-    result(T &&value) : v_(std::in_place_index<0>, std::move(value)) {}
-    result(Error error) : v_(std::in_place_index<1>, std::move(error)) {}
+    template <class U = T, std::enable_if_t<std::is_copy_constructible_v<U>, int> = 0>
+    result(const T &value) noexcept(std::is_nothrow_copy_constructible_v<T>) : v_(std::in_place_index<0>, value) {}
+    result(T &&value) noexcept : v_(std::in_place_index<0>, std::move(value)) {}
+    result(Error error) noexcept : v_(std::in_place_index<1>, std::move(error)) {}
 
     bool has_value() const noexcept { return v_.index() == 0; }
     explicit operator bool() const noexcept { return has_value(); }
 
     // The value; for an error, throws Exception (or, without exceptions, prints the error and aborts).
-    TICKERTAPE_HPP_MODE_DEPENDENT T &value() & {
+    T &value() & {
         if (!has_value()) detail::fail(*std::get_if<1>(&v_));
         return *std::get_if<0>(&v_);
     }
-    TICKERTAPE_HPP_MODE_DEPENDENT const T &value() const & {
+    const T &value() const & {
         if (!has_value()) detail::fail(*std::get_if<1>(&v_));
         return *std::get_if<0>(&v_);
     }
-    TICKERTAPE_HPP_MODE_DEPENDENT T value() && {
+    T value() && {
         if (!has_value()) detail::fail(*std::get_if<1>(&v_));
         return std::move(*std::get_if<0>(&v_));
     }
+    template <class U = T, std::enable_if_t<std::is_copy_constructible_v<U>, int> = 0>
+    T value() const && {
+        if (!has_value()) detail::fail(*std::get_if<1>(&v_));
+        return *std::get_if<0>(&v_);
+    }
+    template <class U = T, std::enable_if_t<!std::is_copy_constructible_v<U>, int> = 0>
+    T value() const && = delete;
     template <class U>
     T value_or(U &&fallback) const & {
         return has_value() ? *std::get_if<0>(&v_) : static_cast<T>(std::forward<U>(fallback));
@@ -315,9 +347,13 @@ public:
     // Unchecked access (checked in debug builds).
     TICKERTAPE_HPP_MODE_DEPENDENT T &operator*() & noexcept { return *checked_value(); }
     TICKERTAPE_HPP_MODE_DEPENDENT const T &operator*() const & noexcept { return *checked_value(); }
-    TICKERTAPE_HPP_MODE_DEPENDENT T operator*() && noexcept(std::is_nothrow_move_constructible_v<T>) {
-        return std::move(*checked_value());
+    TICKERTAPE_HPP_MODE_DEPENDENT T operator*() && noexcept { return std::move(*checked_value()); }
+    template <class U = T, std::enable_if_t<std::is_copy_constructible_v<U>, int> = 0>
+    TICKERTAPE_HPP_MODE_DEPENDENT T operator*() const && noexcept(std::is_nothrow_copy_constructible_v<T>) {
+        return *checked_value();
     }
+    template <class U = T, std::enable_if_t<!std::is_copy_constructible_v<U>, int> = 0>
+    T operator*() const && = delete;
     TICKERTAPE_HPP_MODE_DEPENDENT T *operator->() noexcept { return checked_value(); }
     TICKERTAPE_HPP_MODE_DEPENDENT const T *operator->() const noexcept { return checked_value(); }
 
@@ -329,6 +365,10 @@ public:
     TICKERTAPE_HPP_MODE_DEPENDENT Error error() && noexcept {
         detail::debug_check(!has_value(), "result<T>::error() on a value");
         return std::move(*std::get_if<1>(&v_));
+    }
+    TICKERTAPE_HPP_MODE_DEPENDENT Error error() const && {
+        detail::debug_check(!has_value(), "result<T>::error() on a value");
+        return *std::get_if<1>(&v_);
     }
 
 private:
@@ -352,12 +392,12 @@ template <>
 class [[nodiscard]] result<void> {
 public:
     result() noexcept = default;
-    result(Error error) : error_(std::move(error)) {}
+    result(Error error) noexcept : error_(std::move(error)) {}
 
     bool has_value() const noexcept { return !error_.has_value(); }
     explicit operator bool() const noexcept { return has_value(); }
     // Throws Exception for an error (without exceptions: prints it and aborts).
-    TICKERTAPE_HPP_MODE_DEPENDENT void value() const {
+    void value() const {
         if (error_) detail::fail(*error_);
     }
     TICKERTAPE_HPP_MODE_DEPENDENT const Error &error() const & noexcept {
@@ -367,6 +407,10 @@ public:
     TICKERTAPE_HPP_MODE_DEPENDENT Error error() && noexcept {
         detail::debug_check(error_.has_value(), "result<void>::error() on a success");
         return std::move(*error_);
+    }
+    TICKERTAPE_HPP_MODE_DEPENDENT Error error() const && {
+        detail::debug_check(error_.has_value(), "result<void>::error() on a success");
+        return *error_;
     }
 
 private:
@@ -431,9 +475,16 @@ inline std::uint64_t realtime_ns() noexcept { return tickertape_realtime_ns(); }
 
 // ---- Arguments ----
 
-// A journal path: a `const char *` (NUL-terminated), `std::string`, `std::string_view` (copied, since the C ABI
-// needs a NUL terminator) or `std::filesystem::path`. Paths go to the operating system unchanged. A path with a NUL
-// byte inside fails with Status::invalid_argument. Only meant as a parameter type.
+namespace detail {
+// How the functions that take a journal path receive it: a `const char *` (NUL-terminated), `std::string`,
+// `std::string_view` (copied, since the C ABI needs a NUL terminator) or `std::filesystem::path`, passed directly as
+// the argument. Paths go to the operating system unchanged; a path with a NUL byte inside fails with
+// Status::invalid_argument.
+//
+// Not part of the API (ADR 0036 -> Paths): it can point into a temporary `std::string` or `std::filesystem::path`,
+// which is safe only because a temporary argument lives until the call returns. Declaring a variable of this type
+// (`PathArg p = std::filesystem::path(root) / "journal";`) would dangle, so it lives in `detail`, unnamed by user
+// code; pass the path itself.
 class PathArg {
 public:
     PathArg(const char *path) noexcept : ptr_(path) {}
@@ -459,11 +510,61 @@ private:
     bool has_nul_ = false;
 };
 
+// `d` in whole nanoseconds, rounded up, as an Int (std::int64_t or std::uint64_t): 0 for a zero, negative or NaN
+// duration (callers for which that is wrong reject those first), and the largest Int for a duration that does not
+// fit. Integral counts are converted exactly. Floating-point ones are compared, before the cast, with 2^63 or 2^64,
+// the first value Int cannot hold.
+template <class Int, class Rep, class Period>
+constexpr Int ceil_ns(std::chrono::duration<Rep, Period> d) noexcept {
+    static_assert(std::is_same_v<Int, std::int64_t> || std::is_same_v<Int, std::uint64_t>, "an int64 or uint64");
+    constexpr Int cap = std::numeric_limits<Int>::max();
+    if (!(d > std::chrono::duration<Rep, Period>::zero())) return 0;  // also NaN
+    using Ratio = std::ratio_divide<Period, std::nano>;               // nanoseconds per tick: num / den, reduced
+    if constexpr (std::is_integral_v<Rep>) {
+        static_assert(sizeof(Rep) <= sizeof(std::uintmax_t), "duration counts wider than std::uintmax_t");
+        using U = std::uintmax_t;
+        constexpr U num = static_cast<U>(Ratio::num);
+        constexpr U den = static_cast<U>(Ratio::den);
+        constexpr U ucap = static_cast<U>(cap);
+        const U count = static_cast<U>(d.count());  // positive
+        const U whole = count / den;
+        const U rest = count % den;
+        if (whole > ucap / num) return cap;
+        const U ns = whole * num;
+        U extra = 0;  // rest * num / den, rounded up; at most num
+        if (rest != 0) {
+            if constexpr (num <= std::numeric_limits<U>::max() / den) {
+                extra = rest * num / den + (rest * num % den != 0 ? 1 : 0);
+            } else {  // a ratio too wide for exact arithmetic
+                const long double x = static_cast<long double>(rest) * static_cast<long double>(num) /
+                                      static_cast<long double>(den);
+                extra = static_cast<U>(x);
+                if (static_cast<long double>(extra) < x) extra++;
+            }
+        }
+        if (ns > ucap - extra) return cap;
+        return static_cast<Int>(ns + extra);
+    } else {
+        constexpr long double limit = std::is_signed_v<Int> ? 0x1p63L : 0x1p64L;
+        const long double ticks = static_cast<long double>(d.count());
+        // Far beyond the limit (with a factor 2 of margin for rounding): saturate before the product can overflow.
+        if (!(ticks < 2 * limit * static_cast<long double>(Ratio::den) / static_cast<long double>(Ratio::num))) {
+            return cap;
+        }
+        const long double ns = ticks * static_cast<long double>(Ratio::num) / static_cast<long double>(Ratio::den);
+        if (!(ns < limit)) return cap;
+        const Int whole = static_cast<Int>(ns);
+        return static_cast<long double>(whole) < ns && whole != cap ? whole + 1 : whole;
+    }
+}
+}  // namespace detail
+
 // A timeout for the read functions. Default-constructed (or `no_wait`) does not wait; a positive duration waits up
-// to that long (rounded up to whole nanoseconds, capped at about 292 years); `wait_forever` waits until a record
-// arrives and cannot be interrupted. A zero or negative duration (a deadline that has passed) does not wait: unlike
-// the C ABI, where a negative timeout waits forever. A timeout bounds only the wait for a record: catching up after
-// a seek and file I/O can take longer.
+// to that long (rounded up to whole nanoseconds; integral counts are converted exactly; a duration longer than
+// INT64_MAX nanoseconds, about 292 years, waits INT64_MAX nanoseconds); `wait_forever` waits until a record arrives
+// and cannot be interrupted. A zero or negative duration (a deadline that has passed) does not wait: unlike the C
+// ABI, where a negative timeout waits forever. A timeout bounds only the wait for a record: catching up after a seek
+// and file I/O can take longer.
 class Timeout {
 public:
     struct Forever {};
@@ -471,20 +572,14 @@ public:
     constexpr Timeout() noexcept = default;
     constexpr Timeout(Forever) noexcept : ns_(TICKERTAPE_WAIT_FOREVER) {}
     template <class Rep, class Period>
-    constexpr Timeout(std::chrono::duration<Rep, Period> timeout) noexcept : ns_(to_ns(timeout)) {}
+    constexpr Timeout(std::chrono::duration<Rep, Period> timeout) noexcept
+        : ns_(detail::ceil_ns<std::int64_t>(timeout)) {}
 
     // The value passed to the C ABI: 0, a positive number of nanoseconds, or -1 for forever.
     constexpr std::int64_t c_value() const noexcept { return ns_; }
     constexpr bool is_forever() const noexcept { return ns_ < 0; }
 
 private:
-    template <class Rep, class Period>
-    static constexpr std::int64_t to_ns(std::chrono::duration<Rep, Period> timeout) noexcept {
-        if (!(timeout > std::chrono::duration<Rep, Period>::zero())) return 0;  // also NaN
-        const std::chrono::duration<long double, std::nano> ns(timeout);
-        if (ns.count() >= 9.2e18L) return std::numeric_limits<std::int64_t>::max();
-        return static_cast<std::int64_t>(std::chrono::ceil<std::chrono::nanoseconds>(ns).count());
-    }
     std::int64_t ns_ = TICKERTAPE_NO_WAIT;
 };
 
@@ -522,7 +617,21 @@ struct byte_range<R, std::void_t<decltype(std::data(std::declval<const R &>())),
 template <class R>
 inline constexpr bool is_byte_range_v = byte_range<std::remove_cv_t<std::remove_reference_t<R>>>::value;
 
-// The range types NewRecord accepts as rvalues: views, whose bytes outlive them (ADR 0036 -> Records).
+// Contiguous ranges of writable bytes or chars, for Reader::next_copy: the above with a non-const data(), plus C
+// arrays (a buffer, not a payload, so a NUL terminator is not an issue).
+template <class R, class = void>
+struct writable_byte_range : std::false_type {};
+template <class R>
+struct writable_byte_range<R, std::void_t<decltype(std::data(std::declval<R &>())),
+                                          decltype(std::size(std::declval<R &>()))>>
+    : std::bool_constant<std::is_pointer_v<decltype(std::data(std::declval<R &>()))> &&
+                         !std::is_const_v<std::remove_pointer_t<decltype(std::data(std::declval<R &>()))>> &&
+                         is_byte<std::remove_cv_t<
+                             std::remove_pointer_t<decltype(std::data(std::declval<R &>()))>>>::value> {};
+template <class R>
+inline constexpr bool is_writable_byte_range_v = writable_byte_range<std::remove_reference_t<R>>::value;
+
+// The range types new_record() accepts as rvalues: views, whose bytes outlive them (ADR 0036 -> Records).
 template <class R>
 struct byte_view : std::false_type {};
 template <class Char, class Traits>
@@ -532,46 +641,76 @@ template <class T, std::size_t Extent>
 struct byte_view<std::span<T, Extent>> : std::true_type {};
 #endif
 template <class R>
-inline constexpr bool is_byte_view_v = byte_view<std::remove_cv_t<std::remove_reference_t<R>>>::value;
+inline constexpr bool is_byte_view_v = byte_view<std::remove_cv_t<std::remove_reference_t<R>>>::value
+#if __cplusplus >= 202002L && defined(__cpp_lib_ranges) && __cpp_lib_ranges >= 201911L
+                                       // C++20: also a type of yours that opts into std::ranges::enable_borrowed_range
+                                       || std::ranges::enable_borrowed_range<std::remove_cv_t<std::remove_reference_t<R>>>
+#endif
+    ;
 
 // A duration in whole nanoseconds for the C ABI, rounded up: negative and NaN durations are 0 (callers for which
-// that is wrong reject them first), huge ones saturate.
+// that is wrong reject them first); integral counts are exact; a duration longer than UINT64_MAX nanoseconds is
+// UINT64_MAX.
 template <class Rep, class Period>
-inline std::uint64_t duration_ns(std::chrono::duration<Rep, Period> d) noexcept {
-    if (!(d > std::chrono::duration<Rep, Period>::zero())) return 0;
-    const std::chrono::duration<long double, std::nano> ns(d);
-    if (ns.count() >= 1.8e19L) return std::numeric_limits<std::uint64_t>::max();
-    return static_cast<std::uint64_t>(std::ceil(ns.count()));
+constexpr std::uint64_t duration_ns(std::chrono::duration<Rep, Period> d) noexcept {
+    return ceil_ns<std::uint64_t>(d);
+}
+
+// For the option builders: the error that check_options() returns, in this order: a setter's first error (also a
+// library that does not match the header), then a missing handle (moved from).
+template <class Options>
+inline result<void> check_options(const Options &options) {
+    if (options.error()) return *options.error();
+    if (options.native_handle() == nullptr) return Error(Status::invalid_argument, "the options were moved from");
+    return {};
 }
 }  // namespace detail
 
 // ---- Options ----
 //
-// The option builders record the first error a setter reports, so setters can be chained without checking each
-// one; the open function that takes the options returns that error. Each builder owns a C handle and is move-only.
+// The option builders start with the defaults and record the first error a setter reports, so setters can be
+// chained without checking each one; the open function that takes the options returns that error. Each builder owns
+// a C handle and is move-only. The constructor checks the loaded library first (check_library()): if it cannot be
+// used with this header, it creates no C handle and records Status::unsupported_version as its error, and neither
+// it nor a setter calls a C function other than the version queries. Without a handle (moved from, or that
+// mismatch), a setter records Status::invalid_argument (unless an error is recorded already) and calls nothing.
 
 // Retention settings (ADR 0016): limits, plus an action that must be chosen explicitly (there is no default that
-// deletes). Only a sealed prefix strictly before the checkpoint segment is ever removed.
+// deletes). Only a sealed prefix strictly before the checkpoint segment is ever removed. Starts with no limits and
+// no action.
 class Retention {
 public:
-    Retention() : h_(tickertape_retention_new()) {}
-    Retention(Retention &&other) noexcept : h_(std::exchange(other.h_, nullptr)), error_(std::move(other.error_)) {}
+    Retention() {
+        if (auto compatible = check_library(); !compatible) {
+            error_ = detail::take_error(std::move(compatible));
+        } else {
+            h_ = tickertape_retention_new();
+        }
+    }
+    Retention(Retention &&other) noexcept
+        : h_(std::exchange(other.h_, nullptr)), error_(std::exchange(other.error_, std::nullopt)) {}
     Retention &operator=(Retention &&other) noexcept {
         if (this != &other) {
-            tickertape_retention_free(h_);
+            if (h_ != nullptr) tickertape_retention_free(h_);
             h_ = std::exchange(other.h_, nullptr);
-            error_ = std::move(other.error_);
+            error_ = std::exchange(other.error_, std::nullopt);
         }
         return *this;
     }
     Retention(const Retention &) = delete;
     Retention &operator=(const Retention &) = delete;
-    ~Retention() { tickertape_retention_free(h_); }
+    ~Retention() {
+        if (h_ != nullptr) tickertape_retention_free(h_);
+    }
 
     // Keep at most `count` segment files in total (the checkpoint segment and later ones are always kept).
-    Retention &max_segments(std::uint64_t count) { return record(tickertape_retention_set_max_segments(h_, count)); }
+    Retention &max_segments(std::uint64_t count) {
+        return usable() ? record(tickertape_retention_set_max_segments(h_, count)) : *this;
+    }
     // Keep the total size of segment files at or below `bytes`.
-    Retention &max_bytes(std::uint64_t bytes) { return record(tickertape_retention_set_max_bytes(h_, bytes)); }
+    Retention &max_bytes(std::uint64_t bytes) {
+        return usable() ? record(tickertape_retention_set_max_bytes(h_, bytes)) : *this;
+    }
     // Remove segments sealed longer ago than `age` (by the writer's wall clock), rounded up to whole nanoseconds.
     // A negative or NaN age is an error (Status::invalid_argument), not zero: zero makes every sealed segment old
     // enough to remove.
@@ -583,17 +722,17 @@ public:
             if (!error_) error_ = Error(Status::invalid_argument, "the retention age is negative or NaN");
             return *this;
         }
-        return record(tickertape_retention_set_max_age_ns(h_, detail::duration_ns(age)));
+        return usable() ? record(tickertape_retention_set_max_age_ns(h_, detail::duration_ns(age))) : *this;
     }
     // Permanently delete eligible segments.
-    Retention &delete_segments() { return record(tickertape_retention_set_delete(h_)); }
+    Retention &delete_segments() { return usable() ? record(tickertape_retention_set_delete(h_)) : *this; }
     // Move eligible segments into the existing directory `dir`, keeping their names (never replacing a file).
-    Retention &move_to(const PathArg &dir) {
+    Retention &move_to(const detail::PathArg &dir) {
         if (auto checked = dir.check(); !checked) {
             if (!error_) error_ = detail::take_error(std::move(checked));
             return *this;
         }
-        return record(tickertape_retention_set_move_to(h_, dir.c_str()));
+        return usable() ? record(tickertape_retention_set_move_to(h_, dir.c_str())) : *this;
     }
 
     // The first error a setter reported, if any.
@@ -603,59 +742,78 @@ public:
     const tickertape_retention *native_handle() const noexcept { return h_; }
 
 private:
+    // Whether there is a C handle to call a setter on; if not, records why (unless an error is recorded already).
+    bool usable() {
+        if (h_ != nullptr) return true;
+        if (!error_) error_ = Error(Status::invalid_argument, "the options were moved from");
+        return false;
+    }
     Retention &record(tickertape_status status) {
         if (status < 0 && !error_) error_ = Error::from_last_call(status);
         return *this;
     }
-    tickertape_retention *h_;
+    tickertape_retention *h_ = nullptr;
     std::optional<Error> error_;
 };
 
-// Writer options: segment size, recovery policy, wake-ups, background prefaulting, retention.
+// Writer options: segment size, recovery policy, wake-ups, background prefaulting, retention. Starts with the
+// defaults.
 class WriterOptions {
 public:
-    WriterOptions() : h_(tickertape_writer_options_new()) {}
+    WriterOptions() {
+        if (auto compatible = check_library(); !compatible) {
+            error_ = detail::take_error(std::move(compatible));
+        } else {
+            h_ = tickertape_writer_options_new();
+        }
+    }
     WriterOptions(WriterOptions &&other) noexcept
-        : h_(std::exchange(other.h_, nullptr)), error_(std::move(other.error_)) {}
+        : h_(std::exchange(other.h_, nullptr)), error_(std::exchange(other.error_, std::nullopt)) {}
     WriterOptions &operator=(WriterOptions &&other) noexcept {
         if (this != &other) {
-            tickertape_writer_options_free(h_);
+            if (h_ != nullptr) tickertape_writer_options_free(h_);
             h_ = std::exchange(other.h_, nullptr);
-            error_ = std::move(other.error_);
+            error_ = std::exchange(other.error_, std::nullopt);
         }
         return *this;
     }
     WriterOptions(const WriterOptions &) = delete;
     WriterOptions &operator=(const WriterOptions &) = delete;
-    ~WriterOptions() { tickertape_writer_options_free(h_); }
+    ~WriterOptions() {
+        if (h_ != nullptr) tickertape_writer_options_free(h_);
+    }
 
     // Size of new segment files: a multiple of 65,536 from 65,536 to 2^40 (default 128 MiB). Checked on open
     // (Status::invalid_config).
     WriterOptions &segment_size(std::uint64_t bytes) {
-        return record(tickertape_writer_options_set_segment_size(h_, bytes));
+        return usable() ? record(tickertape_writer_options_set_segment_size(h_, bytes)) : *this;
     }
     WriterOptions &recovery_policy(RecoveryPolicy policy) {
-        return record(tickertape_writer_options_set_recovery_policy(h_, static_cast<std::int32_t>(policy)));
+        return usable() ? record(tickertape_writer_options_set_recovery_policy(h_, static_cast<std::int32_t>(policy)))
+                        : *this;
     }
     // Wake blocked readers through the shared-memory wake-up region (default on).
-    WriterOptions &notify(bool enabled) { return record(tickertape_writer_options_set_notify(h_, enabled ? 1 : 0)); }
+    WriterOptions &notify(bool enabled) {
+        return usable() ? record(tickertape_writer_options_set_notify(h_, enabled ? 1 : 0)) : *this;
+    }
     // Prefault pages (and on macOS prepare the next segment) in background threads (default on). Off gives a writer
     // that starts no threads.
     WriterOptions &prefault(bool enabled) {
-        return record(tickertape_writer_options_set_prefault(h_, enabled ? 1 : 0));
+        return usable() ? record(tickertape_writer_options_set_prefault(h_, enabled ? 1 : 0)) : *this;
     }
     // Apply `retention` (copied) after open and after every successful checkpoint. Its failures never fail the
-    // writer; see Writer::last_retention_error().
+    // writer; see Writer::last_retention_error(). Settings with an error (or moved from) record that error here.
     WriterOptions &retention(const Retention &settings) {
-        if (settings.native_handle() == nullptr) {
-            // The C ABI would read NULL as "no retention".
-            if (!error_) error_ = Error(Status::invalid_argument, "the retention settings were moved from");
+        if (auto checked = detail::check_options(settings); !checked) {
+            // A moved-from Retention has no handle, which the C ABI would read as "no retention".
+            if (!error_) error_ = detail::take_error(std::move(checked));
             return *this;
         }
-        if (settings.error() && !error_) error_ = *settings.error();
-        return record(tickertape_writer_options_set_retention(h_, settings.native_handle()));
+        return usable() ? record(tickertape_writer_options_set_retention(h_, settings.native_handle())) : *this;
     }
-    WriterOptions &no_retention() { return record(tickertape_writer_options_set_retention(h_, nullptr)); }
+    WriterOptions &no_retention() {
+        return usable() ? record(tickertape_writer_options_set_retention(h_, nullptr)) : *this;
+    }
 
     const std::optional<Error> &error() const noexcept { return error_; }
     // The C handle, for C setters the binding does not wrap. Errors those report are not recorded in error().
@@ -663,49 +821,66 @@ public:
     const tickertape_writer_options *native_handle() const noexcept { return h_; }
 
 private:
+    // Whether there is a C handle to call a setter on; if not, records why (unless an error is recorded already).
+    bool usable() {
+        if (h_ != nullptr) return true;
+        if (!error_) error_ = Error(Status::invalid_argument, "the options were moved from");
+        return false;
+    }
     WriterOptions &record(tickertape_status status) {
         if (status < 0 && !error_) error_ = Error::from_last_call(status);
         return *this;
     }
-    tickertape_writer_options *h_;
+    tickertape_writer_options *h_ = nullptr;
     std::optional<Error> error_;
 };
 
-// Reader options: durable-only reads, wake-ups and how a waiting reader backs off.
+// Reader options: durable-only reads, wake-ups and how a waiting reader backs off. Starts with the defaults.
 class ReaderOptions {
 public:
-    ReaderOptions() : h_(tickertape_reader_options_new()) {}
+    ReaderOptions() {
+        if (auto compatible = check_library(); !compatible) {
+            error_ = detail::take_error(std::move(compatible));
+        } else {
+            h_ = tickertape_reader_options_new();
+        }
+    }
     ReaderOptions(ReaderOptions &&other) noexcept
-        : h_(std::exchange(other.h_, nullptr)), error_(std::move(other.error_)) {}
+        : h_(std::exchange(other.h_, nullptr)), error_(std::exchange(other.error_, std::nullopt)) {}
     ReaderOptions &operator=(ReaderOptions &&other) noexcept {
         if (this != &other) {
-            tickertape_reader_options_free(h_);
+            if (h_ != nullptr) tickertape_reader_options_free(h_);
             h_ = std::exchange(other.h_, nullptr);
-            error_ = std::move(other.error_);
+            error_ = std::exchange(other.error_, std::nullopt);
         }
         return *this;
     }
     ReaderOptions(const ReaderOptions &) = delete;
     ReaderOptions &operator=(const ReaderOptions &) = delete;
-    ~ReaderOptions() { tickertape_reader_options_free(h_); }
+    ~ReaderOptions() {
+        if (h_ != nullptr) tickertape_reader_options_free(h_);
+    }
 
     // Return only durable records: those below the checkpoint marker's next_seq (crash contract C13). A durable-only
     // reader treats later records as not written yet, and returns nothing without a valid checkpoint marker.
     ReaderOptions &durable_only(bool enabled) {
-        return record(tickertape_reader_options_set_durable_only(h_, enabled ? 1 : 0));
+        return usable() ? record(tickertape_reader_options_set_durable_only(h_, enabled ? 1 : 0)) : *this;
     }
     // Block on the writer's wake-up region instead of sleeping (default on).
-    ReaderOptions &notify(bool enabled) { return record(tickertape_reader_options_set_notify(h_, enabled ? 1 : 0)); }
+    ReaderOptions &notify(bool enabled) {
+        return usable() ? record(tickertape_reader_options_set_notify(h_, enabled ? 1 : 0)) : *this;
+    }
     // Wait with `spins` busy polls, then `yields` polls that yield, then sleeps from `min_sleep` doubling to
     // `max_sleep` (min_sleep must not exceed max_sleep). Negative sleeps count as zero.
     template <class Rep1, class Period1, class Rep2, class Period2>
     ReaderOptions &backoff(std::uint32_t spins, std::uint32_t yields, std::chrono::duration<Rep1, Period1> min_sleep,
                            std::chrono::duration<Rep2, Period2> max_sleep) {
+        if (!usable()) return *this;
         return record(tickertape_reader_options_set_backoff(h_, spins, yields, detail::duration_ns(min_sleep),
                                                             detail::duration_ns(max_sleep)));
     }
     // Spin without ever yielding or sleeping: lowest latency, one core at 100 %.
-    ReaderOptions &busy_spin() { return record(tickertape_reader_options_set_busy_spin(h_)); }
+    ReaderOptions &busy_spin() { return usable() ? record(tickertape_reader_options_set_busy_spin(h_)) : *this; }
 
     const std::optional<Error> &error() const noexcept { return error_; }
     // The C handle, for C setters the binding does not wrap. Errors those report are not recorded in error().
@@ -713,63 +888,62 @@ public:
     const tickertape_reader_options *native_handle() const noexcept { return h_; }
 
 private:
+    // Whether there is a C handle to call a setter on; if not, records why (unless an error is recorded already).
+    bool usable() {
+        if (h_ != nullptr) return true;
+        if (!error_) error_ = Error(Status::invalid_argument, "the options were moved from");
+        return false;
+    }
     ReaderOptions &record(tickertape_status status) {
         if (status < 0 && !error_) error_ = Error::from_last_call(status);
         return *this;
     }
-    tickertape_reader_options *h_;
+    tickertape_reader_options *h_ = nullptr;
     std::optional<Error> error_;
 };
 
-namespace detail {
-template <class Options>
-inline result<void> check_options(const Options &options) {
-    if (options.native_handle() == nullptr) {
-        return Error(Status::invalid_argument, "the options were moved from");
-    }
-    if (options.error()) return *options.error();
-    return {};
-}
-}  // namespace detail
-
 // ---- Records ----
 
-// A record to append with Writer::append_batch. It does not copy the payload: the bytes must stay valid and
-// unmodified until the append returns. Layout-compatible with tickertape_new_record.
-//
-// A byte range is taken by reference, so a temporary that owns its bytes (`std::to_string(i) + "..."`, a
-// `std::vector` or `std::array` returned by a function) would leave the record pointing into freed memory: those
-// constructors are deleted. An rvalue is accepted only if its type is a std::basic_string_view or a std::span (a
-// view of bytes that live elsewhere); any other range must be an lvalue (a named object).
-class NewRecord {
-public:
-    constexpr NewRecord() noexcept : rec_{nullptr, 0, 0, 0, 0, 0} {}
-    NewRecord(std::uint32_t schema_id, std::uint64_t venue_ts_ns, std::uint64_t local_ts_ns, const void *data,
-              std::size_t size) noexcept
-        : rec_{static_cast<const std::uint8_t *>(data), size, venue_ts_ns, local_ts_ns, schema_id, 0} {}
-    template <class Bytes, std::enable_if_t<detail::is_byte_range_v<Bytes>, int> = 0>
-    NewRecord(std::uint32_t schema_id, std::uint64_t venue_ts_ns, std::uint64_t local_ts_ns,
-              const Bytes &payload) noexcept
-        : NewRecord(schema_id, venue_ts_ns, local_ts_ns, std::data(payload), std::size(payload)) {}
-    // Deleted: a temporary that owns its bytes (std::string, std::vector, std::array, ...) would be destroyed at the
-    // end of the statement, leaving the record dangling. Name it, so that it outlives the append.
-    template <class Bytes, std::enable_if_t<detail::is_byte_range_v<Bytes> && !std::is_lvalue_reference_v<Bytes> &&
-                                                !detail::is_byte_view_v<Bytes>,
-                                            int> = 0>
-    NewRecord(std::uint32_t schema_id, std::uint64_t venue_ts_ns, std::uint64_t local_ts_ns, Bytes &&payload) = delete;
+// A record to append with Writer::append_batch: the C struct tickertape_new_record itself (an alias, not a wrapper),
+// so that a C array, std::array or std::vector of them is an array of the C type and goes to the C ABI as it is.
+// Its fields are public: payload, payload_len, venue_ts_ns, local_ts_ns, schema_id (and reserved, which must be 0).
+// Build one with new_record(), which checks the payload's type; a value-initialised one (`NewRecord{}`) is an empty
+// payload with zero fields. It does not copy the payload: the bytes must stay valid and unmodified until the append
+// returns.
+using NewRecord = ::tickertape_new_record;
 
-    std::uint32_t schema_id() const noexcept { return rec_.schema_id; }
-    std::uint64_t venue_ts_ns() const noexcept { return rec_.venue_ts_ns; }
-    std::uint64_t local_ts_ns() const noexcept { return rec_.local_ts_ns; }
-    const std::uint8_t *data() const noexcept { return rec_.payload; }
-    std::size_t size() const noexcept { return rec_.payload_len; }
+// A NewRecord for the `size` bytes at `data` (not copied).
+inline NewRecord new_record(std::uint32_t schema_id, std::uint64_t venue_ts_ns, std::uint64_t local_ts_ns,
+                            const void *data, std::size_t size) noexcept {
+    NewRecord record{};
+    record.payload = static_cast<const std::uint8_t *>(data);
+    record.payload_len = size;
+    record.venue_ts_ns = venue_ts_ns;
+    record.local_ts_ns = local_ts_ns;
+    record.schema_id = schema_id;
+    return record;
+}
 
-private:
-    tickertape_new_record rec_;
-};
-static_assert(std::is_standard_layout_v<NewRecord> && sizeof(NewRecord) == sizeof(tickertape_new_record) &&
-                  alignof(NewRecord) == alignof(tickertape_new_record),
-              "NewRecord must have tickertape_new_record's layout");
+// A NewRecord for a contiguous range of bytes or chars, which it points into (ADR 0036 -> Records). Because the
+// record keeps a pointer, a temporary that owns its bytes (`std::to_string(i) + "..."`, a std::vector or std::array
+// returned by a function) would leave it pointing into freed memory at the end of the statement: for those the
+// overload below is deleted. Accepted: an lvalue (a named object) of any byte range, and an rvalue of a view type,
+// whose bytes live elsewhere: std::basic_string_view, std::span and, in C++20, any type for which
+// std::ranges::enable_borrowed_range is true (your own view types can opt in).
+template <class Bytes, std::enable_if_t<detail::is_byte_range_v<Bytes> &&
+                                            (std::is_lvalue_reference_v<Bytes> || detail::is_byte_view_v<Bytes>),
+                                        int> = 0>
+NewRecord new_record(std::uint32_t schema_id, std::uint64_t venue_ts_ns, std::uint64_t local_ts_ns,
+                     Bytes &&payload) noexcept {
+    return new_record(schema_id, venue_ts_ns, local_ts_ns, std::data(payload), std::size(payload));
+}
+// Deleted: a temporary that owns its bytes (std::string, std::vector, std::array, ...) is destroyed at the end of the
+// statement, leaving the record dangling. Name it, so that it outlives the append.
+template <class Bytes, std::enable_if_t<detail::is_byte_range_v<Bytes> && !std::is_lvalue_reference_v<Bytes> &&
+                                            !detail::is_byte_view_v<Bytes>,
+                                        int> = 0>
+NewRecord new_record(std::uint32_t schema_id, std::uint64_t venue_ts_ns, std::uint64_t local_ts_ns,
+                     Bytes &&payload) = delete;
 
 class Reader;
 class RecordBatch;
@@ -780,9 +954,11 @@ class RecordBatch;
 // - from a RecordBatch: it points into the batch's buffer and is valid until the next read into that batch, or
 //   until the batch is moved or destroyed;
 // - from Reader::next_copy: it points into your buffer and is valid as long as that is.
-// Copy what you need to keep. In debug builds (TICKERTAPE_DEBUG_CHECKS) reading the payload of a view after its
-// reader or batch moved on aborts with a message; a view whose reader or batch was destroyed is not detected.
-// The sequence number, schema id and timestamps are copies and stay valid.
+// Copy what you need to keep. seq(), schema_id(), the timestamps, size() and empty() are copies and stay valid;
+// data(), as_string_view() and as_span() read the payload and are checked: in debug builds (TICKERTAPE_DEBUG_CHECKS)
+// fetching the payload through a view after its reader or batch moved on aborts with a message. The check runs when
+// the payload is fetched through the view: a pointer, string_view or span taken from it earlier has no continuing
+// check. A view whose reader or batch was destroyed is not detected.
 class RecordView {
 public:
     std::uint64_t seq() const noexcept { return rec_.seq; }
@@ -826,13 +1002,15 @@ private:
 #if __cplusplus >= 202002L && defined(__cpp_lib_span) && __cpp_lib_span >= 202002L
 // C++20: the payload as a span (same lifetime as the view).
 TICKERTAPE_HPP_MODE_DEPENDENT inline std::span<const std::uint8_t> as_span(const RecordView &record) noexcept {
+    const std::uint8_t *data = record.data();  // first, so that the debug check also covers an empty payload
     if (record.empty()) return std::span<const std::uint8_t>();
-    return std::span<const std::uint8_t>(record.data(), record.size());
+    return std::span<const std::uint8_t>(data, record.size());
 }
 #endif
 
 // Storage for Reader::read_batch: room for `max_records` records whose payloads are copied one after another into
-// a buffer of `buffer_bytes`. Both are allocated once, here; reading into a batch never allocates. Move-only.
+// a buffer of `buffer_bytes`. Both are allocated once, here (C++ allocations it owns, not a C handle); reading into a
+// batch never allocates. There is no default constructor. Move-only; a moved-from batch has capacity 0.
 class RecordBatch {
 public:
     class iterator {
@@ -979,8 +1157,8 @@ public:
     // Opens the journal in `dir` for writing, creating it if needed; takes the journal's lock and recovers it
     // (docs/format.md -> Recovery). Errors: Status::locked (another writer has it open), invalid_config, corrupt,
     // unsupported_version, io; unsupported_version also if the loaded library does not match this header.
-    static result<Writer> open(const PathArg &dir) { return open_impl(dir, nullptr); }
-    static result<Writer> open(const PathArg &dir, const WriterOptions &options) {
+    static result<Writer> open(const detail::PathArg &dir) { return open_impl(dir, nullptr); }
+    static result<Writer> open(const detail::PathArg &dir, const WriterOptions &options) {
         if (auto checked = detail::check_options(options); !checked) {
             return detail::take_error(std::move(checked));
         }
@@ -1024,9 +1202,8 @@ public:
     // moving or move-assigning the writer from inside fill is allowed: the append still completes (or aborts), and
     // if the writer was destroyed or reassigned its handle is closed when append_with returns.
     template <class Fill>
-    TICKERTAPE_HPP_MODE_DEPENDENT result<std::uint64_t> append_with(std::uint32_t schema_id, std::uint64_t venue_ts_ns,
-                                                                    std::uint64_t local_ts_ns, std::size_t size,
-                                                                    Fill &&fill) {
+    result<std::uint64_t> append_with(std::uint32_t schema_id, std::uint64_t venue_ts_ns, std::uint64_t local_ts_ns,
+                                      std::size_t size, Fill &&fill) {
         using F = std::remove_reference_t<Fill>;
         static_assert(std::is_invocable_v<F &, std::uint8_t *, std::size_t>,
                       "fill must be callable as fill(std::uint8_t *buf, std::size_t len)");
@@ -1039,12 +1216,12 @@ public:
     // so an argument error appends nothing. Durability as for append().
     BatchAppend append_batch(const NewRecord *records, std::size_t count) {
         BatchAppend out;
-        const tickertape_status status = tickertape_writer_append_batch(
-            h_, reinterpret_cast<const tickertape_new_record *>(records), count, &out.appended, &out.first_seq);
+        const tickertape_status status =
+            tickertape_writer_append_batch(h_, records, count, &out.appended, &out.first_seq);
         if (status < 0) out.outcome = Error::from_last_call(status);
         return out;
     }
-    // The same for a contiguous range of NewRecord (std::vector, std::array, std::span, ...).
+    // The same for a contiguous range of NewRecord (std::vector, std::array, std::span, ...), passed as it is.
     template <class Records,
               std::enable_if_t<std::is_same_v<std::remove_cv_t<std::remove_pointer_t<decltype(std::data(
                                                   std::declval<const Records &>()))>>,
@@ -1090,7 +1267,7 @@ public:
 private:
     explicit Writer(tickertape_writer *handle) noexcept : h_(handle) {}
 
-    static result<Writer> open_impl(const PathArg &dir, const tickertape_writer_options *options) {
+    static result<Writer> open_impl(const detail::PathArg &dir, const tickertape_writer_options *options) {
         if (auto compatible = check_library(); !compatible) return detail::take_error(std::move(compatible));
         if (auto checked = dir.check(); !checked) return detail::take_error(std::move(checked));
         tickertape_writer *handle = nullptr;
@@ -1117,8 +1294,7 @@ private:
 
     // Never lets an exception reach the C ABI: catches it, aborts the append, and append_with rethrows it.
     template <class F>
-    TICKERTAPE_HPP_MODE_DEPENDENT static std::int32_t trampoline(void *user_data, std::uint8_t *buf,
-                                                                 std::size_t len) noexcept {
+    static std::int32_t trampoline(void *user_data, std::uint8_t *buf, std::size_t len) noexcept {
         FillContext<F> *ctx = static_cast<FillContext<F> *>(user_data);
         using R = std::invoke_result_t<F &, std::uint8_t *, std::size_t>;
 #if TICKERTAPE_HPP_EXCEPTIONS
@@ -1143,10 +1319,8 @@ private:
     // Static, and after the C call it touches only the frame on its own stack: `self` may have been destroyed or
     // moved from by then.
     template <class F>
-    TICKERTAPE_HPP_MODE_DEPENDENT static result<std::uint64_t> append_with_impl(Writer *self, std::uint32_t schema_id,
-                                                                              std::uint64_t venue_ts_ns,
-                                                                              std::uint64_t local_ts_ns,
-                                                                              std::size_t size, F &fill) {
+    static result<std::uint64_t> append_with_impl(Writer *self, std::uint32_t schema_id, std::uint64_t venue_ts_ns,
+                                                  std::uint64_t local_ts_ns, std::size_t size, F &fill) {
         std::uint64_t seq = 0;
         if (self->frame_ != nullptr) {
             // Re-entry from this writer's own fill: the C ABI refuses it with TICKERTAPE_E_BUSY before calling the
@@ -1167,21 +1341,22 @@ private:
         // function returns or unwinds, after the error has been read.
         const detail::CloseOnExit deferred_close(ctx.close_on_return ? ctx.handle : nullptr);
         if (!ctx.close_on_return) ctx.owner->frame_ = nullptr;
-        std::optional<Error> error;
-        if (status < 0) error = Error::from_last_call(status);
 #if TICKERTAPE_HPP_EXCEPTIONS
         if (ctx.exception) {
-            if (!error || error->status() == Status::aborted) std::rethrow_exception(ctx.exception);
+            // A clean abort: rethrow the fill's exception before anything that allocates, so that a failed
+            // allocation cannot replace it.
+            if (status >= 0 || status == TICKERTAPE_E_ABORTED) std::rethrow_exception(ctx.exception);
             // The clean-up failed: report the library error, which says the writer has stopped, with the fill's
             // exception nested as its cause.
+            Error error = Error::from_last_call(status);
             try {
                 std::rethrow_exception(ctx.exception);
             } catch (...) {
-                std::throw_with_nested(Exception(std::move(*error)));
+                std::throw_with_nested(Exception(std::move(error)));
             }
         }
 #endif
-        if (error) return std::move(*error);
+        if (status < 0) return Error::from_last_call(status);
         return seq;
     }
 
@@ -1216,8 +1391,8 @@ public:
     // ENOENT if `dir` does not exist (the writer has not started) and not_found if it has no segment yet (the
     // writer is creating it): a loop waiting for the writer retries on exactly these two. corrupt,
     // unsupported_version, io; unsupported_version also if the loaded library does not match this header.
-    static result<Reader> open(const PathArg &dir) { return open_impl(dir, nullptr, false); }
-    static result<Reader> open(const PathArg &dir, const ReaderOptions &options) {
+    static result<Reader> open(const detail::PathArg &dir) { return open_impl(dir, nullptr, false); }
+    static result<Reader> open(const detail::PathArg &dir, const ReaderOptions &options) {
         if (auto checked = detail::check_options(options); !checked) {
             return detail::take_error(std::move(checked));
         }
@@ -1229,8 +1404,8 @@ public:
     // segment files (no writing into, truncating or replacing their contents). A tickertape writer never changes
     // committed bytes, so this holds in normal operation. If it is broken, payloads can change under you, and a
     // truncated file kills the process with SIGBUS. Use open() when you cannot rule this out.
-    static result<Reader> open_mapped_unsafe(const PathArg &dir) { return open_impl(dir, nullptr, true); }
-    static result<Reader> open_mapped_unsafe(const PathArg &dir, const ReaderOptions &options) {
+    static result<Reader> open_mapped_unsafe(const detail::PathArg &dir) { return open_impl(dir, nullptr, true); }
+    static result<Reader> open_mapped_unsafe(const detail::PathArg &dir, const ReaderOptions &options) {
         if (auto checked = detail::check_options(options); !checked) {
             return detail::take_error(std::move(checked));
         }
@@ -1266,14 +1441,20 @@ public:
 
     // Like next(), but copies the payload into `buf` (`size` bytes); the view points into `buf`. If it does not
     // fit: Status::buffer_too_small with Error::needed_size(), and the record is returned by the next read.
-    result<std::optional<RecordView>> next_copy(std::uint8_t *buf, std::size_t size, Timeout timeout = no_wait) {
+    result<std::optional<RecordView>> next_copy(void *buf, std::size_t size, Timeout timeout = no_wait) {
         generation_++;
         tickertape_record rec{};
-        const tickertape_status status = tickertape_reader_next_copy(h_, timeout.c_value(), buf, size, &rec);
+        const tickertape_status status =
+            tickertape_reader_next_copy(h_, timeout.c_value(), static_cast<std::uint8_t *>(buf), size, &rec);
         if (status == TICKERTAPE_E_BUFFER_TOO_SMALL) return Error::from_last_call(status, rec.payload_len);
         if (status < 0) return Error::from_last_call(status);
         if (status == TICKERTAPE_NONE) return std::optional<RecordView>();
         return std::optional<RecordView>(RecordView(rec, nullptr));
+    }
+    // The same into a writable contiguous range of bytes or chars (std::array, std::vector, a C array, ...).
+    template <class Bytes, std::enable_if_t<detail::is_writable_byte_range_v<Bytes>, int> = 0>
+    result<std::optional<RecordView>> next_copy(Bytes &buffer, Timeout timeout = no_wait) {
+        return next_copy(std::data(buffer), std::size(buffer), timeout);
     }
 
     // Reads up to batch.capacity() records into `batch` and returns how many (0 if none arrived within `timeout`).
@@ -1318,7 +1499,7 @@ public:
 private:
     explicit Reader(tickertape_reader *handle) noexcept : h_(handle) {}
 
-    static result<Reader> open_impl(const PathArg &dir, const tickertape_reader_options *options, bool mapped) {
+    static result<Reader> open_impl(const detail::PathArg &dir, const tickertape_reader_options *options, bool mapped) {
         if (auto compatible = check_library(); !compatible) return detail::take_error(std::move(compatible));
         if (auto checked = dir.check(); !checked) return detail::take_error(std::move(checked));
         tickertape_reader *handle = nullptr;
@@ -1374,7 +1555,7 @@ struct RetentionReport {
 
 // Checks every segment of the journal in `dir` without taking a lock or changing anything (safe while a writer is
 // active). Corruption is reported in the report, not as an error. Errors: Status::not_found, io.
-inline result<VerifyReport> verify(const PathArg &dir) {
+inline result<VerifyReport> verify(const detail::PathArg &dir) {
     if (auto compatible = check_library(); !compatible) return detail::take_error(std::move(compatible));
     if (auto checked = dir.check(); !checked) return detail::take_error(std::move(checked));
     tickertape_verify_report raw{};
@@ -1398,7 +1579,7 @@ inline result<VerifyReport> verify(const PathArg &dir) {
 
 // The segments of the journal in `dir`, oldest first (allocates the vector). Errors: Status::not_found if there are
 // none, corrupt or unsupported_version for an invalid header, io.
-inline result<std::vector<SegmentInfo>> list_segments(const PathArg &dir) {
+inline result<std::vector<SegmentInfo>> list_segments(const detail::PathArg &dir) {
     if (auto compatible = check_library(); !compatible) return detail::take_error(std::move(compatible));
     if (auto checked = dir.check(); !checked) return detail::take_error(std::move(checked));
     std::vector<tickertape_segment_info> raw;
@@ -1424,7 +1605,7 @@ inline result<std::vector<SegmentInfo>> list_segments(const PathArg &dir) {
 
 // The checkpoint marker of the journal in `dir`, or nullopt if it is missing or neither slot is valid. Takes no
 // lock; it observes the marker and does not validate the position. Errors: Status::io.
-inline result<std::optional<Checkpoint>> read_checkpoint(const PathArg &dir) {
+inline result<std::optional<Checkpoint>> read_checkpoint(const detail::PathArg &dir) {
     if (auto compatible = check_library(); !compatible) return detail::take_error(std::move(compatible));
     if (auto checked = dir.check(); !checked) return detail::take_error(std::move(checked));
     tickertape_checkpoint raw{};
@@ -1435,7 +1616,7 @@ inline result<std::optional<Checkpoint>> read_checkpoint(const PathArg &dir) {
 }
 
 namespace detail {
-inline result<RetentionReport> retention(const PathArg &dir, const Retention &settings, bool dry_run) {
+inline result<RetentionReport> retention(const detail::PathArg &dir, const Retention &settings, bool dry_run) {
     if (auto compatible = check_library(); !compatible) return detail::take_error(std::move(compatible));
     if (auto checked = dir.check(); !checked) return detail::take_error(std::move(checked));
     if (auto checked = check_options(settings); !checked) return detail::take_error(std::move(checked));
@@ -1451,16 +1632,22 @@ inline result<RetentionReport> retention(const PathArg &dir, const Retention &se
 // Applies retention to the journal in `dir` once (safe while a writer is active). Stops at the first error;
 // removals before it stay in effect. Errors: Status::invalid_argument if `settings` has no action, not_found,
 // corrupt, io (including an existing destination file).
-inline result<RetentionReport> apply_retention(const PathArg &dir, const Retention &settings) {
+inline result<RetentionReport> apply_retention(const detail::PathArg &dir, const Retention &settings) {
     return detail::retention(dir, settings, false);
 }
 
 // What apply_retention() would remove, without changing anything (no action needed).
-inline result<RetentionReport> plan_retention(const PathArg &dir, const Retention &settings) {
+inline result<RetentionReport> plan_retention(const detail::PathArg &dir, const Retention &settings) {
     return detail::retention(dir, settings, true);
 }
 
-}  // namespace v1
+}  // inline namespace v1 or v1_noexcept
 }  // namespace tickertape
+
+// The header's internal macros (the public ones are TICKERTAPE_HPP_VERSION_*, TICKERTAPE_HPP_ABI_VERSION and
+// TICKERTAPE_DEBUG_CHECKS).
+#undef TICKERTAPE_HPP_MODE_DEPENDENT
+#undef TICKERTAPE_HPP_DEBUG_CHECKS_TAG_
+#undef TICKERTAPE_HPP_EXCEPTIONS
 
 #endif  // TICKERTAPE_HPP

@@ -493,6 +493,17 @@ fn programs() -> &'static Programs {
 
 /// A command for a compiled program, under Valgrind if requested.
 fn command(program: &Path) -> Command {
+    command_with_valgrind_args(program, &[])
+}
+
+/// Valgrind's option for programs that replace `operator new` themselves (the allocation-counting and
+/// allocation-failure tests): by default Valgrind also replaces the program's own `operator new` with its
+/// allocator, so the program's counter never moves and its injected failures never happen. With this option the
+/// program's operators are used, and Valgrind still checks the memory they get from `malloc`.
+const VALGRIND_USER_ALLOCATOR: &[&str] = &["--soname-synonyms=somalloc=nouserintercepts"];
+
+/// [`command`], with `valgrind_args` added when it runs under Valgrind.
+fn command_with_valgrind_args(program: &Path, valgrind_args: &[&str]) -> Command {
     let mut cmd = if env_flag("TICKERTAPE_FFI_VALGRIND") {
         let mut c = Command::new("valgrind");
         c.args([
@@ -501,6 +512,7 @@ fn command(program: &Path) -> Command {
             "--leak-check=full",
             "--errors-for-leak-kinds=definite",
         ]);
+        c.args(valgrind_args);
         c.arg(program);
         c
     } else {
@@ -687,6 +699,14 @@ fn write_rust_fixture(dir: &Path) {
 #[test]
 fn c_api_basic() {
     for program in [&programs().c_test, &programs().c11_test] {
+        if *program == programs().c_test && static_link_loses_unwind_info(&compiler(false)) {
+            eprintln!(
+                "skipped {}: it links libtickertape.a with the GCC driver on macOS, which passes \
+                 -no_compact_unwind, so an aborted fill ends the process (docs/c-api.md -> Building and linking)",
+                program.display()
+            );
+            continue;
+        }
         let scratch = tempfile::tempdir().unwrap();
         run_ok(command(program).arg("basic").arg(scratch.path()));
     }
@@ -700,28 +720,52 @@ fn c_header_from_cpp11_and_cpp20() {
     }
 }
 
+/// Whether a program linked statically against `libtickertape.a` by this compiler driver ends the process when the
+/// library aborts a fill (an `append_with` whose fill returns non-zero): on macOS the GCC driver (Homebrew GCC)
+/// passes `-no_compact_unwind` to the linker, so the unwind information the library needs to abort the append
+/// internally is missing, and the process ends inside the library. Apple's toolchain defaults and the shared library
+/// work (docs/c-api.md -> Building and linking).
+fn static_link_loses_unwind_info(tool: &cc::Tool) -> bool {
+    cfg!(target_os = "macos") && tool.is_like_gnu() && !tool.is_like_clang()
+}
+
 /// The C++ binding's whole surface against the real library, as C++17, C++20 and C++17 without exceptions.
 #[test]
 fn cpp_binding() {
     let p = programs();
     for program in [&p.binding, &p.binding_cpp20, &p.binding_no_exceptions] {
+        if *program == p.binding_cpp20 && static_link_loses_unwind_info(&compiler(true)) {
+            eprintln!(
+                "skipped {}: it links libtickertape.a with the GCC driver on macOS, which passes \
+                 -no_compact_unwind, so an aborted fill ends the process (docs/c-api.md -> Building and linking)",
+                program.display()
+            );
+            continue;
+        }
         let scratch = tempfile::tempdir().unwrap();
         run_ok(command(program).arg(scratch.path()));
     }
 }
 
-/// A throwing fill followed by a failed clean-up, every status and corruption reason, and a mismatched library,
-/// against stubbed C functions.
+/// A throwing fill followed by a failed clean-up, every status and corruption reason, a mismatched library (also
+/// for the option builders), and an allocation failure after a clean abort, against stubbed C functions.
 #[test]
 fn cpp_binding_against_stubs() {
-    run_ok(&mut command(&programs().binding_stub));
+    run_ok(&mut command_with_valgrind_args(
+        &programs().binding_stub,
+        VALGRIND_USER_ALLOCATOR,
+    ));
 }
 
-/// The binding allocates nothing on the append and read paths (it counts `operator new`).
+/// The binding allocates nothing on the append and read paths (it counts `operator new`, after a positive control
+/// that a deliberate allocation is counted, also under Valgrind).
 #[test]
 fn cpp_binding_allocates_nothing_on_the_hot_path() {
     let scratch = tempfile::tempdir().unwrap();
-    run_ok(command(&programs().no_alloc).arg(scratch.path()));
+    run_ok(
+        command_with_valgrind_args(&programs().no_alloc, VALGRIND_USER_ALLOCATOR)
+            .arg(scratch.path()),
+    );
 }
 
 /// Debug builds of the binding abort when a record view's payload is read after the next call on its reader.
@@ -732,6 +776,34 @@ fn cpp_binding_detects_a_stale_view_in_debug_builds() {
     let output = command(&programs().binding)
         .arg(scratch.path())
         .arg("stale-view")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.contains("about to read a stale view"),
+        "{stdout}{stderr}"
+    );
+    assert!(!stdout.contains("not detected"), "{stdout}{stderr}");
+    assert!(
+        stderr.contains("used after the next call on its Reader"),
+        "{stderr}"
+    );
+    assert!(
+        output.status.signal() == Some(6) || !output.status.success(),
+        "{}",
+        output.status
+    );
+}
+
+/// C++20: `as_span` of a stale view whose record is empty is caught too (it used to return before the check).
+#[test]
+fn cpp_binding_detects_a_stale_empty_view_through_as_span() {
+    use std::os::unix::process::ExitStatusExt;
+    let scratch = tempfile::tempdir().unwrap();
+    let output = command(&programs().binding_cpp20)
+        .arg(scratch.path())
+        .arg("stale-empty-span")
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1238,18 +1310,15 @@ const C_STRUCT_FIELDS: &[(&str, &[(&str, FieldUse)])] = {
         (
             "tickertape_new_record",
             &[
-                ("payload", Used("NewRecord's constructor and data()")),
-                ("payload_len", Used("NewRecord's constructor and size()")),
+                ("payload", Used("new_record(); NewRecord is the C struct")),
+                ("payload_len", Used("new_record()")),
+                ("venue_ts_ns", Used("new_record()")),
+                ("local_ts_ns", Used("new_record()")),
+                ("schema_id", Used("new_record()")),
                 (
-                    "venue_ts_ns",
-                    Used("NewRecord's constructor and venue_ts_ns()"),
+                    "reserved",
+                    Unused("set to 0 by new_record()'s value-initialisation"),
                 ),
-                (
-                    "local_ts_ns",
-                    Used("NewRecord's constructor and local_ts_ns()"),
-                ),
-                ("schema_id", Used("NewRecord's constructor and schema_id()")),
-                ("reserved", Unused("set to 0 by NewRecord's constructor")),
             ],
         ),
     ]
@@ -1495,7 +1564,9 @@ fn cpp_layout_test_pins_every_public_class() {
     const NOT_PUBLIC: &[&str] = &[
         "is_byte",
         "byte_range",
+        "writable_byte_range",
         "byte_view",
+        "PathArg",
         "ResultAccess",
         "FillFrame",
         "CloseOnExit",
@@ -1545,16 +1616,12 @@ fn cpp_layout_test_pins_every_public_class() {
 
 // ---- Mixing exception and debug-check modes in one program (ADR 0036 -> Mixing modes) ----
 
-/// The attribute that gives a function a symbol per mode.
+/// The attribute that gives a function a symbol per debug-check mode. (The exception mode is in the inline
+/// namespace's name, which covers every declaration: `tickertape::v1` or `tickertape::v1_noexcept`.)
 const MODE_TAG: &str = "TICKERTAPE_HPP_MODE_DEPENDENT";
 
-/// The macros whose value can make an inline function's behaviour depend on how its translation unit was built.
-const MODE_MACROS: &[&str] = &[
-    "TICKERTAPE_HPP_EXCEPTIONS",
-    "TICKERTAPE_DEBUG_CHECKS",
-    "__cpp_exceptions",
-    "NDEBUG",
-];
+/// The macros whose value can make an inline function's behaviour depend on the debug-check mode.
+const MODE_MACROS: &[&str] = &["TICKERTAPE_DEBUG_CHECKS", "NDEBUG"];
 
 /// Calls from functions without the tag to a function that has the name of a tagged one but is a different
 /// function: (caller, callee, what the callee really is).
@@ -1564,9 +1631,15 @@ const NOT_MODE_DEPENDENT_CALLS: &[(&str, &str, &str)] = &[
         "error",
         "the option builders' error(), which returns the recorded std::optional<Error>",
     ),
-    ("retention", "error", "Retention::error(), as above"),
     ("list_segments", "data", "std::vector::data()"),
 ];
+
+/// Tagged functions that call a tagged function only through an operator, which the source check cannot see:
+/// (name, what it calls).
+const TAGGED_THROUGH_OPERATORS: &[(&str, &str)] = &[(
+    "operator*",
+    "RecordBatch::iterator's operator* calls RecordBatch::operator[]",
+)];
 
 /// A function defined in C++ source without comments: everything before its body (attributes, return type, name,
 /// parameters, qualifiers, member initialisers), its name, and its body.
@@ -1742,18 +1815,39 @@ fn calls(body: &str, name: &str) -> bool {
     })
 }
 
-/// Every inline function whose behaviour depends on the exception mode or the debug-check mode has a symbol per
-/// mode: it is declared TICKERTAPE_HPP_MODE_DEPENDENT if its body mentions a mode macro, or calls a function that
-/// is (by name; calls through operators, such as `*result`, are not seen, and the operators are tagged by hand).
-/// Without it, the linker keeps one translation unit's copy for the whole program.
+/// Every inline function whose behaviour depends on the debug-check mode has a symbol per mode: it is declared
+/// TICKERTAPE_HPP_MODE_DEPENDENT if its body mentions a debug-check macro, or calls a function that is (by name;
+/// calls through operators, such as `*result`, are not seen, and the operators are tagged by hand). Without it, the
+/// linker keeps one translation unit's copy for the whole program. Conversely, a tagged function must have a reason
+/// (so that no exception-mode tag is left behind: the inline namespace carries that mode), and the whole binding is
+/// inside the mode-specific inline namespace.
 #[test]
 fn cpp_mode_dependent_functions_have_a_symbol_per_mode() {
     let header = cpp_header();
     assert!(
         header.contains(&format!(
-            "#define {MODE_TAG} \\\n    __attribute__((abi_tag("
+            "#define {MODE_TAG} \\\n    __attribute__((abi_tag(TICKERTAPE_HPP_DEBUG_CHECKS_TAG_)))"
         )),
-        "{MODE_TAG} must expand to abi_tag on GCC and Clang"
+        "{MODE_TAG} must expand to abi_tag with the debug-check tag only on GCC and Clang"
+    );
+    let code = strip_comments(&header);
+    assert_eq!(
+        code.matches("namespace tickertape").count(),
+        1,
+        "the binding opens namespace tickertape once"
+    );
+    let opened = code.find("namespace tickertape {").unwrap();
+    assert!(
+        code[opened..]
+            .trim_start_matches("namespace tickertape {")
+            .trim_start()
+            .starts_with("inline namespace TICKERTAPE_HPP_INLINE_NAMESPACE_ {"),
+        "everything in namespace tickertape must be inside the mode-specific inline namespace"
+    );
+    assert!(
+        code.contains("#define TICKERTAPE_HPP_INLINE_NAMESPACE_ v1\n")
+            && code.contains("#define TICKERTAPE_HPP_INLINE_NAMESPACE_ v1_noexcept\n"),
+        "the inline namespace is v1 with exceptions and v1_noexcept without"
     );
     let functions = cpp_functions(&strip_comments(&header));
     assert!(
@@ -1768,21 +1862,32 @@ fn cpp_mode_dependent_functions_have_a_symbol_per_mode() {
         .collect();
     tagged.sort_unstable();
     tagged.dedup();
-    for expected in [
-        "fail",
-        "debug_check",
-        "value",
-        "error",
-        "check_live",
-        "trampoline",
-        "append_with_impl",
-    ] {
+    for expected in ["debug_check", "error", "check_live", "data", "operator[]"] {
         assert!(
             tagged.contains(&expected),
             "{expected} is not tagged; parsed {tagged:?}"
         );
     }
     let mut problems = Vec::new();
+    for f in functions.iter().filter(|f| f.head.contains(MODE_TAG)) {
+        let mentions_macro = MODE_MACROS
+            .iter()
+            .any(|m| contains_word(&f.head, m) || contains_word(&f.body, m));
+        let calls_tagged = tagged
+            .iter()
+            .filter(|name| !name.starts_with("operator"))
+            .any(|callee| calls(&f.body, callee));
+        let by_hand = TAGGED_THROUGH_OPERATORS
+            .iter()
+            .any(|(name, _)| *name == f.name);
+        if !mentions_macro && !calls_tagged && !by_hand {
+            problems.push(format!(
+                "{}: is {MODE_TAG} but does not depend on the debug-check mode (the exception mode is the inline \
+                 namespace's job)",
+                f.name
+            ));
+        }
+    }
     for f in functions.iter().filter(|f| !f.head.contains(MODE_TAG)) {
         for macro_name in MODE_MACROS {
             if contains_word(&f.head, macro_name) || contains_word(&f.body, macro_name) {
@@ -1821,9 +1926,10 @@ fn cpp_mode_dependent_functions_have_a_symbol_per_mode() {
 
 /// Translation units built with and without exceptions, and with and without debug checks, keep their own behaviour
 /// when linked into one program, in either link order and at -O0 and -O2 (ADR 0036 -> Mixing modes). Without the
-/// mode tags, the copy of `result<T>::value()`, `append_with` or `RecordBatch::operator[]` from the first object
-/// on the link line serves both units: `value()` aborts instead of throwing, a fill's exception escapes, or a debug
-/// check disappears.
+/// mode-specific inline namespace (exceptions) or the abi_tag (debug checks), the copy of `result<T>::value()`,
+/// `append_with`, `list_segments` or `RecordBatch::operator[]` from the first object on the link line serves both
+/// units: `value()` aborts instead of throwing, a fill's exception escapes, an allocation failure inside
+/// `list_segments` terminates the process (Clang) or skips its clean-up (GCC), or a debug check disappears.
 #[test]
 fn cpp_binding_links_units_built_in_different_modes() {
     let scratch = tempfile::tempdir().unwrap();
@@ -1876,7 +1982,10 @@ fn cpp_binding_links_units_built_in_different_modes() {
             link_library(&mut link, Link::Shared);
             run_compiler(link.arg("-o").arg(&program));
             let run = |args: &[&str]| {
-                let output = command(&program).args(args).output().unwrap();
+                let output = command_with_valgrind_args(&program, VALGRIND_USER_ALLOCATOR)
+                    .args(args)
+                    .output()
+                    .unwrap();
                 let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
                 let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
                 (output.status.success(), stdout, stderr)
@@ -1909,6 +2018,19 @@ fn cpp_binding_links_units_built_in_different_modes() {
                     ok && stdout.contains("committed"),
                     "{context}: noexc-fill\n{stdout}{stderr}"
                 );
+                // std::bad_alloc from the 1st, 2nd, ... allocation inside list_segments (an untagged function that
+                // the no-exceptions unit also calls) reaches the exceptions unit's catch every time.
+                let journal = out.join(format!("alloc_{first}{opt}"));
+                let (ok, stdout, stderr) = run(&["exc-alloc", journal.to_str().unwrap()]);
+                let caught = stdout
+                    .trim()
+                    .strip_prefix("caught ")
+                    .and_then(|n| n.parse::<i32>().ok());
+                assert!(
+                    ok && caught.is_some_and(|n| n >= 2),
+                    "{context}: exc-alloc must catch a failure at each allocation of list_segments\n\
+                     {stdout}{stderr}"
+                );
             } else {
                 let (ok, stdout, stderr) = run(&["dbg-index"]);
                 assert!(
@@ -1926,14 +2048,69 @@ fn cpp_binding_links_units_built_in_different_modes() {
     }
 }
 
-// ---- NewRecord and temporaries (ADR 0036 -> Records) ----
-
-/// `NewRecord` does not copy its payload, so it refuses (at compile time) an rvalue range that owns its bytes, and
-/// accepts lvalues and rvalue views (`std::basic_string_view`, `std::span`).
+/// A binding type cannot be passed between units built in different exception modes: the same declaration names a
+/// function taking `tickertape::v1::Writer` in one unit and `tickertape::v1_noexcept::Writer` in the other, so the
+/// link fails (ADR 0036 -> Mixing modes). Built in the same mode, the same two units link (the control).
 #[test]
-fn cpp_new_record_refuses_temporaries_that_own_their_bytes() {
+fn cpp_binding_types_do_not_cross_exception_modes() {
+    let scratch = tempfile::tempdir().unwrap();
+    let out = scratch.path();
+    let source = manifest_dir().join("tests/cpp/mixed_modes_boundary.cpp");
+    lib_dir();
+    let objects: &[(&str, &[&str])] = &[
+        ("define_noexc", &["-fno-exceptions", "-DTT_BOUNDARY_DEFINE"]),
+        ("define_exc", &["-DTT_BOUNDARY_DEFINE"]),
+        ("call_exc", &[]),
+    ];
+    let compiles = objects
+        .iter()
+        .map(|(name, flags)| {
+            let mut cmd = compiler_command("c++17", &[CPP_BINDING_WARNINGS, flags].concat());
+            cmd.arg("-c")
+                .arg(&source)
+                .arg("-o")
+                .arg(out.join(format!("{name}.o")));
+            cmd
+        })
+        .collect();
+    run_all_ok(compiles);
+    let link = |definition: &str| {
+        let mut cmd = compiler(true).to_command();
+        cmd.args(sanitizer_flags())
+            .arg(out.join("call_exc.o"))
+            .arg(out.join(format!("{definition}.o")));
+        link_library(&mut cmd, Link::Shared);
+        cmd.arg("-o")
+            .arg(out.join(format!("boundary_{definition}")));
+        cmd.output().expect("run the linker")
+    };
+    let control = link("define_exc");
+    assert!(
+        control.status.success(),
+        "the same mode must link\n{}",
+        String::from_utf8_lossy(&control.stderr)
+    );
+    let crossed = link("define_noexc");
+    let stderr = String::from_utf8_lossy(&crossed.stderr);
+    assert!(
+        !crossed.status.success() && stderr.contains("tt_boundary_is_open"),
+        "passing a tickertape::Writer between exception modes must fail to link\n{stderr}"
+    );
+}
+
+// ---- Code the binding refuses at compile time (ADR 0036) ----
+
+/// Programs that must not compile, and their neighbours that must: `new_record` refuses an rvalue range that owns
+/// its bytes and accepts lvalues and rvalue views (`std::basic_string_view`, `std::span`, and in C++20 any type
+/// that opts into `std::ranges::enable_borrowed_range`); `result<T>` refuses a T whose move can throw; a const
+/// rvalue `result<Writer>` does not hand out its Writer; `tickertape::PathArg` cannot be named (a variable of it
+/// could dangle), while temporaries passed as path arguments compile.
+#[test]
+fn cpp_binding_refuses_unsafe_code_at_compile_time() {
     const PRELUDE: &str = r#"#include "tickertape.hpp"
 #include <array>
+#include <filesystem>
+#include <ranges>
 #include <span>
 #include <string>
 #include <string_view>
@@ -1941,46 +2118,118 @@ fn cpp_new_record_refuses_temporaries_that_own_their_bytes() {
 #include <vector>
 namespace tt = tickertape;
 const std::string const_string();
+// A user's own view type: it does not own its bytes. It opts into std::ranges::enable_borrowed_range below.
+struct MyView {
+    const char *p;
+    std::size_t n;
+    const char *data() const { return p; }
+    std::size_t size() const { return n; }
+    const char *begin() const { return p; }
+    const char *end() const { return p + n; }
+};
+template <>
+inline constexpr bool std::ranges::enable_borrowed_range<MyView> = true;
+// The same without opting in.
+struct NotBorrowed {
+    const char *p;
+    std::size_t n;
+    const char *data() const { return p; }
+    std::size_t size() const { return n; }
+};
+struct ThrowingMove {
+    ThrowingMove() = default;
+    ThrowingMove(ThrowingMove &&) noexcept(false) {}
+};
 void use(std::vector<tt::NewRecord> &batch, std::string &owned, const std::string &cowned,
-         std::vector<std::uint8_t> &bytes, std::array<char, 1> &fixed);
+         std::vector<std::uint8_t> &bytes, std::array<char, 1> &fixed, const tt::result<tt::Writer> &opened);
 void use(std::vector<tt::NewRecord> &batch, std::string &owned, const std::string &cowned,
-         std::vector<std::uint8_t> &bytes, std::array<char, 1> &fixed) {
-    (void)batch; (void)owned; (void)cowned; (void)bytes; (void)fixed;
+         std::vector<std::uint8_t> &bytes, std::array<char, 1> &fixed, const tt::result<tt::Writer> &opened) {
+    (void)batch; (void)owned; (void)cowned; (void)bytes; (void)fixed; (void)opened;
 "#;
-    const REFUSED: &[&str] = &[
-        r#"batch.emplace_back(1, 0, 0, std::to_string(1) + "...");"#,
-        r#"tt::NewRecord r(1, 0, 0, std::string("x")); (void)r;"#,
-        "tt::NewRecord r(1, 0, 0, std::vector<char>{'a'}); (void)r;",
-        "tt::NewRecord r(1, 0, 0, std::array<char, 1>{{'a'}}); (void)r;",
-        "tt::NewRecord r(1, 0, 0, std::move(owned)); (void)r;",
-        "tt::NewRecord r(1, 0, 0, const_string()); (void)r;",
-        "batch.push_back(tt::NewRecord(1, 0, 0, std::vector<std::uint8_t>(4)));",
+    // (statement, a word the compiler's error must contain); each must fail to compile.
+    const REFUSED: &[(&str, &str)] = &[
+        (
+            r#"batch.push_back(tt::new_record(1, 0, 0, std::to_string(1) + "..."));"#,
+            "deleted",
+        ),
+        (
+            r#"tt::NewRecord r = tt::new_record(1, 0, 0, std::string("x")); (void)r;"#,
+            "deleted",
+        ),
+        (
+            "tt::NewRecord r = tt::new_record(1, 0, 0, std::vector<char>{'a'}); (void)r;",
+            "deleted",
+        ),
+        (
+            "tt::NewRecord r = tt::new_record(1, 0, 0, std::array<char, 1>{{'a'}}); (void)r;",
+            "deleted",
+        ),
+        (
+            "tt::NewRecord r = tt::new_record(1, 0, 0, std::move(owned)); (void)r;",
+            "deleted",
+        ),
+        (
+            "tt::NewRecord r = tt::new_record(1, 0, 0, const_string()); (void)r;",
+            "deleted",
+        ),
+        (
+            "batch.push_back(tt::new_record(1, 0, 0, std::vector<std::uint8_t>(4)));",
+            "deleted",
+        ),
+        (
+            "batch.push_back(tt::new_record(1, 0, 0, NotBorrowed{\"x\", 1}));",
+            "deleted",
+        ),
+        (
+            "tt::result<ThrowingMove> r = ThrowingMove(); (void)r;",
+            "nothrow move",
+        ),
+        (
+            "tt::Writer w = std::move(opened).value(); (void)w;",
+            "deleted",
+        ),
+        ("tt::Writer w = *std::move(opened); (void)w;", "deleted"),
+        (
+            r#"tt::PathArg p = std::filesystem::path("root") / "journal"; (void)p;"#,
+            "PathArg",
+        ),
+        (
+            r#"const tt::PathArg &p = std::string("root"); (void)p;"#,
+            "PathArg",
+        ),
     ];
     const ACCEPTED: &[&str] = &[
-        "tt::NewRecord r(1, 0, 0, owned); (void)r;",
-        "batch.emplace_back(1, 0, 0, owned);",
-        "batch.emplace_back(1, 0, 0, cowned);",
-        "batch.emplace_back(1, 0, 0, bytes);",
-        "batch.emplace_back(1, 0, 0, fixed);",
-        "batch.emplace_back(1, 0, 0, std::string_view(owned));",
-        r#"batch.emplace_back(1, 0, 0, std::string_view("literal"));"#,
-        "batch.emplace_back(1, 0, 0, std::span<const std::uint8_t>(bytes));",
-        "batch.emplace_back(1, 0, 0, std::span<const char, 1>(fixed));",
-        "batch.emplace_back(1, 0, 0, std::as_bytes(std::span<const char>(owned)));",
+        "batch.push_back(tt::new_record(1, 0, 0, owned));",
+        "batch.push_back(tt::new_record(1, 0, 0, cowned));",
+        "batch.push_back(tt::new_record(1, 0, 0, bytes));",
+        "batch.push_back(tt::new_record(1, 0, 0, fixed));",
+        "batch.push_back(tt::new_record(1, 0, 0, std::string_view(owned)));",
+        r#"batch.push_back(tt::new_record(1, 0, 0, std::string_view("literal")));"#,
+        "batch.push_back(tt::new_record(1, 0, 0, std::span<const std::uint8_t>(bytes)));",
+        "batch.push_back(tt::new_record(1, 0, 0, std::span<const char, 1>(fixed)));",
+        "batch.push_back(tt::new_record(1, 0, 0, std::as_bytes(std::span<const char>(owned))));",
+        "batch.push_back(tt::new_record(1, 0, 0, MyView{owned.data(), owned.size()}));",
+        "batch.push_back(tt::new_record(1, 0, 0, std::ranges::subrange(owned.data(), owned.data() + 1)));",
+        "batch.push_back(tt::new_record(1, 0, 0, owned.data(), owned.size()));",
+        "tt::result<int> r = 1; (void)r;",
+        "const tt::Writer &w = opened.value(); (void)w;",
+        r#"(void)tt::verify(std::filesystem::path("root") / "journal");"#,
+        r#"(void)tt::Writer::open(std::string("root") + "/journal");"#,
+        r#"tt::Retention r; r.move_to(std::filesystem::path("root") / "archive");"#,
     ];
     let scratch = tempfile::tempdir().unwrap();
     let compilers = cpp_compilers();
     assert!(!compilers.is_empty(), "no C++ compiler found");
     let mut jobs = Vec::new();
     let mut cases = Vec::new();
-    for (i, statement) in REFUSED
+    for (i, (accept, statement, needle)) in REFUSED
         .iter()
-        .map(|s| (false, s))
-        .chain(ACCEPTED.iter().map(|s| (true, s)))
+        .map(|(s, n)| (false, *s, *n))
+        .chain(ACCEPTED.iter().map(|s| (true, *s, "")))
         .enumerate()
     {
-        let source = scratch.path().join(format!("new_record_{i}.cpp"));
-        std::fs::write(&source, format!("{PRELUDE}    {}\n}}\n", statement.1)).unwrap();
+        let source = scratch.path().join(format!("case_{i}.cpp"));
+        std::fs::write(&source, format!("{PRELUDE}    {statement}\n}}\n")).unwrap();
         for compiler in &compilers {
             let mut cmd = Command::new(compiler);
             cmd.args(["-std=c++20", "-fsyntax-only", "-Wall", "-Wextra", "-Werror"])
@@ -1989,10 +2238,10 @@ void use(std::vector<tt::NewRecord> &batch, std::string &owned, const std::strin
                 .arg(manifest_dir().join("include"))
                 .arg(&source);
             jobs.push(cmd);
-            cases.push(statement);
+            cases.push((accept, statement, needle));
         }
     }
-    for ((accept, statement), (cmd, output)) in cases.into_iter().zip(run_parallel(jobs)) {
+    for ((accept, statement, needle), (cmd, output)) in cases.into_iter().zip(run_parallel(jobs)) {
         let stderr = String::from_utf8_lossy(&output.stderr);
         if accept {
             assert!(
@@ -2000,14 +2249,9 @@ void use(std::vector<tt::NewRecord> &batch, std::string &owned, const std::strin
                 "must compile: {statement}\n{cmd:?}\n{stderr}"
             );
         } else {
-            // Refused by the deleted constructor: "use of deleted function" / "call to deleted constructor", or,
-            // through libstdc++'s C++20 emplace_back, "no matching function for call to construct_at(NewRecord*...)"
-            // (std::construct_at is constrained on the construction being valid).
-            let about_new_record = stderr.contains("NewRecord")
-                && (stderr.contains("deleted") || stderr.contains("construct_at"));
             assert!(
-                !output.status.success() && about_new_record,
-                "must be refused (the NewRecord constructor is deleted): {statement}\n{cmd:?}\n{stderr}"
+                !output.status.success() && stderr.contains(needle),
+                "must be refused (with \"{needle}\" in the error): {statement}\n{cmd:?}\n{stderr}"
             );
         }
     }

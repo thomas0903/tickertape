@@ -7,17 +7,40 @@
 // - a fill that returns false, followed by a failed clean-up: a plain Status::io error;
 // - every status code and every corruption reason, with the OS error, reaching an Error unchanged (including a code
 //   from a newer library that this header does not name);
-// - a library whose version does not match the header: opens, inspection and retention refuse it before calling
-//   the C ABI.
+// - a library whose version does not match the header: opens, inspection, retention and the option builders refuse
+//   it before calling any C function other than the version queries;
+// - an allocation failure after a clean abort of a throwing fill must not replace the fill's exception.
+//
+// It replaces operator new so that allocations can be made to fail on demand. Under Valgrind it must run with
+// --soname-synonyms=somalloc=nouserintercepts (tests/c_api.rs does), or Valgrind would replace that operator new;
+// a positive control checks that the injection works.
 #include "tickertape.hpp"
 
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 namespace tt = tickertape;
+using namespace std::chrono_literals;
+
+// While set, every operator new throws std::bad_alloc.
+static bool fail_allocations = false;
+
+void *operator new(std::size_t size) {
+    if (fail_allocations) throw std::bad_alloc();
+    if (void *p = std::malloc(size ? size : 1)) return p;
+    throw std::bad_alloc();
+}
+// Not inlined: GCC's -Wmismatched-new-delete would otherwise see free() applied to the result of operator new once
+// the replacement operator delete is inlined into a caller.
+__attribute__((noinline)) static void release(void *p) noexcept { std::free(p); }
+void operator delete(void *p) noexcept { release(p); }
+void operator delete(void *p, std::size_t) noexcept { release(p); }
 
 static int failures = 0;
 
@@ -38,8 +61,11 @@ static std::uint32_t stub_version = TICKERTAPE_HPP_VERSION_NUMBER;
 static int stub_opens = 0;
 static int stub_closes = 0;
 static int stub_inspections = 0;  // calls of the inspection and retention functions
+static int stub_calls = 0;        // calls of every C function other than the three version queries
 static int stub_writer;
 static int stub_retention;
+static int stub_writer_options;
+static int stub_reader_options;
 
 extern "C" {
 uint32_t tickertape_abi_version(void) { return TICKERTAPE_ABI_VERSION; }
@@ -48,12 +74,14 @@ const char *tickertape_version(void) { return "stub"; }
 
 tickertape_status tickertape_writer_open(const char *, const struct tickertape_writer_options *,
                                          struct tickertape_writer **writer_out) {
+    stub_calls++;
     stub_opens++;
     *writer_out = reinterpret_cast<struct tickertape_writer *>(&stub_writer);
     return TICKERTAPE_OK;
 }
 
 tickertape_status tickertape_writer_close(struct tickertape_writer *writer) {
+    stub_calls++;
     if (writer) stub_closes++;
     return TICKERTAPE_OK;
 }
@@ -61,6 +89,7 @@ tickertape_status tickertape_writer_close(struct tickertape_writer *writer) {
 tickertape_status tickertape_writer_append_with(struct tickertape_writer *, uint32_t, uint64_t, uint64_t,
                                                 size_t payload_len, tickertape_fill_fn fill, void *user_data,
                                                 uint64_t *seq_out) {
+    stub_calls++;
     unsigned char buf[16] = {0};
     if (fill(user_data, payload_len ? buf : nullptr, payload_len) == 0) {
         if (seq_out) *seq_out = 42;
@@ -69,35 +98,123 @@ tickertape_status tickertape_writer_append_with(struct tickertape_writer *, uint
     return stub_status;
 }
 
-tickertape_status tickertape_writer_checkpoint(struct tickertape_writer *) { return stub_status; }
+tickertape_status tickertape_writer_checkpoint(struct tickertape_writer *) {
+    stub_calls++;
+    return stub_status;
+}
 
 tickertape_status tickertape_verify(const char *, tickertape_verify_report *) {
+    stub_calls++;
     stub_inspections++;
     return TICKERTAPE_OK;
 }
 tickertape_status tickertape_list_segments(const char *, tickertape_segment_info *, size_t, size_t *count_out) {
+    stub_calls++;
     stub_inspections++;
     *count_out = 0;
     return TICKERTAPE_OK;
 }
 tickertape_status tickertape_read_checkpoint(const char *, tickertape_checkpoint *) {
+    stub_calls++;
     stub_inspections++;
     return TICKERTAPE_NONE;
 }
 tickertape_status tickertape_retention_apply(const char *, const struct tickertape_retention *, int32_t,
                                              tickertape_retention_report *) {
+    stub_calls++;
     stub_inspections++;
     return TICKERTAPE_OK;
 }
 struct tickertape_retention *tickertape_retention_new(void) {
+    stub_calls++;
     return reinterpret_cast<struct tickertape_retention *>(&stub_retention);
 }
-void tickertape_retention_free(struct tickertape_retention *) {}
+void tickertape_retention_free(struct tickertape_retention *) { stub_calls++; }
+tickertape_status tickertape_retention_set_max_segments(struct tickertape_retention *, uint64_t) {
+    stub_calls++;
+    return TICKERTAPE_OK;
+}
+tickertape_status tickertape_retention_set_max_bytes(struct tickertape_retention *, uint64_t) {
+    stub_calls++;
+    return TICKERTAPE_OK;
+}
+tickertape_status tickertape_retention_set_max_age_ns(struct tickertape_retention *, uint64_t) {
+    stub_calls++;
+    return TICKERTAPE_OK;
+}
+tickertape_status tickertape_retention_set_delete(struct tickertape_retention *) {
+    stub_calls++;
+    return TICKERTAPE_OK;
+}
+tickertape_status tickertape_retention_set_move_to(struct tickertape_retention *, const char *) {
+    stub_calls++;
+    return TICKERTAPE_OK;
+}
 
-const char *tickertape_last_error_message(void) { return stub_message.c_str(); }
-int32_t tickertape_last_error_os_code(void) { return stub_os_code; }
-int32_t tickertape_last_error_corrupt_reason(void) { return stub_reason; }
+struct tickertape_writer_options *tickertape_writer_options_new(void) {
+    stub_calls++;
+    return reinterpret_cast<struct tickertape_writer_options *>(&stub_writer_options);
+}
+void tickertape_writer_options_free(struct tickertape_writer_options *) { stub_calls++; }
+tickertape_status tickertape_writer_options_set_segment_size(struct tickertape_writer_options *, uint64_t) {
+    stub_calls++;
+    return TICKERTAPE_OK;
+}
+tickertape_status tickertape_writer_options_set_recovery_policy(struct tickertape_writer_options *, int32_t) {
+    stub_calls++;
+    return TICKERTAPE_OK;
+}
+tickertape_status tickertape_writer_options_set_notify(struct tickertape_writer_options *, int32_t) {
+    stub_calls++;
+    return TICKERTAPE_OK;
+}
+tickertape_status tickertape_writer_options_set_prefault(struct tickertape_writer_options *, int32_t) {
+    stub_calls++;
+    return TICKERTAPE_OK;
+}
+tickertape_status tickertape_writer_options_set_retention(struct tickertape_writer_options *,
+                                                          const struct tickertape_retention *) {
+    stub_calls++;
+    return TICKERTAPE_OK;
+}
+
+struct tickertape_reader_options *tickertape_reader_options_new(void) {
+    stub_calls++;
+    return reinterpret_cast<struct tickertape_reader_options *>(&stub_reader_options);
+}
+void tickertape_reader_options_free(struct tickertape_reader_options *) { stub_calls++; }
+tickertape_status tickertape_reader_options_set_durable_only(struct tickertape_reader_options *, int32_t) {
+    stub_calls++;
+    return TICKERTAPE_OK;
+}
+tickertape_status tickertape_reader_options_set_notify(struct tickertape_reader_options *, int32_t) {
+    stub_calls++;
+    return TICKERTAPE_OK;
+}
+tickertape_status tickertape_reader_options_set_backoff(struct tickertape_reader_options *, uint32_t, uint32_t,
+                                                        uint64_t, uint64_t) {
+    stub_calls++;
+    return TICKERTAPE_OK;
+}
+tickertape_status tickertape_reader_options_set_busy_spin(struct tickertape_reader_options *) {
+    stub_calls++;
+    return TICKERTAPE_OK;
+}
+
+const char *tickertape_last_error_message(void) {
+    stub_calls++;
+    return stub_message.c_str();
+}
+int32_t tickertape_last_error_os_code(void) {
+    stub_calls++;
+    return stub_os_code;
+}
+int32_t tickertape_last_error_corrupt_reason(void) {
+    stub_calls++;
+    return stub_reason;
+}
 const char *tickertape_status_name(tickertape_status status) {
+    stub_calls++;
     switch (status) {
         case TICKERTAPE_E_IO: return "TICKERTAPE_E_IO";
         case TICKERTAPE_E_ABORTED: return "TICKERTAPE_E_ABORTED";
@@ -148,6 +265,38 @@ static void failed_cleanup() {
     // The same failure after a fill that returned false: a plain error, no exception.
     auto refused = writer.append_with(1, 0, 0, 8, [](std::uint8_t *, std::size_t) { return false; });
     CHECK(!refused && refused.error().status() == tt::Status::io && refused.error().os_code() == 28);
+
+    // A clean abort whose error message cannot be copied (allocations fail from inside the fill on): the fill's own
+    // exception still reaches the caller, not std::bad_alloc. The binding must rethrow before it builds an Error.
+    struct FillError {
+        int code;
+    };
+    stub_status = TICKERTAPE_E_ABORTED;
+    stub_message = "the fill callback returned non-zero; nothing was appended (a message too long for SSO)";
+    bool injected = false;  // positive control: the injection works (Valgrind must not replace operator new)
+    fail_allocations = true;
+    try {
+        ::operator delete(::operator new(64));
+    } catch (const std::bad_alloc &) {
+        injected = true;
+    }
+    fail_allocations = false;
+    CHECK(injected);
+    try {
+        (void)writer.append_with(1, 0, 0, 8, [](std::uint8_t *, std::size_t) {
+            fail_allocations = true;
+            throw FillError{7};  // allocated by the C++ runtime with malloc, not operator new
+        });
+        fail_allocations = false;
+        CHECK(false);
+    } catch (const FillError &e) {
+        fail_allocations = false;
+        CHECK(e.code == 7);
+    } catch (const std::bad_alloc &) {
+        fail_allocations = false;
+        std::fprintf(stderr, "std::bad_alloc replaced the fill's exception\n");
+        CHECK(false);
+    }
 
     // A fill that does not throw still commits; the writer was never closed behind our back.
     stub_os_code = 0;
@@ -224,16 +373,55 @@ static void mismatched_library() {
     CHECK(stub_inspections == inspections);
     stub_version = TICKERTAPE_HPP_VERSION_NUMBER;
     CHECK(tt::library_compatible());
-    // With a matching library the same calls reach the C ABI.
+    // With a matching library the same calls reach the C ABI. (`retention` was made with the mismatched library, so
+    // it holds that error: make new settings.)
+    CHECK(retention.error() && retention.error()->status() == tt::Status::unsupported_version);
+    const tt::Retention compatible;
     CHECK(tt::verify("unused").has_value() && tt::list_segments("unused").has_value());
-    CHECK(tt::read_checkpoint("unused").has_value() && tt::plan_retention("unused", retention).has_value());
+    CHECK(tt::read_checkpoint("unused").has_value() && tt::plan_retention("unused", compatible).has_value());
     CHECK(stub_inspections == inspections + 5);  // list_segments calls the C function twice (count, then fill)
+}
+
+// The option builders check the library before they create their C handle: with a mismatched library neither they
+// nor their setters call any C function other than the version queries, and the open that uses them reports it.
+static void builders_check_the_library_first() {
+    stub_version = TICKERTAPE_HPP_VERSION_NUMBER + 1;
+    const int calls = stub_calls;
+    {
+        tt::Retention retention;
+        retention.max_segments(1).max_bytes(2).max_age(1s).delete_segments().move_to("unused");
+        tt::WriterOptions writer_options;
+        writer_options.segment_size(65536).recovery_policy(tt::RecoveryPolicy::fail).notify(true).prefault(false);
+        writer_options.retention(retention).no_retention();
+        tt::ReaderOptions reader_options;
+        reader_options.durable_only(true).notify(false).backoff(1, 1, 1us, 2us).busy_spin();
+        for (const std::optional<tt::Error> *error : {&retention.error(), &writer_options.error(), &reader_options.error()}) {
+            CHECK(error->has_value() && (*error)->status() == tt::Status::unsupported_version);
+            CHECK(error->has_value() && (*error)->message().find("stub") != std::string::npos);
+        }
+        CHECK(retention.native_handle() == nullptr && writer_options.native_handle() == nullptr);
+        CHECK(reader_options.native_handle() == nullptr);
+        auto opened = tt::Writer::open("unused", writer_options);
+        CHECK(!opened && opened.error().status() == tt::Status::unsupported_version);
+        tt::WriterOptions moved(std::move(writer_options));  // the error moves with it
+        CHECK(moved.error() && moved.error()->status() == tt::Status::unsupported_version && !writer_options.error());
+        CHECK(!tt::plan_retention("unused", retention));
+    }
+    CHECK(stub_calls == calls);  // nothing but the version queries
+    stub_version = TICKERTAPE_HPP_VERSION_NUMBER;
+    {
+        tt::WriterOptions writer_options;
+        writer_options.segment_size(65536);
+        CHECK(!writer_options.error() && writer_options.native_handle() != nullptr);
+    }
+    CHECK(stub_calls == calls + 3);  // positive control: new, the setter, free
 }
 
 int main() {
     failed_cleanup();
     every_status_and_reason();
     mismatched_library();
+    builders_check_the_library_first();
     if (failures) {
         std::fprintf(stderr, "%d check(s) failed\n", failures);
         return 1;
