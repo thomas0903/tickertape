@@ -29,6 +29,10 @@ capi = []
 # Test-only: the core's failure points (crates/tickertape/src/fault.rs), for the tests of failed clean-ups. Never
 # enable in a library you ship.
 fault-injection = ["tickertape/fault-injection"]
+# Test-only: lets the crate build with `panic = "abort"`, which it otherwise refuses (ADR 0028), for the test that an
+# aborted fill callback needs no unwinding (tests/c_api.rs). Such a library ends the process on a panic instead of
+# returning TICKERTAPE_E_PANIC. Never enable in a library you ship.
+test-panic-abort = []
 
 [dependencies]
 tickertape.workspace = true

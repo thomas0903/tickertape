@@ -139,10 +139,35 @@ fn torn_final_record() {
     assert_sequence(&read_all(dir.path()), 30);
 }
 
+/// How a test gives up on a record inside its fill closure.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Abandon {
+    /// `append_with`'s closure panics.
+    Panic,
+    /// `try_append_with`'s closure returns `Err`.
+    Decline,
+    /// `try_append_with`'s closure panics.
+    PanicInTry,
+}
+
 #[test]
 fn panic_in_fill_then_shorter_append() {
+    abandoned_fill_then_shorter_append(Abandon::Panic);
+}
+
+#[test]
+fn declined_fill_then_shorter_append() {
+    abandoned_fill_then_shorter_append(Abandon::Decline);
+}
+
+#[test]
+fn panic_in_fallible_fill_then_shorter_append() {
+    abandoned_fill_then_shorter_append(Abandon::PanicInTry);
+}
+
+fn abandoned_fill_then_shorter_append(how: Abandon) {
     // C2 / format.md → Abandoned writes: a fill closure writes bytes that form a valid frame for the *next*
-    // sequence number exactly where a shorter record's successor would start, then panics.
+    // sequence number exactly where a shorter record's successor would start, then gives up on the record.
     let dir = tempfile::tempdir().unwrap();
     let mut w = Writer::open(dir.path(), small_config()).unwrap();
     append_n(&mut w, 3);
@@ -150,6 +175,13 @@ fn panic_in_fill_then_shorter_append() {
     for _ in 0..3 {
         r.next_owned().unwrap().unwrap();
     }
+    let (_, path) = segments(dir.path()).pop().unwrap();
+    let file_has_planted_frame = || {
+        std::fs::read(&path)
+            .unwrap()
+            .windows(b"evil".len())
+            .any(|bytes| bytes == b"evil")
+    };
 
     let short_payload = vec![1u8; 8]; // frame 48 bytes, so the next slot starts 48 bytes later
     let next_slot_in_payload = 48 - format::RECORD_HEADER_LEN;
@@ -165,27 +197,63 @@ fn panic_in_fill_then_shorter_append() {
         b"evil",
         &mut fake_body,
     );
-    let result = panic::catch_unwind(AssertUnwindSafe(|| {
-        let rec = NewRecord {
-            schema_id: 0,
-            venue_ts_ns: 0,
-            local_ts_ns: 0,
-            payload: &[],
-        };
-        let _ = w.append_with(&rec, 200, |buf| {
-            buf[next_slot_in_payload..next_slot_in_payload + 4]
-                .copy_from_slice(&fake_len.to_le_bytes());
-            buf[next_slot_in_payload + 4..next_slot_in_payload + 4 + fake_body.len()]
-                .copy_from_slice(&fake_body);
-            panic!("fill failed");
-        });
-    }));
-    assert!(result.is_err());
+    let plant = |buf: &mut [u8]| {
+        buf[next_slot_in_payload..next_slot_in_payload + 4]
+            .copy_from_slice(&fake_len.to_le_bytes());
+        buf[next_slot_in_payload + 4..next_slot_in_payload + 4 + fake_body.len()]
+            .copy_from_slice(&fake_body);
+        // Positive control for the check below: the planted bytes are in the file (shared mapping).
+        assert!(file_has_planted_frame());
+    };
+    let rec = NewRecord {
+        schema_id: 0,
+        venue_ts_ns: 0,
+        local_ts_ns: 0,
+        payload: &[],
+    };
+    match how {
+        Abandon::Panic => {
+            let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                let _ = w.append_with(&rec, 200, |buf| {
+                    plant(buf);
+                    panic!("fill failed");
+                });
+            }));
+            assert!(result.is_err());
+        }
+        Abandon::PanicInTry => {
+            let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                let _ = w.try_append_with(&rec, 200, |buf| -> Result<(), ()> {
+                    plant(buf);
+                    panic!("fill failed");
+                });
+            }));
+            assert!(result.is_err());
+        }
+        Abandon::Decline => {
+            let result = w.try_append_with(&rec, 200, |buf| {
+                plant(buf);
+                Err("declined")
+            });
+            assert!(matches!(result, Ok(Err("declined"))), "{result:?}");
+        }
+    }
+    assert!(w.abandoned_write_error().is_none());
+    assert_eq!(
+        w.next_seq(),
+        3,
+        "the abandoned record used no sequence number"
+    );
+    assert!(
+        !file_has_planted_frame(),
+        "the abandoned bytes are zeroed in the file"
+    );
     assert!(
         r.try_next().unwrap().is_none(),
-        "nothing committed by the panicking append"
+        "nothing committed by the abandoned append"
     );
 
+    // The next append reuses the space: the reader finds it right after record 2.
     let seq = w
         .append(&NewRecord {
             schema_id: 5,
@@ -202,6 +270,40 @@ fn panic_in_fill_then_shorter_append() {
     );
     drop(w);
     assert_eq!(read_all(dir.path()).len(), 4);
+}
+
+#[test]
+fn fallible_fill_is_not_called_when_the_append_fails_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut w = Writer::open(dir.path(), small_config()).unwrap();
+    append_n(&mut w, 2);
+    let max = format::max_payload_len(SMALL_SEGMENT) as usize;
+    let rec = NewRecord {
+        schema_id: 1,
+        venue_ts_ns: 0,
+        local_ts_ns: 0,
+        payload: &[],
+    };
+    let result = w.try_append_with(&rec, max + 1, |_| -> Result<(), ()> {
+        panic!("fill must not be called")
+    });
+    assert!(
+        matches!(result, Err(Error::RecordTooLarge { .. })),
+        "{result:?}"
+    );
+    // A committed fallible fill gets the next sequence number, like `append_with`.
+    let seq = w
+        .try_append_with(&rec, 3, |buf| {
+            buf.copy_from_slice(b"abc");
+            Ok::<(), ()>(())
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(seq, 2);
+    drop(w);
+    let all = read_all(dir.path());
+    assert_eq!(all.len(), 3);
+    assert_eq!(all[2].payload, b"abc");
 }
 
 #[test]

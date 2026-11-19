@@ -158,41 +158,71 @@ fn lib_dir() -> &'static Path {
         if let Ok(dir) = std::env::var("TICKERTAPE_FFI_LIB_DIR") {
             return PathBuf::from(dir);
         }
-        let layout = outer_layout();
-        let target_dir = layout.target_dir.join("ffi-c-api");
-        let profile = match layout.profile_dir.as_str() {
-            "debug" => "dev",
-            name => name,
-        };
-        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-        let mut cmd = Command::new(cargo);
-        cmd.args([
-            "build",
-            "-p",
-            "tickertape-ffi",
-            "--locked",
-            "--profile",
-            profile,
-        ])
-        .arg("--manifest-path")
-        .arg(repo_root().join("Cargo.toml"))
-        .arg("--target-dir")
-        .arg(&target_dir);
-        let mut dir = target_dir.clone();
-        if let Some(triple) = &layout.triple {
-            cmd.args(["--target", triple]);
-            dir.push(triple);
-        }
-        dir.push(&layout.profile_dir);
-        let status = cmd.status().expect("run cargo build");
-        assert!(status.success(), "{cmd:?} failed");
-        assert!(
-            dir.join("libtickertape.a").exists(),
-            "no libtickertape.a in {}",
-            dir.display()
-        );
-        dir
+        build_library("ffi-c-api", &[])
     })
+}
+
+/// The directory with a `libtickertape.a` built with `panic = "abort"` (and the feature `test-panic-abort`, which
+/// lets the crate build that way), as [`lib_dir`] builds its libraries but into `<target-dir>/ffi-c-api-panic-abort`.
+/// Nothing in such a library can unwind: a panic, or a `resume_unwind`, ends the process.
+fn panic_abort_lib_dir() -> &'static Path {
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let profile = cargo_profile();
+        build_library(
+            "ffi-c-api-panic-abort",
+            &[
+                "--features",
+                "test-panic-abort",
+                "--config",
+                &format!("profile.{profile}.panic=\"abort\""),
+            ],
+        )
+    })
+}
+
+/// The Cargo profile of the outer build (`dev` for the `debug` directory).
+fn cargo_profile() -> &'static str {
+    match outer_layout().profile_dir.as_str() {
+        "debug" => "dev",
+        name => name,
+    }
+}
+
+/// Runs `cargo build -p tickertape-ffi --locked` with the outer build's profile and target and the `extra`
+/// arguments into `<target-dir>/<name>`, and returns the directory with the libraries.
+fn build_library(name: &str, extra: &[&str]) -> PathBuf {
+    let layout = outer_layout();
+    let target_dir = layout.target_dir.join(name);
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+    let mut cmd = Command::new(cargo);
+    cmd.args([
+        "build",
+        "-p",
+        "tickertape-ffi",
+        "--locked",
+        "--profile",
+        cargo_profile(),
+    ])
+    .args(extra)
+    .arg("--manifest-path")
+    .arg(repo_root().join("Cargo.toml"))
+    .arg("--target-dir")
+    .arg(&target_dir);
+    let mut dir = target_dir.clone();
+    if let Some(triple) = &layout.triple {
+        cmd.args(["--target", triple]);
+        dir.push(triple);
+    }
+    dir.push(&layout.profile_dir);
+    let status = cmd.status().expect("run cargo build");
+    assert!(status.success(), "{cmd:?} failed");
+    assert!(
+        dir.join("libtickertape.a").exists(),
+        "no libtickertape.a in {}",
+        dir.display()
+    );
+    dir
 }
 
 fn env_flag(name: &str) -> bool {
@@ -699,17 +729,27 @@ fn write_rust_fixture(dir: &Path) {
 #[test]
 fn c_api_basic() {
     for program in [&programs().c_test, &programs().c11_test] {
-        if *program == programs().c_test && static_link_loses_unwind_info(&compiler(false)) {
-            eprintln!(
-                "skipped {}: it links libtickertape.a with the GCC driver on macOS, which passes \
-                 -no_compact_unwind, so an aborted fill ends the process (docs/c-api.md -> Building and linking)",
-                program.display()
-            );
-            continue;
-        }
         let scratch = tempfile::tempdir().unwrap();
         run_ok(command(program).arg("basic").arg(scratch.path()));
     }
+}
+
+/// An aborted fill (a callback that returns non-zero) needs no unwinding inside the library: the whole basic C test,
+/// including its aborted fill (`TICKERTAPE_E_ABORTED`), passes against a static library built with
+/// `panic = "abort"`, in which any unwind ends the process. Before `tickertape_writer_append_with` used the core's
+/// `try_append_with`, the library aborted that append by unwinding, and this program ended at the aborted fill.
+#[test]
+fn aborted_fill_needs_no_unwinding() {
+    let dir = tempfile::tempdir().unwrap();
+    let program = dir.path().join("test_api_panic_abort");
+    let mut cmd = compiler_command("c99", &[]);
+    cmd.arg(manifest_dir().join("tests/c/test_api.c"));
+    cmd.arg(panic_abort_lib_dir().join("libtickertape.a"));
+    cmd.args(static_libs());
+    cmd.arg("-o").arg(&program);
+    run_compiler(&mut cmd);
+    let scratch = tempfile::tempdir().unwrap();
+    run_ok(command(&program).arg("basic").arg(scratch.path()));
 }
 
 /// The C header on its own compiles and works as C++11 and C++20 (ADR 0028), independently of the C++17 binding.
@@ -720,28 +760,11 @@ fn c_header_from_cpp11_and_cpp20() {
     }
 }
 
-/// Whether a program linked statically against `libtickertape.a` by this compiler driver ends the process when the
-/// library aborts a fill (an `append_with` whose fill returns non-zero): on macOS the GCC driver (Homebrew GCC)
-/// passes `-no_compact_unwind` to the linker, so the unwind information the library needs to abort the append
-/// internally is missing, and the process ends inside the library. Apple's toolchain defaults and the shared library
-/// work (docs/c-api.md -> Building and linking).
-fn static_link_loses_unwind_info(tool: &cc::Tool) -> bool {
-    cfg!(target_os = "macos") && tool.is_like_gnu() && !tool.is_like_clang()
-}
-
 /// The C++ binding's whole surface against the real library, as C++17, C++20 and C++17 without exceptions.
 #[test]
 fn cpp_binding() {
     let p = programs();
     for program in [&p.binding, &p.binding_cpp20, &p.binding_no_exceptions] {
-        if *program == p.binding_cpp20 && static_link_loses_unwind_info(&compiler(true)) {
-            eprintln!(
-                "skipped {}: it links libtickertape.a with the GCC driver on macOS, which passes \
-                 -no_compact_unwind, so an aborted fill ends the process (docs/c-api.md -> Building and linking)",
-                program.display()
-            );
-            continue;
-        }
         let scratch = tempfile::tempdir().unwrap();
         run_ok(command(program).arg(scratch.path()));
     }

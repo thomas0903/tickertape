@@ -10,10 +10,11 @@
 
 #![warn(missing_docs)]
 
-#[cfg(panic = "abort")]
+// The feature `test-panic-abort` lifts this check for one test only (tests/c_api.rs), which shows that an aborted
+// fill needs no unwinding.
+#[cfg(all(panic = "abort", not(feature = "test-panic-abort")))]
 compile_error!(
-    "tickertape-ffi needs panic = \"unwind\": it reports caught panics as TICKERTAPE_E_PANIC and aborts fill \
-     callbacks by unwinding (ADR 0028)"
+    "tickertape-ffi needs panic = \"unwind\": it reports caught panics as TICKERTAPE_E_PANIC (ADR 0028)"
 );
 
 mod args;

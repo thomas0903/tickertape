@@ -185,9 +185,9 @@ nothing about when bytes reach the disk; see `crash-contract.md`.
 
 ### Abandoned writes
 
-If the writer starts writing a body and then does not commit it (a panic inside the caller's fill closure), it zeroes
-every byte it may have written and makes that zeroing durable (`msync`, a data sync and the platform barrier) before
-anything else is appended. If that fails, the writer refuses further appends and checkpoints and reports why
+If the writer starts writing a body and then does not commit it (the caller's fill closure panics, or declines through
+`Writer::try_append_with`), it zeroes every byte it may have written and makes that zeroing durable (`msync`, a data
+sync and the platform barrier) before anything else is appended. If that fails, the writer refuses further appends and checkpoints and reports why
 (`Writer::abandoned_write_error`). Treat that as a storage incident, like a failed checkpoint (`crash-contract.md` →
 Errors are sticky): a new writer opened in the same boot accepts appends again, but recovery may see the zeroed bytes
 in the page cache while the disk still holds the stale ones, so nothing is guaranteed about the records written since

@@ -5,6 +5,19 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
+- Library: `Writer::try_append_with(&mut self, record, payload_len, fill)`, a zero-copy append whose closure
+  (`FnOnce(&mut [u8]) -> Result<(), E>`) can decline the record by returning `Err(e)`; the call then returns
+  `Ok(Err(e))` (journal errors stay in the outer `Result<_, tickertape::Error>`). Declining does what a panic in an
+  `append_with` closure does (nothing committed, the bytes zeroed and the zeroing synced, the writer stopped with
+  `abandoned_write_error` if that sync fails) without unwinding (ADR 0039). `append_with` and `append` now go through
+  it; a panic in either closure behaves as before.
+- C ABI: `tickertape_writer_append_with` aborts an append whose `fill` returns non-zero through `try_append_with`,
+  without unwinding inside the library (ADR 0039). Its signature, status codes and documented behaviour are
+  unchanged. Before, `libtickertape.a` linked by the GCC driver on macOS (Homebrew GCC, which passes
+  `-no_compact_unwind`) ended the process at the first aborted fill; that link now works, and the tests no longer skip
+  it. A Rust panic inside the library still unwinds (`TICKERTAPE_E_PANIC`). A test builds the static library with
+  `panic = "abort"` (test-only feature `test-panic-abort`) and runs the C tests, including an aborted fill, against
+  it.
 - C++ binding (ADR 0036, `docs/cpp-api.md`): `crates/tickertape-ffi/include/tickertape.hpp`, a header-only C++17
   wrapper over the C ABI, shipped and installed (`cargo cinstall`) next to `tickertape.h`. It covers the whole C ABI:
   move-only `Writer`, `Reader`, option builders and `RecordBatch`; copying, zero-copy (a lambda) and batch appends
