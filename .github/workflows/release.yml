@@ -211,7 +211,8 @@ jobs:
           sbom-path: dist/${{ env.FILE_STEM }}.cdx.json
 
   publish:
-    needs: [prepare, build]
+    # After `attest`: publishing a crate cannot be undone, so every step that can fail without publishing runs first.
+    needs: [prepare, build, attest]
     if: needs.prepare.outputs.publish == 'true' || inputs.verify_publishing
     runs-on: ubuntu-22.04
     environment: release
