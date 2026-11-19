@@ -115,6 +115,17 @@ pub struct Report {
     pub already_removed_segments: u64,
 }
 
+impl Report {
+    /// Adds another report's counts to this one (saturating).
+    pub(crate) fn absorb(&mut self, other: &Report) {
+        self.removed_segments = self.removed_segments.saturating_add(other.removed_segments);
+        self.removed_bytes = self.removed_bytes.saturating_add(other.removed_bytes);
+        self.already_removed_segments = self
+            .already_removed_segments
+            .saturating_add(other.already_removed_segments);
+    }
+}
+
 /// Plans eligible removals without changing files or taking the writer lock.
 ///
 /// Only a contiguous sealed prefix strictly before a valid checkpoint segment qualifies. Age uses wall clock

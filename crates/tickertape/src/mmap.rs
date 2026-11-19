@@ -218,6 +218,37 @@ impl MapRw {
     pub(crate) fn sync_range(&self, offset: u64, len: u64) -> io::Result<()> {
         msync(self.ptr, self.len, offset, len)
     }
+
+    /// A handle that can `msync` ranges of this mapping from another thread while the writer keeps storing into it,
+    /// and keeps the mapping alive while it lives (ADR 0038).
+    pub(crate) fn flush_handle(&self) -> Flush {
+        Flush {
+            region: Arc::clone(&self.region),
+        }
+    }
+}
+
+/// Writes back ranges of a writer mapping from any thread (the background checkpoint, ADR 0038). Like [`Advice`], it
+/// never reads or writes the mapped bytes, and it keeps the mapping alive while it exists.
+///
+/// Why `msync` on one thread while the writer stores into the same pages on another is sound: `msync` passes an
+/// address range to the kernel and creates no reference into the mapping, so in Rust's terms this thread accesses no
+/// memory at all, and the writer's `&mut` slices stay the only access from this process. What the kernel writes to the
+/// file is whatever the pages hold when it copies them: every byte the writer stored before the checkpoint was
+/// requested (ordered before the `msync` by the hand-over of the request between the threads), and, for bytes stored
+/// during the call, old or new contents in any mixture. The checkpoint marker names only positions before the request,
+/// so the bytes written during the call are never claimed durable; they are records not covered by a checkpoint
+/// (`docs/crash-contract.md`, C8).
+#[derive(Debug, Clone)]
+pub(crate) struct Flush {
+    region: Arc<Region>,
+}
+
+impl Flush {
+    /// `msync(MS_SYNC)` on the pages covering `[offset, offset + len)` of the mapping.
+    pub(crate) fn sync_range(&self, offset: u64, len: u64) -> io::Result<()> {
+        msync(self.region.ptr, self.region.len, offset, len)
+    }
 }
 
 /// Asks the kernel to fault in part of a writer mapping ahead of the writer (ADR 0020), from any thread. It never
@@ -608,6 +639,14 @@ impl Notify {
             | u64::from(self.word(NOTIFY_NONCE_HI).load(Ordering::SeqCst)) << 32
     }
 
+    /// Writer: a handle that publishes on this region from another thread (the background checkpoint, ADR 0038). It
+    /// keeps the region mapped while it lives; clearing the writer flag stays with this `Notify`'s drop.
+    pub(crate) fn publisher(&self) -> NotifyPublisher {
+        NotifyPublisher {
+            region: Arc::clone(&self.map.region),
+        }
+    }
+
     /// Reader: whether the writer that created the region still maintains the counter.
     pub(crate) fn writer_notifies(&self) -> bool {
         self.word(NOTIFY_WRITER_FLAG).load(Ordering::SeqCst) != 0
@@ -655,6 +694,34 @@ impl Notify {
                 Ok(_) => break,
                 Err(actual) => current = actual,
             }
+        }
+    }
+}
+
+/// Publishes on the writer's wake-up region from another thread ([`Notify::publisher`]): the same event-count step as
+/// [`Notify::publish`], so the writer's own handle, and its appends, are unchanged.
+#[derive(Debug, Clone)]
+pub(crate) struct NotifyPublisher {
+    region: Arc<Region>,
+}
+
+impl NotifyPublisher {
+    fn word(&self, offset: u64) -> &AtomicU32 {
+        let off = checked_word(self.region.len, offset)
+            .unwrap_or_else(|| unreachable!("notify offsets are in bounds"));
+        // SAFETY: as in `MapRw::word`: `off` is 8-aligned and `[off, off + 4)` lies inside the region, which stays mapped
+        // and writable while `self.region` lives (the returned reference borrows `self`). The region's words are only
+        // ever accessed atomically, by this process (`Notify`, this handle) and by readers in others; nothing creates a
+        // non-atomic reference into a notify region.
+        unsafe { AtomicU32::from_ptr(self.region.ptr.as_ptr().add(off).cast::<u32>()) }
+    }
+
+    /// Bumps the event counter and wakes blocked readers if any, as [`Notify::publish`] does.
+    pub(crate) fn publish(&self) {
+        let event = self.word(NOTIFY_EVENT);
+        event.fetch_add(1, Ordering::SeqCst);
+        if self.word(NOTIFY_WAITERS).load(Ordering::SeqCst) != 0 {
+            wake_all(event);
         }
     }
 }

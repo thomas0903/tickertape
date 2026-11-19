@@ -7,10 +7,14 @@
 //! the commit word. The reader does what the zero-copy reader does: a `Relaxed` load of the commit word, an `Acquire`
 //! fence if it is non-zero, then ordinary reads of the body. Loom fails the test if any interleaving lets the reader
 //! read a body concurrently with its writing, or see a committed word without the body it publishes.
+//!
+//! Since ADR 0038 a background checkpoint stores the checkpoint marker on the writer's checkpoint thread, not on the
+//! thread that committed the records it covers; [`marker_stored_by_the_checkpoint_thread_covers_only_committed_records`]
+//! models that hand-over.
 
 use loom::cell::UnsafeCell;
-use loom::sync::Arc;
 use loom::sync::atomic::{AtomicU32, Ordering, fence};
+use loom::sync::{Arc, Mutex};
 use loom::thread;
 
 const SLOTS: usize = 3;
@@ -166,5 +170,50 @@ fn single_pass_validation_after_the_fence_always_passes() {
             );
         }
         w.join().unwrap();
+    });
+}
+
+/// ADR 0038: the writer commits records, then hands the frontier (the next slot) to the checkpoint thread through a
+/// mutex, as `Writer::request_checkpoint` hands over a job, and keeps appending; the checkpoint thread stores the marker
+/// (here an atomic with release; in the journal a `pwrite` that a durable-only reader reads back). A durable-only reader
+/// that loads the marker and then reads every slot below it must find each one committed with its body, in every
+/// interleaving with the appends that continue meanwhile.
+#[test]
+fn marker_stored_by_the_checkpoint_thread_covers_only_committed_records() {
+    loom::model(|| {
+        let j = Arc::new(Journal::new());
+        let requested = Arc::new(Mutex::new(None::<u32>));
+        let marker = Arc::new(AtomicU32::new(0));
+        let writer = {
+            let (j, requested) = (j.clone(), requested.clone());
+            thread::spawn(move || {
+                j.append(0, 11);
+                *requested.lock().unwrap() = Some(1);
+                j.append(1, 22);
+                j.append(2, 33);
+            })
+        };
+        let checkpointer = {
+            let (requested, marker) = (requested.clone(), marker.clone());
+            thread::spawn(move || {
+                loop {
+                    if let Some(next) = *requested.lock().unwrap() {
+                        marker.store(next, Ordering::Release);
+                        break;
+                    }
+                    thread::yield_now();
+                }
+            })
+        };
+        let covered = marker.load(Ordering::Acquire);
+        for slot in 0..covered as usize {
+            assert!(
+                j.read(slot).is_some(),
+                "the marker covers slot {slot}, which the reader found empty"
+            );
+        }
+        writer.join().unwrap();
+        checkpointer.join().unwrap();
+        assert_eq!(marker.load(Ordering::Acquire), 1);
     });
 }

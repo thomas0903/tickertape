@@ -95,3 +95,7 @@ path = "soak.rs"
 [[test]]
 name = "committed_tail"
 path = "committed_tail.rs"
+
+[[test]]
+name = "background_checkpoint"
+path = "background_checkpoint.rs"
