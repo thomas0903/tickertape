@@ -260,7 +260,10 @@ impl Reader {
     /// call [`Reader::seek`] to continue on the current chain. A removal is never reported as corruption or as an
     /// I/O "not found" error.
     /// [`Error::Corrupt`] with [`CorruptReason::BrokenChain`] if the segment at the cursor is sealed and still in
-    /// place but the next segment is missing.
+    /// place but the next segment is missing. When the next segment is not found, the reader first reads the seal
+    /// again from the file: if the seal is gone (a repair in place can remove one the reader had read or buffered,
+    /// crash contract C11), it reads the slot as it is now; if it is still there, it tries the next segment once
+    /// more and reports the broken chain only if that misses too. A later call tries again.
     /// [`Error::Io`] if the next segment can't be opened, if checking whether the segment is still in place fails
     /// other than with "not found" (only that counts as a removal), or (with kind
     /// [`OutOfMemory`](std::io::ErrorKind::OutOfMemory)) if the read buffer for the frame at the cursor can't be
@@ -548,6 +551,10 @@ impl Reader {
     }
 
     /// Moves from the seal at the cursor to the next segment, checking that the segment at the cursor is still in place.
+    ///
+    /// Returns `Ok(())` without moving if the successor is missing and the slot at the cursor no longer holds the
+    /// seal: `next_slot` then reads the slot again, and `leave_superseded_segment` lets its caller report that
+    /// nothing is readable yet.
     fn follow_seal(&mut self) -> Result<()> {
         self.check_identity()?;
         crate::fault::hook(crate::fault::Point::ReaderSeal);
@@ -555,14 +562,38 @@ impl Reader {
             Ok(next) => next,
             Err(e) if e.is_not_found() => {
                 // Retention removes the oldest segment first, so a successor it removed means this segment is gone
-                // too: that is discarded history. A successor missing while this segment is still in place is a
-                // broken chain.
+                // too: that is discarded history.
                 self.check_identity()?;
-                return Err(Error::corrupt(
-                    &self.seg.path,
-                    self.offset,
-                    CorruptReason::BrokenChain(self.next_seq),
-                ));
+                // The seal may no longer be in this file, which kept its identity. The `pread` buffer can hold a seal
+                // that recovery has since zeroed in place, quarantining the successor (a seal whose marker storage
+                // damage emptied, with a successor that no longer opens: crash contract C11, ADR 0035 → Damage around
+                // a seal); a mapped reader can load the seal just before that repair. Read the slot again from the
+                // file: if the seal is gone, return to the caller, which reads that slot as it is now. The re-read
+                // skips the buffer anyway; the buffer is dropped for the caller's sake, because a re-read that finds
+                // an empty word does not refill it, and the caller's next read would take the stale seal from it
+                // again and come back here without end.
+                self.buf.clear();
+                crate::fault::hook(crate::fault::Point::ReaderSealReread);
+                if !matches!(self.read_slot(true)?, SlotOutcome::Seal) {
+                    return Ok(());
+                }
+                // The seal is in the file now. A live writer stores a seal only after linking the successor, so a
+                // successor linked since the first attempt (a writer that recovered in between and rolled again)
+                // opens now. Missing while this segment is still in place, it is a broken chain. (One report can
+                // still be transient: a recovery that replaces a successor whose header is damaged keeps the seal,
+                // moves that successor to quarantine and then creates a new one; the next call follows it.)
+                match open_segment(&self.dir, self.next_seq, self.mapped) {
+                    Ok(next) => next,
+                    Err(e) if e.is_not_found() => {
+                        self.check_identity()?;
+                        return Err(Error::corrupt(
+                            &self.seg.path,
+                            self.offset,
+                            CorruptReason::BrokenChain(self.next_seq),
+                        ));
+                    }
+                    Err(e) => return Err(e),
+                }
             }
             Err(e) => return Err(e),
         };
@@ -655,10 +686,12 @@ impl Reader {
             .min(self.seg.size.saturating_sub(offset));
         resize_buf(&mut self.buf, len)
             .map_err(|e| Error::io("allocate read buffer", &self.seg.path, e))?;
-        self.seg
-            .file
-            .read_exact_at(&mut self.buf, offset)
-            .map_err(|e| Error::io("read segment", &self.seg.path, e))?;
+        if let Err(e) = self.seg.file.read_exact_at(&mut self.buf, offset) {
+            // The buffer now holds whatever was read, under the previous `buf_start`: drop it, so that the next
+            // call reads from the file.
+            self.buf.clear();
+            return Err(Error::io("read segment", &self.seg.path, e));
+        }
         self.buf_start = offset;
         Ok(())
     }
