@@ -9,7 +9,9 @@ use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::pybacked::PyBackedBytes;
 use pyo3::sync::MutexExt;
-use pyo3::types::{PyByteArray, PyBytes, PyInt, PyList, PyMemoryView, PyRange, PyString, PyTuple};
+use pyo3::types::{
+    PyByteArray, PyBytes, PyInt, PyList, PyMemoryView, PyRange, PyString, PyTuple, PyType,
+};
 use tickertape::{NewRecord, WriterConfig};
 
 use crate::config::{self, Retention};
@@ -129,18 +131,37 @@ impl<T: Copy + for<'a, 'py> FromPyObject<'a, 'py>> Column<T> {
 }
 
 /// The error for a metadata argument that `iter()` refused: the exception that its type's `__iter__` raised,
-/// unchanged (it may be `KeyboardInterrupt`), or a `TypeError` naming the argument if the type has no `__iter__` and
-/// so is not iterable at all (`iter()` never fails for a type with `__getitem__` alone).
+/// unchanged (it may be `KeyboardInterrupt`), or a `TypeError` naming the argument if the interpreter does not
+/// consider the type iterable at all (see `is_iterable_type`). If that cannot be decided, the original exception.
 fn not_iterable(obj: &Bound<'_, PyAny>, error: PyErr, name: &str) -> PyErr {
-    let has_iter = obj
-        .get_type()
-        .getattr("__iter__")
-        .is_ok_and(|method| !method.is_none());
-    if has_iter {
-        error
-    } else {
-        PyTypeError::new_err(format!("{name} must be an int or a sequence of ints"))
+    match is_iterable_type(&obj.get_type()) {
+        Ok(false) => PyTypeError::new_err(format!("{name} must be an int or a sequence of ints")),
+        Ok(true) | Err(_) => error,
     }
+}
+
+/// Whether `iter()` accepts instances of `ty`, decided as the interpreter decides it: from the type's iterator slot
+/// (`tp_iter`), or without one from its sequence item slot (`iter()` then iterates by index). The interpreter fills
+/// those slots from `__iter__` and `__getitem__` in the dictionaries of the type and its bases (`__iter__ = None`
+/// fills `tp_iter` with a slot that refuses), so this reads those dictionaries along the MRO, through `type`'s own
+/// descriptors: an attribute lookup on the type would go through its metaclass, which can hide or invent names.
+fn is_iterable_type(ty: &Bound<'_, PyType>) -> PyResult<bool> {
+    let type_dict = ty.py().get_type::<PyType>().getattr("__dict__")?;
+    let mro = type_dict
+        .get_item("__mro__")?
+        .call_method1("__get__", (ty,))?;
+    let dict_of = type_dict.get_item("__dict__")?;
+    let mut has_item = None;
+    for base in mro.try_iter()? {
+        let dict = dict_of.call_method1("__get__", (base?,))?;
+        if dict.contains("__iter__")? {
+            return Ok(!dict.get_item("__iter__")?.is_none());
+        }
+        if has_item.is_none() && dict.contains("__getitem__")? {
+            has_item = Some(!dict.get_item("__getitem__")?.is_none());
+        }
+    }
+    Ok(has_item.unwrap_or(false))
 }
 
 /// Refuses a `payloads` argument that is itself one payload: `str` or any bytes-like object (iterating it would
@@ -454,8 +475,10 @@ impl Writer {
         self.owner.set_pid_for_testing(pid);
     }
 
-    /// Test only: locks this handle's mutex and never unlocks it, as if a thread had been inside a call when the
-    /// process forked. In this process every later call that needs the lock then waits forever.
+    /// Test only (feature `test-hooks`): locks this handle's mutex and never unlocks it, as if a thread had been
+    /// inside a call when the process forked. In this process every later call that needs the lock then waits
+    /// forever.
+    #[cfg(feature = "test-hooks")]
     fn _lock_forever_for_testing(&self, py: Python<'_>) {
         std::mem::forget(lock(py, &self.inner));
     }

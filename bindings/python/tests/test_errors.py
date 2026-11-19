@@ -238,8 +238,24 @@ def test_every_exception_survives_pickle_with_its_attributes() -> None:
             assert (copy.errno, copy.strerror, copy.filename) == (28, os.strerror(28), Path("/journal"))
 
 
+class UnprintableStr(str):
+    """A `str` whose `__str__` raises."""
+
+    def __str__(self) -> str:
+        raise RuntimeError("no str for you")
+
+
 def test_pickle_tolerates_deleted_attributes() -> None:
     """Deleting any attribute, on any exception class, does not break pickling; the copy lacks it too."""
+    # With the message deleted, the copy's arguments come from the original's: a str is copied without calling a
+    # subclass's __str__, and anything else is replaced by a fixed text.
+    for message, expected in ((UnprintableStr("message text"), "message text"), (b"bytes", "(message deleted)")):
+        original = tt.TickertapeError("placeholder")
+        original.args = (message,)
+        del original.message
+        copy = pickle.loads(pickle.dumps(original))
+        assert type(copy) is tt.TickertapeError and not hasattr(copy, "message")
+        assert copy.args == (expected,) and type(copy.args[0]) is str
     checked = 0
     for name in tt._errors.__all__:
         cls = getattr(tt, name)

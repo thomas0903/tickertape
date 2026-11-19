@@ -7,11 +7,13 @@ import datetime
 import inspect
 import itertools
 import math
+import os
 import sys
 import threading
 import time
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -417,14 +419,29 @@ def test_append_many_propagates_the_exception_of_a_metadata_objects_iter(journal
         def __iter__(self) -> Iterator[int]:
             raise self.error
 
+    class HidesIter(type):
+        """A metaclass that hides `__iter__` from attribute lookup on its classes (the slot still works)."""
+
+        def __getattribute__(cls, name: str) -> Any:
+            if name == "__iter__":
+                raise AttributeError(name)
+            return super().__getattribute__(name)
+
+    class HiddenUnreadable(Unreadable, metaclass=HidesIter):
+        pass
+
+    class NotIterable:
+        __iter__ = None
+
     with tt.Writer(journal) as w:
         for error in (KeyboardInterrupt(), RuntimeError("no values today"), TypeError("not like this")):
-            for name in ("schema_id", "venue_ts_ns", "local_ts_ns"):
-                with pytest.raises(type(error)) as caught:
-                    w.append_many([b"a", b"b"], **{name: Unreadable(error)})
-                assert caught.value is error
+            for cls in (Unreadable, HiddenUnreadable):
+                for name in ("schema_id", "venue_ts_ns", "local_ts_ns"):
+                    with pytest.raises(type(error)) as caught:
+                        w.append_many([b"a", b"b"], **{name: cls(error)})
+                    assert caught.value is error
         # An object that is not iterable at all still gets the TypeError that names the argument.
-        for value in (object(), 1.5):
+        for value in (object(), 1.5, NotIterable()):
             with pytest.raises(TypeError, match="venue_ts_ns must be an int or a sequence of ints"):
                 w.append_many([b"a"], venue_ts_ns=value)  # type: ignore[arg-type]
         assert w.next_seq == 0
@@ -649,21 +666,21 @@ def test_two_threads_share_one_reader(journal: Path) -> None:
     assert seen["next"] and seen["many"]
 
 
-RETAINED_CAPACITY = 1 << 20  # `RETAINED_CAPACITY` in src/reader.rs
+RETAINED_CAPACITY = 6 << 20  # `RETAINED_CAPACITY` in src/reader.rs
 
 
 @pytest.mark.parametrize("call", ["read_batch", "read_many", "next"])
 def test_an_idle_reader_does_not_keep_a_large_delivered_batch(journal: Path, call: str) -> None:
     with tt.Writer(journal, segment_size=64 << 20) as w:
         w.append_many([bytes([i % 251]) * 4096 for i in range(2048)])  # 8 MiB
-        w.append(b"z" * (4 << 20))  # one 4 MiB record
+        w.append(b"z" * (8 << 20))  # one 8 MiB record
         w.append_many([b"small"] * 300)
     with tt.Reader(journal) as r:
         capacity = getattr(r, "_staging_capacity_for_testing")  # a test hook, not in the stubs
         if call == "next":
             r.seek(2048)
             record = r.next(timeout=0)
-            assert record is not None and len(record.payload) == 4 << 20
+            assert record is not None and len(record.payload) == 8 << 20
         else:
             got = getattr(r, call)(2048)
             assert len(got) == 2048
@@ -675,3 +692,54 @@ def test_an_idle_reader_does_not_keep_a_large_delivered_batch(journal: Path, cal
         assert 0 < kept <= RETAINED_CAPACITY
         assert len(r.read_batch(100)) == 100
         assert capacity() == kept
+
+
+@pytest.mark.parametrize("payload_len", [64, 200])
+def test_common_batches_reuse_their_staging_buffer(journal: Path, payload_len: int) -> None:
+    """`read_batch(10_000)` keeps its staging buffer for the next call instead of allocating a new one each time."""
+    with tt.Writer(journal, segment_size=64 << 20) as w:
+        w.append_many([bytes([i % 251]) * payload_len for i in range(50_000)])
+    with tt.Reader(journal) as r:
+        capacity = getattr(r, "_staging_capacity_for_testing")  # a test hook, not in the stubs
+        assert len(r.read_batch(10_000)) == 10_000
+        kept = capacity()
+        assert 10_000 * (36 + payload_len) <= kept <= RETAINED_CAPACITY
+        for _ in range(3):
+            assert len(r.read_batch(10_000)) == 10_000
+            assert capacity() == kept
+
+
+def native_threads() -> int:
+    """The number of OS threads in this process (not only the ones `threading` knows about)."""
+    if sys.platform == "linux":
+        return len(os.listdir("/proc/self/task"))
+    if sys.platform == "darwin":
+        import ctypes
+        info = ctypes.create_string_buffer(96)  # struct proc_taskinfo
+        libproc = ctypes.CDLL("/usr/lib/libproc.dylib")
+        assert libproc.proc_pidinfo(os.getpid(), 4, 0, info, 96) == 96  # PROC_PIDTASKINFO
+        return int.from_bytes(info.raw[84:88], "little")  # pti_threadnum
+    pytest.skip("counts threads only on Linux and macOS")
+
+
+@pytest.mark.parametrize("call", ["read_batch", "read_many", "next"])
+def test_freeing_a_large_delivered_batch_starts_no_thread(journal: Path, call: str) -> None:
+    """A reader frees a staging buffer too large to keep before the read returns, in the calling thread.
+
+    A thread that freed it would usually be gone when the count is taken, so the read is repeated: a binding that
+    starts one per read is caught with near certainty (an earlier version was, in every trial, within 70 reads).
+    """
+    with tt.Writer(journal, segment_size=64 << 20) as w:
+        w.append_many([b"x" * 7168] * 1024)  # 7 MiB: more than RETAINED_CAPACITY
+        w.append(b"y" * (7 << 20))
+    with tt.Reader(journal) as r:
+        before = native_threads()
+        for attempt in range(200):
+            if call == "next":
+                r.seek(1024)
+                record = r.next(timeout=0)
+                assert record is not None and len(record.payload) == 7 << 20
+            else:
+                r.seek(0)
+                assert len(getattr(r, call)(1024)) == 1024
+            assert native_threads() == before, f"a thread was running after read {attempt}"

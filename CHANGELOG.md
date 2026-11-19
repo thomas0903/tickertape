@@ -5,21 +5,24 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
-- Python: installable bindings (`bindings/python/`, PyPI name `tickertape`, not yet published; ADR 0029). `Writer`
-  and `Reader` classes over the Rust library with batch appends and reads that cross the language boundary once,
-  explicit partial-failure reporting (`BatchAppendError`), columnar `RecordBatch` output for NumPy, pyarrow and pandas
-  (all optional), durable-only reads, interruptible waits that release the GIL, an exception for every error variant,
-  and type stubs. Records are copied into `bytes`; the zero-copy mapped reader is not exposed. One abi3 wheel per
-  platform for CPython 3.11+; a wheel workflow builds manylinux, musllinux and macOS wheels and an sdist, with a
-  Trusted Publishing step that stays off until PyPI is configured. The pure-Python decoder in `python/` is unchanged.
-  Handles refuse use in a forked child (`UsedAfterForkError`, also after process-id reuse), and closing them there
-  releases the child's copies of the descriptors and mappings, so the journal can be reopened while the child runs
-  (a handle that another thread was using at the fork is never released there); a waiting read holds its reader only
-  for 50 ms slices, so signal handlers and other threads can use or close it; a read delivers its records only once
-  its Python result is complete and no signal is pending, so a record staged when Ctrl-C arrives (also while a large
-  result is built, or while the read waits for another thread to deliver) is returned by the next read; an idle
-  reader keeps at most about 1 MiB of staging buffer; the writer's reports are named tuples; every exception survives
-  `pickle` with its current attribute values, also after an attribute was deleted.
+- Python: installable bindings (`bindings/python/`, PyPI name `tickertape`, not yet published; ADR 0029). `Writer` and
+  `Reader` classes over the Rust library with batch appends and reads that cross the language boundary once, explicit
+  partial-failure reporting (`BatchAppendError`), columnar `RecordBatch` output for NumPy, pyarrow and pandas (all
+  optional), durable-only reads, interruptible waits that release the GIL, an exception for every error variant, and
+  type stubs. Records are copied into `bytes`; the zero-copy mapped reader is not exposed. One abi3 wheel per platform
+  for CPython 3.11+; a wheel workflow builds manylinux, musllinux and macOS wheels and an sdist, with a Trusted
+  Publishing step that stays off until PyPI is configured. The pure-Python decoder in `python/` is unchanged. Handles
+  refuse use in a forked child (`UsedAfterForkError`, also after process-id reuse), and closing them there releases
+  the child's copies of the descriptors and mappings, so the journal can be reopened while the child runs (a handle
+  that another thread was using at the fork is never released there); a waiting read holds its reader only for 50 ms
+  slices, so signal handlers and other threads can use or close it; a read delivers its records only once its Python
+  result is complete and no signal is pending, so a record staged when Ctrl-C arrives (also while a large result is
+  built, or while the read waits for another thread to deliver) is returned by the next read; a read that a signal
+  handler interrupted to fork raises `UsedAfterForkError` in the child instead of waiting for the reader's lock; an
+  idle reader keeps at most 6 MiB of staging buffer (enough for `read_batch(10_000)` to reuse it), and a larger one is
+  freed with the GIL released before the read returns; the test-only methods that can wedge a handle exist only in
+  builds with the `test-hooks` feature, not in release wheels; the writer's reports are named tuples; every exception
+  survives `pickle` with its current attribute values, also after an attribute was deleted.
 - Core: `Reader::next_timeout` no longer panics for a timeout too large to add to `Instant::now()` (it waits
   forever), and the reader's back-off no longer panics when doubling a sleep near `Duration::MAX`.
 - Core: new `Writer::release_after_fork`, only for a writer inherited across `fork` and only in the child: closes the

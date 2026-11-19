@@ -113,23 +113,31 @@ jobs:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux }}
           args: --release --locked --out dist -m bindings/python/Cargo.toml
-      - name: Smoke-test the wheel on the runner (end-to-end example, oldest and newest Python)
+      # The release wheel is built without the `test-hooks` feature: the test suite runs against it as shipped, and
+      # the tests that need the hooks skip (ADR 0029).
+      - name: Test the wheel on the runner (test suite and end-to-end example, oldest and newest Python)
         if: matrix.platform != 'musllinux'
         run: |
           for python in python3.11 python3.15; do
             "$python" -m venv "$RUNNER_TEMP/venv-$python"
-            "$RUNNER_TEMP/venv-$python/bin/python" -m pip install dist/*.whl
+            "$RUNNER_TEMP/venv-$python/bin/python" -m pip install dist/*.whl pytest
+            "$RUNNER_TEMP/venv-$python/bin/python" -c \
+              'import tickertape as tt; assert not hasattr(tt.Reader, "_race_commit_for_testing"), "test hooks in a release wheel"'
+            (cd bindings/python && TMPDIR="$RUNNER_TEMP" "$RUNNER_TEMP/venv-$python/bin/python" -m pytest -p no:cacheprovider)
             "$RUNNER_TEMP/venv-$python/bin/python" bindings/python/examples/end_to_end.py "$RUNNER_TEMP/journal-$python"
           done
-      - name: Smoke-test the musllinux wheel in Alpine (end-to-end example)
+      - name: Test the musllinux wheel in Alpine (test suite and end-to-end example)
         if: matrix.platform == 'musllinux'
         run: |
           # Multi-arch index digests, pinned like the actions; update them together with the tags.
           for image in \
               python:3.11-alpine@sha256:7fbad8e4652eae0186429a6f26cf5b23e27e8c6fd7ac4d0cfd7a6988cdeea1e1 \
               python:3.15-alpine@sha256:0f9552bb28711333da16915ec146f5e6bb44a7fdac9ced15dc17c2e0206346dd; do
-            docker run --rm -v "$PWD:/src:ro" -w /src "$image" sh -ec \
-              'python -m venv /tmp/venv && /tmp/venv/bin/pip install dist/*.whl && /tmp/venv/bin/python bindings/python/examples/end_to_end.py /tmp/journal'
+            docker run --rm -v "$PWD:/src:ro" -w /src "$image" sh -ec '
+              python -m venv /tmp/venv && /tmp/venv/bin/pip install dist/*.whl pytest
+              /tmp/venv/bin/python -c "import tickertape as tt; assert not hasattr(tt.Reader, \"_race_commit_for_testing\")"
+              cd bindings/python && /tmp/venv/bin/python -m pytest -p no:cacheprovider && cd /src
+              /tmp/venv/bin/python bindings/python/examples/end_to_end.py /tmp/journal'
           done
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

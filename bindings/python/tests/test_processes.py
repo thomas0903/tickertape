@@ -15,7 +15,7 @@ from pathlib import Path
 import pytest
 
 import tickertape as tt
-from helpers import SMALL_SEGMENT, append_pattern, pattern_tuple
+from helpers import SMALL_SEGMENT, append_pattern, needs_test_hooks, pattern_tuple
 
 FOLLOWER = textwrap.dedent("""
     import hashlib, json, sys
@@ -800,6 +800,7 @@ SIGNAL_DURING_DELIVERY = """
 """
 
 
+@needs_test_hooks
 @pytest.mark.parametrize("call", ["try_next", "iter", "next", "read_many", "read_batch"])
 def test_signal_while_a_read_waits_to_deliver_consumes_nothing(journal: Path, call: str) -> None:
     runs = int(os.environ.get("TICKERTAPE_DELIVERY_RUNS", "20"))
@@ -858,6 +859,7 @@ FORKED_WHILE_BUSY = """
 """
 
 
+@needs_test_hooks
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="needs fork")
 def test_handle_busy_at_fork_is_never_released_in_the_child(journal: Path) -> None:
     result = json.loads(run_script(FORKED_WHILE_BUSY, journal))
@@ -927,3 +929,86 @@ FORKED_DURING_CALLS = """
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="needs fork")
 def test_fork_while_threads_are_inside_calls(journal: Path) -> None:
     assert run_script(FORKED_DURING_CALLS, journal, timeout=60).strip() == "[0, 0, 0, 0, 0]"
+
+
+# A signal handler forks during a read while another thread holds the reader's lock. The child resumes the read where
+# the handler returned; the lock stays held there for ever, because its holder exists only in the parent. The read
+# must raise UsedAfterForkError in the child instead of waiting for that lock. "deliver": the handler runs while the
+# read retries the lock to deliver a built result, and the race hook's thread holds the lock until the read stops
+# retrying. "wait": the handler runs between two wait slices of a blocking read, after a thread has taken the lock and
+# kept it (as a thread inside a call would hold it at the fork). A watchdog kills a child that has not finished within
+# 10 s.
+FORK_IN_HANDLER = """
+    import os, signal, sys, threading, time, warnings
+    import tickertape as tt
+
+    warnings.simplefilter("ignore", DeprecationWarning)  # "use of fork() may lead to deadlocks" (3.12+)
+    path, where, runs = sys.argv[1], sys.argv[2], int(sys.argv[3])
+
+    class Interrupt(Exception):
+        pass
+
+    children = []
+
+    def handler(signum, frame):
+        if where == "wait":
+            holder = threading.Thread(target=reader._lock_forever_for_testing)
+            holder.start()
+            holder.join()
+        pid = os.fork()
+        if pid == 0:
+            return  # the child resumes the read
+        children.append(pid)
+        raise Interrupt
+
+    signal.signal(signal.SIGUSR1, handler)
+    with tt.Writer(path, segment_size=1 << 20) as writer:
+        writer.append_many([b"record"] * 10)
+    outcomes = []
+    for run in range(runs):
+        reader = tt.Reader(path)
+        raced = []
+        if where == "deliver":
+            reader._arm_commit_race_for_testing()
+            helper = threading.Thread(target=lambda: raced.append(reader._race_commit_for_testing(signal.SIGUSR1)))
+            helper.start()
+            read = lambda: reader.read_many(10)
+        else:
+            reader.seek(10)  # nothing there: the read waits
+            helper = threading.Timer(0.2, signal.raise_signal, (signal.SIGUSR1,))
+            helper.start()
+            read = lambda: reader.next(timeout=10)
+        try:
+            got = read()
+        except tt.UsedAfterForkError:
+            os._exit(0)  # the child: refused, as it must be
+        except Interrupt:
+            pass  # the parent
+        except BaseException:
+            os._exit(3)  # the child, failing otherwise (or the parent: no child then, the wait below fails)
+        else:
+            os._exit(2)  # the child returned records it must not deliver (or the parent: no signal arrived)
+        helper.join()
+        assert raced == ([True] if where == "deliver" else []), raced
+        child = children.pop()
+        deadline = time.monotonic() + 10  # the watchdog
+        while (done := os.waitpid(child, os.WNOHANG))[0] == 0 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        if done[0] == 0:
+            os.kill(child, signal.SIGKILL)
+            os.waitpid(child, 0)
+            outcomes.append("hung")
+        else:
+            code = os.waitstatus_to_exitcode(done[1])
+            outcomes.append({0: "refused", 2: "delivered", 3: "failed"}.get(code, f"exit {code}"))
+    print(sorted(set(map(str, outcomes))))
+"""
+
+
+@needs_test_hooks
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs fork")
+@pytest.mark.parametrize("where", ["deliver", "wait"])
+def test_fork_in_a_signal_handler_during_a_read_does_not_hang_the_child(journal: Path, where: str) -> None:
+    runs = int(os.environ.get("TICKERTAPE_DELIVERY_RUNS", "20" if where == "deliver" else "3"))
+    out = run_script(FORK_IN_HANDLER, journal, where, runs, timeout=60 + 11 * runs).strip()
+    assert out == "['refused']", out

@@ -38,15 +38,17 @@ The design decisions are in [ADR 0029](decisions/0029-python-bindings.md). In br
 - **Iteration.** `for record in reader` drains the records committed so far without waiting; each `iter(reader)` is a
   new iterator that stays exhausted once it stops. `reader.next(timeout=None)` waits.
 - **Threads and signals.** Blocking calls release the GIL and wake at least every 50 ms to check for signals with the
-  reader's lock released, so Ctrl-C works during a wait and signal handlers may use the reader. A read that raises
-  consumed nothing, and a read that returns a value consumed exactly the records in it: a read delivers its records
-  only once its result is complete and pending signal handlers have run, so if a handler raises (also while a large
-  result is being built, or while the read waits for another thread using the reader), the records are returned by
-  the next read, not skipped. The one window no binding can close is a signal that arrives once the records are
-  delivered: its handler runs after the call has returned, and if it raises before Python stores the result, the
-  result is lost. Objects can be shared between
-  threads; a read that does not wait returns nothing only when no committed record is left; a waiting read holds its
-  reader for at most 50 ms at a time, and `close()` from another thread ends it with `ValueError`.
+  reader's lock released, so Ctrl-C works during a wait and signal handlers may use the reader. In every thread, a read
+  that raises consumed nothing, and a read that returns a value consumed exactly the records in it. Python runs signal
+  handlers only in the main thread; a read there delivers its records only once its result is complete and pending
+  signal handlers have run, so if a handler raises (also while a large result is being built, or while the read waits
+  for another thread using the reader), the records are returned by the next read, not skipped. The boundary no binding
+  can remove is the read's final signal check: a signal that arrives after it is handled when the call returns, after
+  the records are delivered (and a staging buffer too large to keep is freed), and if its handler raises before Python
+  stores the result, the result is lost. A read in another thread is not interrupted by signals. Other threads that keep
+  taking the reader's lock (a stream of `seek` calls) can delay a delivery, which stays interruptible. Objects can be
+  shared between threads; a read that does not wait returns nothing only when no committed record is left; a waiting
+  read holds its reader for at most 50 ms at a time, and `close()` from another thread ends it with `ValueError`.
 - **Fork.** Handles belong to the process that opened them (its process id and a count of forks, so a reused process
   id does not fool the check); in a forked child they raise `UsedAfterForkError`. Closing them in the child (or
   letting them be collected) releases the child's copies of the descriptors and mappings without unlocking or
@@ -83,9 +85,12 @@ print(duckdb.sql("SELECT schema_id, count(*) FROM frame GROUP BY schema_id"))
 cd bindings/python
 python -m venv .venv && . .venv/bin/activate
 pip install maturin pytest
-maturin develop --release
+maturin develop --release --features test-hooks
 pytest
 ```
+
+The `test-hooks` feature adds the test-only methods that some tests need to order races and simulate a handle locked at
+a fork; without it those tests are skipped. Release wheels are built without it.
 
 The cross-language tests also need the Rust CLI and fixture helpers; without them they are skipped:
 

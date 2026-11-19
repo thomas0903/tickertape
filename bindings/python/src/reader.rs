@@ -1,7 +1,9 @@
 //! `tickertape.Reader`, `tickertape.Record` and `tickertape.RecordBatch`.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+#[cfg(feature = "test-hooks")]
+use std::sync::atomic::AtomicU8;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError, TryLockError};
 use std::time::{Duration, Instant};
 
@@ -25,15 +27,27 @@ const WAIT_SLICE: Duration = Duration::from_millis(50);
 const HAND_OFF: Duration = Duration::from_millis(10);
 
 /// Staging capacity (bytes, all columns together) that a reader keeps between reads for the next one. Reusing it
-/// spares a read of up to about this size from allocating and page-faulting new buffers, which made `read_batch`
-/// measurably faster. A larger buffer is freed once all its records have been delivered, so an idle reader holds at
-/// most about this much. 1 MiB holds about 10,000 records with 64-byte payloads.
-const RETAINED_CAPACITY: usize = 1 << 20;
+/// spares a read from allocating and page-faulting new buffers, which made `read_batch` measurably faster. A larger
+/// buffer is freed once all its records have been delivered, so an idle reader holds at most this much.
+///
+/// What it holds: every record takes 36 bytes of metadata (8 each for `seq`, `venue_ts_ns`, `local_ts_ns` and its
+/// payload offset, 4 for `schema_id`) plus its payload. `fill` reserves metadata room for up to 4,096 records and
+/// each vector then doubles as it fills, so `read_batch(10_000)` grows the metadata to room for 16,384 records
+/// (589,856 bytes). The payload vector doubles from the first payload's length, so it ends below twice the payloads'
+/// total: 1 MiB for 10,000 payloads of 64 bytes (1.56 MiB in all), 3.125 MiB for 10,000 of 200 bytes (3.69 MiB in
+/// all), and under 4.6 MB in all for any 10,000 payloads averaging up to 200 bytes. Why 6 MiB: it keeps all of these,
+/// and every smaller batch, for reuse, while the buffer of a larger batch (100,000 records, or more than 6 MiB of
+/// payloads) is freed after delivery.
+const RETAINED_CAPACITY: usize = 6 << 20;
 
-/// States of the test hook behind `Reader::_race_commit_for_testing`.
+/// States of the test hook behind `Reader::_race_commit_for_testing` (feature `test-hooks`).
+#[cfg(feature = "test-hooks")]
 const RACE_IDLE: u8 = 0;
+#[cfg(feature = "test-hooks")]
 const RACE_ARMED: u8 = 1;
+#[cfg(feature = "test-hooks")]
 const RACE_PAUSED: u8 = 2;
+#[cfg(feature = "test-hooks")]
 const RACE_RESUMED: u8 = 3;
 
 /// A length or offset as `i64` (a `Vec` holds at most `isize::MAX` bytes, which fits on every supported target).
@@ -153,6 +167,20 @@ struct Columns {
 }
 
 impl Columns {
+    /// Empty columns that allocate nothing: not even the leading offset, which `clear` adds before any record is
+    /// pushed (every `fill` starts with one).
+    const fn unallocated() -> Self {
+        Columns {
+            len: 0,
+            seq: Vec::new(),
+            schema_id: Vec::new(),
+            venue_ts_ns: Vec::new(),
+            local_ts_ns: Vec::new(),
+            offsets: Vec::new(),
+            data: Vec::new(),
+        }
+    }
+
     fn with_capacity(n: usize) -> Self {
         let mut offsets = Vec::with_capacity((n + 1) * 8);
         offsets.extend_from_slice(&0i64.to_le_bytes());
@@ -182,11 +210,11 @@ impl Columns {
         self.capacity() > RETAINED_CAPACITY
     }
 
-    /// Empties the columns, keeping their capacity unless it exceeds `RETAINED_CAPACITY`.
+    /// Empties the columns, keeping their capacity unless it exceeds `RETAINED_CAPACITY`, and adds the leading
+    /// offset.
     fn clear(&mut self) {
         if self.is_oversized() {
-            *self = Columns::with_capacity(0);
-            return;
+            *self = Columns::unallocated();
         }
         self.len = 0;
         self.seq.clear();
@@ -208,6 +236,7 @@ impl Columns {
     }
 
     fn push(&mut self, r: &CoreRecord<'_>) {
+        debug_assert!(!self.offsets.is_empty(), "clear() adds the leading offset");
         self.len += 1;
         self.seq.extend_from_slice(&r.seq.to_le_bytes());
         self.schema_id.extend_from_slice(&r.schema_id.to_le_bytes());
@@ -295,7 +324,7 @@ struct Buffer {
 impl Buffer {
     fn new() -> Self {
         Buffer {
-            columns: Columns::with_capacity(0),
+            columns: Columns::unallocated(),
             start: 0,
             epoch: 0,
         }
@@ -320,19 +349,17 @@ impl Buffer {
         self.epoch = self.epoch.wrapping_add(1);
     }
 
-    /// Removes `n` delivered records from the front. Frees nothing itself: this runs right after a read's last
-    /// signal check, and freeing a large buffer can take milliseconds. If the buffer is now empty and holds more than
-    /// `RETAINED_CAPACITY`, its columns are swapped for empty ones and returned, for the caller to free once the lock
-    /// is released (`free_in_background`). Smaller columns are kept for the next `fill` to reuse.
+    /// Removes `n` delivered records from the front. Neither frees nor allocates: this runs with the reader's lock
+    /// held, after a read's last signal check, and freeing a large buffer can take milliseconds. If the buffer is now
+    /// empty and holds more than `RETAINED_CAPACITY`, its columns are swapped for unallocated ones and returned, for
+    /// the caller to free once the lock is released and the GIL detached. Smaller columns are kept for the next
+    /// `fill` to reuse.
     fn consume(&mut self, n: usize) -> Option<Columns> {
         self.start += n;
         self.epoch = self.epoch.wrapping_add(1);
         if self.is_empty() && self.columns.is_oversized() {
             self.start = 0;
-            return Some(std::mem::replace(
-                &mut self.columns,
-                Columns::with_capacity(0),
-            ));
+            return Some(std::mem::replace(&mut self.columns, Columns::unallocated()));
         }
         None
     }
@@ -541,16 +568,6 @@ impl RecordBatchIterator {
     }
 }
 
-/// Frees a staging buffer that was too large to keep, in a short-lived thread. Freeing tens of megabytes can take
-/// milliseconds, and this runs after a read has delivered its records but before its result reaches the caller: a
-/// signal that arrives in between is handled only after the call has returned, so that stretch must stay short. If
-/// no thread can be started, the buffer is freed here (the unused closure is dropped).
-fn free_in_background(columns: Columns) {
-    let _ = std::thread::Builder::new()
-        .name("tickertape-free".to_string())
-        .spawn(move || drop(columns));
-}
-
 /// Between two attempts to take a contended lock: yields at first, then sleeps, up to about 1 ms at a time.
 fn pause(attempt: u32) {
     if attempt < 8 {
@@ -561,6 +578,7 @@ fn pause(attempt: u32) {
 }
 
 /// Test hooks only: waits up to 10 s for `condition`; returns whether it became true.
+#[cfg(feature = "test-hooks")]
 fn wait_until(condition: impl Fn() -> bool) -> bool {
     let started = Instant::now();
     while !condition() {
@@ -712,6 +730,7 @@ pub struct Reader {
     /// Callers waiting for `inner` (see `HAND_OFF`).
     contenders: AtomicUsize,
     /// Test hook state (`RACE_*`, see `_race_commit_for_testing`).
+    #[cfg(feature = "test-hooks")]
     commit_race: AtomicU8,
     owner: Owner,
     path: PathBuf,
@@ -728,11 +747,20 @@ impl Reader {
         Ok(())
     }
 
-    /// Runs `f` on the open state with the lock held and the GIL released, then records the position. `None` if the
-    /// reader is closed. `f` must not run Python code.
-    fn locked<R: Send>(&self, py: Python<'_>, f: impl FnOnce(&mut State) -> R + Send) -> Option<R> {
+    /// Runs `f` on the open state with the lock held and the GIL released, then records the position. `Ok(None)` if
+    /// the reader is closed. `f` must not run Python code.
+    ///
+    /// Raises `UsedAfterForkError` in a forked child before it waits for the lock. Python code that ran since the
+    /// call's first check (a signal handler, a finalizer) may have forked, and the child resumes the call there: the
+    /// lock may have been held at the fork by a thread that does not exist in the child, so it would wait forever.
+    fn locked<R: Send>(
+        &self,
+        py: Python<'_>,
+        f: impl FnOnce(&mut State) -> R + Send,
+    ) -> PyResult<Option<R>> {
+        self.owner.check(py, "Reader")?;
         self.contenders.fetch_add(1, Ordering::AcqRel);
-        py.detach(|| {
+        Ok(py.detach(|| {
             let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
             self.contenders.fetch_sub(1, Ordering::AcqRel);
             guard.as_mut().map(|state| {
@@ -740,12 +768,17 @@ impl Reader {
                 self.position.store(state.position(), Ordering::Release);
                 result
             })
-        })
+        }))
     }
 
-    /// Like `locked` with the GIL held throughout. `f` must not run Python code (it may create objects that the
-    /// garbage collector does not track).
-    fn locked_attached<R>(&self, py: Python<'_>, f: impl FnOnce(&mut State) -> R) -> Option<R> {
+    /// Like `locked` with the GIL held throughout (and the same check for a forked child). `f` must not run Python
+    /// code (it may create objects that the garbage collector does not track).
+    fn locked_attached<R>(
+        &self,
+        py: Python<'_>,
+        f: impl FnOnce(&mut State) -> R,
+    ) -> PyResult<Option<R>> {
+        self.owner.check(py, "Reader")?;
         let mut guard = match self.inner.try_lock() {
             Ok(guard) => guard,
             Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
@@ -754,11 +787,11 @@ impl Reader {
                 lock(py, &self.inner)
             }
         };
-        guard.as_mut().map(|state| {
+        Ok(guard.as_mut().map(|state| {
             let result = f(state);
             self.position.store(state.position(), Ordering::Release);
             result
-        })
+        }))
     }
 
     /// Between two wait slices: lets callers queued for the lock take it first, for at most `HAND_OFF`, with the GIL
@@ -809,6 +842,10 @@ impl Reader {
             }
         };
         loop {
+            // Every pass, not only once per call: a signal handler that ran in the last pass may have forked, and a
+            // child must not wait for the lock (see `locked`) or hand it off to contenders that exist only in the
+            // parent.
+            self.owner.check(py, "Reader")?;
             if self.closed.load(Ordering::Acquire) {
                 return Err(closed(waited));
             }
@@ -822,7 +859,7 @@ impl Reader {
                 let staged = self
                     .locked_attached(py, |s| {
                         s.fill(1, Duration::ZERO).then(|| s.stage(1, &stage))
-                    })
+                    })?
                     .ok_or_else(|| closed(waited))?;
                 match staged {
                     Some(staged) => staged,
@@ -840,7 +877,7 @@ impl Reader {
                             })
                         };
                         (s.fill(max, slice), slice)
-                    })
+                    })?
                     .ok_or_else(|| closed(waited))?;
                 waited |= !slice.is_zero();
                 if !ready {
@@ -862,7 +899,7 @@ impl Reader {
                 if self.closed.load(Ordering::Acquire) {
                     return Err(closed(waited));
                 }
-                self.locked_attached(py, |s| s.stage(max, &stage))
+                self.locked_attached(py, |s| s.stage(max, &stage))?
                     .ok_or_else(|| closed(waited))?
             };
             let (value, epoch, count) = match staged {
@@ -876,6 +913,7 @@ impl Reader {
                 Staged::Nothing => continue,
             };
             let result = finish(value)?;
+            #[cfg(feature = "test-hooks")]
             if self.commit_race.load(Ordering::Relaxed) == RACE_ARMED {
                 self.pause_for_commit_race(py);
             }
@@ -897,11 +935,19 @@ impl Reader {
     /// delivered, and if the records are delivered, no signal was pending at the last check. A signal that arrives
     /// after that check is handled by the interpreter once the call has returned its result. (Running the handlers
     /// with the lock held instead would deadlock a handler that uses the reader.)
+    ///
+    /// A handler may fork. The child resumes this loop, and the lock may be held by a thread that exists only in the
+    /// parent, so every attempt is preceded by the ownership check: in a child it raises `UsedAfterForkError` (having
+    /// delivered nothing) instead of retrying for ever.
+    ///
+    /// After the commit, with the lock released, a staging buffer too large to keep is freed with the GIL released.
+    /// That is after the last signal check, so a signal arriving meanwhile is handled once the call has returned.
     fn deliver(&self, py: Python<'_>, epoch: u64, count: usize) -> PyResult<Option<bool>> {
         let mut queued = None;
         let mut attempt = 0u32;
         loop {
             py.check_signals()?;
+            self.owner.check(py, "Reader")?;
             let mut guard = match self.inner.try_lock() {
                 Ok(guard) => guard,
                 Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
@@ -922,7 +968,7 @@ impl Reader {
             self.position.store(state.position(), Ordering::Release);
             drop(guard);
             if let Some(columns) = oversized {
-                free_in_background(columns);
+                py.detach(move || drop(columns));
             }
             return Ok(Some(delivered));
         }
@@ -931,6 +977,7 @@ impl Reader {
     /// Test only (see `_arm_commit_race_for_testing`): pauses an armed read after it has built its result, before
     /// `deliver`, until `_race_commit_for_testing` holds the lock. Never runs between the last signal check and the
     /// commit.
+    #[cfg(feature = "test-hooks")]
     fn pause_for_commit_race(&self, py: Python<'_>) {
         if self
             .commit_race
@@ -985,6 +1032,7 @@ impl Reader {
             closed: AtomicBool::new(false),
             position: AtomicU64::new(position),
             contenders: AtomicUsize::new(0),
+            #[cfg(feature = "test-hooks")]
             commit_race: AtomicU8::new(RACE_IDLE),
             owner: Owner::current(),
             path,
@@ -1005,7 +1053,7 @@ impl Reader {
                     s.pending = None;
                 }
                 result
-            })
+            })?
             .ok_or_else(|| errors::closed("reader"))?;
         result.map_err(|e| errors::to_py(py, &e))
     }
@@ -1130,19 +1178,23 @@ impl Reader {
         self.owner.set_pid_for_testing(pid);
     }
 
-    /// Test only: locks this handle's mutex and never unlocks it, as if a thread had been inside a call when the
-    /// process forked. In this process every later call that needs the lock then waits forever.
+    /// Test only (feature `test-hooks`): locks this handle's mutex and never unlocks it, as if a thread had been
+    /// inside a call when the process forked. In this process every later call that needs the lock then waits
+    /// forever.
+    #[cfg(feature = "test-hooks")]
     fn _lock_forever_for_testing(&self, py: Python<'_>) {
         std::mem::forget(lock(py, &self.inner));
     }
 
     /// Test only: the staging buffer's capacity in bytes (see `RETAINED_CAPACITY`).
     fn _staging_capacity_for_testing(&self, py: Python<'_>) -> PyResult<usize> {
-        self.locked_attached(py, |s| s.buffer.columns.capacity())
+        self.locked_attached(py, |s| s.buffer.columns.capacity())?
             .ok_or_else(|| errors::closed("reader"))
     }
 
-    /// Test only, with `_race_commit_for_testing`: the next read that builds a result pauses before delivering it.
+    /// Test only (feature `test-hooks`), with `_race_commit_for_testing`: the next read that builds a result pauses
+    /// before delivering it.
+    #[cfg(feature = "test-hooks")]
     fn _arm_commit_race_for_testing(&self) {
         self.commit_race.store(RACE_ARMED, Ordering::SeqCst);
     }
@@ -1150,7 +1202,11 @@ impl Reader {
     /// Test only, from a second thread while the main thread reads: waits until the armed read has built its result
     /// and paused (see `_arm_commit_race_for_testing`), takes the reader's lock, lets the read go on, waits until it
     /// is queued for the lock to deliver its records, raises signal `signum` (its handler runs in the main thread),
-    /// and releases the lock. Returns whether every step happened within 10 s.
+    /// waits until the read has stopped trying to take the lock (its handler raised), and only then releases the
+    /// lock. So the handler always runs while this thread holds the lock, and the read can deliver only if it took
+    /// the lock without running the handler. Returns whether every step happened within 10 s (the last one does not
+    /// if the read keeps retrying). Feature `test-hooks` only.
+    #[cfg(feature = "test-hooks")]
     fn _race_commit_for_testing(&self, py: Python<'_>, signum: i32) -> PyResult<bool> {
         if !py.detach(|| wait_until(|| self.commit_race.load(Ordering::SeqCst) == RACE_PAUSED)) {
             return Ok(false);
@@ -1161,7 +1217,7 @@ impl Reader {
         let raised = if queued {
             py.import("signal")?
                 .call_method1("raise_signal", (signum,))
-                .map(|_| true)
+                .map(|_| py.detach(|| wait_until(|| self.contenders.load(Ordering::SeqCst) == 0)))
         } else {
             Ok(false)
         };

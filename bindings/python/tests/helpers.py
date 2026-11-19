@@ -10,8 +10,17 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 import tickertape as tt
 import tickertape_reader
+
+needs_test_hooks = pytest.mark.skipif(
+    not hasattr(tt.Reader, "_race_commit_for_testing"),
+    reason="needs the test-only methods of a build with the test-hooks feature "
+    "(maturin develop --features test-hooks); release wheels do not have them",
+)
+"""Marks a test that needs the hooks that can wedge a handle (`_lock_forever_for_testing`, the commit-race hooks)."""
 
 SMALL_SEGMENT = 65536
 """The Rust tests' `SMALL_SEGMENT`: small enough that a few hundred records roll segments."""

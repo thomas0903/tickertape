@@ -49,7 +49,9 @@ class TickertapeError(Exception):
         fields = {name: value for name in names if (value := getattr(self, name, missing)) is not missing}
         message = getattr(self, "message", missing)
         if message is missing:
-            message = str(self.args[0]) if self.args else ""
+            # Cannot raise: a str argument is copied as it is, without calling a subclass's __str__.
+            first = self.args[0] if self.args else None
+            message = str.__str__(first) if isinstance(first, str) else "(message deleted)"
         state = {key: value for key, value in self.__dict__.items()
                  if key not in fields and key not in ("message", "_tickertape_fields")}
         return (_rebuild, (type(self), message, fields, "message" not in self.__dict__), state or None)

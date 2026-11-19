@@ -96,8 +96,9 @@ NumPy, pyarrow and pandas are optional and imported only when these methods are 
   other buffers once. The payload is then copied into the journal.
 - Every `Record` owns its payload as an ordinary `bytes` object; it stays valid after the reader moves on or closes.
   `RecordBatch` columns are `bytes` too; arrays made from them keep them alive.
-- A reader copies records into a staging buffer before building a result. Between reads it keeps at most about
-  1 MiB of that buffer for reuse; a larger one is freed once its records have been returned.
+- A reader copies records into a staging buffer before building a result. Between reads it keeps at most 6 MiB of
+  that buffer for reuse (enough for `read_batch(10_000)` with payloads of a few hundred bytes); a larger one is
+  freed, with the GIL released, after the read has delivered its records and before the call returns.
 - The reader is tickertape's safe `pread` reader, memory-safe whatever other processes do to the files. The
   zero-copy mapped reader of the Rust library is not exposed to Python.
 - Blocking calls (`next`, waiting `read_many`/`read_batch`, `checkpoint`, opening a writer, batch loops) release the
@@ -121,7 +122,9 @@ NumPy, pyarrow and pandas are optional and imported only when these methods are 
   keeps the journal locked after the parent closes it). A handle that another thread was using at the moment of the
   fork is never released in the child: its state may be half-updated, and the dead thread's frame keeps a reference
   to it anyway, so its descriptors (for a writer, including the lock) stay open until the child exits or calls
-  `exec`. Open handles in the child after it starts, or use the `spawn` or `forkserver` start method.
+  `exec`. A read that a signal handler interrupted to fork raises `UsedAfterForkError` in the child when the handler
+  returns, having consumed nothing. Open handles in the child after it starts, or use the `spawn` or `forkserver`
+  start method.
 - Free-threaded Python: no free-threaded wheels are published (abi3 wheels cannot load there). Building from the
   sdist for 3.14t works and runs without the GIL, but it is not tested in CI.
 
@@ -129,21 +132,28 @@ NumPy, pyarrow and pandas are optional and imported only when these methods are 
 
 Waits check for signals at least every 50 ms, with the reader's lock released, so Ctrl-C raises `KeyboardInterrupt`
 promptly and signal handlers may use the reader (even close it). For every read (`next`, `try_next`, `read_many`,
-`read_batch`, iteration):
+`read_batch`, iteration), in any thread:
 
 - If it raises (a signal handler raised, the reader was closed, or anything else failed), it consumed nothing: the
   records it had already taken from the journal stay with the reader and the next read returns them first, in order.
 - If it returns a value, exactly the records in that value were consumed.
 
-A read delivers its records only after its result is complete and pending signal handlers have run. That covers a
-signal that arrives while the read builds a large result, or while it waits for another thread that is using the
-reader: the read runs the handlers immediately before every attempt to take the reader's lock, and nothing can run
-or wait between the last check and the delivery.
+Python runs signal handlers only in the main thread, so what follows about handlers concerns reads in the main
+thread. A read there delivers its records only after its result is complete and pending signal handlers have run.
+That covers a signal that arrives while the read builds a large result, or while it waits for another thread that is
+using the reader: the read runs the handlers immediately before every attempt to take the reader's lock, and nothing
+can run or wait between its final signal check and the delivery. While other threads keep taking the reader's lock
+(a stream of `seek` calls, for example), the delivery waits and the read may start over; it stays interruptible
+throughout, because every attempt is preceded by a signal check.
 
-One window remains, and no binding can close it: a signal that arrives after that last check, once the records are
-delivered, is handled at the interpreter's next check, after the read has returned its result. If its handler raises
-before Python stores the result, the returned value is lost. A program that must not lose a record on Ctrl-C should
-handle `SIGINT` itself (for example, set a flag in the handler and stop after the current record).
+The boundary is that final signal check, and no binding can remove it: a signal that arrives after it is handled when
+the call returns, after the read has delivered its records (and freed a staging buffer too large to keep). If its
+handler raises before Python stores the result, the returned value is lost. A program that must not lose a record on
+Ctrl-C should handle `SIGINT` itself (for example, set a flag in the handler and stop after the current record).
+
+A read in another thread never runs handlers, and a signal does not interrupt it; the two rules above still hold for
+it. A handler that runs in the main thread meanwhile may use the reader: if it closes it, the other thread's read
+raises `ValueError` and consumes nothing, or returns its records if it delivered them before the close took effect.
 
 ## Errors
 

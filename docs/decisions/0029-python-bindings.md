@@ -133,13 +133,25 @@ again; this terminates because it only happens when someone else advanced the cu
 not wait returns nothing only when no committed record is left.
 
 So the guarantee is: when a read raises, it consumed nothing; when it returns a value, exactly the records in that
-value were consumed. What no binding can guarantee: a signal that arrives after the last check (once the records are
-delivered) is handled at the interpreter's next check, after the call has returned, and if its handler raises before
-Python stores the result, the result is lost. The documentation says so.
+value were consumed. That holds for reads in every thread. Python runs signal handlers only in the main thread
+(`PyErr_CheckSignals` does nothing elsewhere), so the statements about handlers concern reads in the main thread; a
+read in another thread is not interrupted by a signal, and a handler that closes the reader meanwhile makes it raise
+`ValueError` having consumed nothing, unless it delivered its records first. The boundary is the read's final signal
+check: a signal that arrives after it is handled at the interpreter's next check, once the call has returned, and if
+its handler raises before Python stores the result, the result is lost. No binding can remove that boundary; the
+documentation says so. Because the delivery only tries the mutex, a stream of calls that take it in other threads (for
+example repeated `seek`s, which also make the read start over) can delay a delivery indefinitely; the read stays
+interruptible, since every attempt is preceded by a signal check.
 
-After delivering, a read keeps the buffer's capacity for the next read if it is at most 1 MiB (all columns together);
-a larger buffer is swapped for an empty one and freed in a short-lived thread, so an idle reader holds at most about
-1 MiB, and freeing tens of megabytes (milliseconds) does not lengthen the stretch between the delivery and the return.
+After delivering, a read keeps the buffer's capacity for the next read if it is at most 6 MiB (all columns together):
+`read_batch(10_000)` grows the columns to 1.56 MiB with 64-byte payloads and 3.69 MiB with 200-byte ones (the vectors
+double as they fill), so the common batch sizes reuse their buffer, which made `read_batch` measurably faster. A
+larger buffer is swapped for an unallocated one under the mutex (nothing is allocated or freed between the final
+signal check and the commit) and freed synchronously after the mutex is released, with the GIL released, before the
+call returns. That happens after the commit, so a signal arriving while it runs is handled when the call returns (the
+boundary above). An idle reader holds at most 6 MiB. An earlier version freed it in a short-lived thread instead;
+that made every large read start a thread, made a reader-only process multithreaded before a later `fork`, and could
+strand the buffer in a child forked meanwhile.
 
 **Fork.** A handle records the id of the process that opened it and a fork generation, a counter that a hook
 registered with `os.register_at_fork(after_in_child=...)` at import advances in every child. In any process where
@@ -149,19 +161,24 @@ taking a lock or touching the journal: the child's copy shares the parent's mapp
 not its helper threads, so using it could overwrite the parent's records or fail to join threads.
 
 `close()`, `__exit__` and garbage collection in such a process release what the child holds and nothing else. The
-`flock` on `writer.lock` belongs to the open file description that parent and child share, so a child that kept its
-copy of the descriptor would keep the journal locked after the parent closed its writer. For the writer the bindings
-call `tickertape::Writer::release_after_fork`, a small method added to the core crate for this: it closes the child's
-descriptors and unmaps its mappings without unlocking the description (that would unlock the parent), syncing,
-joining or signalling the helper threads (which do not exist in the child), or removing or changing any file or the
-wake-up region; what the helper threads hold is leaked until the child exits. The core reader has no threads and
-writes nothing, so the child simply drops it. A mutex that was locked when the process forked (another thread was
-inside a call) stays locked in the child, and the copy behind it may be half-updated, so it is never released there:
-`close()` leaves it in place, and the handle's `Drop` (which takes the mutex with a try-lock in a foreign process)
-forgets it instead of dropping it. In practice such a handle is not even collected in the child, because the frame of
-the call that held the mutex, in a thread that no longer exists, keeps a reference to it. Its descriptors, including
-the writer's lock file, stay open until the child exits or execs. Handles must be opened after forking, or the
-`spawn`/`forkserver` start method used.
+`flock` on `writer.lock` belongs to the open file description that parent and child share, so a child that kept its copy
+of the descriptor would keep the journal locked after the parent closed its writer. For the writer the bindings call
+`tickertape::Writer::release_after_fork`, a small method added to the core crate for this: it closes the child's
+descriptors and unmaps its mappings without unlocking the description (that would unlock the parent), syncing, joining
+or signalling the helper threads (which do not exist in the child), or removing or changing any file or the wake-up
+region; what the helper threads hold is leaked until the child exits. The core reader has no threads and writes nothing,
+so the child simply drops it. A mutex that was locked when the process forked (another thread was inside a call) stays
+locked in the child, and the copy behind it may be half-updated, so it is never released there: `close()` leaves it in
+place, and the handle's `Drop` (which takes the mutex with a try-lock in a foreign process) forgets it instead of
+dropping it. In practice such a handle is not even collected in the child, because the frame of the call that held the
+mutex, in a thread that no longer exists, keeps a reference to it. A call can also continue in the child: a signal
+handler (or a finalizer) that forks during a read returns into the read in both processes. So the reader checks the
+owner again before every attempt to take its mutex, not only when a call starts (in the loop that waits for records,
+before each lock, and in every try-lock attempt of the delivery), and the read raises `UsedAfterForkError` in the child,
+having consumed nothing, instead of waiting for ever for a mutex held by a thread that exists only in the parent. The
+writer runs no Python code between its check and taking its mutex. Its descriptors, including the writer's lock file,
+stay open until the child exits or execs. Handles must be opened after forking, or the `spawn`/`forkserver` start method
+used.
 
 **Errors.** Exceptions are defined in Python (`tickertape/_errors.py`) so they can also derive from built-ins:
 `TickertapeError` is the base; `JournalIOError` (also `OSError`, with `errno`, `filename`, `op`, `storage_full`) and
@@ -214,6 +231,11 @@ requests or branches. The one-time setup is in `docs/playbooks/release-checklist
   writer or a reader, use after `fork`, a child releasing the journal while it still runs, a handle whose lock was
   held at the fork, a fork while threads are inside calls, reused process ids, timeouts, the staging capacity an idle
   reader keeps, pickling of every exception (also with deleted attributes), context managers, the writer lock and
-  cross-language fixtures against the Rust CLI and the pure-Python decoder. Test-only methods (`_..._for_testing`)
-  exist on the classes for the hooks. `cargo test --manifest-path bindings/python/Cargo.toml` runs the
-  conversion unit tests.
+  cross-language fixtures against the Rust CLI and the pure-Python decoder, and a signal handler that forks during a
+  read. Test-only methods (`_..._for_testing`) exist on the classes for the hooks. Those that can wedge a handle
+  (`_lock_forever_for_testing`, `_arm_commit_race_for_testing`, `_race_commit_for_testing`) are compiled only with the
+  crate's `test-hooks` feature: the CI test job builds with it, release wheels are built without it, and the wheel
+  workflow runs the test suite against each release wheel as shipped (the tests that need those hooks skip, saying
+  why). The read-only `_staging_capacity_for_testing`, and `_set_owner_pid_for_testing`, which can only make a handle
+  refuse use, stay in every build. `cargo test --manifest-path bindings/python/Cargo.toml` runs the conversion unit
+  tests.

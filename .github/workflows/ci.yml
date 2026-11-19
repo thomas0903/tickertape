@@ -318,6 +318,7 @@ jobs:
         run: |
           cargo fmt --manifest-path bindings/python/Cargo.toml --check
           cargo clippy --manifest-path bindings/python/Cargo.toml --all-targets --locked -- -D warnings
+          cargo clippy --manifest-path bindings/python/Cargo.toml --all-targets --locked --all-features -- -D warnings
       - name: Unit tests of the bindings crate (every error and report variant converts as listed)
         run: |
           # The test binary links libpython; make the runtime linker find it on Linux.
@@ -326,11 +327,13 @@ jobs:
           cargo test --manifest-path bindings/python/Cargo.toml --locked
       - name: Build the Rust CLI and fixture helpers for the cross-language tests
         run: cargo build --release --locked -p tickertape-cli -p tickertape-examples -p tickertape-tests --bins
-      - name: Build the wheel and install it into a clean virtual environment
+      - name: Build the wheel with the test hooks and install it into a clean virtual environment
         run: |
           python -m venv "$RUNNER_TEMP/venv"
           "$RUNNER_TEMP/venv/bin/python" -m pip install --upgrade pip maturin==1.16.0 pytest mypy
-          "$RUNNER_TEMP/venv/bin/maturin" build --release --locked -m bindings/python/Cargo.toml -o "$RUNNER_TEMP/dist"
+          # `test-hooks` adds the test-only methods that can wedge a handle; release wheels never have them (ADR 0029).
+          "$RUNNER_TEMP/venv/bin/maturin" build --release --locked --features test-hooks -m bindings/python/Cargo.toml \
+            -o "$RUNNER_TEMP/dist"
           "$RUNNER_TEMP/venv/bin/python" -m pip install "$RUNNER_TEMP"/dist/*.whl
           # Optional integrations; a package without a wheel for this Python only skips its tests.
           for package in numpy pandas pyarrow duckdb; do
