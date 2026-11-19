@@ -794,25 +794,18 @@ fn verify_waits_for_a_writer_stalled_between_linking_and_sealing() {
         "{:?}",
         report.problems
     );
-    // The "writer" seals 50 ms after verify opens the segment (no hook point lies between verify's scans, so the
-    // seal can't be placed exactly; started from the open, it lands well inside the 630 ms verify waits, however
-    // late the threads get to run, and the first scan, of a few hundred bytes, almost always finds it unsealed).
-    let (opened, wait) = std::sync::mpsc::channel();
+    // The "writer" seals after verify's first scan found the segment unsealed, before it scans again (hook point
+    // `InspectRescan`): verify must scan again rather than report the first scan's state.
+    let rescanned = std::rc::Rc::new(std::cell::Cell::new(false));
+    let r = rescanned.clone();
     tickertape::fault::clear();
-    tickertape::fault::run_at(tickertape::fault::Point::InspectOpen, 0, move || {
-        opened.send(()).unwrap()
+    tickertape::fault::run_at(tickertape::fault::Point::InspectRescan, 0, move || {
+        r.set(true);
+        seal(&path);
     });
-    let sealer = {
-        let path = path.clone();
-        std::thread::spawn(move || {
-            wait.recv().unwrap();
-            std::thread::sleep(Duration::from_millis(50));
-            seal(&path);
-        })
-    };
     let report = tickertape::inspect::verify(dir.path()).unwrap();
     tickertape::fault::clear();
-    sealer.join().unwrap();
+    assert!(rescanned.get(), "verify didn't scan again");
     assert!(report.problems.is_empty(), "{:?}", report.problems);
 }
 

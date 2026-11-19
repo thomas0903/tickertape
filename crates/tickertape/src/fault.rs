@@ -49,6 +49,9 @@ pub enum Point {
     /// After `inspect::verify` finds the newest listed segment sealed, before it looks for the successor. Arm with
     /// [`run_at`].
     InspectSeal,
+    /// In `inspect::verify`, after a scan found a segment in a state a running writer passes through and verify has
+    /// paused, before it scans that segment again. Arm with [`run_at`].
+    InspectRescan,
     /// Syncing the zeroing of an abandoned write (a panicking `append_with` fill closure).
     AbandonedWriteSync,
 }

@@ -38,7 +38,8 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   gone, so a reader could report `Error::Discarded` and `verify` could miss a broken chain. It is now an I/O error.
 - Fix: `verify` (CLI `verify`, `inspect`) scanned a state a running writer passes through again only once, after
   50 ms, so a writer descheduled between linking a new segment and sealing the old one for longer made it report a
-  broken chain. It now scans again with growing pauses, up to 630 ms in all.
+  broken chain. It now scans again with growing pauses, up to 630 ms in all (new hook point `InspectRescan` between
+  those scans).
 - C ABI (ADR 0028, `docs/c-api.md`): a new workspace crate, `crates/tickertape-ffi`, builds `libtickertape` as a
   shared and a static library with a committed, cbindgen-generated C99/C++11 header (`include/tickertape.h`, checked
   for drift in CI) and cargo-c metadata for installation with a pkg-config file. It covers the writer (append,

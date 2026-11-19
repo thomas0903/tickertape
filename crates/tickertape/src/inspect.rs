@@ -315,6 +315,7 @@ fn verify_once(dir: &Path, last: bool) -> Result<Option<VerifyReport>> {
         let mut pause = TRANSIENT_FIRST_PAUSE;
         while transient(scan.end) && pause <= TRANSIENT_LAST_PAUSE {
             std::thread::sleep(pause);
+            crate::fault::hook(crate::fault::Point::InspectRescan);
             scan = journal::scan_open(&file, &path, base)?;
             pause *= 2;
         }
