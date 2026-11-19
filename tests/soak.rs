@@ -981,6 +981,19 @@ impl Soak {
                             quarantined = true;
                         }
                         "completed" if a[2] == file => completed = true,
+                        // Killed between the two stores of the predecessor's seal (its CRC word written, its marker
+                        // not): in front of a successor that no longer opens, recovery preserves that word and
+                        // replaces the predecessor (ADR 0035 → Damage around a seal). Nothing else may be repaired.
+                        "repaired" if a[2] != file && a[6] == format!("BrokenChain({seq})") => {
+                            let kept = fs::read(&a[5]).unwrap();
+                            let mut word = vec![0; 4];
+                            word.extend_from_slice(&format::seal_crc(seq).to_le_bytes());
+                            assert_eq!(
+                                kept, word,
+                                "writer {epoch}: preserved bytes in front of {file}"
+                            );
+                            self.c.quarantined_files_checked += 1;
+                        }
                         _ => self.count_benign(epoch, a),
                     }
                 }

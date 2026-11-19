@@ -565,9 +565,10 @@ impl Reader {
                 // too: that is discarded history.
                 self.check_identity()?;
                 // The seal may no longer be in this file, which kept its identity. The `pread` buffer can hold a seal
-                // that recovery has since zeroed in place, quarantining the successor (a seal whose marker storage
-                // damage emptied, with a successor that no longer opens: crash contract C11, ADR 0035 → Damage around
-                // a seal); a mapped reader can load the seal just before that repair. Read the slot again from the
+                // that storage damage has since zeroed, after which recovery left this file in place and quarantined
+                // the successor (the whole seal zeroed in front of a successor that no longer opens, or a zeroed
+                // stretch from a record through the seal: crash contract C11 (3), ADR 0035 → Damage around a seal); a
+                // mapped reader can load the seal just before the damage. Read the slot again from the
                 // file: if the seal is gone, return to the caller, which reads that slot as it is now. The re-read
                 // skips the buffer anyway; the buffer is dropped for the caller's sake, because a re-read that finds
                 // an empty word does not refill it, and the caller's next read would take the stale seal from it

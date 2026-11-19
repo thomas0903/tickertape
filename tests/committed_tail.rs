@@ -77,6 +77,23 @@ fn hundred_with_checkpoint_at_50(dir: &Path) {
 /// byte the removed tail of `damaged`, up to its last non-zero byte), and the repaired segment (the prefix kept, the
 /// rest zero).
 fn assert_preserved(action: &RecoveryAction, path: &Path, offset: u64, damaged: &[u8], found: u64) {
+    assert_repaired(
+        action,
+        path,
+        offset,
+        damaged,
+        CorruptReason::EmptyCommitWord(found),
+    );
+}
+
+/// [`assert_preserved`] for any reason.
+fn assert_repaired(
+    action: &RecoveryAction,
+    path: &Path,
+    offset: u64,
+    damaged: &[u8],
+    expected: CorruptReason,
+) {
     let RecoveryAction::RepairedTail {
         segment,
         offset: at,
@@ -88,7 +105,7 @@ fn assert_preserved(action: &RecoveryAction, path: &Path, offset: u64, damaged: 
         panic!("expected RepairedTail, got {action:?}");
     };
     assert_eq!((segment.as_path(), *at), (path, offset));
-    assert_eq!(*reason, CorruptReason::EmptyCommitWord(found));
+    assert_eq!(*reason, expected);
     assert_eq!(*len, damaged.len() as u64 - offset);
     let kept = fs::read(quarantine_file).unwrap();
     let tail = &damaged[offset as usize..];
@@ -768,47 +785,98 @@ fn zeroed_block_ending_a_sealed_segment_is_preserved() {
     }
 }
 
+/// Every regular file in `dir` except the lock file (an open writes its PID there, refused or not), with its contents.
+fn files(dir: &Path) -> Vec<(String, Vec<u8>)> {
+    let mut out: Vec<(String, Vec<u8>)> = fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap())
+        .filter(|e| e.file_type().unwrap().is_file() && e.file_name() != "writer.lock")
+        .map(|e| {
+            (
+                e.file_name().to_string_lossy().into_owned(),
+                fs::read(e.path()).unwrap(),
+            )
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// The damage of [`successor_that_does_not_open_ends_the_chain_at_the_seals_place`] applied to segment 0 (`path`,
+/// seal at `seal`) and to the successor for exactly 339: the seal's marker zeroed (or the whole seal, with `whole`),
+/// a stray byte past the seal's place (`stray`), and the successor's magic damaged so that it does not open.
+fn break_chain_at_seal(path: &Path, successor: &Path, seal: u64, whole: bool, stray: bool) {
+    let raw = open_raw(path);
+    raw.write_all_at(&[0; 4], seal).unwrap();
+    if whole {
+        raw.write_all_at(&[0; 4], seal + 4).unwrap();
+    }
+    if stray {
+        raw.write_all_at(&[0xab], seal + 16).unwrap();
+    }
+    open_raw(successor).write_all_at(b"X", 0).unwrap();
+}
+
 #[test]
 fn successor_that_does_not_open_ends_the_chain_at_the_seals_place() {
-    // Review round 3 (fix round 4, item 1e): segment 0's seal marker zeroed and the header of the segment for exactly
-    // 339 damaged, so the successor exists but does not open. The resealing branch needs a successor that opens, so
-    // the evidence search runs instead. It finds nothing in segment 0, and a segment with a higher base (676) counts
-    // only if the non-zero bytes reach past the seal's place. Pinned down here, under both policies:
-    // - only the seal's CRC word left, higher-base segments present: not evidence. The CRC word is zeroed in place
-    //   (under `Fail` too), then the successor and every later segment are disconnected: quarantined, or `Fail`
-    //   refuses at the successor (`BrokenChain`) with the CRC word already zeroed;
-    // - the CRC word and a stray byte past the seal's place, no higher-base segment: no evidence either, the bytes
-    //   are zeroed in place without being preserved (under `Fail` too), then the successor is quarantined or refused;
+    // Review round 3 (fix round 4, item 1e), and the follow-up that closed ADR 0035's "Known gap": segment 0's seal
+    // marker zeroed and the header of the segment for exactly 339 damaged, so the successor exists but does not open.
+    // The resealing branch needs a successor that opens, so the evidence search runs instead. It finds nothing in
+    // segment 0, and a segment with a higher base (676) counts only if the non-zero bytes reach past the seal's
+    // place. Pinned down here, under both policies:
+    // - only the seal's CRC word left, higher-base segments present: not evidence, and the chain is broken at the
+    //   seal's place. The CRC word is preserved and segment 0 replaced (`BrokenChain(339)` at the seal's place), then
+    //   the successor and every later segment are quarantined as disconnected; `Fail` refuses at the seal's place
+    //   without changing a byte;
+    // - the CRC word and a stray byte past the seal's place, no higher-base segment: no evidence either, handled the
+    //   same way;
     // - the same bytes with higher-base segments present: evidence (a segment based above 339), so the tail is
-    //   preserved and segment 0 replaced (`EmptyCommitWord(676)`), or `Fail` refuses without changing a byte.
+    //   preserved and segment 0 replaced (`EmptyCommitWord(676)`), or `Fail` refuses without changing a byte;
+    // - the whole seal zeroed, nothing non-zero after the empty word: nothing to preserve or zero. Segment 0 is left
+    //   in place, the successor and every later segment are quarantined as disconnected, and `Fail` refuses at the
+    //   successor (`BrokenChain(339)` at offset 0) without changing a byte.
+    // `verify` reports every case as `BrokenChain(339)` at the seal's place first (it searches segment 0 only).
     #[derive(Debug, Clone, Copy)]
     enum Expect {
-        /// `ZeroedUncommitted` of `[seal + 4, seal + 4 + len)`, then every later segment disconnected.
-        ZeroedThenDisconnected(u64),
-        /// Corruption at the seal's place, reported with this sequence number.
+        /// Corruption at the seal's place, reported as `BrokenChain(339)`: the tail preserved and segment 0 replaced,
+        /// then every later segment disconnected.
+        BrokenAtSeal,
+        /// Corruption at the seal's place, reported as `EmptyCommitWord` with this sequence number.
         Preserved(u64),
+        /// Nothing after the empty word: segment 0 untouched, every later segment disconnected.
+        Disconnected,
     }
     let cases = [
         (
             "only the seal's CRC word left",
             false,
             false,
-            Expect::ZeroedThenDisconnected(4),
+            false,
+            Expect::BrokenAtSeal,
         ),
         (
             "a stray byte past the seal, no higher base",
             true,
+            false,
             true,
-            Expect::ZeroedThenDisconnected(13),
+            Expect::BrokenAtSeal,
         ),
         (
             "a stray byte past the seal, higher bases",
             false,
+            false,
             true,
             Expect::Preserved(676),
         ),
+        (
+            "the whole seal zeroed",
+            false,
+            true,
+            false,
+            Expect::Disconnected,
+        ),
     ];
-    for (name, one_later, stray, expect) in cases {
+    for (name, one_later, whole, stray, expect) in cases {
         let base = tempfile::tempdir().unwrap();
         let segs = sealed_journal(base.path(), one_later);
         let (_, seal) = record_slots(&segs[0].1);
@@ -817,28 +885,42 @@ fn successor_that_does_not_open_ends_the_chain_at_the_seals_place() {
             let dir = copy_journal(base.path());
             let path = dir.path().join(segs[0].1.file_name().unwrap());
             let successor = dir.path().join(segs[1].1.file_name().unwrap());
-            let raw = open_raw(&path);
-            raw.write_all_at(&[0; 4], seal).unwrap();
-            if stray {
-                raw.write_all_at(&[0xab], seal + 16).unwrap();
-            }
-            open_raw(&successor).write_all_at(b"X", 0).unwrap(); // damages the magic
+            break_chain_at_seal(&path, &successor, seal, whole, stray);
+            let problems = inspect::verify(dir.path()).unwrap().problems;
+            assert!(
+                matches!(problems.first(), Some(inspect::Problem { path: p, offset, reason: CorruptReason::BrokenChain(339), .. }) if *p == path && *offset == seal),
+                "{what}: {problems:?}"
+            );
             let damaged = fs::read(&path).unwrap();
             let before = snapshot(dir.path());
+            let before_files = files(dir.path());
             let identity = {
                 let m = fs::metadata(&path).unwrap();
                 (m.dev(), m.ino())
             };
             let opened = Writer::open(dir.path(), small_config().recovery(policy));
             match (expect, policy, opened) {
-                (Expect::ZeroedThenDisconnected(len), RecoveryPolicy::Quarantine, Ok(w)) => {
+                (
+                    Expect::BrokenAtSeal | Expect::Disconnected,
+                    RecoveryPolicy::Quarantine,
+                    Ok(w),
+                ) => {
                     let actions = &w.recovery_report().actions;
-                    assert!(
-                        matches!(&actions[0], RecoveryAction::ZeroedUncommitted { segment, offset, len: l } if *segment == path && *offset == seal + 4 && *l == len),
-                        "{what}: {actions:?}"
-                    );
-                    assert_eq!(actions.len(), segs.len(), "{what}: {actions:?}");
-                    for (action, (b, p)) in actions[1..].iter().zip(&segs[1..]) {
+                    let disconnected = match expect {
+                        Expect::BrokenAtSeal => {
+                            assert_repaired(
+                                &actions[0],
+                                &path,
+                                seal,
+                                &damaged,
+                                CorruptReason::BrokenChain(339),
+                            );
+                            &actions[1..]
+                        }
+                        _ => &actions[..],
+                    };
+                    assert_eq!(disconnected.len(), segs.len() - 1, "{what}: {actions:?}");
+                    for (action, (b, p)) in disconnected.iter().zip(&segs[1..]) {
                         assert!(
                             matches!(action, RecoveryAction::QuarantinedSegment { segment, reason: CorruptReason::BrokenChain(r), .. } if segment.file_name() == p.file_name() && r == b),
                             "{what}: {action:?}"
@@ -846,38 +928,50 @@ fn successor_that_does_not_open_ends_the_chain_at_the_seals_place() {
                     }
                     assert_eq!(w.next_seq(), 339, "{what}");
                     drop(w);
-                    // Zeroed in place: segment 0 keeps its file identity (not replaced), and the bytes after the
-                    // empty word are zero now.
+                    // Replaced (a new file) when there was a tail to preserve; left in place, unchanged, otherwise.
                     let m = fs::metadata(&path).unwrap();
-                    assert_eq!((m.dev(), m.ino()), identity, "{what}: segment 0 replaced");
-                    let after = fs::read(&path).unwrap();
-                    assert!(
-                        after[(seal + 4) as usize..(seal + 4 + len) as usize]
-                            .iter()
-                            .all(|&b| b == 0),
-                        "{what}: bytes after the empty word not zeroed"
+                    let replaced = (m.dev(), m.ino()) != identity;
+                    assert_eq!(
+                        replaced,
+                        matches!(expect, Expect::BrokenAtSeal),
+                        "{what}: segment 0 replaced"
                     );
+                    if matches!(expect, Expect::Disconnected) {
+                        assert!(
+                            fs::read(&path).unwrap() == damaged,
+                            "{what}: segment 0 changed"
+                        );
+                    }
                     assert_eq!(read_all(dir.path()).len(), 339, "{what}");
-                    // The later segments are preserved unchanged; the zeroed bytes are not.
+                    // Nothing lost: the later segments, unchanged, and the tail, if any, byte for byte.
                     let kept = quarantined(dir.path());
-                    assert_eq!(kept.len(), segs.len() - 1, "{what}");
+                    let tails = usize::from(matches!(expect, Expect::BrokenAtSeal));
+                    assert_eq!(kept.len(), segs.len() - 1 + tails, "{what}: {kept:?}");
                     for (_, bytes) in &before[1..] {
                         assert!(kept.iter().any(|(_, k)| k == bytes), "{what}");
                     }
+                    if tails == 1 {
+                        let end = if stray { seal + 17 } else { seal + 8 };
+                        let tail = &damaged[seal as usize..end as usize];
+                        assert!(kept.iter().any(|(_, k)| k == tail), "{what}: tail");
+                    }
                 }
-                (Expect::ZeroedThenDisconnected(len), RecoveryPolicy::Fail, Err(e)) => {
+                (Expect::BrokenAtSeal, RecoveryPolicy::Fail, Err(e)) => {
+                    assert!(
+                        matches!(&e, Error::Corrupt { path: p, offset, reason: CorruptReason::BrokenChain(339) } if *p == path && *offset == seal),
+                        "{what}: {e:?}"
+                    );
+                    assert!(files(dir.path()) == before_files, "{what}: files changed");
+                    let m = fs::metadata(&path).unwrap();
+                    assert_eq!((m.dev(), m.ino()), identity, "{what}: segment 0 replaced");
+                    assert!(!dir.path().join("quarantine").exists(), "{what}");
+                }
+                (Expect::Disconnected, RecoveryPolicy::Fail, Err(e)) => {
                     assert!(
                         matches!(&e, Error::Corrupt { path: p, offset: 0, reason: CorruptReason::BrokenChain(339) } if *p == successor),
                         "{what}: {e:?}"
                     );
-                    // `Fail` zeroed the bytes after the empty word in place before it reached the successor.
-                    let mut expected = damaged.clone();
-                    expected[(seal + 4) as usize..(seal + 4 + len) as usize].fill(0);
-                    assert!(fs::read(&path).unwrap() == expected, "{what}: segment 0");
-                    assert!(
-                        snapshot(dir.path())[1..] == before[1..],
-                        "{what}: later segments changed"
-                    );
+                    assert!(files(dir.path()) == before_files, "{what}: files changed");
                     assert!(!dir.path().join("quarantine").exists(), "{what}");
                 }
                 (Expect::Preserved(found), RecoveryPolicy::Quarantine, Ok(w)) => {
@@ -895,6 +989,122 @@ fn successor_that_does_not_open_ends_the_chain_at_the_seals_place() {
                     assert!(!dir.path().join("quarantine").exists(), "{what}");
                 }
                 (_, _, other) => panic!("{what}: unexpected {other:?}"),
+            }
+        }
+    }
+}
+
+#[test]
+fn crash_in_the_middle_of_a_broken_chain_repair() {
+    // The repair of `successor_that_does_not_open_ends_the_chain_at_the_seals_place` (a tail after the seal's place in
+    // front of a successor for exactly 339 that does not open), run through and interrupted at either point of the
+    // repair, then reopened: every path ends with the same journal. Segment 0 ends at the seal's place with nothing
+    // after it, the successor and every later segment are in `quarantine/` unchanged, and so is the tail (twice,
+    // identically, when the repair ran twice). Interrupted after the rename, the next open finds nothing after the
+    // empty word, which ends the chain there without zeroing anything, and quarantines the disconnected segments.
+    for (name, one_later, stray) in [
+        ("only the seal's CRC word left", false, false),
+        ("a stray byte past the seal, no higher base", true, true),
+    ] {
+        let base = tempfile::tempdir().unwrap();
+        let segs = sealed_journal(base.path(), one_later);
+        let (_, seal) = record_slots(&segs[0].1);
+        let seg_name = segs[0].1.file_name().unwrap().to_owned();
+        let succ_name = segs[1].1.file_name().unwrap().to_owned();
+        let mut finals = Vec::new();
+        for point in [
+            None,
+            Some(Point::RepairBeforeRename),
+            Some(Point::RepairAfterRename),
+        ] {
+            let what = format!("{name}, {point:?}");
+            let dir = copy_journal(base.path());
+            let path = dir.path().join(&seg_name);
+            let successor = dir.path().join(&succ_name);
+            break_chain_at_seal(&path, &successor, seal, false, stray);
+            let damaged = fs::read(&path).unwrap();
+            let later: Vec<Vec<u8>> = segs[1..]
+                .iter()
+                .map(|(_, p)| fs::read(dir.path().join(p.file_name().unwrap())).unwrap())
+                .collect();
+            if let Some(point) = point {
+                fault::fail_next(point, 5 /* EIO */);
+                let err = Writer::open(dir.path(), small_config()).unwrap_err();
+                fault::clear();
+                assert!(matches!(err, Error::Io { .. }), "{what}: {err}");
+                assert_eq!(quarantined(dir.path()).len(), 1, "{what}: tail preserved");
+                let renamed = fs::read(&path).unwrap() != damaged;
+                assert_eq!(renamed, point == Point::RepairAfterRename, "{what}");
+                assert!(
+                    successor.exists(),
+                    "{what}: successor moved before the repair"
+                );
+            }
+            let w = Writer::open(dir.path(), small_config()).unwrap();
+            let actions = w.recovery_report().actions.clone();
+            assert_eq!(w.next_seq(), 339, "{what}: {actions:?}");
+            drop(w);
+            let repaired = |a: &RecoveryAction| matches!(a, RecoveryAction::RepairedTail { segment, offset, reason: CorruptReason::BrokenChain(339), .. } if *segment == path && *offset == seal);
+            let removed_tmp = |a: &RecoveryAction| matches!(a, RecoveryAction::RemovedTemp { .. });
+            let (first, rest) = match point {
+                None => (1, &actions[1..]),
+                Some(Point::RepairBeforeRename) => (2, &actions[2..]),
+                _ => (0, &actions[..]),
+            };
+            match first {
+                1 => assert!(repaired(&actions[0]), "{what}: {actions:?}"),
+                2 => assert!(
+                    removed_tmp(&actions[0]) && repaired(&actions[1]),
+                    "{what}: {actions:?}"
+                ),
+                _ => {}
+            }
+            assert_eq!(rest.len(), later.len(), "{what}: {actions:?}");
+            assert!(
+                rest.iter().all(|a| matches!(
+                    a,
+                    RecoveryAction::QuarantinedSegment {
+                        reason: CorruptReason::BrokenChain(_),
+                        ..
+                    }
+                )),
+                "{what}: {actions:?}"
+            );
+            let all = read_all(dir.path());
+            assert_eq!(all.len(), 339, "{what}");
+            all.iter().for_each(check_record);
+            let kept = quarantined(dir.path());
+            let end = if stray { seal + 17 } else { seal + 8 };
+            let tail = &damaged[seal as usize..end as usize];
+            let tails = kept.iter().filter(|(_, k)| k == tail).count();
+            let expect_tails = if point == Some(Point::RepairBeforeRename) {
+                2
+            } else {
+                1
+            };
+            assert_eq!(tails, expect_tails, "{what}: {kept:?}");
+            assert_eq!(kept.len(), later.len() + expect_tails, "{what}: {kept:?}");
+            for bytes in &later {
+                assert!(kept.iter().any(|(_, k)| k == bytes), "{what}");
+            }
+            let mut expected = damaged.clone();
+            expected[seal as usize..].fill(0);
+            assert!(fs::read(&path).unwrap() == expected, "{what}: segment 0");
+            // The journal's files: the segments and the checkpoint marker (not the wake-up region, `notify`, which
+            // every open rewrites).
+            finals.push(
+                files(dir.path())
+                    .into_iter()
+                    .filter(|(n, _)| n != "notify")
+                    .collect::<Vec<_>>(),
+            );
+        }
+        for f in &finals {
+            let names =
+                |f: &Vec<(String, Vec<u8>)>| f.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>();
+            assert_eq!(names(f), names(&finals[0]), "{name}");
+            for ((n, a), (_, b)) in f.iter().zip(&finals[0]) {
+                assert!(a == b, "{name}: {n} differs between recovery paths");
             }
         }
     }

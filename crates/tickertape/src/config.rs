@@ -3,10 +3,12 @@
 use std::time::Duration;
 
 /// What the writer does on open when it finds corruption after the last checkpoint: an invalid record or seal, a
-/// segment disconnected from the chain, or an empty commit word after which recovery finds evidence of committed
+/// segment disconnected from the chain, an empty commit word after which recovery finds evidence of committed
 /// history ([`CorruptReason::EmptyCommitWord`](crate::CorruptReason::EmptyCommitWord), or
-/// [`CorruptReason::UncheckedTail`](crate::CorruptReason::UncheckedTail) when its search stops at its work bound;
-/// `docs/crash-contract.md`, C11, and ADR 0035 have the rules).
+/// [`CorruptReason::UncheckedTail`](crate::CorruptReason::UncheckedTail) when its search stops at its work bound), or
+/// non-zero bytes after an empty commit word in front of a segment for the expected sequence number that exists but
+/// does not open ([`CorruptReason::BrokenChain`](crate::CorruptReason::BrokenChain); `docs/crash-contract.md`, C11,
+/// and ADR 0035 have the rules).
 ///
 /// A writer *process* crash in an otherwise intact journal usually does not produce this; power loss, storage errors
 /// or outside modification do. The exception (`docs/crash-contract.md`, C1): the payload of the record being written

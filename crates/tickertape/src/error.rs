@@ -211,7 +211,13 @@ pub enum CorruptReason {
     /// opens, when non-zero bytes follow beyond the seal's eight bytes (`docs/crash-contract.md`, C11 (1)).
     #[error("invalid seal")]
     BadSeal,
-    /// A sealed segment's successor is missing while later segments exist, or doesn't start where the seal says.
+    /// The chain of segments is broken: a sealed segment's successor is missing or doesn't start where the seal
+    /// says, a segment is disconnected from the chain, or the chain ends at an empty commit word in a segment that is
+    /// not the newest. The number is the base the next segment in the chain should have, or, for a segment writer
+    /// recovery found disconnected (reported at offset 0), that segment's own base. Writer recovery reports the last
+    /// case at an empty commit word with non-zero bytes after it in front of a segment for the expected sequence number
+    /// that exists but does not open (`docs/crash-contract.md`, C11 (3)); `verify` reports it wherever the records of a
+    /// segment other than the newest end at an empty commit word with no committed history found after it.
     #[error("next segment {0} missing or inconsistent")]
     BrokenChain(u64),
     /// The checkpoint marker points to a segment that doesn't exist, or to an impossible offset.

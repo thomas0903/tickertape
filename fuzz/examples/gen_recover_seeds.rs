@@ -416,6 +416,44 @@ fn main() {
         ));
     }
 
+    // ADR 0035 → Damage around a seal: the seal's marker zeroed (its CRC word intact) and the successor's header
+    // invalid, so the successor does not open and the chain is broken at the seal's place. The CRC word is preserved
+    // and the first segment replaced (`BrokenChain`), then the successor and the later segment are quarantined as
+    // disconnected; `Fail` refuses at the seal's place without changing a byte. The second pair: a stray byte past the
+    // seal and no segment after the successor, handled the same way.
+    for (name, ops, later, policy) in [
+        (
+            "seal_marker_zeroed_successor_invalid",
+            &marker_zeroed,
+            true,
+            QUARANTINE,
+        ),
+        (
+            "seal_marker_zeroed_successor_invalid_fail",
+            &marker_zeroed,
+            true,
+            FAIL,
+        ),
+        (
+            "seal_marker_zeroed_stray_byte_successor_invalid",
+            &marker_zeroed_stray,
+            false,
+            QUARANTINE,
+        ),
+        (
+            "seal_marker_zeroed_stray_byte_successor_invalid_fail",
+            &marker_zeroed_stray,
+            false,
+            FAIL,
+        ),
+    ] {
+        let mut segments = vec![continuing(ops), continuing(&bad_magic)];
+        if later {
+            segments.push(absolute(1000, &eight));
+        }
+        seeds.push((name, input(policy, &segments, 0, &[])));
+    }
+
     // Review round 1, item 3: a torn append of record 25 whose payload holds a frame with sequence number 26 (a copy
     // of record 0's 140-byte frame, renumbered and re-checksummed). With the torn frame's body complete (its CRC
     // stored for a 188-byte frame, commit word never stored) the embedded frame lies inside it: a torn append, zeroed
