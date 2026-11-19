@@ -1038,9 +1038,11 @@ impl Sampler {
                     continue;
                 }
             }
+            // The record to re-read next time: the last one this scan passed, else the proven one from before (still
+            // in this file, before the head).
             let last_record = match (scan.last, scan.last_at) {
                 (Some(h), Some(at)) => Some((at, h)),
-                _ => carried.and_then(|p| p.last_record),
+                _ => proven.and_then(|p| p.last_record),
             };
             let head = Head {
                 position: scan.end_position,

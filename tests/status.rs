@@ -224,8 +224,9 @@ fn status_never_interferes_with_the_writer() {
 /// Round 2, B1: samples taken while the writer checkpoints and retention removes old segments never report a healthy
 /// journal as corrupt. Retention (here: keep only the checkpoint's segment and newer) removes only segments before
 /// the checkpoint's, so a sample whose listing and marker disagree, or whose checkpoint segment vanishes after the
-/// listing, must re-read them instead of reporting a dangling marker. Runs for `TT_STRESS_MS` (default 1500 ms);
-/// races are most frequent where syncs are cheap (tmpfs: `TMPDIR=/dev/shm`).
+/// listing, must re-read them instead of reporting a dangling marker. Runs for `TT_STRESS_MS` (default 1500 ms) and
+/// at least 20 checkpoints into a new segment (each followed by a removal; slower where syncs are slow, up to a
+/// minute); races are most frequent where syncs are cheap (tmpfs: `TMPDIR=/dev/shm`).
 #[test]
 fn samples_during_retention_are_never_corrupt() {
     let _serial = serial();
@@ -277,7 +278,10 @@ fn samples_during_retention_are_never_corrupt() {
         let payload = vec![7u8; 20_000];
         let started = Instant::now();
         let mut rolled = 0u64;
-        while started.elapsed() < run {
+        // Long enough for retention to have work, however slow the syncs (btrfs can take a fraction of a second).
+        while (started.elapsed() < run || rolled < 20)
+            && started.elapsed() < Duration::from_secs(60)
+        {
             let before = writer.metrics().head.segment_base_seq;
             for _ in 0..3 {
                 writer
@@ -302,7 +306,7 @@ fn samples_during_retention_are_never_corrupt() {
     });
     let (samples, errors) = (samples.into_inner(), errors.into_inner());
     eprintln!("{samples} samples, {errors} I/O errors, {segments} rolls");
-    assert!(segments > 10, "retention had little to do");
+    assert!(segments >= 20, "retention had little to do");
     assert!(samples > 100);
     assert!(
         errors * 20 <= samples,
