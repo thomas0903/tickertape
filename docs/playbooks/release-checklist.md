@@ -51,7 +51,8 @@ single-maintainer repository. Administrators are subject to the checks; force pu
    (tests, benches, examples and the C ABI crate `tickertape-ffi`) have `publish = false`; the release script refuses
    a member that is neither released nor marked so. Releases do not ship the C library yet (ADR 0028). Before 1.0 the
    C ABI is unstable (ABI version 0) and programs require the exact library version; if it changed, the changelog
-   must say so. Dry-running both packages together requires Cargo 1.90+. The release scripts require Python 3.11+; CI
+   must say so. Bump `TICKERTAPE_HPP_VERSION_*` in `crates/tickertape-ffi/include/tickertape.hpp` with the crate
+   version (a test fails otherwise); the C++ binding has the release's version (ADR 0036). Dry-running both packages together requires Cargo 1.90+. The release scripts require Python 3.11+; CI
    selects Python 3.12.
 
 ### C ABI at 1.0 (ADR 0028 → Versioning)

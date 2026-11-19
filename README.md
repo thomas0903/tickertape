@@ -113,14 +113,14 @@ python3 -c "import duckdb; print(duckdb.sql(\"SELECT kind, count(*), min(seq), m
 CLI reference, exit codes and the JSONL and Parquet schemas: [`docs/cli.md`](docs/cli.md).
 Choosing segment sizes and checkpoint intervals, archiving old segments, monitoring and what to do after a crash:
 [`docs/operations.md`](docs/operations.md).
-
 From other languages:
 
-| Language | How | Docs |
-|---|---|---|
-| C, C++ | The C ABI and header in `crates/tickertape-ffi` (not stable before 1.0) | [`docs/c-api.md`](docs/c-api.md) |
-| Java (JDK 25+) | A binding over the C ABI with the Foreign Function and Memory API, in `bindings/java` (not yet on Maven Central) | [`docs/java-api.md`](docs/java-api.md) |
-| Python | A dependency-free, read-only decoder, `python/tickertape_reader.py` | [`python/`](python/README.md) |
+| Language | What | Status | Docs |
+|---|---|---|---|
+| C (and others through FFI) | C ABI: `libtickertape` and `tickertape.h` | not stable before 1.0 | [`docs/c-api.md`](docs/c-api.md) |
+| C++ | Header-only C++17 binding over the C ABI: `tickertape.hpp` (RAII handles, borrowed views, works without exceptions) | not stable before 1.0 | [`docs/cpp-api.md`](docs/cpp-api.md) |
+| Java (JDK 25+) | Binding over the C ABI with the Foreign Function and Memory API, in `bindings/java` | not yet on Maven Central | [`docs/java-api.md`](docs/java-api.md) |
+| Python | Read-only decoder without dependencies | | [`python/`](python/README.md) |
 
 ## Guarantees, in short
 
@@ -170,8 +170,8 @@ Background research: [`docs/research/2026-10-31-market-review.md`](docs/research
 
 ## Project layout
 
-`crates/tickertape` (library) · `crates/tickertape-cli` (the `tickertape` binary) · `crates/tickertape-ffi` (C ABI
-and header) · `bindings/java` (Java binding) · `tests/` (cross-process and crash tests) · `fuzz/` · `benches/` · `examples/` · `docs/` (format, crash contract, decisions, playbooks).
+`crates/tickertape` (library) · `crates/tickertape-cli` (the `tickertape` binary) · `crates/tickertape-ffi` (C ABI,
+C header and C++ binding) · `bindings/java` (Java binding) · `tests/` (cross-process and crash tests) · `fuzz/` · `benches/` · `examples/` · `docs/` (format, crash contract, decisions, playbooks).
 Contributions: [`CONTRIBUTING.md`](CONTRIBUTING.md). Security issues: [`SECURITY.md`](SECURITY.md).
 
 ## Licence
