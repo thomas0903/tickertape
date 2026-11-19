@@ -31,7 +31,7 @@ cargo test --workspace --all-features
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 cargo +1.85 check --workspace --all-features --all-targets   # MSRV
 cargo deny check
-cargo test -p tickertape-tests --release -- --ignored        # long tests: 1M records, 250-kill loop
+cargo test -p tickertape-tests --release -- --ignored        # long tests: 1M records, 250-kill loop, 20 s soak
 cargo +nightly miri test -p tickertape --lib format          # Miri on the format code
 RUSTFLAGS="--cfg loom" cargo test -p tickertape --lib --release protocol_model
 cargo +nightly miri test -p tickertape-ffi --lib pure_         # Miri on the C ABI's argument handling
@@ -41,11 +41,25 @@ cbindgen --config crates/tickertape-ffi/cbindgen.toml --crate tickertape-ffi \
 python3 .github/scripts/check_abi_baseline.py crates/tickertape-ffi/abi/tickertape-baseline.h \
     crates/tickertape-ffi/include/tickertape.h                   # frozen C declarations (from 1.0)
 python3 -m unittest discover -s .github/scripts -p 'test_*.py'  # release and ABI tooling
+tests/compat/generate.sh --check-old-readers                 # released readers on new journals (ADR 0033)
+go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12    # workflow lint
 ```
 
 `cargo test --workspace` compiles and runs C and C++ programs, so it needs a C/C++ compiler; it also runs the
 Python decoder if `python3` is available. On Linux, CI also runs the C programs under Valgrind
 (`TICKERTAPE_FFI_VALGRIND=1`).
+
+CI runs these on Linux x86-64 and macOS, and the tests, long tests and fuzz smoke on aarch64 Linux too.
+`cargo test --workspace` includes the format-v1 compatibility fixtures (`tests/compat/README.md`), which check the
+CLI and the Python decoder too and need `python3` in CI. A weekly workflow (`.github/workflows/soak.yml`) runs the
+soak for 90 minutes per platform; run it locally for longer before changing recovery, the writer or the readers:
+
+```bash
+TICKERTAPE_SOAK_SECS=1800 cargo test -p tickertape-tests --release --test soak -- --ignored --nocapture
+```
+
+It prints its seed and what it exercised; on failure it keeps the journal and logs in `target/tmp/soak-failures/`
+and prints the command that replays the seed (`TICKERTAPE_TEST_SEED`).
 
 On macOS, run the Linux checks in a VM or container too (`docs/playbooks/test-on-linux.md`), and keep test journals
 on a local filesystem (not tmpfs or a shared folder) when you test durability behaviour.

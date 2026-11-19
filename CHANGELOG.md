@@ -35,6 +35,14 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   matrix of long probe, sustained-visibility and periodic-durability runs for every comparison tool, and
   `benches/session.py` runs a whole recorded session with environment capture, a manifest and a time estimate. No
   library or format change; the bench crate now depends on `nix`.
+- Tests: format-v1 compatibility fixtures (ADR 0033). Journals written by the v0.1.0 to v0.4.0 writers themselves
+  (clean and killed mid-append, on Linux aarch64, Linux x86-64 and macOS) are committed with a manifest; the current
+  readers, `verify`, writer recovery, the CLI and the Python decoder are checked against them, and every released
+  version's readers are checked against journals from the current writer (`tests/compat/generate.sh`).
+- Tests: a soak tier (`tests/soak.rs`) combining writer kills, rolls, checkpoints, retention, injected corruption,
+  storage-full and checkpoint failures with six reader processes, for a configurable time, reproducible from a
+  seed. CI runs a 20 s smoke in the long tests and 90 minutes per platform weekly (`.github/workflows/soak.yml`).
+- CI: tests, long tests and the fuzz smoke on aarch64 Linux (`ubuntu-24.04-arm`).
 - Docs: define the path to v1.0 around sustained performance, optional eBPF diagnostics, reader/checkpoint
   optimization, ARM measurements, interoperability, replay/recovery at scale and explicit stability/release gates.
 - Docs: v1.0 scope decisions of 2026-11-19. The external integration is an iceoryx2 recorder and replayer

@@ -412,21 +412,22 @@ fn sustained_bursty_schedule_is_stored_in_the_journal() {
 #[test]
 fn sustained_unpaced_retention_removes_segments_under_a_lagging_reader() {
     // Whether retention overtakes the lagging reader within a short run depends on how fast the writer gets on
-    // this machine at this moment (a loaded runner has given it as few as 60 records/s). No choice of durations
-    // makes that certain, so: every run must satisfy the accounting, and the test repeats the run until one
-    // shows the reader being overtaken. The settings make that the usual first outcome: the reader stalls for
-    // 400 ms in every 500 ms, a 64 KiB segment holds 15 of the 4 KiB records, and the writer checkpoints every
-    // 15 records, so retention (two segments) acts after every roll.
-    const ATTEMPTS: usize = 6;
+    // this machine at this moment (a loaded runner has given it as few as 60 records/s). No fixed duration makes
+    // that certain, so: every run must satisfy the accounting, and the test repeats the run, for longer each time,
+    // until one shows the reader being overtaken. The settings make that the usual first outcome: the reader
+    // stalls for 400 ms in every 500 ms, a 64 KiB segment holds 15 of the 4 KiB records, and the writer checkpoints
+    // every 15 records, so retention (two segments) acts after every roll. The longer attempts are for machines
+    // under heavy load, where two seconds of writing have not always been enough even after several tries.
+    const DURATIONS: [&str; 5] = ["2s", "2s", "4s", "8s", "16s"];
     let mut last = Value::Null;
-    for _ in 0..ATTEMPTS {
+    for duration in DURATIONS {
         let root = tempfile::tempdir().unwrap();
         let result = sustained(
             root.path(),
             &[
                 "--unpaced",
                 "--duration",
-                "2s",
+                duration,
                 "--payload",
                 "4096",
                 "--segment-size",
@@ -466,7 +467,10 @@ fn sustained_unpaced_retention_removes_segments_under_a_lagging_reader() {
         }
         last = serde_json::json!({ "writer": writer, "lagging_reader": lagging });
     }
-    panic!("retention never overtook the lagging reader in {ATTEMPTS} runs; last run: {last}");
+    panic!(
+        "retention never overtook the lagging reader in {} runs of up to 16 s; last run: {last}",
+        DURATIONS.len()
+    );
 }
 
 #[test]

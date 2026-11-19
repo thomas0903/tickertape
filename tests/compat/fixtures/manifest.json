@@ -1,0 +1,2370 @@
+{
+  "description": "Format-v1 journals written by released tickertape versions. See tests/compat/README.md.",
+  "format_version": 1,
+  "pack_format": "TTFXPACK v1, see tests/compat/pack.py",
+  "stream_digest": "SHA-256 over every record in sequence order: seq u64 LE, schema_id u32 LE, venue_ts_ns u64 LE, local_ts_ns u64 LE, payload length u64 LE, payload",
+  "fixtures": [
+    {
+      "name": "v0.1.0-linux-aarch64-clean",
+      "pack": "v0.1.0-linux-aarch64-clean.ttfx",
+      "tag": "v0.1.0",
+      "commit": "a3bd87ce46f938d60c20941fe6bf70cfa0956ec2",
+      "os": "linux",
+      "arch": "aarch64",
+      "platform": "Linux 7.2.12-orbstack-00394-gbecdd6130068 aarch64; OrbStack VM (Linux on macOS) on an Apple M4 Pro; journals on btrfs",
+      "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+      "generator_command": "tests/compat/generate.sh v0.1.0, which runs: tt-compat-gen clean <dir>",
+      "kind": "clean",
+      "library_version": "0.1.0",
+      "segment_size": 65536,
+      "records": 128,
+      "first_seq": 0,
+      "last_seq": 127,
+      "next_seq": 128,
+      "stream_sha256": "19815d9e6b90ced060cac06e47d4db6c64d5624cd33f73bfc78931032201d47b",
+      "durable_records": 82,
+      "durable_stream_sha256": "ada875c24fe142e88f05ac1f6b83731c6e2378d1d66d3784cc9a2bac62d8102e",
+      "checkpoint": {
+        "generation": 1,
+        "next_seq": 82,
+        "segment_base_seq": 41,
+        "offset": 45480
+      },
+      "segments": [
+        {
+          "file": "00000000000000000000.tape",
+          "base_seq": 0,
+          "records": 40,
+          "end_seq": 40,
+          "used_bytes": 4608,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000040.tape",
+          "base_seq": 40,
+          "records": 1,
+          "end_seq": 41,
+          "used_bytes": 65536,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000041.tape",
+          "base_seq": 41,
+          "records": 66,
+          "end_seq": 107,
+          "used_bytes": 48840,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000107.tape",
+          "base_seq": 107,
+          "records": 21,
+          "end_seq": 128,
+          "used_bytes": 32776,
+          "end": "open"
+        }
+      ],
+      "files": [
+        {
+          "name": "00000000000000000000.tape",
+          "len": 65536,
+          "sha256": "9f7496d10f0be843f49013621ff9a97e1582b3db92ca3ee9c28ccd76e3dd8e5a"
+        },
+        {
+          "name": "00000000000000000040.tape",
+          "len": 65536,
+          "sha256": "541f42d58ac7f456add0c2af959b41853ea16e2d0d84f94df0a3b27b051336e6"
+        },
+        {
+          "name": "00000000000000000041.tape",
+          "len": 65536,
+          "sha256": "c389f963e25bbc1f348e6010a5cde1f63ccdf25f834ed6a1c84e2b420e443058"
+        },
+        {
+          "name": "00000000000000000107.tape",
+          "len": 65536,
+          "sha256": "9e8ab9d08cf9fc0a2d2c6028b488f63e31bb26e6c9db4772d3f7aaf96d24317d"
+        },
+        {
+          "name": "checkpoint",
+          "len": 131072,
+          "sha256": "b5999fd490e6ce3d19e478f6fc0bee547ec573750a41c4f3e635f40959cf4dc5"
+        },
+        {
+          "name": "writer.lock",
+          "len": 4,
+          "sha256": "6a27eece1c1658b237aede5c6c2b8af51d235ca08b2f7963b67d99caa7a12395"
+        }
+      ]
+    },
+    {
+      "name": "v0.1.0-linux-aarch64-torn",
+      "pack": "v0.1.0-linux-aarch64-torn.ttfx",
+      "tag": "v0.1.0",
+      "commit": "a3bd87ce46f938d60c20941fe6bf70cfa0956ec2",
+      "os": "linux",
+      "arch": "aarch64",
+      "platform": "Linux 7.2.12-orbstack-00394-gbecdd6130068 aarch64; OrbStack VM (Linux on macOS) on an Apple M4 Pro; journals on btrfs",
+      "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+      "generator_command": "tests/compat/generate.sh v0.1.0, which runs: tt-compat-gen torn <dir>",
+      "kind": "torn",
+      "library_version": "0.1.0",
+      "segment_size": 65536,
+      "records": 143,
+      "first_seq": 0,
+      "last_seq": 142,
+      "next_seq": 143,
+      "stream_sha256": "87521d92686ac52edd7836b8ef0244b20fc692676f5180fb335200fa4f7236b0",
+      "durable_records": 82,
+      "durable_stream_sha256": "ada875c24fe142e88f05ac1f6b83731c6e2378d1d66d3784cc9a2bac62d8102e",
+      "checkpoint": {
+        "generation": 1,
+        "next_seq": 82,
+        "segment_base_seq": 41,
+        "offset": 45480
+      },
+      "segments": [
+        {
+          "file": "00000000000000000000.tape",
+          "base_seq": 0,
+          "records": 40,
+          "end_seq": 40,
+          "used_bytes": 4608,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000040.tape",
+          "base_seq": 40,
+          "records": 1,
+          "end_seq": 41,
+          "used_bytes": 65536,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000041.tape",
+          "base_seq": 41,
+          "records": 66,
+          "end_seq": 107,
+          "used_bytes": 48840,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000107.tape",
+          "base_seq": 107,
+          "records": 36,
+          "end_seq": 143,
+          "used_bytes": 35264,
+          "end": "open"
+        }
+      ],
+      "torn": {
+        "file": "00000000000000000107.tape",
+        "offset": 35264,
+        "uncommitted_end": 35504
+      },
+      "files": [
+        {
+          "name": "00000000000000000000.tape",
+          "len": 65536,
+          "sha256": "ff15d1f106c8f82383650d4c7078a571cab070526758fbf34e1ea7dc200bcb61"
+        },
+        {
+          "name": "00000000000000000040.tape",
+          "len": 65536,
+          "sha256": "699191550ec93eb6430d4b99fa9f21d1267a3db3528e31d122c67f7f082a2865"
+        },
+        {
+          "name": "00000000000000000041.tape",
+          "len": 65536,
+          "sha256": "2a289e25a0d4414534b23141a3987d87bd173bb30fe13cb35c594b885021907d"
+        },
+        {
+          "name": "00000000000000000107.tape",
+          "len": 65536,
+          "sha256": "5981dd0c44aa2582658e356352e6b53ce2a04813166f67068e88a552b6889098"
+        },
+        {
+          "name": "checkpoint",
+          "len": 131072,
+          "sha256": "b5999fd490e6ce3d19e478f6fc0bee547ec573750a41c4f3e635f40959cf4dc5"
+        },
+        {
+          "name": "writer.lock",
+          "len": 4,
+          "sha256": "477e2d13152129e72c4a47a5abed06ce422daff2ca0e99d33bc527477effee34"
+        }
+      ]
+    },
+    {
+      "name": "v0.1.0-linux-x86_64-clean",
+      "pack": "v0.1.0-linux-x86_64-clean.ttfx",
+      "tag": "v0.1.0",
+      "commit": "a3bd87ce46f938d60c20941fe6bf70cfa0956ec2",
+      "os": "linux",
+      "arch": "x86_64",
+      "platform": "Linux 7.2.12-orbstack-00394-gbecdd6130068 x86_64; Docker linux/amd64 container (rust:1.99 image) under Rosetta emulation in OrbStack on an Apple M4 Pro; journals on the container overlay filesystem",
+      "rustc": "rustc 1.100.0 (0ef1bc386 2026-11-09)",
+      "generator_command": "tests/compat/generate.sh v0.1.0, which runs: tt-compat-gen clean <dir>",
+      "kind": "clean",
+      "library_version": "0.1.0",
+      "segment_size": 65536,
+      "records": 128,
+      "first_seq": 0,
+      "last_seq": 127,
+      "next_seq": 128,
+      "stream_sha256": "19815d9e6b90ced060cac06e47d4db6c64d5624cd33f73bfc78931032201d47b",
+      "durable_records": 82,
+      "durable_stream_sha256": "ada875c24fe142e88f05ac1f6b83731c6e2378d1d66d3784cc9a2bac62d8102e",
+      "checkpoint": {
+        "generation": 1,
+        "next_seq": 82,
+        "segment_base_seq": 41,
+        "offset": 45480
+      },
+      "segments": [
+        {
+          "file": "00000000000000000000.tape",
+          "base_seq": 0,
+          "records": 40,
+          "end_seq": 40,
+          "used_bytes": 4608,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000040.tape",
+          "base_seq": 40,
+          "records": 1,
+          "end_seq": 41,
+          "used_bytes": 65536,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000041.tape",
+          "base_seq": 41,
+          "records": 66,
+          "end_seq": 107,
+          "used_bytes": 48840,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000107.tape",
+          "base_seq": 107,
+          "records": 21,
+          "end_seq": 128,
+          "used_bytes": 32776,
+          "end": "open"
+        }
+      ],
+      "files": [
+        {
+          "name": "00000000000000000000.tape",
+          "len": 65536,
+          "sha256": "ab8ccbb61d4faa9c935ef4820af083425ef7758408d83e015c314c165b945613"
+        },
+        {
+          "name": "00000000000000000040.tape",
+          "len": 65536,
+          "sha256": "aa2f9d574726480025273867179a0c88347aa1d3447a604ca8c310c398e51ae7"
+        },
+        {
+          "name": "00000000000000000041.tape",
+          "len": 65536,
+          "sha256": "31fe409b37d246ffd818971087aebc0193a0b9dc25e82fa7352407ab82d3246b"
+        },
+        {
+          "name": "00000000000000000107.tape",
+          "len": 65536,
+          "sha256": "df2b787816696a9291aef86148eab64deaf056351ee15c4cadc8e043807f99e6"
+        },
+        {
+          "name": "checkpoint",
+          "len": 131072,
+          "sha256": "b5999fd490e6ce3d19e478f6fc0bee547ec573750a41c4f3e635f40959cf4dc5"
+        },
+        {
+          "name": "writer.lock",
+          "len": 3,
+          "sha256": "4a30a219a9d7663fdd35c0a5df49c8d55018f13a0c53e10dd8efe8f7e4cc5d89"
+        }
+      ]
+    },
+    {
+      "name": "v0.1.0-linux-x86_64-torn",
+      "pack": "v0.1.0-linux-x86_64-torn.ttfx",
+      "tag": "v0.1.0",
+      "commit": "a3bd87ce46f938d60c20941fe6bf70cfa0956ec2",
+      "os": "linux",
+      "arch": "x86_64",
+      "platform": "Linux 7.2.12-orbstack-00394-gbecdd6130068 x86_64; Docker linux/amd64 container (rust:1.99 image) under Rosetta emulation in OrbStack on an Apple M4 Pro; journals on the container overlay filesystem",
+      "rustc": "rustc 1.100.0 (0ef1bc386 2026-11-09)",
+      "generator_command": "tests/compat/generate.sh v0.1.0, which runs: tt-compat-gen torn <dir>",
+      "kind": "torn",
+      "library_version": "0.1.0",
+      "segment_size": 65536,
+      "records": 143,
+      "first_seq": 0,
+      "last_seq": 142,
+      "next_seq": 143,
+      "stream_sha256": "87521d92686ac52edd7836b8ef0244b20fc692676f5180fb335200fa4f7236b0",
+      "durable_records": 82,
+      "durable_stream_sha256": "ada875c24fe142e88f05ac1f6b83731c6e2378d1d66d3784cc9a2bac62d8102e",
+      "checkpoint": {
+        "generation": 1,
+        "next_seq": 82,
+        "segment_base_seq": 41,
+        "offset": 45480
+      },
+      "segments": [
+        {
+          "file": "00000000000000000000.tape",
+          "base_seq": 0,
+          "records": 40,
+          "end_seq": 40,
+          "used_bytes": 4608,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000040.tape",
+          "base_seq": 40,
+          "records": 1,
+          "end_seq": 41,
+          "used_bytes": 65536,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000041.tape",
+          "base_seq": 41,
+          "records": 66,
+          "end_seq": 107,
+          "used_bytes": 48840,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000107.tape",
+          "base_seq": 107,
+          "records": 36,
+          "end_seq": 143,
+          "used_bytes": 35264,
+          "end": "open"
+        }
+      ],
+      "torn": {
+        "file": "00000000000000000107.tape",
+        "offset": 35264,
+        "uncommitted_end": 35504
+      },
+      "files": [
+        {
+          "name": "00000000000000000000.tape",
+          "len": 65536,
+          "sha256": "218ca7621d625c9ed8a9f8e1b3b553ba9165e4e49765210ea0c27c7ca10e359f"
+        },
+        {
+          "name": "00000000000000000040.tape",
+          "len": 65536,
+          "sha256": "c26c76e493f4aecd13814171c2d4d527ba560d667b4b80a69fe2e9b6715fa305"
+        },
+        {
+          "name": "00000000000000000041.tape",
+          "len": 65536,
+          "sha256": "e351219185ff9ebfa9408dc3b44d3516cc7ac16c29fbf9249746bc2a2cce3039"
+        },
+        {
+          "name": "00000000000000000107.tape",
+          "len": 65536,
+          "sha256": "6b276974ddc17bc557862863826876acae15a8d282398aaffb7cd0c5a6659297"
+        },
+        {
+          "name": "checkpoint",
+          "len": 131072,
+          "sha256": "b5999fd490e6ce3d19e478f6fc0bee547ec573750a41c4f3e635f40959cf4dc5"
+        },
+        {
+          "name": "writer.lock",
+          "len": 3,
+          "sha256": "d83c7ee736be931d85b78a4a60881ced3ff9a31bb417804e45b1d30de40f94f2"
+        }
+      ]
+    },
+    {
+      "name": "v0.1.0-macos-aarch64-clean",
+      "pack": "v0.1.0-macos-aarch64-clean.ttfx",
+      "tag": "v0.1.0",
+      "commit": "a3bd87ce46f938d60c20941fe6bf70cfa0956ec2",
+      "os": "macos",
+      "arch": "aarch64",
+      "platform": "macOS 27.2.1 (Darwin 27.2.0 arm64); Apple M4 Pro; journals on APFS",
+      "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+      "generator_command": "tests/compat/generate.sh v0.1.0, which runs: tt-compat-gen clean <dir>",
+      "kind": "clean",
+      "library_version": "0.1.0",
+      "segment_size": 65536,
+      "records": 128,
+      "first_seq": 0,
+      "last_seq": 127,
+      "next_seq": 128,
+      "stream_sha256": "19815d9e6b90ced060cac06e47d4db6c64d5624cd33f73bfc78931032201d47b",
+      "durable_records": 82,
+      "durable_stream_sha256": "ada875c24fe142e88f05ac1f6b83731c6e2378d1d66d3784cc9a2bac62d8102e",
+      "checkpoint": {
+        "generation": 1,
+        "next_seq": 82,
+        "segment_base_seq": 41,
+        "offset": 45480
+      },
+      "segments": [
+        {
+          "file": "00000000000000000000.tape",
+          "base_seq": 0,
+          "records": 40,
+          "end_seq": 40,
+          "used_bytes": 4608,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000040.tape",
+          "base_seq": 40,
+          "records": 1,
+          "end_seq": 41,
+          "used_bytes": 65536,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000041.tape",
+          "base_seq": 41,
+          "records": 66,
+          "end_seq": 107,
+          "used_bytes": 48840,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000107.tape",
+          "base_seq": 107,
+          "records": 21,
+          "end_seq": 128,
+          "used_bytes": 32776,
+          "end": "open"
+        }
+      ],
+      "files": [
+        {
+          "name": "00000000000000000000.tape",
+          "len": 65536,
+          "sha256": "ceffd08249e051f58e3e28cf17746e96c96b3ddc4f49f273a0ee1b9d14d974c1"
+        },
+        {
+          "name": "00000000000000000040.tape",
+          "len": 65536,
+          "sha256": "67acc90160426738dd5a6761707e4c695b423040195d10522787eb2401c49c3f"
+        },
+        {
+          "name": "00000000000000000041.tape",
+          "len": 65536,
+          "sha256": "19c988aa9aa0dfc47495745c42de14a85b4d6bc3cbceeb3740605eef22bd9d90"
+        },
+        {
+          "name": "00000000000000000107.tape",
+          "len": 65536,
+          "sha256": "9f89df9b138e9275ca07e630c0e3f89d0bc1b5433459da2fa69bd7948af23971"
+        },
+        {
+          "name": "checkpoint",
+          "len": 131072,
+          "sha256": "b5999fd490e6ce3d19e478f6fc0bee547ec573750a41c4f3e635f40959cf4dc5"
+        },
+        {
+          "name": "writer.lock",
+          "len": 4,
+          "sha256": "3b25e0d5df8f8001725cde4476e96f163548426c2ac14f6755e5285cfcd75690"
+        }
+      ]
+    },
+    {
+      "name": "v0.1.0-macos-aarch64-torn",
+      "pack": "v0.1.0-macos-aarch64-torn.ttfx",
+      "tag": "v0.1.0",
+      "commit": "a3bd87ce46f938d60c20941fe6bf70cfa0956ec2",
+      "os": "macos",
+      "arch": "aarch64",
+      "platform": "macOS 27.2.1 (Darwin 27.2.0 arm64); Apple M4 Pro; journals on APFS",
+      "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+      "generator_command": "tests/compat/generate.sh v0.1.0, which runs: tt-compat-gen torn <dir>",
+      "kind": "torn",
+      "library_version": "0.1.0",
+      "segment_size": 65536,
+      "records": 143,
+      "first_seq": 0,
+      "last_seq": 142,
+      "next_seq": 143,
+      "stream_sha256": "87521d92686ac52edd7836b8ef0244b20fc692676f5180fb335200fa4f7236b0",
+      "durable_records": 82,
+      "durable_stream_sha256": "ada875c24fe142e88f05ac1f6b83731c6e2378d1d66d3784cc9a2bac62d8102e",
+      "checkpoint": {
+        "generation": 1,
+        "next_seq": 82,
+        "segment_base_seq": 41,
+        "offset": 45480
+      },
+      "segments": [
+        {
+          "file": "00000000000000000000.tape",
+          "base_seq": 0,
+          "records": 40,
+          "end_seq": 40,
+          "used_bytes": 4608,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000040.tape",
+          "base_seq": 40,
+          "records": 1,
+          "end_seq": 41,
+          "used_bytes": 65536,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000041.tape",
+          "base_seq": 41,
+          "records": 66,
+          "end_seq": 107,
+          "used_bytes": 48840,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000107.tape",
+          "base_seq": 107,
+          "records": 36,
+          "end_seq": 143,
+          "used_bytes": 35264,
+          "end": "open"
+        }
+      ],
+      "torn": {
+        "file": "00000000000000000107.tape",
+        "offset": 35264,
+        "uncommitted_end": 35504
+      },
+      "files": [
+        {
+          "name": "00000000000000000000.tape",
+          "len": 65536,
+          "sha256": "b39a01e3248d729659197f54cc85ff0ab4aca21b827ced96dc9f525a48e070e8"
+        },
+        {
+          "name": "00000000000000000040.tape",
+          "len": 65536,
+          "sha256": "1b65a61aa468ae9fcd5a476cd3e2436f8aada225a82240c34efa92f817dd15d9"
+        },
+        {
+          "name": "00000000000000000041.tape",
+          "len": 65536,
+          "sha256": "c8cc6439162c45ee323dad5b2beb9c740a7c5c7d2e326fdc4407e25a1148f612"
+        },
+        {
+          "name": "00000000000000000107.tape",
+          "len": 65536,
+          "sha256": "4111667f32e13aac5918d04a51a132a9f6235d8634bf513607bcc77f8b99c476"
+        },
+        {
+          "name": "checkpoint",
+          "len": 131072,
+          "sha256": "b5999fd490e6ce3d19e478f6fc0bee547ec573750a41c4f3e635f40959cf4dc5"
+        },
+        {
+          "name": "writer.lock",
+          "len": 4,
+          "sha256": "79059b443ce844d9e9fd0f26e064e6ccf02d9481285936b908449be0d74c93f1"
+        }
+      ]
+    },
+    {
+      "name": "v0.2.0-linux-aarch64-clean",
+      "pack": "v0.2.0-linux-aarch64-clean.ttfx",
+      "tag": "v0.2.0",
+      "commit": "2be9afd16450e94714a034d2c9161d700f083d5e",
+      "os": "linux",
+      "arch": "aarch64",
+      "platform": "Linux 7.2.12-orbstack-00394-gbecdd6130068 aarch64; OrbStack VM (Linux on macOS) on an Apple M4 Pro; journals on btrfs",
+      "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+      "generator_command": "tests/compat/generate.sh v0.2.0, which runs: tt-compat-gen clean <dir>",
+      "kind": "clean",
+      "library_version": "0.2.0",
+      "segment_size": 65536,
+      "records": 128,
+      "first_seq": 0,
+      "last_seq": 127,
+      "next_seq": 128,
+      "stream_sha256": "19815d9e6b90ced060cac06e47d4db6c64d5624cd33f73bfc78931032201d47b",
+      "durable_records": 82,
+      "durable_stream_sha256": "ada875c24fe142e88f05ac1f6b83731c6e2378d1d66d3784cc9a2bac62d8102e",
+      "checkpoint": {
+        "generation": 1,
+        "next_seq": 82,
+        "segment_base_seq": 41,
+        "offset": 45480
+      },
+      "segments": [
+        {
+          "file": "00000000000000000000.tape",
+          "base_seq": 0,
+          "records": 40,
+          "end_seq": 40,
+          "used_bytes": 4608,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000040.tape",
+          "base_seq": 40,
+          "records": 1,
+          "end_seq": 41,
+          "used_bytes": 65536,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000041.tape",
+          "base_seq": 41,
+          "records": 66,
+          "end_seq": 107,
+          "used_bytes": 48840,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000107.tape",
+          "base_seq": 107,
+          "records": 21,
+          "end_seq": 128,
+          "used_bytes": 32776,
+          "end": "open"
+        }
+      ],
+      "files": [
+        {
+          "name": "00000000000000000000.tape",
+          "len": 65536,
+          "sha256": "f63e56b96ca883bc408f89cf5d56cfc02d4160098121d6c0cd62e3a8e00a7d37"
+        },
+        {
+          "name": "00000000000000000040.tape",
+          "len": 65536,
+          "sha256": "63339bd8d933ad73584bf150a358fef303fc98f6a7d8eaa7b81415f4b065f005"
+        },
+        {
+          "name": "00000000000000000041.tape",
+          "len": 65536,
+          "sha256": "81f1a82a52e6adef1e63983c0df69edc0970904575c076770eef6dee1556b459"
+        },
+        {
+          "name": "00000000000000000107.tape",
+          "len": 65536,
+          "sha256": "c48e6bf190bccd43803b757e9e44ddf58ec546e10e80b4c8c0a4a5adfa72b2a8"
+        },
+        {
+          "name": "checkpoint",
+          "len": 131072,
+          "sha256": "b5999fd490e6ce3d19e478f6fc0bee547ec573750a41c4f3e635f40959cf4dc5"
+        },
+        {
+          "name": "writer.lock",
+          "len": 4,
+          "sha256": "ce63ea0809ce32335dd7692f1e0c6c5f3493f2b4039351662b60741de4d9a9bd"
+        }
+      ]
+    },
+    {
+      "name": "v0.2.0-linux-aarch64-torn",
+      "pack": "v0.2.0-linux-aarch64-torn.ttfx",
+      "tag": "v0.2.0",
+      "commit": "2be9afd16450e94714a034d2c9161d700f083d5e",
+      "os": "linux",
+      "arch": "aarch64",
+      "platform": "Linux 7.2.12-orbstack-00394-gbecdd6130068 aarch64; OrbStack VM (Linux on macOS) on an Apple M4 Pro; journals on btrfs",
+      "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+      "generator_command": "tests/compat/generate.sh v0.2.0, which runs: tt-compat-gen torn <dir>",
+      "kind": "torn",
+      "library_version": "0.2.0",
+      "segment_size": 65536,
+      "records": 143,
+      "first_seq": 0,
+      "last_seq": 142,
+      "next_seq": 143,
+      "stream_sha256": "87521d92686ac52edd7836b8ef0244b20fc692676f5180fb335200fa4f7236b0",
+      "durable_records": 82,
+      "durable_stream_sha256": "ada875c24fe142e88f05ac1f6b83731c6e2378d1d66d3784cc9a2bac62d8102e",
+      "checkpoint": {
+        "generation": 1,
+        "next_seq": 82,
+        "segment_base_seq": 41,
+        "offset": 45480
+      },
+      "segments": [
+        {
+          "file": "00000000000000000000.tape",
+          "base_seq": 0,
+          "records": 40,
+          "end_seq": 40,
+          "used_bytes": 4608,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000040.tape",
+          "base_seq": 40,
+          "records": 1,
+          "end_seq": 41,
+          "used_bytes": 65536,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000041.tape",
+          "base_seq": 41,
+          "records": 66,
+          "end_seq": 107,
+          "used_bytes": 48840,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000107.tape",
+          "base_seq": 107,
+          "records": 36,
+          "end_seq": 143,
+          "used_bytes": 35264,
+          "end": "open"
+        }
+      ],
+      "torn": {
+        "file": "00000000000000000107.tape",
+        "offset": 35264,
+        "uncommitted_end": 35504
+      },
+      "files": [
+        {
+          "name": "00000000000000000000.tape",
+          "len": 65536,
+          "sha256": "04c4a2d88f76fd1fc63b0ee908b260b3e270d3e56b19f5971d5dcce48ed0ea03"
+        },
+        {
+          "name": "00000000000000000040.tape",
+          "len": 65536,
+          "sha256": "5942bfaab3488e1de71543c9d9ab3dd2cb4c8357f31080b94e6d2f7377711b53"
+        },
+        {
+          "name": "00000000000000000041.tape",
+          "len": 65536,
+          "sha256": "9b70f902393a5c00680708bc087108611e631e815bd512bcc23a92fd714bab4d"
+        },
+        {
+          "name": "00000000000000000107.tape",
+          "len": 65536,
+          "sha256": "9a42b1c69f52f2bd635983421e09c34a5cf43c8ac08406a1f6493337fc129c6a"
+        },
+        {
+          "name": "checkpoint",
+          "len": 131072,
+          "sha256": "b5999fd490e6ce3d19e478f6fc0bee547ec573750a41c4f3e635f40959cf4dc5"
+        },
+        {
+          "name": "writer.lock",
+          "len": 4,
+          "sha256": "728edd27debc2046984906dbbb117313dab4a9f0e9b47c7f0411e236c175f3e2"
+        }
+      ]
+    },
+    {
+      "name": "v0.2.0-linux-x86_64-clean",
+      "pack": "v0.2.0-linux-x86_64-clean.ttfx",
+      "tag": "v0.2.0",
+      "commit": "2be9afd16450e94714a034d2c9161d700f083d5e",
+      "os": "linux",
+      "arch": "x86_64",
+      "platform": "Linux 7.2.12-orbstack-00394-gbecdd6130068 x86_64; Docker linux/amd64 container (rust:1.99 image) under Rosetta emulation in OrbStack on an Apple M4 Pro; journals on the container overlay filesystem",
+      "rustc": "rustc 1.100.0 (0ef1bc386 2026-11-09)",
+      "generator_command": "tests/compat/generate.sh v0.2.0, which runs: tt-compat-gen clean <dir>",
+      "kind": "clean",
+      "library_version": "0.2.0",
+      "segment_size": 65536,
+      "records": 128,
+      "first_seq": 0,
+      "last_seq": 127,
+      "next_seq": 128,
+      "stream_sha256": "19815d9e6b90ced060cac06e47d4db6c64d5624cd33f73bfc78931032201d47b",
+      "durable_records": 82,
+      "durable_stream_sha256": "ada875c24fe142e88f05ac1f6b83731c6e2378d1d66d3784cc9a2bac62d8102e",
+      "checkpoint": {
+        "generation": 1,
+        "next_seq": 82,
+        "segment_base_seq": 41,
+        "offset": 45480
+      },
+      "segments": [
+        {
+          "file": "00000000000000000000.tape",
+          "base_seq": 0,
+          "records": 40,
+          "end_seq": 40,
+          "used_bytes": 4608,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000040.tape",
+          "base_seq": 40,
+          "records": 1,
+          "end_seq": 41,
+          "used_bytes": 65536,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000041.tape",
+          "base_seq": 41,
+          "records": 66,
+          "end_seq": 107,
+          "used_bytes": 48840,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000107.tape",
+          "base_seq": 107,
+          "records": 21,
+          "end_seq": 128,
+          "used_bytes": 32776,
+          "end": "open"
+        }
+      ],
+      "files": [
+        {
+          "name": "00000000000000000000.tape",
+          "len": 65536,
+          "sha256": "904cc7c117013feeaeca7dbe1301ed9896fa4cd65005c937b627999bce61ec0b"
+        },
+        {
+          "name": "00000000000000000040.tape",
+          "len": 65536,
+          "sha256": "8a1af83f1df2692c5106058b596f31daf4d772418ea972d1f17c98d1e95359af"
+        },
+        {
+          "name": "00000000000000000041.tape",
+          "len": 65536,
+          "sha256": "24b13a287c33ac6c7a3d4374c4f90b3aa4592e1a5c4af7ab00b066d5f8eb1204"
+        },
+        {
+          "name": "00000000000000000107.tape",
+          "len": 65536,
+          "sha256": "b70f1252c623e8fdb2656cb4596950da2ec0ffc8223b423fcb39fd72c9f57346"
+        },
+        {
+          "name": "checkpoint",
+          "len": 131072,
+          "sha256": "b5999fd490e6ce3d19e478f6fc0bee547ec573750a41c4f3e635f40959cf4dc5"
+        },
+        {
+          "name": "writer.lock",
+          "len": 3,
+          "sha256": "7a84ae249fa744b8c1acb6c5247c2cf443e31870aa7217f4a9cd9b157dbd54ef"
+        }
+      ]
+    },
+    {
+      "name": "v0.2.0-linux-x86_64-torn",
+      "pack": "v0.2.0-linux-x86_64-torn.ttfx",
+      "tag": "v0.2.0",
+      "commit": "2be9afd16450e94714a034d2c9161d700f083d5e",
+      "os": "linux",
+      "arch": "x86_64",
+      "platform": "Linux 7.2.12-orbstack-00394-gbecdd6130068 x86_64; Docker linux/amd64 container (rust:1.99 image) under Rosetta emulation in OrbStack on an Apple M4 Pro; journals on the container overlay filesystem",
+      "rustc": "rustc 1.100.0 (0ef1bc386 2026-11-09)",
+      "generator_command": "tests/compat/generate.sh v0.2.0, which runs: tt-compat-gen torn <dir>",
+      "kind": "torn",
+      "library_version": "0.2.0",
+      "segment_size": 65536,
+      "records": 143,
+      "first_seq": 0,
+      "last_seq": 142,
+      "next_seq": 143,
+      "stream_sha256": "87521d92686ac52edd7836b8ef0244b20fc692676f5180fb335200fa4f7236b0",
+      "durable_records": 82,
+      "durable_stream_sha256": "ada875c24fe142e88f05ac1f6b83731c6e2378d1d66d3784cc9a2bac62d8102e",
+      "checkpoint": {
+        "generation": 1,
+        "next_seq": 82,
+        "segment_base_seq": 41,
+        "offset": 45480
+      },
+      "segments": [
+        {
+          "file": "00000000000000000000.tape",
+          "base_seq": 0,
+          "records": 40,
+          "end_seq": 40,
+          "used_bytes": 4608,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000040.tape",
+          "base_seq": 40,
+          "records": 1,
+          "end_seq": 41,
+          "used_bytes": 65536,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000041.tape",
+          "base_seq": 41,
+          "records": 66,
+          "end_seq": 107,
+          "used_bytes": 48840,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000107.tape",
+          "base_seq": 107,
+          "records": 36,
+          "end_seq": 143,
+          "used_bytes": 35264,
+          "end": "open"
+        }
+      ],
+      "torn": {
+        "file": "00000000000000000107.tape",
+        "offset": 35264,
+        "uncommitted_end": 35504
+      },
+      "files": [
+        {
+          "name": "00000000000000000000.tape",
+          "len": 65536,
+          "sha256": "d005715b9809da853b6218374bcf0a13c71af486e5dfb6ddc065202ffe56c7c1"
+        },
+        {
+          "name": "00000000000000000040.tape",
+          "len": 65536,
+          "sha256": "35c783c3464b331f4ad4d0f2ca0e26d165f604d99865c99e9c003ab2d6e3d665"
+        },
+        {
+          "name": "00000000000000000041.tape",
+          "len": 65536,
+          "sha256": "ef81eb0c28470cfdb0f08a9b4cd09fe30f9196df7e885e374b46937c8e268eb5"
+        },
+        {
+          "name": "00000000000000000107.tape",
+          "len": 65536,
+          "sha256": "7fbbab4f328b0112c4cbb3dc2af567423ecc3057dd16b8b3aa8cf64e44e036a5"
+        },
+        {
+          "name": "checkpoint",
+          "len": 131072,
+          "sha256": "b5999fd490e6ce3d19e478f6fc0bee547ec573750a41c4f3e635f40959cf4dc5"
+        },
+        {
+          "name": "writer.lock",
+          "len": 3,
+          "sha256": "ab16ce326c754df41ed00df6f64f7073dcac3e2986bbf8b2a1ce4549b189a0fb"
+        }
+      ]
+    },
+    {
+      "name": "v0.2.0-macos-aarch64-clean",
+      "pack": "v0.2.0-macos-aarch64-clean.ttfx",
+      "tag": "v0.2.0",
+      "commit": "2be9afd16450e94714a034d2c9161d700f083d5e",
+      "os": "macos",
+      "arch": "aarch64",
+      "platform": "macOS 27.2.1 (Darwin 27.2.0 arm64); Apple M4 Pro; journals on APFS",
+      "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+      "generator_command": "tests/compat/generate.sh v0.2.0, which runs: tt-compat-gen clean <dir>",
+      "kind": "clean",
+      "library_version": "0.2.0",
+      "segment_size": 65536,
+      "records": 128,
+      "first_seq": 0,
+      "last_seq": 127,
+      "next_seq": 128,
+      "stream_sha256": "19815d9e6b90ced060cac06e47d4db6c64d5624cd33f73bfc78931032201d47b",
+      "durable_records": 82,
+      "durable_stream_sha256": "ada875c24fe142e88f05ac1f6b83731c6e2378d1d66d3784cc9a2bac62d8102e",
+      "checkpoint": {
+        "generation": 1,
+        "next_seq": 82,
+        "segment_base_seq": 41,
+        "offset": 45480
+      },
+      "segments": [
+        {
+          "file": "00000000000000000000.tape",
+          "base_seq": 0,
+          "records": 40,
+          "end_seq": 40,
+          "used_bytes": 4608,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000040.tape",
+          "base_seq": 40,
+          "records": 1,
+          "end_seq": 41,
+          "used_bytes": 65536,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000041.tape",
+          "base_seq": 41,
+          "records": 66,
+          "end_seq": 107,
+          "used_bytes": 48840,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000107.tape",
+          "base_seq": 107,
+          "records": 21,
+          "end_seq": 128,
+          "used_bytes": 32776,
+          "end": "open"
+        }
+      ],
+      "files": [
+        {
+          "name": "00000000000000000000.tape",
+          "len": 65536,
+          "sha256": "ff49a598744062e99ee73519c4dd1373912f999b972344170b2b59ef6dc2eeac"
+        },
+        {
+          "name": "00000000000000000040.tape",
+          "len": 65536,
+          "sha256": "57422995408664465578fbae8bab24d86ccea9ea46c5e34df4e50f4d78401087"
+        },
+        {
+          "name": "00000000000000000041.tape",
+          "len": 65536,
+          "sha256": "f487317d2cd828b17ab7e5ec1014f091a7aab06db5ad241593937e7a52b4800f"
+        },
+        {
+          "name": "00000000000000000107.tape",
+          "len": 65536,
+          "sha256": "dcb1d75b98b549265deb3226c19d0832b74781aab6c5ffc594d5a86bd91b87c9"
+        },
+        {
+          "name": "checkpoint",
+          "len": 131072,
+          "sha256": "b5999fd490e6ce3d19e478f6fc0bee547ec573750a41c4f3e635f40959cf4dc5"
+        },
+        {
+          "name": "writer.lock",
+          "len": 4,
+          "sha256": "1900b07bf0e92e67724438b3ec075ec00b04ab091a54fba24cf7528ba846e9f3"
+        }
+      ]
+    },
+    {
+      "name": "v0.2.0-macos-aarch64-torn",
+      "pack": "v0.2.0-macos-aarch64-torn.ttfx",
+      "tag": "v0.2.0",
+      "commit": "2be9afd16450e94714a034d2c9161d700f083d5e",
+      "os": "macos",
+      "arch": "aarch64",
+      "platform": "macOS 27.2.1 (Darwin 27.2.0 arm64); Apple M4 Pro; journals on APFS",
+      "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+      "generator_command": "tests/compat/generate.sh v0.2.0, which runs: tt-compat-gen torn <dir>",
+      "kind": "torn",
+      "library_version": "0.2.0",
+      "segment_size": 65536,
+      "records": 143,
+      "first_seq": 0,
+      "last_seq": 142,
+      "next_seq": 143,
+      "stream_sha256": "87521d92686ac52edd7836b8ef0244b20fc692676f5180fb335200fa4f7236b0",
+      "durable_records": 82,
+      "durable_stream_sha256": "ada875c24fe142e88f05ac1f6b83731c6e2378d1d66d3784cc9a2bac62d8102e",
+      "checkpoint": {
+        "generation": 1,
+        "next_seq": 82,
+        "segment_base_seq": 41,
+        "offset": 45480
+      },
+      "segments": [
+        {
+          "file": "00000000000000000000.tape",
+          "base_seq": 0,
+          "records": 40,
+          "end_seq": 40,
+          "used_bytes": 4608,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000040.tape",
+          "base_seq": 40,
+          "records": 1,
+          "end_seq": 41,
+          "used_bytes": 65536,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000041.tape",
+          "base_seq": 41,
+          "records": 66,
+          "end_seq": 107,
+          "used_bytes": 48840,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000107.tape",
+          "base_seq": 107,
+          "records": 36,
+          "end_seq": 143,
+          "used_bytes": 35264,
+          "end": "open"
+        }
+      ],
+      "torn": {
+        "file": "00000000000000000107.tape",
+        "offset": 35264,
+        "uncommitted_end": 35504
+      },
+      "files": [
+        {
+          "name": "00000000000000000000.tape",
+          "len": 65536,
+          "sha256": "9973d14133596971b7403e8ccc84c15e0f5c45c05ebce7cb2ae9fee1c60bb5c6"
+        },
+        {
+          "name": "00000000000000000040.tape",
+          "len": 65536,
+          "sha256": "bf3ca5c51ba1c3e55743a88ecd4a1d7de4b1412e182cf827780535847b754a52"
+        },
+        {
+          "name": "00000000000000000041.tape",
+          "len": 65536,
+          "sha256": "7566b89c11771010cb124ac5ad4c69b4106162722075af43531f7e2c7a419d4f"
+        },
+        {
+          "name": "00000000000000000107.tape",
+          "len": 65536,
+          "sha256": "073d26336e9f2688bba79a980acd44fd5ae8698d7357378c4702e01d62f7d7f4"
+        },
+        {
+          "name": "checkpoint",
+          "len": 131072,
+          "sha256": "b5999fd490e6ce3d19e478f6fc0bee547ec573750a41c4f3e635f40959cf4dc5"
+        },
+        {
+          "name": "writer.lock",
+          "len": 4,
+          "sha256": "041669688dba6edca905acae363296e29902c37b43adcceb7113eb81e1ddb1a1"
+        }
+      ]
+    },
+    {
+      "name": "v0.3.0-linux-aarch64-clean",
+      "pack": "v0.3.0-linux-aarch64-clean.ttfx",
+      "tag": "v0.3.0",
+      "commit": "e81e6b810784659105515c80d08758404854d36b",
+      "os": "linux",
+      "arch": "aarch64",
+      "platform": "Linux 7.2.12-orbstack-00394-gbecdd6130068 aarch64; OrbStack VM (Linux on macOS) on an Apple M4 Pro; journals on btrfs",
+      "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+      "generator_command": "tests/compat/generate.sh v0.3.0, which runs: tt-compat-gen clean <dir>",
+      "kind": "clean",
+      "library_version": "0.3.0",
+      "segment_size": 65536,
+      "records": 128,
+      "first_seq": 0,
+      "last_seq": 127,
+      "next_seq": 128,
+      "stream_sha256": "19815d9e6b90ced060cac06e47d4db6c64d5624cd33f73bfc78931032201d47b",
+      "durable_records": 82,
+      "durable_stream_sha256": "ada875c24fe142e88f05ac1f6b83731c6e2378d1d66d3784cc9a2bac62d8102e",
+      "checkpoint": {
+        "generation": 1,
+        "next_seq": 82,
+        "segment_base_seq": 41,
+        "offset": 45480
+      },
+      "segments": [
+        {
+          "file": "00000000000000000000.tape",
+          "base_seq": 0,
+          "records": 40,
+          "end_seq": 40,
+          "used_bytes": 4608,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000040.tape",
+          "base_seq": 40,
+          "records": 1,
+          "end_seq": 41,
+          "used_bytes": 65536,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000041.tape",
+          "base_seq": 41,
+          "records": 66,
+          "end_seq": 107,
+          "used_bytes": 48840,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000107.tape",
+          "base_seq": 107,
+          "records": 21,
+          "end_seq": 128,
+          "used_bytes": 32776,
+          "end": "open"
+        }
+      ],
+      "files": [
+        {
+          "name": "00000000000000000000.tape",
+          "len": 65536,
+          "sha256": "61e087dc22e762f46c27b81d502e290792bd53ecac73ded19285084117c632e9"
+        },
+        {
+          "name": "00000000000000000040.tape",
+          "len": 65536,
+          "sha256": "f6df59ddcdb73170a08398902c7ababf135a7916e3795dc52fbab21fd6034c54"
+        },
+        {
+          "name": "00000000000000000041.tape",
+          "len": 65536,
+          "sha256": "107e8207c21663367e18b9714120320f464e0ca42ad8c9b2bd40f9946722c0ad"
+        },
+        {
+          "name": "00000000000000000107.tape",
+          "len": 65536,
+          "sha256": "b0c3c3dd3d6599df4813cb120dd8c0de768251cd23471fe6b1e207b15b3adf47"
+        },
+        {
+          "name": "checkpoint",
+          "len": 131072,
+          "sha256": "b5999fd490e6ce3d19e478f6fc0bee547ec573750a41c4f3e635f40959cf4dc5"
+        },
+        {
+          "name": "notify",
+          "len": 80,
+          "sha256": "4bf7b9163876754af6b7c927801df017961aeb586b15f52b38f8a0c7b19e5a14"
+        },
+        {
+          "name": "writer.lock",
+          "len": 4,
+          "sha256": "9e3b6232cb7bd60ef9c5088e1c6dac834ddc05d916e88e2aacf84bb18c8d707a"
+        }
+      ]
+    },
+    {
+      "name": "v0.3.0-linux-aarch64-torn",
+      "pack": "v0.3.0-linux-aarch64-torn.ttfx",
+      "tag": "v0.3.0",
+      "commit": "e81e6b810784659105515c80d08758404854d36b",
+      "os": "linux",
+      "arch": "aarch64",
+      "platform": "Linux 7.2.12-orbstack-00394-gbecdd6130068 aarch64; OrbStack VM (Linux on macOS) on an Apple M4 Pro; journals on btrfs",
+      "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+      "generator_command": "tests/compat/generate.sh v0.3.0, which runs: tt-compat-gen torn <dir>",
+      "kind": "torn",
+      "library_version": "0.3.0",
+      "segment_size": 65536,
+      "records": 143,
+      "first_seq": 0,
+      "last_seq": 142,
+      "next_seq": 143,
+      "stream_sha256": "87521d92686ac52edd7836b8ef0244b20fc692676f5180fb335200fa4f7236b0",
+      "durable_records": 82,
+      "durable_stream_sha256": "ada875c24fe142e88f05ac1f6b83731c6e2378d1d66d3784cc9a2bac62d8102e",
+      "checkpoint": {
+        "generation": 1,
+        "next_seq": 82,
+        "segment_base_seq": 41,
+        "offset": 45480
+      },
+      "segments": [
+        {
+          "file": "00000000000000000000.tape",
+          "base_seq": 0,
+          "records": 40,
+          "end_seq": 40,
+          "used_bytes": 4608,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000040.tape",
+          "base_seq": 40,
+          "records": 1,
+          "end_seq": 41,
+          "used_bytes": 65536,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000041.tape",
+          "base_seq": 41,
+          "records": 66,
+          "end_seq": 107,
+          "used_bytes": 48840,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000107.tape",
+          "base_seq": 107,
+          "records": 36,
+          "end_seq": 143,
+          "used_bytes": 35264,
+          "end": "open"
+        }
+      ],
+      "torn": {
+        "file": "00000000000000000107.tape",
+        "offset": 35264,
+        "uncommitted_end": 35504
+      },
+      "files": [
+        {
+          "name": "00000000000000000000.tape",
+          "len": 65536,
+          "sha256": "18a20f86806636d898742547517349d98b4b6235557c09eeeaeb23bd4afaf093"
+        },
+        {
+          "name": "00000000000000000040.tape",
+          "len": 65536,
+          "sha256": "f8fcaf7e55e90079b6385e0befc8cdde8514b0c56f43a6c7f84d354b63e88135"
+        },
+        {
+          "name": "00000000000000000041.tape",
+          "len": 65536,
+          "sha256": "e67b3f284858bd0346c9084d0b336d7bc0e605ebaa4ca434d687d517ccdd9f20"
+        },
+        {
+          "name": "00000000000000000107.tape",
+          "len": 65536,
+          "sha256": "02e5ff01af852b49ff160a7fec6b18926ed228af2b5d959be6a93c800af8fae4"
+        },
+        {
+          "name": "checkpoint",
+          "len": 131072,
+          "sha256": "b5999fd490e6ce3d19e478f6fc0bee547ec573750a41c4f3e635f40959cf4dc5"
+        },
+        {
+          "name": "notify",
+          "len": 80,
+          "sha256": "50c6a96bbf701828df4fce5185d6b88acd9246814e2f366956ab11216722c615"
+        },
+        {
+          "name": "writer.lock",
+          "len": 4,
+          "sha256": "f06ca10f4977ea7a4857646c826cc9d4b5fa691e2c57766a98ed93dc6001ecde"
+        }
+      ]
+    },
+    {
+      "name": "v0.3.0-linux-x86_64-clean",
+      "pack": "v0.3.0-linux-x86_64-clean.ttfx",
+      "tag": "v0.3.0",
+      "commit": "e81e6b810784659105515c80d08758404854d36b",
+      "os": "linux",
+      "arch": "x86_64",
+      "platform": "Linux 7.2.12-orbstack-00394-gbecdd6130068 x86_64; Docker linux/amd64 container (rust:1.99 image) under Rosetta emulation in OrbStack on an Apple M4 Pro; journals on the container overlay filesystem",
+      "rustc": "rustc 1.100.0 (0ef1bc386 2026-11-09)",
+      "generator_command": "tests/compat/generate.sh v0.3.0, which runs: tt-compat-gen clean <dir>",
+      "kind": "clean",
+      "library_version": "0.3.0",
+      "segment_size": 65536,
+      "records": 128,
+      "first_seq": 0,
+      "last_seq": 127,
+      "next_seq": 128,
+      "stream_sha256": "19815d9e6b90ced060cac06e47d4db6c64d5624cd33f73bfc78931032201d47b",
+      "durable_records": 82,
+      "durable_stream_sha256": "ada875c24fe142e88f05ac1f6b83731c6e2378d1d66d3784cc9a2bac62d8102e",
+      "checkpoint": {
+        "generation": 1,
+        "next_seq": 82,
+        "segment_base_seq": 41,
+        "offset": 45480
+      },
+      "segments": [
+        {
+          "file": "00000000000000000000.tape",
+          "base_seq": 0,
+          "records": 40,
+          "end_seq": 40,
+          "used_bytes": 4608,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000040.tape",
+          "base_seq": 40,
+          "records": 1,
+          "end_seq": 41,
+          "used_bytes": 65536,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000041.tape",
+          "base_seq": 41,
+          "records": 66,
+          "end_seq": 107,
+          "used_bytes": 48840,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000107.tape",
+          "base_seq": 107,
+          "records": 21,
+          "end_seq": 128,
+          "used_bytes": 32776,
+          "end": "open"
+        }
+      ],
+      "files": [
+        {
+          "name": "00000000000000000000.tape",
+          "len": 65536,
+          "sha256": "f1573b26a46d493d13a292919789700f47db3130a48e3f46b856721c588e3132"
+        },
+        {
+          "name": "00000000000000000040.tape",
+          "len": 65536,
+          "sha256": "e37638ffc31804830df3002f24ef62a36a3190ab6dc443cb7df7a184c023503f"
+        },
+        {
+          "name": "00000000000000000041.tape",
+          "len": 65536,
+          "sha256": "54c270db8467ad8e92fc240b82bfda73a3ee9fe3e1cd42066eaaf9feea661d54"
+        },
+        {
+          "name": "00000000000000000107.tape",
+          "len": 65536,
+          "sha256": "9efef9c4d4d9eb5250442dbf94b00533f48a6af464081eb50b068a1274fd221a"
+        },
+        {
+          "name": "checkpoint",
+          "len": 131072,
+          "sha256": "b5999fd490e6ce3d19e478f6fc0bee547ec573750a41c4f3e635f40959cf4dc5"
+        },
+        {
+          "name": "notify",
+          "len": 80,
+          "sha256": "29b6254db56731780c562a27e3d9f4d6f85ad81611f0e33e2ed3541d0ba754f3"
+        },
+        {
+          "name": "writer.lock",
+          "len": 4,
+          "sha256": "6f13d39f5c4665967f7df9f2f7311187fda905292da1a5a7cef66dd8cb6e9dd8"
+        }
+      ]
+    },
+    {
+      "name": "v0.3.0-linux-x86_64-torn",
+      "pack": "v0.3.0-linux-x86_64-torn.ttfx",
+      "tag": "v0.3.0",
+      "commit": "e81e6b810784659105515c80d08758404854d36b",
+      "os": "linux",
+      "arch": "x86_64",
+      "platform": "Linux 7.2.12-orbstack-00394-gbecdd6130068 x86_64; Docker linux/amd64 container (rust:1.99 image) under Rosetta emulation in OrbStack on an Apple M4 Pro; journals on the container overlay filesystem",
+      "rustc": "rustc 1.100.0 (0ef1bc386 2026-11-09)",
+      "generator_command": "tests/compat/generate.sh v0.3.0, which runs: tt-compat-gen torn <dir>",
+      "kind": "torn",
+      "library_version": "0.3.0",
+      "segment_size": 65536,
+      "records": 143,
+      "first_seq": 0,
+      "last_seq": 142,
+      "next_seq": 143,
+      "stream_sha256": "87521d92686ac52edd7836b8ef0244b20fc692676f5180fb335200fa4f7236b0",
+      "durable_records": 82,
+      "durable_stream_sha256": "ada875c24fe142e88f05ac1f6b83731c6e2378d1d66d3784cc9a2bac62d8102e",
+      "checkpoint": {
+        "generation": 1,
+        "next_seq": 82,
+        "segment_base_seq": 41,
+        "offset": 45480
+      },
+      "segments": [
+        {
+          "file": "00000000000000000000.tape",
+          "base_seq": 0,
+          "records": 40,
+          "end_seq": 40,
+          "used_bytes": 4608,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000040.tape",
+          "base_seq": 40,
+          "records": 1,
+          "end_seq": 41,
+          "used_bytes": 65536,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000041.tape",
+          "base_seq": 41,
+          "records": 66,
+          "end_seq": 107,
+          "used_bytes": 48840,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000107.tape",
+          "base_seq": 107,
+          "records": 36,
+          "end_seq": 143,
+          "used_bytes": 35264,
+          "end": "open"
+        }
+      ],
+      "torn": {
+        "file": "00000000000000000107.tape",
+        "offset": 35264,
+        "uncommitted_end": 35504
+      },
+      "files": [
+        {
+          "name": "00000000000000000000.tape",
+          "len": 65536,
+          "sha256": "0e912bba2f9ed89fec41e5b2b8835787c233a3a80857184cef76b8b30b364fe9"
+        },
+        {
+          "name": "00000000000000000040.tape",
+          "len": 65536,
+          "sha256": "6c2fdb53cd1d81171fbe52d054363648cc8e167a3b1726703ac26b7130eb2b85"
+        },
+        {
+          "name": "00000000000000000041.tape",
+          "len": 65536,
+          "sha256": "be37c194845b91d0fadf84ce73812a0c66c48ca2f2b5e070636fe335b3651a7e"
+        },
+        {
+          "name": "00000000000000000107.tape",
+          "len": 65536,
+          "sha256": "511495710d3c338085b85bc90919fe56911ad97351f3181e78aa862ab02b0d03"
+        },
+        {
+          "name": "checkpoint",
+          "len": 131072,
+          "sha256": "b5999fd490e6ce3d19e478f6fc0bee547ec573750a41c4f3e635f40959cf4dc5"
+        },
+        {
+          "name": "notify",
+          "len": 80,
+          "sha256": "b004f5d1a8781f042e8b5e6703e3f9614d15b0db8f37d04082d1f88def5fe08c"
+        },
+        {
+          "name": "writer.lock",
+          "len": 4,
+          "sha256": "da9570a2a77104e59f0185cff795f508d23173949032cf0b90de9dfffaefaad3"
+        }
+      ]
+    },
+    {
+      "name": "v0.3.0-macos-aarch64-clean",
+      "pack": "v0.3.0-macos-aarch64-clean.ttfx",
+      "tag": "v0.3.0",
+      "commit": "e81e6b810784659105515c80d08758404854d36b",
+      "os": "macos",
+      "arch": "aarch64",
+      "platform": "macOS 27.2.1 (Darwin 27.2.0 arm64); Apple M4 Pro; journals on APFS",
+      "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+      "generator_command": "tests/compat/generate.sh v0.3.0, which runs: tt-compat-gen clean <dir>",
+      "kind": "clean",
+      "library_version": "0.3.0",
+      "segment_size": 65536,
+      "records": 128,
+      "first_seq": 0,
+      "last_seq": 127,
+      "next_seq": 128,
+      "stream_sha256": "19815d9e6b90ced060cac06e47d4db6c64d5624cd33f73bfc78931032201d47b",
+      "durable_records": 82,
+      "durable_stream_sha256": "ada875c24fe142e88f05ac1f6b83731c6e2378d1d66d3784cc9a2bac62d8102e",
+      "checkpoint": {
+        "generation": 1,
+        "next_seq": 82,
+        "segment_base_seq": 41,
+        "offset": 45480
+      },
+      "segments": [
+        {
+          "file": "00000000000000000000.tape",
+          "base_seq": 0,
+          "records": 40,
+          "end_seq": 40,
+          "used_bytes": 4608,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000040.tape",
+          "base_seq": 40,
+          "records": 1,
+          "end_seq": 41,
+          "used_bytes": 65536,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000041.tape",
+          "base_seq": 41,
+          "records": 66,
+          "end_seq": 107,
+          "used_bytes": 48840,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000107.tape",
+          "base_seq": 107,
+          "records": 21,
+          "end_seq": 128,
+          "used_bytes": 32776,
+          "end": "open"
+        }
+      ],
+      "files": [
+        {
+          "name": "00000000000000000000.tape",
+          "len": 65536,
+          "sha256": "a7507ad7f55ffde9981efab5385091fe182eb55aa759f25367b533f726f6c168"
+        },
+        {
+          "name": "00000000000000000040.tape",
+          "len": 65536,
+          "sha256": "633ad6d6cd0e18f34cffe75f5503d059b60b2b9989f36c81c118448f5296f839"
+        },
+        {
+          "name": "00000000000000000041.tape",
+          "len": 65536,
+          "sha256": "953c58f099f772386ff530431773258038eff165fb48db49028d824947970ced"
+        },
+        {
+          "name": "00000000000000000107.tape",
+          "len": 65536,
+          "sha256": "26874b27fa7d850bfb2d4fa802e015a022f9462ba778565aca0b3cf3ef64f7f5"
+        },
+        {
+          "name": "checkpoint",
+          "len": 131072,
+          "sha256": "b5999fd490e6ce3d19e478f6fc0bee547ec573750a41c4f3e635f40959cf4dc5"
+        },
+        {
+          "name": "notify",
+          "len": 80,
+          "sha256": "592e47a25e04fdd4c40707d709a768bd8bd23723d830b394c66cf8c761f03f97"
+        },
+        {
+          "name": "writer.lock",
+          "len": 4,
+          "sha256": "2cca79c8bea8c45fd000683f547dc282156b38391b9b05e8552d51ce1af3b902"
+        }
+      ]
+    },
+    {
+      "name": "v0.3.0-macos-aarch64-torn",
+      "pack": "v0.3.0-macos-aarch64-torn.ttfx",
+      "tag": "v0.3.0",
+      "commit": "e81e6b810784659105515c80d08758404854d36b",
+      "os": "macos",
+      "arch": "aarch64",
+      "platform": "macOS 27.2.1 (Darwin 27.2.0 arm64); Apple M4 Pro; journals on APFS",
+      "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+      "generator_command": "tests/compat/generate.sh v0.3.0, which runs: tt-compat-gen torn <dir>",
+      "kind": "torn",
+      "library_version": "0.3.0",
+      "segment_size": 65536,
+      "records": 143,
+      "first_seq": 0,
+      "last_seq": 142,
+      "next_seq": 143,
+      "stream_sha256": "87521d92686ac52edd7836b8ef0244b20fc692676f5180fb335200fa4f7236b0",
+      "durable_records": 82,
+      "durable_stream_sha256": "ada875c24fe142e88f05ac1f6b83731c6e2378d1d66d3784cc9a2bac62d8102e",
+      "checkpoint": {
+        "generation": 1,
+        "next_seq": 82,
+        "segment_base_seq": 41,
+        "offset": 45480
+      },
+      "segments": [
+        {
+          "file": "00000000000000000000.tape",
+          "base_seq": 0,
+          "records": 40,
+          "end_seq": 40,
+          "used_bytes": 4608,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000040.tape",
+          "base_seq": 40,
+          "records": 1,
+          "end_seq": 41,
+          "used_bytes": 65536,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000041.tape",
+          "base_seq": 41,
+          "records": 66,
+          "end_seq": 107,
+          "used_bytes": 48840,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000107.tape",
+          "base_seq": 107,
+          "records": 36,
+          "end_seq": 143,
+          "used_bytes": 35264,
+          "end": "open"
+        }
+      ],
+      "torn": {
+        "file": "00000000000000000107.tape",
+        "offset": 35264,
+        "uncommitted_end": 35504
+      },
+      "files": [
+        {
+          "name": "00000000000000000000.tape",
+          "len": 65536,
+          "sha256": "fa283e9531c018ba920ed75e8124b9c5d8474538021caeaba6927a9f335c19fa"
+        },
+        {
+          "name": "00000000000000000040.tape",
+          "len": 65536,
+          "sha256": "46ae94944cf7defccf8e650b9fc2a11f60a29293bf8ff34217a44a1f50958f2e"
+        },
+        {
+          "name": "00000000000000000041.tape",
+          "len": 65536,
+          "sha256": "3f586e2538c44e396be18c4b99ff36bef10bfb6af2b8aa0cde6eea719d372428"
+        },
+        {
+          "name": "00000000000000000107.tape",
+          "len": 65536,
+          "sha256": "f8eb4989b1ba106a69238e889bd9bc8bcbb83e93bc2d69c5401a5f7d6d761ff9"
+        },
+        {
+          "name": "checkpoint",
+          "len": 131072,
+          "sha256": "b5999fd490e6ce3d19e478f6fc0bee547ec573750a41c4f3e635f40959cf4dc5"
+        },
+        {
+          "name": "next-segment.tmp",
+          "len": 65536,
+          "sha256": "de2f256064a0af797747c2b97505dc0b9f3df0de4f489eac731c23ae9ca9cc31"
+        },
+        {
+          "name": "notify",
+          "len": 80,
+          "sha256": "070d4820c78fff2963693ba004c5c20bf6df8dd5ccfc4749d14a6ad40aab4aa1"
+        },
+        {
+          "name": "writer.lock",
+          "len": 4,
+          "sha256": "7addaafed7639a12d8344a033f3b4dd2a8dbda264d28ca4290b5848ae00e977b"
+        }
+      ]
+    },
+    {
+      "name": "v0.4.0-linux-aarch64-clean",
+      "pack": "v0.4.0-linux-aarch64-clean.ttfx",
+      "tag": "v0.4.0",
+      "commit": "6c9185451ff311ee30706d781901c0365b457344",
+      "os": "linux",
+      "arch": "aarch64",
+      "platform": "Linux 7.2.12-orbstack-00394-gbecdd6130068 aarch64; OrbStack VM (Linux on macOS) on an Apple M4 Pro; journals on btrfs",
+      "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+      "generator_command": "tests/compat/generate.sh v0.4.0, which runs: tt-compat-gen clean <dir>",
+      "kind": "clean",
+      "library_version": "0.4.0",
+      "segment_size": 65536,
+      "records": 128,
+      "first_seq": 0,
+      "last_seq": 127,
+      "next_seq": 128,
+      "stream_sha256": "19815d9e6b90ced060cac06e47d4db6c64d5624cd33f73bfc78931032201d47b",
+      "durable_records": 82,
+      "durable_stream_sha256": "ada875c24fe142e88f05ac1f6b83731c6e2378d1d66d3784cc9a2bac62d8102e",
+      "checkpoint": {
+        "generation": 1,
+        "next_seq": 82,
+        "segment_base_seq": 41,
+        "offset": 45480
+      },
+      "segments": [
+        {
+          "file": "00000000000000000000.tape",
+          "base_seq": 0,
+          "records": 40,
+          "end_seq": 40,
+          "used_bytes": 4608,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000040.tape",
+          "base_seq": 40,
+          "records": 1,
+          "end_seq": 41,
+          "used_bytes": 65536,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000041.tape",
+          "base_seq": 41,
+          "records": 66,
+          "end_seq": 107,
+          "used_bytes": 48840,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000107.tape",
+          "base_seq": 107,
+          "records": 21,
+          "end_seq": 128,
+          "used_bytes": 32776,
+          "end": "open"
+        }
+      ],
+      "files": [
+        {
+          "name": "00000000000000000000.tape",
+          "len": 65536,
+          "sha256": "b186f0633b35e09e3a8e26f4a8c4f349c6a769d7e149fb7eb72096367dc2c983"
+        },
+        {
+          "name": "00000000000000000040.tape",
+          "len": 65536,
+          "sha256": "519f070dacc6510e953b69d2d3861272bf1f643de9ce90022d34aa677d8921ec"
+        },
+        {
+          "name": "00000000000000000041.tape",
+          "len": 65536,
+          "sha256": "178e57c9cc1f2eb4f1e608369d33bbbaa86b2adcc18571ae6ce60e34ba9854f4"
+        },
+        {
+          "name": "00000000000000000107.tape",
+          "len": 65536,
+          "sha256": "9903a24db885c4b8d77a8310449fbb140d6519fc0f95c0c52301d3f7bee14d67"
+        },
+        {
+          "name": "checkpoint",
+          "len": 131072,
+          "sha256": "b5999fd490e6ce3d19e478f6fc0bee547ec573750a41c4f3e635f40959cf4dc5"
+        },
+        {
+          "name": "notify",
+          "len": 80,
+          "sha256": "e6cfe232727ec51246868fe10e21b86374ed5ef5bba32d9728d5ef4700fcc7b2"
+        },
+        {
+          "name": "writer.lock",
+          "len": 4,
+          "sha256": "72e37da8a67d137ab41fe3a0ef269ad619192eb0d93a4a5421b1f0bf05093d86"
+        }
+      ]
+    },
+    {
+      "name": "v0.4.0-linux-aarch64-torn",
+      "pack": "v0.4.0-linux-aarch64-torn.ttfx",
+      "tag": "v0.4.0",
+      "commit": "6c9185451ff311ee30706d781901c0365b457344",
+      "os": "linux",
+      "arch": "aarch64",
+      "platform": "Linux 7.2.12-orbstack-00394-gbecdd6130068 aarch64; OrbStack VM (Linux on macOS) on an Apple M4 Pro; journals on btrfs",
+      "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+      "generator_command": "tests/compat/generate.sh v0.4.0, which runs: tt-compat-gen torn <dir>",
+      "kind": "torn",
+      "library_version": "0.4.0",
+      "segment_size": 65536,
+      "records": 143,
+      "first_seq": 0,
+      "last_seq": 142,
+      "next_seq": 143,
+      "stream_sha256": "87521d92686ac52edd7836b8ef0244b20fc692676f5180fb335200fa4f7236b0",
+      "durable_records": 82,
+      "durable_stream_sha256": "ada875c24fe142e88f05ac1f6b83731c6e2378d1d66d3784cc9a2bac62d8102e",
+      "checkpoint": {
+        "generation": 1,
+        "next_seq": 82,
+        "segment_base_seq": 41,
+        "offset": 45480
+      },
+      "segments": [
+        {
+          "file": "00000000000000000000.tape",
+          "base_seq": 0,
+          "records": 40,
+          "end_seq": 40,
+          "used_bytes": 4608,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000040.tape",
+          "base_seq": 40,
+          "records": 1,
+          "end_seq": 41,
+          "used_bytes": 65536,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000041.tape",
+          "base_seq": 41,
+          "records": 66,
+          "end_seq": 107,
+          "used_bytes": 48840,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000107.tape",
+          "base_seq": 107,
+          "records": 36,
+          "end_seq": 143,
+          "used_bytes": 35264,
+          "end": "open"
+        }
+      ],
+      "torn": {
+        "file": "00000000000000000107.tape",
+        "offset": 35264,
+        "uncommitted_end": 35504
+      },
+      "files": [
+        {
+          "name": "00000000000000000000.tape",
+          "len": 65536,
+          "sha256": "6086a6d31fef5fbf1b5fdbd9e4c47d80d91eb788023ed72f1b7a8dbc3baf880d"
+        },
+        {
+          "name": "00000000000000000040.tape",
+          "len": 65536,
+          "sha256": "acab6ab5c44c79f4f8879427b897572e4ba7be6cfa15f98a695be55bb51186b3"
+        },
+        {
+          "name": "00000000000000000041.tape",
+          "len": 65536,
+          "sha256": "2d2684b59ed42ddc53def129aeb63e7e833dff30535fd4358f8bbebfae413589"
+        },
+        {
+          "name": "00000000000000000107.tape",
+          "len": 65536,
+          "sha256": "6008f8b7d476f474d380e01bfb4fa7110124bf6322245b8db7840455d41c4159"
+        },
+        {
+          "name": "checkpoint",
+          "len": 131072,
+          "sha256": "b5999fd490e6ce3d19e478f6fc0bee547ec573750a41c4f3e635f40959cf4dc5"
+        },
+        {
+          "name": "notify",
+          "len": 80,
+          "sha256": "5499891f83154347b11c2261a24e044bfa51cdab7ba37b12b5b4a02d096ed863"
+        },
+        {
+          "name": "writer.lock",
+          "len": 4,
+          "sha256": "5a0b83e19c5750eed6d8d46cb858d15c956a657093c08afa53133c0fbe5f04fb"
+        }
+      ]
+    },
+    {
+      "name": "v0.4.0-linux-x86_64-clean",
+      "pack": "v0.4.0-linux-x86_64-clean.ttfx",
+      "tag": "v0.4.0",
+      "commit": "6c9185451ff311ee30706d781901c0365b457344",
+      "os": "linux",
+      "arch": "x86_64",
+      "platform": "Linux 7.2.12-orbstack-00394-gbecdd6130068 x86_64; Docker linux/amd64 container (rust:1.99 image) under Rosetta emulation in OrbStack on an Apple M4 Pro; journals on the container overlay filesystem",
+      "rustc": "rustc 1.100.0 (0ef1bc386 2026-11-09)",
+      "generator_command": "tests/compat/generate.sh v0.4.0, which runs: tt-compat-gen clean <dir>",
+      "kind": "clean",
+      "library_version": "0.4.0",
+      "segment_size": 65536,
+      "records": 128,
+      "first_seq": 0,
+      "last_seq": 127,
+      "next_seq": 128,
+      "stream_sha256": "19815d9e6b90ced060cac06e47d4db6c64d5624cd33f73bfc78931032201d47b",
+      "durable_records": 82,
+      "durable_stream_sha256": "ada875c24fe142e88f05ac1f6b83731c6e2378d1d66d3784cc9a2bac62d8102e",
+      "checkpoint": {
+        "generation": 1,
+        "next_seq": 82,
+        "segment_base_seq": 41,
+        "offset": 45480
+      },
+      "segments": [
+        {
+          "file": "00000000000000000000.tape",
+          "base_seq": 0,
+          "records": 40,
+          "end_seq": 40,
+          "used_bytes": 4608,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000040.tape",
+          "base_seq": 40,
+          "records": 1,
+          "end_seq": 41,
+          "used_bytes": 65536,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000041.tape",
+          "base_seq": 41,
+          "records": 66,
+          "end_seq": 107,
+          "used_bytes": 48840,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000107.tape",
+          "base_seq": 107,
+          "records": 21,
+          "end_seq": 128,
+          "used_bytes": 32776,
+          "end": "open"
+        }
+      ],
+      "files": [
+        {
+          "name": "00000000000000000000.tape",
+          "len": 65536,
+          "sha256": "6aac8fb9ec86f8b0048b55197c88072b785dc2a236727cda5925bf6a9fdfb0b2"
+        },
+        {
+          "name": "00000000000000000040.tape",
+          "len": 65536,
+          "sha256": "42948362bf5c2981d187fbe7a3a82e1f1ae2bbb173a9337a00924743cff0ade1"
+        },
+        {
+          "name": "00000000000000000041.tape",
+          "len": 65536,
+          "sha256": "4113b0a330a6cff8a1915a227140812289e186595bdc2c7afe79122553e933e4"
+        },
+        {
+          "name": "00000000000000000107.tape",
+          "len": 65536,
+          "sha256": "2c5f1d7d737c53cc65b4a8170a4aa19eaf89d03a43e7a3acd62344d1fae495b0"
+        },
+        {
+          "name": "checkpoint",
+          "len": 131072,
+          "sha256": "b5999fd490e6ce3d19e478f6fc0bee547ec573750a41c4f3e635f40959cf4dc5"
+        },
+        {
+          "name": "notify",
+          "len": 80,
+          "sha256": "1517c33a7af7db35bbe8852a362f7c3d08b8b31662d8ff174262bc125f7be55f"
+        },
+        {
+          "name": "writer.lock",
+          "len": 4,
+          "sha256": "1cdabc0d91a051251a6e7b1bd972f6cb63daafcee9a8256d9e1a1fa8f95ee086"
+        }
+      ]
+    },
+    {
+      "name": "v0.4.0-linux-x86_64-torn",
+      "pack": "v0.4.0-linux-x86_64-torn.ttfx",
+      "tag": "v0.4.0",
+      "commit": "6c9185451ff311ee30706d781901c0365b457344",
+      "os": "linux",
+      "arch": "x86_64",
+      "platform": "Linux 7.2.12-orbstack-00394-gbecdd6130068 x86_64; Docker linux/amd64 container (rust:1.99 image) under Rosetta emulation in OrbStack on an Apple M4 Pro; journals on the container overlay filesystem",
+      "rustc": "rustc 1.100.0 (0ef1bc386 2026-11-09)",
+      "generator_command": "tests/compat/generate.sh v0.4.0, which runs: tt-compat-gen torn <dir>",
+      "kind": "torn",
+      "library_version": "0.4.0",
+      "segment_size": 65536,
+      "records": 143,
+      "first_seq": 0,
+      "last_seq": 142,
+      "next_seq": 143,
+      "stream_sha256": "87521d92686ac52edd7836b8ef0244b20fc692676f5180fb335200fa4f7236b0",
+      "durable_records": 82,
+      "durable_stream_sha256": "ada875c24fe142e88f05ac1f6b83731c6e2378d1d66d3784cc9a2bac62d8102e",
+      "checkpoint": {
+        "generation": 1,
+        "next_seq": 82,
+        "segment_base_seq": 41,
+        "offset": 45480
+      },
+      "segments": [
+        {
+          "file": "00000000000000000000.tape",
+          "base_seq": 0,
+          "records": 40,
+          "end_seq": 40,
+          "used_bytes": 4608,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000040.tape",
+          "base_seq": 40,
+          "records": 1,
+          "end_seq": 41,
+          "used_bytes": 65536,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000041.tape",
+          "base_seq": 41,
+          "records": 66,
+          "end_seq": 107,
+          "used_bytes": 48840,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000107.tape",
+          "base_seq": 107,
+          "records": 36,
+          "end_seq": 143,
+          "used_bytes": 35264,
+          "end": "open"
+        }
+      ],
+      "torn": {
+        "file": "00000000000000000107.tape",
+        "offset": 35264,
+        "uncommitted_end": 35504
+      },
+      "files": [
+        {
+          "name": "00000000000000000000.tape",
+          "len": 65536,
+          "sha256": "df5a4b7f0291af6f0e5d346414ab269697fa6c242a7b326269280ff8f27fbbd5"
+        },
+        {
+          "name": "00000000000000000040.tape",
+          "len": 65536,
+          "sha256": "3a05d95e4bdffdbaa35a234e6180667fe239d6de1601f03312ca979e9565cabd"
+        },
+        {
+          "name": "00000000000000000041.tape",
+          "len": 65536,
+          "sha256": "1036ef071f1df8e20b90aa5447797de70750406a456c4c814fcea68dfa1e7d86"
+        },
+        {
+          "name": "00000000000000000107.tape",
+          "len": 65536,
+          "sha256": "cfdcca2f660f3482b997b6fb7b94efa3c6bb9f3860822f8aa41e0c5946ae8d69"
+        },
+        {
+          "name": "checkpoint",
+          "len": 131072,
+          "sha256": "b5999fd490e6ce3d19e478f6fc0bee547ec573750a41c4f3e635f40959cf4dc5"
+        },
+        {
+          "name": "notify",
+          "len": 80,
+          "sha256": "c3daf21678552f0687d41ba1af8edacf1a45a01343e39f6244ed9325f6433e5b"
+        },
+        {
+          "name": "writer.lock",
+          "len": 4,
+          "sha256": "b1d7183ef649ed5aac1542c4251412d09b4f184da562f85c41cb42dcae430335"
+        }
+      ]
+    },
+    {
+      "name": "v0.4.0-macos-aarch64-clean",
+      "pack": "v0.4.0-macos-aarch64-clean.ttfx",
+      "tag": "v0.4.0",
+      "commit": "6c9185451ff311ee30706d781901c0365b457344",
+      "os": "macos",
+      "arch": "aarch64",
+      "platform": "macOS 27.2.1 (Darwin 27.2.0 arm64); Apple M4 Pro; journals on APFS",
+      "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+      "generator_command": "tests/compat/generate.sh v0.4.0, which runs: tt-compat-gen clean <dir>",
+      "kind": "clean",
+      "library_version": "0.4.0",
+      "segment_size": 65536,
+      "records": 128,
+      "first_seq": 0,
+      "last_seq": 127,
+      "next_seq": 128,
+      "stream_sha256": "19815d9e6b90ced060cac06e47d4db6c64d5624cd33f73bfc78931032201d47b",
+      "durable_records": 82,
+      "durable_stream_sha256": "ada875c24fe142e88f05ac1f6b83731c6e2378d1d66d3784cc9a2bac62d8102e",
+      "checkpoint": {
+        "generation": 1,
+        "next_seq": 82,
+        "segment_base_seq": 41,
+        "offset": 45480
+      },
+      "segments": [
+        {
+          "file": "00000000000000000000.tape",
+          "base_seq": 0,
+          "records": 40,
+          "end_seq": 40,
+          "used_bytes": 4608,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000040.tape",
+          "base_seq": 40,
+          "records": 1,
+          "end_seq": 41,
+          "used_bytes": 65536,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000041.tape",
+          "base_seq": 41,
+          "records": 66,
+          "end_seq": 107,
+          "used_bytes": 48840,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000107.tape",
+          "base_seq": 107,
+          "records": 21,
+          "end_seq": 128,
+          "used_bytes": 32776,
+          "end": "open"
+        }
+      ],
+      "files": [
+        {
+          "name": "00000000000000000000.tape",
+          "len": 65536,
+          "sha256": "4579a5279e2c51f259aa2299688acfa8ad55f4ff5892b254b5b769d6d4066de2"
+        },
+        {
+          "name": "00000000000000000040.tape",
+          "len": 65536,
+          "sha256": "48f2d75f29e71835b36390030c250c8e205903269217b5717f4834f5cddfa2e1"
+        },
+        {
+          "name": "00000000000000000041.tape",
+          "len": 65536,
+          "sha256": "d009c15dfa61b4256274b3c746472df749b6ff55917c983e89ec07726495ef2d"
+        },
+        {
+          "name": "00000000000000000107.tape",
+          "len": 65536,
+          "sha256": "d79d1369406b33da7d81bceda83af15509ef5a01e83dd3e92c440a1d2d9130ac"
+        },
+        {
+          "name": "checkpoint",
+          "len": 131072,
+          "sha256": "b5999fd490e6ce3d19e478f6fc0bee547ec573750a41c4f3e635f40959cf4dc5"
+        },
+        {
+          "name": "notify",
+          "len": 80,
+          "sha256": "bacc6b2415cbc68cfd960b08548945540393230c9043abd6917ec546c332466c"
+        },
+        {
+          "name": "writer.lock",
+          "len": 4,
+          "sha256": "9d0f9740bf708828641fecffa4c14fa25d195953b513e82203fd62533512d55d"
+        }
+      ]
+    },
+    {
+      "name": "v0.4.0-macos-aarch64-torn",
+      "pack": "v0.4.0-macos-aarch64-torn.ttfx",
+      "tag": "v0.4.0",
+      "commit": "6c9185451ff311ee30706d781901c0365b457344",
+      "os": "macos",
+      "arch": "aarch64",
+      "platform": "macOS 27.2.1 (Darwin 27.2.0 arm64); Apple M4 Pro; journals on APFS",
+      "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+      "generator_command": "tests/compat/generate.sh v0.4.0, which runs: tt-compat-gen torn <dir>",
+      "kind": "torn",
+      "library_version": "0.4.0",
+      "segment_size": 65536,
+      "records": 143,
+      "first_seq": 0,
+      "last_seq": 142,
+      "next_seq": 143,
+      "stream_sha256": "87521d92686ac52edd7836b8ef0244b20fc692676f5180fb335200fa4f7236b0",
+      "durable_records": 82,
+      "durable_stream_sha256": "ada875c24fe142e88f05ac1f6b83731c6e2378d1d66d3784cc9a2bac62d8102e",
+      "checkpoint": {
+        "generation": 1,
+        "next_seq": 82,
+        "segment_base_seq": 41,
+        "offset": 45480
+      },
+      "segments": [
+        {
+          "file": "00000000000000000000.tape",
+          "base_seq": 0,
+          "records": 40,
+          "end_seq": 40,
+          "used_bytes": 4608,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000040.tape",
+          "base_seq": 40,
+          "records": 1,
+          "end_seq": 41,
+          "used_bytes": 65536,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000041.tape",
+          "base_seq": 41,
+          "records": 66,
+          "end_seq": 107,
+          "used_bytes": 48840,
+          "end": "sealed"
+        },
+        {
+          "file": "00000000000000000107.tape",
+          "base_seq": 107,
+          "records": 36,
+          "end_seq": 143,
+          "used_bytes": 35264,
+          "end": "open"
+        }
+      ],
+      "torn": {
+        "file": "00000000000000000107.tape",
+        "offset": 35264,
+        "uncommitted_end": 35504
+      },
+      "files": [
+        {
+          "name": "00000000000000000000.tape",
+          "len": 65536,
+          "sha256": "dff4b44cd26d3f0ae0b0cb96f95511ee2f28d0efbd0d712bc4e69c05f36843a2"
+        },
+        {
+          "name": "00000000000000000040.tape",
+          "len": 65536,
+          "sha256": "dc51f4866e0f711d984f2b1de5ac3df75ebef7e7bd6b72b9862bd6951d081112"
+        },
+        {
+          "name": "00000000000000000041.tape",
+          "len": 65536,
+          "sha256": "191771f70e9f42d8507e27b5ed03953d2ee1b9645c980489e28765325837411f"
+        },
+        {
+          "name": "00000000000000000107.tape",
+          "len": 65536,
+          "sha256": "a04faa3b49c017a59ec454bdc0954367989bef52e6e09fc64e9a57f828c34952"
+        },
+        {
+          "name": "checkpoint",
+          "len": 131072,
+          "sha256": "b5999fd490e6ce3d19e478f6fc0bee547ec573750a41c4f3e635f40959cf4dc5"
+        },
+        {
+          "name": "next-segment.tmp",
+          "len": 65536,
+          "sha256": "de2f256064a0af797747c2b97505dc0b9f3df0de4f489eac731c23ae9ca9cc31"
+        },
+        {
+          "name": "notify",
+          "len": 80,
+          "sha256": "98b9b40f48f6f9c35f95429e867d02c9ebd22f6c7bfd81bd60419798cfeacbef"
+        },
+        {
+          "name": "writer.lock",
+          "len": 4,
+          "sha256": "414de552cad783d4f1d72168e039621f8cc8e1fd7b5971e3e0b72b9517185784"
+        }
+      ]
+    }
+  ]
+}
