@@ -522,3 +522,349 @@ fn stale_identity_and_rolled_back_marker_are_refused() {
     assert!(retention::apply(dir.path(), &plan, &Action::Delete).is_err());
     assert_eq!(segments(dir.path()).len(), 6);
 }
+
+// Readers racing with retention. Each test removes files at exactly the racy point with a fault-injection hook, the
+// way a concurrent retention run (the writer's policy, or `tickertape archive` in another process) could.
+
+/// Applies retention with `max_segments(keep)` to `dir`, as a concurrent archiver would.
+fn retain(dir: &std::path::Path, keep: usize) {
+    let plan = retention::plan(dir, &Policy::default().max_segments(keep)).unwrap();
+    retention::apply(dir, &plan, &Action::Delete).unwrap();
+}
+
+/// A safe reader, or a zero-copy one.
+fn open_reader(dir: &std::path::Path, mapped: bool) -> tickertape::Result<Reader> {
+    if mapped {
+        // SAFETY: only this process's tickertape writer modifies the journal while the reader exists.
+        unsafe { Reader::open_mapped(dir, ReaderConfig::default()) }
+    } else {
+        Reader::open(dir, ReaderConfig::default())
+    }
+}
+
+/// Arms `action` to run the next time this thread reaches `point`, after `skip` earlier passes.
+fn at(point: tickertape::fault::Point, skip: usize, action: impl FnOnce() + 'static) {
+    tickertape::fault::clear();
+    tickertape::fault::run_at(point, skip, action);
+}
+
+#[test]
+fn reader_open_races_retention() {
+    use tickertape::fault::Point;
+    for mapped in [false, true] {
+        let (dir, _writer) = journal(true);
+        let path = dir.path().to_path_buf();
+        at(Point::ReaderOpen, 0, move || retain(&path, 3));
+        let mut reader = open_reader(dir.path(), mapped).unwrap();
+        assert_eq!(
+            reader.next_owned().unwrap().unwrap().seq,
+            3,
+            "mapped {mapped}"
+        );
+    }
+}
+
+#[test]
+fn seek_races_retention() {
+    use tickertape::fault::Point;
+    for mapped in [false, true] {
+        let (dir, _writer) = journal(true);
+        let mut reader = open_reader(dir.path(), mapped).unwrap();
+        // The segment holding the requested record disappears between the listing and the open.
+        let path = dir.path().to_path_buf();
+        at(Point::ReaderOpen, 0, move || retain(&path, 2));
+        match reader.seek(2) {
+            Err(Error::SeqUnavailable {
+                requested: 2,
+                first: 4,
+            }) => {}
+            other => panic!("mapped {mapped}: {other:?}"),
+        }
+        reader.seek(4).unwrap();
+        assert_eq!(reader.next_owned().unwrap().unwrap().seq, 4);
+        // A removal that leaves the chosen segment in place doesn't matter.
+        let path = dir.path().to_path_buf();
+        at(Point::ReaderOpen, 0, move || {
+            fs::remove_file(segments(&path)[0].1.clone()).unwrap()
+        });
+        reader.seek(5).unwrap();
+        assert_eq!(reader.next_owned().unwrap().unwrap().seq, 5);
+    }
+}
+
+#[test]
+fn seal_races_retention() {
+    use tickertape::fault::Point;
+    for mapped in [false, true] {
+        let (dir, _writer) = journal(true);
+        let mut reader = open_reader(dir.path(), mapped).unwrap();
+        assert_eq!(reader.next_owned().unwrap().unwrap().seq, 0);
+        // Retention removes the reader's segment and its successor between the identity check and the open of the
+        // successor: the reader's segment is gone, so this is discarded history, not a broken chain.
+        let path = dir.path().to_path_buf();
+        at(Point::ReaderSeal, 0, move || retain(&path, 4));
+        match reader.next_owned() {
+            Err(Error::Discarded { seq: 1 }) => {}
+            other => panic!("mapped {mapped}: {other:?}"),
+        }
+        assert!(matches!(
+            reader.seek(1),
+            Err(Error::SeqUnavailable { first: 2, .. })
+        ));
+        reader.seek(2).unwrap();
+        assert_eq!(reader.next_owned().unwrap().unwrap().seq, 2);
+        // Only the reader's segment goes: the successor opens, and the recheck after it reports the removal.
+        let path = dir.path().to_path_buf();
+        at(Point::ReaderSeal, 0, move || retain(&path, 3));
+        assert!(matches!(
+            reader.next_owned(),
+            Err(Error::Discarded { seq: 3 })
+        ));
+    }
+}
+
+#[test]
+fn missing_successor_with_segment_in_place_is_a_broken_chain() {
+    use tickertape::fault::Point;
+    for mapped in [false, true] {
+        let (dir, _writer) = journal(true);
+        let mut reader = open_reader(dir.path(), mapped).unwrap();
+        assert_eq!(reader.next_owned().unwrap().unwrap().seq, 0);
+        // Not something retention does (it removes the oldest segment first): the chain is broken.
+        let successor = segments(dir.path())[1].1.clone();
+        at(Point::ReaderSeal, 0, move || {
+            fs::remove_file(successor).unwrap()
+        });
+        match reader.next_owned() {
+            Err(Error::Corrupt {
+                reason: tickertape::CorruptReason::BrokenChain(1),
+                ..
+            }) => {}
+            other => panic!("mapped {mapped}: {other:?}"),
+        }
+        tickertape::fault::clear();
+    }
+}
+
+/// Makes `dir` unsearchable, so that a `stat` of anything in it fails with `EACCES`. Returns false (and restores it)
+/// if that has no effect, as when the tests run as root.
+fn deny_search(dir: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o000)).unwrap();
+    let denied = fs::metadata(dir.join("probe"))
+        .is_err_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied);
+    if !denied {
+        allow_search(dir);
+    }
+    denied
+}
+
+fn allow_search(dir: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+fn is_permission_denied(e: &Error) -> bool {
+    matches!(e, Error::Io { source, .. } if source.kind() == std::io::ErrorKind::PermissionDenied)
+}
+
+/// Only "not found" means a segment is gone. A `stat` that fails for another reason (here `EACCES`; in the field also
+/// `EIO` or `ENOMEM`) says nothing about whether the file is still in place, so it is an I/O error: it must not turn
+/// into `Error::Discarded` for a reader at a seal, or hide a broken chain in `verify`.
+#[test]
+fn stat_errors_are_not_mistaken_for_removal() {
+    use tickertape::fault::Point;
+    for mapped in [false, true] {
+        let (dir, _writer) = journal(true);
+        let mut reader = open_reader(dir.path(), mapped).unwrap();
+        assert_eq!(reader.next_owned().unwrap().unwrap().seq, 0);
+        if !deny_search(dir.path()) {
+            eprintln!(
+                "stat_errors_are_not_mistaken_for_removal: permissions have no effect (root?); skipped"
+            );
+            return;
+        }
+        let result = reader.next_owned();
+        allow_search(dir.path());
+        match result {
+            Err(e) if is_permission_denied(&e) => {}
+            other => panic!("mapped {mapped}: {other:?}"),
+        }
+        assert_eq!(reader.next_owned().unwrap().unwrap().seq, 1);
+    }
+
+    // `verify`: the newest listed segment is sealed and its successor missing while it is still in place, but the
+    // check for the successor fails with `EACCES`.
+    let (dir, writer) = journal(true);
+    let writer = std::rc::Rc::new(std::cell::RefCell::new(writer));
+    let w = writer.clone();
+    at(Point::InspectOpen, 5, move || append(&mut w.borrow_mut()));
+    let denied = std::rc::Rc::new(std::cell::Cell::new(false));
+    let (path, d) = (dir.path().to_path_buf(), denied.clone());
+    tickertape::fault::run_at(Point::InspectSeal, 0, move || {
+        fs::remove_file(segments(&path)[6].1.clone()).unwrap();
+        d.set(deny_search(&path));
+    });
+    let result = tickertape::inspect::verify(dir.path());
+    allow_search(dir.path());
+    tickertape::fault::clear();
+    if denied.get() {
+        match result {
+            Err(e) if is_permission_denied(&e) => {}
+            other => panic!("{other:?}"),
+        }
+    }
+}
+
+#[test]
+fn inspection_races_retention() {
+    use tickertape::fault::Point;
+    use tickertape::inspect;
+    let bases = |s: &[inspect::SegmentInfo]| s.iter().map(|s| s.base_seq).collect::<Vec<_>>();
+
+    // Segment 0 is opened, then retention removes 0..=2 before segment 1 is opened.
+    let (dir, _writer) = journal(true);
+    let path = dir.path().to_path_buf();
+    at(Point::InspectOpen, 1, move || retain(&path, 3));
+    assert_eq!(
+        bases(&inspect::list_segments(dir.path()).unwrap()),
+        [3, 4, 5]
+    );
+
+    let (dir, _writer) = journal(true);
+    let path = dir.path().to_path_buf();
+    at(Point::InspectOpen, 1, move || retain(&path, 3));
+    let report = inspect::verify(dir.path()).unwrap();
+    assert!(report.problems.is_empty(), "{:?}", report.problems);
+    assert_eq!(
+        report
+            .segments
+            .iter()
+            .map(|s| s.info.as_ref().unwrap().base_seq)
+            .collect::<Vec<_>>(),
+        [3, 4, 5]
+    );
+    assert_eq!(
+        (report.records, report.first_seq, report.last_seq),
+        (3, Some(3), Some(5))
+    );
+    tickertape::fault::clear();
+}
+
+#[test]
+fn verify_tolerates_a_roll_during_the_scan() {
+    use tickertape::fault::Point;
+    // The writer fills and seals the newest listed segment before verify scans it: the successor exists, so the
+    // seal isn't a broken chain.
+    let (dir, writer) = journal(true);
+    let writer = std::rc::Rc::new(std::cell::RefCell::new(writer));
+    let w = writer.clone();
+    at(Point::InspectOpen, 5, move || append(&mut w.borrow_mut()));
+    let report = tickertape::inspect::verify(dir.path()).unwrap();
+    assert!(report.problems.is_empty(), "{:?}", report.problems);
+    assert_eq!(report.segments.len(), 6);
+    assert_eq!(report.last_seq, Some(5));
+    tickertape::fault::clear();
+}
+
+/// A rolling writer links the next segment before it seals the current one. If it is descheduled in between for
+/// longer than one re-scan interval, `verify` must still not report the unsealed segment as a broken chain: it scans
+/// a transient state again, with growing pauses, for over half a second. With no writer running, the same state is a
+/// problem (a crash left it behind).
+#[test]
+fn verify_waits_for_a_writer_stalled_between_linking_and_sealing() {
+    use std::os::unix::fs::FileExt;
+    use tickertape::format;
+    use tickertape_tests::{SMALL_SEGMENT, create_raw_segment, end_of_records, open_raw};
+    let dir = tempfile::tempdir().unwrap();
+    let mut writer = Writer::open(dir.path(), small_config()).unwrap();
+    append(&mut writer);
+    drop(writer);
+    let path = segments(dir.path())[0].1.clone();
+    let (end, next) = end_of_records(&path);
+    create_raw_segment(dir.path(), next, SMALL_SEGMENT);
+    let seal = move |path: &std::path::Path| {
+        let raw = open_raw(path);
+        raw.write_all_at(&format::seal_crc(next).to_le_bytes(), end + 4)
+            .unwrap();
+        raw.write_all_at(&format::SEAL_MARKER.to_le_bytes(), end)
+            .unwrap();
+    };
+    // Nobody seals: a broken chain.
+    let report = tickertape::inspect::verify(dir.path()).unwrap();
+    assert!(
+        matches!(
+            report.problems.as_slice(),
+            [tickertape::inspect::Problem {
+                reason: tickertape::CorruptReason::BrokenChain(_),
+                ..
+            }]
+        ),
+        "{:?}",
+        report.problems
+    );
+    // The "writer" seals only after verify's first scan and its first re-scan both found the segment unsealed, just
+    // before the second re-scan (hook point `InspectRescan` runs before each re-scan): verify must keep scanning
+    // rather than give up after one re-scan, and stop once the seal is there. The hook counts the re-scans and
+    // re-arms itself.
+    fn count_rescans(count: std::rc::Rc<std::cell::Cell<u32>>, seal: std::rc::Rc<dyn Fn()>) {
+        tickertape::fault::run_at(tickertape::fault::Point::InspectRescan, 0, move || {
+            count.set(count.get() + 1);
+            if count.get() == 2 {
+                seal();
+            }
+            count_rescans(count, seal);
+        });
+    }
+    let rescans = std::rc::Rc::new(std::cell::Cell::new(0));
+    tickertape::fault::clear();
+    count_rescans(rescans.clone(), std::rc::Rc::new(move || seal(&path)));
+    let report = tickertape::inspect::verify(dir.path()).unwrap();
+    tickertape::fault::clear();
+    assert_eq!(rescans.get(), 2, "re-scans of the unsealed segment");
+    assert!(report.problems.is_empty(), "{:?}", report.problems);
+}
+
+#[test]
+fn verify_tolerates_retention_after_a_roll_during_the_scan() {
+    use tickertape::fault::Point;
+    // The writer seals the newest listed segment before verify scans it; then, before verify looks for the
+    // successor, it rolls again and retention removes the scanned segment and its successor. The missing successor
+    // isn't a broken chain: the segment that points to it is gone too.
+    let (dir, writer) = journal(true);
+    let writer = std::rc::Rc::new(std::cell::RefCell::new(writer));
+    let w = writer.clone();
+    at(Point::InspectOpen, 5, move || append(&mut w.borrow_mut()));
+    let (w, path) = (writer.clone(), dir.path().to_path_buf());
+    tickertape::fault::run_at(Point::InspectSeal, 0, move || {
+        let mut w = w.borrow_mut();
+        append(&mut w);
+        w.checkpoint().unwrap();
+        retain(&path, 1);
+    });
+    let report = tickertape::inspect::verify(dir.path()).unwrap();
+    assert!(report.problems.is_empty(), "{:?}", report.problems);
+    assert_eq!(segments(dir.path()).len(), 1);
+    // A sealed newest segment whose successor is missing while it is still in place is still a problem.
+    let (dir, writer) = journal(true);
+    let writer = std::rc::Rc::new(std::cell::RefCell::new(writer));
+    let w = writer.clone();
+    at(Point::InspectOpen, 5, move || append(&mut w.borrow_mut()));
+    let path = dir.path().to_path_buf();
+    tickertape::fault::run_at(Point::InspectSeal, 0, move || {
+        fs::remove_file(segments(&path)[6].1.clone()).unwrap()
+    });
+    let report = tickertape::inspect::verify(dir.path()).unwrap();
+    assert!(
+        matches!(
+            report.problems.as_slice(),
+            [tickertape::inspect::Problem {
+                reason: tickertape::CorruptReason::BrokenChain(6),
+                ..
+            }]
+        ),
+        "{:?}",
+        report.problems
+    );
+    tickertape::fault::clear();
+}

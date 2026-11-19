@@ -190,7 +190,8 @@ impl MapRw {
     ///
     /// The writer only calls this for bytes that no reader reads: the body of a record before its commit word is
     /// stored, a seal's CRC before its marker, or the uncommitted tail during recovery (never a commit word that a
-    /// reader may be loading). Committed bytes are never modified (ADR 0003).
+    /// reader may be loading). Committed bytes are never modified (ADR 0003), with one exception: recovery zeroes
+    /// records that storage damage made look uncommitted (an emptied commit word), as `Reader::open_mapped` documents.
     pub(crate) fn bytes_mut(&mut self, offset: u64, len: u64) -> Option<&mut [u8]> {
         let end = checked_range(self.len, offset, len)?;
         let start = offset as usize;
