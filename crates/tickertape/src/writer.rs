@@ -309,6 +309,7 @@ impl Writer {
             panic::resume_unwind(cause);
         }
         format::finish_record_body(len, body);
+        crate::fault::pause_before_publish();
         self.active
             .map
             .store_commit_word(offset, len)
