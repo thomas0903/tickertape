@@ -113,9 +113,9 @@ impl ReaderBeacon {
     /// `name` is 1 to 64 ASCII letters, digits, `.`, `_` or `-`; it doesn't start with `.`, isn't the name of a
     /// journal file (`checkpoint`, `writer.lock`, `notify`, `next-segment.tmp`, `quarantine`, `readers`) and doesn't
     /// end in `.tape` or `.tmp` (all compared ignoring ASCII case). If a file already has the name, it is replaced
-    /// only if it is positively a stale beacon: unlocked, exactly 128 bytes, starting with a beacon's magic and version
-    /// (a valid beacon whose owner died, or one whose last update was cut short before its owner died). Anything else
-    /// is left untouched.
+    /// only if it is positively a stale beacon: unlocked, exactly 128 bytes, each of which a beacon writer could have
+    /// written there (a valid beacon whose owner died, or one whose last update was cut short before its owner died,
+    /// which mixes two reports). Anything else is left untouched.
     ///
     /// The file is created with the process's umask (mode `0666` before the umask); an observer needs read access to
     /// it and to the directory. Creation waits while another process creates a beacon in the same directory
@@ -424,49 +424,77 @@ pub(super) fn encode(p: &Payload) -> [u8; BEACON_LEN] {
     b
 }
 
-/// Decodes a beacon; `None` unless `b` is exactly [`BEACON_LEN`] bytes with valid magic, version, flags, reserved
-/// bytes and checksum.
+/// Decodes a beacon; `None` unless `b` is exactly [`BEACON_LEN`] bytes that a beacon writer could have written
+/// ([`well_formed`]) with a valid checksum.
 pub(super) fn decode(b: &[u8]) -> Option<Payload> {
-    if b.len() != BEACON_LEN {
+    let b: &[u8; BEACON_LEN] = b.try_into().ok()?;
+    if !well_formed(b) || u32_at(b, CRC_AT) != crate::crc::crc32c(&b[..CRC_AT]) {
         return None;
     }
-    let u32_at = |at: usize| u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]);
-    let u64_at = |at: usize| {
-        let mut x = [0u8; 8];
-        x.copy_from_slice(&b[at..at + 8]);
-        u64::from_le_bytes(x)
-    };
-    let flags = u32_at(12);
-    if b[0..8] != BEACON_MAGIC
-        || u32_at(8) != BEACON_VERSION
-        || flags & !KNOWN_FLAGS != 0
-        || b[20..24].iter().chain(&b[96..CRC_AT]).any(|&x| x != 0)
-        || u32_at(CRC_AT) != crate::crc::crc32c(&b[..CRC_AT])
-    {
-        return None;
-    }
+    let flags = u32_at(b, 12);
     Some(Payload {
         report: BeaconReport {
-            pid: u32_at(16),
-            next_seq: u64_at(24),
-            position: Position::new(u64_at(32), u64_at(40), u64_at(48)),
+            pid: u32_at(b, 16),
+            next_seq: u64_at(b, 24),
+            position: Position::new(u64_at(b, 32), u64_at(b, 40), u64_at(b, 48)),
             seek_pending: flags & FLAG_SEEK_PENDING != 0,
             durable_only: flags & FLAG_DURABLE_ONLY != 0,
-            updated_unix_ns: u64_at(88),
+            updated_unix_ns: u64_at(b, 88),
         },
-        segment_file: (u64_at(72), u64_at(80)),
-        segment_size: u64_at(64),
-        segment_created_unix_ns: u64_at(56),
+        segment_file: (u64_at(b, 72), u64_at(b, 80)),
+        segment_size: u64_at(b, 64),
+        segment_created_unix_ns: u64_at(b, 56),
     })
 }
 
-/// Whether `b` is a beacon file's contents, possibly torn: it starts with the magic and version, which every write of
-/// a beacon rewrites with the same bytes. So an update cut short (a partial `pwrite` followed by an error such as
-/// `EFBIG`, after which the owner died) still has them, while the checksum fails. Only beacon code writes them: a
-/// 128-byte file that starts with them, unlocked, is a beacon whose owner has gone (ADR 0032 → "The beacon
-/// protocol").
+fn u32_at(b: &[u8; BEACON_LEN], at: usize) -> u32 {
+    u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
+}
+
+fn u64_at(b: &[u8; BEACON_LEN], at: usize) -> u64 {
+    let mut x = [0u8; 8];
+    x.copy_from_slice(&b[at..at + 8]);
+    u64::from_le_bytes(x)
+}
+
+/// Whether every byte of `b` (the checksum aside) is one that a beacon writer puts at that offset in some report, and
+/// the fields that are the same in every report written to one file have values a writer produces. Only per-byte
+/// rules are used, so the rule holds for any mix of two reports cut at one point, which is what an update cut short
+/// leaves (the owner rewrites the whole report with one `pwrite`): ADR 0032 → "What proves a file is a beacon".
+///
+/// - Magic `TTREADER` and version 1 (the same in every write).
+/// - Flags: only bits 0 and 1 (byte 12 at most 3, bytes 13 to 15 zero).
+/// - The owner's pid (the same in every write: only the creating process writes a beacon file) is a positive
+///   `pid_t`: not zero, below 2^31.
+/// - Reserved bytes 20 to 23 and 96 to 123 zero.
+/// - The slot's offset is 8-byte aligned (its low byte's low three bits are zero) and below 2^40, the largest segment
+///   size (bytes 53 to 55 zero).
+/// - The segment size is a multiple of 64 KiB (bytes 64 and 65 zero) and at most 2^40 (byte 69 at most 1, bytes 70
+///   and 71 zero).
+fn well_formed(b: &[u8; BEACON_LEN]) -> bool {
+    let zero = |range: std::ops::Range<usize>| b[range].iter().all(|&x| x == 0);
+    let pid = u32_at(b, 16);
+    b[0..8] == BEACON_MAGIC
+        && u32_at(b, 8) == BEACON_VERSION
+        && u32_at(b, 12) & !KNOWN_FLAGS == 0
+        && pid != 0
+        && pid <= i32::MAX as u32
+        && zero(20..24)
+        && b[48] % crate::format::RECORD_ALIGN as u8 == 0
+        && zero(53..56)
+        && zero(64..66)
+        && b[69] <= 1
+        && zero(70..72)
+        && zero(96..CRC_AT)
+}
+
+/// Whether `b` is a beacon file's contents, possibly torn: [`well_formed`], whatever the checksum says. Every byte a
+/// beacon writer writes satisfies those rules, so an update cut short (a partial `pwrite` followed by an error such as
+/// `EFBIG`, after which the owner died) still does, while its checksum fails. A file of other bytes is not a beacon,
+/// whatever its first bytes: a 128-byte file that is well formed, unlocked, is a beacon whose owner has gone (ADR 0032
+/// → "The beacon protocol").
 fn is_beacon_file(b: &[u8; BEACON_LEN]) -> bool {
-    b[0..8] == BEACON_MAGIC && b[8..12] == BEACON_VERSION.to_le_bytes()
+    well_formed(b)
 }
 
 /// Reads a beacon file through `file`: its exact contents if it has exactly [`BEACON_LEN`] bytes.
@@ -883,6 +911,11 @@ fn observe(path: PathBuf, name: String) -> Option<Observed> {
 #[cfg(test)]
 pub(super) fn name_allowed(name: &str) -> bool {
     check_name(name).is_ok()
+}
+
+#[cfg(test)]
+pub(super) fn beacon_file(b: &[u8; BEACON_LEN]) -> bool {
+    is_beacon_file(b)
 }
 
 #[cfg(test)]

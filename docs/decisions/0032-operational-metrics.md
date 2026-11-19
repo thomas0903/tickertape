@@ -164,17 +164,26 @@ descriptor, so no lock file is needed). Observers never take it.
 7. If `name` exists, check it (takeover): open it `O_NONBLOCK | O_NOFOLLOW`; it must be a regular file. Probe its
    lock with a **shared** non-blocking `flock`: if that fails, a live owner holds it: refuse with
    `Error::BeaconInUse`. If it succeeds (release it at once), read it: it must be exactly 128 bytes that are a beacon
-   (below); otherwise refuse with `Error::InvalidConfig` and leave it untouched. Then `lstat` the name: if it no
+   (below, possibly torn); otherwise refuse with `Error::InvalidConfig` and leave it untouched. Then `lstat` the name: if it no
    longer names the file just checked, go back to step 6. Otherwise `rename` the temporary file over it, and check
    that the name now names the new beacon.
 8. Unlock `D` explicitly (`flock(LOCK_UN)`), then close it.
 
-**What proves a file is a beacon.** Exactly 128 bytes whose first 12 are the magic `TTREADER` and version 1. Every
-write of a beacon rewrites these bytes with the same values, so any mix of a beacon's writes still has them: in
-particular an update cut short (a partial `pwrite` followed by an error, such as `EFBIG` under a file-size limit)
-whose owner then died without its destructors. Only beacon code writes them. The checksum is not required here: a
-torn beacon fails it, and without this rule its name would be stranded for ever (every later creator would refuse
-it). Observers still require the full decode and report a torn beacon `invalid`.
+**What proves a file is a beacon.** Exactly 128 bytes, every one of which (the checksum aside) a beacon writer puts at
+that offset in some report (round 3; before, the magic and version alone decided, so a file of the magic, the version
+and `0xff` was taken over or deleted as a leftover). The owner rewrites the whole report with one `pwrite`, so an
+update cut short (a partial `pwrite` followed by an error, such as `EFBIG` under a file-size limit, whose owner then
+died without its destructors) leaves a prefix of one valid report and the suffix of another, cut at one point. The
+rule therefore uses per-byte conditions only, which every such mix satisfies, and checks every field the format fixes:
+the magic `TTREADER` and version 1; flags with only bits 0 and 1 (byte 12 at most 3, bytes 13 to 15 zero); the owner's
+pid, the same in every write to one file (only its creator writes it), a positive `pid_t` (not zero, below 2^31);
+reserved bytes 20 to 23 and 96 to 123 zero; the slot's offset 8-byte aligned and below 2^40, the largest segment size
+(the low byte's low three bits and bytes 53 to 55 zero); the segment size a multiple of 64 KiB and at most 2^40
+(bytes 64 and 65 zero, byte 69 at most 1, bytes 70 and 71 zero). Cross-field conditions (an offset inside its
+segment, a size of at least 64 KiB) are left out because a mix can break them. Observers require the same rule and
+the checksum (`only_what_a_beacon_writer_could_write_is_a_beacon` checks every cut point of two very different
+reports). The checksum is not required for a takeover: a torn beacon fails it, and without this rule its name would
+be stranded for ever (every later creator would refuse it). Observers report a torn beacon `invalid`.
 
 **Decision (round 2): torn updates are taken over, not prevented.** The alternatives were an update protocol that
 keeps a valid report at all times (two alternating slots, or write-and-rename per update), which would change the

@@ -1361,7 +1361,7 @@ fn leftover_temporary_files_are_removed() {
 }
 
 /// Round 2, A6: a beacon whose last update was cut short (a partial `pwrite`, then its owner died) fails its checksum
-/// but still starts with the beacon magic and version, which every write rewrites unchanged. Unlocked, it is a stale
+/// but every byte is still one a beacon writer writes there (round 3: not only the magic and version). Unlocked, it is a stale
 /// beacon: the next creator takes the name over instead of refusing it for ever. Observers report it invalid.
 #[test]
 fn torn_stale_beacon_is_taken_over() {
@@ -1391,6 +1391,114 @@ fn torn_stale_beacon_is_taken_over() {
     let s = status(dir.path()).unwrap();
     assert_eq!(s.readers[0].state, BeaconState::Live);
     assert_eq!(s.readers[0].report.unwrap().next_seq, 1);
+}
+
+/// Round 3, item 3: a file is a beacon only if every byte is one a beacon writer could have written there, so a
+/// 128-byte file with the magic and version and `0xff` everywhere else is neither taken over at a beacon's name nor
+/// removed as a creator's leftover (before the fix, the magic and version alone decided both). Every mix of two
+/// reports cut at one point (what an update cut short leaves) still counts, and is taken over.
+#[test]
+fn only_what_a_beacon_writer_could_write_is_a_beacon() {
+    // The byte rules rest on these limits of the format.
+    assert_eq!(format::SEGMENT_SIZE_UNIT, 1 << 16);
+    assert_eq!(format::MAX_SEGMENT_SIZE, 1 << 40);
+    assert_eq!(format::RECORD_ALIGN, 8);
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut writer = Writer::open(dir.path(), config()).unwrap();
+    append(&mut writer, 3, 10, 0);
+    // Two reports as different as a reader's can be: another segment, offset and size, seek pending, durable-only.
+    let first = {
+        let mut reader = Reader::open(dir.path(), ReaderConfig::default()).unwrap();
+        reader.try_next().unwrap().unwrap();
+        reader.try_next().unwrap().unwrap();
+        let beacons = tempfile::tempdir().unwrap();
+        let b = ReaderBeacon::create_in(beacons.path(), "a", &reader).unwrap();
+        fs::read(b.path()).unwrap()
+    };
+    drop(writer);
+    let mut writer = Writer::open(
+        dir.path(),
+        WriterConfig::default()
+            .segment_size(4 * SEG)
+            .prefault(false),
+    )
+    .unwrap();
+    append(&mut writer, records_per_segment(10) + 5, 10, 0);
+    writer.checkpoint().unwrap();
+    let second = {
+        let mut reader =
+            Reader::open(dir.path(), ReaderConfig::default().durable_only(true)).unwrap();
+        reader.seek(records_per_segment(10) + 2).unwrap();
+        let beacons = tempfile::tempdir().unwrap();
+        let b = ReaderBeacon::create_in(beacons.path(), "b", &reader).unwrap();
+        fs::read(b.path()).unwrap()
+    };
+    let (first, second): ([u8; BEACON_LEN], [u8; BEACON_LEN]) =
+        (first.try_into().unwrap(), second.try_into().unwrap());
+    for at in [12, 40, 48, 56, 64, 80] {
+        assert_ne!(first[at..at + 4], second[at..at + 4], "offset {at}");
+    }
+    for cut in 0..=BEACON_LEN {
+        for (new, old) in [(&first, &second), (&second, &first)] {
+            let mut torn = *old;
+            torn[..cut].copy_from_slice(&new[..cut]);
+            assert!(beacon::beacon_file(&torn), "cut at {cut}");
+        }
+    }
+
+    // Not a beacon: the magic and version, then 0xff; and single bytes no writer puts there.
+    let mut ff = [0xffu8; BEACON_LEN];
+    ff[..12].copy_from_slice(&first[..12]);
+    assert!(!beacon::beacon_file(&ff));
+    for (at, value) in [
+        (12, 4),
+        (15, 1),
+        (16, 0),
+        (19, 0x80),
+        (20, 1),
+        (48, 1),
+        (53, 1),
+        (64, 1),
+        (69, 2),
+        (71, 1),
+        (100, 1),
+    ] {
+        let mut bad = first;
+        if at == 16 {
+            bad[16..20].fill(0);
+        } else {
+            bad[at] = value;
+        }
+        assert!(!beacon::beacon_file(&bad), "byte {at} = {value}");
+        assert!(beacon::decode(&bad).is_none(), "byte {at} = {value}");
+    }
+
+    // At a beacon's name, the 0xff file is refused and kept; as a leftover temporary file, it stays.
+    let reader = Reader::open(dir.path(), ReaderConfig::default()).unwrap();
+    let beacons = tempfile::tempdir().unwrap();
+    let named = beacons.path().join("ff");
+    fs::write(&named, ff).unwrap();
+    let leftover = beacons.path().join(".r.4246.0.beacon-tmp");
+    fs::write(&leftover, ff).unwrap();
+    let err = ReaderBeacon::create_in(beacons.path(), "ff", &reader).unwrap_err();
+    assert!(matches!(err, Error::InvalidConfig(_)), "{err}");
+    assert_eq!(fs::read(&named).unwrap(), ff);
+    let _r = ReaderBeacon::create_in(beacons.path(), "r", &reader).unwrap();
+    assert_eq!(fs::read(&leftover).unwrap(), ff);
+
+    // A torn mix of the two reports at the name is taken over, and as a leftover it is removed.
+    let mut torn = second;
+    torn[..44].copy_from_slice(&first[..44]);
+    assert!(beacon::decode(&torn).is_none());
+    let named = beacons.path().join("torn");
+    fs::write(&named, torn).unwrap();
+    let leftover = beacons.path().join(".x.4247.0.beacon-tmp");
+    fs::write(&leftover, torn).unwrap();
+    let taken = ReaderBeacon::create_in(beacons.path(), "torn", &reader).unwrap();
+    assert!(taken.is_published());
+    assert!(!leftover.exists());
+    drop(writer);
 }
 
 /// Finding 7: unreadable beacons and unusable beacon directories never fail the sample.
