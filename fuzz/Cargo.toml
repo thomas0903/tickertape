@@ -36,3 +36,7 @@ path = "fuzz_targets/recover_dir.rs"
 test = false
 doc = false
 bench = false
+
+[lints.rust]
+# `cargo fuzz` builds with `--cfg fuzzing`, which enables test hooks in tickertape.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
