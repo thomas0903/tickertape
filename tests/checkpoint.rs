@@ -48,3 +48,46 @@ fn checkpoint_advances_marker() {
         assert!(w.recovery_report().actions.is_empty());
     }
 }
+
+#[test]
+fn failed_cleanup_of_an_abandoned_write_is_reported() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut w = Writer::open(dir.path(), small_config()).unwrap();
+    append_n(&mut w, 3);
+    let record = tickertape::NewRecord {
+        schema_id: 1,
+        venue_ts_ns: 0,
+        local_ts_ns: 0,
+        payload: &[],
+    };
+    fault::fail_next(Point::AbandonedWriteSync, 5 /* EIO */);
+    let abandoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        w.append_with(&record, 16, |_| std::panic::panic_any("abandon"))
+    }));
+    assert!(abandoned.is_err());
+    let cause = w
+        .abandoned_write_error()
+        .expect("the failed clean-up is recorded");
+    assert!(
+        matches!(cause, Error::Io { source, .. } if source.raw_os_error() == Some(5)),
+        "{cause:?}"
+    );
+    // Later appends say why they are refused and carry the OS error; checkpoints say durability is lost.
+    match w.append(&record) {
+        Err(Error::Io { op, source, .. }) => {
+            assert!(op.contains("abandoned write"), "{op}");
+            assert_eq!(source.raw_os_error(), Some(5));
+        }
+        other => panic!("{other:?}"),
+    }
+    let lost = w.checkpoint().unwrap_err();
+    assert!(matches!(lost, Error::DurabilityLost));
+    assert!(lost.to_string().contains("abandoned write"), "{lost}");
+    drop(w);
+    // A new writer's recovery cleans up and starts without the error.
+    let mut w = Writer::open(dir.path(), small_config()).unwrap();
+    assert!(w.abandoned_write_error().is_none());
+    append_n(&mut w, 1);
+    w.checkpoint().unwrap();
+    assert_eq!(read_all(dir.path()).len(), 4);
+}

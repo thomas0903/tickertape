@@ -175,7 +175,8 @@ nothing about when bytes reach the disk; see `crash-contract.md`.
 
 If the writer starts writing a body and then does not commit it (a panic inside the caller's fill closure), it zeroes
 every byte it may have written and makes that zeroing durable (`msync`, a data sync and the platform barrier) before
-anything else is appended. If that fails, the writer refuses further appends; a new writer's recovery cleans up. A body can contain bytes that look like a valid record for the next sequence number, so leftover
+anything else is appended. If that fails, the writer refuses further appends and checkpoints and reports why
+(`Writer::abandoned_write_error`); a new writer's recovery cleans up. A body can contain bytes that look like a valid record for the next sequence number, so leftover
 bytes must never remain past the end of a shorter record that is committed later.
 
 ## Rolling

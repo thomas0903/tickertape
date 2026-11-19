@@ -54,7 +54,7 @@ pub struct Writer {
     generation: u64,
     poisoned: bool,
     /// Set if an abandoned write's zeroing could not be made durable; see `append_with`.
-    appends_blocked: bool,
+    abandoned_write_error: Option<Error>,
     report: RecoveryReport,
     retention_report: crate::retention::Report,
     last_retention_error: Option<Error>,
@@ -175,7 +175,7 @@ impl Writer {
             spare_requested: false,
             generation: checkpoint.map_or(0, |c| c.generation),
             poisoned: false,
-            appends_blocked: false,
+            abandoned_write_error: None,
             report,
             retention_report: crate::retention::Report::default(),
             last_retention_error: None,
@@ -222,11 +222,18 @@ impl Writer {
     where
         F: FnOnce(&mut [u8]),
     {
-        if self.appends_blocked {
+        if let Some(cause) = &self.abandoned_write_error {
+            let source = match cause {
+                Error::Io { source, .. } => source.raw_os_error().map_or_else(
+                    || io::Error::new(source.kind(), source.to_string()),
+                    io::Error::from_raw_os_error,
+                ),
+                other => io::Error::other(other.to_string()),
+            };
             return Err(Error::io(
-                "append after an abandoned write could not be cleaned up durably",
+                "append (refused: an earlier abandoned write could not be zeroed durably; reopen the journal)",
                 &self.active.path,
-                io::Error::other("reopen the journal to recover"),
+                source,
             ));
         }
         if self.next_seq == u64::MAX {
@@ -272,17 +279,19 @@ impl Writer {
         if let Err(cause) = filled {
             body.fill(0);
             // The zeroing must be durable (full platform barrier) before this space is reused.
-            let synced = self
-                .active
-                .map
-                .sync_range(offset, u64::from(len))
+            let synced = crate::fault::inject(crate::fault::Point::AbandonedWriteSync)
+                .and_then(|()| self.active.map.sync_range(offset, u64::from(len)))
                 .and_then(|()| mmap::sync_data(&self.active.file))
                 .and_then(|()| mmap::full_barrier(&self.active.file));
-            if synced.is_err() {
+            if let Err(e) = synced {
                 // Stale bytes could resurface after a power loss and be read as a record after a shorter one,
                 // so this writer must not reuse the space: refuse further appends and checkpoints.
                 self.poisoned = true;
-                self.appends_blocked = true;
+                self.abandoned_write_error = Some(Error::io(
+                    "sync the zeroing of an abandoned write",
+                    &self.active.path,
+                    e,
+                ));
             }
             panic::resume_unwind(cause);
         }
@@ -406,6 +415,15 @@ impl Writer {
     /// Cumulative successful retention removals since open, including partially failed runs.
     pub fn retention_report(&self) -> &crate::retention::Report {
         &self.retention_report
+    }
+
+    /// The error that stopped this writer when the zeroing of an abandoned write (a panic in an
+    /// [`append_with`](Writer::append_with) fill closure) could not be made durable, if that happened.
+    ///
+    /// While it is set, appends fail with [`Error::Io`] and checkpoints with [`Error::DurabilityLost`]; reopen the
+    /// journal to recover (`docs/format.md` → Abandoned writes).
+    pub fn abandoned_write_error(&self) -> Option<&Error> {
+        self.abandoned_write_error.as_ref()
     }
 
     /// Most recent retention error since open. A later successful run does not clear it.
