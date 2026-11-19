@@ -169,8 +169,9 @@ fn live_mapped_reader(iterations: u32) {
                 }
             };
             let mut empty_polls = 0_u64;
-            // When the reader first saw `stop_at` set: it must then reach it within `CATCH_UP`, or the test fails
-            // instead of spinning (and the main thread waiting in `join`) forever.
+            // When the reader first saw `stop_at` set: it must then reach it within `CATCH_UP`, whether it is
+            // polling an empty slot or still returning records, or the test fails instead of running (and the main
+            // thread waiting in `join`) forever.
             let mut catching_up_since: Option<Instant> = None;
             loop {
                 let expected = reader.position();
@@ -188,23 +189,23 @@ fn live_mapped_reader(iterations: u32) {
                         progress.store(rec.seq + 1, Ordering::SeqCst);
                     }
                     Ok(None) => {
-                        let stop = stop_at.load(Ordering::SeqCst);
-                        if reader.position() >= stop {
+                        if reader.position() >= stop_at.load(Ordering::SeqCst) {
                             return empty_polls;
-                        }
-                        if stop != u64::MAX {
-                            let since = *catching_up_since.get_or_insert_with(Instant::now);
-                            assert!(
-                                since.elapsed() < CATCH_UP,
-                                "live mapped reader stuck at position {} for {CATCH_UP:?} after the last \
-                                 writer; expected to reach position {stop} (the final recovered next_seq)",
-                                reader.position()
-                            );
                         }
                         empty_polls += 1;
                         std::hint::spin_loop();
                     }
                     Err(e) => panic!("live mapped reader at {expected}: {e}"),
+                }
+                let stop = stop_at.load(Ordering::SeqCst);
+                if stop != u64::MAX {
+                    let since = *catching_up_since.get_or_insert_with(Instant::now);
+                    assert!(
+                        since.elapsed() < CATCH_UP,
+                        "live mapped reader at position {} {CATCH_UP:?} after the last writer; expected to \
+                         reach position {stop} (the final recovered next_seq)",
+                        reader.position()
+                    );
                 }
             }
         })

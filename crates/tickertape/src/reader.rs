@@ -137,10 +137,10 @@ impl Reader {
     ///
     /// - The length in an earlier record's commit word is enlarged while no writer runs, and a writer then appends
     ///   after that record: validating it loads bytes the writer is storing.
-    /// - The commit word of a published record not yet covered by a checkpoint is zeroed: unless the next writer's
-    ///   recovery can tell that published records follow, which it cannot always do, it zeroes that record and the
-    ///   published records after it in place, under a live zero-copy reader. A payload the caller still holds then
-    ///   changes, and the reader's later loads meet the new writer's stores.
+    /// - The commit word of a published record not yet covered by a checkpoint is zeroed: the next writer's
+    ///   recovery takes that slot for the end of the journal and zeroes that record and the published records
+    ///   after it in place, under a live zero-copy reader. A payload the caller still holds then changes, and the
+    ///   reader's later loads meet the new writer's stores.
     ///
     /// That such loads return some mixture of old and new bytes, which the CRC then rejects, is an assumption about
     /// the implementation on the supported targets, not a guarantee. Earlier releases had the same exposure.
@@ -221,7 +221,9 @@ impl Reader {
     /// so calling again retries the same position (which may succeed after a writer recovery).
     /// [`Error::Discarded`] if writer recovery or retention replaced or removed the segment at the cursor;
     /// call [`Reader::seek`] to continue on the current chain.
-    /// [`Error::Io`] if the next segment can't be opened.
+    /// [`Error::Io`] if the next segment can't be opened, or (with kind
+    /// [`OutOfMemory`](std::io::ErrorKind::OutOfMemory)) if the read buffer for the frame at the cursor can't be
+    /// allocated.
     pub fn try_next(&mut self) -> Result<Option<Record<'_>>> {
         match self.advance()? {
             Some(found) => Ok(Some(self.materialize(found))),
@@ -472,8 +474,10 @@ impl Reader {
                 return Ok(SlotOutcome::Invalid(CorruptReason::BadLength(0)));
             };
             // Validate straight from `Relaxed` atomic loads of the mapping (ADR 0027): no `&[u8]` or other reference
-            // asserting immutability exists until the record has passed validation (`materialize`), so a corrupted
-            // length can't make a slice cover bytes still being written, and nothing is copied.
+            // asserting immutability exists until the record has passed validation (`materialize`), and nothing is
+            // copied. A damaged length is normally rejected by the bounds checks and the CRC before any slice
+            // exists; validation is not proof, and ADR 0027 → "Which loads can race" says what a damaged commit
+            // word can lead to.
             return Ok(read_mapped(map, word, offset, size, expected));
         }
 

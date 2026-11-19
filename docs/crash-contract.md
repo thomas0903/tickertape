@@ -114,9 +114,8 @@ journal; the durability and restart guarantees below apply to retained history.
     runs, and a writer later appends after that record, validating it makes the reader load bytes the writer is
     storing at that moment.
   - *A zeroed commit word.* If storage damage zeroes the commit word of a record that was published but not yet
-    covered by a checkpoint, the next writer's recovery, unless it can tell that published records follow (which it
-    cannot always do), zeroes that record **and the published records after it** in place, under a live zero-copy
-    reader. A payload slice the caller still holds changes, and the reader's later commit-word loads meet the new
+    covered by a checkpoint, the next writer's recovery takes that slot for the end of the journal and zeroes that
+    record **and the published records after it** in place, under a live zero-copy reader. A payload slice the caller still holds changes, and the reader's later commit-word loads meet the new
     writer's stores.
 
   That such loads return some mixture of old and new bytes, which the CRC then rejects, is an assumption about the

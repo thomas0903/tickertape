@@ -90,9 +90,9 @@ writers touch the files.
 1. A writer appends records up to sequence number `T`, which readers return; the last checkpoint covers only the
    records before some `S <= T`.
 2. Storage damage zeroes the commit word of the published record `S`.
-3. A writer reopens. Recovery scans from the checkpoint and stops at the empty slot of record `S`. Unless it can tell
-   that published records follow (which it cannot always do), it takes that slot for the end of the journal and
-   zeroes record `S` **and the published records after it** in place, then appends from there.
+3. A writer reopens. Recovery scans from the checkpoint and stops at the empty slot of record `S`. It takes that slot
+   for the end of the journal and zeroes record `S` **and the published records after it** in place, then appends
+   from there.
 4. A zero-copy reader that is still open while this happens holds payload slices into those records, and they change
    under it: the bytes it validated are not the bytes it hands back. Its later commit-word loads, and the loads that
    validate the records it then reads, meet the recovering and the new writer's stores to the same bytes.
