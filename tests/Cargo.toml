@@ -66,3 +66,7 @@ path = "retention.rs"
 [[test]]
 name = "compat"
 path = "compat.rs"
+
+[[test]]
+name = "soak"
+path = "soak.rs"
