@@ -350,6 +350,7 @@ Every error from the library is a `TickertapeException` (unchecked), with one su
 | `FillAbortedException` | `ABORTED` | A `PayloadFiller` threw; nothing was appended |
 | `HandleBusyException` | `BUSY` | Not reachable through the binding (its guard throws `IllegalStateException` first) |
 | `InternalErrorException` | `PANIC` | A bug in tickertape was caught; the handle is broken, close it |
+| `BeaconInUseException` | `BEACON_IN_USE` | A reader beacon's name is held by a running reader; not thrown yet (no C function creates beacons) |
 | `TickertapeException` | `UNKNOWN` | A code this binding does not know; `code()` has it |
 
 `status()` and `code()` give the status on every exception; `BatchAppendException` reports a partial batch append. The

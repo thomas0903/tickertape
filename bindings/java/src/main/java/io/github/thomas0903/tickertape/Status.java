@@ -47,6 +47,8 @@ public enum Status {
     BUSY(-16),
     /** {@link InternalErrorException}. */
     PANIC(-17),
+    /** {@link BeaconInUseException}. */
+    BEACON_IN_USE(-18),
     /** An error code this binding has no specific mapping for ({@code TICKERTAPE_E_UNKNOWN}, or a newer code). */
     UNKNOWN(-255);
 

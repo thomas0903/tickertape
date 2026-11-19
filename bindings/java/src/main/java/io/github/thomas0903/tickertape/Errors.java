@@ -54,6 +54,7 @@ final class Errors {
             case ABORTED -> new FillAbortedException(message, cause);
             case BUSY -> new HandleBusyException(message, cause);
             case PANIC -> new InternalErrorException(message, cause);
+            case BEACON_IN_USE -> new BeaconInUseException(message, cause);
             case UNKNOWN -> new TickertapeException(Status.UNKNOWN, status, message, cause);
             case OK, NONE -> throw new IllegalArgumentException("not an error: " + status);
         };

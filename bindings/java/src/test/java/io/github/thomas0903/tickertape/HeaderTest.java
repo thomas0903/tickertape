@@ -257,9 +257,9 @@ class HeaderTest {
         assertEquals(8, c.reasonCode());
         assertEquals(42, ((BufferTooSmallException) Errors.create(-14, "", 0, 0, 42, null)).requiredBytes());
         // A code this binding does not know (a newer library) is still an error, with its raw code.
-        TickertapeException future = Errors.create(-18, "new", 0, 0, -1, null);
+        TickertapeException future = Errors.create(-19, "new", 0, 0, -1, null);
         assertEquals(Status.UNKNOWN, future.status());
-        assertEquals(-18, future.code());
+        assertEquals(-19, future.code());
     }
 
     @Test

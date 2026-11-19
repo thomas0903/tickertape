@@ -301,7 +301,8 @@ reads work inside lambdas and streams; every method documents what it throws. Ea
 `JournalLockedException`, `CorruptJournalException` with `reason()`, `UnsupportedFormatVersionException`,
 `JournalNotFoundException`, `SequenceUnavailableException`, `RecordTooLargeException`, `DurabilityLostException`,
 `SequenceExhaustedException`, `DiscardedHistoryException`, `InvalidConfigException`, `BufferTooSmallException` with
-`requiredBytes()`, `FillAbortedException`, `HandleBusyException`, `InternalErrorException`); a code the binding does not
+`requiredBytes()`, `FillAbortedException`, `HandleBusyException`, `InternalErrorException`, and
+`BeaconInUseException`, which nothing throws until the C ABI creates reader beacons); a code the binding does not
 know (a newer library) is a plain `TickertapeException` with `Status.UNKNOWN` and the raw `code()`. `Status` and
 `CorruptReason` are enums with the C values and names; where a reason is reported, its raw C value is kept too
 (`CorruptJournalException.reasonCode()`, `VerifyReport.firstProblemReasonCode()`), so a reason added by a newer library
