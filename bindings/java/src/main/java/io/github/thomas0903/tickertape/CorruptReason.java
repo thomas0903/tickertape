@@ -3,6 +3,9 @@ package io.github.thomas0903.tickertape;
 /**
  * Why journal bytes failed validation ({@code tickertape_corrupt_reason}), from {@link CorruptJournalException#reason()}
  * and {@link VerifyReport#firstProblemReason()}. See {@code docs/format.md} for the rules.
+ *
+ * <p><b>Constants may be added in minor releases</b> (with the C reasons they stand for), so a {@code switch} over a
+ * reason needs a {@code default} branch; until a binding knows a new reason, it reports it as {@link #UNKNOWN}.
  */
 public enum CorruptReason {
     /** No corruption. */

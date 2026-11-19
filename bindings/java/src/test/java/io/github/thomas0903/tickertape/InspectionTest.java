@@ -1,9 +1,11 @@
 package io.github.thomas0903.tickertape;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.IOException;
+import java.lang.reflect.Modifier;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -92,5 +94,32 @@ class InspectionTest {
         assertEquals(r, Retention.moveTo(tmp).maxSegments(3).maxBytes(10).maxAge(Duration.ofSeconds(1)));
         assertTrue(r.toString().contains("maxSegments(3)"), r.toString());
         assertEquals(null, Retention.delete().moveToDirectory());
+    }
+
+    /**
+     * The reports come from C structs that grow (they carry {@code struct_size}), so they are final classes that can
+     * gain accessors, not records whose canonical constructor and pattern would change (ADR 0037 -> Value types). The
+     * frozen structs stay records.
+     */
+    @Test
+    void growableReportsAreClassesAndFrozenValuesAreRecords() throws Exception {
+        for (Class<?> c : List.of(VerifyReport.class, RetentionReport.class)) {
+            assertFalse(c.isRecord(), c + " must not be a record");
+            assertTrue(Modifier.isFinal(c.getModifiers()), c + " must be final");
+            assertEquals(0, c.getConstructors().length, c + " must have no public constructor");
+        }
+        for (Class<?> c : List.of(Checkpoint.class, SegmentInfo.class, RecordCopy.class)) {
+            assertTrue(c.isRecord(), c + " is a frozen value");
+        }
+        Path dir = journal(2, true);
+        VerifyReport a = Journal.verify(dir);
+        VerifyReport b = Journal.verify(dir);
+        assertEquals(a, b);
+        assertEquals(a.hashCode(), b.hashCode());
+        assertTrue(a.toString().startsWith("VerifyReport[segments=" + a.segments() + ", records=" + a.records()),
+                a.toString());
+        RetentionReport plan = Journal.applyRetention(dir, Retention.delete().maxSegments(1), true);
+        assertEquals(plan, Journal.applyRetention(dir, Retention.delete().maxSegments(1), true));
+        assertTrue(plan.toString().contains("removedSegments=" + plan.removedSegments()), plan.toString());
     }
 }

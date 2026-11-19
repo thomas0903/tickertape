@@ -4,6 +4,9 @@ package io.github.thomas0903.tickertape;
  * The C ABI's status codes ({@code tickertape_status_code}), each with its C value. Every error status has its own
  * subclass of {@link TickertapeException}; {@link TickertapeException#status()} returns the status, and
  * {@link #UNKNOWN} stands for a code this binding does not know (a newer library may add codes).
+ *
+ * <p><b>Constants may be added in minor releases</b> (with the C codes they stand for), so a {@code switch} over a
+ * status needs a {@code default} branch; until a binding knows a new code, it reports it as {@link #UNKNOWN}.
  */
 public enum Status {
     /** Success. */
