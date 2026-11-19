@@ -189,6 +189,11 @@ enum class CorruptReason : std::int32_t {
     bad_seal = TICKERTAPE_CORRUPT_BAD_SEAL,
     broken_chain = TICKERTAPE_CORRUPT_BROKEN_CHAIN,
     dangling_checkpoint = TICKERTAPE_CORRUPT_DANGLING_CHECKPOINT,
+    // A commit word reads 0 and evidence of committed records follows it (docs/crash-contract.md C11, ADR 0035).
+    empty_commit_word = TICKERTAPE_CORRUPT_EMPTY_COMMIT_WORD,
+    // A commit word reads 0 and the search of the bytes after it stopped at its work bound: inconclusive, and
+    // treated like empty_commit_word.
+    unchecked_tail = TICKERTAPE_CORRUPT_UNCHECKED_TAIL,
     unknown = TICKERTAPE_CORRUPT_UNKNOWN,
 };
 

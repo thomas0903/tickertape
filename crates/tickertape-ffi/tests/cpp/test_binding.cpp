@@ -166,6 +166,8 @@ static bool is_named(tt::CorruptReason reason) {
         case tt::CorruptReason::bad_seal:
         case tt::CorruptReason::broken_chain:
         case tt::CorruptReason::dangling_checkpoint:
+        case tt::CorruptReason::empty_commit_word:
+        case tt::CorruptReason::unchecked_tail:
         case tt::CorruptReason::unknown:
             return true;
     }
