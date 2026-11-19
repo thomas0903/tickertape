@@ -13,9 +13,12 @@ Report possible vulnerabilities privately as described in [`SECURITY.md`](SECURI
   change to either needs a short design record in `docs/decisions/` (copy `_template.md`), in the same pull request.
 - **Spec, then tests, then code.** Write down the behaviour (rustdoc, spec section or ADR), add tests that fail
   without the change, then implement. `docs/playbooks/add-feature.md` has the checklist.
-- **`unsafe` lives in two modules.** Only `crates/tickertape/src/mmap.rs` (mappings and system calls) and
-  `crates/tickertape/src/crc.rs` (CPU intrinsics, ADR 0019) may contain `unsafe` code, and every `unsafe` block needs
-  a `// SAFETY:` comment. Changes there get extra review.
+- **`unsafe` lives in two modules, plus the C ABI crate.** In the core crate only `crates/tickertape/src/mmap.rs`
+  (mappings and system calls) and `crates/tickertape/src/crc.rs` (CPU intrinsics, ADR 0019) may contain `unsafe`
+  code. The C ABI crate `crates/tickertape-ffi` cannot avoid it (raw pointers from C, exported symbols), so it is a
+  deliberate, scoped exception (ADR 0028): keep each block small, and document each `unsafe extern "C" fn`'s contract
+  in a `# Safety` section (it is copied into the header). Every `unsafe` block needs a `// SAFETY:` comment. Changes
+  there get extra review. FFI code never goes into the core crate.
 - **No unverified claims.** Numbers in docs come from recorded runs (`docs/playbooks/run-benchmark.md`); guarantees
   name the test that checks them.
 
@@ -32,9 +35,20 @@ cargo test -p tickertape-tests --release -- --ignored        # long tests: 1M re
 cargo +nightly miri test -p tickertape --lib -- format crc map_ro   # Miri: format, CRC, mapped loads
 RUSTFLAGS="--cfg loom" cargo test -p tickertape --lib --release protocol_model
 cargo check -p tickertape --all-features --target i686-unknown-linux-gnu   # 32-bit: no read-only mappings
+cargo +nightly miri test -p tickertape-ffi --lib pure_         # Miri on the C ABI's argument handling
+TICKERTAPE_FFI_SANITIZE=1 cargo test -p tickertape-ffi --features fault-injection   # C/C++ tests under ASan, UBSan
+cbindgen --config crates/tickertape-ffi/cbindgen.toml --crate tickertape-ffi \
+    --output crates/tickertape-ffi/include/tickertape.h && git diff --exit-code   # header drift (cbindgen 0.29.4)
+python3 .github/scripts/check_abi_baseline.py crates/tickertape-ffi/abi/tickertape-baseline.h \
+    crates/tickertape-ffi/include/tickertape.h                   # frozen C declarations (from 1.0)
+python3 -m unittest discover -s .github/scripts -p 'test_*.py'  # release and ABI tooling
 tests/compat/generate.sh --check-old-readers                 # released readers on new journals (ADR 0033)
 go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12    # workflow lint
 ```
+
+`cargo test --workspace` compiles and runs C and C++ programs, so it needs a C/C++ compiler; it also runs the
+Python decoder if `python3` is available. On Linux, CI also runs the C programs under Valgrind
+(`TICKERTAPE_FFI_VALGRIND=1`).
 
 Changes to `crc.rs` should also pass the whole suite on tickertape's fallback path, which its hardware path
 otherwise hides on every machine that has the CRC instruction:
