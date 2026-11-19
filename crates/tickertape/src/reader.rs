@@ -553,7 +553,8 @@ impl Reader {
     /// Moves from the seal at the cursor to the next segment, checking that the segment at the cursor is still in place.
     ///
     /// Returns `Ok(())` without moving if the successor is missing and the slot at the cursor no longer holds the
-    /// seal: the caller reads the slot again.
+    /// seal: `next_slot` then reads the slot again, and `leave_superseded_segment` lets its caller report that
+    /// nothing is readable yet.
     fn follow_seal(&mut self) -> Result<()> {
         self.check_identity()?;
         crate::fault::hook(crate::fault::Point::ReaderSeal);
