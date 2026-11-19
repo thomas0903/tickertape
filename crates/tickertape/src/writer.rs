@@ -198,6 +198,8 @@ impl Writer {
     /// - [`Error::Io`] if a roll fails, e.g. the disk is full
     ///   ([`Error::is_storage_full`]). The journal is unchanged and the call can be
     ///   retried.
+    /// - [`Error::Io`] that no retry clears, once the zeroing of an abandoned write could not be made durable
+    ///   ([`Writer::abandoned_write_error`]). [`Error::is_storage_full`] is false for it; reopen the journal.
     pub fn append(&mut self, record: &NewRecord<'_>) -> Result<u64> {
         let payload = record.payload;
         self.append_with(record, payload.len(), |buf| buf.copy_from_slice(payload))
@@ -208,7 +210,9 @@ impl Writer {
     /// `fill` receives a zeroed buffer of exactly `payload_len` bytes inside the mapped segment. No reader can see
     /// it until `fill` returns and the record is committed. If `fill` panics, nothing is committed: the writer zeroes
     /// the buffer and syncs that zeroing (`docs/format.md` → Abandoned writes) before the panic continues, so no
-    /// bytes from it can later be mistaken for a record. `record.payload` is ignored.
+    /// bytes from it can later be mistaken for a record. If that sync fails, the panic continues all the same, the
+    /// stale bytes may still be on disk, and the writer refuses further appends and checkpoints
+    /// ([`Writer::abandoned_write_error`]). `record.payload` is ignored.
     ///
     /// # Errors
     ///
