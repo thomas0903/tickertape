@@ -40,10 +40,13 @@ public final class Retention {
     /**
      * Settings that move eligible segments into the existing directory {@code dir}, keeping their names, with no limits
      * yet. A move never replaces an existing file there (it fails instead).
+     *
+     * @throws IllegalArgumentException if {@code dir} is not on the default file system, or its name cannot be passed
+     *     to the library unchanged (see {@code docs/java-api.md} &rarr; Paths)
      */
     public static Retention moveTo(Path dir) {
         Objects.requireNonNull(dir, "dir");
-        Paths.requireDefaultFileSystem(dir);
+        Paths.nativeBytes(dir); // refuses a path the C library would not see unchanged (see Writer.open)
         return new Retention(dir, -1, -1, -1);
     }
 
@@ -103,7 +106,7 @@ public final class Retention {
                 Errors.check(Native.retentionSetMoveTo(r, Paths.toC(moveTo, arena)));
             }
             return r;
-        } catch (RuntimeException e) {
+        } catch (Throwable e) { // an Error too: the native struct must not leak
             Native.retentionFree(r);
             throw e;
         }

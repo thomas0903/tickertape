@@ -74,22 +74,27 @@ public final class WriterOptions {
         return new WriterOptions(segmentSize, recoveryPolicy, notify, prefault, retention);
     }
 
+    /** The size of new segment files in bytes. */
     public long segmentSize() {
         return segmentSize;
     }
 
+    /** What to do with a corrupt committed tail on open. */
     public RecoveryPolicy recoveryPolicy() {
         return recoveryPolicy;
     }
 
-    public boolean notifyEnabled() {
+    /** Whether the writer wakes blocked readers through its wake-up region (see {@link #notify(boolean)}). */
+    public boolean isNotifyEnabled() {
         return notify;
     }
 
-    public boolean prefaultEnabled() {
+    /** Whether the writer prefaults pages in a background thread (see {@link #prefault(boolean)}). */
+    public boolean isPrefaultEnabled() {
         return prefault;
     }
 
+    /** The retention settings, or {@code null} if retention is off. */
     public Retention retention() {
         return retention;
     }
@@ -111,7 +116,7 @@ public final class WriterOptions {
                 }
             }
             return o;
-        } catch (RuntimeException e) {
+        } catch (Throwable e) { // an Error too: the native struct must not leak
             Native.writerOptionsFree(o);
             throw e;
         }

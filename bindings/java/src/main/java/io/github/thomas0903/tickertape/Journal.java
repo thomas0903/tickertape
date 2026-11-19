@@ -46,7 +46,7 @@ public final class Journal {
                     report.get(JAVA_LONG, off(l, "first_seq")), report.get(JAVA_LONG, off(l, "last_seq")),
                     report.get(JAVA_LONG, off(l, "problems")), report.get(JAVA_LONG, off(l, "first_problem_base_seq")),
                     report.get(JAVA_LONG, off(l, "first_problem_offset")),
-                    CorruptReason.of(report.get(JAVA_INT, off(l, "first_problem_reason"))));
+                    report.get(JAVA_INT, off(l, "first_problem_reason")));
         }
     }
 

@@ -3,8 +3,11 @@ package io.github.thomas0903.tickertape;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import java.io.IOException;
+import java.nio.file.DirectoryNotEmptyException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -180,5 +183,132 @@ class LibraryLoadingTest {
         Tickertape.loadLibrary(TestSupport.LIBRARY);
         assertThrows(IllegalStateException.class, () -> Tickertape.loadLibrary(tmp.resolve("other").resolve(fileName())));
         assertTrue(Tickertape.librarySource().startsWith("libtickertape " + NativeLibrary.VERSION));
+    }
+
+    @Test
+    void theNativesJarWinsOverJavaLibraryPath() throws Exception {
+        List<String> args = new ArrayList<>(base(privateTmp()));
+        args.set(3, "-Djava.library.path=" + TestSupport.LIBRARY.getParent());
+        Path jar = nativesJar(NativeLibrary.sha256(TestSupport.LIBRARY));
+        TestSupport.Result r = probe(args, classes() + java.io.File.pathSeparator + jar);
+        assertEquals(0, r.exit(), r.stdout() + r.stderr());
+        assertTrue(r.stdout().contains("source libtickertape " + NativeLibrary.VERSION + " from the natives JAR"),
+                r.stdout());
+    }
+
+    /** A C compiler, or a skipped test (a failure when {@code tickertape.test.requireTools} is true). */
+    private static String cc() {
+        String cc = System.getenv().getOrDefault("CC", "cc");
+        try {
+            Process p = new ProcessBuilder(cc, "--version").redirectErrorStream(true).start();
+            p.getInputStream().readAllBytes();
+            if (p.waitFor() == 0) {
+                return cc;
+            }
+        } catch (IOException | InterruptedException e) {
+            // fall through
+        }
+        if (TestSupport.REQUIRE_TOOLS) {
+            fail("no C compiler (" + cc + ")");
+        }
+        assumeTrue(false, "no C compiler (" + cc + ")");
+        return null;
+    }
+
+    @Test
+    void aLibraryOfAnotherVersionGetsNoHintAboutTheExtractDirectory() throws Exception {
+        Path source = Files.writeString(tmp.resolve("other.c"), """
+                int tickertape_abi_version(void) { return 0; }
+                int tickertape_version_number(void) { return 9000; }
+                const char *tickertape_version(void) { return "0.9.0"; }
+                """);
+        Path other = Files.createDirectories(tmp.resolve("other")).resolve(fileName());
+        TestSupport.runOk(List.of(cc(), "-shared", "-fPIC", "-o", other.toString(), source.toString()), 120);
+        Path jar = nativesJar(other, NativeLibrary.sha256(other));
+        TestSupport.Result r = probe(base(privateTmp()), classes() + java.io.File.pathSeparator + jar);
+        assertEquals(3, r.exit(), r.stdout() + r.stderr());
+        assertTrue(r.stdout().contains("libtickertape 0.9.0 (ABI 0)") && r.stdout().contains("not compatible"),
+                r.stdout());
+        assertTrue(!r.stdout().contains(NativeLibrary.EXTRACT_DIR_PROPERTY) && !r.stdout().contains("noexec"),
+                "the extract-directory hint is for a file that fails to load, not for a version mismatch: " + r.stdout());
+    }
+
+    /**
+     * Two first calls of {@code loadLibrary} with different paths, at once: each either loads its own path or is
+     * refused, never returns having loaded the other's. The window was between recording the request and loading, so
+     * this is a race the test can only provoke (a barrier, several fresh JVMs), not force.
+     */
+    @Test
+    void concurrentFirstLoadLibraryCallsDoNotCrossOver() throws Exception {
+        Path copy = Files.createDirectories(tmp.resolve("copy")).resolve(fileName());
+        Files.copy(TestSupport.LIBRARY, copy);
+        Path race = tmp.resolve("Race.java");
+        Files.writeString(race, """
+                import io.github.thomas0903.tickertape.Tickertape;
+                import java.nio.file.Path;
+                import java.util.concurrent.CyclicBarrier;
+                public class Race {
+                    public static void main(String[] args) throws Exception {
+                        CyclicBarrier barrier = new CyclicBarrier(2);
+                        String[] outcome = new String[2];
+                        Thread[] threads = new Thread[2];
+                        for (int i = 0; i < 2; i++) {
+                            int k = i;
+                            threads[i] = Thread.ofPlatform().start(() -> {
+                                try {
+                                    barrier.await();
+                                    Tickertape.loadLibrary(Path.of(args[k]));
+                                    outcome[k] = "loaded";
+                                } catch (IllegalStateException e) {
+                                    outcome[k] = "refused";
+                                } catch (Exception e) {
+                                    outcome[k] = "error " + e;
+                                }
+                            });
+                        }
+                        for (Thread t : threads) {
+                            t.join();
+                        }
+                        System.out.println("0 " + outcome[0]);
+                        System.out.println("1 " + outcome[1]);
+                        System.out.println("source " + Tickertape.librarySource());
+                    }
+                }
+                """);
+        String[] paths = {TestSupport.LIBRARY.toAbsolutePath().normalize().toString(), copy.toAbsolutePath().toString()};
+        for (int run = 0; run < 4; run++) {
+            List<String> cmd = new ArrayList<>(List.of(TestSupport.javaLauncher()));
+            cmd.addAll(base(privateTmp()));
+            cmd.addAll(List.of("--class-path", classes(), race.toString(), paths[0], paths[1]));
+            TestSupport.Result r = TestSupport.runOk(cmd, 120);
+            List<String> lines = TestSupport.lines(r.stdout());
+            String source = lines.get(2);
+            int loaded = 0;
+            for (int k = 0; k < 2; k++) {
+                if (lines.get(k).equals(k + " loaded")) {
+                    loaded++;
+                    assertTrue(source.contains(paths[k]), "thread " + k + " returned from loadLibrary(" + paths[k]
+                            + ") but the library came from elsewhere: " + r.stdout());
+                } else {
+                    assertEquals(k + " refused", lines.get(k), r.stdout());
+                }
+            }
+            assertEquals(1, loaded, r.stdout());
+        }
+    }
+
+    @Test
+    void aFailedCleanUpNeitherHidesTheErrorNorSkipsTheRest() throws Exception {
+        Path full = Files.createDirectories(tmp.resolve("full"));
+        Files.writeString(full.resolve("left"), "x"); // deleting a non-empty directory fails
+        Path empty = Files.createDirectories(tmp.resolve("empty"));
+        UnsatisfiedLinkError primary = new UnsatisfiedLinkError("the real failure");
+        NativeLibrary.deleteAll(primary, full, empty);
+        assertTrue(Files.notExists(empty), "the paths after a failed one are deleted too");
+        assertEquals(1, primary.getSuppressed().length);
+        assertTrue(primary.getSuppressed()[0] instanceof DirectoryNotEmptyException, primary.getSuppressed()[0].toString());
+        Path file = Files.writeString(tmp.resolve("file"), "x");
+        NativeLibrary.deleteAll(null, full, file); // after a successful load: a warning, not an exception
+        assertTrue(Files.notExists(file));
     }
 }

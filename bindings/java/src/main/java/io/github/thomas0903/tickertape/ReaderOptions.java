@@ -95,14 +95,17 @@ public final class ReaderOptions {
         return new ReaderOptions(durableOnly, notify, busySpin, spins, yields, minSleepNs, maxSleepNs, ns);
     }
 
+    /** Whether the reader returns only durable records (see {@link #durableOnly(boolean)}). */
     public boolean isDurableOnly() {
         return durableOnly;
     }
 
-    public boolean notifyEnabled() {
+    /** Whether a waiting reader blocks on the writer's wake-up region (see {@link #notify(boolean)}). */
+    public boolean isNotifyEnabled() {
         return notify;
     }
 
+    /** The longest single wait in the library during a blocking read (see {@link #waitSlice(Duration)}). */
     public Duration waitSlice() {
         return Duration.ofNanos(waitSliceNs);
     }
@@ -135,7 +138,7 @@ public final class ReaderOptions {
                 Errors.check(Native.readerOptionsSetBackoff(o, spins, yields, minSleepNs, maxSleepNs));
             }
             return o;
-        } catch (RuntimeException e) {
+        } catch (Throwable e) { // an Error too: the native struct must not leak
             Native.readerOptionsFree(o);
             throw e;
         }

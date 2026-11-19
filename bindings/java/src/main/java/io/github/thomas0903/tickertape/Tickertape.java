@@ -39,8 +39,7 @@ public final class Tickertape {
      */
     public static void loadLibrary(Path path) {
         Objects.requireNonNull(path, "path");
-        NativeLibrary.request(path);
-        NativeLibrary.lookup();
+        NativeLibrary.loadFrom(path);
     }
 
     /** Where the library was loaded from, its version, or why loading failed; for diagnostics. Does not load it. */

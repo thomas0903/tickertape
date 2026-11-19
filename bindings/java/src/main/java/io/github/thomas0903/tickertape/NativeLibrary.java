@@ -6,6 +6,7 @@ import java.io.OutputStream;
 import java.lang.foreign.Arena;
 import java.lang.foreign.FunctionDescriptor;
 import java.lang.foreign.Linker;
+import java.lang.foreign.MemoryLayout;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.SymbolLookup;
 import java.lang.foreign.ValueLayout;
@@ -75,12 +76,22 @@ final class NativeLibrary {
         return abi == ABI_VERSION && (ABI_VERSION == 0 ? lib == VERSION_NUMBER : Integer.compareUnsigned(lib, VERSION_NUMBER) >= 0);
     }
 
+    /** {@code MAJOR.MINOR.PATCH} of a version number, read as the unsigned 32-bit value the C ABI returns. */
     static String versionString(int number) {
-        int n = number;
-        return (Integer.toUnsignedLong(n) / 1_000_000) + "." + (n / 1000 % 1000) + "." + (n % 1000);
+        long n = Integer.toUnsignedLong(number);
+        return (n / 1_000_000) + "." + (n / 1000 % 1000) + "." + (n % 1000);
     }
 
-    static synchronized void request(Path path) {
+    /**
+     * {@link Tickertape#loadLibrary(Path)}: records the request and loads, under one lock, so that two first calls
+     * with different paths cannot cross over (each either loads its own path or is refused).
+     */
+    static synchronized void loadFrom(Path path) {
+        request(path);
+        load0();
+    }
+
+    private static void request(Path path) {
         Path p = path.toAbsolutePath().normalize();
         if (lookup != null || failure != null) {
             if (p.equals(requested) || p.equals(loadedPath)) {
@@ -130,8 +141,10 @@ final class NativeLibrary {
     }
 
     private static void load() throws IOException {
-        if (ValueLayout.ADDRESS.byteSize() != 8) {
-            throw new UnsatisfiedLinkError("the tickertape binding supports 64-bit platforms only");
+        MemoryLayout sizeT = Linker.nativeLinker().canonicalLayouts().get("size_t");
+        if (ValueLayout.ADDRESS.byteSize() != 8 || sizeT == null || sizeT.byteSize() != 8) {
+            throw new UnsatisfiedLinkError("the tickertape binding supports 64-bit platforms only (pointers and size_t"
+                    + " of 8 bytes)");
         }
         List<String> tried = new ArrayList<>();
         if (requested != null) {
@@ -199,16 +212,19 @@ final class NativeLibrary {
     }
 
     private static void open(Path path, String how) {
-        SymbolLookup symbols;
+        check(map(path, how), how);
+        loadedPath = path.toAbsolutePath().normalize();
+    }
+
+    /** Loads the file (the dynamic loader maps it); throws if that fails, before any check of what it is. */
+    private static SymbolLookup map(Path path, String how) {
         try {
-            symbols = SymbolLookup.libraryLookup(path, Arena.global());
+            return SymbolLookup.libraryLookup(path, Arena.global());
         } catch (IllegalArgumentException e) {
             UnsatisfiedLinkError error = new UnsatisfiedLinkError("cannot load libtickertape from " + how + ": " + e.getMessage());
             error.initCause(e);
             throw error;
         }
-        check(symbols, how);
-        loadedPath = path.toAbsolutePath().normalize();
     }
 
     /**
@@ -238,6 +254,7 @@ final class NativeLibrary {
             dir = Files.createTempDirectory(parent, "tickertape-");
         }
         Path file = dir.resolve(fileName);
+        Throwable failure = null;
         try {
             try (InputStream in = url.openStream();
                     OutputStream out = Files.newOutputStream(file, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)) {
@@ -248,11 +265,14 @@ final class NativeLibrary {
                 throw new UnsatisfiedLinkError("the library extracted from " + url + " has SHA-256 " + actual
                         + " but the natives JAR says " + expected + "; refusing to load it");
             }
+            String how = "the natives JAR (" + url + ", SHA-256 " + actual + ")";
+            SymbolLookup symbols;
             try {
-                open(file, "the natives JAR (" + url + ", SHA-256 " + actual + ")");
+                symbols = map(file, how);
             } catch (UnsatisfiedLinkError e) {
                 // The hash matched, so the file is the right library: the usual cause is a directory that does not
-                // allow executable mappings (a noexec temporary directory).
+                // allow executable mappings (a noexec temporary directory). Only for a failure to load the file: a
+                // library that loads but fails the checks below gets no such hint.
                 UnsatisfiedLinkError error = new UnsatisfiedLinkError(e.getMessage() + "; it was extracted into "
                         + parent + ", which may not allow loading libraries from it (for example a noexec file"
                         + " system): set -D" + EXTRACT_DIR_PROPERTY + "=<a directory that does>, or -D"
@@ -260,10 +280,43 @@ final class NativeLibrary {
                 error.initCause(e);
                 throw error;
             }
+            check(symbols, how);
             loadedPath = null; // the extracted copy is deleted below
+        } catch (Throwable t) {
+            failure = t;
+            throw t;
         } finally {
-            Files.deleteIfExists(file);
-            Files.deleteIfExists(dir);
+            deleteAll(failure, file, dir);
+        }
+    }
+
+    /**
+     * Deletes {@code paths} in order, trying every one even if an earlier one fails. A failure is added to
+     * {@code primary}, the exception already on its way out, as a suppressed exception, so it never replaces it; with
+     * no such exception (the library is loaded and usable), it is reported as a warning through
+     * {@link System.Logger} and loading succeeds.
+     */
+    static void deleteAll(Throwable primary, Path... paths) {
+        IOException failed = null;
+        for (Path p : paths) {
+            try {
+                Files.deleteIfExists(p);
+            } catch (IOException e) {
+                if (failed == null) {
+                    failed = e;
+                } else {
+                    failed.addSuppressed(e);
+                }
+            }
+        }
+        if (failed == null) {
+            return;
+        }
+        if (primary != null) {
+            primary.addSuppressed(failed);
+        } else {
+            System.getLogger(NativeLibrary.class.getName()).log(System.Logger.Level.WARNING,
+                    "libtickertape was loaded, but its extracted copy could not be deleted", failed);
         }
     }
 

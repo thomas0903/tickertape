@@ -20,9 +20,10 @@ public final class VerifyReport {
     private final long firstProblemBaseSeq;
     private final long firstProblemOffset;
     private final CorruptReason firstProblemReason;
+    private final int firstProblemReasonCode;
 
     VerifyReport(long segments, long records, long firstSeq, long lastSeq, long problems, long firstProblemBaseSeq,
-            long firstProblemOffset, CorruptReason firstProblemReason) {
+            long firstProblemOffset, int firstProblemReasonCode) {
         this.segments = segments;
         this.records = records;
         this.firstSeq = firstSeq;
@@ -30,7 +31,8 @@ public final class VerifyReport {
         this.problems = problems;
         this.firstProblemBaseSeq = firstProblemBaseSeq;
         this.firstProblemOffset = firstProblemOffset;
-        this.firstProblemReason = Objects.requireNonNull(firstProblemReason);
+        this.firstProblemReason = CorruptReason.of(firstProblemReasonCode);
+        this.firstProblemReasonCode = firstProblemReasonCode;
     }
 
     /** The number of segments checked. */
@@ -71,9 +73,20 @@ public final class VerifyReport {
         return firstProblemOffset;
     }
 
-    /** Why the first problem failed validation ({@link CorruptReason#NONE} if there is none). */
+    /**
+     * Why the first problem failed validation ({@link CorruptReason#NONE} if there is none, and
+     * {@link CorruptReason#UNKNOWN} for a reason this binding does not know: see {@link #firstProblemReasonCode()}).
+     */
     public CorruptReason firstProblemReason() {
         return firstProblemReason;
+    }
+
+    /**
+     * The C value of {@link #firstProblemReason()} as the library returned it, also for a reason this binding does not
+     * know (as {@link CorruptJournalException#reasonCode()}).
+     */
+    public int firstProblemReasonCode() {
+        return firstProblemReasonCode;
     }
 
     /** Whether no problem was found. */
@@ -85,13 +98,13 @@ public final class VerifyReport {
     public boolean equals(Object o) {
         return o instanceof VerifyReport r && segments == r.segments && records == r.records && firstSeq == r.firstSeq
                 && lastSeq == r.lastSeq && problems == r.problems && firstProblemBaseSeq == r.firstProblemBaseSeq
-                && firstProblemOffset == r.firstProblemOffset && firstProblemReason == r.firstProblemReason;
+                && firstProblemOffset == r.firstProblemOffset && firstProblemReasonCode == r.firstProblemReasonCode;
     }
 
     @Override
     public int hashCode() {
         return Objects.hash(segments, records, firstSeq, lastSeq, problems, firstProblemBaseSeq, firstProblemOffset,
-                firstProblemReason);
+                firstProblemReasonCode);
     }
 
     @Override
@@ -100,6 +113,7 @@ public final class VerifyReport {
                 + ", firstSeq=" + Long.toUnsignedString(firstSeq) + ", lastSeq=" + Long.toUnsignedString(lastSeq)
                 + ", problems=" + Long.toUnsignedString(problems) + ", firstProblemBaseSeq="
                 + Long.toUnsignedString(firstProblemBaseSeq) + ", firstProblemOffset="
-                + Long.toUnsignedString(firstProblemOffset) + ", firstProblemReason=" + firstProblemReason + "]";
+                + Long.toUnsignedString(firstProblemOffset) + ", firstProblemReason=" + firstProblemReason
+                + (firstProblemReason == CorruptReason.UNKNOWN ? " (" + firstProblemReasonCode + ")" : "") + "]";
     }
 }
