@@ -20,9 +20,9 @@ default = ["iceoryx2"]
 # The recorder and replayer for services whose Rust types are known at compile time. Uses only iceoryx2's public API.
 iceoryx2 = ["dep:iceoryx2", "dep:zerocopy", "dep:signal-hook"]
 # Services whose types are only known at run time (what `iox2 service record` does), and conversion to and from
-# iceoryx2's recording file format. Depends on iceoryx2 API that upstream marks internal (`__internal_*`,
-# `loan_custom_payload`); all of it is in `src/dynamic.rs`.
-dynamic = ["iceoryx2", "dep:iceoryx2-userland-record-and-replay", "dep:toml"]
+# iceoryx2's human-readable recording files (with a writer and parser of this crate's own). Depends on iceoryx2 API
+# that upstream marks internal (`__internal_*`, `loan_custom_payload`); all of it is in `src/dynamic.rs`.
+dynamic = ["iceoryx2", "dep:toml"]
 # The `tickertape-iox2` command-line tool. Needs `dynamic` to record services by name.
 cli = ["dynamic", "dep:clap", "dep:serde_json"]
 
@@ -34,7 +34,6 @@ thiserror = "2"
 # marks internal, which may change in any release. Moving to another version is a reviewed change (see the README's
 # maintenance section).
 iceoryx2 = { version = "=0.10.0", optional = true }
-iceoryx2-userland-record-and-replay = { version = "=0.10.0", optional = true }
 # Parses the header of iceoryx2's human-readable recording files on import (already in iceoryx2's dependency tree).
 toml = { version = "0.9", default-features = false, features = ["std", "parse", "serde"], optional = true }
 # Safe byte views of typed payloads (no `unsafe` in the typed recorder and replayer).

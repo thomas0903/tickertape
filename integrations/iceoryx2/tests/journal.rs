@@ -332,7 +332,25 @@ fn import_is_validated_and_all_or_nothing() {
         ),
         (
             good.trim_end().rsplit_once('\n').unwrap().0.to_string(),
-            "ends inside the record",
+            "truncated",
+        ),
+        // Review round 3: the last payload line cut after two of its four hex tokens was imported as a shorter
+        // message; names iceoryx2 refuses were imported and only replay or export failed.
+        (
+            good.trim_end().strip_suffix(" 00 00").unwrap().to_string(),
+            "doesn't end with a newline",
+        ),
+        (
+            good.replace("\"imported/x\"", "\"imported/\\u0000x\""),
+            "invalid iceoryx2 service name",
+        ),
+        (
+            good.replace("\"imported/x\"", "\"imported/é\""),
+            "invalid iceoryx2 service name",
+        ),
+        (
+            good.replace("type_name = \"u32\"", "type_name = \"u\\u000032\""),
+            "not valid for iceoryx2",
         ),
         (
             good.replace("payload:  02", "payload:  0x"),
@@ -372,6 +390,24 @@ fn import_is_validated_and_all_or_nothing() {
         SECS(10),
     );
     assert_eq!(status.code(), Some(1), "{err}");
+    // An absolute time that overflows is refused, not saturated.
+    let file = dir.path().join("late.iox2");
+    std::fs::write(&file, &good).unwrap();
+    let before = count(&journal);
+    let (status, _, err) = run(
+        &cli(),
+        &[
+            "import",
+            file.to_str().unwrap(),
+            journal.to_str().unwrap(),
+            "--start-unix-ns",
+            &(u64::MAX - 3_000_000).to_string(),
+        ],
+        SECS(30),
+    );
+    assert_eq!(status.code(), Some(1), "{err}");
+    assert!(err.contains("overflows"), "{err}");
+    assert_eq!(count(&journal), before);
 
     let file = dir.path().join("good.iox2");
     std::fs::write(&file, good).unwrap();

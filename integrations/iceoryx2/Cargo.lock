@@ -62,12 +62,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "anyhow"
-version = "1.0.104"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
-
-[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -679,23 +673,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "iceoryx2-userland-record-and-replay"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "83bd034b14ee70455dbb4833f1b41257f0d557dd63034583fdd231891f3a6a95"
-dependencies = [
- "anyhow",
- "iceoryx2",
- "iceoryx2-bb-container",
- "iceoryx2-bb-elementary",
- "iceoryx2-bb-posix",
- "iceoryx2-bb-system-types",
- "iceoryx2-cal",
- "iceoryx2-log",
- "serde",
-]
-
-[[package]]
 name = "indexmap"
 version = "2.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1145,7 +1122,6 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "iceoryx2",
- "iceoryx2-userland-record-and-replay",
  "proptest",
  "serde",
  "serde_json",

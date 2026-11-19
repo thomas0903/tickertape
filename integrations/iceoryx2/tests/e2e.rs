@@ -8,8 +8,6 @@ mod common;
 #[path = "../examples/common/types.rs"]
 mod types;
 
-use std::time::Duration;
-
 use common::*;
 use iceoryx2::prelude::*;
 use tickertape_iceoryx2::layout::LossKind;
@@ -520,93 +518,85 @@ fn one_recorder_records_and_replays_several_services() {
     }
 }
 
-/// Export to iceoryx2's file format, read it back with the upstream replayer library, import it into a new
-/// journal: message bytes and order survive both directions.
+/// Export to iceoryx2's human-readable file format and import it into a new journal: message bytes and order
+/// survive both directions. (The test below plays an exported file with upstream's own `iox2 service replay`; a
+/// unit test checks the writer byte for byte against a file upstream's recorder wrote.) iox2dump export is gone.
 #[test]
 fn upstream_file_format_round_trip() {
-    use iceoryx2_userland_record_and_replay::prelude::*;
     let _serial = serial();
     const N: u64 = 200;
     let (dir, service) = record_ticks(N, 1000);
     let journal = dir.path().join("j");
     let original = data_of(&scan(&journal));
-    for (repr, upstream_repr) in [
-        ("human-readable", DataRepresentation::HumanReadable),
-        ("iox2-dump", DataRepresentation::Iox2Dump),
-    ] {
-        let file = dir.path().join(format!("export-{repr}.iox2"));
-        let out = run_ok(
-            &cli(),
-            &[
-                "export",
-                journal.to_str().unwrap(),
-                "--output",
-                file.to_str().unwrap(),
-                "--representation",
-                repr,
-                "--json",
-            ],
-            SECS(30),
-        );
-        let report: serde_json::Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(report["messages"], N);
-        assert_eq!(report["service"], service.as_str());
+    let file = dir.path().join("export-human-readable.iox2");
+    let out = run_ok(
+        &cli(),
+        &[
+            "export",
+            journal.to_str().unwrap(),
+            "--output",
+            file.to_str().unwrap(),
+            "--json",
+        ],
+        SECS(30),
+    );
+    let report: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(report["messages"], N);
+    assert_eq!(report["service"], service.as_str());
+    let text = std::fs::read_to_string(&file).unwrap();
+    assert!(
+        text.starts_with(&format!("service_name = \"{service}\"\n")),
+        "{text}"
+    );
+    let times: Vec<u64> = text
+        .lines()
+        .filter_map(|l| l.strip_prefix("time:     "))
+        .map(|t| t.parse().unwrap())
+        .collect();
+    assert_eq!(times.len() as u64, N);
+    assert!(times.windows(2).all(|w| w[0] <= w[1]));
+    assert!(
+        text.ends_with(" \n\n"),
+        "every record ends with its newlines"
+    );
+    let (status, _, err) = run(
+        &cli(),
+        &[
+            "export",
+            journal.to_str().unwrap(),
+            "--output",
+            dir.path().join("dump").to_str().unwrap(),
+            "--representation",
+            "iox2-dump",
+        ],
+        SECS(30),
+    );
+    assert!(!status.success(), "iox2dump export is gone: {err}");
+    assert!(!dir.path().join("dump").exists());
 
-        let replayer =
-            ReplayerOpener::new(&FilePath::new(file.to_str().unwrap().as_bytes()).unwrap())
-                .data_representation(upstream_repr)
-                .open()
-                .unwrap();
-        assert_eq!(replayer.header().service_name.as_str(), service);
-        let records = replayer.read_into_buffer().unwrap();
-        assert_eq!(records.len() as u64, N);
-        let mut last = Duration::ZERO;
-        for (r, (_, _, header, payload)) in records.iter().zip(&original) {
-            assert_eq!((&r.user_header, &r.payload), (header, payload));
-            assert!(r.timestamp >= last);
-            last = r.timestamp;
-        }
-
-        if repr != "human-readable" {
-            // iox2dump files are exported only; import refuses them.
-            let (status, _, err) = run(
-                &cli(),
-                &[
-                    "import",
-                    file.to_str().unwrap(),
-                    dir.path().join("no").to_str().unwrap(),
-                ],
-                SECS(30),
-            );
-            assert_eq!(status.code(), Some(1), "{err}");
-            assert!(err.contains("iox2dump files can't be imported"), "{err}");
-            assert!(!dir.path().join("no").exists(), "nothing appended");
-            continue;
-        }
-        let imported = dir.path().join(format!("imported-{repr}"));
-        let out = run_ok(
-            &cli(),
-            &[
-                "import",
-                file.to_str().unwrap(),
-                imported.to_str().unwrap(),
-                "--json",
-            ],
-            SECS(30),
-        );
-        let report: serde_json::Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(report["messages"], N);
-        let recs = scan(&imported);
-        let Rec::Descriptor(0, d) = &recs[0] else {
-            panic!("descriptor first")
-        };
-        assert!(d.imported);
-        assert_eq!(d.service_name, service);
-        let data = data_of(&recs);
-        assert_eq!(data.len() as u64, N);
-        for ((_, _, h, p), (_, _, header, payload)) in data.iter().zip(&original) {
-            assert_eq!((h, p), (header, payload));
-        }
+    let imported = dir.path().join("imported");
+    let out = run_ok(
+        &cli(),
+        &[
+            "import",
+            file.to_str().unwrap(),
+            imported.to_str().unwrap(),
+            "--json",
+        ],
+        SECS(30),
+    );
+    let report: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(report["messages"], N);
+    let recs = scan(&imported);
+    let Rec::Descriptor(0, d) = &recs[0] else {
+        panic!("descriptor first")
+    };
+    assert!(d.imported);
+    assert_eq!(d.service_name, service);
+    let data = data_of(&recs);
+    assert_eq!(data.len() as u64, N);
+    for ((_, _, h, p), (_, _, header, payload)) in data.iter().zip(&original) {
+        assert_eq!((h, p), (header, payload));
     }
     // Refuses to overwrite.
     let file = dir.path().join("export-human-readable.iox2");

@@ -6,11 +6,14 @@
 //! the system header, the user header and the payload. It comes in two representations: human-readable (a TOML
 //! header and hex lines, the default of both tools) and `iox2dump` (raw bytes).
 //!
-//! [`export`] writes both representations with the `iceoryx2-userland-record-and-replay` crate. [`import`] reads
-//! only the human-readable representation, with a parser of this crate's own: upstream's readers are not meant for
-//! untrusted files (the text reader panics when a multi-byte character crosses a fixed byte index; the `iox2dump`
-//! reader treats file bytes as an initialised Rust struct and allocates from unvalidated lengths). `iox2dump` import
-//! is not offered until it can be done with a parser of this crate's own.
+//! Only the human-readable representation is supported, in both directions, with a writer and a parser of this
+//! crate's own. [`export`] writes it with checked, complete writes (upstream's writer issues one `write` call per
+//! piece and treats a short write as complete, so a full volume could leave a truncated file reported as written).
+//! [`import`] parses it for untrusted input: upstream's readers are not meant for that (the text reader panics when
+//! a multi-byte character crosses a fixed byte index; the `iox2dump` reader treats file bytes as an initialised Rust
+//! struct and allocates from unvalidated lengths). `iox2dump` files are neither written nor read: upstream's writer
+//! serialises the memory image of its header struct, including padding and unused string capacity it leaves
+//! uninitialised, and has the same short-write behaviour (ADR 0030, amendment of review round 3).
 //!
 //! # What each direction loses
 //!
@@ -36,21 +39,23 @@
 //!
 //! # Import is all or nothing
 //!
-//! The whole file is read and validated before anything is appended: the header's version, messaging pattern and
-//! type details ([`layout::validate_types`]), every record's lengths against them, non-decreasing timestamps, and
-//! that the file doesn't end inside a record. A file that fails any check leaves the journal untouched. Only a
-//! journal error while appending (a full volume) can leave part of an import in the journal, as for any writer.
+//! The whole file is read into memory and validated, with all its decoded messages held in memory too, before
+//! anything is appended: the header's version, messaging pattern, service name and type details
+//! ([`layout::validate_types`], and iceoryx2's own name checks), every record's lengths against them, non-decreasing
+//! timestamps that stay representable once added to the start time, and that every line of every record, and the
+//! blank line after it, ends with a newline, as upstream writes them (a file cut anywhere is refused). A file that
+//! fails any check leaves the journal untouched. Only a journal error while appending (a full volume) can leave part
+//! of an import in the journal, as for any writer.
 //!
 //! Imported bytes are not checked to be valid values of their types: replaying an import publishes them under the
 //! recorded type names (see [`Replayer::run_dynamic`](crate::replayer::Replayer::run_dynamic)). Import only files you
 //! trust.
 
 use std::collections::BTreeSet;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use iceoryx2::prelude::*;
-use iceoryx2_userland_record_and_replay::prelude::*;
 use serde::Serialize;
 use tickertape::{NewRecord, Reader, ReaderConfig, WriterConfig};
 
@@ -63,26 +68,13 @@ use crate::placement::Journal;
 use crate::recorder::service_name;
 use crate::{Catalog, Error};
 
-/// The representation of an iceoryx2 recording file.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Representation {
-    /// TOML header and hex lines (the default of `iox2 service record` and `replay`).
-    #[default]
-    HumanReadable,
-    /// Raw bytes: the header is a memory image of a Rust struct, readable only by the same iceoryx2 version on the
-    /// same architecture. Export only.
-    Iox2Dump,
-}
-
-impl From<Representation> for DataRepresentation {
-    fn from(r: Representation) -> Self {
-        match r {
-            Representation::HumanReadable => DataRepresentation::HumanReadable,
-            Representation::Iox2Dump => DataRepresentation::Iox2Dump,
-        }
-    }
-}
+/// The iceoryx2 version this crate is built with (the exact pin in `Cargo.toml`), written into exported files as
+/// upstream's recorder writes its own.
+const ICEORYX2_VERSION: Version = Version {
+    major: 0,
+    minor: 10,
+    patch: 0,
+};
 
 /// What to export.
 #[derive(Debug, Clone, Default)]
@@ -94,8 +86,6 @@ pub struct ExportOptions {
     pub from: Option<u64>,
     /// Last sequence number, inclusive.
     pub to: Option<u64>,
-    /// File representation.
-    pub representation: Representation,
 }
 
 impl ExportOptions {
@@ -116,12 +106,6 @@ impl ExportOptions {
         self.to = Some(seq);
         self
     }
-
-    /// Writes this representation.
-    pub fn representation(mut self, r: Representation) -> Self {
-        self.representation = r;
-        self
-    }
 }
 
 /// The results of [`export`].
@@ -139,20 +123,23 @@ pub struct ExportReport {
     pub runs: u64,
     /// Messages whose timestamp went backwards and was raised to the previous one.
     pub clamped: u64,
-    /// Data records skipped because the descriptor they name is no longer in the journal.
+    /// Data and loss records skipped because the descriptor they name is no longer in the journal.
     pub undescribed: u64,
 }
 
-/// Writes the messages of one service in the journal at `journal` to a new iceoryx2 recording file at `output`.
+/// Writes the messages of one service in the journal at `journal` to a new human-readable iceoryx2 recording file at
+/// `output`.
 ///
-/// Reads through the end of the journal as it is when the export gets there. The file is written under a temporary
-/// name next to `output` and linked to `output` only when complete, so a failed export leaves no partial file.
+/// Reads through the end of the journal as it is when the export gets there. The file is written, completely and
+/// synced, under a temporary name of its own next to `output` (created exclusively; concurrent exports never share
+/// one) and linked to `output` only when complete, so a failed export leaves no partial file and an existing file
+/// is never replaced.
 ///
 /// # Errors
 ///
 /// [`Error::Usage`] if the range holds several services and none was chosen, the chosen service isn't there, or
-/// its types changed between recording runs; [`Error::Upstream`] if the file exists or can't be written; journal and
-/// layout errors as for [`info::scan`](crate::info::scan).
+/// its types changed between recording runs; [`Error::Upstream`] if the file exists; [`Error::Io`] if it can't be
+/// written; journal and layout errors as for [`info::scan`](crate::info::scan).
 pub fn export(
     journal: impl AsRef<Path>,
     output: impl AsRef<Path>,
@@ -182,9 +169,17 @@ pub fn export(
             }
         }
     };
-    let partial = partial_path(output)?;
-    let result = export_to(journal, &partial, &service, options);
-    let result = result.and_then(|report| {
+    let (partial, file) = create_partial(output)?;
+    let io = |op: &'static str| {
+        let path = partial.clone();
+        move |source| Error::Io { op, path, source }
+    };
+    let result = (|| {
+        let mut w = std::io::BufWriter::new(file);
+        let report = export_to(journal, &mut w, &service, options)?;
+        let file = w.into_inner().map_err(|e| io("write")(e.into_error()))?;
+        file.sync_all().map_err(io("sync"))?;
+        drop(file);
         // A hard link fails if `output` exists, so an existing file is never replaced.
         std::fs::hard_link(&partial, output).map_err(|source| Error::Io {
             op: "create",
@@ -192,33 +187,68 @@ pub fn export(
             source,
         })?;
         Ok(report)
-    });
+    })();
+    // Only this export's own temporary file is removed: its name is unique and it was created exclusively.
     let _ = std::fs::remove_file(&partial);
     result
 }
 
-fn partial_path(output: &Path) -> Result<PathBuf, Error> {
+/// Creates a new, uniquely named temporary file next to `output`: `.<name>.partial-<pid>-<counter>-<time>`, created
+/// exclusively (retrying with another name if one exists), so two exports to one destination, in one process or
+/// several, never write or remove each other's file.
+fn create_partial(output: &Path) -> Result<(PathBuf, std::fs::File), Error> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
     let name = output
         .file_name()
         .ok_or_else(|| Error::Usage(format!("{} is not a file name", output.display())))?;
-    let mut partial = std::ffi::OsString::from(".");
-    partial.push(name);
-    partial.push(format!(".partial-{}", std::process::id()));
-    Ok(output.with_file_name(partial))
+    let mut last = None;
+    for _ in 0..100 {
+        let mut partial = std::ffi::OsString::from(".");
+        partial.push(name);
+        partial.push(format!(
+            ".partial-{}-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed),
+            tickertape::clock::realtime_ns()
+        ));
+        let path = output.with_file_name(partial);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => return Ok((path, file)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last = Some((path, e)),
+            Err(source) => {
+                return Err(Error::Io {
+                    op: "create",
+                    path,
+                    source,
+                });
+            }
+        }
+    }
+    let (path, source) = last.expect("at least one attempt");
+    Err(Error::Io {
+        op: "create",
+        path,
+        source,
+    })
 }
 
+/// Writes the export to `w`: the header when the service's first message is found, then each message. Every write
+/// is complete or an error (`write_all`).
 fn export_to(
     journal: &Path,
-    path: &Path,
+    w: &mut dyn Write,
     service: &str,
     options: &ExportOptions,
 ) -> Result<ExportReport, Error> {
     let mut reader = open_at(journal, options.from)?;
     let mut catalog = Catalog::new(journal);
-    let mut recorder: Option<(
-        iceoryx2_userland_record_and_replay::recorder::Recorder,
-        Descriptor,
-    )> = None;
+    let mut first: Option<Descriptor> = None;
+    let system_header = vec![0u8; system_header_detail().size()];
     let mut report = ExportReport {
         service: service.to_string(),
         messages: 0,
@@ -227,6 +257,11 @@ fn export_to(
         runs: 0,
         clamped: 0,
         undescribed: 0,
+    };
+    let write_error = |source| Error::Io {
+        op: "write",
+        path: PathBuf::from("the export file"),
+        source,
     };
     let mut runs = BTreeSet::new();
     let mut first_ts = 0u64;
@@ -244,9 +279,10 @@ fn export_to(
             }
             Decoded::Data(d) => d,
             Decoded::Loss(loss) => {
-                // Not exported, but checked against its descriptor like everywhere else.
-                if let Some(d) = catalog.resolve(seq, loss.descriptor_seq)? {
-                    loss.check(&d).map_err(layout_error)?;
+                // Not exported, but checked against its descriptor like everywhere else, and counted if that is gone.
+                match catalog.resolve(seq, loss.descriptor_seq)? {
+                    Some(d) => loss.check(&d).map_err(layout_error)?,
+                    None => report.undescribed += 1,
                 }
                 continue;
             }
@@ -261,22 +297,16 @@ fn export_to(
             continue;
         }
         runs.insert(d.run_start_seq);
-        let (rec, first) = match &mut recorder {
-            Some((r, first)) => (r, &*first),
+        let first = match &first {
+            Some(first) => first,
             None => {
-                let types = ServiceTypes {
-                    payload: type_detail(&d.payload)?,
-                    user_header: type_detail(&d.user_header)?,
-                    system_header: system_header_detail(),
-                };
-                let r = RecorderBuilder::new(&types)
-                    .data_representation(options.representation.into())
-                    .messaging_pattern(MessagingPattern::PublishSubscribe)
-                    .create(&file_path(path)?, &service_name(service)?)
-                    .map_err(|e| Error::Upstream(format!("create {}: {e:?}", path.display())))?;
+                // The names must be valid for iceoryx2, as for replay.
+                service_name(service)?;
+                type_detail(&d.payload)?;
+                type_detail(&d.user_header)?;
+                text::write_header(w, service, &d.payload, &d.user_header).map_err(write_error)?;
                 first_ts = record.local_ts_ns;
-                let (r, first) = recorder.insert((r, (*d).clone()));
-                (r, &*first)
+                first.insert((*d).clone())
             }
         };
         if first.payload != d.payload || first.user_header != d.user_header {
@@ -290,19 +320,19 @@ fn export_to(
             report.clamped += 1;
         }
         last_offset = offset;
-        let system_header = vec![0u8; rec.header().details.types.system_header.size()];
-        rec.write(RawRecord {
-            timestamp: offset,
-            system_header: &system_header,
-            user_header: data.user_header,
-            payload: data.payload,
-        })
-        .map_err(|e| Error::Upstream(format!("write record {seq}: {e:?}")))?;
+        text::write_record(
+            w,
+            offset.as_millis() as u64,
+            &system_header,
+            data.user_header,
+            data.payload,
+        )
+        .map_err(write_error)?;
         report.messages += 1;
         report.first_seq.get_or_insert(seq);
         report.last_seq = Some(seq);
     }
-    if recorder.is_none() {
+    if first.is_none() {
         return Err(Error::Usage(format!(
             "no messages of service \"{service}\" in the range"
         )));
@@ -348,16 +378,6 @@ fn open_at(journal: &Path, from: Option<u64>) -> Result<Reader, Error> {
         reader.seek(from)?;
     }
     Ok(reader)
-}
-
-fn file_path(path: &Path) -> Result<FilePath, Error> {
-    let bytes = path.as_os_str().as_encoded_bytes();
-    FilePath::new(bytes).map_err(|e| {
-        Error::Upstream(format!(
-            "path {} is not usable by iceoryx2: {e:?}",
-            path.display()
-        ))
-    })
 }
 
 /// How to import.
@@ -421,11 +441,34 @@ pub fn import(
         path: input.to_path_buf(),
         source,
     })?;
-    let file = text::parse(&bytes, options.writer_config.segment_size)
-        .map_err(|e| Error::Upstream(format!("{}: {e}", input.display())))?;
+    let invalid_file = |e: String| Error::Upstream(format!("{}: {e}", input.display()));
+    let file = text::parse(&bytes, options.writer_config.segment_size).map_err(invalid_file)?;
+    drop(bytes);
+    // The names must be valid for iceoryx2, with the same checks replay and export apply, before the journal is
+    // touched.
+    service_name(&file.service_name).map_err(|e| invalid_file(e.to_string()))?;
+    for t in [&file.payload, &file.user_header, &file.system_header] {
+        type_detail(t).map_err(|e| invalid_file(e.to_string()))?;
+    }
     let start_unix_ns = options
         .start_unix_ns
         .unwrap_or_else(tickertape::clock::realtime_ns);
+    // Every record's absolute time must be representable: refused, not saturated.
+    let mut local_ts = Vec::with_capacity(file.records.len());
+    for r in &file.records {
+        let ts = r
+            .timestamp_ms
+            .checked_mul(1_000_000)
+            .and_then(|offset| start_unix_ns.checked_add(offset))
+            .ok_or_else(|| {
+                invalid_file(format!(
+                    "record at line {}: its timestamp of {} ms after the start time {start_unix_ns} ns overflows \
+                     nanoseconds since the Unix epoch",
+                    r.line, r.timestamp_ms
+                ))
+            })?;
+        local_ts.push(ts);
+    }
     let mut descriptor = Descriptor {
         run_start_seq: 0,
         run_start_unix_ns: start_unix_ns,
@@ -452,7 +495,7 @@ pub fn import(
     let bytes = descriptor.encode().map_err(invalid)?;
     let descriptor_seq = journal.open_service(0, bytes, start_unix_ns)?;
     let mut messages = 0;
-    for record in &file.records {
+    for (record, &local_ts_ns) in file.records.iter().zip(&local_ts) {
         let data = DataRecord {
             descriptor_seq,
             publisher_id: 0,
@@ -460,13 +503,12 @@ pub fn import(
             payload: &record.payload,
         };
         let len = data.encoded_len().map_err(invalid)?;
-        let offset = record.timestamp_ms.saturating_mul(1_000_000);
         journal.append_named(
             0,
             &NewRecord {
                 schema_id: SCHEMA_DATA,
                 venue_ts_ns: 0,
-                local_ts_ns: start_unix_ns.saturating_add(offset),
+                local_ts_ns,
                 payload: &[],
             },
             len,
@@ -518,6 +560,8 @@ mod text {
 
     #[derive(Debug)]
     pub(super) struct Record {
+        /// The line its timestamp is on.
+        pub line: usize,
         pub timestamp_ms: u64,
         pub user_header: Vec<u8>,
         pub payload: Vec<u8>,
@@ -533,7 +577,19 @@ mod text {
                     e.valid_up_to()
                 )
             })?;
-        let mut lines = text.split('\n').enumerate().map(|(i, l)| (i + 1, l));
+        // Upstream ends every line with a newline, the last record with an empty line ("\n\n"): text after the
+        // last newline is a line cut short.
+        let complete = text.rfind('\n').map_or(0, |i| i + 1);
+        if complete < text.len() {
+            return Err(format!(
+                "line {} doesn't end with a newline: the file is truncated",
+                text[..complete].matches('\n').count() + 1
+            ));
+        }
+        let mut lines = text
+            .split_terminator('\n')
+            .enumerate()
+            .map(|(i, l)| (i + 1, l));
         let mut header_len = 0usize;
         let mut marker_line = None;
         for (n, line) in lines.by_ref() {
@@ -560,7 +616,17 @@ mod text {
         let max_record = tickertape::format::max_payload_len(segment_size);
         let mut last_ts = 0u64;
         let mut fields: Vec<(usize, &str)> = Vec::with_capacity(4);
+        // The empty line upstream writes after each record, still to come after the record starting on this line.
+        let mut blank_after: Option<usize> = None;
         for (n, line) in lines {
+            if let Some(start) = blank_after.take() {
+                if !line.is_empty() {
+                    return Err(format!(
+                        "line {n}: expected the empty line that ends the record starting on line {start}"
+                    ));
+                }
+                continue;
+            }
             if fields.is_empty() && line.is_empty() {
                 continue;
             }
@@ -629,18 +695,109 @@ mod text {
                 ));
             }
             file.records.push(Record {
+                line: ts_line,
                 timestamp_ms,
                 user_header,
                 payload,
             });
+            blank_after = Some(ts_line);
             fields.clear();
         }
-        if let Some((n, _)) = fields.first() {
+        if let Some(n) = fields.first().map(|f| f.0).or(blank_after) {
             return Err(format!(
                 "the file ends inside the record that starts on line {n} (truncated?)"
             ));
         }
         Ok(file)
+    }
+
+    /// Writes a file's header as upstream's recorder does (its TOML serialisation, an empty line, the marker
+    /// line), for a file of `service` with these payload and user header types and this build's system header.
+    pub(super) fn write_header(
+        w: &mut dyn Write,
+        service: &str,
+        payload: &TypeInfo,
+        user_header: &TypeInfo,
+    ) -> std::io::Result<()> {
+        use std::fmt::Write as _;
+        let system_header = crate::recorder::type_info(&system_header_detail());
+        let mut h = String::new();
+        let v = ICEORYX2_VERSION;
+        let _ = write!(
+            h,
+            "service_name = {}\n\n[iceoryx2_version]\nmajor = {}\nminor = {}\npatch = {}\n\n[details]\n\
+             file_format_version = 1\nmessaging_pattern = \"PublishSubscribe\"\n",
+            toml_string(service),
+            v.major,
+            v.minor,
+            v.patch
+        );
+        for (key, t) in [
+            ("payload", payload),
+            ("user_header", user_header),
+            ("system_header", &system_header),
+        ] {
+            let variant = match t.variant {
+                TypeVariant::FixedSize => "FixedSize",
+                TypeVariant::Dynamic => "Dynamic",
+            };
+            let _ = write!(
+                h,
+                "\n[details.types.{key}]\nvariant = \"{variant}\"\ntype_name = {}\nsize = {}\nalignment = {}\n",
+                toml_string(&t.name),
+                t.size,
+                t.alignment
+            );
+        }
+        h.push_str("\n\n");
+        h.push_str(MARKER);
+        h.push('\n');
+        w.write_all(h.as_bytes())
+    }
+
+    /// Writes one record as upstream's recorder does: four lines and an empty one, bytes as two-digit lower-case hex
+    /// numbers each followed by a space.
+    pub(super) fn write_record(
+        w: &mut dyn Write,
+        timestamp_ms: u64,
+        system_header: &[u8],
+        user_header: &[u8],
+        payload: &[u8],
+    ) -> std::io::Result<()> {
+        use std::fmt::Write as _;
+        let mut r = String::with_capacity(
+            64 + 3 * (system_header.len() + user_header.len() + payload.len()),
+        );
+        let _ = writeln!(r, "time:     {timestamp_ms}");
+        for (prefix, bytes) in [
+            ("sys head: ", system_header),
+            ("usr head: ", user_header),
+            ("payload:  ", payload),
+        ] {
+            r.push_str(prefix);
+            for b in bytes {
+                let _ = write!(r, "{b:02x} ");
+            }
+            r.push('\n');
+        }
+        r.push('\n');
+        w.write_all(r.as_bytes())
+    }
+
+    /// A TOML basic string.
+    fn toml_string(s: &str) -> String {
+        let mut out = String::with_capacity(s.len() + 2);
+        out.push('"');
+        for c in s.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                c if c.is_control() => out.push_str(&format!("\\u{:04X}", c as u32)),
+                c => out.push(c),
+            }
+        }
+        out.push('"');
+        out
     }
 
     /// Bytes written as two-digit hex numbers separated by spaces (with an optional trailing space).
@@ -825,6 +982,10 @@ mod text {
                 ),
                 (
                     good.trim_end().rsplit_once('\n').unwrap().0.to_string(),
+                    "truncated",
+                ),
+                (
+                    good.trim_end().rsplit_once('\n').unwrap().0.to_string() + "\n",
                     "ends inside the record",
                 ),
                 (good.replace("02 00 00 00", "02 00 0g 00"), "two-digit hex"),
@@ -887,6 +1048,24 @@ mod text {
                 ),
                 (good.replace("major = 0", "major = 70000"), "out of range"),
                 (good.replace("\"demo/x\"", "\"\""), "service_name"),
+                // Review round 3: a payload line cut after two complete hex tokens of four, with or without its
+                // newline, and a last record without the empty line upstream writes after it.
+                (
+                    good.trim_end().strip_suffix(" 00 00").unwrap().to_string(),
+                    "doesn't end with a newline",
+                ),
+                (
+                    good.trim_end().strip_suffix(" 00 00").unwrap().to_string() + "\n",
+                    "don't fit",
+                ),
+                (
+                    good.strip_suffix('\n').unwrap().to_string(),
+                    "ends inside the record that starts on line",
+                ),
+                (
+                    good.replacen(" \n\ntime:     5", " \ntime:     5", 1),
+                    "expected the empty line",
+                ),
             ];
             for (text, expected) in cases {
                 let err = parse(text.as_bytes(), SEGMENT).expect_err(expected);
@@ -905,6 +1084,69 @@ mod text {
             );
         }
 
+        /// A four-byte `[u8]` message whose payload line ends after two complete hex tokens was imported as a
+        /// two-byte message: every record must end with its newlines, as upstream writes them.
+        #[test]
+        fn a_truncated_last_record_is_refused() {
+            let text = file(("Dynamic", 1, 1), &record(0, "01 02 03 04"));
+            assert_eq!(
+                parse(text.as_bytes(), SEGMENT).unwrap().records[0].payload,
+                [1, 2, 3, 4]
+            );
+            let cut = text.find("01 02 03 04").unwrap() + "01 02 ".len();
+            for end in cut..text.len() {
+                let err = parse(&text.as_bytes()[..end], SEGMENT).expect_err("truncated");
+                assert!(
+                    err.contains("truncated") || err.contains("newline"),
+                    "{end}: {err}"
+                );
+            }
+        }
+
+        /// The writer produces exactly what upstream's recorder wrote for the fixture (header and record layout),
+        /// and what it writes parses back, including names that need TOML escapes.
+        #[test]
+        fn the_writer_matches_upstream_and_parses_back() {
+            let fixture = include_str!("../tests/fixtures/iox2-0.10.0-record-ticks.txt");
+            let header_end = fixture.find(MARKER).unwrap() + MARKER.len() + 1;
+            let fixed = |name: &str, size, alignment| TypeInfo {
+                variant: TypeVariant::FixedSize,
+                name: name.into(),
+                size,
+                alignment,
+            };
+            let mut out = Vec::new();
+            write_header(
+                &mut out,
+                "tt-fixture/ticks",
+                &fixed("tickertape_iceoryx2::example::Tick", 24, 8),
+                &fixed("tickertape_iceoryx2::example::TickHeader", 16, 8),
+            )
+            .unwrap();
+            assert_eq!(std::str::from_utf8(&out).unwrap(), &fixture[..header_end]);
+            let first = parse(fixture.as_bytes(), SEGMENT).unwrap();
+            let sys: Vec<u8> = (0..48).collect();
+            let r = &first.records[0];
+            write_record(&mut out, 0, &sys, &r.user_header, &r.payload).unwrap();
+            let record_end = fixture[header_end..].find("\n\n").unwrap() + 2;
+            let mut expected = fixture[header_end..header_end + record_end].to_string();
+            let sys_line = expected.lines().nth(1).unwrap().to_string();
+            let ours: String = sys.iter().map(|b| format!("{b:02x} ")).collect();
+            expected = expected.replace(&sys_line, &format!("sys head: {ours}"));
+            assert_eq!(std::str::from_utf8(&out[header_end..]).unwrap(), expected);
+
+            let odd = "a\"b\\c\u{7f}d/é";
+            let mut out = Vec::new();
+            write_header(&mut out, odd, &fixed(odd, 4, 4), &fixed("()", 0, 1)).unwrap();
+            write_record(&mut out, 7, &[0; 48], &[], &[1, 2, 3, 4]).unwrap();
+            let parsed = parse(&out, SEGMENT).unwrap();
+            assert_eq!(
+                (parsed.service_name.as_str(), parsed.payload.name.as_str()),
+                (odd, odd)
+            );
+            assert_eq!(parsed.records[0].payload, [1, 2, 3, 4]);
+        }
+
         #[test]
         fn arbitrary_bytes_never_panic() {
             let good = file(
@@ -920,6 +1162,167 @@ mod text {
                 }
                 let _ = parse(&bytes[..i], SEGMENT);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::layout::{SCHEMA_DESCRIPTOR, Version};
+
+    /// A journal with one service of `u32` payloads and `n` messages.
+    fn journal(n: u32) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("j");
+        let mut w = tickertape::Writer::open(
+            &path,
+            WriterConfig::default().segment_size(65_536).prefault(false),
+        )
+        .unwrap();
+        let fixed = |name: &str, size, alignment| TypeInfo {
+            variant: TypeVariant::FixedSize,
+            name: name.into(),
+            size,
+            alignment,
+        };
+        let d = Descriptor {
+            run_start_seq: 0,
+            run_start_unix_ns: 1,
+            imported: false,
+            iceoryx2_version: Version {
+                major: 0,
+                minor: 10,
+                patch: 0,
+            },
+            settings: ServiceSettings::UNKNOWN,
+            recorder_buffer_size: 0,
+            counter: None,
+            payload: fixed("u32", 4, 4),
+            user_header: fixed("()", 0, 1),
+            system_header: type_info_of_system_header(),
+            service_name: "export/x".into(),
+            recorder: "test".into(),
+        };
+        let bytes = d.encode().unwrap();
+        w.append(&NewRecord {
+            schema_id: SCHEMA_DESCRIPTOR,
+            venue_ts_ns: 0,
+            local_ts_ns: 1_000_000,
+            payload: &bytes,
+        })
+        .unwrap();
+        for i in 0..n {
+            let data = DataRecord {
+                descriptor_seq: 0,
+                publisher_id: 0,
+                user_header: &[],
+                payload: &i.to_le_bytes(),
+            }
+            .encode()
+            .unwrap();
+            w.append(&NewRecord {
+                schema_id: SCHEMA_DATA,
+                venue_ts_ns: 0,
+                local_ts_ns: 1_000_000 * u64::from(i + 1),
+                payload: &data,
+            })
+            .unwrap();
+        }
+        w.checkpoint().unwrap();
+        (dir, path)
+    }
+
+    fn type_info_of_system_header() -> TypeInfo {
+        crate::recorder::type_info(&system_header_detail())
+    }
+
+    /// Accepts at most `chunk` bytes per call, and fails once `limit` bytes were written (a full volume).
+    struct Limited {
+        out: Vec<u8>,
+        chunk: usize,
+        limit: usize,
+    }
+
+    impl Write for Limited {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let room = self.limit - self.out.len();
+            if room == 0 {
+                return Err(std::io::Error::from_raw_os_error(28)); // ENOSPC
+            }
+            let n = buf.len().min(self.chunk).min(room);
+            self.out.extend_from_slice(&buf[..n]);
+            Ok(n)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Short writes are continued until everything is written, and a write that fails fails the export: upstream's
+    /// writer took any `Ok(n)` as complete (review round 3).
+    #[test]
+    fn exports_write_everything_or_fail() {
+        let (_dir, journal) = journal(50);
+        let options = ExportOptions::default();
+        let mut whole = Vec::new();
+        let report = export_to(&journal, &mut whole, "export/x", &options).unwrap();
+        assert_eq!(report.messages, 50);
+        let parsed = text::parse(&whole, 65_536).unwrap();
+        assert_eq!(parsed.records.len(), 50);
+        assert_eq!(parsed.records[49].payload, 49u32.to_le_bytes());
+
+        let mut short = Limited {
+            out: Vec::new(),
+            chunk: 7,
+            limit: usize::MAX,
+        };
+        export_to(&journal, &mut short, "export/x", &options).unwrap();
+        assert_eq!(short.out, whole, "short writes are continued");
+
+        for limit in [0, 10, whole.len() / 2, whole.len() - 1] {
+            let mut full = Limited {
+                out: Vec::new(),
+                chunk: 7,
+                limit,
+            };
+            let err = export_to(&journal, &mut full, "export/x", &options).unwrap_err();
+            assert!(
+                matches!(err, Error::Io { op: "write", .. }),
+                "{limit}: {err}"
+            );
+        }
+    }
+
+    /// Two exports to one destination at the same time, in one process: each writes its own temporary file, one
+    /// links it into place, the other fails without touching the winner's file, and no temporary file remains.
+    #[test]
+    fn concurrent_exports_to_one_destination_never_collide() {
+        let (dir, journal) = journal(2_000);
+        let output = dir.path().join("out.iox2");
+        for _ in 0..5 {
+            let _ = std::fs::remove_file(&output);
+            let barrier = std::sync::Barrier::new(2);
+            let results: Vec<_> = std::thread::scope(|s| {
+                let run = || {
+                    barrier.wait();
+                    export(&journal, &output, &ExportOptions::default())
+                };
+                let a = s.spawn(run);
+                let b = s.spawn(run);
+                vec![a.join().unwrap(), b.join().unwrap()]
+            });
+            let ok = results.iter().filter(|r| r.is_ok()).count();
+            assert_eq!(ok, 1, "{results:?}");
+            let parsed = text::parse(&std::fs::read(&output).unwrap(), 65_536).unwrap();
+            assert_eq!(parsed.records.len(), 2_000, "the winner's file is complete");
+            let left: Vec<_> = std::fs::read_dir(dir.path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|n| n.contains("partial"))
+                .collect();
+            assert!(left.is_empty(), "{left:?}");
         }
     }
 }
