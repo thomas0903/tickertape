@@ -37,7 +37,10 @@ checkpoint marker as dirty, including records an earlier writer appended but nev
 | 4. Marker | Write the next `checkpoint` slot with `pwrite`, then `fdatasync` it | Write the next `checkpoint` slot with `pwrite`, then `fcntl(F_FULLFSYNC)` on it |
 
 The marker file itself is created, synced, and its directory entry synced when the journal is created, so step 4
-only ever overwrites a slot in an existing file.
+only ever overwrites a slot in an existing file. If something cut the marker short, the writer leaves it short at
+open (observers take a full-length marker's modification time as the time of the last checkpoint, ADR 0032), and step
+4 may then extend the file to reach the slot; after step 4 succeeds, a fifth step extends the marker to its full
+length and syncs it (best effort: a marker left short is still valid, and a later checkpoint tries again).
 
 The marker is written only after steps 1–3 succeed, so it never points past data that isn't durable. On macOS,
 plain `fsync` does not flush the drive's write cache; `F_FULLFSYNC` does, and is much slower. tickertape always uses

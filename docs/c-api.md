@@ -317,6 +317,7 @@ sequence on a platform thread, or through such a C shim.
 | `TICKERTAPE_E_ABORTED` | A fill callback returned non-zero (and the writer cleaned up) |
 | `TICKERTAPE_E_BUSY` | Re-entrant call on a handle that is already inside a call |
 | `TICKERTAPE_E_PANIC` | An internal error (a bug in tickertape) was caught; the handle is broken, close it |
+| `TICKERTAPE_E_BEACON_IN_USE` | A reader beacon's name is held by a running reader (no C function creates beacons yet) |
 | `TICKERTAPE_E_UNKNOWN` (-255) | An error this ABI version has no code for |
 
 ### A failed clean-up after an aborted fill

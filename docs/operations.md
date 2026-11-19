@@ -136,6 +136,193 @@ removal.
 Never truncate or edit a segment in place while anything uses the journal: processes that map it can receive
 `SIGBUS`.
 
+## Monitoring
+
+`tickertape status` and the `tickertape::status` module report what an operator needs to know about a running
+recorder, cheaply and without a telemetry service (ADR [0032](decisions/0032-operational-metrics.md); the JSON and
+Prometheus schemas are in [`cli.md`](cli.md)). Nothing they do slows the writer down, takes its lock or changes the
+journal, and every file is opened non-blocking, so a FIFO or device in the journal can't hang them.
+
+**What is reported is never guessed.** A value a sample can't establish is null (JSON), absent (Prometheus) or
+`None` (Rust), usually with a reason. Values that are estimates are named `estimated_*`: the checkpoint's age, the
+exposure's age, rolls left and time to full. A sample reads only the newest segment, so when the checkpoint is in an
+older segment it can't see a missing or damaged segment in between: `head.verified` and `exposure.verified` are then
+false, and the head and exposure are what the newest segment implies. A healthy verdict is then "healthy as far as
+the sample can tell" (`health ok (unverified)`), not a promise that the writer would open the journal. A break the
+sample does see (the head at invalid bytes, a marker the writer refuses, a segment the listing proves missing) is
+reported as corruption. `tickertape verify` checks everything.
+
+### What to alert on
+
+| Signal | Why it matters | Suggested alert |
+|---|---|---|
+| **Corruption** (`tickertape_corrupt`; exit code 2) | The head is at bytes that fail validation (seen after a power loss or storage corruption, until the next writer repairs them; C8, C11), the checkpoint marker points to a missing segment or an impossible offset, or the segment listing proves a segment missing between the checkpoint and the head, so the writer refuses to open the journal | Page |
+| **Exposure age** (`exposure.estimated_age`, `tickertape_exposure_estimated_age_seconds`; CLI `--max-checkpoint-age`) | Everything after the last successful checkpoint may be lost in a power loss, and its sequence numbers reused (crash contract C7, C8). The exposure age is an upper bound on how far back that loss reaches: zero when every record is covered, otherwise the checkpoint's estimated age. It is unknown (and `--max-checkpoint-age` is breached) when records are uncovered and there is no checkpoint or its time is unreliable | Warn above 3× your checkpoint interval, page above 10×; alert on `absent(tickertape_exposure_estimated_age_seconds)` too |
+| **Checkpoint errors** (`Writer::metrics().poisoned`, or `checkpoint()` returning an error) | After a failed checkpoint, durability can't be guaranteed for this writer, and later checkpoints fail (C12, "Errors are sticky"). The marker then stops moving, so the exposure age grows too | Page on the first error. Only the writer process can see this directly |
+| **Storage headroom** (`storage.available_bytes`, `estimated_rolls_left`; `--min-headroom`, `--min-headroom-segments`) | Writes into the active segment need no new space, but the next roll needs a whole segment; when it can't get one, `append` fails with a storage-full error (C9). **On btrfs** a full volume can kill the writer with `SIGBUS` even inside the active segment (C10), so the rolls estimate is optimistic there; on APFS a checkpoint on a full volume fails and poisons the writer. A prepared spare segment is reported (`spare_segment`) but not counted, since publishing it can still fail | Warn below a day's worth of segments at your peak rate (or use `predict_linear` on `tickertape_storage_available_bytes`), page below 2 rolls. Keep a larger margin on btrfs |
+| **Reader lag** (`lag.records`/`bytes`, `unread_age`; `--max-reader-lag`) | A slow reader never slows the writer down (C6), so it can fall arbitrarily far behind. With retention, a reader in a segment that is removed gets `Error::Discarded`, and its beacon shows `lag_unknown_reason` `segment_gone`. A durable-only reader's lag is measured against the checkpoint, which it can't pass | Per consumer, from what the application tolerates. Compare `lag.bytes` (a segment-file footprint) with the bytes retention keeps to see how close a reader is to losing its segment |
+| **Retention failures** (`Writer::metrics().retention_failures`, `Writer::last_retention_error()`) | Retention errors never fail `append` or `checkpoint`; they only show as a journal that keeps growing | Alert when the failure count increases. From outside: `tickertape_segments_bytes` above your retention limit for longer than a checkpoint interval |
+| **Staleness of the metrics** (`tickertape_status_timestamp_seconds`, `tickertape_up`) | A sample that fails writes `tickertape_up 0`; a `tickertape status --watch` that stops (killed, hung storage) stops updating the file, which a textfile collector keeps serving | `tickertape_up == 0`, and `time() - tickertape_status_timestamp_seconds > 3 * <interval>` |
+| **Writer process** (`writer.alive`) | Best effort: the PID in `writer.lock` can be reused | Use your process supervisor for this; treat it as a hint |
+
+The checkpoint's age is estimated from the marker file's modification time and the observer's wall clock (the writer
+changes the marker only at a checkpoint). It is reported as unknown when the time is detectably wrong: in the future
+(a clock stepped back), earlier than the creation of the marker's segment (a copy that didn't keep times, a clock
+step), or after the marker was cut short. A clock stepped forward, a later `touch`, or a copy made after the segment
+was created can't be detected and make the estimate too large or too small. Inside the writer,
+`Writer::metrics().since_checkpoint` uses the monotonic clock instead.
+
+### Cost of sampling
+
+| Call | Cost |
+|---|---|
+| `Writer::metrics()`, `Reader::cursor()`, `Status::lag()` | No system calls |
+| `ReaderBeacon::update()` | A comparison when the reader hasn't moved; otherwise a monotonic clock read, and at most once per interval (1 s by default) one 128-byte `pwrite`, plus a 64-byte header read when the reader moved to another segment |
+| `status()`, `tickertape status` | One `readdir` and one `stat` per segment; two small reads of the checkpoint marker between two `fstat`s; the header of the newest segment, and of the checkpoint's and the oldest segment if different; a `pread` scan of the newest segment from the checkpoint (at most one segment; again if the writer rolled during the sample); one record read for the oldest uncovered record when the scan didn't pass it; `statvfs`; per reader beacon an `open`, an `fstat`, one or two small reads, two `flock`s and an `lstat`, plus a segment header read and one record read for a lagging beacon |
+| `Sampler::sample()`, `tickertape status --watch` | As `status()`, but the scan covers only what was appended since the previous sample |
+
+A record read is 4 KiB, or the whole record if it is larger (it is validated before its timestamp is used). The
+exact counts are in the rustdoc of `tickertape::status::status` and in ADR 0032. Nothing is added to `append` or to
+a reader's read path. Checkpointing regularly keeps one-shot samples cheap, since they scan only what was appended
+since the checkpoint, and lets them verify the chain.
+
+### Prometheus without a server
+
+A node_exporter textfile collector picks up a file that `tickertape status` keeps up to date:
+
+```sh
+# Rewrites the file atomically every 15 seconds; rates and time-to-full appear from the second sample.
+tickertape status /data/journal --format prometheus --watch 15s \
+    --output /var/lib/node_exporter/textfile/tickertape.prom
+# Or from cron, one sample at a time:
+* * * * * tickertape status /data/journal --format prometheus --output /var/lib/node_exporter/textfile/tickertape.prom
+```
+
+With `--watch`, a sample that fails replaces the file with `tickertape_up 0` and the watch goes on; a one-shot run does
+the same before it exits with an error. The file must not lie inside the journal, its `quarantine/` or the beacon
+directory, and `status` replaces an existing file only if it is an earlier output of `status` (in any format) or an
+empty regular file, and it finds no entry of the journal that links to it (when it cannot list the journal's
+directories, a file that starts like a status output is still replaced: that is what lets a failed sample report
+`tickertape_up 0`); anything else, including a symlink, is refused on standard error and stops a watch with exit
+code 1 (remove the file, or choose another path). A write that fails (a full disk, a
+directory that became read-only) stops a watch with exit code 1 too, so keep the timestamp alert below. Give `--output`
+a path in a directory only the monitoring job writes to (such as the textfile directory above), and never link to
+that file from inside the journal: `status` can't tell a file another process puts there between its check and its
+rename from its own, and it can't see a link from a journal directory it can't list. `--watch` with Prometheus output needs
+`--output` (several expositions in one stream are not valid). The `journal` label is the canonical path of the journal
+directory.
+
+Example alert expressions:
+
+```text
+tickertape_corrupt == 1
+tickertape_up == 0
+time() - tickertape_status_timestamp_seconds > 60
+tickertape_exposure_estimated_age_seconds > 30 or (tickertape_exposure_records > 0 unless tickertape_exposure_estimated_age_seconds)
+tickertape_storage_estimated_rolls_left < 2
+predict_linear(tickertape_storage_available_bytes[6h], 24 * 3600) < 0
+tickertape_reader_lag_records{reader="risk-engine"} > 100000 unless on(instance, job, journal, reader) tickertape_reader_live == 0
+```
+
+The last rule counts every reader beacon except a stale one (`tickertape_reader_live` is 0 only for a beacon whose
+owner died, and absent when its lock state is unknown), as `--max-reader-lag` does: an `uncertain` beacon still
+counts. `tickertape_reader_live == 1` instead would silently skip `uncertain` beacons. The match keeps the scrape
+identity: `instance` and `job` are the labels Prometheus attaches to every scraped series by default (for a
+textfile collector, the node_exporter's), so a stale beacon on one host never suppresses a live reader's alert on
+another host that uses the same journal path and reader name. If your relabelling adds or replaces identifying
+labels (a `host` label, say), list those in `on(...)` too, or leave out `on(...)` to match on every label.
+
+As a health check (systemd, Kubernetes, a load balancer script), the exit code is enough:
+
+```sh
+tickertape status /data/journal --max-checkpoint-age 30s --min-headroom-segments 4 --max-reader-lag 100000
+# 0 healthy; 3 a threshold breached; 2 the journal is corrupt or the writer would refuse it; 1 I/O or usage error.
+```
+
+When a one-shot run also has an `--output` it can't write, the health verdict still decides the exit code (2 or 3, or 1
+for a failed sample) and the output's failure goes to standard error; a healthy sample then exits 1.
+
+### Exporting from your own process
+
+The library has no metrics dependency; a few lines connect it to whatever the application uses. With the
+`prometheus` crate, for example:
+
+```rust
+use prometheus::{IntGauge, register_int_gauge};
+
+let exposure = register_int_gauge!("tickertape_exposure_records", "Records not yet durable")?;
+let rolls_left = register_int_gauge!("tickertape_storage_estimated_rolls_left", "Segment rolls that still fit")?;
+let poisoned = register_int_gauge!("tickertape_writer_poisoned", "1 after a failed checkpoint")?;
+let mut sampler = tickertape::status::Sampler::new("/data/journal");
+// On each scrape or timer tick:
+let status = sampler.sample()?;
+if let Some(records) = status.exposure.records {
+    exposure.set(records as i64);
+}
+rolls_left.set(status.storage.estimated_rolls_left as i64);
+poisoned.set(i64::from(writer.metrics().poisoned)); // in the writer's process
+```
+
+With OpenTelemetry, register observable gauges whose callbacks read a `Status` the same way (the builder names vary
+between `opentelemetry` versions):
+
+```rust
+let meter = opentelemetry::global::meter("tickertape");
+let dir = std::path::PathBuf::from("/data/journal");
+let _exposure = meter
+    .u64_observable_gauge("tickertape.exposure.records")
+    .with_callback(move |gauge| {
+        if let Some(records) = tickertape::status::status(&dir).ok().and_then(|s| s.exposure.records) {
+            gauge.observe(records, &[]);
+        }
+    })
+    .build();
+```
+
+### Making readers in other processes visible
+
+Readers leave no trace on disk by default, so an observer can't see their position. A reader that should be
+monitored opts in with a beacon:
+
+```rust
+use tickertape::status::ReaderBeacon;
+
+let mut beacon = ReaderBeacon::create("/data/journal", "risk-engine", &reader)?;
+loop {
+    if let Some(record) = reader.next_timeout(Some(std::time::Duration::from_secs(1)))? {
+        // ... handle the record ...
+    }
+    beacon.update(&reader)?; // writes at most once a second, only when the position moved
+}
+```
+
+The beacon is `<dir>/readers/risk-engine` (128 bytes); it disappears when dropped. A reader that crashes leaves its
+file behind, but `status` reports it as `stale` (the beacon's `flock` died with the process) and never counts it as
+lag; delete the file when you no longer want to see it, or create a beacon with the same name, which takes it over.
+Creating a beacon never replaces anything but a stale beacon (a valid one, or one whose last update was cut short
+when its owner died): a name held by a live reader fails with `Error::BeaconInUse`, and any other file under the
+name is left alone. Names that are journal files' names, in any letter case, are refused. Beacons never influence
+the writer or retention.
+
+- **Permissions.** Beacon files are created with the reader's umask (mode `0666` before the umask). An observer
+  needs read access to the beacon directory and the files; a beacon it can't read is reported as `unreadable`, and a
+  directory it can't list as unusable, without failing the sample. A reader of **another user's journal**, which
+  can't write to its directory, creates its beacon with `ReaderBeacon::create_in` in a directory of its own, and the
+  observer is pointed at it with `--readers-dir` (or `Sampler::readers_dir`).
+- **Identity.** A beacon records the identity of the segment file its cursor is in, and an observer computes lag only
+  against that same file. Beacons of different journals can share a directory: a beacon of another journal shows a
+  `lag_unknown_reason` of `other_history`, and so does a reader still in a segment that recovery repaired or a
+  journal replaced at the same path.
+- **`fork`.** The lock belongs to the open file: a child created with `fork` that keeps the beacon's descriptor
+  keeps the beacon `live` after its creator dies, until the child exits. The descriptor is close-on-exec, so `exec`
+  drops it, but every child holds it from `fork` to `exec`: while another thread spawns a process, a beacon dropped
+  at that moment can still look live (and a creator of the same name can get `BeaconInUse`) for that instant. A
+  child's copy of a `ReaderBeacon` never writes or removes the file: `update` fails in the child, and dropping the
+  copy leaves the parent's beacon in place.
+- **Filesystems.** Beacons, like journals, are for local filesystems. On network filesystems `flock` may be
+  unsupported (observers then report `uncertain`, and lag thresholds apply as for live beacons) or emulated (on Linux
+  NFS, an observer in the owner's own process can release the owner's lock).
+
 ## Checking a journal
 
 - `tickertape verify <dir>` checks every header, record and seal and exits with code 2 if anything is wrong; it is
@@ -156,6 +343,8 @@ Never truncate or edit a segment in place while anything uses the journal: proce
   commit word, `verify` also searches the rest of that segment: it reads backward from the segment's end to find the
   last non-zero byte, then checks the candidates up to it, and can stop early (`cli.md` → `verify`).
 - `tickertape inspect <dir>` lists segments, their sequence ranges and fill level, and the checkpoint marker.
+- `tickertape status <dir>` is the cheap, frequent check: head, checkpoint age, exposure, headroom and reader lag
+  (see "Monitoring"). Unlike `inspect` and `verify`, it does not scan the whole journal.
 
 ## After a crash
 

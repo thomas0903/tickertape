@@ -18,6 +18,8 @@ proptest = "1"
 tempfile = "3"
 # Parses tests/compat/fixtures/manifest.json (already in the lockfile through tickertape-cli).
 serde_json = "1"
+# fork(2) for the reader-beacon tests of forked children (already in the lockfile through tickertape).
+libc = "0.2"
 
 [[test]]
 name = "recovery"
@@ -69,6 +71,14 @@ workspace = true
 [[test]]
 name = "retention"
 path = "retention.rs"
+
+[[test]]
+name = "status"
+path = "status.rs"
+
+[[test]]
+name = "beacon_races"
+path = "beacon_races.rs"
 
 [[test]]
 name = "reader_retention_stress"

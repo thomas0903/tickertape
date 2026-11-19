@@ -689,6 +689,21 @@ impl Reader {
     }
 }
 
+impl Reader {
+    /// For [`Reader::cursor`] and reader beacons (`status.rs`): the cursor and the segment file it is in.
+    pub(crate) fn cursor_parts(&self) -> crate::status::CursorParts<'_> {
+        crate::status::CursorParts {
+            slot_seq: self.next_seq,
+            skip_until: self.skip_until,
+            path: &self.seg.path,
+            offset: self.offset,
+            file: &self.seg.file,
+            identity: self.seg.identity,
+            durable_only: self.config.durable_only,
+        }
+    }
+}
+
 /// Lists the segments, lets `choose` pick one, and opens it. If the chosen segment has disappeared by the time it is
 /// opened (retention or archiving removed it, or writer recovery quarantined it), lists again, so that `choose` sees
 /// the journal as it is now (and likewise if the listing was empty). Retention removes the oldest segments first, so
