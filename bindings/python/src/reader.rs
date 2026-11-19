@@ -293,13 +293,12 @@ impl Buffer {
         self.epoch = self.epoch.wrapping_add(1);
     }
 
-    /// Removes `n` delivered records from the front.
+    /// Removes `n` delivered records from the front. Frees nothing: this runs after a read's last signal check, so
+    /// it must be quick (freeing a large buffer can take milliseconds). The next `fill`, `seek` or `close` empties
+    /// the buffer, with the GIL released.
     fn consume(&mut self, n: usize) {
         self.start += n;
         self.epoch = self.epoch.wrapping_add(1);
-        if self.is_empty() {
-            self.reset();
-        }
     }
 
     /// The first staged record, as a `Record` (not yet a Python object). Allocates only the payload's `bytes`, which
@@ -778,7 +777,9 @@ impl Reader {
                 }
                 // Another caller took or replaced the records while the result was built: start again.
                 continue;
-            } else if !slice.is_zero() {
+            } else if !no_wait {
+                // Also when this pass did not wait (its deadline had passed): a handler that closes the reader must
+                // run before the call reports a timeout.
                 py.check_signals()?;
             }
             if self.closed.load(Ordering::Acquire) {

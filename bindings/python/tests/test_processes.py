@@ -550,21 +550,24 @@ def test_non_blocking_reads_in_two_threads_never_return_empty_early(journal: Pat
 @pytest.mark.parametrize("call", ["next", "read_many", "read_batch"])
 @pytest.mark.parametrize("closer", ["signal", "thread"])
 def test_reader_closed_at_the_deadline_raises(journal: Path, call: str, closer: str) -> None:
+    """A reader closed (by a signal handler or another thread) during the wait slice in which the deadline passes
+    makes the read raise ValueError instead of reporting a timeout."""
     script = """
-        import os, signal, sys, threading, time
+        import signal, sys, threading
         import tickertape as tt
 
         path, call, closer = sys.argv[1:4]
         writer = tt.Writer(path, segment_size=1 << 20)
-        for attempt in range(5):
+        raised = late = 0
+        while raised < 5:
             reader = tt.Reader(path)
             if closer == "signal":
                 signal.signal(signal.SIGALRM, lambda *_: reader.close())
-                signal.setitimer(signal.ITIMER_REAL, 0.03)
+                signal.setitimer(signal.ITIMER_REAL, 0.01)
             else:
-                threading.Timer(0.03, reader.close).start()
+                threading.Timer(0.01, reader.close).start()
             try:
-                # One wait slice (the deadline passes during it); the reader is closed before it ends.
+                # One wait slice (the deadline passes during it); the reader is closed 10 ms into it.
                 if call == "next":
                     result = reader.next(timeout=0.05)
                 elif call == "read_many":
@@ -573,9 +576,17 @@ def test_reader_closed_at_the_deadline_raises(journal: Path, call: str, closer: 
                     result = reader.read_batch(10, timeout=0.05)
             except ValueError as error:
                 assert "closed" in str(error), error
+                raised += 1
                 continue
-            print("returned", repr(result))
-            sys.exit(1)
+            if reader.closed:
+                print("returned", repr(result))  # closed before the read returned, yet it reported a timeout
+                sys.exit(1)
+            # The close came only after the read had returned (the timer or thread ran more than 40 ms late on a
+            # loaded machine), so the timeout was right. Wait for it and try again.
+            late += 1
+            assert late < 20, "the closer kept running late"
+            while not reader.closed:
+                signal.pause() if closer == "signal" else threading.Event().wait(0.01)
         print("ok")
     """
     assert run_script(script, journal, call, closer).strip() == "ok"

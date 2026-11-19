@@ -109,14 +109,14 @@ concurrent calls on one object serialize. The mutex is never held while Python c
 records are converted to Python objects after it is released. `closed`, `Reader.position` and `repr` read atomics and
 never wait.
 
-Waits run in slices of at most 50 ms, and a waiting read holds its reader's mutex only during a slice. Between slices
-it checks a closed flag and calls `PyErr_CheckSignals` with the mutex released, so Ctrl-C raises `KeyboardInterrupt`
-within about 50 ms, signal handlers may use the reader without deadlocking, and `close()` from another thread or a
-handler ends the read with `ValueError` within a slice (the flag is checked before a read reports a timeout, too). The
-remaining wait is computed after the mutex is acquired, so a read queued behind another waiter does not wait its full
-timeout again. Reads from several threads on one reader interleave between slices and share its cursor: each record
-is returned to exactly one caller. A reader is a cursor, so share one between threads only if they coordinate; use one
-reader per consumer.
+Waits run in slices of at most 50 ms, and a waiting read holds its reader's mutex only during a slice. Between slices it
+checks a closed flag and calls `PyErr_CheckSignals` with the mutex released, so Ctrl-C raises `KeyboardInterrupt` within
+about 50 ms, signal handlers may use the reader without deadlocking, and `close()` from another thread or a handler ends
+the read with `ValueError` within a slice (before a waiting read reports a timeout, it runs pending signal handlers and
+checks the flag again). The remaining wait is computed after the mutex is acquired, so a read queued behind another
+waiter does not wait its full timeout again. Reads from several threads on one reader interleave between slices and
+share its cursor: each record is returned to exactly one caller. A reader is a cursor, so share one between threads only
+if they coordinate; use one reader per consumer.
 
 Records are staged in a buffer in the reader: copied from the journal into it with the mutex held, they leave it only
 when a read delivers them. A read checks for signals, builds its complete Python result from a copy of the front of
