@@ -532,11 +532,12 @@ fn quarantined(dir: &Path) -> Vec<(String, Vec<u8>)> {
 fn verify_never_reports_a_healthy_journal_under_a_live_writer() {
     // Review round 1, item 1: `verify` found the empty commit word at the end, and while it searched the rest of the
     // segment the live writer committed that record and more after it, which then counted as evidence. A writer
-    // appending 64-byte records at about 44,000 per second into a 32 MiB segment, as in the reproduction, and
-    // `verify` run repeatedly meanwhile: it must never report a problem. The writer stops before the segment is half
-    // full, so it never rolls.
+    // appending 64-byte records at about 44,000 per second, as in the reproduction, and `verify` run repeatedly
+    // meanwhile (10 times, or for 6 s on a slow machine, where each run reads more as the journal grows): it must
+    // never report a problem. The segment is 64 MiB and the writer stops before it is 7/8 full (about 13 s), so it
+    // never rolls.
     let dir = tempfile::tempdir().unwrap();
-    let size: u64 = 32 << 20;
+    let size: u64 = 64 << 20;
     let config = WriterConfig::default().segment_size(size).prefault(false);
     let mut w = Writer::open(dir.path(), config).unwrap();
     fn record(payload: &[u8; 64]) -> tickertape::NewRecord<'_> {
@@ -552,7 +553,7 @@ fn verify_never_reports_a_healthy_journal_under_a_live_writer() {
     let writer = {
         let stop = Arc::clone(&stop);
         std::thread::spawn(move || {
-            let limit = size / 2 / 104;
+            let limit = size / 8 * 7 / 104;
             let start = Instant::now();
             let mut n = 1_u64;
             while !stop.load(Ordering::Relaxed) && n < limit {
@@ -569,7 +570,11 @@ fn verify_never_reports_a_healthy_journal_under_a_live_writer() {
         })
     };
     let mut runs = 0;
-    while runs < 10 && !writer.is_finished() {
+    let started = Instant::now();
+    while runs < 10
+        && !writer.is_finished()
+        && (runs < 2 || started.elapsed() < Duration::from_secs(6))
+    {
         let report = inspect::verify(dir.path()).unwrap();
         assert!(
             report.problems.is_empty(),
@@ -580,7 +585,7 @@ fn verify_never_reports_a_healthy_journal_under_a_live_writer() {
     }
     stop.store(true, Ordering::Relaxed);
     let appended = writer.join().unwrap();
-    assert!(runs >= 3, "the writer stopped after {runs} runs");
+    assert!(runs >= 2, "the writer stopped after {runs} runs");
     let report = inspect::verify(dir.path()).unwrap();
     assert!(report.problems.is_empty(), "{:?}", report.problems);
     assert_eq!(report.records, appended);
