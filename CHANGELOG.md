@@ -5,6 +5,14 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
+- Performance: the zero-copy reader (`Reader::open_mapped`) no longer copies each record into a scratch buffer to
+  validate it. It computes the CRC32C straight from 8-byte atomic loads of the mapping, feeding each load to the CPU's
+  CRC instruction, and still validates every record before creating any slice into the mapping (ADR 0027). The same
+  records are accepted and rejected, with the same errors; the on-disk format and `open_mapped`'s safety contract are
+  unchanged.
+- Tests: the mapped and safe readers are checked against each other over every payload length up to 4,200 bytes, page
+  and segment boundaries, every corruption class and random damaged journals; the kill loop keeps a live zero-copy
+  reader across every crash; Miri also runs the CRC tests.
 - Docs: define the path to v1.0 around sustained performance, optional eBPF diagnostics, reader/checkpoint
   optimization, ARM measurements, interoperability, replay/recovery at scale and explicit stability/release gates.
 - Docs: v1.0 scope decisions of 2026-11-19. The external integration is an iceoryx2 recorder and replayer

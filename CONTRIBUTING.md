@@ -29,7 +29,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 cargo +1.85 check --workspace --all-features --all-targets   # MSRV
 cargo deny check
 cargo test -p tickertape-tests --release -- --ignored        # long tests: 1M records, 250-kill loop
-cargo +nightly miri test -p tickertape --lib format          # Miri on the format code
+cargo +nightly miri test -p tickertape --lib -- format crc   # Miri on the format and CRC code
 RUSTFLAGS="--cfg loom" cargo test -p tickertape --lib --release protocol_model
 ```
 

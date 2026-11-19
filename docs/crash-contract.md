@@ -68,7 +68,7 @@ journal; the durability and restart guarantees below apply to retained history.
 
 | # | Failure | Guarantee | Platforms | Test |
 |---|---|---|---|---|
-| C1 | Writer process dies (`kill -9`, panic, abort) at any point | Every committed record is intact and readable after restart. A record being appended is entirely present or entirely absent. The next writer continues at the next sequence number, with no gap and no duplicate | Linux, macOS | `tests/kill_loop.rs::kill_loop_250` (250 `SIGKILL`s at random points, with a live reader across all of them; 20 in the default test run) |
+| C1 | Writer process dies (`kill -9`, panic, abort) at any point | Every committed record is intact and readable after restart. A record being appended is entirely present or entirely absent. The next writer continues at the next sequence number, with no gap and no duplicate | Linux, macOS | `tests/kill_loop.rs::kill_loop_250` (250 `SIGKILL`s at random points, with a live safe reader and a live zero-copy reader across all of them; 20 in the default test run) |
 | C2 | Writer process dies with a partly written record, or the caller's fill closure panics | The partial bytes are never visible to readers. The writer (or the next one) zeroes them and makes the zeroing durable before committing anything after them, so no stale bytes can later pass as a record | Linux, macOS | `tests/recovery.rs::torn_final_record`, `::panic_in_fill_then_shorter_append` (simulated crash state); process kill: `tests/kill_loop.rs` |
 | C3 | Writer process dies while holding the lock | The OS releases the `flock` when the process dies; a new writer can open immediately. No stale-lock cleanup is needed | Linux, macOS | `tests/lock.rs::stale_lock_after_kill`; and every iteration of `tests/kill_loop.rs` |
 | C4 | Writer process dies during a roll | No committed record is lost. The next writer completes the roll (`format.md` → Recovery). Readers waiting at the end of the old segment continue once the seal is written | Linux, macOS | `tests/recovery.rs::crash_between_link_and_seal` (simulated crash state); process kill: `tests/kill_loop.rs` (64 KiB segments, so kills land in rolls) |
@@ -91,9 +91,11 @@ journal; the durability and restart guarantees below apply to retained history.
 - **`Reader::open_mapped` (`unsafe`, zero-copy)** hands out `&[u8]` slices pointing into the shared mapping. The caller
   promises that no process other than a tickertape writer modifies the journal's segment files while the reader
   exists. A correct writer never modifies committed bytes and repairs by writing new files, so this holds in normal
-  operation, including writer crashes and recovery. Each record is first validated from a copy made with atomic
-  loads, and a slice into the mapping is created only after it passes, so a corrupted length cannot make a slice
-  cover bytes the writer is still appending (except through a CRC collision on corrupted data, about 2^-32).
+  operation, including writer crashes and recovery. Each record is first validated from atomic loads of the
+  mapping (each byte loaded once, nothing copied; ADR 0027), and a slice into the mapping is created only after it
+  passes, so a corrupted length cannot make a slice cover bytes the writer is still appending (except through a CRC
+  collision on corrupted data, about 2^-32). That a returned payload equals the bytes validated rests on the same
+  promise: nothing modifies committed bytes.
 - **The writer** maps the segments it writes. Its API is safe, following the Rust standard library's position that
   its safety guarantees "only cover what the program itself can do, and not what entities outside the program can
   do to it" (`std::os::unix::io`, on `/proc/self/mem`). Another process writing into or truncating the files the
