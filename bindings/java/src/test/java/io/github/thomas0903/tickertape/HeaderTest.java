@@ -86,7 +86,7 @@ class HeaderTest {
     }
 
     private static String layoutTag(MemoryLayout l) {
-        if (l instanceof AddressLayout) {
+        if (l instanceof AddressLayout || l.equals(Signatures.POINTER_AS_LONG)) {
             return "ptr";
         }
         if (l instanceof ValueLayout.OfInt) {

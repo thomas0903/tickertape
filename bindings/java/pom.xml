@@ -38,6 +38,12 @@
     <!-- Set to true (CI does) to fail instead of skipping tests whose external tools are missing. -->
     <tickertape.test.requireTools>false</tickertape.test.requireTools>
     <tickertape.test.python>python3</tickertape.test.python>
+    <!-- The test JVM's options. Tests run on the module path, patched into the binding's module, so the flag users
+         need is the one tested; deny turns a restricted call without native access into an error instead of a
+         warning. -->
+    <tickertape.test.argLine>--enable-native-access=io.github.thomas0903.tickertape --illegal-native-access=deny --add-modules jdk.management --add-reads io.github.thomas0903.tickertape=java.management,jdk.management</tickertape.test.argLine>
+    <!-- Extra options for the test JVM (for experiments; empty by default). -->
+    <tickertape.test.jvmArgs></tickertape.test.jvmArgs>
     <!-- Set by the os profiles below. -->
     <tickertape.lib.file>libtickertape.so</tickertape.lib.file>
     <tickertape.platform>unknown</tickertape.platform>
@@ -111,9 +117,7 @@
           </dependency>
         </dependencies>
         <configuration>
-          <!-- Tests run on the module path, patched into the binding's module, so the flag users need is the one
-               tested. deny turns a restricted call without native access into an error instead of a warning. -->
-          <argLine>--enable-native-access=io.github.thomas0903.tickertape --illegal-native-access=deny --add-modules jdk.management --add-reads io.github.thomas0903.tickertape=java.management,jdk.management</argLine>
+          <argLine>${tickertape.test.jvmArgs} ${tickertape.test.argLine}</argLine>
           <systemPropertyVariables>
             <tickertape.library.path>${tickertape.native.dir}/${tickertape.lib.file}</tickertape.library.path>
             <tickertape.test.nativeDir>${tickertape.native.dir}</tickertape.test.nativeDir>
@@ -127,6 +131,18 @@
           </systemPropertyVariables>
           <trimStackTrace>false</trimStackTrace>
         </configuration>
+        <executions>
+          <!-- AllocationTest again with escape analysis off: an allocation that only the JIT removes (a wrapper object
+               per call) then fails on every runner, not only where the JIT happens to compile differently. -->
+          <execution>
+            <id>allocation-without-escape-analysis</id>
+            <goals><goal>test</goal></goals>
+            <configuration>
+              <test>AllocationTest</test>
+              <argLine>-XX:-DoEscapeAnalysis ${tickertape.test.jvmArgs} ${tickertape.test.argLine}</argLine>
+            </configuration>
+          </execution>
+        </executions>
       </plugin>
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>

@@ -208,6 +208,8 @@ jobs:
           distribution: temurin
           java-version: '25.0.5'
           cache: maven
+      # '25.0.5' resolves to Temurin 25.0.5+8 on Linux and to the macOS-only respin 25.0.5.1+2 on macOS (ADR 0037).
+      - run: java -version
       - name: Maven
         run: command -v mvn || { sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends maven; }
       - name: Build libtickertape, the CLI and the C test programs

@@ -23,17 +23,25 @@ import java.util.function.Function;
  * keeps what it reads from alive (its reader or batch), so it never reads freed memory because its owner was
  * garbage collected.
  *
+ * <p>Because the view object is reused, a reference kept past its validity becomes valid again: a saved reader view
+ * shows the new record after the next successful read, and a saved batch view is re-pointed by a later
+ * {@link ReadBatch#get(int)} of its index after a refill.
+ *
  * <p>The payload is not copied when the view is made: for a mapped reader it lies in the journal's memory mapping,
  * for the safe reader in the reader's own buffer, for a batch in the batch's buffer. A reader's views read it through a
- * segment in the reader's shared arena, which {@link Reader#close()} closes before it frees the reader: closing waits
- * for an access in progress on any thread, and every later access throws {@link IllegalStateException}. So closing a
- * reader from another thread while a view is being read is safe. {@link #withPayload} hands out a {@link MemorySegment}
- * whose scope closes when the action returns, so a segment can never outlive the record.
+ * segment in the reader's shared arena, which {@link Reader#close()} closes before it frees the reader: an access in
+ * progress when the reader is closed either finishes or throws {@link IllegalStateException}, every later access
+ * throws, and none reads freed memory. Accessors that touch no payload memory (the metadata, {@link #payloadLength()},
+ * copying an empty payload, {@link #isValid()}) see the close through the view's generation, which {@code close}
+ * advances first. So closing a reader from another thread while a view is being read is safe. {@link #withPayload}
+ * hands out a {@link MemorySegment} whose scope closes when the action returns, so a segment can never outlive the
+ * record.
  *
  * <p>What the checks cannot catch: another thread <em>advancing</em> the reader (a read or {@code seek}) while this
- * thread reads its view breaks the rule that a reader is used by one thread at a time; the view may then read bytes of
- * another record, or memory the reader has released (with the mapped reader, possibly an unmapped page: a crash). Use
- * a reader and its views on one thread at a time (see {@link Reader}).
+ * thread reads its view breaks the rule that a reader is used by one thread at a time, with either reader; the view may
+ * then read bytes of another record, or memory the reader has released (the safe reader may reuse its native buffer;
+ * with the mapped reader, possibly an unmapped page: a crash). Use a reader and its views on one thread at a time (see
+ * {@link Reader}).
  *
  * <p>Typed reads take the layout to use, as {@link MemorySegment#get(ValueLayout.OfInt, long)} does. Payloads have no
  * alignment guarantee, so use the unaligned layouts ({@link ValueLayout#JAVA_INT_UNALIGNED} and so on, in native byte
@@ -63,6 +71,8 @@ public final class RecordView {
     /** The payload's offset in {@link #memory}. */
     private long base;
     private long length;
+    /** The last direct (or read-only) buffer {@link #copyPayloadTo(ByteBuffer)} copied into, with its segment. */
+    private BufferSegment lastBuffer;
 
     private RecordView(Object owner, Reader reader, Generation generation, MemorySegment memory) {
         this.owner = owner;
@@ -89,11 +99,15 @@ public final class RecordView {
         this.localTsNs = localTsNs;
         this.base = length == 0 ? 0 : address - memory.address();
         this.length = length;
-        this.generation = ownerGeneration.value;
+        this.generation = ownerGeneration.get();
     }
 
+    /**
+     * Throws unless the view is valid. The owner's generation is read with an acquire load, so a close or a read on
+     * another thread is seen by the next accessor, also in a compiled loop that reads nothing else.
+     */
     private void check() {
-        if (generation != ownerGeneration.value) {
+        if (generation != ownerGeneration.get()) {
             throw new IllegalStateException("this record view is no longer valid: the " + (reader != null ? "reader" : "batch")
                     + " it came from has moved on or was closed; copy what you need before the next call");
         }
@@ -105,11 +119,12 @@ public final class RecordView {
     }
 
     /**
-     * Whether the view is still valid (see the class documentation). A close from another thread is seen here at the
-     * latest when it has finished; an access after that throws in any case.
+     * Whether the view is still valid (see the class documentation). On any thread, this returns false once
+     * {@link Reader#close()} has started invalidating the reader's view (before {@code close} returns), and every
+     * accessor throws from then on.
      */
     public boolean isValid() {
-        return generation == ownerGeneration.value && memory.scope().isAlive();
+        return generation == ownerGeneration.get() && memory.scope().isAlive();
     }
 
     /** The record's sequence number: its position in the journal, from 0, without gaps. */
@@ -273,7 +288,9 @@ public final class RecordView {
     }
 
     /**
-     * Copies the whole payload into {@code dst} at its position and advances the position.
+     * Copies the whole payload into {@code dst} at its position and advances the position. For a direct buffer the
+     * view remembers a segment over the last buffer it copied into (and so keeps that buffer reachable), so repeated
+     * copies into one buffer allocate nothing; the first copy into another direct buffer allocates a small wrapper.
      *
      * @throws BufferOverflowException if fewer than {@link #payloadLength()} bytes remain in {@code dst}
      */
@@ -291,7 +308,9 @@ public final class RecordView {
             if (dst.hasArray()) {
                 MemorySegment.copy(memory, BYTE, src, dst.array(), dst.arrayOffset() + pos, n);
             } else {
-                MemorySegment.copy(memory, src, MemorySegment.ofBuffer(dst), 0, n);
+                BufferSegment target = BufferSegment.of(lastBuffer, dst);
+                lastBuffer = target;
+                MemorySegment.copy(memory, src, target.segment, pos, n);
             }
         } catch (IllegalStateException e) {
             if (!memory.scope().isAlive()) {
@@ -329,23 +348,29 @@ public final class RecordView {
      * segment's scope is closed when the action returns, so using it afterwards throws {@link IllegalStateException};
      * it is confined to the calling thread. For a reader's view, the reader refuses every other call while the action
      * runs (it would move the payload), so the action must not use the reader, and a {@link Reader#close()} from
-     * another thread waits for the action to return. Creates a small scope object per call; the typed accessors above
-     * allocate nothing.
+     * another thread waits for the action to return. For a batch's view, reading into that batch while the action runs
+     * throws {@link IllegalStateException} (it would change the payload). Creates a small scope object per call; the
+     * typed accessors above allocate nothing.
      */
     public <R> R withPayload(Function<? super MemorySegment, ? extends R> action) {
         Objects.requireNonNull(action, "action");
         check();
+        ReadBatch batch = reader == null ? (ReadBatch) owner : null;
         if (reader != null) {
             reader.enterForView();
+        } else {
+            batch.enterPayloadAction();
         }
         try (Arena arena = Arena.ofConfined()) {
-            check(); // the reader cannot move or close from here until the action returns
+            check(); // the reader or batch cannot move or close from here until the action returns
             MemorySegment payload = MemorySegment.ofAddress(memory.address() + base).reinterpret(length, arena, null)
                     .asReadOnly();
             return action.apply(payload);
         } finally {
             if (reader != null) {
                 reader.exitForView();
+            } else {
+                batch.exitPayloadAction();
             }
             Reference.reachabilityFence(this);
         }

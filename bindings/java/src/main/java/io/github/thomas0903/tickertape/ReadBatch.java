@@ -17,7 +17,9 @@ import java.util.function.Consumer;
  * {@code index}: one view object per index, so views of different records never alias ({@code get(0)} and
  * {@code get(1)} can be used side by side), created on the first {@code get} of that index and reused for that index
  * by every later read, so a warm batch allocates nothing. Every view is valid until the next read into this batch;
- * after that it throws {@link IllegalStateException} until {@code get} positions it again. The payloads are in the
+ * after that it throws {@link IllegalStateException} until {@code get} positions it again (a view kept from before a
+ * refill is re-pointed by a later {@code get} of its index). While one of its views is inside
+ * {@link RecordView#withPayload}, reading into the batch throws {@link IllegalStateException}. The payloads are in the
  * batch's own memory, so they never point into the journal and stay readable after the reader is closed; a view keeps
  * its batch, and so that memory, reachable. Not thread-safe.
  */
@@ -42,6 +44,8 @@ public final class ReadBatch {
     /** The view of each index, created on first use. */
     private final RecordView[] views;
     private int size;
+    /** The number of this batch's views inside {@link RecordView#withPayload} (nested actions count each). */
+    private int payloadActions;
 
     /**
      * A batch for up to {@code maxRecords} records and {@code bufferBytes} bytes of payload. A record whose payload is
@@ -73,10 +77,28 @@ public final class ReadBatch {
         return size;
     }
 
-    /** Starts a read into this batch: invalidates its views and empties it. */
+    /**
+     * Starts a read into this batch: invalidates its views and empties it. Refuses while one of its views is inside
+     * {@link RecordView#withPayload}, whose segment shows the batch's buffer: refilling would change the payload under
+     * the action. Called before the reader reads anything, so a refused read consumes nothing.
+     */
     void begin() {
-        generation.value++;
+        if (payloadActions != 0) {
+            throw new IllegalStateException("cannot read into this batch while one of its views is inside withPayload"
+                    + " (the action's segment shows the batch's buffer); read into another batch, or after the action");
+        }
+        generation.advance();
         size = 0;
+    }
+
+    /** A view of this batch enters {@link RecordView#withPayload}. */
+    void enterPayloadAction() {
+        payloadActions++;
+    }
+
+    /** A view of this batch leaves {@link RecordView#withPayload}. */
+    void exitPayloadAction() {
+        payloadActions--;
     }
 
     void filled(int count) {

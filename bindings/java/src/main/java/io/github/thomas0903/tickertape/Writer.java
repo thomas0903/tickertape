@@ -41,13 +41,13 @@ import java.util.Optional;
  */
 @SuppressWarnings("restricted") // calls restricted java.lang.foreign methods; needs native access
 public final class Writer implements AutoCloseable {
-    /** The upcall target, {@link #fill(FillContext, MemorySegment, MemorySegment, long)}, bound per writer. */
+    /** The upcall target, {@link #fill(FillContext, long, long, long)}, bound per writer. */
     private static final MethodHandle FILL;
 
     static {
         try {
             FILL = MethodHandles.lookup().findStatic(Writer.class, "fill", MethodType.methodType(int.class,
-                    FillContext.class, MemorySegment.class, MemorySegment.class, long.class));
+                    FillContext.class, long.class, long.class, long.class));
         } catch (ReflectiveOperationException e) {
             throw new ExceptionInInitializerError(e);
         }
@@ -73,13 +73,13 @@ public final class Writer implements AutoCloseable {
         Throwable error;
         final PayloadBuffer buffer = new PayloadBuffer();
 
-        int run(MemorySegment buf, long len) {
+        int run(long buf, long len) {
             PayloadFiller f = filler;
             if (f == null) {
                 return 1;
             }
             try {
-                buffer.begin(buf.address(), len);
+                buffer.begin(buf, len);
                 f.fill(buffer);
                 return 0;
             } catch (Throwable t) {
@@ -316,7 +316,7 @@ public final class Writer implements AutoCloseable {
      * {@link Throwable}, and so does recording what was caught.
      */
     @SuppressWarnings("unused") // called from native code through FILL
-    private static int fill(FillContext context, MemorySegment userData, MemorySegment buf, long len) {
+    private static int fill(FillContext context, long userData, long buf, long len) {
         try {
             return context.run(buf, len);
         } catch (Throwable t) {
@@ -357,7 +357,9 @@ public final class Writer implements AutoCloseable {
                 return seqOut.get(JAVA_LONG, 0);
             }
             TickertapeException cause = Errors.capture(status);
-            throw new BatchAppendException(cause, countOut.get(JAVA_LONG, 0), seqOut.get(JAVA_LONG, 0));
+            // At most count records were appended (the C ABI's contract), so the count fits in an int.
+            throw new BatchAppendException(cause, (int) Math.min(countOut.get(JAVA_LONG, 0), count),
+                    seqOut.get(JAVA_LONG, 0));
         } finally {
             handle.exit();
             Reference.reachabilityFence(payloads);
@@ -423,9 +425,12 @@ public final class Writer implements AutoCloseable {
     /**
      * Closes the writer and releases the journal's lock. Does <b>not</b> checkpoint: appended records stay visible and
      * survive, but only those covered by a successful {@link #checkpoint()} are durable. Idempotent, and callable from
-     * any thread. If another thread is inside a call on this writer, waits for that call to finish; if another thread
-     * is closing it, waits until the journal is released. So when this returns, on any thread, the journal can be
-     * opened again. Frees the upcall stub of {@link #appendWith} too.
+     * any thread. From the moment it starts, the writer refuses every new call and {@link #isClosed()} is true. If
+     * another thread is inside a call on this writer, waits for that call to finish, without spinning (an interrupt does
+     * not end the wait, and the thread's interrupt status is kept); if another thread is closing it, waits until the
+     * journal is released. So when this returns, on any thread, the journal can be opened again. Frees the upcall stub
+     * of {@link #appendWith} too, which lives in a shared arena: closing a writer that used {@code appendWith} costs a
+     * handshake with every thread of the JVM, as closing a reader does.
      *
      * @throws InternalErrorException if the library reported an internal error while closing (the handle is freed
      *     all the same)
@@ -433,9 +438,13 @@ public final class Writer implements AutoCloseable {
      */
     @Override
     public void close() {
-        int status = handle.close();
-        if (status < 0) {
-            throw Errors.capture(status);
+        try {
+            TickertapeException error = handle.close();
+            if (error != null) {
+                throw error;
+            }
+        } finally {
+            Reference.reachabilityFence(this); // see NativeHandle: the Cleaner must not claim the clean-up meanwhile
         }
     }
 

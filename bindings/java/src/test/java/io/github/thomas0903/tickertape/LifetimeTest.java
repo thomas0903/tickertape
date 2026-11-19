@@ -120,6 +120,32 @@ class LifetimeTest {
     }
 
     @Test
+    void aBatchCannotBeRefilledWhileOneOfItsViewsIsInsideWithPayload() throws Exception {
+        Path dir = journal(5);
+        try (Reader r = Reader.open(dir)) {
+            ReadBatch batch = new ReadBatch(2, 64);
+            ReadBatch other = new ReadBatch(2, 64);
+            assertEquals(2, r.tryReadBatch(batch));
+            RecordView v = batch.get(0);
+            byte[] seen = v.withPayload(segment -> {
+                byte before = segment.get(ValueLayout.JAVA_BYTE, 0);
+                IllegalStateException e = assertThrows(IllegalStateException.class, () -> r.tryReadBatch(batch));
+                assertTrue(e.getMessage().contains("withPayload"), e.getMessage());
+                assertThrows(IllegalStateException.class,
+                        () -> r.readBatch(batch, 0, java.util.concurrent.TimeUnit.MILLISECONDS));
+                assertEquals(2, r.position(), "a refused read consumes nothing");
+                assertEquals(2, r.tryReadBatch(other), "another batch can be read meanwhile");
+                assertEquals(2, other.get(0).seq());
+                return new byte[] {before, segment.get(ValueLayout.JAVA_BYTE, 0)};
+            });
+            assertArrayEquals(new byte[] {0, 0}, seen, "the payload did not change inside its action");
+            assertEquals(0, v.seq(), "the batch was not refilled");
+            assertEquals(1, r.tryReadBatch(batch), "after the action the batch can be refilled");
+            assertEquals(4, batch.get(0).seq());
+        }
+    }
+
+    @Test
     void batchViewsOfDifferentRecordsDoNotAlias() throws Exception {
         Path dir = journal(5);
         try (Reader r = Reader.open(dir)) {

@@ -19,8 +19,8 @@ import java.util.Set;
  *
  * <p>C types map as follows on the supported (LP64) platforms: {@code uint32_t}, {@code int32_t} and
  * {@code tickertape_status} to {@code JAVA_INT}; {@code uint64_t}, {@code int64_t} and {@code size_t} to
- * {@code JAVA_LONG}; every pointer to {@code ADDRESS}. {@code NativeLibrary} refuses a platform where pointers or
- * {@code size_t} are not 8 bytes.
+ * {@code JAVA_LONG}; every pointer to {@code ADDRESS}, except the pointers the fill callback receives (see
+ * {@link #FILL_FN}). {@code NativeLibrary} refuses a platform where pointers or {@code size_t} are not 8 bytes.
  */
 final class Signatures {
     private Signatures() {}
@@ -91,8 +91,18 @@ final class Signatures {
             "tickertape_verify_report", VERIFY_REPORT,
             "tickertape_retention_report", RETENTION_REPORT);
 
-    /** {@code tickertape_fill_fn}: {@code int32_t (*)(void *user_data, uint8_t *buf, size_t len)}. */
-    static final FunctionDescriptor FILL_FN = FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, SIZE_T);
+    /**
+     * A pointer received as a 64-bit integer: on the supported (LP64) platforms both are passed in the same integer
+     * register, and an upcall receives a {@code long} without creating a {@link java.lang.foreign.MemorySegment} per
+     * call (the JIT removes that object only by escape analysis, which is not guaranteed).
+     */
+    static final ValueLayout.OfLong POINTER_AS_LONG = JAVA_LONG.withName("pointer");
+
+    /**
+     * {@code tickertape_fill_fn}: {@code int32_t (*)(void *user_data, uint8_t *buf, size_t len)}, with both pointers
+     * received as {@link #POINTER_AS_LONG}, so that a zero-copy append allocates nothing.
+     */
+    static final FunctionDescriptor FILL_FN = FunctionDescriptor.of(JAVA_INT, POINTER_AS_LONG, POINTER_AS_LONG, SIZE_T);
 
     /**
      * The C functions this binding calls, with their descriptors. Every function in the header is either here or in

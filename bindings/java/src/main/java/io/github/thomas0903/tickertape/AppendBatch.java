@@ -36,6 +36,8 @@ public final class AppendBatch {
 
     private MemorySegment records;
     private MemorySegment payloads;
+    /** {@link #payloads} as a buffer, for copies from a direct buffer; null if it is too large for a ByteBuffer. */
+    private ByteBuffer payloadsBuffer;
     private long[] offsets;
     private int count;
     private long used;
@@ -52,6 +54,7 @@ public final class AppendBatch {
         }
         this.records = Memory.allocate(records * RECORD_SIZE);
         this.payloads = Memory.allocate(payloadBytes);
+        this.payloadsBuffer = asBuffer(payloads);
         this.offsets = new long[records];
     }
 
@@ -76,7 +79,10 @@ public final class AppendBatch {
         return add(schemaId, venueTsNs, localTsNs, payload, 0, payload.length);
     }
 
-    /** Adds a record whose payload is {@code length} bytes of {@code payload} from {@code offset}. */
+    /**
+     * Adds a record whose payload is {@code length} bytes of {@code payload} from {@code offset}. If copying the
+     * payload throws, the batch is unchanged (so are the other {@code add} methods).
+     */
     public AppendBatch add(int schemaId, long venueTsNs, long localTsNs, byte[] payload, int offset, int length) {
         Objects.checkFromIndexSize(offset, length, payload.length);
         long at = reserve(length);
@@ -84,7 +90,10 @@ public final class AppendBatch {
         return entry(schemaId, venueTsNs, localTsNs, at, length);
     }
 
-    /** Adds a record whose payload is all of {@code payload} (heap or native). */
+    /**
+     * Adds a record whose payload is all of {@code payload} (heap or native). A segment that cannot be read here (its
+     * arena is closed, or it is confined to another thread) throws and leaves the batch unchanged.
+     */
     public AppendBatch add(int schemaId, long venueTsNs, long localTsNs, MemorySegment payload) {
         long length = payload.byteSize();
         long at = reserve(length);
@@ -92,18 +101,32 @@ public final class AppendBatch {
         return entry(schemaId, venueTsNs, localTsNs, at, length);
     }
 
-    /** Adds a record whose payload is the bytes between {@code payload}'s position and limit; the buffer is not changed. */
+    /**
+     * Adds a record whose payload is the bytes between {@code payload}'s position and limit; the buffer is not changed.
+     * A buffer that cannot be read (a direct buffer over a closed arena) throws and leaves the batch unchanged.
+     */
     public AppendBatch add(int schemaId, long venueTsNs, long localTsNs, ByteBuffer payload) {
         int length = payload.remaining();
         long at = reserve(length);
         if (payload.hasArray()) {
             MemorySegment.copy(payload.array(), payload.arrayOffset() + payload.position(), payloads, BYTE, at, length);
+        } else if (payloadsBuffer != null) {
+            payloadsBuffer.put((int) at, payload, payload.position(), length); // no wrapper object per call
         } else {
             MemorySegment.copy(MemorySegment.ofBuffer(payload), 0, payloads, at, length);
         }
         return entry(schemaId, venueTsNs, localTsNs, at, length);
     }
 
+    private static ByteBuffer asBuffer(MemorySegment segment) {
+        return segment.byteSize() <= Integer.MAX_VALUE - 8 ? segment.asByteBuffer() : null;
+    }
+
+    /**
+     * Makes room for one more record of {@code length} payload bytes and returns where its payload goes. Changes
+     * nothing that {@link #size()} or {@link #payloadBytes()} report: {@link #entry} commits the record once its
+     * payload is copied, so a copy that throws leaves the batch as it was (with room to spare).
+     */
     private long reserve(long length) {
         if (count == offsets.length) {
             int n = Math.multiplyExact(offsets.length, 2);
@@ -118,12 +141,12 @@ public final class AppendBatch {
             MemorySegment bigger = Memory.allocate(size);
             MemorySegment.copy(payloads, 0, bigger, 0, used);
             payloads = bigger;
+            payloadsBuffer = asBuffer(bigger);
         }
-        long at = used;
-        used = need;
-        return at;
+        return used;
     }
 
+    /** Commits the record whose payload {@link #reserve} placed at {@code at} and the caller has copied there. */
     private AppendBatch entry(int schemaId, long venueTsNs, long localTsNs, long at, long length) {
         long base = count * RECORD_SIZE;
         records.set(JAVA_LONG, base + OFF_LEN, length);
@@ -132,6 +155,7 @@ public final class AppendBatch {
         records.set(JAVA_INT, base + OFF_SCHEMA, schemaId);
         records.set(JAVA_INT, base + OFF_RESERVED, 0);
         offsets[count++] = at;
+        used = at + length;
         return this;
     }
 

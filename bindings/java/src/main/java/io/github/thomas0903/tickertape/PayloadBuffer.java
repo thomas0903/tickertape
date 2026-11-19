@@ -19,7 +19,8 @@ import java.util.Objects;
  * <p>The bytes start zeroed, and no reader can see them until the filler returns normally and the record is committed.
  * Offsets are checked against {@link #length()}. Typed writes take the layout to use, as
  * {@link MemorySegment#set(ValueLayout.OfInt, long, int)} does; payloads have no alignment guarantee, so use the
- * unaligned layouts ({@link ValueLayout#JAVA_LONG_UNALIGNED} and so on).
+ * unaligned layouts ({@link ValueLayout#JAVA_LONG_UNALIGNED} and so on). Every write returns this buffer, so writes
+ * can be chained: {@code p.set(JAVA_LONG_UNALIGNED, 0, price).set(JAVA_INT_UNALIGNED, 8, size)}.
  */
 @SuppressWarnings("restricted") // calls restricted java.lang.foreign methods; needs native access
 public final class PayloadBuffer {
@@ -32,6 +33,8 @@ public final class PayloadBuffer {
      */
     private Thread thread;
     private Arena arena;
+    /** The last direct (or read-only) buffer {@link #put(long, ByteBuffer)} copied from, with its segment. */
+    private BufferSegment lastBuffer;
 
     PayloadBuffer() {}
 
@@ -75,72 +78,87 @@ public final class PayloadBuffer {
         return length;
     }
 
-    /** Writes one byte at {@code offset}. */
-    public void setByte(long offset, byte value) {
+    /** Writes one byte at {@code offset}; returns this buffer. */
+    public PayloadBuffer setByte(long offset, byte value) {
         ALL.set(BYTE, at(offset, 1), value);
+        return this;
     }
 
-    /** Writes {@code value} at {@code offset} with {@code layout}. */
-    public void set(ValueLayout.OfByte layout, long offset, byte value) {
+    /** Writes {@code value} at {@code offset} with {@code layout}; returns this buffer. */
+    public PayloadBuffer set(ValueLayout.OfByte layout, long offset, byte value) {
         ALL.set(layout, at(offset, layout.byteSize()), value);
+        return this;
     }
 
-    /** Writes {@code value} at {@code offset} with {@code layout}. */
-    public void set(ValueLayout.OfShort layout, long offset, short value) {
+    /** Writes {@code value} at {@code offset} with {@code layout}; returns this buffer. */
+    public PayloadBuffer set(ValueLayout.OfShort layout, long offset, short value) {
         ALL.set(layout, at(offset, layout.byteSize()), value);
+        return this;
     }
 
-    /** Writes {@code value} at {@code offset} with {@code layout}. */
-    public void set(ValueLayout.OfChar layout, long offset, char value) {
+    /** Writes {@code value} at {@code offset} with {@code layout}; returns this buffer. */
+    public PayloadBuffer set(ValueLayout.OfChar layout, long offset, char value) {
         ALL.set(layout, at(offset, layout.byteSize()), value);
+        return this;
     }
 
-    /** Writes {@code value} at {@code offset} with {@code layout}. */
-    public void set(ValueLayout.OfInt layout, long offset, int value) {
+    /** Writes {@code value} at {@code offset} with {@code layout}; returns this buffer. */
+    public PayloadBuffer set(ValueLayout.OfInt layout, long offset, int value) {
         ALL.set(layout, at(offset, layout.byteSize()), value);
+        return this;
     }
 
-    /** Writes {@code value} at {@code offset} with {@code layout}. */
-    public void set(ValueLayout.OfLong layout, long offset, long value) {
+    /** Writes {@code value} at {@code offset} with {@code layout}; returns this buffer. */
+    public PayloadBuffer set(ValueLayout.OfLong layout, long offset, long value) {
         ALL.set(layout, at(offset, layout.byteSize()), value);
+        return this;
     }
 
-    /** Writes {@code value} at {@code offset} with {@code layout}. */
-    public void set(ValueLayout.OfFloat layout, long offset, float value) {
+    /** Writes {@code value} at {@code offset} with {@code layout}; returns this buffer. */
+    public PayloadBuffer set(ValueLayout.OfFloat layout, long offset, float value) {
         ALL.set(layout, at(offset, layout.byteSize()), value);
+        return this;
     }
 
-    /** Writes {@code value} at {@code offset} with {@code layout}. */
-    public void set(ValueLayout.OfDouble layout, long offset, double value) {
+    /** Writes {@code value} at {@code offset} with {@code layout}; returns this buffer. */
+    public PayloadBuffer set(ValueLayout.OfDouble layout, long offset, double value) {
         ALL.set(layout, at(offset, layout.byteSize()), value);
+        return this;
     }
 
-    /** Copies all of {@code src} to {@code offset}. */
+    /** Copies all of {@code src} to {@code offset}; returns this buffer. */
     public PayloadBuffer put(long offset, byte[] src) {
         return put(offset, src, 0, src.length);
     }
 
-    /** Copies {@code len} bytes of {@code src} from {@code srcOffset} to {@code offset}. */
+    /** Copies {@code len} bytes of {@code src} from {@code srcOffset} to {@code offset}; returns this buffer. */
     public PayloadBuffer put(long offset, byte[] src, int srcOffset, int len) {
         Objects.checkFromIndexSize(srcOffset, len, src.length);
         MemorySegment.copy(src, srcOffset, ALL, BYTE, at(offset, len), len);
         return this;
     }
 
-    /** Copies all of {@code src} to {@code offset}. */
+    /** Copies all of {@code src} to {@code offset}; returns this buffer. */
     public PayloadBuffer put(long offset, MemorySegment src) {
         MemorySegment.copy(src, 0, ALL, at(offset, src.byteSize()), src.byteSize());
         return this;
     }
 
-    /** Copies the bytes between {@code src}'s position and limit to {@code offset}; {@code src} is not changed. */
+    /**
+     * Copies the bytes between {@code src}'s position and limit to {@code offset}; {@code src} is not changed. Returns
+     * this buffer. For a direct buffer, the writer remembers a segment over the last such buffer (and so keeps it
+     * reachable), so repeated copies from one buffer allocate nothing; the first copy from another allocates a small
+     * wrapper.
+     */
     public PayloadBuffer put(long offset, ByteBuffer src) {
         int n = src.remaining();
         long dst = at(offset, n);
         if (src.hasArray()) {
             MemorySegment.copy(src.array(), src.arrayOffset() + src.position(), ALL, BYTE, dst, n);
         } else {
-            MemorySegment.copy(MemorySegment.ofBuffer(src), 0, ALL, dst, n);
+            BufferSegment source = BufferSegment.of(lastBuffer, src);
+            lastBuffer = source;
+            MemorySegment.copy(source.segment, src.position(), ALL, dst, n);
         }
         return this;
     }

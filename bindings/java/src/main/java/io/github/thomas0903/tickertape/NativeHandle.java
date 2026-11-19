@@ -13,25 +13,36 @@ import java.util.function.ToIntFunction;
  *
  * <p>The C ABI makes use after close, double close and concurrent calls on one handle undefined behaviour; in Java
  * they must be exceptions. Every call therefore enters the guard with one compare-and-set ({@code IDLE -> BUSY}) and
- * leaves it with a release store; a call that finds the handle busy (another thread is inside a call, or a fill
- * callback calls back into its writer), closing or closed throws {@link IllegalStateException} without touching the
- * library. {@link #close} waits for a call in progress to finish (a waiting read gives up within one wait slice when it
- * sees the close request), moves the handle to {@code CLOSING}, frees it exactly once, and only then to
- * {@code CLOSED}; a concurrent {@link #close} waits for that, so every close returns after the C handle is freed.
+ * leaves it with another ({@code BUSY -> IDLE}); a call that finds the handle busy (another thread is inside a call, or
+ * a fill callback calls back into its writer), closing or closed throws {@link IllegalStateException} without touching
+ * the library.
+ *
+ * <p>{@link #close} on an idle handle moves it to {@code CLOSING}, frees it exactly once, and only then moves it to
+ * {@code CLOSED}. On a busy handle it moves it to {@code CLOSE_PENDING} and waits: from then on every new call is
+ * refused (so a thread calling in a loop cannot starve the close, and nothing is consumed after the close began), a
+ * waiting read gives up within one wait slice, and the call in progress, when it leaves, hands the handle straight to
+ * the closer ({@code CLOSE_PENDING -> CLOSING}) with no moment at which another call could enter. A concurrent second
+ * {@link #close} waits for {@code CLOSED}, so every close returns after the C handle is freed. Waiting blocks on this
+ * object's monitor (no spinning, and an interrupt does not end the wait: the interrupt status is kept for the caller).
  *
  * <p>Freeing runs in this order: the arena whose memory the owner hands out without a call (a reader's views) is
- * closed first, which ends every access to it on every thread (the shared arena's handshake); then the C close; then
- * the arena that holds memory the library calls into (a writer's upcall stub), which no call can use any more.
+ * closed first, which ends every access to it on every thread (the shared arena's handshake); then the C close, whose
+ * error, if any, is captured right away on the same thread; then the arena that holds memory the library calls into (a
+ * writer's upcall stub), which no call can use any more.
  *
  * <p>A {@link Cleaner} frees a handle whose owner became unreachable without being closed. It is a safety net only:
  * close handles deterministically. Owners call {@link java.lang.ref.Reference#reachabilityFence} at the end of each
- * call, so an owner cannot become unreachable while one of its calls is still in the library.
+ * call, {@code close} included, so an owner cannot become unreachable while one of its calls is still running: an
+ * explicit close therefore always runs the clean-up itself, on its own thread, and never finds it claimed by the
+ * Cleaner (whose {@code clean()} would then return at once, before the handle is freed).
  */
 final class NativeHandle {
     private static final int IDLE = 0;
     private static final int BUSY = 1;
-    private static final int CLOSING = 2;
-    private static final int CLOSED = 3;
+    /** A call is in progress and a close waits for it: calls are refused, and the call's exit hands over. */
+    private static final int CLOSE_PENDING = 2;
+    private static final int CLOSING = 3;
+    private static final int CLOSED = 4;
 
     private static final VarHandle STATE;
 
@@ -51,9 +62,11 @@ final class NativeHandle {
     private final Closer closer;
     private final Cleaner.Cleanable cleanable;
 
-    @SuppressWarnings("unused") // accessed through STATE
+    /**
+     * The state; changes to {@code CLOSING} after {@code CLOSE_PENDING}, and to {@code CLOSED}, happen while holding
+     * this object's monitor, which closers wait on.
+     */
     private volatile int state;
-    private volatile boolean closeRequested;
     /** The thread inside a call (plain field: only read to recognise a call from inside a callback). */
     private Thread caller;
 
@@ -63,7 +76,8 @@ final class NativeHandle {
         private final ToIntFunction<MemorySegment> close;
         private final Arena beforeFree;
         private volatile Arena afterFree;
-        int status;
+        /** The C close's error, captured on the thread that ran it, right after the call; null if it succeeded. */
+        volatile TickertapeException error;
 
         Closer(MemorySegment ptr, ToIntFunction<MemorySegment> close, Arena beforeFree) {
             this.ptr = ptr;
@@ -76,7 +90,10 @@ final class NativeHandle {
             if (beforeFree != null) {
                 closeArena(beforeFree);
             }
-            status = close.applyAsInt(ptr);
+            int status = close.applyAsInt(ptr);
+            if (status < 0) {
+                error = Errors.capture(status); // the details are per OS thread: read them before anything else
+            }
             Arena after = afterFree;
             if (after != null) {
                 closeArena(after);
@@ -87,22 +104,31 @@ final class NativeHandle {
     /**
      * Closes a shared arena. Closing waits (a thread-local handshake) for every access in progress on any thread, and
      * an access that starts later throws {@link IllegalStateException}. It refuses only while a segment of the arena
-     * is passed to a downcall, which the binding never does with these arenas; retrying covers that case anyway.
+     * is passed to a downcall, which the binding never does with these arenas; retrying covers that case anyway,
+     * without spinning on an interrupted thread (whose interrupt status is kept).
      */
     private static void closeArena(Arena arena) {
-        for (int spins = 0;; spins++) {
-            try {
-                arena.close();
-                return;
-            } catch (IllegalStateException e) {
-                if (!arena.scope().isAlive()) {
+        boolean interrupted = false;
+        try {
+            for (int spins = 0;; spins++) {
+                try {
+                    arena.close();
                     return;
+                } catch (IllegalStateException e) {
+                    if (!arena.scope().isAlive()) {
+                        return;
+                    }
+                    if (spins < 100) {
+                        Thread.onSpinWait();
+                    } else {
+                        interrupted |= Thread.interrupted(); // parkNanos returns at once while interrupted
+                        LockSupport.parkNanos(50_000);
+                    }
                 }
-                if (spins < 100) {
-                    Thread.onSpinWait();
-                } else {
-                    LockSupport.parkNanos(50_000);
-                }
+            }
+        } finally {
+            if (interrupted) {
+                Thread.currentThread().interrupt();
             }
         }
     }
@@ -134,15 +160,23 @@ final class NativeHandle {
         caller = Thread.currentThread();
     }
 
-    /** Leaves a call entered with {@link #enter()}. */
+    /**
+     * Leaves a call entered with {@link #enter()}. If a close is waiting, hands the handle to it: the state goes from
+     * {@code CLOSE_PENDING} straight to {@code CLOSING}, so no call can enter in between.
+     */
     void exit() {
         caller = null;
-        STATE.setRelease(this, IDLE);
+        if (!STATE.compareAndSet(this, BUSY, IDLE)) {
+            synchronized (this) { // CLOSE_PENDING: only a closer changes the state of a busy handle
+                state = CLOSING;
+                notifyAll();
+            }
+        }
     }
 
     private IllegalStateException notIdle() {
-        int s = (int) STATE.getVolatile(this);
-        if (s >= CLOSING) {
+        int s = state;
+        if (s >= CLOSE_PENDING) {
             return new IllegalStateException("the " + kind + " is closed");
         }
         if (caller == Thread.currentThread()) {
@@ -153,62 +187,96 @@ final class NativeHandle {
                 + " may be used by one thread at a time");
     }
 
-    /** True once {@link #close} has been requested from another thread while a call was in progress. */
+    /** True once {@link #close} waits for the call in progress (called from inside that call). */
     boolean closeRequested() {
-        return closeRequested;
+        return state == CLOSE_PENDING;
     }
 
     /** True once {@link #close} has started (the handle refuses calls from then on). */
     boolean isClosed() {
-        return (int) STATE.getVolatile(this) >= CLOSING;
+        return state >= CLOSE_PENDING;
     }
 
     /** As {@link #close(Runnable)} with nothing to run. */
-    int close() {
+    TickertapeException close() {
         return close(null);
     }
 
     /**
-     * Closes the handle: returns 0 if this call freed it or it was already closed, or the negative status the C close
-     * returned (the handle is freed in that case too). Waits for a call in progress on another thread to finish, and
-     * for a close in progress on another thread to free the handle. {@code whileClosing}, if not null, runs once,
-     * after the handle refuses calls and before anything is freed.
+     * Closes the handle: returns null if this call freed it without error or it was already closed, or the error the
+     * C close reported (the handle is freed in that case too), captured on the thread that called the C close. Waits
+     * for a call in progress on another thread to finish, and for a close in progress on another thread to free the
+     * handle. {@code whileClosing}, if not null, runs once, after the handle refuses calls and before anything is
+     * freed. The caller must keep the owner reachable until this returns.
      */
-    int close(Runnable whileClosing) {
-        int spins = 0;
-        for (;;) {
-            int s = (int) STATE.getVolatile(this);
-            if (s == CLOSED) {
-                return 0;
-            }
-            if (s == IDLE) {
-                if (STATE.compareAndSet(this, IDLE, CLOSING)) {
-                    try {
-                        if (whileClosing != null) {
-                            whileClosing.run();
-                        }
-                    } finally {
-                        cleanable.clean();
-                        STATE.setVolatile(this, CLOSED);
+    TickertapeException close(Runnable whileClosing) {
+        boolean interrupted = false;
+        try {
+            for (;;) {
+                int s = state;
+                if (s == IDLE) {
+                    if (STATE.compareAndSet(this, IDLE, CLOSING)) {
+                        return free(whileClosing);
                     }
-                    return closer.status;
+                } else if (s == BUSY || s == CLOSE_PENDING) {
+                    if (caller == Thread.currentThread()) {
+                        throw new IllegalStateException("cannot close the " + kind + " from inside a call on it"
+                                + " (a fill callback or a payload action)");
+                    }
+                    if (s == BUSY && STATE.compareAndSet(this, BUSY, CLOSE_PENDING)) {
+                        interrupted |= await(CLOSING); // the call's exit() hands the handle over
+                        return free(whileClosing);
+                    }
+                    if (s == CLOSE_PENDING) {
+                        interrupted |= await(CLOSED); // another thread's close is waiting for the call
+                        return null;
+                    }
+                } else {
+                    interrupted |= await(CLOSED);
+                    return null;
                 }
-                continue;
             }
-            if (s == BUSY) {
-                if (caller == Thread.currentThread()) {
-                    throw new IllegalStateException("cannot close the " + kind + " from inside a call on it"
-                            + " (a fill callback or a payload action)");
-                }
-                closeRequested = true;
-            }
-            if (++spins < 100) {
-                Thread.onSpinWait();
-            } else if (spins < 200) {
-                Thread.yield();
-            } else {
-                LockSupport.parkNanos(50_000);
+        } finally {
+            if (interrupted) {
+                Thread.currentThread().interrupt();
             }
         }
+    }
+
+    /** Runs the clean-up on this thread (the handle is {@code CLOSING} and owned by this thread). */
+    private TickertapeException free(Runnable whileClosing) {
+        try {
+            if (whileClosing != null) {
+                whileClosing.run();
+            }
+        } finally {
+            try {
+                cleanable.clean();
+            } finally {
+                synchronized (this) {
+                    state = CLOSED;
+                    notifyAll();
+                }
+            }
+        }
+        return closer.error;
+    }
+
+    /**
+     * Waits until the state is at least {@code target} (from {@code CLOSE_PENDING} on, it only grows). Returns whether
+     * the thread was interrupted meanwhile; the interrupt does not end the wait.
+     */
+    private boolean await(int target) {
+        boolean interrupted = false;
+        synchronized (this) {
+            while (state < target) {
+                try {
+                    wait();
+                } catch (InterruptedException e) {
+                    interrupted = true;
+                }
+            }
+        }
+        return interrupted;
     }
 }

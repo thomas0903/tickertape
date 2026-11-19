@@ -5,7 +5,13 @@ import java.util.HexFormat;
 
 /**
  * A record copied out of the journal: independent of the reader, valid for as long as you keep it. Made by
- * {@link RecordView#copy()}; the payload array belongs to this value and is not copied again by {@link #payload()}.
+ * {@link RecordView#copy()}, which gives it a new array of its own.
+ *
+ * <p><b>The payload array is shared, not copied.</b> The constructor stores the array it is given, and
+ * {@link #payload()} returns that same array (no copy on either side, so a copy costs one array). Writing into it
+ * changes this record, including {@link #equals}, which compares payloads by content, and {@link #hashCode}: do not
+ * change the payload of a {@code RecordCopy} that is in a set or used as a map key, and do not pass an array to the
+ * constructor that other code still writes. Copy it ({@code payload().clone()}) to change a payload safely.
  *
  * <p>Unsigned 64-bit and 32-bit fields of the format are returned as Java {@code long} and {@code int} with the same
  * bits (use {@link Long#toUnsignedString(long)} and {@link Integer#toUnsignedLong(int)} to print or widen them).
@@ -14,10 +20,10 @@ import java.util.HexFormat;
  * @param schemaId the caller-defined schema identifier (unsigned 32-bit)
  * @param venueTsNs the venue timestamp as given at append (unsigned 64-bit; 0 means not set)
  * @param localTsNs the local timestamp as given at append (unsigned 64-bit; 0 means not set)
- * @param payload the payload bytes
+ * @param payload the payload bytes (shared, not copied: see above)
  */
 public record RecordCopy(long seq, int schemaId, long venueTsNs, long localTsNs, byte[] payload) {
-    /** Checks that {@code payload} is not null. */
+    /** Checks that {@code payload} is not null; stores the array itself, without a copy. */
     public RecordCopy {
         java.util.Objects.requireNonNull(payload, "payload");
     }

@@ -49,9 +49,10 @@ import java.util.concurrent.TimeUnit;
  * <p><b>Threads.</b> A reader and its views are used by one thread at a time; they may be handed to another thread
  * between calls (with the usual happens-before). A call that finds the reader in use by another thread, or closed,
  * throws {@link IllegalStateException} and does nothing. {@link #close()} may be called from any thread, also while
- * another thread blocks in a read or reads the current view: it waits for a call in progress (a blocked read gives up
- * within one wait slice), ends every access to the view (which then throws {@link IllegalStateException}), and then
- * frees the reader. A blocking read pins a virtual thread to its carrier for the whole wait; follow live journals from
+ * another thread blocks in a read or reads the current view: from the moment it starts it refuses every new call, it
+ * waits for a call in progress (a blocked read gives up within one wait slice), ends every access to the view (which
+ * then throws {@link IllegalStateException}), and then frees the reader. Closing costs a handshake with every thread of
+ * the JVM (see {@link #close()}): keep readers open rather than opening short-lived ones. A blocking read pins a virtual thread to its carrier for the whole wait; follow live journals from
  * platform threads, or poll with {@link #tryNext()} and park between polls.
  */
 public final class Reader implements AutoCloseable {
@@ -183,7 +184,7 @@ public final class Reader implements AutoCloseable {
     public RecordView tryNext() {
         handle.enter();
         try {
-            generation.value++;
+            generation.advance();
             return result(Native.readerNext(handle.ptr, 0, record));
         } finally {
             handle.exit();
@@ -233,7 +234,7 @@ public final class Reader implements AutoCloseable {
         }
         handle.enter();
         try {
-            generation.value++;
+            generation.advance();
             boolean forever = timeoutNs >= FOREVER_NS;
             long deadline = forever ? 0 : System.nanoTime() + timeoutNs;
             for (;;) {
@@ -337,7 +338,7 @@ public final class Reader implements AutoCloseable {
     }
 
     private int readBatch(ReadBatch batch, long timeoutNs) {
-        generation.value++;
+        generation.advance();
         return Native.readerReadBatch(handle.ptr, timeoutNs, batch.records, batch.maxRecords(), batch.buffer,
                 batch.bufferBytes(), u64Out);
     }
@@ -369,7 +370,7 @@ public final class Reader implements AutoCloseable {
     public void seek(long seq) {
         handle.enter();
         try {
-            generation.value++;
+            generation.advance();
             Errors.check(Native.readerSeek(handle.ptr, seq));
         } finally {
             handle.exit();
@@ -404,11 +405,17 @@ public final class Reader implements AutoCloseable {
     }
 
     /**
-     * Closes the reader and frees it, invalidating its view. Idempotent, and callable from any thread: if another
-     * thread is inside a call on this reader, waits for it to finish (a blocked read ends within one wait slice,
-     * throwing {@link IllegalStateException}); if another thread is reading the view, its access in progress
-     * completes and every later one throws {@link IllegalStateException}. When this returns, on any thread, the reader
-     * is freed (a concurrent second {@code close} waits for the first).
+     * Closes the reader and frees it, invalidating its view. Idempotent, and callable from any thread. From the moment
+     * it starts, the reader refuses every new call and {@link #isClosed()} is true. If another thread is inside a call
+     * on this reader, waits for it to finish (a blocked read ends within one wait slice, throwing
+     * {@link IllegalStateException}), without spinning; an interrupt does not end that wait, and the thread's interrupt
+     * status is kept. If another thread is reading the view, its access in progress either finishes or throws
+     * {@link IllegalStateException}, every later one throws, and none reads freed memory. When this returns, on any
+     * thread, the reader is freed (a concurrent second {@code close} waits for the first).
+     *
+     * <p>Ending the accesses to the view closes a shared arena, which the JDK does with a handshake with every thread of
+     * the JVM: every running Java thread is stopped briefly, and the cost grows with the number of threads (hundreds of
+     * microseconds with hundreds of threads; see {@code docs/java-api.md} &rarr; Interruption and closing).
      *
      * @throws InternalErrorException if the library reported an internal error while closing (the reader is freed
      *     all the same)
@@ -416,9 +423,13 @@ public final class Reader implements AutoCloseable {
      */
     @Override
     public void close() {
-        int status = handle.close(() -> generation.value++);
-        if (status < 0) {
-            throw Errors.capture(status);
+        try {
+            TickertapeException error = handle.close(generation::advance);
+            if (error != null) {
+                throw error;
+            }
+        } finally {
+            Reference.reachabilityFence(this); // see NativeHandle: the Cleaner must not claim the clean-up meanwhile
         }
     }
 
