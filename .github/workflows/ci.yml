@@ -191,12 +191,24 @@ jobs:
           prefix-key: v0-rust-iceoryx2
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --all-features --locked -- -D warnings
+      - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo clippy --all-targets --no-default-features --locked -- -D warnings
+      # The upstream CLI, for the test that plays an exported file with `iox2 service replay`. With
+      # TICKERTAPE_REQUIRE_IOX2 set, that test fails instead of skipping when `iox2` is missing.
+      - run: cargo install --locked iceoryx2-cli@0.10.0
       # Cross-process tests: publishers, recorders, live readers and subscribers on local shared memory; no network.
       - run: cargo test --all-features --locked
-      # The live reader example builds without iceoryx2.
+        env:
+          TICKERTAPE_REQUIRE_IOX2: "1"
+      # The default features (typed recorder and replayer, no `dynamic`) and no features at all (layout, catalog,
+      # info and the live reader example, without iceoryx2).
+      - run: cargo test --locked
+      - run: cargo test --no-default-features --locked
       - run: cargo build --example follow --no-default-features --locked
       - run: cargo doc --all-features --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - run: cargo doc --no-default-features --no-deps --locked
         env:
           RUSTDOCFLAGS: -D warnings
 

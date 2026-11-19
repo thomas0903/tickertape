@@ -2,7 +2,8 @@ name: iceoryx2 upstream
 
 # Builds and tests the iceoryx2 integration against the newest published iceoryx2 release and against upstream
 # `main`, so that API changes are noticed early. Scheduled and manual only: it never runs on pull requests, so an
-# upstream change cannot fail them.
+# upstream change cannot fail them. Informational: a failure here is a heads-up about a coming port (see the
+# integration README's maintenance section), not a broken build; against `main` it is expected to fail today.
 on:
   schedule:
     - cron: '23 5 * * 1'
@@ -24,6 +25,8 @@ jobs:
         os: [ubuntu-latest, macos-latest]
         iceoryx2: [latest-release, main]
     runs-on: ${{ matrix.os }}
+    # Informational (see above): failures are reported in the run, but don't fail the workflow.
+    continue-on-error: true
     defaults:
       run:
         working-directory: integrations/iceoryx2
