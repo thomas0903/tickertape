@@ -67,7 +67,10 @@
 //! # Recording runs, restarts and durability
 //!
 //! Each run of the recorder is a recording run. It writes a descriptor for each service before that service's first
-//! message, and again at the start of every journal segment, so that segments left after retention or archiving can
+//! message, and again so that every segment holds the descriptors of the records in it: each new segment starts with
+//! the descriptors of all open services, after a filler record that ends the previous segment when one is needed
+//! (the rules, boundaries and the one exception, a record too large to share a segment with its descriptor, are under
+//! [where descriptors lie](crate::layout#where-descriptors-lie)). So segments left after retention or archiving can
 //! still be decoded. A recorder restarted on the same journal continues it after recovery; tickertape sequence
 //! numbers stay gap-free. If the service keeps history (`history_size > 0`), a reconnecting recorder receives that
 //! history again; such repeats are recorded as messages again, and with a counter configured they are not reported
@@ -94,14 +97,14 @@ use iceoryx2::service::static_config::message_type_details::{
 };
 use iceoryx2::service::static_config::publish_subscribe::StaticConfig as PubSubConfig;
 use serde::Serialize;
-use tickertape::{NewRecord, Writer, WriterConfig};
+use tickertape::{NewRecord, WriterConfig};
 
 use crate::Error;
 use crate::layout::{
     self, CounterField, DataRecord, Descriptor, LossKind, LossRecord, MAX_BUFFER_SIZE, SCHEMA_DATA,
-    SCHEMA_DESCRIPTOR, SCHEMA_LOSS, ServiceSettings, TypeInfo, TypeVariant, Version,
+    SCHEMA_LOSS, ServiceSettings, TypeInfo, TypeVariant, Version,
 };
-use crate::tail::SegmentMirror;
+use crate::placement::Journal;
 use crate::typed::{Create, Recordable, RecordableHeader};
 
 /// One received message, as the recorder sees it.
@@ -155,6 +158,8 @@ type VenueTs<H> = Arc<dyn Fn(&H) -> u64 + Send + Sync>;
 type OnOpen = Box<dyn FnMut(&str, u64) + Send>;
 /// Called when a service fails.
 type OnError = Box<dyn FnMut(&str, &Error) + Send>;
+/// Called once a recording run has started.
+type OnStart = Box<dyn FnOnce(u64) + Send>;
 
 /// A service whose payload type `P` (a type or a slice) and user header type `H` are known at compile time.
 ///
@@ -415,7 +420,7 @@ pub struct ServiceReport {
     pub name: String,
     /// Sequence number of this run's first descriptor of the service, if the service was opened.
     pub descriptor_seq: Option<u64>,
-    /// Descriptor records written for the service: the first, one per segment start, and one per reopening.
+    /// Descriptor records written for the service: the first, one per new segment, and one per reopening.
     pub descriptors: u64,
     /// Messages recorded.
     pub messages: u64,
@@ -450,6 +455,9 @@ pub struct RecorderReport {
     pub messages: u64,
     /// Checkpoints taken, including the final one.
     pub checkpoints: u64,
+    /// Filler records written: each ends a segment early so that the descriptors start the next one (see
+    /// [where descriptors lie](crate::layout#where-descriptors-lie)).
+    pub fillers: u64,
     /// Why it stopped.
     pub stop_reason: StopReason,
     /// Per service.
@@ -472,6 +480,7 @@ pub struct RecorderBuilder {
     max_duration: Option<Duration>,
     on_open: Option<OnOpen>,
     on_error: Option<OnError>,
+    on_start: Option<OnStart>,
 }
 
 impl core::fmt::Debug for RecorderBuilder {
@@ -553,7 +562,23 @@ impl RecorderBuilder {
         self
     }
 
-    /// Whether `SIGINT` and `SIGTERM` stop the recorder cleanly (a second one exits at once). Default: true.
+    /// Whether this run handles `SIGINT` and `SIGTERM`. Default: true.
+    ///
+    /// With true, while the run is active: the first of these signals that the run's signal thread takes sets the
+    /// stop flag, and the run stops cleanly (a final checkpoint for a recorder; the stop reason is "signal"). A
+    /// signal it takes after that ends the process at once with exit status 130 (`SIGINT`) or 143 (`SIGTERM`), with
+    /// no final checkpoint. Signals of one kind that arrive before the thread has taken the previous one are merged
+    /// into one (by the signal iterator, and by the operating system, which keeps at most one pending signal of each
+    /// kind), so two of the same kind sent back to back can stop the run cleanly instead of ending the process; a
+    /// `SIGINT` and a `SIGTERM` are never merged. A handler the process installed before the first run still runs
+    /// first.
+    ///
+    /// When the run returns, and no other run in the process is handling signals, `SIGINT` and `SIGTERM` end the
+    /// process as their default action would: the first run installs, for the rest of the process's life, an action
+    /// that emulates the default whenever no run handles signals. So a process that handles these signals itself
+    /// should pass false and stop runs with the stop flag.
+    ///
+    /// With false, the run leaves the process's signal handling alone.
     pub fn handle_signals(mut self, on: bool) -> Self {
         self.handle_signals = on;
         self
@@ -582,6 +607,13 @@ impl RecorderBuilder {
     /// service is retried; the other services keep recording.
     pub fn on_error(mut self, f: impl FnMut(&str, &Error) + Send + 'static) -> Self {
         self.on_error = Some(Box::new(f));
+        self
+    }
+
+    /// Called once with the run's `run_start_seq`, after signal handling is installed and the journal is open,
+    /// before any service is opened.
+    pub fn on_start(mut self, f: impl FnOnce(u64) + Send + 'static) -> Self {
+        self.on_start = Some(Box::new(f));
         self
     }
 
@@ -641,8 +673,6 @@ pub struct Recorder {
 /// this changes.
 struct Tracking {
     descriptor: Arc<Descriptor>,
-    descriptor_bytes: Vec<u8>,
-    descriptor_seq: u64,
     counter: Option<CounterField>,
     next_counter: HashMap<u128, u64>,
 }
@@ -665,6 +695,7 @@ impl Recorder {
             max_duration: None,
             on_open: None,
             on_error: None,
+            on_start: None,
         }
     }
 
@@ -695,9 +726,11 @@ impl Recorder {
             .signal_handling_mode(SignalHandlingMode::Disabled)
             .create::<ipc::Service>()
             .map_err(|e| Error::iox("create node", e))?;
-        let writer = Writer::open(&config.journal, config.writer_config.clone())?;
-        let mirror = SegmentMirror::new(&config.journal, config.writer_config.segment_size)?;
-        let mut journal = Journal { writer, mirror };
+        let mut journal = Journal::open(
+            &config.journal,
+            config.writer_config.clone(),
+            config.services.len(),
+        )?;
         let run = RunInfo {
             start_seq: journal.writer.next_seq(),
             start_unix_ns: tickertape::clock::realtime_ns(),
@@ -726,6 +759,9 @@ impl Recorder {
             checkpoints: 0,
         };
         let signalled = signals.as_ref().map(|s| Arc::clone(&s.signalled));
+        if let Some(f) = config.on_start.take() {
+            f(run.start_seq);
+        }
         let result = record(
             &mut config,
             &node,
@@ -740,11 +776,15 @@ impl Recorder {
         let stop_reason = result?;
         checkpoint?;
         state.checkpoints += 1;
+        for (i, report) in state.reports.iter_mut().enumerate() {
+            report.descriptors = journal.descriptors(i);
+        }
         Ok(RecorderReport {
             run_start_seq: run.start_seq,
             next_seq: journal.writer.next_seq(),
             messages: state.messages,
             checkpoints: state.checkpoints,
+            fillers: journal.fillers(),
             stop_reason,
             services: state.reports,
         })
@@ -760,52 +800,6 @@ struct RunState {
     reports: Vec<ServiceReport>,
     messages: u64,
     checkpoints: u64,
-}
-
-/// The writer, and a mirror of its position that predicts segment rolls.
-struct Journal {
-    writer: Writer,
-    mirror: SegmentMirror,
-}
-
-impl Journal {
-    fn append(
-        &mut self,
-        schema_id: u32,
-        venue: u64,
-        local: u64,
-        payload: &[u8],
-    ) -> Result<u64, Error> {
-        let seq = self.writer.append(&NewRecord {
-            schema_id,
-            venue_ts_ns: venue,
-            local_ts_ns: local,
-            payload,
-        })?;
-        self.mirror.appended(payload.len());
-        Ok(seq)
-    }
-
-    /// Before appending a record of `len` payload bytes that names a descriptor (or is one): if it would start a
-    /// new segment, first writes the descriptor of every open service, so that the new segment begins with them.
-    fn describe_segment(
-        &mut self,
-        len: usize,
-        tracking: &mut [Option<Tracking>],
-        reports: &mut [ServiceReport],
-    ) -> Result<(), Error> {
-        if !self.mirror.would_roll(len) || tracking.iter().all(Option::is_none) {
-            return Ok(());
-        }
-        let now = tickertape::clock::realtime_ns();
-        for (t, report) in tracking.iter_mut().zip(reports.iter_mut()) {
-            if let Some(t) = t {
-                t.descriptor_seq = self.append(SCHEMA_DESCRIPTOR, 0, now, &t.descriptor_bytes)?;
-                report.descriptors += 1;
-            }
-        }
-        Ok(())
-    }
 }
 
 /// Messages taken from one service in one pass, before the checkpoint timer and stop conditions are looked at.
@@ -829,10 +823,11 @@ fn record(
     let mut failed = vec![false; n];
     loop {
         // Close services that failed, then open what can be opened, writing a descriptor for each.
-        for ((failed, source), track) in failed.iter_mut().zip(&mut sources).zip(&mut tracking) {
-            if std::mem::take(failed) {
-                *source = None;
-                *track = None;
+        for i in 0..n {
+            if std::mem::take(&mut failed[i]) {
+                sources[i] = None;
+                tracking[i] = None;
+                journal.close_service(i);
             }
         }
         for i in 0..n {
@@ -967,23 +962,15 @@ fn activate(
         service: factory.name().to_string(),
         reason: e.to_string(),
     })?;
-    journal.describe_segment(bytes.len(), tracking, &mut state.reports)?;
-    let seq = journal.append(
-        SCHEMA_DESCRIPTOR,
-        0,
-        tickertape::clock::realtime_ns(),
-        &bytes,
-    )?;
+    let seq = journal.open_service(i, bytes, tickertape::clock::realtime_ns())?;
     let report = &mut state.reports[i];
     report.descriptor_seq.get_or_insert(seq);
-    report.descriptors += 1;
+    report.descriptors = journal.descriptors(i);
     report.buffer_size = Some(d.buffer_size);
     report.subscriber_max_buffer_size = Some(d.settings.subscriber_max_buffer_size);
     report.safe_overflow = Some(d.settings.safe_overflow);
     tracking[i] = Some(Tracking {
         descriptor: Arc::new(descriptor),
-        descriptor_bytes: bytes,
-        descriptor_seq: seq,
         counter: factory.counter(),
         next_counter: HashMap::new(),
     });
@@ -1116,17 +1103,33 @@ fn record_message(
             received: value,
         })
     });
-    if let Some(mut loss) = loss {
-        journal.describe_segment(layout::LOSS_RECORD_LEN, tracking, &mut state.reports)?;
-        let Some(track) = tracking[i].as_ref() else {
-            return Ok(());
-        };
-        loss.descriptor_seq = track.descriptor_seq;
-        let bytes = loss.encode().map_err(|e| Error::Unsupported {
+    if let Some(loss) = loss {
+        // Checked before anything is appended (the descriptor's sequence number doesn't affect validity).
+        loss.encode().map_err(|e| Error::Unsupported {
             service: track.descriptor.service_name.clone(),
             reason: e.to_string(),
         })?;
-        journal.append(SCHEMA_LOSS, 0, local_ts_ns, &bytes)?;
+        journal.append_named(
+            i,
+            &NewRecord {
+                schema_id: SCHEMA_LOSS,
+                venue_ts_ns: 0,
+                local_ts_ns,
+                payload: &[],
+            },
+            layout::LOSS_RECORD_LEN,
+            |buf, descriptor_seq| {
+                // Checked above, so this can't fail; if it did, the panic makes the writer discard the record
+                // instead of committing it.
+                let bytes = LossRecord {
+                    descriptor_seq,
+                    ..loss
+                }
+                .encode()
+                .expect("loss record checked");
+                buf.copy_from_slice(&bytes);
+            },
+        )?;
         let report = &mut state.reports[i];
         match loss.kind {
             LossKind::Gap => {
@@ -1136,7 +1139,28 @@ fn record_message(
             LossKind::Backwards => report.backwards += 1,
         }
     }
-    journal.describe_segment(data_len, tracking, &mut state.reports)?;
+    journal.append_named(
+        i,
+        &NewRecord {
+            schema_id: SCHEMA_DATA,
+            venue_ts_ns: m.venue_ts_ns,
+            local_ts_ns,
+            payload: &[],
+        },
+        data_len,
+        |buf, descriptor_seq| {
+            // The length was checked above, so this can't fail; if it did, the panic makes the writer discard the
+            // record instead of committing it.
+            DataRecord {
+                descriptor_seq,
+                publisher_id: m.origin,
+                user_header: m.user_header,
+                payload: m.payload,
+            }
+            .encode_into(buf)
+            .expect("data record length checked")
+        },
+    )?;
     let Some(track) = tracking[i].as_mut() else {
         return Ok(());
     };
@@ -1147,25 +1171,6 @@ fn record_message(
             .next_counter
             .insert(m.origin, value.wrapping_add(1) & c.max_value());
     }
-    let record = DataRecord {
-        descriptor_seq: track.descriptor_seq,
-        publisher_id: m.origin,
-        user_header: m.user_header,
-        payload: m.payload,
-    };
-    journal.writer.append_with(
-        &NewRecord {
-            schema_id: SCHEMA_DATA,
-            venue_ts_ns: m.venue_ts_ns,
-            local_ts_ns,
-            payload: &[],
-        },
-        data_len,
-        // The length was checked above, so this can't fail; if it did, the panic makes the writer discard the
-        // record instead of committing it.
-        |buf| record.encode_into(buf).expect("data record length checked"),
-    )?;
-    journal.mirror.appended(data_len);
     let report = &mut state.reports[i];
     report.messages += 1;
     report.payload_bytes = report.payload_bytes.saturating_add(m.payload.len() as u64);
@@ -1173,9 +1178,15 @@ fn record_message(
     Ok(())
 }
 
-/// `SIGINT`/`SIGTERM` handling for one run: the first signal sets the stop flag and this run's own `signalled` flag;
-/// a second one exits at once (status 130 or 143). Signals are taken one at a time by a thread (signal-hook's
-/// iterator), so two signals arriving together can't both look like the first.
+/// `SIGINT`/`SIGTERM` handling for one run (see [`RecorderBuilder::handle_signals`] for what the process sees): the
+/// first signal the run's signal thread takes sets the stop flag and this run's own `signalled` flag; a signal it
+/// takes after that exits at once (status 130 or 143). Signals are taken one at a time by that thread (signal-hook's
+/// iterator), so two signals can't both look like the first; but signals of one kind that arrive before the thread
+/// has taken the previous one are merged into one, by the iterator and by the operating system.
+///
+/// While no run handles signals, `SIGINT` and `SIGTERM` take their default action (they end the process): the first
+/// registration in a process installs, for the rest of its life, a conditional default action for both (signal-hook's
+/// `register_conditional_default`), armed whenever no registration is alive.
 pub(crate) struct Signals {
     handle: signal_hook::iterator::Handle,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -1183,15 +1194,53 @@ pub(crate) struct Signals {
     pub(crate) signalled: Arc<AtomicBool>,
 }
 
+/// The process-wide state behind [`Signals`]: the flag that arms the default action, and how many registrations are
+/// alive.
+struct SignalDefaults {
+    idle: Arc<AtomicBool>,
+    active: usize,
+}
+
+static SIGNAL_DEFAULTS: std::sync::Mutex<Option<SignalDefaults>> = std::sync::Mutex::new(None);
+
+fn signal_error(source: std::io::Error) -> Error {
+    Error::Io {
+        op: "install signal handler",
+        path: PathBuf::new(),
+        source,
+    }
+}
+
 impl Signals {
     pub(crate) fn register(stop: &Arc<AtomicBool>) -> Result<Signals, Error> {
         use signal_hook::consts::{SIGINT, SIGTERM};
-        let io = |source| Error::Io {
-            op: "install signal handler",
-            path: PathBuf::new(),
-            source,
-        };
-        let mut signals = signal_hook::iterator::Signals::new([SIGINT, SIGTERM]).map_err(io)?;
+        {
+            let mut defaults = SIGNAL_DEFAULTS.lock().unwrap_or_else(|e| e.into_inner());
+            let defaults = match &mut *defaults {
+                Some(d) => d,
+                None => {
+                    let idle = Arc::new(AtomicBool::new(false));
+                    for signal in [SIGINT, SIGTERM] {
+                        signal_hook::flag::register_conditional_default(signal, Arc::clone(&idle))
+                            .map_err(signal_error)?;
+                    }
+                    defaults.insert(SignalDefaults { idle, active: 0 })
+                }
+            };
+            defaults.active += 1;
+            defaults.idle.store(false, Ordering::SeqCst);
+        }
+        let registered = Self::register_iterator(stop);
+        if registered.is_err() {
+            Self::release();
+        }
+        registered
+    }
+
+    fn register_iterator(stop: &Arc<AtomicBool>) -> Result<Signals, Error> {
+        use signal_hook::consts::{SIGINT, SIGTERM};
+        let mut signals =
+            signal_hook::iterator::Signals::new([SIGINT, SIGTERM]).map_err(signal_error)?;
         let handle = signals.handle();
         let signalled = Arc::new(AtomicBool::new(false));
         let (seen, stop) = (Arc::clone(&signalled), Arc::clone(stop));
@@ -1206,17 +1255,30 @@ impl Signals {
                 }
                 // `signals` is dropped here, which unregisters the handlers.
             })
-            .map_err(io)?;
+            .map_err(signal_error)?;
         Ok(Signals {
             handle,
             thread: Some(thread),
             signalled,
         })
     }
+
+    /// One registration fewer; with none left, arms the default action.
+    fn release() {
+        let mut defaults = SIGNAL_DEFAULTS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(d) = &mut *defaults {
+            d.active = d.active.saturating_sub(1);
+            if d.active == 0 {
+                d.idle.store(true, Ordering::SeqCst);
+            }
+        }
+    }
 }
 
 impl Drop for Signals {
     fn drop(&mut self) {
+        // Arm the default action first: a signal arriving from here on ends the process (the run is over).
+        Self::release();
         self.handle.close();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
@@ -1229,11 +1291,9 @@ mod tests {
     use super::*;
     use crate::layout::TypeVariant;
 
-    fn tracking_for(descriptor: Descriptor, seq: u64) -> Tracking {
+    fn tracking_for(descriptor: Descriptor) -> Tracking {
         Tracking {
-            descriptor_bytes: descriptor.encode().unwrap(),
             descriptor: Arc::new(descriptor),
-            descriptor_seq: seq,
             counter: None,
             next_counter: HashMap::new(),
         }
@@ -1290,14 +1350,10 @@ mod tests {
     fn invalid_messages_are_refused_before_appending() {
         let dir = tempfile::tempdir().unwrap();
         let config = WriterConfig::default().segment_size(65_536).prefault(false);
-        let writer = Writer::open(dir.path(), config).unwrap();
-        let mirror = SegmentMirror::new(dir.path(), 65_536).unwrap();
-        let mut journal = Journal { writer, mirror };
+        let mut journal = Journal::open(dir.path(), config, 1).unwrap();
         let d = descriptor(16);
-        let seq = journal
-            .append(SCHEMA_DESCRIPTOR, 0, 1, &d.encode().unwrap())
-            .unwrap();
-        let mut tracking = vec![Some(tracking_for(d, seq))];
+        journal.open_service(0, d.encode().unwrap(), 1).unwrap();
+        let mut tracking = vec![Some(tracking_for(d))];
         let mut state = RunState {
             reports: vec![report()],
             messages: 0,
@@ -1345,19 +1401,15 @@ mod tests {
     fn counters_use_modular_distance() {
         let dir = tempfile::tempdir().unwrap();
         let config = WriterConfig::default().segment_size(65_536).prefault(false);
-        let writer = Writer::open(dir.path(), config).unwrap();
-        let mirror = SegmentMirror::new(dir.path(), 65_536).unwrap();
-        let mut journal = Journal { writer, mirror };
+        let mut journal = Journal::open(dir.path(), config, 1).unwrap();
         let mut d = descriptor(16);
         d.counter = Some(CounterField {
             location: layout::CounterLocation::UserHeader,
             offset: 0,
             width: 4,
         });
-        let seq = journal
-            .append(SCHEMA_DESCRIPTOR, 0, 1, &d.encode().unwrap())
-            .unwrap();
-        let mut t = tracking_for(d.clone(), seq);
+        journal.open_service(0, d.encode().unwrap(), 1).unwrap();
+        let mut t = tracking_for(d.clone());
         t.counter = d.counter;
         let mut tracking = vec![Some(t)];
         let mut state = RunState {
@@ -1432,9 +1484,7 @@ mod tests {
         let config = WriterConfig::default()
             .segment_size(1 << 24)
             .prefault(false);
-        let writer = Writer::open(dir.path(), config).unwrap();
-        let mirror = SegmentMirror::new(dir.path(), 1 << 24).unwrap();
-        let mut journal = Journal { writer, mirror };
+        let mut journal = Journal::open(dir.path(), config, 2).unwrap();
         let d = descriptor(16);
         let described = || Described {
             payload: d.payload.clone(),
@@ -1452,13 +1502,9 @@ mod tests {
                 described: described(),
             })),
         ];
-        let mut tracking = vec![
-            Some(tracking_for(d.clone(), 0)),
-            Some(tracking_for(d.clone(), 0)),
-        ];
-        journal
-            .append(SCHEMA_DESCRIPTOR, 0, 1, &d.encode().unwrap())
-            .unwrap();
+        let mut tracking = vec![Some(tracking_for(d.clone())), Some(tracking_for(d.clone()))];
+        journal.open_service(0, d.encode().unwrap(), 1).unwrap();
+        journal.open_service(1, d.encode().unwrap(), 1).unwrap();
         let mut state = RunState {
             reports: vec![report(), report()],
             messages: 0,

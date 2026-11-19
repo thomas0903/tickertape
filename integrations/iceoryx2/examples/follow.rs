@@ -117,6 +117,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     d.service_name, l.expected, l.received
                 );
             }
+            // Zeros that end a segment early so that the descriptors start the next one: skipped.
+            Decoded::Filler(_) => {}
             Decoded::Other => println!("other seq={seq} schema={:#x}", record.schema_id),
         }
     }

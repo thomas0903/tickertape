@@ -1,3 +1,5 @@
+#[cfg(feature = "iceoryx2")]
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -103,4 +105,30 @@ impl Catalog {
                 reason: "removed from the journal with an older segment".into(),
             })
     }
+}
+
+/// Names of the services that have a descriptor anywhere in the journal in `dir`, before sequence number `end`:
+/// what the journal records, wherever its descriptors lie. Reads every record from the journal's first one once;
+/// descriptors are validated.
+///
+/// # Errors
+///
+/// [`Error::Journal`] if reading fails; [`Error::Layout`] if a descriptor is malformed or invalid.
+#[cfg(feature = "iceoryx2")]
+pub(crate) fn service_names(dir: &Path, end: u64) -> Result<BTreeSet<String>, Error> {
+    let mut reader = Reader::open(dir, ReaderConfig::default())?;
+    let mut names = BTreeSet::new();
+    while let Some(record) = reader.try_next()? {
+        if record.seq >= end {
+            break;
+        }
+        if record.schema_id == SCHEMA_DESCRIPTOR {
+            let d = Descriptor::decode(record.payload).map_err(|source| Error::Layout {
+                seq: record.seq,
+                source,
+            })?;
+            names.insert(d.service_name);
+        }
+    }
+    Ok(names)
 }

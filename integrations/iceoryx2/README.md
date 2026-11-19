@@ -114,6 +114,7 @@ the Unix epoch); `venue_ts_ns` is what an optional extractor read from the user 
 | `0x4932_0001` | descriptor: one recorded service |
 | `0x4932_0002` | data record: one message |
 | `0x4932_0003` | loss record: a gap in a publisher counter |
+| `0x4932_0004` | filler: zeros that end a segment early (see [where descriptors lie](#where-descriptors-lie)) |
 
 ### Growth rule
 
@@ -130,19 +131,61 @@ the Unix epoch); `venue_ts_ns` is what an optional extractor read from the user 
   required: a reader rejects an unknown required tag and skips unknown optional ones; an entry that runs past its area
   is malformed. Version 1 defines no tags.
 
-### Recording runs and repeated descriptors
+### Recording runs
 
 A *recording run* is one run of the recorder, or one import. Its descriptors carry `run_start_seq`, the journal's next
-sequence number when the run began. A service's descriptor may appear several times in a run with the same content:
-the recorder writes each open service's descriptor again at the start of every journal segment, before the segment's
-first data or loss record. A data or loss record names the most recent descriptor of its service before it.
+sequence number when the run began. A service's descriptor may appear several times in a run with the same content
+(below). A data or loss record names the most recent descriptor of its service before it.
+
+### Where descriptors lie
+
+Retention and `tickertape archive` remove segments from the front of a journal, so a record can only be decoded on its
+own if its descriptor is in the same segment. The recorder and the importer keep this rule:
+
+**Every data and loss record has the descriptor it names in its own segment, before it**, except a record too large to
+share a segment with that descriptor: one with `64 + align8(40 + d) + align8(40 + r) > segment size − 8`, where `d` is
+the descriptor's length and `r` the record's (a tickertape segment has a 64-byte header, records have a 40-byte header
+and are 8-byte aligned, and the last 8 bytes of a segment hold no record; [format](../../docs/format.md)). With 64 KiB
+segments and a 400-byte descriptor, that is a record payload larger than 64,984 bytes; with the default 128 MiB
+segments, about 128 MiB.
 
 - **Guaranteed:** in a journal written by this crate, every data and loss record whose segment is still there can be
-  decoded, including after retention or `tickertape archive` removed older segments; except a record too large to
-  share a segment with the descriptors (it then starts a segment of its own).
-- **Not guaranteed:** that a record's descriptor is still there (journals written otherwise, or that exception).
-  Readers skip, count and report such records instead of stopping: `info` (`undescribed_records`), `replay` and
-  `export` (`undescribed`), and the `follow` example (`undescribed` lines).
+  decoded, including after retention or `tickertape archive` removed older segments, except that exception. Every
+  segment the recorder starts begins with the descriptors of the services open at that point.
+- **Not guaranteed:** that a record's descriptor is still there (journals written otherwise, or the exception). Readers
+  skip, count and report such records instead of stopping: `info` (`undescribed_records`), `replay` and `export`
+  (`undescribed`), and the `follow` example (`undescribed` lines).
+
+How the recorder does it, before each record that names a descriptor (and before a service's first descriptor):
+
+1. If the record fits in what is left of the active segment, together with its service's descriptor when that isn't
+   in the segment yet, they are appended there.
+2. Otherwise the record must start a new segment. The new segment begins with the descriptors of all open services, in
+   the order the services were configured, then the record, if they all fit in one segment together. If they don't,
+   it begins with the record's own descriptor, then the record (the other services' descriptors follow before their
+   next records, by rule 1). If not even that fits, the record is too large to share a segment with its descriptor and
+   is appended as it is, wherever the writer puts it (the exception).
+3. tickertape's writer starts a new segment only when a record doesn't fit, and has no call to start one. So that the
+   first of those descriptors starts the new segment, the recorder first appends a **filler** that takes exactly the
+   space left, when that descriptor would still fit there. When it wouldn't (less space left than the descriptor
+   takes, including less than the 40 bytes any record needs), the descriptor starts the new segment by itself and no
+   filler is written. A filler is therefore never smaller than a descriptor, and never smaller than the smallest
+   record.
+
+**Space left** is the segment size minus 8, minus the bytes in use: 64 for the header plus `align8(40 + payload
+length)` per record. The recorder reads the newest segment when it opens the journal and then adds every record it
+appends; after a record that didn't fit, the writer has started a new segment of its configured size, and the count
+starts again at 64. These rules come from tickertape's public `format` module (`frame_len`, `align8`, `record_fits`,
+`SEGMENT_HEADER_LEN`, `SEGMENT_TRAILER_LEN`), not from copies, and tests check them against a real writer (a filler of
+exactly the space left stays in its segment; the next record, of any size, starts a new one).
+
+### Filler (`0x4932_0004`)
+
+A record whose payload is all zero bytes, of any length from 0 to tickertape's largest payload. It carries no data and
+names no descriptor; it is the last record of its segment. Readers skip it without looking at its payload. Version-1
+readers written before fillers existed see an unknown reserved schema id and ignore it as well, so fillers didn't need
+a new layout version. `info` reports fillers apart from data (`filler_records`, `filler_bytes`); the recorder's report
+counts those it wrote (`fillers`).
 
 ### Descriptor (`0x4932_0001`)
 
@@ -231,8 +274,9 @@ neither.
 ### Validity rules
 
 A decoder must apply all of these; this crate applies them in `Descriptor::decode`, `DataRecord::check` and
-`LossRecord::check` (and `Descriptor::encode` refuses whatever `decode` refuses), in every reader, before recording a
-service, and before importing a file.
+`LossRecord::check` (and `Descriptor::encode` refuses whatever `decode` refuses), to every record in every reader
+(`info`, `replay`, `export`, `follow`; loss records too, although only `info` and `follow` use them), before recording
+a service, and before importing a file.
 
 - Layout version 1; descriptor magic `TTI2`; no unknown required flag bit or extension tag; every extension entry
   inside its area; strings valid UTF-8; nothing missing.
@@ -297,18 +341,30 @@ The normative description, with tests that pin every offset, is the rustdoc of [
   these repeats are not reported as losses, but the counters in the recorded messages show them. Recovery after a
   crash zeroes the unused rest of the active segment; with the default 128 MiB segments that takes a moment, so
   `--segment-size` can be lowered for fast restarts.
-- **Replay** creates the target services with the recorded types and settings, or opens them if they exist; an
-  existing service with other types is refused, and so is a second recorded descriptor with other types for the same
-  target (a type change between recording runs, or two `--map` rules onto one name). Names are prefixed with `replay/`
-  by default so that a replay can't feed a recorder of the original service; `--original-names` replays onto the
-  recorded names. While a writer holds the journal, a target name the journal is recording (a descriptor in its newest
-  segment) is refused unless `--allow-live-targets` is given, and the replay ends at the journal's committed end when
-  it started. Paced replay schedules each message from the first one by the recorded receive times divided by
-  `--speed` (from 0.000001 to 1,000,000,000), sleeps on a monotonic clock and spins for the last millisecond; it
-  reproduces gaps between recording runs and forward jumps of the recording clock in real time (scaled), and reports
-  late sends (scheduled versus actual) without dropping them. Messages sent before a subscriber has connected are
-  lost unless the service keeps history: `--wait-subscribers` waits for subscribers first, and the replayer keeps its
-  publishers open 500 ms after the last message (`--linger-ms`).
+- **Replay** creates the target services with the recorded types and settings, or opens them if they exist; an existing
+  service with other types is refused, and so is a second recorded descriptor with other types for the same target (a
+  type change between recording runs, or two `--map` rules onto one name). Names are prefixed with `replay/` by default
+  so that a replay can't feed a recorder of the original service; `--original-names` replays onto the recorded names.
+  While a writer (a recorder or an import) holds the journal, a target name that any descriptor in the journal names is
+  refused unless `--allow-live-targets` is given: the replayer reads the whole journal once, before replaying, to learn
+  them, so it doesn't matter which segments hold the descriptors. A service the recorder is still waiting for (it hasn't
+  appeared yet) has no descriptor and isn't known, so a replay that creates it is recorded; the replay still ends at the
+  journal's committed end when it started, so that is one pass, not a loop. Paced replay schedules each message from the
+  first one by the recorded receive times divided by `--speed` (from 0.000001 to 1,000,000,000), sleeps on a monotonic
+  clock and spins for the last millisecond; it reproduces gaps between recording runs and forward jumps of the recording
+  clock in real time (scaled), and reports late sends (scheduled versus actual) without dropping them. Messages sent
+  before a subscriber has connected are lost unless the service keeps history: `--wait-subscribers` waits for
+  subscribers first, and the replayer keeps its publishers open 500 ms after the last message (`--linger-ms`).
+- **Signals.** By default (`handle_signals(true)`; the CLI always), while a recording or replay runs, the first
+  `SIGINT` or `SIGTERM` its signal thread takes stops it cleanly (the recorder takes a final checkpoint); a signal
+  taken after that ends the process at once with status 130 (`SIGINT`) or 143 (`SIGTERM`), without a final
+  checkpoint. Signals of one kind that arrive before the thread has taken the previous one are merged into one (the
+  operating system keeps at most one pending signal of each kind), so two of the same kind sent back to back can stop
+  cleanly instead of ending the process; a `SIGINT` and a `SIGTERM` are never merged. When the run returns, and no
+  other run in the process handles signals, both signals take their default action again (they end the process): the
+  first run installs, for the rest of the process's life, an action that emulates the default whenever no run handles
+  signals. A handler the process installed before still runs first, so a process that handles these signals itself
+  should use `handle_signals(false)` and the stop flag.
 - **Seeking is by sequence number.** There is no seek by time yet (`--from` takes a sequence number).
 
 ### Known limitations

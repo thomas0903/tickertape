@@ -43,6 +43,8 @@ pub mod dynamic;
 #[cfg(feature = "iceoryx2")]
 mod pacing;
 #[cfg(feature = "iceoryx2")]
+mod placement;
+#[cfg(feature = "iceoryx2")]
 pub mod recorder;
 #[cfg(feature = "iceoryx2")]
 pub mod replayer;

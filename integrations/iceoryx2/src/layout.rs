@@ -1,6 +1,6 @@
 //! The payload layout of recorded iceoryx2 messages, version 1. No iceoryx2 dependency.
 //!
-//! A recording is an ordinary tickertape journal. This crate writes three kinds of records into it, told apart by
+//! A recording is an ordinary tickertape journal. This crate writes four kinds of records into it, told apart by
 //! the record's `schema_id`. Schema ids `0x4932_0000..=0x4932_FFFF` (`"I2"` followed by a 16-bit number) are
 //! reserved for this crate; other schema ids may be mixed into the same journal by other writers and are ignored.
 //!
@@ -9,6 +9,7 @@
 //! | `0x4932_0001` | [`SCHEMA_DESCRIPTOR`] | [`Descriptor`]: one recorded service         |
 //! | `0x4932_0002` | [`SCHEMA_DATA`]       | [`DataRecord`]: one message                  |
 //! | `0x4932_0003` | [`SCHEMA_LOSS`]       | [`LossRecord`]: a gap in a publisher counter |
+//! | `0x4932_0004` | [`SCHEMA_FILLER`]     | filler: zeros that end a segment early       |
 //!
 //! All integers are little-endian. Strings are UTF-8 with a `u16` byte length in front and no terminator. User
 //! header and payload bytes are copied exactly as the publisher wrote them: they keep the publisher's native
@@ -47,16 +48,55 @@
 //!
 //! A *recording run* is one run of a recorder (or one import). It is identified by `run_start_seq`, the journal's
 //! next sequence number when the run began; all descriptors of a run carry it. A service's descriptor may appear
-//! several times in a run, with the same content: the recorder writes each active service's descriptor again at
-//! the start of every journal segment (before the segment's first data or loss record), so that a segment that
-//! survives retention or archiving can still be decoded on its own. A data or loss record names the most recent
-//! descriptor of its service written before it.
+//! several times in a run, with the same content (see below). A data or loss record names the most recent descriptor
+//! of its service written before it.
 //!
-//! What is guaranteed: in a journal written by this crate's recorder, every data and loss record whose segment is
-//! present can be decoded, unless that record was too large to share a segment with the descriptors (then it
-//! starts a segment of its own, and the descriptors are in the previous one). What is not: a reader that finds a
-//! record whose descriptor is no longer in the journal (removed with an older segment) skips it, counts it and
-//! reports it; it must not stop. `info`, `replay`, `export` and the `follow` example do that.
+//! # Where descriptors lie
+//!
+//! tickertape segments can be removed from the front of a journal (retention, `tickertape archive`), so a record is
+//! only decodable on its own if its descriptor is in the same segment. The recorder and the importer keep this rule:
+//!
+//! **Every data and loss record has the descriptor it names in its own segment, before it**, except a record too
+//! large to share a segment with that descriptor: one with `64 + align8(40 + d) + align8(40 + r) > segment size − 8`,
+//! where `d` is the descriptor's length and `r` the record's (tickertape's segment header is 64 bytes, its record
+//! header 40, records are 8-byte aligned and the last 8 bytes of a segment hold no record; `docs/format.md`). For
+//! 64 KiB segments and a 400-byte descriptor that is a record payload larger than 64,984 bytes; for the default
+//! 128 MiB segments, about 128 MiB.
+//!
+//! So every segment that remains after older ones were removed decodes on its own, and every segment the recorder
+//! starts begins with the descriptors of the services open at that point. How it is done, before each record that
+//! names a descriptor (and before a service's first descriptor):
+//!
+//! 1. If the record fits in what is left of the active segment, together with its service's descriptor when that
+//!    isn't in the segment yet, they are appended there.
+//! 2. Otherwise the record must start a new segment. The new segment begins with the descriptors of all open
+//!    services, in the order the services were configured, then the record, if they all fit in one segment together;
+//!    otherwise with the record's own descriptor only, then the record (the other services' descriptors are then
+//!    written before their next record, by rule 1); and if not even that fits, the record is too large to share a
+//!    segment with its descriptor and is appended as it is, wherever the writer puts it (the exception above).
+//! 3. tickertape's writer starts a new segment only when a record doesn't fit. So that the first of those
+//!    descriptors starts the new segment, the recorder first appends a **filler record** taking exactly the space
+//!    left, if that descriptor would still fit there. If it wouldn't (less space left than that descriptor takes,
+//!    including less than the 40 bytes any record needs), the descriptor starts the new segment by itself and no
+//!    filler is written. A filler is therefore never smaller than a descriptor, and so never smaller than the smallest
+//!    record.
+//!
+//! The space left is the segment size minus 8, minus the bytes in use: 64 for the header plus `align8(40 + payload
+//! length)` for each record. The recorder reads the newest segment when it opens the journal, then adds each record
+//! it appends; when a record didn't fit, the writer started a new segment of its configured size and the count
+//! starts again at 64. The rules come from tickertape's public `format` module (`frame_len`, `align8`, `record_fits`,
+//! `SEGMENT_HEADER_LEN`, `SEGMENT_TRAILER_LEN`), and tests check them against a real writer.
+//!
+//! A reader that finds a record whose descriptor is no longer in the journal (written otherwise, or the exception)
+//! skips it, counts it and reports it; it must not stop. `info`, `replay`, `export` and the `follow` example do that.
+//!
+//! # Filler (`SCHEMA_FILLER`)
+//!
+//! A record whose payload is all zero bytes, of any length (0 up to tickertape's largest payload). It carries no
+//! data and names no descriptor. Readers skip it without looking at its payload; it is the last record of its
+//! segment. Version-1 readers written before fillers existed decode its schema id as an unknown reserved id and
+//! ignore it too, so fillers need no new layout version. `info` counts fillers separately from data
+//! (`filler_records`, `filler_bytes`).
 //!
 //! # Descriptor (`SCHEMA_DESCRIPTOR`)
 //!
@@ -172,6 +212,9 @@
 //!   header size; payload length equal to the payload size, or a multiple of the element size for a slice.
 //! - Loss record: counter width equal to the descriptor's; the descriptor has a counter; expected and received fit
 //!   in the width and differ; the kind matches the distance rule above.
+//!
+//! This crate's readers (`info`, `replay`, `export` and the `follow` example) apply every rule to every record they
+//! read, including loss records they don't otherwise use.
 
 use serde::Serialize;
 
@@ -181,6 +224,9 @@ pub const SCHEMA_DESCRIPTOR: u32 = 0x4932_0001;
 pub const SCHEMA_DATA: u32 = 0x4932_0002;
 /// Schema id of a [`LossRecord`].
 pub const SCHEMA_LOSS: u32 = 0x4932_0003;
+/// Schema id of a filler record: zero bytes that end a segment early, so that the descriptors start the next one
+/// (see [where descriptors lie](self#where-descriptors-lie)). Readers skip it without looking at its payload.
+pub const SCHEMA_FILLER: u32 = 0x4932_0004;
 /// Schema ids reserved for this crate.
 pub const SCHEMA_RESERVED: core::ops::RangeInclusive<u32> = 0x4932_0000..=0x4932_FFFF;
 
@@ -606,8 +652,9 @@ fn validate_type(info: &TypeInfo, what: &'static str) -> Result<(), LayoutError>
     Ok(())
 }
 
-/// One recorded service, written at the start of each recording run and again at the start of every journal
-/// segment while the run lasts. See the [module docs](self) for bytes.
+/// One recorded service, written before its first record in a recording run and again in every journal segment that
+/// holds its records (see [where descriptors lie](self#where-descriptors-lie)). See the [module docs](self) for
+/// bytes.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct Descriptor {
     /// The journal's next sequence number when the recording run began. Shared by all descriptors of a run.
@@ -1117,6 +1164,8 @@ pub enum Decoded<'a> {
     Data(DataRecord<'a>),
     /// A counter gap.
     Loss(LossRecord),
+    /// A filler record, with its payload length; skipped.
+    Filler(usize),
     /// A schema id this crate doesn't write; left alone.
     Other,
 }
@@ -1132,6 +1181,7 @@ pub fn decode(schema_id: u32, payload: &[u8]) -> Result<Decoded<'_>, LayoutError
         SCHEMA_DESCRIPTOR => Decoded::Descriptor(Box::new(Descriptor::decode(payload)?)),
         SCHEMA_DATA => Decoded::Data(DataRecord::decode(payload)?),
         SCHEMA_LOSS => Decoded::Loss(LossRecord::decode(payload)?),
+        SCHEMA_FILLER => Decoded::Filler(payload.len()),
         _ => Decoded::Other,
     })
 }
@@ -1920,6 +1970,9 @@ mod tests {
     #[test]
     fn unknown_reserved_schema_ids_decode_as_other() {
         assert_eq!(decode(0x4932_00FF, b"anything"), Ok(Decoded::Other));
+        // A filler is skipped whatever it holds.
+        assert_eq!(decode(SCHEMA_FILLER, &[0; 24]), Ok(Decoded::Filler(24)));
+        assert_eq!(decode(SCHEMA_FILLER, b"anything"), Ok(Decoded::Filler(8)));
         assert_eq!(decode(1, b""), Ok(Decoded::Other));
     }
 }

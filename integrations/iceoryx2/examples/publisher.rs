@@ -1,11 +1,13 @@
 //! A typed iceoryx2 publisher for the tests and the quick start.
 //!
-//! Usage: `publisher --service NAME [--kind tick|slice] [--count N] [--rate HZ] [--wait-subscribers N]
-//! [--wait-secs S] [--skip-every K] [--notify EVENT] [--buffer N] [--linger-ms MS] [--blocking]`
+//! Usage: `publisher --service NAME [--kind tick|slice|bytes] [--size BYTES] [--count N] [--rate HZ]
+//! [--wait-subscribers N] [--wait-secs S] [--skip-every K] [--notify EVENT] [--buffer N] [--linger-ms MS]
+//! [--blocking]`
 //!
 //! Sends `--count` messages (0: until killed) at `--rate` per second, on an absolute schedule. Each message has a
 //! `TickHeader` user header with a counter (0, 1, 2, ...) and the send time, and a payload derived from the
-//! counter (see `common/types.rs`): a `Tick`, or with `--kind slice` a `[u32]` of 1 to 16 elements.
+//! counter (see `common/types.rs`): a `Tick`, with `--kind slice` a `[u32]` of 1 to 16 elements, or with
+//! `--kind bytes` a `[u8]` of exactly `--size` bytes (default 1,000; byte `i` is `counter + i`, wrapping).
 //! `--skip-every K` leaves out one counter value after every K messages, to simulate loss. If it creates the
 //! service, it creates it with `subscriber_max_buffer_size` = `--buffer` (default 4096). With `--blocking` it
 //! requires the service without safe overflow (and creates it so), so a full subscriber buffer makes it wait
@@ -20,9 +22,17 @@ use iceoryx2::prelude::*;
 mod types;
 use types::{Tick, TickHeader};
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Tick,
+    Slice,
+    Bytes,
+}
+
 struct Args {
     service: String,
-    slice: bool,
+    kind: Kind,
+    size: usize,
     count: u64,
     rate: f64,
     wait_subscribers: usize,
@@ -37,7 +47,8 @@ struct Args {
 fn parse() -> Result<Args, String> {
     let mut a = Args {
         service: String::new(),
-        slice: false,
+        kind: Kind::Tick,
+        size: 1000,
         count: 100,
         rate: 1000.0,
         wait_subscribers: 0,
@@ -53,7 +64,15 @@ fn parse() -> Result<Args, String> {
         let mut value = || it.next().ok_or(format!("{flag} needs a value"));
         match flag.as_str() {
             "--service" => a.service = value()?,
-            "--kind" => a.slice = value()? == "slice",
+            "--kind" => {
+                a.kind = match value()?.as_str() {
+                    "tick" => Kind::Tick,
+                    "slice" => Kind::Slice,
+                    "bytes" => Kind::Bytes,
+                    other => return Err(format!("unknown kind {other}")),
+                }
+            }
+            "--size" => a.size = value()?.parse().map_err(|_| "--size")?,
             "--count" => a.count = value()?.parse().map_err(|_| "--count")?,
             "--rate" => a.rate = value()?.parse().map_err(|_| "--rate")?,
             "--wait-subscribers" => {
@@ -175,7 +194,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::thread::sleep(args.linger);
         println!("sent {sent} failed {failed}");
     };
-    if args.slice {
+    if args.kind == Kind::Bytes {
+        let service = open_or_create!(node, &name, [u8], args.buffer, args.blocking);
+        let publisher = service
+            .publisher_builder()
+            .initial_max_slice_len(args.size)
+            .create()?;
+        start_send(
+            &mut |counter, header| {
+                let Ok(mut sample) = publisher.loan_slice_uninit(args.size) else {
+                    return false;
+                };
+                *sample.user_header_mut() = header;
+                let sample = sample.write_from_fn(|i| (counter as usize).wrapping_add(i) as u8);
+                sample.send().is_ok()
+            },
+            &|| service.dynamic_config().number_of_subscribers(),
+        );
+    } else if args.kind == Kind::Slice {
         let service = open_or_create!(node, &name, [u32], args.buffer, args.blocking);
         let publisher = service
             .publisher_builder()

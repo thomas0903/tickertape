@@ -14,9 +14,11 @@
 //!
 //! A replay can still feed a recorder that is recording the target name right now (for example `--original-names`
 //! while the recorder that wrote the journal still runs, or a journal that recorded a `replay/...` service). So, by
-//! default, the replay ends at the journal's committed end as it was when the replay started, and the replayer
-//! refuses a target name that the journal is recording at the moment (a service with a descriptor in the journal's
-//! newest segment while a writer holds the journal) unless [`ReplayerBuilder::allow_live_targets`] is given.
+//! default, the replay ends at the journal's committed end as it was when the replay started, and while a writer
+//! holds the journal the replayer refuses a target name that any descriptor in the journal names, unless
+//! [`ReplayerBuilder::allow_live_targets`] is given. It learns those names by reading the whole journal once before
+//! the replay, so where the descriptors lie doesn't matter; a service the recorder hasn't opened yet (still waiting
+//! for it to appear) has no descriptor and isn't known, and a replay that creates it is recorded, once.
 //!
 //! # Types
 //!
@@ -173,7 +175,7 @@ pub struct ReplayReport {
     /// Data records skipped because the descriptor they name is no longer in the journal (retention or archiving
     /// removed its segment).
     pub undescribed: u64,
-    /// Other records passed over (descriptors, loss records, other schemas).
+    /// Other records passed over (descriptors, loss records, fillers, other schemas).
     pub other_records: u64,
     /// Per target service.
     pub services: Vec<ReplayServiceReport>,
@@ -201,7 +203,11 @@ pub struct ReplayerBuilder {
     linger: Duration,
     end_at_start: bool,
     allow_live_targets: bool,
+    on_start: Option<OnStart>,
 }
+
+/// Called once a replay has started.
+type OnStart = Box<dyn FnOnce() + Send>;
 
 impl core::fmt::Debug for ReplayerBuilder {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -300,7 +306,23 @@ impl ReplayerBuilder {
         self
     }
 
-    /// Whether `SIGINT` and `SIGTERM` stop the replay cleanly. Default: true.
+    /// Whether this run handles `SIGINT` and `SIGTERM`. Default: true.
+    ///
+    /// With true, while the run is active: the first of these signals that the run's signal thread takes sets the
+    /// stop flag, and the run stops cleanly (a final checkpoint for a recorder; the stop reason is "signal"). A
+    /// signal it takes after that ends the process at once with exit status 130 (`SIGINT`) or 143 (`SIGTERM`), with
+    /// no final checkpoint. Signals of one kind that arrive before the thread has taken the previous one are merged
+    /// into one (by the signal iterator, and by the operating system, which keeps at most one pending signal of each
+    /// kind), so two of the same kind sent back to back can stop the run cleanly instead of ending the process; a
+    /// `SIGINT` and a `SIGTERM` are never merged. A handler the process installed before the first run still runs
+    /// first.
+    ///
+    /// When the run returns, and no other run in the process is handling signals, `SIGINT` and `SIGTERM` end the
+    /// process as their default action would: the first run installs, for the rest of the process's life, an action
+    /// that emulates the default whenever no run handles signals. So a process that handles these signals itself
+    /// should pass false and stop runs with the stop flag.
+    ///
+    /// With false, the run leaves the process's signal handling alone.
     pub fn handle_signals(mut self, on: bool) -> Self {
         self.handle_signals = on;
         self
@@ -332,8 +354,20 @@ impl ReplayerBuilder {
 
     /// Allows target names that the journal is recording right now (default: refused). A recorder of such a
     /// service records the replay into the journal being replayed.
+    ///
+    /// While a writer holds the journal (a recorder, or an import), the replayer first reads the whole journal
+    /// once, up to its committed end, and refuses every target name that a descriptor anywhere in it names, wherever
+    /// that descriptor lies. Names without a descriptor yet are not known: a recorder still waiting for a service
+    /// to appear records a replay that creates it. The replay then still ends at the journal's end as it was when
+    /// the replay started ([`ReplayerBuilder::end_at_start`]), so it makes one pass, not a loop.
     pub fn allow_live_targets(mut self, on: bool) -> Self {
         self.allow_live_targets = on;
+        self
+    }
+
+    /// Called once, after signal handling is installed and the journal is open, before the first record is read.
+    pub fn on_start(mut self, f: impl FnOnce() + Send + 'static) -> Self {
+        self.on_start = Some(Box::new(f));
         self
     }
 
@@ -401,6 +435,7 @@ impl Replayer {
             linger: Duration::ZERO,
             end_at_start: true,
             allow_live_targets: false,
+            on_start: None,
         }
     }
 
@@ -451,10 +486,11 @@ impl Replayer {
             .create::<ipc::Service>()
             .map_err(|e| Error::iox("create node", e))?;
         let mut reader = Reader::open(&config.journal, ReaderConfig::default())?;
-        // The end now, and the names the journal is recording now (if a writer holds it).
+        // The end now, and the names the journal is recording now (if a writer holds it): every service with a
+        // descriptor anywhere in the journal.
         let tail = crate::tail::read(&config.journal)?;
         let live: BTreeSet<String> = if crate::tail::has_live_writer(&config.journal)? {
-            tail.services
+            crate::catalog::service_names(&config.journal, tail.end_seq)?
         } else {
             BTreeSet::new()
         };
@@ -480,6 +516,9 @@ impl Replayer {
             pacing: None,
             end: ReplayEnd::EndOfJournal,
         };
+        if let Some(f) = config.on_start.take() {
+            f();
+        }
         loop {
             if config.stop.load(Ordering::Relaxed) {
                 report.end = stopped();
@@ -506,7 +545,15 @@ impl Replayer {
                         continue;
                     }
                     Decoded::Data(data) => data,
-                    Decoded::Loss(_) | Decoded::Other => {
+                    Decoded::Loss(loss) => {
+                        // Checked against its descriptor like everywhere else, though nothing is sent for it.
+                        if let Some(d) = catalog.resolve(seq, loss.descriptor_seq)? {
+                            loss.check(&d).map_err(layout_error)?;
+                        }
+                        report.other_records += 1;
+                        continue;
+                    }
+                    Decoded::Filler(_) | Decoded::Other => {
                         report.other_records += 1;
                         continue;
                     }

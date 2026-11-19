@@ -20,6 +20,10 @@ pub struct Info {
     pub records: u64,
     /// Records with schema ids this crate doesn't write.
     pub other_records: u64,
+    /// Filler records: zeros that end a segment early so that the descriptors start the next one. Not data.
+    pub filler_records: u64,
+    /// Payload bytes of the filler records.
+    pub filler_bytes: u64,
     /// Data and loss records skipped because the descriptor they name is no longer in the journal (retention or
     /// archiving removed its segment).
     pub undescribed_records: u64,
@@ -44,7 +48,7 @@ pub struct Run {
     pub imported: bool,
     /// Services that have a descriptor in this run.
     pub services: Vec<String>,
-    /// Descriptor records of this run still in the journal (the recorder repeats them at each segment start).
+    /// Descriptor records of this run still in the journal (repeated in every segment that holds the run's records).
     pub descriptors: u64,
 }
 
@@ -59,7 +63,7 @@ pub struct Service {
     pub user_header_type: String,
     /// Recording runs with a descriptor of this service still in the journal.
     pub runs: u64,
-    /// Descriptor records (repeated at each segment start, so several per run).
+    /// Descriptor records (repeated in every segment that holds the service's records, so several per run).
     pub descriptors: u64,
     /// Messages recorded (whose descriptor is still in the journal).
     pub messages: u64,
@@ -153,6 +157,10 @@ pub fn scan(dir: impl AsRef<Path>, durable_only: bool) -> Result<Info, Error> {
                 let service = service_entry(&mut services, &d);
                 service.loss_records += 1;
                 service.missing_messages = service.missing_messages.saturating_add(loss.missing());
+            }
+            Decoded::Filler(len) => {
+                info.filler_records += 1;
+                info.filler_bytes = info.filler_bytes.saturating_add(len as u64);
             }
             Decoded::Other => info.other_records += 1,
         }

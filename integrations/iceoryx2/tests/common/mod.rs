@@ -5,8 +5,8 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tickertape::{Reader, ReaderConfig};
@@ -60,39 +60,80 @@ pub fn unique(name: &str) -> String {
 pub struct Proc {
     pub child: Option<Child>,
     pub what: String,
-    // Output is drained by threads as it comes, so a chatty child never blocks on a full pipe.
-    out: Option<std::thread::JoinHandle<String>>,
-    err: Option<std::thread::JoinHandle<String>>,
+    // Output is drained by threads as it comes, so a chatty child never blocks on a full pipe; what has arrived so
+    // far can be looked at while the child runs.
+    out: Arc<Mutex<String>>,
+    err: Arc<Mutex<String>>,
+    drains: Vec<std::thread::JoinHandle<()>>,
 }
 
-fn drain(mut r: impl Read + Send + 'static) -> std::thread::JoinHandle<String> {
+fn drain(
+    mut r: impl Read + Send + 'static,
+    into: Arc<Mutex<String>>,
+) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
-        let mut s = String::new();
-        let _ = r.read_to_string(&mut s);
-        s
+        let mut buf = [0u8; 4096];
+        loop {
+            match r.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => into
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push_str(&String::from_utf8_lossy(&buf[..n])),
+            }
+        }
     })
 }
 
 impl Proc {
     pub fn spawn(program: &Path, args: &[&str]) -> Proc {
+        Proc::spawn_with_env(program, args, &[])
+    }
+
+    pub fn spawn_with_env(program: &Path, args: &[&str], env: &[(&str, &str)]) -> Proc {
         let mut child = Command::new(program)
             .args(args)
             .env(
                 "IOX2_LOG_LEVEL",
                 std::env::var("TT_TEST_IOX2_LOG").unwrap_or_else(|_| "Error".into()),
             )
+            .envs(env.iter().copied())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .unwrap_or_else(|e| panic!("spawn {}: {e}", program.display()));
-        let out = drain(child.stdout.take().expect("stdout"));
-        let err = drain(child.stderr.take().expect("stderr"));
+        let out = Arc::new(Mutex::new(String::new()));
+        let err = Arc::new(Mutex::new(String::new()));
+        let drains = vec![
+            drain(child.stdout.take().expect("stdout"), Arc::clone(&out)),
+            drain(child.stderr.take().expect("stderr"), Arc::clone(&err)),
+        ];
         Proc {
             child: Some(child),
             what: format!("{} {}", program.display(), args.join(" ")),
-            out: Some(out),
-            err: Some(err),
+            out,
+            err,
+            drains,
+        }
+    }
+
+    /// Waits until the child has written `needle` to stdout or stderr, at most `timeout`.
+    pub fn wait_for_output(&self, needle: &str, timeout: Duration) {
+        let seen = || {
+            [&self.out, &self.err]
+                .iter()
+                .any(|b| b.lock().unwrap_or_else(|e| e.into_inner()).contains(needle))
+        };
+        let deadline = Instant::now() + timeout;
+        while !seen() {
+            assert!(
+                Instant::now() < deadline,
+                "{} did not print {needle:?} within {timeout:?}; stderr:\n{}",
+                self.what,
+                self.err.lock().unwrap_or_else(|e| e.into_inner())
+            );
+            std::thread::sleep(Duration::from_millis(5));
         }
     }
 
@@ -119,29 +160,24 @@ impl Proc {
             if Instant::now() > deadline {
                 let _ = child.kill();
                 let _ = child.wait();
-                let err = self
-                    .err
-                    .take()
-                    .map(|h| h.join().unwrap_or_default())
-                    .unwrap_or_default();
+                for d in self.drains.drain(..) {
+                    let _ = d.join();
+                }
                 panic!(
-                    "{} did not exit within {timeout:?}; stderr:\n{err}",
-                    self.what
+                    "{} did not exit within {timeout:?}; stderr:\n{}",
+                    self.what,
+                    self.err.lock().unwrap_or_else(|e| e.into_inner())
                 );
             }
             std::thread::sleep(Duration::from_millis(10));
         };
-        let out = self
-            .out
-            .take()
-            .map(|h| h.join().unwrap_or_default())
-            .unwrap_or_default();
-        let err = self
-            .err
-            .take()
-            .map(|h| h.join().unwrap_or_default())
-            .unwrap_or_default();
-        (status, out, err)
+        for d in self.drains.drain(..) {
+            let _ = d.join();
+        }
+        let take = |b: &Arc<Mutex<String>>| {
+            std::mem::take(&mut *b.lock().unwrap_or_else(|e| e.into_inner()))
+        };
+        (status, take(&self.out), take(&self.err))
     }
 
     /// Whether it has exited.
@@ -225,6 +261,9 @@ pub fn scan(dir: &Path) -> Vec<Rec> {
             "tickertape sequence numbers must have no gaps or duplicates"
         );
         expected += 1;
+        if r.schema_id == layout::SCHEMA_FILLER {
+            continue;
+        }
         out.push(
             match layout::decode(r.schema_id, r.payload).expect("decode") {
                 Decoded::Descriptor(d) => {
@@ -251,7 +290,9 @@ pub fn scan(dir: &Path) -> Vec<Rec> {
                     }
                 }
                 Decoded::Loss(l) => Rec::Loss(r.seq, l),
-                Decoded::Other => panic!("unexpected schema {:#x} at {}", r.schema_id, r.seq),
+                Decoded::Filler(_) | Decoded::Other => {
+                    panic!("unexpected schema {:#x} at {}", r.schema_id, r.seq)
+                }
             },
         );
     }
@@ -522,4 +563,182 @@ pub fn run_of(descriptor: &RawDescriptor, first_seq: u64, n: u64) -> Vec<(u32, V
         ));
     }
     out
+}
+
+/// Schema id of a filler record.
+pub const FILLER: u32 = layout::SCHEMA_FILLER;
+
+/// What [`check_placement`] found in a journal.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Placement {
+    /// Segments in the journal.
+    pub segments: usize,
+    /// Data records.
+    pub data: u64,
+    /// Loss records.
+    pub loss: u64,
+    /// Descriptor records.
+    pub descriptors: u64,
+    /// Filler records.
+    pub fillers: u64,
+    /// Data and loss records too large to share a segment with the descriptor they name (the documented exception).
+    pub exceptions: u64,
+    /// Data and loss records whose descriptor is not in the journal any more (after retention), exceptions included.
+    pub undescribed: u64,
+    /// Segments holding a data or loss record (other than an exception) of a service whose descriptor is not among
+    /// the descriptors the segment starts with: it comes later in the segment (a service opened, or reopened,
+    /// mid-segment, or a new recording run).
+    pub not_leading: u64,
+}
+
+/// Checks the placement guarantee of the layout for every segment of the journal in `dir`:
+///
+/// - every data and loss record has the descriptor it names in its own segment, before it, unless the record is
+///   too large to share a segment with that descriptor (counted in [`Placement::exceptions`]; if the descriptor is
+///   gone too, it is also counted as undescribed);
+/// - so a segment that holds data or loss records starts with a descriptor, unless it starts with such an
+///   exception or a filler;
+/// - a filler holds zeros and fills its segment exactly: it ends where the trailer starts.
+pub fn check_placement(dir: &Path) -> Placement {
+    use tickertape::format::{SEGMENT_HEADER_LEN, SEGMENT_TRAILER_LEN, align8, frame_len};
+    let segments = tickertape::inspect::list_segments(dir).expect("list segments");
+    let frame = |payload: usize| align8(u64::from(frame_len(payload).expect("frame length")));
+    // Descriptor lengths by sequence number, for every descriptor still in the journal.
+    let mut descriptor_len: std::collections::HashMap<u64, usize> = Default::default();
+    let mut descriptor_name: std::collections::HashMap<u64, String> = Default::default();
+    {
+        let mut reader = Reader::open(dir, ReaderConfig::default()).expect("open journal");
+        while let Some(r) = reader.try_next().expect("read journal") {
+            if r.schema_id == layout::SCHEMA_DESCRIPTOR {
+                descriptor_len.insert(r.seq, r.payload.len());
+                let d = Descriptor::decode(r.payload).expect("descriptor");
+                descriptor_name.insert(r.seq, d.service_name);
+            }
+        }
+    }
+    let mut out = Placement {
+        segments: segments.len(),
+        ..Placement::default()
+    };
+    for (k, segment) in segments.iter().enumerate() {
+        let next_base = segments.get(k + 1).map(|s| s.base_seq);
+        let mut reader = Reader::open(dir, ReaderConfig::default()).expect("open journal");
+        reader.seek(segment.base_seq).expect("seek segment");
+        let mut used = SEGMENT_HEADER_LEN as u64;
+        let mut here: std::collections::HashSet<u64> = Default::default();
+        let mut leading: std::collections::HashSet<String> = Default::default();
+        let mut in_leading_run = true;
+        let mut not_leading = false;
+        let mut filled = false;
+        while let Some(r) = reader.try_next().expect("read journal") {
+            if next_base.is_some_and(|n| r.seq >= n) {
+                break;
+            }
+            assert!(
+                !filled,
+                "record {} follows a filler in segment {}",
+                r.seq, segment.base_seq
+            );
+            used += frame(r.payload.len());
+            let named = match layout::decode(r.schema_id, r.payload).expect("decode") {
+                Decoded::Descriptor(d) => {
+                    here.insert(r.seq);
+                    if in_leading_run {
+                        leading.insert(d.service_name.clone());
+                    }
+                    out.descriptors += 1;
+                    None
+                }
+                Decoded::Data(d) => {
+                    out.data += 1;
+                    Some(d.descriptor_seq)
+                }
+                Decoded::Loss(l) => {
+                    out.loss += 1;
+                    Some(l.descriptor_seq)
+                }
+                Decoded::Filler(_) => {
+                    assert!(
+                        r.payload.iter().all(|b| *b == 0),
+                        "filler {} holds zeros",
+                        r.seq
+                    );
+                    assert_eq!(
+                        used,
+                        segment.segment_size - SEGMENT_TRAILER_LEN as u64,
+                        "filler {} fills segment {} exactly",
+                        r.seq,
+                        segment.base_seq
+                    );
+                    out.fillers += 1;
+                    filled = true;
+                    None
+                }
+                _ => panic!("unexpected schema {:#x} at {}", r.schema_id, r.seq),
+            };
+            if r.schema_id != layout::SCHEMA_DESCRIPTOR {
+                in_leading_run = false;
+            }
+            let Some(descriptor_seq) = named else {
+                continue;
+            };
+            if here.contains(&descriptor_seq) {
+                not_leading |= !leading.contains(&descriptor_name[&descriptor_seq]);
+                continue;
+            }
+            // Not in this segment: allowed only for a record too large to share a segment with its descriptor.
+            let Some(&len) = descriptor_len.get(&descriptor_seq) else {
+                out.undescribed += 1;
+                out.exceptions += 1;
+                continue;
+            };
+            let together = SEGMENT_HEADER_LEN as u64 + frame(len) + frame(r.payload.len());
+            assert!(
+                together > segment.segment_size - SEGMENT_TRAILER_LEN as u64,
+                "record {} (payload {} bytes) in segment {} names descriptor {descriptor_seq}, which is not in its \
+                 segment, although both fit in one",
+                r.seq,
+                r.payload.len(),
+                segment.base_seq
+            );
+            out.exceptions += 1;
+        }
+        out.not_leading += u64::from(not_leading);
+    }
+    out
+}
+
+/// A service name of exactly `len` bytes that no other test or run uses, so that descriptors of different runs
+/// have the same length.
+pub fn unique_of_len(name: &str, len: usize) -> String {
+    let mut s = unique(name);
+    assert!(s.len() <= len, "{s} is longer than {len}");
+    while s.len() < len {
+        s.push('x');
+    }
+    s
+}
+
+/// Removes all but the newest `keep` segments of the journal in `dir`, as `tickertape archive --keep-segments`
+/// does: with `to`, moves them there (`--to`), otherwise deletes them. Returns how many were removed.
+pub fn archive(dir: &Path, keep: usize, to: Option<&Path>) -> usize {
+    use tickertape::retention::{self, Action, Policy};
+    let plan = retention::plan(dir, &Policy::default().max_segments(keep)).expect("plan");
+    let action = to.map_or(Action::Delete, |p| Action::MoveTo(p.to_path_buf()));
+    retention::apply(dir, &plan, &action)
+        .expect("apply")
+        .removed_segments as usize
+}
+
+/// Copies the journal directory `from` (its segments and checkpoint marker) to `to`.
+pub fn copy_journal(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).expect("create copy");
+    for entry in std::fs::read_dir(from).expect("read journal dir") {
+        let entry = entry.expect("entry");
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.ends_with(".tape") || name == "checkpoint" {
+            std::fs::copy(entry.path(), to.join(&*name)).expect("copy");
+        }
+    }
 }

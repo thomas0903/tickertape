@@ -18,15 +18,18 @@ fn a_signal_stops_only_the_run_it_arrived_in() {
     let dir = tempfile::tempdir().unwrap();
     let service = unique("signals");
     let run = |stop_with_signal: bool| {
+        // The stopper starts once the run has installed its signal handlers (`on_start`).
+        let (started, start) = std::sync::mpsc::channel();
         let recorder = Recorder::builder(dir.path().join("j"))
             .service_typed::<u64>(&service)
             .handle_signals(true)
             .max_duration(Duration::from_secs(30))
+            .on_start(move |_| started.send(()).unwrap())
             .build()
             .unwrap();
         let stop = recorder.stop_flag();
         let stopper = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(300));
+            start.recv().unwrap();
             if stop_with_signal {
                 signal_hook::low_level::raise(signal_hook::consts::SIGTERM).unwrap();
             } else {

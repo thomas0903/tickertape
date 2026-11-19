@@ -104,38 +104,54 @@ fn typed_record_then_typed_replay() {
     assert!(err.to_string().contains("registered Rust types"), "{err}");
 }
 
-/// With small segments and retention, the recorder writes every open service's descriptor at the start of each
-/// segment, so every segment that survives can be decoded on its own: no record is left without its descriptor.
+/// With small segments and the writer's retention policy, every segment holds the descriptor of the records in it,
+/// so every segment that survives can be decoded on its own: no record is left without its descriptor. With small
+/// messages and with messages of about 1 KiB (1,008 bytes leave room for a descriptor at the end of each full
+/// segment, which round 1 wrongly used).
 #[test]
 fn descriptors_repeat_per_segment_and_survive_retention() {
     let _serial = serial();
-    const N: u64 = 4000;
+    retention_case(None, 4000);
+    retention_case(Some(1008), 600);
+}
+
+fn retention_case(bytes: Option<usize>, n: u64) {
     let dir = tempfile::tempdir().unwrap();
     let journal = dir.path().join("j");
     let service = unique("retention");
-    let publisher = Proc::spawn(
-        &example("publisher"),
-        &[
-            "--service",
-            &service,
-            "--count",
-            &N.to_string(),
-            "--rate",
-            "4000",
-            "--wait-subscribers",
-            "1",
-            "--blocking",
-        ],
-    );
+    let mut args = vec![
+        "--service".to_string(),
+        service.clone(),
+        "--count".into(),
+        n.to_string(),
+        "--rate".into(),
+        "4000".into(),
+        "--wait-subscribers".into(),
+        "1".into(),
+        "--blocking".into(),
+    ];
+    if let Some(size) = bytes {
+        args.extend([
+            "--kind".into(),
+            "bytes".into(),
+            "--size".into(),
+            size.to_string(),
+        ]);
+    }
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let publisher = Proc::spawn(&example("publisher"), &args);
     wait_for_service(&service, SECS(20));
-    let recorder = Recorder::builder(&journal)
-        .typed(
-            TypedService::<Tick, TickHeader>::new(&service).counter(CounterField {
-                location: CounterLocation::UserHeader,
-                offset: 0,
-                width: 8,
-            }),
-        )
+    let counter = CounterField {
+        location: CounterLocation::UserHeader,
+        offset: 0,
+        width: 8,
+    };
+    let builder = Recorder::builder(&journal);
+    let builder = match bytes {
+        None => builder.typed(TypedService::<Tick, TickHeader>::new(&service).counter(counter)),
+        Some(_) => builder.typed(TypedService::<[u8], TickHeader>::new(&service).counter(counter)),
+    };
+    let recorder = builder
         .writer_config(
             tickertape::WriterConfig::default()
                 .segment_size(65_536)
@@ -147,37 +163,34 @@ fn descriptors_repeat_per_segment_and_survive_retention() {
         )
         .checkpoint_interval(Duration::from_millis(20))
         .handle_signals(false)
-        .max_messages(N)
+        .max_messages(n)
         .max_duration(Duration::from_secs(60))
         .build()
         .unwrap();
     let report = recorder.run().unwrap();
     let (status, _, err) = publisher.wait(SECS(30));
     assert!(status.success(), "{err}");
-    assert_eq!(report.messages, N);
+    assert_eq!(report.messages, n);
     assert!(report.services[0].descriptors >= 6, "{report:?}");
 
     let segments = tickertape::inspect::list_segments(&journal).unwrap();
     assert_eq!(segments.len(), 3, "retention kept three segments");
     assert!(segments[0].base_seq > 0, "older segments were removed");
-    for segment in &segments {
-        let mut reader =
-            tickertape::Reader::open(&journal, tickertape::ReaderConfig::default()).unwrap();
-        reader.seek(segment.base_seq).unwrap();
-        let first = reader.try_next().unwrap().unwrap();
-        assert_eq!(
-            first.schema_id,
-            tickertape_iceoryx2::layout::SCHEMA_DESCRIPTOR,
-            "segment at {} starts with the descriptor",
-            segment.base_seq
-        );
-    }
+    let placement = check_placement(&journal);
+    assert_eq!(placement.exceptions, 0, "{placement:?}");
+    assert_eq!(placement.not_leading, 0, "{placement:?}");
+    assert_eq!(placement.undescribed, 0, "{placement:?}");
     let info = tickertape_iceoryx2::info::scan(&journal, false).unwrap();
     assert_eq!(info.undescribed_records, 0, "{info:?}");
+    assert_eq!(info.filler_records, placement.fillers, "{info:?}");
+    if bytes.is_some() {
+        assert!(info.filler_records > 0, "{info:?}");
+    }
     assert_eq!(info.runs.len(), 1);
     assert_eq!(info.services[0].runs, 1);
     let data = info.services[0].messages;
-    assert!(data > 0 && data < N, "{data}");
+    assert!(data > 0 && data < n, "{data}");
+    assert_eq!(data, placement.data);
 }
 
 /// The safe `Replayer::run` replays only services registered with their Rust types; everything else needs the

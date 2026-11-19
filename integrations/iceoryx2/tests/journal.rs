@@ -561,18 +561,16 @@ fn signals_stop_cleanly_and_a_second_one_exits_at_once() {
         "300000",
         "--json",
     ];
+    // Each process says when it has started, which is after its signal handlers are installed.
     let recorder = Proc::spawn(&cli(), &record_args);
-    wait_until(SECS(20), "the journal", || {
-        journal.join("writer.lock").exists()
-    });
-    std::thread::sleep(Duration::from_millis(200));
+    recorder.wait_for_output("tickertape-iox2: recording into", SECS(20));
     recorder.signal("TERM");
     let (status, out, err) = recorder.wait(SECS(20));
     assert!(status.success(), "{err}");
     assert!(out.contains("\"stop_reason\":\"signal\""), "{out}");
 
     let recorder = Proc::spawn(&cli(), &record_args);
-    std::thread::sleep(Duration::from_millis(500));
+    recorder.wait_for_output("tickertape-iox2: recording into", SECS(20));
     let pid = recorder.pid().to_string();
     let killed = std::process::Command::new("sh")
         .args(["-c", &format!("kill -TERM {pid} && kill -INT {pid}")])
@@ -606,11 +604,109 @@ fn signals_stop_cleanly_and_a_second_one_exits_at_once() {
             "--json",
         ],
     );
-    std::thread::sleep(Duration::from_millis(800));
+    replay.wait_for_output("tickertape-iox2: replaying", SECS(20));
     replay.signal("TERM");
     let (status, out, err) = replay.wait(SECS(20));
     assert!(status.success(), "{err}");
     let report: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(report["messages"], 0, "{report}");
     assert_eq!(report["end"], "signal");
+}
+
+/// A loss record that doesn't match its descriptor (here: the descriptor has no counter) is malformed for every
+/// reader, not only `info`: `replay` and `export` refuse it too (exit 2), as the layout's validity rules require.
+#[test]
+fn loss_records_are_checked_against_their_descriptor_by_every_reader() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let journal = j(&dir);
+    let service = unique("loss-check");
+    let loss = tickertape_iceoryx2::layout::LossRecord {
+        kind: tickertape_iceoryx2::layout::LossKind::Gap,
+        width: 8,
+        descriptor_seq: 0,
+        publisher_id: 0,
+        expected: 1,
+        received: 3,
+    }
+    .encode()
+    .unwrap()
+    .to_vec();
+    let mut records = run_of(&RawDescriptor::new(&service, u64_type()), 0, 2);
+    records.push((tickertape_iceoryx2::layout::SCHEMA_LOSS, loss));
+    records.push((SCHEMA_DATA, raw_data(0, &[], &7u64.to_le_bytes())));
+    append_records(&journal, SEGMENT, &records);
+    let path = journal.to_str().unwrap();
+    let out = dir.path().join("x.iox2");
+    let prefix = format!("{}/", unique("loss-check-target"));
+    for args in [
+        vec!["info", path],
+        vec!["replay", path, "--linger-ms", "0", "--prefix", &prefix],
+        vec!["export", path, "--output", out.to_str().unwrap()],
+    ] {
+        let (status, _, err) = run(&cli(), &args, SECS(30));
+        assert_eq!(status.code(), Some(2), "{args:?}: {err}");
+        assert!(err.contains("counter"), "{args:?}: {err}");
+    }
+    assert!(!out.exists());
+}
+
+/// A file written by the real upstream recorder (`iox2 service record` 0.10.0; provenance in
+/// `tests/fixtures/README.md`) imports: its types, message bytes, order and relative times arrive in the journal.
+#[test]
+fn import_reads_a_file_written_by_upstream() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = j(&dir);
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/iox2-0.10.0-record-ticks.txt");
+    let report: serde_json::Value = serde_json::from_str(&run_ok(
+        &cli(),
+        &[
+            "import",
+            fixture.to_str().unwrap(),
+            journal.to_str().unwrap(),
+            "--start-unix-ns",
+            "1700000000000000000",
+            "--json",
+        ],
+        SECS(30),
+    ))
+    .unwrap();
+    assert_eq!(report["service"], "tt-fixture/ticks", "{report}");
+    assert_eq!(report["messages"], 5, "{report}");
+    assert_eq!(report["iceoryx2_version"], "0.10.0", "{report}");
+    let recs = scan(&journal);
+    let Rec::Descriptor(_, d) = &recs[0] else {
+        panic!("{:?}", recs[0]);
+    };
+    assert!(d.imported);
+    assert_eq!(d.payload.name, "tickertape_iceoryx2::example::Tick");
+    assert_eq!((d.payload.size, d.payload.alignment), (24, 8));
+    assert_eq!(
+        d.user_header.name,
+        "tickertape_iceoryx2::example::TickHeader"
+    );
+    assert_eq!(d.user_header.size, 16);
+    let offsets_ms = [0u64, 23, 40, 69, 81];
+    let data: Vec<_> = recs[1..]
+        .iter()
+        .map(|r| match r {
+            Rec::Data {
+                local_ts_ns,
+                header,
+                payload,
+                publisher_id,
+                ..
+            } => (*local_ts_ns, header.clone(), payload.clone(), *publisher_id),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(data.len(), 5);
+    for (i, (ts, header, payload, publisher)) in data.iter().enumerate() {
+        assert_eq!(*ts, 1_700_000_000_000_000_000 + offsets_ms[i] * 1_000_000);
+        assert_eq!(counter_of(header), i as u64, "the user header's counter");
+        assert_eq!(counter_of(payload), i as u64, "the payload's counter");
+        assert_eq!(payload.len(), 24);
+        assert_eq!(*publisher, 0, "publisher ids are not imported");
+    }
 }

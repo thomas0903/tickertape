@@ -5,20 +5,21 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
-- Integration: `tickertape-iceoryx2` 0.1.0 in `integrations/iceoryx2` (ADR 0030; outside the workspace, own lockfile
-  and version, not published). Records one or several iceoryx2 publish/subscribe services into a journal (a
-  descriptor per service, repeated at every segment start so retained segments decode on their own, then one record
-  per message with publisher id, user header and payload; layout version 1 documented byte by byte, with a growth
-  rule and validity rules), with periodic and final checkpoints, clean SIGINT/SIGTERM handling, per-service failures
+- Integration: `tickertape-iceoryx2` 0.1.0 in `integrations/iceoryx2` (ADR 0030; outside the workspace, own lockfile and
+  version, not published). Records one or several iceoryx2 publish/subscribe services into a journal (a descriptor per
+  service, repeated so that every segment holds the descriptors of the records in it (a filler record ends a segment
+  early when needed) and retained segments decode on their own, then one record per message with publisher id, user
+  header and payload; layout version 1 documented byte by byte, with a growth rule and validity rules), with periodic
+  and final checkpoints, clean SIGINT/SIGTERM handling (default actions restored between runs), per-service failures
   that are reported and retried, and loss records from an optional publisher-side counter. Every size, alignment,
   element count and service setting read from a journal or file is validated before it reaches iceoryx2. Replays from
   any sequence number onto renamed services (`replay/` by default), as fast as possible or at the recorded pace with
-  late-send reports, refusing type changes on one target and names the journal is recording live; typed replay is
-  safe, replay by recorded type details is an `unsafe fn`. Exports to iceoryx2's recording files and imports their
-  human-readable form with its own parser, all or nothing. A typed recorder and replayer use only iceoryx2's public
-  API; recording services by name (feature `dynamic`, used by the `tickertape-iox2` tool) uses API iceoryx2 marks
-  internal, so iceoryx2 is pinned to `=0.10.0`. CI builds and tests it on Linux x86-64, Linux aarch64 and macOS, and
-  weekly (informational) against the newest iceoryx2 release and upstream `main`.
+  late-send reports, refusing type changes on one target and names the journal is recording live; typed replay is safe,
+  replay by recorded type details is an `unsafe fn`. Exports to iceoryx2's recording files and imports their
+  human-readable form with its own parser, all or nothing. A typed recorder and replayer use only iceoryx2's public API;
+  recording services by name (feature `dynamic`, used by the `tickertape-iox2` tool) uses API iceoryx2 marks internal,
+  so iceoryx2 is pinned to `=0.10.0`. CI builds and tests it on Linux x86-64, Linux aarch64 and macOS, and weekly
+  (informational) against the newest iceoryx2 release and upstream `main`.
 - Dependencies: `deny.toml` allows the 0BSD licence (public-domain equivalent; `enum-iterator`, required by iceoryx2,
   in the integration's lockfile).
 - Benchmarks: the test of a lagging reader under retention no longer depends on machine speed (it failed on

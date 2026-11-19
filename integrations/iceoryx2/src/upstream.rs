@@ -52,13 +52,14 @@ use std::time::Duration;
 use iceoryx2::prelude::*;
 use iceoryx2_userland_record_and_replay::prelude::*;
 use serde::Serialize;
-use tickertape::{NewRecord, Reader, ReaderConfig, Writer, WriterConfig};
+use tickertape::{NewRecord, Reader, ReaderConfig, WriterConfig};
 
 use crate::dynamic::{system_header_detail, type_detail};
 use crate::layout::{
-    self, DataRecord, Decoded, Descriptor, MAX_SERVICE_NAME_LEN, SCHEMA_DATA, SCHEMA_DESCRIPTOR,
-    ServiceSettings, TypeInfo, TypeVariant, Version,
+    self, DataRecord, Decoded, Descriptor, MAX_SERVICE_NAME_LEN, SCHEMA_DATA, ServiceSettings,
+    TypeInfo, TypeVariant, Version,
 };
+use crate::placement::Journal;
 use crate::recorder::service_name;
 use crate::{Catalog, Error};
 
@@ -242,7 +243,14 @@ fn export_to(
                 continue;
             }
             Decoded::Data(d) => d,
-            _ => continue,
+            Decoded::Loss(loss) => {
+                // Not exported, but checked against its descriptor like everywhere else.
+                if let Some(d) = catalog.resolve(seq, loss.descriptor_seq)? {
+                    loss.check(&d).map_err(layout_error)?;
+                }
+                continue;
+            }
+            Decoded::Filler(_) | Decoded::Other => continue,
         };
         let Some(d) = catalog.resolve(seq, data.descriptor_seq)? else {
             report.undescribed += 1;
@@ -312,18 +320,23 @@ fn services_in(journal: &Path, options: &ExportOptions) -> Result<BTreeSet<Strin
         if options.to.is_some_and(|to| seq > to) {
             break;
         }
-        match layout::decode(record.schema_id, record.payload)
-            .map_err(|source| Error::Layout { seq, source })?
-        {
+        let layout_error = |source| Error::Layout { seq, source };
+        match layout::decode(record.schema_id, record.payload).map_err(layout_error)? {
             Decoded::Descriptor(d) => {
                 catalog.insert(seq, *d);
             }
             Decoded::Data(data) => {
                 if let Some(d) = catalog.resolve(seq, data.descriptor_seq)? {
+                    data.check(&d).map_err(layout_error)?;
                     names.insert(d.service_name.clone());
                 }
             }
-            _ => {}
+            Decoded::Loss(loss) => {
+                if let Some(d) = catalog.resolve(seq, loss.descriptor_seq)? {
+                    loss.check(&d).map_err(layout_error)?;
+                }
+            }
+            Decoded::Filler(_) | Decoded::Other => {}
         }
     }
     Ok(names)
@@ -389,7 +402,8 @@ pub struct ImportReport {
 }
 
 /// Appends the messages of a human-readable iceoryx2 recording file to the journal at `journal` (created if
-/// needed), as one new recording run with one descriptor, then checkpoints. The file is read and validated
+/// needed), as one new recording run, then checkpoints. Its descriptor is written first and again in every segment
+/// the run fills, as the recorder does ([where descriptors lie](crate::layout#where-descriptors-lie)). The file is read and validated
 /// completely first (see the [module docs](self#import-is-all-or-nothing)).
 ///
 /// # Errors
@@ -431,16 +445,12 @@ pub fn import(
     };
     let invalid = |e: layout::LayoutError| Error::Upstream(format!("{}: {e}", input.display()));
     descriptor.validate().map_err(invalid)?;
-    // Everything is checked; now append.
-    let mut writer = Writer::open(journal.as_ref(), options.writer_config.clone())?;
-    descriptor.run_start_seq = writer.next_seq();
+    // Everything is checked; now append, with the descriptor repeated wherever the recorder would repeat it (see
+    // where descriptors lie, in the layout docs).
+    let mut journal = Journal::open(journal.as_ref(), options.writer_config.clone(), 1)?;
+    descriptor.run_start_seq = journal.writer.next_seq();
     let bytes = descriptor.encode().map_err(invalid)?;
-    let descriptor_seq = writer.append(&NewRecord {
-        schema_id: SCHEMA_DESCRIPTOR,
-        venue_ts_ns: 0,
-        local_ts_ns: start_unix_ns,
-        payload: &bytes,
-    })?;
+    let descriptor_seq = journal.open_service(0, bytes, start_unix_ns)?;
     let mut messages = 0;
     for record in &file.records {
         let data = DataRecord {
@@ -449,24 +459,38 @@ pub fn import(
             user_header: &record.user_header,
             payload: &record.payload,
         };
-        let payload = data.encode().map_err(invalid)?;
+        let len = data.encoded_len().map_err(invalid)?;
         let offset = record.timestamp_ms.saturating_mul(1_000_000);
-        writer.append(&NewRecord {
-            schema_id: SCHEMA_DATA,
-            venue_ts_ns: 0,
-            local_ts_ns: start_unix_ns.saturating_add(offset),
-            payload: &payload,
-        })?;
+        journal.append_named(
+            0,
+            &NewRecord {
+                schema_id: SCHEMA_DATA,
+                venue_ts_ns: 0,
+                local_ts_ns: start_unix_ns.saturating_add(offset),
+                payload: &[],
+            },
+            len,
+            // The length was checked above, so this can't fail; if it did, the panic makes the writer discard the
+            // record instead of committing it.
+            |buf, descriptor_seq| {
+                DataRecord {
+                    descriptor_seq,
+                    ..data
+                }
+                .encode_into(buf)
+                .expect("data record length checked")
+            },
+        )?;
         messages += 1;
     }
-    writer.checkpoint()?;
+    journal.writer.checkpoint()?;
     Ok(ImportReport {
         service: file.service_name,
         iceoryx2_version: file.iceoryx2_version.to_string(),
         descriptor_seq,
         messages,
         start_unix_ns,
-        next_seq: writer.next_seq(),
+        next_seq: journal.writer.next_seq(),
     })
 }
 

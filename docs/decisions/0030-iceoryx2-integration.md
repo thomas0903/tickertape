@@ -120,3 +120,40 @@ Nothing had been released, so the layout changed in place (still version 1). Wha
 - **Exact pin.** iceoryx2 is pinned to `=0.10.0` while internal APIs are used; the weekly job against upstream is
   informational.
 
+
+## Amendment: review round 2 (2026-11-19)
+
+The first review of round 2 reproduced that the repeated descriptors of round 1 did not hold for ordinary message
+sizes: the recorder wrote the descriptors when the next *data record* would start a new segment, but a ~300-byte
+descriptor usually still fitted in the old segment, so the descriptors landed at its end and the data record opened
+the new segment with nothing before it (with 1,000-byte messages and 64 KiB segments, only segment 0 started with a
+descriptor). Retained segments then decoded as "undescribed", and the replayer's live-target guard, which read
+descriptors from the newest segment only, found no services and didn't refuse. Nothing was released; the layout stays
+version 1. What was decided:
+
+- **The placement rule is stated as what readers need:** every data and loss record has the descriptor it names in its
+  own segment, before it, except a record too large to share a segment with that descriptor (`64 + align8(40 + d) +
+  align8(40 + r) > segment size − 8`). New segments start with the descriptors of all open services; when they don't
+  all fit with the record, with the record's own descriptor (the others follow before their next records).
+- **A filler record, not a core change.** tickertape's `Writer` starts a new segment only when a record doesn't fit
+  and has no call to start one, and the core stays unchanged. So when the descriptors must start a new segment and the
+  first of them would still fit in the old one, the recorder first appends a filler (schema id `0x4932_0004`, all
+  zeros) of exactly the space left. A filler is written only when that descriptor fits, so it is never smaller than a
+  record; with less room than that, the descriptor rolls by itself. Version-1 readers already ignore unknown reserved
+  schema ids, so this needs no new version; `info` reports fillers apart from data. The alternative, writing the
+  descriptors and the record as one unit, would need a record format of its own or a core call to roll, and would make
+  every reader unpack it.
+- **No copied constants.** The recorder computes the space left with tickertape's public `format` module (frame
+  length, 8-byte alignment, `record_fits`, header and trailer sizes); tests check against a real writer that a filler
+  of exactly that size stays in its segment and that the next record rolls. The importer uses the same code (it used
+  to write one descriptor per run).
+- **The live-target guard reads the whole journal.** While a writer holds the journal, the replayer reads it once and
+  refuses every target name that any descriptor names, wherever it lies. A service the recorder is still waiting for
+  has no descriptor and is not known; the replay ends at the journal's end as it was at start, so that case is one
+  pass, not a loop. Documented rather than solved: the journal holds nothing that names it.
+- **Signals.** A run with signal handling (the default) installs, the first time, a conditional default action for
+  `SIGINT` and `SIGTERM` that is armed whenever no run handles signals, so a library user's process can be stopped with
+  Ctrl-C again after a run. Same-kind signals arriving before the run's signal thread has taken the previous one are
+  merged (as the operating system merges pending signals), and the documentation now says so instead of promising
+  that a second signal always exits.
+- **Every reader checks loss records** against their descriptor (`replay` and `export` did not).
