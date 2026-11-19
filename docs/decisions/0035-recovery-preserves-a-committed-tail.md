@@ -193,7 +193,9 @@ not open" means that the successor itself is invalid: the writer's open reports 
 header, an invalid header, a size that does not match the header, a base that does not match the name) or as an
 unsupported format version. Any other error opening, reading or mapping it is an I/O error (`EACCES` on files restored
 read-only, `EMFILE`, `ENOMEM` or a mapping limit), which says nothing about the journal: the open returns it under
-either policy before changing anything, as the seal branch does for a successor that a valid seal names. Taken as a
+either policy without changing anything at `P` or at the successor, as the seal branch does for a successor that a
+valid seal names (what the scan did before it reached `P`, a seal written in front of an earlier segment for
+example, stays). Taken as a
 broken chain, such an error after a plain crash between publishing the successor and sealing `X` would preserve the
 seal's CRC word, replace `X` and quarantine the healthy successor and every later segment, or make `Fail` report
 `BrokenChain` and hide the cause (`::successor_that_fails_to_open_for_an_io_error_fails_the_open`: once the error is
@@ -223,8 +225,13 @@ this state: `X`'s records end at `P` without a seal, and the segment that would 
 entered. `BadSeal` would say that the bytes at `P` are a damaged seal in front of a successor that continues the
 chain, which recovery then reseals; here nothing continues, and with bytes past the seal's place they need not be a
 seal at all. The successor's own error (`BadMagic`, `BadSegmentHeader`, `SizeMismatch`, for example) describes another file at
-offset 0, and `verify` reports it there when the successor fails its read-only checks; the writer's report is about
-`X`, where the chain ends. So the writer and `verify` agree on the reason and the position.
+offset 0 (offset 8 for an unsupported version), and `verify` reports it there when the successor fails its
+read-only checks; the writer's report is about `X`, where the chain ends. So in the two cases this change adds
+(only the seal's CRC word left, or other bytes with no higher-base segment) the writer and `verify` agree on the
+reason and the position. They do not in the two it leaves alone: with other bytes and a higher-base segment the
+writer reports `EmptyCommitWord` for that segment's base at `P` where `verify` reports `BrokenChain`, and with
+nothing non-zero after `P` a refusing writer reports `BrokenChain` at the successor's offset 0 where `verify` reports
+it at `P`.
 
 `verify` reports `BrokenChain` at `P` in every case of this paragraph where the search of `X` finds nothing, and a
 problem at the successor only when it fails `verify`'s own read-only checks (a segment the writer cannot open
@@ -432,8 +439,8 @@ time it takes to read the tail. A repair costs writing the quarantine copy and t
 - What `Fail` does not promise: it does not change the bytes of the corruption it reports, nor anything after them in
   that segment, and moves no file, but the open is not read-only. Before scanning it creates the lock file if it is
   missing and writes its PID into it (best effort), removes stale temporary names (`*.tape.tmp`, the prepared spare),
-  and creates the checkpoint file if it is missing or extends it to its full length if it is shorter, so a refused
-  open can still have changed those files. When it refuses, the changes recovery made earlier in the scan stay in
+  and creates the checkpoint file if it is missing (a marker shorter than its full length is left as it is: only a
+  successful checkpoint extends it), so a refused open can still have changed those files. When it refuses, the changes recovery made earlier in the scan stay in
   place: the clean-ups a process crash needs (a zeroed torn tail, a seal written for a crash between publishing a
   successor and sealing, for example in segment `X` when the corruption is in its successor, a created missing
   successor), and the zeroing at an empty commit word where the search completed without evidence, which after

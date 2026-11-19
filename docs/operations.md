@@ -382,7 +382,7 @@ the writer or retention.
   damage also destroyed the checkpoint marker (C13).
 - **What `Fail` still does when it refuses:** it leaves the bytes of the corruption it reports, and everything after
   them in that segment, unchanged, and moves no file, but the open is not read-only. Before scanning it may create
-  the lock file and the checkpoint file or extend the checkpoint file, writes its PID into the lock file (best
+  the lock file and the checkpoint file, writes its PID into the lock file (best
   effort), and removes stale temporary files (`*.tape.tmp`, `next-segment.tmp`); and it keeps changes recovery made
   earlier in the scan, including bytes zeroed in place. Crash contract C11 lists them.
 - **Refused to open** (missing checkpoint segment or a gap in the chain): restore the missing segments from a copy,

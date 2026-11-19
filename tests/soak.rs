@@ -1012,6 +1012,10 @@ impl Soak {
                             let kept = fs::read(&a[5]).unwrap();
                             let mut word = vec![0; 4];
                             word.extend_from_slice(&format::seal_crc(seq).to_le_bytes());
+                            // The copy ends at the tail's last non-zero byte, and a CRC can end in zero bytes.
+                            while word.last() == Some(&0) {
+                                word.pop();
+                            }
                             assert_eq!(
                                 kept, word,
                                 "writer {epoch}: preserved bytes in front of {file}"

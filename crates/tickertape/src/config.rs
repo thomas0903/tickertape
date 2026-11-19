@@ -30,7 +30,7 @@ pub enum RecoveryPolicy {
     /// Return [`Error::Corrupt`](crate::Error::Corrupt) from [`Writer::open`](crate::Writer::open) instead of
     /// quarantining or repairing anything. The bytes at the corrupt position it reports, and everything after them in
     /// that segment, are left untouched, and no segment is moved. The open is not read-only, though: before it scans
-    /// it may create the lock file and create or extend the checkpoint file, writes its PID into the lock file (best
+    /// it may create the lock file and the checkpoint file, writes its PID into the lock file (best
     /// effort) and removes stale temporary files, and it keeps what recovery changed earlier in the scan, including
     /// bytes zeroed in place, which after storage damage can be published records (`docs/crash-contract.md`, C11,
     /// lists these changes).
