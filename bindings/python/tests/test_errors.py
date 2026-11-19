@@ -232,6 +232,23 @@ def test_every_exception_survives_pickle_with_its_attributes() -> None:
             assert (copy.errno, copy.strerror, copy.filename) == (28, os.strerror(28), Path("/journal"))
 
 
+def test_pickle_keeps_the_current_attribute_values() -> None:
+    error = tt.BatchAppendError("batch failed", appended=3, first_seq=10, failed_index=3)
+    error.failed_index = 7
+    error.first_seq = None
+    setattr(error, "extra", "added later")
+    copy = pickle.loads(pickle.dumps(error))
+    assert (copy.appended, copy.first_seq, copy.failed_index, getattr(copy, "extra")) == (3, None, 7, "added later")
+    error.message = "changed message"
+    assert pickle.loads(pickle.dumps(error)).message == "changed message"
+    io_error = tt.JournalIOError("io failed", op="open", storage_full=False, errno=2, strerror="gone",
+                                 filename=Path("/a"))
+    io_error.op = "changed"
+    io_error.filename = Path("/b")
+    copy = pickle.loads(pickle.dumps(io_error))
+    assert (copy.op, copy.errno, copy.strerror, copy.filename) == ("changed", 2, "gone", Path("/b"))
+
+
 def test_real_io_error_survives_pickle_and_has_the_os_message(journal: Path) -> None:
     with pytest.raises(tt.JournalIOError) as raised:
         tt.Reader(journal / "missing")

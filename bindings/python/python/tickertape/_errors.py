@@ -5,8 +5,8 @@ Every exception raised for a ``tickertape::Error`` is a :class:`TickertapeError`
 handlers work too: :class:`JournalIOError` is an :class:`OSError`, :class:`RecordTooLargeError` and
 :class:`InvalidConfigError` are :class:`ValueError`, and :class:`SeqUnavailableError` is a :class:`LookupError`.
 
-Every exception keeps its message and documented attributes across ``pickle`` (for example when it is sent back from
-a ``multiprocessing`` worker). ``__cause__`` is not pickled, as for every Python exception.
+Every exception keeps its message and attributes, with their current values, across ``pickle`` (for example when it is
+sent back from a ``multiprocessing`` worker). ``__cause__`` is not pickled, as for every Python exception.
 """
 
 from __future__ import annotations
@@ -35,9 +35,13 @@ class TickertapeError(Exception):
         return self.message
 
     def __reduce__(self) -> tuple[Any, ...]:
-        # Rebuild from the message and fields: OSError keeps errno, strerror and filename outside __dict__, so the
-        # default reduction would lose them. Then restore anything else set on the instance (such as __notes__).
-        fields = self._tickertape_fields
+        # Rebuild from the current message and field values: OSError keeps errno, strerror and filename outside
+        # __dict__, so the default reduction would lose them. Then restore anything else set on the instance (such as
+        # __notes__).
+        names = list(self._tickertape_fields)
+        if isinstance(self, OSError):
+            names += [name for name in ("errno", "strerror", "filename") if name not in names]
+        fields = {name: getattr(self, name) for name in names}
         state = {key: value for key, value in self.__dict__.items()
                  if key not in fields and key not in ("message", "_tickertape_fields")}
         return (_rebuild, (type(self), self.message, fields), state or None)
@@ -126,10 +130,12 @@ class InvalidConfigError(TickertapeError, ValueError):
 class UsedAfterForkError(TickertapeError):
     """A :class:`Writer` or :class:`Reader` was used in a child process created by ``fork()``.
 
-    A handle belongs to the process that opened it. A forked child gets a copy that shares the parent's memory
-    mappings, file descriptors and writer lock but not its helper threads, so using it could overwrite records or
-    hang. Every method except ``close()`` raises this in the child, before touching anything; ``close()``, ``with``
-    and garbage collection in the child only discard the copy. Open handles after forking, or use the ``spawn`` or
+    A handle belongs to the process that opened it (its process id and a count of forks, so a reused process id is
+    still recognised). A forked child gets a copy that shares the parent's memory mappings, file descriptors and writer
+    lock but not its helper threads, so using it could overwrite records or hang. Every method except ``close()``
+    raises this in the child, before touching anything. ``close()``, ``with`` and garbage collection in the child
+    release the child's copies of the descriptors and mappings, without unlocking, syncing, or changing any file, so
+    the journal can be reopened once the parent closes its writer. Open handles after forking, or use the ``spawn`` or
     ``forkserver`` start method of :mod:`multiprocessing`.
     """
 

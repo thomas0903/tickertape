@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Mutex, MutexGuard, PoisonError, TryLockError};
 
 use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::{PyTypeError, PyValueError};
@@ -16,6 +16,17 @@ use crate::config::{self, Retention};
 use crate::errors;
 use crate::owner::Owner;
 use crate::reports;
+
+/// In a child created by `fork`: takes the value out of a handle's mutex without waiting. A mutex that was locked
+/// when the process forked stays locked here (the thread that held it exists only in the parent); its value is then
+/// left for the handle's `Drop`, which needs no lock.
+pub fn take_inherited<T>(mutex: &Mutex<Option<T>>) -> Option<T> {
+    match mutex.try_lock() {
+        Ok(mut guard) => guard.take(),
+        Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner().take(),
+        Err(TryLockError::WouldBlock) => None,
+    }
+}
 
 /// Locks a mutex without holding the GIL while waiting (no deadlock with a thread that holds the lock and needs
 /// the GIL), ignoring poisoning: every guarded value stays consistent between calls into the core crate.
@@ -76,12 +87,14 @@ impl<T: Copy + for<'a, 'py> FromPyObject<'a, 'py>> Column<T> {
         for item in obj.try_iter().map_err(|_| {
             PyTypeError::new_err(format!("{name} must be an int or a sequence of ints"))
         })? {
+            // The iterator's own exception comes first (it may be KeyboardInterrupt).
+            let item = item?;
             if values.len() == len {
                 return Err(PyValueError::new_err(format!(
                     "{name} has more values than the {len} payloads"
                 )));
             }
-            values.push(item?.extract::<T>().map_err(Into::into)?);
+            values.push(item.extract::<T>().map_err(Into::into)?);
         }
         if values.len() != len {
             return Err(PyValueError::new_err(format!(
@@ -131,7 +144,8 @@ fn check_payloads_container(payloads: &Bound<'_, PyAny>) -> PyResult<()> {
 /// Locking: the core writer sits in a mutex, taken without the GIL and never held while Python code runs (errors and
 /// reports are converted to Python objects after it is released). `closed` is a separate flag, readable without the
 /// lock. A handle used in another process than the one that opened it (a child created by `fork`) raises
-/// `UsedAfterForkError` and never touches the shared journal state there, not even to close.
+/// `UsedAfterForkError` and never touches the shared journal state there. Closing or dropping it there releases only
+/// that process's copies of the descriptors and mappings (`tickertape::Writer::release_after_fork`).
 #[pyclass(frozen, module = "tickertape")]
 #[derive(Debug)]
 pub struct Writer {
@@ -142,12 +156,19 @@ pub struct Writer {
 }
 
 impl Writer {
-    /// Runs `f` on the open core writer, with the mutex held and the GIL held. `f` must not run Python code.
-    fn with<R>(&self, py: Python<'_>, f: impl FnOnce(&mut tickertape::Writer) -> R) -> PyResult<R> {
+    /// Raises `UsedAfterForkError` in a forked child, `ValueError` after `close()`. Called before consuming any
+    /// argument.
+    fn check(&self, py: Python<'_>) -> PyResult<()> {
         self.owner.check(py, "Writer")?;
         if self.closed.load(Ordering::Acquire) {
             return Err(errors::closed("writer"));
         }
+        Ok(())
+    }
+
+    /// Runs `f` on the open core writer, with the mutex held and the GIL held. `f` must not run Python code.
+    fn with<R>(&self, py: Python<'_>, f: impl FnOnce(&mut tickertape::Writer) -> R) -> PyResult<R> {
+        self.check(py)?;
         let mut guard = lock(py, &self.inner);
         match guard.as_mut() {
             Some(writer) => Ok(f(writer)),
@@ -161,10 +182,7 @@ impl Writer {
         py: Python<'_>,
         f: impl FnOnce(&mut tickertape::Writer) -> R + Send,
     ) -> PyResult<R> {
-        self.owner.check(py, "Writer")?;
-        if self.closed.load(Ordering::Acquire) {
-            return Err(errors::closed("writer"));
-        }
+        self.check(py)?;
         py.detach(|| {
             let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
             guard.as_mut().map(f)
@@ -176,10 +194,12 @@ impl Writer {
 impl Drop for Writer {
     fn drop(&mut self) {
         if self.owner.is_foreign() {
-            // A copy made by fork(): its helper threads don't exist here, and the mappings and lock belong to the
-            // parent. Leak it; the process exit releases what this copy holds.
+            // A copy made by fork(): its helper threads don't exist here, and the lock, the files and the wake-up
+            // region belong to the parent. Release only this process's descriptors and mappings.
             let inner = self.inner.get_mut().unwrap_or_else(PoisonError::into_inner);
-            std::mem::forget(inner.take());
+            if let Some(writer) = inner.take() {
+                writer.release_after_fork();
+            }
         }
     }
 }
@@ -243,7 +263,7 @@ impl Writer {
         venue_ts_ns: u64,
         local_ts_ns: u64,
     ) -> PyResult<u64> {
-        self.owner.check(py, "Writer")?;
+        self.check(py)?;
         let payload = Payload::extract(payload)?;
         let result = self.with(py, |w| {
             w.append(&NewRecord {
@@ -269,7 +289,7 @@ impl Writer {
         venue_ts_ns: Option<&Bound<'py, PyAny>>,
         local_ts_ns: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyRange>> {
-        self.owner.check(py, "Writer")?;
+        self.check(py)?;
         check_payloads_container(payloads)?;
         let mut items = Vec::new();
         for item in payloads.try_iter()? {
@@ -376,10 +396,14 @@ impl Writer {
 
     /// Releases the lock and closes the journal files, without a checkpoint: records appended since the last
     /// checkpoint stay visible but are not made durable. Calling it again does nothing. In a child created by
-    /// `fork`, it only marks this copy closed and touches nothing the parent owns.
+    /// `fork`, it closes only this process's copies of the descriptors and mappings: the parent keeps the lock, and
+    /// nothing is synced, joined or removed.
     fn close(&self, py: Python<'_>) {
         self.closed.store(true, Ordering::Release);
         if self.owner.is_foreign() {
+            if let Some(writer) = take_inherited(&self.inner) {
+                writer.release_after_fork();
+            }
             return;
         }
         let writer = lock(py, &self.inner).take();
@@ -388,11 +412,13 @@ impl Writer {
     }
 
     fn __enter__(slf: Bound<'_, Self>) -> PyResult<Bound<'_, Self>> {
-        slf.get().owner.check(slf.py(), "Writer")?;
-        if slf.get().closed() {
-            return Err(errors::closed("writer"));
-        }
+        slf.get().check(slf.py())?;
         Ok(slf)
+    }
+
+    /// Test only: pretends this handle was opened by process `pid` (to simulate process-id reuse after `fork`).
+    fn _set_owner_pid_for_testing(&self, pid: u32) {
+        self.owner.set_pid_for_testing(pid);
     }
 
     /// Closes the writer (see `close()`); does not checkpoint and does not suppress exceptions.

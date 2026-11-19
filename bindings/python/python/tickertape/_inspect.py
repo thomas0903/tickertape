@@ -20,7 +20,9 @@ class Checkpoint(NamedTuple):
 
     generation: int
     next_seq: int
-    """Every record with a smaller sequence number was durable when the slot was written."""
+    """The marker's coverage boundary: the marker covers the records with a smaller sequence number, and a durable-only
+    reader returns only those. What "durable" means for covered records, and under which storage assumptions, is in
+    the crash contract (https://github.com/thomas0903/tickertape/blob/main/docs/crash-contract.md)."""
     segment_base_seq: int
     offset: int
 

@@ -8,6 +8,7 @@ import signal
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 from pathlib import Path
 
@@ -391,3 +392,342 @@ def test_handles_refuse_use_after_fork(journal: Path, prefault: bool) -> None:
     assert parent == {"parent_append": 1, "parent_next": 0}
     assert records == [[0, "zero"], [1, "parent"], [2, "after"]]
     assert tt.verify(journal).ok
+
+
+# A signal whose handler raises arrives at a random moment of a read that returns a large result, often while the
+# result is being built. The records must either reach the caller or stay staged for the next read. A timer signal
+# (SIGALRM) is used because the kernel delivers it while the reading thread holds the GIL, which a Python thread
+# could not do. One loss is tolerated: the documented window after the call has returned its result and before
+# Python stores it, which is a few microseconds long and can be told apart because the cursor had already moved
+# when the handler ran.
+INTERRUPTED_WHILE_BUILDING = """
+    import random, signal, sys, time
+    import tickertape as tt
+
+    path, call = sys.argv[1], sys.argv[2]
+    if call == "next":
+        count, size, segment = 1, 24 << 20, 64 << 20
+    elif call == "read_many":
+        count, size, segment = 200_000, 16, 32 << 20
+    else:
+        count, size, segment = 20_000, 1024, 64 << 20
+    with tt.Writer(path, segment_size=segment) as writer:
+        writer.append_many([i.to_bytes(8, "little") * (size // 8) for i in range(count)])
+    reader = tt.Reader(path)
+
+    def read():
+        if call == "next":
+            return reader.next(timeout=5)
+        if call == "read_many":
+            return reader.read_many(count, timeout=5)
+        return reader.read_batch(count, timeout=5)
+
+    def check(result):
+        records = [result] if call == "next" else result.records() if call == "read_batch" else result
+        assert [r.seq for r in records] == list(range(count)), (len(records), records[:1])
+        for r in records[:: max(1, count // 100)]:
+            assert r.payload == r.seq.to_bytes(8, "little") * (size // 8)
+
+    class Interrupt(Exception):
+        pass
+
+    armed, seen = [False], []
+
+    def handler(signum, frame):
+        if armed[0]:
+            armed[0] = False
+            seen.append(reader.position)
+            raise Interrupt
+
+    signal.signal(signal.SIGALRM, handler)
+    durations = []
+    for _ in range(5):
+        reader.seek(0)
+        started = time.perf_counter()
+        result = read()
+        durations.append(time.perf_counter() - started)
+        check(result)
+        del result
+    # Aim at the later part of the call, where the result is built (the first calls are slower).
+    duration = min(durations)
+    staged = after_return = delivered = 0
+    for attempt in range(40):
+        reader.seek(0)
+        box = []
+        seen.clear()
+        try:
+            armed[0] = True
+            signal.setitimer(signal.ITIMER_REAL, random.uniform(0.3 * duration, 1.0 * duration))
+            box.append(read())
+            armed[0] = False
+            signal.setitimer(signal.ITIMER_REAL, 0)
+        except Interrupt:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            if box:
+                delivered += 1  # the handler ran after the result was stored
+            elif seen[0] != 0:
+                after_return += 1  # the documented window: returned, not yet stored
+                continue
+            else:
+                staged += 1
+                assert reader.position == 0, reader.position
+                box.append(read())  # the interrupted call's records are returned by the next read
+        else:
+            delivered += 1
+        check(box[0])
+    print(staged, after_return, delivered)
+"""
+
+
+@pytest.mark.parametrize("call", ["next", "read_many", "read_batch"])
+def test_interrupt_while_the_result_is_built_keeps_the_records(journal: Path, call: str) -> None:
+    staged, after_return, delivered = map(int, run_script(INTERRUPTED_WHILE_BUILDING, journal, call,
+                                                          timeout=120).split())
+    assert after_return <= 1, (staged, after_return, delivered)
+    assert staged >= 5, (staged, after_return, delivered)  # the test did interrupt reads
+
+
+def test_signal_handler_reading_during_iteration_does_not_end_it(journal: Path) -> None:
+    """A handler that takes records while a ``for`` loop iterates must not make the loop stop early."""
+    script = """
+        import signal, sys
+        import tickertape as tt
+
+        path, count = sys.argv[1], 50_000
+        with tt.Writer(path, segment_size=16 << 20) as writer:
+            writer.append_many([b"%d" % i for i in range(count)])
+        reader = tt.Reader(path)
+        taken_by_handler = []
+
+        def handler(*_):
+            record = reader.try_next()
+            if record is not None:
+                taken_by_handler.append(record.seq)
+
+        signal.signal(signal.SIGALRM, handler)
+        signal.setitimer(signal.ITIMER_REAL, 0.0001, 0.0001)
+        looped = [record.seq for record in reader]
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, signal.SIG_IGN)
+        assert sorted(looped + taken_by_handler) == list(range(count)), (len(looped), len(taken_by_handler))
+        print(len(looped), len(taken_by_handler))
+    """
+    looped, by_handler = map(int, run_script(script, journal, timeout=60).split())
+    assert looped + by_handler == 50_000 and by_handler > 0
+
+
+def test_non_blocking_reads_in_two_threads_never_return_empty_early(journal: Path) -> None:
+    """``read_many(timeout=0)`` returns [] only when no committed record remains, even if another thread takes the
+    records it found staged."""
+    count = 10_000
+    with tt.Writer(journal, segment_size=SMALL_SEGMENT * 64) as w:
+        w.append_many([b"%d" % i for i in range(count)])
+    for _ in range(10):
+        reader = tt.Reader(journal)
+        results: dict[int, list[int]] = {0: [], 1: []}
+        premature: list[int] = []
+
+        def consume(me: int) -> None:
+            while True:
+                got = reader.read_many(10, timeout=0)
+                if not got:
+                    position = reader.position
+                    if position < count:
+                        premature.append(position)
+                    return
+                results[me].extend(r.seq for r in got)
+
+        threads = [threading.Thread(target=consume, args=(i,)) for i in results]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(30)
+        assert premature == [], premature
+        assert sorted(results[0] + results[1]) == list(range(count))
+        reader.close()
+
+
+@pytest.mark.parametrize("call", ["next", "read_many", "read_batch"])
+@pytest.mark.parametrize("closer", ["signal", "thread"])
+def test_reader_closed_at_the_deadline_raises(journal: Path, call: str, closer: str) -> None:
+    script = """
+        import os, signal, sys, threading, time
+        import tickertape as tt
+
+        path, call, closer = sys.argv[1:4]
+        writer = tt.Writer(path, segment_size=1 << 20)
+        for attempt in range(5):
+            reader = tt.Reader(path)
+            if closer == "signal":
+                signal.signal(signal.SIGALRM, lambda *_: reader.close())
+                signal.setitimer(signal.ITIMER_REAL, 0.03)
+            else:
+                threading.Timer(0.03, reader.close).start()
+            try:
+                # One wait slice (the deadline passes during it); the reader is closed before it ends.
+                if call == "next":
+                    result = reader.next(timeout=0.05)
+                elif call == "read_many":
+                    result = reader.read_many(10, timeout=0.05)
+                else:
+                    result = reader.read_batch(10, timeout=0.05)
+            except ValueError as error:
+                assert "closed" in str(error), error
+                continue
+            print("returned", repr(result))
+            sys.exit(1)
+        print("ok")
+    """
+    assert run_script(script, journal, call, closer).strip() == "ok"
+
+
+def test_a_read_behind_a_waiting_one_does_not_wait_past_its_deadline(journal: Path) -> None:
+    """A 40 ms read queued behind another waiter (which holds the reader for up to one 50 ms slice) measures its
+    remaining wait once it has the reader, instead of waiting its whole timeout again (about 90 ms)."""
+    script = """
+        import statistics, sys, threading, time
+        import tickertape as tt
+
+        path = sys.argv[1]
+        writer = tt.Writer(path, segment_size=1 << 20)
+        reader = tt.Reader(path)
+        stop = threading.Event()
+
+        def wait():
+            while not stop.is_set():
+                reader.next(timeout=0.2)
+
+        thread = threading.Thread(target=wait)
+        thread.start()
+        time.sleep(0.1)
+        took = []
+        for _ in range(20):
+            started = time.monotonic()
+            assert reader.next(timeout=0.04) is None
+            took.append(time.monotonic() - started)
+        stop.set()
+        thread.join()
+        print(f"{statistics.median(took):.4f}")
+    """
+    assert float(run_script(script, journal)) < 0.07
+
+
+# The parent closes its writer while a forked child is still alive and has released its inherited copies. Both must
+# then be able to open a new writer: the child's copy of the lock file's descriptor no longer holds the lock.
+FORK_RELEASES = """
+    import gc, json, multiprocessing, os, sys, warnings
+    import tickertape as tt
+
+    warnings.simplefilter("ignore", DeprecationWarning)  # "use of fork() may lead to deadlocks" (3.12+)
+    path, prefault, how, start = sys.argv[1], sys.argv[2] == "1", sys.argv[3], sys.argv[4]
+    writer = tt.Writer(path, segment_size=1 << 20, prefault=prefault)
+    writer.append(b"zero")
+    reader = tt.Reader(path)
+    assert reader.try_next().seq == 0
+
+    def open_fds():
+        return len(os.listdir("/dev/fd"))
+
+    def child(to_parent, from_parent):
+        global writer, reader
+        before = open_fds()
+        if how == "close":
+            writer.close()
+            reader.close()
+        elif how == "exit":
+            writer.__exit__(None, None, None)
+            reader.__exit__(None, None, None)
+        else:
+            del writer, reader
+            gc.collect()
+        released = before - open_fds()
+        os.write(to_parent, b"r")
+        assert os.read(from_parent, 1) == b"g"
+        try:
+            with tt.Writer(path) as mine:
+                seq = mine.append(b"child")
+            result = {"released": released, "child_append": seq}
+        except Exception as error:
+            result = {"released": released, "error": repr(error)}
+        os.write(to_parent, json.dumps(result).encode())
+
+    to_parent_r, to_parent_w = os.pipe()
+    from_parent_r, from_parent_w = os.pipe()
+    if start == "os.fork":
+        pid = os.fork()
+        if pid == 0:
+            try:
+                child(to_parent_w, from_parent_r)
+            finally:
+                os._exit(0)
+        wait = lambda: os.waitpid(pid, 0)
+    else:
+        proc = multiprocessing.get_context("fork").Process(target=child, args=(to_parent_w, from_parent_r))
+        proc.start()
+        wait = proc.join
+    assert os.read(to_parent_r, 1) == b"r"  # the child has released its copies and is still alive
+    assert reader.try_next() is None
+    writer.close()
+    reader.close()
+    try:
+        with tt.Writer(path) as again:
+            parent_append = again.append(b"parent")
+    except tt.LockedError as error:
+        parent_append = repr(error)
+    os.write(from_parent_w, b"g")
+    child_result = json.loads(os.read(to_parent_r, 4096))
+    wait()
+    print(json.dumps({"parent_append": parent_append, **child_result}))
+    print(json.dumps([(r.seq, r.payload.decode()) for r in tt.Reader(path)]))
+"""
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs fork")
+@pytest.mark.parametrize("start", ["os.fork", "multiprocessing"])
+@pytest.mark.parametrize("how", ["close", "exit", "collect"])
+@pytest.mark.parametrize("prefault", [False, True], ids=["prefault=False", "prefault=True"])
+def test_forked_child_releases_the_journal(journal: Path, prefault: bool, how: str, start: str) -> None:
+    result, records = map(json.loads, run_script(FORK_RELEASES, journal, int(prefault), how, start).splitlines())
+    assert result["parent_append"] == 1, result
+    assert result.get("child_append") == 2, result
+    # The writer holds at least the lock file, the checkpoint file and a segment; the reader a segment.
+    assert result["released"] >= 4, result
+    assert records == [[0, "zero"], [1, "parent"], [2, "child"]]
+    assert tt.verify(journal).ok
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs fork")
+def test_fork_guard_survives_process_id_reuse(journal: Path) -> None:
+    """A handle whose recorded process id matches the current process is still foreign after a fork."""
+    script = """
+        import json, os, sys, warnings
+        import tickertape as tt
+
+        warnings.simplefilter("ignore", DeprecationWarning)
+        path = sys.argv[1]
+        writer = tt.Writer(path, segment_size=1 << 20)
+        reader = tt.Reader(path)
+        writer._set_owner_pid_for_testing(os.getpid())  # no change in the owner
+        assert writer.append(b"parent") == 0
+        pid = os.fork()
+        if pid == 0:
+            results = {}
+            # As if this child had been given the process id of the process that opened the handles.
+            writer._set_owner_pid_for_testing(os.getpid())
+            reader._set_owner_pid_for_testing(os.getpid())
+            for name, call in [("append", lambda: writer.append(b"child")), ("try_next", reader.try_next)]:
+                try:
+                    call()
+                    results[name] = "returned"
+                except tt.UsedAfterForkError:
+                    results[name] = "refused"
+            writer.close()
+            reader.close()
+            print(json.dumps(results), flush=True)
+            os._exit(0)
+        os.waitpid(pid, 0)
+        print(json.dumps([writer.append(b"after"), reader.try_next().seq]), flush=True)
+    """
+    child, parent = map(json.loads, run_script(script, journal).splitlines())
+    assert child == {"append": "refused", "try_next": "refused"}
+    assert parent == [1, 0]

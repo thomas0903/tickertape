@@ -10,6 +10,7 @@ import math
 import sys
 import threading
 import time
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -391,6 +392,41 @@ def test_append_many_stops_reading_an_endless_metadata_column(journal: Path) -> 
             w.append_many([b"a", b"b"], venue_ts_ns=iter(range(3)))
         assert time.monotonic() - started < 1
         assert w.next_seq == 0
+
+
+def test_append_many_propagates_the_metadata_iterators_own_exception(journal: Path) -> None:
+    def values_then(error: BaseException, count: int) -> Iterator[int]:
+        yield from range(count)
+        raise error
+
+    with tt.Writer(journal) as w:
+        for error in (KeyboardInterrupt(), RuntimeError("metadata source failed")):
+            with pytest.raises(type(error)) as caught:
+                w.append_many([b"a", b"b"], schema_id=values_then(error, 2))
+            assert caught.value is error
+            with pytest.raises(type(error)):
+                w.append_many([b"a", b"b"], local_ts_ns=values_then(error, 1))
+        assert w.next_seq == 0
+
+
+def test_closed_writer_consumes_nothing(journal: Path) -> None:
+    consumed: list[int] = []
+
+    def endless() -> Iterator[bytes]:
+        while len(consumed) < 1_000_000:  # bounded, so that a failing build fails instead of filling memory
+            consumed.append(1)
+            yield b"x"
+
+    w = tt.Writer(journal)
+    w.close()
+    started = time.monotonic()
+    with pytest.raises(ValueError, match="closed writer"):
+        w.append_many(endless())
+    with pytest.raises(ValueError, match="closed writer"):
+        w.append_many([b"a"], schema_id=itertools.count())
+    with pytest.raises(ValueError, match="closed writer"):
+        w.append(12345)  # type: ignore[arg-type]  # not a payload, but the closed state is checked first
+    assert consumed == [] and time.monotonic() - started < 1
 
 
 def test_payload_buffers_must_be_unsigned_bytes(journal: Path) -> None:

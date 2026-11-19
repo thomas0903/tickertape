@@ -137,3 +137,37 @@ def test_missing_optional_package_is_explained(journal: Path, monkeypatch: pytes
     monkeypatch.setitem(sys.modules, "pyarrow", None)
     with pytest.raises(ImportError, match="optional package 'pyarrow'"):
         batch.to_arrow()
+
+
+class _Index:
+    """An object with a custom ``__index__``."""
+
+    def __init__(self, result: object) -> None:
+        self.result = result
+
+    def __index__(self) -> int:
+        if isinstance(self.result, BaseException):
+            raise self.result
+        assert isinstance(self.result, int)
+        return self.result
+
+
+def test_batch_indexing_errors(journal: Path) -> None:
+    """Only an out-of-range integer is an IndexError; other index types are TypeError and exceptions propagate."""
+    write(journal, 3)
+    with tt.Reader(journal) as r:
+        batch = r.read_batch(10)
+    for bad in ("0", 1.5, None, b"0", [0]):
+        with pytest.raises(TypeError):
+            batch[bad]  # type: ignore[index]
+    for raised in (KeyboardInterrupt(), ValueError("from __index__"), OverflowError("from __index__")):
+        with pytest.raises(type(raised)) as caught:
+            batch[_Index(raised)]
+        assert caught.value is raised
+    for out_of_range in (3, -4, 2**63, 2**100, -(2**100)):
+        with pytest.raises(IndexError):
+            batch[out_of_range]
+        with pytest.raises(IndexError):
+            batch[_Index(out_of_range)]
+    assert batch[_Index(1)].seq == 1
+    assert batch[True].seq == 1 and batch[-1].seq == 2

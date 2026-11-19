@@ -112,23 +112,41 @@ never wait.
 Waits run in slices of at most 50 ms, and a waiting read holds its reader's mutex only during a slice. Between slices
 it checks a closed flag and calls `PyErr_CheckSignals` with the mutex released, so Ctrl-C raises `KeyboardInterrupt`
 within about 50 ms, signal handlers may use the reader without deadlocking, and `close()` from another thread or a
-handler ends the read with `ValueError` within a slice. Reads from several threads on one reader interleave between
-slices and share its cursor: each record is returned to exactly one caller. A reader is a cursor, so share one between
-threads only if they coordinate; use one reader per consumer.
+handler ends the read with `ValueError` within a slice (the flag is checked before a read reports a timeout, too). The
+remaining wait is computed after the mutex is acquired, so a read queued behind another waiter does not wait its full
+timeout again. Reads from several threads on one reader interleave between slices and share its cursor: each record
+is returned to exactly one caller. A reader is a cursor, so share one between threads only if they coordinate; use one
+reader per consumer.
 
-Records cross into Python in two steps: they are copied from the journal into a buffer in the reader, then, after the
-signal check, taken out and converted. If a signal handler raises, the buffered records stay and the next read returns
-them first, so a record is never skipped because of an interrupt that arrives before the read returns. A signal that
-arrives after the binding has returned, before Python stores the result, is handled by the interpreter as after any
-call, and the result is lost; no binding can prevent that, and the documentation says so.
+Records are staged in a buffer in the reader: copied from the journal into it with the mutex held, they leave it only
+when a read delivers them. A read checks for signals, builds its complete Python result from a copy of the front of
+the buffer (the list of `Record`s, the `RecordBatch`, or the single `Record`) with the mutex released, checks for
+signals again, and only then removes the records, after confirming (by a counter of buffer changes) that the front
+still holds the records it built from. If a handler raises, or building fails, at any of these points, the records
+stay staged and the next read returns them first. If another caller (a thread, or a read in a signal handler) took
+them meanwhile, the read discards its result and looks at the journal again; this terminates because it only happens
+when someone else advanced the cursor, and it means a read that does not wait returns nothing only when no committed
+record is left. After the second signal check no Python code runs in the call. A signal that arrives after the call
+has returned its result, before Python stores it, is handled by the interpreter as after any call, and the result is
+lost; no binding can prevent that, and the documentation says so.
 
-**Fork.** A handle records the id of the process that opened it. In any other process (a child created by `fork`,
-which `multiprocessing` uses by default on Linux before Python 3.14), every method raises `UsedAfterForkError`
-before taking a lock or touching the journal: the child's copy shares the parent's mappings, descriptors and writer
-lock but not its helper threads, so using it could overwrite the parent's records or fail to join threads. `close()`,
-`__exit__` and garbage collection in such a process only mark the copy closed and leak it (`mem::forget`), never
-releasing the lock or joining threads. Handles must be opened after forking, or the `spawn`/`forkserver` start method
-used.
+**Fork.** A handle records the id of the process that opened it and a fork generation, a counter that a hook
+registered with `os.register_at_fork(after_in_child=...)` at import advances in every child. In any process where
+either differs (a child created by `fork`, which `multiprocessing` uses by default on Linux before Python 3.14, or a
+later descendant that happens to get the opening process's id), every method raises `UsedAfterForkError` before
+taking a lock or touching the journal: the child's copy shares the parent's mappings, descriptors and writer lock but
+not its helper threads, so using it could overwrite the parent's records or fail to join threads.
+
+`close()`, `__exit__` and garbage collection in such a process release what the child holds and nothing else. The
+`flock` on `writer.lock` belongs to the open file description that parent and child share, so a child that kept its
+copy of the descriptor would keep the journal locked after the parent closed its writer. For the writer the bindings
+call `tickertape::Writer::release_after_fork`, a small method added to the core crate for this: it closes the child's
+descriptors and unmaps its mappings without unlocking the description (that would unlock the parent), syncing,
+joining or signalling the helper threads (which do not exist in the child), or removing or changing any file or the
+wake-up region; what the helper threads hold is leaked until the child exits. The core reader has no threads and
+writes nothing, so the child simply drops it. A mutex that was locked when the process forked (another thread was
+inside a call) stays locked in the child; then `close()` leaves the copy to garbage collection, which needs no lock.
+Handles must be opened after forking, or the `spawn`/`forkserver` start method used.
 
 **Errors.** Exceptions are defined in Python (`tickertape/_errors.py`) so they can also derive from built-ins:
 `TickertapeError` is the base; `JournalIOError` (also `OSError`, with `errno`, `filename`, `op`, `storage_full`) and
@@ -175,8 +193,9 @@ requests or branches. The one-time setup is in `docs/playbooks/release-checklist
 - A second lockfile to keep up to date; CI runs `cargo deny` on it too.
 - Not covered: free-threaded wheels, Windows, PyPy, Arrow PyCapsule export, live zero-copy access.
 - Tests: `bindings/python/tests/` (pytest) cover round trips, batches and partial failure, live following across
-  processes, durable-only reads, rolls, corruption, Ctrl-C (including a record arriving during the interrupted wait),
-  signal handlers that use or close the reader, cross-thread `close()`, threads sharing a writer or a reader, use
-  after `fork`, timeouts, pickling of every exception, context managers, the writer lock and cross-language fixtures
+  processes, durable-only reads, rolls, corruption, Ctrl-C (including a record arriving during the interrupted wait and
+  a signal while a large result is built), signal handlers that use or close the reader, cross-thread `close()`,
+  threads sharing a writer or a reader, use after `fork`, a child releasing the journal while it still runs, reused
+  process ids, timeouts, pickling of every exception, context managers, the writer lock and cross-language fixtures
   against the Rust CLI and the pure-Python decoder. `cargo test --manifest-path bindings/python/Cargo.toml` runs the
   conversion unit tests.

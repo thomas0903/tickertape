@@ -38,5 +38,6 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(inspect::list_segments, m)?)?;
     m.add_function(wrap_pyfunction!(inspect::read_checkpoint, m)?)?;
     m.add_function(wrap_pyfunction!(inspect::verify, m)?)?;
+    owner::register(m)?;
     Ok(())
 }

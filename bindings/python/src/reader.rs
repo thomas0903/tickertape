@@ -7,13 +7,13 @@ use std::time::{Duration, Instant};
 
 use pyo3::exceptions::{PyIndexError, PyStopIteration, PyTypeError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyList, PySlice, PyTuple};
+use pyo3::types::{PyBytes, PyDict, PyInt, PyList, PySlice, PyTuple};
 use tickertape::{ReaderConfig, Record as CoreRecord};
 
 use crate::config::{Backoff, Timeout};
 use crate::errors;
 use crate::owner::Owner;
-use crate::writer::lock;
+use crate::writer::{lock, take_inherited};
 
 /// Longest uninterrupted wait without the GIL, and the longest the reader's lock is held by a waiting read. Between
 /// slices the binding releases the lock and checks for signals, so Ctrl-C (`KeyboardInterrupt`) interrupts a blocking
@@ -181,16 +181,14 @@ impl Columns {
     }
 
     fn push(&mut self, r: &CoreRecord<'_>) {
-        self.push_fields(r.seq, r.schema_id, r.venue_ts_ns, r.local_ts_ns, r.payload);
-    }
-
-    fn push_fields(&mut self, seq: u64, schema_id: u32, venue: u64, local: u64, payload: &[u8]) {
         self.len += 1;
-        self.seq.extend_from_slice(&seq.to_le_bytes());
-        self.schema_id.extend_from_slice(&schema_id.to_le_bytes());
-        self.venue_ts_ns.extend_from_slice(&venue.to_le_bytes());
-        self.local_ts_ns.extend_from_slice(&local.to_le_bytes());
-        self.data.extend_from_slice(payload);
+        self.seq.extend_from_slice(&r.seq.to_le_bytes());
+        self.schema_id.extend_from_slice(&r.schema_id.to_le_bytes());
+        self.venue_ts_ns
+            .extend_from_slice(&r.venue_ts_ns.to_le_bytes());
+        self.local_ts_ns
+            .extend_from_slice(&r.local_ts_ns.to_le_bytes());
+        self.data.extend_from_slice(r.payload);
         self.offsets
             .extend_from_slice(&to_i64(self.data.len()).to_le_bytes());
     }
@@ -226,32 +224,45 @@ impl Columns {
         )
     }
 
-    /// A copy of records `[from, to)`.
-    fn slice(&self, from: usize, to: usize) -> Columns {
-        let mut out = Columns::with_capacity(to - from);
-        for i in from..to {
-            out.push_fields(
-                Columns::u64_at(&self.seq, i),
-                Columns::u32_at(&self.schema_id, i),
-                Columns::u64_at(&self.venue_ts_ns, i),
-                Columns::u64_at(&self.local_ts_ns, i),
-                self.payload(i),
-            );
+    /// Records `[from, from + n)` as a `RecordBatch` (not yet a Python object). Allocates only `bytes` objects,
+    /// which the garbage collector does not track, so no Python code runs.
+    fn batch(&self, py: Python<'_>, from: usize, n: usize) -> RecordBatch {
+        let (base, end) = (self.offset_at(from), self.offset_at(from + n));
+        let offsets = if base == 0 {
+            PyBytes::new(py, &self.offsets[from * 8..(from + n + 1) * 8])
+        } else {
+            // Offsets relative to the first payload of the batch.
+            let mut rebased = Vec::with_capacity((n + 1) * 8);
+            for i in from..=from + n {
+                rebased.extend_from_slice(&to_i64(self.offset_at(i) - base).to_le_bytes());
+            }
+            PyBytes::new(py, &rebased)
+        };
+        RecordBatch {
+            len: n,
+            seq: PyBytes::new(py, &self.seq[from * 8..(from + n) * 8]).unbind(),
+            schema_id: PyBytes::new(py, &self.schema_id[from * 4..(from + n) * 4]).unbind(),
+            venue_ts_ns: PyBytes::new(py, &self.venue_ts_ns[from * 8..(from + n) * 8]).unbind(),
+            local_ts_ns: PyBytes::new(py, &self.local_ts_ns[from * 8..(from + n) * 8]).unbind(),
+            payload_offsets: offsets.unbind(),
+            payload_data: PyBytes::new(py, &self.data[base..end]).unbind(),
         }
-        out
     }
 }
 
-/// Records read from the journal but not yet handed to Python, in front of the core reader's cursor.
+/// Records read from the journal but not yet delivered to Python ("staged"), in front of the core reader's cursor.
 ///
-/// A read first moves records from the core reader into this buffer (under the reader's lock, without running
-/// Python code), then releases the lock and checks for signals, and only then takes them out and converts them. If
-/// a signal handler raises (`KeyboardInterrupt`), the records stay here and the next read returns them.
+/// A read moves records from the core reader into this buffer and builds its result from a copy, leaving them
+/// staged; it removes them (`consume`) only once the Python result object is complete and no Python code can run
+/// any more in the call. If a signal handler raises (`KeyboardInterrupt`) or anything else fails before that, the
+/// records stay here and the next read returns them. `epoch` changes with every change to the buffer, so the
+/// removal can confirm that the front still holds the records the result was built from.
 #[derive(Debug)]
 struct Buffer {
     columns: Columns,
-    /// Records before `start` were already taken.
+    /// Records before `start` were already delivered.
     start: usize,
+    epoch: u64,
 }
 
 impl Buffer {
@@ -259,7 +270,12 @@ impl Buffer {
         Buffer {
             columns: Columns::with_capacity(0),
             start: 0,
+            epoch: 0,
         }
+    }
+
+    fn len(&self) -> usize {
+        self.columns.len - self.start
     }
 
     fn is_empty(&self) -> bool {
@@ -274,35 +290,43 @@ impl Buffer {
     fn reset(&mut self) {
         self.columns.clear();
         self.start = 0;
+        self.epoch = self.epoch.wrapping_add(1);
     }
 
-    /// Takes up to `max` records from the front.
-    fn take(&mut self, max: usize) -> Columns {
-        let n = max.min(self.columns.len - self.start);
-        if self.start == 0 && n == self.columns.len {
-            return std::mem::replace(&mut self.columns, Columns::with_capacity(0));
-        }
-        let out = self.columns.slice(self.start, self.start + n);
+    /// Removes `n` delivered records from the front.
+    fn consume(&mut self, n: usize) {
         self.start += n;
+        self.epoch = self.epoch.wrapping_add(1);
         if self.is_empty() {
             self.reset();
         }
-        out
     }
 
-    /// Takes the first record, as a `Record`. Allocates only the payload's `bytes`, which the garbage collector does
-    /// not track, so no Python code can run (this is called with the reader's lock held).
-    fn take_one(&mut self, py: Python<'_>) -> Option<Record> {
-        if self.is_empty() {
-            return None;
-        }
-        let record = self.columns.record(py, self.start);
-        self.start += 1;
-        if self.is_empty() {
-            self.reset();
-        }
-        Some(record)
+    /// The first staged record, as a `Record` (not yet a Python object). Allocates only the payload's `bytes`, which
+    /// the garbage collector does not track, so no Python code runs (this is called with the reader's lock held).
+    fn record(&self, py: Python<'_>, i: usize) -> Record {
+        self.columns.record(py, self.start + i)
     }
+
+    /// The first `n` staged records as `Record`s; see `record`.
+    fn records(&self, py: Python<'_>, n: usize) -> Vec<Record> {
+        (0..n).map(|i| self.record(py, i)).collect()
+    }
+
+    /// The first `n` staged records as a `RecordBatch`; see `Columns::batch`.
+    fn batch(&self, py: Python<'_>, n: usize) -> RecordBatch {
+        self.columns.batch(py, self.start, n)
+    }
+}
+
+/// What a read found staged, under the reader's lock.
+enum Staged<T> {
+    /// A result built from the first `count` staged records, which stay staged until `State::commit`.
+    Records { value: T, epoch: u64, count: usize },
+    /// No records were staged, but an error was held back; it has been taken.
+    Error(tickertape::Error),
+    /// Nothing: another caller took what `fill` found.
+    Nothing,
 }
 
 /// A batch of records as columns, each an immutable `bytes` object owned by the batch.
@@ -337,18 +361,6 @@ pub struct RecordBatch {
 }
 
 impl RecordBatch {
-    fn from_columns(py: Python<'_>, c: &Columns) -> Self {
-        RecordBatch {
-            len: c.len,
-            seq: PyBytes::new(py, &c.seq).unbind(),
-            schema_id: PyBytes::new(py, &c.schema_id).unbind(),
-            venue_ts_ns: PyBytes::new(py, &c.venue_ts_ns).unbind(),
-            local_ts_ns: PyBytes::new(py, &c.local_ts_ns).unbind(),
-            payload_offsets: PyBytes::new(py, &c.offsets).unbind(),
-            payload_data: PyBytes::new(py, &c.data).unbind(),
-        }
-    }
-
     fn record(&self, py: Python<'_>, i: usize) -> Record {
         let offsets = self.payload_offsets.bind(py).as_bytes();
         let (start, end) = (
@@ -380,7 +392,8 @@ impl RecordBatch {
     }
 
     /// Record `index` (negative indices count from the end), as a `Record` with its own copy of the payload.
-    /// Slicing is not supported (use `records()[a:b]`, or slice the arrays from `to_numpy()`).
+    /// Slicing is not supported (use `records()[a:b]`, or slice the arrays from `to_numpy()`). As for a list, other
+    /// non-integer indices raise `TypeError` and only an integer out of range raises `IndexError`.
     fn __getitem__(&self, py: Python<'_>, index: &Bound<'_, PyAny>) -> PyResult<Record> {
         if index.is_instance_of::<PySlice>() {
             return Err(PyTypeError::new_err(
@@ -388,6 +401,13 @@ impl RecordBatch {
                  from batch.to_numpy()",
             ));
         }
+        // Like a list: an object without `__index__` is a TypeError, and `__index__`'s own exceptions propagate.
+        let index = if index.is_instance_of::<PyInt>() {
+            index.clone()
+        } else {
+            py.import("operator")?.getattr("index")?.call1((index,))?
+        };
+        // Only an int too large for isize fails here; it is out of range.
         let index: isize = index
             .extract()
             .map_err(|_| PyIndexError::new_err("RecordBatch index out of range"))?;
@@ -555,27 +575,31 @@ impl State {
         }
     }
 
-    /// Takes up to `max` buffered records; with none buffered, the held-back error; `None` if there is neither.
-    /// Runs no Python code.
-    fn take(&mut self, max: usize) -> Result<Option<Columns>, tickertape::Error> {
+    /// Builds a result from up to `max` staged records with `build` (which must not run Python code), leaving them
+    /// staged; with none staged, takes the held-back error.
+    fn stage<T>(&mut self, max: usize, build: impl FnOnce(&Buffer, usize) -> T) -> Staged<T> {
         if !self.buffer.is_empty() {
-            Ok(Some(self.buffer.take(max)))
+            let count = max.min(self.buffer.len());
+            Staged::Records {
+                value: build(&self.buffer, count),
+                epoch: self.buffer.epoch,
+                count,
+            }
         } else if let Some(e) = self.pending.take() {
-            Err(e)
+            Staged::Error(e)
         } else {
-            Ok(None)
+            Staged::Nothing
         }
     }
 
-    /// Like `take(1)`, as a `Record` (see `Buffer::take_one`).
-    fn take_one(&mut self, py: Python<'_>) -> Result<Option<Record>, tickertape::Error> {
-        if let Some(record) = self.buffer.take_one(py) {
-            Ok(Some(record))
-        } else if let Some(e) = self.pending.take() {
-            Err(e)
-        } else {
-            Ok(None)
+    /// Delivers the records a `Staged::Records` result was built from: removes them if the buffer has not changed
+    /// since. Returns false if it has (another caller took or replaced them), and changes nothing then.
+    fn commit(&mut self, epoch: u64, count: usize) -> bool {
+        if self.buffer.epoch != epoch {
+            return false;
         }
+        self.buffer.consume(count);
+        true
     }
 }
 
@@ -590,6 +614,10 @@ impl State {
 /// to Python objects all run with it released. `closed` and the last known `position` are atomics, readable without
 /// the lock. `close()` sets the flag first, so a read waiting in another thread (or interrupted by a signal handler
 /// that closes the reader) ends within one slice with `ValueError`.
+///
+/// In a child created by `fork`, every method raises `UsedAfterForkError`; closing or dropping the copy there closes
+/// that process's segment descriptors and unmaps its wake-up region (the core reader has no threads and writes
+/// nothing, so dropping it is safe there).
 #[pyclass(frozen, module = "tickertape")]
 #[derive(Debug)]
 pub struct Reader {
@@ -602,16 +630,6 @@ pub struct Reader {
     owner: Owner,
     path: PathBuf,
     durable_only: bool,
-}
-
-impl Drop for Reader {
-    fn drop(&mut self) {
-        if self.owner.is_foreign() {
-            // A copy made by fork(): leave the parent's descriptors and mappings alone (see `Writer`'s drop).
-            let inner = self.inner.get_mut().unwrap_or_else(PoisonError::into_inner);
-            std::mem::forget(inner.take());
-        }
-    }
 }
 
 impl Reader {
@@ -677,17 +695,21 @@ impl Reader {
     /// Reads up to `max` records: waits up to `timeout` for the first (`Timeout::ZERO`: not at all), then takes what
     /// is already committed.
     ///
-    /// Each step holds the lock only for one bounded slice. Signals are checked with the lock released, after records
-    /// are buffered and before they are taken: if a handler raises (`KeyboardInterrupt`), the records stay buffered
-    /// and the next read returns them. A record taken by another thread (or by a read in a signal handler) meanwhile
-    /// is that call's; this one keeps waiting.
-    fn read<T>(
+    /// Each step holds the lock only for one bounded slice. Records are staged in the buffer (see `Buffer`); `stage`
+    /// builds the result's parts from them under the lock (it must not run Python code), and `finish` turns those
+    /// into the Python result with the lock released. Signals are checked before the result is built and again after
+    /// it is complete; the records leave the buffer only after that last check, and only if the buffer still holds
+    /// them. If a handler raises (`KeyboardInterrupt`) or building fails, the records stay staged and the next read
+    /// returns them. If another thread (or a read in a signal handler) took them meanwhile, this call looks at the
+    /// journal again: that can happen only when someone else advanced the cursor, so the loop makes progress.
+    fn read<T, U>(
         &self,
         py: Python<'_>,
         max: usize,
         timeout: Timeout,
-        mut take: impl FnMut(&mut State) -> Result<Option<T>, tickertape::Error>,
-    ) -> PyResult<Option<T>> {
+        stage: impl Fn(&Buffer, usize) -> T,
+        finish: impl Fn(T) -> PyResult<U>,
+    ) -> PyResult<Option<U>> {
         self.check(py)?;
         if max == 0 {
             return Ok(None);
@@ -706,35 +728,61 @@ impl Reader {
             if self.closed.load(Ordering::Acquire) {
                 return Err(closed(waited));
             }
-            let slice = if no_wait {
-                Duration::ZERO
-            } else {
-                deadline.map_or(WAIT_SLICE, |d| {
-                    WAIT_SLICE.min(d.saturating_duration_since(Instant::now()))
-                })
-            };
             if waited {
                 self.hand_off(py);
             }
             // Taking one committed record is quicker than releasing the GIL.
-            let detach = !slice.is_zero() || max > 1;
-            let ready = self
-                .locked(py, detach, |s| s.fill(max, slice))
+            let detach = !no_wait || max > 1;
+            let (ready, slice) = self
+                .locked(py, detach, |s| {
+                    // The remaining wait, measured once the lock is held.
+                    let slice = if no_wait {
+                        Duration::ZERO
+                    } else {
+                        deadline.map_or(WAIT_SLICE, |d| {
+                            WAIT_SLICE.min(d.saturating_duration_since(Instant::now()))
+                        })
+                    };
+                    (s.fill(max, slice), slice)
+                })
                 .ok_or_else(|| closed(waited))?;
             waited |= !slice.is_zero();
             if ready {
-                // Run signal handlers before anything leaves the buffer (see above).
+                // Run signal handlers before building the result (see above).
                 py.check_signals()?;
-                match self
-                    .locked_attached(py, &mut take)
+                if self.closed.load(Ordering::Acquire) {
+                    return Err(closed(waited));
+                }
+                let staged = self
+                    .locked_attached(py, |s| s.stage(max, &stage))
+                    .ok_or_else(|| closed(waited))?;
+                let (value, epoch, count) = match staged {
+                    Staged::Records {
+                        value,
+                        epoch,
+                        count,
+                    } => (value, epoch, count),
+                    Staged::Error(e) => return Err(errors::to_py(py, &e)),
+                    // Taken by another thread or a signal handler: look at the journal again.
+                    Staged::Nothing => continue,
+                };
+                let result = finish(value)?;
+                // The last point in this call where Python code (a signal handler) can run. After it, nothing does
+                // until the result has been returned.
+                py.check_signals()?;
+                if self
+                    .locked_attached(py, |s| s.commit(epoch, count))
                     .ok_or_else(|| closed(waited))?
                 {
-                    Ok(Some(taken)) => return Ok(Some(taken)),
-                    Ok(None) => {} // taken by another thread or a signal handler
-                    Err(e) => return Err(errors::to_py(py, &e)),
+                    return Ok(Some(result));
                 }
+                // Another caller took or replaced the records while the result was built: start again.
+                continue;
             } else if !slice.is_zero() {
                 py.check_signals()?;
+            }
+            if self.closed.load(Ordering::Acquire) {
+                return Err(closed(waited));
             }
             if no_wait || deadline.is_some_and(|d| Instant::now() >= d) {
                 return Ok(None);
@@ -742,14 +790,14 @@ impl Reader {
         }
     }
 
-    fn read_one(&self, py: Python<'_>, timeout: Timeout) -> PyResult<Option<Record>> {
-        self.read(py, 1, timeout, |s| s.take_one(py))
-    }
-
-    fn read_columns(&self, py: Python<'_>, max: usize, timeout: Timeout) -> PyResult<Columns> {
-        Ok(self
-            .read(py, max, timeout, |s| s.take(max))?
-            .unwrap_or_else(|| Columns::with_capacity(0)))
+    fn read_one(&self, py: Python<'_>, timeout: Timeout) -> PyResult<Option<Py<Record>>> {
+        self.read(
+            py,
+            1,
+            timeout,
+            |buffer, _| buffer.record(py, 0),
+            |record| Py::new(py, record),
+        )
     }
 }
 
@@ -800,7 +848,7 @@ impl Reader {
             .locked(py, true, |s| {
                 let result = s.reader.seek(seq);
                 if result.is_ok() {
-                    s.buffer = Buffer::new();
+                    s.buffer.reset();
                     s.pending = None;
                 }
                 result
@@ -810,15 +858,15 @@ impl Reader {
     }
 
     /// Returns the next committed record, or `None` if there is none yet. Never waits.
-    fn try_next(&self, py: Python<'_>) -> PyResult<Option<Record>> {
+    fn try_next(&self, py: Python<'_>) -> PyResult<Option<Py<Record>>> {
         self.read_one(py, Timeout::ZERO)
     }
 
     /// Returns the next record, waiting up to `timeout` seconds for one (`None`, the default: wait forever). Returns
     /// `None` if the timeout passes. Waits with the GIL released. Ctrl-C raises `KeyboardInterrupt`; a record that
-    /// arrived meanwhile is kept for the next read.
+    /// arrived meanwhile stays staged for the next read.
     #[pyo3(signature = (timeout=None), text_signature = "($self, timeout=None)")]
-    fn next(&self, py: Python<'_>, timeout: Option<Timeout>) -> PyResult<Option<Record>> {
+    fn next(&self, py: Python<'_>, timeout: Option<Timeout>) -> PyResult<Option<Py<Record>>> {
         self.read_one(py, timeout.unwrap_or(Timeout::FOREVER))
     }
 
@@ -836,12 +884,14 @@ impl Reader {
         max_records: usize,
         timeout: Timeout,
     ) -> PyResult<Py<PyList>> {
-        let columns = self.read_columns(py, max_records, timeout)?;
-        let list = PyList::empty(py);
-        for i in 0..columns.len {
-            list.append(columns.record(py, i))?;
-        }
-        Ok(list.unbind())
+        let list = self.read(
+            py,
+            max_records,
+            timeout,
+            |buffer, n| buffer.records(py, n),
+            |records| Ok(PyList::new(py, records)?.unbind()),
+        )?;
+        list.map_or_else(|| Ok(PyList::empty(py).unbind()), Ok)
     }
 
     /// Like `read_many`, but returns the records as a columnar `RecordBatch`.
@@ -854,9 +904,18 @@ impl Reader {
         py: Python<'_>,
         max_records: usize,
         timeout: Timeout,
-    ) -> PyResult<RecordBatch> {
-        let columns = self.read_columns(py, max_records, timeout)?;
-        Ok(RecordBatch::from_columns(py, &columns))
+    ) -> PyResult<Py<RecordBatch>> {
+        let batch = self.read(
+            py,
+            max_records,
+            timeout,
+            |buffer, n| buffer.batch(py, n),
+            |batch| Py::new(py, batch),
+        )?;
+        batch.map_or_else(
+            || Py::new(py, Columns::with_capacity(0).batch(py, 0, 0)),
+            Ok,
+        )
     }
 
     /// The sequence number of the next record this reader will return. Never blocks.
@@ -885,10 +944,12 @@ impl Reader {
     }
 
     /// Closes the segment files. Calling it again does nothing. A read waiting in another thread raises
-    /// `ValueError` within about 50 ms. In a child created by `fork`, it only marks this copy closed.
+    /// `ValueError` within about 50 ms. In a child created by `fork`, it closes that process's copies of the
+    /// descriptors and mappings, and nothing else.
     fn close(&self, py: Python<'_>) {
         self.closed.store(true, Ordering::Release);
         if self.owner.is_foreign() {
+            drop(take_inherited(&self.inner));
             return;
         }
         self.contenders.fetch_add(1, Ordering::AcqRel);
@@ -905,6 +966,11 @@ impl Reader {
     #[pyo3(signature = (*_args))]
     fn __exit__(&self, py: Python<'_>, _args: &Bound<'_, PyTuple>) {
         self.close(py);
+    }
+
+    /// Test only: pretends this handle was opened by process `pid` (to simulate process-id reuse after `fork`).
+    fn _set_owner_pid_for_testing(&self, pid: u32) {
+        self.owner.set_pid_for_testing(pid);
     }
 
     /// A new iterator over the records committed so far: it stops at the first position without one (it doesn't
@@ -954,7 +1020,7 @@ impl ReaderIterator {
         slf
     }
 
-    fn __next__(&self, py: Python<'_>) -> PyResult<Record> {
+    fn __next__(&self, py: Python<'_>) -> PyResult<Py<Record>> {
         if self.exhausted.load(Ordering::Acquire) {
             return Err(PyStopIteration::new_err(()));
         }

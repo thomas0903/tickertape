@@ -334,8 +334,13 @@ pub fn used_after_fork(what: &str, owner_pid: u32, pid: u32) -> ErrorSpec {
     ErrorSpec {
         class: "UsedAfterForkError",
         message: format!(
-            "this {what} was opened in process {owner_pid} and cannot be used in process {pid}, a child created \
-             by fork(); open a new {what} in the child (or use the 'spawn' start method of multiprocessing)"
+            "this {what} was opened in process {owner_pid}{reused} and cannot be used in process {pid}, a child \
+             created by fork(); open a new {what} in the child (or use the 'spawn' start method of multiprocessing)",
+            reused = if owner_pid == pid {
+                " (before a fork; the process id was reused)"
+            } else {
+                ""
+            }
         ),
         fields: vec![("owner_pid", owner_pid.into()), ("pid", pid.into())],
     }

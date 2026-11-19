@@ -65,13 +65,15 @@ sequence number `e.first_seq`), the rest were not, and `e.__cause__` is the erro
 To retry after resolving the cause, pass `payloads[e.failed_index:]` and slice every per-record metadata sequence at
 the same index (`schema_id=schema_ids[e.failed_index:]`, ...); a single-int metadata value needs no slicing.
 `append_many` consumes its arguments, so if you may retry, pass lists, tuples or arrays, not one-shot iterators or
-generators.
+generators. An exception raised by an argument's iterator (including `KeyboardInterrupt`) propagates as it is, with
+nothing appended. A closed writer, or one used in a forked child, raises before consuming any argument.
 
 `read_many(max_records, *, timeout=0)` waits up to `timeout` seconds for the first record, then returns what is
 already committed. `read_batch` does the same but returns a `RecordBatch` of columns: little-endian `bytes` for
 `seq`, `schema_id`, `venue_ts_ns`, `local_ts_ns`, and Arrow-style payload offsets and data. A `RecordBatch` has a
 length, can be indexed (`batch[i]`, `batch[-1]`) and iterated (each item a `Record`); slicing raises `TypeError` (use
-`batch.records()[a:b]`, or slice the arrays from `to_numpy()`).
+`batch.records()[a:b]`, or slice the arrays from `to_numpy()`). As for a list, an index must be an int (or have
+`__index__`): other types raise `TypeError`, and only an int out of range raises `IndexError`.
 
 Timeouts are seconds as an int, a float or a `datetime.timedelta`. `None`, `math.inf` and any value too large to
 represent (such as `sys.maxsize`) wait forever; negative values and NaN raise `ValueError`. The defaults differ on
@@ -99,29 +101,39 @@ NumPy, pyarrow and pandas are optional and imported only when these methods are 
 - Blocking calls (`next`, waiting `read_many`/`read_batch`, `checkpoint`, opening a writer, batch loops) release the
   GIL.
 - `Writer` and `Reader` objects can be used from any thread; calls on one object are serialized. A waiting read
-  holds its reader for at most 50 ms at a time, so other calls on that reader (`position`, `close()`, another read)
-  run in between; `closed`, `position` and `repr` never wait at all. Reads from several threads share the one
-  cursor: each record goes to exactly one of them, in order, and which one gets it is unspecified. Give each consumer
-  its own reader.
+  holds its reader for at most 50 ms at a time, so other calls on that reader (`seek`, `close()`, another read) run
+  in between; `closed`, `position` and `repr` never wait at all. Reads from several threads share the one cursor:
+  each record goes to exactly one of them, in order, and which one gets it is unspecified. A read that does not wait
+  returns nothing only when no committed record is left, even if another thread took the records it had found.
+  Give each consumer its own reader.
 - `close()` from another thread (or from a signal handler) ends a read that is waiting on that reader within about
-  50 ms; the waiting call raises `ValueError`.
+  50 ms; the waiting call raises `ValueError`, also when its timeout has passed meanwhile.
 - Fork: a `Writer` or `Reader` belongs to the process that opened it. In a child created by `fork()` (including
   `multiprocessing`'s default start method on Linux before Python 3.14), every method raises `UsedAfterForkError`
-  without touching the journal, and `close()`, leaving a `with` block and garbage collection only discard the copy.
-  Open handles in the child after it starts, or use the `spawn` or `forkserver` start method.
+  without touching the journal. A handle is the child's own only if it was opened in the child; a process id that
+  matches is not enough (the bindings also count forks, so a reused process id is still recognised as foreign).
+  `close()`, leaving a `with` block and garbage collection in the child release the child's copies of the file
+  descriptors and memory mappings and nothing else: the parent keeps the writer's lock, and nothing is synced,
+  changed or removed. So once the parent closes its writer, the journal can be opened again while the child is
+  still running. Close inherited handles early in the child (until then its copy of the lock file's descriptor
+  keeps the journal locked after the parent closes it). Open handles in the child after it starts, or use the
+  `spawn` or `forkserver` start method.
+- Free-threaded Python: no free-threaded wheels are published (abi3 wheels cannot load there). Building from the
+  sdist for 3.14t works and runs without the GIL, but it is not tested in CI.
 
 ### Ctrl-C and other signals
 
 Waits check for signals at least every 50 ms, with the reader's lock released, so Ctrl-C raises `KeyboardInterrupt`
 promptly and signal handlers may use the reader (even close it). When a signal handler raises during a read
 (`next`, `try_next`, `read_many`, `read_batch`, iteration), records the read had already taken from the journal are
-kept and returned, in order, by the next read on that reader; none is skipped. The guarantee covers signals that
-arrive before the read returns. A signal that arrives in the instant after the read has returned, before Python
-stores the result, is handled at that point, as after any function call: if its handler raises, the returned value
-is lost. A program that must not lose a record on Ctrl-C should handle `SIGINT` itself (for example, set a flag in the
-handler and stop after the current record).
-- Free-threaded Python: no free-threaded wheels are published (abi3 wheels cannot load there). Building from the
-  sdist for 3.14t works and runs without the GIL, but it is not tested in CI.
+kept and returned, in order, by the next read on that reader; none is skipped. That includes a signal that arrives
+while the read builds its result (a large `read_many` list or `read_batch`): a read delivers its records only after
+the result is complete and its handlers have run, and if one raises, the records stay for the next read.
+
+One window remains, and no binding can close it: a signal that arrives after the read has returned its result and
+before Python stores it (a few microseconds) is handled at that point, as after any function call, and if its
+handler raises, the returned value is lost. A program that must not lose a record on Ctrl-C should handle `SIGINT`
+itself (for example, set a flag in the handler and stop after the current record).
 
 ## Errors
 
@@ -130,8 +142,8 @@ All errors derive from `tt.TickertapeError`: `JournalIOError` (also an `OSError`
 `UnsupportedVersionError`, `JournalNotFoundError`, `SeqUnavailableError` (also a `LookupError`),
 `RecordTooLargeError` and `InvalidConfigError` (also `ValueError`), `DurabilityLostError`, `SequenceExhaustedError`,
 `DiscardedError` (call `seek` to continue), `BatchAppendError` and `UsedAfterForkError`. Using a closed object raises
-`ValueError`. Every exception keeps its message and attributes across `pickle` (for example from a `multiprocessing`
-worker); `JournalIOError.strerror` is the OS message, as `os.strerror(errno)`.
+`ValueError`. Every exception keeps its message and the current values of its attributes across `pickle` (for
+example from a `multiprocessing` worker); `JournalIOError.strerror` is the OS message, as `os.strerror(errno)`.
 
 `Writer.recovery_report` (a `RecoveryReport` with a list of `RecoveryAction`) and `Writer.retention_report` (a
 `RetentionReport`) are named tuples, like the results of the inspection functions below.
