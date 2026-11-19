@@ -9,16 +9,21 @@ use tickertape::{Backoff, ReaderConfig, RecoveryPolicy, WriterConfig};
 use crate::args;
 use crate::status::{FfiError, guard, tickertape_status, tickertape_status_code as S};
 
-/// What a writer does on open when it finds a corrupt committed record at the end of the newest segment
-/// (`docs/format.md` → Recovery). Uncommitted partial records are always cleaned up, whatever the policy.
+/// What a writer does on open when it finds corruption after the checkpoint (`docs/format.md` → Recovery;
+/// `docs/crash-contract.md` C1, C8 and C11). After a process crash in an otherwise intact journal, an uncommitted
+/// partial record is usually zeroed in place under either policy; the exception, a torn record that recovery cannot
+/// tell from damage, is in C1.
 #[allow(non_camel_case_types)]
 #[repr(i32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum tickertape_recovery_policy {
-    /// Copy the invalid bytes to `quarantine/` in the journal directory, then continue after the last valid record.
-    /// Nothing is ever deleted. The default.
+    /// Copy the invalid bytes to `quarantine/` in the journal directory (a disconnected segment is moved there),
+    /// then continue after the last valid record. No segment and no repaired tail is deleted; bytes that recovery
+    /// zeroes in place are not kept (C8). The default.
     TICKERTAPE_RECOVERY_QUARANTINE = 0,
-    /// Fail the open with `TICKERTAPE_E_CORRUPT` instead of quarantining or repairing anything.
+    /// Fail the open with `TICKERTAPE_E_CORRUPT`: the bytes at the corruption it reports, and everything after them
+    /// in that segment, are left untouched and no file is moved. The open is not read-only: C11 lists what it may
+    /// still change.
     TICKERTAPE_RECOVERY_FAIL = 1,
 }
 

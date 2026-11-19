@@ -52,6 +52,9 @@ pub struct Writer {
     /// Directories whose entries changed since the last checkpoint.
     dirty_dirs: BTreeSet<PathBuf>,
     checkpoint_file: File,
+    /// The marker file is shorter than its full length (something cut it): it is extended after the next checkpoint's
+    /// marker barrier, never at open (ADR 0032 → Checkpoint age).
+    checkpoint_file_short: bool,
     /// The wake-up region, if enabled and available (ADRs 0017 and 0021).
     notify: Option<mmap::Notify>,
     /// The background prefault thread, if enabled and started (ADR 0020).
@@ -67,6 +70,12 @@ pub struct Writer {
     report: RecoveryReport,
     retention_report: crate::retention::Report,
     last_retention_error: Option<Error>,
+    /// Retention runs that failed since open.
+    retention_failures: u64,
+    /// The checkpoint marker's current slot as this writer last wrote it (or read it at open).
+    checkpointed: Option<CheckpointSlot>,
+    /// When this writer's last successful checkpoint finished.
+    last_checkpoint_at: Option<std::time::Instant>,
 }
 
 /// An open, mapped segment.
@@ -155,7 +164,7 @@ impl Writer {
             dirty_dirs: BTreeSet::new(),
         };
         rec.remove_tmp_files()?;
-        let (checkpoint_file, checkpoint) = rec.open_checkpoint_file()?;
+        let (checkpoint_file, checkpoint, checkpoint_file_short) = rec.open_checkpoint_file()?;
         let state = rec.recover(checkpoint)?;
         let mut dirty_dirs = rec.dirty_dirs;
         // A new writer can't know whether directory entries made by earlier writers are durable, including the
@@ -182,6 +191,7 @@ impl Writer {
             dirty: state.dirty,
             dirty_dirs,
             checkpoint_file,
+            checkpoint_file_short,
             notify,
             prefault,
             spare: None,
@@ -192,6 +202,9 @@ impl Writer {
             report,
             retention_report: crate::retention::Report::default(),
             last_retention_error: None,
+            retention_failures: 0,
+            checkpointed: checkpoint,
+            last_checkpoint_at: None,
         };
         writer.run_retention();
         Ok(writer)
@@ -415,10 +428,25 @@ impl Writer {
         self.checkpoint_file
             .write_all_at(&bytes, at)
             .map_err(|e| Error::io("write checkpoint marker", &marker_path, e))?;
+        crate::fault::inject(crate::fault::Point::CheckpointMarkerSync)
+            .map_err(|e| Error::io("sync checkpoint marker", &marker_path, e))?;
         mmap::full_barrier(&self.checkpoint_file)
             .map_err(|e| Error::io("sync checkpoint marker", &marker_path, e))?;
+        // 5. A marker that something cut short is extended only now, after its slot is durable: observers take a
+        // full-length marker's modification time as the checkpoint's time (ADR 0032), so the extension must not
+        // happen before a checkpoint has succeeded (a short marker's age is unknown). Best effort: the checkpoint has
+        // succeeded, and a marker left short is still valid (each slot is read on its own); a later checkpoint tries
+        // again.
+        if self.checkpoint_file_short
+            && mmap::preallocate(&self.checkpoint_file, format::CHECKPOINT_FILE_LEN as u64).is_ok()
+            && mmap::sync_data(&self.checkpoint_file).is_ok()
+        {
+            self.checkpoint_file_short = false;
+        }
 
         self.generation = generation;
+        self.checkpointed = Some(slot);
+        self.last_checkpoint_at = Some(std::time::Instant::now());
         // Durable-only readers wait for the marker to move.
         if let Some(notify) = &self.notify {
             notify.publish();
@@ -466,6 +494,33 @@ impl Writer {
         self.last_retention_error.as_ref()
     }
 
+    /// Operational metrics only the writer knows: the head, the last checkpoint and its age by the monotonic clock,
+    /// what the next checkpoint has to sync, whether the writer is poisoned, and retention failures (ADR 0032; see
+    /// [`crate::status`] for what other processes can observe).
+    ///
+    /// Cost: no system calls; one monotonic clock read, and a sum over the segments touched since the last
+    /// checkpoint. Nothing is added to [`Writer::append`].
+    pub fn metrics(&self) -> crate::status::WriterMetrics {
+        let dirty = self.dirty.iter().fold(0u64, |sum, seg| {
+            sum.saturating_add(seg.to.saturating_sub(seg.from))
+        });
+        crate::status::WriterMetrics {
+            head: crate::status::Position::new(self.next_seq, self.active.base, self.offset),
+            segment_size: self.active.size,
+            checkpoint: self.checkpointed,
+            since_checkpoint: self.last_checkpoint_at.map(|at| at.elapsed()),
+            // Without a marker, everything from where recovery started (the oldest retained segment) is uncovered.
+            uncheckpointed_records: self.next_seq.saturating_sub(
+                self.checkpointed
+                    .map_or(self.report.scanned_from_seq, |c| c.next_seq),
+            ),
+            uncheckpointed_bytes: dirty
+                .saturating_add(self.offset.saturating_sub(self.active_dirty_from)),
+            poisoned: self.poisoned,
+            retention_failures: self.retention_failures,
+        }
+    }
+
     fn run_retention(&mut self) {
         let Some((policy, action)) = &self.config.retention else {
             return;
@@ -475,6 +530,7 @@ impl Writer {
         });
         if let Err(error) = result {
             self.last_retention_error = Some(error);
+            self.retention_failures = self.retention_failures.saturating_add(1);
         }
     }
 
@@ -796,8 +852,9 @@ impl Recovery<'_> {
         Ok(())
     }
 
-    /// Opens (creating if needed) the checkpoint marker file and decodes the current checkpoint.
-    fn open_checkpoint_file(&mut self) -> Result<(File, Option<CheckpointSlot>)> {
+    /// Opens (creating if needed) the checkpoint marker file and decodes the current checkpoint. Also returns whether
+    /// an existing marker is shorter than its full length.
+    fn open_checkpoint_file(&mut self) -> Result<(File, Option<CheckpointSlot>, bool)> {
         let path = self.dir.join(CHECKPOINT_FILE);
         let existed = path.exists();
         let file = OpenOptions::new()
@@ -815,17 +872,20 @@ impl Recovery<'_> {
         file.read_exact_at(&mut contents, 0)
             .map_err(|e| Error::io("read checkpoint marker", &path, e))?;
         let checkpoint = format::decode_checkpoint(&contents);
-        if len < format::CHECKPOINT_FILE_LEN as u64 {
-            // Preallocated, not sparse, so that writing a slot never needs new blocks (a full disk must not make
-            // checkpoints fail).
+        if !existed {
+            // A new marker: preallocated, not sparse, so that writing a slot never needs new blocks (a full disk must
+            // not make checkpoints fail).
             mmap::preallocate(&file, format::CHECKPOINT_FILE_LEN as u64)
                 .map_err(|e| Error::io("create checkpoint marker", &path, e))?;
             mmap::sync_data(&file).map_err(|e| Error::io("sync checkpoint marker", &path, e))?;
-        }
-        if !existed {
             journal::sync_dir(self.dir)?;
+            return Ok((file, checkpoint, false));
         }
-        Ok((file, checkpoint))
+        // An existing marker that something cut short is left short here: observers take a full-length marker's
+        // modification time as the time of the last checkpoint (ADR 0032), and the time of an extension is not that.
+        // The next checkpoint extends it after its slot is durable. Until then, a checkpoint writes its slot into
+        // the short file, which may need a new block.
+        Ok((file, checkpoint, len < format::CHECKPOINT_FILE_LEN as u64))
     }
 
     fn recover(&mut self, checkpoint: Option<CheckpointSlot>) -> Result<RecoveredState> {
@@ -874,6 +934,8 @@ impl Recovery<'_> {
         }
         let mut visited = BTreeSet::new();
         let mut dirty = Vec::new();
+        // Where this writer's uncheckpointed data starts in `seg` (for `Writer::metrics`).
+        let mut seg_from = offset;
 
         loop {
             visited.insert(seg.base);
@@ -882,22 +944,68 @@ impl Recovery<'_> {
             seq = scan.next_seq;
             match scan.end {
                 ScanEnd::Empty => {
-                    self.zero_uncommitted_tail(&mut seg, offset)?;
+                    let tail_end = format::nonzero_end(
+                        &RwView(&seg.map),
+                        offset + format::COMMIT_WORD_LEN as u64,
+                    );
                     if seq != seg.base && bases.contains(&seq) && !visited.contains(&seq) {
-                        // Crash between publishing the next segment and sealing this one.
-                        let next = match open_segment(self.dir, seq) {
-                            Ok(next) => next,
-                            Err(_) => break,
-                        };
-                        self.write_seal(&mut seg, offset, seq)?;
-                        self.report.actions.push(RecoveryAction::Sealed {
-                            segment: seg.path.clone(),
-                        });
-                        dirty.push(inherited(seg));
-                        seg = next;
-                        offset = format::SEGMENT_HEADER_LEN as u64;
-                        continue;
+                        if let Ok(next) = open_segment(self.dir, seq) {
+                            // The successor for exactly `seq` exists, is not this segment (at the first record slot
+                            // `seq` is this segment's own base), has not been visited, and opens and maps: `offset`
+                            // is where this segment's seal belongs, and the chain continues in the successor (ADR
+                            // 0035, "Damage around a seal"). A valid header alone is not enough: `open_segment`
+                            // must succeed.
+                            if tail_end.is_some_and(|end| end > offset + format::SEAL_LEN as u64) {
+                                // Bytes beyond the seal: no crash leaves them (a roll writes nothing after the seal,
+                                // and records `seq` onwards are in the successor), so this is a damaged seal, not
+                                // missing history, and later segments are not evidence. They are never records of
+                                // this segment either: those would repeat the successor's sequence numbers. Preserve
+                                // them as any repair does, then reseal and continue into the successor in this open.
+                                // This is exactly where an interrupted repair leaves the next open (the segment ends
+                                // at `offset`, followed by the same branch below), so an interruption at any point
+                                // gives the same journal. `Fail` refuses: the bytes are damage.
+                                if self.config.recovery == RecoveryPolicy::Fail {
+                                    return Err(Error::corrupt(
+                                        &seg.path,
+                                        offset,
+                                        CorruptReason::BadSeal,
+                                    ));
+                                }
+                                seg = self.repair_tail(seg, offset, CorruptReason::BadSeal)?;
+                            } else {
+                                // A crash between publishing the successor and sealing this segment (or the seal's
+                                // marker damaged): at most the seal's CRC word is left.
+                                self.zero_uncommitted_tail(&mut seg, offset, tail_end)?;
+                            }
+                            self.write_seal(&mut seg, offset, seq)?;
+                            self.report.actions.push(RecoveryAction::Sealed {
+                                segment: seg.path.clone(),
+                            });
+                            dirty.push(inherited(seg, seg_from, offset));
+                            seg = next;
+                            offset = format::SEGMENT_HEADER_LEN as u64;
+                            seg_from = offset;
+                            continue;
+                        }
                     }
+                    if let Some(reason) = tail_end.and_then(|end| {
+                        committed_after_empty(&seg, offset, seq, end, &bases, &visited)
+                    }) {
+                        // Evidence of committed history, or a search stopped at its work bound: a committed tail (ADR
+                        // 0035; usually storage damage, but a torn payload can lead here too, crash contract C1).
+                        if self.config.recovery == RecoveryPolicy::Fail {
+                            return Err(Error::corrupt(&seg.path, offset, reason));
+                        }
+                        seg = self.repair_tail(seg, offset, reason)?;
+                        break;
+                    }
+                    // The search completed without evidence: a torn append or the clean end, or damage that left no
+                    // evidence (ADR 0035, "What cannot be detected"). (A successor for exactly `seq` that does not
+                    // open, as before this change, ends the chain here: the bytes after `offset` are zeroed in place
+                    // without a copy even under `Fail`, then the successor is quarantined below, or refused as
+                    // disconnected under `Fail`. Known gap, ADR 0035: a later change will preserve them under
+                    // `Quarantine` and make `Fail` refuse before zeroing.)
+                    self.zero_uncommitted_tail(&mut seg, offset, tail_end)?;
                     break;
                 }
                 ScanEnd::Seal => {
@@ -913,9 +1021,10 @@ impl Recovery<'_> {
                     if bases.contains(&seq) {
                         match open_segment(self.dir, seq) {
                             Ok(next) => {
-                                dirty.push(inherited(seg));
+                                dirty.push(inherited(seg, seg_from, offset));
                                 seg = next;
                                 offset = format::SEGMENT_HEADER_LEN as u64;
+                                seg_from = offset;
                                 continue;
                             }
                             Err(Error::Corrupt { .. } | Error::UnsupportedVersion { .. })
@@ -944,7 +1053,7 @@ impl Recovery<'_> {
                     self.report.actions.push(RecoveryAction::CompletedRoll {
                         segment: next.path.clone(),
                     });
-                    dirty.push(inherited(seg));
+                    dirty.push(inherited(seg, seg_from, offset));
                     seg = next;
                     visited.insert(seq);
                     offset = format::SEGMENT_HEADER_LEN as u64;
@@ -999,20 +1108,19 @@ impl Recovery<'_> {
         )
     }
 
-    /// Zeroes non-zero bytes after an uncommitted end at `offset` (commit word 0) and syncs them.
-    fn zero_uncommitted_tail(&mut self, seg: &mut Segment, offset: u64) -> Result<()> {
+    /// Zeroes non-zero bytes after an uncommitted end at `offset` (commit word 0), which end at `tail_end`
+    /// ([`format::nonzero_end`]), and syncs them.
+    fn zero_uncommitted_tail(
+        &mut self,
+        seg: &mut Segment,
+        offset: u64,
+        tail_end: Option<u64>,
+    ) -> Result<()> {
         let start = offset + format::COMMIT_WORD_LEN as u64;
-        if start >= seg.size {
-            return Ok(());
-        }
-        let last_nonzero = seg
-            .map
-            .bytes(start, seg.size - start)
-            .and_then(|tail| tail.iter().rposition(|&b| b != 0));
-        let Some(last) = last_nonzero else {
+        let Some(end) = tail_end.filter(|&end| end > start) else {
             return Ok(());
         };
-        let len = last as u64 + 1;
+        let len = end - start;
         seg.map
             .bytes_mut(start, len)
             .ok_or_else(|| Error::io("zero tail", &seg.path, io::Error::other("out of bounds")))?
@@ -1100,7 +1208,7 @@ impl Recovery<'_> {
         Ok(fin)
     }
 
-    /// Repairs a corrupt committed tail by replacement (`docs/format.md` → Recovery, step 4).
+    /// Repairs a corrupt tail by replacement (`docs/format.md` → Recovery, step 4, last row).
     fn repair_tail(&mut self, seg: Segment, offset: u64, reason: CorruptReason) -> Result<Segment> {
         let quarantine_file = self.preserve_bytes(&seg, offset)?;
         let tmp = journal::tmp_path(self.dir, seg.base);
@@ -1123,8 +1231,12 @@ impl Recovery<'_> {
         file.write_all_at(prefix, 0)
             .map_err(|e| Error::io("write repaired segment", &tmp, e))?;
         mmap::sync_data(&file).map_err(|e| Error::io("sync repaired segment", &tmp, e))?;
+        crate::fault::inject(crate::fault::Point::RepairBeforeRename)
+            .map_err(|e| Error::io("replace segment", &seg.path, e))?;
         fs::rename(&tmp, &seg.path).map_err(|e| Error::io("replace segment", &seg.path, e))?;
         journal::sync_dir(self.dir)?;
+        crate::fault::inject(crate::fault::Point::RepairAfterRename)
+            .map_err(|e| Error::io("sync directory", self.dir, e))?;
         mmap::full_barrier(&file)
             .map_err(|e| Error::io("full sync repaired segment", &seg.path, e))?;
         self.report.actions.push(RecoveryAction::RepairedTail {
@@ -1168,11 +1280,47 @@ impl Recovery<'_> {
     }
 }
 
-/// A segment inherited from an earlier writer: the next checkpoint syncs its file.
-fn inherited(seg: Segment) -> DirtySegment {
+/// Committed history after an empty slot at `offset` of `seg`, where a scan expecting `seq` stopped and whose
+/// non-zero bytes end at `tail_end` (ADR 0035): a later record or final seal in the segment that validates with a
+/// sequence number its position allows, or a segment with a larger base than `seq`, which a process crash leaves
+/// only after record `seq` was committed. Returns how to report it: [`CorruptReason::EmptyCommitWord`] with the sequence number the
+/// evidence carries (a record's, a seal's next sequence number, or a segment's base), or
+/// [`CorruptReason::UncheckedTail`] when the search in the segment stopped at its work bound. After a process crash
+/// none of these is usually present; the exception is a torn payload whose bytes form a candidate (crash contract C1).
+/// A segment with a larger base counts only when the caller found non-zero bytes after the commit word (`tail_end`),
+/// and not in the case below.
+///
+/// The caller has already handled a successor for exactly `seq` that opens (a seal belongs at `offset`). A later
+/// segment is still not evidence when that successor exists but does not open and the non-zero bytes end within a
+/// seal at `offset`: unchanged from before, the chain then ends at `offset`.
+fn committed_after_empty(
+    seg: &Segment,
+    offset: u64,
+    seq: u64,
+    tail_end: u64,
+    bases: &BTreeSet<u64>,
+    visited: &BTreeSet<u64>,
+) -> Option<CorruptReason> {
+    if let Some(found) = format::find_history_before(&RwView(&seg.map), offset, seq, tail_end) {
+        return Some(found.reason());
+    }
+    let successor_pending = seq != seg.base && bases.contains(&seq) && !visited.contains(&seq);
+    if successor_pending && tail_end <= offset + format::SEAL_LEN as u64 {
+        return None;
+    }
+    bases
+        .range(seq.checked_add(1)?..)
+        .next()
+        .map(|&base| CorruptReason::EmptyCommitWord(base))
+}
+
+/// A segment inherited from an earlier writer: the next checkpoint syncs its whole file. `[from, seal_at)` holds the
+/// records an earlier writer appended after the marker, followed by the seal at `seal_at`; the range only feeds
+/// [`Writer::metrics`] (`uncheckpointed_bytes`).
+fn inherited(seg: Segment, from: u64, seal_at: u64) -> DirtySegment {
     DirtySegment {
-        from: 0,
-        to: seg.size,
+        from,
+        to: seal_at + format::SEAL_LEN as u64,
         file: seg.file,
         map: None,
         path: seg.path,
@@ -1199,7 +1347,11 @@ pub struct RecoveryReport {
 pub enum RecoveryAction {
     /// The journal didn't exist and was created.
     Created,
-    /// Uncommitted bytes after the last record (a record being written when the previous writer died) were zeroed.
+    /// Non-zero bytes after an empty commit word were zeroed in place, without a copy (`docs/crash-contract.md`, C8
+    /// and C11). This describes the action taken on the evidence recovery found, not what readers saw: after a
+    /// process crash in an otherwise intact journal the bytes are an unpublished record body (or what is left of one)
+    /// or the CRC word of a seal recovery is about to write, which no reader saw, but after storage damage that left no evidence they can be
+    /// published records a reader has already returned (C11 (3)).
     ZeroedUncommitted {
         /// The segment.
         segment: PathBuf,
@@ -1208,8 +1360,13 @@ pub enum RecoveryAction {
         /// Number of bytes zeroed.
         len: u64,
     },
-    /// A corrupt committed tail was copied to `quarantine`, and the segment was replaced by a copy with the tail
-    /// zeroed (never edited in place).
+    /// A corrupt tail was copied to `quarantine` (from `offset` to the segment's last non-zero byte), and the segment
+    /// was replaced by a copy with the tail zeroed (never edited in place). The tail starts at an invalid record or
+    /// seal; at an empty commit word with evidence of committed history after it, or after which the search stopped
+    /// at its work bound ([`CorruptReason::EmptyCommitWord`](crate::CorruptReason::EmptyCommitWord),
+    /// [`CorruptReason::UncheckedTail`](crate::CorruptReason::UncheckedTail)); or at the place of a seal with damage
+    /// beyond it ([`CorruptReason::BadSeal`](crate::CorruptReason::BadSeal); `docs/crash-contract.md`, C11). What
+    /// followed `offset` leaves the segment; the quarantine file keeps its bytes up to the last non-zero one.
     RepairedTail {
         /// The segment.
         segment: PathBuf,

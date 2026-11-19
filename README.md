@@ -17,6 +17,9 @@ Think of it as a flight recorder for a trading system or any other latency-sensi
   you configure a retention policy; `tickertape archive` can move or delete old, checkpoint-covered segments.
 - The **`tickertape` CLI** tails, inspects, verifies and summarizes journals (`stats`), and exports them to
   JSONL or Parquet. Its `archive` command is the only command that changes a journal.
+- **Operational metrics** without a telemetry service: `tickertape status` (text, JSON or Prometheus text format, and
+  a health-check exit code) and `tickertape::status` report checkpoint age, what a power loss would remove now,
+  storage headroom, and the lag of readers that opt in.
 
 ![tickertape architecture: a writer process appends to segment files and a checkpoint marker in one journal directory; safe and zero-copy reader processes and the CLI read them; the CLI exports Parquet or JSONL for DuckDB and Python](docs/figures/architecture.svg)
 
@@ -108,7 +111,7 @@ python3 -c "import duckdb; print(duckdb.sql(\"SELECT kind, count(*), min(seq), m
 ```
 
 CLI reference, exit codes and the JSONL and Parquet schemas: [`docs/cli.md`](docs/cli.md).
-Choosing segment sizes and checkpoint intervals, archiving old segments and what to do after a crash:
+Choosing segment sizes and checkpoint intervals, archiving old segments, monitoring and what to do after a crash:
 [`docs/operations.md`](docs/operations.md).
 For direct, read-only access from Python without dependencies, see [`python/`](python/README.md).
 From C, C++ or another language through a C ABI (not stable before 1.0), see [`docs/c-api.md`](docs/c-api.md).
@@ -138,7 +141,9 @@ The full statement, per platform and with the test for each claim, is [`docs/cra
   Readers that must not act on such records can use `ReaderConfig::durable_only(true)` (CLI: `--durable-only`),
   which only returns records covered by a checkpoint.
 - **Corruption is detected, never silently returned.** Every record is checked (length, CRC32C, sequence). Recovery
-  preserves anything it removes in `quarantine/` and never edits bytes in place.
+  repairs a corrupt tail by replacing its segment and moves disconnected segments aside, preserving both in
+  `quarantine/`. Some bytes after the last record are zeroed in place without a copy: usually a torn append that no
+  reader saw, but also damage that recovery cannot tell from one. See the crash contract, C8 and C11.
 - **Readers.** `Reader::open` reads with `pread` and is memory-safe whatever other processes do. Zero-copy
   `Reader::open_mapped` is `unsafe`: it requires that only a tickertape writer modifies the files.
 - **Known limits.** A full btrfs volume can crash the writer with `SIGBUS` even inside preallocated segments; a

@@ -156,20 +156,44 @@ pub(crate) fn sync_dir(dir: &Path) -> Result<()> {
 }
 
 /// Window size for [`scan_file`].
-const SCAN_WINDOW: usize = 1 << 20;
+pub(crate) const SCAN_WINDOW: usize = 1 << 20;
 
 /// A [`format::SegmentView`] over a segment file read with `pread` in windows, so that scanning a segment needs memory
-/// for one window (or one record, if larger), never the whole file. An I/O error makes the view return `None`; the
+/// for one window of at most [`SCAN_WINDOW`] bytes, never the whole file: callers read a larger record in pieces of
+/// at most that size ([`format::SegmentView::max_piece`]). An I/O error makes the view return `None`; the
 /// error is kept and reported by [`scan_file`].
-struct PreadView<'f> {
+pub(crate) struct PreadView<'f> {
     file: &'f File,
     len: u64,
+    /// Bytes to fetch per `pread` (more if one request is larger).
+    window_len: u64,
     /// The bytes at `[window.0, window.0 + window.1.len())`.
     window: std::cell::RefCell<(u64, Vec<u8>)>,
     error: std::cell::RefCell<Option<std::io::Error>>,
 }
 
-impl PreadView<'_> {
+impl<'f> PreadView<'f> {
+    /// A view of `file`, whose length is `len`, fetching `window_len` bytes per `pread`.
+    pub(crate) fn new(file: &'f File, len: u64, window_len: usize) -> PreadView<'f> {
+        PreadView {
+            file,
+            len,
+            window_len: window_len as u64,
+            window: std::cell::RefCell::new((0, Vec::new())),
+            error: std::cell::RefCell::new(None),
+        }
+    }
+
+    /// Forgets the cached window, so that the next access reads the file again.
+    pub(crate) fn invalidate(&self) {
+        self.window.borrow_mut().1.clear();
+    }
+
+    /// The first I/O error a read hit, if any (the view returned `None` for it).
+    pub(crate) fn take_error(&self) -> Option<std::io::Error> {
+        self.error.borrow_mut().take()
+    }
+
     /// Makes `[offset, offset + len)` (already checked against the file length) available in the window.
     fn fill(&self, offset: u64, len: u64) -> bool {
         let mut window = self.window.borrow_mut();
@@ -177,7 +201,10 @@ impl PreadView<'_> {
         if offset >= *start && offset + len <= *start + buf.len() as u64 {
             return true;
         }
-        let want = len.max(SCAN_WINDOW as u64).min(self.len - offset);
+        // Every caller reads in pieces of at most `max_piece`: the window never grows past it, whatever length a
+        // damaged slot claims (validation streams longer bodies, `format::read_slot`).
+        debug_assert!(len <= SCAN_WINDOW as u64, "pread window of {len} bytes");
+        let want = len.max(self.window_len).min(self.len - offset);
         buf.resize(want as usize, 0);
         match self.file.read_exact_at(buf, offset) {
             Ok(()) => {
@@ -215,6 +242,10 @@ impl format::SegmentView for PreadView<'_> {
         let at = (offset - window.0) as usize;
         Some(f(&window.1[at..at + len as usize]))
     }
+
+    fn max_piece(&self) -> u64 {
+        SCAN_WINDOW as u64
+    }
 }
 
 /// Scans a segment file from its first record slot, expecting `base` there, reading it with `pread` in bounded
@@ -226,21 +257,61 @@ pub(crate) fn scan_file(path: &Path, base: u64) -> Result<format::ScanResult> {
 
 /// Like [`scan_file`], for a segment file that is already open (`path` names it in errors).
 pub(crate) fn scan_open(file: &File, path: &Path, base: u64) -> Result<format::ScanResult> {
+    scan_open_from(file, path, format::SEGMENT_HEADER_LEN as u64, base)
+}
+
+/// [`scan_open`] from `offset`, expecting `seq` there.
+pub(crate) fn scan_open_from(
+    file: &File,
+    path: &Path,
+    offset: u64,
+    seq: u64,
+) -> Result<format::ScanResult> {
+    with_pread_view(file, path, |view| format::scan_segment(view, offset, seq))
+}
+
+/// The commit word at `offset` of an open segment file, read with a fresh 4-byte `pread` (0 if it lies outside the
+/// file or is misaligned).
+pub(crate) fn commit_word_open(file: &File, path: &Path, offset: u64) -> Result<u32> {
     let len = file
         .metadata()
         .map_err(|e| Error::io("stat segment", path, e))?
         .len();
-    let view = PreadView {
-        file,
-        len,
-        window: std::cell::RefCell::new((0, Vec::new())),
-        error: std::cell::RefCell::new(None),
-    };
-    let scan = format::scan_segment(&view, format::SEGMENT_HEADER_LEN as u64, base);
-    if let Some(e) = view.error.into_inner() {
+    let word_len = format::COMMIT_WORD_LEN as u64;
+    if offset % format::RECORD_ALIGN as u64 != 0
+        || offset.checked_add(word_len).is_none_or(|end| end > len)
+    {
+        return Ok(0);
+    }
+    let mut word = [0; format::COMMIT_WORD_LEN];
+    file.read_exact_at(&mut word, offset)
+        .map_err(|e| Error::io("read segment", path, e))?;
+    Ok(u32::from_le_bytes(word))
+}
+
+/// [`format::find_history_after_empty`] on an open segment file, read with `pread` in bounded windows.
+pub(crate) fn history_after_empty_open(
+    file: &File,
+    path: &Path,
+    offset: u64,
+    expected_seq: u64,
+) -> Result<Option<format::LaterHistory>> {
+    with_pread_view(file, path, |view| {
+        format::find_history_after_empty(view, offset, expected_seq)
+    })
+}
+
+fn with_pread_view<R>(file: &File, path: &Path, f: impl FnOnce(&PreadView<'_>) -> R) -> Result<R> {
+    let len = file
+        .metadata()
+        .map_err(|e| Error::io("stat segment", path, e))?
+        .len();
+    let view = PreadView::new(file, len, SCAN_WINDOW);
+    let result = f(&view);
+    if let Some(e) = view.take_error() {
         return Err(Error::io("read segment", path, e));
     }
-    Ok(scan)
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -271,5 +342,50 @@ mod scan_tests {
                 format::scan_segment(&image[..], format::SEGMENT_HEADER_LEN as u64, base);
             assert_eq!(scan_file(&path, base).unwrap(), expected, "segment {base}");
         }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "writes megabytes")]
+    fn records_longer_than_the_window_are_read_in_pieces() {
+        // Review round 2, item 2: the window never grows past `SCAN_WINDOW` (asserted in `PreadView::fill`), for a
+        // valid record of 3 MiB, the same record with a bad checksum, and the search after an empty commit word.
+        let dir = tempfile::tempdir().unwrap();
+        let mut w =
+            Writer::open(dir.path(), WriterConfig::default().segment_size(4 << 20)).unwrap();
+        for payload in [vec![1u8; 100], vec![7u8; 3 << 20], vec![2u8; 100]] {
+            w.append(&NewRecord {
+                schema_id: 1,
+                venue_ts_ns: 0,
+                local_ts_ns: 0,
+                payload: &payload,
+            })
+            .unwrap();
+        }
+        drop(w);
+        let (base, path) = list_segments(dir.path()).unwrap().pop().unwrap();
+        let first = format::SEGMENT_HEADER_LEN as u64;
+        let image = fs::read(&path).unwrap();
+        let expected = format::scan_segment(&image[..], first, base);
+        assert_eq!(expected.records, 3);
+        assert_eq!(scan_file(&path, base).unwrap(), expected);
+        let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.write_all_at(&[0; 4], first).unwrap();
+        let open = File::open(&path).unwrap();
+        assert!(matches!(
+            history_after_empty_open(&open, &path, first, base).unwrap(),
+            Some(format::LaterHistory::Record { seq: 1, .. })
+        ));
+        file.write_all_at(&[0xee], first + 200 + (1 << 20)).unwrap();
+        file.write_all_at(&image[first as usize..first as usize + 4], first)
+            .unwrap();
+        let scan = scan_file(&path, base).unwrap();
+        assert_eq!(scan.records, 1);
+        assert_eq!(
+            scan.end,
+            format::ScanEnd::Invalid(CorruptReason::BadChecksum)
+        );
+        assert_eq!(commit_word_open(&open, &path, first).unwrap(), 100 + 40);
+        assert_eq!(commit_word_open(&open, &path, first + 4).unwrap(), 0);
+        assert_eq!(commit_word_open(&open, &path, 4 << 20).unwrap(), 0);
     }
 }

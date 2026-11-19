@@ -259,10 +259,37 @@ pub fn corrupt_by_replacement(dir: &Path, seq: u64) {
 }
 
 /// Zeroes the commit word of record `seq` in the segment file itself (same inode), as storage damage that loses one
-/// word would (C11). Recovery then takes the record for the end of the committed records and zeroes the rest of the
-/// segment in place, so a later writer appends a different history into the same file. A safe reader that copied
-/// the old bytes into its read buffer before the damage still holds them.
+/// word would (C11). If `seq` is the newest record, recovery can't tell this from a torn append (ADR 0035): it takes
+/// the record for the end of the committed records and zeroes the rest of the segment in place, so a later writer
+/// appends a different history into the same file. If committed records follow, recovery finds them and replaces
+/// the segment instead (`EmptyCommitWord`); for an in-place repair from an earlier record, see
+/// [`zero_commit_words_from`].
 pub fn zero_commit_word(dir: &Path, seq: u64) {
     let (path, offset) = locate_record(dir, seq);
     open_raw(&path).write_all_at(&[0; 4], offset).unwrap();
+}
+
+/// Zeroes the commit words of record `seq` and of every later record, in the segment file itself (same inode), as
+/// storage damage that loses those words would (C11). `seq` must be in the newest segment. No record after the first
+/// zeroed word then validates and no later segment exists, so recovery can't tell the damage from a torn append
+/// (ADR 0035): it takes record `seq` for the end of the committed records and zeroes the rest of the segment in
+/// place, so a later writer appends a different history into the same file. A safe reader that copied the old bytes
+/// into its read buffer before the damage still holds them.
+pub fn zero_commit_words_from(dir: &Path, seq: u64) {
+    let (path, mut offset) = locate_record(dir, seq);
+    assert_eq!(
+        segments(dir).last().map(|s| &s.1),
+        Some(&path),
+        "record {seq} is in the newest segment"
+    );
+    let image = std::fs::read(&path).unwrap();
+    let raw = open_raw(&path);
+    let mut at = seq;
+    while let Ok(format::Slot::Record { next_offset, .. }) =
+        format::read_slot(&image[..], offset, at)
+    {
+        raw.write_all_at(&[0; 4], offset).unwrap();
+        offset = next_offset;
+        at += 1;
+    }
 }

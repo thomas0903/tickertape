@@ -167,8 +167,13 @@ enum tickertape_status_code
    */
   TICKERTAPE_E_PANIC = -17,
   /**
+   * A reader beacon with this name is held by a running reader (ADR 0032). The C ABI does not create beacons yet;
+   * the code exists so that every core error has one.
+   */
+  TICKERTAPE_E_BEACON_IN_USE = -18,
+  /**
    * An error this version of the C ABI has no specific code for. Its value stays far from the assigned codes,
-   * which later versions extend downwards from -17.
+   * which later versions extend downwards from -18.
    */
   TICKERTAPE_E_UNKNOWN = -255,
 };
@@ -234,7 +239,9 @@ enum tickertape_corrupt_reason
    */
   TICKERTAPE_CORRUPT_BAD_FLAGS = 10,
   /**
-   * A seal's checksum does not match the expected next sequence number.
+   * A seal is invalid (its checksum does not match the expected next sequence number, or it lies where a seal
+   * cannot), or writer recovery found non-zero bytes beyond the place of a missing seal in front of a successor
+   * segment that opens (`docs/crash-contract.md` C11).
    */
   TICKERTAPE_CORRUPT_BAD_SEAL = 11,
   /**
@@ -245,6 +252,21 @@ enum tickertape_corrupt_reason
    * The checkpoint marker points to a missing segment or an impossible offset.
    */
   TICKERTAPE_CORRUPT_DANGLING_CHECKPOINT = 13,
+  /**
+   * A commit word reads 0, and recovery or verify found evidence of committed records after it (usually storage
+   * damage; a torn payload can also cause it: `docs/crash-contract.md` C1, C11; ADR 0035). The error message
+   * names the sequence number the evidence carries: a later valid record's, the next sequence number of a seal
+   * that ends the segment, or the base of a later segment.
+   */
+  TICKERTAPE_CORRUPT_EMPTY_COMMIT_WORD = 14,
+  /**
+   * A commit word reads 0, and the bytes after it were too costly to check completely (the search for committed
+   * records stopped at its work bound; ADR 0035). Inconclusive, but treated like
+   * `TICKERTAPE_CORRUPT_EMPTY_COMMIT_WORD`: the writer preserves the bytes or refuses. The error message names a
+   * sequence number: the one in the header of the candidate record where the search stopped, or the expected one
+   * plus one when it stopped at a final seal.
+   */
+  TICKERTAPE_CORRUPT_UNCHECKED_TAIL = 15,
   /**
    * A reason this version of the C ABI has no specific code for.
    */
@@ -259,8 +281,10 @@ typedef int32_t tickertape_corrupt_reason;
 #endif // __cplusplus
 
 /**
- * What a writer does on open when it finds a corrupt committed record at the end of the newest segment
- * (`docs/format.md` → Recovery). Uncommitted partial records are always cleaned up, whatever the policy.
+ * What a writer does on open when it finds corruption after the checkpoint (`docs/format.md` → Recovery;
+ * `docs/crash-contract.md` C1, C8 and C11). After a process crash in an otherwise intact journal, an uncommitted
+ * partial record is usually zeroed in place under either policy; the exception, a torn record that recovery cannot
+ * tell from damage, is in C1.
  */
 enum tickertape_recovery_policy
 #if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
@@ -268,12 +292,15 @@ enum tickertape_recovery_policy
 #endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
  {
   /**
-   * Copy the invalid bytes to `quarantine/` in the journal directory, then continue after the last valid record.
-   * Nothing is ever deleted. The default.
+   * Copy the invalid bytes to `quarantine/` in the journal directory (a disconnected segment is moved there),
+   * then continue after the last valid record. No segment and no repaired tail is deleted; bytes that recovery
+   * zeroes in place are not kept (C8). The default.
    */
   TICKERTAPE_RECOVERY_QUARANTINE = 0,
   /**
-   * Fail the open with `TICKERTAPE_E_CORRUPT` instead of quarantining or repairing anything.
+   * Fail the open with `TICKERTAPE_E_CORRUPT`: the bytes at the corruption it reports, and everything after them
+   * in that segment, are left untouched and no file is moved. The open is not read-only: C11 lists what it may
+   * still change.
    */
   TICKERTAPE_RECOVERY_FAIL = 1,
 };
