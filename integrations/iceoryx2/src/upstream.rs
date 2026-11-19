@@ -133,7 +133,9 @@ pub struct ExportReport {
 /// Reads through the end of the journal as it is when the export gets there. The file is written, completely and
 /// synced, under a temporary name of its own next to `output` (created exclusively; concurrent exports never share
 /// one) and linked to `output` only when complete, so a failed export leaves no partial file and an existing file
-/// is never replaced; the directory is then synced, so the name survives a power loss once `export` returns.
+/// is never replaced; the directory is then synced, so the name survives a power loss once `export` returns. The
+/// directory is opened for that sync before anything is written, so a directory that can't be opened (write and
+/// search permission without read permission) fails the export before the file exists, and a retry can succeed.
 ///
 /// # Errors
 ///
@@ -169,6 +171,18 @@ pub fn export(
             }
         }
     };
+    // The directory is opened for syncing before anything is created in it, so that an export that can't make its
+    // file durable fails before the file is published, not after (a directory with write and search permission but
+    // no read permission takes the link, but can't be opened).
+    let dir = match output.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let dir_handle = std::fs::File::open(dir).map_err(|source| Error::Io {
+        op: "open directory (to sync it)",
+        path: dir.to_path_buf(),
+        source,
+    })?;
     let (partial, file) = create_partial(output)?;
     let io = |op: &'static str| {
         let path = partial.clone();
@@ -189,17 +203,13 @@ pub fn export(
         // Then the temporary name goes, and the directory is synced so that the new name (and the removal) survive
         // a power loss; before that, a power loss may lose the name, never leave a partial file under it.
         let _ = std::fs::remove_file(&partial);
-        let dir = match output.parent() {
-            Some(p) if !p.as_os_str().is_empty() => p,
-            _ => Path::new("."),
-        };
-        std::fs::File::open(dir)
-            .and_then(|d| d.sync_all())
-            .map_err(|source| Error::Io {
-                op: "sync directory",
-                path: dir.to_path_buf(),
-                source,
-            })?;
+        // Only an I/O error of the file system can fail this now; the file is then complete under its name, but
+        // the name may not survive a power loss, which the error says.
+        dir_handle.sync_all().map_err(|source| Error::Io {
+            op: "sync directory (the exported file is complete, but its name may not survive a power loss)",
+            path: dir.to_path_buf(),
+            source,
+        })?;
         Ok(report)
     })();
     // Only this export's own temporary file is removed: its name is unique and it was created exclusively.
@@ -1344,6 +1354,42 @@ mod tests {
                 .collect();
             assert!(left.is_empty(), "{left:?}");
         }
+    }
+
+    /// Review round 5: a directory with write and search permission but no read permission takes the hard link
+    /// but can't be opened for the sync after it. The export fails before anything is created, so no complete file
+    /// is left behind under the destination's name with an error, and a retry once the directory is readable
+    /// succeeds. (Skipped when the permission doesn't stop this process, as for root.)
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_directory_fails_before_the_file_is_published() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, journal) = journal(10);
+        let out_dir = dir.path().join("write-and-search-only");
+        std::fs::create_dir(&out_dir).unwrap();
+        std::fs::set_permissions(&out_dir, std::fs::Permissions::from_mode(0o300)).unwrap();
+        if std::fs::File::open(&out_dir).is_ok() {
+            std::fs::set_permissions(&out_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            eprintln!("skipped: the directory permission doesn't apply to this process");
+            return;
+        }
+        let output = out_dir.join("out.iox2");
+        let err = export(&journal, &output, &ExportOptions::default()).unwrap_err();
+        std::fs::set_permissions(&out_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            matches!(err, Error::Io { op, .. } if op.starts_with("open directory")),
+            "{err}"
+        );
+        let left: Vec<_> = std::fs::read_dir(&out_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert!(
+            left.is_empty(),
+            "nothing is published or left behind: {left:?}"
+        );
+        let report = export(&journal, &output, &ExportOptions::default()).unwrap();
+        assert_eq!(report.messages, 10, "a retry succeeds");
     }
 
     /// Review round 4: the temporary name doesn't grow with the destination's, so a destination whose name has the

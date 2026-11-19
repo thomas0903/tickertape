@@ -195,6 +195,9 @@ impl SourceFactory for DynamicService {
         let Some(details) = details else {
             return Ok(Opened::NotYet);
         };
+        // Its settings are checked against the caps before the service is opened (iceoryx2 lists a service's
+        // nodes, in proportion to `max_nodes`, when it opens one) and before anything else is sized by them.
+        crate::typed::check_settings(&self.name, details.static_details.publish_subscribe())?;
         let types = *details
             .static_details
             .publish_subscribe()

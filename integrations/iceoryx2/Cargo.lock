@@ -1122,6 +1122,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "iceoryx2",
+ "iceoryx2-bb-posix",
  "proptest",
  "serde",
  "serde_json",

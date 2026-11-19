@@ -284,6 +284,9 @@ impl ReplayerBuilder {
             let name = service_name(target)?;
             let factory =
                 P::open_service::<H>(node, &name, target, Create::Replay(descriptor.settings))?;
+            // The settings in force (someone may have created the target since `check_existing`) are checked
+            // before `service_version`, which lists the service's nodes.
+            crate::typed::check_settings(target, factory.static_config())?;
             let got = describe(factory.static_config(), service_version(node, &name), 0);
             if let Some(diff) = type_difference(
                 descriptor,
@@ -816,6 +819,9 @@ pub(crate) fn check_existing(
     let Some(details) = details else {
         return Ok(());
     };
+    // Its settings are checked against the caps before the service is opened (iceoryx2 lists a service's nodes,
+    // in proportion to `max_nodes`, when it opens one).
+    crate::typed::check_settings(target, details.static_details.publish_subscribe())?;
     let got = describe(
         details.static_details.publish_subscribe(),
         service_version(node, &name),

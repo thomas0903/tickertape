@@ -23,7 +23,9 @@ Report possible vulnerabilities privately as described in [`SECURITY.md`](SECURI
   `integrations/iceoryx2/src/dynamic.rs`, for iceoryx2 API that is only offered as `unsafe` (services whose types are
   known only at run time); the crate denies `unsafe_code` everywhere else. Its binary,
   `integrations/iceoryx2/src/main.rs`, has one `unsafe` call, which passes the user's trust in a recording on to the
-  `unsafe fn` `Replayer::run_dynamic`. The same rules apply to both.
+  `unsafe fn` `Replayer::run_dynamic`. The same rules apply to both. Its allocation measurement test,
+  `integrations/iceoryx2/tests/allocation.rs`, implements a counting global allocator (an `unsafe impl GlobalAlloc`
+  that forwards to `System`), test code only, under the same rules.
 - **No unverified claims.** Numbers in docs come from recorded runs (`docs/playbooks/run-benchmark.md`); guarantees
   name the test that checks them.
 

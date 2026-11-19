@@ -322,60 +322,104 @@ The normative description, with tests that pin every offset, is the rustdoc of [
 
 ### Memory a replay target or a recorder subscriber may cost
 
-Not a decoding rule: a limit the replayer and the recorder apply before they create a publisher or subscriber, to the
-service's settings *in force*: those of the service as opened or created (a recorded 0 means iceoryx2's default, from
-the node's configuration), not the recorded ones. These are all the allocations iceoryx2 0.10.0 makes, with unchecked
-arithmetic, when a port and its connections are created (formulas in [`src/layout.rs`](src/layout.rs)). A publisher
-preallocates `samples = max_subscribers × (buffer + borrowed) + history_size + loaned samples` (the replayer's
-publishers loan 2) and has `segments` data segments: 1 with a static allocation strategy (the replayer's, for
-fixed-size payloads), 255 with a growing one (the replayer's power-of-two strategy for slices). `samples` is at most
-1,048,576.
+Not a decoding rule: caps on the service settings this tool hands to iceoryx2, and upper estimates of what iceoryx2
+0.10.0 then allocates, which the replayer and the recorder check before they create a publisher or subscriber.
+iceoryx2 itself enforces none of these limits. They apply to the service's settings *in force*: those of the service
+as opened or created (a recorded 0 means iceoryx2's default, from the node's configuration), not the recorded ones.
+The settings are checked against the caps of the [validity rules](#validity-rules) before anything iceoryx2 sizes by
+them, and the estimates (formulas in [`src/layout.rs`](src/layout.rs), with checked arithmetic) cover what iceoryx2
+0.10.0 allocates, with unchecked arithmetic, when a port and its connections are created and while it runs.
+
+The estimates are checked against what iceoryx2 really allocates, not only against a reading of its source:
+[`tests/allocation.rs`](tests/allocation.rs) creates ports of small, representative shapes on a real iceoryx2 node
+(fixed-size and `[u8]` services; static and growing publishers; 0, 8 and 32 publishers present when a subscriber is
+created, and 8 and 32 that connect after it; 0, 8 and 32 subscribers present when a publisher is created; history 0
+and 3; a slice publisher whose data segment grew twice and three times with a history of 3) and asserts, for every
+shape, that each estimate is at least what it measured: the heap the port leaves live (a counting global allocator)
+and the sizes of the shared-memory objects named after the port (the files under `/dev/shm` on Linux; on macOS,
+where iceoryx2 0.10.0 keeps a state file `/tmp/<name>.shm_state` per object, naming a POSIX shared-memory object that
+has no path, the objects as iceoryx2 lists and opens them). It runs on macOS and Linux (CI: x86-64 and aarch64);
+`cargo test --all-features --test allocation -- --nocapture` prints the table.
+
+A publisher preallocates `samples = max_subscribers × (buffer + borrowed) + history_size + loaned samples` (the
+replayer's publishers loan 2) and has `segments` data segments: 1 with a static allocation strategy (the replayer's,
+for fixed-size payloads), 255 with a growing one (the replayer's power-of-two strategy for slices). `samples` is at
+most 1,048,576.
 
 | Port | Where | What | Limit |
 |---|---|---|---|
 | Replay publisher | heap | an 8-byte reference counter per sample for each data segment (`segments × samples × 8`), a connection slot per possible subscriber (`max_subscribers × 2 KiB`), a history entry per history sample (`history_size × 32`), 1 MiB fixed | 128 MiB |
 | Replay publisher | shared memory | one connection per subscriber (`max_subscribers ×` the connection below) | 512 MiB |
-| Replay publisher | shared memory | its data segment: `samples × chunk size` (for a growing strategy the chunk size rounded up to a power of two, as iceoryx2 grows it), plus the alignment and `4 × (samples + 1) + 3` bytes of pool index | 1 GiB |
-| Recorder subscriber | heap | a connection slot per publisher and per expired connection it may keep (`(max(subscriber_expired_connection_buffer, borrowed) + max_publishers) × 8 KiB`), 1 MiB fixed | 128 MiB |
+| Replay publisher | shared memory | **every data segment that can be alive at once**: the first, `samples × first chunk size`; for a growing strategy, one more for every power of two above the first chunk size up to the largest sample's chunk size rounded up to a power of two (a larger sample makes iceoryx2 create a segment of such chunks, and an old segment stays while a sample in it is referenced: by the history, a subscriber or a loan), and the management object of the segments (64 KiB). Each segment adds the alignment, `4 × (samples + 1) + 3` bytes of pool index and a 4 KiB storage header, and takes whole 64 KiB pages | 1 GiB in all |
+| Recorder subscriber | heap | a connection slot for every publisher the service allows and every expired connection it may keep, each with a growing publisher's segment table (`(max(subscriber_expired_connection_buffer, borrowed) + max_publishers) × (8 KiB + 384 KiB)`), 1 MiB fixed | 128 MiB |
 | Recorder subscriber | shared memory | the connections it creates, one per publisher present, sized by what each **publisher** advertises | 512 MiB |
 
 A connection (one publisher to one subscriber) holds a used-chunk list of one byte per sample for each of the
 publisher's data segments (`segments × samples`), a submission queue (`8 × (buffer + 1) + 7`), a completion queue
 (`8 × (buffer + borrowed + 1) + 7`) and fixed parts (4 KiB, and 64 bytes per segment), counted in whole 64 KiB pages
 (each connection and data segment is a shared-memory object of its own; 64 KiB is the largest page size of the
-supported targets). The per-slot sizes on the heap are those of iceoryx2-internal types, measured (1,304 bytes per
-subscriber slot of a publisher, 16 per history entry, 3,680 to 3,824 per connection slot of a subscriber, on macOS
-and Linux aarch64; connections had about 32 bytes per segment and 200 fixed bytes besides their lists and queues) and counted with the
-margins above. All of it is computed with checked arithmetic.
+supported targets).
 
-For example, an existing slice target with 1,024 subscribers, buffer 30 and 2 borrowed samples has 32,770 samples and
+The per-slot sizes are those of iceoryx2 0.10.0's internal types, measured on macOS and Linux aarch64 (the constants
+in [`src/layout.rs`](src/layout.rs) say so next to each value) and counted with a margin: 1,304 bytes per subscriber
+slot of a publisher, 16 per history entry, about 330 KB of fixed publisher heap with 255 segments, 3,680 to 3,824
+bytes per connection slot of a subscriber, and about 302 KB per connection to a publisher with a growing data
+segment: the subscriber's view of that segment allocates a table of 255 segment entries at once (static publishers
+add about 70 bytes). The last one is why the recorder's heap counts `max_publishers`, not the publishers present:
+see below.
+
+Examples. An existing slice target with 1,024 subscribers, buffer 30 and 2 borrowed samples has 32,770 samples and
 63.75 MiB of reference counters, but its publisher's 1,024 connections would take 8 GiB of used-chunk lists (255 ×
 32,770 bytes each): refused. 8 subscribers with buffers of 4,096 (the publisher example's) fit for slices: 63.8 MiB of
-reference counters and 64.5 MiB of connections. A service allowing more than about 16,000 borrowed samples is refused
-by the recorder (connection slots).
+reference counters and 64.5 MiB of connections; its data segments take 129.8 MiB with the first 4 KiB chunks, 386 MiB
+once a message has needed 8 KiB chunks and 899 MiB after 16 KiB ones, and a message that needs 32 KiB chunks (1.9 GiB
+in all) is refused. A static segment of 32,764 chunks of 32,768 bytes came to exactly 1 GiB without its storage
+header, and is refused with it. A service the recorder records may allow at most 331 connection slots: with the
+default expired-connection buffer of 128, at most 203 publishers (2,048 publishers would need at least 146 MiB of
+segment tables).
 
-The replayer checks the data segment when it creates a publisher (its first slice holds about 4 KiB) and, for slices,
-before each larger message, which would make the segment grow; a message over the limit stops the replay with an
-error.
+The replayer checks the data segments when it creates a publisher (its first slice holds about 4 KiB) and, for
+slices, before each message larger than the first chunks, which may make iceoryx2 create another segment; a message
+over the limit stops the replay with an error.
 
 **What the recorder can and cannot bound.** iceoryx2 sizes each connection by what the publisher advertises (its
 sample count and data segments; `Connection::new` in `port/details/receiver.rs`), not by the recorder's settings, and
-gives a subscriber no way to decline a publisher. The recorder reads those values from the service's dynamic
-configuration (public API) and checks them, with its own heap, just before it creates its subscriber; that is when it
-creates the connections to the publishers already there, and a service over the limits is refused (reported and
-retried). A publisher created later creates its connections to the subscribers that exist, and registers itself (so
-that the recorder can see its values) only after that; the recorder then maps those connections (it doesn't allocate
-them, and doesn't allocate the publishers' data segments either). So the recorder can't bound what a later publisher
-makes the system allocate, nor, in iceoryx2 0.10.0, refuse to connect to it. In one race it does allocate: a
-publisher created while the recorder's subscriber is being created may register after the check and before the
-subscriber has registered, and the subscriber then creates the connection to it, sized by that publisher's values,
-when it next receives.
+gives a subscriber no way to decline a publisher. The recorder first checks the service's settings and its own heap,
+from the settings alone; only then does it list the publishers present (iceoryx2 allocates that list in proportion to
+`max_publishers`) and check the connections it will create to them, sized by what each of them advertises, just
+before it creates its subscriber. A service over a limit is refused (reported and retried).
 
-So one replay target costs at most 128 MiB of heap and 1.5 GiB of shared memory (2.5 GiB while a grown data segment
-replaces the previous one), and the recorder's subscriber of one service at most 128 MiB of heap and 512 MiB of
-connections it creates (except in the race above), whatever a journal says. A target, or a service to record, over
-these limits is refused with the quantity and the limit. Raising them later is compatible; lowering them would refuse
-recordings that replay today.
+- *Heap: bounded, for publishers present and later ones alike.* A publisher that connects after the subscriber exists
+  costs the subscriber a connection slot and, if its data segment can grow, the 255-entry segment table, on the
+  subscriber's next receive, and the recorder can't decline it. So the check counts both for every publisher the
+  service allows (`max_publishers`) and for every expired connection (which keeps its table), whether or not those
+  publishers exist yet. Fixed-size services are not exempt: a fixed-size publisher takes its allocation strategy
+  from its own process's iceoryx2 configuration (`publisher_allocation_strategy`), which may be growing, and iceoryx2
+  then gives it a growing data segment, and the subscriber the full table, though its payload never grows.
+- *Shared memory of connections to later publishers: not bounded.* Each port takes its snapshot of the other side's
+  ports before it registers itself (`Publisher::new` in `port/publisher.rs` near line 587, `Subscriber::new` in
+  `port/subscriber.rs` near line 286), and whichever of the two refreshes its connections first creates the
+  connection between them. Normally a publisher created later sees the recorder's subscriber in its snapshot and
+  creates the connection itself; the recorder only maps it. But a publisher that registers after the recorder's
+  check, and whose own snapshot was taken before the recorder's subscriber registered, may be missed by both
+  snapshots, or seen by the subscriber's; the subscriber then creates the connection to it, at creation or on its
+  next receive (if that comes before the publisher refreshes), sized by that publisher's values, which the recorder
+  never checked. The number of such connections is bounded by `max_publishers`, their size is not: a publisher's
+  sample count includes its own loaned samples, which the service doesn't limit. Publishers' data segments are
+  theirs; the recorder maps them and allocates none.
+- *Before the check.* To read a service's settings at all, iceoryx2 lists the service's nodes when it reads its
+  details or opens it (two vectors in proportion to `max_nodes`, 24 bytes a slot, plus each registered node's state),
+  before any setting can be seen through its public API. The recorder and the replayer check the settings right
+  after the first such read and before opening the service, so this happens once for a service over the caps.
+
+So one replay target costs at most 128 MiB of heap and 1.5 GiB of shared memory: 512 MiB of connections and 1 GiB
+for all its data segments together, during and after growth (the publisher shapes of `tests/allocation.rs`, the
+grown slice publisher among them, and the unit tests `retained_data_segments_count` and `data_segment_headers_count`
+in `src/layout.rs`). The recorder's subscriber of one service costs at most 128 MiB of heap, including what later
+publishers cost it (the subscriber shapes with publishers present and connecting later), and 512 MiB of connections
+it creates to the publishers present at its check (the same shapes; the race above excepted), whatever a journal
+says. A target, or a service to record, over these limits is refused with the quantity and the limit. Raising them
+later is compatible; lowering them would refuse recordings that replay today.
 
 ## Behaviour and limits
 

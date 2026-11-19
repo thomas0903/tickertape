@@ -39,11 +39,31 @@ type PubSubDynamic = iceoryx2::service::dynamic_config::publish_subscribe::Dynam
     <ipc::Service as iceoryx2::service::Service>::Bag,
 >;
 
+/// Checks the settings in force of the service `display` (`cfg`) against this crate's caps
+/// ([`ServiceSettings::validate`](layout::ServiceSettings::validate)), before anything that iceoryx2 sizes by them
+/// (listing its ports or nodes, creating a port) runs.
+pub(crate) fn check_settings(display: &str, cfg: &PubSubConfig) -> Result<(), Error> {
+    let unknown = Version {
+        major: 0,
+        minor: 0,
+        patch: 0,
+    };
+    describe(cfg, unknown, 0)
+        .settings
+        .validate()
+        .map_err(|e| Error::Unsupported {
+            service: display.to_string(),
+            reason: format!("the service's settings in force: {e}"),
+        })
+}
+
 /// Checks what the recorder's subscriber of the service `display`, with a buffer of `buffer` samples, will make
-/// iceoryx2 allocate, with the service's settings in force (`cfg`), before it is created: its connection slots on the
-/// heap, and the connections it creates to the publishers present (`dynamic`), sized by what each of them advertises
-/// (see [`layout::subscriber_allocation`]); the service's types are validated too. Publishers created later create
-/// their connections to it themselves, before it can see them.
+/// iceoryx2 allocate, with the service's settings in force (`cfg`), before it is created. First, from the settings
+/// alone: the types, the settings' caps and its heap, which counts a connection slot with a growing publisher's
+/// segment table for every publisher the service allows (`max_publishers`) and every expired connection, so it
+/// bounds publishers that connect later too (see [`layout::subscriber_heap`]). Only then are the publishers present
+/// listed (iceoryx2 allocates that list in proportion to `max_publishers`), and the connections the subscriber
+/// creates to them checked, sized by what each of them advertises (see [`layout::subscriber_allocation`]).
 pub(crate) fn check_subscriber(
     node: &Node<ipc::Service>,
     display: &str,
@@ -57,20 +77,23 @@ pub(crate) fn check_subscriber(
         patch: 0,
     };
     let described = describe(cfg, unknown, 0);
+    let unsupported = |reason: String| Error::Unsupported {
+        service: display.to_string(),
+        reason,
+    };
     layout::validate_types(
         &described.payload,
         &described.user_header,
         &described.system_header,
     )
-    .map_err(|e| Error::Unsupported {
-        service: display.to_string(),
-        reason: e.to_string(),
-    })?;
+    .map_err(|e| unsupported(e.to_string()))?;
     let expired = node
         .config()
         .defaults
         .publish_subscribe
         .subscriber_expired_connection_buffer;
+    layout::subscriber_heap(&described.settings, expired as u64)
+        .map_err(|e| unsupported(format!("the service's settings in force: {e}")))?;
     let mut publishers = Vec::new();
     dynamic.list_publishers(|p| {
         publishers.push(layout::AdvertisedPublisher {
@@ -86,9 +109,10 @@ pub(crate) fn check_subscriber(
         &publishers,
     )
     .map(|_| ())
-    .map_err(|e| Error::Unsupported {
-        service: display.to_string(),
-        reason: format!("the service's settings in force and its publishers: {e}"),
+    .map_err(|e| {
+        unsupported(format!(
+            "the service's settings in force and its publishers: {e}"
+        ))
     })
 }
 
@@ -113,12 +137,14 @@ pub struct PortBudget {
     allocation: PortAllocation,
     chunk: ChunkLayout,
     element_size: u64,
+    /// The chunk size the publisher is created with (its first data segment's buckets).
+    initial_chunk: u64,
 }
 
 impl PortBudget {
     /// Checks the settings and types in force of the service `display` (`cfg`, from the port factory: what iceoryx2
     /// opened or created, defaults included) for a publisher with `max_loaned` loaned samples, a growing allocation
-    /// strategy (255 data segments) or a static one, that starts with `initial_elements` (its data segment is
+    /// strategy (255 data segments) or a static one, that starts with `initial_elements` (its first data segment is
     /// checked too): its heap, its connections and its data segment (see [`layout::publisher_allocation`]).
     pub(crate) fn check(
         display: &str,
@@ -146,21 +172,26 @@ impl PortBudget {
         let allocation =
             layout::publisher_allocation(&described.settings, max_loaned as u64, growing)
                 .map_err(|e| unsupported(format!("the service's settings in force: {e}")))?;
+        let initial_chunk = chunk.size_for(initial_elements as u64).ok_or_else(|| {
+            unsupported(format!("a sample of {initial_elements} elements overflows"))
+        })?;
         let budget = PortBudget {
             allocation,
             chunk,
             element_size: described.payload.size,
+            initial_chunk,
         };
         budget.check_elements(display, initial_elements as u64)?;
         Ok(budget)
     }
 
-    /// Checks the data segment for a sample of `elements` payload elements (a slice publisher's segment grows to
-    /// hold the largest sample loaned).
+    /// Checks the data segments that can be alive at once after a sample of `elements` payload elements is loaned:
+    /// a slice publisher's segments grow to hold the largest sample loaned, and older segments stay while samples
+    /// in them are referenced (see [`PortAllocation::check_data_segments`]).
     pub(crate) fn check_elements(&self, display: &str, elements: u64) -> Result<(), Error> {
         let chunk = self.chunk.size_for(elements).unwrap_or(u64::MAX);
         self.allocation
-            .check_data_segment(chunk, self.chunk.alignment)
+            .check_data_segments(self.initial_chunk, chunk, self.chunk.alignment)
             .map(|_| ())
             .map_err(|e| Error::Unsupported {
                 service: display.to_string(),
@@ -168,13 +199,21 @@ impl PortBudget {
             })
     }
 
-    /// Checks the data segment before a slice payload of `payload_len` bytes is loaned; fixed-size payloads were
-    /// checked when the publisher was created.
+    /// Checks the data segments before a slice payload of `payload_len` bytes is loaned; fixed-size payloads, and
+    /// samples that fit the first segment's chunks, were checked when the publisher was created.
     pub(crate) fn check_payload(&self, display: &str, payload_len: usize) -> Result<(), Error> {
         if self.allocation.segments == 1 || self.element_size == 0 {
             return Ok(());
         }
-        self.check_elements(display, payload_len as u64 / self.element_size)
+        let elements = payload_len as u64 / self.element_size;
+        if self
+            .chunk
+            .size_for(elements)
+            .is_some_and(|c| c <= self.initial_chunk)
+        {
+            return Ok(());
+        }
+        self.check_elements(display, elements)
     }
 }
 

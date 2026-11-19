@@ -44,9 +44,16 @@ clap = { version = "~4.5.0", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 
 [dev-dependencies]
+# Lists and sizes iceoryx2's shared-memory objects in the allocation measurement test (`tests/allocation.rs`); on
+# macOS they are not files, and this is how iceoryx2 itself finds them. Already in iceoryx2's dependency tree.
+iceoryx2-bb-posix = "=0.10.0"
 proptest = "1"
 serde_json = "1"
 tempfile = "3"
+
+[[test]]
+name = "allocation"
+required-features = ["iceoryx2"]
 
 [[bin]]
 name = "tickertape-iox2"

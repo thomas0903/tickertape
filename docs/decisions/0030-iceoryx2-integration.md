@@ -222,3 +222,27 @@ gigabytes, and found a few more integrity gaps. Nothing was released; the layout
   escapes where upstream's serialiser may choose short escapes or single quotes, which both parsers read alike.
 - **`fork`**: the same-process check compares process ids stamped by the sending node, so it relies on iceoryx2
   handles not being used across `fork`, as iceoryx2 requires; stated where the precondition is.
+
+## Amendment: review round 5 (2026-11-20)
+
+- **The memory limits are checked against measurements.** Three rounds in a row a reviewer found an iceoryx2
+  allocation the budget did not count, by reading further into upstream. `integrations/iceoryx2/tests/allocation.rs`
+  now creates ports of representative shapes on a real iceoryx2 node and asserts that every estimate is at least the
+  heap (counting allocator) and shared memory (object sizes) it measures; the README lists the shapes and which
+  test backs each worst case. The limits are described as what they are: caps on the settings this tool hands to
+  iceoryx2, with upper estimates of what iceoryx2 0.10.0 then allocates.
+- **The recorder's heap is bounded by `max_publishers`.** A subscriber's connection to a publisher with a growing
+  data segment allocates a 255-entry segment table (about 302 KB) when it is created, including for publishers that
+  connect after the subscriber exists, which it cannot decline. The heap check counts one for every connection slot
+  the settings allow (`max_publishers` and the expired-connection buffer), fixed-size services included (their
+  publishers' strategy comes from their own configuration). With the default expired-connection buffer, a recorded
+  service may allow at most 203 publishers.
+- **A replay target's data segments are bounded in total.** A growing publisher keeps an old segment while a sample in
+  it is referenced, and every segment has a storage header and the growing ones a management object: the 1 GiB limit
+  now applies to the sum of every segment that can be alive at once, headers included.
+- **Settings are validated before anything is sized by them**: the recorder checks them before it lists a service's
+  publishers, and both sides check a running service's settings before they open it. iceoryx2 lists a service's
+  nodes (in proportion to `max_nodes`) when it reads or opens a service, before any setting is visible; that
+  remains.
+- **Exports open the destination directory before writing**, so a directory that cannot be opened for the final sync
+  fails the export before the file is published.
