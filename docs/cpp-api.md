@@ -446,4 +446,4 @@ field, status code or corruption reason is added without a decision for the bind
 function lacks its mode tag (ADR 0036).
 `TICKERTAPE_FFI_SANITIZE=1` and `TICKERTAPE_FFI_VALGRIND=1` work as for the C tests; under Valgrind the tests that
 replace `operator new` run with `--soname-synonyms=somalloc=nouserintercepts`. With the GCC driver on macOS, the
-statically linked test programs are skipped, for the reason in [Building and linking](#building-and-linking).
+statically linked test programs run too ([Building and linking](#building-and-linking)).

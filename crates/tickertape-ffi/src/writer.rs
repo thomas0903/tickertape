@@ -274,8 +274,11 @@ pub unsafe extern "C" fn tickertape_writer_append_with(
         // SAFETY: forwarded caller contract.
         let seq = unsafe { handle(writer) }?.with(|w| {
             // A non-zero return declines the record through the core's `try_append_with`, which zeroes and syncs the
-            // bytes and returns: aborting needs no unwinding. A panic or foreign exception out of `fill` still
-            // unwinds, to the guard around this call.
+            // bytes and returns: aborting needs no unwinding. A Rust panic out of `fill` is cleaned up by the core and
+            // resumed, then caught by `Handle::with` (the handle becomes broken; `TICKERTAPE_E_PANIC`). A foreign
+            // exception out of `fill` is unsupported (ADR 0028): with current Rust the core's `catch_unwind` ends the
+            // process.
+            let mut declined = false;
             let appended = w.try_append_with(&record, payload_len, |buf| {
                 let ptr = if buf.is_empty() {
                     std::ptr::null_mut()
@@ -286,25 +289,28 @@ pub unsafe extern "C" fn tickertape_writer_append_with(
                 // valid for `buf.len()` writable bytes for the duration of the call.
                 match unsafe { fill(user_data, ptr, buf.len()) } {
                     0 => Ok(()),
-                    _ => Err(()),
+                    _ => {
+                        declined = true;
+                        Err(())
+                    }
                 }
             });
             match appended {
                 Ok(Ok(seq)) => Ok(seq),
-                // The writer refuses appends once a clean-up failed, before calling `fill`, so an error recorded
-                // now comes from this call.
-                Ok(Err(())) => Err(match w.abandoned_write_error() {
-                    Some(cause) => FfiError::from(cause).with_message(format!(
+                Ok(Err(())) => Err(FfiError::new(
+                    S::TICKERTAPE_E_ABORTED,
+                    "the fill callback returned non-zero; nothing was appended",
+                )),
+                // `fill` declined and the clean-up failed: the core returns the error of a refused append; report
+                // the recorded cause (the same OS error) with a message that says what happened.
+                Err(e) => Err(match w.abandoned_write_error() {
+                    Some(cause) if declined => FfiError::from(cause).with_message(format!(
                         "the fill callback returned non-zero, and zeroing the abandoned bytes durably failed: \
                          {cause}; the writer refuses further appends and checkpoints: close it and reopen the \
                          journal"
                     )),
-                    None => FfiError::new(
-                        S::TICKERTAPE_E_ABORTED,
-                        "the fill callback returned non-zero; nothing was appended",
-                    ),
+                    _ => writer_error(w, e),
                 }),
-                Err(e) => Err(writer_error(w, e)),
             }
         })?;
         // SAFETY: forwarded caller contract.

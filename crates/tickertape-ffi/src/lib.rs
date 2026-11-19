@@ -10,11 +10,17 @@
 
 #![warn(missing_docs)]
 
-// The feature `test-panic-abort` lifts this check for one test only (tests/c_api.rs), which shows that an aborted
-// fill needs no unwinding.
-#[cfg(all(panic = "abort", not(feature = "test-panic-abort")))]
+// The private compiler cfg `tickertape_test_panic_abort` lifts this check for one test only (tests/c_api.rs, which
+// passes it in the rustflags of its own build), to show that an aborted fill needs no unwinding. It is not a Cargo
+// feature, so `--all-features` cannot lift the check, and it is refused without `panic = "abort"`, so it cannot be
+// left on by accident.
+#[cfg(all(panic = "abort", not(tickertape_test_panic_abort)))]
 compile_error!(
     "tickertape-ffi needs panic = \"unwind\": it reports caught panics as TICKERTAPE_E_PANIC (ADR 0028)"
+);
+#[cfg(all(tickertape_test_panic_abort, not(panic = "abort")))]
+compile_error!(
+    "the cfg tickertape_test_panic_abort is for one test of tickertape-ffi built with panic = \"abort\"; remove it"
 );
 
 mod args;

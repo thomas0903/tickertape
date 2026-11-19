@@ -158,26 +158,38 @@ fn lib_dir() -> &'static Path {
         if let Ok(dir) = std::env::var("TICKERTAPE_FFI_LIB_DIR") {
             return PathBuf::from(dir);
         }
-        build_library("ffi-c-api", &[])
+        run_library_build(library_build("ffi-c-api"), "ffi-c-api")
     })
 }
 
-/// The directory with a `libtickertape.a` built with `panic = "abort"` (and the feature `test-panic-abort`, which
-/// lets the crate build that way), as [`lib_dir`] builds its libraries but into `<target-dir>/ffi-c-api-panic-abort`.
-/// Nothing in such a library can unwind: a panic, or a `resume_unwind`, ends the process.
+/// The directory with a `libtickertape.a` built with `panic = "abort"`, as [`lib_dir`] builds its libraries but into
+/// `<target-dir>/ffi-c-api-panic-abort`, with the private compiler cfg `tickertape_test_panic_abort` (which lets the
+/// crate build that way; `src/lib.rs`) added to that build's rustflags only. Nothing in such a library can unwind: a
+/// panic, or a `resume_unwind`, ends the process.
 fn panic_abort_lib_dir() -> &'static Path {
     static DIR: OnceLock<PathBuf> = OnceLock::new();
     DIR.get_or_init(|| {
         let profile = cargo_profile();
-        build_library(
-            "ffi-c-api-panic-abort",
-            &[
-                "--features",
-                "test-panic-abort",
-                "--config",
-                &format!("profile.{profile}.panic=\"abort\""),
-            ],
-        )
+        let mut cmd = library_build("ffi-c-api-panic-abort");
+        cmd.args(["--config", &format!("profile.{profile}.panic=\"abort\"")]);
+        // Cargo takes the rustflags from the first of CARGO_ENCODED_RUSTFLAGS and RUSTFLAGS that is set (and ignores
+        // `build.rustflags` then), so the cfg is added to whichever the outer environment uses.
+        let mut flags: Vec<String> = match std::env::var("CARGO_ENCODED_RUSTFLAGS") {
+            Ok(encoded) => encoded
+                .split('\x1f')
+                .filter(|f| !f.is_empty())
+                .map(str::to_owned)
+                .collect(),
+            Err(_) => std::env::var("RUSTFLAGS")
+                .unwrap_or_default()
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect(),
+        };
+        flags.extend(["--cfg".to_owned(), "tickertape_test_panic_abort".to_owned()]);
+        cmd.env_remove("RUSTFLAGS")
+            .env("CARGO_ENCODED_RUSTFLAGS", flags.join("\x1f"));
+        run_library_build(cmd, "ffi-c-api-panic-abort")
     })
 }
 
@@ -189,11 +201,10 @@ fn cargo_profile() -> &'static str {
     }
 }
 
-/// Runs `cargo build -p tickertape-ffi --locked` with the outer build's profile and target and the `extra`
-/// arguments into `<target-dir>/<name>`, and returns the directory with the libraries.
-fn build_library(name: &str, extra: &[&str]) -> PathBuf {
+/// The command `cargo build -p tickertape-ffi --locked` with the outer build's profile and target into
+/// `<target-dir>/<name>`, for [`run_library_build`].
+fn library_build(name: &str) -> Command {
     let layout = outer_layout();
-    let target_dir = layout.target_dir.join(name);
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
     let mut cmd = Command::new(cargo);
     cmd.args([
@@ -204,14 +215,21 @@ fn build_library(name: &str, extra: &[&str]) -> PathBuf {
         "--profile",
         cargo_profile(),
     ])
-    .args(extra)
     .arg("--manifest-path")
     .arg(repo_root().join("Cargo.toml"))
     .arg("--target-dir")
-    .arg(&target_dir);
-    let mut dir = target_dir.clone();
+    .arg(layout.target_dir.join(name));
     if let Some(triple) = &layout.triple {
         cmd.args(["--target", triple]);
+    }
+    cmd
+}
+
+/// Runs a [`library_build`] command for `<target-dir>/<name>` and returns the directory with the libraries.
+fn run_library_build(mut cmd: Command, name: &str) -> PathBuf {
+    let layout = outer_layout();
+    let mut dir = layout.target_dir.join(name);
+    if let Some(triple) = &layout.triple {
         dir.push(triple);
     }
     dir.push(&layout.profile_dir);

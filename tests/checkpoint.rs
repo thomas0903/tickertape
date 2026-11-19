@@ -90,6 +90,20 @@ fn failed_cleanup_of_a_declined_write_on_a_full_volume_is_not_storage_full() {
     failed_cleanup_is_reported(28 /* ENOSPC */, Abandon::Decline);
 }
 
+/// `refused` is the error of an append refused after a failed clean-up: it says why, carries the OS error `errno`,
+/// and is never storage-full.
+fn assert_refused_after_failed_cleanup(refused: &Error, errno: i32) {
+    assert!(!refused.is_storage_full(), "{refused:?}");
+    match refused {
+        Error::Io { op, source, .. } => {
+            assert!(op.contains("abandoned write"), "{op}");
+            assert_eq!(os_code(source), Some(errno));
+            assert_ne!(source.kind(), std::io::ErrorKind::StorageFull);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
 fn failed_cleanup_is_reported(errno: i32, how: Abandon) {
     let dir = tempfile::tempdir().unwrap();
     let mut w = Writer::open(dir.path(), small_config()).unwrap();
@@ -109,9 +123,13 @@ fn failed_cleanup_is_reported(errno: i32, how: Abandon) {
             assert!(abandoned.is_err());
         }
         Abandon::Decline => {
-            // The decline is still reported as such; the failed clean-up shows in `abandoned_write_error`.
+            // A failed clean-up is the journal's error: the call returns the outer `Err`, the one every later append
+            // returns, and the caller's value is dropped.
             let declined = w.try_append_with(&record, 16, |_| Err("abandon"));
-            assert!(matches!(declined, Ok(Err("abandon"))), "{declined:?}");
+            match declined {
+                Err(e) => assert_refused_after_failed_cleanup(&e, errno),
+                Ok(other) => panic!("{other:?}"),
+            }
         }
     }
     let cause = w
@@ -129,18 +147,9 @@ fn failed_cleanup_is_reported(errno: i32, how: Abandon) {
             panic!("fill must not be called on a stopped writer")
         })
         .unwrap_err();
-    assert!(!refused.is_storage_full(), "{refused:?}");
+    assert_refused_after_failed_cleanup(&refused, errno);
     for _ in 0..3 {
-        let refused = w.append(&record).unwrap_err();
-        assert!(!refused.is_storage_full(), "{refused:?}");
-        match refused {
-            Error::Io { op, source, .. } => {
-                assert!(op.contains("abandoned write"), "{op}");
-                assert_eq!(os_code(&source), Some(errno));
-                assert_ne!(source.kind(), std::io::ErrorKind::StorageFull);
-            }
-            other => panic!("{other:?}"),
-        }
+        assert_refused_after_failed_cleanup(&w.append(&record).unwrap_err(), errno);
     }
     let lost = w.checkpoint().unwrap_err();
     assert!(matches!(lost, Error::DurabilityLost));

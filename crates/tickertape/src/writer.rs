@@ -267,19 +267,24 @@ impl Writer {
     /// Appends a record whose payload is written in place by `fill`, which may decline to finish it.
     ///
     /// As [`Writer::append_with`], except that `fill` returns a `Result`: `Ok(())` commits the record, and
-    /// `Err(e)` abandons it and makes this return `Ok(Err(e))`, without a panic or any unwinding. The outer `Result`
-    /// carries the journal's errors, so `?` passes those on and leaves the caller with its own outcome.
+    /// `Err(e)` abandons it, and once the abandoned bytes are cleaned up this returns `Ok(Err(e))`, without a panic or
+    /// any unwinding. The outer `Result` carries the journal's errors, so `?` passes those on and leaves the caller
+    /// with its own outcome.
     ///
     /// Declining does what a panic in the closure does, except that this returns instead of the panic continuing:
-    /// nothing is committed and the sequence number is not used; the writer zeroes the buffer and syncs that zeroing
-    /// (`docs/format.md` → Abandoned writes) before it returns, so no bytes from it can later be mistaken for a
-    /// record, and the next append reuses the space. That sync makes declining slow: keep it for exceptional cases.
+    /// nothing is committed and the sequence number is not used. The writer zeroes the whole record it had begun (the
+    /// header fields it wrote and `fill`'s buffer: everything after the commit word, which was never written) and
+    /// syncs that zeroing (`docs/format.md` → Abandoned writes) before it returns, so no bytes from it can later be
+    /// mistaken for a record. The next record is written at the same place if it fits there. A roll that this call
+    /// completed before `fill` ran stays in place: the old segment is sealed and the writer is at the new segment's
+    /// first slot. The sync makes declining slow: keep it for exceptional cases.
     ///
-    /// If the zeroing cannot be made durable, this still returns `Ok(Err(e))`, but the stale bytes may still be on
-    /// disk and the writer is stopped: [`Writer::abandoned_write_error`] returns the cause, and every later append
-    /// fails with [`Error::Io`] and every checkpoint with [`Error::DurabilityLost`]. Check
-    /// [`Writer::abandoned_write_error`] after a decline to report it at once. A panic in `fill` behaves as in
-    /// [`Writer::append_with`]. `record.payload` is ignored.
+    /// If `fill` declines and the zeroing cannot be made durable, this returns the outer `Err`: the [`Error::Io`]
+    /// that every later append returns, and the caller's `e` is dropped. The stale bytes may still be on disk and the
+    /// writer is stopped: [`Writer::abandoned_write_error`] returns the cause, and every later append fails with
+    /// [`Error::Io`] and every checkpoint with [`Error::DurabilityLost`]. A panic in `fill` behaves as in
+    /// [`Writer::append_with`]: the panic continues, and a failed clean-up is recorded the same way.
+    /// `record.payload` is ignored.
     ///
     /// ```no_run
     /// # use tickertape::{NewRecord, Writer, WriterConfig};
@@ -303,7 +308,9 @@ impl Writer {
     ///
     /// # Errors
     ///
-    /// As for [`Writer::append`]; `fill` is not called when the append fails before it.
+    /// As for [`Writer::append`]. An outer `Err` means the journal failed. `fill` did not run, except when it
+    /// declined and the clean-up failed, which is the one case where [`Writer::abandoned_write_error`] is set by this
+    /// call.
     pub fn try_append_with<F, E>(
         &mut self,
         record: &NewRecord<'_>,
@@ -314,26 +321,7 @@ impl Writer {
         F: FnOnce(&mut [u8]) -> std::result::Result<(), E>,
     {
         if let Some(cause) = &self.abandoned_write_error {
-            let source = match cause {
-                Error::Io { source, .. } => {
-                    let os = source
-                        .get_ref()
-                        .and_then(|e| e.downcast_ref::<io::Error>())
-                        .unwrap_or(source);
-                    os.raw_os_error().map_or_else(
-                        || io::Error::new(os.kind(), os.to_string()),
-                        io::Error::from_raw_os_error,
-                    )
-                }
-                other => io::Error::other(other.to_string()),
-            };
-            // Wrapped, like the cause, so that the OS error (say ENOSPC) is never `is_storage_full`: freeing space
-            // does not make this writer accept appends again.
-            return Err(Error::io(
-                "append (refused: an earlier abandoned write could not be zeroed durably; reopen the journal)",
-                &self.active.path,
-                io::Error::other(source),
-            ));
+            return Err(refused_append(cause, &self.active.path));
         }
         if self.next_seq == u64::MAX {
             return Err(Error::SequenceExhausted);
@@ -378,11 +366,13 @@ impl Writer {
         match filled {
             Ok(Ok(())) => {}
             Ok(Err(declined)) => {
-                self.abandon(offset, len);
+                // A failed clean-up is the journal's error: the caller's value is dropped.
+                self.abandon(offset, len)?;
                 return Ok(Err(declined));
             }
             Err(cause) => {
-                self.abandon(offset, len);
+                // The panic continues even if the clean-up failed; the cause is recorded all the same.
+                let _ = self.abandon(offset, len);
                 panic::resume_unwind(cause);
             }
         }
@@ -416,11 +406,11 @@ impl Writer {
 
     /// Abandons the uncommitted record of frame length `len` at `offset` (its fill closure declined or panicked):
     /// zeroes its body and makes the zeroing durable (full platform barrier) before the space can be reused
-    /// (`docs/format.md` → Abandoned writes). If that fails, stops the writer ([`Writer::abandoned_write_error`]).
-    /// The one clean-up for both ways of abandoning a record.
+    /// (`docs/format.md` → Abandoned writes). If that fails, stops the writer ([`Writer::abandoned_write_error`]) and
+    /// returns the error that every later append returns. The one clean-up for both ways of abandoning a record.
     #[cold]
     #[inline(never)]
-    fn abandon(&mut self, offset: u64, len: u32) {
+    fn abandon(&mut self, offset: u64, len: u32) -> Result<()> {
         let body_len = u64::from(len) - format::COMMIT_WORD_LEN as u64;
         let zeroed = match self
             .active
@@ -438,17 +428,21 @@ impl Writer {
             .and_then(|()| self.active.map.sync_range(offset, u64::from(len)))
             .and_then(|()| mmap::sync_data(&self.active.file))
             .and_then(|()| mmap::full_barrier(&self.active.file));
-        if let Err(e) = synced {
-            // Stale bytes could resurface after a power loss and be read as a record after a shorter one,
-            // so this writer must not reuse the space: refuse further appends and checkpoints.
-            self.poisoned = true;
-            // The OS error is wrapped (kind `Other`) so that it is never `is_storage_full`.
-            self.abandoned_write_error = Some(Error::io(
-                "sync the zeroing of an abandoned write",
-                &self.active.path,
-                io::Error::other(e),
-            ));
-        }
+        let Err(e) = synced else {
+            return Ok(());
+        };
+        // Stale bytes could resurface after a power loss and be read as a record after a shorter one,
+        // so this writer must not reuse the space: refuse further appends and checkpoints.
+        self.poisoned = true;
+        // The OS error is wrapped (kind `Other`) so that it is never `is_storage_full`.
+        let cause = Error::io(
+            "sync the zeroing of an abandoned write",
+            &self.active.path,
+            io::Error::other(e),
+        );
+        let refused = refused_append(&cause, &self.active.path);
+        self.abandoned_write_error = Some(cause);
+        Err(refused)
     }
 
     /// Makes every record appended so far durable, using the platform's sync calls (see
@@ -776,6 +770,34 @@ fn publish_spare(dir: &Path, base: u64, size: u64, spare: Spare) -> Result<Segme
         file: spare.file,
         map: spare.map,
     })
+}
+
+/// The error of an append refused because the zeroing of an abandoned write could not be made durable (`cause`, the
+/// writer's [`Writer::abandoned_write_error`]): an [`Error::Io`] with the cause's OS error. Returned by every append
+/// from then on, and by the `try_append_with` call whose decline left that clean-up failed.
+#[cold]
+#[inline(never)]
+fn refused_append(cause: &Error, path: &Path) -> Error {
+    let source = match cause {
+        Error::Io { source, .. } => {
+            let os = source
+                .get_ref()
+                .and_then(|e| e.downcast_ref::<io::Error>())
+                .unwrap_or(source);
+            os.raw_os_error().map_or_else(
+                || io::Error::new(os.kind(), os.to_string()),
+                io::Error::from_raw_os_error,
+            )
+        }
+        other => io::Error::other(other.to_string()),
+    };
+    // Wrapped, like the cause, so that the OS error (say ENOSPC) is never `is_storage_full`: freeing space does not
+    // make this writer accept appends again.
+    Error::io(
+        "append (refused: an earlier abandoned write could not be zeroed durably; reopen the journal)",
+        path,
+        io::Error::other(source),
+    )
 }
 
 /// An internal bounds check failed (a bug, reported as an error rather than a panic).

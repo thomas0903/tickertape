@@ -91,10 +91,11 @@ program can produce duplicate symbols; link one of them dynamically in that case
 
 **macOS and the GCC driver.** The GCC driver (Homebrew `gcc`/`g++`) passes `-no_compact_unwind` to the linker, so
 `libtickertape.a` linked that way loses its unwind information. No ordinary result depends on it: an append whose
-fill callback returns non-zero returns `TICKERTAPE_E_ABORTED` without unwinding (ADR 0039). The library still
-unwinds to catch a Rust panic (a bug in tickertape, otherwise reported as `TICKERTAPE_E_PANIC`), so with that link
-such a panic ends the process instead. Shared linkage, or the static library linked by Apple Clang (`cc`, `c++`),
-keeps the unwind information.
+fill callback returns non-zero returns without unwinding (ADR 0039), with `TICKERTAPE_E_ABORTED` when the clean-up
+succeeds and `TICKERTAPE_E_IO` when it fails (see `tickertape_writer_append_with` below). The library still unwinds to
+catch a Rust panic (a bug in tickertape, otherwise reported as `TICKERTAPE_E_PANIC`), so with that link such a panic
+ends the process instead. Shared linkage, or the static library linked by Apple Clang (`cc`, `c++`), keeps the unwind
+information.
 
 C++ can use the same header (it has `extern "C"` guards), but the C++ binding
 [`tickertape.hpp`](../crates/tickertape-ffi/include/tickertape.hpp) (C++17, header-only, [`cpp-api.md`](cpp-api.md))
@@ -349,9 +350,11 @@ Errors are sticky):
   cache can hold the zeroed bytes as clean pages while the disk still holds the stale ones; recovery then reads zeros
   and has no reason to rewrite them, so reopening does not establish that the clean-up reached the disk.
 
-Later versions may add codes; treat any unknown negative value as an error. No Rust panic ever unwinds into C: every
+Later versions may add codes; treat any unknown negative value as an error. No Rust panic unwinds into C: every
 function catches panics and returns `TICKERTAPE_E_PANIC` (the library must be built with Rust's default
-`panic = "unwind"`, which the crate enforces). The Rust panic message is also printed to standard error.
+`panic = "unwind"`, which the crate enforces). The exception is the static library linked by the GCC driver on macOS,
+where a panic ends the process instead (see [Building and linking](#building-and-linking)). The Rust panic message is
+also printed to standard error.
 
 ## Threading
 

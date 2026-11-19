@@ -54,9 +54,9 @@ checkpoint error, records written before it may not be durable even if a later w
 a checkpoint error as an incident.
 
 The same holds when the writer cannot sync the zeroing of an abandoned write (a fill closure that panicked, or a
-`try_append_with` fill closure that declined; `format.md` → Abandoned writes). That writer refuses appends as well as checkpoints
-(`Writer::abandoned_write_error`), and the durability of everything written since its last successful checkpoint is
-unknown, also for a later writer in the same boot.
+`try_append_with` fill closure that declined; `format.md` → Abandoned writes). That writer refuses appends as well as
+checkpoints (`Writer::abandoned_write_error`), and the durability of everything written since its last successful
+checkpoint is unknown, also for a later writer in the same boot.
 
 ## Storage assumptions for durability
 
