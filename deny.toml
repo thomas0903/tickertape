@@ -6,6 +6,12 @@ all-features = true
 [advisories]
 # RustSec advisories: vulnerabilities and unmaintained crates fail the check; yanked crates too.
 yanked = "deny"
+ignore = [
+    # chrono was declared unmaintained (informational, not a vulnerability). It reaches tickertape-cli only through
+    # parquet, whose newest release (60.1.0, checked 2026-11-19) still requires it, so there is no upgrade to make.
+    # The library crate does not depend on it. Remove this entry when parquet drops or replaces chrono.
+    { id = "RUSTSEC-2026-0543", reason = "transitive through parquet in the CLI only; no parquet release without chrono" },
+]
 
 [licenses]
 # Permissive licences compatible with MIT OR Apache-2.0 distribution.
