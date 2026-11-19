@@ -21,6 +21,9 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   weekly (informational) against the newest iceoryx2 release and upstream `main`.
 - Dependencies: `deny.toml` allows the 0BSD licence (public-domain equivalent; `enum-iterator`, required by iceoryx2,
   in the integration's lockfile).
+- Benchmarks: the test of a lagging reader under retention no longer depends on machine speed (it failed on
+  macOS CI runners), and `tt-sustained` readers retry a seek when retention removes the segment they were about to
+  open.
 - Benchmarks: sustained workloads (ADR 0026). `tt-sustained` runs one writer and any mix of safe/mapped,
   visible/durable-only and lagging reader processes for a fixed duration (default 10 minutes) with steady, bursty or
   unpaced traffic, periodic checkpoints, segment rolls and writer retention, and reports latency percentiles, late
