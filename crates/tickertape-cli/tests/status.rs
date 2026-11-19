@@ -373,6 +373,37 @@ fn invalid_head_and_corrupt_header() {
     assert_eq!(v["head"]["invalid_reason"], "record checksum mismatch");
     assert_eq!(v["health"]["breaches"][0]["code"], "head_invalid");
     assert_eq!(v["health"]["corrupt"], true);
+    // Round 3, item 4: an invalid head is not verified, and the exposure is unknown (before the fix: verified, two
+    // records, 120 bytes), in the JSON, the text and the Prometheus output.
+    assert_eq!(v["head"]["verified"], false, "{v}");
+    assert_eq!(v["health"]["verified"], false, "{v}");
+    assert_eq!(v["exposure"]["verified"], false, "{v}");
+    assert_eq!(v["exposure"]["records"], Value::Null, "{v}");
+    assert_eq!(v["exposure"]["bytes"], Value::Null, "{v}");
+    assert_eq!(v["exposure"]["estimated_age_s"], Value::Null, "{v}");
+    let text = command().args(["status", path]).output().unwrap();
+    let text = String::from_utf8(text.stdout).unwrap();
+    assert!(
+        text.contains("(not verified: the head is at invalid bytes)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("exposure    unknown records, ? bytes"),
+        "{text}"
+    );
+    assert!(text.contains("(not verified)"), "{text}");
+    assert!(text.contains("health      CORRUPT: head_invalid"), "{text}");
+    let prom = command()
+        .args(["status", path, "--format", "prometheus"])
+        .output()
+        .unwrap();
+    let prom = String::from_utf8(prom.stdout).unwrap();
+    let samples = check_exposition(&prom);
+    let value = |name: &str| samples.iter().find(|(n, _, _)| n == name).map(|s| s.2);
+    assert_eq!(value("tickertape_head_verified"), Some(0.0), "{prom}");
+    assert_eq!(value("tickertape_exposure_verified"), Some(0.0), "{prom}");
+    assert_eq!(value("tickertape_exposure_records"), None, "{prom}");
+    assert_eq!(value("tickertape_exposure_bytes"), None, "{prom}");
     // Corruption takes precedence over a breached threshold.
     assert_eq!(status_json(&[path, "--min-headroom", "1048576T"]).1, 2);
     // A damaged newest header is corruption.

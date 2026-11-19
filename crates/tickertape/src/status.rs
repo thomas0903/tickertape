@@ -172,9 +172,10 @@ pub struct Head {
     pub last_local_ts_ns: Option<u64>,
     /// True if this sample (or, for a [`Sampler`], its earlier samples of the same segment file) validated every
     /// record from the checkpoint marker's position (without a marker, from the start of the oldest segment) to the
-    /// head. False means the checkpoint is in an older segment (or there are several segments and no checkpoint):
-    /// the segments in between were not read, so a missing or damaged one would not have been noticed, and the head's
-    /// sequence number is what the newest segment's name and records imply, not a verified count. A sample with
+    /// head. False means the head is at invalid bytes ([`HeadEnd::Invalid`], a corruption breach), or the checkpoint
+    /// is in an older segment (or there are several segments and no checkpoint): the segments in between were not
+    /// read, so a missing or damaged one would not have been noticed, and the head's sequence number is what the
+    /// newest segment's name and records imply, not a verified count. A sample with
     /// `verified == false` and no breach does **not** mean that [`Writer::open`](crate::Writer::open) would open the
     /// journal.
     pub verified: bool,
@@ -301,8 +302,9 @@ impl CheckpointStatus {
 #[non_exhaustive]
 pub struct Exposure {
     /// Committed records not covered by the checkpoint marker (without a marker, every record from the start of the
-    /// oldest segment). `None` if the marker can't be used ([`CheckpointStatus::problem`]), lies beyond the head, or
-    /// a segment in between is proven missing ([`Head::chain_broken`]). If the chain is not verified
+    /// oldest segment). `None` if the marker can't be used ([`CheckpointStatus::problem`]), lies beyond the head, a
+    /// segment in between is proven missing ([`Head::chain_broken`]), or the head is at invalid bytes
+    /// ([`HeadEnd::Invalid`]: what lies before them is not known to be what the writer would keep). If the chain is not verified
     /// ([`Exposure::verified`] false), this is the head's sequence number (as the newest segment implies it) minus the
     /// marker's, whether or not the segments in between are intact.
     pub records: Option<u64>,
@@ -1094,7 +1096,11 @@ impl Sampler {
             (Some(_), None) => None,
         };
         head.chain_broken = covered_from.is_some_and(|c| missing_segment(&files, c, head_seg.base));
+        // A head at invalid bytes is a break the sample confirms (the writer refuses the journal): nothing up to it is
+        // verified, and no exposure is summed up to it (round 3).
+        let head_invalid = matches!(head.end, HeadEnd::Invalid(_));
         head.verified = !head.chain_broken
+            && !head_invalid
             && covered_from.is_some_and(|c| {
                 c.segment_base_seq == head_seg.base
                     && origin <= c.offset
@@ -1122,7 +1128,7 @@ impl Sampler {
         // Exposure. Nothing is summed across a segment the listing proves missing. The oldest uncovered record's
         // timestamp is looked up afresh in every sample (one record read), never carried from an earlier one.
         let records = covered_from
-            .filter(|_| !head.chain_broken)
+            .filter(|_| !head.chain_broken && !head_invalid)
             .and_then(|c| head.position.next_seq.checked_sub(c.next_seq));
         let oldest_local_ts_ns = match (records, covered_from) {
             (Some(n), Some(c)) if n > 0 => {

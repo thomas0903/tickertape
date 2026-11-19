@@ -774,6 +774,8 @@ fn age_unknown_words(reason: tickertape::status::AgeUnknown) -> &'static str {
 fn render_text(out: &mut String, journal: &Path, s: &Status, breaches: &[Breach]) {
     let unverified = if s.head.chain_broken {
         " (chain broken: a segment between the checkpoint and the head is missing)"
+    } else if matches!(s.head.end, HeadEnd::Invalid(_)) {
+        " (not verified: the head is at invalid bytes)"
     } else if s.head.verified {
         ""
     } else {

@@ -427,6 +427,32 @@ fn invalid_head_is_corruption() {
     assert_eq!(breaches, vec![Breach::HeadInvalid]);
     assert!(breaches[0].is_corruption());
     assert!(!Breach::CheckpointAge.is_corruption());
+    // Round 3, item 4: the sample is unverified and the exposure unknown (before the fix: verified, 2 records), for
+    // a one-shot sample and a sampler alike, with or without a checkpoint before the damage.
+    let unverified = |s: &Status| {
+        assert!(!s.head.verified);
+        assert!(!s.exposure.verified);
+        assert_eq!(s.exposure.records, None);
+        assert_eq!(s.exposure.bytes, None);
+        assert_eq!(s.exposure.estimated_age, None);
+        assert_eq!(s.exposure.oldest_local_ts_ns, None);
+    };
+    unverified(&s);
+    let mut sampler = Sampler::new(dir.path());
+    unverified(&sampler.sample().unwrap());
+    unverified(&sampler.sample().unwrap());
+    // A checkpoint after the first record, in the head's segment: still unverified.
+    file.write_all_at(&[0xA5], at).unwrap();
+    let mut writer = Writer::open(dir.path(), config()).unwrap();
+    writer.checkpoint().unwrap();
+    append(&mut writer, 2, 10, 0);
+    drop(writer);
+    let at = 64 + 4 * frame(10) + format::RECORD_HEADER_LEN as u64;
+    file.write_all_at(&[0x5A], at).unwrap();
+    let s = status(dir.path()).unwrap();
+    assert!(matches!(s.head.end, HeadEnd::Invalid(_)), "{:?}", s.head);
+    assert!(s.checkpoint.unwrap().problem.is_none());
+    unverified(&s);
 }
 
 #[test]

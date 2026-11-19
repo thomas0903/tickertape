@@ -279,9 +279,10 @@ not be established.
 
 - `head`: where the next record goes, as far as the newest segment shows. `end` is `sealed` only when the newest
   segment ends in a seal and its successor didn't exist when checked (a writer died during a roll); `invalid` when
-  bytes there still fail validation after re-reading. `verified` is true if the sample validated every record from
-  the checkpoint (or, without one, from the start of the oldest segment) to the head; false when the checkpoint is
-  in an older segment, whose successors it didn't read. `chain_broken` is true when the segment names and sizes
+  bytes there still fail validation after re-reading (corruption: `verified` is then false and `exposure` unknown).
+  `verified` is true if the sample validated every record from the checkpoint (or, without one, from the start of
+  the oldest segment) to the head; false when the head is `invalid` or the checkpoint is in an older segment, whose
+  successors it didn't read. `chain_broken` is true when the segment names and sizes
   alone prove a segment missing in between (the next segment starts beyond what the previous one can hold): the
   writer refuses such a journal, `exposure` is unknown and `health.corrupt` is true. Other missing segments leave
   `verified` false.
