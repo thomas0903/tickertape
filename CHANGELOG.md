@@ -5,6 +5,20 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
+- Operational metrics (ADR 0032), with no format change and nothing added to `append` or the reader's read path:
+  - `tickertape::status::status(dir)` and `status::Sampler` sample a journal from any process: the writer's head,
+    the checkpoint marker and its age (from the marker's modification time), what a power loss would remove now
+    (exposure), storage headroom in bytes and segment rolls, and the writer's PID. A `Sampler` resumes its scan
+    where it stopped and measures append rates and an estimated time until the volume is full.
+  - `Writer::metrics()` (head, checkpoint age by the monotonic clock, bytes the next checkpoint must sync, poisoned
+    flag, retention failure count), `Reader::cursor()` and `Status::lag()` for in-process reader lag.
+  - `status::ReaderBeacon`: an opt-in 64-byte file in `<dir>/readers/` that publishes a reader's position for
+    observers in other processes. A held `flock` tells live readers from dead ones; the writer and retention never
+    read beacons.
+  - CLI: `tickertape status <DIR>` with text, `--json` (`schema_version` 1) and `--format prometheus` output,
+    `--watch`, `--output` (atomic replace, for a node_exporter textfile collector), and health thresholds
+    (`--max-checkpoint-age`, `--min-headroom`, `--min-headroom-segments`, `--max-reader-lag`) that exit with code 3.
+  - `rustix` now also enables its `process` feature (for `kill(pid, 0)`); no new crates.
 - Docs: define the path to v1.0 around sustained performance, optional eBPF diagnostics, reader/checkpoint
   optimization, ARM measurements, interoperability, replay/recovery at scale and explicit stability/release gates.
 - Docs: v1.0 scope decisions of 2026-11-19. The external integration is an iceoryx2 recorder and replayer
