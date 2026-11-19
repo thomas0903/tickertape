@@ -167,8 +167,13 @@ enum tickertape_status_code
    */
   TICKERTAPE_E_PANIC = -17,
   /**
+   * A reader beacon with this name is held by a running reader (ADR 0032). The C ABI does not create beacons yet;
+   * the code exists so that every core error has one.
+   */
+  TICKERTAPE_E_BEACON_IN_USE = -18,
+  /**
    * An error this version of the C ABI has no specific code for. Its value stays far from the assigned codes,
-   * which later versions extend downwards from -17.
+   * which later versions extend downwards from -18.
    */
   TICKERTAPE_E_UNKNOWN = -255,
 };

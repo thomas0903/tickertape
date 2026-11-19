@@ -156,20 +156,43 @@ pub(crate) fn sync_dir(dir: &Path) -> Result<()> {
 }
 
 /// Window size for [`scan_file`].
-const SCAN_WINDOW: usize = 1 << 20;
+pub(crate) const SCAN_WINDOW: usize = 1 << 20;
 
 /// A [`format::SegmentView`] over a segment file read with `pread` in windows, so that scanning a segment needs memory
 /// for one window (or one record, if larger), never the whole file. An I/O error makes the view return `None`; the
 /// error is kept and reported by [`scan_file`].
-struct PreadView<'f> {
+pub(crate) struct PreadView<'f> {
     file: &'f File,
     len: u64,
+    /// Bytes to fetch per `pread` (more if one request is larger).
+    window_len: u64,
     /// The bytes at `[window.0, window.0 + window.1.len())`.
     window: std::cell::RefCell<(u64, Vec<u8>)>,
     error: std::cell::RefCell<Option<std::io::Error>>,
 }
 
-impl PreadView<'_> {
+impl<'f> PreadView<'f> {
+    /// A view of `file`, whose length is `len`, fetching `window_len` bytes per `pread`.
+    pub(crate) fn new(file: &'f File, len: u64, window_len: usize) -> PreadView<'f> {
+        PreadView {
+            file,
+            len,
+            window_len: window_len as u64,
+            window: std::cell::RefCell::new((0, Vec::new())),
+            error: std::cell::RefCell::new(None),
+        }
+    }
+
+    /// Forgets the cached window, so that the next access reads the file again.
+    pub(crate) fn invalidate(&self) {
+        self.window.borrow_mut().1.clear();
+    }
+
+    /// The first I/O error a read hit, if any (the view returned `None` for it).
+    pub(crate) fn take_error(&self) -> Option<std::io::Error> {
+        self.error.borrow_mut().take()
+    }
+
     /// Makes `[offset, offset + len)` (already checked against the file length) available in the window.
     fn fill(&self, offset: u64, len: u64) -> bool {
         let mut window = self.window.borrow_mut();
@@ -177,7 +200,7 @@ impl PreadView<'_> {
         if offset >= *start && offset + len <= *start + buf.len() as u64 {
             return true;
         }
-        let want = len.max(SCAN_WINDOW as u64).min(self.len - offset);
+        let want = len.max(self.window_len).min(self.len - offset);
         buf.resize(want as usize, 0);
         match self.file.read_exact_at(buf, offset) {
             Ok(()) => {
@@ -230,14 +253,9 @@ pub(crate) fn scan_open(file: &File, path: &Path, base: u64) -> Result<format::S
         .metadata()
         .map_err(|e| Error::io("stat segment", path, e))?
         .len();
-    let view = PreadView {
-        file,
-        len,
-        window: std::cell::RefCell::new((0, Vec::new())),
-        error: std::cell::RefCell::new(None),
-    };
+    let view = PreadView::new(file, len, SCAN_WINDOW);
     let scan = format::scan_segment(&view, format::SEGMENT_HEADER_LEN as u64, base);
-    if let Some(e) = view.error.into_inner() {
+    if let Some(e) = view.take_error() {
         return Err(Error::io("read segment", path, e));
     }
     Ok(scan)

@@ -305,6 +305,11 @@ fn pure_every_error_variant_has_a_code() {
             Error::InvalidConfig("x".into()),
             tickertape_status_code::TICKERTAPE_E_INVALID_CONFIG,
         ),
+        (
+            "BeaconInUse",
+            Error::BeaconInUse { path: path.clone() },
+            tickertape_status_code::TICKERTAPE_E_BEACON_IN_USE,
+        ),
     ];
     let names: BTreeSet<String> = samples.iter().map(|(n, _, _)| n.to_string()).collect();
     assert_eq!(
@@ -1842,7 +1847,8 @@ fn report_struct_size_works_in_both_directions() {
 fn pure_unknown_status_is_far_from_the_assigned_codes() {
     assert_eq!(code(S::TICKERTAPE_E_UNKNOWN), -255);
     assert_eq!(name(-255), "TICKERTAPE_E_UNKNOWN");
-    assert_eq!(name(-18), "TICKERTAPE_UNKNOWN_STATUS");
+    assert_eq!(name(-18), "TICKERTAPE_E_BEACON_IN_USE");
+    assert_eq!(name(-19), "TICKERTAPE_UNKNOWN_STATUS");
 }
 
 #[test]

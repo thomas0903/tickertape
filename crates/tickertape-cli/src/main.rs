@@ -7,6 +7,7 @@ mod parquet_export;
 mod report;
 mod stats;
 mod stats_seconds;
+mod status;
 mod tail;
 
 use std::fmt;
@@ -17,7 +18,7 @@ use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
-const EXIT_CODES: &str = "Exit codes: 0 success (including help, end of input or idle timeout); 1 usage, I/O or missing journal; 2 corruption or unsupported journal format.";
+const EXIT_CODES: &str = "Exit codes: 0 success (including help, end of input or idle timeout); 1 usage, I/O or missing journal; 2 corruption or unsupported journal format; 3 (status only) a health threshold is breached.";
 const RECORD_SCHEMA: &str = "Record JSONL schema (keys in order): {\"seq\":u64,\"schema_id\":u32,\"venue_ts_ns\":u64,\"local_ts_ns\":u64,\"payload_b64\":string}. payload_b64 is standard base64 with padding. One object per line.\n\nExit codes: 0 success (including help, end of input or idle timeout); 1 usage, I/O or missing journal; 2 corruption or unsupported journal format.";
 
 #[derive(Debug, Parser)]
@@ -47,6 +48,9 @@ enum Command {
     /// Summarize records through the committed end observed in a startup scan
     #[command(after_help = stats::HELP)]
     Stats(StatsArgs),
+    /// Report head, checkpoint age, exposure, storage headroom and reader lag; usable as a health check
+    #[command(after_help = status::HELP)]
+    Status(status::StatusArgs),
 }
 
 #[derive(Debug, Args)]
@@ -223,6 +227,7 @@ fn run(cli: Cli) -> Result<()> {
         Command::Verify(args) => report::verify(args, &mut out)?,
         Command::Export(args) => export::run(args, &mut out)?,
         Command::Stats(args) => stats::run(args, &mut out)?,
+        Command::Status(args) => status::run(args, &mut out)?,
     }
     out.flush().map_err(|e| output::io_error("flush stdout", e))
 }

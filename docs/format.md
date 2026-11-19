@@ -29,6 +29,7 @@ A journal is one directory. Only these names have a meaning; anything else is ig
 | `notify` | Wake-up record (ADRs 0017, 0021): 80 bytes naming the running writer's shared-memory wake-up region (magic `TTNOTIFY`, version, kind, nonce, pid and descriptor on Linux or object name on macOS, journal directory identity, CRC32C; layout in ADR 0021). Readers only read it with `pread`; it is replaced by rename, never written in place. Carries no journal data; deleting it or damage to it only affects reader latency |
 | `writer.lock` | Lock file. The writer holds an exclusive `flock` on it while open and writes its PID (decimal ASCII) into it. The PID is informational; the lock is the authority |
 | `quarantine/` | Bytes and segments removed from the journal by recovery, kept so that nothing is silently destroyed. Never read by readers, never deleted by tickertape |
+| `readers/` | Optional reader beacons (ADR [0032](decisions/0032-operational-metrics.md)): 128-byte files (magic `TTREADER`) in which applications that opt in publish a reader's position for monitoring, plus hidden temporary files (`.<name>.<pid>.<n>.beacon-tmp`) while one is created. Not part of format version 1: the writer, readers, recovery and retention never read or modify it (v0.4.0 included) |
 
 Segments are never removed automatically unless a writer retention policy is configured.
 `tickertape archive` or `tickertape::retention` can remove a contiguous prefix of sealed segments strictly before
@@ -131,7 +132,9 @@ ext4 maximum), and a torn write of one slot is unlikely to damage the other; thi
 is no larger than that. If both slots are damaged anyway, recovery falls back to a full scan (tested).
 
 The writer creates the file (all zeros, so neither slot is valid), syncs it, and syncs the journal directory when it
-creates the journal, before the first segment. Generations start at 1. A checkpoint that would need generation
+creates the journal, before the first segment. A writer that finds an existing marker shorter than 131,072 bytes (something cut it)
+leaves it so at open, writes its checkpoints' slots into it, and extends it to its full length (zeros) after the first
+checkpoint whose slot and marker sync succeed. Readers accept a short marker (below). Generations start at 1. A checkpoint that would need generation
 `u64::MAX` fails.
 
 | Offset in slot | Size | Field | Value |
