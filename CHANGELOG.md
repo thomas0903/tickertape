@@ -5,6 +5,13 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
+- Benchmarks: sustained workloads (ADR 0026). `tt-sustained` runs one writer and any mix of safe/mapped,
+  visible/durable-only and lagging reader processes for a fixed duration (default 10 minutes) with steady, bursty or
+  unpaced traffic, periodic checkpoints, segment rolls and writer retention, and reports latency percentiles, late
+  sends, reader lag, CPU time and a per-second wall-clock time series. `compare/run.py --sustained` adds a resumable
+  matrix of long probe, sustained-visibility and periodic-durability runs for every comparison tool, and
+  `benches/session.py` runs a whole recorded session with environment capture, a manifest and a time estimate. No
+  library or format change; the bench crate now depends on `nix`.
 - Docs: define the path to v1.0 around sustained performance, optional eBPF diagnostics, reader/checkpoint
   optimization, ARM measurements, interoperability, replay/recovery at scale and explicit stability/release gates.
 - Docs: v1.0 scope decisions of 2026-11-19. The external integration is an iceoryx2 recorder and replayer

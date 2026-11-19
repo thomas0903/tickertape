@@ -117,6 +117,153 @@ records/s includes appends, per-call instrumentation and dirty checkpoints, excl
 writer opening and the final empty checkpoint. Durations use a monotonic clock.
 The filesystem and storage determine what sync costs; this is not a power-loss test.
 
+## Sustained workloads (`tt-sustained`)
+
+Design and rejected alternatives: [ADR 0026](../docs/decisions/0026-sustained-workloads.md).
+
+```sh
+cargo build -p tickertape-bench --release --bins
+target/release/tt-sustained --help
+# Smoke test: a few seconds, two readers.
+target/release/tt-sustained run --dir /tmp/tt-sus --out /tmp/tt-sus-out --rate 20000 --duration 3s \
+  --checkpoint-every 500ms --segment-size 1048576 --retain-segments 4 --readers mapped,safe:durable:wait=block
+# Ten minutes of 1,024 B records at 100,000/s with checkpoints, rolls, retention and a reader that falls behind.
+target/release/tt-sustained run --dir "$J/steady" --out results/steady --rate 100000 --payload 1024 \
+  --duration 10m --warmup 10s --checkpoint-every 1s --retain-bytes 68719476736 \
+  --readers mapped,safe:wait=default,safe:durable:wait=block,safe:delay=40us
+# Bursts at 1,000,000/s for 10 % of every 100 ms (mean 100,000/s); unpaced to find sustainable throughput.
+target/release/tt-sustained run ... --burst-rate 1000000 --burst-period 100ms --burst-duty 10
+target/release/tt-sustained run ... --unpaced --checkpoint-every 1s --retain-bytes 68719476736
+```
+
+One run is one writer process and one process per reader, for `--warmup` plus `--duration` (default 10 minutes; any
+duration, down to a few seconds for smoke tests). `--dir` (the journal, on the filesystem under test) and `--out`
+(results) must be new or empty and must not contain each other. Run `--help` for every flag.
+
+**Traffic.** `--rate N` schedules record *i* at `t0 + floor(i * 1e9 / N)`. `--burst-rate P` sends bursts at *P*
+records/s during the first `--burst-duty` percent (default 10) of every `--burst-period` (default 100 ms), nothing in
+the rest: the mean rate is `floor(P * period * duty / 100) / period`. Both store the **intended** time in
+`local_ts_ns`; the writer busy-waits for it and sends every record even when late, with no skipping or rebasing,
+and readers measure `now - intended`, so a backlog counts as latency (coordinated omission handled as in
+`tt-latency`). `--unpaced` sends as fast as it can until the duration ends; its records carry their actual send
+start, so its reader latency is measured from the send, not from a schedule. A paced writer that falls more than
+`--overrun-limit` (default 60 s) behind the end of its schedule stops and reports `unsent_records`; nothing is
+dropped silently.
+
+**Checkpoints, rolls and retention.** `--checkpoint-every 1s` checkpoints on a fixed wall-clock grid (grid points
+missed during a slow checkpoint are counted as `checkpoint_grid_overruns`), `--checkpoint-records N` after every N
+records; both run on the writer thread, like an application would, and delay later sends. A final checkpoint after
+the last record is timed separately. `--segment-size` controls how often segments roll; roll appends (the appends
+that created a segment, classified from the segment capacity as in `tt-checkpoint`) get their own histogram.
+`--retain-segments N` / `--retain-bytes B` enable writer retention (delete, after each checkpoint), so a run can write
+far more than the disk holds. The tool refuses to start if its estimated peak disk use (bounded by retention when
+set) exceeds 90 % of free space (`--no-disk-check` overrides); an unpaced run without retention has no bound and
+only gets a warning.
+
+**Readers.** `--readers` takes a comma-separated list of `kind[:option]...`: `safe` (`pread`) or `mapped`
+(zero-copy), with `durable` (durable-only, needs checkpoints), `wait=spin|default|block|sleep` (as `tt-latency
+--wait`; `--wait` sets the default, spin), `delay=<D>` (pause after every record: busy-wait below 1 ms, sleep above)
+and `stall=<pause>/<every>`. A reader with a delay or stall is *lagging*: it stops when the writer finishes and reports
+how far behind it was. When retention removes the segment a reader is in, the reader gets `Error::Discarded`, seeks
+to the oldest record still present and counts the records it never saw (`skipped_by_retention`,
+`discard_events`). Other readers get `--drain-timeout` (default 60 s) to catch up after the writer finishes; a reader
+that doesn't is reported with `drained: false`. For every reader, `records_read + skipped_by_retention +
+remaining_records` must equal the records written, or the run fails.
+
+**What it reports.** Text, or with `--json` one object (also always written to `OUT/result.json`) with explicit
+unit suffixes: the full configuration (schedule, durability, retention, readers and wait modes, prefault, CPUs), host
+facts, the start time, and
+
+- writer: `count`, `planned_records`, `unsent_records`, `stopped_by`, `achieved_records_per_s`,
+  `achieved_payload_mb_per_s` (decimal, payload only), `intended_records_per_s`, `late_records` (more than 1 µs after
+  the intended time), `max_schedule_delay_us`, `append_latency`, `roll_append_latency`, `checkpoint_latency`,
+  `final_checkpoint_us`, `rolls`, `checkpoints`, retention counts and last error;
+- per reader: `latency` (`latency_kind` is `visible` or `durable_only`), `lag` (`samples`, then
+  min/p50/.../max in `_records` and `_bytes`; bytes are records × journal bytes per record), read/skipped/remaining
+  counts and `drained`;
+- per process: `cpu` (`user_cpu_s`, `system_cpu_s`, their fractions of wall time where 1.0 is one busy core,
+  minor and major page faults, context switches, all threads, from `getrusage`), `hot_thread_cpu` (the measuring
+  thread alone; Linux only) and, for the writer, `schedule_wait_s` (busy-waiting for intended times, included in its
+  CPU time);
+- `dataset`: bytes appended, RAM, whether the appended data exceeded RAM, the peak disk estimate and free space.
+
+Latency and lag statistics are min/p50/p90/p99/p99.9/p99.99/max from HdrHistogram (three significant figures).
+`--warmup` time is excluded from latency, lag and checkpoint statistics but included in counts, rates and the series.
+
+**Time series.** `OUT/series.jsonl` has one line per wall-clock second (`t_unix_s`, `t_utc`), from the first to the
+last second of the run, with the writer's records, late sends, maximum schedule delay, append maximum and p99,
+checkpoints and rolls (count and maximum), position and CPU fractions, and per reader the records received, latency
+maximum and p99, skipped records, maximum lag in records and bytes, and CPU fractions. Operations are attributed to
+the second in which they started in their process (a reader: when it received the record), so a writer stall shows
+at its start and the readers' latency where they saw it. Timestamps are `CLOCK_REALTIME`, the clock eBPF tools print
+with wall-clock timestamps. The raw per-process files (`writer.series.jsonl`, `reader-N.series.jsonl`) stay next to it.
+
+**Measurement cost.** Per append: two monotonic clock reads, two histogram increments (three on a roll), a
+per-second bucket update and one release store of the position. Per received record: one wall-clock read, two
+histogram increments, a bucket update and one release store. The measuring threads make no system calls for
+measurement except one channel send per second; a sampler thread per process does the rest (the writer's wakes every
+millisecond to publish its position with one `pwrite`, readers' every `--lag-interval`, default 10 ms, for one
+`pread`, and each reads `getrusage` once a second). To see what this costs on a given machine, compare the unpaced
+rate with the Criterion append benchmark on the same filesystem; the difference also includes the readers.
+
+**Lag accuracy.** Lag is the writer's published `next_seq` minus the reader's position, sampled every
+`--lag-interval`. The writer's value is up to about a millisecond old, so lag can be understated by that much of the
+rate, and it is never negative.
+
+**CPU pinning.** `--cpus 2,3,4,...` pins the writer thread to the first CPU and reader *i*'s thread to CPU *i+1*
+(Linux `sched_setaffinity`; needs one CPU per process). Helper threads (tickertape's prefault thread, the samplers)
+stay unpinned. On macOS the run continues unpinned and the result says so. A paced writer always busy-waits and a
+`wait=spin` reader always spins: each needs a whole core, so give a run at least 1 + readers + 1 CPUs.
+
+**Sizing runs larger than RAM.** Journal bytes per record are the payload plus a 40-byte header rounded up to 8:
+104 for 64 B, 1,064 for 1,024 B. A run appends `rate × (warmup + duration) × bytes per record`.
+
+- *Appended data larger than RAM* (steady write-back with the page cache cycling): choose the rate and duration so
+  that the appended bytes exceed RAM (the result's `dataset.appended_exceeds_ram`), and keep disk use bounded with
+  retention: `--retain-bytes` well below free space. Deleting segments drops their cached pages, so this exercises
+  write-back and reclaim, not reads from storage.
+- *Readers reading data that is not in RAM*: the retained data must exceed RAM, so the disk must be larger than RAM.
+  Retain more than RAM (`--retain-bytes`, e.g. 1.5 × RAM, below free space) and add a lagging reader that falls more
+  than RAM behind (for example `safe:delay=<D>` reading at half the rate); its lag in bytes shows when it passed RAM.
+  `benches/session.py`'s `beyond-ram` scenario sizes this automatically.
+
+Example: on a 64 GiB machine at 100,000 records/s of 1,024 B (106.4 MB/s of journal data), 1.5 × RAM (103 GB) takes about 16 minutes.
+
+## Recorded sustained session
+
+`benches/session.py` runs a whole session on the filesystem under test: the tickertape scenarios with `tt-sustained`,
+then the sustained comparison matrix (`compare/README.md`). It needs Python 3.9+, Rust, and for the comparison Java 21
+and Maven (`JAVA_HOME`), or `--compare-tools` without `chronicle,aeron`.
+
+```sh
+# Validate a machine first: a few minutes in total.
+python3 benches/session.py --journal-dir /mnt/test/tt --out ~/session-quick --quick --yes
+# The full session (prints its estimate, then asks; --yes when not interactive, e.g. under tmux or nohup).
+python3 benches/session.py --journal-dir /mnt/test/tt --out ~/session-full
+python3 benches/session.py --journal-dir /mnt/test/tt --out ~/session-full --dry-run   # plan and estimate only
+```
+
+`--journal-dir` must exist on the filesystem under test; journals and the comparison's data go in a directory the
+session owns there (`tt-session-<hash>`), deleted after each run with `sync` before the next. `--out` gets
+`manifest.json` (parameters, commit, every run with its exact command, status, times and result path),
+`environment.txt` (kernel, distribution, virtualization and DMI product name, CPU, memory, NUMA, filesystem, mount
+options, block devices and I/O schedulers, transparent huge pages, write-back sysctls, rustc, cargo, git commit and
+status, Java and Maven), `commands.txt`, `tickertape/<run>/` (each run's `result.json` and series), `compare/` (the
+comparison's own output), and `logs/`.
+
+The session is safe to re-run: the same command skips finished runs, removes a run's partial output and the leftovers
+of a killed session, and refuses an `--out` started with different parameters. SIGTERM or SIGHUP (a closed terminal)
+stops the current run and kills its processes. Matrices:
+
+- `--quick`: 64 B only, 10 s per tickertape scenario (probe, steady-50, bursty, lagging, visibility-only), then the
+  comparison's quick mode with 3 s runs. Functional validation only, never results.
+- `full` (default): 64 B and 1,024 B, 10 minutes per scenario plus 10 s warmup, two repeats (the probe once), all seven
+  scenarios, then the full comparison (`compare/README.md`). It prints an estimate of roughly 20 hours with every tool;
+  `--only`, `--scenarios`, `--compare-tools`, `--duration` and `--repeats` select less.
+
+Scenario definitions are in `python3 benches/session.py --help`. Rates derive from the tickertape probe of the same
+payload, so they adapt to the machine; the probe's rate and every derived argument are in each run's `result.json`.
+
 ## Recording a run
 
 Follow [the benchmark playbook](../docs/playbooks/run-benchmark.md). Build release
@@ -128,8 +275,8 @@ the repository, and run each benchmark at least twice. Record:
 - CPU model/architecture, memory, OS version, kernel and journal filesystem.
 - Cache mode, reader kind, payload, segment size, rate, count, warmup and checkpoint
   batch settings; whether coordinated omission is handled by intended timestamps.
-- Host load, power state and any external affinity settings. No affinity is applied
-  by this harness.
+- Host load, power state and any external affinity settings. Only `tt-sustained --cpus`
+  applies affinity, and its result records it.
 - Virtualization explicitly: **OrbStack VM (Linux on macOS)** plus host Mac model,
   never bare-metal Linux. CI is smoke only. In the OrbStack VM use its own disk
   (`TMPDIR=$HOME/tmp`); `/tmp` is tmpfs and unsuitable for storage measurements.
