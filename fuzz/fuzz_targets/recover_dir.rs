@@ -663,7 +663,20 @@ fn run(data: &[u8]) {
                     old[..offset],
                     "bytes before the repair changed"
                 );
-                assert!(new[offset..].iter().all(|&b| b == 0), "tail not zeroed");
+                // A damaged seal whose successor opens is resealed after the repair (ADR 0035, "Damage around a
+                // seal"): the seal, then zeros.
+                let resealed = report.actions.iter().any(
+                    |a| matches!(a, RecoveryAction::Sealed { segment: s } if s == segment),
+                );
+                let zeros_from = if resealed {
+                    offset + format::SEAL_LEN
+                } else {
+                    offset
+                };
+                assert!(
+                    new[zeros_from..].iter().all(|&b| b == 0),
+                    "tail not zeroed"
+                );
             }
             RecoveryAction::QuarantinedSegment {
                 segment,

@@ -388,6 +388,34 @@ fn main() {
         ));
     }
 
+    // Review round 2, item 1: the same, plus one stray non-zero byte just past the seal. The successor exists and
+    // opens, so this is a damaged seal: the bytes after the seal's place are preserved, the seal is written again and
+    // every segment is kept (`Fail` refuses).
+    let mut marker_zeroed_stray = Ops::default();
+    marker_zeroed_stray
+        .records(5, 40)
+        .op(&[1, 0])
+        .zero(AT_CURSOR, -8, 4)
+        .write(AT_CURSOR, 1, &[0x5a]);
+    for (name, policy) in [
+        ("seal_marker_zeroed_stray_byte", QUARANTINE),
+        ("seal_marker_zeroed_stray_byte_fail", FAIL),
+    ] {
+        seeds.push((
+            name,
+            input(
+                policy,
+                &[
+                    continuing(&marker_zeroed_stray),
+                    continuing(&three),
+                    continuing(&eight),
+                ],
+                0,
+                &[],
+            ),
+        ));
+    }
+
     // Review round 1, item 3: a torn append of record 25 whose payload holds a frame with sequence number 26 (a copy
     // of record 0's 140-byte frame, renumbered and re-checksummed). With the torn frame's body complete (its CRC
     // stored for a 188-byte frame, commit word never stored) the embedded frame lies inside it: a torn append, zeroed

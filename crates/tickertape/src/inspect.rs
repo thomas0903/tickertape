@@ -217,9 +217,13 @@ pub fn verify(dir: impl AsRef<Path>) -> Result<VerifyReport> {
         });
 
         let mut scan = scan_file(&path, base)?;
+        // One 50 ms retry per segment for an invalid record at the end of the newest segment, shared by the first
+        // scan and the scans that follow a live writer below.
+        let mut rescanned = false;
         if newest && matches!(scan.end, ScanEnd::Invalid(_)) {
             // A live writer may have been mid-append while we copied the file: look again before reporting.
-            std::thread::sleep(Duration::from_millis(50));
+            rescanned = true;
+            wait_for_writer();
             scan = scan_file(&path, base)?;
         }
         let mut later = later_history(&path, &scan)?;
@@ -230,7 +234,7 @@ pub fn verify(dir: impl AsRef<Path>) -> Result<VerifyReport> {
                 // A live writer may still be filling the record at the empty word with a payload that holds frames
                 // (the accepted false positive, ADR 0035): give it the same 50 ms to commit, once.
                 waited = true;
-                std::thread::sleep(Duration::from_millis(50));
+                wait_for_writer();
                 word = journal::commit_word_in_file(&path, scan.end_offset)?;
             }
             if word == 0 {
@@ -248,7 +252,13 @@ pub fn verify(dir: impl AsRef<Path>) -> Result<VerifyReport> {
                 break;
             }
             follows += 1;
-            let more = journal::scan_file_from(&path, scan.end_offset, scan.next_seq)?;
+            let mut more = journal::scan_file_from(&path, scan.end_offset, scan.next_seq)?;
+            if matches!(more.end, ScanEnd::Invalid(_)) && !rescanned {
+                // The same race as for the first scan, at the new end: the writer was mid-append there.
+                rescanned = true;
+                wait_for_writer();
+                more = journal::scan_file_from(&path, scan.end_offset, scan.next_seq)?;
+            }
             scan = format::ScanResult {
                 records: scan.records + more.records,
                 ..more
@@ -279,7 +289,7 @@ pub fn verify(dir: impl AsRef<Path>) -> Result<VerifyReport> {
             ScanEnd::Empty if later.is_some() => report.problems.push(Problem {
                 path: path.clone(),
                 offset: scan.end_offset,
-                reason: CorruptReason::EmptyCommitWord(later.map_or(0, |h| h.seq())),
+                reason: later.map_or(CorruptReason::EmptyCommitWord(0), |h| h.reason()),
             }),
             ScanEnd::Empty if newest => seg.end = SegmentEnd::Open,
             ScanEnd::Empty => report.problems.push(Problem {
@@ -297,6 +307,17 @@ pub fn verify(dir: impl AsRef<Path>) -> Result<VerifyReport> {
         report.segments.push(seg);
     }
     Ok(report)
+}
+
+/// Gives a live writer 50 ms to finish what [`verify`] caught it in the middle of.
+fn wait_for_writer() {
+    #[cfg(test)]
+    tests::WAIT_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook();
+        }
+    });
+    std::thread::sleep(Duration::from_millis(50));
 }
 
 /// How many times [`verify`] follows a live writer past the end of the newest segment (see the loop there) before it
@@ -319,6 +340,82 @@ fn scan_file(path: &Path, base: u64) -> Result<format::ScanResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+    use std::os::unix::fs::FileExt;
+
+    thread_local! {
+        /// Runs at each of [`wait_for_writer`]'s waits on this thread, standing in for a live writer.
+        pub(super) static WAIT_HOOK: RefCell<Option<Box<dyn FnMut()>>> = RefCell::new(None);
+    }
+
+    #[test]
+    fn follow_loop_retries_a_record_caught_mid_append() {
+        // Review round 2, item 5. A live writer: verify finds the empty commit word of record 10 with record 11
+        // after it, and while it waits the writer commits record 10 and is caught in the middle of record 12 (its
+        // commit word stored in this simulation, its body not yet valid). The scan that follows must give the
+        // writer the same one retry as the first scan, not report a bad checksum on a healthy journal.
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = crate::Writer::open(
+            dir.path(),
+            crate::WriterConfig::default().segment_size(format::SEGMENT_SIZE_UNIT),
+        )
+        .unwrap();
+        for i in 0..13_u8 {
+            w.append(&crate::NewRecord {
+                schema_id: 1,
+                venue_ts_ns: 0,
+                local_ts_ns: 0,
+                payload: &[i; 50],
+            })
+            .unwrap();
+        }
+        drop(w);
+        let (_, path) = journal::list_segments(dir.path()).unwrap().pop().unwrap();
+        let full = std::fs::read(&path).unwrap();
+        let mut offsets = vec![format::SEGMENT_HEADER_LEN as u64];
+        for seq in 0..13 {
+            let at = *offsets.last().unwrap();
+            let Ok(format::Slot::Record { next_offset, .. }) =
+                format::read_slot(&full[..], at, seq)
+            else {
+                panic!("record {seq}");
+            };
+            offsets.push(next_offset);
+        }
+        let (r10, r12, end) = (
+            offsets[10] as usize,
+            offsets[12] as usize,
+            offsets[13] as usize,
+        );
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.write_all_at(&[0; 4], r10 as u64).unwrap();
+        file.write_all_at(&vec![0; end - r12], r12 as u64).unwrap();
+        let mut stage = 0;
+        let (full_hook, path_hook) = (full.clone(), path.clone());
+        WAIT_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path_hook)
+                    .unwrap();
+                match stage {
+                    0 => {
+                        file.write_all_at(&full_hook[r10..r10 + 4], r10 as u64)
+                            .unwrap();
+                        file.write_all_at(&full_hook[r12..r12 + 4], r12 as u64)
+                            .unwrap();
+                    }
+                    _ => file.write_all_at(&full_hook[r12..end], r12 as u64).unwrap(),
+                }
+                stage += 1;
+            }));
+        });
+        let report = verify(dir.path()).unwrap();
+        WAIT_HOOK.with(|hook| hook.borrow_mut().take());
+        assert!(report.problems.is_empty(), "{:?}", report.problems);
+        assert_eq!(report.records, 13);
+        assert_eq!(std::fs::read(&path).unwrap(), full);
+    }
 
     #[test]
     fn checkpoint_missing_invalid_valid_and_truncated() {

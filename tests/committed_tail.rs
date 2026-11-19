@@ -865,6 +865,75 @@ fn payload_holding_another_journals_frames() {
 }
 
 #[test]
+fn payload_ending_in_a_seal_for_the_next_record() {
+    // Review round 2, item 7: the same exception as an embedded frame. The writer of record 3 was killed after the
+    // payload was written and before the CRC was stored, and the payload ends with the eight bytes of a valid seal
+    // for 4 at an aligned position: a final seal in the window, so recovery can't tell it from damage and preserves
+    // (`Quarantine`) or refuses (`Fail`). Nothing is lost. With the CRC stored, the frame covers the seal and it is a
+    // plain torn append, zeroed in place.
+    let base = tempfile::tempdir().unwrap();
+    let mut w = Writer::open(base.path(), small_config()).unwrap();
+    append_n(&mut w, 3);
+    drop(w);
+    let (_, seg) = segments(base.path()).pop().unwrap();
+    let name = seg.file_name().unwrap().to_owned();
+    let (_, p) = record_slots(&seg);
+    let mut payload = vec![0x11u8; 24];
+    payload.extend_from_slice(&format::SEAL_MARKER.to_le_bytes());
+    payload.extend_from_slice(&format::seal_crc(4).to_le_bytes());
+    let header = RecordHeader {
+        seq: 3,
+        schema_id: 3,
+        venue_ts_ns: 30,
+        local_ts_ns: 31,
+    };
+    let len = format::frame_len(payload.len()).unwrap();
+    let mut complete = vec![0u8; len as usize];
+    format::encode_record_body(&header, &payload, &mut complete[4..]);
+    assert_eq!((p + 64) % 8, 0);
+    let mut torn = complete.clone();
+    torn[4..8].fill(0);
+    for policy in [RecoveryPolicy::Quarantine, RecoveryPolicy::Fail] {
+        let dir = copy_journal(base.path());
+        let path = dir.path().join(&name);
+        open_raw(&path).write_all_at(&torn, p).unwrap();
+        let damaged = fs::read(&path).unwrap();
+        let before = snapshot(dir.path());
+        match Writer::open(dir.path(), small_config().recovery(policy)) {
+            Ok(w) => {
+                assert_eq!(policy, RecoveryPolicy::Quarantine);
+                let actions = &w.recovery_report().actions;
+                assert_eq!(actions.len(), 1, "{actions:?}");
+                assert_preserved(&actions[0], &path, p, &damaged, 4);
+                assert_eq!(w.next_seq(), 3);
+            }
+            Err(Error::Corrupt {
+                path: at,
+                offset,
+                reason: CorruptReason::EmptyCommitWord(4),
+            }) => {
+                assert_eq!(policy, RecoveryPolicy::Fail);
+                assert_eq!((at, offset), (path.clone(), p));
+                assert!(snapshot(dir.path()) == before);
+            }
+            Err(e) => panic!("{policy:?}: {e}"),
+        }
+    }
+    for policy in [RecoveryPolicy::Fail, RecoveryPolicy::Quarantine] {
+        let dir = copy_journal(base.path());
+        let path = dir.path().join(&name);
+        open_raw(&path).write_all_at(&complete, p).unwrap();
+        let w = Writer::open(dir.path(), small_config().recovery(policy)).unwrap();
+        assert!(
+            matches!(&w.recovery_report().actions[..], [RecoveryAction::ZeroedUncommitted { offset, .. }] if *offset == p + 4),
+            "{policy:?}: {:?}",
+            w.recovery_report().actions
+        );
+        assert_eq!(w.next_seq(), 3);
+    }
+}
+
+#[test]
 fn damage_that_leaves_nothing_valid_after_it_cannot_be_detected() {
     // Review round 1, item 4: the class of damage recovery cannot detect is any damage after which no record
     // validates and no final seal or later segment remains. 120 records, a checkpoint at 100, `Fail`.
@@ -914,6 +983,62 @@ fn damage_that_leaves_nothing_valid_after_it_cannot_be_detected() {
                 .all(|&b| b == 0),
             "{name}: the records after {next} are destroyed"
         );
+    }
+}
+
+#[test]
+fn an_inconclusive_search_is_reported_as_unchecked() {
+    // Review round 2, item 6: after the newest record, every slot carries the header of a following record (sequence
+    // 4) with the largest length and a bad checksum, so the search stops at its work bound before it can decide.
+    // The tail is still preserved (or refused), but reported as `UncheckedTail`, not as proven `EmptyCommitWord`.
+    let base = tempfile::tempdir().unwrap();
+    let mut w = Writer::open(base.path(), small_config()).unwrap();
+    append_n(&mut w, 3);
+    drop(w);
+    let (_, seg) = segments(base.path()).pop().unwrap();
+    let name = seg.file_name().unwrap().to_owned();
+    let (_, p) = record_slots(&seg);
+    let size = fs::metadata(&seg).unwrap().len();
+    let mut tail = vec![0u8; (size - p) as usize];
+    let mut q = 40;
+    while p + q + 48 <= size - 8 {
+        let len = (size - 8 - (p + q)) as u32;
+        tail[q as usize..q as usize + 4].copy_from_slice(&len.to_le_bytes());
+        tail[q as usize + 4..q as usize + 8].copy_from_slice(&1_u32.to_le_bytes());
+        tail[q as usize + 8..q as usize + 16].copy_from_slice(&4_u64.to_le_bytes());
+        q = (q + 24).div_ceil(8) * 8;
+    }
+    for policy in [RecoveryPolicy::Quarantine, RecoveryPolicy::Fail] {
+        let dir = copy_journal(base.path());
+        let path = dir.path().join(&name);
+        open_raw(&path).write_all_at(&tail, p).unwrap();
+        let problems = inspect::verify(dir.path()).unwrap().problems;
+        assert!(
+            matches!(&problems[..], [inspect::Problem { offset, reason: CorruptReason::UncheckedTail(4), .. }] if *offset == p),
+            "{problems:?}"
+        );
+        let before = snapshot(dir.path());
+        match Writer::open(dir.path(), small_config().recovery(policy)) {
+            Ok(w) => {
+                assert_eq!(policy, RecoveryPolicy::Quarantine);
+                let actions = &w.recovery_report().actions;
+                assert!(
+                    matches!(&actions[..], [RecoveryAction::RepairedTail { offset, reason: CorruptReason::UncheckedTail(4), .. }] if *offset == p),
+                    "{actions:?}"
+                );
+                assert_eq!(w.next_seq(), 3);
+            }
+            Err(Error::Corrupt {
+                offset,
+                reason: CorruptReason::UncheckedTail(4),
+                ..
+            }) => {
+                assert_eq!(policy, RecoveryPolicy::Fail);
+                assert_eq!(offset, p);
+                assert!(snapshot(dir.path()) == before);
+            }
+            Err(e) => panic!("{policy:?}: {e}"),
+        }
     }
 }
 
@@ -994,6 +1119,128 @@ fn crash_in_the_middle_of_a_repair() {
             assert!(kept.iter().any(|(_, k)| k == bytes), "{point:?}");
         }
     }
+}
+
+#[test]
+fn crash_in_the_middle_of_a_seal_repair() {
+    // Review round 2, item 1: 50 records in segments based 0, 18 and 36. Segment 0's seal marker reads zero and one
+    // stray non-zero byte lies just past the seal, so the bytes after the empty word end outside the seal. The exact
+    // successor (base 18) exists and the chain continues from it: a damaged seal, not missing history. Recovery
+    // preserves the stray bytes, reseals and keeps all 50 records, whether it runs through or is interrupted at
+    // either point of the repair (and reopened), and every path ends with the same journal: the original one.
+    // `Fail` refuses without changing a byte.
+    let base = tempfile::tempdir().unwrap();
+    let mut w = Writer::open(base.path(), small_config()).unwrap();
+    let payload = |seq: u64| vec![seq as u8 ^ 0xa5; 3500];
+    for seq in 0..50 {
+        let data = payload(seq);
+        w.append(&tickertape::NewRecord {
+            schema_id: 1,
+            venue_ts_ns: seq,
+            local_ts_ns: seq,
+            payload: &data,
+        })
+        .unwrap();
+    }
+    drop(w);
+    let segs = segments(base.path());
+    assert_eq!(segs.iter().map(|s| s.0).collect::<Vec<_>>(), [0, 18, 36]);
+    let original = snapshot(base.path());
+    let (slots, seal) = record_slots(&segs[0].1);
+    assert_eq!(slots.len(), 18);
+    let name = segs[0].1.file_name().unwrap().to_owned();
+    let damage = |path: &Path| {
+        let raw = open_raw(path);
+        raw.write_all_at(&[0; 4], seal).unwrap();
+        raw.write_all_at(&[0x5a], seal + 9).unwrap();
+    };
+
+    let mut finals = Vec::new();
+    for point in [
+        None,
+        Some(Point::RepairBeforeRename),
+        Some(Point::RepairAfterRename),
+    ] {
+        let dir = copy_journal(base.path());
+        let path = dir.path().join(&name);
+        damage(&path);
+        let damaged = fs::read(&path).unwrap();
+        let mut actions = Vec::new();
+        if let Some(point) = point {
+            fault::fail_next(point, 5 /* EIO */);
+            let err = Writer::open(dir.path(), small_config()).unwrap_err();
+            fault::clear();
+            assert!(matches!(err, Error::Io { .. }), "{point:?}: {err}");
+        }
+        let w = Writer::open(dir.path(), small_config()).unwrap();
+        actions.extend(w.recovery_report().actions.iter().cloned());
+        assert_eq!(w.next_seq(), 50, "{point:?}: {actions:?}");
+        drop(w);
+        let sealed = |a: &RecoveryAction| matches!(a, RecoveryAction::Sealed { segment } if *segment == path);
+        let repaired = |a: &RecoveryAction| matches!(a, RecoveryAction::RepairedTail { segment, offset, reason: CorruptReason::BadSeal, .. } if *segment == path && *offset == seal);
+        let removed_tmp = |a: &RecoveryAction| matches!(a, RecoveryAction::RemovedTemp { .. });
+        assert!(
+            match (point, &actions[..]) {
+                (None, [r, s]) => repaired(r) && sealed(s),
+                (Some(Point::RepairBeforeRename), [t, r, s]) =>
+                    removed_tmp(t) && repaired(r) && sealed(s),
+                // The segment already ends at the seal's place: the next open reseals and continues.
+                (Some(Point::RepairAfterRename), [s]) => sealed(s),
+                _ => false,
+            },
+            "{point:?}: {actions:?}"
+        );
+        let all = read_all(dir.path());
+        assert_eq!(all.len(), 50, "{point:?}");
+        for r in &all {
+            assert_eq!(r.payload, payload(r.seq), "{point:?}");
+        }
+        // The stray bytes are preserved (twice, identically, if the repair ran twice), from the seal's offset.
+        let kept = quarantined(dir.path());
+        assert!(!kept.is_empty(), "{point:?}");
+        for (_, bytes) in &kept {
+            assert_eq!(
+                bytes[..],
+                damaged[seal as usize..seal as usize + 10],
+                "{point:?}"
+            );
+        }
+        assert_eq!(
+            kept.len(),
+            if point == Some(Point::RepairBeforeRename) {
+                2
+            } else {
+                1
+            }
+        );
+        finals.push(
+            snapshot(dir.path())
+                .into_iter()
+                .map(|(p, b)| (p.file_name().unwrap().to_owned(), b))
+                .collect::<Vec<_>>(),
+        );
+    }
+    let original: Vec<_> = original
+        .into_iter()
+        .map(|(p, b)| (p.file_name().unwrap().to_owned(), b))
+        .collect();
+    for journal in &finals {
+        assert!(
+            *journal == original,
+            "a recovery path ended with a different journal"
+        );
+    }
+
+    let dir = copy_journal(base.path());
+    let path = dir.path().join(&name);
+    damage(&path);
+    let before = snapshot(dir.path());
+    let err = Writer::open(dir.path(), small_config().recovery(RecoveryPolicy::Fail)).unwrap_err();
+    assert!(
+        matches!(&err, Error::Corrupt { path: p, offset, reason: CorruptReason::BadSeal } if *p == path && *offset == seal),
+        "{err:?}"
+    );
+    assert!(snapshot(dir.path()) == before, "Fail changed bytes");
 }
 
 proptest! {

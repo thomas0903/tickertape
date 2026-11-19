@@ -827,33 +827,56 @@ impl Recovery<'_> {
                         &RwView(&seg.map),
                         offset + format::COMMIT_WORD_LEN as u64,
                     );
-                    if let Some(found) = tail_end.and_then(|end| {
+                    if seq != seg.base && bases.contains(&seq) && !visited.contains(&seq) {
+                        if let Ok(next) = open_segment(self.dir, seq) {
+                            // The successor for exactly `seq` exists and opens: `offset` is where this segment's
+                            // seal belongs, and the chain continues in the successor (ADR 0035, "Damage around a
+                            // seal").
+                            if tail_end.is_some_and(|end| end > offset + format::SEAL_LEN as u64) {
+                                // Bytes beyond the seal: no crash leaves them (a roll writes nothing after the seal,
+                                // and records `seq` onwards are in the successor), so this is a damaged seal, not
+                                // missing history, and later segments are not evidence. They are never records of
+                                // this segment either: those would repeat the successor's sequence numbers. Preserve
+                                // them as any repair does, then reseal and continue into the successor in this open.
+                                // This is exactly where an interrupted repair leaves the next open (the segment ends
+                                // at `offset`, followed by the same branch below), so an interruption at any point
+                                // gives the same journal. `Fail` refuses: the bytes are damage.
+                                if self.config.recovery == RecoveryPolicy::Fail {
+                                    return Err(Error::corrupt(
+                                        &seg.path,
+                                        offset,
+                                        CorruptReason::BadSeal,
+                                    ));
+                                }
+                                seg = self.repair_tail(seg, offset, CorruptReason::BadSeal)?;
+                            } else {
+                                // A crash between publishing the successor and sealing this segment (or the seal's
+                                // marker damaged): at most the seal's CRC word is left.
+                                self.zero_uncommitted_tail(&mut seg, offset, tail_end)?;
+                            }
+                            self.write_seal(&mut seg, offset, seq)?;
+                            self.report.actions.push(RecoveryAction::Sealed {
+                                segment: seg.path.clone(),
+                            });
+                            dirty.push(inherited(seg));
+                            seg = next;
+                            offset = format::SEGMENT_HEADER_LEN as u64;
+                            continue;
+                        }
+                    }
+                    if let Some(reason) = tail_end.and_then(|end| {
                         committed_after_empty(&seg, offset, seq, end, &bases, &visited)
                     }) {
                         // Not a torn append: storage damage hid committed records (ADR 0035).
-                        let reason = CorruptReason::EmptyCommitWord(found);
                         if self.config.recovery == RecoveryPolicy::Fail {
                             return Err(Error::corrupt(&seg.path, offset, reason));
                         }
                         seg = self.repair_tail(seg, offset, reason)?;
                         break;
                     }
+                    // A torn append or the clean end. (A successor for exactly `seq` that does not open, as before
+                    // this change, ends the chain here and is quarantined below.)
                     self.zero_uncommitted_tail(&mut seg, offset, tail_end)?;
-                    if seq != seg.base && bases.contains(&seq) && !visited.contains(&seq) {
-                        // Crash between publishing the next segment and sealing this one.
-                        let next = match open_segment(self.dir, seq) {
-                            Ok(next) => next,
-                            Err(_) => break,
-                        };
-                        self.write_seal(&mut seg, offset, seq)?;
-                        self.report.actions.push(RecoveryAction::Sealed {
-                            segment: seg.path.clone(),
-                        });
-                        dirty.push(inherited(seg));
-                        seg = next;
-                        offset = format::SEGMENT_HEADER_LEN as u64;
-                        continue;
-                    }
                     break;
                 }
                 ScanEnd::Seal => {
@@ -1130,13 +1153,14 @@ impl Recovery<'_> {
 /// Committed history after an empty slot at `offset` of `seg`, where a scan expecting `seq` stopped and whose
 /// non-zero bytes end at `tail_end` (ADR 0035): a later record or final seal in the segment that validates with a
 /// sequence number its position allows, or a segment with a larger base than `seq`, which only exists if record
-/// `seq` was committed. Returns the sequence number the evidence carries: a record's, a seal's next sequence number,
-/// or a segment's base. A torn append leaves none of these.
+/// `seq` was committed. Returns how to report it: [`CorruptReason::EmptyCommitWord`] with the sequence number the
+/// evidence carries (a record's, a seal's next sequence number, or a segment's base), or
+/// [`CorruptReason::UncheckedTail`] when the search in the segment stopped at its work bound. A torn append leaves
+/// none of these.
 ///
-/// A later segment is not evidence when the successor for exactly `seq` is waiting to be entered and the non-zero
-/// bytes end within a seal at `offset`. A crash between publishing that successor and sealing leaves this (the
-/// seal's CRC word written, its marker not), and so does damage to just the seal's marker; both are repaired by
-/// writing the seal again, which loses nothing.
+/// The caller has already handled a successor for exactly `seq` that opens (a seal belongs at `offset`). A later
+/// segment is still not evidence when that successor exists but does not open and the non-zero bytes end within a
+/// seal at `offset`: unchanged from before, the chain then ends at `offset`.
 fn committed_after_empty(
     seg: &Segment,
     offset: u64,
@@ -1144,15 +1168,18 @@ fn committed_after_empty(
     tail_end: u64,
     bases: &BTreeSet<u64>,
     visited: &BTreeSet<u64>,
-) -> Option<u64> {
+) -> Option<CorruptReason> {
     if let Some(found) = format::find_history_before(&RwView(&seg.map), offset, seq, tail_end) {
-        return Some(found.seq());
+        return Some(found.reason());
     }
     let successor_pending = seq != seg.base && bases.contains(&seq) && !visited.contains(&seq);
     if successor_pending && tail_end <= offset + format::SEAL_LEN as u64 {
         return None;
     }
-    bases.range(seq.checked_add(1)?..).next().copied()
+    bases
+        .range(seq.checked_add(1)?..)
+        .next()
+        .map(|&base| CorruptReason::EmptyCommitWord(base))
 }
 
 /// A segment inherited from an earlier writer: the next checkpoint syncs its file.
