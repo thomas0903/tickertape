@@ -1,0 +1,169 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  tickertape Java binding (ADR 0037): java.lang.foreign over the C ABI in crates/tickertape-ffi. No runtime
+  dependencies. Build the C library first, then run mvn verify; README.md has the commands.
+
+  The version is the C library version this binding is written against (ADR 0037 -> Versioning); a test fails if
+  it differs from crates/tickertape-ffi/include/tickertape.h. Nothing here publishes anything.
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <!-- io.github.<user> needs no domain; the owner has not registered a Maven Central namespace yet (ADR 0037). -->
+  <groupId>io.github.thomas0903</groupId>
+  <artifactId>tickertape</artifactId>
+  <version>0.4.0</version>
+  <packaging>jar</packaging>
+
+  <name>tickertape</name>
+  <description>Java binding for tickertape, a crash-safe local market-data journal, over its C ABI with the Foreign Function and Memory API</description>
+  <url>https://github.com/thomas0903/tickertape</url>
+  <licenses>
+    <license><name>MIT</name><url>https://opensource.org/licenses/MIT</url></license>
+    <license><name>Apache-2.0</name><url>https://www.apache.org/licenses/LICENSE-2.0</url></license>
+  </licenses>
+  <scm><url>https://github.com/thomas0903/tickertape</url></scm>
+
+  <properties>
+    <maven.compiler.release>25</maven.compiler.release>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
+    <!-- Reproducible JAR timestamps. -->
+    <project.build.outputTimestamp>2026-11-19T00:00:00Z</project.build.outputTimestamp>
+
+    <!-- Where the built libtickertape and the test tools are (bindings/java/scripts/build-native.sh). -->
+    <tickertape.native.dir>${project.basedir}/../../target/release</tickertape.native.dir>
+    <tickertape.tools.dir>${tickertape.native.dir}/java-tools</tickertape.tools.dir>
+    <!-- Set to true (CI does) to fail instead of skipping tests whose external tools are missing. -->
+    <tickertape.test.requireTools>false</tickertape.test.requireTools>
+    <tickertape.test.python>python3</tickertape.test.python>
+    <!-- Set by the os profiles below. -->
+    <tickertape.lib.file>libtickertape.so</tickertape.lib.file>
+    <tickertape.platform>unknown</tickertape.platform>
+
+    <junit.version>6.1.3</junit.version>
+  </properties>
+
+  <dependencies>
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <version>${junit.version}</version>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <pluginManagement>
+      <plugins>
+        <plugin><groupId>org.apache.maven.plugins</groupId><artifactId>maven-clean-plugin</artifactId><version>3.5.0</version></plugin>
+        <plugin><groupId>org.apache.maven.plugins</groupId><artifactId>maven-resources-plugin</artifactId><version>3.5.0</version></plugin>
+        <plugin><groupId>org.apache.maven.plugins</groupId><artifactId>maven-install-plugin</artifactId><version>3.2.0</version></plugin>
+      </plugins>
+    </pluginManagement>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <version>3.16.0</version>
+        <configuration>
+          <compilerArgs>
+            <arg>-Xlint:all</arg>
+            <arg>-Xdoclint:all,-missing</arg>
+            <arg>-Werror</arg>
+          </compilerArgs>
+        </configuration>
+        <executions>
+          <execution>
+            <!-- The allocation test reads the thread's allocation counter (jdk.management). -->
+            <id>default-testCompile</id>
+            <configuration>
+              <compilerArgs combine.children="append">
+                <arg>--add-modules</arg>
+                <arg>jdk.management</arg>
+                <arg>--add-reads</arg>
+                <arg>io.github.thomas0903.tickertape=java.management,jdk.management</arg>
+              </compilerArgs>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <version>3.6.1</version>
+        <configuration>
+          <!-- Tests run on the module path, patched into the binding's module, so the flag users need is the one
+               tested. deny turns a restricted call without native access into an error instead of a warning. -->
+          <argLine>--enable-native-access=io.github.thomas0903.tickertape --illegal-native-access=deny --add-modules jdk.management --add-reads io.github.thomas0903.tickertape=java.management,jdk.management</argLine>
+          <systemPropertyVariables>
+            <tickertape.library.path>${tickertape.native.dir}/${tickertape.lib.file}</tickertape.library.path>
+            <tickertape.test.nativeDir>${tickertape.native.dir}</tickertape.test.nativeDir>
+            <tickertape.test.toolsDir>${tickertape.tools.dir}</tickertape.test.toolsDir>
+            <tickertape.test.requireTools>${tickertape.test.requireTools}</tickertape.test.requireTools>
+            <tickertape.test.python>${tickertape.test.python}</tickertape.test.python>
+            <tickertape.test.repoRoot>${project.basedir}/../..</tickertape.test.repoRoot>
+            <tickertape.test.classes>${project.build.outputDirectory}</tickertape.test.classes>
+            <tickertape.test.platform>${tickertape.platform}</tickertape.test.platform>
+            <tickertape.test.libFile>${tickertape.lib.file}</tickertape.test.libFile>
+          </systemPropertyVariables>
+          <trimStackTrace>false</trimStackTrace>
+        </configuration>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-jar-plugin</artifactId>
+        <version>3.5.1</version>
+      </plugin>
+    </plugins>
+  </build>
+
+  <profiles>
+    <profile>
+      <id>os-linux</id>
+      <activation><os><name>Linux</name></os></activation>
+      <properties><tickertape.lib.file>libtickertape.so</tickertape.lib.file></properties>
+    </profile>
+    <profile>
+      <id>os-macos</id>
+      <activation><os><family>mac</family></os></activation>
+      <properties><tickertape.lib.file>libtickertape.dylib</tickertape.lib.file></properties>
+    </profile>
+    <profile><id>linux-x86_64</id><activation><os><name>Linux</name><arch>amd64</arch></os></activation><properties><tickertape.platform>linux-x86_64</tickertape.platform></properties></profile>
+    <profile><id>linux-aarch64</id><activation><os><name>Linux</name><arch>aarch64</arch></os></activation><properties><tickertape.platform>linux-aarch64</tickertape.platform></properties></profile>
+    <profile><id>macos-aarch64</id><activation><os><family>mac</family><arch>aarch64</arch></os></activation><properties><tickertape.platform>macos-aarch64</tickertape.platform></properties></profile>
+    <profile><id>macos-x86_64</id><activation><os><family>mac</family><arch>x86_64</arch></os></activation><properties><tickertape.platform>macos-x86_64</tickertape.platform></properties></profile>
+
+    <!-- The natives profile also builds tickertape-<version>-natives-<platform>.jar, which carries the library
+         staged by scripts/stage-natives.sh (library plus its SHA-256) for extraction at run time. Built locally and
+         in CI only; publishing it is a later release step (ADR 0037). -->
+    <profile>
+      <id>natives</id>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-jar-plugin</artifactId>
+            <executions>
+              <execution>
+                <id>natives</id>
+                <phase>package</phase>
+                <goals><goal>jar</goal></goals>
+                <configuration>
+                  <classifier>natives-${tickertape.platform}</classifier>
+                  <classesDirectory>${project.build.directory}/natives-staging</classesDirectory>
+                  <archive>
+                    <manifestEntries>
+                      <Automatic-Module-Name>io.github.thomas0903.tickertape.natives</Automatic-Module-Name>
+                    </manifestEntries>
+                  </archive>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+  </profiles>
+</project>
