@@ -411,51 +411,62 @@ fn sustained_bursty_schedule_is_stored_in_the_journal() {
 
 #[test]
 fn sustained_unpaced_retention_removes_segments_under_a_lagging_reader() {
-    let root = tempfile::tempdir().unwrap();
-    let result = sustained(
-        root.path(),
-        &[
-            "--unpaced",
-            "--duration",
-            "2s",
-            // Sized so the outcome does not depend on the machine's speed: with 1,024-byte records a 64 KiB segment
-            // holds about 60, so the lagging reader (10 ms per record) reaches a segment boundary about 0.6 s after
-            // it starts, and the writer, which rolls every 60 records, stays many times faster than that reader
-            // even on a loaded CI runner. With the default 64-byte payload and a 2 ms delay the reader needed
-            // over a second to reach a boundary, which a slow runner did not always give it within the run.
-            "--payload",
-            "1024",
-            "--segment-size",
-            "65536",
-            "--checkpoint-records",
-            "200",
-            "--retain-segments",
-            "2",
-            "--readers",
-            "safe:wait=sleep,safe:delay=10ms",
-        ],
-    );
-    let writer = &result["writer"];
-    let count = writer["count"].as_u64().unwrap();
-    assert_eq!(writer["stopped_by"], "duration");
-    assert_eq!(writer["late_records"], Value::Null);
-    assert_eq!(writer["unsent_records"], Value::Null);
-    assert!(writer["retention"]["removed_segments"].as_u64().unwrap() > 0);
-    // The lagging reader stops when the writer finishes; every record is read, skipped or reported as remaining.
-    let lagging = &result["readers"][1];
-    assert_eq!(lagging["lagging"], true);
-    assert!(lagging["skipped_by_retention"].as_u64().unwrap() > 0);
-    assert!(lagging["discard_events"].as_u64().unwrap() > 0);
-    let accounted = ["records_read", "skipped_by_retention", "remaining_records"]
-        .iter()
-        .map(|k| lagging[*k].as_u64().unwrap())
-        .sum::<u64>();
-    assert_eq!(accounted, count);
-    assert!(lagging["lag"]["max_records"].as_f64().unwrap() > 0.0);
-    assert_eq!(
-        result["coordinated_omission"],
-        "unpaced: latency measured from the actual send start"
-    );
+    // Whether retention overtakes the lagging reader within a short run depends on how fast the writer gets on
+    // this machine at this moment (a loaded runner has given it as few as 60 records/s). No choice of durations
+    // makes that certain, so: every run must satisfy the accounting, and the test repeats the run until one
+    // shows the reader being overtaken. The settings make that the usual first outcome: the reader stalls for
+    // 400 ms in every 500 ms, a 64 KiB segment holds 15 of the 4 KiB records, and the writer checkpoints every
+    // 15 records, so retention (two segments) acts after every roll.
+    const ATTEMPTS: usize = 6;
+    let mut last = Value::Null;
+    for _ in 0..ATTEMPTS {
+        let root = tempfile::tempdir().unwrap();
+        let result = sustained(
+            root.path(),
+            &[
+                "--unpaced",
+                "--duration",
+                "2s",
+                "--payload",
+                "4096",
+                "--segment-size",
+                "65536",
+                "--checkpoint-records",
+                "15",
+                "--retain-segments",
+                "2",
+                "--readers",
+                "safe:wait=sleep,safe:stall=400ms/500ms",
+            ],
+        );
+        let writer = &result["writer"];
+        let count = writer["count"].as_u64().unwrap();
+        assert_eq!(writer["stopped_by"], "duration");
+        assert_eq!(writer["late_records"], Value::Null);
+        assert_eq!(writer["unsent_records"], Value::Null);
+        // The lagging reader stops when the writer finishes; every record is read, skipped or reported as
+        // remaining, whether or not retention overtook it.
+        let lagging = &result["readers"][1];
+        assert_eq!(lagging["lagging"], true);
+        let accounted = ["records_read", "skipped_by_retention", "remaining_records"]
+            .iter()
+            .map(|k| lagging[*k].as_u64().unwrap())
+            .sum::<u64>();
+        assert_eq!(accounted, count);
+        assert_eq!(
+            result["coordinated_omission"],
+            "unpaced: latency measured from the actual send start"
+        );
+        let overtaken = lagging["skipped_by_retention"].as_u64().unwrap() > 0
+            && lagging["discard_events"].as_u64().unwrap() > 0;
+        if overtaken {
+            assert!(writer["retention"]["removed_segments"].as_u64().unwrap() > 0);
+            assert!(lagging["lag"]["max_records"].as_f64().unwrap() > 0.0);
+            return;
+        }
+        last = serde_json::json!({ "writer": writer, "lagging_reader": lagging });
+    }
+    panic!("retention never overtook the lagging reader in {ATTEMPTS} runs; last run: {last}");
 }
 
 #[test]
