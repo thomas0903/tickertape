@@ -37,6 +37,12 @@ pub enum Point {
     SpareMap,
     /// Writing the spare's header when the writer publishes it at roll (arm with [`fail_next`]).
     SpareHeader,
+    /// Recovery repairing a corrupt tail, after the tail was preserved in `quarantine/` and the repaired copy written,
+    /// before that copy is renamed over the segment (stands in for a crash there).
+    RepairBeforeRename,
+    /// Recovery repairing a corrupt tail, after the repaired copy replaced the segment, before later segments are
+    /// handled (stands in for a crash there).
+    RepairAfterRename,
     /// After a reader lists the segments and before it opens the one it chose (`Reader::open`,
     /// `Reader::open_mapped`, `Reader::seek`). Arm with [`run_at`].
     ReaderOpen,
@@ -55,7 +61,9 @@ pub enum Point {
     /// [`run_at`].
     InspectSeal,
     /// In `inspect::verify`, after a scan found a segment in a state a running writer passes through and verify has
-    /// paused, before it scans that segment again. Arm with [`run_at`].
+    /// paused, before it scans that segment again. That includes the pauses of the scans that follow a live writer
+    /// past an empty commit word at the end of the newest segment, and the one before verify reads that commit word
+    /// again (ADR 0035). Arm with [`run_at`].
     InspectRescan,
     /// Syncing the zeroing of an abandoned write (a panicking `append_with` fill closure).
     AbandonedWriteSync,

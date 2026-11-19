@@ -10,9 +10,10 @@
 //!
 //! `durable_readers_under_repairs` adds crash contract C13 (ADR 0034): the writer restarts every few checkpoints, and
 //! before most restarts a record after the checkpoint is damaged. Usually it is corrupted in a copy renamed over its
-//! segment, so recovery replaces a segment that readers still hold with valid bytes; sometimes its commit word is
-//! zeroed in the file itself, so recovery removes it and the records after it in place, while safe readers may still
-//! hold the old bytes in their read buffers. Durable-only readers must never return a record that a reader of the
+//! segment, so recovery replaces a segment that readers still hold with valid bytes; sometimes, in the newest
+//! segment, its commit word and those of the records after it are zeroed in the file itself (damage recovery can't
+//! tell from a torn append, ADR 0035), so recovery removes them in place, while safe readers may still hold the old
+//! bytes in their read buffers. Durable-only readers must never return a record that a reader of the
 //! repaired journal doesn't also return at the same sequence number with the same bytes; visible readers must never
 //! move from a removed history into the repaired one without `Error::Discarded`, except across an in-place repair,
 //! which keeps the file's identity (C11). A zero-copy visible reader's payload borrows the mapping, so an in-place
@@ -30,7 +31,7 @@ use tickertape::{
 };
 use tickertape_tests::{
     Rng, append_n, check_record, corrupt_by_replacement, end_of_records, payload_len, segments,
-    small_config, zero_commit_word,
+    small_config, zero_commit_words_from,
 };
 
 /// A reader that hasn't made progress for this long while the writer has is stuck. Time during which the writer
@@ -471,9 +472,10 @@ enum Restart {
     /// No repair: every file keeps its identity and every record.
     Clean,
     /// Recovery removed records in place after a commit word zeroed in the file, and the new writer began there: that
-    /// file keeps its identity, so readers can't notice (C11). Later segments, if any, were quarantined, unchanged.
-    /// `zeroed_end`: the base of the first segment after the one zeroed in place (`u64::MAX` if it was the newest),
-    /// so recovery changed bytes only of records below it. `moved_from`: see [`Restart::moved_from`].
+    /// file keeps its identity, so readers can't notice (C11). `zeroed_end`: the base of the first segment after the
+    /// one zeroed in place, so recovery changed bytes only of records below it. [`restart_loop`] damages in place only
+    /// the newest segment, so it always records `u64::MAX`; the field keeps [`changed_in_place`] general (its unit
+    /// test covers a repair in an older segment). `moved_from`: see [`Restart::moved_from`].
     InPlace { zeroed_end: u64, moved_from: u64 },
     /// Recovery began the new writer in a segment it replaced (a corrupt copy was renamed over it), or after
     /// quarantining segments: readers holding the old files notice, and must report `Error::Discarded` before they
@@ -645,7 +647,9 @@ fn repairs(duration: Duration) {
 
 /// Appends and checkpoints, then appends a tail that isn't checkpointed and restarts the writer, usually after
 /// damaging a record after the checkpoint: half the time by corrupting it in a copy renamed over its segment, a
-/// quarter of the time by zeroing its commit word in place. Until stopped.
+/// quarter of the time by zeroing, in place, its commit word and those of the records after it (in the newest
+/// segment, so that recovery can't tell the damage from a torn append and repairs in place; ADR 0035). Until
+/// stopped.
 fn restart_loop(
     mut writer: Writer,
     config: tickertape::WriterConfig,
@@ -670,18 +674,21 @@ fn restart_loop(
             let marker = inspect::read_checkpoint(shared.dir)
                 .unwrap()
                 .expect("checkpoint");
-            let newest = segments(shared.dir).pop().expect("a segment").1;
+            let (newest_base, newest) = segments(shared.dir).pop().expect("a segment");
             let (_, end) = end_of_records(&newest);
-            if end > marker.next_seq {
-                let seq = marker.next_seq + rng.below(end - marker.next_seq);
+            // Damage in place only in the newest segment: in an older one the later segments are committed history
+            // after the empty word, and recovery replaces the segment instead (ADR 0035).
+            let first = if damage < 4 {
+                marker.next_seq.max(newest_base)
+            } else {
+                marker.next_seq
+            };
+            if end > first {
+                let seq = first + rng.below(end - first);
                 if damage < 4 {
-                    let zeroed_end = segments(shared.dir)
-                        .iter()
-                        .map(|s| s.0)
-                        .find(|&base| base > seq)
-                        .unwrap_or(u64::MAX);
-                    zero_commit_word(shared.dir, seq);
-                    zeroed = Some(zeroed_end);
+                    zero_commit_words_from(shared.dir, seq);
+                    // `seq` is in the newest segment: no segment follows the zeroed range.
+                    zeroed = Some(u64::MAX);
                 } else {
                     corrupt_by_replacement(shared.dir, seq);
                     let (_, path) = before.iter().rev().find(|s| s.0 <= seq).expect("a segment");
@@ -728,8 +735,8 @@ fn restart_loop(
             shared.in_place_repairs.fetch_add(1, Ordering::SeqCst);
         }
         generation += 1;
-        // A zeroed commit word is where recovery stopped and the new writer began, in place, even when recovery also
-        // quarantined later segments (the zeroed word was in an older one).
+        // A zeroed commit word (always in the newest segment) is where recovery stopped and the new writer began, in
+        // place.
         let restart = match (zeroed, replaced) {
             (Some(zeroed_end), _) => Restart::InPlace {
                 zeroed_end,
