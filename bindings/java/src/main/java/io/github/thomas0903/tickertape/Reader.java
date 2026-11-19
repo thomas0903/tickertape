@@ -414,8 +414,9 @@ public final class Reader implements AutoCloseable {
      * thread, the reader is freed (a concurrent second {@code close} waits for the first).
      *
      * <p>Ending the accesses to the view closes a shared arena, which the JDK does with a handshake with every thread of
-     * the JVM: every running Java thread is stopped briefly, and the cost grows with the number of threads (hundreds of
-     * microseconds with hundreds of threads; see {@code docs/java-api.md} &rarr; Interruption and closing).
+     * the JVM: every running Java thread is stopped briefly, and the cost grows with the number of threads (see
+     * {@code docs/java-api.md} &rarr; Interruption and closing). Keep a reader open and {@link #seek(long)} it instead of
+     * reopening.
      *
      * @throws InternalErrorException if the library reported an internal error while closing (the reader is freed
      *     all the same)

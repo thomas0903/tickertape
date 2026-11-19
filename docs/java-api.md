@@ -264,11 +264,9 @@ once the handle is freed, with the thread's interrupt status still set.
 **Closing a reader stops every thread briefly.** Closing a reader ends every access to its views by closing a shared
 arena, and the JDK does that with a handshake with every thread of the JVM: each running Java thread is stopped
 briefly at a safepoint-like poll, and the cost grows with the number of threads. So does closing a writer that used
-`appendWith` (its upcall stub lives in a shared arena too). One reviewer's measurement of open plus close on an idle
-JVM: about 50 microseconds before this design, 67 after; with 500 parked threads, about 80 before and 440 to 560
-after. Code that opens short-lived readers often, in a JVM with many threads, pays this every time and briefly
-disturbs every other thread: keep a reader open and `seek` it instead of reopening, or use one long-lived reader per
-consumer.
+`appendWith` (its upcall stub lives in a shared arena too). Code that opens short-lived readers often, in a JVM with
+many threads, pays this every time and briefly disturbs every other thread: keep a reader open and `seek` it instead
+of reopening, or use one long-lived reader per consumer.
 
 The slice has two costs. A reader blocked with nothing to read returns to Java once per slice, about 100 times a
 second at 10 ms, and each new slice starts the library's back-off again (its spins and yields); and an interrupt or a

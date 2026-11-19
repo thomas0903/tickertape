@@ -133,12 +133,10 @@ records, or records encoded field by field). Both allocate nothing per record.
   acquire load (the first version used a plain field: a thread reading a view's metadata in a compiled loop kept
   getting values more than a second after `close()` returned, because the JIT hoisted the load, and so did a copy of an
   empty payload, which touches no memory and so never meets the arena check). An acquire load costs a plain `mov` on
-  x86-64 and an `ldar` on AArch64, and cannot be hoisted. Informal measurement (`ReadPathCostTest`, run on request;
-  not under the benchmark rules: an Apple M-series laptop, JDK 25.0.5.1, best of ten rounds, three runs): `tryNext`
-  plus seven accessors took 36.1 to 37.0 ns before and 38.2 to 40.1 ns after with the safe reader (35.0 to 35.2 and
-  37.5 to 38.6 ns with the mapped reader), about 2 to 3 ns more, which includes the guard's second compare-and-set
-  (see Threads); seven accessors alone on one view took 2.1 ns (safe) and 0.25 ns (mapped) before, numbers that only a
-  hoisted load allows, and about 4.3 ns after. Reuse cuts both ways and is documented: a saved view
+  x86-64 and an `ldar` on AArch64, and cannot be hoisted. The read path pays for it, and for the guard's second
+  compare-and-set (see Threads), on every accessor; `ReadPathCostTest`, run on request, measures the path informally
+  (its figures are in the pull request, not here: they were not taken under the benchmark rules). Reuse cuts both
+  ways and is documented: a saved view
   shows the next record after the next read, a view kept from a batch is re-pointed by a later `get` after a refill,
   and a saved `PayloadBuffer` is usable again during a later fill on the same thread.
 - **Every view access goes through memory whose lifetime the JVM enforces.** Each reader has one shared arena and one
@@ -154,8 +152,7 @@ records, or records encoded field by field). Both allocate nothing per record.
   thread while a consumer reads its view is safe, which the guide's shutdown pattern needs. The cost is on close, not
   on reads, but it is not small: the handshake stops every running Java thread briefly and grows with the number of
   threads, for every reader closed (and every writer that used `appendWith`, whose upcall stub is in a shared arena).
-  A reviewer measured open plus close at about 50 microseconds before this design and 67 after on an idle JVM, and
-  about 80 before and 440 to 560 after with 500 parked threads. We accept it because readers are meant to be
+  We accept it because readers are meant to be
   long-lived (seek instead of reopening); the guide says so, for code that opens short-lived readers. Reads add a
   liveness check of the arena next to the bounds check, which the JIT can hoist out of loops.
 - A view holds its owner (reader or batch) strongly, and every accessor ends with
@@ -190,7 +187,7 @@ records, or records encoded field by field). Both allocate nothing per record.
   per call, the `MemorySegment.ofBuffer` wrapper and its scope for a direct buffer, while the same JDK build passed
   locally). Without escape analysis that run found three such objects: that wrapper, the same one in
   `PayloadBuffer.put(ByteBuffer)` and `AppendBatch.add(ByteBuffer)`, and the two `MemorySegment`s an upcall creates for
-  the fill callback's pointer arguments (80 bytes per `appendWith`). The fill callback now receives its pointers as
+  the fill callback's pointer arguments (on every `appendWith`). The fill callback now receives its pointers as
   64-bit integers (`Signatures.POINTER_AS_LONG`; a pointer and an `int64_t` travel in the same register on every
   supported LP64 ABI, and `HeaderTest` still checks them as pointers); `AppendBatch` copies a direct buffer through a
   `ByteBuffer` view of its own memory; and a view or a payload buffer remembers a segment over the last direct buffer
