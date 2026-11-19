@@ -4,7 +4,8 @@ tickertape has a header-only C++ binding over its C ABI: one header,
 [`crates/tickertape-ffi/include/tickertape.hpp`](../crates/tickertape-ffi/include/tickertape.hpp), next to the C
 header `tickertape.h`, linked against the same `libtickertape`. It needs C++17 and nothing beyond the standard
 library, and has the same API with and without exceptions; with GCC and Clang, code built with and without
-exceptions (or debug checks) can be linked into one program ([Mixing modes](#mixing-modes)). This page explains how to use it; the header documents
+exceptions (or debug checks) can be linked into one program, though binding types cannot be passed between code built
+in different exception modes ([Mixing modes](#mixing-modes)). This page explains how to use it; the header documents
 every function, and [ADR 0036](decisions/0036-cpp-binding.md) gives the design and its reasons. The rules of the C
 ABI underneath ([`c-api.md`](c-api.md)) still hold; this page repeats the ones you need.
 
@@ -92,16 +93,23 @@ example a component built with `-fno-exceptions` inside an application that catc
 GCC and Clang each unit keeps its own behaviour:
 
 - **Exceptions on or off.** Everything in the header lives in an inline namespace named after the mode:
-  `tickertape::v1` with exceptions, `tickertape::v1_noexcept` without. You still write `tickertape::Writer`, but the
-  two modes have different symbols for every function, type and constant, so no unit ever runs code built for the
-  other mode (including the clean-up code the compiler generates, which an allocation failure passes through).
-- **So binding types do not cross that boundary.** A `tickertape::Writer` from a unit built with exceptions is a
+  `tickertape::v1` with exceptions, `tickertape::v1_noexcept` without. You still write `tickertape::Writer`, but
+  every definition the header provides has a different symbol in each mode (including the clean-up code the compiler
+  generates, which an allocation failure passes through), and the header instantiates no standard-library function
+  that an exception can pass through over only its C types: the C structs it owns are held in a buffer type of its
+  own. What the two modes still share is standard-library code over built-in and standard types (`std::string`,
+  `std::optional<std::uint64_t>`, ...), which any program that mixes exception modes shares with or without this
+  header: mixing modes is only as safe as your toolchain's standard library makes it. The mixed-mode test covers GCC
+  and Clang on Linux and Apple Clang and Homebrew GCC on macOS.
+- **Binding types do not cross that boundary.** A `tickertape::Writer` from a unit built with exceptions is a
   different type from one built without. If a header of yours declares `void feed(tickertape::Writer &)`, defining
   it in a `-fno-exceptions` component and calling it from an application built with exceptions fails to link
-  (undefined reference to `feed(tickertape::v1::Writer&)`). That is deliberate: the alternative is silently running
-  one mode's code in the other. Across such a boundary, pass C handles (`writer.native_handle()`, used through the
-  C API in `tickertape.h` on the other side) or plain data (sequence numbers, timestamps, payload bytes;
-  `tickertape::NewRecord`, which is the C struct).
+  (undefined reference to `feed(tickertape::v1::Writer&)`). The link error only helps with the commonest case, a
+  binding type in a **parameter list**: a binding type that appears only in a non-template function's **return
+  type** (`tickertape::Writer open_feed();`), or in a data member or a global, is not part of the symbol's name, so
+  such a crossing links, and is undefined behaviour. Do not let binding types cross the boundary at all; pass C
+  handles (`writer.native_handle()`, used through the C API in `tickertape.h` on the other side) or plain data
+  (sequence numbers, timestamps, payload bytes; `tickertape::NewRecord`, which is the C struct).
 - **Debug checks on or off.** Debug and release units share the types and can pass them freely; the few inline
   functions whose behaviour depends on the check (`operator*`, `error()`, `RecordView::data()`,
   `RecordBatch::operator[]`, ...) get a different symbol in each mode (`abi_tag`).
@@ -110,8 +118,8 @@ GCC and Clang each unit keeps its own behaviour:
 
 What it does not change:
 
-- Behaviour follows the code that acts on a value: `value()` called in a unit built without exceptions aborts on an
-  error, whichever unit produced the result.
+- With debug checks, where the types are shared, behaviour follows the code that acts on a value: a view made in a
+  release unit is checked when a debug unit reads its payload, and not the other way round.
 - A fill function passed to `append_with` from code built without exceptions must not throw.
 - Your own inline functions that call debug-checked ones are yours to keep consistent across modes, as for any
   header.
@@ -135,16 +143,19 @@ What it does not change:
 - **Paths** can be a `const char *`, `std::string`, `std::string_view` or `std::filesystem::path`, passed directly
   as the argument; temporaries such as `tt::Writer::open(root / "journal")` are fine. A path with a NUL byte inside
   fails with `invalid_argument` (the C ABI would cut it short). The parameter type behind this is internal
-  (`tickertape::detail`), because a variable of it could point into a destroyed temporary; a function of yours that
-  forwards a path should take a path type such as `const std::filesystem::path &`.
+  (`tickertape::detail::PathArg`): it can point into the temporary you pass, which is safe in these call forms only.
+  Do not name it; code that does can store one and let it dangle. A function of yours that forwards a path should
+  take a path type such as `const std::filesystem::path &`, or a template parameter.
 - **Payloads** can be any contiguous range of `char`, `unsigned char`, `signed char` or `std::byte`
   (`std::string_view`, `std::string`, `std::vector<std::uint8_t>`, `std::array`, `std::span`, `char8_t` ranges in
   C++20), or a pointer and a size. String literals and other C arrays are refused, because they would include the
   terminating NUL: write `std::string_view("text")`.
 - **Timeouts** are a `tickertape::Timeout`: `tickertape::no_wait` (the default), any `std::chrono` duration, or
   `tickertape::wait_forever`. **A zero or negative duration does not wait** (unlike the C ABI, where a negative
-  timeout waits forever): a deadline that has passed returns at once. Durations are rounded up to whole nanoseconds
-  (integral counts exactly; anything longer than `INT64_MAX` nanoseconds, about 292 years, waits that long).
+  timeout waits forever): a deadline that has passed returns at once. Durations are rounded up to whole nanoseconds;
+  integral counts are converted exactly for every period (integer arithmetic only, so a positive duration never
+  becomes 0 or comes out below its exact value), and anything longer than `INT64_MAX` nanoseconds, about 292 years,
+  waits that long.
   A timeout bounds only the wait for a record; catching up after a seek and file I/O can take longer.
 - **Timestamps** are `std::uint64_t` nanoseconds that you choose; `tickertape::realtime_ns()` reads the wall clock.
 
@@ -229,11 +240,18 @@ tt::Writer writer = tt::Writer::open("/data/journal", options).value();
   copy or an allocation. Build records with `tt::new_record(schema_id, venue_ts_ns, local_ts_ns, bytes)` or
   `tt::new_record(schema_id, venue_ts_ns, local_ts_ns, data, size)`. A record keeps a pointer to its payload, not a
   copy, so **the payload must be a named object** (an lvalue) that outlives the append, or a view: an rvalue is
-  accepted only if it is a `std::basic_string_view`, a `std::span` or, in C++20, a type for which
-  `std::ranges::enable_borrowed_range` is true (specialise it for your own view types). `tt::new_record(7, 0, 0,
-  std::to_string(i) + "...")` does not compile (the string would be destroyed at the end of the statement and the
-  record would point into freed memory), and neither does a temporary `std::string`, `std::vector` or `std::array`.
-  Keep the strings in a container that lives until the append returns.
+  accepted only if `tt::enable_borrowed_bytes<T>` is true for its type, which it is for `std::basic_string_view` and
+  `std::span`. For a view type of your own, specialise it (at any language level):
+
+  ```cpp
+  template <> inline constexpr bool tickertape::enable_borrowed_bytes<MyView> = true;
+  ```
+
+  `std::ranges::enable_borrowed_range` is not consulted, so other C++20 views (`std::ranges::subrange`, ...) must be
+  named or opted in the same way. `tt::new_record(7, 0, 0, std::to_string(i) + "...")` does not compile (the string
+  would be destroyed at the end of the statement and the record would point into freed memory), and neither does a
+  temporary `std::string`, `std::vector` or `std::array`. Keep the strings in a container that lives until the
+  append returns.
 
 ## Reading
 
@@ -326,7 +344,8 @@ and returns nothing without a valid checkpoint marker. See [`c-api.md` → Durab
 | `name()`, `to_string()` | `"TICKERTAPE_E_IO"`, and `"TICKERTAPE_E_IO: <message>"` |
 
 `tickertape::Exception` (a `std::runtime_error`) holds an `Error`, shared between copies so that copying an exception
-never throws; `what()` is `to_string()`. `message()` on a temporary `Error` returns the string by value.
+never throws; `what()` is `to_string()`. Moving an exception copies it, so a moved-from exception still has its
+`Error`. `message()` on a temporary `Error` returns the string by value.
 
 `Status` and `CorruptReason` have one enumerator per C code: see the table in
 [`c-api.md` → Errors](c-api.md#errors) (`TICKERTAPE_E_SEQ_UNAVAILABLE` is `Status::seq_unavailable`, and so on). A
@@ -404,11 +423,13 @@ as C++17, C++20 and C++17 without exceptions, plus a test against stubbed C func
 throwing fill, every status and corruption reason), the allocation check, a debug-check death test, the
 cross-language fixtures with Rust, Python and C, the example, and a compile-only matrix of C++17, C++20 and C++23
 with and without exceptions and `NDEBUG` for every C++ compiler it finds (`TICKERTAPE_FFI_CXX_COMPILERS` sets the
-list), which also pins every class's size and alignment (`tests/cpp/layout.cpp`). It links units built in different
-modes into one program (including an allocation failure inside a binding function), checks that binding types
-cannot be passed between exception modes, that `new_record` refuses owning temporaries and other unsafe code at
-compile time, and fails if a C function, struct field, status code or corruption reason is added without a decision
-for the binding, or if a debug-check-dependent function lacks its mode tag (ADR 0036).
+list), which also pins every class's size and alignment (`tests/cpp/layout.cpp`). It checks that the header's
+definitions are the same at every language level, links units built in different modes into one program with every
+compiler (failing each allocation inside a binding function in turn, and checking with `nm` that the two exception
+modes define no common binding symbol), checks that binding types cannot be passed between exception modes, that
+`new_record` refuses owning temporaries and other unsafe code at compile time, and fails if a C function, struct
+field, status code or corruption reason is added without a decision for the binding, or if a debug-check-dependent
+function lacks its mode tag (ADR 0036).
 `TICKERTAPE_FFI_SANITIZE=1` and `TICKERTAPE_FFI_VALGRIND=1` work as for the C tests; under Valgrind the tests that
 replace `operator new` run with `--soname-synonyms=somalloc=nouserintercepts`. With the GCC driver on macOS, the
 statically linked test programs are skipped, for the reason in [Building and linking](#building-and-linking).

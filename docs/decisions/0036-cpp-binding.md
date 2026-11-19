@@ -67,6 +67,22 @@ taken by a template that accepts any contiguous range of `char`/`unsigned char`/
 `char8_t` in C++20), so `std::span` works without a C++20 overload. Exception and debug-check modes are below
 (**Mixing modes**).
 
+**Nothing the header defines depends on the language level.** A program may link a C++17 unit and a C++20 unit
+that both include the header, and each inline function, class, variable template and inline variable must then have
+one definition, token for token. **Rule:** a block conditional on the language standard or on a library
+feature-test macro may only add whole declarations (`as_span`, the `char8_t` specialisation of `detail::is_byte`, the
+`std::span` specialisation of `enable_borrowed_bytes`); it never changes a definition that also exists at C++17.
+Round 2 broke this: under C++20 `detail::is_byte_view_v` gained an `|| std::ranges::enable_borrowed_range<...>` term,
+so the two units held two definitions of one variable template. It is replaced by the binding's own opt-in
+(**Records**), the same at every level. `tests/c_api.rs` enforces the rule: it preprocesses the header as C++17,
+C++20 and C++23, with and without exceptions, with every C++ compiler found, and fails if a line of the lower level
+changes or disappears at the higher one, or if the lines only the higher level has are not whole declarations
+(balanced brackets, ending in `;` or `}`, after a line that ends a declaration); run against round 2 it reports
+exactly that term and nothing else. One condition in the header is a property of the target, not of the language
+level: the exact duration conversion uses a 128-bit product where `__SIZEOF_INT128__` is defined and 64-bit long
+multiplication otherwise (**Timeouts**); that is the same in every unit of a program built for one target with GCC
+or Clang, and both bodies compute the same exact value.
+
 **Mixing modes.** One program may contain translation units built with and without exceptions, and with and without
 debug checks: a low-latency component built with `-fno-exceptions` inside an application built with exceptions is
 exactly this binding's audience, so mixing is made safe rather than forbidden. The first version claimed this
@@ -79,22 +95,40 @@ when the linker kept the copy built with `-fno-exceptions`, a `std::bad_alloc` p
 process (Clang, which marks such code as unable to unwind) or skipped its clean-up (GCC). What is guaranteed now, with
 GCC and Clang (the Itanium C++ ABI: Linux, macOS):
 
-- **The exception mode is part of every symbol's name.** Everything the header declares lives in an inline
-  namespace whose name carries the mode: `tickertape::v1` when exceptions are enabled (`__cpp_exceptions`),
+- **Every definition the header provides has a mode-specific symbol.** Everything the header declares lives in an
+  inline namespace whose name carries the mode: `tickertape::v1` when exceptions are enabled (`__cpp_exceptions`),
   `tickertape::v1_noexcept` when they are not. Every function, type and inline variable of the binding therefore has
-  a symbol per mode, and no definition is shared between units built in different exception modes, whatever the
-  compiler generates inside it. Code in one translation unit still writes `tickertape::Writer`.
+  a symbol per mode, whatever the compiler generates inside it. Code in one translation unit still writes
+  `tickertape::Writer`.
+- **No standard-library instantiation over only the binding's C types is shared.** The namespace does not reach a
+  standard-library template whose arguments are only C types: round 2's `list_segments` used
+  `std::vector<tickertape_segment_info>`, whose `resize` is one weak symbol for both modes; when the
+  `-fno-exceptions` object came first on the link line the linker kept its copy (compiled without unwind
+  information), and a `std::bad_alloc` from `operator new` inside it ended the process (Apple Clang 21, `-O0` and
+  `-O2`; Homebrew GCC 15 was not affected). The C structs the header owns (and the byte buffer of `RecordBatch`) are
+  now held in `detail::Array<T>`, a move-only, pointer-sized owner of a `new[]` array declared in the mode-specific
+  namespace, so its functions are mode-specific; moving C handles uses `detail::take_handle` rather than
+  `std::exchange` over a C pointer. Neither changes a public signature or a class's size or alignment (`RecordBatch`
+  stays two pointers and four integers). What is left is `std::data` and `std::size` on a range of `NewRecord` given
+  to `append_batch`, which cannot throw.
+- **What remains shared between modes** is standard-library code over built-in and standard types (`std::string`,
+  `std::optional<std::uint64_t>` and the like), which any program that mixes exception modes shares with or without
+  this header. Mixing modes is therefore only as safe as the toolchain's standard library makes it. The mixed-mode
+  test covers GCC and Clang on Linux (libstdc++) and Apple Clang and Homebrew GCC on macOS (libc++ and libstdc++).
 - **Units built in different exception modes can be linked into one program**, and each keeps its own behaviour for
-  everything: `value()` throws in the one and aborts in the other, a fill's exception is rethrown, and an allocation
-  failure inside any binding function reaches the caller's `catch`.
-- **Binding types do not cross an exception-mode boundary.** `tickertape::Writer` in a unit built with exceptions
-  and `tickertape::Writer` in one built without are different types (`v1::Writer` and `v1_noexcept::Writer`), so a
-  function declared as `bool is_open(const tickertape::Writer &)` in a shared header is a different function in each
-  mode: defining it in a `-fno-exceptions` unit and calling it from an exceptions unit is a link error (undefined
-  reference). That is the intended outcome: the alternative is one unit running the other's code in the wrong mode.
-  Across such a boundary pass C handles (`native_handle()`, used through the C API on the other side) or plain
-  data: `tickertape::NewRecord` is the C struct and is shared; sequence numbers, timestamps and payload bytes are
-  plain values.
+  the binding: `value()` throws in the one and aborts in the other, a fill's exception is rethrown, and an allocation
+  failure inside a binding function reaches the caller's `catch`.
+- **Binding types do not cross a boundary between exception modes.** `tickertape::Writer` in a unit built with
+  exceptions and `tickertape::Writer` in one built without are different types (`v1::Writer` and
+  `v1_noexcept::Writer`). Where a binding type is in a function's **parameter list**, it is part of the symbol's
+  name, so a function declared as `bool is_open(const tickertape::Writer &)` in a shared header is a different
+  function in each mode: defining it in a `-fno-exceptions` unit and calling it from an exceptions unit is a link
+  error (undefined reference). Where a binding type appears only in a non-template function's **return type** (or in
+  a data member or a global), it is not part of the symbol's name, so such a crossing links, and is undefined
+  behaviour. The rule is that binding types do not cross the boundary; the link error is a help for the commonest
+  case, not a guarantee. Across such a boundary pass C handles (`native_handle()`, used through the C API on the
+  other side) or plain data: `tickertape::NewRecord` is the C struct and is shared; sequence numbers, timestamps and
+  payload bytes are plain values.
 - **The debug-check mode is shared.** Debug and release units of one program commonly exchange the binding's types,
   and only the check differs, so the types are the same in both modes (the debug check's fields exist in every
   build; `[[maybe_unused]]` keeps Clang quiet when `NDEBUG` leaves them unread). Every inline function whose
@@ -109,21 +143,30 @@ GCC and Clang (the Itanium C++ ABI: Linux, macOS):
   the same standard library with the same settings that affect its layout (for example `_GLIBCXX_USE_CXX11_ABI`, or
   libstdc++'s and libc++'s debug modes), as for any C++ library whose types contain `std::string`, `std::vector` or
   `std::optional`.
-- **Not covered:** behaviour follows the code that acts on a value, not the code that made it (`value()` in a
-  no-exceptions unit aborts, whichever unit produced the result); a fill passed to `append_with` from a
-  no-exceptions unit must not throw (nothing there catches it); your own inline functions that call debug-checked
-  ones are yours to keep consistent; and MSVC is out of scope (it has no `abi_tag`): there, build the whole program
-  in one mode.
+- **Not covered:** in the debug-check mode, where the types are shared, behaviour follows the code that acts on a
+  value, not the code that made it (a view made in a release unit is checked when a debug unit reads its payload);
+  a fill passed to `append_with` from a no-exceptions unit must not throw (nothing there catches it); your own inline
+  functions that call debug-checked ones are yours to keep consistent; and MSVC is out of scope (it has no
+  `abi_tag`): there, build the whole program in one mode.
 - **Enforced** by a source check in `tests/c_api.rs` (it fails if anything in `namespace tickertape` is outside the
   mode-specific inline namespace, if a function whose body mentions a debug-check macro or calls a tagged function by
   name lacks the tag, or if a tagged function has no such reason; calls through operators are not seen, so those
   operators are tagged by hand), by `tests/cpp/layout.cpp` (the namespace name in each mode of the compile matrix),
   and by link tests: units built in each mode are linked into one program in both orders, at -O0 and -O2, asserting
-  each unit's behaviour (no-exceptions with exceptions, including a `std::bad_alloc` injected by a replaced
-  `operator new` at each allocation inside `list_segments` in turn, which must reach the exceptions unit's `catch`;
-  debug checks with none); and passing a `tickertape::Writer` from a no-exceptions unit to an exceptions unit must
-  fail to link, while the same two units built in one mode link. With the round-2 namespace removed, the
-  allocation case terminates with Clang in one link order at -O0 and -O2.
+  each unit's behaviour (no-exceptions with exceptions; debug checks with none); and passing a `tickertape::Writer`
+  from a no-exceptions unit to an exceptions unit must fail to link, while the same two units built in one mode link.
+  The allocation case fails every allocation of a `list_segments` call in turn (n = 1, 2, ... until the call
+  succeeds), with the failure armed only after the replaced `operator new` and `operator new[]` have been probed
+  (`detail::Array` allocates with `new[]`, which AddressSanitizer and Valgrind do not route through a replaced
+  `operator new`), and asserts that each `std::bad_alloc` reaches the exceptions unit's `catch` and that at least
+  the two known allocations were exercised.
+  (Round 2's version armed it before its own probe, so n = 1 failed the probe and the first allocation inside the
+  call was never failed, yet the test passed.) Where `nm` is available, the test also fails if any symbol defined in
+  both the exceptions object and the no-exceptions object mentions `tickertape`, which catches C struct names
+  inside standard-library instantiations; without `nm` it says so and skips that part. Against round 2's header both
+  parts fail with Apple Clang: the symbol check lists `std::vector<tickertape_segment_info>` functions, and the
+  allocation walk terminates with "uncaught exception of type std::bad_alloc" when the no-exceptions object comes
+  first.
 
 **Errors: one surface returning `tickertape::result<T>`** (option 3). `result<T>` holds a `T` or a
 `tickertape::Error`; it is `[[nodiscard]]`, so a discarded result is a compiler warning (an ignored error is never
@@ -149,10 +192,15 @@ move costs nothing next to a call into the library. These rules are fixed for 1.
   else lends a reference.
 - **`tickertape::Exception` is nothrow-copyable**, as every standard exception is (copying one during exception
   handling must not throw, or the program terminates): it holds its `Error` through a `std::shared_ptr<const Error>`
-  created once in its constructor, so copies share it. This is a layout change, made before 1.0 for that reason. The header defines its own type rather than using
-`std::expected`, so that its types are the same at every language level. Apart from `std::bad_alloc` (an error copies
-its message; `list_segments` returns a vector), the binding never throws, except from `value()` and from
-`Writer::append_with`, which rethrows what the user's fill threw (below).
+  created once in its constructor, so copies share it. This is a layout change, made before 1.0 for that reason.
+  **It declares its copy operations and no move operations**, so moving one is a nothrow copy, as with
+  `std::runtime_error`: an implicit move would leave the source's `shared_ptr` empty, and `status()`, `error()` or
+  any other accessor on a moved-from exception (a handler that moves it into a queue, then logs from the original)
+  would dereference null. A test calls every accessor on a moved-from and a move-assigned-from exception.
+
+The header defines its own type rather than using `std::expected`, so that its types are the same at every language
+level. Apart from `std::bad_alloc` (an error copies its message; `list_segments` returns a vector), the binding never
+throws, except from `value()` and from `Writer::append_with`, which rethrows what the user's fill threw (below).
 
 - `Error` carries a `Status`, the library's message, the OS error number (`os_code()`, for `io` and `storage_full`)
   and the corruption reason (`corrupt_reason()`, for `corrupt`), all read from the C ABI's per-thread last-error
@@ -192,9 +240,12 @@ that accepts them, `detail::PathArg`, keeps a pointer into a `std::string` or `s
 which is safe because a temporary argument lives until the call returns, but would dangle in a variable
 (`PathArg p = std::filesystem::path(root) / "journal";` points into a path destroyed at the end of the statement).
 Rather than refuse rvalues (which would also refuse `Writer::open(dir / "journal")`, the commonest form) or copy every
-path, the type is **not part of the API**: it lives in `tickertape::detail`, `tickertape::PathArg` does not exist
-(a compile-fail test), and the documented way to pass a path is the path itself. A function of yours that forwards a
-path takes a path type (`const std::filesystem::path &`, `const char *`), not the binding's parameter type. The
+path, the type is **an internal parameter type**: it lives in `tickertape::detail`, `tickertape::PathArg` does not
+exist (a compile-fail test), and the documented way to pass a path is the path itself. Its protection is against
+binding a temporary in the documented call forms, no more: code that names the `detail` type itself can still store
+one and let it dangle (`tickertape::detail::PathArg p = std::string("x");` compiles, by guaranteed copy elision). A
+function of yours that forwards a path takes a path type (`const std::filesystem::path &`, `const char *`) or a
+template parameter, not the binding's parameter type. The
 inspection results are C++ structs with
 `std::optional` where the C struct has "valid only if" fields; `list_segments` returns a `std::vector` (it allocates,
 and retries if the list grows between its two calls). `apply_retention` and `plan_retention` replace the `dry_run`
@@ -246,9 +297,14 @@ names is a named `Status`), and `-Wswitch` makes a new enumerator break the test
   moves into factory functions: `tickertape::new_record(schema_id, venue_ts_ns, local_ts_ns, bytes)` and
   `new_record(schema_id, venue_ts_ns, local_ts_ns, data, size)`, so `batch.push_back(new_record(...))` and a
   `std::array` or `std::vector` of records stay allocation-free and go to the C ABI as they are. A record keeps a
-  pointer, not a copy, so **`new_record` accepts an rvalue byte range only if its type is a view**: a specialisation
-  of `std::basic_string_view` or `std::span`, or, in C++20, any type for which `std::ranges::enable_borrowed_range` is
-  true (a user's own view type opts in by specialising it); for any other range type the rvalue overload is deleted,
+  pointer, not a copy, so **`new_record` accepts an rvalue byte range only if its type is a view**: one for which
+  the binding's own variable template `tickertape::enable_borrowed_bytes<T>` is true. It is `false` by default and
+  `true` for `std::basic_string_view` and, where `std::span` exists, `std::span`; a user's own view type opts in by
+  specialising it (`template <> inline constexpr bool tickertape::enable_borrowed_bytes<MyView> = true;`), at C++17
+  as well. Round 2 picked up `std::ranges::enable_borrowed_range` automatically in C++20, which made the header's
+  definition depend on the standard (**Language level**); the binding no longer consults it, so a C++20 type that
+  opts only into it (or `std::ranges::subrange`) is refused unless it also specialises `enable_borrowed_bytes`. For
+  any other range type the rvalue overload is deleted,
   so `new_record(1, 0, 0, std::to_string(i) + "...")` (a pointer into a string destroyed at the end of the statement)
   and rvalues of `std::array`, `std::vector` and `std::string` do not compile. Lvalues of any byte range are
   accepted, as are pointer-and-size pairs. A list of view types rather than a rule such as "trivially copyable": a
@@ -285,12 +341,19 @@ and Valgrind).
 
 **Timeouts** are a `Timeout`: `no_wait` (the default), any `std::chrono::duration`, or `wait_forever`. Durations are
 rounded up to whole nanoseconds and saturate at `INT64_MAX` nanoseconds; the unsigned conversion for retention ages
-and back-off sleeps saturates at `UINT64_MAX`. Integral counts are converted exactly (in integer arithmetic, so
-`std::chrono::nanoseconds{9'200'000'000'000'000'000}` stays that value); floating-point counts are compared with the
-first value the target cannot hold (2^63 or 2^64) before the cast. **A zero or negative duration does not
-wait.** This deliberately differs from the C ABI, where a negative timeout waits forever: in C++ a negative duration
-is usually a deadline that has passed, and waiting forever for it would be a bug that is hard to see. Waiting forever
-needs the explicit `wait_forever`.
+and back-off sleeps saturates at `UINT64_MAX`. **Integral counts are converted exactly, for every period**, in
+integer arithmetic (so `std::chrono::nanoseconds{9'200'000'000'000'000'000}` stays that value): a positive duration
+never becomes 0 and never comes out below its exact value. The count is split into whole periods and a remainder;
+where the period's `num * den` does not fit 64 bits, the remainder's share is computed with a 128-bit product where
+the compiler has one (`__SIZEOF_INT128__`) and otherwise by long multiplication in 64-bit arithmetic that keeps the
+quotient and remainder of the partial product (`detail::mul_div_ceil_portable`, tested against the 128-bit result).
+Round 2 used `long double` there, which is a 53-bit `double` on Apple arm64: one tick of
+`duration<int, ratio<1000000000, 999999999999999999>>` (just over 1 ns) gave 1 ns, and 986 of 1999 counts just
+below 1000000007 of `duration<int64_t, ratio<999999937, 1000000007>>` came out low by up to about 70 ns.
+Floating-point counts are compared with the first value the target cannot hold (2^63 or 2^64) before the cast. **A
+zero or negative duration does not wait.** This deliberately differs from the C ABI, where a negative timeout waits
+forever: in C++ a negative duration is usually a deadline that has passed, and waiting forever for it would be a bug
+that is hard to see. Waiting forever needs the explicit `wait_forever`.
 
 **Threads and fork** are the C ABI's rules: an object may move between threads but must not be used by two at once,
 including through const member functions (`Writer::next_seq`, `last_retention_error`, `Reader::position` call
@@ -358,9 +421,11 @@ ordinary abort does not unwind is a separate follow-up.
   replay), a compile-only matrix (`compile_all.cpp` and `layout.cpp` as C++17, C++20 and C++23, with and without
   exceptions, with and without `NDEBUG`, with every C++ compiler found: GCC and Clang on Linux, Apple Clang on
   macOS, under `-Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror`, with `static_assert`s for the API's
-  compile-time properties), the mixed-mode link tests and the mode-tag source check (**Mixing modes**),
-  compile-fail and compile-pass programs (`new_record` and temporaries, a payload with a throwing move, a const
-  rvalue `result<Writer>`, `tickertape::PathArg`), and the coverage, struct-field, layout, enumerator and version
+  compile-time properties), the language-level check (**Language level**), the mixed-mode link tests with their
+  shared-symbol check and the mode-tag source check (**Mixing modes**),
+  compile-fail and compile-pass programs as C++17 and C++20 (`new_record` and temporaries, `enable_borrowed_bytes`
+  for a user's view, a payload with a throwing move, a const rvalue `result<Writer>`, `tickertape::PathArg`), and the
+  coverage, struct-field, layout, enumerator and version
   checks above. `test_no_alloc.cpp` replaces every form of `operator new` (plain, array, aligned, `nothrow`) and
   first checks that a deliberate allocation of each kind is counted; under Valgrind it runs with
   `--soname-synonyms=somalloc=nouserintercepts`, without which Valgrind replaces the test's operators and nothing is
