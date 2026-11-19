@@ -440,9 +440,11 @@ impl Writer {
             segment_size: self.active.size,
             checkpoint: self.checkpointed,
             since_checkpoint: self.last_checkpoint_at.map(|at| at.elapsed()),
-            uncheckpointed_records: self
-                .next_seq
-                .saturating_sub(self.checkpointed.map_or(0, |c| c.next_seq)),
+            // Without a marker, everything from where recovery started (the oldest retained segment) is uncovered.
+            uncheckpointed_records: self.next_seq.saturating_sub(
+                self.checkpointed
+                    .map_or(self.report.scanned_from_seq, |c| c.next_seq),
+            ),
             uncheckpointed_bytes: dirty
                 .saturating_add(self.offset.saturating_sub(self.active_dirty_from)),
             poisoned: self.poisoned,
@@ -756,10 +758,18 @@ impl Recovery<'_> {
             .map_err(|e| Error::io("read checkpoint marker", &path, e))?;
         let checkpoint = format::decode_checkpoint(&contents);
         if len < format::CHECKPOINT_FILE_LEN as u64 {
+            let modified = existed
+                .then(|| file.metadata().and_then(|m| m.modified()).ok())
+                .flatten();
             // Preallocated, not sparse, so that writing a slot never needs new blocks (a full disk must not make
             // checkpoints fail).
             mmap::preallocate(&file, format::CHECKPOINT_FILE_LEN as u64)
                 .map_err(|e| Error::io("create checkpoint marker", &path, e))?;
+            // Extending the file is not a checkpoint: keep the modification time that observers read as the time of
+            // the last checkpoint (ADR 0032). Best effort; the time is informational.
+            if let Some(modified) = modified {
+                let _ = file.set_modified(modified);
+            }
             mmap::sync_data(&file).map_err(|e| Error::io("sync checkpoint marker", &path, e))?;
         }
         if !existed {
@@ -814,6 +824,8 @@ impl Recovery<'_> {
         }
         let mut visited = BTreeSet::new();
         let mut dirty = Vec::new();
+        // Where this writer's uncheckpointed data starts in `seg` (for `Writer::metrics`).
+        let mut seg_from = offset;
 
         loop {
             visited.insert(seg.base);
@@ -833,9 +845,10 @@ impl Recovery<'_> {
                         self.report.actions.push(RecoveryAction::Sealed {
                             segment: seg.path.clone(),
                         });
-                        dirty.push(inherited(seg));
+                        dirty.push(inherited(seg, seg_from, offset));
                         seg = next;
                         offset = format::SEGMENT_HEADER_LEN as u64;
+                        seg_from = offset;
                         continue;
                     }
                     break;
@@ -853,9 +866,10 @@ impl Recovery<'_> {
                     if bases.contains(&seq) {
                         match open_segment(self.dir, seq) {
                             Ok(next) => {
-                                dirty.push(inherited(seg));
+                                dirty.push(inherited(seg, seg_from, offset));
                                 seg = next;
                                 offset = format::SEGMENT_HEADER_LEN as u64;
+                                seg_from = offset;
                                 continue;
                             }
                             Err(Error::Corrupt { .. } | Error::UnsupportedVersion { .. })
@@ -884,7 +898,7 @@ impl Recovery<'_> {
                     self.report.actions.push(RecoveryAction::CompletedRoll {
                         segment: next.path.clone(),
                     });
-                    dirty.push(inherited(seg));
+                    dirty.push(inherited(seg, seg_from, offset));
                     seg = next;
                     visited.insert(seq);
                     offset = format::SEGMENT_HEADER_LEN as u64;
@@ -1108,11 +1122,13 @@ impl Recovery<'_> {
     }
 }
 
-/// A segment inherited from an earlier writer: the next checkpoint syncs its file.
-fn inherited(seg: Segment) -> DirtySegment {
+/// A segment inherited from an earlier writer: the next checkpoint syncs its whole file. `[from, seal_at)` holds the
+/// records an earlier writer appended after the marker, followed by the seal at `seal_at`; the range only feeds
+/// [`Writer::metrics`] (`uncheckpointed_bytes`).
+fn inherited(seg: Segment, from: u64, seal_at: u64) -> DirtySegment {
     DirtySegment {
-        from: 0,
-        to: seg.size,
+        from,
+        to: seal_at + format::SEAL_LEN as u64,
         file: seg.file,
         map: None,
         path: seg.path,

@@ -1,12 +1,24 @@
+//! `tickertape status` from the outside. Every test takes `SERIAL`: each spawns the CLI, and a spawned child briefly
+//! holds copies of all of this process's descriptors (between `fork` and `exec`), including the locks of beacons
+//! that another test drops and expects to see stale.
+
 use std::collections::BTreeSet;
 use std::fs;
 use std::os::unix::fs::FileExt;
+use std::sync::Mutex;
+use std::time::{Duration, SystemTime};
 
 use assert_cmd::Command;
 use predicates::prelude::*;
 use serde_json::Value;
 use tickertape::status::ReaderBeacon;
 use tickertape::{NewRecord, Reader, ReaderConfig, Writer, WriterConfig};
+
+static SERIAL: Mutex<()> = Mutex::new(());
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 fn command() -> Command {
     Command::new(assert_cmd::cargo::cargo_bin!("tickertape"))
@@ -29,6 +41,34 @@ fn journal(records: u64, checkpoint: bool) -> (tempfile::TempDir, Writer) {
         writer.checkpoint().unwrap();
     }
     (dir, writer)
+}
+
+/// Makes every segment and the checkpoint look `by` older: the creation time in each segment header and the marker's
+/// modification time (a checkpoint can't predate its segment, so both move).
+fn backdate(dir: &std::path::Path, by: Duration) {
+    use tickertape::format;
+    for entry in fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_some_and(|e| e == "tape") {
+            let file = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            let mut buf = [0u8; format::SEGMENT_HEADER_LEN];
+            file.read_exact_at(&mut buf, 0).unwrap();
+            let mut header = format::decode_segment_header(&buf).unwrap();
+            header.created_unix_ns -= by.as_nanos() as u64;
+            file.write_all_at(&format::encode_segment_header(&header), 0)
+                .unwrap();
+        }
+    }
+    let marker = fs::OpenOptions::new()
+        .write(true)
+        .open(dir.join("checkpoint"))
+        .unwrap();
+    let modified = marker.metadata().unwrap().modified().unwrap();
+    marker.set_modified(modified - by).unwrap();
 }
 
 fn status_json(args: &[&str]) -> (Value, i32) {
@@ -54,6 +94,7 @@ fn set<'a>(names: &[&'a str]) -> BTreeSet<&'a str> {
 
 #[test]
 fn help_and_usage_errors() {
+    let _serial = serial();
     command()
         .args(["status", "--help"])
         .assert()
@@ -68,7 +109,10 @@ fn help_and_usage_errors() {
                 .and(predicate::str::contains("--max-reader-lag"))
                 .and(predicate::str::contains("--readers-dir"))
                 .and(predicate::str::contains("schema_version"))
-                .and(predicate::str::contains("3 a health threshold")),
+                .and(predicate::str::contains("3 a health threshold"))
+                .and(predicate::str::contains(
+                    "2 the sample found the journal corrupt",
+                )),
         );
     for args in [
         vec!["status"],
@@ -81,6 +125,7 @@ fn help_and_usage_errors() {
         vec!["status", "x", "--format", "xml"],
         vec!["status", "x", "--max-checkpoint-age", "5"],
         vec!["status", "x", "--min-headroom", "1Q"],
+        vec!["status", "x", "--watch", "1s", "--format", "prometheus"],
     ] {
         command().args(&args).assert().code(1).stdout("");
     }
@@ -95,6 +140,7 @@ fn help_and_usage_errors() {
 
 #[test]
 fn json_schema_is_stable() {
+    let _serial = serial();
     let (dir, mut writer) = journal(3, true);
     writer
         .append(&NewRecord {
@@ -107,6 +153,7 @@ fn json_schema_is_stable() {
     let reader = Reader::open(dir.path(), ReaderConfig::default()).unwrap();
     let _beacon = ReaderBeacon::create(dir.path(), "consumer", &reader).unwrap();
     let path = dir.path().to_str().unwrap();
+    let canonical = fs::canonicalize(dir.path()).unwrap();
     let (v, code) = status_json(&[path]);
     assert_eq!(code, 0);
     assert_eq!(
@@ -122,12 +169,13 @@ fn json_schema_is_stable() {
             "storage",
             "rates",
             "writer",
+            "readers_dir",
             "readers",
             "health",
         ])
     );
     assert_eq!(v["schema_version"], 1);
-    assert_eq!(v["journal"], path);
+    assert_eq!(v["journal"], canonical.to_str().unwrap());
     assert!(v["sampled_unix_ns"].is_u64());
     assert_eq!(
         keys(&v["head"]),
@@ -139,8 +187,10 @@ fn json_schema_is_stable() {
             "end",
             "invalid_reason",
             "last_local_ts_ns",
+            "verified",
         ])
     );
+    assert_eq!(v["head"]["verified"], true);
     assert_eq!(v["head"]["next_seq"], 4);
     assert_eq!(v["head"]["end"], "open");
     assert_eq!(v["head"]["invalid_reason"], Value::Null);
@@ -164,18 +214,27 @@ fn json_schema_is_stable() {
             "next_seq",
             "segment_base_seq",
             "offset",
-            "written_unix_ns",
-            "age_s",
-            "clock_skew",
+            "problem",
+            "modified_unix_ns",
+            "estimated_age_s",
+            "age_unknown_reason",
         ])
     );
     assert_eq!(v["checkpoint"]["next_seq"], 3);
-    assert!(v["checkpoint"]["age_s"].is_f64());
-    assert_eq!(v["checkpoint"]["clock_skew"], false);
+    assert!(v["checkpoint"]["estimated_age_s"].is_f64());
+    assert_eq!(v["checkpoint"]["problem"], Value::Null);
+    assert_eq!(v["checkpoint"]["age_unknown_reason"], Value::Null);
     assert_eq!(
         keys(&v["exposure"]),
-        set(&["records", "bytes", "age_s", "oldest_local_ts_ns"])
+        set(&[
+            "records",
+            "bytes",
+            "estimated_age_s",
+            "oldest_local_ts_ns",
+            "verified"
+        ])
     );
+    assert_eq!(v["exposure"]["verified"], true);
     assert_eq!(v["exposure"]["records"], 1);
     assert_eq!(v["exposure"]["oldest_local_ts_ns"], 123);
     assert_eq!(
@@ -183,18 +242,20 @@ fn json_schema_is_stable() {
         set(&[
             "available_bytes",
             "total_bytes",
-            "segment_size_bytes",
+            "next_segment_size_bytes",
             "spare_segment",
-            "rolls_left",
-            "time_to_full_s",
+            "estimated_rolls_left",
+            "estimated_time_to_full_s",
         ])
     );
     assert!(v["storage"]["available_bytes"].is_u64());
-    assert_eq!(v["storage"]["time_to_full_s"], Value::Null);
+    assert_eq!(v["storage"]["estimated_time_to_full_s"], Value::Null);
     assert_eq!(v["rates"], Value::Null);
     assert_eq!(keys(&v["writer"]), set(&["pid", "alive"]));
     assert_eq!(v["writer"]["pid"], std::process::id());
     assert_eq!(v["writer"]["alive"], true);
+    assert_eq!(keys(&v["readers_dir"]), set(&["path", "state", "error"]));
+    assert_eq!(v["readers_dir"]["state"], "listed");
     let readers = v["readers"].as_array().unwrap();
     assert_eq!(readers.len(), 1);
     assert_eq!(
@@ -204,8 +265,11 @@ fn json_schema_is_stable() {
             "state",
             "pid",
             "next_seq",
+            "durable_only",
+            "seek_pending",
             "lag_records",
             "lag_bytes",
+            "lag_unknown_reason",
             "unread_age_s",
             "oldest_unread_local_ts_ns",
             "updated_unix_ns",
@@ -215,11 +279,17 @@ fn json_schema_is_stable() {
     assert_eq!(readers[0]["name"], "consumer");
     assert_eq!(readers[0]["state"], "live");
     assert_eq!(readers[0]["lag_records"], 4);
-    assert_eq!(v["health"], serde_json::json!({"ok": true, "breaches": []}));
+    assert_eq!(readers[0]["durable_only"], false);
+    assert_eq!(readers[0]["lag_unknown_reason"], Value::Null);
+    assert_eq!(
+        v["health"],
+        serde_json::json!({"ok": true, "corrupt": false, "breaches": []})
+    );
 }
 
 #[test]
 fn health_exit_codes() {
+    let _serial = serial();
     let (dir, mut writer) = journal(3, true);
     let path = dir.path().to_str().unwrap();
     // Healthy thresholds.
@@ -246,12 +316,14 @@ fn health_exit_codes() {
             payload: b"x",
         })
         .unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(1100));
-    let (v, code) = status_json(&[path, "--max-checkpoint-age", "1s"]);
+    assert_eq!(status_json(&[path, "--max-checkpoint-age", "1h"]).1, 0);
+    // An hour-old checkpoint (the segment's creation time is moved back too: a checkpoint can't predate it).
+    backdate(dir.path(), Duration::from_secs(7200));
+    let (v, code) = status_json(&[path, "--max-checkpoint-age", "1h"]);
     assert_eq!(code, 3);
     assert_eq!(
         v["health"],
-        serde_json::json!({"ok": false, "breaches": [{"code": "checkpoint_age", "reader": null}]})
+        serde_json::json!({"ok": false, "corrupt": false, "breaches": [{"code": "checkpoint_age", "reader": null}]})
     );
     // Headroom.
     command()
@@ -284,6 +356,7 @@ fn health_exit_codes() {
 
 #[test]
 fn invalid_head_and_corrupt_header() {
+    let _serial = serial();
     let (dir, writer) = journal(3, false);
     drop(writer);
     let path = dir.path().to_str().unwrap();
@@ -291,12 +364,16 @@ fn invalid_head_and_corrupt_header() {
     let file = fs::OpenOptions::new().write(true).open(&segment).unwrap();
     // Damage the last record's payload: the head stops before it and reports invalid bytes.
     file.write_all_at(&[0], 64 + 2 * 1040 + 40).unwrap();
+    // Corruption, as `verify` reports it: exit 2 (not 3), with the sample on stdout.
     let (v, code) = status_json(&[path]);
-    assert_eq!(code, 3);
+    assert_eq!(code, 2);
     assert_eq!(v["head"]["end"], "invalid");
     assert_eq!(v["head"]["next_seq"], 2);
     assert_eq!(v["head"]["invalid_reason"], "record checksum mismatch");
     assert_eq!(v["health"]["breaches"][0]["code"], "head_invalid");
+    assert_eq!(v["health"]["corrupt"], true);
+    // Corruption takes precedence over a breached threshold.
+    assert_eq!(status_json(&[path, "--min-headroom", "1048576T"]).1, 2);
     // A damaged newest header is corruption.
     file.write_all_at(&[0], 0).unwrap();
     command().args(["status", path]).assert().code(2).stdout("");
@@ -383,6 +460,7 @@ fn check_exposition(text: &str) -> Vec<(String, String, f64)> {
 
 #[test]
 fn prometheus_output_is_valid() {
+    let _serial = serial();
     let tmp = tempfile::tempdir().unwrap();
     // A journal path that needs label escaping.
     let dir = tmp.path().join("we\"ird\\name");
@@ -415,20 +493,32 @@ fn prometheus_output_is_valid() {
             .2
     };
     assert_eq!(get("tickertape_head_next_seq", ""), 3.0);
+    assert_eq!(get("tickertape_up", ""), 1.0);
     assert_eq!(get("tickertape_healthy", ""), 1.0);
+    assert_eq!(get("tickertape_corrupt", ""), 0.0);
+    assert_eq!(get("tickertape_head_verified", ""), 1.0);
+    assert_eq!(get("tickertape_checkpoint_invalid", ""), 0.0);
+    assert!(get("tickertape_status_timestamp_seconds", "") > 1e9);
     assert_eq!(get("tickertape_checkpoint_present", ""), 1.0);
     assert_eq!(get("tickertape_exposure_records", ""), 0.0);
-    assert_eq!(get("tickertape_exposure_age_seconds", ""), 0.0);
+    assert_eq!(get("tickertape_exposure_estimated_age_seconds", ""), 0.0);
     assert!(get("tickertape_storage_available_bytes", "") > 0.0);
     assert_eq!(get("tickertape_writer_alive", ""), 1.0);
     assert_eq!(get("tickertape_reader_live", "r-1"), 1.0);
     assert_eq!(get("tickertape_reader_lag_records", "r-1"), 3.0);
     assert!(text.contains(r#"journal=""#) && text.contains(r#"we\"ird\\name"#));
+    // The label is the canonical path.
+    let canonical = fs::canonicalize(&dir).unwrap();
+    assert!(text.contains(&format!(
+        "journal=\"{}\"",
+        canonical.to_str().unwrap().replace('\\', "\\\\").replace('"', "\\\"")
+    )));
     drop(writer);
 }
 
 #[test]
 fn watch_output_file_and_samples() {
+    let _serial = serial();
     let (dir, writer) = journal(3, true);
     let path = dir.path().to_str().unwrap();
     let out = command()
@@ -497,6 +587,7 @@ fn watch_output_file_and_samples() {
 
 #[test]
 fn text_output() {
+    let _serial = serial();
     let (dir, writer) = journal(70, true);
     command()
         .args(["status", dir.path().to_str().unwrap()])
@@ -515,5 +606,222 @@ fn text_output() {
                 .and(predicate::str::contains("readers     none"))
                 .and(predicate::str::contains("health      ok")),
         );
+    drop(writer);
+}
+
+/// Finding 16: with --watch, a failed sample is reported and the watch goes on; a Prometheus file then says
+/// `tickertape_up 0` with a fresh timestamp instead of keeping the last good sample.
+#[test]
+fn watch_reports_failed_samples_and_continues() {
+    let _serial = serial();
+    let empty = tempfile::tempdir().unwrap();
+    let path = empty.path().to_str().unwrap();
+    let out = command()
+        .args([
+            "status",
+            path,
+            "--json",
+            "--watch",
+            "10ms",
+            "--samples",
+            "2",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let text = String::from_utf8(out.stdout).unwrap();
+    let lines: Vec<Value> = text
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 2);
+    for line in &lines {
+        assert_eq!(
+            keys(line),
+            set(&["schema_version", "journal", "sampled_unix_ns", "error"])
+        );
+        assert_eq!(line["error"]["code"], "not_found");
+        assert!(
+            line["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("no journal segments")
+        );
+    }
+    command()
+        .args(["status", path, "--watch", "10ms", "--samples", "2"])
+        .assert()
+        .code(0)
+        .stdout(predicate::str::contains("error       no journal segments").count(2));
+
+    // A journal whose sample fails after a good one: the file is replaced by `up 0`.
+    let (dir, writer) = journal(3, true);
+    let outdir = tempfile::tempdir().unwrap();
+    let target = outdir.path().join("t.prom");
+    command()
+        .args([
+            "status",
+            dir.path().to_str().unwrap(),
+            "--format",
+            "prometheus",
+            "--output",
+        ])
+        .arg(&target)
+        .assert()
+        .code(0);
+    assert!(
+        fs::read_to_string(&target)
+            .unwrap()
+            .contains("tickertape_up{")
+    );
+    drop(writer);
+    let segment = dir.path().join("00000000000000000000.tape");
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&segment)
+        .unwrap()
+        .write_all_at(&[0], 0)
+        .unwrap();
+    command()
+        .args([
+            "status",
+            dir.path().to_str().unwrap(),
+            "--format",
+            "prometheus",
+            "--output",
+        ])
+        .arg(&target)
+        .assert()
+        .code(2);
+    let text = fs::read_to_string(&target).unwrap();
+    let samples = check_exposition(&text);
+    let names: Vec<&str> = samples.iter().map(|(n, _, _)| n.as_str()).collect();
+    assert_eq!(
+        names,
+        ["tickertape_status_timestamp_seconds", "tickertape_up"]
+    );
+    assert_eq!(samples[1].2, 0.0);
+    assert!(samples[0].2 > 1e9);
+    assert_eq!(fs::read_dir(outdir.path()).unwrap().count(), 1);
+}
+
+/// Finding 17: the journal is identified by its canonical path, however it was typed.
+#[test]
+fn journal_is_the_canonical_path() {
+    let _serial = serial();
+    let (dir, writer) = journal(1, true);
+    let parent = dir.path().parent().unwrap();
+    let name = dir.path().file_name().unwrap().to_str().unwrap();
+    let out = command()
+        .current_dir(parent)
+        .args(["status", &format!("./{name}"), "--json"])
+        .output()
+        .unwrap();
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        v["journal"],
+        fs::canonicalize(dir.path()).unwrap().to_str().unwrap()
+    );
+    drop(writer);
+}
+
+/// Finding 10: a checkpoint marker the writer refuses is corruption (exit 2), whatever else is healthy.
+#[test]
+fn dangling_checkpoint_exits_2() {
+    let _serial = serial();
+    let (dir, writer) = journal(130, true);
+    drop(writer);
+    let mut segments: Vec<_> = fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|e| e == "tape"))
+        .collect();
+    segments.sort();
+    fs::remove_file(segments.last().unwrap()).unwrap();
+    let (v, code) = status_json(&[dir.path().to_str().unwrap()]);
+    assert_eq!(code, 2);
+    assert_eq!(v["checkpoint"]["problem"], "missing_segment");
+    assert_eq!(v["exposure"]["records"], Value::Null);
+    assert_eq!(
+        v["health"]["breaches"],
+        serde_json::json!([{"code": "checkpoint_invalid", "reader": null}])
+    );
+    command()
+        .args(["status", dir.path().to_str().unwrap()])
+        .assert()
+        .code(2)
+        .stdout(predicate::str::contains("CORRUPT: checkpoint_invalid"));
+}
+
+/// Findings 12 and 18: a modification time in the future is an unknown age (named as such, not "no checkpoint"),
+/// which breaches --max-checkpoint-age when records are uncovered.
+#[test]
+fn unreliable_checkpoint_time() {
+    let _serial = serial();
+    let (dir, mut writer) = journal(3, true);
+    writer
+        .append(&NewRecord {
+            schema_id: 1,
+            venue_ts_ns: 0,
+            local_ts_ns: 0,
+            payload: b"x",
+        })
+        .unwrap();
+    let marker = fs::OpenOptions::new()
+        .write(true)
+        .open(dir.path().join("checkpoint"))
+        .unwrap();
+    marker
+        .set_modified(SystemTime::now() + Duration::from_secs(3600))
+        .unwrap();
+    let path = dir.path().to_str().unwrap();
+    let (v, code) = status_json(&[path, "--max-checkpoint-age", "1d"]);
+    assert_eq!(code, 3);
+    assert_eq!(v["checkpoint"]["estimated_age_s"], Value::Null);
+    assert_eq!(
+        v["checkpoint"]["age_unknown_reason"],
+        "modification_time_in_future"
+    );
+    command().args(["status", path]).assert().code(0).stdout(
+        predicate::str::contains("unknown (the marker's modification time is in the future)")
+            .and(predicate::str::contains("no checkpoint").not()),
+    );
+    drop(writer);
+}
+
+/// Finding 3: a FIFO in place of the marker fails the sample (exit 1) instead of hanging.
+#[test]
+fn fifo_marker_does_not_hang() {
+    let _serial = serial();
+    let (dir, writer) = journal(3, false);
+    drop(writer);
+    fs::remove_file(dir.path().join("checkpoint")).unwrap();
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(dir.path().join("checkpoint"))
+            .status()
+            .unwrap()
+            .success()
+    );
+    command()
+        .args(["status", dir.path().to_str().unwrap()])
+        .timeout(Duration::from_secs(30))
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("not a regular file"));
+}
+
+/// Finding 7: a beacon directory that can't be listed is reported, without failing the sample.
+#[test]
+fn unusable_readers_directory() {
+    let _serial = serial();
+    let (dir, writer) = journal(3, true);
+    fs::write(dir.path().join("readers"), b"not a directory").unwrap();
+    let (v, code) = status_json(&[dir.path().to_str().unwrap()]);
+    assert_eq!(code, 0);
+    assert_eq!(v["readers_dir"]["state"], "unusable");
+    assert!(v["readers_dir"]["error"].is_string());
+    assert_eq!(v["readers"], serde_json::json!([]));
+    assert_eq!(v["head"]["next_seq"], 3);
     drop(writer);
 }

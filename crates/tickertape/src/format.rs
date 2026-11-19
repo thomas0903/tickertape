@@ -287,23 +287,28 @@ pub fn decode_checkpoint(file: &[u8]) -> Option<CheckpointSlot> {
         .into_iter()
         .filter_map(|offset| {
             let end = (offset as u64).checked_add(CHECKPOINT_SLOT_LEN as u64)?;
-            let buf = file.get(offset..usize::try_from(end).ok()?)?;
-            if buf[..8] != CHECKPOINT_MAGIC
-                || read_u16(buf, 8) != Some(FORMAT_VERSION)
-                || buf[10..16].iter().chain(&buf[48..60]).any(|&b| b != 0)
-                || read_u32(buf, 60) != Some(crate::crc::crc32c(&buf[..60]))
-            {
-                return None;
-            }
-            Some(CheckpointSlot {
-                generation: read_u64(buf, 16)?,
-                next_seq: read_u64(buf, 24)?,
-                segment_base_seq: read_u64(buf, 32)?,
-                offset: read_u64(buf, 40)?,
-            })
+            decode_checkpoint_slot(file.get(offset..usize::try_from(end).ok()?)?)
         })
         // `max_by_key` returns the last of equal maxima: on a tie the slot at 65,536 wins (docs/format.md).
         .max_by_key(|slot| slot.generation)
+}
+
+/// Decodes one 64-byte checkpoint slot; `None` if it is not valid (or not 64 bytes long).
+pub(crate) fn decode_checkpoint_slot(buf: &[u8]) -> Option<CheckpointSlot> {
+    if buf.len() != CHECKPOINT_SLOT_LEN
+        || buf[..8] != CHECKPOINT_MAGIC
+        || read_u16(buf, 8) != Some(FORMAT_VERSION)
+        || buf[10..16].iter().chain(&buf[48..60]).any(|&b| b != 0)
+        || read_u32(buf, 60) != Some(crate::crc::crc32c(&buf[..60]))
+    {
+        return None;
+    }
+    Some(CheckpointSlot {
+        generation: read_u64(buf, 16)?,
+        next_seq: read_u64(buf, 24)?,
+        segment_base_seq: read_u64(buf, 32)?,
+        offset: read_u64(buf, 40)?,
+    })
 }
 
 /// Read access to one segment: an in-memory image (`[u8]`), the `pread`-based reader (which copies), or the

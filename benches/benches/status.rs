@@ -4,7 +4,6 @@
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
 use std::path::Path;
-use std::time::Duration;
 use tickertape::status::{self, ReaderBeacon, Sampler};
 use tickertape::{NewRecord, Reader, ReaderConfig, Writer, WriterConfig};
 
@@ -72,20 +71,14 @@ fn status_costs(c: &mut Criterion) {
     group.bench_function("Reader::cursor", |b| b.iter(|| black_box(reader.cursor())));
     let snapshot = status::status(dir.path()).expect("status");
     group.bench_function("Status::lag", |b| {
-        b.iter(|| black_box(snapshot.lag(black_box(reader.cursor()))));
+        b.iter(|| black_box(snapshot.lag(&black_box(reader.cursor()))));
     });
     let mut beacon = ReaderBeacon::create(dir.path(), "bench", &reader).expect("beacon");
     group.bench_function("ReaderBeacon::update (position unchanged)", |b| {
         b.iter(|| black_box(beacon.update(&reader).expect("update")));
     });
-    beacon.set_interval(Duration::ZERO);
-    let mut seq = 0u64;
-    group.bench_function("ReaderBeacon::update_position (writes)", |b| {
-        b.iter(|| {
-            seq += 1;
-            let position = status::Position::new(seq, 0, 64);
-            black_box(beacon.update_position(position).expect("update"))
-        });
+    group.bench_function("ReaderBeacon::flush (writes)", |b| {
+        b.iter(|| beacon.flush(&reader).expect("flush"));
     });
     group.finish();
     drop(beacon);

@@ -553,9 +553,17 @@ impl Reader {
 }
 
 impl Reader {
-    /// For [`Reader::cursor`] (`status.rs`): the position, the current segment's path and the cursor's offset.
-    pub(crate) fn cursor_parts(&self) -> (u64, &Path, u64) {
-        (self.position(), &self.seg.path, self.offset)
+    /// For [`Reader::cursor`] and reader beacons (`status.rs`): the cursor and the segment file it is in.
+    pub(crate) fn cursor_parts(&self) -> crate::status::CursorParts<'_> {
+        crate::status::CursorParts {
+            slot_seq: self.next_seq,
+            skip_until: self.skip_until,
+            path: &self.seg.path,
+            offset: self.offset,
+            file: &self.seg.file,
+            identity: self.seg.identity,
+            durable_only: self.config.durable_only,
+        }
     }
 }
 

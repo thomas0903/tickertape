@@ -102,6 +102,14 @@ pub enum Error {
     /// A configuration value is out of range.
     #[error("invalid configuration: {0}")]
     InvalidConfig(String),
+
+    /// A reader beacon with this name is held by a running reader (or a process that inherited its descriptor), so
+    /// [`ReaderBeacon::create`](crate::status::ReaderBeacon::create) won't take the name.
+    #[error("reader beacon {} is held by a running reader", path.display())]
+    BeaconInUse {
+        /// The beacon file.
+        path: PathBuf,
+    },
 }
 
 impl Error {

@@ -180,13 +180,30 @@ fn destination(dir: &Path, path: &Path) -> Result<File> {
     Ok(file)
 }
 
+/// Fails if a file in the journal directory tree is the output file (a hard link). Entries that disappear during the
+/// walk (a reader beacon dropped, a segment archived) and subdirectories that can't be listed (another user's
+/// `readers/`) are skipped; v0.4.0 failed on both. The journal directory itself must be listable.
 fn reject_alias(dir: &Path, dev: u64, ino: u64) -> Result<()> {
     let mut pending = vec![dir.to_path_buf()];
+    let mut top = true;
     while let Some(dir) = pending.pop() {
-        for entry in fs::read_dir(dir).map_err(|e| output::io_error("list journal entries", e))? {
-            let entry = entry.map_err(|e| output::io_error("read journal entry", e))?;
-            let metadata = fs::symlink_metadata(entry.path())
-                .map_err(|e| output::io_error("stat journal entry", e))?;
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if !top && is_skippable(&e) => continue,
+            Err(e) => return Err(output::io_error("list journal entries", e)),
+        };
+        top = false;
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) if is_skippable(&e) => continue,
+                Err(e) => return Err(output::io_error("read journal entry", e)),
+            };
+            let metadata = match fs::symlink_metadata(entry.path()) {
+                Ok(metadata) => metadata,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(output::io_error("stat journal entry", e)),
+            };
             if metadata.dev() == dev && metadata.ino() == ino {
                 return Err(Failure::usage("export output aliases a journal file"));
             }
@@ -198,9 +215,40 @@ fn reject_alias(dir: &Path, dev: u64, ino: u64) -> Result<()> {
     Ok(())
 }
 
+/// A subdirectory that vanished or can't be read.
+fn is_skippable(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::NotFound
+            | std::io::ErrorKind::PermissionDenied
+            | std::io::ErrorKind::NotADirectory
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A subdirectory that can't be listed doesn't fail the alias check (ADR 0032: beacon directories of other users).
+    #[test]
+    fn alias_walk_skips_unreadable_subdirectories() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let locked = dir.path().join("readers");
+        fs::create_dir(&locked).unwrap();
+        fs::write(dir.path().join("file"), b"x").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        let readable = fs::read_dir(&locked).is_ok(); // true when running as root
+        let result = reject_alias(dir.path(), 0, 0);
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            result.is_ok() || readable,
+            "{:?}",
+            result.err().map(|f| f.message)
+        );
+        let meta = fs::metadata(dir.path().join("file")).unwrap();
+        assert!(reject_alias(dir.path(), meta.dev(), meta.ino()).is_err());
+    }
     use std::io;
     use tickertape::{NewRecord, Writer, WriterConfig};
 
