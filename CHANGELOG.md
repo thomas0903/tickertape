@@ -12,7 +12,9 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   A reader at a seal whose segment and successor were both removed returned `CorruptReason::BrokenChain`; it now
   returns `Error::Discarded` (a missing successor while the reader's segment is still in place is still a broken
   chain). `inspect::list_segments` and `inspect::verify` (CLI `inspect`, `verify`) skip segments removed while they
-  run instead of failing, and `verify` no longer reports a problem when the writer rolls during the scan. New
+  run instead of failing, and `verify` no longer reports a problem when the writer rolls during the scan. Readers and
+  inspection also list again when a directory listing of a live journal comes back empty (on btrfs a listing omits
+  segments created after it started, so concurrent retention could make it miss all of them). New
   fault-injection hook points (`fault::run_at`) and a stress test with `max_segments(2)` retention cover this.
 - Benchmarks: the test of a lagging reader under retention no longer depends on machine speed (it failed on
   macOS CI runners), and `tt-sustained` readers retry a seek when retention removes the segment they were about to

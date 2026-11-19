@@ -41,6 +41,9 @@ pub enum Point {
     /// After inspection (`inspect::list_segments`, `inspect::verify`) lists the segments, before it opens each one.
     /// Arm with [`run_at`].
     InspectOpen,
+    /// After `inspect::verify` finds the newest listed segment sealed, before it looks for the successor. Arm with
+    /// [`run_at`].
+    InspectSeal,
 }
 
 #[cfg(feature = "fault-injection")]

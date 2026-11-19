@@ -30,7 +30,8 @@ pub struct SegmentInfo {
 /// Lists the segments in `dir`, oldest first, with their decoded headers.
 ///
 /// A segment that retention (or writer recovery) removes between the directory listing and the opening of its file is
-/// not an error: the directory is listed again, so the result leaves it out.
+/// not an error: the directory is listed again, so the result leaves it out. So is a listing that comes back empty on
+/// a live journal (btrfs omits entries created after a listing starts).
 ///
 /// # Errors
 ///
@@ -63,14 +64,25 @@ fn open_listed(path: &Path, last: bool) -> Result<Option<File>> {
     }
 }
 
+/// Lists the segment files. `Ok(None)` if there are none, unless this is the `last` attempt ([`Error::NotFound`]):
+/// on a live journal a directory read can come back empty, because btrfs returns only entries that existed when the
+/// directory was opened and still exist when it is read.
+fn list_nonempty(dir: &Path, last: bool) -> Result<Option<Vec<(u64, PathBuf)>>> {
+    let segments = journal::list_segments(dir)?;
+    match (segments.is_empty(), last) {
+        (false, _) => Ok(Some(segments)),
+        (true, false) => Ok(None),
+        (true, true) => Err(Error::NotFound {
+            dir: dir.to_path_buf(),
+        }),
+    }
+}
+
 /// One attempt at [`list_segments`]: `Ok(None)` if a listed segment disappeared.
 fn list_once(dir: &Path, last: bool) -> Result<Option<Vec<SegmentInfo>>> {
-    let segments = journal::list_segments(dir)?;
-    if segments.is_empty() {
-        return Err(Error::NotFound {
-            dir: dir.to_path_buf(),
-        });
-    }
+    let Some(segments) = list_nonempty(dir, last)? else {
+        return Ok(None);
+    };
     let mut out = Vec::with_capacity(segments.len());
     for (base, path) in segments {
         let Some(file) = open_listed(&path, last)? else {
@@ -199,15 +211,12 @@ pub fn verify(dir: impl AsRef<Path>) -> Result<VerifyReport> {
     }
 }
 
-/// One attempt at [`verify`]: `Ok(None)` if a listed segment disappeared other than from the oldest end, or the
-/// newest listed segment did.
+/// One attempt at [`verify`]: `Ok(None)` if the listing was empty, or a listed segment disappeared other than from
+/// the oldest end, or the newest listed segment did.
 fn verify_once(dir: &Path, last: bool) -> Result<Option<VerifyReport>> {
-    let segments = journal::list_segments(dir)?;
-    if segments.is_empty() {
-        return Err(Error::NotFound {
-            dir: dir.to_path_buf(),
-        });
-    }
+    let Some(segments) = list_nonempty(dir, last)? else {
+        return Ok(None);
+    };
     let mut report = VerifyReport {
         segments: Vec::new(),
         records: 0,
@@ -295,15 +304,22 @@ fn verify_once(dir: &Path, last: bool) -> Result<Option<VerifyReport>> {
             ScanEnd::Seal => {
                 seg.used_bytes += format::SEAL_LEN as u64;
                 seg.end = SegmentEnd::Sealed;
-                // Unless the writer rolled after the listing, the successor exists now.
-                if newest
-                    && journal::path_identity(&journal::segment_path(dir, scan.next_seq)).is_none()
-                {
-                    report.problems.push(Problem {
-                        path: path.clone(),
-                        offset: scan.end_offset,
-                        reason: CorruptReason::BrokenChain(scan.next_seq),
-                    });
+                // A sealed newest segment is a problem only if its successor is missing while it is still in
+                // place: if the writer rolled after the listing the successor exists now, and if retention has
+                // since removed both (oldest first), this segment is gone too.
+                if newest {
+                    crate::fault::hook(crate::fault::Point::InspectSeal);
+                    let successor = journal::segment_path(dir, scan.next_seq);
+                    if journal::path_identity(&successor).is_none()
+                        && journal::path_identity(&path)
+                            == Some(journal::file_identity(&file, &path)?)
+                    {
+                        report.problems.push(Problem {
+                            path: path.clone(),
+                            offset: scan.end_offset,
+                            reason: CorruptReason::BrokenChain(scan.next_seq),
+                        });
+                    }
                 }
             }
             ScanEnd::Empty if newest => seg.end = SegmentEnd::Open,
