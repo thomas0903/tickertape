@@ -27,8 +27,10 @@ Sustained runs last 10 minutes each and a full session about a day, so they run 
 `benches/session.py`, which runs the tickertape scenarios (`tt-sustained`) and the sustained comparison
 (`compare/README.md`, "Sustained mode") and keeps everything in one output directory.
 
-1. **Machine.** Note the instance type, region and whether it is bare metal or a VM. Use local NVMe or the volume you
-   want to measure, formatted without lazy initialisation (ext4: `mkfs.ext4 -E lazy_itable_init=0,lazy_journal_init=0`;
+1. **Machine.** Cloud measurements run on Google Cloud VMs with local SSD (roadmap, owner decisions of 2026-11-19);
+   label them as cloud VMs, never bare metal. Note the machine type, zone and local SSD count, since the environment
+   capture only sees the DMI product name. Use the local SSD or the volume you want to measure, formatted without
+   lazy initialisation (ext4: `mkfs.ext4 -E lazy_itable_init=0,lazy_journal_init=0`;
    ADR 0025 found a fresh lazily initialised ext4 volume confounding). Mount it, create a directory on it for
    `--journal-dir`, and keep `--out` on another filesystem if possible (e.g. the root volume).
 2. **Software.** Rust (the repository's `rust-toolchain.toml`), Python 3.9+, Java 21 and Maven (set `JAVA_HOME`), at a
@@ -43,8 +45,8 @@ Sustained runs last 10 minutes each and a full session about a day, so they run 
    `python3 benches/session.py --journal-dir /mnt/test/tt --out ~/session-full --yes`.
    If it is interrupted (or a run fails), run the same command again: finished runs are skipped, partial output and
    scratch data are removed, and the manifest records every session.
-6. **Keep the raw output.** Copy the whole `--out` directory off the machine before terminating it (results,
-   series, environment, commands, logs). Delete the cloud resources afterwards.
+6. **Keep the raw output.** Copy the whole `--out` directory off the machine before deleting it (results, series,
+   environment, commands, logs); local SSD contents do not survive the VM. Delete the cloud resources afterwards.
 7. **Record** in `docs/benchmarks.md` as for other runs: environment (from `environment.txt`), the session command,
    commit, the tables with units and percentiles as printed, achieved rates and late sends, reader lag, CPU, the
    durability and wait settings of each scenario, and how coordinated omission was handled. Report visibility-only
