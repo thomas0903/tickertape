@@ -112,6 +112,16 @@ Choosing segment sizes and checkpoint intervals, archiving old segments and what
 [`docs/operations.md`](docs/operations.md).
 For direct, read-only access from Python without dependencies, see [`python/`](python/README.md).
 
+## iceoryx2 integration
+
+[`integrations/iceoryx2`](integrations/iceoryx2/README.md) records one or several
+[iceoryx2](https://github.com/eclipse-iceoryx/iceoryx2) publish/subscribe services into a journal. Any tickertape
+reader follows the recording live without iceoryx2, `tickertape-iox2 replay` publishes it back onto iceoryx2 (renamed
+by default, at the recorded pace or as fast as possible), `tickertape export` writes it to Parquet, and
+`tickertape-iox2 export`/`import` convert to and from iceoryx2's own recording files. It is a separate crate with its
+own version (0.1.0, not yet published) and lockfile; its quick start and the byte layout of its records are in its
+README. Why iceoryx2: [ADR 0030](docs/decisions/0030-iceoryx2-integration.md).
+
 ## Guarantees, in short
 
 The full statement, per platform and with the test for each claim, is [`docs/crash-contract.md`](docs/crash-contract.md).
@@ -148,7 +158,7 @@ own documentation for the current state.
 |---|---|---|
 | [Chronicle Queue](https://github.com/OpenHFT/Chronicle-Queue) | Mature Java persisted queue (open-source core) | Its Rust library is part of the commercial Enterprise edition and [requires a licence key](https://rustdoc.chronicle.software/chronicle/queue/index.html) |
 | [Aeron](https://aeron.io/) and [Aeron Archive](https://aeron.io/docs/aeron-archive/overview/) | Messaging transport with recording, replay and replication; Rust clients exist (e.g. [rusteron](https://crates.io/crates/rusteron-archive)) | Runs a separate media driver and covers networking and replication; much larger scope |
-| [iceoryx2](https://github.com/eclipse-iceoryx/iceoryx2) | Zero-copy shared-memory IPC in Rust | Live publish/subscribe; a retained, replayable file journal is not its focus. Could feed a tickertape recorder |
+| [iceoryx2](https://github.com/eclipse-iceoryx/iceoryx2) | Zero-copy shared-memory IPC in Rust | Live publish/subscribe; its own recorder writes one service per file, with no live readers of the recording. [`tickertape-iceoryx2`](integrations/iceoryx2/README.md) records iceoryx2 services into a tickertape journal and replays them |
 | [yaque](https://crates.io/crates/yaque), [queue-file](https://crates.io/crates/queue-file) | Disk-backed queues / FIFO files in Rust | Queue semantics (consume once) rather than independent readers replaying from any position |
 | [commitlog](https://crates.io/crates/commitlog), [okaywal](https://crates.io/crates/okaywal) | Rust append-only log and write-ahead log | Storage building blocks without a cross-process live-reader API |
 | [Databento DBN](https://github.com/databento/dbn) | Market-data encoding format with Rust and Python tooling | A data format, not a multi-reader journal; DBN records could be tickertape payloads |
@@ -159,7 +169,8 @@ Background research: [`docs/research/2026-10-31-market-review.md`](docs/research
 ## Project layout
 
 `crates/tickertape` (library) · `crates/tickertape-cli` (the `tickertape` binary) · `tests/` (cross-process and
-crash tests) · `fuzz/` · `benches/` · `examples/` · `docs/` (format, crash contract, decisions, playbooks).
+crash tests) · `fuzz/` · `benches/` · `examples/` · `integrations/iceoryx2` (separate crate) · `docs/` (format,
+crash contract, decisions, playbooks).
 Contributions: [`CONTRIBUTING.md`](CONTRIBUTING.md). Security issues: [`SECURITY.md`](SECURITY.md).
 
 ## Licence

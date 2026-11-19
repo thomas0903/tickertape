@@ -15,7 +15,9 @@ Report possible vulnerabilities privately as described in [`SECURITY.md`](SECURI
   without the change, then implement. `docs/playbooks/add-feature.md` has the checklist.
 - **`unsafe` lives in two modules.** Only `crates/tickertape/src/mmap.rs` (mappings and system calls) and
   `crates/tickertape/src/crc.rs` (CPU intrinsics, ADR 0019) may contain `unsafe` code, and every `unsafe` block needs
-  a `// SAFETY:` comment. Changes there get extra review.
+  a `// SAFETY:` comment. Changes there get extra review. Outside the core crates, the iceoryx2 integration has
+  `unsafe` in exactly one module, `integrations/iceoryx2/src/dynamic.rs`, for iceoryx2 API that is only offered as
+  `unsafe` (services whose types are known only at run time); the same rules apply there.
 - **No unverified claims.** Numbers in docs come from recorded runs (`docs/playbooks/run-benchmark.md`); guarantees
   name the test that checks them.
 
@@ -35,6 +37,18 @@ RUSTFLAGS="--cfg loom" cargo test -p tickertape --lib --release protocol_model
 
 On macOS, run the Linux checks in a VM or container too (`docs/playbooks/test-on-linux.md`), and keep test journals
 on a local filesystem (not tmpfs or a shared folder) when you test durability behaviour.
+
+The iceoryx2 integration (`integrations/iceoryx2`) is outside the workspace, with its own lockfile and MSRV (1.89).
+Its checks, run from that directory:
+
+```bash
+cargo fmt --check
+cargo clippy --all-targets --all-features --locked -- -D warnings
+cargo clippy --all-targets --no-default-features --locked -- -D warnings
+cargo test --all-features --locked
+cargo +1.89 check --all-features --all-targets --locked
+cargo-deny --manifest-path Cargo.toml --config ../../deny.toml --all-features check
+```
 
 ## Pull requests
 
