@@ -25,7 +25,8 @@ New crate names still need an initial, explicitly authorized API-token publish b
 ### PyPI (Python bindings, ADR 0029)
 
 Until these steps are done, `python-wheels.yml` builds and smoke-tests the wheels and sdist and uploads them as
-workflow artefacts, but its `publish` job is skipped. Nothing reaches PyPI without all three.
+workflow artefacts, but its `publish` job is skipped. Nothing reaches PyPI without steps 1–3; steps 4 and 5 protect
+the publishing path and must be done before step 3.
 
 1. On [pypi.org](https://pypi.org/manage/account/publishing/), signed in as the maintainer (with 2FA), add a
    **pending publisher** (it creates the project on the first upload, so no token is ever needed):
@@ -45,6 +46,16 @@ workflow artefacts, but its `publish` job is skipped. Nothing reaches PyPI witho
    (as for `release`).
 3. Add the repository variable `PYPI_PUBLISHING` with the value `enabled` (Settings → Secrets and variables →
    Actions → Variables). Delete it to switch publishing off again.
+4. Protect release tags: add a tag ruleset (Settings → Rules → Rulesets → New tag ruleset) targeting `v*` that
+   restricts creation, update and deletion to the maintainer (bypass list: repository admin only) and blocks force
+   pushes. A tag-triggered run takes its workflow files from the tagged commit, not from `main`: anyone who could
+   push a `v*` tag could point it at a commit with an edited `python-wheels.yml` or `release.yml` and publish from
+   it. The ruleset makes tags as protected as `main`.
+5. Require a reviewer for the `pypi` environment (Settings → Environments → `pypi` → Required reviewers: the
+   maintainer; also tick "Prevent self-review" if another maintainer exists). Each publish job then waits for an
+   explicit approval in the Actions UI, a last check that the run, its tag and its workflow file are the expected
+   ones. `release.py prepare` resolves only `refs/tags/<tag>` and the workflows check out the fully qualified tag, so
+   a branch named like a tag can never pass the gate.
 
 See PyPI's [Trusted Publishing documentation](https://docs.pypi.org/trusted-publishers/).
 

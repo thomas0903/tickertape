@@ -27,6 +27,8 @@ Option 2.
 and the Python package `tickertape` (`python/tickertape/`). It is excluded from the Cargo workspace and has its own
 `Cargo.lock`, like `fuzz/` and `compare/`, so PyO3 does not enter the workspace lockfile or MSRV check. It depends on
 `crates/tickertape` by path. Its version is kept equal to the workspace version; `release.py prepare` checks that.
+This is a deliberate exception to ADR 0031's rule that a binding's version follows the C ABI's version: these
+bindings use the Rust API directly, not the C ABI (see the amendment note in ADR 0031).
 
 **ABI and Python versions.** One `abi3-py311` wheel per platform serves CPython 3.11 and newer. 3.11 is the oldest
 CPython still supported upstream (3.10 reached end of life in October 2026), and the buffer protocol needed to accept
@@ -49,21 +51,37 @@ Docs present both (`docs/python.md`); the import names differ (`tickertape_reade
 
 **API.** `Writer(path, *, segment_size, recovery, notify, prefault, retention)` with `append`, `append_many`,
 `checkpoint`, `next_seq`, `recovery_report`, `retention_report`, `last_retention_error` and `close`; `Reader(path, *,
-durable_only, notify, backoff)` with `seek`, `try_next`, `next(timeout)`, iteration, `read_many`, `read_batch`,
+durable_only, notify, backoff)` with `seek`, `try_next`, `next(timeout=None)`, iteration, `read_many`, `read_batch`,
 `position` and `close`; `Backoff`, `Retention.delete(...)`/`Retention.archive(dir, ...)`; `verify`, `list_segments`
-and `read_checkpoint` returning named tuples. Both classes are context managers; `close()` is idempotent; use after
+and `read_checkpoint` returning named tuples, and the writer's reports as named tuples too (`RecoveryReport` with a
+list of `RecoveryAction`, `RetentionReport`). Both classes are context managers; `close()` is idempotent; use after
 close raises `ValueError`, as for Python files. Closing a writer does **not** checkpoint, like the Rust `Drop` and like
-closing a Python file (which flushes but does not `fsync`): visibility already happened at `append`.
+closing a Python file (which flushes but does not `fsync`): visibility already happened at `append`. `Record`,
+`Backoff` and `Retention` have value equality (returning `NotImplemented` for other types) and matching hashes.
+Runtime signatures and stubs show the real defaults: `next(timeout=None)` waits forever, `read_many`/`read_batch`
+default to `timeout=0`. Timeouts are seconds or a `timedelta`; `None`, `math.inf` and anything too large to represent
+mean forever.
+
+**Iteration.** `Reader` is an iterable, not an iterator: `iter(reader)` returns a new iterator that drains the records
+committed so far from the reader's live cursor, never waits, and stays exhausted once it stops (Python's iterator
+protocol requires that). `next(reader)` is therefore a `TypeError`, which also avoids confusing it with
+`reader.next()`, which waits. `RecordBatch` supports `len`, indexing and iteration; slicing raises `TypeError` (it may
+be added later without breaking callers).
 
 **Batches cross the boundary once.** `append_many(payloads, *, schema_id, venue_ts_ns, local_ts_ns)` takes an iterable
 of payloads and, for each metadata field, one int or a sequence of ints. Every argument is converted and checked
 before anything is appended (a bad argument appends nothing). It returns the `range` of assigned sequence numbers.
-If an append fails part-way, it raises `BatchAppendError` with `appended`, `first_seq` and `failed_index`, and the
-mapped core error as `__cause__`: `payloads[:appended]` are committed (visible, not durable), the rest are not, and
-the caller can retry `payloads[appended:]`. `read_many(max_records, *, timeout=0)` waits up to `timeout` for the first
+`payloads` must not itself be a payload: `str` and every bytes-like object raise `TypeError`. A metadata iterable
+that yields more values than there are payloads fails as soon as it does, so an endless iterator cannot exhaust
+memory. If an append fails part-way (preflight checks conversion and lengths, but a record that does not fit or a full
+disk can still fail it), it raises `BatchAppendError` with `appended`, `first_seq` and `failed_index`, and the mapped
+core error as `__cause__`: `payloads[:appended]` are committed (visible, not durable), the rest are not. To retry, the
+caller slices the payloads and every per-record metadata sequence at `failed_index`, so a caller who may retry keeps
+replayable sequences rather than one-shot iterators. The returned `range` is built from Python ints when sequence
+numbers exceed `isize` (from 2**63). `read_many(max_records, *, timeout=0)` waits up to `timeout` for the first
 record (`None`: forever), then returns what is already committed, up to `max_records`. If an error occurs after it
-has read some records, it returns those and raises the error on the next read (`seek` clears it), so neither the
-records nor the error are lost. `read_batch` has the same semantics and returns a columnar `RecordBatch`.
+has read some records, it returns those and raises the error on the next read (a successful `seek` clears it; a
+failed one leaves it), so neither the records nor the error are lost. `read_batch` has the same semantics and returns a columnar `RecordBatch`.
 
 **Columnar batches.** A `RecordBatch` holds six immutable `bytes` objects: little-endian `seq`, `schema_id`,
 `venue_ts_ns`, `local_ts_ns` and Arrow `large_binary` payload offsets and data. `numpy.frombuffer` and
@@ -73,8 +91,10 @@ none is a dependency. We do not implement the buffer protocol or the Arrow PyCap
 `unsafe` (raw `Py_buffer` or `ArrowArray` structs) or a large Arrow dependency, for no gain over `bytes`, which already
 export the buffer protocol. The PyCapsule interface is a possible follow-up through a vetted crate.
 
-**Copies and lifetimes.** `append` borrows a `bytes` payload without copying it (bytes are immutable) and copies other
-buffers once, because they could change while the GIL is released; the writer then copies the payload into the
+**Copies and lifetimes.** Payloads are `bytes` or buffers of unsigned bytes only (item format `B`: `bytearray`,
+`memoryview`, `array('B')`, `uint8` NumPy arrays); other item types such as `array('b')` or `int8` arrays raise
+`TypeError` rather than being reinterpreted. `append` borrows a `bytes` payload without copying it (bytes are
+immutable) and copies other buffers once, because they could change while the GIL is released; the writer then copies the payload into the
 segment. Every `Record` owns its payload as a `bytes` object, valid after the reader moves on or closes. The
 binding uses only the safe `pread` reader. `Reader::open_mapped` is not exposed: its precondition (only a tickertape
 writer modifies the files) cannot be checked from Python, a `SIGBUS` would kill the interpreter, and records must be
@@ -82,23 +102,51 @@ copied into `bytes` anyway, so it would save little.
 
 **GIL, threads and signals.** The GIL is released for `Writer` open (recovery), `checkpoint`, `close`, the append
 loop of `append_many`, the read loops of `read_many`/`read_batch`, `seek`, inspection, and every wait. A single
-`append` or `try_next` keeps the GIL (it is shorter than releasing it, except during a segment roll). Waits run in
-slices of at most 50 ms; between slices the binding calls `PyErr_CheckSignals`, so Ctrl-C raises `KeyboardInterrupt`
-within about 50 ms and consumes no record. `Writer` and `Reader` may be used from any thread: each holds its core
-object in a mutex, acquired without holding the GIL, so concurrent calls on one object serialize. A reader is a cursor,
-so share one between threads only if they coordinate; use one reader per consumer.
+`append` or `try_next` keeps the GIL (it is shorter than releasing it, except during a segment roll). `Writer` and
+`Reader` may be used from any thread: each holds its core object in a mutex, acquired without holding the GIL, so
+concurrent calls on one object serialize. The mutex is never held while Python code runs: exceptions, reports and
+records are converted to Python objects after it is released. `closed`, `Reader.position` and `repr` read atomics and
+never wait.
+
+Waits run in slices of at most 50 ms, and a waiting read holds its reader's mutex only during a slice. Between slices
+it checks a closed flag and calls `PyErr_CheckSignals` with the mutex released, so Ctrl-C raises `KeyboardInterrupt`
+within about 50 ms, signal handlers may use the reader without deadlocking, and `close()` from another thread or a
+handler ends the read with `ValueError` within a slice. Reads from several threads on one reader interleave between
+slices and share its cursor: each record is returned to exactly one caller. A reader is a cursor, so share one between
+threads only if they coordinate; use one reader per consumer.
+
+Records cross into Python in two steps: they are copied from the journal into a buffer in the reader, then, after the
+signal check, taken out and converted. If a signal handler raises, the buffered records stay and the next read returns
+them first, so a record is never skipped because of an interrupt that arrives before the read returns. A signal that
+arrives after the binding has returned, before Python stores the result, is handled by the interpreter as after any
+call, and the result is lost; no binding can prevent that, and the documentation says so.
+
+**Fork.** A handle records the id of the process that opened it. In any other process (a child created by `fork`,
+which `multiprocessing` uses by default on Linux before Python 3.14), every method raises `UsedAfterForkError`
+before taking a lock or touching the journal: the child's copy shares the parent's mappings, descriptors and writer
+lock but not its helper threads, so using it could overwrite the parent's records or fail to join threads. `close()`,
+`__exit__` and garbage collection in such a process only mark the copy closed and leak it (`mem::forget`), never
+releasing the lock or joining threads. Handles must be opened after forking, or the `spawn`/`forkserver` start method
+used.
 
 **Errors.** Exceptions are defined in Python (`tickertape/_errors.py`) so they can also derive from built-ins:
 `TickertapeError` is the base; `JournalIOError` (also `OSError`, with `errno`, `filename`, `op`, `storage_full`) and
 its subclass `StorageFullError`; `LockedError`; `CorruptJournalError` (`path`, `offset`, a stable `reason` code for
 each `CorruptReason`, `details`); `UnsupportedVersionError`; `JournalNotFoundError`; `SeqUnavailableError` (also
 `LookupError`); `RecordTooLargeError` and `InvalidConfigError` (also `ValueError`); `DurabilityLostError`;
-`SequenceExhaustedError`; `DiscardedError`; `BatchAppendError`. Both core enums are `#[non_exhaustive]`, so the
-compiler cannot flag a new variant; a test parses `crates/tickertape/src/error.rs` and fails if any variant is missing
-from the binding's mapping tables. Unmapped variants would still raise `TickertapeError` (reason `"unknown"`).
+`SequenceExhaustedError`; `DiscardedError`; `BatchAppendError`; and `UsedAfterForkError` for the binding's own fork
+check. Every documented attribute survives `pickle` (`TickertapeError.__reduce__` rebuilds from the message and
+fields, because `OSError` keeps `errno`, `strerror` and `filename` outside `__dict__`); `strerror` is the OS message
+without Rust's `(os error N)` suffix. Both core enums are `#[non_exhaustive]`, so the compiler cannot flag a new
+variant. A Python test parses `crates/tickertape/src/error.rs` and fails if a variant is missing from the binding's
+tables; Rust unit tests in the bindings crate convert an instance of every listed `Error` and `CorruptReason` variant
+and fail if one does not map as listed. The same pair of checks covers `RecoveryAction` kinds and `SegmentEnd` codes.
+Unmapped variants would still raise `TickertapeError` (reason `"unknown"`).
 
 **Durability.** Unchanged and stated as in the crash contract: visible when `append` returns, durable when a later
 `checkpoint` returns; `Reader(durable_only=True)` returns only records below the checkpoint marker's `next_seq`.
+Including the contract's caveat: after a failed checkpoint, records appended before it may not be durable even if a
+writer opened later in the same boot checkpoints successfully.
 
 **Typing.** `_native.pyi` and `py.typed` ship in the wheel. CI runs `mypy --strict` and `mypy.stubtest` against the
 built module.
@@ -126,5 +174,8 @@ requests or branches. The one-time setup is in `docs/playbooks/release-checklist
 - A second lockfile to keep up to date; CI runs `cargo deny` on it too.
 - Not covered: free-threaded wheels, Windows, PyPy, Arrow PyCapsule export, live zero-copy access.
 - Tests: `bindings/python/tests/` (pytest) cover round trips, batches and partial failure, live following across
-  processes, durable-only reads, rolls, corruption, Ctrl-C, context managers, the writer lock and cross-language
-  fixtures against the Rust CLI and the pure-Python decoder.
+  processes, durable-only reads, rolls, corruption, Ctrl-C (including a record arriving during the interrupted wait),
+  signal handlers that use or close the reader, cross-thread `close()`, threads sharing a writer or a reader, use
+  after `fork`, timeouts, pickling of every exception, context managers, the writer lock and cross-language fixtures
+  against the Rust CLI and the pure-Python decoder. `cargo test --manifest-path bindings/python/Cargo.toml` runs the
+  conversion unit tests.

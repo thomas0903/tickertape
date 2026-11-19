@@ -25,15 +25,25 @@ The design decisions are in [ADR 0029](decisions/0029-python-bindings.md). In br
 
 - **Visible versus durable** is exactly as in the crash contract: visible when `append` returns, durable when a later
   `checkpoint()` returns. Closing a writer does not checkpoint. `Reader(durable_only=True)` returns only checkpointed
-  records.
-- **Copies.** Every record returned to Python owns its payload as `bytes`. Batch columns are `bytes` objects that
-  NumPy and pyarrow wrap without another copy. There is no live zero-copy access; the mapped Rust reader is not
-  exposed.
-- **Batches cross the language boundary once.** `append_many` checks all arguments first, then appends; on a failure
-  part-way it raises `BatchAppendError` saying how many records were appended and from which sequence number.
-  `read_many` and `read_batch` wait for the first record (up to a timeout), then return what is already committed.
-- **Threads and signals.** Blocking calls release the GIL and wake at least every 50 ms to check for signals, so
-  Ctrl-C works during a wait. Objects can be shared between threads; calls on one object are serialized.
+  records. After a failed checkpoint, records appended before it may not be durable even if a writer opened later in
+  the same boot checkpoints successfully.
+- **Copies.** Payloads are `bytes` or buffers of unsigned bytes (uint8 only). Every record returned to Python owns its
+  payload as `bytes`. Batch columns are `bytes` objects that NumPy and pyarrow wrap without another copy. There is no
+  live zero-copy access; the mapped Rust reader is not exposed.
+- **Batches cross the language boundary once.** `append_many` converts and checks all arguments first, then appends;
+  on a failure part-way it raises `BatchAppendError` saying how many records were appended and from which sequence
+  number. To retry, slice the payloads and every per-record metadata sequence at `failed_index`, so keep them in
+  sequences rather than one-shot iterators. `read_many` and `read_batch` wait for the first record (up to a timeout,
+  default 0), then return what is already committed.
+- **Iteration.** `for record in reader` drains the records committed so far without waiting; each `iter(reader)` is a
+  new iterator that stays exhausted once it stops. `reader.next(timeout=None)` waits.
+- **Threads and signals.** Blocking calls release the GIL and wake at least every 50 ms to check for signals with the
+  reader's lock released, so Ctrl-C works during a wait and signal handlers may use the reader. A record already
+  taken from the journal when a handler raises is returned by the next read, not skipped. Objects can be shared
+  between threads; a waiting read holds its reader for at most 50 ms at a time, and `close()` from another thread
+  ends it with `ValueError`.
+- **Fork.** Handles belong to the process that opened them; in a forked child they raise `UsedAfterForkError`. Open
+  them after forking, or use the `spawn` start method of `multiprocessing`.
 
 ### End-to-end example
 

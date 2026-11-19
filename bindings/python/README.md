@@ -24,12 +24,17 @@ with tt.Writer("/tmp/journal") as writer:
     writer.checkpoint()  # durable, not only visible
 
 with tt.Reader("/tmp/journal") as reader:
-    for record in reader:  # the records committed so far
+    for record in reader:  # the records committed so far; doesn't wait
         print(record.seq, record.schema_id, record.payload)
     reader.seek(2)
     batch = reader.read_many(1000)  # up to 1000 records, one call
     live = reader.next(timeout=5.0)  # waits for the writer (Ctrl-C works), None on timeout
 ```
+
+`iter(reader)` returns a new iterator over the records committed so far. It never waits, and once it stops it stays
+exhausted; a later `for` loop over the reader starts a new iterator at the reader's current position. To follow the
+writer, call `reader.next(timeout=...)` (default `None`: wait forever) or `read_many`/`read_batch` with a timeout.
+The reader itself is not an iterator: `next(reader)` raises `TypeError`.
 
 A complete example, with a live follower in a second process and a hand-off to pandas and DuckDB, is
 [`examples/end_to_end.py`](https://github.com/thomas0903/tickertape/blob/main/bindings/python/examples/end_to_end.py).
@@ -42,16 +47,35 @@ A record is **visible** to readers, and survives the writer process dying, as so
 `checkpoint()` returns. Closing a writer does not checkpoint. Readers that must never act on a record a power loss
 could erase use `Reader(path, durable_only=True)`, which returns only records covered by the last checkpoint.
 
+A failed `checkpoint()` poisons the writer: later checkpoints raise `DurabilityLostError`, appends keep working. The
+failure is not undone by reopening: records appended before a failed checkpoint may not be durable even if a writer
+opened later in the same boot checkpoints successfully (on Linux a failed `fsync` can drop the dirty pages). Treat a
+checkpoint error as an incident.
+
 ## Batches and columns
 
-`append_many(payloads, *, schema_id, venue_ts_ns, local_ts_ns)` takes an iterable of payloads; each metadata argument
-is one int for all records or a sequence with one per record. Everything is checked before anything is appended. If an
-append fails part-way, it raises `BatchAppendError`: `payloads[:e.appended]` were appended (from sequence number
-`e.first_seq`), the rest were not, and `e.__cause__` is the error (for example `StorageFullError`).
+`append_many(payloads, *, schema_id, venue_ts_ns, local_ts_ns)` takes an iterable of payloads (not a single `bytes`,
+`bytearray`, `memoryview` or other bytes-like object, and not a `str`: those raise `TypeError`). Each metadata
+argument is one int for all records or an iterable with exactly one per record. All arguments are converted and
+their lengths checked before anything is appended, so a bad argument appends nothing. A record can still fail during
+the append, for example one that doesn't fit in a segment (`RecordTooLargeError`) or a full disk
+(`StorageFullError`). Then `append_many` raises `BatchAppendError`: `payloads[:e.appended]` were appended (from
+sequence number `e.first_seq`), the rest were not, and `e.__cause__` is the error.
 
-`read_many(max_records, *, timeout=0)` waits up to `timeout` seconds for the first record (`None`: forever), then
-returns what is already committed. `read_batch` does the same but returns a `RecordBatch` of columns: little-endian
-`bytes` for `seq`, `schema_id`, `venue_ts_ns`, `local_ts_ns`, and Arrow-style payload offsets and data.
+To retry after resolving the cause, pass `payloads[e.failed_index:]` and slice every per-record metadata sequence at
+the same index (`schema_id=schema_ids[e.failed_index:]`, ...); a single-int metadata value needs no slicing.
+`append_many` consumes its arguments, so if you may retry, pass lists, tuples or arrays, not one-shot iterators or
+generators.
+
+`read_many(max_records, *, timeout=0)` waits up to `timeout` seconds for the first record, then returns what is
+already committed. `read_batch` does the same but returns a `RecordBatch` of columns: little-endian `bytes` for
+`seq`, `schema_id`, `venue_ts_ns`, `local_ts_ns`, and Arrow-style payload offsets and data. A `RecordBatch` has a
+length, can be indexed (`batch[i]`, `batch[-1]`) and iterated (each item a `Record`); slicing raises `TypeError` (use
+`batch.records()[a:b]`, or slice the arrays from `to_numpy()`).
+
+Timeouts are seconds as an int, a float or a `datetime.timedelta`. `None`, `math.inf` and any value too large to
+represent (such as `sys.maxsize`) wait forever; negative values and NaN raise `ValueError`. The defaults differ on
+purpose: `next()` waits forever, `read_many` and `read_batch` don't wait.
 
 ```python
 batch = reader.read_batch(100_000)
@@ -64,16 +88,38 @@ NumPy, pyarrow and pandas are optional and imported only when these methods are 
 
 ## Copies, lifetimes and threads
 
-- `append` uses a `bytes` payload without copying it and copies other buffers (`bytearray`, `memoryview`, arrays)
-  once. The payload is then copied into the journal.
+- Payloads are `bytes` or any buffer of unsigned bytes (`bytearray`, `memoryview`, `array('B')`, `uint8` NumPy
+  arrays); buffers of other item types (`array('b')`, `int8` or wider arrays) raise `TypeError`, view them as bytes
+  first (`memoryview(a).cast('B')`, `a.view(np.uint8)`). `append` uses a `bytes` payload without copying it and copies
+  other buffers once. The payload is then copied into the journal.
 - Every `Record` owns its payload as an ordinary `bytes` object; it stays valid after the reader moves on or closes.
   `RecordBatch` columns are `bytes` too; arrays made from them keep them alive.
 - The reader is tickertape's safe `pread` reader, memory-safe whatever other processes do to the files. The
   zero-copy mapped reader of the Rust library is not exposed to Python.
 - Blocking calls (`next`, waiting `read_many`/`read_batch`, `checkpoint`, opening a writer, batch loops) release the
-  GIL. Waits check for signals at least every 50 ms, so Ctrl-C raises `KeyboardInterrupt` and consumes nothing.
-- `Writer` and `Reader` objects can be used from any thread; calls on one object are serialized. A reader is one
-  cursor, so give each consumer its own.
+  GIL.
+- `Writer` and `Reader` objects can be used from any thread; calls on one object are serialized. A waiting read
+  holds its reader for at most 50 ms at a time, so other calls on that reader (`position`, `close()`, another read)
+  run in between; `closed`, `position` and `repr` never wait at all. Reads from several threads share the one
+  cursor: each record goes to exactly one of them, in order, and which one gets it is unspecified. Give each consumer
+  its own reader.
+- `close()` from another thread (or from a signal handler) ends a read that is waiting on that reader within about
+  50 ms; the waiting call raises `ValueError`.
+- Fork: a `Writer` or `Reader` belongs to the process that opened it. In a child created by `fork()` (including
+  `multiprocessing`'s default start method on Linux before Python 3.14), every method raises `UsedAfterForkError`
+  without touching the journal, and `close()`, leaving a `with` block and garbage collection only discard the copy.
+  Open handles in the child after it starts, or use the `spawn` or `forkserver` start method.
+
+### Ctrl-C and other signals
+
+Waits check for signals at least every 50 ms, with the reader's lock released, so Ctrl-C raises `KeyboardInterrupt`
+promptly and signal handlers may use the reader (even close it). When a signal handler raises during a read
+(`next`, `try_next`, `read_many`, `read_batch`, iteration), records the read had already taken from the journal are
+kept and returned, in order, by the next read on that reader; none is skipped. The guarantee covers signals that
+arrive before the read returns. A signal that arrives in the instant after the read has returned, before Python
+stores the result, is handled at that point, as after any function call: if its handler raises, the returned value
+is lost. A program that must not lose a record on Ctrl-C should handle `SIGINT` itself (for example, set a flag in the
+handler and stop after the current record).
 - Free-threaded Python: no free-threaded wheels are published (abi3 wheels cannot load there). Building from the
   sdist for 3.14t works and runs without the GIL, but it is not tested in CI.
 
@@ -83,7 +129,12 @@ All errors derive from `tt.TickertapeError`: `JournalIOError` (also an `OSError`
 `LockedError` (another writer has the journal), `CorruptJournalError` (`path`, `offset`, `reason` code, `details`),
 `UnsupportedVersionError`, `JournalNotFoundError`, `SeqUnavailableError` (also a `LookupError`),
 `RecordTooLargeError` and `InvalidConfigError` (also `ValueError`), `DurabilityLostError`, `SequenceExhaustedError`,
-`DiscardedError` (call `seek` to continue) and `BatchAppendError`. Using a closed object raises `ValueError`.
+`DiscardedError` (call `seek` to continue), `BatchAppendError` and `UsedAfterForkError`. Using a closed object raises
+`ValueError`. Every exception keeps its message and attributes across `pickle` (for example from a `multiprocessing`
+worker); `JournalIOError.strerror` is the OS message, as `os.strerror(errno)`.
+
+`Writer.recovery_report` (a `RecoveryReport` with a list of `RecoveryAction`) and `Writer.retention_report` (a
+`RetentionReport`) are named tuples, like the results of the inspection functions below.
 
 ## Inspection
 
