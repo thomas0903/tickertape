@@ -3,7 +3,8 @@
 tickertape has a header-only C++ binding over its C ABI: one header,
 [`crates/tickertape-ffi/include/tickertape.hpp`](../crates/tickertape-ffi/include/tickertape.hpp), next to the C
 header `tickertape.h`, linked against the same `libtickertape`. It needs C++17 and nothing beyond the standard
-library, and works the same with and without exceptions. This page explains how to use it; the header documents
+library, and has the same API with and without exceptions; with GCC and Clang, code built with and without
+exceptions (or debug checks) can be linked into one program ([Mixing modes](#mixing-modes)). This page explains how to use it; the header documents
 every function, and [ADR 0036](decisions/0036-cpp-binding.md) gives the design and its reasons. The rules of the C
 ABI underneath ([`c-api.md`](c-api.md)) still hold; this page repeats the ones you need.
 
@@ -73,8 +74,24 @@ the usual system places, such as an installed library. Set `TICKERTAPE_LIBRARY` 
 choose the files yourself. `examples/c/CMakeLists.txt` uses it.
 
 **Compilers.** Tested with GCC 15 and Clang 21 on Linux and Apple Clang on macOS, as C++17, C++20 and C++23, with
-and without `-fno-exceptions`, under `-Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror`. CI adds the GCC and
-Clang of its Ubuntu runner. The header needs `<filesystem>` (GCC 9, Clang 9, or a macOS 10.15 deployment target).
+and without `-fno-exceptions`, with and without `NDEBUG`, under `-Wall -Wextra -Wpedantic -Wconversion -Wshadow
+-Werror`. CI adds the GCC and Clang of its Ubuntu runner. The header needs `<filesystem>` (GCC 9, Clang 9, or a
+macOS 10.15 deployment target).
+
+### Mixing modes
+
+A program may link translation units built with and without exceptions, and with and without debug checks (for
+example a component built with `-fno-exceptions` inside an application that catches `tickertape::Exception`). With
+GCC and Clang each unit keeps its own behaviour: the classes have the same layout in every mode and pass freely
+between units, and the few inline functions whose behaviour depends on the mode (`value()`, `operator*`, `error()`,
+`RecordView::data()`, `RecordBatch::operator[]`, `append_with`, ...) get a different symbol in each mode
+(`abi_tag`), so the linker never gives one unit another unit's copy. What it does not change:
+
+- Behaviour follows the code that acts on a value: `value()` called in a unit built without exceptions aborts on an
+  error, whichever unit produced the result.
+- A fill function passed to `append_with` from code built without exceptions must not throw.
+- Your own inline functions that call these are yours to keep consistent across modes, as for any header.
+- Other compilers (MSVC) have no `abi_tag`: there, build the whole program in one mode.
 
 ## Conventions
 
@@ -86,8 +103,9 @@ Clang of its Ubuntu runner. The header needs `<filesystem>` (GCC 9, Clang 9, or 
   the error with `r.error()`. `result<void>` has no value. Results are `[[nodiscard]]`: ignoring one is a compiler
   warning, so errors are never silently lost. On a temporary result, `value()`, `*` and `error()` return by value,
   so `for (auto &s : list_segments(dir).value())` is safe.
-- **Nothing else throws.** The only exceptions are from `value()`, and from `Writer::append_with`, which rethrows what
-  your fill function threw.
+- **Nothing else throws**, apart from `std::bad_alloc` (an error copies its message; `list_segments` returns a
+  vector). The only other exceptions are from `value()`, and from `Writer::append_with`, which rethrows what your
+  fill function threw.
 - **Paths** can be a `const char *`, `std::string`, `std::string_view` or `std::filesystem::path`. A path with a NUL
   byte inside fails with `invalid_argument` (the C ABI would cut it short).
 - **Payloads** can be any contiguous range of `char`, `unsigned char`, `signed char` or `std::byte`
@@ -122,14 +140,15 @@ Clang of its Ubuntu runner. The header needs `<filesystem>` (GCC 9, Clang 9, or 
   `local_ts_ns()` are copies and stay valid; `data()`, `size()` and `as_string_view()` read the payload. Copy what you
   need to keep: `std::string(view.as_string_view())`.
 - **Debug check:** in builds without `NDEBUG` (or with `TICKERTAPE_DEBUG_CHECKS` defined to 1), reading the payload
-  of a view after its reader moved on aborts with a message. A view whose reader was destroyed is not detected. The
-  check does not change any type's layout, so code built with and without it can be linked together.
+  of a view after its reader moved on aborts with a message. A view whose reader was destroyed is not detected. Code
+  built with and without the check can be linked together ([Mixing modes](#mixing-modes)).
 - **Copy-out instead:** `Reader::next_copy(buf, size)` copies one payload into your buffer, and
   `Reader::read_batch(batch)` copies many into a `RecordBatch`. Views from a batch are valid until the next read into
   that batch, or until it is moved or destroyed; views from `next_copy` as long as your buffer.
 - `data()` is null when the payload is empty. `as_string_view()` and `as_span()` handle that; guard it before
   passing the pointer to `memcpy` or `printf("%.*s")`.
-- `NewRecord` (for `append_batch`) does not copy its payload: keep the bytes alive until the append returns.
+- `NewRecord` (for `append_batch`) does not copy its payload: keep the bytes alive until the append returns. It
+  refuses temporaries that own their bytes at compile time (see [Writing](#writing)).
 - **No hidden allocation on the hot path.** `append`, `append_with`, `append_batch`, `next_seq`, `next`, `next_copy`,
   `read_batch` and `position` allocate nothing in the binding when they succeed (`tests/cpp/test_no_alloc.cpp`
   checks it by counting `operator new`). A failure allocates, to copy the error message. `RecordBatch` allocates its
@@ -171,7 +190,29 @@ tt::Writer writer = tt::Writer::open("/data/journal", options).value();
   appended.outcome.value();   // throws if it stopped early; appended.appended says how far it got
   ```
 
+  A `NewRecord` keeps a pointer to its payload, not a copy, so **the payload must be a named object** (an lvalue)
+  that outlives the append, or a view: an rvalue is accepted only if it is a `std::basic_string_view` or a
+  `std::span`. `batch.emplace_back(7, 0, 0, std::to_string(i) + "...")` does not compile (the string would be
+  destroyed at the end of the statement and the record would point into freed memory), and neither does a
+  temporary `std::vector` or `std::array`. Keep the strings in a container that lives until the append returns.
+
 ## Reading
+
+**The read loop.** `next()` returns a `result<std::optional<RecordView>>`, which has two different "bools": the
+result's (did the call fail?) and the optional's (did a record arrive?). Test them in that order:
+
+```cpp
+tt::result<std::optional<tt::RecordView>> r = reader.next(100ms);
+if (!r) { /* the call failed: r.error() */ }
+else if (!*r) { /* no record within the timeout */ }
+else { const tt::RecordView &record = **r; /* a record */ }
+```
+
+> **Warning:** `if (auto r = reader.next())` is true when the call *succeeded*, including when no record arrived,
+> and `(*r)->data()` on an empty optional is undefined behaviour. With exceptions, `if (auto record =
+> reader.next().value())` tests the optional and is the shortest correct form.
+
+A complete loop:
 
 ```cpp
 tt::Reader reader = tt::Reader::open("/data/journal").value();   // at the oldest record
@@ -255,12 +296,17 @@ options, and `unsupported_version` when the loaded library does not match the he
 
 The option builders record the first error a setter reports (for example `backoff` with a minimum above the
 maximum), so you can chain setters; the open function that takes them returns it, and `options.error()` shows it.
+Their `native_handle()` gives the C handle for a C setter the header does not wrap yet; errors from such calls are
+not recorded.
 
 ## Threading
 
 - A `Writer` or `Reader` may be moved to another thread between calls, but must not be used by two threads at the
-  same time. The same holds for options and batches. Different readers are independent.
-- The fill function runs on the thread that called `append_with`.
+  same time, **including through const member functions** (`Writer::next_seq()`, `last_retention_error()`,
+  `Reader::position()` call into the same C handle). The same holds for options and batches. Different readers are
+  independent.
+- The fill function runs on the thread that called `append_with`. The writer counts as in use until `append_with`
+  returns, even if the fill hands it to another thread: that thread must not call it before then.
 - The binding reads the C ABI's per-thread error state inside the call that failed, so `Error` is always the right
   one, whatever your threading. The header adds no global state of its own.
 - With the default options a writer starts a background helper thread; `WriterOptions::prefault(false)` gives one
@@ -277,7 +323,9 @@ maximum), so you can chain setters; the open function that takes them returns it
 - `tickertape::read_checkpoint(dir)` returns the checkpoint marker, or `std::nullopt` if there is no valid one.
 - Retention (ADR 0016) removes a sealed, checkpoint-covered prefix of old segments. Build a `Retention` with limits
   (`max_segments`, `max_bytes`, `max_age`) and an action, which must be set explicitly: `delete_segments()` or
-  `move_to(dir)`. Pass it to `WriterOptions::retention` to run after every checkpoint (errors go to
+  `move_to(dir)`. **A negative or NaN `max_age` is an error** (`invalid_argument`, returned by whatever uses the
+  settings), never zero, which would make every sealed segment old enough to remove; ages round up to whole
+  nanoseconds. Pass it to `WriterOptions::retention` to run after every checkpoint (errors go to
   `Writer::last_retention_error()`), or to `tickertape::apply_retention(dir, settings)` to run once.
   `tickertape::plan_retention(dir, settings)` says what would be removed, without an action and without changing
   anything.
@@ -290,11 +338,15 @@ that release, and follows the C ABI's rule ([`c-api.md` → Versioning](c-api.md
 
 - **Before 1.0** it needs exactly its own release's `tickertape.h` and library.
 - **From 1.0** it needs the same ABI version and a `tickertape.h` and library at least as new as itself. Within a
-  major version no public declaration is removed or changes meaning; new functions, members and enumerators may be
-  added.
+  major version no public declaration is removed or changes meaning; new functions, member functions, types and
+  enumerators may be added, but **no class gains a data member**, so that components built against different minor
+  versions agree on every type.
+- The classes live in the inline namespace `tickertape::v1` (you write `tickertape::Writer`). A major version that
+  changes a layout moves to `v2`, so code built against both can be linked into one program. Do not forward-declare
+  the header's classes; include it.
 
-It checks `tickertape.h` at compile time (`#error`), and the loaded library at run time in every open function
-(`Status::unsupported_version`). `tickertape::check_library()` and `tickertape::library_compatible()` run the same
+It checks `tickertape.h` at compile time (`#error`), and the loaded library at run time in every function that takes
+a journal path (`Status::unsupported_version`). `tickertape::check_library()` and `tickertape::library_compatible()` run the same
 check, and `library_version()` returns the library's version string.
 
 ## Testing
@@ -303,6 +355,9 @@ check, and `library_version()` returns the library's version string.
 as C++17, C++20 and C++17 without exceptions, plus a test against stubbed C functions (a failed clean-up after a
 throwing fill, every status and corruption reason), the allocation check, a debug-check death test, the
 cross-language fixtures with Rust, Python and C, the example, and a compile-only matrix of C++17, C++20 and C++23
-with and without exceptions for every C++ compiler it finds (`TICKERTAPE_FFI_CXX_COMPILERS` sets the list). It also
-fails if a C function, status code or corruption reason is added without a decision for the binding (ADR 0036).
+with and without exceptions and `NDEBUG` for every C++ compiler it finds (`TICKERTAPE_FFI_CXX_COMPILERS` sets the
+list), which also pins every class's size and alignment (`tests/cpp/layout.cpp`). It links units built in different
+modes into one program, checks that `NewRecord` refuses owning temporaries, and fails if a C function, struct
+field, status code or corruption reason is added without a decision for the binding, or if a mode-dependent
+function lacks its mode tag (ADR 0036).
 `TICKERTAPE_FFI_SANITIZE=1` and `TICKERTAPE_FFI_VALGRIND=1` work as for the C tests.

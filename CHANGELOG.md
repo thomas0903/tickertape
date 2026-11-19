@@ -14,11 +14,16 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   `[[nodiscard]]`, with a `Status`, message, OS error and corruption reason) whose `value()` throws, so it works with
   and without `-fno-exceptions`. An exception thrown by a fill never crosses the C ABI: it is rethrown after the
   aborted append, nested inside the library error if the clean-up failed, and destroying or moving the writer inside
-  its own fill is defined. Negative timeouts do not wait (unlike C). The header checks the C header's version at
-  compile time and the library's at every open. Tested as C++17, C++20 and C++17 without exceptions under
-  AddressSanitizer, UBSan and Valgrind, compile-tested as C++17/20/23 with GCC and Clang under `-Wconversion
-  -Wshadow -Wpedantic`, with an allocation check for the hot path and cross-language fixtures; tests fail if a C
-  function, status or corruption reason is added without a decision for the binding. A CMake package
+  its own fill is defined. Negative timeouts do not wait (unlike C); a negative or NaN retention age is an error.
+  With GCC and Clang, units built with and without exceptions or debug checks can be linked into one program (the
+  mode-dependent inline functions carry an `abi_tag` per mode). `NewRecord` refuses temporaries that own their
+  bytes at compile time. The classes live in the inline namespace `tickertape::v1`, and no class gains a data
+  member within a major version. The header checks the C header's version at compile time and the library's in
+  every call that takes a journal path. Tested as C++17, C++20 and C++17 without exceptions under
+  AddressSanitizer, UBSan and Valgrind, compile-tested as C++17/20/23 with and without exceptions and `NDEBUG` with
+  GCC and Clang under `-Wconversion -Wshadow -Wpedantic`, with a layout pin for every class, a mixed-mode link test,
+  an allocation check for the hot path and cross-language fixtures; tests fail if a C function, struct field,
+  status or corruption reason is added without a decision for the binding. A CMake package
   (`tickertape::tickertape`, `tickertape::cpp`) serves `find_package` and `add_subdirectory`. The C++11 example
   wrapper `examples/c/tickertape.hpp` is removed; `examples/c/example.cpp` now records, follows live and replays
   with the binding, and the examples need C++17.
