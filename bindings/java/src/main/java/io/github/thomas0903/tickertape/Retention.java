@@ -41,12 +41,12 @@ public final class Retention {
      * Settings that move eligible segments into the existing directory {@code dir}, keeping their names, with no limits
      * yet. A move never replaces an existing file there (it fails instead).
      *
-     * @throws IllegalArgumentException if {@code dir} is not on the default file system, or its name cannot be passed
-     *     to the library unchanged (see {@code docs/java-api.md} &rarr; Paths)
+     * @throws IllegalArgumentException if {@code dir} is not on the default file system (see
+     *     {@linkplain Tickertape##paths Tickertape &rarr; Paths}, which also says how the path is passed)
      */
     public static Retention moveTo(Path dir) {
         Objects.requireNonNull(dir, "dir");
-        Paths.nativeBytes(dir); // refuses a path the C library would not see unchanged (see Writer.open)
+        Paths.nativeBytes(dir); // refuses a path of another file system now, not when the retention is applied
         return new Retention(dir, -1, -1, -1);
     }
 

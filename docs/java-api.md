@@ -97,32 +97,22 @@ The Linux libraries are built for glibc.
   2^64 - 1).
 - **Options** (`WriterOptions`, `ReaderOptions`, `Retention`) are immutable values: each setter returns a new value.
   They are copied into the library when a writer or reader is opened.
-- **Paths** must be on the default file system. They reach the library as the bytes the operating system knows them
-  by. The JDK has no public way to read a path's bytes, so the binding passes a path only when its text provably
-  stands for its bytes, and refuses it otherwise: it makes a path from `toString()` (`Path.of(text)`) and compares the
-  two, which the JDK does by their bytes. If they are equal, the binding encodes the text as the JDK encodes a path's
-  text, with its file-name charset (`sun.jnu.encoding`: UTF-8 on macOS, the locale's charset on Linux) and, on macOS
-  with `-Djdk.nio.path.useNormalizationFormD` enabled, after normalizing to Unicode form D, which gives the path's own
-  bytes. If not, every call that takes the path throws `IllegalArgumentException` before anything reaches the library
-  (`Retention.moveTo` already when it is built), since the text would name a different file, possibly an existing
-  sibling. This happens in two cases:
-  - a name the JDK could not decode (on Linux, bytes that are not valid UTF-8 under a UTF-8 locale), which shows as
-    U+FFFD in Java (a name that holds U+FFFD itself is accepted);
-  - on macOS with `-Djdk.nio.path.useNormalizationFormD` enabled, a path whose bytes are not in form D, typically an
-    entry stored in form C that `Files.list` or a directory stream returned. The JDK keeps a listed entry's bytes and
-    shows its text in form C, as it shows every path under that property, while a path made from that text holds
-    form D bytes; on a volume that tells the two forms apart these name different files. Build the path from a string
-    (`Path.of`, `resolve(String)`), or run without the property.
+- **Paths** must be on the default file system; a path of any other (a zip file system, say) throws
+  `IllegalArgumentException`. The library receives the bytes the JDK itself uses for the path, so a name in any
+  encoding or Unicode normalization form, including one that is not valid in the file-system encoding (on Linux, bytes
+  that are not UTF-8 under a UTF-8 locale) and an entry stored in form C that a directory listing returned under
+  macOS's `-Djdk.nio.path.useNormalizationFormD`, reaches the operating system as the JDK holds it. The binding reads
+  those bytes from `Path.toUri()`, whose `file:` URI carries the absolute path's bytes percent-encoded one by one, and
+  decodes them; it does not reconstruct them from `toString()`. What follows from that:
+  - the library receives the **absolute** path: a relative path is resolved as the JDK resolves it, against the
+    JVM's working directory, so paths in the library's error messages, and so in exceptions, are absolute; trailing
+    slashes are removed (except from the root);
+  - `toUri()` may `stat` the path once (to tell whether it is a directory), which happens when a journal is opened or
+    inspected, or a retention destination is set (`Retention.moveTo`), never per record.
 
-  | `useNormalizationFormD` (macOS) | `Path.of(p.toString()).equals(p)` | The binding |
-  |---|---|---|
-  | not set (or not macOS) | yes | passes `toString()` encoded with the file-name charset |
-  | not set (or not macOS) | no | throws `IllegalArgumentException` (a name the JDK could not decode) |
-  | set | yes | passes `toString()` normalized to form D, then encoded |
-  | set | no | throws `IllegalArgumentException` naming the property (or, if the text holds U+FFFD, as above) |
-
-  The charset and that property are read once, when the binding first converts a path (the JDK, too, uses its
-  start-up values): changing either property later is not supported.
+  The exact URI form is the default provider's behaviour on Linux and macOS, not something the `Path.toUri`
+  specification fixes; the binding's tests pin it, and a URI not in that form is refused with
+  `IllegalArgumentException` rather than guessed at. The Javadoc of `Tickertape` (Paths) says the same.
 - **Names.** Boolean accessors are `isXxx()` everywhere (`isClosed()`, `isMapped()`, `isValid()`, `isIntact()`, and
   in the options `isDurableOnly()`, `isNotifyEnabled()`, `isPrefaultEnabled()`); option setters are the bare name
   (`notify(boolean)`). Every `PayloadBuffer` write (`setByte`, `set`, `put`) returns the buffer, so writes chain.
@@ -186,9 +176,11 @@ The Linux libraries are built for glibc.
   per-call object):
   - `append` with a native `MemorySegment`, which is passed to the library as it is (no condition on its size).
   - `append` with a `byte[]`, a heap `MemorySegment`, or a direct, heap or read-only heap `ByteBuffer`, which are
-    copied through the writer's scratch buffer: of a payload no larger than the largest payload of these kinds that
-    the writer was given before. A native segment does not count, so the first `byte[]` append larger than every
-    earlier copied payload allocates even after larger native-segment appends (the buffer grows). One exception: after
+    copied through the writer's scratch buffer: of a payload that fits the buffer's current capacity, which starts at
+    256 bytes (the constant `SCRATCH_INITIAL_BYTES` in `Writer.java`) and, when a copied payload does not fit, grows to the larger of that
+    payload and twice the capacity. So a writer warmed with 64-byte arrays appends 256-byte arrays without allocating. A native
+    segment is passed as it is and does not grow the buffer, so the first `byte[]` append larger than the capacity
+    allocates even after larger native-segment appends. One exception: after
     a heap segment larger than `Integer.MAX_VALUE - 8` bytes, the next `ByteBuffer` append replaces the scratch buffer
     with one of its own size.
   - `appendBatch`; `nextSeq()`.
@@ -205,8 +197,9 @@ The Linux libraries are built for glibc.
     `ByteBuffer`, while the batch does not grow; a batch that grows allocates, so size it up front or let it grow
     once and reuse it. For a buffer without an accessible array (a direct or a read-only heap buffer) this holds only
     up to a payload capacity of `Integer.MAX_VALUE - 8` bytes (above it, each such `add` builds a wrapper).
-  - For both readers: `tryNext`, `next()` and a timed `next` that find a record; the view's metadata accessors,
-    `isValid()`, `getByte`, `get(layout)`, and `copyPayloadTo` a `MemorySegment`, a `byte[]`, a heap `ByteBuffer`, or
+  - For both readers: `tryNext`, `next()` and a timed `next` that find a record; the view's metadata accessors
+    (`seq()`, `schemaId()`, `venueTsNs()`, `localTsNs()`, `payloadLength()`) and `isValid()`, each measured on its own;
+    `getByte`, `get(layout)`, and `copyPayloadTo` a `MemorySegment`, a `byte[]`, a heap `ByteBuffer`, or
     the same direct `ByteBuffer` as that view's previous copy (the view remembers it, and keeps it reachable while the
     view is); the first copy into another direct buffer allocates a small object.
   - `tryReadBatch` and a timed `readBatch` that find records; `ReadBatch.get` of an index used before; and on a

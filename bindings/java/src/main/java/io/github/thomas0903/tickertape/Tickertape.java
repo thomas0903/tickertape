@@ -18,6 +18,23 @@ import java.util.Objects;
  * ABI is unstable (ABI version 0), so the binding requires exactly that library version. From 1.0 it requires the same
  * ABI version and a library at least as new as itself. See {@code docs/java-api.md} &rarr; Versioning.
  *
+ * <p id="paths"><b>Paths.</b> Every method that takes the {@link Path} of a journal, or of a retention destination,
+ * passes the C library the bytes the JDK itself uses for that path, so a name in any encoding or Unicode normalization
+ * form reaches the operating system as the JDK holds it. The binding reads those bytes from {@link Path#toUri()}, whose
+ * {@code file:} URI carries them percent-encoded. Three consequences:
+ *
+ * <ul>
+ *   <li>The library receives the <b>absolute</b> path: a relative path is resolved as the JDK resolves it, against the
+ *       JVM's working directory. Paths in the library's error messages, and so in the binding's exceptions, are
+ *       absolute. Trailing slashes are removed (except from the root).
+ *   <li>{@code toUri()} may {@code stat} the path once (to tell whether it is a directory). This happens when a journal
+ *       is opened or inspected, or a retention destination is set, never per record.
+ *   <li>Only the default file system is supported; a path of any other ({@code FileSystems.newFileSystem}, a zip file
+ *       system) throws {@link IllegalArgumentException}.
+ * </ul>
+ *
+ * <p>See {@code docs/java-api.md} &rarr; Conventions &rarr; Paths.
+ *
  * <p>The JVM must allow this module native access: {@code --enable-native-access=io.github.thomas0903.tickertape}
  * on the module path, {@code --enable-native-access=ALL-UNNAMED} on the class path.
  */

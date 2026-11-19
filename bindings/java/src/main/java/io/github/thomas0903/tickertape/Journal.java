@@ -31,6 +31,8 @@ public final class Journal {
      * through (a segment roll in progress) is scanned again for up to 630 ms, so only a writer stalled in it for longer
      * can make the scan report a problem that is not there (a {@link CorruptReason#BROKEN_CHAIN}); verify again to tell.
      *
+     * @throws IllegalArgumentException if {@code dir} is not on the default file system (see
+     *     {@linkplain Tickertape##paths Tickertape &rarr; Paths}, which also says how the path is passed)
      * @throws JournalNotFoundException if {@code dir} has no segments
      * @throws JournalIoException if reading fails (with {@code ENOENT} if {@code dir} does not exist)
      */
@@ -53,6 +55,8 @@ public final class Journal {
     /**
      * Lists the segments in {@code dir}, oldest first. The list can change while a writer is active.
      *
+     * @throws IllegalArgumentException if {@code dir} is not on the default file system (see
+     *     {@linkplain Tickertape##paths Tickertape &rarr; Paths}, which also says how the path is passed)
      * @throws JournalNotFoundException if there are no segments
      * @throws CorruptJournalException if a segment header is invalid
      * @throws UnsupportedFormatVersionException if a segment has an unsupported format version
@@ -92,6 +96,8 @@ public final class Journal {
      * Reads the checkpoint marker of the journal in {@code dir}, or returns empty if the marker file is missing or
      * neither slot is valid. This observes the marker; it does not validate the position it describes.
      *
+     * @throws IllegalArgumentException if {@code dir} is not on the default file system (see
+     *     {@linkplain Tickertape##paths Tickertape &rarr; Paths}, which also says how the path is passed)
      * @throws JournalIoException if the marker exists but cannot be read
      */
     public static Optional<Checkpoint> readCheckpoint(Path dir) {
@@ -117,6 +123,8 @@ public final class Journal {
      * eligible, removed oldest first; without a valid checkpoint marker nothing is. Stops at the first error; removals
      * before it stay in effect.
      *
+     * @throws IllegalArgumentException if {@code dir} is not on the default file system (see
+     *     {@linkplain Tickertape##paths Tickertape &rarr; Paths}, which also says how the path is passed)
      * @throws JournalNotFoundException if there are no segments
      * @throws CorruptJournalException if a segment header is invalid
      * @throws JournalIoException if a removal fails (including an existing destination file for a move)

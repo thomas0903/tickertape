@@ -40,9 +40,9 @@ import java.util.Optional;
  * warm the appends allocate nothing on the Java heap under the conditions that {@code docs/java-api.md} &rarr;
  * Allocation lists (and that the binding's allocation test measures): among them, for an append whose payload is
  * copied through the scratch buffer (a {@code byte[]}, a heap {@link MemorySegment}, any {@link ByteBuffer}), a payload
- * no larger than the largest such payload appended before (the scratch buffer grows otherwise; a native segment is
- * passed as it is and does not count), and for {@link PayloadBuffer#put(long, ByteBuffer)} of a direct or read-only
- * buffer, the same buffer as before.
+ * that fits the buffer's current capacity, which starts at 256 bytes and, when such a payload does not fit, grows to
+ * the larger of that payload and twice the capacity (a native segment is passed as it is and does not count), and for
+ * {@link PayloadBuffer#put(long, ByteBuffer)} of a direct or read-only buffer, the same buffer as before.
  */
 @SuppressWarnings("restricted") // calls restricted java.lang.foreign methods; needs native access
 public final class Writer implements AutoCloseable {
@@ -62,7 +62,10 @@ public final class Writer implements AutoCloseable {
     private final Path dir;
     private final MemorySegment seqOut = Memory.allocate(8);
     private final MemorySegment countOut = Memory.allocate(8);
-    private MemorySegment scratch = Memory.allocate(256);
+    /** The scratch buffer's starting capacity in bytes; it grows when a copied payload does not fit (see scratch). */
+    static final int SCRATCH_INITIAL_BYTES = 256;
+
+    private MemorySegment scratch = Memory.allocate(SCRATCH_INITIAL_BYTES);
     private ByteBuffer scratchBuffer = scratch.asByteBuffer();
 
     private MemorySegment fillStub;
@@ -118,6 +121,8 @@ public final class Writer implements AutoCloseable {
      * journal's lock, then recovers it ({@code docs/format.md} &rarr; Recovery): everything after the last checkpoint
      * is validated, and anything invalid is repaired or quarantined before this returns.
      *
+     * @throws IllegalArgumentException if {@code dir} is not on the default file system (see
+     *     {@linkplain Tickertape##paths Tickertape &rarr; Paths}, which also says how the path is passed)
      * @throws JournalLockedException if another writer has the journal open
      * @throws InvalidConfigException if an option is out of range
      * @throws CorruptJournalException if the journal is damaged in a way recovery does not repair, or the tail is

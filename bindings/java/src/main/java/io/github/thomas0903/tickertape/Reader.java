@@ -101,6 +101,8 @@ public final class Reader implements AutoCloseable {
      * reads the files with {@code pread} into a buffer it owns and validates the copy, so it is memory-safe whatever
      * other processes do to the files; at worst it reports corruption.
      *
+     * @throws IllegalArgumentException if {@code dir} is not on the default file system (see
+     *     {@linkplain Tickertape##paths Tickertape &rarr; Paths}, which also says how the path is passed)
      * @throws JournalIoException with {@code ENOENT} if {@code dir} does not exist (a reader that starts before its
      *     writer sees this, since the writer creates the directory)
      * @throws JournalNotFoundException if {@code dir} has no segment yet (the writer is creating it). A loop that waits

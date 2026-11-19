@@ -187,13 +187,17 @@ records, or records encoded field by field). Both allocate nothing per record.
   call, which escape analysis removed on the local machine but not on the runner, with the same JDK build). The
   operations, each with the `AllocationTest` method that measures it:
   - `append` with a native `MemorySegment`, passed to the library as it is, with no condition on its size
-    (`writerCallsAllocateNothing`, `theScratchConditionCountsOnlyPayloadsCopiedThroughIt`).
+    (`writerCallsAllocateNothing`, `theScratchConditionIsTheBuffersCapacity`).
   - `append` with a `byte[]`, a heap `MemorySegment`, or a direct, heap or read-only heap `ByteBuffer`, which are
-    copied through the writer's scratch buffer, of a payload no larger than the largest payload of these kinds the
-    writer was given before (`writerCallsAllocateNothing`). The condition is per source kind, as the code has it: a
-    native segment does not count, so the first `byte[]` append larger than every earlier copied payload allocates
-    even after larger native-segment appends, which `theScratchConditionCountsOnlyPayloadsCopiedThroughIt` measures
-    (the previous wording, "no larger than one appended before", was not true across kinds). One exception: after a
+    copied through the writer's scratch buffer, of a payload that fits the buffer's current capacity
+    (`writerCallsAllocateNothing`). The capacity starts at 256 bytes (`SCRATCH_INITIAL_BYTES` in `Writer.java`) and,
+    when a copied payload does not fit, grows to the larger of that payload and twice the capacity; a native segment is passed
+    as it is and does not grow it. `theScratchConditionIsTheBuffersCapacity` measures both sides: after 64-byte arrays
+    an array of the full starting capacity allocates nothing, and the first `byte[]` append larger than the capacity
+    allocates even after larger native-segment appends. Two earlier wordings were inexact: "no larger than one
+    appended before" was not true across kinds, and "no larger than the largest copied payload before" denied the
+    headroom the buffer already has (a writer warmed with 64-byte arrays appends 128 bytes without allocating). One
+    exception: after a
     heap segment larger than `Integer.MAX_VALUE - 8` bytes, the next `ByteBuffer` append replaces the scratch buffer
     with one of its own size.
   - `appendBatch`; `nextSeq()` (`writerCallsAllocateNothing`).
@@ -205,8 +209,9 @@ records, or records encoded field by field). Both allocate nothing per record.
     `ByteBuffer`, into a batch that does not grow (records and payload bytes within its capacity, which for a buffer
     without an accessible array, a direct or a read-only heap one, must be at most `Integer.MAX_VALUE - 8` payload
     bytes: above that, each such `add` builds a wrapper). A batch that grows allocates (`writerCallsAllocateNothing`).
-  - For both readers: `tryNext`, `next()` and a timed `next` that find a record; the view's metadata accessors,
-    `isValid()`, `getByte`, `get(layout)`, and `copyPayloadTo` a `MemorySegment`, a `byte[]`, a heap `ByteBuffer`, or a
+  - For both readers: `tryNext`, `next()` and a timed `next` that find a record; the view's metadata accessors
+    (`seq()`, `schemaId()`, `venueTsNs()`, `localTsNs()`, `payloadLength()`) and `isValid()`, each measured on its own
+    (an earlier version measured the six together as one figure), `getByte`, `get(layout)`, and `copyPayloadTo` a `MemorySegment`, a `byte[]`, a heap `ByteBuffer`, or a
     direct `ByteBuffer` that is the same buffer as in the previous copy by that view
     (`readerCallsAndViewsAllocateNothing`).
   - `tryReadBatch` and a timed `readBatch` that find records; `ReadBatch.get` of an index used before; and on a
@@ -325,31 +330,40 @@ allocates it); the documentation says that writing into it changes `equals` and 
 preferred this to defensive copies in the constructor and the accessor, which would double the cost of every copy
 for a misuse that the documentation covers.
 
-**Paths.** The C ABI passes path bytes to the operating system unchanged, and the JDK offers no public way to read a
-`Path`'s bytes (`UnixPath` keeps them, `toString()` decodes them with `sun.jnu.encoding`). So the binding passes a
-path only when its text provably stands for its bytes, and refuses it otherwise. The proof is a round trip, made for
-every path on every platform: `Path.of(p.toString()).equals(p)`, which the JDK decides by comparing bytes. When it
-holds, the path's bytes are those of its text encoded the JDK's way, so the binding encodes the text that way: with
-that same charset (the first version always used UTF-8, which picks a different file under a non-UTF-8 locale), after
-the one other step the JDK takes on the way to the bytes, which on macOS with `jdk.nio.path.useNormalizationFormD`
-enabled is normalizing the text to Unicode form D. When it fails, the binding throws `IllegalArgumentException` before
-any call. It fails in two known cases. A name the JDK could not decode: the decoded string holds U+FFFD (a name that
-legitimately contains U+FFFD round-trips and is accepted). And, with the form-D property on macOS, a path whose bytes
-are not in form D: the JDK shows every path's text in form C and encodes text in form D, so a path made from a string
-holds form D bytes, but an entry stored in form C keeps its bytes when `Files.list` or a directory stream returns it.
-The previous round normalized the text to form D whenever the property was set, which was right for the first kind of
-path and sent the wrong bytes for the second: on a volume that tells the forms apart, `Reader.open` of a listed entry
-then failed or opened a form-D sibling. Such a path is now refused, with a message that names the property and says to
-build the path from a string or to run without the property; without the property nothing changed. The charset and
-that property are read once, when the binding first converts a path, as the JDK reads its own at start-up; changing
-them later is not supported. We chose refusing over reading the bytes through implementation details (`toUri()`'s
-percent-encoding happens to expose them, but its form is unspecified): such names are rare, and a call that targets a
-sibling of the named journal, for example retention on the wrong directory, is not acceptable. `PathsTest` tests the
-decision directly, with the setting and the round-trip result passed in (no volume that tells form C from form D is at
-hand, and one JVM cannot switch the property, which the JDK reads at start-up); creates an undecodable name on Linux
-(skipped where the file system refuses it, as APFS does) next to the sibling it decodes to; and, on macOS, creates an
-entry in form C, which a listing returns as it is, and checks that it is refused under the property (run with it in
-the build) and passed unchanged without it.
+**Paths.** The C ABI passes path bytes to the operating system unchanged, so the binding must pass the bytes the JDK
+itself uses for a `Path`. It reads them from `Path.toUri()`: for a path of the default file system on Linux and macOS,
+the URI's raw path is the **absolute** path's bytes, percent-encoded byte by byte (unreserved ASCII left as it is, a
+`/` appended when the path is an existing directory that does not already end in one). The binding requires the
+default file system (`path.getFileSystem() == FileSystems.getDefault()`, `IllegalArgumentException` otherwise), takes
+`toUri().getRawPath()`, requires a leading `/`, decodes `%XX` to that byte and every other character to its ASCII byte,
+strips trailing slashes except for the root, and passes the result NUL-terminated. A character above U+007F, a
+malformed escape or an encoded NUL is refused with `IllegalArgumentException` naming the path, since it would mean the
+JDK's form is not the expected one; the binding does not guess.
+
+Rounds 2 to 4 of the review built the bytes from `Path.toString()` instead, and each round left a hole, because the text
+does not determine the bytes. The first version encoded the text as UTF-8 and so named a sibling for a name that was
+not valid in the file-system encoding (the JDK shows it with U+FFFD). The next encoded with `sun.jnu.encoding` and
+refused a path whose text did not round-trip, and normalized to form D under macOS's
+`jdk.nio.path.useNormalizationFormD`, which sent the wrong bytes for a listed entry stored in form C. The last refused
+any path for which `Path.of(p.toString()).equals(p)` failed, which also refused a valid path that carries a trailing
+slash in its bytes (`Path.of(URI.create("file:///tmp/journal%2F"))`: `Path.of` of its text strips the slash) and
+reported it as an invalid file-system encoding, and misreported a form-C name that also contained U+FFFD. Reading the
+URI removes the guess: an undecodable name on Linux and a listed form-C name under the property are now passed by
+their own bytes rather than refused, and the charset lookup, the property handling and the round-trip check are gone.
+
+The cost is that the URI form is the default provider's behaviour on Linux and macOS, not part of the `Path.toUri`
+specification, which leaves the exact form to the provider. `PathsTest` pins it, asserting the exact bytes for an
+ASCII absolute path, a relative path, an existing directory and a missing path, the `file:///tmp/journal%2F` path,
+reserved URI characters, the root, an accented name made from a string under both normalization settings (the build
+runs the class a second time with the property; the expected bytes are read back from the file system by the shell
+after the JDK created the directory), a listed form-C entry on macOS, a name containing U+FFFD, the undecodable name on
+Linux (the journal opened is the one with that name, not its decoded twin; skipped on macOS, whose file system refuses
+the name), and a zip file system path refused. A JDK that changes the form fails those tests, or is refused at run
+time, rather than passing other bytes silently. The supported range is unchanged: JDK 25 and later. Three consequences
+are documented in the Javadoc (`Tickertape`, Paths, linked from every method that takes a journal path) and the guide:
+the library receives the absolute path (a relative one resolved against the JVM's working directory, so paths in error
+messages are absolute); `toUri()` may `stat` the path once per conversion (when a journal is opened or inspected, or a
+retention destination set, never per record); and only the default file system is supported.
 
 **Finding the library.** In this order, and the first library found must be compatible or loading fails (it never falls
 through to a later candidate after a failure): `Tickertape.loadLibrary(path)` before first use; the system property
@@ -402,7 +416,8 @@ rule does not force.
   metadata, empty payloads or `isValid()`); a pending close (new calls refused and `isClosed()` true while it waits,
   the hand-over leaving no gap, a calling loop not starving it, an interrupted closer not spinning, a second closer
   waiting, reopening at once under collector pressure); a batch refused while its view is in `withPayload`;
-  undecodable path names (Linux); the API conventions above; the payload buffer refusing other threads;
+  path conversion (the exact bytes passed for each kind of path, including undecodable names on Linux and form-C
+  names on macOS); the API conventions above; the payload buffer refusing other threads;
   interruption (latency, no lost or duplicated records under constant interrupts, already-interrupted threads, close
   from another thread, virtual threads); threading (concurrent use refused, handles moved through an executor,
   readers on several threads, inspection beside a writer, two threads closing a writer together and reopening it);
