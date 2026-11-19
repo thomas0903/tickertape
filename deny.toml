@@ -43,3 +43,16 @@ unknown-git = "deny"
 name = "tiny-keccak"
 version = "=2.0.2"
 allow = ["CC0-1.0"]
+
+# iceoryx2 (integrations/iceoryx2, its own lockfile) -> iceoryx2-bb-posix requires enum-iterator, licensed 0BSD
+# (public-domain equivalent, permissive). Keep 0BSD scoped to these two crates; the maintainer may prefer to add
+# 0BSD to the allow list instead.
+[[licenses.exceptions]]
+name = "enum-iterator"
+version = "=2.3.0"
+allow = ["0BSD"]
+
+[[licenses.exceptions]]
+name = "enum-iterator-derive"
+version = "=1.5.0"
+allow = ["0BSD"]
