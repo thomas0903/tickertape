@@ -49,8 +49,29 @@ fn checkpoint_advances_marker() {
     }
 }
 
+/// The OS error behind an I/O error, looking through the wrapper that keeps it from counting as storage-full.
+fn os_code(source: &std::io::Error) -> Option<i32> {
+    source.raw_os_error().or_else(|| {
+        source
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<std::io::Error>())
+            .and_then(std::io::Error::raw_os_error)
+    })
+}
+
 #[test]
 fn failed_cleanup_of_an_abandoned_write_is_reported() {
+    failed_cleanup_is_reported(5 /* EIO */);
+}
+
+#[test]
+fn failed_cleanup_on_a_full_volume_is_not_storage_full() {
+    // `fsync` can fail with ENOSPC on a full APFS volume (docs/crash-contract.md). Freeing space does not make this
+    // writer usable again, so neither the recorded error nor a refused append may say "storage full, retry".
+    failed_cleanup_is_reported(28 /* ENOSPC */);
+}
+
+fn failed_cleanup_is_reported(errno: i32) {
     let dir = tempfile::tempdir().unwrap();
     let mut w = Writer::open(dir.path(), small_config()).unwrap();
     append_n(&mut w, 3);
@@ -60,7 +81,7 @@ fn failed_cleanup_of_an_abandoned_write_is_reported() {
         local_ts_ns: 0,
         payload: &[],
     };
-    fault::fail_next(Point::AbandonedWriteSync, 5 /* EIO */);
+    fault::fail_next(Point::AbandonedWriteSync, errno);
     let abandoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         w.append_with(&record, 16, |_| std::panic::panic_any("abandon"))
     }));
@@ -69,16 +90,23 @@ fn failed_cleanup_of_an_abandoned_write_is_reported() {
         .abandoned_write_error()
         .expect("the failed clean-up is recorded");
     assert!(
-        matches!(cause, Error::Io { source, .. } if source.raw_os_error() == Some(5)),
+        matches!(cause, Error::Io { source, .. } if os_code(source) == Some(errno)),
         "{cause:?}"
     );
-    // Later appends say why they are refused and carry the OS error; checkpoints say durability is lost.
-    match w.append(&record) {
-        Err(Error::Io { op, source, .. }) => {
-            assert!(op.contains("abandoned write"), "{op}");
-            assert_eq!(source.raw_os_error(), Some(5));
+    assert!(!cause.is_storage_full(), "{cause:?}");
+    // Later appends say why they are refused and carry the OS error, but are never storage-full: retrying after
+    // freeing space would not help. Checkpoints say durability is lost.
+    for _ in 0..3 {
+        let refused = w.append(&record).unwrap_err();
+        assert!(!refused.is_storage_full(), "{refused:?}");
+        match refused {
+            Error::Io { op, source, .. } => {
+                assert!(op.contains("abandoned write"), "{op}");
+                assert_eq!(os_code(&source), Some(errno));
+                assert_ne!(source.kind(), std::io::ErrorKind::StorageFull);
+            }
+            other => panic!("{other:?}"),
         }
-        other => panic!("{other:?}"),
     }
     let lost = w.checkpoint().unwrap_err();
     assert!(matches!(lost, Error::DurabilityLost));

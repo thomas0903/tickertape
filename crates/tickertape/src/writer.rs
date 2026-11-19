@@ -224,16 +224,24 @@ impl Writer {
     {
         if let Some(cause) = &self.abandoned_write_error {
             let source = match cause {
-                Error::Io { source, .. } => source.raw_os_error().map_or_else(
-                    || io::Error::new(source.kind(), source.to_string()),
-                    io::Error::from_raw_os_error,
-                ),
+                Error::Io { source, .. } => {
+                    let os = source
+                        .get_ref()
+                        .and_then(|e| e.downcast_ref::<io::Error>())
+                        .unwrap_or(source);
+                    os.raw_os_error().map_or_else(
+                        || io::Error::new(os.kind(), os.to_string()),
+                        io::Error::from_raw_os_error,
+                    )
+                }
                 other => io::Error::other(other.to_string()),
             };
+            // Wrapped, like the cause, so that the OS error (say ENOSPC) is never `is_storage_full`: freeing space
+            // does not make this writer accept appends again.
             return Err(Error::io(
                 "append (refused: an earlier abandoned write could not be zeroed durably; reopen the journal)",
                 &self.active.path,
-                source,
+                io::Error::other(source),
             ));
         }
         if self.next_seq == u64::MAX {
@@ -287,10 +295,11 @@ impl Writer {
                 // Stale bytes could resurface after a power loss and be read as a record after a shorter one,
                 // so this writer must not reuse the space: refuse further appends and checkpoints.
                 self.poisoned = true;
+                // The OS error is wrapped (kind `Other`) so that it is never `is_storage_full`.
                 self.abandoned_write_error = Some(Error::io(
                     "sync the zeroing of an abandoned write",
                     &self.active.path,
-                    e,
+                    io::Error::other(e),
                 ));
             }
             panic::resume_unwind(cause);
@@ -420,8 +429,15 @@ impl Writer {
     /// The error that stopped this writer when the zeroing of an abandoned write (a panic in an
     /// [`append_with`](Writer::append_with) fill closure) could not be made durable, if that happened.
     ///
-    /// While it is set, appends fail with [`Error::Io`] and checkpoints with [`Error::DurabilityLost`]; reopen the
-    /// journal to recover (`docs/format.md` → Abandoned writes).
+    /// Treat this as a storage incident, like a failed checkpoint (`docs/crash-contract.md` → Errors are sticky).
+    /// While it is set, appends fail with [`Error::Io`] and checkpoints with [`Error::DurabilityLost`], and the
+    /// durability of everything written since the last successful checkpoint is unknown. Reopening the journal gives
+    /// a writer that accepts appends again, but no guarantee about that tail across a power loss: the zeroed bytes may
+    /// only be in the page cache, so recovery cannot tell whether the disk still holds the stale ones.
+    ///
+    /// The `source` of this error and of every refused append has kind [`io::ErrorKind::Other`], so
+    /// [`Error::is_storage_full`] is false even when the sync failed with `ENOSPC` (retrying after freeing space does
+    /// not help); the OS error is its inner error ([`io::Error::get_ref`]).
     pub fn abandoned_write_error(&self) -> Option<&Error> {
         self.abandoned_write_error.as_ref()
     }
