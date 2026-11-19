@@ -3,6 +3,7 @@ package compare;
 import net.openhft.chronicle.queue.*;
 import net.openhft.chronicle.queue.impl.single.SingleChronicleQueueBuilder;
 import net.openhft.chronicle.bytes.Bytes;
+import net.openhft.chronicle.bytes.SyncMode;
 import net.openhft.chronicle.wire.DocumentContext;
 import java.nio.file.Path;
 
@@ -12,7 +13,10 @@ public final class Main {
         final ExcerptAppender appender;
         final ExcerptTailer tailer;
         QueueEndpoint(String role, Path dir) {
-            queue = SingleChronicleQueueBuilder.binary(dir.toFile()).build();
+            // Periodic durability (SD) uses msync(MS_SYNC) through SyncMode.SYNC; otherwise the default.
+            SingleChronicleQueueBuilder builder = SingleChronicleQueueBuilder.binary(dir.toFile());
+            if (Harness.periodicSyncRequested) builder.syncMode(SyncMode.SYNC);
+            queue = builder.build();
             appender = role.equals("writer") ? queue.createAppender() : null;
             tailer = role.equals("reader") ? queue.createTailer().toStart() : null;
         }
@@ -33,6 +37,7 @@ public final class Main {
         }
         public String syncOperation() { return "ExcerptAppender.sync (MS_ASYNC submission)"; }
         public void sync() { appender.sync(); }
+        public String periodicSync() { appender.sync(); return "ExcerptAppender.sync with SyncMode.SYNC (msync MS_SYNC)"; }
         public void close() { queue.close(); }
     }
     public static void main(String[] args) throws Exception { Harness.run(args,QueueEndpoint::new); }

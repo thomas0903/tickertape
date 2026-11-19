@@ -25,6 +25,18 @@ jobs:
       - run: python3 -m unittest discover -s .github/scripts -p 'test_*.py' -v
       - run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
 
+  bench-tooling:
+    name: bench tooling (python)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: '3.12'
+      # Unit tests of the comparison runner (short and sustained mode) and the session runner; nothing is measured.
+      - run: python3 -m unittest discover -s compare -p 'test_*.py' -v
+      - run: python3 -m unittest discover -s benches -p 'test_*.py' -v
+
   check:
     name: check (${{ matrix.os }})
     strategy:
@@ -66,6 +78,9 @@ jobs:
           cargo build -p tickertape-bench --release --bins --locked
           target/release/tt-latency run --dir "$RUNNER_TEMP/tt-lat-smoke" --rate 20000 --count 20000 --payload 64 --reader mapped
           target/release/tt-checkpoint --dir "$RUNNER_TEMP/tt-ckpt-smoke" --payload 64 --batch 100 --checkpoints 2 --segment-size 65536
+          target/release/tt-sustained run --dir "$RUNNER_TEMP/tt-sus-smoke" --out "$RUNNER_TEMP/tt-sus-smoke-out" \
+            --rate 20000 --duration 3s --checkpoint-every 500ms --segment-size 1048576 --retain-segments 4 \
+            --readers mapped,safe:durable:wait=block,safe:delay=100us
 
   ffi:
     name: c abi (${{ matrix.os }})
