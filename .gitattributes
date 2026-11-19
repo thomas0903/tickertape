@@ -1,0 +1,2 @@
+# Format-v1 compatibility fixtures (tests/compat/README.md): packed journals, never diffed, merged or converted.
+tests/compat/fixtures/*.ttfx binary

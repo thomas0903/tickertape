@@ -7,6 +7,8 @@ use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
+pub mod soak;
+
 use tickertape::format::{self, SegmentHeader};
 use tickertape::{NewRecord, OwnedRecord, Reader, ReaderConfig, Writer, WriterConfig};
 

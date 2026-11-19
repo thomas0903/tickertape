@@ -91,6 +91,10 @@ crates.io uploads are immutable, and rerunning does not undo published versions.
 
 ## After publishing
 
+- Add the release's format-v1 compatibility fixtures, written by the tagged version on macOS and Linux
+  (`tests/compat/README.md` → "Adding the fixtures for a new release"): run `tests/compat/generate.sh vX.Y.Z` on
+  both, add the tag to `RELEASED_TAGS` in `tests/compat.rs`, and merge them in a pull request. Every release
+  contributes one set (ADR 0033).
 - Update the README and roadmap to reflect publication and test the installation instructions.
 - Keep launch announcement drafts local under ignored `docs/launch/`; posting requires an explicit instruction.
 - Bump to the next development version only when work on it starts.
