@@ -268,9 +268,10 @@ loop {
 The beacon is `<dir>/readers/risk-engine` (128 bytes); it disappears when dropped. A reader that crashes leaves its
 file behind, but `status` reports it as `stale` (the beacon's `flock` died with the process) and never counts it as
 lag; delete the file when you no longer want to see it, or create a beacon with the same name, which takes it over.
-Creating a beacon never replaces anything but a stale beacon: a name held by a live reader fails with
-`Error::BeaconInUse`, and any other file under the name is left alone. Beacons never influence the writer or
-retention.
+Creating a beacon never replaces anything but a stale beacon (a valid one, or one whose last update was cut short
+when its owner died): a name held by a live reader fails with `Error::BeaconInUse`, and any other file under the
+name is left alone. Names that are journal files' names, in any letter case, are refused. Beacons never influence
+the writer or retention.
 
 - **Permissions.** Beacon files are created with the reader's umask (mode `0666` before the umask). An observer
   needs read access to the beacon directory and the files; a beacon it can't read is reported as `unreadable`, and a
@@ -284,7 +285,9 @@ retention.
 - **`fork`.** The lock belongs to the open file: a child created with `fork` that keeps the beacon's descriptor
   keeps the beacon `live` after its creator dies, until the child exits. The descriptor is close-on-exec, so `exec`
   drops it, but every child holds it from `fork` to `exec`: while another thread spawns a process, a beacon dropped
-  at that moment can still look live (and a creator of the same name can get `BeaconInUse`) for that instant.
+  at that moment can still look live (and a creator of the same name can get `BeaconInUse`) for that instant. A
+  child's copy of a `ReaderBeacon` never writes or removes the file: `update` fails in the child, and dropping the
+  copy leaves the parent's beacon in place.
 - **Filesystems.** Beacons, like journals, are for local filesystems. On network filesystems `flock` may be
   unsupported (observers then report `uncertain`, and lag thresholds apply as for live beacons) or emulated (on Linux
   NFS, an observer in the owner's own process can release the owner's lock).

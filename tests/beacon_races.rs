@@ -321,6 +321,124 @@ fn observer_when_the_owner_leaves_mid_observation() {
     }
 }
 
+/// Forks. The child runs `child` and exits with the code it returns, without running destructors or unwinding.
+fn fork_child(child: impl FnOnce() -> i32) -> libc::pid_t {
+    // SAFETY: fork has no memory-safety preconditions. The child only calls `child`, which the tests keep to a few
+    // system calls and allocations (glibc and macOS's allocator reinitialise their locks in a forked child), then
+    // leaves with `_exit`.
+    let pid = unsafe { libc::fork() };
+    assert!(pid >= 0, "fork failed");
+    if pid == 0 {
+        let code = std::panic::catch_unwind(std::panic::AssertUnwindSafe(child)).unwrap_or(101);
+        // SAFETY: `_exit` ends the process without running atexit handlers or destructors, as a forked child should.
+        unsafe { libc::_exit(code) };
+    }
+    pid
+}
+
+/// Waits for a forked child; its exit code.
+fn wait_child(pid: libc::pid_t) -> i32 {
+    let mut status = 0;
+    // SAFETY: `status` is a valid pointer for the call's duration.
+    let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+    assert_eq!(waited, pid, "waitpid");
+    assert!(
+        libc::WIFEXITED(status),
+        "child did not exit normally: {status}"
+    );
+    libc::WEXITSTATUS(status)
+}
+
+/// Round 2, A5: a child created with `fork` gets a copy of its parent's beacon. Dropping the copy never removes the
+/// parent's live beacon, and updating it fails (the file belongs to the creator).
+#[test]
+fn a_forked_child_never_writes_or_removes_the_beacon() {
+    let _spawning = spawning();
+    let f = fixture();
+    let reader = reader_at(&f.journal, 3);
+    let moved = reader_at(&f.journal, 5);
+    let mut beacon = ReaderBeacon::create_in(&f.beacons, "parent", &reader).unwrap();
+    beacon.set_interval(Duration::ZERO);
+    let before = std::fs::read(beacon.path()).unwrap();
+    let pid = fork_child(|| {
+        // SAFETY: after `fork` this process's `beacon` is a copy the parent never sees, and the child never drops the
+        // original (it leaves with `_exit`): reading it bitwise gives the child one owned value, which it drops as a
+        // child whose code owned the beacon would.
+        let mut copy = unsafe { std::ptr::read(&beacon) };
+        let refused = copy.update(&moved).is_err() && copy.flush(&moved).is_err();
+        drop(copy);
+        if refused { 0 } else { 1 }
+    });
+    assert_eq!(wait_child(pid), 0, "the child wrote the parent's beacon");
+    assert!(
+        beacon.is_published(),
+        "the child's drop removed the parent's beacon"
+    );
+    assert_eq!(std::fs::read(beacon.path()).unwrap(), before);
+    let s = observe(&f);
+    assert_eq!(s.readers.len(), 1);
+    assert_eq!(s.readers[0].state, BeaconState::Live);
+    assert_eq!(s.readers[0].report.unwrap().next_seq, 3);
+    // The parent's own beacon still works and is removed by the parent.
+    assert!(beacon.update(&moved).unwrap());
+    let path = beacon.path().to_path_buf();
+    drop(beacon);
+    assert!(!path.exists());
+}
+
+/// Round 2, A5: a child forked while a creator holds the beacon directory's lock doesn't keep the lock after the
+/// creator releases it (the lock belongs to the open file, which the child shares): the next creator doesn't wait for
+/// the child.
+#[test]
+fn a_forked_child_does_not_keep_the_directory_lock() {
+    let _spawning = spawning();
+    let f = fixture();
+    let reader = reader_at(&f.journal, 2);
+    let mut fds = [0; 2];
+    // SAFETY: `fds` is a valid array of two descriptors for the call's duration.
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    let (read_end, write_end) = (fds[0], fds[1]);
+    let child = std::rc::Rc::new(std::cell::Cell::new(None));
+    let forked = child.clone();
+    on_pause(Some(Box::new(move |p| {
+        if p == Pause::CreatorWroteTemporary && forked.get().is_none() {
+            forked.set(Some(fork_child(|| {
+                let mut byte = 0u8;
+                // SAFETY: `byte` is a valid one-byte buffer; the read blocks until the parent writes or closes.
+                unsafe { libc::read(read_end, (&raw mut byte).cast(), 1) };
+                0
+            })));
+        }
+    })));
+    let first = ReaderBeacon::create_in(&f.beacons, "first", &reader).unwrap();
+    on_pause(None);
+    let pid = child.get().expect("forked at the pause point");
+    // The child still runs, holding copies of every descriptor, the directory lock's included.
+    let beacons = f.beacons.clone();
+    let journal = f.journal.clone();
+    let (done, finished) = channel();
+    thread::spawn(move || {
+        let reader = reader_at(&journal, 1);
+        let created = ReaderBeacon::create_in(&beacons, "second", &reader).map(drop);
+        let _ = done.send(created.is_ok());
+    });
+    let created = finished.recv_timeout(Duration::from_secs(10));
+    // SAFETY: `write_end` is the pipe's write end; writing one byte releases the child.
+    unsafe { libc::write(write_end, [1u8].as_ptr().cast(), 1) };
+    assert_eq!(wait_child(pid), 0);
+    // SAFETY: both descriptors are ours and closed once.
+    unsafe {
+        libc::close(read_end);
+        libc::close(write_end);
+    }
+    assert_eq!(
+        created,
+        Ok(true),
+        "the second creator waited for the child that inherited the directory lock"
+    );
+    drop(first);
+}
+
 /// Kills a child on drop.
 struct Guard(Child);
 
@@ -413,14 +531,20 @@ fn beacon_churn_across_processes() {
     });
     assert!(samples.load(Ordering::Relaxed) > 0);
     // Take over whatever stale beacons remain and drop them: the directory ends up empty, temporary files that
-    // killed creators left included.
+    // killed creators left included, except those of creators killed between creating their temporary file and
+    // writing it: an empty file doesn't prove it is a beacon, so it is left alone.
     let reader = reader_at(&f.journal, 0);
     for name in ["a", "b"] {
         drop(ReaderBeacon::create_in(&f.beacons, name, &reader).unwrap());
     }
     let left: Vec<_> = std::fs::read_dir(&f.beacons)
         .unwrap()
-        .map(|e| e.unwrap().file_name())
+        .map(|e| e.unwrap())
+        .filter(|e| {
+            let name = e.file_name().into_string().unwrap();
+            !(name.ends_with(".beacon-tmp") && e.metadata().unwrap().len() < 128)
+        })
+        .map(|e| e.file_name())
         .collect();
     assert!(left.is_empty(), "left behind: {left:?}");
 }

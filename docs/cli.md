@@ -99,7 +99,9 @@ Errors and recovery warnings go to stderr. JSON results go to stdout (or the sel
   that fails is reported (a JSON line with `error`, a text `error` line, or `tickertape_up 0`) and the watch goes on.
   `--output` writes each sample to a new, uniquely named temporary file in the same directory (created exclusively,
   never following a symlink) and renames it over `FILE`, so a node_exporter textfile collector never reads a partial
-  file; `FILE` must be outside the journal. A one-shot sample that fails still replaces `FILE` with `tickertape_up 0`.
+  file; `FILE` must be outside the journal and the beacon directory, and must not be a file that the journal's
+  entries name through symlinks (checked before every replacement). A one-shot sample that fails still replaces
+  `FILE` with `tickertape_up 0`.
   `--watch` with `--format prometheus` needs `--output`. Thresholds (`DUR` and `B` as for `archive`):
   `--max-checkpoint-age` is breached when records are uncovered and the checkpoint's estimated age is above `DUR` or
   unknown, or there is no checkpoint (an idle, fully checkpointed journal and an empty one are healthy);

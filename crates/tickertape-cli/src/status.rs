@@ -3,6 +3,7 @@
 use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -112,6 +113,10 @@ pub(crate) fn run(args: StatusArgs, out: &mut dyn Write) -> Result<()> {
     if let Some(readers) = &args.readers_dir {
         sampler = sampler.readers_dir(readers);
     }
+    let readers_dir = args
+        .readers_dir
+        .clone()
+        .unwrap_or_else(|| journal.join(tickertape::status::READERS_DIR));
     let mut taken = 0u64;
     loop {
         let sampled = sampler.sample();
@@ -161,7 +166,10 @@ pub(crate) fn run(args: StatusArgs, out: &mut dyn Write) -> Result<()> {
         let print = args.watch.is_some() || outcome.is_ok() || output.is_some();
         if print {
             match &output {
-                Some(path) => replace_file(path, text.as_bytes())?,
+                Some(path) => {
+                    check_output(&journal, &readers_dir, path)?;
+                    replace_file(path, text.as_bytes())?;
+                }
                 None => {
                     if taken > 0 && format == StatusFormat::Text {
                         writeln!(out).map_err(|e| output::io_error("write output", e))?;
@@ -240,6 +248,45 @@ fn destination(journal: &Path, path: &Path) -> Result<PathBuf> {
         ));
     }
     Ok(parent.join(name))
+}
+
+/// Refuses to replace `dest` if that could change what a sample reads, checked before every replacement because the
+/// journal can change between samples. `dest` must not be in the beacon directory, and must not be a file that an
+/// entry of the journal directory names, following symlinks: a segment or the marker may be a symlink to a file
+/// outside the journal, which renaming over `dest` would replace. Hard links count too (renaming over one would not
+/// change the journal's file, but the alias is refused, as `export` refuses it).
+fn check_output(journal: &Path, readers_dir: &Path, dest: &Path) -> Result<()> {
+    let refuse = || {
+        Failure::usage(format!(
+            "status output {} is a file the journal or its beacon directory uses",
+            dest.display()
+        ))
+    };
+    if let Ok(readers) = fs::canonicalize(readers_dir) {
+        if dest.parent().is_some_and(|p| p.starts_with(&readers)) {
+            return Err(refuse());
+        }
+    }
+    // Nothing to replace yet.
+    let Ok(target) = fs::metadata(dest) else {
+        return Ok(());
+    };
+    let entries = match fs::read_dir(journal) {
+        Ok(entries) => entries,
+        // No journal, so nothing of it to replace (the sample reports it missing).
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(output::io_error("list journal directory", e)),
+    };
+    for entry in entries {
+        let entry = entry.map_err(|e| output::io_error("list journal directory", e))?;
+        // `metadata` follows symlinks: the file a sample reads through this name.
+        if fs::metadata(entry.path())
+            .is_ok_and(|m| m.dev() == target.dev() && m.ino() == target.ino())
+        {
+            return Err(refuse());
+        }
+    }
+    Ok(())
 }
 
 /// The `n`th candidate temporary name for replacing `path`, in the same directory.

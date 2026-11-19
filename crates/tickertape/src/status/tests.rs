@@ -946,6 +946,15 @@ fn beacons_never_replace_other_files() {
         "00000000000000000000.tape",
         "00000000000000000000.tape.tmp",
         "x.tmp",
+        // Round 2, A1: on a case-insensitive filesystem (APFS) these name journal files.
+        "CHECKPOINT",
+        "Writer.Lock",
+        "NOTIFY",
+        "Next-Segment.TMP",
+        "Quarantine",
+        "READERS",
+        "00000000000000000000.TAPE",
+        "x.Tmp",
     ] {
         assert!(!beacon::name_allowed(name), "{name}");
         let err = ReaderBeacon::create_in(dir.path(), name, &reader).unwrap_err();
@@ -961,8 +970,10 @@ fn beacons_never_replace_other_files() {
     };
     let mut long = valid.clone();
     long.push(0);
+    // A damaged magic is not a beacon. (A beacon whose later bytes are damaged is one whose update was cut short: see
+    // `torn_stale_beacon_is_taken_over`.)
     let mut damaged = valid.clone();
-    damaged[30] ^= 1;
+    damaged[3] ^= 1;
     for (name, contents) in [
         ("notes", b"my notes".to_vec()),
         ("empty", Vec::new()),
@@ -1003,8 +1014,22 @@ fn leftover_temporary_files_are_removed() {
     drop(Writer::open(dir.path(), config()).unwrap());
     let reader = Reader::open(dir.path(), ReaderConfig::default()).unwrap();
     let beacons = tempfile::tempdir().unwrap();
+    let valid = {
+        let b = ReaderBeacon::create_in(beacons.path(), "probe", &reader).unwrap();
+        fs::read(b.path()).unwrap()
+    };
     let dead = beacons.path().join(".r.4242.0.beacon-tmp");
-    fs::write(&dead, b"").unwrap();
+    fs::write(&dead, &valid).unwrap();
+    // Round 2, A2: names, file types and free locks don't prove provenance. These reach the deletion check (valid
+    // temporary names, regular, unlocked) but their contents are not a beacon's, so they stay.
+    let notes = beacons.path().join(".notes.123.0.beacon-tmp");
+    fs::write(&notes, b"my notes").unwrap();
+    let empty = beacons.path().join(".r.4244.0.beacon-tmp");
+    fs::write(&empty, b"").unwrap();
+    let mut longer = valid.clone();
+    longer.push(0);
+    let long = beacons.path().join(".r.4245.0.beacon-tmp");
+    fs::write(&long, &longer).unwrap();
     let held = beacons.path().join(".r.4243.0.beacon-tmp");
     let held_file = File::create(&held).unwrap();
     rustix::fs::flock(&held_file, rustix::fs::FlockOperation::LockExclusive).unwrap();
@@ -1016,6 +1041,42 @@ fn leftover_temporary_files_are_removed() {
     assert!(!dead.exists());
     assert!(held.exists());
     assert!(unrelated.exists());
+    assert_eq!(fs::read(&notes).unwrap(), b"my notes");
+    assert!(empty.exists());
+    assert_eq!(fs::read(&long).unwrap(), longer);
+}
+
+/// Round 2, A6: a beacon whose last update was cut short (a partial `pwrite`, then its owner died) fails its checksum
+/// but still starts with the beacon magic and version, which every write rewrites unchanged. Unlocked, it is a stale
+/// beacon: the next creator takes the name over instead of refusing it for ever. Observers report it invalid.
+#[test]
+fn torn_stale_beacon_is_taken_over() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut writer = Writer::open(dir.path(), config()).unwrap();
+    append(&mut writer, 5, 10, 0);
+    let mut reader = Reader::open(dir.path(), ReaderConfig::default()).unwrap();
+    let path = stale_beacon(ReaderBeacon::create(dir.path(), "torn", &reader).unwrap());
+    // The prefix of a later update: the next 40 bytes of a beacon for a reader that moved on.
+    reader.try_next().unwrap().unwrap();
+    let newer = {
+        let beacons = tempfile::tempdir().unwrap();
+        let b = ReaderBeacon::create_in(beacons.path(), "newer", &reader).unwrap();
+        fs::read(b.path()).unwrap()
+    };
+    let old = fs::read(&path).unwrap();
+    let mut torn = newer[..40].to_vec();
+    torn.extend_from_slice(&old[40..]);
+    assert_ne!(torn, old);
+    fs::write(&path, &torn).unwrap();
+    assert!(beacon::decode(&torn).is_none());
+    let s = status(dir.path()).unwrap();
+    assert_eq!(s.readers[0].state, BeaconState::Invalid);
+
+    let taken = ReaderBeacon::create(dir.path(), "torn", &reader).unwrap();
+    assert!(taken.is_published());
+    let s = status(dir.path()).unwrap();
+    assert_eq!(s.readers[0].state, BeaconState::Live);
+    assert_eq!(s.readers[0].report.unwrap().next_seq, 1);
 }
 
 /// Finding 7: unreadable beacons and unusable beacon directories never fail the sample.

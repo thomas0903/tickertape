@@ -585,6 +585,59 @@ fn watch_output_file_and_samples() {
     drop(writer);
 }
 
+/// Round 2, A4: `--output` never replaces a file the journal reads through a symlink (a segment kept outside the
+/// journal directory), nor a file in the beacon directory.
+#[test]
+fn output_never_replaces_a_file_the_journal_uses() {
+    let _serial = serial();
+    let (dir, writer) = journal(3, true);
+    drop(writer);
+    let outside = tempfile::tempdir().unwrap();
+    let segment = dir.path().join("00000000000000000000.tape");
+    let backing = outside.path().join("backing.tape");
+    fs::rename(&segment, &backing).unwrap();
+    std::os::unix::fs::symlink(&backing, &segment).unwrap();
+    let before = fs::read(&backing).unwrap();
+    // The journal is readable through the symlink.
+    let (json, code) = status_json(&[dir.path().to_str().unwrap()]);
+    assert_eq!(code, 0, "{json}");
+    assert_eq!(json["head"]["next_seq"], 3);
+    for args in [&[][..], &["--watch", "10ms", "--samples", "1"][..]] {
+        command()
+            .args([
+                "status",
+                dir.path().to_str().unwrap(),
+                "--format",
+                "prometheus",
+                "--output",
+            ])
+            .arg(&backing)
+            .args(args)
+            .assert()
+            .code(1)
+            .stderr(predicate::str::contains(
+                "the journal or its beacon directory uses",
+            ));
+        assert_eq!(
+            fs::read(&backing).unwrap(),
+            before,
+            "the segment was replaced"
+        );
+    }
+    // A beacon directory chosen with --readers-dir is off limits too.
+    let beacons = tempfile::tempdir().unwrap();
+    let victim = beacons.path().join("reader");
+    fs::write(&victim, b"beacon").unwrap();
+    command()
+        .args(["status", dir.path().to_str().unwrap(), "--readers-dir"])
+        .arg(beacons.path())
+        .arg("--output")
+        .arg(&victim)
+        .assert()
+        .code(1);
+    assert_eq!(fs::read(&victim).unwrap(), b"beacon");
+}
+
 #[test]
 fn text_output() {
     let _serial = serial();

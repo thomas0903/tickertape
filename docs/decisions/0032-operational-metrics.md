@@ -1,7 +1,7 @@
 # 0032: Operational metrics and reader beacons
 
 - **Status:** proposed
-- **Date:** 2026-11-19 (revised the same day after review round 1 of PR #8)
+- **Date:** 2026-11-19 (revised the same day after review rounds 1 and 2 of PR #8)
 
 ## Context
 
@@ -138,28 +138,57 @@ descriptor, so no lock file is needed). Observers never take it.
 
 1. Check the name: 1 to 64 ASCII letters, digits, `.`, `_`, `-`, not starting with `.`; not a journal file's name
    (`checkpoint`, `writer.lock`, `notify`, `next-segment.tmp`, `quarantine`, `readers`); not ending in `.tape` or
-   `.tmp`. A beacon directory may be the journal directory itself, so this keeps beacons away from journal files by
-   construction.
+   `.tmp`; all compared ignoring ASCII case, since on a case-insensitive filesystem (APFS by default) `CHECKPOINT`
+   names the marker. A beacon directory may be the journal directory itself, so this keeps beacons away from journal
+   files by construction.
 2. Read the reader's segment header (from the reader's own descriptor) and encode the beacon.
 3. Lock `D` exclusively (waiting if another creator holds it).
-4. Remove temporary files that creators which died before publishing left (`.<name>.<pid>.<n>.beacon-tmp`, regular,
-   unlocked). Under the directory lock, an unlocked temporary file can't belong to a creator that is still working.
+4. Remove temporary files that creators which died before publishing left: names of the form
+   `.<name>.<pid>.<n>.beacon-tmp` that are regular files, unlocked, **and whose contents prove they are beacons**
+   (below), if the name still names the file checked. Under the directory lock, an unlocked temporary file can't
+   belong to a creator that is still working; but a name, a file type and a free lock don't prove where a file came
+   from, and the directory may be the caller's, so the contents decide (decision below).
 5. Create a new temporary file `.<name>.<pid>.<n>.beacon-tmp` with `O_CREAT | O_EXCL` (never follows a symlink,
-   never opens an existing file), with the process's umask; lock it exclusively (it is new, so this can't fail for
-   contention); write the complete beacon.
-6. Publish: `link` the temporary file to `name`. If that succeeds, unlink the temporary name. Done.
+   never opens an existing file), with the process's umask; note its identity (`fstat`); lock it exclusively (it is
+   new, so this can't fail for contention); write the complete beacon.
+6. Publish: `link` the temporary file to `name`. If that succeeds, unlink the temporary name if it still names the
+   temporary file (`lstat`). Done.
 7. If `name` exists, check it (takeover): open it `O_NONBLOCK | O_NOFOLLOW`; it must be a regular file. Probe its
    lock with a **shared** non-blocking `flock`: if that fails, a live owner holds it: refuse with
-   `Error::BeaconInUse`. If it succeeds (release it at once), read it: it must be exactly 128 bytes that decode
-   (magic, version, flags, reserved bytes, checksum); otherwise refuse with `Error::InvalidConfig` and leave it
-   untouched. Then `lstat` the name: if it no longer names the file just checked, go back to step 6. Otherwise
-   `rename` the temporary file over it, and check that the name now names the new beacon.
-8. Unlock `D`.
+   `Error::BeaconInUse`. If it succeeds (release it at once), read it: it must be exactly 128 bytes that are a beacon
+   (below); otherwise refuse with `Error::InvalidConfig` and leave it untouched. Then `lstat` the name: if it no
+   longer names the file just checked, go back to step 6. Otherwise `rename` the temporary file over it, and check
+   that the name now names the new beacon.
+8. Unlock `D` explicitly (`flock(LOCK_UN)`), then close it.
 
-**Updating**: `pwrite` the 128 bytes at offset 0 of the locked file.
+**What proves a file is a beacon.** Exactly 128 bytes whose first 12 are the magic `TTREADER` and version 1. Every
+write of a beacon rewrites these bytes with the same values, so any mix of a beacon's writes still has them: in
+particular an update cut short (a partial `pwrite` followed by an error, such as `EFBIG` under a file-size limit)
+whose owner then died without its destructors. Only beacon code writes them. The checksum is not required here: a
+torn beacon fails it, and without this rule its name would be stranded for ever (every later creator would refuse
+it). Observers still require the full decode and report a torn beacon `invalid`.
 
-**Removing** (dropping the beacon): `lstat` the name; if it still names this beacon's file, unlink it; then close
-the file, which releases the lock.
+**Decision (round 2): torn updates are taken over, not prevented.** The alternatives were an update protocol that
+keeps a valid report at all times (two alternating slots, or write-and-rename per update), which would change the
+128-byte format or cost several system calls per update instead of one `pwrite`. Recognising a torn beacon by the
+bytes no write changes keeps the format and the update cost, and the lock still decides liveness: a torn file is
+taken over only if no process holds it. **Temporary files** are removed by the same rule, so a leftover is removed
+only if its creator wrote it completely at least once; the empty file of a creator that died between creating and
+writing it (a window of one system call) stays, a harmless hidden file of the creator's name, rather than letting a
+name pattern justify deleting files in a directory the caller chose.
+
+**Updating**: `pwrite` the 128 bytes at offset 0 of the locked file, only in the process that created the beacon.
+
+**Removing** (dropping the beacon): in the process that created the beacon only, `lstat` the name; if it still
+names this beacon's file, unlink it; then close the file, which releases the lock.
+
+**Forked children.** A child created with `fork` gets a copy of the `ReaderBeacon` and of its descriptor. The beacon
+records its creator's process id: in any other process `update` and `flush` fail and dropping the copy does nothing,
+so a child that exits never unlinks its parent's live beacon (`a_forked_child_never_writes_or_removes_the_beacon`).
+The directory lock is released explicitly at step 8, so a child forked while its creator held it doesn't keep it
+once the creator is done (`a_forked_child_does_not_keep_the_directory_lock`). If the creator dies while holding the
+directory lock, a child forked meanwhile keeps it until the child exits or execs, and creators in that directory wait
+for it.
 
 **Observing** a beacon in `D` (no directory lock): skip names that are invalid or reserved and entries that are known
 not to be regular files; open the name `O_NONBLOCK | O_NOFOLLOW` (a FIFO, socket, directory or symlink is skipped,
@@ -201,9 +230,13 @@ umask 077) is `unreadable`; one that doesn't decode is `invalid`.
   `observer_when_the_owner_leaves_mid_observation`).
 - *A torn update.* An observer that reads while the owner rewrites the beacon may see a mix; the checksum fails and
   it reads again.
-- *A creator that dies.* Before step 6, it leaves a temporary file, removed by the next creator (step 4); between the
-  `link` and the unlink of the temporary name, a second, harmless link to a now stale beacon, removed the same way.
-  It never holds the directory lock beyond its death.
+- *A creator that dies.* Before step 6, it leaves a temporary file, removed by the next creator (step 4) once it was
+  written; between the `link` and the unlink of the temporary name, a second, harmless link to a now stale beacon,
+  removed the same way. It never holds the directory lock beyond its death, unless a child it forked meanwhile
+  survives it (above).
+- *An owner that dies during an update.* A `pwrite` cut short leaves a torn beacon: observers report it `invalid`,
+  and the next creator of the name takes it over, since it is unlocked and still a beacon by the rule above
+  (`torn_stale_beacon_is_taken_over`).
 
 **Limits, stated in the rustdoc and in `docs/operations.md`.** The lock belongs to the open file, not the process: a
 child created with `fork` that keeps the descriptor keeps a dead reader's beacon live until the child exits. The
@@ -279,7 +312,9 @@ path, so `./j` and `/abs/j` are one series.
   repeated expositions in one stream are not a valid exposition.
 - **`--output`** writes each sample to a new, uniquely named temporary file in the destination directory, created
   with `O_CREAT | O_EXCL` (it never follows a symlink or opens an existing file), and renames it over the target; the
-  temporary file is removed on every error. The target must be outside the journal. A one-shot sample that fails
+  temporary file is removed on every error. The target must be outside the journal and the beacon directory, and,
+  checked before every replacement, must not be a file that an entry of the journal directory names, following
+  symlinks (a segment or the marker may be a symlink to a file outside the journal, which the rename would replace). A one-shot sample that fails
   still replaces the file (with `tickertape_up 0`), so a collector never keeps serving a stale healthy sample.
 
 ## Compatibility
@@ -298,8 +333,9 @@ path, so `./j` and `/abs/j` are one series.
 - **v0.4.0's `export --output`** walks the journal directory tree to reject an output file that is a hard link to a
   journal file. It fails if an entry disappears mid-walk (a beacon dropped at that moment) or a subdirectory can't be
   listed (another user's `readers/`): a transient failure of an export to a file, which a retry fixes. This change
-  makes the walk skip entries that vanish and subdirectories it cannot list; the journal directory itself must still
-  be listable.
+  makes the walk skip, **inside `readers/` only**, entries that vanish and a directory it cannot list. Everywhere
+  else it fails closed as v0.4.0 does: an unreadable `quarantine/` (which may hold the only copy of repaired-away
+  bytes) or a segment that vanishes mid-walk is an error, never a reason to truncate the output.
 
 ## Consequences
 

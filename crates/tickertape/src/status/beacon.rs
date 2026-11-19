@@ -34,7 +34,8 @@ const CRC_AT: usize = BEACON_LEN - 4;
 /// Suffix of a creator's temporary file (`.<name>.<pid>.<n>.beacon-tmp`). Starts with a dot, so never a beacon name.
 const TMP_SUFFIX: &str = ".beacon-tmp";
 /// Names in a journal directory that a beacon must never take, even in a beacon directory of the caller's choosing
-/// (which may be the journal directory itself). Names ending in `.tape` or `.tmp` are refused as well.
+/// (which may be the journal directory itself). Names ending in `.tape` or `.tmp` are refused as well. All compared
+/// ignoring ASCII case: on a case-insensitive filesystem (APFS by default) `CHECKPOINT` names the marker.
 const RESERVED_NAMES: [&str; 6] = [
     journal::CHECKPOINT_FILE,
     journal::LOCK_FILE,
@@ -66,7 +67,9 @@ const OBSERVE_ATTEMPTS: u32 = 3;
 /// **Caveats.** The lock belongs to the open file, not the process: a child created with `fork` that keeps the
 /// descriptor keeps the beacon live after its creator dies, until the child exits. The descriptor is close-on-exec,
 /// so `exec` drops it, but from `fork` to `exec` every child holds it: while another thread is spawning a process,
-/// a beacon that was just dropped can still look live for that moment. On network filesystems `flock` may be emulated or unsupported (Linux NFS emulates it with
+/// a beacon that was just dropped can still look live for that moment. A forked child's copy of a `ReaderBeacon`
+/// never writes or removes the file (its creator's process id is recorded): [`ReaderBeacon::update`] fails there,
+/// and dropping it does nothing. On network filesystems `flock` may be emulated or unsupported (Linux NFS emulates it with
 /// byte-range locks, so a probe from the same process as the owner can release the owner's lock); beacons are
 /// supported on local filesystems only, like the journal. Where the lock can't be probed, observers report
 /// [`BeaconState::Uncertain`].
@@ -94,9 +97,13 @@ pub struct ReaderBeacon {
     identity: Identity,
     interval: Duration,
     last_write: Option<Instant>,
-    last_seq: Option<u64>,
+    /// The cursor last written: slot sequence number, skip target, offset and segment file.
+    last_cursor: Option<(u64, u64, u64, Identity)>,
     /// The reader's current segment file and its header's creation time and size, read once per segment.
     segment: Option<(Identity, u64, u64)>,
+    /// The process that created the beacon. A child created with `fork` gets a copy of the beacon, but the file is
+    /// its creator's: the child never writes or removes it.
+    creator: u32,
 }
 
 impl ReaderBeacon {
@@ -105,8 +112,10 @@ impl ReaderBeacon {
     ///
     /// `name` is 1 to 64 ASCII letters, digits, `.`, `_` or `-`; it doesn't start with `.`, isn't the name of a
     /// journal file (`checkpoint`, `writer.lock`, `notify`, `next-segment.tmp`, `quarantine`, `readers`) and doesn't
-    /// end in `.tape` or `.tmp`. If a file already has the name, it is replaced only if it is positively a stale beacon
-    /// (exactly 128 bytes, valid magic, version and checksum, and unlocked); anything else is left untouched.
+    /// end in `.tape` or `.tmp` (all compared ignoring ASCII case). If a file already has the name, it is replaced
+    /// only if it is positively a stale beacon: unlocked, exactly 128 bytes, starting with a beacon's magic and version
+    /// (a valid beacon whose owner died, or one whose last update was cut short before its owner died). Anything else
+    /// is left untouched.
     ///
     /// The file is created with the process's umask (mode `0666` before the umask); an observer needs read access to
     /// it and to the directory. Creation waits while another process creates a beacon in the same directory
@@ -139,9 +148,10 @@ impl ReaderBeacon {
     /// directory with [`Sampler::readers_dir`](super::Sampler::readers_dir) or `tickertape status --readers-dir`.
     ///
     /// Cost: `open` and `flock` of the directory, a `readdir` pass to remove temporary files that crashed creators
-    /// left, `open` (exclusive create), `flock`, `fstat`, a 128-byte `pwrite` and `link` of a temporary file, then
-    /// `unlink` of its temporary name. Taking over a stale beacon instead costs an `open`, `fstat`, `flock`, `pread`
-    /// and `lstat` of the old file and a `rename`. Reading the reader's segment header costs one `fstat` and `pread`.
+    /// left, `open` (exclusive create), `fstat`, `flock`, a 128-byte `pwrite` and `link` of a temporary file, then
+    /// `lstat` and `unlink` of its temporary name, and `flock` (unlock) and `close` of the directory. Taking over a
+    /// stale beacon instead costs an `open`, `fstat`, two `flock`s, two `pread`s and an `lstat` of the old file, a
+    /// `rename` and an `lstat`. Reading the reader's segment header costs one `fstat` and `pread`.
     ///
     /// # Errors
     ///
@@ -157,23 +167,25 @@ impl ReaderBeacon {
         let mut segment = None;
         let bytes = encode(&payload_of(reader, &mut segment)?);
 
-        let _dir_lock = DirLock::acquire(dir)?;
+        let dir_lock = DirLock::acquire(dir)?;
         remove_leftovers(dir);
         let (mut tmp, file) = Temporary::create(dir, name)?;
         file.write_all_at(&bytes, 0)
             .map_err(|e| Error::io("write reader beacon", &tmp.path, e))?;
         pause(Pause::CreatorWroteTemporary);
-        let identity = journal::file_identity(&file, &tmp.path)?;
-        publish(&tmp.path, &path, identity)?;
+        let identity = tmp.identity;
+        publish(&tmp, &path)?;
         tmp.published = true;
+        drop(dir_lock);
         Ok(ReaderBeacon {
             path,
             file,
             identity,
             interval: super::DEFAULT_BEACON_INTERVAL,
             last_write: Some(Instant::now()),
-            last_seq: Some(reader.position()),
+            last_cursor: Some(cursor_key(reader)),
             segment,
+            creator: std::process::id(),
         })
     }
 
@@ -183,19 +195,23 @@ impl ReaderBeacon {
         self.interval = interval;
     }
 
-    /// Publishes `reader`'s cursor if its sequence number ([`Reader::position`]) moved since the last write and the
-    /// interval has passed. Returns whether it wrote.
+    /// Publishes `reader`'s cursor if it moved since the last write and the interval has passed. Returns whether it
+    /// wrote. The whole cursor is compared (the slot, a pending seek's target and the segment file), not only
+    /// [`Reader::position`], so a seek that resolves, or a cursor that moves to another file at the same sequence
+    /// number, is published too.
     ///
-    /// Cost: a comparison if the position hasn't moved; otherwise one monotonic clock read, and at most once per
-    /// interval one 128-byte `pwrite` (no sync) and a wall-clock read, plus one `fstat` and a 64-byte `pread` of the
-    /// segment header when the reader has moved to another segment file since the last write. Calling it after every
-    /// record adds about one clock read per record; call it once per batch where that matters.
+    /// Cost: a comparison if the cursor hasn't moved; otherwise one monotonic clock read, and at most once per
+    /// interval a `getpid`, one 128-byte `pwrite` (no sync) and a wall-clock read, plus one `fstat` and a 64-byte
+    /// `pread` of the segment header when the reader has moved to another segment file since the last write. Calling
+    /// it after every record adds about one clock read per record; call it once per batch where that matters.
     ///
     /// # Errors
     ///
-    /// [`Error::Io`] if the write fails, [`Error::Corrupt`] if the reader's segment header can't be read.
+    /// [`Error::Io`] if the write fails, or if this process is not the one that created the beacon (a child created
+    /// with `fork` holds a copy of the beacon but must not write it); [`Error::Corrupt`] if the reader's segment
+    /// header can't be read.
     pub fn update(&mut self, reader: &Reader) -> Result<bool> {
-        if self.last_seq == Some(reader.position())
+        if self.last_cursor == Some(cursor_key(reader))
             || self
                 .last_write
                 .is_some_and(|at| at.elapsed() < self.interval)
@@ -208,7 +224,7 @@ impl ReaderBeacon {
 
     /// Publishes `reader`'s cursor now, whatever the interval.
     ///
-    /// Cost: one 128-byte `pwrite`, plus a segment header read as for [`ReaderBeacon::update`].
+    /// Cost: a `getpid` and one 128-byte `pwrite`, plus a segment header read as for [`ReaderBeacon::update`].
     ///
     /// # Errors
     ///
@@ -231,18 +247,44 @@ impl ReaderBeacon {
     }
 
     fn write(&mut self, reader: &Reader) -> Result<()> {
+        if std::process::id() != self.creator {
+            return Err(Error::io(
+                "write reader beacon",
+                &self.path,
+                io::Error::other(
+                    "the beacon belongs to the process that created it, not to a forked child",
+                ),
+            ));
+        }
+        let key = cursor_key(reader);
         let payload = payload_of(reader, &mut self.segment)?;
         self.file
             .write_all_at(&encode(&payload), 0)
             .map_err(|e| Error::io("write reader beacon", &self.path, e))?;
         self.last_write = Some(Instant::now());
-        self.last_seq = Some(payload.report.next_seq);
+        self.last_cursor = Some(key);
         Ok(())
     }
 }
 
+/// What [`ReaderBeacon::update`] compares: the reader's slot sequence number, skip target, offset and segment file.
+fn cursor_key(reader: &Reader) -> (u64, u64, u64, Identity) {
+    let parts = reader.cursor_parts();
+    (
+        parts.slot_seq,
+        parts.skip_until,
+        parts.offset,
+        parts.identity,
+    )
+}
+
 impl Drop for ReaderBeacon {
     fn drop(&mut self) {
+        // A child created with `fork` has a copy of this value (and of the descriptor), but the file belongs to the
+        // creator, which may still be using it: only the creator removes it.
+        if std::process::id() != self.creator {
+            return;
+        }
         // We still hold the lock, so no creator can take the name over between this check and the unlink: only a
         // stale beacon is ever replaced. The lock is released when `file` closes, after the unlink.
         if self.is_published() {
@@ -293,7 +335,13 @@ fn valid_name(name: &str) -> bool {
 }
 
 fn reserved(name: &str) -> bool {
-    RESERVED_NAMES.contains(&name) || name.ends_with(".tape") || name.ends_with(".tmp")
+    let ends_with = |suffix: &str| {
+        name.len() >= suffix.len()
+            && name.as_bytes()[name.len() - suffix.len()..].eq_ignore_ascii_case(suffix.as_bytes())
+    };
+    RESERVED_NAMES.iter().any(|r| r.eq_ignore_ascii_case(name))
+        || ends_with(".tape")
+        || ends_with(".tmp")
 }
 
 fn lstat_identity(path: &Path) -> Option<Identity> {
@@ -412,6 +460,15 @@ pub(super) fn decode(b: &[u8]) -> Option<Payload> {
     })
 }
 
+/// Whether `b` is a beacon file's contents, possibly torn: it starts with the magic and version, which every write of
+/// a beacon rewrites with the same bytes. So an update cut short (a partial `pwrite` followed by an error such as
+/// `EFBIG`, after which the owner died) still has them, while the checksum fails. Only beacon code writes them: a
+/// 128-byte file that starts with them, unlocked, is a beacon whose owner has gone (ADR 0032 → "The beacon
+/// protocol").
+fn is_beacon_file(b: &[u8; BEACON_LEN]) -> bool {
+    b[0..8] == BEACON_MAGIC && b[8..12] == BEACON_VERSION.to_le_bytes()
+}
+
 /// Reads a beacon file through `file`: its exact contents if it has exactly [`BEACON_LEN`] bytes.
 fn read_exact_beacon(file: &File) -> io::Result<Option<[u8; BEACON_LEN]>> {
     // One byte more than a beacon, to see a longer file without trusting `fstat` alone.
@@ -447,6 +504,15 @@ fn probe(file: &File) -> BeaconState {
     }
 }
 
+/// Whether opening a possible beacon failed because the name is a symlink (`ELOOP`, from `O_NOFOLLOW`) or a socket
+/// (`ENXIO` on Linux, `EOPNOTSUPP` on macOS): not a beacon.
+fn not_openable(e: &io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(libc::ELOOP | libc::ENXIO | libc::EOPNOTSUPP)
+    )
+}
+
 /// Opens a possible beacon without blocking and without following a symlink.
 fn open_beacon(path: &Path) -> io::Result<File> {
     OpenOptions::new()
@@ -456,8 +522,19 @@ fn open_beacon(path: &Path) -> io::Result<File> {
 }
 
 /// The exclusive lock on a beacon directory that creators hold while they create or take over a beacon there.
+///
+/// Released explicitly when dropped, not only by closing the descriptor: a child created with `fork` meanwhile holds
+/// a copy of the descriptor, and the lock (which belongs to the open file) would otherwise stay held until the child
+/// exits or execs. A child forked while its creator held the lock still keeps it if the creator dies before releasing
+/// it; creators in that directory then wait for the child.
 struct DirLock {
-    _dir: File,
+    dir: File,
+}
+
+impl Drop for DirLock {
+    fn drop(&mut self) {
+        let _ = rustix::fs::flock(&self.dir, rustix::fs::FlockOperation::Unlock);
+    }
 }
 
 impl DirLock {
@@ -471,18 +548,28 @@ impl DirLock {
             Ok(()) => {}
             Err(e) if e == rustix::io::Errno::WOULDBLOCK => {
                 pause(Pause::CreatorWaitsForDirectoryLock);
-                rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive)
-                    .map_err(|e| Error::io("lock reader beacon directory", dir, e.into()))?;
+                loop {
+                    match rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive) {
+                        Ok(()) => break,
+                        // A signal interrupted the wait.
+                        Err(e) if e == rustix::io::Errno::INTR => {}
+                        Err(e) => {
+                            return Err(Error::io("lock reader beacon directory", dir, e.into()));
+                        }
+                    }
+                }
             }
             Err(e) => return Err(Error::io("lock reader beacon directory", dir, e.into())),
         }
-        Ok(DirLock { _dir: file })
+        Ok(DirLock { dir: file })
     }
 }
 
 /// The name of a creator's temporary beacon, removed unless the beacon was published.
 struct Temporary {
     path: PathBuf,
+    /// The temporary file (device, inode): the name is removed only while it still names this file.
+    identity: Identity,
     published: bool,
 }
 
@@ -504,8 +591,16 @@ impl Temporary {
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists && n < 1000 => continue,
                 Err(e) => return Err(Error::io("create reader beacon", &path, e)),
             };
+            let identity = match journal::file_identity(&file, &path) {
+                Ok(identity) => identity,
+                Err(e) => {
+                    let _ = fs::remove_file(&path);
+                    return Err(e);
+                }
+            };
             let tmp = Temporary {
                 path,
+                identity,
                 published: false,
             };
             rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive)
@@ -516,23 +611,33 @@ impl Temporary {
     }
 }
 
+impl Temporary {
+    /// Removes the temporary name if it still names this file.
+    fn remove(&self) {
+        if lstat_identity(&self.path) == Some(self.identity) {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
 impl Drop for Temporary {
     fn drop(&mut self) {
         if !self.published {
-            let _ = fs::remove_file(&self.path);
+            self.remove();
         }
     }
 }
 
 /// Publishes the temporary beacon at `path`: links it there if the name is free, or replaces a stale beacon. Runs
 /// under the directory lock, so no other creator changes the name meanwhile.
-fn publish(tmp: &Path, path: &Path, identity: Identity) -> Result<()> {
+fn publish(tmp: &Temporary, path: &Path) -> Result<()> {
+    let identity = tmp.identity;
     for _ in 0..PUBLISH_ATTEMPTS {
-        match fs::hard_link(tmp, path) {
+        match fs::hard_link(&tmp.path, path) {
             Ok(()) => {
                 // The beacon is published; a leftover temporary name is a harmless second link, removed by a later
                 // creator.
-                let _ = fs::remove_file(tmp);
+                tmp.remove();
                 return Ok(());
             }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
@@ -542,7 +647,7 @@ fn publish(tmp: &Path, path: &Path, identity: Identity) -> Result<()> {
             Existing::Changed => continue,
             Existing::Stale => {
                 pause(Pause::CreatorFoundStale);
-                fs::rename(tmp, path)
+                fs::rename(&tmp.path, path)
                     .map_err(|e| Error::io("replace stale reader beacon", path, e))?;
                 if lstat_identity(path) != Some(identity) {
                     // Only something outside the protocol can have replaced it since.
@@ -570,9 +675,10 @@ enum Existing {
     Stale,
 }
 
-/// Checks the file at `path` before a takeover: it must be a regular file of exactly [`BEACON_LEN`] bytes that
-/// decodes, and unlocked. The lock is probed first: if it is held, the file is someone's live beacon, whatever its
-/// contents show at this instant; if it is free, nobody can write it any more, so its contents are final.
+/// Checks the file at `path` before a takeover: it must be a regular file of exactly [`BEACON_LEN`] bytes that is a
+/// beacon ([`is_beacon_file`]: valid, or an update cut short when its owner died), and unlocked. The lock is probed
+/// first: if it is held, the file is someone's live beacon, whatever its contents show at this instant; if it is
+/// free, nobody can write it any more, so its contents are final.
 fn check_existing(path: &Path) -> Result<Existing> {
     let not_a_beacon = || {
         Error::InvalidConfig(format!(
@@ -583,11 +689,7 @@ fn check_existing(path: &Path) -> Result<Existing> {
     let file = match open_beacon(path) {
         Ok(file) => file,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Existing::Changed),
-        Err(e)
-            if e.raw_os_error() == Some(libc::ELOOP) || e.raw_os_error() == Some(libc::ENXIO) =>
-        {
-            return Err(not_a_beacon());
-        }
+        Err(e) if not_openable(&e) => return Err(not_a_beacon()),
         Err(e) => return Err(Error::io("open existing reader beacon", path, e)),
     };
     pause(Pause::CreatorOpenedExisting);
@@ -610,9 +712,12 @@ fn check_existing(path: &Path) -> Result<Existing> {
     }
     let contents =
         read_exact_beacon(&file).map_err(|e| Error::io("read existing reader beacon", path, e))?;
-    if contents.and_then(|b| decode(&b)).is_none() {
+    if !contents.is_some_and(|b| is_beacon_file(&b)) {
         return Err(not_a_beacon());
     }
+    // Everything above was learnt from the open file; the rename that follows acts on the name. If the name now names
+    // another file (something outside the protocol replaced it meanwhile), that file was never checked: check again
+    // (test `takeover_rechecks_a_replaced_name`).
     if lstat_identity(path) != Some((meta.dev(), meta.ino())) {
         return Ok(Existing::Changed);
     }
@@ -620,7 +725,11 @@ fn check_existing(path: &Path) -> Result<Existing> {
 }
 
 /// Removes temporary files that creators which died before publishing left behind. Runs under the directory lock,
-/// so an unlocked temporary file can't belong to a creator that is still working. Best effort.
+/// so an unlocked temporary file can't belong to a creator that is still working. A name, a file type and a free
+/// lock don't prove where a file came from, so a file is removed only if its contents prove it is a beacon
+/// ([`is_beacon_file`]) and its name still names the file checked; anything else under such a name (another
+/// program's file, or the empty file of a creator that died between creating and writing it) is left alone. Best
+/// effort.
 fn remove_leftovers(dir: &Path) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
@@ -637,7 +746,14 @@ fn remove_leftovers(dir: &Path) {
         let Ok(file) = open_beacon(&path) else {
             continue;
         };
-        if file.metadata().is_ok_and(|m| m.is_file()) && probe(&file) == BeaconState::Stale {
+        let Ok(meta) = file.metadata() else {
+            continue;
+        };
+        if meta.is_file()
+            && probe(&file) == BeaconState::Stale
+            && read_exact_beacon(&file).is_ok_and(|b| b.is_some_and(|b| is_beacon_file(&b)))
+            && lstat_identity(&path) == Some((meta.dev(), meta.ino()))
+        {
             let _ = fs::remove_file(&path);
         }
     }
@@ -709,13 +825,7 @@ fn observe(path: PathBuf, name: String) -> Option<Observed> {
         let file = match open_beacon(&path) {
             Ok(file) => file,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return None,
-            // A symlink (O_NOFOLLOW) or a socket.
-            Err(e)
-                if e.raw_os_error() == Some(libc::ELOOP)
-                    || e.raw_os_error() == Some(libc::ENXIO) =>
-            {
-                return None;
-            }
+            Err(e) if not_openable(&e) => return None,
             Err(_) => return Some(unreadable(path, name)),
         };
         let meta = match file.metadata() {
