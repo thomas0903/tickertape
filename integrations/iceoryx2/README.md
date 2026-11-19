@@ -354,8 +354,9 @@ asserts two things:
   per connection, per publisher sample and per buffer entry), the port is measured at two values and the measured
   cost per item must be at most the formula's constant; where the constant is meant to be tight, also at least a
   stated fraction of it (90% for sizes taken exactly from the source, 50% for measured sizes counted with a margin
-  under 2×; the generous ones, a subscriber's connection slot at 2.2× and a connection counted in whole 64 KiB
-  pages, are bounded from above only).
+  under 2×; a subscriber's connection slot, counted at about 2.2× what is measured, is bounded from above only,
+  and a connection, counted in whole 64 KiB pages, is bounded from above by that figure and from below by the
+  bytes each connection must hold).
 
 The figures at the caps below (128 MiB of heap, 1.5 GiB of shared memory) are the formulas evaluated at the caps, not
 measurements. The test runs on macOS and Linux (CI: x86-64 and aarch64);
@@ -395,9 +396,9 @@ reference counters and 64.5 MiB of connections; its data segments take 129.8 MiB
 once a message has needed 8 KiB chunks and 899 MiB after 16 KiB ones, and a message that needs 32 KiB chunks (1.9 GiB
 in all) is refused. A static segment of 32,764 chunks of 32,768 bytes came to exactly 1 GiB without its storage
 header, and is refused with it. A service the recorder records may allow at most 331 connection slots: with the
-default expired-connection buffer of 128, at most 203 publishers (2,048 publishers would need at least 146 MiB of
-segment tables). The recorder's refusal says how many publishers would fit with the node's expired-connection buffer
-and the service's other settings, and names the 203 of the default buffer.
+default expired-connection buffer of 128, at most 203 publishers (the segment tables of 2,048 publishers alone would come to
+about 590 MiB, at the 302 KB measured for each). The recorder's refusal says how many publishers would fit with the
+node's expired-connection buffer and the service's other settings, and names the 203 of the default buffer.
 
 The replayer checks the data segments when it creates a publisher (its first slice holds about 4 KiB) and, for
 slices, before each message larger than the first chunks, which may make iceoryx2 create another segment; a message
