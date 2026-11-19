@@ -49,12 +49,37 @@ pub(crate) fn run(args: TailArgs, out: &mut dyn Write) -> Result<()> {
     Ok(())
 }
 
+/// Continues after `Error::Discarded` at `seq`: seeks to `seq` on the current chain, or, if retention or archiving
+/// removed it (a durable-only reader learns of a removal when the checkpoint moves past its position, ADR 0034), to
+/// the oldest record still in the journal. Warnings go to standard error, so standard output keeps its format.
 fn resume(reader: &mut Reader, seq: u64) -> Result<()> {
-    writeln!(
-        io::stderr().lock(),
-        "tickertape: warning: history discarded at sequence {seq}; seeking to the current chain"
-    )
-    .map_err(|e| output::io_error("write recovery warning", e))?;
-    reader.seek(seq)?;
+    warn(format_args!(
+        "history discarded at sequence {seq}; seeking to the current chain"
+    ))?;
+    let mut target = seq;
+    loop {
+        match reader.seek(target) {
+            Ok(()) => return Ok(()),
+            Err(Error::SeqUnavailable { first, .. }) if first > target => {
+                if first - 1 == seq {
+                    warn(format_args!(
+                        "record {seq} was removed before tail read it; continuing at sequence {first}"
+                    ))?;
+                } else {
+                    warn(format_args!(
+                        "records {seq} to {} were removed before tail read them; continuing at sequence {first}",
+                        first - 1
+                    ))?;
+                }
+                target = first;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+fn warn(message: std::fmt::Arguments<'_>) -> Result<()> {
+    writeln!(io::stderr().lock(), "tickertape: warning: {message}")
+        .map_err(|e| output::io_error("write recovery warning", e))?;
     Ok(())
 }
