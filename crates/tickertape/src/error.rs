@@ -187,9 +187,12 @@ pub enum CorruptReason {
     /// The checkpoint marker points to a segment that doesn't exist, or to an impossible offset.
     #[error("checkpoint marker points to missing segment {0} or an invalid offset")]
     DanglingCheckpoint(u64),
-    /// A commit word reads 0 (no record), but records were committed after it: a later valid record or seal in the
-    /// same segment, or a later segment, carries this sequence number. A torn append never leaves this; storage
-    /// damage, power loss or outside modification does (`docs/format.md` → Recovery, ADR 0035).
+    /// A commit word reads 0 (no record), but records were committed after it (`docs/format.md` → Recovery,
+    /// ADR 0035). The number is the sequence number the evidence carries: a later valid record's in the same segment,
+    /// the next sequence number of a valid seal that ends the segment, or the base of a later segment. Storage damage,
+    /// power loss or outside modification leaves this; a writer process crash does not, except when the payload it
+    /// was writing holds a valid frame whose sequence number falls in the window (frames copied from another
+    /// journal, for example) and was not completely written.
     #[error("commit word is 0 but committed history follows it (sequence {0})")]
     EmptyCommitWord(u64),
 }

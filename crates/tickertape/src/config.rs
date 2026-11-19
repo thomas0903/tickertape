@@ -6,9 +6,13 @@ use std::time::Duration;
 /// empty commit word that committed records follow (a later valid record, a final seal or a later segment;
 /// [`CorruptReason::EmptyCommitWord`](crate::CorruptReason::EmptyCommitWord), ADR 0035).
 ///
-/// A writer *process* crash never produces this (see `docs/crash-contract.md`, C1/C2); only power loss, storage
-/// errors or outside modification do. Uncommitted partial records, with nothing committed after them, are always
-/// cleaned up, whatever the policy.
+/// A writer *process* crash never produces this (see `docs/crash-contract.md`, C1/C2), with one exception; otherwise
+/// only power loss, storage errors or outside modification do. The exception: a crash while a payload was being
+/// written that contains an 8-byte-aligned, checksum-valid record frame whose sequence number falls in the window
+/// recovery checks (for example raw frames copied from another journal), when the payload was not completely
+/// written. Recovery cannot tell those bytes from committed records behind a damaged commit word and reports
+/// [`CorruptReason::EmptyCommitWord`](crate::CorruptReason::EmptyCommitWord); nothing is lost (ADR 0035). Uncommitted
+/// partial records, with nothing committed after them, are always cleaned up, whatever the policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum RecoveryPolicy {
@@ -20,10 +24,17 @@ pub enum RecoveryPolicy {
     Quarantine,
     /// Return [`Error::Corrupt`](crate::Error::Corrupt) from [`Writer::open`](crate::Writer::open) instead of
     /// quarantining or repairing anything. Committed bytes are never changed and nothing is moved; the bytes after an
-    /// empty commit word are checked for committed records before any of them is zeroed. Recovery may still have done
+    /// empty commit word are checked for committed records before any of them is zeroed (damage after which nothing
+    /// valid remains can't be told from a torn append and is zeroed like one, ADR 0035). Recovery may still have done
     /// the clean-ups it performs before reaching the corrupt position, which a writer *process* crash also requires:
     /// removing stale `*.tape.tmp` files, zeroing never-committed bytes after a segment's last record, writing a
     /// missing seal, and creating a missing successor segment (`docs/format.md` → Recovery).
+    ///
+    /// After a plain process crash this refuses only in the exception above (`EmptyCommitWord` at the start of the
+    /// record being written, whose payload holds the frames that count as evidence). To continue, check the frame at
+    /// the reported offset: if its sequence number is the expected one and the frames after it lie inside its
+    /// payload, open once with [`RecoveryPolicy::Quarantine`], which preserves those bytes in `quarantine/` and
+    /// continues after the last committed record (`docs/operations.md` → After a crash).
     Fail,
 }
 

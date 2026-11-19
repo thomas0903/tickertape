@@ -217,11 +217,42 @@ pub fn verify(dir: impl AsRef<Path>) -> Result<VerifyReport> {
         });
 
         let mut scan = scan_file(&path, base)?;
-        let mut later = later_history(&path, &scan)?;
-        if newest && (matches!(scan.end, ScanEnd::Invalid(_)) || later.is_some()) {
+        if newest && matches!(scan.end, ScanEnd::Invalid(_)) {
             // A live writer may have been mid-append while we copied the file: look again before reporting.
             std::thread::sleep(Duration::from_millis(50));
             scan = scan_file(&path, base)?;
+        }
+        let mut later = later_history(&path, &scan)?;
+        let (mut follows, mut waited) = (0, false);
+        while newest && later.is_some() {
+            let mut word = journal::commit_word_in_file(&path, scan.end_offset)?;
+            if word == 0 && !waited {
+                // A live writer may still be filling the record at the empty word with a payload that holds frames
+                // (the accepted false positive, ADR 0035): give it the same 50 ms to commit, once.
+                waited = true;
+                std::thread::sleep(Duration::from_millis(50));
+                word = journal::commit_word_in_file(&path, scan.end_offset)?;
+            }
+            if word == 0 {
+                break;
+            }
+            // The journal grew while we searched: a live writer committed the record at the empty word P and
+            // appended after it, and those records were the evidence. The writer stores P's commit word before it
+            // writes anything after P's frame, and evidence there includes a commit word stored after P's (a
+            // record's or a seal's, each with release ordering), so evidence a live writer appended always comes
+            // with a non-zero word at P; real damage at P stays zero. Continue the scan from P instead of reporting.
+            if follows == MAX_FOLLOWS {
+                // The writer keeps appending faster than we can search: stop here and describe the segment as open
+                // at the last record reached, as for anything appended after `verify` returns. Not corruption.
+                later = None;
+                break;
+            }
+            follows += 1;
+            let more = journal::scan_file_from(&path, scan.end_offset, scan.next_seq)?;
+            scan = format::ScanResult {
+                records: scan.records + more.records,
+                ..more
+            };
             later = later_history(&path, &scan)?;
         }
         seg.records = scan.records;
@@ -267,6 +298,10 @@ pub fn verify(dir: impl AsRef<Path>) -> Result<VerifyReport> {
     }
     Ok(report)
 }
+
+/// How many times [`verify`] follows a live writer past the end of the newest segment (see the loop there) before it
+/// stops and reports the end it reached as open.
+const MAX_FOLLOWS: u32 = 8;
 
 /// Committed history after the empty slot a scan ended at, if it ended at one ([`format::find_history_after_empty`]).
 fn later_history(path: &Path, scan: &format::ScanResult) -> Result<Option<format::LaterHistory>> {

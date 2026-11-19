@@ -576,9 +576,15 @@ pub fn nonzero_end<V: SegmentView + ?Sized>(segment: &V, from: u64) -> Option<u6
 /// `expected_seq < T <= expected_seq + (Q - offset) / 40` (every record is at least 40 bytes), or a seal in the same
 /// range that is the last non-zero item in the segment. The first such record is returned.
 ///
+/// Candidates inside a completely written torn frame are not evidence: if the frame at `offset` has an intact header
+/// apart from its commit word (sequence number `expected_seq`, flags zero, and a stored CRC that matches for a length
+/// covering every non-zero byte after `offset`, allowing up to 63 trailing zero bytes, but not also for a length that
+/// ends at the first candidate), its payload holds the candidates and this returns `None`.
+///
 /// Work: one pass over `[offset, len)` to find its last non-zero byte, cheap header checks at each 8-byte position up
 /// to it, and CRC32C over at most twice the remaining segment length for candidate records (beyond that it returns
-/// [`LaterHistory::Unchecked`]), plus one CRC of 12 bytes per possible sequence number for a final seal.
+/// [`LaterHistory::Unchecked`]), plus one CRC of 12 bytes per possible sequence number for a final seal, and, once,
+/// CRC32C over the torn frame at `offset` up to the first candidate and up to the last non-zero byte.
 pub fn find_history_after_empty<V: SegmentView + ?Sized>(
     segment: &V,
     offset: u64,
@@ -598,6 +604,16 @@ pub(crate) fn find_history_before<V: SegmentView + ?Sized>(
     let len = segment.len();
     let budget = len.saturating_sub(offset).saturating_mul(2);
     let mut spent = 0_u64;
+    // The first candidate decides: either the torn frame at `offset` covers every non-zero byte (then no candidate
+    // can lie outside it), or it is evidence.
+    let evidence = |found: LaterHistory| {
+        let first = match found {
+            LaterHistory::Record { offset, .. }
+            | LaterHistory::Seal { offset, .. }
+            | LaterHistory::Unchecked { offset, .. } => offset,
+        };
+        (!torn_frame_covers_tail(segment, offset, expected_seq, end, first)).then_some(found)
+    };
     // A record after the empty slot starts at least one minimal frame after it.
     let mut q = offset.checked_add(RECORD_HEADER_LEN as u64)?;
     while q < end {
@@ -620,7 +636,7 @@ pub(crate) fn find_history_before<V: SegmentView + ?Sized>(
                 });
                 if let Some(next_seq) = found {
                     if read_slot(segment, q, next_seq) == Ok(Slot::Seal) {
-                        return Some(LaterHistory::Seal {
+                        return evidence(LaterHistory::Seal {
                             offset: q,
                             next_seq,
                         });
@@ -636,16 +652,101 @@ pub(crate) fn find_history_before<V: SegmentView + ?Sized>(
             if let Some((seq, 0)) = fields.filter(|(seq, _)| in_range(*seq)) {
                 spent = spent.saturating_add(u64::from(word));
                 if spent > budget {
-                    return Some(LaterHistory::Unchecked { offset: q, seq });
+                    return evidence(LaterHistory::Unchecked { offset: q, seq });
                 }
                 if matches!(read_slot(segment, q, seq), Ok(Slot::Record { .. })) {
-                    return Some(LaterHistory::Record { offset: q, seq });
+                    return evidence(LaterHistory::Record { offset: q, seq });
                 }
             }
         }
         q += RECORD_ALIGN as u64;
     }
     None
+}
+
+/// How many trailing zero bytes a completely written torn frame's payload may end with for
+/// [`torn_frame_covers_tail`] to recognise it: the frame lengths tried run from the last non-zero byte to this many
+/// bytes past it.
+const COVER_SLACK: u64 = 63;
+
+/// True if the frame at `offset` (commit word 0) is a completely written torn append whose body holds every non-zero
+/// byte up to `end`, so that a candidate at `first_candidate` lies inside its payload and is not evidence (ADR 0035).
+///
+/// That is the case when its header is intact apart from the commit word (sequence number `expected_seq`, flags
+/// zero) and its stored CRC matches for some frame length `L` that fits with `end - offset <= L <= end - offset +`
+/// [`COVER_SLACK`]: a writer killed after storing the CRC and before the commit word leaves exactly this. A body
+/// torn in the middle has no CRC yet (or one that doesn't match), and a payload that ends in more than
+/// [`COVER_SLACK`] zero bytes needs a length outside the range: both stay evidence. Each length tried can match by
+/// chance (`2^-32`), so a frame whose CRC also matches for a length ending where the first candidate starts is not
+/// covered: that is a complete record followed by the next one, as a zeroed commit word leaves it.
+fn torn_frame_covers_tail<V: SegmentView + ?Sized>(
+    segment: &V,
+    offset: u64,
+    expected_seq: u64,
+    end: u64,
+    first_candidate: u64,
+) -> bool {
+    let fields = segment.with_bytes(offset + COMMIT_WORD_LEN as u64, 20, |b| {
+        Some((read_u32(b, 0)?, read_u64(b, 4)?, read_u32(b, 16)?))
+    });
+    let Some(Some((stored, seq, flags))) = fields else {
+        return false;
+    };
+    if seq != expected_seq || flags != 0 {
+        return false;
+    }
+    let Some(covered) = end.checked_sub(offset) else {
+        return false;
+    };
+    if !crc_matches_some_len(segment, offset, stored, covered, covered + COVER_SLACK) {
+        return false;
+    }
+    let before = first_candidate.saturating_sub(offset);
+    !crc_matches_some_len(segment, offset, stored, before.saturating_sub(7), before)
+}
+
+/// True if the record CRC `stored` of a frame at `offset` matches for some frame length in `lo..=hi` that is valid
+/// and fits in the segment. Reads `[offset + 8, offset + hi)` once: the CRC of the shortest length is computed in
+/// one pass, and each longer one by moving the length prefix's CRC past the bytes ([`crate::crc::x8n`]).
+fn crc_matches_some_len<V: SegmentView + ?Sized>(
+    segment: &V,
+    offset: u64,
+    stored: u32,
+    lo: u64,
+    hi: u64,
+) -> bool {
+    let fields_at = offset + 8;
+    let limit = segment
+        .len()
+        .saturating_sub(SEGMENT_TRAILER_LEN as u64)
+        .saturating_sub(offset)
+        / RECORD_ALIGN as u64
+        * RECORD_ALIGN as u64;
+    let lo = lo.max(RECORD_HEADER_LEN as u64);
+    let hi = hi.min(u64::from(MAX_FRAME_LEN)).min(limit);
+    if lo > hi {
+        return false;
+    }
+    let Some(mut crc) = segment.with_bytes(fields_at, lo - 8, crate::crc::crc32c) else {
+        return false;
+    };
+    let mut shift = crate::crc::x8n(lo - 8);
+    segment
+        .with_bytes(fields_at + lo - 8, hi - lo, |more| {
+            for (len, next) in (lo..=hi).zip(more.iter().map(Some).chain([None])) {
+                // `record_crc(len, fields) == crc32c(len ‖ fields)`.
+                let prefix = crate::crc::crc32c(&(len as u32).to_le_bytes());
+                if crate::crc::mul_mod(shift, prefix) ^ crc == stored {
+                    return true;
+                }
+                if let Some(&byte) = next {
+                    crc = crate::crc::crc32c_append(crc, &[byte]);
+                    shift = crate::crc::mul_mod(shift, 1 << 23);
+                }
+            }
+            false
+        })
+        .unwrap_or(false)
 }
 
 /// The file name of the segment whose first record is `base_seq`, e.g. `00000000000000000042.tape`.
@@ -1214,6 +1315,128 @@ mod tests {
     }
 
     #[test]
+    fn crc_length_search_matches_direct_checksums() {
+        let mut image = vec![0u8; 4096];
+        let mut x = 0x2545_f491_4f6c_dd1d_u64;
+        for b in &mut image[72..1000] {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *b = x as u8;
+        }
+        let at = 64_u64;
+        let step = if cfg!(miri) { 97 } else { 1 };
+        for len in (40..1100_u64).step_by(step) {
+            let stored = record_crc(len as u32, &image[72..(at + len) as usize]);
+            assert!(
+                crc_matches_some_len(&image[..], at, stored, len, len),
+                "{len}"
+            );
+            assert!(
+                crc_matches_some_len(&image[..], at, stored, 40, len + 30),
+                "{len}"
+            );
+            assert!(crc_matches_some_len(
+                &image[..],
+                at,
+                stored,
+                len.saturating_sub(5),
+                len + 5
+            ));
+            assert!(
+                !crc_matches_some_len(&image[..], at, stored, len + 1, len + 1),
+                "{len}"
+            );
+            assert!(
+                !crc_matches_some_len(&image[..], at, stored ^ 1, len, len),
+                "{len}"
+            );
+        }
+        // Lengths that don't fit in the segment are never tried.
+        let len = 4096 - 8 - 64;
+        let stored = record_crc(len as u32, &image[72..4096 - 8]);
+        assert!(crc_matches_some_len(&image[..], at, stored, len, len + 100));
+        assert!(!crc_matches_some_len(
+            &image[..],
+            at + 8,
+            stored,
+            len,
+            len + 100
+        ));
+    }
+
+    #[test]
+    fn frames_inside_a_completely_written_torn_frame_are_not_history() {
+        // Records 7 to 9, then a torn append of record 10 whose payload holds the frames of records 10 to 14 of
+        // another journal (or of this one's future), at aligned positions. Records 11 to 14 fall in the window.
+        let (mut image, offsets) = records_image(3);
+        let p = offsets[3];
+        let mut frames = vec![0u8; 1200];
+        let mut at = 0;
+        for i in 0..5 {
+            at = append(
+                &mut frames,
+                at,
+                &record(10 + i),
+                &vec![i as u8; (i as usize * 37) % 200],
+            );
+        }
+        frames.truncate(at);
+        let mut payload = frames.clone();
+        payload.push(0xee);
+        let (len, torn) = body(&record(10), &payload);
+        image[p + 4..p + len as usize].copy_from_slice(&torn);
+        // Complete body, CRC stored: the candidates lie inside it.
+        assert_eq!(find_history_after_empty(&image[..], p as u64, 10), None);
+        // The same with up to COVER_SLACK trailing zero bytes in the payload, and with one more.
+        for zeros in [1, 8, COVER_SLACK as usize, COVER_SLACK as usize + 1] {
+            let mut copy = image.clone();
+            copy[p..p + len as usize + 200].fill(0);
+            let mut padded = payload.clone();
+            padded.extend(std::iter::repeat_n(0, zeros));
+            let (plen, pbody) = body(&record(10), &padded);
+            copy[p + 4..p + plen as usize].copy_from_slice(&pbody);
+            let found = find_history_after_empty(&copy[..], p as u64, 10);
+            if zeros as u64 <= COVER_SLACK {
+                assert_eq!(found, None, "{zeros}");
+            } else {
+                assert!(
+                    matches!(found, Some(LaterHistory::Record { seq: 11, .. })),
+                    "{zeros}: {found:?}"
+                );
+            }
+        }
+        // Torn in the middle: no CRC yet. Evidence (the accepted false positive).
+        let mut copy = image.clone();
+        copy[p + 4..p + 8].fill(0);
+        copy[p + 40 + frames.len() / 2 + 64..p + len as usize].fill(0);
+        assert!(matches!(
+            find_history_after_empty(&copy[..], p as u64, 10),
+            Some(LaterHistory::Record { seq: 11, .. })
+        ));
+        // A frame at P with the wrong sequence number or non-zero flags is not a torn append of record 10.
+        for (field, value) in [(8, 99_u8), (20, 1)] {
+            let mut copy = image.clone();
+            copy[p + field] = value;
+            assert!(
+                find_history_after_empty(&copy[..], p as u64, 10).is_some(),
+                "{field}"
+            );
+        }
+        // A real zeroed commit word in front of the newest two records is still found: the frame at P is a complete
+        // record that ends where the next one starts.
+        let (mut real, offsets) = records_image(6);
+        real[offsets[4]..offsets[4] + 4].fill(0);
+        assert_eq!(
+            find_history_after_empty(&real[..], offsets[4] as u64, 11),
+            Some(LaterHistory::Record {
+                offset: offsets[5] as u64,
+                seq: 12
+            })
+        );
+    }
+
+    #[test]
     fn history_search_stops_at_its_work_bound() {
         // Every slot after the empty one carries the header of the next record, claiming the largest length, with a
         // bad checksum: checking them all would cost about (size / 8) * size bytes of CRC.
@@ -1335,9 +1558,23 @@ mod tests {
                 let len = 40 + torn_len.min(room - 40);
                 let mut x = torn_seed | 1;
                 let payload: Vec<u8> = (0..len - 40).map(|_| { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x as u8 }).collect();
-                let (_, body) = body(&record(7 + n), &payload);
+                let (_, torn_body) = body(&record(7 + n), &payload);
                 let mut torn = image.clone();
-                torn[end + 4..end + len].copy_from_slice(&body);
+                torn[end + 4..end + len].copy_from_slice(&torn_body);
+                prop_assert_eq!(find_history_after_empty(&torn[..], end as u64, 7 + n), None);
+                // A complete body (CRC stored) whose payload holds the frames of the records that would follow it,
+                // as a payload copying frames from elsewhere does: they lie inside the frame, so not evidence.
+                let mut frames = vec![0u8; len - 40];
+                let mut at = 0;
+                let mut k = 1;
+                while at + 48 <= frames.len() {
+                    at = append(&mut frames, at, &record(7 + n + k), &[k as u8; 8]);
+                    k += 1;
+                }
+                if let Some(last) = frames.last_mut() { *last = 1; }
+                let (_, embedding) = body(&record(7 + n), &frames);
+                let mut torn = image.clone();
+                torn[end + 4..end + len].copy_from_slice(&embedding);
                 prop_assert_eq!(find_history_after_empty(&torn[..], end as u64, 7 + n), None);
             }
         }

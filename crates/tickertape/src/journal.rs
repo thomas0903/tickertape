@@ -212,8 +212,18 @@ impl format::SegmentView for PreadView<'_> {
 /// Scans a segment file from its first record slot, expecting `base` there, reading it with `pread` in bounded
 /// windows (the file is never mapped, so other processes can't affect memory safety).
 pub(crate) fn scan_file(path: &Path, base: u64) -> Result<format::ScanResult> {
+    scan_file_from(path, format::SEGMENT_HEADER_LEN as u64, base)
+}
+
+/// [`scan_file`] from `offset`, expecting `seq` there.
+pub(crate) fn scan_file_from(path: &Path, offset: u64, seq: u64) -> Result<format::ScanResult> {
+    with_pread_view(path, |view| format::scan_segment(view, offset, seq))
+}
+
+/// The commit word at `offset` of a segment file, read with a fresh `pread` (0 if it lies outside the file).
+pub(crate) fn commit_word_in_file(path: &Path, offset: u64) -> Result<u32> {
     with_pread_view(path, |view| {
-        format::scan_segment(view, format::SEGMENT_HEADER_LEN as u64, base)
+        format::SegmentView::commit_word(view, offset).unwrap_or(0)
     })
 }
 

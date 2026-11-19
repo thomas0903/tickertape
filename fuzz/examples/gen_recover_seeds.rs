@@ -362,6 +362,55 @@ fn main() {
         input(FAIL, &[continuing(&torn_stale)], 0, &[]),
     ));
 
+    // Review round 1, item 2: the seal's marker zeroed (its CRC word intact) with two segments after it. The same
+    // bytes as a crash between publishing the successor and sealing: the seal is written again, nothing is removed.
+    let mut marker_zeroed = Ops::default();
+    marker_zeroed
+        .records(5, 40)
+        .op(&[1, 0])
+        .zero(AT_CURSOR, -8, 4);
+    for (name, policy) in [
+        ("seal_marker_zeroed", QUARANTINE),
+        ("seal_marker_zeroed_fail", FAIL),
+    ] {
+        seeds.push((
+            name,
+            input(
+                policy,
+                &[
+                    continuing(&marker_zeroed),
+                    continuing(&three),
+                    continuing(&eight),
+                ],
+                0,
+                &[],
+            ),
+        ));
+    }
+
+    // Review round 1, item 3: a torn append of record 25 whose payload holds a frame with sequence number 26 (a copy
+    // of record 0's 140-byte frame, renumbered and re-checksummed). With the torn frame's body complete (its CRC
+    // stored for a 188-byte frame, commit word never stored) the embedded frame lies inside it: a torn append, zeroed
+    // in place. Without the CRC (torn mid-body) it is the accepted false positive: preserved, or refused by `Fail`.
+    let mut embedding = Ops::default();
+    embedding
+        .records(25, 100)
+        .copy(AT_FIRST_RECORD, 0, AT_CURSOR, 48, 140)
+        .write(AT_CURSOR, 56, &26u64.to_le_bytes())
+        .op(&[8, AT_CURSOR, 48])
+        .write(AT_CURSOR, 0, &188u32.to_le_bytes())
+        .write(AT_CURSOR, 8, &25u64.to_le_bytes());
+    let mut complete = Ops(embedding.0.clone(), embedding.1);
+    complete.op(&[8, AT_CURSOR, 0]).zero(AT_CURSOR, 0, 4);
+    embedding.zero(AT_CURSOR, 0, 4);
+    for (name, ops, policy) in [
+        ("torn_complete_body_holding_a_frame_fail", &complete, FAIL),
+        ("torn_body_holding_a_frame", &embedding, QUARANTINE),
+        ("torn_body_holding_a_frame_fail", &embedding, FAIL),
+    ] {
+        seeds.push((name, input(policy, &[continuing(ops)], 0, &[])));
+    }
+
     for (name, bytes) in seeds {
         fs::write(dir.join(name), bytes).unwrap();
     }

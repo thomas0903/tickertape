@@ -30,6 +30,12 @@ pub enum Point {
     SpareMap,
     /// Writing the spare's header when the writer publishes it at roll (arm with [`fail_next`]).
     SpareHeader,
+    /// Recovery repairing a corrupt tail, after the tail was preserved in `quarantine/` and the repaired copy written,
+    /// before that copy is renamed over the segment (stands in for a crash there).
+    RepairBeforeRename,
+    /// Recovery repairing a corrupt tail, after the repaired copy replaced the segment, before later segments are
+    /// handled (stands in for a crash there).
+    RepairAfterRename,
 }
 
 #[cfg(feature = "fault-injection")]
