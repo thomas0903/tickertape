@@ -7,8 +7,10 @@
 //! - The remaining tail uses a plain serial loop.
 //!
 //! The `crc32c` crate is the fallback without the instruction and under Miri. Results are bit-identical. Building
-//! with `RUSTFLAGS="--cfg tickertape_force_soft_crc"` compiles only the fallback, so the whole test suite can run on
-//! it on any machine (CONTRIBUTING.md).
+//! with `RUSTFLAGS="--cfg tickertape_force_soft_crc"` compiles out tickertape's own hardware path, so the whole test
+//! suite can run on tickertape's fallback code (the calls into `crc32c` and the staging buffer of
+//! [`crc32c_append_parts`]) on any machine (CONTRIBUTING.md). It forces nothing in the `crc32c` crate, which still
+//! picks its own hardware implementation on CPUs that have the instruction.
 //!
 //! [`crc32c_append_parts`] computes the same CRC over words loaded one at a time from shared memory
 //! ([`SharedWords`]), so the zero-copy reader can check a record without copying it first (ADR 0027): on the
@@ -46,8 +48,9 @@ pub(crate) fn crc32c_append_parts(
     }
 }
 
-/// [`crc32c_append_parts`] without the CPU instruction: the words go through a small stack buffer, 256 bytes at a
-/// time, into the `crc32c` crate. This is the only path that copies, and only into that buffer.
+/// [`crc32c_append_parts`] without tickertape's own hardware path: the words go through a small stack buffer, 256
+/// bytes at a time, into the `crc32c` crate (which uses the CPU instruction itself where it has one, including
+/// under `--cfg tickertape_force_soft_crc`). This is the only path that copies, and only into that buffer.
 fn soft_append_parts(crc: u32, head: &[u8], words: SharedWords<'_>, tail: &[u8]) -> u32 {
     let mut crc = crc32c::crc32c_append(crc, head);
     let mut buf = [0u8; 256];

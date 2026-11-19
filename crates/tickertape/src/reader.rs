@@ -112,9 +112,7 @@ impl Reader {
     /// without copying.
     ///
     /// Each record is validated (length, CRC32C, sequence number, flags) from atomic loads of the mapping before any
-    /// slice into it is created, so a damaged length can't make a payload cover bytes the writer is still
-    /// appending (barring a CRC collision, about 2^-32 per damaged record). The checks, their order and the errors
-    /// are those of [`Reader::open`] (ADR 0027).
+    /// slice into it is created. The checks, their order and the errors are those of [`Reader::open`] (ADR 0027).
     ///
     /// Segments are mapped only on x86-64 and aarch64. On other targets this opens the same reader as
     /// [`Reader::open`] (same API and results; payloads borrow from a buffer the reader owns and nothing is mapped),
@@ -124,17 +122,28 @@ impl Reader {
     ///
     /// While the returned reader exists, no process other than a tickertape [`Writer`](crate::Writer) may modify
     /// the journal's segment files (writing into them, truncating them, or replacing their contents through other
-    /// tools). A tickertape writer never modifies committed bytes, including during crash recovery, which only
-    /// zeroes never-committed bytes and writes seals in place, at or after the first empty slot, and otherwise
-    /// replaces or moves whole files (`docs/format.md` → Recovery). A returned payload is the bytes that were
-    /// validated only because nothing modifies them afterwards. If a mapped file is truncated, the process receives
-    /// `SIGBUS`.
+    /// tools). If a mapped file is truncated, the process receives `SIGBUS`.
     ///
-    /// Known limitation: if storage damage enlarges the length in an earlier record's commit word while no writer
-    /// runs, and a writer then appends after it, validating that record can load bytes the writer is storing at
-    /// that moment. Rust's memory model doesn't cover this (it is a data race if the writer runs in the same
-    /// process). The loads return a mixture of old and new bytes and the CRC rejects the record except with
-    /// probability about 2^-32, as in every earlier release (ADR 0027 → "Which loads can race").
+    /// What follows holds for an intact publication chain, where every commit word the reader follows is one a
+    /// writer published. A tickertape writer then never modifies committed bytes, including during crash recovery,
+    /// which in place only zeroes the bytes after the first empty slot (never committed, on an intact chain) and
+    /// writes a seal there, and otherwise replaces or moves whole files (`docs/format.md` → Recovery). A returned
+    /// payload is the bytes that were validated only because nothing modifies them afterwards.
+    ///
+    /// Known limitation: a commit word damaged on storage breaks the chain, and then a mapped load can touch bytes a
+    /// writer is storing to without synchronisation. If the writer runs in the same process, that is a data race,
+    /// undefined behaviour in Rust's terms, before any CRC runs; for a writer in another process the language says
+    /// nothing. Two cases (ADR 0027 → "Which loads can race"):
+    ///
+    /// - The length in an earlier record's commit word is enlarged while no writer runs, and a writer then appends
+    ///   after that record: validating it loads bytes the writer is storing.
+    /// - The commit word of a published record not yet covered by a checkpoint is zeroed: unless the next writer's
+    ///   recovery can tell that published records follow, which it cannot always do, it zeroes that record and the
+    ///   published records after it in place, under a live zero-copy reader. A payload the caller still holds then
+    ///   changes, and the reader's later loads meet the new writer's stores.
+    ///
+    /// That such loads return some mixture of old and new bytes, which the CRC then rejects, is an assumption about
+    /// the implementation on the supported targets, not a guarantee. Earlier releases had the same exposure.
     ///
     /// # Errors
     ///
@@ -386,7 +395,10 @@ impl Reader {
         loop {
             let mut attempt = 0;
             let outcome = loop {
-                match self.read_slot(attempt > 0)? {
+                let read = self.read_slot(attempt > 0)?;
+                #[cfg(test)]
+                let read = tests::scripted(read);
+                match read {
                     SlotOutcome::Invalid(_) if attempt < VALIDATION_RETRIES => attempt += 1,
                     other => break other,
                 }
@@ -459,9 +471,9 @@ impl Reader {
             let Some(word) = map.commit_word(offset) else {
                 return Ok(SlotOutcome::Invalid(CorruptReason::BadLength(0)));
             };
-            // Validate straight from `Relaxed` atomic loads of the mapping (ADR 0027): no reference into the mapping
-            // exists until the record has passed validation (`materialize`), so a corrupted length can't make a slice
-            // cover bytes still being written, and nothing is copied.
+            // Validate straight from `Relaxed` atomic loads of the mapping (ADR 0027): no `&[u8]` or other reference
+            // asserting immutability exists until the record has passed validation (`materialize`), so a corrupted
+            // length can't make a slice cover bytes still being written, and nothing is copied.
             return Ok(read_mapped(map, word, offset, size, expected));
         }
 
@@ -524,7 +536,8 @@ impl Reader {
         let len = want
             .max(CHUNK as u64)
             .min(self.seg.size.saturating_sub(offset));
-        self.buf.resize(len as usize, 0);
+        resize_buf(&mut self.buf, len)
+            .map_err(|e| Error::io("allocate read buffer", &self.seg.path, e))?;
         self.seg
             .file
             .read_exact_at(&mut self.buf, offset)
@@ -582,6 +595,20 @@ fn open_segment(dir: &Path, base: u64, mapped: bool) -> Result<OpenSegment> {
         identity,
         map,
     })
+}
+
+/// Resizes the `pread` buffer to `len` bytes without panicking: a frame longer than the address space allows (on a
+/// 32-bit target, a valid record of more than `isize::MAX` bytes in a large segment) is reported as an
+/// [`std::io::ErrorKind::OutOfMemory`] error, leaving `buf` unchanged, instead of aborting in `Vec::resize`.
+fn resize_buf(buf: &mut Vec<u8>, len: u64) -> std::io::Result<()> {
+    let out_of_memory = || std::io::Error::from(std::io::ErrorKind::OutOfMemory);
+    let len = usize::try_from(len).map_err(|_| out_of_memory())?;
+    if let Some(additional) = len.checked_sub(buf.len()) {
+        buf.try_reserve_exact(additional)
+            .map_err(|_| out_of_memory())?;
+    }
+    buf.resize(len, 0);
+    Ok(())
 }
 
 /// Finishes classifying a slot of a mapped segment, given its observed commit word (the zero-copy reader, ADR 0027).
@@ -829,5 +856,134 @@ mod wake_tests {
             r.waker.is_none(),
             "wake-ups still on after an unsupported wait"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Reader, SlotOutcome, VALIDATION_RETRIES, resize_buf};
+    use crate::mmap::MAPPED_READS;
+    use crate::{CorruptReason, Error, NewRecord, ReaderConfig, Writer, WriterConfig};
+    use std::cell::Cell;
+
+    thread_local! {
+        /// How many of this thread's next non-empty slot reads [`scripted`] turns into a validation failure.
+        static FAIL_READS: Cell<u32> = const { Cell::new(0) };
+    }
+
+    /// Test builds only: replaces a slot read with `Invalid(BadChecksum)` while [`FAIL_READS`] is non-zero, as if
+    /// the bytes had been damaged for that one read.
+    pub(super) fn scripted(outcome: SlotOutcome) -> SlotOutcome {
+        FAIL_READS.with(|n| match (n.get(), &outcome) {
+            (0, _) | (_, SlotOutcome::Empty) => outcome,
+            (left, _) => {
+                n.set(left - 1);
+                SlotOutcome::Invalid(CorruptReason::BadChecksum)
+            }
+        })
+    }
+
+    fn journal_of(count: usize) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer =
+            Writer::open(dir.path(), WriterConfig::default().segment_size(65_536)).unwrap();
+        for i in 0..count {
+            let payload = [i as u8; 100];
+            writer
+                .append(&NewRecord {
+                    schema_id: 0,
+                    venue_ts_ns: 0,
+                    local_ts_ns: 0,
+                    payload: &payload,
+                })
+                .unwrap();
+        }
+        dir
+    }
+
+    /// A slot that fails validation once and validates on the re-read is returned, by both readers: neither reports
+    /// corruption for a transient failure. After `VALIDATION_RETRIES` re-reads that all fail, both report it.
+    #[test]
+    fn a_failed_validation_is_retried_by_both_readers() {
+        let dir = journal_of(3);
+        for mapped in [false, true] {
+            let mut reader = if mapped {
+                // SAFETY: only the tickertape writer above modifies the journal, and it has been dropped.
+                unsafe { Reader::open_mapped(dir.path(), ReaderConfig::default()) }.unwrap()
+            } else {
+                Reader::open(dir.path(), ReaderConfig::default()).unwrap()
+            };
+            assert_eq!(reader.try_next().unwrap().unwrap().seq, 0);
+            FAIL_READS.with(|n| n.set(1));
+            let record = reader.try_next().unwrap().unwrap();
+            assert_eq!(
+                (record.seq, record.payload),
+                (1, &[1u8; 100][..]),
+                "mapped: {mapped}"
+            );
+            FAIL_READS.with(|n| n.set(VALIDATION_RETRIES + 1));
+            match reader.try_next() {
+                Err(Error::Corrupt {
+                    reason: CorruptReason::BadChecksum,
+                    ..
+                }) => {}
+                other => panic!("mapped: {mapped}: {other:?}"),
+            }
+            FAIL_READS.with(|n| n.set(0));
+        }
+    }
+
+    /// `open_mapped` really maps segments where `MAPPED_READS` holds (x86-64 and aarch64), so the differential tests
+    /// in `tests/mapped_reader.rs` compare two different readers there; elsewhere it falls back to `pread`. Before and
+    /// after a roll, since each segment is opened separately. The safe reader never maps.
+    #[test]
+    fn open_mapped_maps_segments_where_supported() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer =
+            Writer::open(dir.path(), WriterConfig::default().segment_size(65_536)).unwrap();
+        let payload = [5u8; 1000];
+        let record = NewRecord {
+            schema_id: 0,
+            venue_ts_ns: 0,
+            local_ts_ns: 0,
+            payload: &payload,
+        };
+        for _ in 0..100 {
+            writer.append(&record).unwrap();
+        }
+        // SAFETY: only the tickertape writer above modifies the journal, and it is idle.
+        let mut mapped =
+            unsafe { Reader::open_mapped(dir.path(), ReaderConfig::default()) }.unwrap();
+        let mut safe = Reader::open(dir.path(), ReaderConfig::default()).unwrap();
+        assert_eq!(mapped.mapped, MAPPED_READS);
+        for n in 0..100 {
+            assert_eq!(mapped.seg.map.is_some(), MAPPED_READS, "record {n}");
+            assert!(safe.seg.map.is_none());
+            assert_eq!(mapped.try_next().unwrap().unwrap().payload, payload);
+            assert_eq!(safe.try_next().unwrap().unwrap().payload, payload);
+        }
+        assert!(
+            !mapped.seg.path.ends_with("00000000000000000000.tape"),
+            "the records span more than one segment"
+        );
+        assert_eq!(mapped.seg.map.is_some(), MAPPED_READS);
+    }
+
+    /// A frame the address space can't hold is an error, not a `capacity overflow` panic in `Vec::resize`, and the
+    /// buffer is left as it was. On 64-bit targets these lengths fit in `usize` but exceed `isize::MAX`; on 32-bit
+    /// targets the first already fails the conversion to `usize`.
+    #[test]
+    fn resize_buf_refuses_unreservable_lengths() {
+        for len in [u64::MAX, isize::MAX as u64 + 1] {
+            let mut buf = vec![7u8; 16];
+            let err = resize_buf(&mut buf, len).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::OutOfMemory, "len {len}");
+            assert_eq!(buf, [7u8; 16]);
+        }
+        let mut buf = vec![7u8; 16];
+        resize_buf(&mut buf, 4).unwrap();
+        assert_eq!(buf, [7u8; 4]);
+        resize_buf(&mut buf, 8).unwrap();
+        assert_eq!(buf, [7, 7, 7, 7, 0, 0, 0, 0]);
     }
 }

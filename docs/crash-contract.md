@@ -78,7 +78,7 @@ journal; the durability and restart guarantees below apply to retained history.
 | C8 | OS crash or power loss, records **not** covered by a checkpoint | Any of them may be lost, including records readers already saw. Recovery keeps the longest valid chain starting at the last checkpoint, never accepts a record that fails validation, and moves (never deletes) anything after the first invalid position to `quarantine/` | Linux, macOS | Validation and quarantine: `tests/recovery.rs::disconnected_segment_is_quarantined`, `::dangling_checkpoint_is_refused`, `::missing_middle_segment_is_refused`, `::fail_policy_refuses_invalid_successor_header`, fuzz targets (`recover_dir` runs recovery on generated directories); `tests/soak.rs::soak` (corruption, truncation and damaged headers after the checkpoint, injected between restarts: every removed byte is found in `quarantine/`, a damaged middle segment is refused without changing a byte, and live readers return `Error::Discarded` before moving to the repaired history). Power loss itself: **untested** |
 | C9 | Disk full while creating a segment | `append` returns an error for which `Error::is_storage_full()` is true. The journal stays consistent and readable; a later `append` retries the roll. A new writer can open a cleanly stopped journal on a full disk (the lock file's PID is best effort), but recovery states that need a new file (a missing successor, a quarantine copy, a repaired segment) fail with a storage-full error. A `checkpoint()` on a completely full volume succeeded on ext4, btrfs and tmpfs and **failed with `ENOSPC` on APFS** (from `fsync`), poisoning the writer as for any checkpoint error | Linux, macOS | `tests/disk_full.rs::injected_enospc_on_roll_is_reported_and_retried`, `::injected_link_failure_leaves_no_trace`, `::map_failure_during_roll_is_retried`; real full volumes: `::real_small_filesystem` (APFS, ext4, btrfs, tmpfs; `#[ignore]`d); injected failures of roll links and preallocations in a running journal, retried by the writer: `tests/soak.rs::soak` |
 | C10 | Disk full while writing into an existing segment | On APFS, ext4 and tmpfs: no effect; segments are preallocated, so writing into them needs no new blocks. **On btrfs this does not hold**: with the volume full, the first write into a not-yet-written page of a preallocated segment kills the writer with `SIGBUS`; with copy-on-write disabled (`chattr +C`) the writer instead blocks inside the kernel's page-fault handler. Keep free space on btrfs volumes that hold journals | Measured: APFS (owner's Mac), ext4, btrfs and tmpfs (OrbStack VM, Linux 7.2.12) | `tests/disk_full.rs::full_volume_then_write_into_preallocated_segment` and `::full_volume_then_roll_into_prepared_spare` (macOS default path: a segment prepared in the background before the volume filled up, ADR 0022; writing into it never fails, while publishing it at the roll may report storage full as in C9) (`#[ignore]`d: need a small volume; fail on btrfs as described) |
-| C11 | Corrupted bytes in a segment (storage error, outside modification) | Readers and `verify` detect corruption that breaks the CRC32C, length, sequence or chain checks and report it with the file and offset; they never return a record that fails validation. The writer quarantines (or, with `RecoveryPolicy::Fail`, refuses) a corrupt tail; it repairs by writing a new file, never by changing committed bytes in place | Linux, macOS | `tests/recovery.rs::malformed_checksum_is_quarantined_and_repaired`, `::malformed_length_is_rejected`; fuzz targets `parse_segment`, `decode_record`; `tests/soak.rs::soak` (`verify` reports each injected corruption at its file and offset); journals from v0.1.0–v0.4.0: `tests/compat.rs::corrupt_tail_of_old_journal_is_quarantined_or_refused` |
+| C11 | Corrupted bytes in a segment (storage error, outside modification) | Readers and `verify` detect corruption that breaks the CRC32C, length, sequence or chain checks and report it with the file and offset; they never return a record that fails validation. The writer quarantines (or, with `RecoveryPolicy::Fail`, refuses) a corrupt tail and repairs it by writing a new file. In place, recovery only zeroes the bytes after the first empty slot and writes a seal there; a damaged commit word that reads as zero can make those bytes published records (see "Readers, the writer and memory safety" → Known limitation) | Linux, macOS | `tests/recovery.rs::malformed_checksum_is_quarantined_and_repaired`, `::malformed_length_is_rejected`; fuzz targets `parse_segment`, `decode_record`; `tests/soak.rs::soak` (`verify` reports each injected corruption at its file and offset); journals from v0.1.0–v0.4.0: `tests/compat.rs::corrupt_tail_of_old_journal_is_quarantined_or_refused` |
 | C12 | A checkpoint fails | The error is returned and the writer stays poisoned (`Error::DurabilityLost` on later checkpoints). See "Errors are sticky" | Linux, macOS | `tests/checkpoint.rs::poisoned_after_failure` (injected error); `tests/soak.rs::soak` (injected failures in a running journal, then a restart) |
 | C13 | A durable-only reader (`ReaderConfig::durable_only`) | Returns only records with a sequence number below the checkpoint marker's `next_seq`, so (under the storage assumptions) never a record that a power loss can remove; it waits while the next record is not covered | Linux, macOS | `tests/durable_only.rs::durable_only_reader_stops_at_checkpoint`, `::no_valid_checkpoint_returns_nothing`, `::durable_only_rolls_and_seeks`, `::checkpoint_boundary_at_seal_preserves_cursor`, `::next_timeout_waits_for_checkpoint`, `::durable_only_reader_process_stops_at_checkpoint`; `tests/soak.rs::soak` (durable-only reader processes never return a record that recovery later removes); journals from v0.1.0–v0.4.0: `tests/compat.rs::durable_only_readers_stop_at_the_checkpoint`. Power loss itself: **untested** |
 | C14 | Retention runs, fails or is interrupted | Removes only a sealed prefix strictly before the checkpoint segment: never removes that segment or anything after it, never leaves a gap. An interrupted move leaves the original, a destination copy, or both; a partial copy never permits removing the original. Existing destinations are never replaced; conflicts require explicit resolution before retry | Linux, macOS | `tests/retention.rs::limits_and_checkpoint_boundary`, `::checkpoint_segment_and_newer_are_kept`, `::concurrent_archiver_and_missing_middle`, `::age_uses_successor_and_never_skips_oldest`, `::apply_revalidates_checkpoint_and_identity`, `::move_and_conflict_stop_at_oldest`, `::injected_cross_device_copy_and_interrupted_sync`, `::interrupted_move_preserves_original_and_retries`, `::retention_kill_loop_50` (50 SIGKILLs, ignored); reader behavior: `::reader_discarded_at_removed_segment_end`; `tests/soak.rs::soak` (every segment retention moves is a sealed prefix of valid records, while the writer is killed and restarted). Power loss itself: **untested** |
@@ -90,24 +90,36 @@ journal; the durability and restart guarantees below apply to retained history.
   At worst it reports corruption.
 - **`Reader::open_mapped` (`unsafe`, zero-copy)** hands out `&[u8]` slices pointing into the shared mapping. The caller
   promises that no process other than a tickertape writer modifies the journal's segment files while the reader
-  exists. A correct writer never modifies committed bytes: recovery only zeroes never-committed bytes and writes seals
-  in place, at or after the first empty slot, and otherwise replaces or moves whole files. So the promise holds in
-  normal operation, including writer crashes and recovery. Each record is first validated from atomic loads of the
-  mapping (each byte loaded once, nothing copied; ADR 0027), and a slice into the mapping is created only after it
-  passes. That a returned payload equals the bytes validated rests on the same promise: nothing modifies committed
-  bytes. Segments are mapped only on x86-64 and aarch64; on other targets `open_mapped` reads with `pread` like
-  `Reader::open`.
+  exists. Each record is first validated from atomic loads of the mapping (each byte loaded once, nothing copied;
+  ADR 0027), and a slice into the mapping is created only after it passes. Segments are mapped only on x86-64 and
+  aarch64; on other targets `open_mapped` reads with `pread` like `Reader::open`.
 
-  **Known limitation (damaged lengths).** If storage damage enlarges the length in an earlier record's commit word
-  while no writer runs, and a writer later appends after that record, validating it can make the reader load bytes the
-  writer is storing at that moment. For published records the writer's release store orders all its stores before
-  the reader's loads and the loads stay inside the record, so this is the only case where they can race. Rust's
-  memory model does not cover it (a data race if the writer runs in the same process, outside the model if it is
-  another process). On the supported targets each load is a single aligned load instruction that returns a mixture
-  of old and new bytes, and the CRC then rejects the record except with probability about 2^-32 per attempt; a chance
-  match would yield a payload over bytes still being written. Every earlier release, which copied the same range with
-  the same atomic loads, had the same exposure. Closing it needs a separately synchronised publication frontier,
-  a planned protocol change (ADR 0027 → "Which loads can race").
+  These guarantees hold **for an intact publication chain**, where every commit word the reader follows is one a
+  writer published. A correct writer then never modifies committed bytes: in place, recovery only zeroes the bytes
+  after the first empty slot (never committed, on an intact chain) and writes a seal there, and otherwise replaces or
+  moves whole files. So in normal operation, including writer crashes and recovery, the reader's loads race with no
+  store, and a returned payload stays equal to the bytes validated.
+
+  **Known limitation (commit words damaged on storage).** A damaged commit word breaks the chain, and a mapped load
+  can then touch bytes a writer is storing to without synchronisation. If the writer runs in the same process that is
+  a data race in Rust's terms, before any CRC runs; for a writer in another process the language says nothing. Two
+  cases:
+
+  - *An enlarged length.* If storage damage enlarges the length in an earlier record's commit word while no writer
+    runs, and a writer later appends after that record, validating it makes the reader load bytes the writer is
+    storing at that moment.
+  - *A zeroed commit word.* If storage damage zeroes the commit word of a record that was published but not yet
+    covered by a checkpoint, the next writer's recovery, unless it can tell that published records follow (which it
+    cannot always do), zeroes that record **and the published records after it** in place, under a live zero-copy
+    reader. A payload slice the caller still holds changes, and the reader's later commit-word loads meet the new
+    writer's stores.
+
+  That such loads return some mixture of old and new bytes, which the CRC then rejects, is an assumption about the
+  implementation on the supported targets (aligned single-instruction loads), not a guarantee; how likely a chance
+  match is depends on the corruption, and a retry can read the same bytes. Every earlier release, which copied the
+  same range with the same atomic loads, had the same exposure. A separately synchronised publication frontier, a
+  planned protocol change, would bound the loads in the first case; it does not close the second, where the bytes
+  change because recovery rewrites them (ADR 0027 → "Which loads can race").
 - **The writer** maps the segments it writes. Its API is safe, following the Rust standard library's position that
   its safety guarantees "only cover what the program itself can do, and not what entities outside the program can
   do to it" (`std::os::unix::io`, on `/proc/self/mem`). Another process writing into or truncating the files the

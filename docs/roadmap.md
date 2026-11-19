@@ -137,7 +137,9 @@ does not help or cannot preserve those guarantees; such a decision must be expli
     concurrency, corruption and crash checks. Record replay and live-reader results on x86-64 and aarch64.
   - Follow-up: bound the zero-copy reader's loads by a separately synchronised publication frontier (a shared word
     the writer advances on every append), so a damaged length can no longer make validation load bytes a live writer
-    is storing (ADR 0027 → "Which loads can race"). A protocol change: its own ADR, measurements and review.
+    is storing (ADR 0027 → "Which loads can race"). A protocol change: its own ADR, measurements and review. A
+    reader-side frontier alone does not close the other known limitation, a zeroed commit word that lets recovery
+    rewrite published records in place under a live reader.
 - [ ] **Cheaper checkpoints with prefaulting.**
   - Measure how much prefaulted, unwritten dirty data contributes to checkpoint cost on each platform. The current
     implementation already restricts `msync` to written ranges, then performs file-wide sync/barrier operations.

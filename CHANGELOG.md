@@ -15,15 +15,19 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   reader across every crash; Miri also runs the CRC tests.
 - Platforms: `Reader::open_mapped` maps segments only on x86-64 and aarch64, where 8-byte atomic loads from read-only
   memory are documented to work. On other targets it now reads with `pread`, like `Reader::open` (same API and
-  results). CI checks that the crate builds for `i686-unknown-linux-gnu`.
-- Docs: `open_mapped`'s rustdoc, ADR 0027 and the crash contract now state precisely when the zero-copy reader's
-  validation loads can race with a writer (only for a record whose length was damaged on disk, as in every earlier
-  release) and what then happens; a publication frontier that closes this is a separate follow-up.
+  results; a frame too long for the address space is reported as an `Error::Io` with `ErrorKind::OutOfMemory`
+  instead of panicking). CI checks that the crate builds for `i686-unknown-linux-gnu`.
+- Docs: `open_mapped`'s rustdoc, ADR 0027 and the crash contract now state that the zero-copy reader's guarantees
+  hold for an intact publication chain, and when its loads can race with a writer: a commit word damaged on storage,
+  either a length enlarged (validation then loads bytes a live writer is storing) or a published record's word
+  zeroed (recovery can then zero that record and the published records after it in place, under a live reader), as
+  in every earlier release. A publication frontier, a separate follow-up, would close only the first.
 - Tests: a zero-copy reader polls while writer processes append records of mixed sizes, roll and are killed; a
   deterministic test checks that a complete but unpublished record stays invisible; differential tests recompute the
   CRC after damage so the sequence and flag checks are reached; the corruption matrix covers records long enough for
   the three-lane CRC; tests check that the word-fed CRC takes the hardware path and the three-lane blocks; Miri runs
-  `MapRo`'s loads over an anonymous mapping; `--cfg tickertape_force_soft_crc` runs the suite on the software CRC.
+  `MapRo`'s loads over an anonymous mapping; `--cfg tickertape_force_soft_crc` runs the suite on tickertape's CRC fallback (the `crc32c` crate still uses
+  the CPU instruction where it has one).
 - Benchmarks: the test of a lagging reader under retention no longer depends on machine speed (it failed on
   macOS CI runners), and `tt-sustained` readers retry a seek when retention removes the segment they were about to
   open.

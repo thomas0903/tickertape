@@ -279,9 +279,9 @@ pub(crate) const MAPPED_READS: bool = cfg!(any(target_arch = "x86_64", target_ar
 /// A zero-copy reader's read-only shared mapping of one segment file.
 ///
 /// Reads before validation go only through [`MapRo::commit_word`], [`MapRo::load_u32`] and [`MapRo::words`], all
-/// `Relaxed` atomic loads through references that assert no immutability. What makes those loads sound, and the one
-/// case in which they are not covered by Rust's memory model (a commit word whose length is damaged), is set out in
-/// ADR 0027 → "Which loads can race".
+/// `Relaxed` atomic loads through references that assert no immutability. What makes those loads sound on an intact
+/// publication chain, and the cases in which they are not covered by Rust's memory model (commit words damaged on
+/// storage), is set out in ADR 0027 → "Which loads can race".
 #[derive(Debug)]
 pub(crate) struct MapRo {
     ptr: NonNull<u8>,
@@ -313,8 +313,12 @@ impl MapRo {
         // SAFETY: aligned and in bounds (checked); the mapping lives as long as `self`. The reference is created by a
         // pointer cast, not `AtomicU32::from_ptr` (which requires writable memory), and is used only for a 4-byte
         // `Relaxed` load, which `core::sync::atomic` documents as permitted on read-only memory on the targets that
-        // map segments for reading (`MAPPED_READS`; `new` refuses elsewhere). The writer accesses commit words only
-        // with 4-byte atomic stores (ADR 0003), so this load races with no store and is never mixed-size.
+        // map segments for reading (`MAPPED_READS`; `new` refuses elsewhere). On an intact publication chain the
+        // writer accesses commit words only with 4-byte atomic stores (ADR 0003), so this load has no data race (it
+        // meets only matching 4-byte atomic stores) and is never mixed-size. A commit word damaged on storage breaks
+        // that: if a published record's commit word reads as zero, recovery can zero that record and the records
+        // after it in place under a live reader, and this load can then meet a writer's stores that are not 4-byte
+        // atomics at this address (ADR 0027 → "Which loads can race").
         let word = unsafe { &*self.ptr.as_ptr().add(off).cast::<AtomicU32>() };
         let value = word.load(Ordering::Relaxed);
         if value != 0 {
@@ -338,11 +342,12 @@ impl MapRo {
         // to read-only memory") permits exactly that on read-only memory on the targets that map segments for reading
         // (`MAPPED_READS`; `new` refuses elsewhere). `AtomicU32` is an `UnsafeCell`, so the reference asserts nothing
         // about the bytes staying unchanged.
-        // Races. The reader's two uses load `[P+4, P+8)` after observing the commit word at `P`: the writer stored
-        // those 4 bytes before its `Release` store of that word, which the reader's `Acquire` fence synchronises
-        // with, and never stores to them again, so this load races with no store. That holds even when the length in
-        // the commit word is damaged, because `[P+4, P+8)` lies before the next slot (ADR 0027 → "Which loads can
-        // race").
+        // Races. The reader's two uses load `[P+4, P+8)` after observing the commit word at `P`. On an intact
+        // publication chain the writer stored those 4 bytes before its `Release` store of that word, which the
+        // reader's `Acquire` fence synchronises with, and never stores to them again, so this load has no data race.
+        // A commit word damaged on storage breaks that: a writer can then be storing to these bytes (recovery zeroing
+        // a published record whose commit word reads as zero, in place, under a live reader), and the load races
+        // with those stores (ADR 0027 → "Which loads can race").
         let word = unsafe { &*self.ptr.as_ptr().add(offset as usize).cast::<AtomicU32>() };
         Some(word.load(Ordering::Relaxed))
     }
@@ -372,11 +377,13 @@ impl MapRo {
         // another size. If the length in the commit word is damaged, the words can reach past the writer's current
         // slot, where a live writer is storing body bytes (non-atomic) and the next commit word (a 4-byte atomic).
         // That is a data race, and a mixed-size access, in Rust's memory model when the writer is in this process,
-        // and outside the model when it is another process. The code then relies on each load being one aligned
-        // 8-byte load instruction on these targets, which cannot fault inside the mapping and returns some mixture of
-        // old and new bytes; the compiler may not split, repeat or invent an atomic load; and no reference asserting
-        // immutability exists. The CRC then rejects the frame except with probability about 2^-32. The copying reader
-        // before ADR 0027 loaded the same bytes the same way. A known limitation: ADR 0027 → "Which loads can race".
+        // before any CRC runs, and outside the model when it is another process. A zeroed commit word lets recovery
+        // rewrite published records in place under a live reader, with the same result. The code then assumes,
+        // without a guarantee, that each load is one aligned 8-byte load instruction on these targets, which cannot
+        // fault inside the mapping and returns some mixture of old and new bytes; that the compiler does not split,
+        // repeat or invent an atomic load; and that, since no reference asserting immutability exists, the CRC then
+        // rejects the mixed frame. The copying reader before ADR 0027 loaded the same bytes the same way. A known
+        // limitation: ADR 0027 → "Which loads can race".
         let words = unsafe {
             std::slice::from_raw_parts(
                 self.ptr.as_ptr().add(start).cast::<AtomicU64>(),
@@ -393,9 +400,9 @@ impl MapRo {
     /// The bytes must belong to a committed record that has already been validated (length, CRC, sequence, flags)
     /// from `Relaxed` atomic loads ([`MapRo::load_u32`], [`MapRo::words`]) made after observing its non-zero commit
     /// word, and no process may modify them while the returned slice lives. This is `Reader::open_mapped`'s safety
-    /// contract; the tickertape writer never modifies committed bytes. Validating first means a damaged length
-    /// can't make the slice cover bytes the writer is still appending to (barring a CRC collision, about 2^-32 per
-    /// damaged record).
+    /// contract; on an intact publication chain the tickertape writer never modifies committed bytes. Validating
+    /// first means a damaged length is rejected by the CRC before a slice can cover bytes the writer is still
+    /// appending to, under the assumption about racing loads in ADR 0027 → "Which loads can race".
     pub(crate) unsafe fn committed_bytes(&self, offset: u64, len: u64) -> Option<&[u8]> {
         let end = checked_range(self.len, offset, len)?;
         let start = offset as usize;
@@ -1220,7 +1227,12 @@ mod tests {
         let mut rw = MapRw::new(&file, 65536).unwrap();
         rw.bytes_mut(68, 4).unwrap().copy_from_slice(b"abcd");
         rw.store_commit_word(64, 40).unwrap();
-        let ro = MapRo::new(&file, 65536).unwrap();
+        assert_eq!(rw.commit_word(64), Some(40));
+        rw.sync_range(64, 8).unwrap();
+        sync_data(&file).unwrap();
+        let Some(ro) = map_ro_where_supported(&file, 65536) else {
+            return;
+        };
         assert_eq!(ro.commit_word(64), Some(40));
         assert_eq!(ro.load_u32(68), Some(u32::from_le_bytes(*b"abcd")));
         assert_eq!(ro.load_u32(66), None, "misaligned");
@@ -1240,9 +1252,6 @@ mod tests {
         assert!(ro.words(8, u64::MAX).is_none(), "overflowing length");
         // SAFETY: the bytes were written before the observed commit word and nothing modifies them afterwards.
         assert_eq!(unsafe { ro.committed_bytes(68, 4) }.unwrap(), b"abcd");
-        assert_eq!(rw.commit_word(64), Some(40));
-        rw.sync_range(64, 8).unwrap();
-        sync_data(&file).unwrap();
     }
 
     #[test]
@@ -1257,7 +1266,9 @@ mod tests {
         assert!(rw.commit_word(65528).is_some());
         assert!(rw.bytes_mut(65530, 7).is_none());
         assert!(rw.bytes(u64::MAX, 2).is_none());
-        let ro = MapRo::new(&file, 65536).unwrap();
+        let Some(ro) = map_ro_where_supported(&file, 65536) else {
+            return;
+        };
         assert!(ro.commit_word(4).is_none());
         // SAFETY: out-of-bounds requests return None without touching memory.
         assert!(unsafe { ro.committed_bytes(65535, 2) }.is_none());
@@ -1283,10 +1294,47 @@ mod tests {
         let (_dir, mut file) = temp_file(131072);
         assert_eq!(file.metadata().unwrap().len(), 131072);
         file.write_all(b"x").unwrap();
-        let ro = MapRo::new(&file, 131072).unwrap();
-        assert_eq!(ro.commit_word(131064), Some(0));
         sync_all(&file).unwrap();
         full_barrier(&file).unwrap();
+        if let Some(ro) = map_ro_where_supported(&file, 131072) {
+            assert_eq!(ro.commit_word(131064), Some(0));
+        }
+    }
+
+    /// `MapRo::new` where segments are mapped for reading; elsewhere checks that it refuses with `Unsupported`
+    /// (ADR 0027 → Supported targets) and returns `None`, so a test keeps its writer-side assertions there.
+    fn map_ro_where_supported(file: &File, len: usize) -> Option<MapRo> {
+        let mapped = MapRo::new(file, len);
+        assert_eq!(
+            mapped.is_ok(),
+            MAPPED_READS,
+            "MapRo::new: {:?}",
+            mapped.as_ref().err()
+        );
+        match mapped {
+            Ok(ro) => Some(ro),
+            Err(e) => {
+                assert_eq!(e.kind(), io::ErrorKind::Unsupported);
+                None
+            }
+        }
+    }
+
+    /// Segments are mapped for reading exactly on x86-64 and aarch64, and refused (`Unsupported`, nothing mapped)
+    /// everywhere else, where `Reader::open_mapped` reads with `pread` (ADR 0027 → Supported targets).
+    #[test]
+    fn mapped_reads_exactly_on_x86_64_and_aarch64() {
+        assert_eq!(
+            MAPPED_READS,
+            cfg!(any(target_arch = "x86_64", target_arch = "aarch64"))
+        );
+        let (_dir, file) = temp_file(65536);
+        let ro = map_ro_where_supported(&file, 65536);
+        assert_eq!(ro.is_some(), MAPPED_READS);
+        if !MAPPED_READS {
+            let err = MapRo::new(&file, 65536).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+        }
     }
 
     #[test]

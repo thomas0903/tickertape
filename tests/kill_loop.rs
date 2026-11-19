@@ -5,7 +5,7 @@ use std::io::{BufRead, BufReader, Read};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tickertape::{Reader, ReaderConfig, RecoveryAction, Writer, WriterConfig};
 use tickertape_tests::{Rng, kill_len, mixed_len, payload, read_all, segments};
@@ -147,6 +147,7 @@ fn kill_loop_250() {
 /// including the three-lane loop runs on live data), roll 64 KiB segments, and are killed and restarted. The reader
 /// must never report an error and must return exactly the records each writer published, in order.
 fn live_mapped_reader(iterations: u32) {
+    const CATCH_UP: Duration = Duration::from_secs(60);
     let mut rng = Rng::from_env("live_mapped_reader");
     let dir = tempfile::tempdir().unwrap();
     let journal = dir.path().join("journal");
@@ -168,6 +169,9 @@ fn live_mapped_reader(iterations: u32) {
                 }
             };
             let mut empty_polls = 0_u64;
+            // When the reader first saw `stop_at` set: it must then reach it within `CATCH_UP`, or the test fails
+            // instead of spinning (and the main thread waiting in `join`) forever.
+            let mut catching_up_since: Option<Instant> = None;
             loop {
                 let expected = reader.position();
                 match reader.try_next() {
@@ -184,8 +188,18 @@ fn live_mapped_reader(iterations: u32) {
                         progress.store(rec.seq + 1, Ordering::SeqCst);
                     }
                     Ok(None) => {
-                        if reader.position() >= stop_at.load(Ordering::SeqCst) {
+                        let stop = stop_at.load(Ordering::SeqCst);
+                        if reader.position() >= stop {
                             return empty_polls;
+                        }
+                        if stop != u64::MAX {
+                            let since = *catching_up_since.get_or_insert_with(Instant::now);
+                            assert!(
+                                since.elapsed() < CATCH_UP,
+                                "live mapped reader stuck at position {} for {CATCH_UP:?} after the last \
+                                 writer; expected to reach position {stop} (the final recovered next_seq)",
+                                reader.position()
+                            );
                         }
                         empty_polls += 1;
                         std::hint::spin_loop();

@@ -30,10 +30,11 @@ Spec: [`format.md`](../format.md) → Publication; ADR 0003.
 - **Writer.** It writes the body `[P+4, P+len)` with ordinary stores, then stores `len` into the commit word at `P`
   with `Release`. The padding `[P+len, P+align8(len))` is already zero and never written; the next record starts at
   `P+align8(len)`. After the release store the writer never modifies `[P, P+align8(len))` again. Abandoned bodies
-  are zeroed (durably) before any later commit. Recovery never modifies committed bytes either: in place, it only
-  zeroes never-committed bytes after the first empty slot (`zero_uncommitted_tail`) and writes a missing seal at
-  that slot (`write_seal`); every other repair replaces or moves a whole file (ADR 0007, `format.md` → Recovery).
-  This is the "committed bytes are immutable" guarantee.
+  are zeroed (durably) before any later commit. In place, recovery only zeroes the bytes after the first empty slot
+  (`zero_uncommitted_tail`), which on an intact chain were never committed, and writes a missing seal at that slot
+  (`write_seal`); every other repair replaces or moves a whole file (ADR 0007, `format.md` → Recovery). So on an
+  intact publication chain committed bytes are immutable. A commit word damaged on storage breaks that (below,
+  "Which loads can race").
 - **Reader, ordering.** It loads the commit word with a 4-byte `Relaxed` atomic load and, if it is non-zero, issues
   `fence(Acquire)`. If that load read the value of the writer's release store, the store synchronises with the fence,
   so every write the writer made before the store happens before every load the reader makes after the fence (fence
@@ -47,9 +48,9 @@ Spec: [`format.md`](../format.md) → Publication; ADR 0003.
 
   None of these overlaps the commit word, so there is no mixed-size access to it (the old copy loaded it again as
   half of an 8-byte word). The loads are unordered among themselves; they need no order, since one release store
-  published all of them. `Relaxed` 4- and 8-byte loads are the only atomic operations `core::sync::atomic` documents
-  as allowed on read-only memory on x86-64 and aarch64 ("Atomic accesses to read-only memory", present at MSRV 1.85),
-  which is why neither `Acquire` loads nor wider loads are used.
+  published all of them. `Relaxed` loads of up to 8 bytes are the only atomic operations `core::sync::atomic`
+  documents as allowed on read-only memory on x86-64 and aarch64 ("Atomic accesses to read-only memory", present at
+  MSRV 1.85), which is why neither `Acquire` loads nor wider loads are used.
 
 `SharedWords` keeps the `&[AtomicU64]` it wraps private and offers only `Relaxed` loads, so no other operation can
 reach the read-only mapping. That slice is a reference, but to `UnsafeCell`s: it asserts nothing about the bytes
@@ -59,15 +60,21 @@ code runs under Miri and in the fuzzer, and a test runs `MapRo`'s own loads unde
 
 ## Which loads can race
 
+The guarantees in this ADR hold **for an intact publication chain**: every commit word the reader follows is one the
+writer published. Storage damage to a commit word (its length enlarged, or the word zeroed) breaks the chain, and
+then they do not hold; the cases are below.
+
 **Records published by the protocol: no race and no mixed-size access.** For a record whose commit word holds the
 length the writer stored, the writer's release store of that word synchronises with the reader's acquire fence, so
 every writer store to the frame happens before every reader load of it, and the writer never stores to the frame
 again. The reader's loads stay inside `[P+4, P+align8(len))`: they end where the next slot's commit word begins and
 never touch another record's commit word, which the writer accesses only as a 4-byte atomic. The commit word at `P`
-itself is loaded as a 4-byte atomic too. The CRC field load at `P+4` (and a seal's CRC) is also safe in the case
-below, because `[P+4, P+8)` always lies before the next slot.
+itself is loaded as a 4-byte atomic too.
 
-**A frame whose length is damaged: a known limitation.** This case stays inside `open_mapped`'s contract:
+**Damaged commit words: known limitations.** Both cases stay inside `open_mapped`'s contract, since only tickertape
+writers touch the files.
+
+*An enlarged length.*
 
 1. A writer appends up to offset `Q` in a segment and checkpoints.
 2. While nothing runs, storage damage enlarges the length in the commit word of an earlier record at `P`, so that
@@ -78,31 +85,51 @@ below, because `[P+4, P+8)` always lies before the next slot.
    with ordinary (non-atomic) stores, and can cover a later record's commit word, which the writer stores as a 4-byte
    atomic.
 
-An atomic load that races with a non-atomic store is a data race in Rust's memory model, and overlapping atomic
-accesses of different sizes are undefined as well; a reviewer confirmed both with Miri on a small model. When the
-writer is another process, which is the normal deployment, the accesses are outside the model altogether (ADR 0003
-already reasons about cross-process `MAP_SHARED` memory by analogy with threads). Here the implementation relies on
-facts below the language:
+*A zeroed commit word.*
+
+1. A writer appends records up to sequence number `T`, which readers return; the last checkpoint covers only the
+   records before some `S <= T`.
+2. Storage damage zeroes the commit word of the published record `S`.
+3. A writer reopens. Recovery scans from the checkpoint and stops at the empty slot of record `S`. Unless it can tell
+   that published records follow (which it cannot always do), it takes that slot for the end of the journal and
+   zeroes record `S` **and the published records after it** in place, then appends from there.
+4. A zero-copy reader that is still open while this happens holds payload slices into those records, and they change
+   under it: the bytes it validated are not the bytes it hands back. Its later commit-word loads, and the loads that
+   validate the records it then reads, meet the recovering and the new writer's stores to the same bytes.
+
+In both cases a mapped load touches bytes a writer is storing to without synchronisation. When the writer runs in
+the same process, that is a data race in Rust's memory model **before any CRC runs**, and overlapping atomic accesses
+of different sizes are undefined as well; a reviewer confirmed both with Miri on a small model. When the writer is
+another process, which is the normal deployment, the accesses are outside the model altogether (ADR 0003 already
+reasons about cross-process `MAP_SHARED` memory by analogy with threads). Validation does not prevent this, since the
+loads that race are the ones validation makes.
+
+What happens next is an **assumption about the implementation on the supported machines, not a guarantee**:
 
 - on x86-64 and aarch64 (the only targets that map segments for reading, below), an aligned 4- or 8-byte load is a
   single instruction (`mov`, `ldr`) that cannot fault inside the mapping and returns some mixture of old and new bytes
-  of the word, never anything else;
-- the compiler may not split, repeat or invent an atomic load, so each word is read once, and the value validated is
-  the value fed to the CRC;
+  of the word;
+- the compiler does not split, repeat or invent an atomic load, so each word is read once, and the value validated
+  is the value fed to the CRC;
 - no `&[u8]` or other reference asserting immutability exists before validation, so nothing licenses the compiler to
   assume the bytes are stable.
 
-The outcome: the CRC rejects the frame, except with probability about 2^-32 per attempt (a reader retries
-`VALIDATION_RETRIES` times before reporting corruption), as in every earlier release. A chance match that also passes
-the sequence and flag checks would hand out a slice over bytes that are still being written. **The copying reader
-before this decision had exactly the same exposure**, since it copied the same range with the same atomic loads; this
-decision does not introduce it, and it removes the old reader's one mixed-size load (the record's own commit word,
-loaded again as half of an 8-byte word).
+Under that assumption, a frame that mixes bytes from different writes fails the CRC, and the reader reports
+corruption. How likely a chance match is depends on the corruption and on what the writer is storing; a reader
+retries `VALIDATION_RETRIES` times before reporting it, but a retry can read the same bytes, so retries are not
+independent attempts. A frame that passes would hand out a slice over bytes that are still being written. In the
+zeroed-word case the reader can also return records that validate and then change. **The copying reader before this
+decision had exactly the same exposure**, since it copied the same range with the same atomic loads and relied on
+the same immutability after validation; this decision does not introduce it, and it removes the old reader's one
+mixed-size load (the record's own commit word, loaded again as half of an 8-byte word).
 
-Closing it needs the reader's loads to be bounded by a publication boundary that is synchronised independently of
-the untrusted length: a shared frontier word that the writer advances on every append. That is a protocol change with
-its own design and measurements, so it is a separate follow-up (roadmap → "Remove the mapped reader's validation
-copy"), not part of this decision.
+Closing the enlarged-length case needs the reader's loads to be bounded by a publication boundary that is
+synchronised independently of the untrusted length: a shared frontier word that the writer advances on every append.
+That is a protocol change with its own design and measurements, so it is a separate follow-up (roadmap → "Remove the
+mapped reader's validation copy"), not part of this decision. A reader-side frontier alone does not close the
+zeroed-word case: there the reader loads nothing out of bounds; the bytes change because recovery rewrites published
+records in place. That needs recovery to recognise such damage before it zeroes anything, and recovery cannot tell
+every such case from a torn append.
 
 **Can any of the exposure be removed at no cost?** No:
 
@@ -150,9 +177,10 @@ The seal check reads the seal CRC with one 4-byte load (`MapRo::load_u32`) inste
 
 After validation succeeds, `Reader::materialize` creates `&[u8]` over `[P+40, P+len)` in the mapping, and the caller
 reads it later. What makes those bytes equal to the ones the CRC covered is only `open_mapped`'s safety contract: while
-the reader exists, no process other than a tickertape writer modifies the segment files, and a tickertape writer never
-modifies committed bytes. **The new reader relies on nothing the old one didn't.** The old reader also validated one
-set of bytes (its copy) and handed out a slice of another (the mapping), so it relied on exactly the same immutability.
+the reader exists, no process other than a tickertape writer modifies the segment files, and a tickertape writer
+never modifies committed bytes on an intact publication chain (for a damaged commit word, see "Which loads can
+race"). **The new reader relies on nothing the old one didn't.** The old reader also validated one set of bytes (its
+copy) and handed out a slice of another (the mapping), so it relied on exactly the same immutability.
 What the copy additionally gave, that the returned header values are the ones checked even if the contract were
 broken, is kept by loading each word once. The validation-before-slice order is unchanged. The safety contract of
 `open_mapped`, the crash contract and the on-disk format are therefore unchanged; their wording about "a copy" is
@@ -198,8 +226,8 @@ before and as any read of a returned payload would. The safe reader still never 
 Option 6, as described above, on x86-64 and aarch64; the `pread` reader on other targets. `MapRo::copy_atomic_into`
 and the reader's scratch buffer are removed. Unsafe code: two new blocks in `mmap.rs` (`MapRo::load_u32`, a 4-byte
 load; `MapRo::words`, an `&[AtomicU64]` over a bounds-checked, 8-aligned range wrapped in `SharedWords`), and
-target-feature functions in `crc.rs` that call the same intrinsics as before on values. The damaged-length case above
-is accepted as a known limitation, unchanged from earlier releases, until the publication-frontier follow-up.
+target-feature functions in `crc.rs` that call the same intrinsics as before on values. The damaged-commit-word
+cases above are accepted as known limitations, unchanged from earlier releases.
 
 ## Measurements
 
@@ -253,6 +281,7 @@ sends on these machines. A difference of 5–40 ns per record is below what that
 - The Miri job also runs the CRC tests and `MapRo`'s loads over an anonymous mapping
   (`cargo +nightly miri test -p tickertape --lib -- format crc map_ro`), which execute the word decoder, the software
   fallback, and the pointer arithmetic, bounds and alignment of `MapRo::load_u32` and `MapRo::words`. Miri cannot run
-  the hardware path or file mappings. `RUSTFLAGS="--cfg tickertape_force_soft_crc"` builds only the software fallback,
-  so the whole suite can run on it.
+  the hardware path or file mappings. `RUSTFLAGS="--cfg tickertape_force_soft_crc"` compiles out tickertape's own
+  hardware path, so the whole suite can run on its fallback (the `crc32c` crate still picks its own hardware
+  implementation on capable CPUs).
 - `crc.rs` and `mmap.rs` changed, so this needs the independent review those modules require.

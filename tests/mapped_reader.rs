@@ -370,6 +370,27 @@ fn every_corruption_class_is_reported_identically() {
                 );
             }
         }
+        // A frame that ends exactly at the end of the segment covers the 8-byte trailer, which never holds a record:
+        // a bad length, not a checksum failure. One word shorter, it ends at the trailer and is a valid length, so
+        // the CRC decides.
+        let to_end = (SMALL_SEGMENT - placed.offset) as u32;
+        add(
+            format!("{label}: commit word reaching the segment end ({to_end})"),
+            path,
+            placed,
+            Box::new(move |p, at| write_at(p, at.offset, &to_end.to_le_bytes())),
+            Expect::Corrupt(seq, |r| matches!(r, CorruptReason::BadLength(_))),
+        );
+        let to_trailer = to_end - 8;
+        if to_trailer != placed.len {
+            add(
+                format!("{label}: commit word reaching the trailer ({to_trailer})"),
+                path,
+                placed,
+                Box::new(move |p, at| write_at(p, at.offset, &to_trailer.to_le_bytes())),
+                Expect::Corrupt(seq, |r| matches!(r, CorruptReason::BadChecksum)),
+            );
+        }
         add(
             format!("{label}: seal marker with a wrong CRC"),
             path,
@@ -487,6 +508,18 @@ fn every_corruption_class_is_reported_identically() {
         Box::new(move |f, _| {
             let b = read_at(f, middle_end + 4, 1)[0];
             write_at(f, middle_end + 4, &[b ^ 1]);
+        }),
+        Expect::Corrupt(before_seal.header.seq + 1, |r| {
+            matches!(r, CorruptReason::BadSeal)
+        }),
+    );
+    add(
+        "seal: CRC of the next sequence number".into(),
+        &seal_path,
+        before_seal,
+        Box::new(move |f, at| {
+            let crc = format::seal_crc(at.header.seq + 2);
+            write_at(f, middle_end + 4, &crc.to_le_bytes());
         }),
         Expect::Corrupt(before_seal.header.seq + 1, |r| {
             matches!(r, CorruptReason::BadSeal)

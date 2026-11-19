@@ -36,8 +36,10 @@ tests/compat/generate.sh --check-old-readers                 # released readers 
 go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12    # workflow lint
 ```
 
-Changes to `crc.rs` should also pass the whole suite on the software CRC, which the instruction otherwise hides on
-every machine that has it: `RUSTFLAGS="--cfg tickertape_force_soft_crc" cargo test --workspace --all-features`.
+Changes to `crc.rs` should also pass the whole suite on tickertape's fallback path, which its hardware path
+otherwise hides on every machine that has the CRC instruction:
+`RUSTFLAGS="--cfg tickertape_force_soft_crc" cargo test --workspace --all-features`. This compiles out tickertape's
+own hardware path only; the `crc32c` crate it falls back to still picks its hardware implementation on capable CPUs.
 
 CI runs these on Linux x86-64 and macOS, and the tests, long tests and fuzz smoke on aarch64 Linux too.
 `cargo test --workspace` includes the format-v1 compatibility fixtures (`tests/compat/README.md`), which check the
