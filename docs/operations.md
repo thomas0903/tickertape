@@ -202,7 +202,8 @@ With `--watch`, a sample that fails replaces the file with `tickertape_up 0` and
 does the same before it exits with an error. The file must not lie inside the journal, its `quarantine/` or the beacon
 directory, and `status` replaces an existing file only if it is an earlier output of `status` (in any format) or an
 empty regular file; anything else, including a symlink, is refused on standard error and stops a watch with exit
-code 1 (remove the file, or choose another path), so keep the timestamp alert below. `--watch` with Prometheus output needs `--output` (several expositions
+code 1 (remove the file, or choose another path). A write that fails (a full disk, a directory that became read-only)
+stops a watch with exit code 1 too, so keep the timestamp alert below. `--watch` with Prometheus output needs `--output` (several expositions
 in one stream are not valid). The `journal` label is the canonical path of the journal directory.
 
 Example alert expressions:

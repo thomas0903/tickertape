@@ -1259,6 +1259,76 @@ fn output_ownership_does_not_depend_on_the_journal() {
 /// to another directory (before the fix the check compared the output with the directory only, and replaced the
 /// file), not a new file in that directory, and not a file a quarantine entry reaches through a symlink or a hard
 /// link.
+/// A destination outside the journal whose path goes through the journal directory with `..` is outside it (round 5:
+/// the path as given was compared with its `..` components in place, and refused); one inside it stays refused
+/// however it is spelled.
+#[test]
+fn output_path_with_parent_components() {
+    let _serial = serial();
+    let (dir, writer) = journal(2, true);
+    drop(writer);
+    let journal_dir = dir.path().canonicalize().unwrap();
+    let name = journal_dir.file_name().unwrap().to_owned();
+    let parent = journal_dir.parent().unwrap();
+    let outside = tempfile::Builder::new()
+        .prefix("tt-status-out-")
+        .tempdir_in(parent)
+        .unwrap();
+    let outside_name = outside.path().file_name().unwrap().to_owned();
+    // <journal>/../<outside>/ok.prom, absolute.
+    let through = journal_dir.join("..").join(&outside_name).join("ok.prom");
+    command()
+        .args([
+            "status",
+            journal_dir.to_str().unwrap(),
+            "--format",
+            "prometheus",
+            "--output",
+        ])
+        .arg(&through)
+        .assert()
+        .code(0);
+    assert_eq!(up_in(&outside.path().join("ok.prom")), 1.0);
+    // The same from inside the journal directory, with relative paths: `status . --output ../<outside>/rel.prom`.
+    command()
+        .current_dir(&journal_dir)
+        .args(["status", ".", "--format", "prometheus", "--output"])
+        .arg(
+            std::path::Path::new("..")
+                .join(&outside_name)
+                .join("rel.prom"),
+        )
+        .assert()
+        .code(0);
+    assert_eq!(up_in(&outside.path().join("rel.prom")), 1.0);
+    // Inside the journal, spelled through `..`: refused, and nothing is created.
+    let inside = outside.path().join("..").join(&name).join("in.prom");
+    command()
+        .args([
+            "status",
+            journal_dir.to_str().unwrap(),
+            "--format",
+            "prometheus",
+            "--output",
+        ])
+        .arg(&inside)
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("not written"))
+        .stderr(predicate::str::contains("which the journal uses"));
+    assert!(!journal_dir.join("in.prom").exists());
+    command()
+        .current_dir(outside.path())
+        .args(["status"])
+        .arg(std::path::Path::new("..").join(&name))
+        .args(["--format", "prometheus", "--output"])
+        .arg(std::path::Path::new("..").join(&name).join("in.prom"))
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("which the journal uses"));
+    assert!(!journal_dir.join("in.prom").exists());
+}
+
 #[test]
 fn output_never_replaces_quarantined_evidence() {
     let _serial = serial();

@@ -420,11 +420,14 @@ with `--watch`, which goes on sampling and picks the journal up once it exists).
   segment, notify or beacon file just created, a `.bin.partial` just created — are refused by the path checks under
   their own names and by the walk when reached through a symlink or hard link, and refused outright when the walk
   can't run. With this rule a failed sample's report can always be written over an earlier status output, whatever
-  state the journal is in, and can never be written over anything else. The archive directory of
+  state the journal is in, and is never written over a file that is not empty and does not start like a status
+  output. One case rests on that content test alone: a quarantined copy that someone moved out of `quarantine/`
+  under another name (and, say, left a symlink to) is protected by neither the path rule nor the name rule, only by
+  not starting with one of the three prefixes above. The archive directory of
   `tickertape archive` is not recorded anywhere `status` can see, but nothing in it can pass either (its files are
   segments).
 
-## Compatibility## Compatibility
+## Compatibility
 
 - No format change. `docs/format.md` lists `readers/` as an advisory name outside the format, like `notify`.
 - **v0.4.0 and `readers/`.** Two reviewers checked by reading that v0.4.0's writer open and recovery, `verify`,

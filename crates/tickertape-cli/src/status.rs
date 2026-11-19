@@ -266,11 +266,29 @@ fn describe(breach: &Breach) -> String {
     }
 }
 
-/// The `--output` destination, as given (made absolute, symlinks kept) and resolved (its directory's canonical path
-/// joined with its name). The resolved path is the one replaced.
+/// The `--output` destination, as given (made absolute, symlinks kept, `.` and `..` taken out by [`lexical`]) and
+/// resolved (its directory's canonical path joined with its name). The resolved path is the one replaced.
 struct Destination {
     given: PathBuf,
     resolved: PathBuf,
+}
+
+/// `path`, which is absolute, without its `.` components and with each `..` taken against the component before it,
+/// without reading the file system. Only for the by-name comparisons of [`check_output`]: `/data/j/../status.prom`
+/// is not inside `/data/j`. Where a symlink makes this differ from where the path really leads, the comparison of the
+/// resolved paths decides.
+fn lexical(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// Resolves `path` for `--output`: it must name a file in a directory that exists.
@@ -286,7 +304,7 @@ fn destination(path: &Path) -> Result<Destination> {
         fs::canonicalize(parent).map_err(|e| output::io_error("resolve output directory", e))?;
     let given = std::path::absolute(path).map_err(|e| output::io_error("resolve output", e))?;
     Ok(Destination {
-        given,
+        given: lexical(&given),
         resolved: parent.join(name),
     })
 }
@@ -304,7 +322,14 @@ struct JournalPlaces {
 impl JournalPlaces {
     fn new(journal_given: &Path, journal: &Path, readers_given: Option<&Path>) -> JournalPlaces {
         let mut dirs = Vec::new();
-        for j in [journal_given, journal] {
+        // Each as given (which is what gets resolved again at every check) and with `.` and `..` taken out (which is
+        // what the destination as given is compared with).
+        for j in [
+            journal_given,
+            journal,
+            &lexical(journal_given),
+            &lexical(journal),
+        ] {
             dirs.push(j.to_path_buf());
             dirs.push(j.join(QUARANTINE_DIR));
             if readers_given.is_none() {
@@ -312,6 +337,7 @@ impl JournalPlaces {
             }
         }
         dirs.extend(readers_given.map(Path::to_path_buf));
+        dirs.extend(readers_given.map(lexical));
         dirs.sort();
         dirs.dedup();
         let readers = readers_given.map_or_else(
