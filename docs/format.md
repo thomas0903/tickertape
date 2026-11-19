@@ -341,6 +341,16 @@ position. It would return a record that is not in the journal only if the new hi
 checksum and the expected sequence number at that position (ADR
 [0034](decisions/0034-durable-only-reads-check-segment-identity.md) → In-place repairs).
 
+An in-place repair can also remove a seal: when storage damage empties a seal's marker and its successor no longer
+opens, recovery zeroes what is left of the seal in place and moves the successor into `quarantine/` (step 4, "Commit
+word `0`, no committed history, no such segment that opens", then step 5). A reader may have read the seal before,
+and the safe reader may still hold it in its buffer. So a reader at a seal whose successor is missing while its own
+segment is still in place reads the slot again from the file before it reports a broken chain. If the seal is gone,
+it reads the slot as it is now: it waits there (`Ok(None)`) or returns the new history's record, without
+`Error::Discarded`, like any reader across an in-place repair. If the seal is there, a writer stored it only after
+linking its successor, so the reader tries the successor once more and reports `CorruptReason::BrokenChain` only if it
+is still missing.
+
 Until it checks, a visible reader may return records from a segment that recovery has just preserved and removed.
 Such records are like records lost to a power loss that a reader had already seen (`crash-contract.md` → C8). A
 durable-only reader never does (C13). A reader never moves from a removed history into the repaired one without
