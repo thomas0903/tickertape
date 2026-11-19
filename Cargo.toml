@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/tickertape",
     "crates/tickertape-cli",
+    "crates/tickertape-ffi",
     "tests",
     "benches",
     "examples",

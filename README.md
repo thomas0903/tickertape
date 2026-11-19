@@ -111,6 +111,7 @@ CLI reference, exit codes and the JSONL and Parquet schemas: [`docs/cli.md`](doc
 Choosing segment sizes and checkpoint intervals, archiving old segments and what to do after a crash:
 [`docs/operations.md`](docs/operations.md).
 For direct, read-only access from Python without dependencies, see [`python/`](python/README.md).
+From C, C++ or another language through a C ABI (not stable before 1.0), see [`docs/c-api.md`](docs/c-api.md).
 
 ## iceoryx2 integration
 
@@ -168,9 +169,9 @@ Background research: [`docs/research/2026-10-31-market-review.md`](docs/research
 
 ## Project layout
 
-`crates/tickertape` (library) · `crates/tickertape-cli` (the `tickertape` binary) · `tests/` (cross-process and
-crash tests) · `fuzz/` · `benches/` · `examples/` · `integrations/iceoryx2` (separate crate) · `docs/` (format,
-crash contract, decisions, playbooks).
+`crates/tickertape` (library) · `crates/tickertape-cli` (the `tickertape` binary) · `crates/tickertape-ffi` (C ABI
+and header) · `tests/` (cross-process and crash tests) · `fuzz/` · `benches/` · `examples/` · `integrations/iceoryx2`
+(separate crate) · `docs/` (format, crash contract, decisions, playbooks).
 Contributions: [`CONTRIBUTING.md`](CONTRIBUTING.md). Security issues: [`SECURITY.md`](SECURITY.md).
 
 ## Licence
