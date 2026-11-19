@@ -473,12 +473,24 @@ enum Restart {
     /// Recovery removed records in place after a commit word zeroed in the file, and the new writer began there: that
     /// file keeps its identity, so readers can't notice (C11). Later segments, if any, were quarantined, unchanged.
     /// `zeroed_end`: the base of the first segment after the one zeroed in place (`u64::MAX` if it was the newest),
-    /// so recovery changed bytes only of records below it.
-    InPlace { zeroed_end: u64 },
+    /// so recovery changed bytes only of records below it. `moved_from`: see [`Restart::moved_from`].
+    InPlace { zeroed_end: u64, moved_from: u64 },
     /// Recovery began the new writer in a segment it replaced (a corrupt copy was renamed over it), or after
     /// quarantining segments: readers holding the old files notice, and must report `Error::Discarded` before they
-    /// return records of the repaired history.
-    Replaced,
+    /// return records of the repaired history. `moved_from`: see [`Restart::moved_from`].
+    Replaced { moved_from: u64 },
+}
+
+impl Restart {
+    /// The base of the first segment whose file the restart moved out of the journal (quarantined it, or renamed
+    /// another file over its name), `u64::MAX` if none: the files of all later segments were moved too. The bytes of
+    /// a moved file never change again.
+    fn moved_from(self) -> u64 {
+        match self {
+            Restart::Clean => u64::MAX,
+            Restart::InPlace { moved_from, .. } | Restart::Replaced { moved_from } => moved_from,
+        }
+    }
 }
 
 fn repairs(duration: Duration) {
@@ -649,8 +661,11 @@ fn restart_loop(
         append_generation(&mut writer, 1 + rng.below(300), generation);
         shared.window.fetch_add(1, Ordering::SeqCst);
         drop(writer);
+        let before = segments(shared.dir);
         let damage = rng.below(8);
         let (mut zeroed, mut replaced) = (None, false);
+        // Paths of the segment files moved out of the journal, by the damage or by recovery.
+        let mut moved = Vec::new();
         if damage >= 2 {
             let marker = inspect::read_checkpoint(shared.dir)
                 .unwrap()
@@ -669,12 +684,31 @@ fn restart_loop(
                     zeroed = Some(zeroed_end);
                 } else {
                     corrupt_by_replacement(shared.dir, seq);
+                    let (_, path) = before.iter().rev().find(|s| s.0 <= seq).expect("a segment");
+                    moved.push(path.clone());
                     replaced = true;
                 }
             }
         }
         writer = reopen_writer(shared.dir, config.clone());
         let actions = &writer.recovery_report().actions;
+        moved.extend(actions.iter().filter_map(|a| match a {
+            RecoveryAction::RepairedTail { segment, .. }
+            | RecoveryAction::QuarantinedSegment { segment, .. } => Some(segment.clone()),
+            _ => None,
+        }));
+        let name = |path: &std::path::PathBuf| path.file_name().map(|n| n.to_owned());
+        let moved_from = before
+            .iter()
+            .find(|s| moved.iter().any(|m| name(m) == name(&s.1)))
+            .map_or(u64::MAX, |s| s.0);
+        assert!(
+            before
+                .iter()
+                .filter(|s| s.0 >= moved_from)
+                .all(|s| moved.iter().any(|m| name(m) == name(&s.1))),
+            "recovery moved some segments from {moved_from} on but not all: {before:?}, {actions:?}"
+        );
         if actions.iter().any(|a| {
             matches!(
                 a,
@@ -697,8 +731,11 @@ fn restart_loop(
         // A zeroed commit word is where recovery stopped and the new writer began, in place, even when recovery also
         // quarantined later segments (the zeroed word was in an older one).
         let restart = match (zeroed, replaced) {
-            (Some(zeroed_end), _) => Restart::InPlace { zeroed_end },
-            (None, true) => Restart::Replaced,
+            (Some(zeroed_end), _) => Restart::InPlace {
+                zeroed_end,
+                moved_from,
+            },
+            (None, true) => Restart::Replaced { moved_from },
             (None, false) => Restart::Clean,
         };
         shared.restarts.lock().unwrap().push(restart);
@@ -773,7 +810,9 @@ fn visible_follow(shared: &Repairs<'_>, mapped: bool) {
         match reader.next_timeout(Some(Duration::from_millis(20))) {
             Ok(Some(record)) => {
                 let record = record.to_owned();
-                // Right after the copy: a restart that began later can't have changed it.
+                // Right after the copy: a restart that began later can't have changed it. The fence keeps the copy's
+                // loads from the mapping before this load of the window.
+                std::sync::atomic::fence(Ordering::Acquire);
                 let copied = shared.window.load(Ordering::SeqCst);
                 assert_eq!(record.seq, expected, "mapped {mapped}");
                 if mapped {
@@ -788,9 +827,8 @@ fn visible_follow(shared: &Repairs<'_>, mapped: bool) {
                     let between = generation as usize + 1..=next as usize;
                     assert!(
                         next >= generation
-                            && between
-                                .clone()
-                                .all(|g| starts[g] > seq || restarts[g] != Restart::Replaced),
+                            && between.clone().all(|g| starts[g] > seq
+                                || !matches!(restarts[g], Restart::Replaced { .. })),
                         "visible reader (mapped {mapped}) moved from record {seq} of generation {generation} to \
                          record {} of generation {next} without Error::Discarded (generations between: {:?})",
                         record.seq,
@@ -829,10 +867,9 @@ fn visible_follow(shared: &Repairs<'_>, mapped: bool) {
 /// validation can come out of `to_owned` with its payload zeroed, wholly or in part (the copy races with the
 /// zeroing), or, if the copy is late enough, partly overwritten by the new history appended there, while its header
 /// fields, copied out during validation, are right. That is all the contract allows, and only for a record such a
-/// repair removed while the reader held it: one at or after the start, and in the segment zeroed, of a generation
-/// whose restart (with an in-place repair) overlapped the read, from before the read to the end of the copy. The
-/// safe reader, and durable-only readers of both kinds (which return only records below
-/// a marker, never zeroed in place: C13), get the full check.
+/// repair removed, in the file the reader mapped, while the reader held it ([`changed_in_place`]). The safe reader,
+/// and durable-only readers of both kinds (which return only records below a marker, never zeroed in place: C13),
+/// get the full check.
 fn check_mapped_visible(
     shared: &Repairs<'_>,
     r: &OwnedRecord,
@@ -857,14 +894,13 @@ fn check_mapped_visible(
     }
     let starts = shared.starts.lock().unwrap();
     let restarts = shared.restarts.lock().unwrap();
-    let generations: Vec<_> = (since..starts.len().min(until + 1))
+    let window = since..starts.len().min(until + 1);
+    let generations: Vec<_> = window
+        .clone()
         .map(|g| (g, starts[g], restarts[g]))
         .collect();
     assert!(
-        generations.iter().any(|&(_, start, restart)| matches!(
-            restart,
-            Restart::InPlace { zeroed_end } if start <= r.seq && r.seq < zeroed_end
-        )),
+        changed_in_place(&starts, &restarts, window, r.seq, r.schema_id as usize),
         "zero-copy payload of {} (generation {}) changed, but no in-place repair removed it during the read \
          (generations since: {generations:?}): {:?}",
         r.seq,
@@ -886,4 +922,79 @@ fn check_mapped_visible(
         r.payload
     );
     shared.changed_payloads.fetch_add(1, Ordering::SeqCst);
+}
+
+/// Whether one of the restarts making generations `window` (those that overlapped the zero-copy read, see
+/// [`check_mapped_visible`]) can have changed, in place, the payload of record `seq` of generation `generation` in the
+/// file the reader mapped.
+///
+/// Restart `g` must have repaired in place a range holding the record (`starts[g] <= seq < zeroed_end`), after the
+/// record was written (`g > generation`). And no restart between them may have moved the file holding the record
+/// out of the journal (`moved_from <= seq`). The reader validated a record of generation `generation`, so it mapped
+/// the file as it was before such a restart: starts only grow, so that restart began below `starts[g] <= seq`, and
+/// every file holding `seq` since holds a newer generation there. The bytes of a moved file never change again;
+/// restart `g` repaired a file that took its place. For example: a
+/// reader holds record 450 in the segment based at 339; restart A repairs in place at 300 in an earlier segment and
+/// quarantines segment 339; restart B repairs in place at 450 in the segment 339 recreated after A. B covers record
+/// 450, but changed a file the reader never mapped.
+fn changed_in_place(
+    starts: &[u64],
+    restarts: &[Restart],
+    window: std::ops::Range<usize>,
+    seq: u64,
+    generation: usize,
+) -> bool {
+    window.into_iter().any(|g| {
+        matches!(
+            restarts[g],
+            Restart::InPlace { zeroed_end, .. } if starts[g] <= seq && seq < zeroed_end
+        ) && g > generation
+            && (generation + 1..g).all(|between| restarts[between].moved_from() > seq)
+    })
+}
+
+#[test]
+fn zero_copy_payload_changes_need_the_mapped_file() {
+    // Generation 0 wrote record 450 in the segment based at 339. Restart A (generation 1) repairs in place at 300 in
+    // the segment based at 200 and quarantines segment 339; restart B (generation 2) repairs in place at 450 in the
+    // recreated segment 339, whose next segment is based at 500.
+    let changed = |a, window, seq, generation| {
+        let b = Restart::InPlace {
+            zeroed_end: 500,
+            moved_from: u64::MAX,
+        };
+        changed_in_place(
+            &[0, 300, 450],
+            &[Restart::Clean, a, b],
+            window,
+            seq,
+            generation,
+        )
+    };
+    let a = Restart::InPlace {
+        zeroed_end: 339,
+        moved_from: 339,
+    };
+    assert!(!changed(a, 1..3, 450, 0));
+    // Nor when only B overlapped the read (A quarantined the record's file before it). B does excuse a change to a
+    // record of generation 1, written in the recreated segment.
+    assert!(!changed(a, 2..3, 450, 0));
+    assert!(changed(a, 2..3, 450, 1));
+    // Without A's quarantine (record 450 still in A's zeroed range), A or B may have changed it.
+    let kept = Restart::InPlace {
+        zeroed_end: u64::MAX,
+        moved_from: u64::MAX,
+    };
+    assert!(changed(kept, 2..3, 450, 0));
+    assert!(changed(kept, 1..2, 450, 0));
+    // A replacement of the record's file has the same effect as a quarantine.
+    assert!(!changed(
+        Restart::Replaced { moved_from: 339 },
+        1..3,
+        450,
+        0
+    ));
+    // B doesn't excuse a change to a record it kept, nor to one written after it.
+    assert!(!changed(kept, 2..3, 449, 1));
+    assert!(!changed(kept, 2..3, 450, 2));
 }

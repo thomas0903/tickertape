@@ -794,18 +794,25 @@ fn verify_waits_for_a_writer_stalled_between_linking_and_sealing() {
         "{:?}",
         report.problems
     );
-    // The "writer" seals after verify's first scan found the segment unsealed, before it scans again (hook point
-    // `InspectRescan`): verify must scan again rather than report the first scan's state.
-    let rescanned = std::rc::Rc::new(std::cell::Cell::new(false));
-    let r = rescanned.clone();
+    // The "writer" seals only after verify's first scan and its first re-scan both found the segment unsealed, just
+    // before the second re-scan (hook point `InspectRescan` runs before each re-scan): verify must keep scanning
+    // rather than give up after one re-scan, and stop once the seal is there. The hook counts the re-scans and
+    // re-arms itself.
+    fn count_rescans(count: std::rc::Rc<std::cell::Cell<u32>>, seal: std::rc::Rc<dyn Fn()>) {
+        tickertape::fault::run_at(tickertape::fault::Point::InspectRescan, 0, move || {
+            count.set(count.get() + 1);
+            if count.get() == 2 {
+                seal();
+            }
+            count_rescans(count, seal);
+        });
+    }
+    let rescans = std::rc::Rc::new(std::cell::Cell::new(0));
     tickertape::fault::clear();
-    tickertape::fault::run_at(tickertape::fault::Point::InspectRescan, 0, move || {
-        r.set(true);
-        seal(&path);
-    });
+    count_rescans(rescans.clone(), std::rc::Rc::new(move || seal(&path)));
     let report = tickertape::inspect::verify(dir.path()).unwrap();
     tickertape::fault::clear();
-    assert!(rescanned.get(), "verify didn't scan again");
+    assert_eq!(rescans.get(), 2, "re-scans of the unsealed segment");
     assert!(report.problems.is_empty(), "{:?}", report.problems);
 }
 
