@@ -215,8 +215,9 @@ pub struct Problem {
 /// numbers; run `verify` again to tell. A problem that is really there is always reported, only later. With no
 /// writer running every reported problem is in the files (it need not be storage damage: a record torn by a crash
 /// whose payload holds such frames is reported the same way, crash contract C1; and the next open need not meet
-/// it, since `verify` checks the records of every retained segment while a writer's recovery scans records from the
-/// checkpoint onward, or from the oldest retained segment when there is no valid checkpoint), and a journal a crash left in such a state, or with an empty commit word in front of committed records at the end
+/// it, since `verify` visits every retained segment and scans records in each segment whose header passes
+/// validation, while a writer's recovery scans records from the checkpoint onward, or from the oldest retained
+/// segment when neither checkpoint slot decodes), and a journal a crash left in such a state, or with an empty commit word in front of committed records at the end
 /// of the newest segment, takes those 630 ms or 50 ms longer to verify.
 /// Retention is not a problem either: a segment it removes before the scan reaches it is not an error, and since
 /// retention removes the oldest segments first, the report then starts at the oldest segment the scan could still

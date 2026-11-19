@@ -150,8 +150,9 @@ Never truncate or edit a segment in place while anything uses the journal: proce
   word in front of committed records while it is being written; a second run after the record is committed reports
   nothing. With no writer running, a problem it reports is in the files, though not always storage damage: a record torn by a
   crash whose payload holds such frames is reported the same way (crash contract C1). The next open need not meet it:
-  `verify` checks the records of every retained segment, while a writer's recovery scans records from the checkpoint
-  onward (from the oldest retained segment when there is no valid checkpoint). Where a segment's records end at an empty
+  `verify` visits every retained segment and scans records in each segment whose header passes validation, while a
+  writer's recovery scans records from the checkpoint onward (from the oldest retained segment when neither
+  checkpoint slot decodes). Where a segment's records end at an empty
   commit word, `verify` also searches the rest of that segment: it reads backward from the segment's end to find the
   last non-zero byte, then checks the candidates up to it, and can stop early (`cli.md` → `verify`).
 - `tickertape inspect <dir>` lists segments, their sequence ranges and fill level, and the checkpoint marker.
