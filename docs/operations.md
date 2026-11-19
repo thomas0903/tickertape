@@ -282,8 +282,9 @@ retention.
   `lag_unknown_reason` of `other_history`, and so does a reader still in a segment that recovery repaired or a
   journal replaced at the same path.
 - **`fork`.** The lock belongs to the open file: a child created with `fork` that keeps the beacon's descriptor
-  (dropped at `exec`, since it is close-on-exec) keeps the beacon `live` after its creator dies, until the child
-  exits.
+  keeps the beacon `live` after its creator dies, until the child exits. The descriptor is close-on-exec, so `exec`
+  drops it, but every child holds it from `fork` to `exec`: while another thread spawns a process, a beacon dropped
+  at that moment can still look live (and a creator of the same name can get `BeaconInUse`) for that instant.
 - **Filesystems.** Beacons, like journals, are for local filesystems. On network filesystems `flock` may be
   unsupported (observers then report `uncertain`, and lag thresholds apply as for live beacons) or emulated (on Linux
   NFS, an observer in the owner's own process can release the owner's lock).

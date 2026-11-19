@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
-use std::sync::Mutex;
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread;
@@ -21,11 +21,17 @@ use tickertape_tests::{append_n, small_config};
 const CHURN: &str = env!("CARGO_BIN_EXE_tt-beacon-churn");
 const WAIT: Duration = Duration::from_secs(30);
 
-/// See `tests/status.rs`: spawning must not overlap with tests that release locks and expect them free.
-static SERIAL: Mutex<()> = Mutex::new(());
+/// A spawned child holds copies of all of this process's descriptors from `fork` until `exec`, including other
+/// tests' beacon locks, which would then look held. Tests that release a lock and expect it free take this shared;
+/// the test that spawns takes it exclusively.
+static SPAWNING: RwLock<()> = RwLock::new(());
 
-fn serial() -> std::sync::MutexGuard<'static, ()> {
-    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+fn no_spawning() -> std::sync::RwLockReadGuard<'static, ()> {
+    SPAWNING.read().unwrap_or_else(|e| e.into_inner())
+}
+
+fn spawning() -> std::sync::RwLockWriteGuard<'static, ()> {
+    SPAWNING.write().unwrap_or_else(|e| e.into_inner())
 }
 
 struct Fixture {
@@ -110,6 +116,7 @@ fn temporary_files(dir: &Path) -> Vec<String> {
 /// the first beacon before it is complete.
 #[test]
 fn creators_of_one_name_serialize() {
+    let _quiet = no_spawning();
     let f = fixture();
     let (reached, a_paused) = channel();
     let (a_go, go) = channel();
@@ -144,6 +151,7 @@ fn creators_of_one_name_serialize() {
 /// Finding 6: an observer holding its shared probe lock on a stale beacon doesn't stop a creator from taking it over.
 #[test]
 fn takeover_while_an_observer_holds_its_probe() {
+    let _quiet = no_spawning();
     let f = fixture();
     stale(&f, "r", 0);
     let (reached, holding) = channel();
@@ -172,6 +180,7 @@ fn takeover_while_an_observer_holds_its_probe() {
 /// beacon under the name (no ghost writing to a deleted file).
 #[test]
 fn owner_drops_while_a_creator_checks_the_name() {
+    let _quiet = no_spawning();
     let f = fixture();
     let owner = ReaderBeacon::create_in(&f.beacons, "r", &reader_at(&f.journal, 1)).unwrap();
     let (reached, opened) = channel();
@@ -202,6 +211,7 @@ fn owner_drops_while_a_creator_checks_the_name() {
 /// a live beacon.
 #[test]
 fn two_creators_take_over_one_stale_beacon() {
+    let _quiet = no_spawning();
     let f = fixture();
     stale(&f, "r", 0);
     let (reached, b_found) = channel();
@@ -231,6 +241,7 @@ fn two_creators_take_over_one_stale_beacon() {
 /// so the creator is refused, and afterwards the name is free.
 #[test]
 fn creator_during_the_owners_unlink() {
+    let _quiet = no_spawning();
     let f = fixture();
     let owner = ReaderBeacon::create_in(&f.beacons, "r", &reader_at(&f.journal, 1)).unwrap();
     let (reached, unlinking) = channel();
@@ -253,6 +264,7 @@ fn creator_during_the_owners_unlink() {
 /// position with the new owner's lock: it reports the new beacon, live, with its own position.
 #[test]
 fn observer_sees_the_new_owner_after_a_takeover() {
+    let _quiet = no_spawning();
     for point in [
         Pause::ObserverOpened,
         Pause::ObserverRead,
@@ -287,6 +299,7 @@ fn observer_sees_the_new_owner_after_a_takeover() {
 /// The owner leaves after an observer read its beacon: the observer notices the name is gone and reports nothing.
 #[test]
 fn observer_when_the_owner_leaves_mid_observation() {
+    let _quiet = no_spawning();
     for point in [Pause::ObserverOpened, Pause::ObserverRead] {
         let f = fixture();
         let owner = ReaderBeacon::create_in(&f.beacons, "r", &reader_at(&f.journal, 1)).unwrap();
@@ -323,7 +336,7 @@ impl Drop for Guard {
 /// complete beacons (live or stale), and afterwards nothing is left behind.
 #[test]
 fn beacon_churn_across_processes() {
-    let _serial = serial();
+    let _spawning = spawning();
     let f = fixture();
     let stop = AtomicBool::new(false);
     let go = f.beacons.parent().unwrap().join("go");

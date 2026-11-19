@@ -64,8 +64,9 @@ const OBSERVE_ATTEMPTS: u32 = 3;
 /// [`ReaderBeacon::flush`] before a reader stops for a long time, so the last position is published.
 ///
 /// **Caveats.** The lock belongs to the open file, not the process: a child created with `fork` that keeps the
-/// descriptor (it is opened close-on-exec, so `exec` drops it) keeps the beacon live after its creator dies, until
-/// the child exits. On network filesystems `flock` may be emulated or unsupported (Linux NFS emulates it with
+/// descriptor keeps the beacon live after its creator dies, until the child exits. The descriptor is close-on-exec,
+/// so `exec` drops it, but from `fork` to `exec` every child holds it: while another thread is spawning a process,
+/// a beacon that was just dropped can still look live for that moment. On network filesystems `flock` may be emulated or unsupported (Linux NFS emulates it with
 /// byte-range locks, so a probe from the same process as the owner can release the owner's lock); beacons are
 /// supported on local filesystems only, like the journal. Where the lock can't be probed, observers report
 /// [`BeaconState::Uncertain`].

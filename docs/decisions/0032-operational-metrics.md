@@ -206,8 +206,10 @@ umask 077) is `unreadable`; one that doesn't decode is `invalid`.
   It never holds the directory lock beyond its death.
 
 **Limits, stated in the rustdoc and in `docs/operations.md`.** The lock belongs to the open file, not the process: a
-child created with `fork` that keeps the descriptor (it is opened close-on-exec, so `exec` drops it) keeps a dead
-reader's beacon live until the child exits. On network filesystems `flock` may be emulated or unsupported: Linux NFS
+child created with `fork` that keeps the descriptor keeps a dead reader's beacon live until the child exits. The
+descriptor is close-on-exec, so `exec` drops it, but every child holds it from `fork` to `exec`: a beacon dropped
+while another thread spawns a process can look live for that instant (the race tests run the spawning test alone
+for this reason; with it running alongside, 48 of 200 runs on macOS saw such a moment). On network filesystems `flock` may be emulated or unsupported: Linux NFS
 emulates it with byte-range locks, so an observer in the owner's own process can release the owner's lock. Beacons,
 like journals, are supported on local filesystems only; where the probe fails, observers report `uncertain`, and lag
 thresholds apply to `uncertain` beacons as to live ones. A beacon created with umask 077 can't be read by other users
