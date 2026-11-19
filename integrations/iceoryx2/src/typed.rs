@@ -137,6 +137,82 @@ pub(crate) fn initial_slice_len(cfg: &PubSubConfig) -> usize {
     (4096 / stride).max(1)
 }
 
+/// How the replayer's publisher of a service replayed by its recorded type details ([`Replayer::run_dynamic`]) is
+/// created: (growing, initial elements). A fixed-size payload gets a static strategy, a slice a growing one that
+/// starts with [`initial_slice_len`] elements.
+///
+/// [`Replayer::run_dynamic`]: crate::replayer::Replayer::run_dynamic
+pub(crate) fn recorded_types_publisher(cfg: &PubSubConfig, slice: bool) -> (bool, usize) {
+    if slice {
+        (true, initial_slice_len(cfg))
+    } else {
+        (false, 1)
+    }
+}
+
+/// The settings a service created by [`open_or_create!`] with `create` gets from the node `node`: the node's
+/// configured defaults (`defaults.publish_subscribe`, what iceoryx2's builder starts from), overridden by what
+/// `create` asks for, and raised to 1 where iceoryx2 0.10.0 raises a 0 to 1 when it creates the service
+/// (`adjust_configuration_to_meaningful_values` in `service/builder/publish_subscribe.rs`).
+pub(crate) fn settings_to_create(node: &Node<ipc::Service>, create: Create) -> ServiceSettings {
+    let d = &node.config().defaults.publish_subscribe;
+    let mut s = ServiceSettings {
+        history_size: d.publisher_history_size as u64,
+        subscriber_max_buffer_size: d.subscriber_max_buffer_size as u64,
+        subscriber_max_borrowed_samples: d.subscriber_max_borrowed_samples as u64,
+        max_publishers: d.max_publishers as u64,
+        max_subscribers: d.max_subscribers as u64,
+        max_nodes: d.max_nodes as u64,
+        safe_overflow: d.enable_safe_overflow,
+    };
+    match create {
+        Create::Recorder { buffer } => s.subscriber_max_buffer_size = buffer as u64,
+        Create::Replay(r) => {
+            // As `open_or_create!` passes them: history and overflow always, the others where recorded (not 0).
+            s.history_size = r.history_size;
+            s.safe_overflow = r.safe_overflow;
+            let known = |recorded: u64, default: u64| if recorded > 0 { recorded } else { default };
+            s.subscriber_max_buffer_size =
+                known(r.subscriber_max_buffer_size, s.subscriber_max_buffer_size);
+            s.subscriber_max_borrowed_samples = known(
+                r.subscriber_max_borrowed_samples,
+                s.subscriber_max_borrowed_samples,
+            );
+            s.max_publishers = known(r.max_publishers, s.max_publishers);
+            s.max_subscribers = known(r.max_subscribers, s.max_subscribers);
+            s.max_nodes = known(r.max_nodes, s.max_nodes);
+        }
+    }
+    for v in [
+        &mut s.subscriber_max_buffer_size,
+        &mut s.subscriber_max_borrowed_samples,
+        &mut s.max_publishers,
+        &mut s.max_subscribers,
+        &mut s.max_nodes,
+    ] {
+        *v = (*v).max(1);
+    }
+    s
+}
+
+/// Checks the settings a service created with `create` would get ([`settings_to_create`]) against this crate's caps,
+/// before it is created: iceoryx2 sizes the new service's shared configuration by them (`max_publishers`,
+/// `max_subscribers`, `max_nodes`), and a configured default may be far above the caps.
+pub(crate) fn check_before_create(
+    node: &Node<ipc::Service>,
+    display: &str,
+    create: Create,
+) -> Result<(), Error> {
+    settings_to_create(node, create)
+        .validate()
+        .map_err(|e| Error::Unsupported {
+            service: display.to_string(),
+            reason: format!(
+                "the settings it would be created with (iceoryx2's configured defaults where none is given): {e}"
+            ),
+        })
+}
+
 /// What a port of an opened (or created) service will make iceoryx2 allocate, checked before the port is created;
 /// see [memory a port may make iceoryx2 allocate](crate::layout#memory-a-port-may-make-iceoryx2-allocate).
 #[doc(hidden)]
@@ -238,12 +314,14 @@ pub enum Create {
     Replay(ServiceSettings),
 }
 
-/// Opens a publish-subscribe service, or creates it with `$create` if it doesn't exist. `$make` is a closure that
-/// returns a fresh builder; the same code serves typed, slice and runtime-typed builders. Only an open error saying
-/// the service doesn't exist leads to a create, and only a create error saying it already exists (someone created
-/// it in between) leads to a second open; every other error is returned as it is.
+/// Opens a publish-subscribe service, or creates it with `$create` from the node `$node` if it doesn't exist. `$make`
+/// is a closure that returns a fresh builder; the same code serves typed, slice and runtime-typed builders. Only an
+/// open error saying the service doesn't exist leads to a create, and only a create error saying it already exists
+/// (someone created it in between) leads to a second open; every other error is returned as it is. Before the
+/// create, the settings it would give the service (the node's configured defaults where `$create` gives none) are
+/// checked against the caps ([`check_before_create`]).
 macro_rules! open_or_create {
-    ($make:expr, $display:expr, $create:expr) => {{
+    ($node:expr, $make:expr, $display:expr, $create:expr) => {{
         use iceoryx2::service::builder::publish_subscribe::{
             PublishSubscribeCreateError as CreateError, PublishSubscribeOpenError as OpenError,
         };
@@ -251,6 +329,7 @@ macro_rules! open_or_create {
         match make().open() {
             Ok(s) => Ok(s),
             Err(OpenError::DoesNotExist) => {
+                $crate::typed::check_before_create($node, $display, $create)?;
                 let mut b = make();
                 match $create {
                     $crate::typed::Create::Recorder { buffer } => {
@@ -342,6 +421,15 @@ pub trait Recordable: sealed::Sealed + Debug + IceoryxSend + 'static {
 /// A payload the typed replayer accepts: a [`Recordable`] type that can also be rebuilt from bytes
 /// (`zerocopy::FromBytes`).
 pub trait Replayable: Recordable {
+    /// Checks what the replay publisher of a service with the settings and types `cfg` (as opened, or read from an
+    /// existing service's details) will make iceoryx2 allocate (see [`PortBudget`]).
+    #[doc(hidden)]
+    fn budget(
+        node: &Node<ipc::Service>,
+        cfg: &PubSubConfig,
+        display: &str,
+    ) -> Result<PortBudget, Error>;
+
     /// Creates the replay publisher, after checking what it will allocate (see [`PortBudget`]).
     #[doc(hidden)]
     fn publisher<H: ReplayableHeader>(
@@ -380,6 +468,7 @@ impl<T: Debug + ZeroCopySend + IntoBytes + Immutable + 'static> Recordable for T
         create: Create,
     ) -> Result<Factory<Self, H>, Error> {
         open_or_create!(
+            node,
             || node
                 .service_builder(name)
                 .publish_subscribe::<T>()
@@ -422,6 +511,7 @@ impl<T: Debug + ZeroCopySend + IntoBytes + Immutable + 'static> Recordable for [
         create: Create,
     ) -> Result<Factory<Self, H>, Error> {
         open_or_create!(
+            node,
             || node
                 .service_builder(name)
                 .publish_subscribe::<[T]>()
@@ -453,20 +543,28 @@ impl<T: Debug + ZeroCopySend + IntoBytes + Immutable + 'static> Recordable for [
 }
 
 impl<T: Debug + ZeroCopySend + IntoBytes + FromBytes + Immutable + 'static> Replayable for T {
+    fn budget(
+        node: &Node<ipc::Service>,
+        cfg: &PubSubConfig,
+        display: &str,
+    ) -> Result<PortBudget, Error> {
+        // A fixed-size publisher takes the configured default strategy (static unless a configuration file says
+        // otherwise); iceoryx2 offers no setter for it.
+        PortBudget::check(
+            display,
+            cfg,
+            PUBLISHER_MAX_LOANED,
+            default_strategy_grows(node),
+            1,
+        )
+    }
+
     fn publisher<H: ReplayableHeader>(
         node: &Node<ipc::Service>,
         factory: &Factory<T, H>,
         display: &str,
     ) -> Result<(Publisher<ipc::Service, T, H>, PortBudget), Error> {
-        // A fixed-size publisher takes the configured default strategy (static unless a configuration file says
-        // otherwise); iceoryx2 offers no setter for it.
-        let budget = PortBudget::check(
-            display,
-            factory.static_config(),
-            PUBLISHER_MAX_LOANED,
-            default_strategy_grows(node),
-            1,
-        )?;
+        let budget = Self::budget(node, factory.static_config(), display)?;
         let publisher = factory
             .publisher_builder()
             .max_loaned_samples(PUBLISHER_MAX_LOANED)
@@ -501,19 +599,27 @@ impl<T: Debug + ZeroCopySend + IntoBytes + FromBytes + Immutable + 'static> Repl
 impl<T: Debug + ZeroCopySend + IntoBytes + FromBytes + Immutable + Copy + 'static> Replayable
     for [T]
 {
-    fn publisher<H: ReplayableHeader>(
+    fn budget(
         _node: &Node<ipc::Service>,
+        cfg: &PubSubConfig,
+        display: &str,
+    ) -> Result<PortBudget, Error> {
+        PortBudget::check(
+            display,
+            cfg,
+            PUBLISHER_MAX_LOANED,
+            true,
+            initial_slice_len(cfg),
+        )
+    }
+
+    fn publisher<H: ReplayableHeader>(
+        node: &Node<ipc::Service>,
         factory: &Factory<[T], H>,
         display: &str,
     ) -> Result<(Publisher<ipc::Service, [T], H>, PortBudget), Error> {
         let initial = initial_slice_len(factory.static_config());
-        let budget = PortBudget::check(
-            display,
-            factory.static_config(),
-            PUBLISHER_MAX_LOANED,
-            true,
-            initial,
-        )?;
+        let budget = Self::budget(node, factory.static_config(), display)?;
         let publisher = factory
             .publisher_builder()
             .max_loaned_samples(PUBLISHER_MAX_LOANED)
@@ -551,5 +657,127 @@ impl<T: Debug + ZeroCopySend + IntoBytes + FromBytes + Immutable + Copy + 'stati
             .send()
             .map_err(|e| Error::iox("send", e))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iceoryx2::config::Config;
+
+    fn name(what: &str) -> String {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        format!(
+            "tt-typed-unit/{}-{}/{what}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
+    /// A node whose configured publish-subscribe defaults are changed by `f`.
+    fn node_with(f: impl FnOnce(&mut Config)) -> Node<ipc::Service> {
+        let mut config = Config::global_config().clone();
+        f(&mut config);
+        NodeBuilder::new()
+            .config(&config)
+            .signal_handling_mode(SignalHandlingMode::Disabled)
+            .create::<ipc::Service>()
+            .unwrap()
+    }
+
+    /// Review round 7: a service that doesn't exist yet is created with the node's configured defaults where the
+    /// recording (or the recorder) gives no value; a default over a cap (`max_publishers = 40000`) is refused before
+    /// `create()`, which would size the new service's shared configuration by it, and the service is not created.
+    #[test]
+    fn configured_defaults_over_a_cap_are_refused_before_create() {
+        let node = node_with(|c| c.defaults.publish_subscribe.max_publishers = 40_000);
+        for create in [
+            Create::Replay(ServiceSettings::UNKNOWN),
+            Create::Recorder { buffer: 16 },
+        ] {
+            let display = name("defaults-over-cap");
+            let service = ServiceName::new(&display).unwrap();
+            let err = <u64 as Recordable>::open_service::<()>(&node, &service, &display, create)
+                .map(drop)
+                .unwrap_err();
+            assert!(
+                matches!(&err, Error::Unsupported { reason, .. }
+                    if reason.contains("would be created with") && reason.contains("max_publishers is 40000")),
+                "{create:?}: {err}"
+            );
+            let open = node
+                .service_builder(&service)
+                .publish_subscribe::<u64>()
+                .open();
+            assert!(
+                matches!(
+                    open,
+                    Err(iceoryx2::service::builder::publish_subscribe::PublishSubscribeOpenError::DoesNotExist)
+                ),
+                "{create:?}: the service was created"
+            );
+        }
+        // A recorded value replaces the default, so the same node creates a service with a recorded max_publishers.
+        let display = name("recorded-replaces-default");
+        let recorded = ServiceSettings {
+            max_publishers: 4,
+            ..ServiceSettings::UNKNOWN
+        };
+        let factory = <u64 as Recordable>::open_service::<()>(
+            &node,
+            &ServiceName::new(&display).unwrap(),
+            &display,
+            Create::Replay(recorded),
+        )
+        .unwrap();
+        assert_eq!(factory.static_config().max_publishers(), 4);
+    }
+
+    /// The settings checked before `create()` are the ones iceoryx2 then gives the service: unusual configured
+    /// defaults (zeros among them, which iceoryx2 raises to 1), with and without recorded values.
+    #[test]
+    fn settings_to_create_are_what_iceoryx2_creates() {
+        let node = node_with(|c| {
+            let d = &mut c.defaults.publish_subscribe;
+            d.max_publishers = 0;
+            d.max_subscribers = 7;
+            d.max_nodes = 5;
+            d.publisher_history_size = 3;
+            d.subscriber_max_buffer_size = 0;
+            d.subscriber_max_borrowed_samples = 4;
+            d.enable_safe_overflow = false;
+        });
+        let recorded = ServiceSettings {
+            history_size: 2,
+            subscriber_max_buffer_size: 9,
+            subscriber_max_borrowed_samples: 0,
+            max_publishers: 0,
+            max_subscribers: 6,
+            max_nodes: 0,
+            safe_overflow: true,
+        };
+        for create in [
+            Create::Replay(ServiceSettings::UNKNOWN),
+            Create::Replay(recorded),
+            Create::Recorder { buffer: 11 },
+        ] {
+            let display = name("settings-to-create");
+            let expected = settings_to_create(&node, create);
+            let factory = <u64 as Recordable>::open_service::<()>(
+                &node,
+                &ServiceName::new(&display).unwrap(),
+                &display,
+                create,
+            )
+            .unwrap();
+            let unknown = Version {
+                major: 0,
+                minor: 0,
+                patch: 0,
+            };
+            let got = describe(factory.static_config(), unknown, 0).settings;
+            assert_eq!(got, expected, "{create:?}");
+        }
     }
 }

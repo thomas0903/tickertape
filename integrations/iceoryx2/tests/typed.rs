@@ -551,6 +551,58 @@ fn typed_replay_refuses_a_target_whose_connections_are_too_large() {
     assert_eq!(factory.dynamic_config().number_of_publishers(), 0);
 }
 
+/// Review round 7: an existing target is checked in full from its details (settings, types, the replay publisher's
+/// budget) before the replayer opens it. The target allows one node, which its creator already is, so opening it
+/// from the replayer's node would fail (`ExceedsMaxNumberOfNodes`): the refusal names the budget instead, which
+/// shows that it came before the open.
+#[test]
+fn typed_replay_refuses_an_existing_target_before_opening_it() {
+    use iceoryx2::prelude::*;
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let journal = dir.path().join("j");
+    let service = unique("wide-one-node");
+    append_records(
+        &journal,
+        1 << 20,
+        &run_of(
+            &RawDescriptor::new(&service, RawType::slice("u8", 1, 1)),
+            0,
+            2,
+        ),
+    );
+    let node = NodeBuilder::new()
+        .signal_handling_mode(SignalHandlingMode::Disabled)
+        .create::<ipc::Service>()
+        .unwrap();
+    let target = format!("{}/{service}", unique("wide-one-node-target"));
+    let factory = node
+        .service_builder(&ServiceName::new(&target).unwrap())
+        .publish_subscribe::<[u8]>()
+        .max_nodes(1)
+        .max_subscribers(1024)
+        .subscriber_max_buffer_size(30)
+        .subscriber_max_borrowed_samples(2)
+        .create()
+        .unwrap();
+    let err = Replayer::builder(&journal)
+        .typed::<[u8], ()>(&service)
+        .remap(tickertape_iceoryx2::replayer::Remap::default().rule(&service, &target))
+        .handle_signals(false)
+        .build()
+        .unwrap()
+        .run()
+        .unwrap_err();
+    assert!(
+        matches!(err, Error::Unsupported { .. })
+            && err
+                .to_string()
+                .contains("connections to max_subscribers subscribers"),
+        "{err}"
+    );
+    assert_eq!(factory.dynamic_config().number_of_publishers(), 0);
+}
+
 /// Review round 4: the recorder's subscriber keeps a connection slot on the heap for each publisher and each
 /// borrowed sample it may hold after a publisher leaves; a service allowing 16,384 borrowed samples would take
 /// 128 MiB of them. The recorder refuses the service (reported, retried) before its subscriber exists.

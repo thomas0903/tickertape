@@ -68,7 +68,9 @@ use crate::recorder::{
     open_listener, service_name, service_version, type_info,
 };
 use crate::replayer::{ReplayReport, Replayer, Sink};
-use crate::typed::{Create, PUBLISHER_MAX_LOANED, PortBudget, initial_slice_len, open_or_create};
+use crate::typed::{
+    Create, PUBLISHER_MAX_LOANED, PortBudget, open_or_create, recorded_types_publisher,
+};
 
 type RawFactory = PortFactory<ipc::Service, [CustomPayloadMarker], CustomHeaderMarker>;
 type RawBuilder = PubSubBuilder<[CustomPayloadMarker], CustomHeaderMarker, ipc::Service>;
@@ -395,24 +397,27 @@ fn sink(
     let payload = type_detail(&descriptor.payload)?;
     let user_header = type_detail(&descriptor.user_header)?;
     let factory = open_or_create!(
+        node,
         || raw_builder(node, &name, &payload, &user_header),
         target,
         Create::Replay(descriptor.settings)
     )?;
     // What the publisher will allocate, from the service's settings and types in force (as opened or created,
     // iceoryx2's defaults included), checked before it exists.
-    let (strategy, initial) = match payload.variant() {
-        IoxVariant::FixedSize => (AllocationStrategy::Static, 1),
-        IoxVariant::Dynamic => (
-            AllocationStrategy::PowerOfTwo,
-            initial_slice_len(factory.static_config()),
-        ),
+    let (growing, initial) = recorded_types_publisher(
+        factory.static_config(),
+        payload.variant() == IoxVariant::Dynamic,
+    );
+    let strategy = if growing {
+        AllocationStrategy::PowerOfTwo
+    } else {
+        AllocationStrategy::Static
     };
     let budget = PortBudget::check(
         target,
         factory.static_config(),
         PUBLISHER_MAX_LOANED,
-        strategy != AllocationStrategy::Static,
+        growing,
         initial,
     )?;
     let publisher = factory

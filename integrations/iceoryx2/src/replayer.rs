@@ -54,7 +54,7 @@ use tickertape::{Reader, ReaderConfig};
 use crate::layout::{self, Decoded, Descriptor, TypeInfo};
 use crate::pacing::Pacer;
 pub use crate::pacing::{MAX_SPEED, MIN_SPEED, PacingReport};
-use crate::recorder::{Signals, describe, service_name, service_version};
+use crate::recorder::{Signals, describe, service_name};
 use crate::typed::{Create, PortBudget, ReplayableHeader, header_type};
 use crate::{Catalog, Error, Replayable};
 
@@ -279,15 +279,19 @@ impl ReplayerBuilder {
     ) -> Self {
         let factory: SinkFactory = Box::new(|node, target, descriptor| {
             // The registration was checked against `descriptor` before (check_registration), so nothing that
-            // doesn't match it creates the target.
-            check_existing(node, target, descriptor)?;
+            // doesn't match it creates the target. An existing target is checked in full (settings, types, the
+            // publisher's budget) from its details, before it is opened.
+            check_existing(node, target, descriptor, &|cfg| {
+                P::budget(node, cfg, target).map(drop)
+            })?;
             let name = service_name(target)?;
             let factory =
                 P::open_service::<H>(node, &name, target, Create::Replay(descriptor.settings))?;
-            // The settings in force (someone may have created the target since `check_existing`) are checked
-            // before `service_version`, which lists the service's nodes.
+            // Again for the settings in force (someone may have created the target since `check_existing`). The
+            // iceoryx2 version isn't needed for the comparison, so it isn't read (reading it lists the service's
+            // nodes again).
             crate::typed::check_settings(target, factory.static_config())?;
-            let got = describe(factory.static_config(), service_version(node, &name), 0);
+            let got = describe(factory.static_config(), UNKNOWN_VERSION, 0);
             if let Some(diff) = type_difference(
                 descriptor,
                 &got.payload,
@@ -778,7 +782,18 @@ fn open_sink(
     let sink = match (config.typed.get_mut(&descriptor.service_name), untyped) {
         (Some(registered), _) => (registered.factory)(node, target, descriptor)?,
         (None, Some(untyped)) => {
-            check_existing(node, target, descriptor)?;
+            let slice = descriptor.payload.variant == layout::TypeVariant::Dynamic;
+            check_existing(node, target, descriptor, &|cfg| {
+                let (growing, initial) = crate::typed::recorded_types_publisher(cfg, slice);
+                PortBudget::check(
+                    target,
+                    cfg,
+                    crate::typed::PUBLISHER_MAX_LOANED,
+                    growing,
+                    initial,
+                )
+                .map(drop)
+            })?;
             untyped(node, target, descriptor)?
         }
         (None, None) => {
@@ -807,11 +822,23 @@ fn open_sink(
     Ok(sink)
 }
 
-/// Refuses clearly if `target` already exists with types other than the recorded ones.
+/// The iceoryx2 version where it isn't needed (comparisons of types and settings).
+const UNKNOWN_VERSION: layout::Version = layout::Version {
+    major: 0,
+    minor: 0,
+    patch: 0,
+};
+
+/// If `target` already exists, checks it from its details, without opening it: its settings against the caps, its
+/// types against the recorded ones (refused clearly if they differ), and then what the replay publisher would
+/// allocate (`budget`, with the service's settings and types). Reading the details lists the service's nodes once
+/// (iceoryx2 does, in proportion to `max_nodes`); nothing else here does, so a target refused here costs one such
+/// listing, and opening it (which lists them again, in iceoryx2's clean-up) comes only after all of this passed.
 pub(crate) fn check_existing(
     node: &Node<ipc::Service>,
     target: &str,
     descriptor: &Descriptor,
+    budget: &dyn Fn(&PubSubConfig) -> Result<(), Error>,
 ) -> Result<(), Error> {
     let name = service_name(target)?;
     let details = ipc::Service::details(&name, node.config(), MessagingPattern::PublishSubscribe)
@@ -819,28 +846,25 @@ pub(crate) fn check_existing(
     let Some(details) = details else {
         return Ok(());
     };
-    // Its settings are checked against the caps before the service is opened (iceoryx2 lists a service's nodes,
-    // in proportion to `max_nodes`, when it opens one).
-    crate::typed::check_settings(target, details.static_details.publish_subscribe())?;
-    let got = describe(
-        details.static_details.publish_subscribe(),
-        service_version(node, &name),
-        0,
-    );
-    match type_difference(
+    let cfg = details.static_details.publish_subscribe();
+    crate::typed::check_settings(target, cfg)?;
+    let got = describe(cfg, UNKNOWN_VERSION, 0);
+    if let Some(diff) = type_difference(
         descriptor,
         &got.payload,
         &got.user_header,
         Some(&got.system_header),
         AlignmentRule::ServiceAtLeastRecorded,
     ) {
-        None => Ok(()),
-        Some(diff) => Err(Error::Incompatible {
+        return Err(Error::Incompatible {
             service: target.to_string(),
             reason: format!("it already exists with other types: {diff}"),
-        }),
+        });
     }
+    budget(cfg)
 }
+
+type PubSubConfig = iceoryx2::service::static_config::publish_subscribe::StaticConfig;
 
 /// Which alignments [`type_difference`] accepts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

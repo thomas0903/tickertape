@@ -327,7 +327,8 @@ Not a decoding rule: caps on the service settings this tool hands to iceoryx2, a
 iceoryx2 itself enforces none of these limits. They apply to the service's settings *in force*: those of the service
 as opened or created (a recorded 0 means iceoryx2's default, from the node's configuration), not the recorded ones.
 The settings are checked against the caps of the [validity rules](#validity-rules) before anything iceoryx2 sizes by
-them, and the estimates (formulas in [`src/layout.rs`](src/layout.rs), with checked arithmetic) cover what iceoryx2
+them (with the one exception of reading an existing service's settings, and in the order given under *What is
+checked before what* below), and the estimates (formulas in [`src/layout.rs`](src/layout.rs), with checked arithmetic) cover what iceoryx2
 0.10.0 allocates, with unchecked arithmetic, when a port and its connections are created and while it runs.
 
 The estimates are checked against what iceoryx2 really allocates, not only against a reading of its source:
@@ -424,14 +425,37 @@ before it creates its subscriber. A service over a limit is refused (reported an
   check, and whose own snapshot was taken before the recorder's subscriber registered, may be missed by both
   snapshots, or seen by the subscriber's; the subscriber then creates the connection to it, at creation or on its
   next receive (if that comes before the publisher refreshes), sized by that publisher's values, which the recorder
-  never checked. The number of such connections is bounded by `max_publishers`, their size is not: a publisher's
-  sample count includes its own loaned samples, which the service doesn't limit. Publishers' data segments are
-  theirs; the recorder maps them and allocates none.
-- *Before the check.* To read a service's settings at all, iceoryx2 lists the service's nodes when it reads its
-  details or opens it (two vectors in proportion to `max_nodes`, 24 bytes a slot, plus each registered node's state),
-  before any setting can be seen through its public API. The recorder and the replayer check the settings right
-  after the first such read and before opening the service, so this happens once per attempt: a refused service
-  is attempted again on each retry, and the memory is freed after each attempt.
+  never checked. Their number is bounded by the connections the subscriber can hold at once, which iceoryx2 sizes
+  as `max_publishers` active ones plus `max(subscriber_expired_connection_buffer, subscriber_max_borrowed_samples)`
+  expired ones (`Subscriber::new` near line 280; 1 + 128 for a service allowing one publisher, with iceoryx2's
+  defaults), the same slots the heap check counts. `max_publishers` alone does not bound them: it limits the
+  publishers registered at one time, and a publisher that leaves unread data behind keeps its connection in the
+  expired buffer (`prepare_connection_removal` in `port/details/receiver.rs` near line 260). With `max_publishers =
+  1`, two publishers that both took their snapshot before the recorder's subscriber registered can register one
+  after the other; if the first sends and exits between two polls of the recorder, its connection stays while the
+  subscriber creates the one to the second. Their size is not bounded: a publisher's sample count includes its own
+  loaned samples, which the service doesn't limit. Publishers' data segments are theirs; the recorder maps them and
+  allocates none.
+- *Before the check.* To read an existing service's settings at all, iceoryx2 lists the service's nodes when it
+  reads its details or opens it (two vectors in proportion to `max_nodes`, 24 bytes a slot, plus each registered
+  node's state), before any setting can be seen through its public API. The recorder recording by name reads the
+  details, checks the settings and only then opens the service; the typed recorder opens it and checks the settings
+  right after. Either way the nodes are listed once before a refusal; a refused service is attempted again on each
+  retry, and the memory is freed after each attempt.
+
+**What is checked before what, for a replay target.** For a target that exists, the replayer reads its details (the
+one listing of its nodes above) and checks, in this order and without opening it: the settings against the caps,
+the types against the recording, and what its publisher would allocate (heap, connections, first data segment). A
+target refused by any of these costs that one listing. Only when all of them pass does it open the target
+(iceoryx2's clean-up on open lists the nodes again), check the settings in force once more (the target may have been
+replaced meanwhile), and create its publisher. A target that doesn't exist yet is created with the recorded settings
+and, for each setting the recording leaves at 0, the default of the node's iceoryx2 configuration
+(`defaults.publish_subscribe`, which may come from a configuration file); iceoryx2 sizes the new service's shared
+configuration by them (`max_publishers`, `max_subscribers`, `max_nodes`) when it creates it. So those settings, as
+iceoryx2 will create them, are checked against the caps before the service is created: a configured default over a
+cap (say `max_publishers = 40000`) is refused and nothing is created. The publisher's budget is checked after the
+service is created, against the settings in force. The recorder creates a missing service the same way (with its
+buffer as `subscriber_max_buffer_size`), with the same check first.
 
 So one replay target costs at most 128 MiB of heap and 1.5 GiB of shared memory: 512 MiB of connections and 1 GiB
 for all its data segments together, during and after growth. The recorder's subscriber of one service costs at most
@@ -540,8 +564,10 @@ human-readable file that `iox2 service replay` and the `iceoryx2-userland-record
 by this crate, with every write checked to be complete, synced, under a temporary name of its own in the
 destination's directory (a short fixed prefix and unique numbers, created exclusively, so concurrent exports never
 share one and any valid destination name works), and linked into place only when complete; an existing file is never
-replaced, and the directory is synced after the link, so once the export reports success its name survives a power
-loss (before that, a power loss may lose the name, never leave a partial file under it). For service and type names
+replaced, and the directory that holds the name is synced after the link (opened again by the same path if that
+path now leads to another directory, say through a symbolic link switched meanwhile), so once the export reports
+success its name survives a power loss (before that, a power loss may lose the name, never leave a partial file under
+it). For service and type names
 without quotes, backslashes or control characters the file has the same bytes upstream's recorder writes (a test
 compares them with a file it wrote); other names are written as double-quoted TOML strings with `\uXXXX` escapes for
 control characters, where upstream's serialiser may choose short escapes (`\n`) or single-quoted strings: different

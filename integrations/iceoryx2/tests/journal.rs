@@ -671,7 +671,8 @@ fn replay_bounds_what_a_target_allocates() {
     assert_eq!(target.dynamic_config().number_of_publishers(), 0);
     // Review round 4: an existing slice target with 1,024 subscribers, buffer 30 and 2 borrowed samples passes the
     // sample count (32,770) and the reference counters (63.75 MiB), but its publisher's connections would take
-    // about 8 GiB of used-chunk lists: refused before the publisher exists.
+    // about 8 GiB of used-chunk lists: refused before the publisher exists. Review round 7: and before the target
+    // is opened; it allows one node, its creator, so an open from the replayer's node would fail instead.
     let journal = dir.path().join("existing-slice");
     let service = unique("existing-slice");
     append_records(
@@ -687,6 +688,7 @@ fn replay_bounds_what_a_target_allocates() {
     let target = node
         .service_builder(&ServiceName::new(&format!("{prefix}{service}")).unwrap())
         .publish_subscribe::<[u8]>()
+        .max_nodes(1)
         .max_subscribers(1024)
         .subscriber_max_buffer_size(30)
         .subscriber_max_borrowed_samples(2)

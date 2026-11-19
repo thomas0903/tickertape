@@ -250,3 +250,32 @@ gigabytes, and found a few more integrity gaps. Nothing was released; the layout
   remains.
 - **Exports open the destination directory before writing**, so a directory that cannot be opened for the final sync
   fails the export before the file is published.
+
+## Amendment: review round 7 (2026-11-20)
+
+- **Exports sync the directory that holds the name.** Round 5 opened the destination directory before creating the
+  file, so that an unreadable directory fails before anything is published, and synced that handle after the link.
+  If the path to the directory is a symbolic link switched in between, the file and its name land in the new
+  directory and the old one was synced. The early open stays (it is the check); after the link, the path is
+  resolved again and its directory synced (the early handle when it is the same directory, by device and inode).
+  Creating and linking relative to the directory handle would remove the remaining window between the link and that
+  resolution, but needs `openat`/`linkat`, which the standard library doesn't offer without `unsafe` or a new
+  dependency; so the window is documented instead.
+- **Unchecked connections are counted as iceoryx2 holds them.** The connections a recorder's subscriber may create to
+  later publishers, unchecked, are bounded in number by its connection storage, `max_publishers` active plus
+  `max(subscriber_expired_connection_buffer, subscriber_max_borrowed_samples)` expired (a publisher that leaves
+  unread data keeps its connection in the expired buffer), not by `max_publishers` alone; the README and
+  `layout.rs` say so.
+- **An existing replay target is checked in full before it is opened.** Its details give its settings and types:
+  the replayer checks the settings, the types and its publisher's budget from them, and opens the target only if
+  all pass, so a refused target costs one listing of its nodes (it cost four on typed replay: the details, two
+  reads of the creating iceoryx2 version, which the comparison doesn't need, and the open). A test target that
+  allows only its creator's node shows the order: an open would fail, and the refusal names the budget.
+- **A missing service is checked before it is created.** iceoryx2 creates a service with its configured defaults
+  for every setting not given (the replayer passes only the recorded settings that are not 0, the recorder only
+  its buffer) and sizes the service's shared configuration by them. Those defaults are public (the node's
+  configuration), so the settings the service would get are checked against the caps before `create()`, and a
+  configured default over a cap is refused without creating anything. (Round 5's statement that both sides check
+  settings before opening a service holds for an existing replay target and for the recorder by name; the typed
+  recorder opens the service and checks right after, which lists the nodes once, as the README says.)
+

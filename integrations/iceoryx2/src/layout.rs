@@ -284,8 +284,11 @@
 //!   snapshot of them, taken before it registers. A publisher takes its snapshot of the subscribers before it
 //!   registers too, and whichever of the two refreshes first creates a connection the other's snapshot missed; so
 //!   the connection to a publisher that registers after the check and missed the subscriber in its own snapshot
-//!   may be created by the subscriber, unchecked. That is not bounded (see the README). A subscriber doesn't
-//!   allocate the publishers' data segments; it maps them.
+//!   may be created by the subscriber, unchecked. Their number is at most the connections a subscriber holds at
+//!   once, `max_publishers` active plus `max(subscriber_expired_connection_buffer, borrowed)` expired (a publisher
+//!   that leaves unread data keeps its connection in the expired buffer; iceoryx2 0.10.0 sizes its connection
+//!   storage so, `port/subscriber.rs` near line 280), not `max_publishers` alone; their size is not bounded (see the
+//!   README). A subscriber doesn't allocate the publishers' data segments; it maps them.
 //!
 //! So one replay target costs at most 128 MiB of heap and 1.5 GiB of shared memory (512 MiB of connections and
 //! 1 GiB for all its data segments together, during and after growth), and the recorder's subscriber of one service
