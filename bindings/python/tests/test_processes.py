@@ -448,18 +448,22 @@ INTERRUPTED_WHILE_BUILDING = """
         durations.append(time.perf_counter() - started)
         check(result)
         del result
-    # Aim at the later part of the call, where the result is built (the first calls are slower).
-    duration = min(durations)
-    staged = after_return = delivered = 0
-    for attempt in range(40):
+    # Aim at the later part of the call, where the result is built. The first calls are slower, and the timing
+    # drifts on a shared machine, so the target follows the latest uninterrupted calls.
+    staged = after_return = delivered = attempts = 0
+    while staged < 10 and attempts < 300:
+        attempts += 1
+        duration = min(durations[-5:])
         reader.seek(0)
         box = []
         seen.clear()
         try:
             armed[0] = True
-            signal.setitimer(signal.ITIMER_REAL, random.uniform(0.3 * duration, 1.0 * duration))
+            started = time.perf_counter()
+            signal.setitimer(signal.ITIMER_REAL, random.uniform(0.2 * duration, 1.0 * duration))
             box.append(read())
             armed[0] = False
+            took = time.perf_counter() - started
             signal.setitimer(signal.ITIMER_REAL, 0)
         except Interrupt:
             signal.setitimer(signal.ITIMER_REAL, 0)
@@ -474,6 +478,7 @@ INTERRUPTED_WHILE_BUILDING = """
                 box.append(read())  # the interrupted call's records are returned by the next read
         else:
             delivered += 1
+            durations.append(took)
         check(box[0])
     print(staged, after_return, delivered)
 """
@@ -484,7 +489,7 @@ def test_interrupt_while_the_result_is_built_keeps_the_records(journal: Path, ca
     staged, after_return, delivered = map(int, run_script(INTERRUPTED_WHILE_BUILDING, journal, call,
                                                           timeout=120).split())
     assert after_return <= 1, (staged, after_return, delivered)
-    assert staged >= 5, (staged, after_return, delivered)  # the test did interrupt reads
+    assert staged >= 10, (staged, after_return, delivered)  # the test did interrupt reads
 
 
 def test_signal_handler_reading_during_iteration_does_not_end_it(journal: Path) -> None:
