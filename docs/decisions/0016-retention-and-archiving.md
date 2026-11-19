@@ -39,7 +39,8 @@ destination (they fail instead).
 
 **Readers** positioned inside a segment that is removed keep reading it (they hold it open) and get
 `Error::Discarded` at its end; `seek` to continue. Readers before the oldest remaining segment get
-`Error::SeqUnavailable`.
+`Error::SeqUnavailable`. (Amended 2026-11-19 by ADR [0034](0034-durable-only-reads-check-segment-identity.md): a
+durable-only reader may get `Error::Discarded` earlier, when the checkpoint moves past its cursor.)
 
 ## Consequences
 

@@ -39,3 +39,8 @@ __pycache__/
 
 # Local documentation research
 .firecrawl/
+
+# C examples built in place (examples/c/Makefile)
+/examples/c/writer
+/examples/c/reader
+/examples/c/example

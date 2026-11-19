@@ -40,3 +40,11 @@ The CLI exposes it as `tickertape tail --durable-only` and `tickertape export --
 - If a checkpoint fails (the writer is poisoned), the marker stops moving and durable-only readers stop advancing,
   which is the safe direction.
 - No on-disk format change; older journals work unchanged.
+
+## Addendum (2026-11-19)
+
+The safety argument above holds for the journal's current files, but a reader reads from the file it has open, which
+recovery may have replaced since. A durable-only reader could apply a marker written after a repair to the old file
+and return records that recovery removed. ADR [0034](0034-durable-only-reads-check-segment-identity.md) adds the rule
+that fixes it: a reader applies a marker that moves past its cursor only after confirming, after reading the marker,
+that its segment's path still names the file it has open; otherwise it returns `Error::Discarded`.

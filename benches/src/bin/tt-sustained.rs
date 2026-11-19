@@ -1155,17 +1155,6 @@ fn reader(config: &Config) -> Result<()> {
                             expected = first;
                             own.store(expected, Ordering::Release);
                         }
-                        // `Reader::seek` lists the segments and then opens one; retention can remove it in
-                        // between, and the library then reports the missing file instead of `SeqUnavailable`.
-                        // List again. Remove this arm once the library retries by itself (the fix is in review
-                        // on the branch `core/reader-retention-races`).
-                        Err(Error::Io { ref source, .. })
-                            if source.kind() == std::io::ErrorKind::NotFound =>
-                        {
-                            if Instant::now() >= hard_deadline {
-                                return Err("reader timed out".into());
-                            }
-                        }
                         Err(e) => return Err(e.into()),
                     }
                 }

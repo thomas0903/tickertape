@@ -114,6 +114,7 @@ CLI reference, exit codes and the JSONL and Parquet schemas: [`docs/cli.md`](doc
 Choosing segment sizes and checkpoint intervals, archiving old segments, monitoring and what to do after a crash:
 [`docs/operations.md`](docs/operations.md).
 For direct, read-only access from Python without dependencies, see [`python/`](python/README.md).
+From C, C++ or another language through a C ABI (not stable before 1.0), see [`docs/c-api.md`](docs/c-api.md).
 
 ## Guarantees, in short
 
@@ -124,7 +125,7 @@ The full statement, per platform and with the test for each claim, is [`docs/cra
   `F_FULLFSYNC` on macOS).
 - **Process crashes.** After the writer is killed at any point, every committed record is intact and the next
   writer continues with no gap and no duplicate. Tested with 250 `SIGKILL`s at random points per run, on Linux
-  and macOS, with a live reader across all of them.
+  and macOS, with live readers (safe and zero-copy) across all of them.
 - **Power loss is not claimed.** Durability after a checkpoint depends on the filesystem and drive honouring
   flushes; it is stated, not tested. Records after the last checkpoint may be lost, including ones readers saw.
   Readers that must not act on such records can use `ReaderConfig::durable_only(true)` (CLI: `--durable-only`),
@@ -161,8 +162,8 @@ Background research: [`docs/research/2026-10-31-market-review.md`](docs/research
 
 ## Project layout
 
-`crates/tickertape` (library) · `crates/tickertape-cli` (the `tickertape` binary) · `tests/` (cross-process and
-crash tests) · `fuzz/` · `benches/` · `examples/` · `docs/` (format, crash contract, decisions, playbooks).
+`crates/tickertape` (library) · `crates/tickertape-cli` (the `tickertape` binary) · `crates/tickertape-ffi` (C ABI
+and header) · `tests/` (cross-process and crash tests) · `fuzz/` · `benches/` · `examples/` · `docs/` (format, crash contract, decisions, playbooks).
 Contributions: [`CONTRIBUTING.md`](CONTRIBUTING.md). Security issues: [`SECURITY.md`](SECURITY.md).
 
 ## Licence

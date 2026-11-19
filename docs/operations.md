@@ -122,9 +122,16 @@ Segments are ordinary files named after their first sequence number (`0000000000
 copy sealed segments without changing the journal.
 
 Readers that are still inside a segment you delete keep reading it (they hold the file open), but when they reach
-its end they return `Error::Discarded`, because the file is gone; seek to their position to continue
-(`tickertape tail` does this automatically). Readers positioned before the oldest remaining segment get
-`Error::SeqUnavailable` from `seek`. `Reader::open` starts at the oldest segment that exists.
+its end they return `Error::Discarded`, because the file is gone; seek to their position to continue. Durable-only
+readers may return it earlier, when the checkpoint moves past their position (ADR 0034); seeking to that position
+then fails with `Error::SeqUnavailable`, because the records there are gone, so continue at the oldest sequence
+number it reports. `tickertape tail` does both automatically, and warns on standard error with the range of records
+it skipped. Readers positioned before the oldest remaining segment get `Error::SeqUnavailable` from `seek`, also when
+the removal happens while `seek` runs. `Reader::open` starts at the oldest segment that exists. A removal never shows
+up as a corruption error in readers, `tickertape inspect` or `tickertape verify`, and shows up as an I/O "not found"
+error only if the segment a reader chose vanished on each of 8 listings in a row (crash contract C14).
+A `stat` that fails other than with "not found" (`EACCES`, `EIO`) is reported as an I/O error, never taken for a
+removal.
 
 Never truncate or edit a segment in place while anything uses the journal: processes that map it can receive
 `SIGBUS`.
@@ -302,7 +309,10 @@ the writer or retention.
 ## Checking a journal
 
 - `tickertape verify <dir>` checks every header, record and seal and exits with code 2 if anything is wrong; it is
-  read-only and safe to run while the writer is active.
+  read-only and safe to run while the writer is active. A segment that ends in a state a running writer passes
+  through (a record being written, or a segment not yet sealed whose successor exists) is scanned again with growing
+  pauses, for up to 630 ms, before it is reported. If the writer is stalled in such a state for longer, `verify` can
+  report a problem that isn't there; run it again to tell. With no writer running, every problem it reports is real.
 - `tickertape inspect <dir>` lists segments, their sequence ranges and fill level, and the checkpoint marker.
 - `tickertape status <dir>` is the cheap, frequent check: head, checkpoint age, exposure, headroom and reader lag
   (see "Monitoring"). Unlike `inspect` and `verify`, it does not scan the whole journal.
@@ -314,7 +324,10 @@ the writer or retention.
   most a zeroed uncommitted tail, a completed seal or roll, and removed temporary files.
 - **Power loss or storage errors:** the writer validates the journal from the last checkpoint. Corrupt or
   disconnected data is moved to `quarantine/` (never deleted), or, with `RecoveryPolicy::Fail`, the writer refuses to
-  open so that a human can look first. Readers that had seen discarded records get `Error::Discarded`.
+  open so that a human can look first. Readers that had seen discarded records get `Error::Discarded`, except after a
+repair in place (damage that emptied a commit word, so recovery zeroes the records after it in the same file), which
+visible readers can't notice: they may continue into the new history, wait, or report corruption, until seeked to
+their position (crash contract C11). Durable-only readers never return records that recovery discarded (C13).
 - **Refused to open** (missing checkpoint segment or a gap in the chain): restore the missing segments from a copy,
   or move the affected segments aside knowingly. tickertape won't discard history on its own.
 

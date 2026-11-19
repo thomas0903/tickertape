@@ -257,6 +257,117 @@ pub fn decode_record_body(
     ))
 }
 
+/// Validates and decodes a record read word by word from shared memory: the zero-copy reader's version of
+/// [`decode_record_body`] (ADR 0027). It makes the same checks in the same order and returns the same results for
+/// the same bytes, without any slice of the body.
+///
+/// `commit_word` is the value loaded from `P` (not a seal, not zero); `crc` is the `u32` at `P+4`; `words` are the
+/// 8-byte words covering `[P+8, P+align8(len))`: four header words, then the payload, whose last word may end in
+/// padding (never checked, as in [`decode_record_body`], which doesn't see it). Each word is loaded exactly once,
+/// so the header returned is the one the CRC covered. A word count that doesn't match `commit_word` is
+/// [`CorruptReason::BadLength`], like a body of the wrong length. Bounds against the segment are the caller's job.
+pub(crate) fn decode_record_words(
+    commit_word: u32,
+    crc: u32,
+    words: crate::mmap::SharedWords<'_>,
+    expected_seq: u64,
+) -> Result<RecordHeader, CorruptReason> {
+    let bad_len = CorruptReason::BadLength(commit_word);
+    if !(RECORD_HEADER_LEN as u32..=MAX_FRAME_LEN).contains(&commit_word) {
+        return Err(bad_len);
+    }
+    let len = u64::from(commit_word);
+    // Header words after the commit word and CRC: seq, schema id and flags, venue and local timestamps.
+    const FIELD_WORDS: usize = (RECORD_HEADER_LEN - 8) / 8;
+    if words.len() as u64 != (align8(len) - 8) / 8 {
+        return Err(bad_len);
+    }
+    let payload_len = len - RECORD_HEADER_LEN as u64;
+    let full_words = usize::try_from(payload_len / 8).map_err(|_| bad_len)?;
+    let tail_len = (payload_len % 8) as usize;
+    let (fields, payload) = words.split_at_checked(FIELD_WORDS).ok_or(bad_len)?;
+    let (full, last) = payload.split_at_checked(full_words).ok_or(bad_len)?;
+    let mut field = [0u64; FIELD_WORDS];
+    for (dest, word) in field.iter_mut().zip(fields.iter()) {
+        *dest = word;
+    }
+    // The CRC covers the commit word's 4 bytes, the header words, and the payload without its padding.
+    let mut head = [0u8; 4 + 8 * FIELD_WORDS];
+    put(&mut head, 0, &commit_word.to_le_bytes());
+    for (i, word) in field.iter().enumerate() {
+        put(&mut head, 4 + 8 * i as u64, &word.to_le_bytes());
+    }
+    let tail = if tail_len == 0 {
+        [0u8; 8]
+    } else {
+        last.get(0).ok_or(bad_len)?.to_le_bytes()
+    };
+    let computed = crate::crc::crc32c_append_parts(0, &head, full, &tail[..tail_len]);
+    if crc != computed {
+        return Err(CorruptReason::BadChecksum);
+    }
+    let [seq, schema_and_flags, venue_ts_ns, local_ts_ns] = field;
+    if seq != expected_seq {
+        return Err(CorruptReason::BadSequence {
+            expected: expected_seq,
+            found: seq,
+        });
+    }
+    if (schema_and_flags >> 32) as u32 != 0 {
+        return Err(CorruptReason::BadFlags);
+    }
+    Ok(RecordHeader {
+        seq,
+        schema_id: schema_and_flags as u32,
+        venue_ts_ns,
+        local_ts_ns,
+    })
+}
+
+/// Fuzzing hook, not part of the API: [`decode_record_words`] over a body (`[P+4, P+len)`) laid out in ordinary
+/// memory as the zero-copy reader would see it. The padding up to the next 8-byte boundary is filled with non-zero
+/// bytes, because a mapping's padding is only zero while nothing has damaged it, and the decoder must ignore it.
+/// `None` unless `body.len() == commit_word - 4`, because the reader always takes the word count from the commit
+/// word.
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub fn decode_record_words_for_fuzzing(
+    commit_word: u32,
+    body: &[u8],
+    expected_seq: u64,
+) -> Option<Result<RecordHeader, CorruptReason>> {
+    if body.len() as u64 + COMMIT_WORD_LEN as u64 != u64::from(commit_word) || body.len() < 4 {
+        return None;
+    }
+    let crc = read_u32(body, 0)?;
+    let words = words_of_padded(&body[4..], 0xa5);
+    Some(decode_record_words(
+        commit_word,
+        crc,
+        crate::mmap::SharedWords::new(&words),
+        expected_seq,
+    ))
+}
+
+/// `bytes` as atomic little-endian words, the last one zero-padded.
+#[cfg(test)]
+fn words_of(bytes: &[u8]) -> Vec<std::sync::atomic::AtomicU64> {
+    words_of_padded(bytes, 0)
+}
+
+/// `bytes` as atomic little-endian words, the last one padded with `pad`.
+#[cfg(any(test, fuzzing))]
+fn words_of_padded(bytes: &[u8], pad: u8) -> Vec<std::sync::atomic::AtomicU64> {
+    bytes
+        .chunks(8)
+        .map(|chunk| {
+            let mut word = [pad; 8];
+            word[..chunk.len()].copy_from_slice(chunk);
+            std::sync::atomic::AtomicU64::new(u64::from_le_bytes(word))
+        })
+        .collect()
+}
+
 /// The `seal_crc` value for a seal announcing `next_seq`.
 pub fn seal_crc(next_seq: u64) -> u32 {
     crate::crc::crc32c_append(
@@ -735,6 +846,213 @@ mod tests {
         );
     }
 
+    /// Decodes the record whose body starts at `image[0]` (`P+4`) both ways: from the body slice, as the `pread`
+    /// reader does, and word by word, as the zero-copy reader does, with the words taken from `image` up to
+    /// `P+align8(len)` (so the last word holds whatever `image` has after the payload, as a mapping would).
+    fn decode_both(
+        len: u32,
+        image: &[u8],
+        seq: u64,
+    ) -> (
+        Result<RecordHeader, CorruptReason>,
+        Result<RecordHeader, CorruptReason>,
+    ) {
+        let by_body = decode_record_body(len, &image[..len as usize - 4], seq).map(|(h, _)| h);
+        let crc = read_u32(image, 0).unwrap();
+        let words = if len >= RECORD_HEADER_LEN as u32 {
+            words_of(&image[4..align8(u64::from(len)) as usize - 4])
+        } else {
+            Vec::new()
+        };
+        let by_words = decode_record_words(len, crc, crate::mmap::SharedWords::new(&words), seq);
+        (by_body, by_words)
+    }
+
+    /// A record body for `payload_len` pseudorandom bytes, followed by 64 more pseudorandom bytes (padding and
+    /// whatever comes next).
+    fn record_image(payload_len: usize, seed: u64) -> (u32, Vec<u8>) {
+        let mut x = seed | 1;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let payload: Vec<u8> = (0..payload_len).map(|_| next() as u8).collect();
+        let header = RecordHeader {
+            seq: 7,
+            schema_id: next() as u32,
+            venue_ts_ns: next(),
+            local_ts_ns: next(),
+        };
+        let (len, mut image) = body(&header, &payload);
+        image.extend((0..64).map(|_| next() as u8));
+        (len, image)
+    }
+
+    #[test]
+    fn word_decoder_matches_body_decoder_for_every_length() {
+        // Every payload length through two full rounds of both CRC lane sizes plus every tail (the three-lane
+        // thresholds are 192 and 768 bytes of payload words), so every alignment of the payload's last word.
+        const MAX_PAYLOAD: usize = 2 * 3 * (256 + 64) + 64 + 16;
+        let step = if cfg!(miri) { 199 } else { 1 };
+        for payload_len in (0..=MAX_PAYLOAD).step_by(step) {
+            let (len, image) = record_image(payload_len, payload_len as u64);
+            let body_len = len as usize - 4;
+            let padded = align8(u64::from(len)) as usize - 4;
+            let (by_body, by_words) = decode_both(len, &image, 7);
+            assert!(by_body.is_ok(), "payload {payload_len}");
+            assert_eq!(by_words, by_body, "payload {payload_len}");
+            // Every byte position class: each byte of the CRC and header fields, the payload's first and last
+            // bytes and the bytes on either side of each word boundary near its ends and the lane boundaries,
+            // and the padding (not checked by either decoder).
+            let mut positions: Vec<usize> = (0..36).collect();
+            for p in [0, 1, 7, 8, 9, 191, 192, 255, 256, 767, 768] {
+                positions.push(36 + p);
+            }
+            for back in 1..=9 {
+                positions.push(body_len.saturating_sub(back));
+            }
+            positions.extend(body_len..padded);
+            positions.retain(|&p| p < padded);
+            for p in positions {
+                let mut bad = image.clone();
+                bad[p] ^= 0x41;
+                let (by_body, by_words) = decode_both(len, &bad, 7);
+                assert_eq!(by_words, by_body, "payload {payload_len}, byte {p}");
+                assert_eq!(
+                    by_body.is_ok(),
+                    p >= body_len,
+                    "payload {payload_len}, byte {p}"
+                );
+                // The same damage under a recomputed CRC, so that the checks after the CRC decide: the sequence
+                // number, the flags, or nothing (schema id, timestamps, payload and padding are accepted as found).
+                finish_record_body(len, &mut bad[..body_len]);
+                let (by_body, by_words) = decode_both(len, &bad, 7);
+                assert_eq!(
+                    by_words, by_body,
+                    "payload {payload_len}, byte {p}, valid CRC"
+                );
+                let expected = match p {
+                    4..12 => Err(CorruptReason::BadSequence {
+                        expected: 7,
+                        found: 7 ^ (0x41 << (8 * (p - 4))),
+                    }),
+                    16..20 => Err(CorruptReason::BadFlags),
+                    _ => Ok(()),
+                };
+                assert_eq!(
+                    by_body.map(|_| ()),
+                    expected,
+                    "payload {payload_len}, byte {p}, valid CRC"
+                );
+            }
+            // A wrong sequence number, and commit words that disagree with the bytes.
+            assert_eq!(decode_both(len, &image, 8).1, decode_both(len, &image, 8).0);
+            for other in [
+                len.wrapping_sub(8),
+                len - 1,
+                len + 1,
+                len + 8,
+                0,
+                39,
+                SEAL_MARKER,
+            ] {
+                if (other as usize) <= image.len() - 4 && other != 0 && other != SEAL_MARKER {
+                    let (by_body, by_words) = decode_both(other, &image, 7);
+                    assert_eq!(
+                        by_words, by_body,
+                        "payload {payload_len}, commit word {other}"
+                    );
+                    assert!(
+                        by_words.is_err(),
+                        "payload {payload_len}, commit word {other}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn word_decoder_validation_rules() {
+        let (len, image) = record_image(3, 1);
+        let crc = read_u32(&image, 0).unwrap();
+        let words = words_of(&image[4..align8(u64::from(len)) as usize - 4]);
+        let view = crate::mmap::SharedWords::new(&words);
+        assert_eq!(decode_record_words(len, crc, view, 7).map(|h| h.seq), Ok(7));
+        for bad in [0, 1, 39, SEAL_MARKER] {
+            assert_eq!(
+                decode_record_words(bad, crc, view, 7),
+                Err(CorruptReason::BadLength(bad))
+            );
+        }
+        // Word counts that don't match the commit word, one short and one long.
+        for (short, long) in [
+            (view.split_at_checked(view.len() - 1).unwrap().0, None),
+            (view, Some(())),
+        ] {
+            let extended;
+            let words = match long {
+                None => short,
+                Some(()) => {
+                    extended = words_of(&image[4..align8(u64::from(len)) as usize + 4]);
+                    crate::mmap::SharedWords::new(&extended)
+                }
+            };
+            assert_eq!(
+                decode_record_words(len, crc, words, 7),
+                Err(CorruptReason::BadLength(len))
+            );
+        }
+        assert_eq!(
+            decode_record_words(len, crc ^ 1, view, 7),
+            Err(CorruptReason::BadChecksum)
+        );
+        assert_eq!(
+            decode_record_words(len, crc, view, 8),
+            Err(CorruptReason::BadSequence {
+                expected: 8,
+                found: 7
+            })
+        );
+        // Every flag bit on its own, under a valid CRC: both decoders reject each one.
+        for bit in 0..32 {
+            let mut flagged = image[..len as usize - 4].to_vec();
+            flagged[16 + bit / 8] |= 1 << (bit % 8);
+            finish_record_body(len, &mut flagged);
+            let words = words_of_padded(&flagged[4..], 0x5c);
+            let crc = read_u32(&flagged, 0).unwrap();
+            let view = crate::mmap::SharedWords::new(&words);
+            assert_eq!(
+                decode_record_words(len, crc, view, 7),
+                Err(CorruptReason::BadFlags),
+                "flag bit {bit}"
+            );
+            assert_eq!(
+                decode_record_body(len, &flagged, 7).map(|(h, _)| h),
+                Err(CorruptReason::BadFlags),
+                "flag bit {bit}"
+            );
+            // A wrong sequence number as well: the sequence is checked first, by both decoders.
+            assert_eq!(
+                decode_record_words(len, crc, view, 8),
+                Err(CorruptReason::BadSequence {
+                    expected: 8,
+                    found: 7
+                }),
+                "flag bit {bit} and a wrong sequence number"
+            );
+            assert_eq!(
+                decode_record_body(len, &flagged, 8).map(|(h, _)| h),
+                Err(CorruptReason::BadSequence {
+                    expected: 8,
+                    found: 7
+                }),
+                "flag bit {bit} and a wrong sequence number"
+            );
+        }
+    }
+
     #[test]
     fn in_place_fields_preserve_crc_and_payload() {
         let mut bytes = [0xab; 41];
@@ -988,6 +1306,30 @@ mod tests {
             let header = RecordHeader { seq, schema_id, venue_ts_ns, local_ts_ns };
             let (len, body) = body(&header, &payload);
             prop_assert_eq!(decode_record_body(len, &body, seq), Ok((header, &payload[..])));
+        }
+
+        #[test]
+        fn word_decoder_agrees_with_body_decoder(
+            payload_len in 0_usize..2200, seed in any::<u64>(), byte in any::<usize>(), xor in any::<u8>(),
+            seq_delta in 0_u64..3, len_delta in -9_i64..=9, fix_crc in 0_u8..3,
+        ) {
+            let (len, image) = record_image(payload_len, seed);
+            let mut image = image;
+            let padded = align8(u64::from(len)) as usize - 4;
+            image[byte % padded] ^= xor;
+            let other = u32::try_from(i64::from(len) + len_delta).unwrap();
+            if other >= 40 && other as usize - 4 <= image.len() - 4 {
+                // In a third of the cases, recompute the CRC for the commit word used, so that the damage reaches
+                // the checks after the CRC (sequence number, flags) instead of almost always failing the CRC.
+                if fix_crc == 0 {
+                    finish_record_body(other, &mut image[..other as usize - 4]);
+                }
+                let (by_body, by_words) = decode_both(other, &image, 7 + seq_delta);
+                if fix_crc == 0 {
+                    prop_assert_ne!(&by_body, &Err(CorruptReason::BadChecksum));
+                }
+                prop_assert_eq!(by_words, by_body);
+            }
         }
 
         #[test]

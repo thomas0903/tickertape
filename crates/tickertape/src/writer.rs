@@ -54,7 +54,7 @@ pub struct Writer {
     generation: u64,
     poisoned: bool,
     /// Set if an abandoned write's zeroing could not be made durable; see `append_with`.
-    appends_blocked: bool,
+    abandoned_write_error: Option<Error>,
     report: RecoveryReport,
     retention_report: crate::retention::Report,
     last_retention_error: Option<Error>,
@@ -181,7 +181,7 @@ impl Writer {
             spare_requested: false,
             generation: checkpoint.map_or(0, |c| c.generation),
             poisoned: false,
-            appends_blocked: false,
+            abandoned_write_error: None,
             report,
             retention_report: crate::retention::Report::default(),
             last_retention_error: None,
@@ -207,6 +207,8 @@ impl Writer {
     /// - [`Error::Io`] if a roll fails, e.g. the disk is full
     ///   ([`Error::is_storage_full`]). The journal is unchanged and the call can be
     ///   retried.
+    /// - [`Error::Io`] that no retry clears, once the zeroing of an abandoned write could not be made durable
+    ///   ([`Writer::abandoned_write_error`]). [`Error::is_storage_full`] is false for it; reopen the journal.
     pub fn append(&mut self, record: &NewRecord<'_>) -> Result<u64> {
         let payload = record.payload;
         self.append_with(record, payload.len(), |buf| buf.copy_from_slice(payload))
@@ -217,7 +219,9 @@ impl Writer {
     /// `fill` receives a zeroed buffer of exactly `payload_len` bytes inside the mapped segment. No reader can see
     /// it until `fill` returns and the record is committed. If `fill` panics, nothing is committed: the writer zeroes
     /// the buffer and syncs that zeroing (`docs/format.md` → Abandoned writes) before the panic continues, so no
-    /// bytes from it can later be mistaken for a record. `record.payload` is ignored.
+    /// bytes from it can later be mistaken for a record. If that sync fails, the panic continues all the same, the
+    /// stale bytes may still be on disk, and the writer refuses further appends and checkpoints
+    /// ([`Writer::abandoned_write_error`]). `record.payload` is ignored.
     ///
     /// # Errors
     ///
@@ -231,11 +235,26 @@ impl Writer {
     where
         F: FnOnce(&mut [u8]),
     {
-        if self.appends_blocked {
+        if let Some(cause) = &self.abandoned_write_error {
+            let source = match cause {
+                Error::Io { source, .. } => {
+                    let os = source
+                        .get_ref()
+                        .and_then(|e| e.downcast_ref::<io::Error>())
+                        .unwrap_or(source);
+                    os.raw_os_error().map_or_else(
+                        || io::Error::new(os.kind(), os.to_string()),
+                        io::Error::from_raw_os_error,
+                    )
+                }
+                other => io::Error::other(other.to_string()),
+            };
+            // Wrapped, like the cause, so that the OS error (say ENOSPC) is never `is_storage_full`: freeing space
+            // does not make this writer accept appends again.
             return Err(Error::io(
-                "append after an abandoned write could not be cleaned up durably",
+                "append (refused: an earlier abandoned write could not be zeroed durably; reopen the journal)",
                 &self.active.path,
-                io::Error::other("reopen the journal to recover"),
+                io::Error::other(source),
             ));
         }
         if self.next_seq == u64::MAX {
@@ -281,21 +300,25 @@ impl Writer {
         if let Err(cause) = filled {
             body.fill(0);
             // The zeroing must be durable (full platform barrier) before this space is reused.
-            let synced = self
-                .active
-                .map
-                .sync_range(offset, u64::from(len))
+            let synced = crate::fault::inject(crate::fault::Point::AbandonedWriteSync)
+                .and_then(|()| self.active.map.sync_range(offset, u64::from(len)))
                 .and_then(|()| mmap::sync_data(&self.active.file))
                 .and_then(|()| mmap::full_barrier(&self.active.file));
-            if synced.is_err() {
+            if let Err(e) = synced {
                 // Stale bytes could resurface after a power loss and be read as a record after a shorter one,
                 // so this writer must not reuse the space: refuse further appends and checkpoints.
                 self.poisoned = true;
-                self.appends_blocked = true;
+                // The OS error is wrapped (kind `Other`) so that it is never `is_storage_full`.
+                self.abandoned_write_error = Some(Error::io(
+                    "sync the zeroing of an abandoned write",
+                    &self.active.path,
+                    io::Error::other(e),
+                ));
             }
             panic::resume_unwind(cause);
         }
         format::finish_record_body(len, body);
+        crate::fault::pause_before_publish();
         self.active
             .map
             .store_commit_word(offset, len)
@@ -417,6 +440,22 @@ impl Writer {
     /// Cumulative successful retention removals since open, including partially failed runs.
     pub fn retention_report(&self) -> &crate::retention::Report {
         &self.retention_report
+    }
+
+    /// The error that stopped this writer when the zeroing of an abandoned write (a panic in an
+    /// [`append_with`](Writer::append_with) fill closure) could not be made durable, if that happened.
+    ///
+    /// Treat this as a storage incident, like a failed checkpoint (`docs/crash-contract.md` → Errors are sticky).
+    /// While it is set, appends fail with [`Error::Io`] and checkpoints with [`Error::DurabilityLost`], and the
+    /// durability of everything written since the last successful checkpoint is unknown. Reopening the journal gives
+    /// a writer that accepts appends again, but no guarantee about that tail across a power loss: the zeroed bytes may
+    /// only be in the page cache, so recovery cannot tell whether the disk still holds the stale ones.
+    ///
+    /// The `source` of this error and of every refused append has kind [`io::ErrorKind::Other`], so
+    /// [`Error::is_storage_full`] is false even when the sync failed with `ENOSPC` (retrying after freeing space does
+    /// not help); the OS error is its inner error ([`io::Error::get_ref`]).
+    pub fn abandoned_write_error(&self) -> Option<&Error> {
+        self.abandoned_write_error.as_ref()
     }
 
     /// Most recent retention error since open. A later successful run does not clear it.
