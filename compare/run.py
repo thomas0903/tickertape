@@ -59,7 +59,7 @@ def capture(command):
         return f"unavailable: {e}"
 
 
-def environment(out, env, quick):
+def environment(out, env, quick, name="environment.txt"):
     commands = [["git", "rev-parse", "HEAD"], ["git", "status", "--short"],
                 ["uname", "-a"], ["rustc", "--version"], ["cargo", "--version"],
                 [str(Path(env["JAVA_HOME"]) / "bin/java"), "-version"], ["mvn", "-version"]]
@@ -68,8 +68,9 @@ def environment(out, env, quick):
         commands += [["sw_vers"], ["sysctl", "machdep.cpu.brand_string", "hw.ncpu", "hw.memsize"],
                      ["diskutil", "info", mount], ["df", "-h", tempfile.gettempdir()]]
     else:
-        commands += [["lscpu"], ["free", "-h"], ["df", "-T", tempfile.gettempdir()]]
-    with (out / "environment.txt").open("w") as f:
+        commands += [["lscpu"], ["free", "-h"], ["df", "-T", tempfile.gettempdir()],
+                     ["findmnt", "-T", tempfile.gettempdir()], ["lsblk", "-o", "NAME,MODEL,SIZE,ROTA,TYPE,MOUNTPOINT"]]
+    with (out / name).open("w") as f:
         f.write(f"date_utc: {datetime.datetime.now(datetime.timezone.utc).isoformat()}\n")
         f.write(f"quick: {quick}\nTMPDIR: {tempfile.gettempdir()}\nJAVA_HOME: {env['JAVA_HOME']}\n")
         f.write("versions: " + json.dumps(VERSIONS) + "\n")
@@ -257,36 +258,78 @@ def validate_result(result):
         assert math.isclose(stats["payload_mb_per_s"], expected, rel_tol=1e-9)
 
 
+def build(out, env, java_tools, tt_latency=False):
+    """Builds the Rust adapters (and tt-latency for the short mode) and the selected Java adapters once."""
+    with (out / "build.log").open("a") as log:
+        execute(["cargo", "build", "--locked", "--release", "--manifest-path", HERE / "Cargo.toml",
+                 "--target-dir", HERE / "target"], stdout=log, stderr=subprocess.STDOUT, env=env, timeout=1800)
+        if tt_latency:
+            execute(["cargo", "build", "--locked", "--release", "-p", "tickertape-bench", "--bin", "tt-latency",
+                     "--target-dir", HERE / "target"], cwd=ROOT, stdout=log, stderr=subprocess.STDOUT, env=env,
+                    timeout=1800)
+        for tool in java_tools:
+            execute(["mvn", "-B", "-q", "-f", HERE / tool / "pom.xml", "package", "dependency:build-classpath", "dependency:list",
+                     "-Dmdep.outputFile=target/classpath.txt",
+                     f"-DoutputFile={out / (tool + '-dependencies.txt')}"], stdout=log, stderr=subprocess.STDOUT, env=env,
+                    timeout=1800)
+
+
+def java_environment(env, needed, parser):
+    jdk = env.get("JAVA_HOME")
+    if not jdk and Path("/opt/homebrew/opt/openjdk@21").exists():
+        jdk = "/opt/homebrew/opt/openjdk@21"
+    if not jdk:
+        if needed:
+            parser.error("set JAVA_HOME to Java 21 (or leave chronicle and aeron out with --tools)")
+        jdk = "unavailable"
+    env["JAVA_HOME"] = jdk
+    env["PATH"] = str(Path(jdk) / "bin") + os.pathsep + env["PATH"]
+    os.environ.update({"JAVA_HOME": jdk, "PATH": env["PATH"]})
+
+
 def main():
     suite_start = time.monotonic()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("outdir", type=Path)
-    parser.add_argument("--quick", action="store_true", help="100 warmup + 1000 measured latency; 2000 throughput records")
+    parser.add_argument("--quick", action="store_true",
+                        help="short mode: 100 warmup + 1000 measured latency; 2000 throughput records. "
+                             "Sustained mode: 5 s runs, 1 s warmup, one repeat")
+    sustained_args = parser.add_argument_group("sustained mode (ADR 0026; see compare/README.md)")
+    sustained_args.add_argument("--sustained", action="store_true", help="run the resumable sustained matrix")
+    sustained_args.add_argument("--resume", action="store_true", help="continue the matrix started in OUTDIR")
+    sustained_args.add_argument("--dry-run", action="store_true", help="print the plan and estimate, run nothing")
+    sustained_args.add_argument("--keep-going", action="store_true", help="record failed runs and continue")
+    sustained_args.add_argument("--duration", type=float, help="seconds per run (default 600; quick 5)")
+    sustained_args.add_argument("--warmup", type=float, help="paced seconds before the measured part (default 10; quick 1)")
+    sustained_args.add_argument("--repeats", type=int, help="repeats of every paced run (default 2; quick 1)")
+    sustained_args.add_argument("--tools", help="comma-separated subset of " + ",".join(TOOLS))
+    sustained_args.add_argument("--workloads", help="comma-separated subset of probe,SV,SD (default all)")
+    sustained_args.add_argument("--payloads", help="comma-separated subset of 64,1024 (default both)")
+    sustained_args.add_argument("--rates", help="explicit paced rates in records/s, the same for every tool")
+    sustained_args.add_argument("--rate-fractions", dest="fractions",
+                                help="paced rates as fractions of each probe's achieved rate (default 0.5,0.9)")
+    sustained_args.add_argument("--sync-every-ms", type=int, default=1000, help="SD sync interval (default 1000)")
+    sustained_args.add_argument("--tt-readers", help="tickertape readers: safe,mapped (default mapped)")
     args = parser.parse_args()
+    if args.sustained:
+        import sustained
+        env = dict(os.environ)
+        tools = args.tools.split(",") if args.tools else TOOLS
+        java_environment(env, any(t in ("chronicle", "aeron") for t in tools) and not args.dry_run, parser)
+        sustained.main(args, env, build)
+        return
+    if any([args.resume, args.dry_run, args.keep_going, args.duration, args.warmup, args.repeats, args.tools,
+            args.workloads, args.payloads, args.rates, args.fractions, args.tt_readers]):
+        parser.error("these options need --sustained")
     # Exclusive output creation prevents accidentally mixing runs with old results.
     out = args.outdir.resolve()
     out.mkdir(parents=True, exist_ok=True)
     if any(out.iterdir()):
         parser.error("OUTDIR must be new or empty")
     env = dict(os.environ)
-    jdk = env.get("JAVA_HOME")
-    if not jdk and Path("/opt/homebrew/opt/openjdk@21").exists():
-        jdk = "/opt/homebrew/opt/openjdk@21"
-    if not jdk:
-        parser.error("set JAVA_HOME to Java 21")
-    env["JAVA_HOME"] = jdk
-    env["PATH"] = str(Path(jdk) / "bin") + os.pathsep + env["PATH"]
-    os.environ.update({"JAVA_HOME": jdk, "PATH": env["PATH"]})
+    java_environment(env, True, parser)
     environment(out, env, args.quick)
-    with (out / "build.log").open("w") as log:
-        execute(["cargo", "build", "--locked", "--release", "--manifest-path", HERE / "Cargo.toml",
-                 "--target-dir", HERE / "target"], stdout=log, stderr=subprocess.STDOUT, env=env)
-        execute(["cargo", "build", "--locked", "--release", "-p", "tickertape-bench", "--bin", "tt-latency",
-                 "--target-dir", HERE / "target"], cwd=ROOT, stdout=log, stderr=subprocess.STDOUT, env=env)
-        for tool in ("chronicle", "aeron"):
-            execute(["mvn", "-B", "-q", "-f", HERE / tool / "pom.xml", "package", "dependency:build-classpath", "dependency:list",
-                     "-Dmdep.outputFile=target/classpath.txt",
-                     f"-DoutputFile={out / (tool + '-dependencies.txt')}"], stdout=log, stderr=subprocess.STDOUT, env=env)
+    build(out, env, ("chronicle", "aeron"), tt_latency=True)
     with (out / "commands.txt").open("w") as commands:
         for repeat in (1, 2):
             for payload in (64, 1024):
