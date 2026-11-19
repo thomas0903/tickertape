@@ -385,6 +385,42 @@ static void retention(const std::string &root) {
     CHECK(planned.removed_segments >= 2 && planned.removed_bytes == planned.removed_segments * 65536);
     CHECK(MUST(tt::list_segments(dir)).size() == before.size());  // planning changes nothing
 
+    // A negative or NaN age is an error, never "every sealed segment is old enough" (which would remove them all).
+    for (int which = 0; which < 3; which++) {
+        tt::Retention bad;
+        if (which == 0) bad.max_age(-std::chrono::hours(1));
+        if (which == 1) bad.max_age(std::chrono::duration<double>(std::nan("")));
+        if (which == 2) bad.max_age(std::chrono::duration<double, std::nano>(-0.5));
+        bad.delete_segments();
+        CHECK(bad.error() && bad.error()->status() == tt::Status::invalid_argument);
+        CHECK_FAILS(tt::plan_retention(dir, bad), tt::Status::invalid_argument);
+        CHECK_FAILS(tt::apply_retention(dir, bad), tt::Status::invalid_argument);
+        tt::WriterOptions with_bad_age;
+        with_bad_age.retention(bad);
+        CHECK(with_bad_age.error() && with_bad_age.error()->status() == tt::Status::invalid_argument);
+    }
+    CHECK(MUST(tt::list_segments(dir)).size() == before.size());
+    // Ages round up to whole nanoseconds (towards keeping), and zero stays a valid, explicit choice.
+    CHECK(tt::detail::duration_ns(std::chrono::duration<double, std::nano>(0.25)) == 1);
+    CHECK(tt::detail::duration_ns(std::chrono::duration<double, std::nano>(2.5)) == 3);
+    CHECK(tt::detail::duration_ns(std::chrono::seconds(2)) == 2000000000u);
+    {
+        tt::Retention zero;
+        zero.max_age(std::chrono::seconds(0));
+        CHECK(!zero.error());
+    }
+
+    // A C setter the binding does not wrap can be called through the non-const native handle.
+    {
+        tt::Retention raw;
+        CHECK(tickertape_retention_set_max_segments(raw.native_handle(), 1) == TICKERTAPE_OK);
+        CHECK(MUST(tt::plan_retention(dir, raw)).removed_segments == planned.removed_segments);
+        tt::WriterOptions writer_options;
+        CHECK(tickertape_writer_options_set_prefault(writer_options.native_handle(), 0) == TICKERTAPE_OK);
+        tt::ReaderOptions reader_options;
+        CHECK(tickertape_reader_options_set_notify(reader_options.native_handle(), 0) == TICKERTAPE_OK);
+    }
+
     tt::Retention move;
     move.max_segments(1).max_bytes(UINT64_MAX).max_age(std::chrono::hours(24 * 365)).move_to(fs::path(archive));
     const tt::RetentionReport moved = MUST(tt::apply_retention(dir, move));

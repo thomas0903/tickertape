@@ -7,7 +7,8 @@
 // - a fill that returns false, followed by a failed clean-up: a plain Status::io error;
 // - every status code and every corruption reason, with the OS error, reaching an Error unchanged (including a code
 //   from a newer library that this header does not name);
-// - a library whose version does not match the header: opens refuse it before calling the C ABI.
+// - a library whose version does not match the header: opens, inspection and retention refuse it before calling
+//   the C ABI.
 #include "tickertape.hpp"
 
 #include <cstdio>
@@ -36,7 +37,9 @@ static std::int32_t stub_reason = 0;
 static std::uint32_t stub_version = TICKERTAPE_HPP_VERSION_NUMBER;
 static int stub_opens = 0;
 static int stub_closes = 0;
+static int stub_inspections = 0;  // calls of the inspection and retention functions
 static int stub_writer;
+static int stub_retention;
 
 extern "C" {
 uint32_t tickertape_abi_version(void) { return TICKERTAPE_ABI_VERSION; }
@@ -67,6 +70,29 @@ tickertape_status tickertape_writer_append_with(struct tickertape_writer *, uint
 }
 
 tickertape_status tickertape_writer_checkpoint(struct tickertape_writer *) { return stub_status; }
+
+tickertape_status tickertape_verify(const char *, tickertape_verify_report *) {
+    stub_inspections++;
+    return TICKERTAPE_OK;
+}
+tickertape_status tickertape_list_segments(const char *, tickertape_segment_info *, size_t, size_t *count_out) {
+    stub_inspections++;
+    *count_out = 0;
+    return TICKERTAPE_OK;
+}
+tickertape_status tickertape_read_checkpoint(const char *, tickertape_checkpoint *) {
+    stub_inspections++;
+    return TICKERTAPE_NONE;
+}
+tickertape_status tickertape_retention_apply(const char *, const struct tickertape_retention *, int32_t,
+                                             tickertape_retention_report *) {
+    stub_inspections++;
+    return TICKERTAPE_OK;
+}
+struct tickertape_retention *tickertape_retention_new(void) {
+    return reinterpret_cast<struct tickertape_retention *>(&stub_retention);
+}
+void tickertape_retention_free(struct tickertape_retention *) {}
 
 const char *tickertape_last_error_message(void) { return stub_message.c_str(); }
 int32_t tickertape_last_error_os_code(void) { return stub_os_code; }
@@ -182,8 +208,26 @@ static void mismatched_library() {
     CHECK(!refused && refused.error().message().find("stub") != std::string::npos);
     CHECK(!tt::library_compatible() && !tt::check_library());
     CHECK(stub_opens == opens);  // refused before the C ABI was called
+
+    // Every function that takes a journal path checks the library, not only the opens.
+    const int inspections = stub_inspections;
+    const tt::Retention retention;
+    CHECK(!tt::verify("unused") && tt::verify("unused").error().status() == tt::Status::unsupported_version);
+    CHECK(!tt::list_segments("unused") &&
+          tt::list_segments("unused").error().status() == tt::Status::unsupported_version);
+    CHECK(!tt::read_checkpoint("unused") &&
+          tt::read_checkpoint("unused").error().status() == tt::Status::unsupported_version);
+    CHECK(!tt::plan_retention("unused", retention) &&
+          tt::plan_retention("unused", retention).error().status() == tt::Status::unsupported_version);
+    CHECK(!tt::apply_retention("unused", retention) &&
+          tt::apply_retention("unused", retention).error().status() == tt::Status::unsupported_version);
+    CHECK(stub_inspections == inspections);
     stub_version = TICKERTAPE_HPP_VERSION_NUMBER;
     CHECK(tt::library_compatible());
+    // With a matching library the same calls reach the C ABI.
+    CHECK(tt::verify("unused").has_value() && tt::list_segments("unused").has_value());
+    CHECK(tt::read_checkpoint("unused").has_value() && tt::plan_retention("unused", retention).has_value());
+    CHECK(stub_inspections == inspections + 5);  // list_segments calls the C function twice (count, then fill)
 }
 
 int main() {

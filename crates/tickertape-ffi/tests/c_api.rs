@@ -242,23 +242,33 @@ fn compiler(cpp: bool) -> cc::Tool {
         .get_compiler()
 }
 
-/// Compiles `sources` as language standard `std` (`c99`, `c++17`, ...) with the extra `flags` into the executable
-/// `out`.
-fn compile(sources: &[PathBuf], std: &str, link: Link, flags: &[&str], out: &Path) {
-    let cpp = std.starts_with("c++");
-    let mut cmd = compiler(cpp).to_command();
-    cmd.arg(format!("-std={std}"));
-    cmd.args(["-Wall", "-Wextra", "-Werror", "-pedantic"]);
-    cmd.args(flags);
+/// The sanitizer flags for compiling and linking under `TICKERTAPE_FFI_SANITIZE=1`.
+fn sanitizer_flags() -> &'static [&'static str] {
     if env_flag("TICKERTAPE_FFI_SANITIZE") {
-        cmd.args([
+        &[
             "-fsanitize=address,undefined",
             "-fno-sanitize-recover=all",
             "-fno-omit-frame-pointer",
-        ]);
+        ]
+    } else {
+        &[]
     }
+}
+
+/// A compiler command for language standard `std` (`c99`, `c++17`, ...) with warnings as errors, the sanitizers if
+/// requested, the include directory and the extra `flags`.
+fn compiler_command(std: &str, flags: &[&str]) -> Command {
+    let mut cmd = compiler(std.starts_with("c++")).to_command();
+    cmd.arg(format!("-std={std}"));
+    cmd.args(["-Wall", "-Wextra", "-Werror", "-pedantic"]);
+    cmd.args(flags);
+    cmd.args(sanitizer_flags());
     cmd.arg("-I").arg(manifest_dir().join("include"));
-    cmd.args(sources);
+    cmd
+}
+
+/// Adds the arguments that link the tickertape library as `link` says.
+fn link_library(cmd: &mut Command, link: Link) {
     match link {
         Link::Static => {
             cmd.arg(lib_dir().join("libtickertape.a"));
@@ -271,14 +281,66 @@ fn compile(sources: &[PathBuf], std: &str, link: Link, flags: &[&str], out: &Pat
         }
         Link::None => {}
     }
-    cmd.arg("-o").arg(out);
-    let output = cmd.output().expect("run the C compiler");
+}
+
+/// Runs a compiler (or linker) command and fails the test with its output if it fails.
+fn run_compiler(cmd: &mut Command) {
+    let output = cmd.output().expect("run the compiler");
     assert!(
         output.status.success(),
-        "compiling {sources:?} failed: {cmd:?}\n{}{}",
+        "{cmd:?} failed\n{}{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+/// Compiles `sources` as language standard `std` with the extra `flags` into the executable `out`.
+fn compile(sources: &[PathBuf], std: &str, link: Link, flags: &[&str], out: &Path) {
+    let mut cmd = compiler_command(std, flags);
+    cmd.args(sources);
+    link_library(&mut cmd, link);
+    cmd.arg("-o").arg(out);
+    run_compiler(&mut cmd);
+}
+
+/// Runs `commands` a few at a time (as many as there are CPUs) and returns their outputs in order.
+fn run_parallel(commands: Vec<Command>) -> Vec<(Command, Output)> {
+    let parallel = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let queue = Mutex::new(commands.into_iter().enumerate());
+    let done = Mutex::new(Vec::new());
+    std::thread::scope(|scope| {
+        for _ in 0..parallel {
+            scope.spawn(|| {
+                loop {
+                    let next = queue.lock().unwrap().next();
+                    let Some((index, mut cmd)) = next else { break };
+                    let output = cmd.output().expect("run the compiler");
+                    done.lock().unwrap().push((index, cmd, output));
+                }
+            });
+        }
+    });
+    let mut done = done.into_inner().unwrap();
+    done.sort_by_key(|(index, _, _)| *index);
+    done.into_iter()
+        .map(|(_, cmd, output)| (cmd, output))
+        .collect()
+}
+
+/// Runs `commands` a few at a time and fails with the output of every one that failed.
+fn run_all_ok(commands: Vec<Command>) {
+    let failures: Vec<String> = run_parallel(commands)
+        .into_iter()
+        .filter(|(_, output)| !output.status.success())
+        .map(|(cmd, output)| {
+            format!(
+                "{cmd:?} failed\n{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        })
+        .collect();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 /// Sources, language standard, link mode, extra flags and output of one program.
@@ -901,6 +963,14 @@ fn strip_comments(text: &str) -> String {
     out
 }
 
+/// Whether `code` contains `word` as a whole identifier.
+fn contains_word(code: &str, word: &str) -> bool {
+    let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    code.match_indices(word).any(|(at, _)| {
+        !code[..at].ends_with(is_ident) && !code[at + word.len()..].starts_with(is_ident)
+    })
+}
+
 /// The names of the functions `tickertape.h` declares (one per declaration line inside `extern "C"`).
 fn c_functions(header: &str) -> Vec<String> {
     header
@@ -1375,40 +1445,570 @@ fn cpp_compilers() -> Vec<PathBuf> {
     compilers
 }
 
-/// The header compiles without warnings as C++17, C++20 and C++23, with and without exceptions, with every C++
-/// compiler found (GCC and Clang on Linux CI), under -Wall -Wextra -Wpedantic -Wconversion -Wshadow.
+/// The header compiles without warnings as C++17, C++20 and C++23, with and without exceptions, with and without
+/// `NDEBUG` (which turns the debug checks off), with every C++ compiler found (GCC and Clang on Linux CI), under
+/// -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror. `layout.cpp` pins every public class's size and
+/// alignment in each of these configurations.
 #[test]
 fn cpp_header_compiles_at_every_language_level() {
     let scratch = tempfile::tempdir().unwrap();
-    let source = manifest_dir().join("tests/cpp/compile_all.cpp");
+    let tests = manifest_dir().join("tests/cpp");
+    let sources = [tests.join("compile_all.cpp"), tests.join("layout.cpp")];
     let compilers = cpp_compilers();
     assert!(!compilers.is_empty(), "no C++ compiler found");
+    let mut jobs = Vec::new();
     for (i, compiler) in compilers.iter().enumerate() {
         for std in ["c++17", "c++20", "c++23"] {
             for exceptions in ["-fexceptions", "-fno-exceptions"] {
-                let mut cmd = Command::new(compiler);
-                cmd.arg(format!("-std={std}"))
-                    .arg(exceptions)
-                    .args(["-O2", "-Wall", "-Wextra", "-Werror"])
-                    .args(CPP_BINDING_WARNINGS)
-                    .arg("-I")
-                    .arg(manifest_dir().join("include"))
-                    .arg("-c")
-                    .arg(&source)
-                    .arg("-o")
-                    .arg(
-                        scratch
-                            .path()
-                            .join(format!("compile_all_{i}_{std}{exceptions}.o")),
-                    );
-                let output = cmd.output().expect("run the C++ compiler");
+                for debug in ["-UNDEBUG", "-DNDEBUG"] {
+                    for source in &sources {
+                        let stem = source.file_stem().unwrap().to_string_lossy();
+                        let mut cmd = Command::new(compiler);
+                        cmd.arg(format!("-std={std}"))
+                            .args([exceptions, debug])
+                            .args(["-O2", "-Wall", "-Wextra", "-Werror"])
+                            .args(CPP_BINDING_WARNINGS)
+                            .arg("-I")
+                            .arg(manifest_dir().join("include"))
+                            .arg("-c")
+                            .arg(source)
+                            .arg("-o")
+                            .arg(
+                                scratch
+                                    .path()
+                                    .join(format!("{stem}_{i}_{std}{exceptions}{debug}.o")),
+                            );
+                        jobs.push(cmd);
+                    }
+                }
+            }
+        }
+    }
+    run_all_ok(jobs);
+}
+
+/// Every public class and enumeration of the binding has its size and alignment pinned in `tests/cpp/layout.cpp`
+/// (ADR 0036 -> Versioning: no data member is added within a major version).
+#[test]
+fn cpp_layout_test_pins_every_public_class() {
+    // Classes that are not part of the public surface: the `detail` namespace and Writer's private frame type.
+    const NOT_PUBLIC: &[&str] = &[
+        "is_byte",
+        "byte_range",
+        "byte_view",
+        "ResultAccess",
+        "FillFrame",
+        "CloseOnExit",
+        "FillContext",
+    ];
+    let header = strip_comments(&cpp_header());
+    let layout = read_text(&manifest_dir().join("tests/cpp/layout.cpp"));
+    let pinned: Vec<&str> = layout
+        .lines()
+        .filter_map(|line| line.strip_prefix("TT_PIN(")?.split(',').next())
+        .collect();
+    let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let mut classes = Vec::new();
+    for line in header.lines() {
+        let line = line.trim_start();
+        let Some(rest) = ["enum class ", "class ", "struct "]
+            .iter()
+            .find_map(|kind| line.strip_prefix(kind))
+        else {
+            continue;
+        };
+        let rest = rest.trim_start_matches("[[nodiscard]]").trim_start();
+        let name: String = rest.chars().take_while(|&c| is_ident(c)).collect();
+        let after = rest[name.len()..].trim_start();
+        // A definition, not a forward declaration or an explicit specialisation of a detail trait.
+        if name.is_empty()
+            || after.starts_with(';')
+            || after.starts_with('<')
+            || NOT_PUBLIC.contains(&name.as_str())
+        {
+            continue;
+        }
+        classes.push(name);
+    }
+    assert!(classes.len() >= 20, "parsed only {classes:?}");
+    for name in &classes {
+        let is_pinned = pinned.iter().any(|ty| {
+            ty.split("::")
+                .any(|part| part == name || part.starts_with(&format!("{name}<")))
+        });
+        assert!(
+            is_pinned,
+            "{name} is a public class of tickertape.hpp without a TT_PIN line in tests/cpp/layout.cpp"
+        );
+    }
+}
+
+// ---- Mixing exception and debug-check modes in one program (ADR 0036 -> Mixing modes) ----
+
+/// The attribute that gives a function a symbol per mode.
+const MODE_TAG: &str = "TICKERTAPE_HPP_MODE_DEPENDENT";
+
+/// The macros whose value can make an inline function's behaviour depend on how its translation unit was built.
+const MODE_MACROS: &[&str] = &[
+    "TICKERTAPE_HPP_EXCEPTIONS",
+    "TICKERTAPE_DEBUG_CHECKS",
+    "__cpp_exceptions",
+    "NDEBUG",
+];
+
+/// Calls from functions without the tag to a function that has the name of a tagged one but is a different
+/// function: (caller, callee, what the callee really is).
+const NOT_MODE_DEPENDENT_CALLS: &[(&str, &str, &str)] = &[
+    (
+        "check_options",
+        "error",
+        "the option builders' error(), which returns the recorded std::optional<Error>",
+    ),
+    ("retention", "error", "Retention::error(), as above"),
+    ("list_segments", "data", "std::vector::data()"),
+];
+
+/// A function defined in C++ source without comments: everything before its body (attributes, return type, name,
+/// parameters, qualifiers, member initialisers), its name, and its body.
+struct CppFunction {
+    head: String,
+    name: String,
+    body: String,
+}
+
+/// The function definitions in `code` (from `strip_comments`), including member functions defined in their class.
+/// A crude parser for this header's style, not for C++ in general: a `{` opens a function body when the declaration
+/// before it has a parameter list and is not a class, struct, union, enum or namespace.
+fn cpp_functions(code: &str) -> Vec<CppFunction> {
+    let chars: Vec<char> = code.chars().collect();
+    let mut functions = Vec::new();
+    let mut head_start = 0;
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            ';' | '}' => head_start = i + 1,
+            '{' => {
+                let head = declaration_head(&chars[head_start..i].iter().collect::<String>());
+                let close = matching_brace(&chars, i);
+                if member_brace_initializer(&head) {
+                    i = close; // `member_{...}` in a constructor's initialiser list: the declaration continues
+                } else if let Some(name) = function_name(&head) {
+                    let body = chars[i + 1..close].iter().collect();
+                    functions.push(CppFunction { head, name, body });
+                    i = close;
+                    head_start = close + 1;
+                } else {
+                    head_start = i + 1; // a class, namespace, enum or braced initialiser: look inside
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    functions
+}
+
+/// The index of the `}` that closes the `{` at `open`.
+fn matching_brace(chars: &[char], open: usize) -> usize {
+    let mut depth = 0;
+    for (k, &c) in chars.iter().enumerate().skip(open) {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return k;
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("unbalanced braces in tickertape.hpp");
+}
+
+/// A declaration's text without preprocessor directives (and their continuation lines) and access specifiers, on
+/// one line.
+fn declaration_head(text: &str) -> String {
+    let mut kept = Vec::new();
+    let mut continued = false;
+    for line in text.lines() {
+        let directive = continued || line.trim_start().starts_with('#');
+        continued = directive && line.trim_end().ends_with('\\');
+        if !directive {
+            kept.push(line.trim());
+        }
+    }
+    let mut head = kept.join(" ").trim().to_owned();
+    while let Some(rest) = ["public:", "private:", "protected:"]
+        .iter()
+        .find_map(|access| head.strip_prefix(access))
+    {
+        head = rest.trim().to_owned();
+    }
+    head
+}
+
+/// `head` without leading `template <...>` clauses and `[[...]]` attributes.
+fn strip_template_and_attributes(head: &str) -> &str {
+    let mut rest = head.trim_start();
+    loop {
+        if let Some(after) = rest.strip_prefix("template") {
+            let after = after.trim_start();
+            if after.starts_with('<') {
+                let mut depth = 0;
+                let mut end = after.len();
+                for (k, c) in after.char_indices() {
+                    match c {
+                        '<' => depth += 1,
+                        '>' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                end = k + 1;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                rest = after[end..].trim_start();
+                continue;
+            }
+        }
+        if rest.starts_with("[[") {
+            if let Some(end) = rest.find("]]") {
+                rest = rest[end + 2..].trim_start();
+                continue;
+            }
+        }
+        return rest;
+    }
+}
+
+/// Whether a constructor's member initialiser list (`) : member_(...)` or `) noexcept : ...`) is in `head`.
+fn has_member_initializers(head: &str) -> bool {
+    let bytes = head.as_bytes();
+    (0..bytes.len()).any(|k| {
+        bytes[k] == b':' && bytes.get(k + 1) != Some(&b':') && (k == 0 || bytes[k - 1] != b':') && {
+            let before = head[..k].trim_end();
+            before.ends_with(')') || before.ends_with("noexcept")
+        }
+    })
+}
+
+/// Whether the `{` after `head` starts a braced member initialiser (`: rec_{...}`) rather than the body.
+fn member_brace_initializer(head: &str) -> bool {
+    let last = head.trim_end().chars().last();
+    last.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_' || c == '>')
+        && has_member_initializers(head)
+}
+
+/// The name of the function `head` declares (`value`, `operator*`, `~Writer`), or None if it is not a function.
+fn function_name(head: &str) -> Option<String> {
+    let rest = strip_template_and_attributes(head);
+    let first_word: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    if ["class", "struct", "union", "enum", "namespace"].contains(&first_word.as_str()) {
+        return None;
+    }
+    let before = rest[..rest.find('(')?].trim_end();
+    if before.ends_with("operator") {
+        return Some("operator()".to_owned());
+    }
+    if let Some(at) = before.rfind("operator") {
+        if !before[..at].ends_with(|c: char| c.is_ascii_alphanumeric() || c == '_') {
+            return Some(
+                before[at..]
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            );
+        }
+    }
+    let name = before
+        .rsplit(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '~'))
+        .next()?;
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
+/// Whether `body` calls a function named `name` (`name(` as a whole identifier, not `std::name(`).
+fn calls(body: &str, name: &str) -> bool {
+    let call = format!("{name}(");
+    body.match_indices(&call).any(|(at, _)| {
+        let before = &body[..at];
+        !before.ends_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+            && !before.ends_with("std::")
+    })
+}
+
+/// Every inline function whose behaviour depends on the exception mode or the debug-check mode has a symbol per
+/// mode: it is declared TICKERTAPE_HPP_MODE_DEPENDENT if its body mentions a mode macro, or calls a function that
+/// is (by name; calls through operators, such as `*result`, are not seen, and the operators are tagged by hand).
+/// Without it, the linker keeps one translation unit's copy for the whole program.
+#[test]
+fn cpp_mode_dependent_functions_have_a_symbol_per_mode() {
+    let header = cpp_header();
+    assert!(
+        header.contains(&format!(
+            "#define {MODE_TAG} \\\n    __attribute__((abi_tag("
+        )),
+        "{MODE_TAG} must expand to abi_tag on GCC and Clang"
+    );
+    let functions = cpp_functions(&strip_comments(&header));
+    assert!(
+        functions.len() > 100,
+        "parsed only {} functions",
+        functions.len()
+    );
+    let mut tagged: Vec<&str> = functions
+        .iter()
+        .filter(|f| f.head.contains(MODE_TAG))
+        .map(|f| f.name.as_str())
+        .collect();
+    tagged.sort_unstable();
+    tagged.dedup();
+    for expected in [
+        "fail",
+        "debug_check",
+        "value",
+        "error",
+        "check_live",
+        "trampoline",
+        "append_with_impl",
+    ] {
+        assert!(
+            tagged.contains(&expected),
+            "{expected} is not tagged; parsed {tagged:?}"
+        );
+    }
+    let mut problems = Vec::new();
+    for f in functions.iter().filter(|f| !f.head.contains(MODE_TAG)) {
+        for macro_name in MODE_MACROS {
+            if contains_word(&f.head, macro_name) || contains_word(&f.body, macro_name) {
+                problems.push(format!(
+                    "{}: mentions {macro_name} but is not {MODE_TAG}",
+                    f.name
+                ));
+            }
+        }
+        for callee in tagged.iter().filter(|name| !name.starts_with("operator")) {
+            let allowed = NOT_MODE_DEPENDENT_CALLS
+                .iter()
+                .any(|(caller, c, _)| *caller == f.name && c == callee);
+            if calls(&f.body, callee) && !allowed {
+                problems.push(format!(
+                    "{}: calls {callee}(), which is {MODE_TAG}, but is not",
+                    f.name
+                ));
+            }
+        }
+    }
+    assert!(
+        problems.is_empty(),
+        "declare these functions {MODE_TAG} (ADR 0036 -> Mixing modes):\n{}",
+        problems.join("\n")
+    );
+    for (caller, callee, _) in NOT_MODE_DEPENDENT_CALLS {
+        assert!(
+            functions
+                .iter()
+                .any(|f| f.name == *caller && !f.head.contains(MODE_TAG) && calls(&f.body, callee)),
+            "NOT_MODE_DEPENDENT_CALLS: {caller} no longer calls {callee}(); remove the entry"
+        );
+    }
+}
+
+/// Translation units built with and without exceptions, and with and without debug checks, keep their own behaviour
+/// when linked into one program, in either link order and at -O0 and -O2 (ADR 0036 -> Mixing modes). Without the
+/// mode tags, the copy of `result<T>::value()`, `append_with` or `RecordBatch::operator[]` from the first object
+/// on the link line serves both units: `value()` aborts instead of throwing, a fill's exception escapes, or a debug
+/// check disappears.
+#[test]
+fn cpp_binding_links_units_built_in_different_modes() {
+    let scratch = tempfile::tempdir().unwrap();
+    let out = scratch.path();
+    let tests = manifest_dir().join("tests/cpp");
+    let unit = tests.join("mixed_modes_unit.cpp");
+    let main = tests.join("mixed_modes_main.cpp");
+    lib_dir(); // build the library before the compilers run in parallel
+    let objects: &[(&str, &Path, &[&str])] = &[
+        (
+            "noexc",
+            &unit,
+            &["-fno-exceptions", "-DTICKERTAPE_DEBUG_CHECKS=0"],
+        ),
+        ("exc", &unit, &["-DTICKERTAPE_DEBUG_CHECKS=0"]),
+        ("dbg", &unit, &["-DTICKERTAPE_DEBUG_CHECKS=1"]),
+        ("main_exceptions", &main, &["-DTT_MIXED_PAIR_EXCEPTIONS"]),
+        (
+            "main_debug_checks",
+            &main,
+            &["-DTT_MIXED_PAIR_DEBUG_CHECKS"],
+        ),
+    ];
+    // (driver, first unit, second unit): each pair in both orders.
+    let programs = [
+        ("main_exceptions", "noexc", "exc"),
+        ("main_exceptions", "exc", "noexc"),
+        ("main_debug_checks", "dbg", "exc"),
+        ("main_debug_checks", "exc", "dbg"),
+    ];
+    for opt in ["-O0", "-O2"] {
+        let object = |name: &str| out.join(format!("{name}{opt}.o"));
+        let compiles = objects
+            .iter()
+            .map(|(name, source, flags)| {
+                let mut cmd =
+                    compiler_command("c++17", &[CPP_BINDING_WARNINGS, flags, &[opt]].concat());
+                cmd.arg("-c").arg(source).arg("-o").arg(object(name));
+                cmd
+            })
+            .collect();
+        run_all_ok(compiles);
+        for (driver, first, second) in programs {
+            let program = out.join(format!("{driver}_{first}_{second}{opt}"));
+            let mut link = compiler(true).to_command();
+            link.args(sanitizer_flags())
+                .arg(object(driver))
+                .arg(object(first))
+                .arg(object(second));
+            link_library(&mut link, Link::Shared);
+            run_compiler(link.arg("-o").arg(&program));
+            let run = |args: &[&str]| {
+                let output = command(&program).args(args).output().unwrap();
+                let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+                let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+                (output.status.success(), stdout, stderr)
+            };
+            let context = format!(
+                "{} (objects in this order: {first}, {second})",
+                program.display()
+            );
+            if driver == "main_exceptions" {
+                let (ok, stdout, stderr) = run(&["exc-value"]);
                 assert!(
-                    output.status.success(),
-                    "{cmd:?} failed\n{}{}",
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
+                    ok && stdout.contains("threw"),
+                    "{context}: exc-value\n{stdout}{stderr}"
+                );
+                let (ok, stdout, stderr) = run(&["noexc-value"]);
+                assert!(
+                    !ok && stderr.contains("result<T>::value() on an error")
+                        && !stdout.contains("returned"),
+                    "{context}: noexc-value must abort\n{stdout}{stderr}"
+                );
+                let journal = out.join(format!("exc_{first}{opt}"));
+                let (ok, stdout, stderr) = run(&["exc-fill", journal.to_str().unwrap()]);
+                assert!(
+                    ok && stdout.contains("rethrown"),
+                    "{context}: exc-fill\n{stdout}{stderr}"
+                );
+                let journal = out.join(format!("noexc_{first}{opt}"));
+                let (ok, stdout, stderr) = run(&["noexc-fill", journal.to_str().unwrap()]);
+                assert!(
+                    ok && stdout.contains("committed"),
+                    "{context}: noexc-fill\n{stdout}{stderr}"
+                );
+            } else {
+                let (ok, stdout, stderr) = run(&["dbg-index"]);
+                assert!(
+                    !ok && stderr.contains("RecordBatch index out of range")
+                        && !stdout.contains("returned"),
+                    "{context}: dbg-index must abort\n{stdout}{stderr}"
+                );
+                let (ok, stdout, stderr) = run(&["nodbg-index"]);
+                assert!(
+                    ok && stdout.contains("unchecked 0"),
+                    "{context}: nodbg-index\n{stdout}{stderr}"
                 );
             }
+        }
+    }
+}
+
+// ---- NewRecord and temporaries (ADR 0036 -> Records) ----
+
+/// `NewRecord` does not copy its payload, so it refuses (at compile time) an rvalue range that owns its bytes, and
+/// accepts lvalues and rvalue views (`std::basic_string_view`, `std::span`).
+#[test]
+fn cpp_new_record_refuses_temporaries_that_own_their_bytes() {
+    const PRELUDE: &str = r#"#include "tickertape.hpp"
+#include <array>
+#include <span>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+namespace tt = tickertape;
+const std::string const_string();
+void use(std::vector<tt::NewRecord> &batch, std::string &owned, const std::string &cowned,
+         std::vector<std::uint8_t> &bytes, std::array<char, 1> &fixed);
+void use(std::vector<tt::NewRecord> &batch, std::string &owned, const std::string &cowned,
+         std::vector<std::uint8_t> &bytes, std::array<char, 1> &fixed) {
+    (void)batch; (void)owned; (void)cowned; (void)bytes; (void)fixed;
+"#;
+    const REFUSED: &[&str] = &[
+        r#"batch.emplace_back(1, 0, 0, std::to_string(1) + "...");"#,
+        r#"tt::NewRecord r(1, 0, 0, std::string("x")); (void)r;"#,
+        "tt::NewRecord r(1, 0, 0, std::vector<char>{'a'}); (void)r;",
+        "tt::NewRecord r(1, 0, 0, std::array<char, 1>{{'a'}}); (void)r;",
+        "tt::NewRecord r(1, 0, 0, std::move(owned)); (void)r;",
+        "tt::NewRecord r(1, 0, 0, const_string()); (void)r;",
+        "batch.push_back(tt::NewRecord(1, 0, 0, std::vector<std::uint8_t>(4)));",
+    ];
+    const ACCEPTED: &[&str] = &[
+        "tt::NewRecord r(1, 0, 0, owned); (void)r;",
+        "batch.emplace_back(1, 0, 0, owned);",
+        "batch.emplace_back(1, 0, 0, cowned);",
+        "batch.emplace_back(1, 0, 0, bytes);",
+        "batch.emplace_back(1, 0, 0, fixed);",
+        "batch.emplace_back(1, 0, 0, std::string_view(owned));",
+        r#"batch.emplace_back(1, 0, 0, std::string_view("literal"));"#,
+        "batch.emplace_back(1, 0, 0, std::span<const std::uint8_t>(bytes));",
+        "batch.emplace_back(1, 0, 0, std::span<const char, 1>(fixed));",
+        "batch.emplace_back(1, 0, 0, std::as_bytes(std::span<const char>(owned)));",
+    ];
+    let scratch = tempfile::tempdir().unwrap();
+    let compilers = cpp_compilers();
+    assert!(!compilers.is_empty(), "no C++ compiler found");
+    let mut jobs = Vec::new();
+    let mut cases = Vec::new();
+    for (i, statement) in REFUSED
+        .iter()
+        .map(|s| (false, s))
+        .chain(ACCEPTED.iter().map(|s| (true, s)))
+        .enumerate()
+    {
+        let source = scratch.path().join(format!("new_record_{i}.cpp"));
+        std::fs::write(&source, format!("{PRELUDE}    {}\n}}\n", statement.1)).unwrap();
+        for compiler in &compilers {
+            let mut cmd = Command::new(compiler);
+            cmd.args(["-std=c++20", "-fsyntax-only", "-Wall", "-Wextra", "-Werror"])
+                .args(CPP_BINDING_WARNINGS)
+                .arg("-I")
+                .arg(manifest_dir().join("include"))
+                .arg(&source);
+            jobs.push(cmd);
+            cases.push(statement);
+        }
+    }
+    for ((accept, statement), (cmd, output)) in cases.into_iter().zip(run_parallel(jobs)) {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if accept {
+            assert!(
+                output.status.success(),
+                "must compile: {statement}\n{cmd:?}\n{stderr}"
+            );
+        } else {
+            // Refused by the deleted constructor: "use of deleted function" / "call to deleted constructor", or,
+            // through libstdc++'s C++20 emplace_back, "no matching function for call to construct_at(NewRecord*...)"
+            // (std::construct_at is constrained on the construction being valid).
+            let about_new_record = stderr.contains("NewRecord")
+                && (stderr.contains("deleted") || stderr.contains("construct_at"));
+            assert!(
+                !output.status.success() && about_new_record,
+                "must be refused (the NewRecord constructor is deleted): {statement}\n{cmd:?}\n{stderr}"
+            );
         }
     }
 }

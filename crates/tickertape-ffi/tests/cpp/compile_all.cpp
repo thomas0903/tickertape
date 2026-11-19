@@ -37,6 +37,12 @@ std::uint64_t use_everything(const std::filesystem::path &dir) {
     reader_options.durable_only(true).notify(false).backoff(100, 10, 10us, 1ms).busy_spin();
     sum += writer_options.error() ? 1u : 0u;
     sum += reader_options.native_handle() != nullptr ? 1u : 0u;
+    // The non-const handles take the C setters the binding does not wrap, without a const_cast.
+    sum += static_cast<std::uint64_t>(-tickertape_retention_set_max_segments(retention.native_handle(), 3));
+    sum += static_cast<std::uint64_t>(-tickertape_writer_options_set_notify(writer_options.native_handle(), 1));
+    sum += static_cast<std::uint64_t>(-tickertape_reader_options_set_notify(reader_options.native_handle(), 1));
+    const tt::ReaderOptions &const_options = reader_options;
+    sum += const_options.native_handle() != nullptr ? 1u : 0u;
 
     tt::result<tt::Writer> opened = tt::Writer::open(dir, writer_options);
     if (!opened) return static_cast<std::uint64_t>(opened.error().os_code()) + opened.error().needed_size();
