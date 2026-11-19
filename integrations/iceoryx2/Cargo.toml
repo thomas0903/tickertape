@@ -1,0 +1,77 @@
+[package]
+name = "tickertape-iceoryx2"
+description = "Record iceoryx2 publish/subscribe services into a tickertape journal, follow them live, replay and export them"
+version = "0.1.0"
+edition = "2024"
+# iceoryx2 0.10 requires Rust 1.89; the core tickertape crates keep their own, lower MSRV.
+rust-version = "1.89"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/thomas0903/tickertape"
+homepage = "https://github.com/thomas0903/tickertape"
+authors = ["The tickertape contributors"]
+readme = "README.md"
+keywords = ["iceoryx2", "journal", "record", "replay", "ipc"]
+categories = ["development-tools", "filesystem"]
+# Not published yet; the maintainer decides when (see the pull request that added this crate).
+publish = false
+
+[features]
+default = ["iceoryx2"]
+# The recorder and replayer for services whose Rust types are known at compile time. Uses only iceoryx2's public API.
+iceoryx2 = ["dep:iceoryx2", "dep:zerocopy", "dep:signal-hook"]
+# Services whose types are only known at run time (what `iox2 service record` does), and conversion to and from
+# iceoryx2's recording file format. Depends on iceoryx2 API that upstream marks internal (`__internal_*`,
+# `loan_custom_payload`); all of it is in `src/dynamic.rs`.
+dynamic = ["iceoryx2", "dep:iceoryx2-userland-record-and-replay"]
+# The `tickertape-iox2` command-line tool. Needs `dynamic` to record services by name.
+cli = ["dynamic", "dep:clap", "dep:serde_json"]
+
+[dependencies]
+tickertape = { path = "../../crates/tickertape", version = "0.4.0" }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+# Pinned to one minor version: iceoryx2 is 0.x and breaks its API between minor releases.
+iceoryx2 = { version = "~0.10.0", optional = true }
+iceoryx2-userland-record-and-replay = { version = "~0.10.0", optional = true }
+# Safe byte views of typed payloads (no `unsafe` in the typed recorder and replayer).
+zerocopy = { version = "0.8", features = ["derive"], optional = true }
+# SIGINT/SIGTERM to an atomic flag without `unsafe`.
+signal-hook = { version = "0.3", optional = true }
+clap = { version = "~4.5.0", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+
+[dev-dependencies]
+proptest = "1"
+serde_json = "1"
+tempfile = "3"
+
+[[bin]]
+name = "tickertape-iox2"
+path = "src/main.rs"
+required-features = ["cli"]
+
+# Follows a recording live with tickertape alone; builds with `--no-default-features` (no iceoryx2 at all).
+[[example]]
+name = "follow"
+
+# A typed iceoryx2 publisher used by the tests and the quick start.
+[[example]]
+name = "publisher"
+required-features = ["iceoryx2"]
+
+# A typed recorder (public iceoryx2 API only) and a typed subscriber, used by the tests.
+[[example]]
+name = "typed-recorder"
+required-features = ["iceoryx2"]
+
+[[example]]
+name = "subscriber"
+required-features = ["iceoryx2"]
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
