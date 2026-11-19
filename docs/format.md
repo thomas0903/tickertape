@@ -302,6 +302,20 @@ its position. It would return a record that is not in the journal only if the ne
 checksum and the expected sequence number at that position (ADR
 [0034](decisions/0034-durable-only-reads-check-segment-identity.md) → In-place repairs).
 
+Such a repair can also remove a seal: when the emptied commit word is in a sealed segment, the zeroing runs to the end
+of the segment, seal included, and the successor, which the scan no longer reaches, is moved into `quarantine/` (step
+4, "Commit word `0`, no such segment", then step 5). A reader may have read the seal before, and the safe reader may
+still hold it in its buffer. So a reader at a seal whose successor is missing while its own segment is still in place
+reads the slot again from the file before it reports a broken chain. If the seal is gone, it reads the slot as it is
+now: it waits there (`Ok(None)`) or reads on in the new history, without `Error::Discarded`, like any reader across an
+in-place repair. Where the repair began earlier in the segment than the seal (at a record's emptied commit word), the
+reader's position can fall inside a record of the new history, and it then waits or reports corruption there as
+described above. If the seal is there, a live writer stored it only after linking its successor, so the reader tries
+the successor once more and reports `CorruptReason::BrokenChain` only if it is still missing. One such report can be
+transient: a recovery that replaces a successor whose header is damaged keeps the seal, moves that successor into
+`quarantine/` and then creates a new one, and a reader whose two attempts both fall in between follows the new
+successor on its next call.
+
 Until it checks, a visible reader may return records from a segment that recovery has just preserved and removed.
 Such records are like records lost to a power loss that a reader had already seen (`crash-contract.md` → C8). A
 durable-only reader never does (C13). A reader never moves from a removed history into the repaired one without

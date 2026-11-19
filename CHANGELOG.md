@@ -5,6 +5,17 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
+- Fixed: a visible reader no longer reports `CorruptReason::BrokenChain` for a seal that writer recovery removed in
+  place after the reader had read it. When storage damage empties a commit word after the checkpoint in a sealed
+  segment, recovery zeroes from there to the end of the segment in place, seal included, and quarantines the
+  successor. The safe reader could still hold the seal in its read buffer (a zero-copy reader could load it just
+  before the repair), follow it, find no successor while its own segment kept its identity, and report a broken chain
+  on a healthy journal on every call, until the new writer rolled to the same base again or the application seeked.
+  A reader at a seal whose successor is missing now reads the slot again from the file, and reports a broken chain
+  only if the seal is still there and the successor still missing. Found by
+  `reader_retention_stress::durable_readers_under_repairs_long` on arm64 Linux CI and
+  `::durable_readers_under_repairs` on macOS CI. New fault point `fault::Point::ReaderSealReread`. The on-disk format
+  is unchanged.
 - Library: dropping a `Writer` now releases the journal lock explicitly (`flock(LOCK_UN)`), after its helper threads
   have stopped and readers have been told it has gone, and so does a `Writer::open` that fails after taking the lock.
   Until now the lock was released only when the last copy of its descriptor closed, and a child that another thread
