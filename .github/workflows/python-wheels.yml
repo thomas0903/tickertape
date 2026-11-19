@@ -12,8 +12,13 @@ on:
   push:
     tags: ['v*']
   pull_request:
+    # The wheels compile the core crate too: a core change can break a musllinux or aarch64 wheel, and that must show
+    # up on the pull request, not at release time after the crates are published.
     paths:
       - 'bindings/python/**'
+      - 'crates/tickertape/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
       - '.github/workflows/python-wheels.yml'
   workflow_dispatch:
     inputs:
@@ -60,7 +65,8 @@ jobs:
           persist-credentials: false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          # Always the fully qualified tag: an unqualified name could resolve to a branch called like the tag.
+          ref: ${{ github.event_name == 'push' && github.ref || format('refs/tags/{0}', inputs.ref) }}
           path: source
           fetch-depth: 0
           persist-credentials: false
@@ -118,7 +124,10 @@ jobs:
       - name: Smoke-test the musllinux wheel in Alpine (end-to-end example)
         if: matrix.platform == 'musllinux'
         run: |
-          for image in python:3.11-alpine python:3.15-alpine; do
+          # Multi-arch index digests, pinned like the actions; update them together with the tags.
+          for image in \
+              python:3.11-alpine@sha256:7fbad8e4652eae0186429a6f26cf5b23e27e8c6fd7ac4d0cfd7a6988cdeea1e1 \
+              python:3.15-alpine@sha256:0f9552bb28711333da16915ec146f5e6bb44a7fdac9ced15dc17c2e0206346dd; do
             docker run --rm -v "$PWD:/src:ro" -w /src "$image" sh -ec \
               'python -m venv /tmp/venv && /tmp/venv/bin/pip install dist/*.whl && /tmp/venv/bin/python bindings/python/examples/end_to_end.py /tmp/journal'
           done

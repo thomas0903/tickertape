@@ -101,12 +101,21 @@ def release_notes(changelog, version):
             "[CLI binary installation](https://github.com/thomas0903/tickertape/blob/main/docs/install.md)\n")
 
 
+def tag_commit(source, tag):
+    """The commit that the tag `refs/tags/<tag>` points to. Never a branch (or any other ref) with the same name."""
+    result = subprocess.run(["git", "rev-parse", "--verify", "--quiet", f"refs/tags/{tag}^{{commit}}"],
+                            cwd=source, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise ValueError(f"{tag} is not a tag in the source checkout")
+    return result.stdout.strip()
+
+
 def prepare(args):
     source = args.source.resolve()
     version = version_for_tag(args.tag)
     validate_versions(source, version)
     sha = run("git", "rev-parse", "HEAD", cwd=source)
-    if run("git", "rev-parse", f"{args.tag}^{{commit}}", cwd=source) != sha:
+    if tag_commit(source, args.tag) != sha:
         raise ValueError("source checkout does not match the release tag")
     subprocess.run(["git", "merge-base", "--is-ancestor", sha, "origin/main"], cwd=source, check=True)
     repo = os.environ["GITHUB_REPOSITORY"]

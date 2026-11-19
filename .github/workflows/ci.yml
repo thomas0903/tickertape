@@ -190,6 +190,12 @@ jobs:
         run: |
           cargo fmt --manifest-path bindings/python/Cargo.toml --check
           cargo clippy --manifest-path bindings/python/Cargo.toml --all-targets --locked -- -D warnings
+      - name: Unit tests of the bindings crate (every error and report variant converts as listed)
+        run: |
+          # The test binary links libpython; make the runtime linker find it on Linux.
+          LD_LIBRARY_PATH="$(python -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          export LD_LIBRARY_PATH
+          cargo test --manifest-path bindings/python/Cargo.toml --locked
       - name: Build the Rust CLI and fixture helpers for the cross-language tests
         run: cargo build --release --locked -p tickertape-cli -p tickertape-examples -p tickertape-tests --bins
       - name: Build the wheel and install it into a clean virtual environment
