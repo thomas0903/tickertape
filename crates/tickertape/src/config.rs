@@ -2,22 +2,44 @@
 
 use std::time::Duration;
 
-/// What the writer does on open when it finds a corrupt committed record at the end of the newest segment.
+/// What the writer does on open when it finds corruption after the last checkpoint: an invalid record or seal, a
+/// segment disconnected from the chain, an empty commit word after which recovery finds evidence of committed
+/// history ([`CorruptReason::EmptyCommitWord`](crate::CorruptReason::EmptyCommitWord), or
+/// [`CorruptReason::UncheckedTail`](crate::CorruptReason::UncheckedTail) when its search stops at its work bound), or
+/// non-zero bytes after an empty commit word in front of a segment for the expected sequence number that exists but
+/// does not open ([`CorruptReason::BrokenChain`](crate::CorruptReason::BrokenChain); `docs/crash-contract.md`, C11,
+/// and ADR 0035 have the rules).
 ///
-/// A writer *process* crash never produces this (see `docs/crash-contract.md`, C1/C2); only power loss, storage
-/// errors or outside modification do. Uncommitted partial records are always cleaned up, whatever the policy.
+/// A writer *process* crash in an otherwise intact journal usually does not produce this; power loss, storage errors
+/// or outside modification do. The exception (`docs/crash-contract.md`, C1): the payload of the record being written
+/// can hold bytes that recovery's search counts as committed history (raw frames copied from another journal, for
+/// example). Recovery cannot tell those bytes from damage and reports
+/// [`CorruptReason::EmptyCommitWord`](crate::CorruptReason::EmptyCommitWord) or
+/// [`CorruptReason::UncheckedTail`](crate::CorruptReason::UncheckedTail); `Quarantine` preserves them and `Fail`
+/// refuses. Nothing is lost (ADR 0035).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum RecoveryPolicy {
-    /// Copy the invalid bytes to `quarantine/` in the journal directory, fsync the copy, then zero them and continue
-    /// appending after the last valid record. Nothing is ever deleted. The default.
+    /// Copy the corrupt tail (from the corrupt position to the last non-zero byte of its segment) to `quarantine/`
+    /// in the journal directory, fsync the copy, then replace the segment by a copy with the tail zeroed (never
+    /// edited in place), move disconnected segments into `quarantine/`, and continue appending after the last valid
+    /// record. No segment and no repaired tail is deleted. Some bytes are zeroed in place without a copy, as after a
+    /// crash (`docs/crash-contract.md`, C8). The default.
     #[default]
     Quarantine,
     /// Return [`Error::Corrupt`](crate::Error::Corrupt) from [`Writer::open`](crate::Writer::open) instead of
-    /// quarantining or repairing anything. Committed bytes are never changed and nothing is moved. Recovery may still
-    /// have done the clean-ups it performs before reaching the corrupt position, which a writer *process* crash also
-    /// requires: removing stale `*.tape.tmp` files, zeroing never-committed bytes after a segment's last record,
-    /// writing a missing seal, and creating a missing successor segment (`docs/format.md` → Recovery).
+    /// quarantining or repairing anything. The bytes at the corrupt position it reports, and everything after them in
+    /// that segment, are left untouched, and no segment is moved. The open is not read-only, though: before it scans
+    /// it may create the lock file and the checkpoint file, writes its PID into the lock file (best
+    /// effort) and removes stale temporary files, and it keeps what recovery changed earlier in the scan, including
+    /// bytes zeroed in place, which after storage damage can be published records (`docs/crash-contract.md`, C11,
+    /// lists these changes).
+    ///
+    /// After a plain process crash this usually opens; it refuses in the exception above (`EmptyCommitWord` or
+    /// `UncheckedTail` at the start of the record being written). The bytes alone cannot tell that from storage
+    /// damage. If the application knows it was writing such a payload when the process died, open once with
+    /// [`RecoveryPolicy::Quarantine`], which preserves those bytes in `quarantine/` and continues after the last
+    /// committed record (`docs/operations.md` → After a crash).
     Fail,
 }
 
@@ -180,6 +202,16 @@ impl ReaderConfig {
     /// A missing or invalid marker covers no records. At the boundary, `try_next` returns `None` without
     /// consuming the record, and `next_timeout` polls until a checkpoint covers it or the timeout expires.
     /// If the writer never checkpoints, this reader returns nothing.
+    ///
+    /// A marker describes the journal's current files. When a refreshed marker covers records past the cursor, the
+    /// reader first confirms that its segment's path still names the file it has open (one `stat`, only then, never
+    /// per record). If recovery replaced that segment or retention removed it, the reader returns
+    /// [`Error::Discarded`](crate::Error::Discarded) rather than read records the marker doesn't vouch for; call
+    /// [`Reader::seek`](crate::Reader::seek) to continue. If the check passes, the reader reads the records the marker
+    /// newly covers from the file's current bytes, not from what it had read ahead before, so recovery removing
+    /// records after the checkpoint in place (in the same file) can't make it return them. A reader overtaken by
+    /// retention may therefore learn of the removal when the checkpoint moves past its cursor, before the end of the
+    /// removed segment (ADR 0034).
     ///
     /// See ADR 0010 (`docs/decisions/0010-durable-only-reads.md` in the repository) and crash contract C13
     /// (`docs/crash-contract.md`), including its storage assumptions. The marker is read from the file, never mapped, and cached until needed.

@@ -164,8 +164,9 @@ jobs:
       # From 1.0, removing or changing a frozen declaration fails; additions pass (ADR 0028 -> Versioning).
       - name: ABI baseline check
         run: python3 .github/scripts/check_abi_baseline.py crates/tickertape-ffi/abi/tickertape-baseline.h crates/tickertape-ffi/include/tickertape.h
-      # Rust tests of the extern "C" functions (with the core's failure points), then the C99/C11 and C++11/C++20
-      # programs, examples and cross-language fixtures, compiled with AddressSanitizer and UBSan.
+      # Rust tests of the extern "C" functions (with the core's failure points), then the C99/C11 programs, the C++
+      # binding's programs (C++17, C++20, no exceptions; ADR 0036), examples and cross-language fixtures, compiled
+      # with AddressSanitizer and UBSan, and the binding's compile-only matrix (C++17/20/23 with g++ and clang++).
       - name: C ABI tests (AddressSanitizer, UBSan)
         run: cargo test -p tickertape-ffi --locked --features fault-injection
         env:
@@ -186,6 +187,67 @@ jobs:
           make -C examples/c
           cmake -S examples/c -B "$RUNNER_TEMP/examples"
           cmake --build "$RUNNER_TEMP/examples"
+          cmake -S crates/tickertape-ffi/tests/cmake -B "$RUNNER_TEMP/cmake-subdir"
+          cmake --build "$RUNNER_TEMP/cmake-subdir"
+          "$RUNNER_TEMP/cmake-subdir/example" "$RUNNER_TEMP/journal" record 3
+          "$RUNNER_TEMP/examples/example" "$RUNNER_TEMP/journal" replay
+
+  # The Java binding (ADR 0037) on JDK 25 against the library built here: JUnit tests (with the cross-language and
+  # released-format fixtures), then the natives JAR and an install test that runs the example from the built JARs.
+  # Nothing is published.
+  java:
+    name: java binding (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
+        with:
+          distribution: temurin
+          java-version: '25.0.5'
+          cache: maven
+      # '25.0.5' resolves to Temurin 25.0.5+8 on Linux and to the macOS-only respin 25.0.5.1+2 on macOS (ADR 0037).
+      - run: java -version
+      - name: Maven
+        run: command -v mvn || { sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends maven; }
+      - name: Build libtickertape, the CLI and the C test programs
+        run: echo "TT_NATIVE_DIR=$(bindings/java/scripts/build-native.sh)" >> "$GITHUB_ENV"
+      # Everything Maven needs, before the build: with an empty cache, Maven Central once answered "not found" for a
+      # plugin that exists (maven-resources-plugin 3.5.0, on one runner of three). Maven records such a miss, so a
+      # retry forces an update (-U). Only resolution is retried, never the tests; the later steps find everything local.
+      - name: Resolve Maven plugins and dependencies
+        run: |
+          for attempt in 1 2 3; do
+            if mvn -B -ntp -U -f bindings/java/pom.xml -Pnatives dependency:go-offline; then
+              exit 0
+            fi
+            echo "::warning::Maven resolution failed (attempt $attempt of 3)"
+            sleep $((attempt * 20))
+          done
+          exit 1
+      # On the module path with --illegal-native-access=deny; missing tools (CLI, C programs, Python) fail the run.
+      - name: Java tests
+        run: mvn -B -ntp -f bindings/java/pom.xml verify -Dtickertape.native.dir="$TT_NATIVE_DIR" -Dtickertape.test.requireTools=true
+      - name: Natives JAR
+        run: |
+          case "$RUNNER_OS-$RUNNER_ARCH" in
+            Linux-X64) platform=linux-x86_64 ;;
+            Linux-ARM64) platform=linux-aarch64 ;;
+            macOS-ARM64) platform=macos-aarch64 ;;
+            macOS-X64) platform=macos-x86_64 ;;
+            *) echo "unsupported runner: $RUNNER_OS-$RUNNER_ARCH" >&2; exit 1 ;;
+          esac
+          bindings/java/scripts/stage-natives.sh "$TT_NATIVE_DIR" "$platform"
+          mvn -B -ntp -f bindings/java/pom.xml -Pnatives package -DskipTests
+      - name: Install test from the built JARs
+        run: bindings/java/scripts/install-test.sh "$RUNNER_TEMP/java-install"
 
   msrv:
     name: msrv
@@ -283,3 +345,74 @@ jobs:
           TICKERTAPE_PYTHON: ${{ steps.python.outputs.python-path }}
       # M8: the README quickstart, end to end (producer, live consumer, verify, Parquet export, DuckDB query).
       - run: examples/quickstart.sh "${{ steps.python.outputs.python-path }}"
+
+  # The iceoryx2 integration is outside the workspace (own lockfile and MSRV); these jobs only touch its directory.
+  iceoryx2:
+    name: iceoryx2 integration (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: integrations/iceoryx2
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: integrations/iceoryx2
+          prefix-key: v0-rust-iceoryx2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --all-features --locked -- -D warnings
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo clippy --all-targets --no-default-features --locked -- -D warnings
+      # The upstream CLI, for the test that plays an exported file with `iox2 service replay`. With
+      # TICKERTAPE_REQUIRE_IOX2 set, that test fails instead of skipping when `iox2` is missing.
+      - run: cargo install --locked iceoryx2-cli@0.10.0
+      # Cross-process tests: publishers, recorders, live readers and subscribers on local shared memory; no network.
+      - run: cargo test --all-features --locked
+        env:
+          TICKERTAPE_REQUIRE_IOX2: "1"
+      # The default features (typed recorder and replayer, no `dynamic`) and no features at all (layout, catalog,
+      # info and the live reader example, without iceoryx2).
+      - run: cargo test --locked
+      - run: cargo test --no-default-features --locked
+      - run: cargo build --example follow --no-default-features --locked
+      - run: cargo doc --all-features --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - run: cargo doc --no-default-features --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  iceoryx2-msrv:
+    name: iceoryx2 integration msrv
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: integrations/iceoryx2
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read rust-version from the integration's Cargo.toml
+        id: msrv
+        run: echo "version=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)" >> "$GITHUB_OUTPUT"
+      - run: rustup toolchain install ${{ steps.msrv.outputs.version }} --profile minimal
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: integrations/iceoryx2
+          prefix-key: v0-rust-iceoryx2-msrv
+      - run: cargo +${{ steps.msrv.outputs.version }} check --all-features --all-targets --locked
+
+  iceoryx2-deny:
+    name: cargo deny (iceoryx2 integration)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The repository's policy (deny.toml) against the integration's own lockfile.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          manifest-path: integrations/iceoryx2/Cargo.toml
+          arguments: --all-features --config deny.toml
+          command: check

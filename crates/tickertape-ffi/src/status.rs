@@ -70,8 +70,11 @@ pub enum tickertape_status_code {
     /// An internal error (a bug in tickertape) was caught. The handle involved is broken: later calls on it return
     /// this code; close it.
     TICKERTAPE_E_PANIC = -17,
+    /// A reader beacon with this name is held by a running reader (ADR 0032). The C ABI does not create beacons yet;
+    /// the code exists so that every core error has one.
+    TICKERTAPE_E_BEACON_IN_USE = -18,
     /// An error this version of the C ABI has no specific code for. Its value stays far from the assigned codes,
-    /// which later versions extend downwards from -17.
+    /// which later versions extend downwards from -18.
     TICKERTAPE_E_UNKNOWN = -255,
 }
 
@@ -103,12 +106,28 @@ pub enum tickertape_corrupt_reason {
     TICKERTAPE_CORRUPT_BAD_SEQUENCE = 9,
     /// A reserved field is not zero.
     TICKERTAPE_CORRUPT_BAD_FLAGS = 10,
-    /// A seal's checksum does not match the expected next sequence number.
+    /// A seal is invalid (its checksum does not match the expected next sequence number, or it lies where a seal
+    /// cannot), or writer recovery found non-zero bytes beyond the place of a missing seal in front of a successor
+    /// segment that opens (`docs/crash-contract.md` C11).
     TICKERTAPE_CORRUPT_BAD_SEAL = 11,
-    /// A sealed segment's successor is missing while later segments exist, or does not start where the seal says.
+    /// A sealed segment's successor is missing while later segments exist, or does not start where the seal says; or
+    /// the chain ends at an empty commit word in a segment that is not the newest, such as one in front of a successor
+    /// segment that does not open (writer recovery then preserves the non-zero bytes after that word, or refuses:
+    /// `docs/crash-contract.md` C11 (3)), or a segment is disconnected from the chain.
     TICKERTAPE_CORRUPT_BROKEN_CHAIN = 12,
     /// The checkpoint marker points to a missing segment or an impossible offset.
     TICKERTAPE_CORRUPT_DANGLING_CHECKPOINT = 13,
+    /// A commit word reads 0, and recovery or verify found evidence of committed records after it (usually storage
+    /// damage; a torn payload can also cause it: `docs/crash-contract.md` C1, C11; ADR 0035). The error message
+    /// names the sequence number the evidence carries: a later valid record's, the next sequence number of a seal
+    /// that ends the segment, or the base of a later segment.
+    TICKERTAPE_CORRUPT_EMPTY_COMMIT_WORD = 14,
+    /// A commit word reads 0, and the bytes after it were too costly to check completely (the search for committed
+    /// records stopped at its work bound; ADR 0035). Inconclusive, but treated like
+    /// `TICKERTAPE_CORRUPT_EMPTY_COMMIT_WORD`: the writer preserves the bytes or refuses. The error message names a
+    /// sequence number: the one in the header of the candidate record where the search stopped, or the expected one
+    /// plus one when it stopped at a final seal.
+    TICKERTAPE_CORRUPT_UNCHECKED_TAIL = 15,
     /// A reason this version of the C ABI has no specific code for.
     TICKERTAPE_CORRUPT_UNKNOWN = 255,
 }
@@ -187,6 +206,7 @@ pub(crate) fn status_of(error: &Error) -> S {
         Error::SequenceExhausted => S::TICKERTAPE_E_SEQUENCE_EXHAUSTED,
         Error::Discarded { .. } => S::TICKERTAPE_E_DISCARDED,
         Error::InvalidConfig(_) => S::TICKERTAPE_E_INVALID_CONFIG,
+        Error::BeaconInUse { .. } => S::TICKERTAPE_E_BEACON_IN_USE,
         _ => S::TICKERTAPE_E_UNKNOWN,
     }
 }
@@ -207,6 +227,8 @@ pub(crate) fn corrupt_reason_of(reason: &CorruptReason) -> R {
         CorruptReason::BadSeal => R::TICKERTAPE_CORRUPT_BAD_SEAL,
         CorruptReason::BrokenChain(_) => R::TICKERTAPE_CORRUPT_BROKEN_CHAIN,
         CorruptReason::DanglingCheckpoint(_) => R::TICKERTAPE_CORRUPT_DANGLING_CHECKPOINT,
+        CorruptReason::EmptyCommitWord(_) => R::TICKERTAPE_CORRUPT_EMPTY_COMMIT_WORD,
+        CorruptReason::UncheckedTail(_) => R::TICKERTAPE_CORRUPT_UNCHECKED_TAIL,
         _ => R::TICKERTAPE_CORRUPT_UNKNOWN,
     }
 }
@@ -473,6 +495,7 @@ pub extern "C" fn tickertape_status_name(status: tickertape_status) -> *const c_
             TICKERTAPE_E_ABORTED,
             TICKERTAPE_E_BUSY,
             TICKERTAPE_E_PANIC,
+            TICKERTAPE_E_BEACON_IN_USE,
             TICKERTAPE_E_UNKNOWN,
         ]
     )
@@ -501,6 +524,8 @@ pub extern "C" fn tickertape_corrupt_reason_name(reason: i32) -> *const c_char {
             TICKERTAPE_CORRUPT_BAD_SEAL,
             TICKERTAPE_CORRUPT_BROKEN_CHAIN,
             TICKERTAPE_CORRUPT_DANGLING_CHECKPOINT,
+            TICKERTAPE_CORRUPT_EMPTY_COMMIT_WORD,
+            TICKERTAPE_CORRUPT_UNCHECKED_TAIL,
             TICKERTAPE_CORRUPT_UNKNOWN,
         ]
     )

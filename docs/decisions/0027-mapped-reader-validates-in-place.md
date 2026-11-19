@@ -30,7 +30,7 @@ Spec: [`format.md`](../format.md) → Publication; ADR 0003.
 - **Writer.** It writes the body `[P+4, P+len)` with ordinary stores, then stores `len` into the commit word at `P`
   with `Release`. The padding `[P+len, P+align8(len))` is already zero and never written; the next record starts at
   `P+align8(len)`. After the release store the writer never modifies `[P, P+align8(len))` again. Abandoned bodies
-  are zeroed (durably) before any later commit. In place, recovery only zeroes the bytes after the first empty slot
+  are zeroed (durably) before any later commit. In place, recovery only zeroes bytes after an empty slot
   (`zero_uncommitted_tail`), which on an intact chain were never committed, and writes a missing seal at that slot
   (`write_seal`); every other repair replaces or moves a whole file (ADR 0007, `format.md` → Recovery). So on an
   intact publication chain committed bytes are immutable. A commit word damaged on storage breaks that (below,
@@ -90,9 +90,12 @@ writers touch the files.
 1. A writer appends records up to sequence number `T`, which readers return; the last checkpoint covers only the
    records before some `S <= T`.
 2. Storage damage zeroes the commit word of the published record `S`.
-3. A writer reopens. Recovery scans from the checkpoint and stops at the empty slot of record `S`. It takes that slot
-   for the end of the journal and zeroes record `S` **and the published records after it** in place, then appends
-   from there.
+3. A writer reopens. Recovery scans from the checkpoint and stops at the empty slot of record `S`. When it finds
+   evidence of the records after it, it usually replaces the segment by a new file (or `Fail` refuses), which leaves
+   readers' mappings unchanged (ADR 0035). When it finds none, it cannot tell the damage from a torn append: it takes
+   that slot for the end of the journal and zeroes record `S` **and the published records after it** in place, then
+   appends from there. That covers damage after which nothing validates, such as the commit word of the newest
+   record zeroed; crash contract C11 (3) has the cases.
 4. A zero-copy reader that is still open while this happens holds payload slices into those records, and they change
    under it: the bytes it validated are not the bytes it hands back. Its later commit-word loads, and the loads that
    validate the records it then reads, meet the recovering and the new writer's stores to the same bytes.

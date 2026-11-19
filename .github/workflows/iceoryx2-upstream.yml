@@ -1,0 +1,59 @@
+name: iceoryx2 upstream
+
+# Builds and tests the iceoryx2 integration against the newest published iceoryx2 release and against upstream
+# `main`, so that API changes are noticed early. Scheduled and manual only: it never runs on pull requests, so an
+# upstream change cannot fail them. Informational: a failure here is a heads-up about a coming port (see the
+# integration README's maintenance section), not a broken build; against `main` it is expected to fail today.
+on:
+  schedule:
+    - cron: '23 5 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  upstream:
+    name: iceoryx2 ${{ matrix.iceoryx2 }} (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        iceoryx2: [latest-release, main]
+    runs-on: ${{ matrix.os }}
+    # Informational (see above): failures are reported in the run, but don't fail the workflow.
+    continue-on-error: true
+    defaults:
+      run:
+        working-directory: integrations/iceoryx2
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain || rustup toolchain install
+      - name: Use the newest iceoryx2 release
+        if: matrix.iceoryx2 == 'latest-release'
+        run: |
+          version=$(curl -sSf -A "tickertape-ci (https://github.com/thomas0903/tickertape)" \
+            https://crates.io/api/v1/crates/iceoryx2 \
+            | python3 -c 'import json, sys; print(json.load(sys.stdin)["crate"]["max_stable_version"])')
+          echo "Newest iceoryx2 release: $version"
+          echo "IOX2_VERSION=$version" >> "$GITHUB_ENV"
+          sed -i.bak -E "s/^(iceoryx2(-userland-record-and-replay)? = \{ version = )\"[^\"]*\"/\1\"=$version\"/" Cargo.toml
+      - name: Use iceoryx2 from upstream main
+        if: matrix.iceoryx2 == 'main'
+        run: |
+          sed -i.bak -E 's#^(iceoryx2(-userland-record-and-replay)?) = \{ version = "[^"]*"#\1 = { git = "https://github.com/eclipse-iceoryx/iceoryx2", branch = "main"#' Cargo.toml
+      - run: git diff -- Cargo.toml
+      - run: cargo update
+      - run: cargo tree --all-features -i iceoryx2 --depth 0
+      # With a matching upstream CLI, also play an exported file with `iox2 service replay`.
+      - name: Install the matching iox2 CLI
+        if: matrix.iceoryx2 == 'latest-release'
+        run: |
+          cargo install --locked "iceoryx2-cli@$IOX2_VERSION"
+          echo "TICKERTAPE_REQUIRE_IOX2=1" >> "$GITHUB_ENV"
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo test --all-features

@@ -17,6 +17,9 @@ Think of it as a flight recorder for a trading system or any other latency-sensi
   you configure a retention policy; `tickertape archive` can move or delete old, checkpoint-covered segments.
 - The **`tickertape` CLI** tails, inspects, verifies and summarizes journals (`stats`), and exports them to
   JSONL or Parquet. Its `archive` command is the only command that changes a journal.
+- **Operational metrics** without a telemetry service: `tickertape status` (text, JSON or Prometheus text format, and
+  a health-check exit code) and `tickertape::status` report checkpoint age, what a power loss would remove now,
+  storage headroom, and the lag of readers that opt in.
 
 ![tickertape architecture: a writer process appends to segment files and a checkpoint marker in one journal directory; safe and zero-copy reader processes and the CLI read them; the CLI exports Parquet or JSONL for DuckDB and Python](docs/figures/architecture.svg)
 
@@ -134,10 +137,26 @@ python3 -c "import duckdb; print(duckdb.sql(\"SELECT kind, count(*), min(seq), m
 ```
 
 CLI reference, exit codes and the JSONL and Parquet schemas: [`docs/cli.md`](docs/cli.md).
-Choosing segment sizes and checkpoint intervals, archiving old segments and what to do after a crash:
+Choosing segment sizes and checkpoint intervals, archiving old segments, monitoring and what to do after a crash:
 [`docs/operations.md`](docs/operations.md).
-For direct, read-only access from Python without dependencies, see [`python/`](python/README.md).
-From C, C++ or another language through a C ABI (not stable before 1.0), see [`docs/c-api.md`](docs/c-api.md).
+From other languages:
+
+| Language | What | Status | Docs |
+|---|---|---|---|
+| C (and others through FFI) | C ABI: `libtickertape` and `tickertape.h` | not stable before 1.0 | [`docs/c-api.md`](docs/c-api.md) |
+| C++ | Header-only C++17 binding over the C ABI: `tickertape.hpp` (RAII handles, borrowed views, works without exceptions) | not stable before 1.0 | [`docs/cpp-api.md`](docs/cpp-api.md) |
+| Java (JDK 25+) | Binding over the C ABI with the Foreign Function and Memory API, in `bindings/java` | not yet on Maven Central | [`docs/java-api.md`](docs/java-api.md) |
+| Python | Read-only decoder without dependencies | | [`python/`](python/README.md) |
+
+## iceoryx2 integration
+
+[`integrations/iceoryx2`](integrations/iceoryx2/README.md) records one or several
+[iceoryx2](https://github.com/eclipse-iceoryx/iceoryx2) publish/subscribe services into a journal. Any tickertape
+reader follows the recording live without iceoryx2, `tickertape-iox2 replay` publishes it back onto iceoryx2 (renamed
+by default, at the recorded pace or as fast as possible), `tickertape export` writes it to Parquet, and
+`tickertape-iox2 export`/`import` convert to and from iceoryx2's own recording files. It is a separate crate with its
+own version (0.1.0, not yet published) and lockfile; its quick start and the byte layout of its records are in its
+README. Why iceoryx2: [ADR 0030](docs/decisions/0030-iceoryx2-integration.md).
 
 ## Guarantees, in short
 
@@ -154,7 +173,9 @@ The full statement, per platform and with the test for each claim, is [`docs/cra
   Readers that must not act on such records can use `ReaderConfig::durable_only(true)` (CLI: `--durable-only`),
   which only returns records covered by a checkpoint.
 - **Corruption is detected, never silently returned.** Every record is checked (length, CRC32C, sequence). Recovery
-  preserves anything it removes in `quarantine/` and never edits bytes in place.
+  repairs a corrupt tail by replacing its segment and moves disconnected segments aside, preserving both in
+  `quarantine/`. Some bytes after the last record are zeroed in place without a copy: usually a torn append that no
+  reader saw, but also damage that recovery cannot tell from one. See the crash contract, C8 and C11.
 - **Readers.** `Reader::open` reads with `pread` and is memory-safe whatever other processes do. Zero-copy
   `Reader::open_mapped` is `unsafe`: it requires that only a tickertape writer modifies the files.
 - **Known limits.** A full btrfs volume can crash the writer with `SIGBUS` even inside preallocated segments; a
@@ -175,7 +196,7 @@ own documentation for the current state.
 |---|---|---|
 | [Chronicle Queue](https://github.com/OpenHFT/Chronicle-Queue) | Mature Java persisted queue (open-source core) | Its Rust library is part of the commercial Enterprise edition and [requires a licence key](https://rustdoc.chronicle.software/chronicle/queue/index.html) |
 | [Aeron](https://aeron.io/) and [Aeron Archive](https://aeron.io/docs/aeron-archive/overview/) | Messaging transport with recording, replay and replication; Rust clients exist (e.g. [rusteron](https://crates.io/crates/rusteron-archive)) | Runs a separate media driver and covers networking and replication; much larger scope |
-| [iceoryx2](https://github.com/eclipse-iceoryx/iceoryx2) | Zero-copy shared-memory IPC in Rust | Live publish/subscribe; a retained, replayable file journal is not its focus. Could feed a tickertape recorder |
+| [iceoryx2](https://github.com/eclipse-iceoryx/iceoryx2) | Zero-copy shared-memory IPC in Rust | Live publish/subscribe; its own recorder writes one service per file, with no live readers of the recording. [`tickertape-iceoryx2`](integrations/iceoryx2/README.md) records iceoryx2 services into a tickertape journal and replays them |
 | [yaque](https://crates.io/crates/yaque), [queue-file](https://crates.io/crates/queue-file) | Disk-backed queues / FIFO files in Rust | Queue semantics (consume once) rather than independent readers replaying from any position |
 | [commitlog](https://crates.io/crates/commitlog), [okaywal](https://crates.io/crates/okaywal) | Rust append-only log and write-ahead log | Storage building blocks without a cross-process live-reader API |
 | [Databento DBN](https://github.com/databento/dbn) | Market-data encoding format with Rust and Python tooling | A data format, not a multi-reader journal; DBN records could be tickertape payloads |
@@ -185,8 +206,10 @@ Background research: [`docs/research/2026-10-31-market-review.md`](docs/research
 
 ## Project layout
 
-`crates/tickertape` (library) · `crates/tickertape-cli` (the `tickertape` binary) · `crates/tickertape-ffi` (C ABI
-and header) · `tests/` (cross-process and crash tests) · `fuzz/` · `benches/` · `examples/` · `docs/` (format, crash contract, decisions, playbooks).
+`crates/tickertape` (library) · `crates/tickertape-cli` (the `tickertape` binary) · `crates/tickertape-ffi` (C ABI,
+C header and C++ binding) · `bindings/java` (Java binding) · `tests/` (cross-process and crash tests) · `fuzz/` ·
+`benches/` · `examples/` · `integrations/iceoryx2` (separate crate) · `docs/` (format, crash contract, decisions,
+playbooks).
 Contributions: [`CONTRIBUTING.md`](CONTRIBUTING.md). Security issues: [`SECURITY.md`](SECURITY.md).
 
 ## Licence

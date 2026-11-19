@@ -4,7 +4,8 @@
 //! retention (moving old segments to an archive directory), injected storage-full roll failures (C9) and the
 //! occasional injected checkpoint failure (C12). It is killed with SIGKILL at random points, including during
 //! recovery (C1–C4), or stopped cleanly, and restarted. Between restarts the test sometimes damages the journal
-//! after the checkpoint (a flipped record byte, a truncated or damaged newest segment, or a damaged middle segment)
+//! after the checkpoint (a flipped record byte, a zeroed commit word, a truncated or damaged newest segment, or a
+//! damaged middle segment)
 //! and checks that recovery quarantines exactly what the crash contract says, byte for byte, or refuses without
 //! changing anything (C8, C11). Reader processes of both kinds (safe and mapped, visible and durable-only) follow the
 //! journal the whole time and must each see a gap-free, duplicate-free stream of records that pass their checksum and
@@ -15,9 +16,8 @@
 //!   replay the same decisions, though process timing still varies).
 //! - Disk use is bounded (retention, and the test deletes archived and quarantined files after checking them); the
 //!   run fails if the journal, archive and quarantine together exceed 64 MiB.
-//! - Known issue: durable-only readers can return records a repair removes (see
-//!   `tests/durable_only.rs::known_failure_durable_only_reader_returns_discarded_records_after_repair`); the run
-//!   counts and reports them, and fails on them with `TICKERTAPE_SOAK_STRICT=1`.
+//! - Durable-only readers must never return a record that a repair later removes (C13, ADR 0034); the run fails on
+//!   the first one.
 //! - On failure the journal, archive, logs and the seed are copied to `TICKERTAPE_SOAK_ARTIFACTS` (default
 //!   `target/tmp/soak-failures/`), and the panic message names the directory.
 //!
@@ -139,6 +139,9 @@ struct Chain {
     visited: Vec<(u64, PathBuf)>,
     /// Records from the scan start (the checkpoint, if any) to the end.
     uncovered: Vec<ChainRecord>,
+    /// Segments entered from an unsealed predecessor (killed between publishing a segment and sealing its
+    /// predecessor): `(base entered, predecessor, offset of the predecessor's empty slot)`.
+    unsealed: Vec<(u64, PathBuf, u64)>,
 }
 
 /// Walks the chain the way recovery does, from the checkpoint (or the oldest segment), without changing anything.
@@ -151,6 +154,7 @@ fn walk(dir: &Path) -> Result<Chain, String> {
             checkpoint: None,
             visited: Vec::new(),
             uncovered: Vec::new(),
+            unsealed: Vec::new(),
         });
     }
     let checkpoint = inspect::read_checkpoint(dir).map_err(|e| e.to_string())?;
@@ -168,6 +172,7 @@ fn walk(dir: &Path) -> Result<Chain, String> {
         checkpoint,
         visited: Vec::new(),
         uncovered: Vec::new(),
+        unsealed: Vec::new(),
     };
     loop {
         let path = dir.join(format::segment_file_name(base));
@@ -213,6 +218,7 @@ fn walk(dir: &Path) -> Result<Chain, String> {
                         && !chain.visited.iter().any(|v| v.0 == seq) =>
                 {
                     // Killed between publishing the next segment and sealing this one (C4).
+                    chain.unsealed.push((seq, path.clone(), offset));
                     base = seq;
                     offset = format::SEGMENT_HEADER_LEN as u64;
                     break;
@@ -237,7 +243,8 @@ fn walk(dir: &Path) -> Result<Chain, String> {
 enum Expect {
     /// Recover normally: `next_seq == end`, nothing quarantined.
     Clean { end: u64 },
-    /// A flipped byte in record `seq` at `offset` of `file`: repair that tail, quarantine every later segment.
+    /// A flipped byte or zeroed commit word in record `seq` at `offset` of `file`: repair that tail, quarantine every
+    /// later segment.
     Repair {
         file: String,
         offset: u64,
@@ -255,6 +262,9 @@ enum Expect {
         old_end: u64,
         damaged: Vec<u8>,
         how: &'static str,
+        /// The unsealed predecessor of `file` (killed between publishing `file` and sealing it), if any: its file name
+        /// and the end of its records, where its seal belongs.
+        unsealed_predecessor: Option<(String, u64)>,
     },
     /// A middle segment damaged: recovery must refuse and change no segment byte; then the test restores it.
     Refuse {
@@ -294,7 +304,6 @@ struct Counters {
     reader_records_from_discarded_history: u64,
     late_readers: u64,
     max_disk_bytes: u64,
-    known_durable_after_repair: u64,
 }
 
 struct ReaderProc {
@@ -489,17 +498,12 @@ impl Soak {
                                  (epoch {truth:?}) nor a range recovery discarded"
                             );
                         };
-                        if discarded && r.durable {
-                            // Known issue: tests/durable_only.rs::
-                            // known_failure_durable_only_reader_returns_discarded_records_after_repair. Every such
-                            // record is in a range a repair removed after the checkpoint (checked above); counted
-                            // and reported, and fatal with TICKERTAPE_SOAK_STRICT=1.
-                            assert!(
-                                std::env::var("TICKERTAPE_SOAK_STRICT").as_deref() != Ok("1"),
-                                "durable-only reader {who} returned records {a}..{b} that recovery later removed"
-                            );
-                            self.c.known_durable_after_repair += b - a;
-                        }
+                        // C13 (ADR 0034): a durable-only reader returns only checkpointed records, which no
+                        // repair removes.
+                        assert!(
+                            !(discarded && r.durable),
+                            "durable-only reader {who} returned records {a}..{b} that recovery later removed"
+                        );
                         if discarded {
                             self.c.reader_records_from_discarded_history += b - a;
                         } else {
@@ -967,6 +971,7 @@ impl Soak {
                     old_end,
                     damaged,
                     how,
+                    unsealed_predecessor,
                 },
                 Some(next),
             ) => {
@@ -974,7 +979,7 @@ impl Soak {
                     next, seq,
                     "writer {epoch}: after a {how} newest segment recovery continues at its base"
                 );
-                let (mut quarantined, mut completed) = (false, false);
+                let (mut quarantined, mut completed, mut preserved_seal) = (false, false, false);
                 for a in &actions {
                     match a[1].as_str() {
                         "quarantined" if a[2] == file => {
@@ -986,6 +991,37 @@ impl Soak {
                             quarantined = true;
                         }
                         "completed" if a[2] == file => completed = true,
+                        // Killed between the two stores of the predecessor's seal (its CRC word written, its marker
+                        // not): in front of a successor that no longer opens, recovery preserves that word and
+                        // replaces the predecessor (ADR 0035 → Damage around a seal), at the predecessor's end of
+                        // records, at most once. Nothing else may be repaired.
+                        "repaired" if a[2] != file && a[6] == format!("BrokenChain({seq})") => {
+                            assert!(
+                                !preserved_seal,
+                                "writer {epoch}: seal place repaired twice: {actions:?}"
+                            );
+                            preserved_seal = true;
+                            let (pred, end) = unsealed_predecessor.as_ref().unwrap_or_else(|| {
+                                panic!("writer {epoch}: {file} had no unsealed predecessor: {a:?}")
+                            });
+                            assert_eq!(
+                                (a[2].as_str(), a[3].parse::<u64>().unwrap()),
+                                (pred.as_str(), *end),
+                                "writer {epoch}: repaired at the predecessor's end of records"
+                            );
+                            let kept = fs::read(&a[5]).unwrap();
+                            let mut word = vec![0; 4];
+                            word.extend_from_slice(&format::seal_crc(seq).to_le_bytes());
+                            // The copy ends at the tail's last non-zero byte, and a CRC can end in zero bytes.
+                            while word.last() == Some(&0) {
+                                word.pop();
+                            }
+                            assert_eq!(
+                                kept, word,
+                                "writer {epoch}: preserved bytes in front of {file}"
+                            );
+                            self.c.quarantined_files_checked += 1;
+                        }
                         _ => self.count_benign(epoch, a),
                     }
                 }
@@ -1077,9 +1113,16 @@ impl Soak {
             let r: ChainRecord =
                 chain.uncovered[rng.below(chain.uncovered.len() as u64) as usize].clone();
             let mut image = fs::read(&r.path).unwrap();
-            // A byte of the body (after the commit word), so the record fails its checksum.
-            let at = r.offset as usize + 4 + rng.below(u64::from(r.len) - 4) as usize;
-            image[at] ^= 1 << rng.below(8);
+            // Zeroing the commit word of a record that has a successor hides committed records behind an empty slot
+            // (ADR 0035); the newest record's would look like a torn append, so it is never chosen for this.
+            let zero_word = pick < 3 && r.seq + 1 < chain.end;
+            if zero_word {
+                image[r.offset as usize..r.offset as usize + 4].fill(0);
+            } else {
+                // A byte of the body (after the commit word), so the record fails its checksum.
+                let at = r.offset as usize + 4 + rng.below(u64::from(r.len) - 4) as usize;
+                image[at] ^= 1 << rng.below(8);
+            }
             let later: Vec<(String, Vec<u8>)> = chain
                 .visited
                 .iter()
@@ -1101,7 +1144,12 @@ impl Soak {
                 tail: image[r.offset as usize..].to_vec(),
                 later,
             };
-            (r.path, r.offset, "flipped record byte")
+            let kind = if zero_word {
+                "zeroed commit word"
+            } else {
+                "flipped record byte"
+            };
+            (r.path, r.offset, kind)
         } else {
             let newest = chain.visited.last().unwrap().clone();
             let middle = after.len() > 1 && rng.below(3) == 0;
@@ -1128,24 +1176,28 @@ impl Soak {
             };
             let snapshot = segment_snapshot(&self.journal);
             replace_file(&path, &damaged, &self.root);
-            self.expect = if middle {
-                let mut snapshot = snapshot;
-                snapshot.insert(file.clone(), damaged);
-                Expect::Refuse {
-                    file,
-                    original,
-                    snapshot,
-                    end: chain.end,
-                }
-            } else {
-                Expect::Replace {
-                    file,
-                    seq: base,
-                    old_end: chain.end,
-                    damaged,
-                    how: if truncate { "truncated" } else { "damaged" },
-                }
-            };
+            self.expect =
+                if middle {
+                    let mut snapshot = snapshot;
+                    snapshot.insert(file.clone(), damaged);
+                    Expect::Refuse {
+                        file,
+                        original,
+                        snapshot,
+                        end: chain.end,
+                    }
+                } else {
+                    Expect::Replace {
+                        file,
+                        seq: base,
+                        old_end: chain.end,
+                        damaged,
+                        how: if truncate { "truncated" } else { "damaged" },
+                        unsealed_predecessor: chain.unsealed.iter().find(|u| u.0 == base).map(
+                            |u| (u.1.file_name().unwrap().to_string_lossy().into_owned(), u.2),
+                        ),
+                    }
+                };
             (path, 0, how)
         };
         *self.c.injected.entry(kind).or_default() += 1;
@@ -1233,15 +1285,6 @@ impl Soak {
             c.max_disk_bytes / 1024,
             DISK_LIMIT >> 20
         );
-        if c.known_durable_after_repair > 0 {
-            let _ = writeln!(
-                s,
-                "  KNOWN ISSUE: durable-only readers returned {} records that a repair later removed \
-                 (tests/durable_only.rs::known_failure_durable_only_reader_returns_discarded_records_after_repair; \
-                 TICKERTAPE_SOAK_STRICT=1 makes this fatal)",
-                c.known_durable_after_repair
-            );
-        }
         s
     }
 

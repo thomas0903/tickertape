@@ -11,7 +11,8 @@ and its reasons are in [ADR 0028](decisions/0028-c-abi.md).
 > [Versioning](#versioning).
 
 Examples: [`examples/c/`](../examples/c/README.md) (a C writer, a C reader that replays or follows live, and a C++
-example with a small RAII wrapper header, `tickertape.hpp`).
+example). **From C++, use the C++ binding** ([`cpp-api.md`](cpp-api.md)): the header-only `tickertape.hpp` next to
+`tickertape.h`, with RAII handles, borrowed record views and errors as values or exceptions.
 
 ```c
 #include "tickertape.h"
@@ -88,10 +89,18 @@ cc app.c $(pkg-config --cflags --libs tickertape) -o app
 The static library contains its own copy of the Rust standard library, so linking two Rust static libraries into one
 program can produce duplicate symbols; link one of them dynamically in that case.
 
-C++ uses the same header (it has `extern "C"` guards). [`examples/c/tickertape.hpp`](../examples/c/tickertape.hpp)
-is a header-only C++11 wrapper you can copy. `examples/c/Makefile` shows both link styles (`writer` links the static
-library, `reader` and `example` the shared one); `examples/c/CMakeLists.txt` links the shared library only, through
-pkg-config when the library is installed.
+**macOS: link the static library with Apple's toolchain defaults, or use the shared library.** The GCC driver
+(Homebrew `gcc`/`g++`) passes `-no_compact_unwind` to the linker. The library aborts an append whose fill callback
+returns non-zero by unwinding internally, and with `libtickertape.a` linked that way the unwind information is gone,
+so such an `append_with` ends the process inside the library. Shared linkage with either compiler, and the static
+library linked by Apple Clang (`cc`, `c++`), work. (The tests skip their statically linked programs in that
+configuration for this reason.)
+
+C++ can use the same header (it has `extern "C"` guards), but the C++ binding
+[`tickertape.hpp`](../crates/tickertape-ffi/include/tickertape.hpp) (C++17, header-only, [`cpp-api.md`](cpp-api.md))
+wraps it with RAII and is the supported way. `examples/c/Makefile` shows both link styles (`writer` links the static
+library, `reader` and `example` the shared one); `examples/c/CMakeLists.txt` links the shared library through the
+CMake package in `crates/tickertape-ffi/cmake/`, which finds the repository's build or an installed library.
 
 ## Conventions
 
@@ -152,7 +161,7 @@ pkg-config when the library is installed.
 non-zero reserved fields. A call on a handle that is already inside a call on the same thread (for example from a
 fill callback, see below) returns `TICKERTAPE_E_BUSY` and does nothing. **Using a handle after closing it, closing it
 twice, and calling into one handle from two threads at the same time are undefined behaviour and are not detected.**
-The C++ wrapper and language bindings should make these impossible by construction.
+The C++ binding (move-only handles) and other language bindings should make these impossible by construction.
 
 ## Writing
 
@@ -282,12 +291,22 @@ They behave like `errno`: successful calls leave them unchanged, so read them ri
 UTF-8: a file name that is not valid UTF-8 appears with its invalid bytes replaced (U+FFFD), so do not parse paths
 out of it.
 
+The corruption reasons are the `tickertape_corrupt_reason` values in the header, one for each core `CorruptReason`;
+new reasons get new values and existing values never change. A reason's detail (a sequence number, a length, a
+segment) is in the message only. Two reasons concern an empty commit word followed by what recovery treats as committed records (ADR 0035):
+`TICKERTAPE_CORRUPT_EMPTY_COMMIT_WORD` (14; the message names the sequence number the evidence carries: a later
+record's, a final seal's next sequence number or a later segment's base) and `TICKERTAPE_CORRUPT_UNCHECKED_TAIL`
+(15; the search stopped at its work bound before it could decide, and the writer treats the bytes as committed
+history all the same). `tickertape_verify` reports both as `first_problem_reason`; a writer opened with
+`TICKERTAPE_RECOVERY_FAIL` returns `TICKERTAPE_E_CORRUPT` with them.
+
 **Binding authors:** the state is per **operating-system thread**. A runtime that can move a task to another OS
 thread between two foreign calls (Go goroutines, Java virtual threads) can read another thread's state, or none. Read
 the details on the same OS thread, in the same foreign call sequence as the failing call: in Go, call through a small C
 function in the cgo preamble that makes the call and captures the code, message, OS error and corruption reason
-together (or hold `runtime.LockOSThread` across the call and the reads); in Java, read them in the same downcall
-sequence on a platform thread, or through such a C shim.
+together (or hold `runtime.LockOSThread` across the call and the reads); in Java, read them in the same sequence of
+downcalls, with no Java code in between that can block, as the Java binding does
+([ADR 0037](decisions/0037-java-binding.md)).
 
 | Code | Meaning |
 |---|---|
@@ -308,6 +327,7 @@ sequence on a platform thread, or through such a C shim.
 | `TICKERTAPE_E_ABORTED` | A fill callback returned non-zero (and the writer cleaned up) |
 | `TICKERTAPE_E_BUSY` | Re-entrant call on a handle that is already inside a call |
 | `TICKERTAPE_E_PANIC` | An internal error (a bug in tickertape) was caught; the handle is broken, close it |
+| `TICKERTAPE_E_BEACON_IN_USE` | A reader beacon's name is held by a running reader (no C function creates beacons yet) |
 | `TICKERTAPE_E_UNKNOWN` (-255) | An error this ABI version has no code for |
 
 ### A failed clean-up after an aborted fill
@@ -349,8 +369,9 @@ function catches panics and returns `TICKERTAPE_E_PANIC` (the library must be bu
   multithreaded process (as a process with a writer usually is, through its helper thread) may call only
   async-signal-safe functions until it calls `exec`, and opening a handle allocates memory: so a child opens its own
   handles only after `exec`, and a child that does not `exec` must not call any tickertape function. The library
-  opens files with close-on-exec, so `exec` releases an inherited writer lock, but a child that neither execs nor
-  exits keeps the journal locked.
+  opens files with close-on-exec, so `exec` closes the child's copy of the writer lock's descriptor, but a child that
+  neither execs nor exits keeps the journal locked once the parent has exited without closing the writer, for its
+  whole life if it never execs. Closing the writer in the parent releases the lock even while such a child exists.
 
 ## Inspection and retention
 
@@ -404,9 +425,9 @@ int compatible = tickertape_abi_version() == TICKERTAPE_ABI_VERSION &&
 
 ## Testing
 
-`cargo test -p tickertape-ffi` runs Rust tests of the exported functions and compiles and runs C99 and C++11 test
-programs (as C99 and C11) and C++ programs (as C++11 and C++20), and the examples against the committed header,
-including cross-language fixtures with the Rust reader and
+`cargo test -p tickertape-ffi` runs Rust tests of the exported functions and compiles and runs the C test program
+(as C99 and C11), a C++11 and C++20 check of the C header, the C++ binding's tests ([`cpp-api.md`](cpp-api.md) →
+Testing) and the examples against the committed headers, including cross-language fixtures with the Rust reader and
 the Python decoder ([`python/`](../python/README.md)). Set `TICKERTAPE_FFI_SANITIZE=1` to build the C programs with
 AddressSanitizer and UBSan, or `TICKERTAPE_FFI_VALGRIND=1` to run them under Valgrind. After changing the C ABI,
 regenerate the header with cbindgen 0.29.4 (the command is in `crates/tickertape-ffi/cbindgen.toml`); CI fails if it

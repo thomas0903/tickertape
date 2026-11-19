@@ -199,11 +199,13 @@ pub fn mixed_len(seq: u64) -> usize {
     }
 }
 
-/// Opens a writer, retrying briefly while the lock is held.
+/// Opens a writer, retrying briefly while the lock is held: only for reopening a journal right after its writer
+/// *process* was killed or exited.
 ///
-/// Rust opens files with close-on-exec, but a child process forked by a test running in parallel holds a copy of
-/// every open descriptor until it calls `exec`, including a just-dropped writer's lock. Tests that drop a writer and
-/// immediately reopen the journal use this to ride out that window.
+/// The OS then releases the lock only when the last copy of its descriptor closes. A child that the writer process
+/// itself had forked would hold such a copy until it called `exec` or exited (crash contract C3); the retry rides
+/// that out, and is only a margin when the writer process forks nothing. After a writer dropped in this process,
+/// use a plain [`Writer::open`]: the drop releases the lock at once.
 pub fn reopen_writer(dir: &Path, config: WriterConfig) -> Writer {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
@@ -213,5 +215,81 @@ pub fn reopen_writer(dir: &Path, config: WriterConfig) -> Writer {
             }
             other => return other.expect("reopen writer"),
         }
+    }
+}
+
+/// The segment holding record `seq` and the record's offset in it.
+pub fn locate_record(dir: &Path, seq: u64) -> (PathBuf, u64) {
+    let (base, path) = segments(dir)
+        .into_iter()
+        .rev()
+        .find(|(base, _)| *base <= seq)
+        .expect("a segment at or below seq");
+    let image = std::fs::read(&path).unwrap();
+    let (mut offset, mut at) = (format::SEGMENT_HEADER_LEN as u64, base);
+    while at < seq {
+        match format::read_slot(&image[..], offset, at) {
+            Ok(format::Slot::Record { next_offset, .. }) => offset = next_offset,
+            other => panic!("record {at} in {}: {other:?}", path.display()),
+        }
+        at += 1;
+    }
+    assert!(
+        matches!(
+            format::read_slot(&image[..], offset, seq),
+            Ok(format::Slot::Record { .. })
+        ),
+        "record {seq} in {}",
+        path.display()
+    );
+    (path, offset)
+}
+
+/// Makes record `seq` corrupt in the file that a later writer's recovery reads, without touching the file that open
+/// readers hold: writes a copy of the segment holding `seq` with one byte of the record's fields flipped (a checksum
+/// mismatch), and renames the copy over the segment. Readers that have the segment open keep valid bytes where
+/// recovery will find corruption, as when a reader's copy of a page outlives a storage failure (C11).
+pub fn corrupt_by_replacement(dir: &Path, seq: u64) {
+    let (path, offset) = locate_record(dir, seq);
+    let mut image = std::fs::read(&path).unwrap();
+    image[offset as usize + 20] ^= 0xff;
+    let tmp = dir.join("corrupt-replacement");
+    std::fs::write(&tmp, &image).unwrap();
+    std::fs::rename(&tmp, &path).unwrap();
+}
+
+/// Zeroes the commit word of record `seq` in the segment file itself (same inode), as storage damage that loses one
+/// word would (C11). If `seq` is the newest record, recovery can't tell this from a torn append (ADR 0035): it takes
+/// the record for the end of the committed records and zeroes the rest of the segment in place, so a later writer
+/// appends a different history into the same file. If committed records follow, recovery finds them and replaces
+/// the segment instead (`EmptyCommitWord`); for an in-place repair from an earlier record, see
+/// [`zero_commit_words_from`].
+pub fn zero_commit_word(dir: &Path, seq: u64) {
+    let (path, offset) = locate_record(dir, seq);
+    open_raw(&path).write_all_at(&[0; 4], offset).unwrap();
+}
+
+/// Zeroes the commit words of record `seq` and of every later record, in the segment file itself (same inode), as
+/// storage damage that loses those words would (C11). `seq` must be in the newest segment. No record after the first
+/// zeroed word then validates and no later segment exists, so recovery can't tell the damage from a torn append
+/// (ADR 0035): it takes record `seq` for the end of the committed records and zeroes the rest of the segment in
+/// place, so a later writer appends a different history into the same file. A safe reader that copied the old bytes
+/// into its read buffer before the damage still holds them.
+pub fn zero_commit_words_from(dir: &Path, seq: u64) {
+    let (path, mut offset) = locate_record(dir, seq);
+    assert_eq!(
+        segments(dir).last().map(|s| &s.1),
+        Some(&path),
+        "record {seq} is in the newest segment"
+    );
+    let image = std::fs::read(&path).unwrap();
+    let raw = open_raw(&path);
+    let mut at = seq;
+    while let Ok(format::Slot::Record { next_offset, .. }) =
+        format::read_slot(&image[..], offset, at)
+    {
+        raw.write_all_at(&[0; 4], offset).unwrap();
+        offset = next_offset;
+        at += 1;
     }
 }
