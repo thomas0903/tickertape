@@ -209,7 +209,8 @@ jobs:
           command: check
 
   miri:
-    name: miri (format code, C ABI)
+    # Also runs the C ABI's argument-handling tests. The name is a required status check on main; keep it.
+    name: miri (format code)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
