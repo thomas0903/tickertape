@@ -1,0 +1,184 @@
+package io.github.thomas0903.tickertape;
+
+import static io.github.thomas0903.tickertape.Memory.BYTE;
+import static java.lang.foreign.ValueLayout.JAVA_INT;
+import static java.lang.foreign.ValueLayout.JAVA_LONG;
+
+import java.lang.foreign.MemoryLayout.PathElement;
+import java.lang.foreign.MemorySegment;
+import java.nio.ByteBuffer;
+import java.util.Arrays;
+import java.util.Objects;
+
+/**
+ * Records collected for one {@link Writer#appendBatch} call, which appends them in order with one call into the
+ * library. Payloads are copied into the batch's own native memory when added, so the caller's arrays and buffers can
+ * be reused at once. Reuse a batch with {@link #clear()}. Not thread-safe.
+ *
+ * <p><b>Allocation.</b> An {@code add} that needs more room than the batch has (records or payload bytes) grows it,
+ * which allocates. Within its capacity, {@code add} allocates nothing, with one limit: {@code add(..., ByteBuffer)} of a
+ * buffer without an accessible array (a direct buffer, or a read-only heap buffer) builds a small wrapper object per
+ * call when the batch's payload capacity is above {@code Integer.MAX_VALUE - 8} bytes (more than a {@code ByteBuffer}
+ * can cover). So size the batch for its working load up front (the constructor's arguments), or let it grow once and
+ * reuse it.
+ *
+ * <pre>{@code
+ * AppendBatch batch = new AppendBatch();
+ * for (Quote q : quotes) {
+ *     batch.add(QUOTE, q.venueTs(), Tickertape.realtimeNs(), q.encoded());
+ * }
+ * long first = writer.appendBatch(batch);
+ * batch.clear();
+ * }</pre>
+ */
+public final class AppendBatch {
+    private static final long RECORD_SIZE = Signatures.NEW_RECORD.byteSize();
+    private static final long OFF_PAYLOAD = Signatures.NEW_RECORD.byteOffset(PathElement.groupElement("payload"));
+    private static final long OFF_LEN = Signatures.NEW_RECORD.byteOffset(PathElement.groupElement("payload_len"));
+    private static final long OFF_VENUE = Signatures.NEW_RECORD.byteOffset(PathElement.groupElement("venue_ts_ns"));
+    private static final long OFF_LOCAL = Signatures.NEW_RECORD.byteOffset(PathElement.groupElement("local_ts_ns"));
+    private static final long OFF_SCHEMA = Signatures.NEW_RECORD.byteOffset(PathElement.groupElement("schema_id"));
+    private static final long OFF_RESERVED = Signatures.NEW_RECORD.byteOffset(PathElement.groupElement("reserved"));
+
+    private MemorySegment records;
+    private MemorySegment payloads;
+    /** {@link #payloads} as a buffer, for copies from a direct buffer; null if it is too large for a ByteBuffer. */
+    private ByteBuffer payloadsBuffer;
+    private long[] offsets;
+    private int count;
+    private long used;
+
+    /** A batch with room for 64 records and 64 KiB of payload to start with; it grows as needed. */
+    public AppendBatch() {
+        this(64, 64 * 1024);
+    }
+
+    /** A batch with room for {@code records} records and {@code payloadBytes} bytes of payload; it grows as needed. */
+    public AppendBatch(int records, long payloadBytes) {
+        if (records < 1 || payloadBytes < 0) {
+            throw new IllegalArgumentException("records must be positive and payloadBytes not negative");
+        }
+        this.records = Memory.allocate(records * RECORD_SIZE);
+        this.payloads = Memory.allocate(payloadBytes);
+        this.payloadsBuffer = asBuffer(payloads);
+        this.offsets = new long[records];
+    }
+
+    /** The number of records added since the last {@link #clear()}. */
+    public int size() {
+        return count;
+    }
+
+    /** The total payload bytes added since the last {@link #clear()}. */
+    public long payloadBytes() {
+        return used;
+    }
+
+    /** Removes every record, keeping the memory for reuse. */
+    public void clear() {
+        count = 0;
+        used = 0;
+    }
+
+    /** Adds a record whose payload is all of {@code payload}. */
+    public AppendBatch add(int schemaId, long venueTsNs, long localTsNs, byte[] payload) {
+        return add(schemaId, venueTsNs, localTsNs, payload, 0, payload.length);
+    }
+
+    /**
+     * Adds a record whose payload is {@code length} bytes of {@code payload} from {@code offset}. If copying the
+     * payload throws, the batch is unchanged (so are the other {@code add} methods).
+     */
+    public AppendBatch add(int schemaId, long venueTsNs, long localTsNs, byte[] payload, int offset, int length) {
+        Objects.checkFromIndexSize(offset, length, payload.length);
+        long at = reserve(length);
+        MemorySegment.copy(payload, offset, payloads, BYTE, at, length);
+        return entry(schemaId, venueTsNs, localTsNs, at, length);
+    }
+
+    /**
+     * Adds a record whose payload is all of {@code payload} (heap or native). A segment that cannot be read here (its
+     * arena is closed, or it is confined to another thread) throws and leaves the batch unchanged.
+     */
+    public AppendBatch add(int schemaId, long venueTsNs, long localTsNs, MemorySegment payload) {
+        long length = payload.byteSize();
+        long at = reserve(length);
+        MemorySegment.copy(payload, 0, payloads, at, length);
+        return entry(schemaId, venueTsNs, localTsNs, at, length);
+    }
+
+    /**
+     * Adds a record whose payload is the bytes between {@code payload}'s position and limit; the buffer is not changed.
+     * A buffer that cannot be read (a direct buffer over a closed arena) throws and leaves the batch unchanged. For a
+     * buffer without an accessible array (a direct or a read-only heap buffer) this allocates nothing only while the
+     * batch's payload capacity is at most {@code Integer.MAX_VALUE - 8} bytes (see the class documentation).
+     */
+    public AppendBatch add(int schemaId, long venueTsNs, long localTsNs, ByteBuffer payload) {
+        int length = payload.remaining();
+        long at = reserve(length);
+        if (payload.hasArray()) {
+            MemorySegment.copy(payload.array(), payload.arrayOffset() + payload.position(), payloads, BYTE, at, length);
+        } else if (payloadsBuffer != null) {
+            payloadsBuffer.put((int) at, payload, payload.position(), length); // no wrapper object per call
+        } else {
+            MemorySegment.copy(MemorySegment.ofBuffer(payload), 0, payloads, at, length);
+        }
+        return entry(schemaId, venueTsNs, localTsNs, at, length);
+    }
+
+    private static ByteBuffer asBuffer(MemorySegment segment) {
+        return segment.byteSize() <= Integer.MAX_VALUE - 8 ? segment.asByteBuffer() : null;
+    }
+
+    /**
+     * Makes room for one more record of {@code length} payload bytes and returns where its payload goes. Changes
+     * nothing that {@link #size()} or {@link #payloadBytes()} report: {@link #entry} commits the record once its
+     * payload is copied, so a copy that throws leaves the batch as it was (with room to spare).
+     */
+    private long reserve(long length) {
+        if (count == offsets.length) {
+            int n = Math.multiplyExact(offsets.length, 2);
+            MemorySegment bigger = Memory.allocate(n * RECORD_SIZE);
+            bigger.copyFrom(records.asSlice(0, count * RECORD_SIZE));
+            records = bigger;
+            offsets = Arrays.copyOf(offsets, n);
+        }
+        long need = Math.addExact(used, length);
+        if (need > payloads.byteSize()) {
+            long size = Math.max(need, Math.multiplyExact(payloads.byteSize(), 2));
+            MemorySegment bigger = Memory.allocate(size);
+            MemorySegment.copy(payloads, 0, bigger, 0, used);
+            payloads = bigger;
+            payloadsBuffer = asBuffer(bigger);
+        }
+        return used;
+    }
+
+    /** Commits the record whose payload {@link #reserve} placed at {@code at} and the caller has copied there. */
+    private AppendBatch entry(int schemaId, long venueTsNs, long localTsNs, long at, long length) {
+        long base = count * RECORD_SIZE;
+        records.set(JAVA_LONG, base + OFF_LEN, length);
+        records.set(JAVA_LONG, base + OFF_VENUE, venueTsNs);
+        records.set(JAVA_LONG, base + OFF_LOCAL, localTsNs);
+        records.set(JAVA_INT, base + OFF_SCHEMA, schemaId);
+        records.set(JAVA_INT, base + OFF_RESERVED, 0);
+        offsets[count++] = at;
+        used = at + length;
+        return this;
+    }
+
+    /** Writes each record's payload pointer (the payload memory may have moved since it was added). */
+    MemorySegment prepare() {
+        long base = payloads.address();
+        for (int i = 0; i < count; i++) {
+            // A pointer is 8 bytes on every supported platform (checked at load); writing it as a long allocates nothing.
+            records.set(JAVA_LONG, i * RECORD_SIZE + OFF_PAYLOAD, base + offsets[i]);
+        }
+        return records;
+    }
+
+    /** Keeps the payload memory reachable during the call that uses the pointers {@link #prepare()} wrote. */
+    MemorySegment payloadMemory() {
+        return payloads;
+    }
+}

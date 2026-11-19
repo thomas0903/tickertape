@@ -51,6 +51,7 @@ python3 .github/scripts/check_abi_baseline.py crates/tickertape-ffi/abi/tickerta
 python3 -m unittest discover -s .github/scripts -p 'test_*.py'  # release and ABI tooling
 tests/compat/generate.sh --check-old-readers                 # released readers on new journals (ADR 0033)
 go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12    # workflow lint
+bindings/java/scripts/build-native.sh && mvn -f bindings/java/pom.xml verify   # Java binding (JDK 25)
 ```
 
 `cargo test --workspace` compiles and runs C and C++ programs, so it needs a C/C++ compiler; it also runs the
