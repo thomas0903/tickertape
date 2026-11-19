@@ -20,6 +20,9 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 - Release operations: `release.py prepare` also checks the Python bindings' version and lockfile against the tag, and
   resolves only `refs/tags/<tag>`, so a branch named like a release tag is refused; the release workflows check out
   the fully qualified tag. The release checklist adds a `v*` tag ruleset and required reviewers for `pypi`.
+- Benchmarks: the test of a lagging reader under retention no longer depends on machine speed (it failed on
+  macOS CI runners), and `tt-sustained` readers retry a seek when retention removes the segment they were about to
+  open.
 - Benchmarks: sustained workloads (ADR 0026). `tt-sustained` runs one writer and any mix of safe/mapped,
   visible/durable-only and lagging reader processes for a fixed duration (default 10 minutes) with steady, bursty or
   unpaced traffic, periodic checkpoints, segment rolls and writer retention, and reports latency percentiles, late
