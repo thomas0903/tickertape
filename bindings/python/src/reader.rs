@@ -155,6 +155,31 @@ impl Columns {
         }
     }
 
+    /// Empties the columns, keeping their capacity (unless it is large).
+    fn clear(&mut self) {
+        if self.data.capacity() > 1 << 20 || self.seq.capacity() > 1 << 16 {
+            *self = Columns::with_capacity(0);
+            return;
+        }
+        self.len = 0;
+        self.seq.clear();
+        self.schema_id.clear();
+        self.venue_ts_ns.clear();
+        self.local_ts_ns.clear();
+        self.offsets.clear();
+        self.offsets.extend_from_slice(&0i64.to_le_bytes());
+        self.data.clear();
+    }
+
+    /// Room for `n` more records (payload bytes excluded).
+    fn reserve(&mut self, n: usize) {
+        self.seq.reserve(n * 8);
+        self.schema_id.reserve(n * 4);
+        self.venue_ts_ns.reserve(n * 8);
+        self.local_ts_ns.reserve(n * 8);
+        self.offsets.reserve(n * 8);
+    }
+
     fn push(&mut self, r: &CoreRecord<'_>) {
         self.push_fields(r.seq, r.schema_id, r.venue_ts_ns, r.local_ts_ns, r.payload);
     }
@@ -245,18 +270,38 @@ impl Buffer {
         (!self.is_empty()).then(|| Columns::u64_at(&self.columns.seq, self.start))
     }
 
+    /// Empties the buffer, keeping its capacity for the next read.
+    fn reset(&mut self) {
+        self.columns.clear();
+        self.start = 0;
+    }
+
     /// Takes up to `max` records from the front.
     fn take(&mut self, max: usize) -> Columns {
         let n = max.min(self.columns.len - self.start);
         if self.start == 0 && n == self.columns.len {
-            return std::mem::replace(self, Buffer::new()).columns;
+            return std::mem::replace(&mut self.columns, Columns::with_capacity(0));
         }
         let out = self.columns.slice(self.start, self.start + n);
         self.start += n;
         if self.is_empty() {
-            *self = Buffer::new();
+            self.reset();
         }
         out
+    }
+
+    /// Takes the first record, as a `Record`. Allocates only the payload's `bytes`, which the garbage collector does
+    /// not track, so no Python code can run (this is called with the reader's lock held).
+    fn take_one(&mut self, py: Python<'_>) -> Option<Record> {
+        if self.is_empty() {
+            return None;
+        }
+        let record = self.columns.record(py, self.start);
+        self.start += 1;
+        if self.is_empty() {
+            self.reset();
+        }
+        Some(record)
     }
 }
 
@@ -483,11 +528,9 @@ impl State {
         if !self.buffer.is_empty() || self.pending.is_some() {
             return true;
         }
-        self.buffer = Buffer {
-            columns: Columns::with_capacity(max.min(4096)),
-            start: 0,
-        };
+        self.buffer.reset();
         let columns = &mut self.buffer.columns;
+        columns.reserve(max.min(4096));
         if let Some(e) = drain(&mut self.reader, columns, max) {
             self.pending = Some(e);
             return true;
@@ -512,14 +555,26 @@ impl State {
         }
     }
 
-    /// Takes up to `max` buffered records; with none buffered, the held-back error. Runs no Python code.
-    fn take(&mut self, max: usize) -> Result<Columns, tickertape::Error> {
+    /// Takes up to `max` buffered records; with none buffered, the held-back error; `None` if there is neither.
+    /// Runs no Python code.
+    fn take(&mut self, max: usize) -> Result<Option<Columns>, tickertape::Error> {
         if !self.buffer.is_empty() {
-            Ok(self.buffer.take(max))
+            Ok(Some(self.buffer.take(max)))
         } else if let Some(e) = self.pending.take() {
             Err(e)
         } else {
-            Ok(Columns::with_capacity(0))
+            Ok(None)
+        }
+    }
+
+    /// Like `take(1)`, as a `Record` (see `Buffer::take_one`).
+    fn take_one(&mut self, py: Python<'_>) -> Result<Option<Record>, tickertape::Error> {
+        if let Some(record) = self.buffer.take_one(py) {
+            Ok(Some(record))
+        } else if let Some(e) = self.pending.take() {
+            Err(e)
+        } else {
+            Ok(None)
         }
     }
 }
@@ -577,23 +632,32 @@ impl Reader {
         detach: bool,
         f: impl FnOnce(&mut State) -> R + Send,
     ) -> Option<R> {
-        let run = |state: &mut State| {
+        if !detach {
+            return self.locked_attached(py, f);
+        }
+        self.contenders.fetch_add(1, Ordering::AcqRel);
+        py.detach(|| {
+            let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+            self.contenders.fetch_sub(1, Ordering::AcqRel);
+            guard.as_mut().map(|state| {
+                let result = f(state);
+                self.position.store(state.position(), Ordering::Release);
+                result
+            })
+        })
+    }
+
+    /// Like `locked` with the GIL held throughout. `f` must not run Python code (it may create objects that the
+    /// garbage collector does not track).
+    fn locked_attached<R>(&self, py: Python<'_>, f: impl FnOnce(&mut State) -> R) -> Option<R> {
+        self.contenders.fetch_add(1, Ordering::AcqRel);
+        let mut guard = lock(py, &self.inner);
+        self.contenders.fetch_sub(1, Ordering::AcqRel);
+        guard.as_mut().map(|state| {
             let result = f(state);
             self.position.store(state.position(), Ordering::Release);
             result
-        };
-        self.contenders.fetch_add(1, Ordering::AcqRel);
-        if detach {
-            py.detach(|| {
-                let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
-                self.contenders.fetch_sub(1, Ordering::AcqRel);
-                guard.as_mut().map(run)
-            })
-        } else {
-            let mut guard = lock(py, &self.inner);
-            self.contenders.fetch_sub(1, Ordering::AcqRel);
-            guard.as_mut().map(run)
-        }
+        })
     }
 
     /// Between two wait slices: lets callers queued for the lock take it first, for at most `HAND_OFF`, with the GIL
@@ -617,10 +681,16 @@ impl Reader {
     /// are buffered and before they are taken: if a handler raises (`KeyboardInterrupt`), the records stay buffered
     /// and the next read returns them. A record taken by another thread (or by a read in a signal handler) meanwhile
     /// is that call's; this one keeps waiting.
-    fn read(&self, py: Python<'_>, max: usize, timeout: Timeout) -> PyResult<Columns> {
+    fn read<T>(
+        &self,
+        py: Python<'_>,
+        max: usize,
+        timeout: Timeout,
+        mut take: impl FnMut(&mut State) -> Result<Option<T>, tickertape::Error>,
+    ) -> PyResult<Option<T>> {
         self.check(py)?;
         if max == 0 {
-            return Ok(Columns::with_capacity(0));
+            return Ok(None);
         }
         let no_wait = timeout == Timeout::ZERO;
         let deadline = timeout.deadline(Instant::now());
@@ -656,25 +726,30 @@ impl Reader {
                 // Run signal handlers before anything leaves the buffer (see above).
                 py.check_signals()?;
                 match self
-                    .locked(py, false, |s| s.take(max))
+                    .locked_attached(py, &mut take)
                     .ok_or_else(|| closed(waited))?
                 {
-                    Ok(columns) if columns.len > 0 => return Ok(columns),
-                    Ok(_) => {} // taken by another thread or a signal handler
+                    Ok(Some(taken)) => return Ok(Some(taken)),
+                    Ok(None) => {} // taken by another thread or a signal handler
                     Err(e) => return Err(errors::to_py(py, &e)),
                 }
             } else if !slice.is_zero() {
                 py.check_signals()?;
             }
             if no_wait || deadline.is_some_and(|d| Instant::now() >= d) {
-                return Ok(Columns::with_capacity(0));
+                return Ok(None);
             }
         }
     }
 
     fn read_one(&self, py: Python<'_>, timeout: Timeout) -> PyResult<Option<Record>> {
-        let columns = self.read(py, 1, timeout)?;
-        Ok((columns.len > 0).then(|| columns.record(py, 0)))
+        self.read(py, 1, timeout, |s| s.take_one(py))
+    }
+
+    fn read_columns(&self, py: Python<'_>, max: usize, timeout: Timeout) -> PyResult<Columns> {
+        Ok(self
+            .read(py, max, timeout, |s| s.take(max))?
+            .unwrap_or_else(|| Columns::with_capacity(0)))
     }
 }
 
@@ -761,7 +836,7 @@ impl Reader {
         max_records: usize,
         timeout: Timeout,
     ) -> PyResult<Py<PyList>> {
-        let columns = self.read(py, max_records, timeout)?;
+        let columns = self.read_columns(py, max_records, timeout)?;
         let list = PyList::empty(py);
         for i in 0..columns.len {
             list.append(columns.record(py, i))?;
@@ -780,7 +855,7 @@ impl Reader {
         max_records: usize,
         timeout: Timeout,
     ) -> PyResult<RecordBatch> {
-        let columns = self.read(py, max_records, timeout)?;
+        let columns = self.read_columns(py, max_records, timeout)?;
         Ok(RecordBatch::from_columns(py, &columns))
     }
 
