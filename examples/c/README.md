@@ -4,8 +4,9 @@ Programs that use the tickertape C ABI (`crates/tickertape-ffi`, documented in [
 
 - `writer.c`: records events, checkpointing every 100 records and at the end.
 - `reader.c`: replays a journal (`replay`), or follows it live from another process (`follow`).
-- `example.cpp` with `tickertape.hpp`: a small header-only C++11 RAII wrapper (exceptions for errors, handles freed
-  by destructors, a lambda for zero-copy appends) and a record-and-replay example.
+- `example.cpp`: the same with the C++ binding (`crates/tickertape-ffi/include/tickertape.hpp`, C++17,
+  [`docs/cpp-api.md`](../../docs/cpp-api.md)): `record`, `follow` live from another process, and `replay` with batch
+  reads, handling errors as values (it also builds with `-fno-exceptions`).
 
 Build the library, then the examples, from the repository root:
 
@@ -22,7 +23,11 @@ examples/c/writer /tmp/tt-c 20 50            # 20 records, one every 50 ms
 wait
 examples/c/reader /tmp/tt-c replay 10        # records 10..19
 TICKERTAPE_DURABLE_ONLY=1 examples/c/reader /tmp/tt-c replay
-examples/c/example /tmp/tt-c
+
+examples/c/example /tmp/tt-cpp follow 20 &   # the same with the C++ binding
+examples/c/example /tmp/tt-cpp record 20 50
+wait
+examples/c/example /tmp/tt-cpp replay 10
 ```
 
 `tests/c_api.rs` in `crates/tickertape-ffi` builds and runs these examples in CI.

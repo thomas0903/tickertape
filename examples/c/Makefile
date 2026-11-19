@@ -1,5 +1,6 @@
 # Builds the C and C++ examples against the library from `cargo build --release -p tickertape-ffi`, run from the
-# repository root. `writer` links the static library, `reader` and `example` the shared one.
+# repository root. `writer` links the static library, `reader` and `example` the shared one. `example` uses the C++
+# binding, crates/tickertape-ffi/include/tickertape.hpp (C++17).
 #
 #   make -C examples/c              # or: make -C examples/c PROFILE=debug
 #
@@ -18,7 +19,7 @@ STATIC_LIBS = -lgcc_s -lutil -lrt -lpthread -lm -ldl -lc
 endif
 
 CFLAGS ?= -std=c99 -O2 -Wall -Wextra -pedantic
-CXXFLAGS ?= -std=c++11 -O2 -Wall -Wextra -pedantic
+CXXFLAGS ?= -std=c++17 -O2 -Wall -Wextra -pedantic
 RPATH = -Wl,-rpath,$(abspath $(LIBDIR))
 
 all: writer reader example
@@ -29,8 +30,8 @@ writer: writer.c
 reader: reader.c
 	$(CC) $(CFLAGS) -I$(INCLUDE) $< -L$(LIBDIR) -ltickertape $(RPATH) -o $@
 
-example: example.cpp tickertape.hpp
-	$(CXX) $(CXXFLAGS) -I$(INCLUDE) -I. $< -L$(LIBDIR) -ltickertape $(RPATH) -o $@
+example: example.cpp $(INCLUDE)/tickertape.hpp
+	$(CXX) $(CXXFLAGS) -I$(INCLUDE) $< -L$(LIBDIR) -ltickertape $(RPATH) -o $@
 
 clean:
 	rm -f writer reader example

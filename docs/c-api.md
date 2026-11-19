@@ -11,7 +11,8 @@ and its reasons are in [ADR 0028](decisions/0028-c-abi.md).
 > [Versioning](#versioning).
 
 Examples: [`examples/c/`](../examples/c/README.md) (a C writer, a C reader that replays or follows live, and a C++
-example with a small RAII wrapper header, `tickertape.hpp`).
+example). **From C++, use the C++ binding** ([`cpp-api.md`](cpp-api.md)): the header-only `tickertape.hpp` next to
+`tickertape.h`, with RAII handles, borrowed record views and errors as values or exceptions.
 
 ```c
 #include "tickertape.h"
@@ -88,10 +89,18 @@ cc app.c $(pkg-config --cflags --libs tickertape) -o app
 The static library contains its own copy of the Rust standard library, so linking two Rust static libraries into one
 program can produce duplicate symbols; link one of them dynamically in that case.
 
-C++ uses the same header (it has `extern "C"` guards). [`examples/c/tickertape.hpp`](../examples/c/tickertape.hpp)
-is a header-only C++11 wrapper you can copy. `examples/c/Makefile` shows both link styles (`writer` links the static
-library, `reader` and `example` the shared one); `examples/c/CMakeLists.txt` links the shared library only, through
-pkg-config when the library is installed.
+**macOS: link the static library with Apple's toolchain defaults, or use the shared library.** The GCC driver
+(Homebrew `gcc`/`g++`) passes `-no_compact_unwind` to the linker. The library aborts an append whose fill callback
+returns non-zero by unwinding internally, and with `libtickertape.a` linked that way the unwind information is gone,
+so such an `append_with` ends the process inside the library. Shared linkage with either compiler, and the static
+library linked by Apple Clang (`cc`, `c++`), work. (The tests skip their statically linked programs in that
+configuration for this reason.)
+
+C++ can use the same header (it has `extern "C"` guards), but the C++ binding
+[`tickertape.hpp`](../crates/tickertape-ffi/include/tickertape.hpp) (C++17, header-only, [`cpp-api.md`](cpp-api.md))
+wraps it with RAII and is the supported way. `examples/c/Makefile` shows both link styles (`writer` links the static
+library, `reader` and `example` the shared one); `examples/c/CMakeLists.txt` links the shared library through the
+CMake package in `crates/tickertape-ffi/cmake/`, which finds the repository's build or an installed library.
 
 ## Conventions
 
@@ -152,7 +161,7 @@ pkg-config when the library is installed.
 non-zero reserved fields. A call on a handle that is already inside a call on the same thread (for example from a
 fill callback, see below) returns `TICKERTAPE_E_BUSY` and does nothing. **Using a handle after closing it, closing it
 twice, and calling into one handle from two threads at the same time are undefined behaviour and are not detected.**
-The C++ wrapper and language bindings should make these impossible by construction.
+The C++ binding (move-only handles) and other language bindings should make these impossible by construction.
 
 ## Writing
 
@@ -415,9 +424,9 @@ int compatible = tickertape_abi_version() == TICKERTAPE_ABI_VERSION &&
 
 ## Testing
 
-`cargo test -p tickertape-ffi` runs Rust tests of the exported functions and compiles and runs C99 and C++11 test
-programs (as C99 and C11) and C++ programs (as C++11 and C++20), and the examples against the committed header,
-including cross-language fixtures with the Rust reader and
+`cargo test -p tickertape-ffi` runs Rust tests of the exported functions and compiles and runs the C test program
+(as C99 and C11), a C++11 and C++20 check of the C header, the C++ binding's tests ([`cpp-api.md`](cpp-api.md) →
+Testing) and the examples against the committed headers, including cross-language fixtures with the Rust reader and
 the Python decoder ([`python/`](../python/README.md)). Set `TICKERTAPE_FFI_SANITIZE=1` to build the C programs with
 AddressSanitizer and UBSan, or `TICKERTAPE_FFI_VALGRIND=1` to run them under Valgrind. After changing the C ABI,
 regenerate the header with cbindgen 0.29.4 (the command is in `crates/tickertape-ffi/cbindgen.toml`); CI fails if it
