@@ -71,6 +71,10 @@ name = "retention"
 path = "retention.rs"
 
 [[test]]
+name = "reader_retention_stress"
+path = "reader_retention_stress.rs"
+
+[[test]]
 name = "compat"
 path = "compat.rs"
 

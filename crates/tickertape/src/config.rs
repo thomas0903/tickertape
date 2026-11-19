@@ -204,6 +204,16 @@ impl ReaderConfig {
     /// consuming the record, and `next_timeout` polls until a checkpoint covers it or the timeout expires.
     /// If the writer never checkpoints, this reader returns nothing.
     ///
+    /// A marker describes the journal's current files. When a refreshed marker covers records past the cursor, the
+    /// reader first confirms that its segment's path still names the file it has open (one `stat`, only then, never
+    /// per record). If recovery replaced that segment or retention removed it, the reader returns
+    /// [`Error::Discarded`](crate::Error::Discarded) rather than read records the marker doesn't vouch for; call
+    /// [`Reader::seek`](crate::Reader::seek) to continue. If the check passes, the reader reads the records the marker
+    /// newly covers from the file's current bytes, not from what it had read ahead before, so recovery removing
+    /// records after the checkpoint in place (in the same file) can't make it return them. A reader overtaken by
+    /// retention may therefore learn of the removal when the checkpoint moves past its cursor, before the end of the
+    /// removed segment (ADR 0034).
+    ///
     /// See ADR 0010 (`docs/decisions/0010-durable-only-reads.md` in the repository) and crash contract C13
     /// (`docs/crash-contract.md`), including its storage assumptions. The marker is read from the file, never mapped, and cached until needed.
     ///

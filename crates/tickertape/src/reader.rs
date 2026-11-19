@@ -22,6 +22,8 @@ const CHUNK: usize = 64 * 1024;
 const NOTIFY_MAX_WAIT: Duration = Duration::from_millis(100);
 /// Re-reads before a validation failure is reported as corruption (the copy may predate the commit).
 const VALIDATION_RETRIES: u32 = 3;
+/// Listings `open` and `seek` make when the segment they chose disappears before they can open it.
+const LISTING_ATTEMPTS: u32 = 8;
 
 /// An independent cursor over a journal, in this or another process.
 ///
@@ -58,6 +60,10 @@ pub struct Reader {
     next_seq: u64,
     /// Exclusive checkpoint boundary, refreshed only when durable-only reads reach it.
     durable_next_seq: u64,
+    /// The segment the marker that set `durable_next_seq` names (0 if there was no valid marker).
+    durable_segment_base: u64,
+    /// When a durable-only reader waiting at the checkpoint last checked a segment that the marker has moved past.
+    superseded_checked: Option<Instant>,
     /// Records before this are skipped (set by `seek`).
     skip_until: u64,
     /// `pread` buffer: bytes of `seg` starting at file offset `buf_start`.
@@ -71,6 +77,7 @@ pub struct Reader {
 
 #[derive(Debug)]
 struct OpenSegment {
+    base: u64,
     path: PathBuf,
     size: u64,
     file: File,
@@ -98,6 +105,11 @@ enum SlotOutcome {
 
 impl Reader {
     /// Opens the journal in `dir`, positioned at the first record of the oldest segment.
+    ///
+    /// If retention removes the oldest segment while the reader opens it, the reader opens the oldest segment that
+    /// remains; it doesn't report the removed file. A directory listing that comes back empty while retention runs
+    /// (on btrfs a listing omits segments created after it started, so it can miss every segment) is listed again
+    /// rather than reported as [`Error::NotFound`].
     ///
     /// # Errors
     ///
@@ -160,13 +172,12 @@ impl Reader {
     }
 
     fn open_inner(dir: &Path, config: ReaderConfig, mapped: bool) -> Result<Reader> {
-        let segments = journal::list_segments(dir)?;
-        let Some((base, _)) = segments.first() else {
-            return Err(Error::NotFound {
+        let (base, seg) = open_listed(dir, mapped, |segments| match segments.first() {
+            Some((base, _)) => Ok(*base),
+            None => Err(Error::NotFound {
                 dir: dir.to_path_buf(),
-            });
-        };
-        let seg = open_segment(dir, *base, mapped)?;
+            }),
+        })?;
         let waker = config.notify.then(|| crate::notify::Waker::new(dir));
         Ok(Reader {
             dir: dir.to_path_buf(),
@@ -174,9 +185,11 @@ impl Reader {
             mapped,
             seg,
             offset: format::SEGMENT_HEADER_LEN as u64,
-            next_seq: *base,
+            next_seq: base,
             durable_next_seq: 0,
-            skip_until: *base,
+            durable_segment_base: 0,
+            superseded_checked: None,
+            skip_until: base,
             buf: Vec::new(),
             buf_start: 0,
             waker,
@@ -190,29 +203,40 @@ impl Reader {
     /// writer gets there, and records before `seq` are skipped. Every record on the way is validated, so the reader
     /// only lands on positions along the journal's current chain.
     ///
+    /// Retention may remove the segment holding `seq` while `seek` runs (between listing the segments and opening
+    /// the chosen one). `seek` then lists the segments again, so it returns [`Error::SeqUnavailable`] with the new
+    /// oldest sequence number, never an I/O error for the removed file. A segment removed just after `seek`
+    /// returns is still read, and the reader returns [`Error::Discarded`] at its end, as for any removed segment; a
+    /// durable-only reader may get it earlier, when the checkpoint moves past its position (ADR 0034).
+    ///
     /// # Errors
     ///
-    /// [`Error::SeqUnavailable`] if `seq` is older than the oldest segment;
-    /// [`Error::Corrupt`] or [`Error::Io`] while locating it.
+    /// [`Error::SeqUnavailable`] if `seq` is older than the oldest segment, including when retention removes it
+    /// during the call;
+    /// [`Error::Corrupt`] or [`Error::Io`] while locating it. An I/O "not found" error for a segment that `seek`
+    /// listed is returned only if the chosen segment disappeared on each of 8 listings in a row.
     pub fn seek(&mut self, seq: u64) -> Result<()> {
-        let segments = journal::list_segments(&self.dir)?;
-        let Some((first, _)) = segments.first() else {
-            return Err(Error::NotFound {
-                dir: self.dir.clone(),
-            });
-        };
-        let Some((base, _)) = segments.iter().rev().find(|(b, _)| *b <= seq) else {
-            return Err(Error::SeqUnavailable {
-                requested: seq,
-                first: *first,
-            });
-        };
-        self.seg = open_segment(&self.dir, *base, self.mapped)?;
+        let (base, seg) = open_listed(&self.dir, self.mapped, |segments| {
+            let Some((first, _)) = segments.first() else {
+                return Err(Error::NotFound {
+                    dir: self.dir.clone(),
+                });
+            };
+            match segments.iter().rev().find(|(b, _)| *b <= seq) {
+                Some((base, _)) => Ok(*base),
+                None => Err(Error::SeqUnavailable {
+                    requested: seq,
+                    first: *first,
+                }),
+            }
+        })?;
+        self.seg = seg;
         self.offset = format::SEGMENT_HEADER_LEN as u64;
-        self.next_seq = *base;
+        self.next_seq = base;
         self.skip_until = seq;
         self.buf.clear();
         self.waiting_since = None;
+        self.superseded_checked = None;
         Ok(())
     }
 
@@ -220,15 +244,28 @@ impl Reader {
     ///
     /// `Ok(None)` means there is no new record yet. Follows seals into the next segment transparently.
     /// With [`ReaderConfig::durable_only`] enabled, records wait at the cursor until covered by a checkpoint;
-    /// a missing or invalid checkpoint marker covers no records.
+    /// a missing or invalid checkpoint marker covers no records. A marker describes the journal's current files, so a
+    /// durable-only reader applies a marker that moves past its cursor only after confirming that its segment is still
+    /// in place; if recovery replaced it or retention removed it, the reader returns [`Error::Discarded`] then, instead
+    /// of reading on in the file it has open (ADR 0034). If it is in place, the reader reads the records the marker
+    /// newly covers from the file's current bytes, so records that recovery removed in place are never returned.
+    /// A visible reader can't notice such an in-place repair (storage damage that emptied a commit word; crash
+    /// contract C11): it may return records it had already read, then continue in the new history, wait, or report
+    /// corruption at a position that no longer starts a record; [`Reader::seek`] to its position puts it back on the
+    /// current chain.
     ///
     /// # Errors
     ///
     /// [`Error::Corrupt`] if the bytes at the cursor fail validation. The cursor doesn't move,
     /// so calling again retries the same position (which may succeed after a writer recovery).
-    /// [`Error::Discarded`] if writer recovery or retention replaced or removed the segment at the cursor;
-    /// call [`Reader::seek`] to continue on the current chain.
-    /// [`Error::Io`] if the next segment can't be opened, or (with kind
+    /// [`Error::Discarded`] if writer recovery or retention replaced or removed the segment at the cursor
+    /// (including when retention removed both it and the next segment while the reader was moving between them);
+    /// call [`Reader::seek`] to continue on the current chain. A removal is never reported as corruption or as an
+    /// I/O "not found" error.
+    /// [`Error::Corrupt`] with [`CorruptReason::BrokenChain`] if the segment at the cursor is sealed and still in
+    /// place but the next segment is missing.
+    /// [`Error::Io`] if the next segment can't be opened, if checking whether the segment is still in place fails
+    /// other than with "not found" (only that counts as a removal), or (with kind
     /// [`OutOfMemory`](std::io::ErrorKind::OutOfMemory)) if the read buffer for the frame at the cursor can't be
     /// allocated.
     pub fn try_next(&mut self) -> Result<Option<Record<'_>>> {
@@ -359,9 +396,10 @@ impl Reader {
         self.next_seq.max(self.skip_until)
     }
 
-    /// Returns `Error::Discarded` if the current segment's path no longer names the file the reader has open.
+    /// Returns `Error::Discarded` if the current segment's path no longer names the file the reader has open, and
+    /// `Error::Io` if that can't be checked (a `stat` failing other than with "not found").
     fn check_identity(&self) -> Result<()> {
-        if journal::path_identity(&self.seg.path) != Some(self.seg.identity) {
+        if journal::path_identity(&self.seg.path)? != Some(self.seg.identity) {
             return Err(Error::Discarded {
                 seq: self.position(),
             });
@@ -379,6 +417,9 @@ impl Reader {
                     refreshed = true;
                 }
                 if self.next_seq >= self.durable_next_seq {
+                    if self.durable_segment_base > self.seg.base {
+                        self.leave_superseded_segment()?;
+                    }
                     return Ok(None);
                 }
             }
@@ -391,10 +432,70 @@ impl Reader {
         }
     }
 
+    /// Called when a durable-only reader is waiting at the checkpoint and the marker names a later segment than the
+    /// one it holds. Every record of the held segment is then covered, so the reader is at its seal (if the file is
+    /// still the current one), and the marker can't move past the cursor while the writer appends nothing to the new
+    /// segment: without this, the reader would never check its segment, and one that retention removed would leave it
+    /// returning `Ok(None)` for as long as the writer stays idle, where a visible reader returns `Error::Discarded`
+    /// (crash contract C14). So it does what a visible reader does at that slot: at a seal it checks the segment's
+    /// identity and moves to the successor, without returning anything (the successor is opened after the marker was
+    /// read, so ADR 0034 needs no further check for it); a removed or replaced segment gives `Error::Discarded`, which
+    /// is the result when retention removed it: the reader can't tell a retention removal from a repair (ADR 0034,
+    /// option 5), and nothing is lost, since `seek` to the cursor lands on the successor's first record. At any other
+    /// slot (the held file isn't the current one) it checks the identity only.
+    ///
+    /// Throttled to once per [`IDENTITY_CHECK_INTERVAL`], the interval at which a visible reader waiting at an empty
+    /// slot checks its segment: a removal is noticed as quickly as a visible reader notices it. At a seal the first
+    /// check moves the reader on, so a reader keeping up with the writer makes one per roll; it repeats (at most ten
+    /// `stat`s a second) only while the held file shows no seal at the cursor, and a reader whose marker names its own
+    /// segment never makes it.
+    fn leave_superseded_segment(&mut self) -> Result<()> {
+        let now = Instant::now();
+        if self
+            .superseded_checked
+            .is_some_and(|at| now.duration_since(at) < IDENTITY_CHECK_INTERVAL)
+        {
+            return Ok(());
+        }
+        self.superseded_checked = Some(now);
+        // `fresh`: the safe reader reads the slot from the file, not its buffer. The buffer can hold a record past the
+        // checkpoint that recovery has since zeroed in place and that the seal now covers; probed from the buffer, it
+        // would hide the seal on every call. The mapping shows the current bytes anyway.
+        match self.read_slot(true)? {
+            SlotOutcome::Seal => self.follow_seal(),
+            _ => self.check_identity(),
+        }
+    }
+
     /// Read the marker through ordinary file I/O (never a mapping); invalid or missing means no coverage.
+    ///
+    /// A marker speaks about the journal's current files, not about the file this reader has open, which recovery
+    /// may have replaced (or retention removed) since. So a marker that moves past the cursor is applied only after
+    /// confirming, *after* reading it, that the segment's path still names the open file; otherwise this returns
+    /// `Error::Discarded` without applying it. Read first, then check: the check then proves the open file was current
+    /// at a moment after the marker was written, and recovery keeps every record a marker covers, byte for byte, in
+    /// the current files from then on. Checking first would let a repair and the new writer's checkpoint land between
+    /// the check and the read, applying the new marker to the old file. The open file's descriptor keeps its inode
+    /// allocated, so no later file can have its identity.
+    ///
+    /// When the check passes, the `pread` buffer is discarded, so every record the marker newly covers is read from
+    /// the file after the check. Bytes past the old marker that were buffered before may predate a repair that kept
+    /// the file (recovery zeroing, in place, records after the checkpoint whose commit word storage damage emptied),
+    /// which no identity check can see. Bytes before a marker never change in place, so records below the new marker
+    /// read now are the covered ones, and the cursor (never past a marker the reader applied) is a record boundary of
+    /// the current history. The mapping needs nothing: it shows the current bytes. ADR 0034 has the full argument.
     fn refresh_checkpoint(&mut self) -> Result<()> {
-        self.durable_next_seq =
-            crate::inspect::read_checkpoint(&self.dir)?.map_or(0, |c| c.next_seq);
+        crate::fault::hook(crate::fault::Point::ReaderCheckpoint);
+        let (durable, segment_base) = crate::inspect::read_checkpoint(&self.dir)?
+            .map_or((0, 0), |c| (c.next_seq, c.segment_base_seq));
+        if durable > self.next_seq {
+            crate::fault::hook(crate::fault::Point::ReaderCheckpointIdentity);
+            self.check_identity()?;
+            // Bytes buffered before the marker was read may predate an in-place repair after the old marker.
+            self.buf.clear();
+        }
+        self.durable_next_seq = durable;
+        self.durable_segment_base = segment_base;
         Ok(())
     }
 
@@ -440,35 +541,43 @@ impl Reader {
                     self.next_seq = next_seq;
                     return Ok(Some(found));
                 }
-                SlotOutcome::Seal => {
-                    self.check_identity()?;
-                    let next = match open_segment(&self.dir, self.next_seq, self.mapped) {
-                        Ok(next) => next,
-                        Err(Error::Io { source, .. })
-                            if source.kind() == std::io::ErrorKind::NotFound =>
-                        {
-                            return Err(Error::corrupt(
-                                &self.seg.path,
-                                self.offset,
-                                CorruptReason::BrokenChain(self.next_seq),
-                            ));
-                        }
-                        Err(e) => return Err(e),
-                    };
-                    // Recheck after opening the successor: if recovery replaced this segment in between, the
-                    // successor may belong to a different history.
-                    self.check_identity()?;
-                    self.seg = next;
-                    self.offset = format::SEGMENT_HEADER_LEN as u64;
-                    self.buf.clear();
-                    self.waiting_since = None;
-                }
+                SlotOutcome::Seal => self.follow_seal()?,
                 SlotOutcome::Invalid(reason) => {
                     self.check_identity()?;
                     return Err(Error::corrupt(&self.seg.path, self.offset, reason));
                 }
             }
         }
+    }
+
+    /// Moves from the seal at the cursor to the next segment, checking that the segment at the cursor is still in place.
+    fn follow_seal(&mut self) -> Result<()> {
+        self.check_identity()?;
+        crate::fault::hook(crate::fault::Point::ReaderSeal);
+        let next = match open_segment(&self.dir, self.next_seq, self.mapped) {
+            Ok(next) => next,
+            Err(e) if e.is_not_found() => {
+                // Retention removes the oldest segment first, so a successor it removed means this segment is gone
+                // too: that is discarded history. A successor missing while this segment is still in place is a
+                // broken chain.
+                self.check_identity()?;
+                return Err(Error::corrupt(
+                    &self.seg.path,
+                    self.offset,
+                    CorruptReason::BrokenChain(self.next_seq),
+                ));
+            }
+            Err(e) => return Err(e),
+        };
+        // Recheck after opening the successor: if recovery replaced this segment in between, the successor may belong
+        // to a different history.
+        self.check_identity()?;
+        self.seg = next;
+        self.offset = format::SEGMENT_HEADER_LEN as u64;
+        self.buf.clear();
+        self.waiting_since = None;
+        self.superseded_checked = None;
+        Ok(())
     }
 
     /// One attempt at reading the slot at the cursor. `fresh` forces the `pread` path to re-read from the file.
@@ -583,6 +692,35 @@ impl Reader {
     }
 }
 
+/// Lists the segments, lets `choose` pick one, and opens it. If the chosen segment has disappeared by the time it is
+/// opened (retention or archiving removed it, or writer recovery quarantined it), lists again, so that `choose` sees
+/// the journal as it is now (and likewise if the listing was empty). Retention removes the oldest segments first, so
+/// the second listing already reflects a removal; after [`LISTING_ATTEMPTS`] listings in a row whose chosen segment
+/// vanished, the last "not found" error is returned.
+fn open_listed(
+    dir: &Path,
+    mapped: bool,
+    choose: impl Fn(&[(u64, PathBuf)]) -> Result<u64>,
+) -> Result<(u64, OpenSegment)> {
+    let mut attempts = 1;
+    loop {
+        let segments = journal::list_segments(dir)?;
+        // On a live journal a directory read can come back empty: btrfs returns only entries that existed when the
+        // directory was opened and still exist when it is read, so retention removing them all while new segments
+        // are created leaves none. List again.
+        if segments.is_empty() && attempts < LISTING_ATTEMPTS {
+            attempts += 1;
+            continue;
+        }
+        let base = choose(&segments)?;
+        crate::fault::hook(crate::fault::Point::ReaderOpen);
+        match open_segment(dir, base, mapped) {
+            Err(e) if e.is_not_found() && attempts < LISTING_ATTEMPTS => attempts += 1,
+            result => return result.map(|seg| (base, seg)),
+        }
+    }
+}
+
 fn open_segment(dir: &Path, base: u64, mapped: bool) -> Result<OpenSegment> {
     let path = journal::segment_path(dir, base);
     let file = File::open(&path).map_err(|e| Error::io("open segment", &path, e))?;
@@ -601,6 +739,7 @@ fn open_segment(dir: &Path, base: u64, mapped: bool) -> Result<OpenSegment> {
         None
     };
     Ok(OpenSegment {
+        base,
         path,
         size: header.segment_size,
         file,

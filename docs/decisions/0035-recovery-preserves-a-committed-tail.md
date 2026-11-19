@@ -237,8 +237,13 @@ bounded: after 8
 rounds (a writer appending faster than `verify` can search) it stops and reports the segment as open at the last
 record it reached, which is what it reports for anything appended after it returns; never a problem. A scan that
 continues from `P` can catch the writer mid-append at the new end as the first scan can, so an invalid record there
-gets the same one 50 ms retry; the first scan and the continued scans share that one retry per segment (review
-round 2; `inspect::tests::follow_loop_retries_a_record_caught_mid_append`). Only the newest
+gets the same retry; the first scan and the continued scans share that retry per segment (review round 2;
+`inspect::tests::follow_loop_retries_a_record_caught_mid_append`). Since this was merged with the reader fixes for
+retention races (crash contract C14), the retry is no longer one 50 ms rescan but rescans after pauses of 10 ms
+doubling up to 320 ms (630 ms in all), still one budget per segment: the continued scans take the pauses the first
+scan left and never start them again, so `verify` sleeps at most 630 ms per segment for rescans however many rounds
+the loop makes. The 50 ms wait at a still-empty word is separate, once per segment, so rescans cannot use it up
+(`inspect::tests::follow_loop_rescans_share_the_first_scans_budget`). Only the newest
 segment needs this: the writer appends only there, and the empty word of a segment it has just rolled from only ever
 becomes a seal marker, with nothing written after it that could be evidence. No other reader-side function uses the
 evidence search (`list_segments`, `status` and the readers never call it), and writer recovery holds the lock.

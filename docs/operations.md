@@ -122,9 +122,16 @@ Segments are ordinary files named after their first sequence number (`0000000000
 copy sealed segments without changing the journal.
 
 Readers that are still inside a segment you delete keep reading it (they hold the file open), but when they reach
-its end they return `Error::Discarded`, because the file is gone; seek to their position to continue
-(`tickertape tail` does this automatically). Readers positioned before the oldest remaining segment get
-`Error::SeqUnavailable` from `seek`. `Reader::open` starts at the oldest segment that exists.
+its end they return `Error::Discarded`, because the file is gone; seek to their position to continue. Durable-only
+readers may return it earlier, when the checkpoint moves past their position (ADR 0034); seeking to that position
+then fails with `Error::SeqUnavailable`, because the records there are gone, so continue at the oldest sequence
+number it reports. `tickertape tail` does both automatically, and warns on standard error with the range of records
+it skipped. Readers positioned before the oldest remaining segment get `Error::SeqUnavailable` from `seek`, also when
+the removal happens while `seek` runs. `Reader::open` starts at the oldest segment that exists. A removal never shows
+up as a corruption error in readers, `tickertape inspect` or `tickertape verify`, and shows up as an I/O "not found"
+error only if the segment a reader chose vanished on each of 8 listings in a row (crash contract C14).
+A `stat` that fails other than with "not found" (`EACCES`, `EIO`) is reported as an I/O error, never taken for a
+removal.
 
 Never truncate or edit a segment in place while anything uses the journal: processes that map it can receive
 `SIGBUS`.
@@ -132,12 +139,17 @@ Never truncate or edit a segment in place while anything uses the journal: proce
 ## Checking a journal
 
 - `tickertape verify <dir>` checks every header, record and seal and exits with code 2 if anything is wrong; it is
-  read-only and safe to run while the writer is active (records the writer commits while `verify` looks at the end
-  of the newest segment are followed, not reported; ADR 0035). One exception: if the writer takes longer than about
-  50 ms to fill a single record whose payload itself contains valid tickertape frames with nearby sequence numbers
-  (a journal that stores another journal's raw frames), `verify` can report that record as an empty commit word in
-  front of committed records while it is being written; a second run after the record is committed reports nothing.
-  `verify` reads the whole newest segment, including the unwritten part after the last record.
+  read-only and safe to run while the writer is active. A segment that ends in a state a running writer passes
+  through (a record being written, or a segment not yet sealed whose successor exists) is scanned again with growing
+  pauses, for up to 630 ms, before it is reported. Records the writer commits while `verify` looks at the end of the
+  newest segment are followed, not reported (ADR 0035); a record being written at the end `verify` follows them to is
+  scanned again with what is left of those 630 ms for that segment. If the writer is stalled in such a state for
+  longer, `verify` can report a problem that isn't there; run it again to tell. Likewise, if the writer takes longer
+  than about 50 ms to fill a single record whose payload itself contains valid tickertape frames with nearby sequence
+  numbers (a journal that stores another journal's raw frames), `verify` can report that record as an empty commit
+  word in front of committed records while it is being written; a second run after the record is committed reports
+  nothing. With no writer running, every problem it reports is real. `verify` reads the whole newest segment,
+  including the unwritten part after the last record.
 - `tickertape inspect <dir>` lists segments, their sequence ranges and fill level, and the checkpoint marker.
 
 ## After a crash
@@ -170,7 +182,10 @@ Never truncate or edit a segment in place while anything uses the journal: proce
   remains (for example the commit words of the newest records zeroed) can't be told from a crash and is zeroed like a torn append, under either policy. If
   `quarantine/` holds two files with identical bytes for the same position, a repair was interrupted and repeated;
   either copy can be deleted.
-  Readers that had seen discarded records get `Error::Discarded`.
+  Readers that had seen discarded records get `Error::Discarded`, except after a repair in place (damage that can't
+  be told from a crash, as above, so recovery zeroes the records after the empty commit word in the same file), which
+  visible readers can't notice: they may continue into the new history, wait, or report corruption, until seeked to
+  their position (crash contract C11). Durable-only readers never return records that recovery discarded (C13).
 - **What `Fail` still does when it refuses:** it never changes the corrupt bytes or anything after them, but the
   open is not read-only. It records its PID in the lock file, removes stale temporary files (`*.tape.tmp`,
   `next-segment.tmp`) before scanning, and keeps the clean-ups a crash needs that come before the corruption: a

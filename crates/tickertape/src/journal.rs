@@ -2,6 +2,7 @@
 //! validating segment files, and file identity.
 
 use std::fs::{self, File};
+use std::io;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 
@@ -131,9 +132,16 @@ pub(crate) fn file_identity(file: &File, path: &Path) -> Result<Identity> {
     Ok((meta.dev(), meta.ino()))
 }
 
-/// The identity of whatever `path` names now, or `None` if nothing.
-pub(crate) fn path_identity(path: &Path) -> Option<Identity> {
-    fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
+/// The identity of whatever `path` names now, or `None` if nothing does ("not found").
+///
+/// Any other failure (`EACCES`, `EIO`, `ENOMEM`, ...) says nothing about whether the file is still in place, so it
+/// is returned as an error rather than taken for a removal.
+pub(crate) fn path_identity(path: &Path) -> Result<Option<Identity>> {
+    match fs::metadata(path) {
+        Ok(m) => Ok(Some((m.dev(), m.ino()))),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(Error::io("stat segment", path, e)),
+    }
 }
 
 /// Opens a directory so that it can be synced.
@@ -219,18 +227,28 @@ impl format::SegmentView for PreadView<'_> {
 /// Scans a segment file from its first record slot, expecting `base` there, reading it with `pread` in bounded
 /// windows (the file is never mapped, so other processes can't affect memory safety).
 pub(crate) fn scan_file(path: &Path, base: u64) -> Result<format::ScanResult> {
-    scan_file_from(path, format::SEGMENT_HEADER_LEN as u64, base)
-}
-
-/// [`scan_file`] from `offset`, expecting `seq` there.
-pub(crate) fn scan_file_from(path: &Path, offset: u64, seq: u64) -> Result<format::ScanResult> {
-    with_pread_view(path, |view| format::scan_segment(view, offset, seq))
-}
-
-/// The commit word at `offset` of a segment file, read with a fresh 4-byte `pread` (0 if it lies outside the file or
-/// is misaligned).
-pub(crate) fn commit_word_in_file(path: &Path, offset: u64) -> Result<u32> {
     let file = File::open(path).map_err(|e| Error::io("open segment", path, e))?;
+    scan_open(&file, path, base)
+}
+
+/// Like [`scan_file`], for a segment file that is already open (`path` names it in errors).
+pub(crate) fn scan_open(file: &File, path: &Path, base: u64) -> Result<format::ScanResult> {
+    scan_open_from(file, path, format::SEGMENT_HEADER_LEN as u64, base)
+}
+
+/// [`scan_open`] from `offset`, expecting `seq` there.
+pub(crate) fn scan_open_from(
+    file: &File,
+    path: &Path,
+    offset: u64,
+    seq: u64,
+) -> Result<format::ScanResult> {
+    with_pread_view(file, path, |view| format::scan_segment(view, offset, seq))
+}
+
+/// The commit word at `offset` of an open segment file, read with a fresh 4-byte `pread` (0 if it lies outside the
+/// file or is misaligned).
+pub(crate) fn commit_word_open(file: &File, path: &Path, offset: u64) -> Result<u32> {
     let len = file
         .metadata()
         .map_err(|e| Error::io("stat segment", path, e))?
@@ -247,25 +265,25 @@ pub(crate) fn commit_word_in_file(path: &Path, offset: u64) -> Result<u32> {
     Ok(u32::from_le_bytes(word))
 }
 
-/// [`format::find_history_after_empty`] on a segment file, read with `pread` in bounded windows.
-pub(crate) fn history_after_empty_in_file(
+/// [`format::find_history_after_empty`] on an open segment file, read with `pread` in bounded windows.
+pub(crate) fn history_after_empty_open(
+    file: &File,
     path: &Path,
     offset: u64,
     expected_seq: u64,
 ) -> Result<Option<format::LaterHistory>> {
-    with_pread_view(path, |view| {
+    with_pread_view(file, path, |view| {
         format::find_history_after_empty(view, offset, expected_seq)
     })
 }
 
-fn with_pread_view<R>(path: &Path, f: impl FnOnce(&PreadView<'_>) -> R) -> Result<R> {
-    let file = File::open(path).map_err(|e| Error::io("open segment", path, e))?;
+fn with_pread_view<R>(file: &File, path: &Path, f: impl FnOnce(&PreadView<'_>) -> R) -> Result<R> {
     let len = file
         .metadata()
         .map_err(|e| Error::io("stat segment", path, e))?
         .len();
     let view = PreadView {
-        file: &file,
+        file,
         len,
         window: std::cell::RefCell::new((0, Vec::new())),
         error: std::cell::RefCell::new(None),
@@ -333,8 +351,9 @@ mod scan_tests {
         assert_eq!(scan_file(&path, base).unwrap(), expected);
         let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
         file.write_all_at(&[0; 4], first).unwrap();
+        let open = File::open(&path).unwrap();
         assert!(matches!(
-            history_after_empty_in_file(&path, first, base).unwrap(),
+            history_after_empty_open(&open, &path, first, base).unwrap(),
             Some(format::LaterHistory::Record { seq: 1, .. })
         ));
         file.write_all_at(&[0xee], first + 200 + (1 << 20)).unwrap();
@@ -346,8 +365,8 @@ mod scan_tests {
             scan.end,
             format::ScanEnd::Invalid(CorruptReason::BadChecksum)
         );
-        assert_eq!(commit_word_in_file(&path, first).unwrap(), 100 + 40);
-        assert_eq!(commit_word_in_file(&path, first + 4).unwrap(), 0);
-        assert_eq!(commit_word_in_file(&path, 4 << 20).unwrap(), 0);
+        assert_eq!(commit_word_open(&open, &path, first).unwrap(), 100 + 40);
+        assert_eq!(commit_word_open(&open, &path, first + 4).unwrap(), 0);
+        assert_eq!(commit_word_open(&open, &path, 4 << 20).unwrap(), 0);
     }
 }

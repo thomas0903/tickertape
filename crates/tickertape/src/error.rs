@@ -120,6 +120,11 @@ impl Error {
         matches!(self, Error::Io { source, .. } if crate::mmap::is_storage_full(source))
     }
 
+    /// True for an I/O error saying a file or directory doesn't exist (`ENOENT`).
+    pub(crate) fn is_not_found(&self) -> bool {
+        matches!(self, Error::Io { source, .. } if source.kind() == io::ErrorKind::NotFound)
+    }
+
     pub(crate) fn io(op: &'static str, path: impl Into<PathBuf>, source: io::Error) -> Error {
         Error::Io {
             op,
