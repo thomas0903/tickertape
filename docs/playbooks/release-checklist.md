@@ -26,7 +26,10 @@ single-maintainer repository. Administrators are subject to the checks; force pu
 
 ## Prepare
 
-1. Set `[workspace.package].version` and `[workspace.dependencies].tickertape.version` in `Cargo.toml`.
+1. Set `[workspace.package].version` and `[workspace.dependencies].tickertape.version` in `Cargo.toml`. Set the
+   C header's version macros to match (`TICKERTAPE_VERSION_MAJOR`, `_MINOR`, `_PATCH` in
+   `crates/tickertape-ffi/src/lib.rs`; the build fails until they do) and regenerate the header with cbindgen 0.29.4
+   (the command is in `crates/tickertape-ffi/cbindgen.toml`).
 2. Add a dated `## [X.Y.Z] - YYYY-MM-DD` section to `CHANGELOG.md`, and update its compare link.
 3. Check the packages and run the normal checks:
 
@@ -44,8 +47,37 @@ single-maintainer repository. Administrators are subject to the checks; force pu
    gitleaks git --redact --no-banner
    ```
 
-   Each crate must include both licences and its README, and exclude local agent tooling. Dry-running both packages
-   together requires Cargo 1.90+. The release scripts require Python 3.11+; CI selects Python 3.12.
+   Each crate must include both licences and its README, and exclude local agent tooling. Other workspace members
+   (tests, benches, examples and the C ABI crate `tickertape-ffi`) have `publish = false`; the release script refuses
+   a member that is neither released nor marked so. Releases do not ship the C library yet (ADR 0028). Before 1.0 the
+   C ABI is unstable (ABI version 0) and programs require the exact library version; if it changed, the changelog
+   must say so. Dry-running both packages together requires Cargo 1.90+. The release scripts require Python 3.11+; CI
+   selects Python 3.12.
+
+### C ABI at 1.0 (ADR 0028 → Versioning)
+
+For the 1.0 release, and checked again for every later release that ships the C library:
+
+1. In `crates/tickertape-ffi/src/lib.rs`, set `TICKERTAPE_ABI_VERSION` to 1 (only at 1.0; it changes again only
+   with a major version that breaks the ABI), and regenerate the header.
+2. Freeze the ABI, at 1.0 **and at every later stable release**: copy the release's
+   `crates/tickertape-ffi/include/tickertape.h` (the header as shipped) over
+   `crates/tickertape-ffi/abi/tickertape-baseline.h`, in the release preparation pull request, after the CI check
+   against the previous baseline has passed. From then on CI fails if a later change removes or changes a
+   declaration from it; additions pass. Refreshing it at every release matters: a baseline left at 1.0 would let a
+   function added in 1.1 be removed in 1.2. Never edit the baseline to make CI pass; a break needs a new major
+   version and ABI version.
+3. Build the packaged library as packagers will (`cargo cinstall --release -p tickertape-ffi --prefix /usr/local
+   --destdir "$STAGE"`, or the release archive once it exists), and check its name in the files:
+   - Linux: `readelf -d "$STAGE"/usr/local/lib/libtickertape.so.1* | grep SONAME` prints `libtickertape.so.1`, and
+     `libtickertape.so.1` is a link to the real file.
+   - macOS: `otool -D "$STAGE"/usr/local/lib/libtickertape.1.dylib` prints an install name ending in
+     `libtickertape.1.dylib` (`@rpath/` or the install prefix, never a build directory).
+4. Link a program against the installed package, not the build tree, and run it: install into a scratch prefix,
+   then build `examples/c/writer.c` and `reader.c` with `pkg-config --cflags --libs tickertape` (and the static
+   variant with `pkg-config --static`), with `PKG_CONFIG_PATH` pointing at the scratch prefix, and run
+   `examples/c/README.md`'s record-and-replay commands. Check that the program loads the installed library (`ldd` on
+   Linux, `otool -L` on macOS).
 4. Merge the release preparation pull request and wait for all CI jobs on the resulting `main` commit to pass.
 5. Confirm the owner has authorized publishing that exact version, then tag that commit:
 

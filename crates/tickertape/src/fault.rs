@@ -30,6 +30,8 @@ pub enum Point {
     SpareMap,
     /// Writing the spare's header when the writer publishes it at roll (arm with [`fail_next`]).
     SpareHeader,
+    /// Syncing the zeroing of an abandoned write (a panicking `append_with` fill closure).
+    AbandonedWriteSync,
 }
 
 #[cfg(feature = "fault-injection")]

@@ -142,6 +142,51 @@ jobs:
       - run: rustup show active-toolchain || rustup toolchain install
       - run: tests/compat/generate.sh --check-old-readers
 
+  ffi:
+    name: c abi (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cbindgen@0.29.4
+      # The committed header must be exactly what cbindgen generates from the crate (ADR 0028).
+      - name: Header drift check
+        run: |
+          cbindgen --config crates/tickertape-ffi/cbindgen.toml --crate tickertape-ffi --output crates/tickertape-ffi/include/tickertape.h
+          git diff --exit-code -- crates/tickertape-ffi/include/tickertape.h
+      # From 1.0, removing or changing a frozen declaration fails; additions pass (ADR 0028 -> Versioning).
+      - name: ABI baseline check
+        run: python3 .github/scripts/check_abi_baseline.py crates/tickertape-ffi/abi/tickertape-baseline.h crates/tickertape-ffi/include/tickertape.h
+      # Rust tests of the extern "C" functions (with the core's failure points), then the C99/C11 and C++11/C++20
+      # programs, examples and cross-language fixtures, compiled with AddressSanitizer and UBSan.
+      - name: C ABI tests (AddressSanitizer, UBSan)
+        run: cargo test -p tickertape-ffi --locked --features fault-injection
+        env:
+          TICKERTAPE_FFI_SANITIZE: '1'
+          TICKERTAPE_FFI_REQUIRE_PYTHON: '1'
+      - name: C and C++ programs under Valgrind
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends valgrind
+          cargo test -p tickertape-ffi --locked --test c_api
+        env:
+          TICKERTAPE_FFI_VALGRIND: '1'
+          TICKERTAPE_FFI_REQUIRE_PYTHON: '1'
+      - name: Examples build with make and CMake
+        run: |
+          cargo build --release -p tickertape-ffi --locked
+          make -C examples/c
+          cmake -S examples/c -B "$RUNNER_TEMP/examples"
+          cmake --build "$RUNNER_TEMP/examples"
+
   msrv:
     name: msrv
     runs-on: ubuntu-latest
@@ -164,6 +209,7 @@ jobs:
           command: check
 
   miri:
+    # Also runs the C ABI's argument-handling tests. The name is a required status check on main; keep it.
     name: miri (format code)
     runs-on: ubuntu-latest
     steps:
@@ -171,6 +217,8 @@ jobs:
       - run: rustup toolchain install nightly --profile minimal --component miri,rust-src
       - run: cargo +nightly miri setup
       - run: cargo +nightly miri test -p tickertape --lib format
+      # The C ABI's argument handling, error mapping and option builders (the tests that touch no files).
+      - run: cargo +nightly miri test -p tickertape-ffi --lib pure_
 
   loom:
     name: loom (protocol model)
