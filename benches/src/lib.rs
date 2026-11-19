@@ -1,5 +1,7 @@
 //! Shared validation, scheduling and reporting for the benchmark tools.
 
+pub mod sustained;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;

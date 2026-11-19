@@ -239,3 +239,255 @@ fn invalid_inputs_fail_before_creating_a_journal() {
         assert!(!path.exists());
     }
 }
+
+fn sustained(root: &std::path::Path, args: &[&str]) -> Value {
+    let output = Command::new(env!("CARGO_BIN_EXE_tt-sustained"))
+        .args(["run", "--dir"])
+        .arg(root.join("journal"))
+        .arg("--out")
+        .arg(root.join("out"))
+        .args(args)
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let saved: Value =
+        serde_json::from_slice(&std::fs::read(root.join("out/result.json")).unwrap()).unwrap();
+    assert_eq!(result, saved);
+    result
+}
+
+fn journal_timestamps(dir: &std::path::Path) -> Vec<u64> {
+    let mut reader = tickertape::Reader::open(dir, tickertape::ReaderConfig::default()).unwrap();
+    let mut timestamps = Vec::new();
+    while let Some(record) = reader.try_next().unwrap() {
+        assert_eq!(record.seq, timestamps.len() as u64);
+        timestamps.push(record.local_ts_ns);
+    }
+    timestamps
+}
+
+#[test]
+fn sustained_steady_run_with_checkpoints_rolls_and_two_readers() {
+    let root = tempfile::tempdir().unwrap();
+    let result = sustained(
+        root.path(),
+        &[
+            "--rate",
+            "5000",
+            "--duration",
+            "2s",
+            "--warmup",
+            "500ms",
+            "--payload",
+            "1024",
+            "--segment-size",
+            "65536",
+            "--checkpoint-records",
+            "1000",
+            "--readers",
+            "safe:wait=default,mapped:durable:wait=block",
+        ],
+    );
+    let writer = &result["writer"];
+    // 2.5 s at 5,000 records/s, every one sent: no skipped or rebased sends.
+    assert_eq!(writer["count"], 12_500);
+    assert_eq!(writer["planned_records"], 12_500);
+    assert_eq!(writer["unsent_records"], 0);
+    assert_eq!(writer["stopped_by"], "schedule_end");
+    // Records intended in the 500 ms warmup are excluded from latency statistics only.
+    assert_eq!(writer["records_measured"], 10_000);
+    assert_eq!(writer["append_latency"]["count"], 10_000);
+    assert_eq!(writer["checkpoints"], 12);
+    assert!(writer["final_checkpoint_us"].as_f64().unwrap() > 0.0);
+    // 61 records of 1,064 bytes fit in a 64 KiB segment; the first segment is created on open.
+    assert_eq!(writer["rolls"], (12_500 - 1) / 61);
+    assert!(writer["roll_append_latency"]["count"].as_u64().unwrap() > 0);
+    assert!(writer["cpu"]["user_cpu_s"].as_f64().unwrap() >= 0.0);
+    assert!(writer["late_records"].as_u64().unwrap() <= 12_500);
+    assert_eq!(result["config"]["record_bytes"], 1064);
+    assert_eq!(result["config"]["schedule"]["kind"], "steady");
+    assert_eq!(result["dataset"]["appended_bytes"], 12_500 * 1064);
+    let readers = result["readers"].as_array().unwrap();
+    assert_eq!(readers.len(), 2);
+    assert_eq!(readers[0]["latency_kind"], "visible");
+    assert_eq!(readers[1]["latency_kind"], "durable_only");
+    assert_eq!(readers[1]["wait"], "block");
+    for reader in readers {
+        assert_eq!(reader["records_read"], 12_500);
+        assert_eq!(reader["remaining_records"], 0);
+        assert_eq!(reader["skipped_by_retention"], 0);
+        assert_eq!(reader["drained"], true);
+        assert_eq!(reader["latency"]["count"], 10_000);
+        assert!(reader["lag"]["samples"].as_u64().unwrap() > 0);
+        assert!(reader["lag"]["max_bytes"].as_f64().unwrap() >= 0.0);
+        let p50 = reader["latency"]["p50_us"].as_f64().unwrap();
+        assert!(reader["latency"]["max_us"].as_f64().unwrap() >= p50);
+    }
+    // Paced records carry their intended send time.
+    let t0 = result["start_unix_ns"].as_u64().unwrap();
+    let schedule = tickertape_bench::sustained::Schedule::steady(5000).unwrap();
+    for (i, ts) in journal_timestamps(&root.path().join("journal"))
+        .iter()
+        .enumerate()
+    {
+        assert_eq!(*ts, schedule.intended_ns(t0, i as u64).unwrap());
+    }
+    // One merged line per wall-clock second, covering every record sent.
+    let series: Vec<Value> = std::fs::read_to_string(root.path().join("out/series.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(
+        series.len() as u64,
+        result["series_seconds"].as_u64().unwrap()
+    );
+    assert!(series.len() >= 3);
+    let seconds: Vec<u64> = series
+        .iter()
+        .map(|l| l["t_unix_s"].as_u64().unwrap())
+        .collect();
+    assert!(seconds.windows(2).all(|w| w[1] == w[0] + 1));
+    assert_eq!(seconds[0], t0 / 1_000_000_000);
+    let sent: f64 = series
+        .iter()
+        .map(|l| l["writer"]["records"].as_f64().unwrap())
+        .sum();
+    assert_eq!(sent, 12_500.0);
+    let received: f64 = series
+        .iter()
+        .map(|l| l["readers"][1]["records"].as_f64().unwrap())
+        .sum();
+    assert_eq!(received, 12_500.0);
+    assert!(series[0]["t_utc"].as_str().unwrap().ends_with('Z'));
+}
+
+#[test]
+fn sustained_bursty_schedule_is_stored_in_the_journal() {
+    let root = tempfile::tempdir().unwrap();
+    let result = sustained(
+        root.path(),
+        &[
+            "--burst-rate",
+            "20000",
+            "--burst-period",
+            "200ms",
+            "--burst-duty",
+            "25",
+            "--duration",
+            "1s",
+            "--readers",
+            "mapped",
+        ],
+    );
+    // Bursts of 1,000 records every 200 ms: 5,000 records, a mean of 5,000 records/s.
+    assert_eq!(result["writer"]["count"], 5_000);
+    assert_eq!(result["config"]["schedule"]["burst_records"], 1_000);
+    assert_eq!(result["config"]["schedule"]["mean_records_per_s"], 5_000.0);
+    assert_eq!(result["readers"][0]["records_read"], 5_000);
+    let t0 = result["start_unix_ns"].as_u64().unwrap();
+    let schedule = tickertape_bench::sustained::Schedule::bursty(
+        20_000,
+        std::time::Duration::from_millis(200),
+        25,
+    )
+    .unwrap();
+    let timestamps = journal_timestamps(&root.path().join("journal"));
+    assert_eq!(timestamps.len(), 5_000);
+    for (i, ts) in timestamps.iter().enumerate() {
+        assert_eq!(*ts, schedule.intended_ns(t0, i as u64).unwrap());
+    }
+    assert_eq!(
+        timestamps[1_000] - timestamps[999],
+        200_000_000 - 999 * 50_000
+    );
+}
+
+#[test]
+fn sustained_unpaced_retention_removes_segments_under_a_lagging_reader() {
+    let root = tempfile::tempdir().unwrap();
+    let result = sustained(
+        root.path(),
+        &[
+            "--unpaced",
+            "--duration",
+            "2s",
+            "--segment-size",
+            "65536",
+            "--checkpoint-records",
+            "200",
+            "--retain-segments",
+            "2",
+            "--readers",
+            "safe:wait=sleep,safe:delay=2ms",
+        ],
+    );
+    let writer = &result["writer"];
+    let count = writer["count"].as_u64().unwrap();
+    assert_eq!(writer["stopped_by"], "duration");
+    assert_eq!(writer["late_records"], Value::Null);
+    assert_eq!(writer["unsent_records"], Value::Null);
+    assert!(writer["retention"]["removed_segments"].as_u64().unwrap() > 0);
+    // The lagging reader stops when the writer finishes; every record is read, skipped or reported as remaining.
+    let lagging = &result["readers"][1];
+    assert_eq!(lagging["lagging"], true);
+    assert_eq!(lagging["drained"], false);
+    assert!(lagging["skipped_by_retention"].as_u64().unwrap() > 0);
+    assert!(lagging["discard_events"].as_u64().unwrap() > 0);
+    let accounted = ["records_read", "skipped_by_retention", "remaining_records"]
+        .iter()
+        .map(|k| lagging[*k].as_u64().unwrap())
+        .sum::<u64>();
+    assert_eq!(accounted, count);
+    assert!(lagging["lag"]["max_records"].as_f64().unwrap() > 0.0);
+    assert_eq!(
+        result["coordinated_omission"],
+        "unpaced: latency measured from the actual send start"
+    );
+}
+
+#[test]
+fn sustained_rejects_invalid_configurations_before_creating_directories() {
+    for options in [
+        vec!["--rate", "100", "--unpaced"],
+        vec!["--duration", "1s"],
+        vec!["--rate", "0"],
+        vec!["--rate", "100", "--duration", "0s"],
+        vec!["--rate", "100", "--retain-segments", "2"],
+        vec!["--rate", "100", "--readers", "safe:durable"],
+        vec!["--rate", "100", "--readers", "fast"],
+        vec![
+            "--rate",
+            "100",
+            "--checkpoint-every",
+            "1s",
+            "--checkpoint-records",
+            "5",
+        ],
+        vec!["--rate", "100", "--burst-duty", "5"],
+        vec!["--burst-rate", "1", "--burst-period", "1ms"],
+        vec!["--rate", "100", "--cpus", "0", "--readers", "safe"],
+        vec!["--rate", "100", "--segment-size", "1000"],
+        vec!["--rate", "100", "--lag-interval", "10us"],
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_tt-sustained"))
+            .arg("run")
+            .args(&options)
+            .arg("--dir")
+            .arg(root.path().join("journal"))
+            .arg("--out")
+            .arg(root.path().join("out"))
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{options:?}");
+        assert!(!root.path().join("journal").exists(), "{options:?}");
+        assert!(!root.path().join("out").exists(), "{options:?}");
+    }
+}
