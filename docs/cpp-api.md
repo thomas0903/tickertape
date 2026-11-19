@@ -1,0 +1,308 @@
+# C++ API
+
+tickertape has a header-only C++ binding over its C ABI: one header,
+[`crates/tickertape-ffi/include/tickertape.hpp`](../crates/tickertape-ffi/include/tickertape.hpp), next to the C
+header `tickertape.h`, linked against the same `libtickertape`. It needs C++17 and nothing beyond the standard
+library, and works the same with and without exceptions. This page explains how to use it; the header documents
+every function, and [ADR 0036](decisions/0036-cpp-binding.md) gives the design and its reasons. The rules of the C
+ABI underneath ([`c-api.md`](c-api.md)) still hold; this page repeats the ones you need.
+
+> **Status:** like the C ABI, the binding is not stable before tickertape 1.0. Use the header, the C header and the
+> library from one release (the header checks this; see [Versioning](#versioning)).
+
+Example: [`examples/c/example.cpp`](../examples/c/example.cpp) records, follows a journal live from another process,
+and replays it.
+
+```cpp
+#include "tickertape.hpp"
+#include <cstdio>
+
+namespace tt = tickertape;
+using namespace std::chrono_literals;
+
+int main() {
+    tt::Writer writer = tt::Writer::open("/tmp/journal").value();   // throws tt::Exception on error
+    std::uint64_t seq = writer.append(1, 0, tt::realtime_ns(), std::string_view("hello")).value();
+    writer.checkpoint().value();                                    // durable, not only visible
+
+    tt::Reader reader = tt::Reader::open("/tmp/journal").value();
+    reader.seek(seq).value();
+    if (std::optional<tt::RecordView> record = reader.next(100ms).value()) {
+        // The payload is borrowed: valid until the next call on `reader`.
+        std::printf("%llu %.*s\n", (unsigned long long)record->seq(), (int)record->size(),
+                    record->as_string_view().data());
+    }
+}
+```
+
+Without exceptions, test the result instead of calling `value()`:
+
+```cpp
+tt::result<tt::Writer> opened = tt::Writer::open("/tmp/journal");
+if (!opened) {
+    std::fprintf(stderr, "%s\n", opened.error().to_string().c_str());   // "TICKERTAPE_E_LOCKED: ..."
+    return 1;
+}
+tt::Writer writer = std::move(opened).value();
+```
+
+## Building and linking
+
+Build the library with Cargo (Rust 1.85 or newer), then compile as C++17 or later against the include directory:
+
+```bash
+cargo build --release -p tickertape-ffi
+c++ -std=c++17 app.cpp -I crates/tickertape-ffi/include -L target/release -ltickertape \
+    -Wl,-rpath,"$PWD/target/release" -o app
+```
+
+Static linking, installation with `cargo cinstall` (which installs `tickertape.hpp` next to `tickertape.h`) and
+pkg-config work as for C: see [`c-api.md` → Building and linking](c-api.md#building-and-linking).
+
+**CMake.** `crates/tickertape-ffi/cmake/tickertapeConfig.cmake` defines `tickertape::tickertape` (the shared library
+and `tickertape.h`) and `tickertape::cpp` (plus `tickertape.hpp` and the C++17 requirement):
+
+```cmake
+find_package(tickertape CONFIG REQUIRED PATHS /path/to/tickertape/crates/tickertape-ffi/cmake)
+# or: add_subdirectory(/path/to/tickertape/crates/tickertape-ffi tickertape)
+target_link_libraries(app PRIVATE tickertape::cpp)
+```
+
+It finds the library in the repository's `target/release` (set `TICKERTAPE_PROFILE` for another profile), then in
+the usual system places, such as an installed library. Set `TICKERTAPE_LIBRARY` and `TICKERTAPE_INCLUDE_DIR` to
+choose the files yourself. `examples/c/CMakeLists.txt` uses it.
+
+**Compilers.** Tested with GCC 15 and Clang 21 on Linux and Apple Clang on macOS, as C++17, C++20 and C++23, with
+and without `-fno-exceptions`, under `-Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror`. CI adds the GCC and
+Clang of its Ubuntu runner. The header needs `<filesystem>` (GCC 9, Clang 9, or a macOS 10.15 deployment target).
+
+## Conventions
+
+- **Names:** everything is in `namespace tickertape`. Classes are `PascalCase`, functions and enumerators
+  `snake_case`. The C names stay available through `tickertape.h`.
+- **Results:** every fallible function returns `tickertape::result<T>`: a `T` or a `tickertape::Error`. Test it with
+  `if (r)` or `r.has_value()`; take the value with `value()` (which throws `tickertape::Exception` for an error, or
+  without exceptions prints the error and aborts), or with `*r` and `r->` (unchecked, except in debug builds); read
+  the error with `r.error()`. `result<void>` has no value. Results are `[[nodiscard]]`: ignoring one is a compiler
+  warning, so errors are never silently lost. On a temporary result, `value()`, `*` and `error()` return by value,
+  so `for (auto &s : list_segments(dir).value())` is safe.
+- **Nothing else throws.** The only exceptions are from `value()`, and from `Writer::append_with`, which rethrows what
+  your fill function threw.
+- **Paths** can be a `const char *`, `std::string`, `std::string_view` or `std::filesystem::path`. A path with a NUL
+  byte inside fails with `invalid_argument` (the C ABI would cut it short).
+- **Payloads** can be any contiguous range of `char`, `unsigned char`, `signed char` or `std::byte`
+  (`std::string_view`, `std::string`, `std::vector<std::uint8_t>`, `std::array`, `std::span`, `char8_t` ranges in
+  C++20), or a pointer and a size. String literals and other C arrays are refused, because they would include the
+  terminating NUL: write `std::string_view("text")`.
+- **Timeouts** are a `tickertape::Timeout`: `tickertape::no_wait` (the default), any `std::chrono` duration, or
+  `tickertape::wait_forever`. **A zero or negative duration does not wait** (unlike the C ABI, where a negative
+  timeout waits forever): a deadline that has passed returns at once. Durations are rounded up to whole nanoseconds.
+  A timeout bounds only the wait for a record; catching up after a seek and file I/O can take longer.
+- **Timestamps** are `std::uint64_t` nanoseconds that you choose; `tickertape::realtime_ns()` reads the wall clock.
+
+## Ownership and lifetimes
+
+| Object | Create | Owns |
+|---|---|---|
+| `Writer` | `Writer::open(dir[, options])` | a writer handle (and the journal's lock) |
+| `Reader` | `Reader::open(dir[, options])`, `Reader::open_mapped_unsafe(dir[, options])` | a reader handle |
+| `WriterOptions`, `ReaderOptions`, `Retention` | their constructors | an option handle |
+| `RecordBatch` | `RecordBatch(max_records, buffer_bytes)` | storage for batch reads |
+
+- All of them are **move-only** and free what they own in their destructor. A moved-from or default-constructed
+  object is **empty**: you can destroy it or assign to it, and calls on it fail with `invalid_argument`.
+  `is_open()` tells whether a writer or reader holds a handle.
+- The destructor of a `Writer` closes it **without checkpointing**: records stay visible, but only checkpointed
+  records are durable. `close()` does the same now and reports the status.
+- Options and retention settings are copied by the functions that take them. A moved-from options object passed to
+  `open` fails with `invalid_argument` rather than meaning "the defaults".
+- **`RecordView` borrows.** `Reader::next` returns a view whose payload points into the reader's buffer (safe reader)
+  or into the memory-mapped segment (mapped reader). **It is valid until the next call on that reader other than
+  `position()`, or until the reader is moved or destroyed.** The view's `seq()`, `schema_id()`, `venue_ts_ns()` and
+  `local_ts_ns()` are copies and stay valid; `data()`, `size()` and `as_string_view()` read the payload. Copy what you
+  need to keep: `std::string(view.as_string_view())`.
+- **Debug check:** in builds without `NDEBUG` (or with `TICKERTAPE_DEBUG_CHECKS` defined to 1), reading the payload
+  of a view after its reader moved on aborts with a message. A view whose reader was destroyed is not detected. The
+  check does not change any type's layout, so code built with and without it can be linked together.
+- **Copy-out instead:** `Reader::next_copy(buf, size)` copies one payload into your buffer, and
+  `Reader::read_batch(batch)` copies many into a `RecordBatch`. Views from a batch are valid until the next read into
+  that batch, or until it is moved or destroyed; views from `next_copy` as long as your buffer.
+- `data()` is null when the payload is empty. `as_string_view()` and `as_span()` handle that; guard it before
+  passing the pointer to `memcpy` or `printf("%.*s")`.
+- `NewRecord` (for `append_batch`) does not copy its payload: keep the bytes alive until the append returns.
+- **No hidden allocation on the hot path.** `append`, `append_with`, `append_batch`, `next_seq`, `next`, `next_copy`,
+  `read_batch` and `position` allocate nothing in the binding when they succeed (`tests/cpp/test_no_alloc.cpp`
+  checks it by counting `operator new`). A failure allocates, to copy the error message. `RecordBatch` allocates its
+  storage once, in its constructor; `list_segments` returns a `std::vector`.
+
+## Writing
+
+```cpp
+tt::WriterOptions options;
+options.segment_size(64 * 1024 * 1024).prefault(false);
+tt::Writer writer = tt::Writer::open("/data/journal", options).value();
+```
+
+- `append(schema_id, venue_ts_ns, local_ts_ns, payload)` copies the payload into the journal and returns the
+  record's sequence number.
+- `append_with(schema_id, venue_ts_ns, local_ts_ns, size, fill)` avoids that copy: it calls
+  `fill(std::uint8_t *buf, std::size_t len)` once with `size` zeroed bytes inside the mapped segment (`buf` is null
+  when `size` is 0), on your thread, before it returns. `fill` returns `void` to commit, or `bool` (`false` aborts,
+  for code without exceptions). It must not keep `buf`.
+  - Aborting, by returning `false` or throwing, commits nothing, but the writer zeroes the bytes and syncs that to
+    storage first, so it is slow: keep it for exceptional cases. Returning `false` gives `Status::aborted`; an
+    exception is rethrown unchanged after the call.
+  - If that sync fails, the writer stops accepting appends and checkpoints (a storage incident: see
+    [`c-api.md` → A failed clean-up](c-api.md#a-failed-clean-up-after-an-aborted-fill)). The call then returns
+    `Status::io` (with the OS error) instead; if `fill` threw, it throws `tickertape::Exception` with that error, and
+    your exception nested inside (`std::rethrow_if_nested`), so you learn both.
+  - Calling the same writer from inside `fill` (including `close()`) fails with `Status::busy`. Destroying the
+    writer, moving it or assigning to it from inside `fill` is allowed: the append still completes (or aborts), and
+    a writer destroyed or replaced that way is closed when `append_with` returns.
+- `append_batch(records)` appends a `std::vector`, `std::array` or other range of `NewRecord` (or a pointer and a
+  count) in order and returns a `BatchAppend`: `first_seq`, `appended` (how many were committed) and `outcome` (the
+  error that stopped it, if any). Every record is checked first, so an argument error appends nothing; after that the
+  records before the failing one stay appended: retry from `records[appended]`, not from the start.
+
+  ```cpp
+  std::vector<tt::NewRecord> batch;
+  for (const std::string &message : messages) batch.emplace_back(7, venue_ts, tt::realtime_ns(), message);
+  tt::BatchAppend appended = writer.append_batch(batch);
+  appended.outcome.value();   // throws if it stopped early; appended.appended says how far it got
+  ```
+
+## Reading
+
+```cpp
+tt::Reader reader = tt::Reader::open("/data/journal").value();   // at the oldest record
+reader.seek(1000).value();                                       // the next record is seq 1000
+while (!stop_requested()) {
+    tt::result<std::optional<tt::RecordView>> next = reader.next(100ms);
+    if (!next) {
+        if (next.error().status() == tt::Status::discarded) {    // recovery or retention replaced the segment
+            if (reader.seek(reader.position().value())) continue;
+        }
+        throw tt::Exception(next.error());                      // or handle it without exceptions
+    }
+    if (*next) handle(**next);                                  // the payload is valid until the next call
+}
+```
+
+There are two readers, as in C:
+
+- `Reader::open`, the **safe reader**, reads the files with `pread` into a buffer it owns and validates the copy. It
+  is memory-safe whatever other processes do to the files.
+- `Reader::open_mapped_unsafe`, the **mapped reader**, returns payloads that point straight into the memory-mapped
+  segment, without a copy. **Precondition: while it exists, no process other than a tickertape writer may modify the
+  journal's segment files.** A tickertape writer never changes committed bytes, so this holds in normal operation. If
+  something else writes into or truncates a segment, payloads can change under you, and truncation kills the process
+  with `SIGBUS`. The `_unsafe` suffix is there so that it is never chosen by accident.
+
+**Starting before the writer.** Opening a journal whose writer has not started fails with `Status::io` and
+`os_code() == ENOENT`; while the writer creates the first segment it fails with `Status::not_found`. A loop that waits
+for the writer retries on exactly these two (`examples/c/example.cpp` does).
+
+**Cancelling a wait.** `next(tickertape::wait_forever)` cannot be interrupted, and destroying the reader from another
+thread while it waits is undefined behaviour. Loop with a finite timeout and check for a stop request between calls.
+
+**Batches.** `read_batch(batch, timeout)` waits up to the timeout for the first record only, then takes what is
+already committed, up to `batch.capacity()` records or until the next payload does not fit in the batch's buffer (it
+is then returned first by the next read). If even the first does not fit, it fails with `Status::buffer_too_small`
+and `error().needed_size()`. If an error happens after some records were read, the call returns those records, and
+the next read returns the error: records handed out are never lost. A successful `seek` discards a held-back record
+and a deferred error.
+
+```cpp
+tt::RecordBatch batch(256, 1 << 20);   // allocated once
+while (std::size_t n = reader.read_batch(batch, 10ms).value()) {
+    for (const tt::RecordView &record : batch) handle(record);
+}
+```
+
+## Durability
+
+| Level | Reached when | Means |
+|---|---|---|
+| **Visible** | an append returns a value | Readers on this host can read the record, and it survives the writer process dying. It can still be lost in a power loss or OS crash |
+| **Durable** | a later `Writer::checkpoint()` succeeds | The record is on stable storage, under the crash contract's storage assumptions |
+
+Closing or destroying a writer does not checkpoint. A failed checkpoint poisons the writer: later checkpoints fail
+with `Status::durability_lost` while appends keep working; treat it as an incident. `ReaderOptions::durable_only(true)`
+gives a reader that returns only durable records (crash contract C13): it treats later records as not written yet
+and returns nothing without a valid checkpoint marker. See [`c-api.md` → Durability](c-api.md#durability) and
+[`crash-contract.md`](crash-contract.md) for the conditions.
+
+## Errors
+
+`tickertape::Error` describes a failed call:
+
+| Member | Returns |
+|---|---|
+| `status()` | A `tickertape::Status` (`io`, `locked`, `corrupt`, ...) |
+| `message()` | The library's description, with the file and operation involved (UTF-8) |
+| `os_code()` | `errno` for `Status::io` and `Status::storage_full`, else 0 |
+| `corrupt_reason()` | A `tickertape::CorruptReason` for `Status::corrupt`, else `CorruptReason::none` |
+| `needed_size()` | For `Status::buffer_too_small` from `next_copy` and `read_batch`: the bytes the record needs |
+| `name()`, `to_string()` | `"TICKERTAPE_E_IO"`, and `"TICKERTAPE_E_IO: <message>"` |
+
+`tickertape::Exception` (a `std::runtime_error`) holds an `Error`; `what()` is `to_string()`.
+
+`Status` and `CorruptReason` have one enumerator per C code: see the table in
+[`c-api.md` → Errors](c-api.md#errors) (`TICKERTAPE_E_SEQ_UNAVAILABLE` is `Status::seq_unavailable`, and so on). A
+newer library may return a code this header does not name; it keeps its numeric value, and any negative value is an
+error. The binding adds three cases of its own: `invalid_argument` for a path with a NUL byte and for moved-from
+options, and `unsupported_version` when the loaded library does not match the header.
+
+The option builders record the first error a setter reports (for example `backoff` with a minimum above the
+maximum), so you can chain setters; the open function that takes them returns it, and `options.error()` shows it.
+
+## Threading
+
+- A `Writer` or `Reader` may be moved to another thread between calls, but must not be used by two threads at the
+  same time. The same holds for options and batches. Different readers are independent.
+- The fill function runs on the thread that called `append_with`.
+- The binding reads the C ABI's per-thread error state inside the call that failed, so `Error` is always the right
+  one, whatever your threading. The header adds no global state of its own.
+- With the default options a writer starts a background helper thread; `WriterOptions::prefault(false)` gives one
+  that starts none.
+- **`fork()`:** the C rules apply unchanged ([`c-api.md` → Threading](c-api.md#threading)): never use or destroy, in
+  the child, objects created before the fork. Destroying a `Writer` closes its handle, so a child that does not
+  `exec` must not run their destructors either (leave with `_exit`).
+
+## Inspection and retention
+
+- `tickertape::verify(dir)` checks every segment and returns a `VerifyReport` (records, first and last sequence
+  numbers, number of problems and the first one). Corruption is reported there, not as an error.
+- `tickertape::list_segments(dir)` returns the segments, oldest first.
+- `tickertape::read_checkpoint(dir)` returns the checkpoint marker, or `std::nullopt` if there is no valid one.
+- Retention (ADR 0016) removes a sealed, checkpoint-covered prefix of old segments. Build a `Retention` with limits
+  (`max_segments`, `max_bytes`, `max_age`) and an action, which must be set explicitly: `delete_segments()` or
+  `move_to(dir)`. Pass it to `WriterOptions::retention` to run after every checkpoint (errors go to
+  `Writer::last_retention_error()`), or to `tickertape::apply_retention(dir, settings)` to run once.
+  `tickertape::plan_retention(dir, settings)` says what would be removed, without an action and without changing
+  anything.
+
+## Versioning
+
+The header defines `TICKERTAPE_HPP_VERSION_MAJOR`, `_MINOR`, `_PATCH`, `TICKERTAPE_HPP_VERSION_NUMBER` and
+`TICKERTAPE_HPP_ABI_VERSION`: the release it ships in. It has the same version as the `tickertape.h` and library of
+that release, and follows the C ABI's rule ([`c-api.md` → Versioning](c-api.md#versioning)):
+
+- **Before 1.0** it needs exactly its own release's `tickertape.h` and library.
+- **From 1.0** it needs the same ABI version and a `tickertape.h` and library at least as new as itself. Within a
+  major version no public declaration is removed or changes meaning; new functions, members and enumerators may be
+  added.
+
+It checks `tickertape.h` at compile time (`#error`), and the loaded library at run time in every open function
+(`Status::unsupported_version`). `tickertape::check_library()` and `tickertape::library_compatible()` run the same
+check, and `library_version()` returns the library's version string.
+
+## Testing
+
+`cargo test -p tickertape-ffi` compiles and runs the binding's test programs (`crates/tickertape-ffi/tests/cpp/`)
+as C++17, C++20 and C++17 without exceptions, plus a test against stubbed C functions (a failed clean-up after a
+throwing fill, every status and corruption reason), the allocation check, a debug-check death test, the
+cross-language fixtures with Rust, Python and C, the example, and a compile-only matrix of C++17, C++20 and C++23
+with and without exceptions for every C++ compiler it finds (`TICKERTAPE_FFI_CXX_COMPILERS` sets the list). It also
+fails if a C function, status code or corruption reason is added without a decision for the binding (ADR 0036).
+`TICKERTAPE_FFI_SANITIZE=1` and `TICKERTAPE_FFI_VALGRIND=1` work as for the C tests.

@@ -5,6 +5,23 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
+- C++ binding (ADR 0036, `docs/cpp-api.md`): `crates/tickertape-ffi/include/tickertape.hpp`, a header-only C++17
+  wrapper over the C ABI, shipped and installed (`cargo cinstall`) next to `tickertape.h`. It covers the whole C ABI:
+  move-only `Writer`, `Reader`, option builders and `RecordBatch`; copying, zero-copy (a lambda) and batch appends;
+  checkpoint; seek; next with `std::chrono` timeouts; durable-only reads; the zero-copy reader as
+  `Reader::open_mapped_unsafe`; `RecordView`s whose borrowed payload is checked in debug builds; copy-out and batch
+  reads; verify, segment listing, the checkpoint marker and retention. Errors are values (`tickertape::result<T>`,
+  `[[nodiscard]]`, with a `Status`, message, OS error and corruption reason) whose `value()` throws, so it works with
+  and without `-fno-exceptions`. An exception thrown by a fill never crosses the C ABI: it is rethrown after the
+  aborted append, nested inside the library error if the clean-up failed, and destroying or moving the writer inside
+  its own fill is defined. Negative timeouts do not wait (unlike C). The header checks the C header's version at
+  compile time and the library's at every open. Tested as C++17, C++20 and C++17 without exceptions under
+  AddressSanitizer, UBSan and Valgrind, compile-tested as C++17/20/23 with GCC and Clang under `-Wconversion
+  -Wshadow -Wpedantic`, with an allocation check for the hot path and cross-language fixtures; tests fail if a C
+  function, status or corruption reason is added without a decision for the binding. A CMake package
+  (`tickertape::tickertape`, `tickertape::cpp`) serves `find_package` and `add_subdirectory`. The C++11 example
+  wrapper `examples/c/tickertape.hpp` is removed; `examples/c/example.cpp` now records, follows live and replays
+  with the binding, and the examples need C++17.
 - C ABI (ADR 0028, `docs/c-api.md`): a new workspace crate, `crates/tickertape-ffi`, builds `libtickertape` as a
   shared and a static library with a committed, cbindgen-generated C99/C++11 header (`include/tickertape.h`, checked
   for drift in CI) and cargo-c metadata for installation with a pkg-config file. It covers the writer (append,
