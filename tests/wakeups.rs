@@ -36,7 +36,7 @@ fn writer_publishes_a_notify_record() {
     assert_eq!(&bytes[..8], b"TTNOTIFY");
     drop(w);
     // A writer with wake-ups disabled removes the record, so readers poll.
-    let _w = tickertape_tests::reopen_writer(dir.path(), small_config().notify(false));
+    let _w = Writer::open(dir.path(), small_config().notify(false)).unwrap();
     assert!(!dir.path().join("notify").exists());
 }
 
@@ -48,7 +48,7 @@ fn ping_pong(
     rounds: u64,
     seed_name: &str,
 ) -> Vec<Duration> {
-    let mut w = tickertape_tests::reopen_writer(dir, small_config());
+    let mut w = Writer::open(dir, small_config()).unwrap();
     let first = w.next_seq();
     let path = dir.to_path_buf();
     let (sent_tx, sent_rx) = mpsc::channel::<Instant>();
@@ -161,7 +161,7 @@ fn reader_started_before_the_writer_gets_wake_ups() {
         delays[delays.len() / 2]
     });
     std::thread::sleep(Duration::from_millis(50));
-    let mut w = tickertape_tests::reopen_writer(dir.path(), small_config());
+    let mut w = Writer::open(dir.path(), small_config()).unwrap();
     std::thread::sleep(Duration::from_millis(350));
     for seq in 0..10 {
         std::thread::sleep(Duration::from_millis(20));
@@ -271,7 +271,7 @@ fn a_fifo_in_place_of_the_record_never_hangs() {
         "reader hung: {:?}",
         started.elapsed()
     );
-    let mut w = tickertape_tests::reopen_writer(dir.path(), small_config());
+    let mut w = Writer::open(dir.path(), small_config()).unwrap();
     append(&mut w, 0);
     assert_eq!(
         r.next_timeout(Some(Duration::from_secs(5)))
@@ -337,7 +337,7 @@ fn a_restarted_writer_is_noticed_within_the_refresh_interval() {
     let path = dir.path().to_path_buf();
     let writer = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(60));
-        let mut w2 = tickertape_tests::reopen_writer(&path, small_config());
+        let mut w2 = Writer::open(&path, small_config()).unwrap();
         let sent = Instant::now();
         append(&mut w2, 0);
         (sent, w2)
