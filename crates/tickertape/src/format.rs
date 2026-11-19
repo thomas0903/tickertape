@@ -887,12 +887,13 @@ const SEAL_CRC_BYTES: u64 = 12;
 /// bytes past it.
 const COVER_SLACK: u64 = 63;
 
-/// True if the frame at `offset` (commit word 0) is a completely written torn append whose body holds every non-zero
-/// byte up to `end`, so that a candidate at `first_candidate` lies inside its payload and is not evidence (ADR 0035).
+/// True if recovery takes the frame at `offset` (commit word 0) for a completely written torn append whose body
+/// holds every non-zero byte up to `end`, so that a candidate at `first_candidate` lies inside its payload and is
+/// not counted as evidence (ADR 0035). A heuristic on the CRC, not a proof.
 ///
 /// That is the case when its header is intact apart from the commit word (sequence number `expected_seq`, flags
 /// zero) and its stored CRC matches for some frame length `L` that fits with `end - offset <= L <= end - offset +`
-/// [`COVER_SLACK`]: a writer killed after storing the CRC and before the commit word leaves exactly this. A body
+/// [`COVER_SLACK`]: a writer killed after storing the CRC and before the commit word leaves such bytes. A body
 /// torn in the middle has no CRC yet (or one that doesn't match), and a payload that ends in more than
 /// [`COVER_SLACK`] zero bytes needs a length outside the range: both stay evidence. Each length tried can match by
 /// chance (`2^-32`), so a frame whose CRC also matches for a length ending where the first candidate starts is not

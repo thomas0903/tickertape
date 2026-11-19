@@ -15,17 +15,18 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   without dropping its writer still leaves the lock with such a child until it execs or exits, for its whole life if
   it never execs (crash contract C3).
 - Fixed: writer recovery no longer zeroes committed records in place when it finds evidence of them after an empty
-  commit word (storage damage that zeroed a commit word after the checkpoint, for example). It used to take every
-  empty commit word for the end of the journal and zero everything after it, under `RecoveryPolicy::Fail` too,
-  changing bytes that zero-copy readers had borrowed. It now searches the bytes after an empty commit word for
+  commit word (storage damage that zeroed a commit word after the checkpoint, for example). It used to zero
+  everything after an empty commit word (and then, where the expected successor opened, rewrite the seal and go on),
+  under `RecoveryPolicy::Fail` too, changing bytes that zero-copy readers had borrowed. It now searches the bytes after an empty commit word for
   committed history and, when it finds some, treats the tail as corruption: `Quarantine` preserves it in
   `quarantine/` and replaces the segment, `Fail` refuses (what an open under `Fail` may still change: crash contract
   C11). New `CorruptReason::EmptyCommitWord`, and `CorruptReason::UncheckedTail` when the search stops at its work
   bound before deciding, both also reported by `verify` and mapped in the C ABI
   (`TICKERTAPE_CORRUPT_EMPTY_COMMIT_WORD`, `TICKERTAPE_CORRUPT_UNCHECKED_TAIL`) (ADR 0035). `verify` and `inspect`
   now search the rest of a segment whose records end at an empty commit word, in bounded memory whatever length a
-  damaged slot claims. A damaged seal in front of a successor segment that opens is rewritten, keeping the records of
-  its segment (bytes after it are preserved first, or `Fail` refuses with `BadSeal`). Some damage still cannot be told
+  damaged slot claims. A seal whose marker is empty, in front of a successor segment that opens, is rewritten, keeping the records
+  of its segment (non-zero bytes beyond the seal's CRC word are preserved first, or `Fail` refuses with `BadSeal`);
+  a seal with its marker present and an invalid CRC is a corrupt tail like any other (crash contract C11 (1)). Some damage still cannot be told
   from a torn append and is zeroed in place as before, and a known gap remains in front of a successor that does not
   open (crash contract C8, C11). A torn record whose payload holds bytes the search counts as committed history (raw
   frames copied from another journal, for example) can be preserved, or refused under `Fail`, even after a plain

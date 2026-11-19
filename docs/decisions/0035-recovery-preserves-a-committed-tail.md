@@ -70,9 +70,11 @@ detected").
 
 **Candidates inside a completely written torn frame are not evidence.** If the frame at `P` has an intact header
 apart from its commit word (sequence number `S`, flags zero) and its stored CRC matches for a frame length `L` that
-fits and covers every non-zero byte after `P` (`L` from the end of the last non-zero byte to 63 bytes past it), it is
-a torn append whose body was completely written, and any candidate lies inside its payload: recovery treats `P` as a
-torn append. A writer killed after storing the CRC and before the commit store leaves exactly this. It does not cover
+fits and covers every non-zero byte after `P` (`L` from the end of the last non-zero byte to 63 bytes past it), and
+no matching length ends at the first candidate's aligned boundary, recovery takes it for a torn append whose body
+was completely written, with any candidate inside its payload, and treats `P` as a torn append. This is a heuristic
+on the CRC, not a proof: a writer killed after storing the CRC and before the commit store leaves such bytes, and
+damaged bytes can match by chance. It does not cover
 a body torn in the middle (no CRC yet, or a CRC the bytes don't match yet), or a payload ending in more than 63 zero
 bytes (its length lies outside the range tried): those stay evidence, the conservative side, and with a candidate
 inside them they are the process-crash exception below. Every length tried can
@@ -228,7 +230,9 @@ to its end, with the first record's body left, is the same case as the last row
 ### What recovery does with a committed tail
 
 It is corruption, handled under `RecoveryPolicy` exactly like an invalid record at `P`, reported as
-`CorruptReason::EmptyCommitWord(T)`:
+`CorruptReason::EmptyCommitWord(T)` when a record, a seal or a segment with a higher base is the evidence, and as
+`CorruptReason::UncheckedTail` when the search stopped at its work bound outside a completely written torn frame
+(the same repair or refusal either way):
 
 - `Quarantine` (default): preserve the bytes from `P` to the last non-zero byte of `X` in `quarantine/` (the zeros
   after it are left out), replace `X` by a copy with `[P, Z)` zeroed
@@ -317,11 +321,12 @@ before `P`.
 
 ### What cannot be detected
 
-Recovery and `verify` see only what is after `P`. **Any damage after which no record validates and no final seal or
-segment with a higher base remains** (a segment counting under the rules of evidence (3), so not one when only the
-seal's CRC word is left in front of a successor for exactly `S` that does not open) is byte for byte a torn append,
-and, unless a distinct, unentered segment for exactly `S` opens (then the seal branch decides, below), is zeroed like
-one: the records it covers are destroyed in place, and `ZeroedUncommitted` reports the action
+Recovery and `verify` see only what is after `P`. **Any damage after which the search counts no evidence** (it finds
+no record that validates and no final seal, no segment with a higher base counts under the rules of evidence (3), so
+not one when only the seal's CRC word is left in front of a successor for exactly `S` that does not open, and it does
+not stop at its work bound outside a completely written torn frame) is classified as a torn append: recovery cannot
+tell it from one, whether or not a real torn append could leave those bytes. Unless a distinct, unentered segment
+for exactly `S` opens (then the seal branch decides, below), it is zeroed like one: the records it covers are destroyed in place, and `ZeroedUncommitted` reports the action
 taken, though a reader may already have returned them. What else happens depends on the rest of the directory. In
 the newest segment, with no segment for `S` or above and nothing else wrong, the zeroing is all: nothing reaches
 `quarantine/`, `verify` reports nothing, and `Fail` does not refuse. A distinct, unentered segment for exactly `S`

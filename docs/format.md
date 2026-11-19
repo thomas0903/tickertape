@@ -252,8 +252,9 @@ Readers never modify a journal. Only the writer repairs it, on open, after takin
    cannot be detected).
 
 5. **Disconnected segments.** Every segment in the recovery domain that the scan did not visit (whatever its
-   `base_seq`, including one between visited segments) and every segment in the domain with an invalid header is
-   not part of the valid chain. `Quarantine`: preserve it by moving it into `quarantine/`. `Fail`: refuse.
+   `base_seq`, including one between visited segments) is not part of the valid chain. `Quarantine`: preserve it
+   by moving it into `quarantine/`. `Fail`: refuse. (A segment with an invalid header is usually such a segment;
+   where the scan itself has to open it, the open fails or the segment is replaced: crash contract C8.)
 
    With `Fail`, a refusal leaves the bytes at the corruption position it reports, and everything after them in that
    segment, untouched, and moves no file. The open is not read-only, though: the steps above run in order, and what

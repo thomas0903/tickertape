@@ -148,7 +148,9 @@ Never truncate or edit a segment in place while anything uses the journal: proce
   than about 50 ms to fill a single record whose payload itself contains valid tickertape frames with nearby sequence
   numbers (a journal that stores another journal's raw frames), `verify` can report that record as an empty commit
   word in front of committed records while it is being written; a second run after the record is committed reports
-  nothing. With no writer running, every problem it reports is real. Where a segment's records end at an empty
+  nothing. With no writer running, a problem it reports is in the files and will be met by the next open, though not always
+  storage damage: a record torn by a crash whose payload holds such frames is reported the same way (crash contract
+  C1). Where a segment's records end at an empty
   commit word, `verify` also searches the rest of that segment: it reads backward from the segment's end to find the
   last non-zero byte, then checks the candidates up to it, and can stop early (`cli.md` → `verify`).
 - `tickertape inspect <dir>` lists segments, their sequence ranges and fill level, and the checkpoint marker.
@@ -176,8 +178,8 @@ Never truncate or edit a segment in place while anything uses the journal: proce
   zeros): a last record whose payload ends in zero bytes declares a length that reaches past the end of the copy, and
   it only validates with those zeros put back. Some bytes are zeroed in place without a copy: damage that recovery
   cannot tell from a crash, and, for now, the bytes in front of a next segment that does not open (crash contract C8
-  and C11). A damaged seal in front of a next segment that opens is rewritten, keeping the records of its segment
-  (C11 (1)). If `quarantine/` holds two files with identical bytes for the same position, a repair was interrupted
+  and C11). A seal whose marker is empty, in front of a next segment that opens, is rewritten, keeping the records of its
+  segment; a seal with its marker present and an invalid CRC is a corrupt tail like any other (C11 (1)). If `quarantine/` holds two files with identical bytes for the same position, a repair was interrupted
   and repeated; either copy can be deleted.
   Readers that had seen discarded records get `Error::Discarded`, except after a repair in place (damage that can't
   be told from a crash, as above, so recovery zeroes the records after the empty commit word in the same file), which
