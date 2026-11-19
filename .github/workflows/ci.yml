@@ -67,6 +67,48 @@ jobs:
           target/release/tt-latency run --dir "$RUNNER_TEMP/tt-lat-smoke" --rate 20000 --count 20000 --payload 64 --reader mapped
           target/release/tt-checkpoint --dir "$RUNNER_TEMP/tt-ckpt-smoke" --payload 64 --batch 100 --checkpoints 2 --segment-size 65536
 
+  ffi:
+    name: c abi (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cbindgen@0.29.4
+      # The committed header must be exactly what cbindgen generates from the crate (ADR 0028).
+      - name: Header drift check
+        run: |
+          cbindgen --config crates/tickertape-ffi/cbindgen.toml --crate tickertape-ffi --output crates/tickertape-ffi/include/tickertape.h
+          git diff --exit-code -- crates/tickertape-ffi/include/tickertape.h
+      # Rust tests of the extern "C" functions, then the C99/C++11 programs, examples and cross-language fixtures,
+      # compiled with AddressSanitizer and UBSan.
+      - name: C ABI tests (AddressSanitizer, UBSan)
+        run: cargo test -p tickertape-ffi --locked
+        env:
+          TICKERTAPE_FFI_SANITIZE: '1'
+          TICKERTAPE_FFI_REQUIRE_PYTHON: '1'
+      - name: C and C++ programs under Valgrind
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends valgrind
+          cargo test -p tickertape-ffi --locked --test c_api
+        env:
+          TICKERTAPE_FFI_VALGRIND: '1'
+          TICKERTAPE_FFI_REQUIRE_PYTHON: '1'
+      - name: Examples build with make and CMake
+        run: |
+          cargo build --release -p tickertape-ffi --locked
+          make -C examples/c
+          cmake -S examples/c -B "$RUNNER_TEMP/examples"
+          cmake --build "$RUNNER_TEMP/examples"
+
   msrv:
     name: msrv
     runs-on: ubuntu-latest
@@ -89,13 +131,15 @@ jobs:
           command: check
 
   miri:
-    name: miri (format code)
+    name: miri (format code, C ABI)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install nightly --profile minimal --component miri,rust-src
       - run: cargo +nightly miri setup
       - run: cargo +nightly miri test -p tickertape --lib format
+      # The C ABI's argument handling, error mapping and option builders (the tests that touch no files).
+      - run: cargo +nightly miri test -p tickertape-ffi --lib pure_
 
   loom:
     name: loom (protocol model)
