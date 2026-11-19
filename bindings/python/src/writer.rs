@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError, TryLockError};
 
 use pyo3::buffer::PyBuffer;
-use pyo3::exceptions::{PyTypeError, PyValueError};
+use pyo3::exceptions::{PyMemoryError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::pybacked::PyBackedBytes;
 use pyo3::sync::MutexExt;
@@ -131,37 +131,42 @@ impl<T: Copy + for<'a, 'py> FromPyObject<'a, 'py>> Column<T> {
 }
 
 /// The error for a metadata argument that `iter()` refused: the exception that its type's `__iter__` raised,
-/// unchanged (it may be `KeyboardInterrupt`), or a `TypeError` naming the argument if the interpreter does not
-/// consider the type iterable at all (see `is_iterable_type`). If that cannot be decided, the original exception.
+/// unchanged (it may be `KeyboardInterrupt`), or a `TypeError` naming the argument if the interpreter cannot iterate
+/// the object at all. If that cannot be decided, the original exception.
+///
+/// `iter()` decides as follows: if the type's iterator slot (`tp_iter`) is filled, it calls it; otherwise, if the
+/// object passes the sequence check (`PySequence_Check`: a sequence item slot, as a class's `__getitem__` fills it but
+/// a C type's mapping-only `__getitem__`, such as `re.Match`'s, does not), it returns an index iterator, which
+/// cannot fail except for lack of memory; otherwise it refuses. The interpreter fills `tp_iter` from an `__iter__` in
+/// the dictionaries of the type and its bases, and `__iter__ = None` fills it with a slot that refuses (see
+/// `iter_slot`). So: an `__iter__` that is not `None` raised its own exception; with `__iter__ = None`, or without
+/// any `__iter__` (where a sequence would not have failed), the interpreter refused, unless it ran out of memory.
 fn not_iterable(obj: &Bound<'_, PyAny>, error: PyErr, name: &str) -> PyErr {
-    match is_iterable_type(&obj.get_type()) {
-        Ok(false) => PyTypeError::new_err(format!("{name} must be an int or a sequence of ints")),
-        Ok(true) | Err(_) => error,
+    match iter_slot(&obj.get_type()) {
+        Ok(Some(false) | None) if !error.is_instance_of::<PyMemoryError>(obj.py()) => {
+            PyTypeError::new_err(format!("{name} must be an int or a sequence of ints"))
+        }
+        Ok(_) | Err(_) => error,
     }
 }
 
-/// Whether `iter()` accepts instances of `ty`, decided as the interpreter decides it: from the type's iterator slot
-/// (`tp_iter`), or without one from its sequence item slot (`iter()` then iterates by index). The interpreter fills
-/// those slots from `__iter__` and `__getitem__` in the dictionaries of the type and its bases (`__iter__ = None`
-/// fills `tp_iter` with a slot that refuses), so this reads those dictionaries along the MRO, through `type`'s own
-/// descriptors: an attribute lookup on the type would go through its metaclass, which can hide or invent names.
-fn is_iterable_type(ty: &Bound<'_, PyType>) -> PyResult<bool> {
+/// The `__iter__` that fills `ty`'s iterator slot: `None` if no class in its MRO defines one (the slot is empty),
+/// `Some(false)` if the first one is `None` (the slot refuses), `Some(true)` otherwise. Reads the dictionaries along
+/// the MRO through `type`'s own descriptors, calling nothing on the object or its classes: an attribute lookup on the
+/// type would go through its metaclass, which can hide or invent names.
+fn iter_slot(ty: &Bound<'_, PyType>) -> PyResult<Option<bool>> {
     let type_dict = ty.py().get_type::<PyType>().getattr("__dict__")?;
     let mro = type_dict
         .get_item("__mro__")?
         .call_method1("__get__", (ty,))?;
     let dict_of = type_dict.get_item("__dict__")?;
-    let mut has_item = None;
     for base in mro.try_iter()? {
         let dict = dict_of.call_method1("__get__", (base?,))?;
         if dict.contains("__iter__")? {
-            return Ok(!dict.get_item("__iter__")?.is_none());
-        }
-        if has_item.is_none() && dict.contains("__getitem__")? {
-            has_item = Some(!dict.get_item("__getitem__")?.is_none());
+            return Ok(Some(!dict.get_item("__iter__")?.is_none()));
         }
     }
-    Ok(has_item.unwrap_or(false))
+    Ok(None)
 }
 
 /// Refuses a `payloads` argument that is itself one payload: `str` or any bytes-like object (iterating it would

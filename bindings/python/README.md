@@ -96,9 +96,12 @@ NumPy, pyarrow and pandas are optional and imported only when these methods are 
   other buffers once. The payload is then copied into the journal.
 - Every `Record` owns its payload as an ordinary `bytes` object; it stays valid after the reader moves on or closes.
   `RecordBatch` columns are `bytes` too; arrays made from them keep them alive.
-- A reader copies records into a staging buffer before building a result. Between reads it keeps at most 6 MiB of
-  that buffer for reuse (enough for `read_batch(10_000)` with payloads of a few hundred bytes); a larger one is
-  freed, with the GIL released, after the read has delivered its records and before the call returns.
+- A reader copies records into a staging buffer before building a result. Once all staged records have been
+  delivered, it keeps at most 6 MiB (6,291,456 bytes) of that buffer for reuse (enough for `read_batch(10_000)` with
+  payloads of a few hundred bytes); a larger one is freed, with the GIL released, by the read that delivers the last
+  of them, before the call returns (or by a `seek`). Records that a read took from the journal but did not deliver,
+  because it raised (on a signal, for example), stay staged in their buffer, however large, until a later read
+  returns them.
 - The reader is tickertape's safe `pread` reader, memory-safe whatever other processes do to the files. The
   zero-copy mapped reader of the Rust library is not exposed to Python.
 - Blocking calls (`next`, waiting `read_many`/`read_batch`, `checkpoint`, opening a writer, batch loops) release the
@@ -123,7 +126,7 @@ NumPy, pyarrow and pandas are optional and imported only when these methods are 
   fork is never released in the child: its state may be half-updated, and the dead thread's frame keeps a reference
   to it anyway, so its descriptors (for a writer, including the lock) stay open until the child exits or calls
   `exec`. A read that a signal handler interrupted to fork raises `UsedAfterForkError` in the child when the handler
-  returns, having consumed nothing. Open handles in the child after it starts, or use the `spawn` or `forkserver`
+  returns, having consumed nothing (also if its timeout passed meanwhile or the handler closed the reader). Open handles in the child after it starts, or use the `spawn` or `forkserver`
   start method.
 - Free-threaded Python: no free-threaded wheels are published (abi3 wheels cannot load there). Building from the
   sdist for 3.14t works and runs without the GIL, but it is not tested in CI.

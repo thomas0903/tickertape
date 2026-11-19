@@ -8,6 +8,8 @@ import inspect
 import itertools
 import math
 import os
+import re
+import signal
 import sys
 import threading
 import time
@@ -18,7 +20,7 @@ from typing import Any
 import pytest
 
 import tickertape as tt
-from helpers import SMALL_SEGMENT, append_pattern, as_tuples, pattern_tuple, synthetic_journal
+from helpers import SMALL_SEGMENT, append_pattern, as_tuples, needs_test_hooks, pattern_tuple, synthetic_journal
 
 
 def test_round_trip_and_metadata(journal: Path) -> None:
@@ -433,6 +435,9 @@ def test_append_many_propagates_the_exception_of_a_metadata_objects_iter(journal
     class NotIterable:
         __iter__ = None
 
+    match = re.match("a", "a")  # supports indexing (a mapping-only __getitem__) but not iteration
+    assert match is not None
+
     with tt.Writer(journal) as w:
         for error in (KeyboardInterrupt(), RuntimeError("no values today"), TypeError("not like this")):
             for cls in (Unreadable, HiddenUnreadable):
@@ -441,7 +446,7 @@ def test_append_many_propagates_the_exception_of_a_metadata_objects_iter(journal
                         w.append_many([b"a", b"b"], **{name: cls(error)})
                     assert caught.value is error
         # An object that is not iterable at all still gets the TypeError that names the argument.
-        for value in (object(), 1.5, NotIterable()):
+        for value in (object(), 1.5, NotIterable(), match):
             with pytest.raises(TypeError, match="venue_ts_ns must be an int or a sequence of ints"):
                 w.append_many([b"a"], venue_ts_ns=value)  # type: ignore[arg-type]
         assert w.next_seq == 0
@@ -692,6 +697,55 @@ def test_an_idle_reader_does_not_keep_a_large_delivered_batch(journal: Path, cal
         assert 0 < kept <= RETAINED_CAPACITY
         assert len(r.read_batch(100)) == 100
         assert capacity() == kept
+
+
+def test_the_staging_bound_depends_on_capacity_not_on_the_record_count(journal: Path) -> None:
+    """100,000 empty records grow the staging columns to 4,718,848 bytes (the figure documented in src/reader.rs),
+    below the bound, so their buffer is kept; 131,073 exceed it with metadata alone, so theirs is freed."""
+    with tt.Writer(journal, segment_size=64 << 20) as w:
+        w.append_many([b""] * 300_000)
+    with tt.Reader(journal) as r:
+        capacity = getattr(r, "_staging_capacity_for_testing")  # a test hook, not in the stubs
+        assert len(r.read_batch(100_000)) == 100_000
+        assert capacity() == 4_718_848
+        assert len(r.read_batch(131_073)) == 131_073
+        assert capacity() == 0
+
+
+@needs_test_hooks
+def test_a_read_that_raised_keeps_its_staged_batch_until_it_is_delivered(journal: Path) -> None:
+    """The bound applies once the staged records have been delivered: the buffer of a read that raised keeps them,
+    however large, and so does a smaller read that delivers only some of them; the read that delivers the last frees
+    it."""
+    with tt.Writer(journal, segment_size=64 << 20) as w:
+        w.append_many([b"x" * 7168] * 1024)  # 7 MiB: more than RETAINED_CAPACITY
+
+    class Interrupt(Exception):
+        pass
+
+    def handler(signum: int, frame: object) -> None:
+        raise Interrupt
+
+    previous = signal.signal(signal.SIGUSR1, handler)
+    try:
+        with tt.Reader(journal) as r:
+            capacity = getattr(r, "_staging_capacity_for_testing")  # a test hook, not in the stubs
+            getattr(r, "_arm_commit_race_for_testing")()  # test hooks, not in the stubs
+            race = getattr(r, "_race_commit_for_testing")
+            raced: list[bool] = []
+            helper = threading.Thread(target=lambda: raced.append(race(signal.SIGUSR1)))
+            helper.start()
+            with pytest.raises(Interrupt):
+                r.read_batch(1024)
+            helper.join()
+            assert raced == [True]
+            assert r.position == 0 and capacity() > RETAINED_CAPACITY
+            assert len(r.read_batch(24)) == 24
+            assert r.position == 24 and capacity() > RETAINED_CAPACITY
+            assert len(r.read_batch(2000)) == 1000  # the rest of the staged batch, and nothing more
+            assert r.position == 1024 and capacity() == 0
+    finally:
+        signal.signal(signal.SIGUSR1, previous)
 
 
 @pytest.mark.parametrize("payload_len", [64, 200])

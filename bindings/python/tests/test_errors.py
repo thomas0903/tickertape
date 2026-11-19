@@ -245,11 +245,31 @@ class UnprintableStr(str):
         raise RuntimeError("no str for you")
 
 
+class ClassRaises:
+    """An object with a working `__str__` whose `__class__` attribute raises (`isinstance` reads it)."""
+
+    def __str__(self) -> str:
+        return "printable"
+
+    @property  # type: ignore[misc]
+    def __class__(self) -> type:
+        raise RuntimeError("no class for you")
+
+
+class StrClassRaises(str):
+    """A `str` whose `__class__` attribute raises."""
+
+    @property  # type: ignore[misc]
+    def __class__(self) -> type:
+        raise RuntimeError("no class for you")
+
+
 def test_pickle_tolerates_deleted_attributes() -> None:
     """Deleting any attribute, on any exception class, does not break pickling; the copy lacks it too."""
     # With the message deleted, the copy's arguments come from the original's: a str is copied without calling a
     # subclass's __str__, and anything else is replaced by a fixed text.
-    for message, expected in ((UnprintableStr("message text"), "message text"), (b"bytes", "(message deleted)")):
+    for message, expected in ((UnprintableStr("message text"), "message text"), (b"bytes", "(message deleted)"),
+                              (ClassRaises(), "(message deleted)"), (StrClassRaises("text"), "text")):
         original = tt.TickertapeError("placeholder")
         original.args = (message,)
         del original.message

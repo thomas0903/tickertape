@@ -27,17 +27,27 @@ const WAIT_SLICE: Duration = Duration::from_millis(50);
 const HAND_OFF: Duration = Duration::from_millis(10);
 
 /// Staging capacity (bytes, all columns together) that a reader keeps between reads for the next one. Reusing it
-/// spares a read from allocating and page-faulting new buffers, which made `read_batch` measurably faster. A larger
-/// buffer is freed once all its records have been delivered, so an idle reader holds at most this much.
+/// spares a read from allocating and page-faulting new buffers, which made `read_batch` measurably faster.
+///
+/// The bound applies once every staged record has been delivered: the read that delivers the last of them frees the
+/// buffer if its capacity exceeds this (`Buffer::consume`), and so does a successful `seek`, or a read that refills
+/// an empty buffer (`Columns::clear`). So whenever no record is staged, a reader holds at most this much. While
+/// records are staged (a read raised, for example on a signal, before delivering them; or a smaller read delivered
+/// only the first of them), the buffer keeps whatever capacity holds them, however large, until a later read delivers
+/// the last of them or a `seek` drops them.
 ///
 /// What it holds: every record takes 36 bytes of metadata (8 each for `seq`, `venue_ts_ns`, `local_ts_ns` and its
 /// payload offset, 4 for `schema_id`) plus its payload. `fill` reserves metadata room for up to 4,096 records and
 /// each vector then doubles as it fills, so `read_batch(10_000)` grows the metadata to room for 16,384 records
-/// (589,856 bytes). The payload vector doubles from the first payload's length, so it ends below twice the payloads'
-/// total: 1 MiB for 10,000 payloads of 64 bytes (1.56 MiB in all), 3.125 MiB for 10,000 of 200 bytes (3.69 MiB in
-/// all), and under 4.6 MB in all for any 10,000 payloads averaging up to 200 bytes. Why 6 MiB: it keeps all of these,
-/// and every smaller batch, for reuse, while the buffer of a larger batch (100,000 records, or more than 6 MiB of
-/// payloads) is freed after delivery.
+/// (589,856 bytes), and any batch of 131,072 records or fewer to at most 4,718,848 bytes (room for 131,072 records;
+/// 100,000 empty records take exactly that). The metadata alone exceeds 6 MiB only above 131,072 records (8,388,864
+/// bytes at 131,073). The payload vector doubles from the first payload's length, so it ends below twice the
+/// payloads' total: 1 MiB for 10,000 payloads of 64 bytes (1.56 MiB in all), 3.125 MiB for 10,000 of 200 bytes (3.69
+/// MiB in all), and under 4.6 MB in all for any 10,000 payloads averaging up to 200 bytes. Why 6 MiB: it keeps all of
+/// these, and every smaller batch, for reuse. Whether a larger batch's buffer is kept depends only on the total
+/// capacity: a batch of more than 131,072 records, or one whose payload vector grew past 6 MiB, is always freed after
+/// delivery; a batch of 100,000 records is freed only if its payload vector grew past 1,572,608 bytes (6 MiB minus
+/// the 4,718,848 bytes of metadata).
 const RETAINED_CAPACITY: usize = 6 << 20;
 
 /// States of the test hook behind `Reader::_race_commit_for_testing` (feature `test-hooks`).
@@ -819,6 +829,15 @@ impl Reader {
     /// or building fails, the records stay staged and the next read returns them. If another thread (or a read in a
     /// signal handler) took them meanwhile, this call looks at the journal again: that can happen only when someone
     /// else advanced the cursor, so the loop makes progress.
+    ///
+    /// Fork: Python code that runs during the call (a signal handler, or a finalizer run by an allocation) may fork,
+    /// and the child resumes the call there. So the call checks the owner again on every way out that does not raise
+    /// an exception of that Python code: before every attempt to take the lock (each pass, `locked`,
+    /// `locked_attached`, `deliver`), before reporting a timeout or an empty non-blocking read, and before raising
+    /// `ValueError` for a closed reader or an error held back by an earlier batch. A child therefore raises
+    /// `UsedAfterForkError`, having consumed nothing. A returned value needs no check after the commit: `deliver`
+    /// checks immediately before it, and no Python code runs in between. An exception raised by a handler (or by
+    /// building the result) propagates unchanged, in the child too.
     fn read<T, U>(
         &self,
         py: Python<'_>,
@@ -834,8 +853,11 @@ impl Reader {
         let no_wait = timeout == Timeout::ZERO;
         let deadline = timeout.deadline(Instant::now());
         let mut waited = false;
+        // In a forked child, `UsedAfterForkError` instead (see above).
         let closed = |waited: bool| {
-            if waited {
+            if let Err(e) = self.owner.check(py, "Reader") {
+                e
+            } else if waited {
                 errors::closed_while_waiting()
             } else {
                 errors::closed("reader")
@@ -863,7 +885,11 @@ impl Reader {
                     .ok_or_else(|| closed(waited))?;
                 match staged {
                     Some(staged) => staged,
-                    None => return Ok(None),
+                    None => {
+                        // No signal check ran, but taking the lock may have re-acquired the GIL.
+                        self.owner.check(py, "Reader")?;
+                        return Ok(None);
+                    }
                 }
             } else {
                 let (ready, slice) = self
@@ -890,6 +916,9 @@ impl Reader {
                         return Err(closed(waited));
                     }
                     if no_wait || deadline.is_some_and(|d| Instant::now() >= d) {
+                        // A handler that ran in the signal check above may have forked (`locked` re-acquired the
+                        // GIL too): the child must not report a timeout.
+                        self.owner.check(py, "Reader")?;
                         return Ok(None);
                     }
                     continue;
@@ -908,7 +937,12 @@ impl Reader {
                     epoch,
                     count,
                 } => (value, epoch, count),
-                Staged::Error(e) => return Err(errors::to_py(py, &e)),
+                Staged::Error(e) => {
+                    // Building the exception runs Python code.
+                    let error = errors::to_py(py, &e);
+                    self.owner.check(py, "Reader")?;
+                    return Err(error);
+                }
                 // Taken by another thread or a signal handler: look at the journal again.
                 Staged::Nothing => continue,
             };
@@ -1092,7 +1126,15 @@ impl Reader {
             |buffer, n| buffer.records(py, n),
             |records| Ok(PyList::new(py, records)?.unbind()),
         )?;
-        list.map_or_else(|| Ok(PyList::empty(py).unbind()), Ok)
+        list.map_or_else(
+            || {
+                // Allocating the empty list may run the garbage collector, and so finalizers that fork.
+                let empty = PyList::empty(py).unbind();
+                self.owner.check(py, "Reader")?;
+                Ok(empty)
+            },
+            Ok,
+        )
     }
 
     /// Like `read_many`, but returns the records as a columnar `RecordBatch`.
@@ -1114,7 +1156,12 @@ impl Reader {
             |batch| Py::new(py, batch),
         )?;
         batch.map_or_else(
-            || Py::new(py, Columns::with_capacity(0).batch(py, 0, 0)),
+            || {
+                // As in `read_many`.
+                let empty = Py::new(py, Columns::with_capacity(0).batch(py, 0, 0))?;
+                self.owner.check(py, "Reader")?;
+                Ok(empty)
+            },
             Ok,
         )
     }

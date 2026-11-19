@@ -397,9 +397,11 @@ def test_handles_refuse_use_after_fork(journal: Path, prefault: bool) -> None:
 # A signal whose handler raises arrives at a random moment of a read that returns a large result, often while the
 # result is being built. The records must either reach the caller or stay staged for the next read. A timer signal
 # (SIGALRM) is used because the kernel delivers it while the reading thread holds the GIL, which a Python thread
-# could not do. One loss is tolerated: the documented window after the call has returned its result and before
-# Python stores it, which is a few microseconds long and can be told apart because the cursor had already moved
-# when the handler ran.
+# could not do. The handler may also run after the read's final signal check, once the call has returned and before
+# Python stores the result: that loses the value, as documented, and may happen any number of times. Every attempt
+# checks what is guaranteed, whenever the signal arrives: if the read raised, it consumed nothing (the cursor is still
+# at 0, as it was when the handler ran, and the next read returns all the records); if it returned, exactly the
+# returned records were consumed (the cursor is at the end, and was when a late handler ran).
 INTERRUPTED_WHILE_BUILDING = """
     import random, signal, sys, time
     import tickertape as tt
@@ -467,16 +469,23 @@ INTERRUPTED_WHILE_BUILDING = """
             signal.setitimer(signal.ITIMER_REAL, 0)
         except Interrupt:
             signal.setitimer(signal.ITIMER_REAL, 0)
+            position = reader.position
             if box:
-                delivered += 1  # the handler ran after the result was stored
-            elif seen[0] != 0:
-                after_return += 1  # the documented window: returned, not yet stored
+                assert position == count, position  # the handler ran after the result was stored
+                delivered += 1
+            elif position != 0:
+                # The read returned and the handler raised before Python stored the result (after the final signal
+                # check): the returned records were consumed, and the value is lost.
+                assert position == count and seen == [count], (position, seen)
+                after_return += 1
                 continue
             else:
+                # The read raised: it consumed nothing, and the next read returns its records.
+                assert seen == [0], seen
                 staged += 1
-                assert reader.position == 0, reader.position
-                box.append(read())  # the interrupted call's records are returned by the next read
+                box.append(read())
         else:
+            assert reader.position == count, reader.position
             delivered += 1
             durations.append(took)
         check(box[0])
@@ -488,7 +497,7 @@ INTERRUPTED_WHILE_BUILDING = """
 def test_interrupt_while_the_result_is_built_keeps_the_records(journal: Path, call: str) -> None:
     staged, after_return, delivered = map(int, run_script(INTERRUPTED_WHILE_BUILDING, journal, call,
                                                           timeout=120).split())
-    assert after_return <= 1, (staged, after_return, delivered)
+    # Any number of late signals (`after_return`) is allowed; the script checked every attempt.
     assert staged >= 10, (staged, after_return, delivered)  # the test did interrupt reads
 
 
@@ -936,7 +945,10 @@ def test_fork_while_threads_are_inside_calls(journal: Path) -> None:
 # must raise UsedAfterForkError in the child instead of waiting for that lock. "deliver": the handler runs while the
 # read retries the lock to deliver a built result, and the race hook's thread holds the lock until the read stops
 # retrying. "wait": the handler runs between two wait slices of a blocking read, after a thread has taken the lock and
-# kept it (as a thread inside a call would hold it at the fork). A watchdog kills a child that has not finished within
+# kept it (as a thread inside a call would hold it at the fork). "timeout": a timer signal (SIGALRM) arrives during a
+# read with a 0.2 s timeout on an empty journal, and the handler takes longer than that before it forks, so the read
+# resumes past its deadline: the child must not report a timeout. "closed": the handler closes the reader and forks:
+# the child must not raise ValueError for the closed reader. A watchdog kills a child that has not finished within
 # 10 s.
 FORK_IN_HANDLER = """
     import os, signal, sys, threading, time, warnings
@@ -955,6 +967,10 @@ FORK_IN_HANDLER = """
             holder = threading.Thread(target=reader._lock_forever_for_testing)
             holder.start()
             holder.join()
+        elif where == "timeout":
+            time.sleep(0.25)  # the read's deadline passes before the handler returns
+        elif where == "closed":
+            reader.close()
         pid = os.fork()
         if pid == 0:
             return  # the child resumes the read
@@ -962,6 +978,7 @@ FORK_IN_HANDLER = """
         raise Interrupt
 
     signal.signal(signal.SIGUSR1, handler)
+    signal.signal(signal.SIGALRM, handler)
     with tt.Writer(path, segment_size=1 << 20) as writer:
         writer.append_many([b"record"] * 10)
     outcomes = []
@@ -973,11 +990,16 @@ FORK_IN_HANDLER = """
             helper = threading.Thread(target=lambda: raced.append(reader._race_commit_for_testing(signal.SIGUSR1)))
             helper.start()
             read = lambda: reader.read_many(10)
-        else:
+        elif where == "wait":
             reader.seek(10)  # nothing there: the read waits
             helper = threading.Timer(0.2, signal.raise_signal, (signal.SIGUSR1,))
             helper.start()
             read = lambda: reader.next(timeout=10)
+        else:
+            reader.seek(10)
+            helper = None
+            signal.setitimer(signal.ITIMER_REAL, 0.02)
+            read = lambda: reader.next(timeout=0.2 if where == "timeout" else 10)
         try:
             got = read()
         except tt.UsedAfterForkError:
@@ -987,8 +1009,9 @@ FORK_IN_HANDLER = """
         except BaseException:
             os._exit(3)  # the child, failing otherwise (or the parent: no child then, the wait below fails)
         else:
-            os._exit(2)  # the child returned records it must not deliver (or the parent: no signal arrived)
-        helper.join()
+            os._exit(2)  # the child returned (records, or a timeout) (or the parent: no signal arrived)
+        if helper is not None:
+            helper.join()
         assert raced == ([True] if where == "deliver" else []), raced
         child = children.pop()
         deadline = time.monotonic() + 10  # the watchdog
@@ -1000,15 +1023,16 @@ FORK_IN_HANDLER = """
             outcomes.append("hung")
         else:
             code = os.waitstatus_to_exitcode(done[1])
-            outcomes.append({0: "refused", 2: "delivered", 3: "failed"}.get(code, f"exit {code}"))
+            outcomes.append({0: "refused", 2: "returned", 3: "failed"}.get(code, f"exit {code}"))
     print(sorted(set(map(str, outcomes))))
 """
 
 
-@needs_test_hooks
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="needs fork")
-@pytest.mark.parametrize("where", ["deliver", "wait"])
+@pytest.mark.parametrize("where", ["deliver", "wait", "timeout", "closed"])
 def test_fork_in_a_signal_handler_during_a_read_does_not_hang_the_child(journal: Path, where: str) -> None:
+    if where in ("deliver", "wait") and not hasattr(tt.Reader, "_race_commit_for_testing"):
+        pytest.skip(needs_test_hooks.kwargs["reason"])  # "timeout" and "closed" need no hooks
     runs = int(os.environ.get("TICKERTAPE_DELIVERY_RUNS", "20" if where == "deliver" else "3"))
     out = run_script(FORK_IN_HANDLER, journal, where, runs, timeout=60 + 11 * runs).strip()
     assert out == "['refused']", out

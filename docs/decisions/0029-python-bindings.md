@@ -143,13 +143,20 @@ documentation says so. Because the delivery only tries the mutex, a stream of ca
 example repeated `seek`s, which also make the read start over) can delay a delivery indefinitely; the read stays
 interruptible, since every attempt is preceded by a signal check.
 
-After delivering, a read keeps the buffer's capacity for the next read if it is at most 6 MiB (all columns together):
-`read_batch(10_000)` grows the columns to 1.56 MiB with 64-byte payloads and 3.69 MiB with 200-byte ones (the vectors
-double as they fill), so the common batch sizes reuse their buffer, which made `read_batch` measurably faster. A
-larger buffer is swapped for an unallocated one under the mutex (nothing is allocated or freed between the final
+After delivering the last staged record, a read keeps the buffer's capacity for the next read if it is at most 6 MiB
+(6,291,456 bytes, all columns together): `read_batch(10_000)` grows the columns to 1.56 MiB with 64-byte payloads and
+3.69 MiB with 200-byte ones (the vectors double as they fill), so the common batch sizes reuse their buffer, which made
+`read_batch` measurably faster. Whether a buffer is kept depends only on its capacity, not on the number of records:
+the metadata of up to 131,072 records takes at most 4,718,848 bytes (100,000 empty records take exactly that, and
+their buffer is kept), so such a batch is freed only if its payloads grew their vector past the remaining 1,572,608
+bytes; above 131,072 records the metadata alone exceeds 6 MiB. A larger buffer is swapped for an unallocated one under the mutex (nothing is allocated or freed between the final
 signal check and the commit) and freed synchronously after the mutex is released, with the GIL released, before the
 call returns. That happens after the commit, so a signal arriving while it runs is handled when the call returns (the
-boundary above). An idle reader holds at most 6 MiB. An earlier version freed it in a short-lived thread instead;
+boundary above). A successful `seek` frees it too. So the bound is exact in this sense: whenever no record is staged,
+a reader holds at most 6 MiB of staging capacity. While records are staged, the buffer that holds them is kept whatever
+its size: a read that raised (on a signal, for example) keeps its staged batch until a later read delivers it (a
+7 MiB batch stays allocated between the two calls and is freed by the read that returns it), and a read for fewer
+records than are staged delivers only the first of them and keeps the rest. An earlier version freed it in a short-lived thread instead;
 that made every large read start a thread, made a reader-only process multithreaded before a later `fork`, and could
 strand the buffer in a child forked meanwhile.
 

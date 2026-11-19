@@ -128,15 +128,19 @@ jobs:
           done
       - name: Test the musllinux wheel in Alpine (test suite and end-to-end example)
         if: matrix.platform == 'musllinux'
+        # One command per line, each from /src (pytest in a subshell), so `sh -e` stops at the first that fails: `-e`
+        # does not apply to a command on the left of `&&`, and a failed `cd ... && pytest && cd /src` went on in the
+        # wrong directory.
         run: |
           # Multi-arch index digests, pinned like the actions; update them together with the tags.
           for image in \
               python:3.11-alpine@sha256:7fbad8e4652eae0186429a6f26cf5b23e27e8c6fd7ac4d0cfd7a6988cdeea1e1 \
               python:3.15-alpine@sha256:0f9552bb28711333da16915ec146f5e6bb44a7fdac9ced15dc17c2e0206346dd; do
             docker run --rm -v "$PWD:/src:ro" -w /src "$image" sh -ec '
-              python -m venv /tmp/venv && /tmp/venv/bin/pip install dist/*.whl pytest
+              python -m venv /tmp/venv
+              /tmp/venv/bin/pip install dist/*.whl pytest
               /tmp/venv/bin/python -c "import tickertape as tt; assert not hasattr(tt.Reader, \"_race_commit_for_testing\")"
-              cd bindings/python && /tmp/venv/bin/python -m pytest -p no:cacheprovider && cd /src
+              (cd bindings/python && /tmp/venv/bin/python -m pytest -p no:cacheprovider)
               /tmp/venv/bin/python bindings/python/examples/end_to_end.py /tmp/journal'
           done
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

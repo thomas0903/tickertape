@@ -49,9 +49,10 @@ class TickertapeError(Exception):
         fields = {name: value for name in names if (value := getattr(self, name, missing)) is not missing}
         message = getattr(self, "message", missing)
         if message is missing:
-            # Cannot raise: a str argument is copied as it is, without calling a subclass's __str__.
+            # Cannot raise: nothing is called on the argument. Its type comes from type(), not isinstance() (which
+            # reads a __class__ attribute that can raise), and a str is copied without calling a subclass's __str__.
             first = self.args[0] if self.args else None
-            message = str.__str__(first) if isinstance(first, str) else "(message deleted)"
+            message = str.__str__(first) if issubclass(type(first), str) else "(message deleted)"
         state = {key: value for key, value in self.__dict__.items()
                  if key not in fields and key not in ("message", "_tickertape_fields")}
         return (_rebuild, (type(self), message, fields, "message" not in self.__dict__), state or None)
