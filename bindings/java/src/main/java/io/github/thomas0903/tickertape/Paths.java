@@ -63,7 +63,7 @@ final class Paths {
         }
         // U+FFFD is what decoding put in place of bytes it could not decode; a name may also contain the character
         // itself, which survives, so only the round trip decides (the JDK compares paths by their bytes).
-        if (s.indexOf('�') >= 0 && !Path.of(s).equals(p)) {
+        if (s.indexOf('\uFFFD') >= 0 && !Path.of(s).equals(p)) {
             throw notConvertible(p);
         }
         try {

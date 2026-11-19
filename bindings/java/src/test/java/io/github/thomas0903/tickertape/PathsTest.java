@@ -78,7 +78,7 @@ class PathsTest {
     /** Names the JVM can decode keep working, also as a directory listing returns them (on macOS, NFC or NFD). */
     @Test
     void nonAsciiNamesWork() throws Exception {
-        String name = "journal-é中";
+        String name = "journal-\u00e9\u4e2d";
         assumeTrue(Paths.FILE_NAMES.newEncoder().canEncode(name), "the file-system encoding cannot represent " + name);
         Path dir = tmp.resolve(name);
         journal(dir);
