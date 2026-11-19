@@ -7,8 +7,8 @@ use tickertape::fault::Point;
 use tickertape::retention::{self, Action, Policy};
 use tickertape::{Error, NewRecord, OwnedRecord, Reader, ReaderConfig, RecoveryAction, Writer};
 use tickertape_tests::{
-    append_n, check_record, corrupt_by_replacement, read_all, reopen_writer, segments,
-    small_config, zero_commit_word,
+    append_n, check_record, corrupt_by_replacement, read_all, segments, small_config,
+    zero_commit_word,
 };
 
 fn open(dir: &std::path::Path, mapped: bool) -> Reader {
@@ -205,7 +205,7 @@ fn append_history(writer: &mut Writer, n: u64, tag: u32) {
 /// and checkpoints, appends `tail` more, and stops.
 fn repair(dir: &std::path::Path, corrupt: u64, checkpointed: u64, tail: u64, tag: u32) {
     corrupt_by_replacement(dir, corrupt);
-    let mut writer = reopen_writer(dir, small_config());
+    let mut writer = Writer::open(dir, small_config()).unwrap();
     assert_eq!(
         writer.next_seq(),
         corrupt,
@@ -407,7 +407,7 @@ fn second_repair_before_the_identity_check_is_discarded() {
 
         // The reader holds the third history's file; the writer checkpoints, then a repair lands after the reader
         // reads that marker.
-        let mut writer = reopen_writer(dir.path(), small_config());
+        let mut writer = Writer::open(dir.path(), small_config()).unwrap();
         append_history(&mut writer, 10, 98);
         writer.checkpoint().unwrap(); // covers 50..60
         append_history(&mut writer, 10, 98); // 60..70, not checkpointed
@@ -435,7 +435,7 @@ fn repair_in_place(dir: &std::path::Path, damaged: u64, checkpointed: u64, tag: 
     let path = segments(dir).pop().unwrap().1;
     let before = identity(&path);
     zero_commit_word(dir, damaged);
-    let mut writer = reopen_writer(dir, small_config());
+    let mut writer = Writer::open(dir, small_config()).unwrap();
     assert_eq!(
         writer.next_seq(),
         damaged,
@@ -500,7 +500,7 @@ fn durable_only_reader_rereads_the_tail_after_an_in_place_repair() {
                 );
 
                 // The cursor is on a record boundary of the new history: the reader follows it on.
-                let mut writer = reopen_writer(dir.path(), small_config());
+                let mut writer = Writer::open(dir.path(), small_config()).unwrap();
                 append_history(&mut writer, 10, 99);
                 writer.checkpoint().unwrap();
                 let (records, discarded) = drain(&mut reader, end + 10);
@@ -693,7 +693,7 @@ fn durable_only_reader_sees_a_seal_written_over_a_buffered_record() {
         assert!(reader.try_next().unwrap().is_none());
 
         zero_commit_word(dir.path(), 3);
-        let mut writer = reopen_writer(dir.path(), small_config());
+        let mut writer = Writer::open(dir.path(), small_config()).unwrap();
         assert_eq!(writer.next_seq(), 3);
         assert!(
             writer

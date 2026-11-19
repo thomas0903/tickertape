@@ -436,7 +436,7 @@ fn current_writer_recovers_appends_and_checkpoints() {
                 f.name
             );
         }
-        let reopened = tickertape_tests::reopen_writer(&dir, config());
+        let reopened = Writer::open(&dir, config()).unwrap();
         assert!(reopened.recovery_report().actions.is_empty(), "{}", f.name);
         assert_eq!(reopened.next_seq(), start + 40);
     }
