@@ -1,10 +1,13 @@
 package io.github.thomas0903.tickertape;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
@@ -90,5 +93,50 @@ class PathsTest {
             }
             assertEquals(1, Journal.verify(p).records());
         }
+    }
+
+    /**
+     * With {@code jdk.nio.path.useNormalizationFormD} on macOS the JDK encodes a path's text in form D (and shows it in
+     * form C), so the binding must encode form D too; without it, the text as it is. The JDK reads the property at
+     * start-up, so the conversion is tested with the setting passed in.
+     */
+    @Test
+    void anAccentedNameIsEncodedAsTheJdkDoesUnderEitherNormalizationSetting() throws Exception {
+        String composed = "journal-caf\u00e9"; // as Path.toString() shows it in either setting
+        String decomposed = "journal-cafe\u0301";
+        byte[] nfc = composed.getBytes(StandardCharsets.UTF_8);
+        byte[] nfd = decomposed.getBytes(StandardCharsets.UTF_8);
+        assertFalse(java.util.Arrays.equals(nfc, nfd));
+
+        assertArrayEquals(nfd, Paths.encode(composed, StandardCharsets.UTF_8, true));
+        assertArrayEquals(nfd, Paths.encode(decomposed, StandardCharsets.UTF_8, true));
+        assertArrayEquals(nfc, Paths.encode(composed, StandardCharsets.UTF_8, false));
+        assertArrayEquals(nfd, Paths.encode(decomposed, StandardCharsets.UTF_8, false));
+        byte[] ascii = "journal-a".getBytes(StandardCharsets.UTF_8);
+        assertArrayEquals(ascii, Paths.encode("journal-a", StandardCharsets.UTF_8, true));
+    }
+
+    /** The property is on when empty or {@code true} (any case), as the JDK reads it, and only on macOS. */
+    @Test
+    void theNormalizationPropertyIsReadAsTheJdkReadsIt() {
+        assertTrue(Paths.normalizationProperty(""));
+        assertTrue(Paths.normalizationProperty("true"));
+        assertTrue(Paths.normalizationProperty("TRUE"));
+        assertFalse(Paths.normalizationProperty(null));
+        assertFalse(Paths.normalizationProperty("false"));
+        assertFalse(Paths.normalizationProperty("yes"));
+        boolean mac = System.getProperty("os.name").startsWith("Mac");
+        boolean set = Paths.normalizationProperty(System.getProperty("jdk.nio.path.useNormalizationFormD"));
+        assertEquals(mac && set, Paths.NORMALIZE_TO_NFD);
+    }
+
+    /** End to end in this JVM: the bytes the binding uses for an accented path are those of the setting in effect. */
+    @Test
+    void anAccentedPathConvertsWithTheSettingInEffect() throws Exception {
+        String name = "journal-caf\u00e9";
+        assumeTrue(Paths.FILE_NAMES.newEncoder().canEncode(name), "the file-system encoding cannot represent " + name);
+        Path p = tmp.resolve(name);
+        byte[] expected = Paths.encode(p.toString(), Paths.FILE_NAMES, Paths.NORMALIZE_TO_NFD);
+        assertArrayEquals(expected, Paths.nativeBytes(p));
     }
 }

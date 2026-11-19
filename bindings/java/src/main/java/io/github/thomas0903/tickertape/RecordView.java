@@ -71,7 +71,10 @@ public final class RecordView {
     /** The payload's offset in {@link #memory}. */
     private long base;
     private long length;
-    /** The last direct (or read-only) buffer {@link #copyPayloadTo(ByteBuffer)} copied into, with its segment. */
+    /**
+     * The last direct buffer {@link #copyPayloadTo(ByteBuffer)} copied into, with its segment. Reachable only from this
+     * view (and so from its reader or batch): no global root reaches a view, not even a reader's Cleaner action.
+     */
     private BufferSegment lastBuffer;
 
     private RecordView(Object owner, Reader reader, Generation generation, MemorySegment memory) {
@@ -289,8 +292,9 @@ public final class RecordView {
 
     /**
      * Copies the whole payload into {@code dst} at its position and advances the position. For a direct buffer the
-     * view remembers a segment over the last buffer it copied into (and so keeps that buffer reachable), so repeated
-     * copies into one buffer allocate nothing; the first copy into another direct buffer allocates a small wrapper.
+     * view remembers a segment over the last buffer it copied into (and so keeps that buffer reachable for as long as
+     * the view is), so repeated copies into the same buffer allocate nothing; the first copy into another direct buffer
+     * allocates a small object.
      *
      * @throws BufferOverflowException if fewer than {@link #payloadLength()} bytes remain in {@code dst}
      */

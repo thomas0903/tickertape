@@ -8,16 +8,18 @@ import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.lang.ref.WeakReference;
+import java.nio.ByteBuffer;
 import java.nio.file.Path;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 /** Use after close, views after the next call, payload segments after their scope, and the Cleaner safety net. */
-@SuppressWarnings("try") // closes resources inside their try blocks on purpose
+@SuppressWarnings({"try", "restricted"}) // closes resources inside their try blocks on purpose; reinterpret
 class LifetimeTest {
     @TempDir
     Path tmp;
@@ -254,6 +256,61 @@ class LifetimeTest {
             System.gc();
             Thread.sleep(10);
         }
+    }
+
+    /**
+     * The writer remembers the last direct buffer a fill copied from. That memory must be reachable only from the
+     * writer, never from the upcall stub (whose target is a global root until the writer is freed): here the buffer's
+     * arena is never closed and its clean-up action refers to the writer, so a stub that reached the buffer would keep
+     * the writer, and the journal's lock, for ever.
+     */
+    @Test
+    void anUnclosedWriterWhoseLastSourceBufferRefersToItIsReleasedByTheCleaner() throws Exception {
+        Path dir = tmp.resolve("j");
+        WeakReference<Writer> ref = appendFromABufferThatRefersTo(dir);
+        awaitReopenable(dir, ref);
+    }
+
+    private static WeakReference<Writer> appendFromABufferThatRefersTo(Path dir) {
+        Writer w = Writer.open(dir, TestSupport.small());
+        ByteBuffer src = bufferReferring(w);
+        src.put(0, (byte) 7);
+        w.appendWith(1, 0, 0, 1, p -> p.put(0, src.limit(1)));
+        return new WeakReference<>(w);
+    }
+
+    /**
+     * A direct buffer whose memory keeps {@code owner} reachable: its arena (shared, never closed) has a clean-up
+     * action that refers to {@code owner}. Collecting both is up to the collector: they form a cycle.
+     */
+    private static ByteBuffer bufferReferring(Object owner) {
+        Arena arena = Arena.ofShared();
+        Object[] holder = {owner};
+        return arena.allocate(8).reinterpret(8, arena, s -> holder[0].hashCode()).asByteBuffer();
+    }
+
+    /** As above for a reader's view, which remembers the last direct buffer it copied into. */
+    @Test
+    void anUnclosedReaderWhoseViewsLastTargetBufferRefersToItIsCollected() throws Exception {
+        Path dir = journal(2);
+        WeakReference<Reader> ref = copyIntoABufferThatRefersTo(dir);
+        long deadline = System.nanoTime() + 20_000_000_000L;
+        while (ref.get() != null) {
+            if (System.nanoTime() > deadline) {
+                throw new AssertionError("a forgotten reader whose view copied into such a buffer was never collected");
+            }
+            System.gc();
+            Thread.sleep(10);
+        }
+    }
+
+    private static WeakReference<Reader> copyIntoABufferThatRefersTo(Path dir) {
+        Reader r = Reader.openMappedUnsafe(dir);
+        ByteBuffer dst = bufferReferring(r);
+        r.tryNext().copyPayloadTo(dst.clear());
+        r.tryNext().copyPayloadTo(dst.clear());
+        assertEquals(1, dst.get(0));
+        return new WeakReference<>(r);
     }
 
     private static void awaitReopenable(Path dir, WeakReference<Writer> ref) throws Exception {

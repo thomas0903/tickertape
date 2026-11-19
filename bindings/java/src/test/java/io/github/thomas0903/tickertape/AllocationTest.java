@@ -104,6 +104,7 @@ class AllocationTest {
             MemorySegment heapPayload = MemorySegment.ofArray(new byte[64]);
             ByteBuffer direct = ByteBuffer.allocateDirect(64);
             ByteBuffer heap = ByteBuffer.allocate(64);
+            ByteBuffer readOnly = ByteBuffer.allocate(64).asReadOnlyBuffer(); // no accessible array
 
             measure("append(byte[])", i -> w.append(1, i, i, payload));
             measure("append(native MemorySegment)", i -> w.append(1, i, i, nativePayload));
@@ -119,10 +120,19 @@ class AllocationTest {
             measure("appendWith, PayloadBuffer.put(byte[])", i -> w.appendWith(1, i, i, 64, putArray));
             PayloadFiller putSegment = p -> p.put(0, nativePayload);
             measure("appendWith, PayloadBuffer.put(MemorySegment)", i -> w.appendWith(1, i, i, 64, putSegment));
+            PayloadFiller putHeapSegment = p -> p.put(0, heapPayload);
+            measure("appendWith, PayloadBuffer.put(heap MemorySegment)", i -> w.appendWith(1, i, i, 64, putHeapSegment));
             PayloadFiller putDirect = p -> p.put(0, direct);
             measure("appendWith, PayloadBuffer.put(direct ByteBuffer)", i -> w.appendWith(1, i, i, 64, putDirect));
             PayloadFiller putHeap = p -> p.put(0, heap);
             measure("appendWith, PayloadBuffer.put(heap ByteBuffer)", i -> w.appendWith(1, i, i, 64, putHeap));
+            PayloadFiller putReadOnly = p -> p.put(0, readOnly);
+            measure("appendWith, PayloadBuffer.put(read-only heap ByteBuffer)",
+                    i -> w.appendWith(1, i, i, 64, putReadOnly));
+            // A read-only source must not evict the direct one (one remembered buffer per kind).
+            PayloadFiller putBoth = p -> p.put(0, readOnly).put(0, direct);
+            measure("appendWith, PayloadBuffer.put alternating a read-only heap and a direct ByteBuffer",
+                    i -> w.appendWith(1, i, i, 64, (i & 1) == 0 ? putBoth : putDirect));
 
             // One call each: add (with a clear every 16 adds, so the batch keeps its size) and appendBatch.
             AppendBatch adds = new AppendBatch(16, 16 * 64);
@@ -137,6 +147,12 @@ class AllocationTest {
                     adds.clear();
                 }
                 adds.add(1, i, i, nativePayload);
+            });
+            measure("AppendBatch.add(heap MemorySegment)", i -> {
+                if (adds.size() == 16) {
+                    adds.clear();
+                }
+                adds.add(1, i, i, heapPayload);
             });
             measure("AppendBatch.add(direct ByteBuffer)", i -> {
                 if (adds.size() == 16) {

@@ -14,7 +14,8 @@ import java.util.Objects;
  * segment. A {@link PayloadFiller} receives one; it is valid only on the thread running the filler and only until the
  * filler returns. Every method throws {@link WrongThreadException} on any other thread (do not hand the buffer, or its
  * {@link #segment()}, to another thread), and {@link IllegalStateException} after the filler has returned. The writer
- * reuses one object for all its appends, so filling allocates nothing (unless you ask for {@link #segment()}).
+ * reuses one object for all its appends, so the writes allocate nothing, except {@link #segment()} and a
+ * {@link #put(long, ByteBuffer)} from a direct or read-only buffer other than the last one of its kind.
  *
  * <p>The bytes start zeroed, and no reader can see them until the filler returns normally and the record is committed.
  * Offsets are checked against {@link #length()}. Typed writes take the layout to use, as
@@ -33,10 +34,24 @@ public final class PayloadBuffer {
      */
     private Thread thread;
     private Arena arena;
-    /** The last direct (or read-only) buffer {@link #put(long, ByteBuffer)} copied from, with its segment. */
-    private BufferSegment lastBuffer;
+    /**
+     * The writer's cache of the buffers {@link #put(long, ByteBuffer)} copied from, attached only while an append with
+     * a fill runs (see {@link BufferCache}: this object is reachable from the upcall stub, so it must not keep the
+     * caller's buffers outside a fill).
+     */
+    private BufferCache sources;
 
     PayloadBuffer() {}
+
+    /** Lends the writer's buffer cache for one append with a fill (called by the writer, before the downcall). */
+    void attach(BufferCache cache) {
+        sources = cache;
+    }
+
+    /** Takes the cache back (called by the writer when the append returns, whatever happened). */
+    void detach() {
+        sources = null;
+    }
 
     /** Starts a fill on the calling thread (the upcall thread). */
     void begin(long address, long length) {
@@ -146,19 +161,20 @@ public final class PayloadBuffer {
 
     /**
      * Copies the bytes between {@code src}'s position and limit to {@code offset}; {@code src} is not changed. Returns
-     * this buffer. For a direct buffer, the writer remembers a segment over the last such buffer (and so keeps it
-     * reachable), so repeated copies from one buffer allocate nothing; the first copy from another allocates a small
-     * wrapper.
+     * this buffer. For a direct buffer, and for a read-only heap buffer, the writer remembers a segment over the last
+     * buffer of that kind (one of each), so repeated copies from the same buffer allocate nothing, and the first copy
+     * from another buffer of that kind allocates a small object. The writer keeps those two buffers reachable until
+     * other buffers replace them or it is closed (or itself unreachable).
      */
     public PayloadBuffer put(long offset, ByteBuffer src) {
         int n = src.remaining();
         long dst = at(offset, n);
         if (src.hasArray()) {
             MemorySegment.copy(src.array(), src.arrayOffset() + src.position(), ALL, BYTE, dst, n);
-        } else {
-            BufferSegment source = BufferSegment.of(lastBuffer, src);
-            lastBuffer = source;
-            MemorySegment.copy(source.segment, src.position(), ALL, dst, n);
+        } else if (sources != null) {
+            MemorySegment.copy(sources.segment(src), src.position(), ALL, dst, n);
+        } else { // not reached: a fill always runs with the writer's cache attached
+            MemorySegment.copy(MemorySegment.ofBuffer(src), 0, ALL, dst, n);
         }
         return this;
     }

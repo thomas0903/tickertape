@@ -131,12 +131,13 @@ records, or records encoded field by field). Both allocate nothing per record.
   call advances, and `close()` too, from the closing thread, before it frees anything; every accessor checks it and
   throws `IllegalStateException` on a stale view. The counter is advanced with a release store and read with an
   acquire load (the first version used a plain field: a thread reading a view's metadata in a compiled loop kept
-  getting values more than a second after `close()` returned, because the JIT hoisted the load, and so did a copy of an
-  empty payload, which touches no memory and so never meets the arena check). An acquire load costs a plain `mov` on
-  x86-64 and an `ldar` on AArch64, and cannot be hoisted. The read path pays for it, and for the guard's second
-  compare-and-set (see Threads), on every accessor; `ReadPathCostTest`, run on request, measures the path informally
-  (its figures are in the pull request, not here: they were not taken under the benchmark rules). Reuse cuts both
-  ways and is documented: a saved view
+  getting values after `close()` had returned, because the JIT hoisted the load out of the loop, and so did a copy of
+  an empty payload, which touches no memory and so never meets the arena check). An acquire load costs a plain `mov`
+  on x86-64 and an `ldar` on AArch64, and cannot be hoisted. The read path pays for that load once per accessor, and
+  for the guard's pair of compare-and-sets (see Threads) once per guarded call (`tryNext`, the `next` methods, the
+  batch reads, `seek` and the other reader methods, and `withPayload`), not per accessor; `ReadPathCostTest`, run on
+  request, measures the path informally (its figures are in the pull request, not here: they were not taken under the
+  benchmark rules). Reuse cuts both ways and is documented: a saved view
   shows the next record after the next read, a view kept from a batch is re-pointed by a later `get` after a refill,
   and a saved `PayloadBuffer` is usable again during a later fill on the same thread.
 - **Every view access goes through memory whose lifetime the JVM enforces.** Each reader has one shared arena and one
@@ -176,24 +177,47 @@ records, or records encoded field by field). Both allocate nothing per record.
   batch (a second copy of the view API). A batch's views are valid until the batch is filled again. The copying API:
   `RecordView.copy()` (a `RecordCopy` record), `payloadToArray()`, and `copyPayloadTo` a `byte[]`, `ByteBuffer` or
   `MemorySegment`.
-- **Allocation.** After warm-up, `append` (all forms), `appendWith` (with the `PayloadBuffer` writers other than
-  `segment()`), `AppendBatch.add` and `appendBatch`, `tryNext`, `next()` and a timed `next` that find a record,
-  `tryReadBatch` and a timed `readBatch`, `ReadBatch.get` of an index used before, and the view accessors allocate
-  nothing per call. `AllocationTest` measures each operation on its own with the thread's allocated-bytes counter
-  around 20,000 calls (a batch call counts once; the first version counted 16 loop iterations per batch call, which
-  hid a small allocation per call), allowing one byte per call, and the build runs it a second time with
-  `-XX:-DoEscapeAnalysis`. That second run is the guarantee: an object built per call and removed only by escape
-  analysis passes on one JIT and fails on another, as `copyPayloadTo(ByteBuffer)` did on CI's macOS runner (72 bytes
-  per call, the `MemorySegment.ofBuffer` wrapper and its scope for a direct buffer, while the same JDK build passed
-  locally). Without escape analysis that run found three such objects: that wrapper, the same one in
+- **Allocation.** The guarantee is what `AllocationTest` measures, and no more: once warm, each of the operations
+  below allocates nothing on the Java heap per call, under the conditions given. The test measures each operation on
+  its own with the thread's allocated-bytes counter around 20,000 calls (a batch call counts once; the first version
+  counted 16 loop iterations per batch call, which hid a small allocation per call), allowing one byte per call, and
+  the build runs it a second time with `-XX:-DoEscapeAnalysis`. That second run is the guarantee: an object built per
+  call and removed only by escape analysis passes on one JIT and fails on another, as `copyPayloadTo(ByteBuffer)` did
+  on CI's macOS runner (the `MemorySegment.ofBuffer` wrapper and its scope object for a direct buffer, built on every
+  call, which escape analysis removed on the local machine but not on the runner, with the same JDK build). The
+  operations:
+  - `append` with a `byte[]`, a native or heap `MemorySegment`, or a direct or heap `ByteBuffer`, of a payload no
+    larger than one the writer appended before (the scratch buffer grows otherwise); `appendBatch`; `nextSeq()`.
+  - `appendWith` whose filler uses `set`, `setByte`, `put(byte[])`, `put(MemorySegment)` of a native or heap segment,
+    `put(ByteBuffer)` of a heap buffer, and `put(ByteBuffer)` of a direct buffer or a read-only heap buffer that is
+    the same buffer of its kind as in the previous `put` of that kind (the writer remembers one of each; a copy from a
+    new one allocates a small object). Alternating one read-only and one direct buffer is measured too.
+  - `AppendBatch.add` with a `byte[]`, a native or heap `MemorySegment`, or a direct or heap `ByteBuffer`, into a
+    batch that does not grow (records and payload bytes within its capacity, which for a direct buffer must be at most
+    `Integer.MAX_VALUE - 8` payload bytes: above that, each such `add` builds a wrapper). A batch that grows allocates.
+  - For both readers: `tryNext`, `next()` and a timed `next` that find a record; the view's metadata accessors,
+    `isValid()`, `getByte`, `get(layout)`, and `copyPayloadTo` a `MemorySegment`, a `byte[]`, a heap `ByteBuffer`, or a
+    direct `ByteBuffer` that is the same buffer as in the previous copy by that view.
+  - `tryReadBatch` and a timed `readBatch` that find records, `ReadBatch.get` of an index used before and its view's
+    accessors, and `copyPayloadTo` a direct `ByteBuffer` (the same one) from a batch's view.
+
+  Without escape analysis the test found three objects built per call: that wrapper, the same one in
   `PayloadBuffer.put(ByteBuffer)` and `AppendBatch.add(ByteBuffer)`, and the two `MemorySegment`s an upcall creates for
   the fill callback's pointer arguments (on every `appendWith`). The fill callback now receives its pointers as
   64-bit integers (`Signatures.POINTER_AS_LONG`; a pointer and an `int64_t` travel in the same register on every
   supported LP64 ABI, and `HeaderTest` still checks them as pointers); `AppendBatch` copies a direct buffer through a
-  `ByteBuffer` view of its own memory; and a view or a payload buffer remembers a segment over the last direct buffer
-  it used (`BufferSegment`), so repeated use of one buffer allocates nothing and a new buffer costs one small wrapper,
-  which the documentation of those two overloads states. CI pins Temurin `25.0.5`, which resolves to 25.0.5+8 on
-  Linux and to the macOS-only respin 25.0.5.1+2 on macOS; the test no longer depends on which.
+  `ByteBuffer` view of its own memory; and a view, or a writer, remembers a segment over the last direct buffer it
+  used (`BufferSegment`; a writer also over the last read-only heap buffer, in a second slot), so repeated use of one
+  buffer allocates nothing and a new buffer costs one small object, which the documentation of those overloads
+  states. Remembering a buffer keeps it reachable, and with it whatever its memory keeps alive (an arena whose clean-up
+  action refers to the writer, say), so the rule is that nothing the caller passed in may be reachable from a global
+  root. A writer's upcall stub is one (the JVM roots its target until the stub's arena is closed), and its target
+  reaches the payload buffer; so the writer keeps its cache (`BufferCache`) itself and lends it to the payload buffer
+  only for the length of each `appendWith`, and `close()` drops it. A dropped writer and its cached buffer then form at
+  most a cycle the collector frees (the first version kept the cache in the payload buffer, where it kept a dropped
+  writer, and its journal's lock, for ever; `LifetimeTest` covers both this and a reader's view). A view's cache is
+  reachable only from the view, whose reader or batch no global root reaches. CI pins Temurin `25.0.5`, which
+  resolves to 25.0.5+8 on Linux and to the macOS-only respin 25.0.5.1+2 on macOS; the test no longer depends on which.
 
 **Value types.** A C struct that carries `struct_size` is designed to grow: later versions append fields
 (`tickertape_verify_report`, `tickertape_retention_report`). Its Java type is a **final class with accessor methods
@@ -221,8 +245,8 @@ compare-and-set refused and hands the handle straight to the closer (`CLOSE_PEND
 which another call could enter. The closer then frees the handle exactly once (for a reader, after closing its views'
 arena) and marks it `CLOSED`. A `close()` that finds the handle `CLOSE_PENDING` or `CLOSING` waits for `CLOSED`, so
 every `close()` returns after the C handle is freed and a writer's journal can be reopened at once. Closers wait on the
-guard's monitor, not with `parkNanos` (which returns at once on an interrupted thread: the first version spun at 100 %
-CPU there); an interrupt does not end the wait, and the interrupt status is restored when `close()` returns. Closing
+guard's monitor, not with `parkNanos` (which returns at once on an interrupted thread: the first version spun
+there); an interrupt does not end the wait, and the interrupt status is restored when `close()` returns. Closing
 from inside the handle's own filler or payload action is refused. `docs/java-api.md` lists exactly which misuse throws and which is undefined. Separate handles, and `Journal`'s functions, are independent and can run on any threads. `fork()`
 does not arise in Java.
 
@@ -282,13 +306,19 @@ for a misuse that the documentation covers.
 **Paths.** The C ABI passes path bytes to the operating system unchanged, and the JDK offers no public way to read a
 `Path`'s bytes (`UnixPath` keeps them, `toString()` decodes them with `sun.jnu.encoding`). So the binding encodes
 `toString()` with that same charset (the first version always used UTF-8, which picks a different file under a
-non-UTF-8 locale) and refuses, with `IllegalArgumentException` before any call, a path whose bytes the JDK could not
+non-UTF-8 locale), after the one other step the JDK takes on the way to the bytes: on macOS with
+`jdk.nio.path.useNormalizationFormD` enabled, the JDK normalizes a path's text to Unicode form D before encoding it
+(and shows it in form C), so the binding normalizes to form D too; otherwise an accented name could reach the library
+with other bytes than the JDK's own on a file system that tells the two forms apart. The charset and that property are
+read once, when the binding first converts a path, as the JDK reads its own at start-up; changing them later is not
+supported. It refuses, with `IllegalArgumentException` before any call, a path whose bytes the JDK could not
 decode: the decoded string holds U+FFFD and does not convert back to the same path (the JDK compares paths by their
 bytes). A name that legitimately contains U+FFFD round-trips and is accepted. We chose refusing over reading the bytes
 through implementation details (`toUri()`'s percent-encoding happens to expose them, but its form is unspecified):
 such names are rare, and a call that targets a sibling of the named journal, for example retention on the wrong
 directory, is not acceptable. `PathsTest` creates such a name on Linux (skipped where the file system refuses it, as
-APFS does) next to the sibling it decodes to.
+APFS does) next to the sibling it decodes to, and tests the conversion of an accented name with the form-D setting
+passed in, both ways (the JDK reads its property at start-up, so one JVM cannot switch it).
 
 **Finding the library.** In this order, and the first library found must be compatible or loading fails (it never falls
 through to a later candidate after a failure): `Tickertape.loadLibrary(path)` before first use; the system property

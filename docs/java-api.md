@@ -98,10 +98,13 @@ The Linux libraries are built for glibc.
 - **Options** (`WriterOptions`, `ReaderOptions`, `Retention`) are immutable values: each setter returns a new value.
   They are copied into the library when a writer or reader is opened.
 - **Paths** must be on the default file system. They reach the library as the bytes the operating system knows them
-  by: the JDK has no public way to read a path's bytes, so the binding encodes `toString()` with the JDK's own
-  file-name charset (`sun.jnu.encoding`: UTF-8 on macOS, the locale's charset on Linux), which gives back the same
-  bytes for every name the JDK could decode. A name it could not decode (on Linux, bytes that are not valid UTF-8 under
-  a UTF-8 locale) shows as U+FFFD in Java and would name a different file, so every call that takes such a path throws
+  by: the JDK has no public way to read a path's bytes, so the binding encodes `toString()` as the JDK encodes a
+  path's text, with its file-name charset (`sun.jnu.encoding`: UTF-8 on macOS, the locale's charset on Linux) and, on
+  macOS with `-Djdk.nio.path.useNormalizationFormD` enabled, after normalizing to Unicode form D as the JDK then does.
+  That gives back the same bytes for every name the JDK could decode. The charset and that property are read once,
+  when the binding first converts a path (the JDK, too, uses its start-up values): changing either property later is
+  not supported. A name the JDK could not decode (on Linux, bytes that are not valid UTF-8 under a UTF-8 locale) shows
+  as U+FFFD in Java and would name a different file, so every call that takes such a path throws
   `IllegalArgumentException` before anything reaches the library (`Retention.moveTo` already when it is built).
 - **Names.** Boolean accessors are `isXxx()` everywhere (`isClosed()`, `isMapped()`, `isValid()`, `isIntact()`, and
   in the options `isDurableOnly()`, `isNotifyEnabled()`, `isPrefaultEnabled()`); option setters are the bare name
@@ -160,15 +163,30 @@ The Linux libraries are built for glibc.
   that same array, without copies (`RecordView.copy()` gives it a new array of its own). Writing into the array
   changes the record, including `equals` and `hashCode`, which compare the payload's content: do not change one that
   is in a set or a map key; clone the array to change a payload.
-- **Allocation.** Once warm, these allocate nothing on the Java heap, per call: appends (all forms), `appendWith`
-  (with every `PayloadBuffer` writer except `segment()`), `AppendBatch.add` (all forms) and `appendBatch`, `tryNext`,
-  `next()` and a timed `next` that find a record, `tryReadBatch` and a timed `readBatch`, `ReadBatch.get` for an index
-  used before, `nextSeq()`, and the view accessors. One exception, for direct buffers: `copyPayloadTo(ByteBuffer)` and
-  `PayloadBuffer.put(ByteBuffer)` remember a segment over the last direct buffer used (and keep that buffer
-  reachable), so repeated use of one buffer allocates nothing, and the first use of another allocates a small wrapper.
-  `AllocationTest` measures each operation on its own, per call (a batch call counts once), and runs a second time
-  with the JIT's escape analysis off, so nothing relies on the JIT removing a per-call object. `withPayload`,
-  `PayloadBuffer.segment()` and the copying methods that return new objects (`copy()`, `payloadToArray()`) allocate.
+- **Allocation.** The guarantee is exactly what `AllocationTest` measures: once warm, each of these allocates nothing
+  on the Java heap per call, under the conditions given (the test measures each operation on its own, a batch call
+  counting once, and runs a second time with the JIT's escape analysis off, so nothing relies on the JIT removing a
+  per-call object):
+  - `append` with a `byte[]`, a native or heap `MemorySegment`, or a direct or heap `ByteBuffer`, of a payload no
+    larger than one the writer appended before (its scratch buffer grows otherwise); `appendBatch`; `nextSeq()`.
+  - `appendWith` whose filler uses `set`, `setByte`, `put(byte[])`, `put(MemorySegment)` (native or heap), or
+    `put(ByteBuffer)` of a heap buffer, or of a direct or read-only heap buffer that is the same as in the previous
+    `put` of its kind. The writer remembers the last direct and the last read-only buffer (one of each, so
+    alternating the two is fine), and keeps them reachable until others replace them or it is closed; the first copy
+    from another buffer of a kind allocates a small object.
+  - `AppendBatch.add` with a `byte[]`, a native or heap `MemorySegment`, or a direct or heap `ByteBuffer`, while the
+    batch does not grow; a batch that grows allocates, so size it up front or let it grow once and reuse it. For a
+    direct buffer this holds only up to a payload capacity of `Integer.MAX_VALUE - 8` bytes (above it, each such
+    `add` builds a wrapper).
+  - For both readers: `tryNext`, `next()` and a timed `next` that find a record; the view's metadata accessors,
+    `isValid()`, `getByte`, `get(layout)`, and `copyPayloadTo` a `MemorySegment`, a `byte[]`, a heap `ByteBuffer`, or
+    the same direct `ByteBuffer` as that view's previous copy (the view remembers it, and keeps it reachable while the
+    view is); the first copy into another direct buffer allocates a small object.
+  - `tryReadBatch` and a timed `readBatch` that find records, `ReadBatch.get` of an index used before and its view's
+    accessors.
+
+  Everything else may allocate; in particular `withPayload`, `PayloadBuffer.segment()`, and the copying methods that
+  return new objects (`copy()`, `payloadToArray()`) do.
 
 ## Writing
 
@@ -327,8 +345,9 @@ the same thread, so they are reliable on platform and virtual threads alike.
 
 - A `Writer` or `Reader` is used by one thread at a time, and a reader's views with it. It may be handed to another
   thread between calls, with the usual happens-before (an executor, a lock, a queue). The binding checks this on every
-  call with an atomic compare-and-set on entry and another on exit: a call that finds the handle in use by another
-  thread, or closed, throws `IllegalStateException` and does nothing.
+  call with an atomic compare-and-set on entry and another on exit (once per call such as `tryNext` or `withPayload`;
+  a view's accessors take no guard, they read the view's generation with one acquire load each): a call that finds
+  the handle in use by another thread, or closed, throws `IllegalStateException` and does nothing.
 - `close()` may be called from any thread, also while another thread blocks in a read or reads the current view. From
   the moment it starts, `isClosed()` is true and every new call is refused. It waits for a call in progress to finish
   (a blocked read ends within one wait slice), which hands the handle straight to it, ends every access to the

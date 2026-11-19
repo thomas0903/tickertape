@@ -76,7 +76,7 @@ public final class ReaderOptions {
         return new ReaderOptions(durableOnly, notify, false, spins, yields, min, max, waitSliceNs);
     }
 
-    /** Makes a waiting reader spin without ever yielding or sleeping: lowest latency, one core at 100 %. */
+    /** Makes a waiting reader spin without ever yielding or sleeping: lowest latency, one core kept busy. */
     public ReaderOptions busySpin() {
         return new ReaderOptions(durableOnly, notify, true, spins, yields, minSleepNs, maxSleepNs, waitSliceNs);
     }

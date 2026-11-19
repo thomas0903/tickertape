@@ -13,8 +13,13 @@ import java.util.Objects;
 /**
  * Records collected for one {@link Writer#appendBatch} call, which appends them in order with one call into the
  * library. Payloads are copied into the batch's own native memory when added, so the caller's arrays and buffers can
- * be reused at once. Reuse a batch with {@link #clear()}: once it has grown to its working size, adding and appending
- * allocate nothing. Not thread-safe.
+ * be reused at once. Reuse a batch with {@link #clear()}. Not thread-safe.
+ *
+ * <p><b>Allocation.</b> An {@code add} that needs more room than the batch has (records or payload bytes) grows it,
+ * which allocates. Within its capacity, {@code add} allocates nothing, with one limit: {@code add(..., ByteBuffer)} of a
+ * direct buffer builds a small wrapper object per call when the batch's payload capacity is above
+ * {@code Integer.MAX_VALUE - 8} bytes (more than a {@code ByteBuffer} can cover). So size the batch for its working
+ * load up front (the constructor's arguments), or let it grow once and reuse it.
  *
  * <pre>{@code
  * AppendBatch batch = new AppendBatch();
@@ -103,7 +108,9 @@ public final class AppendBatch {
 
     /**
      * Adds a record whose payload is the bytes between {@code payload}'s position and limit; the buffer is not changed.
-     * A buffer that cannot be read (a direct buffer over a closed arena) throws and leaves the batch unchanged.
+     * A buffer that cannot be read (a direct buffer over a closed arena) throws and leaves the batch unchanged. For a
+     * direct buffer this allocates nothing only while the batch's payload capacity is at most
+     * {@code Integer.MAX_VALUE - 8} bytes (see the class documentation).
      */
     public AppendBatch add(int schemaId, long venueTsNs, long localTsNs, ByteBuffer payload) {
         int length = payload.remaining();

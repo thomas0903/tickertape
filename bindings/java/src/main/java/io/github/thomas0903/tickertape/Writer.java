@@ -36,8 +36,11 @@ import java.util.Optional;
  * calls ({@link #open}, {@link #checkpoint()}, an append that rolls to a new segment) pin a virtual thread to its
  * carrier while they run.
  *
- * <p><b>Allocation.</b> After warm-up, {@code append}, {@link #appendWith} and {@link #appendBatch} allocate nothing on
- * the Java heap: the writer reuses one scratch buffer, its output memory and one {@link PayloadBuffer}.
+ * <p><b>Allocation.</b> The writer reuses one scratch buffer, its output memory and one {@link PayloadBuffer}, so once
+ * warm the appends allocate nothing on the Java heap under the conditions that {@code docs/java-api.md} &rarr;
+ * Allocation lists (and that the binding's allocation test measures): among them, a payload no larger than one
+ * appended before (the scratch buffer grows otherwise), and for {@link PayloadBuffer#put(long, ByteBuffer)} of a direct
+ * or read-only buffer, the same buffer as before.
  */
 @SuppressWarnings("restricted") // calls restricted java.lang.foreign methods; needs native access
 public final class Writer implements AutoCloseable {
@@ -62,11 +65,18 @@ public final class Writer implements AutoCloseable {
 
     private MemorySegment fillStub;
     private final FillContext fill = new FillContext();
+    /**
+     * The buffers {@link PayloadBuffer#put(long, ByteBuffer)} copied from. Only the writer references it, and it lends
+     * it to the payload buffer for each {@link #appendWith} (see {@link BufferCache}).
+     */
+    private final BufferCache sources = new BufferCache();
 
     /**
      * What the upcall stub is bound to: the filler of the append in progress, what it threw, and the reusable payload
      * buffer. It must never reference the writer: the stub keeps its target reachable from a global root until the
-     * stub's arena is closed, and the writer's Cleaner could otherwise never run.
+     * stub's arena is closed, and the writer's Cleaner could otherwise never run. Nor may it reference anything the
+     * caller passed in outside a fill (the filler, its error and the writer's {@link BufferCache} are all cleared when
+     * the append returns), since that could refer to the writer.
      */
     private static final class FillContext {
         PayloadFiller filler;
@@ -269,12 +279,14 @@ public final class Writer implements AutoCloseable {
             MemorySegment stub = fillStub();
             fill.filler = filler;
             fill.error = null;
+            fill.buffer.attach(sources);
             int status;
             try {
                 status = Native.writerAppendWith(handle.ptr, schemaId, venueTsNs, localTsNs, length, stub,
                         MemorySegment.NULL, seqOut);
             } finally {
                 fill.filler = null;
+                fill.buffer.detach();
             }
             Throwable thrown = fill.error;
             fill.error = null;
@@ -440,6 +452,7 @@ public final class Writer implements AutoCloseable {
     public void close() {
         try {
             TickertapeException error = handle.close();
+            sources.clear(); // no call can run any more: let go of the caller's buffers
             if (error != null) {
                 throw error;
             }
