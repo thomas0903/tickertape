@@ -1,7 +1,9 @@
 # 0035: Recovery preserves a committed tail behind an empty commit word
 
 - **Status:** accepted (a fix within the existing recovery contract; refines [0007](0007-checkpoint-marker-and-recovery.md))
-- **Date:** 2026-11-19
+- **Date:** 2026-11-19; amended 2026-11-20 (the tail in front of a successor that does not open is preserved, or
+  refused under `Fail`, instead of zeroed in place, and an I/O error opening that successor fails the open: "Damage
+  around a seal")
 
 ## Context
 
@@ -57,7 +59,7 @@ these counts:
 
 The order is fixed. First, when the successor for exactly `S` exists, is not `X` itself (at `X`'s first record slot
 `S` is `X`'s own base), has not been entered yet, and opens (the writer opens and maps it successfully; a valid header
-alone is not enough), `P` is where `X`'s seal belongs and the chain continues in that successor; that takes precedence, and none of the above is
+alone is not enough; an I/O error opening it fails the open, see "Damage around a seal"), `P` is where `X`'s seal belongs and the chain continues in that successor; that takes precedence, and none of the above is
 consulted (see "Damage around a seal" below). Otherwise, if `X` holds any non-zero byte after `P`'s commit word, the search
 runs, in `X` first: the first record or final seal it finds (1, 2), or a stop at its work bound ("Work bound" below),
 decides, unless the torn-frame check below dismisses it. Only when the search of `X` yields nothing is (3) consulted.
@@ -66,7 +68,9 @@ Evidence, or a stop at the work bound that is not dismissed, means a committed t
 
 If the search completes without finding any, `P` is treated as a torn append (or a clean end) and handled exactly as
 before; that decision follows from the evidence, and damage that left none is zeroed the same way ("What cannot be
-detected").
+detected"). The exception is a successor for exactly `S` that exists, is not `X`, has not been entered and does not
+open: the chain is then broken at `P`, and non-zero bytes after its commit word are preserved, not zeroed ("Damage
+around a seal").
 
 **Candidates inside a completely written torn frame are not evidence.** If the frame at `P` has an intact header
 apart from its commit word (sequence number `S`, flags zero) and its stored CRC matches for a frame length `L` that
@@ -184,27 +188,60 @@ interrupted at both fault points). This cannot lose records the previous code ke
 every segment are kept, and the bytes after `P` are preserved. Nor can it refuse or quarantine what a process crash
 leaves, which is at most the CRC word.
 
-A successor for exactly `S` that exists but does not open (an invalid header, for example) is handled as before: the resealing
-branch is not taken, the search runs, and the chain ends at `P` when it finds nothing. The bytes after `P` are then
-zeroed in place, without being preserved, under either policy, and the successor and every later segment are
-disconnected (step 5: `Quarantine` moves them into `quarantine/`, `Fail` refuses at the successor with
-`BrokenChain`, after the zeroing). Two branches end there. Only the seal's CRC word is left: it is zeroed in place
-even when segments with higher bases exist, because evidence (3) does not count for those bytes (they are what a
-crash between publishing the successor and sealing leaves, before the successor's header was damaged). Other bytes
-follow `P`, no segment with a higher base exists, and the search finds no evidence in `X`: they are zeroed in place
-too. With
-other bytes after `P` and a segment with a higher base, evidence (3) holds and the tail is preserved
-(`EmptyCommitWord`, or `UncheckedTail` from the search of `X`; `Fail` refuses without changing a byte of `X`).
-`verify` reports `BrokenChain` at `P` in the first two, and a problem at the successor only when it fails `verify`'s
-own read-only checks (a segment the writer cannot open read-write or map can pass them). All three under both
-policies:
-`tests/committed_tail.rs::successor_that_does_not_open_ends_the_chain_at_the_seals_place`.
+A successor for exactly `S` that exists but does not open does not take the resealing branch: the search runs. "Does
+not open" means that the successor itself is invalid: the writer's open reports it as corrupt (a file shorter than a
+header, an invalid header, a size that does not match the header, a base that does not match the name) or as an
+unsupported format version. Any other error opening, reading or mapping it is an I/O error (`EACCES` on files restored
+read-only, `EMFILE`, `ENOMEM` or a mapping limit), which says nothing about the journal: the open returns it under
+either policy without changing anything at `P` or at the successor, as the seal branch does for a successor that a
+valid seal names (what the scan did before it reached `P`, a seal written in front of an earlier segment for
+example, stays). Taken as a
+broken chain, such an error after a plain crash between publishing the successor and sealing `X` would preserve the
+seal's CRC word, replace `X` and quarantine the healthy successor and every later segment, or make `Fail` report
+`BrokenChain` and hide the cause (`::successor_that_fails_to_open_for_an_io_error_fails_the_open`: once the error is
+gone, the next open completes the roll). When it finds evidence, the tail is a committed tail ("What recovery does with a
+committed tail", below). When it finds none, the chain is broken at `P`: `X` ends there, and the successor, which
+recovery cannot enter, and every later segment are disconnected (step 5). What happens to `X` depends on what follows
+`P`'s commit word:
 
-**Known gap.** In that case the chain is already broken at an empty commit word (the successor for exactly `S`
-exists but does not open, and the search finds no evidence), and recovery today zeroes the non-zero bytes after the
-empty word in place without preserving them, under both policies. Those bytes can be the only ones left for
-diagnosis or salvage. A later change will preserve that tail under `Quarantine` and make `Fail` refuse before
-zeroing it; this change leaves the behaviour as it was.
+- **Non-zero bytes.** The chain cannot continue past them whatever they are, and they can be the only bytes left for
+  diagnosis or salvage, so they are handled as a corrupt tail, reported as `CorruptReason::BrokenChain(S)` at `P`.
+  `Quarantine` preserves the bytes from `P` to the last non-zero byte of `X` in `quarantine/` and replaces `X` by a
+  copy with `[P, Z)` zeroed (`RepairedTail`), exactly as for any corrupt tail, then moves the successor and every
+  later segment into `quarantine/` as disconnected. `Fail` refuses with `BrokenChain(S)` at `(X, P)` before it
+  changes a byte of `X` or moves a file. Two shapes reach this branch: only bytes of the seal's CRC word left (every
+  non-zero byte in `[P+4, P+8)`), whether or not segments with higher bases exist (evidence (3) does not count for those bytes: they are what a crash between
+  publishing the successor and sealing leaves, with the successor's header damaged since); and other bytes after
+  `P` with no segment of a higher base (with one, evidence (3) holds: the tail is preserved as `EmptyCommitWord`, or
+  `UncheckedTail` from the search of `X`, `Fail` refusing without changing a byte of `X`, and the successor and later
+  segments are disconnected in the same way).
+- **Nothing non-zero** (the whole seal zeroed, for example): there is nothing to preserve or zero, and recovery
+  keeps the behaviour it had. `X` is left as it is, ending at `P`, and the disconnected segments are quarantined, or
+  `Fail` refuses at the first of them, normally the successor (`BrokenChain(S)` at its offset 0), without changing a
+  byte of `X`.
+
+The reason is `BrokenChain(S)` at `P` because it says what is wrong, and it is what `verify` already reports for
+this state: `X`'s records end at `P` without a seal, and the segment that would continue the chain cannot be
+entered. `BadSeal` would say that the bytes at `P` are a damaged seal in front of a successor that continues the
+chain, which recovery then reseals; here nothing continues, and with bytes past the seal's place they need not be a
+seal at all. The successor's own error (`BadMagic`, `BadSegmentHeader`, `SizeMismatch`, for example) describes another file at
+offset 0 (offset 8 for an unsupported version), and `verify` reports it there when the successor fails its
+read-only checks; the writer's report is about `X`, where the chain ends. So in the two cases this change adds
+(only the seal's CRC word left, or other bytes with no higher-base segment) the writer and `verify` agree on the
+reason and the position. They do not in the two it leaves alone: with other bytes and a higher-base segment the
+writer reports `EmptyCommitWord` for that segment's base at `P` where `verify` reports `BrokenChain`, and with
+nothing non-zero after `P` a refusing writer reports `BrokenChain` at offset 0 of the first disconnected segment
+(that successor, unless a segment with a lower base is disconnected too, which is then named) where `verify`
+reports `BrokenChain` for the expected sequence number at `P`.
+
+`verify` reports `BrokenChain` at `P` in every case of this paragraph where the search of `X` finds nothing, and a
+problem at the successor only when it fails `verify`'s own read-only checks (a segment the writer cannot open
+read-write or map can pass them; the writer's open then fails with that I/O error, above). Every case under both policies:
+`tests/committed_tail.rs::successor_that_does_not_open_ends_the_chain_at_the_seals_place`; the repair interrupted at
+both fault points: `::crash_in_the_middle_of_a_broken_chain_repair` ("A crash during the repair", below).
+
+Before this amendment (2026-11-20) the non-zero bytes of the first branch were zeroed in place without a copy,
+under both policies, and `Fail` refused at the successor only after that zeroing.
 
 The shapes with a successor that opens, each decided explicitly and tested under both policies
 (`tests/committed_tail.rs::damage_around_a_seal_is_resealed_or_preserved_never_lost`, with three later segments and
@@ -260,7 +297,8 @@ It is corruption, handled under `RecoveryPolicy` exactly like an invalid record 
 ### Torn appends are unchanged
 
 When the search completes without evidence, recovery zeroes `[P+4, last non-zero byte]` in place and syncs it
-(`ZeroedUncommitted`), as before. For a torn append that stays sound for a zero-copy reader (for damage that left no
+(`ZeroedUncommitted`), as before, except in front of a successor for exactly `S` that does not open ("Damage around
+a seal"). For a torn append that stays sound for a zero-copy reader (for damage that left no
 evidence it does not: "What cannot be detected"): a reader creates a slice only after loading a non-zero commit word and
 validating the record, the commit word at `P` was never non-zero, so no reader holds a slice into `[P, Z)`; records
 before `P` are not touched; and the evidence search only reads. The compatibility fixtures killed mid-append, the
@@ -316,6 +354,11 @@ stand in for a crash there (`::crash_in_the_middle_of_a_repair`):
   recovery finds no evidence in `X`, ends the chain at `P`, and quarantines the later segments as disconnected.
 - For damage around a seal (above), after the rename the next recovery finds `X` ending at `P` with the successor
   waiting, writes the seal and continues, which is what the uninterrupted repair does next.
+- For a tail in front of a successor that does not open (above), after the rename the next recovery finds `X` ending
+  at `P` with nothing non-zero after it, ends the chain there without zeroing anything, and quarantines the successor
+  and the later segments as disconnected, which is what the uninterrupted repair does next
+  (`::crash_in_the_middle_of_a_broken_chain_repair`: every path, uninterrupted or interrupted at either point, ends
+  with the same segment files and checkpoint).
 
 Either way, every removed byte is in `quarantine/` once the next recovery completes, and the journal keeps records
 before `P`.
@@ -328,15 +371,16 @@ completely written torn frame is dismissed; no segment with a higher base counts
 not one when only the seal's CRC word is left in front of a successor for exactly `S` that does not open; and the
 search did not stop at its work bound outside such a frame) is classified as a torn append: recovery cannot
 tell it from one, whether or not a real torn append could leave those bytes. Unless a distinct, unentered segment
-for exactly `S` opens (then the seal branch decides, below), it is zeroed like one: the records it covers are destroyed in place, and `ZeroedUncommitted` reports the action
+for exactly `S` exists (if it opens, the seal branch decides; if it does not, the chain is broken at `P`: both
+below), it is zeroed like one: the records it covers are destroyed in place, and `ZeroedUncommitted` reports the action
 taken, though a reader may already have returned them. What else happens depends on the rest of the directory. In
 the newest segment, with no segment for `S` or above and nothing else wrong, the zeroing is all: nothing reaches
 `quarantine/`, `verify` reports nothing, and `Fail` does not refuse. A distinct, unentered segment for exactly `S`
 that opens takes recovery into the seal branch ("Damage around a seal"), not the search: the seal's CRC word is
 zeroed and the seal written, or other bytes after `P` are preserved (or refused with `BadSeal`); `verify`, which does not weigh other segments,
-reports `BrokenChain` at `P` unless it finds evidence in `X`. When that segment exists but does not open, the tail
-is zeroed as above and that segment and later ones are disconnected: quarantined, or refused under `Fail` after the
-zeroing (the known gap under "Damage around a seal"); `verify` reports `BrokenChain` at `P`. The newest record's commit
+reports `BrokenChain` at `P` unless it finds evidence in `X`. When that segment exists but does not open, nothing
+is zeroed: a non-zero tail is preserved as `BrokenChain` (or refused under `Fail` without changing a byte of `X`),
+and that segment and later ones are disconnected ("Damage around a seal"); `verify` reports `BrokenChain` at `P`. The newest record's commit
 word zeroed is one case (a writer killed between the CRC store and the commit store leaves the same bytes); so are,
 with 120 records and a checkpoint at 100, the commit words of the **two** newest records zeroed (next sequence 118,
 records 118 and 119 destroyed) and a zeroed block from the start of the third-newest record into the newest record's
@@ -396,14 +440,14 @@ time it takes to read the tail. A repair costs writing the quarantine copy and t
 - What `Fail` does not promise: it does not change the bytes of the corruption it reports, nor anything after them in
   that segment, and moves no file, but the open is not read-only. Before scanning it creates the lock file if it is
   missing and writes its PID into it (best effort), removes stale temporary names (`*.tape.tmp`, the prepared spare),
-  and creates the checkpoint file if it is missing or extends it to its full length if it is shorter, so a refused
-  open can still have changed those files. When it refuses, the changes recovery made earlier in the scan stay in
+  and creates the checkpoint file if it is missing (an open leaves a marker shorter than its full length as it is),
+  so a refused open can still have changed those files. When it refuses, the changes recovery made earlier in the scan stay in
   place: the clean-ups a process crash needs (a zeroed torn tail, a seal written for a crash between publishing a
   successor and sealing, for example in segment `X` when the corruption is in its successor, a created missing
   successor), and the zeroing at an empty commit word where the search completed without evidence, which after
-  damage removes published records ("What cannot be detected") and which, in front of a segment for exactly `S` that
-  does not open, comes before `Fail` refuses at that segment ("Damage around a seal"). Crash contract C11 keeps this
-  list.
+  damage removes published records ("What cannot be detected"). In front of a segment for exactly `S` that does not
+  open nothing is zeroed: `Fail` refuses at `P` before changing `X` when bytes follow it ("Damage around a seal").
+  Crash contract C11 keeps this list.
 - Spec: [`format.md`](../format.md) → Recovery (the table and steps), [`crash-contract.md`](../crash-contract.md)
   (C1, C2, C8, C11, readers and memory safety), [`operations.md`](../operations.md) (checking a journal, after a
   crash), [`cli.md`](../cli.md) (`verify`). Tests: `tests/committed_tail.rs`, `tests/kill_loop.rs::kill_inside_fill`,
