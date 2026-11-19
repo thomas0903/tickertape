@@ -13,6 +13,9 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[non_exhaustive]
 pub enum Error {
     /// An operating-system call failed.
+    ///
+    /// A reader also reports a read buffer it cannot allocate this way, with kind
+    /// [`OutOfMemory`](std::io::ErrorKind::OutOfMemory): a frame too large for the address space of a 32-bit target.
     #[error("{op} failed for {}: {source}", path.display())]
     Io {
         /// What tickertape was doing, e.g. `"preallocate segment"`.
@@ -80,10 +83,15 @@ pub enum Error {
         max: usize,
     },
 
-    /// The writer is poisoned after a failed checkpoint; durability of earlier records can't be guaranteed.
+    /// The writer is poisoned after a failed checkpoint, or after the zeroing of an abandoned write could not be
+    /// made durable ([`Writer::abandoned_write_error`](crate::Writer::abandoned_write_error)); durability of
+    /// earlier records can't be guaranteed.
     ///
-    /// Appends still work. See `docs/crash-contract.md` → Errors are sticky.
-    #[error("an earlier checkpoint failed; durability can no longer be guaranteed for this writer")]
+    /// Appends still work after a failed checkpoint. See `docs/crash-contract.md` → Errors are sticky.
+    #[error(
+        "an earlier checkpoint failed, or an abandoned write could not be zeroed durably; durability can no longer be \
+         guaranteed for this writer"
+    )]
     DurabilityLost,
 
     /// The next sequence number would be `u64::MAX`.
@@ -110,6 +118,11 @@ impl Error {
     /// Appends that fail this way leave the journal consistent and can be retried once space is available.
     pub fn is_storage_full(&self) -> bool {
         matches!(self, Error::Io { source, .. } if crate::mmap::is_storage_full(source))
+    }
+
+    /// True for an I/O error saying a file or directory doesn't exist (`ENOENT`).
+    pub(crate) fn is_not_found(&self) -> bool {
+        matches!(self, Error::Io { source, .. } if source.kind() == io::ErrorKind::NotFound)
     }
 
     pub(crate) fn io(op: &'static str, path: impl Into<PathBuf>, source: io::Error) -> Error {

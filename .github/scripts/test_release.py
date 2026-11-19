@@ -86,6 +86,22 @@ class ReleaseTests(unittest.TestCase):
             (bindings / "Cargo.lock").write_text(lock.format("0.5.0"))
             release.validate_bindings_version(root, "0.5.0")
 
+    def test_unreleased_workspace_members_must_not_be_publishable(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "Cargo.toml").write_text('[workspace]\nmembers=["crates/tickertape","crates/tickertape-cli",'
+                                             '"crates/extra"]\n[workspace.package]\nversion="0.4.0"\n'
+                                             '[workspace.dependencies]\ntickertape={version="0.4.0"}\n')
+            for name in ("tickertape", "tickertape-cli", "extra"):
+                (root / "crates" / name).mkdir(parents=True)
+                (root / "crates" / name / "Cargo.toml").write_text(
+                    f'[package]\nname="{name}"\nversion.workspace=true\n')
+            with self.assertRaisesRegex(ValueError, "extra is not released"):
+                release.validate_versions(root, "0.4.0")
+            (root / "crates/extra/Cargo.toml").write_text(
+                '[package]\nname="extra"\nversion.workspace=true\npublish=false\n')
+            release.validate_versions(root, "0.4.0")
+
     def test_ci_must_be_the_latest_main_push_for_this_commit(self):
         green = dict(head_sha="abc", head_branch="main", event="push", run_number=1,
                      status="completed", conclusion="success")
