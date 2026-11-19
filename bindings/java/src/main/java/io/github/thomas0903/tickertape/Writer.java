@@ -45,8 +45,12 @@ import java.util.Optional;
  * the new capacity is the larger of the payload and twice the old capacity, where the doubled figure is capped at
  * {@code Integer.MAX_VALUE - 8} bytes: with a capacity of 1,200,000,000 bytes, a 1,300,000,000-byte payload grows it
  * to {@code Integer.MAX_VALUE - 8} bytes, not 2,400,000,000. A payload above the cap grows it to exactly the payload's
- * size; a buffer that large cannot back a {@link ByteBuffer}, so the next {@code ByteBuffer} append replaces it with
- * one of that append's size. A native segment is passed as it is and does not count.
+ * size, and a buffer that large cannot back a {@link ByteBuffer}: a {@code byte[]} or heap segment above the cap is
+ * copied into it segment to segment; a {@code ByteBuffer} above the cap (direct, heap or read-only, with
+ * {@code Integer.MAX_VALUE - 7} to {@code Integer.MAX_VALUE} bytes remaining) is copied into it through a segment over
+ * the buffer, which allocates that wrapper; and the next {@code ByteBuffer} append at or below the cap replaces it
+ * with a buffer of that append's size. The record then reaches the library, which appends it or refuses it with its
+ * usual {@link RecordTooLargeException}. A native segment is passed as it is and does not count.
  */
 @SuppressWarnings("restricted") // calls restricted java.lang.foreign methods; needs native access
 public final class Writer implements AutoCloseable {
@@ -229,7 +233,12 @@ public final class Writer implements AutoCloseable {
         handle.enter();
         try {
             MemorySegment buf = scratch(length);
-            if (scratchBuffer == null) { // the scratch buffer grew beyond what a ByteBuffer can cover
+            if (scratchCopy(Source.BYTE_BUFFER, length) == ScratchCopy.BUFFER_SEGMENT_COPY) {
+                // Above the cap no ByteBuffer view of the scratch can exist: copy segment to segment (allocates).
+                MemorySegment.copy(MemorySegment.ofBuffer(payload), 0, buf, 0, length);
+                return appendRaw(schemaId, venueTsNs, localTsNs, buf, length);
+            }
+            if (scratchBuffer == null) { // a heap segment or array grew the scratch beyond what a ByteBuffer can cover
                 buf = scratch = Memory.allocate(length);
                 scratchBuffer = scratch.asByteBuffer();
             }
@@ -243,16 +252,56 @@ public final class Writer implements AutoCloseable {
 
     /**
      * The scratch buffer, grown first if {@code length} does not fit: to the larger of {@code length} and twice the
-     * capacity, the doubled figure capped at {@code Integer.MAX_VALUE - 8}; above the cap, to exactly {@code length},
-     * with no {@code ByteBuffer} view (the {@code ByteBuffer} append then replaces it).
+     * capacity, the doubled figure capped at {@link #SCRATCH_VIEW_CAP}; above the cap, to exactly {@code length}, with
+     * no {@code ByteBuffer} view (a later {@code ByteBuffer} append at or below the cap then replaces it).
      */
     private MemorySegment scratch(long length) {
         if (length > scratch.byteSize()) {
-            long size = Math.max(length, Math.min(scratch.byteSize() * 2, Integer.MAX_VALUE - 8));
+            long size = Math.max(length, Math.min(scratch.byteSize() * 2, SCRATCH_VIEW_CAP));
             scratch = Memory.allocate(size);
-            scratchBuffer = size <= Integer.MAX_VALUE - 8 ? scratch.asByteBuffer() : null;
+            scratchBuffer = size <= SCRATCH_VIEW_CAP ? scratch.asByteBuffer() : null;
         }
         return scratch;
+    }
+
+    /**
+     * The largest scratch buffer that has a {@code ByteBuffer} view: {@code MemorySegment.asByteBuffer} refuses a
+     * larger segment. Also the cap on the doubled capacity.
+     */
+    static final long SCRATCH_VIEW_CAP = Integer.MAX_VALUE - 8;
+
+    /** The kinds of payload an append copies through the scratch buffer. */
+    enum Source {
+        BYTE_ARRAY,
+        HEAP_SEGMENT,
+        /** A direct, heap or read-only heap {@code ByteBuffer}: all three are copied the same way. */
+        BYTE_BUFFER
+    }
+
+    /** How a copied payload reaches the scratch buffer. */
+    enum ScratchCopy {
+        /** {@code MemorySegment.copy} from the array or segment into the scratch segment, at any size. */
+        SEGMENT_COPY,
+        /**
+         * {@code ByteBuffer.put} into the scratch buffer's {@code ByteBuffer} view, without allocating once warm; a
+         * scratch buffer without a view (grown above the cap by an array or heap segment) is first replaced by one of
+         * the payload's size.
+         */
+        VIEW_PUT,
+        /**
+         * {@code MemorySegment.copy} from {@code MemorySegment.ofBuffer(payload)} into the scratch segment, grown to
+         * exactly the payload's size if it is smaller: a {@code ByteBuffer} above {@link #SCRATCH_VIEW_CAP}, which no
+         * {@code ByteBuffer} view of the scratch can cover. It allocates the wrapper segment on every call.
+         */
+        BUFFER_SEGMENT_COPY
+    }
+
+    /** The copy path for a payload of {@code source}'s kind and {@code length} bytes (see {@link ScratchCopy}). */
+    static ScratchCopy scratchCopy(Source source, long length) {
+        if (source != Source.BYTE_BUFFER) {
+            return ScratchCopy.SEGMENT_COPY;
+        }
+        return length > SCRATCH_VIEW_CAP ? ScratchCopy.BUFFER_SEGMENT_COPY : ScratchCopy.VIEW_PUT;
     }
 
     private long appendRaw(int schemaId, long venueTsNs, long localTsNs, MemorySegment payload, long length) {

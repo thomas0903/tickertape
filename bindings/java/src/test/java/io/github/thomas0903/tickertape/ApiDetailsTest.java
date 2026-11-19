@@ -169,4 +169,35 @@ class ApiDetailsTest {
         }
         return dir;
     }
+
+    /**
+     * The copy path an append takes into the writer's scratch buffer, by the source's kind and size. A test cannot
+     * allocate the two gibibytes the large path needs, so it asserts the choice: a {@code byte[]} or heap segment is
+     * copied segment to segment at any size; a {@code ByteBuffer} goes through the scratch's {@code ByteBuffer} view up
+     * to {@link Writer#SCRATCH_VIEW_CAP} bytes and, above it, through {@code MemorySegment.ofBuffer}, never through a
+     * view that {@code MemorySegment.asByteBuffer} would refuse.
+     */
+    @Test
+    @SuppressWarnings("restricted") // reinterpret, to make segments of the boundary sizes without allocating them
+    void theScratchCopyPathDependsOnTheSourcesKindAndSize() {
+        assertEquals(Integer.MAX_VALUE - 8, Writer.SCRATCH_VIEW_CAP);
+        long cap = Writer.SCRATCH_VIEW_CAP;
+        for (long length : new long[] {0, 1, Writer.SCRATCH_INITIAL_BYTES, cap, cap + 1, Integer.MAX_VALUE,
+                Integer.MAX_VALUE + 1L, Long.MAX_VALUE}) {
+            assertEquals(Writer.ScratchCopy.SEGMENT_COPY, Writer.scratchCopy(Writer.Source.BYTE_ARRAY, length));
+            assertEquals(Writer.ScratchCopy.SEGMENT_COPY, Writer.scratchCopy(Writer.Source.HEAP_SEGMENT, length));
+        }
+        for (long length : new long[] {0, 1, Writer.SCRATCH_INITIAL_BYTES, cap - 1, cap}) {
+            assertEquals(Writer.ScratchCopy.VIEW_PUT, Writer.scratchCopy(Writer.Source.BYTE_BUFFER, length),
+                    "" + length);
+        }
+        for (long length : new long[] {cap + 1, Integer.MAX_VALUE - 7, Integer.MAX_VALUE}) {
+            assertEquals(Writer.ScratchCopy.BUFFER_SEGMENT_COPY, Writer.scratchCopy(Writer.Source.BYTE_BUFFER, length),
+                    "" + length);
+        }
+        // The boundary is where the JDK stops: a segment of the cap has a ByteBuffer view, one byte more does not.
+        MemorySegment atCap = MemorySegment.NULL.reinterpret(cap);
+        assertEquals(cap, atCap.asByteBuffer().capacity());
+        assertThrows(IllegalStateException.class, () -> MemorySegment.NULL.reinterpret(cap + 1).asByteBuffer());
+    }
 }

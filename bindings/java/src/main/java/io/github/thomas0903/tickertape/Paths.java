@@ -2,8 +2,13 @@ package io.github.thomas0903.tickertape;
 
 import java.io.ByteArrayOutputStream;
 import java.lang.foreign.Arena;
+import java.lang.foreign.FunctionDescriptor;
+import java.lang.foreign.Linker;
+import java.lang.foreign.MemoryLayout;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
+import java.lang.invoke.MethodHandle;
+import java.lang.invoke.VarHandle;
 import java.nio.file.FileSystems;
 import java.nio.file.Path;
 import java.util.Arrays;
@@ -20,11 +25,23 @@ import java.util.Arrays;
  * name that is not valid in the file-system encoding, a name in either Unicode normalization form, and a path that
  * carries a trailing slash all reach the library as the JDK holds them.
  *
- * <p>An absolute path is passed as those bytes. A relative path is passed relative: the JDK forms its absolute path by
- * joining the bytes of its default directory, a {@code /} and the relative path's own bytes, so the binding decodes the
- * default directory's URI ({@code Path.of("").toUri()}) the same way and strips that prefix and the separator after it.
- * An empty remainder is passed as {@code .}. If the prefix does not match, the absolute bytes are passed rather than a
+ * <p>An absolute path is passed as those bytes. A relative path is passed relative when the JDK's default directory is
+ * the process's working directory, against which the C library resolves it: the JDK forms its absolute path by joining
+ * the bytes of its default directory, a {@code /} and the relative path's own bytes, so the binding decodes the default
+ * directory's URI ({@code Path.of("").toUri()}) the same way and strips that prefix and the separator after it. An
+ * empty remainder is passed as {@code .}. If the prefix does not match, the absolute bytes are passed rather than a
  * guess. Either way, trailing slashes are stripped except for the root.
+ *
+ * <p>The JDK reads its default directory from {@code user.dir} at start-up, so a JVM started with
+ * {@code -Duser.dir=/b} in {@code /a} resolves {@code Path.of("journal")} under {@code /b}, while the C library would
+ * resolve {@code journal} under {@code /a}. The JDK itself passes a relative path to the operating system as it is
+ * only when its default directory is the process's working directory, and the resolved absolute path otherwise; the
+ * binding does the same. When this class is initialised it reads the process's working directory once with the C
+ * library's {@code getcwd} (through the FFM linker, in a buffer that grows on {@code ERANGE}) and compares its bytes
+ * with the default directory's; when they differ, or {@code getcwd} fails, every relative path is passed as its
+ * absolute bytes, to which the path-length limit then applies (as it does to the JDK's own file operations in that
+ * configuration). A process that changes its working directory later, through native code, is outside what the
+ * binding follows, as it is for the JDK.
  *
  * <p>The exact URI form is the default provider's behaviour, not part of the {@code Path.toUri} specification;
  * {@code PathsTest} pins it, and anything other than the expected form (a raw path that does not start with {@code /},
@@ -33,24 +50,100 @@ import java.util.Arrays;
  *
  * <p>What callers see is documented once, on {@link Tickertape} &rarr; Paths.
  */
+@SuppressWarnings("restricted") // calls getcwd through the FFM linker; needs native access
 final class Paths {
     private Paths() {}
 
     /** The path the default directory has; a relative path is relative to it. */
     private static final Path EMPTY = Path.of("");
 
+    /** {@code ERANGE} on Linux and macOS: {@code getcwd}'s buffer is too small. */
+    private static final int ERANGE = 34;
+    /** The largest buffer {@link #processWorkingDirectory} tries before it gives up. */
+    private static final int GETCWD_MAX_BYTES = 1 << 20;
+
+    /**
+     * Whether a relative path is passed relative: the process's working directory, read once by {@code getcwd}, has
+     * the bytes of the JDK's default directory (see the class documentation).
+     */
+    private static final boolean PASS_RELATIVE =
+            passRelative(processWorkingDirectory(1024), stripTrailingSlashes(uriBytes(EMPTY)));
+
+    /**
+     * Whether a relative path may be passed relative, given the bytes {@code getcwd} returned for the process's working
+     * directory ({@code null} if it failed) and those of the JDK's default directory: only when they are the same
+     * directory by its bytes, trailing slashes aside.
+     */
+    static boolean passRelative(byte[] processCwd, byte[] defaultDirectory) {
+        return processCwd != null && processCwd.length > 0 && processCwd[0] == '/'
+                && Arrays.equals(stripTrailingSlashes(processCwd), stripTrailingSlashes(defaultDirectory));
+    }
+
+    /** Whether this JVM passes relative paths relative (see {@link #passRelative}). */
+    static boolean passesRelative() {
+        return PASS_RELATIVE;
+    }
+
+    /**
+     * The process's working directory as {@code getcwd} returns it, without the NUL, or {@code null} if it fails (or
+     * the call cannot be made). The buffer starts at {@code initialBytes} and doubles on {@code ERANGE}, up to
+     * {@link #GETCWD_MAX_BYTES}.
+     */
+    static byte[] processWorkingDirectory(int initialBytes) {
+        try {
+            Linker linker = Linker.nativeLinker();
+            MemorySegment symbol = linker.defaultLookup().find("getcwd").orElse(null);
+            if (symbol == null) {
+                return null;
+            }
+            MemoryLayout sizeT = linker.canonicalLayouts().get("size_t");
+            if (sizeT == null || sizeT.byteSize() != 8) {
+                return null;
+            }
+            Linker.Option errno = Linker.Option.captureCallState("errno");
+            MethodHandle getcwd = linker.downcallHandle(symbol,
+                    FunctionDescriptor.of(ValueLayout.ADDRESS, ValueLayout.ADDRESS, sizeT), errno);
+            MemoryLayout stateLayout = Linker.Option.captureStateLayout();
+            VarHandle errnoHandle = stateLayout.varHandle(MemoryLayout.PathElement.groupElement("errno"));
+            try (Arena arena = Arena.ofConfined()) {
+                MemorySegment state = arena.allocate(stateLayout);
+                for (long size = Math.max(1, initialBytes); size <= GETCWD_MAX_BYTES; size *= 2) {
+                    MemorySegment buf = arena.allocate(size);
+                    MemorySegment result = (MemorySegment) getcwd.invokeExact(state, buf, size);
+                    if (!result.equals(MemorySegment.NULL)) {
+                        for (long i = 0; i < size; i++) {
+                            if (buf.get(ValueLayout.JAVA_BYTE, i) == 0) {
+                                return buf.asSlice(0, i).toArray(ValueLayout.JAVA_BYTE);
+                            }
+                        }
+                        return null; // not NUL-terminated: not what getcwd promises
+                    }
+                    if ((int) errnoHandle.get(state, 0L) != ERANGE) {
+                        return null;
+                    }
+                }
+                return null;
+            }
+        } catch (Error e) {
+            throw e;
+        } catch (Throwable t) { // invokeExact declares Throwable; a failed call means "unknown", hence absolute paths
+            return null;
+        }
+    }
+
     /**
      * The bytes the operating system knows {@code p} by: absolute for an absolute path, relative (or {@code .}) for a
-     * relative one, without trailing slashes (except for the root) and without the terminating NUL; throws
-     * {@link IllegalArgumentException} for a path that is not on the default file system or whose URI is not in the
-     * expected form (see the class documentation).
+     * relative one when the JDK's default directory is the process's working directory (absolute otherwise), without
+     * trailing slashes (except for the root) and without the terminating NUL; throws {@link IllegalArgumentException}
+     * for a path that is not on the default file system or whose URI is not in the expected form (see the class
+     * documentation).
      */
     static byte[] nativeBytes(Path p) {
         if (p.getFileSystem() != FileSystems.getDefault()) {
             throw new IllegalArgumentException("not a path on the default file system: " + p);
         }
         byte[] absolute = stripTrailingSlashes(uriBytes(p));
-        if (p.isAbsolute()) {
+        if (p.isAbsolute() || !PASS_RELATIVE) {
             return absolute;
         }
         byte[] base = stripTrailingSlashes(uriBytes(EMPTY));

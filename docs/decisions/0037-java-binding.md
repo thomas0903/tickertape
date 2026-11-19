@@ -200,9 +200,17 @@ records, or records encoded field by field). Both allocate nothing per record.
     before" was not true across kinds, and "no larger than the largest copied payload before" denied the headroom the
     buffer already has (a writer warmed with 64-byte arrays appends 128 bytes without allocating). One exception: a
     copied payload above the cap (a heap segment can be far above it; a `byte[]` or `ByteBuffer` only by the few bytes
-    up to `Integer.MAX_VALUE`) grows the buffer to exactly its size, which is too large to back a `ByteBuffer`, so the
-    next `ByteBuffer` append replaces the scratch buffer with one of that append's size (a `ByteBuffer` append above the
-    cap gets one in the same call).
+    up to `Integer.MAX_VALUE`) grows the buffer to exactly its size, which is too large to back a `ByteBuffer`. A
+    `byte[]` or heap segment above the cap is copied into it with `MemorySegment.copy`; a `ByteBuffer` above the cap
+    (direct, heap or read-only heap, with `Integer.MAX_VALUE - 7` to `Integer.MAX_VALUE` bytes remaining) is copied
+    into it from `MemorySegment.ofBuffer(payload)` with `MemorySegment.copy` (allocating that wrapper), reusing a
+    scratch buffer already large enough; a later `ByteBuffer` append at or below the cap replaces a scratch buffer that
+    large with one of that append's size. The record then reaches the library, which appends it or refuses it with its
+    usual `RecordTooLargeException`. Until review round 7 the `ByteBuffer` path asked for a `ByteBuffer` view of a
+    scratch buffer above the cap, which `MemorySegment.asByteBuffer` refuses (`IllegalStateException`), so such an
+    append threw before it reached the library; `Writer.scratchCopy` now chooses the path from the source's kind and
+    size, and `ApiDetailsTest` asserts that choice (the large path itself needs two gibibytes and more of memory and is
+    not run by the suite).
   - `appendBatch`; `nextSeq()` (`writerCallsAllocateNothing`).
   - `appendWith` whose filler uses `set`, `setByte`, `put(byte[])`, `put(MemorySegment)` of a native or heap segment,
     `put(ByteBuffer)` of a heap buffer, and `put(ByteBuffer)` of a direct buffer or a read-only heap buffer that is
@@ -373,8 +381,8 @@ macOS, whose file system refuses the name), and a zip file system path refused. 
 tests, or is refused at run time, rather than passing other bytes silently. The supported range is unchanged: JDK 25 and
 later. Three consequences are documented in the Javadoc (`Tickertape`, Paths, linked from every method that takes a
 journal path) and the guide: an absolute path is passed as its bytes and a relative one relative, with its own bytes,
-resolved by the library against the process's working directory (the directory the JVM started in, against which the JDK
-resolves relative paths too; setting `user.dir`, which the JDK does not support, moves neither); `toUri()` may `stat`
+resolved by the library against the process's working directory when that is the JDK's default directory, and passed as
+its absolute bytes otherwise (see below); `toUri()` may `stat`
 the path once per conversion, and the working directory once more for a relative path (when a journal is opened or
 inspected, or a retention destination set, never per record); and only the default file system is supported.
 
@@ -383,6 +391,25 @@ from a deep working directory: on macOS a working directory of 1,020 bytes and t
 bytes, over the 1,024-byte limit, so the library's directory open failed with a name-too-long error where the JDK opens
 `Path.of("journal")`. Round 6 keeps the bytes from the URI but passes a relative path relative, as the binding did
 before round 5.
+
+Round 6's documentation said the library and the JDK resolve a relative path against the same directory and that setting
+`user.dir` moves neither. That holds for setting the property after start-up, not for `-Duser.dir=`: the JDK reads
+`user.dir` once at start-up as its default directory, so a JVM started in `/a` with `-Duser.dir=/b` resolves
+`Path.of("journal")` under `/b`, while the library resolved the relative `journal` that round 6 passed under `/a`, the
+process's working directory: another journal. The JDK handles this in its own file operations by passing a relative path
+to the operating system as it is only when its default directory is the process's working directory (it compares the two
+when the file system is created) and the resolved absolute path otherwise. Round 7 does the same. When `Paths` is
+initialised it calls the C library's `getcwd` once through the FFM linker (`Linker.nativeLinker().defaultLookup()`, with
+`errno` captured; the buffer starts at 1,024 bytes and doubles on `ERANGE`, up to one mebibyte) and compares the bytes
+with those of the default directory (`Path.of("").toUri()`, decoded like any path, trailing slashes aside). If they are
+equal, a relative path is passed relative, as in round 6; if they differ, or `getcwd` fails (any other `errno`, the
+symbol missing, a call that cannot be made), a relative path is passed as its absolute bytes, as in round 5, and the
+path-length limit then applies to that absolute form, which is also what the JDK's own file operations use in that
+configuration. The comparison is made once: a process that changes its working directory afterwards through native code
+is outside what the binding follows, as it is for the JDK. `PathsTest` asserts the decision as a function of the two
+byte strings, that `getcwd` returns this JVM's working directory from a one-byte starting buffer, and, in a forked JVM
+started in one directory with `-Duser.dir=` naming another, each holding a journal, that `Path.of("journal")` reaches
+the one under `user.dir`, which the JDK's own `Files.list` and `Files.exists` see.
 
 **Finding the library.** In this order, and the first library found must be compatible or loading fails (it never falls
 through to a later candidate after a failure): `Tickertape.loadLibrary(path)` before first use; the system property

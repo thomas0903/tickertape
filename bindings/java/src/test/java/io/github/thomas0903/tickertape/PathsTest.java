@@ -247,6 +247,94 @@ class PathsTest {
                 TestSupport.lines(r.stdout()), r.stderr());
     }
 
+    /**
+     * A relative path is passed relative only when the process's working directory, as {@code getcwd} returns it, has
+     * the bytes of the JDK's default directory; otherwise, or when {@code getcwd} failed, it is passed absolute.
+     */
+    @Test
+    void aRelativePathIsPassedRelativeOnlyWhenTheDefaultDirectoryIsTheWorkingDirectory() {
+        assertTrue(Paths.passRelative(utf8("/a/b"), utf8("/a/b")));
+        assertTrue(Paths.passRelative(utf8("/a/b"), utf8("/a/b/")), "the default directory's URI ends in a slash");
+        assertTrue(Paths.passRelative(utf8("/"), utf8("/")));
+        assertTrue(Paths.passRelative(new byte[] {'/', 'j', (byte) 0xFF}, new byte[] {'/', 'j', (byte) 0xFF}));
+        assertFalse(Paths.passRelative(utf8("/a"), utf8("/b")), "-Duser.dir=/b in /a");
+        assertFalse(Paths.passRelative(utf8("/a"), utf8("/a/b")));
+        assertFalse(Paths.passRelative(utf8("/a/b"), utf8("/a")));
+        assertFalse(Paths.passRelative(utf8("/a/café"), utf8("/a/cafe\u0301")), "the same text in another form");
+        assertFalse(Paths.passRelative(new byte[] {'/', 'j', (byte) 0xFF}, new byte[] {'/', 'j', (byte) 0xEF,
+                (byte) 0xBF, (byte) 0xBD}), "an undecodable name and its decoded twin");
+        assertFalse(Paths.passRelative(null, utf8("/a")), "getcwd failed");
+        assertFalse(Paths.passRelative(utf8("(unreachable)/a"), utf8("/a")),
+                "Linux's mark for a directory outside the root");
+        assertFalse(Paths.passRelative(new byte[0], utf8("/")));
+    }
+
+    /**
+     * {@code getcwd}, called through the FFM linker, returns this JVM's working directory, which the build does not
+     * move from the JDK's default directory; a buffer of one byte grows on {@code ERANGE} until it fits.
+     */
+    @Test
+    void getcwdReturnsTheWorkingDirectoryAndGrowsItsBuffer() {
+        byte[] defaultDirectory = Paths.nativeBytes(Path.of("").toAbsolutePath());
+        assertArrayEquals(defaultDirectory, Paths.processWorkingDirectory(1024));
+        assertArrayEquals(defaultDirectory, Paths.processWorkingDirectory(1));
+        assertArrayEquals(defaultDirectory, Paths.processWorkingDirectory(defaultDirectory.length));
+        assertTrue(Paths.passesRelative());
+    }
+
+    /**
+     * A forked JVM started in one directory with {@code -Duser.dir=} naming another, each holding a journal with a
+     * different payload and a marker file. The JDK resolves {@code Path.of("journal")} under {@code user.dir}, so its
+     * own {@code Files.list} and {@code Files.exists} see that directory; the binding must open the journal there too,
+     * not the one in the process's working directory. A fork, so that this JVM's directories do not change.
+     */
+    @Test
+    void aRelativePathFollowsTheJdkWhenUserDirIsSetAtStartUp() throws Exception {
+        Path started = Files.createDirectory(tmp.toRealPath().resolve("started"));
+        Path userDir = Files.createDirectory(tmp.toRealPath().resolve("user-dir"));
+        journal(started.resolve("journal"), 1);
+        journal(userDir.resolve("journal"), 2);
+        Files.createFile(started.resolve("marker-started"));
+        Files.createFile(userDir.resolve("marker-user-dir"));
+        Path program = tmp.resolve("UserDir.java");
+        Files.writeString(program, """
+                import io.github.thomas0903.tickertape.*;
+                import java.nio.file.*;
+                public class UserDir {
+                    public static void main(String[] args) throws Exception {
+                        Path rel = Path.of("journal");
+                        try (var names = Files.list(Path.of(""))) {
+                            System.out.println("listed " + names.map(p -> p.getFileName().toString()).sorted().toList());
+                        }
+                        System.out.println("exists " + Files.exists(Path.of("marker-user-dir"))
+                                + " " + Files.exists(Path.of("marker-started")));
+                        try (Reader r = Reader.open(rel)) {
+                            System.out.println("payload " + r.tryNext().getByte(0));
+                        }
+                        try (Reader r = Reader.openMappedUnsafe(rel)) {
+                            System.out.println("mapped " + r.tryNext().getByte(0));
+                        }
+                        System.out.println("records " + Journal.verify(rel).records());
+                        try (Writer w = Writer.open(rel, WriterOptions.defaults().segmentSize(65_536).prefault(false))) {
+                            w.append(1, 0, 0, new byte[] {3});
+                        }
+                        System.out.println("records " + Journal.verify(Path.of("journal")).records());
+                    }
+                }
+                """);
+        TestSupport.Result r = TestSupport.run(List.of(TestSupport.javaLauncher(), "-Duser.dir=" + userDir,
+                "--enable-native-access=ALL-UNNAMED", "--illegal-native-access=deny",
+                "-Dtickertape.library.path=" + TestSupport.LIBRARY.toAbsolutePath(),
+                "--class-path", TestSupport.CLASSES.toAbsolutePath().toString(), program.toString()), started, 120);
+        assertEquals(0, r.exit(), "stdout:\n" + r.stdout() + "\nstderr:\n" + r.stderr());
+        assertEquals(List.of("listed [journal, marker-user-dir]", "exists true false", "payload 2", "mapped 2",
+                "records 1", "records 2"), TestSupport.lines(r.stdout()), r.stderr());
+        try (Reader reader = Reader.open(started.resolve("journal"))) {
+            assertEquals(1, reader.tryNext().getByte(0));
+            assertEquals(null, reader.tryNext(), "the journal in the process's working directory is unchanged");
+        }
+    }
+
     /** {@code toUri()} appends a slash to an existing directory; the bytes passed do not depend on it. */
     @Test
     void anExistingDirectoryAndAMissingPathHaveNoTrailingSlash() throws Exception {

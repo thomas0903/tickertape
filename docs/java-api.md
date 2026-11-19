@@ -104,15 +104,22 @@ The Linux libraries are built for glibc.
   macOS's `-Djdk.nio.path.useNormalizationFormD`, reaches the operating system as the JDK holds it. The binding reads
   those bytes from `Path.toUri()`, whose `file:` URI carries the absolute path's bytes percent-encoded one by one, and
   decodes them; it does not reconstruct them from `toString()`. What follows from that:
-  - an absolute path is passed as its bytes; a relative path is passed **relative**, with its own bytes (the empty
-    path as `.`): the binding strips from the absolute bytes those of the JDK's default directory
-    (`Path.of("").toUri()`) and the separator after them, and passes the absolute bytes if that prefix does not match.
-    The library resolves a relative path against the process's working directory, which is the directory the JVM
-    started in and the one the JDK resolves relative paths against too: Java code cannot change it, and setting the
-    `user.dir` property, which the JDK does not support, moves neither (only native code that calls `chdir` does). A
-    journal reached by a short relative path from a deep working directory therefore opens even when its absolute path
-    would exceed the platform's path-length limit, as the JDK opens it. Trailing slashes are removed (except from the
-    root);
+  - an absolute path is passed as its bytes. A relative path is resolved by the JDK against its default directory, which
+    it reads from `user.dir` at start-up, and by the C library against the process's working directory; the two are the
+    same unless the JVM was started with `-Duser.dir=` naming another directory (setting the property later moves
+    neither). The binding follows the JDK, which passes a relative path to the operating system as it is only when its
+    default directory is the process's working directory: the first time the binding converts a path it calls the C
+    library's `getcwd` once, through the FFM linker, and compares the bytes with those of the default directory
+    (`Path.of("").toUri()`, decoded like any path). If they are the same, a relative path is passed **relative**, with
+    its own bytes (the empty path as `.`): the binding strips from the absolute bytes those of the default directory and
+    the separator after them, and passes the absolute bytes if that prefix does not match. A journal reached by a short
+    relative path from a deep working directory therefore opens even when its absolute path would exceed the platform's
+    path-length limit, as the JDK opens it. If they differ (`-Duser.dir=`), or `getcwd` fails, a relative path is passed
+    as its absolute bytes, under the default directory, so it reaches the journal the JDK's own `Files` methods see; the
+    path-length limit then applies to that absolute form, as it does to the JDK's own file operations in that
+    configuration. The comparison is made once: a process that changes its working directory afterwards through native
+    code (`chdir`) is outside what the binding follows, as it is for the JDK. Trailing slashes are removed (except from
+    the root);
   - `toUri()` may `stat` the path once (to tell whether it is a directory), and for a relative path the working
     directory once more, which happens when a journal is opened or inspected, or a retention destination is set
     (`Retention.moveTo`), never per record.
@@ -191,9 +198,14 @@ The Linux libraries are built for glibc.
     without allocating. A native segment is passed as it is and does not grow the buffer, so the first `byte[]` append
     larger than the capacity allocates even after larger native-segment appends. One exception: a copied payload above
     the cap (a heap segment can be far above it; a `byte[]` or `ByteBuffer` only by the few bytes up to
-    `Integer.MAX_VALUE`) grows the buffer to exactly its size, which is too large to back a `ByteBuffer`, so the next
-    `ByteBuffer` append replaces the scratch buffer with one of that append's size (a `ByteBuffer` append above the cap
-    gets one in the same call).
+    `Integer.MAX_VALUE`) grows the buffer to exactly its size, which is too large to back a `ByteBuffer`. By source:
+    a `byte[]` or heap segment above the cap is copied into that buffer segment to segment (`MemorySegment.copy`); a
+    `ByteBuffer` above the cap (direct, heap or read-only heap, with `Integer.MAX_VALUE - 7` to `Integer.MAX_VALUE`
+    bytes remaining) is copied into it through a segment over the buffer (`MemorySegment.ofBuffer`, a wrapper
+    allocated on each such call), reusing a scratch buffer that is already large enough; a later `ByteBuffer` append
+    at or below the cap replaces a scratch buffer that large with one of that append's size. In every case the record
+    then reaches the library, which appends it or, when it does not fit in one segment, refuses it with its usual
+    `RecordTooLargeException`.
   - `appendBatch`; `nextSeq()`.
   - `appendWith` whose filler uses `set`, `setByte`, `put(byte[])`, `put(MemorySegment)` (native or heap), or
     `put(ByteBuffer)` of a heap buffer, or of a direct or read-only heap buffer that is the same as in the previous
