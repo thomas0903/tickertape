@@ -46,36 +46,83 @@ struct OuterLayout {
 fn outer_layout() -> &'static OuterLayout {
     static LAYOUT: OnceLock<OuterLayout> = OnceLock::new();
     LAYOUT.get_or_init(|| {
-        // <target-dir>/[<triple>/]<profile>/deps/c_api-<hash>
         let exe = std::env::current_exe().unwrap();
-        let profile_dir = exe
-            .parent()
-            .and_then(Path::parent)
-            .expect("test binary in <profile>/deps");
-        let parent = profile_dir.parent().unwrap();
-        let parent_name = parent.file_name().and_then(|n| n.to_str()).unwrap_or("");
         let targets = rustc()
             .args(["--print", "target-list"])
             .output()
             .expect("run rustc --print target-list");
-        let is_triple = String::from_utf8_lossy(&targets.stdout)
-            .lines()
-            .any(|t| t == parent_name);
-        OuterLayout {
-            target_dir: if is_triple {
-                parent.parent().unwrap().to_path_buf()
-            } else {
-                parent.to_path_buf()
-            },
-            triple: is_triple.then(|| parent_name.to_owned()),
-            profile_dir: profile_dir
-                .file_name()
-                .unwrap()
-                .to_str()
-                .unwrap()
-                .to_owned(),
-        }
+        let targets = String::from_utf8_lossy(&targets.stdout).into_owned();
+        layout_of(&exe, |name| targets.lines().any(|t| t == name)).unwrap_or_else(|| {
+            panic!(
+                "cannot tell the profile directory from the test binary's path {}; set TICKERTAPE_FFI_LIB_DIR",
+                exe.display()
+            )
+        })
     })
+}
+
+/// Works out the layout from the path of a test binary. Cargo has used two layouts:
+/// `<target-dir>/[<triple>/]<profile>/deps/<name>-<hash>`, and (newer versions)
+/// `<target-dir>/[<triple>/]<profile>/build/<package>/<hash>/out/<name>-<hash>`.
+fn layout_of(exe: &Path, is_triple: impl Fn(&str) -> bool) -> Option<OuterLayout> {
+    let name = |p: &Path| p.file_name().and_then(|n| n.to_str()).map(str::to_owned);
+    let dir = exe.parent()?;
+    let profile_dir = match name(dir)?.as_str() {
+        "deps" => dir.parent()?,
+        "out" => {
+            let build = dir.parent()?.parent()?.parent()?;
+            if name(build)? != "build" {
+                return None;
+            }
+            build.parent()?
+        }
+        _ => return None,
+    };
+    let parent = profile_dir.parent()?;
+    let parent_name = name(parent).unwrap_or_default();
+    let triple = is_triple(&parent_name).then_some(parent_name);
+    Some(OuterLayout {
+        target_dir: if triple.is_some() {
+            parent.parent()?.to_path_buf()
+        } else {
+            parent.to_path_buf()
+        },
+        triple,
+        profile_dir: name(profile_dir)?,
+    })
+}
+
+#[test]
+fn layout_is_found_in_both_cargo_layouts() {
+    let is_triple = |name: &str| name == "aarch64-unknown-linux-gnu";
+    for (exe, target_dir, triple, profile) in [
+        ("/t/debug/deps/c_api-0123", "/t", None, "debug"),
+        (
+            "/t/debug/build/tickertape-ffi/0123/out/c_api-0123",
+            "/t",
+            None,
+            "debug",
+        ),
+        (
+            "/t/aarch64-unknown-linux-gnu/release/deps/c_api-0123",
+            "/t",
+            Some("aarch64-unknown-linux-gnu"),
+            "release",
+        ),
+        (
+            "/t/aarch64-unknown-linux-gnu/custom/build/tickertape-ffi/0123/out/c_api-0123",
+            "/t",
+            Some("aarch64-unknown-linux-gnu"),
+            "custom",
+        ),
+    ] {
+        let layout = layout_of(Path::new(exe), is_triple).unwrap_or_else(|| panic!("{exe}"));
+        assert_eq!(layout.target_dir, Path::new(target_dir), "{exe}");
+        assert_eq!(layout.triple.as_deref(), triple, "{exe}");
+        assert_eq!(layout.profile_dir, profile, "{exe}");
+    }
+    assert!(layout_of(Path::new("/t/debug/elsewhere/c_api-0123"), is_triple).is_none());
+    assert!(layout_of(Path::new("/t/debug/x/y/z/out/c_api-0123"), is_triple).is_none());
 }
 
 /// The target triple to compile the C programs for: the outer build's `--target`, or rustc's host.
