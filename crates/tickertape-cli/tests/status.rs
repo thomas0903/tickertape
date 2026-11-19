@@ -1255,13 +1255,9 @@ fn output_ownership_does_not_depend_on_the_journal() {
     assert_eq!(fs::read_dir(outdir.path()).unwrap().count(), 2);
 }
 
-/// Round 3, item 2: `--output` never replaces quarantined evidence: not a file in a `quarantine/` that is a symlink
-/// to another directory (before the fix the check compared the output with the directory only, and replaced the
-/// file), not a new file in that directory, and not a file a quarantine entry reaches through a symlink or a hard
-/// link.
 /// A destination outside the journal whose path goes through the journal directory with `..` is outside it (round 5:
 /// the path as given was compared with its `..` components in place, and refused); one inside it stays refused
-/// however it is spelled.
+/// however it is spelled. The symlink cases are `output_path_through_a_symlink_and_parent_components`.
 #[test]
 fn output_path_with_parent_components() {
     let _serial = serial();
@@ -1329,6 +1325,83 @@ fn output_path_with_parent_components() {
     assert!(!journal_dir.join("in.prom").exists());
 }
 
+/// Round 5, item 1: with a symlink before a `..`, only the file system knows where a path leads. `srv/gateway` is a
+/// symlink to `data/live`, so `srv/gateway/../journal` is `data/journal`, not `srv/journal`. Before the fix the paths
+/// were also compared with `..` taken out lexically, so a destination in `srv/journal` was refused as inside the
+/// journal given as `srv/gateway/../journal`, and one in `data/journal` spelled `srv/gateway/../journal/…` was refused
+/// as inside a journal at `srv/journal`. Each is really outside the journal and is now written; a destination that is
+/// really inside it is refused however either path is spelled.
+#[test]
+fn output_path_through_a_symlink_and_parent_components() {
+    let _serial = serial();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    fs::create_dir_all(root.join("data/live")).unwrap();
+    fs::create_dir_all(root.join("srv")).unwrap();
+    std::os::unix::fs::symlink(root.join("data/live"), root.join("srv/gateway")).unwrap();
+    let real = root.join("data/journal");
+    let decoy = root.join("srv/journal");
+    for dir in [&real, &decoy] {
+        let mut writer = Writer::open(dir, WriterConfig::default().segment_size(65536)).unwrap();
+        writer
+            .append(&NewRecord {
+                schema_id: 1,
+                venue_ts_ns: 0,
+                local_ts_ns: 0,
+                payload: b"x",
+            })
+            .unwrap();
+        writer.checkpoint().unwrap();
+    }
+    let through = root.join("srv/gateway/../journal");
+    assert_eq!(through.canonicalize().unwrap(), real);
+    // Really outside the journal: written.
+    for (journal, target, written) in [
+        (&through, decoy.join("a.prom"), decoy.join("a.prom")),
+        (&decoy, through.join("b.prom"), real.join("b.prom")),
+    ] {
+        for watch in [false, true] {
+            let out = status_to(journal, "prometheus", &target, watch, &[]);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(
+                out.status.code(),
+                Some(0),
+                "{} -> {}, watch {watch}: {stderr}",
+                journal.display(),
+                target.display()
+            );
+            assert_eq!(up_in(&written), 1.0);
+        }
+    }
+    // Really inside the journal: refused, and nothing is created.
+    for (journal, target) in [
+        (&through, real.join("c.prom")),
+        (&through, through.join("c.prom")),
+        (&real, through.join("c.prom")),
+        (&through, through.join("quarantine/c.prom")),
+    ] {
+        fs::create_dir_all(real.join("quarantine")).unwrap();
+        for watch in [false, true] {
+            let out = status_to(journal, "prometheus", &target, watch, &[]);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(
+                out.status.code(),
+                Some(1),
+                "{} -> {}, watch {watch}: {stderr}",
+                journal.display(),
+                target.display()
+            );
+            assert!(stderr.contains("which the journal uses"), "{stderr}");
+        }
+    }
+    assert!(!real.join("c.prom").exists());
+    assert!(!real.join("quarantine/c.prom").exists());
+}
+
+/// Round 3, item 2: `--output` never replaces quarantined evidence: not a file in a `quarantine/` that is a symlink
+/// to another directory (before the fix the check compared the output with the directory only, and replaced the
+/// file), not a new file in that directory, and not a file a quarantine entry reaches through a symlink or a hard
+/// link.
 #[test]
 fn output_never_replaces_quarantined_evidence() {
     let _serial = serial();
@@ -1577,6 +1650,70 @@ fn output_case_c_the_journal_symlink_itself() {
     assert!(!dir.path().join("status.prom").exists());
 }
 
+/// Round 5, item 3: a file that starts like a status output is still refused when a journal entry reaches it, by a
+/// symlink or a hard link in `quarantine/` (before the fix only an empty file was checked against the journal's
+/// entries, and this one was replaced). The walk visits every entry: one that can't be `stat`ed, met first (in the
+/// journal directory), doesn't hide the match. Once nothing reaches it, it is replaced.
+#[test]
+fn output_reached_by_the_journal_is_refused_whatever_it_starts_with() {
+    use std::os::unix::fs::PermissionsExt;
+    let _serial = serial();
+    let (dir, writer) = journal(2, true);
+    drop(writer);
+    let quarantine = dir.path().join("quarantine");
+    fs::create_dir(&quarantine).unwrap();
+    let outdir = tempfile::tempdir().unwrap();
+    let target = outdir.path().join("t.prom");
+    let looks: &[u8] =
+        b"# HELP tickertape_status_timestamp_seconds evidence that only looks like an output\n";
+    fs::write(&target, looks).unwrap();
+    let refused = |entry: &str, out: &std::process::Output| {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{entry}: {stderr}");
+        assert!(stderr.contains("not written"), "{entry}: {stderr}");
+        assert!(
+            stderr.contains("the journal reaches it through") && stderr.contains(entry),
+            "{entry}: {stderr}"
+        );
+        assert_eq!(fs::read(&target).unwrap(), looks, "{entry}");
+    };
+    std::os::unix::fs::symlink(&target, quarantine.join("x")).unwrap();
+    for watch in [false, true] {
+        refused(
+            "quarantine/x",
+            &status_to(dir.path(), "prometheus", &target, watch, &[]),
+        );
+    }
+    fs::remove_file(quarantine.join("x")).unwrap();
+    fs::hard_link(&target, quarantine.join("y")).unwrap();
+    for watch in [false, true] {
+        refused(
+            "quarantine/y",
+            &status_to(dir.path(), "prometheus", &target, watch, &[]),
+        );
+    }
+    let locked = tempfile::tempdir().unwrap();
+    if !is_root() {
+        fs::create_dir(locked.path().join("sub")).unwrap();
+        std::os::unix::fs::symlink(locked.path().join("sub/x"), dir.path().join("unstatable"))
+            .unwrap();
+        fs::set_permissions(locked.path().join("sub"), fs::Permissions::from_mode(0o000)).unwrap();
+        let out = status_to(dir.path(), "prometheus", &target, false, &[]);
+        fs::set_permissions(locked.path().join("sub"), fs::Permissions::from_mode(0o755)).unwrap();
+        refused("quarantine/y", &out);
+        fs::remove_file(dir.path().join("unstatable")).unwrap();
+    }
+    fs::remove_file(quarantine.join("y")).unwrap();
+    let out = status_to(dir.path(), "prometheus", &target, false, &[]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(up_in(&target), 1.0);
+}
+
 /// Round 4, item 1: an earlier output in each format, of a sample and of a failed sample, is replaced by an output in
 /// each format; a symlink to an earlier output and a symlink to anything else are refused; an empty file is replaced
 /// unless a journal entry reaches it.
@@ -1730,6 +1867,31 @@ fn exit_code_when_the_output_cannot_be_written() {
             assert_eq!(fs::read(&unrelated).unwrap(), b"keep me");
         }
     }
+    // Round 5, item 2: a destination whose directory doesn't exist is an output that can't be written, under the same
+    // rule. Before the fix it was resolved before the first sample, so every case exited 1 (a corrupt journal too).
+    let nowhere = outdir.path().join("missing-dir").join("status.prom");
+    for (journal, extra, code) in cases {
+        for format in ["text", "json", "prometheus"] {
+            let out = status_to(journal, format, &nowhere, false, extra);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(
+                out.status.code(),
+                Some(code),
+                "{}, {format}: {stderr}",
+                journal.display()
+            );
+            assert!(
+                stderr.contains("not written") && stderr.contains("can't resolve its directory"),
+                "{}, {format}: {stderr}",
+                journal.display()
+            );
+        }
+    }
+    let watched = status_to(healthy.path(), "prometheus", &nowhere, true, &[]);
+    let stderr = String::from_utf8_lossy(&watched.stderr);
+    assert_eq!(watched.status.code(), Some(1), "{stderr}");
+    assert_eq!(stderr.matches("not written").count(), 1, "{stderr}");
+    assert!(!outdir.path().join("missing-dir").exists());
     // A write that fails: the output directory is read-only.
     if !is_root() {
         let readonly = tempfile::tempdir().unwrap();

@@ -175,13 +175,14 @@ that offset in some report (round 3; before, the magic and version alone decided
 and `0xff` was taken over or deleted as a leftover). The owner rewrites the whole report with one `pwrite`, so an
 update cut short (a partial `pwrite` followed by an error, such as `EFBIG` under a file-size limit, whose owner then
 died without its destructors) leaves a prefix of one valid report and the suffix of another, cut at one point. The
-rule therefore uses per-byte conditions only, which every such mix satisfies, and checks every field the format fixes:
+rule therefore uses conditions that every such mix satisfies: per-byte conditions on every field the format fixes,
+and (round 4, below) one condition across two fields. The per-byte conditions:
 the magic `TTREADER` and version 1; flags with only bits 0 and 1 (byte 12 at most 3, bytes 13 to 15 zero); the owner's
 pid, the same in every write to one file (only its creator writes it), a positive `pid_t` (not zero, below 2^31);
 reserved bytes 20 to 23 and 96 to 123 zero; the slot's offset 8-byte aligned and below 2^40, the largest segment size
 (the low byte's low three bits and bytes 53 to 55 zero); the segment size a multiple of 64 KiB and at most 2^40
-(bytes 64 and 65 zero, byte 69 at most 1, bytes 70 and 71 zero). Cross-field conditions (an offset inside its
-segment, a size of at least 64 KiB) are left out because a mix can break them. **Round 4:** one condition across
+(bytes 64 and 65 zero, byte 69 at most 1, bytes 70 and 71 zero). Other conditions across fields (an offset inside
+its segment, a size of at least 64 KiB) are left out because a mix can break them. **Round 4:** one condition across
 fields survives every cut: the slot's offset is at least 64 (the segment header's length) **or** the segment size is
 not zero. Every report has both, because a reader always holds an open segment whose header it validated (a `Reader`
 can't be opened on a journal without segments, so no report describes "no segment") and its offset never goes below
@@ -355,7 +356,11 @@ with `--watch`, which goes on sampling and picks the journal up once it exists).
   whose output can't be written (the `--output` target refused, or its write or rename failing, or standard output
   failing) exits 1. With `--watch`, which reports health in each sample, an output that can't be written stops the
   watch with 1. Before, a refused target and a failed write exited 1 whatever the sample found, and a target whose
-  safety couldn't be established left the corruption's 2 although the documentation promised 1.
+  safety couldn't be established left the corruption's 2 although the documentation promised 1. **Round 5:** the
+  `--output` target is resolved when each output is written, not before the first sample, so a target whose
+  directory doesn't exist (or can't be searched) is an output that can't be written under this rule; before, it
+  exited 1 before sampling and a corrupt journal's 2 was lost. Only `--output` naming no file at all (a usage error
+  that needs no file system) is still reported before sampling.
 - **`--max-checkpoint-age`** checks the exposure's estimated age: breached when records are uncovered and the
   checkpoint is older than the limit, its age is unknown (except `marker_changing`, which means a checkpoint just
   happened), or there is no checkpoint. An idle, fully checkpointed
@@ -380,13 +385,19 @@ with `--watch`, which goes on sampling and picks the journal up once it exists).
   matters most exactly when the journal can't be inspected, so no rule that depends on inspecting it can be right.
   Checked before every replacement (the journal and the target can change between samples):
 
-  1. **Certain path checks.** The target, as given (made absolute, symlinks kept) and resolved (its directory's
-     canonical path and its name), must not be or lie inside the journal directory, its `quarantine/` or the beacon
-     directory, each taken as given on the command line, from the journal's canonical path, and resolved again at
-     the check. A directory that can't be resolved is compared by path only; that failure grants nothing, since the
-     next rules still apply. Its name must not be one a writer gives the files it quarantines: 20 digits first, then
-     `.bin` or `.bin.partial` last (`<base>.tape-<n>.bin`, `<base>-<offset>-<time>-<n>.bin`,
-     `<base>-<offset>-<time>.bin.partial`).
+  1. **Certain path checks.** The target must not be or lie inside the journal directory, its `quarantine/` or the
+     beacon directory, each taken as given on the command line (made absolute) and from the journal's canonical path.
+     **The resolved paths decide** (round 5): the target resolved (its directory's canonical path and its name) is
+     compared with each of those directories canonicalised again at the check. The paths **as given** are an extra
+     refusal, used only where they have no `..`: the target as given (made absolute, symlinks kept), if it has no `..`,
+     and the target resolved are compared with each directory as given that has no `..`. A `..` after a symlink leads
+     where the symlink's target's parent is, so neither its lexical form nor its form as given says where the path leads
+     (`/srv/gateway/../journal`, with `/srv/gateway` a symlink to `/data/live`, is `/data/journal`; taking the `..` out
+     lexically, as an earlier round-5 commit did, protected `/srv/journal` instead, and refused a target there); a path
+     with `..` is compared by its resolved form only. A directory that can't be canonicalised is compared by path only
+     (so not at all if it has a `..`); that failure grants nothing, since the next rules still apply. Its name must not
+     be one a writer gives the files it quarantines: 20 digits first, then `.bin` or `.bin.partial` last
+     (`<base>.tape-<n>.bin`, `<base>-<offset>-<time>-<n>.bin`, `<base>-<offset>-<time>.bin.partial`).
   2. **A path that doesn't exist is created.**
   3. **An existing path is replaced only if `lstat` shows a regular file** (never a symlink, a directory, a FIFO, a
      socket or a device), opened with `O_NOFOLLOW | O_NONBLOCK` and checked to be the file `lstat` saw, **whose
@@ -399,10 +410,15 @@ with `--watch`, which goes on sampling and picks the journal up once it exists).
      | `prometheus` (a sample or a failed sample) | `# HELP tickertape_status_timestamp_seconds ` (always the first family) |
 
      A file of any of the three formats may be replaced by any format, so changing `--format` works. **Or the file
-     is empty, and no entry of the journal directory, `quarantine/` or the beacon directory reaches it** by symlink
-     or hard link; if one of those directories (that exists) can't be listed, or an entry can't be `stat`ed, an
-     empty file is refused. An empty file is the one kind of file a journal can also hold (below), and the walk is
-     kept for it only, as an extra refusal: its errors refuse and never grant.
+     is empty.** In both cases, **no entry of the journal directory, `quarantine/` or the beacon directory may reach
+     it** by symlink or hard link (round 5: before, only an empty file was walked for, so a file that someone linked
+     into `quarantine/` and that starts with a status prefix was replaced). The walk visits every entry it can, past
+     a directory it can't list and an entry it can't `stat`, so it reports a match before an error. It is an extra
+     refusal, and what its failure means depends on the file: an empty file, the one kind a journal can also hold
+     (below), is refused if one of those directories (that exists) can't be listed or an entry can't be `stat`ed;
+     for a file that starts like a status output the content test stands, because ownership by content is the rule
+     that works when the journal can't be read, and a walk failure that refused would leave a stale output in place
+     after a failed sample.
   4. **Anything else is refused**, with a message that says how to proceed (remove the file, or choose another
      path).
 
@@ -426,6 +442,13 @@ with `--watch`, which goes on sampling and picks the journal up once it exists).
   not starting with one of the three prefixes above. The archive directory of
   `tickertape archive` is not recorded anywhere `status` can see, but nothing in it can pass either (its files are
   segments).
+
+  **What the rule leaves (round 5).** Two cases remain, and both need someone to have arranged the files that way.
+  When the journal's directories can't be listed, a file outside the journal that starts with one of the three
+  prefixes is taken for an earlier status output even if a journal entry points to it. And the check and the rename
+  are not one atomic step, so a file another process puts at the target's name in between is replaced. An operator
+  avoids both by giving `--output` a path in a directory that only the monitoring job writes to, such as the
+  node_exporter textfile directory.
 
 ## Compatibility
 

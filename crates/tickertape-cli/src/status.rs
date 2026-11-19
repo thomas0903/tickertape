@@ -22,7 +22,7 @@ const CORRUPT: u8 = 2;
 /// Version of the JSON object; bumped when a field is removed or changes meaning (adding fields doesn't bump it).
 const SCHEMA_VERSION: u32 = 1;
 
-pub(crate) const HELP: &str = "Samples the journal without taking the writer lock or writing to it: the writer's head, the checkpoint and what a power loss would remove now (exposure), space left on the volume, the writer process, and readers that publish a beacon (tickertape::status::ReaderBeacon) in <DIR>/readers or --readers-dir. Values a sample can't establish are null; estimates are named estimated_*. head.verified and exposure.verified say whether the sample validated the records between the checkpoint and the head (it reads only the newest segment). Cost: a scan of the newest segment from the checkpoint (or its start; with --watch only what was appended since the previous sample), one stat per segment, statvfs, and a few small reads per beacon.\n\nJSON schema (schema_version 1; fields may be added): see docs/cli.md. With --watch, one object per line; a sample that fails is a line {\"schema_version\":1,\"journal\":string,\"sampled_unix_ns\":u64,\"error\":{\"code\":string,\"message\":string}} and the watch continues.\n\nPrometheus: text exposition format 0.0.4, gauges named tickertape_*, labelled journal=\"<canonical DIR>\" (and reader=\"<name>\"); tickertape_up is 0 for a failed sample and tickertape_status_timestamp_seconds always tells when the file was written; see docs/cli.md. --watch with --format prometheus needs --output.\n\n--output FILE: FILE must lie outside the journal directory, its quarantine/ and the beacon directory (compared as given and with symlinks resolved). If FILE exists, it is replaced only if it is a regular file (not a symlink) that is an earlier output of tickertape status in any format, or empty (and no journal entry reaches it); anything else is refused: remove it or choose another path.\n\nExit codes: 0 healthy (or help, or --watch finished); 1 usage, I/O or missing journal; 2 the sample found the journal corrupt (the head at invalid bytes, a checkpoint marker the writer would refuse, a segment the listing proves missing, a damaged newest segment header) or an unsupported format, which takes precedence over 3; 3 a health threshold is breached (not with --watch, which reports health in each sample). If the --output file (or standard output) can't be written, the sample's verdict wins (2, 3, or 1 for a failed sample) and the reason still goes to stderr; a healthy sample then exits 1, and --watch stops with 1. The sample doesn't read the segments between an older checkpoint and the head: when head.verified is false (health.verified in JSON, \"health ok (unverified)\" in text), 0 does not mean that the writer would open the journal; run verify for that.";
+pub(crate) const HELP: &str = "Samples the journal without taking the writer lock or writing to it: the writer's head, the checkpoint and what a power loss would remove now (exposure), space left on the volume, the writer process, and readers that publish a beacon (tickertape::status::ReaderBeacon) in <DIR>/readers or --readers-dir. Values a sample can't establish are null; estimates are named estimated_*. head.verified and exposure.verified say whether the sample validated the records between the checkpoint and the head (it reads only the newest segment). Cost: a scan of the newest segment from the checkpoint (or its start; with --watch only what was appended since the previous sample), one stat per segment, statvfs, and a few small reads per beacon.\n\nJSON schema (schema_version 1; fields may be added): see docs/cli.md. With --watch, one object per line; a sample that fails is a line {\"schema_version\":1,\"journal\":string,\"sampled_unix_ns\":u64,\"error\":{\"code\":string,\"message\":string}} and the watch continues.\n\nPrometheus: text exposition format 0.0.4, gauges named tickertape_*, labelled journal=\"<canonical DIR>\" (and reader=\"<name>\"); tickertape_up is 0 for a failed sample and tickertape_status_timestamp_seconds always tells when the file was written; see docs/cli.md. --watch with --format prometheus needs --output.\n\n--output FILE: FILE must lie outside the journal directory, its quarantine/ and the beacon directory (compared with symlinks resolved, and also as given where neither path has '..'). If FILE exists, it is replaced only if it is a regular file (not a symlink) that is an earlier output of tickertape status in any format, or empty, and that no entry of those directories reaches (an empty file they can't be listed to rule out is refused); anything else is refused: remove it or choose another path. A FILE whose directory can't be resolved is an output that can't be written.\n\nExit codes: 0 healthy (or help, or --watch finished); 1 usage, I/O or missing journal; 2 the sample found the journal corrupt (the head at invalid bytes, a checkpoint marker the writer would refuse, a segment the listing proves missing, a damaged newest segment header) or an unsupported format, which takes precedence over 3; 3 a health threshold is breached (not with --watch, which reports health in each sample). If the --output file (or standard output) can't be written, the sample's verdict wins (2, 3, or 1 for a failed sample) and the reason still goes to stderr; a healthy sample then exits 1, and --watch stops with 1. The sample doesn't read the segments between an older checkpoint and the head: when head.verified is false (health.verified in JSON, \"health ok (unverified)\" in text), 0 does not mean that the writer would open the journal; run verify for that.";
 
 #[derive(Debug, Args)]
 pub(crate) struct StatusArgs {
@@ -108,7 +108,13 @@ pub(crate) fn run(args: StatusArgs, out: &mut dyn Write) -> Result<()> {
     let journal_given = std::path::absolute(&args.dir)
         .map_err(|e| output::io_error("resolve journal directory", e))?;
     let journal = fs::canonicalize(&args.dir).unwrap_or_else(|_| journal_given.clone());
-    let output = args.output.as_deref().map(destination).transpose()?;
+    // Only the usage error is reported before sampling; the destination is resolved when each output is written, so
+    // that a directory that can't be resolved is an output that could not be written (round 5), under the one
+    // exit-code rule below.
+    let output = args.output.as_deref();
+    if output.is_some_and(|path| path.file_name().is_none()) {
+        return Err(Failure::usage("--output must name a file"));
+    }
     let readers_given = args
         .readers_dir
         .as_deref()
@@ -168,16 +174,14 @@ pub(crate) fn run(args: StatusArgs, out: &mut dyn Write) -> Result<()> {
         // --output file, so that a collector sees `tickertape_up 0` rather than a stale healthy sample.
         let print = args.watch.is_some() || outcome.is_ok() || output.is_some();
         let written = if print {
-            match &output {
-                Some(dest) => check_output(&places, dest)
+            match output {
+                Some(path) => destination(path)
+                    .and_then(|dest| check_output(&places, &dest).map(|()| dest))
                     .map_err(|why| Failure {
                         code: 1,
-                        message: format!(
-                            "status output {} not written: {why}",
-                            dest.given.display()
-                        ),
+                        message: format!("status output {} not written: {why}", path.display()),
                     })
-                    .and_then(|()| replace_file(&dest.resolved, text.as_bytes())),
+                    .and_then(|dest| replace_file(&dest.resolved, text.as_bytes())),
                 None => (if taken > 0 && format == StatusFormat::Text {
                     writeln!(out)
                 } else {
@@ -266,70 +270,52 @@ fn describe(breach: &Breach) -> String {
     }
 }
 
-/// The `--output` destination, as given (made absolute, symlinks kept, `.` and `..` taken out by [`lexical`]) and
-/// resolved (its directory's canonical path joined with its name). The resolved path is the one replaced.
+/// The `--output` destination, as given (made absolute; symlinks and `..` kept) and resolved (its directory's
+/// canonical path joined with its name). The resolved path is the one replaced.
 struct Destination {
     given: PathBuf,
     resolved: PathBuf,
 }
 
-/// `path`, which is absolute, without its `.` components and with each `..` taken against the component before it,
-/// without reading the file system. Only for the by-name comparisons of [`check_output`]: `/data/j/../status.prom`
-/// is not inside `/data/j`. Where a symlink makes this differ from where the path really leads, the comparison of the
-/// resolved paths decides.
-fn lexical(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                out.pop();
-            }
-            other => out.push(other),
-        }
-    }
-    out
-}
-
-/// Resolves `path` for `--output`: it must name a file in a directory that exists.
-fn destination(path: &Path) -> Result<Destination> {
-    let name = path
-        .file_name()
-        .ok_or_else(|| Failure::usage("--output must name a file"))?;
+/// Resolves `path`, which names a file (checked before sampling), for `--output` at the moment it is written. `Err`
+/// says why it can't be resolved (its directory doesn't exist or can't be searched): an output that can't be written.
+fn destination(path: &Path) -> std::result::Result<Destination, String> {
+    let name = path.file_name().ok_or("it names no file")?;
     let parent = match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => Path::new("."),
     };
-    let parent =
-        fs::canonicalize(parent).map_err(|e| output::io_error("resolve output directory", e))?;
-    let given = std::path::absolute(path).map_err(|e| output::io_error("resolve output", e))?;
+    let parent = fs::canonicalize(parent).map_err(|e| {
+        format!("can't resolve its directory: {e} (create it, or choose another path)")
+    })?;
+    let given = std::path::absolute(path).map_err(|e| format!("can't make it absolute: {e}"))?;
     Ok(Destination {
-        given: lexical(&given),
+        given,
         resolved: parent.join(name),
     })
+}
+
+/// Whether `path` has a `..` component, which only the file system can resolve: a symlink before it leads elsewhere
+/// than taking it against the component before it would (round 5).
+fn has_parent_dir(path: &Path) -> bool {
+    path.components()
+        .any(|c| c == std::path::Component::ParentDir)
 }
 
 /// The directories a journal uses, for [`check_output`].
 struct JournalPlaces {
     /// The journal directory, its `quarantine/` and the beacon directory, each from the path given on the command line
-    /// (made absolute) and from the journal's canonical path. Each is also resolved again at every check.
+    /// (made absolute) and from the journal's canonical path. Each is resolved again at every check.
     dirs: Vec<PathBuf>,
-    /// The directories whose entries must not reach an empty destination: the journal directory, its `quarantine/`
-    /// and the beacon directory.
+    /// The directories whose entries must not reach the destination: the journal directory, its `quarantine/` and the
+    /// beacon directory.
     listed: Vec<PathBuf>,
 }
 
 impl JournalPlaces {
     fn new(journal_given: &Path, journal: &Path, readers_given: Option<&Path>) -> JournalPlaces {
         let mut dirs = Vec::new();
-        // Each as given (which is what gets resolved again at every check) and with `.` and `..` taken out (which is
-        // what the destination as given is compared with).
-        for j in [
-            journal_given,
-            journal,
-            &lexical(journal_given),
-            &lexical(journal),
-        ] {
+        for j in [journal_given, journal] {
             dirs.push(j.to_path_buf());
             dirs.push(j.join(QUARANTINE_DIR));
             if readers_given.is_none() {
@@ -337,7 +323,6 @@ impl JournalPlaces {
             }
         }
         dirs.extend(readers_given.map(Path::to_path_buf));
-        dirs.extend(readers_given.map(lexical));
         dirs.sort();
         dirs.dedup();
         let readers = readers_given.map_or_else(
@@ -390,29 +375,46 @@ fn is_quarantine_name(name: &std::ffi::OsStr) -> bool {
 /// be replaced. Rule (ADR 0032, round 4): **ownership of the destination is proved by what it is**, never by
 /// inspecting the journal, which may be impossible exactly when the failure report matters.
 ///
-/// 1. Certain path checks: `dest`, as given and resolved, must not be or lie inside the journal directory, its
-///    `quarantine/` or the beacon directory, each as given and (when it can be resolved) resolved. A directory that
-///    can't be resolved is compared by path only: that failure grants nothing, since the next rules still apply.
+/// 1. Certain path checks: `dest` must not be or lie inside the journal directory, its `quarantine/` or the beacon
+///    directory. **The resolved paths decide** (round 5): `dest`'s resolved path is compared with each of those
+///    directories canonicalised at this check. The paths **as given** are an extra refusal only, and only where they
+///    hold no `..` (which a symlink before it makes lead elsewhere than it reads): `dest` as given, if it has no `..`,
+///    and `dest` resolved are compared with each directory as given that has no `..`. A directory that can't be
+///    canonicalised is compared by path only (so, with a `..`, not at all): that failure grants nothing, since the
+///    next rules still apply.
 /// 2. Its name must not be one a writer gives a quarantined file ([`is_quarantine_name`]).
 /// 3. A path that doesn't exist is created. An existing one is replaced only if `lstat` shows a regular file (never a
 ///    symlink, directory, FIFO, socket or device) that either starts as an output of `tickertape status` in one of
-///    its formats ([`is_status_output`]), or is empty and no entry of the journal directory, `quarantine/` or the
-///    beacon directory reaches it, by symlink or hard link (an empty file is the one kind a journal can also hold: a
-///    lock file whose PID wasn't written yet, a marker cut to zero, a temporary file just created). If those
-///    directories can't be listed, an empty file is refused.
+///    its formats ([`is_status_output`]), or is empty; and, in both cases, no entry of the journal directory,
+///    `quarantine/` or the beacon directory reaches it, by symlink or hard link ([`reached_from`]). The walk is an
+///    extra refusal, and what its failure means differs: an empty file (the one kind a journal can also hold: a lock
+///    file whose PID wasn't written yet, a marker cut to zero, a temporary file just created) is refused when the walk
+///    can't establish that nothing reaches it, while for a file that starts like a status output the content stands,
+///    so that a failed sample's report can replace a stale output whatever state the journal is in.
 ///
 /// `Err` says why the destination is refused and how to proceed.
 fn check_output(places: &JournalPlaces, dest: &Destination) -> std::result::Result<(), String> {
+    let inside = |d: &Path| {
+        format!(
+            "it is or lies inside {}, which the journal uses (choose a path outside the journal directory, its \
+             quarantine/ and the beacon directory)",
+            d.display()
+        )
+    };
+    let given_by_name = !has_parent_dir(&dest.given);
     for dir in &places.dirs {
-        let resolved = fs::canonicalize(dir).ok();
-        for d in std::iter::once(dir).chain(resolved.as_ref()) {
-            if dest.given.starts_with(d) || dest.resolved.starts_with(d) {
-                return Err(format!(
-                    "it is or lies inside {}, which the journal uses (choose a path outside the journal directory, \
-                     its quarantine/ and the beacon directory)",
-                    d.display()
-                ));
-            }
+        if let Some(resolved) = fs::canonicalize(dir)
+            .ok()
+            .filter(|r| dest.resolved.starts_with(r))
+        {
+            return Err(inside(&resolved));
+        }
+        // `dest.resolved` has no symlink before its name, so a directory without `..` that is a prefix of it is
+        // exactly that directory.
+        if !has_parent_dir(dir)
+            && ((given_by_name && dest.given.starts_with(dir)) || dest.resolved.starts_with(dir))
+        {
+            return Err(inside(dir));
         }
     }
     if dest.resolved.file_name().is_some_and(is_quarantine_name) {
@@ -466,19 +468,22 @@ fn check_output(places: &JournalPlaces, dest: &Destination) -> std::result::Resu
             }
         }
     }
-    if n > 0 {
-        return if is_status_output(&head[..n]) {
-            Ok(())
-        } else {
-            Err(refuse.into())
-        };
+    if n > 0 && !is_status_output(&head[..n]) {
+        return Err(refuse.into());
     }
     match reached_from(&places.listed, (meta.dev(), meta.ino())) {
         Ok(None) => Ok(()),
         Ok(Some(entry)) => Err(format!(
-            "it is empty and the journal reaches it through {} (choose another path)",
+            "it is {} and the journal reaches it through {} (choose another path)",
+            if n > 0 {
+                "an earlier output of tickertape status by its content,"
+            } else {
+                "empty"
+            },
             entry.display()
         )),
+        // Round 5: what starts like a status output is one, when the journal can't be walked to show otherwise.
+        Err(_) if n > 0 => Ok(()),
         Err(why) => Err(format!(
             "it is empty, and whether the journal uses it can't be established ({why}); remove it, or choose \
              another path"
@@ -486,30 +491,42 @@ fn check_output(places: &JournalPlaces, dest: &Destination) -> std::result::Resu
     }
 }
 
-/// The first entry of `dirs` that reaches the file `id` (device, inode), following symlinks. A directory that doesn't
-/// exist, isn't a directory or is a symlink loop has no entries. `Err` says why a directory couldn't be listed or an
-/// entry couldn't be stat'ed.
+/// An entry of `dirs` that reaches the file `id` (device, inode), following symlinks. A directory that doesn't exist,
+/// isn't a directory or is a symlink loop has no entries. Every entry that can be visited is, past any directory that
+/// can't be listed and any entry that can't be `stat`ed (round 5), so a match is reported before an error: `Err` (why
+/// the first directory couldn't be listed or entry couldn't be `stat`ed) only when no entry visited reaches the file.
 fn reached_from(dirs: &[PathBuf], id: (u64, u64)) -> std::result::Result<Option<PathBuf>, String> {
+    let mut first_error = None;
     for dir in dirs {
         let entries = match fs::read_dir(dir) {
             Ok(entries) => entries,
             Err(e) if names_nothing(&e) => continue,
-            Err(e) => return Err(format!("can't list {}: {e}", dir.display())),
+            Err(e) => {
+                first_error.get_or_insert_with(|| format!("can't list {}: {e}", dir.display()));
+                continue;
+            }
         };
         for entry in entries {
-            let path = entry
-                .map_err(|e| format!("can't list {}: {e}", dir.display()))?
-                .path();
+            let path = match entry {
+                Ok(entry) => entry.path(),
+                Err(e) => {
+                    first_error.get_or_insert_with(|| format!("can't list {}: {e}", dir.display()));
+                    break;
+                }
+            };
             match fs::metadata(&path) {
                 Ok(m) if (m.dev(), m.ino()) == id => return Ok(Some(path)),
                 Ok(_) => {}
                 // Vanished, a dangling symlink or a symlink loop: reaches no file.
                 Err(e) if names_nothing(&e) => {}
-                Err(e) => return Err(format!("can't stat {}: {e}", path.display())),
+                Err(e) => {
+                    first_error
+                        .get_or_insert_with(|| format!("can't stat {}: {e}", path.display()));
+                }
             }
         }
     }
-    Ok(None)
+    first_error.map_or(Ok(None), Err)
 }
 
 /// Whether a path that failed to resolve with `e` names no file or directory at all: it doesn't exist, a component is

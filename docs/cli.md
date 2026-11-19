@@ -104,18 +104,26 @@ Errors and recovery warnings go to stderr. JSON results go to stdout (or the sel
   that fails is reported (a JSON line with `error`, a text `error` line, or `tickertape_up 0`) and the watch goes on.
   `--output` writes each sample to a new, uniquely named temporary file in the same directory (created exclusively,
   never following a symlink) and renames it over `FILE`, so a node_exporter textfile collector never reads a partial
-  file. Checked before every replacement: `FILE` must not be or lie inside the journal directory, its `quarantine/` or
-  the beacon directory, compared as given and with symlinks resolved (so neither the symlink through which the journal
-  was given nor a `quarantine/` that is a symlink to another directory can be named), and must not have a name a writer
-  gives quarantined files (20 digits, ending `.bin` or `.bin.partial`). A `FILE` that doesn't exist is created; an
-  existing one is replaced only if it is a regular file (not a symlink, directory, FIFO or device) that is an earlier
+  file. `FILE` is resolved when each output is written: a `FILE` whose directory doesn't exist is an output that can't
+  be written (exit codes below). Checked before every replacement: `FILE` must not be or lie inside the journal
+  directory, its `quarantine/` or the beacon directory. The paths with symlinks resolved decide; the paths as given are
+  compared too, as an extra refusal, where neither has a `..` (after a symlink, `..` leads to the parent of the
+  symlink's target, so only the resolved path says where such a path leads). So neither the symlink through which the
+  journal was given nor a `quarantine/` that is a symlink to another directory can be named. `FILE` must not have a name
+  a writer gives quarantined files (20 digits, ending `.bin` or `.bin.partial`). A `FILE` that doesn't exist is created;
+  an existing one is replaced only if it is a regular file (not a symlink, directory, FIFO or device) that is an earlier
   output of `tickertape status` in any of the three formats (recognised by its first bytes: `journal     /`,
-  `{"schema_version":<n>,"journal":"/` or `# HELP tickertape_status_timestamp_seconds `), or empty with no entry of
-  the journal directory, `quarantine/` or the beacon directory reaching it through a symlink or a hard link (an
-  empty file the journal's directories can't be listed to rule out is refused). Anything else is refused: remove it,
-  or choose another path. So a sample that fails always replaces an earlier output with `tickertape_up 0`, also when
-  the journal can't be listed at all (unreadable, not a directory, a symlink loop), and never replaces anything else
-  (the archive directory of `archive` is not known to `status`, but nothing in it is an earlier status output).
+  `{"schema_version":<n>,"journal":"/` or `# HELP tickertape_status_timestamp_seconds `) or empty, and that no entry of
+  the journal directory, `quarantine/` or the beacon directory reaches through a symlink or a hard link (an empty file
+  the journal's directories can't be listed to rule out is refused; a file that starts like an earlier output is taken
+  for one when they can't be listed). Anything else is refused: remove it, or choose another path. So a sample that
+  fails always replaces an earlier output with `tickertape_up 0`, also when the journal can't be listed at all
+  (unreadable, not a directory, a symlink loop), and replaces nothing else except in the two cases below (the archive
+  directory of `archive` is not known to `status`, but nothing in it is an earlier status output). Two cases remain,
+  both needing someone to have arranged the files: when the journal's directories can't be listed, a file outside the
+  journal that starts with one of the three prefixes is taken for an earlier output even if a journal entry points to
+  it; and the check and the rename are not one atomic step, so a file another process puts at `FILE`'s name in between
+  is replaced. Give `--output` a path in a directory only the monitoring job writes to.
   `--watch` with `--format prometheus` needs `--output`. Thresholds (`DUR` and `B` as for `archive`):
   `--max-checkpoint-age` is breached when records are uncovered and the checkpoint's estimated age is above `DUR` or
   unknown, or there is no checkpoint (an idle, fully checkpointed journal and an empty one are healthy); an age
