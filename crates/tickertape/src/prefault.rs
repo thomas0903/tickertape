@@ -113,11 +113,26 @@ impl Prefaulter {
 
 impl Drop for Prefaulter {
     fn drop(&mut self) {
+        #[cfg(test)]
+        if let Some(hook) = test_hooks::ON_DROP.with(std::cell::Cell::take) {
+            hook();
+        }
         lock(&self.shared).stop = true;
         self.shared.wake.notify_one();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+    }
+}
+
+/// Test-only instrumentation of [`Prefaulter`]'s drop.
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Called (once) when a `Prefaulter` starts to drop on this thread, before it stops and joins the helper.
+        pub(crate) static ON_DROP: Cell<Option<fn()>> = const { Cell::new(None) };
     }
 }
 
