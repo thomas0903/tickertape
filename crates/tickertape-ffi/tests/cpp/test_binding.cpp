@@ -143,6 +143,7 @@ static bool is_named(tt::Status status) {
         case tt::Status::aborted:
         case tt::Status::busy:
         case tt::Status::panic:
+        case tt::Status::beacon_in_use:
         case tt::Status::unknown:
             return true;
     }

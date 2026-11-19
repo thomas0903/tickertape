@@ -167,6 +167,9 @@ enum class Status : std::int32_t {
     aborted = TICKERTAPE_E_ABORTED,
     busy = TICKERTAPE_E_BUSY,
     panic = TICKERTAPE_E_PANIC,
+    // A reader beacon with this name is held by a running reader (ADR 0032). The C ABI does not create beacons yet,
+    // so no function of this header returns it today; it is named so that every C status has a name here.
+    beacon_in_use = TICKERTAPE_E_BEACON_IN_USE,
     unknown = TICKERTAPE_E_UNKNOWN,
 };
 
