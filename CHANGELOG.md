@@ -7,6 +7,9 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 - Docs: define the path to v1.0 around sustained performance, optional eBPF diagnostics, reader/checkpoint
   optimization, ARM measurements, interoperability, replay/recovery at scale and explicit stability/release gates.
+- Docs: v1.0 scope decisions of 2026-11-19. The external integration is an iceoryx2 recorder and replayer
+  (ADR 0030); v1.0 adds a C++ header and a Java binding, and more install channels (ADR 0031); cloud measurements
+  move to Google Cloud VMs.
 - Release operations: add tag-driven Trusted Publishing, native Linux/macOS CLI archives with checksums,
   registry/docs.rs verification, and a documented retry/backfill process.
 - Repository: add bug/feature issue forms, binary installation instructions and CI checks for release tooling.
