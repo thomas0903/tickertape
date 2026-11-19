@@ -157,4 +157,42 @@ class ThreadingTest {
             assertTrue(Journal.verify(dir).isIntact(), Journal.verify(dir).toString());
         }
     }
+
+    @Test
+    void everyConcurrentCloseReturnsAfterTheJournalIsReleased() throws Exception {
+        Path dir = tmp.resolve("j");
+        // With the default options the writer has a helper thread, so its C close takes a while (it joins it).
+        try (Writer w = Writer.open(dir, WriterOptions.defaults().segmentSize(65_536))) {
+            w.append(1, 0, 0, new byte[1]);
+        }
+        Object reopen = new Object();
+        for (int iteration = 0; iteration < 100; iteration++) {
+            Writer w = Writer.open(dir, WriterOptions.defaults().segmentSize(65_536));
+            CountDownLatch start = new CountDownLatch(1);
+            AtomicReference<Throwable> failure = new AtomicReference<>();
+            List<Thread> closers = new ArrayList<>();
+            for (int k = 0; k < 2; k++) {
+                closers.add(Thread.ofPlatform().start(() -> {
+                    try {
+                        start.await();
+                        w.close();
+                        assertTrue(w.isClosed());
+                        // Whichever close returns first or second, the journal is free when it does.
+                        synchronized (reopen) {
+                            Writer.open(dir, TestSupport.small()).close();
+                        }
+                    } catch (Throwable t) {
+                        failure.compareAndSet(null, t);
+                    }
+                }));
+            }
+            start.countDown();
+            for (Thread t : closers) {
+                t.join();
+            }
+            if (failure.get() != null) {
+                throw new AssertionError("iteration " + iteration, failure.get());
+            }
+        }
+    }
 }

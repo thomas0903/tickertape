@@ -41,12 +41,13 @@ import java.util.Optional;
  */
 @SuppressWarnings("restricted") // calls restricted java.lang.foreign methods; needs native access
 public final class Writer implements AutoCloseable {
+    /** The upcall target, {@link #fill(FillContext, MemorySegment, MemorySegment, long)}, bound per writer. */
     private static final MethodHandle FILL;
 
     static {
         try {
-            FILL = MethodHandles.lookup().findVirtual(Writer.class, "fill",
-                    MethodType.methodType(int.class, MemorySegment.class, MemorySegment.class, long.class));
+            FILL = MethodHandles.lookup().findStatic(Writer.class, "fill", MethodType.methodType(int.class,
+                    FillContext.class, MemorySegment.class, MemorySegment.class, long.class));
         } catch (ReflectiveOperationException e) {
             throw new ExceptionInInitializerError(e);
         }
@@ -60,13 +61,39 @@ public final class Writer implements AutoCloseable {
     private ByteBuffer scratchBuffer = scratch.asByteBuffer();
 
     private MemorySegment fillStub;
-    private PayloadFiller filler;
-    private Throwable fillError;
-    private final PayloadBuffer payloadBuffer = new PayloadBuffer();
+    private final FillContext fill = new FillContext();
+
+    /**
+     * What the upcall stub is bound to: the filler of the append in progress, what it threw, and the reusable payload
+     * buffer. It must never reference the writer: the stub keeps its target reachable from a global root until the
+     * stub's arena is closed, and the writer's Cleaner could otherwise never run.
+     */
+    private static final class FillContext {
+        PayloadFiller filler;
+        Throwable error;
+        final PayloadBuffer buffer = new PayloadBuffer();
+
+        int run(MemorySegment buf, long len) {
+            PayloadFiller f = filler;
+            if (f == null) {
+                return 1;
+            }
+            try {
+                buffer.begin(buf.address(), len);
+                f.fill(buffer);
+                return 0;
+            } catch (Throwable t) {
+                error = t;
+                return 1;
+            } finally {
+                buffer.end();
+            }
+        }
+    }
 
     private Writer(Path dir, MemorySegment ptr) {
         this.dir = dir;
-        this.handle = new NativeHandle(this, "writer", ptr, Native::writerClose);
+        this.handle = new NativeHandle(this, "writer", ptr, Native::writerClose, null);
     }
 
     /** Opens the journal in {@code dir} with the default options; see {@link #open(Path, WriterOptions)}. */
@@ -223,7 +250,10 @@ public final class Writer implements AutoCloseable {
      * like a failed checkpoint; the writer then refuses every further append and checkpoint (see
      * {@code docs/c-api.md} &rarr; A failed clean-up).
      *
-     * <p>The first call on a writer creates its upcall stub (once per writer).
+     * <p>{@code filler} and the {@link PayloadBuffer} it receives belong to this thread: handing the buffer to another
+     * thread makes every use there throw {@link WrongThreadException} (rethrow it from the filler to abort).
+     *
+     * <p>The first call on a writer creates its upcall stub (once per writer); {@link #close()} frees it.
      *
      * @throws FillAbortedException if the filler threw
      * @throws IllegalStateException if the writer is closed or in use by another thread (including a call from inside
@@ -237,17 +267,17 @@ public final class Writer implements AutoCloseable {
         handle.enter();
         try {
             MemorySegment stub = fillStub();
-            this.filler = filler;
-            this.fillError = null;
+            fill.filler = filler;
+            fill.error = null;
             int status;
             try {
                 status = Native.writerAppendWith(handle.ptr, schemaId, venueTsNs, localTsNs, length, stub,
                         MemorySegment.NULL, seqOut);
             } finally {
-                this.filler = null;
+                fill.filler = null;
             }
-            Throwable thrown = fillError;
-            fillError = null;
+            Throwable thrown = fill.error;
+            fill.error = null;
             if (status >= 0) {
                 return seqOut.get(JAVA_LONG, 0);
             }
@@ -262,29 +292,42 @@ public final class Writer implements AutoCloseable {
         }
     }
 
+    /**
+     * The writer's upcall stub, created on first use in a shared arena that the handle closes after the C writer is
+     * freed (by {@link #close()} or the Cleaner), bound to {@link #fill} and not to the writer.
+     */
     private MemorySegment fillStub() {
         if (fillStub == null) {
-            fillStub = Linker.nativeLinker().upcallStub(FILL.bindTo(this), Signatures.FILL_FN, Arena.ofAuto());
+            Arena arena = Arena.ofShared();
+            try {
+                fillStub = Linker.nativeLinker().upcallStub(FILL.bindTo(fill), Signatures.FILL_FN, arena);
+            } catch (RuntimeException | Error e) {
+                arena.close();
+                throw e;
+            }
+            handle.closeAfterFree(arena);
         }
         return fillStub;
     }
 
-    /** The upcall target: runs the filler and turns anything it throws into an abort. Never throws. */
+    /**
+     * The upcall target: runs the filler and turns anything it throws into an abort. Nothing may escape an upcall (the
+     * JVM would exit), so everything, the payload buffer's clean-up included, runs inside a catch of
+     * {@link Throwable}, and so does recording what was caught.
+     */
     @SuppressWarnings("unused") // called from native code through FILL
-    private int fill(MemorySegment userData, MemorySegment buf, long len) {
-        PayloadFiller f = filler;
-        if (f == null) {
-            return 1;
-        }
+    private static int fill(FillContext context, MemorySegment userData, MemorySegment buf, long len) {
         try {
-            payloadBuffer.begin(buf.address(), len);
-            f.fill(payloadBuffer);
-            return 0;
+            return context.run(buf, len);
         } catch (Throwable t) {
-            fillError = t;
+            try {
+                if (context.error == null) {
+                    context.error = t;
+                }
+            } catch (Throwable ignored) {
+                // nothing more can be done; the append is aborted all the same
+            }
             return 1;
-        } finally {
-            payloadBuffer.end();
         }
     }
 
@@ -302,6 +345,8 @@ public final class Writer implements AutoCloseable {
     public long appendBatch(AppendBatch batch) {
         Objects.requireNonNull(batch, "batch");
         handle.enter();
+        // The pointers prepare() writes point into this memory: keep exactly this object reachable during the call.
+        MemorySegment payloads = batch.payloadMemory();
         try {
             MemorySegment records = batch.prepare();
             int count = batch.size();
@@ -315,7 +360,8 @@ public final class Writer implements AutoCloseable {
             throw new BatchAppendException(cause, countOut.get(JAVA_LONG, 0), seqOut.get(JAVA_LONG, 0));
         } finally {
             handle.exit();
-            Reference.reachabilityFence(batch.payloadMemory());
+            Reference.reachabilityFence(payloads);
+            Reference.reachabilityFence(batch);
             Reference.reachabilityFence(this);
         }
     }
@@ -369,15 +415,17 @@ public final class Writer implements AutoCloseable {
         }
     }
 
-    /** Whether {@link #close()} has run. */
+    /** Whether {@link #close()} has started (from then on the writer refuses every call). */
     public boolean isClosed() {
         return handle.isClosed();
     }
 
     /**
      * Closes the writer and releases the journal's lock. Does <b>not</b> checkpoint: appended records stay visible and
-     * survive, but only those covered by a successful {@link #checkpoint()} are durable. Idempotent. If another
-     * thread is inside a call on this writer, waits for that call to finish.
+     * survive, but only those covered by a successful {@link #checkpoint()} are durable. Idempotent, and callable from
+     * any thread. If another thread is inside a call on this writer, waits for that call to finish; if another thread
+     * is closing it, waits until the journal is released. So when this returns, on any thread, the journal can be
+     * opened again. Frees the upcall stub of {@link #appendWith} too.
      *
      * @throws InternalErrorException if the library reported an internal error while closing (the handle is freed
      *     all the same)

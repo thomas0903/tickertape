@@ -46,12 +46,13 @@ import java.util.concurrent.TimeUnit;
  * it), and notice a {@link #close()} from another thread. A record that arrives during a slice is returned at once,
  * even if the thread was interrupted meanwhile; the interrupt status then stays set for the caller to see.
  *
- * <p><b>Threads.</b> A reader is used by one thread at a time; it may be handed to another thread between calls (with
- * the usual happens-before). A call that finds the reader in use by another thread, or closed, throws
- * {@link IllegalStateException} and does nothing. {@link #close()} may be called from any thread: it waits for a call
- * in progress (a blocked read gives up within one wait slice) and then frees the reader. A blocking read pins a
- * virtual thread to its carrier for the whole wait; follow live journals from platform threads, or poll with
- * {@link #tryNext()} and park between polls.
+ * <p><b>Threads.</b> A reader and its views are used by one thread at a time; they may be handed to another thread
+ * between calls (with the usual happens-before). A call that finds the reader in use by another thread, or closed,
+ * throws {@link IllegalStateException} and does nothing. {@link #close()} may be called from any thread, also while
+ * another thread blocks in a read or reads the current view: it waits for a call in progress (a blocked read gives up
+ * within one wait slice), ends every access to the view (which then throws {@link IllegalStateException}), and then
+ * frees the reader. A blocking read pins a virtual thread to its carrier for the whole wait; follow live journals from
+ * platform threads, or poll with {@link #tryNext()} and park between polls.
  */
 public final class Reader implements AutoCloseable {
     private static final long OFF_SEQ = off("seq");
@@ -74,7 +75,7 @@ public final class Reader implements AutoCloseable {
     private final boolean mapped;
     private final long waitSliceNs;
     private final Generation generation = new Generation();
-    private final RecordView view = new RecordView(generation, this);
+    private final RecordView view;
     private final MemorySegment record = Memory.allocate(Signatures.RECORD.byteSize());
     private final MemorySegment u64Out = Memory.allocate(8);
 
@@ -82,7 +83,11 @@ public final class Reader implements AutoCloseable {
         this.dir = dir;
         this.mapped = mapped;
         this.waitSliceNs = waitSliceNs;
-        this.handle = new NativeHandle(this, "reader", ptr, Native::readerClose);
+        // The view reads the library's memory only through this arena, which close() (or the Cleaner) closes before
+        // it frees the reader: closing a shared arena waits for every access in progress on any thread.
+        Arena memoryArena = Arena.ofShared();
+        this.view = RecordView.ofReader(this, generation, Memory.overAddressSpace(memoryArena));
+        this.handle = new NativeHandle(this, "reader", ptr, Native::readerClose, memoryArena);
     }
 
     /** Opens the safe reader on {@code dir} with the default options; see {@link #open(Path, ReaderOptions)}. */
@@ -393,7 +398,7 @@ public final class Reader implements AutoCloseable {
         Reference.reachabilityFence(this);
     }
 
-    /** Whether {@link #close()} has run. */
+    /** Whether {@link #close()} has started (from then on the reader refuses every call). */
     public boolean isClosed() {
         return handle.isClosed();
     }
@@ -401,7 +406,9 @@ public final class Reader implements AutoCloseable {
     /**
      * Closes the reader and frees it, invalidating its view. Idempotent, and callable from any thread: if another
      * thread is inside a call on this reader, waits for it to finish (a blocked read ends within one wait slice,
-     * throwing {@link IllegalStateException}).
+     * throwing {@link IllegalStateException}); if another thread is reading the view, its access in progress
+     * completes and every later one throws {@link IllegalStateException}. When this returns, on any thread, the reader
+     * is freed (a concurrent second {@code close} waits for the first).
      *
      * @throws InternalErrorException if the library reported an internal error while closing (the reader is freed
      *     all the same)
@@ -409,8 +416,7 @@ public final class Reader implements AutoCloseable {
      */
     @Override
     public void close() {
-        int status = handle.close();
-        generation.value++;
+        int status = handle.close(() -> generation.value++);
         if (status < 0) {
             throw Errors.capture(status);
         }

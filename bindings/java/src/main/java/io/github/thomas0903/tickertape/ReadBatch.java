@@ -13,9 +13,13 @@ import java.util.function.Consumer;
  * after another into a buffer of {@link #bufferBytes()} bytes, all owned by the batch. Reuse one batch for every read:
  * reading into it allocates nothing.
  *
- * <p>The records stay in the batch until it is filled again. {@link #get(int)} returns the batch's one reusable
- * {@link RecordView}, positioned at that record; it is valid until the next read into this batch. The payloads are in
- * the batch's own memory, so they never point into the journal. Not thread-safe.
+ * <p>The records stay in the batch until it is filled again. {@link #get(int)} returns the batch's view of record
+ * {@code index}: one view object per index, so views of different records never alias ({@code get(0)} and
+ * {@code get(1)} can be used side by side), created on the first {@code get} of that index and reused for that index
+ * by every later read, so a warm batch allocates nothing. Every view is valid until the next read into this batch;
+ * after that it throws {@link IllegalStateException} until {@code get} positions it again. The payloads are in the
+ * batch's own memory, so they never point into the journal and stay readable after the reader is closed; a view keeps
+ * its batch, and so that memory, reachable. Not thread-safe.
  */
 public final class ReadBatch {
     private static final long RECORD_SIZE = Signatures.RECORD.byteSize();
@@ -35,7 +39,8 @@ public final class ReadBatch {
     private final int maxRecords;
     private final long bufferLength;
     final Generation generation = new Generation();
-    private final RecordView view = new RecordView(generation, null);
+    /** The view of each index, created on first use. */
+    private final RecordView[] views;
     private int size;
 
     /**
@@ -50,6 +55,7 @@ public final class ReadBatch {
         this.records = Memory.allocate(maxRecords * RECORD_SIZE);
         this.buffer = Memory.allocate(bufferBytes);
         this.bufferLength = bufferBytes;
+        this.views = new RecordView[maxRecords];
     }
 
     /** The most records one read can return. */
@@ -83,13 +89,18 @@ public final class ReadBatch {
     }
 
     /**
-     * The batch's reusable view, positioned at record {@code index} of the last read. Each call repositions the same
-     * object.
+     * The batch's view of record {@code index} of the last read, valid until the next read into this batch. The same
+     * object for the same index every time, and a different one for each index; the first call for an index creates it
+     * (once per batch), later calls allocate nothing.
      *
      * @throws IndexOutOfBoundsException if {@code index} is not below {@link #size()}
      */
     public RecordView get(int index) {
         Objects.checkIndex(index, size);
+        RecordView view = views[index];
+        if (view == null) {
+            view = views[index] = RecordView.ofBatch(this, generation, buffer);
+        }
         long base = index * RECORD_SIZE;
         view.set(records.get(JAVA_LONG, base + OFF_SEQ), records.get(JAVA_INT, base + OFF_SCHEMA),
                 records.get(JAVA_LONG, base + OFF_VENUE), records.get(JAVA_LONG, base + OFF_LOCAL),
@@ -97,7 +108,7 @@ public final class ReadBatch {
         return view;
     }
 
-    /** Calls {@code action} with the view positioned at each record of the last read, in order. */
+    /** Calls {@code action} with the view of each record of the last read ({@link #get(int)}), in order. */
     public void forEach(Consumer<? super RecordView> action) {
         for (int i = 0; i < size; i++) {
             action.accept(get(i));

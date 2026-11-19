@@ -1,5 +1,6 @@
 package io.github.thomas0903.tickertape;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -119,9 +120,117 @@ class LifetimeTest {
     }
 
     @Test
+    void batchViewsOfDifferentRecordsDoNotAlias() throws Exception {
+        Path dir = journal(5);
+        try (Reader r = Reader.open(dir)) {
+            ReadBatch batch = new ReadBatch(4, 64);
+            assertEquals(4, r.tryReadBatch(batch));
+            RecordView x = batch.get(0);
+            RecordView y = batch.get(1);
+            assertEquals(0, x.seq(), "an earlier get is not re-pointed by a later one");
+            assertEquals(1, y.seq());
+            assertEquals(0, x.getByte(0));
+            assertEquals(1, y.getByte(0));
+            assertSame(x, batch.get(0), "one view object per index, reused");
+            assertEquals(1, r.tryReadBatch(batch));
+            assertThrows(IllegalStateException.class, x::seq, "a view from the previous read is stale");
+            assertThrows(IllegalStateException.class, y::seq);
+            assertEquals(4, batch.get(0).seq());
+        }
+    }
+
+    @Test
+    void aBatchViewKeepsItsBatchAndItsMemoryAlive() throws Exception {
+        Path dir = tmp.resolve("j");
+        byte[] payload = new byte[4096];
+        java.util.Arrays.fill(payload, (byte) 90);
+        try (Writer w = Writer.open(dir, TestSupport.small())) {
+            w.append(1, 0, 0, payload);
+        }
+        AtomicReference<WeakReference<ReadBatch>> batch = new AtomicReference<>();
+        RecordView v;
+        try (Reader r = Reader.open(dir)) {
+            v = readIntoForgottenBatch(r, batch);
+        }
+        // Only the view references the batch now. Collect hard, and churn native memory so freed memory is reused.
+        for (int i = 0; i < 20; i++) {
+            System.gc();
+            try (java.lang.foreign.Arena a = java.lang.foreign.Arena.ofConfined()) {
+                a.allocate(4096).fill((byte) 17);
+            }
+            Thread.sleep(5);
+        }
+        assertNotNull(batch.get().get(), "the batch must stay reachable through its view");
+        assertTrue(v.isValid());
+        for (int i = 0; i < payload.length; i++) {
+            assertEquals(90, v.getByte(i), "byte " + i);
+        }
+        assertArrayEquals(payload, v.payloadToArray());
+    }
+
+    private static RecordView readIntoForgottenBatch(Reader r, AtomicReference<WeakReference<ReadBatch>> ref) {
+        ReadBatch batch = new ReadBatch(1, 4096);
+        assertEquals(1, r.tryReadBatch(batch));
+        ref.set(new WeakReference<>(batch));
+        return batch.get(0);
+    }
+
+    @Test
+    void aReaderViewKeepsAForgottenReaderOpen() throws Exception {
+        Path dir = journal(2);
+        AtomicReference<WeakReference<Reader>> reader = new AtomicReference<>();
+        RecordView v = openReadAndForget(dir, reader);
+        for (int i = 0; i < 10; i++) {
+            System.gc();
+            Thread.sleep(5);
+        }
+        assertNotNull(reader.get().get(), "the reader must stay reachable (and unfreed) through its view");
+        assertEquals(0, v.seq());
+        assertEquals(0, v.getByte(0));
+        assertEquals(3, v.getByte(2));
+        reader.get().get().close();
+        assertThrows(IllegalStateException.class, () -> v.getByte(0));
+    }
+
+    private static RecordView openReadAndForget(Path dir, AtomicReference<WeakReference<Reader>> ref) {
+        Reader r = Reader.openMappedUnsafe(dir);
+        ref.set(new WeakReference<>(r));
+        return r.tryNext();
+    }
+
+    @Test
     void anUnclosedWriterIsReleasedByTheCleaner() throws Exception {
         Path dir = tmp.resolve("j");
-        WeakReference<Writer> ref = openAndForget(dir);
+        WeakReference<Writer> ref = openAndForget(dir, false);
+        awaitReopenable(dir, ref);
+    }
+
+    @Test
+    void anUnclosedWriterThatUsedAppendWithIsReleasedByTheCleaner() throws Exception {
+        Path dir = tmp.resolve("j");
+        WeakReference<Writer> ref = openAndForget(dir, true);
+        awaitReopenable(dir, ref);
+    }
+
+    @Test
+    void aClosedWriterThatUsedAppendWithCanBeCollected() throws Exception {
+        Path dir = tmp.resolve("j");
+        Writer w = Writer.open(dir, TestSupport.small());
+        w.appendWith(1, 0, 0, 8, p -> p.setByte(0, (byte) 1));
+        w.close();
+        WeakReference<Writer> ref = new WeakReference<>(w);
+        w = null;
+        long deadline = System.nanoTime() + 20_000_000_000L;
+        while (ref.get() != null) {
+            if (System.nanoTime() > deadline) {
+                throw new AssertionError("a closed writer that used appendWith was never collected");
+            }
+            System.gc();
+            Thread.sleep(10);
+        }
+    }
+
+    private static void awaitReopenable(Path dir, WeakReference<Writer> ref) throws Exception {
         // The journal stays locked until the cleaner closes the forgotten writer.
         long deadline = System.nanoTime() + 20_000_000_000L;
         Writer again = null;
@@ -142,9 +251,13 @@ class LifetimeTest {
         }
     }
 
-    private static WeakReference<Writer> openAndForget(Path dir) {
+    private static WeakReference<Writer> openAndForget(Path dir, boolean appendWith) {
         Writer w = Writer.open(dir, TestSupport.small());
-        w.append(1, 0, 0, new byte[1]);
+        if (appendWith) {
+            w.appendWith(1, 0, 0, 1, p -> p.setByte(0, (byte) 1));
+        } else {
+            w.append(1, 0, 0, new byte[1]);
+        }
         assertNotNull(w);
         return new WeakReference<>(w);
     }

@@ -248,7 +248,18 @@ final class NativeLibrary {
                 throw new UnsatisfiedLinkError("the library extracted from " + url + " has SHA-256 " + actual
                         + " but the natives JAR says " + expected + "; refusing to load it");
             }
-            open(file, "the natives JAR (" + url + ", SHA-256 " + actual + ")");
+            try {
+                open(file, "the natives JAR (" + url + ", SHA-256 " + actual + ")");
+            } catch (UnsatisfiedLinkError e) {
+                // The hash matched, so the file is the right library: the usual cause is a directory that does not
+                // allow executable mappings (a noexec temporary directory).
+                UnsatisfiedLinkError error = new UnsatisfiedLinkError(e.getMessage() + "; it was extracted into "
+                        + parent + ", which may not allow loading libraries from it (for example a noexec file"
+                        + " system): set -D" + EXTRACT_DIR_PROPERTY + "=<a directory that does>, or -D"
+                        + PATH_PROPERTY + "=<path to the library>");
+                error.initCause(e);
+                throw error;
+            }
             loadedPath = null; // the extracted copy is deleted below
         } finally {
             Files.deleteIfExists(file);

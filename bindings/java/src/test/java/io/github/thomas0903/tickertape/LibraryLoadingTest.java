@@ -52,11 +52,15 @@ class LibraryLoadingTest {
 
     /** A natives JAR as the natives profile builds it, with the given hash file contents (null: none). */
     private Path nativesJar(String hash) throws IOException {
+        return nativesJar(TestSupport.LIBRARY, hash);
+    }
+
+    private Path nativesJar(Path library, String hash) throws IOException {
         Path jar = tmp.resolve("natives.jar");
         String base = NativeLibrary.RESOURCE_ROOT + NativeLibrary.platform() + "/";
         try (JarOutputStream out = new JarOutputStream(Files.newOutputStream(jar))) {
             out.putNextEntry(new JarEntry(base + fileName()));
-            Files.copy(TestSupport.LIBRARY, out);
+            Files.copy(library, out);
             out.closeEntry();
             if (hash != null) {
                 out.putNextEntry(new JarEntry(base + fileName() + ".sha256"));
@@ -110,6 +114,16 @@ class LibraryLoadingTest {
         TestSupport.Result r = probe(base(privateTmp()), classes() + java.io.File.pathSeparator + jar);
         assertEquals(3, r.exit(), r.stdout() + r.stderr());
         assertTrue(r.stdout().contains("refusing to load it"), r.stdout());
+    }
+
+    @Test
+    void aVerifiedLibraryThatFailsToLoadNamesTheExtractDirectoryProperty() throws Exception {
+        // Stands in for a noexec temporary directory: the hash matches, but loading the extracted file fails.
+        Path bogus = Files.writeString(tmp.resolve("bogus"), "not a library");
+        Path jar = nativesJar(bogus, NativeLibrary.sha256(bogus));
+        TestSupport.Result r = probe(base(privateTmp()), classes() + java.io.File.pathSeparator + jar);
+        assertEquals(3, r.exit(), r.stdout() + r.stderr());
+        assertTrue(r.stdout().contains("-D" + NativeLibrary.EXTRACT_DIR_PROPERTY + "="), r.stdout());
     }
 
     @Test

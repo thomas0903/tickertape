@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -266,8 +267,9 @@ class WriterReaderTest {
                 RecordView v = batch.get(i);
                 assertEquals(i, v.seq());
                 assertEquals(i, v.payloadLength());
-                assertSame(batch.get(0), batch.get(1), "one reusable view");
+                assertSame(v, batch.get(i), "one view per index");
             }
+            assertNotSame(batch.get(0), batch.get(1), "views of different records do not alias");
             // Payloads 8..13 take 8+9+...+13 = 63 bytes; 14 more do not fit in what is left of 64.
             int n = r.tryReadBatch(batch);
             assertEquals(6, n, "records 8 to 13 fit in 64 bytes; 14 is held back");

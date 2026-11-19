@@ -75,6 +75,10 @@ class AllocationTest {
             assertNoAllocation("append(MemorySegment)", i -> w.append(1, i, i, nativePayload));
             assertNoAllocation("append(ByteBuffer)", i -> w.append(1, i, i, direct));
             assertNoAllocation("appendWith", i -> w.appendWith(1, i, i, 64, filler));
+            ByteBuffer heap = ByteBuffer.allocate(64);
+            PayloadFiller bufferFiller = p -> p.put(0, direct).put(0, heap);
+            assertNoAllocation("appendWith with PayloadBuffer.put(ByteBuffer), direct and heap",
+                    i -> w.appendWith(1, i, i, 64, bufferFiller));
             assertNoAllocation("appendBatch", i -> {
                 if (i % 16 == 0) {
                     batch.clear();
@@ -89,6 +93,8 @@ class AllocationTest {
             for (boolean mapped : new boolean[] {false, true}) {
                 try (Reader r = mapped ? Reader.openMappedUnsafe(dir) : Reader.open(dir)) {
                     long[] sum = new long[1];
+                    ByteBuffer directOut = ByteBuffer.allocateDirect(64);
+                    ByteBuffer heapOut = ByteBuffer.allocate(64);
                     assertNoAllocation((mapped ? "mapped" : "safe") + " tryNext and view accessors", i -> {
                         RecordView v = r.tryNext();
                         if (v == null) {
@@ -99,6 +105,10 @@ class AllocationTest {
                                 + v.get(ValueLayout.JAVA_LONG_UNALIGNED, 0) + v.getByte(63);
                         v.copyPayloadTo(nativePayload, 0);
                         v.copyPayloadTo(payload, 0);
+                        directOut.clear();
+                        v.copyPayloadTo(directOut);
+                        heapOut.clear();
+                        v.copyPayloadTo(heapOut);
                     });
                     assertTrue(sum[0] != 0);
                 }
@@ -119,10 +129,30 @@ class AllocationTest {
                     }
                 });
                 assertTrue(seen[0] > 0);
+                r.seek(0);
+                assertNoAllocation("timed readBatch with records available", i -> {
+                    if (i % 16 != 0) {
+                        return;
+                    }
+                    int n = r.readBatch(rb, 1, java.util.concurrent.TimeUnit.SECONDS);
+                    if (n == 0 || r.position() >= total - 64) {
+                        r.seek(0);
+                    }
+                    for (int k = 0; k < n; k++) {
+                        seen[0] += rb.get(k).getByte(0);
+                    }
+                });
             }
             try (Reader r = Reader.open(dir)) {
                 assertNoAllocation("timed next with records available", i -> {
                     if (r.next(1, java.util.concurrent.TimeUnit.SECONDS) == null || r.position() >= total - 1) {
+                        r.seek(0);
+                    }
+                });
+                r.seek(0);
+                assertNoAllocation("next() with records available", i -> {
+                    r.next();
+                    if (r.position() >= total - 1) {
                         r.seek(0);
                     }
                 });

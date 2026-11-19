@@ -28,8 +28,9 @@ class ZeroCopyAppendTest {
         try (Writer w = Writer.open(dir, TestSupport.small())) {
             long seq = w.appendWith(1, 2, 3, 40, p -> {
                 assertEquals(40, p.length());
+                MemorySegment before = p.segment();
                 for (long i = 0; i < 40; i++) {
-                    assertEquals(0, MemorySegment.ofArray(new byte[1]).get(ValueLayout.JAVA_BYTE, 0), "zeroed");
+                    assertEquals(0, before.get(ValueLayout.JAVA_BYTE, i), "the buffer starts zeroed at " + i);
                 }
                 p.setByte(0, (byte) 1);
                 p.set(ValueLayout.JAVA_SHORT_UNALIGNED, 1, (short) 2);
@@ -106,6 +107,68 @@ class ZeroCopyAppendTest {
             assertTrue(kept.get().toString().contains("no longer valid"));
             // The same buffer object serves the next append.
             w.appendWith(1, 0, 0, 8, p -> assertSame(kept.get(), p));
+        }
+    }
+
+    @Test
+    void theBufferRefusesEveryOtherThread() throws Exception {
+        Path dir = tmp.resolve("j");
+        try (Writer w = Writer.open(dir, TestSupport.small())) {
+            // The reviewer's scenario: a filler hands the buffer to a helper thread and waits for it. segment() used
+            // to create a confined arena on the helper, which the upcall then failed to close: the JVM exited.
+            AtomicReference<Throwable> helperSaw = new AtomicReference<>();
+            FillAbortedException e = assertThrows(FillAbortedException.class, () -> w.appendWith(1, 0, 0, 16, p -> {
+                Thread helper = Thread.ofPlatform().start(() -> {
+                    try {
+                        p.segment().set(ValueLayout.JAVA_BYTE, 0, (byte) 1);
+                    } catch (Throwable t) {
+                        helperSaw.set(t);
+                    }
+                });
+                helper.join();
+                throw new Exception("the helper failed", helperSaw.get());
+            }));
+            assertInstanceOf(WrongThreadException.class, helperSaw.get());
+            assertSame(helperSaw.get(), e.getCause().getCause());
+            assertEquals(0, w.nextSeq(), "the append was aborted");
+
+            // Every accessor refuses another thread, also when the filler returns normally after the helper.
+            AtomicReference<Throwable> first = new AtomicReference<>();
+            int[] refused = new int[1];
+            long seq = w.appendWith(1, 0, 0, 16, p -> {
+                Thread helper = Thread.ofPlatform().start(() -> {
+                    Runnable[] uses = {
+                        p::length,
+                        () -> p.setByte(0, (byte) 1),
+                        () -> p.set(ValueLayout.JAVA_LONG_UNALIGNED, 0, 1L),
+                        () -> p.put(0, new byte[] {1}),
+                        () -> p.put(0, ByteBuffer.allocateDirect(1)),
+                        () -> p.put(0, MemorySegment.ofArray(new byte[1])),
+                        p::segment,
+                    };
+                    for (Runnable use : uses) {
+                        try {
+                            use.run();
+                        } catch (WrongThreadException expected) {
+                            refused[0]++;
+                        } catch (Throwable t) {
+                            first.compareAndSet(null, t);
+                        }
+                    }
+                });
+                helper.join();
+                p.setByte(15, (byte) 7);
+            });
+            assertEquals(null, first.get());
+            assertEquals(7, refused[0], "every accessor threw WrongThreadException on the helper");
+            assertEquals(0, seq, "the writer is still usable");
+            assertEquals(1, w.append(1, 0, 0, new byte[] {2}));
+        }
+        try (Reader r = Reader.open(dir)) {
+            RecordView v = r.tryNext();
+            assertEquals(0, v.getByte(0), "nothing the helper tried was written");
+            assertEquals(7, v.getByte(15));
+            assertEquals(2, r.tryNext().getByte(0));
         }
     }
 
