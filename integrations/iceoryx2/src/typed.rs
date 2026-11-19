@@ -92,8 +92,16 @@ pub(crate) fn check_subscriber(
         .defaults
         .publish_subscribe
         .subscriber_expired_connection_buffer;
-    layout::subscriber_heap(&described.settings, expired as u64)
-        .map_err(|e| unsupported(format!("the service's settings in force: {e}")))?;
+    let in_force = |e| unsupported(format!("the service's settings in force: {e}"));
+    described.settings.validate().map_err(in_force)?;
+    layout::subscriber_heap(&described.settings, expired as u64).map_err(|e| {
+        // The settings are within their caps, so this is the heap, which max_publishers drives.
+        let fit = layout::subscriber_max_publishers(&described.settings, expired as u64);
+        unsupported(format!(
+            "the service's settings in force: {e}; with an expired-connection buffer of {expired} and these \
+             settings at most {fit} for max_publishers fits (203 with iceoryx2's default buffer of 128)"
+        ))
+    })?;
     let mut publishers = Vec::new();
     dynamic.list_publishers(|p| {
         publishers.push(layout::AdvertisedPublisher {

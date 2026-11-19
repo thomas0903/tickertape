@@ -591,5 +591,12 @@ fn the_recorder_refuses_a_subscriber_over_the_heap_limit() {
         !errors.is_empty() && errors.iter().all(|e| e.contains("subscriber heap")),
         "{errors:?}"
     );
+    // The refusal names how many publishers would fit: none, with 16,384 borrowed samples taking the slots.
+    assert!(
+        errors
+            .iter()
+            .all(|e| e.contains("at most 0 for max_publishers fits (203 with iceoryx2's default")),
+        "{errors:?}"
+    );
     assert_eq!(factory.dynamic_config().number_of_subscribers(), 0);
 }

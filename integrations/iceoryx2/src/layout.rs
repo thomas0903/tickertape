@@ -233,8 +233,10 @@
 //! are created and while it runs (`port/publisher.rs` `Publisher::new`, `port/subscriber.rs` `Subscriber::new`,
 //! `port/details/{sender,receiver}.rs` `Connection::new`, `iceoryx2-cal/src/zero_copy_connection/common.rs`
 //! `SharedManagementData`, `iceoryx2-cal/src/resizable_shared_memory/dynamic.rs`). Every estimate is checked against
-//! measurements of real ports by `tests/allocation.rs`: a formula that comes out below a measured figure is wrong.
-//! The measured constants carry the version they were measured with.
+//! measurements of real ports by `tests/allocation.rs` (the heap that goes through Rust's global allocator, and the
+//! shared-memory objects): a formula that comes out below a measured figure is wrong, and so is a per-item constant
+//! below the measured cost per item. iceoryx2's direct `malloc` users, which that test can't see, are in the
+//! formulas from its source. The measured constants carry the version they were measured with.
 //!
 //! A publisher preallocates `samples = max_subscribers × (buffer + borrowed) + history + its loaned samples` (where
 //! `buffer` is `subscriber_max_buffer_size` and `borrowed` `subscriber_max_borrowed_samples`) and has `segments` data
@@ -268,7 +270,10 @@
 //! - on the heap: a connection slot for each publisher it may connect to and each expired connection it may keep,
 //!   `max(subscriber_expired_connection_buffer, borrowed) + max_publishers` slots, each counted with
 //!   [`SUBSCRIBER_HEAP_PER_CONNECTION`] and [`SUBSCRIBER_HEAP_PER_GROWING_PUBLISHER`] (the 255-entry table its view
-//!   of a growing publisher's data segment allocates), plus [`SUBSCRIBER_HEAP_FIXED_BYTES`]; at most
+//!   of a growing publisher's data segment allocates); the two lists iceoryx2 allocates with `malloc` directly,
+//!   bypassing Rust's global allocator ([`SUBSCRIBER_DIRECT_HEAP_PER_PUBLISHER`] per `max_publishers` and
+//!   [`SUBSCRIBER_DIRECT_HEAP_PER_EXPIRED`] per expired-connection slot, from the source: the only users of its
+//!   `HeapAllocator` on the publish-subscribe paths); plus [`SUBSCRIBER_HEAP_FIXED_BYTES`]; at most
 //!   [`MAX_PORT_HEAP_BYTES`]. This depends on the settings alone, so it bounds the publishers that connect after the
 //!   subscriber exists, which cost it this heap on its next receive and which it can't decline, as well as those
 //!   present. Fixed-size services are not exempt: a fixed-size publisher takes its allocation strategy from its own
@@ -384,6 +389,19 @@ pub const SUBSCRIBER_HEAP_PER_CONNECTION: u64 = 8192;
 /// active or expired, may hold one: any publisher can have a growing segment (a fixed-size publisher takes its
 /// strategy from its own process's configuration), and an expired connection keeps its view.
 pub const SUBSCRIBER_HEAP_PER_GROWING_PUBLISHER: u64 = 384 << 10;
+/// A subscriber's heap per active connection slot (one per `max_publishers`) that iceoryx2 allocates with its own
+/// `HeapAllocator`, which calls `malloc` directly, bypassing Rust's global allocator (so `tests/allocation.rs`
+/// can't count it): the `connections` list of the receiver, a `PolymorphicVec<UnsafeCell<Option<SlotMapKey>>,
+/// HeapAllocator>` of `max_publishers` entries of 16 bytes (iceoryx2 0.10.0 `port/subscriber.rs` near line 288,
+/// `iceoryx2-bb-memory` `heap_allocator.rs` near line 41, `iceoryx2-bb-posix` `memory.rs` near line 124). Taken from
+/// the source, not measured; the few bytes of alignment and bookkeeping per list are in
+/// [`SUBSCRIBER_HEAP_FIXED_BYTES`].
+pub const SUBSCRIBER_DIRECT_HEAP_PER_PUBLISHER: u64 = 16;
+/// A subscriber's heap per expired-connection slot (`max(subscriber_expired_connection_buffer, borrowed)`) that
+/// iceoryx2 allocates with its `HeapAllocator` (direct `malloc`, as [`SUBSCRIBER_DIRECT_HEAP_PER_PUBLISHER`]): the
+/// receiver's `to_be_removed_connections`, a `PolymorphicVec<SlotMapKey, HeapAllocator>` of 8-byte entries
+/// (iceoryx2 0.10.0 `port/subscriber.rs` near line 302). Taken from the source, not measured.
+pub const SUBSCRIBER_DIRECT_HEAP_PER_EXPIRED: u64 = 8;
 /// A data segment's headers besides its chunks and pool index: the dynamic storage's header and the allocator's
 /// details in front of the payload (`dynamic_storage/posix_shared_memory.rs`, `shared_memory/common.rs`; iceoryx2
 /// 0.10.0, a few hundred bytes), counted with a margin, before the segment is rounded up to whole pages.
@@ -893,7 +911,9 @@ pub struct AdvertisedPublisher {
 /// in force, with the node's `expired_connection_buffer` (`subscriber_expired_connection_buffer`): a connection slot
 /// for each publisher it may connect to and each expired connection it may keep, `max(expired_connection_buffer,
 /// borrowed) + max_publishers`, each counted with [`SUBSCRIBER_HEAP_PER_CONNECTION`] and the segment table of a
-/// growing publisher ([`SUBSCRIBER_HEAP_PER_GROWING_PUBLISHER`]), plus [`SUBSCRIBER_HEAP_FIXED_BYTES`]; at most
+/// growing publisher ([`SUBSCRIBER_HEAP_PER_GROWING_PUBLISHER`]); the two lists iceoryx2 allocates with `malloc`
+/// directly, [`SUBSCRIBER_DIRECT_HEAP_PER_PUBLISHER`] per `max_publishers` and
+/// [`SUBSCRIBER_DIRECT_HEAP_PER_EXPIRED`] per expired-connection slot; plus [`SUBSCRIBER_HEAP_FIXED_BYTES`]; at most
 /// [`MAX_PORT_HEAP_BYTES`]. It depends on the settings alone, so it bounds the publishers that connect after the
 /// subscriber exists too, and it is checked before anything that allocates in proportion to the settings.
 ///
@@ -905,21 +925,55 @@ pub fn subscriber_heap(
     expired_connection_buffer: u64,
 ) -> Result<u64, LayoutError> {
     settings.validate()?;
-    let s = settings;
-    let slots = expired_connection_buffer
-        .max(s.subscriber_max_borrowed_samples)
-        .checked_add(s.max_publishers);
-    let heap = slots
-        .and_then(|n| {
-            n.checked_mul(SUBSCRIBER_HEAP_PER_CONNECTION + SUBSCRIBER_HEAP_PER_GROWING_PUBLISHER)
-        })
-        .and_then(|v| v.checked_add(SUBSCRIBER_HEAP_FIXED_BYTES));
     out_of_range(
         "subscriber heap ((max(expired connection buffer, borrowed) + max_publishers) connection slots, each with \
          a growing publisher's segment table)",
-        heap,
+        subscriber_heap_bytes(settings, expired_connection_buffer),
         MAX_PORT_HEAP_BYTES,
     )
+}
+
+fn subscriber_heap_bytes(s: &ServiceSettings, expired_connection_buffer: u64) -> Option<u64> {
+    let expired = expired_connection_buffer.max(s.subscriber_max_borrowed_samples);
+    let slots = expired.checked_add(s.max_publishers)?;
+    slots
+        .checked_mul(SUBSCRIBER_HEAP_PER_CONNECTION + SUBSCRIBER_HEAP_PER_GROWING_PUBLISHER)?
+        // iceoryx2 0.10.0 `port/subscriber.rs` near lines 288-306: the receiver's `connections` (16 bytes per
+        // `max_publishers`) and `to_be_removed_connections` (8 bytes per expired-connection slot), allocated with
+        // its `HeapAllocator`, which calls `malloc` directly and isn't seen by a counting global allocator.
+        .checked_add(
+            s.max_publishers
+                .checked_mul(SUBSCRIBER_DIRECT_HEAP_PER_PUBLISHER)?,
+        )?
+        .checked_add(expired.checked_mul(SUBSCRIBER_DIRECT_HEAP_PER_EXPIRED)?)?
+        .checked_add(SUBSCRIBER_HEAP_FIXED_BYTES)
+}
+
+/// The largest `max_publishers` that [`subscriber_heap`] accepts with the other settings as they are and the node's
+/// `expired_connection_buffer` (at most [`MAX_PORTS`]; 0 if none fits): 203 with iceoryx2's default
+/// expired-connection buffer of 128 and at most 128 borrowed samples. For messages that refuse a service.
+pub fn subscriber_max_publishers(
+    settings: &ServiceSettings,
+    expired_connection_buffer: u64,
+) -> u64 {
+    let fits = |max_publishers| {
+        let s = ServiceSettings {
+            max_publishers,
+            ..*settings
+        };
+        subscriber_heap_bytes(&s, expired_connection_buffer)
+            .is_some_and(|h| h <= MAX_PORT_HEAP_BYTES)
+    };
+    // `fits` is monotonic in `max_publishers`: bisect over 0..=MAX_PORTS.
+    if !fits(0) {
+        return 0;
+    }
+    let (mut ok, mut over) = (0, MAX_PORTS + 1);
+    while over - ok > 1 {
+        let mid = ok + (over - ok) / 2;
+        if fits(mid) { ok = mid } else { over = mid }
+    }
+    ok
 }
 
 /// Checks what a subscriber with a buffer of `buffer` samples, of a service with these settings in force, makes
@@ -2509,8 +2563,13 @@ mod tests {
         // No publisher yet: (max(128, 2) + 2) slots × (8 KiB + a growing publisher's 384 KiB segment table) +
         // 1 MiB, no connections.
         let slot = SUBSCRIBER_HEAP_PER_CONNECTION + SUBSCRIBER_HEAP_PER_GROWING_PUBLISHER;
+        // The two lists iceoryx2 allocates with `malloc` directly: 16 bytes per max_publishers, 8 per expired slot.
+        let direct = |publishers: u64, expired: u64| {
+            publishers * SUBSCRIBER_DIRECT_HEAP_PER_PUBLISHER
+                + expired * SUBSCRIBER_DIRECT_HEAP_PER_EXPIRED
+        };
         let a = subscriber_allocation(&s, 128, 1024, &[]).unwrap();
-        assert_eq!(a.heap, 130 * slot + (1 << 20));
+        assert_eq!(a.heap, 130 * slot + direct(2, 128) + (1 << 20));
         assert_eq!(a.heap, subscriber_heap(&s, 128).unwrap());
         assert_eq!(a.connections, 0);
         // Borrowed samples above the expired-connection buffer take its place.
@@ -2519,7 +2578,7 @@ mod tests {
             ..s
         };
         let a = subscriber_allocation(&borrowed, 128, 1024, &[]).unwrap();
-        assert_eq!(a.heap, 302 * slot + (1 << 20));
+        assert_eq!(a.heap, 302 * slot + direct(2, 300) + (1 << 20));
         // 330 borrowed samples: 332 slots of 392 KiB, plus 1 MiB fixed, over 128 MiB.
         let too_many = ServiceSettings {
             subscriber_max_borrowed_samples: 330,
@@ -2540,6 +2599,12 @@ mod tests {
         let err = subscriber_heap(&publishers(204), 128).unwrap_err();
         assert!(err.to_string().contains("segment table"), "{err}");
         assert!(subscriber_heap(&publishers(2048), 128).is_err());
+        // The figure the recorder's refusal names.
+        assert_eq!(subscriber_max_publishers(&s, 128), 203);
+        assert_eq!(subscriber_max_publishers(&s, 8), 323);
+        assert_eq!(subscriber_max_publishers(&too_many, 128), 1);
+        assert_eq!(subscriber_max_publishers(&s, 400), 0);
+        assert_eq!(subscriber_max_publishers(&s, u64::MAX), 0);
         // Settings over their caps are refused by the same call, before anything is sized by them.
         assert!(matches!(
             subscriber_heap(&publishers(4097), 0),

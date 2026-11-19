@@ -331,15 +331,34 @@ them, and the estimates (formulas in [`src/layout.rs`](src/layout.rs), with chec
 0.10.0 allocates, with unchecked arithmetic, when a port and its connections are created and while it runs.
 
 The estimates are checked against what iceoryx2 really allocates, not only against a reading of its source:
-[`tests/allocation.rs`](tests/allocation.rs) creates ports of small, representative shapes on a real iceoryx2 node
-(fixed-size and `[u8]` services; static and growing publishers; 0, 8 and 32 publishers present when a subscriber is
-created, and 8 and 32 that connect after it; 0, 8 and 32 subscribers present when a publisher is created; history 0
-and 3; a slice publisher whose data segment grew twice and three times with a history of 3) and asserts, for every
-shape, that each estimate is at least what it measured: the heap the port leaves live (a counting global allocator)
-and the sizes of the shared-memory objects named after the port (the files under `/dev/shm` on Linux; on macOS,
-where iceoryx2 0.10.0 keeps a state file `/tmp/<name>.shm_state` per object, naming a POSIX shared-memory object that
-has no path, the objects as iceoryx2 lists and opens them). It runs on macOS and Linux (CI: x86-64 and aarch64);
-`cargo test --all-features --test allocation -- --nocapture` prints the table.
+[`tests/allocation.rs`](tests/allocation.rs) creates ports on a real iceoryx2 node and measures the heap that goes
+through Rust's global allocator (a counting global allocator: the bytes the port leaves live) and the sizes of the
+shared-memory objects named after the port (the files under `/dev/shm` on Linux; on macOS, where iceoryx2 0.10.0
+keeps a state file `/tmp/<name>.shm_state` per object, naming a POSIX shared-memory object that has no path, the
+objects as iceoryx2 lists and opens them). iceoryx2's direct `malloc` users, which that allocator can't see, are
+listed in the formula from its source: on the publish-subscribe paths, only the subscriber's two connection lists
+(16 bytes per `max_publishers` and 8 per expired-connection slot, `port/subscriber.rs` near lines 288-306). It
+asserts two things:
+
+- *No term is missing*: for small, representative shapes (fixed-size and `[u8]` services; static and growing
+  publishers; 0, 8 and 32 publishers present when a subscriber is created, and 8 and 32 that connect after it; 0, 8
+  and 32 subscribers present when a publisher is created; history 0 and 3; a slice publisher whose data segment grew
+  twice and three times with a history of 3) and for one shape per port kind with a raised setting (a publisher
+  allowing 1,024 subscribers, 896 if growing; a subscriber allowing 200 publishers), each estimate is at least what
+  was measured. At these shapes the totals are dominated by the fixed parts and by empty slots, so this alone
+  doesn't show that each per-item constant is large enough.
+- *Each per-item coefficient is bounded*: for each quantity the budget charges per item (a subscriber's heap per
+  growing publisher connected, per connection slot and per expired-connection slot; a publisher's heap per
+  subscriber slot, per buffer sample and per history sample; a data segment's bytes per sample; a connection's bytes
+  per connection, per publisher sample and per buffer entry), the port is measured at two values and the measured
+  cost per item must be at most the formula's constant; where the constant is meant to be tight, also at least a
+  stated fraction of it (90% for sizes taken exactly from the source, 50% for measured sizes counted with a margin
+  under 2×; the generous ones, a subscriber's connection slot at 2.2× and a connection counted in whole 64 KiB
+  pages, are bounded from above only).
+
+The figures at the caps below (128 MiB of heap, 1.5 GiB of shared memory) are the formulas evaluated at the caps, not
+measurements. The test runs on macOS and Linux (CI: x86-64 and aarch64);
+`cargo test --all-features --test allocation -- --nocapture` prints both tables.
 
 A publisher preallocates `samples = max_subscribers × (buffer + borrowed) + history_size + loaned samples` (the
 replayer's publishers loan 2) and has `segments` data segments: 1 with a static allocation strategy (the replayer's,
@@ -351,7 +370,7 @@ most 1,048,576.
 | Replay publisher | heap | an 8-byte reference counter per sample for each data segment (`segments × samples × 8`), a connection slot per possible subscriber (`max_subscribers × 2 KiB`), a history entry per history sample (`history_size × 32`), 1 MiB fixed | 128 MiB |
 | Replay publisher | shared memory | one connection per subscriber (`max_subscribers ×` the connection below) | 512 MiB |
 | Replay publisher | shared memory | **every data segment that can be alive at once**: the first, `samples × first chunk size`; for a growing strategy, one more for every power of two above the first chunk size up to the largest sample's chunk size rounded up to a power of two (a larger sample makes iceoryx2 create a segment of such chunks, and an old segment stays while a sample in it is referenced: by the history, a subscriber or a loan), and the management object of the segments (64 KiB). Each segment adds the alignment, `4 × (samples + 1) + 3` bytes of pool index and a 4 KiB storage header, and takes whole 64 KiB pages | 1 GiB in all |
-| Recorder subscriber | heap | a connection slot for every publisher the service allows and every expired connection it may keep, each with a growing publisher's segment table (`(max(subscriber_expired_connection_buffer, borrowed) + max_publishers) × (8 KiB + 384 KiB)`), 1 MiB fixed | 128 MiB |
+| Recorder subscriber | heap | a connection slot for every publisher the service allows and every expired connection it may keep, each with a growing publisher's segment table (`(max(subscriber_expired_connection_buffer, borrowed) + max_publishers) × (8 KiB + 384 KiB)`), the two lists iceoryx2 allocates with `malloc` directly (`max_publishers × 16 + max(subscriber_expired_connection_buffer, borrowed) × 8`), 1 MiB fixed | 128 MiB |
 | Recorder subscriber | shared memory | the connections it creates, one per publisher present, sized by what each **publisher** advertises | 512 MiB |
 
 A connection (one publisher to one subscriber) holds a used-chunk list of one byte per sample for each of the
@@ -376,7 +395,8 @@ once a message has needed 8 KiB chunks and 899 MiB after 16 KiB ones, and a mess
 in all) is refused. A static segment of 32,764 chunks of 32,768 bytes came to exactly 1 GiB without its storage
 header, and is refused with it. A service the recorder records may allow at most 331 connection slots: with the
 default expired-connection buffer of 128, at most 203 publishers (2,048 publishers would need at least 146 MiB of
-segment tables).
+segment tables). The recorder's refusal says how many publishers would fit with the node's expired-connection buffer
+and the service's other settings, and names the 203 of the default buffer.
 
 The replayer checks the data segments when it creates a publisher (its first slice holds about 4 KiB) and, for
 slices, before each message larger than the first chunks, which may make iceoryx2 create another segment; a message
@@ -410,16 +430,19 @@ before it creates its subscriber. A service over a limit is refused (reported an
 - *Before the check.* To read a service's settings at all, iceoryx2 lists the service's nodes when it reads its
   details or opens it (two vectors in proportion to `max_nodes`, 24 bytes a slot, plus each registered node's state),
   before any setting can be seen through its public API. The recorder and the replayer check the settings right
-  after the first such read and before opening the service, so this happens once for a service over the caps.
+  after the first such read and before opening the service, so this happens once per attempt: a refused service
+  is attempted again on each retry, and the memory is freed after each attempt.
 
 So one replay target costs at most 128 MiB of heap and 1.5 GiB of shared memory: 512 MiB of connections and 1 GiB
-for all its data segments together, during and after growth (the publisher shapes of `tests/allocation.rs`, the
-grown slice publisher among them, and the unit tests `retained_data_segments_count` and `data_segment_headers_count`
-in `src/layout.rs`). The recorder's subscriber of one service costs at most 128 MiB of heap, including what later
-publishers cost it (the subscriber shapes with publishers present and connecting later), and 512 MiB of connections
-it creates to the publishers present at its check (the same shapes; the race above excepted), whatever a journal
-says. A target, or a service to record, over these limits is refused with the quantity and the limit. Raising them
-later is compatible; lowering them would refuse recordings that replay today.
+for all its data segments together, during and after growth. The recorder's subscriber of one service costs at most
+128 MiB of heap, including what later publishers cost it, and 512 MiB of connections it creates to the publishers
+present at its check (the race above excepted), whatever a journal says. These figures are the formulas evaluated at
+the caps. What backs the formulas: `tests/allocation.rs` shows that no term is missing (each estimate covers what the
+shapes above measured, the grown slice publisher and the subscribers with publishers connecting later among them) and
+bounds each per-item coefficient at small shapes; the unit tests `retained_data_segments_count` and
+`data_segment_headers_count` in `src/layout.rs` cover the data segments' sum and headers; the direct `malloc` lists
+come from iceoryx2's source. A target, or a service to record, over these limits is refused with the quantity and the
+limit. Raising them later is compatible; lowering them would refuse recordings that replay today.
 
 ## Behaviour and limits
 
