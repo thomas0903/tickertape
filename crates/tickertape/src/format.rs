@@ -236,6 +236,20 @@ pub fn decode_record_body(
     if read_u32(body, 0) != Some(record_crc(commit_word, &body[4..])) {
         return Err(CorruptReason::BadChecksum);
     }
+    Ok((
+        decode_record_fields(commit_word, body, expected_seq)?,
+        &body[36..],
+    ))
+}
+
+/// The header fields of a record body whose length and CRC32C are already checked: `body` holds at least its first
+/// 36 bytes.
+fn decode_record_fields(
+    commit_word: u32,
+    body: &[u8],
+    expected_seq: u64,
+) -> Result<RecordHeader, CorruptReason> {
+    let bad_len = CorruptReason::BadLength(commit_word);
     let seq = read_u64(body, 4).ok_or(bad_len)?;
     if seq != expected_seq {
         return Err(CorruptReason::BadSequence {
@@ -246,15 +260,12 @@ pub fn decode_record_body(
     if read_u32(body, 16) != Some(0) {
         return Err(CorruptReason::BadFlags);
     }
-    Ok((
-        RecordHeader {
-            seq,
-            schema_id: read_u32(body, 12).ok_or(bad_len)?,
-            venue_ts_ns: read_u64(body, 20).ok_or(bad_len)?,
-            local_ts_ns: read_u64(body, 28).ok_or(bad_len)?,
-        },
-        &body[36..],
-    ))
+    Ok(RecordHeader {
+        seq,
+        schema_id: read_u32(body, 12).ok_or(bad_len)?,
+        venue_ts_ns: read_u64(body, 20).ok_or(bad_len)?,
+        local_ts_ns: read_u64(body, 28).ok_or(bad_len)?,
+    })
 }
 
 /// The `seal_crc` value for a seal announcing `next_seq`.
@@ -326,6 +337,12 @@ pub trait SegmentView {
     fn commit_word(&self, offset: u64) -> Option<u32>;
     /// Calls `f` with the bytes `[offset, offset + len)`. `None` if the range is out of bounds.
     fn with_bytes<R>(&self, offset: u64, len: u64, f: impl FnOnce(&[u8]) -> R) -> Option<R>;
+    /// The longest range a single [`with_bytes`](Self::with_bytes) call should ask for. A view that copies (the
+    /// `pread` view) allocates the range it is asked for, so validation reads a record body longer than this in
+    /// pieces instead, before its CRC32C has shown that its length is real. Views over memory have no limit.
+    fn max_piece(&self) -> u64 {
+        u64::MAX
+    }
 }
 
 impl SegmentView for [u8] {
@@ -407,11 +424,16 @@ pub fn read_slot<V: SegmentView + ?Sized>(
     {
         return Err(CorruptReason::BadLength(len));
     }
-    let header = segment
-        .with_bytes(body_offset, u64::from(len) - 4, |body| {
-            decode_record_body(len, body, expected_seq).map(|(header, _)| header)
-        })
-        .ok_or(CorruptReason::BadLength(len))??;
+    let body_len = u64::from(len) - COMMIT_WORD_LEN as u64;
+    let header = if body_len <= segment.max_piece() {
+        segment
+            .with_bytes(body_offset, body_len, |body| {
+                decode_record_body(len, body, expected_seq).map(|(header, _)| header)
+            })
+            .ok_or(CorruptReason::BadLength(len))??
+    } else {
+        decode_record_in_pieces(segment, body_offset, len, expected_seq)?
+    };
     let next_offset = offset
         .checked_add(align8(u64::from(len)))
         .ok_or(CorruptReason::BadLength(len))?;
@@ -420,6 +442,43 @@ pub fn read_slot<V: SegmentView + ?Sized>(
         len,
         next_offset,
     })
+}
+
+/// [`decode_record_body`] for a body longer than the view's [`SegmentView::max_piece`], already checked to lie inside
+/// the segment: the CRC32C is computed over pieces of at most that size (and at most 1 MiB), so a damaged length
+/// costs no allocation, and the header fields are decoded only once the CRC matches. Same result, same order of
+/// checks.
+fn decode_record_in_pieces<V: SegmentView + ?Sized>(
+    segment: &V,
+    body_offset: u64,
+    len: u32,
+    expected_seq: u64,
+) -> Result<RecordHeader, CorruptReason> {
+    let bad_len = CorruptReason::BadLength(len);
+    let piece_len = segment.max_piece().clamp(RECORD_HEADER_LEN as u64, 1 << 20);
+    let stored = segment
+        .with_bytes(body_offset, 4, |b| read_u32(b, 0))
+        .flatten()
+        .ok_or(bad_len)?;
+    let mut crc = crate::crc::crc32c(&len.to_le_bytes());
+    let mut at = body_offset.checked_add(4).ok_or(bad_len)?;
+    let mut left = u64::from(len) - 8;
+    while left > 0 {
+        let piece = left.min(piece_len);
+        crc = segment
+            .with_bytes(at, piece, |bytes| crate::crc::crc32c_append(crc, bytes))
+            .ok_or(bad_len)?;
+        at += piece;
+        left -= piece;
+    }
+    if crc != stored {
+        return Err(CorruptReason::BadChecksum);
+    }
+    segment
+        .with_bytes(body_offset, RECORD_HEADER_LEN as u64 - 4, |fields| {
+            decode_record_fields(len, fields, expected_seq)
+        })
+        .ok_or(bad_len)?
 }
 
 /// Where a forward scan of one segment stopped.
@@ -514,8 +573,10 @@ pub enum LaterHistory {
         next_seq: u64,
     },
     /// So many slots carry headers of this journal's following records with bad checksums that checking them all
-    /// would exceed the work bound; `offset` and `seq` are those of the slot that exceeded it. Only bytes made of
-    /// this journal's own record headers can do this, and they are not a torn append's either way.
+    /// would exceed the work bound; `offset` and `seq` are those of the slot that exceeded it (for a final seal, the
+    /// expected sequence number plus one). Only bytes made of this journal's own record headers can do this, and they
+    /// are not a torn append's either way. Inconclusive: nothing was proven valid, so it is reported as
+    /// [`CorruptReason::UncheckedTail`], not [`CorruptReason::EmptyCommitWord`].
     Unchecked {
         /// The slot that exceeded the bound.
         offset: u64,
@@ -530,6 +591,15 @@ impl LaterHistory {
         match *self {
             LaterHistory::Record { seq, .. } | LaterHistory::Unchecked { seq, .. } => seq,
             LaterHistory::Seal { next_seq, .. } => next_seq,
+        }
+    }
+
+    /// How recovery and `verify` report this evidence: [`CorruptReason::EmptyCommitWord`] for a record or seal that
+    /// validated, [`CorruptReason::UncheckedTail`] when the search stopped at its work bound before deciding.
+    pub fn reason(&self) -> CorruptReason {
+        match *self {
+            LaterHistory::Unchecked { seq, .. } => CorruptReason::UncheckedTail(seq),
+            _ => CorruptReason::EmptyCommitWord(self.seq()),
         }
     }
 }
@@ -574,7 +644,7 @@ pub fn nonzero_end<V: SegmentView + ?Sized>(segment: &V, from: u64) -> Option<u6
 /// bytes can contain a valid frame is through a payload that holds one. This returns evidence only for a frame or
 /// seal that also has a sequence number its position allows: a record at `Q` with sequence `T` such that
 /// `expected_seq < T <= expected_seq + (Q - offset) / 40` (every record is at least 40 bytes), or a seal in the same
-/// range that is the last non-zero item in the segment. The first such record is returned.
+/// range, and at most [`SEAL_SEARCH_RECORDS`] after `expected_seq`, that is the last non-zero item in the segment. The first such record is returned.
 ///
 /// Candidates inside a completely written torn frame are not evidence: if the frame at `offset` has an intact header
 /// apart from its commit word (sequence number `expected_seq`, flags zero, and a stored CRC that matches for a length
@@ -583,7 +653,8 @@ pub fn nonzero_end<V: SegmentView + ?Sized>(segment: &V, from: u64) -> Option<u6
 ///
 /// Work: one pass over `[offset, len)` to find its last non-zero byte, cheap header checks at each 8-byte position up
 /// to it, and CRC32C over at most twice the remaining segment length for candidate records (beyond that it returns
-/// [`LaterHistory::Unchecked`]), plus one CRC of 12 bytes per possible sequence number for a final seal, and, once,
+/// [`LaterHistory::Unchecked`]), plus one CRC of 12 bytes for each of at most [`SEAL_SEARCH_RECORDS`] next sequence
+/// numbers for a final seal (inside the same bound), and, once,
 /// CRC32C over the torn frame at `offset` up to the first candidate and up to the last non-zero byte.
 pub fn find_history_after_empty<V: SegmentView + ?Sized>(
     segment: &V,
@@ -602,7 +673,11 @@ pub(crate) fn find_history_before<V: SegmentView + ?Sized>(
     end: u64,
 ) -> Option<LaterHistory> {
     let len = segment.len();
-    let budget = len.saturating_sub(offset).saturating_mul(2);
+    // CRC32C bytes: twice the rest of the segment for candidate records, plus the bounded final-seal search.
+    let budget = len
+        .saturating_sub(offset)
+        .saturating_mul(2)
+        .saturating_add(SEAL_SEARCH_RECORDS * SEAL_CRC_BYTES);
     let mut spent = 0_u64;
     // The first candidate decides: either the torn frame at `offset` covers every non-zero byte (then no candidate
     // can lie outside it), or it is evidence.
@@ -623,15 +698,23 @@ pub(crate) fn find_history_before<V: SegmentView + ?Sized>(
         let max_records = (q - offset) / RECORD_HEADER_LEN as u64;
         let in_range = |seq: u64| seq > expected_seq && seq - expected_seq <= max_records;
         if word == SEAL_MARKER {
-            // Only a final seal: nothing non-zero after it.
+            // Only a final seal: nothing non-zero after it. At most `SEAL_SEARCH_RECORDS` next sequence numbers are
+            // tried, each a chance match for a torn payload ending in a seal marker and four arbitrary bytes.
             if q.saturating_add(SEAL_LEN as u64) >= end {
-                let crc = segment
-                    .with_bytes(q + COMMIT_WORD_LEN as u64, 4, |b| read_u32(b, 0))
+                let tries = max_records.min(SEAL_SEARCH_RECORDS);
+                spent = spent.saturating_add(tries * SEAL_CRC_BYTES);
+                if spent > budget {
+                    let seq = expected_seq.checked_add(1)?;
+                    return evidence(LaterHistory::Unchecked { offset: q, seq });
+                }
+                let crc = q
+                    .checked_add(COMMIT_WORD_LEN as u64)
+                    .and_then(|at| segment.with_bytes(at, 4, |b| read_u32(b, 0)))
                     .flatten();
                 let prefix = crate::crc::crc32c(&SEAL_MARKER.to_le_bytes());
                 let found = crc.and_then(|crc| {
-                    (1..=max_records)
-                        .filter_map(|k| expected_seq.checked_add(k))
+                    (1..=tries)
+                        .map_while(|k| expected_seq.checked_add(k))
                         .find(|next| crate::crc::crc32c_append(prefix, &next.to_le_bytes()) == crc)
                 });
                 if let Some(next_seq) = found {
@@ -646,8 +729,9 @@ pub(crate) fn find_history_before<V: SegmentView + ?Sized>(
         } else if (RECORD_HEADER_LEN as u32..=MAX_FRAME_LEN).contains(&word)
             && record_fits(len, q, word)
         {
-            let fields = segment
-                .with_bytes(q + 8, 16, |b| (read_u64(b, 0), read_u32(b, 12)))
+            let fields = q
+                .checked_add(8)
+                .and_then(|at| segment.with_bytes(at, 16, |b| (read_u64(b, 0), read_u32(b, 12))))
                 .and_then(|(seq, flags)| Some((seq?, flags?)));
             if let Some((seq, 0)) = fields.filter(|(seq, _)| in_range(*seq)) {
                 spent = spent.saturating_add(u64::from(word));
@@ -659,10 +743,21 @@ pub(crate) fn find_history_before<V: SegmentView + ?Sized>(
                 }
             }
         }
-        q += RECORD_ALIGN as u64;
+        q = q.checked_add(RECORD_ALIGN as u64)?;
     }
     None
 }
+
+/// How many next sequence numbers the final-seal search tries after an empty commit word (ADR 0035): a final seal
+/// counts as evidence only if it announces one of the `SEAL_SEARCH_RECORDS` sequence numbers after the expected one.
+/// It covers a zeroed 4 KiB block of minimal records (102) in front of the seal. A longer damaged run before a seal is
+/// still found through the successor segment (evidence from a later segment), unless the successor was lost too.
+/// Each number tried is a `2^-32` chance match for a torn payload whose last aligned eight non-zero bytes are a seal
+/// marker and four arbitrary bytes, so this bounds that false positive by `2^-25`.
+pub const SEAL_SEARCH_RECORDS: u64 = 128;
+
+/// CRC32C bytes per sequence number tried by the final-seal search (the marker and the sequence number).
+const SEAL_CRC_BYTES: u64 = 12;
 
 /// How many trailing zero bytes a completely written torn frame's payload may end with for
 /// [`torn_frame_covers_tail`] to recognise it: the frame lengths tried run from the last non-zero byte to this many
@@ -686,7 +781,10 @@ fn torn_frame_covers_tail<V: SegmentView + ?Sized>(
     end: u64,
     first_candidate: u64,
 ) -> bool {
-    let fields = segment.with_bytes(offset + COMMIT_WORD_LEN as u64, 20, |b| {
+    let Some(fields_at) = offset.checked_add(COMMIT_WORD_LEN as u64) else {
+        return false;
+    };
+    let fields = segment.with_bytes(fields_at, 20, |b| {
         Some((read_u32(b, 0)?, read_u64(b, 4)?, read_u32(b, 16)?))
     });
     let Some(Some((stored, seq, flags))) = fields else {
@@ -698,7 +796,13 @@ fn torn_frame_covers_tail<V: SegmentView + ?Sized>(
     let Some(covered) = end.checked_sub(offset) else {
         return false;
     };
-    if !crc_matches_some_len(segment, offset, stored, covered, covered + COVER_SLACK) {
+    if !crc_matches_some_len(
+        segment,
+        offset,
+        stored,
+        covered,
+        covered.saturating_add(COVER_SLACK),
+    ) {
         return false;
     }
     let before = first_candidate.saturating_sub(offset);
@@ -716,7 +820,9 @@ fn crc_matches_some_len<V: SegmentView + ?Sized>(
     lo: u64,
     hi: u64,
 ) -> bool {
-    let fields_at = offset + 8;
+    let Some(fields_at) = offset.checked_add(8) else {
+        return false;
+    };
     let limit = segment
         .len()
         .saturating_sub(SEGMENT_TRAILER_LEN as u64)
@@ -1329,6 +1435,50 @@ mod tests {
     }
 
     #[test]
+    fn final_seal_search_is_capped() {
+        // Review round 2, item 3: a final seal is evidence only if it announces one of the `SEAL_SEARCH_RECORDS`
+        // sequence numbers after the expected one, however far from the empty word it lies. Record 9's commit word
+        // is zeroed, and a seal follows 8,000 bytes later (room for 200 minimal records).
+        let (mut image, offsets) = records_image(3);
+        let p = offsets[2];
+        image[p..p + 4].fill(0);
+        let q = offsets[3] + 8_000;
+        for (k, found) in [
+            (1, true),
+            (SEAL_SEARCH_RECORDS, true),
+            (SEAL_SEARCH_RECORDS + 1, false),
+            (150, false),
+        ] {
+            let mut copy = image.clone();
+            seal(&mut copy, q, 9 + k);
+            let expect = found.then_some(LaterHistory::Seal {
+                offset: q as u64,
+                next_seq: 9 + k,
+            });
+            assert_eq!(
+                find_history_after_empty(&copy[..], p as u64, 9),
+                expect,
+                "{k}"
+            );
+        }
+        // Sequence numbers at the end of the range: no overflow, nothing to find past `u64::MAX`.
+        let mut copy = image.clone();
+        seal(&mut copy, q, u64::MAX);
+        assert_eq!(
+            find_history_after_empty(&copy[..], p as u64, u64::MAX - 1),
+            Some(LaterHistory::Seal {
+                offset: q as u64,
+                next_seq: u64::MAX
+            })
+        );
+        assert_eq!(
+            find_history_after_empty(&copy[..], p as u64, u64::MAX),
+            None
+        );
+        assert_eq!(find_history_after_empty(&copy[..], u64::MAX - 7, 9), None);
+    }
+
+    #[test]
     fn crc_length_search_matches_direct_checksums() {
         let mut image = vec![0u8; 4096];
         let mut x = 0x2545_f491_4f6c_dd1d_u64;
@@ -1379,12 +1529,36 @@ mod tests {
         ));
     }
 
-    /// A view that records the largest range it was asked for, as a `pread` view would have to allocate it.
+    /// A view that records the largest range it was asked for, as a `pread` view would have to allocate it, and
+    /// announces the `pread` view's window as its [`SegmentView::max_piece`].
+    #[cfg(not(miri))]
     struct Metered<'a> {
         bytes: &'a [u8],
         largest: std::cell::Cell<u64>,
     }
 
+    #[cfg(not(miri))]
+    impl<'a> Metered<'a> {
+        /// The `pread` view's window (`journal::SCAN_WINDOW`).
+        const WINDOW: u64 = 1 << 20;
+
+        fn new(bytes: &'a [u8]) -> Self {
+            Metered {
+                bytes,
+                largest: std::cell::Cell::new(0),
+            }
+        }
+
+        fn assert_bounded(&self) {
+            assert!(
+                self.largest.get() <= Self::WINDOW,
+                "read {} bytes at once",
+                self.largest.get()
+            );
+        }
+    }
+
+    #[cfg(not(miri))]
     impl SegmentView for Metered<'_> {
         fn len(&self) -> u64 {
             self.bytes.len() as u64
@@ -1398,6 +1572,104 @@ mod tests {
             self.largest.set(self.largest.get().max(len));
             self.bytes.with_bytes(offset, len, f)
         }
+
+        fn max_piece(&self) -> u64 {
+            Self::WINDOW
+        }
+    }
+
+    /// A 4 MiB segment image of base 7: one small record, then record 8 with a payload of about 3 MiB, then record 9.
+    /// Returns it and the three offsets and the end.
+    #[cfg(not(miri))]
+    fn image_with_a_long_record() -> (Vec<u8>, [usize; 4]) {
+        let mut image = vec![0u8; 4 << 20];
+        let mut x = 0x2545_f491_4f6c_dd1d_u64;
+        let long: Vec<u8> = (0..(3 << 20) + 13)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect();
+        let r7 = 64;
+        let r8 = append(&mut image, r7, &record(7), &[1; 20]);
+        let r9 = append(&mut image, r8, &record(8), &long);
+        let end = append(&mut image, r9, &record(9), &[2; 30]);
+        (image, [r7, r8, r9, end])
+    }
+
+    #[test]
+    #[cfg(not(miri))]
+    fn forward_scan_reads_a_long_record_in_bounded_pieces() {
+        // Review round 2, item 2: a `pread` view must never be asked for a whole record body larger than its window,
+        // valid or not, because it allocates what it is asked for before the CRC can reject a damaged length.
+        let (mut image, [_, r8, _, end]) = image_with_a_long_record();
+        let view = Metered::new(&image);
+        let expected = ScanResult {
+            end_offset: end as u64,
+            next_seq: 10,
+            records: 3,
+            end: ScanEnd::Empty,
+        };
+        assert_eq!(scan_segment(&view, 64, 7), expected);
+        assert_eq!(scan_segment(&image[..], 64, 7), expected);
+        view.assert_bounded();
+        // The same record with one payload byte damaged, or its sequence number or flags wrong: the same errors as
+        // over memory, still in bounded pieces.
+        for (at, xor) in [
+            (r8 + 1000, 1_u8),
+            (r8 + (2 << 20), 0x80),
+            (r8 + 40 + (3 << 20) + 12, 4),
+            (r8 + 8, 1),
+            (r8 + 20, 1),
+        ] {
+            let mut copy = image.clone();
+            copy[at] ^= xor;
+            let view = Metered::new(&copy);
+            let scan = scan_segment(&view, 64, 7);
+            assert_eq!(scan, scan_segment(&copy[..], 64, 7), "{at}");
+            assert!(matches!(scan.end, ScanEnd::Invalid(_)), "{at}: {scan:?}");
+            assert_eq!(scan.end_offset, r8 as u64);
+            view.assert_bounded();
+        }
+        // A damaged length: record 7's commit word claims most of the segment.
+        let claim = ((4 << 20) - 64 - 8_u32) & !7;
+        image[64..68].copy_from_slice(&claim.to_le_bytes());
+        let view = Metered::new(&image);
+        assert_eq!(
+            scan_segment(&view, 64, 7).end,
+            ScanEnd::Invalid(CorruptReason::BadChecksum)
+        );
+        view.assert_bounded();
+    }
+
+    #[test]
+    #[cfg(not(miri))]
+    fn candidate_validation_reads_a_long_frame_in_bounded_pieces() {
+        // Review round 2, item 2: after an empty commit word, a candidate frame with an in-range sequence number,
+        // zero flags and a large length that fits is validated without asking for its whole body.
+        let (image, [r7, r8, ..]) = image_with_a_long_record();
+        // Record 7's commit word zeroed: the long record 8 is the evidence.
+        let mut damaged = image.clone();
+        damaged[r7..r7 + 4].fill(0);
+        let view = Metered::new(&damaged);
+        assert_eq!(
+            find_history_after_empty(&view, r7 as u64, 7),
+            Some(LaterHistory::Record {
+                offset: r8 as u64,
+                seq: 8
+            })
+        );
+        view.assert_bounded();
+        // Its body damaged too: it no longer validates, and record 9 after it is the evidence.
+        damaged[r8 + 5000] ^= 1;
+        let view = Metered::new(&damaged);
+        assert!(matches!(
+            find_history_after_empty(&view, r7 as u64, 7),
+            Some(LaterHistory::Record { seq: 9, .. })
+        ));
+        view.assert_bounded();
     }
 
     #[test]
@@ -1415,10 +1687,7 @@ mod tests {
         let at = 64_u64;
         let len = (3 << 20) + 936_u64;
         let stored = record_crc(len as u32, &image[72..(at + len) as usize]);
-        let view = Metered {
-            bytes: &image,
-            largest: std::cell::Cell::new(0),
-        };
+        let view = Metered::new(&image);
         assert!(crc_matches_some_len(&view, at, stored, len - 40, len + 40));
         assert!(!crc_matches_some_len(
             &view,
@@ -1427,11 +1696,7 @@ mod tests {
             len - 40,
             len + 40
         ));
-        assert!(
-            view.largest.get() <= 1 << 20,
-            "read {} bytes at once",
-            view.largest.get()
-        );
+        view.assert_bounded();
     }
 
     #[test]
@@ -1519,10 +1784,18 @@ mod tests {
             q += 24;
             q = q.div_ceil(8) * 8;
         }
-        assert!(matches!(
-            find_history_after_empty(&image[..], 64, 7),
-            Some(LaterHistory::Unchecked { seq: 8, .. })
-        ));
+        let found = find_history_after_empty(&image[..], 64, 7);
+        assert!(
+            matches!(found, Some(LaterHistory::Unchecked { seq: 8, .. })),
+            "{found:?}"
+        );
+        // Inconclusive, and reported as such (review round 2, item 6).
+        assert_eq!(
+            found.map(|h| h.reason()),
+            Some(CorruptReason::UncheckedTail(8))
+        );
+        let proven = LaterHistory::Record { offset: 64, seq: 8 };
+        assert_eq!(proven.reason(), CorruptReason::EmptyCommitWord(8));
     }
 
     fn property_config() -> ProptestConfig {

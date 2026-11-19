@@ -169,6 +169,9 @@ impl PreadView<'_> {
         if offset >= *start && offset + len <= *start + buf.len() as u64 {
             return true;
         }
+        // Every caller reads in pieces of at most `max_piece`: the window never grows past it, whatever length a
+        // damaged slot claims (validation streams longer bodies, `format::read_slot`).
+        debug_assert!(len <= SCAN_WINDOW as u64, "pread window of {len} bytes");
         let want = len.max(SCAN_WINDOW as u64).min(self.len - offset);
         buf.resize(want as usize, 0);
         match self.file.read_exact_at(buf, offset) {
@@ -207,6 +210,10 @@ impl format::SegmentView for PreadView<'_> {
         let at = (offset - window.0) as usize;
         Some(f(&window.1[at..at + len as usize]))
     }
+
+    fn max_piece(&self) -> u64 {
+        SCAN_WINDOW as u64
+    }
 }
 
 /// Scans a segment file from its first record slot, expecting `base` there, reading it with `pread` in bounded
@@ -220,11 +227,24 @@ pub(crate) fn scan_file_from(path: &Path, offset: u64, seq: u64) -> Result<forma
     with_pread_view(path, |view| format::scan_segment(view, offset, seq))
 }
 
-/// The commit word at `offset` of a segment file, read with a fresh `pread` (0 if it lies outside the file).
+/// The commit word at `offset` of a segment file, read with a fresh 4-byte `pread` (0 if it lies outside the file or
+/// is misaligned).
 pub(crate) fn commit_word_in_file(path: &Path, offset: u64) -> Result<u32> {
-    with_pread_view(path, |view| {
-        format::SegmentView::commit_word(view, offset).unwrap_or(0)
-    })
+    let file = File::open(path).map_err(|e| Error::io("open segment", path, e))?;
+    let len = file
+        .metadata()
+        .map_err(|e| Error::io("stat segment", path, e))?
+        .len();
+    let word_len = format::COMMIT_WORD_LEN as u64;
+    if offset % format::RECORD_ALIGN as u64 != 0
+        || offset.checked_add(word_len).is_none_or(|end| end > len)
+    {
+        return Ok(0);
+    }
+    let mut word = [0; format::COMMIT_WORD_LEN];
+    file.read_exact_at(&mut word, offset)
+        .map_err(|e| Error::io("read segment", path, e))?;
+    Ok(u32::from_le_bytes(word))
 }
 
 /// [`format::find_history_after_empty`] on a segment file, read with `pread` in bounded windows.
@@ -285,5 +305,49 @@ mod scan_tests {
                 format::scan_segment(&image[..], format::SEGMENT_HEADER_LEN as u64, base);
             assert_eq!(scan_file(&path, base).unwrap(), expected, "segment {base}");
         }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "writes megabytes")]
+    fn records_longer_than_the_window_are_read_in_pieces() {
+        // Review round 2, item 2: the window never grows past `SCAN_WINDOW` (asserted in `PreadView::fill`), for a
+        // valid record of 3 MiB, the same record with a bad checksum, and the search after an empty commit word.
+        let dir = tempfile::tempdir().unwrap();
+        let mut w =
+            Writer::open(dir.path(), WriterConfig::default().segment_size(4 << 20)).unwrap();
+        for payload in [vec![1u8; 100], vec![7u8; 3 << 20], vec![2u8; 100]] {
+            w.append(&NewRecord {
+                schema_id: 1,
+                venue_ts_ns: 0,
+                local_ts_ns: 0,
+                payload: &payload,
+            })
+            .unwrap();
+        }
+        drop(w);
+        let (base, path) = list_segments(dir.path()).unwrap().pop().unwrap();
+        let first = format::SEGMENT_HEADER_LEN as u64;
+        let image = fs::read(&path).unwrap();
+        let expected = format::scan_segment(&image[..], first, base);
+        assert_eq!(expected.records, 3);
+        assert_eq!(scan_file(&path, base).unwrap(), expected);
+        let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.write_all_at(&[0; 4], first).unwrap();
+        assert!(matches!(
+            history_after_empty_in_file(&path, first, base).unwrap(),
+            Some(format::LaterHistory::Record { seq: 1, .. })
+        ));
+        file.write_all_at(&[0xee], first + 200 + (1 << 20)).unwrap();
+        file.write_all_at(&image[first as usize..first as usize + 4], first)
+            .unwrap();
+        let scan = scan_file(&path, base).unwrap();
+        assert_eq!(scan.records, 1);
+        assert_eq!(
+            scan.end,
+            format::ScanEnd::Invalid(CorruptReason::BadChecksum)
+        );
+        assert_eq!(commit_word_in_file(&path, first).unwrap(), 100 + 40);
+        assert_eq!(commit_word_in_file(&path, first + 4).unwrap(), 0);
+        assert_eq!(commit_word_in_file(&path, 4 << 20).unwrap(), 0);
     }
 }
