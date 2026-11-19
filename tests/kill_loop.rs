@@ -15,8 +15,10 @@ fn kill_loop(iterations: u32) {
     let mut rng = Rng::from_env("kill_loop");
     let dir = tempfile::tempdir().unwrap();
     let journal = dir.path().join("journal");
-    // A live reader that stays open across every crash: it must never see a gap, corruption, or a discarded segment.
+    // Live readers (safe and zero-copy) that stay open across every crash: they must never see a gap, corruption, or
+    // a discarded segment.
     let mut reader: Option<Reader> = None;
+    let mut mapped: Option<Reader> = None;
     let mut killed_mid_run = 0;
 
     for i in 0..iterations {
@@ -71,30 +73,44 @@ fn kill_loop(iterations: u32) {
         }
         drop(w);
 
-        let r = match &mut reader {
-            Some(r) => r,
-            None => reader.insert(Reader::open(&journal, ReaderConfig::default()).unwrap()),
-        };
-        while r.position() < next {
-            let rec = r
-                .next_owned()
-                .unwrap_or_else(|e| {
-                    panic!("iteration {i}: live reader error at {}: {e}", r.position())
-                })
-                .unwrap_or_else(|| panic!("iteration {i}: record {} missing", r.position()));
-            assert_eq!(rec.schema_id, (rec.seq % 7) as u32);
-            assert_eq!(rec.venue_ts_ns, rec.seq * 10);
-            assert_eq!(
-                rec.payload,
-                payload(rec.seq, kill_len(rec.seq)),
-                "iteration {i}, seq {}",
-                rec.seq
+        // Both live readers: the safe one and a zero-copy one (ADR 0027), which validates straight from the mapping.
+        for (kind, slot) in [("safe", &mut reader), ("mapped", &mut mapped)] {
+            let r = match slot {
+                Some(r) => r,
+                None => slot.insert(if kind == "mapped" {
+                    // SAFETY: only the tickertape writer (killed and recovered here) modifies the journal, and it
+                    // never modifies committed bytes, including during recovery.
+                    unsafe { Reader::open_mapped(&journal, ReaderConfig::default()) }.unwrap()
+                } else {
+                    Reader::open(&journal, ReaderConfig::default()).unwrap()
+                }),
+            };
+            while r.position() < next {
+                let rec = r
+                    .next_owned()
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "iteration {i}: live {kind} reader error at {}: {e}",
+                            r.position()
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        panic!("iteration {i}: {kind} record {} missing", r.position())
+                    });
+                assert_eq!(rec.schema_id, (rec.seq % 7) as u32);
+                assert_eq!(rec.venue_ts_ns, rec.seq * 10);
+                assert_eq!(
+                    rec.payload,
+                    payload(rec.seq, kill_len(rec.seq)),
+                    "iteration {i}, {kind} reader, seq {}",
+                    rec.seq
+                );
+            }
+            assert!(
+                r.try_next().unwrap().is_none(),
+                "iteration {i}: {kind} reader sees more than recovery"
             );
         }
-        assert!(
-            r.try_next().unwrap().is_none(),
-            "iteration {i}: reader sees more than recovery"
-        );
     }
 
     let all = read_all(&journal);

@@ -12,6 +12,7 @@ autotests = false
 tickertape = { workspace = true, features = ["fault-injection"] }
 
 [dev-dependencies]
+proptest = "1"
 tempfile = "3"
 
 [[test]]
@@ -53,6 +54,10 @@ path = "slow_reader.rs"
 [[test]]
 name = "durable_only"
 path = "durable_only.rs"
+
+[[test]]
+name = "mapped_reader"
+path = "mapped_reader.rs"
 
 [lints]
 workspace = true
