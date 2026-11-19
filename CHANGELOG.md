@@ -5,6 +5,20 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
+- Background checkpoints (ADR 0038, **proposed**; a prototype whose design is finished after a Linux measurement):
+  `Writer::request_checkpoint` starts a checkpoint of every record appended so far on the writer's checkpoint thread
+  (`tickertape-checkpoint`, started by the first request) and returns the sequence number it covers up to, so appends
+  continue while the sync calls run; `Writer::checkpoint_progress` returns a `CheckpointProgress` (the durable marker,
+  and the request still pending); `Writer::close` waits for the checkpoints in flight and reports whether every
+  checkpoint of the writer succeeded. Requests made while one checkpoint runs join into one more. A failed background
+  checkpoint poisons the writer and is returned once by the next of these calls or `checkpoint()`. `checkpoint()`
+  keeps its meaning (it waits for background checkpoints first), dropping the writer waits for requested checkpoints,
+  and the writer's retention runs on the checkpoint thread after each background checkpoint. No format change. The
+  crash contract names the background path in "Two levels", "What `checkpoint()` does", "Errors are sticky", C1, C7,
+  C12, C13 and C14. Fault injection gains `Point::CheckpointBeforeMarker` and `fault::hold_background`.
+  `tt-sustained --checkpoint-mode blocking|background` (and `benches/session.py --checkpoint-mode`) compares both, with
+  new result fields `checkpoint_mode`, `checkpoint_durable_latency`, `checkpoint_pause` and
+  `checkpoint_requests_while_in_flight`.
 - C++ binding (ADR 0036, `docs/cpp-api.md`): `crates/tickertape-ffi/include/tickertape.hpp`, a header-only C++17
   wrapper over the C ABI, shipped and installed (`cargo cinstall`) next to `tickertape.h`. It covers the whole C ABI:
   move-only `Writer`, `Reader`, option builders and `RecordBatch`; copying, zero-copy (a lambda) and batch appends

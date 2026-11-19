@@ -60,6 +60,13 @@ writer process crashing, but not a power loss (crash contract C1, C7, C8).
 A common pattern is a time- or count-based checkpoint (for example every second or every N records, whichever comes
 first) plus one before a clean shutdown. Dropping a `Writer` does not checkpoint.
 
+**Background checkpoints** (Rust API, ADR 0038, proposed): `Writer::request_checkpoint()` starts a checkpoint of
+everything appended so far on the writer's own checkpoint thread and returns at once, so appends go on while the sync
+calls run; `Writer::checkpoint_progress()` reports when it is durable. Records appended after the request are not
+covered. A failure is reported by the next of these calls (or `checkpoint()`, or `Writer::close()`), and poisons the
+writer as above. Dropping the writer waits for the requested checkpoints; `close()` waits and reports how they ended.
+Whether a background checkpoint keeps the writer from stalling on Linux is still being measured (ADR 0038).
+
 If `checkpoint()` returns an error, the writer refuses all later checkpoints (`Error::DurabilityLost`) while appends
 keep working. Treat it as an incident: see "Errors are sticky" in the crash contract.
 
