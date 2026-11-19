@@ -3,6 +3,11 @@
 // so the same declaration names a different function in each mode. tests/c_api.rs builds this file twice, once with
 // TT_BOUNDARY_DEFINE (the definition) and once without (the caller), and links the two: in different exception modes
 // the link must fail; in the same mode (the control) it must succeed.
+//
+// The link error covers a binding type in a parameter list only. A binding type that appears only in the return type
+// of a non-template function (`tickertape::Writer make_writer();`), or in a data member or global, is not part of the
+// symbol's name, so that crossing links and is undefined behaviour: the rule is that binding types do not cross the
+// boundary at all, and this link error is a help for the commonest case, not a guarantee. Not tested, on purpose.
 #include "tickertape.hpp"
 
 bool tt_boundary_is_open(const tickertape::Writer &writer);

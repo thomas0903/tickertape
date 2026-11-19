@@ -21,19 +21,24 @@ void SharedFill::operator()(std::uint8_t *buf, std::size_t len) const {
 
 static int fail_at = 0;      // the allocation (counted from tt_fail_nth_allocation) that throws; 0: none
 static int allocations = 0;  // since tt_fail_nth_allocation
-static bool replaced = false;
+static bool replaced_single = false;
+static bool replaced_array = false;
 
 bool tt_fail_nth_allocation(int n) {
+    // The probes run disarmed, so that neither is the allocation that fails; the count starts after them. Both forms
+    // are replaced and probed: the binding allocates arrays with new[], and under AddressSanitizer or Valgrind the
+    // tool's own operator new[] does not call the operator new below.
+    fail_at = 0;
+    replaced_single = false;
+    replaced_array = false;
+    ::operator delete(::operator new(1));      // never elided: tells whether these replacements are the ones in use
+    ::operator delete[](::operator new[](1));
+    allocations = 0;
     fail_at = n;
-    allocations = 0;
-    replaced = false;
-    ::operator delete(::operator new(1));  // never elided: tells whether this replacement is the one in use
-    allocations = 0;
-    return replaced;
+    return replaced_single && replaced_array;
 }
 
-void *operator new(std::size_t size) {
-    replaced = true;
+static void *allocate(std::size_t size) {
     if (fail_at > 0 && ++allocations == fail_at) {
         fail_at = 0;
         throw std::bad_alloc();
@@ -41,11 +46,21 @@ void *operator new(std::size_t size) {
     if (void *p = std::malloc(size ? size : 1)) return p;
     throw std::bad_alloc();
 }
+void *operator new(std::size_t size) {
+    replaced_single = true;
+    return allocate(size);
+}
+void *operator new[](std::size_t size) {
+    replaced_array = true;
+    return allocate(size);
+}
 // Not inlined: GCC's -Wmismatched-new-delete would otherwise see free() applied to the result of operator new once
 // the replacement operator delete is inlined into a caller.
 __attribute__((noinline)) static void release(void *p) noexcept { std::free(p); }
 void operator delete(void *p) noexcept { release(p); }
 void operator delete(void *p, std::size_t) noexcept { release(p); }
+void operator delete[](void *p) noexcept { release(p); }
+void operator delete[](void *p, std::size_t) noexcept { release(p); }
 
 int main(int argc, char **argv) {
     const std::string what = argc > 1 ? argv[1] : "";

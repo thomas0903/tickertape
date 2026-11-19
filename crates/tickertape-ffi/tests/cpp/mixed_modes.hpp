@@ -15,8 +15,9 @@ struct SharedFill {
     void operator()(std::uint8_t *buf, std::size_t len) const;
 };
 
-// Defined in mixed_modes_main.cpp, which replaces operator new: the `n`th allocation from now throws std::bad_alloc
-// (0: none). Returns whether the replacement is in use (false under a tool that replaces operator new itself).
+// Defined in mixed_modes_main.cpp, which replaces operator new and operator new[]: the `n`th allocation from now
+// throws std::bad_alloc (0: none). Returns whether both replacements are in use (false under a tool that replaces
+// them itself).
 bool tt_fail_nth_allocation(int n);
 
 // Each unit defines these with its mode in the name: exc_ or noexc_, then dbg_ or nodbg_.

@@ -97,6 +97,21 @@ static_assert(std::is_same_v<decltype(std::declval<tt::Error &&>().message()), s
 // B2: copying an Exception never throws (as for every standard exception).
 static_assert(std::is_nothrow_copy_constructible_v<tt::Exception> && std::is_nothrow_copy_assignable_v<tt::Exception>,
               "Exception copies without throwing");
+// B2 (round 3): moving an Exception copies it (it has no move operations), so a moved-from one keeps its Error;
+// the copy, and therefore the move, never throws. test_binding.cpp checks every accessor after a move.
+static_assert(std::is_nothrow_move_constructible_v<tt::Exception> && std::is_nothrow_move_assignable_v<tt::Exception>,
+              "moving an Exception does not throw");
+// enable_borrowed_bytes, the binding's own opt-in for rvalue views in new_record(), is the same at every language
+// level: string views (and, where it exists, std::span) only; owning ranges stay out.
+static_assert(tt::enable_borrowed_bytes<std::string_view> && tt::detail::is_byte_view_v<const std::string_view &&>,
+              "string views are borrowed");
+static_assert(!tt::enable_borrowed_bytes<std::string> && !tt::enable_borrowed_bytes<std::vector<std::uint8_t>> &&
+                  !tt::enable_borrowed_bytes<std::array<char, 4>>,
+              "owning ranges are not");
+#if __cplusplus >= 202002L && defined(__cpp_lib_span)
+static_assert(tt::enable_borrowed_bytes<std::span<const std::uint8_t>> && tt::enable_borrowed_bytes<std::span<char, 4>>,
+              "spans are borrowed");
+#endif
 // B3: next_copy takes untyped memory and writable byte ranges.
 static_assert(copies_into<std::array<char, 8> &>::value && copies_into<std::vector<std::byte> &>::value &&
                   copies_into<std::string &>::value,

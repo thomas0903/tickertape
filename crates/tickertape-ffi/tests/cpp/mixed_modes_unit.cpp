@@ -70,11 +70,12 @@ int TT_UNIT(index_out_of_range)() {
 }
 
 // list_segments is an ordinary inline function: it mentions no mode macro and carries no abi_tag, but it contains
-// exception handling the compiler generates (it calls reserve() while another vector is live). Only the inline
-// namespace keeps the copy built without exceptions out of the exceptions unit. Creates a journal in `dir`, then:
-// with exceptions, makes each allocation inside list_segments fail in turn (1st, 2nd, ...) until a call succeeds,
-// catching every std::bad_alloc here, and returns how many it caught (-1 for another outcome); without
-// exceptions, returns the number of segments.
+// exception handling the compiler generates. Only the inline namespace keeps the copy built without exceptions (and
+// every standard-library function it instantiates, which is why its C-struct buffer is the binding's own type, not
+// std::vector<tickertape_segment_info>) out of the exceptions unit. Creates a journal in `dir`, then:
+// with exceptions, makes each allocation inside list_segments fail in turn (n = 1, 2, ...) until a call succeeds,
+// checking that every std::bad_alloc reaches the catch here, and returns how many it caught (-1 for another
+// outcome); without exceptions, returns the number of segments.
 int TT_UNIT(list_segments)(const char *dir) {
     {
         tt::WriterOptions options;
@@ -85,14 +86,18 @@ int TT_UNIT(list_segments)(const char *dir) {
 #if defined(__cpp_exceptions)
     int caught = 0;
     for (int n = 1; n <= 32; n++) {
+        bool threw = false;
         try {
             if (!tt_fail_nth_allocation(n)) return -1;  // operator new is not the test's
             const tt::result<std::vector<tt::SegmentInfo>> segments = tt::list_segments(dir);
             tt_fail_nth_allocation(0);
-            return segments && !segments->empty() ? caught : -1;
+            if (!segments || segments->empty()) return -1;
         } catch (const std::bad_alloc &) {
-            caught++;
+            tt_fail_nth_allocation(0);
+            threw = true;
         }
+        if (!threw) return caught == n - 1 ? caught : -1;  // the first call that succeeds ends the walk
+        caught++;
     }
     return -1;
 #else

@@ -1556,6 +1556,185 @@ fn cpp_header_compiles_at_every_language_level() {
     run_all_ok(jobs);
 }
 
+/// The lines of `tickertape.hpp` after preprocessing, as (line number in the header, text), when `compiler`
+/// preprocesses a file that includes it with `flags`; blank lines are left out.
+fn preprocessed_header_lines(
+    compiler: &Path,
+    flags: &[&str],
+    scratch: &Path,
+) -> Vec<(u32, String)> {
+    let source = scratch.join("include_tickertape_hpp.cpp");
+    std::fs::write(&source, "#include \"tickertape.hpp\"\n").unwrap();
+    let mut cmd = Command::new(compiler);
+    cmd.arg("-E")
+        .args(flags)
+        .arg("-I")
+        .arg(manifest_dir().join("include"))
+        .arg(&source);
+    let output = cmd.output().expect("run the preprocessor");
+    assert!(
+        output.status.success(),
+        "{cmd:?} failed\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let mut lines = Vec::new();
+    let mut in_header = false;
+    let mut line_no = 0u32;
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        // A line marker: `# <line> "<file>" <flags>` (GCC, Clang) or `#line <line> "<file>"`.
+        let marker = line
+            .strip_prefix("# ")
+            .or_else(|| line.strip_prefix("#line "))
+            .filter(|rest| rest.starts_with(|c: char| c.is_ascii_digit()));
+        if let Some(rest) = marker {
+            let mut parts = rest.splitn(2, ' ');
+            line_no = parts.next().unwrap().parse().unwrap();
+            let file = parts.next().unwrap_or_default();
+            in_header = file
+                .split('"')
+                .nth(1)
+                .is_some_and(|f| f.ends_with("/tickertape.hpp"));
+            continue;
+        }
+        if in_header && !line.trim().is_empty() {
+            lines.push((line_no, line.trim().to_owned()));
+        }
+        line_no += 1;
+    }
+    assert!(
+        lines.len() > 1000,
+        "found only {} lines of tickertape.hpp in {cmd:?}",
+        lines.len()
+    );
+    lines
+}
+
+/// Whether the brackets in `text` balance (a crude test that it holds whole declarations).
+fn brackets_balance(text: &str) -> bool {
+    let mut stack = Vec::new();
+    for c in text.chars() {
+        match c {
+            '(' | '[' | '{' => stack.push(c),
+            ')' | ']' | '}' => {
+                let open = match c {
+                    ')' => '(',
+                    ']' => '[',
+                    _ => '{',
+                };
+                if stack.pop() != Some(open) {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    stack.is_empty()
+}
+
+/// Compares the preprocessed header at a lower and a higher language level: every line of the lower one must be in
+/// the higher one unchanged, and the lines only the higher one has must come in runs of whole declarations (balanced
+/// brackets, ending in `;` or `}`, after a line that ends a declaration or opens a scope).
+fn standard_dependent_definitions(
+    lower: &[(u32, String)],
+    higher: &[(u32, String)],
+) -> Vec<String> {
+    let mut lower_lines: std::collections::BTreeMap<u32, String> = Default::default();
+    for (n, text) in lower {
+        lower_lines
+            .entry(*n)
+            .and_modify(|t| {
+                t.push(' ');
+                t.push_str(text);
+            })
+            .or_insert_with(|| text.clone());
+    }
+    let mut higher_lines: Vec<(u32, String)> = Vec::new();
+    for (n, text) in higher {
+        match higher_lines.last_mut() {
+            Some((last, t)) if last == n => {
+                t.push(' ');
+                t.push_str(text);
+            }
+            _ => higher_lines.push((*n, text.clone())),
+        }
+    }
+    let mut problems = Vec::new();
+    for (n, text) in &lower_lines {
+        match higher_lines.iter().find(|(m, _)| m == n) {
+            Some((_, t)) if t == text => {}
+            Some((_, t)) => problems.push(format!("line {n} changes: `{text}` becomes `{t}`")),
+            None => problems.push(format!("line {n} disappears: `{text}`")),
+        }
+    }
+    let mut i = 0;
+    while i < higher_lines.len() {
+        if lower_lines.contains_key(&higher_lines[i].0) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < higher_lines.len() && !lower_lines.contains_key(&higher_lines[i].0) {
+            i += 1;
+        }
+        let added: Vec<&str> = higher_lines[start..i]
+            .iter()
+            .map(|(_, t)| t.as_str())
+            .collect();
+        let added = added.join(" ");
+        let after_a_declaration =
+            start == 0 || higher_lines[start - 1].1.ends_with([';', '{', '}', ':']);
+        if !(brackets_balance(&added) && added.ends_with([';', '}']) && after_a_declaration) {
+            problems.push(format!(
+                "lines {}..={} are added inside a declaration, not as whole declarations: `{added}`",
+                higher_lines[start].0,
+                higher_lines[i - 1].0
+            ));
+        }
+    }
+    problems
+}
+
+/// Nothing the header defines depends on the language level (ADR 0036 -> Language level): a block conditional on
+/// the standard or on a library feature-test macro may only add whole declarations (`as_span`, the `char8_t` and
+/// `std::span` specialisations). Otherwise a program linking a C++17 unit and a C++20 unit would contain two
+/// different definitions of one inline function, class or variable (a one-definition-rule violation). Checked by
+/// preprocessing the header as C++17, C++20 and C++23, with and without exceptions, with every C++ compiler found.
+#[test]
+fn cpp_header_definitions_do_not_depend_on_the_language_level() {
+    let scratch = tempfile::tempdir().unwrap();
+    let compilers = cpp_compilers();
+    assert!(!compilers.is_empty(), "no C++ compiler found");
+    let mut problems = Vec::new();
+    for compiler in &compilers {
+        for exceptions in ["-fexceptions", "-fno-exceptions"] {
+            let at = |std: &str| {
+                preprocessed_header_lines(
+                    compiler,
+                    &[&format!("-std={std}"), exceptions],
+                    scratch.path(),
+                )
+            };
+            let (cpp17, cpp20, cpp23) = (at("c++17"), at("c++20"), at("c++23"));
+            for (lower, higher, what) in [
+                (&cpp17, &cpp20, "C++17 -> C++20"),
+                (&cpp20, &cpp23, "C++20 -> C++23"),
+            ] {
+                for problem in standard_dependent_definitions(lower, higher) {
+                    problems.push(format!(
+                        "{} {exceptions} {what}: {problem}",
+                        compiler.display()
+                    ));
+                }
+            }
+        }
+    }
+    assert!(
+        problems.is_empty(),
+        "tickertape.hpp has definitions that differ between language levels:\n{}",
+        problems.join("\n")
+    );
+}
+
 /// Every public class and enumeration of the binding has its size and alignment pinned in `tests/cpp/layout.cpp`
 /// (ADR 0036 -> Versioning: no data member is added within a major version).
 #[test]
@@ -1565,7 +1744,7 @@ fn cpp_layout_test_pins_every_public_class() {
         "is_byte",
         "byte_range",
         "writable_byte_range",
-        "byte_view",
+        "Array",
         "PathArg",
         "ResultAccess",
         "FillFrame",
@@ -1625,14 +1804,11 @@ const MODE_MACROS: &[&str] = &["TICKERTAPE_DEBUG_CHECKS", "NDEBUG"];
 
 /// Calls from functions without the tag to a function that has the name of a tagged one but is a different
 /// function: (caller, callee, what the callee really is).
-const NOT_MODE_DEPENDENT_CALLS: &[(&str, &str, &str)] = &[
-    (
-        "check_options",
-        "error",
-        "the option builders' error(), which returns the recorded std::optional<Error>",
-    ),
-    ("list_segments", "data", "std::vector::data()"),
-];
+const NOT_MODE_DEPENDENT_CALLS: &[(&str, &str, &str)] = &[(
+    "check_options",
+    "error",
+    "the option builders' error(), which returns the recorded std::optional<Error>",
+)];
 
 /// Tagged functions that call a tagged function only through an operator, which the source check cannot see:
 /// (name, what it calls).
@@ -1925,11 +2101,14 @@ fn cpp_mode_dependent_functions_have_a_symbol_per_mode() {
 }
 
 /// Translation units built with and without exceptions, and with and without debug checks, keep their own behaviour
-/// when linked into one program, in either link order and at -O0 and -O2 (ADR 0036 -> Mixing modes). Without the
-/// mode-specific inline namespace (exceptions) or the abi_tag (debug checks), the copy of `result<T>::value()`,
+/// when linked into one program, in either link order, at -O0 and -O2, with every C++ compiler of the matrix, and the
+/// two exception-mode objects define no common symbol that mentions tickertape (ADR 0036 -> Mixing modes). Without
+/// the mode-specific inline namespace (exceptions) or the abi_tag (debug checks), the copy of `result<T>::value()`,
 /// `append_with`, `list_segments` or `RecordBatch::operator[]` from the first object on the link line serves both
 /// units: `value()` aborts instead of throwing, a fill's exception escapes, an allocation failure inside
-/// `list_segments` terminates the process (Clang) or skips its clean-up (GCC), or a debug check disappears.
+/// `list_segments` terminates the process (Clang) or skips its clean-up (GCC), or a debug check disappears. The same
+/// happens through a standard-library instantiation over a C struct (round 2's `std::vector<tickertape_segment_info>`),
+/// which the shared-symbol check catches.
 #[test]
 fn cpp_binding_links_units_built_in_different_modes() {
     let scratch = tempfile::tempdir().unwrap();
@@ -1960,92 +2139,171 @@ fn cpp_binding_links_units_built_in_different_modes() {
         ("main_debug_checks", "dbg", "exc"),
         ("main_debug_checks", "exc", "dbg"),
     ];
-    for opt in ["-O0", "-O2"] {
-        let object = |name: &str| out.join(format!("{name}{opt}.o"));
-        let compiles = objects
-            .iter()
-            .map(|(name, source, flags)| {
-                let mut cmd =
-                    compiler_command("c++17", &[CPP_BINDING_WARNINGS, flags, &[opt]].concat());
-                cmd.arg("-c").arg(source).arg("-o").arg(object(name));
-                cmd
-            })
-            .collect();
-        run_all_ok(compiles);
-        for (driver, first, second) in programs {
-            let program = out.join(format!("{driver}_{first}_{second}{opt}"));
-            let mut link = compiler(true).to_command();
-            link.args(sanitizer_flags())
-                .arg(object(driver))
-                .arg(object(first))
-                .arg(object(second));
-            link_library(&mut link, Link::Shared);
-            run_compiler(link.arg("-o").arg(&program));
-            let run = |args: &[&str]| {
-                let output = command_with_valgrind_args(&program, VALGRIND_USER_ALLOCATOR)
-                    .args(args)
-                    .output()
-                    .unwrap();
-                let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-                let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-                (output.status.success(), stdout, stderr)
-            };
-            let context = format!(
-                "{} (objects in this order: {first}, {second})",
-                program.display()
-            );
-            if driver == "main_exceptions" {
-                let (ok, stdout, stderr) = run(&["exc-value"]);
-                assert!(
-                    ok && stdout.contains("threw"),
-                    "{context}: exc-value\n{stdout}{stderr}"
+    let compilers = cpp_compilers();
+    assert!(!compilers.is_empty(), "no C++ compiler found");
+    for (ci, cxx) in compilers.iter().enumerate() {
+        // The sanitizers only with the compiler the other tests use (Homebrew GCC on macOS has none).
+        let sanitize: &[&str] = if cxx.as_path() == compiler(true).path() {
+            sanitizer_flags()
+        } else {
+            &[]
+        };
+        for opt in ["-O0", "-O2"] {
+            let object = |name: &str| out.join(format!("{name}_{ci}{opt}.o"));
+            let compiles = objects
+                .iter()
+                .map(|(name, source, flags)| {
+                    let mut cmd = Command::new(cxx);
+                    cmd.args(["-std=c++17", "-Wall", "-Wextra", "-Werror"])
+                        .args(CPP_BINDING_WARNINGS)
+                        .args(*flags)
+                        .arg(opt)
+                        .args(sanitize)
+                        .arg("-I")
+                        .arg(manifest_dir().join("include"))
+                        .arg("-c")
+                        .arg(source)
+                        .arg("-o")
+                        .arg(object(name));
+                    cmd
+                })
+                .collect();
+            run_all_ok(compiles);
+            check_no_shared_binding_symbols(&object("exc"), &object("noexc"));
+            for (driver, first, second) in programs {
+                let program = out.join(format!("{driver}_{first}_{second}_{ci}{opt}"));
+                let mut link = Command::new(cxx);
+                link.args(sanitize)
+                    .arg(object(driver))
+                    .arg(object(first))
+                    .arg(object(second));
+                link_library(&mut link, Link::Shared);
+                run_compiler(link.arg("-o").arg(&program));
+                let run = |args: &[&str]| {
+                    let output = command_with_valgrind_args(&program, VALGRIND_USER_ALLOCATOR)
+                        .args(args)
+                        .output()
+                        .unwrap();
+                    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+                    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+                    (output.status.success(), stdout, stderr)
+                };
+                let context = format!(
+                    "{} ({}; objects in this order: {first}, {second})",
+                    program.display(),
+                    cxx.display()
                 );
-                let (ok, stdout, stderr) = run(&["noexc-value"]);
-                assert!(
-                    !ok && stderr.contains("result<T>::value() on an error")
-                        && !stdout.contains("returned"),
-                    "{context}: noexc-value must abort\n{stdout}{stderr}"
-                );
-                let journal = out.join(format!("exc_{first}{opt}"));
-                let (ok, stdout, stderr) = run(&["exc-fill", journal.to_str().unwrap()]);
-                assert!(
-                    ok && stdout.contains("rethrown"),
-                    "{context}: exc-fill\n{stdout}{stderr}"
-                );
-                let journal = out.join(format!("noexc_{first}{opt}"));
-                let (ok, stdout, stderr) = run(&["noexc-fill", journal.to_str().unwrap()]);
-                assert!(
-                    ok && stdout.contains("committed"),
-                    "{context}: noexc-fill\n{stdout}{stderr}"
-                );
-                // std::bad_alloc from the 1st, 2nd, ... allocation inside list_segments (an untagged function that
-                // the no-exceptions unit also calls) reaches the exceptions unit's catch every time.
-                let journal = out.join(format!("alloc_{first}{opt}"));
-                let (ok, stdout, stderr) = run(&["exc-alloc", journal.to_str().unwrap()]);
-                let caught = stdout
-                    .trim()
-                    .strip_prefix("caught ")
-                    .and_then(|n| n.parse::<i32>().ok());
-                assert!(
-                    ok && caught.is_some_and(|n| n >= 2),
-                    "{context}: exc-alloc must catch a failure at each allocation of list_segments\n\
-                     {stdout}{stderr}"
-                );
-            } else {
-                let (ok, stdout, stderr) = run(&["dbg-index"]);
-                assert!(
-                    !ok && stderr.contains("RecordBatch index out of range")
-                        && !stdout.contains("returned"),
-                    "{context}: dbg-index must abort\n{stdout}{stderr}"
-                );
-                let (ok, stdout, stderr) = run(&["nodbg-index"]);
-                assert!(
-                    ok && stdout.contains("unchecked 0"),
-                    "{context}: nodbg-index\n{stdout}{stderr}"
-                );
+                if driver == "main_exceptions" {
+                    let (ok, stdout, stderr) = run(&["exc-value"]);
+                    assert!(
+                        ok && stdout.contains("threw"),
+                        "{context}: exc-value\n{stdout}{stderr}"
+                    );
+                    let (ok, stdout, stderr) = run(&["noexc-value"]);
+                    assert!(
+                        !ok && stderr.contains("result<T>::value() on an error")
+                            && !stdout.contains("returned"),
+                        "{context}: noexc-value must abort\n{stdout}{stderr}"
+                    );
+                    let journal = out.join(format!("exc_{first}_{ci}{opt}"));
+                    let (ok, stdout, stderr) = run(&["exc-fill", journal.to_str().unwrap()]);
+                    assert!(
+                        ok && stdout.contains("rethrown"),
+                        "{context}: exc-fill\n{stdout}{stderr}"
+                    );
+                    let journal = out.join(format!("noexc_{first}_{ci}{opt}"));
+                    let (ok, stdout, stderr) = run(&["noexc-fill", journal.to_str().unwrap()]);
+                    assert!(
+                        ok && stdout.contains("committed"),
+                        "{context}: noexc-fill\n{stdout}{stderr}"
+                    );
+                    // std::bad_alloc from the 1st, 2nd, ... allocation inside list_segments (an untagged function that
+                    // the no-exceptions unit also calls) reaches the exceptions unit's catch every time, until a call
+                    // succeeds. list_segments allocates at least twice (its C-struct buffer, then the result's vector).
+                    let journal = out.join(format!("alloc_{first}_{ci}{opt}"));
+                    let (ok, stdout, stderr) = run(&["exc-alloc", journal.to_str().unwrap()]);
+                    let caught = stdout
+                        .trim()
+                        .strip_prefix("caught ")
+                        .and_then(|n| n.parse::<i32>().ok());
+                    assert!(
+                        ok && caught.is_some_and(|n| n >= 2),
+                        "{context}: exc-alloc must catch a failure at each allocation of list_segments\n\
+                         {stdout}{stderr}"
+                    );
+                } else {
+                    let (ok, stdout, stderr) = run(&["dbg-index"]);
+                    assert!(
+                        !ok && stderr.contains("RecordBatch index out of range")
+                            && !stdout.contains("returned"),
+                        "{context}: dbg-index must abort\n{stdout}{stderr}"
+                    );
+                    let (ok, stdout, stderr) = run(&["nodbg-index"]);
+                    assert!(
+                        ok && stdout.contains("unchecked 0"),
+                        "{context}: nodbg-index\n{stdout}{stderr}"
+                    );
+                }
             }
         }
     }
+}
+
+/// The defined external symbols of an object file, as `nm` prints them, or `None` if `nm` cannot be run.
+fn defined_symbols(object: &Path) -> Option<Vec<String>> {
+    let output = Command::new("nm").arg("-g").arg(object).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let symbols = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            // "<address> <type> <name>" for a defined symbol; "<type> <name>" (U, w, v) for an undefined one.
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            match fields.as_slice() {
+                [_, kind, name] if !matches!(*kind, "U" | "u" | "w" | "v") => {
+                    Some((*name).to_owned())
+                }
+                _ => None,
+            }
+        })
+        .collect();
+    Some(symbols)
+}
+
+/// No symbol that mentions `tickertape` is defined in both the exceptions object and the no-exceptions object (ADR
+/// 0036 -> Mixing modes). Such a symbol is a weak definition the linker keeps once for the whole program, so one
+/// mode's copy would run in the other: for example `std::vector<tickertape_segment_info>::resize`, a standard-library
+/// instantiation over a C struct, which is outside the binding's namespace. Skipped with a message without `nm`.
+fn check_no_shared_binding_symbols(exceptions: &Path, no_exceptions: &Path) {
+    let (Some(exc), Some(noexc)) = (defined_symbols(exceptions), defined_symbols(no_exceptions))
+    else {
+        eprintln!(
+            "skipping the shared-symbol check of the mixed-mode objects: nm is not available"
+        );
+        return;
+    };
+    assert!(
+        exc.iter().any(|s| s.contains("tickertape")),
+        "nm found no tickertape symbol in {}: the check would prove nothing",
+        exceptions.display()
+    );
+    let shared: Vec<&String> = exc
+        .iter()
+        .filter(|s| s.contains("tickertape") && noexc.contains(s))
+        .collect();
+    assert!(
+        shared.is_empty(),
+        "symbols defined by both the exceptions and the no-exceptions object ({} and {}); the linker keeps one \
+         copy for both modes:\n{}",
+        exceptions.display(),
+        no_exceptions.display(),
+        shared
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
 }
 
 /// A binding type cannot be passed between units built in different exception modes: the same declaration names a
@@ -2100,25 +2358,28 @@ fn cpp_binding_types_do_not_cross_exception_modes() {
 
 // ---- Code the binding refuses at compile time (ADR 0036) ----
 
-/// Programs that must not compile, and their neighbours that must: `new_record` refuses an rvalue range that owns
-/// its bytes and accepts lvalues and rvalue views (`std::basic_string_view`, `std::span`, and in C++20 any type
-/// that opts into `std::ranges::enable_borrowed_range`); `result<T>` refuses a T whose move can throw; a const
-/// rvalue `result<Writer>` does not hand out its Writer; `tickertape::PathArg` cannot be named (a variable of it
-/// could dangle), while temporaries passed as path arguments compile.
+/// Programs that must not compile, and their neighbours that must, as C++17 and C++20 (the C++20-only statements
+/// at C++20): `new_record` refuses an rvalue range that owns its bytes and accepts lvalues and rvalue views (types
+/// for which `tickertape::enable_borrowed_bytes` is true: `std::basic_string_view`, `std::span`, and a user's view
+/// type that specialises it, at every language level; `std::ranges::enable_borrowed_range` is not consulted);
+/// `result<T>` refuses a T whose move can throw; a const rvalue `result<Writer>` does not hand out its Writer;
+/// `tickertape::PathArg` cannot be named, while temporaries passed as path arguments compile.
 #[test]
 fn cpp_binding_refuses_unsafe_code_at_compile_time() {
     const PRELUDE: &str = r#"#include "tickertape.hpp"
 #include <array>
 #include <filesystem>
+#if __cplusplus >= 202002L
 #include <ranges>
 #include <span>
+#endif
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
 namespace tt = tickertape;
 const std::string const_string();
-// A user's own view type: it does not own its bytes. It opts into std::ranges::enable_borrowed_range below.
+// A user's own view type: it does not own its bytes. It opts into tickertape::enable_borrowed_bytes below.
 struct MyView {
     const char *p;
     std::size_t n;
@@ -2128,7 +2389,20 @@ struct MyView {
     const char *end() const { return p + n; }
 };
 template <>
-inline constexpr bool std::ranges::enable_borrowed_range<MyView> = true;
+inline constexpr bool tt::enable_borrowed_bytes<MyView> = true;
+#if __cplusplus >= 202002L
+// A view that opts into std::ranges::enable_borrowed_range only, which the binding does not consult.
+struct StdBorrowed {
+    const char *p;
+    std::size_t n;
+    const char *data() const { return p; }
+    std::size_t size() const { return n; }
+    const char *begin() const { return p; }
+    const char *end() const { return p + n; }
+};
+template <>
+inline constexpr bool std::ranges::enable_borrowed_range<StdBorrowed> = true;
+#endif
 // The same without opting in.
 struct NotBorrowed {
     const char *p;
@@ -2181,6 +2455,14 @@ void use(std::vector<tt::NewRecord> &batch, std::string &owned, const std::strin
             "deleted",
         ),
         (
+            "batch.push_back(tt::new_record(1, 0, 0, StdBorrowed{\"x\", 1}));",
+            "deleted",
+        ),
+        (
+            "batch.push_back(tt::new_record(1, 0, 0, std::ranges::subrange(owned.data(), owned.data() + 1)));",
+            "deleted",
+        ),
+        (
             "tt::result<ThrowingMove> r = ThrowingMove(); (void)r;",
             "nothrow move",
         ),
@@ -2209,7 +2491,6 @@ void use(std::vector<tt::NewRecord> &batch, std::string &owned, const std::strin
         "batch.push_back(tt::new_record(1, 0, 0, std::span<const char, 1>(fixed)));",
         "batch.push_back(tt::new_record(1, 0, 0, std::as_bytes(std::span<const char>(owned))));",
         "batch.push_back(tt::new_record(1, 0, 0, MyView{owned.data(), owned.size()}));",
-        "batch.push_back(tt::new_record(1, 0, 0, std::ranges::subrange(owned.data(), owned.data() + 1)));",
         "batch.push_back(tt::new_record(1, 0, 0, owned.data(), owned.size()));",
         "tt::result<int> r = 1; (void)r;",
         "const tt::Writer &w = opened.value(); (void)w;",
@@ -2217,6 +2498,12 @@ void use(std::vector<tt::NewRecord> &batch, std::string &owned, const std::strin
         r#"(void)tt::Writer::open(std::string("root") + "/journal");"#,
         r#"tt::Retention r; r.move_to(std::filesystem::path("root") / "archive");"#,
     ];
+    // Statements that name C++20 library types are compiled as C++20 only.
+    let needs_cpp20 = |statement: &str| {
+        ["std::span", "std::ranges", "std::as_bytes", "StdBorrowed"]
+            .iter()
+            .any(|name| statement.contains(name))
+    };
     let scratch = tempfile::tempdir().unwrap();
     let compilers = cpp_compilers();
     assert!(!compilers.is_empty(), "no C++ compiler found");
@@ -2230,15 +2517,23 @@ void use(std::vector<tt::NewRecord> &batch, std::string &owned, const std::strin
     {
         let source = scratch.path().join(format!("case_{i}.cpp"));
         std::fs::write(&source, format!("{PRELUDE}    {statement}\n}}\n")).unwrap();
+        let standards: &[&str] = if needs_cpp20(statement) {
+            &["c++20"]
+        } else {
+            &["c++17", "c++20"]
+        };
         for compiler in &compilers {
-            let mut cmd = Command::new(compiler);
-            cmd.args(["-std=c++20", "-fsyntax-only", "-Wall", "-Wextra", "-Werror"])
-                .args(CPP_BINDING_WARNINGS)
-                .arg("-I")
-                .arg(manifest_dir().join("include"))
-                .arg(&source);
-            jobs.push(cmd);
-            cases.push((accept, statement, needle));
+            for std in standards {
+                let mut cmd = Command::new(compiler);
+                cmd.arg(format!("-std={std}"))
+                    .args(["-fsyntax-only", "-Wall", "-Wextra", "-Werror"])
+                    .args(CPP_BINDING_WARNINGS)
+                    .arg("-I")
+                    .arg(manifest_dir().join("include"))
+                    .arg(&source);
+                jobs.push(cmd);
+                cases.push((accept, statement, needle));
+            }
         }
     }
     for ((accept, statement, needle), (cmd, output)) in cases.into_iter().zip(run_parallel(jobs)) {

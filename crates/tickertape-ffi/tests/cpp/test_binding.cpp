@@ -16,6 +16,7 @@
 #include <array>
 #include <cerrno>
 #include <chrono>
+#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -23,7 +24,9 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <optional>
+#include <ratio>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -203,6 +206,112 @@ static void versions() {
                                  std::to_string(TICKERTAPE_HPP_VERSION_PATCH);
     CHECK(tt::library_version() == expected);
     CHECK(tt::realtime_ns() > 1600000000ull * 1000000000ull);
+}
+
+// ---- Exact duration conversion (ADR 0036 -> Timeouts) ----
+
+// Periods whose num * den (in nanoseconds) does not fit 64 bits, so the conversion needs a 128-bit product or the
+// header's 64-bit long multiplication. One tick of the first is just over 1 ns.
+using JustOverOneNs = std::ratio<1000000000, 999999999999999999>;  // 10^18 / (10^18 - 1) ns
+using WideRatio = std::ratio<999999937, 1000000007>;              // 999999937 * 10^9 / 1000000007 ns
+
+#if defined(__SIZEOF_INT128__)
+__extension__ typedef unsigned __int128 u128;
+
+// ceil(count * num / den) nanoseconds, saturated at the largest Int: the exact answer, computed independently.
+template <class Int, class Period>
+static std::uint64_t exact_ns(std::uint64_t count) {
+    using R = std::ratio_divide<Period, std::nano>;
+    const u128 product = static_cast<u128>(count) * static_cast<u128>(R::num);
+    const u128 den = static_cast<u128>(R::den);
+    const u128 ceil = product / den + (product % den != 0 ? 1 : 0);
+    const u128 cap = static_cast<u128>(std::numeric_limits<Int>::max());
+    return static_cast<std::uint64_t>(ceil > cap ? cap : ceil);
+}
+
+// Both conversions (Timeout, saturating at INT64_MAX; duration_ns, at UINT64_MAX) give the exact answer for `count`.
+template <class Rep, class Period>
+static bool converts_exactly(Rep count) {
+    const std::chrono::duration<Rep, Period> d(count);
+    const std::uint64_t c = static_cast<std::uint64_t>(count);
+    return static_cast<std::uint64_t>(tt::Timeout(d).c_value()) == exact_ns<std::int64_t, Period>(c) &&
+           tt::detail::duration_ns(d) == exact_ns<std::uint64_t, Period>(c);
+}
+#endif
+
+static void exact_durations() {
+    // One tick of just over 1 ns is 2 ns (a 53-bit long double, as on Apple arm64, gave 1).
+    static_assert(tt::Timeout(std::chrono::duration<int, JustOverOneNs>(1)).c_value() == 2, "just over 1 ns");
+    static_assert(tt::detail::duration_ns(std::chrono::duration<int, JustOverOneNs>(1)) == 2, "just over 1 ns");
+    static_assert(tt::Timeout(std::chrono::duration<std::int64_t, WideRatio>(1)).c_value() == 999999931,
+                  "one wide tick: ceil(999999937000000000 / 1000000007)");
+    // The 64-bit method on its own (the header uses it where there is no 128-bit type).
+    static_assert(tt::detail::mul_div_ceil_portable(1, 1000000000000000000, 999999999999999999) == 2, "portable");
+    static_assert(tt::detail::mul_div_ceil_portable(1000000006, 999999937000000000, 1000000007) ==
+                      999999936000000070,
+                  "portable, counts below den");
+    static_assert(tt::detail::mul_div_ceil_portable(0, 5, 7) == 0 && tt::detail::mul_div_ceil_portable(6, 7, 7) == 6,
+                  "portable, exact quotients");
+    static_assert(tt::detail::mul_div_ceil_portable(INTMAX_MAX - 1, INTMAX_MAX, INTMAX_MAX) == INTMAX_MAX - 1,
+                  "portable, the widest operands");
+#if defined(__SIZEOF_INT128__)
+    // Every count just below 1000000007 (where 986 of 1999 came out low through long double), and its neighbours.
+    int wrong = 0;
+    for (std::int64_t count = 1000000007 - 1999; count <= 1000000007 + 1999; count++) {
+        if (!converts_exactly<std::int64_t, WideRatio>(count)) wrong++;
+    }
+    CHECK(wrong == 0);
+    // The portable method against the 128-bit product, over a spread of operands (a < d <= INTMAX_MAX).
+    std::uint64_t x = 0x9E3779B97F4A7C15u;
+    int portable_wrong = 0;
+    for (int i = 0; i < 20000; i++) {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        const std::uint64_t d = (x >> 1) | 1u;
+        const std::uint64_t b = (x * 0x2545F4914F6CDD1Du) >> 1;
+        const std::uint64_t a = (x >> (i % 63)) % d;
+        const u128 product = static_cast<u128>(a) * b;
+        const std::uint64_t expected = static_cast<std::uint64_t>(product / d + (product % d != 0 ? 1 : 0));
+        if (tt::detail::mul_div_ceil_portable(a, b, d) != expected || tt::detail::mul_div_ceil(a, b, d) != expected) {
+            portable_wrong++;
+        }
+    }
+    CHECK(portable_wrong == 0);
+    // Just below, at and above each cap, for the wide periods: exact, then saturated.
+    for (std::int64_t delta = -3; delta <= 3; delta++) {
+        // INT64_MAX ns is about 9223372036854775807 * 1000000007 / 999999937000000000 = 9.22e9 wide ticks.
+        const std::int64_t below_int64 = 9223372682 + delta;
+        CHECK((converts_exactly<std::int64_t, WideRatio>(below_int64)));
+        // UINT64_MAX ns is about 1.84e10 wide ticks.
+        const std::uint64_t below_uint64 = static_cast<std::uint64_t>(18446745364 + delta);
+        CHECK((converts_exactly<std::uint64_t, WideRatio>(below_uint64)));
+        CHECK((converts_exactly<std::int64_t, JustOverOneNs>(INT64_MAX - 12 + delta)));
+        const std::uint64_t near_uint64_max = UINT64_MAX - 22 + static_cast<std::uint64_t>(delta + 3);
+        CHECK((converts_exactly<std::uint64_t, JustOverOneNs>(near_uint64_max)));
+    }
+    CHECK((converts_exactly<std::int64_t, WideRatio>(INT64_MAX)));
+    CHECK((converts_exactly<int, JustOverOneNs>(INT_MAX)));
+    // The periods that already worked.
+    CHECK((converts_exactly<std::int64_t, std::milli>(123456789)));
+    CHECK((converts_exactly<std::int64_t, std::ratio<60>>(153722867)));   // minutes, just below 2^63 ns
+    CHECK((converts_exactly<std::int64_t, std::ratio<60>>(153722868)));   // and just above
+    CHECK((converts_exactly<std::int64_t, std::pico>(2001)));
+    CHECK((converts_exactly<std::int64_t, std::ratio<1, 3000000000>>(1)));  // a third of a nanosecond
+    CHECK((converts_exactly<std::uint8_t, std::ratio<1>>(255)));          // uint8_t seconds
+    CHECK((converts_exactly<std::int64_t, std::nano>(INT64_MAX)));
+    CHECK((converts_exactly<std::int64_t, std::ratio<3600>>(std::chrono::hours::max().count())));
+#endif
+    // A positive duration never becomes 0.
+    static_assert(tt::Timeout(std::chrono::duration<std::int64_t, std::ratio<1, 3000000000>>(1)).c_value() == 1,
+                  "a third of a nanosecond");
+    static_assert(tt::Timeout(std::chrono::duration<std::uint8_t>(255)).c_value() == 255000000000, "uint8_t seconds");
+    // Floating point is unchanged: NaN does not wait, infinities saturate or do not wait.
+    CHECK(tt::Timeout(std::chrono::duration<double>(std::numeric_limits<double>::quiet_NaN())).c_value() == 0);
+    CHECK(tt::Timeout(std::chrono::duration<double>(std::numeric_limits<double>::infinity())).c_value() == INT64_MAX);
+    CHECK(tt::Timeout(std::chrono::duration<double>(-std::numeric_limits<double>::infinity())).c_value() == 0);
+    CHECK(tt::detail::duration_ns(std::chrono::duration<double>(std::numeric_limits<double>::infinity())) ==
+          UINT64_MAX);
 }
 
 static void timeouts() {
@@ -796,6 +905,26 @@ static void exceptions(const std::string &root) {
         CHECK(&copy.error() == &e.error() && copy.status() == tt::Status::locked);
         CHECK(std::string(copy.what()) == "TICKERTAPE_E_LOCKED: held");
     }
+    // A moved-from or move-assigned-from Exception keeps its Error: moving one copies it (no null shared Error).
+    {
+        tt::Exception original(tt::Error(tt::Status::corrupt, "bad", 5, tt::CorruptReason::bad_magic, 7));
+        const tt::Exception moved(std::move(original));
+        tt::Exception assigned(tt::Error(tt::Status::busy, "other"));
+        tt::Exception source(tt::Error(tt::Status::corrupt, "bad", 5, tt::CorruptReason::bad_magic, 7));
+        assigned = std::move(source);
+        const std::initializer_list<const tt::Exception *> all = {&original, &moved, &source, &assigned};
+        for (const tt::Exception *e : all) {
+            CHECK(e->status() == tt::Status::corrupt);
+            CHECK(e->error().status() == tt::Status::corrupt);
+            CHECK(e->error().message() == "bad");
+            CHECK(e->error().os_code() == 5);
+            CHECK(e->error().corrupt_reason() == tt::CorruptReason::bad_magic);
+            CHECK(e->error().needed_size() == 7);
+            CHECK(e->error().name() == "TICKERTAPE_E_CORRUPT");
+            CHECK(e->error().to_string() == "TICKERTAPE_E_CORRUPT: bad");
+            CHECK(std::string(e->what()) == "TICKERTAPE_E_CORRUPT: bad");
+        }
+    }
     try {
         tt::check_library().value();
         tt::result<int> failed = tt::Error(tt::Status::busy, "x");
@@ -973,6 +1102,7 @@ int main(int argc, char **argv) {
     versions();
     names_match_the_library();
     timeouts();
+    exact_durations();
     surface(root);
     retention(root);
     errors(root);

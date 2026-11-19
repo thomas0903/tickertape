@@ -5,10 +5,10 @@
 //
 // - Every fallible function returns `tickertape::result<T>`: a value or a `tickertape::Error`. `.value()` returns
 //   the value or throws `tickertape::Exception` (with exceptions disabled it prints the error and aborts). The
-//   header has the same API with and without exceptions, and translation units built with and without exceptions
-//   (or debug checks) can be linked into one program with GCC and Clang (ADR 0036 -> Mixing modes). Apart from
-//   std::bad_alloc, it throws only from `.value()` and from `Writer::append_with`, which rethrows what your fill
-//   function threw.
+//   header has the same API with and without exceptions. With GCC and Clang, translation units built with and
+//   without exceptions (or debug checks) can be linked into one program, but binding types cannot be passed between
+//   units built in different exception modes (ADR 0036 -> Mixing modes). Apart from std::bad_alloc, it throws only
+//   from `.value()` and from `Writer::append_with`, which rethrows what your fill function threw.
 // - `Writer`, `Reader`, `WriterOptions`, `ReaderOptions`, `Retention` and `RecordBatch` are move-only owners of one
 //   C handle (or buffer) each. A default-constructed `Writer` or `Reader` is empty; the option builders start with
 //   the defaults; `RecordBatch` has no default constructor. A moved-from object is empty: destroying or assigning to
@@ -53,9 +53,6 @@
 
 #if __cplusplus >= 202002L && __has_include(<span>)
 #include <span>
-#endif
-#if __cplusplus >= 202002L && __has_include(<ranges>)
-#include <ranges>
 #endif
 
 // ---- Version ----
@@ -104,11 +101,16 @@
 // Mixing modes (ADR 0036 -> Mixing modes).
 //
 // - Exception mode: everything below lives in the inline namespace tickertape::v1 when exceptions are enabled and
-//   tickertape::v1_noexcept when they are not. Every function, type and inline variable therefore has a symbol of
-//   its own in each mode, and no definition is shared between units built in different modes, including the
-//   exception handling a compiler generates inside any function. Code still writes tickertape::Writer. A binding
-//   type cannot be passed between units built in different exception modes: that is a link error, on purpose
-//   (pass C handles or plain data across such a boundary).
+//   tickertape::v1_noexcept when they are not, so every definition the header provides has a symbol of its own in
+//   each mode, including the exception handling a compiler generates inside it, and the header instantiates no
+//   standard-library function that an exception can pass through over only its C types (detail::Array holds those;
+//   what is left, std::data and std::size on a range given to append_batch, cannot throw). Code still writes
+//   tickertape::Writer. What remains shared between modes is standard-library code over built-in and standard types
+//   (std::string, std::optional<std::uint64_t>, ...), as in any program that mixes modes: that is as safe as the
+//   toolchain's standard library makes it. Binding types must not cross a boundary between exception modes (pass C
+//   handles or plain data). A binding type in a function's parameter list makes such a crossing a link error; one
+//   only in a non-template function's return type (or in a data member or global) is not part of the symbol's name,
+//   so that crossing links and is undefined behaviour.
 // - Debug-check mode: the types are shared, so that debug and release units can exchange them. The inline functions
 //   whose behaviour depends on the mode are declared TICKERTAPE_HPP_MODE_DEPENDENT, which gives them a different
 //   symbol in each mode (GCC's and Clang's abi_tag). A test fails if a function that mentions a debug-check macro,
@@ -253,12 +255,19 @@ private:
 };
 
 // What result<T>::value() throws for an error. what() is Error::to_string(). Copying it never throws (as for every
-// standard exception): the Error is shared between copies, not copied.
+// standard exception): the Error is shared between copies, not copied. It has no move operations: moving one copies
+// it, so that a moved-from Exception keeps its Error (as std::runtime_error keeps its message) and every accessor
+// still works on it.
 class Exception : public std::runtime_error {
 public:
     explicit Exception(Error error)
         : std::runtime_error(error.to_string()),
           error_(std::shared_ptr<const Error>(std::make_shared<Error>(std::move(error)))) {}
+    // Declared so that no move operations are generated (a move would leave error_ null).
+    Exception(const Exception &) = default;
+    Exception &operator=(const Exception &) = default;
+    ~Exception() override = default;
+
     const Error &error() const noexcept { return *error_; }
     Status status() const noexcept { return error_->status(); }
 
@@ -482,9 +491,10 @@ namespace detail {
 // Status::invalid_argument.
 //
 // Not part of the API (ADR 0036 -> Paths): it can point into a temporary `std::string` or `std::filesystem::path`,
-// which is safe only because a temporary argument lives until the call returns. Declaring a variable of this type
-// (`PathArg p = std::filesystem::path(root) / "journal";`) would dangle, so it lives in `detail`, unnamed by user
-// code; pass the path itself.
+// which is safe because a temporary argument lives until the call returns. That protects the documented call forms
+// (the path passed directly as the argument) only: code that names this detail type itself can still store one and
+// let it dangle (`detail::PathArg p = std::string("x");` compiles, by guaranteed copy elision). Pass the path
+// itself; a function that forwards a path takes a path type or a template parameter.
 class PathArg {
 public:
     PathArg(const char *path) noexcept : ptr_(path) {}
@@ -510,10 +520,49 @@ private:
     bool has_nul_ = false;
 };
 
+// ceil(a * b / d), exactly, for a < d <= INTMAX_MAX (so the result is at most b), in std::uintmax_t arithmetic
+// only: long multiplication over the bits of b, keeping the quotient and the remainder (below d) of the partial
+// product, so nothing overflows. Used where there is no 128-bit integer type, and tested against it.
+constexpr std::uintmax_t mul_div_ceil_portable(std::uintmax_t a, std::uintmax_t b, std::uintmax_t d) noexcept {
+    std::uintmax_t quotient = 0;
+    std::uintmax_t remainder = 0;  // quotient * d + remainder == a * (the bits of b seen so far), remainder < d
+    for (int bit = std::numeric_limits<std::uintmax_t>::digits - 1; bit >= 0; bit--) {
+        quotient <<= 1;
+        remainder <<= 1;  // below 2 * d, which fits
+        if (remainder >= d) {
+            remainder -= d;
+            quotient++;
+        }
+        if (((b >> bit) & 1u) != 0) {
+            remainder += a;  // below 2 * d
+            if (remainder >= d) {
+                remainder -= d;
+                quotient++;
+            }
+        }
+    }
+    return quotient + (remainder != 0 ? 1 : 0);
+}
+
+// The same, with a 128-bit product where the compiler has one (GCC and Clang on 64-bit targets). The condition is a
+// property of the target, not of the language level: it is the same in every unit of a program built for one
+// target, and both bodies compute the same exact value.
+#if defined(__SIZEOF_INT128__)
+constexpr std::uintmax_t mul_div_ceil(std::uintmax_t a, std::uintmax_t b, std::uintmax_t d) noexcept {
+    __extension__ typedef unsigned __int128 wide;
+    const wide product = static_cast<wide>(a) * static_cast<wide>(b);
+    return static_cast<std::uintmax_t>(product / d + (product % d != 0 ? 1 : 0));
+}
+#else
+constexpr std::uintmax_t mul_div_ceil(std::uintmax_t a, std::uintmax_t b, std::uintmax_t d) noexcept {
+    return mul_div_ceil_portable(a, b, d);
+}
+#endif
+
 // `d` in whole nanoseconds, rounded up, as an Int (std::int64_t or std::uint64_t): 0 for a zero, negative or NaN
 // duration (callers for which that is wrong reject those first), and the largest Int for a duration that does not
-// fit. Integral counts are converted exactly. Floating-point ones are compared, before the cast, with 2^63 or 2^64,
-// the first value Int cannot hold.
+// fit. Integral counts are converted exactly, for every period, in integer arithmetic. Floating-point ones are
+// compared, before the cast, with 2^63 or 2^64, the first value Int cannot hold.
 template <class Int, class Rep, class Period>
 constexpr Int ceil_ns(std::chrono::duration<Rep, Period> d) noexcept {
     static_assert(std::is_same_v<Int, std::int64_t> || std::is_same_v<Int, std::uint64_t>, "an int64 or uint64");
@@ -531,15 +580,12 @@ constexpr Int ceil_ns(std::chrono::duration<Rep, Period> d) noexcept {
         const U rest = count % den;
         if (whole > ucap / num) return cap;
         const U ns = whole * num;
-        U extra = 0;  // rest * num / den, rounded up; at most num
+        U extra = 0;  // rest * num / den, rounded up, exactly; at most num, and at least 1 (rest > 0)
         if (rest != 0) {
             if constexpr (num <= std::numeric_limits<U>::max() / den) {
                 extra = rest * num / den + (rest * num % den != 0 ? 1 : 0);
-            } else {  // a ratio too wide for exact arithmetic
-                const long double x = static_cast<long double>(rest) * static_cast<long double>(num) /
-                                      static_cast<long double>(den);
-                extra = static_cast<U>(x);
-                if (static_cast<long double>(extra) < x) extra++;
+            } else {  // rest * num can exceed 64 bits
+                extra = mul_div_ceil(rest, num, den);
             }
         }
         if (ns > ucap - extra) return cap;
@@ -586,6 +632,24 @@ private:
 inline constexpr Timeout no_wait{};
 inline constexpr Timeout::Forever wait_forever{};
 
+// Whether new_record() may keep a pointer into an rvalue of the byte range T: true only for views, whose bytes live
+// elsewhere and outlive the view (ADR 0036 -> Records). true for std::basic_string_view and, where the standard
+// library has it, std::span; false for everything else, including std::string, std::vector and std::array, which own
+// their bytes. Specialise it for a view type of your own (cv-unqualified, at namespace scope):
+//
+//     template <> inline constexpr bool tickertape::enable_borrowed_bytes<MyView> = true;
+//
+// It is the binding's own opt-in, the same at every language level; std::ranges::enable_borrowed_range is not
+// consulted (that would make the header's definitions depend on the standard).
+template <class T>
+inline constexpr bool enable_borrowed_bytes = false;
+template <class Char, class Traits>
+inline constexpr bool enable_borrowed_bytes<std::basic_string_view<Char, Traits>> = true;
+#if __cplusplus >= 202002L && defined(__cpp_lib_span) && __cpp_lib_span >= 202002L
+template <class T, std::size_t Extent>
+inline constexpr bool enable_borrowed_bytes<std::span<T, Extent>> = true;
+#endif
+
 namespace detail {
 template <class T>
 struct is_byte : std::false_type {};
@@ -631,22 +695,49 @@ struct writable_byte_range<R, std::void_t<decltype(std::data(std::declval<R &>()
 template <class R>
 inline constexpr bool is_writable_byte_range_v = writable_byte_range<std::remove_reference_t<R>>::value;
 
-// The range types new_record() accepts as rvalues: views, whose bytes outlive them (ADR 0036 -> Records).
+// Whether new_record() accepts an rvalue of R: true for views, whose bytes outlive them (see enable_borrowed_bytes).
 template <class R>
-struct byte_view : std::false_type {};
-template <class Char, class Traits>
-struct byte_view<std::basic_string_view<Char, Traits>> : std::true_type {};
-#if __cplusplus >= 202002L && defined(__cpp_lib_span) && __cpp_lib_span >= 202002L
-template <class T, std::size_t Extent>
-struct byte_view<std::span<T, Extent>> : std::true_type {};
-#endif
-template <class R>
-inline constexpr bool is_byte_view_v = byte_view<std::remove_cv_t<std::remove_reference_t<R>>>::value
-#if __cplusplus >= 202002L && defined(__cpp_lib_ranges) && __cpp_lib_ranges >= 201911L
-                                       // C++20: also a type of yours that opts into std::ranges::enable_borrowed_range
-                                       || std::ranges::enable_borrowed_range<std::remove_cv_t<std::remove_reference_t<R>>>
-#endif
-    ;
+inline constexpr bool is_byte_view_v = enable_borrowed_bytes<std::remove_cv_t<std::remove_reference_t<R>>>;
+
+// An owned array of `size` value-initialised T (none for 0), allocated with new[] (which can throw std::bad_alloc),
+// freed by the destructor; move-only and pointer-sized, like std::unique_ptr<T[]>. The header holds the C structs
+// (and the bytes) it owns in this rather than in std::vector or std::unique_ptr: those, instantiated with a C struct,
+// would be one standard-library symbol shared by both exception modes, so the linker could keep the copy built
+// without exceptions for the whole program, and a std::bad_alloc passing through it would end the process. Declared
+// here, in the mode-specific namespace, each mode has its own copy (ADR 0036 -> Mixing modes).
+template <class T>
+class Array {
+public:
+    Array() noexcept = default;
+    explicit Array(std::size_t size) : p_(size != 0 ? new T[size]() : nullptr) {}
+    Array(Array &&other) noexcept : p_(other.p_) { other.p_ = nullptr; }
+    Array &operator=(Array &&other) noexcept {
+        if (this != &other) {
+            delete[] p_;
+            p_ = other.p_;
+            other.p_ = nullptr;
+        }
+        return *this;
+    }
+    Array(const Array &) = delete;
+    Array &operator=(const Array &) = delete;
+    ~Array() { delete[] p_; }
+
+    T *get() const noexcept { return p_; }
+    T &operator[](std::size_t index) const noexcept { return p_[index]; }
+
+private:
+    T *p_ = nullptr;
+};
+
+// Empties a C handle and returns its old value (std::exchange, without a standard-library instantiation over a C
+// type that both exception modes would share).
+template <class T>
+T *take_handle(T *&handle) noexcept {
+    T *old = handle;
+    handle = nullptr;
+    return old;
+}
 
 // A duration in whole nanoseconds for the C ABI, rounded up: negative and NaN durations are 0 (callers for which
 // that is wrong reject them first); integral counts are exact; a duration longer than UINT64_MAX nanoseconds is
@@ -688,11 +779,11 @@ public:
         }
     }
     Retention(Retention &&other) noexcept
-        : h_(std::exchange(other.h_, nullptr)), error_(std::exchange(other.error_, std::nullopt)) {}
+        : h_(detail::take_handle(other.h_)), error_(std::exchange(other.error_, std::nullopt)) {}
     Retention &operator=(Retention &&other) noexcept {
         if (this != &other) {
             if (h_ != nullptr) tickertape_retention_free(h_);
-            h_ = std::exchange(other.h_, nullptr);
+            h_ = detail::take_handle(other.h_);
             error_ = std::exchange(other.error_, std::nullopt);
         }
         return *this;
@@ -768,11 +859,11 @@ public:
         }
     }
     WriterOptions(WriterOptions &&other) noexcept
-        : h_(std::exchange(other.h_, nullptr)), error_(std::exchange(other.error_, std::nullopt)) {}
+        : h_(detail::take_handle(other.h_)), error_(std::exchange(other.error_, std::nullopt)) {}
     WriterOptions &operator=(WriterOptions &&other) noexcept {
         if (this != &other) {
             if (h_ != nullptr) tickertape_writer_options_free(h_);
-            h_ = std::exchange(other.h_, nullptr);
+            h_ = detail::take_handle(other.h_);
             error_ = std::exchange(other.error_, std::nullopt);
         }
         return *this;
@@ -846,11 +937,11 @@ public:
         }
     }
     ReaderOptions(ReaderOptions &&other) noexcept
-        : h_(std::exchange(other.h_, nullptr)), error_(std::exchange(other.error_, std::nullopt)) {}
+        : h_(detail::take_handle(other.h_)), error_(std::exchange(other.error_, std::nullopt)) {}
     ReaderOptions &operator=(ReaderOptions &&other) noexcept {
         if (this != &other) {
             if (h_ != nullptr) tickertape_reader_options_free(h_);
-            h_ = std::exchange(other.h_, nullptr);
+            h_ = detail::take_handle(other.h_);
             error_ = std::exchange(other.error_, std::nullopt);
         }
         return *this;
@@ -928,8 +1019,8 @@ inline NewRecord new_record(std::uint32_t schema_id, std::uint64_t venue_ts_ns, 
 // record keeps a pointer, a temporary that owns its bytes (`std::to_string(i) + "..."`, a std::vector or std::array
 // returned by a function) would leave it pointing into freed memory at the end of the statement: for those the
 // overload below is deleted. Accepted: an lvalue (a named object) of any byte range, and an rvalue of a view type,
-// whose bytes live elsewhere: std::basic_string_view, std::span and, in C++20, any type for which
-// std::ranges::enable_borrowed_range is true (your own view types can opt in).
+// whose bytes live elsewhere: a type for which enable_borrowed_bytes is true (std::basic_string_view, std::span, and
+// your own view types if you specialise it).
 template <class Bytes, std::enable_if_t<detail::is_byte_range_v<Bytes> &&
                                             (std::is_lvalue_reference_v<Bytes> || detail::is_byte_view_v<Bytes>),
                                         int> = 0>
@@ -1045,8 +1136,8 @@ public:
     };
 
     RecordBatch(std::size_t max_records, std::size_t buffer_bytes)
-        : records_(max_records ? std::make_unique<tickertape_record[]>(max_records) : nullptr),
-          buffer_(buffer_bytes ? std::make_unique<std::uint8_t[]>(buffer_bytes) : nullptr),
+        : records_(max_records),
+          buffer_(buffer_bytes),
           capacity_(max_records),
           buffer_size_(buffer_bytes) {}
     RecordBatch(RecordBatch &&other) noexcept
@@ -1088,8 +1179,8 @@ public:
 
 private:
     friend class Reader;
-    std::unique_ptr<tickertape_record[]> records_;
-    std::unique_ptr<std::uint8_t[]> buffer_;
+    detail::Array<tickertape_record> records_;
+    detail::Array<std::uint8_t> buffer_;
     std::size_t capacity_;
     std::size_t buffer_size_;
     std::size_t count_ = 0;
@@ -1138,14 +1229,14 @@ public:
     // An empty writer; calls on it fail with Status::invalid_argument.
     Writer() noexcept = default;
     Writer(Writer &&other) noexcept
-        : h_(std::exchange(other.h_, nullptr)), frame_(std::exchange(other.frame_, nullptr)) {
+        : h_(detail::take_handle(other.h_)), frame_(detail::take_handle(other.frame_)) {
         if (frame_ != nullptr) frame_->owner = this;
     }
     Writer &operator=(Writer &&other) noexcept {
         if (this != &other) {
             release();
-            h_ = std::exchange(other.h_, nullptr);
-            frame_ = std::exchange(other.frame_, nullptr);
+            h_ = detail::take_handle(other.h_);
+            frame_ = detail::take_handle(other.frame_);
             if (frame_ != nullptr) frame_->owner = this;
         }
         return *this;
@@ -1372,11 +1463,11 @@ class Reader {
 public:
     // An empty reader; calls on it fail with Status::invalid_argument.
     Reader() noexcept = default;
-    Reader(Reader &&other) noexcept : h_(std::exchange(other.h_, nullptr)) { other.generation_++; }
+    Reader(Reader &&other) noexcept : h_(detail::take_handle(other.h_)) { other.generation_++; }
     Reader &operator=(Reader &&other) noexcept {
         if (this != &other) {
             (void)tickertape_reader_close(h_);
-            h_ = std::exchange(other.h_, nullptr);
+            h_ = detail::take_handle(other.h_);
             generation_++;
             other.generation_++;
         }
@@ -1489,7 +1580,7 @@ public:
     // Closes the reader now and reports the close's status; the reader is empty afterwards.
     result<void> close() {
         generation_++;
-        const tickertape_status status = tickertape_reader_close(std::exchange(h_, nullptr));
+        const tickertape_status status = tickertape_reader_close(detail::take_handle(h_));
         return detail::status_to_result(status);
     }
 
@@ -1582,22 +1673,24 @@ inline result<VerifyReport> verify(const detail::PathArg &dir) {
 inline result<std::vector<SegmentInfo>> list_segments(const detail::PathArg &dir) {
     if (auto compatible = check_library(); !compatible) return detail::take_error(std::move(compatible));
     if (auto checked = dir.check(); !checked) return detail::take_error(std::move(checked));
-    std::vector<tickertape_segment_info> raw;
+    // The C structs go in the binding's own buffer, not a std::vector<tickertape_segment_info> (see detail::Array).
+    detail::Array<tickertape_segment_info> raw;
+    std::size_t count = 0;
     // The list can grow between the two calls while a writer is active; retry a few times.
     for (int attempt = 0;; attempt++) {
-        std::size_t count = 0;
         tickertape_status status = tickertape_list_segments(dir.c_str(), nullptr, 0, &count);
         if (status < 0) return Error::from_last_call(status);
-        raw.resize(count + 4);
-        status = tickertape_list_segments(dir.c_str(), raw.data(), raw.size(), &count);
+        const std::size_t room = count + 4;
+        raw = detail::Array<tickertape_segment_info>(room);
+        status = tickertape_list_segments(dir.c_str(), raw.get(), room, &count);
         if (status == TICKERTAPE_E_BUFFER_TOO_SMALL && attempt < 8) continue;
         if (status < 0) return Error::from_last_call(status);
-        raw.resize(count);
         break;
     }
     std::vector<SegmentInfo> segments;
-    segments.reserve(raw.size());
-    for (const tickertape_segment_info &s : raw) {
+    segments.reserve(count);
+    for (std::size_t i = 0; i < count; i++) {
+        const tickertape_segment_info &s = raw[i];
         segments.push_back(SegmentInfo{s.base_seq, s.segment_size, s.created_unix_ns, s.format_version});
     }
     return segments;
