@@ -758,17 +758,16 @@ impl Recovery<'_> {
             .map_err(|e| Error::io("read checkpoint marker", &path, e))?;
         let checkpoint = format::decode_checkpoint(&contents);
         if len < format::CHECKPOINT_FILE_LEN as u64 {
-            let modified = existed
-                .then(|| file.metadata().and_then(|m| m.modified()).ok())
-                .flatten();
             // Preallocated, not sparse, so that writing a slot never needs new blocks (a full disk must not make
             // checkpoints fail).
             mmap::preallocate(&file, format::CHECKPOINT_FILE_LEN as u64)
                 .map_err(|e| Error::io("create checkpoint marker", &path, e))?;
-            // Extending the file is not a checkpoint: keep the modification time that observers read as the time of
-            // the last checkpoint (ADR 0032). Best effort; the time is informational.
-            if let Some(modified) = modified {
-                let _ = file.set_modified(modified);
+            // Observers read the marker's modification time as the time of the last checkpoint (ADR 0032). A short
+            // marker's time is when it was cut, not a checkpoint's, and neither is the time of this extension: set it
+            // to the Unix epoch, which observers report as an unknown age until the next checkpoint writes a slot.
+            // Best effort; the time is informational.
+            if existed {
+                let _ = file.set_modified(std::time::UNIX_EPOCH);
             }
             mmap::sync_data(&file).map_err(|e| Error::io("sync checkpoint marker", &path, e))?;
         }

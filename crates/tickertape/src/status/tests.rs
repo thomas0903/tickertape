@@ -237,32 +237,48 @@ fn unreliable_checkpoint_times_are_unknown() {
     assert!(s.breaches(&t).is_empty());
 }
 
-/// Finding 12: a writer that extends a short marker at open doesn't refresh its modification time (that isn't a
-/// checkpoint).
+/// Finding 12, round 2 B4: a writer that extends a short marker at open doesn't make its age look known. The cut set
+/// the marker's modification time to the time of the cut (not a checkpoint's); the writer extends the marker and
+/// sets its time to the epoch, so the age stays unknown (and the threshold breached) until the next checkpoint.
 #[test]
-fn reopening_with_a_short_marker_keeps_its_time() {
+fn reopening_with_a_short_marker_keeps_the_age_unknown() {
     let dir = tempfile::tempdir().unwrap();
     let mut writer = Writer::open(dir.path(), config()).unwrap();
     append(&mut writer, 2, 10, 0);
     writer.checkpoint().unwrap();
+    // Generation 2 in the slot at offset 0, which survives the cut; one record uncovered.
     writer.checkpoint().unwrap();
+    append(&mut writer, 1, 10, 0);
     drop(writer);
     backdate_checkpoint(dir.path(), 0, 3 * HOUR);
-    let file = marker(dir.path());
-    let old = file.metadata().unwrap().modified().unwrap();
-    file.set_len(4096).unwrap();
-    file.set_modified(old).unwrap();
-    drop(file);
-    drop(Writer::open(dir.path(), config()).unwrap());
+    let t = Thresholds::default().max_checkpoint_age(HOUR);
+    // The cut refreshes the modification time, as truncating a file does.
+    marker(dir.path()).set_len(4096).unwrap();
+    let s = status(dir.path()).unwrap();
+    assert_eq!(
+        s.checkpoint.unwrap().age_unknown,
+        Some(AgeUnknown::MarkerResized)
+    );
+    assert_eq!(s.breaches(&t), vec![Breach::CheckpointAge]);
+
+    let mut writer = Writer::open(dir.path(), config()).unwrap();
     let meta = fs::metadata(dir.path().join("checkpoint")).unwrap();
     assert_eq!(meta.len(), format::CHECKPOINT_FILE_LEN as u64);
-    let modified = meta.modified().unwrap();
-    assert!(
-        modified <= old + Duration::from_secs(1),
-        "the marker's time was refreshed"
-    );
     let s = status(dir.path()).unwrap();
-    assert!(s.checkpoint.unwrap().estimated_age.unwrap() >= 2 * HOUR);
+    let c = s.checkpoint.unwrap();
+    assert_eq!(c.marker.generation, 2);
+    assert_eq!(c.estimated_age, None);
+    assert_eq!(c.age_unknown, Some(AgeUnknown::MarkerExtended));
+    assert_eq!(s.exposure.records, Some(1));
+    assert_eq!(s.breaches(&t), vec![Breach::CheckpointAge]);
+
+    // The next checkpoint makes the age known again.
+    append(&mut writer, 1, 10, 0);
+    writer.checkpoint().unwrap();
+    append(&mut writer, 1, 10, 0);
+    let s = status(dir.path()).unwrap();
+    assert!(s.checkpoint.unwrap().estimated_age.unwrap() < HOUR);
+    assert!(s.breaches(&t).is_empty());
 }
 
 #[test]
@@ -372,6 +388,10 @@ fn missing_middle_segment_is_unverified() {
     assert!(!s.head.verified);
     assert!(!s.exposure.verified);
     assert_eq!(s.checkpoint.unwrap().problem, None);
+    // Round 2, B2: not provable from the listing (the gap fits what a segment can hold), so not a breach: the sample
+    // is unverified, which callers must not read as "the writer would open it".
+    assert!(!s.head.chain_broken);
+    assert!(s.breaches(&Thresholds::default()).is_empty());
 }
 
 #[test]
@@ -499,6 +519,7 @@ fn time_to_full_of_a_sealed_head() {
         end: HeadEnd::Open,
         last_local_ts_ns: None,
         verified: true,
+        chain_broken: false,
     };
     let open = storage(dir.path(), &head, Some(rates)).unwrap();
     head.end = HeadEnd::Sealed;
@@ -660,6 +681,228 @@ fn sampler_does_not_cache_a_failed_lookup() {
         sampler.sample().unwrap().exposure.oldest_local_ts_ns,
         Some(2)
     );
+}
+
+/// Round 2, B3 (a): a segment overwritten in place by an older snapshot of itself (same inode, size and header, as
+/// ext4 gives a restored copy) is not resumed: the last record the sampler passed is gone, so it rescans and reports
+/// what a fresh sample reports.
+#[test]
+fn sampler_rescans_a_snapshot_restored_in_place() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut writer = Writer::open(dir.path(), config()).unwrap();
+    append(&mut writer, 2, 10, 0);
+    let path = journal::segment_path(dir.path(), 0);
+    let snapshot = fs::read(&path).unwrap();
+    append(&mut writer, 4, 10, 0);
+    drop(writer);
+    let mut sampler = Sampler::new(dir.path());
+    let first = sampler.sample().unwrap();
+    assert_eq!(first.head.position.next_seq, 6);
+    assert!(first.head.verified);
+    let ino = fs::metadata(&path).unwrap().ino();
+    File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .write_all_at(&snapshot, 0)
+        .unwrap();
+    assert_eq!(fs::metadata(&path).unwrap().ino(), ino);
+    let s = sampler.sample().unwrap();
+    let fresh = status(dir.path()).unwrap();
+    assert_eq!(fresh.head.position.next_seq, 2);
+    assert_eq!(s.head, fresh.head);
+    assert_eq!(s.rates, None, "the history changed under the sampler");
+}
+
+/// Writes a journal whose checkpoint is at the end of segment 0, so the oldest uncovered record is the first of
+/// segment `per`, reached by following the seal; its timestamp is `ts`.
+fn checkpoint_at_a_seal(dir: &Path, ts: u64) -> u64 {
+    let per = records_per_segment(1000);
+    let mut writer = Writer::open(dir, config()).unwrap();
+    append(&mut writer, per, 1000, 1);
+    writer.checkpoint().unwrap();
+    append(&mut writer, 2, 1000, ts);
+    per
+}
+
+/// Round 2, B3 (b): the oldest uncovered record's timestamp, found by following a seal into the next segment, is not
+/// carried over when that segment is replaced: it is looked up in every sample.
+#[test]
+fn sampler_follows_a_replaced_successor() {
+    let dir = tempfile::tempdir().unwrap();
+    let per = checkpoint_at_a_seal(dir.path(), 2);
+    let other = tempfile::tempdir().unwrap();
+    checkpoint_at_a_seal(other.path(), 99);
+    let mut sampler = Sampler::new(dir.path());
+    let s = sampler.sample().unwrap();
+    assert_eq!(s.checkpoint.unwrap().marker.segment_base_seq, 0);
+    assert_eq!(s.head.position.segment_base_seq, per);
+    assert_eq!(s.exposure.oldest_local_ts_ns, Some(2));
+    // Replace segment `per` by one whose records carry timestamp 99 (as recovery replaces a segment it repairs).
+    fs::rename(
+        journal::segment_path(other.path(), per),
+        journal::segment_path(dir.path(), per),
+    )
+    .unwrap();
+    assert_eq!(
+        status(dir.path()).unwrap().exposure.oldest_local_ts_ns,
+        Some(99)
+    );
+    assert_eq!(
+        sampler.sample().unwrap().exposure.oldest_local_ts_ns,
+        Some(99)
+    );
+}
+
+/// Round 2, B3 (c): a checkpoint marker that moved to a position the sampler's earlier scans passed is checked there
+/// before the sampler resumes. One that isn't a record boundary with its sequence number is reported as a fresh
+/// sample reports it (corruption), never as verified and healthy.
+#[test]
+fn sampler_checks_a_marker_that_moved_behind_its_head() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut writer = Writer::open(dir.path(), config()).unwrap();
+    append(&mut writer, 6, 10, 0);
+    drop(writer);
+    let mut sampler = Sampler::new(dir.path());
+    let first = sampler.sample().unwrap();
+    assert!(first.head.verified);
+    assert_eq!(first.checkpoint, None);
+    // A marker into the middle of record 1, aligned, inside the area the sampler scanned.
+    let slot = CheckpointSlot {
+        generation: 5,
+        next_seq: 3,
+        segment_base_seq: 0,
+        offset: 64 + frame(10) + 8,
+    };
+    marker(dir.path())
+        .write_all_at(&format::encode_checkpoint_slot(&slot), 65_536)
+        .unwrap();
+    let fresh = status(dir.path()).unwrap();
+    assert!(
+        matches!(fresh.head.end, HeadEnd::Invalid(_)),
+        "{:?}",
+        fresh.head
+    );
+    let s = sampler.sample().unwrap();
+    assert_eq!(s.head, fresh.head);
+    assert_eq!(
+        s.breaches(&Thresholds::default()),
+        vec![Breach::HeadInvalid]
+    );
+
+    // A marker that moved to a real record boundary behind the head is accepted, and the sampler resumes.
+    let dir = tempfile::tempdir().unwrap();
+    let mut writer = Writer::open(dir.path(), config()).unwrap();
+    append(&mut writer, 6, 10, 0);
+    drop(writer);
+    let mut sampler = Sampler::new(dir.path());
+    sampler.sample().unwrap();
+    let slot = CheckpointSlot {
+        generation: 1,
+        next_seq: 2,
+        segment_base_seq: 0,
+        offset: 64 + 2 * frame(10),
+    };
+    marker(dir.path())
+        .write_all_at(&format::encode_checkpoint_slot(&slot), 65_536)
+        .unwrap();
+    let s = sampler.sample().unwrap();
+    assert_eq!(s.head.position.next_seq, 6);
+    assert!(s.head.verified);
+    assert_eq!(s.exposure.records, Some(4));
+}
+
+/// Round 2, B1: a checkpoint segment that the listing showed but that is gone when it is opened (retention removed it
+/// after the marker moved on) is not reported as a dangling marker: the error makes the sampler retry with a fresh
+/// listing and marker.
+#[test]
+fn checkpoint_segment_gone_after_the_listing_is_retried() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut writer = Writer::open(dir.path(), config()).unwrap();
+    let per = records_per_segment(1000);
+    append(&mut writer, per + 2, 1000, 0);
+    writer.checkpoint().unwrap();
+    append(&mut writer, per, 1000, 0);
+    drop(writer);
+    let files = list_files(dir.path()).unwrap();
+    let marker = read_marker(dir.path()).unwrap().unwrap();
+    let c = marker.slot.unwrap();
+    assert_eq!(c.segment_base_seq, per);
+    fs::remove_file(journal::segment_path(dir.path(), per)).unwrap();
+    let mut open = OpenSegments::default();
+    let result = checkpoint_status(dir.path(), &files, &mut open, c, &marker, 0);
+    assert!(
+        matches!(&result, Err(Error::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound),
+        "{result:?}"
+    );
+}
+
+/// Round 2, B2: with every segment gone and a valid marker, the sample reports a dangling checkpoint (corruption, as
+/// the writer reports it), not a missing journal.
+#[test]
+fn checkpoint_without_segments_is_dangling() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut writer = Writer::open(dir.path(), config()).unwrap();
+    append(&mut writer, 3, 10, 0);
+    writer.checkpoint().unwrap();
+    drop(writer);
+    fs::remove_file(journal::segment_path(dir.path(), 0)).unwrap();
+    let err = Writer::open(dir.path(), config()).unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            Error::Corrupt {
+                reason: CorruptReason::DanglingCheckpoint(0),
+                ..
+            }
+        ),
+        "{err}"
+    );
+    let err = status(dir.path()).unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            Error::Corrupt {
+                reason: CorruptReason::DanglingCheckpoint(0),
+                ..
+            }
+        ),
+        "{err}"
+    );
+}
+
+/// Round 2, B2: a segment the listing proves missing (the next segment's base is beyond what the checkpoint's segment
+/// can hold) is a corruption breach, consistent with `verify`, and no exposure is summed across it.
+#[test]
+fn provably_missing_segment_is_corruption() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut writer = Writer::open(dir.path(), config()).unwrap();
+    append(&mut writer, 3, 10, 0);
+    writer.checkpoint().unwrap();
+    append(&mut writer, 2, 10, 0);
+    drop(writer);
+    // A valid, empty newest segment far beyond what segment 0 can hold (at most (SEG - 72) / 40 records).
+    let base = 1_000_000;
+    let header = SegmentHeader {
+        segment_size: SEG,
+        base_seq: base,
+        created_unix_ns: crate::clock::realtime_ns(),
+    };
+    let path = journal::segment_path(dir.path(), base);
+    let file = File::create(&path).unwrap();
+    file.set_len(SEG).unwrap();
+    file.write_all_at(&format::encode_segment_header(&header), 0)
+        .unwrap();
+    let report = crate::inspect::verify(dir.path()).unwrap();
+    assert!(!report.problems.is_empty(), "verify agrees");
+    let s = status(dir.path()).unwrap();
+    assert!(s.head.chain_broken);
+    assert!(!s.head.verified);
+    assert_eq!(s.exposure.records, None);
+    assert_eq!(s.exposure.bytes, None);
+    let breaches = s.breaches(&Thresholds::default());
+    assert_eq!(breaches, vec![Breach::ChainBroken]);
+    assert!(breaches[0].is_corruption());
 }
 
 #[test]
@@ -1224,6 +1467,110 @@ fn beacon_update_is_rate_limited() {
     let report = status(dir.path()).unwrap().readers[0].report.unwrap();
     assert!(report.seek_pending);
     assert_eq!(report.next_seq, 4);
+    // Round 2, B5: a pending seek whose cursor moves while its target (and so `Reader::position`) stays the same
+    // (here it skips the records on its way to a target not written yet) is published: the whole cursor is compared.
+    reader.seek(10).unwrap();
+    assert!(beacon.update(&reader).unwrap());
+    assert_eq!(
+        status(dir.path()).unwrap().readers[0]
+            .report
+            .unwrap()
+            .position
+            .next_seq,
+        0
+    );
+    assert!(reader.try_next().unwrap().is_none());
+    assert_eq!(reader.position(), 10);
+    assert!(beacon.update(&reader).unwrap(), "the cursor moved");
+    let report = status(dir.path()).unwrap().readers[0].report.unwrap();
+    assert_eq!(report.next_seq, 10);
+    assert_eq!(report.position.next_seq, 5);
+    assert!(report.seek_pending);
+    assert!(!beacon.update(&reader).unwrap(), "nothing moved");
+}
+
+/// Round 2, B6: an unread record whose timestamp is later than the observer's clock gives an unknown unread age, not
+/// zero.
+#[test]
+fn unread_age_of_a_future_timestamp_is_unknown() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut writer = Writer::open(dir.path(), config()).unwrap();
+    let future = crate::clock::realtime_ns() + u64::try_from(HOUR.as_nanos()).unwrap();
+    append(&mut writer, 3, 10, future);
+    let reader = Reader::open(dir.path(), ReaderConfig::default()).unwrap();
+    let _beacon = ReaderBeacon::create(dir.path(), "r", &reader).unwrap();
+    let s = status(dir.path()).unwrap();
+    let r = &s.readers[0];
+    assert_eq!(r.lag.unwrap().records, 3);
+    assert_eq!(r.oldest_unread_local_ts_ns, Some(future));
+    assert_eq!(r.unread_age, None);
+}
+
+/// Round 2, B6: the sample's clock is read after the beacons, so a beacon written while the sample runs has an update
+/// age rather than one "in the future".
+#[cfg(feature = "fault-injection")]
+#[test]
+fn a_beacon_written_during_the_sample_has_an_update_age() {
+    use crate::fault::{Pause, on_pause};
+    let dir = tempfile::tempdir().unwrap();
+    let mut writer = Writer::open(dir.path(), config()).unwrap();
+    append(&mut writer, 3, 10, 0);
+    let mut reader = Reader::open(dir.path(), ReaderConfig::default()).unwrap();
+    let mut beacon = ReaderBeacon::create(dir.path(), "r", &reader).unwrap();
+    let mut written = false;
+    on_pause(Some(Box::new(move |p| {
+        if p == Pause::ObserverOpened && !written {
+            written = true;
+            // Later than anything the sample read before the beacons.
+            std::thread::sleep(Duration::from_millis(2));
+            reader.try_next().unwrap().unwrap();
+            beacon.flush(&reader).unwrap();
+        }
+    })));
+    let s = status(dir.path());
+    on_pause(None);
+    let s = s.unwrap();
+    assert_eq!(
+        s.readers[0].report.unwrap().next_seq,
+        1,
+        "the observer read the new write"
+    );
+    assert!(s.readers[0].update_age.is_some());
+    assert!(s.readers[0].report.unwrap().updated_unix_ns <= s.sampled_unix_ns);
+}
+
+/// Round 2, B7: a beacon whose name is replaced during every attempt to observe it is reported as `changing`, with
+/// no contents and no lag (what was seen belongs to files that no longer hold the name).
+#[cfg(feature = "fault-injection")]
+#[test]
+fn a_beacon_replaced_during_every_observation_is_changing() {
+    use crate::fault::{Pause, on_pause};
+    let dir = tempfile::tempdir().unwrap();
+    let mut writer = Writer::open(dir.path(), config()).unwrap();
+    append(&mut writer, 3, 10, 0);
+    let reader = Reader::open(dir.path(), ReaderConfig::default()).unwrap();
+    let journal = dir.path().to_path_buf();
+    let mut beacon = Some(ReaderBeacon::create(dir.path(), "r", &reader).unwrap());
+    on_pause(Some(Box::new(move |p| {
+        if p == Pause::ObserverRead {
+            // The observer holds the old file open, so the new one gets another inode.
+            drop(beacon.take());
+            beacon = Some(ReaderBeacon::create(&journal, "r", &reader).unwrap());
+        }
+    })));
+    let s = status(dir.path());
+    on_pause(None);
+    let s = s.unwrap();
+    assert_eq!(s.readers.len(), 1);
+    let r = &s.readers[0];
+    assert_eq!(r.state, BeaconState::Changing);
+    assert_eq!(r.report, None);
+    assert_eq!(r.lag, None);
+    assert_eq!(r.lag_unknown, None);
+    assert!(
+        s.breaches(&Thresholds::default().max_reader_lag(0))
+            .is_empty()
+    );
 }
 
 #[test]

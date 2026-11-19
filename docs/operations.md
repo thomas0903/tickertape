@@ -140,13 +140,16 @@ journal, and every file is opened non-blocking, so a FIFO or device in the journ
 `None` (Rust), usually with a reason. Values that are estimates are named `estimated_*`: the checkpoint's age, the
 exposure's age, rolls left and time to full. A sample reads only the newest segment, so when the checkpoint is in an
 older segment it can't see a missing or damaged segment in between: `head.verified` and `exposure.verified` are then
-false, and the head and exposure are what the newest segment implies. `tickertape verify` checks everything.
+false, and the head and exposure are what the newest segment implies. A healthy verdict is then "healthy as far as
+the sample can tell" (`health ok (unverified)`), not a promise that the writer would open the journal. A break the
+sample does see (the head at invalid bytes, a marker the writer refuses, a segment the listing proves missing) is
+reported as corruption. `tickertape verify` checks everything.
 
 ### What to alert on
 
 | Signal | Why it matters | Suggested alert |
 |---|---|---|
-| **Corruption** (`tickertape_corrupt`; exit code 2) | The head is at bytes that fail validation (seen after a power loss or storage corruption, until the next writer repairs them; C8, C11), or the checkpoint marker points to a missing segment or an impossible offset, so the writer refuses to open the journal | Page |
+| **Corruption** (`tickertape_corrupt`; exit code 2) | The head is at bytes that fail validation (seen after a power loss or storage corruption, until the next writer repairs them; C8, C11), the checkpoint marker points to a missing segment or an impossible offset, or the segment listing proves a segment missing between the checkpoint and the head, so the writer refuses to open the journal | Page |
 | **Exposure age** (`exposure.estimated_age`, `tickertape_exposure_estimated_age_seconds`; CLI `--max-checkpoint-age`) | Everything after the last successful checkpoint may be lost in a power loss, and its sequence numbers reused (crash contract C7, C8). The exposure age is an upper bound on how far back that loss reaches: zero when every record is covered, otherwise the checkpoint's estimated age. It is unknown (and `--max-checkpoint-age` is breached) when records are uncovered and there is no checkpoint or its time is unreliable | Warn above 3× your checkpoint interval, page above 10×; alert on `absent(tickertape_exposure_estimated_age_seconds)` too |
 | **Checkpoint errors** (`Writer::metrics().poisoned`, or `checkpoint()` returning an error) | After a failed checkpoint, durability can't be guaranteed for this writer, and later checkpoints fail (C12, "Errors are sticky"). The marker then stops moving, so the exposure age grows too | Page on the first error. Only the writer process can see this directly |
 | **Storage headroom** (`storage.available_bytes`, `estimated_rolls_left`; `--min-headroom`, `--min-headroom-segments`) | Writes into the active segment need no new space, but the next roll needs a whole segment; when it can't get one, `append` fails with a storage-full error (C9). **On btrfs** a full volume can kill the writer with `SIGBUS` even inside the active segment (C10), so the rolls estimate is optimistic there; on APFS a checkpoint on a full volume fails and poisons the writer. A prepared spare segment is reported (`spare_segment`) but not counted, since publishing it can still fail | Warn below a day's worth of segments at your peak rate (or use `predict_linear` on `tickertape_storage_available_bytes`), page below 2 rolls. Keep a larger margin on btrfs |

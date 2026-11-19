@@ -72,7 +72,9 @@ mod paused {
 /// reaches until it is removed.
 #[cfg(feature = "fault-injection")]
 pub fn on_pause(hook: Option<Box<dyn FnMut(Pause)>>) {
-    paused::HOOK.with(|h| *h.borrow_mut() = hook);
+    // The old hook is dropped after the borrow ends: dropping what it owns (a beacon, say) may reach a pause point.
+    let old = paused::HOOK.with(|h| std::mem::replace(&mut *h.borrow_mut(), hook));
+    drop(old);
 }
 
 /// Called by the beacon protocol at each pause point.

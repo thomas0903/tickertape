@@ -22,7 +22,7 @@ const CORRUPT: u8 = 2;
 /// Version of the JSON object; bumped when a field is removed or changes meaning (adding fields doesn't bump it).
 const SCHEMA_VERSION: u32 = 1;
 
-pub(crate) const HELP: &str = "Samples the journal without taking the writer lock or writing to it: the writer's head, the checkpoint and what a power loss would remove now (exposure), space left on the volume, the writer process, and readers that publish a beacon (tickertape::status::ReaderBeacon) in <DIR>/readers or --readers-dir. Values a sample can't establish are null; estimates are named estimated_*. head.verified and exposure.verified say whether the sample validated the records between the checkpoint and the head (it reads only the newest segment). Cost: a scan of the newest segment from the checkpoint (or its start; with --watch only what was appended since the previous sample), one stat per segment, statvfs, and a few small reads per beacon.\n\nJSON schema (schema_version 1; fields may be added): see docs/cli.md. With --watch, one object per line; a sample that fails is a line {\"schema_version\":1,\"journal\":string,\"sampled_unix_ns\":u64,\"error\":{\"code\":string,\"message\":string}} and the watch continues.\n\nPrometheus: text exposition format 0.0.4, gauges named tickertape_*, labelled journal=\"<canonical DIR>\" (and reader=\"<name>\"); tickertape_up is 0 for a failed sample and tickertape_status_timestamp_seconds always tells when the file was written; see docs/cli.md. --watch with --format prometheus needs --output.\n\nExit codes: 0 healthy (or help, or --watch finished); 1 usage, I/O or missing journal; 2 the sample found the journal corrupt (the head at invalid bytes, a checkpoint marker the writer would refuse, a damaged newest segment header) or an unsupported format, which takes precedence over 3; 3 a health threshold is breached (not with --watch, which reports health in each sample).";
+pub(crate) const HELP: &str = "Samples the journal without taking the writer lock or writing to it: the writer's head, the checkpoint and what a power loss would remove now (exposure), space left on the volume, the writer process, and readers that publish a beacon (tickertape::status::ReaderBeacon) in <DIR>/readers or --readers-dir. Values a sample can't establish are null; estimates are named estimated_*. head.verified and exposure.verified say whether the sample validated the records between the checkpoint and the head (it reads only the newest segment). Cost: a scan of the newest segment from the checkpoint (or its start; with --watch only what was appended since the previous sample), one stat per segment, statvfs, and a few small reads per beacon.\n\nJSON schema (schema_version 1; fields may be added): see docs/cli.md. With --watch, one object per line; a sample that fails is a line {\"schema_version\":1,\"journal\":string,\"sampled_unix_ns\":u64,\"error\":{\"code\":string,\"message\":string}} and the watch continues.\n\nPrometheus: text exposition format 0.0.4, gauges named tickertape_*, labelled journal=\"<canonical DIR>\" (and reader=\"<name>\"); tickertape_up is 0 for a failed sample and tickertape_status_timestamp_seconds always tells when the file was written; see docs/cli.md. --watch with --format prometheus needs --output.\n\nExit codes: 0 healthy (or help, or --watch finished); 1 usage, I/O or missing journal; 2 the sample found the journal corrupt (the head at invalid bytes, a checkpoint marker the writer would refuse, a segment the listing proves missing, a damaged newest segment header) or an unsupported format, which takes precedence over 3; 3 a health threshold is breached (not with --watch, which reports health in each sample). The sample doesn't read the segments between an older checkpoint and the head: when head.verified is false (health.verified in JSON, \"health ok (unverified)\" in text), 0 does not mean that the writer would open the journal; run verify for that.";
 
 #[derive(Debug, Args)]
 pub(crate) struct StatusArgs {
@@ -388,6 +388,7 @@ struct JsonHead {
     invalid_reason: Option<String>,
     last_local_ts_ns: Option<u64>,
     verified: bool,
+    chain_broken: bool,
 }
 
 #[derive(Serialize)]
@@ -471,6 +472,9 @@ struct JsonReader {
 struct JsonHealth {
     ok: bool,
     corrupt: bool,
+    /// False if the sample didn't validate the chain from the checkpoint to the head: `ok` then doesn't mean that
+    /// the writer would open the journal.
+    verified: bool,
     breaches: Vec<JsonBreach>,
 }
 
@@ -499,6 +503,7 @@ impl JsonStatus {
                 },
                 last_local_ts_ns: s.head.last_local_ts_ns,
                 verified: s.head.verified,
+                chain_broken: s.head.chain_broken,
             },
             segments: JsonSegments {
                 count: s.segments.count,
@@ -568,6 +573,7 @@ impl JsonStatus {
             health: JsonHealth {
                 ok: breaches.is_empty(),
                 corrupt: breaches.iter().any(Breach::is_corruption),
+                verified: s.head.verified,
                 breaches: breaches
                     .iter()
                     .map(|b| JsonBreach {
@@ -640,7 +646,9 @@ fn age_unknown_words(reason: tickertape::status::AgeUnknown) -> &'static str {
 
 // Writing to a String never fails, so the `fmt::Result`s below are ignored.
 fn render_text(out: &mut String, journal: &Path, s: &Status, breaches: &[Breach]) {
-    let unverified = if s.head.verified {
+    let unverified = if s.head.chain_broken {
+        " (chain broken: a segment between the checkpoint and the head is missing)"
+    } else if s.head.verified {
         ""
     } else {
         " (chain from the checkpoint not verified by this sample)"
@@ -771,7 +779,9 @@ fn render_text(out: &mut String, journal: &Path, s: &Status, breaches: &[Breach]
         );
     }
     if breaches.is_empty() {
-        let _ = writeln!(out, "health      ok");
+        // Unverified: the writer may still refuse the journal (a segment the sample didn't read may be missing).
+        let qualifier = if s.head.verified { "" } else { " (unverified)" };
+        let _ = writeln!(out, "health      ok{qualifier}");
     } else {
         let codes: Vec<String> = breaches.iter().map(describe).collect();
         let what = if breaches.iter().any(Breach::is_corruption) {
@@ -906,7 +916,7 @@ fn render_prometheus(
     );
     e.gauge(
         "corrupt",
-        "1 if the sample found the journal corrupt: the head at invalid bytes, or an unusable checkpoint marker.",
+        "1 if the sample found the journal corrupt: the head at invalid bytes, an unusable checkpoint marker, or a segment the listing proves missing.",
         Some(flag(breaches.iter().any(Breach::is_corruption))),
     );
     e.gauge(
@@ -921,7 +931,7 @@ fn render_prometheus(
     );
     e.gauge(
         "head_verified",
-        "1 if the sample validated every record from the checkpoint to the head.",
+        "1 if the sample validated every record from the checkpoint to the head; if 0, tickertape_healthy 1 doesn't mean the writer would open the journal.",
         Some(flag(s.head.verified)),
     );
     e.gauge("segments", "Segment files.", Some(s.segments.count));

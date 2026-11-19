@@ -483,11 +483,13 @@ fn beacon_churn_across_processes() {
                 while !stop.load(Ordering::Relaxed) {
                     let s = sampler.sample().unwrap();
                     for r in &s.readers {
+                        // `Changing`: the name was replaced during every attempt to observe it; nothing reported.
                         assert!(
-                            matches!(r.state, BeaconState::Live | BeaconState::Stale),
+                            matches!(r.state, BeaconState::Live | BeaconState::Stale)
+                                && r.report.is_some()
+                                || r.state == BeaconState::Changing && r.report.is_none(),
                             "observer saw {r:?}"
                         );
-                        assert!(r.report.is_some());
                     }
                     samples.fetch_add(1, Ordering::Relaxed);
                 }

@@ -811,8 +811,8 @@ pub(super) fn observe_all(dir: &Path) -> (BeaconDirState, Vec<Observed>) {
 }
 
 /// Observes one beacon: its contents, its file identity and its lock state, all for the same file, and checks that
-/// the name still names that file afterwards (retrying if a creator replaced it meanwhile). `None` if the name no
-/// longer exists or isn't a regular file.
+/// the name still names that file afterwards (retrying if a creator replaced it meanwhile, up to 3 attempts, then
+/// [`BeaconState::Changing`] without contents). `None` if the name no longer exists or isn't a regular file.
 fn observe(path: PathBuf, name: String) -> Option<Observed> {
     let unreadable = |path: PathBuf, name: String| Observed {
         name,
@@ -820,7 +820,7 @@ fn observe(path: PathBuf, name: String) -> Option<Observed> {
         state: BeaconState::Unreadable,
         payload: None,
     };
-    let mut last = None;
+    let mut replaced = false;
     for _ in 0..OBSERVE_ATTEMPTS {
         let file = match open_beacon(&path) {
             Ok(file) => file,
@@ -867,10 +867,16 @@ fn observe(path: PathBuf, name: String) -> Option<Observed> {
             return Some(observed);
         }
         // Replaced (or removed) while we looked: what we saw is true of a file that is no longer there.
-        last = Some(observed);
+        replaced = true;
     }
-    // Still being replaced after every attempt: report the last file seen, which held the name moments ago.
-    last
+    // Still being replaced after every attempt: what was seen belongs to files that no longer hold the name, so
+    // nothing about the reader is reported.
+    replaced.then_some(Observed {
+        name,
+        path,
+        state: BeaconState::Changing,
+        payload: None,
+    })
 }
 
 /// Whether `name` is something a beacon may be named (for the CLI and tests).

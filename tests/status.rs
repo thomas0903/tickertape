@@ -221,6 +221,95 @@ fn status_never_interferes_with_the_writer() {
     assert_eq!(names(dir.path()), before);
 }
 
+/// Round 2, B1: samples taken while the writer checkpoints and retention removes old segments never report a healthy
+/// journal as corrupt. Retention (here: keep only the checkpoint's segment and newer) removes only segments before
+/// the checkpoint's, so a sample whose listing and marker disagree, or whose checkpoint segment vanishes after the
+/// listing, must re-read them instead of reporting a dangling marker. Runs for `TT_STRESS_MS` (default 1500 ms);
+/// races are most frequent where syncs are cheap (tmpfs: `TMPDIR=/dev/shm`).
+#[test]
+fn samples_during_retention_are_never_corrupt() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let config = small_config().retention(
+        tickertape::retention::Policy::default().max_segments(1),
+        tickertape::retention::Action::Delete,
+    );
+    let mut writer = Writer::open(dir.path(), config).unwrap();
+    let run = Duration::from_millis(
+        std::env::var("TT_STRESS_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1500),
+    );
+    let stop = AtomicBool::new(false);
+    let samples = std::sync::atomic::AtomicU64::new(0);
+    let errors = std::sync::atomic::AtomicU64::new(0);
+    let check = |sampled: tickertape::Result<status::Status>| match sampled {
+        Ok(s) => {
+            let breaches = s.breaches(&Thresholds::default());
+            assert!(
+                breaches.is_empty(),
+                "a healthy journal sampled as {breaches:?}: {s:?}"
+            );
+            samples.fetch_add(1, Ordering::Relaxed);
+        }
+        // The journal changed faster than a sample could follow (exit 1, not a corruption verdict).
+        Err(Error::Io { .. }) => {
+            errors.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(e) => panic!("sample failed: {e}"),
+    };
+    let segments = std::thread::scope(|scope| {
+        let _stop = StopOnDrop(&stop);
+        scope.spawn(|| {
+            while !stop.load(Ordering::Relaxed) {
+                check(status::status(dir.path()));
+            }
+        });
+        scope.spawn(|| {
+            let mut sampler = Sampler::new(dir.path());
+            while !stop.load(Ordering::Relaxed) {
+                check(sampler.sample());
+            }
+        });
+        // Records of a third of a segment: every checkpoint follows a roll, so the marker leaves its segment, which
+        // retention then removes, as often as possible.
+        let payload = vec![7u8; 20_000];
+        let started = Instant::now();
+        let mut rolled = 0u64;
+        while started.elapsed() < run {
+            let before = writer.metrics().head.segment_base_seq;
+            for _ in 0..3 {
+                writer
+                    .append(&tickertape::NewRecord {
+                        schema_id: 1,
+                        venue_ts_ns: 0,
+                        local_ts_ns: 0,
+                        payload: &payload,
+                    })
+                    .unwrap();
+            }
+            writer.checkpoint().unwrap();
+            rolled += u64::from(writer.metrics().head.segment_base_seq != before);
+        }
+        assert_eq!(
+            writer.metrics().retention_failures,
+            0,
+            "{:?}",
+            writer.last_retention_error()
+        );
+        rolled
+    });
+    let (samples, errors) = (samples.into_inner(), errors.into_inner());
+    eprintln!("{samples} samples, {errors} I/O errors, {segments} rolls");
+    assert!(segments > 10, "retention had little to do");
+    assert!(samples > 100);
+    assert!(
+        errors * 20 <= samples,
+        "{errors} of {samples} samples failed"
+    );
+}
+
 /// The PID in `writer.lock` of a process that no longer exists (moved here from the unit tests, which must not
 /// spawn processes).
 #[test]

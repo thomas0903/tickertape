@@ -174,8 +174,15 @@ pub struct Head {
     /// record from the checkpoint marker's position (without a marker, from the start of the oldest segment) to the
     /// head. False means the checkpoint is in an older segment (or there are several segments and no checkpoint):
     /// the segments in between were not read, so a missing or damaged one would not have been noticed, and the head's
-    /// sequence number is what the newest segment's name and records imply, not a verified count.
+    /// sequence number is what the newest segment's name and records imply, not a verified count. A sample with
+    /// `verified == false` and no breach does **not** mean that [`Writer::open`](crate::Writer::open) would open the
+    /// journal.
     pub verified: bool,
+    /// True if the segment listing alone proves a segment missing between the checkpoint (or the oldest segment) and
+    /// the head: the next segment's base sequence number is beyond what the previous segment can hold. The writer
+    /// refuses such a journal ([`Breach::ChainBroken`]), and no exposure is summed across the gap. Most missing
+    /// segments can't be proven this way; they leave `verified` false.
+    pub chain_broken: bool,
 }
 
 /// The segment files.
@@ -234,8 +241,12 @@ pub enum AgeUnknown {
     /// The marker file doesn't have its full length, so its modification time is the time it was cut, not of a
     /// checkpoint.
     MarkerResized,
-    /// The marker's metadata kept changing while it was read.
+    /// The marker's metadata kept changing while it was read: a writer checkpointing very often. Not a breach of
+    /// [`Thresholds::max_checkpoint_age`], since it means the marker was just written.
     Changing,
+    /// A writer found the marker short at open and extended it, setting its modification time to the Unix epoch, so
+    /// that the time it was cut short is not taken for a checkpoint's. The age is unknown until the next checkpoint.
+    MarkerExtended,
 }
 
 impl AgeUnknown {
@@ -247,6 +258,7 @@ impl AgeUnknown {
             AgeUnknown::BeforeSegment => "modification_time_before_segment",
             AgeUnknown::MarkerResized => "marker_resized",
             AgeUnknown::Changing => "marker_changing",
+            AgeUnknown::MarkerExtended => "marker_extended",
         }
     }
 }
@@ -289,10 +301,14 @@ impl CheckpointStatus {
 #[non_exhaustive]
 pub struct Exposure {
     /// Committed records not covered by the checkpoint marker (without a marker, every record from the start of the
-    /// oldest segment). `None` if the marker can't be used ([`CheckpointStatus::problem`]) or lies beyond the head.
+    /// oldest segment). `None` if the marker can't be used ([`CheckpointStatus::problem`]), lies beyond the head, or
+    /// a segment in between is proven missing ([`Head::chain_broken`]). If the chain is not verified
+    /// ([`Exposure::verified`] false), this is the head's sequence number (as the newest segment implies it) minus the
+    /// marker's, whether or not the segments in between are intact.
     pub records: Option<u64>,
     /// Segment-file footprint between the marker's position and the head (see [`Lag::bytes`]); zero when no record
-    /// is uncovered. `None` if `records` is, or a segment involved is missing.
+    /// is uncovered. `None` if `records` is, or a segment named by an end is missing. If the chain is not verified,
+    /// it sums the segment files listed in between, so a missing one is not counted.
     pub bytes: Option<u64>,
     /// Estimated time the uncovered records have been exposed, at most: zero if there are none, otherwise the
     /// checkpoint's [`estimated_age`](CheckpointStatus::estimated_age) (every uncovered record was appended after
@@ -372,6 +388,9 @@ pub enum BeaconState {
     Invalid,
     /// The file couldn't be opened or read (for example, another user's beacon created under umask 077).
     Unreadable,
+    /// The name was replaced by another file during every attempt to observe it, so nothing seen belongs to the file
+    /// that holds the name now: no contents and no lag are reported.
+    Changing,
 }
 
 impl BeaconState {
@@ -383,6 +402,7 @@ impl BeaconState {
             BeaconState::Uncertain => "uncertain",
             BeaconState::Invalid => "invalid",
             BeaconState::Unreadable => "unreadable",
+            BeaconState::Changing => "changing",
         }
     }
 }
@@ -410,8 +430,9 @@ pub struct Lag {
     /// durable-only reader): the rest of the cursor's segment, every segment in between and the target's offset, so
     /// headers, seals, unused tails and trailers count. Per segment boundary it exceeds the unread record bytes by
     /// less than 72 bytes plus the size of the first record of the next segment (the record that didn't fit). Zero
-    /// when `records` is. `None` while a seek is pending ([`Cursor::seek_pending`]) or if a segment involved is
-    /// missing.
+    /// when `records` is. `None` while a seek is pending ([`Cursor::seek_pending`]) or if the segment of either end is
+    /// not listed. The segments in between are the ones listed, not read: unless the sample verified the chain
+    /// ([`Head::verified`]), a missing one is simply not counted.
     pub bytes: Option<u64>,
 }
 
@@ -471,7 +492,8 @@ pub struct ReaderStatus {
     pub path: PathBuf,
     /// Whether its owner is running, and whether the file could be read.
     pub state: BeaconState,
-    /// The beacon's contents, unless the state is [`BeaconState::Invalid`] or [`BeaconState::Unreadable`].
+    /// The beacon's contents, unless the state is [`BeaconState::Invalid`], [`BeaconState::Unreadable`] or
+    /// [`BeaconState::Changing`].
     pub report: Option<BeaconReport>,
     /// Time since the last beacon write, by the observer's wall clock. `None` if the write time is in the future.
     pub update_age: Option<Duration>,
@@ -484,7 +506,8 @@ pub struct ReaderStatus {
     pub oldest_unread_local_ts_ns: Option<u64>,
     /// Observer's wall clock minus `oldest_unread_local_ts_ns`, or zero if the reader has caught up. Meaningful when
     /// the producer stamps `local_ts_ns` from this host's wall clock (for example with
-    /// [`crate::clock::realtime_ns`]). `None` while a seek is pending, or if the lag or the timestamp is unknown.
+    /// [`crate::clock::realtime_ns`]). `None` while a seek is pending, if the lag or the timestamp is unknown, or if
+    /// the timestamp is later than the observer's clock.
     pub unread_age: Option<Duration>,
 }
 
@@ -494,8 +517,8 @@ pub struct ReaderStatus {
 pub struct Status {
     /// The journal directory, as given.
     pub dir: PathBuf,
-    /// The observer's wall clock after reading the checkpoint marker, nanoseconds since the Unix epoch. Ages are
-    /// measured from it.
+    /// The observer's wall clock after reading the checkpoint marker and the beacons, nanoseconds since the Unix
+    /// epoch. Ages are measured from it.
     pub sampled_unix_ns: u64,
     /// The writer's head.
     pub head: Head,
@@ -599,6 +622,9 @@ pub enum Breach {
     /// The checkpoint marker can't be used ([`CheckpointStatus::problem`]): the writer refuses to open the journal.
     /// Always checked; corruption.
     CheckpointInvalid,
+    /// A segment between the checkpoint and the head is missing, as the listing proves ([`Head::chain_broken`]): the
+    /// writer refuses to open the journal. Always checked; corruption.
+    ChainBroken,
     /// [`Thresholds::max_checkpoint_age`].
     CheckpointAge,
     /// [`Thresholds::min_headroom_bytes`].
@@ -618,6 +644,7 @@ impl Breach {
         match self {
             Breach::HeadInvalid => "head_invalid",
             Breach::CheckpointInvalid => "checkpoint_invalid",
+            Breach::ChainBroken => "chain_broken",
             Breach::CheckpointAge => "checkpoint_age",
             Breach::HeadroomBytes => "headroom_bytes",
             Breach::HeadroomSegments => "headroom_segments",
@@ -628,7 +655,10 @@ impl Breach {
     /// True if the sample found the journal corrupt, as `tickertape verify` or [`Writer::open`](crate::Writer::open)
     /// would (the CLI exits with 2 rather than 3).
     pub fn is_corruption(&self) -> bool {
-        matches!(self, Breach::HeadInvalid | Breach::CheckpointInvalid)
+        matches!(
+            self,
+            Breach::HeadInvalid | Breach::CheckpointInvalid | Breach::ChainBroken
+        )
     }
 }
 
@@ -694,8 +724,14 @@ impl Status {
         Ok(Lag { records, bytes })
     }
 
-    /// The health checks this sample fails, given `thresholds`. [`Breach::HeadInvalid`] and
-    /// [`Breach::CheckpointInvalid`] are always checked.
+    /// The health checks this sample fails, given `thresholds`. [`Breach::HeadInvalid`],
+    /// [`Breach::CheckpointInvalid`] and [`Breach::ChainBroken`] are always checked.
+    ///
+    /// The rule for breaks in the chain: a break the sample confirms from what it reads anyway (the head at invalid
+    /// bytes, a marker the writer refuses, a segment the listing proves missing) is a corruption breach, and no
+    /// exposure is summed across it. What the sample doesn't read (the segments between an older checkpoint and the
+    /// head) is not checked: no breach, but [`Head::verified`] is false, so an empty list doesn't then mean that the
+    /// writer would open the journal.
     ///
     /// Cost: no system calls.
     pub fn breaches(&self, thresholds: &Thresholds) -> Vec<Breach> {
@@ -705,6 +741,9 @@ impl Status {
         }
         if self.checkpoint.is_some_and(|c| c.problem.is_some()) {
             out.push(Breach::CheckpointInvalid);
+        }
+        if self.head.chain_broken {
+            out.push(Breach::ChainBroken);
         }
         if let Some(max) = thresholds.max_checkpoint_age {
             if self.exposure.records != Some(0)
@@ -773,8 +812,9 @@ impl Status {
 ///
 /// # Errors
 ///
-/// [`Error::NotFound`] if `dir` has no segments; [`Error::Corrupt`] or [`Error::UnsupportedVersion`] if the newest
-/// segment's header is invalid; [`Error::Io`], including when the writer rolled 16 times during one sample. A beacon
+/// [`Error::NotFound`] if `dir` has no segments; [`Error::Corrupt`] if it has none but the checkpoint marker names
+/// one (the writer refuses it as a dangling checkpoint), or if the newest segment's header is invalid
+/// ([`Error::UnsupportedVersion`] for an unsupported version); [`Error::Io`], including when the writer rolled 16 times during one sample. A beacon
 /// that can't be read, or a beacon directory that can't be listed, never fails the sample.
 pub fn status(dir: impl AsRef<Path>) -> Result<Status> {
     Sampler::new(dir).sample()
@@ -783,12 +823,15 @@ pub fn status(dir: impl AsRef<Path>) -> Result<Status> {
 /// Samples a journal repeatedly, more cheaply than [`status`]: each sample resumes the head scan where the previous
 /// one stopped, and successive samples give append [`Rates`] and an estimated time until the volume is full.
 ///
-/// Everything a sampler carries from one sample to the next is keyed by the identity of the segment file it came
-/// from (device, inode, and the header's creation time and size, since inode numbers are reused), so a journal
-/// replaced at the same path, or a segment repaired by recovery, is scanned afresh, and rates and cached timestamps
-/// are dropped rather than carried across. A failed lookup is never cached.
+/// A sampler resumes only with proof that the newest segment is the file its previous samples scanned and that it
+/// still holds what they saw: it keeps that file open between samples, so its inode can't be reused by another file
+/// (ext4 reuses inode numbers at once), and it re-reads the last record they passed. Otherwise (a journal replaced at
+/// the same path, a segment repaired by recovery or restored from a copy) it scans afresh and drops its rates. If the
+/// checkpoint marker moved to a position the previous scans passed, the slot there is checked against the marker
+/// before resuming. Nothing else is carried from one sample to the next.
 ///
-/// Holds no file open between samples and starts no thread.
+/// Holds one file open between samples (the newest segment at the previous sample; if retention removes it meanwhile,
+/// its space is freed at the next sample) and starts no thread.
 #[derive(Debug, Clone)]
 pub struct Sampler {
     dir: PathBuf,
@@ -802,18 +845,15 @@ struct Previous {
     head: Head,
     /// The head's segment file.
     head_seg: SegId,
+    /// Kept open so that `head_seg`'s inode can't be reused while the sampler relies on it: a file with that identity
+    /// is the same file.
+    _pinned: std::sync::Arc<File>,
     /// Where the scans of `head_seg` that led to `head` started (they validated everything from there).
     origin: u64,
-    /// The oldest uncovered record's timestamp, with what it was looked up for.
-    exposure_ts: Option<(ExposureKey, Option<u64>)>,
-}
-
-/// What the oldest uncovered record's timestamp depends on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ExposureKey {
-    generation: u64,
-    covered_from: Position,
-    segment: SegId,
+    /// The last record those scans passed (its offset and header), re-read before resuming.
+    last_record: Option<(u64, RecordHeader)>,
+    /// The checkpoint marker's slot at that sample.
+    marker: Option<CheckpointSlot>,
 }
 
 /// A segment file as listed: its base, size and file identity.
@@ -858,6 +898,12 @@ impl OpenSegments {
         self.opened.push(opened);
         Ok(self.opened.last().expect("just pushed"))
     }
+
+    /// Takes the open segment `base` out (to keep it open after the sample).
+    fn take(&mut self, base: u64) -> Option<File> {
+        let i = self.opened.iter().position(|o| o.id.base == base)?;
+        Some(self.opened.swap_remove(i).file)
+    }
 }
 
 impl Sampler {
@@ -878,11 +924,13 @@ impl Sampler {
         self
     }
 
-    /// Takes a sample. Costs as for [`status`], except that the newest segment is scanned only from the previous
-    /// sample's head while it is the same segment file (or from the checkpoint, if that is further on), so a
-    /// steady-state sample reads only the bytes appended since the previous one; and that when the head moved to
-    /// another segment, the previous head's segment header is read (one `open`, `fstat` and `pread`) to check that
-    /// the history continued before rates are reported.
+    /// Takes a sample. Costs as for [`status`], except that while the newest segment is the file the previous sample
+    /// scanned, it is scanned only from the previous sample's head (or from the checkpoint, if that is further on),
+    /// so a steady-state sample reads only the bytes appended since the previous one, plus one 4 KiB `pread` to
+    /// re-read the last record the previous scans passed (and another of the slot at the checkpoint marker, if it
+    /// moved to a position those scans passed); and that when the head moved to another segment, the previous head's
+    /// segment header is read (one `open`, two `fstat`s, `pread`, `fstat`) to check that the history continued before
+    /// rates are reported.
     ///
     /// # Errors
     ///
@@ -903,39 +951,54 @@ impl Sampler {
 
     fn sample_once(&mut self) -> Result<Status> {
         let at = Instant::now();
-        let mut files = list_files(&self.dir)?;
-        let marker = read_marker(&self.dir)?;
-        // After the marker, so that a checkpoint landing during the read is never in the future.
-        let now_ns = crate::clock::realtime_ns();
-        let slot = marker.as_ref().and_then(|m| m.slot);
+        let (mut files, mut marker) = list_with_marker(&self.dir)?;
         let mut open = OpenSegments::default();
 
-        // The head: scan the newest segment; if the writer rolled meanwhile, list again and take the new newest.
+        // The head: scan the newest segment; if the writer rolled meanwhile, list again (and read the marker again,
+        // so that the two agree) and take the new newest.
         let mut rolls = 0;
-        let (head, head_seg, origin, start, scan_first) = loop {
-            let newest = *files.last().ok_or_else(|| Error::NotFound {
-                dir: self.dir.clone(),
-            })?;
+        let (head, head_seg, origin, start, scan_first, last_record, proven) = loop {
+            let slot = marker.as_ref().and_then(|m| m.slot);
+            let newest = *files
+                .last()
+                .expect("list_with_marker never returns an empty listing");
             let seg = open.get(&self.dir, newest.base)?;
             let id = seg.id;
             let size = id.size;
             let marker_here = slot
                 .filter(|c| c.segment_base_seq == id.base && valid_offset(c.offset, size))
                 .map(|c| Position::new(c.next_seq, c.segment_base_seq, c.offset));
-            let resumed = self
-                .previous
-                .as_ref()
-                .filter(|p| p.head_seg == id && valid_offset(p.head.position.offset, size));
-            let (start, origin, carried_ts) = match (resumed, marker_here) {
-                // The marker is past the previous head: start there (less to read, and validated from there on).
-                (Some(p), Some(m)) if m.offset > p.head.position.offset => (m, m.offset, None),
-                (Some(p), _) => (p.head.position, p.origin, p.head.last_local_ts_ns),
-                (None, Some(m)) => (m, m.offset, None),
-                (None, None) => (
+            let fresh = match marker_here {
+                Some(m) => (m, m.offset),
+                None => (
                     Position::new(id.base, id.base, format::SEGMENT_HEADER_LEN as u64),
                     format::SEGMENT_HEADER_LEN as u64,
-                    None,
                 ),
+            };
+            // The previous samples' file, unchanged where they stopped: same identity (its inode is pinned, so not
+            // reused) and the same last record.
+            let proven = self
+                .previous
+                .as_ref()
+                .filter(|p| p.head_seg == id && valid_offset(p.head.position.offset, size))
+                .filter(|p| p.last_record.is_none_or(|(at, h)| record_is(seg, at, h)));
+            let resumed = proven.filter(|p| match marker_here {
+                // The marker is past the previous head: start there (less to read, and validated from there on).
+                Some(m) if m.offset > p.head.position.offset => false,
+                // The marker moved to a position the previous scans passed: it must be a record boundary with the
+                // marker's sequence number, as a scan from it would check.
+                Some(m) if p.marker != slot && m.offset >= p.origin => {
+                    if m.offset == p.head.position.offset {
+                        m.next_seq == p.head.position.next_seq
+                    } else {
+                        matches!(slot_at(seg, m), Some(Ok(Slot::Record { .. })))
+                    }
+                }
+                _ => true,
+            });
+            let (start, origin, carried) = match resumed {
+                Some(p) => (p.head.position, p.origin, Some(p)),
+                None => (fresh.0, fresh.1, None),
             };
             let scan = scan_from(&seg.file, &seg.path, size, start)?;
             if scan.end == HeadEnd::Sealed {
@@ -951,24 +1014,45 @@ impl Sampler {
                             )),
                         ));
                     }
-                    files = list_files(&self.dir)?;
+                    (files, marker) = list_with_marker(&self.dir)?;
                     continue;
                 }
             }
+            let last_record = match (scan.last, scan.last_at) {
+                (Some(h), Some(at)) => Some((at, h)),
+                _ => carried.and_then(|p| p.last_record),
+            };
             let head = Head {
                 position: scan.end_position,
                 segment_size: size,
                 end: scan.end,
                 last_local_ts_ns: match scan.last {
                     Some(h) => Some(h.local_ts_ns).filter(|&ts| ts != 0),
-                    None => carried_ts,
+                    None => carried.and_then(|p| p.head.last_local_ts_ns),
                 },
                 verified: false,
+                chain_broken: false,
             };
-            break (head, id, origin, start, scan.first);
+            break (
+                head,
+                id,
+                origin,
+                start,
+                scan.first,
+                last_record,
+                proven.is_some(),
+            );
         };
         let mut head = head;
         let first = files[0];
+        let slot = marker.as_ref().and_then(|m| m.slot);
+
+        // Readers, observed before the clock is read, so that a beacon written during the sample is never in the
+        // future.
+        let (readers_dir_state, observed) = beacon::observe_all(&self.readers_dir);
+        // After the marker and the beacons, so that a checkpoint or a beacon write landing during the sample is
+        // never in the future.
+        let now_ns = crate::clock::realtime_ns();
 
         // The checkpoint, checked as the writer checks it at open.
         let checkpoint = match (slot, marker.as_ref()) {
@@ -987,11 +1071,13 @@ impl Sampler {
             )),
             (Some(_), None) => None,
         };
-        head.verified = covered_from.is_some_and(|c| {
-            c.segment_base_seq == head_seg.base
-                && origin <= c.offset
-                && c.next_seq <= head.position.next_seq
-        });
+        head.chain_broken = covered_from.is_some_and(|c| missing_segment(&files, c, head_seg.base));
+        head.verified = !head.chain_broken
+            && covered_from.is_some_and(|c| {
+                c.segment_base_seq == head_seg.base
+                    && origin <= c.offset
+                    && c.next_seq <= head.position.next_seq
+            });
 
         // Segments summary.
         let oldest_created_unix_ns = open
@@ -1011,45 +1097,21 @@ impl Sampler {
             }),
         };
 
-        // Exposure.
-        let records = covered_from.and_then(|c| head.position.next_seq.checked_sub(c.next_seq));
-        let mut exposure_ts = None;
+        // Exposure. Nothing is summed across a segment the listing proves missing. The oldest uncovered record's
+        // timestamp is looked up afresh in every sample (one record read), never carried from an earlier one.
+        let records = covered_from
+            .filter(|_| !head.chain_broken)
+            .and_then(|c| head.position.next_seq.checked_sub(c.next_seq));
         let oldest_local_ts_ns = match (records, covered_from) {
             (Some(n), Some(c)) if n > 0 => {
                 if start == c && scan_first.is_some() {
                     scan_first.map(|h| h.local_ts_ns).filter(|&ts| ts != 0)
                 } else {
-                    let generation = checkpoint.map_or(0, |c| c.marker.generation);
-                    match open.get(&self.dir, c.segment_base_seq) {
-                        Ok(seg) => {
-                            let key = ExposureKey {
-                                generation,
-                                covered_from: c,
-                                segment: seg.id,
-                            };
-                            let cached = self
-                                .previous
-                                .as_ref()
-                                .and_then(|p| p.exposure_ts)
-                                .filter(|(k, _)| *k == key)
-                                .map(|(_, ts)| ts);
-                            match cached {
-                                Some(ts) => {
-                                    exposure_ts = Some((key, ts));
-                                    ts
-                                }
-                                None => match record_at(&self.dir, seg, c) {
-                                    Some(header) => {
-                                        let ts = Some(header.local_ts_ns).filter(|&ts| ts != 0);
-                                        exposure_ts = Some((key, ts));
-                                        ts
-                                    }
-                                    None => None,
-                                },
-                            }
-                        }
-                        Err(_) => None,
-                    }
+                    open.get(&self.dir, c.segment_base_seq)
+                        .ok()
+                        .and_then(|seg| record_at(&self.dir, seg, c))
+                        .map(|h| h.local_ts_ns)
+                        .filter(|&ts| ts != 0)
                 }
             }
             _ => None,
@@ -1061,27 +1123,31 @@ impl Sampler {
                 (Some(_), Some(c)) => footprint(&files, c, head.position),
                 _ => None,
             },
-            estimated_age: if records == Some(0) {
-                Some(Duration::ZERO)
-            } else {
-                usable.and_then(|c| c.estimated_age)
+            estimated_age: match records {
+                Some(0) => Some(Duration::ZERO),
+                Some(_) => usable.and_then(|c| c.estimated_age),
+                None => None,
             },
             oldest_local_ts_ns,
             verified: head.verified,
         };
 
-        // Rates, if the history continued from the previous head.
+        // Rates, if the history provably continued from the previous head.
         let rates = self.previous.as_ref().and_then(|p| {
             let interval = at.checked_duration_since(p.at)?;
             let secs = interval.as_secs_f64();
             if secs <= 0.0 || head.position.next_seq < p.head.position.next_seq {
                 return None;
             }
-            let continued = p.head_seg == head_seg
-                || (p.head_seg.base < head_seg.base
+            // The previous head's file is pinned, so a file with its identity is that file.
+            let continued = if p.head_seg == head_seg {
+                proven
+            } else {
+                p.head_seg.base < head_seg.base
                     && open
                         .get(&self.dir, p.head_seg.base)
-                        .is_ok_and(|o| o.id == p.head_seg));
+                        .is_ok_and(|o| o.id == p.head_seg)
+            };
             continued.then(|| Rates {
                 interval,
                 records_per_sec: (head.position.next_seq - p.head.position.next_seq) as f64 / secs,
@@ -1092,8 +1158,6 @@ impl Sampler {
         let storage = storage(&self.dir, &head, rates)?;
         let writer = writer_process(&self.dir);
 
-        // Readers.
-        let (readers_dir_state, observed) = beacon::observe_all(&self.readers_dir);
         let mut status = Status {
             dir: self.dir.clone(),
             sampled_unix_ns: now_ns,
@@ -1115,12 +1179,18 @@ impl Sampler {
             .collect();
         status.readers = readers;
 
+        let pinned = open
+            .take(head_seg.base)
+            .map(std::sync::Arc::new)
+            .expect("the head's segment was opened by this sample");
         self.previous = Some(Previous {
             at,
             head,
             head_seg,
+            _pinned: pinned,
             origin,
-            exposure_ts,
+            last_record,
+            marker: slot,
         });
         Ok(status)
     }
@@ -1137,14 +1207,60 @@ impl Reader {
     }
 }
 
-/// Lists the segment files with their sizes and identities.
-fn list_files(dir: &Path) -> Result<Vec<SegFile>> {
-    let listed = journal::list_segments(dir)?;
-    if listed.is_empty() {
-        return Err(Error::NotFound {
-            dir: dir.to_path_buf(),
+/// Lists the segment files and reads the checkpoint marker so that the two agree. If the marker names a segment the
+/// listing lacks (the writer may have rolled and checkpointed into a new segment after the listing), the directory is
+/// listed again and the marker read again, until the segment is listed or the marker didn't change across a listing:
+/// retention never removes the checkpoint's segment, so a segment missing from a listing taken while the marker named
+/// it is really missing. Up to [`MARKER_ATTEMPTS`] times; then an I/O error (the marker kept moving to segments that
+/// weren't listed yet). Costs nothing extra when the marker's segment is listed.
+///
+/// An empty listing is [`Error::NotFound`], unless the marker names a segment: the writer refuses such a journal
+/// (dangling checkpoint), so it is [`Error::Corrupt`].
+fn list_with_marker(dir: &Path) -> Result<(Vec<SegFile>, Option<Marker>)> {
+    let mut files = list_files(dir)?;
+    let mut marker = read_marker(dir)?;
+    let named = |m: &Option<Marker>| m.as_ref().and_then(|m| m.slot);
+    let mut attempts = 0;
+    while let Some(c) =
+        named(&marker).filter(|c| files.iter().all(|f| f.base != c.segment_base_seq))
+    {
+        attempts += 1;
+        if attempts > MARKER_ATTEMPTS {
+            return Err(Error::io(
+                "sample journal",
+                dir,
+                io::Error::other(
+                    "the checkpoint marker kept naming segments the listing didn't show yet",
+                ),
+            ));
+        }
+        files = list_files(dir)?;
+        let again = read_marker(dir)?;
+        let unchanged = named(&again) == Some(c);
+        marker = again;
+        if unchanged {
+            // Confirmed missing if still unlisted: the marker named it during the whole listing.
+            break;
+        }
+    }
+    if files.is_empty() {
+        return Err(match named(&marker) {
+            Some(c) => Error::corrupt(
+                dir.join(journal::CHECKPOINT_FILE),
+                0,
+                CorruptReason::DanglingCheckpoint(c.segment_base_seq),
+            ),
+            None => Error::NotFound {
+                dir: dir.to_path_buf(),
+            },
         });
     }
+    Ok((files, marker))
+}
+
+/// Lists the segment files with their sizes and identities (possibly none).
+fn list_files(dir: &Path) -> Result<Vec<SegFile>> {
+    let listed = journal::list_segments(dir)?;
     let mut files = Vec::with_capacity(listed.len());
     for (base, path) in &listed {
         let meta = std::fs::metadata(path).map_err(|e| Error::io("stat segment", path, e))?;
@@ -1224,11 +1340,41 @@ fn footprint(files: &[SegFile], from: Position, to: Position) -> Option<u64> {
     Some(rest.saturating_add(between).saturating_add(to.offset))
 }
 
+/// Whether the listing alone proves a segment missing between `from` (the checkpoint's position, or the start of the
+/// oldest segment) and the head's segment `head_base`, which [`Writer::open`](crate::Writer::open) refuses as a
+/// broken chain: a segment can hold no more records than fit in its record area at the smallest frame (40 bytes), so
+/// the next listed segment's base can't lie further on. A missing segment that this doesn't prove (most of them: the
+/// sample doesn't read the segments in between) leaves the chain unverified instead ([`Head::verified`]).
+fn missing_segment(files: &[SegFile], from: Position, head_base: u64) -> bool {
+    let min_frame = format::align8(format::RECORD_HEADER_LEN as u64);
+    let (Ok(i), Ok(j)) = (
+        files.binary_search_by_key(&from.segment_base_seq, |f| f.base),
+        files.binary_search_by_key(&head_base, |f| f.base),
+    ) else {
+        return false;
+    };
+    let (mut seq, mut offset) = (from.next_seq, from.offset);
+    for k in i..j {
+        let end = files[k]
+            .size
+            .saturating_sub(format::SEGMENT_TRAILER_LEN as u64);
+        let most = seq.saturating_add(end.saturating_sub(offset) / min_frame);
+        if files[k + 1].base > most {
+            return true;
+        }
+        seq = files[k + 1].base;
+        offset = format::SEGMENT_HEADER_LEN as u64;
+    }
+    false
+}
+
 struct ScanOut {
     end_position: Position,
     end: HeadEnd,
     first: Option<RecordHeader>,
     last: Option<RecordHeader>,
+    /// Offset of `last`.
+    last_at: Option<u64>,
 }
 
 /// Reads the slot at `offset` (expecting `seq`), re-reading up to [`VALIDATION_RETRIES`] times while it fails
@@ -1261,6 +1407,7 @@ fn scan_from(file: &File, path: &Path, size: u64, start: Position) -> Result<Sca
     let mut position = start;
     let mut first = None;
     let mut last = None;
+    let mut last_at = None;
     let end = loop {
         match read_slot_retrying(&view, path, position.offset, position.next_seq)? {
             Ok(Slot::Empty) => break HeadEnd::Open,
@@ -1276,6 +1423,7 @@ fn scan_from(file: &File, path: &Path, size: u64, start: Position) -> Result<Sca
                 };
                 first.get_or_insert(header);
                 last = Some(header);
+                last_at = Some(position.offset);
                 position.offset = next_offset;
                 position.next_seq = next_seq;
             }
@@ -1286,7 +1434,24 @@ fn scan_from(file: &File, path: &Path, size: u64, start: Position) -> Result<Sca
         end,
         first,
         last,
+        last_at,
     })
+}
+
+/// The slot at `position` in the open segment `seg`, validated for `position.next_seq` (re-read while it fails, as a
+/// scan does); `None` if it can't be read. One `pread` of 4 KiB (more for a larger record).
+fn slot_at(seg: &Opened, position: Position) -> Option<std::result::Result<Slot, CorruptReason>> {
+    let view = PreadView::new(&seg.file, seg.id.size, RECORD_WINDOW);
+    read_slot_retrying(&view, &seg.path, position.offset, position.next_seq).ok()
+}
+
+/// Whether the slot at `offset` in `seg` still holds the record `header` (same sequence number, lengths, timestamps,
+/// schema and checksum).
+fn record_is(seg: &Opened, offset: u64, header: RecordHeader) -> bool {
+    matches!(
+        slot_at(seg, Position::new(header.seq, seg.id.base, offset)),
+        Some(Ok(Slot::Record { header: h, .. })) if h == header
+    )
 }
 
 /// The header of the record at `position` in the open segment `seg`, following one seal into the next segment;
@@ -1399,6 +1564,7 @@ fn checkpoint_status(
     now_ns: u64,
 ) -> Result<CheckpointStatus> {
     let mut created = None;
+    // `list_with_marker` confirmed that a segment missing from the listing is missing.
     let problem = if files.iter().all(|f| f.base != c.segment_base_seq) {
         Some(CheckpointProblem::MissingSegment)
     } else {
@@ -1410,9 +1576,8 @@ fn checkpoint_status(
             Err(Error::Corrupt { .. } | Error::UnsupportedVersion { .. }) => {
                 Some(CheckpointProblem::InvalidSegmentHeader)
             }
-            Err(Error::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
-                Some(CheckpointProblem::MissingSegment)
-            }
+            // Listed, then gone: retention removed it after the marker moved on. Not a problem of this marker; the
+            // error makes the sampler try again with a fresh listing and marker.
             Err(e) => return Err(e),
         }
     };
@@ -1423,6 +1588,7 @@ fn checkpoint_status(
     } else {
         match marker.modified_unix_ns {
             None => Some(AgeUnknown::NoModificationTime),
+            Some(0) => Some(AgeUnknown::MarkerExtended),
             Some(m) if m > now_ns => Some(AgeUnknown::InFuture),
             Some(m) if created.is_some_and(|c| m.saturating_add(MTIME_SLACK_NS) < c) => {
                 Some(AgeUnknown::BeforeSegment)
@@ -1569,9 +1735,11 @@ fn reader_status(
                     .and_then(|seg| record_at(dir, seg, report.position))
                     .map(|h| h.local_ts_ns)
                     .filter(|&ts| ts != 0);
+                // A timestamp later than the observer's clock gives no age (unknown), not zero.
                 out.unread_age = out
                     .oldest_unread_local_ts_ns
-                    .map(|ts| Duration::from_nanos(now_ns.saturating_sub(ts)));
+                    .and_then(|ts| now_ns.checked_sub(ts))
+                    .map(Duration::from_nanos);
             }
         }
     }

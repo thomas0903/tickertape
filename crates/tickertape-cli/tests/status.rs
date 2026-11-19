@@ -188,6 +188,7 @@ fn json_schema_is_stable() {
             "invalid_reason",
             "last_local_ts_ns",
             "verified",
+            "chain_broken",
         ])
     );
     assert_eq!(v["head"]["verified"], true);
@@ -283,7 +284,7 @@ fn json_schema_is_stable() {
     assert_eq!(readers[0]["lag_unknown_reason"], Value::Null);
     assert_eq!(
         v["health"],
-        serde_json::json!({"ok": true, "corrupt": false, "breaches": []})
+        serde_json::json!({"ok": true, "corrupt": false, "verified": true, "breaches": []})
     );
 }
 
@@ -323,7 +324,7 @@ fn health_exit_codes() {
     assert_eq!(code, 3);
     assert_eq!(
         v["health"],
-        serde_json::json!({"ok": false, "corrupt": false, "breaches": [{"code": "checkpoint_age", "reader": null}]})
+        serde_json::json!({"ok": false, "corrupt": false, "verified": true, "breaches": [{"code": "checkpoint_age", "reader": null}]})
     );
     // Headroom.
     command()
@@ -583,6 +584,62 @@ fn watch_output_file_and_samples() {
         .stderr(predicate::str::contains("outside the journal"));
     assert!(!dir.path().join("status.prom").exists());
     drop(writer);
+}
+
+/// Round 2, B2: a missing middle segment that the sample can't see (it doesn't read the segments between an older
+/// checkpoint and the head) exits 0 but says "unverified" in the JSON and the text; with every segment gone and a
+/// valid checkpoint, the sample reports a dangling checkpoint as the writer does (exit 2).
+#[test]
+fn unverified_chain_and_dangling_checkpoint_without_segments() {
+    let _serial = serial();
+    let (dir, mut writer) = journal(2, true);
+    let path = dir.path().to_str().unwrap().to_string();
+    // Fill a few more segments of 64 KiB (about 60 records of 1000 bytes each).
+    for _ in 0..200 {
+        writer
+            .append(&NewRecord {
+                schema_id: 1,
+                venue_ts_ns: 0,
+                local_ts_ns: 0,
+                payload: &[7; 1000],
+            })
+            .unwrap();
+    }
+    drop(writer);
+    let mut segments: Vec<_> = fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|e| e == "tape"))
+        .collect();
+    segments.sort();
+    assert!(segments.len() >= 3, "{segments:?}");
+    fs::remove_file(&segments[1]).unwrap();
+    assert!(Writer::open(dir.path(), WriterConfig::default().segment_size(65536)).is_err());
+    let (v, code) = status_json(&[&path]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["head"]["verified"], false);
+    assert_eq!(v["head"]["chain_broken"], false);
+    assert_eq!(v["health"]["ok"], true);
+    assert_eq!(v["health"]["verified"], false);
+    command()
+        .args(["status", &path])
+        .assert()
+        .code(0)
+        .stdout(predicate::str::contains("health      ok (unverified)\n"));
+
+    let (dir, writer) = journal(3, true);
+    drop(writer);
+    for entry in fs::read_dir(dir.path()).unwrap() {
+        let p = entry.unwrap().path();
+        if p.extension().is_some_and(|e| e == "tape") {
+            fs::remove_file(p).unwrap();
+        }
+    }
+    command()
+        .args(["status", dir.path().to_str().unwrap()])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("checkpoint"));
 }
 
 /// Round 2, A4: `--output` never replaces a file the journal reads through a symlink (a segment kept outside the
