@@ -1,7 +1,7 @@
 # 0032: Operational metrics and reader beacons
 
 - **Status:** proposed
-- **Date:** 2026-11-19 (revised the same day after review rounds 1 and 2 of PR #8, and on 2026-11-20 after round 3)
+- **Date:** 2026-11-19 (revised the same day after review rounds 1 and 2 of PR #8, and on 2026-11-20 after rounds 3 and 4)
 
 ## Context
 
@@ -339,7 +339,13 @@ with `--watch`, which goes on sampling and picks the journal up once it exists).
   segments), a segment the listing proves missing between the checkpoint and the head, a damaged newest segment
   header, an unsupported format. 2 takes precedence over 3. 1 for usage and I/O errors and a missing journal. 0 with
   `head.verified` false means healthy as far as the sample can tell, not that the writer would open the journal
-  (governing rule 2).
+  (governing rule 2). **Decision (round 4): when a sample's verdict and an output failure both apply**, the verdict
+  wins, because it is the signal a monitor acts on: 2 (corrupt, whether the sample failed or found corruption), 3
+  (unhealthy) or 1 (the sample failed), and the output failure is still written to standard error. A healthy sample
+  whose output can't be written (the `--output` target refused, or its write or rename failing, or standard output
+  failing) exits 1. With `--watch`, which reports health in each sample, an output that can't be written stops the
+  watch with 1. Before, a refused target and a failed write exited 1 whatever the sample found, and a target whose
+  safety couldn't be established left the corruption's 2 although the documentation promised 1.
 - **`--max-checkpoint-age`** checks the exposure's estimated age: breached when records are uncovered and the
   checkpoint is older than the limit, its age is unknown (except `marker_changing`, which means a checkpoint just
   happened), or there is no checkpoint. An idle, fully checkpointed
@@ -352,23 +358,63 @@ with `--watch`, which goes on sampling and picks the journal up once it exists).
   repeated expositions in one stream are not a valid exposition.
 - **`--output`** writes each sample to a new, uniquely named temporary file in the destination directory, created
   with `O_CREAT | O_EXCL` (it never follows a symlink or opens an existing file), and renames it over the target; the
-  temporary file is removed on every error. Checked before every replacement, the target must not lie inside a
-  directory the journal uses (the journal directory, `quarantine/`, the beacon directory), compared as given and with
-  symlinks resolved on both sides (round 3: a `quarantine/` that is a symlink to another directory, which recovery
-  accepts, holds evidence too), and must not be a file that an entry of the journal directory or of `quarantine/`
-  reaches, following symlinks or by hard link (a segment, the marker or a quarantined file may be a symlink to a file
-  outside the journal, which the rename would replace). The archive directory of `tickertape archive` is not
-  recorded anywhere `status` can see, so it is not checked. A sample that fails still replaces the file (with
-  `tickertape_up 0`), so a collector never keeps serving a stale healthy sample. **Decision (round 3):** when the
-  journal can't be walked (unreadable, not a directory, a symlink loop), the sample has failed too; the check then
-  decides from what it can establish without the walk: the target is not inside those directories by path, and is
-  not the file the failed sample's error names. If so, `tickertape_up 0` is written and a watch goes on. If even that
-  can't be established (a beacon directory that can't be resolved, a target that can't be `stat`ed, a successful
-  sample whose journal can't be walked a moment later), nothing is written, the reason goes to standard error every
-  time, and a watch goes on; a one-shot status exits 1. Before this, the check's own walk failed first and left a
-  stale `tickertape_up 1` file.
+  temporary file is removed on every error. A sample that fails still replaces the file (with `tickertape_up 0`), so
+  a collector never keeps serving a stale healthy sample.
 
-## Compatibility
+  **Decision (round 4): ownership of the destination is proved by what it is, not by inspecting the journal.**
+  Rounds 2 and 3 decided whether the target was safe to replace by walking the journal directory and `quarantine/`
+  for an entry that reaches it, and each left a case where the journal could not be inspected and a fallback let the
+  failure report replace a quarantined file: a journal that can't be listed with a `quarantine` symlink to another
+  directory; a `quarantine/` that can't be listed but holds a symlink to the target; and the target being the very
+  symlink through which the journal was given (`run` compared only the canonical journal). The failure report
+  matters most exactly when the journal can't be inspected, so no rule that depends on inspecting it can be right.
+  Checked before every replacement (the journal and the target can change between samples):
+
+  1. **Certain path checks.** The target, as given (made absolute, symlinks kept) and resolved (its directory's
+     canonical path and its name), must not be or lie inside the journal directory, its `quarantine/` or the beacon
+     directory, each taken as given on the command line, from the journal's canonical path, and resolved again at
+     the check. A directory that can't be resolved is compared by path only; that failure grants nothing, since the
+     next rules still apply. Its name must not be one a writer gives the files it quarantines: 20 digits first, then
+     `.bin` or `.bin.partial` last (`<base>.tape-<n>.bin`, `<base>-<offset>-<time>-<n>.bin`,
+     `<base>-<offset>-<time>.bin.partial`).
+  2. **A path that doesn't exist is created.**
+  3. **An existing path is replaced only if `lstat` shows a regular file** (never a symlink, a directory, a FIFO, a
+     socket or a device), opened with `O_NOFOLLOW | O_NONBLOCK` and checked to be the file `lstat` saw, **whose
+     first bytes are how an output of `tickertape status` starts** in one of its formats:
+
+     | Format | First bytes (exact) |
+     |---|---|
+     | `text` (a sample or a failed sample) | `journal     /` (the label padded to 12 columns, then the absolute journal path) |
+     | `json` (a sample, or a failed sample's `error` object) | `{"schema_version":`, 1 to 10 ASCII digits, then `,"journal":"/` (`serde` writes the fields in declaration order, and both objects start with these two) |
+     | `prometheus` (a sample or a failed sample) | `# HELP tickertape_status_timestamp_seconds ` (always the first family) |
+
+     A file of any of the three formats may be replaced by any format, so changing `--format` works. **Or the file
+     is empty, and no entry of the journal directory, `quarantine/` or the beacon directory reaches it** by symlink
+     or hard link; if one of those directories (that exists) can't be listed, or an entry can't be `stat`ed, an
+     empty file is refused. An empty file is the one kind of file a journal can also hold (below), and the walk is
+     kept for it only, as an extra refusal: its errors refuse and never grant.
+  4. **Anything else is refused**, with a message that says how to proceed (remove the file, or choose another
+     path).
+
+  **Why no file a journal uses can pass.** A segment (and any copy of it) starts with `TICKTAPE`, the checkpoint
+  marker with `TICKCKPT` (a marker cut short is a prefix of a marker: too short, or still `TICKCKPT`), a beacon with
+  `TTREADER` (a torn beacon keeps its magic, which no update changes; a temporary beacon file is `TTREADER` or
+  empty), the notify record and `notify.tmp` with `TTNOTIFY`, `writer.lock` holds the writer's PID in decimal digits,
+  and `next-segment.tmp` and `*.tape.tmp` start with `TICKTAPE` or, preallocated before their header is written, with
+  zero bytes; none starts with `j`, `{` or `#`. A file in
+  `quarantine/` is a hard link to a quarantined segment or a preserved tail; a segment quarantined for a damaged
+  header, or a tail (the bytes from the record that failed validation), may start with anything, so for those the
+  content test is not the argument: every name a writer gives a file in `quarantine/` is refused by rule 1, wherever
+  the target is (a `quarantine/` that is a symlink, or can't be resolved, keeps those names). The files that can be
+  empty — `writer.lock` before its PID is written (or when writing it failed), a marker cut to zero, a temporary
+  segment, notify or beacon file just created, a `.bin.partial` just created — are refused by the path checks under
+  their own names and by the walk when reached through a symlink or hard link, and refused outright when the walk
+  can't run. With this rule a failed sample's report can always be written over an earlier status output, whatever
+  state the journal is in, and can never be written over anything else. The archive directory of
+  `tickertape archive` is not recorded anywhere `status` can see, but nothing in it can pass either (its files are
+  segments).
+
+## Compatibility## Compatibility
 
 - No format change. `docs/format.md` lists `readers/` as an advisory name outside the format, like `notify`.
 - **v0.4.0 and `readers/`.** Two reviewers checked by reading that v0.4.0's writer open and recovery, `verify`,

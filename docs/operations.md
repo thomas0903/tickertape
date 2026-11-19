@@ -200,8 +200,9 @@ tickertape status /data/journal --format prometheus --watch 15s \
 
 With `--watch`, a sample that fails replaces the file with `tickertape_up 0` and the watch goes on; a one-shot run
 does the same before it exits with an error. The file must not lie inside the journal, its `quarantine/` or the beacon
-directory; if `status` can't establish that replacing it is safe, it leaves the file alone and warns on standard
-error, so keep the timestamp alert below. `--watch` with Prometheus output needs `--output` (several expositions
+directory, and `status` replaces an existing file only if it is an earlier output of `status` (in any format) or an
+empty regular file; anything else, including a symlink, is refused on standard error and stops a watch with exit
+code 1 (remove the file, or choose another path), so keep the timestamp alert below. `--watch` with Prometheus output needs `--output` (several expositions
 in one stream are not valid). The `journal` label is the canonical path of the journal directory.
 
 Example alert expressions:
@@ -230,6 +231,9 @@ As a health check (systemd, Kubernetes, a load balancer script), the exit code i
 tickertape status /data/journal --max-checkpoint-age 30s --min-headroom-segments 4 --max-reader-lag 100000
 # 0 healthy; 3 a threshold breached; 2 the journal is corrupt or the writer would refuse it; 1 I/O or usage error.
 ```
+
+When a one-shot run also has an `--output` it can't write, the health verdict still decides the exit code (2 or 3, or 1
+for a failed sample) and the output's failure goes to standard error; a healthy sample then exits 1.
 
 ### Exporting from your own process
 

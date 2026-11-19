@@ -104,14 +104,18 @@ Errors and recovery warnings go to stderr. JSON results go to stdout (or the sel
   that fails is reported (a JSON line with `error`, a text `error` line, or `tickertape_up 0`) and the watch goes on.
   `--output` writes each sample to a new, uniquely named temporary file in the same directory (created exclusively,
   never following a symlink) and renames it over `FILE`, so a node_exporter textfile collector never reads a partial
-  file. Checked before every replacement, `FILE` must not lie inside the journal directory, its `quarantine/` or the
-  beacon directory (compared as given and with symlinks resolved, so a `quarantine/` that is a symlink to another
-  directory is covered), and must not be a file that an entry of the journal directory or of `quarantine/` reaches
-  through a symlink or a hard link (the archive directory of `archive` is not known to `status`). A sample that fails
-  still replaces `FILE` with `tickertape_up 0`, also when the journal can't be listed at all (unreadable, not a
-  directory, a symlink loop): the check then relies on the paths and on the file the error names. When the check
-  can't establish that `FILE` is safe to replace (for example a `--readers-dir` that can't be resolved), `FILE` is
-  not written, a warning goes to standard error every time, and a watch goes on (a one-shot status exits 1).
+  file. Checked before every replacement: `FILE` must not be or lie inside the journal directory, its `quarantine/` or
+  the beacon directory, compared as given and with symlinks resolved (so neither the symlink through which the journal
+  was given nor a `quarantine/` that is a symlink to another directory can be named), and must not have a name a writer
+  gives quarantined files (20 digits, ending `.bin` or `.bin.partial`). A `FILE` that doesn't exist is created; an
+  existing one is replaced only if it is a regular file (not a symlink, directory, FIFO or device) that is an earlier
+  output of `tickertape status` in any of the three formats (recognised by its first bytes: `journal     /`,
+  `{"schema_version":<n>,"journal":"/` or `# HELP tickertape_status_timestamp_seconds `), or empty with no entry of
+  the journal directory, `quarantine/` or the beacon directory reaching it through a symlink or a hard link (an
+  empty file the journal's directories can't be listed to rule out is refused). Anything else is refused: remove it,
+  or choose another path. So a sample that fails always replaces an earlier output with `tickertape_up 0`, also when
+  the journal can't be listed at all (unreadable, not a directory, a symlink loop), and never replaces anything else
+  (the archive directory of `archive` is not known to `status`, but nothing in it is an earlier status output).
   `--watch` with `--format prometheus` needs `--output`. Thresholds (`DUR` and `B` as for `archive`):
   `--max-checkpoint-age` is breached when records are uncovered and the checkpoint's estimated age is above `DUR` or
   unknown, or there is no checkpoint (an idle, fully checkpointed journal and an empty one are healthy); an age
@@ -124,8 +128,11 @@ Errors and recovery warnings go to stderr. JSON results go to stdout (or the sel
   marker the writer refuses (missing segment, invalid offset or segment header; also a marker in a directory without
   segments), a segment the listing proves missing between the checkpoint and the head, a damaged newest segment
   header, an unsupported format (2 takes precedence over 3); **1** usage or I/O errors and a missing journal. **0**
-  with `head.verified` false is "healthy as far as the sample can tell", not "the writer would open it". With `--watch` it
-  reports health in each sample and exits 0 when `--samples` are done.
+  with `head.verified` false is "healthy as far as the sample can tell", not "the writer would open it". When the
+  output (the `--output` file, or standard output) can't be written, refused or failed, the sample's verdict wins: 2,
+  3, or 1 for a failed sample, with the output's failure on standard error too; a healthy sample then exits **1**.
+  With `--watch` it reports health in each sample and exits 0 when `--samples` are done; an output it can't write
+  stops it with **1**.
   On a one-shot sample, `last_local_ts_ns` of the head is null when the checkpoint is at the head (the scan starts
   there and sees no record).
 

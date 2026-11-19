@@ -22,7 +22,7 @@ const CORRUPT: u8 = 2;
 /// Version of the JSON object; bumped when a field is removed or changes meaning (adding fields doesn't bump it).
 const SCHEMA_VERSION: u32 = 1;
 
-pub(crate) const HELP: &str = "Samples the journal without taking the writer lock or writing to it: the writer's head, the checkpoint and what a power loss would remove now (exposure), space left on the volume, the writer process, and readers that publish a beacon (tickertape::status::ReaderBeacon) in <DIR>/readers or --readers-dir. Values a sample can't establish are null; estimates are named estimated_*. head.verified and exposure.verified say whether the sample validated the records between the checkpoint and the head (it reads only the newest segment). Cost: a scan of the newest segment from the checkpoint (or its start; with --watch only what was appended since the previous sample), one stat per segment, statvfs, and a few small reads per beacon.\n\nJSON schema (schema_version 1; fields may be added): see docs/cli.md. With --watch, one object per line; a sample that fails is a line {\"schema_version\":1,\"journal\":string,\"sampled_unix_ns\":u64,\"error\":{\"code\":string,\"message\":string}} and the watch continues.\n\nPrometheus: text exposition format 0.0.4, gauges named tickertape_*, labelled journal=\"<canonical DIR>\" (and reader=\"<name>\"); tickertape_up is 0 for a failed sample and tickertape_status_timestamp_seconds always tells when the file was written; see docs/cli.md. --watch with --format prometheus needs --output.\n\nExit codes: 0 healthy (or help, or --watch finished); 1 usage, I/O or missing journal; 2 the sample found the journal corrupt (the head at invalid bytes, a checkpoint marker the writer would refuse, a segment the listing proves missing, a damaged newest segment header) or an unsupported format, which takes precedence over 3; 3 a health threshold is breached (not with --watch, which reports health in each sample). The sample doesn't read the segments between an older checkpoint and the head: when head.verified is false (health.verified in JSON, \"health ok (unverified)\" in text), 0 does not mean that the writer would open the journal; run verify for that.";
+pub(crate) const HELP: &str = "Samples the journal without taking the writer lock or writing to it: the writer's head, the checkpoint and what a power loss would remove now (exposure), space left on the volume, the writer process, and readers that publish a beacon (tickertape::status::ReaderBeacon) in <DIR>/readers or --readers-dir. Values a sample can't establish are null; estimates are named estimated_*. head.verified and exposure.verified say whether the sample validated the records between the checkpoint and the head (it reads only the newest segment). Cost: a scan of the newest segment from the checkpoint (or its start; with --watch only what was appended since the previous sample), one stat per segment, statvfs, and a few small reads per beacon.\n\nJSON schema (schema_version 1; fields may be added): see docs/cli.md. With --watch, one object per line; a sample that fails is a line {\"schema_version\":1,\"journal\":string,\"sampled_unix_ns\":u64,\"error\":{\"code\":string,\"message\":string}} and the watch continues.\n\nPrometheus: text exposition format 0.0.4, gauges named tickertape_*, labelled journal=\"<canonical DIR>\" (and reader=\"<name>\"); tickertape_up is 0 for a failed sample and tickertape_status_timestamp_seconds always tells when the file was written; see docs/cli.md. --watch with --format prometheus needs --output.\n\n--output FILE: FILE must lie outside the journal directory, its quarantine/ and the beacon directory (compared as given and with symlinks resolved). If FILE exists, it is replaced only if it is a regular file (not a symlink) that is an earlier output of tickertape status in any format, or empty (and no journal entry reaches it); anything else is refused: remove it or choose another path.\n\nExit codes: 0 healthy (or help, or --watch finished); 1 usage, I/O or missing journal; 2 the sample found the journal corrupt (the head at invalid bytes, a checkpoint marker the writer would refuse, a segment the listing proves missing, a damaged newest segment header) or an unsupported format, which takes precedence over 3; 3 a health threshold is breached (not with --watch, which reports health in each sample). If the --output file (or standard output) can't be written, the sample's verdict wins (2, 3, or 1 for a failed sample) and the reason still goes to stderr; a healthy sample then exits 1, and --watch stops with 1. The sample doesn't read the segments between an older checkpoint and the head: when head.verified is false (health.verified in JSON, \"health ok (unverified)\" in text), 0 does not mean that the writer would open the journal; run verify for that.";
 
 #[derive(Debug, Args)]
 pub(crate) struct StatusArgs {
@@ -43,7 +43,7 @@ pub(crate) struct StatusArgs {
     /// With --watch, stop after N samples
     #[arg(long, value_name = "N", requires = "watch", value_parser = clap::value_parser!(u64).range(1..))]
     samples: Option<u64>,
-    /// Write each sample to FILE, replacing it atomically (for a node_exporter textfile collector); outside the journal
+    /// Write each sample to FILE, replacing it atomically (for a node_exporter textfile collector); outside the journal; an existing FILE must be empty or an earlier status output
     #[arg(long, value_name = "FILE")]
     output: Option<PathBuf>,
     /// Unhealthy if records are uncovered and the checkpoint's estimated age is above DUR (integer followed by d, h, m or s) or unknown (except marker_changing: the marker was being rewritten, so a checkpoint just happened), or there is no checkpoint
@@ -105,22 +105,21 @@ pub(crate) fn run(args: StatusArgs, out: &mut dyn Write) -> Result<()> {
     // resolved (the journal is missing or unreadable), the absolute path as given: the sample then fails and is
     // reported like any failed sample (`tickertape_up 0` in an --output file, an error line with --watch, which goes
     // on and samples again).
-    let journal = fs::canonicalize(&args.dir)
-        .or_else(|_| std::path::absolute(&args.dir))
+    let journal_given = std::path::absolute(&args.dir)
         .map_err(|e| output::io_error("resolve journal directory", e))?;
-    let output = args
-        .output
+    let journal = fs::canonicalize(&args.dir).unwrap_or_else(|_| journal_given.clone());
+    let output = args.output.as_deref().map(destination).transpose()?;
+    let readers_given = args
+        .readers_dir
         .as_deref()
-        .map(|path| destination(&journal, path))
-        .transpose()?;
+        .map(std::path::absolute)
+        .transpose()
+        .map_err(|e| output::io_error("resolve beacon directory", e))?;
+    let places = JournalPlaces::new(&journal_given, &journal, readers_given.as_deref());
     let mut sampler = Sampler::new(&journal);
     if let Some(readers) = &args.readers_dir {
         sampler = sampler.readers_dir(readers);
     }
-    let readers_dir = args
-        .readers_dir
-        .clone()
-        .unwrap_or_else(|| journal.join(tickertape::status::READERS_DIR));
     let mut taken = 0u64;
     loop {
         let sampled = sampler.sample();
@@ -168,69 +167,76 @@ pub(crate) fn run(args: StatusArgs, out: &mut dyn Write) -> Result<()> {
         // A one-shot sample that failed prints nothing on stdout (the error goes to stderr), but still replaces an
         // --output file, so that a collector sees `tickertape_up 0` rather than a stale healthy sample.
         let print = args.watch.is_some() || outcome.is_ok() || output.is_some();
-        if print {
+        let written = if print {
             match &output {
-                Some(path) => {
-                    match check_output(&journal, &readers_dir, path, sampled.as_ref().err()) {
-                        OutputCheck::Safe => replace_file(path, text.as_bytes())?,
-                        OutputCheck::Refused => {
-                            return Err(Failure::usage(format!(
-                                "status output {} is a file the journal or its beacon directory uses",
-                                path.display()
-                            )));
-                        }
-                        // Not written this time; a watch goes on, and a one-shot status fails after reporting.
-                        OutputCheck::Unknown(why) => {
-                            let message = format!(
-                                "status output {} not written: can't establish that it is not a file the journal uses ({why})",
-                                path.display()
-                            );
-                            let _ = writeln!(
-                                std::io::stderr().lock(),
-                                "tickertape: warning: {message}"
-                            );
-                            if args.watch.is_none() && sampled.is_ok() {
-                                return Err(Failure { code: 1, message });
-                            }
-                        }
-                    }
-                }
-                None => {
-                    if taken > 0 && format == StatusFormat::Text {
-                        writeln!(out).map_err(|e| output::io_error("write output", e))?;
-                    }
-                    out.write_all(text.as_bytes())
-                        .and_then(|()| out.flush())
-                        .map_err(|e| output::io_error("write output", e))?;
-                }
+                Some(dest) => check_output(&places, dest)
+                    .map_err(|why| Failure {
+                        code: 1,
+                        message: format!(
+                            "status output {} not written: {why}",
+                            dest.given.display()
+                        ),
+                    })
+                    .and_then(|()| replace_file(&dest.resolved, text.as_bytes())),
+                None => (if taken > 0 && format == StatusFormat::Text {
+                    writeln!(out)
+                } else {
+                    Ok(())
+                })
+                .and_then(|()| out.write_all(text.as_bytes()))
+                .and_then(|()| out.flush())
+                .map_err(|e| output::io_error("write output", e)),
             }
-        }
+        } else {
+            Ok(())
+        };
         taken += 1;
         let Some(interval) = args.watch else {
-            let breaches = match (sampled, outcome) {
-                (Err(error), _) => return Err(error.into()),
-                (Ok(_), Ok(breaches)) => breaches,
-                (Ok(_), Err(())) => unreachable!("a sample's outcome follows the sample"),
+            // One rule for every one-shot path (ADR 0032, round 4): the sample's verdict wins (2 corrupt, 3 unhealthy,
+            // 1 a failed sample), because it is what a monitor acts on; an output that could not be written is then
+            // still reported on standard error. A healthy sample whose output could not be written exits 1.
+            return match (verdict(sampled, outcome), written) {
+                (Ok(()), written) => written,
+                (Err(verdict), Ok(())) => Err(verdict),
+                (Err(verdict), Err(output)) => {
+                    let _ = writeln!(std::io::stderr().lock(), "tickertape: {output}");
+                    Err(verdict)
+                }
             };
-            if breaches.is_empty() {
-                return Ok(());
-            }
-            let codes: Vec<String> = breaches.iter().map(describe).collect();
-            let code = if breaches.iter().any(Breach::is_corruption) {
-                CORRUPT
-            } else {
-                UNHEALTHY
-            };
-            return Err(Failure {
-                code,
-                message: format!("unhealthy: {}", codes.join(", ")),
-            });
         };
+        // A watch stops at the first output it can't write (exit 1): the destination is not one it may replace, or
+        // the write failed.
+        written?;
         if args.samples.is_some_and(|n| taken >= n) {
             return Ok(());
         }
         std::thread::sleep(interval);
     }
+}
+
+/// A one-shot sample's verdict: `Ok` if healthy, else the failure it exits with (the sample's error, or the breaches).
+fn verdict(
+    sampled: tickertape::Result<Status>,
+    outcome: std::result::Result<Vec<Breach>, ()>,
+) -> Result<()> {
+    let breaches = match (sampled, outcome) {
+        (Err(error), _) => return Err(error.into()),
+        (Ok(_), Ok(breaches)) => breaches,
+        (Ok(_), Err(())) => unreachable!("a sample's outcome follows the sample"),
+    };
+    if breaches.is_empty() {
+        return Ok(());
+    }
+    let codes: Vec<String> = breaches.iter().map(describe).collect();
+    let code = if breaches.iter().any(Breach::is_corruption) {
+        CORRUPT
+    } else {
+        UNHEALTHY
+    };
+    Err(Failure {
+        code,
+        message: format!("unhealthy: {}", codes.join(", ")),
+    })
 }
 
 fn json_line(text: &mut String, value: &impl Serialize) -> Result<()> {
@@ -260,8 +266,15 @@ fn describe(breach: &Breach) -> String {
     }
 }
 
-/// Resolves `path` for `--output`: its directory must exist and be outside the journal.
-fn destination(journal: &Path, path: &Path) -> Result<PathBuf> {
+/// The `--output` destination, as given (made absolute, symlinks kept) and resolved (its directory's canonical path
+/// joined with its name). The resolved path is the one replaced.
+struct Destination {
+    given: PathBuf,
+    resolved: PathBuf,
+}
+
+/// Resolves `path` for `--output`: it must name a file in a directory that exists.
+fn destination(path: &Path) -> Result<Destination> {
     let name = path
         .file_name()
         .ok_or_else(|| Failure::usage("--output must name a file"))?;
@@ -271,132 +284,206 @@ fn destination(journal: &Path, path: &Path) -> Result<PathBuf> {
     };
     let parent =
         fs::canonicalize(parent).map_err(|e| output::io_error("resolve output directory", e))?;
-    if parent.starts_with(journal) {
-        return Err(Failure::usage(
-            "status output must be outside the journal directory",
-        ));
+    let given = std::path::absolute(path).map_err(|e| output::io_error("resolve output", e))?;
+    Ok(Destination {
+        given,
+        resolved: parent.join(name),
+    })
+}
+
+/// The directories a journal uses, for [`check_output`].
+struct JournalPlaces {
+    /// The journal directory, its `quarantine/` and the beacon directory, each from the path given on the command line
+    /// (made absolute) and from the journal's canonical path. Each is also resolved again at every check.
+    dirs: Vec<PathBuf>,
+    /// The directories whose entries must not reach an empty destination: the journal directory, its `quarantine/`
+    /// and the beacon directory.
+    listed: Vec<PathBuf>,
+}
+
+impl JournalPlaces {
+    fn new(journal_given: &Path, journal: &Path, readers_given: Option<&Path>) -> JournalPlaces {
+        let mut dirs = Vec::new();
+        for j in [journal_given, journal] {
+            dirs.push(j.to_path_buf());
+            dirs.push(j.join(QUARANTINE_DIR));
+            if readers_given.is_none() {
+                dirs.push(j.join(tickertape::status::READERS_DIR));
+            }
+        }
+        dirs.extend(readers_given.map(Path::to_path_buf));
+        dirs.sort();
+        dirs.dedup();
+        let readers = readers_given.map_or_else(
+            || journal.join(tickertape::status::READERS_DIR),
+            Path::to_path_buf,
+        );
+        JournalPlaces {
+            dirs,
+            listed: vec![journal.to_path_buf(), journal.join(QUARANTINE_DIR), readers],
+        }
     }
-    Ok(parent.join(name))
 }
 
-/// Whether `--output` may be replaced now ([`check_output`]).
-#[derive(Debug, PartialEq, Eq)]
-enum OutputCheck {
-    /// Replacing the destination can't replace anything the journal uses.
-    Safe,
-    /// The destination is (or is inside) something the journal uses: never written.
-    Refused,
-    /// Whether the destination is something the journal uses could not be established, for this reason: it is not
-    /// written this time, and the reason goes to standard error.
-    Unknown(String),
+const QUARANTINE_DIR: &str = "quarantine";
+
+/// How every format's output starts (`render_text`, `JsonStatus`/`JsonError`, `render_prometheus`; the unit test
+/// `every_format_is_recognised` renders each). The journal's path is absolute, so it starts with `/`.
+const TEXT_PREFIX: &[u8] = b"journal     /";
+const JSON_PREFIX: &[u8] = b"{\"schema_version\":";
+const JSON_AFTER_VERSION: &[u8] = b",\"journal\":\"/";
+const PROMETHEUS_PREFIX: &[u8] = b"# HELP tickertape_status_timestamp_seconds ";
+/// Enough bytes for every prefix (the JSON one with a 10-digit schema version is 41 bytes).
+const PREFIX_READ: usize = 64;
+
+/// Whether `head`, the first bytes of a file, are how an output of `tickertape status` starts in one of its formats.
+/// No file a journal holds can start so (ADR 0032, round 4): segments start with `TICKTAPE`, the checkpoint marker with
+/// `TICKCKPT`, a beacon with `TTREADER`, the notify record with `TTNOTIFY`, and `writer.lock` holds a decimal PID.
+fn is_status_output(head: &[u8]) -> bool {
+    if head.starts_with(TEXT_PREFIX) || head.starts_with(PROMETHEUS_PREFIX) {
+        return true;
+    }
+    let Some(rest) = head.strip_prefix(JSON_PREFIX) else {
+        return false;
+    };
+    let digits = rest.iter().take_while(|b| b.is_ascii_digit()).count();
+    (1..=10).contains(&digits) && rest[digits..].starts_with(JSON_AFTER_VERSION)
 }
 
-/// Refuses to replace `dest` if that could replace something a journal uses, checked before every replacement because
-/// the journal can change between samples. `dest` must not lie inside the journal directory, its `quarantine/` or the
-/// beacon directory, compared both as given and with symlinks resolved on both sides (a `quarantine/` that is a
-/// symlink to another directory holds evidence too). And it must not be a file that an entry of the journal directory
-/// or of `quarantine/` reaches, following symlinks: a segment, the marker or a quarantined file may be a symlink to a
-/// file outside the journal, which renaming over `dest` would replace. Hard links count too (renaming over one would
-/// not change the journal's file, but the alias is refused, as `export` refuses it). The archive directory of
-/// `tickertape archive` is not known to `status` (nothing in the journal records it), so it can't be checked.
+/// Whether `name` is one a writer gives the files it puts in `quarantine/`: `<20 digits>…-<n>.bin` (a quarantined
+/// segment `<base>.tape-<n>.bin`, a preserved tail `<base>-<offset>-<time>-<n>.bin`) or, while it writes a tail,
+/// `<base>-<offset>-<time>.bin.partial`.
+fn is_quarantine_name(name: &std::ffi::OsStr) -> bool {
+    let name = name.as_encoded_bytes();
+    name.len() > 20
+        && name[..20].iter().all(u8::is_ascii_digit)
+        && (name.ends_with(b".bin") || name.ends_with(b".bin.partial"))
+}
+
+/// Decides, before every replacement (the journal and the destination can change between samples), whether `dest` may
+/// be replaced. Rule (ADR 0032, round 4): **ownership of the destination is proved by what it is**, never by
+/// inspecting the journal, which may be impossible exactly when the failure report matters.
 ///
-/// `failed` is the error of the sample about to be reported, if it failed. When the journal can't be walked (it is
-/// unreadable, not a directory, or a symlink loop) the sample has failed too, and the check decides from what it can
-/// still establish (round 3): `dest` is not inside those directories by path, and is not the file the failed sample
-/// names in its error. Then the failure report (`tickertape_up 0`) is written, so a collector never keeps a stale
-/// healthy sample. If that can't be established either, the result is [`OutputCheck::Unknown`].
-fn check_output(
-    journal: &Path,
-    readers_dir: &Path,
-    dest: &Path,
-    failed: Option<&tickertape::Error>,
-) -> OutputCheck {
-    let Some(parent) = dest.parent() else {
-        return OutputCheck::Unknown("the output has no parent directory".into());
-    };
-    let quarantine = journal.join("quarantine");
-    let readers_dir =
-        std::path::absolute(readers_dir).unwrap_or_else(|_| readers_dir.to_path_buf());
-    for dir in [journal, &quarantine, &readers_dir] {
-        if parent.starts_with(dir) || dest == dir {
-            return OutputCheck::Refused;
-        }
-        match fs::canonicalize(dir) {
-            Ok(resolved) if parent.starts_with(&resolved) || dest == resolved => {
-                return OutputCheck::Refused;
+/// 1. Certain path checks: `dest`, as given and resolved, must not be or lie inside the journal directory, its
+///    `quarantine/` or the beacon directory, each as given and (when it can be resolved) resolved. A directory that
+///    can't be resolved is compared by path only: that failure grants nothing, since the next rules still apply.
+/// 2. Its name must not be one a writer gives a quarantined file ([`is_quarantine_name`]).
+/// 3. A path that doesn't exist is created. An existing one is replaced only if `lstat` shows a regular file (never a
+///    symlink, directory, FIFO, socket or device) that either starts as an output of `tickertape status` in one of
+///    its formats ([`is_status_output`]), or is empty and no entry of the journal directory, `quarantine/` or the
+///    beacon directory reaches it, by symlink or hard link (an empty file is the one kind a journal can also hold: a
+///    lock file whose PID wasn't written yet, a marker cut to zero, a temporary file just created). If those
+///    directories can't be listed, an empty file is refused.
+///
+/// `Err` says why the destination is refused and how to proceed.
+fn check_output(places: &JournalPlaces, dest: &Destination) -> std::result::Result<(), String> {
+    for dir in &places.dirs {
+        let resolved = fs::canonicalize(dir).ok();
+        for d in std::iter::once(dir).chain(resolved.as_ref()) {
+            if dest.given.starts_with(d) || dest.resolved.starts_with(d) {
+                return Err(format!(
+                    "it is or lies inside {}, which the journal uses (choose a path outside the journal directory, \
+                     its quarantine/ and the beacon directory)",
+                    d.display()
+                ));
             }
-            Ok(_) => {}
-            // Nothing there, a file where a directory component should be, or a symlink loop: nothing inside it.
-            Err(e) if names_nothing(&e) => {}
-            // A journal that can't be walked fails the sample; the path check above is what can be established.
-            Err(_) if failed.is_some() && dir.starts_with(journal) => {}
+        }
+    }
+    if dest.resolved.file_name().is_some_and(is_quarantine_name) {
+        return Err(
+            "its name is one a writer gives the files it quarantines (choose another name)".into(),
+        );
+    }
+    let lstat = match fs::symlink_metadata(&dest.resolved) {
+        Ok(m) => m,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("can't lstat it: {e} (choose another path)")),
+    };
+    let kind = lstat.file_type();
+    if kind.is_symlink() {
+        return Err(
+            "it is a symlink, which status never replaces (remove it, or choose another path)"
+                .into(),
+        );
+    }
+    if !kind.is_file() {
+        return Err("it is not a regular file (choose another path)".into());
+    }
+    let refuse = "it is neither empty nor an earlier output of tickertape status (remove it, or choose another path)";
+    // O_NOFOLLOW and the identity check: the file read is the one lstat saw; O_NONBLOCK: never hang on a FIFO put in
+    // its place meanwhile.
+    use std::os::unix::fs::{FileExt, OpenOptionsExt};
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&dest.resolved)
+        .map_err(|e| {
+            format!("can't read it to recognise it: {e} (remove it, or choose another path)")
+        })?;
+    let meta = file
+        .metadata()
+        .map_err(|e| format!("can't stat it: {e} (choose another path)"))?;
+    if !meta.is_file() || (meta.dev(), meta.ino()) != (lstat.dev(), lstat.ino()) {
+        return Err("it changed while it was checked (try again)".into());
+    }
+    let mut head = [0u8; PREFIX_READ];
+    let mut n = 0;
+    while n < head.len() {
+        match file.read_at(&mut head[n..], n as u64) {
+            Ok(0) => break,
+            Ok(k) => n += k,
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
             Err(e) => {
-                return OutputCheck::Unknown(format!("can't resolve {}: {e}", dir.display()));
+                return Err(format!(
+                    "can't read it to recognise it: {e} (remove it, or choose another path)"
+                ));
             }
         }
     }
-    // The file that renaming over `dest` would unlink, and (if `dest` is a symlink) the one it names.
-    let mut targets = Vec::new();
-    for meta in [fs::symlink_metadata(dest), fs::metadata(dest)] {
-        match meta {
-            Ok(m) => targets.push((m.dev(), m.ino())),
-            // Missing, or a symlink that names nothing (dangling, or a loop): no file there.
-            Err(e) if names_nothing(&e) => {}
-            Err(e) => return OutputCheck::Unknown(format!("can't stat the output: {e}")),
-        }
+    if n > 0 {
+        return if is_status_output(&head[..n]) {
+            Ok(())
+        } else {
+            Err(refuse.into())
+        };
     }
-    if targets.is_empty() {
-        // Nothing to replace yet.
-        return OutputCheck::Safe;
-    }
-    let reaches = |path: &Path| -> std::io::Result<bool> {
-        match fs::metadata(path) {
-            Ok(m) => Ok(targets.contains(&(m.dev(), m.ino()))),
-            // Vanished, a dangling symlink or a symlink loop: reaches no file.
-            Err(e) if names_nothing(&e) => Ok(false),
-            Err(e) => Err(e),
-        }
-    };
-    match walk_journal(journal, &quarantine, &reaches) {
-        Ok(true) => OutputCheck::Refused,
-        Ok(false) => OutputCheck::Safe,
-        // The sample failed too. A file its error names that can't be stat'ed either (a symlink loop) is no file the
-        // sample identified.
-        Err(_)
-            if failed
-                .and_then(error_path)
-                .is_some_and(|p| reaches(p).unwrap_or(false)) =>
-        {
-            OutputCheck::Refused
-        }
-        Err(_) if failed.is_some() => OutputCheck::Safe,
-        Err(walk) => OutputCheck::Unknown(walk),
+    match reached_from(&places.listed, (meta.dev(), meta.ino())) {
+        Ok(None) => Ok(()),
+        Ok(Some(entry)) => Err(format!(
+            "it is empty and the journal reaches it through {} (choose another path)",
+            entry.display()
+        )),
+        Err(why) => Err(format!(
+            "it is empty, and whether the journal uses it can't be established ({why}); remove it, or choose \
+             another path"
+        )),
     }
 }
 
-/// Whether an entry of the journal directory or of its `quarantine/` reaches a file for which `reaches` holds. An
-/// error says why that couldn't be established. A missing journal or `quarantine/` has no entries.
-fn walk_journal(
-    journal: &Path,
-    quarantine: &Path,
-    reaches: &dyn Fn(&Path) -> std::io::Result<bool>,
-) -> std::result::Result<bool, String> {
-    for dir in [journal, quarantine] {
+/// The first entry of `dirs` that reaches the file `id` (device, inode), following symlinks. A directory that doesn't
+/// exist, isn't a directory or is a symlink loop has no entries. `Err` says why a directory couldn't be listed or an
+/// entry couldn't be stat'ed.
+fn reached_from(dirs: &[PathBuf], id: (u64, u64)) -> std::result::Result<Option<PathBuf>, String> {
+    for dir in dirs {
         let entries = match fs::read_dir(dir) {
             Ok(entries) => entries,
             Err(e) if names_nothing(&e) => continue,
             Err(e) => return Err(format!("can't list {}: {e}", dir.display())),
         };
         for entry in entries {
-            let entry = entry.map_err(|e| format!("can't list {}: {e}", dir.display()))?;
-            match reaches(&entry.path()) {
-                Ok(true) => return Ok(true),
-                Ok(false) => {}
-                Err(e) => return Err(format!("can't stat {}: {e}", entry.path().display())),
+            let path = entry
+                .map_err(|e| format!("can't list {}: {e}", dir.display()))?
+                .path();
+            match fs::metadata(&path) {
+                Ok(m) if (m.dev(), m.ino()) == id => return Ok(Some(path)),
+                Ok(_) => {}
+                // Vanished, a dangling symlink or a symlink loop: reaches no file.
+                Err(e) if names_nothing(&e) => {}
+                Err(e) => return Err(format!("can't stat {}: {e}", path.display())),
             }
         }
     }
-    Ok(false)
+    Ok(None)
 }
 
 /// Whether a path that failed to resolve with `e` names no file or directory at all: it doesn't exist, a component is
@@ -404,16 +491,6 @@ fn walk_journal(
 fn names_nothing(e: &std::io::Error) -> bool {
     matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory)
         || e.raw_os_error() == Some(libc::ELOOP)
-}
-
-/// The file a failed sample names in its error, if any.
-fn error_path(error: &tickertape::Error) -> Option<&Path> {
-    match error {
-        tickertape::Error::Io { path, .. }
-        | tickertape::Error::Corrupt { path, .. }
-        | tickertape::Error::UnsupportedVersion { path, .. } => Some(path),
-        _ => None,
-    }
 }
 
 /// The `n`th candidate temporary name for replacing `path`, in the same directory.
@@ -1273,6 +1350,113 @@ mod tests {
                     .file_type()
                     .is_symlink()
             );
+        }
+    }
+
+    /// Round 4, item 1: every format's output, for a sample and for a failed sample, starts as `is_status_output`
+    /// expects (so an earlier output can always be replaced), and nothing a journal holds does.
+    #[test]
+    fn every_format_is_recognised() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = tickertape::Writer::open(
+            dir.path(),
+            tickertape::WriterConfig::default().segment_size(65536),
+        )
+        .unwrap();
+        writer
+            .append(&tickertape::NewRecord {
+                schema_id: 1,
+                venue_ts_ns: 0,
+                local_ts_ns: 0,
+                payload: b"x",
+            })
+            .unwrap();
+        writer.checkpoint().unwrap();
+        let journal = fs::canonicalize(dir.path()).unwrap();
+        let sample = Sampler::new(&journal).sample().unwrap();
+        let breaches = sample.breaches(&Thresholds::default());
+        let failed = tickertape::Error::NotFound {
+            dir: journal.clone(),
+        };
+        let mut outputs = Vec::new();
+        let mut text = String::new();
+        render_text(&mut text, &journal, &sample, &breaches);
+        outputs.push(text);
+        let mut text = String::new();
+        let _ = writeln!(text, "journal     {}", journal.display());
+        outputs.push(text);
+        let mut text = String::new();
+        json_line(&mut text, &JsonStatus::new(&journal, &sample, &breaches)).unwrap();
+        outputs.push(text);
+        let mut text = String::new();
+        json_line(
+            &mut text,
+            &JsonError {
+                schema_version: SCHEMA_VERSION,
+                journal: journal.to_string_lossy().into_owned(),
+                sampled_unix_ns: 1,
+                error: JsonErrorBody {
+                    code: error_code(&failed),
+                    message: failed.to_string(),
+                },
+            },
+        )
+        .unwrap();
+        outputs.push(text);
+        let mut text = String::new();
+        render_prometheus(&mut text, &journal, Some((&sample, &breaches)), None);
+        outputs.push(text);
+        let mut text = String::new();
+        render_prometheus(&mut text, &journal, None, Some(1));
+        outputs.push(text);
+        for output in &outputs {
+            let head = &output.as_bytes()[..output.len().min(PREFIX_READ)];
+            assert!(is_status_output(head), "{output}");
+        }
+        assert!(is_status_output(
+            b"{\"schema_version\":12,\"journal\":\"/j\""
+        ));
+        // What a journal holds: a segment, the marker, the notify record, writer.lock (a PID), a beacon; and
+        // prefixes of an output that are too short to tell.
+        let segment = fs::read(journal.join("00000000000000000000.tape")).unwrap();
+        let marker = fs::read(journal.join("checkpoint")).unwrap();
+        let lock = fs::read(journal.join("writer.lock")).unwrap();
+        for bytes in [
+            &segment[..PREFIX_READ],
+            &marker[..PREFIX_READ],
+            &lock[..],
+            b"TTNOTIFY\x01\0\0\0",
+            b"TTREADER\x01\0\0\0",
+            b"journal     ",
+            b"journal     j",
+            b"{\"schema_version\":,\"journal\":\"/",
+            b"{\"schema_version\":1,\"journal\":\"j",
+            b"# HELP tickertape_status_timestamp_seconds",
+            b"# HELP tickertape_up ",
+            b"",
+        ] {
+            assert!(!is_status_output(bytes), "{bytes:?}");
+        }
+        drop(writer);
+    }
+
+    #[test]
+    fn quarantine_names() {
+        use std::ffi::OsStr;
+        for name in [
+            "00000000000000000000.tape-0.bin",
+            "00000000000000000062-000000000064-1763600000000000000-0.bin",
+            "00000000000000000062-000000000064-1763600000000000000.bin.partial",
+        ] {
+            assert!(is_quarantine_name(OsStr::new(name)), "{name}");
+        }
+        for name in [
+            "status.bin",
+            "tickertape.prom",
+            "00000000000000000000.tape",
+            "0000000000000000000.bin",
+        ] {
+            assert!(!is_quarantine_name(OsStr::new(name)), "{name}");
         }
     }
 

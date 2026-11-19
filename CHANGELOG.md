@@ -32,7 +32,8 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   - CLI: `tickertape status <DIR>` with text, `--json` (`schema_version` 1) and `--format prometheus` output,
     `--watch` (failed samples are reported and the watch continues; `tickertape_up` and
     `tickertape_status_timestamp_seconds` show staleness), `--output` (atomic replace through an exclusively created
-    temporary file, for a node_exporter textfile collector), and health thresholds (`--max-checkpoint-age`,
+    temporary file, for a node_exporter textfile collector; it replaces only an earlier status output or an empty
+    file, never a symlink or anything else), and health thresholds (`--max-checkpoint-age`,
     `--min-headroom`, `--min-headroom-segments`, `--max-reader-lag`) that exit with code 3; a journal the sample
     finds corrupt (or the writer would refuse) exits with 2. A journal missing at start-up is reported as a failed
     sample (`tickertape_up 0`).

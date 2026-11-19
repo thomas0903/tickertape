@@ -594,10 +594,11 @@ fn watch_output_file_and_samples() {
         .code(0)
         .stdout(predicate::str::contains("UNHEALTHY").count(2));
 
-    // --output replaces the file atomically and leaves no temporary file behind.
+    // --output replaces the file atomically and leaves no temporary file behind (an empty file, as `touch` leaves it,
+    // may be replaced).
     let outdir = tempfile::tempdir().unwrap();
     let target = outdir.path().join("tickertape.prom");
-    fs::write(&target, "old").unwrap();
+    fs::write(&target, "").unwrap();
     command()
         .args(["status", path, "--format", "prometheus", "--output"])
         .arg(&target)
@@ -778,9 +779,7 @@ fn output_never_replaces_a_file_the_journal_uses() {
             .args(args)
             .assert()
             .code(1)
-            .stderr(predicate::str::contains(
-                "the journal or its beacon directory uses",
-            ));
+            .stderr(predicate::str::contains("not written"));
         assert_eq!(
             fs::read(&backing).unwrap(),
             before,
@@ -1171,7 +1170,7 @@ fn output_reports_a_journal_that_cant_be_walked() {
         }
     }
     assert_eq!(fs::read_dir(outdir.path()).unwrap().count(), 1);
-    // An output that is itself a symlink loop names no file: it is replaced.
+    // Round 4: an output that is itself a symlink (here a loop) is never replaced.
     fs::remove_file(&target).unwrap();
     std::os::unix::fs::symlink(&target, &target).unwrap();
     command()
@@ -1184,15 +1183,16 @@ fn output_reports_a_journal_that_cant_be_walked() {
         ])
         .arg(&target)
         .assert()
-        .code(0);
-    assert_eq!(up_in(&target), 1.0);
+        .code(1)
+        .stderr(predicate::str::contains("is a symlink"));
+    assert_eq!(fs::read_link(&target).unwrap(), target);
 }
 
-/// Round 3, item 1 (c): when it can't be established that the destination is not something the journal uses (here
-/// the beacon directory chosen with --readers-dir can't be resolved), nothing is written, the reason goes to standard
-/// error every time, and a watch goes on; a one-shot status exits 1.
+/// Round 4, item 1: a beacon directory that can't be resolved (round 3: the output was then "not established" and
+/// never written) no longer stands in the way of replacing an earlier output, in a watch and once; and an existing file
+/// that is not an earlier output is refused at the first sample, left byte for byte, and stops a watch (exit 1).
 #[test]
-fn output_not_established_is_reported_and_the_watch_goes_on() {
+fn output_ownership_does_not_depend_on_the_journal() {
     use std::os::unix::fs::PermissionsExt;
     if is_root() {
         return;
@@ -1206,8 +1206,9 @@ fn output_not_established_is_reported_and_the_watch_goes_on() {
     fs::set_permissions(locked.path().join("sub"), fs::Permissions::from_mode(0o000)).unwrap();
     let outdir = tempfile::tempdir().unwrap();
     let target = outdir.path().join("t.prom");
-    fs::write(&target, b"previous").unwrap();
-    let run = |watch: bool| {
+    let unrelated = outdir.path().join("notes.txt");
+    fs::write(&unrelated, b"previous").unwrap();
+    let run = |target: &std::path::Path, watch: bool| {
         let mut cmd = command();
         cmd.args([
             "status",
@@ -1218,21 +1219,40 @@ fn output_not_established_is_reported_and_the_watch_goes_on() {
         .arg("--readers-dir")
         .arg(&readers)
         .arg("--output")
-        .arg(&target);
+        .arg(target);
         if watch {
             cmd.args(["--watch", "10ms", "--samples", "3"]);
         }
         cmd.output().unwrap()
     };
-    let watched = run(true);
-    let once = run(false);
+    let created = run(&target, false);
+    let watched = run(&target, true);
+    let once = run(&target, false);
+    let refused_watch = run(&unrelated, true);
+    let refused_once = run(&unrelated, false);
     fs::set_permissions(locked.path().join("sub"), fs::Permissions::from_mode(0o755)).unwrap();
-    let stderr = String::from_utf8_lossy(&watched.stderr);
-    assert_eq!(watched.status.code(), Some(0), "{stderr}");
-    assert_eq!(stderr.matches("not written").count(), 3, "{stderr}");
-    assert_eq!(once.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&once.stderr).contains("not written"));
-    assert_eq!(fs::read(&target).unwrap(), b"previous");
+    for (out, code) in [(&created, 0), (&watched, 0), (&once, 0)] {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(code), "{stderr}");
+        assert!(!stderr.contains("not written"), "{stderr}");
+    }
+    assert_eq!(up_in(&target), 1.0);
+    for out in [&refused_watch, &refused_once] {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{stderr}");
+        // Once: a watch stops at the first output it can't write.
+        assert_eq!(stderr.matches("not written").count(), 1, "{stderr}");
+        assert!(
+            stderr.contains("neither empty nor an earlier output of tickertape status"),
+            "{stderr}"
+        );
+        assert!(
+            stderr.contains("remove it, or choose another path"),
+            "{stderr}"
+        );
+    }
+    assert_eq!(fs::read(&unrelated).unwrap(), b"previous");
+    assert_eq!(fs::read_dir(outdir.path()).unwrap().count(), 2);
 }
 
 /// Round 3, item 2: `--output` never replaces quarantined evidence: not a file in a `quarantine/` that is a symlink
@@ -1273,10 +1293,417 @@ fn output_never_replaces_quarantined_evidence() {
             if watch {
                 cmd.args(["--watch", "10ms", "--samples", "1"]);
             }
-            cmd.assert().code(1).stderr(predicate::str::contains(
-                "the journal or its beacon directory uses",
-            ));
+            cmd.assert()
+                .code(1)
+                .stderr(predicate::str::contains("not written"));
             assert_eq!(fs::read(victim).ok(), before, "{}", victim.display());
         }
+    }
+}
+
+/// Runs a one-shot (or, with `watch`, a 3-sample) `status <dir> --format <format> --output <target>` with `extra`
+/// arguments.
+fn status_to(
+    dir: &std::path::Path,
+    format: &str,
+    target: &std::path::Path,
+    watch: bool,
+    extra: &[&str],
+) -> std::process::Output {
+    let mut cmd = command();
+    cmd.arg("status")
+        .arg(dir)
+        .args(["--format", format, "--output"])
+        .arg(target)
+        .args(extra);
+    if watch {
+        cmd.args(["--watch", "10ms", "--samples", "3"]);
+    }
+    cmd.output().unwrap()
+}
+
+/// Round 4, item 1 (a): the journal directory can't be listed and `quarantine` is a symlink to another directory, so
+/// the quarantine can't be resolved and the walk fails. Before the fix the failure report was renamed over the
+/// quarantined file. Now neither a quarantined copy (under its own name or another), nor an empty file there, is
+/// replaced, once or in a watch; while a stale healthy output elsewhere still gets `tickertape_up 0`.
+#[test]
+fn output_case_a_unlistable_journal_with_a_quarantine_symlink() {
+    use std::os::unix::fs::PermissionsExt;
+    if is_root() {
+        return;
+    }
+    let _serial = serial();
+    let (dir, writer) = journal(3, true);
+    drop(writer);
+    let elsewhere = tempfile::tempdir().unwrap();
+    let evidence = elsewhere.path().join("evidence");
+    fs::create_dir(&evidence).unwrap();
+    std::os::unix::fs::symlink(&evidence, dir.path().join("quarantine")).unwrap();
+    let segment = fs::read(dir.path().join("00000000000000000000.tape")).unwrap();
+    let named = evidence.join("00000000000000000000.tape-0.bin");
+    let copy = evidence.join("copy");
+    let tail = evidence.join("tail");
+    let empty = evidence.join("empty");
+    fs::write(&named, &segment).unwrap();
+    fs::write(&copy, &segment).unwrap();
+    fs::write(&tail, &segment[64..2000]).unwrap();
+    fs::write(&empty, b"").unwrap();
+    let outdir = tempfile::tempdir().unwrap();
+    let stale = outdir.path().join("t.prom");
+    assert_eq!(
+        status_to(dir.path(), "prometheus", &stale, false, &[])
+            .status
+            .code(),
+        Some(0)
+    );
+    assert_eq!(up_in(&stale), 1.0);
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o000)).unwrap();
+    let mut results = Vec::new();
+    for victim in [&named, &copy, &tail, &empty] {
+        for watch in [false, true] {
+            results.push((
+                victim,
+                watch,
+                status_to(dir.path(), "prometheus", victim, watch, &[]),
+            ));
+        }
+    }
+    let reported = status_to(dir.path(), "prometheus", &stale, true, &[]);
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+    for (victim, watch, out) in &results {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "{}, watch {watch}: {stderr}",
+            victim.display()
+        );
+        assert!(
+            stderr.contains("not written"),
+            "{}, watch {watch}: {stderr}",
+            victim.display()
+        );
+    }
+    assert_eq!(fs::read(&named).unwrap(), segment);
+    assert_eq!(fs::read(&copy).unwrap(), segment);
+    assert_eq!(fs::read(&tail).unwrap(), &segment[64..2000]);
+    assert_eq!(fs::read(&empty).unwrap(), b"");
+    assert_eq!(fs::read_dir(&evidence).unwrap().count(), 4);
+    assert_eq!(
+        reported.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&reported.stderr)
+    );
+    assert_eq!(up_in(&stale), 0.0);
+}
+
+/// Round 4, item 1 (b): the journal can be listed, the sample fails for another reason (no segments), and
+/// `quarantine/` can't be listed but holds symlinks to the destination. Before the fix the walk's error let the
+/// failure report replace it. Now the destination (evidence, or an empty file) is refused; an earlier output is still
+/// replaced by the failure report.
+#[test]
+fn output_case_b_unlistable_quarantine_holding_a_symlink() {
+    use std::os::unix::fs::PermissionsExt;
+    if is_root() {
+        return;
+    }
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let quarantine = dir.path().join("quarantine");
+    fs::create_dir(&quarantine).unwrap();
+    let outdir = tempfile::tempdir().unwrap();
+    let evidence = outdir.path().join("evidence");
+    let empty = outdir.path().join("empty");
+    fs::write(&evidence, b"TICKTAPE repaired-away bytes").unwrap();
+    fs::write(&empty, b"").unwrap();
+    std::os::unix::fs::symlink(&evidence, quarantine.join("x-0.bin")).unwrap();
+    std::os::unix::fs::symlink(&empty, quarantine.join("y-0.bin")).unwrap();
+    let earlier = outdir.path().join("t.json");
+    fs::write(
+        &earlier,
+        b"{\"schema_version\":1,\"journal\":\"/elsewhere\"}\n",
+    )
+    .unwrap();
+    fs::set_permissions(&quarantine, fs::Permissions::from_mode(0o000)).unwrap();
+    let mut results = Vec::new();
+    for victim in [&evidence, &empty] {
+        for watch in [false, true] {
+            results.push((
+                victim,
+                watch,
+                status_to(dir.path(), "json", victim, watch, &[]),
+            ));
+        }
+    }
+    let replaced = status_to(dir.path(), "json", &earlier, false, &[]);
+    fs::set_permissions(&quarantine, fs::Permissions::from_mode(0o755)).unwrap();
+    for (victim, watch, out) in &results {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "{}, watch {watch}: {stderr}",
+            victim.display()
+        );
+        assert!(
+            stderr.contains("not written"),
+            "{}, watch {watch}: {stderr}",
+            victim.display()
+        );
+    }
+    assert_eq!(
+        fs::read(&evidence).unwrap(),
+        b"TICKTAPE repaired-away bytes"
+    );
+    assert_eq!(fs::read(&empty).unwrap(), b"");
+    // The sample failed (exit 1), and its report replaced the earlier output.
+    assert_eq!(replaced.status.code(), Some(1));
+    let v: Value = serde_json::from_slice(&fs::read(&earlier).unwrap()).unwrap();
+    assert!(v["error"]["code"].is_string(), "{v}");
+}
+
+/// Round 4, item 1 (c): `status` is given the journal through a symlink and `--output` names that same symlink.
+/// Before the fix `run` compared only the canonical journal and the rename replaced the symlink. Now it is refused
+/// (inside the journal as given), by absolute and by relative path, and the symlink is left alone.
+#[test]
+fn output_case_c_the_journal_symlink_itself() {
+    let _serial = serial();
+    let (dir, writer) = journal(2, true);
+    drop(writer);
+    let tmp = tempfile::tempdir().unwrap();
+    let link = tmp.path().join("jlink");
+    std::os::unix::fs::symlink(dir.path(), &link).unwrap();
+    for watch in [false, true] {
+        let out = status_to(&link, "prometheus", &link, watch, &[]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{stderr}");
+        assert!(stderr.contains("which the journal uses"), "{stderr}");
+        assert_eq!(fs::read_link(&link).unwrap(), dir.path());
+    }
+    let out = command()
+        .current_dir(tmp.path())
+        .args([
+            "status",
+            "jlink",
+            "--format",
+            "prometheus",
+            "--output",
+            "jlink",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(fs::read_link(&link).unwrap(), dir.path());
+    assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 1);
+    // A file inside the journal reached through the symlink is refused too.
+    let inside = link.join("status.prom");
+    assert_eq!(
+        status_to(&link, "prometheus", &inside, false, &[])
+            .status
+            .code(),
+        Some(1)
+    );
+    assert!(!dir.path().join("status.prom").exists());
+}
+
+/// Round 4, item 1: an earlier output in each format, of a sample and of a failed sample, is replaced by an output in
+/// each format; a symlink to an earlier output and a symlink to anything else are refused; an empty file is replaced
+/// unless a journal entry reaches it.
+#[test]
+fn output_replaces_earlier_outputs_only() {
+    let _serial = serial();
+    let (dir, writer) = journal(2, true);
+    drop(writer);
+    let missing = dir.path().join("missing");
+    let outdir = tempfile::tempdir().unwrap();
+    let target = outdir.path().join("status.out");
+    let formats = ["text", "json", "prometheus"];
+    let first = |format: &str| match format {
+        "text" => "journal     /",
+        "json" => "{\"schema_version\":1,\"journal\":\"/",
+        _ => "# HELP tickertape_status_timestamp_seconds ",
+    };
+    for from in formats {
+        for from_journal in [dir.path(), &missing] {
+            for to in formats {
+                let _ = fs::remove_file(&target);
+                let out = status_to(from_journal, from, &target, false, &[]);
+                assert!(out.status.code() == Some(0) || out.status.code() == Some(1));
+                assert!(
+                    fs::read_to_string(&target)
+                        .unwrap()
+                        .starts_with(first(from))
+                );
+                let out = status_to(dir.path(), to, &target, false, &[]);
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                assert_eq!(out.status.code(), Some(0), "{from} -> {to}: {stderr}");
+                assert!(
+                    fs::read_to_string(&target).unwrap().starts_with(first(to)),
+                    "{from} -> {to}"
+                );
+            }
+        }
+    }
+    // Symlinks are never replaced, whatever they name.
+    let unrelated = outdir.path().join("unrelated");
+    fs::write(&unrelated, b"keep me").unwrap();
+    let earlier = fs::read(&target).unwrap();
+    for (name, to) in [("to-output", &target), ("to-other", &unrelated)] {
+        let link = outdir.path().join(name);
+        std::os::unix::fs::symlink(to, &link).unwrap();
+        for watch in [false, true] {
+            let out = status_to(dir.path(), "prometheus", &link, watch, &[]);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(out.status.code(), Some(1), "{name}: {stderr}");
+            assert!(stderr.contains("is a symlink"), "{name}: {stderr}");
+            assert_eq!(fs::read_link(&link).unwrap(), *to);
+        }
+    }
+    assert_eq!(fs::read(&target).unwrap(), earlier);
+    assert_eq!(fs::read(&unrelated).unwrap(), b"keep me");
+    // A directory or a FIFO is not a regular file.
+    let sub = outdir.path().join("sub");
+    fs::create_dir(&sub).unwrap();
+    let fifo = outdir.path().join("fifo");
+    let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+    // SAFETY: a valid NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+    for path in [&sub, &fifo] {
+        let out = status_to(dir.path(), "prometheus", path, false, &[]);
+        assert_eq!(out.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&out.stderr).contains("not a regular file"));
+    }
+    // An empty file is replaced, unless the journal reaches it (here through a symlink in the journal directory).
+    let empty = outdir.path().join("empty");
+    fs::write(&empty, b"").unwrap();
+    std::os::unix::fs::symlink(&empty, dir.path().join("odd")).unwrap();
+    let out = status_to(dir.path(), "prometheus", &empty, false, &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("the journal reaches it"), "{stderr}");
+    assert_eq!(fs::read(&empty).unwrap(), b"");
+    fs::remove_file(dir.path().join("odd")).unwrap();
+    assert_eq!(
+        status_to(dir.path(), "prometheus", &empty, false, &[])
+            .status
+            .code(),
+        Some(0)
+    );
+    assert_eq!(up_in(&empty), 1.0);
+    // A name a writer gives quarantined files is refused, even where nothing exists yet.
+    let qname = outdir.path().join("00000000000000000000.tape-0.bin");
+    assert_eq!(
+        status_to(dir.path(), "prometheus", &qname, false, &[])
+            .status
+            .code(),
+        Some(1)
+    );
+    assert!(!qname.exists());
+}
+
+/// Round 4, item 2: one exit-code rule when both a sample's verdict and an output failure apply. The verdict wins (2
+/// corrupt, whether the sample failed or found corruption; 3 unhealthy; 1 a failed sample), and the output failure is
+/// on stderr; a healthy sample whose output can't be written exits 1. The output failure is a refused destination or
+/// a write that fails. Before the fix a refused destination exited 1 and a failed write exited 1 whatever the sample
+/// found.
+#[test]
+fn exit_code_when_the_output_cannot_be_written() {
+    use std::os::unix::fs::PermissionsExt;
+    let _serial = serial();
+    let (healthy, writer) = journal(3, true);
+    drop(writer);
+    let (invalid_head, writer) = journal(3, false);
+    drop(writer);
+    let segment = invalid_head.path().join("00000000000000000000.tape");
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&segment)
+        .unwrap()
+        .write_all_at(&[0], 64 + 2 * 1040 + 40)
+        .unwrap();
+    let (bad_header, writer) = journal(3, false);
+    drop(writer);
+    fs::OpenOptions::new()
+        .write(true)
+        .open(bad_header.path().join("00000000000000000000.tape"))
+        .unwrap()
+        .write_all_at(&[0], 0)
+        .unwrap();
+    let missing = healthy.path().join("missing");
+    let outdir = tempfile::tempdir().unwrap();
+    let unrelated = outdir.path().join("notes.txt");
+    fs::write(&unrelated, b"keep me").unwrap();
+    let huge = ["--min-headroom", "1048576T"];
+    let cases: [(&std::path::Path, &[&str], i32); 5] = [
+        (healthy.path(), &[], 1),
+        (healthy.path(), &huge, 3),
+        (invalid_head.path(), &[], 2),
+        (bad_header.path(), &[], 2),
+        (&missing, &[], 1),
+    ];
+    for (journal, extra, code) in cases {
+        for format in ["text", "json", "prometheus"] {
+            let out = status_to(journal, format, &unrelated, false, extra);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(
+                out.status.code(),
+                Some(code),
+                "{}: {stderr}",
+                journal.display()
+            );
+            assert!(
+                stderr.contains("not written"),
+                "{}: {stderr}",
+                journal.display()
+            );
+            assert_eq!(fs::read(&unrelated).unwrap(), b"keep me");
+        }
+    }
+    // A write that fails: the output directory is read-only.
+    if !is_root() {
+        let readonly = tempfile::tempdir().unwrap();
+        let target = readonly.path().join("t.prom");
+        fs::set_permissions(readonly.path(), fs::Permissions::from_mode(0o555)).unwrap();
+        let mut results = Vec::new();
+        for (journal, extra, code) in cases {
+            results.push((
+                journal,
+                code,
+                status_to(journal, "prometheus", &target, false, extra),
+            ));
+        }
+        let watched = status_to(healthy.path(), "prometheus", &target, true, &[]);
+        fs::set_permissions(readonly.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        for (journal, code, out) in results {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(
+                out.status.code(),
+                Some(code),
+                "{}: {stderr}",
+                journal.display()
+            );
+            assert!(
+                stderr.contains("temporary output"),
+                "{}: {stderr}",
+                journal.display()
+            );
+        }
+        let stderr = String::from_utf8_lossy(&watched.stderr);
+        assert_eq!(watched.status.code(), Some(1), "{stderr}");
+        assert_eq!(stderr.matches("temporary output").count(), 1, "{stderr}");
+        assert!(!target.exists());
+    }
+    // Every output written: the sample's verdict alone.
+    let target = outdir.path().join("t.prom");
+    for (journal, extra, code) in cases {
+        let out = status_to(journal, "prometheus", &target, false, extra);
+        let expected = if journal == healthy.path() && extra.is_empty() {
+            0
+        } else {
+            code
+        };
+        assert_eq!(out.status.code(), Some(expected), "{}", journal.display());
+        assert!(!String::from_utf8_lossy(&out.stderr).contains("not written"));
     }
 }
