@@ -148,66 +148,47 @@ Never truncate or edit a segment in place while anything uses the journal: proce
   than about 50 ms to fill a single record whose payload itself contains valid tickertape frames with nearby sequence
   numbers (a journal that stores another journal's raw frames), `verify` can report that record as an empty commit
   word in front of committed records while it is being written; a second run after the record is committed reports
-  nothing. With no writer running, every problem it reports is real. `verify` reads the whole newest segment,
-  including the unwritten part after the last record.
+  nothing. With no writer running, every problem it reports is real. Where a segment's records end at an empty
+  commit word, `verify` also searches the rest of that segment: it reads backward from the segment's end to find the
+  last non-zero byte, then checks the candidates up to it, and can stop early (`cli.md` → `verify`).
 - `tickertape inspect <dir>` lists segments, their sequence ranges and fill level, and the checkpoint marker.
 
 ## After a crash
 
 - **Writer process crash:** just start the writer again. It cleans up a partly written record and continues with the
-  next sequence number (C1–C4). Its `recovery_report()` lists what it did; after a plain process crash it contains at
-  most a zeroed uncommitted tail, a completed seal or roll, and removed temporary files, with one exception: if the
-  record being written had a payload holding a valid record frame whose sequence number falls in recovery's window
-  (for example raw frames copied from another journal), or ending with the eight bytes of a valid seal for one, and
-  the crash interrupted it before the body was complete (including a payload written in full whose checksum was not
-  yet stored), or the payload ends in more than 63 zero bytes, recovery
-  cannot tell those bytes from damage (`EmptyCommitWord`, ADR 0035). The same holds for a payload holding several
-  header-shaped byte sequences (copies of this journal's record headers, for example) whose length claims exhaust
-  recovery's work budget (every candidate checked before the budget runs out fails its checksum, and the one that
-  would exceed it is not checked: `UncheckedTail`). With the default `Quarantine` it then
-  reports a `RepairedTail`, the torn record's bytes are in `quarantine/`, and nothing committed is lost. With
-  `RecoveryPolicy::Fail` the writer refuses to open: look at the frame at the reported file and offset (it should
-  carry the expected sequence number in its header, with the frames or headers that count as evidence inside its
-  payload); if
-  so, it was the record being written, so open the writer once with `RecoveryPolicy::Quarantine`, which preserves it
-  and continues. If not, treat it as the storage damage below.
+  next sequence number (C1–C4). Its `recovery_report()` usually lists at most a zeroed uncommitted tail, a completed
+  seal or roll, and removed temporary files. The exception (crash contract C1): the record being written can hold
+  bytes that recovery's search counts as committed records (raw frames copied from another journal, for example), and
+  recovery then reports `EmptyCommitWord` or `UncheckedTail`. With the default `Quarantine` it preserves those bytes
+  in `quarantine/` (`RepairedTail`) and continues; nothing committed is lost. With `RecoveryPolicy::Fail` the writer
+  refuses to open. The bytes alone cannot tell this from storage damage: a frame at the reported file and offset that
+  carries the expected sequence number, with the candidates inside its payload, is consistent with a torn append, but
+  damage can leave the same bytes (ADR 0035). Decide from what the application knows it was writing when the process
+  died: if it was such a payload, open the writer once with `RecoveryPolicy::Quarantine`, which preserves those bytes
+  and continues; if not, treat it as the storage damage below.
 - **Power loss or storage errors:** the writer validates the journal from the last checkpoint. Corrupt or
-  disconnected data it detects is moved to `quarantine/` (not deleted; what is zeroed in place instead is below),
-  or, with `RecoveryPolicy::Fail`, the writer refuses to
-  open so that a human can look first. That includes committed records hidden behind a zeroed commit word
-  (`EmptyCommitWord`, or `UncheckedTail` when the bytes were too costly to check completely): the quarantine file
-  starts at the empty word and holds them byte for byte (ADR 0035). A quarantine file of a tail stops at the last
-  non-zero byte: the zeros after it are left out. To restore records from it, copy it back to the offset in its name
-  and keep the rest of the segment zero (or, outside a segment, append zeros): a last record whose payload ends in
-  zero bytes declares a length that reaches past the end of the copy, and it only validates with those zeros put
-  back. When
-  recovery's search completes and finds no evidence of committed history (what counts: `format.md` → Recovery,
-  step 4), the damage can't be told from a crash and is zeroed in place like a torn append, under either policy,
-  without a copy: for example the commit words of the newest records zeroed, or a valid final seal more than 128
-  records away when nothing else is found. A damaged seal comes first: when a segment for exactly the expected
-  sequence number exists, is not the segment being scanned, has not been scanned yet and opens (the writer opens
-  and maps it; a valid header is not enough), the seal in front of it is rewritten, in place when only its checksum
-  word is left, otherwise after the bytes after it are preserved and the segment replaced (`Fail` refuses with
-  `BadSeal` instead). That seal repair keeps every record of the segment; the next segment is then checked as
-  usual. When that next segment exists but does not open and the search finds nothing, the bytes after the empty
-  commit word are zeroed in place without a copy, under both policies (a known gap, crash contract C11). If
-  `quarantine/` holds two files with identical bytes for the same position, a repair was interrupted and repeated;
-  either copy can be deleted.
+  disconnected data it detects is usually moved to `quarantine/`, not deleted, or, with `RecoveryPolicy::Fail`, the
+  writer refuses to open so that a human can look first. That includes committed records hidden behind a zeroed
+  commit word, when recovery finds evidence of them (`EmptyCommitWord`, or `UncheckedTail` when the bytes were too
+  costly to check completely; crash contract C11): the quarantine file starts at the empty word (ADR 0035). A
+  quarantine file of a tail stops at the last non-zero byte: the zeros after it are left out. To restore records from
+  it, copy it back to the offset in its name and keep the rest of the segment zero (or, outside a segment, append
+  zeros): a last record whose payload ends in zero bytes declares a length that reaches past the end of the copy, and
+  it only validates with those zeros put back. Some bytes are zeroed in place without a copy: damage that recovery
+  cannot tell from a crash, and, for now, the bytes in front of a next segment that does not open (crash contract C8
+  and C11). A damaged seal in front of a next segment that opens is rewritten, keeping the records of its segment
+  (C11 (1)). If `quarantine/` holds two files with identical bytes for the same position, a repair was interrupted
+  and repeated; either copy can be deleted.
   Readers that had seen discarded records get `Error::Discarded`, except after a repair in place (damage that can't
   be told from a crash, as above, so recovery zeroes the records after the empty commit word in the same file), which
   visible readers can't notice: they may continue into the new history, wait, or report corruption, until seeked to
   their position (crash contract C11). Durable-only readers never return records that recovery discarded, unless the
   damage also destroyed the checkpoint marker (C13).
-- **What `Fail` still does when it refuses:** it does not change the bytes of the corruption it reports or anything
-  after them in that segment, and moves no file, but the open is not read-only. It records its PID in the lock file,
-  removes stale temporary files (`*.tape.tmp`,
-  `next-segment.tmp`) before scanning, and keeps the clean-ups a crash needs that come before the corruption: a
-  zeroed torn tail, a seal written after a crash between publishing the next segment and sealing (for example the
-  seal of the segment in front of a corrupt one), a created missing successor. When the next segment exists but does
-  not open, recovery first zeroes in place what follows the last record of the segment in front of it (the seal's
-  checksum word, or other bytes in which it finds no committed record when no segment follows that next one), which
-  can erase damaged bytes earlier in the scan than the corruption it then reports, and refuses at that next segment
-  (`BrokenChain`); the zeroing stays (crash contract C11, known gap).
+- **What `Fail` still does when it refuses:** it leaves the bytes of the corruption it reports, and everything after
+  them in that segment, unchanged, and moves no file, but the open is not read-only. Before scanning it may create
+  the lock file and the checkpoint file or extend the checkpoint file, writes its PID into the lock file (best
+  effort), and removes stale temporary files (`*.tape.tmp`, `next-segment.tmp`); and it keeps changes recovery made
+  earlier in the scan, including bytes zeroed in place. Crash contract C11 lists them.
 - **Refused to open** (missing checkpoint segment or a gap in the chain): restore the missing segments from a copy,
   or move the affected segments aside knowingly. tickertape won't discard history on its own.
 

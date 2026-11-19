@@ -118,14 +118,14 @@ repair" to consider.
 
 ### In-place repairs
 
-Recovery doesn't always replace a file. At an empty commit word it zeroes the rest of the segment in place
+Recovery doesn't always replace a file. At an empty commit word it can zero the rest of the segment in place
 (`format.md` → Recovery, step 4), and the new writer appends into the same file. After a writer *process* crash the
 bytes it zeroes were never committed. But storage damage (C11) that empties the commit word of a committed record
 after the checkpoint makes that record look like the end, so recovery removes it and every record after it in
 place, on the same inode. Recovery could replace the file instead whenever it can tell that committed records follow
 the empty word; it can't tell when only the newest record's commit word is lost, so this shape remains. (ADR
-[0035](0035-recovery-preserves-a-committed-tail.md) has since made recovery replace the file whenever it finds
-committed history after the empty word; the in-place repair remains for damage it can't tell from a torn append,
+[0035](0035-recovery-preserves-a-committed-tail.md) has since made recovery usually replace the file when it finds
+committed history after the empty word (crash contract C11); the in-place repair remains for damage it can't tell from a torn append,
 such as the newest record's commit word zeroed, and that is the case below.) The file keeps its identity, so no
 identity check can see it. What it means:
 

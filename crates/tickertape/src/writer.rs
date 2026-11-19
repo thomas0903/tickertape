@@ -928,7 +928,8 @@ impl Recovery<'_> {
                     if let Some(reason) = tail_end.and_then(|end| {
                         committed_after_empty(&seg, offset, seq, end, &bases, &visited)
                     }) {
-                        // Not a torn append: storage damage hid committed records (ADR 0035).
+                        // Evidence of committed history, or a search stopped at its work bound: a committed tail (ADR
+                        // 0035; usually storage damage, but a torn payload can lead here too, crash contract C1).
                         if self.config.recovery == RecoveryPolicy::Fail {
                             return Err(Error::corrupt(&seg.path, offset, reason));
                         }
@@ -1143,7 +1144,7 @@ impl Recovery<'_> {
         Ok(fin)
     }
 
-    /// Repairs a corrupt committed tail by replacement (`docs/format.md` → Recovery, step 4).
+    /// Repairs a corrupt tail by replacement (`docs/format.md` → Recovery, step 4, last row).
     fn repair_tail(&mut self, seg: Segment, offset: u64, reason: CorruptReason) -> Result<Segment> {
         let quarantine_file = self.preserve_bytes(&seg, offset)?;
         let tmp = journal::tmp_path(self.dir, seg.base);
@@ -1217,13 +1218,13 @@ impl Recovery<'_> {
 
 /// Committed history after an empty slot at `offset` of `seg`, where a scan expecting `seq` stopped and whose
 /// non-zero bytes end at `tail_end` (ADR 0035): a later record or final seal in the segment that validates with a
-/// sequence number its position allows, or a segment with a larger base than `seq`, which only exists if record
-/// `seq` was committed. Returns how to report it: [`CorruptReason::EmptyCommitWord`] with the sequence number the
+/// sequence number its position allows, or a segment with a larger base than `seq`, which a process crash leaves
+/// only after record `seq` was committed. Returns how to report it: [`CorruptReason::EmptyCommitWord`] with the sequence number the
 /// evidence carries (a record's, a seal's next sequence number, or a segment's base), or
-/// [`CorruptReason::UncheckedTail`] when the search in the segment stopped at its work bound. A torn append leaves
-/// none of these, except in the process-crash exception (a torn payload holding frames or header-shaped bytes, ADR
-/// 0035). A segment with a larger base counts only when the caller found non-zero bytes after the commit word
-/// (`tail_end`), and not in the case below.
+/// [`CorruptReason::UncheckedTail`] when the search in the segment stopped at its work bound. After a process crash
+/// none of these is usually present; the exception is a torn payload whose bytes form a candidate (crash contract C1).
+/// A segment with a larger base counts only when the caller found non-zero bytes after the commit word (`tail_end`),
+/// and not in the case below.
 ///
 /// The caller has already handled a successor for exactly `seq` that opens (a seal belongs at `offset`). A later
 /// segment is still not evidence when that successor exists but does not open and the non-zero bytes end within a
@@ -1280,15 +1281,11 @@ pub struct RecoveryReport {
 pub enum RecoveryAction {
     /// The journal didn't exist and was created.
     Created,
-    /// Non-zero bytes after an empty commit word were zeroed in place, without a copy: what is left of a missing seal
-    /// before it is written, or the bytes after the end of the chain when recovery's search for committed history
-    /// completed and found no evidence (ADR 0035). This describes the action taken on the evidence recovery found,
-    /// not what readers saw: after a process crash in an otherwise intact journal the bytes are the record being
-    /// written when the previous writer died, which no reader saw, but after storage damage that left no evidence
-    /// they can be published records a reader has already returned (`docs/crash-contract.md`, C11). With evidence the
-    /// tail is corrupt instead ([`RecoveryAction::RepairedTail`] with
-    /// [`CorruptReason::EmptyCommitWord`](crate::CorruptReason::EmptyCommitWord) or
-    /// [`CorruptReason::UncheckedTail`](crate::CorruptReason::UncheckedTail)).
+    /// Non-zero bytes after an empty commit word were zeroed in place, without a copy (`docs/crash-contract.md`, C8
+    /// and C11). This describes the action taken on the evidence recovery found, not what readers saw: after a
+    /// process crash in an otherwise intact journal the bytes are an unpublished record body (or what is left of one)
+    /// or the CRC word of a seal recovery is about to write, which no reader saw, but after storage damage that left no evidence they can be
+    /// published records a reader has already returned (C11 (3)).
     ZeroedUncommitted {
         /// The segment.
         segment: PathBuf,
@@ -1297,10 +1294,13 @@ pub enum RecoveryAction {
         /// Number of bytes zeroed.
         len: u64,
     },
-    /// A corrupt committed tail was copied to `quarantine`, and the segment was replaced by a copy with the tail
-    /// zeroed (never edited in place). The tail starts at an invalid record or seal, or at an empty commit word that
-    /// committed records follow ([`CorruptReason::EmptyCommitWord`](crate::CorruptReason::EmptyCommitWord)); the
-    /// records from there on leave the journal and are kept byte for byte in the quarantine file.
+    /// A corrupt tail was copied to `quarantine` (from `offset` to the segment's last non-zero byte), and the segment
+    /// was replaced by a copy with the tail zeroed (never edited in place). The tail starts at an invalid record or
+    /// seal; at an empty commit word with evidence of committed history after it, or after which the search stopped
+    /// at its work bound ([`CorruptReason::EmptyCommitWord`](crate::CorruptReason::EmptyCommitWord),
+    /// [`CorruptReason::UncheckedTail`](crate::CorruptReason::UncheckedTail)); or at the place of a seal with damage
+    /// beyond it ([`CorruptReason::BadSeal`](crate::CorruptReason::BadSeal); `docs/crash-contract.md`, C11). What
+    /// followed `offset` leaves the segment; the quarantine file keeps its bytes up to the last non-zero one.
     RepairedTail {
         /// The segment.
         segment: PathBuf,

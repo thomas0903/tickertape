@@ -103,20 +103,24 @@ pub enum tickertape_corrupt_reason {
     TICKERTAPE_CORRUPT_BAD_SEQUENCE = 9,
     /// A reserved field is not zero.
     TICKERTAPE_CORRUPT_BAD_FLAGS = 10,
-    /// A seal's checksum does not match the expected next sequence number.
+    /// A seal is invalid (its checksum does not match the expected next sequence number, or it lies where a seal
+    /// cannot), or writer recovery found non-zero bytes beyond the place of a missing seal in front of a successor
+    /// segment that opens (`docs/crash-contract.md` C11).
     TICKERTAPE_CORRUPT_BAD_SEAL = 11,
     /// A sealed segment's successor is missing while later segments exist, or does not start where the seal says.
     TICKERTAPE_CORRUPT_BROKEN_CHAIN = 12,
     /// The checkpoint marker points to a missing segment or an impossible offset.
     TICKERTAPE_CORRUPT_DANGLING_CHECKPOINT = 13,
-    /// A commit word reads 0, but records were committed after it (storage damage; ADR 0035). The error message
+    /// A commit word reads 0, and recovery or verify found evidence of committed records after it (usually storage
+    /// damage; a torn payload can also cause it: `docs/crash-contract.md` C1, C11; ADR 0035). The error message
     /// names the sequence number the evidence carries: a later valid record's, the next sequence number of a seal
     /// that ends the segment, or the base of a later segment.
     TICKERTAPE_CORRUPT_EMPTY_COMMIT_WORD = 14,
     /// A commit word reads 0, and the bytes after it were too costly to check completely (the search for committed
     /// records stopped at its work bound; ADR 0035). Inconclusive, but treated like
-    /// `TICKERTAPE_CORRUPT_EMPTY_COMMIT_WORD`: the writer preserves the bytes or refuses. The error message names the
-    /// sequence number in the header where the search stopped.
+    /// `TICKERTAPE_CORRUPT_EMPTY_COMMIT_WORD`: the writer preserves the bytes or refuses. The error message names a
+    /// sequence number: the one in the header of the candidate record where the search stopped, or the expected one
+    /// plus one when it stopped at a final seal.
     TICKERTAPE_CORRUPT_UNCHECKED_TAIL = 15,
     /// A reason this version of the C ABI has no specific code for.
     TICKERTAPE_CORRUPT_UNKNOWN = 255,

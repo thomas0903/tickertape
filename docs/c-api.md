@@ -284,7 +284,7 @@ out of it.
 
 The corruption reasons are the `tickertape_corrupt_reason` values in the header, one for each core `CorruptReason`;
 new reasons get new values and existing values never change. A reason's detail (a sequence number, a length, a
-segment) is in the message only. Two reasons concern an empty commit word followed by committed records (ADR 0035):
+segment) is in the message only. Two reasons concern an empty commit word followed by what recovery treats as committed records (ADR 0035):
 `TICKERTAPE_CORRUPT_EMPTY_COMMIT_WORD` (14; the message names the sequence number the evidence carries: a later
 record's, a final seal's next sequence number or a later segment's base) and `TICKERTAPE_CORRUPT_UNCHECKED_TAIL`
 (15; the search stopped at its work bound before it could decide, and the writer treats the bytes as committed

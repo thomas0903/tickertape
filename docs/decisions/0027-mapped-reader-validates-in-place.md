@@ -90,19 +90,12 @@ writers touch the files.
 1. A writer appends records up to sequence number `T`, which readers return; the last checkpoint covers only the
    records before some `S <= T`.
 2. Storage damage zeroes the commit word of the published record `S`.
-3. A writer reopens. Recovery scans from the checkpoint and stops at the empty slot of record `S`, then decides in
-   this order (ADR 0035 → "How recovery tells them apart", "Damage around a seal"). If a distinct, unvisited segment
-   for exactly `S` exists and opens (a damaged seal), that takes precedence over any search: the seal is rewritten in
-   place only when nothing but its CRC word is left, in a slot that never held a record; otherwise the bytes after
-   the seal's place are preserved and the segment replaced, then sealed (or `Fail` refuses). Otherwise recovery
-   searches for committed history under the writer's evidence rules (`format.md` → Recovery, step 4): evidence, or a
-   search stopped at its work budget before deciding (`UncheckedTail`, nothing proven), makes it treat the slot as
-   corruption and replace the segment by a new file (or `Fail` refuses), which leaves readers' mappings unchanged.
-   If the search completes without evidence, recovery cannot tell the damage from a torn append: it takes that slot
-   for the end of the journal and zeroes record `S` **and the published records after it** in place, then appends
-   from there. That covers damage after which nothing validates (the commit word of the newest record, or of the two
-   newest, zeroed, or a block from one record into the next one's header) and the other cases crash contract C11 (3)
-   lists.
+3. A writer reopens. Recovery scans from the checkpoint and stops at the empty slot of record `S`. When it finds
+   evidence of the records after it, it usually replaces the segment by a new file (or `Fail` refuses), which leaves
+   readers' mappings unchanged (ADR 0035). When it finds none, it cannot tell the damage from a torn append: it takes
+   that slot for the end of the journal and zeroes record `S` **and the published records after it** in place, then
+   appends from there. That covers damage after which nothing validates, such as the commit word of the newest
+   record zeroed; crash contract C11 (3) has the cases.
 4. A zero-copy reader that is still open while this happens holds payload slices into those records, and they change
    under it: the bytes it validated are not the bytes it hands back. Its later commit-word loads, and the loads that
    validate the records it then reads, meet the recovering and the new writer's stores to the same bytes.

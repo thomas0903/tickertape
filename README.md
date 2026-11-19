@@ -129,10 +129,8 @@ The full statement, per platform and with the test for each claim, is [`docs/cra
   which only returns records covered by a checkpoint.
 - **Corruption is detected, never silently returned.** Every record is checked (length, CRC32C, sequence). Recovery
   repairs a corrupt tail by replacing its segment and moves disconnected segments aside, preserving both in
-  `quarantine/`. It zeroes bytes in place, without a copy, only after the last record when its search finds no
-  evidence of committed history after them: a torn append that no reader saw, or damage that left no such evidence,
-  which no check can tell from a torn append (including, for now, when the next segment exists but does not open).
-  See the crash contract, C8 and C11.
+  `quarantine/`. Some bytes after the last record are zeroed in place without a copy: usually a torn append that no
+  reader saw, but also damage that recovery cannot tell from one. See the crash contract, C8 and C11.
 - **Readers.** `Reader::open` reads with `pread` and is memory-safe whatever other processes do. Zero-copy
   `Reader::open_mapped` is `unsafe`: it requires that only a tickertape writer modifies the files.
 - **Known limits.** A full btrfs volume can crash the writer with `SIGBUS` even inside preallocated segments; a

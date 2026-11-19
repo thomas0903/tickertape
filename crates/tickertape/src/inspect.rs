@@ -196,7 +196,8 @@ pub struct Problem {
 /// Uncommitted bytes after the end of the newest segment (left by a crashed writer, cleaned up by the next one) are
 /// not a problem. Anything that a reader would reject is, and so are states that only a crash leaves behind and the
 /// next writer repairs (a sealed newest segment without a successor, or an unsealed segment that has one), and
-/// committed records after an empty commit word ([`CorruptReason::EmptyCommitWord`], reported at the empty word).
+/// evidence of committed records after an empty commit word ([`CorruptReason::EmptyCommitWord`], or
+/// [`CorruptReason::UncheckedTail`] when the search stops at its work bound, reported at the empty word).
 ///
 /// Against a live journal, the report describes the segments listed when the scan started, as the scan found them.
 /// A writer appending or rolling during the scan is not a problem: a segment that ends in a state a writer passes
@@ -389,7 +390,8 @@ fn verify_once(dir: &Path, last: bool) -> Result<Option<VerifyReport>> {
                     }
                 }
             }
-            // Committed records after an empty commit word: storage damage, not a torn append (ADR 0035).
+            // Evidence of committed records after an empty commit word, or a search stopped at its work bound: usually
+            // storage damage (ADR 0035; crash contract C1 has the exception).
             ScanEnd::Empty if later.is_some() => report.problems.push(Problem {
                 path: path.clone(),
                 offset: scan.end_offset,

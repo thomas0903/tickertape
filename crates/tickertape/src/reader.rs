@@ -149,18 +149,13 @@ impl Reader {
     ///
     /// - The length in an earlier record's commit word is enlarged while no writer runs, and a writer then appends
     ///   after that record: validating it loads bytes the writer is storing.
-    /// - The commit word of a published record not yet covered by a checkpoint is zeroed, the slot is not treated
-    ///   as a damaged seal (that needs a distinct, unvisited segment for exactly the expected sequence number that
-    ///   opens; recovery then rewrites the seal in place only when nothing but its CRC word is left, in a slot that
-    ///   never held a record), and recovery's search completes without finding evidence that committed history
-    ///   follows (what counts: `docs/format.md` → Recovery, step 4). That is damage after which nothing validates
-    ///   (the newest record, or damage reaching the records after it), or a valid final seal more than 128 records
-    ///   past the empty slot when nothing else is found. The next writer's recovery cannot tell that from a torn
-    ///   append, takes the slot for the end of the journal and zeroes that record and the published records after
-    ///   it in place, under a live zero-copy reader. A payload the caller
-    ///   still holds then changes, and the reader's later loads meet the new writer's stores. (With evidence, or a
-    ///   search stopped at its budget, recovery replaces the segment by a new file, and mappings of the old file do
-    ///   not change; so does a damaged seal whose successor opens, unless only its CRC word is left. ADR 0035.)
+    /// - The commit word of a published record not yet covered by a checkpoint is zeroed, and the next writer's
+    ///   recovery cannot tell that from a torn append (damage after which nothing validates, such as the newest
+    ///   record's commit word zeroed; `docs/crash-contract.md`, C11 (3), has the cases). It then takes the slot for
+    ///   the end of the journal and zeroes that record and the published records after it in place, under a live
+    ///   zero-copy reader. A payload the caller still holds then changes, and the reader's later loads meet the new
+    ///   writer's stores. (When recovery finds evidence of the records, it usually replaces the segment by a new
+    ///   file instead, and mappings of the old file do not change. ADR 0035.)
     ///
     /// That such loads return some mixture of old and new bytes, which the CRC then rejects, is an assumption about
     /// the implementation on the supported targets, not a guarantee. Earlier releases had the same exposure.

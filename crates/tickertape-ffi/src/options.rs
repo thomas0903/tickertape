@@ -11,8 +11,8 @@ use crate::status::{FfiError, guard, tickertape_status, tickertape_status_code a
 
 /// What a writer does on open when it finds corruption after the checkpoint (`docs/format.md` → Recovery;
 /// `docs/crash-contract.md` C1, C8 and C11). After a process crash in an otherwise intact journal, an uncommitted
-/// partial record is zeroed in place under either policy; the exception, a torn record that recovery cannot tell
-/// from damage, is in C1 and C2.
+/// partial record is usually zeroed in place under either policy; the exception, a torn record that recovery cannot
+/// tell from damage, is in C1.
 #[allow(non_camel_case_types)]
 #[repr(i32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,7 +22,8 @@ pub enum tickertape_recovery_policy {
     /// zeroes in place are not kept (C8). The default.
     TICKERTAPE_RECOVERY_QUARANTINE = 0,
     /// Fail the open with `TICKERTAPE_E_CORRUPT`: the bytes at the corruption it reports, and everything after them
-    /// in that segment, are left untouched and no file is moved. Clean-ups made earlier in the scan are kept (C11).
+    /// in that segment, are left untouched and no file is moved. The open is not read-only: C11 lists what it may
+    /// still change.
     TICKERTAPE_RECOVERY_FAIL = 1,
 }
 

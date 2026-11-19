@@ -190,8 +190,9 @@ impl MapRw {
     ///
     /// The writer only calls this for bytes that no reader reads: the body of a record before its commit word is
     /// stored, a seal's CRC before its marker, or the uncommitted tail during recovery (never a commit word that a
-    /// reader may be loading). Committed bytes are never modified (ADR 0003), with one exception: recovery zeroes
-    /// records that storage damage made look uncommitted (an emptied commit word), as `Reader::open_mapped` documents.
+    /// reader may be loading). Committed bytes are never modified (ADR 0003), with one exception: recovery can zero
+    /// records that storage damage made look uncommitted (an emptied commit word; `docs/crash-contract.md`, C11 (3)),
+    /// as `Reader::open_mapped` documents.
     pub(crate) fn bytes_mut(&mut self, offset: u64, len: u64) -> Option<&mut [u8]> {
         let end = checked_range(self.len, offset, len)?;
         let start = offset as usize;
@@ -378,17 +379,12 @@ impl MapRo {
         // another size. If the length in the commit word is damaged, the words can reach past the writer's current
         // slot, where a live writer is storing body bytes (non-atomic) and the next commit word (a 4-byte atomic).
         // That is a data race, and a mixed-size access, in Rust's memory model when the writer is in this process,
-        // before any CRC runs, and outside the model when it is another process. A zeroed commit word that recovery
-        // does not treat as a damaged seal (that needs a distinct, unvisited segment for exactly the expected sequence
-        // number that opens) and after which its search completes without evidence (the writer's evidence rules:
-        // `docs/format.md` → Recovery, step 4; damage after which nothing validates, for example) lets recovery zero
-        // published records in place under a live reader, with the same result; otherwise it replaces the file, or
-        // rewrites a damaged seal of which only the CRC word is left, in a slot that never held a record (ADR 0035).
-        // The code then assumes, without a
-        // guarantee, that each load is one aligned 8-byte load instruction on these targets, which cannot fault
-        // inside the mapping and returns some mixture of old and new bytes; that the compiler does not split, repeat
-        // or invent an atomic load; and that, since no reference asserting immutability exists, the CRC then rejects
-        // the mixed frame. The copying reader before ADR 0027 loaded the same bytes the same way. A known
+        // before any CRC runs, and outside the model when it is another process. A zeroed commit word can let
+        // recovery zero published records in place under a live reader, with the same result (when: crash contract
+        // C11 (3)). The code then assumes, without a guarantee, that each load is one aligned 8-byte load instruction
+        // on these targets, which cannot fault inside the mapping and returns some mixture of old and new bytes; that
+        // the compiler does not split, repeat or invent an atomic load; and that, since no reference asserting
+        // immutability exists, the CRC then rejects the mixed frame. The copying reader before ADR 0027 loaded the same bytes the same way. A known
         // limitation: ADR 0027 → "Which loads can race".
         let words = unsafe {
             std::slice::from_raw_parts(

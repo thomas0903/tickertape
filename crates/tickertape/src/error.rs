@@ -198,7 +198,9 @@ pub enum CorruptReason {
     /// A reserved field is non-zero.
     #[error("reserved flags are non-zero")]
     BadFlags,
-    /// A seal's checksum doesn't match the expected next sequence number.
+    /// A seal is invalid: its checksum doesn't match the expected next sequence number, or it lies where a seal
+    /// can't. Writer recovery also reports it at the place of a missing seal in front of a successor segment that
+    /// opens, when non-zero bytes follow beyond the seal's eight bytes (`docs/crash-contract.md`, C11 (1)).
     #[error("invalid seal")]
     BadSeal,
     /// A sealed segment's successor is missing while later segments exist, or doesn't start where the seal says.
@@ -207,27 +209,20 @@ pub enum CorruptReason {
     /// The checkpoint marker points to a segment that doesn't exist, or to an impossible offset.
     #[error("checkpoint marker points to missing segment {0} or an invalid offset")]
     DanglingCheckpoint(u64),
-    /// A commit word reads 0 (no record), and recovery found evidence of committed history after it
-    /// (`docs/format.md` → Recovery, step 4, ADR 0035). The number is the sequence number the evidence carries: a
-    /// later valid record's in the same segment, the next sequence number of a valid seal that ends the segment (one
-    /// of the next 128), or the base of a segment whose base is higher than the expected sequence number (`verify`
-    /// does not weigh later segments, and reports that case as [`BrokenChain`](Self::BrokenChain)). Storage damage,
-    /// power loss or outside modification leaves this; a writer process crash does not, except when the payload it
-    /// was writing holds a valid frame whose sequence number falls in the window (frames copied from another journal,
-    /// for example), or ends with a valid seal for one, and the record's body was not completely written (or the
-    /// payload ends in more than 63 zero bytes): then the evidence is in the torn payload, not in committed records.
+    /// A commit word reads 0 (no record), and recovery or `verify` found evidence of committed history after it
+    /// (`docs/crash-contract.md`, C11 (2); ADR 0035). The number is the sequence number the evidence carries: a later
+    /// valid record's, a final seal's next sequence number, or (writer recovery only; `verify` does not weigh other
+    /// segments) the base of a later segment. Usually storage damage, power loss or outside modification; a torn
+    /// payload left by a writer process crash can also cause it (`docs/crash-contract.md`, C1).
     #[error("commit word is 0 but committed history follows it (sequence {0})")]
     EmptyCommitWord(u64),
-    /// A commit word reads 0, and the bytes after it hold so many headers of this journal's following records (with
-    /// checksums that would need checking) that the search for committed history stopped at its work bound before it
-    /// could decide, and they do not lie inside a completely written torn frame at the empty word (`docs/format.md` →
-    /// Recovery, step 4, ADR 0035). The bound is checked before the candidate that would
-    /// cross it is validated, so that candidate's checksum is unknown: it may or may not be a record. Inconclusive,
-    /// unlike [`EmptyCommitWord`](Self::EmptyCommitWord): no record was proven valid. Recovery still treats the tail as
-    /// committed history (preserved, or refused with `RecoveryPolicy::Fail`). Storage damage leaves this, and so
-    /// does a writer process crash while filling a payload that holds such headers (ADR 0035). The number is the
-    /// sequence number in the header of the slot where the search stopped (for a final seal, the expected sequence
-    /// number plus one).
+    /// A commit word reads 0, and the search for committed history after it stopped at its work bound before it could
+    /// decide (`docs/crash-contract.md`, C11 (2); ADR 0035 → Work bound). Inconclusive, unlike
+    /// [`EmptyCommitWord`](Self::EmptyCommitWord): no record was proven valid, but recovery still treats the tail as
+    /// committed history (preserved, or refused with `RecoveryPolicy::Fail`). Storage damage can cause it, and so
+    /// can a torn payload left by a writer process crash (`docs/crash-contract.md`, C1). The number is the sequence
+    /// number in the header of the candidate record where the search stopped, or the expected sequence number plus
+    /// one when it stopped at a final seal.
     #[error(
         "commit word is 0 and the bytes after it were too costly to check completely (sequence {0}); treated as committed history"
     )]

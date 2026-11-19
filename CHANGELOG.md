@@ -14,26 +14,22 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   copy of a writer (which it must not do) leaves the lock with the parent. A writer process that exits or dies
   without dropping its writer still leaves the lock with such a child until it execs or exits, for its whole life if
   it never execs (crash contract C3).
-- Fixed: writer recovery no longer zeroes committed records in place when storage damage zeroes a commit word after
-  the checkpoint. It used to take the empty commit word for the end of the journal and zero everything after it,
-  under `RecoveryPolicy::Fail` too, changing bytes that zero-copy readers had borrowed. Recovery now checks the
-  bytes after an empty commit word for committed history (a later record that validates with a sequence number its
-  position allows, a final seal for one of the next 128 sequence numbers, or a segment with a higher base; the full
-  rules are in `docs/format.md` → Recovery) and treats it as corruption: `Quarantine` preserves the tail in
-  `quarantine/` and replaces the segment, `Fail` refuses without changing the corrupt bytes it reports or anything
-  after them in that segment (an open under `Fail` still records its PID, removes stale
-  temporary files and keeps the crash clean-ups that come before the corruption, such as a seal written in front of
-  a corrupt successor). When the search completes without evidence, the bytes are still zeroed in place, as for a torn append. New `CorruptReason::EmptyCommitWord`, and
-  `CorruptReason::UncheckedTail` when the search stops at its work bound before deciding, both also reported by
-  `verify` and mapped in the C ABI (`TICKERTAPE_CORRUPT_EMPTY_COMMIT_WORD`, `TICKERTAPE_CORRUPT_UNCHECKED_TAIL`)
-  (ADR 0035); `verify` and `inspect` now read the unwritten rest of the newest segment, in bounded memory whatever
-  length a damaged slot claims. A damaged seal whose successor segment exists and opens is rewritten, keeping every record
-  of its segment; bytes after it are preserved first (`Fail` refuses with `BadSeal` instead). Known gap, unchanged:
-  when that successor exists but does not open and the search finds nothing, the bytes after the empty commit word
-  are zeroed in place without a copy under both policies (ADR 0035). Damage after which no record validates and no final seal or segment with a
-  higher base remains (such as the newest records' commit words zeroed) remains indistinguishable from a torn append. A torn
-  payload holding valid frames from another journal, or ending with a valid seal, with sequence numbers in the window,
-  is preserved (or refused under `Fail`) even after a plain process crash.
+- Fixed: writer recovery no longer zeroes committed records in place when it finds evidence of them after an empty
+  commit word (storage damage that zeroed a commit word after the checkpoint, for example). It used to take every
+  empty commit word for the end of the journal and zero everything after it, under `RecoveryPolicy::Fail` too,
+  changing bytes that zero-copy readers had borrowed. It now searches the bytes after an empty commit word for
+  committed history and, when it finds some, treats the tail as corruption: `Quarantine` preserves it in
+  `quarantine/` and replaces the segment, `Fail` refuses (what an open under `Fail` may still change: crash contract
+  C11). New `CorruptReason::EmptyCommitWord`, and `CorruptReason::UncheckedTail` when the search stops at its work
+  bound before deciding, both also reported by `verify` and mapped in the C ABI
+  (`TICKERTAPE_CORRUPT_EMPTY_COMMIT_WORD`, `TICKERTAPE_CORRUPT_UNCHECKED_TAIL`) (ADR 0035). `verify` and `inspect`
+  now search the rest of a segment whose records end at an empty commit word, in bounded memory whatever length a
+  damaged slot claims. A damaged seal in front of a successor segment that opens is rewritten, keeping the records of
+  its segment (bytes after it are preserved first, or `Fail` refuses with `BadSeal`). Some damage still cannot be told
+  from a torn append and is zeroed in place as before, and a known gap remains in front of a successor that does not
+  open (crash contract C8, C11). A torn record whose payload holds bytes the search counts as committed history (raw
+  frames copied from another journal, for example) can be preserved, or refused under `Fail`, even after a plain
+  process crash (C1).
 - Fix: readers racing with retention (the writer's policy or `tickertape archive`) no longer report a removed segment
   as an error of the wrong kind. `Reader::seek` returned an I/O "not found" error when the segment it chose was
   removed before it opened it; it now lists the segments again and returns `Error::SeqUnavailable` with the new
