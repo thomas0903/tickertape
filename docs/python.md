@@ -4,7 +4,7 @@ There are two ways to use tickertape journals from Python. Both read the same on
 
 | | Bindings: `pip install tickertape` | Decoder: `python/tickertape_reader.py` |
 |---|---|---|
-| Install | A wheel (built from Rust with PyO3); CPython 3.11+ on Linux and macOS | Copy one file; Python 3.9+, any platform, no dependencies |
+| Install | A wheel (built from Rust with PyO3); CPython 3.11+ on Linux and macOS | Copy one file; Python 3.9+, no dependencies |
 | Import | `import tickertape` | `import tickertape_reader` |
 | Write | Yes: `Writer`, the single writer, with the journal lock and crash recovery | No |
 | Read | Live cursor: replay from any sequence, follow the writer, wait with a timeout | One pass over what is committed when it runs; doesn't follow or wait |

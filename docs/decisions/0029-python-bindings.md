@@ -32,8 +32,8 @@ and the Python package `tickertape` (`python/tickertape/`). It is excluded from 
 CPython still supported upstream (3.10 reached end of life in October 2026), and the buffer protocol needed to accept
 `bytearray`/`memoryview`/NumPy payloads joined the stable ABI in 3.11. CI tests 3.11 and 3.15. Free-threaded Python is
 **not shipped**: abi3 wheels cannot load in a free-threaded interpreter. The classes do not rely on the GIL (frozen
-PyO3 classes with an internal mutex), and a source build for 3.14t passes the test suite locally, but CI does not test
-it. PEP 803 (`abi3t`, 3.15+) is a later option.
+PyO3 classes with an internal mutex), and a source build for 3.14t passed the test suite locally with the GIL
+disabled (the optional NumPy/pyarrow/pandas tests were skipped), but CI does not test it. PEP 803 (`abi3t`, 3.15+) is a later option.
 
 **Name.** PyPI distribution `tickertape` (import name `tickertape`). On 2026-11-19 the PyPI JSON API and simple index
 returned 404 for `tickertape`, `ticker-tape`, `tickertape-journal`, `pytickertape`, `py-tickertape`,
