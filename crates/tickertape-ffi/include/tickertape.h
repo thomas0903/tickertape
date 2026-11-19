@@ -7,10 +7,15 @@
  * - Functions return a tickertape_status: TICKERTAPE_OK (0) or TICKERTAPE_NONE (1) on success, a negative
  *   TICKERTAPE_E_* code on failure. After a failure, tickertape_last_error_message() and friends describe it
  *   (per thread).
- * - Handles are opaque. Free each with its *_close / *_free function; NULL is ignored there. NULL where a pointer
- *   is required returns TICKERTAPE_E_INVALID_ARGUMENT. Use after close, double close and concurrent use of one
- *   handle from several threads are undefined behaviour.
+ * - Handles are opaque. Free each with its *_close / *_free function; NULL is ignored there. A close that returns
+ *   anything but TICKERTAPE_E_BUSY has freed the handle: never retry it. NULL where a pointer is required returns
+ *   TICKERTAPE_E_INVALID_ARGUMENT. Use after close, double close and concurrent use of one handle from several
+ *   threads are undefined behaviour. Allocation failure aborts the process; no function returns NULL for it.
  * - Pointers must be valid and aligned for their type. Paths are NUL-terminated byte strings.
+ * - Input and output memory of one call must not overlap, and inputs must stay unmodified until the call returns.
+ *   Output storage is the caller's. Each function's Safety section names its regions.
+ * - Before 1.0 the ABI is unstable: check at start-up that the library is exactly this header's version (see
+ *   TICKERTAPE_ABI_VERSION for the check, which also covers 1.x).
  * - Visible is not durable: a record is visible to readers when an append returns, and durable only after a later
  *   successful tickertape_writer_checkpoint (docs/crash-contract.md).
  */
@@ -26,10 +31,42 @@
 /**
  * The version of the C ABI this header describes. Compare it with `tickertape_abi_version()` at start-up.
  *
- * Before tickertape 1.0 the ABI version is 0 and the ABI may change in any minor release (the changelog says when).
- * From 1.0 it is 1, and functions, constants and struct layouts are only ever added, never removed or changed.
+ * Before tickertape 1.0 the ABI version is 0, which means **unstable**: any release may change the ABI, so a program
+ * (or binding) must load exactly the library version its header came from. From 1.0 the ABI version is 1 (and the
+ * soname `libtickertape.so.1`); a later major version that breaks the ABI gets a new ABI version. Within one ABI
+ * version, functions, constants, status codes and fields of extensible structs are only ever added, so a program
+ * works with any library at least as new as its header. The start-up check that covers both cases:
+ *
+ * ```c
+ * uint32_t lib = tickertape_version_number();
+ * int compatible = tickertape_abi_version() == TICKERTAPE_ABI_VERSION &&
+ *                  (TICKERTAPE_ABI_VERSION == 0 ? lib == TICKERTAPE_VERSION_NUMBER
+ *                                               : lib >= TICKERTAPE_VERSION_NUMBER);
+ * ```
  */
 #define TICKERTAPE_ABI_VERSION 0
+
+/**
+ * The major version of the library this header belongs to.
+ */
+#define TICKERTAPE_VERSION_MAJOR 0
+
+/**
+ * The minor version of the library this header belongs to.
+ */
+#define TICKERTAPE_VERSION_MINOR 4
+
+/**
+ * The patch version of the library this header belongs to.
+ */
+#define TICKERTAPE_VERSION_PATCH 0
+
+/**
+ * The version of the library this header belongs to as one comparable number: `MAJOR * 1000000 + MINOR * 1000 +
+ * PATCH` (0.4.0 is 4000, 1.2.3 is 1002003). Compare it with `tickertape_version_number()`; see
+ * `TICKERTAPE_ABI_VERSION` for the rule.
+ */
+#define TICKERTAPE_VERSION_NUMBER (((TICKERTAPE_VERSION_MAJOR * 1000000) + (TICKERTAPE_VERSION_MINOR * 1000)) + TICKERTAPE_VERSION_PATCH)
 
 /**
  * Status codes returned as `tickertape_status`.
@@ -46,7 +83,8 @@ enum tickertape_status_code
   /**
    * Success, but there is nothing to return: no record is committed at the reader's position yet, the timeout
    * passed, or (durable-only readers) the next record is not covered by a checkpoint yet; or there is no valid
-   * checkpoint marker. Output arguments are left unchanged. Not an error; the last error is not set.
+   * checkpoint marker. Output arguments are left unchanged, except where a function says otherwise
+   * (`tickertape_reader_read_batch` sets `*count_out` to 0). Not an error; the last error is not set.
    */
   TICKERTAPE_NONE = 1,
   /**
@@ -76,7 +114,8 @@ enum tickertape_status_code
    */
   TICKERTAPE_E_UNSUPPORTED_VERSION = -6,
   /**
-   * The directory contains no journal segments (for example, the writer has not started yet).
+   * The directory exists but contains no journal segments (for example, the writer has not created the first one
+   * yet). A directory that does not exist is `TICKERTAPE_E_IO` with `ENOENT` instead.
    */
   TICKERTAPE_E_NOT_FOUND = -7,
   /**
@@ -88,8 +127,9 @@ enum tickertape_status_code
    */
   TICKERTAPE_E_RECORD_TOO_LARGE = -9,
   /**
-   * An earlier checkpoint failed, so this writer can no longer guarantee durability. Appends still work. See
-   * `docs/crash-contract.md` → Errors are sticky.
+   * An earlier checkpoint failed, or the clean-up after an aborted fill callback failed, so this writer can no
+   * longer guarantee durability. After a failed checkpoint appends still work. See `docs/crash-contract.md` →
+   * Errors are sticky.
    */
   TICKERTAPE_E_DURABILITY_LOST = -10,
   /**
@@ -110,7 +150,8 @@ enum tickertape_status_code
    */
   TICKERTAPE_E_BUFFER_TOO_SMALL = -14,
   /**
-   * A fill callback returned non-zero; nothing was appended.
+   * A fill callback returned non-zero; nothing was appended and the writer cleaned up. (If the clean-up fails, the
+   * call returns `TICKERTAPE_E_IO` or `TICKERTAPE_E_STORAGE_FULL` instead; see `tickertape_writer_append_with`.)
    */
   TICKERTAPE_E_ABORTED = -15,
   /**
@@ -124,9 +165,10 @@ enum tickertape_status_code
    */
   TICKERTAPE_E_PANIC = -17,
   /**
-   * An error this version of the C ABI has no specific code for.
+   * An error this version of the C ABI has no specific code for. Its value stays far from the assigned codes,
+   * which later versions extend downwards from -17.
    */
-  TICKERTAPE_E_UNKNOWN = -18,
+  TICKERTAPE_E_UNKNOWN = -255,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L
@@ -315,14 +357,20 @@ typedef struct tickertape_writer_options tickertape_writer_options;
 typedef int32_t tickertape_status;
 
 /**
- * A summary of `tickertape_verify`. Set `struct_size` to `sizeof(tickertape_verify_report)` before the call; later
- * versions may append fields and write only those that fit in `struct_size`.
+ * A summary of `tickertape_verify`, an extensible struct (ADR 0028 → Versioning).
+ *
+ * Set `struct_size` to `sizeof(tickertape_verify_report)` before the call. The library rejects a `struct_size`
+ * below 72 (this struct's size in the first stable release) with `TICKERTAPE_E_INVALID_ARGUMENT`, writes
+ * `min(struct_size, the library's own size)` bytes, and stores the number of bytes it filled back into
+ * `struct_size`. Later versions only append fields: before reading a field added after 1.0, check that
+ * `struct_size` (after the call) covers it, since an older library leaves it unwritten.
  */
 typedef struct tickertape_verify_report {
   /**
-   * Set by the caller to `sizeof(tickertape_verify_report)`; left unchanged.
+   * In: the size of the caller's struct (`sizeof(tickertape_verify_report)`). Out: the number of bytes the
+   * library filled.
    */
-  size_t struct_size;
+  uint64_t struct_size;
   /**
    * Number of segments checked.
    */
@@ -413,15 +461,21 @@ typedef struct tickertape_checkpoint {
 } tickertape_checkpoint;
 
 /**
- * What `tickertape_retention_apply` removed (or, with `dry_run`, would remove). Set `struct_size` to
- * `sizeof(tickertape_retention_report)` before the call; later versions may append fields and write only those that
- * fit in `struct_size`.
+ * What `tickertape_retention_apply` removed (or, with `dry_run`, would remove), an extensible struct (ADR 0028 →
+ * Versioning).
+ *
+ * Set `struct_size` to `sizeof(tickertape_retention_report)` before the call. The library rejects a `struct_size`
+ * below 32 (this struct's size in the first stable release) with `TICKERTAPE_E_INVALID_ARGUMENT`, writes
+ * `min(struct_size, the library's own size)` bytes, and stores the number of bytes it filled back into
+ * `struct_size`. Later versions only append fields: before reading a field added after 1.0, check that
+ * `struct_size` (after the call) covers it, since an older library leaves it unwritten.
  */
 typedef struct tickertape_retention_report {
   /**
-   * Set by the caller to `sizeof(tickertape_retention_report)`; left unchanged.
+   * In: the size of the caller's struct (`sizeof(tickertape_retention_report)`). Out: the number of bytes the
+   * library filled.
    */
-  size_t struct_size;
+  uint64_t struct_size;
   /**
    * Segment files removed by this call (with `dry_run`: planned for removal).
    */
@@ -443,7 +497,7 @@ typedef struct tickertape_retention_report {
  * mapped reader, into the memory-mapped segment, and stays valid only until the next call that takes the same
  * reader (other than `tickertape_reader_position`) or until the reader is closed. Copy what you need to keep. Returned
  * by `tickertape_reader_next_copy` and `tickertape_reader_read_batch` with `payload` pointing into the caller's
- * buffer. When `payload_len` is 0, `payload` may be NULL or dangling and must not be dereferenced.
+ * buffer. When `payload_len` is 0, `payload` is NULL.
  */
 typedef struct tickertape_record {
   /**
@@ -479,10 +533,14 @@ typedef struct tickertape_record {
 /**
  * Fills a payload buffer in place for `tickertape_writer_append_with`.
  *
- * Called once, on the calling thread, with `buf` pointing to `len` zeroed bytes inside the mapped segment. Write
- * the payload into it and return 0 to commit the record, or return non-zero to abort the append. The callback must
- * not keep `buf` after it returns, must not call any function on the writer that invoked it (that returns
- * `TICKERTAPE_E_BUSY`), and must not unwind or `longjmp` out (C++: catch every exception inside).
+ * Called once, on the calling thread, with `buf` pointing to `len` zeroed bytes inside the mapped segment (`buf` is
+ * NULL when `len` is 0). Write the payload into it and return 0 to commit the record, or return non-zero to abort
+ * the append. The callback must not keep `buf` after it returns, and must not call any function on the writer that
+ * invoked it (that returns `TICKERTAPE_E_BUSY`; closing it from here is refused the same way).
+ *
+ * The callback must return normally. A C++ exception that escapes it terminates the process (the library cannot
+ * catch foreign exceptions and aborts): catch every exception inside and return non-zero instead. Leaving it with
+ * `longjmp` is undefined behaviour.
  */
 typedef int32_t (*tickertape_fill_fn)(void *user_data, uint8_t *buf, size_t len);
 
@@ -523,10 +581,15 @@ extern "C" {
 #endif // __cplusplus
 
 /**
- * Returns the C ABI version of the loaded library; it must equal `TICKERTAPE_ABI_VERSION` from the header the
- * program was compiled with.
+ * Returns the C ABI version of the loaded library. See `TICKERTAPE_ABI_VERSION` for the start-up check.
  */
 uint32_t tickertape_abi_version(void);
+
+/**
+ * Returns the version of the loaded library as one comparable number (`TICKERTAPE_VERSION_NUMBER` of the header it
+ * was built with). See `TICKERTAPE_ABI_VERSION` for the start-up check.
+ */
+uint32_t tickertape_version_number(void);
 
 /**
  * Returns the library version, such as `"0.4.0"`. The string is static; never NULL.
@@ -547,12 +610,13 @@ uint64_t tickertape_realtime_ns(void);
  *
  * Corruption is reported in `report->problems` with `TICKERTAPE_OK`, not as an error. Uncommitted bytes after the
  * end of the newest segment are not a problem. Errors: `TICKERTAPE_E_NOT_FOUND`, `TICKERTAPE_E_IO`,
- * `TICKERTAPE_E_INVALID_ARGUMENT` if `report->struct_size` is too small.
+ * `TICKERTAPE_E_INVALID_ARGUMENT` if `report->struct_size` is below the minimum (see `tickertape_verify_report`).
  *
  * # Safety
  *
- * `dir` must be NULL or a NUL-terminated string. `report` must be NULL or point to a writable
- * `tickertape_verify_report` whose `struct_size` is set.
+ * `dir` must be NULL or a NUL-terminated string that stays unmodified until the call returns. `report` must be NULL
+ * or point to a caller-owned, 8-byte aligned struct of `report->struct_size` writable bytes whose `struct_size` is
+ * set, and must not overlap `dir`.
  */
 tickertape_status tickertape_verify(const char *dir, struct tickertape_verify_report *report);
 
@@ -563,12 +627,14 @@ tickertape_status tickertape_verify(const char *dir, struct tickertape_verify_re
  * Call with `segments` NULL and `capacity` 0 to learn the count (returns `TICKERTAPE_OK`). If `capacity` is smaller
  * than the count, returns `TICKERTAPE_E_BUFFER_TOO_SMALL` with `*count_out` set and nothing written. The list can
  * change between calls while a writer is active. Errors: `TICKERTAPE_E_NOT_FOUND` if there are no segments;
- * `TICKERTAPE_E_CORRUPT` or `TICKERTAPE_E_UNSUPPORTED_VERSION` for an invalid header; `TICKERTAPE_E_IO`.
+ * `TICKERTAPE_E_CORRUPT` or `TICKERTAPE_E_UNSUPPORTED_VERSION` for an invalid header; `TICKERTAPE_E_IO`;
+ * `TICKERTAPE_E_INVALID_ARGUMENT` if `count_out` overlaps the `segments` array.
  *
  * # Safety
  *
- * `dir` must be NULL or a NUL-terminated string. `segments` must be valid for writing `capacity` entries (or NULL
- * with `capacity` 0). `count_out` must be NULL or valid for writing a `size_t`.
+ * `dir` must be NULL or a NUL-terminated string that stays unmodified until the call returns. `segments` must be
+ * valid for writing `capacity` entries (or NULL with `capacity` 0). `count_out` must be NULL or valid for writing a
+ * `size_t`. Both outputs are caller-owned and must not overlap each other or `dir`.
  */
 tickertape_status tickertape_list_segments(const char *dir,
                                            struct tickertape_segment_info *segments,
@@ -583,8 +649,8 @@ tickertape_status tickertape_list_segments(const char *dir,
  *
  * # Safety
  *
- * `dir` must be NULL or a NUL-terminated string. `checkpoint_out` must be NULL or valid for writing a
- * `tickertape_checkpoint`.
+ * `dir` must be NULL or a NUL-terminated string that stays unmodified until the call returns. `checkpoint_out` must
+ * be NULL or valid for writing a `tickertape_checkpoint` (caller-owned), and must not overlap `dir`.
  */
 tickertape_status tickertape_read_checkpoint(const char *dir, struct tickertape_checkpoint *checkpoint_out);
 
@@ -595,13 +661,15 @@ tickertape_status tickertape_read_checkpoint(const char *dir, struct tickertape_
  * Only a sealed prefix strictly before the checkpoint segment is eligible, removed oldest first; without a valid
  * checkpoint marker nothing is. Takes no writer lock and is safe while a writer is active. Stops at the first
  * error; removals before it stay in effect (and are not counted in a report, which is written only on success).
- * Errors: `TICKERTAPE_E_INVALID_ARGUMENT` if `retention` has no action (not needed with `dry_run`);
- * `TICKERTAPE_E_NOT_FOUND`; `TICKERTAPE_E_CORRUPT`; `TICKERTAPE_E_IO` (including an existing destination file).
+ * Errors: `TICKERTAPE_E_INVALID_ARGUMENT` if `retention` has no action (not needed with `dry_run`) or
+ * `report->struct_size` is below the minimum (see `tickertape_retention_report`); `TICKERTAPE_E_NOT_FOUND`;
+ * `TICKERTAPE_E_CORRUPT`; `TICKERTAPE_E_IO` (including an existing destination file).
  *
  * # Safety
  *
- * `dir` must be NULL or a NUL-terminated string. `retention` must be NULL or live retention settings. `report` must
- * be NULL or point to a writable `tickertape_retention_report` whose `struct_size` is set.
+ * `dir` must be NULL or a NUL-terminated string that stays unmodified until the call returns. `retention` must be
+ * NULL or live retention settings. `report` must be NULL or point to a caller-owned, 8-byte aligned struct of
+ * `report->struct_size` writable bytes whose `struct_size` is set, and must not overlap `dir`.
  */
 tickertape_status tickertape_retention_apply(const char *dir,
                                              const struct tickertape_retention *retention,
@@ -610,7 +678,7 @@ tickertape_status tickertape_retention_apply(const char *dir,
 
 /**
  * Creates writer options with the defaults: 128 MiB segments, `TICKERTAPE_RECOVERY_QUARANTINE`, notify on,
- * prefault on, no retention. Returns NULL only if memory allocation fails.
+ * prefault on, no retention. Never returns NULL: if memory cannot be allocated, the process aborts.
  */
 struct tickertape_writer_options *tickertape_writer_options_new(void);
 
@@ -679,7 +747,7 @@ tickertape_status tickertape_writer_options_set_retention(struct tickertape_writ
 
 /**
  * Creates reader options with the defaults: not durable-only, notify on, default back-off (100 spins, 10 yields,
- * then sleeps from 10 µs doubling to 1 ms). Returns NULL only if memory allocation fails.
+ * then sleeps from 10 µs doubling to 1 ms). Never returns NULL: if memory cannot be allocated, the process aborts.
  */
 struct tickertape_reader_options *tickertape_reader_options_new(void);
 
@@ -699,6 +767,8 @@ void tickertape_reader_options_free(struct tickertape_reader_options *options);
  *
  * A durable-only reader returns `TICKERTAPE_NONE` (or keeps waiting) at a record that no checkpoint covers yet.
  * Without a valid checkpoint marker it returns nothing; if the writer never checkpoints, it never returns a record.
+ * Records it returns survive a power loss only under the crash contract's conditions: storage that honours the sync
+ * calls, and no failed checkpoint earlier in the same boot (`docs/crash-contract.md`).
  *
  * # Safety
  *
@@ -743,7 +813,8 @@ tickertape_status tickertape_reader_options_set_backoff(struct tickertape_reader
 tickertape_status tickertape_reader_options_set_busy_spin(struct tickertape_reader_options *options);
 
 /**
- * Creates retention settings with no limits and no action. Returns NULL only if memory allocation fails.
+ * Creates retention settings with no limits and no action. Never returns NULL: if memory cannot be allocated, the
+ * process aborts.
  */
 struct tickertape_retention *tickertape_retention_new(void);
 
@@ -806,19 +877,23 @@ tickertape_status tickertape_retention_set_move_to(struct tickertape_retention *
 
 /**
  * Opens a reader on the journal in directory `dir`, positioned at the first record of the oldest segment, and stores
- * the new handle in `*reader_out` (NULL on failure). `options` may be NULL for the defaults; they are copied.
+ * the new handle in `*reader_out` (NULL on failure). `options` may be NULL for the defaults; they are copied. If
+ * memory for the handle cannot be allocated, the process aborts (there is no out-of-memory status).
  *
  * This is the safe reader: it reads the files with `pread` into a buffer it owns and validates the copy, so it is
  * memory-safe whatever other processes do to the files, and never receives `SIGBUS`. At worst it reports corruption.
  *
- * Errors: `TICKERTAPE_E_NOT_FOUND` if `dir` has no segments yet (for example, the writer has not started);
- * `TICKERTAPE_E_CORRUPT` or `TICKERTAPE_E_UNSUPPORTED_VERSION` if the oldest segment's header is invalid;
- * `TICKERTAPE_E_IO`.
+ * Errors: `TICKERTAPE_E_IO` with `ENOENT` (`tickertape_last_error_os_code`) if `dir` does not exist, which is what
+ * a reader that starts before the writer sees, since the writer creates the directory; `TICKERTAPE_E_NOT_FOUND` if
+ * `dir` exists but has no segment yet (the writer is creating it). A loop that waits for the writer should retry on
+ * both and fail on anything else. `TICKERTAPE_E_CORRUPT` or `TICKERTAPE_E_UNSUPPORTED_VERSION` if the oldest
+ * segment's header is invalid; `TICKERTAPE_E_IO` for other OS errors.
  *
  * # Safety
  *
  * `dir` must be NULL or a NUL-terminated string. `options` must be NULL or live reader options. `reader_out` must
- * be NULL or valid for writing a pointer.
+ * be NULL or valid for writing a pointer, and must not overlap `dir`. Inputs must stay unmodified until the call
+ * returns.
  */
 tickertape_status tickertape_reader_open(const char *dir,
                                          const struct tickertape_reader_options *options,
@@ -845,12 +920,13 @@ tickertape_status tickertape_reader_open_mapped_unsafe(const char *dir,
 
 /**
  * Closes a reader and frees the handle, invalidating any record view it returned. NULL is ignored. Returns
- * `TICKERTAPE_E_BUSY` (and closes nothing) if called from inside a call on the same reader.
+ * `TICKERTAPE_E_BUSY` (and closes nothing; the handle stays valid) if called from inside a call on the same reader.
  *
  * # Safety
  *
- * `reader` must be NULL or a live reader handle. After this returns `TICKERTAPE_OK` the handle is invalid; using or
- * closing it again is undefined behaviour.
+ * `reader` must be NULL or a live reader handle. After this returns any status other than `TICKERTAPE_E_BUSY`
+ * (including `TICKERTAPE_E_PANIC`), the handle is freed: using or closing it again is undefined behaviour, so never
+ * retry a close that failed with another status.
  */
 tickertape_status tickertape_reader_close(struct tickertape_reader *reader);
 
@@ -858,11 +934,15 @@ tickertape_status tickertape_reader_close(struct tickertape_reader *reader);
  * Positions the reader so that the next record returned is `seq`.
  *
  * If `seq` has not been written yet, the reader waits for it: reads return `TICKERTAPE_NONE` until the writer gets
- * there, and records before `seq` are skipped. Every record on the way is validated, so the reader only lands on
- * positions along the journal's current chain. Discards a record held back by `tickertape_reader_next_copy` or
- * `tickertape_reader_read_batch`, and an error deferred by `tickertape_reader_read_batch`.
+ * there, and records before `seq` are skipped. Every record on the way is validated (by the reads that follow), so
+ * the reader only lands on positions along the journal's current chain. Any call invalidates the record view
+ * returned by `tickertape_reader_next`. A successful seek also discards a record held back by
+ * `tickertape_reader_next_copy` or `tickertape_reader_read_batch`, and an error deferred by
+ * `tickertape_reader_read_batch`; a failed seek leaves the reader exactly as it was (same position, held-back
+ * record and deferred error).
  *
- * Errors: `TICKERTAPE_E_SEQ_UNAVAILABLE` if `seq` is older than the oldest segment; `TICKERTAPE_E_NOT_FOUND`;
+ * Errors: `TICKERTAPE_E_SEQ_UNAVAILABLE` if `seq` is older than the oldest segment (retention removed it; seek to
+ * the oldest segment's `base_seq` from `tickertape_list_segments` to continue there); `TICKERTAPE_E_NOT_FOUND`;
  * `TICKERTAPE_E_CORRUPT` or `TICKERTAPE_E_IO` while locating it.
  *
  * # Safety
@@ -876,15 +956,20 @@ tickertape_status tickertape_reader_seek(struct tickertape_reader *reader, uint6
  *
  * `timeout_ns` 0 (`TICKERTAPE_NO_WAIT`) does not wait; a positive value waits up to that many nanoseconds, using
  * the configured back-off and wake-ups; a negative value (`TICKERTAPE_WAIT_FOREVER`) waits until a record arrives.
- * Returns `TICKERTAPE_OK` with a record, or `TICKERTAPE_NONE` (leaving `*record_out` unchanged) if no record is
- * committed yet or the timeout passed. Follows seals into the next segment transparently.
+ * The timeout bounds only the wait for a record to become available: argument checks, catching up after a seek
+ * (validating the records skipped on the way) and file I/O are not interrupted, so a call can take longer. A call
+ * waiting with `TICKERTAPE_WAIT_FOREVER` cannot be interrupted, not even by closing the reader from another thread
+ * (which is undefined behaviour): to make a wait cancellable, loop with a finite timeout and check for
+ * cancellation between calls. Returns `TICKERTAPE_OK` with a record, or `TICKERTAPE_NONE` (leaving `*record_out`
+ * unchanged) if no record is committed yet or the timeout passed. Follows seals into the next segment
+ * transparently.
  *
  * Without durable-only, the reader returns records as soon as they are **visible**, including records that a later
  * power loss can erase (the writer then reuses their sequence numbers). With durable-only, it returns only records
  * covered by a checkpoint (**durable**) and treats the rest as not written yet.
  *
  * The view's `payload` is valid until the next call that takes this reader (other than
- * `tickertape_reader_position`) or until the reader is closed.
+ * `tickertape_reader_position`) or until the reader is closed. It is NULL when `payload_len` is 0.
  *
  * Errors: `TICKERTAPE_E_CORRUPT` if the bytes at the cursor fail validation (the cursor does not move, so calling
  * again retries the same position, which may succeed after a writer recovery); `TICKERTAPE_E_DISCARDED` if writer
@@ -894,7 +979,7 @@ tickertape_status tickertape_reader_seek(struct tickertape_reader *reader, uint6
  * # Safety
  *
  * `reader` must be NULL or a live reader handle. `record_out` must be NULL or valid for writing a
- * `tickertape_record`.
+ * `tickertape_record` (caller-owned storage; only the returned payload pointer borrows from the reader).
  */
 tickertape_status tickertape_reader_next(struct tickertape_reader *reader,
                                          int64_t timeout_ns,
@@ -904,14 +989,17 @@ tickertape_status tickertape_reader_next(struct tickertape_reader *reader,
  * Like `tickertape_reader_next`, but copies the payload into the caller's buffer `buf` of `buf_len` bytes; the
  * returned record's `payload` points to `buf`.
  *
+ * `payload` is NULL when `payload_len` is 0.
+ *
  * If the payload does not fit, returns `TICKERTAPE_E_BUFFER_TOO_SMALL` with `*record_out` describing the record
  * (with `payload` NULL and `payload_len` the size needed); the record is held back and returned by the next read
- * call on this reader.
+ * call on this reader. Returns `TICKERTAPE_E_INVALID_ARGUMENT` if `record_out` overlaps `buf`.
  *
  * # Safety
  *
  * `reader` must be NULL or a live reader handle. `buf` must be valid for writing `buf_len` bytes (it may be NULL
- * when `buf_len` is 0). `record_out` must be NULL or valid for writing a `tickertape_record`.
+ * when `buf_len` is 0). `record_out` must be NULL or valid for writing a `tickertape_record`. Both are caller-owned
+ * and must not overlap each other.
  */
 tickertape_status tickertape_reader_next_copy(struct tickertape_reader *reader,
                                               int64_t timeout_ns,
@@ -921,7 +1009,8 @@ tickertape_status tickertape_reader_next_copy(struct tickertape_reader *reader,
 
 /**
  * Reads up to `max_records` records into `records`, copying their payloads one after another into `buf` (`buf_len`
- * bytes), and stores the number read in `*count_out`. Each record's `payload` points into `buf`.
+ * bytes), and stores the number read in `*count_out`. Each record's `payload` points into `buf` (NULL when its
+ * `payload_len` is 0). `max_records` must not be 0 (`TICKERTAPE_E_INVALID_ARGUMENT`).
  *
  * Waits up to `timeout_ns` (as for `tickertape_reader_next`) for the first record only, then takes only records that
  * are already committed. Stops when `max_records` are read, the next record's payload does not fit in the rest of
@@ -933,14 +1022,20 @@ tickertape_status tickertape_reader_next_copy(struct tickertape_reader *reader,
  *
  * Partial failure: an error that happens before any record is read is returned directly. An error after one or
  * more records is **not** returned by this call: it returns `TICKERTAPE_OK` with the records read so far, and the
- * next read call on this reader returns the error (the reader does not advance past the failing position). So no
- * record handed out is ever lost to an error.
+ * next read call on this reader (`next`, `next_copy` or `read_batch`) returns the error. A successful
+ * `tickertape_reader_seek` discards it instead. The reader does not advance past the failing position, so a
+ * persistent error (such as corruption) is returned again by the calls after that. No record handed out is ever
+ * lost to an error.
+ *
+ * `*count_out` is set to 0 first, also on errors and with `TICKERTAPE_NONE`. Returns
+ * `TICKERTAPE_E_INVALID_ARGUMENT` if any two of `records` (all `max_records` entries), `buf` and `count_out`
+ * overlap.
  *
  * # Safety
  *
  * `reader` must be NULL or a live reader handle. `records` must be valid for writing `max_records`
- * `tickertape_record`s. `buf` must be valid for writing `buf_len` bytes (it may be NULL when `buf_len` is 0) and must
- * not overlap `records`. `count_out` must be NULL or valid for writing a `size_t`.
+ * `tickertape_record`s. `buf` must be valid for writing `buf_len` bytes (it may be NULL when `buf_len` is 0).
+ * `count_out` must be NULL or valid for writing a `size_t`. All three are caller-owned and must not overlap.
  */
 tickertape_status tickertape_reader_read_batch(struct tickertape_reader *reader,
                                                int64_t timeout_ns,
@@ -965,6 +1060,10 @@ tickertape_status tickertape_reader_position(struct tickertape_reader *reader, u
  * failed yet.
  *
  * Every call that returns a negative status sets the last error; other calls leave it unchanged (like `errno`).
+ * The state is per **operating-system thread**: read it on the same OS thread, right after the failing call. In a
+ * runtime that moves its tasks between OS threads (Go goroutines, Java virtual threads), make the failing call and
+ * the reads of the code, message, OS error and corruption reason in one foreign call sequence that cannot move,
+ * for example a C shim that captures all four, or Go's `runtime.LockOSThread`.
  */
 tickertape_status tickertape_last_error_code(void);
 
@@ -972,8 +1071,9 @@ tickertape_status tickertape_last_error_code(void);
  * Returns a description of the last error on the calling thread, or an empty string. Never NULL.
  *
  * The string is owned by the library and stays valid until the next call on this thread that returns a negative
- * status, or until the thread exits. Do not free it. It is UTF-8 except for file names, which are passed through
- * as the operating system returned them.
+ * status, or until the thread exits. Do not free it. It is always valid UTF-8: a file name that is not valid UTF-8
+ * appears with its invalid bytes replaced by U+FFFD, so do not parse paths out of it. Per OS thread, as for
+ * `tickertape_last_error_code`.
  */
 const char *tickertape_last_error_message(void);
 
@@ -1007,7 +1107,8 @@ const char *tickertape_corrupt_reason_name(int32_t reason);
  *
  * Takes the journal's lock, then recovers the journal (`docs/format.md` → Recovery): it validates everything after
  * the last checkpoint, repairs or quarantines what is invalid, and syncs every repair before returning. `options`
- * may be NULL for the defaults; they are copied. On failure `*writer_out` is set to NULL.
+ * may be NULL for the defaults; they are copied. On failure `*writer_out` is set to NULL. If memory for the handle
+ * cannot be allocated, the process aborts (there is no out-of-memory status).
  *
  * Errors: `TICKERTAPE_E_LOCKED` if another writer has the journal open; `TICKERTAPE_E_INVALID_CONFIG`;
  * `TICKERTAPE_E_CORRUPT` if the journal is damaged in a way recovery does not repair, or the tail is corrupt and the
@@ -1016,7 +1117,8 @@ const char *tickertape_corrupt_reason_name(int32_t reason);
  * # Safety
  *
  * `dir` must be NULL or a NUL-terminated string. `options` must be NULL or live writer options. `writer_out` must
- * be NULL or valid for writing a pointer.
+ * be NULL or valid for writing a pointer, and must not overlap `dir`. Inputs must stay unmodified until the call
+ * returns.
  */
 tickertape_status tickertape_writer_open(const char *dir,
                                          const struct tickertape_writer_options *options,
@@ -1027,12 +1129,13 @@ tickertape_status tickertape_writer_open(const char *dir,
  *
  * Closing does **not** checkpoint: every appended record stays visible to readers and survives the process exiting,
  * but only records covered by a successful `tickertape_writer_checkpoint` are durable. Returns `TICKERTAPE_E_BUSY`
- * (and closes nothing) if called from a fill callback of the same writer.
+ * (and closes nothing; the handle stays valid) if called from a fill callback of the same writer.
  *
  * # Safety
  *
- * `writer` must be NULL or a live handle from `tickertape_writer_open`. After this returns `TICKERTAPE_OK` the handle
- * is invalid; using or closing it again is undefined behaviour.
+ * `writer` must be NULL or a live handle from `tickertape_writer_open`. After this returns any status other than
+ * `TICKERTAPE_E_BUSY` (including `TICKERTAPE_E_PANIC`), the handle is freed: using or closing it again is undefined
+ * behaviour, so never retry a close that failed with another status.
  */
 tickertape_status tickertape_writer_close(struct tickertape_writer *writer);
 
@@ -1044,14 +1147,16 @@ tickertape_status tickertape_writer_close(struct tickertape_writer *writer);
  * `tickertape_writer_checkpoint` succeeds. If the record does not fit in the current segment, the writer first rolls
  * to a new segment (slower: it creates and syncs a file).
  *
- * Errors: `TICKERTAPE_E_INVALID_ARGUMENT` (`payload` NULL with `payload_len` > 0); `TICKERTAPE_E_RECORD_TOO_LARGE`;
- * `TICKERTAPE_E_SEQUENCE_EXHAUSTED`; `TICKERTAPE_E_STORAGE_FULL` or `TICKERTAPE_E_IO` if a roll fails (the journal
- * is unchanged and the call can be retried).
+ * Errors: `TICKERTAPE_E_INVALID_ARGUMENT` (`payload` NULL with `payload_len` > 0, or `seq_out` overlapping the
+ * payload); `TICKERTAPE_E_RECORD_TOO_LARGE`; `TICKERTAPE_E_SEQUENCE_EXHAUSTED`; `TICKERTAPE_E_STORAGE_FULL` or
+ * `TICKERTAPE_E_IO` if a roll fails (the journal is unchanged and the call can be retried), or after a failed
+ * clean-up of an aborted fill (see `tickertape_writer_append_with`).
  *
  * # Safety
  *
  * `writer` must be NULL or a live writer handle. `payload` must point to `payload_len` readable bytes (or be
- * anything, including NULL, when `payload_len` is 0). `seq_out` must be NULL or valid for writing a `uint64_t`.
+ * anything, including NULL, when `payload_len` is 0) that stay unmodified until the call returns. `seq_out` must be
+ * NULL or valid for writing a `uint64_t`, and must not overlap the payload.
  */
 tickertape_status tickertape_writer_append(struct tickertape_writer *writer,
                                            uint32_t schema_id,
@@ -1066,13 +1171,17 @@ tickertape_status tickertape_writer_append(struct tickertape_writer *writer,
  * `*seq_out` (which may be NULL).
  *
  * `fill(user_data, buf, payload_len)` is called once with a zeroed buffer of exactly `payload_len` bytes inside the
- * mapped segment; no reader can see it until `fill` returns 0 and the record is committed. Durability is as for
- * `tickertape_writer_append`: **visible** on return, **durable** only after a later successful checkpoint.
+ * mapped segment (`buf` NULL when `payload_len` is 0); no reader can see it until `fill` returns 0 and the record is
+ * committed. Durability is as for `tickertape_writer_append`: **visible** on return, **durable** only after a later
+ * successful checkpoint.
  *
  * If `fill` returns non-zero, nothing is committed and this returns `TICKERTAPE_E_ABORTED`: the writer zeroes the
  * buffer and syncs that zeroing to storage before returning (`docs/format.md` → Abandoned writes), so aborting is
- * slow; use it only for exceptional cases. If that sync fails, the writer refuses further appends and checkpoints
- * (reopen the journal to recover).
+ * slow; use it only for exceptional cases. If that sync fails, this call returns `TICKERTAPE_E_IO` (or
+ * `TICKERTAPE_E_STORAGE_FULL`) with the OS error and a message saying the clean-up failed, instead of
+ * `TICKERTAPE_E_ABORTED`. The writer then refuses further appends (the same code and OS error, with a message
+ * that says why) and checkpoints (`TICKERTAPE_E_DURABILITY_LOST`): close it and reopen the journal, whose recovery
+ * cleans up.
  *
  * Errors: as for `tickertape_writer_append`, plus `TICKERTAPE_E_ABORTED`, and `TICKERTAPE_E_INVALID_ARGUMENT` if
  * `fill` is NULL. `fill` is not called when the append fails before it.
@@ -1080,8 +1189,8 @@ tickertape_status tickertape_writer_append(struct tickertape_writer *writer,
  * # Safety
  *
  * `writer` must be NULL or a live writer handle. `fill` must be NULL or a function that follows the
- * `tickertape_fill_fn` contract; `user_data` is passed to it unchanged. `seq_out` must be NULL or valid for writing
- * a `uint64_t`.
+ * `tickertape_fill_fn` contract; `user_data` is passed to it unchanged and never dereferenced by the library.
+ * `seq_out` must be NULL or valid for writing a `uint64_t`; it is written after `fill` returns.
  */
 tickertape_status tickertape_writer_append_with(struct tickertape_writer *writer,
                                                 uint32_t schema_id,
@@ -1095,21 +1204,29 @@ tickertape_status tickertape_writer_append_with(struct tickertape_writer *writer
 /**
  * Appends `count` records in order, stopping at the first failure.
  *
- * Every record is checked first (`payload` NULL with `payload_len` > 0, `reserved` not 0): an argument error
- * returns `TICKERTAPE_E_INVALID_ARGUMENT` and appends nothing. Then the records are appended one by one, as with
- * `tickertape_writer_append`. `*appended_out` is always set to the number of records appended, and `*first_seq_out`
- * (which may be NULL) to the sequence number of the first; they are consecutive. On an error, the records before
- * the failing one (index `*appended_out`) **are appended** and stay appended: retry only from the failing record.
+ * Every record is checked first (`payload` NULL with `payload_len` > 0, a length too large, `reserved` not 0): an
+ * argument error returns `TICKERTAPE_E_INVALID_ARGUMENT`, naming the record's index in the message, and appends
+ * nothing. Then the records are appended one by one, as with `tickertape_writer_append`. `*first_seq_out` (which may
+ * be NULL) is set to the sequence number the first record gets, and `*appended_out` to the number of records
+ * appended so far, updated as each one commits; the appended records are consecutive. On an error, the records
+ * before the failing one (index `*appended_out`) **are appended** and stay appended: retry only from the failing
+ * record.
+ *
+ * If `appended_out` or `first_seq_out` overlaps another argument (each other, the `records` array or a payload),
+ * returns `TICKERTAPE_E_INVALID_ARGUMENT` and writes nothing. Otherwise `*appended_out` is always set (0 on an
+ * argument error).
  *
  * Durability is as for `tickertape_writer_append`: **visible** on return, **durable** only after a later
- * successful checkpoint. Errors: as for `tickertape_writer_append`.
+ * successful checkpoint. Errors: as for `tickertape_writer_append`, and `TICKERTAPE_E_INVALID_ARGUMENT` if `count`
+ * records do not fit in memory.
  *
  * # Safety
  *
  * `writer` must be NULL or a live writer handle. `records` must point to `count` readable
  * `tickertape_new_record`s whose payloads follow the rule for `tickertape_writer_append` (it may be NULL when `count`
- * is 0). `appended_out` must be NULL or valid for writing a `size_t`, and `first_seq_out` NULL or valid for writing
- * a `uint64_t`.
+ * is 0); the records and their payloads must stay unmodified until the call returns. `appended_out` must be NULL or
+ * valid for writing a `size_t`, and `first_seq_out` NULL or valid for writing a `uint64_t`; neither may overlap the
+ * records, their payloads or each other.
  */
 tickertape_status tickertape_writer_append_batch(struct tickertape_writer *writer,
                                                  const struct tickertape_new_record *records,
@@ -1125,7 +1242,8 @@ tickertape_status tickertape_writer_append_batch(struct tickertape_writer *write
  * Errors: `TICKERTAPE_E_IO` or `TICKERTAPE_E_STORAGE_FULL` if a sync fails. The writer is then poisoned: every later
  * checkpoint returns `TICKERTAPE_E_DURABILITY_LOST`, because a failed sync can drop data that a retry would not
  * rewrite. Appends keep working. Treat a checkpoint error as an incident: records written before it may not be
- * durable even if a later writer's checkpoint succeeds.
+ * durable even if a later writer's checkpoint succeeds. `TICKERTAPE_E_DURABILITY_LOST` is also returned after a
+ * failed clean-up of an aborted fill (the message says which happened).
  *
  * # Safety
  *

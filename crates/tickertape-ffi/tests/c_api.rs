@@ -31,30 +31,108 @@ fn repo_root() -> PathBuf {
     manifest_dir().join("../..")
 }
 
+fn rustc() -> Command {
+    Command::new(std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into()))
+}
+
+/// Where this test binary was built: the target directory, the `--target` triple if the build had one (from
+/// `--target` or `CARGO_BUILD_TARGET`), and the profile directory's name (`debug`, `release`, or a custom profile).
+struct OuterLayout {
+    target_dir: PathBuf,
+    triple: Option<String>,
+    profile_dir: String,
+}
+
+fn outer_layout() -> &'static OuterLayout {
+    static LAYOUT: OnceLock<OuterLayout> = OnceLock::new();
+    LAYOUT.get_or_init(|| {
+        // <target-dir>/[<triple>/]<profile>/deps/c_api-<hash>
+        let exe = std::env::current_exe().unwrap();
+        let profile_dir = exe
+            .parent()
+            .and_then(Path::parent)
+            .expect("test binary in <profile>/deps");
+        let parent = profile_dir.parent().unwrap();
+        let parent_name = parent.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let targets = rustc()
+            .args(["--print", "target-list"])
+            .output()
+            .expect("run rustc --print target-list");
+        let is_triple = String::from_utf8_lossy(&targets.stdout)
+            .lines()
+            .any(|t| t == parent_name);
+        OuterLayout {
+            target_dir: if is_triple {
+                parent.parent().unwrap().to_path_buf()
+            } else {
+                parent.to_path_buf()
+            },
+            triple: is_triple.then(|| parent_name.to_owned()),
+            profile_dir: profile_dir
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_owned(),
+        }
+    })
+}
+
+/// The target triple to compile the C programs for: the outer build's `--target`, or rustc's host.
+fn target_triple() -> &'static str {
+    static TRIPLE: OnceLock<String> = OnceLock::new();
+    TRIPLE.get_or_init(|| {
+        outer_layout().triple.clone().unwrap_or_else(|| {
+            let output = rustc().arg("-vV").output().expect("run rustc -vV");
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .lines()
+                .find_map(|line| line.strip_prefix("host: ").map(str::to_owned))
+                .expect("rustc -vV prints the host triple")
+        })
+    })
+}
+
 /// The directory with `libtickertape.{a,so,dylib}`.
 ///
 /// Cargo does not build a crate's `cdylib` or `staticlib` for its integration tests, so the first call runs
-/// `cargo build -p tickertape-ffi` into a separate target directory (`target/ffi-c-api`; the outer build holds the
-/// lock on the normal one). `TICKERTAPE_FFI_LIB_DIR` points at prebuilt libraries instead.
+/// `cargo build -p tickertape-ffi --locked` with the outer build's profile and target into a separate target
+/// directory (`<target-dir>/ffi-c-api`; the outer build holds the lock on the normal one), and returns the
+/// matching directory there. `TICKERTAPE_FFI_LIB_DIR` points at prebuilt libraries instead.
 fn lib_dir() -> &'static Path {
     static DIR: OnceLock<PathBuf> = OnceLock::new();
     DIR.get_or_init(|| {
         if let Ok(dir) = std::env::var("TICKERTAPE_FFI_LIB_DIR") {
             return PathBuf::from(dir);
         }
-        // target/<profile>/deps/c_api-<hash>
-        let exe = std::env::current_exe().unwrap();
-        let target = exe.ancestors().nth(3).unwrap().join("ffi-c-api");
+        let layout = outer_layout();
+        let target_dir = layout.target_dir.join("ffi-c-api");
+        let profile = match layout.profile_dir.as_str() {
+            "debug" => "dev",
+            name => name,
+        };
         let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-        let status = Command::new(cargo)
-            .args(["build", "-p", "tickertape-ffi", "--manifest-path"])
-            .arg(repo_root().join("Cargo.toml"))
-            .arg("--target-dir")
-            .arg(&target)
-            .status()
-            .expect("run cargo build");
-        assert!(status.success(), "cargo build -p tickertape-ffi failed");
-        let dir = target.join("debug");
+        let mut cmd = Command::new(cargo);
+        cmd.args([
+            "build",
+            "-p",
+            "tickertape-ffi",
+            "--locked",
+            "--profile",
+            profile,
+        ])
+        .arg("--manifest-path")
+        .arg(repo_root().join("Cargo.toml"))
+        .arg("--target-dir")
+        .arg(&target_dir);
+        let mut dir = target_dir.clone();
+        if let Some(triple) = &layout.triple {
+            cmd.args(["--target", triple]);
+            dir.push(triple);
+        }
+        dir.push(&layout.profile_dir);
+        let status = cmd.status().expect("run cargo build");
+        assert!(status.success(), "{cmd:?} failed");
         assert!(
             dir.join("libtickertape.a").exists(),
             "no libtickertape.a in {}",
@@ -68,20 +146,12 @@ fn env_flag(name: &str) -> bool {
     std::env::var(name).is_ok_and(|v| v == "1")
 }
 
-fn target_triple() -> &'static str {
-    match (std::env::consts::ARCH, std::env::consts::OS) {
-        ("aarch64", "macos") => "aarch64-apple-darwin",
-        ("x86_64", "macos") => "x86_64-apple-darwin",
-        ("aarch64", "linux") => "aarch64-unknown-linux-gnu",
-        ("x86_64", "linux") => "x86_64-unknown-linux-gnu",
-        other => panic!("unsupported platform {other:?}"),
-    }
-}
-
 /// System libraries a static link of the Rust library needs (`rustc --print native-static-libs`).
 fn static_libs() -> &'static [&'static str] {
     if cfg!(target_os = "macos") {
         &["-liconv", "-lc", "-lm"]
+    } else if cfg!(target_env = "musl") {
+        &["-lc"]
     } else {
         &[
             "-lgcc_s",
@@ -101,8 +171,9 @@ enum Link {
     Shared,
 }
 
-/// Compiles `sources` into the executable `out`.
-fn compile(sources: &[PathBuf], cpp: bool, link: Link, extra_includes: &[PathBuf], out: &Path) {
+/// Compiles `sources` as language standard `std` (`c99`, `c++20`, ...) into the executable `out`.
+fn compile(sources: &[PathBuf], std: &str, link: Link, extra_includes: &[PathBuf], out: &Path) {
+    let cpp = std.starts_with("c++");
     let tool = cc::Build::new()
         .cargo_metadata(false)
         .cargo_warnings(false)
@@ -113,12 +184,8 @@ fn compile(sources: &[PathBuf], cpp: bool, link: Link, extra_includes: &[PathBuf
         .cpp(cpp)
         .get_compiler();
     let mut cmd = tool.to_command();
-    cmd.args(if cpp {
-        ["-std=c++11", "-pedantic"]
-    } else {
-        ["-std=c99", "-pedantic"]
-    });
-    cmd.args(["-Wall", "-Wextra", "-Werror"]);
+    cmd.arg(format!("-std={std}"));
+    cmd.args(["-Wall", "-Wextra", "-Werror", "-pedantic"]);
     if env_flag("TICKERTAPE_FFI_SANITIZE") {
         cmd.args([
             "-fsanitize=address,undefined",
@@ -155,8 +222,12 @@ fn compile(sources: &[PathBuf], cpp: bool, link: Link, extra_includes: &[PathBuf
 /// The compiled programs, built once per test process.
 struct Programs {
     _dir: tempfile::TempDir,
+    /// `tests/c/test_api.c` as C99 (linked statically) and as C11 (linked dynamically).
     c_test: PathBuf,
+    c11_test: PathBuf,
+    /// `tests/cpp/test_wrapper.cpp` as C++11 and C++20.
     cpp_test: PathBuf,
+    cpp20_test: PathBuf,
     writer: PathBuf,
     reader: PathBuf,
     example: PathBuf,
@@ -170,45 +241,40 @@ fn programs() -> &'static Programs {
         let examples = repo_root().join("examples/c");
         let p = Programs {
             c_test: dir.path().join("test_api"),
+            c11_test: dir.path().join("test_api_c11"),
             cpp_test: dir.path().join("test_wrapper"),
+            cpp20_test: dir.path().join("test_wrapper_cpp20"),
             writer: dir.path().join("writer"),
             reader: dir.path().join("reader"),
             example: dir.path().join("example"),
             _dir: dir,
         };
-        compile(
-            &[tests.join("c/test_api.c")],
-            false,
-            Link::Static,
-            &[],
-            &p.c_test,
-        );
-        compile(
-            &[tests.join("cpp/test_wrapper.cpp")],
-            true,
-            Link::Shared,
-            std::slice::from_ref(&examples),
-            &p.cpp_test,
-        );
+        let c_test = [tests.join("c/test_api.c")];
+        let cpp_test = [tests.join("cpp/test_wrapper.cpp")];
+        let wrapper = std::slice::from_ref(&examples);
+        compile(&c_test, "c99", Link::Static, &[], &p.c_test);
+        compile(&c_test, "c11", Link::Shared, &[], &p.c11_test);
+        compile(&cpp_test, "c++11", Link::Shared, wrapper, &p.cpp_test);
+        compile(&cpp_test, "c++20", Link::Static, wrapper, &p.cpp20_test);
         compile(
             &[examples.join("writer.c")],
-            false,
+            "c99",
             Link::Static,
             &[],
             &p.writer,
         );
         compile(
             &[examples.join("reader.c")],
-            false,
+            "c99",
             Link::Shared,
             &[],
             &p.reader,
         );
         compile(
             &[examples.join("example.cpp")],
-            true,
+            "c++11",
             Link::Shared,
-            std::slice::from_ref(&examples),
+            wrapper,
             &p.example,
         );
         p
@@ -410,14 +476,42 @@ fn write_rust_fixture(dir: &Path) {
 
 #[test]
 fn c_api_basic() {
-    let scratch = tempfile::tempdir().unwrap();
-    run_ok(command(&programs().c_test).arg("basic").arg(scratch.path()));
+    for program in [&programs().c_test, &programs().c11_test] {
+        let scratch = tempfile::tempdir().unwrap();
+        run_ok(command(program).arg("basic").arg(scratch.path()));
+    }
 }
 
 #[test]
 fn cpp_wrapper() {
+    for program in [&programs().cpp_test, &programs().cpp20_test] {
+        let scratch = tempfile::tempdir().unwrap();
+        run_ok(command(program).arg(scratch.path()));
+    }
+}
+
+/// The header promises that a C++ exception escaping a fill callback terminates the process (it must never unwind
+/// through the library into the caller).
+#[test]
+fn cpp_exception_escaping_a_fill_callback_aborts() {
+    use std::os::unix::process::ExitStatusExt;
     let scratch = tempfile::tempdir().unwrap();
-    run_ok(command(&programs().cpp_test).arg(scratch.path()));
+    let output = command(&programs().cpp_test)
+        .arg(scratch.path())
+        .arg("throw-from-fill")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("caught"),
+        "the exception reached the caller"
+    );
+    assert!(
+        output.status.signal() == Some(6) || stderr.contains("foreign exception"),
+        "{}: {stderr}",
+        output.status
+    );
 }
 
 #[test]

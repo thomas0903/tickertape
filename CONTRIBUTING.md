@@ -35,9 +35,12 @@ cargo test -p tickertape-tests --release -- --ignored        # long tests: 1M re
 cargo +nightly miri test -p tickertape --lib format          # Miri on the format code
 RUSTFLAGS="--cfg loom" cargo test -p tickertape --lib --release protocol_model
 cargo +nightly miri test -p tickertape-ffi --lib pure_         # Miri on the C ABI's argument handling
-TICKERTAPE_FFI_SANITIZE=1 cargo test -p tickertape-ffi         # C/C++ tests under ASan and UBSan
+TICKERTAPE_FFI_SANITIZE=1 cargo test -p tickertape-ffi --features fault-injection   # C/C++ tests under ASan, UBSan
 cbindgen --config crates/tickertape-ffi/cbindgen.toml --crate tickertape-ffi \
     --output crates/tickertape-ffi/include/tickertape.h && git diff --exit-code   # header drift (cbindgen 0.29.4)
+python3 .github/scripts/check_abi_baseline.py crates/tickertape-ffi/abi/tickertape-baseline.h \
+    crates/tickertape-ffi/include/tickertape.h                   # frozen C declarations (from 1.0)
+python3 -m unittest discover -s .github/scripts -p 'test_*.py'  # release and ABI tooling
 ```
 
 `cargo test --workspace` compiles and runs C and C++ programs, so it needs a C/C++ compiler; it also runs the

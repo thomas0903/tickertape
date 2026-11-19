@@ -5,7 +5,7 @@ use std::path::Path;
 
 use tickertape::{OwnedRecord, Reader, ReaderConfig, Record};
 
-use crate::args;
+use crate::args::{self, Region};
 use crate::options::tickertape_reader_options;
 use crate::status::{FfiError, Handle, guard, tickertape_status, tickertape_status_code as S};
 
@@ -25,7 +25,7 @@ pub struct tickertape_reader(Handle<ReaderState>);
 /// mapped reader, into the memory-mapped segment, and stays valid only until the next call that takes the same
 /// reader (other than `tickertape_reader_position`) or until the reader is closed. Copy what you need to keep. Returned
 /// by `tickertape_reader_next_copy` and `tickertape_reader_read_batch` with `payload` pointing into the caller's
-/// buffer. When `payload_len` is 0, `payload` may be NULL or dangling and must not be dereferenced.
+/// buffer. When `payload_len` is 0, `payload` is NULL.
 #[allow(non_camel_case_types)]
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -46,13 +46,36 @@ pub struct tickertape_record {
     pub reserved: u32,
 }
 
+// The frozen layout (ADR 0028 → Versioning); tests/c/test_api.c asserts the same values with offsetof and sizeof.
+#[cfg(target_pointer_width = "64")]
+#[allow(dead_code)]
+fn record_layout_is_frozen() {
+    // Inside a function so that cbindgen does not parse it; the constant is evaluated all the same.
+    const _: () = {
+        use std::mem::{align_of, offset_of, size_of};
+        assert!(size_of::<tickertape_record>() == 48 && align_of::<tickertape_record>() == 8);
+        assert!(offset_of!(tickertape_record, seq) == 0);
+        assert!(offset_of!(tickertape_record, venue_ts_ns) == 8);
+        assert!(offset_of!(tickertape_record, local_ts_ns) == 16);
+        assert!(offset_of!(tickertape_record, payload) == 24);
+        assert!(offset_of!(tickertape_record, payload_len) == 32);
+        assert!(offset_of!(tickertape_record, schema_id) == 40);
+        assert!(offset_of!(tickertape_record, reserved) == 44);
+    };
+}
+
 impl tickertape_record {
+    /// The record with `payload` as its payload pointer, or NULL if the payload is empty.
     fn new(record: &Record<'_>, payload: *const u8) -> tickertape_record {
         tickertape_record {
             seq: record.seq,
             venue_ts_ns: record.venue_ts_ns,
             local_ts_ns: record.local_ts_ns,
-            payload,
+            payload: if record.payload.is_empty() {
+                std::ptr::null()
+            } else {
+                payload
+            },
             payload_len: record.payload.len(),
             schema_id: record.schema_id,
             reserved: 0,
@@ -128,7 +151,7 @@ unsafe fn handle<'a>(ptr: *mut tickertape_reader) -> Result<&'a Handle<ReaderSta
         return Err(FfiError::null("reader"));
     }
     // SAFETY: not NULL; the caller guarantees a live handle. Only shared references to the handle are created; the
-    // state inside is reached through `Handle::with`.
+    // state inside is reached through `Handle::with` and `Handle::with_ref`.
     Ok(unsafe { &(*ptr).0 })
 }
 
@@ -175,19 +198,23 @@ unsafe fn open(
 }
 
 /// Opens a reader on the journal in directory `dir`, positioned at the first record of the oldest segment, and stores
-/// the new handle in `*reader_out` (NULL on failure). `options` may be NULL for the defaults; they are copied.
+/// the new handle in `*reader_out` (NULL on failure). `options` may be NULL for the defaults; they are copied. If
+/// memory for the handle cannot be allocated, the process aborts (there is no out-of-memory status).
 ///
 /// This is the safe reader: it reads the files with `pread` into a buffer it owns and validates the copy, so it is
 /// memory-safe whatever other processes do to the files, and never receives `SIGBUS`. At worst it reports corruption.
 ///
-/// Errors: `TICKERTAPE_E_NOT_FOUND` if `dir` has no segments yet (for example, the writer has not started);
-/// `TICKERTAPE_E_CORRUPT` or `TICKERTAPE_E_UNSUPPORTED_VERSION` if the oldest segment's header is invalid;
-/// `TICKERTAPE_E_IO`.
+/// Errors: `TICKERTAPE_E_IO` with `ENOENT` (`tickertape_last_error_os_code`) if `dir` does not exist, which is what
+/// a reader that starts before the writer sees, since the writer creates the directory; `TICKERTAPE_E_NOT_FOUND` if
+/// `dir` exists but has no segment yet (the writer is creating it). A loop that waits for the writer should retry on
+/// both and fail on anything else. `TICKERTAPE_E_CORRUPT` or `TICKERTAPE_E_UNSUPPORTED_VERSION` if the oldest
+/// segment's header is invalid; `TICKERTAPE_E_IO` for other OS errors.
 ///
 /// # Safety
 ///
 /// `dir` must be NULL or a NUL-terminated string. `options` must be NULL or live reader options. `reader_out` must
-/// be NULL or valid for writing a pointer.
+/// be NULL or valid for writing a pointer, and must not overlap `dir`. Inputs must stay unmodified until the call
+/// returns.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tickertape_reader_open(
     dir: *const c_char,
@@ -222,12 +249,13 @@ pub unsafe extern "C" fn tickertape_reader_open_mapped_unsafe(
 }
 
 /// Closes a reader and frees the handle, invalidating any record view it returned. NULL is ignored. Returns
-/// `TICKERTAPE_E_BUSY` (and closes nothing) if called from inside a call on the same reader.
+/// `TICKERTAPE_E_BUSY` (and closes nothing; the handle stays valid) if called from inside a call on the same reader.
 ///
 /// # Safety
 ///
-/// `reader` must be NULL or a live reader handle. After this returns `TICKERTAPE_OK` the handle is invalid; using or
-/// closing it again is undefined behaviour.
+/// `reader` must be NULL or a live reader handle. After this returns any status other than `TICKERTAPE_E_BUSY`
+/// (including `TICKERTAPE_E_PANIC`), the handle is freed: using or closing it again is undefined behaviour, so never
+/// retry a close that failed with another status.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tickertape_reader_close(
     reader: *mut tickertape_reader,
@@ -253,11 +281,15 @@ pub unsafe extern "C" fn tickertape_reader_close(
 /// Positions the reader so that the next record returned is `seq`.
 ///
 /// If `seq` has not been written yet, the reader waits for it: reads return `TICKERTAPE_NONE` until the writer gets
-/// there, and records before `seq` are skipped. Every record on the way is validated, so the reader only lands on
-/// positions along the journal's current chain. Discards a record held back by `tickertape_reader_next_copy` or
-/// `tickertape_reader_read_batch`, and an error deferred by `tickertape_reader_read_batch`.
+/// there, and records before `seq` are skipped. Every record on the way is validated (by the reads that follow), so
+/// the reader only lands on positions along the journal's current chain. Any call invalidates the record view
+/// returned by `tickertape_reader_next`. A successful seek also discards a record held back by
+/// `tickertape_reader_next_copy` or `tickertape_reader_read_batch`, and an error deferred by
+/// `tickertape_reader_read_batch`; a failed seek leaves the reader exactly as it was (same position, held-back
+/// record and deferred error).
 ///
-/// Errors: `TICKERTAPE_E_SEQ_UNAVAILABLE` if `seq` is older than the oldest segment; `TICKERTAPE_E_NOT_FOUND`;
+/// Errors: `TICKERTAPE_E_SEQ_UNAVAILABLE` if `seq` is older than the oldest segment (retention removed it; seek to
+/// the oldest segment's `base_seq` from `tickertape_list_segments` to continue there); `TICKERTAPE_E_NOT_FOUND`;
 /// `TICKERTAPE_E_CORRUPT` or `TICKERTAPE_E_IO` while locating it.
 ///
 /// # Safety
@@ -272,9 +304,10 @@ pub unsafe extern "C" fn tickertape_reader_seek(
         // SAFETY: forwarded caller contract.
         unsafe { handle(reader) }?.with(|state| {
             state.returned = None;
+            // The core leaves its cursor unchanged when a seek fails; keep what belongs to that cursor too.
+            state.reader.seek(seq)?;
             state.pending = None;
             state.deferred = None;
-            state.reader.seek(seq)?;
             Ok(())
         })?;
         Ok(S::TICKERTAPE_OK)
@@ -285,15 +318,20 @@ pub unsafe extern "C" fn tickertape_reader_seek(
 ///
 /// `timeout_ns` 0 (`TICKERTAPE_NO_WAIT`) does not wait; a positive value waits up to that many nanoseconds, using
 /// the configured back-off and wake-ups; a negative value (`TICKERTAPE_WAIT_FOREVER`) waits until a record arrives.
-/// Returns `TICKERTAPE_OK` with a record, or `TICKERTAPE_NONE` (leaving `*record_out` unchanged) if no record is
-/// committed yet or the timeout passed. Follows seals into the next segment transparently.
+/// The timeout bounds only the wait for a record to become available: argument checks, catching up after a seek
+/// (validating the records skipped on the way) and file I/O are not interrupted, so a call can take longer. A call
+/// waiting with `TICKERTAPE_WAIT_FOREVER` cannot be interrupted, not even by closing the reader from another thread
+/// (which is undefined behaviour): to make a wait cancellable, loop with a finite timeout and check for
+/// cancellation between calls. Returns `TICKERTAPE_OK` with a record, or `TICKERTAPE_NONE` (leaving `*record_out`
+/// unchanged) if no record is committed yet or the timeout passed. Follows seals into the next segment
+/// transparently.
 ///
 /// Without durable-only, the reader returns records as soon as they are **visible**, including records that a later
 /// power loss can erase (the writer then reuses their sequence numbers). With durable-only, it returns only records
 /// covered by a checkpoint (**durable**) and treats the rest as not written yet.
 ///
 /// The view's `payload` is valid until the next call that takes this reader (other than
-/// `tickertape_reader_position`) or until the reader is closed.
+/// `tickertape_reader_position`) or until the reader is closed. It is NULL when `payload_len` is 0.
 ///
 /// Errors: `TICKERTAPE_E_CORRUPT` if the bytes at the cursor fail validation (the cursor does not move, so calling
 /// again retries the same position, which may succeed after a writer recovery); `TICKERTAPE_E_DISCARDED` if writer
@@ -303,7 +341,7 @@ pub unsafe extern "C" fn tickertape_reader_seek(
 /// # Safety
 ///
 /// `reader` must be NULL or a live reader handle. `record_out` must be NULL or valid for writing a
-/// `tickertape_record`.
+/// `tickertape_record` (caller-owned storage; only the returned payload pointer borrows from the reader).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tickertape_reader_next(
     reader: *mut tickertape_reader,
@@ -339,14 +377,17 @@ pub unsafe extern "C" fn tickertape_reader_next(
 /// Like `tickertape_reader_next`, but copies the payload into the caller's buffer `buf` of `buf_len` bytes; the
 /// returned record's `payload` points to `buf`.
 ///
+/// `payload` is NULL when `payload_len` is 0.
+///
 /// If the payload does not fit, returns `TICKERTAPE_E_BUFFER_TOO_SMALL` with `*record_out` describing the record
 /// (with `payload` NULL and `payload_len` the size needed); the record is held back and returned by the next read
-/// call on this reader.
+/// call on this reader. Returns `TICKERTAPE_E_INVALID_ARGUMENT` if `record_out` overlaps `buf`.
 ///
 /// # Safety
 ///
 /// `reader` must be NULL or a live reader handle. `buf` must be valid for writing `buf_len` bytes (it may be NULL
-/// when `buf_len` is 0). `record_out` must be NULL or valid for writing a `tickertape_record`.
+/// when `buf_len` is 0). `record_out` must be NULL or valid for writing a `tickertape_record`. Both are caller-owned
+/// and must not overlap each other.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tickertape_reader_next_copy(
     reader: *mut tickertape_reader,
@@ -364,6 +405,10 @@ pub unsafe extern "C" fn tickertape_reader_next_copy(
                 "buf must not be NULL when buf_len is not 0",
             ));
         }
+        args::disjoint(&[
+            Region::of(buf, buf_len, "buf"),
+            Region::of(record_out, 1, "record_out"),
+        ])?;
         // SAFETY: forwarded caller contract.
         unsafe { handle(reader) }?.with(|state| {
             state.begin()?;
@@ -396,7 +441,8 @@ pub unsafe extern "C" fn tickertape_reader_next_copy(
 }
 
 /// Reads up to `max_records` records into `records`, copying their payloads one after another into `buf` (`buf_len`
-/// bytes), and stores the number read in `*count_out`. Each record's `payload` points into `buf`.
+/// bytes), and stores the number read in `*count_out`. Each record's `payload` points into `buf` (NULL when its
+/// `payload_len` is 0). `max_records` must not be 0 (`TICKERTAPE_E_INVALID_ARGUMENT`).
 ///
 /// Waits up to `timeout_ns` (as for `tickertape_reader_next`) for the first record only, then takes only records that
 /// are already committed. Stops when `max_records` are read, the next record's payload does not fit in the rest of
@@ -408,14 +454,20 @@ pub unsafe extern "C" fn tickertape_reader_next_copy(
 ///
 /// Partial failure: an error that happens before any record is read is returned directly. An error after one or
 /// more records is **not** returned by this call: it returns `TICKERTAPE_OK` with the records read so far, and the
-/// next read call on this reader returns the error (the reader does not advance past the failing position). So no
-/// record handed out is ever lost to an error.
+/// next read call on this reader (`next`, `next_copy` or `read_batch`) returns the error. A successful
+/// `tickertape_reader_seek` discards it instead. The reader does not advance past the failing position, so a
+/// persistent error (such as corruption) is returned again by the calls after that. No record handed out is ever
+/// lost to an error.
+///
+/// `*count_out` is set to 0 first, also on errors and with `TICKERTAPE_NONE`. Returns
+/// `TICKERTAPE_E_INVALID_ARGUMENT` if any two of `records` (all `max_records` entries), `buf` and `count_out`
+/// overlap.
 ///
 /// # Safety
 ///
 /// `reader` must be NULL or a live reader handle. `records` must be valid for writing `max_records`
-/// `tickertape_record`s. `buf` must be valid for writing `buf_len` bytes (it may be NULL when `buf_len` is 0) and must
-/// not overlap `records`. `count_out` must be NULL or valid for writing a `size_t`.
+/// `tickertape_record`s. `buf` must be valid for writing `buf_len` bytes (it may be NULL when `buf_len` is 0).
+/// `count_out` must be NULL or valid for writing a `size_t`. All three are caller-owned and must not overlap.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tickertape_reader_read_batch(
     reader: *mut tickertape_reader,
@@ -440,6 +492,11 @@ pub unsafe extern "C" fn tickertape_reader_read_batch(
                 "buf must not be NULL when buf_len is not 0",
             ));
         }
+        args::disjoint(&[
+            Region::of(records, max_records, "records"),
+            Region::of(buf, buf_len, "buf"),
+            Region::of(count_out, 1, "count_out"),
+        ])?;
         // SAFETY: forwarded caller contract.
         unsafe { handle(reader) }?.with(|state| {
             state.begin()?;
@@ -478,12 +535,12 @@ pub unsafe extern "C" fn tickertape_reader_read_batch(
                 // SAFETY: `used + len <= buf_len`, so the destination lies inside the caller's buffer, which cannot
                 // overlap the reader's own buffer or a read-only mapping.
                 unsafe { args::copy_to(buf, used, record.payload) };
-                let payload = if used == 0 {
-                    // With `buf_len == 0`, `buf` may be NULL; it is returned unchanged.
-                    buf
+                let payload = if len == 0 {
+                    // `tickertape_record::new` stores NULL for an empty payload.
+                    std::ptr::null_mut()
                 } else {
-                    // SAFETY: `0 < used <= buf_len`, so `buf` is not NULL and the result stays within (or one past
-                    // the end of) the caller's buffer.
+                    // SAFETY: `used + len <= buf_len` with `len > 0`, so `buf` is not NULL and the result stays
+                    // within the caller's buffer.
                     unsafe { buf.add(used) }
                 };
                 // SAFETY: `count < max_records`, and `records` is valid for `max_records` elements.
@@ -515,7 +572,7 @@ pub unsafe extern "C" fn tickertape_reader_position(
 ) -> tickertape_status {
     guard(|| {
         // SAFETY: forwarded caller contract.
-        let seq = unsafe { handle(reader) }?.with(|state| {
+        let seq = unsafe { handle(reader) }?.with_ref(|state| {
             Ok(state
                 .pending
                 .as_ref()

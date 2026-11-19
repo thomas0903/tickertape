@@ -26,6 +26,9 @@ doc = false
 [features]
 # Empty; cargo-c (`cargo cbuild`, `cargo cinstall`) enables it by convention. It changes nothing in the build.
 capi = []
+# Test-only: the core's failure points (crates/tickertape/src/fault.rs), for the tests of failed clean-ups. Never
+# enable in a library you ship.
+fault-injection = ["tickertape/fault-injection"]
 
 [dependencies]
 tickertape.workspace = true

@@ -3,9 +3,9 @@
 use std::ffi::{c_char, c_void};
 use std::panic::{self, AssertUnwindSafe};
 
-use tickertape::{NewRecord, Writer, WriterConfig};
+use tickertape::{Error, NewRecord, Writer, WriterConfig};
 
-use crate::args;
+use crate::args::{self, Region};
 use crate::options::tickertape_writer_options;
 use crate::status::{FfiError, Handle, guard, tickertape_status, tickertape_status_code as S};
 
@@ -38,15 +38,38 @@ pub struct tickertape_new_record {
     pub reserved: u32,
 }
 
+// The frozen layout (ADR 0028 → Versioning); tests/c/test_api.c asserts the same values with offsetof and sizeof.
+#[cfg(target_pointer_width = "64")]
+#[allow(dead_code)]
+fn new_record_layout_is_frozen() {
+    // Inside a function so that cbindgen does not parse it; the constant is evaluated all the same.
+    const _: () = {
+        use std::mem::{align_of, offset_of, size_of};
+        assert!(
+            size_of::<tickertape_new_record>() == 40 && align_of::<tickertape_new_record>() == 8
+        );
+        assert!(offset_of!(tickertape_new_record, payload) == 0);
+        assert!(offset_of!(tickertape_new_record, payload_len) == 8);
+        assert!(offset_of!(tickertape_new_record, venue_ts_ns) == 16);
+        assert!(offset_of!(tickertape_new_record, local_ts_ns) == 24);
+        assert!(offset_of!(tickertape_new_record, schema_id) == 32);
+        assert!(offset_of!(tickertape_new_record, reserved) == 36);
+    };
+}
+
 /// Fills a payload buffer in place for `tickertape_writer_append_with`.
 ///
-/// Called once, on the calling thread, with `buf` pointing to `len` zeroed bytes inside the mapped segment. Write
-/// the payload into it and return 0 to commit the record, or return non-zero to abort the append. The callback must
-/// not keep `buf` after it returns, must not call any function on the writer that invoked it (that returns
-/// `TICKERTAPE_E_BUSY`), and must not unwind or `longjmp` out (C++: catch every exception inside).
+/// Called once, on the calling thread, with `buf` pointing to `len` zeroed bytes inside the mapped segment (`buf` is
+/// NULL when `len` is 0). Write the payload into it and return 0 to commit the record, or return non-zero to abort
+/// the append. The callback must not keep `buf` after it returns, and must not call any function on the writer that
+/// invoked it (that returns `TICKERTAPE_E_BUSY`; closing it from here is refused the same way).
+///
+/// The callback must return normally. A C++ exception that escapes it terminates the process (the library cannot
+/// catch foreign exceptions and aborts): catch every exception inside and return non-zero instead. Leaving it with
+/// `longjmp` is undefined behaviour.
 #[allow(non_camel_case_types)]
 pub type tickertape_fill_fn =
-    Option<unsafe extern "C" fn(user_data: *mut c_void, buf: *mut u8, len: usize) -> i32>;
+    Option<unsafe extern "C-unwind" fn(user_data: *mut c_void, buf: *mut u8, len: usize) -> i32>;
 
 /// The unwind payload that aborts an `append_with` whose callback returned non-zero.
 struct FillAborted;
@@ -61,8 +84,20 @@ unsafe fn handle<'a>(ptr: *mut tickertape_writer) -> Result<&'a Handle<Writer>, 
         return Err(FfiError::null("writer"));
     }
     // SAFETY: not NULL; the caller guarantees a live handle. Only shared references to the handle are created; the
-    // state inside is reached through `Handle::with`.
+    // state inside is reached through `Handle::with` and `Handle::with_ref`.
     Ok(unsafe { &(*ptr).0 })
+}
+
+/// Converts an error from an append or checkpoint, saying what happened if an aborted fill's clean-up failed
+/// earlier (the core reports that as `DurabilityLost` on checkpoints, which otherwise means a failed checkpoint).
+fn writer_error(writer: &Writer, error: Error) -> FfiError {
+    match (&error, writer.abandoned_write_error()) {
+        (Error::DurabilityLost, Some(cause)) => FfiError::from(&error).with_message(format!(
+            "durability can no longer be guaranteed for this writer: the clean-up after an aborted fill callback \
+             failed ({cause}); close the writer and reopen the journal"
+        )),
+        _ => FfiError::from(error),
+    }
 }
 
 /// Opens the journal in directory `dir` for writing, creating the directory and the first segment if needed, and
@@ -70,7 +105,8 @@ unsafe fn handle<'a>(ptr: *mut tickertape_writer) -> Result<&'a Handle<Writer>, 
 ///
 /// Takes the journal's lock, then recovers the journal (`docs/format.md` → Recovery): it validates everything after
 /// the last checkpoint, repairs or quarantines what is invalid, and syncs every repair before returning. `options`
-/// may be NULL for the defaults; they are copied. On failure `*writer_out` is set to NULL.
+/// may be NULL for the defaults; they are copied. On failure `*writer_out` is set to NULL. If memory for the handle
+/// cannot be allocated, the process aborts (there is no out-of-memory status).
 ///
 /// Errors: `TICKERTAPE_E_LOCKED` if another writer has the journal open; `TICKERTAPE_E_INVALID_CONFIG`;
 /// `TICKERTAPE_E_CORRUPT` if the journal is damaged in a way recovery does not repair, or the tail is corrupt and the
@@ -79,7 +115,8 @@ unsafe fn handle<'a>(ptr: *mut tickertape_writer) -> Result<&'a Handle<Writer>, 
 /// # Safety
 ///
 /// `dir` must be NULL or a NUL-terminated string. `options` must be NULL or live writer options. `writer_out` must
-/// be NULL or valid for writing a pointer.
+/// be NULL or valid for writing a pointer, and must not overlap `dir`. Inputs must stay unmodified until the call
+/// returns.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tickertape_writer_open(
     dir: *const c_char,
@@ -109,12 +146,13 @@ pub unsafe extern "C" fn tickertape_writer_open(
 ///
 /// Closing does **not** checkpoint: every appended record stays visible to readers and survives the process exiting,
 /// but only records covered by a successful `tickertape_writer_checkpoint` are durable. Returns `TICKERTAPE_E_BUSY`
-/// (and closes nothing) if called from a fill callback of the same writer.
+/// (and closes nothing; the handle stays valid) if called from a fill callback of the same writer.
 ///
 /// # Safety
 ///
-/// `writer` must be NULL or a live handle from `tickertape_writer_open`. After this returns `TICKERTAPE_OK` the handle
-/// is invalid; using or closing it again is undefined behaviour.
+/// `writer` must be NULL or a live handle from `tickertape_writer_open`. After this returns any status other than
+/// `TICKERTAPE_E_BUSY` (including `TICKERTAPE_E_PANIC`), the handle is freed: using or closing it again is undefined
+/// behaviour, so never retry a close that failed with another status.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tickertape_writer_close(
     writer: *mut tickertape_writer,
@@ -144,14 +182,16 @@ pub unsafe extern "C" fn tickertape_writer_close(
 /// `tickertape_writer_checkpoint` succeeds. If the record does not fit in the current segment, the writer first rolls
 /// to a new segment (slower: it creates and syncs a file).
 ///
-/// Errors: `TICKERTAPE_E_INVALID_ARGUMENT` (`payload` NULL with `payload_len` > 0); `TICKERTAPE_E_RECORD_TOO_LARGE`;
-/// `TICKERTAPE_E_SEQUENCE_EXHAUSTED`; `TICKERTAPE_E_STORAGE_FULL` or `TICKERTAPE_E_IO` if a roll fails (the journal
-/// is unchanged and the call can be retried).
+/// Errors: `TICKERTAPE_E_INVALID_ARGUMENT` (`payload` NULL with `payload_len` > 0, or `seq_out` overlapping the
+/// payload); `TICKERTAPE_E_RECORD_TOO_LARGE`; `TICKERTAPE_E_SEQUENCE_EXHAUSTED`; `TICKERTAPE_E_STORAGE_FULL` or
+/// `TICKERTAPE_E_IO` if a roll fails (the journal is unchanged and the call can be retried), or after a failed
+/// clean-up of an aborted fill (see `tickertape_writer_append_with`).
 ///
 /// # Safety
 ///
 /// `writer` must be NULL or a live writer handle. `payload` must point to `payload_len` readable bytes (or be
-/// anything, including NULL, when `payload_len` is 0). `seq_out` must be NULL or valid for writing a `uint64_t`.
+/// anything, including NULL, when `payload_len` is 0) that stay unmodified until the call returns. `seq_out` must be
+/// NULL or valid for writing a `uint64_t`, and must not overlap the payload.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tickertape_writer_append(
     writer: *mut tickertape_writer,
@@ -165,6 +205,10 @@ pub unsafe extern "C" fn tickertape_writer_append(
     guard(|| {
         // SAFETY: forwarded caller contract.
         let payload = unsafe { args::bytes(payload, payload_len, "payload") }?;
+        args::disjoint(&[
+            Region::of(payload.as_ptr(), payload.len(), "payload"),
+            Region::of(seq_out, 1, "seq_out"),
+        ])?;
         let record = NewRecord {
             schema_id,
             venue_ts_ns,
@@ -172,7 +216,8 @@ pub unsafe extern "C" fn tickertape_writer_append(
             payload,
         };
         // SAFETY: forwarded caller contract.
-        let seq = unsafe { handle(writer) }?.with(|w| Ok(w.append(&record)?))?;
+        let seq = unsafe { handle(writer) }?
+            .with(|w| w.append(&record).map_err(|e| writer_error(w, e)))?;
         // SAFETY: forwarded caller contract.
         unsafe { args::write_optional(seq_out, seq) };
         Ok(S::TICKERTAPE_OK)
@@ -183,13 +228,17 @@ pub unsafe extern "C" fn tickertape_writer_append(
 /// `*seq_out` (which may be NULL).
 ///
 /// `fill(user_data, buf, payload_len)` is called once with a zeroed buffer of exactly `payload_len` bytes inside the
-/// mapped segment; no reader can see it until `fill` returns 0 and the record is committed. Durability is as for
-/// `tickertape_writer_append`: **visible** on return, **durable** only after a later successful checkpoint.
+/// mapped segment (`buf` NULL when `payload_len` is 0); no reader can see it until `fill` returns 0 and the record is
+/// committed. Durability is as for `tickertape_writer_append`: **visible** on return, **durable** only after a later
+/// successful checkpoint.
 ///
 /// If `fill` returns non-zero, nothing is committed and this returns `TICKERTAPE_E_ABORTED`: the writer zeroes the
 /// buffer and syncs that zeroing to storage before returning (`docs/format.md` → Abandoned writes), so aborting is
-/// slow; use it only for exceptional cases. If that sync fails, the writer refuses further appends and checkpoints
-/// (reopen the journal to recover).
+/// slow; use it only for exceptional cases. If that sync fails, this call returns `TICKERTAPE_E_IO` (or
+/// `TICKERTAPE_E_STORAGE_FULL`) with the OS error and a message saying the clean-up failed, instead of
+/// `TICKERTAPE_E_ABORTED`. The writer then refuses further appends (the same code and OS error, with a message
+/// that says why) and checkpoints (`TICKERTAPE_E_DURABILITY_LOST`): close it and reopen the journal, whose recovery
+/// cleans up.
 ///
 /// Errors: as for `tickertape_writer_append`, plus `TICKERTAPE_E_ABORTED`, and `TICKERTAPE_E_INVALID_ARGUMENT` if
 /// `fill` is NULL. `fill` is not called when the append fails before it.
@@ -197,8 +246,8 @@ pub unsafe extern "C" fn tickertape_writer_append(
 /// # Safety
 ///
 /// `writer` must be NULL or a live writer handle. `fill` must be NULL or a function that follows the
-/// `tickertape_fill_fn` contract; `user_data` is passed to it unchanged. `seq_out` must be NULL or valid for writing
-/// a `uint64_t`.
+/// `tickertape_fill_fn` contract; `user_data` is passed to it unchanged and never dereferenced by the library.
+/// `seq_out` must be NULL or valid for writing a `uint64_t`; it is written after `fill` returns.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tickertape_writer_append_with(
     writer: *mut tickertape_writer,
@@ -222,9 +271,14 @@ pub unsafe extern "C" fn tickertape_writer_append_with(
         let seq = unsafe { handle(writer) }?.with(|w| {
             let appended = panic::catch_unwind(AssertUnwindSafe(|| {
                 w.append_with(&record, payload_len, |buf| {
-                    // SAFETY: `fill` follows the callback contract (caller guarantee); `buf` is valid for
-                    // `buf.len()` writable bytes for the duration of the call.
-                    let rc = unsafe { fill(user_data, buf.as_mut_ptr(), buf.len()) };
+                    let ptr = if buf.is_empty() {
+                        std::ptr::null_mut()
+                    } else {
+                        buf.as_mut_ptr()
+                    };
+                    // SAFETY: `fill` follows the callback contract (caller guarantee); `ptr` is NULL with length 0
+                    // or valid for `buf.len()` writable bytes for the duration of the call.
+                    let rc = unsafe { fill(user_data, ptr, buf.len()) };
                     if rc != 0 {
                         // The core treats an unwind out of the closure as an abandoned write: it zeroes and syncs
                         // the bytes, then continues the unwind, which is caught just below.
@@ -233,11 +287,20 @@ pub unsafe extern "C" fn tickertape_writer_append_with(
                 })
             }));
             match appended {
-                Ok(result) => Ok(result?),
-                Err(payload) if payload.is::<FillAborted>() => Err(FfiError::new(
-                    S::TICKERTAPE_E_ABORTED,
-                    "the fill callback returned non-zero; nothing was appended",
-                )),
+                Ok(result) => result.map_err(|e| writer_error(w, e)),
+                // The writer refuses appends once a clean-up failed, before calling `fill`, so an error recorded
+                // now comes from this call.
+                Err(payload) if payload.is::<FillAborted>() => Err(match w.abandoned_write_error() {
+                    Some(cause) => FfiError::from(cause).with_message(format!(
+                        "the fill callback returned non-zero, and zeroing the abandoned bytes durably failed: \
+                         {cause}; the writer refuses further appends and checkpoints: close it and reopen the \
+                         journal"
+                    )),
+                    None => FfiError::new(
+                        S::TICKERTAPE_E_ABORTED,
+                        "the fill callback returned non-zero; nothing was appended",
+                    ),
+                }),
                 Err(payload) => panic::resume_unwind(payload),
             }
         })?;
@@ -247,23 +310,59 @@ pub unsafe extern "C" fn tickertape_writer_append_with(
     })
 }
 
+/// Appends `records` in order with `append`, storing the number committed in `*appended_out` after each one, so that
+/// it is right whenever this returns or unwinds.
+///
+/// # Safety
+///
+/// Every record must have been checked by `tickertape_writer_append_batch` (payload not NULL when its length is not
+/// 0, length within `isize::MAX`), and its payload must be readable and unmodified during the call. `appended_out`
+/// must be valid for writing a `usize` and must not overlap `records` or any payload.
+pub(crate) unsafe fn append_records(
+    records: &[tickertape_new_record],
+    appended_out: *mut usize,
+    mut append: impl FnMut(&NewRecord<'_>) -> Result<u64, FfiError>,
+) -> Result<(), FfiError> {
+    for (index, r) in records.iter().enumerate() {
+        // SAFETY: checked before (see the function's contract); cannot fail here.
+        let payload = unsafe { args::bytes(r.payload, r.payload_len, "payload") }?;
+        append(&NewRecord {
+            schema_id: r.schema_id,
+            venue_ts_ns: r.venue_ts_ns,
+            local_ts_ns: r.local_ts_ns,
+            payload,
+        })?;
+        // SAFETY: valid for writes and disjoint from every input (the function's contract).
+        unsafe { appended_out.write(index + 1) };
+    }
+    Ok(())
+}
+
 /// Appends `count` records in order, stopping at the first failure.
 ///
-/// Every record is checked first (`payload` NULL with `payload_len` > 0, `reserved` not 0): an argument error
-/// returns `TICKERTAPE_E_INVALID_ARGUMENT` and appends nothing. Then the records are appended one by one, as with
-/// `tickertape_writer_append`. `*appended_out` is always set to the number of records appended, and `*first_seq_out`
-/// (which may be NULL) to the sequence number of the first; they are consecutive. On an error, the records before
-/// the failing one (index `*appended_out`) **are appended** and stay appended: retry only from the failing record.
+/// Every record is checked first (`payload` NULL with `payload_len` > 0, a length too large, `reserved` not 0): an
+/// argument error returns `TICKERTAPE_E_INVALID_ARGUMENT`, naming the record's index in the message, and appends
+/// nothing. Then the records are appended one by one, as with `tickertape_writer_append`. `*first_seq_out` (which may
+/// be NULL) is set to the sequence number the first record gets, and `*appended_out` to the number of records
+/// appended so far, updated as each one commits; the appended records are consecutive. On an error, the records
+/// before the failing one (index `*appended_out`) **are appended** and stay appended: retry only from the failing
+/// record.
+///
+/// If `appended_out` or `first_seq_out` overlaps another argument (each other, the `records` array or a payload),
+/// returns `TICKERTAPE_E_INVALID_ARGUMENT` and writes nothing. Otherwise `*appended_out` is always set (0 on an
+/// argument error).
 ///
 /// Durability is as for `tickertape_writer_append`: **visible** on return, **durable** only after a later
-/// successful checkpoint. Errors: as for `tickertape_writer_append`.
+/// successful checkpoint. Errors: as for `tickertape_writer_append`, and `TICKERTAPE_E_INVALID_ARGUMENT` if `count`
+/// records do not fit in memory.
 ///
 /// # Safety
 ///
 /// `writer` must be NULL or a live writer handle. `records` must point to `count` readable
 /// `tickertape_new_record`s whose payloads follow the rule for `tickertape_writer_append` (it may be NULL when `count`
-/// is 0). `appended_out` must be NULL or valid for writing a `size_t`, and `first_seq_out` NULL or valid for writing
-/// a `uint64_t`.
+/// is 0); the records and their payloads must stay unmodified until the call returns. `appended_out` must be NULL or
+/// valid for writing a `size_t`, and `first_seq_out` NULL or valid for writing a `uint64_t`; neither may overlap the
+/// records, their payloads or each other.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tickertape_writer_append_batch(
     writer: *mut tickertape_writer,
@@ -273,20 +372,42 @@ pub unsafe extern "C" fn tickertape_writer_append_batch(
     first_seq_out: *mut u64,
 ) -> tickertape_status {
     guard(|| {
-        // SAFETY: forwarded caller contract.
-        unsafe { args::write(appended_out, 0, "appended_out") }?;
-        if count > 0 && records.is_null() {
-            return Err(FfiError::invalid(
-                "records must not be NULL when count is not 0",
-            ));
+        if appended_out.is_null() {
+            return Err(FfiError::null("appended_out"));
         }
-        let records: &[tickertape_new_record] = if count == 0 {
-            &[]
-        } else {
-            // SAFETY: not NULL; the caller guarantees `count` readable records.
-            unsafe { std::slice::from_raw_parts(records, count) }
+        let outputs = [
+            Region::of(appended_out, 1, "appended_out"),
+            Region::of(first_seq_out, 1, "first_seq_out"),
+        ];
+        // SAFETY: forwarded caller contract; this checks the pointer and the size in bytes without reading.
+        let records = unsafe { args::slice(records, count, "records", "count") };
+        let records = match records {
+            Ok(records) => records,
+            Err(error) => {
+                args::disjoint(&outputs)?;
+                // SAFETY: not NULL; the caller guarantees it is writable; it overlaps no output (checked), and
+                // the records are not read.
+                unsafe { appended_out.write(0) };
+                return Err(error);
+            }
         };
-        let mut new_records = Vec::with_capacity(records.len());
+        // Overlaps first, before anything is written: an output inside an input would change it mid-call.
+        let array = Region::of(records.as_ptr(), records.len(), "records");
+        args::disjoint(&[outputs[0], outputs[1], array])?;
+        for (index, r) in records.iter().enumerate() {
+            if r.payload_len > isize::MAX as usize {
+                continue; // rejected by the validation below
+            }
+            let payload = Region::of(r.payload, r.payload_len, "payload");
+            if let Some(output) = outputs.iter().find(|o| o.overlaps(&payload)) {
+                return Err(FfiError::invalid(format!(
+                    "records[{index}].payload and {} must not overlap",
+                    output.name()
+                )));
+            }
+        }
+        // SAFETY: not NULL; the caller guarantees it is writable; it overlaps no input (checked above).
+        unsafe { appended_out.write(0) };
         for (index, r) in records.iter().enumerate() {
             if r.reserved != 0 {
                 return Err(FfiError::invalid(format!(
@@ -294,37 +415,22 @@ pub unsafe extern "C" fn tickertape_writer_append_batch(
                 )));
             }
             // SAFETY: the caller guarantees each payload is readable for its length.
-            let payload =
-                unsafe { args::bytes(r.payload, r.payload_len, "payload") }.map_err(|_| {
-                    FfiError::invalid(format!(
-                        "records[{index}].payload must not be NULL when payload_len is not 0"
-                    ))
-                })?;
-            new_records.push(NewRecord {
-                schema_id: r.schema_id,
-                venue_ts_ns: r.venue_ts_ns,
-                local_ts_ns: r.local_ts_ns,
-                payload,
-            });
+            unsafe { args::bytes(r.payload, r.payload_len, "payload") }.map_err(|e| {
+                let message = format!("records[{index}].{}", e.message());
+                e.with_message(message)
+            })?;
         }
         // SAFETY: forwarded caller contract.
-        let (appended, first, result) = unsafe { handle(writer) }?.with(|w| {
-            let first = w.next_seq();
-            let mut appended = 0usize;
-            for record in &new_records {
-                if let Err(error) = w.append(record) {
-                    return Ok((appended, first, Err(FfiError::from(error))));
-                }
-                appended += 1;
+        unsafe { handle(writer) }?.with(|w| {
+            // SAFETY: `first_seq_out` is NULL or writable (caller guarantee) and overlaps no input (checked above).
+            unsafe { args::write_optional(first_seq_out, w.next_seq()) };
+            // SAFETY: every record was checked above, and `appended_out` overlaps no input.
+            unsafe {
+                append_records(records, appended_out, |record| {
+                    w.append(record).map_err(|e| writer_error(w, e))
+                })
             }
-            Ok((appended, first, Ok(())))
         })?;
-        // SAFETY: checked above that `appended_out` is writable; `first_seq_out` per the caller contract.
-        unsafe {
-            appended_out.write(appended);
-            args::write_optional(first_seq_out, first);
-        }
-        result?;
         Ok(S::TICKERTAPE_OK)
     })
 }
@@ -336,7 +442,8 @@ pub unsafe extern "C" fn tickertape_writer_append_batch(
 /// Errors: `TICKERTAPE_E_IO` or `TICKERTAPE_E_STORAGE_FULL` if a sync fails. The writer is then poisoned: every later
 /// checkpoint returns `TICKERTAPE_E_DURABILITY_LOST`, because a failed sync can drop data that a retry would not
 /// rewrite. Appends keep working. Treat a checkpoint error as an incident: records written before it may not be
-/// durable even if a later writer's checkpoint succeeds.
+/// durable even if a later writer's checkpoint succeeds. `TICKERTAPE_E_DURABILITY_LOST` is also returned after a
+/// failed clean-up of an aborted fill (the message says which happened).
 ///
 /// # Safety
 ///
@@ -347,7 +454,7 @@ pub unsafe extern "C" fn tickertape_writer_checkpoint(
 ) -> tickertape_status {
     guard(|| {
         // SAFETY: forwarded caller contract.
-        unsafe { handle(writer) }?.with(|w| Ok(w.checkpoint()?))?;
+        unsafe { handle(writer) }?.with(|w| w.checkpoint().map_err(|e| writer_error(w, e)))?;
         Ok(S::TICKERTAPE_OK)
     })
 }
@@ -364,7 +471,7 @@ pub unsafe extern "C" fn tickertape_writer_next_seq(
 ) -> tickertape_status {
     guard(|| {
         // SAFETY: forwarded caller contract.
-        let seq = unsafe { handle(writer) }?.with(|w| Ok(w.next_seq()))?;
+        let seq = unsafe { handle(writer) }?.with_ref(|w| Ok(w.next_seq()))?;
         // SAFETY: forwarded caller contract.
         unsafe { args::write(seq_out, seq, "seq_out") }?;
         Ok(S::TICKERTAPE_OK)
@@ -384,7 +491,7 @@ pub unsafe extern "C" fn tickertape_writer_last_retention_error(
 ) -> tickertape_status {
     guard(|| {
         // SAFETY: forwarded caller contract.
-        unsafe { handle(writer) }?.with(|w| match w.last_retention_error() {
+        unsafe { handle(writer) }?.with_ref(|w| match w.last_retention_error() {
             None => Ok(S::TICKERTAPE_OK),
             Some(error) => Err(FfiError::from(error)),
         })

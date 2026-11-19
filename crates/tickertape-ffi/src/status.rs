@@ -22,7 +22,8 @@ pub enum tickertape_status_code {
     TICKERTAPE_OK = 0,
     /// Success, but there is nothing to return: no record is committed at the reader's position yet, the timeout
     /// passed, or (durable-only readers) the next record is not covered by a checkpoint yet; or there is no valid
-    /// checkpoint marker. Output arguments are left unchanged. Not an error; the last error is not set.
+    /// checkpoint marker. Output arguments are left unchanged, except where a function says otherwise
+    /// (`tickertape_reader_read_batch` sets `*count_out` to 0). Not an error; the last error is not set.
     TICKERTAPE_NONE = 1,
     /// A required pointer was NULL, a value was out of range, or a reserved field was not zero.
     TICKERTAPE_E_INVALID_ARGUMENT = -1,
@@ -38,14 +39,16 @@ pub enum tickertape_status_code {
     TICKERTAPE_E_CORRUPT = -5,
     /// A segment was written by an incompatible format version.
     TICKERTAPE_E_UNSUPPORTED_VERSION = -6,
-    /// The directory contains no journal segments (for example, the writer has not started yet).
+    /// The directory exists but contains no journal segments (for example, the writer has not created the first one
+    /// yet). A directory that does not exist is `TICKERTAPE_E_IO` with `ENOENT` instead.
     TICKERTAPE_E_NOT_FOUND = -7,
     /// The requested sequence number is older than the oldest segment in the journal.
     TICKERTAPE_E_SEQ_UNAVAILABLE = -8,
     /// The payload does not fit in one segment.
     TICKERTAPE_E_RECORD_TOO_LARGE = -9,
-    /// An earlier checkpoint failed, so this writer can no longer guarantee durability. Appends still work. See
-    /// `docs/crash-contract.md` → Errors are sticky.
+    /// An earlier checkpoint failed, or the clean-up after an aborted fill callback failed, so this writer can no
+    /// longer guarantee durability. After a failed checkpoint appends still work. See `docs/crash-contract.md` →
+    /// Errors are sticky.
     TICKERTAPE_E_DURABILITY_LOST = -10,
     /// Sequence numbers (or checkpoint generations) are exhausted.
     TICKERTAPE_E_SEQUENCE_EXHAUSTED = -11,
@@ -56,7 +59,8 @@ pub enum tickertape_status_code {
     TICKERTAPE_E_INVALID_CONFIG = -13,
     /// A caller-provided buffer or array is too small. The function says what it reports about the size needed.
     TICKERTAPE_E_BUFFER_TOO_SMALL = -14,
-    /// A fill callback returned non-zero; nothing was appended.
+    /// A fill callback returned non-zero; nothing was appended and the writer cleaned up. (If the clean-up fails, the
+    /// call returns `TICKERTAPE_E_IO` or `TICKERTAPE_E_STORAGE_FULL` instead; see `tickertape_writer_append_with`.)
     TICKERTAPE_E_ABORTED = -15,
     /// The handle is already inside a call on this thread, for example when a fill callback calls back into the
     /// writer that invoked it. Nothing was done.
@@ -64,8 +68,9 @@ pub enum tickertape_status_code {
     /// An internal error (a bug in tickertape) was caught. The handle involved is broken: later calls on it return
     /// this code; close it.
     TICKERTAPE_E_PANIC = -17,
-    /// An error this version of the C ABI has no specific code for.
-    TICKERTAPE_E_UNKNOWN = -18,
+    /// An error this version of the C ABI has no specific code for. Its value stays far from the assigned codes,
+    /// which later versions extend downwards from -17.
+    TICKERTAPE_E_UNKNOWN = -255,
 }
 
 /// Why journal bytes failed validation, returned by `tickertape_last_error_corrupt_reason` and in verify reports.
@@ -125,6 +130,16 @@ pub(crate) struct FfiError {
 }
 
 impl FfiError {
+    pub(crate) fn message(&self) -> &str {
+        &self.message
+    }
+
+    /// The same error with another message (the OS error and corruption reason are kept).
+    pub(crate) fn with_message(mut self, message: impl Into<String>) -> FfiError {
+        self.message = message.into();
+        self
+    }
+
     pub(crate) fn new(code: S, message: impl Into<String>) -> FfiError {
         FfiError {
             code,
@@ -308,6 +323,39 @@ impl<T> Handle<T> {
         })
     }
 
+    /// Runs `body` with shared access to the state, unless the handle is busy or broken. For read-only calls, which
+    /// must not invalidate pointers that earlier calls handed out (`tickertape_reader_position` promises not to
+    /// invalidate a borrowed record view).
+    pub(crate) fn with_ref<R>(
+        &self,
+        body: impl FnOnce(&T) -> Result<R, FfiError>,
+    ) -> Result<R, FfiError> {
+        if self.broken.get() {
+            return Err(FfiError::new(
+                S::TICKERTAPE_E_PANIC,
+                "this handle is broken by an earlier internal error; close it",
+            ));
+        }
+        if self.busy.replace(true) {
+            return Err(FfiError::new(
+                S::TICKERTAPE_E_BUSY,
+                "this handle is already inside a call on this thread",
+            ));
+        }
+        let result = panic::catch_unwind(AssertUnwindSafe(|| {
+            // SAFETY: `busy` was false and is now true, so no `with` call on this thread holds a mutable reference to
+            // the state, and the C ABI forbids concurrent calls on one handle from several threads. Only a shared
+            // reference is created, so raw pointers derived from earlier calls stay valid; it does not outlive this
+            // closure.
+            body(unsafe { &*self.inner.get() })
+        }));
+        self.busy.set(false);
+        result.unwrap_or_else(|p| {
+            self.broken.set(true);
+            Err(FfiError::panic(&*p))
+        })
+    }
+
     /// Whether a call on this handle is running on this thread.
     pub(crate) fn is_busy(&self) -> bool {
         self.busy.get()
@@ -318,6 +366,10 @@ impl<T> Handle<T> {
 /// failed yet.
 ///
 /// Every call that returns a negative status sets the last error; other calls leave it unchanged (like `errno`).
+/// The state is per **operating-system thread**: read it on the same OS thread, right after the failing call. In a
+/// runtime that moves its tasks between OS threads (Go goroutines, Java virtual threads), make the failing call and
+/// the reads of the code, message, OS error and corruption reason in one foreign call sequence that cannot move,
+/// for example a C shim that captures all four, or Go's `runtime.LockOSThread`.
 #[unsafe(no_mangle)]
 pub extern "C" fn tickertape_last_error_code() -> tickertape_status {
     LAST_ERROR
@@ -329,8 +381,9 @@ pub extern "C" fn tickertape_last_error_code() -> tickertape_status {
 /// Returns a description of the last error on the calling thread, or an empty string. Never NULL.
 ///
 /// The string is owned by the library and stays valid until the next call on this thread that returns a negative
-/// status, or until the thread exits. Do not free it. It is UTF-8 except for file names, which are passed through
-/// as the operating system returned them.
+/// status, or until the thread exits. Do not free it. It is always valid UTF-8: a file name that is not valid UTF-8
+/// appears with its invalid bytes replaced by U+FFFD, so do not parse paths out of it. Per OS thread, as for
+/// `tickertape_last_error_code`.
 #[unsafe(no_mangle)]
 pub extern "C" fn tickertape_last_error_message() -> *const c_char {
     static EMPTY: &[u8] = b"\0";

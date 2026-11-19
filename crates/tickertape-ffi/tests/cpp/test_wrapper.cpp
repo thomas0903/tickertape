@@ -1,5 +1,8 @@
-// C++11 test of the C ABI through the RAII wrapper in examples/c/tickertape.hpp, compiled against the committed
-// header by tests/c_api.rs and linked against the shared library. Usage: test_wrapper <scratch-dir>
+// C++11/C++20 test of the C ABI through the RAII wrapper in examples/c/tickertape.hpp, compiled against the committed
+// header by tests/c_api.rs. Usage:
+//
+//   test_wrapper <scratch-dir>                    the wrapper's behaviour
+//   test_wrapper <scratch-dir> throw-from-fill    lets an exception escape a raw fill callback: must abort
 #include "tickertape.hpp"
 
 #include <cstdio>
@@ -86,12 +89,30 @@ static void roundtrip(const std::string &dir) {
     }
 }
 
+// A fill callback that breaks the contract: the exception must not unwind through the library into the caller.
+static int32_t throwing_fill(void *, uint8_t *, std::size_t) { throw std::runtime_error("escaped"); }
+
+static int throw_from_fill(const std::string &dir) {
+    tickertape::WriterOptions options;
+    options.segment_size(65536).prefault(false);
+    tickertape::Writer writer(dir, &options);
+    try {
+        (void)tickertape_writer_append_with(writer.get(), 1, 0, 0, 8, &throwing_fill, nullptr, nullptr);
+    } catch (...) {
+        std::printf("caught\n");  // must not happen: the process terminates first
+        return 0;
+    }
+    std::printf("returned\n");
+    return 0;
+}
+
 int main(int argc, char **argv) {
+    if (argc == 3 && std::string(argv[2]) == "throw-from-fill") return throw_from_fill(std::string(argv[1]) + "/throw");
     if (argc != 2) {
-        std::fprintf(stderr, "usage: %s <scratch-dir>\n", argv[0]);
+        std::fprintf(stderr, "usage: %s <scratch-dir> [throw-from-fill]\n", argv[0]);
         return 2;
     }
-    if (tickertape_abi_version() != TICKERTAPE_ABI_VERSION) return 1;
+    if (!tickertape::library_is_compatible()) return 1;
     try {
         roundtrip(std::string(argv[1]) + "/cpp");
     } catch (const std::exception &e) {

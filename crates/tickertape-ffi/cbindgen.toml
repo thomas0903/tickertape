@@ -19,10 +19,15 @@ header = """/*
  * - Functions return a tickertape_status: TICKERTAPE_OK (0) or TICKERTAPE_NONE (1) on success, a negative
  *   TICKERTAPE_E_* code on failure. After a failure, tickertape_last_error_message() and friends describe it
  *   (per thread).
- * - Handles are opaque. Free each with its *_close / *_free function; NULL is ignored there. NULL where a pointer
- *   is required returns TICKERTAPE_E_INVALID_ARGUMENT. Use after close, double close and concurrent use of one
- *   handle from several threads are undefined behaviour.
+ * - Handles are opaque. Free each with its *_close / *_free function; NULL is ignored there. A close that returns
+ *   anything but TICKERTAPE_E_BUSY has freed the handle: never retry it. NULL where a pointer is required returns
+ *   TICKERTAPE_E_INVALID_ARGUMENT. Use after close, double close and concurrent use of one handle from several
+ *   threads are undefined behaviour. Allocation failure aborts the process; no function returns NULL for it.
  * - Pointers must be valid and aligned for their type. Paths are NUL-terminated byte strings.
+ * - Input and output memory of one call must not overlap, and inputs must stay unmodified until the call returns.
+ *   Output storage is the caller's. Each function's Safety section names its regions.
+ * - Before 1.0 the ABI is unstable: check at start-up that the library is exactly this header's version (see
+ *   TICKERTAPE_ABI_VERSION for the check, which also covers 1.x).
  * - Visible is not durable: a record is visible to readers when an append returns, and durable only after a later
  *   successful tickertape_writer_checkpoint (docs/crash-contract.md).
  */"""

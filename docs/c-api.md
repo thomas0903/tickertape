@@ -6,8 +6,9 @@ with one header, [`crates/tickertape-ffi/include/tickertape.h`](../crates/ticker
 compiles as C99 and C++11. The header documents every function; this page explains the rules they share. The design
 and its reasons are in [ADR 0028](decisions/0028-c-abi.md).
 
-> **Status:** the C ABI is not stable before tickertape 1.0. `TICKERTAPE_ABI_VERSION` is 0, and any minor release may
-> change it (the changelog says when). See [Versioning](#versioning).
+> **Status:** the C ABI is not stable before tickertape 1.0. `TICKERTAPE_ABI_VERSION` is 0, which means unstable: any
+> release may change it (the changelog says when), so load exactly the library version your header came from. See
+> [Versioning](#versioning).
 
 Examples: [`examples/c/`](../examples/c/README.md) (a C writer, a C reader that replays or follows live, and a C++
 example with a small RAII wrapper header, `tickertape.hpp`).
@@ -16,27 +17,36 @@ example with a small RAII wrapper header, `tickertape.hpp`).
 #include "tickertape.h"
 #include <stdio.h>
 
+static int fail(const char *what, tickertape_status status) {
+    fprintf(stderr, "%s: %s: %s\n", what, tickertape_status_name(status), tickertape_last_error_message());
+    return 1;
+}
+
 int main(void) {
     tickertape_writer *writer;
     tickertape_reader *reader;
     tickertape_record record;
+    tickertape_status s;
     uint64_t seq;
 
-    if (tickertape_writer_open("/tmp/journal", NULL, &writer) != TICKERTAPE_OK) {
-        fprintf(stderr, "open: %s\n", tickertape_last_error_message());
-        return 1;
+    if ((s = tickertape_writer_open("/tmp/journal", NULL, &writer)) != TICKERTAPE_OK) return fail("open", s);
+    s = tickertape_writer_append(writer, 1, 0, tickertape_realtime_ns(), (const uint8_t *)"hello", 5, &seq);
+    if (s == TICKERTAPE_OK) s = tickertape_writer_checkpoint(writer); /* durable, not only visible */
+    if (s != TICKERTAPE_OK) {
+        tickertape_writer_close(writer);
+        return fail("append or checkpoint", s);
     }
-    tickertape_writer_append(writer, 1, 0, tickertape_realtime_ns(), (const uint8_t *)"hello", 5, &seq);
-    tickertape_writer_checkpoint(writer);         /* durable, not only visible */
 
-    tickertape_reader_open("/tmp/journal", NULL, &reader);
-    tickertape_reader_seek(reader, seq);
-    if (tickertape_reader_next(reader, TICKERTAPE_NO_WAIT, &record) == TICKERTAPE_OK) {
-        printf("%.*s\n", (int)record.payload_len, (const char *)record.payload);
+    if ((s = tickertape_reader_open("/tmp/journal", NULL, &reader)) == TICKERTAPE_OK) {
+        if ((s = tickertape_reader_seek(reader, seq)) == TICKERTAPE_OK &&
+            (s = tickertape_reader_next(reader, TICKERTAPE_NO_WAIT, &record)) == TICKERTAPE_OK) {
+            /* record.payload is NULL when payload_len is 0, and borrowed until the next call on the reader. */
+            printf("%.*s\n", (int)record.payload_len, record.payload_len ? (const char *)record.payload : "");
+        }
+        tickertape_reader_close(reader);
     }
-    tickertape_reader_close(reader);
     tickertape_writer_close(writer);
-    return 0;
+    return s < 0 ? fail("read", s) : 0;
 }
 ```
 
@@ -79,8 +89,9 @@ The static library contains its own copy of the Rust standard library, so linkin
 program can produce duplicate symbols; link one of them dynamically in that case.
 
 C++ uses the same header (it has `extern "C"` guards). [`examples/c/tickertape.hpp`](../examples/c/tickertape.hpp)
-is a header-only C++11 wrapper you can copy. `examples/c/Makefile` and `examples/c/CMakeLists.txt` show both link
-styles; the CMake file uses pkg-config when the library is installed.
+is a header-only C++11 wrapper you can copy. `examples/c/Makefile` shows both link styles (`writer` links the static
+library, `reader` and `example` the shared one); `examples/c/CMakeLists.txt` links the shared library only, through
+pkg-config when the library is installed.
 
 ## Conventions
 
@@ -91,8 +102,20 @@ styles; the CMake file uses pkg-config when the library is installed.
 - **Paths** are NUL-terminated byte strings, passed to the operating system unchanged.
 - **Flags** (`int32_t enabled`) treat any non-zero value as true.
 - **Timeouts** are `int64_t` nanoseconds: 0 (`TICKERTAPE_NO_WAIT`) does not wait, a positive value waits up to that
-  long, a negative value (`TICKERTAPE_WAIT_FOREVER`) waits until something arrives.
+  long, a negative value (`TICKERTAPE_WAIT_FOREVER`) waits until something arrives. A timeout bounds only the wait
+  for a record to become available. Argument checks, catching up after a seek (the reader validates every record it
+  skips) and file I/O are not interrupted, so a call can take longer than its timeout: a 1 ns timeout right after
+  seeking far ahead took about 5 ms in a test.
 - **Pointers** must be valid and aligned for their type. Optional output pointers are marked as such in the header.
+- **Inputs and outputs of one call must not overlap**, and inputs (payloads, record arrays, paths) must stay valid
+  and unmodified, by any thread, until the call returns. Output storage (records, counts, reports) is owned by the
+  caller; only a `payload` pointer returned by `tickertape_reader_next` points into library memory. Each function's
+  `# Safety` section in the header names the regions that must be disjoint. Where the check is cheap (appends, batch
+  appends, copy-out and batch reads, segment listing), an overlap returns `TICKERTAPE_E_INVALID_ARGUMENT`; elsewhere
+  it is undefined behaviour.
+- **Memory:** functions that allocate (the `*_new` functions, and the open functions for their handles) never return
+  NULL or an error for lack of memory: like any Rust program, the library aborts the process if an allocation
+  fails.
 
 ## Ownership and lifetimes
 
@@ -104,7 +127,10 @@ styles; the CMake file uses pkg-config when the library is installed.
 | Reader options | `tickertape_reader_options_new` | `tickertape_reader_options_free` |
 | Retention settings | `tickertape_retention_new` | `tickertape_retention_free` |
 
-- All objects are opaque handles. Free each exactly once with its function; passing NULL there does nothing.
+- All objects are opaque handles. Free each exactly once with its function; passing NULL there does nothing. After a
+  close returns any status other than `TICKERTAPE_E_BUSY` (including `TICKERTAPE_E_PANIC`), the handle is freed:
+  never retry a close that failed, or it would free twice. `TICKERTAPE_E_BUSY` (closing a writer from its own fill
+  callback) closes nothing and the handle stays valid.
 - Options and retention settings are copied by the functions that take them, so they can be freed right after.
 - **Records returned by `tickertape_reader_next` are borrowed views.** `record.payload` points into the reader's
   buffer (safe reader) or straight into the memory-mapped segment (mapped reader). It is valid until the next call
@@ -113,10 +139,14 @@ styles; the CMake file uses pkg-config when the library is installed.
 - **Copy-out instead:** `tickertape_reader_next_copy` copies one payload into a buffer you own, and
   `tickertape_reader_read_batch` copies many records' payloads one after another into one buffer. The returned
   records point into your buffer, and stay valid as long as it does.
-- When `payload_len` is 0, `payload` may be NULL or dangling; do not dereference it.
+- When `payload_len` is 0, `payload` is NULL (from every read function). Guard it before passing it to functions
+  such as `printf("%.*s")` or `memcpy` that must not receive NULL.
 - Strings returned by `tickertape_version`, `tickertape_status_name` and `tickertape_corrupt_reason_name` are static.
   `tickertape_last_error_message` returns a per-thread string, valid until the next failing call on that thread.
   Never free them.
+- Extensible structs (`tickertape_verify_report`, `tickertape_retention_report`) start with a `uint64_t struct_size`:
+  set it to `sizeof` the struct before the call; after the call it holds the number of bytes the library filled (see
+  [Versioning](#versioning)).
 
 **Misuse.** NULL where a pointer is required returns `TICKERTAPE_E_INVALID_ARGUMENT`, as do out-of-range values and
 non-zero reserved fields. A call on a handle that is already inside a call on the same thread (for example from a
@@ -136,35 +166,44 @@ tickertape_writer_options_free(options);
 
 - `tickertape_writer_append` copies the payload into the journal and returns the record's sequence number.
 - `tickertape_writer_append_with` avoids that copy: it calls your `tickertape_fill_fn` once with a zeroed buffer
-  inside the mapped segment; you write the payload and return 0. Returning non-zero aborts the append
-  (`TICKERTAPE_E_ABORTED`): nothing is committed, but the writer zeroes the buffer and syncs that to storage first
-  (the format requires it), so aborting is slow. The callback runs on the calling thread, must not keep the buffer,
-  must not call into the same writer, and must not unwind or `longjmp` out of the call. In C++ catch every exception
-  inside the callback (the wrapper's `append_with` does this and rethrows after the call).
+  inside the mapped segment (NULL for an empty payload); you write the payload and return 0. Returning non-zero
+  aborts the append (`TICKERTAPE_E_ABORTED`): nothing is committed, but the writer zeroes the buffer and syncs that to
+  storage first (the format requires it), so aborting is slow. If that sync fails, the call returns
+  `TICKERTAPE_E_IO` (or `TICKERTAPE_E_STORAGE_FULL`) with the OS error instead, and the writer refuses further
+  appends and checkpoints until the journal is reopened. The callback runs on the calling thread, must not keep the
+  buffer, and must not call into the same writer (that, including closing it, returns `TICKERTAPE_E_BUSY`). It must
+  return normally: a C++ exception that escapes it terminates the process, and `longjmp` out of it is undefined
+  behaviour. In C++ catch every exception inside the callback (the wrapper's `append_with` does this and rethrows
+  after the call).
 - `tickertape_writer_append_batch` appends an array of `tickertape_new_record`s in order. It checks every element
-  first, so an argument error appends nothing. It then stops at the first failure and returns that error, with
-  `*appended_out` records already appended (sequence numbers `*first_seq_out` onwards). Those records stay in the
-  journal: retry from the failing one, not from the start.
+  first, so an argument error appends nothing (the message names the element's index). It then stops at the first
+  failure and returns that error, with `*appended_out` records already appended (sequence numbers `*first_seq_out`
+  onwards; `*appended_out` is updated as each record commits). Those records stay in the journal: retry from the
+  failing one, not from the start.
 
 ## Reading
 
 ```c
 tickertape_reader *reader;
-tickertape_reader_open("/data/journal", NULL, &reader);      /* positioned at the oldest record */
-tickertape_reader_seek(reader, 1000);                         /* next record returned is seq 1000 */
 tickertape_record record;
-for (;;) {
-    tickertape_status s = tickertape_reader_next(reader, 100000000 /* 100 ms */, &record);
-    if (s == TICKERTAPE_NONE) continue;                          /* nothing new yet */
-    if (s == TICKERTAPE_E_DISCARDED) {                           /* recovery or retention replaced the segment */
+tickertape_status s = tickertape_reader_open("/data/journal", NULL, &reader); /* at the oldest record */
+if (s == TICKERTAPE_OK) s = tickertape_reader_seek(reader, 1000);              /* next record is seq 1000 */
+while (s >= 0 && !stop_requested()) {
+    s = tickertape_reader_next(reader, 100000000 /* 100 ms */, &record);
+    if (s == TICKERTAPE_NONE) continue;                    /* nothing new yet: check for a stop request */
+    if (s == TICKERTAPE_E_DISCARDED) {                     /* recovery or retention replaced the segment */
         uint64_t at;
-        tickertape_reader_position(reader, &at);
-        tickertape_reader_seek(reader, at);
-        continue;
+        if ((s = tickertape_reader_position(reader, &at)) == TICKERTAPE_OK) s = tickertape_reader_seek(reader, at);
+        if (s == TICKERTAPE_E_SEQ_UNAVAILABLE) {
+            /* Retention removed the records from `at` on before they were read. Either stop here (s < 0 ends the
+             * loop), or continue at the oldest record left: the first segment's base_seq from
+             * tickertape_list_segments (examples/c/reader.c does this). */
+        }
+        continue;                                          /* never retry a failed seek in a loop */
     }
-    if (s < 0) break;
-    handle(&record);                                             /* record.payload is valid until the next call */
+    if (s == TICKERTAPE_OK) handle(&record);               /* record.payload is valid until the next call */
 }
+if (s < 0) fprintf(stderr, "%s: %s\n", tickertape_status_name(s), tickertape_last_error_message());
 ```
 
 There are two readers:
@@ -181,12 +220,24 @@ There are two readers:
 Both validate every record (length, CRC32C, sequence number) before returning it, follow segment rolls, and wait with
 the configured back-off, blocking on the writer's wake-up region when it is available.
 
+**Starting before the writer.** A reader that opens a journal before its writer has started gets `TICKERTAPE_E_IO`
+with `tickertape_last_error_os_code() == ENOENT`, because the writer creates the directory. While the writer is
+creating the first segment, the directory exists but is empty, and the open returns `TICKERTAPE_E_NOT_FOUND`. A loop
+that waits for the writer should retry on exactly these two and fail on anything else.
+
+**Cancelling a wait.** A call blocked in `tickertape_reader_next` with `TICKERTAPE_WAIT_FOREVER` cannot be
+interrupted, and closing the reader from another thread while it waits is undefined behaviour. To make a reader
+stoppable (a binding that offers cancellation, a service that shuts down), loop with a finite timeout and check for
+a stop request between calls.
+
 `tickertape_reader_read_batch` waits up to the timeout for the first record only, then takes what is already
 committed, up to the array size or until the next payload does not fit in the buffer. A record that does not fit is
 held back and returned first by the next call (`TICKERTAPE_E_BUFFER_TOO_SMALL` if even the first one does not fit,
 with the size it needs in `records[0].payload_len`). If an error occurs after some records were read, the call
-returns `TICKERTAPE_OK` with those records, and the next read call returns the error: records handed out are never
-lost to an error.
+returns `TICKERTAPE_OK` with those records, and the next read call (`next`, `next_copy` or `read_batch`) returns the
+error: records handed out are never lost to an error. A successful `tickertape_reader_seek` discards a held-back
+record and a deferred error; a failed seek changes nothing. The reader stays at the failing position, so a
+persistent error (corruption) is returned again by the following calls until you seek elsewhere.
 
 ## Durability
 
@@ -203,8 +254,12 @@ Closing a writer does not checkpoint. A failed checkpoint poisons the writer: la
 Readers return visible records by default. A reader whose options have
 `tickertape_reader_options_set_durable_only(options, 1)` returns only durable records: those below the checkpoint
 marker's `next_seq` (crash contract C13). It treats records after that as not written yet (`TICKERTAPE_NONE`, or it
-keeps waiting), returns nothing if there is no valid checkpoint marker, and never returns a record that a power loss
-can remove.
+keeps waiting) and returns nothing if there is no valid checkpoint marker. It never returns a record that a power
+loss can remove **under the crash contract's conditions**: the filesystem and drive honour the sync calls (no lying
+write caches); a block made durable is not damaged by an interrupted later write to the same block; and no
+checkpoint has failed earlier in the same boot (a failed sync can drop data that a later successful checkpoint, even
+by a new writer, does not detect). See
+[`crash-contract.md`](crash-contract.md) → Storage assumptions for durability, and → Errors are sticky.
 
 ## Errors
 
@@ -218,7 +273,16 @@ Each failing call records, for the calling thread only, what went wrong:
 | `tickertape_last_error_corrupt_reason()` | A `TICKERTAPE_CORRUPT_*` reason for `TICKERTAPE_E_CORRUPT`, else 0 |
 
 They behave like `errno`: successful calls leave them unchanged, so read them right after the call that failed.
-`tickertape_status_name` and `tickertape_corrupt_reason_name` turn codes into names for logs.
+`tickertape_status_name` and `tickertape_corrupt_reason_name` turn codes into names for logs. The message is always
+UTF-8: a file name that is not valid UTF-8 appears with its invalid bytes replaced (U+FFFD), so do not parse paths
+out of it.
+
+**Binding authors:** the state is per **operating-system thread**. A runtime that can move a task to another OS
+thread between two foreign calls (Go goroutines, Java virtual threads) can read another thread's state, or none. Read
+the details on the same OS thread, in the same foreign call sequence as the failing call: in Go, call through a small C
+function in the cgo preamble that makes the call and captures the code, message, OS error and corruption reason
+together (or hold `runtime.LockOSThread` across the call and the reads); in Java, read them in the same downcall
+sequence on a platform thread, or through such a C shim.
 
 | Code | Meaning |
 |---|---|
@@ -228,18 +292,18 @@ They behave like `errno`: successful calls leave them unchanged, so read them ri
 | `TICKERTAPE_E_LOCKED` | Another writer has the journal open |
 | `TICKERTAPE_E_CORRUPT` | Journal bytes failed validation; a reader's cursor does not move |
 | `TICKERTAPE_E_UNSUPPORTED_VERSION` | A segment has an unsupported format version |
-| `TICKERTAPE_E_NOT_FOUND` | The directory has no segments yet |
+| `TICKERTAPE_E_NOT_FOUND` | The directory exists but has no segments yet (a missing directory is `TICKERTAPE_E_IO` with `ENOENT`) |
 | `TICKERTAPE_E_SEQ_UNAVAILABLE` | The sequence number is older than the oldest segment |
 | `TICKERTAPE_E_RECORD_TOO_LARGE` | The payload does not fit in a segment |
-| `TICKERTAPE_E_DURABILITY_LOST` | An earlier checkpoint failed |
+| `TICKERTAPE_E_DURABILITY_LOST` | An earlier checkpoint, or the clean-up after an aborted fill, failed |
 | `TICKERTAPE_E_SEQUENCE_EXHAUSTED` | Sequence numbers are exhausted |
 | `TICKERTAPE_E_DISCARDED` | The reader's segment was replaced or removed by recovery or retention; call `tickertape_reader_seek` |
 | `TICKERTAPE_E_INVALID_CONFIG` | A configuration value is out of range |
 | `TICKERTAPE_E_BUFFER_TOO_SMALL` | A caller buffer or array is too small (the function says what size it needs) |
-| `TICKERTAPE_E_ABORTED` | A fill callback returned non-zero |
+| `TICKERTAPE_E_ABORTED` | A fill callback returned non-zero (and the writer cleaned up) |
 | `TICKERTAPE_E_BUSY` | Re-entrant call on a handle that is already inside a call |
 | `TICKERTAPE_E_PANIC` | An internal error (a bug in tickertape) was caught; the handle is broken, close it |
-| `TICKERTAPE_E_UNKNOWN` | An error this ABI version has no code for |
+| `TICKERTAPE_E_UNKNOWN` (-255) | An error this ABI version has no code for |
 
 Later versions may add codes; treat any unknown negative value as an error. No Rust panic ever unwinds into C: every
 function catches panics and returns `TICKERTAPE_E_PANIC` (the library must be built with Rust's default
@@ -250,6 +314,7 @@ function catches panics and returns `TICKERTAPE_E_PANIC` (the library must be bu
 - A writer or reader handle may be moved to another thread between calls, but must not be used by two threads at
   the same time. Synchronise yourself if you share one; a writer is single-threaded in this sense.
 - Different readers are independent and can be used from different threads, in any number of processes.
+- The last-error state is per OS thread; see [Errors](#errors) for runtimes that move tasks between threads.
 - Option builders follow the same rule as handles. The free-standing functions (`tickertape_verify`,
   `tickertape_list_segments`, `tickertape_read_checkpoint`, `tickertape_retention_apply`, and the version and error
   functions) can be called from any thread.
@@ -273,25 +338,48 @@ function catches panics and returns `TICKERTAPE_E_PANIC` (the library must be bu
   `tickertape_writer_last_retention_error`), or to `tickertape_retention_apply` to run once (`dry_run` to only plan).
 
 The reports `tickertape_verify_report` and `tickertape_retention_report` start with `struct_size`: set it to
-`sizeof` the struct before the call.
+`sizeof` the struct before the call (see [Versioning](#versioning) for what the library writes back).
 
 ## Versioning
 
-- `TICKERTAPE_ABI_VERSION` in the header must equal `tickertape_abi_version()` from the loaded library; check it at
-  start-up. `tickertape_version()` returns the library's version string.
-- **Before 1.0** the ABI version is 0, and a minor release may change the ABI; the changelog says so when it does.
+The header defines `TICKERTAPE_ABI_VERSION`, `TICKERTAPE_VERSION_MAJOR`, `_MINOR`, `_PATCH` and
+`TICKERTAPE_VERSION_NUMBER` (`MAJOR * 1000000 + MINOR * 1000 + PATCH`, so 0.4.0 is 4000). The library returns its
+own values from `tickertape_abi_version()` and `tickertape_version_number()` (and the string from
+`tickertape_version()`). Check them at start-up:
+
+```c
+uint32_t lib = tickertape_version_number();
+int compatible = tickertape_abi_version() == TICKERTAPE_ABI_VERSION &&
+                 (TICKERTAPE_ABI_VERSION == 0 ? lib == TICKERTAPE_VERSION_NUMBER   /* before 1.0: exactly */
+                                              : lib >= TICKERTAPE_VERSION_NUMBER); /* from 1.0: at least */
+```
+
+- **Before 1.0** the ABI version is 0, which means *unstable*: any release may change the ABI (the changelog says
+  so). A program or binding must load exactly the library version its header came from.
 - **From 1.0** the ABI version is 1 and the shared library's soname is `libtickertape.so.1` (macOS:
-  `libtickertape.1.dylib`). No function, constant or struct field is removed or changes meaning or layout. New
-  functions, constants, option setters and status codes may be added.
+  `libtickertape.1.dylib`). No function, constant or struct field is removed or changes meaning or layout; new
+  functions, constants, option setters, status codes and fields at the end of extensible structs may be added. A
+  program therefore works with any 1.x library at least as new as its header, and the check above refuses an older
+  library, which may lack functions or fields the program uses. A release that breaks the ABI would be 2.0, with ABI
+  version 2 and a new soname.
 - Configuration that may grow is behind opaque builders. The record structs (`tickertape_record`,
   `tickertape_new_record`), `tickertape_segment_info` and `tickertape_checkpoint` describe format version 1 and are
-  frozen; a new format version would come with new types. Report structs grow at the end, guarded by `struct_size`.
-  Reserved fields must be zero.
+  frozen; a new format version would come with new types. Reserved fields must be zero.
+- **Extensible structs** (`tickertape_verify_report`, `tickertape_retention_report`) start with a `uint64_t
+  struct_size`. Each has a minimum size, its size in the first stable release (72 and 32 bytes), below which the call
+  returns `TICKERTAPE_E_INVALID_ARGUMENT`. The library writes `min(struct_size, its own size)` bytes and stores the
+  number of bytes it filled back into `struct_size`. So a program built against an older, smaller struct works with
+  a newer library, and a program built against a newer, larger struct can tell that an older library did not write
+  the newer fields: check `struct_size` after the call before reading a field added later.
+- Nothing removes a frozen declaration by accident: Rust and the C tests assert every struct's size and field
+  offsets, and from 1.0 CI compares the header with the released one (`crates/tickertape-ffi/abi/`), failing if a
+  frozen declaration is removed or changed.
 
 ## Testing
 
 `cargo test -p tickertape-ffi` runs Rust tests of the exported functions and compiles and runs C99 and C++11 test
-programs and the examples against the committed header, including cross-language fixtures with the Rust reader and
+programs (as C99 and C11) and C++ programs (as C++11 and C++20), and the examples against the committed header,
+including cross-language fixtures with the Rust reader and
 the Python decoder ([`python/`](../python/README.md)). Set `TICKERTAPE_FFI_SANITIZE=1` to build the C programs with
 AddressSanitizer and UBSan, or `TICKERTAPE_FFI_VALGRIND=1` to run them under Valgrind. After changing the C ABI,
 regenerate the header with cbindgen 0.29.4 (the command is in `crates/tickertape-ffi/cbindgen.toml`); CI fails if it

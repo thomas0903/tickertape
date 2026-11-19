@@ -22,6 +22,55 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+/* The frozen struct layouts, checked at compile time (C99 has no _Static_assert). The Rust side asserts the same
+ * offsets and sizes, so swapping or resizing a field breaks the build on one side or the other. */
+#define STATIC_ASSERT(name, cond) typedef char static_assert_##name[(cond) ? 1 : -1]
+#if UINTPTR_MAX == UINT64_MAX
+STATIC_ASSERT(record_size, sizeof(tickertape_record) == 48);
+STATIC_ASSERT(record_seq, offsetof(tickertape_record, seq) == 0);
+STATIC_ASSERT(record_venue_ts, offsetof(tickertape_record, venue_ts_ns) == 8);
+STATIC_ASSERT(record_local_ts, offsetof(tickertape_record, local_ts_ns) == 16);
+STATIC_ASSERT(record_payload, offsetof(tickertape_record, payload) == 24);
+STATIC_ASSERT(record_payload_len, offsetof(tickertape_record, payload_len) == 32);
+STATIC_ASSERT(record_schema_id, offsetof(tickertape_record, schema_id) == 40);
+STATIC_ASSERT(record_reserved, offsetof(tickertape_record, reserved) == 44);
+STATIC_ASSERT(new_record_size, sizeof(tickertape_new_record) == 40);
+STATIC_ASSERT(new_record_payload, offsetof(tickertape_new_record, payload) == 0);
+STATIC_ASSERT(new_record_payload_len, offsetof(tickertape_new_record, payload_len) == 8);
+STATIC_ASSERT(new_record_venue_ts, offsetof(tickertape_new_record, venue_ts_ns) == 16);
+STATIC_ASSERT(new_record_local_ts, offsetof(tickertape_new_record, local_ts_ns) == 24);
+STATIC_ASSERT(new_record_schema_id, offsetof(tickertape_new_record, schema_id) == 32);
+STATIC_ASSERT(new_record_reserved, offsetof(tickertape_new_record, reserved) == 36);
+#endif
+STATIC_ASSERT(segment_info_size, sizeof(tickertape_segment_info) == 32);
+STATIC_ASSERT(segment_info_base_seq, offsetof(tickertape_segment_info, base_seq) == 0);
+STATIC_ASSERT(segment_info_segment_size, offsetof(tickertape_segment_info, segment_size) == 8);
+STATIC_ASSERT(segment_info_created, offsetof(tickertape_segment_info, created_unix_ns) == 16);
+STATIC_ASSERT(segment_info_format_version, offsetof(tickertape_segment_info, format_version) == 24);
+STATIC_ASSERT(segment_info_reserved, offsetof(tickertape_segment_info, reserved) == 28);
+STATIC_ASSERT(checkpoint_size, sizeof(tickertape_checkpoint) == 32);
+STATIC_ASSERT(checkpoint_generation, offsetof(tickertape_checkpoint, generation) == 0);
+STATIC_ASSERT(checkpoint_next_seq, offsetof(tickertape_checkpoint, next_seq) == 8);
+STATIC_ASSERT(checkpoint_segment_base_seq, offsetof(tickertape_checkpoint, segment_base_seq) == 16);
+STATIC_ASSERT(checkpoint_offset, offsetof(tickertape_checkpoint, offset) == 24);
+STATIC_ASSERT(verify_report_size, sizeof(tickertape_verify_report) == 72);
+STATIC_ASSERT(verify_report_struct_size, offsetof(tickertape_verify_report, struct_size) == 0);
+STATIC_ASSERT(verify_report_segments, offsetof(tickertape_verify_report, segments) == 8);
+STATIC_ASSERT(verify_report_records, offsetof(tickertape_verify_report, records) == 16);
+STATIC_ASSERT(verify_report_first_seq, offsetof(tickertape_verify_report, first_seq) == 24);
+STATIC_ASSERT(verify_report_last_seq, offsetof(tickertape_verify_report, last_seq) == 32);
+STATIC_ASSERT(verify_report_problems, offsetof(tickertape_verify_report, problems) == 40);
+STATIC_ASSERT(verify_report_problem_base, offsetof(tickertape_verify_report, first_problem_base_seq) == 48);
+STATIC_ASSERT(verify_report_problem_offset, offsetof(tickertape_verify_report, first_problem_offset) == 56);
+STATIC_ASSERT(verify_report_problem_reason, offsetof(tickertape_verify_report, first_problem_reason) == 64);
+STATIC_ASSERT(verify_report_reserved, offsetof(tickertape_verify_report, reserved) == 68);
+STATIC_ASSERT(retention_report_size, sizeof(tickertape_retention_report) == 32);
+STATIC_ASSERT(retention_report_struct_size, offsetof(tickertape_retention_report, struct_size) == 0);
+STATIC_ASSERT(retention_report_removed, offsetof(tickertape_retention_report, removed_segments) == 8);
+STATIC_ASSERT(retention_report_bytes, offsetof(tickertape_retention_report, removed_bytes) == 16);
+STATIC_ASSERT(retention_report_already, offsetof(tickertape_retention_report, already_removed_segments) == 24);
+STATIC_ASSERT(struct_size_is_64_bit, sizeof(((tickertape_verify_report *)0)->struct_size) == 8);
+
 static int failures = 0;
 
 #define CHECK(cond)                                                                                  \
@@ -71,6 +120,10 @@ static int pattern_matches(const tickertape_record *r, uint64_t seq) {
         r->local_ts_ns != 2000000u + 3u * seq || r->payload_len != pattern_len(seq) || r->reserved != 0) {
         fprintf(stderr, "record %" PRIu64 ": metadata mismatch (seq %" PRIu64 ", len %zu)\n", seq, r->seq,
                 r->payload_len);
+        return 0;
+    }
+    if ((r->payload_len == 0) != (r->payload == NULL)) {
+        fprintf(stderr, "record %" PRIu64 ": payload must be NULL exactly when payload_len is 0\n", seq);
         return 0;
     }
     for (i = 0; i < r->payload_len; i++) {
@@ -146,9 +199,25 @@ static void join(char *out, size_t cap, const char *dir, const char *name) {
     snprintf(out, cap, "%s/%s", dir, name);
 }
 
+/* The start-up check from the header (TICKERTAPE_ABI_VERSION): before 1.0 the exact version, from 1.0 the same ABI
+ * version and a library at least as new as the header. */
+static int library_is_compatible(void) {
+    uint32_t lib = tickertape_version_number();
+    return tickertape_abi_version() == TICKERTAPE_ABI_VERSION &&
+           (TICKERTAPE_ABI_VERSION == 0 ? lib == TICKERTAPE_VERSION_NUMBER : lib >= TICKERTAPE_VERSION_NUMBER);
+}
+
 static void test_versions_and_names(void) {
+    char expected[64];
     CHECK(tickertape_abi_version() == TICKERTAPE_ABI_VERSION);
-    CHECK(strlen(tickertape_version()) > 0);
+    CHECK(tickertape_version_number() == TICKERTAPE_VERSION_NUMBER);
+    CHECK(TICKERTAPE_VERSION_NUMBER ==
+          TICKERTAPE_VERSION_MAJOR * 1000000u + TICKERTAPE_VERSION_MINOR * 1000u + TICKERTAPE_VERSION_PATCH);
+    snprintf(expected, sizeof expected, "%d.%d.%d", TICKERTAPE_VERSION_MAJOR, TICKERTAPE_VERSION_MINOR,
+             TICKERTAPE_VERSION_PATCH);
+    CHECK(strcmp(tickertape_version(), expected) == 0);
+    CHECK(library_is_compatible());
+    CHECK(TICKERTAPE_E_UNKNOWN == -255);
     CHECK(strcmp(tickertape_status_name(TICKERTAPE_E_DISCARDED), "TICKERTAPE_E_DISCARDED") == 0);
     CHECK(strcmp(tickertape_status_name(-999), "TICKERTAPE_UNKNOWN_STATUS") == 0);
     CHECK(strcmp(tickertape_corrupt_reason_name(TICKERTAPE_CORRUPT_BAD_SEAL), "TICKERTAPE_CORRUPT_BAD_SEAL") == 0);
@@ -381,6 +450,21 @@ static void test_corruption_and_inspection(const char *scratch) {
     CHECK(report.records == 2 && report.problems == 1);
     CHECK(report.first_problem_base_seq == 0 && report.first_problem_offset == 64 + 48 * 2);
     CHECK(report.first_problem_reason == TICKERTAPE_CORRUPT_BAD_CHECKSUM);
+
+    /* A struct from a newer header with a field this library does not know: the library fills only its own part
+     * and says so in struct_size, so the caller knows the new field was not written. */
+    {
+        struct newer_verify_report {
+            tickertape_verify_report v1;
+            uint64_t added_later;
+        } newer;
+        memset(&newer, 0xCD, sizeof newer);
+        newer.v1.struct_size = sizeof newer;
+        CHECK_STATUS(tickertape_verify(dir, &newer.v1), TICKERTAPE_OK);
+        CHECK(newer.v1.struct_size == sizeof(tickertape_verify_report));
+        CHECK(newer.v1.records == 2);
+        CHECK(newer.added_later == 0xCDCDCDCDCDCDCDCDull);
+    }
 }
 
 static int run_basic(const char *scratch) {
@@ -481,8 +565,9 @@ static int run_read_fixture(const char *dir, uint64_t count, uint64_t durable_ne
 
 int main(int argc, char **argv) {
     int result;
-    if (tickertape_abi_version() != TICKERTAPE_ABI_VERSION) {
-        fprintf(stderr, "header and library ABI versions differ\n");
+    if (!library_is_compatible()) {
+        fprintf(stderr, "the library (%s) is not compatible with this header (%d.%d.%d)\n", tickertape_version(),
+                TICKERTAPE_VERSION_MAJOR, TICKERTAPE_VERSION_MINOR, TICKERTAPE_VERSION_PATCH);
         return 1;
     }
     if (argc == 3 && strcmp(argv[1], "basic") == 0) {

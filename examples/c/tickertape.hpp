@@ -12,7 +12,6 @@
 #include <cstdint>
 #include <exception>
 #include <memory>
-#include <new>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -37,6 +36,14 @@ inline tickertape_status check(tickertape_status status) {
     return status;
 }
 
+// Whether the loaded library can be used with the header this was compiled with (see TICKERTAPE_ABI_VERSION): the
+// exact version before 1.0, the same ABI version and a library at least as new as the header from 1.0.
+inline bool library_is_compatible() noexcept {
+    const uint32_t lib = tickertape_version_number();
+    return tickertape_abi_version() == TICKERTAPE_ABI_VERSION &&
+           (TICKERTAPE_ABI_VERSION == 0 ? lib == TICKERTAPE_VERSION_NUMBER : lib >= TICKERTAPE_VERSION_NUMBER);
+}
+
 namespace detail {
 template <class T, void (*Free)(T *)> struct Deleter {
     void operator()(T *p) const noexcept { Free(p); }
@@ -46,11 +53,10 @@ inline void close_reader(tickertape_reader *r) { (void)tickertape_reader_close(r
 inline int64_t to_ns(std::chrono::nanoseconds t) { return static_cast<int64_t>(t.count()); }
 }  // namespace detail
 
+// The *_new functions never return NULL: the library aborts the process if it cannot allocate.
 class WriterOptions {
 public:
-    WriterOptions() : p_(tickertape_writer_options_new()) {
-        if (!p_) throw std::bad_alloc();
-    }
+    WriterOptions() : p_(tickertape_writer_options_new()) {}
     WriterOptions &segment_size(uint64_t bytes) {
         check(tickertape_writer_options_set_segment_size(p_.get(), bytes));
         return *this;
@@ -77,9 +83,7 @@ private:
 
 class ReaderOptions {
 public:
-    ReaderOptions() : p_(tickertape_reader_options_new()) {
-        if (!p_) throw std::bad_alloc();
-    }
+    ReaderOptions() : p_(tickertape_reader_options_new()) {}
     // Return only durable records (covered by a checkpoint); see tickertape_reader_options_set_durable_only.
     ReaderOptions &durable_only(bool on) {
         check(tickertape_reader_options_set_durable_only(p_.get(), on ? 1 : 0));
@@ -120,8 +124,13 @@ public:
         return seq;
     }
 
-    // Appends a record whose payload `fill(uint8_t *buf, size_t len)` writes in place. If `fill` throws, nothing is
-    // committed and the exception propagates (aborting costs a sync; see tickertape_writer_append_with).
+    // Appends a record whose payload `fill(uint8_t *buf, size_t len)` writes in place (`buf` is NULL when `len` is
+    // 0). If `fill` throws, nothing is committed and the exception propagates (aborting costs a sync; see
+    // tickertape_writer_append_with).
+    //
+    // `fill` must not call this Writer, and must not destroy, move from or move-assign it: closing the handle from
+    // inside its own callback is refused with TICKERTAPE_E_BUSY, which the destructor cannot report, so the old
+    // handle would leak.
     template <class Fill>
     uint64_t append_with(uint32_t schema_id, uint64_t venue_ts_ns, uint64_t local_ts_ns, std::size_t len,
                          Fill &&fill) {
@@ -183,7 +192,9 @@ public:
         return Reader(r);
     }
 
-    // Returns true with a record, false if none arrived within `timeout` (zero: don't wait; negative: forever).
+    // Returns true with a record, false if none arrived within `timeout` (zero: don't wait; negative: forever, which
+    // cannot be interrupted: use a finite timeout in a loop to make a wait cancellable). `out.payload` is NULL when
+    // `out.payload_len` is 0.
     bool next(tickertape_record &out, std::chrono::nanoseconds timeout = std::chrono::nanoseconds(0)) {
         return check(tickertape_reader_next(p_.get(), detail::to_ns(timeout), &out)) == TICKERTAPE_OK;
     }

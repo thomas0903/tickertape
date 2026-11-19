@@ -12,6 +12,10 @@ int main(int argc, char **argv) {
         std::fprintf(stderr, "usage: %s <dir>\n", argv[0]);
         return 2;
     }
+    if (!tickertape::library_is_compatible()) {
+        std::fprintf(stderr, "library %s does not match this header\n", tickertape_version());
+        return 1;
+    }
     try {
         tickertape::Writer writer(argv[1]);
         uint64_t first = writer.next_seq();
@@ -29,8 +33,9 @@ int main(int argc, char **argv) {
         reader.seek(first);
         tickertape_record r;
         while (reader.next(r)) {  // don't wait: replay what is there
-            std::printf("%llu %.*s\n", static_cast<unsigned long long>(r.seq), static_cast<int>(r.payload_len),
-                        reinterpret_cast<const char *>(r.payload));
+            // r.payload is NULL when the payload is empty; printf("%.*s") must not get NULL.
+            const char *text = r.payload_len > 0 ? reinterpret_cast<const char *>(r.payload) : "";
+            std::printf("%llu %.*s\n", static_cast<unsigned long long>(r.seq), static_cast<int>(r.payload_len), text);
         }
     } catch (const tickertape::Error &e) {
         std::fprintf(stderr, "%s\n", e.what());

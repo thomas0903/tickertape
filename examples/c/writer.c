@@ -31,10 +31,16 @@ int main(int argc, char **argv) {
     }
     count = argc > 2 ? strtoul(argv[2], NULL, 10) : 10;
     interval_ms = argc > 3 ? strtoul(argv[3], NULL, 10) : 0;
-    if (tickertape_abi_version() != TICKERTAPE_ABI_VERSION) {
-        fprintf(stderr, "library ABI %u does not match header ABI %d\n", tickertape_abi_version(),
-                TICKERTAPE_ABI_VERSION);
-        return 1;
+    {
+        /* Before 1.0 the ABI is unstable and the library must be exactly the header's version; from 1.0 it must
+         * have the same ABI version and be at least as new (see TICKERTAPE_ABI_VERSION in the header). */
+        uint32_t lib = tickertape_version_number();
+        if (tickertape_abi_version() != TICKERTAPE_ABI_VERSION ||
+            (TICKERTAPE_ABI_VERSION == 0 ? lib != TICKERTAPE_VERSION_NUMBER : lib < TICKERTAPE_VERSION_NUMBER)) {
+            fprintf(stderr, "library %s does not match header %d.%d.%d\n", tickertape_version(),
+                    TICKERTAPE_VERSION_MAJOR, TICKERTAPE_VERSION_MINOR, TICKERTAPE_VERSION_PATCH);
+            return 1;
+        }
     }
 
     status = tickertape_writer_open(argv[1], NULL, &writer); /* NULL options: defaults */
@@ -65,7 +71,10 @@ int main(int argc, char **argv) {
     }
 
     status = tickertape_writer_checkpoint(writer); /* make everything durable before exiting */
-    tickertape_writer_close(writer);
-    if (status != TICKERTAPE_OK) return fail("checkpoint", status);
+    if (status != TICKERTAPE_OK) {
+        tickertape_writer_close(writer);
+        return fail("checkpoint", status);
+    }
+    if ((status = tickertape_writer_close(writer)) != TICKERTAPE_OK) return fail("close", status);
     return 0;
 }

@@ -90,24 +90,134 @@ pub(crate) unsafe fn copy_to(dst: *mut u8, offset: usize, src: &[u8]) {
     unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), dst.add(offset), src.len()) };
 }
 
-/// Reads the `struct_size` field at the start of a caller's report struct, checking that it covers `T`.
+/// Borrows `count` values of type `T` at `ptr`. `ptr` may be NULL only when `count` is 0. Nothing is read: this
+/// only checks the pointer and that the array's size in bytes fits in `isize::MAX`.
 ///
 /// # Safety
 ///
-/// `ptr` must be NULL or point to a readable, aligned `usize` (the struct's first field).
-pub(crate) unsafe fn struct_size<T>(ptr: *const T, name: &str) -> Result<usize, FfiError> {
+/// If `count > 0`, `ptr` must be NULL or point to `count` initialised values that stay valid and are not written for
+/// `'a`.
+pub(crate) unsafe fn slice<'a, T>(
+    ptr: *const T,
+    count: usize,
+    name: &str,
+    count_name: &str,
+) -> Result<&'a [T], FfiError> {
+    if count == 0 {
+        return Ok(&[]);
+    }
+    if ptr.is_null() {
+        return Err(FfiError::invalid(format!(
+            "{name} must not be NULL when {count_name} is not 0"
+        )));
+    }
+    if count
+        .checked_mul(size_of::<T>())
+        .is_none_or(|bytes| bytes > isize::MAX as usize)
+    {
+        return Err(FfiError::invalid(format!("{count_name} is too large")));
+    }
+    if !ptr.is_aligned() {
+        return Err(FfiError::invalid(format!("{name} is not aligned")));
+    }
+    // SAFETY: not NULL, aligned, the size in bytes fits in isize, and the caller guarantees `count` initialised values
+    // valid and unmodified for 'a.
+    Ok(unsafe { std::slice::from_raw_parts(ptr, count) })
+}
+
+/// A range of caller memory that one call reads or writes, for the overlap checks (ADR 0028 → Ownership).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Region<'n> {
+    start: usize,
+    len: usize,
+    name: &'n str,
+}
+
+impl<'n> Region<'n> {
+    /// `count` values of type `T` at `ptr`; empty if `ptr` is NULL. Only the address is used.
+    pub(crate) fn of<T>(ptr: *const T, count: usize, name: &'n str) -> Region<'n> {
+        let len = if ptr.is_null() {
+            0
+        } else {
+            count.saturating_mul(size_of::<T>())
+        };
+        Region {
+            start: ptr.addr(),
+            len,
+            name,
+        }
+    }
+
+    pub(crate) fn name(&self) -> &'n str {
+        self.name
+    }
+
+    pub(crate) fn overlaps(&self, other: &Region<'_>) -> bool {
+        self.len > 0
+            && other.len > 0
+            && self.start < other.start.saturating_add(other.len)
+            && other.start < self.start.saturating_add(self.len)
+    }
+}
+
+/// Fails with `TICKERTAPE_E_INVALID_ARGUMENT` if any two of `regions` overlap.
+pub(crate) fn disjoint(regions: &[Region<'_>]) -> Result<(), FfiError> {
+    for (index, a) in regions.iter().enumerate() {
+        if let Some(b) = regions[index + 1..].iter().find(|b| a.overlaps(b)) {
+            return Err(FfiError::invalid(format!(
+                "{} and {} must not overlap",
+                a.name, b.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Reads the `uint64_t struct_size` field at the start of a caller's extensible struct and checks it against the
+/// struct's minimum size (its size in the first stable release). Returns how many bytes the library fills:
+/// `min(struct_size, size_of::<T>())`. See ADR 0028 → Versioning.
+///
+/// # Safety
+///
+/// `ptr` must be NULL or point to a readable `uint64_t` (the struct's first field).
+pub(crate) unsafe fn struct_size<T>(
+    ptr: *const T,
+    min_size: usize,
+    name: &str,
+) -> Result<usize, FfiError> {
     if ptr.is_null() {
         return Err(FfiError::null(name));
     }
-    // SAFETY: not NULL; the caller guarantees the struct starts with an aligned, readable `size_t`.
-    let size = unsafe { ptr.cast::<usize>().read() };
-    if size < std::mem::size_of::<T>() {
+    if !ptr.is_aligned() {
+        return Err(FfiError::invalid(format!("{name} is not aligned")));
+    }
+    // SAFETY: not NULL and aligned (a `T` starts with its `uint64_t struct_size`, so `T`'s alignment covers it); the
+    // caller guarantees the field is readable.
+    let size = unsafe { ptr.cast::<u64>().read() };
+    if size < min_size as u64 {
         return Err(FfiError::invalid(format!(
-            "{name}->struct_size is {size}; set it to sizeof the struct ({} in this version)",
-            std::mem::size_of::<T>()
+            "{name}->struct_size is {size}; set it to sizeof the struct (at least {min_size})"
         )));
     }
-    Ok(size)
+    Ok(usize::try_from(size).map_or(size_of::<T>(), |size| size.min(size_of::<T>())))
+}
+
+/// Writes the first `filled` bytes of `value` to a caller's extensible struct, then stores `filled` in its
+/// `struct_size` field so that the caller can tell which fields were written.
+///
+/// # Safety
+///
+/// `ptr` must be valid for writing `filled` bytes and aligned for `T`. `filled` must come from [`struct_size`] for
+/// the same `T`, and `T` must start with a `u64 struct_size` field and have no padding bytes.
+pub(crate) unsafe fn write_struct<T: Copy>(ptr: *mut T, value: T, filled: usize) {
+    debug_assert!((size_of::<u64>()..=size_of::<T>()).contains(&filled));
+    // SAFETY: `value` is a live local of `filled <= size_of::<T>()` bytes without padding; the caller guarantees
+    // `ptr` is valid for writing `filled` bytes, and a caller-owned struct cannot overlap a local.
+    unsafe {
+        std::ptr::copy_nonoverlapping((&raw const value).cast::<u8>(), ptr.cast::<u8>(), filled)
+    };
+    // SAFETY: `filled >= 8` bytes are writable, and the struct starts with an aligned `u64`.
+    unsafe { ptr.cast::<u64>().write(filled as u64) };
 }
 
 /// Converts a timeout in nanoseconds: 0 means do not wait (`Some(ZERO)`), negative means wait forever (`None`).

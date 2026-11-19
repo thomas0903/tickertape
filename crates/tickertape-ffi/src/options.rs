@@ -101,12 +101,14 @@ unsafe fn free<T>(ptr: *mut T) {
     }
 }
 
+/// Allocates a default object. Allocation failure aborts the process (Rust's allocator never returns NULL to here),
+/// and `T::default` cannot panic for these types, so nothing can unwind out of the `extern "C"` functions below.
 fn new<T: Default>() -> *mut T {
-    std::panic::catch_unwind(|| Box::into_raw(Box::<T>::default())).unwrap_or(std::ptr::null_mut())
+    Box::into_raw(Box::<T>::default())
 }
 
 /// Creates writer options with the defaults: 128 MiB segments, `TICKERTAPE_RECOVERY_QUARANTINE`, notify on,
-/// prefault on, no retention. Returns NULL only if memory allocation fails.
+/// prefault on, no retention. Never returns NULL: if memory cannot be allocated, the process aborts.
 #[unsafe(no_mangle)]
 pub extern "C" fn tickertape_writer_options_new() -> *mut tickertape_writer_options {
     new()
@@ -239,7 +241,7 @@ pub unsafe extern "C" fn tickertape_writer_options_set_retention(
 }
 
 /// Creates reader options with the defaults: not durable-only, notify on, default back-off (100 spins, 10 yields,
-/// then sleeps from 10 µs doubling to 1 ms). Returns NULL only if memory allocation fails.
+/// then sleeps from 10 µs doubling to 1 ms). Never returns NULL: if memory cannot be allocated, the process aborts.
 #[unsafe(no_mangle)]
 pub extern "C" fn tickertape_reader_options_new() -> *mut tickertape_reader_options {
     new()
@@ -262,6 +264,8 @@ pub unsafe extern "C" fn tickertape_reader_options_free(options: *mut tickertape
 ///
 /// A durable-only reader returns `TICKERTAPE_NONE` (or keeps waiting) at a record that no checkpoint covers yet.
 /// Without a valid checkpoint marker it returns nothing; if the writer never checkpoints, it never returns a record.
+/// Records it returns survive a power loss only under the crash contract's conditions: storage that honours the sync
+/// calls, and no failed checkpoint earlier in the same boot (`docs/crash-contract.md`).
 ///
 /// # Safety
 ///
@@ -349,7 +353,8 @@ pub unsafe extern "C" fn tickertape_reader_options_set_busy_spin(
     })
 }
 
-/// Creates retention settings with no limits and no action. Returns NULL only if memory allocation fails.
+/// Creates retention settings with no limits and no action. Never returns NULL: if memory cannot be allocated, the
+/// process aborts.
 #[unsafe(no_mangle)]
 pub extern "C" fn tickertape_retention_new() -> *mut tickertape_retention {
     new()

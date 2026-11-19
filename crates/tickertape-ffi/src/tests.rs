@@ -152,6 +152,23 @@ fn check_record(record: &tickertape_record, seq: u64) {
 #[test]
 fn pure_versions() {
     assert_eq!(tickertape_abi_version(), TICKERTAPE_ABI_VERSION);
+    let number = |v: &str| v.parse::<u32>().unwrap();
+    assert_eq!(
+        TICKERTAPE_VERSION_NUMBER,
+        number(env!("CARGO_PKG_VERSION_MAJOR")) * 1_000_000
+            + number(env!("CARGO_PKG_VERSION_MINOR")) * 1_000
+            + number(env!("CARGO_PKG_VERSION_PATCH"))
+    );
+    assert_eq!(tickertape_version_number(), TICKERTAPE_VERSION_NUMBER);
+    // Before 1.0 the ABI is unstable (version 0); from 1.0 the ABI version is the major version.
+    assert_eq!(
+        TICKERTAPE_ABI_VERSION,
+        if TICKERTAPE_VERSION_MAJOR == 0 {
+            0
+        } else {
+            TICKERTAPE_VERSION_MAJOR
+        }
+    );
     let version = unsafe { CStr::from_ptr(tickertape_version()) };
     assert_eq!(version.to_str().unwrap(), env!("CARGO_PKG_VERSION"));
     assert_eq!(version.to_str().unwrap(), tickertape::VERSION);
@@ -756,7 +773,7 @@ fn checkpoint_durable_only_and_inspection() {
     assert_eq!(checkpoint.generation, 1);
 
     let mut report = tickertape_verify_report {
-        struct_size: size_of::<tickertape_verify_report>(),
+        struct_size: size_of::<tickertape_verify_report>() as u64,
         ..Default::default()
     };
     assert_eq!(
@@ -766,7 +783,10 @@ fn checkpoint_durable_only_and_inspection() {
     assert_eq!(report.records, 15);
     assert_eq!((report.first_seq, report.last_seq), (0, 14));
     assert_eq!(report.problems, 0);
-    assert_eq!(report.struct_size, size_of::<tickertape_verify_report>());
+    assert_eq!(
+        report.struct_size,
+        size_of::<tickertape_verify_report>() as u64
+    );
     assert_eq!(unsafe { tickertape_reader_close(durable) }, OK);
     assert_eq!(unsafe { tickertape_writer_close(writer) }, OK);
 }
@@ -977,7 +997,7 @@ fn batch_errors_after_records_are_deferred_to_the_next_call() {
     assert_eq!(unsafe { tickertape_reader_close(reader) }, OK);
 
     let mut report = tickertape_verify_report {
-        struct_size: size_of::<tickertape_verify_report>(),
+        struct_size: size_of::<tickertape_verify_report>() as u64,
         ..Default::default()
     };
     assert_eq!(
@@ -1000,7 +1020,7 @@ struct FillState {
     calls: usize,
 }
 
-unsafe extern "C" fn fill(user_data: *mut c_void, buf: *mut u8, len: usize) -> i32 {
+unsafe extern "C-unwind" fn fill(user_data: *mut c_void, buf: *mut u8, len: usize) -> i32 {
     let state = unsafe { &mut *user_data.cast::<FillState>() };
     state.calls += 1;
     let buf = unsafe { std::slice::from_raw_parts_mut(buf, len) };
@@ -1206,7 +1226,7 @@ fn retention_plans_applies_and_readers_see_seq_unavailable() {
         OK
     );
     let mut report = tickertape_retention_report {
-        struct_size: size_of::<tickertape_retention_report>(),
+        struct_size: size_of::<tickertape_retention_report>() as u64,
         ..Default::default()
     };
     assert_eq!(
@@ -1329,4 +1349,876 @@ fn handles_move_between_threads() {
     append(writer.0, 2);
     follower.join().unwrap();
     assert_eq!(unsafe { tickertape_writer_close(writer.0) }, OK);
+}
+
+// ---- Review round 1: regression tests ----
+
+use tickertape_status_code as S;
+
+fn new_record(bytes: &[u8]) -> tickertape_new_record {
+    tickertape_new_record {
+        payload: bytes.as_ptr(),
+        payload_len: bytes.len(),
+        venue_ts_ns: 1,
+        local_ts_ns: 2,
+        schema_id: 3,
+        reserved: 0,
+    }
+}
+
+fn next_seq(writer: *mut tickertape_writer) -> u64 {
+    let mut next = u64::MAX;
+    assert_eq!(unsafe { tickertape_writer_next_seq(writer, &mut next) }, OK);
+    next
+}
+
+fn position(reader: *mut tickertape_reader) -> u64 {
+    let mut seq = u64::MAX;
+    assert_eq!(unsafe { tickertape_reader_position(reader, &mut seq) }, OK);
+    seq
+}
+
+/// Moves the journal directory away for the duration of `body`, so that `tickertape_reader_seek` fails (listing
+/// the segments returns `ENOENT`) while a reader's open segment stays readable.
+fn with_journal_moved<R>(j: &Journal, body: impl FnOnce() -> R) -> R {
+    let moved = j.dir.with_file_name("moved-away");
+    std::fs::rename(&j.dir, &moved).unwrap();
+    let result = body();
+    std::fs::rename(&moved, &j.dir).unwrap();
+    result
+}
+
+#[test]
+fn failed_seek_keeps_the_held_back_record() {
+    let j = Journal::new();
+    let writer = j.writer(65_536);
+    for seq in 0..4 {
+        append(writer, seq);
+    }
+    assert_eq!(unsafe { tickertape_writer_close(writer) }, OK);
+    let reader = j.reader(false, false);
+    let mut record = empty_record();
+    let mut small = [0u8; 8];
+    let mut big = [0u8; 512];
+    // Record 0 is empty; record 1 (37 bytes) does not fit in 8 bytes and is held back.
+    assert_eq!(
+        unsafe { tickertape_reader_next_copy(reader, 0, big.as_mut_ptr(), big.len(), &mut record) },
+        OK
+    );
+    check_record(&record, 0);
+    assert_eq!(
+        unsafe {
+            tickertape_reader_next_copy(reader, 0, small.as_mut_ptr(), small.len(), &mut record)
+        },
+        code(S::TICKERTAPE_E_BUFFER_TOO_SMALL)
+    );
+    let status = with_journal_moved(&j, || unsafe { tickertape_reader_seek(reader, 3) });
+    assert_eq!(status, code(S::TICKERTAPE_E_IO), "{}", last_message());
+    assert_eq!(
+        position(reader),
+        1,
+        "a failed seek does not move the reader"
+    );
+    assert_eq!(
+        unsafe { tickertape_reader_next_copy(reader, 0, big.as_mut_ptr(), big.len(), &mut record) },
+        OK
+    );
+    check_record(&record, 1);
+    // A failed seek with SEQ_UNAVAILABLE behaves the same way: nothing is lost.
+    assert_eq!(
+        unsafe {
+            tickertape_reader_next_copy(reader, 0, small.as_mut_ptr(), small.len(), &mut record)
+        },
+        code(S::TICKERTAPE_E_BUFFER_TOO_SMALL)
+    );
+    assert_eq!(record.seq, 2);
+    assert_eq!(unsafe { tickertape_reader_close(reader) }, OK);
+}
+
+#[test]
+fn failed_seek_keeps_the_deferred_error() {
+    let j = Journal::new();
+    let writer = j.writer(65_536);
+    let payload = [7u8; 8];
+    for _ in 0..5 {
+        let status =
+            unsafe { tickertape_writer_append(writer, 1, 0, 0, payload.as_ptr(), 8, null_mut()) };
+        assert_eq!(status, OK);
+    }
+    assert_eq!(unsafe { tickertape_writer_close(writer) }, OK);
+    let segment = j.dir.join(format!("{:020}.tape", 0));
+    let flip = |segment: &Path| {
+        let mut bytes = std::fs::read(segment).unwrap();
+        bytes[64 + 48 * 3 + 40] ^= 0xFF;
+        std::fs::write(segment, bytes).unwrap();
+    };
+    flip(&segment);
+    let reader = j.reader(false, false);
+    let mut records = [empty_record(); 10];
+    let mut buf = [0u8; 1024];
+    let mut count = 0;
+    let status = unsafe {
+        tickertape_reader_read_batch(
+            reader,
+            0,
+            records.as_mut_ptr(),
+            records.len(),
+            buf.as_mut_ptr(),
+            buf.len(),
+            &mut count,
+        )
+    };
+    assert_eq!((status, count), (OK, 3));
+    let status = with_journal_moved(&j, || unsafe { tickertape_reader_seek(reader, 0) });
+    assert_eq!(status, code(S::TICKERTAPE_E_IO), "{}", last_message());
+    // Repair the record: the error deferred by the batch is still reported (once), then reading continues.
+    flip(&segment);
+    let mut record = empty_record();
+    assert_eq!(
+        unsafe { tickertape_reader_next(reader, 0, &mut record) },
+        code(S::TICKERTAPE_E_CORRUPT),
+        "the deferred error survives a failed seek"
+    );
+    assert_eq!(
+        unsafe { tickertape_reader_next(reader, 0, &mut record) },
+        OK
+    );
+    assert_eq!(record.seq, 3);
+    // A successful seek clears a deferred error.
+    flip(&segment);
+    assert_eq!(unsafe { tickertape_reader_seek(reader, 0) }, OK);
+    let status = unsafe {
+        tickertape_reader_read_batch(
+            reader,
+            0,
+            records.as_mut_ptr(),
+            records.len(),
+            buf.as_mut_ptr(),
+            buf.len(),
+            &mut count,
+        )
+    };
+    assert_eq!((status, count), (OK, 3));
+    flip(&segment);
+    assert_eq!(unsafe { tickertape_reader_seek(reader, 0) }, OK);
+    assert_eq!(
+        unsafe { tickertape_reader_next(reader, 0, &mut record) },
+        OK
+    );
+    assert_eq!(record.seq, 0);
+    assert_eq!(unsafe { tickertape_reader_close(reader) }, OK);
+}
+
+#[test]
+fn pure_append_batch_rejects_a_count_too_large() {
+    // Never dereferenced: the count is rejected before the array is touched.
+    let records = std::ptr::NonNull::<tickertape_new_record>::dangling().as_ptr();
+    let mut appended = 9usize;
+    let status = unsafe {
+        tickertape_writer_append_batch(
+            null_mut(),
+            records,
+            usize::MAX / 8,
+            &mut appended,
+            null_mut(),
+        )
+    };
+    assert_eq!(status, INVALID);
+    assert!(last_message().contains("count"), "{}", last_message());
+    assert_eq!(appended, 0);
+}
+
+#[test]
+fn pure_append_batch_reports_the_failing_record() {
+    let byte = 0u8;
+    let mut records = [new_record(b"ok"), new_record(b"ok")];
+    records[1].payload = &byte;
+    records[1].payload_len = isize::MAX as usize + 1;
+    let mut appended = 9usize;
+    let status = unsafe {
+        tickertape_writer_append_batch(null_mut(), records.as_ptr(), 2, &mut appended, null_mut())
+    };
+    assert_eq!(status, INVALID);
+    let message = last_message();
+    assert!(
+        message.contains("records[1]") && message.contains("too large"),
+        "{message}"
+    );
+    records[1].payload = null();
+    records[1].payload_len = 1;
+    let status = unsafe {
+        tickertape_writer_append_batch(null_mut(), records.as_ptr(), 2, &mut appended, null_mut())
+    };
+    assert_eq!(status, INVALID);
+    let message = last_message();
+    assert!(
+        message.contains("records[1].payload") && message.contains("NULL"),
+        "{message}"
+    );
+}
+
+#[test]
+fn overlapping_arguments_are_rejected() {
+    let j = Journal::new();
+    let writer = j.writer(65_536);
+    let alpha = b"alpha";
+    // append_batch: an output inside the records array (it would zero a length before validation).
+    let mut records = [new_record(alpha), new_record(alpha)];
+    let inside = (&raw mut records[0].payload_len).cast::<usize>();
+    let status =
+        unsafe { tickertape_writer_append_batch(writer, records.as_ptr(), 2, inside, null_mut()) };
+    assert_eq!(status, INVALID);
+    assert!(last_message().contains("overlap"), "{}", last_message());
+    assert_eq!(records[0].payload_len, 5, "the input is untouched");
+    // An output inside a payload.
+    let mut words = [0u64; 4];
+    records[1].payload = words.as_ptr().cast();
+    records[1].payload_len = size_of_val(&words);
+    let mut appended = 0usize;
+    let status = unsafe {
+        tickertape_writer_append_batch(
+            writer,
+            records.as_ptr(),
+            2,
+            &mut appended,
+            &raw mut words[1],
+        )
+    };
+    assert_eq!(status, INVALID);
+    // The two outputs overlapping each other.
+    records[1] = new_record(alpha);
+    let mut both = 0u64;
+    let status = unsafe {
+        tickertape_writer_append_batch(
+            writer,
+            records.as_ptr(),
+            2,
+            (&raw mut both).cast(),
+            &raw mut both,
+        )
+    };
+    assert_eq!(status, INVALID);
+    // append: seq_out inside the payload.
+    let mut payload_words = [7u64; 2];
+    let status = unsafe {
+        tickertape_writer_append(
+            writer,
+            1,
+            0,
+            0,
+            payload_words.as_ptr().cast(),
+            16,
+            &raw mut payload_words[1],
+        )
+    };
+    assert_eq!(status, INVALID);
+    assert_eq!(next_seq(writer), 0, "nothing was appended");
+
+    for seq in 0..4 {
+        append(writer, seq);
+    }
+    let reader = j.reader(false, false);
+    let mut storage = [empty_record(); 4];
+    let base = storage.as_mut_ptr();
+    // next_copy: record_out inside the copy buffer.
+    let status = unsafe {
+        tickertape_reader_next_copy(reader, 0, base.cast(), size_of_val(&storage), base.add(1))
+    };
+    assert_eq!(status, INVALID);
+    // read_batch: records inside the buffer, count_out inside the buffer, count_out inside records.
+    let mut buf = [0u64; 64];
+    let mut count = 0usize;
+    let status = unsafe {
+        tickertape_reader_read_batch(
+            reader,
+            0,
+            buf.as_mut_ptr().cast(),
+            2,
+            buf.as_mut_ptr().cast(),
+            size_of_val(&buf),
+            &mut count,
+        )
+    };
+    assert_eq!(status, INVALID);
+    let status = unsafe {
+        tickertape_reader_read_batch(
+            reader,
+            0,
+            base,
+            4,
+            buf.as_mut_ptr().cast(),
+            size_of_val(&buf),
+            (&raw mut buf[3]).cast(),
+        )
+    };
+    assert_eq!(status, INVALID);
+    let status = unsafe {
+        tickertape_reader_read_batch(
+            reader,
+            0,
+            base,
+            4,
+            buf.as_mut_ptr().cast(),
+            size_of_val(&buf),
+            (&raw mut storage[2].payload_len).cast(),
+        )
+    };
+    assert_eq!(status, INVALID);
+    assert_eq!(position(reader), 0, "nothing was read");
+    // list_segments: count_out inside the array.
+    let mut segments = [tickertape_segment_info::default(); 2];
+    let status = unsafe {
+        tickertape_list_segments(
+            j.c_dir.as_ptr(),
+            segments.as_mut_ptr(),
+            2,
+            (&raw mut segments[1].segment_size).cast(),
+        )
+    };
+    assert_eq!(status, INVALID);
+    assert_eq!(unsafe { tickertape_reader_close(reader) }, OK);
+    assert_eq!(unsafe { tickertape_writer_close(writer) }, OK);
+}
+
+/// A caller's report struct from a newer header: larger than this library's, with guard bytes after it.
+#[repr(C, align(8))]
+struct Larger<T> {
+    report: T,
+    newer_fields: [u8; 32],
+}
+
+#[test]
+fn report_struct_size_works_in_both_directions() {
+    let j = Journal::new();
+    let writer = j.writer(65_536);
+    for seq in 0..1500 {
+        append(writer, seq);
+    }
+    assert_eq!(unsafe { tickertape_writer_checkpoint(writer) }, OK);
+    assert_eq!(unsafe { tickertape_writer_close(writer) }, OK);
+
+    let verify_size = size_of::<tickertape_verify_report>();
+    let mut larger = Larger {
+        report: tickertape_verify_report::default(),
+        newer_fields: [0xAB; 32],
+    };
+    larger.report.struct_size = (verify_size + 32) as _;
+    assert_eq!(
+        unsafe { tickertape_verify(j.c_dir.as_ptr(), &mut larger.report) },
+        OK
+    );
+    assert_eq!(larger.report.records, 1500);
+    assert_eq!(
+        larger.report.struct_size as usize, verify_size,
+        "struct_size says how many bytes the library filled"
+    );
+    assert!(larger.newer_fields.iter().all(|&b| b == 0xAB));
+    // A struct of exactly the minimum (1.0) size.
+    let mut minimum = tickertape_verify_report {
+        struct_size: verify_size as _,
+        ..Default::default()
+    };
+    assert_eq!(
+        unsafe { tickertape_verify(j.c_dir.as_ptr(), &mut minimum) },
+        OK
+    );
+    assert_eq!(minimum.struct_size as usize, verify_size);
+    assert_eq!(minimum.records, 1500);
+    minimum.struct_size = (verify_size - 1) as _;
+    assert_eq!(
+        unsafe { tickertape_verify(j.c_dir.as_ptr(), &mut minimum) },
+        INVALID
+    );
+
+    let retention = tickertape_retention_new();
+    assert_eq!(
+        unsafe { tickertape_retention_set_max_segments(retention, 1) },
+        OK
+    );
+    let retention_size = size_of::<tickertape_retention_report>();
+    let mut larger = Larger {
+        report: tickertape_retention_report::default(),
+        newer_fields: [0xCD; 32],
+    };
+    larger.report.struct_size = (retention_size + 32) as _;
+    assert_eq!(
+        unsafe { tickertape_retention_apply(j.c_dir.as_ptr(), retention, 1, &mut larger.report) },
+        OK
+    );
+    assert!(larger.report.removed_segments >= 1);
+    assert_eq!(larger.report.struct_size as usize, retention_size);
+    assert!(larger.newer_fields.iter().all(|&b| b == 0xCD));
+    let mut minimum = tickertape_retention_report {
+        struct_size: retention_size as _,
+        ..Default::default()
+    };
+    assert_eq!(
+        unsafe { tickertape_retention_apply(j.c_dir.as_ptr(), retention, 1, &mut minimum) },
+        OK
+    );
+    assert_eq!(minimum.struct_size as usize, retention_size);
+    unsafe { tickertape_retention_free(retention) };
+}
+
+#[test]
+fn pure_unknown_status_is_far_from_the_assigned_codes() {
+    assert_eq!(code(S::TICKERTAPE_E_UNKNOWN), -255);
+    assert_eq!(name(-255), "TICKERTAPE_E_UNKNOWN");
+    assert_eq!(name(-18), "TICKERTAPE_UNKNOWN_STATUS");
+}
+
+#[test]
+fn zero_length_payloads_everywhere() {
+    let j = Journal::new();
+    let writer = j.writer(65_536);
+    // append, append_batch and append_with with empty payloads (seq 0, 1, 2).
+    assert_eq!(
+        unsafe { tickertape_writer_append(writer, 1, 0, 0, null(), 0, null_mut()) },
+        OK
+    );
+    let mut empty = new_record(b"");
+    empty.payload = null();
+    let mut appended = 0;
+    assert_eq!(
+        unsafe { tickertape_writer_append_batch(writer, &empty, 1, &mut appended, null_mut()) },
+        OK
+    );
+    assert_eq!(appended, 1);
+    let mut state = EmptyFill {
+        calls: 0,
+        buf_was_null: false,
+    };
+    let status = unsafe {
+        tickertape_writer_append_with(
+            writer,
+            1,
+            0,
+            0,
+            0,
+            Some(empty_fill),
+            (&raw mut state).cast(),
+            null_mut(),
+        )
+    };
+    assert_eq!(status, OK, "{}", last_message());
+    assert_eq!(state.calls, 1, "the callback runs for an empty payload too");
+    assert!(state.buf_was_null, "an empty buffer is passed as NULL");
+    append_raw(writer, b"not empty"); // seq 3
+    assert_eq!(next_seq(writer), 4);
+
+    for mapped in [false, true] {
+        let reader = j.reader(false, mapped);
+        let mut record = empty_record();
+        for seq in 0..3 {
+            assert_eq!(
+                unsafe { tickertape_reader_next(reader, 0, &mut record) },
+                OK
+            );
+            assert_eq!((record.seq, record.payload_len), (seq, 0));
+            assert!(record.payload.is_null(), "zero-length payloads are NULL");
+        }
+        assert_eq!(unsafe { tickertape_reader_seek(reader, 0) }, OK);
+        // next_copy with a NULL buffer of length 0.
+        assert_eq!(
+            unsafe { tickertape_reader_next_copy(reader, 0, null_mut(), 0, &mut record) },
+            OK
+        );
+        assert!(record.seq == 0 && record.payload.is_null());
+        // read_batch with a NULL buffer of length 0 takes the empty records and holds back the next one.
+        let mut records = [empty_record(); 8];
+        let mut count = 0;
+        let status = unsafe {
+            tickertape_reader_read_batch(
+                reader,
+                0,
+                records.as_mut_ptr(),
+                records.len(),
+                null_mut(),
+                0,
+                &mut count,
+            )
+        };
+        assert_eq!((status, count), (OK, 2));
+        assert!(records[..2].iter().all(|r| r.payload.is_null()));
+        assert_eq!((records[0].seq, records[1].seq), (1, 2));
+        // With a non-NULL buffer, an empty record still gets a NULL payload.
+        let mut buf = [0u8; 4];
+        assert_eq!(unsafe { tickertape_reader_seek(reader, 2) }, OK);
+        let status = unsafe {
+            tickertape_reader_read_batch(
+                reader,
+                0,
+                records.as_mut_ptr(),
+                records.len(),
+                buf.as_mut_ptr(),
+                buf.len(),
+                &mut count,
+            )
+        };
+        assert_eq!((status, count), (OK, 1));
+        assert!(records[0].payload.is_null());
+        assert_eq!(unsafe { tickertape_reader_close(reader) }, OK);
+    }
+    assert_eq!(unsafe { tickertape_writer_close(writer) }, OK);
+}
+
+struct EmptyFill {
+    calls: usize,
+    buf_was_null: bool,
+}
+
+unsafe extern "C-unwind" fn empty_fill(user_data: *mut c_void, buf: *mut u8, len: usize) -> i32 {
+    let state = unsafe { &mut *user_data.cast::<EmptyFill>() };
+    state.calls += 1;
+    state.buf_was_null = buf.is_null() && len == 0;
+    0
+}
+
+struct CloseFill {
+    writer: *mut tickertape_writer,
+    close_status: i32,
+}
+
+unsafe extern "C-unwind" fn closing_fill(user_data: *mut c_void, buf: *mut u8, len: usize) -> i32 {
+    let state = unsafe { &mut *user_data.cast::<CloseFill>() };
+    state.close_status = unsafe { tickertape_writer_close(state.writer) };
+    unsafe { std::ptr::write_bytes(buf, b'x', len) };
+    0
+}
+
+#[test]
+fn closing_a_writer_from_its_fill_callback_is_busy() {
+    let j = Journal::new();
+    let writer = j.writer(65_536);
+    let mut state = CloseFill {
+        writer,
+        close_status: OK,
+    };
+    let mut seq = u64::MAX;
+    let status = unsafe {
+        tickertape_writer_append_with(
+            writer,
+            1,
+            0,
+            0,
+            3,
+            Some(closing_fill),
+            (&raw mut state).cast(),
+            &mut seq,
+        )
+    };
+    assert_eq!(status, OK, "{}", last_message());
+    assert_eq!(state.close_status, code(S::TICKERTAPE_E_BUSY));
+    assert_eq!(seq, 0);
+    // The handle is still alive.
+    append_raw(writer, b"after");
+    assert_eq!(next_seq(writer), 2);
+    assert_eq!(unsafe { tickertape_writer_close(writer) }, OK);
+}
+
+unsafe extern "C-unwind" fn panicking_fill(_: *mut c_void, _: *mut u8, _: usize) -> i32 {
+    panic!("a bug inside the callback");
+}
+
+#[test]
+fn a_panic_breaks_the_handle_through_an_exported_function() {
+    let j = Journal::new();
+    let writer = j.writer(65_536);
+    append_raw(writer, b"before");
+    let status = unsafe {
+        tickertape_writer_append_with(
+            writer,
+            1,
+            0,
+            0,
+            4,
+            Some(panicking_fill),
+            null_mut(),
+            null_mut(),
+        )
+    };
+    assert_eq!(status, code(S::TICKERTAPE_E_PANIC));
+    assert!(
+        last_message().contains("a bug inside the callback"),
+        "{}",
+        last_message()
+    );
+    let mut seq = 0;
+    assert_eq!(
+        unsafe { tickertape_writer_next_seq(writer, &mut seq) },
+        code(S::TICKERTAPE_E_PANIC)
+    );
+    assert_eq!(
+        unsafe { tickertape_writer_append(writer, 1, 0, 0, null(), 0, null_mut()) },
+        code(S::TICKERTAPE_E_PANIC)
+    );
+    assert!(last_message().contains("broken"), "{}", last_message());
+    assert_eq!(unsafe { tickertape_writer_close(writer) }, OK);
+    // Nothing from the abandoned append is visible.
+    let reader = j.reader(false, false);
+    let mut record = empty_record();
+    assert_eq!(
+        unsafe { tickertape_reader_next(reader, 0, &mut record) },
+        OK
+    );
+    assert_eq!(
+        unsafe { tickertape_reader_next(reader, 0, &mut record) },
+        NONE
+    );
+    assert_eq!(unsafe { tickertape_reader_close(reader) }, OK);
+}
+
+#[test]
+fn discarded_is_reported_and_the_reader_recovers() {
+    let j = Journal::new();
+    let writer = j.writer(65_536);
+    for seq in 0..1500 {
+        append(writer, seq);
+    }
+    assert_eq!(unsafe { tickertape_writer_checkpoint(writer) }, OK);
+    let reader = j.reader(false, false);
+    let retention = tickertape_retention_new();
+    unsafe {
+        assert_eq!(tickertape_retention_set_max_segments(retention, 1), OK);
+        assert_eq!(tickertape_retention_set_delete(retention), OK);
+        assert_eq!(
+            tickertape_retention_apply(j.c_dir.as_ptr(), retention, 0, null_mut()),
+            OK
+        );
+        tickertape_retention_free(retention);
+    }
+    // The reader still has the first segment open and reads it to its end, then notices the removal.
+    let mut record = empty_record();
+    let mut read = 0u64;
+    let status = loop {
+        let status = unsafe { tickertape_reader_next(reader, 0, &mut record) };
+        if status != OK {
+            break status;
+        }
+        check_record(&record, read);
+        read += 1;
+    };
+    assert_eq!(
+        status,
+        code(S::TICKERTAPE_E_DISCARDED),
+        "{}",
+        last_message()
+    );
+    assert_eq!(tickertape_last_error_code(), status);
+    assert!(read > 0);
+    // Seeking to the same position fails: the records there were removed. Continue at the oldest one left.
+    assert_eq!(
+        unsafe { tickertape_reader_seek(reader, position(reader)) },
+        code(S::TICKERTAPE_E_SEQ_UNAVAILABLE)
+    );
+    let mut segment = tickertape_segment_info::default();
+    let mut count = 0;
+    assert_eq!(
+        unsafe { tickertape_list_segments(j.c_dir.as_ptr(), &mut segment, 1, &mut count) },
+        OK
+    );
+    assert_eq!(count, 1);
+    assert_eq!(
+        unsafe { tickertape_reader_seek(reader, segment.base_seq) },
+        OK
+    );
+    assert_eq!(
+        unsafe { tickertape_reader_next(reader, 0, &mut record) },
+        OK
+    );
+    check_record(&record, segment.base_seq);
+    assert_eq!(unsafe { tickertape_reader_close(reader) }, OK);
+    assert_eq!(unsafe { tickertape_writer_close(writer) }, OK);
+}
+
+#[test]
+fn retention_apply_without_a_report_and_with_a_move() {
+    let j = Journal::new();
+    let writer = j.writer(65_536);
+    for seq in 0..1500 {
+        append(writer, seq);
+    }
+    assert_eq!(unsafe { tickertape_writer_checkpoint(writer) }, OK);
+    let mut before = 0;
+    assert_eq!(
+        unsafe { tickertape_list_segments(j.c_dir.as_ptr(), null_mut(), 0, &mut before) },
+        OK
+    );
+    let archive = j.dir.with_file_name("archive");
+    std::fs::create_dir(&archive).unwrap();
+    let c_archive = cstr(&archive);
+    let retention = tickertape_retention_new();
+    unsafe {
+        assert_eq!(tickertape_retention_set_max_segments(retention, 1), OK);
+        assert_eq!(
+            tickertape_retention_set_move_to(retention, c_archive.as_ptr()),
+            OK
+        );
+        // No report.
+        assert_eq!(
+            tickertape_retention_apply(j.c_dir.as_ptr(), retention, 0, null_mut()),
+            OK
+        );
+    }
+    let mut after = 0;
+    assert_eq!(
+        unsafe { tickertape_list_segments(j.c_dir.as_ptr(), null_mut(), 0, &mut after) },
+        OK
+    );
+    assert_eq!(after, 1);
+    let moved = std::fs::read_dir(&archive).unwrap().count();
+    assert_eq!(
+        moved,
+        before - after,
+        "the segments were moved, not deleted"
+    );
+    assert!(archive.join(format!("{:020}.tape", 0)).exists());
+    // Nothing is left to move.
+    let mut report = tickertape_retention_report {
+        struct_size: size_of::<tickertape_retention_report>() as _,
+        ..Default::default()
+    };
+    assert_eq!(
+        unsafe { tickertape_retention_apply(j.c_dir.as_ptr(), retention, 0, &mut report) },
+        OK
+    );
+    assert_eq!(report.removed_segments, 0);
+    unsafe { tickertape_retention_free(retention) };
+    assert_eq!(unsafe { tickertape_writer_close(writer) }, OK);
+}
+
+#[test]
+fn mapped_view_stays_valid_across_position_and_a_segment_roll() {
+    let j = Journal::new();
+    let writer = j.writer(65_536);
+    for seq in 0..3 {
+        append(writer, seq);
+    }
+    let reader = j.reader(false, true);
+    let mut record = empty_record();
+    for _ in 0..2 {
+        assert_eq!(
+            unsafe { tickertape_reader_next(reader, 0, &mut record) },
+            OK
+        );
+    }
+    check_record(&record, 1);
+    // The writer rolls to new segments while the view is held; position does not invalidate it.
+    let mut segments = 0;
+    for seq in 3..1000 {
+        append(writer, seq);
+    }
+    assert_eq!(
+        unsafe { tickertape_list_segments(j.c_dir.as_ptr(), null_mut(), 0, &mut segments) },
+        OK
+    );
+    assert!(segments > 1);
+    assert_eq!(position(reader), 2);
+    check_record(&record, 1);
+    assert_eq!(position(reader), 2);
+    check_record(&record, 1);
+    assert_eq!(unsafe { tickertape_reader_close(reader) }, OK);
+    assert_eq!(unsafe { tickertape_writer_close(writer) }, OK);
+}
+
+#[test]
+fn pure_append_batch_counts_each_commit_even_if_a_later_append_panics() {
+    let bytes = *b"abc";
+    let records = [new_record(&bytes), new_record(&bytes), new_record(&bytes)];
+    let mut appended = 0usize;
+    let mut calls = 0;
+    let status = guard(|| {
+        unsafe {
+            crate::writer::append_records(&records, &mut appended, |_| {
+                calls += 1;
+                assert!(calls < 3, "the third append fails inside the core");
+                Ok(calls)
+            })
+        }?;
+        Ok(tickertape_status_code::TICKERTAPE_OK)
+    });
+    assert_eq!(status, code(S::TICKERTAPE_E_PANIC));
+    assert_eq!(appended, 2, "the two committed records are counted");
+}
+
+#[test]
+fn pure_with_ref_keeps_pointers_from_earlier_calls_valid() {
+    // State stored inline, as a reader's buffer could be one day: a pointer handed out by one call must survive a
+    // read-only call (as a record view survives `tickertape_reader_position`). Under Miri, creating a `&mut` to the
+    // state here (`Handle::with`) would invalidate `view`; `Handle::with_ref` does not.
+    let handle = Handle::new([7u8; 16]);
+    let view = handle.with(|state| Ok(state.as_ptr())).unwrap();
+    let first = handle.with_ref(|state| Ok(state[0])).unwrap();
+    assert_eq!(first, 7);
+    assert_eq!(unsafe { *view.add(3) }, 7);
+    // A read-only call from inside another call on the same handle is refused, like any re-entrant call.
+    let inner = handle.with(|_| Ok(handle.with_ref(|_| Ok(())).unwrap_err().code));
+    assert_eq!(inner.unwrap(), S::TICKERTAPE_E_BUSY);
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn failed_cleanup_after_an_aborted_fill_is_reported() {
+    use tickertape::fault::{self, Point};
+    let j = Journal::new();
+    let writer = j.writer(65_536);
+    append_raw(writer, b"first");
+    let mut state = FillState {
+        writer,
+        abort: true,
+        reentrant_status: OK,
+        calls: 0,
+    };
+    fault::fail_next(Point::AbandonedWriteSync, 5 /* EIO */);
+    let status = unsafe {
+        tickertape_writer_append_with(
+            writer,
+            1,
+            0,
+            0,
+            37,
+            Some(fill),
+            (&raw mut state).cast(),
+            null_mut(),
+        )
+    };
+    assert_eq!(status, code(S::TICKERTAPE_E_IO), "not a clean abort");
+    assert_eq!(tickertape_last_error_os_code(), 5);
+    let message = last_message();
+    assert!(
+        message.contains("fill callback") && message.contains("zeroing"),
+        "{message}"
+    );
+    // Later appends are refused with the same OS error, and say why.
+    let status = unsafe { tickertape_writer_append(writer, 1, 0, 0, null(), 0, null_mut()) };
+    assert_eq!(status, code(S::TICKERTAPE_E_IO));
+    assert_eq!(tickertape_last_error_os_code(), 5);
+    assert!(
+        last_message().contains("abandoned write"),
+        "{}",
+        last_message()
+    );
+    let mut appended = 0;
+    let empty = new_record(b"");
+    assert_eq!(
+        unsafe { tickertape_writer_append_batch(writer, &empty, 1, &mut appended, null_mut()) },
+        code(S::TICKERTAPE_E_IO)
+    );
+    assert_eq!(appended, 0);
+    // The checkpoint blames the clean-up, not an earlier checkpoint.
+    assert_eq!(
+        unsafe { tickertape_writer_checkpoint(writer) },
+        code(S::TICKERTAPE_E_DURABILITY_LOST)
+    );
+    let message = last_message();
+    assert!(
+        message.contains("aborted fill") && !message.contains("earlier checkpoint"),
+        "{message}"
+    );
+    assert_eq!(unsafe { tickertape_writer_close(writer) }, OK);
+    // Reopening recovers.
+    let writer = j.writer(65_536);
+    assert_eq!(append_raw(writer, b"second"), 1);
+    assert_eq!(unsafe { tickertape_writer_checkpoint(writer) }, OK);
+    assert_eq!(unsafe { tickertape_writer_close(writer) }, OK);
 }
