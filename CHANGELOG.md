@@ -101,6 +101,26 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   `find_package` and `add_subdirectory`. The C++11 example wrapper `examples/c/tickertape.hpp` is removed;
   `examples/c/example.cpp` now records, follows live and replays with the binding, and the examples need C++17. On
   macOS, link the static library with Apple's toolchain defaults or use the shared library (`docs/c-api.md`).
+- Java binding (ADR 0037, `docs/java-api.md`): `bindings/java`, a Maven project (JDK 25, module
+  `io.github.thomas0903.tickertape`, no runtime dependencies) over the C ABI with the Foreign Function and Memory API
+  and no JNI. It covers the writer (copying, zero-copy and batch appends, checkpoint), the safe and mapped readers
+  (try, timed and blocking next, batch reads, seek, durable-only), inspection and retention. Use after close,
+  concurrent calls on a handle, a stale record view and a payload buffer used on another thread throw instead of
+  crashing; closing a reader from another thread is safe while a view is being read (views read through the reader's
+  shared arena, which close ends first); blocking reads honour `Thread.interrupt()` and a close from another thread
+  without losing records; record views are reused and checked, keep their memory alive, and the hot paths allocate
+  nothing (checked with the JIT's escape analysis off too). A close refuses new calls from the moment it starts and
+  takes over from the call in progress without a gap; closing a reader costs a handshake with every JVM thread, so
+  readers are meant to be long-lived. A path is passed to the library by the bytes the JDK holds for it (a relative
+  path stays relative), so a name the JVM cannot decode opens the journal of that name and not one of a similar
+  name; only the default file system is supported. What remains undefined (another thread advancing a reader while its view is read, sharing a batch between
+  threads, the mapped reader's precondition) is listed in the guide. Reports from growable C structs are classes, not
+  records, so they can gain fields after 1.0.
+  Every C status and corruption reason has its own exception or constant, checked against the header. The library is
+  found by explicit path, system property, a natives JAR (extracted privately and hash-checked) or the library path,
+  and a library of another version is refused. Tested on Linux x86-64, Linux arm64 and macOS in a new CI job, including
+  the cross-language fixtures and the released-format fixtures. Not published to Maven Central yet; the coordinates
+  `io.github.thomas0903:tickertape` await the owner's confirmation.
 - Fixed: a visible reader no longer reports `CorruptReason::BrokenChain` for a seal that is no longer in the file.
   When recovery repairs a tail in place, a seal can go with it while the successor is moved to `quarantine/`. The
   safe reader could still hold the seal in its read buffer (a zero-copy reader could load it just before the damage

@@ -119,6 +119,7 @@ From other languages:
 |---|---|---|---|
 | C (and others through FFI) | C ABI: `libtickertape` and `tickertape.h` | not stable before 1.0 | [`docs/c-api.md`](docs/c-api.md) |
 | C++ | Header-only C++17 binding over the C ABI: `tickertape.hpp` (RAII handles, borrowed views, works without exceptions) | not stable before 1.0 | [`docs/cpp-api.md`](docs/cpp-api.md) |
+| Java (JDK 25+) | Binding over the C ABI with the Foreign Function and Memory API, in `bindings/java` | not yet on Maven Central | [`docs/java-api.md`](docs/java-api.md) |
 | Python | Read-only decoder without dependencies | | [`python/`](python/README.md) |
 
 ## iceoryx2 integration
@@ -180,8 +181,9 @@ Background research: [`docs/research/2026-10-31-market-review.md`](docs/research
 ## Project layout
 
 `crates/tickertape` (library) · `crates/tickertape-cli` (the `tickertape` binary) · `crates/tickertape-ffi` (C ABI,
-C header and C++ binding) · `tests/` (cross-process and crash tests) · `fuzz/` · `benches/` · `examples/` ·
-`integrations/iceoryx2` (separate crate) · `docs/` (format, crash contract, decisions, playbooks).
+C header and C++ binding) · `bindings/java` (Java binding) · `tests/` (cross-process and crash tests) · `fuzz/` ·
+`benches/` · `examples/` · `integrations/iceoryx2` (separate crate) · `docs/` (format, crash contract, decisions,
+playbooks).
 Contributions: [`CONTRIBUTING.md`](CONTRIBUTING.md). Security issues: [`SECURITY.md`](SECURITY.md).
 
 ## Licence
