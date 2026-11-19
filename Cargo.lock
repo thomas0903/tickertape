@@ -1456,6 +1456,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "tickertape-ffi"
+version = "0.4.0"
+dependencies = [
+ "cc",
+ "tempfile",
+ "tickertape",
+]
+
+[[package]]
 name = "tickertape-tests"
 version = "0.4.0"
 dependencies = [

@@ -1,0 +1,61 @@
+[package]
+name = "tickertape-ffi"
+description = "C ABI for tickertape: a shared and static library plus a C99/C++11 header (ADR 0028)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme = "README.md"
+# Not published to crates.io yet: the C ABI is distributed as source in this repository until the maintainer decides
+# how to ship it (ADR 0028 → Distribution). The release tooling refuses unlisted members that are publishable.
+publish = false
+# Local tooling files that may exist in a checkout.
+exclude = ["AGENTS.md", "CLAUDE.md"]
+
+[lib]
+# The artefacts are libtickertape.{so,dylib,a}, so C code links with -ltickertape (and pkg-config name `tickertape`).
+name = "tickertape"
+crate-type = ["cdylib", "staticlib"]
+# The core crate is also called `tickertape`; documenting both would collide (cargo issue 6313). The C header,
+# generated from this crate's doc comments, is the documentation of this crate.
+doc = false
+
+[features]
+# Empty; cargo-c (`cargo cbuild`, `cargo cinstall`) enables it by convention. It changes nothing in the build.
+capi = []
+
+[dependencies]
+tickertape.workspace = true
+
+[dev-dependencies]
+# Compiles the C and C++ test programs against the committed header (tests/c_api.rs).
+cc = "1"
+tempfile = "3"
+
+[lints]
+workspace = true
+
+# cargo-c (`cargo cinstall`) support for packagers: installs libtickertape with a soname, the committed header and a
+# pkg-config file. A plain `cargo build` produces the same libraries without versioned file names.
+[package.metadata.capi]
+min_version = "0.10.0"
+
+[package.metadata.capi.header]
+name = "tickertape"
+subdirectory = false
+# The header is generated with cbindgen and committed (include/tickertape.h); CI checks it for drift.
+generation = false
+
+[package.metadata.capi.install.include]
+asset = [{ from = "include/tickertape.h" }]
+
+[package.metadata.capi.pkg_config]
+name = "tickertape"
+filename = "tickertape"
+description = "C ABI for tickertape, a local append-only event journal on memory-mapped files"
+
+[package.metadata.capi.library]
+name = "tickertape"
