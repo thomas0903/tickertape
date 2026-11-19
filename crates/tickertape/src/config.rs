@@ -3,8 +3,9 @@
 use std::time::Duration;
 
 /// What the writer does on open when it finds corruption after the last checkpoint: an invalid record or seal, or an
-/// empty commit word that committed records follow (a later valid record, a final seal or a later segment;
-/// [`CorruptReason::EmptyCommitWord`](crate::CorruptReason::EmptyCommitWord), ADR 0035).
+/// empty commit word that committed records follow (a later valid record, a final seal, or a segment with a higher
+/// base than the expected sequence number; [`CorruptReason::EmptyCommitWord`](crate::CorruptReason::EmptyCommitWord),
+/// ADR 0035).
 ///
 /// A writer *process* crash never produces this (see `docs/crash-contract.md`, C1/C2), with one exception; otherwise
 /// only power loss, storage errors or outside modification do. The exception: a crash while a payload was being
@@ -15,8 +16,10 @@ use std::time::Duration;
 /// [`CorruptReason::EmptyCommitWord`](crate::CorruptReason::EmptyCommitWord). The same holds for a payload holding
 /// several header-shaped byte sequences (copies of this journal's record headers, for example) whose length claims
 /// exhaust the search's work budget although every candidate checksum fails: reported as
-/// [`CorruptReason::UncheckedTail`](crate::CorruptReason::UncheckedTail). Nothing is lost (ADR 0035). Uncommitted
-/// partial records, with nothing committed after them, are always cleaned up, whatever the policy.
+/// [`CorruptReason::UncheckedTail`](crate::CorruptReason::UncheckedTail). Nothing is lost (ADR 0035). Every other
+/// uncommitted partial record is zeroed in place, whatever the policy. One in the exception is not: `Quarantine`
+/// preserves its bytes and replaces the segment, and `Fail` refuses and leaves it untouched (`docs/crash-contract.md`,
+/// C1 and C2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum RecoveryPolicy {
@@ -33,7 +36,11 @@ pub enum RecoveryPolicy {
     /// the clean-ups it performs before reaching the corrupt position, which a writer *process* crash also requires:
     /// removing stale `*.tape.tmp` files (and the prepared spare), zeroing never-committed bytes after a segment's
     /// last record, writing a missing seal (which can be the seal in front of a corrupt successor), and creating a
-    /// missing successor segment (`docs/format.md` → Recovery). Opening also records the PID in the lock file.
+    /// missing successor segment (`docs/format.md` → Recovery). In front of a successor segment that exists but has
+    /// an invalid header, it also zeroes in place the bytes after the previous segment's last record (the seal's
+    /// checksum word, or other bytes in which it finds no committed record when no segment follows that successor)
+    /// before refusing at the successor ([`CorruptReason::BrokenChain`](crate::CorruptReason::BrokenChain)). Opening
+    /// also records the PID in the lock file.
     ///
     /// After a plain process crash this refuses only in the exception above (`EmptyCommitWord` or `UncheckedTail` at
     /// the start of the record being written, whose payload holds the frames or headers that count as evidence). To

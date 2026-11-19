@@ -934,7 +934,8 @@ impl Recovery<'_> {
                         break;
                     }
                     // A torn append or the clean end. (A successor for exactly `seq` that does not open, as before
-                    // this change, ends the chain here and is quarantined below.)
+                    // this change, ends the chain here: the bytes after `offset` are zeroed even under `Fail`, then the
+                    // successor is quarantined below, or refused as disconnected under `Fail`.)
                     self.zero_uncommitted_tail(&mut seg, offset, tail_end)?;
                     break;
                 }
@@ -1273,9 +1274,10 @@ pub enum RecoveryAction {
     /// The journal didn't exist and was created.
     Created,
     /// Uncommitted bytes after the last record (a record being written when the previous writer died) were zeroed in
-    /// place. Only done when nothing committed follows them, so no reader can have seen them (ADR 0035); if a valid
-    /// record, a final seal or a later segment follows, the tail is corrupt instead ([`RecoveryAction::RepairedTail`]
-    /// with [`CorruptReason::EmptyCommitWord`](crate::CorruptReason::EmptyCommitWord)).
+    /// place. Only done when recovery finds nothing committed after them, so no reader can have seen them (ADR 0035);
+    /// if a valid record, a final seal or a segment with a higher base than the expected sequence number follows, the
+    /// tail is corrupt instead ([`RecoveryAction::RepairedTail`] with
+    /// [`CorruptReason::EmptyCommitWord`](crate::CorruptReason::EmptyCommitWord)).
     ZeroedUncommitted {
         /// The segment.
         segment: PathBuf,

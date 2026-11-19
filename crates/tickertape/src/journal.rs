@@ -159,7 +159,8 @@ pub(crate) fn sync_dir(dir: &Path) -> Result<()> {
 const SCAN_WINDOW: usize = 1 << 20;
 
 /// A [`format::SegmentView`] over a segment file read with `pread` in windows, so that scanning a segment needs memory
-/// for one window (or one record, if larger), never the whole file. An I/O error makes the view return `None`; the
+/// for one window of at most [`SCAN_WINDOW`] bytes, never the whole file: callers read a larger record in pieces of
+/// at most that size ([`format::SegmentView::max_piece`]). An I/O error makes the view return `None`; the
 /// error is kept and reported by [`scan_file`].
 struct PreadView<'f> {
     file: &'f File,

@@ -178,8 +178,13 @@ Never truncate or edit a segment in place while anything uses the journal: proce
   and keep the rest of the segment zero (or, outside a segment, append zeros): a last record whose payload ends in
   zero bytes declares a length that reaches past the end of the copy, and it only validates with those zeros put
   back. Damage
-  after which no record validates and no final seal (for one of the next 128 sequence numbers) or later segment
-  remains (for example the commit words of the newest records zeroed) can't be told from a crash and is zeroed like a torn append, under either policy. If
+  after which no record validates and no final seal (for one of the next 128 sequence numbers) or segment with a
+  higher base than the expected sequence number remains (for example the commit words of the newest records zeroed)
+  can't be told from a crash and is zeroed like a torn append, under either policy; so is a valid final seal further
+  away, when nothing else is found and the search completes within its work budget. When the segment for exactly
+  the expected sequence number exists and opens, that comes first: a damaged seal in front of it is rewritten (in
+  place when only its checksum word is left, otherwise after the bytes after it are preserved and the segment
+  replaced), and every record is kept. If
   `quarantine/` holds two files with identical bytes for the same position, a repair was interrupted and repeated;
   either copy can be deleted.
   Readers that had seen discarded records get `Error::Discarded`, except after a repair in place (damage that can't
@@ -190,7 +195,11 @@ Never truncate or edit a segment in place while anything uses the journal: proce
   open is not read-only. It records its PID in the lock file, removes stale temporary files (`*.tape.tmp`,
   `next-segment.tmp`) before scanning, and keeps the clean-ups a crash needs that come before the corruption: a
   zeroed torn tail, a seal written after a crash between publishing the next segment and sealing (for example the
-  seal of the segment in front of a corrupt one), a created missing successor.
+  seal of the segment in front of a corrupt one), a created missing successor. When the next segment exists but has
+  an invalid header, recovery first zeroes in place what follows the last record of the segment in front of it (the
+  seal's checksum word, or other bytes in which it finds no committed record when no segment follows that next
+  one), then refuses at that next segment
+  (`BrokenChain`); the zeroing stays.
 - **Refused to open** (missing checkpoint segment or a gap in the chain): restore the missing segments from a copy,
   or move the affected segments aside knowingly. tickertape won't discard history on its own.
 

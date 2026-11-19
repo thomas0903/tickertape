@@ -378,12 +378,15 @@ impl MapRo {
         // another size. If the length in the commit word is damaged, the words can reach past the writer's current
         // slot, where a live writer is storing body bytes (non-atomic) and the next commit word (a 4-byte atomic).
         // That is a data race, and a mixed-size access, in Rust's memory model when the writer is in this process,
-        // before any CRC runs, and outside the model when it is another process. A zeroed commit word after which
-        // recovery finds no evidence within its search bounds (no record that validates within the work budget, no
-        // final seal for one of the next 128 sequence numbers, no later segment, and a search that did not stop at
-        // its budget: damage after which nothing validates, or a valid final seal more than 128 records past the
-        // empty slot with no later segment left) lets recovery zero published records in place under a live reader,
-        // with the same result; otherwise it replaces the file (ADR 0035). The code then assumes, without a
+        // before any CRC runs, and outside the model when it is another process. A zeroed commit word in front of
+        // which no segment for exactly the expected sequence number opens (one that opens makes it a damaged seal,
+        // handled first), and after which recovery's search finds no evidence within its bounds (no record that
+        // validates within the work budget, no final seal for one of the next 128 sequence numbers, no segment with a
+        // higher base than the expected sequence number, and a search that did not stop at its budget: damage after
+        // which nothing validates, or a valid final seal more than 128 records past the empty slot when nothing else
+        // is found) lets recovery zero published records in place under a live reader, with the same result;
+        // otherwise it replaces the file, or rewrites a damaged seal of which only the CRC word is left, in a slot
+        // that never held a record (ADR 0035). The code then assumes, without a
         // guarantee, that each load is one aligned 8-byte load instruction on these targets, which cannot fault
         // inside the mapping and returns some mixture of old and new bytes; that the compiler does not split, repeat
         // or invent an atomic load; and that, since no reference asserting immutability exists, the CRC then rejects

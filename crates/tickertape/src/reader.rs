@@ -149,17 +149,19 @@ impl Reader {
     ///
     /// - The length in an earlier record's commit word is enlarged while no writer runs, and a writer then appends
     ///   after that record: validating it loads bytes the writer is storing.
-    /// - The commit word of a published record not yet covered by a checkpoint is zeroed, and recovery finds no
-    ///   evidence within its search bounds that committed history follows: no record that validates within the
-    ///   work budget, no final seal for one of the next 128 sequence numbers, no later segment, and the search did
-    ///   not stop at its budget. That is damage after which nothing validates (the newest record, or damage
-    ///   reaching the records after it), or a valid final seal more than 128 records past the empty slot with no
-    ///   later segment left. The next writer's recovery cannot tell that from a torn append, takes the slot for
-    ///   the end of the journal and zeroes that record and the published records after it in place, under a live
-    ///   zero-copy reader. A payload the caller still holds then changes, and the reader's later loads meet the
-    ///   new writer's stores. (With evidence, or a search stopped at its budget, recovery replaces the segment by
-    ///   a new file, and mappings of the old file do not change; a damaged seal whose successor opens is rewritten
-    ///   in place only when nothing but its CRC word is left, in a slot that never held a record. ADR 0035.)
+    /// - The commit word of a published record not yet covered by a checkpoint is zeroed, no segment for exactly
+    ///   the expected sequence number opens (when one does, recovery treats the slot as a damaged seal first, and
+    ///   rewrites it in place only when nothing but its CRC word is left, in a slot that never held a record), and
+    ///   recovery's search finds no evidence within its bounds that committed history follows: no record that
+    ///   validates within the work budget, no final seal for one of the next 128 sequence numbers, no segment with
+    ///   a higher base than the expected sequence number, and the search did not stop at its budget. That is
+    ///   damage after which nothing validates (the newest record, or damage reaching the records after it), or a
+    ///   valid final seal more than 128 records past the empty slot when nothing else is found. The next writer's
+    ///   recovery cannot tell that from a torn append, takes the slot for the end of the journal and zeroes that
+    ///   record and the published records after it in place, under a live zero-copy reader. A payload the caller
+    ///   still holds then changes, and the reader's later loads meet the new writer's stores. (With evidence, or a
+    ///   search stopped at its budget, recovery replaces the segment by a new file, and mappings of the old file do
+    ///   not change; so does a damaged seal whose successor opens, unless only its CRC word is left. ADR 0035.)
     ///
     /// That such loads return some mixture of old and new bytes, which the CRC then rejects, is an assumption about
     /// the implementation on the supported targets, not a guarantee. Earlier releases had the same exposure.

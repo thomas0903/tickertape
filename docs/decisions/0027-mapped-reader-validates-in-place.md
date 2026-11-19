@@ -90,18 +90,20 @@ writers touch the files.
 1. A writer appends records up to sequence number `T`, which readers return; the last checkpoint covers only the
    records before some `S <= T`.
 2. Storage damage zeroes the commit word of the published record `S`.
-3. A writer reopens. Recovery scans from the checkpoint and stops at the empty slot of record `S`, then decides by
-   what it finds within its search bounds (ADR 0035 → "How recovery tells them apart"). If it finds a record that
-   validates within the work budget, a final seal for one of the next 128 sequence numbers or a later segment, or
-   the search stops at its work budget before deciding (`UncheckedTail`, nothing proven), it treats the slot as
-   corruption and replaces the segment by a new file (or `Fail` refuses), which leaves readers' mappings unchanged.
-   If the segment for exactly `S` exists and opens (a damaged seal), the seal is rewritten in place only when
-   nothing but its CRC word is left, in a slot that never held a record; otherwise the bytes after it are preserved
-   and the segment replaced, then sealed. If it finds none of these, it cannot tell the damage from a torn append:
-   it takes that slot for the end of the journal and zeroes record `S` **and the published records after it** in
-   place, then appends from there. That covers damage after which nothing validates (the commit word of the newest
-   record, or of the two newest, zeroed, or a block from one record into the next one's header), and a valid final
-   seal more than 128 records past the empty slot with no later segment left.
+3. A writer reopens. Recovery scans from the checkpoint and stops at the empty slot of record `S`, then decides in
+   this order (ADR 0035 → "How recovery tells them apart", "Damage around a seal"). If the segment for exactly `S`
+   exists and opens (a damaged seal), that takes precedence over any search: the seal is rewritten in place only
+   when nothing but its CRC word is left, in a slot that never held a record; otherwise the bytes after the seal's
+   place are preserved and the segment replaced, then sealed. Otherwise recovery searches within its bounds: if it
+   finds a record that validates within the work budget, a final seal for one of the next 128 sequence numbers or a
+   segment with a higher base than `S`, or the search stops at its work budget before deciding (`UncheckedTail`,
+   nothing proven), it treats the slot as corruption and replaces the segment by a new file (or `Fail` refuses),
+   which leaves readers' mappings unchanged. If it finds none of these, it cannot tell the damage from a torn
+   append: it takes that slot for the end of the journal and zeroes record `S` **and the published records after
+   it** in place, then appends from there. That covers damage after which nothing validates (the commit word of the
+   newest record, or of the two newest, zeroed, or a block from one record into the next one's header), and a valid
+   final seal more than 128 records past the empty slot, only when the search finds nothing else (no segment with a
+   higher base either) and completes within its budget.
 4. A zero-copy reader that is still open while this happens holds payload slices into those records, and they change
    under it: the bytes it validated are not the bytes it hands back. Its later commit-word loads, and the loads that
    validate the records it then reads, meet the recovering and the new writer's stores to the same bytes.

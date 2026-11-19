@@ -49,13 +49,18 @@ these counts:
 2. **A final seal.** A valid seal for a `T` in the same range, and at most `SEAL_SEARCH_RECORDS` (128) above `S`,
    that is the last non-zero item in `X`. (When record `S` is the last before a seal, the seal is the only thing
    after it.)
-3. **A later segment.** A segment file whose base is greater than `S`, if `X` holds any non-zero byte after `P`.
-   (Without non-zero bytes there is nothing to preserve, and the existing rule for disconnected segments applies.)
+3. **A later segment**, meaning one with a **higher** base than `S` (the successor for exactly `S` is not one): a
+   segment file whose base is greater than `S`, if `X` holds any non-zero byte after `P`. (Without non-zero bytes
+   there is nothing to preserve, and the existing rule for disconnected segments applies.) It does not count when
+   the segment for exactly `S` exists but does not open and every non-zero byte after `P` lies in `[P+4, P+8)`, the
+   seal's CRC word (see "Damage around a seal").
 
-None of these is consulted when the successor for exactly `S` exists, has not been entered yet and opens: `P` is
-then where `X`'s seal belongs and the chain continues in that successor (see "Damage around a seal" below).
+The order is fixed. First, when the successor for exactly `S` exists, has not been entered yet and opens, `P` is
+where `X`'s seal belongs and the chain continues in that successor; that takes precedence, and none of the above is
+consulted (see "Damage around a seal" below). Otherwise the search runs: evidence found, or the search stopped at
+its work bound ("Work bound" below), means a committed tail (preserved, or refused under `Fail`).
 
-If none is found, `P` is a torn append (or a clean end) and is handled exactly as before.
+If none is found within the search's bounds, `P` is a torn append (or a clean end) and is handled exactly as before.
 
 **Candidates inside a completely written torn frame are not evidence.** If the frame at `P` has an intact header
 apart from its commit word (sequence number `S`, flags zero) and its stored CRC matches for a frame length `L` that
@@ -126,7 +131,8 @@ a sequence number in the window and zero flags at several positions, as damage o
 1,536 bytes); and at the first candidate, once, CRC32C over
 the frame at `P` up to the last non-zero byte and up to the candidate (at most twice `Z - P` more) plus 72 shifts. It
 runs once per recovery, at the one empty slot where the scan stops, and in `verify`. When the bound stops the search
-before a candidate is decided, nothing was proven: the tail is still treated as committed history, but it is reported as
+before a candidate is decided, nothing was proven (the bound is checked before the candidate that would cross it is
+validated, so that candidate's CRC is unknown: it may or may not be a record): the tail is still treated as committed history, but it is reported as
 `CorruptReason::UncheckedTail(seq)`, not `EmptyCommitWord`, with the sequence number in the header where the search
 stopped. A plain process crash can cause it: a writer killed while filling a payload that holds several such
 header-shaped byte sequences (copies of this journal's record headers, for example) leaves overlapping length claims
@@ -161,8 +167,21 @@ at `P`, which is where an interrupted repair leaves the next open, and that open
 same seal, so every path gives the same journal (`::crash_in_the_middle_of_a_seal_repair`, uninterrupted and
 interrupted at both fault points). This cannot lose records the previous code kept: everything in `X` before `P` and
 every segment are kept, and the bytes after `P` are preserved. Nor can it refuse or quarantine what a process crash
-leaves, which is at most the CRC word. A successor that exists but does not open is handled as before (the chain
-ends at `P`). The shapes, each decided explicitly and tested under both policies
+leaves, which is at most the CRC word.
+
+A successor for exactly `S` that exists but does not open (an invalid header) is handled as before: the resealing
+branch is not taken, the search runs, and the chain ends at `P` when it finds nothing. The bytes after `P` are then
+zeroed in place, without being preserved, under either policy, and the successor and every later segment are
+disconnected (step 5: `Quarantine` moves them into `quarantine/`, `Fail` refuses at the successor with
+`BrokenChain`, after the zeroing). Two branches end there. Only the seal's CRC word is left: it is zeroed in place
+even when segments with higher bases exist, because evidence (3) does not count for those bytes (they are what a
+crash between publishing the successor and sealing leaves, before the successor's header was damaged). Other bytes
+follow `P` and no segment with a higher base exists: nothing in `X` validates, so they are zeroed in place too. With
+other bytes after `P` and a segment with a higher base, evidence (3) holds and the tail is preserved
+(`EmptyCommitWord`; `Fail` refuses without changing a byte). All three under both policies:
+`tests/committed_tail.rs::successor_that_does_not_open_ends_the_chain_at_the_seals_place`.
+
+The shapes with a successor that opens, each decided explicitly and tested under both policies
 (`tests/committed_tail.rs::damage_around_a_seal_is_resealed_or_preserved_never_lost`, with three later segments and
 with exactly one):
 
@@ -272,7 +291,7 @@ before `P`.
 ### What cannot be detected
 
 Recovery and `verify` see only what is after `P`. **Any damage after which no record validates and no final seal or
-later segment remains** is byte for byte a torn append, and is zeroed like one: the records it covers are destroyed in
+segment with a higher base remains** is byte for byte a torn append, and is zeroed like one: the records it covers are destroyed in
 place, nothing reaches `quarantine/`, `verify` reports nothing, and `Fail` does not refuse. The newest record's commit
 word zeroed is one case (a writer killed between the CRC store and the commit store leaves the same bytes); so are,
 with 120 records and a checkpoint at 100, the commit words of the **two** newest records zeroed (next sequence 118,
@@ -282,8 +301,9 @@ header (next sequence 117), because what remains after the empty word no longer 
 sees its bytes change, but only after something other than a tickertape writer changed the file, which
 `open_mapped`'s precondition already excludes. Damage that zeroes a commit word and everything after it leaves
 nothing to find or preserve. A final seal counts only for one of the next 128 sequence numbers, so damage that
-leaves a valid final seal further away is zeroed the same way when no later segment is left either (the successor
-lost too).
+leaves a valid final seal further away is zeroed the same way, but only when the search finds no other evidence (no
+record in its window, and no segment with a higher base: the seal's successor lost too) and completes within its
+work bound.
 
 ## Cost
 
@@ -306,7 +326,7 @@ time it takes to read the tail. A repair costs writing the quarantine copy and t
 ## Consequences
 
 - New `CorruptReason::EmptyCommitWord(seq)` (the enum is `#[non_exhaustive]`); `seq` is the sequence number the
-  evidence carries: a later record's, a final seal's next sequence number, or a later segment's base.
+  evidence carries: a later record's, a final seal's next sequence number, or the base of a segment above `S`.
   `inspect::verify` and `tickertape verify` report it at the empty word, in the newest segment too, from evidence in
   the segment itself. Where only a later segment proves that history exists (the commit word and the seal both
   zeroed, nothing valid left in the segment), the writer reports `EmptyCommitWord` but `verify` reports the
@@ -330,7 +350,10 @@ time it takes to read the tail. A repair costs writing the quarantine copy and t
   open still records its PID in the lock file and removes stale temporary names (`*.tape.tmp`, the prepared spare)
   before scanning, and the clean-ups a process crash needs that come before the corrupt position in the scan stay
   in place when it refuses: a zeroed torn tail, a seal written for a crash between publishing a successor and
-  sealing (for example in segment `X` when the corruption is in its successor), a created missing successor.
+  sealing (for example in segment `X` when the corruption is in its successor), a created missing successor. When
+  the successor for exactly `S` exists but does not open, the bytes zeroed in place at `P` (the seal's CRC word, or
+  other bytes when no segment with a higher base exists; "Damage around a seal") stay zeroed when `Fail` then
+  refuses at that successor.
 - Spec: [`format.md`](../format.md) → Recovery (the table and steps), [`crash-contract.md`](../crash-contract.md)
   (C1, C2, C8, C11, readers and memory safety), [`operations.md`](../operations.md) (checking a journal, after a
   crash), [`cli.md`](../cli.md) (`verify`). Tests: `tests/committed_tail.rs`, `tests/kill_loop.rs::kill_inside_fill`,

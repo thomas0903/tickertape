@@ -768,6 +768,123 @@ fn zeroed_block_ending_a_sealed_segment_is_preserved() {
     }
 }
 
+#[test]
+fn successor_that_does_not_open_ends_the_chain_at_the_seals_place() {
+    // Review round 3 (fix round 4, item 1e): segment 0's seal marker zeroed and the header of the segment for exactly
+    // 339 damaged, so the successor exists but does not open. The resealing branch needs a successor that opens, so
+    // the evidence search runs instead. It finds nothing in segment 0, and a segment with a higher base (676) counts
+    // only if the non-zero bytes reach past the seal's place. Pinned down here, under both policies:
+    // - only the seal's CRC word left, higher-base segments present: not evidence. The CRC word is zeroed in place
+    //   (under `Fail` too), then the successor and every later segment are disconnected: quarantined, or `Fail`
+    //   refuses at the successor (`BrokenChain`) with the CRC word already zeroed;
+    // - the CRC word and a stray byte past the seal's place, no higher-base segment: no evidence either, the bytes
+    //   are zeroed in place without being preserved (under `Fail` too), then the successor is quarantined or refused;
+    // - the same bytes with higher-base segments present: evidence (a segment based above 339), so the tail is
+    //   preserved and segment 0 replaced (`EmptyCommitWord(676)`), or `Fail` refuses without changing a byte.
+    #[derive(Debug, Clone, Copy)]
+    enum Expect {
+        /// `ZeroedUncommitted` of `[seal + 4, seal + 4 + len)`, then every later segment disconnected.
+        ZeroedThenDisconnected(u64),
+        /// Corruption at the seal's place, reported with this sequence number.
+        Preserved(u64),
+    }
+    let cases = [
+        (
+            "only the seal's CRC word left",
+            false,
+            false,
+            Expect::ZeroedThenDisconnected(4),
+        ),
+        (
+            "a stray byte past the seal, no higher base",
+            true,
+            true,
+            Expect::ZeroedThenDisconnected(13),
+        ),
+        (
+            "a stray byte past the seal, higher bases",
+            false,
+            true,
+            Expect::Preserved(676),
+        ),
+    ];
+    for (name, one_later, stray, expect) in cases {
+        let base = tempfile::tempdir().unwrap();
+        let segs = sealed_journal(base.path(), one_later);
+        let (_, seal) = record_slots(&segs[0].1);
+        for policy in [RecoveryPolicy::Quarantine, RecoveryPolicy::Fail] {
+            let what = format!("{name}, {policy:?}");
+            let dir = copy_journal(base.path());
+            let path = dir.path().join(segs[0].1.file_name().unwrap());
+            let successor = dir.path().join(segs[1].1.file_name().unwrap());
+            let raw = open_raw(&path);
+            raw.write_all_at(&[0; 4], seal).unwrap();
+            if stray {
+                raw.write_all_at(&[0xab], seal + 16).unwrap();
+            }
+            open_raw(&successor).write_all_at(b"X", 0).unwrap(); // damages the magic
+            let damaged = fs::read(&path).unwrap();
+            let before = snapshot(dir.path());
+            let opened = Writer::open(dir.path(), small_config().recovery(policy));
+            match (expect, policy, opened) {
+                (Expect::ZeroedThenDisconnected(len), RecoveryPolicy::Quarantine, Ok(w)) => {
+                    let actions = &w.recovery_report().actions;
+                    assert!(
+                        matches!(&actions[0], RecoveryAction::ZeroedUncommitted { segment, offset, len: l } if *segment == path && *offset == seal + 4 && *l == len),
+                        "{what}: {actions:?}"
+                    );
+                    assert_eq!(actions.len(), segs.len(), "{what}: {actions:?}");
+                    for (action, (b, p)) in actions[1..].iter().zip(&segs[1..]) {
+                        assert!(
+                            matches!(action, RecoveryAction::QuarantinedSegment { segment, reason: CorruptReason::BrokenChain(r), .. } if segment.file_name() == p.file_name() && r == b),
+                            "{what}: {action:?}"
+                        );
+                    }
+                    assert_eq!(w.next_seq(), 339, "{what}");
+                    drop(w);
+                    assert_eq!(read_all(dir.path()).len(), 339, "{what}");
+                    // The later segments are preserved unchanged; the zeroed bytes are not.
+                    let kept = quarantined(dir.path());
+                    assert_eq!(kept.len(), segs.len() - 1, "{what}");
+                    for (_, bytes) in &before[1..] {
+                        assert!(kept.iter().any(|(_, k)| k == bytes), "{what}");
+                    }
+                }
+                (Expect::ZeroedThenDisconnected(len), RecoveryPolicy::Fail, Err(e)) => {
+                    assert!(
+                        matches!(&e, Error::Corrupt { path: p, offset: 0, reason: CorruptReason::BrokenChain(339) } if *p == successor),
+                        "{what}: {e:?}"
+                    );
+                    // `Fail` zeroed the bytes after the empty word in place before it reached the successor.
+                    let mut expected = damaged.clone();
+                    expected[(seal + 4) as usize..(seal + 4 + len) as usize].fill(0);
+                    assert!(fs::read(&path).unwrap() == expected, "{what}: segment 0");
+                    assert!(
+                        snapshot(dir.path())[1..] == before[1..],
+                        "{what}: later segments changed"
+                    );
+                    assert!(!dir.path().join("quarantine").exists(), "{what}");
+                }
+                (Expect::Preserved(found), RecoveryPolicy::Quarantine, Ok(w)) => {
+                    let actions = &w.recovery_report().actions;
+                    assert_preserved(&actions[0], &path, seal, &damaged, found);
+                    assert_eq!(actions.len(), segs.len(), "{what}: {actions:?}");
+                    assert_eq!(w.next_seq(), 339, "{what}");
+                }
+                (Expect::Preserved(found), RecoveryPolicy::Fail, Err(e)) => {
+                    assert!(
+                        matches!(&e, Error::Corrupt { path: p, offset, reason: CorruptReason::EmptyCommitWord(f) } if *p == path && *offset == seal && *f == found),
+                        "{what}: {e:?}"
+                    );
+                    assert!(snapshot(dir.path()) == before, "{what}: bytes changed");
+                    assert!(!dir.path().join("quarantine").exists(), "{what}");
+                }
+                (_, _, other) => panic!("{what}: unexpected {other:?}"),
+            }
+        }
+    }
+}
+
 /// Review round 1, item 3: journal B holds records 0 to 2 and its writer stopped while filling record 3's payload
 /// with the raw frames of journal A (records 0 to 19). Returns B's directory, the offset of record 3 and its bytes
 /// `[P, P + len)` as they would be once the body is complete (CRC included, commit word not stored).

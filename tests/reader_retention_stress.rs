@@ -472,9 +472,10 @@ enum Restart {
     /// No repair: every file keeps its identity and every record.
     Clean,
     /// Recovery removed records in place after a commit word zeroed in the file, and the new writer began there: that
-    /// file keeps its identity, so readers can't notice (C11). Later segments, if any, were quarantined, unchanged.
-    /// `zeroed_end`: the base of the first segment after the one zeroed in place (`u64::MAX` if it was the newest),
-    /// so recovery changed bytes only of records below it. `moved_from`: see [`Restart::moved_from`].
+    /// file keeps its identity, so readers can't notice (C11). `zeroed_end`: the base of the first segment after the
+    /// one zeroed in place, so recovery changed bytes only of records below it. [`restart_loop`] damages in place only
+    /// the newest segment, so it always records `u64::MAX`; the field keeps [`changed_in_place`] general (its unit
+    /// test covers a repair in an older segment). `moved_from`: see [`Restart::moved_from`].
     InPlace { zeroed_end: u64, moved_from: u64 },
     /// Recovery began the new writer in a segment it replaced (a corrupt copy was renamed over it), or after
     /// quarantining segments: readers holding the old files notice, and must report `Error::Discarded` before they
@@ -685,13 +686,9 @@ fn restart_loop(
             if end > first {
                 let seq = first + rng.below(end - first);
                 if damage < 4 {
-                    let zeroed_end = segments(shared.dir)
-                        .iter()
-                        .map(|s| s.0)
-                        .find(|&base| base > seq)
-                        .unwrap_or(u64::MAX);
                     zero_commit_words_from(shared.dir, seq);
-                    zeroed = Some(zeroed_end);
+                    // `seq` is in the newest segment: no segment follows the zeroed range.
+                    zeroed = Some(u64::MAX);
                 } else {
                     corrupt_by_replacement(shared.dir, seq);
                     let (_, path) = before.iter().rev().find(|s| s.0 <= seq).expect("a segment");
@@ -738,8 +735,8 @@ fn restart_loop(
             shared.in_place_repairs.fetch_add(1, Ordering::SeqCst);
         }
         generation += 1;
-        // A zeroed commit word is where recovery stopped and the new writer began, in place, even when recovery also
-        // quarantined later segments (the zeroed word was in an older one).
+        // A zeroed commit word (always in the newest segment) is where recovery stopped and the new writer began, in
+        // place.
         let restart = match (zeroed, replaced) {
             (Some(zeroed_end), _) => Restart::InPlace {
                 zeroed_end,

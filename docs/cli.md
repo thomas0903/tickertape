@@ -36,9 +36,11 @@ Errors and recovery warnings go to stderr. JSON results go to stdout (or the sel
   return 2 when the scan reports problems. On a live journal the scan describes observations during the scan,
   not an atomic snapshot; states a running writer passes through are scanned again for up to 630 ms before they
   are reported, and records the writer commits while `verify` looks behind an empty commit word are followed, not
-  reported (see `operations.md` → Checking a journal). Where a segment's records end at an empty commit word (always
-  the newest segment), it reads the rest of the segment up to its end, to find committed records hidden behind that
-  word (`EmptyCommitWord`, ADR 0035); it used to stop at the end of the records. On an empty 128 MiB segment this took
+  reported (see `operations.md` → Checking a journal). Where a segment's records end at an empty commit word (the
+  newest segment, or a damaged older one, which it first scans again for up to 630 ms in case a rolling writer is
+  about to seal it), it reads the rest of the segment up to its end, to find committed records hidden behind that
+  word (`EmptyCommitWord`, or `UncheckedTail`, ADR 0035; an older segment with nothing found there is reported as
+  `BrokenChain`); it used to stop at the end of the records. On an empty 128 MiB segment this took
   21 ms instead of 9 ms (warm page cache, Apple M4 Pro); with a cold cache or slow storage it costs reading the
   unwritten rest of the newest segment. `inspect` runs the same scan.
 - `export <DIR> --format jsonl|parquet [--output <FILE>|-] [--from <SEQ>] [--to <SEQ>]

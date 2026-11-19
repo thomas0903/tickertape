@@ -209,16 +209,18 @@ pub enum CorruptReason {
     DanglingCheckpoint(u64),
     /// A commit word reads 0 (no record), but records were committed after it (`docs/format.md` → Recovery,
     /// ADR 0035). The number is the sequence number the evidence carries: a later valid record's in the same segment,
-    /// the next sequence number of a valid seal that ends the segment, or the base of a later segment. Storage damage,
-    /// power loss or outside modification leaves this; a writer process crash does not, except when the payload it
-    /// was writing holds a valid frame whose sequence number falls in the window (frames copied from another
-    /// journal, for example) and was not completely written.
+    /// the next sequence number of a valid seal that ends the segment (one of the next 128), or the base of a segment
+    /// whose base is higher than the expected sequence number. Storage damage, power loss or outside modification
+    /// leaves this; a writer process crash does not, except when the payload it was writing holds a valid frame whose
+    /// sequence number falls in the window (frames copied from another journal, for example), or ends with a valid
+    /// seal for one, and was not completely written (or ends in more than 63 zero bytes).
     #[error("commit word is 0 but committed history follows it (sequence {0})")]
     EmptyCommitWord(u64),
     /// A commit word reads 0, and the bytes after it hold so many headers of this journal's following records (with
     /// checksums that would need checking) that the search for committed history stopped at its work bound before it
-    /// could decide (`docs/format.md` → Recovery, ADR 0035). Inconclusive, unlike
-    /// [`EmptyCommitWord`](Self::EmptyCommitWord): no record was proven valid. Recovery still treats the tail as
+    /// could decide (`docs/format.md` → Recovery, ADR 0035). The bound is checked before the candidate that would
+    /// cross it is validated, so that candidate's checksum is unknown: it may or may not be a record. Inconclusive,
+    /// unlike [`EmptyCommitWord`](Self::EmptyCommitWord): no record was proven valid. Recovery still treats the tail as
     /// committed history (preserved, or refused with `RecoveryPolicy::Fail`). Storage damage leaves this, and so
     /// does a writer process crash while filling a payload that holds such headers (ADR 0035). The number is the
     /// sequence number in the header of the slot where the search stopped (for a final seal, the expected sequence
