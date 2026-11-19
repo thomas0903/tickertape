@@ -52,7 +52,7 @@ cargo build --locked --release --manifest-path compare/Cargo.toml
 cargo fmt --manifest-path compare/Cargo.toml --check
 cargo clippy --manifest-path compare/Cargo.toml --all-targets -- -D warnings
 cargo test --manifest-path compare/Cargo.toml
-python3 -m unittest discover -s compare -p 'test_*.py'
+python3 -m unittest discover -s compare -p 'test_*.py'   # short and sustained mode
 # Java builds, if invoking an adapter directly:
 JAVA_HOME=/path/to/jdk21 mvn -B -q -f compare/chronicle/pom.xml package dependency:build-classpath -Dmdep.outputFile=target/classpath.txt
 JAVA_HOME=/path/to/jdk21 mvn -B -q -f compare/aeron/pom.xml package dependency:build-classpath -Dmdep.outputFile=target/classpath.txt
@@ -72,6 +72,98 @@ compare/plain-file/run.sh reader --dir /tmp/file-fixture --mode warm_replay --co
 # Tickertape replay selects --reader safe or --reader mapped.
 # W2 roles require --control, --rate, --warmup; use run-all.sh for the barrier.
 ```
+
+## Sustained mode
+
+Implementation of [ADR 0026](../docs/decisions/0026-sustained-workloads.md). Runs of at least 10 minutes per
+configuration for every compatible tool, both payloads, at rates below and near each tool's sustainable throughput,
+in a matrix that survives interrupted sessions. Like the short mode it contains no results; CI never runs it.
+
+```sh
+export JAVA_HOME=/path/to/jdk21
+# Plan and estimated duration only (writes nothing):
+python3 compare/run.py ~/compare-sustained --sustained --dry-run
+# Validate a machine: 5 s runs, 64 B, one repeat (a few minutes; never results).
+TMPDIR=/mnt/test/tmp python3 compare/run.py ~/compare-quick --sustained --quick --keep-going
+# The full matrix: 10-minute runs, 64 B and 1,024 B, two repeats (about 16 hours with every tool).
+TMPDIR=/mnt/test/tmp python3 compare/run.py ~/compare-sustained --sustained --keep-going
+# After an interruption, the same command plus --resume continues where it stopped.
+TMPDIR=/mnt/test/tmp python3 compare/run.py ~/compare-sustained --sustained --keep-going --resume
+```
+
+`TMPDIR` selects the filesystem under test, as in the short mode. `benches/session.py` runs this matrix as part of a
+recorded session. Options: `--duration` (seconds per run, default 600), `--warmup` (paced seconds before the measured
+part, default 10), `--repeats` (default 2), `--tools`, `--workloads`, `--payloads`, `--rates 10000,100000` (explicit
+rates for every tool) or `--rate-fractions 0.5,0.9` (default), `--sync-every-ms` (default 1000), `--tt-readers
+safe,mapped` (default mapped; `tt-sustained` covers both readers in depth), `--keep-going` (record a failed run in
+`failures.jsonl` and continue; the default stops) and `--dry-run`.
+
+**Workloads.** For every tool and payload:
+
+- **probe**: unpaced sends for the run duration, with a concurrent reader where the tool supports one, so the rate is
+  what the whole pipeline sustains (writer, storage write-back and reader). Its records carry the actual send time,
+  so its reader latency is measured from the send. The probe's `count` is only a disk cap.
+- **SV, sustained visibility**: paced at a fraction of the probe's achieved rate (default 50 % and 90 %) with the
+  short W2 protocol: intended times, busy-waiting, every record sent when late (no skipping or rebasing), one
+  concurrent reader measuring `now - intended` after validation. No harness sync. The first `--warmup` seconds are
+  excluded from the histogram, not from the writer's counts.
+- **SD, sustained periodic durability**: SV plus the tool's closest equivalent of a checkpoint every
+  `--sync-every-ms`, on the writer thread, on a fixed grid (grid points missed during a slow sync are counted as
+  `grid_overruns`). Its latency is reported separately (`writer.periodic_sync`).
+
+Visibility-only (SV) and durability (SD) results are separate runs and must be reported separately. Paced rates come
+from each tool's own probe, so 90 % is "near this tool's sustainable throughput on this machine", not the same rate
+for every tool; use `--rates` for identical absolute rates.
+
+**Supported cases and unequal guarantees.**
+
+| Tool | probe | SV | SD operation | Notes |
+|---|---|---|---|---|
+| tickertape | writer + reader | yes | `Writer::checkpoint` (data, then the durable marker) | the only tool whose sync also publishes a durable position readers can use |
+| Chronicle Queue | writer + reader | yes | `ExcerptAppender.sync` with `SyncMode.SYNC` (`msync(MS_SYNC)` of the store) | not tested for power loss here; which index files it covers is Chronicle's choice |
+| Aeron IPC | writer + reader | yes | **unsupported** | IPC has no persistence; Archive is not implemented |
+| yaque | writer + reader | yes | **unsupported** | no sync operation; `try_send` only flushes its buffer to the OS |
+| queue-file | **writer only** | **writer only** | `QueueFile::sync_all` (`fsync`) | upstream forbids concurrent process access: achieved rate, late sends and sync latency only, no reader latency |
+| plain file | writer + reader | yes | `File::sync_data` (`fdatasync`) | no CRC, no recovery protocol |
+
+None of these sync operations is verified for power-loss durability by this suite, and their costs cover different
+amounts of data and metadata. `matrix.json` lists the unsupported cases of the selected matrix. Short-mode
+guarantee labels (`guarantees` in every result) still apply.
+
+**Outputs.** OUTDIR gets `matrix.json` (the parameters; `--resume` refuses different ones), `environment.txt` (and
+`environment-resume-<time>.txt` for every resumed session), `build.log`, `commands.txt` (every child command, labelled
+by run), `children.log` (child stderr and raw child JSON), `runs/<label>.json` (one result per run, written
+atomically when the run finishes), `skipped/<label>.json` (runs that could not fit on the disk, with the reason),
+`failures.jsonl`, `retries.jsonl` (runs discarded because the wall clock stepped backwards, at most three per run)
+and `results.jsonl` (all `runs/` results concatenated at the end; `runs/` is the source of truth). Labels are
+`<workload>-<tool>-<reader>-<payload>-<rate>-r<repeat>`, with rate `unpaced`, `f50` (50 % of the probe) or
+`r10000` (explicit).
+
+Each result has `writer` (`count`, `planned_count`, `achieved_records_per_s`, `late_records`, `max_late_us`,
+`stopped_by`, `periodic_sync`) and `reader_result` (the latency histogram as in W2; for the probe, `count` and
+`latency`; `null` for queue-file), plus `tool`, `tool_version`, `guarantees`, `workload`, `payload`, `reader`,
+`concurrent_reader`, `rate_tag`, `rate`, `count`, `warmup`, `duration_s`, `warmup_s`, `sync_every_ms`,
+`periodic_sync_operation`, `repeat`, `quick`, start and finish times, the data directory and free space before the run.
+
+**No hidden drops.** The runner rejects a run unless the paced writer sent every scheduled record, the reader received
+exactly the records written (minus the warmup in its histogram), the late count is in range, every percentile is
+finite and ordered, and an SD run synced at least once. A tool that cannot keep up shows it as late sends, latency
+and, for the probe, a lower rate.
+
+**Resume and interruptions.** Runs execute sequentially in a fixed order (probes first, then repeats with tools
+interleaved). A finished or skipped run is never repeated; a failed run is retried by the next `--resume`. SIGTERM
+and SIGHUP stop the current run and kill its process groups. Each measurement's data lives under a scratch directory
+owned by this OUTDIR (`$TMPDIR/tt-compare-sustained-<hash>`), which the next session removes, so a killed session
+leaves nothing behind that fills the disk. The runner calls `sync` after every run.
+
+**Disk use.** Long runs at high rates write a lot: 10 minutes at 1,000,000 records/s of 64 B is about 62 GB for
+tickertape. Before every run the runner predicts its data (records × a conservative per-record size) and skips it with
+the reason in `skipped/` if it exceeds 80 % of free space minus 1 GiB; the probe stops at that size
+(`stopped_by: count`). Use a volume larger than the expected data, or a shorter duration.
+
+**Estimated duration.** The runner prints `estimated_seconds` before starting and the remaining estimate before every
+run (schedule time plus a fixed allowance per run for process start, drain and `sync`). With all six tools, the
+default matrix has 92 runs: 12 probes and, per repeat and payload, 12 SV and 8 SD runs.
 
 ## Workloads and schema
 
