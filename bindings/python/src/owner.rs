@@ -63,8 +63,13 @@ impl Owner {
 
     /// True in a process other than the one that opened the handle (a child created by `fork`).
     pub fn is_foreign(&self) -> bool {
-        std::process::id() != self.pid()
-            || FORK_GENERATION.load(Ordering::Acquire) != self.generation
+        std::process::id() != self.pid() || self.fork_generation_changed()
+    }
+
+    /// True if a child has been forked from Python since the handle was opened and this is that child (or one of
+    /// its descendants): one atomic load, no system call. The check `settle` makes on the way out.
+    fn fork_generation_changed(&self) -> bool {
+        FORK_GENERATION.load(Ordering::Acquire) != self.generation
     }
 
     /// Raises `UsedAfterForkError` in a foreign process. Call before taking any lock or touching the journal.
@@ -89,6 +94,15 @@ impl Owner {
     /// What the interpreter does after the method returns (adding a traceback entry, storing the result, running a
     /// signal handler) is after the call.
     ///
+    /// The check on the way out compares the fork generation only (one atomic load), not the process id, which
+    /// would add a system call to every successful call. A fork during the call on the calling thread can only come
+    /// from Python code run inside the call, that is, through CPython's fork machinery, which runs the
+    /// `after_in_child` hook and so advances the generation. The full check (process id and generation) is made on
+    /// entry (`check`), where it also catches a child forked without CPython's hooks. The limit: a child forked
+    /// during a call by code that bypasses CPython's fork hooks (a direct `fork()` from C) is not detected on that
+    /// call's way out, only by the entry check of its next call (CPython requires such code to call
+    /// `PyOS_AfterFork_Child`, which runs the hooks).
+    ///
     /// `body` is a closure so that every `?` and `return` in a method passes through here; a source check in the
     /// tests below keeps every method of `Reader`, `ReaderIterator` and `Writer` that returns a `PyResult` in this
     /// form.
@@ -99,11 +113,22 @@ impl Owner {
         body: impl FnOnce() -> PyResult<T>,
     ) -> PyResult<T> {
         let result = body();
+        if result.is_err() || self.fork_generation_changed() {
+            return self.settle_slow(py, what, result);
+        }
+        result
+    }
+
+    /// `settle` for an exception or a child: kept out of line, so that the way out of a successful call is one
+    /// comparison and one atomic load.
+    #[cold]
+    #[inline(never)]
+    fn settle_slow<T>(&self, py: Python<'_>, what: &str, result: PyResult<T>) -> PyResult<T> {
         if let Err(error) = &result {
             // Builds the exception object now (a no-op if it exists): nothing is allocated for it after the check.
             error.value(py);
         }
-        if self.is_foreign() {
+        if self.fork_generation_changed() {
             // Released before the replacement is built, so that the replacement is built last.
             drop(result);
             return Err(errors::used_after_fork(what, self.pid(), std::process::id()).into_py(py));
@@ -157,6 +182,40 @@ mod tests {
             }
         }
         panic!("unbalanced {open}{close}")
+    }
+
+    /// The body of the function `name` in `file`.
+    fn function_body<'a>(file: &'a str, name: &str) -> &'a str {
+        let start = file
+            .find(&format!("fn {name}"))
+            .unwrap_or_else(|| panic!("no fn {name}"));
+        let open = start + file[start..].find('{').expect("a body") + 1;
+        &file[open..open + matching_brace(&file[open..])]
+    }
+
+    /// A successful call makes no system call on its way out: `settle` returns the result after comparing the fork
+    /// generation only (see `settle`). Only `settle_slow`, for an exception or in a child, may read the process id.
+    #[test]
+    fn exit_check_reads_no_process_id() {
+        let owner = include_str!("owner.rs");
+        let settle = function_body(owner, "settle<T>");
+        let expected = "let result = body();
+        if result.is_err() || self.fork_generation_changed() {
+            return self.settle_slow(py, what, result);
+        }
+        result";
+        assert_eq!(
+            settle.trim(),
+            expected,
+            "the success path of settle must be one comparison and the fork generation"
+        );
+        let generation = function_body(owner, "fork_generation_changed");
+        for forbidden in ["process::id", "is_foreign", ".pid()", ".check("] {
+            assert!(
+                !generation.contains(forbidden),
+                "fork_generation_changed must not use {forbidden}:\n{generation}"
+            );
+        }
     }
 
     /// Every method of a handle that returns a `PyResult` (constructors excepted: they have no owner yet) is one

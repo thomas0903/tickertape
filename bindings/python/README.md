@@ -111,7 +111,8 @@ NumPy, pyarrow and pandas are optional and imported only when these methods are 
   in between; `closed`, `position` and `repr` never wait at all. Reads from several threads share the one cursor:
   each record goes to exactly one of them, in order, and which one gets it is unspecified. A read that does not wait
   returns nothing only when no committed record is left, even if another thread took the records it had found.
-  Give each consumer its own reader.
+  Give each consumer its own reader. Changing the class of an argument (for example adding or removing its
+  `__iter__`) from another thread while a call is using that argument is not supported.
 - `close()` from another thread (or from a signal handler) ends a read that is waiting on that reader within about
   50 ms; the waiting call raises `ValueError`, also when its timeout has passed meanwhile.
 - Fork: a `Writer` or `Reader` belongs to the process that opened it. In a child created by `fork()` (including
@@ -131,9 +132,12 @@ NumPy, pyarrow and pandas are optional and imported only when these methods are 
   interpreter (an exception object is built before it): if Python code forks during a call (a signal handler, or a
   finalizer run by the garbage collector), the call raises `UsedAfterForkError` in the child, whatever it would have
   returned or raised. A fork that happens after that, while the interpreter delivers the result (stores it, adds a
-  traceback entry, or runs a signal handler), is after the call. Arguments are converted before a method runs, so an
-  invalid argument raises its `TypeError` (or `OverflowError`) in any process. Open handles in the child after it
-  starts, or use the `spawn` or `forkserver` start method.
+  traceback entry, or runs a signal handler), is after the call. That last check compares only the bindings' fork
+  count, which CPython's fork hooks advance (the full check, process id included, is made as each call starts): a
+  child forked during a call by C code that bypasses those hooks (a direct `fork()` that does not call
+  `PyOS_AfterFork_Child`, as CPython requires) is detected only when it next calls a method. Arguments are converted
+  before a method runs, so an invalid argument raises its `TypeError` (or `OverflowError`) in any process. Open
+  handles in the child after it starts, or use the `spawn` or `forkserver` start method.
 - Free-threaded Python: no free-threaded wheels are published (abi3 wheels cannot load there). Building from the
   sdist for 3.14t works and runs without the GIL, but it is not tested in CI.
 

@@ -468,6 +468,32 @@ def test_append_many_propagates_the_exception_of_a_metadata_objects_iter(journal
         assert w.next_seq == 0
 
 
+def test_append_many_looks_up_a_metadata_types_iter_once(journal: Path) -> None:
+    """A successful call does one `__iter__` lookup on the type of a metadata argument that is not a list or tuple
+    (and none for a list or tuple, which cannot be observed from Python: see `iterate` in `writer.rs`)."""
+    lookups: list[str] = []
+
+    class CountsLookups(type):
+        def __getattribute__(cls, name: str) -> Any:
+            if name == "__iter__":
+                lookups.append(name)
+            return super().__getattribute__(name)
+
+    class Values(metaclass=CountsLookups):
+        def __init__(self, *values: int) -> None:
+            self.values = values
+
+        def __iter__(self) -> Iterator[int]:
+            return iter(self.values)
+
+    with tt.Writer(journal) as w:
+        assert w.append_many([b"a", b"b"], schema_id=Values(1, 2), venue_ts_ns=[3, 4], local_ts_ns=(5, 6)) == range(2)
+        assert lookups == ["__iter__"]
+        lookups.clear()
+        w.append_many([b"c"], schema_id=Values(7), venue_ts_ns=Values(8), local_ts_ns=Values(9))
+        assert lookups == ["__iter__"] * 3
+
+
 def test_closed_writer_consumes_nothing(journal: Path) -> None:
     consumed: list[int] = []
 

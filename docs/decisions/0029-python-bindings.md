@@ -107,7 +107,9 @@ loop of `append_many`, the read loops of `read_many`/`read_batch`, `seek`, inspe
 `Reader` may be used from any thread: each holds its core object in a mutex, acquired without holding the GIL, so
 concurrent calls on one object serialize. The mutex is never held while Python code runs: exceptions, reports and
 records are converted to Python objects after it is released. `closed`, `Reader.position` and `repr` read atomics and
-never wait.
+never wait. Changing the class of an argument from another thread while a call is using that argument (on
+free-threaded Python, installing an `__iter__` on a metadata argument's class between the binding's lookup and
+`iter()`) is not supported.
 
 Waits run in slices of at most 50 ms, and a waiting read holds its reader's mutex only during a slice. Between slices it
 checks a closed flag and calls `PyErr_CheckSignals` with the mutex released, so Ctrl-C raises `KeyboardInterrupt` within
@@ -191,9 +193,18 @@ CPython 3.11 the collector runs inside allocations; PyO3 builds an exception cre
 method has returned). So every method of a handle that returns a result does so through one helper,
 `Owner::settle`: it takes the method's body as a closure (so every `?` and `return` passes through it), builds the
 exception object if there is one, and then checks the owner, replacing the result or exception with
-`UsedAfterForkError` in a child. The boundary is exact in this sense: the owner check is the last thing the binding
-does before it hands a result or an exception back to the interpreter, and a fork that happens after that, while the
-interpreter delivers the result (storing it, adding a traceback entry, running a signal handler), is after the call.
+`UsedAfterForkError` in a child. That exit check compares the fork generation only (one atomic load); the process id,
+a system call on Linux, is compared on entry only, so a successful call does not pay for it twice. A fork during the
+call on the calling thread can only come from Python code run inside it, through CPython's fork machinery, which runs
+the `after_in_child` hook and advances the generation; the entry check also catches a child forked without CPython's
+hooks. The limit: a child forked during a call by code that bypasses CPython's fork hooks (a direct `fork()` from C)
+is not detected on that call's exit, only by its next call's entry check (CPython requires such code to call
+`PyOS_AfterFork_Child`). Building a lazily created exception in `settle` releases and reacquires the GIL once (PyO3
+normalises it through its detach path); that happens only when a method raises (an exhausted iterator's
+`StopIteration` included), and the owner check follows it, so this is accepted. The boundary is exact in this sense:
+the owner check is the last thing the binding does before it hands a result or an exception back to the interpreter,
+and a fork that happens after that, while the interpreter delivers the result (storing it, adding a traceback entry,
+running a signal handler), is after the call.
 Arguments are converted by PyO3 before the method runs, so an invalid argument raises its conversion error in any
 process. A unit test checks the source of every such method for that form, and a test on 3.11 forks in a finalizer
 while the exception for a closed handle is built. Its descriptors, including the writer's lock file,

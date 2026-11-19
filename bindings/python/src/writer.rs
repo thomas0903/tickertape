@@ -6,6 +6,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError, TryLockError};
 
 use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::{PyTypeError, PyValueError};
+use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::pybacked::PyBackedBytes;
 use pyo3::sync::MutexExt;
@@ -134,9 +135,10 @@ impl<T: Copy + for<'a, 'py> FromPyObject<'a, 'py>> Column<T> {
 /// `iter(obj)` for a metadata argument. An exception raised by the object's own `__iter__` propagates unchanged (it
 /// may be `KeyboardInterrupt`); if the interpreter cannot iterate the object at all, a `TypeError` naming the argument.
 ///
-/// Which of the two happened is decided before `iter()` is called, from the type's MRO (`iter_slot`), because the
-/// object's `__iter__` may change its class before it raises. `iter()` decides as follows: if the type's iterator
-/// slot (`tp_iter`) is filled, it calls it; otherwise, if the object passes the sequence check (`PySequence_Check`: a
+/// A `list` or `tuple` (exactly those types) is iterated without any lookup: their iterators cannot fail to be made.
+/// For any other type, which of the two happened is decided before `iter()` is called, because the object's
+/// `__iter__` may change its class before it raises. `iter()` decides as follows: if the type's iterator slot
+/// (`tp_iter`) is filled, it calls it; otherwise, if the object passes the sequence check (`PySequence_Check`: a
 /// sequence item slot, as a class's `__getitem__` fills it but a C type's mapping-only `__getitem__`, such as
 /// `re.Match`'s, does not), it returns an index iterator; otherwise it refuses with `TypeError`. The interpreter fills
 /// `tp_iter` from an `__iter__` in the dictionaries of the type and its bases, and `__iter__ = None` fills it with a
@@ -144,8 +146,21 @@ impl<T: Copy + for<'a, 'py> FromPyObject<'a, 'py>> Column<T> {
 /// raises propagates. Without one, or with `__iter__ = None`, `iter()` runs no Python code of the object, and a
 /// `TypeError` it raises is the interpreter's refusal, replaced by the binding's; anything else (`MemoryError`)
 /// propagates.
+///
+/// The decision takes one attribute lookup on the type (`getattr(type(obj), "__iter__", None)`), which allocates
+/// nothing for an ordinary class. Only if that finds no `__iter__`, or `None`, are the dictionaries along the MRO read
+/// as well (`iter_slot`), because a metaclass can hide the name from the lookup while the slot still runs it; that
+/// happens for objects that are not iterable, where the call fails anyway.
 fn iterate<'py>(obj: &Bound<'py, PyAny>, name: &str) -> PyResult<Bound<'py, PyIterator>> {
-    if iter_slot(&obj.get_type())? == Some(true) {
+    if obj.is_exact_instance_of::<PyList>() || obj.is_exact_instance_of::<PyTuple>() {
+        return obj.try_iter();
+    }
+    let ty = obj.get_type();
+    let own_iter = match ty.getattr_opt(intern!(obj.py(), "__iter__"))? {
+        Some(iter) => !iter.is_none(),
+        None => false,
+    };
+    if own_iter || iter_slot(&ty)? == Some(true) {
         return obj.try_iter();
     }
     obj.try_iter().map_err(|error| {

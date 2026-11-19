@@ -1004,6 +1004,8 @@ impl Reader {
             let (delivered, oversized) = state.commit(epoch, count);
             self.position.store(state.position(), Ordering::Release);
             drop(guard);
+            // Nothing may be inserted between the commit above and this hook: the post-delivery test
+            // (`_returning_for_testing`) catches a signal check placed after the pause point, not one placed here.
             #[cfg(feature = "test-hooks")]
             if delivered {
                 self.returning.store(true, Ordering::SeqCst);
