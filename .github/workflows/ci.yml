@@ -187,6 +187,48 @@ jobs:
           cmake -S examples/c -B "$RUNNER_TEMP/examples"
           cmake --build "$RUNNER_TEMP/examples"
 
+  # The Java binding (ADR 0037) on JDK 25 against the library built here: JUnit tests (with the cross-language and
+  # released-format fixtures), then the natives JAR and an install test that runs the example from the built JARs.
+  # Nothing is published.
+  java:
+    name: java binding (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
+        with:
+          distribution: temurin
+          java-version: '25.0.5'
+          cache: maven
+      - name: Maven
+        run: command -v mvn || { sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends maven; }
+      - name: Build libtickertape, the CLI and the C test programs
+        run: echo "TT_NATIVE_DIR=$(bindings/java/scripts/build-native.sh)" >> "$GITHUB_ENV"
+      # On the module path with --illegal-native-access=deny; missing tools (CLI, C programs, Python) fail the run.
+      - name: Java tests
+        run: mvn -B -ntp -f bindings/java/pom.xml verify -Dtickertape.native.dir="$TT_NATIVE_DIR" -Dtickertape.test.requireTools=true
+      - name: Natives JAR
+        run: |
+          case "$RUNNER_OS-$RUNNER_ARCH" in
+            Linux-X64) platform=linux-x86_64 ;;
+            Linux-ARM64) platform=linux-aarch64 ;;
+            macOS-ARM64) platform=macos-aarch64 ;;
+            macOS-X64) platform=macos-x86_64 ;;
+            *) echo "unsupported runner: $RUNNER_OS-$RUNNER_ARCH" >&2; exit 1 ;;
+          esac
+          bindings/java/scripts/stage-natives.sh "$TT_NATIVE_DIR" "$platform"
+          mvn -B -ntp -f bindings/java/pom.xml -Pnatives package -DskipTests
+      - name: Install test from the built JARs
+        run: bindings/java/scripts/install-test.sh "$RUNNER_TEMP/java-install"
+
   msrv:
     name: msrv
     runs-on: ubuntu-latest
