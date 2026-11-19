@@ -944,23 +944,68 @@ impl Recovery<'_> {
             seq = scan.next_seq;
             match scan.end {
                 ScanEnd::Empty => {
-                    self.zero_uncommitted_tail(&mut seg, offset)?;
+                    let tail_end = format::nonzero_end(
+                        &RwView(&seg.map),
+                        offset + format::COMMIT_WORD_LEN as u64,
+                    );
                     if seq != seg.base && bases.contains(&seq) && !visited.contains(&seq) {
-                        // Crash between publishing the next segment and sealing this one.
-                        let next = match open_segment(self.dir, seq) {
-                            Ok(next) => next,
-                            Err(_) => break,
-                        };
-                        self.write_seal(&mut seg, offset, seq)?;
-                        self.report.actions.push(RecoveryAction::Sealed {
-                            segment: seg.path.clone(),
-                        });
-                        dirty.push(inherited(seg, seg_from, offset));
-                        seg = next;
-                        offset = format::SEGMENT_HEADER_LEN as u64;
-                        seg_from = offset;
-                        continue;
+                        if let Ok(next) = open_segment(self.dir, seq) {
+                            // The successor for exactly `seq` exists, is not this segment (at the first record slot
+                            // `seq` is this segment's own base), has not been visited, and opens and maps: `offset`
+                            // is where this segment's seal belongs, and the chain continues in the successor (ADR
+                            // 0035, "Damage around a seal"). A valid header alone is not enough: `open_segment`
+                            // must succeed.
+                            if tail_end.is_some_and(|end| end > offset + format::SEAL_LEN as u64) {
+                                // Bytes beyond the seal: no crash leaves them (a roll writes nothing after the seal,
+                                // and records `seq` onwards are in the successor), so this is a damaged seal, not
+                                // missing history, and later segments are not evidence. They are never records of
+                                // this segment either: those would repeat the successor's sequence numbers. Preserve
+                                // them as any repair does, then reseal and continue into the successor in this open.
+                                // This is exactly where an interrupted repair leaves the next open (the segment ends
+                                // at `offset`, followed by the same branch below), so an interruption at any point
+                                // gives the same journal. `Fail` refuses: the bytes are damage.
+                                if self.config.recovery == RecoveryPolicy::Fail {
+                                    return Err(Error::corrupt(
+                                        &seg.path,
+                                        offset,
+                                        CorruptReason::BadSeal,
+                                    ));
+                                }
+                                seg = self.repair_tail(seg, offset, CorruptReason::BadSeal)?;
+                            } else {
+                                // A crash between publishing the successor and sealing this segment (or the seal's
+                                // marker damaged): at most the seal's CRC word is left.
+                                self.zero_uncommitted_tail(&mut seg, offset, tail_end)?;
+                            }
+                            self.write_seal(&mut seg, offset, seq)?;
+                            self.report.actions.push(RecoveryAction::Sealed {
+                                segment: seg.path.clone(),
+                            });
+                            dirty.push(inherited(seg, seg_from, offset));
+                            seg = next;
+                            offset = format::SEGMENT_HEADER_LEN as u64;
+                            seg_from = offset;
+                            continue;
+                        }
                     }
+                    if let Some(reason) = tail_end.and_then(|end| {
+                        committed_after_empty(&seg, offset, seq, end, &bases, &visited)
+                    }) {
+                        // Evidence of committed history, or a search stopped at its work bound: a committed tail (ADR
+                        // 0035; usually storage damage, but a torn payload can lead here too, crash contract C1).
+                        if self.config.recovery == RecoveryPolicy::Fail {
+                            return Err(Error::corrupt(&seg.path, offset, reason));
+                        }
+                        seg = self.repair_tail(seg, offset, reason)?;
+                        break;
+                    }
+                    // The search completed without evidence: a torn append or the clean end, or damage that left no
+                    // evidence (ADR 0035, "What cannot be detected"). (A successor for exactly `seq` that does not
+                    // open, as before this change, ends the chain here: the bytes after `offset` are zeroed in place
+                    // without a copy even under `Fail`, then the successor is quarantined below, or refused as
+                    // disconnected under `Fail`. Known gap, ADR 0035: a later change will preserve them under
+                    // `Quarantine` and make `Fail` refuse before zeroing.)
+                    self.zero_uncommitted_tail(&mut seg, offset, tail_end)?;
                     break;
                 }
                 ScanEnd::Seal => {
@@ -1063,20 +1108,19 @@ impl Recovery<'_> {
         )
     }
 
-    /// Zeroes non-zero bytes after an uncommitted end at `offset` (commit word 0) and syncs them.
-    fn zero_uncommitted_tail(&mut self, seg: &mut Segment, offset: u64) -> Result<()> {
+    /// Zeroes non-zero bytes after an uncommitted end at `offset` (commit word 0), which end at `tail_end`
+    /// ([`format::nonzero_end`]), and syncs them.
+    fn zero_uncommitted_tail(
+        &mut self,
+        seg: &mut Segment,
+        offset: u64,
+        tail_end: Option<u64>,
+    ) -> Result<()> {
         let start = offset + format::COMMIT_WORD_LEN as u64;
-        if start >= seg.size {
-            return Ok(());
-        }
-        let last_nonzero = seg
-            .map
-            .bytes(start, seg.size - start)
-            .and_then(|tail| tail.iter().rposition(|&b| b != 0));
-        let Some(last) = last_nonzero else {
+        let Some(end) = tail_end.filter(|&end| end > start) else {
             return Ok(());
         };
-        let len = last as u64 + 1;
+        let len = end - start;
         seg.map
             .bytes_mut(start, len)
             .ok_or_else(|| Error::io("zero tail", &seg.path, io::Error::other("out of bounds")))?
@@ -1164,7 +1208,7 @@ impl Recovery<'_> {
         Ok(fin)
     }
 
-    /// Repairs a corrupt committed tail by replacement (`docs/format.md` → Recovery, step 4).
+    /// Repairs a corrupt tail by replacement (`docs/format.md` → Recovery, step 4, last row).
     fn repair_tail(&mut self, seg: Segment, offset: u64, reason: CorruptReason) -> Result<Segment> {
         let quarantine_file = self.preserve_bytes(&seg, offset)?;
         let tmp = journal::tmp_path(self.dir, seg.base);
@@ -1187,8 +1231,12 @@ impl Recovery<'_> {
         file.write_all_at(prefix, 0)
             .map_err(|e| Error::io("write repaired segment", &tmp, e))?;
         mmap::sync_data(&file).map_err(|e| Error::io("sync repaired segment", &tmp, e))?;
+        crate::fault::inject(crate::fault::Point::RepairBeforeRename)
+            .map_err(|e| Error::io("replace segment", &seg.path, e))?;
         fs::rename(&tmp, &seg.path).map_err(|e| Error::io("replace segment", &seg.path, e))?;
         journal::sync_dir(self.dir)?;
+        crate::fault::inject(crate::fault::Point::RepairAfterRename)
+            .map_err(|e| Error::io("sync directory", self.dir, e))?;
         mmap::full_barrier(&file)
             .map_err(|e| Error::io("full sync repaired segment", &seg.path, e))?;
         self.report.actions.push(RecoveryAction::RepairedTail {
@@ -1232,6 +1280,40 @@ impl Recovery<'_> {
     }
 }
 
+/// Committed history after an empty slot at `offset` of `seg`, where a scan expecting `seq` stopped and whose
+/// non-zero bytes end at `tail_end` (ADR 0035): a later record or final seal in the segment that validates with a
+/// sequence number its position allows, or a segment with a larger base than `seq`, which a process crash leaves
+/// only after record `seq` was committed. Returns how to report it: [`CorruptReason::EmptyCommitWord`] with the sequence number the
+/// evidence carries (a record's, a seal's next sequence number, or a segment's base), or
+/// [`CorruptReason::UncheckedTail`] when the search in the segment stopped at its work bound. After a process crash
+/// none of these is usually present; the exception is a torn payload whose bytes form a candidate (crash contract C1).
+/// A segment with a larger base counts only when the caller found non-zero bytes after the commit word (`tail_end`),
+/// and not in the case below.
+///
+/// The caller has already handled a successor for exactly `seq` that opens (a seal belongs at `offset`). A later
+/// segment is still not evidence when that successor exists but does not open and the non-zero bytes end within a
+/// seal at `offset`: unchanged from before, the chain then ends at `offset`.
+fn committed_after_empty(
+    seg: &Segment,
+    offset: u64,
+    seq: u64,
+    tail_end: u64,
+    bases: &BTreeSet<u64>,
+    visited: &BTreeSet<u64>,
+) -> Option<CorruptReason> {
+    if let Some(found) = format::find_history_before(&RwView(&seg.map), offset, seq, tail_end) {
+        return Some(found.reason());
+    }
+    let successor_pending = seq != seg.base && bases.contains(&seq) && !visited.contains(&seq);
+    if successor_pending && tail_end <= offset + format::SEAL_LEN as u64 {
+        return None;
+    }
+    bases
+        .range(seq.checked_add(1)?..)
+        .next()
+        .map(|&base| CorruptReason::EmptyCommitWord(base))
+}
+
 /// A segment inherited from an earlier writer: the next checkpoint syncs its whole file. `[from, seal_at)` holds the
 /// records an earlier writer appended after the marker, followed by the seal at `seal_at`; the range only feeds
 /// [`Writer::metrics`] (`uncheckpointed_bytes`).
@@ -1265,7 +1347,11 @@ pub struct RecoveryReport {
 pub enum RecoveryAction {
     /// The journal didn't exist and was created.
     Created,
-    /// Uncommitted bytes after the last record (a record being written when the previous writer died) were zeroed.
+    /// Non-zero bytes after an empty commit word were zeroed in place, without a copy (`docs/crash-contract.md`, C8
+    /// and C11). This describes the action taken on the evidence recovery found, not what readers saw: after a
+    /// process crash in an otherwise intact journal the bytes are an unpublished record body (or what is left of one)
+    /// or the CRC word of a seal recovery is about to write, which no reader saw, but after storage damage that left no evidence they can be
+    /// published records a reader has already returned (C11 (3)).
     ZeroedUncommitted {
         /// The segment.
         segment: PathBuf,
@@ -1274,8 +1360,13 @@ pub enum RecoveryAction {
         /// Number of bytes zeroed.
         len: u64,
     },
-    /// A corrupt committed tail was copied to `quarantine`, and the segment was replaced by a copy with the tail
-    /// zeroed (never edited in place).
+    /// A corrupt tail was copied to `quarantine` (from `offset` to the segment's last non-zero byte), and the segment
+    /// was replaced by a copy with the tail zeroed (never edited in place). The tail starts at an invalid record or
+    /// seal; at an empty commit word with evidence of committed history after it, or after which the search stopped
+    /// at its work bound ([`CorruptReason::EmptyCommitWord`](crate::CorruptReason::EmptyCommitWord),
+    /// [`CorruptReason::UncheckedTail`](crate::CorruptReason::UncheckedTail)); or at the place of a seal with damage
+    /// beyond it ([`CorruptReason::BadSeal`](crate::CorruptReason::BadSeal); `docs/crash-contract.md`, C11). What
+    /// followed `offset` leaves the segment; the quarantine file keeps its bytes up to the last non-zero one.
     RepairedTail {
         /// The segment.
         segment: PathBuf,

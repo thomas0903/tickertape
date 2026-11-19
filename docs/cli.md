@@ -35,8 +35,17 @@ Errors and recovery warnings go to stderr. JSON results go to stdout (or the sel
   Missing/invalid checkpoint slots yield `none` in text or `null` in JSON; a checkpoint I/O error fails the command.
 - `verify <DIR> [--json]`: checksum scan and chain validation, totals and every problem. Both inspect and verify
   return 2 when the scan reports problems. On a live journal the scan describes observations during the scan,
-  not an atomic snapshot; states a running writer passes through are scanned again for up to 630 ms before they
-  are reported (see `operations.md` → Checking a journal).
+  not an atomic snapshot; states a running writer passes through are scanned again after pauses that add up to
+  630 ms (plus the time of the scans) before they are reported, and records the writer commits while `verify` looks
+  behind an empty commit word are followed, not reported (see `operations.md` → Checking a journal). Where a
+  segment's records end at an empty commit word (the newest segment, or an older one that is damaged or whose roll
+  was interrupted, which it first scans again with the same pauses in case a rolling writer is about to seal it),
+  it searches the rest of the segment for committed records hidden behind that word (`EmptyCommitWord`, or
+  `UncheckedTail`, ADR 0035; an older segment with nothing found there is reported as `BrokenChain`): it reads
+  backward from the segment's end to find the last non-zero byte, then checks the candidates up to it, and can stop
+  early at the first evidence or at its work budget. It used to stop at the end of the records. On an empty 128 MiB segment this took
+  21 ms instead of 9 ms (warm page cache, Apple M4 Pro); with a cold cache or slow storage it costs reading the
+  unwritten rest of the newest segment. `inspect` runs the same scan.
 - `export <DIR> --format jsonl|parquet [--output <FILE>|-] [--from <SEQ>] [--to <SEQ>]
   [--decode market-demo] [--durable-only]`: writes records from the
   inclusive range; JSONL defaults to stdout and `--output -` also selects stdout for JSONL. The output file is created or

@@ -138,8 +138,8 @@ impl Reader {
     ///
     /// What follows holds for an intact publication chain, where every commit word the reader follows is one a
     /// writer published. A tickertape writer then never modifies committed bytes, including during crash recovery,
-    /// which in place only zeroes the bytes after the first empty slot (never committed, on an intact chain) and
-    /// writes a seal there, and otherwise replaces or moves whole files (`docs/format.md` → Recovery). A returned
+    /// which in place only zeroes bytes after an empty slot (never committed, on an intact chain) and writes a seal
+    /// there, and otherwise replaces or moves whole files (`docs/format.md` → Recovery). A returned
     /// payload is the bytes that were validated only because nothing modifies them afterwards.
     ///
     /// Known limitation: a commit word damaged on storage breaks the chain, and then a mapped load can touch bytes a
@@ -149,10 +149,13 @@ impl Reader {
     ///
     /// - The length in an earlier record's commit word is enlarged while no writer runs, and a writer then appends
     ///   after that record: validating it loads bytes the writer is storing.
-    /// - The commit word of a published record not yet covered by a checkpoint is zeroed: the next writer's
-    ///   recovery takes that slot for the end of the journal and zeroes that record and the published records
-    ///   after it in place, under a live zero-copy reader. A payload the caller still holds then changes, and the
-    ///   reader's later loads meet the new writer's stores.
+    /// - The commit word of a published record not yet covered by a checkpoint is zeroed, and the next writer's
+    ///   recovery cannot tell that from a torn append (damage after which nothing validates, such as the newest
+    ///   record's commit word zeroed; `docs/crash-contract.md`, C11 (3), has the cases). It then takes the slot for
+    ///   the end of the journal and zeroes that record and the published records after it in place, under a live
+    ///   zero-copy reader. A payload the caller still holds then changes, and the reader's later loads meet the new
+    ///   writer's stores. (When recovery finds evidence of the records, it usually replaces the segment by a new
+    ///   file instead, and mappings of the old file do not change. ADR 0035.)
     ///
     /// That such loads return some mixture of old and new bytes, which the CRC then rejects, is an assumption about
     /// the implementation on the supported targets, not a guarantee. Earlier releases had the same exposure.
@@ -241,7 +244,8 @@ impl Reader {
     /// durable-only reader applies a marker that moves past its cursor only after confirming that its segment is still
     /// in place; if recovery replaced it or retention removed it, the reader returns [`Error::Discarded`] then, instead
     /// of reading on in the file it has open (ADR 0034). If it is in place, the reader reads the records the marker
-    /// newly covers from the file's current bytes, so records that recovery removed in place are never returned.
+    /// newly covers from the file's current bytes, so records that recovery removed in place are never returned
+    /// (crash contract C13 states the exception: damage that also destroys the checkpoint marker).
     /// A visible reader can't notice such an in-place repair (storage damage that emptied a commit word; crash
     /// contract C11): it may return records it had already read, then continue in the new history, wait, or report
     /// corruption at a position that no longer starts a record; [`Reader::seek`] to its position puts it back on the

@@ -137,7 +137,9 @@ The full statement, per platform and with the test for each claim, is [`docs/cra
   Readers that must not act on such records can use `ReaderConfig::durable_only(true)` (CLI: `--durable-only`),
   which only returns records covered by a checkpoint.
 - **Corruption is detected, never silently returned.** Every record is checked (length, CRC32C, sequence). Recovery
-  preserves anything it removes in `quarantine/` and never edits bytes in place.
+  repairs a corrupt tail by replacing its segment and moves disconnected segments aside, preserving both in
+  `quarantine/`. Some bytes after the last record are zeroed in place without a copy: usually a torn append that no
+  reader saw, but also damage that recovery cannot tell from one. See the crash contract, C8 and C11.
 - **Readers.** `Reader::open` reads with `pread` and is memory-safe whatever other processes do. Zero-copy
   `Reader::open_mapped` is `unsafe`: it requires that only a tickertape writer modifies the files.
 - **Known limits.** A full btrfs volume can crash the writer with `SIGBUS` even inside preallocated segments; a
