@@ -22,9 +22,21 @@ CRATES = ("tickertape", "tickertape-cli")
 TARGETS = (
     "x86_64-unknown-linux-gnu",
     "aarch64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
     "x86_64-apple-darwin",
     "aarch64-apple-darwin",
 )
+# cargo-binstall and Homebrew install the static musl archive on every Linux machine: it needs no particular glibc.
+LINUX_INSTALL_TARGETS = {
+    "x86_64-unknown-linux-gnu": "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-gnu": "aarch64-unknown-linux-musl",
+}
+
+
+def archive_stem(tag, target):
+    """The archive's file name without `.tar.gz`, which is also its single top-level directory."""
+    return f"tickertape-{tag}-{target}"
 
 
 def run(*args, cwd=None):
@@ -85,6 +97,53 @@ def release_notes(changelog, version):
             "[CLI binary installation](https://github.com/thomas0903/tickertape/blob/main/docs/install.md)\n")
 
 
+BINSTALL_SUFFIXES = {"tgz": ".tar.gz", "tar.gz": ".tar.gz"}
+
+
+def render_binstall(template, values):
+    """Render a cargo-binstall template; unknown placeholders are errors, not empty strings."""
+    def replace(match):
+        key = match.group(1)
+        if key not in values:
+            raise ValueError(f"unsupported cargo-binstall placeholder {{ {key} }}")
+        return values[key]
+    return re.sub(r"\{\s*([a-z-]+)\s*\}", replace, template)
+
+
+def binstall_metadata(source):
+    """Return the CLI crate's `[package.metadata.binstall]` table, or None for tags from before it existed."""
+    with (source / "crates" / "tickertape-cli" / "Cargo.toml").open("rb") as file:
+        package = tomllib.load(file)["package"]
+    return package.get("metadata", {}).get("binstall")
+
+
+def check_binstall(source, tag):
+    """Check that cargo-binstall resolves every release target to an archive this script packages.
+
+    Returns False when the tag has no metadata (older releases), True when it matches, and raises otherwise."""
+    metadata = binstall_metadata(source)
+    if metadata is None:
+        return False
+    with (source / "Cargo.toml").open("rb") as file:
+        repo = tomllib.load(file)["workspace"]["package"]["repository"]
+    version = version_for_tag(tag)
+    for target in TARGETS:
+        settings = {key: value for key, value in metadata.items() if key != "overrides"}
+        settings.update(metadata.get("overrides", {}).get(target, {}))
+        suffix = BINSTALL_SUFFIXES.get(settings.get("pkg-fmt"))
+        if suffix is None or "pkg-url" not in settings or "bin-dir" not in settings:
+            raise ValueError(f"cargo-binstall metadata for {target} needs pkg-url, bin-dir and pkg-fmt = \"tgz\"")
+        values = {"name": "tickertape-cli", "version": version, "target": target, "repo": repo,
+                  "bin": "tickertape", "binary-ext": "", "archive-suffix": suffix, "archive-format": "tgz"}
+        archive = archive_stem(tag, LINUX_INSTALL_TARGETS.get(target, target))
+        expected_url = f"{repo}/releases/download/{tag}/{archive}.tar.gz"
+        if render_binstall(settings["pkg-url"], values) != expected_url:
+            raise ValueError(f"cargo-binstall pkg-url for {target} does not resolve to {expected_url}")
+        if render_binstall(settings["bin-dir"], values) != f"{archive}/tickertape":
+            raise ValueError(f"cargo-binstall bin-dir for {target} does not resolve to {archive}/tickertape")
+    return True
+
+
 def prepare(args):
     source = args.source.resolve()
     version = version_for_tag(args.tag)
@@ -96,8 +155,9 @@ def prepare(args):
     repo = os.environ["GITHUB_REPOSITORY"]
     runs = gh_json("api", f"repos/{repo}/actions/workflows/ci.yml/runs?head_sha={sha}&per_page=100")
     require_green_ci(runs["workflow_runs"], sha)
+    binstall = check_binstall(source, args.tag)
     args.notes.write_text(release_notes((source / "CHANGELOG.md").read_text(), version))
-    outputs = {"tag": args.tag, "version": version, "sha": sha}
+    outputs = {"tag": args.tag, "version": version, "sha": sha, "binstall": str(binstall).lower()}
     with Path(os.environ["GITHUB_OUTPUT"]).open("a") as file:
         for key, value in outputs.items():
             file.write(f"{key}={value}\n")
@@ -138,11 +198,19 @@ def publish(args):
         subprocess.run(["cargo", "publish", "--locked", "-p", name], cwd=args.source, check=True)
 
 
+def requirement(target):
+    if target.endswith("-linux-musl"):
+        return "This Linux binary is statically linked with musl and needs no C library on the system."
+    if target.endswith("-linux-gnu"):
+        return "This Linux binary requires glibc 2.35 or later."
+    return "This macOS binary requires macOS 11 or later. It is unsigned and is not notarized."
+
+
 def package(args):
     version = version_for_tag(args.tag)
     if args.target not in TARGETS:
         raise ValueError("unsupported release target")
-    name = f"tickertape-{args.tag}-{args.target}"
+    name = archive_stem(args.tag, args.target)
     binary = args.source / "target" / args.target / "release/tickertape"
     files = [("tickertape", binary.read_bytes(), 0o755)]
     for filename in ("LICENSE-MIT", "LICENSE-APACHE"):
@@ -150,8 +218,7 @@ def package(args):
     readme = (f"tickertape {version} CLI for {args.target}\n\n"
               "Run ./tickertape --help, or copy tickertape to a directory on your PATH.\n"
               "Verify the archive against SHA256SUMS from the same GitHub release.\n"
-              "Linux binaries require glibc 2.35 or later. macOS binaries require macOS 11 or later.\n"
-              "The macOS archives are unsigned and are not notarized.\n\n"
+              f"{requirement(args.target)}\n\n"
               "Installation: https://github.com/thomas0903/tickertape/blob/main/docs/install.md\n"
               "Crash contract: https://github.com/thomas0903/tickertape/blob/main/docs/crash-contract.md\n")
     files.append(("README.txt", readme.encode(), 0o644))
@@ -168,15 +235,48 @@ def package(args):
     print(destination)
 
 
+def sbom(args):
+    """Write a CycloneDX SBOM of the CLI's locked dependency graph for one target, next to its archive.
+
+    The output is reproducible: cargo-cyclonedx takes its timestamp from SOURCE_DATE_EPOCH (the commit time), and
+    the checkout's absolute path is replaced so that reruns on any runner produce the same bytes."""
+    version_for_tag(args.tag)
+    if args.target not in TARGETS:
+        raise ValueError("unsupported release target")
+    source = args.source.resolve()
+    epoch = run("git", "show", "-s", "--format=%ct", "HEAD", cwd=source)
+    subprocess.run(["cargo", "cyclonedx", "--manifest-path", "crates/tickertape-cli/Cargo.toml",
+                    "--format", "json", "--spec-version", "1.5", "--describe", "binaries",
+                    "--target", args.target], cwd=source, check=True,
+                   env={**os.environ, "SOURCE_DATE_EPOCH": epoch})
+    generated = source / "crates" / "tickertape-cli" / "tickertape_bin.cdx.json"
+    document = generated.read_text().replace(f"file://{source}", "file://.")
+    if json.loads(document)["metadata"]["component"]["name"] != "tickertape":
+        raise ValueError("the SBOM does not describe the tickertape binary")
+    args.output.mkdir(parents=True, exist_ok=True)
+    destination = args.output / f"{archive_stem(args.tag, args.target)}.cdx.json"
+    destination.write_text(document)
+    print(destination)
+
+
+def release_files(tag):
+    """Every file the GitHub release carries besides SHA256SUMS: an archive and its SBOM per target."""
+    return {f"{archive_stem(tag, target)}{suffix}" for target in TARGETS for suffix in (".tar.gz", ".cdx.json")}
+
+
+def checksums_extend(existing, new):
+    """A release's SHA256SUMS may only gain lines (binaries added to an older release), never change or lose one."""
+    return set(existing.splitlines()) <= set(new.splitlines())
+
+
 def github_release(args):
     repo = os.environ["GITHUB_REPOSITORY"]
-    archives = sorted(args.artifacts.glob("*.tar.gz"))
-    expected = {f"tickertape-{args.tag}-{target}.tar.gz" for target in TARGETS}
-    if {path.name for path in archives} != expected:
-        raise ValueError("expected exactly one CLI archive for each release target")
+    files = sorted([*args.artifacts.glob("*.tar.gz"), *args.artifacts.glob("*.cdx.json")])
+    if {path.name for path in files} != release_files(args.tag):
+        raise ValueError("expected exactly one CLI archive and one SBOM for each release target")
     checksums = args.artifacts / "SHA256SUMS"
     checksums.write_text("".join(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}\n"
-                                 for path in archives))
+                                 for path in files))
     # List instead of treating every `release view` failure as a missing release.
     releases = gh_json("api", f"repos/{repo}/releases?per_page=100", "--paginate", "--slurp")
     existing = next((release for page in releases for release in page
@@ -189,15 +289,25 @@ def github_release(args):
                         "--notes-file", str(args.notes)], check=True)
         existing = gh_json("api", f"repos/{repo}/releases/tags/{args.tag}")
     asset_names = {asset["name"] for asset in existing["assets"]}
-    for path in [*archives, checksums]:
-        if path.name in asset_names:
-            with tempfile.TemporaryDirectory() as temporary:
-                subprocess.run(["gh", "release", "download", args.tag, "--repo", repo,
-                                "--pattern", path.name, "--dir", temporary], check=True)
-                if Path(temporary, path.name).read_bytes() != path.read_bytes():
-                    raise ValueError(f"existing asset {path.name} differs; refusing to overwrite it")
+    # Compare every existing asset before uploading anything, so that a refused run leaves the release unchanged.
+    uploads = []
+    for path in [*files, checksums]:
+        if path.name not in asset_names:
+            uploads.append([str(path)])
             continue
-        subprocess.run(["gh", "release", "upload", args.tag, str(path), "--repo", repo], check=True)
+        with tempfile.TemporaryDirectory() as temporary:
+            subprocess.run(["gh", "release", "download", args.tag, "--repo", repo,
+                            "--pattern", path.name, "--dir", temporary], check=True)
+            existing_bytes = Path(temporary, path.name).read_bytes()
+        if existing_bytes == path.read_bytes():
+            continue
+        if path == checksums and checksums_extend(existing_bytes.decode(), path.read_text()):
+            uploads.append([str(path), "--clobber"])
+            continue
+        raise ValueError(f"existing asset {path.name} differs; refusing to overwrite it")
+    # SHA256SUMS comes last, after every file it lists.
+    for upload in uploads:
+        subprocess.run(["gh", "release", "upload", args.tag, *upload, "--repo", repo], check=True)
     if existing["draft"]:
         subprocess.run(["gh", "release", "edit", args.tag, "--repo", repo,
                         "--draft=false", "--latest"], check=True)
@@ -248,6 +358,18 @@ def main():
     command.add_argument("--target", required=True)
     command.add_argument("--output", type=Path, required=True)
     command.set_defaults(function=package)
+    command = commands.add_parser("sbom")
+    command.add_argument("--source", type=Path, required=True)
+    command.add_argument("--tag", required=True)
+    command.add_argument("--target", required=True)
+    command.add_argument("--output", type=Path, required=True)
+    command.set_defaults(function=sbom)
+    command = commands.add_parser("check-binstall")
+    command.add_argument("--source", type=Path, required=True)
+    command.add_argument("--tag", required=True)
+    command.set_defaults(function=lambda args: print(
+        "cargo-binstall metadata matches the release archives" if check_binstall(args.source, args.tag)
+        else "no cargo-binstall metadata"))
     command = commands.add_parser("github-release")
     command.add_argument("--tag", required=True)
     command.add_argument("--artifacts", type=Path, required=True)
