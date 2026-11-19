@@ -207,9 +207,10 @@ pub enum CorruptReason {
     /// checksums that would need checking) that the search for committed history stopped at its work bound before it
     /// could decide (`docs/format.md` → Recovery, ADR 0035). Inconclusive, unlike
     /// [`EmptyCommitWord`](Self::EmptyCommitWord): no record was proven valid. Recovery still treats the tail as
-    /// committed history (preserved, or refused with `RecoveryPolicy::Fail`), because a torn append never leaves
-    /// more than one record header. The number is the sequence number in the header of the slot where the search
-    /// stopped (for a final seal, the expected sequence number plus one).
+    /// committed history (preserved, or refused with `RecoveryPolicy::Fail`). Storage damage leaves this, and so
+    /// does a writer process crash while filling a payload that holds such headers (ADR 0035). The number is the
+    /// sequence number in the header of the slot where the search stopped (for a final seal, the expected sequence
+    /// number plus one).
     #[error(
         "commit word is 0 and the bytes after it were too costly to check completely (sequence {0}); treated as committed history"
     )]

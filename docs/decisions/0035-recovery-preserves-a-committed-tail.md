@@ -103,8 +103,9 @@ was not completely written or its payload ends in more than 63 zero bytes (above
 crash** (`Fail`). No rule on these bytes can remove this: a torn payload holding such frames is byte for byte the same
 as committed records behind a damaged commit word. Nothing is lost either way, so it stays on the conservative side,
 and the exception is stated where the contract promises that a crash needs no human (C1, C2, the `RecoveryPolicy`
-rustdoc, `operations.md`). An operator whose `Fail` writer refuses with `EmptyCommitWord` after a known process crash
-checks the frame at the reported offset: if it has the expected sequence number and the frames after it lie inside
+rustdoc, `operations.md`). The same holds for a torn payload of header-shaped bytes that
+exhausts the work budget (`UncheckedTail`; "Work bound" below). An operator whose `Fail` writer refuses with
+`EmptyCommitWord` or `UncheckedTail` after a known process crash checks the frame at the reported offset: if it has the expected sequence number and the frames after it lie inside
 its payload, it is a torn append, and opening once with `Quarantine` preserves those bytes and continues
 (`tests/committed_tail.rs::payload_holding_another_journals_frames`, `::payload_ending_in_a_seal_for_the_next_record`; `tests/recovery.rs::panic_in_fill_then_shorter_append`
 builds one from this journal's own frames, but panics instead of being killed, so its bytes are zeroed before recovery
@@ -120,15 +121,18 @@ loss) zeroes whole blocks, headers included, and the first intact record after t
 **Work bound.** One backward pass over `[P+4, Z)` to find its last non-zero byte (recovery already made this pass to
 zero the tail); at each 8-byte position up to that byte, a commit-word load and, if the length is in range, a 16-byte
 header read; CRC32C for candidates whose header passes, at most twice the length `Z - P` in total (beyond that the
-search stops and reports the tail as committed history, which only bytes made of this journal's own record headers
-can cause); for a final seal at most 128 CRCs of 12 bytes, counted in the same bound (which is raised by those
+search stops and reports the tail as committed history, which only header-shaped bytes can cause: lengths in range,
+a sequence number in the window and zero flags at several positions, as damage or a torn payload can leave them); for a final seal at most 128 CRCs of 12 bytes, counted in the same bound (which is raised by those
 1,536 bytes); and at the first candidate, once, CRC32C over
 the frame at `P` up to the last non-zero byte and up to the candidate (at most twice `Z - P` more) plus 72 shifts. It
 runs once per recovery, at the one empty slot where the scan stops, and in `verify`. When the bound stops the search
-before a candidate is decided, nothing was proven: the tail is still treated as committed history (only this
-journal's own record headers can cause it, and a torn append leaves one header at most), but it is reported as
+before a candidate is decided, nothing was proven: the tail is still treated as committed history, but it is reported as
 `CorruptReason::UncheckedTail(seq)`, not `EmptyCommitWord`, with the sequence number in the header where the search
-stopped. Memory is bounded too: `verify` reads with `pread` into a 1 MiB window, and every read, including the CRC32C
+stopped. A plain process crash can cause it: a writer killed while filling a payload that holds several such
+header-shaped byte sequences (copies of this journal's record headers, for example) leaves overlapping length claims
+that exhaust the budget although every candidate CRC fails and the torn record's own CRC was never written. That is
+part of the process-crash exception above: `Quarantine` preserves the bytes, `Fail` refuses with `UncheckedTail`
+(`tests/committed_tail.rs::torn_payload_of_header_shaped_bytes_is_unchecked`). Memory is bounded too: `verify` reads with `pread` into a 1 MiB window, and every read, including the CRC32C
 of a candidate or a scanned record with a large length, goes in pieces of at most that size, so a damaged length never
 allocates more (review round 2); the writer reads its own mapping and is unchanged.
 
@@ -272,7 +276,9 @@ header (next sequence 117), because what remains after the empty word no longer 
 (`::damage_that_leaves_nothing_valid_after_it_cannot_be_detected`). A zero-copy reader holding any of those records
 sees its bytes change, but only after something other than a tickertape writer changed the file, which
 `open_mapped`'s precondition already excludes. Damage that zeroes a commit word and everything after it leaves
-nothing to find or preserve.
+nothing to find or preserve. A final seal counts only for one of the next 128 sequence numbers, so damage that
+leaves a valid final seal further away is zeroed the same way when no later segment is left either (the successor
+lost too).
 
 ## Cost
 
@@ -312,7 +318,8 @@ time it takes to read the tail. A repair costs writing the quarantine copy and t
   that wrote pages back out of order, records after the checkpoint are preserved in `quarantine/` (or the open is
   refused) instead of zeroed; C8 allowed losing them either way.
 - `Fail` can refuse after a plain process crash in one case: a torn payload holding frames, or ending with a seal,
-  in the window (above). C1, C2, the `RecoveryPolicy` rustdoc and `operations.md` state it, with what an operator
+  in the window (`EmptyCommitWord`), or holding enough header-shaped bytes to exhaust the work budget
+  (`UncheckedTail`) (above). C1, C2, the `RecoveryPolicy` rustdoc and `operations.md` state it, with what an operator
   does.
 - What `Fail` does not promise: it never changes the bytes of the corruption it refuses, nor anything after it, but
   open still records its PID in the lock file and removes stale temporary names (`*.tape.tmp`, the prepared spare)

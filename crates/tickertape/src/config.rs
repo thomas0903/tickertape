@@ -10,8 +10,12 @@ use std::time::Duration;
 /// only power loss, storage errors or outside modification do. The exception: a crash while a payload was being
 /// written that contains an 8-byte-aligned, checksum-valid record frame whose sequence number falls in the window
 /// recovery checks (for example raw frames copied from another journal), or that ends with a valid seal for such a
-/// sequence number, when the payload was not completely written (or ends in more than 63 zero bytes). Recovery cannot tell those bytes from committed records behind a damaged commit word and reports
-/// [`CorruptReason::EmptyCommitWord`](crate::CorruptReason::EmptyCommitWord); nothing is lost (ADR 0035). Uncommitted
+/// sequence number, when the payload was not completely written (or ends in more than 63 zero bytes). Recovery
+/// cannot tell those bytes from committed records behind a damaged commit word and reports
+/// [`CorruptReason::EmptyCommitWord`](crate::CorruptReason::EmptyCommitWord). The same holds for a payload holding
+/// several header-shaped byte sequences (copies of this journal's record headers, for example) whose length claims
+/// exhaust the search's work budget although every candidate checksum fails: reported as
+/// [`CorruptReason::UncheckedTail`](crate::CorruptReason::UncheckedTail). Nothing is lost (ADR 0035). Uncommitted
 /// partial records, with nothing committed after them, are always cleaned up, whatever the policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
@@ -31,11 +35,12 @@ pub enum RecoveryPolicy {
     /// last record, writing a missing seal (which can be the seal in front of a corrupt successor), and creating a
     /// missing successor segment (`docs/format.md` → Recovery). Opening also records the PID in the lock file.
     ///
-    /// After a plain process crash this refuses only in the exception above (`EmptyCommitWord` at the start of the
-    /// record being written, whose payload holds the frames that count as evidence). To continue, check the frame at
-    /// the reported offset: if its sequence number is the expected one and the frames after it lie inside its
-    /// payload, open once with [`RecoveryPolicy::Quarantine`], which preserves those bytes in `quarantine/` and
-    /// continues after the last committed record (`docs/operations.md` → After a crash).
+    /// After a plain process crash this refuses only in the exception above (`EmptyCommitWord` or `UncheckedTail` at
+    /// the start of the record being written, whose payload holds the frames or headers that count as evidence). To
+    /// continue, check the frame at the reported offset: if its sequence number is the expected one and the frames
+    /// or headers after it lie inside its payload, open once with [`RecoveryPolicy::Quarantine`], which preserves
+    /// those bytes in `quarantine/` and continues after the last committed record (`docs/operations.md` → After a
+    /// crash).
     Fail,
 }
 

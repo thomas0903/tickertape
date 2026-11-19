@@ -234,8 +234,9 @@ Readers never modify a journal. Only the writer repairs it, on open, after takin
    `P`, and does not also match for a length `L'` with `P + align8(L')` at the first candidate. A writer process crash
    never leaves committed history, with one exception: a payload that holds an 8-byte-aligned, CRC-valid frame whose
    sequence number falls in the window of (a), or ends with a valid seal as in (b), when the crash interrupted it
-   before the body was complete (or the payload ends in more than 63 zero bytes). No rule can tell those bytes from damage; they are preserved (or `Fail`
-   refuses) and nothing is lost. Otherwise the bytes of a torn append lie inside the one frame being written, and a
+   before the body was complete (or the payload ends in more than 63 zero bytes), or holds enough header-shaped
+   bytes to stop the search at its work bound (below). No rule can tell those bytes from damage; they are preserved
+   (or `Fail` refuses) and nothing is lost. Otherwise the bytes of a torn append lie inside the one frame being written, and a
    segment with base `B` exists only once record `B - 1` was committed. The search reads only; its work is bounded
    (ADR 0035), and if candidate records would need CRC32C over more than twice `Z - P` bytes (plus the bounded seal
    search) it stops and counts the tail as committed history, reported as `UncheckedTail` because nothing was
@@ -252,8 +253,8 @@ Readers never modify a journal. Only the writer repairs it, on open, after takin
 
    Bytes are zeroed in place only after an empty commit word with no committed history after it. After a crash no
    record was ever committed there, so no reader can have seen them. Damage can't always be recognised: **any damage
-   after which no record validates and no final seal or later segment remains** is byte for byte a torn append and is
-   zeroed like one, destroying the records it covers without preserving them. Examples, with 120 records and a
+   after which no record validates and no final seal or later segment remains** (a final seal counting only for
+   `T <= S + 128`) is byte for byte a torn append and is zeroed like one, destroying the records it covers without preserving them. Examples, with 120 records and a
    checkpoint at 100: the newest record's commit word zeroed (next sequence 119); the commit words of the two newest
    records zeroed (next sequence 118); a zeroed block from the start of the third-newest record into the newest
    record's header (next sequence 117). `verify` reports none of these, `Fail` does not refuse, and a zero-copy

@@ -137,13 +137,17 @@ impl Reader {
     ///
     /// - The length in an earlier record's commit word is enlarged while no writer runs, and a writer then appends
     ///   after that record: validating it loads bytes the writer is storing.
-    /// - The commit word of a published record not yet covered by a checkpoint is zeroed, and nothing that
-    ///   validates follows it (it was the newest record, or the damage reached the records after it): the next
-    ///   writer's recovery cannot tell that from a torn append, takes the slot for the end of the journal and
-    ///   zeroes that record and the published records after it in place, under a live zero-copy reader. A payload
-    ///   the caller still holds then changes, and the reader's later loads meet the new writer's stores. (When a
-    ///   valid record, a final seal or a later segment follows, recovery repairs by writing a new file instead,
-    ///   and mappings of the old file do not change.)
+    /// - The commit word of a published record not yet covered by a checkpoint is zeroed, and recovery finds no
+    ///   evidence within its search bounds that committed history follows: no record that validates within the
+    ///   work budget, no final seal for one of the next 128 sequence numbers, no later segment, and the search did
+    ///   not stop at its budget. That is damage after which nothing validates (the newest record, or damage
+    ///   reaching the records after it), or a valid final seal more than 128 records past the empty slot with no
+    ///   later segment left. The next writer's recovery cannot tell that from a torn append, takes the slot for
+    ///   the end of the journal and zeroes that record and the published records after it in place, under a live
+    ///   zero-copy reader. A payload the caller still holds then changes, and the reader's later loads meet the
+    ///   new writer's stores. (With evidence, or a search stopped at its budget, recovery replaces the segment by
+    ///   a new file, and mappings of the old file do not change; a damaged seal whose successor opens is rewritten
+    ///   in place only when nothing but its CRC word is left, in a slot that never held a record. ADR 0035.)
     ///
     /// That such loads return some mixture of old and new bytes, which the CRC then rejects, is an assumption about
     /// the implementation on the supported targets, not a guarantee. Earlier releases had the same exposure.

@@ -148,10 +148,13 @@ Never truncate or edit a segment in place while anything uses the journal: proce
   record being written had a payload holding a valid record frame whose sequence number falls in recovery's window
   (for example raw frames copied from another journal), or ending with the eight bytes of a valid seal for one, and
   the crash interrupted it before the body was complete (or the payload ends in more than 63 zero bytes), recovery
-  cannot tell those bytes from damage (`EmptyCommitWord`, ADR 0035). With the default `Quarantine` it then
+  cannot tell those bytes from damage (`EmptyCommitWord`, ADR 0035). The same holds for a payload holding several
+  header-shaped byte sequences (copies of this journal's record headers, for example) whose length claims exhaust
+  recovery's work budget although none validates (`UncheckedTail`). With the default `Quarantine` it then
   reports a `RepairedTail`, the torn record's bytes are in `quarantine/`, and nothing committed is lost. With
   `RecoveryPolicy::Fail` the writer refuses to open: look at the frame at the reported file and offset (it should
-  carry the expected sequence number in its header, with the frames that count as evidence inside its payload); if
+  carry the expected sequence number in its header, with the frames or headers that count as evidence inside its
+  payload); if
   so, it was the record being written, so open the writer once with `RecoveryPolicy::Quarantine`, which preserves it
   and continues. If not, treat it as the storage damage below.
 - **Power loss or storage errors:** the writer validates the journal from the last checkpoint. Corrupt or
@@ -163,8 +166,8 @@ Never truncate or edit a segment in place while anything uses the journal: proce
   and keep the rest of the segment zero (or, outside a segment, append zeros): a last record whose payload ends in
   zero bytes declares a length that reaches past the end of the copy, and it only validates with those zeros put
   back. Damage
-  after which no record validates and no final seal or later segment remains (for example the commit words of the
-  newest records zeroed) can't be told from a crash and is zeroed like a torn append, under either policy. If
+  after which no record validates and no final seal (for one of the next 128 sequence numbers) or later segment
+  remains (for example the commit words of the newest records zeroed) can't be told from a crash and is zeroed like a torn append, under either policy. If
   `quarantine/` holds two files with identical bytes for the same position, a repair was interrupted and repeated;
   either copy can be deleted.
   Readers that had seen discarded records get `Error::Discarded`.
