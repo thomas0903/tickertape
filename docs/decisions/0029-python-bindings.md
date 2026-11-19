@@ -81,7 +81,8 @@ replayable sequences rather than one-shot iterators. The returned `range` is bui
 numbers exceed `isize` (from 2**63). `read_many(max_records, *, timeout=0)` waits up to `timeout` for the first
 record (`None`: forever), then returns what is already committed, up to `max_records`. If an error occurs after it
 has read some records, it returns those and raises the error on the next read (a successful `seek` clears it; a
-failed one leaves it), so neither the records nor the error are lost. `read_batch` has the same semantics and returns a columnar `RecordBatch`.
+failed one leaves it), so neither the records nor the error are lost. `read_batch` has the same semantics and
+returns a columnar `RecordBatch`.
 
 **Columnar batches.** A `RecordBatch` holds six immutable `bytes` objects: little-endian `seq`, `schema_id`,
 `venue_ts_ns`, `local_ts_ns` and Arrow `large_binary` payload offsets and data. `numpy.frombuffer` and
@@ -93,9 +94,9 @@ export the buffer protocol. The PyCapsule interface is a possible follow-up thro
 
 **Copies and lifetimes.** Payloads are `bytes` or buffers of unsigned bytes only (item format `B`: `bytearray`,
 `memoryview`, `array('B')`, `uint8` NumPy arrays); other item types such as `array('b')` or `int8` arrays raise
-`TypeError` rather than being reinterpreted. `append` borrows a `bytes` payload without copying it (bytes are
-immutable) and copies other buffers once, because they could change while the GIL is released; the writer then copies the payload into the
-segment. Every `Record` owns its payload as a `bytes` object, valid after the reader moves on or closes. The
+`TypeError` rather than being reinterpreted. `append` borrows a `bytes` payload without copying it (bytes are immutable)
+and copies other buffers once, because they could change while the GIL is released; the writer then copies the payload
+into the segment. Every `Record` owns its payload as a `bytes` object, valid after the reader moves on or closes. The
 binding uses only the safe `pread` reader. `Reader::open_mapped` is not exposed: its precondition (only a tickertape
 writer modifies the files) cannot be checked from Python, a `SIGBUS` would kill the interpreter, and records must be
 copied into `bytes` anyway, so it would save little.
