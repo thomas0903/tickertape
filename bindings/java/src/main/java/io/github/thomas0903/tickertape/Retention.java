@@ -46,7 +46,7 @@ public final class Retention {
      */
     public static Retention moveTo(Path dir) {
         Objects.requireNonNull(dir, "dir");
-        Paths.nativeBytes(dir); // refuses a path of another file system now, not when the retention is applied
+        Paths.check(dir); // refuses a path of another file system now, not when the retention is applied
         return new Retention(dir, -1, -1, -1);
     }
 

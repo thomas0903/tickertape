@@ -1,6 +1,7 @@
 package io.github.thomas0903.tickertape;
 
 import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.FunctionDescriptor;
 import java.lang.foreign.Linker;
@@ -9,9 +10,14 @@ import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.lang.invoke.MethodHandle;
 import java.lang.invoke.VarHandle;
+import java.net.URI;
 import java.nio.file.FileSystems;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.util.Arrays;
+import java.util.function.BooleanSupplier;
+import java.util.function.Supplier;
 
 /**
  * Path conversion for the C ABI, which takes NUL-terminated byte strings and passes them to the OS unchanged (ADR 0037
@@ -25,23 +31,25 @@ import java.util.Arrays;
  * name that is not valid in the file-system encoding, a name in either Unicode normalization form, and a path that
  * carries a trailing slash all reach the library as the JDK holds them.
  *
- * <p>An absolute path is passed as those bytes. A relative path is passed relative when the JDK's default directory is
- * the process's working directory, against which the C library resolves it: the JDK forms its absolute path by joining
- * the bytes of its default directory, a {@code /} and the relative path's own bytes, so the binding decodes the default
- * directory's URI ({@code Path.of("").toUri()}) the same way and strips that prefix and the separator after it. An
- * empty remainder is passed as {@code .}. If the prefix does not match, the absolute bytes are passed rather than a
- * guess. Either way, trailing slashes are stripped except for the root.
+ * <p>An absolute path is passed as those bytes. A relative path is passed relative when the JDK passes it to the
+ * operating system as it is (below), so that the C library resolves it against the same directory: the JDK forms its
+ * absolute path by joining the bytes of its default directory, a {@code /} and the relative path's own bytes, so the
+ * binding decodes the default directory's URI ({@code Path.of("").toUri()}) the same way and strips that prefix and the
+ * separator after it. An empty remainder is passed as {@code .}. If the prefix does not match, the absolute bytes are
+ * passed rather than a guess. Either way, trailing slashes are stripped except for the root.
  *
- * <p>The JDK reads its default directory from {@code user.dir} at start-up, so a JVM started with
- * {@code -Duser.dir=/b} in {@code /a} resolves {@code Path.of("journal")} under {@code /b}, while the C library would
- * resolve {@code journal} under {@code /a}. The JDK itself passes a relative path to the operating system as it is
- * only when its default directory is the process's working directory, and the resolved absolute path otherwise; the
- * binding does the same. When this class is initialised it reads the process's working directory once with the C
- * library's {@code getcwd} (through the FFM linker, in a buffer that grows on {@code ERANGE}) and compares its bytes
- * with the default directory's; when they differ, or {@code getcwd} fails, every relative path is passed as its
- * absolute bytes, to which the path-length limit then applies (as it does to the JDK's own file operations in that
- * configuration). A process that changes its working directory later, through native code, is outside what the
- * binding follows, as it is for the JDK.
+ * <p>The JDK reads its default directory from {@code user.dir} at start-up and decides then, once, whether it passes a
+ * relative path to the operating system as it is (when the default directory has the bytes {@code getcwd} returned
+ * at that moment, and {@code sun.nio.fs.chdirAllowed} is not set) or resolved against the default directory
+ * (otherwise, for example under {@code -Duser.dir=/b} in {@code /a}). That flag is not readable, so the binding infers
+ * it, the first time it converts a relative path, from what the JDK does: see
+ * {@link #passRelative(byte[], byte[], boolean, Directories)}. In short, a relative path is passed relative when the
+ * process's working directory now has the default directory's bytes, or when the JDK's own {@code stat} of
+ * {@code Path.of("")} reaches the working directory while the default directory's path does not (the working directory
+ * was renamed after start-up); otherwise it is passed as its absolute bytes, to which the path-length limit then applies, as it does to the JDK's own file operations in that
+ * configuration. A determination that succeeded is kept for the life of the class (the JDK's flag does not change
+ * either); one that failed is not, and the path is passed absolute while the next conversion tries again. A process
+ * that changes its working directory through native code is outside what the binding follows, as it is for the JDK.
  *
  * <p>The exact URI form is the default provider's behaviour, not part of the {@code Path.toUri} specification;
  * {@code PathsTest} pins it, and anything other than the expected form (a raw path that does not start with {@code /},
@@ -62,26 +70,172 @@ final class Paths {
     /** The largest buffer {@link #processWorkingDirectory} tries before it gives up. */
     private static final int GETCWD_MAX_BYTES = 1 << 20;
 
-    /**
-     * Whether a relative path is passed relative: the process's working directory, read once by {@code getcwd}, has
-     * the bytes of the JDK's default directory (see the class documentation).
-     */
-    private static final boolean PASS_RELATIVE =
-            passRelative(processWorkingDirectory(1024), stripTrailingSlashes(uriBytes(EMPTY)));
+    /** This JVM's determination, made at the first conversion of a relative path. */
+    private static final Decision DECISION = new Decision();
+    /** The working directory as {@code getcwd} returns it now, or {@code null} if the call fails. */
+    private static final Supplier<byte[]> GETCWD = () -> processWorkingDirectory(1024);
 
     /**
-     * Whether a relative path may be passed relative, given the bytes {@code getcwd} returned for the process's working
-     * directory ({@code null} if it failed) and those of the JDK's default directory: only when they are the same
-     * directory by its bytes, trailing slashes aside.
+     * Whether a relative path is passed relative, determined on first use and kept once a determination succeeds. A
+     * failed one (the {@code getcwd} call refused, say because the module has no native access yet, or a {@code stat}
+     * failing) is not kept: that conversion passes the path absolute, and the next one tries again. The cost of a try
+     * is a {@code getcwd} and at most three {@code stat}s; conversions happen when a journal is opened or inspected or
+     * a retention destination is applied, never per record, and once a try succeeds a conversion reads one volatile
+     * field.
      */
-    static boolean passRelative(byte[] processCwd, byte[] defaultDirectory) {
-        return processCwd != null && processCwd.length > 0 && processCwd[0] == '/'
-                && Arrays.equals(stripTrailingSlashes(processCwd), stripTrailingSlashes(defaultDirectory));
+    static final class Decision {
+        private volatile Boolean passRelative;
+
+        /** The kept determination, or {@code null} if none has succeeded yet. */
+        Boolean kept() {
+            return passRelative;
+        }
+
+        /** Whether to pass a relative path relative; {@code workingDirectory} is asked only until one try succeeds. */
+        boolean passRelative(Supplier<byte[]> workingDirectory) {
+            Boolean kept = passRelative;
+            if (kept != null) {
+                return kept;
+            }
+            Boolean now = Paths.passRelative(workingDirectory.get(), stripTrailingSlashes(uriBytes(EMPTY)),
+                    chdirAllowed(System.getProperty("sun.nio.fs.chdirAllowed", "false")), JDK_DIRECTORIES);
+            if (now == null) {
+                return false;
+            }
+            passRelative = now; // two threads may both decide; they reach the same answer
+            return now;
+        }
     }
 
-    /** Whether this JVM passes relative paths relative (see {@link #passRelative}). */
+    /** {@code sun.nio.fs.chdirAllowed} as the JDK reads it: empty or {@code true} makes it resolve every path. */
+    static boolean chdirAllowed(String value) {
+        return value.isEmpty() || Boolean.parseBoolean(value);
+    }
+
+    /**
+     * The identities of the three directories {@link #passRelative(byte[], byte[], boolean, Directories)} compares; any
+     * value with {@code equals}, {@code null} if unknown.
+     */
+    interface Directories {
+        /** The directory the JDK reaches for {@code Path.of("")}: {@code .} or its default directory. */
+        Object empty() throws IOException;
+
+        /** The directory the default directory's absolute path names now. */
+        Object defaultDirectory() throws IOException;
+
+        /** The directory the bytes {@code getcwd} returned name now. */
+        Object workingDirectory(byte[] processCwd) throws IOException;
+    }
+
+    /** {@link Directories} through the JDK's own {@code stat}: the file key, device and inode on Linux and macOS. */
+    static final Directories JDK_DIRECTORIES = new Directories() {
+        @Override
+        public Object empty() throws IOException {
+            return fileKey(EMPTY);
+        }
+
+        @Override
+        public Object defaultDirectory() throws IOException {
+            return fileKey(EMPTY.toAbsolutePath());
+        }
+
+        @Override
+        public Object workingDirectory(byte[] processCwd) throws IOException {
+            return fileKey(fromBytes(processCwd));
+        }
+    };
+
+    private static Object fileKey(Path p) throws IOException {
+        return Files.readAttributes(p, BasicFileAttributes.class).fileKey();
+    }
+
+    /**
+     * The path of the default file system with exactly these absolute bytes: the default provider builds a path from a
+     * {@code file:} URI's percent-encoded bytes without decoding them as text (the inverse of {@link #uriBytes}).
+     */
+    static Path fromBytes(byte[] absolute) {
+        StringBuilder uri = new StringBuilder("file://");
+        for (byte b : absolute) {
+            int c = b & 0xFF;
+            if (c == '/' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-' || c == '.'
+                    || c == '_' || c == '~') {
+                uri.append((char) c);
+            } else {
+                uri.append('%').append(Character.toUpperCase(Character.forDigit(c >> 4, 16)))
+                        .append(Character.toUpperCase(Character.forDigit(c & 0xF, 16)));
+            }
+        }
+        return Path.of(URI.create(uri.toString()));
+    }
+
+    /**
+     * Whether a relative path is passed relative, as the JDK passes it: {@code TRUE} relative, {@code FALSE} absolute,
+     * {@code null} if it cannot be determined now. The JDK passes relative paths as they are exactly when, at start-up,
+     * {@code sun.nio.fs.chdirAllowed} was not set and its default directory had the bytes {@code getcwd} returned
+     * ({@code UnixFileSystem}'s {@code needToResolveAgainstDefaultDirectory}, used by
+     * {@code UnixPath.getByteArrayForSysCalls}). Given {@code getcwd}'s bytes now ({@code null} if it failed), the
+     * default directory's bytes and the property:
+     *
+     * <ol>
+     *   <li>{@code getcwd} failed, or returned no absolute path: {@code null}.
+     *   <li>The property is set: {@code FALSE}, as the JDK resolves every path.
+     *   <li>The two byte strings are equal (trailing slashes aside): {@code TRUE}; the working directory is the one the
+     *       JVM started in, unless native code moved it.
+     *   <li>Otherwise either the JDK resolves against another directory, or names the working directory by another path
+     *       ({@code -Duser.dir=} naming a symbolic link to it, say), or it passes relative paths as they are and the
+     *       working directory was renamed after start-up. The JDK's own {@code stat} of {@code Path.of("")} (of
+     *       {@code .} when it passes relative paths as they are, of the default directory otherwise) tells: if it does
+     *       not reach the directory {@code getcwd} names, {@code FALSE}.
+     *   <li>It does. If the default directory's absolute path also reaches it, {@code FALSE}: the JDK resolves against
+     *       that path (step 4's {@code stat} was of it) or, if the working directory was renamed and that path made to
+     *       name it again, both forms reach the same directory. If that path names another directory or none,
+     *       {@code TRUE}: step 4's {@code stat} was of {@code .}, so the JDK passes relative paths as they are.
+     * </ol>
+     *
+     * <p>Comparing real paths ({@code toRealPath}) would not do: the JDK's {@code UnixPath.toRealPath} resolves the
+     * default directory's path, not {@code .}, so it fails once the working directory is renamed, and it returns the
+     * working directory's real path for a {@code user.dir} that names it through a symbolic link, against which the JDK
+     * resolves. A {@code stat} failure in steps 1 to 4 is {@code null}; one in step 5 is {@code TRUE}, since that path
+     * gave step 4's answer moments before if the JDK resolves against it.
+     */
+    static Boolean passRelative(byte[] processCwd, byte[] defaultDirectory, boolean chdirAllowed, Directories dirs) {
+        if (processCwd == null || processCwd.length == 0 || processCwd[0] != '/') {
+            return null;
+        }
+        if (chdirAllowed) {
+            return false;
+        }
+        if (Arrays.equals(stripTrailingSlashes(processCwd), stripTrailingSlashes(defaultDirectory))) {
+            return true;
+        }
+        Object workingDirectory;
+        Object empty;
+        try {
+            workingDirectory = dirs.workingDirectory(processCwd);
+            empty = dirs.empty();
+        } catch (IOException | RuntimeException e) { // a RuntimeException: an InvalidPathException, say
+            return null;
+        }
+        if (workingDirectory == null || empty == null) {
+            return null;
+        }
+        if (!empty.equals(workingDirectory)) {
+            return false;
+        }
+        Object defaultDir;
+        try {
+            defaultDir = dirs.defaultDirectory();
+        } catch (IOException e) {
+            return true;
+        } catch (RuntimeException e) {
+            return null;
+        }
+        return defaultDir == null ? null : !defaultDir.equals(workingDirectory);
+    }
+
+    /** Whether this JVM passes relative paths relative (see {@link Decision}). */
     static boolean passesRelative() {
-        return PASS_RELATIVE;
+        return DECISION.passRelative(GETCWD);
     }
 
     /**
@@ -139,11 +293,14 @@ final class Paths {
      * documentation).
      */
     static byte[] nativeBytes(Path p) {
-        if (p.getFileSystem() != FileSystems.getDefault()) {
-            throw new IllegalArgumentException("not a path on the default file system: " + p);
-        }
+        return nativeBytes(p, Paths::passesRelative);
+    }
+
+    /** {@link #nativeBytes(Path)}, asking {@code passRelative} (only for a relative path) how to pass it. */
+    static byte[] nativeBytes(Path p, BooleanSupplier passRelative) {
+        requireDefaultFileSystem(p);
         byte[] absolute = stripTrailingSlashes(uriBytes(p));
-        if (p.isAbsolute() || !PASS_RELATIVE) {
+        if (p.isAbsolute() || !passRelative.getAsBoolean()) {
             return absolute;
         }
         byte[] base = stripTrailingSlashes(uriBytes(EMPTY));
@@ -156,6 +313,21 @@ final class Paths {
             return absolute;
         }
         return from == absolute.length ? new byte[] {'.'} : Arrays.copyOfRange(absolute, from, absolute.length);
+    }
+
+    /**
+     * Checks that {@code p} can be converted (see {@link #nativeBytes(Path)}) without determining how a
+     * relative path is passed; throws {@link IllegalArgumentException} otherwise.
+     */
+    static void check(Path p) {
+        requireDefaultFileSystem(p);
+        uriBytes(p);
+    }
+
+    private static void requireDefaultFileSystem(Path p) {
+        if (p.getFileSystem() != FileSystems.getDefault()) {
+            throw new IllegalArgumentException("not a path on the default file system: " + p);
+        }
     }
 
     /** The decoded raw path of {@code p.toUri()}: the absolute path's bytes, perhaps with a trailing slash. */

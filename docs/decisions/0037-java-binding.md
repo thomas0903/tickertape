@@ -381,10 +381,10 @@ macOS, whose file system refuses the name), and a zip file system path refused. 
 tests, or is refused at run time, rather than passing other bytes silently. The supported range is unchanged: JDK 25 and
 later. Three consequences are documented in the Javadoc (`Tickertape`, Paths, linked from every method that takes a
 journal path) and the guide: an absolute path is passed as its bytes and a relative one relative, with its own bytes,
-resolved by the library against the process's working directory when that is the JDK's default directory, and passed as
-its absolute bytes otherwise (see below); `toUri()` may `stat`
-the path once per conversion, and the working directory once more for a relative path (when a journal is opened or
-inspected, or a retention destination set, never per record); and only the default file system is supported.
+resolved by the library against the process's working directory, when the JDK passes it to the operating system as it
+is, and passed as its absolute bytes otherwise (see below); `toUri()` may `stat` the path once per conversion, and the
+working directory once more for a relative path (when a journal is opened or inspected, or a retention destination set,
+never per record); and only the default file system is supported.
 
 Round 5 of the review passed the absolute bytes for every path. That broke a journal reached by a short relative path
 from a deep working directory: on macOS a working directory of 1,020 bytes and the relative path `journal` make 1,028
@@ -410,6 +410,39 @@ is outside what the binding follows, as it is for the JDK. `PathsTest` asserts t
 byte strings, that `getcwd` returns this JVM's working directory from a one-byte starting buffer, and, in a forked JVM
 started in one directory with `-Duser.dir=` naming another, each holding a journal, that `Path.of("journal")` reaches
 the one under `user.dir`, which the JDK's own `Files.list` and `Files.exists` see.
+
+Round 7's comparison is not the JDK's decision when something changed between the JVM's start and the binding's first
+conversion. If the working directory is renamed in between (started in `/work/a`, renamed to `/work/b`), the JDK still
+passes `journal` as it is (`Files.exists` checks `/work/b/journal`), but `getcwd` now returns `/work/b`, which differs
+from the stored `/work/a`, so round 7 passed `/work/a/journal`: the open failed, or opened another journal if that path
+had been reused. And a failed `getcwd` (native access refused to the module at that moment, say) was cached as "pass
+absolute" for the life of the class. Round 8 infers the JDK's decision from its behaviour. The JDK passes relative
+paths as they are exactly when, at start-up, `sun.nio.fs.chdirAllowed` was not set and its default directory had the
+bytes `getcwd` returned (`UnixFileSystem.needToResolveAgainstDefaultDirectory`, used by
+`UnixPath.getByteArrayForSysCalls`). The binding decides, in order: `getcwd` failed or returned no absolute path:
+undetermined; the property is set: absolute; `getcwd`'s bytes equal the default directory's: relative; otherwise it
+compares file keys (device and inode) from the JDK's own `stat`: if the `stat` of `Path.of("")`, which is of `.` when
+the JDK passes relative paths as they are and of the default directory otherwise, does not reach the directory
+`getcwd`'s bytes name (read through a path built from a `file:` URI of those bytes, which the default provider does not
+decode as text), absolute; if it does and the default directory's absolute path also reaches it, absolute (the JDK
+resolves against that path, or the renamed working directory's old path names it again, so both forms reach it); if
+that path names another directory or none, relative (the JDK's `stat` was of `.`). A `stat` failure before the last
+step leaves the decision undetermined; one in the last step means relative, since that path gave the previous answer
+moments before if the JDK resolves against it. The decision is exact apart from that re-pointed old path (which reaches
+the same directory at the time), a native `chdir` before the first conversion, and the property changed after
+start-up. Comparing `getcwd` with `Path.of("").toRealPath()` instead does not work, because
+`UnixPath.toRealPath` calls `realpath` on `toAbsolutePath()`, the default directory's path, not on `.`: it throws
+`NoSuchFileException` once the working directory is renamed, and for a JVM started with `-Duser.dir=` naming a symbolic
+link to the working directory it returns the working directory's real path although the JDK resolves against the link.
+Starting the JVM through a symbolic link does not matter: `getcwd` returns the physical path on Linux and macOS, and the
+JVM sets `user.dir` from `getcwd`, not from `$PWD`. A determination that succeeded is kept; one that failed is not, the
+path is passed absolute and the next conversion tries again, at the cost of a `getcwd` and at most three `stat`s, paid
+only when a journal is opened or inspected or a retention destination applied, never per record (`Retention.moveTo`
+checks its path without deciding). `PathsTest` asserts the decision table with injected identities, the real probes in
+the test JVM, that a failed determination followed by a successful one ends with the successful one kept, and, in a
+forked JVM that renames its own working directory and moves another journal to the old path before its first binding
+call, that `Path.of("journal")` opens the journal in the renamed directory, as `Files.exists` sees it (on round 7 it
+opened the other journal).
 
 **Finding the library.** In this order, and the first library found must be compatible or loading fails (it never falls
 through to a later candidate after a failure): `Tickertape.loadLibrary(path)` before first use; the system property

@@ -9,12 +9,15 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.AccessDeniedException;
 import java.nio.file.FileSystem;
 import java.nio.file.FileSystems;
 import java.nio.file.Files;
 import java.nio.file.InvalidPathException;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -247,26 +250,148 @@ class PathsTest {
                 TestSupport.lines(r.stdout()), r.stderr());
     }
 
+    /** Directories with these identities; an {@link IOException} is thrown instead of returned. */
+    private static Paths.Directories dirs(Object empty, Object defaultDirectory, Object workingDirectory) {
+        return new Paths.Directories() {
+            @Override
+            public Object empty() throws IOException {
+                return identity(empty);
+            }
+
+            @Override
+            public Object defaultDirectory() throws IOException {
+                return identity(defaultDirectory);
+            }
+
+            @Override
+            public Object workingDirectory(byte[] processCwd) throws IOException {
+                return identity(workingDirectory);
+            }
+        };
+    }
+
+    private static Object identity(Object value) throws IOException {
+        if (value instanceof IOException e) {
+            throw e;
+        }
+        return value;
+    }
+
+    /** Directories that must not be looked at: the byte strings decide. */
+    private static final Paths.Directories UNASKED = new Paths.Directories() {
+        @Override
+        public Object empty() {
+            throw new AssertionError("stat of the empty path");
+        }
+
+        @Override
+        public Object defaultDirectory() {
+            throw new AssertionError("stat of the default directory");
+        }
+
+        @Override
+        public Object workingDirectory(byte[] processCwd) {
+            throw new AssertionError("stat of the working directory");
+        }
+    };
+
+    private static Boolean decide(String cwd, String defaultDirectory, Paths.Directories dirs) {
+        return Paths.passRelative(utf8(cwd), utf8(defaultDirectory), false, dirs);
+    }
+
     /**
-     * A relative path is passed relative only when the process's working directory, as {@code getcwd} returns it, has
-     * the bytes of the JDK's default directory; otherwise, or when {@code getcwd} failed, it is passed absolute.
+     * The decision as a function of {@code getcwd}'s bytes now, the default directory's bytes, the JDK's
+     * {@code chdirAllowed} property and the identities of the directories the JDK's {@code stat} of {@code Path.of("")},
+     * the default directory's path and {@code getcwd}'s path reach: {@code TRUE} relative, {@code FALSE} absolute,
+     * {@code null} undetermined (passed absolute, not kept).
      */
     @Test
-    void aRelativePathIsPassedRelativeOnlyWhenTheDefaultDirectoryIsTheWorkingDirectory() {
-        assertTrue(Paths.passRelative(utf8("/a/b"), utf8("/a/b")));
-        assertTrue(Paths.passRelative(utf8("/a/b"), utf8("/a/b/")), "the default directory's URI ends in a slash");
-        assertTrue(Paths.passRelative(utf8("/"), utf8("/")));
-        assertTrue(Paths.passRelative(new byte[] {'/', 'j', (byte) 0xFF}, new byte[] {'/', 'j', (byte) 0xFF}));
-        assertFalse(Paths.passRelative(utf8("/a"), utf8("/b")), "-Duser.dir=/b in /a");
-        assertFalse(Paths.passRelative(utf8("/a"), utf8("/a/b")));
-        assertFalse(Paths.passRelative(utf8("/a/b"), utf8("/a")));
-        assertFalse(Paths.passRelative(utf8("/a/café"), utf8("/a/cafe\u0301")), "the same text in another form");
-        assertFalse(Paths.passRelative(new byte[] {'/', 'j', (byte) 0xFF}, new byte[] {'/', 'j', (byte) 0xEF,
-                (byte) 0xBF, (byte) 0xBD}), "an undecodable name and its decoded twin");
-        assertFalse(Paths.passRelative(null, utf8("/a")), "getcwd failed");
-        assertFalse(Paths.passRelative(utf8("(unreachable)/a"), utf8("/a")),
-                "Linux's mark for a directory outside the root");
-        assertFalse(Paths.passRelative(new byte[0], utf8("/")));
+    void aRelativePathIsPassedRelativeExactlyWhenTheJdkPassesItAsItIs() {
+        // The byte strings are equal: the JVM's working directory is where it started.
+        assertEquals(true, decide("/a/b", "/a/b", UNASKED));
+        assertEquals(true, decide("/a/b", "/a/b/", UNASKED), "the default directory's URI ends in a slash");
+        assertEquals(true, decide("/", "/", UNASKED));
+        assertEquals(true, Paths.passRelative(new byte[] {'/', 'j', (byte) 0xFF}, new byte[] {'/', 'j', (byte) 0xFF},
+                false, UNASKED));
+        assertEquals(false, Paths.passRelative(utf8("/a"), utf8("/a"), true, UNASKED),
+                "sun.nio.fs.chdirAllowed: the JDK resolves every path");
+        // They differ: the JDK's own stat of the empty path decides.
+        assertEquals(false, decide("/a", "/b", dirs("B", "B", "A")), "-Duser.dir=/b in /a");
+        assertEquals(false, decide("/a", "/a/b", dirs("AB", "AB", "A")));
+        assertEquals(false, decide("/a", "/link-to-a", dirs("A", "A", "A")),
+                "-Duser.dir= naming the working directory through a symbolic link: the JDK resolves against it");
+        assertEquals(false, decide("/a/café", "/a/cafe\u0301", dirs("C", "C", "C")),
+                "the same name in another form, which the JDK resolves against");
+        assertEquals(true, decide("/work/b", "/work/a", dirs("B", new NoSuchFileException("/work/a"), "B")),
+                "started in /work/a, renamed to /work/b: the JDK's stat of . reaches it and /work/a is gone");
+        assertEquals(true, decide("/work/b", "/work/a", dirs("B", "A2", "B")),
+                "renamed, and /work/a made again: it names another directory");
+        assertEquals(true, decide("/work/b", "/work/a", dirs("B", new AccessDeniedException("/work"), "B")));
+        assertEquals(false, decide("/work/b", "/work/a", dirs("B", "B", "B")),
+                "renamed, and /work/a made to name it again: both forms reach it");
+        // Undetermined.
+        assertEquals(null, Paths.passRelative(null, utf8("/a"), false, UNASKED), "getcwd failed");
+        assertEquals(null, decide("(unreachable)/a", "/a", UNASKED), "Linux's mark for a directory outside the root");
+        assertEquals(null, Paths.passRelative(new byte[0], utf8("/"), false, UNASKED));
+        assertEquals(null, decide("/a", "/b", dirs(new NoSuchFileException("/b"), "B", "A")), "user.dir is gone");
+        assertEquals(null, decide("/a", "/b", dirs("B", "B", new AccessDeniedException("/a"))));
+        assertEquals(null, decide("/a", "/b", dirs(null, "B", "A")), "no file key");
+        assertEquals(null, decide("/a", "/b", dirs("A", null, "A")), "no file key");
+    }
+
+    /** {@code sun.nio.fs.chdirAllowed} as the JDK parses it. */
+    @Test
+    void theChdirPropertyIsReadAsTheJdkReadsIt() {
+        assertTrue(Paths.chdirAllowed(""));
+        assertTrue(Paths.chdirAllowed("true"));
+        assertTrue(Paths.chdirAllowed("TRUE"));
+        assertFalse(Paths.chdirAllowed("false"));
+        assertFalse(Paths.chdirAllowed("yes"));
+    }
+
+    /**
+     * The real probes in this JVM, whose working directory is its default directory: the byte strings agree, and a
+     * working directory that names another directory makes the JDK's stat of the empty path (of {@code .}) differ.
+     */
+    @Test
+    void theJdkProbesReachTheDirectoriesTheyName() throws Exception {
+        byte[] defaultDirectory = Paths.nativeBytes(Path.of("").toAbsolutePath());
+        Paths.Directories jdk = Paths.JDK_DIRECTORIES;
+        assertEquals(true, Paths.passRelative(Paths.processWorkingDirectory(1024), defaultDirectory, false, jdk));
+        assertEquals(false, Paths.passRelative(Paths.nativeBytes(tmp.toRealPath()), defaultDirectory, false, jdk));
+        assertEquals(jdk.empty(), jdk.workingDirectory(Paths.processWorkingDirectory(1024)));
+        assertEquals(jdk.empty(), jdk.defaultDirectory());
+        byte[] odd = concat(Paths.nativeBytes(tmp), utf8("/j%: é"));
+        assertArrayEquals(odd, Paths.nativeBytes(Paths.fromBytes(odd)), "a path made from bytes keeps them");
+        if (!MAC) {
+            byte[] undecodable = concat(Paths.nativeBytes(tmp), new byte[] {'/', 'j', (byte) 0xFF});
+            assertArrayEquals(undecodable, Paths.nativeBytes(Paths.fromBytes(undecodable)));
+        }
+    }
+
+    /**
+     * A determination that fails is not kept: that conversion passes the path absolute and the next one tries again;
+     * once one succeeds it is kept, and the working directory is not asked for again. An absolute path never asks.
+     */
+    @Test
+    void aFailedDeterminationIsNotKept() {
+        Paths.Decision decision = new Paths.Decision();
+        Path rel = Path.of("rel", "journal");
+        byte[] absolute = Paths.nativeBytes(rel.toAbsolutePath());
+        assertArrayEquals(absolute, Paths.nativeBytes(rel, () -> decision.passRelative(() -> null)),
+                "getcwd failed (native access refused, say): absolute");
+        assertEquals(null, decision.kept());
+        assertArrayEquals(absolute, Paths.nativeBytes(rel, () -> decision.passRelative(() -> utf8("(unreachable)/a"))));
+        assertEquals(null, decision.kept());
+        assertArrayEquals(utf8("rel/journal"),
+                Paths.nativeBytes(rel, () -> decision.passRelative(() -> Paths.processWorkingDirectory(1024))));
+        assertEquals(true, decision.kept());
+        assertArrayEquals(utf8("rel/journal"), Paths.nativeBytes(rel, () -> decision.passRelative(() -> {
+            throw new AssertionError("asked again after a determination succeeded");
+        })));
+        assertArrayEquals(absolute, Paths.nativeBytes(rel.toAbsolutePath(), () -> {
+            throw new AssertionError("asked for an absolute path");
+        }));
     }
 
     /**
@@ -332,6 +457,57 @@ class PathsTest {
         try (Reader reader = Reader.open(started.resolve("journal"))) {
             assertEquals(1, reader.tryNext().getByte(0));
             assertEquals(null, reader.tryNext(), "the journal in the process's working directory is unchanged");
+        }
+    }
+
+    /**
+     * A forked JVM started in {@code a} renames its own working directory to {@code b}, and moves another journal to
+     * {@code a}, before its first binding call. The JDK passes {@code Path.of("journal")} to the operating system as it
+     * is, so its own {@code Files.exists} sees {@code b}; the binding must open the journal there too, not the one now
+     * at the path the JVM started in. A fork, so that this JVM's working directory does not move.
+     */
+    @Test
+    void aRelativePathFollowsTheJdkWhenTheWorkingDirectoryIsRenamed() throws Exception {
+        Path started = Files.createDirectory(tmp.toRealPath().resolve("a"));
+        Path other = Files.createDirectory(tmp.toRealPath().resolve("other"));
+        journal(started.resolve("journal"), 1);
+        journal(other.resolve("journal"), 9);
+        Files.createFile(started.resolve("marker-started"));
+        Path program = tmp.resolve("Renamed.java");
+        Files.writeString(program, """
+                import io.github.thomas0903.tickertape.*;
+                import java.nio.file.*;
+                public class Renamed {
+                    public static void main(String[] args) throws Exception {
+                        Path here = Path.of("").toAbsolutePath();
+                        Files.move(here, here.resolveSibling("b"));
+                        Files.move(here.resolveSibling("other"), here);
+                        Path rel = Path.of("journal");
+                        System.out.println("exists " + Files.exists(Path.of("marker-started")));
+                        try (Reader r = Reader.open(rel)) {
+                            System.out.println("payload " + r.tryNext().getByte(0));
+                        }
+                        try (Reader r = Reader.openMappedUnsafe(rel)) {
+                            System.out.println("mapped " + r.tryNext().getByte(0));
+                        }
+                        System.out.println("records " + Journal.verify(rel).records());
+                        try (Writer w = Writer.open(rel, WriterOptions.defaults().segmentSize(65_536).prefault(false))) {
+                            w.append(1, 0, 0, new byte[] {3});
+                        }
+                        System.out.println("records " + Journal.verify(Path.of("journal")).records());
+                    }
+                }
+                """);
+        TestSupport.Result r = TestSupport.run(List.of(TestSupport.javaLauncher(), "--enable-native-access=ALL-UNNAMED",
+                "--illegal-native-access=deny", "-Dtickertape.library.path=" + TestSupport.LIBRARY.toAbsolutePath(),
+                "--class-path", TestSupport.CLASSES.toAbsolutePath().toString(), program.toString()), started, 120);
+        assertEquals(0, r.exit(), "stdout:\n" + r.stdout() + "\nstderr:\n" + r.stderr());
+        assertEquals(List.of("exists true", "payload 1", "mapped 1", "records 1", "records 2"),
+                TestSupport.lines(r.stdout()), r.stderr());
+        assertEquals(2, Journal.verify(tmp.resolve("b").resolve("journal")).records());
+        try (Reader reader = Reader.open(started.resolve("journal"))) {
+            assertEquals(9, reader.tryNext().getByte(0));
+            assertEquals(null, reader.tryNext(), "the journal now at the path the JVM started in is unchanged");
         }
     }
 

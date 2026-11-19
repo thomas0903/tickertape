@@ -24,21 +24,21 @@ import java.util.Objects;
  * {@code file:} URI carries them percent-encoded. Three consequences:
  *
  * <ul>
- *   <li>An absolute path is passed as its bytes. A relative path is resolved by the JDK against its default
- *       directory, which it reads from {@code user.dir} at start-up, and by the C library against the process's
- *       working directory. These are the same directory unless the JVM was started with {@code -Duser.dir=} naming
- *       another (setting the property later moves neither). The binding does what the JDK does for its own file
- *       operations: the first time it converts a path it reads the working directory, once, with the C library's
- *       {@code getcwd} and compares its bytes with the default directory's. If they are the same, a relative path is
- *       passed relative, with its own bytes (the empty path as {@code .}), so a short relative path opens from a deep
- *       working directory as the JDK opens it. If they differ, or {@code getcwd} fails, it is passed as its absolute
- *       bytes, under the default directory, and the platform's path-length limit applies to that absolute form, as it
- *       does to the JDK's own file operations in that configuration. A process that changes its working directory
- *       afterwards, through native code that calls {@code chdir}, is outside what the binding follows, as it is for
- *       the JDK. Trailing slashes are removed (except from the root).
+ *   <li>An absolute path is passed as its bytes. A relative path is passed the way the JDK passes it to the
+ *       operating system for its own file operations: relative, with its own bytes (the empty path as {@code .}), when
+ *       the JDK does so, which is when it started with its default directory ({@code user.dir}) equal to the process's
+ *       working directory, and as its absolute bytes under the default directory otherwise ({@code -Duser.dir=}
+ *       naming another directory), to which the platform's path-length limit then applies. The JDK does not expose
+ *       that decision, so the binding infers it the first time it converts a relative path: relative if the working
+ *       directory ({@code getcwd}) has the default directory's bytes, or if the JDK's own {@code stat} of
+ *       {@code Path.of("")} reaches the working directory while the default directory's path does not (the working
+ *       directory was renamed after start-up); absolute otherwise, or if the inference fails, in which case the next
+ *       conversion tries again. A process that changes its working directory through native code ({@code chdir}) is
+ *       outside what the binding follows, as it is for the JDK. Trailing slashes are removed (except from the root).
  *   <li>{@code toUri()} may {@code stat} the path once (to tell whether it is a directory), and for a relative path
- *       the working directory once more. This happens when a journal is opened or inspected, or a retention
- *       destination is set, never per record.
+ *       the working directory once more; until the inference above has succeeded, a relative path also costs a
+ *       {@code getcwd} and up to three more {@code stat}s. This happens when a journal is opened or inspected, or a
+ *       retention destination is set, never per record.
  *   <li>Only the default file system is supported; a path of any other ({@code FileSystems.newFileSystem}, a zip file
  *       system) throws {@link IllegalArgumentException}.
  * </ul>

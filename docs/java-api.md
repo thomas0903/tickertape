@@ -104,25 +104,26 @@ The Linux libraries are built for glibc.
   macOS's `-Djdk.nio.path.useNormalizationFormD`, reaches the operating system as the JDK holds it. The binding reads
   those bytes from `Path.toUri()`, whose `file:` URI carries the absolute path's bytes percent-encoded one by one, and
   decodes them; it does not reconstruct them from `toString()`. What follows from that:
-  - an absolute path is passed as its bytes. A relative path is resolved by the JDK against its default directory, which
-    it reads from `user.dir` at start-up, and by the C library against the process's working directory; the two are the
-    same unless the JVM was started with `-Duser.dir=` naming another directory (setting the property later moves
-    neither). The binding follows the JDK, which passes a relative path to the operating system as it is only when its
-    default directory is the process's working directory: the first time the binding converts a path it calls the C
-    library's `getcwd` once, through the FFM linker, and compares the bytes with those of the default directory
-    (`Path.of("").toUri()`, decoded like any path). If they are the same, a relative path is passed **relative**, with
-    its own bytes (the empty path as `.`): the binding strips from the absolute bytes those of the default directory and
-    the separator after them, and passes the absolute bytes if that prefix does not match. A journal reached by a short
-    relative path from a deep working directory therefore opens even when its absolute path would exceed the platform's
-    path-length limit, as the JDK opens it. If they differ (`-Duser.dir=`), or `getcwd` fails, a relative path is passed
-    as its absolute bytes, under the default directory, so it reaches the journal the JDK's own `Files` methods see; the
-    path-length limit then applies to that absolute form, as it does to the JDK's own file operations in that
-    configuration. The comparison is made once: a process that changes its working directory afterwards through native
-    code (`chdir`) is outside what the binding follows, as it is for the JDK. Trailing slashes are removed (except from
-    the root);
+  - an absolute path is passed as its bytes. A relative path is passed the way the JDK passes it to the operating
+    system for its own file operations. The JDK decides that once, at start-up: relative when its default directory
+    (`user.dir`) has the bytes of the process's working directory, resolved against the default directory otherwise
+    (`-Duser.dir=` naming another directory). It does not expose the decision, so the binding infers it the first time
+    it converts a relative path: **relative** if the working directory, read with the C library's `getcwd` through the
+    FFM linker, has the default directory's bytes, or if the JDK's own `stat` of `Path.of("")` reaches the working
+    directory while the default directory's path does not (the working directory was renamed after start-up); as its
+    **absolute** bytes otherwise, or if the inference fails (native access refused, a `stat` failing), in which case
+    that conversion passes the absolute bytes and the next one tries again. A relative path passed relative keeps its
+    own bytes (the empty path as `.`): the binding strips from the absolute bytes those of the default directory and the
+    separator after them, and passes the absolute bytes if that prefix does not match, so a journal reached by a short
+    relative path from a deep working directory opens even when its absolute path would exceed the platform's
+    path-length limit, as the JDK opens it. Passed absolute, it reaches the journal the JDK's own `Files` methods see,
+    and the path-length limit applies to that absolute form, as it does to the JDK's own file operations then. A process
+    that changes its working directory through native code (`chdir`) is outside what the binding follows, as it is for
+    the JDK. Trailing slashes are removed (except from the root);
   - `toUri()` may `stat` the path once (to tell whether it is a directory), and for a relative path the working
-    directory once more, which happens when a journal is opened or inspected, or a retention destination is set
-    (`Retention.moveTo`), never per record.
+    directory once more (until the inference has succeeded, also a `getcwd` and up to three more `stat`s), which
+    happens when a journal is opened or inspected, or a retention destination is set (`Retention.moveTo`), never per
+    record.
 
   The exact URI form is the default provider's behaviour on Linux and macOS, not something the `Path.toUri`
   specification fixes; the binding's tests pin it, and a URI not in that form is refused with
