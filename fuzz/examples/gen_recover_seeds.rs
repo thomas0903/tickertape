@@ -16,6 +16,9 @@ const FAIL: u8 = 0x00;
 /// Offset selectors of the grammar.
 const AT_CURSOR: u8 = 2;
 const AT_LAST_RECORD: u8 = 3;
+const AT_FIRST_RECORD: u8 = 1;
+/// Followed by a `u16` offset.
+const ABSOLUTE: u8 = 6;
 
 #[derive(Default)]
 struct Ops(Vec<u8>, u8);
@@ -43,6 +46,25 @@ impl Ops {
         let mut op = vec![2, sel, delta as u8, bytes.len() as u8];
         op.extend_from_slice(bytes);
         self.op(&op)
+    }
+
+    /// Zeroes `len` bytes at `sel` + `delta` (`sel` one of the named selectors).
+    fn zero(&mut self, sel: u8, delta: i8, len: u16) -> &mut Self {
+        let [lo, hi] = len.to_le_bytes();
+        self.op(&[3, sel, delta as u8, lo, hi])
+    }
+
+    /// Zeroes `len` bytes at the absolute offset `at`.
+    fn zero_at(&mut self, at: u16, len: u16) -> &mut Self {
+        let [a, b] = at.to_le_bytes();
+        let [lo, hi] = len.to_le_bytes();
+        self.op(&[3, ABSOLUTE, a, b, 0, lo, hi])
+    }
+
+    /// Copies `len` bytes from `from` + `from_delta` to `to` + `to_delta` (named selectors).
+    fn copy(&mut self, from: u8, from_delta: i8, to: u8, to_delta: i8, len: u16) -> &mut Self {
+        let [lo, hi] = len.to_le_bytes();
+        self.op(&[9, from, from_delta as u8, to, to_delta as u8, lo, hi])
     }
 
     fn flip(&mut self, sel: u8, delta: i8, bit: u8) -> &mut Self {
@@ -157,8 +179,9 @@ fn main() {
         ));
     }
 
-    // `Fail` refuses a disconnected segment, but only after the scan zeroed the never-committed bytes of the first
-    // segment (every policy does that), so a refused open is not byte-for-byte a no-op.
+    // `Fail` refuses a disconnected segment. Its base is above the first segment's next sequence number, which only
+    // a committed record there could have produced, so the non-zero bytes after the first segment's records count as
+    // committed history (ADR 0035) and the refusal comes before anything is zeroed.
     seeds.push((
         "disconnected_after_torn_tail_fail",
         input(
@@ -269,6 +292,74 @@ fn main() {
             0,
             &[],
         ),
+    ));
+
+    // ADR 0035: storage damage zeroes the commit word of a record that has committed records after it (record 10
+    // of 30, 100-byte payloads: 144-byte frames from offset 64). Recovery must preserve the tail, or refuse.
+    let mut zeroed_word = Ops::default();
+    zeroed_word.records(30, 100).zero_at(64 + 144 * 10, 4);
+    for (name, policy) in [
+        ("zeroed_commit_word", QUARANTINE),
+        ("zeroed_commit_word_fail", FAIL),
+    ] {
+        seeds.push((name, input(policy, &[continuing(&zeroed_word)], 0, &[])));
+    }
+
+    // The same in a sealed first segment (record 50 of its 640-byte frames), with a second segment after it.
+    let mut zeroed_sealed = Ops::default();
+    zeroed_sealed
+        .records(255, 600)
+        .zero_at(64 + 640 * 50, 4)
+        .seal_to_next();
+    seeds.push((
+        "zeroed_commit_word_sealed",
+        input(
+            QUARANTINE,
+            &[continuing(&zeroed_sealed), continuing(&second)],
+            0,
+            &[],
+        ),
+    ));
+
+    // The last record before a seal: the seal (and the successor) are the only evidence.
+    let mut zeroed_last = Ops::default();
+    zeroed_last
+        .records(5, 40)
+        .zero(AT_LAST_RECORD, 0, 4)
+        .seal_to_next();
+    for (name, policy) in [
+        ("zeroed_commit_word_before_seal", QUARANTINE),
+        ("zeroed_commit_word_before_seal_fail", FAIL),
+    ] {
+        seeds.push((
+            name,
+            input(
+                policy,
+                &[continuing(&zeroed_last), continuing(&three)],
+                0,
+                &[],
+            ),
+        ));
+    }
+
+    // A zeroed 600-byte block (lost write) covering several records, with intact records after it.
+    let mut zeroed_block = Ops::default();
+    zeroed_block.records(40, 100).zero_at(64 + 144 * 10, 600);
+    seeds.push((
+        "zeroed_block",
+        input(QUARANTINE, &[continuing(&zeroed_block)], 0, &[]),
+    ));
+
+    // A torn append whose bytes hold a stale copy of the first record's frame: a valid frame, but with a sequence
+    // number its position rules out, so it is still a torn append (zeroed in place, nothing quarantined).
+    let mut torn_stale = Ops::default();
+    torn_stale
+        .records(25, 100)
+        .write(AT_CURSOR, 4, &[0xab; 40])
+        .copy(AT_FIRST_RECORD, 0, AT_CURSOR, 48, 144);
+    seeds.push((
+        "torn_tail_with_stale_frame",
+        input(FAIL, &[continuing(&torn_stale)], 0, &[]),
     ));
 
     for (name, bytes) in seeds {

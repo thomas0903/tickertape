@@ -4,7 +4,8 @@
 //! retention (moving old segments to an archive directory), injected storage-full roll failures (C9) and the
 //! occasional injected checkpoint failure (C12). It is killed with SIGKILL at random points, including during
 //! recovery (C1–C4), or stopped cleanly, and restarted. Between restarts the test sometimes damages the journal
-//! after the checkpoint (a flipped record byte, a truncated or damaged newest segment, or a damaged middle segment)
+//! after the checkpoint (a flipped record byte, a zeroed commit word, a truncated or damaged newest segment, or a
+//! damaged middle segment)
 //! and checks that recovery quarantines exactly what the crash contract says, byte for byte, or refuses without
 //! changing anything (C8, C11). Reader processes of both kinds (safe and mapped, visible and durable-only) follow the
 //! journal the whole time and must each see a gap-free, duplicate-free stream of records that pass their checksum and
@@ -237,7 +238,8 @@ fn walk(dir: &Path) -> Result<Chain, String> {
 enum Expect {
     /// Recover normally: `next_seq == end`, nothing quarantined.
     Clean { end: u64 },
-    /// A flipped byte in record `seq` at `offset` of `file`: repair that tail, quarantine every later segment.
+    /// A flipped byte or zeroed commit word in record `seq` at `offset` of `file`: repair that tail, quarantine every
+    /// later segment.
     Repair {
         file: String,
         offset: u64,
@@ -1077,9 +1079,16 @@ impl Soak {
             let r: ChainRecord =
                 chain.uncovered[rng.below(chain.uncovered.len() as u64) as usize].clone();
             let mut image = fs::read(&r.path).unwrap();
-            // A byte of the body (after the commit word), so the record fails its checksum.
-            let at = r.offset as usize + 4 + rng.below(u64::from(r.len) - 4) as usize;
-            image[at] ^= 1 << rng.below(8);
+            // Zeroing the commit word of a record that has a successor hides committed records behind an empty slot
+            // (ADR 0035); the newest record's would look like a torn append, so it is never chosen for this.
+            let zero_word = pick < 3 && r.seq + 1 < chain.end;
+            if zero_word {
+                image[r.offset as usize..r.offset as usize + 4].fill(0);
+            } else {
+                // A byte of the body (after the commit word), so the record fails its checksum.
+                let at = r.offset as usize + 4 + rng.below(u64::from(r.len) - 4) as usize;
+                image[at] ^= 1 << rng.below(8);
+            }
             let later: Vec<(String, Vec<u8>)> = chain
                 .visited
                 .iter()
@@ -1101,7 +1110,12 @@ impl Soak {
                 tail: image[r.offset as usize..].to_vec(),
                 later,
             };
-            (r.path, r.offset, "flipped record byte")
+            let kind = if zero_word {
+                "zeroed commit word"
+            } else {
+                "flipped record byte"
+            };
+            (r.path, r.offset, kind)
         } else {
             let newest = chain.visited.last().unwrap().clone();
             let middle = after.len() > 1 && rng.below(3) == 0;
