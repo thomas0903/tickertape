@@ -72,7 +72,8 @@ detected").
 apart from its commit word (sequence number `S`, flags zero) and its stored CRC matches for a frame length `L` that
 fits and covers every non-zero byte after `P` (`L` from the end of the last non-zero byte to 63 bytes past it), and
 no matching length ends at the first candidate's aligned boundary, recovery takes it for a torn append whose body
-was completely written, with any candidate inside its payload, and treats `P` as a torn append. This is a heuristic
+was completely written, with any candidate inside its payload, and does not count the candidates in the segment (a
+segment with a higher base is still consulted afterwards, and counts under evidence (3)). This is a heuristic
 on the CRC, not a proof: a writer killed after storing the CRC and before the commit store leaves such bytes, and
 damaged bytes can match by chance. It does not cover
 a body torn in the middle (no CRC yet, or a CRC the bytes don't match yet), or a payload ending in more than 63 zero
@@ -321,10 +322,11 @@ before `P`.
 
 ### What cannot be detected
 
-Recovery and `verify` see only what is after `P`. **Any damage after which the search counts no evidence** (it finds
-no record that validates and no final seal, no segment with a higher base counts under the rules of evidence (3), so
-not one when only the seal's CRC word is left in front of a successor for exactly `S` that does not open, and it does
-not stop at its work bound outside a completely written torn frame) is classified as a torn append: recovery cannot
+Recovery and `verify` see only what is after `P`. **Any damage after which the search counts no evidence** (after
+the torn-frame check no record and no final seal in the segment counts: one that validates but lies inside a
+completely written torn frame is dismissed; no segment with a higher base counts under the rules of evidence (3), so
+not one when only the seal's CRC word is left in front of a successor for exactly `S` that does not open; and the
+search did not stop at its work bound outside such a frame) is classified as a torn append: recovery cannot
 tell it from one, whether or not a real torn append could leave those bytes. Unless a distinct, unentered segment
 for exactly `S` opens (then the seal branch decides, below), it is zeroed like one: the records it covers are destroyed in place, and `ZeroedUncommitted` reports the action
 taken, though a reader may already have returned them. What else happens depends on the rest of the directory. In

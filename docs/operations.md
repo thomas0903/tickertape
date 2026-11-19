@@ -148,9 +148,10 @@ Never truncate or edit a segment in place while anything uses the journal: proce
   than about 50 ms to fill a single record whose payload itself contains valid tickertape frames with nearby sequence
   numbers (a journal that stores another journal's raw frames), `verify` can report that record as an empty commit
   word in front of committed records while it is being written; a second run after the record is committed reports
-  nothing. With no writer running, a problem it reports is in the files and will be met by the next open, though not always
-  storage damage: a record torn by a crash whose payload holds such frames is reported the same way (crash contract
-  C1). Where a segment's records end at an empty
+  nothing. With no writer running, a problem it reports is in the files, though not always storage damage: a record torn by a
+  crash whose payload holds such frames is reported the same way (crash contract C1). The next open meets it only if
+  it lies after the checkpoint, where recovery's scan starts; `verify` scans every retained segment from its first
+  record. Where a segment's records end at an empty
   commit word, `verify` also searches the rest of that segment: it reads backward from the segment's end to find the
   last non-zero byte, then checks the candidates up to it, and can stop early (`cli.md` → `verify`).
 - `tickertape inspect <dir>` lists segments, their sequence ranges and fill level, and the checkpoint marker.

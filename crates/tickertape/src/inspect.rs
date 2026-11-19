@@ -213,9 +213,10 @@ pub struct Problem {
 /// report is real unless the writer stayed in such a state for that long (descheduled or stopped between two
 /// steps), or took longer than those 50 ms to fill a record whose payload holds valid frames with nearby sequence
 /// numbers; run `verify` again to tell. A problem that is really there is always reported, only later. With no
-/// writer running every reported problem is in the files and will be met by the next open (it need not be storage
-/// damage: a record torn by a crash whose payload holds such frames is reported the same way, crash contract C1),
-/// and a journal a crash left in such a state, or with an empty commit word in front of committed records at the end
+/// writer running every reported problem is in the files (it need not be storage damage: a record torn by a crash
+/// whose payload holds such frames is reported the same way, crash contract C1; and the next open meets it only if
+/// it lies after the checkpoint, where recovery's scan starts, while `verify` scans every retained segment from its
+/// first record), and a journal a crash left in such a state, or with an empty commit word in front of committed records at the end
 /// of the newest segment, takes those 630 ms or 50 ms longer to verify.
 /// Retention is not a problem either: a segment it removes before the scan reaches it is not an error, and since
 /// retention removes the oldest segments first, the report then starts at the oldest segment the scan could still
