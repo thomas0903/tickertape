@@ -1,13 +1,19 @@
-//! Compiles the C99 and C++11 test programs and the examples against the committed header and the libraries Cargo
-//! built for this crate, runs them, and checks the cross-language fixtures:
+//! Compiles the C test programs, the C++ binding's test programs (`include/tickertape.hpp`, ADR 0036) and the
+//! examples against the committed headers and the libraries Cargo built for this crate, runs them, and checks the
+//! cross-language fixtures:
 //!
-//! - a journal written through the C ABI reads back identically with the Rust reader and the Python decoder
-//!   (`python/tickertape_reader.py`), including durable-only reads and a segment roll;
-//! - the C reader reads a journal written by the Rust writer.
+//! - a journal written through the C ABI or the C++ binding reads back identically with the Rust reader, the Python
+//!   decoder (`python/tickertape_reader.py`) and the other language, including durable-only reads and a segment roll;
+//! - the C and C++ readers read a journal written by the Rust writer.
+//!
+//! It also checks that the C++ binding covers every C function and status, compiles at every language level, and
+//! allocates nothing on the hot path.
 //!
 //! Environment:
 //! - `TICKERTAPE_FFI_SANITIZE=1`: compile the C/C++ programs with AddressSanitizer and UBSan.
 //! - `TICKERTAPE_FFI_VALGRIND=1`: run the C/C++ programs under Valgrind (Linux).
+//! - `TICKERTAPE_FFI_CXX_COMPILERS`: the C++ compilers for the language-level matrix (space-separated; default: the
+//!   `cc` crate's, plus `g++` and `clang++` if found).
 //! - `TICKERTAPE_FFI_REQUIRE_PYTHON=1`: fail instead of skipping the Python checks when no `python3` is found
 //!   (`TICKERTAPE_PYTHON` overrides the interpreter).
 //! - `CC`, `CXX`, `CFLAGS`, `CXXFLAGS`: as for the `cc` crate.
@@ -220,10 +226,12 @@ enum Link {
     None,
 }
 
-/// Compiles `sources` as language standard `std` (`c99`, `c++20`, ...) into the executable `out`.
-fn compile(sources: &[PathBuf], std: &str, link: Link, extra_includes: &[PathBuf], out: &Path) {
-    let cpp = std.starts_with("c++");
-    let tool = cc::Build::new()
+/// The warnings the C++ binding promises to compile without (ADR 0036), on top of `-Wall -Wextra -Werror`.
+const CPP_BINDING_WARNINGS: &[&str] = &["-Wpedantic", "-Wconversion", "-Wshadow"];
+
+/// The C or C++ compiler the `cc` crate picks for the target (honours `CC`, `CXX`, `CFLAGS`, `CXXFLAGS`).
+fn compiler(cpp: bool) -> cc::Tool {
+    cc::Build::new()
         .cargo_metadata(false)
         .cargo_warnings(false)
         .target(target_triple())
@@ -231,10 +239,17 @@ fn compile(sources: &[PathBuf], std: &str, link: Link, extra_includes: &[PathBuf
         .opt_level(1)
         .debug(true)
         .cpp(cpp)
-        .get_compiler();
-    let mut cmd = tool.to_command();
+        .get_compiler()
+}
+
+/// Compiles `sources` as language standard `std` (`c99`, `c++17`, ...) with the extra `flags` into the executable
+/// `out`.
+fn compile(sources: &[PathBuf], std: &str, link: Link, flags: &[&str], out: &Path) {
+    let cpp = std.starts_with("c++");
+    let mut cmd = compiler(cpp).to_command();
     cmd.arg(format!("-std={std}"));
     cmd.args(["-Wall", "-Wextra", "-Werror", "-pedantic"]);
+    cmd.args(flags);
     if env_flag("TICKERTAPE_FFI_SANITIZE") {
         cmd.args([
             "-fsanitize=address,undefined",
@@ -243,9 +258,6 @@ fn compile(sources: &[PathBuf], std: &str, link: Link, extra_includes: &[PathBuf
         ]);
     }
     cmd.arg("-I").arg(manifest_dir().join("include"));
-    for include in extra_includes {
-        cmd.arg("-I").arg(include);
-    }
     cmd.args(sources);
     match link {
         Link::Static => {
@@ -269,16 +281,25 @@ fn compile(sources: &[PathBuf], std: &str, link: Link, extra_includes: &[PathBuf
     );
 }
 
+/// Sources, language standard, link mode, extra flags and output of one program.
+type CompileJob<'a> = (Vec<PathBuf>, &'a str, Link, &'a [&'a str], &'a Path);
+
 /// The compiled programs, built once per test process.
 struct Programs {
     /// `tests/c/test_api.c` as C99 (linked statically) and as C11 (linked dynamically).
     c_test: PathBuf,
     c11_test: PathBuf,
-    /// `tests/cpp/test_wrapper.cpp` as C++11 and C++20.
-    cpp_test: PathBuf,
-    cpp20_test: PathBuf,
-    /// `tests/cpp/test_wrapper_stub.cpp` as C++11, with stubbed C functions instead of the library.
-    cpp_stub_test: PathBuf,
+    /// `tests/cpp/test_c_header.cpp`: the C header alone from C++11 and C++20.
+    c_header_cpp11: PathBuf,
+    c_header_cpp20: PathBuf,
+    /// `tests/cpp/test_binding.cpp` as C++17 (shared), C++20 (static) and C++17 without exceptions (shared).
+    binding: PathBuf,
+    binding_cpp20: PathBuf,
+    binding_no_exceptions: PathBuf,
+    /// `tests/cpp/test_binding_stub.cpp` as C++17, with stubbed C functions instead of the library.
+    binding_stub: PathBuf,
+    /// `tests/cpp/test_no_alloc.cpp` as C++17.
+    no_alloc: PathBuf,
     writer: PathBuf,
     reader: PathBuf,
     example: PathBuf,
@@ -320,48 +341,90 @@ fn programs() -> &'static Programs {
         let p = Programs {
             c_test: dir.join("test_api"),
             c11_test: dir.join("test_api_c11"),
-            cpp_test: dir.join("test_wrapper"),
-            cpp20_test: dir.join("test_wrapper_cpp20"),
-            cpp_stub_test: dir.join("test_wrapper_stub"),
+            c_header_cpp11: dir.join("test_c_header_cpp11"),
+            c_header_cpp20: dir.join("test_c_header_cpp20"),
+            binding: dir.join("test_binding"),
+            binding_cpp20: dir.join("test_binding_cpp20"),
+            binding_no_exceptions: dir.join("test_binding_no_exceptions"),
+            binding_stub: dir.join("test_binding_stub"),
+            no_alloc: dir.join("test_no_alloc"),
             writer: dir.join("writer"),
             reader: dir.join("reader"),
             example: dir.join("example"),
         };
-        let c_test = [tests.join("c/test_api.c")];
-        let cpp_test = [tests.join("cpp/test_wrapper.cpp")];
-        let wrapper = std::slice::from_ref(&examples);
-        compile(&c_test, "c99", Link::Static, &[], &p.c_test);
-        compile(&c_test, "c11", Link::Shared, &[], &p.c11_test);
-        compile(&cpp_test, "c++11", Link::Shared, wrapper, &p.cpp_test);
-        compile(&cpp_test, "c++20", Link::Static, wrapper, &p.cpp20_test);
-        compile(
-            &[tests.join("cpp/test_wrapper_stub.cpp")],
-            "c++11",
-            Link::None,
-            wrapper,
-            &p.cpp_stub_test,
-        );
-        compile(
-            &[examples.join("writer.c")],
-            "c99",
-            Link::Static,
-            &[],
-            &p.writer,
-        );
-        compile(
-            &[examples.join("reader.c")],
-            "c99",
-            Link::Shared,
-            &[],
-            &p.reader,
-        );
-        compile(
-            &[examples.join("example.cpp")],
-            "c++11",
-            Link::Shared,
-            wrapper,
-            &p.example,
-        );
+        let c_test = vec![tests.join("c/test_api.c")];
+        let c_header = vec![tests.join("cpp/test_c_header.cpp")];
+        let binding = vec![tests.join("cpp/test_binding.cpp")];
+        let strict = CPP_BINDING_WARNINGS;
+        let no_exceptions = [CPP_BINDING_WARNINGS, &["-fno-exceptions"]].concat();
+        let jobs: Vec<CompileJob<'_>> = vec![
+            (c_test.clone(), "c99", Link::Static, &[], &p.c_test),
+            (c_test, "c11", Link::Shared, &[], &p.c11_test),
+            (
+                c_header.clone(),
+                "c++11",
+                Link::Shared,
+                &[],
+                &p.c_header_cpp11,
+            ),
+            (c_header, "c++20", Link::Static, &[], &p.c_header_cpp20),
+            (binding.clone(), "c++17", Link::Shared, strict, &p.binding),
+            (
+                binding.clone(),
+                "c++20",
+                Link::Static,
+                strict,
+                &p.binding_cpp20,
+            ),
+            (
+                binding,
+                "c++17",
+                Link::Shared,
+                &no_exceptions,
+                &p.binding_no_exceptions,
+            ),
+            (
+                vec![tests.join("cpp/test_binding_stub.cpp")],
+                "c++17",
+                Link::None,
+                strict,
+                &p.binding_stub,
+            ),
+            (
+                vec![tests.join("cpp/test_no_alloc.cpp")],
+                "c++17",
+                Link::Shared,
+                strict,
+                &p.no_alloc,
+            ),
+            (
+                vec![examples.join("writer.c")],
+                "c99",
+                Link::Static,
+                &[],
+                &p.writer,
+            ),
+            (
+                vec![examples.join("reader.c")],
+                "c99",
+                Link::Shared,
+                &[],
+                &p.reader,
+            ),
+            (
+                vec![examples.join("example.cpp")],
+                "c++17",
+                Link::Shared,
+                strict,
+                &p.example,
+            ),
+        ];
+        lib_dir(); // build the library once, before the compilers run in parallel
+        std::thread::scope(|scope| {
+            for (sources, std, link, flags, out) in &jobs {
+                scope.spawn(move || compile(sources, std, *link, flags, out));
+            }
+        });
         p
     })
 }
@@ -567,30 +630,76 @@ fn c_api_basic() {
     }
 }
 
+/// The C header on its own compiles and works as C++11 and C++20 (ADR 0028), independently of the C++17 binding.
 #[test]
-fn cpp_wrapper() {
-    for program in [&programs().cpp_test, &programs().cpp20_test] {
+fn c_header_from_cpp11_and_cpp20() {
+    for program in [&programs().c_header_cpp11, &programs().c_header_cpp20] {
+        run_ok(&mut command(program));
+    }
+}
+
+/// The C++ binding's whole surface against the real library, as C++17, C++20 and C++17 without exceptions.
+#[test]
+fn cpp_binding() {
+    let p = programs();
+    for program in [&p.binding, &p.binding_cpp20, &p.binding_no_exceptions] {
         let scratch = tempfile::tempdir().unwrap();
         run_ok(command(program).arg(scratch.path()));
     }
 }
 
-/// The wrapper's `append_with` when the fill throws: a clean abort rethrows the fill's exception; a failed clean-up
-/// throws the library error with the fill's exception nested (stubbed C functions produce the failure).
+/// A throwing fill followed by a failed clean-up, every status and corruption reason, and a mismatched library,
+/// against stubbed C functions.
 #[test]
-fn cpp_wrapper_reports_a_failed_cleanup_after_a_throwing_fill() {
-    run_ok(&mut command(&programs().cpp_stub_test));
+fn cpp_binding_against_stubs() {
+    run_ok(&mut command(&programs().binding_stub));
+}
+
+/// The binding allocates nothing on the append and read paths (it counts `operator new`).
+#[test]
+fn cpp_binding_allocates_nothing_on_the_hot_path() {
+    let scratch = tempfile::tempdir().unwrap();
+    run_ok(command(&programs().no_alloc).arg(scratch.path()));
+}
+
+/// Debug builds of the binding abort when a record view's payload is read after the next call on its reader.
+#[test]
+fn cpp_binding_detects_a_stale_view_in_debug_builds() {
+    use std::os::unix::process::ExitStatusExt;
+    let scratch = tempfile::tempdir().unwrap();
+    let output = command(&programs().binding)
+        .arg(scratch.path())
+        .arg("stale-view")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.contains("about to read a stale view"),
+        "{stdout}{stderr}"
+    );
+    assert!(!stdout.contains("not detected"), "{stdout}{stderr}");
+    assert!(
+        stderr.contains("used after the next call on its Reader"),
+        "{stderr}"
+    );
+    assert!(
+        output.status.signal() == Some(6) || !output.status.success(),
+        "{}",
+        output.status
+    );
 }
 
 /// Documents one platform's outcome, not a promise: an exception escaping a fill callback is unsupported, and Rust
 /// leaves it unspecified whether a foreign exception reaching `catch_unwind` aborts the process or is caught as an
 /// opaque error. On the platforms CI runs (Linux and macOS with the system C++ runtime) the process aborts; if a
-/// toolchain update changes that, update the docs' description of the observed behaviour, not the contract.
+/// toolchain update changes that, update the docs' description of the observed behaviour, not the contract. (The C++
+/// binding never lets this happen: its trampoline catches everything.)
 #[test]
-fn cpp_exception_escaping_a_fill_callback_aborts() {
+fn cpp_exception_escaping_a_raw_fill_callback_aborts() {
     use std::os::unix::process::ExitStatusExt;
     let scratch = tempfile::tempdir().unwrap();
-    let output = command(&programs().cpp_test)
+    let output = command(&programs().binding)
         .arg(scratch.path())
         .arg("throw-from-fill")
         .output()
@@ -608,35 +717,43 @@ fn cpp_exception_escaping_a_fill_callback_aborts() {
     );
 }
 
+fn read_fixture_in(program: &Path, dir: &Path) {
+    let mut cmd = command(program);
+    cmd.arg("read-fixture")
+        .arg(dir)
+        .arg(FIXTURE_RECORDS.to_string())
+        .arg(FIXTURE_CHECKPOINT_AT.to_string());
+    run_ok(&mut cmd);
+}
+
 #[test]
-fn journal_written_through_c_reads_back_in_rust_and_python() {
+fn journal_written_through_c_reads_back_in_rust_python_and_cpp() {
     let scratch = tempfile::tempdir().unwrap();
     let dir = scratch.path().join("from-c");
     run_ok(command(&programs().c_test).arg("write-fixture").arg(&dir));
     check_fixture_from_rust_and_python(&dir);
-    // The C reader agrees too.
-    run_ok(
-        command(&programs().c_test)
-            .arg("read-fixture")
-            .arg(&dir)
-            .arg(FIXTURE_RECORDS.to_string())
-            .arg(FIXTURE_CHECKPOINT_AT.to_string()),
-    );
+    read_fixture_in(&programs().c_test, &dir);
+    read_fixture_in(&programs().binding, &dir);
 }
 
 #[test]
-fn journal_written_by_rust_reads_back_in_c() {
+fn journal_written_through_cpp_reads_back_in_rust_python_and_c() {
+    let scratch = tempfile::tempdir().unwrap();
+    let dir = scratch.path().join("from-cpp");
+    run_ok(command(&programs().binding).arg("write-fixture").arg(&dir));
+    check_fixture_from_rust_and_python(&dir);
+    read_fixture_in(&programs().c_test, &dir);
+    read_fixture_in(&programs().binding_no_exceptions, &dir);
+}
+
+#[test]
+fn journal_written_by_rust_reads_back_in_c_and_cpp() {
     let scratch = tempfile::tempdir().unwrap();
     let dir = scratch.path().join("from-rust");
     write_rust_fixture(&dir);
     check_fixture_from_rust_and_python(&dir);
-    run_ok(
-        command(&programs().c_test)
-            .arg("read-fixture")
-            .arg(&dir)
-            .arg(FIXTURE_RECORDS.to_string())
-            .arg(FIXTURE_CHECKPOINT_AT.to_string()),
-    );
+    read_fixture_in(&programs().c_test, &dir);
+    read_fixture_in(&programs().binding_cpp20, &dir);
 }
 
 #[test]
@@ -671,17 +788,6 @@ fn examples_record_follow_live_and_replay() {
     assert_eq!(replay.lines().count(), 20);
     assert_eq!(replay.lines().collect::<Vec<_>>()[..], lines[10..]);
 
-    let example = run_ok(command(&p.example).arg(&dir));
-    let example = String::from_utf8(example.stdout).unwrap();
-    let expected = [
-        "30 order 0",
-        "31 order 1",
-        "32 order 2",
-        "33 order 3",
-        "34 order 4",
-        "35 zero-copy",
-    ];
-    assert_eq!(example.lines().collect::<Vec<_>>(), expected);
     // The writer checkpointed at the end, so a durable-only replay sees everything.
     let durable = run_ok(
         command(&p.reader)
@@ -691,6 +797,393 @@ fn examples_record_follow_live_and_replay() {
     );
     assert_eq!(
         String::from_utf8(durable.stdout).unwrap().lines().count(),
-        36
+        30
     );
+}
+
+#[test]
+fn cpp_example_records_follows_live_and_replays() {
+    let scratch = tempfile::tempdir().unwrap();
+    let dir = scratch.path().join("example");
+    let p = programs();
+    let follower = command(&p.example)
+        .arg(&dir)
+        .arg("follow")
+        .arg("30")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    run_ok(
+        command(&p.example)
+            .arg(&dir)
+            .arg("record")
+            .arg("30")
+            .arg("5"),
+    );
+    let followed = wait_with_deadline(follower, Duration::from_secs(60));
+    let followed = String::from_utf8(followed.stdout).unwrap();
+    let lines: Vec<&str> = followed.lines().collect();
+    let expected: Vec<String> = (0..30)
+        .map(|i| format!("{i} schema={} order {i}", 1 + i % 2))
+        .collect();
+    assert_eq!(lines, expected, "{followed}");
+
+    let replay = run_ok(command(&p.example).arg(&dir).arg("replay").arg("10"));
+    let replay = String::from_utf8(replay.stdout).unwrap();
+    assert_eq!(replay.lines().collect::<Vec<_>>()[..], lines[10..]);
+    // The C reader agrees.
+    let c_replay = run_ok(command(&p.reader).arg(&dir).arg("replay"));
+    assert_eq!(
+        String::from_utf8(c_replay.stdout).unwrap().lines().count(),
+        30
+    );
+    // It checkpointed at the end, so a durable-only replay sees everything.
+    let durable = run_ok(
+        command(&p.example)
+            .arg(&dir)
+            .arg("replay")
+            .env("TICKERTAPE_DURABLE_ONLY", "1"),
+    );
+    assert_eq!(String::from_utf8(durable.stdout).unwrap(), followed);
+}
+
+// ---- The C++ binding's coverage of the C ABI (ADR 0036) ----
+
+fn read_text(path: &Path) -> String {
+    std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+}
+
+fn c_header() -> String {
+    read_text(&manifest_dir().join("include/tickertape.h"))
+}
+
+fn cpp_header() -> String {
+    read_text(&manifest_dir().join("include/tickertape.hpp"))
+}
+
+/// The names of the functions `tickertape.h` declares (one per declaration line inside `extern "C"`).
+fn c_functions(header: &str) -> Vec<String> {
+    header
+        .lines()
+        .filter(|line| {
+            line.starts_with(|c: char| c.is_ascii_alphabetic())
+                && !line.starts_with("typedef")
+                && !line.starts_with("enum")
+                && !line.starts_with("extern")
+        })
+        .filter_map(|line| {
+            let before = &line[..line.find('(')?];
+            let name = before
+                .rsplit(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .next()?;
+            name.starts_with("tickertape_").then(|| name.to_owned())
+        })
+        .collect()
+}
+
+/// Every C function the C++ binding calls, with the C++ declaration that wraps it.
+const CPP_WRAPPED: &[(&str, &str)] = &[
+    (
+        "tickertape_abi_version",
+        "library_abi_version, library_compatible",
+    ),
+    (
+        "tickertape_version_number",
+        "library_version_number, library_compatible",
+    ),
+    ("tickertape_version", "library_version, check_library"),
+    ("tickertape_realtime_ns", "realtime_ns"),
+    ("tickertape_verify", "verify"),
+    ("tickertape_list_segments", "list_segments"),
+    ("tickertape_read_checkpoint", "read_checkpoint"),
+    (
+        "tickertape_retention_apply",
+        "apply_retention, plan_retention",
+    ),
+    ("tickertape_writer_options_new", "WriterOptions()"),
+    ("tickertape_writer_options_free", "~WriterOptions"),
+    (
+        "tickertape_writer_options_set_segment_size",
+        "WriterOptions::segment_size",
+    ),
+    (
+        "tickertape_writer_options_set_recovery_policy",
+        "WriterOptions::recovery_policy",
+    ),
+    (
+        "tickertape_writer_options_set_notify",
+        "WriterOptions::notify",
+    ),
+    (
+        "tickertape_writer_options_set_prefault",
+        "WriterOptions::prefault",
+    ),
+    (
+        "tickertape_writer_options_set_retention",
+        "WriterOptions::retention, no_retention",
+    ),
+    ("tickertape_reader_options_new", "ReaderOptions()"),
+    ("tickertape_reader_options_free", "~ReaderOptions"),
+    (
+        "tickertape_reader_options_set_durable_only",
+        "ReaderOptions::durable_only",
+    ),
+    (
+        "tickertape_reader_options_set_notify",
+        "ReaderOptions::notify",
+    ),
+    (
+        "tickertape_reader_options_set_backoff",
+        "ReaderOptions::backoff",
+    ),
+    (
+        "tickertape_reader_options_set_busy_spin",
+        "ReaderOptions::busy_spin",
+    ),
+    ("tickertape_retention_new", "Retention()"),
+    ("tickertape_retention_free", "~Retention"),
+    (
+        "tickertape_retention_set_max_segments",
+        "Retention::max_segments",
+    ),
+    ("tickertape_retention_set_max_bytes", "Retention::max_bytes"),
+    ("tickertape_retention_set_max_age_ns", "Retention::max_age"),
+    (
+        "tickertape_retention_set_delete",
+        "Retention::delete_segments",
+    ),
+    ("tickertape_retention_set_move_to", "Retention::move_to"),
+    ("tickertape_reader_open", "Reader::open"),
+    (
+        "tickertape_reader_open_mapped_unsafe",
+        "Reader::open_mapped_unsafe",
+    ),
+    ("tickertape_reader_close", "~Reader, Reader::close"),
+    ("tickertape_reader_seek", "Reader::seek"),
+    ("tickertape_reader_next", "Reader::next"),
+    ("tickertape_reader_next_copy", "Reader::next_copy"),
+    (
+        "tickertape_reader_read_batch",
+        "Reader::read_batch, RecordBatch",
+    ),
+    ("tickertape_reader_position", "Reader::position"),
+    ("tickertape_last_error_message", "Error::message"),
+    ("tickertape_last_error_os_code", "Error::os_code"),
+    (
+        "tickertape_last_error_corrupt_reason",
+        "Error::corrupt_reason",
+    ),
+    ("tickertape_status_name", "status_name, Error::name"),
+    ("tickertape_corrupt_reason_name", "corrupt_reason_name"),
+    ("tickertape_writer_open", "Writer::open"),
+    ("tickertape_writer_close", "~Writer, Writer::close"),
+    ("tickertape_writer_append", "Writer::append"),
+    ("tickertape_writer_append_with", "Writer::append_with"),
+    (
+        "tickertape_writer_append_batch",
+        "Writer::append_batch, NewRecord",
+    ),
+    ("tickertape_writer_checkpoint", "Writer::checkpoint"),
+    ("tickertape_writer_next_seq", "Writer::next_seq"),
+    (
+        "tickertape_writer_last_retention_error",
+        "Writer::last_retention_error",
+    ),
+];
+
+/// C functions the C++ binding deliberately does not call; ADR 0036 lists each with the same reason.
+const CPP_NOT_WRAPPED: &[(&str, &str)] = &[(
+    "tickertape_last_error_code",
+    "every call returns its status, and Error takes the code from that return value",
+)];
+
+/// Fails when a C function is added (or removed) without a decision about the C++ binding (ADR 0036).
+#[test]
+fn cpp_binding_decides_about_every_c_function() {
+    let functions = c_functions(&c_header());
+    assert!(functions.len() > 40, "parsed only {functions:?}");
+    let cpp = cpp_header();
+    let adr = read_text(&repo_root().join("docs/decisions/0036-cpp-binding.md"));
+    for name in &functions {
+        let wrapped = CPP_WRAPPED.iter().any(|(c, _)| c == name);
+        let not_wrapped = CPP_NOT_WRAPPED.iter().any(|(c, _)| c == name);
+        assert!(
+            wrapped != not_wrapped,
+            "{name}: add it to CPP_WRAPPED (and wrap it in tickertape.hpp) or to CPP_NOT_WRAPPED (and ADR 0036)"
+        );
+        if wrapped {
+            assert!(
+                cpp.contains(&format!("{name}(")),
+                "{name} is listed as wrapped but tickertape.hpp never calls it"
+            );
+        } else {
+            assert!(
+                !cpp.contains(&format!("{name}(")),
+                "{name} is listed as not wrapped but tickertape.hpp calls it"
+            );
+            assert!(
+                adr.contains(name.as_str()),
+                "ADR 0036 must say why {name} is not wrapped"
+            );
+        }
+    }
+    for (name, _) in CPP_WRAPPED.iter().chain(CPP_NOT_WRAPPED) {
+        assert!(
+            functions.iter().any(|f| f == name),
+            "{name} is listed but tickertape.h does not declare it"
+        );
+    }
+}
+
+/// The enumerators of the C enum or C++ enum class that starts at `start`: the `TICKERTAPE_*` name on each line
+/// up to the closing brace (left of `=` in C, right of it in C++).
+fn enumerators(text: &str, start: &str) -> Vec<String> {
+    let body = &text[text.find(start).unwrap_or_else(|| panic!("no {start}"))..];
+    let body = &body[..body.find("};").unwrap()];
+    body.lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let at = line.find("TICKERTAPE_")?;
+            let name: String = line[at..]
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            (line.contains('=') && !line.starts_with("//") && !line.starts_with('*'))
+                .then_some(name)
+        })
+        .collect()
+}
+
+/// Every status code, corruption reason and recovery policy of the C ABI has a C++ enumerator.
+#[test]
+fn cpp_binding_maps_every_status_and_reason() {
+    let c = c_header();
+    let cpp = cpp_header();
+    for (c_enum, cpp_enum, min) in [
+        ("enum tickertape_status_code", "enum class Status", 20),
+        (
+            "enum tickertape_corrupt_reason",
+            "enum class CorruptReason",
+            15,
+        ),
+        (
+            "enum tickertape_recovery_policy",
+            "enum class RecoveryPolicy",
+            2,
+        ),
+    ] {
+        let mut from_c = enumerators(&c, c_enum);
+        let mut from_cpp = enumerators(&cpp, cpp_enum);
+        assert!(from_c.len() >= min, "{c_enum}: {from_c:?}");
+        from_c.sort();
+        from_cpp.sort();
+        assert_eq!(
+            from_c, from_cpp,
+            "{cpp_enum} in tickertape.hpp must name every value of {c_enum}"
+        );
+    }
+}
+
+fn define(text: &str, name: &str) -> u32 {
+    let prefix = format!("#define {name} ");
+    let line = text
+        .lines()
+        .find(|line| line.starts_with(&prefix))
+        .unwrap_or_else(|| panic!("no {name}"));
+    line[prefix.len()..].trim().parse().unwrap()
+}
+
+/// The C++ header carries the version of the release it belongs to (ADR 0036 -> Versioning).
+#[test]
+fn cpp_header_version_matches_the_crate() {
+    let cpp = cpp_header();
+    let number = |s: &str| s.parse::<u32>().unwrap();
+    assert_eq!(
+        define(&cpp, "TICKERTAPE_HPP_VERSION_MAJOR"),
+        number(env!("CARGO_PKG_VERSION_MAJOR"))
+    );
+    assert_eq!(
+        define(&cpp, "TICKERTAPE_HPP_VERSION_MINOR"),
+        number(env!("CARGO_PKG_VERSION_MINOR"))
+    );
+    assert_eq!(
+        define(&cpp, "TICKERTAPE_HPP_VERSION_PATCH"),
+        number(env!("CARGO_PKG_VERSION_PATCH"))
+    );
+    assert_eq!(
+        define(&cpp, "TICKERTAPE_HPP_ABI_VERSION"),
+        define(&c_header(), "TICKERTAPE_ABI_VERSION")
+    );
+}
+
+/// The C++ compilers for the language-level matrix: the one the `cc` crate picks, plus `g++` and `clang++` if they
+/// are on the `PATH` and are different compilers (by `--version`). `TICKERTAPE_FFI_CXX_COMPILERS` (space-separated)
+/// replaces the list.
+fn cpp_compilers() -> Vec<PathBuf> {
+    if let Ok(list) = std::env::var("TICKERTAPE_FFI_CXX_COMPILERS") {
+        return list.split_whitespace().map(PathBuf::from).collect();
+    }
+    let mut candidates = vec![compiler(true).path().to_path_buf()];
+    candidates.extend([PathBuf::from("g++"), PathBuf::from("clang++")]);
+    let mut seen = Vec::new();
+    let mut compilers = Vec::new();
+    for candidate in candidates {
+        let Ok(output) = Command::new(&candidate).arg("--version").output() else {
+            continue;
+        };
+        let version = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_owned();
+        if output.status.success() && !seen.contains(&version) {
+            eprintln!(
+                "C++ compiler for the matrix: {} ({version})",
+                candidate.display()
+            );
+            seen.push(version);
+            compilers.push(candidate);
+        }
+    }
+    compilers
+}
+
+/// The header compiles without warnings as C++17, C++20 and C++23, with and without exceptions, with every C++
+/// compiler found (GCC and Clang on Linux CI), under -Wall -Wextra -Wpedantic -Wconversion -Wshadow.
+#[test]
+fn cpp_header_compiles_at_every_language_level() {
+    let scratch = tempfile::tempdir().unwrap();
+    let source = manifest_dir().join("tests/cpp/compile_all.cpp");
+    let compilers = cpp_compilers();
+    assert!(!compilers.is_empty(), "no C++ compiler found");
+    for (i, compiler) in compilers.iter().enumerate() {
+        for std in ["c++17", "c++20", "c++23"] {
+            for exceptions in ["-fexceptions", "-fno-exceptions"] {
+                let mut cmd = Command::new(compiler);
+                cmd.arg(format!("-std={std}"))
+                    .arg(exceptions)
+                    .args(["-O2", "-Wall", "-Wextra", "-Werror"])
+                    .args(CPP_BINDING_WARNINGS)
+                    .arg("-I")
+                    .arg(manifest_dir().join("include"))
+                    .arg("-c")
+                    .arg(&source)
+                    .arg("-o")
+                    .arg(
+                        scratch
+                            .path()
+                            .join(format!("compile_all_{i}_{std}{exceptions}.o")),
+                    );
+                let output = cmd.output().expect("run the C++ compiler");
+                assert!(
+                    output.status.success(),
+                    "{cmd:?} failed\n{}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+    }
 }
