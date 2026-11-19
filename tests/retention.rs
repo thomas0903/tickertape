@@ -794,15 +794,24 @@ fn verify_waits_for_a_writer_stalled_between_linking_and_sealing() {
         "{:?}",
         report.problems
     );
-    // The "writer" seals 200 ms after verify starts.
+    // The "writer" seals 50 ms after verify opens the segment (no hook point lies between verify's scans, so the
+    // seal can't be placed exactly; started from the open, it lands well inside the 630 ms verify waits, however
+    // late the threads get to run, and the first scan, of a few hundred bytes, almost always finds it unsealed).
+    let (opened, wait) = std::sync::mpsc::channel();
+    tickertape::fault::clear();
+    tickertape::fault::run_at(tickertape::fault::Point::InspectOpen, 0, move || {
+        opened.send(()).unwrap()
+    });
     let sealer = {
         let path = path.clone();
         std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(200));
+            wait.recv().unwrap();
+            std::thread::sleep(Duration::from_millis(50));
             seal(&path);
         })
     };
     let report = tickertape::inspect::verify(dir.path()).unwrap();
+    tickertape::fault::clear();
     sealer.join().unwrap();
     assert!(report.problems.is_empty(), "{:?}", report.problems);
 }

@@ -573,6 +573,191 @@ fn durable_only_reader_overtaken_by_retention_is_discarded_when_the_checkpoint_m
     }
 }
 
+/// The checkpoint boundary at a segment's end, with an empty successor (found by review). A durable-only reader has
+/// read every record of segment A (the marker covers them all); the writer rolls to B without committing a record
+/// there (a caught panic in `append_with`'s `fill` after the roll), checkpoints (the marker names B, at the reader's
+/// cursor), and retention removes A. The marker never moves past the cursor while the writer is idle, so the reader
+/// never reached an identity check: before the fix, both durable-only readers returned `Ok(None)` on every call, where
+/// a visible reader returns `Error::Discarded`. Now a durable-only reader waiting at the checkpoint with a marker
+/// naming a later segment does what a visible reader does at the seal: it follows the seal to B if A is in place and
+/// returns `Discarded` at its cursor if A is gone (ADR 0034 → Readers overtaken by retention).
+#[test]
+fn durable_only_reader_at_a_removed_segment_end_with_an_empty_successor_is_discarded() {
+    for mapped in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = Writer::open(dir.path(), small_config()).unwrap();
+        let payload = vec![0; 20_000];
+        let record = NewRecord {
+            schema_id: 1,
+            venue_ts_ns: 0,
+            local_ts_ns: 0,
+            payload: &payload,
+        };
+        for _ in 0..3 {
+            writer.append(&record).unwrap(); // Three fill the segment.
+        }
+        writer.checkpoint().unwrap();
+        let mut rolled = open(dir.path(), mapped);
+        let mut stale = open(dir.path(), mapped);
+        let mut visible = Reader::open(dir.path(), ReaderConfig::default()).unwrap();
+        for reader in [&mut rolled, &mut stale, &mut visible] {
+            for seq in 0..3 {
+                assert_eq!(reader.next_owned().unwrap().unwrap().seq, seq);
+            }
+            assert!(reader.try_next().unwrap().is_none());
+        }
+
+        // The fourth record doesn't fit: the writer rolls to segment 3, then the fill panics, so nothing is committed
+        // there.
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = writer.append_with(&record, payload.len(), |_| panic!("fill failed"));
+        }));
+        assert!(panicked.is_err());
+        assert_eq!(writer.next_seq(), 3);
+        assert_eq!(
+            segments(dir.path()).iter().map(|s| s.0).collect::<Vec<_>>(),
+            [0, 3]
+        );
+        writer.checkpoint().unwrap();
+        let marker = tickertape::inspect::read_checkpoint(dir.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!((marker.segment_base_seq, marker.next_seq), (3, 3));
+
+        // With segment 0 still in place, the reader moves to segment 3 and keeps it after the removal.
+        assert!(rolled.try_next().unwrap().is_none());
+        let plan = retention::plan(dir.path(), &Policy::default().max_segments(1)).unwrap();
+        retention::apply(dir.path(), &plan, &Action::Delete).unwrap();
+        assert_eq!(
+            segments(dir.path()).iter().map(|s| s.0).collect::<Vec<_>>(),
+            [3]
+        );
+        assert!(rolled.try_next().unwrap().is_none());
+
+        // A reader that hadn't looked since the roll finds segment 0 gone, as the visible reader does.
+        for reader in [&mut stale, &mut visible] {
+            match reader.try_next() {
+                Err(Error::Discarded { seq: 3 }) => {}
+                other => panic!("mapped {mapped}: {:?}", other.map(|r| r.map(|r| r.seq))),
+            }
+            reader.seek(3).unwrap();
+        }
+
+        writer.append(&record).unwrap();
+        assert!(stale.try_next().unwrap().is_none(), "not checkpointed yet");
+        writer.checkpoint().unwrap();
+        for reader in [&mut rolled, &mut stale, &mut visible] {
+            let record = reader.next_owned().unwrap().unwrap();
+            assert_eq!(record.seq, 3);
+            assert!(reader.try_next().unwrap().is_none());
+        }
+    }
+}
+
+/// A `stat` that fails other than with "not found" (here `EACCES`) at the identity check after reading a marker that
+/// moved past the cursor is an I/O error, and the reader doesn't apply that marker: the next call reads the marker
+/// again and checks again. Had it applied the marker, the replacement below would go unnoticed and the reader would
+/// return record 10 from the old file.
+#[test]
+fn identity_check_that_fails_leaves_the_marker_unapplied() {
+    use std::os::unix::fs::PermissionsExt;
+    for mapped in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = Writer::open(dir.path(), small_config()).unwrap();
+        append_n(&mut writer, 10);
+        writer.checkpoint().unwrap();
+        let mut reader = open(dir.path(), mapped);
+        expect_range(&mut reader, 0..10);
+        append_n(&mut writer, 10);
+        writer.checkpoint().unwrap();
+
+        let path = dir.path().to_path_buf();
+        let denied = std::rc::Rc::new(std::cell::Cell::new(false));
+        let d = denied.clone();
+        at(Point::ReaderCheckpointIdentity, move || {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+            d.set(
+                std::fs::metadata(path.join("probe"))
+                    .is_err_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied),
+            );
+        });
+        let result = reader.next_owned();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        tickertape::fault::clear();
+        if !denied.get() {
+            eprintln!(
+                "identity_check_that_fails_leaves_the_marker_unapplied: permissions have no effect (root?); skipped"
+            );
+            return;
+        }
+        match result {
+            Err(Error::Io { ref source, .. })
+                if source.kind() == std::io::ErrorKind::PermissionDenied => {}
+            other => panic!("mapped {mapped}: {:?}", other.map(|r| r.map(|r| r.seq))),
+        }
+        assert_eq!(reader.position(), 10);
+
+        // A copy renamed over the segment: same records, another file.
+        let segment = segments(dir.path())[0].1.clone();
+        let copy = dir.path().join("copy");
+        std::fs::copy(&segment, &copy).unwrap();
+        std::fs::rename(&copy, &segment).unwrap();
+        match reader.next_owned() {
+            Err(Error::Discarded { seq: 10 }) => {}
+            other => panic!("mapped {mapped}: {:?}", other.map(|r| r.map(|r| r.seq))),
+        }
+        reader.seek(10).unwrap();
+        expect_range(&mut reader, 10..20);
+    }
+}
+
+/// `seek` to a position past the start of a segment (`skip_until` above the base: the reader replays the segment from
+/// its start, skipping records before the target), then a repair of that segment before the next read. The reader
+/// had applied the marker at 10; the targets lie before it (5) and after it (12). A replacement gives
+/// `Error::Discarded` at the reader's position once a new marker moves past the cursor; an in-place repair is read
+/// through. Either way every record returned is the repaired journal's.
+#[test]
+fn seek_inside_a_segment_then_a_repair_before_the_next_read() {
+    for in_place in [false, true] {
+        for target in [5, 12] {
+            for mapped in [false, true] {
+                let case = format!("in place {in_place}, target {target}, mapped {mapped}");
+                let dir = tempfile::tempdir().unwrap();
+                let mut writer = Writer::open(dir.path(), small_config()).unwrap();
+                append_n(&mut writer, 10);
+                writer.checkpoint().unwrap();
+                append_n(&mut writer, 10); // 10..20, not checkpointed
+                drop(writer);
+                let mut reader = open(dir.path(), mapped);
+                expect_range(&mut reader, 0..10);
+                reader.seek(target).unwrap();
+                assert_eq!(reader.position(), target);
+
+                if in_place {
+                    repair_in_place(dir.path(), 15, 10, 99); // 15..25 of a new history, checkpointed
+                } else {
+                    repair(dir.path(), 15, 10, 0, 99);
+                }
+                let (records, discarded) = drain(&mut reader, 25);
+                assert_repaired_history(dir.path(), &records, target..25);
+                let expected: &[u64] = match (in_place, target) {
+                    (true, _) => &[],
+                    (false, 5) => &[10],
+                    (false, _) => &[12],
+                };
+                assert_eq!(discarded, expected, "{case}");
+                assert!(
+                    records
+                        .iter()
+                        .filter(|r| r.seq >= 15)
+                        .all(|r| r.schema_id == 99),
+                    "{case}"
+                );
+            }
+        }
+    }
+}
+
 /// A visible reader holding a segment that recovery replaced may return the old file's records after the repair:
 /// they were committed (visible) before the crash, which is all a visible reader promises, and are like records lost
 /// to a power loss that it had already seen (C8). It reports `Error::Discarded` within the identity-check interval of

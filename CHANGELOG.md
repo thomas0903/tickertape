@@ -28,6 +28,9 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   A safe durable-only reader could also return such records from its read buffer when recovery removed them in
   place, in a file that kept its identity (storage damage that emptied a commit word after the checkpoint); it now
   discards that buffer when it applies a new marker, so it reads every newly covered record from the file again.
+  A durable-only reader waiting at the end of a segment that retention removed, with the checkpoint naming the next
+  segment but not yet past its position (the writer rolled and committed nothing there), returned `Ok(None)` for as
+  long as the writer stayed idle; it now returns `Error::Discarded` there, as a visible reader does.
 - Fix: `tickertape tail` exited with an error when the records at its position had been removed by retention, which
   a `--durable-only` tail now learns of when the checkpoint moves past it. It continues at the oldest record still in
   the journal and warns on standard error with the range it skipped.
@@ -37,8 +40,8 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   50 ms, so a writer descheduled between linking a new segment and sealing the old one for longer made it report a
   broken chain. It now scans again with growing pauses, up to 630 ms in all.
 - Benchmarks: the test of a lagging reader under retention no longer depends on machine speed (it failed on
-  macOS CI runners), and `tt-sustained` readers retry a seek when retention removes the segment they were about to
-  open.
+  macOS CI runners). `tt-sustained` readers no longer need to retry a seek when retention removes the segment they
+  were about to open: `Reader::seek` now lists again by itself.
 - Benchmarks: sustained workloads (ADR 0026). `tt-sustained` runs one writer and any mix of safe/mapped,
   visible/durable-only and lagging reader processes for a fixed duration (default 10 minutes) with steady, bursty or
   unpaced traffic, periodic checkpoints, segment rolls and writer retention, and reports latency percentiles, late

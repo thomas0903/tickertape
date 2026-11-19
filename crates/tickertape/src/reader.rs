@@ -60,6 +60,10 @@ pub struct Reader {
     next_seq: u64,
     /// Exclusive checkpoint boundary, refreshed only when durable-only reads reach it.
     durable_next_seq: u64,
+    /// The segment the marker that set `durable_next_seq` names (0 if there was no valid marker).
+    durable_segment_base: u64,
+    /// When a durable-only reader waiting at the checkpoint last checked a segment that the marker has moved past.
+    superseded_checked: Option<Instant>,
     /// Records before this are skipped (set by `seek`).
     skip_until: u64,
     /// `pread` buffer: bytes of `seg` starting at file offset `buf_start`.
@@ -75,6 +79,7 @@ pub struct Reader {
 
 #[derive(Debug)]
 struct OpenSegment {
+    base: u64,
     path: PathBuf,
     size: u64,
     file: File,
@@ -152,6 +157,8 @@ impl Reader {
             offset: format::SEGMENT_HEADER_LEN as u64,
             next_seq: base,
             durable_next_seq: 0,
+            durable_segment_base: 0,
+            superseded_checked: None,
             skip_until: base,
             buf: Vec::new(),
             buf_start: 0,
@@ -200,6 +207,7 @@ impl Reader {
         self.skip_until = seq;
         self.buf.clear();
         self.waiting_since = None;
+        self.superseded_checked = None;
         Ok(())
     }
 
@@ -378,6 +386,9 @@ impl Reader {
                     refreshed = true;
                 }
                 if self.next_seq >= self.durable_next_seq {
+                    if self.durable_segment_base > self.seg.base {
+                        self.leave_superseded_segment()?;
+                    }
                     return Ok(None);
                 }
             }
@@ -387,6 +398,38 @@ impl Reader {
             if found.header.seq >= self.skip_until {
                 return Ok(Some(found));
             }
+        }
+    }
+
+    /// Called when a durable-only reader is waiting at the checkpoint and the marker names a later segment than the
+    /// one it holds. Every record of the held segment is then covered, so the reader is at its seal (if the file is
+    /// still the current one), and the marker can't move past the cursor while the writer appends nothing to the new
+    /// segment: without this, the reader would never check its segment, and one that retention removed would leave it
+    /// returning `Ok(None)` for as long as the writer stays idle, where a visible reader returns `Error::Discarded`
+    /// (crash contract C14). So it does what a visible reader does at that slot: at a seal it checks the segment's
+    /// identity and moves to the successor, without returning anything (the successor is opened after the marker was
+    /// read, so ADR 0034 needs no further check for it); a removed or replaced segment gives `Error::Discarded`, which
+    /// is the result when retention removed it: the reader can't tell a retention removal from a repair (ADR 0034,
+    /// option 5), and nothing is lost, since `seek` to the cursor lands on the successor's first record. At any other
+    /// slot (the held file isn't the current one) it checks the identity only.
+    ///
+    /// Throttled to once per [`IDENTITY_CHECK_INTERVAL`], the interval at which a visible reader waiting at an empty
+    /// slot checks its segment: a removal is noticed as quickly as a visible reader notices it. At a seal the first
+    /// check moves the reader on, so a reader keeping up with the writer makes one per roll; it repeats (at most ten
+    /// `stat`s a second) only while the held file shows no seal at the cursor, and a reader whose marker names its own
+    /// segment never makes it.
+    fn leave_superseded_segment(&mut self) -> Result<()> {
+        let now = Instant::now();
+        if self
+            .superseded_checked
+            .is_some_and(|at| now.duration_since(at) < IDENTITY_CHECK_INTERVAL)
+        {
+            return Ok(());
+        }
+        self.superseded_checked = Some(now);
+        match self.read_slot(false)? {
+            SlotOutcome::Seal => self.follow_seal(),
+            _ => self.check_identity(),
         }
     }
 
@@ -409,7 +452,8 @@ impl Reader {
     /// the current history. The mapping needs nothing: it shows the current bytes. ADR 0034 has the full argument.
     fn refresh_checkpoint(&mut self) -> Result<()> {
         crate::fault::hook(crate::fault::Point::ReaderCheckpoint);
-        let durable = crate::inspect::read_checkpoint(&self.dir)?.map_or(0, |c| c.next_seq);
+        let (durable, segment_base) = crate::inspect::read_checkpoint(&self.dir)?
+            .map_or((0, 0), |c| (c.next_seq, c.segment_base_seq));
         if durable > self.next_seq {
             crate::fault::hook(crate::fault::Point::ReaderCheckpointIdentity);
             self.check_identity()?;
@@ -417,6 +461,7 @@ impl Reader {
             self.buf.clear();
         }
         self.durable_next_seq = durable;
+        self.durable_segment_base = segment_base;
         Ok(())
     }
 
@@ -459,38 +504,43 @@ impl Reader {
                     self.next_seq = next_seq;
                     return Ok(Some(found));
                 }
-                SlotOutcome::Seal => {
-                    self.check_identity()?;
-                    crate::fault::hook(crate::fault::Point::ReaderSeal);
-                    let next = match open_segment(&self.dir, self.next_seq, self.mapped) {
-                        Ok(next) => next,
-                        Err(e) if e.is_not_found() => {
-                            // Retention removes the oldest segment first, so a successor it removed means this
-                            // segment is gone too: that is discarded history. A successor missing while this
-                            // segment is still in place is a broken chain.
-                            self.check_identity()?;
-                            return Err(Error::corrupt(
-                                &self.seg.path,
-                                self.offset,
-                                CorruptReason::BrokenChain(self.next_seq),
-                            ));
-                        }
-                        Err(e) => return Err(e),
-                    };
-                    // Recheck after opening the successor: if recovery replaced this segment in between, the
-                    // successor may belong to a different history.
-                    self.check_identity()?;
-                    self.seg = next;
-                    self.offset = format::SEGMENT_HEADER_LEN as u64;
-                    self.buf.clear();
-                    self.waiting_since = None;
-                }
+                SlotOutcome::Seal => self.follow_seal()?,
                 SlotOutcome::Invalid(reason) => {
                     self.check_identity()?;
                     return Err(Error::corrupt(&self.seg.path, self.offset, reason));
                 }
             }
         }
+    }
+
+    /// Moves from the seal at the cursor to the next segment, checking that the segment at the cursor is still in place.
+    fn follow_seal(&mut self) -> Result<()> {
+        self.check_identity()?;
+        crate::fault::hook(crate::fault::Point::ReaderSeal);
+        let next = match open_segment(&self.dir, self.next_seq, self.mapped) {
+            Ok(next) => next,
+            Err(e) if e.is_not_found() => {
+                // Retention removes the oldest segment first, so a successor it removed means this segment is gone
+                // too: that is discarded history. A successor missing while this segment is still in place is a
+                // broken chain.
+                self.check_identity()?;
+                return Err(Error::corrupt(
+                    &self.seg.path,
+                    self.offset,
+                    CorruptReason::BrokenChain(self.next_seq),
+                ));
+            }
+            Err(e) => return Err(e),
+        };
+        // Recheck after opening the successor: if recovery replaced this segment in between, the successor may belong
+        // to a different history.
+        self.check_identity()?;
+        self.seg = next;
+        self.offset = format::SEGMENT_HEADER_LEN as u64;
+        self.buf.clear();
+        self.waiting_since = None;
+        self.superseded_checked = None;
+        Ok(())
     }
 
     /// One attempt at reading the slot at the cursor. `fresh` forces the `pread` path to re-read from the file.
@@ -659,6 +709,7 @@ fn open_segment(dir: &Path, base: u64, mapped: bool) -> Result<OpenSegment> {
         None
     };
     Ok(OpenSegment {
+        base,
         path,
         size: header.segment_size,
         file,

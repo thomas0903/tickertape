@@ -569,6 +569,75 @@ fn durable_only_tail_continues_after_retention_removed_its_position() {
     }
 }
 
+/// As above, with exactly one record removed before `tail` read it: the warning names that record alone.
+#[test]
+fn durable_only_tail_names_a_single_removed_record() {
+    use std::io::BufRead;
+    use tickertape::retention::{self, Action, Policy};
+
+    let (dir, mut writer) = journal(2); // three records fill a segment: 0..3, 3..6, ...
+    writer.checkpoint().unwrap();
+    let mut child = ProcessCommand::new(assert_cmd::cargo::cargo_bin!("tickertape"))
+        .args([
+            "tail",
+            "--durable-only",
+            "--count",
+            "3",
+            "--timeout-secs",
+            "10",
+        ])
+        .arg(dir.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+    let mut read = String::new();
+    for _ in 0..2 {
+        stdout.read_line(&mut read).unwrap();
+    }
+    // Hold tail at record 2 while the checkpoint moves past it and retention removes segment 0, which ends with it.
+    let signal = |signal: &str| {
+        let status = ProcessCommand::new("kill")
+            .arg(signal)
+            .arg(child.id().to_string())
+            .status()
+            .unwrap();
+        assert!(status.success());
+    };
+    signal("-STOP");
+    for n in 2..7 {
+        append(&mut writer, n);
+    }
+    writer.checkpoint().unwrap();
+    let plan = retention::plan(dir.path(), &Policy::default().max_segments(2)).unwrap();
+    retention::apply(dir.path(), &plan, &Action::Delete).unwrap();
+    assert_eq!(
+        tickertape::inspect::list_segments(dir.path()).unwrap()[0].base_seq,
+        3
+    );
+    signal("-CONT");
+    stdout.read_to_string(&mut read).unwrap();
+    let result = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(result.status.success(), "{result:?}");
+    let seqs: Vec<&str> = read
+        .lines()
+        .map(|line| {
+            line.strip_prefix("seq=")
+                .and_then(|l| l.split(' ').next())
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(seqs, ["0", "1", "3"]);
+    assert!(
+        stderr.contains(
+            "warning: record 2 was removed before tail read it; continuing at sequence 3"
+        ),
+        "{stderr}"
+    );
+}
+
 #[test]
 fn export_rejects_dangling_symlink_into_journal() {
     let (dir, _writer) = journal(1);

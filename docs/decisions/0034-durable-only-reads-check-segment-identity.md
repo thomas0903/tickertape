@@ -169,6 +169,44 @@ end" described what holding the file allows; for durable-only readers it now rea
 checkpoint moves past their cursor". A durable-only reader can't keep the old behaviour safely, because it can't tell
 a retention removal from a repair (option 5).
 
+**At a segment's end, with an empty successor** (found by review). The check above runs only when a marker moves
+past the cursor. A reader that has read every record of segment A waits at A's seal; the writer rolls to B and commits
+nothing there (a caught panic in `append_with`'s `fill` after the roll leaves exactly this), checkpoints (the marker
+now names B, but its `next_seq` equals the cursor), and retention removes A, which the marker no longer protects.
+The marker can't move past the cursor until the writer commits a record in B, so the reader returned `Ok(None)` on
+every call for as long as the writer stayed idle, while a visible reader at the same position returns `Discarded`.
+That breaks C14 (a reader racing with a removal gets `Discarded`).
+
+So a durable-only reader waiting at the checkpoint whose marker names a later segment than the one it holds does what
+a visible reader does at that slot. Every record of the held segment is then covered, so if the file is current the
+cursor is at its seal: the reader checks the segment's identity and follows the seal to the successor, exactly as
+`next_slot` does at a seal, but returns nothing (the records in the successor wait for a marker as before; the
+successor is a file opened after the marker was read, which needs no further check). At any other slot the held file
+isn't the current one, and the reader checks its identity only.
+
+In the exact scenario the result is `Error::Discarded { seq: <cursor> }`, not a move to B:
+
+- C14 promises `Discarded` to a reader whose segment retention removed, and a visible reader at the same position gets
+  it at the same call. A durable-only reader that stalls where a visible reader is told its file is gone breaks that.
+- C13 and option 5: the reader can't tell that A was removed by retention rather than moved to `quarantine/` by
+  recovery, and the seal that would lead it to B was read from a file that is no longer one of the journal's current
+  files. The rule above lets a marker, and so the chain it implies, apply only to a segment confirmed current after
+  reading it. Following the seal of a removed file would be the unconfirmed case, even though here the marker names B
+  at the cursor.
+- Nothing is lost: everything the reader returned was below a marker it applied, and `seek` to the cursor lands on B's
+  first record, which is where a move to B would have put it.
+
+When A is still in place (the writer rolled and retention hasn't run), the reader moves to B at the first call and
+no longer holds A; a later removal of A doesn't concern it.
+
+The check is throttled to once per 100 ms (`IDENTITY_CHECK_INTERVAL`), the interval at which a visible reader waiting
+at an empty slot checks its segment, so a durable-only reader notices the removal as quickly as a visible one. At a
+seal the first check moves the reader on, so a reader keeping up with the writer makes it once per roll, never per
+poll; it repeats, at most ten `stat`s a second, only while the held file shows no seal at the cursor, and a reader
+whose marker names its own segment (the caught-up case) never makes it.
+`tests/durable_only.rs::durable_only_reader_at_a_removed_segment_end_with_an_empty_successor_is_discarded` covers the
+safe and the zero-copy reader, with A in place and removed.
+
 ### Cost
 
 The check is one `stat` of the segment path, made only when a refreshed marker moves past the cursor, that is at most
@@ -176,6 +214,8 @@ once per checkpoint the reader observes, after reading the 128 KiB marker file, 
 reader that keeps up with a writer checkpointing after every record makes one per record; otherwise it is amortised
 over the records a checkpoint covers. It is never on the per-record path. When the check passes, the safe reader also
 discards its read buffer, so its next read is one commit-word `pread` and a buffer refill, at the same frequency.
+A reader waiting at the checkpoint with a marker that names a later segment makes at most one more `stat` (and one
+slot read) per 100 ms, in practice once per roll (above).
 
 ## Consequences
 

@@ -31,7 +31,9 @@ pub struct SegmentInfo {
 ///
 /// A segment that retention (or writer recovery) removes between the directory listing and the opening of its file is
 /// not an error: the directory is listed again, so the result leaves it out. So is a listing that comes back empty on
-/// a live journal (btrfs omits entries created after a listing starts).
+/// a live journal (btrfs omits entries created after a listing starts). Both are retried at most 8 times: a listing
+/// still empty on the eighth attempt gives [`Error::NotFound`], and a listed segment that vanished on the eighth an
+/// I/O error. A segment removed after it was opened can still be in the result.
 ///
 /// # Errors
 ///
@@ -207,6 +209,10 @@ pub struct Problem {
 /// Retention is not a problem either: a segment it removes before the scan reaches it is not an error, and since
 /// retention removes the oldest segments first, the report then starts at the oldest segment the scan could still
 /// open, leaving out the removed history and what was found in it.
+/// But a segment already open when retention removed it can stay in the report, with its records: the newest listed
+/// segment always does, since nothing after it is opened. No problem is reported for its missing successor. As for
+/// [`list_segments`], the listing is retried at most 8 times: still empty on the eighth attempt, the result is
+/// [`Error::NotFound`].
 ///
 /// # Errors
 ///

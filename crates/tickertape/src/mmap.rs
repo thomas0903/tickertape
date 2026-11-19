@@ -348,8 +348,9 @@ impl MapRo {
     ///
     /// The bytes must belong to a committed record that has already been validated (length, CRC, sequence) from a
     /// [`MapRo::copy_atomic_into`] copy taken after observing its non-zero commit word, and no process may modify them
-    /// while the returned slice lives. This is `Reader::open_mapped`'s safety contract; the tickertape writer never
-    /// modifies committed bytes. Validating first means a corrupted length can't make the slice cover bytes the
+    /// while the returned slice lives. This is `Reader::open_mapped`'s safety contract. The tickertape writer modifies
+    /// committed bytes in one case only, which that contract names: recovery zeroes, in place, records after the
+    /// checkpoint whose commit word storage damage emptied (they look uncommitted). Validating first means a corrupted length can't make the slice cover bytes the
     /// writer is still appending to (barring a CRC collision, about 2^-32 per corrupted record).
     pub(crate) unsafe fn committed_bytes(&self, offset: u64, len: u64) -> Option<&[u8]> {
         let end = checked_range(self.len, offset, len)?;
