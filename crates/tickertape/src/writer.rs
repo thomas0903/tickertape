@@ -17,8 +17,15 @@ use crate::record::NewRecord;
 
 /// The only process allowed to append to a journal.
 ///
-/// Holds an exclusive `flock` on `writer.lock` for as long as it lives; the OS releases it when the process exits
-/// or dies, so a crashed writer never leaves a stale lock. `Writer` is `Send` but not `Sync`: appends take `&mut self`.
+/// Holds an exclusive `flock` on `writer.lock` for as long as it lives. Dropping the writer in the process that
+/// opened it releases the lock, after the writer's helper threads have stopped, so the journal can be reopened at
+/// once, by this or another process. If the process exits or dies instead, the OS releases the lock when the last
+/// copy of its descriptor closes, so a crashed writer never leaves a stale lock; but a child the process forked keeps
+/// a copy until it calls `exec` or exits, for its whole life if it never execs (crash contract C3). A forked child
+/// must neither use nor drop an inherited writer: if it drops one, the lock stays with the parent, but the writer's
+/// other clean-up still runs in the child, where stopping the prefault helper (whose thread does not exist there)
+/// can stall it and clearing the wake-up region disturbs the parent's readers. `Writer` is `Send` but not `Sync`: appends take
+/// `&mut self`.
 ///
 /// The writer maps the segments it writes. Another process writing into or truncating those files is outside the
 /// contract and can crash or corrupt this process (see `docs/crash-contract.md` → Readers, the writer and memory
@@ -28,10 +35,12 @@ use crate::record::NewRecord;
 /// but is durable only after [`Writer::checkpoint`]. See `docs/crash-contract.md`.
 #[derive(Debug)]
 pub struct Writer {
+    /// Holds the `flock` for the writer's lifetime. Keep this field first: fields drop in declaration order, and in a
+    /// forked child the guard's descriptor must close before any field whose drop could block there (see the
+    /// `Drop` implementation).
+    lock: JournalLock,
     dir: PathBuf,
     config: WriterConfig,
-    /// Holds the `flock` for the writer's lifetime.
-    _lock: File,
     active: Segment,
     /// Offset of the next record in `active`.
     offset: u64,
@@ -134,6 +143,10 @@ impl Writer {
             }
         }
         let lock = take_lock(&dir)?;
+        #[cfg(test)]
+        if let Some(hook) = tests::AFTER_LOCK.with(std::cell::Cell::take) {
+            hook();
+        }
 
         let mut rec = Recovery {
             dir: &dir,
@@ -161,7 +174,7 @@ impl Writer {
         let mut writer = Writer {
             dir,
             config,
-            _lock: lock,
+            lock,
             active_dirty_from: state.active_dirty_from,
             offset: state.offset,
             next_seq: state.next_seq,
@@ -532,10 +545,52 @@ impl Writer {
 
 impl Drop for Writer {
     fn drop(&mut self) {
-        // Don't leave a spare behind for the next writer's recovery to clean up.
-        if let Some(Ok(Ok(spare))) = self.spare.take().map(|h| h.join()) {
-            drop(spare);
-            let _ = fs::remove_file(self.dir.join(journal::SPARE_FILE));
+        // The order of what follows:
+        // - In the process that took the lock: join the spare-segment thread and remove a prepared spare (so the
+        //   next writer's recovery has nothing to clean up), stop the helper and tell waiting readers that this
+        //   writer has gone, all here, while the lock is still held, so that a new writer never overlaps them. Then
+        //   the fields drop in declaration order: first the lock guard, which unlocks explicitly and closes its
+        //   descriptor, then the others, which only unmap and close.
+        // - In any other process (a forked child that dropped its copy, which it must not do): nothing is torn down
+        //   here. The spare belongs to the parent's writer and its thread does not exist in the child, so it is
+        //   neither joined nor removed. The lock guard drops first, without unlocking (the lock still protects the
+        //   parent's writer), and closes the child's copy of the descriptor before the later fields `notify` and
+        //   `prefault` drop, since joining the helper there can block forever and must not keep the journal locked
+        //   once the parent has gone.
+        if self.lock.owned_here() {
+            if let Some(Ok(Ok(spare))) = self.spare.take().map(|h| h.join()) {
+                drop(spare);
+                let _ = fs::remove_file(self.dir.join(journal::SPARE_FILE));
+            }
+            drop(self.prefault.take());
+            drop(self.notify.take());
+        }
+    }
+}
+
+/// The exclusive `flock` on `writer.lock`, released when the guard drops, also when [`Writer::open`] fails after
+/// taking it.
+#[derive(Debug)]
+struct JournalLock {
+    file: File,
+    /// The process that took the lock: only it may unlock (a forked child shares the lock's open file description).
+    pid: u32,
+}
+
+impl JournalLock {
+    /// Whether this is the process that took the lock.
+    fn owned_here(&self) -> bool {
+        self.pid == std::process::id()
+    }
+}
+
+impl Drop for JournalLock {
+    fn drop(&mut self) {
+        // Release the lock explicitly: closing the descriptor (when `file` drops) would not release it while a child
+        // forked by another thread still holds a copy of it before `exec`. Only in the process that took it: in a
+        // forked child the lock still protects the parent's writer, and only the descriptor closes.
+        if self.owned_here() {
+            let _ = mmap::unlock(&self.file);
         }
     }
 }
@@ -601,7 +656,7 @@ fn create_dirs(dir: &Path) -> Result<Vec<PathBuf>> {
 }
 
 /// Opens `writer.lock` and takes the exclusive `flock`; records our PID in it.
-fn take_lock(dir: &Path) -> Result<File> {
+fn take_lock(dir: &Path) -> Result<JournalLock> {
     let path = dir.join(LOCK_FILE);
     let mut file = OpenOptions::new()
         .read(true)
@@ -625,7 +680,10 @@ fn take_lock(dir: &Path) -> Result<File> {
     let _ = file
         .set_len(0)
         .and_then(|()| file.write_all_at(std::process::id().to_string().as_bytes(), 0));
-    Ok(file)
+    Ok(JournalLock {
+        file,
+        pid: std::process::id(),
+    })
 }
 
 /// Creates and publishes a new segment (`docs/format.md` → Rolling, steps 2–3). Returns the open file (read-write)
@@ -1266,4 +1324,159 @@ pub enum RecoveryAction {
         /// The removed file.
         file: PathBuf,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mmap::forked;
+    use std::cell::{Cell, RefCell};
+    use std::os::unix::io::{AsRawFd, RawFd};
+    use std::rc::Rc;
+
+    thread_local! {
+        /// Called (once) by [`Writer::open`] on this thread right after it has taken the lock.
+        pub(super) static AFTER_LOCK: Cell<Option<Box<dyn FnOnce()>>> = const { Cell::new(None) };
+        /// The writer's lock descriptor, for a forked child's probe.
+        static LOCK_FD: Cell<RawFd> = const { Cell::new(-1) };
+    }
+
+    fn append_one(writer: &mut Writer) {
+        writer
+            .append(&NewRecord {
+                schema_id: 1,
+                venue_ts_ns: 0,
+                local_ts_ns: 0,
+                payload: b"x",
+            })
+            .unwrap();
+    }
+
+    /// A child forked while the writer is open (here by this test; in practice by any thread spawning a process)
+    /// shares the lock's open file description until it calls `exec`. Dropping the writer must still release the
+    /// lock at once, so the journal can be reopened while that child exists.
+    #[test]
+    fn drop_releases_the_lock_while_a_forked_child_holds_a_copy() {
+        let _forked = forked::LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let config = WriterConfig::default().segment_size(1 << 20);
+        let mut writer = Writer::open(dir.path(), config.clone()).unwrap();
+        append_one(&mut writer);
+        let child = forked::fork(|| {}).unwrap();
+        drop(writer);
+        let reopened = Writer::open(dir.path(), config);
+        assert_eq!(child.wait(), Some(0));
+        assert_eq!(
+            reopened
+                .expect("the dropped writer's lock must not wait for the forked child")
+                .next_seq(),
+            1
+        );
+    }
+
+    /// A forked child that drops its copy of the writer must leave the lock with the parent, whose writer is still
+    /// open: unlocking the shared open file description would let a second writer in.
+    #[test]
+    fn a_forked_child_dropping_its_copy_keeps_the_parents_lock() {
+        let _forked = forked::LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        // No helper threads or wake-up region, which a child must not touch: only the lock is under test.
+        let config = WriterConfig::default()
+            .segment_size(1 << 20)
+            .prefault(false)
+            .notify(false);
+        let mut writer = Some(Writer::open(dir.path(), config.clone()).unwrap());
+        append_one(writer.as_mut().unwrap());
+        let child = forked::fork(|| drop(writer.take())).unwrap();
+        // The child has dropped its copy and exited, closing its descriptors.
+        assert_eq!(child.wait(), Some(0));
+        match Writer::open(dir.path(), config.clone()) {
+            Err(Error::Locked { pid, .. }) => assert_eq!(pid, Some(std::process::id())),
+            other => panic!("expected Locked while the parent's writer is open, got {other:?}"),
+        }
+        let mut writer = writer.unwrap();
+        append_one(&mut writer);
+        drop(writer);
+        assert_eq!(Writer::open(dir.path(), config).unwrap().next_seq(), 2);
+    }
+
+    /// A forked child that drops its copy of the writer (which it must not do) must close its copy of the lock
+    /// descriptor before it stops the prefault helper: the helper thread does not exist in the child, so stopping it
+    /// can block forever there, and the child must not keep the journal locked after the parent has gone.
+    #[test]
+    fn a_forked_child_dropping_its_copy_closes_the_lock_before_the_helper() {
+        const CLOSED: i32 = 42;
+        const STILL_OPEN: i32 = 43;
+        if !cfg!(any(target_vendor = "apple", target_os = "linux")) {
+            return; // No helper thread elsewhere.
+        }
+        let _forked = forked::LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        // The prefault helper runs; no wake-up region, whose clean-up in the child would disturb nothing here but
+        // is not under test.
+        let config = WriterConfig::default().segment_size(1 << 20).notify(false);
+        let mut writer = Some(Writer::open(dir.path(), config).unwrap());
+        let open = writer.as_mut().unwrap();
+        append_one(open);
+        assert!(open.prefault.is_some(), "the helper must run for this test");
+        let fd = open.lock.file.as_raw_fd();
+        let child = forked::fork(|| {
+            LOCK_FD.set(fd);
+            // Leave as the helper is about to be stopped, reporting whether the lock descriptor is still open.
+            crate::prefault::test_hooks::ON_DROP.set(Some(|| {
+                forked::exit(if forked::is_open(LOCK_FD.get()) {
+                    STILL_OPEN
+                } else {
+                    CLOSED
+                })
+            }));
+            drop(writer.take());
+        })
+        .unwrap();
+        assert_eq!(
+            child.wait(),
+            Some(CLOSED),
+            "the child must close its lock descriptor before it stops the helper"
+        );
+        let mut writer = writer.unwrap();
+        append_one(&mut writer);
+    }
+
+    /// An open that fails after taking the lock (here: `RecoveryPolicy::Fail` refusing a damaged journal) must
+    /// release the lock explicitly too, so that the next open (here with `Quarantine`) succeeds at once while a child
+    /// forked during the failed open still holds a copy of the descriptor.
+    #[test]
+    fn a_failed_open_releases_the_lock_while_a_forked_child_holds_a_copy() {
+        let _forked = forked::LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let config = WriterConfig::default().segment_size(1 << 20);
+        let mut writer = Writer::open(dir.path(), config.clone()).unwrap();
+        append_one(&mut writer);
+        drop(writer);
+        // A segment off the chain, which `Fail` refuses and `Quarantine` moves away.
+        drop(create_segment(dir.path(), 500, 1 << 20).unwrap());
+        let child = Rc::new(RefCell::new(None));
+        let slot = Rc::clone(&child);
+        AFTER_LOCK.set(Some(Box::new(move || {
+            *slot.borrow_mut() = Some(forked::fork(|| {}).unwrap());
+        })));
+        let failed = Writer::open(dir.path(), config.clone().recovery(RecoveryPolicy::Fail));
+        assert!(matches!(failed, Err(Error::Corrupt { .. })), "{failed:?}");
+        let child = child
+            .borrow_mut()
+            .take()
+            .expect("the child is forked once the lock is taken");
+        let reopened = Writer::open(dir.path(), config);
+        assert_eq!(child.wait(), Some(0));
+        let reopened = reopened.expect("the failed open's lock must not wait for the forked child");
+        assert!(
+            matches!(
+                reopened.recovery_report().actions[..],
+                [RecoveryAction::QuarantinedSegment { .. }]
+            ),
+            "{:?}",
+            reopened.recovery_report()
+        );
+        assert_eq!(reopened.next_seq(), 1);
+    }
 }

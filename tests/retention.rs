@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use tickertape::retention::{self, Action, Policy, Reason};
 use tickertape::{Error, NewRecord, Reader, ReaderConfig, Writer};
-use tickertape_tests::{read_all, reopen_writer, segments, small_config};
+use tickertape_tests::{read_all, segments, small_config};
 
 fn append(writer: &mut Writer) {
     writer
@@ -72,7 +72,10 @@ fn limits_and_checkpoint_boundary() {
             .is_empty()
     );
     drop(writer);
-    assert_eq!(reopen_writer(dir.path(), small_config()).next_seq(), 6);
+    assert_eq!(
+        Writer::open(dir.path(), small_config()).unwrap().next_seq(),
+        6
+    );
     assert_eq!(read_all(dir.path()).len(), 3);
 }
 
@@ -168,7 +171,7 @@ fn writer_bounds_disk_and_reports_errors() {
     );
     assert_eq!(read_all(dir.path()).len(), 2);
     drop(writer);
-    assert_eq!(reopen_writer(dir.path(), config).next_seq(), 40);
+    assert_eq!(Writer::open(dir.path(), config).unwrap().next_seq(), 40);
 
     let (dir, mut writer) = journal(true);
     append(&mut writer);
@@ -179,7 +182,7 @@ fn writer_bounds_disk_and_reports_errors() {
         Policy::default().max_segments(1),
         Action::MoveTo(dest.clone()),
     );
-    let mut writer = reopen_writer(dir.path(), config);
+    let mut writer = Writer::open(dir.path(), config).unwrap();
     assert!(writer.last_retention_error().is_some());
     append(&mut writer);
     writer.checkpoint().unwrap();
@@ -280,7 +283,7 @@ fn interrupted_move_preserves_original_and_retries() {
             fs::write(&target, &image[..len]).unwrap();
         }
         drop(writer);
-        let writer = reopen_writer(dir.path(), small_config());
+        let writer = Writer::open(dir.path(), small_config()).unwrap();
         assert_eq!(writer.next_seq(), 6);
         let action = Action::MoveTo(dest.path().into());
         if copied.is_some() {
@@ -367,7 +370,10 @@ fn retention_kill_loop_50() {
                 );
             }
         }
-        assert_eq!(reopen_writer(dir.path(), small_config()).next_seq(), 12);
+        assert_eq!(
+            Writer::open(dir.path(), small_config()).unwrap().next_seq(),
+            12
+        );
         assert!(
             tickertape::inspect::verify(dir.path())
                 .unwrap()
@@ -401,7 +407,10 @@ fn injected_cross_device_copy_and_interrupted_sync() {
             assert!(result.is_err());
             assert!(first.path.exists());
             drop(writer);
-            assert_eq!(reopen_writer(dir.path(), small_config()).next_seq(), 6);
+            assert_eq!(
+                Writer::open(dir.path(), small_config()).unwrap().next_seq(),
+                6
+            );
             assert!(retention::apply(dir.path(), &plan, &action).is_err());
             fs::remove_file(target).unwrap();
             fault::fail_next(Point::RetentionRename, 18);
@@ -435,7 +444,7 @@ fn writer_counts_partial_runs_and_sync_errors() {
         Policy::default().max_segments(1),
         Action::MoveTo(dest.path().into()),
     );
-    let mut writer = reopen_writer(dir.path(), config);
+    let mut writer = Writer::open(dir.path(), config).unwrap();
     assert_eq!(writer.retention_report().removed_segments, 1);
     assert!(writer.last_retention_error().is_some());
     assert!(paths[1].1.exists());

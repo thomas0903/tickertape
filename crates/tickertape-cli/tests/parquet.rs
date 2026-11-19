@@ -390,16 +390,9 @@ assert con.execute('SELECT max(venue_ts_ns) FROM read_parquet(?)', [sys.argv[1]]
 #[test]
 fn durable_only_parquet_export() {
     let dir = journal(4);
-    // Retry briefly: a child forked by a parallel test may still hold the dropped writer's lock until its exec.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    let mut writer = loop {
-        match Writer::open(dir.path(), WriterConfig::default().segment_size(65536)) {
-            Err(tickertape::Error::Locked { .. }) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(std::time::Duration::from_millis(2));
-            }
-            other => break other.unwrap(),
-        }
-    };
+    // No retry: the dropped writer released its lock, even if a child forked by a parallel test (to spawn the CLI)
+    // still holds a copy of its descriptor.
+    let mut writer = Writer::open(dir.path(), WriterConfig::default().segment_size(65536)).unwrap();
     let dest = TempDir::new().unwrap();
     let file = dest.path().join("durable.parquet");
     export(dir.path(), &file, &["--durable-only"]);

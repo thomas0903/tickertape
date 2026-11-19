@@ -1019,6 +1019,233 @@ pub(crate) fn try_lock_exclusive(file: &File) -> io::Result<bool> {
     }
 }
 
+/// Releases the `flock` held through `file`'s open file description.
+///
+/// The lock belongs to the description, not the descriptor: closing the descriptor releases it only once every copy
+/// is closed, and a child forked by any thread holds a copy until it calls `exec` or exits. Unlocking releases it at
+/// once, for every process sharing the description, so only the process that took the lock may call this.
+pub(crate) fn unlock(file: &File) -> io::Result<()> {
+    // SAFETY: flock on a valid descriptor has no memory-safety preconditions.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(last_os_error())
+    }
+}
+
+/// Test helper: a forked child that has not called `exec`, holding copies of all of this process's descriptors.
+#[cfg(test)]
+pub(crate) mod forked {
+    use std::fs::File;
+    use std::io::{self, Write};
+    use std::os::unix::io::{FromRawFd, RawFd};
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    /// Held by tests while their forked child exists, and by tests that rely on closing a descriptor to release a
+    /// lock (the child holds a copy of every descriptor this process had at the fork).
+    pub(crate) static LOCK: Mutex<()> = Mutex::new(());
+
+    /// Exit status of a child whose `in_child` panicked.
+    pub(crate) const PANICKED: i32 = 101;
+    /// Exit status of a child whose wait for its release failed with an error other than `EINTR`.
+    pub(crate) const WAIT_FAILED: i32 = 102;
+    /// How long [`Child::wait`] waits for the child to exit before killing it and failing the test.
+    const TIMEOUT: Duration = Duration::from_secs(30);
+
+    /// A forked child. It runs a closure, then waits until it is released (or this process exits), then exits.
+    #[derive(Debug)]
+    pub(crate) struct Child {
+        pid: libc::pid_t,
+        release: Option<File>,
+    }
+
+    /// Forks; the child calls `in_child` (on its copy of this process's memory), then blocks reading a pipe until
+    /// [`Child::wait`] or the handle's drop releases it, or until this process exits, and leaves with `_exit`: status
+    /// 0, [`PANICKED`] if `in_child` panicked, or [`WAIT_FAILED`] if reading the pipe failed (an interrupted read is
+    /// retried). The child never returns into the test harness and runs no exit handlers.
+    ///
+    /// The child of a multithreaded process may call only async-signal-safe functions. Waiting does (`close`,
+    /// `read`, `_exit`); `in_child` is the caller's responsibility (allocating relies on the system allocator
+    /// reinitialising its locks in the child, which glibc's and macOS's do).
+    pub(crate) fn fork(in_child: impl FnOnce()) -> io::Result<Child> {
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: `fds` is a valid array of two descriptors for `pipe` to fill.
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+            return Err(super::last_os_error());
+        }
+        let [read_fd, write_fd] = fds;
+        for fd in fds {
+            // SAFETY: fcntl on a descriptor we just created. Close-on-exec keeps the pipe out of other tests' children
+            // once they exec (they could inherit it before the flag is set; that only delays their EOF, not ours).
+            unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+        }
+        // SAFETY: `fork` has no memory-safety preconditions. The child below only runs `in_child` (see the function
+        // documentation) and async-signal-safe calls, and leaves with `_exit` without returning.
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            let err = super::last_os_error();
+            // SAFETY: both descriptors are ours and still open.
+            unsafe {
+                libc::close(read_fd);
+                libc::close(write_fd);
+            }
+            return Err(err);
+        }
+        if pid == 0 {
+            let mut status = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(in_child))
+            {
+                Ok(()) => 0,
+                Err(_) => PANICKED,
+            };
+            let mut byte = 0_u8;
+            // SAFETY: the child's own copies of the pipe. Closing the write end first lets `read` see EOF if the parent
+            // dies, so the child never outlives it for long. Reading the error code does not allocate.
+            unsafe {
+                libc::close(write_fd);
+                // A byte (released) or end of file (released, or this process has gone) ends the wait; an interrupted
+                // read must not, or the child would close its descriptors before the test is done with them.
+                while libc::read(read_fd, (&raw mut byte).cast(), 1) < 0 {
+                    if io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                        if status == 0 {
+                            status = WAIT_FAILED;
+                        }
+                        break;
+                    }
+                }
+            }
+            exit(status);
+        }
+        // SAFETY: the parent's copy of the read end, which it does not use.
+        unsafe { libc::close(read_fd) };
+        Ok(Child {
+            pid,
+            // SAFETY: `write_fd` is open and owned by nothing else in this process.
+            release: Some(unsafe { File::from_raw_fd(write_fd) }),
+        })
+    }
+
+    /// Leaves the (forked child) process at once with `status`, without unwinding or running exit handlers.
+    pub(crate) fn exit(status: i32) -> ! {
+        // SAFETY: `_exit` is async-signal-safe and has no preconditions.
+        unsafe { libc::_exit(status) }
+    }
+
+    /// Makes `signal` interrupt blocking calls in this process, and in children forked from it afterwards, instead of
+    /// terminating it: installs a handler that does nothing, without `SA_RESTART`.
+    pub(crate) fn interrupt_on(signal: libc::c_int) {
+        extern "C" fn ignore(_: libc::c_int) {}
+        // SAFETY: a zeroed `sigaction` is valid (empty mask, no flags); the handler is async-signal-safe (it does
+        // nothing) and lives for the whole program.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = ignore as extern "C" fn(libc::c_int) as libc::sighandler_t;
+            libc::sigaction(signal, &action, std::ptr::null_mut());
+        }
+    }
+
+    /// Whether `fd` is an open descriptor in this process.
+    pub(crate) fn is_open(fd: RawFd) -> bool {
+        // SAFETY: F_GETFD only reads the descriptor's flags; on a closed descriptor it fails with EBADF.
+        unsafe { libc::fcntl(fd, libc::F_GETFD) != -1 }
+    }
+
+    /// Why reaping a child failed.
+    enum ReapError {
+        /// It did not exit within [`TIMEOUT`] and was killed.
+        TimedOut,
+        /// `waitpid` failed.
+        Wait(io::Error),
+    }
+
+    impl Child {
+        /// Releases the child and returns its exit status (`None` if it did not exit normally).
+        ///
+        /// # Panics
+        ///
+        /// If the child does not exit within 30 seconds (it is then killed and reaped), or `waitpid` fails.
+        pub(crate) fn wait(self) -> Option<i32> {
+            self.wait_within(TIMEOUT)
+        }
+
+        /// [`Child::wait`], killing the child if it has not exited `timeout` after its release.
+        pub(crate) fn wait_within(mut self, timeout: Duration) -> Option<i32> {
+            let pid = self.pid;
+            match self.reap(timeout) {
+                Ok(status) => status,
+                Err(e) => panic!("{}", e.message(pid, timeout)),
+            }
+        }
+
+        /// Sends `signal` to the child.
+        pub(crate) fn signal(&self, signal: libc::c_int) {
+            // SAFETY: `pid` names our own child, which is not reaped before `self` is consumed or dropped.
+            unsafe { libc::kill(self.pid, signal) };
+        }
+
+        /// Releases and reaps the child; `Ok(None)` if it was already reaped or did not exit normally.
+        fn reap(&mut self, timeout: Duration) -> Result<Option<i32>, ReapError> {
+            let Some(mut release) = self.release.take() else {
+                return Ok(None);
+            };
+            // The child may have left already (if it exited from `in_child`): ignore EPIPE.
+            let _ = release.write_all(&[1]);
+            drop(release);
+            let deadline = Instant::now() + timeout;
+            let mut status = 0;
+            loop {
+                // SAFETY: polls our own child; `status` is a valid out-pointer.
+                let rc = unsafe { libc::waitpid(self.pid, &mut status, libc::WNOHANG) };
+                if rc == self.pid {
+                    break;
+                }
+                if rc < 0 {
+                    let err = io::Error::last_os_error();
+                    if err.kind() != io::ErrorKind::Interrupted {
+                        return Err(ReapError::Wait(err));
+                    }
+                } else if Instant::now() >= deadline {
+                    // SAFETY: kills and reaps our own child, which has not been reaped (`rc` was 0), so `pid` still
+                    // names it.
+                    unsafe {
+                        libc::kill(self.pid, libc::SIGKILL);
+                        while libc::waitpid(self.pid, &mut status, 0) < 0
+                            && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted
+                        {
+                        }
+                    }
+                    return Err(ReapError::TimedOut);
+                } else {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+            Ok(libc::WIFEXITED(status).then(|| libc::WEXITSTATUS(status)))
+        }
+    }
+
+    impl ReapError {
+        fn message(&self, pid: libc::pid_t, timeout: Duration) -> String {
+            match self {
+                ReapError::TimedOut => format!(
+                    "forked child {pid} did not exit within {timeout:?} of its release (deadlocked?); killed it"
+                ),
+                ReapError::Wait(e) => format!("waiting for forked child {pid} failed: {e}"),
+            }
+        }
+    }
+
+    impl Drop for Child {
+        fn drop(&mut self) {
+            if let Err(e) = self.reap(TIMEOUT) {
+                if !std::thread::panicking() {
+                    panic!("{}", e.message(self.pid, TIMEOUT));
+                }
+            }
+        }
+    }
+}
+
 /// Reserves disk blocks for the first `len` bytes of `file` and sets its size to `len`, so that later writes into
 /// that range don't need new blocks (modulo copy-on-write filesystems; see the crash contract).
 pub(crate) fn preallocate(file: &File, len: u64) -> io::Result<()> {
@@ -1283,6 +1510,7 @@ mod tests {
 
     #[test]
     fn lock_is_exclusive_across_handles() {
+        let _forked = forked::LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("lock");
         let a = File::create(&path).unwrap();
@@ -1294,6 +1522,66 @@ mod tests {
         );
         drop(a);
         assert!(try_lock_exclusive(&b).unwrap());
+    }
+
+    /// The fork helper kills a child that does not exit after its release and fails the test, instead of hanging.
+    #[test]
+    #[should_panic(expected = "did not exit within 100ms of its release (deadlocked?); killed it")]
+    fn forked_child_that_never_exits_is_killed() {
+        let _forked = forked::LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let child = forked::fork(|| {
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+        })
+        .unwrap();
+        child.wait_within(std::time::Duration::from_millis(100));
+    }
+
+    /// A signal interrupting the forked child's wait for its release must not end the wait: the child keeps its
+    /// descriptors (here: the only copy holding a lock) until it is released.
+    #[test]
+    fn forked_child_keeps_waiting_when_its_wait_is_interrupted() {
+        let _forked = forked::LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lock");
+        let locked = File::create(&path).unwrap();
+        assert!(try_lock_exclusive(&locked).unwrap());
+        // Installed before the fork, so the child has the handler from its first instruction: a signal that arrived
+        // before the child had installed it itself would terminate the child and release the lock. Nothing sends
+        // this signal to the test process, where the handler stays installed.
+        forked::interrupt_on(libc::SIGUSR1);
+        let child = forked::fork(|| {}).unwrap();
+        drop(locked);
+        let other = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        child.signal(libc::SIGUSR1);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(
+            !try_lock_exclusive(&other).unwrap(),
+            "the interrupted child must still hold its copy of the lock"
+        );
+        assert_eq!(child.wait(), Some(0));
+        assert!(try_lock_exclusive(&other).unwrap());
+    }
+
+    /// Closing one descriptor of a locked open file description keeps the lock while another descriptor of it is
+    /// open (as in a child forked before `exec`); `unlock` releases it for all of them.
+    #[test]
+    fn unlock_releases_a_lock_that_a_copied_descriptor_still_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lock");
+        let a = File::create(&path).unwrap();
+        let copy = a.try_clone().unwrap();
+        let other = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        assert!(try_lock_exclusive(&a).unwrap());
+        drop(a);
+        assert!(
+            !try_lock_exclusive(&other).unwrap(),
+            "the copy still holds the lock"
+        );
+        unlock(&copy).unwrap();
+        assert!(try_lock_exclusive(&other).unwrap());
     }
 
     #[test]
