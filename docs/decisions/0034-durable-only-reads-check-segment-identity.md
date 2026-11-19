@@ -59,6 +59,12 @@ that doesn't move past the cursor lets the reader read nothing, so it needs no c
 reading a marker (`Reader::open`, `seek`, the successor at a seal) need no extra check: they were current after the
 marker was written, which is what the check establishes for the file already open.
 
+**After the check passes, the reader reads again every record the marker newly covers.** The safe (`pread`) reader
+validates records in a read buffer of its own, which can hold bytes it read past the cursor before the marker was
+written; when the check passes it discards that buffer, so the records from its cursor up to the new marker are read
+from the file after the check. The zero-copy reader reads through its mapping, which shows the file's current bytes.
+This matters for a repair that keeps the file (see "In-place repairs" below), which no identity check can see.
+
 ### The ordering argument
 
 Facts the argument uses:
@@ -71,17 +77,28 @@ Facts the argument uses:
   covered. The writer only appends; recovery starts at the marker and never changes a record before it (a repaired
   copy keeps everything before the repair point byte for byte, and the repair point is at or after the marker);
   retention removes whole segments; a segment created after the marker begins at or after `D`.
-- **F3. Committed bytes never change, and identities don't come back.** No tickertape process modifies committed
-  bytes in a file, so what a reader reads from its open file at any time is what that file held when it was
-  current. A path that stops naming a file never names it again (recovery moves the old file into `quarantine/`,
-  retention moves or deletes it, nothing moves files back), and while the reader holds the file open its inode stays
-  allocated, so no new file can have its (device, inode).
+- **F3. Bytes before the marker never change in place.** No tickertape process changes, in a file, a byte of a
+  record below the current marker's `next_seq`: the writer only appends, recovery starts at the marker, and a file
+  that stopped being current is never written again. Bytes *after* the marker can change in place: recovery zeroes
+  everything after an empty commit word at or after the marker in the same file, and when storage damage emptied the
+  commit word of a committed record, that removes committed records in place ("In-place repairs" below). The
+  argument therefore never relies on bytes after the marker that the reader read before the marker was written.
+- **F4. Identities don't come back.** A path that stops naming a file never names it again (recovery moves the old
+  file into `quarantine/`, retention moves or deletes it, nothing moves files back), and while the reader holds the
+  file open its inode stays allocated, so no new file can have its (device, inode).
+- **F5. Records the marker newly covers are read after the check.** When the check passes, the safe reader discards
+  its read buffer and the zero-copy reader reads its mapping, so every record from the cursor up to `D` is read from
+  `f` after time `c` below.
 
 **Claim.** If the reader reads a marker `D` at time `r` and then, at a time `c` after `r`, finds that its segment's
 path still names its open file `f`, then `f` holds the covered record at every sequence number below `D` that it
-contains. The marker was written at some time `w` before `r`, so before `c`; at `c`, `f` is a current file; by F2 it
-holds the covered records, and by F3 the reader reads exactly those, then or later. By F3 the check can't be
-satisfied by a different file that happens to have `f`'s identity.
+contains, at `c` and from then on, and the reader returns exactly those. The marker was written at some time `w`
+before `r`, so before `c`; at `c`, `f` is a current file; by F2 it holds the covered records; by F3 those bytes
+don't change afterwards (a later marker is at or after `D`, since recovery keeps every record below the marker it
+starts from); and by F5 the reader reads them after `c`. By F4 the check can't be satisfied by a different file that
+happens to have `f`'s identity. The reader's cursor is never past `D` (it returns only records below the marker it
+applied), and the end of a record below `D` is the start of the next record or seal in every later history of `f`,
+so after an in-place repair the cursor is still on a boundary of the current history.
 
 The interleavings, with X the reader's segment and `f` the file it has open:
 
@@ -90,13 +107,48 @@ The interleavings, with X the reader's segment and `f` the file it has open:
 | Repair of X and the new writer's checkpoint, then the marker read | The reader reads the new marker; the check finds the repaired copy, not `f`: `Discarded`. This is the reported bug |
 | Marker read (the old writer's `D1`), then the repair and the new checkpoint, then the check | The check fails: `Discarded`. Conservative: `D1` described `f` truthfully, but the reader can't tell which writer wrote the marker it read, so it applies neither |
 | Marker read, check passes, then the repair | The reader applied `D1`, written while `f` was current, so `f`'s records below `D1` are covered and the repair kept them (F2); the reader returns the right records. At `D1` it reads the new marker, which moves past the cursor, and the check fails: `Discarded` |
-| Two or more repairs between the marker read and the check | The path names neither `f` nor the first repair's file: `Discarded`. No repair can bring back `f`'s identity (F3) |
+| Two or more repairs between the marker read and the check | The path names neither `f` nor the first repair's file: `Discarded`. No repair can bring back `f`'s identity (F4) |
 | A reader that already holds a repaired copy, and a second repair after it reads a marker | The same as any repair: the check compares with the file the reader holds now |
+| In-place repair after the marker the reader applied (`D1`), the new writer's history appended into `f` and checkpointed (`D2`), then the marker read | The check passes: `f` is still the current file. The reader discards its buffer and reads the records from its cursor up to `D2` from `f` again: the records recovery kept, then the new history. It returned nothing past `D1`, and recovery kept everything below `D1`, so nothing it returned was removed and there is no `Discarded`. Before the buffer was discarded, the safe reader returned the removed records it had buffered (found by review) |
 | **Rejected order:** check passes, then the repair and the new writer's checkpoint, then the marker read | Nothing shows that `f` was current after the new marker was written; the reader would apply it to `f` and return removed records. The claim needs the check *after* the read |
 
 A reader that got `Discarded` keeps the marker value it last applied. After `seek` it holds a file opened after that
 marker was written, which F2 covers. Recovery never writes the marker itself (F1), so there is no marker "of the
 repair" to consider.
+
+### In-place repairs
+
+Recovery doesn't always replace a file. At an empty commit word it zeroes the rest of the segment in place
+(`format.md` → Recovery, step 4), and the new writer appends into the same file. After a writer *process* crash the
+bytes it zeroes were never committed. But storage damage (C11) that empties the commit word of a committed record
+after the checkpoint makes that record look like the end, so recovery removes it and every record after it in
+place, on the same inode. Recovery could replace the file instead whenever it can tell that committed records follow
+the empty word; it can't tell when only the newest record's commit word is lost, so this shape remains. The file
+keeps its identity, so no identity check can see it. What it means:
+
+- **Durable-only readers** are unaffected, by F3 and F5: the records they return are below a marker they applied,
+  which recovery keeps byte for byte, and the records after that are read again from the current bytes once a new
+  marker is trusted. The cursor stays on a record boundary of the new history (see the claim), so the reader goes on
+  reading it, with no `Error::Discarded` and no corruption report. A durable-only reader therefore doesn't need to
+  treat "the bytes at my cursor changed while the identity didn't" as discarded history: nothing it returned was
+  removed. `tests/durable_only.rs::durable_only_reader_rereads_the_tail_after_an_in_place_repair` damages the
+  middle and the newest uncheckpointed record, for the safe and the zero-copy reader, with the reader waiting at the
+  checkpoint or stopped inside the coverage of a marker it had applied; `durable_readers_under_repairs` mixes
+  in-place repairs with replacements.
+- **Visible readers** can't see an in-place repair, and nothing in this decision changes that. A visible reader may
+  return the removed records it had already read (or, for the safe reader, buffered), as for a replaced file (they
+  were committed). It then continues at its cursor in the new history without `Error::Discarded`. If the new
+  history's records line up with the old ones there, it reads them, so it moves from the removed history into the
+  new one without `Discarded`. Otherwise its cursor falls inside a record of the new history, and it waits at what
+  looks like an empty slot (`Ok(None)`; the identity check passes, so it never gets `Discarded`), or, once the bytes
+  there are non-zero, reports `Error::Corrupt` for the new history, which is not corrupt. It would return a record
+  that is not in the journal only if the new history held, at that offset, bytes forming a frame with a valid
+  CRC32C and the expected sequence number. `seek` to its position puts it back on the current chain. Detecting this
+  needs recovery to replace the file (or a writer generation in the format), so it is left to the work on recovery;
+  `crash-contract.md` C11 and "Readers after a repair" describe it.
+
+Storage damage to the marker itself is outside this argument: without a valid marker, recovery starts at the oldest
+segment and may zero records in place that an earlier marker covered (C11).
 
 ### Readers overtaken by retention
 
@@ -126,14 +178,15 @@ over the records a checkpoint covers. It is never on the per-record path.
 
 ## Consequences
 
-- C13 holds when recovery replaces a segment a durable-only reader holds. The rule is stated in the rustdoc of
+- C13 holds when recovery replaces a segment a durable-only reader holds, and when it removes records after the
+  checkpoint in place. The rule is stated in the rustdoc of
   `ReaderConfig::durable_only` and `Reader::try_next`, crash contract C13 and C14, and `format.md` (Checkpoint
   marker; What readers do about repairs). ADRs 0010 and 0016 point here.
 - New fault-injection hook points `ReaderCheckpoint` (before the marker read) and `ReaderCheckpointIdentity` (between
   the read and the check) let tests put a repair at each point of the interleaving
   (`tests/durable_only.rs`). `tests/reader_retention_stress.rs::durable_readers_under_repairs` restarts the writer
-  every few checkpoints with corruption injected before most restarts, and checks every record durable-only readers
-  return against the repaired journal.
+  every few checkpoints with damage injected before most restarts (a corrupt copy renamed over a segment, or a
+  commit word zeroed in place), and checks every record durable-only readers return against the repaired journal.
 - The CLI's `export --durable-only` and `stats --durable-only` read the marker before they open their reader, so
   everything they read is in files opened after the marker was written. No change.
 - No on-disk format change.

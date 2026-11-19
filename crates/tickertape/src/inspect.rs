@@ -53,6 +53,11 @@ pub fn list_segments(dir: impl AsRef<Path>) -> Result<Vec<SegmentInfo>> {
 /// oldest segments first, so the next listing already reflects a removal; more attempts are needed only if files
 /// keep disappearing, and on the last one a missing file is reported as an I/O error.
 const LISTING_ATTEMPTS: u32 = 8;
+/// [`verify`] scans a segment that ends in a state a live writer passes through again after this pause, then after
+/// pauses twice as long as the one before, up to [`TRANSIENT_LAST_PAUSE`].
+const TRANSIENT_FIRST_PAUSE: Duration = Duration::from_millis(10);
+/// The longest of those pauses (10 + 20 + ... + 320 ms: 630 ms in all).
+const TRANSIENT_LAST_PAUSE: Duration = Duration::from_millis(320);
 
 /// Opens a listed segment. `Ok(None)` if it no longer exists, unless this is the `last` attempt.
 fn open_listed(path: &Path, last: bool) -> Result<Option<File>> {
@@ -191,10 +196,17 @@ pub struct Problem {
 /// next writer repairs (a sealed newest segment without a successor, or an unsealed segment that has one).
 ///
 /// Against a live journal, the report describes the segments listed when the scan started, as the scan found them.
-/// A writer appending or rolling during the scan is not a problem (states it passes through are looked at again).
-/// Neither is retention: a segment it removes before the scan reaches it is not an error, and since retention
-/// removes the oldest segments first, the report then starts at the oldest segment the scan could still open,
-/// leaving out the removed history and what was found in it.
+/// A writer appending or rolling during the scan is not a problem: a segment that ends in a state a writer passes
+/// through (a record being written at the end of the newest segment, or an unsealed segment whose successor already
+/// exists, because a rolling writer links the successor just before it seals) is scanned again, after pauses of
+/// 10 ms doubling up to 320 ms (630 ms in all), until it no longer is. So with a writer running, a problem in the
+/// report is real unless the writer stayed in such a state for that long (descheduled or stopped between two
+/// steps); run `verify` again to tell. A problem that is really there is always reported, only later. With no writer
+/// running every reported problem is real, and a journal a crash left in such a state takes those 630 ms longer to
+/// verify.
+/// Retention is not a problem either: a segment it removes before the scan reaches it is not an error, and since
+/// retention removes the oldest segments first, the report then starts at the oldest segment the scan could still
+/// open, leaving out the removed history and what was found in it.
 ///
 /// # Errors
 ///
@@ -286,16 +298,19 @@ fn verify_once(dir: &Path, last: bool) -> Result<Option<VerifyReport>> {
         });
 
         let mut scan = journal::scan_open(&file, &path, base)?;
-        let transient = match scan.end {
+        let transient = |end: ScanEnd| match end {
             // A live writer may have been mid-append while we copied the file.
             ScanEnd::Invalid(_) => newest,
             // A rolling writer publishes the next segment just before it seals this one.
             ScanEnd::Empty => !newest,
             _ => false,
         };
-        if transient {
-            std::thread::sleep(Duration::from_millis(50));
+        // A writer descheduled in such a state stays in it: look again with growing pauses before reporting it.
+        let mut pause = TRANSIENT_FIRST_PAUSE;
+        while transient(scan.end) && pause <= TRANSIENT_LAST_PAUSE {
+            std::thread::sleep(pause);
             scan = journal::scan_open(&file, &path, base)?;
+            pause *= 2;
         }
         seg.records = scan.records;
         seg.end_seq = scan.next_seq;
@@ -310,8 +325,8 @@ fn verify_once(dir: &Path, last: bool) -> Result<Option<VerifyReport>> {
                 if newest {
                     crate::fault::hook(crate::fault::Point::InspectSeal);
                     let successor = journal::segment_path(dir, scan.next_seq);
-                    if journal::path_identity(&successor).is_none()
-                        && journal::path_identity(&path)
+                    if journal::path_identity(&successor)?.is_none()
+                        && journal::path_identity(&path)?
                             == Some(journal::file_identity(&file, &path)?)
                     {
                         report.problems.push(Problem {

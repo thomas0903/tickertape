@@ -25,6 +25,17 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   checkpoint moves past its position instead of at the end of the removed segment. New hook points
   `ReaderCheckpoint` and `ReaderCheckpointIdentity`, deterministic tests and a stress test with corruption injected
   between writer restarts cover this, and the soak test now fails on such a record instead of counting it.
+  A safe durable-only reader could also return such records from its read buffer when recovery removed them in
+  place, in a file that kept its identity (storage damage that emptied a commit word after the checkpoint); it now
+  discards that buffer when it applies a new marker, so it reads every newly covered record from the file again.
+- Fix: `tickertape tail` exited with an error when the records at its position had been removed by retention, which
+  a `--durable-only` tail now learns of when the checkpoint moves past it. It continues at the oldest record still in
+  the journal and warns on standard error with the range it skipped.
+- Fix: a `stat` that failed with an error other than "not found" (`EACCES`, `EIO`) counted as the segment being
+  gone, so a reader could report `Error::Discarded` and `verify` could miss a broken chain. It is now an I/O error.
+- Fix: `verify` (CLI `verify`, `inspect`) scanned a state a running writer passes through again only once, after
+  50 ms, so a writer descheduled between linking a new segment and sealing the old one for longer made it report a
+  broken chain. It now scans again with growing pauses, up to 630 ms in all.
 - Benchmarks: the test of a lagging reader under retention no longer depends on machine speed (it failed on
   macOS CI runners), and `tt-sustained` readers retry a seek when retention removes the segment they were about to
   open.

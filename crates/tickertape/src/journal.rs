@@ -2,6 +2,7 @@
 //! validating segment files, and file identity.
 
 use std::fs::{self, File};
+use std::io;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 
@@ -131,9 +132,16 @@ pub(crate) fn file_identity(file: &File, path: &Path) -> Result<Identity> {
     Ok((meta.dev(), meta.ino()))
 }
 
-/// The identity of whatever `path` names now, or `None` if nothing.
-pub(crate) fn path_identity(path: &Path) -> Option<Identity> {
-    fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
+/// The identity of whatever `path` names now, or `None` if nothing does ("not found").
+///
+/// Any other failure (`EACCES`, `EIO`, `ENOMEM`, ...) says nothing about whether the file is still in place, so it
+/// is returned as an error rather than taken for a removal.
+pub(crate) fn path_identity(path: &Path) -> Result<Option<Identity>> {
+    match fs::metadata(path) {
+        Ok(m) => Ok(Some((m.dev(), m.ino()))),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(Error::io("stat segment", path, e)),
+    }
 }
 
 /// Opens a directory so that it can be synced.

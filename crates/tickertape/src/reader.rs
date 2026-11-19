@@ -124,9 +124,10 @@ impl Reader {
     ///
     /// While the returned reader exists, no process other than a tickertape [`Writer`](crate::Writer) may modify
     /// the journal's segment files (writing into them, truncating them, or replacing their contents through other
-    /// tools). A tickertape writer never modifies bytes after committing them, including during crash recovery,
-    /// which repairs by replacing files (`docs/format.md` → Recovery). If a mapped file is truncated, the process
-    /// receives `SIGBUS`.
+    /// tools). A tickertape writer never truncates a segment, and repairs a corrupt tail by replacing the file
+    /// (`docs/format.md` → Recovery); the only committed bytes it changes in place are records that storage damage
+    /// made look uncommitted (an emptied commit word), which recovery zeroes. If a mapped file is truncated, the
+    /// process receives `SIGBUS`.
     ///
     /// # Errors
     ///
@@ -169,7 +170,8 @@ impl Reader {
     /// Retention may remove the segment holding `seq` while `seek` runs (between listing the segments and opening
     /// the chosen one). `seek` then lists the segments again, so it returns [`Error::SeqUnavailable`] with the new
     /// oldest sequence number, never an I/O error for the removed file. A segment removed just after `seek`
-    /// returns is still read, and the reader returns [`Error::Discarded`] at its end, as for any removed segment.
+    /// returns is still read, and the reader returns [`Error::Discarded`] at its end, as for any removed segment; a
+    /// durable-only reader may get it earlier, when the checkpoint moves past its position (ADR 0034).
     ///
     /// # Errors
     ///
@@ -208,7 +210,12 @@ impl Reader {
     /// a missing or invalid checkpoint marker covers no records. A marker describes the journal's current files, so a
     /// durable-only reader applies a marker that moves past its cursor only after confirming that its segment is still
     /// in place; if recovery replaced it or retention removed it, the reader returns [`Error::Discarded`] then, instead
-    /// of reading on in the file it has open (ADR 0034).
+    /// of reading on in the file it has open (ADR 0034). If it is in place, the reader reads the records the marker
+    /// newly covers from the file's current bytes, so records that recovery removed in place are never returned.
+    /// A visible reader can't notice such an in-place repair (storage damage that emptied a commit word; crash
+    /// contract C11): it may return records it had already read, then continue in the new history, wait, or report
+    /// corruption at a position that no longer starts a record; [`Reader::seek`] to its position puts it back on the
+    /// current chain.
     ///
     /// # Errors
     ///
@@ -220,7 +227,8 @@ impl Reader {
     /// I/O "not found" error.
     /// [`Error::Corrupt`] with [`CorruptReason::BrokenChain`] if the segment at the cursor is sealed and still in
     /// place but the next segment is missing.
-    /// [`Error::Io`] if the next segment can't be opened.
+    /// [`Error::Io`] if the next segment can't be opened, or if checking whether the segment is still in place fails
+    /// other than with "not found" (only that counts as a removal).
     pub fn try_next(&mut self) -> Result<Option<Record<'_>>> {
         match self.advance()? {
             Some(found) => Ok(Some(self.materialize(found))),
@@ -349,9 +357,10 @@ impl Reader {
         self.next_seq.max(self.skip_until)
     }
 
-    /// Returns `Error::Discarded` if the current segment's path no longer names the file the reader has open.
+    /// Returns `Error::Discarded` if the current segment's path no longer names the file the reader has open, and
+    /// `Error::Io` if that can't be checked (a `stat` failing other than with "not found").
     fn check_identity(&self) -> Result<()> {
-        if journal::path_identity(&self.seg.path) != Some(self.seg.identity) {
+        if journal::path_identity(&self.seg.path)? != Some(self.seg.identity) {
             return Err(Error::Discarded {
                 seq: self.position(),
             });
@@ -390,13 +399,22 @@ impl Reader {
     /// at a moment after the marker was written, and recovery keeps every record a marker covers, byte for byte, in
     /// the current files from then on. Checking first would let a repair and the new writer's checkpoint land between
     /// the check and the read, applying the new marker to the old file. The open file's descriptor keeps its inode
-    /// allocated, so no later file can have its identity. ADR 0034 has the full argument.
+    /// allocated, so no later file can have its identity.
+    ///
+    /// When the check passes, the `pread` buffer is discarded, so every record the marker newly covers is read from
+    /// the file after the check. Bytes past the old marker that were buffered before may predate a repair that kept
+    /// the file (recovery zeroing, in place, records after the checkpoint whose commit word storage damage emptied),
+    /// which no identity check can see. Bytes before a marker never change in place, so records below the new marker
+    /// read now are the covered ones, and the cursor (never past a marker the reader applied) is a record boundary of
+    /// the current history. The mapping needs nothing: it shows the current bytes. ADR 0034 has the full argument.
     fn refresh_checkpoint(&mut self) -> Result<()> {
         crate::fault::hook(crate::fault::Point::ReaderCheckpoint);
         let durable = crate::inspect::read_checkpoint(&self.dir)?.map_or(0, |c| c.next_seq);
         if durable > self.next_seq {
             crate::fault::hook(crate::fault::Point::ReaderCheckpointIdentity);
             self.check_identity()?;
+            // Bytes buffered before the marker was read may predate an in-place repair after the old marker.
+            self.buf.clear();
         }
         self.durable_next_seq = durable;
         Ok(())

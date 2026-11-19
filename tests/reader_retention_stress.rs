@@ -9,10 +9,13 @@
 //! `--ignored`. Replay a run with `TICKERTAPE_TEST_SEED`.
 //!
 //! `durable_readers_under_repairs` adds crash contract C13 (ADR 0034): the writer restarts every few checkpoints, and
-//! before most restarts a record after the checkpoint is corrupted in a copy renamed over its segment, so recovery
-//! replaces a segment that readers still hold with valid bytes. Durable-only readers must never return a record that
-//! a reader of the repaired journal doesn't also return at the same sequence number with the same bytes; visible
-//! readers must never move from a removed history into the repaired one without `Error::Discarded`.
+//! before most restarts a record after the checkpoint is damaged. Usually it is corrupted in a copy renamed over its
+//! segment, so recovery replaces a segment that readers still hold with valid bytes; sometimes its commit word is
+//! zeroed in the file itself, so recovery removes it and the records after it in place, while safe readers may still
+//! hold the old bytes in their read buffers. Durable-only readers must never return a record that a reader of the
+//! repaired journal doesn't also return at the same sequence number with the same bytes; visible readers must never
+//! move from a removed history into the repaired one without `Error::Discarded`, except across an in-place repair,
+//! which keeps the file's identity (C11).
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -25,7 +28,7 @@ use tickertape::{
 };
 use tickertape_tests::{
     Rng, append_n, check_record, corrupt_by_replacement, end_of_records, payload, payload_len,
-    reopen_writer, segments, small_config,
+    reopen_writer, segments, small_config, zero_commit_word,
 };
 
 /// A reader that hasn't made progress for this long while the writer has is stuck. Time during which the writer
@@ -431,11 +434,16 @@ struct Repairs<'a> {
     /// `starts[g]`: the sequence number at which writer generation `g` began appending (its `next_seq` after
     /// recovery). Pushed before the generation appends anything.
     starts: &'a Mutex<Vec<u64>>,
+    /// `in_place[g]`: whether recovery made generation `g`'s start by removing records in place (after a zeroed
+    /// commit word) rather than by replacing a file. Pushed before `starts[g]`.
+    in_place: &'a Mutex<Vec<bool>>,
     /// Odd while the writer is stopped, from just before a corrupt copy may be renamed into place until recovery has
     /// repaired it. Visible readers may report corruption only during such a window.
     window: &'a AtomicU64,
     /// Restarts whose recovery replaced or quarantined a segment.
     repairs: &'a AtomicU64,
+    /// Restarts whose recovery removed records in place.
+    in_place_repairs: &'a AtomicU64,
     /// `Error::Discarded` seen by durable-only readers.
     discarded: &'a AtomicU64,
     /// Records returned by durable-only readers.
@@ -446,16 +454,23 @@ fn repairs(duration: Duration) {
     let dir = tempfile::tempdir().unwrap();
     let stop = AtomicBool::new(false);
     let starts = Mutex::new(vec![0]);
+    let in_place = Mutex::new(vec![false]);
     let window = AtomicU64::new(0);
-    let (repairs, discarded, durable_records) =
-        (AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0));
+    let (repairs, in_place_repairs, discarded, durable_records) = (
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    );
     let mut rng = Rng::from_env("durable_readers_under_repairs");
     let shared = Repairs {
         dir: dir.path(),
         stop: &stop,
         starts: &starts,
+        in_place: &in_place,
         window: &window,
         repairs: &repairs,
+        in_place_repairs: &in_place_repairs,
         discarded: &discarded,
         durable_records: &durable_records,
     };
@@ -495,8 +510,11 @@ fn repairs(duration: Duration) {
             .collect();
 
         let started = Instant::now();
-        let exercised =
-            || repairs.load(Ordering::SeqCst) >= 3 && discarded.load(Ordering::SeqCst) > 0;
+        let exercised = || {
+            repairs.load(Ordering::SeqCst) >= 3
+                && in_place_repairs.load(Ordering::SeqCst) > 0
+                && discarded.load(Ordering::SeqCst) > 0
+        };
         while (started.elapsed() < duration
             || (!exercised() && started.elapsed() < duration + GRACE))
             && !stop.load(Ordering::SeqCst)
@@ -560,14 +578,19 @@ fn repairs(duration: Duration) {
             }
         }
     }
-    let (repairs, discarded) = (repairs.into_inner(), discarded.into_inner());
+    let (repairs, in_place_repairs, discarded) = (
+        repairs.into_inner(),
+        in_place_repairs.into_inner(),
+        discarded.into_inner(),
+    );
     eprintln!(
-        "durable_readers_under_repairs: {} generations, {repairs} repairs, {} durable-only records, {discarded} \
-         discarded",
+        "durable_readers_under_repairs: {} generations, {repairs} repairs, {in_place_repairs} in place, {} \
+         durable-only records, {discarded} discarded",
         starts.len(),
         durable_records.into_inner(),
     );
     assert!(repairs >= 3, "only {repairs} repairs");
+    assert!(in_place_repairs > 0, "no in-place repairs");
     assert!(
         discarded > 0,
         "durable-only readers never raced with a repair"
@@ -575,7 +598,8 @@ fn repairs(duration: Duration) {
 }
 
 /// Appends and checkpoints, then appends a tail that isn't checkpointed and restarts the writer, usually after
-/// corrupting a record after the checkpoint in a copy renamed over its segment. Until stopped.
+/// damaging a record after the checkpoint: half the time by corrupting it in a copy renamed over its segment, a
+/// quarter of the time by zeroing its commit word in place. Until stopped.
 fn restart_loop(
     mut writer: Writer,
     config: tickertape::WriterConfig,
@@ -591,21 +615,27 @@ fn restart_loop(
         append_generation(&mut writer, 1 + rng.below(300), generation);
         shared.window.fetch_add(1, Ordering::SeqCst);
         drop(writer);
-        if rng.below(4) != 0 {
+        let damage = rng.below(8);
+        let mut zeroed = false;
+        if damage >= 2 {
             let marker = inspect::read_checkpoint(shared.dir)
                 .unwrap()
                 .expect("checkpoint");
             let newest = segments(shared.dir).pop().expect("a segment").1;
             let (_, end) = end_of_records(&newest);
             if end > marker.next_seq {
-                corrupt_by_replacement(
-                    shared.dir,
-                    marker.next_seq + rng.below(end - marker.next_seq),
-                );
+                let seq = marker.next_seq + rng.below(end - marker.next_seq);
+                if damage < 4 {
+                    zero_commit_word(shared.dir, seq);
+                    zeroed = true;
+                } else {
+                    corrupt_by_replacement(shared.dir, seq);
+                }
             }
         }
         writer = reopen_writer(shared.dir, config.clone());
-        if writer.recovery_report().actions.iter().any(|a| {
+        let actions = &writer.recovery_report().actions;
+        if actions.iter().any(|a| {
             matches!(
                 a,
                 RecoveryAction::RepairedTail { .. } | RecoveryAction::QuarantinedSegment { .. }
@@ -613,7 +643,17 @@ fn restart_loop(
         }) {
             shared.repairs.fetch_add(1, Ordering::SeqCst);
         }
+        if zeroed {
+            assert!(
+                actions
+                    .iter()
+                    .any(|a| matches!(a, RecoveryAction::ZeroedUncommitted { .. })),
+                "{actions:?}"
+            );
+            shared.in_place_repairs.fetch_add(1, Ordering::SeqCst);
+        }
         generation += 1;
+        shared.in_place.lock().unwrap().push(zeroed);
         shared.starts.lock().unwrap().push(writer.next_seq());
         shared.window.fetch_add(1, Ordering::SeqCst);
     }
@@ -670,7 +710,11 @@ fn durable_follow(shared: &Repairs<'_>, mapped: bool, slow: bool) -> Vec<(u64, u
 
 /// Follows the journal with a visible reader. Between two `Error::Discarded`, consecutive records must belong to one
 /// history: if record `s` is of generation `g1` and `s + 1` of `g2`, then `g2 >= g1` and every generation after `g1`
-/// up to `g2` began at or after `s + 1` (kept record `s`).
+/// up to `g2` began at or after `s + 1` (kept record `s`) or was made by an in-place repair. A visible reader can't
+/// see an in-place repair (the file keeps its identity): it may return the removed records it had already read or
+/// buffered and then continue in the new history. Records at a sequence number have the same length in every
+/// generation here, so its cursor stays on a record boundary; with other lengths it could fall inside a record of
+/// the new history (`docs/crash-contract.md`, C11).
 fn visible_follow(shared: &Repairs<'_>, mapped: bool) {
     let mut reader = open(shared.dir, mapped, false);
     let mut expected = reader.position();
@@ -685,11 +729,11 @@ fn visible_follow(shared: &Repairs<'_>, mapped: bool) {
                 if let Some((seq, generation)) = previous {
                     let next = record.schema_id;
                     let starts = shared.starts.lock().unwrap();
+                    let in_place = shared.in_place.lock().unwrap();
                     assert!(
                         next >= generation
-                            && starts[generation as usize + 1..=next as usize]
-                                .iter()
-                                .all(|&start| start > seq),
+                            && (generation as usize + 1..=next as usize)
+                                .all(|g| starts[g] > seq || in_place[g]),
                         "visible reader (mapped {mapped}) moved from record {seq} of generation {generation} to \
                          record {} of generation {next} without Error::Discarded",
                         record.seq

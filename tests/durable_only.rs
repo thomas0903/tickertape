@@ -5,9 +5,10 @@ use std::time::Duration;
 
 use tickertape::fault::Point;
 use tickertape::retention::{self, Action, Policy};
-use tickertape::{Error, NewRecord, OwnedRecord, Reader, ReaderConfig, Writer};
+use tickertape::{Error, NewRecord, OwnedRecord, Reader, ReaderConfig, RecoveryAction, Writer};
 use tickertape_tests::{
-    append_n, check_record, corrupt_by_replacement, read_all, reopen_writer, segments, small_config,
+    append_n, check_record, corrupt_by_replacement, read_all, reopen_writer, segments,
+    small_config, zero_commit_word,
 };
 
 fn open(dir: &std::path::Path, mapped: bool) -> Reader {
@@ -418,6 +419,95 @@ fn second_repair_before_the_identity_check_is_discarded() {
         let (records, discarded) = drain(&mut reader, 75);
         assert_repaired_history(dir.path(), &records, 50..75);
         assert_eq!(discarded, [50], "mapped {mapped}");
+    }
+}
+
+/// Storage damage zeroes the commit word of record `damaged`, which no checkpoint covers, in the segment file itself
+/// (C11). Recovery takes it for the end of the committed records and zeroes the rest of the segment in place: the
+/// file keeps its identity, so no identity check can see the repair. The next writer appends `checkpointed` records of
+/// history `tag` into the same file, from `damaged` on, and checkpoints.
+fn repair_in_place(dir: &std::path::Path, damaged: u64, checkpointed: u64, tag: u32) {
+    let identity = |path: &std::path::Path| {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::metadata(path).unwrap();
+        (meta.dev(), meta.ino())
+    };
+    let path = segments(dir).pop().unwrap().1;
+    let before = identity(&path);
+    zero_commit_word(dir, damaged);
+    let mut writer = reopen_writer(dir, small_config());
+    assert_eq!(
+        writer.next_seq(),
+        damaged,
+        "recovery keeps the records before the damaged one"
+    );
+    assert!(
+        writer
+            .recovery_report()
+            .actions
+            .iter()
+            .any(|a| matches!(a, RecoveryAction::ZeroedUncommitted { .. })),
+        "{:?}",
+        writer.recovery_report().actions
+    );
+    append_history(&mut writer, checkpointed, tag);
+    writer.checkpoint().unwrap();
+    assert_eq!(identity(&path), before, "repaired in place");
+}
+
+/// A safe durable-only reader validates records in its read buffer, which can hold bytes it read past the checkpoint
+/// before the repair. Records 10..20 are not checkpointed and the reader has buffered them; recovery removes records
+/// from `damaged` on in place and the new writer checkpoints a different history there (whose records have other
+/// lengths, so the old record boundaries fall inside new records). The reader must read every record the new marker
+/// covers from the current file: the kept records, then the new history, with no `Error::Discarded` (nothing it
+/// returned was removed) and no corruption report. The middle record (15) and the newest record (19) are damaged in
+/// turn; the reader waits at the checkpoint (10) or stops inside the coverage of a marker it already applied (13 of
+/// 0..15).
+#[test]
+fn durable_only_reader_rereads_the_tail_after_an_in_place_repair() {
+    for (checkpoint, stop) in [(10, 10), (15, 13)] {
+        for damaged in [15, 19] {
+            if damaged < checkpoint {
+                continue;
+            }
+            for mapped in [false, true] {
+                let case = format!(
+                    "checkpoint {checkpoint}, stop {stop}, damaged {damaged}, mapped {mapped}"
+                );
+                let dir = tempfile::tempdir().unwrap();
+                let mut writer = Writer::open(dir.path(), small_config()).unwrap();
+                append_n(&mut writer, checkpoint);
+                writer.checkpoint().unwrap();
+                append_n(&mut writer, 20 - checkpoint); // up to 20, not checkpointed
+                drop(writer);
+                let mut reader = open(dir.path(), mapped);
+                for seq in 0..stop {
+                    let record = reader.next_owned().unwrap().expect("checkpointed record");
+                    assert_eq!(record.seq, seq, "{case}");
+                    check_record(&record);
+                }
+
+                repair_in_place(dir.path(), damaged, 10, 99);
+                let end = damaged + 10;
+                let (records, discarded) = drain(&mut reader, end);
+                assert_repaired_history(dir.path(), &records, stop..end);
+                assert!(discarded.is_empty(), "{case}: {discarded:?}");
+                assert!(
+                    records[(damaged - stop) as usize..]
+                        .iter()
+                        .all(|r| r.schema_id == 99),
+                    "{case}"
+                );
+
+                // The cursor is on a record boundary of the new history: the reader follows it on.
+                let mut writer = reopen_writer(dir.path(), small_config());
+                append_history(&mut writer, 10, 99);
+                writer.checkpoint().unwrap();
+                let (records, discarded) = drain(&mut reader, end + 10);
+                assert_repaired_history(dir.path(), &records, end..end + 10);
+                assert!(discarded.is_empty(), "{case}: {discarded:?}");
+            }
+        }
     }
 }
 

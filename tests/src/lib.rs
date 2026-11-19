@@ -204,17 +204,14 @@ pub fn reopen_writer(dir: &Path, config: WriterConfig) -> Writer {
     }
 }
 
-/// Makes record `seq` corrupt in the file that a later writer's recovery reads, without touching the file that open
-/// readers hold: writes a copy of the segment holding `seq` with one byte of the record's fields flipped (a checksum
-/// mismatch), and renames the copy over the segment. Readers that have the segment open keep valid bytes where
-/// recovery will find corruption, as when a reader's copy of a page outlives a storage failure (C11).
-pub fn corrupt_by_replacement(dir: &Path, seq: u64) {
+/// The segment holding record `seq` and the record's offset in it.
+pub fn locate_record(dir: &Path, seq: u64) -> (PathBuf, u64) {
     let (base, path) = segments(dir)
         .into_iter()
         .rev()
         .find(|(base, _)| *base <= seq)
         .expect("a segment at or below seq");
-    let mut image = std::fs::read(&path).unwrap();
+    let image = std::fs::read(&path).unwrap();
     let (mut offset, mut at) = (format::SEGMENT_HEADER_LEN as u64, base);
     while at < seq {
         match format::read_slot(&image[..], offset, at) {
@@ -231,8 +228,27 @@ pub fn corrupt_by_replacement(dir: &Path, seq: u64) {
         "record {seq} in {}",
         path.display()
     );
+    (path, offset)
+}
+
+/// Makes record `seq` corrupt in the file that a later writer's recovery reads, without touching the file that open
+/// readers hold: writes a copy of the segment holding `seq` with one byte of the record's fields flipped (a checksum
+/// mismatch), and renames the copy over the segment. Readers that have the segment open keep valid bytes where
+/// recovery will find corruption, as when a reader's copy of a page outlives a storage failure (C11).
+pub fn corrupt_by_replacement(dir: &Path, seq: u64) {
+    let (path, offset) = locate_record(dir, seq);
+    let mut image = std::fs::read(&path).unwrap();
     image[offset as usize + 20] ^= 0xff;
     let tmp = dir.join("corrupt-replacement");
     std::fs::write(&tmp, &image).unwrap();
     std::fs::rename(&tmp, &path).unwrap();
+}
+
+/// Zeroes the commit word of record `seq` in the segment file itself (same inode), as storage damage that loses one
+/// word would (C11). Recovery then takes the record for the end of the committed records and zeroes the rest of the
+/// segment in place, so a later writer appends a different history into the same file. A safe reader that copied
+/// the old bytes into its read buffer before the damage still holds them.
+pub fn zero_commit_word(dir: &Path, seq: u64) {
+    let (path, offset) = locate_record(dir, seq);
+    open_raw(&path).write_all_at(&[0; 4], offset).unwrap();
 }
