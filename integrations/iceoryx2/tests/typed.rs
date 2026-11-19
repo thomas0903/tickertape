@@ -103,3 +103,118 @@ fn typed_record_then_typed_replay() {
     assert!(matches!(err, Error::Incompatible { .. }), "{err}");
     assert!(err.to_string().contains("registered Rust types"), "{err}");
 }
+
+/// With small segments and retention, the recorder writes every open service's descriptor at the start of each
+/// segment, so every segment that survives can be decoded on its own: no record is left without its descriptor.
+#[test]
+fn descriptors_repeat_per_segment_and_survive_retention() {
+    let _serial = serial();
+    const N: u64 = 4000;
+    let dir = tempfile::tempdir().unwrap();
+    let journal = dir.path().join("j");
+    let service = unique("retention");
+    let publisher = Proc::spawn(
+        &example("publisher"),
+        &[
+            "--service",
+            &service,
+            "--count",
+            &N.to_string(),
+            "--rate",
+            "4000",
+            "--wait-subscribers",
+            "1",
+            "--blocking",
+        ],
+    );
+    wait_for_service(&service, SECS(20));
+    let recorder = Recorder::builder(&journal)
+        .typed(
+            TypedService::<Tick, TickHeader>::new(&service).counter(CounterField {
+                location: CounterLocation::UserHeader,
+                offset: 0,
+                width: 8,
+            }),
+        )
+        .writer_config(
+            tickertape::WriterConfig::default()
+                .segment_size(65_536)
+                .prefault(false)
+                .retention(
+                    tickertape::retention::Policy::default().max_segments(3),
+                    tickertape::retention::Action::Delete,
+                ),
+        )
+        .checkpoint_interval(Duration::from_millis(20))
+        .handle_signals(false)
+        .max_messages(N)
+        .max_duration(Duration::from_secs(60))
+        .build()
+        .unwrap();
+    let report = recorder.run().unwrap();
+    let (status, _, err) = publisher.wait(SECS(30));
+    assert!(status.success(), "{err}");
+    assert_eq!(report.messages, N);
+    assert!(report.services[0].descriptors >= 6, "{report:?}");
+
+    let segments = tickertape::inspect::list_segments(&journal).unwrap();
+    assert_eq!(segments.len(), 3, "retention kept three segments");
+    assert!(segments[0].base_seq > 0, "older segments were removed");
+    for segment in &segments {
+        let mut reader =
+            tickertape::Reader::open(&journal, tickertape::ReaderConfig::default()).unwrap();
+        reader.seek(segment.base_seq).unwrap();
+        let first = reader.try_next().unwrap().unwrap();
+        assert_eq!(
+            first.schema_id,
+            tickertape_iceoryx2::layout::SCHEMA_DESCRIPTOR,
+            "segment at {} starts with the descriptor",
+            segment.base_seq
+        );
+    }
+    let info = tickertape_iceoryx2::info::scan(&journal, false).unwrap();
+    assert_eq!(info.undescribed_records, 0, "{info:?}");
+    assert_eq!(info.runs.len(), 1);
+    assert_eq!(info.services[0].runs, 1);
+    let data = info.services[0].messages;
+    assert!(data > 0 && data < N, "{data}");
+}
+
+/// The safe `Replayer::run` replays only services registered with their Rust types; everything else needs the
+/// `unsafe` `run_dynamic`, whose caller vouches for the recorded bytes.
+#[test]
+fn safe_replay_refuses_services_without_rust_types() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = dir.path().join("j");
+    let service = unique("untyped");
+    append_records(
+        &journal,
+        1 << 20,
+        &run_of(
+            &RawDescriptor::new(&service, RawType::fixed("u64", 8, 8)),
+            0,
+            2,
+        ),
+    );
+    let err = Replayer::builder(&journal)
+        .handle_signals(false)
+        .build()
+        .unwrap()
+        .run()
+        .unwrap_err();
+    assert!(matches!(err, Error::Usage(_)), "{err}");
+    assert!(err.to_string().contains("run_dynamic"), "{err}");
+    // Registered with matching Rust types, it replays.
+    let report = Replayer::builder(&journal)
+        .typed::<u64, ()>(&service)
+        .remap(
+            tickertape_iceoryx2::replayer::Remap::default()
+                .prefix(format!("{}/", unique("typed-target"))),
+        )
+        .handle_signals(false)
+        .build()
+        .unwrap()
+        .run()
+        .unwrap();
+    assert_eq!(report.messages, 2);
+}

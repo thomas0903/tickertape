@@ -7,7 +7,9 @@
 //! - [`Catalog`] and [`info`]: look up descriptors and summarize a recording, also without iceoryx2.
 //! - `recorder` (feature `iceoryx2`, on by default): `Recorder` records one or several services into one journal.
 //! - `replayer` (feature `iceoryx2`): `Replayer` publishes recorded messages again, as fast as possible or at the
-//!   recorded pace.
+//!   recorded pace. Typed replay is safe; replaying services by their recorded type details is an `unsafe fn`
+//!   (`Replayer::run_dynamic`, feature `dynamic`), because the recorded bytes are published as values of the
+//!   recorded types: replay only recordings you trust.
 //! - `dynamic` and `upstream` (feature `dynamic`): services whose Rust types are only known at run time, and
 //!   iceoryx2's recording file format. These use iceoryx2 API that upstream marks internal; see the `dynamic`
 //!   module.
@@ -25,13 +27,18 @@
 //! only after the next checkpoint.
 
 #![warn(missing_docs)]
+// `unsafe` is allowed in exactly one module, `dynamic` (see CONTRIBUTING.md).
+#![deny(unsafe_code)]
 
 mod catalog;
 mod error;
 pub mod info;
 pub mod layout;
+#[cfg(feature = "iceoryx2")]
+mod tail;
 
 #[cfg(feature = "dynamic")]
+#[allow(unsafe_code)]
 pub mod dynamic;
 #[cfg(feature = "iceoryx2")]
 mod pacing;

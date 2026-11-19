@@ -11,17 +11,42 @@
 //! - `TypeDetail::__internal_new_from_parts` to build type details from a recording.
 //!
 //! Upstream may change any of these in a minor release; this module is the only place that uses them, so that a
-//! change is easy to follow. It is also the only module of the crate with `unsafe` code: every block is listed
-//! with its reasoning below and in the pull request that added it. The typed [`recorder`](crate::recorder) and
-//! [`replayer`](crate::replayer) paths need none.
+//! change is easy to follow. It is also the only module of the crate with `unsafe` code (the crate denies
+//! `unsafe_code` everywhere else): every block is listed with its reasoning below and in the pull request that
+//! added it. The typed [`recorder`](crate::recorder) and [`replayer`](crate::replayer) paths need none.
+//!
+//! Type details reach these setters only after [`layout::validate_types`] accepted them, whether they come from a
+//! running service, a journal or a file: alignment, sizes, the chunk layout they imply and the user header's
+//! variant. Replayed service settings are checked by [`layout::ServiceSettings::validate`] first too.
 //!
 //! Recording copies the bytes exactly as they are in shared memory, including padding inside the user's types;
 //! replay writes them back unchanged.
+//!
+//! # Assumptions this module makes about iceoryx2
+//!
+//! - **The user header is reached through a zero-sized reference.** For a runtime-typed service, iceoryx2 0.10 hands
+//!   out the user header only as `&CustomHeaderMarker` / `&mut CustomHeaderMarker`, a reference to a zero-sized
+//!   type at the header's address, and offers no accessor that yields a pointer or slice derived from the chunk
+//!   (its chunk accessors are crate-private). This module, like upstream's own `iox2 service record`, `replay`,
+//!   `publish` and `subscribe`, casts that reference to a byte pointer and accesses the header's
+//!   `user header size` bytes through it. The address and its provenance come from the shared-memory mapping
+//!   (iceoryx2 derives the reference from the chunk's raw pointer), but the reference itself covers zero bytes.
+//!   Under the Tree Borrows aliasing model, accesses outside a reference's range through a pointer derived from it
+//!   are permitted; under Stacked Borrows they are not. Rust has not settled its aliasing model, so this relies on
+//!   the more permissive one. A supported accessor is in the upstream requests drafted in the pull request.
+//!   Headers of size 0 are never accessed.
+//! - **Received bytes are initialised.** The recorder reads every payload and header byte as `u8`. Bytes written by
+//!   another process are bytes of a shared mapping this process didn't write, and are initialised for it. A
+//!   publisher in the *same* process that publishes a type with padding through iceoryx2's typed API may leave the
+//!   padding bytes uninitialised in Rust's abstract machine; reading them as `u8` is then undefined behaviour in
+//!   principle (upstream's recorder does the same). Don't record a padded type with this module from the process
+//!   that publishes it; the typed recorder, which only accepts types without padding, has no such case.
 
 use iceoryx2::port::listener::Listener;
 use iceoryx2::port::publisher::Publisher;
 use iceoryx2::port::subscriber::Subscriber;
 use iceoryx2::prelude::*;
+use iceoryx2::service::builder::publish_subscribe::Builder as PubSubBuilder;
 use iceoryx2::service::marker::{CustomHeaderMarker, CustomPayloadMarker};
 use iceoryx2::service::port_factory::PortFactory as _;
 use iceoryx2::service::port_factory::publish_subscribe::PortFactory;
@@ -30,15 +55,16 @@ use iceoryx2::service::static_config::message_type_details::{
 };
 
 use crate::Error;
-use crate::layout::{CounterField, Descriptor, TypeInfo, TypeVariant};
+use crate::layout::{self, CounterField, Descriptor, TypeInfo, TypeVariant};
 use crate::recorder::{
-    Described, Message, Source, SourceFactory, describe, open_listener, service_name,
-    service_version, type_info,
+    Described, Message, Opened, Source, SourceFactory, describe, not_there_yet, open_error,
+    open_listener, service_name, service_version, type_info,
 };
-use crate::replayer::Sink;
+use crate::replayer::{ReplayReport, Replayer, Sink};
 use crate::typed::{Create, open_or_create};
 
 type RawFactory = PortFactory<ipc::Service, [CustomPayloadMarker], CustomHeaderMarker>;
+type RawBuilder = PubSubBuilder<[CustomPayloadMarker], CustomHeaderMarker, ipc::Service>;
 
 /// A service recorded by name, with the types its publishers created it with (feature `dynamic`).
 ///
@@ -73,8 +99,8 @@ impl DynamicService {
         }
     }
 
-    /// Reads `venue_ts_ns` as an unsigned little-endian 64-bit integer at this byte offset in the user header.
-    /// Messages whose header is too short get 0.
+    /// Reads `venue_ts_ns` as an unsigned little-endian 64-bit integer at this byte offset in the user header. The
+    /// eight bytes must lie inside the service's user header, or the service is refused when it is opened.
     pub fn venue_ts_offset(mut self, offset: u32) -> Self {
         self.venue_ts_offset = Some(offset);
         self
@@ -93,7 +119,7 @@ impl DynamicService {
     }
 }
 
-/// Builds an iceoryx2 `TypeDetail` from a recorded one.
+/// Builds an iceoryx2 `TypeDetail` from a recorded one that passed [`layout::validate_types`].
 pub(crate) fn type_detail(info: &TypeInfo) -> Result<TypeDetail, Error> {
     let n = |v: u64, what: &str| {
         usize::try_from(v)
@@ -116,35 +142,29 @@ pub(crate) fn type_detail(info: &TypeInfo) -> Result<TypeDetail, Error> {
     })
 }
 
-/// Opens (or, with `create`, creates) a service with type details given at run time.
-fn open_raw(
+/// A builder for a service with type details given at run time. The caller has validated them with
+/// [`layout::validate_types`].
+fn raw_builder(
     node: &Node<ipc::Service>,
     name: &ServiceName,
-    display: &str,
     payload: &TypeDetail,
     user_header: &TypeDetail,
-    create: Option<Create>,
-) -> Result<RawFactory, Error> {
-    let make = || {
-        let builder = node
-            .service_builder(name)
-            .publish_subscribe::<[CustomPayloadMarker]>()
-            .user_header::<CustomHeaderMarker>();
-        // SAFETY: (unsafe block 1) The type details are either read from the running service (recording) or
-        // recorded from it (replay), so they describe the memory layout its other ports use; iceoryx2 checks them
-        // against the existing service on open. This module only ever reads and writes those samples as plain
-        // bytes, within the sizes the same details give (see `DynamicSource::drain` and `DynamicSink::send`).
-        unsafe {
-            builder
-                .__internal_set_payload_type_details(payload)
-                .__internal_set_user_header_type_details(user_header)
-        }
-    };
-    match create {
-        Some(create) => open_or_create!(make, display, create),
-        None => make()
-            .open()
-            .map_err(|e| crate::recorder::incompatible_or(display, e)),
+) -> RawBuilder {
+    let builder = node
+        .service_builder(name)
+        .publish_subscribe::<[CustomPayloadMarker]>()
+        .user_header::<CustomHeaderMarker>();
+    // SAFETY: (unsafe block 1) The type details passed `layout::validate_types` (power-of-two alignment of at most
+    // 4096, sizes that are multiples of it, a fixed-size user header, a non-zero slice element size, and a chunk
+    // layout that fits a Rust `Layout` for any element count a journal record can hold), so iceoryx2's unchecked
+    // chunk arithmetic can't overflow. They are read from the running service (recording) or recorded from one
+    // (replay), and iceoryx2 checks them against an existing service on open. This module only ever reads and writes
+    // the samples as plain bytes, within the sizes the same details give (see `DynamicSource::drain` and
+    // `DynamicSink::send`).
+    unsafe {
+        builder
+            .__internal_set_payload_type_details(payload)
+            .__internal_set_user_header_type_details(user_header)
     }
 }
 
@@ -157,34 +177,43 @@ impl SourceFactory for DynamicService {
         self.counter
     }
 
-    fn open(
-        &mut self,
-        node: &Node<ipc::Service>,
-        buffer_size: usize,
-    ) -> Result<Option<Box<dyn Source>>, Error> {
+    fn open(&mut self, node: &Node<ipc::Service>, buffer_size: usize) -> Result<Opened, Error> {
         let name = service_name(&self.name)?;
         let details =
             ipc::Service::details(&name, node.config(), MessagingPattern::PublishSubscribe)
                 .map_err(|e| Error::iox(&format!("read details of \"{}\"", self.name), e))?;
         let Some(details) = details else {
-            return Ok(None);
+            return Ok(Opened::NotYet);
         };
         let types = *details
             .static_details
             .publish_subscribe()
             .message_type_details();
-        let factory = match open_raw(
-            node,
-            &name,
-            &self.name,
-            &types.payload,
-            &types.user_header,
-            None,
-        ) {
+        // The running service's type details come from shared memory another process wrote: validate them before
+        // they reach iceoryx2's internal setters.
+        let unsupported = |reason: String| Error::Unsupported {
+            service: self.name.clone(),
+            reason,
+        };
+        layout::validate_types(
+            &type_info(&types.payload),
+            &type_info(&types.user_header),
+            &type_info(&types.header),
+        )
+        .map_err(|e| unsupported(e.to_string()))?;
+        if let Some(offset) = self.venue_ts_offset
+            && u64::from(offset) + 8 > types.user_header.size() as u64
+        {
+            return Err(unsupported(format!(
+                "the venue timestamp at offset {offset} doesn't fit its {}-byte user header",
+                types.user_header.size()
+            )));
+        }
+        let factory = match raw_builder(node, &name, &types.payload, &types.user_header).open() {
             Ok(f) => f,
             // It went away between the two calls; try again later.
-            Err(Error::Iceoryx2(text)) if text.contains("DoesNotExist") => return Ok(None),
-            Err(e) => return Err(e),
+            Err(e) if not_there_yet(&e) => return Ok(Opened::NotYet),
+            Err(e) => return Err(open_error(&self.name, e)),
         };
         let cfg = factory.static_config();
         let buffer = buffer_size.min(cfg.subscriber_max_buffer_size()).max(1);
@@ -194,7 +223,7 @@ impl SourceFactory for DynamicService {
             .create()
             .map_err(|e| Error::iox("create subscriber", e))?;
         let described = describe(cfg, service_version(node, &name), buffer);
-        Ok(Some(Box::new(DynamicSource {
+        Ok(Opened::Ready(Box::new(DynamicSource {
             user_header_len: types.user_header.size(),
             subscriber,
             venue_ts_offset: self.venue_ts_offset,
@@ -239,18 +268,25 @@ impl Source for DynamicSource {
             // SAFETY: (unsafe block 2) For `[CustomPayloadMarker]` (a one-byte marker), iceoryx2 sizes the payload
             // slice in bytes: number of elements times the element size from the type details. The memory is the
             // sample's payload in shared memory, mapped read-only for this subscriber while `sample` lives, and
-            // this slice doesn't outlive `sample`. Bytes written by another process are initialized as far as this
-            // process can tell (as for any shared mapping).
+            // this slice doesn't outlive `sample`. Bytes written by another process are initialised for this one;
+            // the exception, a padded type published from this same process, is in the module docs.
             let payload = unsafe {
                 core::slice::from_raw_parts(payload.as_ptr().cast::<u8>(), payload.len())
             };
-            let header: *const CustomHeaderMarker = sample.user_header();
-            // SAFETY: (unsafe block 3) `CustomHeaderMarker` has size 0; the sample's real user header starts at
-            // this address and is `user_header_len` bytes long, the size from the service's type details, which
-            // iceoryx2 reserves in every sample's chunk. It lives as long as `sample`, and the slice doesn't
-            // outlive it.
-            let user_header =
-                unsafe { core::slice::from_raw_parts(header.cast::<u8>(), self.user_header_len) };
+            let user_header: &[u8] = if self.user_header_len == 0 {
+                &[]
+            } else {
+                let header: *const CustomHeaderMarker = sample.user_header();
+                // SAFETY: (unsafe block 3) iceoryx2 reserves `user_header_len` bytes (the size in the service's type
+                // details, validated when the service was opened) for the user header in every sample's chunk,
+                // starting at this address, initialised by the publisher, and alive as long as `sample`; the slice
+                // doesn't outlive it. The pointer comes from a reference to the zero-sized `CustomHeaderMarker`,
+                // which iceoryx2 derives from the chunk pointer; accessing the bytes beyond it relies on the Tree
+                // Borrows aliasing model, as the module docs explain, because iceoryx2 0.10 has no accessor that
+                // yields a pointer derived from the chunk itself. Upstream's own record and subscribe tools do the
+                // same.
+                unsafe { core::slice::from_raw_parts(header.cast::<u8>(), self.user_header_len) }
+            };
             let venue_ts_ns = self.venue_ts_offset.map_or(0, |offset| {
                 let start = offset as usize;
                 user_header
@@ -270,29 +306,51 @@ impl Source for DynamicSource {
     }
 }
 
+impl Replayer {
+    /// Replays like [`Replayer::run`], and replays every service not registered with
+    /// [`ReplayerBuilder::typed`](crate::replayer::ReplayerBuilder::typed) by its recorded type details, as
+    /// `iox2 service replay` does: the recorded bytes are published under the recorded type name.
+    ///
+    /// The type details and settings are validated before they reach iceoryx2, and every message is checked against
+    /// them (sizes, element counts), so a damaged or hostile journal can't make this function access memory out of
+    /// bounds. What can't be checked is whether the bytes are valid *values* of the advertised types.
+    ///
+    /// # Safety
+    ///
+    /// The payload and user header of every replayed message must be a valid value of the type its descriptor
+    /// advertises, for every subscriber of the target services. That holds when the journal was recorded from
+    /// correct publishers of those types and has not been altered since (tickertape's checksums detect accidental
+    /// damage, not a journal written with wrong contents). A subscriber of a type with invalid bit patterns, such as
+    /// `bool` or an enum, has undefined behaviour in its own safe code if this doesn't hold. Replay only recordings
+    /// you trust, as with upstream's own replay tool.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Replayer::run`], except that unregistered services are replayed instead of refused.
+    pub unsafe fn run_dynamic(self) -> Result<ReplayReport, Error> {
+        self.run_with(Some(sink))
+    }
+}
+
 /// Opens a publisher on `target` with the recorded type details, creating the service with the recorded settings
-/// if it doesn't exist.
-pub(crate) fn sink(
+/// if it doesn't exist. The descriptor is validated again before anything reaches iceoryx2. Only
+/// [`Replayer::run_dynamic`] uses it, whose caller promises that the sent bytes are valid values (unsafe block 7).
+fn sink(
     node: &Node<ipc::Service>,
     target: &str,
     descriptor: &Descriptor,
 ) -> Result<Box<dyn Sink>, Error> {
+    descriptor.validate().map_err(|e| Error::Unsupported {
+        service: descriptor.service_name.clone(),
+        reason: e.to_string(),
+    })?;
     let name = service_name(target)?;
     let payload = type_detail(&descriptor.payload)?;
     let user_header = type_detail(&descriptor.user_header)?;
-    if descriptor.payload.size == 0 && descriptor.payload.variant == TypeVariant::Dynamic {
-        return Err(Error::Usage(format!(
-            "service \"{}\" has a slice payload of zero-sized elements, which can't be replayed",
-            descriptor.service_name
-        )));
-    }
-    let factory = open_raw(
-        node,
-        &name,
+    let factory = open_or_create!(
+        || raw_builder(node, &name, &payload, &user_header),
         target,
-        &payload,
-        &user_header,
-        Some(Create::Replay(descriptor.settings)),
+        Create::Replay(descriptor.settings)
     )?;
     let element = payload.size();
     let publisher = match payload.variant() {
@@ -305,8 +363,8 @@ pub(crate) fn sink(
     }
     .map_err(|e| Error::iox("create publisher", e))?;
     Ok(Box::new(DynamicSink {
+        descriptor: descriptor.clone(),
         variant: payload.variant(),
-        element,
         user_header_len: user_header.size(),
         factory,
         publisher,
@@ -316,39 +374,28 @@ pub(crate) fn sink(
 struct DynamicSink {
     factory: RawFactory,
     publisher: Publisher<ipc::Service, [CustomPayloadMarker], CustomHeaderMarker>,
+    descriptor: Descriptor,
     variant: IoxVariant,
-    element: usize,
     user_header_len: usize,
 }
 
 impl Sink for DynamicSink {
     fn send(&mut self, user_header: &[u8], payload: &[u8]) -> Result<(), Error> {
-        if user_header.len() != self.user_header_len {
-            return Err(Error::Usage(format!(
-                "recorded user header has {} bytes, the service's has {}",
-                user_header.len(),
-                self.user_header_len
-            )));
+        let elements =
+            layout::check_message(user_header, payload, &self.descriptor).map_err(|e| {
+                Error::Unsupported {
+                    service: self.descriptor.service_name.clone(),
+                    reason: e.to_string(),
+                }
+            })?;
+        let elements = usize::try_from(elements)
+            .map_err(|_| Error::Usage("element count does not fit this platform".into()))?;
+        if self.variant == IoxVariant::FixedSize && elements != 1 {
+            return Err(Error::Usage("a fixed-size payload has one element".into()));
         }
-        let elements = match self.variant {
-            IoxVariant::FixedSize if payload.len() == self.element => 1,
-            IoxVariant::Dynamic
-                if self.element > 0 && payload.len().is_multiple_of(self.element) =>
-            {
-                payload.len() / self.element
-            }
-            _ => {
-                return Err(Error::Usage(format!(
-                    "recorded payload of {} bytes doesn't fit the service's {}-byte {:?} type",
-                    payload.len(),
-                    self.element,
-                    self.variant
-                )));
-            }
-        };
         // SAFETY: (unsafe block 4) `loan_custom_payload` requires: a slice length other than 1 only for a dynamic
-        // payload (checked above), and that the sample be treated as `elements * element size` bytes, which is
-        // `payload.len()`, exactly what is written below.
+        // payload (checked just above), and that the sample be treated as `elements * element size` bytes, which is
+        // `payload.len()` (checked by `check_message`), exactly what is written below.
         let mut sample = unsafe { self.publisher.loan_custom_payload(elements) }
             .map_err(|e| Error::iox("loan", e))?;
         let destination = sample.payload_mut();
@@ -369,18 +416,25 @@ impl Sink for DynamicSink {
                 payload.len(),
             );
         }
-        let header: *mut CustomHeaderMarker = sample.user_header_mut();
-        // SAFETY: (unsafe block 6) The sample's user header area starts at the zero-sized marker's address and is
-        // `user_header_len` bytes long, the size in the service's type details (checked equal to
-        // `user_header.len()` above). It is exclusively ours until `send`, and doesn't overlap `user_header`.
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                user_header.as_ptr(),
-                header.cast::<u8>(),
-                user_header.len(),
-            );
+        if self.user_header_len > 0 {
+            let header: *mut CustomHeaderMarker = sample.user_header_mut();
+            // SAFETY: (unsafe block 6) iceoryx2 reserves `user_header_len` bytes (the validated size in the
+            // service's type details, equal to `user_header.len()` by `check_message`) for the user header in the
+            // loaned chunk, starting at this address; they are exclusively ours until `send` and don't overlap
+            // `user_header`. As in block 3, the pointer comes from a reference to the zero-sized
+            // `CustomHeaderMarker` and writing beyond it relies on the Tree Borrows aliasing model (module docs);
+            // upstream's replay and publish tools do the same.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    user_header.as_ptr(),
+                    header.cast::<u8>(),
+                    user_header.len(),
+                );
+            }
         }
-        // SAFETY: (unsafe block 7) Every byte of the payload and user header was written above.
+        // SAFETY: (unsafe block 7) Every byte of the payload and user header was written above. That those bytes
+        // are valid values of the service's types is the contract of `Replayer::run_dynamic` (an `unsafe fn`), the
+        // only way to reach this sink.
         let sample = unsafe { sample.assume_init() };
         sample.send().map_err(|e| Error::iox("send", e))?;
         Ok(())
@@ -395,8 +449,4 @@ impl Sink for DynamicSink {
 /// [`upstream`](crate::upstream)).
 pub(crate) fn system_header_detail() -> TypeDetail {
     TypeDetail::new::<iceoryx2::service::header::publish_subscribe::Header>(IoxVariant::FixedSize)
-}
-
-pub(crate) fn type_info_of(detail: &TypeDetail) -> TypeInfo {
-    type_info(detail)
 }

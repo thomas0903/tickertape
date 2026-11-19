@@ -1,4 +1,4 @@
-//! Summarize a recording: sessions, services, message counts, time ranges and reported losses. No iceoryx2.
+//! Summarize a recording: recording runs, services, message counts, time ranges and reported losses. No iceoryx2.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -20,18 +20,21 @@ pub struct Info {
     pub records: u64,
     /// Records with schema ids this crate doesn't write.
     pub other_records: u64,
-    /// Recording sessions, by session id.
-    pub sessions: Vec<Session>,
+    /// Data and loss records skipped because the descriptor they name is no longer in the journal (retention or
+    /// archiving removed its segment).
+    pub undescribed_records: u64,
+    /// Recording runs, by `run_start_seq`, as far as their descriptors are still in the journal.
+    pub runs: Vec<Run>,
     /// Recorded services, by name.
     pub services: Vec<Service>,
 }
 
-/// One run of the recorder.
+/// One recording run: one run of the recorder, or one import.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct Session {
-    /// The journal's next sequence number when the recorder opened it.
-    pub session_id: u64,
-    /// When it started, nanoseconds since the Unix epoch.
+pub struct Run {
+    /// The journal's next sequence number when the run began.
+    pub run_start_seq: u64,
+    /// When it began, nanoseconds since the Unix epoch.
     pub start_unix_ns: u64,
     /// Who recorded it.
     pub recorder: String,
@@ -39,11 +42,13 @@ pub struct Session {
     pub iceoryx2_version: String,
     /// True if imported from an iceoryx2 recording file (times reconstructed).
     pub imported: bool,
-    /// Services that have a descriptor in this session.
+    /// Services that have a descriptor in this run.
     pub services: Vec<String>,
+    /// Descriptor records of this run still in the journal (the recorder repeats them at each segment start).
+    pub descriptors: u64,
 }
 
-/// One recorded service, across sessions.
+/// One recorded service, across runs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Service {
     /// Service name.
@@ -52,9 +57,11 @@ pub struct Service {
     pub payload_type: String,
     /// User header type name, from the latest descriptor.
     pub user_header_type: String,
-    /// Descriptor records (one per session that recorded the service).
+    /// Recording runs with a descriptor of this service still in the journal.
+    pub runs: u64,
+    /// Descriptor records (repeated at each segment start, so several per run).
     pub descriptors: u64,
-    /// Messages recorded.
+    /// Messages recorded (whose descriptor is still in the journal).
     pub messages: u64,
     /// Payload bytes recorded (user headers excluded).
     pub payload_bytes: u64,
@@ -68,71 +75,89 @@ pub struct Service {
     pub last_local_ts_ns: Option<u64>,
     /// Loss records: counter gaps and counter regressions.
     pub loss_records: u64,
-    /// Messages missing according to the counter gaps.
+    /// Messages missing according to the counter gaps (saturating).
     pub missing_messages: u64,
+    #[serde(skip)]
+    last_run: Option<u64>,
 }
 
 /// Reads the journal in `dir` from its first record to the end committed when the reader gets there.
 ///
-/// With `durable_only`, stops at the last checkpoint instead.
+/// With `durable_only`, stops at the last checkpoint instead. Records whose descriptor is no longer in the journal
+/// are counted in [`Info::undescribed_records`] and otherwise skipped.
 ///
 /// # Errors
 ///
 /// [`Error::Journal`] if the journal can't be read; [`Error::Layout`] or [`Error::MissingDescriptor`] if a record of
-/// this crate's schemas is malformed or names a descriptor that isn't there.
+/// this crate's schemas is malformed, doesn't match its descriptor, or names a record that isn't a descriptor.
 pub fn scan(dir: impl AsRef<Path>, durable_only: bool) -> Result<Info, Error> {
     let dir = dir.as_ref();
     let mut reader = Reader::open(dir, ReaderConfig::default().durable_only(durable_only))?;
     let mut catalog = Catalog::new(dir);
     let mut info = Info::default();
-    let mut sessions: BTreeMap<u64, Session> = BTreeMap::new();
+    let mut runs: BTreeMap<u64, Run> = BTreeMap::new();
     let mut services: BTreeMap<String, Service> = BTreeMap::new();
     while let Some(record) = reader.try_next()? {
         let seq = record.seq;
         info.first_seq.get_or_insert(seq);
         info.last_seq = Some(seq);
         info.records += 1;
-        let decoded = layout::decode(record.schema_id, record.payload)
-            .map_err(|source| Error::Layout { seq, source })?;
-        match decoded {
+        let layout_error = |source| Error::Layout { seq, source };
+        match layout::decode(record.schema_id, record.payload).map_err(layout_error)? {
             Decoded::Descriptor(d) => {
-                let session = sessions.entry(d.session_id).or_insert_with(|| Session {
-                    session_id: d.session_id,
-                    start_unix_ns: d.session_start_unix_ns,
+                let run = runs.entry(d.run_start_seq).or_insert_with(|| Run {
+                    run_start_seq: d.run_start_seq,
+                    start_unix_ns: d.run_start_unix_ns,
                     recorder: d.recorder.clone(),
                     iceoryx2_version: d.iceoryx2_version.to_string(),
                     imported: d.imported,
                     services: Vec::new(),
+                    descriptors: 0,
                 });
-                if !session.services.contains(&d.service_name) {
-                    session.services.push(d.service_name.clone());
+                run.descriptors += 1;
+                if !run.services.contains(&d.service_name) {
+                    run.services.push(d.service_name.clone());
                 }
                 let service = service_entry(&mut services, &d);
                 service.descriptors += 1;
+                if service.last_run != Some(d.run_start_seq) {
+                    service.runs += 1;
+                    service.last_run = Some(d.run_start_seq);
+                }
                 service.payload_type = d.payload.name.clone();
                 service.user_header_type = d.user_header.name.clone();
                 catalog.insert(seq, *d);
             }
             Decoded::Data(data) => {
-                let d = catalog.get(seq, data.descriptor_seq)?;
+                let Some(d) = catalog.resolve(seq, data.descriptor_seq)? else {
+                    info.undescribed_records += 1;
+                    continue;
+                };
+                data.check(&d).map_err(layout_error)?;
                 let service = service_entry(&mut services, &d);
                 service.messages += 1;
-                service.payload_bytes += data.payload.len() as u64;
+                service.payload_bytes = service
+                    .payload_bytes
+                    .saturating_add(data.payload.len() as u64);
                 service.first_seq.get_or_insert(seq);
                 service.last_seq = Some(seq);
                 service.first_local_ts_ns.get_or_insert(record.local_ts_ns);
                 service.last_local_ts_ns = Some(record.local_ts_ns);
             }
             Decoded::Loss(loss) => {
-                let d = catalog.get(seq, loss.descriptor_seq)?;
+                let Some(d) = catalog.resolve(seq, loss.descriptor_seq)? else {
+                    info.undescribed_records += 1;
+                    continue;
+                };
+                loss.check(&d).map_err(layout_error)?;
                 let service = service_entry(&mut services, &d);
                 service.loss_records += 1;
-                service.missing_messages += loss.missing();
+                service.missing_messages = service.missing_messages.saturating_add(loss.missing());
             }
             Decoded::Other => info.other_records += 1,
         }
     }
-    info.sessions = sessions.into_values().collect();
+    info.runs = runs.into_values().collect();
     info.services = services.into_values().collect();
     Ok(info)
 }
@@ -147,6 +172,7 @@ fn service_entry<'a>(
             name: d.service_name.clone(),
             payload_type: d.payload.name.clone(),
             user_header_type: d.user_header.name.clone(),
+            runs: 0,
             descriptors: 0,
             messages: 0,
             payload_bytes: 0,
@@ -156,5 +182,6 @@ fn service_entry<'a>(
             last_local_ts_ns: None,
             loss_records: 0,
             missing_messages: 0,
+            last_run: None,
         })
 }

@@ -1,6 +1,10 @@
 //! `tickertape-iox2`: record iceoryx2 services into a tickertape journal, replay them, convert to and from
 //! iceoryx2 recording files, and summarize a recording.
 
+// The only `unsafe` here is the one call that passes the user's trust in a recording on to
+// `Replayer::run_dynamic` (see CONTRIBUTING.md and the `replay` help).
+#![deny(unsafe_code)]
+
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -34,29 +38,37 @@ enum Command {
     /// Record one or more services into a journal until SIGINT, SIGTERM or a limit (changes the journal)
     #[command(after_help = RECORD_HELP)]
     Record(RecordArgs),
-    /// Publish recorded messages onto iceoryx2 services, renamed with a prefix by default
+    /// Publish recorded messages onto iceoryx2 services, renamed with a prefix by default (replay only recordings you trust)
     #[command(after_help = REPLAY_HELP)]
     Replay(ReplayArgs),
     /// Write one service's messages to a new iceoryx2 recording file (for iox2 service replay)
     #[command(after_help = EXPORT_HELP)]
     Export(ExportArgs),
-    /// Append an iceoryx2 recording file (from iox2 service record) to a journal (changes the journal)
+    /// Append a human-readable iceoryx2 recording file (from iox2 service record) to a journal (changes the journal; import only files you trust)
     #[command(after_help = IMPORT_HELP)]
     Import(ImportArgs),
-    /// Summarize sessions, services, message counts, time ranges and reported losses
+    /// Summarize recording runs, services, message counts, time ranges and reported losses
     #[command(after_help = INFO_HELP)]
     Info(InfoArgs),
 }
 
-const RECORD_HELP: &str = "Services are opened by name with the types their publishers created them with (this uses iceoryx2 API that upstream marks internal; see the crate docs). A service that doesn't exist yet is retried every 100 ms. Every --checkpoint-interval-ms, and once more on SIGINT/SIGTERM, recorded messages are made durable. The subscriber buffer is the smaller of --buffer-size and the service's subscriber_max_buffer_size (iceoryx2's default is 2); messages that overflow it are lost before the recorder sees them. Use --counter to detect that.\n\nWith --json, the final report is one JSON object: {\"session_id\":u64,\"next_seq\":u64,\"messages\":u64,\"checkpoints\":u64,\"stop_reason\":\"signal\"|\"stop_flag\"|\"max_messages\"|\"max_duration\",\"services\":[{\"name\":string,\"descriptor_seq\":u64|null,\"messages\":u64,\"payload_bytes\":u64,\"buffer_size\":u64|null,\"subscriber_max_buffer_size\":u64|null,\"safe_overflow\":bool|null,\"gaps\":u64,\"missing\":u64,\"backwards\":u64}]}.\n\nExit codes: 0 success (including help); 1 usage, I/O, iceoryx2 or missing journal; 2 corruption, unsupported journal format or a malformed record. A second SIGINT or SIGTERM exits at once with 130 or 143.";
+const RECORD_HELP: &str = "Services are opened by name with the types their publishers created them with (this uses iceoryx2 API that upstream marks internal; see the crate docs). A service that doesn't exist yet, fails to open (types or settings outside the limits in the crate README, other types than expected) or fails while receiving is reported on stderr and retried every 100 ms; the other services keep recording. A full volume, or a message larger than a journal segment, stops the recorder (after a final checkpoint). Every --checkpoint-interval-ms, and once more on SIGINT/SIGTERM, recorded messages are made durable; a checkpoint pauses recording, so messages arriving meanwhile must fit in the subscriber buffer. The subscriber buffer is the smaller of --buffer-size and the service's subscriber_max_buffer_size (iceoryx2's default is 2); messages that overflow it are lost before the recorder sees them. Use --counter to detect that. Each service's descriptor is written again at the start of every journal segment.\n\nWith --json, the final report is one JSON object: {\"run_start_seq\":u64,\"next_seq\":u64,\"messages\":u64,\"checkpoints\":u64,\"stop_reason\":\"signal\"|\"stop_flag\"|\"max_messages\"|\"max_duration\",\"services\":[{\"name\":string,\"descriptor_seq\":u64|null,\"descriptors\":u64,\"messages\":u64,\"payload_bytes\":u64,\"buffer_size\":u64|null,\"subscriber_max_buffer_size\":u64|null,\"safe_overflow\":bool|null,\"gaps\":u64,\"missing\":u64,\"backwards\":u64,\"errors\":u64,\"last_error\":string|null}]}.\n\nExit codes: 0 success (including help); 1 usage, I/O, iceoryx2 or missing journal; 2 corruption, unsupported journal format or a malformed record. A second SIGINT or SIGTERM exits at once with 130 or 143.";
 
-const REPLAY_HELP: &str = "Each recorded service is replayed onto PREFIX + name (default prefix replay/), so a replay can't feed a recorder of the original service; --original-names replays onto the recorded names. Target services are created with the recorded types and settings, or opened if they exist; an existing service with other types is refused. Paced replay (--speed) schedules each message from the first replayed one by the recorded receive times divided by the speed.\n\nWith --json, the report is one JSON object: {\"first_seq\":u64|null,\"last_seq\":u64|null,\"messages\":u64,\"filtered\":u64,\"other_records\":u64,\"services\":[{\"recorded\":string,\"target\":string,\"messages\":u64}],\"pacing\":null|{\"speed\":f64,\"late_threshold_ns\":u64,\"sends\":u64,\"late_sends\":u64,\"max_late_ns\":u64,\"max_late_seq\":u64|null,\"max_late_scheduled_ns\":u64,\"max_late_actual_ns\":u64,\"mean_late_ns\":u64,\"last_scheduled_ns\":u64,\"last_actual_ns\":u64},\"end\":\"end_of_journal\"|\"to_reached\"|\"signal\"|\"stop_flag\"}.\n\nExit codes: 0 success (including help); 1 usage, I/O, iceoryx2 or missing journal; 2 corruption, unsupported journal format or a malformed record.";
+const REPLAY_HELP: &str = concat!(
+    "Each recorded service is replayed onto PREFIX + name (default prefix replay/), so a replay can't feed a recorder of the original service; --original-names replays onto the recorded names. A target name the journal is recording right now (while a recorder holds the journal) is refused unless --allow-live-targets is given, and the replay ends at the journal's committed end when it started. Target services are created with the recorded types and settings, or opened if they exist; an existing service with other types is refused, and so are two recorded descriptors with different types for one target (a type change between recording runs, or two --map rules onto one name). Paced replay (--speed, from 0.000001 to 1000000000) schedules each message from the first replayed one by the recorded receive times divided by the speed; gaps between recording runs and forward steps of the recording clock are waited out. Records whose descriptor was removed by retention are skipped and counted.\n\n",
+    "Replay only recordings you trust, as with upstream's own replay tool: the recorded bytes are published as values of the recorded types without being checked to be valid values (a subscriber of a type such as bool or an enum has undefined behaviour if they are not). tickertape's checksums detect accidental damage, not a journal or file written with wrong contents. Sizes, alignments, element counts and service settings are validated.",
+    "\n\nWith --json, the report is one JSON object: {\"first_seq\":u64|null,\"last_seq\":u64|null,\"messages\":u64,\"filtered\":u64,\"undescribed\":u64,\"other_records\":u64,\"services\":[{\"recorded\":string,\"target\":string,\"messages\":u64}],\"pacing\":null|{\"speed\":f64,\"late_threshold_ns\":u64,\"sends\":u64,\"late_sends\":u64,\"max_late_ns\":u64,\"max_late_seq\":u64|null,\"max_late_scheduled_ns\":u64,\"max_late_actual_ns\":u64,\"mean_late_ns\":u64,\"last_scheduled_ns\":u64,\"last_actual_ns\":u64},\"end\":\"end_of_journal\"|\"to_reached\"|\"signal\"|\"stop_flag\"}.\n\nExit codes: 0 success (including help); 1 usage, I/O, iceoryx2 or missing journal; 2 corruption, unsupported journal format or a malformed record. A second SIGINT or SIGTERM exits at once with 130 or 143."
+);
 
-const EXPORT_HELP: &str = "An iceoryx2 recording file holds one service, with timestamps in whole milliseconds since its first message. Lost on export: absolute time, sub-millisecond precision, session boundaries, sequence numbers, venue_ts_ns, loss records, service settings; the system header is written as zeros. Backward timestamps are raised to the previous one (counted as clamped). The output file must not exist.\n\nWith --json: {\"service\":string,\"messages\":u64,\"first_seq\":u64|null,\"last_seq\":u64|null,\"sessions\":u64,\"clamped\":u64}.\n\nExit codes: 0 success (including help); 1 usage, I/O, iceoryx2 or missing journal; 2 corruption, unsupported journal format or a malformed record.";
+const EXPORT_HELP: &str = "An iceoryx2 recording file holds one service, with timestamps in whole milliseconds since its first message. Lost on export: absolute time, sub-millisecond precision, recording-run boundaries, sequence numbers, publisher ids, venue_ts_ns, loss records, service settings; the system header is written as zeros. Backward timestamps are raised to the previous one (counted as clamped). Records whose descriptor was removed by retention are skipped (counted as undescribed). Both representations can be written; only human-readable files can be imported. The output file must not exist; it is written under a temporary name and appears only when complete.\n\nWith --json: {\"service\":string,\"messages\":u64,\"first_seq\":u64|null,\"last_seq\":u64|null,\"runs\":u64,\"clamped\":u64,\"undescribed\":u64}.\n\nExit codes: 0 success (including help); 1 usage, I/O, iceoryx2 or missing journal; 2 corruption, unsupported journal format or a malformed record.";
 
-const IMPORT_HELP: &str = "The file's messages become one new session with one descriptor (flagged as imported). Its times are relative, so local_ts_ns is --start-unix-ns (default: now) plus each message's offset. System headers and service settings are not imported. Only import iox2-dump files you trust: that representation is a raw memory image and its reader is not memory-safe on damaged input.\n\nWith --json: {\"service\":string,\"iceoryx2_version\":string,\"descriptor_seq\":u64,\"messages\":u64,\"start_unix_ns\":u64,\"next_seq\":u64}.\n\nExit codes: 0 success (including help); 1 usage, I/O, iceoryx2 or missing journal; 2 corruption, unsupported journal format or a malformed record.";
+const IMPORT_HELP: &str = concat!(
+    "Reads a human-readable iceoryx2 recording file (iox2-dump files can't be imported). The whole file is read and validated first (file format version 1, publish-subscribe, type details within the limits in the crate README, every record's lengths, non-decreasing timestamps, no truncated record); a file that fails leaves the journal untouched. Its messages become one new recording run with one descriptor (flagged as imported). Its times are relative, so local_ts_ns is --start-unix-ns (default: now) plus each message's offset. System headers (and with them publisher ids) and service settings are not imported.\n\nImport only files you trust: a replay of the journal publishes the imported bytes. ",
+    "Replay only recordings you trust, as with upstream's own replay tool: the recorded bytes are published as values of the recorded types without being checked to be valid values (a subscriber of a type such as bool or an enum has undefined behaviour if they are not). tickertape's checksums detect accidental damage, not a journal or file written with wrong contents. Sizes, alignments, element counts and service settings are validated.",
+    "\n\nWith --json: {\"service\":string,\"iceoryx2_version\":string,\"descriptor_seq\":u64,\"messages\":u64,\"start_unix_ns\":u64,\"next_seq\":u64}.\n\nExit codes: 0 success (including help); 1 usage, I/O, iceoryx2, missing journal or an invalid file; 2 corruption, unsupported journal format or a malformed record."
+);
 
-const INFO_HELP: &str = "Reads from the first record to the committed end observed when the reader gets there (no writer lock).\n\nWith --json: {\"first_seq\":u64|null,\"last_seq\":u64|null,\"records\":u64,\"other_records\":u64,\"sessions\":[{\"session_id\":u64,\"start_unix_ns\":u64,\"recorder\":string,\"iceoryx2_version\":string,\"imported\":bool,\"services\":[string]}],\"services\":[{\"name\":string,\"payload_type\":string,\"user_header_type\":string,\"descriptors\":u64,\"messages\":u64,\"payload_bytes\":u64,\"first_seq\":u64|null,\"last_seq\":u64|null,\"first_local_ts_ns\":u64|null,\"last_local_ts_ns\":u64|null,\"loss_records\":u64,\"missing_messages\":u64}]}.\n\nExit codes: 0 success (including help); 1 usage, I/O or missing journal; 2 corruption, unsupported journal format or a malformed record.";
+const INFO_HELP: &str = "Reads from the first record to the committed end observed when the reader gets there (no writer lock). A recording run is one run of the recorder or one import, identified by run_start_seq; its descriptors repeat at each segment start. Records whose descriptor was removed by retention are counted as undescribed.\n\nWith --json: {\"first_seq\":u64|null,\"last_seq\":u64|null,\"records\":u64,\"other_records\":u64,\"undescribed_records\":u64,\"runs\":[{\"run_start_seq\":u64,\"start_unix_ns\":u64,\"recorder\":string,\"iceoryx2_version\":string,\"imported\":bool,\"services\":[string],\"descriptors\":u64}],\"services\":[{\"name\":string,\"payload_type\":string,\"user_header_type\":string,\"runs\":u64,\"descriptors\":u64,\"messages\":u64,\"payload_bytes\":u64,\"first_seq\":u64|null,\"last_seq\":u64|null,\"first_local_ts_ns\":u64|null,\"last_local_ts_ns\":u64|null,\"loss_records\":u64,\"missing_messages\":u64}]}.\n\nExit codes: 0 success (including help); 1 usage, I/O or missing journal; 2 corruption, unsupported journal format or a malformed record.";
 
 #[derive(Debug, Args)]
 struct RecordArgs {
@@ -71,7 +83,7 @@ struct RecordArgs {
     /// WaitSet interval in microseconds: the longest a message waits when no event wakes the recorder
     #[arg(long, value_name = "US", default_value_t = 1000)]
     poll_interval_us: u64,
-    /// Subscriber buffer to ask for (capped by the service's subscriber_max_buffer_size)
+    /// Subscriber buffer to ask for (capped by the service's subscriber_max_buffer_size; at most 65536)
     #[arg(long, value_name = "N", default_value_t = 1024)]
     buffer_size: usize,
     /// Publisher-side counter to check for lost messages, in every service: header|payload:OFFSET:WIDTH (width 4 or 8, little-endian)
@@ -111,7 +123,7 @@ struct ReplayArgs {
     /// Stop after this sequence number, inclusive
     #[arg(long, value_name = "SEQ")]
     to: Option<u64>,
-    /// Replay at the recorded pace divided by F (1 = recorded pace); default: as fast as possible
+    /// Replay at F times the recorded pace (1 = recorded pace, 2 = twice as fast; 0.000001 to 1000000000); default: as fast as possible
     #[arg(long, value_name = "F", conflicts_with = "as_fast_as_possible")]
     speed: Option<f64>,
     /// Replay as fast as possible (the default)
@@ -126,6 +138,9 @@ struct ReplayArgs {
     /// Replay the recorded service FROM onto TO (repeatable; overrides the prefix)
     #[arg(long = "map", value_name = "FROM=TO", value_parser = parse_map)]
     maps: Vec<(String, String)>,
+    /// Allow target names the journal is recording right now (the replay would be recorded into the journal)
+    #[arg(long)]
+    allow_live_targets: bool,
     /// Replay only this recorded service (repeat for several; default: all)
     #[arg(long = "service", value_name = "NAME")]
     services: Vec<String>,
@@ -183,7 +198,7 @@ struct ExportArgs {
     /// Last sequence number, inclusive
     #[arg(long, value_name = "SEQ")]
     to: Option<u64>,
-    /// File representation (as iox2 service record --data-representation)
+    /// File representation (as iox2 service record --data-representation; only human-readable files can be imported again)
     #[arg(long, value_enum, default_value = "human-readable")]
     representation: Repr,
     /// Print the report as one JSON object (schema below)
@@ -193,13 +208,10 @@ struct ExportArgs {
 
 #[derive(Debug, Args)]
 struct ImportArgs {
-    /// iceoryx2 recording file
+    /// Human-readable iceoryx2 recording file
     input: PathBuf,
     /// Journal directory (created if missing)
     journal: PathBuf,
-    /// File representation
-    #[arg(long, value_enum, default_value = "human-readable")]
-    representation: Repr,
     /// Start time to add the file's relative timestamps to, in nanoseconds since the Unix epoch (default: now)
     #[arg(long, value_name = "NS")]
     start_unix_ns: Option<u64>,
@@ -282,6 +294,9 @@ fn record(args: RecordArgs, out: &mut dyn Write) -> Result<(), Error> {
         .node_name(&args.node_name)
         .on_open(|name, seq| {
             eprintln!("tickertape-iox2: recording \"{name}\" (descriptor at sequence {seq})")
+        })
+        .on_error(|name, error| {
+            eprintln!("tickertape-iox2: service \"{name}\": {error} (retrying every 100 ms)")
         });
     for name in &args.services {
         let mut service = DynamicService::new(name);
@@ -314,11 +329,11 @@ fn record(args: RecordArgs, out: &mut dyn Write) -> Result<(), Error> {
     (|| -> io::Result<()> {
         writeln!(
             out,
-            "session {} stopped ({:?}): {} messages, sequence numbers {}..{}, {} checkpoints",
-            report.session_id,
+            "recording run {} stopped ({:?}): {} messages, sequence numbers {}..{}, {} checkpoints",
+            report.run_start_seq,
             report.stop_reason,
             report.messages,
-            report.session_id,
+            report.run_start_seq,
             report.next_seq,
             report.checkpoints
         )?;
@@ -346,6 +361,9 @@ fn record(args: RecordArgs, out: &mut dyn Write) -> Result<(), Error> {
                     ", {} gaps ({} missing), {} backwards",
                     s.gaps, s.missing, s.backwards
                 )?;
+            }
+            if let Some(e) = &s.last_error {
+                write!(out, ", {} errors (last: {e})", s.errors)?;
             }
             writeln!(out)?;
         }
@@ -384,7 +402,14 @@ fn replay(args: ReplayArgs, out: &mut dyn Write) -> Result<(), Error> {
     if let Some(n) = args.wait_subscribers {
         builder = builder.wait_for_subscribers(n, args.wait_timeout_secs);
     }
-    let report = builder.build()?.run()?;
+    builder = builder.allow_live_targets(args.allow_live_targets);
+    let replayer = builder.build()?;
+    // SAFETY: Replaying a recording publishes its bytes as values of the recorded types. Running `replay` is the
+    // user's statement that they trust the recording; the help, the README and the crate docs say so ("replay only
+    // recordings you trust", as with upstream's `iox2 service replay`). Everything else (sizes, alignments, element
+    // counts, settings) is validated by the library.
+    #[allow(unsafe_code)]
+    let report = unsafe { replayer.run_dynamic() }?;
     let io = |e| Error::Io {
         op: "write report",
         path: "stdout".into(),
@@ -395,6 +420,13 @@ fn replay(args: ReplayArgs, out: &mut dyn Write) -> Result<(), Error> {
     }
     (|| -> io::Result<()> {
         writeln!(out, "replayed {} messages ({:?})", report.messages, report.end)?;
+        if report.undescribed > 0 {
+            writeln!(
+                out,
+                "  skipped {} records whose descriptor is no longer in the journal",
+                report.undescribed
+            )?;
+        }
         for s in &report.services {
             writeln!(out, "  {} -> {}: {} messages", s.recorded, s.target, s.messages)?;
         }
@@ -442,18 +474,19 @@ fn export(args: ExportArgs, out: &mut dyn Write) -> Result<(), Error> {
     }
     writeln!(
         out,
-        "exported {} messages of \"{}\" from {} session(s) to {} ({} timestamps clamped)",
+        "exported {} messages of \"{}\" from {} recording run(s) to {} ({} timestamps clamped, {} records skipped without a descriptor)",
         report.messages,
         report.service,
-        report.sessions,
+        report.runs,
         args.output.display(),
-        report.clamped
+        report.clamped,
+        report.undescribed
     )
     .map_err(io)
 }
 
 fn import(args: ImportArgs, out: &mut dyn Write) -> Result<(), Error> {
-    let mut options = ImportOptions::default().representation(args.representation.into());
+    let mut options = ImportOptions::default();
     if let Some(ns) = args.start_unix_ns {
         options = options.start_unix_ns(ns);
     }
@@ -491,18 +524,19 @@ fn info(args: InfoArgs, out: &mut dyn Write) -> Result<(), Error> {
     (|| -> io::Result<()> {
         writeln!(
             out,
-            "records: {} (sequence numbers {}..={}), {} of other schemas",
+            "records: {} (sequence numbers {}..={}), {} of other schemas, {} without their descriptor (removed)",
             info.records,
             info.first_seq.map_or("-".into(), |s| s.to_string()),
             info.last_seq.map_or("-".into(), |s| s.to_string()),
-            info.other_records
+            info.other_records,
+            info.undescribed_records
         )?;
-        writeln!(out, "sessions:")?;
-        for s in &info.sessions {
+        writeln!(out, "recording runs:")?;
+        for s in &info.runs {
             writeln!(
                 out,
                 "  {}  start {}  {}{}  iceoryx2 {}  services: {}",
-                s.session_id,
+                s.run_start_seq,
                 ns_to_text(Some(s.start_unix_ns)),
                 s.recorder,
                 if s.imported { " (imported)" } else { "" },
@@ -514,10 +548,11 @@ fn info(args: InfoArgs, out: &mut dyn Write) -> Result<(), Error> {
         for s in &info.services {
             writeln!(
                 out,
-                "  {}  payload {}  header {}  messages {}  bytes {}  seq {}..={}  time {}..{}  losses {} ({} missing)",
+                "  {}  payload {}  header {}  runs {}  messages {}  bytes {}  seq {}..={}  time {}..{}  losses {} ({} missing)",
                 s.name,
                 s.payload_type,
                 s.user_header_type,
+                s.runs,
                 s.messages,
                 s.payload_bytes,
                 s.first_seq.map_or("-".into(), |v| v.to_string()),

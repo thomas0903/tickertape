@@ -52,17 +52,44 @@ fn data_of(recs: &[Rec]) -> Vec<(u64, u64, Vec<u8>, Vec<u8>)> {
 fn descriptors_of(recs: &[Rec]) -> Vec<(u64, String, u64)> {
     recs.iter()
         .filter_map(|r| match r {
-            Rec::Descriptor(seq, d) => Some((*seq, d.service_name.clone(), d.session_id)),
+            Rec::Descriptor(seq, d) => Some((*seq, d.service_name.clone(), d.run_start_seq)),
             _ => None,
         })
         .collect()
 }
 
-/// Records `n` tick messages of a fresh service with the dynamic CLI recorder; returns (journal, service).
+/// Starts a blocking publisher of `n` messages (no safe overflow: it waits instead of dropping when a subscriber
+/// buffer is full, so delivery is exact) and waits until it has created its service.
+fn blocking_publisher(service: &str, n: u64, rate: u64, extra: &[&str]) -> Proc {
+    let n = n.to_string();
+    let rate = rate.to_string();
+    let args = [
+        &[
+            "--service",
+            service,
+            "--count",
+            &n,
+            "--rate",
+            &rate,
+            "--wait-subscribers",
+            "1",
+            "--blocking",
+        ][..],
+        extra,
+    ]
+    .concat();
+    let publisher = Proc::spawn(&example("publisher"), &args);
+    wait_for_service(service, SECS(20));
+    publisher
+}
+
+/// Records `n` tick messages of a fresh service with the dynamic CLI recorder; returns (journal, service). Delivery
+/// is blocking and the recorder checks the counter, so a lost message fails here, as loss, not later as a mismatch.
 fn record_ticks(n: u64, rate: u64) -> (tempfile::TempDir, String) {
     let dir = tempfile::tempdir().unwrap();
     let journal = dir.path().join("j");
     let service = unique("ticks");
+    let publisher = blocking_publisher(&service, n, rate, &[]);
     let recorder = Proc::spawn(
         &cli(),
         &[
@@ -70,27 +97,25 @@ fn record_ticks(n: u64, rate: u64) -> (tempfile::TempDir, String) {
             journal.to_str().unwrap(),
             "--service",
             &service,
+            "--counter",
+            "header:0:8",
             "--json",
         ],
     );
-    run_ok(
-        &example("publisher"),
-        &[
-            "--service",
-            &service,
-            "--count",
-            &n.to_string(),
-            "--rate",
-            &rate.to_string(),
-            "--wait-subscribers",
-            "1",
-        ],
-        SECS(60),
-    );
+    let (status, _, err) = publisher.wait(SECS(60));
+    assert!(status.success(), "publisher: {err}");
     recorder.signal("TERM");
     let (status, out, err) = recorder.wait(SECS(20));
     assert!(status.success(), "recorder failed: {err}");
     let report: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        (
+            &report["services"][0]["gaps"],
+            &report["services"][0]["backwards"]
+        ),
+        (&serde_json::json!(0), &serde_json::json!(0)),
+        "messages were lost before the recorder: {out}"
+    );
     assert_eq!(report["messages"], n, "{out}");
     assert_eq!(report["stop_reason"], "signal");
     (dir, service)
@@ -106,6 +131,7 @@ fn typed_recording_is_followed_live_in_both_modes() {
     let journal = dir.path().join("j");
     let j = journal.to_str().unwrap();
     let service = unique("typed");
+    let publisher = blocking_publisher(&service, N, 2000, &[]);
     let recorder = Proc::spawn(
         &example("typed-recorder"),
         &[
@@ -140,20 +166,8 @@ fn typed_recording_is_followed_live_in_both_modes() {
             "30",
         ],
     );
-    run_ok(
-        &example("publisher"),
-        &[
-            "--service",
-            &service,
-            "--count",
-            &N.to_string(),
-            "--rate",
-            "2000",
-            "--wait-subscribers",
-            "1",
-        ],
-        SECS(60),
-    );
+    let (status, _, err) = publisher.wait(SECS(60));
+    assert!(status.success(), "publisher: {err}");
     // Both readers finish while the recorder is still running: they follow the journal live, and the periodic
     // checkpoints make the records durable without a stop.
     wait_until(SECS(20), "both readers to see every message", || {
@@ -165,8 +179,11 @@ fn typed_recording_is_followed_live_in_both_modes() {
     let (status, out, err) = recorder.wait(SECS(20));
     assert!(status.success(), "{err}");
     let report: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        report["services"][0]["gaps"], 0,
+        "lost before the recorder: {out}"
+    );
     assert_eq!(report["messages"], N);
-    assert_eq!(report["services"][0]["gaps"], 0);
 
     let recs = scan(&journal);
     let data = data_of(&recs);
@@ -197,7 +214,8 @@ fn typed_recording_is_followed_live_in_both_modes() {
 }
 
 /// SIGKILL the recorder mid-stream, restart it on the same journal: the journal recovers and continues with no
-/// duplicate or missing tickertape sequence numbers, and nothing a reader saw before the kill is lost.
+/// duplicate or missing tickertape sequence numbers, and nothing a reader saw before the kill is lost. The publisher
+/// runs until the test stops it, so the restarted recorder has all the time it needs to recover and subscribe.
 #[test]
 fn killed_recorder_restarts_and_continues_the_journal() {
     let _serial = serial();
@@ -227,7 +245,7 @@ fn killed_recorder_restarts_and_continues_the_journal() {
             "--service",
             &service,
             "--count",
-            "3000",
+            "0",
             "--rate",
             "2000",
             "--wait-subscribers",
@@ -242,10 +260,15 @@ fn killed_recorder_restarts_and_continues_the_journal() {
     first.signal("KILL");
     let (status, _, _) = first.wait(SECS(10));
     assert!(!status.success(), "SIGKILL ends the recorder abnormally");
+    let after_kill = count(&journal);
     let second = Proc::spawn(&cli(), &[&record_args[..], &["--json"]].concat());
-    let (status, publisher_out, err) = publisher.wait(SECS(60));
-    assert!(status.success(), "publisher: {err}");
-    assert!(publisher_out.contains("sent 3000"), "{publisher_out}");
+    wait_until(
+        SECS(60),
+        "the restarted recorder to record 400 more messages",
+        || count(&journal) >= after_kill + 400,
+    );
+    publisher.signal("KILL");
+    let _ = publisher.wait(SECS(10));
     second.signal("TERM");
     let (status, out, err) = second.wait(SECS(20));
     assert!(status.success(), "second recorder: {err}");
@@ -253,17 +276,19 @@ fn killed_recorder_restarts_and_continues_the_journal() {
 
     let recs = scan(&journal); // checks gap-free sequence numbers from 0
     let descriptors = descriptors_of(&recs);
+    let runs: std::collections::BTreeSet<u64> = descriptors.iter().map(|d| d.2).collect();
     assert_eq!(
-        descriptors.len(),
+        runs.len(),
         2,
-        "one descriptor per session: {descriptors:?}\nsecond recorder: {out}\n{err}"
+        "two recording runs: {descriptors:?}\nsecond recorder: {out}\n{err}"
     );
-    let (second_descriptor, second_session) = (descriptors[1].0, descriptors[1].2);
+    let second_run = *runs.last().unwrap();
+    let second_descriptor = descriptors.iter().find(|d| d.2 == second_run).unwrap().0;
     assert_eq!(
-        second_session, second_descriptor,
-        "the second session starts where the first ended"
+        second_run, second_descriptor,
+        "the second run starts where the first ended, with its descriptor"
     );
-    assert_eq!(report["session_id"], second_session);
+    assert_eq!(report["run_start_seq"], second_run);
     let data = data_of(&recs);
     let counters: Vec<u64> = data.iter().map(|(_, _, h, _)| counter_of(h)).collect();
     assert!(
@@ -273,17 +298,11 @@ fn killed_recorder_restarts_and_continues_the_journal() {
     for (_, _, header, payload) in &data {
         expect_tick(header, payload, counter_of(header));
     }
-    let first_session = data
-        .iter()
-        .filter(|(_, d, _, _)| *d == descriptors[0].0)
-        .count();
+    let first_run = data.iter().filter(|(_, d, _, _)| *d < second_run).count();
+    assert!(first_run >= 390, "the first run's records survive the kill");
     assert!(
-        first_session >= 400,
-        "the first session's records survive the kill"
-    );
-    assert!(
-        data.len() > first_session,
-        "the second session recorded more"
+        data.len() >= first_run + 390,
+        "the second run recorded more"
     );
     // The follower read the journal across the kill and the restart; everything it saw is in the journal.
     let (status, out, err) = follower.wait(SECS(20));
@@ -395,6 +414,8 @@ fn one_recorder_records_and_replays_several_services() {
     let journal = dir.path().join("j");
     let j = journal.to_str().unwrap();
     let (ticks, slices) = (unique("multi-ticks"), unique("multi-slices"));
+    let a = blocking_publisher(&ticks, N, 1000, &[]);
+    let b = blocking_publisher(&slices, N, 1000, &["--kind", "slice"]);
     let recorder = Proc::spawn(
         &cli(),
         &[
@@ -404,35 +425,9 @@ fn one_recorder_records_and_replays_several_services() {
             &ticks,
             "--service",
             &slices,
+            "--counter",
+            "header:0:8",
             "--json",
-        ],
-    );
-    let a = Proc::spawn(
-        &example("publisher"),
-        &[
-            "--service",
-            &ticks,
-            "--count",
-            &N.to_string(),
-            "--rate",
-            "1000",
-            "--wait-subscribers",
-            "1",
-        ],
-    );
-    let b = Proc::spawn(
-        &example("publisher"),
-        &[
-            "--service",
-            &slices,
-            "--kind",
-            "slice",
-            "--count",
-            &N.to_string(),
-            "--rate",
-            "1000",
-            "--wait-subscribers",
-            "1",
         ],
     );
     assert!(a.wait(SECS(60)).0.success());
@@ -441,16 +436,20 @@ fn one_recorder_records_and_replays_several_services() {
     let (status, out, err) = recorder.wait(SECS(20));
     assert!(status.success(), "{err}");
     let report: serde_json::Value = serde_json::from_str(&out).unwrap();
+    for s in report["services"].as_array().unwrap() {
+        assert_eq!(s["gaps"], 0, "lost before the recorder: {out}");
+    }
     assert_eq!(report["messages"], 2 * N);
 
     let info: serde_json::Value =
         serde_json::from_str(&run_ok(&cli(), &["info", j, "--json"], SECS(20))).unwrap();
-    assert_eq!(info["sessions"].as_array().unwrap().len(), 1);
+    assert_eq!(info["runs"].as_array().unwrap().len(), 1);
     let services = info["services"].as_array().unwrap();
     assert_eq!(services.len(), 2);
     for s in services {
         assert_eq!(s["messages"], N);
         assert_eq!(s["descriptors"], 1);
+        assert_eq!(s["runs"], 1);
     }
 
     let (descriptors, followed) = parse_follow(&run_ok(
@@ -568,6 +567,22 @@ fn upstream_file_format_round_trip() {
             last = r.timestamp;
         }
 
+        if repr != "human-readable" {
+            // iox2dump files are exported only; import refuses them.
+            let (status, _, err) = run(
+                &cli(),
+                &[
+                    "import",
+                    file.to_str().unwrap(),
+                    dir.path().join("no").to_str().unwrap(),
+                ],
+                SECS(30),
+            );
+            assert_eq!(status.code(), Some(1), "{err}");
+            assert!(err.contains("iox2dump files can't be imported"), "{err}");
+            assert!(!dir.path().join("no").exists(), "nothing appended");
+            continue;
+        }
         let imported = dir.path().join(format!("imported-{repr}"));
         let out = run_ok(
             &cli(),
@@ -575,8 +590,6 @@ fn upstream_file_format_round_trip() {
                 "import",
                 file.to_str().unwrap(),
                 imported.to_str().unwrap(),
-                "--representation",
-                repr,
                 "--json",
             ],
             SECS(30),
@@ -611,7 +624,8 @@ fn upstream_file_format_round_trip() {
 }
 
 /// The upstream `iox2 service replay` plays an exported file onto a subscriber. Needs the `iox2` binary
-/// (`cargo install iceoryx2-cli`); skipped without it unless TICKERTAPE_REQUIRE_IOX2=1.
+/// (`cargo install iceoryx2-cli@0.10.0`); skipped without it, unless TICKERTAPE_REQUIRE_IOX2 is set (as in CI),
+/// which makes a missing `iox2` a failure.
 #[test]
 fn upstream_cli_replays_an_exported_file() {
     let _serial = serial();
@@ -656,7 +670,9 @@ fn upstream_cli_replays_an_exported_file() {
         &example("subscriber"),
         &["--service", &target, "--count", &N.to_string()],
     );
-    std::thread::sleep(Duration::from_millis(500));
+    wait_until(SECS(20), "the subscriber to connect", || {
+        _service.dynamic_config().number_of_subscribers() >= 1
+    });
     run_ok(
         std::path::Path::new("iox2"),
         &[
@@ -832,4 +848,117 @@ fn cli_exit_codes() {
     drop(w);
     let (status, _, err) = run(&cli(), &["info", journal.to_str().unwrap()], SECS(10));
     assert_eq!(status.code(), Some(2), "{err}");
+}
+
+/// A user header aligned beyond what the layout accepts (4096), for a service the recorder must refuse.
+#[derive(Debug, Default, Clone, Copy, ZeroCopySend)]
+#[repr(C)]
+#[repr(align(8192))]
+struct OverAligned {
+    value: u64,
+}
+
+/// A service that appears later and can't be recorded (its types are outside the layout's limits), or whose venue
+/// timestamp offset doesn't fit its user header, is reported and retried; the other services keep recording. The
+/// venue timestamp extractor reads the header at the given offset.
+#[test]
+fn per_service_failures_do_not_stop_the_others() {
+    let _serial = serial();
+    const N: u64 = 200;
+    let dir = tempfile::tempdir().unwrap();
+    let journal = dir.path().join("j");
+    let j = journal.to_str().unwrap();
+    let (good, bad) = (unique("good"), unique("bad"));
+    let publisher = blocking_publisher(&good, N, 200, &[]);
+    let recorder = Proc::spawn(
+        &cli(),
+        &[
+            "record",
+            j,
+            "--service",
+            &good,
+            "--service",
+            &bad,
+            "--venue-ts-offset",
+            "8",
+            "--json",
+        ],
+    );
+    // The bad service appears while the good one is being recorded.
+    wait_until(SECS(20), "the first messages", || count(&journal) > 20);
+    let node = NodeBuilder::new().create::<ipc::Service>().unwrap();
+    let _bad = node
+        .service_builder(&ServiceName::new(&bad).unwrap())
+        .publish_subscribe::<u64>()
+        .user_header::<OverAligned>()
+        .create()
+        .unwrap();
+    let (status, _, err) = publisher.wait(SECS(60));
+    assert!(status.success(), "{err}");
+    recorder.signal("TERM");
+    let (status, out, err) = recorder.wait(SECS(20));
+    assert!(status.success(), "{err}");
+    let report: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let services = report["services"].as_array().unwrap();
+    let (g, b) = if services[0]["name"] == good.as_str() {
+        (&services[0], &services[1])
+    } else {
+        (&services[1], &services[0])
+    };
+    assert_eq!(g["messages"], N, "{out}");
+    assert_eq!(g["errors"], 0, "{out}");
+    assert_eq!(b["messages"], 0, "{out}");
+    assert!(b["errors"].as_u64().unwrap() >= 1, "{out}");
+    assert!(
+        b["last_error"].as_str().unwrap().contains("alignment"),
+        "{out}"
+    );
+    assert_eq!(
+        err.lines().filter(|l| l.contains(bad.as_str())).count(),
+        1,
+        "the failure is reported once while it doesn't change: {err}"
+    );
+    // venue_ts_ns is the header's u64 at offset 8.
+    let recs = scan(&journal);
+    let mut data = 0;
+    for r in &recs {
+        if let Rec::Data {
+            venue_ts_ns,
+            header,
+            ..
+        } = r
+        {
+            assert_eq!(
+                *venue_ts_ns,
+                u64::from_le_bytes(header[8..16].try_into().unwrap())
+            );
+            assert!(*venue_ts_ns > 0);
+            data += 1;
+        }
+    }
+    assert_eq!(data, N);
+
+    // A venue timestamp offset that doesn't fit the 16-byte header is refused for that service.
+    let service = unique("offset");
+    let publisher = blocking_publisher(&service, 5, 100, &["--wait-secs", "2"]);
+    let journal = dir.path().join("k");
+    let recorder = Proc::spawn(
+        &cli(),
+        &[
+            "record",
+            journal.to_str().unwrap(),
+            "--service",
+            &service,
+            "--venue-ts-offset",
+            "12",
+            "--json",
+        ],
+    );
+    let _ = publisher.wait(SECS(20));
+    recorder.signal("TERM");
+    let (status, out, err) = recorder.wait(SECS(20));
+    assert!(status.success(), "{err}");
+    assert!(err.contains("venue timestamp at offset 12"), "{err}");
+    let report: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(report["messages"], 0, "{out}");
 }

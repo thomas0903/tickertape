@@ -9,8 +9,9 @@ use crate::layout::{Descriptor, SCHEMA_DESCRIPTOR};
 
 /// Finds and caches descriptor records by sequence number, with its own tickertape reader.
 ///
-/// Every data record names its descriptor's sequence number, so a reader that starts in the middle of a journal
-/// resolves descriptors with one seek each, not a scan from the start.
+/// Every data and loss record names its descriptor's sequence number, so a reader that starts in the middle of a
+/// journal resolves descriptors with one seek each, not a scan from the start. Descriptors are validated when they
+/// are decoded ([`Descriptor::decode`]).
 #[derive(Debug)]
 pub struct Catalog {
     dir: PathBuf,
@@ -35,15 +36,21 @@ impl Catalog {
         descriptor
     }
 
-    /// The descriptor at `descriptor_seq`, named by the record at `seq`.
+    /// The descriptor at `descriptor_seq`, named by the record at `seq`, or `None` if it is no longer in the
+    /// journal: retention or `tickertape archive` removed the segment that held it. A reader skips and counts such
+    /// records; it doesn't stop.
     ///
     /// # Errors
     ///
-    /// [`Error::MissingDescriptor`] if that record is not a descriptor or is no longer in the journal;
-    /// [`Error::Layout`] if it is malformed; [`Error::Journal`] if reading fails.
-    pub fn get(&mut self, seq: u64, descriptor_seq: u64) -> Result<Arc<Descriptor>, Error> {
+    /// [`Error::MissingDescriptor`] if `descriptor_seq` is not before `seq` or the record there is not a
+    /// descriptor; [`Error::Layout`] if it is malformed or invalid; [`Error::Journal`] if reading fails.
+    pub fn resolve(
+        &mut self,
+        seq: u64,
+        descriptor_seq: u64,
+    ) -> Result<Option<Arc<Descriptor>>, Error> {
         if let Some(d) = self.cache.get(&descriptor_seq) {
-            return Ok(Arc::clone(d));
+            return Ok(Some(Arc::clone(d)));
         }
         let missing = |reason: String| Error::MissingDescriptor {
             seq,
@@ -63,16 +70,16 @@ impl Catalog {
         };
         match reader.seek(descriptor_seq) {
             Ok(()) => {}
-            Err(tickertape::Error::SeqUnavailable { first, .. }) => {
-                return Err(missing(format!(
-                    "removed from the journal, which now starts at {first}"
-                )));
-            }
+            Err(tickertape::Error::SeqUnavailable { .. }) => return Ok(None),
             Err(e) => return Err(e.into()),
         }
-        let record = reader
-            .try_next()?
-            .ok_or_else(|| missing("not in the journal".into()))?;
+        let Some(record) = reader.try_next()? else {
+            return Err(missing("not in the journal".into()));
+        };
+        if record.seq != descriptor_seq {
+            // The journal starts after it (removed while this reader was open).
+            return Ok(None);
+        }
         if record.schema_id != SCHEMA_DESCRIPTOR {
             return Err(missing(format!("it has schema id {:#x}", record.schema_id)));
         }
@@ -80,6 +87,20 @@ impl Catalog {
             seq: descriptor_seq,
             source,
         })?;
-        Ok(self.insert(descriptor_seq, descriptor))
+        Ok(Some(self.insert(descriptor_seq, descriptor)))
+    }
+
+    /// Like [`Catalog::resolve`], but a descriptor that is no longer in the journal is an error too.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Catalog::resolve`], and [`Error::MissingDescriptor`] if the descriptor was removed.
+    pub fn get(&mut self, seq: u64, descriptor_seq: u64) -> Result<Arc<Descriptor>, Error> {
+        self.resolve(seq, descriptor_seq)?
+            .ok_or_else(|| Error::MissingDescriptor {
+                seq,
+                descriptor_seq,
+                reason: "removed from the journal with an older segment".into(),
+            })
     }
 }

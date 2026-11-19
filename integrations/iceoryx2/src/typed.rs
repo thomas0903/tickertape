@@ -24,10 +24,14 @@ pub enum Create {
 }
 
 /// Opens a publish-subscribe service, or creates it with `$create` if it doesn't exist. `$make` is a closure that
-/// returns a fresh builder; the same code serves typed, slice and runtime-typed builders.
+/// returns a fresh builder; the same code serves typed, slice and runtime-typed builders. Only an open error saying
+/// the service doesn't exist leads to a create, and only a create error saying it already exists (someone created
+/// it in between) leads to a second open; every other error is returned as it is.
 macro_rules! open_or_create {
     ($make:expr, $display:expr, $create:expr) => {{
-        use iceoryx2::service::builder::publish_subscribe::PublishSubscribeOpenError as OpenError;
+        use iceoryx2::service::builder::publish_subscribe::{
+            PublishSubscribeCreateError as CreateError, PublishSubscribeOpenError as OpenError,
+        };
         let make = $make;
         match make().open() {
             Ok(s) => Ok(s),
@@ -38,6 +42,8 @@ macro_rules! open_or_create {
                         b = b.subscriber_max_buffer_size(buffer)
                     }
                     $crate::typed::Create::Replay(s) => {
+                        // Validated settings (layout::ServiceSettings::validate) fit in usize on every supported
+                        // platform; zero means unknown and keeps iceoryx2's default.
                         let n = |v: u64| usize::try_from(v).unwrap_or(usize::MAX);
                         b = b
                             .history_size(n(s.history_size))
@@ -63,13 +69,13 @@ macro_rules! open_or_create {
                 }
                 match b.create() {
                     Ok(s) => Ok(s),
-                    // Someone else created it in between: open theirs.
-                    Err(_) => make()
+                    Err(CreateError::AlreadyExists) => make()
                         .open()
-                        .map_err(|e| $crate::recorder::incompatible_or($display, e)),
+                        .map_err(|e| $crate::recorder::open_error($display, e)),
+                    Err(e) => Err($crate::recorder::create_error($display, e)),
                 }
             }
-            Err(e) => Err($crate::recorder::incompatible_or($display, e)),
+            Err(e) => Err($crate::recorder::open_error($display, e)),
         }
     }};
 }

@@ -6,13 +6,15 @@
 //! Prints one line per record, `key=value` separated by spaces, byte strings in hex:
 //!
 //! ```text
-//! descriptor seq=0 session=0 service=demo/ticks payload_type=... payload_size=24 header_type=... header_size=16
-//! data seq=1 service=demo/ticks local_ts=... venue_ts=... header=0000... payload=0100...
+//! descriptor seq=0 run=0 service=demo/ticks payload_type=... payload_size=24 header_type=... header_size=16
+//! data seq=1 service=demo/ticks publisher=... local_ts=... venue_ts=... header=0000... payload=0100...
 //! loss seq=7 service=demo/ticks kind=gap expected=5 received=9
+//! undescribed seq=9 descriptor_seq=3
 //! ```
 //!
-//! It stops after `--count` data records, or after `--idle-secs` seconds without a new record (default 5). With
-//! `--durable-only` it only returns records covered by a checkpoint.
+//! A record whose descriptor is no longer in the journal (retention removed its segment) is reported as
+//! `undescribed` and skipped. It stops after `--count` data records, or after `--idle-secs` seconds without a new
+//! record (default 5). With `--durable-only` it only returns records covered by a checkpoint.
 
 use std::time::{Duration, Instant};
 
@@ -73,8 +75,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         match layout::decode(record.schema_id, record.payload)? {
             Decoded::Descriptor(d) => {
                 println!(
-                    "descriptor seq={seq} session={} service={} payload_type={} payload_size={} header_type={} header_size={}",
-                    d.session_id,
+                    "descriptor seq={seq} run={} service={} payload_type={} payload_size={} header_type={} header_size={}",
+                    d.run_start_seq,
                     d.service_name,
                     d.payload.name,
                     d.payload.size,
@@ -84,10 +86,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 catalog.insert(seq, *d);
             }
             Decoded::Data(m) => {
-                let d = catalog.get(seq, m.descriptor_seq)?;
+                let Some(d) = catalog.resolve(seq, m.descriptor_seq)? else {
+                    println!("undescribed seq={seq} descriptor_seq={}", m.descriptor_seq);
+                    continue;
+                };
+                m.check(&d)?;
                 println!(
-                    "data seq={seq} service={} local_ts={} venue_ts={} header={} payload={}",
+                    "data seq={seq} service={} publisher={:x} local_ts={} venue_ts={} header={} payload={}",
                     d.service_name,
+                    m.publisher_id,
                     record.local_ts_ns,
                     record.venue_ts_ns,
                     hex(m.user_header),
@@ -96,7 +103,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 data += 1;
             }
             Decoded::Loss(l) => {
-                let d = catalog.get(seq, l.descriptor_seq)?;
+                let Some(d) = catalog.resolve(seq, l.descriptor_seq)? else {
+                    println!("undescribed seq={seq} descriptor_seq={}", l.descriptor_seq);
+                    continue;
+                };
+                l.check(&d)?;
                 let kind = match l.kind {
                     LossKind::Gap => "gap",
                     LossKind::Backwards => "backwards",

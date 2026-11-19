@@ -201,6 +201,7 @@ pub enum Rec {
     Data {
         seq: u64,
         descriptor_seq: u64,
+        publisher_id: u128,
         local_ts_ns: u64,
         venue_ts_ns: u64,
         header: Vec<u8>,
@@ -209,11 +210,15 @@ pub enum Rec {
     Loss(u64, LossRecord),
 }
 
-/// Reads every record of the journal, checking that sequence numbers start at 0 and have no gaps.
+/// Reads every record of the journal, checking that sequence numbers start at 0 and have no gaps, and that every data
+/// record names the most recent descriptor before it and fits it.
 pub fn scan(dir: &Path) -> Vec<Rec> {
     let mut reader = Reader::open(dir, ReaderConfig::default()).expect("open journal");
     let mut out = Vec::new();
     let mut expected = 0;
+    let mut descriptors: std::collections::HashMap<u64, Descriptor> =
+        std::collections::HashMap::new();
+    let mut latest: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
     while let Some(r) = reader.try_next().expect("read journal") {
         assert_eq!(
             r.seq, expected,
@@ -222,21 +227,49 @@ pub fn scan(dir: &Path) -> Vec<Rec> {
         expected += 1;
         out.push(
             match layout::decode(r.schema_id, r.payload).expect("decode") {
-                Decoded::Descriptor(d) => Rec::Descriptor(r.seq, *d),
-                Decoded::Data(d) => Rec::Data {
-                    seq: r.seq,
-                    descriptor_seq: d.descriptor_seq,
-                    local_ts_ns: r.local_ts_ns,
-                    venue_ts_ns: r.venue_ts_ns,
-                    header: d.user_header.to_vec(),
-                    payload: d.payload.to_vec(),
-                },
+                Decoded::Descriptor(d) => {
+                    descriptors.insert(r.seq, (*d).clone());
+                    latest.insert(d.service_name.clone(), r.seq);
+                    Rec::Descriptor(r.seq, *d)
+                }
+                Decoded::Data(d) => {
+                    let descriptor = &descriptors[&d.descriptor_seq];
+                    d.check(descriptor).expect("data fits its descriptor");
+                    assert_eq!(
+                        latest[&descriptor.service_name], d.descriptor_seq,
+                        "record {} names the most recent descriptor of its service",
+                        r.seq
+                    );
+                    Rec::Data {
+                        seq: r.seq,
+                        descriptor_seq: d.descriptor_seq,
+                        publisher_id: d.publisher_id,
+                        local_ts_ns: r.local_ts_ns,
+                        venue_ts_ns: r.venue_ts_ns,
+                        header: d.user_header.to_vec(),
+                        payload: d.payload.to_vec(),
+                    }
+                }
                 Decoded::Loss(l) => Rec::Loss(r.seq, l),
                 Decoded::Other => panic!("unexpected schema {:#x} at {}", r.schema_id, r.seq),
             },
         );
     }
     out
+}
+
+/// Waits until a publish-subscribe service named `name` exists.
+#[cfg(feature = "iceoryx2")]
+pub fn wait_for_service(name: &str, timeout: Duration) {
+    use iceoryx2::prelude::*;
+    let config = iceoryx2::config::Config::global_config();
+    let service_name = ServiceName::new(name).expect("service name");
+    wait_until(timeout, &format!("service {name} to exist"), || {
+        matches!(
+            ipc::Service::details(&service_name, config, MessagingPattern::PublishSubscribe),
+            Ok(Some(_))
+        )
+    });
 }
 
 /// Number of records currently committed.
@@ -276,8 +309,15 @@ pub struct Followed {
 }
 
 pub fn parse_follow(out: &str) -> (Vec<(u64, String)>, Vec<Followed>) {
+    let (descriptors, data, _) = parse_follow_all(out);
+    (descriptors, data)
+}
+
+/// Like [`parse_follow`], plus the sequence numbers of `undescribed` lines.
+pub fn parse_follow_all(out: &str) -> (Vec<(u64, String)>, Vec<Followed>, Vec<u64>) {
     let mut descriptors = Vec::new();
     let mut data = Vec::new();
+    let mut undescribed = Vec::new();
     for line in out.lines() {
         let mut words = line.split_whitespace();
         let kind = words.next().unwrap_or("");
@@ -296,10 +336,11 @@ pub fn parse_follow(out: &str) -> (Vec<(u64, String)>, Vec<Followed>) {
                 header: unhex(fields["header"]),
                 payload: unhex(fields["payload"]),
             }),
+            "undescribed" => undescribed.push(fields["seq"].parse().unwrap()),
             _ => {}
         }
     }
-    (descriptors, data)
+    (descriptors, data, undescribed)
 }
 
 /// Lines `<header hex> <payload hex>` of the `subscriber` example.
@@ -317,3 +358,153 @@ pub fn counter_of(header: &[u8]) -> u64 {
 }
 
 pub const SECS: fn(u64) -> Duration = Duration::from_secs;
+
+/// One type detail, written without validation (for damaged descriptors).
+#[derive(Debug, Clone)]
+pub struct RawType {
+    pub dynamic: bool,
+    pub name: String,
+    pub size: u64,
+    pub alignment: u64,
+}
+
+impl RawType {
+    pub fn fixed(name: &str, size: u64, alignment: u64) -> RawType {
+        RawType {
+            dynamic: false,
+            name: name.into(),
+            size,
+            alignment,
+        }
+    }
+
+    pub fn slice(name: &str, size: u64, alignment: u64) -> RawType {
+        RawType {
+            dynamic: true,
+            ..RawType::fixed(name, size, alignment)
+        }
+    }
+}
+
+/// A descriptor encoded straight from the documented byte layout, without the validation `Descriptor::encode`
+/// applies, so tests can write what a damaged journal or a hostile file would hold.
+#[derive(Debug, Clone)]
+pub struct RawDescriptor {
+    pub run_start_seq: u64,
+    pub flags: u16,
+    /// history, buffer, borrowed, publishers, subscribers, nodes.
+    pub settings: [u64; 6],
+    pub safe_overflow: u8,
+    pub recorder_buffer: u64,
+    pub payload: RawType,
+    pub user_header: RawType,
+    pub system_header: RawType,
+    pub service: String,
+}
+
+impl RawDescriptor {
+    /// A valid descriptor for `service` with this payload, no user header and iceoryx2 0.10's system header.
+    pub fn new(service: &str, payload: RawType) -> RawDescriptor {
+        RawDescriptor {
+            run_start_seq: 0,
+            flags: 0,
+            settings: [0, 16, 2, 2, 8, 20],
+            safe_overflow: 1,
+            recorder_buffer: 16,
+            payload,
+            user_header: RawType::fixed("()", 0, 1),
+            system_header: RawType::fixed(
+                "iceoryx2::service::header::publish_subscribe::Header",
+                48,
+                8,
+            ),
+            service: service.into(),
+        }
+    }
+
+    pub fn bytes(&self) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(b"TTI2");
+        b.extend_from_slice(&1u16.to_le_bytes());
+        b.extend_from_slice(&self.flags.to_le_bytes());
+        b.extend_from_slice(&self.run_start_seq.to_le_bytes());
+        b.extend_from_slice(&1_700_000_000_000_000_000u64.to_le_bytes());
+        for v in [0u16, 10, 0] {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        b.push(1);
+        b.push(self.safe_overflow);
+        for v in self.settings {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        b.extend_from_slice(&self.recorder_buffer.to_le_bytes());
+        b.extend_from_slice(&[0; 8]); // no counter, reserved, offset 0
+        for t in [&self.payload, &self.user_header, &self.system_header] {
+            b.push(u8::from(t.dynamic));
+            b.push(0);
+            b.extend_from_slice(&(t.name.len() as u16).to_le_bytes());
+            b.extend_from_slice(&[0; 4]);
+            b.extend_from_slice(&t.size.to_le_bytes());
+            b.extend_from_slice(&t.alignment.to_le_bytes());
+            b.extend_from_slice(t.name.as_bytes());
+        }
+        for s in [self.service.as_str(), "test"] {
+            b.extend_from_slice(&(s.len() as u16).to_le_bytes());
+            b.extend_from_slice(s.as_bytes());
+        }
+        b
+    }
+}
+
+/// A data record naming `descriptor_seq`.
+pub fn raw_data(descriptor_seq: u64, header: &[u8], payload: &[u8]) -> Vec<u8> {
+    layout::DataRecord {
+        descriptor_seq,
+        publisher_id: 0,
+        user_header: header,
+        payload,
+    }
+    .encode()
+    .expect("encode data record")
+}
+
+/// Appends records `(schema id, payload)` to the journal in `dir` (created with `segment_size` if new), with
+/// `local_ts_ns` 1 ms apart; returns their sequence numbers.
+pub fn append_records(dir: &Path, segment_size: u64, records: &[(u32, Vec<u8>)]) -> Vec<u64> {
+    let mut writer = tickertape::Writer::open(
+        dir,
+        tickertape::WriterConfig::default()
+            .segment_size(segment_size)
+            .prefault(false),
+    )
+    .expect("open writer");
+    let base = 1_700_000_000_000_000_000u64 + writer.next_seq() * 1_000_000;
+    let seqs = records
+        .iter()
+        .enumerate()
+        .map(|(i, (schema_id, payload))| {
+            writer
+                .append(&tickertape::NewRecord {
+                    schema_id: *schema_id,
+                    venue_ts_ns: 0,
+                    local_ts_ns: base + i as u64 * 1_000_000,
+                    payload,
+                })
+                .expect("append")
+        })
+        .collect();
+    writer.checkpoint().expect("checkpoint");
+    seqs
+}
+
+/// A descriptor record followed by `n` data records of eight bytes each (the counter as `u64`).
+pub fn run_of(descriptor: &RawDescriptor, first_seq: u64, n: u64) -> Vec<(u32, Vec<u8>)> {
+    let mut out = vec![(layout::SCHEMA_DESCRIPTOR, descriptor.bytes())];
+    for i in 0..n {
+        out.push((
+            layout::SCHEMA_DATA,
+            raw_data(first_seq, &[], &i.to_le_bytes()),
+        ));
+    }
+    out
+}

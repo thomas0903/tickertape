@@ -22,7 +22,7 @@ iceoryx2 = ["dep:iceoryx2", "dep:zerocopy", "dep:signal-hook"]
 # Services whose types are only known at run time (what `iox2 service record` does), and conversion to and from
 # iceoryx2's recording file format. Depends on iceoryx2 API that upstream marks internal (`__internal_*`,
 # `loan_custom_payload`); all of it is in `src/dynamic.rs`.
-dynamic = ["iceoryx2", "dep:iceoryx2-userland-record-and-replay"]
+dynamic = ["iceoryx2", "dep:iceoryx2-userland-record-and-replay", "dep:toml"]
 # The `tickertape-iox2` command-line tool. Needs `dynamic` to record services by name.
 cli = ["dynamic", "dep:clap", "dep:serde_json"]
 
@@ -30,9 +30,13 @@ cli = ["dynamic", "dep:clap", "dep:serde_json"]
 tickertape = { path = "../../crates/tickertape", version = "0.4.0" }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
-# Pinned to one minor version: iceoryx2 is 0.x and breaks its API between minor releases.
-iceoryx2 = { version = "~0.10.0", optional = true }
-iceoryx2-userland-record-and-replay = { version = "~0.10.0", optional = true }
+# Pinned exactly: iceoryx2 is 0.x, breaks its API between minor releases, and the `dynamic` feature uses API it
+# marks internal, which may change in any release. Moving to another version is a reviewed change (see the README's
+# maintenance section).
+iceoryx2 = { version = "=0.10.0", optional = true }
+iceoryx2-userland-record-and-replay = { version = "=0.10.0", optional = true }
+# Parses the header of iceoryx2's human-readable recording files on import (already in iceoryx2's dependency tree).
+toml = { version = "0.9", default-features = false, features = ["std", "parse", "serde"], optional = true }
 # Safe byte views of typed payloads (no `unsafe` in the typed recorder and replayer).
 zerocopy = { version = "0.8", features = ["derive"], optional = true }
 # SIGINT/SIGTERM to an atomic flag without `unsafe`.

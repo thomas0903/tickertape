@@ -12,14 +12,33 @@
 //! original service (which would record its own replay). Replaying onto the original names needs
 //! [`Remap::original_names`]; individual names can be mapped with [`Remap::rule`].
 //!
+//! A replay can still feed a recorder that is recording the target name right now (for example `--original-names`
+//! while the recorder that wrote the journal still runs, or a journal that recorded a `replay/...` service). So, by
+//! default, the replay ends at the journal's committed end as it was when the replay started, and the replayer
+//! refuses a target name that the journal is recording at the moment (a service with a descriptor in the journal's
+//! newest segment while a writer holds the journal) unless [`ReplayerBuilder::allow_live_targets`] is given.
+//!
 //! # Types
 //!
-//! Each target service is opened, or created with the recorded settings, using the recorded type details. If it
-//! already exists with different types, the replayer refuses with [`Error::Incompatible`] and says what differs.
-//! Services registered with [`ReplayerBuilder::typed`] use only iceoryx2's public API and also check the Rust types
-//! against the recording. Other services need the `dynamic` feature.
+//! Each target service is opened, or created with the recorded settings, using the recorded type details, which
+//! were validated when their descriptor was decoded. If it already exists with different types, the replayer
+//! refuses with [`Error::Incompatible`] and says what differs. Every later descriptor that resolves to the same
+//! target (a later recording run of the service, or another service mapped onto it) must have exactly the same
+//! payload and user header types (variant, name, size and alignment), or the replay stops with
+//! [`Error::Incompatible`] naming both.
+//!
+//! # Trust
+//!
+//! A subscriber of a target service reads the replayed bytes as values of the advertised types. Services registered
+//! with [`ReplayerBuilder::typed`] use only iceoryx2's public API, check the Rust types against the recording, and
+//! rebuild every value with `zerocopy::FromBytes`, so [`Replayer::run`] is safe. Replaying any other service sends
+//! the recorded bytes under the recorded type name without knowing the type, so a typed subscriber of a type with
+//! invalid bit patterns (`bool`, an enum) would have undefined behaviour if the bytes are not valid values. The
+//! journal's checksums protect against accidental damage, not against a journal written with wrong contents. That
+//! path is `Replayer::run_dynamic`, an `unsafe fn` (feature `dynamic`): replay only recordings you trust, as with
+//! upstream's own replay tool.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -32,8 +51,8 @@ use tickertape::{Reader, ReaderConfig};
 
 use crate::layout::{self, Decoded, Descriptor, TypeInfo};
 use crate::pacing::Pacer;
-pub use crate::pacing::PacingReport;
-use crate::recorder::{Signals, describe, service_name, service_version, signalled};
+pub use crate::pacing::{MAX_SPEED, MIN_SPEED, PacingReport};
+use crate::recorder::{Signals, describe, service_name, service_version};
 use crate::typed::{Create, ReplayableHeader};
 use crate::{Catalog, Error, Replayable};
 
@@ -109,12 +128,17 @@ pub(crate) trait Sink {
 type SinkFactory =
     Box<dyn FnMut(&Node<ipc::Service>, &str, &Descriptor) -> Result<Box<dyn Sink>, Error> + Send>;
 
+/// Opens a sink for a service that isn't registered as typed. Only `Replayer::run_dynamic` passes one.
+pub(crate) type UntypedSink =
+    fn(&Node<ipc::Service>, &str, &Descriptor) -> Result<Box<dyn Sink>, Error>;
+
 /// Why [`Replayer::run`] returned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum ReplayEnd {
-    /// It reached the end of the journal as it was when the replayer got there.
+    /// It reached the end of the journal: the committed end when the replay started (the default), or the end when
+    /// the replayer got there ([`ReplayerBuilder::end_at_start`] set to false).
     EndOfJournal,
     /// It passed [`ReplayerBuilder::to`].
     ToReached,
@@ -146,6 +170,9 @@ pub struct ReplayReport {
     pub messages: u64,
     /// Data records skipped by the service filter.
     pub filtered: u64,
+    /// Data records skipped because the descriptor they name is no longer in the journal (retention or archiving
+    /// removed its segment).
+    pub undescribed: u64,
     /// Other records passed over (descriptors, loss records, other schemas).
     pub other_records: u64,
     /// Per target service.
@@ -172,6 +199,8 @@ pub struct ReplayerBuilder {
     handle_signals: bool,
     wait_for_subscribers: Option<(usize, Duration)>,
     linger: Duration,
+    end_at_start: bool,
+    allow_live_targets: bool,
 }
 
 impl core::fmt::Debug for ReplayerBuilder {
@@ -194,13 +223,16 @@ impl ReplayerBuilder {
         self
     }
 
-    /// Stops after this sequence number, inclusive (default: the end of the journal when reached).
+    /// Stops after this sequence number, inclusive (default: the end of the journal, see
+    /// [`ReplayerBuilder::end_at_start`]).
     pub fn to(mut self, seq: u64) -> Self {
         self.to = Some(seq);
         self
     }
 
-    /// Sends at the recorded pace divided by `speed` (1.0 is the recorded pace).
+    /// Sends at the recorded pace multiplied by `speed` (1.0 is the recorded pace, 2.0 twice as fast), from
+    /// [`MIN_SPEED`] to [`MAX_SPEED`]. Gaps are reproduced as recorded, scaled: a pause between recording runs, or a
+    /// forward step of the wall clock while recording, is waited out in real time.
     pub fn speed(mut self, speed: f64) -> Self {
         self.speed = Some(speed);
         self
@@ -290,6 +322,21 @@ impl ReplayerBuilder {
         self
     }
 
+    /// Whether the replay ends at the journal's committed end as it was when the replay started (true, the default)
+    /// or keeps going to the end as it is when the replayer gets there (false). With false, a replay onto names a
+    /// running recorder records can feed itself without end.
+    pub fn end_at_start(mut self, on: bool) -> Self {
+        self.end_at_start = on;
+        self
+    }
+
+    /// Allows target names that the journal is recording right now (default: refused). A recorder of such a
+    /// service records the replay into the journal being replayed.
+    pub fn allow_live_targets(mut self, on: bool) -> Self {
+        self.allow_live_targets = on;
+        self
+    }
+
     /// A flag that stops the replay when set, from any thread.
     pub fn stop_flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.stop)
@@ -299,13 +346,14 @@ impl ReplayerBuilder {
     ///
     /// # Errors
     ///
-    /// [`Error::Usage`] if the speed is not positive and finite, or `to` is before `from`.
+    /// [`Error::Usage`] if the speed is outside [`MIN_SPEED`] to [`MAX_SPEED`] or not a number, or `to` is before
+    /// `from`.
     pub fn build(self) -> Result<Replayer, Error> {
         if let Some(s) = self.speed
-            && !(s.is_finite() && s > 0.0)
+            && !(MIN_SPEED..=MAX_SPEED).contains(&s)
         {
             return Err(Error::Usage(format!(
-                "speed must be a positive number, not {s}"
+                "speed must be from {MIN_SPEED} to {MAX_SPEED}, not {s}"
             )));
         }
         if let (Some(from), Some(to)) = (self.from, self.to)
@@ -326,6 +374,11 @@ pub struct Replayer {
 struct Target {
     report: ReplayServiceReport,
     sink: Box<dyn Sink>,
+    /// The validated types of the descriptor that opened the target, and the recorded service and record it came
+    /// from; every other descriptor resolving to this target must match exactly.
+    payload: TypeInfo,
+    user_header: TypeInfo,
+    first: (String, u64),
 }
 
 impl Replayer {
@@ -346,6 +399,8 @@ impl Replayer {
             handle_signals: true,
             wait_for_subscribers: None,
             linger: Duration::ZERO,
+            end_at_start: true,
+            allow_live_targets: false,
         }
     }
 
@@ -354,20 +409,38 @@ impl Replayer {
         Arc::clone(&self.config.stop)
     }
 
-    /// Replays to the end of the journal (as it is when reached), `to`, a signal or the stop flag.
+    /// Replays to the end of the journal (see [`ReplayerBuilder::end_at_start`]), `to`, a signal or the stop flag.
+    /// Every recorded service must be registered with [`ReplayerBuilder::typed`]; others are refused (replay them
+    /// with `Replayer::run_dynamic`).
     ///
     /// # Errors
     ///
-    /// [`Error::Journal`] or [`Error::Layout`] if the recording can't be read; [`Error::Incompatible`] if a target
-    /// service exists with other types; [`Error::Usage`] if a service is neither registered as typed nor
-    /// replayable without types (feature `dynamic`), or its name maps onto itself; [`Error::Iceoryx2`] if sending
-    /// fails.
+    /// [`Error::Journal`] or [`Error::Layout`] if the recording can't be read or a record is invalid;
+    /// [`Error::Incompatible`] if a target service exists with other types, or two descriptors with different types
+    /// resolve to one target; [`Error::Usage`] if a service is not registered as typed, its name maps onto itself
+    /// or onto a name the journal is recording right now, or a paced send time can't be represented;
+    /// [`Error::Iceoryx2`] if sending fails.
     pub fn run(self) -> Result<ReplayReport, Error> {
+        self.run_with(None)
+    }
+
+    pub(crate) fn run_with(self, untyped: Option<UntypedSink>) -> Result<ReplayReport, Error> {
         let mut config = self.config;
-        let _signals = if config.handle_signals {
+        let signals = if config.handle_signals {
             Some(Signals::register(&config.stop)?)
         } else {
             None
+        };
+        let signalled = signals.as_ref().map(|s| Arc::clone(&s.signalled));
+        let stopped = || {
+            if signalled
+                .as_ref()
+                .is_some_and(|s| s.load(Ordering::Relaxed))
+            {
+                ReplayEnd::Signal
+            } else {
+                ReplayEnd::StopFlag
+            }
         };
         let node = NodeBuilder::new()
             .name(
@@ -378,6 +451,14 @@ impl Replayer {
             .create::<ipc::Service>()
             .map_err(|e| Error::iox("create node", e))?;
         let mut reader = Reader::open(&config.journal, ReaderConfig::default())?;
+        // The end now, and the names the journal is recording now (if a writer holds it).
+        let tail = crate::tail::read(&config.journal)?;
+        let live: BTreeSet<String> = if crate::tail::has_live_writer(&config.journal)? {
+            tail.services
+        } else {
+            BTreeSet::new()
+        };
+        let end = config.end_at_start.then_some(tail.end_seq);
         if let Some(from) = config.from {
             reader.seek(from)?;
         }
@@ -386,13 +467,14 @@ impl Replayer {
             .speed
             .map(|s| Pacer::new(s, config.spin, config.late_threshold));
         let mut targets: Vec<Target> = Vec::new();
-        let mut by_descriptor: HashMap<u64, usize> = HashMap::new();
+        let mut by_descriptor: HashMap<u64, Option<usize>> = HashMap::new();
         let mut by_target: HashMap<String, usize> = HashMap::new();
         let mut report = ReplayReport {
             first_seq: None,
             last_seq: None,
             messages: 0,
             filtered: 0,
+            undescribed: 0,
             other_records: 0,
             services: Vec::new(),
             pacing: None,
@@ -407,30 +489,37 @@ impl Replayer {
                 break;
             };
             let seq = record.seq;
+            if end.is_some_and(|end| seq >= end) {
+                break;
+            }
             if config.to.is_some_and(|to| seq > to) {
                 report.end = ReplayEnd::ToReached;
                 break;
             }
             report.last_seq = Some(seq);
-            let data = match layout::decode(record.schema_id, record.payload)
-                .map_err(|source| Error::Layout { seq, source })?
-            {
-                Decoded::Descriptor(d) => {
-                    catalog.insert(seq, *d);
-                    report.other_records += 1;
-                    continue;
-                }
-                Decoded::Data(data) => data,
-                Decoded::Loss(_) | Decoded::Other => {
-                    report.other_records += 1;
-                    continue;
-                }
+            let layout_error = |source| Error::Layout { seq, source };
+            let data =
+                match layout::decode(record.schema_id, record.payload).map_err(layout_error)? {
+                    Decoded::Descriptor(d) => {
+                        catalog.insert(seq, *d);
+                        report.other_records += 1;
+                        continue;
+                    }
+                    Decoded::Data(data) => data,
+                    Decoded::Loss(_) | Decoded::Other => {
+                        report.other_records += 1;
+                        continue;
+                    }
+                };
+            let Some(descriptor) = catalog.resolve(seq, data.descriptor_seq)? else {
+                report.undescribed += 1;
+                continue;
             };
+            data.check(&descriptor).map_err(layout_error)?;
             let index = match by_descriptor.get(&data.descriptor_seq) {
-                Some(&i) => Some(i),
+                Some(&i) => i,
                 None => {
-                    let descriptor = catalog.get(seq, data.descriptor_seq)?;
-                    if config
+                    let i = if config
                         .services
                         .as_ref()
                         .is_some_and(|s| !s.contains(&descriptor.service_name))
@@ -438,10 +527,27 @@ impl Replayer {
                         None
                     } else {
                         let target = config.remap.target(&descriptor.service_name)?;
-                        let i = match by_target.get(&target) {
-                            Some(&i) => i,
+                        if live.contains(&target) && !config.allow_live_targets {
+                            return Err(Error::Usage(format!(
+                                "refusing to replay \"{}\" onto \"{target}\": the journal is recording that service \
+                                 right now, so the replay would be recorded into it; choose another name, stop the \
+                                 recorder, or allow live targets",
+                                descriptor.service_name
+                            )));
+                        }
+                        Some(match by_target.get(&target) {
+                            Some(&i) => {
+                                check_same_types(
+                                    &targets[i],
+                                    &target,
+                                    &descriptor,
+                                    data.descriptor_seq,
+                                )?;
+                                i
+                            }
                             None => {
-                                let sink = open_sink(&mut config, &node, &target, &descriptor)?;
+                                let sink =
+                                    open_sink(&mut config, untyped, &node, &target, &descriptor)?;
                                 targets.push(Target {
                                     report: ReplayServiceReport {
                                         recorded: descriptor.service_name.clone(),
@@ -449,22 +555,30 @@ impl Replayer {
                                         messages: 0,
                                     },
                                     sink,
+                                    payload: descriptor.payload.clone(),
+                                    user_header: descriptor.user_header.clone(),
+                                    first: (descriptor.service_name.clone(), data.descriptor_seq),
                                 });
                                 by_target.insert(target, targets.len() - 1);
                                 targets.len() - 1
                             }
-                        };
-                        by_descriptor.insert(data.descriptor_seq, i);
-                        Some(i)
-                    }
+                        })
+                    };
+                    by_descriptor.insert(data.descriptor_seq, i);
+                    i
                 }
             };
             let Some(index) = index else {
                 report.filtered += 1;
                 continue;
             };
+            // Waiting for subscribers may have been cut short by a stop request: don't send after it.
+            if config.stop.load(Ordering::Relaxed) {
+                report.end = stopped();
+                break;
+            }
             let scheduled = match pacer.as_mut() {
-                Some(p) => match p.wait(record.local_ts_ns, &config.stop) {
+                Some(p) => match p.wait(seq, record.local_ts_ns, &config.stop)? {
                     Some(t) => Some(t),
                     None => {
                         report.end = stopped();
@@ -489,69 +603,83 @@ impl Replayer {
                 std::thread::sleep(Duration::from_millis(5).min(config.linger));
             }
         }
+        drop(signals);
         report.services = targets.into_iter().map(|t| t.report).collect();
         report.pacing = pacer.map(|p| p.report);
         Ok(report)
     }
 }
 
-fn stopped() -> ReplayEnd {
-    if signalled().load(Ordering::Relaxed) {
-        ReplayEnd::Signal
-    } else {
-        ReplayEnd::StopFlag
+/// Requires a descriptor that resolves to an existing target to have exactly the target's types.
+fn check_same_types(
+    existing: &Target,
+    target: &str,
+    descriptor: &Descriptor,
+    descriptor_seq: u64,
+) -> Result<(), Error> {
+    if existing.payload == descriptor.payload && existing.user_header == descriptor.user_header {
+        return Ok(());
     }
+    let show = |t: &TypeInfo| {
+        format!(
+            "{:?} {} (size {}, alignment {})",
+            t.variant, t.name, t.size, t.alignment
+        )
+    };
+    Err(Error::Incompatible {
+        service: target.to_string(),
+        reason: format!(
+            "recorded service \"{}\" (descriptor {descriptor_seq}) has payload {} and user header {}, but the target \
+             already carries payload {} and user header {} from recorded service \"{}\" (descriptor {}); replay \
+             them onto different names (--map) or separately (--from/--to)",
+            descriptor.service_name,
+            show(&descriptor.payload),
+            show(&descriptor.user_header),
+            show(&existing.payload),
+            show(&existing.user_header),
+            existing.first.0,
+            existing.first.1,
+        ),
+    })
 }
 
 fn open_sink(
     config: &mut ReplayerBuilder,
+    untyped: Option<UntypedSink>,
     node: &Node<ipc::Service>,
     target: &str,
     descriptor: &Descriptor,
 ) -> Result<Box<dyn Sink>, Error> {
-    let sink = match config.typed.get_mut(&descriptor.service_name) {
-        Some(factory) => factory(node, target, descriptor)?,
-        None => dynamic_sink(node, target, descriptor)?,
+    let sink = match (config.typed.get_mut(&descriptor.service_name), untyped) {
+        (Some(factory), _) => factory(node, target, descriptor)?,
+        (None, Some(untyped)) => {
+            check_existing(node, target, descriptor)?;
+            untyped(node, target, descriptor)?
+        }
+        (None, None) => {
+            return Err(Error::Usage(format!(
+                "service \"{}\" (payload type {}) is not registered with ReplayerBuilder::typed; replaying services \
+                 by their recorded type details needs Replayer::run_dynamic (feature `dynamic`)",
+                descriptor.service_name, descriptor.payload.name
+            )));
+        }
     };
     if let Some((count, timeout)) = config.wait_for_subscribers {
         let deadline = Instant::now() + timeout;
         while sink.subscribers() < count {
+            if config.stop.load(Ordering::Relaxed) {
+                break;
+            }
             if Instant::now() >= deadline {
                 return Err(Error::Usage(format!(
                     "service \"{target}\" has {} subscribers after {timeout:?}; waited for {count}",
                     sink.subscribers()
                 )));
             }
-            if config.stop.load(Ordering::Relaxed) {
-                break;
-            }
             std::thread::sleep(Duration::from_millis(5));
         }
     }
     Ok(sink)
-}
-
-#[cfg(feature = "dynamic")]
-fn dynamic_sink(
-    node: &Node<ipc::Service>,
-    target: &str,
-    descriptor: &Descriptor,
-) -> Result<Box<dyn Sink>, Error> {
-    check_existing(node, target, descriptor)?;
-    crate::dynamic::sink(node, target, descriptor)
-}
-
-#[cfg(not(feature = "dynamic"))]
-fn dynamic_sink(
-    _: &Node<ipc::Service>,
-    _: &str,
-    descriptor: &Descriptor,
-) -> Result<Box<dyn Sink>, Error> {
-    Err(Error::Usage(format!(
-        "service \"{}\" (payload type {}) is not registered with ReplayerBuilder::typed, and replaying services \
-         whose types are only known at run time needs the `dynamic` feature",
-        descriptor.service_name, descriptor.payload.name
-    )))
 }
 
 /// Refuses clearly if `target` already exists with types other than the recorded ones.
