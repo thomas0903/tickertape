@@ -142,6 +142,16 @@
               <argLine>-XX:-DoEscapeAnalysis ${tickertape.test.jvmArgs} ${tickertape.test.argLine}</argLine>
             </configuration>
           </execution>
+          <!-- PathsTest again with macOS's form-D path property (no effect elsewhere): the JDK reads it at start-up, so
+               the refusal of a listed form-C name under it can only be tested in a JVM started with it. -->
+          <execution>
+            <id>paths-with-normalization-form-d</id>
+            <goals><goal>test</goal></goals>
+            <configuration>
+              <test>PathsTest</test>
+              <argLine>-Djdk.nio.path.useNormalizationFormD=true ${tickertape.test.jvmArgs} ${tickertape.test.argLine}</argLine>
+            </configuration>
+          </execution>
         </executions>
       </plugin>
       <plugin>

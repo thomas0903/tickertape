@@ -98,14 +98,31 @@ The Linux libraries are built for glibc.
 - **Options** (`WriterOptions`, `ReaderOptions`, `Retention`) are immutable values: each setter returns a new value.
   They are copied into the library when a writer or reader is opened.
 - **Paths** must be on the default file system. They reach the library as the bytes the operating system knows them
-  by: the JDK has no public way to read a path's bytes, so the binding encodes `toString()` as the JDK encodes a
-  path's text, with its file-name charset (`sun.jnu.encoding`: UTF-8 on macOS, the locale's charset on Linux) and, on
-  macOS with `-Djdk.nio.path.useNormalizationFormD` enabled, after normalizing to Unicode form D as the JDK then does.
-  That gives back the same bytes for every name the JDK could decode. The charset and that property are read once,
-  when the binding first converts a path (the JDK, too, uses its start-up values): changing either property later is
-  not supported. A name the JDK could not decode (on Linux, bytes that are not valid UTF-8 under a UTF-8 locale) shows
-  as U+FFFD in Java and would name a different file, so every call that takes such a path throws
-  `IllegalArgumentException` before anything reaches the library (`Retention.moveTo` already when it is built).
+  by. The JDK has no public way to read a path's bytes, so the binding passes a path only when its text provably
+  stands for its bytes, and refuses it otherwise: it makes a path from `toString()` (`Path.of(text)`) and compares the
+  two, which the JDK does by their bytes. If they are equal, the binding encodes the text as the JDK encodes a path's
+  text, with its file-name charset (`sun.jnu.encoding`: UTF-8 on macOS, the locale's charset on Linux) and, on macOS
+  with `-Djdk.nio.path.useNormalizationFormD` enabled, after normalizing to Unicode form D, which gives the path's own
+  bytes. If not, every call that takes the path throws `IllegalArgumentException` before anything reaches the library
+  (`Retention.moveTo` already when it is built), since the text would name a different file, possibly an existing
+  sibling. This happens in two cases:
+  - a name the JDK could not decode (on Linux, bytes that are not valid UTF-8 under a UTF-8 locale), which shows as
+    U+FFFD in Java (a name that holds U+FFFD itself is accepted);
+  - on macOS with `-Djdk.nio.path.useNormalizationFormD` enabled, a path whose bytes are not in form D, typically an
+    entry stored in form C that `Files.list` or a directory stream returned. The JDK keeps a listed entry's bytes and
+    shows its text in form C, as it shows every path under that property, while a path made from that text holds
+    form D bytes; on a volume that tells the two forms apart these name different files. Build the path from a string
+    (`Path.of`, `resolve(String)`), or run without the property.
+
+  | `useNormalizationFormD` (macOS) | `Path.of(p.toString()).equals(p)` | The binding |
+  |---|---|---|
+  | not set (or not macOS) | yes | passes `toString()` encoded with the file-name charset |
+  | not set (or not macOS) | no | throws `IllegalArgumentException` (a name the JDK could not decode) |
+  | set | yes | passes `toString()` normalized to form D, then encoded |
+  | set | no | throws `IllegalArgumentException` naming the property (or, if the text holds U+FFFD, as above) |
+
+  The charset and that property are read once, when the binding first converts a path (the JDK, too, uses its
+  start-up values): changing either property later is not supported.
 - **Names.** Boolean accessors are `isXxx()` everywhere (`isClosed()`, `isMapped()`, `isValid()`, `isIntact()`, and
   in the options `isDurableOnly()`, `isNotifyEnabled()`, `isPrefaultEnabled()`); option setters are the bare name
   (`notify(boolean)`). Every `PayloadBuffer` write (`setByte`, `set`, `put`) returns the buffer, so writes chain.
@@ -167,25 +184,33 @@ The Linux libraries are built for glibc.
   on the Java heap per call, under the conditions given (the test measures each operation on its own, a batch call
   counting once, and runs a second time with the JIT's escape analysis off, so nothing relies on the JIT removing a
   per-call object):
-  - `append` with a `byte[]`, a native or heap `MemorySegment`, or a direct or heap `ByteBuffer`, of a payload no
-    larger than one the writer appended before (its scratch buffer grows otherwise); `appendBatch`; `nextSeq()`.
+  - `append` with a native `MemorySegment`, which is passed to the library as it is (no condition on its size).
+  - `append` with a `byte[]`, a heap `MemorySegment`, or a direct, heap or read-only heap `ByteBuffer`, which are
+    copied through the writer's scratch buffer: of a payload no larger than the largest payload of these kinds that
+    the writer was given before. A native segment does not count, so the first `byte[]` append larger than every
+    earlier copied payload allocates even after larger native-segment appends (the buffer grows). One exception: after
+    a heap segment larger than `Integer.MAX_VALUE - 8` bytes, the next `ByteBuffer` append replaces the scratch buffer
+    with one of its own size.
+  - `appendBatch`; `nextSeq()`.
   - `appendWith` whose filler uses `set`, `setByte`, `put(byte[])`, `put(MemorySegment)` (native or heap), or
     `put(ByteBuffer)` of a heap buffer, or of a direct or read-only heap buffer that is the same as in the previous
-    `put` of its kind. The writer remembers the last direct and the last read-only buffer (one of each, so
-    alternating the two is fine), and keeps them reachable until others replace them or it is closed (close a
-    writer you are done with: the `Cleaner` is a backstop, and it cannot free an unclosed writer that a remembered
-    buffer's own clean-up action refers back to); the first copy from another buffer of a kind allocates a small
-    object.
-  - `AppendBatch.add` with a `byte[]`, a native or heap `MemorySegment`, or a direct or heap `ByteBuffer`, while the
-    batch does not grow; a batch that grows allocates, so size it up front or let it grow once and reuse it. For a
-    direct buffer this holds only up to a payload capacity of `Integer.MAX_VALUE - 8` bytes (above it, each such
-    `add` builds a wrapper).
+    `put` of its kind; alternating one direct and one read-only heap buffer is fine. The first copy from another
+    buffer of a kind allocates a small object. The writer remembers two buffers, the last direct one and the last
+    read-only heap one, so a later fill from the other kind does not release the first; it keeps each reachable until
+    another of its kind replaces it, and `close()` releases both. Close a writer you are done with: the `Cleaner` is
+    a backstop, and it cannot free an unclosed writer that remembers a buffer whose memory belongs to an automatic
+    arena (`Arena.ofAuto()`) with a clean-up action that refers back to the writer, because the JDK's cleaner holds
+    that action; with a shared or confined arena the unclosed writer is collected.
+  - `AppendBatch.add` with a `byte[]`, a native or heap `MemorySegment`, or a direct, heap or read-only heap
+    `ByteBuffer`, while the batch does not grow; a batch that grows allocates, so size it up front or let it grow
+    once and reuse it. For a buffer without an accessible array (a direct or a read-only heap buffer) this holds only
+    up to a payload capacity of `Integer.MAX_VALUE - 8` bytes (above it, each such `add` builds a wrapper).
   - For both readers: `tryNext`, `next()` and a timed `next` that find a record; the view's metadata accessors,
     `isValid()`, `getByte`, `get(layout)`, and `copyPayloadTo` a `MemorySegment`, a `byte[]`, a heap `ByteBuffer`, or
     the same direct `ByteBuffer` as that view's previous copy (the view remembers it, and keeps it reachable while the
     view is); the first copy into another direct buffer allocates a small object.
-  - `tryReadBatch` and a timed `readBatch` that find records, `ReadBatch.get` of an index used before and its view's
-    accessors.
+  - `tryReadBatch` and a timed `readBatch` that find records; `ReadBatch.get` of an index used before; and on a
+    batch's view, the same accessors and copies as on a reader's view (above).
 
   Everything else may allocate; in particular `withPayload`, `PayloadBuffer.segment()`, and the copying methods that
   return new objects (`copy()`, `payloadToArray()`) do.

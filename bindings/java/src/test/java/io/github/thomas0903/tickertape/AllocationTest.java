@@ -111,6 +111,7 @@ class AllocationTest {
             measure("append(heap MemorySegment)", i -> w.append(1, i, i, heapPayload));
             measure("append(direct ByteBuffer)", i -> w.append(1, i, i, direct));
             measure("append(heap ByteBuffer)", i -> w.append(1, i, i, heap));
+            measure("append(read-only heap ByteBuffer)", i -> w.append(1, i, i, readOnly));
 
             PayloadFiller setLong = p -> p.set(ValueLayout.JAVA_LONG_UNALIGNED, 0, 42L);
             measure("appendWith, PayloadBuffer.set", i -> w.appendWith(1, i, i, 64, setLong));
@@ -166,12 +167,47 @@ class AllocationTest {
                 }
                 adds.add(1, i, i, heap);
             });
+            measure("AppendBatch.add(read-only heap ByteBuffer)", i -> {
+                if (adds.size() == 16) {
+                    adds.clear();
+                }
+                adds.add(1, i, i, readOnly);
+            });
             AppendBatch batch = new AppendBatch(4, 4 * 64);
             for (int k = 0; k < 4; k++) {
                 batch.add(1, k, k, payload);
             }
             measure("appendBatch (4 records per call)", i -> w.appendBatch(batch));
             measure("nextSeq", i -> w.nextSeq());
+        }
+        assertNoFailures();
+    }
+
+    /**
+     * The scratch-buffer condition is per source kind: a native segment is passed to the library as it is and does not
+     * count, so the first array append larger than every payload copied through the scratch buffer before allocates
+     * (the buffer grows) even after larger native-segment appends, and array appends up to that size allocate nothing
+     * afterwards. The writer's scratch buffer starts at 256 bytes.
+     */
+    @Test
+    void theScratchConditionCountsOnlyPayloadsCopiedThroughIt() throws Exception {
+        WriterOptions options = WriterOptions.defaults().segmentSize(64L << 20).prefault(false);
+        byte[] small = new byte[64];
+        byte[] large = new byte[512];
+        try (Writer w = Writer.open(tmp.resolve("s"), options); Arena arena = Arena.ofConfined()) {
+            MemorySegment largeNative = arena.allocate(large.length);
+            measure("append(byte[]) of 64 bytes", i -> w.append(1, i, i, small));
+            measure("append(native MemorySegment) of 512 bytes, after arrays of 64 bytes",
+                    i -> w.append(1, i, i, largeNative));
+            long before = THREADS.getCurrentThreadAllocatedBytes();
+            w.append(1, 0, 0, large);
+            long first = THREADS.getCurrentThreadAllocatedBytes() - before;
+            if (first < 16) {
+                failures.add("the first append(byte[]) of 512 bytes after native segments of 512 bytes allocated "
+                        + first + " bytes, but the scratch buffer has to grow (the documented condition is wrong)");
+            }
+            measure("append(byte[]) of 512 bytes, after the first", i -> w.append(1, i, i, large));
+            measure("append(byte[]) of 64 bytes, after one of 512", i -> w.append(1, i, i, small));
         }
         assertNoFailures();
     }
@@ -228,15 +264,12 @@ class AllocationTest {
             try (Reader r = Reader.open(dir)) {
                 ReadBatch rb = new ReadBatch(64, 64 * 64);
                 long[] seen = new long[1];
-                measure("tryReadBatch and its views", i -> {
+                measure("tryReadBatch with records available", i -> {
                     int n = r.tryReadBatch(rb);
                     if (n == 0) {
                         r.seek(0);
                     }
-                    for (int k = 0; k < n; k++) {
-                        RecordView v = rb.get(k);
-                        seen[0] += v.getByte(63) + v.seq();
-                    }
+                    seen[0] += n;
                 });
                 r.seek(0);
                 measure("readBatch(timeout) with records available", i -> {
@@ -246,10 +279,26 @@ class AllocationTest {
                     }
                     seen[0] += n;
                 });
-                RecordView v = rb.get(0);
+                r.seek(0);
+                int filled = r.tryReadBatch(rb);
+                assertTrue(filled == 64, "a full batch");
+                RecordView[] got = new RecordView[1];
+                // The warm-up gets every index once, so the measured calls are of indexes used before.
+                measure("ReadBatch.get of an index used before", i -> got[0] = rb.get(i & 63));
+                RecordView v = rb.get(1);
+                measure("batch view metadata", i -> seen[0] += v.seq() + v.schemaId() + v.venueTsNs()
+                        + v.localTsNs() + v.payloadLength() + (v.isValid() ? 1 : 0));
+                measure("batch view get(layout)", i -> seen[0] += v.get(ValueLayout.JAVA_LONG_UNALIGNED, i & 7));
+                measure("batch view getByte", i -> seen[0] += v.getByte(63));
+                measure("batch view copyPayloadTo(MemorySegment)", i -> v.copyPayloadTo(segmentOut, 0));
+                measure("batch view copyPayloadTo(byte[])", i -> v.copyPayloadTo(arrayOut, 0));
                 measure("batch view copyPayloadTo(direct ByteBuffer)", i -> {
                     directOut.clear();
                     v.copyPayloadTo(directOut);
+                });
+                measure("batch view copyPayloadTo(heap ByteBuffer)", i -> {
+                    heapOut.clear();
+                    v.copyPayloadTo(heapOut);
                 });
                 assertTrue(seen[0] > 0);
             }

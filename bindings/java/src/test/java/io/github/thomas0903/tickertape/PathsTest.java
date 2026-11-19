@@ -17,8 +17,10 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 /**
- * Paths reach the C library as the bytes the operating system knows them by (ADR 0037 &rarr; Paths): a name the JVM
- * cannot decode is refused before anything reaches the library, so a lossy conversion can never select a sibling.
+ * Paths reach the C library as the bytes the operating system knows them by (ADR 0037 &rarr; Paths): a path is passed
+ * only when a path made from its text equals it, and refused otherwise (a name the JVM cannot decode; on macOS with the
+ * form-D property, a listed name not in form D), so a lossy conversion can never select a sibling. The build runs this
+ * class a second time with {@code -Djdk.nio.path.useNormalizationFormD=true} (see {@code pom.xml}).
  */
 class PathsTest {
     @TempDir
@@ -114,6 +116,71 @@ class PathsTest {
         assertArrayEquals(nfd, Paths.encode(decomposed, StandardCharsets.UTF_8, false));
         byte[] ascii = "journal-a".getBytes(StandardCharsets.UTF_8);
         assertArrayEquals(ascii, Paths.encode("journal-a", StandardCharsets.UTF_8, true));
+    }
+
+    /**
+     * The decision itself, with the setting and the round-trip result passed in (no volume that tells form C from form
+     * D is at hand, and one JVM cannot switch the property): a path is passed only when the round trip holds, in form D
+     * under the property; otherwise it is refused, whatever its text holds.
+     */
+    @Test
+    void aPathIsPassedOnlyWhenItsTextRoundTrips() {
+        String accented = "journal-caf\u00e9";
+        String replaced = "j\uFFFD";
+        // Property not set (or not macOS).
+        assertEquals(Paths.Conversion.ENCODE, Paths.conversion(accented, false, true));
+        assertEquals(Paths.Conversion.ENCODE, Paths.conversion(replaced, false, true)); // a name that holds U+FFFD
+        assertEquals(Paths.Conversion.REFUSE_UNDECODABLE, Paths.conversion(replaced, false, false));
+        assertEquals(Paths.Conversion.REFUSE_UNDECODABLE, Paths.conversion(accented, false, false)); // not only U+FFFD
+        // Property set (macOS).
+        assertEquals(Paths.Conversion.ENCODE_NFD, Paths.conversion(accented, true, true));
+        assertEquals(Paths.Conversion.REFUSE_NOT_FORM_D, Paths.conversion(accented, true, false));
+        assertEquals(Paths.Conversion.REFUSE_UNDECODABLE, Paths.conversion(replaced, true, false));
+    }
+
+    /** The round trip compares bytes, and a text the JDK cannot turn back into a path does not round-trip. */
+    @Test
+    void theRoundTripIsTheJdksOwnComparison() {
+        Path p = tmp.resolve("journal-a");
+        assertTrue(Paths.roundTrips(p.toString(), p));
+        assertFalse(Paths.roundTrips(p.toString() + "b", p));
+        assertFalse(Paths.roundTrips("journal\0a", p)); // Path.of refuses NUL
+    }
+
+    /**
+     * On macOS a name stored in form C keeps those bytes when a directory listing returns it, and shows the same text
+     * under either setting. Without the form-D property the binding passes those bytes; with it, a path made from the
+     * text would hold form D bytes, so the listed path is refused (on a volume that tells the forms apart, form D names
+     * another file), while the path made from a string is passed in form D.
+     */
+    @Test
+    void aListedNameInFormCIsRefusedOnlyUnderTheFormDProperty() throws Exception {
+        assumeTrue(System.getProperty("os.name").startsWith("Mac"), "the property exists only on macOS");
+        String name = "journal-caf\u00e9";
+        TestSupport.Result made = TestSupport.run(List.of("sh", "-c",
+                "mkdir -- \"$1/$(printf 'journal-caf\\303\\251')\"", "sh", tmp.toString()), 30);
+        assertEquals(0, made.exit(), made.stderr());
+        Path asListed = listed(name);
+        assertTrue(asListed != null, "listed");
+        byte[] formC = asListed.toString().getBytes(StandardCharsets.UTF_8);
+        if (Paths.NORMALIZE_TO_NFD) {
+            assertFalse(Paths.roundTrips(asListed.toString(), asListed));
+            List<Consumer<Path>> calls = List.of(p -> Reader.open(p).close(), Journal::verify, Retention::moveTo);
+            for (Consumer<Path> call : calls) {
+                IllegalArgumentException e = assertThrows(IllegalArgumentException.class, () -> call.accept(asListed));
+                assertTrue(e.getMessage().contains("useNormalizationFormD"), e.getMessage());
+            }
+            Path fromString = tmp.resolve(name);
+            assertTrue(Paths.roundTrips(fromString.toString(), fromString));
+            assertArrayEquals(java.text.Normalizer.normalize(fromString.toString(), java.text.Normalizer.Form.NFD)
+                    .getBytes(StandardCharsets.UTF_8), Paths.nativeBytes(fromString));
+        } else {
+            assertArrayEquals(formC, Paths.nativeBytes(asListed));
+            journal(asListed);
+            try (Reader r = Reader.open(asListed)) {
+                assertEquals(42, r.tryNext().getByte(0));
+            }
+        }
     }
 
     /** The property is on when empty or {@code true} (any case), as the JDK reads it, and only on macOS. */

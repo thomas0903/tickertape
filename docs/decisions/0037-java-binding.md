@@ -185,31 +185,48 @@ records, or records encoded field by field). Both allocate nothing per record.
   call and removed only by escape analysis passes on one JIT and fails on another, as `copyPayloadTo(ByteBuffer)` did
   on CI's macOS runner (the `MemorySegment.ofBuffer` wrapper and its scope object for a direct buffer, built on every
   call, which escape analysis removed on the local machine but not on the runner, with the same JDK build). The
-  operations:
-  - `append` with a `byte[]`, a native or heap `MemorySegment`, or a direct or heap `ByteBuffer`, of a payload no
-    larger than one the writer appended before (the scratch buffer grows otherwise); `appendBatch`; `nextSeq()`.
+  operations, each with the `AllocationTest` method that measures it:
+  - `append` with a native `MemorySegment`, passed to the library as it is, with no condition on its size
+    (`writerCallsAllocateNothing`, `theScratchConditionCountsOnlyPayloadsCopiedThroughIt`).
+  - `append` with a `byte[]`, a heap `MemorySegment`, or a direct, heap or read-only heap `ByteBuffer`, which are
+    copied through the writer's scratch buffer, of a payload no larger than the largest payload of these kinds the
+    writer was given before (`writerCallsAllocateNothing`). The condition is per source kind, as the code has it: a
+    native segment does not count, so the first `byte[]` append larger than every earlier copied payload allocates
+    even after larger native-segment appends, which `theScratchConditionCountsOnlyPayloadsCopiedThroughIt` measures
+    (the previous wording, "no larger than one appended before", was not true across kinds). One exception: after a
+    heap segment larger than `Integer.MAX_VALUE - 8` bytes, the next `ByteBuffer` append replaces the scratch buffer
+    with one of its own size.
+  - `appendBatch`; `nextSeq()` (`writerCallsAllocateNothing`).
   - `appendWith` whose filler uses `set`, `setByte`, `put(byte[])`, `put(MemorySegment)` of a native or heap segment,
     `put(ByteBuffer)` of a heap buffer, and `put(ByteBuffer)` of a direct buffer or a read-only heap buffer that is
     the same buffer of its kind as in the previous `put` of that kind (the writer remembers one of each; a copy from a
-    new one allocates a small object). Alternating one read-only and one direct buffer is measured too.
-  - `AppendBatch.add` with a `byte[]`, a native or heap `MemorySegment`, or a direct or heap `ByteBuffer`, into a
-    batch that does not grow (records and payload bytes within its capacity, which for a direct buffer must be at most
-    `Integer.MAX_VALUE - 8` payload bytes: above that, each such `add` builds a wrapper). A batch that grows allocates.
+    new one allocates a small object); alternating one read-only and one direct buffer (`writerCallsAllocateNothing`).
+  - `AppendBatch.add` with a `byte[]`, a native or heap `MemorySegment`, or a direct, heap or read-only heap
+    `ByteBuffer`, into a batch that does not grow (records and payload bytes within its capacity, which for a buffer
+    without an accessible array, a direct or a read-only heap one, must be at most `Integer.MAX_VALUE - 8` payload
+    bytes: above that, each such `add` builds a wrapper). A batch that grows allocates (`writerCallsAllocateNothing`).
   - For both readers: `tryNext`, `next()` and a timed `next` that find a record; the view's metadata accessors,
     `isValid()`, `getByte`, `get(layout)`, and `copyPayloadTo` a `MemorySegment`, a `byte[]`, a heap `ByteBuffer`, or a
-    direct `ByteBuffer` that is the same buffer as in the previous copy by that view.
-  - `tryReadBatch` and a timed `readBatch` that find records, `ReadBatch.get` of an index used before and its view's
-    accessors, and `copyPayloadTo` a direct `ByteBuffer` (the same one) from a batch's view.
+    direct `ByteBuffer` that is the same buffer as in the previous copy by that view
+    (`readerCallsAndViewsAllocateNothing`).
+  - `tryReadBatch` and a timed `readBatch` that find records; `ReadBatch.get` of an index used before; and on a
+    batch's view, the same accessors and copies as on a reader's view (`readerCallsAndViewsAllocateNothing`, which
+    measures each of these on its own; the previous version measured `tryReadBatch`, `get`, `getByte` and `seq`
+    together as one figure, and its list named accessors it did not measure).
 
-  Without escape analysis the test found three objects built per call: that wrapper, the same one in
-  `PayloadBuffer.put(ByteBuffer)` and `AppendBatch.add(ByteBuffer)`, and the two `MemorySegment`s an upcall creates for
+  The guide's list (`docs/java-api.md` &rarr; Allocation) is this list.
+
+  Without escape analysis the test found the same pattern, an object built on every call that only escape analysis
+  removes, in three places: that wrapper in `copyPayloadTo(ByteBuffer)`, the same wrapper in
+  `PayloadBuffer.put(ByteBuffer)` and `AppendBatch.add(ByteBuffer)`, and the `MemorySegment`s an upcall creates for
   the fill callback's pointer arguments (on every `appendWith`). The fill callback now receives its pointers as
   64-bit integers (`Signatures.POINTER_AS_LONG`; a pointer and an `int64_t` travel in the same register on every
   supported LP64 ABI, and `HeaderTest` still checks them as pointers); `AppendBatch` copies a direct buffer through a
   `ByteBuffer` view of its own memory; and a view, or a writer, remembers a segment over the last direct buffer it
-  used (`BufferSegment`; a writer also over the last read-only heap buffer, in a second slot), so repeated use of one
-  buffer allocates nothing and a new buffer costs one small object, which the documentation of those overloads
-  states. Remembering a buffer keeps it reachable, and with it whatever its memory keeps alive (an arena whose clean-up
+  used (`BufferSegment`; a writer remembers two buffers, the last direct one and the last read-only heap one, in two
+  slots, so a later fill from the other kind does not release the first, and `close()` releases both), so repeated
+  use of one buffer allocates nothing and a new buffer costs one small object, which the documentation of those
+  overloads states. Remembering a buffer keeps it reachable, and with it whatever its memory keeps alive (an arena whose clean-up
   action refers to the writer, say), so the rule is that nothing the caller passed in may be reachable from a global
   root. A writer's upcall stub is one (the JVM roots its target until the stub's arena is closed), and its target
   reaches the payload buffer; so the writer keeps its cache (`BufferCache`) itself and lends it to the payload buffer
@@ -219,7 +236,8 @@ records, or records encoded field by field). Both allocate nothing per record.
   and it is the caller's own root, not the binding's: a remembered buffer whose memory belongs to an automatic arena
   (`Arena.ofAuto()`) with a clean-up action that refers to the writer. The JDK's cleaner holds that action until the
   arena is unreachable, so an unclosed writer that still remembers such a buffer is not collected; `close()` drops
-  the cache and ends it. A view's cache is reachable only from the view, whose reader or batch no global root
+  the cache (both remembered buffers) and ends it. With a shared or confined arena nothing outside holds the action,
+  and an unclosed writer is collected (`LifetimeTest`, with a shared arena whose buffer refers back to the writer). A view's cache is reachable only from the view, whose reader or batch no global root
   reaches. CI pins Temurin `25.0.5`, which
   resolves to 25.0.5+8 on Linux and to the macOS-only respin 25.0.5.1+2 on macOS; the test no longer depends on which.
 
@@ -308,21 +326,30 @@ preferred this to defensive copies in the constructor and the accessor, which wo
 for a misuse that the documentation covers.
 
 **Paths.** The C ABI passes path bytes to the operating system unchanged, and the JDK offers no public way to read a
-`Path`'s bytes (`UnixPath` keeps them, `toString()` decodes them with `sun.jnu.encoding`). So the binding encodes
-`toString()` with that same charset (the first version always used UTF-8, which picks a different file under a
-non-UTF-8 locale), after the one other step the JDK takes on the way to the bytes: on macOS with
-`jdk.nio.path.useNormalizationFormD` enabled, the JDK normalizes a path's text to Unicode form D before encoding it
-(and shows it in form C), so the binding normalizes to form D too; otherwise an accented name could reach the library
-with other bytes than the JDK's own on a file system that tells the two forms apart. The charset and that property are
-read once, when the binding first converts a path, as the JDK reads its own at start-up; changing them later is not
-supported. It refuses, with `IllegalArgumentException` before any call, a path whose bytes the JDK could not
-decode: the decoded string holds U+FFFD and does not convert back to the same path (the JDK compares paths by their
-bytes). A name that legitimately contains U+FFFD round-trips and is accepted. We chose refusing over reading the bytes
-through implementation details (`toUri()`'s percent-encoding happens to expose them, but its form is unspecified):
-such names are rare, and a call that targets a sibling of the named journal, for example retention on the wrong
-directory, is not acceptable. `PathsTest` creates such a name on Linux (skipped where the file system refuses it, as
-APFS does) next to the sibling it decodes to, and tests the conversion of an accented name with the form-D setting
-passed in, both ways (the JDK reads its property at start-up, so one JVM cannot switch it).
+`Path`'s bytes (`UnixPath` keeps them, `toString()` decodes them with `sun.jnu.encoding`). So the binding passes a
+path only when its text provably stands for its bytes, and refuses it otherwise. The proof is a round trip, made for
+every path on every platform: `Path.of(p.toString()).equals(p)`, which the JDK decides by comparing bytes. When it
+holds, the path's bytes are those of its text encoded the JDK's way, so the binding encodes the text that way: with
+that same charset (the first version always used UTF-8, which picks a different file under a non-UTF-8 locale), after
+the one other step the JDK takes on the way to the bytes, which on macOS with `jdk.nio.path.useNormalizationFormD`
+enabled is normalizing the text to Unicode form D. When it fails, the binding throws `IllegalArgumentException` before
+any call. It fails in two known cases. A name the JDK could not decode: the decoded string holds U+FFFD (a name that
+legitimately contains U+FFFD round-trips and is accepted). And, with the form-D property on macOS, a path whose bytes
+are not in form D: the JDK shows every path's text in form C and encodes text in form D, so a path made from a string
+holds form D bytes, but an entry stored in form C keeps its bytes when `Files.list` or a directory stream returns it.
+The previous round normalized the text to form D whenever the property was set, which was right for the first kind of
+path and sent the wrong bytes for the second: on a volume that tells the forms apart, `Reader.open` of a listed entry
+then failed or opened a form-D sibling. Such a path is now refused, with a message that names the property and says to
+build the path from a string or to run without the property; without the property nothing changed. The charset and
+that property are read once, when the binding first converts a path, as the JDK reads its own at start-up; changing
+them later is not supported. We chose refusing over reading the bytes through implementation details (`toUri()`'s
+percent-encoding happens to expose them, but its form is unspecified): such names are rare, and a call that targets a
+sibling of the named journal, for example retention on the wrong directory, is not acceptable. `PathsTest` tests the
+decision directly, with the setting and the round-trip result passed in (no volume that tells form C from form D is at
+hand, and one JVM cannot switch the property, which the JDK reads at start-up); creates an undecodable name on Linux
+(skipped where the file system refuses it, as APFS does) next to the sibling it decodes to; and, on macOS, creates an
+entry in form C, which a listing returns as it is, and checks that it is refused under the property (run with it in
+the build) and passed unchanged without it.
 
 **Finding the library.** In this order, and the first library found must be compatible or loading fails (it never falls
 through to a later candidate after a failure): `Tickertape.loadLibrary(path)` before first use; the system property

@@ -38,9 +38,11 @@ import java.util.Optional;
  *
  * <p><b>Allocation.</b> The writer reuses one scratch buffer, its output memory and one {@link PayloadBuffer}, so once
  * warm the appends allocate nothing on the Java heap under the conditions that {@code docs/java-api.md} &rarr;
- * Allocation lists (and that the binding's allocation test measures): among them, a payload no larger than one
- * appended before (the scratch buffer grows otherwise), and for {@link PayloadBuffer#put(long, ByteBuffer)} of a direct
- * or read-only buffer, the same buffer as before.
+ * Allocation lists (and that the binding's allocation test measures): among them, for an append whose payload is
+ * copied through the scratch buffer (a {@code byte[]}, a heap {@link MemorySegment}, any {@link ByteBuffer}), a payload
+ * no larger than the largest such payload appended before (the scratch buffer grows otherwise; a native segment is
+ * passed as it is and does not count), and for {@link PayloadBuffer#put(long, ByteBuffer)} of a direct or read-only
+ * buffer, the same buffer as before.
  */
 @SuppressWarnings("restricted") // calls restricted java.lang.foreign methods; needs native access
 public final class Writer implements AutoCloseable {
