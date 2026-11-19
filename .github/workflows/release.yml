@@ -398,6 +398,8 @@ jobs:
           git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
             commit --quiet -m "tickertape $RELEASE_TAG"
           # The token reaches git through a credential helper only; it is never part of a URL or command line.
+          # The helper's own shell expands $1 and $TAP_TOKEN when git runs it, so they must stay in single quotes.
+          # shellcheck disable=SC2016
           git -c credential.helper= \
             -c credential.helper='!f() { test "$1" = get && printf "username=x-access-token\npassword=%s\n" "$TAP_TOKEN"; }; f' \
             push origin HEAD:main
