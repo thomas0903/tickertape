@@ -1,0 +1,56 @@
+service_name = "tt-fixture/ticks"
+
+[iceoryx2_version]
+major = 0
+minor = 10
+patch = 0
+
+[details]
+file_format_version = 1
+messaging_pattern = "PublishSubscribe"
+
+[details.types.payload]
+variant = "FixedSize"
+type_name = "tickertape_iceoryx2::example::Tick"
+size = 24
+alignment = 8
+
+[details.types.user_header]
+variant = "FixedSize"
+type_name = "tickertape_iceoryx2::example::TickHeader"
+size = 16
+alignment = 8
+
+[details.types.system_header]
+variant = "FixedSize"
+type_name = "iceoryx2::service::header::publish_subscribe::Header"
+size = 48
+alignment = 8
+
+
+### Recorded Data Start ###
+time:     0
+sys head: 0d 9c fe 6a 58 a3 a6 26 0b 02 01 00 3c 15 00 00 0d 9c fe 6a 80 5e 5e 27 0b 02 01 00 02 00 00 00 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 
+usr head: 00 00 00 00 00 00 00 00 68 3e b9 32 8e 5f e9 18 
+payload:  00 00 00 00 00 00 00 00 d4 88 98 00 00 00 00 00 01 00 00 00 00 00 00 00 
+
+time:     23
+sys head: 0d 9c fe 6a 58 a3 a6 26 0b 02 01 00 3c 15 00 00 0d 9c fe 6a 80 5e 5e 27 0b 02 01 00 02 00 00 00 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 
+usr head: 01 00 00 00 00 00 00 00 98 55 16 34 8e 5f e9 18 
+payload:  01 00 00 00 00 00 00 00 db 88 98 00 00 00 00 00 02 00 00 00 01 00 00 00 
+
+time:     40
+sys head: 0d 9c fe 6a 58 a3 a6 26 0b 02 01 00 3c 15 00 00 0d 9c fe 6a 80 5e 5e 27 0b 02 01 00 02 00 00 00 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 
+usr head: 02 00 00 00 00 00 00 00 50 84 1f 35 8e 5f e9 18 
+payload:  02 00 00 00 00 00 00 00 e2 88 98 00 00 00 00 00 03 00 00 00 00 00 00 00 
+
+time:     69
+sys head: 0d 9c fe 6a 58 a3 a6 26 0b 02 01 00 3c 15 00 00 0d 9c fe 6a 80 5e 5e 27 0b 02 01 00 02 00 00 00 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 
+usr head: 03 00 00 00 00 00 00 00 48 fa c8 36 8e 5f e9 18 
+payload:  03 00 00 00 00 00 00 00 e9 88 98 00 00 00 00 00 04 00 00 00 01 00 00 00 
+
+time:     81
+sys head: 0d 9c fe 6a 58 a3 a6 26 0b 02 01 00 3c 15 00 00 0d 9c fe 6a 80 5e 5e 27 0b 02 01 00 02 00 00 00 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 
+usr head: 04 00 00 00 00 00 00 00 b0 b0 86 37 8e 5f e9 18 
+payload:  04 00 00 00 00 00 00 00 f0 88 98 00 00 00 00 00 05 00 00 00 00 00 00 00 
+

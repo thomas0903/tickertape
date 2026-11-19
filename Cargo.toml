@@ -8,7 +8,7 @@ members = [
     "benches",
     "examples",
 ]
-exclude = ["fuzz", "compare", "bindings/python"]
+exclude = ["fuzz", "compare", "bindings/python", "integrations"]
 
 [workspace.package]
 version = "0.4.0"

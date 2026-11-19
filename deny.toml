@@ -24,6 +24,8 @@ allow = [
     "ISC",
     "Unicode-3.0",
     "Zlib",
+    # Public-domain equivalent; enum-iterator (required by iceoryx2, in integrations/iceoryx2) uses it.
+    "0BSD",
 ]
 confidence-threshold = 0.9
 # The list covers future dependencies too; don't warn about entries no current crate uses.
