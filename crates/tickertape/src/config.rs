@@ -3,10 +3,12 @@
 use std::time::Duration;
 
 /// What the writer does on open when it finds corruption after the last checkpoint: an invalid record or seal, a
-/// segment disconnected from the chain, or an empty commit word after which recovery finds evidence of committed
+/// segment disconnected from the chain, an empty commit word after which recovery finds evidence of committed
 /// history ([`CorruptReason::EmptyCommitWord`](crate::CorruptReason::EmptyCommitWord), or
-/// [`CorruptReason::UncheckedTail`](crate::CorruptReason::UncheckedTail) when its search stops at its work bound;
-/// `docs/crash-contract.md`, C11, and ADR 0035 have the rules).
+/// [`CorruptReason::UncheckedTail`](crate::CorruptReason::UncheckedTail) when its search stops at its work bound), or
+/// non-zero bytes after an empty commit word in front of a segment for the expected sequence number that exists but
+/// does not open ([`CorruptReason::BrokenChain`](crate::CorruptReason::BrokenChain); `docs/crash-contract.md`, C11,
+/// and ADR 0035 have the rules).
 ///
 /// A writer *process* crash in an otherwise intact journal usually does not produce this; power loss, storage errors
 /// or outside modification do. The exception (`docs/crash-contract.md`, C1): the payload of the record being written
@@ -28,7 +30,7 @@ pub enum RecoveryPolicy {
     /// Return [`Error::Corrupt`](crate::Error::Corrupt) from [`Writer::open`](crate::Writer::open) instead of
     /// quarantining or repairing anything. The bytes at the corrupt position it reports, and everything after them in
     /// that segment, are left untouched, and no segment is moved. The open is not read-only, though: before it scans
-    /// it may create the lock file and create or extend the checkpoint file, writes its PID into the lock file (best
+    /// it may create the lock file and the checkpoint file, writes its PID into the lock file (best
     /// effort) and removes stale temporary files, and it keeps what recovery changed earlier in the scan, including
     /// bytes zeroed in place, which after storage damage can be published records (`docs/crash-contract.md`, C11,
     /// lists these changes).
