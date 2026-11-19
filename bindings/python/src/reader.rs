@@ -36,18 +36,20 @@ const HAND_OFF: Duration = Duration::from_millis(10);
 /// only the first of them), the buffer keeps whatever capacity holds them, however large, until a later read delivers
 /// the last of them or a `seek` drops them.
 ///
+/// The rule is about capacity only: once every staged record has been delivered, the buffers are dropped if their
+/// total capacity exceeds this, and kept otherwise. No record count decides it, because the vectors are reused: a
+/// read grows them from whatever capacity earlier reads left, so the capacity after a batch depends on the reader's
+/// history, not only on the batch.
+///
 /// What it holds: every record takes 36 bytes of metadata (8 each for `seq`, `venue_ts_ns`, `local_ts_ns` and its
-/// payload offset, 4 for `schema_id`) plus its payload. `fill` reserves metadata room for up to 4,096 records and
-/// each vector then doubles as it fills, so `read_batch(10_000)` grows the metadata to room for 16,384 records
-/// (589,856 bytes), and any batch of 131,072 records or fewer to at most 4,718,848 bytes (room for 131,072 records;
-/// 100,000 empty records take exactly that). The metadata alone exceeds 6 MiB only above 131,072 records (8,388,864
-/// bytes at 131,073). The payload vector doubles from the first payload's length, so it ends below twice the
-/// payloads' total: 1 MiB for 10,000 payloads of 64 bytes (1.56 MiB in all), 3.125 MiB for 10,000 of 200 bytes (3.69
-/// MiB in all), and under 4.6 MB in all for any 10,000 payloads averaging up to 200 bytes. Why 6 MiB: it keeps all of
-/// these, and every smaller batch, for reuse. Whether a larger batch's buffer is kept depends only on the total
-/// capacity: a batch of more than 131,072 records, or one whose payload vector grew past 6 MiB, is always freed after
-/// delivery; a batch of 100,000 records is freed only if its payload vector grew past 1,572,608 bytes (6 MiB minus
-/// the 4,718,848 bytes of metadata).
+/// payload offset, 4 for `schema_id`) plus its payload. `fill` reserves metadata room for up to 4,096 more records
+/// and each vector then doubles as it fills. Examples, each the first read of a fresh reader: `read_batch(10_000)`
+/// grows the metadata to room for 16,384 records (589,856 bytes); 100,000 empty records take 4,718,848 bytes (room
+/// for 131,072 records), and 131,073 take 8,388,864, so their buffer is dropped. The payload vector doubles from the
+/// first payload's length, so it ends below twice the payloads' total: 1 MiB for 10,000 payloads of 64 bytes (1.56
+/// MiB in all), 3.125 MiB for 10,000 of 200 bytes (3.69 MiB in all). Why 6 MiB: it keeps these common batches for
+/// reuse. With another history the figures differ: a reader that first reads 2,049 empty records and then 131,073
+/// more ends with 4,721,408 bytes, and keeps them.
 const RETAINED_CAPACITY: usize = 6 << 20;
 
 /// States of the test hook behind `Reader::_race_commit_for_testing` (feature `test-hooks`).
@@ -742,6 +744,13 @@ pub struct Reader {
     /// Test hook state (`RACE_*`, see `_race_commit_for_testing`).
     #[cfg(feature = "test-hooks")]
     commit_race: AtomicU8,
+    /// Test hook state (`RACE_*`, see `_signal_after_commit_for_testing`).
+    #[cfg(feature = "test-hooks")]
+    signal_race: AtomicU8,
+    /// Test hook: set when a read has delivered its records, cleared as the method returns (`settle`); see
+    /// `_returning_for_testing`.
+    #[cfg(feature = "test-hooks")]
+    returning: AtomicBool,
     owner: Owner,
     path: PathBuf,
     durable_only: bool,
@@ -755,6 +764,15 @@ impl Reader {
             return Err(errors::closed("reader"));
         }
         Ok(())
+    }
+
+    /// The way out of every method that returns a result (`Owner::settle`): builds the exception if there is one,
+    /// then checks the owner, as the last thing the method does.
+    fn settle<T>(&self, py: Python<'_>, body: impl FnOnce() -> PyResult<T>) -> PyResult<T> {
+        let result = self.owner.settle(py, "Reader", body);
+        #[cfg(feature = "test-hooks")]
+        self.returning.store(false, Ordering::SeqCst);
+        result
     }
 
     /// Runs `f` on the open state with the lock held and the GIL released, then records the position. `Ok(None)` if
@@ -831,13 +849,11 @@ impl Reader {
     /// else advanced the cursor, so the loop makes progress.
     ///
     /// Fork: Python code that runs during the call (a signal handler, or a finalizer run by an allocation) may fork,
-    /// and the child resumes the call there. So the call checks the owner again on every way out that does not raise
-    /// an exception of that Python code: before every attempt to take the lock (each pass, `locked`,
-    /// `locked_attached`, `deliver`), before reporting a timeout or an empty non-blocking read, and before raising
-    /// `ValueError` for a closed reader or an error held back by an earlier batch. A child therefore raises
-    /// `UsedAfterForkError`, having consumed nothing. A returned value needs no check after the commit: `deliver`
-    /// checks immediately before it, and no Python code runs in between. An exception raised by a handler (or by
-    /// building the result) propagates unchanged, in the child too.
+    /// and the child resumes the call there. So the call checks the owner before every attempt to take the lock
+    /// (each pass, `locked`, `locked_attached`, `deliver`): a child never waits for a lock that a thread of the
+    /// parent may hold, and consumes nothing. Whatever the call returns or raises then passes through `settle`, in
+    /// the method that called this, which checks the owner as the method's last step: a child raises
+    /// `UsedAfterForkError` instead (also instead of an exception raised by a handler or by building the result).
     fn read<T, U>(
         &self,
         py: Python<'_>,
@@ -853,11 +869,8 @@ impl Reader {
         let no_wait = timeout == Timeout::ZERO;
         let deadline = timeout.deadline(Instant::now());
         let mut waited = false;
-        // In a forked child, `UsedAfterForkError` instead (see above).
         let closed = |waited: bool| {
-            if let Err(e) = self.owner.check(py, "Reader") {
-                e
-            } else if waited {
+            if waited {
                 errors::closed_while_waiting()
             } else {
                 errors::closed("reader")
@@ -885,11 +898,7 @@ impl Reader {
                     .ok_or_else(|| closed(waited))?;
                 match staged {
                     Some(staged) => staged,
-                    None => {
-                        // No signal check ran, but taking the lock may have re-acquired the GIL.
-                        self.owner.check(py, "Reader")?;
-                        return Ok(None);
-                    }
+                    None => return Ok(None),
                 }
             } else {
                 let (ready, slice) = self
@@ -916,9 +925,6 @@ impl Reader {
                         return Err(closed(waited));
                     }
                     if no_wait || deadline.is_some_and(|d| Instant::now() >= d) {
-                        // A handler that ran in the signal check above may have forked (`locked` re-acquired the
-                        // GIL too): the child must not report a timeout.
-                        self.owner.check(py, "Reader")?;
                         return Ok(None);
                     }
                     continue;
@@ -937,12 +943,7 @@ impl Reader {
                     epoch,
                     count,
                 } => (value, epoch, count),
-                Staged::Error(e) => {
-                    // Building the exception runs Python code.
-                    let error = errors::to_py(py, &e);
-                    self.owner.check(py, "Reader")?;
-                    return Err(error);
-                }
+                Staged::Error(e) => return Err(errors::to_py(py, &e)),
                 // Taken by another thread or a signal handler: look at the journal again.
                 Staged::Nothing => continue,
             };
@@ -976,6 +977,8 @@ impl Reader {
     ///
     /// After the commit, with the lock released, a staging buffer too large to keep is freed with the GIL released.
     /// That is after the last signal check, so a signal arriving meanwhile is handled once the call has returned.
+    /// From the commit to the method's return nothing checks signals or runs Python code; with the `test-hooks`
+    /// feature, `_signal_after_commit_for_testing` and `_returning_for_testing` let a test check that.
     fn deliver(&self, py: Python<'_>, epoch: u64, count: usize) -> PyResult<Option<bool>> {
         let mut queued = None;
         let mut attempt = 0u32;
@@ -1001,6 +1004,11 @@ impl Reader {
             let (delivered, oversized) = state.commit(epoch, count);
             self.position.store(state.position(), Ordering::Release);
             drop(guard);
+            #[cfg(feature = "test-hooks")]
+            if delivered {
+                self.returning.store(true, Ordering::SeqCst);
+                self.pause_for_signal_race(py);
+            }
             if let Some(columns) = oversized {
                 py.detach(move || drop(columns));
             }
@@ -1020,6 +1028,20 @@ impl Reader {
         {
             py.detach(|| wait_until(|| self.commit_race.load(Ordering::SeqCst) == RACE_RESUMED));
             self.commit_race.store(RACE_IDLE, Ordering::SeqCst);
+        }
+    }
+
+    /// Test only (see `_signal_after_commit_for_testing`): pauses an armed read right after it has delivered its
+    /// records, with the GIL released, until another thread has raised a signal.
+    #[cfg(feature = "test-hooks")]
+    fn pause_for_signal_race(&self, py: Python<'_>) {
+        if self
+            .signal_race
+            .compare_exchange(RACE_ARMED, RACE_PAUSED, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            py.detach(|| wait_until(|| self.signal_race.load(Ordering::SeqCst) == RACE_RESUMED));
+            self.signal_race.store(RACE_IDLE, Ordering::SeqCst);
         }
     }
 
@@ -1068,6 +1090,10 @@ impl Reader {
             contenders: AtomicUsize::new(0),
             #[cfg(feature = "test-hooks")]
             commit_race: AtomicU8::new(RACE_IDLE),
+            #[cfg(feature = "test-hooks")]
+            signal_race: AtomicU8::new(RACE_IDLE),
+            #[cfg(feature = "test-hooks")]
+            returning: AtomicBool::new(false),
             owner: Owner::current(),
             path,
             durable_only,
@@ -1078,23 +1104,25 @@ impl Reader {
     /// to continue after `DiscardedError`. If it succeeds, it also drops records held for an interrupted read and
     /// an error held back by a batch call; if it fails, the reader is unchanged.
     fn seek(&self, py: Python<'_>, seq: u64) -> PyResult<()> {
-        self.check(py)?;
-        let result = self
-            .locked(py, |s| {
-                let result = s.reader.seek(seq);
-                if result.is_ok() {
-                    s.buffer.reset();
-                    s.pending = None;
-                }
-                result
-            })?
-            .ok_or_else(|| errors::closed("reader"))?;
-        result.map_err(|e| errors::to_py(py, &e))
+        self.settle(py, || {
+            self.check(py)?;
+            let result = self
+                .locked(py, |s| {
+                    let result = s.reader.seek(seq);
+                    if result.is_ok() {
+                        s.buffer.reset();
+                        s.pending = None;
+                    }
+                    result
+                })?
+                .ok_or_else(|| errors::closed("reader"))?;
+            result.map_err(|e| errors::to_py(py, &e))
+        })
     }
 
     /// Returns the next committed record, or `None` if there is none yet. Never waits.
     fn try_next(&self, py: Python<'_>) -> PyResult<Option<Py<Record>>> {
-        self.read_one(py, Timeout::ZERO)
+        self.settle(py, || self.read_one(py, Timeout::ZERO))
     }
 
     /// Returns the next record, waiting up to `timeout` seconds for one (`None`, the default: wait forever). Returns
@@ -1102,7 +1130,9 @@ impl Reader {
     /// arrived meanwhile stays staged for the next read.
     #[pyo3(signature = (timeout=None), text_signature = "($self, timeout=None)")]
     fn next(&self, py: Python<'_>, timeout: Option<Timeout>) -> PyResult<Option<Py<Record>>> {
-        self.read_one(py, timeout.unwrap_or(Timeout::FOREVER))
+        self.settle(py, || {
+            self.read_one(py, timeout.unwrap_or(Timeout::FOREVER))
+        })
     }
 
     /// Up to `max_records` records as a list. Waits up to `timeout` seconds for the first one (default 0: don't
@@ -1119,22 +1149,16 @@ impl Reader {
         max_records: usize,
         timeout: Timeout,
     ) -> PyResult<Py<PyList>> {
-        let list = self.read(
-            py,
-            max_records,
-            timeout,
-            |buffer, n| buffer.records(py, n),
-            |records| Ok(PyList::new(py, records)?.unbind()),
-        )?;
-        list.map_or_else(
-            || {
-                // Allocating the empty list may run the garbage collector, and so finalizers that fork.
-                let empty = PyList::empty(py).unbind();
-                self.owner.check(py, "Reader")?;
-                Ok(empty)
-            },
-            Ok,
-        )
+        self.settle(py, || {
+            let list = self.read(
+                py,
+                max_records,
+                timeout,
+                |buffer, n| buffer.records(py, n),
+                |records| Ok(PyList::new(py, records)?.unbind()),
+            )?;
+            Ok(list.unwrap_or_else(|| PyList::empty(py).unbind()))
+        })
     }
 
     /// Like `read_many`, but returns the records as a columnar `RecordBatch`.
@@ -1148,29 +1172,28 @@ impl Reader {
         max_records: usize,
         timeout: Timeout,
     ) -> PyResult<Py<RecordBatch>> {
-        let batch = self.read(
-            py,
-            max_records,
-            timeout,
-            |buffer, n| buffer.batch(py, n),
-            |batch| Py::new(py, batch),
-        )?;
-        batch.map_or_else(
-            || {
-                // As in `read_many`.
-                let empty = Py::new(py, Columns::with_capacity(0).batch(py, 0, 0))?;
-                self.owner.check(py, "Reader")?;
-                Ok(empty)
-            },
-            Ok,
-        )
+        self.settle(py, || {
+            let batch = self.read(
+                py,
+                max_records,
+                timeout,
+                |buffer, n| buffer.batch(py, n),
+                |batch| Py::new(py, batch),
+            )?;
+            batch.map_or_else(
+                || Py::new(py, Columns::with_capacity(0).batch(py, 0, 0)),
+                Ok,
+            )
+        })
     }
 
     /// The sequence number of the next record this reader will return. Never blocks.
     #[getter]
     fn position(&self, py: Python<'_>) -> PyResult<u64> {
-        self.check(py)?;
-        Ok(self.position.load(Ordering::Acquire))
+        self.settle(py, || {
+            self.check(py)?;
+            Ok(self.position.load(Ordering::Acquire))
+        })
     }
 
     /// Whether this reader returns only checkpointed (durable) records.
@@ -1211,8 +1234,11 @@ impl Reader {
     }
 
     fn __enter__(slf: Bound<'_, Self>) -> PyResult<Bound<'_, Self>> {
-        slf.get().check(slf.py())?;
-        Ok(slf)
+        let (py, reader) = (slf.py(), slf.clone());
+        reader.get().settle(py, move || {
+            slf.get().check(py)?;
+            Ok(slf)
+        })
     }
 
     #[pyo3(signature = (*_args))]
@@ -1235,8 +1261,10 @@ impl Reader {
 
     /// Test only: the staging buffer's capacity in bytes (see `RETAINED_CAPACITY`).
     fn _staging_capacity_for_testing(&self, py: Python<'_>) -> PyResult<usize> {
-        self.locked_attached(py, |s| s.buffer.columns.capacity())?
-            .ok_or_else(|| errors::closed("reader"))
+        self.settle(py, || {
+            self.locked_attached(py, |s| s.buffer.columns.capacity())?
+                .ok_or_else(|| errors::closed("reader"))
+        })
     }
 
     /// Test only (feature `test-hooks`), with `_race_commit_for_testing`: the next read that builds a result pauses
@@ -1255,31 +1283,76 @@ impl Reader {
     /// if the read keeps retrying). Feature `test-hooks` only.
     #[cfg(feature = "test-hooks")]
     fn _race_commit_for_testing(&self, py: Python<'_>, signum: i32) -> PyResult<bool> {
-        if !py.detach(|| wait_until(|| self.commit_race.load(Ordering::SeqCst) == RACE_PAUSED)) {
-            return Ok(false);
+        self.settle(py, || {
+            if !py.detach(|| wait_until(|| self.commit_race.load(Ordering::SeqCst) == RACE_PAUSED))
+            {
+                return Ok(false);
+            }
+            let guard = lock(py, &self.inner);
+            self.commit_race.store(RACE_RESUMED, Ordering::SeqCst);
+            let queued = py.detach(|| wait_until(|| self.contenders.load(Ordering::SeqCst) > 0));
+            let raised = if queued {
+                py.import("signal")?
+                    .call_method1("raise_signal", (signum,))
+                    .map(|_| {
+                        py.detach(|| wait_until(|| self.contenders.load(Ordering::SeqCst) == 0))
+                    })
+            } else {
+                Ok(false)
+            };
+            drop(guard);
+            raised
+        })
+    }
+
+    /// Test only (feature `test-hooks`), with `_signal_after_commit_for_testing`: the next read that delivers records
+    /// pauses right after the delivery.
+    #[cfg(feature = "test-hooks")]
+    fn _arm_signal_after_commit_for_testing(&self) {
+        self.signal_race.store(RACE_ARMED, Ordering::SeqCst);
+    }
+
+    /// Test only, from a second thread while the main thread reads: waits until the armed read has delivered its
+    /// records and paused (see `_arm_signal_after_commit_for_testing`), raises signal `signum` (the C-level handler
+    /// runs in this thread; the Python handler runs in the main thread at its next signal check or bytecode), and lets
+    /// the read go on. Returns whether the read paused within 10 s and the signal was raised. Feature `test-hooks`
+    /// only. (It returns no `PyResult`, so it does not pass through `settle`, which would clear the flag that
+    /// `_returning_for_testing` reads while the read is still returning.)
+    #[cfg(feature = "test-hooks")]
+    fn _signal_after_commit_for_testing(&self, py: Python<'_>, signum: i32) -> bool {
+        if !py.detach(|| wait_until(|| self.signal_race.load(Ordering::SeqCst) == RACE_PAUSED)) {
+            return false;
         }
-        let guard = lock(py, &self.inner);
-        self.commit_race.store(RACE_RESUMED, Ordering::SeqCst);
-        let queued = py.detach(|| wait_until(|| self.contenders.load(Ordering::SeqCst) > 0));
-        let raised = if queued {
-            py.import("signal")?
-                .call_method1("raise_signal", (signum,))
-                .map(|_| py.detach(|| wait_until(|| self.contenders.load(Ordering::SeqCst) == 0)))
-        } else {
-            Ok(false)
-        };
-        drop(guard);
+        let raised = py
+            .import("signal")
+            .and_then(|signal| signal.call_method1("raise_signal", (signum,)))
+            .is_ok();
+        self.signal_race.store(RACE_RESUMED, Ordering::SeqCst);
         raised
+    }
+
+    /// Test only (feature `test-hooks`): whether a read of this reader has delivered its records and not yet returned.
+    /// A signal handler that sees `True` ran inside the read, after the delivery.
+    #[cfg(feature = "test-hooks")]
+    fn _returning_for_testing(&self) -> bool {
+        self.returning.load(Ordering::SeqCst)
     }
 
     /// A new iterator over the records committed so far: it stops at the first position without one (it doesn't
     /// wait) and then stays exhausted. It reads from this reader's cursor, so iterating again later (with a new
     /// iterator) continues from there. Use `next(timeout=...)` or `read_many` to follow live.
-    fn __iter__(slf: Bound<'_, Self>) -> PyResult<ReaderIterator> {
-        slf.get().check(slf.py())?;
-        Ok(ReaderIterator {
-            reader: slf.unbind(),
-            exhausted: AtomicBool::new(false),
+    fn __iter__(slf: Bound<'_, Self>) -> PyResult<Py<ReaderIterator>> {
+        let (py, reader) = (slf.py(), slf.clone());
+        reader.get().settle(py, move || {
+            slf.get().check(py)?;
+            // Built here, before the owner check in `settle`: allocating the object may run the garbage collector.
+            Py::new(
+                py,
+                ReaderIterator {
+                    reader: slf.unbind(),
+                    exhausted: AtomicBool::new(false),
+                },
+            )
         })
     }
 
@@ -1330,15 +1403,18 @@ impl ReaderIterator {
     }
 
     fn __next__(&self, py: Python<'_>) -> PyResult<Py<Record>> {
-        if self.exhausted.load(Ordering::Acquire) {
-            return Err(PyStopIteration::new_err(()));
-        }
-        match self.reader.get().read_one(py, Timeout::ZERO)? {
-            Some(record) => Ok(record),
-            None => {
-                self.exhausted.store(true, Ordering::Release);
-                Err(PyStopIteration::new_err(()))
+        let reader = self.reader.get();
+        reader.settle(py, || {
+            if self.exhausted.load(Ordering::Acquire) {
+                return Err(PyStopIteration::new_err(()));
             }
-        }
+            match reader.read_one(py, Timeout::ZERO)? {
+                Some(record) => Ok(record),
+                None => {
+                    self.exhausted.store(true, Ordering::Release);
+                    Err(PyStopIteration::new_err(()))
+                }
+            }
+        })
     }
 }

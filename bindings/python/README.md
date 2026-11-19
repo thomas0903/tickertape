@@ -126,8 +126,14 @@ NumPy, pyarrow and pandas are optional and imported only when these methods are 
   fork is never released in the child: its state may be half-updated, and the dead thread's frame keeps a reference
   to it anyway, so its descriptors (for a writer, including the lock) stay open until the child exits or calls
   `exec`. A read that a signal handler interrupted to fork raises `UsedAfterForkError` in the child when the handler
-  returns, having consumed nothing (also if its timeout passed meanwhile or the handler closed the reader). Open handles in the child after it starts, or use the `spawn` or `forkserver`
-  start method.
+  returns, having consumed nothing (also if its timeout passed meanwhile or the handler closed the reader). More
+  generally, the owner check is the last thing the bindings do before they hand a result or an exception back to the
+  interpreter (an exception object is built before it): if Python code forks during a call (a signal handler, or a
+  finalizer run by the garbage collector), the call raises `UsedAfterForkError` in the child, whatever it would have
+  returned or raised. A fork that happens after that, while the interpreter delivers the result (stores it, adds a
+  traceback entry, or runs a signal handler), is after the call. Arguments are converted before a method runs, so an
+  invalid argument raises its `TypeError` (or `OverflowError`) in any process. Open handles in the child after it
+  starts, or use the `spawn` or `forkserver` start method.
 - Free-threaded Python: no free-threaded wheels are published (abi3 wheels cannot load there). Building from the
   sdist for 3.14t works and runs without the GIL, but it is not tested in CI.
 

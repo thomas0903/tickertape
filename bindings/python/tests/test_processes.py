@@ -10,6 +10,7 @@ import sys
 import textwrap
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -402,6 +403,13 @@ def test_handles_refuse_use_after_fork(journal: Path, prefault: bool) -> None:
 # checks what is guaranteed, whenever the signal arrives: if the read raised, it consumed nothing (the cursor is still
 # at 0, as it was when the handler ran, and the next read returns all the records); if it returned, exactly the
 # returned records were consumed (the cursor is at the end, and was when a late handler ran).
+#
+# What this test cannot tell apart: a handler that ran after the read returned (before Python stored the result) and
+# one that ran inside the read after it delivered its records (which a binding that checked signals after the
+# delivery would do). Both see the final cursor with nothing stored, and the interpreter runs handlers between a
+# call's return and the assignment of its result, so nothing visible from Python separates them. This test checks the
+# user-visible guarantee; `test_nothing_runs_python_code_between_the_delivery_and_the_return` (test hooks) checks the
+# other half: that a read runs no signal handler and no other Python code from the delivery to its return.
 INTERRUPTED_WHILE_BUILDING = """
     import random, signal, sys, time
     import tickertape as tt
@@ -475,7 +483,8 @@ INTERRUPTED_WHILE_BUILDING = """
                 delivered += 1
             elif position != 0:
                 # The read returned and the handler raised before Python stored the result (after the final signal
-                # check): the returned records were consumed, and the value is lost.
+                # check): the returned records were consumed, and the value is lost. (A handler that ran inside the
+                # read after its delivery would look the same; the test-hooks test named above rules that out.)
                 assert position == count and seen == [count], (position, seen)
                 after_return += 1
                 continue
@@ -1036,3 +1045,127 @@ def test_fork_in_a_signal_handler_during_a_read_does_not_hang_the_child(journal:
     runs = int(os.environ.get("TICKERTAPE_DELIVERY_RUNS", "20" if where == "deliver" else "3"))
     out = run_script(FORK_IN_HANDLER, journal, where, runs, timeout=60 + 11 * runs).strip()
     assert out == "['refused']", out
+
+
+# A finalizer forks while the binding builds the exception that a call on a closed handle raises. On CPython 3.11 the
+# garbage collector runs inside the allocation that crosses its threshold, so with the threshold at 1 and a garbage
+# cycle whose finalizer forks, the first garbage-collected allocation in the call runs the finalizer there. In these
+# calls that is the exception object (`ValueError`, built from the error PyO3 created lazily): the child resumes
+# building it, and must raise `UsedAfterForkError` all the same, because the owner check comes after the exception is
+# built (`Owner::settle`). From 3.12 on, the collector runs only at the interpreter's next check, after the call, so
+# the test needs 3.11. The calls are bound before the collector is armed (a bound method is a garbage-collected
+# object).
+FORK_WHILE_RAISING = """
+    import gc, os, sys
+    import tickertape as tt
+
+    path, call = sys.argv[1], sys.argv[2]
+    writer = tt.Writer(path, segment_size=1 << 20)
+    reader = tt.Reader(path)
+    owner, name = call.split(".")
+    handle = writer if owner == "writer" else reader
+    handle.close()
+    args = {"append": (b"x",), "read_many": (10,), "read_batch": (10,), "seek": (0,)}.get(name, ())
+    function = getattr if name in ("position", "next_seq") else getattr(handle, name)
+    if function is getattr:
+        args = (handle, name)
+    forked = []
+
+    class Forker:
+        def __del__(self):
+            forked.append(os.fork())
+
+    gc.collect()
+    gc.disable()
+    cycle = Forker()
+    cycle.cycle = cycle
+    del cycle
+    gc.set_threshold(1)
+    keep = [[] for _ in range(10)]  # well past the threshold
+    gc.enable()
+    try:
+        function(*args)
+    except tt.UsedAfterForkError:
+        outcome = "refused"
+    except ValueError:
+        outcome = "ValueError"
+    except BaseException as error:
+        outcome = type(error).__name__
+    else:
+        outcome = "returned"
+    gc.set_threshold(700)
+    if forked == [0]:
+        os._exit({"refused": 0, "ValueError": 3}.get(outcome, 4))
+    assert len(forked) == 1, "the finalizer did not run inside the call"
+    _, status = os.waitpid(forked[0], 0)
+    child = {0: "refused", 3: "ValueError", 4: "other"}.get(os.waitstatus_to_exitcode(status), "exit")
+    print(outcome, child)
+"""
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs fork")
+@pytest.mark.skipif(sys.version_info[:2] != (3, 11), reason="the garbage collector runs inside allocations only on 3.11")
+@pytest.mark.parametrize("call", ["reader.try_next", "reader.read_many", "reader.read_batch", "reader.seek",
+                                  "reader.position", "reader.__iter__", "writer.append", "writer.next_seq",
+                                  "writer.checkpoint", "writer.__enter__"])
+def test_fork_while_the_exception_is_built_raises_used_after_fork_in_the_child(journal: Path, call: str) -> None:
+    assert run_script(FORK_WHILE_RAISING, journal, call).split() == ["ValueError", "refused"]
+
+
+@needs_test_hooks
+@pytest.mark.parametrize("size", ["small", "oversized"])
+@pytest.mark.parametrize("call", ["try_next", "iter", "next", "read_many", "read_batch"])
+def test_nothing_runs_python_code_between_the_delivery_and_the_return(journal: Path, call: str, size: str) -> None:
+    """A read runs no signal handler and no other Python code from the delivery of its records to its return.
+
+    The read pauses right after the delivery while another thread raises a signal (`_signal_after_commit_for_testing`),
+    then goes on. If anything in the rest of the call checked signals or ran Python code (which checks them too), the
+    handler would run inside the read, and see `_returning_for_testing()` true; it must run only once the call has
+    returned. "oversized" also covers freeing a staging buffer too large to keep, which happens in that stretch.
+    """
+    count = 1 if call in ("try_next", "iter", "next") else 1024
+    big = size == "oversized"
+    with tt.Writer(journal, segment_size=64 << 20) as w:
+        if count == 1:
+            w.append(b"x" * ((7 << 20) if big else 100))
+        else:
+            w.append_many([b"x" * (7168 if big else 16)] * count)  # 7 MiB in all: more than RETAINED_CAPACITY
+    seen: list[tuple[bool, int]] = []
+    runs = int(os.environ.get("TICKERTAPE_DELIVERY_RUNS", "20"))
+    with tt.Reader(journal) as reader:
+        returning = getattr(reader, "_returning_for_testing")  # test hooks, not in the stubs
+        arm = getattr(reader, "_arm_signal_after_commit_for_testing")
+        race = getattr(reader, "_signal_after_commit_for_testing")
+        reads: dict[str, Callable[[], object]] = {
+            "try_next": reader.try_next,
+            "iter": lambda: next(iter(reader)),
+            "next": lambda: reader.next(timeout=5),
+            "read_many": lambda: reader.read_many(count),
+            "read_batch": lambda: reader.read_batch(count),
+        }
+
+        def handler(signum: int, frame: object) -> None:
+            seen.append((returning(), reader.position))
+
+        previous = signal.signal(signal.SIGUSR1, handler)
+        try:
+            for _ in range(runs):
+                reader.seek(0)
+                seen.clear()
+                arm()
+                raced: list[bool] = []
+                helper = threading.Thread(target=lambda: raced.append(race(signal.SIGUSR1)))
+                helper.start()
+                got = reads[call]()
+                helper.join()
+                deadline = time.monotonic() + 5
+                while not seen and time.monotonic() < deadline:
+                    time.sleep(0.001)  # the handler runs at the main thread's next check
+                assert raced == [True]
+                assert seen == [(False, count)], seen  # it ran after the read had returned
+                if count == 1:
+                    assert isinstance(got, tt.Record)
+                else:
+                    assert isinstance(got, (list, tt.RecordBatch)) and len(got) == count
+        finally:
+            signal.signal(signal.SIGUSR1, previous)

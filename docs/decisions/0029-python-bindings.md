@@ -144,12 +144,14 @@ example repeated `seek`s, which also make the read start over) can delay a deliv
 interruptible, since every attempt is preceded by a signal check.
 
 After delivering the last staged record, a read keeps the buffer's capacity for the next read if it is at most 6 MiB
-(6,291,456 bytes, all columns together): `read_batch(10_000)` grows the columns to 1.56 MiB with 64-byte payloads and
-3.69 MiB with 200-byte ones (the vectors double as they fill), so the common batch sizes reuse their buffer, which made
-`read_batch` measurably faster. Whether a buffer is kept depends only on its capacity, not on the number of records:
-the metadata of up to 131,072 records takes at most 4,718,848 bytes (100,000 empty records take exactly that, and
-their buffer is kept), so such a batch is freed only if its payloads grew their vector past the remaining 1,572,608
-bytes; above 131,072 records the metadata alone exceeds 6 MiB. A larger buffer is swapped for an unallocated one under the mutex (nothing is allocated or freed between the final
+(6,291,456 bytes, all columns together), and drops it if its total capacity exceeds that. The rule is about capacity
+only, and no record count decides it: the vectors are reused and grow (doubling) from whatever capacity earlier reads
+left, so the capacity after a batch depends on the reader's history. Examples, each the first read of a fresh reader:
+`read_batch(10_000)` grows the columns to 1.56 MiB with 64-byte payloads and 3.69 MiB with 200-byte ones, so the
+common batch sizes reuse their buffer, which made `read_batch` measurably faster; 100,000 empty records take
+4,718,848 bytes and their buffer is kept, while 131,073 take 8,388,864 and theirs is dropped. With another history
+the figures differ: a reader that first reads 2,049 empty records and then 131,073 more ends with 4,721,408 bytes and
+keeps them. A larger buffer is swapped for an unallocated one under the mutex (nothing is allocated or freed between the final
 signal check and the commit) and freed synchronously after the mutex is released, with the GIL released, before the
 call returns. That happens after the commit, so a signal arriving while it runs is handled when the call returns (the
 boundary above). A successful `seek` frees it too. So the bound is exact in this sense: whenever no record is staged,
@@ -183,7 +185,18 @@ handler (or a finalizer) that forks during a read returns into the read in both 
 owner again before every attempt to take its mutex, not only when a call starts (in the loop that waits for records,
 before each lock, and in every try-lock attempt of the delivery), and the read raises `UsedAfterForkError` in the child,
 having consumed nothing, instead of waiting for ever for a mutex held by a thread that exists only in the parent. The
-writer runs no Python code between its check and taking its mutex. Its descriptors, including the writer's lock file,
+writer runs no Python code between its check and taking its mutex. Python code can also run, and fork, after the last
+of those checks: a finalizer run by the garbage collector when the call allocates its result or its exception (on
+CPython 3.11 the collector runs inside allocations; PyO3 builds an exception created with `PyErr::new` only once the
+method has returned). So every method of a handle that returns a result does so through one helper,
+`Owner::settle`: it takes the method's body as a closure (so every `?` and `return` passes through it), builds the
+exception object if there is one, and then checks the owner, replacing the result or exception with
+`UsedAfterForkError` in a child. The boundary is exact in this sense: the owner check is the last thing the binding
+does before it hands a result or an exception back to the interpreter, and a fork that happens after that, while the
+interpreter delivers the result (storing it, adding a traceback entry, running a signal handler), is after the call.
+Arguments are converted by PyO3 before the method runs, so an invalid argument raises its conversion error in any
+process. A unit test checks the source of every such method for that form, and a test on 3.11 forks in a finalizer
+while the exception for a closed handle is built. Its descriptors, including the writer's lock file,
 stay open until the child exits or execs. Handles must be opened after forking, or the `spawn`/`forkserver` start method
 used.
 
@@ -238,11 +251,14 @@ requests or branches. The one-time setup is in `docs/playbooks/release-checklist
   writer or a reader, use after `fork`, a child releasing the journal while it still runs, a handle whose lock was
   held at the fork, a fork while threads are inside calls, reused process ids, timeouts, the staging capacity an idle
   reader keeps, pickling of every exception (also with deleted attributes), context managers, the writer lock and
-  cross-language fixtures against the Rust CLI and the pure-Python decoder, and a signal handler that forks during a
-  read. Test-only methods (`_..._for_testing`) exist on the classes for the hooks. Those that can wedge a handle
-  (`_lock_forever_for_testing`, `_arm_commit_race_for_testing`, `_race_commit_for_testing`) are compiled only with the
-  crate's `test-hooks` feature: the CI test job builds with it, release wheels are built without it, and the wheel
+  cross-language fixtures against the Rust CLI and the pure-Python decoder, a signal handler that forks during a
+  read, a finalizer that forks while a call's exception is built (3.11), and a signal raised right after a read's
+  delivery, whose handler must run only once the read has returned (test hooks). Test-only methods
+  (`_..._for_testing`) exist on the classes for the hooks. Those that can wedge a handle or pause a read
+  (`_lock_forever_for_testing`, `_arm_commit_race_for_testing`, `_race_commit_for_testing`,
+  `_arm_signal_after_commit_for_testing`, `_signal_after_commit_for_testing`, `_returning_for_testing`) are compiled
+  only with the crate's `test-hooks` feature: the CI test job builds with it, release wheels are built without it, and the wheel
   workflow runs the test suite against each release wheel as shipped (the tests that need those hooks skip, saying
   why). The read-only `_staging_capacity_for_testing`, and `_set_owner_pid_for_testing`, which can only make a handle
   refuse use, stay in every build. `cargo test --manifest-path bindings/python/Cargo.toml` runs the conversion unit
-  tests.
+  tests and the source check that every method of a handle returns through `Owner::settle`.

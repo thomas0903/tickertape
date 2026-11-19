@@ -13,7 +13,7 @@ import signal
 import sys
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -435,12 +435,28 @@ def test_append_many_propagates_the_exception_of_a_metadata_objects_iter(journal
     class NotIterable:
         __iter__ = None
 
+    def removes_its_iter(error: BaseException) -> Any:
+        """A sequence whose `__iter__` removes itself from its class and then raises: the binding must decide before
+        calling `iter()` that the exception is the object's own (afterwards the class has no `__iter__`)."""
+
+        class RemovesItsIter:
+            def __getitem__(self, index: int) -> int:
+                return 0
+
+            def __iter__(self) -> Iterator[int]:
+                delattr(type(self), "__iter__")
+                raise error
+
+        return RemovesItsIter()
+
+    makers: tuple[Callable[[BaseException], Any], ...] = (Unreadable, HiddenUnreadable, removes_its_iter)
+
     match = re.match("a", "a")  # supports indexing (a mapping-only __getitem__) but not iteration
     assert match is not None
 
     with tt.Writer(journal) as w:
         for error in (KeyboardInterrupt(), RuntimeError("no values today"), TypeError("not like this")):
-            for cls in (Unreadable, HiddenUnreadable):
+            for cls in makers:
                 for name in ("schema_id", "venue_ts_ns", "local_ts_ns"):
                     with pytest.raises(type(error)) as caught:
                         w.append_many([b"a", b"b"], **{name: cls(error)})
@@ -700,8 +716,10 @@ def test_an_idle_reader_does_not_keep_a_large_delivered_batch(journal: Path, cal
 
 
 def test_the_staging_bound_depends_on_capacity_not_on_the_record_count(journal: Path) -> None:
-    """100,000 empty records grow the staging columns to 4,718,848 bytes (the figure documented in src/reader.rs),
-    below the bound, so their buffer is kept; 131,073 exceed it with metadata alone, so theirs is freed."""
+    """The figures documented in src/reader.rs. In a fresh reader, 100,000 empty records grow the staging columns to
+    4,718,848 bytes, below the bound, so their buffer is kept, and 131,073 more then grow them past it, so theirs is
+    freed. A reader that first read 2,049 empty records keeps the buffer of 131,073 more (4,721,408 bytes): the
+    vectors grow from the capacity they had, so no record count decides."""
     with tt.Writer(journal, segment_size=64 << 20) as w:
         w.append_many([b""] * 300_000)
     with tt.Reader(journal) as r:
@@ -710,6 +728,11 @@ def test_the_staging_bound_depends_on_capacity_not_on_the_record_count(journal: 
         assert capacity() == 4_718_848
         assert len(r.read_batch(131_073)) == 131_073
         assert capacity() == 0
+    with tt.Reader(journal) as r:
+        capacity = getattr(r, "_staging_capacity_for_testing")
+        assert len(r.read_batch(2_049)) == 2_049
+        assert len(r.read_batch(131_073)) == 131_073
+        assert capacity() == 4_721_408 <= RETAINED_CAPACITY
 
 
 @needs_test_hooks

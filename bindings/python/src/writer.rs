@@ -5,12 +5,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError, TryLockError};
 
 use pyo3::buffer::PyBuffer;
-use pyo3::exceptions::{PyMemoryError, PyTypeError, PyValueError};
+use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::pybacked::PyBackedBytes;
 use pyo3::sync::MutexExt;
 use pyo3::types::{
-    PyByteArray, PyBytes, PyInt, PyList, PyMemoryView, PyRange, PyString, PyTuple, PyType,
+    PyByteArray, PyBytes, PyInt, PyIterator, PyList, PyMemoryView, PyRange, PyString, PyTuple,
+    PyType,
 };
 use tickertape::{NewRecord, WriterConfig};
 
@@ -103,7 +104,7 @@ impl<T: Copy + for<'a, 'py> FromPyObject<'a, 'py>> Column<T> {
             return obj.extract::<T>().map(Column::All).map_err(Into::into);
         }
         let mut values = Vec::with_capacity(len);
-        for item in obj.try_iter().map_err(|e| not_iterable(obj, e, name))? {
+        for item in iterate(obj, name)? {
             // The iterator's own exception comes first (it may be KeyboardInterrupt).
             let item = item?;
             if values.len() == len {
@@ -130,24 +131,30 @@ impl<T: Copy + for<'a, 'py> FromPyObject<'a, 'py>> Column<T> {
     }
 }
 
-/// The error for a metadata argument that `iter()` refused: the exception that its type's `__iter__` raised,
-/// unchanged (it may be `KeyboardInterrupt`), or a `TypeError` naming the argument if the interpreter cannot iterate
-/// the object at all. If that cannot be decided, the original exception.
+/// `iter(obj)` for a metadata argument. An exception raised by the object's own `__iter__` propagates unchanged (it
+/// may be `KeyboardInterrupt`); if the interpreter cannot iterate the object at all, a `TypeError` naming the argument.
 ///
-/// `iter()` decides as follows: if the type's iterator slot (`tp_iter`) is filled, it calls it; otherwise, if the
-/// object passes the sequence check (`PySequence_Check`: a sequence item slot, as a class's `__getitem__` fills it but
-/// a C type's mapping-only `__getitem__`, such as `re.Match`'s, does not), it returns an index iterator, which
-/// cannot fail except for lack of memory; otherwise it refuses. The interpreter fills `tp_iter` from an `__iter__` in
-/// the dictionaries of the type and its bases, and `__iter__ = None` fills it with a slot that refuses (see
-/// `iter_slot`). So: an `__iter__` that is not `None` raised its own exception; with `__iter__ = None`, or without
-/// any `__iter__` (where a sequence would not have failed), the interpreter refused, unless it ran out of memory.
-fn not_iterable(obj: &Bound<'_, PyAny>, error: PyErr, name: &str) -> PyErr {
-    match iter_slot(&obj.get_type()) {
-        Ok(Some(false) | None) if !error.is_instance_of::<PyMemoryError>(obj.py()) => {
-            PyTypeError::new_err(format!("{name} must be an int or a sequence of ints"))
-        }
-        Ok(_) | Err(_) => error,
+/// Which of the two happened is decided before `iter()` is called, from the type's MRO (`iter_slot`), because the
+/// object's `__iter__` may change its class before it raises. `iter()` decides as follows: if the type's iterator
+/// slot (`tp_iter`) is filled, it calls it; otherwise, if the object passes the sequence check (`PySequence_Check`: a
+/// sequence item slot, as a class's `__getitem__` fills it but a C type's mapping-only `__getitem__`, such as
+/// `re.Match`'s, does not), it returns an index iterator; otherwise it refuses with `TypeError`. The interpreter fills
+/// `tp_iter` from an `__iter__` in the dictionaries of the type and its bases, and `__iter__ = None` fills it with a
+/// slot that refuses with `TypeError`. So with an `__iter__` that is not `None`, `iter()` runs it and whatever it
+/// raises propagates. Without one, or with `__iter__ = None`, `iter()` runs no Python code of the object, and a
+/// `TypeError` it raises is the interpreter's refusal, replaced by the binding's; anything else (`MemoryError`)
+/// propagates.
+fn iterate<'py>(obj: &Bound<'py, PyAny>, name: &str) -> PyResult<Bound<'py, PyIterator>> {
+    if iter_slot(&obj.get_type())? == Some(true) {
+        return obj.try_iter();
     }
+    obj.try_iter().map_err(|error| {
+        if error.is_instance_of::<PyTypeError>(obj.py()) {
+            PyTypeError::new_err(format!("{name} must be an int or a sequence of ints"))
+        } else {
+            error
+        }
+    })
 }
 
 /// The `__iter__` that fills `ty`'s iterator slot: `None` if no class in its MRO defines one (the slot is empty),
@@ -221,6 +228,12 @@ impl Writer {
             return Err(errors::closed("writer"));
         }
         Ok(())
+    }
+
+    /// The way out of every method that returns a result (`Owner::settle`): builds the exception if there is one,
+    /// then checks the owner, as the last thing the method does.
+    fn settle<T>(&self, py: Python<'_>, body: impl FnOnce() -> PyResult<T>) -> PyResult<T> {
+        self.owner.settle(py, "Writer", body)
     }
 
     /// Runs `f` on the open core writer, with the mutex held and the GIL held. `f` must not run Python code.
@@ -320,17 +333,19 @@ impl Writer {
         venue_ts_ns: u64,
         local_ts_ns: u64,
     ) -> PyResult<u64> {
-        self.check(py)?;
-        let payload = Payload::extract(payload)?;
-        let result = self.with(py, |w| {
-            w.append(&NewRecord {
-                schema_id,
-                venue_ts_ns,
-                local_ts_ns,
-                payload: payload.as_slice(),
-            })
-        })?;
-        convert(py, result)
+        self.settle(py, || {
+            self.check(py)?;
+            let payload = Payload::extract(payload)?;
+            let result = self.with(py, |w| {
+                w.append(&NewRecord {
+                    schema_id,
+                    venue_ts_ns,
+                    local_ts_ns,
+                    payload: payload.as_slice(),
+                })
+            })?;
+            convert(py, result)
+        })
     }
 
     /// Appends a batch with one call across the language boundary and returns the range of assigned sequence
@@ -346,61 +361,63 @@ impl Writer {
         venue_ts_ns: Option<&Bound<'py, PyAny>>,
         local_ts_ns: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyRange>> {
-        self.check(py)?;
-        check_payloads_container(payloads)?;
-        let mut items = Vec::new();
-        for item in payloads.try_iter()? {
-            items.push(Payload::extract(&item?)?);
-        }
-        let n = items.len();
-        let column = |obj: Option<&Bound<'py, PyAny>>, name| match obj {
-            None => Ok(Column::All(0)),
-            Some(o) => Column::<u64>::extract(o, name, n),
-        };
-        let schema_ids = match schema_id {
-            None => Column::All(0),
-            Some(o) => Column::<u32>::extract(o, "schema_id", n)?,
-        };
-        let venue = column(venue_ts_ns, "venue_ts_ns")?;
-        let local = column(local_ts_ns, "local_ts_ns")?;
-
-        let (first, appended, failure) = self.with_detached(py, |writer| {
-            let first = writer.next_seq();
-            for (i, payload) in items.iter().enumerate() {
-                let record = NewRecord {
-                    schema_id: schema_ids.get(i),
-                    venue_ts_ns: venue.get(i),
-                    local_ts_ns: local.get(i),
-                    payload: payload.as_slice(),
-                };
-                if let Err(e) = writer.append(&record) {
-                    return (first, i, Some(e));
-                }
+        self.settle(py, || {
+            self.check(py)?;
+            check_payloads_container(payloads)?;
+            let mut items = Vec::new();
+            for item in payloads.try_iter()? {
+                items.push(Payload::extract(&item?)?);
             }
-            (first, items.len(), None)
-        })?;
-        if let Some(err) = failure {
-            return Err(errors::batch_append(
-                py,
-                &err,
-                appended,
-                (appended > 0).then_some(first),
-            ));
-        }
-        // The writer assigned `appended` consecutive numbers from `first`, so this cannot overflow.
-        let end = u64::try_from(appended)
-            .ok()
-            .and_then(|n| first.checked_add(n))
-            .ok_or_else(|| PyValueError::new_err("sequence number range overflows"))?;
-        match (isize::try_from(first), isize::try_from(end)) {
-            (Ok(start), Ok(stop)) => Ok(PyRange::new(py, start, stop)?),
-            // Beyond isize: build the range from Python ints.
-            _ => Ok(py
-                .import("builtins")?
-                .getattr("range")?
-                .call1((first, end))?
-                .cast_into::<PyRange>()?),
-        }
+            let n = items.len();
+            let column = |obj: Option<&Bound<'py, PyAny>>, name| match obj {
+                None => Ok(Column::All(0)),
+                Some(o) => Column::<u64>::extract(o, name, n),
+            };
+            let schema_ids = match schema_id {
+                None => Column::All(0),
+                Some(o) => Column::<u32>::extract(o, "schema_id", n)?,
+            };
+            let venue = column(venue_ts_ns, "venue_ts_ns")?;
+            let local = column(local_ts_ns, "local_ts_ns")?;
+
+            let (first, appended, failure) = self.with_detached(py, |writer| {
+                let first = writer.next_seq();
+                for (i, payload) in items.iter().enumerate() {
+                    let record = NewRecord {
+                        schema_id: schema_ids.get(i),
+                        venue_ts_ns: venue.get(i),
+                        local_ts_ns: local.get(i),
+                        payload: payload.as_slice(),
+                    };
+                    if let Err(e) = writer.append(&record) {
+                        return (first, i, Some(e));
+                    }
+                }
+                (first, items.len(), None)
+            })?;
+            if let Some(err) = failure {
+                return Err(errors::batch_append(
+                    py,
+                    &err,
+                    appended,
+                    (appended > 0).then_some(first),
+                ));
+            }
+            // The writer assigned `appended` consecutive numbers from `first`, so this cannot overflow.
+            let end = u64::try_from(appended)
+                .ok()
+                .and_then(|n| first.checked_add(n))
+                .ok_or_else(|| PyValueError::new_err("sequence number range overflows"))?;
+            match (isize::try_from(first), isize::try_from(end)) {
+                (Ok(start), Ok(stop)) => Ok(PyRange::new(py, start, stop)?),
+                // Beyond isize: build the range from Python ints.
+                _ => Ok(py
+                    .import("builtins")?
+                    .getattr("range")?
+                    .call1((first, end))?
+                    .cast_into::<PyRange>()?),
+            }
+        })
     }
 
     /// Makes every record appended so far durable (see `docs/crash-contract.md`). Blocks until the sync calls
@@ -408,14 +425,16 @@ impl Writer {
     /// `DurabilityLostError`, appends keep working. Records appended before a failed checkpoint may not be durable
     /// even if a writer opened later in the same boot checkpoints successfully.
     fn checkpoint(&self, py: Python<'_>) -> PyResult<()> {
-        let result = self.with_detached(py, tickertape::Writer::checkpoint)?;
-        convert(py, result)
+        self.settle(py, || {
+            let result = self.with_detached(py, tickertape::Writer::checkpoint)?;
+            convert(py, result)
+        })
     }
 
     /// The sequence number the next append will get.
     #[getter]
     fn next_seq(&self, py: Python<'_>) -> PyResult<u64> {
-        self.with(py, |w| w.next_seq())
+        self.settle(py, || self.with(py, |w| w.next_seq()))
     }
 
     /// The journal directory.
@@ -433,22 +452,28 @@ impl Writer {
     /// What recovery did when this writer opened the journal, as a `RecoveryReport`.
     #[getter]
     fn recovery_report<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let report = self.with(py, |w| w.recovery_report().clone())?;
-        reports::recovery_report(py, &report)
+        self.settle(py, || {
+            let report = self.with(py, |w| w.recovery_report().clone())?;
+            reports::recovery_report(py, &report)
+        })
     }
 
     /// Cumulative retention removals since open, as a `RetentionReport`.
     #[getter]
     fn retention_report<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let report = self.with(py, |w| w.retention_report().clone())?;
-        reports::retention_report(py, &report)
+        self.settle(py, || {
+            let report = self.with(py, |w| w.retention_report().clone())?;
+            reports::retention_report(py, &report)
+        })
     }
 
     /// The most recent retention error since open, as an exception instance (not raised), or `None`.
     #[getter]
     fn last_retention_error(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
-        let spec = self.with(py, |w| w.last_retention_error().map(errors::describe))?;
-        Ok(spec.map(|s| s.into_py(py).into_value(py).into_any()))
+        self.settle(py, || {
+            let spec = self.with(py, |w| w.last_retention_error().map(errors::describe))?;
+            Ok(spec.map(|s| s.into_py(py).into_value(py).into_any()))
+        })
     }
 
     /// Releases the lock and closes the journal files, without a checkpoint: records appended since the last
@@ -471,8 +496,11 @@ impl Writer {
     }
 
     fn __enter__(slf: Bound<'_, Self>) -> PyResult<Bound<'_, Self>> {
-        slf.get().check(slf.py())?;
-        Ok(slf)
+        let (py, writer) = (slf.py(), slf.clone());
+        writer.get().settle(py, move || {
+            slf.get().check(py)?;
+            Ok(slf)
+        })
     }
 
     /// Test only: pretends this handle was opened by process `pid` (to simulate process-id reuse after `fork`).

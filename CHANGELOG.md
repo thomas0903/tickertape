@@ -28,7 +28,8 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   result is complete and no signal is pending, so a record staged when Ctrl-C arrives (also while a large result is
   built, or while the read waits for another thread to deliver) is returned by the next read; a read that a signal
   handler interrupted to fork raises `UsedAfterForkError` in the child instead of waiting for the reader's lock or
-  reporting a timeout; once all staged records are delivered, a reader keeps at most 6 MiB of staging buffer (enough
+  reporting a timeout, and so does any call during which Python code forked, whatever it would have returned or
+  raised (the owner check is the last thing a method does, after its exception is built); once all staged records are delivered, a reader keeps at most 6 MiB of staging buffer (enough
   for `read_batch(10_000)` to reuse it), and a larger one is freed with the GIL released before the read that
   delivers them returns (records staged by a read that raised stay in their buffer until a later read returns them); the test-only methods that can wedge a handle exist only in
   builds with the `test-hooks` feature, not in release wheels; the writer's reports are named tuples; every exception
