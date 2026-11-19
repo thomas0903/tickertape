@@ -160,7 +160,7 @@ fn leftover_spare_is_removed_and_reported_at_open() {
     let dir = tempfile::tempdir().unwrap();
     drop(Writer::open(dir.path(), small_config()).unwrap());
     std::fs::write(dir.path().join(SPARE), vec![0u8; 4096]).unwrap();
-    let w = tickertape_tests::reopen_writer(dir.path(), small_config());
+    let w = Writer::open(dir.path(), small_config()).unwrap();
     assert!(!dir.path().join(SPARE).exists());
     assert!(
         w.recovery_report()

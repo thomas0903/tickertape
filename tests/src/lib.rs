@@ -199,12 +199,13 @@ pub fn mixed_len(seq: u64) -> usize {
     }
 }
 
-/// Opens a writer, retrying briefly while the lock is held.
+/// Opens a writer, retrying briefly while the lock is held: only for reopening a journal right after its writer
+/// *process* was killed or exited.
 ///
-/// Dropping a writer releases its lock at once, but when a writer *process* exits or is killed, the OS releases the
-/// lock only as the last copy of its descriptor closes: Rust opens files with close-on-exec, but a child process
-/// forked by a test running in parallel holds a copy of every open descriptor until it calls `exec`. Tests that
-/// reopen a journal right after its writer process ended use this to ride out that window (crash contract C3).
+/// The OS then releases the lock only when the last copy of its descriptor closes: Rust opens files with
+/// close-on-exec, but a child process forked by a test running in parallel (to spawn a program) holds a copy of
+/// every open descriptor until it calls `exec`, so this rides out that window (crash contract C3). After a writer
+/// dropped in this process, use a plain [`Writer::open`]: the drop releases the lock at once.
 pub fn reopen_writer(dir: &Path, config: WriterConfig) -> Writer {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {

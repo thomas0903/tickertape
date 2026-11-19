@@ -6,12 +6,14 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 ## [Unreleased]
 
 - Library: dropping a `Writer` now releases the journal lock explicitly (`flock(LOCK_UN)`), after its helper threads
-  have stopped and readers have been told it has gone. Until now the lock was released only when its descriptor
-  closed, and a child that another thread had just forked (for example to spawn a program) shares the lock until it
-  calls `exec`, so reopening the journal right after dropping the writer, or handing it over to another process,
-  could fail with `Error::Locked` for that instant. Only the process that opened the writer unlocks: a forked child
-  dropping its copy of a writer still leaves the lock with the parent. A writer process that exits or dies without
-  dropping its writer still leaves the lock with such a child until it execs or exits (crash contract C3).
+  have stopped and readers have been told it has gone, and so does a `Writer::open` that fails after taking the lock.
+  Until now the lock was released only when the last copy of its descriptor closed, and a child that another thread
+  had forked (for example to spawn a program) holds a copy until it calls `exec` or exits, so reopening the journal
+  right after dropping the writer or after a failed open, or handing it over to another process, could fail with
+  `Error::Locked` naming this process. Only the process that opened the writer unlocks: a forked child dropping its
+  copy of a writer (which it must not do) leaves the lock with the parent. A writer process that exits or dies
+  without dropping its writer still leaves the lock with such a child until it execs or exits, for its whole life if
+  it never execs (crash contract C3).
 - C ABI (ADR 0028, `docs/c-api.md`): a new workspace crate, `crates/tickertape-ffi`, builds `libtickertape` as a
   shared and a static library with a committed, cbindgen-generated C99/C++11 header (`include/tickertape.h`, checked
   for drift in CI) and cargo-c metadata for installation with a pkg-config file. It covers the writer (append,

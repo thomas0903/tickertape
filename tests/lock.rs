@@ -29,7 +29,7 @@ fn second_writer_fails() {
 
     tickertape_tests::append_n(&mut first, 1);
     drop(first);
-    let reopened = tickertape_tests::reopen_writer(dir.path(), small_config());
+    let reopened = Writer::open(dir.path(), small_config()).unwrap();
     assert_eq!(reopened.next_seq(), 4);
 }
 
