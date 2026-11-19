@@ -451,9 +451,11 @@ with `--watch`, which goes on sampling and picks the journal up once it exists).
   node_exporter textfile directory, and the first by never linking to the output file from inside the journal (a
   link from a journal directory can exist whoever writes to the output's directory, and `status` cannot see it
   while that directory can't be listed). The walk runs before every replacement, so on every sample of a watch: it
-  lists the journal directory, `quarantine/` and the beacon directory, and `stat`s an entry only if it is a symlink,
-  or if the output file has more than one hard link (a file with one name can be reached only through a symlink),
-  so its cost is that of listing those directories.
+  lists the journal directory, `quarantine/` and the beacon directory and `stat`s every entry, which is its cost
+  (one `stat` per segment, quarantined file and beacon per sample). A cheaper walk that `stat`ed only symlinks
+  unless the output file had more than one hard link was tried in round 5 and dropped: the link count can change
+  between reading it and visiting an entry, and a file bind mount reaches a file without a link, so it could miss
+  entries the full walk finds.
 
 ## Compatibility
 
