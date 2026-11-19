@@ -5,19 +5,28 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
-- Operational metrics (ADR 0032), with no format change and nothing added to `append` or the reader's read path:
+- Operational metrics (ADR 0032), with no format change and nothing added to `append` or the reader's read path.
+  Values a sample can't establish are reported as unknown, never guessed, and estimates are named as such:
   - `tickertape::status::status(dir)` and `status::Sampler` sample a journal from any process: the writer's head,
-    the checkpoint marker and its age (from the marker's modification time), what a power loss would remove now
-    (exposure), storage headroom in bytes and segment rolls, and the writer's PID. A `Sampler` resumes its scan
-    where it stopped and measures append rates and an estimated time until the volume is full.
-  - `Writer::metrics()` (head, checkpoint age by the monotonic clock, bytes the next checkpoint must sync, poisoned
+    the checkpoint marker (validated as the writer validates it) and an estimate of its age from the marker's
+    modification time, what a power loss would remove now (exposure), storage headroom in bytes and estimated segment
+    rolls, and the writer's PID. Whether the sample verified the chain from the checkpoint to the head is reported. A
+    `Sampler` resumes its scan where it stopped, keyed by segment identity, and measures append rates and an estimated
+    time until the volume is full.
+  - `Writer::metrics()` (head, checkpoint age by the monotonic clock, uncheckpointed records and bytes, poisoned
     flag, retention failure count), `Reader::cursor()` and `Status::lag()` for in-process reader lag.
-  - `status::ReaderBeacon`: an opt-in 64-byte file in `<dir>/readers/` that publishes a reader's position for
-    observers in other processes. A held `flock` tells live readers from dead ones; the writer and retention never
-    read beacons.
+  - `status::ReaderBeacon`: an opt-in 128-byte file in `<dir>/readers/` that publishes a reader's position, the
+    identity of its segment and whether it is durable-only, for observers in other processes. Beacons are published
+    atomically under a directory lock, never replace anything but a stale beacon (`Error::BeaconInUse` for a live
+    one), and a held `flock` tells live readers from dead ones; the writer and retention never read beacons.
   - CLI: `tickertape status <DIR>` with text, `--json` (`schema_version` 1) and `--format prometheus` output,
-    `--watch`, `--output` (atomic replace, for a node_exporter textfile collector), and health thresholds
-    (`--max-checkpoint-age`, `--min-headroom`, `--min-headroom-segments`, `--max-reader-lag`) that exit with code 3.
+    `--watch` (failed samples are reported and the watch continues; `tickertape_up` and
+    `tickertape_status_timestamp_seconds` show staleness), `--output` (atomic replace through an exclusively created
+    temporary file, for a node_exporter textfile collector), and health thresholds (`--max-checkpoint-age`,
+    `--min-headroom`, `--min-headroom-segments`, `--max-reader-lag`) that exit with code 3; a journal the sample
+    finds corrupt (or the writer would refuse) exits with 2.
+  - `export --output` no longer fails when an entry in the journal directory disappears during its alias check (a
+    reader beacon dropped meanwhile) or a subdirectory can't be listed. v0.4.0 failed transiently in those cases.
   - `rustix` now also enables its `process` feature (for `kill(pid, 0)`); no new crates.
 - Docs: define the path to v1.0 around sustained performance, optional eBPF diagnostics, reader/checkpoint
   optimization, ARM measurements, interoperability, replay/recovery at scale and explicit stability/release gates.

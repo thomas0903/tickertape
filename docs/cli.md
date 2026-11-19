@@ -8,8 +8,8 @@ writer's shared-memory wake-up region (ADRs 0017, 0021), which is outside the jo
 journal data. `status --output` writes a file that must be outside the journal directory.
 
 All commands support `--help`. Exit codes: **0** success (including help, exhausted input, count reached or idle
-timeout), **1** usage, I/O or missing-journal error, **2** corrupt data or an unsupported journal format, **3**
-(`status` only) a health threshold is breached.
+timeout), **1** usage, I/O or missing-journal error, **2** corrupt data or an unsupported journal format (for
+`status`, also a journal the writer would refuse), **3** (`status` only) a health threshold is breached.
 Errors and recovery warnings go to stderr. JSON results go to stdout (or the selected export file).
 
 ## Commands
@@ -83,23 +83,33 @@ Errors and recovery warnings go to stderr. JSON results go to stdout (or the sel
 - `status <DIR> [--format text|json|prometheus | --json] [--readers-dir <DIR>] [--watch <INTERVAL> [--samples <N>]]
   [--output <FILE>] [--max-checkpoint-age <DUR>] [--min-headroom <B>] [--min-headroom-segments <N>]
   [--max-reader-lag <N>]`: one sample of the journal's operational state (ADR
-  [0032](decisions/0032-operational-metrics.md)): the writer's head, the segments, the checkpoint marker and its age,
-  the exposure (records not covered by the checkpoint, which a power loss can remove), storage headroom, the writer's
-  PID (best effort), and every reader that publishes a beacon (`tickertape::status::ReaderBeacon`) in `<DIR>/readers`
-  or `--readers-dir`. It never takes the writer lock or touches it, and writes nothing into the journal.
+  [0032](decisions/0032-operational-metrics.md)): the writer's head, the segments, the checkpoint marker and an
+  estimate of its age, the exposure (records not covered by the checkpoint, which a power loss can remove), storage
+  headroom, the writer's PID (best effort), and every reader that publishes a beacon
+  (`tickertape::status::ReaderBeacon`) in `<DIR>/readers` or `--readers-dir`. It never takes the writer lock or
+  touches it, writes nothing into the journal, and opens every file non-blocking (a FIFO can't hang it). Values it
+  can't establish are null, never guessed; estimates are named `estimated_*`. It reads only the newest segment, so
+  `head.verified` and `exposure.verified` say whether it validated the records between the checkpoint and the head;
+  `verify` checks everything.
   Cost: one `stat` per segment, a `pread` scan of the newest segment from the checkpoint position (or from its
-  start if the checkpoint is in an older segment), `statvfs`, and a few small reads per beacon; with `--watch`, each
-  sample after the first scans only what was appended since the previous one.
+  start if the checkpoint is in an older segment), a few headers, `statvfs`, and a few small reads per beacon; with
+  `--watch`, each sample after the first scans only what was appended since the previous one.
   `--watch` samples every `INTERVAL` (an integer followed by `ms`, `s`, `m` or `h`) until interrupted, or `--samples`
-  times; from the second sample on it reports append rates and an estimated time until the volume is full. `--output`
-  writes each sample to a temporary file in the same directory and renames it over `FILE`, so a node_exporter textfile
-  collector never reads a partial file. Thresholds (`DUR` and `B` as for `archive`): `--max-checkpoint-age` is
-  breached when records are uncovered and the checkpoint is older than `DUR`, or there is no checkpoint (an idle,
-  fully checkpointed journal is healthy however old its checkpoint); `--min-headroom` when fewer than `B` bytes are
-  available; `--min-headroom-segments` when fewer than `N` more segments fit; `--max-reader-lag` when a **live** reader
-  beacon lags by more than `N` records (stale beacons, whose owner died, never count). A head at invalid bytes is
-  always unhealthy. Without `--watch` the command exits **3** when unhealthy; with `--watch` it reports health in each
-  sample and exits 0 when `--samples` are done. A damaged newest segment header returns **2**.
+  times; from the second sample on it reports append rates and an estimated time until the volume is full. A sample
+  that fails is reported (a JSON line with `error`, a text `error` line, or `tickertape_up 0`) and the watch goes on.
+  `--output` writes each sample to a new, uniquely named temporary file in the same directory (created exclusively,
+  never following a symlink) and renames it over `FILE`, so a node_exporter textfile collector never reads a partial
+  file; `FILE` must be outside the journal. A one-shot sample that fails still replaces `FILE` with `tickertape_up 0`.
+  `--watch` with `--format prometheus` needs `--output`. Thresholds (`DUR` and `B` as for `archive`):
+  `--max-checkpoint-age` is breached when records are uncovered and the checkpoint's estimated age is above `DUR` or
+  unknown, or there is no checkpoint (an idle, fully checkpointed journal and an empty one are healthy);
+  `--min-headroom` when fewer than `B` bytes are available; `--min-headroom-segments` when fewer than `N` more
+  segments are estimated to fit; `--max-reader-lag` when a **live** (or `uncertain`) reader beacon lags by more than
+  `N` records (stale beacons, whose owner died, never count). Exit codes: **0** healthy; **3** a threshold is
+  breached; **2** the sample found the journal corrupt, as `verify` would: the head at invalid bytes, a checkpoint
+  marker the writer refuses (missing segment, invalid offset or segment header), a damaged newest segment header, an
+  unsupported format (2 takes precedence over 3); **1** usage or I/O errors and a missing journal. With `--watch` it
+  reports health in each sample and exits 0 when `--samples` are done.
   On a one-shot sample, `last_local_ts_ns` of the head is null when the checkpoint is at the head (the scan starts
   there and sees no record).
 
@@ -211,64 +221,99 @@ a dry run). JSON numbers preserve their u64 interpretation; consumers should use
 ```text
 {"schema_version":1,"journal":string,"sampled_unix_ns":u64,
  "head":{"next_seq":u64,"segment_base_seq":u64,"offset":u64,"segment_size_bytes":u64,
-         "end":"open"|"sealed"|"invalid","invalid_reason":string|null,"last_local_ts_ns":u64|null},
+         "end":"open"|"sealed"|"invalid","invalid_reason":string|null,"last_local_ts_ns":u64|null,"verified":bool},
  "segments":{"count":u64,"first_seq":u64,"total_bytes":u64,"oldest_created_unix_ns":u64|null,
              "before_checkpoint":u64},
  "checkpoint":{"generation":u64,"next_seq":u64,"segment_base_seq":u64,"offset":u64,
-               "written_unix_ns":u64|null,"age_s":number|null,"clock_skew":bool}|null,
- "exposure":{"records":u64,"bytes":u64|null,"age_s":number|null,"oldest_local_ts_ns":u64|null},
- "storage":{"available_bytes":u64,"total_bytes":u64,"segment_size_bytes":u64,"spare_segment":bool,
-            "rolls_left":u64,"time_to_full_s":number|null},
+               "problem":"missing_segment"|"invalid_segment_header"|"invalid_offset"|null,
+               "modified_unix_ns":u64|null,"estimated_age_s":number|null,
+               "age_unknown_reason":"no_modification_time"|"modification_time_in_future"|
+                                    "modification_time_before_segment"|"marker_resized"|"marker_changing"|null}|null,
+ "exposure":{"records":u64|null,"bytes":u64|null,"estimated_age_s":number|null,"oldest_local_ts_ns":u64|null,
+             "verified":bool},
+ "storage":{"available_bytes":u64,"total_bytes":u64,"next_segment_size_bytes":u64,"spare_segment":bool,
+            "estimated_rolls_left":u64,"estimated_time_to_full_s":number|null},
  "rates":{"interval_s":number,"records_per_s":number,"bytes_per_s":number|null}|null,
  "writer":{"pid":u32|null,"alive":bool|null},
- "readers":[{"name":string,"state":"live"|"stale"|"invalid","pid":u32|null,"next_seq":u64|null,
-             "lag_records":u64|null,"lag_bytes":u64|null,"unread_age_s":number|null,
-             "oldest_unread_local_ts_ns":u64|null,"updated_unix_ns":u64|null,"update_age_s":number|null}, ...],
- "health":{"ok":bool,"breaches":[{"code":"head_invalid"|"checkpoint_age"|"headroom_bytes"|
-                                          "headroom_segments"|"reader_lag","reader":string|null}, ...]}}
+ "readers_dir":{"path":string,"state":"listed"|"missing"|"unusable","error":string|null},
+ "readers":[{"name":string,"state":"live"|"stale"|"uncertain"|"invalid"|"unreadable","pid":u32|null,
+             "next_seq":u64|null,"durable_only":bool|null,"seek_pending":bool|null,
+             "lag_records":u64|null,"lag_bytes":u64|null,
+             "lag_unknown_reason":"segment_gone"|"other_history"|"segment_unreadable"|"checkpoint_unusable"|null,
+             "unread_age_s":number|null,"oldest_unread_local_ts_ns":u64|null,
+             "updated_unix_ns":u64|null,"update_age_s":number|null}, ...],
+ "health":{"ok":bool,"corrupt":bool,
+           "breaches":[{"code":"head_invalid"|"checkpoint_invalid"|"checkpoint_age"|"headroom_bytes"|
+                                "headroom_segments"|"reader_lag","reader":string|null}, ...]}}
 ```
 
-`schema_version` is 1. Fields may be added without changing it; removing a field or changing its meaning bumps it.
-With `--watch`, each sample is one line. `journal` is the directory as given. Times ending in `_unix_ns` are
-nanoseconds since the Unix epoch by the observer's wall clock, except `last_local_ts_ns`, `oldest_local_ts_ns` and
-`oldest_unread_local_ts_ns`, which are records' caller-supplied `local_ts_ns` (null if unset). Durations ending in
-`_s` are seconds.
+With `--watch`, a sample that fails is the line
+`{"schema_version":1,"journal":string,"sampled_unix_ns":u64,"error":{"code":"not_found"|"corrupt"|"unsupported_version"|"io","message":string}}`.
 
-- `head`: where the next record goes. `end` is `sealed` only when the newest segment ends in a seal and its successor
-  doesn't exist (a writer died during a roll); `invalid` when bytes there still fail validation after re-reading.
+`schema_version` is 1. Fields may be added without changing it; removing a field or changing its meaning bumps it.
+With `--watch`, each sample is one line. `journal` is the canonical absolute path of the journal directory. Times
+ending in `_unix_ns` are nanoseconds since the Unix epoch by the observer's wall clock (or, for `updated_unix_ns`,
+the reader's), except `last_local_ts_ns`, `oldest_local_ts_ns` and `oldest_unread_local_ts_ns`, which are records'
+caller-supplied `local_ts_ns` (null if unset). Durations ending in `_s` are seconds. `null` means the value could
+not be established.
+
+- `head`: where the next record goes, as far as the newest segment shows. `end` is `sealed` only when the newest
+  segment ends in a seal and its successor didn't exist when checked (a writer died during a roll); `invalid` when
+  bytes there still fail validation after re-reading. `verified` is true if the sample validated every record from
+  the checkpoint (or, without one, from the start of the oldest segment) to the head; false when the checkpoint is
+  in an older segment, whose successors it didn't read.
 - `segments.before_checkpoint`: segments older than the checkpoint segment, which retention may remove.
-- `checkpoint.written_unix_ns` is the marker file's modification time and `age_s` the time since then (0 with
-  `clock_skew` if it is in the future). It is wrong if something else writes the file or a copy didn't keep times.
-- `exposure`: `records` not covered by the checkpoint (all records if there is none); `bytes` are segment-file bytes
-  from the checkpoint position to the head (null if the checkpoint's segment is missing); `age_s` is 0 with no
-  uncovered records, otherwise the checkpoint's age (null with no checkpoint).
-- `storage`: `available_bytes` is what unprivileged users may still allocate (`statvfs`); `rolls_left` is how many
-  more segments of `segment_size_bytes` fit, plus one with a prepared spare (`spare_segment`). Writes into the active
-  segment need no new space (except on btrfs), so the roll after these fails. `time_to_full_s` needs `rates`.
-- `rates`: null on the first sample; `bytes_per_s` counts segment-file bytes.
-- `readers`: one entry per file in the beacon directory with a valid name, sorted by name. `live` means the owning
-  process holds the beacon's lock; `stale` means it died (the values are its last report); `invalid` entries have
-  null values. `lag_*` compare the beacon's last reported position with this sample's head; `unread_age_s` is the
+- `checkpoint`: the marker's current slot, or null if no slot is valid. `problem` is set when the writer would refuse
+  the marker (its segment missing or with an invalid header, or an offset outside the record area); then `exposure`
+  is unknown and `health.corrupt` is true. `modified_unix_ns` is the marker file's modification time and
+  `estimated_age_s` the time since then, read after the marker; null with `age_unknown_reason` when the time is
+  detectably unreliable. It is wrong if something else writes the file or a copy didn't keep times.
+- `exposure`: `records` not covered by the checkpoint (all records from the oldest segment if there is none); `bytes`
+  are the segment-file footprint from the checkpoint position to the head (0 when no record is uncovered, null if a
+  segment involved is missing); `estimated_age_s` is 0 with no uncovered records, otherwise the checkpoint's
+  estimated age (null with no checkpoint or an unknown age).
+- `storage`: `available_bytes` is what unprivileged users may still allocate (`statvfs`), the observed fact.
+  `estimated_rolls_left` is how many more segments of `next_segment_size_bytes` fit (the prepared spare's size if
+  there is one, else the newest segment's); a prepared spare whose blocks are allocated is `spare_segment` and is
+  not counted, since publishing it can still fail on a full volume. Writes into the active segment need no new space
+  (except on btrfs), so the roll after these fails. `estimated_time_to_full_s` needs `rates`.
+- `rates`: null on the first sample and after the history changed (the journal replaced, a segment repaired);
+  `bytes_per_s` counts segment-file bytes.
+- `readers_dir`: the beacon directory read; `unusable` (with the OS error) when it exists but couldn't be listed, in
+  which case `readers` is empty.
+- `readers`: one entry per regular file in the beacon directory with a valid beacon name, sorted by name. `live`
+  means a process holds the beacon's lock; `stale` means its owner died (the values are its last report);
+  `uncertain` means the lock couldn't be probed (locks unsupported); `invalid` and `unreadable` entries have null
+  values. `lag_*` compare the beacon's last reported position with this sample's head, or with the checkpoint for a
+  `durable_only` reader; they are null with `lag_unknown_reason` when the beacon's segment is gone or is not the
+  file this journal has under that name (`other_history`: another journal sharing the directory, a replaced journal,
+  a repaired segment). `lag_bytes` is also null while a seek is pending (`seek_pending`). `unread_age_s` is the
   observer's clock minus the first unread record's `local_ts_ns` (0 when caught up).
+- `health`: `ok` if nothing is breached; `corrupt` if a breach is corruption (`head_invalid`, `checkpoint_invalid`,
+  always checked; the command then exits 2).
 
 ### `status --format prometheus`
 
-Text exposition format 0.0.4. Every metric is a gauge with the label `journal="<DIR>"`; reader metrics also have
-`reader="<name>"`. Metrics without a value in this sample (for example the checkpoint's age without a checkpoint)
-are omitted.
+Text exposition format 0.0.4. Every metric is a gauge with the label `journal="<canonical DIR>"`; reader metrics
+also have `reader="<name>"`. Metrics without a value in this sample (for example the checkpoint's age without a
+checkpoint, or when it is unreliable) are omitted. A sample that fails has only `tickertape_status_timestamp_seconds`
+and `tickertape_up 0`. `--watch` needs `--output` with this format.
 
 | Metric | Value |
 |---|---|
-| `tickertape_status_timestamp_seconds` | Sample time |
-| `tickertape_healthy` | 1 if no given threshold is breached and the head is valid |
-| `tickertape_head_next_seq`, `tickertape_head_invalid` | Head |
+| `tickertape_status_timestamp_seconds` | Sample time; alert when it stops advancing |
+| `tickertape_up` | 1 if the sample succeeded, 0 if it failed |
+| `tickertape_healthy` | 1 if no given threshold is breached and no corruption was found |
+| `tickertape_corrupt` | 1 if the head is at invalid bytes or the checkpoint marker is unusable |
+| `tickertape_head_next_seq`, `tickertape_head_invalid`, `tickertape_head_verified` | Head |
 | `tickertape_segments`, `tickertape_segments_bytes`, `tickertape_first_seq`, `tickertape_segments_before_checkpoint`, `tickertape_oldest_segment_created_timestamp_seconds` | Segments |
-| `tickertape_checkpoint_present`, `tickertape_checkpoint_generation`, `tickertape_checkpoint_next_seq`, `tickertape_checkpoint_age_seconds` | Checkpoint |
-| `tickertape_exposure_records`, `tickertape_exposure_bytes`, `tickertape_exposure_age_seconds` | Exposure |
-| `tickertape_storage_available_bytes`, `tickertape_storage_size_bytes`, `tickertape_storage_rolls_left`, `tickertape_storage_time_to_full_seconds` | Storage |
+| `tickertape_checkpoint_present`, `tickertape_checkpoint_invalid`, `tickertape_checkpoint_generation`, `tickertape_checkpoint_next_seq`, `tickertape_checkpoint_estimated_age_seconds` | Checkpoint |
+| `tickertape_exposure_records`, `tickertape_exposure_bytes`, `tickertape_exposure_estimated_age_seconds`, `tickertape_exposure_verified` | Exposure |
+| `tickertape_storage_available_bytes`, `tickertape_storage_size_bytes`, `tickertape_storage_spare_segment`, `tickertape_storage_estimated_rolls_left`, `tickertape_storage_estimated_time_to_full_seconds` | Storage |
 | `tickertape_append_records_per_second` | With `--watch`, from the second sample |
 | `tickertape_writer_alive` | 1 if the PID in `writer.lock` exists (best effort) |
-| `tickertape_reader_live`, `tickertape_reader_lag_records`, `tickertape_reader_lag_bytes`, `tickertape_reader_unread_age_seconds`, `tickertape_reader_update_age_seconds` | Per reader beacon (`reader_live` is 1 or 0; invalid beacons are omitted) |
+| `tickertape_readers_dir_usable` | 0 if the beacon directory exists but couldn't be listed |
+| `tickertape_reader_live`, `tickertape_reader_lag_records`, `tickertape_reader_lag_bytes`, `tickertape_reader_unread_age_seconds`, `tickertape_reader_update_age_seconds` | Per reader beacon (`reader_live` is 1 or 0, absent for `uncertain`, `invalid` and `unreadable` beacons; lag metrics are absent when the lag is unknown) |
 
 ### Parquet (`export --format parquet`)
 
