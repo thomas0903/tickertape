@@ -20,3 +20,35 @@ appear anywhere in the README or docs. Never compare with other tools.
 6. **Sanity check.** Run each benchmark at least twice. If runs differ by more than about 10 %, say so and report both.
 7. CI runners are smoke runs only (they prove the benchmark runs). Never record their numbers as results.
 8. Commit: `bench: record <benchmark> on <machine>`.
+
+## Sustained session (ADR 0026)
+
+Sustained runs last 10 minutes each and a full session about a day, so they run on a cloud Linux machine with
+`benches/session.py`, which runs the tickertape scenarios (`tt-sustained`) and the sustained comparison
+(`compare/README.md`, "Sustained mode") and keeps everything in one output directory.
+
+1. **Machine.** Note the instance type, region and whether it is bare metal or a VM. Use local NVMe or the volume you
+   want to measure, formatted without lazy initialisation (ext4: `mkfs.ext4 -E lazy_itable_init=0,lazy_journal_init=0`;
+   ADR 0025 found a fresh lazily initialised ext4 volume confounding). Mount it, create a directory on it for
+   `--journal-dir`, and keep `--out` on another filesystem if possible (e.g. the root volume).
+2. **Software.** Rust (the repository's `rust-toolchain.toml`), Python 3.9+, Java 21 and Maven (set `JAVA_HOME`), at a
+   clean commit. Optional: `numactl`, and free CPUs for `--cpus` pinning.
+3. **Validate the machine** with the quick matrix (a few minutes; functional only, never results):
+   `python3 benches/session.py --journal-dir /mnt/test/tt --out ~/session-quick --quick --yes`.
+   Check `~/session-quick/manifest.json` (every run `done`, none `failed`) and `logs/`.
+4. **Estimate.** `python3 benches/session.py --journal-dir /mnt/test/tt --out ~/session-full --dry-run` prints the
+   plan and `estimated_seconds`. Reduce with `--only`, `--scenarios`, `--compare-tools`, `--duration` or `--repeats`
+   if the budget requires, and say so when recording.
+5. **Run** inside `tmux` or `nohup` so a dropped SSH connection doesn't end it:
+   `python3 benches/session.py --journal-dir /mnt/test/tt --out ~/session-full --yes`.
+   If it is interrupted (or a run fails), run the same command again: finished runs are skipped, partial output and
+   scratch data are removed, and the manifest records every session.
+6. **Keep the raw output.** Copy the whole `--out` directory off the machine before terminating it (results,
+   series, environment, commands, logs). Delete the cloud resources afterwards.
+7. **Record** in `docs/benchmarks.md` as for other runs: environment (from `environment.txt`), the session command,
+   commit, the tables with units and percentiles as printed, achieved rates and late sends, reader lag, CPU, the
+   durability and wait settings of each scenario, and how coordinated omission was handled. Report visibility-only
+   and periodic-durability comparisons separately, with the unsupported cases and unequal guarantees from
+   `compare/README.md`. Point stalls out with their wall-clock times from `series.jsonl`.
+8. **Repeats.** The full matrix runs every paced configuration twice; flag differences above about 10 % as in the
+   general procedure's sanity check. A single quick or CI run is never a result.
