@@ -13,6 +13,8 @@ tickertape = { workspace = true, features = ["fault-injection"] }
 
 [dev-dependencies]
 tempfile = "3"
+# Parses tests/compat/fixtures/manifest.json (already in the lockfile through tickertape-cli).
+serde_json = "1"
 
 [[test]]
 name = "recovery"
@@ -68,3 +70,11 @@ path = "status.rs"
 [[test]]
 name = "beacon_races"
 path = "beacon_races.rs"
+
+[[test]]
+name = "compat"
+path = "compat.rs"
+
+[[test]]
+name = "soak"
+path = "soak.rs"
