@@ -73,6 +73,10 @@ pub struct Reader {
     waker: Option<crate::notify::Waker>,
     /// When the reader started waiting at an empty slot.
     waiting_since: Option<Instant>,
+    /// The record [`Reader::advance`] found last (valid only after it returned `true`). The slot reads decode a
+    /// record's header straight into it, so that the per-record path passes only small values around (see
+    /// [`SlotOutcome`]).
+    found: Found,
 }
 
 #[derive(Debug)]
@@ -94,14 +98,32 @@ struct Found {
     payload_len: usize,
 }
 
-/// What is at the cursor.
+/// What is at the cursor. A record's header is not part of it: the slot read decodes it into `Reader::found`.
+///
+/// This is deliberate. While the decoded header travelled by value through this enum, `Result<SlotOutcome>`,
+/// `Option<Found>` and back, the speed of the per-record path depended on how the compiler chose to copy it: after an
+/// unrelated change (#16) it copied the header through the stack in pieces that the CPU could not forward from store
+/// to load, twice per record. The per-record path now passes only a tag and a length, and the checks below keep it so.
+/// They catch the header (or anything as large) moving back into these values and a change of what the functions on
+/// the per-record path return; they cannot catch other ways in which a change makes the compiler slower here, so a
+/// change to this file, to `format.rs` or to what this path inlines or returns (`error.rs`, `mmap.rs`, `crc.rs`)
+/// needs the `replay` benchmark before and after (`CONTRIBUTING.md`).
 #[derive(Debug, Clone, Copy)]
 enum SlotOutcome {
     Empty,
-    Record { header: RecordHeader, len: u32 },
+    Record { len: u32 },
     Seal,
     Invalid(CorruptReason),
 }
+
+const _: () = assert!(
+    size_of::<SlotOutcome>() < size_of::<RecordHeader>(),
+    "SlotOutcome must stay smaller than RecordHeader: see the comment above it (a larger CorruptReason variant \
+     also trips this)"
+);
+const _: fn(&mut Reader, bool) -> Result<SlotOutcome> = Reader::read_slot;
+const _: fn(&mut Reader) -> Result<bool> = Reader::next_slot;
+const _: fn(&mut Reader) -> Result<bool> = Reader::advance;
 
 impl Reader {
     /// Opens the journal in `dir`, positioned at the first record of the oldest segment.
@@ -190,6 +212,16 @@ impl Reader {
             buf_start: 0,
             waker,
             waiting_since: None,
+            found: Found {
+                header: RecordHeader {
+                    seq: 0,
+                    schema_id: 0,
+                    venue_ts_ns: 0,
+                    local_ts_ns: 0,
+                },
+                payload_at: 0,
+                payload_len: 0,
+            },
         })
     }
 
@@ -269,9 +301,10 @@ impl Reader {
     /// [`OutOfMemory`](std::io::ErrorKind::OutOfMemory)) if the read buffer for the frame at the cursor can't be
     /// allocated.
     pub fn try_next(&mut self) -> Result<Option<Record<'_>>> {
-        match self.advance()? {
-            Some(found) => Ok(Some(self.materialize(found))),
-            None => Ok(None),
+        if self.advance()? {
+            Ok(Some(self.materialize()))
+        } else {
+            Ok(None)
         }
     }
 
@@ -287,16 +320,16 @@ impl Reader {
         let deadline = timeout.map(|t| Instant::now() + t);
         let mut waiter = Waiter::new(self.config.backoff);
         loop {
-            if let Some(found) = self.advance()? {
-                return Ok(Some(self.materialize(found)));
+            if self.advance()? {
+                return Ok(Some(self.materialize()));
             }
             if deadline.is_some_and(|d| Instant::now() >= d) {
                 return Ok(None);
             }
             if waiter.in_blocking_phase() {
                 if let Some(blocked) = self.block(deadline) {
-                    if let Some(found) = blocked? {
-                        return Ok(Some(self.materialize(found)));
+                    if blocked? {
+                        return Ok(Some(self.materialize()));
                     }
                     continue;
                 }
@@ -309,7 +342,7 @@ impl Reader {
     }
 
     /// Blocks on the journal's wake-up region, if there is one: `None` if the reader should poll instead.
-    fn block(&mut self, deadline: Option<Instant>) -> Option<Result<Option<Found>>> {
+    fn block(&mut self, deadline: Option<Instant>) -> Option<Result<bool>> {
         let waker = self.waker.as_mut()?;
         waker.refresh_if_due();
         // Never block past the next refresh: a writer that restarted can only wake readers on its new region.
@@ -334,10 +367,10 @@ impl Reader {
         &mut self,
         notify: &crate::mmap::Notify,
         deadline: Option<Instant>,
-    ) -> (Result<Option<Found>>, bool) {
+    ) -> (Result<bool>, bool) {
         let seen = notify.begin_wait();
         let found = self.advance();
-        if !matches!(found, Ok(None)) {
+        if !matches!(found, Ok(false)) {
             notify.end_wait();
             return (found, true);
         }
@@ -355,7 +388,7 @@ impl Reader {
             std::thread::sleep(wait.min(self.config.backoff.max_sleep));
         }
         notify.end_wait();
-        (Ok(None), supported)
+        (Ok(false), supported)
     }
 
     /// Like [`Reader::try_next`], but copies the record out of the reader.
@@ -407,29 +440,42 @@ impl Reader {
         Ok(())
     }
 
-    /// Finds the next record to return, moving the cursor past it (and past skipped records and seals).
-    fn advance(&mut self) -> Result<Option<Found>> {
+    /// Finds the next record to return, moving the cursor past it (and past skipped records and seals). Returns
+    /// `true` with the record in `self.found`, or `false` if there is none yet.
+    fn advance(&mut self) -> Result<bool> {
         let mut refreshed = false;
         loop {
-            if self.config.durable_only && self.next_seq >= self.durable_next_seq {
-                if !refreshed {
-                    self.refresh_checkpoint()?;
-                    refreshed = true;
-                }
-                if self.next_seq >= self.durable_next_seq {
-                    if self.durable_segment_base > self.seg.base {
-                        self.leave_superseded_segment()?;
-                    }
-                    return Ok(None);
-                }
+            if self.config.durable_only
+                && self.next_seq >= self.durable_next_seq
+                && !self.durable_covers_cursor(&mut refreshed)?
+            {
+                return Ok(false);
             }
-            let Some(found) = self.next_slot()? else {
-                return Ok(None);
-            };
-            if found.header.seq >= self.skip_until {
-                return Ok(Some(found));
+            if !self.next_slot()? {
+                return Ok(false);
+            }
+            if self.found.header.seq >= self.skip_until {
+                return Ok(true);
             }
         }
+    }
+
+    /// For a durable-only reader whose cursor is at the checkpoint boundary it knows: refreshes the marker (once per
+    /// [`Reader::advance`] call, tracked in `refreshed`) and says whether it now covers the cursor. If not, and the
+    /// marker names a later segment, see [`Reader::leave_superseded_segment`].
+    #[inline(never)]
+    fn durable_covers_cursor(&mut self, refreshed: &mut bool) -> Result<bool> {
+        if !*refreshed {
+            self.refresh_checkpoint()?;
+            *refreshed = true;
+        }
+        if self.next_seq >= self.durable_next_seq {
+            if self.durable_segment_base > self.seg.base {
+                self.leave_superseded_segment()?;
+            }
+            return Ok(false);
+        }
+        Ok(true)
     }
 
     /// Called when a durable-only reader is waiting at the checkpoint and the marker names a later segment than the
@@ -499,54 +545,94 @@ impl Reader {
         Ok(())
     }
 
-    /// Reads and validates the slot at the cursor, following seals. Returns a record (cursor moved past it), or
-    /// `None` at an empty slot.
-    fn next_slot(&mut self) -> Result<Option<Found>> {
+    /// Reads and validates the slot at the cursor, following seals. Returns `true` with the record in `self.found`
+    /// (cursor moved past it), or `false` at an empty slot.
+    ///
+    /// A slot that fails validation is read again from the file up to [`VALIDATION_RETRIES`] times before it is
+    /// reported. The record path is kept short: the other outcomes are handled in functions that are never inlined.
+    /// (They are not marked `#[cold]`: that moved them to the end of the code and, on the machine where this was
+    /// measured, made the unrelated append path slower by changing where its code landed.)
+    fn next_slot(&mut self) -> Result<bool> {
         loop {
-            let mut attempt = 0;
-            let outcome = loop {
-                let read = self.read_slot(attempt > 0)?;
-                #[cfg(test)]
-                let read = tests::scripted(read);
-                match read {
-                    SlotOutcome::Invalid(_) if attempt < VALIDATION_RETRIES => attempt += 1,
-                    other => break other,
-                }
+            let read = self.read_slot(false)?;
+            #[cfg(test)]
+            let read = tests::scripted(read);
+            let outcome = match read {
+                SlotOutcome::Record { len } => return self.step_past_record(len),
+                SlotOutcome::Invalid(_) => self.read_slot_again()?,
+                other => other,
             };
             match outcome {
+                SlotOutcome::Record { len } => return self.step_past_record(len),
                 SlotOutcome::Empty => {
-                    let now = Instant::now();
-                    let since = *self.waiting_since.get_or_insert(now);
-                    if now.duration_since(since) >= IDENTITY_CHECK_INTERVAL {
-                        self.waiting_since = Some(now);
-                        self.check_identity()?;
-                    }
-                    return Ok(None);
-                }
-                SlotOutcome::Record { header, len } => {
-                    self.waiting_since = None;
-                    let found = Found {
-                        header,
-                        payload_at: self.offset + format::RECORD_HEADER_LEN as u64,
-                        payload_len: len as usize - format::RECORD_HEADER_LEN,
-                    };
-                    let Some(next_seq) = self.next_seq.checked_add(1) else {
-                        return Err(Error::corrupt(
-                            &self.seg.path,
-                            self.offset,
-                            CorruptReason::SequenceExhausted,
-                        ));
-                    };
-                    self.offset += format::align8(u64::from(len));
-                    self.next_seq = next_seq;
-                    return Ok(Some(found));
+                    self.at_empty_slot()?;
+                    return Ok(false);
                 }
                 SlotOutcome::Seal => self.follow_seal()?,
-                SlotOutcome::Invalid(reason) => {
-                    self.check_identity()?;
-                    return Err(Error::corrupt(&self.seg.path, self.offset, reason));
-                }
+                SlotOutcome::Invalid(reason) => return Err(self.invalid_slot(reason)),
             }
+        }
+    }
+
+    /// The retries of a slot whose first read failed validation: up to [`VALIDATION_RETRIES`] fresh reads, until one
+    /// gives something other than `Invalid` (the last outcome is returned either way).
+    #[inline(never)]
+    fn read_slot_again(&mut self) -> Result<SlotOutcome> {
+        let mut attempt = 1;
+        loop {
+            let read = self.read_slot(true)?;
+            #[cfg(test)]
+            let read = tests::scripted(read);
+            match read {
+                SlotOutcome::Invalid(_) if attempt < VALIDATION_RETRIES => attempt += 1,
+                other => return Ok(other),
+            }
+        }
+    }
+
+    /// Completes a record that the slot read decoded into `self.found`: records where its payload is and moves the
+    /// cursor past it. Always returns `Ok(true)` unless the sequence numbers are exhausted.
+    #[inline(always)]
+    fn step_past_record(&mut self, len: u32) -> Result<bool> {
+        self.waiting_since = None;
+        let Some(next_seq) = self.next_seq.checked_add(1) else {
+            return Err(self.sequence_exhausted());
+        };
+        self.found.payload_at = self.offset + format::RECORD_HEADER_LEN as u64;
+        self.found.payload_len = len as usize - format::RECORD_HEADER_LEN;
+        self.offset += format::align8(u64::from(len));
+        self.next_seq = next_seq;
+        Ok(true)
+    }
+
+    #[inline(never)]
+    fn sequence_exhausted(&self) -> Error {
+        Error::corrupt(
+            &self.seg.path,
+            self.offset,
+            CorruptReason::SequenceExhausted,
+        )
+    }
+
+    /// At an empty slot: checks the segment's identity once per [`IDENTITY_CHECK_INTERVAL`] of waiting there.
+    #[inline(never)]
+    fn at_empty_slot(&mut self) -> Result<()> {
+        let now = Instant::now();
+        let since = *self.waiting_since.get_or_insert(now);
+        if now.duration_since(since) >= IDENTITY_CHECK_INTERVAL {
+            self.waiting_since = Some(now);
+            self.check_identity()?;
+        }
+        Ok(())
+    }
+
+    /// The error for a slot that still fails validation after the retries (`Error::Discarded` if the segment was
+    /// replaced or removed).
+    #[inline(never)]
+    fn invalid_slot(&self, reason: CorruptReason) -> Error {
+        match self.check_identity() {
+            Err(e) => e,
+            Ok(()) => Error::corrupt(&self.seg.path, self.offset, reason),
         }
     }
 
@@ -608,7 +694,8 @@ impl Reader {
         Ok(())
     }
 
-    /// One attempt at reading the slot at the cursor. `fresh` forces the `pread` path to re-read from the file.
+    /// One attempt at reading the slot at the cursor. `fresh` forces the `pread` path to re-read from the file. A
+    /// record's header is decoded into `self.found.header` (also by reads whose record the caller then ignores).
     fn read_slot(&mut self, fresh: bool) -> Result<SlotOutcome> {
         let offset = self.offset;
         let expected = self.next_seq;
@@ -622,7 +709,14 @@ impl Reader {
             // copied. A damaged length is normally rejected by the bounds checks and the CRC before any slice
             // exists; validation is not proof, and ADR 0027 → "Which loads can race" says what a damaged commit
             // word can lead to.
-            return Ok(read_mapped(map, word, offset, size, expected));
+            return Ok(read_mapped(
+                map,
+                word,
+                offset,
+                size,
+                expected,
+                &mut self.found.header,
+            ));
         }
 
         // pread path (ADR 0003): observe the commit word, fence, then use body bytes read after the fence.
@@ -670,7 +764,13 @@ impl Reader {
             .checked_sub(self.buf_start)
             .and_then(|start| usize::try_from(start).ok())
             .and_then(|start| self.buf.get(start..start.checked_add(len as usize)?));
-        Ok(finish(pending, word, expected, bytes))
+        Ok(finish(
+            pending,
+            word,
+            expected,
+            bytes,
+            &mut self.found.header,
+        ))
     }
 
     /// Fills the `pread` buffer from `offset`: at least the frame of commit word `word`, normally a whole chunk,
@@ -696,7 +796,9 @@ impl Reader {
         Ok(())
     }
 
-    fn materialize(&self, found: Found) -> Record<'_> {
+    /// The record [`Reader::advance`] just found, borrowing its payload from the mapping or the buffer.
+    fn materialize(&self) -> Record<'_> {
+        let found = &self.found;
         let payload: &[u8] = match &self.seg.map {
             Some(map) => {
                 // SAFETY: the payload is part of a record validated after observing its non-zero commit word;
@@ -809,8 +911,15 @@ fn resize_buf(buf: &mut Vec<u8>, len: u64) -> std::io::Result<()> {
 
 /// Finishes classifying a slot of a mapped segment, given its observed commit word (the zero-copy reader, ADR 0027).
 /// Every byte is read with a `Relaxed` atomic load, each at most once; the results are those [`finish`] gives for
-/// the same bytes.
-fn read_mapped(map: &MapRo, word: u32, offset: u64, size: u64, expected: u64) -> SlotOutcome {
+/// the same bytes. A record's header goes to `header`.
+fn read_mapped(
+    map: &MapRo,
+    word: u32,
+    offset: u64,
+    size: u64,
+    expected: u64,
+    header: &mut RecordHeader,
+) -> SlotOutcome {
     match classify(word, offset, size) {
         Pending::Done(outcome) => outcome,
         Pending::Seal => match offset.checked_add(4).and_then(|at| map.load_u32(at)) {
@@ -827,7 +936,10 @@ fn read_mapped(map: &MapRo, word: u32, offset: u64, size: u64, expected: u64) ->
             match (crc, words) {
                 (Some(crc), Some(words)) => {
                     match format::decode_record_words(word, crc, words, expected) {
-                        Ok(header) => SlotOutcome::Record { header, len: word },
+                        Ok(decoded) => {
+                            *header = decoded;
+                            SlotOutcome::Record { len: word }
+                        }
                         Err(reason) => SlotOutcome::Invalid(reason),
                     }
                 }
@@ -881,8 +993,15 @@ fn pending_len(pending: Pending) -> u64 {
     }
 }
 
-/// Finishes classifying a slot, given the bytes after its commit word (`None` if they couldn't be read).
-fn finish(pending: Pending, word: u32, expected: u64, bytes: Option<&[u8]>) -> SlotOutcome {
+/// Finishes classifying a slot, given the bytes after its commit word (`None` if they couldn't be read). A record's
+/// header goes to `header`.
+fn finish(
+    pending: Pending,
+    word: u32,
+    expected: u64,
+    bytes: Option<&[u8]>,
+    header: &mut RecordHeader,
+) -> SlotOutcome {
     match (pending, bytes) {
         (Pending::Done(outcome), _) => outcome,
         (Pending::Seal, Some(crc)) if crc == format::seal_crc(expected).to_le_bytes() => {
@@ -892,7 +1011,10 @@ fn finish(pending: Pending, word: u32, expected: u64, bytes: Option<&[u8]>) -> S
         (Pending::Record { .. }, None) => SlotOutcome::Invalid(CorruptReason::BadLength(word)),
         (Pending::Record { .. }, Some(body)) => {
             match format::decode_record_body(word, body, expected) {
-                Ok((header, _)) => SlotOutcome::Record { header, len: word },
+                Ok((decoded, _)) => {
+                    *header = decoded;
+                    SlotOutcome::Record { len: word }
+                }
                 Err(reason) => SlotOutcome::Invalid(reason),
             }
         }
