@@ -245,7 +245,10 @@ enum tickertape_corrupt_reason
    */
   TICKERTAPE_CORRUPT_BAD_SEAL = 11,
   /**
-   * A sealed segment's successor is missing while later segments exist, or does not start where the seal says.
+   * A sealed segment's successor is missing while later segments exist, or does not start where the seal says; or
+   * the chain ends at an empty commit word in a segment that is not the newest, such as one in front of a successor
+   * segment that does not open (writer recovery then preserves the non-zero bytes after that word, or refuses:
+   * `docs/crash-contract.md` C11 (3)), or a segment is disconnected from the chain.
    */
   TICKERTAPE_CORRUPT_BROKEN_CHAIN = 12,
   /**
