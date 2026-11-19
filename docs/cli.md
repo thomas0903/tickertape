@@ -20,7 +20,10 @@ Errors and recovery warnings go to stderr. JSON results go to stdout (or the sel
   after that many idle seconds; it resets after each record. Text shows sequence, schema, timestamps, payload
   length and the first 32 payload bytes as lowercase hex, followed by `…` when truncated. JSON is the record
   JSONL contract below. Each line is flushed for live consumers. After discarded history, tail warns and seeks
-  to the sequence reported by the reader. `--decode market-demo` appends ` decoded=<kind> instrument=… side=…
+  to the sequence reported by the reader. If retention or archiving removed that sequence (a `--durable-only` tail
+  learns of a removal when the checkpoint moves past its position), it continues at the oldest sequence still in the
+  journal, with a warning on standard error naming the skipped records (`records A to B were removed before tail
+  read them; continuing at sequence C`). Warnings never go to standard output, so the JSON lines stay intact. `--decode market-demo` appends ` decoded=<kind> instrument=… side=…
   price=… qty=…` (plus ` trade_id=…` or ` action=…`) to each text line, or ` decoded=-` when the record isn't a
   market-demo event; with `--format json` it adds the same `decoded` object as `export --decode` (see below).
   `--durable-only` returns only records below the current checkpoint marker's `next_seq` and waits for later
@@ -31,7 +34,8 @@ Errors and recovery warnings go to stderr. JSON results go to stdout (or the sel
   Missing/invalid checkpoint slots yield `none` in text or `null` in JSON; a checkpoint I/O error fails the command.
 - `verify <DIR> [--json]`: checksum scan and chain validation, totals and every problem. Both inspect and verify
   return 2 when the scan reports problems. On a live journal the scan describes observations during the scan,
-  not an atomic snapshot.
+  not an atomic snapshot; states a running writer passes through are scanned again for up to 630 ms before they
+  are reported (see `operations.md` → Checking a journal).
 - `export <DIR> --format jsonl|parquet [--output <FILE>|-] [--from <SEQ>] [--to <SEQ>]
   [--decode market-demo] [--durable-only]`: writes records from the
   inclusive range; JSONL defaults to stdout and `--output -` also selects stdout for JSONL. The output file is created or
