@@ -1657,10 +1657,29 @@ fn storage(dir: &Path, head: &Head, rates: Option<Rates>) -> Result<Storage> {
     let total_bytes = vfs.f_blocks.saturating_mul(vfs.f_frsize);
     let spare = std::fs::symlink_metadata(dir.join(journal::SPARE_FILE))
         .ok()
-        .filter(|m| m.is_file() && format::validate_segment_size(m.len()).is_ok());
-    let next_segment_size = spare.as_ref().map_or(head.segment_size, |m| m.len()).max(1);
-    // A sparse file of the right length holds no space: count it only if its blocks are allocated.
-    let spare_segment = spare.is_some_and(|m| m.blocks().saturating_mul(512) >= m.len());
+        .filter(|m| m.is_file() && format::validate_segment_size(m.len()).is_ok())
+        // A sparse file of the right length holds no space: count it only if its blocks are allocated.
+        .map(|m| (m.len(), m.blocks().saturating_mul(512) >= m.len()));
+    Ok(estimate_storage(
+        available_bytes,
+        total_bytes,
+        spare,
+        head,
+        rates,
+    ))
+}
+
+/// The storage estimates from the observed figures: `spare` is the prepared spare's length and whether its blocks are
+/// allocated. Separate from [`storage`] so that tests can give it fixed figures (free space changes under them).
+fn estimate_storage(
+    available_bytes: u64,
+    total_bytes: u64,
+    spare: Option<(u64, bool)>,
+    head: &Head,
+    rates: Option<Rates>,
+) -> Storage {
+    let next_segment_size = spare.map_or(head.segment_size, |(len, _)| len).max(1);
+    let spare_segment = spare.is_some_and(|(_, allocated)| allocated);
     let estimated_rolls_left = available_bytes / next_segment_size;
     let estimated_time_to_full = rates
         .and_then(|r| r.bytes_per_sec)
@@ -1674,14 +1693,14 @@ fn storage(dir: &Path, head: &Head, rates: Option<Rates>) -> Result<Storage> {
                 .saturating_add(estimated_rolls_left.saturating_mul(next_segment_size));
             Duration::try_from_secs_f64(bytes as f64 / rate).ok()
         });
-    Ok(Storage {
+    Storage {
         available_bytes,
         total_bytes,
         next_segment_size,
         spare_segment,
         estimated_rolls_left,
         estimated_time_to_full,
-    })
+    }
 }
 
 fn writer_process(dir: &Path) -> WriterProcess {

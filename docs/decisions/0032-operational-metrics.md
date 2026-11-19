@@ -1,7 +1,7 @@
 # 0032: Operational metrics and reader beacons
 
 - **Status:** proposed
-- **Date:** 2026-11-19 (revised the same day after review rounds 1 and 2 of PR #8)
+- **Date:** 2026-11-19 (revised the same day after review rounds 1 and 2 of PR #8, and on 2026-11-20 after round 3)
 
 ## Context
 

@@ -110,6 +110,8 @@ fn help_and_usage_errors() {
                 .and(predicate::str::contains("--readers-dir"))
                 .and(predicate::str::contains("schema_version"))
                 .and(predicate::str::contains("3 a health threshold"))
+                // Round 3, item 9: the exception to an unknown age breaching --max-checkpoint-age.
+                .and(predicate::str::contains("except marker_changing"))
                 .and(predicate::str::contains(
                     "2 the sample found the journal corrupt",
                 )),

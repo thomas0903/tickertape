@@ -114,7 +114,9 @@ Errors and recovery warnings go to stderr. JSON results go to stdout (or the sel
   not written, a warning goes to standard error every time, and a watch goes on (a one-shot status exits 1).
   `--watch` with `--format prometheus` needs `--output`. Thresholds (`DUR` and `B` as for `archive`):
   `--max-checkpoint-age` is breached when records are uncovered and the checkpoint's estimated age is above `DUR` or
-  unknown, or there is no checkpoint (an idle, fully checkpointed journal and an empty one are healthy);
+  unknown, or there is no checkpoint (an idle, fully checkpointed journal and an empty one are healthy); an age
+  unknown because the marker kept changing while it was read (`marker_changing`, a checkpoint just happened) is not a
+  breach;
   `--min-headroom` when fewer than `B` bytes are available; `--min-headroom-segments` when fewer than `N` more
   segments are estimated to fit; `--max-reader-lag` when a **live** (or `uncertain`) reader beacon lags by more than
   `N` records (stale beacons, whose owner died, never count). Exit codes: **0** healthy; **3** a threshold is
@@ -314,9 +316,12 @@ not be established.
   means a process holds the beacon's lock; `stale` means its owner died (the values are its last report);
   `uncertain` means the lock couldn't be probed (locks unsupported); `invalid` and `unreadable` entries have null
   values, and so do `changing` ones (the name was replaced by another file during every attempt to read it). `lag_*` compare the beacon's last reported position with this sample's head, or with the checkpoint for a
-  `durable_only` reader; they are null with `lag_unknown_reason` when the beacon's segment is gone or is not the
-  file this journal has under that name (`other_history`: another journal sharing the directory, a replaced journal,
-  a repaired segment). `lag_bytes` is also null while a seek is pending (`seek_pending`). `unread_age_s` is the
+  `durable_only` reader; they are null with `lag_unknown_reason` when the beacon's segment is gone (`segment_gone`)
+  or is not the file this journal has under that name (`other_history`: another journal sharing the directory, a
+  replaced journal, a repaired segment), when its header can't be read (`segment_unreadable`), when a durable-only
+  reader's checkpoint marker is unusable (`checkpoint_unusable`), or when the segment is newer than every segment the
+  sample listed (`ahead_of_sample`: the writer created it after the sample listed the journal; the next sample sees
+  it). `lag_bytes` is also null while a seek is pending (`seek_pending`). `unread_age_s` is the
   observer's clock minus the first unread record's `local_ts_ns` (0 when caught up; null if that timestamp is later
   than the observer's clock).
 - `health`: `ok` if nothing is breached; `corrupt` if a breach is corruption (`head_invalid`, `checkpoint_invalid`,

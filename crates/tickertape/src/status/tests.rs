@@ -556,9 +556,10 @@ fn spare_segment_and_headroom() {
 
 /// Finding 13: a sealed head has no writable bytes left in the time estimate.
 #[test]
+/// The estimate from fixed figures (round 3, item 10: two `statvfs` calls in a row could see different free space
+/// while other tests wrote, which made this test fail once), plus the same relation through `statvfs` itself, re-read
+/// until two readings agree.
 fn time_to_full_of_a_sealed_head() {
-    let dir = tempfile::tempdir().unwrap();
-    drop(Writer::open(dir.path(), config()).unwrap());
     let rates = Rates {
         interval: Duration::from_secs(1),
         records_per_sec: 1.0,
@@ -572,13 +573,47 @@ fn time_to_full_of_a_sealed_head() {
         verified: true,
         chain_broken: false,
     };
-    let open = storage(dir.path(), &head, Some(rates)).unwrap();
+    let left = (SEG - 64) as f64 / SEG as f64;
+    // 10 segments and a half free; a spare of another size is used for the rolls but not counted as space.
+    let available = 10 * SEG + SEG / 2;
+    let open = estimate_storage(available, 100 * SEG, None, &head, Some(rates));
+    assert_eq!(open.estimated_rolls_left, 10);
+    assert_eq!(open.next_segment_size, SEG);
+    assert!((open.estimated_time_to_full.unwrap().as_secs_f64() - (10.0 + left)).abs() < 1e-6);
     head.end = HeadEnd::Sealed;
-    let sealed = storage(dir.path(), &head, Some(rates)).unwrap();
+    let sealed = estimate_storage(available, 100 * SEG, None, &head, Some(rates));
+    assert_eq!(sealed.estimated_time_to_full.unwrap().as_secs_f64(), 10.0);
+    let spare = estimate_storage(
+        available,
+        100 * SEG,
+        Some((2 * SEG, true)),
+        &head,
+        Some(rates),
+    );
+    assert_eq!(spare.next_segment_size, 2 * SEG);
+    assert_eq!(spare.estimated_rolls_left, 5);
+    assert!(spare.spare_segment);
+    assert_eq!(spare.estimated_time_to_full.unwrap().as_secs_f64(), 10.0);
+    assert!(
+        !estimate_storage(available, 100 * SEG, Some((2 * SEG, false)), &head, None).spare_segment
+    );
+    assert_eq!(
+        estimate_storage(available, 100 * SEG, None, &head, None).estimated_time_to_full,
+        None
+    );
+
+    // Through `statvfs`: the sealed head's estimate is its rolls, read until the free space holds still between two
+    // samples (other tests write meanwhile).
+    let dir = tempfile::tempdir().unwrap();
+    drop(Writer::open(dir.path(), config()).unwrap());
+    let consistent = (0..100).find_map(|_| {
+        let first = storage(dir.path(), &head, Some(rates)).unwrap();
+        let second = storage(dir.path(), &head, Some(rates)).unwrap();
+        (first == second).then_some(second)
+    });
+    let sealed = consistent.expect("the free space never held still over two statvfs calls");
     let rolls = sealed.estimated_rolls_left as f64;
     assert_eq!(sealed.estimated_time_to_full.unwrap().as_secs_f64(), rolls);
-    let left = (SEG - 64) as f64 / SEG as f64;
-    assert!((open.estimated_time_to_full.unwrap().as_secs_f64() - (rolls + left)).abs() < 1e-6);
 }
 
 #[test]

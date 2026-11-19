@@ -213,12 +213,16 @@ time() - tickertape_status_timestamp_seconds > 60
 tickertape_exposure_estimated_age_seconds > 30 or (tickertape_exposure_records > 0 unless tickertape_exposure_estimated_age_seconds)
 tickertape_storage_estimated_rolls_left < 2
 predict_linear(tickertape_storage_available_bytes[6h], 24 * 3600) < 0
-tickertape_reader_lag_records{reader="risk-engine"} > 100000 unless on(journal, reader) tickertape_reader_live == 0
+tickertape_reader_lag_records{reader="risk-engine"} > 100000 unless on(instance, job, journal, reader) tickertape_reader_live == 0
 ```
 
 The last rule counts every reader beacon except a stale one (`tickertape_reader_live` is 0 only for a beacon whose
 owner died, and absent when its lock state is unknown), as `--max-reader-lag` does: an `uncertain` beacon still
-counts. `tickertape_reader_live == 1` instead would silently skip `uncertain` beacons.
+counts. `tickertape_reader_live == 1` instead would silently skip `uncertain` beacons. The match keeps the scrape
+identity: `instance` and `job` are the labels Prometheus attaches to every scraped series by default (for a
+textfile collector, the node_exporter's), so a stale beacon on one host never suppresses a live reader's alert on
+another host that uses the same journal path and reader name. If your relabelling adds or replaces identifying
+labels (a `host` label, say), list those in `on(...)` too, or leave out `on(...)` to match on every label.
 
 As a health check (systemd, Kubernetes, a load balancer script), the exit code is enough:
 

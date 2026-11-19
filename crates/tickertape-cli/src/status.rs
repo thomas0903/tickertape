@@ -46,7 +46,7 @@ pub(crate) struct StatusArgs {
     /// Write each sample to FILE, replacing it atomically (for a node_exporter textfile collector); outside the journal
     #[arg(long, value_name = "FILE")]
     output: Option<PathBuf>,
-    /// Unhealthy if records are uncovered and the checkpoint's estimated age is above DUR (integer followed by d, h, m or s) or unknown, or there is no checkpoint
+    /// Unhealthy if records are uncovered and the checkpoint's estimated age is above DUR (integer followed by d, h, m or s) or unknown (except marker_changing: the marker was being rewritten, so a checkpoint just happened), or there is no checkpoint
     #[arg(long, value_name = "DUR", value_parser = archive::parse_duration)]
     max_checkpoint_age: Option<Duration>,
     /// Unhealthy if fewer than B bytes are available on the volume (optional K/M/G/T suffix)
