@@ -32,10 +32,24 @@ cargo test --workspace --all-features
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 cargo +1.85 check --workspace --all-features --all-targets   # MSRV
 cargo deny check
-cargo test -p tickertape-tests --release -- --ignored        # long tests: 1M records, 250-kill loop
+cargo test -p tickertape-tests --release -- --ignored        # long tests: 1M records, 250-kill loop, 20 s soak
 cargo +nightly miri test -p tickertape --lib format          # Miri on the format code
 RUSTFLAGS="--cfg loom" cargo test -p tickertape --lib --release protocol_model
+tests/compat/generate.sh --check-old-readers                 # released readers on new journals (ADR 0033)
+go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12    # workflow lint
 ```
+
+CI runs these on Linux x86-64 and macOS, and the tests, long tests and fuzz smoke on aarch64 Linux too.
+`cargo test --workspace` includes the format-v1 compatibility fixtures (`tests/compat/README.md`), which check the
+CLI and the Python decoder too and need `python3` in CI. A weekly workflow (`.github/workflows/soak.yml`) runs the
+soak for 90 minutes per platform; run it locally for longer before changing recovery, the writer or the readers:
+
+```bash
+TICKERTAPE_SOAK_SECS=1800 cargo test -p tickertape-tests --release --test soak -- --ignored --nocapture
+```
+
+It prints its seed and what it exercised; on failure it keeps the journal and logs in `target/tmp/soak-failures/`
+and prints the command that replays the seed (`TICKERTAPE_TEST_SEED`).
 
 On macOS, run the Linux checks in a VM or container too (`docs/playbooks/test-on-linux.md`), and keep test journals
 on a local filesystem (not tmpfs or a shared folder) when you test durability behaviour.
