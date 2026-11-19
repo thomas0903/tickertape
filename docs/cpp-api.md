@@ -99,15 +99,20 @@ GCC and Clang each unit keeps its own behaviour:
   that an exception can pass through over only its C types: the C structs it owns are held in a buffer type of its
   own. What the two modes still share is standard-library code over built-in and standard types (`std::string`,
   `std::optional<std::uint64_t>`, ...), which any program that mixes exception modes shares with or without this
-  header: mixing modes is only as safe as your toolchain's standard library makes it. The mixed-mode test covers GCC
-  and Clang on Linux and Apple Clang and Homebrew GCC on macOS.
+  header: mixing modes is only as safe as your toolchain's standard library makes it. The same goes for containers
+  your own code instantiates over the binding's C types: `tickertape::NewRecord` is the C struct, outside the mode
+  namespace, so a `std::vector<tickertape::NewRecord>` used in both modes is one shared instantiation. CI runs the
+  mixed-mode test with GCC and Clang on Linux and Apple Clang on macOS; Homebrew GCC on macOS was run by hand.
 - **Binding types do not cross that boundary.** A `tickertape::Writer` from a unit built with exceptions is a
   different type from one built without. If a header of yours declares `void feed(tickertape::Writer &)`, defining
   it in a `-fno-exceptions` component and calling it from an application built with exceptions fails to link
   (undefined reference to `feed(tickertape::v1::Writer&)`). The link error only helps with the commonest case, a
-  binding type in a **parameter list**: a binding type that appears only in a non-template function's **return
-  type** (`tickertape::Writer open_feed();`), or in a data member or a global, is not part of the symbol's name, so
-  such a crossing links, and is undefined behaviour. Do not let binding types cross the boundary at all; pass C
+  binding type in the **parameter list** of a function that is called directly by its name: a binding type that
+  appears only in a non-template function's **return type** (`tickertape::Writer open_feed();`), or in a data member
+  or a global, is not part of the symbol's name, and a call through a virtual function, a function pointer or an
+  `extern "C"` function does not go by the symbol's name at all (an interface such as
+  `struct Sink { virtual bool feed(tickertape::Writer &) = 0; };` implemented in one mode and called from the other
+  links). Such a crossing links, and is undefined behaviour. Do not let binding types cross the boundary at all; pass C
   handles (`writer.native_handle()`, used through the C API in `tickertape.h` on the other side) or plain data
   (sequence numbers, timestamps, payload bytes; `tickertape::NewRecord`, which is the C struct).
 - **Debug checks on or off.** Debug and release units share the types and can pass them freely; the few inline
@@ -241,7 +246,8 @@ tt::Writer writer = tt::Writer::open("/data/journal", options).value();
   `tt::new_record(schema_id, venue_ts_ns, local_ts_ns, data, size)`. A record keeps a pointer to its payload, not a
   copy, so **the payload must be a named object** (an lvalue) that outlives the append, or a view: an rvalue is
   accepted only if `tt::enable_borrowed_bytes<T>` is true for its type, which it is for `std::basic_string_view` and
-  `std::span`. For a view type of your own, specialise it (at any language level):
+  `std::span`. For a view type of your own, specialise it (at any language level), in the header that defines the
+  type, so that every translation unit sees it before its first use:
 
   ```cpp
   template <> inline constexpr bool tickertape::enable_borrowed_bytes<MyView> = true;

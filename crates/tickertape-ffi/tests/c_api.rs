@@ -1631,9 +1631,56 @@ fn brackets_balance(text: &str) -> bool {
     stack.is_empty()
 }
 
+/// Whether every scope still open at the end of `text` (preprocessed C++) is a namespace or an `extern "C"` block,
+/// so that a declaration placed there is a declaration of its own and not a member added to a class or a statement
+/// added to a function. String and character literals are skipped; a `'` after a letter or digit is a digit
+/// separator.
+fn at_namespace_scope(text: &str) -> bool {
+    let mut open: Vec<bool> = Vec::new();
+    // The tokens since the last `;`, `{` or `}`: what the next `{` belongs to.
+    let mut head = String::new();
+    let mut previous = ' ';
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' | '\'' if c == '"' || !previous.is_ascii_alphanumeric() => {
+                head.push(c);
+                while let Some(d) = chars.next() {
+                    if d == '\\' {
+                        chars.next();
+                    } else if d == c {
+                        break;
+                    } else {
+                        head.push(d);
+                    }
+                }
+                head.push(c);
+            }
+            '{' => {
+                let h = head.trim_start();
+                open.push(
+                    h.starts_with("namespace")
+                        || h.starts_with("inline namespace")
+                        || h.starts_with("extern \"C\""),
+                );
+                head.clear();
+            }
+            '}' => {
+                open.pop();
+                head.clear();
+            }
+            ';' => head.clear(),
+            _ => head.push(c),
+        }
+        previous = c;
+    }
+    open.iter().all(|namespace| *namespace)
+}
+
 /// Compares the preprocessed header at a lower and a higher language level: every line of the lower one must be in
 /// the higher one unchanged, and the lines only the higher one has must come in runs of whole declarations (balanced
-/// brackets, ending in `;` or `}`, after a line that ends a declaration or opens a scope).
+/// brackets, ending in `;` or `}`, after a line that ends a declaration or opens a scope) at namespace scope (a
+/// member added to a class changes that class's definition).
 fn standard_dependent_definitions(
     lower: &[(u32, String)],
     higher: &[(u32, String)],
@@ -1689,9 +1736,91 @@ fn standard_dependent_definitions(
                 higher_lines[start].0,
                 higher_lines[i - 1].0
             ));
+            continue;
+        }
+        let before: Vec<&str> = higher_lines[..start]
+            .iter()
+            .map(|(_, t)| t.as_str())
+            .collect();
+        if !at_namespace_scope(&before.join(" ")) {
+            problems.push(format!(
+                "lines {}..={} are added inside a class or a function, not at namespace scope: `{added}`",
+                higher_lines[start].0,
+                higher_lines[i - 1].0
+            ));
         }
     }
     problems
+}
+
+/// The comparison itself: what it must accept and what it must report.
+#[test]
+fn language_level_comparison_reports_changed_definitions() {
+    let lines = |text: &[(u32, &str)]| -> Vec<(u32, String)> {
+        text.iter().map(|(n, t)| (*n, (*t).to_owned())).collect()
+    };
+    let lower = lines(&[
+        (1, "extern \"C\" {"),
+        (2, "struct c_struct { int a; };"),
+        (3, "}"),
+        (4, "namespace tickertape { inline namespace v1 {"),
+        (5, "class Error {"),
+        (6, "const char *open() const { return \"{\"; }"),
+        (7, "char brace() const { return '{'; }"),
+        (8, "long big() const { return 1'000'000; }"),
+        (10, "};"),
+        (11, "inline bool ok(int n) {"),
+        (12, "return n > 0;"),
+        (14, "}"),
+        (17, "} }"),
+    ]);
+    assert_eq!(
+        standard_dependent_definitions(&lower, &lower),
+        Vec::<String>::new()
+    );
+    // Whole declarations added at namespace scope: accepted.
+    let mut added = lower.clone();
+    added.insert(12, (15, "template <class T>".to_owned()));
+    added.insert(
+        13,
+        (16, "inline bool spanned(T t) { return ok(t); }".to_owned()),
+    );
+    assert_eq!(
+        standard_dependent_definitions(&lower, &added),
+        Vec::<String>::new()
+    );
+    // A member added to a class: a whole declaration, but it changes the class.
+    let mut member = lower.clone();
+    member.insert(8, (9, "void only_cxx20() {}".to_owned()));
+    let problems = standard_dependent_definitions(&lower, &member);
+    assert_eq!(problems.len(), 1, "{problems:?}");
+    assert!(
+        problems[0].contains("not at namespace scope"),
+        "{problems:?}"
+    );
+    // A statement added to a function.
+    let mut statement = lower.clone();
+    statement.insert(11, (13, "(void)n;".to_owned()));
+    let problems = standard_dependent_definitions(&lower, &statement);
+    assert_eq!(problems.len(), 1, "{problems:?}");
+    assert!(
+        problems[0].contains("not at namespace scope"),
+        "{problems:?}"
+    );
+    // A changed line and a line that disappears.
+    let mut changed = lower.clone();
+    changed[10].1 = "return n >= 0;".to_owned();
+    changed.remove(7);
+    let problems = standard_dependent_definitions(&lower, &changed);
+    assert_eq!(problems.len(), 2, "{problems:?}");
+    assert!(
+        problems.iter().any(|p| p.contains("line 12 changes")),
+        "{problems:?}"
+    );
+    assert!(
+        problems.iter().any(|p| p.contains("line 8 disappears")),
+        "{problems:?}"
+    );
 }
 
 /// Nothing the header defines depends on the language level (ADR 0036 -> Language level): a block conditional on

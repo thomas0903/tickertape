@@ -71,7 +71,8 @@ taken by a template that accepts any contiguous range of `char`/`unsigned char`/
 that both include the header, and each inline function, class, variable template and inline variable must then have
 one definition, token for token. **Rule:** a block conditional on the language standard or on a library
 feature-test macro may only add whole declarations (`as_span`, the `char8_t` specialisation of `detail::is_byte`, the
-`std::span` specialisation of `enable_borrowed_bytes`); it never changes a definition that also exists at C++17.
+`std::span` specialisation of `enable_borrowed_bytes`), at namespace scope (a member added to a class changes that
+class's definition); it never changes a definition that also exists at C++17.
 Round 2 broke this: under C++20 `detail::is_byte_view_v` gained an `|| std::ranges::enable_borrowed_range<...>` term,
 so the two units held two definitions of one variable template. It is replaced by the binding's own opt-in
 (**Records**), the same at every level. `tests/c_api.rs` enforces the rule: it preprocesses the header as C++17,
@@ -113,8 +114,12 @@ GCC and Clang (the Itanium C++ ABI: Linux, macOS):
   to `append_batch`, which cannot throw.
 - **What remains shared between modes** is standard-library code over built-in and standard types (`std::string`,
   `std::optional<std::uint64_t>` and the like), which any program that mixes exception modes shares with or without
-  this header. Mixing modes is therefore only as safe as the toolchain's standard library makes it. The mixed-mode
-  test covers GCC and Clang on Linux (libstdc++) and Apple Clang and Homebrew GCC on macOS (libc++ and libstdc++).
+  this header, and a container that the user's code instantiates over the binding's C types
+  (`std::vector<tickertape::NewRecord>`: `NewRecord` is the C struct, outside the mode namespace), which is one
+  instantiation for both modes like round 2's `std::vector<tickertape_segment_info>`, only outside the header. Mixing
+  modes is therefore only as safe as the toolchain's standard library makes it. CI runs the mixed-mode test with GCC
+  and Clang on Linux (libstdc++) and Apple Clang on macOS (libc++); Homebrew GCC on macOS (libstdc++) was run by
+  hand, by setting `TICKERTAPE_FFI_CXX_COMPILERS` (on the macOS runner `g++` is Apple Clang).
 - **Units built in different exception modes can be linked into one program**, and each keeps its own behaviour for
   the binding: `value()` throws in the one and aborts in the other, a fill's exception is rethrown, and an allocation
   failure inside a binding function reaches the caller's `catch`.
@@ -123,9 +128,11 @@ GCC and Clang (the Itanium C++ ABI: Linux, macOS):
   `v1_noexcept::Writer`). Where a binding type is in a function's **parameter list**, it is part of the symbol's
   name, so a function declared as `bool is_open(const tickertape::Writer &)` in a shared header is a different
   function in each mode: defining it in a `-fno-exceptions` unit and calling it from an exceptions unit is a link
-  error (undefined reference). Where a binding type appears only in a non-template function's **return type** (or in
-  a data member or a global), it is not part of the symbol's name, so such a crossing links, and is undefined
-  behaviour. The rule is that binding types do not cross the boundary; the link error is a help for the commonest
+  error (undefined reference), when the call is a direct call by name. Where a binding type appears only in a
+  non-template function's **return type** (or in a data member or a global), it is not part of the symbol's name, and
+  a call through a virtual function, a function pointer or an `extern "C"` function does not go by the symbol's name
+  at all (a round-3 reviewer linked an interface with a virtual `feed(tickertape::Writer &)` implemented without
+  exceptions and called with them); such a crossing links, and is undefined behaviour. The rule is that binding types do not cross the boundary; the link error is a help for the commonest
   case, not a guarantee. Across such a boundary pass C handles (`native_handle()`, used through the C API on the
   other side) or plain data: `tickertape::NewRecord` is the C struct and is shared; sequence numbers, timestamps and
   payload bytes are plain values.
@@ -301,7 +308,8 @@ names is a named `Status`), and `-Wswitch` makes a new enumerator break the test
   the binding's own variable template `tickertape::enable_borrowed_bytes<T>` is true. It is `false` by default and
   `true` for `std::basic_string_view` and, where `std::span` exists, `std::span`; a user's own view type opts in by
   specialising it (`template <> inline constexpr bool tickertape::enable_borrowed_bytes<MyView> = true;`), at C++17
-  as well. Round 2 picked up `std::ranges::enable_borrowed_range` automatically in C++20, which made the header's
+  as well, in the header that defines the type (a unit that does not see the specialisation gets the deleted
+  overload, a compile error; one that sees it after a use gets "specialization after instantiation"). Round 2 picked up `std::ranges::enable_borrowed_range` automatically in C++20, which made the header's
   definition depend on the standard (**Language level**); the binding no longer consults it, so a C++20 type that
   opts only into it (or `std::ranges::subrange`) is refused unless it also specialises `enable_borrowed_bytes`. For
   any other range type the rvalue overload is deleted,

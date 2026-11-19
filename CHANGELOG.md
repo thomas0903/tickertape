@@ -22,10 +22,13 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   linked into one program, and binding types cannot be passed between units built in different exception modes: the
   inline namespace is `tickertape::v1` with exceptions and `tickertape::v1_noexcept` without, so every definition the
   header provides has a mode-specific symbol (and it instantiates no throwing standard-library function over only its
-  C types); a binding type in a parameter list makes a crossing a link error, but one only in a return type links and
-  is undefined, so the rule is not to cross. Standard-library code over standard types stays shared, as in any program
-  that mixes modes: that is as safe as the toolchain's standard library makes it (the mixed-mode test covers GCC and
-  Clang on Linux, Apple Clang and Homebrew GCC on macOS). The debug-check-dependent functions carry an `abi_tag`.
+  C types); a binding type in the parameter list of a function called directly by name makes a crossing a link error,
+  but one only in a return type, or passed through a virtual function, a function pointer or an `extern "C"`
+  function, links and is undefined, so the rule is not to cross. Standard-library code over standard types stays
+  shared, as in any program that mixes modes, and so does a container your own code instantiates over `NewRecord` or
+  another C type: that is as safe as the toolchain's standard library makes it (CI runs the mixed-mode test with GCC
+  and Clang on Linux and Apple Clang on macOS; Homebrew GCC on macOS was run by hand). The debug-check-dependent
+  functions carry an `abi_tag`.
   `new_record` refuses temporaries that own their bytes at compile time; rvalue views are accepted where
   `tickertape::enable_borrowed_bytes` is true (`std::basic_string_view`, `std::span`, and your own view types if you
   specialise it), the same at every language level. Paths are passed directly; the parameter type is the internal

@@ -108,9 +108,10 @@
 //   tickertape::Writer. What remains shared between modes is standard-library code over built-in and standard types
 //   (std::string, std::optional<std::uint64_t>, ...), as in any program that mixes modes: that is as safe as the
 //   toolchain's standard library makes it. Binding types must not cross a boundary between exception modes (pass C
-//   handles or plain data). A binding type in a function's parameter list makes such a crossing a link error; one
-//   only in a non-template function's return type (or in a data member or global) is not part of the symbol's name,
-//   so that crossing links and is undefined behaviour.
+//   handles or plain data). A binding type in the parameter list of a function called directly by name makes such a
+//   crossing a link error; one only in a non-template function's return type (or in a data member or global) is not
+//   part of the symbol's name, and a call through a virtual function, a function pointer or an extern "C" function
+//   does not go by the name, so those crossings link and are undefined behaviour.
 // - Debug-check mode: the types are shared, so that debug and release units can exchange them. The inline functions
 //   whose behaviour depends on the mode are declared TICKERTAPE_HPP_MODE_DEPENDENT, which gives them a different
 //   symbol in each mode (GCC's and Clang's abi_tag). A test fails if a function that mentions a debug-check macro,
@@ -635,7 +636,8 @@ inline constexpr Timeout::Forever wait_forever{};
 // Whether new_record() may keep a pointer into an rvalue of the byte range T: true only for views, whose bytes live
 // elsewhere and outlive the view (ADR 0036 -> Records). true for std::basic_string_view and, where the standard
 // library has it, std::span; false for everything else, including std::string, std::vector and std::array, which own
-// their bytes. Specialise it for a view type of your own (cv-unqualified, at namespace scope):
+// their bytes. Specialise it for a view type of your own (cv-unqualified, at namespace scope, in the header that
+// defines the type, so that every translation unit sees it before its first use):
 //
 //     template <> inline constexpr bool tickertape::enable_borrowed_bytes<MyView> = true;
 //
