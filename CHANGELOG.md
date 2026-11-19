@@ -15,6 +15,12 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   `BrokenChain` at the empty commit word before any byte of that segment changes; it used to zero them, then refuse
   at the next segment. With nothing non-zero after the word nothing changes. `verify` already reported this state as
   `BrokenChain` at the same position. The on-disk format is unchanged.
+- Changed: when the segment that follows an empty commit word exists but cannot be opened for a reason other than
+  its content (an I/O error such as a permission or a failed mapping; also a directory or a dangling link under a
+  segment's name), `Writer::open` now fails with `Error::Io` before it changes anything, under both recovery
+  policies. Only a segment that is invalid (`Error::Corrupt`) or of an unsupported version ends the chain there.
+  Until now any failure to open it ended the chain: after a plain crash during a roll, a transient error could make
+  `Quarantine` move that healthy segment and every later one to `quarantine/` (crash contract C11).
 - C++ binding (ADR 0036, `docs/cpp-api.md`): `crates/tickertape-ffi/include/tickertape.hpp`, a header-only C++17
   wrapper over the C ABI, shipped and installed (`cargo cinstall`) next to `tickertape.h`. It covers the whole C ABI:
   move-only `Writer`, `Reader`, option builders and `RecordBatch`; copying, zero-copy (a lambda) and batch appends
