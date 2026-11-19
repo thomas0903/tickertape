@@ -29,6 +29,9 @@ pub struct SegmentInfo {
 
 /// Lists the segments in `dir`, oldest first, with their decoded headers.
 ///
+/// A segment that retention (or writer recovery) removes between the directory listing and the opening of its file is
+/// not an error: the directory is listed again, so the result leaves it out.
+///
 /// # Errors
 ///
 /// [`Error::NotFound`] if there are none; [`Error::Corrupt`] or
@@ -36,32 +39,61 @@ pub struct SegmentInfo {
 /// [`Error::Io`].
 pub fn list_segments(dir: impl AsRef<Path>) -> Result<Vec<SegmentInfo>> {
     let dir = dir.as_ref();
+    let mut attempt = 1;
+    loop {
+        if let Some(segments) = list_once(dir, attempt == LISTING_ATTEMPTS)? {
+            return Ok(segments);
+        }
+        attempt += 1;
+    }
+}
+
+/// Listings [`list_segments`] and [`verify`] make when segments disappear while they run. Retention removes the
+/// oldest segments first, so the next listing already reflects a removal; more attempts are needed only if files
+/// keep disappearing, and on the last one a missing file is reported as an I/O error.
+const LISTING_ATTEMPTS: u32 = 8;
+
+/// Opens a listed segment. `Ok(None)` if it no longer exists, unless this is the `last` attempt.
+fn open_listed(path: &Path, last: bool) -> Result<Option<File>> {
+    crate::fault::hook(crate::fault::Point::InspectOpen);
+    match File::open(path) {
+        Ok(file) => Ok(Some(file)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !last => Ok(None),
+        Err(e) => Err(Error::io("open segment", path, e)),
+    }
+}
+
+/// One attempt at [`list_segments`]: `Ok(None)` if a listed segment disappeared.
+fn list_once(dir: &Path, last: bool) -> Result<Option<Vec<SegmentInfo>>> {
     let segments = journal::list_segments(dir)?;
     if segments.is_empty() {
         return Err(Error::NotFound {
             dir: dir.to_path_buf(),
         });
     }
-    segments
-        .into_iter()
-        .map(|(base, path)| {
-            let file = File::open(&path).map_err(|e| Error::io("open segment", &path, e))?;
-            let header = journal::read_header(&file, &path, base)?;
-            Ok(SegmentInfo {
-                path,
-                base_seq: base,
-                segment_size: header.segment_size,
-                format_version: format::FORMAT_VERSION,
-                created_unix_ns: header.created_unix_ns,
-            })
-        })
-        .collect()
+    let mut out = Vec::with_capacity(segments.len());
+    for (base, path) in segments {
+        let Some(file) = open_listed(&path, last)? else {
+            return Ok(None);
+        };
+        let header = journal::read_header(&file, &path, base)?;
+        out.push(SegmentInfo {
+            path,
+            base_seq: base,
+            segment_size: header.segment_size,
+            format_version: format::FORMAT_VERSION,
+            created_unix_ns: header.created_unix_ns,
+        });
+    }
+    Ok(Some(out))
 }
 
 /// Reads the current checkpoint marker without taking the writer lock or modifying the journal.
 ///
 /// Returns `Ok(None)` when `checkpoint` is missing or neither slot is valid. A truncated marker may still
-/// contain a valid slot. This is an observation of the marker, not validation of the position it describes.
+/// contain a valid slot. This is an observation of the marker, not validation of the position it describes. The
+/// writer updates the marker in place and neither retention nor recovery removes it, so reading it can't race with
+/// them (durable-only readers read it the same way).
 ///
 /// # Errors
 ///
@@ -146,12 +178,30 @@ pub struct Problem {
 /// not a problem. Anything that a reader would reject is, and so are states that only a crash leaves behind and the
 /// next writer repairs (a sealed newest segment without a successor, or an unsealed segment that has one).
 ///
+/// Against a live journal, the report describes the segments listed when the scan started, as the scan found them.
+/// A writer appending or rolling during the scan is not a problem (states it passes through are looked at again).
+/// Neither is retention: a segment it removes before the scan reaches it is not an error, and since retention
+/// removes the oldest segments first, the report then starts at the oldest segment the scan could still open,
+/// leaving out the removed history and what was found in it.
+///
 /// # Errors
 ///
 /// [`Error::NotFound`] or [`Error::Io`]. Corruption is reported in
 /// [`VerifyReport::problems`], not as an error.
 pub fn verify(dir: impl AsRef<Path>) -> Result<VerifyReport> {
     let dir = dir.as_ref();
+    let mut attempt = 1;
+    loop {
+        if let Some(report) = verify_once(dir, attempt == LISTING_ATTEMPTS)? {
+            return Ok(report);
+        }
+        attempt += 1;
+    }
+}
+
+/// One attempt at [`verify`]: `Ok(None)` if a listed segment disappeared other than from the oldest end, or the
+/// newest listed segment did.
+fn verify_once(dir: &Path, last: bool) -> Result<Option<VerifyReport>> {
     let segments = journal::list_segments(dir)?;
     if segments.is_empty() {
         return Err(Error::NotFound {
@@ -165,10 +215,22 @@ pub fn verify(dir: impl AsRef<Path>) -> Result<VerifyReport> {
         last_seq: None,
         problems: Vec::new(),
     };
-    let mut expected_base = segments[0].0;
+    let mut expected_base = Some(segments[0].0);
     let count = segments.len();
     for (i, (base, path)) in segments.into_iter().enumerate() {
         let newest = i + 1 == count;
+        let Some(file) = open_listed(&path, last)? else {
+            // Removed after the listing. Removal from the oldest end (retention, archiving) also took everything
+            // checked so far: start the report again from the next segment. Anything else: verify again.
+            let oldest = journal::list_segments(dir)?.first().map(|(b, _)| *b);
+            if newest || oldest.is_none_or(|oldest| base >= oldest) {
+                return Ok(None);
+            }
+            report.segments.clear();
+            report.problems.clear();
+            expected_base = None;
+            continue;
+        };
         let mut seg = SegmentReport {
             info: None,
             path: path.clone(),
@@ -177,14 +239,13 @@ pub fn verify(dir: impl AsRef<Path>) -> Result<VerifyReport> {
             used_bytes: 0,
             end: SegmentEnd::Damaged,
         };
-        if base != expected_base {
+        if let Some(expected) = expected_base.filter(|expected| *expected != base) {
             report.problems.push(Problem {
                 path: path.clone(),
                 offset: 0,
-                reason: CorruptReason::BrokenChain(expected_base),
+                reason: CorruptReason::BrokenChain(expected),
             });
         }
-        let file = File::open(&path).map_err(|e| Error::io("open segment", &path, e))?;
         let header = match journal::read_header(&file, &path, base) {
             Ok(h) => h,
             Err(Error::Corrupt { reason, offset, .. }) => {
@@ -215,25 +276,29 @@ pub fn verify(dir: impl AsRef<Path>) -> Result<VerifyReport> {
             created_unix_ns: header.created_unix_ns,
         });
 
-        let mut scan = scan_file(&path, base)?;
-        if newest && matches!(scan.end, ScanEnd::Invalid(_)) {
-            // A live writer may have been mid-append while we copied the file: look again before reporting.
+        let mut scan = journal::scan_open(&file, &path, base)?;
+        let transient = match scan.end {
+            // A live writer may have been mid-append while we copied the file.
+            ScanEnd::Invalid(_) => newest,
+            // A rolling writer publishes the next segment just before it seals this one.
+            ScanEnd::Empty => !newest,
+            _ => false,
+        };
+        if transient {
             std::thread::sleep(Duration::from_millis(50));
-            scan = scan_file(&path, base)?;
+            scan = journal::scan_open(&file, &path, base)?;
         }
         seg.records = scan.records;
         seg.end_seq = scan.next_seq;
         seg.used_bytes = scan.end_offset;
-        report.records += scan.records;
-        if scan.records > 0 {
-            report.first_seq.get_or_insert(base);
-            report.last_seq = Some(scan.next_seq - 1);
-        }
         match scan.end {
             ScanEnd::Seal => {
                 seg.used_bytes += format::SEAL_LEN as u64;
                 seg.end = SegmentEnd::Sealed;
-                if newest {
+                // Unless the writer rolled after the listing, the successor exists now.
+                if newest
+                    && journal::path_identity(&journal::segment_path(dir, scan.next_seq)).is_none()
+                {
                     report.problems.push(Problem {
                         path: path.clone(),
                         offset: scan.end_offset,
@@ -253,15 +318,20 @@ pub fn verify(dir: impl AsRef<Path>) -> Result<VerifyReport> {
                 reason,
             }),
         }
-        expected_base = scan.next_seq;
+        expected_base = Some(scan.next_seq);
         report.segments.push(seg);
     }
-    Ok(report)
-}
-
-/// Scans a segment file with bounded memory (`pread` windows; see [`journal::scan_file`]).
-fn scan_file(path: &Path, base: u64) -> Result<format::ScanResult> {
-    journal::scan_file(path, base)
+    // Totals over the segments reported (records in a segment run from its base to `end_seq`).
+    report.records = report.segments.iter().map(|s| s.records).sum();
+    let mut with_records = report.segments.iter().filter(|s| s.records > 0);
+    report.first_seq = with_records.next().map(|s| s.end_seq - s.records);
+    report.last_seq = report
+        .segments
+        .iter()
+        .rev()
+        .find(|s| s.records > 0)
+        .map(|s| s.end_seq - 1);
+    Ok(Some(report))
 }
 
 #[cfg(test)]

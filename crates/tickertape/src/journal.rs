@@ -213,12 +213,17 @@ impl format::SegmentView for PreadView<'_> {
 /// windows (the file is never mapped, so other processes can't affect memory safety).
 pub(crate) fn scan_file(path: &Path, base: u64) -> Result<format::ScanResult> {
     let file = File::open(path).map_err(|e| Error::io("open segment", path, e))?;
+    scan_open(&file, path, base)
+}
+
+/// Like [`scan_file`], for a segment file that is already open (`path` names it in errors).
+pub(crate) fn scan_open(file: &File, path: &Path, base: u64) -> Result<format::ScanResult> {
     let len = file
         .metadata()
         .map_err(|e| Error::io("stat segment", path, e))?
         .len();
     let view = PreadView {
-        file: &file,
+        file,
         len,
         window: std::cell::RefCell::new((0, Vec::new())),
         error: std::cell::RefCell::new(None),

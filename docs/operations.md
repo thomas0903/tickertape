@@ -124,7 +124,9 @@ copy sealed segments without changing the journal.
 Readers that are still inside a segment you delete keep reading it (they hold the file open), but when they reach
 its end they return `Error::Discarded`, because the file is gone; seek to their position to continue
 (`tickertape tail` does this automatically). Readers positioned before the oldest remaining segment get
-`Error::SeqUnavailable` from `seek`. `Reader::open` starts at the oldest segment that exists.
+`Error::SeqUnavailable` from `seek`, also when the removal happens while `seek` runs. `Reader::open` starts at the
+oldest segment that exists. A removal never shows up as a corruption error or an I/O "not found" error in readers,
+`tickertape inspect` or `tickertape verify` (crash contract C14).
 
 Never truncate or edit a segment in place while anything uses the journal: processes that map it can receive
 `SIGBUS`.

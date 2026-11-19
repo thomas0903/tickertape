@@ -22,6 +22,8 @@ const CHUNK: usize = 64 * 1024;
 const NOTIFY_MAX_WAIT: Duration = Duration::from_millis(100);
 /// Re-reads before a validation failure is reported as corruption (the copy may predate the commit).
 const VALIDATION_RETRIES: u32 = 3;
+/// Listings `open` and `seek` make when the segment they chose disappears before they can open it.
+const LISTING_ATTEMPTS: u32 = 8;
 
 /// An independent cursor over a journal, in this or another process.
 ///
@@ -101,6 +103,9 @@ enum SlotOutcome {
 impl Reader {
     /// Opens the journal in `dir`, positioned at the first record of the oldest segment.
     ///
+    /// If retention removes the oldest segment while the reader opens it, the reader opens the oldest segment that
+    /// remains; it doesn't report the removed file.
+    ///
     /// # Errors
     ///
     /// [`Error::NotFound`] if `dir` has no segments (for example, the writer hasn't started),
@@ -129,13 +134,12 @@ impl Reader {
     }
 
     fn open_inner(dir: &Path, config: ReaderConfig, mapped: bool) -> Result<Reader> {
-        let segments = journal::list_segments(dir)?;
-        let Some((base, _)) = segments.first() else {
-            return Err(Error::NotFound {
+        let (base, seg) = open_listed(dir, mapped, |segments| match segments.first() {
+            Some((base, _)) => Ok(*base),
+            None => Err(Error::NotFound {
                 dir: dir.to_path_buf(),
-            });
-        };
-        let seg = open_segment(dir, *base, mapped)?;
+            }),
+        })?;
         let waker = config.notify.then(|| crate::notify::Waker::new(dir));
         Ok(Reader {
             dir: dir.to_path_buf(),
@@ -143,9 +147,9 @@ impl Reader {
             mapped,
             seg,
             offset: format::SEGMENT_HEADER_LEN as u64,
-            next_seq: *base,
+            next_seq: base,
             durable_next_seq: 0,
-            skip_until: *base,
+            skip_until: base,
             buf: Vec::new(),
             buf_start: 0,
             scratch: Vec::new(),
@@ -160,26 +164,35 @@ impl Reader {
     /// writer gets there, and records before `seq` are skipped. Every record on the way is validated, so the reader
     /// only lands on positions along the journal's current chain.
     ///
+    /// Retention may remove the segment holding `seq` while `seek` runs (between listing the segments and opening
+    /// the chosen one). `seek` then lists the segments again, so it returns [`Error::SeqUnavailable`] with the new
+    /// oldest sequence number, never an I/O error for the removed file. A segment removed just after `seek`
+    /// returns is still read, and the reader returns [`Error::Discarded`] at its end, as for any removed segment.
+    ///
     /// # Errors
     ///
-    /// [`Error::SeqUnavailable`] if `seq` is older than the oldest segment;
-    /// [`Error::Corrupt`] or [`Error::Io`] while locating it.
+    /// [`Error::SeqUnavailable`] if `seq` is older than the oldest segment, including when retention removes it
+    /// during the call;
+    /// [`Error::Corrupt`] or [`Error::Io`] while locating it. An I/O "not found" error for a segment that `seek`
+    /// listed is returned only if the chosen segment disappeared on each of 8 listings in a row.
     pub fn seek(&mut self, seq: u64) -> Result<()> {
-        let segments = journal::list_segments(&self.dir)?;
-        let Some((first, _)) = segments.first() else {
-            return Err(Error::NotFound {
-                dir: self.dir.clone(),
-            });
-        };
-        let Some((base, _)) = segments.iter().rev().find(|(b, _)| *b <= seq) else {
-            return Err(Error::SeqUnavailable {
-                requested: seq,
-                first: *first,
-            });
-        };
-        self.seg = open_segment(&self.dir, *base, self.mapped)?;
+        let (base, seg) = open_listed(&self.dir, self.mapped, |segments| {
+            let Some((first, _)) = segments.first() else {
+                return Err(Error::NotFound {
+                    dir: self.dir.clone(),
+                });
+            };
+            match segments.iter().rev().find(|(b, _)| *b <= seq) {
+                Some((base, _)) => Ok(*base),
+                None => Err(Error::SeqUnavailable {
+                    requested: seq,
+                    first: *first,
+                }),
+            }
+        })?;
+        self.seg = seg;
         self.offset = format::SEGMENT_HEADER_LEN as u64;
-        self.next_seq = *base;
+        self.next_seq = base;
         self.skip_until = seq;
         self.buf.clear();
         self.waiting_since = None;
@@ -196,8 +209,12 @@ impl Reader {
     ///
     /// [`Error::Corrupt`] if the bytes at the cursor fail validation. The cursor doesn't move,
     /// so calling again retries the same position (which may succeed after a writer recovery).
-    /// [`Error::Discarded`] if writer recovery or retention replaced or removed the segment at the cursor;
-    /// call [`Reader::seek`] to continue on the current chain.
+    /// [`Error::Discarded`] if writer recovery or retention replaced or removed the segment at the cursor
+    /// (including when retention removed both it and the next segment while the reader was moving between them);
+    /// call [`Reader::seek`] to continue on the current chain. A removal is never reported as corruption or as an
+    /// I/O "not found" error.
+    /// [`Error::Corrupt`] with [`CorruptReason::BrokenChain`] if the segment at the cursor is sealed and still in
+    /// place but the next segment is missing.
     /// [`Error::Io`] if the next segment can't be opened.
     pub fn try_next(&mut self) -> Result<Option<Record<'_>>> {
         match self.advance()? {
@@ -407,11 +424,14 @@ impl Reader {
                 }
                 SlotOutcome::Seal => {
                     self.check_identity()?;
+                    crate::fault::hook(crate::fault::Point::ReaderSeal);
                     let next = match open_segment(&self.dir, self.next_seq, self.mapped) {
                         Ok(next) => next,
-                        Err(Error::Io { source, .. })
-                            if source.kind() == std::io::ErrorKind::NotFound =>
-                        {
+                        Err(e) if e.is_not_found() => {
+                            // Retention removes the oldest segment first, so a successor it removed means this
+                            // segment is gone too: that is discarded history. A successor missing while this
+                            // segment is still in place is a broken chain.
+                            self.check_identity()?;
                             return Err(Error::corrupt(
                                 &self.seg.path,
                                 self.offset,
@@ -548,6 +568,27 @@ impl Reader {
             venue_ts_ns: found.header.venue_ts_ns,
             local_ts_ns: found.header.local_ts_ns,
             payload,
+        }
+    }
+}
+
+/// Lists the segments, lets `choose` pick one, and opens it. If the chosen segment has disappeared by the time it is
+/// opened (retention or archiving removed it, or writer recovery quarantined it), lists again, so that `choose` sees
+/// the journal as it is now. Retention removes the oldest segments first, so the second listing already reflects a
+/// removal; after [`LISTING_ATTEMPTS`] listings in a row whose chosen segment vanished, the last "not found" error is
+/// returned.
+fn open_listed(
+    dir: &Path,
+    mapped: bool,
+    choose: impl Fn(&[(u64, PathBuf)]) -> Result<u64>,
+) -> Result<(u64, OpenSegment)> {
+    let mut attempts = 1;
+    loop {
+        let base = choose(&journal::list_segments(dir)?)?;
+        crate::fault::hook(crate::fault::Point::ReaderOpen);
+        match open_segment(dir, base, mapped) {
+            Err(e) if e.is_not_found() && attempts < LISTING_ATTEMPTS => attempts += 1,
+            result => return result.map(|seg| (base, seg)),
         }
     }
 }
