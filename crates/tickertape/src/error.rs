@@ -13,6 +13,9 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[non_exhaustive]
 pub enum Error {
     /// An operating-system call failed.
+    ///
+    /// A reader also reports a read buffer it cannot allocate this way, with kind
+    /// [`OutOfMemory`](std::io::ErrorKind::OutOfMemory): a frame too large for the address space of a 32-bit target.
     #[error("{op} failed for {}: {source}", path.display())]
     Io {
         /// What tickertape was doing, e.g. `"preallocate segment"`.

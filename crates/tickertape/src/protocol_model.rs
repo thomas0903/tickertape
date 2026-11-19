@@ -114,3 +114,57 @@ fn two_readers_agree() {
         }
     });
 }
+
+/// A record whose body is several words with a checksum, validated the way the zero-copy reader does it since
+/// ADR 0027: after the commit word and the fence, each body word is read once and fed to the check as it is read,
+/// with no copy and no second read. The model reads the words non-atomically (`UnsafeCell`), which is stricter than
+/// the reader's `Relaxed` atomic loads: loom fails on any read that races with the writer.
+struct WordRecord {
+    commit: AtomicU32,
+    /// Word 0 is the checksum of the commit word and words 1 and 2.
+    words: [UnsafeCell<u64>; 3],
+}
+
+fn check(len: u32, a: u64, b: u64) -> u64 {
+    (u64::from(len) ^ a.rotate_left(7) ^ b.rotate_left(29)).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+}
+
+#[test]
+fn single_pass_validation_after_the_fence_always_passes() {
+    loom::model(|| {
+        let r = Arc::new(WordRecord {
+            commit: AtomicU32::new(0),
+            words: std::array::from_fn(|_| UnsafeCell::new(0)),
+        });
+        let w = {
+            let r = r.clone();
+            thread::spawn(move || {
+                let (a, b) = (0x1111_2222_3333_4444, 0x5555_6666_7777_8888);
+                // SAFETY: loom checks these accesses; a race with the reader would fail the model.
+                r.words[1].with_mut(|p| unsafe { *p = a });
+                // SAFETY: as above.
+                r.words[2].with_mut(|p| unsafe { *p = b });
+                // SAFETY: as above.
+                r.words[0].with_mut(|p| unsafe { *p = check(24, a, b) });
+                r.commit.store(24, Ordering::Release);
+            })
+        };
+        let word = r.commit.load(Ordering::Relaxed);
+        if word != 0 {
+            fence(Ordering::Acquire);
+            // One pass: each word read exactly once, in the order the CRC lanes might use.
+            // SAFETY: as above.
+            let stored = r.words[0].with(|p| unsafe { *p });
+            // SAFETY: as above.
+            let a = r.words[1].with(|p| unsafe { *p });
+            // SAFETY: as above.
+            let b = r.words[2].with(|p| unsafe { *p });
+            assert_eq!(
+                stored,
+                check(word, a, b),
+                "a published record failed validation"
+            );
+        }
+        w.join().unwrap();
+    });
+}

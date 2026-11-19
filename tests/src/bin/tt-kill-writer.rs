@@ -2,8 +2,9 @@
 //! it is killed. Every 16 appends it prints the last sequence number whose `append` returned, so the test knows a
 //! lower bound of what was committed. It also checkpoints at random intervals.
 //!
-//! Usage: `tt-kill-writer <dir> <segment_size> <seed> [slow-fill]`
+//! Usage: `tt-kill-writer <dir> <segment_size> <seed> [mixed] [slow-fill]`
 //!
+//! With `mixed`, payload lengths follow `mixed_len` (up to 3,199 bytes) instead of `kill_len` (up to 512 bytes).
 //! With `slow-fill`, payloads are written by `append_with` in 8-byte steps with a pause in between, so that most
 //! kills land inside the fill closure: after the header fields and before the CRC and the commit word.
 
@@ -11,14 +12,20 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use tickertape::{NewRecord, Writer, WriterConfig};
-use tickertape_tests::{Rng, kill_len, payload};
+use tickertape_tests::{Rng, kill_len, mixed_len, payload};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let dir = PathBuf::from(&args[1]);
     let segment_size: u64 = args[2].parse().expect("segment_size");
     let mut rng = Rng::new(args[3].parse().expect("seed"));
-    let slow_fill = args.get(4).is_some_and(|a| a == "slow-fill");
+    let options = &args[4.min(args.len())..];
+    let slow_fill = options.iter().any(|a| a == "slow-fill");
+    let len_of: fn(u64) -> usize = if options.iter().any(|a| a == "mixed") {
+        mixed_len
+    } else {
+        kill_len
+    };
 
     let mut writer = Writer::open(&dir, WriterConfig::default().segment_size(segment_size))
         .expect("open writer");
@@ -26,7 +33,7 @@ fn main() {
     let mut next_checkpoint = rng.below(2000);
     loop {
         let seq = writer.next_seq();
-        let data = payload(seq, kill_len(seq));
+        let data = payload(seq, len_of(seq));
         let record = NewRecord {
             schema_id: (seq % 7) as u32,
             venue_ts_ns: seq * 10,

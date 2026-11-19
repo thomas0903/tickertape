@@ -1,6 +1,7 @@
 # 0003: Publication protocol and access to mapped memory
 
-- **Status:** accepted (owner approval, 2026-10-31)
+- **Status:** accepted (owner approval, 2026-10-31); the zero-copy reader's validation copy is superseded by
+  [0027](0027-mapped-reader-validates-in-place.md)
 - **Date:** 2026-10-31 (revised twice after cross-provider reviews the same day)
 
 ## Context

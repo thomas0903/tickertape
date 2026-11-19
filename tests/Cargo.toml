@@ -12,11 +12,12 @@ autotests = false
 tickertape = { workspace = true, features = ["fault-injection"] }
 
 [dev-dependencies]
+# Differential tests of the readers, and generated journals for the damaged-commit-word property test (already a
+# dev-dependency of tickertape).
+proptest = "1"
 tempfile = "3"
 # Parses tests/compat/fixtures/manifest.json (already in the lockfile through tickertape-cli).
 serde_json = "1"
-# Generated journals for the damaged-commit-word property test (already a dev-dependency of tickertape).
-proptest = "1"
 
 [[test]]
 name = "recovery"
@@ -57,6 +58,10 @@ path = "slow_reader.rs"
 [[test]]
 name = "durable_only"
 path = "durable_only.rs"
+
+[[test]]
+name = "mapped_reader"
+path = "mapped_reader.rs"
 
 [lints]
 workspace = true
