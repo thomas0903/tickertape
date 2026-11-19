@@ -80,10 +80,15 @@ pub enum Error {
         max: usize,
     },
 
-    /// The writer is poisoned after a failed checkpoint; durability of earlier records can't be guaranteed.
+    /// The writer is poisoned after a failed checkpoint, or after the zeroing of an abandoned write could not be
+    /// made durable ([`Writer::abandoned_write_error`](crate::Writer::abandoned_write_error)); durability of
+    /// earlier records can't be guaranteed.
     ///
-    /// Appends still work. See `docs/crash-contract.md` → Errors are sticky.
-    #[error("an earlier checkpoint failed; durability can no longer be guaranteed for this writer")]
+    /// Appends still work after a failed checkpoint. See `docs/crash-contract.md` → Errors are sticky.
+    #[error(
+        "an earlier checkpoint failed, or an abandoned write could not be zeroed durably; durability can no longer be \
+         guaranteed for this writer"
+    )]
     DurabilityLost,
 
     /// The next sequence number would be `u64::MAX`.

@@ -36,6 +36,8 @@ pub enum Point {
     /// Recovery repairing a corrupt tail, after the repaired copy replaced the segment, before later segments are
     /// handled (stands in for a crash there).
     RepairAfterRename,
+    /// Syncing the zeroing of an abandoned write (a panicking `append_with` fill closure).
+    AbandonedWriteSync,
 }
 
 #[cfg(feature = "fault-injection")]
