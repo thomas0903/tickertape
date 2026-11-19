@@ -1,9 +1,9 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{DirEntryExt, MetadataExt};
 use std::path::Path;
 
-use tickertape::{Reader, ReaderConfig};
+use tickertape::{Error, Reader, ReaderConfig};
 
 use crate::{Decoder, ExportArgs, ExportFormat, Failure, Result, output, parquet_export};
 
@@ -51,9 +51,19 @@ pub(crate) fn run(args: ExportArgs, stdout: &mut dyn Write) -> Result<()> {
         None
     };
     let mut snapshot = open(&args)?;
+    // The writing pass starts at the same record, not at the oldest segment when it opens: retention may remove the
+    // oldest segment between the passes.
+    let start = snapshot.position();
     let (count, terminal) = capture(&mut snapshot, args.to, end_seq);
     // Open the input before touching the destination, and reject output paths that alias journal files.
-    let mut reader = open(&args)?;
+    let mut reader = Reader::open(&args.dir, config(&args))?;
+    match reader.seek(start) {
+        Ok(()) => {}
+        // Nothing to export, so nothing was lost.
+        Err(Error::SeqUnavailable { .. }) if count == 0 => {}
+        Err(Error::SeqUnavailable { first, .. }) => return Err(removed(start, first)),
+        Err(error) => return Err(error.into()),
+    }
     match args.format {
         ExportFormat::Jsonl => {
             if args.output == Path::new("-") {
@@ -72,31 +82,55 @@ pub(crate) fn run(args: ExportArgs, stdout: &mut dyn Write) -> Result<()> {
             parquet_export::write(&mut reader, count, file, args.decode)?;
         }
     }
-    if let Some(error) = terminal {
-        return Err(error.into());
+    if let Some(failure) = terminal {
+        return Err(failure);
     }
     Ok(())
 }
 
+fn config(args: &ExportArgs) -> ReaderConfig {
+    ReaderConfig::default()
+        .durable_only(args.durable_only)
+        .notify(false)
+}
+
 fn open(args: &ExportArgs) -> Result<Reader> {
-    let mut reader = Reader::open(
-        &args.dir,
-        ReaderConfig::default()
-            .durable_only(args.durable_only)
-            .notify(false),
-    )?;
+    let mut reader = Reader::open(&args.dir, config(args))?;
     if let Some(from) = args.from {
         reader.seek(from)?;
     }
     Ok(reader)
 }
 
+/// Continues a pass after [`Error::Discarded`] at `seq` (recovery or retention replaced or removed the segment the
+/// reader holds): at `seq` on the current chain, or, if retention or archiving removed it, an error naming the records
+/// removed. A pass that has read a segment retention then removed loses nothing; one that meets removed records it
+/// hadn't read stops, so a partial export is never presented as complete.
+pub(crate) fn resume(reader: &mut Reader, seq: u64) -> Result<()> {
+    match reader.seek(seq) {
+        Ok(()) => Ok(()),
+        Err(Error::SeqUnavailable { first, .. }) => Err(removed(seq, first)),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Records `seq` to `first - 1` (`first`, the oldest sequence number left, is greater than `seq`) are gone.
+fn removed(seq: u64, first: u64) -> Failure {
+    let records = if first - 1 == seq {
+        format!(
+            "record {seq} was removed from the journal (by retention or archiving) before export read it"
+        )
+    } else {
+        format!(
+            "records {seq} to {} were removed from the journal (by retention or archiving) before export read them",
+            first - 1
+        )
+    };
+    Failure::usage(format!("export stopped at sequence {seq}: {records}"))
+}
+
 /// Capture a prefix without reading past the exclusive startup checkpoint boundary.
-fn capture(
-    reader: &mut Reader,
-    to: Option<u64>,
-    end_seq: Option<u64>,
-) -> (u64, Option<tickertape::Error>) {
+fn capture(reader: &mut Reader, to: Option<u64>, end_seq: Option<u64>) -> (u64, Option<Failure>) {
     let mut count = 0;
     let terminal = loop {
         if end_seq.is_some_and(|end| reader.position() >= end) {
@@ -111,7 +145,12 @@ fn capture(
                 }
             }
             Ok(None) => break None,
-            Err(error) => break Some(error),
+            Err(Error::Discarded { seq }) => {
+                if let Err(failure) = resume(reader, seq) {
+                    break Some(failure);
+                }
+            }
+            Err(error) => break Some(error.into()),
         }
     };
     (count, terminal)
@@ -124,17 +163,24 @@ fn jsonl(
     out: &mut dyn Write,
     decoder: Option<Decoder>,
 ) -> Result<()> {
-    for _ in 0..count {
-        match reader.try_next()? {
-            Some(record) => output::export_record(out, &record, decoder)?,
-            None => {
-                return Err(Failure::usage(
-                    "journal changed during export: captured records are no longer available",
-                ));
+    let mut written = 0;
+    while written < count {
+        match reader.try_next() {
+            Ok(Some(record)) => {
+                output::export_record(out, &record, decoder)?;
+                written += 1;
             }
+            Ok(None) => return Err(changed()),
+            Err(Error::Discarded { seq }) => resume(reader, seq)?,
+            Err(error) => return Err(error.into()),
         }
     }
     Ok(())
+}
+
+/// The writing pass found fewer records than the startup scan counted.
+pub(crate) fn changed() -> Failure {
+    Failure::usage("journal changed during export: captured records are no longer available")
 }
 
 fn destination(dir: &Path, path: &Path) -> Result<File> {
@@ -183,9 +229,11 @@ fn destination(dir: &Path, path: &Path) -> Result<File> {
 /// Fails if a file in the journal directory tree is the output file (a hard link), or if that can't be established.
 /// The one exception is the reader beacon directory `readers/`, which holds no journal data: beacons that disappear
 /// during the walk (dropped) and a `readers/` that can't be listed (another user's) are skipped, where v0.4.0
-/// failed. Everywhere else (segments, the checkpoint marker, `quarantine/`) the check fails closed, as in v0.4.0: an
-/// entry that vanishes or a directory that can't be listed is an error, so evidence in an unreadable `quarantine/`
-/// is never truncated.
+/// failed. Everywhere else (segments, the checkpoint marker, `quarantine/`) the check fails closed, as in v0.4.0: a
+/// directory that can't be listed is an error, so evidence in an unreadable `quarantine/` is never truncated. An
+/// entry that vanishes between the listing and its `stat` (retention removing or archiving a segment) is skipped,
+/// unless the inode number in its directory entry is the output's: a segment that archiving moves out of the
+/// directory during the walk may be the output's other name.
 fn reject_alias(dir: &Path, dev: u64, ino: u64) -> Result<()> {
     let readers = dir.join(tickertape::status::READERS_DIR);
     let mut pending = vec![dir.to_path_buf()];
@@ -203,9 +251,17 @@ fn reject_alias(dir: &Path, dev: u64, ino: u64) -> Result<()> {
                 Err(e) => return Err(output::io_error("read journal entry", e)),
             };
             let tolerant = entry.path().starts_with(&readers);
+            #[cfg(test)]
+            tests::before_stat(&entry.path());
             let metadata = match fs::symlink_metadata(entry.path()) {
                 Ok(metadata) => metadata,
                 Err(e) if tolerant && e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound && entry.ino() != ino => {
+                    continue;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(Failure::usage("export output aliases a journal file"));
+                }
                 Err(e) => return Err(output::io_error("stat journal entry", e)),
             };
             if metadata.dev() == dev && metadata.ino() == ino {
@@ -373,5 +429,221 @@ mod tests {
         let mut reader = Reader::open(dir.path(), ReaderConfig::default()).unwrap();
         assert_eq!(reader.next_owned().unwrap().unwrap().seq, 0);
         assert_eq!(reader.next_owned().unwrap().unwrap().seq, 1);
+    }
+
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use tickertape::fault::Point;
+    use tickertape::retention::{self, Action, Policy};
+
+    type StatHook = Box<dyn FnMut(&Path)>;
+
+    thread_local! {
+        static BEFORE_STAT: RefCell<Option<StatHook>> = const { RefCell::new(None) };
+    }
+
+    /// Test seam: runs in `reject_alias` after it reads a directory entry and before it stats it.
+    pub(super) fn before_stat(path: &Path) {
+        let hook = BEFORE_STAT.with(|h| h.borrow_mut().take());
+        if let Some(mut hook) = hook {
+            hook(path);
+            BEFORE_STAT.with(|h| {
+                h.borrow_mut().get_or_insert(hook);
+            });
+        }
+    }
+
+    fn append_large(writer: &mut Writer) {
+        writer
+            .append(&NewRecord {
+                schema_id: 1,
+                venue_ts_ns: 0,
+                local_ts_ns: 0,
+                payload: &[7; 40_000],
+            })
+            .unwrap();
+    }
+
+    /// Records 0..=5, one per segment, and a checkpoint in the newest segment: retention may remove segments 0 to 4.
+    fn retained_journal() -> (tempfile::TempDir, Writer) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer =
+            Writer::open(dir.path(), WriterConfig::default().segment_size(65536)).unwrap();
+        for _ in 0..6 {
+            append_large(&mut writer);
+        }
+        writer.checkpoint().unwrap();
+        (dir, writer)
+    }
+
+    /// Deletes the oldest segments, keeping `keep`.
+    fn retain(dir: &Path, keep: usize) {
+        let plan = retention::plan(dir, &Policy::default().max_segments(keep)).unwrap();
+        retention::apply(dir, &plan, &Action::Delete).unwrap();
+    }
+
+    fn at(point: Point, skip: usize, action: impl FnOnce() + 'static) {
+        tickertape::fault::clear();
+        tickertape::fault::run_at(point, skip, action);
+    }
+
+    fn seqs(jsonl: &[u8]) -> Vec<u64> {
+        String::from_utf8_lossy(jsonl)
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line).unwrap()["seq"]
+                    .as_u64()
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    fn export_args(dir: &Path) -> ExportArgs {
+        ExportArgs {
+            dir: dir.into(),
+            format: ExportFormat::Jsonl,
+            decode: None,
+            output: "-".into(),
+            from: None,
+            to: None,
+            durable_only: false,
+        }
+    }
+
+    /// A segment that retention removes between the listing and the `stat` of its entry is not an alias and not an
+    /// error. But an entry that is the output (a hard link) and moves out of the journal during the walk, as archiving
+    /// moves segments, is still refused: the inode number in its directory entry matches.
+    #[test]
+    fn alias_walk_skips_an_entry_removed_during_the_walk() {
+        let (dir, _writer) = retained_journal();
+        let out = tempfile::tempdir().unwrap();
+        let output = out.path().join("out.jsonl");
+        fs::write(&output, b"").unwrap();
+        let meta = fs::metadata(&output).unwrap();
+        let mut removed = false;
+        BEFORE_STAT.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move |path: &Path| {
+                if !removed && path.extension().is_some_and(|e| e == "tape") {
+                    fs::remove_file(path).unwrap();
+                    removed = true;
+                }
+            }))
+        });
+        let result = reject_alias(dir.path(), meta.dev(), meta.ino());
+        BEFORE_STAT.with(|h| h.borrow_mut().take());
+        assert!(result.is_ok(), "{:?}", result.err().map(|f| f.message));
+
+        let segment = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.extension().is_some_and(|e| e == "tape"))
+            .unwrap();
+        let linked = out.path().join("linked.jsonl");
+        fs::hard_link(&segment, &linked).unwrap();
+        let meta = fs::metadata(&linked).unwrap();
+        let archived = out.path().join("archived.tape");
+        BEFORE_STAT.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move |path: &Path| {
+                if path == segment {
+                    fs::rename(path, &archived).unwrap();
+                }
+            }))
+        });
+        let result = reject_alias(dir.path(), meta.dev(), meta.ino());
+        BEFORE_STAT.with(|h| h.borrow_mut().take());
+        assert_eq!(
+            result.err().map(|f| f.message).as_deref(),
+            Some("export output aliases a journal file")
+        );
+    }
+
+    /// Retention removes the oldest segment between the startup scan and the writing pass, and the writer appends: the
+    /// writing pass must start where the scan started (record 0), not at the new oldest segment, which would shift
+    /// the window by a record. Record 0 is gone, so the export fails naming it, before writing anything.
+    #[test]
+    fn writing_pass_starts_where_the_startup_scan_started() {
+        let (dir, writer) = retained_journal();
+        let writer = Rc::new(RefCell::new(writer));
+        let (path, w) = (dir.path().to_path_buf(), writer.clone());
+        // The startup scan's `Reader::open` is the first pass through the hook point, the writing pass's the second.
+        at(Point::ReaderOpen, 1, move || {
+            retain(&path, 5);
+            append_large(&mut w.borrow_mut());
+        });
+        let mut out = Vec::new();
+        let result = run(export_args(dir.path()), &mut out);
+        tickertape::fault::clear();
+        assert_eq!(seqs(&out), Vec::<u64>::new());
+        let failure = result.unwrap_err();
+        assert_eq!(failure.code, 1);
+        assert_eq!(
+            failure.message,
+            "export stopped at sequence 0: record 0 was removed from the journal (by retention or archiving) \
+             before export read it"
+        );
+    }
+
+    /// Retention removes the segment the writing pass has just read: nothing it planned to export is lost, so it
+    /// continues in the next segment. If retention also removed the next segment, the records in it are gone: the
+    /// export fails naming the first of them, after the records before it.
+    #[test]
+    fn writing_pass_continues_past_a_removed_segment_it_has_read() {
+        let (dir, _writer) = retained_journal();
+        let mut reader = Reader::open(dir.path(), ReaderConfig::default()).unwrap();
+        let path = dir.path().to_path_buf();
+        // At the seal of segment 0, after the reader checked that its segment is in place.
+        at(Point::ReaderSeal, 0, move || retain(&path, 5));
+        let mut out = Vec::new();
+        let result = jsonl(&mut reader, 6, &mut out, None);
+        tickertape::fault::clear();
+        assert!(result.is_ok(), "{:?}", result.err().map(|f| f.message));
+        assert_eq!(seqs(&out), [0, 1, 2, 3, 4, 5]);
+
+        let (dir, _writer) = retained_journal();
+        let mut reader = Reader::open(dir.path(), ReaderConfig::default()).unwrap();
+        let path = dir.path().to_path_buf();
+        at(Point::ReaderSeal, 0, move || retain(&path, 3));
+        let mut out = Vec::new();
+        let result = jsonl(&mut reader, 6, &mut out, None);
+        tickertape::fault::clear();
+        assert_eq!(seqs(&out), [0]);
+        let failure = result.unwrap_err();
+        assert_eq!(failure.code, 1);
+        assert_eq!(
+            failure.message,
+            "export stopped at sequence 1: records 1 to 2 were removed from the journal (by retention or archiving) \
+             before export read them"
+        );
+    }
+
+    /// The same for the startup scan: a removed segment it has read doesn't end the count; removed records it hadn't
+    /// read end it with the error naming the first of them.
+    #[test]
+    fn startup_scan_continues_past_a_removed_segment_it_has_read() {
+        let (dir, _writer) = retained_journal();
+        let mut reader = Reader::open(dir.path(), ReaderConfig::default()).unwrap();
+        let path = dir.path().to_path_buf();
+        at(Point::ReaderSeal, 0, move || retain(&path, 5));
+        let (count, terminal) = capture(&mut reader, None, None);
+        tickertape::fault::clear();
+        assert_eq!((count, terminal.map(|e| e.to_string())), (6, None));
+
+        let (dir, _writer) = retained_journal();
+        let mut reader = Reader::open(dir.path(), ReaderConfig::default()).unwrap();
+        let path = dir.path().to_path_buf();
+        at(Point::ReaderSeal, 0, move || retain(&path, 4));
+        let (count, terminal) = capture(&mut reader, None, None);
+        tickertape::fault::clear();
+        assert_eq!(
+            (count, terminal.map(|e| e.to_string())),
+            (
+                1,
+                Some(
+                    "export stopped at sequence 1: record 1 was removed from the journal (by retention or \
+                     archiving) before export read it"
+                        .to_owned()
+                )
+            )
+        );
     }
 }

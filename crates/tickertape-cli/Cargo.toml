@@ -32,6 +32,8 @@ tempfile = "3"
 parquet = { version = "59", default-features = false, features = ["snap"] }
 
 [dev-dependencies]
+# The unit tests race retention against the export and tail passes at the reader's hook points (src/fault.rs).
+tickertape = { workspace = true, features = ["fault-injection"] }
 assert_cmd = "2"
 predicates = "3"
 

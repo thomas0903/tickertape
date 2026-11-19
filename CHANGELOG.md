@@ -5,6 +5,17 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
+- Fix: `tickertape export` under retention or archiving (crash contract C14). Without `--from`, the writing pass
+  opened the journal again and started at whatever segment was oldest then, so retention between the startup scan and
+  the writing pass shifted the exported window (exit 0 with the wrong records) or failed with "journal changed during
+  export"; it now starts at the record the startup scan started at. A segment that recovery replaced or retention
+  removed after a pass had read it ended the export with exit 1 ("the segment at sequence N was replaced or removed");
+  both passes now continue at that position on the current chain. Records removed before export read them end it with
+  exit 1 and `export stopped at sequence N: records N to M were removed from the journal (by retention or archiving)
+  before export read them` (`record N was ... read it` for one), after the records before N (a Parquet file is
+  finalized, as on corruption). The check that the output file is not a journal file no longer fails (exit 1, "stat
+  journal entry") on a segment removed while it walks the directory; it skips that entry unless the inode number in
+  its directory entry is the output's.
 - C++ binding (ADR 0036, `docs/cpp-api.md`): `crates/tickertape-ffi/include/tickertape.hpp`, a header-only C++17
   wrapper over the C ABI, shipped and installed (`cargo cinstall`) next to `tickertape.h`. It covers the whole C ABI:
   move-only `Writer`, `Reader`, option builders and `RecordBatch`; copying, zero-copy (a lambda) and batch appends

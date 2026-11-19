@@ -11,7 +11,7 @@ use parquet::file::writer::{SerializedFileWriter, SerializedRowGroupWriter};
 use parquet::schema::parser::parse_message_type;
 use tickertape::{OwnedRecord, Reader};
 
-use crate::{Decoder, Failure, Result, output};
+use crate::{Decoder, Failure, Result, export, output};
 
 pub(crate) const SCHEMA: &str = "message tickertape_record {
   required int64 seq (INTEGER(64,false));
@@ -70,14 +70,18 @@ fn write_records(
         let capacity = remaining.min(ROW_GROUP_ROWS as u64) as usize;
         let mut rows = Vec::with_capacity(capacity);
         let mut terminal = None;
-        for _ in 0..capacity {
+        while rows.len() < capacity {
             match reader.next_owned() {
                 Ok(Some(record)) => rows.push(record),
                 Ok(None) => {
-                    terminal = Some(Failure::usage(
-                        "journal changed during export: captured records are no longer available",
-                    ));
+                    terminal = Some(export::changed());
                     break;
+                }
+                Err(tickertape::Error::Discarded { seq }) => {
+                    if let Err(e) = export::resume(reader, seq) {
+                        terminal = Some(e);
+                        break;
+                    }
                 }
                 Err(e) => {
                     terminal = Some(e.into());
@@ -268,6 +272,55 @@ mod tests {
                 exported.get_row_iter(None).unwrap().count(),
                 if corrupt { 1 } else { 2 }
             );
+        }
+    }
+
+    /// Retention removes the segment the writing pass has just read: the export continues in the next segment and is
+    /// complete. If retention also removed the next segment, the export fails naming its first record, after
+    /// finalizing the records before it as a readable file.
+    #[test]
+    fn writing_pass_continues_past_a_removed_segment_it_has_read() {
+        use tickertape::fault::Point;
+        use tickertape::retention::{self, Action, Policy};
+        for (keep, rows) in [(5, 6), (3, 1)] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut writer =
+                Writer::open(dir.path(), WriterConfig::default().segment_size(65536)).unwrap();
+            for _ in 0..6 {
+                writer
+                    .append(&NewRecord {
+                        schema_id: 1,
+                        venue_ts_ns: 0,
+                        local_ts_ns: 0,
+                        payload: &[7; 40_000],
+                    })
+                    .unwrap();
+            }
+            writer.checkpoint().unwrap();
+            let mut reader = Reader::open(dir.path(), ReaderConfig::default()).unwrap();
+            let path = dir.path().to_path_buf();
+            tickertape::fault::clear();
+            // At the seal of segment 0, after the reader checked that its segment is in place.
+            tickertape::fault::run_at(Point::ReaderSeal, 0, move || {
+                let plan = retention::plan(&path, &Policy::default().max_segments(keep)).unwrap();
+                retention::apply(&path, &plan, &Action::Delete).unwrap();
+            });
+            let file = tempfile::NamedTempFile::new().unwrap();
+            let result = write(&mut reader, 6, file.reopen().unwrap(), None);
+            tickertape::fault::clear();
+            if keep == 5 {
+                assert!(result.is_ok(), "{:?}", result.err().map(|f| f.message));
+            } else {
+                let failure = result.unwrap_err();
+                assert_eq!(failure.code, 1);
+                assert_eq!(
+                    failure.message,
+                    "export stopped at sequence 1: records 1 to 2 were removed from the journal (by retention or \
+                     archiving) before export read them"
+                );
+            }
+            let exported = SerializedFileReader::new(file.reopen().unwrap()).unwrap();
+            assert_eq!(exported.metadata().file_metadata().num_rows(), rows);
         }
     }
 }

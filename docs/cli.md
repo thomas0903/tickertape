@@ -50,9 +50,14 @@ Errors and recovery warnings go to stderr. JSON results go to stdout (or the sel
   [--decode market-demo] [--durable-only]`: writes records from the
   inclusive range; JSONL defaults to stdout and `--output -` also selects stdout for JSONL. The output file is created or
   truncated, but a path naming an existing journal entry (including via symlinks/hard links), or any path inside
-  the journal, is rejected. `--to` must not precede `--from`.
-  A first safe-reader pass captures the committed end, then a second pass emits those records, never following
-  subsequent appends. Corruption encountered in the selected startup scan is reported after the valid prefix
+  the journal, is rejected (an entry that retention removes while this check walks the directory is skipped, unless
+  the inode number in its directory entry is the output file's). `--to` must not precede `--from`.
+  A first safe-reader pass captures the committed end, then a second pass, starting at the record the first started
+  at, emits those records, never following subsequent appends. Under retention or archiving (crash contract C14),
+  a segment that recovery replaced or retention removed after a pass had read it loses nothing: the pass continues
+  at that position on the current chain. Records removed before a pass read them end the export with exit 1 and
+  `export stopped at sequence N: records N to M were removed from the journal (by retention or archiving) before
+  export read them`, after the records before N that the second pass had reached (a Parquet file is finalized). Corruption encountered in the selected startup scan is reported after the valid prefix
   has been written. An empty journal exports no records. Parquet requires a file destination (missing
   `--output` or `-` returns 1). Parquet uses Snappy compression
   and row groups of at most 100,000 records. On corruption the valid prefix is finalized as a readable file
