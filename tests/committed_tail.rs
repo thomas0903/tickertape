@@ -995,6 +995,77 @@ fn successor_that_does_not_open_ends_the_chain_at_the_seals_place() {
 }
 
 #[test]
+fn successor_that_fails_to_open_for_an_io_error_fails_the_open() {
+    // PR #23 review round 1, item 1: "does not open" means the successor itself is invalid (`Corrupt`,
+    // `UnsupportedVersion`). Here a crash between publishing segment 339 and sealing segment 0 (the seal's marker
+    // missing, with or without its CRC word) is followed by a healthy successor that the writer cannot open read-write:
+    // its write permissions are removed, as on files restored read-only. That is an I/O error about the successor, not
+    // evidence about the journal, so the open fails with it under both policies, before changing a byte or moving a
+    // file. Once the permissions are back, the next open completes the roll as after any such crash.
+    use std::os::unix::fs::PermissionsExt;
+    let base = tempfile::tempdir().unwrap();
+    let segs = sealed_journal(base.path(), false);
+    let (_, seal) = record_slots(&segs[0].1);
+    for whole in [false, true] {
+        for policy in [RecoveryPolicy::Quarantine, RecoveryPolicy::Fail] {
+            let what = format!("whole seal zeroed: {whole}, {policy:?}");
+            let dir = copy_journal(base.path());
+            let path = dir.path().join(segs[0].1.file_name().unwrap());
+            let successor = dir.path().join(segs[1].1.file_name().unwrap());
+            let raw = open_raw(&path);
+            raw.write_all_at(&[0; 4], seal).unwrap();
+            if whole {
+                raw.write_all_at(&[0; 4], seal + 4).unwrap();
+            }
+            drop(raw);
+            let before_files = files(dir.path());
+            let mode = fs::metadata(&successor).unwrap().permissions().mode();
+            fs::set_permissions(&successor, fs::Permissions::from_mode(0o444)).unwrap();
+            if fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&successor)
+                .is_ok()
+            {
+                // Running as root: permissions do not apply.
+                eprintln!("skipping: permissions have no effect (running as root?)");
+                return;
+            }
+            let opened = Writer::open(dir.path(), small_config().recovery(policy));
+            assert!(
+                matches!(&opened, Err(Error::Io { path: p, source, .. }) if *p == successor && source.kind() == std::io::ErrorKind::PermissionDenied),
+                "{what}: {:?}",
+                opened.as_ref().map(Writer::recovery_report)
+            );
+            drop(opened);
+            fs::set_permissions(&successor, fs::Permissions::from_mode(mode)).unwrap();
+            assert!(files(dir.path()) == before_files, "{what}: files changed");
+            assert!(!dir.path().join("quarantine").exists(), "{what}");
+
+            // Permissions restored: the roll completes (the CRC word, if any, zeroed in place, then the seal written).
+            let w = Writer::open(dir.path(), small_config().recovery(policy)).unwrap();
+            let actions = &w.recovery_report().actions;
+            let sealed = |a: &RecoveryAction| matches!(a, RecoveryAction::Sealed { segment } if *segment == path);
+            let zeroed_crc = |a: &RecoveryAction| matches!(a, RecoveryAction::ZeroedUncommitted { segment, offset, len: 4 } if *segment == path && *offset == seal + 4);
+            assert!(
+                match &actions[..] {
+                    [s] => whole && sealed(s),
+                    [z, s] => !whole && zeroed_crc(z) && sealed(s),
+                    _ => false,
+                },
+                "{what}: {actions:?}"
+            );
+            assert_eq!(w.next_seq(), 1200, "{what}");
+            drop(w);
+            let all = read_all(dir.path());
+            assert_eq!(all.len(), 1200, "{what}");
+            all.iter().for_each(check_record);
+            assert!(!dir.path().join("quarantine").exists(), "{what}");
+        }
+    }
+}
+
+#[test]
 fn crash_in_the_middle_of_a_broken_chain_repair() {
     // The repair of `successor_that_does_not_open_ends_the_chain_at_the_seals_place` (a tail after the seal's place in
     // front of a successor for exactly 339 that does not open), run through and interrupted at either point of the

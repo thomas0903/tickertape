@@ -953,7 +953,17 @@ impl Recovery<'_> {
                     let successor_pending =
                         seq != seg.base && bases.contains(&seq) && !visited.contains(&seq);
                     if successor_pending {
-                        if let Ok(next) = open_segment(self.dir, seq) {
+                        // "Does not open" means the successor itself is invalid: `Corrupt` (a short file, a bad
+                        // header, a size or base mismatch) or `UnsupportedVersion`, as in the seal branch below. Any
+                        // other error (an I/O error opening, reading or mapping it: `EACCES`, `EMFILE`, `ENOMEM`) says
+                        // nothing about the journal and is returned here, before anything is changed, under both
+                        // policies.
+                        let opened = match open_segment(self.dir, seq) {
+                            Ok(next) => Some(next),
+                            Err(Error::Corrupt { .. } | Error::UnsupportedVersion { .. }) => None,
+                            Err(e) => return Err(e),
+                        };
+                        if let Some(next) = opened {
                             // The successor for exactly `seq` exists, is not this segment (at the first record slot
                             // `seq` is this segment's own base), has not been visited, and opens and maps: `offset`
                             // is where this segment's seal belongs, and the chain continues in the successor (ADR
@@ -1371,10 +1381,15 @@ pub enum RecoveryAction {
     /// Non-zero bytes after an empty commit word were zeroed in place, without a copy (`docs/crash-contract.md`, C8
     /// and C11). This describes the action taken on the evidence recovery found, not what readers saw: after a
     /// process crash in an otherwise intact journal the bytes are an unpublished record body (or what is left of one)
-    /// or the CRC word of a seal recovery is about to write, which no reader saw, but after storage damage that left no evidence they can be
-    /// published records a reader has already returned (C11 (3)). Bytes after an empty commit word in front of a
-    /// segment for the expected sequence number that exists but does not open are not zeroed: they are preserved
-    /// ([`RecoveryAction::RepairedTail`] with [`CorruptReason::BrokenChain`](crate::CorruptReason::BrokenChain)).
+    /// or the CRC word of a seal recovery is about to write, which no reader saw, but after storage damage that left
+    /// no evidence they can be published records a reader has already returned (C11 (3)). Bytes after an empty commit
+    /// word in front of a segment for the expected sequence number that exists but does not open are not zeroed: when
+    /// the search finds no evidence of committed history after the word, they are preserved as
+    /// [`RecoveryAction::RepairedTail`] with [`CorruptReason::BrokenChain`](crate::CorruptReason::BrokenChain) (C11
+    /// (3)); when it finds some (other bytes after the seal's place and a segment with a higher base, for example),
+    /// they are preserved as for any evidence, with
+    /// [`CorruptReason::EmptyCommitWord`](crate::CorruptReason::EmptyCommitWord) or
+    /// [`CorruptReason::UncheckedTail`](crate::CorruptReason::UncheckedTail) (C11 (2)).
     ZeroedUncommitted {
         /// The segment.
         segment: PathBuf,
@@ -1389,9 +1404,10 @@ pub enum RecoveryAction {
     /// at its work bound ([`CorruptReason::EmptyCommitWord`](crate::CorruptReason::EmptyCommitWord),
     /// [`CorruptReason::UncheckedTail`](crate::CorruptReason::UncheckedTail)); at the place of a seal with damage
     /// beyond it ([`CorruptReason::BadSeal`](crate::CorruptReason::BadSeal)); or at an empty commit word with
-    /// non-zero bytes after it in front of a segment for the expected sequence number that exists but does not open
-    /// ([`CorruptReason::BrokenChain`](crate::CorruptReason::BrokenChain); `docs/crash-contract.md`, C11). What
-    /// followed `offset` leaves the segment; the quarantine file keeps its bytes up to the last non-zero one.
+    /// non-zero bytes after it in front of a segment for the expected sequence number that exists but does not open,
+    /// when the search finds no evidence after it ([`CorruptReason::BrokenChain`](crate::CorruptReason::BrokenChain);
+    /// `docs/crash-contract.md`, C11 (3)). What followed `offset` leaves the segment; the quarantine file keeps its
+    /// bytes up to the last non-zero one.
     RepairedTail {
         /// The segment.
         segment: PathBuf,

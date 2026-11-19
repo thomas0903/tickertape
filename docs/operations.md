@@ -369,8 +369,10 @@ the writer or retention.
   zeros): a last record whose payload ends in zero bytes declares a length that reaches past the end of the copy, and
   it only validates with those zeros put back. Some bytes are zeroed in place without a copy: damage that recovery
   cannot tell from a crash (crash contract C8 and C11). Bytes after an empty commit word in front of a next segment
-  that does not open are preserved like a corrupt tail (`BrokenChain`), and that next segment and the later ones are
-  moved to `quarantine/` as disconnected; `Fail` refuses before changing those bytes (C11 (3)). A seal whose marker is empty, in front of a next segment that opens, is rewritten, keeping the records of its
+  that does not open (is invalid; an I/O error opening it fails the open instead) are preserved like a corrupt tail,
+  reported as `BrokenChain` when the search finds no evidence of committed history after the word (with evidence, as
+  `EmptyCommitWord` or `UncheckedTail`), and that next segment and the later ones are moved to `quarantine/` as
+  disconnected; `Fail` refuses before changing those bytes (C11 (2) and (3)). A seal whose marker is empty, in front of a next segment that opens, is rewritten, keeping the records of its
   segment; a seal with its marker present and an invalid CRC is a corrupt tail like any other (C11 (1)). If `quarantine/` holds two files with identical bytes for the same position, a repair was interrupted
   and repeated; either copy can be deleted.
   Readers that had seen discarded records get `Error::Discarded`, except after a repair in place (damage that can't

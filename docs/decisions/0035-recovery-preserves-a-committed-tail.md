@@ -2,7 +2,8 @@
 
 - **Status:** accepted (a fix within the existing recovery contract; refines [0007](0007-checkpoint-marker-and-recovery.md))
 - **Date:** 2026-11-19; amended 2026-11-20 (the tail in front of a successor that does not open is preserved, or
-  refused under `Fail`, instead of zeroed in place: "Damage around a seal")
+  refused under `Fail`, instead of zeroed in place, and an I/O error opening that successor fails the open: "Damage
+  around a seal")
 
 ## Context
 
@@ -58,7 +59,7 @@ these counts:
 
 The order is fixed. First, when the successor for exactly `S` exists, is not `X` itself (at `X`'s first record slot
 `S` is `X`'s own base), has not been entered yet, and opens (the writer opens and maps it successfully; a valid header
-alone is not enough), `P` is where `X`'s seal belongs and the chain continues in that successor; that takes precedence, and none of the above is
+alone is not enough; an I/O error opening it fails the open, see "Damage around a seal"), `P` is where `X`'s seal belongs and the chain continues in that successor; that takes precedence, and none of the above is
 consulted (see "Damage around a seal" below). Otherwise, if `X` holds any non-zero byte after `P`'s commit word, the search
 runs, in `X` first: the first record or final seal it finds (1, 2), or a stop at its work bound ("Work bound" below),
 decides, unless the torn-frame check below dismisses it. Only when the search of `X` yields nothing is (3) consulted.
@@ -187,8 +188,16 @@ interrupted at both fault points). This cannot lose records the previous code ke
 every segment are kept, and the bytes after `P` are preserved. Nor can it refuse or quarantine what a process crash
 leaves, which is at most the CRC word.
 
-A successor for exactly `S` that exists but does not open (an invalid header, for example) does not take the
-resealing branch: the search runs. When it finds evidence, the tail is a committed tail ("What recovery does with a
+A successor for exactly `S` that exists but does not open does not take the resealing branch: the search runs. "Does
+not open" means that the successor itself is invalid: the writer's open reports it as corrupt (a file shorter than a
+header, an invalid header, a size that does not match the header, a base that does not match the name) or as an
+unsupported format version. Any other error opening, reading or mapping it is an I/O error (`EACCES` on files restored
+read-only, `EMFILE`, `ENOMEM` or a mapping limit), which says nothing about the journal: the open returns it under
+either policy before changing anything, as the seal branch does for a successor that a valid seal names. Taken as a
+broken chain, such an error after a plain crash between publishing the successor and sealing `X` would preserve the
+seal's CRC word, replace `X` and quarantine the healthy successor and every later segment, or make `Fail` report
+`BrokenChain` and hide the cause (`::successor_that_fails_to_open_for_an_io_error_fails_the_open`: once the error is
+gone, the next open completes the roll). When it finds evidence, the tail is a committed tail ("What recovery does with a
 committed tail", below). When it finds none, the chain is broken at `P`: `X` ends there, and the successor, which
 recovery cannot enter, and every later segment are disconnected (step 5). What happens to `X` depends on what follows
 `P`'s commit word:
@@ -213,13 +222,13 @@ The reason is `BrokenChain(S)` at `P` because it says what is wrong, and it is w
 this state: `X`'s records end at `P` without a seal, and the segment that would continue the chain cannot be
 entered. `BadSeal` would say that the bytes at `P` are a damaged seal in front of a successor that continues the
 chain, which recovery then reseals; here nothing continues, and with bytes past the seal's place they need not be a
-seal at all. The successor's own error (`BadMagic`, `BadSegmentHeader`, an I/O error) describes another file at
+seal at all. The successor's own error (`BadMagic`, `BadSegmentHeader`, `SizeMismatch`, for example) describes another file at
 offset 0, and `verify` reports it there when the successor fails its read-only checks; the writer's report is about
 `X`, where the chain ends. So the writer and `verify` agree on the reason and the position.
 
 `verify` reports `BrokenChain` at `P` in every case of this paragraph where the search of `X` finds nothing, and a
 problem at the successor only when it fails `verify`'s own read-only checks (a segment the writer cannot open
-read-write or map can pass them). Every case under both policies:
+read-write or map can pass them; the writer's open then fails with that I/O error, above). Every case under both policies:
 `tests/committed_tail.rs::successor_that_does_not_open_ends_the_chain_at_the_seals_place`; the repair interrupted at
 both fault points: `::crash_in_the_middle_of_a_broken_chain_repair` ("A crash during the repair", below).
 
