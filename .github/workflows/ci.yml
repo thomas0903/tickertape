@@ -212,6 +212,19 @@ jobs:
         run: command -v mvn || { sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends maven; }
       - name: Build libtickertape, the CLI and the C test programs
         run: echo "TT_NATIVE_DIR=$(bindings/java/scripts/build-native.sh)" >> "$GITHUB_ENV"
+      # Everything Maven needs, before the build: with an empty cache, Maven Central once answered "not found" for a
+      # plugin that exists (maven-resources-plugin 3.5.0, on one runner of three). Maven records such a miss, so a
+      # retry forces an update (-U). Only resolution is retried, never the tests; the later steps find everything local.
+      - name: Resolve Maven plugins and dependencies
+        run: |
+          for attempt in 1 2 3; do
+            if mvn -B -ntp -U -f bindings/java/pom.xml -Pnatives dependency:go-offline; then
+              exit 0
+            fi
+            echo "::warning::Maven resolution failed (attempt $attempt of 3)"
+            sleep $((attempt * 20))
+          done
+          exit 1
       # On the module path with --illegal-native-access=deny; missing tools (CLI, C programs, Python) fail the run.
       - name: Java tests
         run: mvn -B -ntp -f bindings/java/pom.xml verify -Dtickertape.native.dir="$TT_NATIVE_DIR" -Dtickertape.test.requireTools=true

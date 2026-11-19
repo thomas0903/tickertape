@@ -52,6 +52,13 @@
       <version>${junit.version}</version>
       <scope>test</scope>
     </dependency>
+    <!-- Declared (surefire would otherwise fetch it while the tests start) so that dependency:go-offline resolves it. -->
+    <dependency>
+      <groupId>org.junit.platform</groupId>
+      <artifactId>junit-platform-launcher</artifactId>
+      <version>${junit.version}</version>
+      <scope>test</scope>
+    </dependency>
   </dependencies>
 
   <build>
@@ -60,6 +67,8 @@
         <plugin><groupId>org.apache.maven.plugins</groupId><artifactId>maven-clean-plugin</artifactId><version>3.5.0</version></plugin>
         <plugin><groupId>org.apache.maven.plugins</groupId><artifactId>maven-resources-plugin</artifactId><version>3.5.0</version></plugin>
         <plugin><groupId>org.apache.maven.plugins</groupId><artifactId>maven-install-plugin</artifactId><version>3.2.0</version></plugin>
+        <!-- CI resolves everything up front with dependency:go-offline (see .github/workflows/ci.yml). -->
+        <plugin><groupId>org.apache.maven.plugins</groupId><artifactId>maven-dependency-plugin</artifactId><version>3.9.0</version></plugin>
       </plugins>
     </pluginManagement>
     <plugins>
@@ -93,6 +102,14 @@
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-surefire-plugin</artifactId>
         <version>3.6.1</version>
+        <dependencies>
+          <!-- The JUnit Platform provider, declared for the same reason as junit-platform-launcher above. -->
+          <dependency>
+            <groupId>org.apache.maven.surefire</groupId>
+            <artifactId>surefire-junit-platform</artifactId>
+            <version>3.6.1</version>
+          </dependency>
+        </dependencies>
         <configuration>
           <!-- Tests run on the module path, patched into the binding's module, so the flag users need is the one
                tested. deny turns a restricted call without native access into an error instead of a warning. -->
