@@ -4,7 +4,7 @@
 //! every shape a torn append can leave is still zeroed in place with nothing quarantined.
 
 use std::fs;
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -825,6 +825,10 @@ fn successor_that_does_not_open_ends_the_chain_at_the_seals_place() {
             open_raw(&successor).write_all_at(b"X", 0).unwrap(); // damages the magic
             let damaged = fs::read(&path).unwrap();
             let before = snapshot(dir.path());
+            let identity = {
+                let m = fs::metadata(&path).unwrap();
+                (m.dev(), m.ino())
+            };
             let opened = Writer::open(dir.path(), small_config().recovery(policy));
             match (expect, policy, opened) {
                 (Expect::ZeroedThenDisconnected(len), RecoveryPolicy::Quarantine, Ok(w)) => {
@@ -842,6 +846,17 @@ fn successor_that_does_not_open_ends_the_chain_at_the_seals_place() {
                     }
                     assert_eq!(w.next_seq(), 339, "{what}");
                     drop(w);
+                    // Zeroed in place: segment 0 keeps its file identity (not replaced), and the bytes after the
+                    // empty word are zero now.
+                    let m = fs::metadata(&path).unwrap();
+                    assert_eq!((m.dev(), m.ino()), identity, "{what}: segment 0 replaced");
+                    let after = fs::read(&path).unwrap();
+                    assert!(
+                        after[(seal + 4) as usize..(seal + 4 + len) as usize]
+                            .iter()
+                            .all(|&b| b == 0),
+                        "{what}: bytes after the empty word not zeroed"
+                    );
                     assert_eq!(read_all(dir.path()).len(), 339, "{what}");
                     // The later segments are preserved unchanged; the zeroed bytes are not.
                     let kept = quarantined(dir.path());

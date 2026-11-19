@@ -693,8 +693,9 @@ pub enum LaterHistory {
         /// The sequence number it announces.
         next_seq: u64,
     },
-    /// So many slots carry headers of this journal's following records with bad checksums that checking them all
-    /// would exceed the work bound; `offset` and `seq` are those of the slot that exceeded it (for a final seal, the
+    /// So many slots carry headers of this journal's following records that checking them all would exceed the work
+    /// bound: every candidate checked before it failed its checksum, and the one that would exceed it was not checked
+    /// (its checksum is unknown). `offset` and `seq` are those of the slot that exceeded it (for a final seal, the
     /// expected sequence number plus one). Only header-shaped bytes can do this, from damage or from a torn payload
     /// that holds them (ADR 0035). Inconclusive: nothing was proven valid, so it is reported as
     /// [`CorruptReason::UncheckedTail`], not [`CorruptReason::EmptyCommitWord`].
@@ -772,7 +773,7 @@ pub fn nonzero_end<V: SegmentView + ?Sized>(segment: &V, from: u64) -> Option<u6
 /// covering every non-zero byte after `offset`, allowing up to 63 trailing zero bytes, but not also for a length that
 /// ends at the first candidate), its payload holds the candidates and this returns `None`.
 ///
-/// Work: one pass over `[offset, len)` to find its last non-zero byte, cheap header checks at each 8-byte position up
+/// Work: one backward pass from the end of `[offset, len)` to find its last non-zero byte, cheap header checks at each 8-byte position up
 /// to it, and CRC32C over at most twice the remaining segment length for candidate records (beyond that it returns
 /// [`LaterHistory::Unchecked`]), plus one CRC of 12 bytes for each of at most [`SEAL_SEARCH_RECORDS`] next sequence
 /// numbers for a final seal (inside the same bound), and, once,
@@ -872,9 +873,10 @@ pub(crate) fn find_history_before<V: SegmentView + ?Sized>(
 /// How many next sequence numbers the final-seal search tries after an empty commit word (ADR 0035): a final seal
 /// counts as evidence only if it announces one of the `SEAL_SEARCH_RECORDS` sequence numbers after the expected one.
 /// It covers a zeroed 4 KiB block of minimal records (102) in front of the seal. A longer damaged run before a seal is
-/// still found through the successor segment (evidence from a later segment), unless the successor was lost too.
-/// Each number tried is a `2^-32` chance match for a torn payload whose last aligned eight non-zero bytes are a seal
-/// marker and four arbitrary bytes, so this bounds that false positive by `2^-25`.
+/// still found through the successor segment (evidence from a segment with a higher base), unless the successor was
+/// lost too. Each number tried is a `2^-32` chance match for a torn payload that ends, as far as it was written, in a
+/// seal marker at an 8-byte-aligned position and four arbitrary bytes, followed only by zeros, so this bounds that
+/// false positive by `2^-25`.
 pub const SEAL_SEARCH_RECORDS: u64 = 128;
 
 /// CRC32C bytes per sequence number tried by the final-seal search (the marker and the sequence number).

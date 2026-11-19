@@ -2,45 +2,54 @@
 
 use std::time::Duration;
 
-/// What the writer does on open when it finds corruption after the last checkpoint: an invalid record or seal, or an
-/// empty commit word that committed records follow (a later valid record, a final seal, or a segment with a higher
-/// base than the expected sequence number; [`CorruptReason::EmptyCommitWord`](crate::CorruptReason::EmptyCommitWord),
-/// ADR 0035).
+/// What the writer does on open when it finds corruption after the last checkpoint: an invalid record or seal, a
+/// segment disconnected from the chain, or an empty commit word after which recovery finds evidence of committed
+/// history ([`CorruptReason::EmptyCommitWord`](crate::CorruptReason::EmptyCommitWord), or
+/// [`CorruptReason::UncheckedTail`](crate::CorruptReason::UncheckedTail) when its search stops at its work budget;
+/// what counts as evidence: `docs/format.md` → Recovery, step 4, and ADR 0035).
 ///
-/// A writer *process* crash never produces this (see `docs/crash-contract.md`, C1/C2), with one exception; otherwise
-/// only power loss, storage errors or outside modification do. The exception: a crash while a payload was being
-/// written that contains an 8-byte-aligned, checksum-valid record frame whose sequence number falls in the window
-/// recovery checks (for example raw frames copied from another journal), or that ends with a valid seal for such a
-/// sequence number, when the payload was not completely written (or ends in more than 63 zero bytes). Recovery
-/// cannot tell those bytes from committed records behind a damaged commit word and reports
-/// [`CorruptReason::EmptyCommitWord`](crate::CorruptReason::EmptyCommitWord). The same holds for a payload holding
-/// several header-shaped byte sequences (copies of this journal's record headers, for example) whose length claims
-/// exhaust the search's work budget although every candidate checksum fails: reported as
-/// [`CorruptReason::UncheckedTail`](crate::CorruptReason::UncheckedTail). Nothing is lost (ADR 0035). Every other
-/// uncommitted partial record is zeroed in place, whatever the policy. One in the exception is not: `Quarantine`
-/// preserves its bytes and replaces the segment, and `Fail` refuses and leaves it untouched (`docs/crash-contract.md`,
-/// C1 and C2).
+/// A writer *process* crash in an otherwise intact journal never produces this (see `docs/crash-contract.md`, C1/C2),
+/// with one exception; otherwise only power loss, storage errors or outside modification do. The exception: a crash
+/// before the body of the record being appended was completely written (its CRC is written last, so this includes a
+/// payload written in full whose CRC was not yet stored), or after, when its payload ends in more than 63 zero bytes,
+/// where the payload contains an 8-byte-aligned, checksum-valid record frame whose sequence number falls in the window
+/// recovery checks (for example raw frames copied from another journal), or ends, as far as it was written, with a
+/// valid seal for such a sequence number. Recovery cannot tell those bytes from committed records behind a damaged
+/// commit word and reports [`CorruptReason::EmptyCommitWord`](crate::CorruptReason::EmptyCommitWord). The same holds
+/// for a payload holding several header-shaped byte sequences (copies of this journal's record headers, for example)
+/// whose length claims exhaust the search's work budget: every candidate checked before the budget runs out fails
+/// its checksum, and the one that would exceed it is not checked. That is reported as
+/// [`CorruptReason::UncheckedTail`](crate::CorruptReason::UncheckedTail). Nothing is lost (ADR 0035). After a process
+/// crash in an otherwise intact journal, every other uncommitted partial record is zeroed in place, under either
+/// policy. One in the exception is not: `Quarantine` preserves its bytes and replaces the segment, and `Fail` refuses
+/// and leaves it untouched (`docs/crash-contract.md`, C1 and C2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum RecoveryPolicy {
     /// Copy everything from the corrupt position to the end of its segment to `quarantine/` in the journal
     /// directory, fsync the copy, then replace the segment by a copy with those bytes zeroed (never edited in place),
-    /// move later segments into `quarantine/`, and continue appending after the last valid record. Nothing is ever
-    /// deleted. The default.
+    /// move later segments into `quarantine/`, and continue appending after the last valid record. No segment and
+    /// no repaired tail is deleted; bytes after an empty commit word where recovery finds no evidence of committed
+    /// history are zeroed in place without a copy, as after a crash (`docs/crash-contract.md`, C8). The default.
     #[default]
     Quarantine,
     /// Return [`Error::Corrupt`](crate::Error::Corrupt) from [`Writer::open`](crate::Writer::open) instead of
-    /// quarantining or repairing anything. Committed bytes are never changed and nothing is moved; the bytes after an
-    /// empty commit word are checked for committed records before any of them is zeroed (damage after which nothing
-    /// valid remains can't be told from a torn append and is zeroed like one, ADR 0035). Recovery may still have done
-    /// the clean-ups it performs before reaching the corrupt position, which a writer *process* crash also requires:
-    /// removing stale `*.tape.tmp` files (and the prepared spare), zeroing never-committed bytes after a segment's
-    /// last record, writing a missing seal (which can be the seal in front of a corrupt successor), and creating a
-    /// missing successor segment (`docs/format.md` → Recovery). In front of a successor segment that exists but has
-    /// an invalid header, it also zeroes in place the bytes after the previous segment's last record (the seal's
-    /// checksum word, or other bytes in which it finds no committed record when no segment follows that successor)
-    /// before refusing at the successor ([`CorruptReason::BrokenChain`](crate::CorruptReason::BrokenChain)). Opening
-    /// also records the PID in the lock file.
+    /// quarantining or repairing anything. The bytes at the corrupt position it reports, and everything after them in
+    /// that segment, are left untouched, and no segment is moved. Recovery runs in scan order, though, so before it
+    /// reaches that position it may already have changed other bytes (`docs/format.md` → Recovery, step 5):
+    ///
+    /// - The clean-ups a writer *process* crash also requires: removing stale `*.tape.tmp` files (and the prepared
+    ///   spare), zeroing never-committed bytes after a segment's last record, writing a missing seal after zeroing
+    ///   what is left of it (at most its checksum word; this can be the seal in front of the corrupt successor it then
+    ///   refuses at), and creating a missing successor segment.
+    /// - Zeroing in place, without a copy, the non-zero bytes after an empty commit word where the search for
+    ///   committed history completed and found none. After a crash those bytes were never committed. After storage
+    ///   damage that left no evidence they can be published records (ADR 0035, "What cannot be detected"): `Fail`
+    ///   then opens without refusing, or, when the segment for exactly the expected sequence number exists but does
+    ///   not open, refuses at that segment ([`CorruptReason::BrokenChain`](crate::CorruptReason::BrokenChain)) with
+    ///   the zeroing kept (a known gap, ADR 0035).
+    ///
+    /// Opening also records the PID in the lock file.
     ///
     /// After a plain process crash this refuses only in the exception above (`EmptyCommitWord` or `UncheckedTail` at
     /// the start of the record being written, whose payload holds the frames or headers that count as evidence). To

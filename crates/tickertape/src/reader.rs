@@ -138,8 +138,8 @@ impl Reader {
     ///
     /// What follows holds for an intact publication chain, where every commit word the reader follows is one a
     /// writer published. A tickertape writer then never modifies committed bytes, including during crash recovery,
-    /// which in place only zeroes the bytes after the first empty slot (never committed, on an intact chain) and
-    /// writes a seal there, and otherwise replaces or moves whole files (`docs/format.md` → Recovery). A returned
+    /// which in place only zeroes bytes after an empty slot (never committed, on an intact chain) and writes a seal
+    /// there, and otherwise replaces or moves whole files (`docs/format.md` → Recovery). A returned
     /// payload is the bytes that were validated only because nothing modifies them afterwards.
     ///
     /// Known limitation: a commit word damaged on storage breaks the chain, and then a mapped load can touch bytes a
@@ -149,16 +149,15 @@ impl Reader {
     ///
     /// - The length in an earlier record's commit word is enlarged while no writer runs, and a writer then appends
     ///   after that record: validating it loads bytes the writer is storing.
-    /// - The commit word of a published record not yet covered by a checkpoint is zeroed, no segment for exactly
-    ///   the expected sequence number opens (when one does, recovery treats the slot as a damaged seal first, and
-    ///   rewrites it in place only when nothing but its CRC word is left, in a slot that never held a record), and
-    ///   recovery's search finds no evidence within its bounds that committed history follows: no record that
-    ///   validates within the work budget, no final seal for one of the next 128 sequence numbers, no segment with
-    ///   a higher base than the expected sequence number, and the search did not stop at its budget. That is
-    ///   damage after which nothing validates (the newest record, or damage reaching the records after it), or a
-    ///   valid final seal more than 128 records past the empty slot when nothing else is found. The next writer's
-    ///   recovery cannot tell that from a torn append, takes the slot for the end of the journal and zeroes that
-    ///   record and the published records after it in place, under a live zero-copy reader. A payload the caller
+    /// - The commit word of a published record not yet covered by a checkpoint is zeroed, the slot is not treated
+    ///   as a damaged seal (that needs a distinct, unvisited segment for exactly the expected sequence number that
+    ///   opens; recovery then rewrites the seal in place only when nothing but its CRC word is left, in a slot that
+    ///   never held a record), and recovery's search completes without finding evidence that committed history
+    ///   follows (what counts: `docs/format.md` → Recovery, step 4). That is damage after which nothing validates
+    ///   (the newest record, or damage reaching the records after it), or a valid final seal more than 128 records
+    ///   past the empty slot when nothing else is found. The next writer's recovery cannot tell that from a torn
+    ///   append, takes the slot for the end of the journal and zeroes that record and the published records after
+    ///   it in place, under a live zero-copy reader. A payload the caller
     ///   still holds then changes, and the reader's later loads meet the new writer's stores. (With evidence, or a
     ///   search stopped at its budget, recovery replaces the segment by a new file, and mappings of the old file do
     ///   not change; so does a damaged seal whose successor opens, unless only its CRC word is left. ADR 0035.)
@@ -250,7 +249,8 @@ impl Reader {
     /// durable-only reader applies a marker that moves past its cursor only after confirming that its segment is still
     /// in place; if recovery replaced it or retention removed it, the reader returns [`Error::Discarded`] then, instead
     /// of reading on in the file it has open (ADR 0034). If it is in place, the reader reads the records the marker
-    /// newly covers from the file's current bytes, so records that recovery removed in place are never returned.
+    /// newly covers from the file's current bytes, so records that recovery removed in place are never returned
+    /// (crash contract C13 states the exception: damage that also destroys the checkpoint marker).
     /// A visible reader can't notice such an in-place repair (storage damage that emptied a commit word; crash
     /// contract C11): it may return records it had already read, then continue in the new history, wait, or report
     /// corruption at a position that no longer starts a record; [`Reader::seek`] to its position puts it back on the

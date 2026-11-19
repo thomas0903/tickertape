@@ -888,9 +888,11 @@ impl Recovery<'_> {
                     );
                     if seq != seg.base && bases.contains(&seq) && !visited.contains(&seq) {
                         if let Ok(next) = open_segment(self.dir, seq) {
-                            // The successor for exactly `seq` exists and opens: `offset` is where this segment's
-                            // seal belongs, and the chain continues in the successor (ADR 0035, "Damage around a
-                            // seal").
+                            // The successor for exactly `seq` exists, is not this segment (at the first record slot
+                            // `seq` is this segment's own base), has not been visited, and opens and maps: `offset`
+                            // is where this segment's seal belongs, and the chain continues in the successor (ADR
+                            // 0035, "Damage around a seal"). A valid header alone is not enough: `open_segment`
+                            // must succeed.
                             if tail_end.is_some_and(|end| end > offset + format::SEAL_LEN as u64) {
                                 // Bytes beyond the seal: no crash leaves them (a roll writes nothing after the seal,
                                 // and records `seq` onwards are in the successor), so this is a damaged seal, not
@@ -933,9 +935,12 @@ impl Recovery<'_> {
                         seg = self.repair_tail(seg, offset, reason)?;
                         break;
                     }
-                    // A torn append or the clean end. (A successor for exactly `seq` that does not open, as before
-                    // this change, ends the chain here: the bytes after `offset` are zeroed even under `Fail`, then the
-                    // successor is quarantined below, or refused as disconnected under `Fail`.)
+                    // The search completed without evidence: a torn append or the clean end, or damage that left no
+                    // evidence (ADR 0035, "What cannot be detected"). (A successor for exactly `seq` that does not
+                    // open, as before this change, ends the chain here: the bytes after `offset` are zeroed in place
+                    // without a copy even under `Fail`, then the successor is quarantined below, or refused as
+                    // disconnected under `Fail`. Known gap, ADR 0035: a later change will preserve them under
+                    // `Quarantine` and make `Fail` refuse before zeroing.)
                     self.zero_uncommitted_tail(&mut seg, offset, tail_end)?;
                     break;
                 }
@@ -1216,7 +1221,9 @@ impl Recovery<'_> {
 /// `seq` was committed. Returns how to report it: [`CorruptReason::EmptyCommitWord`] with the sequence number the
 /// evidence carries (a record's, a seal's next sequence number, or a segment's base), or
 /// [`CorruptReason::UncheckedTail`] when the search in the segment stopped at its work bound. A torn append leaves
-/// none of these.
+/// none of these, except in the process-crash exception (a torn payload holding frames or header-shaped bytes, ADR
+/// 0035). A segment with a larger base counts only when the caller found non-zero bytes after the commit word
+/// (`tail_end`), and not in the case below.
 ///
 /// The caller has already handled a successor for exactly `seq` that opens (a seal belongs at `offset`). A later
 /// segment is still not evidence when that successor exists but does not open and the non-zero bytes end within a
@@ -1273,11 +1280,15 @@ pub struct RecoveryReport {
 pub enum RecoveryAction {
     /// The journal didn't exist and was created.
     Created,
-    /// Uncommitted bytes after the last record (a record being written when the previous writer died) were zeroed in
-    /// place. Only done when recovery finds nothing committed after them, so no reader can have seen them (ADR 0035);
-    /// if a valid record, a final seal or a segment with a higher base than the expected sequence number follows, the
+    /// Non-zero bytes after an empty commit word were zeroed in place, without a copy: what is left of a missing seal
+    /// before it is written, or the bytes after the end of the chain when recovery's search for committed history
+    /// completed and found no evidence (ADR 0035). This describes the action taken on the evidence recovery found,
+    /// not what readers saw: after a process crash in an otherwise intact journal the bytes are the record being
+    /// written when the previous writer died, which no reader saw, but after storage damage that left no evidence
+    /// they can be published records a reader has already returned (`docs/crash-contract.md`, C11). With evidence the
     /// tail is corrupt instead ([`RecoveryAction::RepairedTail`] with
-    /// [`CorruptReason::EmptyCommitWord`](crate::CorruptReason::EmptyCommitWord)).
+    /// [`CorruptReason::EmptyCommitWord`](crate::CorruptReason::EmptyCommitWord) or
+    /// [`CorruptReason::UncheckedTail`](crate::CorruptReason::UncheckedTail)).
     ZeroedUncommitted {
         /// The segment.
         segment: PathBuf,

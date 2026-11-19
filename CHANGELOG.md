@@ -18,17 +18,20 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   the checkpoint. It used to take the empty commit word for the end of the journal and zero everything after it,
   under `RecoveryPolicy::Fail` too, changing bytes that zero-copy readers had borrowed. Recovery now checks the
   bytes after an empty commit word for committed history (a later record that validates with a sequence number its
-  position allows, a final seal for one of the next 128 sequence numbers, or a later segment) and treats it as
-  corruption: `Quarantine` preserves the tail in `quarantine/` and replaces the segment, `Fail` refuses without
-  changing the corrupt bytes or anything after them (an open under `Fail` still records its PID, removes stale
+  position allows, a final seal for one of the next 128 sequence numbers, or a segment with a higher base; the full
+  rules are in `docs/format.md` → Recovery) and treats it as corruption: `Quarantine` preserves the tail in
+  `quarantine/` and replaces the segment, `Fail` refuses without changing the corrupt bytes it reports or anything
+  after them in that segment (an open under `Fail` still records its PID, removes stale
   temporary files and keeps the crash clean-ups that come before the corruption, such as a seal written in front of
-  a corrupt successor). Torn appends are still zeroed in place. New `CorruptReason::EmptyCommitWord`, and
+  a corrupt successor). When the search completes without evidence, the bytes are still zeroed in place, as for a torn append. New `CorruptReason::EmptyCommitWord`, and
   `CorruptReason::UncheckedTail` when the search stops at its work bound before deciding, both also reported by
   `verify` and mapped in the C ABI (`TICKERTAPE_CORRUPT_EMPTY_COMMIT_WORD`, `TICKERTAPE_CORRUPT_UNCHECKED_TAIL`)
   (ADR 0035); `verify` and `inspect` now read the unwritten rest of the newest segment, in bounded memory whatever
-  length a damaged slot claims. A damaged seal whose successor segment exists is rewritten and every record kept;
-  bytes after it are preserved first. Damage after which no record validates and no final seal or later segment
-  remains (such as the newest records' commit words zeroed) remains indistinguishable from a torn append. A torn
+  length a damaged slot claims. A damaged seal whose successor segment exists and opens is rewritten, keeping every record
+  of its segment; bytes after it are preserved first (`Fail` refuses with `BadSeal` instead). Known gap, unchanged:
+  when that successor exists but does not open and the search finds nothing, the bytes after the empty commit word
+  are zeroed in place without a copy under both policies (ADR 0035). Damage after which no record validates and no final seal or segment with a
+  higher base remains (such as the newest records' commit words zeroed) remains indistinguishable from a torn append. A torn
   payload holding valid frames from another journal, or ending with a valid seal, with sequence numbers in the window,
   is preserved (or refused under `Fail`) even after a plain process crash.
 - Fix: readers racing with retention (the writer's policy or `tickertape archive`) no longer report a removed segment
