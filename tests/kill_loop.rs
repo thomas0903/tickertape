@@ -13,7 +13,7 @@ use tickertape_tests::{Rng, kill_len, mixed_len, payload, read_all, segments};
 const KILL_WRITER: &str = env!("CARGO_BIN_EXE_tt-kill-writer");
 const SEGMENT: u64 = 64 * 1024;
 
-fn kill_loop(iterations: u32) {
+fn kill_loop(iterations: u32, slow_fill: bool) {
     let mut rng = Rng::from_env("kill_loop");
     let dir = tempfile::tempdir().unwrap();
     let journal = dir.path().join("journal");
@@ -22,6 +22,7 @@ fn kill_loop(iterations: u32) {
     let mut reader: Option<Reader> = None;
     let mut mapped: Option<Reader> = None;
     let mut killed_mid_run = 0;
+    let mut torn_zeroed = 0;
 
     for i in 0..iterations {
         let mut child = Command::new(KILL_WRITER)
@@ -30,6 +31,7 @@ fn kill_loop(iterations: u32) {
                 &SEGMENT.to_string(),
                 &rng.next_u64().to_string(),
             ])
+            .args(slow_fill.then_some("slow-fill"))
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
@@ -65,6 +67,7 @@ fn kill_loop(iterations: u32) {
             );
         }
         for action in &w.recovery_report().actions {
+            torn_zeroed += u32::from(matches!(action, RecoveryAction::ZeroedUncommitted { .. }));
             assert!(
                 !matches!(
                     action,
@@ -120,7 +123,7 @@ fn kill_loop(iterations: u32) {
         assert_eq!(rec.seq, i as u64);
     }
     eprintln!(
-        "kill_loop: {iterations} kills ({killed_mid_run} after appends started), {} records, {} segments",
+        "kill_loop: {iterations} kills ({killed_mid_run} after appends started, {torn_zeroed} torn appends zeroed), {} records, {} segments",
         all.len(),
         segments(&journal).len()
     );
@@ -128,18 +131,31 @@ fn kill_loop(iterations: u32) {
         killed_mid_run > iterations / 4,
         "too few kills landed while appending"
     );
+    if slow_fill {
+        assert!(
+            torn_zeroed > iterations / 4,
+            "too few kills landed inside a fill"
+        );
+    }
 }
 
 #[test]
 fn kill_loop_short() {
-    kill_loop(20);
+    kill_loop(20, false);
 }
 
 /// The M4 exit criterion: at least 200 kills. Run with `cargo test -p tickertape-tests --release -- --ignored`.
 #[test]
 #[ignore = "long: 250 kills; run with --release -- --ignored"]
 fn kill_loop_250() {
-    kill_loop(250);
+    kill_loop(250, false);
+}
+
+/// ADR 0035: kills that land inside the fill closure (between the header fields and the commit word) leave a torn
+/// append, which recovery zeroes in place and never mistakes for committed records hidden by a damaged commit word.
+#[test]
+fn kill_inside_fill() {
+    kill_loop(30, true);
 }
 
 /// A zero-copy reader validating records **while** the writer fills and publishes them (ADR 0027): a thread polls

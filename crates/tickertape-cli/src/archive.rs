@@ -61,7 +61,7 @@ fn scaled(value: &str, suffixes: &[(char, u64)]) -> std::result::Result<u64, Str
         .ok_or_else(|| "value exceeds u64 range".into())
 }
 
-fn parse_bytes(value: &str) -> std::result::Result<u64, String> {
+pub(crate) fn parse_bytes(value: &str) -> std::result::Result<u64, String> {
     scaled(
         value,
         &[
@@ -73,7 +73,7 @@ fn parse_bytes(value: &str) -> std::result::Result<u64, String> {
     )
 }
 
-fn parse_duration(value: &str) -> std::result::Result<Duration, String> {
+pub(crate) fn parse_duration(value: &str) -> std::result::Result<Duration, String> {
     if !value.ends_with(['d', 'h', 'm', 's']) {
         return Err("expected an integer followed by d, h, m or s".into());
     }

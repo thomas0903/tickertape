@@ -34,6 +34,39 @@ pub(crate) fn crc32c_append(crc: u32, data: &[u8]) -> u32 {
     }
 }
 
+/// The CRC32C polynomial in the reflected bit order of a finished CRC.
+const POLY: u32 = 0x82f6_3b78;
+
+/// `a * b` modulo the CRC32C polynomial, both in the reflected bit order of a finished CRC (zlib's `multmodp`).
+pub(crate) fn mul_mod(a: u32, mut b: u32) -> u32 {
+    let mut product = 0;
+    let mut bit = 1_u32 << 31;
+    while bit != 0 {
+        if a & bit != 0 {
+            product ^= b;
+        }
+        b = if b & 1 != 0 { (b >> 1) ^ POLY } else { b >> 1 };
+        bit >>= 1;
+    }
+    product
+}
+
+/// `x^(8n)` modulo the polynomial. Moving a CRC past `n` bytes is a multiplication by it:
+/// `crc32c(A ‖ B) == mul_mod(x8n(B.len()), crc32c(A)) ^ crc32c(B)` (zlib's `crc32_combine`; CRC32C, like zlib's
+/// CRC-32, starts from and finishes with all ones, so those terms cancel).
+pub(crate) fn x8n(mut n: u64) -> u32 {
+    let mut power = 1_u32 << 31; // x^0
+    let mut square = 1_u32 << 23; // x^8, then x^16, x^32, ...: x^(8 * 2^k)
+    while n != 0 {
+        if n & 1 != 0 {
+            power = mul_mod(square, power);
+        }
+        square = mul_mod(square, square);
+        n >>= 1;
+    }
+    power
+}
+
 /// Continues `crc` over `head`, then the bytes of `words` (word `i` is bytes `[8i, 8i + 8)`, little-endian), then
 /// `tail`: the same value as [`crc32c_append`] over the concatenation. Each word is loaded exactly once.
 pub(crate) fn crc32c_append_parts(
@@ -576,6 +609,13 @@ mod tests {
         #[test]
         fn matches_the_crate(init in any::<u32>(), data in proptest::collection::vec(any::<u8>(), 0..5000)) {
             prop_assert_eq!(crc32c_append(init, &data), crc32c::crc32c_append(init, &data));
+        }
+
+        #[test]
+        fn moving_a_crc_past_bytes_matches_one_pass(a in proptest::collection::vec(any::<u8>(), 0..300), b in proptest::collection::vec(any::<u8>(), 0..3000)) {
+            let mut joined = a.clone();
+            joined.extend_from_slice(&b);
+            prop_assert_eq!(mul_mod(x8n(b.len() as u64), crc32c(&a)) ^ crc32c(&b), crc32c(&joined));
         }
 
         #[test]

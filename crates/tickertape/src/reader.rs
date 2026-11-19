@@ -138,8 +138,8 @@ impl Reader {
     ///
     /// What follows holds for an intact publication chain, where every commit word the reader follows is one a
     /// writer published. A tickertape writer then never modifies committed bytes, including during crash recovery,
-    /// which in place only zeroes the bytes after the first empty slot (never committed, on an intact chain) and
-    /// writes a seal there, and otherwise replaces or moves whole files (`docs/format.md` → Recovery). A returned
+    /// which in place only zeroes bytes after an empty slot (never committed, on an intact chain) and writes a seal
+    /// there, and otherwise replaces or moves whole files (`docs/format.md` → Recovery). A returned
     /// payload is the bytes that were validated only because nothing modifies them afterwards.
     ///
     /// Known limitation: a commit word damaged on storage breaks the chain, and then a mapped load can touch bytes a
@@ -149,10 +149,13 @@ impl Reader {
     ///
     /// - The length in an earlier record's commit word is enlarged while no writer runs, and a writer then appends
     ///   after that record: validating it loads bytes the writer is storing.
-    /// - The commit word of a published record not yet covered by a checkpoint is zeroed: the next writer's
-    ///   recovery takes that slot for the end of the journal and zeroes that record and the published records
-    ///   after it in place, under a live zero-copy reader. A payload the caller still holds then changes, and the
-    ///   reader's later loads meet the new writer's stores.
+    /// - The commit word of a published record not yet covered by a checkpoint is zeroed, and the next writer's
+    ///   recovery cannot tell that from a torn append (damage after which nothing validates, such as the newest
+    ///   record's commit word zeroed; `docs/crash-contract.md`, C11 (3), has the cases). It then takes the slot for
+    ///   the end of the journal and zeroes that record and the published records after it in place, under a live
+    ///   zero-copy reader. A payload the caller still holds then changes, and the reader's later loads meet the new
+    ///   writer's stores. (When recovery finds evidence of the records, it usually replaces the segment by a new
+    ///   file instead, and mappings of the old file do not change. ADR 0035.)
     ///
     /// That such loads return some mixture of old and new bytes, which the CRC then rejects, is an assumption about
     /// the implementation on the supported targets, not a guarantee. Earlier releases had the same exposure.
@@ -241,7 +244,8 @@ impl Reader {
     /// durable-only reader applies a marker that moves past its cursor only after confirming that its segment is still
     /// in place; if recovery replaced it or retention removed it, the reader returns [`Error::Discarded`] then, instead
     /// of reading on in the file it has open (ADR 0034). If it is in place, the reader reads the records the marker
-    /// newly covers from the file's current bytes, so records that recovery removed in place are never returned.
+    /// newly covers from the file's current bytes, so records that recovery removed in place are never returned
+    /// (crash contract C13 states the exception: damage that also destroys the checkpoint marker).
     /// A visible reader can't notice such an in-place repair (storage damage that emptied a commit word; crash
     /// contract C11): it may return records it had already read, then continue in the new history, wait, or report
     /// corruption at a position that no longer starts a record; [`Reader::seek`] to its position puts it back on the
@@ -559,13 +563,13 @@ impl Reader {
                 // too: that is discarded history.
                 self.check_identity()?;
                 // The seal may no longer be in this file, which kept its identity. The `pread` buffer can hold a seal
-                // that recovery has since zeroed in place, quarantining the successor (storage damage emptied a commit
-                // word earlier in this sealed segment, after the checkpoint, and recovery zeroed from there to the end
-                // of the segment, seal included: crash contract C11); a mapped reader can load the seal just before
-                // that repair. Read the slot again from the file: if the seal is gone, return to the caller, which
-                // reads that slot as it is now. The re-read skips the buffer anyway; the buffer is dropped for the
-                // caller's sake, because a re-read that finds an empty word does not refill it, and the caller's next
-                // read would take the stale seal from it again and come back here without end.
+                // that recovery has since zeroed in place, quarantining the successor (a seal whose marker storage
+                // damage emptied, with a successor that no longer opens: crash contract C11, ADR 0035 → Damage around
+                // a seal); a mapped reader can load the seal just before that repair. Read the slot again from the
+                // file: if the seal is gone, return to the caller, which reads that slot as it is now. The re-read
+                // skips the buffer anyway; the buffer is dropped for the caller's sake, because a re-read that finds
+                // an empty word does not refill it, and the caller's next read would take the stale seal from it
+                // again and come back here without end.
                 self.buf.clear();
                 crate::fault::hook(crate::fault::Point::ReaderSealReread);
                 if !matches!(self.read_slot(true)?, SlotOutcome::Seal) {
@@ -710,6 +714,21 @@ impl Reader {
             venue_ts_ns: found.header.venue_ts_ns,
             local_ts_ns: found.header.local_ts_ns,
             payload,
+        }
+    }
+}
+
+impl Reader {
+    /// For [`Reader::cursor`] and reader beacons (`status.rs`): the cursor and the segment file it is in.
+    pub(crate) fn cursor_parts(&self) -> crate::status::CursorParts<'_> {
+        crate::status::CursorParts {
+            slot_seq: self.next_seq,
+            skip_until: self.skip_until,
+            path: &self.seg.path,
+            offset: self.offset,
+            file: &self.seg.file,
+            identity: self.seg.identity,
+            durable_only: self.config.durable_only,
         }
     }
 }

@@ -180,13 +180,34 @@ fn destination(dir: &Path, path: &Path) -> Result<File> {
     Ok(file)
 }
 
+/// Fails if a file in the journal directory tree is the output file (a hard link), or if that can't be established.
+/// The one exception is the reader beacon directory `readers/`, which holds no journal data: beacons that disappear
+/// during the walk (dropped) and a `readers/` that can't be listed (another user's) are skipped, where v0.4.0
+/// failed. Everywhere else (segments, the checkpoint marker, `quarantine/`) the check fails closed, as in v0.4.0: an
+/// entry that vanishes or a directory that can't be listed is an error, so evidence in an unreadable `quarantine/`
+/// is never truncated.
 fn reject_alias(dir: &Path, dev: u64, ino: u64) -> Result<()> {
+    let readers = dir.join(tickertape::status::READERS_DIR);
     let mut pending = vec![dir.to_path_buf()];
     while let Some(dir) = pending.pop() {
-        for entry in fs::read_dir(dir).map_err(|e| output::io_error("list journal entries", e))? {
-            let entry = entry.map_err(|e| output::io_error("read journal entry", e))?;
-            let metadata = fs::symlink_metadata(entry.path())
-                .map_err(|e| output::io_error("stat journal entry", e))?;
+        let tolerant = dir.starts_with(&readers);
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if tolerant && is_skippable(&e) => continue,
+            Err(e) => return Err(output::io_error("list journal entries", e)),
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) if tolerant && is_skippable(&e) => continue,
+                Err(e) => return Err(output::io_error("read journal entry", e)),
+            };
+            let tolerant = entry.path().starts_with(&readers);
+            let metadata = match fs::symlink_metadata(entry.path()) {
+                Ok(metadata) => metadata,
+                Err(e) if tolerant && e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(output::io_error("stat journal entry", e)),
+            };
             if metadata.dev() == dev && metadata.ino() == ino {
                 return Err(Failure::usage("export output aliases a journal file"));
             }
@@ -198,9 +219,63 @@ fn reject_alias(dir: &Path, dev: u64, ino: u64) -> Result<()> {
     Ok(())
 }
 
+/// A part of `readers/` that vanished or can't be read.
+fn is_skippable(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::NotFound
+            | std::io::ErrorKind::PermissionDenied
+            | std::io::ErrorKind::NotADirectory
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An unreadable `readers/` doesn't fail the alias check (ADR 0032: beacon directories of other users), but any
+    /// other unreadable subdirectory does (round 2, A3): an output hard-linked to evidence in an unreadable
+    /// `quarantine/` is refused, never truncated.
+    #[test]
+    fn alias_walk_fails_closed_except_in_readers() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let readers = dir.path().join("readers");
+        fs::create_dir(&readers).unwrap();
+        fs::write(dir.path().join("file"), b"x").unwrap();
+        let quarantine = dir.path().join("quarantine");
+        fs::create_dir(&quarantine).unwrap();
+        let evidence = quarantine.join("00000000000000000000.tape.0");
+        fs::write(&evidence, b"evidence").unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let output = out.path().join("out.jsonl");
+        fs::hard_link(&evidence, &output).unwrap();
+        let evidence_meta = fs::metadata(&evidence).unwrap();
+
+        fs::set_permissions(&readers, fs::Permissions::from_mode(0o000)).unwrap();
+        fs::set_permissions(&quarantine, fs::Permissions::from_mode(0o000)).unwrap();
+        let root = fs::read_dir(&readers).is_ok(); // permissions don't apply to root
+        let unrelated = reject_alias(dir.path(), 0, 0);
+        let alias = reject_alias(dir.path(), evidence_meta.dev(), evidence_meta.ino());
+        fs::set_permissions(&quarantine, fs::Permissions::from_mode(0o755)).unwrap();
+        // An unreadable readers/ alone is skipped.
+        let readers_only = reject_alias(dir.path(), 0, 0);
+        fs::set_permissions(&readers, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            alias.is_err(),
+            "an alias inside an unreadable quarantine/ was accepted"
+        );
+        if !root {
+            assert!(unrelated.is_err(), "an unreadable quarantine/ was skipped");
+        }
+        assert!(
+            readers_only.is_ok(),
+            "{:?}",
+            readers_only.err().map(|f| f.message)
+        );
+        let meta = fs::metadata(dir.path().join("file")).unwrap();
+        assert!(reject_alias(dir.path(), meta.dev(), meta.ino()).is_err());
+    }
     use std::io;
     use tickertape::{NewRecord, Writer, WriterConfig};
 

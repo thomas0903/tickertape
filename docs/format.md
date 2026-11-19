@@ -3,8 +3,9 @@
 Status: **accepted** (M1, approved by the owner on 2026-10-31). This document is normative: the code
 must match it. Rationale: ADRs [0002](decisions/0002-record-format.md) (record format),
 [0003](decisions/0003-publication-protocol.md) (publication and memory access),
-[0005](decisions/0005-segment-rolling.md) (segments and rolling) and
-[0007](decisions/0007-checkpoint-marker-and-recovery.md) (checkpoint marker and recovery).
+[0005](decisions/0005-segment-rolling.md) (segments and rolling),
+[0007](decisions/0007-checkpoint-marker-and-recovery.md) (checkpoint marker and recovery) and
+[0035](decisions/0035-recovery-preserves-a-committed-tail.md) (committed records after an empty commit word).
 
 ## Conventions
 
@@ -28,7 +29,8 @@ A journal is one directory. Only these names have a meaning; anything else is ig
 | `checkpoint` | The checkpoint marker: where the last successful checkpoint ended (see "Checkpoint marker") |
 | `notify` | Wake-up record (ADRs 0017, 0021): 80 bytes naming the running writer's shared-memory wake-up region (magic `TTNOTIFY`, version, kind, nonce, pid and descriptor on Linux or object name on macOS, journal directory identity, CRC32C; layout in ADR 0021). Readers only read it with `pread`; it is replaced by rename, never written in place. Carries no journal data; deleting it or damage to it only affects reader latency |
 | `writer.lock` | Lock file. The writer holds an exclusive `flock` on it while open and writes its PID (decimal ASCII) into it. The PID is informational; the lock is the authority |
-| `quarantine/` | Bytes and segments removed from the journal by recovery, kept so that nothing is silently destroyed. Never read by readers, never deleted by tickertape |
+| `quarantine/` | Bytes and segments removed from the journal by recovery, kept so that they are not destroyed (bytes recovery zeroes in place are not kept: "Recovery (writer open)", step 4). Never read by readers, never deleted by tickertape |
+| `readers/` | Optional reader beacons (ADR [0032](decisions/0032-operational-metrics.md)): 128-byte files (magic `TTREADER`) in which applications that opt in publish a reader's position for monitoring, plus hidden temporary files (`.<name>.<pid>.<n>.beacon-tmp`) while one is created. Not part of format version 1: the writer, readers, recovery and retention never read or modify it (v0.4.0 included) |
 
 Segments are never removed automatically unless a writer retention policy is configured.
 `tickertape archive` or `tickertape::retention` can remove a contiguous prefix of sealed segments strictly before
@@ -131,7 +133,9 @@ ext4 maximum), and a torn write of one slot is unlikely to damage the other; thi
 is no larger than that. If both slots are damaged anyway, recovery falls back to a full scan (tested).
 
 The writer creates the file (all zeros, so neither slot is valid), syncs it, and syncs the journal directory when it
-creates the journal, before the first segment. Generations start at 1. A checkpoint that would need generation
+creates the journal, before the first segment. A writer that finds an existing marker shorter than 131,072 bytes (something cut it)
+leaves it so at open, writes its checkpoints' slots into it, and extends it to its full length (zeros) after the first
+checkpoint whose slot and marker sync succeed. Readers accept a short marker (below). Generations start at 1. A checkpoint that would need generation
 `u64::MAX` fails.
 
 | Offset in slot | Size | Field | Value |
@@ -173,7 +177,7 @@ The writer appends a record at `P` in this order:
 
 A reader at `P` observes the commit word first and the body only afterwards, ordered as described in ADR 0003 (an
 acquire load from the mapping, or a `pread` followed by an acquire fence). `0` means "nothing yet". Any other value
-means the body is visible, so the reader reads and validates it. Committed bytes are never modified by a correctly working writer.
+means the body is visible, so the reader reads and validates it. Committed bytes are never modified by a correctly working writer on an intact chain; after storage damage that recovery cannot tell from a torn append, it zeroes published records in place ("Recovery (writer open)", step 4).
 
 A seal is published the same way (`seal_crc` first, then a release store of `0xFFFFFFFF`), and only after the next
 segment file is fully created and in place. This orders *visibility* between processes on the same host. It says
@@ -227,35 +231,48 @@ Readers never modify a journal. Only the writer repairs it, on open, after takin
 3. **Scan forward** through the chain, validating every record and seal: record by record within a segment; at a
    valid seal, into the segment it names. The scan stops at the first position `P` (in segment `X`, of size `Z`)
    that is not a valid record and not a valid seal whose successor exists.
-4. **Classify what is at `P`:**
+4. **Classify what is at `P`.** At a commit word `0`, where `S` is the expected sequence number, recovery decides
+   in a fixed order, stated exactly in crash contract C11 and ADR 0035 ("How recovery tells them apart", "Damage
+   around a seal"). First, whether `P` is where `X`'s seal belongs, in front of a segment named `{S:020}.tape` that
+   opens (second row below). Otherwise, if `[P+4, Z)` holds any non-zero byte, whether it shows **committed history**
+   after `P`: in the common case a later record or final seal in `X` with a sequence number its position allows, or
+   a segment with a `base_seq` greater than `S`; the search is bounded and only reads, and a stop at its bound counts
+   too (ADR 0035 has the rules and their exceptions). Committed history leads to the first row below; otherwise `P`
+   is the end of the chain (third row). A writer process crash usually leaves no committed history; the exception, a
+   torn payload whose bytes the search counts, is in crash contract C1.
 
    | At `P` | Meaning | Action |
    |---|---|---|
-   | Commit word `0`, and a segment named `{next_seq:020}.tape` exists | The previous writer died between publishing the next segment and sealing this one | Zero any non-zero bytes in `[P, Z)` in place, write the seal, and continue scanning in that segment (step 3) |
-   | Commit word `0`, no such segment | Clean end, or a body the previous writer never committed (no reader ever saw it). Or storage damage that emptied a committed record's commit word: then this removes committed records in place (see "What readers do about repairs") | Zero any non-zero bytes in `[P, Z)` in place. This is the end of the chain |
+   | Commit word `0`, committed history after it | Usually storage damage, power loss or outside modification that hid committed records behind an empty commit word (C1 has the exception) | Corruption, as in the last row, reported as `EmptyCommitWord(T)` (or `UncheckedTail` when the search stopped at its bound): `Quarantine` repairs by replacement; `Fail` refuses before anything in `X` is changed |
+   | Commit word `0`, and `P` is where `X`'s seal belongs (a segment named `{S:020}.tape` exists, is not `X`, has not been scanned and opens) | Usually the previous writer died between publishing the next segment and sealing this one; or the seal was damaged | When at most the seal's CRC word is non-zero after `P`: zero it in place. Otherwise, as in the last row (`BadSeal`). Then write the seal and continue scanning in that segment (step 3), which is checked like any segment (C11 (1)) |
+   | Commit word `0`, neither of the above | Usually the clean end, or a body the previous writer never committed (no reader saw it); also damage that left no evidence, and then this removes published records in place (C11 (3); "What readers do about repairs") | Zero any non-zero bytes after `P` in place, without a copy, under either policy. This is the end of the chain; segments the scan did not reach are disconnected (step 5), including a segment named `{S:020}.tape` that does not open (a known gap: ADR 0035) |
    | Valid seal, successor missing, no segment with a larger `base_seq` | Crash or power loss during a roll | Create the successor (as in "Rolling"). This is the end of the chain |
    | Valid seal, successor missing, a segment with a larger `base_seq` exists | A segment in the middle of the chain is missing (deleted by someone, or lost) | **Refuse** under every policy: tickertape doesn't discard a large part of a journal on its own |
-   | Commit word non-zero, invalid record or seal | Not possible after a writer *process* crash. Power loss, storage corruption or outside modification | `Quarantine` (default): preserve `[P, Z)` in `quarantine/`, then **repair by replacement**: write a copy of `X` with `[P, Z)` zeroed to `X.tmp`, sync it, and `rename` it over `X`. `Fail`: refuse (see below) |
+   | Commit word non-zero, invalid record or seal | Not possible after a writer *process* crash. Power loss, storage corruption or outside modification | `Quarantine` (default): preserve the bytes from `P` to the last non-zero byte of `X` in `quarantine/`, then **repair by replacement**: write a copy of `X` with `[P, Z)` zeroed to `X.tmp`, sync it, and `rename` it over `X`. `Fail`: refuse (see below) |
+
+   Bytes are zeroed in place only after an empty commit word (crash contract C8). Some damage cannot be told from a
+   torn append and is zeroed like one, destroying the records it covers without a copy (C11 (3), ADR 0035 → What
+   cannot be detected).
 
 5. **Disconnected segments.** Every segment in the recovery domain that the scan did not visit (whatever its
-   `base_seq`, including one between visited segments) and every segment in the domain with an invalid header is
-   not part of the valid chain. `Quarantine`: preserve it by moving it into `quarantine/`. `Fail`: refuse.
+   `base_seq`, including one between visited segments) is not part of the valid chain. `Quarantine`: preserve it
+   by moving it into `quarantine/`. `Fail`: refuse. (A segment with an invalid header is usually such a segment;
+   where the scan itself has to open it, the open fails or the segment is replaced: crash contract C8.)
 
-   With `Fail`, a refusal never changes committed bytes and never moves a file. The steps above run in order,
-   though, so clean-ups that come before the corrupt position (removing temporary files, zeroing never-committed
-   bytes, writing a missing seal, creating a missing successor) may already have happened; they are the same ones a
-   writer process crash requires.
+   With `Fail`, a refusal leaves the bytes at the corruption position it reports, and everything after them in that
+   segment, untouched, and moves no file. The open is not read-only, though: the steps above run in order, and what
+   an open may change before it refuses is listed in crash contract C11.
    Segments below the recovery domain were covered by an earlier checkpoint; files placed in the directory by other
    means are outside the contract.
 6. **Persist the repairs** before returning: every in-place zeroing, seal and new file is synced, and the journal
    directory (and `quarantine/`) is synced after any create, rename or link, with the platform barrier
    (`crash-contract.md` → What `checkpoint()` does, steps 1–3).
 
-**Preserving data in `quarantine/`.** Before any destructive step (zeroing committed bytes, replacing or moving a
-segment), and aborting the repair with an error if any step fails:
+**Preserving data in `quarantine/`.** Before replacing or moving a segment, and aborting the repair with an error if
+any step fails (bytes zeroed in place are not preserved: crash contract C8):
 
 1. If `quarantine/` doesn't exist: create it, then sync the journal directory.
-2. Bytes: write them to a new file `….partial` created with `O_EXCL`, sync it, then publish it with `link` to
+2. Bytes (a tail, from the corrupt position to the last non-zero byte of its segment): write them to a new file `….partial` created with `O_EXCL`, sync it, then publish it with `link` to
    `{base_seq:020}-{offset:012}-{unix_ns}-{n}.bin` (`n` = 0, 1, … until a name is free; `link` never replaces), unlink
    the `.partial` name, and sync `quarantine/`.
    Whole segments: sync the segment file's data, `link` it to a free name in `quarantine/` (as above), sync
@@ -267,7 +284,8 @@ repair. Leftover `.partial` files are kept as evidence. Records before `P` are n
 
 Every action is reported in the writer's `RecoveryReport`. Recovery work is: listing the directory; reading every
 record after the scan start (the data written since the last checkpoint); reading `[P, Z)` of the last segment to find
-non-zero bytes; and, only for repairs, copying the affected segment or tail.
+non-zero bytes and, up to the last of them, checking each 8-byte position for committed history (step 4); and, only
+for repairs, copying the affected segment or tail.
 
 ### What readers do about repairs
 
@@ -290,31 +308,33 @@ every record the marker newly covers from the file's current bytes: the safe rea
 into its buffer before, because bytes after a marker can change in place (below).
 
 Not every repair replaces the file. When storage damage empties the commit word of a committed record after the
-checkpoint, recovery takes it for the end of the records and zeroes it and everything after it in place (step 4,
-"Commit word `0`"), and the next writer appends a different history into the same file. The file keeps its identity,
-so readers can't notice. A durable-only reader is unaffected: it returned only records below a marker, which recovery
-keeps, and it reads the rest from the current bytes once a later marker is trusted; its position is a record
-boundary of the new history, so it simply reads on. A visible reader may return the removed records it had already
-read or buffered, and then continue at its old position in the new history without `Error::Discarded`. Where the
-records of the two histories line up it reads the new ones; otherwise its position falls inside a record, and it
-waits there (`Ok(None)`) or reports `Error::Corrupt` for bytes that aren't corrupt, until the application seeks to
-its position. It would return a record that is not in the journal only if the new history held a frame with a valid
+checkpoint and leaves no committed history after it that recovery can find (damage indistinguishable from a torn
+append, such as the newest record's commit word zeroed; crash contract C11 (3)), recovery takes it for the end of
+the records and zeroes it and the non-zero bytes after it in place (step 4, third row), and the next writer appends a different history into the same file. The file keeps
+its identity, so readers can't notice. A durable-only reader is unaffected: it returned only records below a marker,
+which recovery keeps, and it reads the rest from the current bytes once a later marker is trusted; its position is a
+record boundary of the new history, so it simply reads on. A visible reader may return the removed records it had
+already read or buffered, and then continue at its old position in the new history without `Error::Discarded`. Where
+the records of the two histories line up it reads the new ones; otherwise its position falls inside a record, and it
+waits there (`Ok(None)`) or reports `Error::Corrupt` for bytes that aren't corrupt, until the application seeks to its
+position. It would return a record that is not in the journal only if the new history held a frame with a valid
 checksum and the expected sequence number at that position (ADR
 [0034](decisions/0034-durable-only-reads-check-segment-identity.md) → In-place repairs).
 
-Such a repair can also remove a seal: when the emptied commit word is in a sealed segment, the zeroing runs to the end
-of the segment, seal included, and the successor, which the scan no longer reaches, is moved into `quarantine/` (step
-4, "Commit word `0`, no such segment", then step 5). A reader may have read the seal before, and the safe reader may
-still hold it in its buffer. So a reader at a seal whose successor is missing while its own segment is still in place
-reads the slot again from the file before it reports a broken chain. If the seal is gone, it reads the slot as it is
-now: it waits there (`Ok(None)`) or reads on in the new history, without `Error::Discarded`, like any reader across an
-in-place repair. Where the repair began earlier in the segment than the seal (at a record's emptied commit word), the
-reader's position can fall inside a record of the new history, and it then waits or reports corruption there as
-described above. If the seal is there, a live writer stored it only after linking its successor, so the reader tries
-the successor once more and reports `CorruptReason::BrokenChain` only if it is still missing. One such report can be
-transient: a recovery that replaces a successor whose header is damaged keeps the seal, moves that successor into
-`quarantine/` and then creates a new one, and a reader whose two attempts both fall in between follows the new
-successor on its next call.
+An in-place repair can also remove a seal: when storage damage empties a seal's marker and its successor no longer
+opens, recovery zeroes what is left of the seal in place and moves the successor into `quarantine/` (crash contract
+C11, the known gap; ADR 0035 → Damage around a seal; then step 5). A reader may have read the seal before,
+and the safe reader may still hold it in its buffer. So a reader at a seal whose successor is missing while its own
+segment is still in place reads the slot again from the file before it reports a broken chain. If the seal is gone,
+it reads the slot as it is now: it waits there (`Ok(None)`) or returns the new history's record, without
+`Error::Discarded`, like any reader across an in-place repair. (In the repair named above the zeroing starts at the
+seal's own slot, so the reader's position starts a record of the new history. Where a repair that removed a seal began
+earlier in the segment, at an empty commit word with no committed history found after it, the reader's position can
+fall inside a new record, and it then waits or reports corruption there as described above.) If the seal is there, a
+live writer stored it only after linking its successor, so the reader tries the successor once more and reports
+`CorruptReason::BrokenChain` only if it is still missing. One such report can be transient: a recovery that replaces
+a successor whose header is damaged keeps the seal, moves that successor into `quarantine/` and then creates a new
+one, and a reader whose two attempts both fall in between follows the new successor on its next call.
 
 Until it checks, a visible reader may return records from a segment that recovery has just preserved and removed.
 Such records are like records lost to a power loss that a reader had already seen (`crash-contract.md` → C8). A

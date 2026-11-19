@@ -118,13 +118,16 @@ repair" to consider.
 
 ### In-place repairs
 
-Recovery doesn't always replace a file. At an empty commit word it zeroes the rest of the segment in place
+Recovery doesn't always replace a file. At an empty commit word it can zero the rest of the segment in place
 (`format.md` → Recovery, step 4), and the new writer appends into the same file. After a writer *process* crash the
 bytes it zeroes were never committed. But storage damage (C11) that empties the commit word of a committed record
 after the checkpoint makes that record look like the end, so recovery removes it and every record after it in
 place, on the same inode. Recovery could replace the file instead whenever it can tell that committed records follow
-the empty word; it can't tell when only the newest record's commit word is lost, so this shape remains. The file
-keeps its identity, so no identity check can see it. What it means:
+the empty word; it can't tell when only the newest record's commit word is lost, so this shape remains. (ADR
+[0035](0035-recovery-preserves-a-committed-tail.md) has since made recovery usually replace the file when it finds
+committed history after the empty word (crash contract C11); the in-place repair remains for damage it can't tell from a torn append,
+such as the newest record's commit word zeroed, and that is the case below.) The file keeps its identity, so no
+identity check can see it. What it means:
 
 - **Durable-only readers** are unaffected, by F3 and F5: the records they return are below a marker they applied,
   which recovery keeps byte for byte, and the records after that are read again from the current bytes once a new
@@ -132,7 +135,8 @@ keeps its identity, so no identity check can see it. What it means:
   reading it, with no `Error::Discarded` and no corruption report. A durable-only reader therefore doesn't need to
   treat "the bytes at my cursor changed while the identity didn't" as discarded history: nothing it returned was
   removed. `tests/durable_only.rs::durable_only_reader_rereads_the_tail_after_an_in_place_repair` damages the
-  middle and the newest uncheckpointed record, for the safe and the zero-copy reader, with the reader waiting at the
+  uncheckpointed records from the middle one on, and the newest alone (zeroing their commit words, which since ADR
+  0035 is the shape that is still repaired in place), for the safe and the zero-copy reader, with the reader waiting at the
   checkpoint or stopped inside the coverage of a marker it had applied; `durable_readers_under_repairs` mixes
   in-place repairs with replacements.
 - **Visible readers** can't see an in-place repair, and nothing in this decision changes that. A visible reader may
@@ -235,8 +239,8 @@ slot read) per 100 ms, in practice once per roll (above).
 - New fault-injection hook points `ReaderCheckpoint` (before the marker read) and `ReaderCheckpointIdentity` (between
   the read and the check) let tests put a repair at each point of the interleaving
   (`tests/durable_only.rs`). `tests/reader_retention_stress.rs::durable_readers_under_repairs` restarts the writer
-  every few checkpoints with damage injected before most restarts (a corrupt copy renamed over a segment, or a
-  commit word zeroed in place), and checks every record durable-only readers return against the repaired journal.
+  every few checkpoints with damage injected before most restarts (a corrupt copy renamed over a segment, or
+  commit words zeroed in place from a record in the newest segment on), and checks every record durable-only readers return against the repaired journal.
 - The CLI's `export --durable-only` and `stats --durable-only` read the marker before they open their reader, so
   everything they read is in files opened after the marker was written. No change.
 - No on-disk format change.

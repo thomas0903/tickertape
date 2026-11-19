@@ -4,7 +4,9 @@
 //! the operation fails with the given OS error instead of running. A test can also run code at the moment a record
 //! is complete but not yet published ([`before_next_publish`]). Readers and inspection have hook points too, where a
 //! test can run an action of its own ([`run_at`]), for example removing files at exactly the moment a concurrent
-//! retention run could. Without the feature, the injection and hook points compile to nothing.
+//! retention run could. A test can also install a pause hook on a thread ([`on_pause`]): it runs whenever that thread
+//! reaches a [`Pause`] point in the reader-beacon protocol, so a test can stop one party there and run another party's
+//! steps in between, deterministically. Without the feature, the injection, hook and pause points compile to nothing.
 
 use std::io;
 
@@ -21,6 +23,8 @@ pub enum Point {
     Link,
     /// Syncing segment data during `checkpoint()`.
     CheckpointSync,
+    /// Syncing the checkpoint marker after writing its slot, during `checkpoint()`.
+    CheckpointMarkerSync,
     /// Renaming a retention segment (inject EXDEV to exercise the copy path).
     RetentionRename,
     /// Syncing an archive copy before removing its source.
@@ -33,6 +37,12 @@ pub enum Point {
     SpareMap,
     /// Writing the spare's header when the writer publishes it at roll (arm with [`fail_next`]).
     SpareHeader,
+    /// Recovery repairing a corrupt tail, after the tail was preserved in `quarantine/` and the repaired copy written,
+    /// before that copy is renamed over the segment (stands in for a crash there).
+    RepairBeforeRename,
+    /// Recovery repairing a corrupt tail, after the repaired copy replaced the segment, before later segments are
+    /// handled (stands in for a crash there).
+    RepairAfterRename,
     /// After a reader lists the segments and before it opens the one it chose (`Reader::open`,
     /// `Reader::open_mapped`, `Reader::seek`). Arm with [`run_at`].
     ReaderOpen,
@@ -55,11 +65,77 @@ pub enum Point {
     /// [`run_at`].
     InspectSeal,
     /// In `inspect::verify`, after a scan found a segment in a state a running writer passes through and verify has
-    /// paused, before it scans that segment again. Arm with [`run_at`].
+    /// paused, before it scans that segment again. That includes the pauses of the scans that follow a live writer
+    /// past an empty commit word at the end of the newest segment, and the one before verify reads that commit word
+    /// again (ADR 0035). Arm with [`run_at`].
     InspectRescan,
     /// Syncing the zeroing of an abandoned write (a panicking `append_with` fill closure).
     AbandonedWriteSync,
 }
+
+/// Points in the reader-beacon protocol (ADR 0032 → "The beacon protocol") where a test's pause hook runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Pause {
+    /// A creator found the beacon directory's lock held by another creator and is about to wait for it.
+    CreatorWaitsForDirectoryLock,
+    /// A creator holds the directory lock and has written its locked temporary beacon, before publishing it.
+    CreatorWroteTemporary,
+    /// A creator found the name taken and opened the file there, before checking it.
+    CreatorOpenedExisting,
+    /// A creator found the file at the name to be a stale beacon, before replacing it.
+    CreatorFoundStale,
+    /// A dropping beacon confirmed that its path still names its file, before unlinking it.
+    OwnerBeforeUnlink,
+    /// An observer opened a beacon file, before reading it.
+    ObserverOpened,
+    /// An observer read a beacon's contents, before probing its lock.
+    ObserverRead,
+    /// An observer holds its shared probe lock on a beacon, before releasing it.
+    ObserverHoldsProbe,
+}
+
+#[cfg(feature = "fault-injection")]
+mod paused {
+    use super::Pause;
+    use std::cell::RefCell;
+
+    type Hook = Box<dyn FnMut(Pause)>;
+
+    thread_local! {
+        pub(super) static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+}
+
+/// Installs (or, with `None`, removes) this thread's pause hook. It is called with each [`Pause`] point this thread
+/// reaches until it is removed.
+#[cfg(feature = "fault-injection")]
+pub fn on_pause(hook: Option<Box<dyn FnMut(Pause)>>) {
+    // The old hook is dropped after the borrow ends: dropping what it owns (a beacon, say) may reach a pause point.
+    let old = paused::HOOK.with(|h| std::mem::replace(&mut *h.borrow_mut(), hook));
+    drop(old);
+}
+
+/// Called by the beacon protocol at each pause point.
+#[cfg(feature = "fault-injection")]
+pub(crate) fn pause(point: Pause) {
+    // Take the hook out while it runs, so that a hook may itself reach pause points without re-entering.
+    let hook = paused::HOOK.with(|h| h.borrow_mut().take());
+    if let Some(mut hook) = hook {
+        hook(point);
+        paused::HOOK.with(|h| {
+            let mut slot = h.borrow_mut();
+            if slot.is_none() {
+                *slot = Some(hook);
+            }
+        });
+    }
+}
+
+/// Called by the beacon protocol at each pause point (no-op without the `fault-injection` feature).
+#[cfg(not(feature = "fault-injection"))]
+#[inline(always)]
+pub(crate) fn pause(_point: Pause) {}
 
 #[cfg(feature = "fault-injection")]
 mod armed {

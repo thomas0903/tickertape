@@ -6,16 +6,16 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 ## [Unreleased]
 
 - Fixed: a visible reader no longer reports `CorruptReason::BrokenChain` for a seal that writer recovery removed in
-  place after the reader had read it. When storage damage empties a commit word after the checkpoint in a sealed
-  segment, recovery zeroes from there to the end of the segment in place, seal included, and quarantines the
-  successor. The safe reader could still hold the seal in its read buffer (a zero-copy reader could load it just
-  before the repair), follow it, find no successor while its own segment kept its identity, and report a broken chain
-  on a healthy journal on every call, until the new writer rolled to the same base again or the application seeked.
-  A reader at a seal whose successor is missing now reads the slot again from the file, and reports a broken chain
-  only if the seal is still there and the successor still missing. Found by
-  `reader_retention_stress::durable_readers_under_repairs_long` on arm64 Linux CI and
-  `::durable_readers_under_repairs` on macOS CI. New fault point `fault::Point::ReaderSealReread`. The on-disk format
-  is unchanged.
+  place after the reader had read it. The safe reader could still hold the seal in its read buffer (a zero-copy
+  reader could load it just before the repair), follow it, find the successor quarantined while its own segment kept
+  its identity, and report a broken chain on a healthy journal on every call, until the new writer rolled to the
+  same base again or the application seeked. A reader at a seal whose successor is missing now reads the slot again
+  from the file, and reports a broken chain only if the seal is still there and the successor still missing. Found
+  by `reader_retention_stress::durable_readers_under_repairs` on CI (arm64 Linux and macOS, three times in one
+  night), where one zeroed commit word in a sealed segment caused such a repair; with ADR 0035 recovery replaces
+  that segment instead, and the remaining
+  in-place repair that removes a seal needs two damaged places (a seal's marker emptied and its successor no longer
+  opening).
 - Library: dropping a `Writer` now releases the journal lock explicitly (`flock(LOCK_UN)`), after its helper threads
   have stopped and readers have been told it has gone, and so does a `Writer::open` that fails after taking the lock.
   Until now the lock was released only when the last copy of its descriptor closed, and a child that another thread
@@ -25,6 +25,55 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   copy of a writer (which it must not do) leaves the lock with the parent. A writer process that exits or dies
   without dropping its writer still leaves the lock with such a child until it execs or exits, for its whole life if
   it never execs (crash contract C3).
+- Operational metrics (ADR 0032), with no format change and nothing added to `append` or the reader's read path.
+  Values a sample can't establish are reported as unknown, never guessed, and estimates are named as such:
+  - `tickertape::status::status(dir)` and `status::Sampler` sample a journal from any process: the writer's head,
+    the checkpoint marker (validated as the writer validates it) and an estimate of its age from the marker's
+    modification time, what a power loss would remove now (exposure), storage headroom in bytes and estimated segment
+    rolls, and the writer's PID. Whether the sample verified the chain from the checkpoint to the head is reported; a
+    break it confirms is corruption, and a healthy but unverified sample says so. A `Sampler` resumes its scan where it
+    stopped only with proof that the segment is the same, unchanged file, and measures append rates and an estimated
+    time until the volume is full.
+  - `Writer::metrics()` (head, checkpoint age by the monotonic clock, uncheckpointed records and bytes, poisoned
+    flag, retention failure count), `Reader::cursor()` and `Status::lag()` for in-process reader lag.
+  - `status::ReaderBeacon`: an opt-in 128-byte file in `<dir>/readers/` that publishes a reader's position, the
+    identity of its segment and whether it is durable-only, for observers in other processes. Beacons are published
+    atomically under a directory lock, never replace anything but a stale beacon (`Error::BeaconInUse` for a live
+    one), and a held `flock` tells live readers from dead ones; the writer and retention never read beacons.
+  - CLI: `tickertape status <DIR>` with text, `--json` (`schema_version` 1) and `--format prometheus` output,
+    `--watch` (failed samples are reported and the watch continues; `tickertape_up` and
+    `tickertape_status_timestamp_seconds` show staleness), `--output` (atomic replace through an exclusively created
+    temporary file, for a node_exporter textfile collector; it replaces only an earlier status output or an empty
+    file, never a symlink or anything else), and health thresholds (`--max-checkpoint-age`,
+    `--min-headroom`, `--min-headroom-segments`, `--max-reader-lag`) that exit with code 3; a journal the sample
+    finds corrupt (or the writer would refuse) exits with 2. A journal missing at start-up is reported as a failed
+    sample (`tickertape_up 0`).
+  - `export --output` no longer fails when a reader beacon disappears during its alias check or `readers/` can't be
+    listed (another user's). v0.4.0 failed transiently in those cases. Everywhere else in the journal the check still
+    fails closed.
+  - `rustix` now also enables its `process` feature (for `kill(pid, 0)`); no new crates.
+  - A writer that finds the checkpoint marker cut short no longer extends it at open: it extends it after its next
+    checkpoint has succeeded, so that observers can't take the time of the cut or of the extension for a
+    checkpoint's (a short marker's age is reported unknown). Every reader already accepts a short marker.
+  - C ABI: the new `Error::BeaconInUse` has its own status code, `TICKERTAPE_E_BEACON_IN_USE` (-18); no C function
+    creates beacons yet.
+- Fixed: writer recovery no longer zeroes committed records in place when it finds evidence of them after an empty
+  commit word (storage damage that zeroed a commit word after the checkpoint, for example). It used to zero
+  everything after an empty commit word (and then, where the expected successor opened, rewrite the seal and go on),
+  under `RecoveryPolicy::Fail` too, changing bytes that zero-copy readers had borrowed. It now searches the bytes after an empty commit word for
+  committed history and, when it finds some, treats the tail as corruption: `Quarantine` preserves it in
+  `quarantine/` and replaces the segment, `Fail` refuses (what an open under `Fail` may still change: crash contract
+  C11). New `CorruptReason::EmptyCommitWord`, and `CorruptReason::UncheckedTail` when the search stops at its work
+  bound before deciding, both also reported by `verify` and mapped in the C ABI
+  (`TICKERTAPE_CORRUPT_EMPTY_COMMIT_WORD`, `TICKERTAPE_CORRUPT_UNCHECKED_TAIL`) (ADR 0035). `verify` and `inspect`
+  now search the rest of a segment whose records end at an empty commit word, in bounded memory whatever length a
+  damaged slot claims. A seal whose marker is empty, in front of a successor segment that opens, is rewritten, keeping the records
+  of its segment (non-zero bytes beyond the seal's CRC word are preserved first, or `Fail` refuses with `BadSeal`);
+  a seal with its marker present and an invalid CRC is a corrupt tail like any other (crash contract C11 (1)). Some damage still cannot be told
+  from a torn append and is zeroed in place as before, and a known gap remains in front of a successor that does not
+  open (crash contract C8, C11). A torn record whose payload holds bytes the search counts as committed history (raw
+  frames copied from another journal, for example) can be preserved, or refused under `Fail`, even after a plain
+  process crash (C1).
 - Fix: readers racing with retention (the writer's policy or `tickertape archive`) no longer report a removed segment
   as an error of the wrong kind. `Reader::seek` returned an I/O "not found" error when the segment it chose was
   removed before it opened it; it now lists the segments again and returns `Error::SeqUnavailable` with the new
@@ -46,8 +95,10 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   `ReaderCheckpoint` and `ReaderCheckpointIdentity`, deterministic tests and a stress test with corruption injected
   between writer restarts cover this, and the soak test now fails on such a record instead of counting it.
   A safe durable-only reader could also return such records from its read buffer when recovery removed them in
-  place, in a file that kept its identity (storage damage that emptied a commit word after the checkpoint); it now
-  discards that buffer when it applies a new marker, so it reads every newly covered record from the file again.
+  place, in a file that kept its identity (storage damage that emptied a commit word after the checkpoint, where
+  recovery finds no committed history after it and so can't tell it from a torn append, such as the newest record's
+  commit word zeroed; see the recovery fix above); it now discards that buffer when it applies a new marker, so it
+  reads every newly covered record from the file again.
   A durable-only reader waiting at the end of a segment that retention removed, with the checkpoint naming the next
   segment but not yet past its position (the writer rolled and committed nothing there), returned `Ok(None)` for as
   long as the writer stayed idle; it now returns `Error::Discarded` there, as a visible reader does.
@@ -59,7 +110,9 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 - Fix: `verify` (CLI `verify`, `inspect`) scanned a state a running writer passes through again only once, after
   50 ms, so a writer descheduled between linking a new segment and sealing the old one for longer made it report a
   broken chain. It now scans again with growing pauses, up to 630 ms in all (new hook point `InspectRescan` between
-  those scans).
+  those scans). The scans with which `verify` follows a live writer past an empty commit word at the end of the
+  newest segment (ADR 0035, above) take their rescans of an invalid record from the same 630 ms per segment instead
+  of a 50 ms retry of their own; the 50 ms `verify` waits once before reporting a still-empty commit word stays.
 - C ABI (ADR 0028, `docs/c-api.md`): a new workspace crate, `crates/tickertape-ffi`, builds `libtickertape` as a
   shared and a static library with a committed, cbindgen-generated C99/C++11 header (`include/tickertape.h`, checked
   for drift in CI) and cargo-c metadata for installation with a pkg-config file. It covers the writer (append,
