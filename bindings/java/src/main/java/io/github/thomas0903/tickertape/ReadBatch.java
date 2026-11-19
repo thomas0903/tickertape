@@ -33,6 +33,7 @@ public final class ReadBatch {
     final MemorySegment records;
     final MemorySegment buffer;
     private final int maxRecords;
+    private final long bufferLength;
     final Generation generation = new Generation();
     private final RecordView view = new RecordView(generation, null);
     private int size;
@@ -50,8 +51,6 @@ public final class ReadBatch {
         this.buffer = Memory.allocate(bufferBytes);
         this.bufferLength = bufferBytes;
     }
-
-    private final long bufferLength;
 
     /** The most records one read can return. */
     public int maxRecords() {

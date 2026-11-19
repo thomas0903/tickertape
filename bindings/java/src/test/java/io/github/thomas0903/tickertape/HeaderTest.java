@@ -228,7 +228,7 @@ class HeaderTest {
         assertTrue(codes.size() >= 20, codes.toString());
         Map<Class<?>, String> classes = new HashMap<>();
         for (Map.Entry<String, Integer> e : codes.entrySet()) {
-            Status s = Status.of(e.getValue() >= 0 ? e.getValue() : e.getValue());
+            Status s = Status.of(e.getValue());
             assertEquals(e.getKey(), s.cName(), "Status for " + e);
             assertEquals((int) e.getValue(), s.code());
             if (e.getValue() >= 0) {

@@ -58,6 +58,8 @@ final class NativeLibrary {
     static final String RESOURCE_ROOT = "META-INF/tickertape/native/";
 
     private static SymbolLookup lookup;
+    /** {@link #lookup} once loading succeeded, read without the lock (calls such as realtimeNs run per record). */
+    private static volatile SymbolLookup loaded;
     private static String source;
     private static Path requested;
     /** The file the library was loaded from, when it is still there (not for an extracted copy). */
@@ -98,7 +100,12 @@ final class NativeLibrary {
     }
 
     /** Loads the library if needed and returns its symbols; throws the same error on every call if loading failed. */
-    static synchronized SymbolLookup lookup() {
+    static SymbolLookup lookup() {
+        SymbolLookup l = loaded;
+        return l != null ? l : load0();
+    }
+
+    private static synchronized SymbolLookup load0() {
         if (lookup != null) {
             return lookup;
         }
@@ -109,6 +116,7 @@ final class NativeLibrary {
         }
         try {
             load();
+            loaded = lookup;
             return lookup;
         } catch (UnsatisfiedLinkError e) {
             failure = e;
