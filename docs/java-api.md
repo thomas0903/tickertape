@@ -119,7 +119,10 @@ The Linux libraries are built for glibc.
     path-length limit, as the JDK opens it. Passed absolute, it reaches the journal the JDK's own `Files` methods see,
     and the path-length limit applies to that absolute form, as it does to the JDK's own file operations then. A process
     that changes its working directory through native code (`chdir`) is outside what the binding follows, as it is for
-    the JDK. Trailing slashes are removed (except from the root);
+    the JDK. Known limit: with `-Duser.dir=` naming a directory other than the process's working directory, directories
+    renamed (or a symbolic link replaced) around the binding's first conversion of a relative path can leave the
+    binding and the JDK resolving relative paths against different directories; pass absolute journal paths when
+    `-Duser.dir` is used. Trailing slashes are removed (except from the root);
   - `toUri()` may `stat` the path once (to tell whether it is a directory), and for a relative path the working
     directory once more (until the inference has succeeded, also a `getcwd` and up to three more `stat`s), which
     happens when a journal is opened or inspected, or a retention destination is set (`Retention.moveTo`), never per
