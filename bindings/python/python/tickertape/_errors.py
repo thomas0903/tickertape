@@ -1,0 +1,141 @@
+"""Exception hierarchy of the tickertape bindings.
+
+Every exception raised for a ``tickertape::Error`` is a :class:`TickertapeError`. Some also inherit from the built-in
+exception that matches their meaning, so generic handlers work too: :class:`JournalIOError` is an :class:`OSError`,
+:class:`RecordTooLargeError` and :class:`InvalidConfigError` are :class:`ValueError`, and
+:class:`SeqUnavailableError` is a :class:`LookupError`.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any, Optional
+
+
+class TickertapeError(Exception):
+    """Base class of every error raised for a ``tickertape::Error``."""
+
+    def __init__(self, message: str, **fields: Any) -> None:
+        super().__init__(message)
+        self.message = message
+        for name, value in fields.items():
+            setattr(self, name, value)
+
+    def __str__(self) -> str:
+        return self.message
+
+
+class JournalIOError(TickertapeError, OSError):
+    """An operating-system call failed. ``errno``, ``strerror`` and ``filename`` are set as for :class:`OSError`."""
+
+    op: str
+    """What tickertape was doing, for example ``"preallocate segment"``."""
+    storage_full: bool
+    """True for ``ENOSPC``/``EDQUOT``. Such append failures leave the journal consistent and can be retried."""
+
+
+class StorageFullError(JournalIOError):
+    """The filesystem is full (``ENOSPC``, ``EDQUOT``). Appends can be retried once space is available."""
+
+
+class LockedError(TickertapeError):
+    """Another writer holds the journal's lock."""
+
+    path: Path
+    pid: Optional[int]
+    """The PID recorded in ``writer.lock``, if it could be read. Informational only."""
+
+
+class CorruptJournalError(TickertapeError):
+    """Bytes in a segment failed validation. The reader's cursor does not move; reading again retries."""
+
+    path: Path
+    offset: int
+    """Byte offset of the invalid header, record or seal."""
+    reason: str
+    """A stable code such as ``"bad_checksum"`` (see ``tickertape.CORRUPT_REASONS``)."""
+    details: dict[str, Any]
+    """The reason's fields, for example ``{"expected": 5, "found": 7}`` for ``"bad_sequence"``."""
+
+
+class UnsupportedVersionError(TickertapeError):
+    """A segment was written by an incompatible format version."""
+
+    path: Path
+    found: int
+    supported: int
+
+
+class JournalNotFoundError(TickertapeError):
+    """The directory contains no segments (for example, the writer hasn't started yet)."""
+
+    path: Path
+
+
+class SeqUnavailableError(TickertapeError, LookupError):
+    """A requested sequence number is older than the oldest segment in the journal."""
+
+    requested: int
+    first: int
+
+
+class RecordTooLargeError(TickertapeError, ValueError):
+    """A payload does not fit in one segment (or in the current, still empty segment)."""
+
+    length: int
+    max: int
+
+
+class DurabilityLostError(TickertapeError):
+    """An earlier checkpoint failed; this writer can no longer guarantee durability. Appends still work."""
+
+
+class SequenceExhaustedError(TickertapeError):
+    """The next sequence number would be 2**64 - 1."""
+
+
+class DiscardedError(TickertapeError):
+    """Recovery or retention replaced or removed the segment at the reader's position. Call ``seek`` to continue."""
+
+    seq: int
+
+
+class InvalidConfigError(TickertapeError, ValueError):
+    """A configuration value is out of range."""
+
+
+class BatchAppendError(TickertapeError):
+    """``Writer.append_many`` failed part-way.
+
+    Records ``payloads[:appended]`` were appended (sequence numbers ``first_seq`` to ``first_seq + appended - 1``,
+    visible but not yet durable); ``payloads[failed_index:]`` were not. The error that stopped the batch is
+    ``__cause__``. Retry with ``payloads[appended:]`` once the cause is resolved.
+    """
+
+    appended: int
+    first_seq: Optional[int]
+    """``None`` when nothing was appended."""
+    failed_index: int
+
+
+__all__ = [
+    "BatchAppendError",
+    "CorruptJournalError",
+    "DiscardedError",
+    "DurabilityLostError",
+    "InvalidConfigError",
+    "JournalIOError",
+    "JournalNotFoundError",
+    "LockedError",
+    "RecordTooLargeError",
+    "SeqUnavailableError",
+    "SequenceExhaustedError",
+    "StorageFullError",
+    "TickertapeError",
+    "UnsupportedVersionError",
+]
+
+# Report the public location in tracebacks and reprs.
+for _name in __all__:
+    globals()[_name].__module__ = "tickertape"
+del _name
