@@ -552,6 +552,13 @@ impl Reader {
     }
 }
 
+impl Reader {
+    /// For [`Reader::cursor`] (`status.rs`): the position, the current segment's path and the cursor's offset.
+    pub(crate) fn cursor_parts(&self) -> (u64, &Path, u64) {
+        (self.position(), &self.seg.path, self.offset)
+    }
+}
+
 fn open_segment(dir: &Path, base: u64, mapped: bool) -> Result<OpenSegment> {
     let path = journal::segment_path(dir, base);
     let file = File::open(&path).map_err(|e| Error::io("open segment", &path, e))?;

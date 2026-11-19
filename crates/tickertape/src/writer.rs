@@ -58,6 +58,12 @@ pub struct Writer {
     report: RecoveryReport,
     retention_report: crate::retention::Report,
     last_retention_error: Option<Error>,
+    /// Retention runs that failed since open.
+    retention_failures: u64,
+    /// The checkpoint marker's current slot as this writer last wrote it (or read it at open).
+    checkpointed: Option<CheckpointSlot>,
+    /// When this writer's last successful checkpoint finished.
+    last_checkpoint_at: Option<std::time::Instant>,
 }
 
 /// An open, mapped segment.
@@ -179,6 +185,9 @@ impl Writer {
             report,
             retention_report: crate::retention::Report::default(),
             last_retention_error: None,
+            retention_failures: 0,
+            checkpointed: checkpoint,
+            last_checkpoint_at: None,
         };
         writer.run_retention();
         Ok(writer)
@@ -383,6 +392,8 @@ impl Writer {
             .map_err(|e| Error::io("sync checkpoint marker", &marker_path, e))?;
 
         self.generation = generation;
+        self.checkpointed = Some(slot);
+        self.last_checkpoint_at = Some(std::time::Instant::now());
         // Durable-only readers wait for the marker to move.
         if let Some(notify) = &self.notify {
             notify.publish();
@@ -414,6 +425,31 @@ impl Writer {
         self.last_retention_error.as_ref()
     }
 
+    /// Operational metrics only the writer knows: the head, the last checkpoint and its age by the monotonic clock,
+    /// what the next checkpoint has to sync, whether the writer is poisoned, and retention failures (ADR 0032; see
+    /// [`crate::status`] for what other processes can observe).
+    ///
+    /// Cost: no system calls; one monotonic clock read, and a sum over the segments touched since the last
+    /// checkpoint. Nothing is added to [`Writer::append`].
+    pub fn metrics(&self) -> crate::status::WriterMetrics {
+        let dirty = self.dirty.iter().fold(0u64, |sum, seg| {
+            sum.saturating_add(seg.to.saturating_sub(seg.from))
+        });
+        crate::status::WriterMetrics {
+            head: crate::status::Position::new(self.next_seq, self.active.base, self.offset),
+            segment_size: self.active.size,
+            checkpoint: self.checkpointed,
+            since_checkpoint: self.last_checkpoint_at.map(|at| at.elapsed()),
+            uncheckpointed_records: self
+                .next_seq
+                .saturating_sub(self.checkpointed.map_or(0, |c| c.next_seq)),
+            uncheckpointed_bytes: dirty
+                .saturating_add(self.offset.saturating_sub(self.active_dirty_from)),
+            poisoned: self.poisoned,
+            retention_failures: self.retention_failures,
+        }
+    }
+
     fn run_retention(&mut self) {
         let Some((policy, action)) = &self.config.retention else {
             return;
@@ -423,6 +459,7 @@ impl Writer {
         });
         if let Err(error) = result {
             self.last_retention_error = Some(error);
+            self.retention_failures = self.retention_failures.saturating_add(1);
         }
     }
 
