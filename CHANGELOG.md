@@ -5,6 +5,17 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
+- Java binding (ADR 0037, `docs/java-api.md`): `bindings/java`, a Maven project (JDK 25, module
+  `io.github.thomas0903.tickertape`, no runtime dependencies) over the C ABI with the Foreign Function and Memory API
+  and no JNI. It covers the writer (copying, zero-copy and batch appends, checkpoint), the safe and mapped readers
+  (try, timed and blocking next, batch reads, seek, durable-only), inspection and retention. Use after close and
+  concurrent use of a handle throw instead of crashing; blocking reads honour `Thread.interrupt()` and a close from
+  another thread without losing records; record views are reused and checked, and the hot paths allocate nothing.
+  Every C status and corruption reason has its own exception or constant, checked against the header. The library is
+  found by explicit path, system property, a natives JAR (extracted privately and hash-checked) or the library path,
+  and a library of another version is refused. Tested on Linux x86-64, Linux arm64 and macOS in a new CI job, including
+  the cross-language fixtures and the released-format fixtures. Not published to Maven Central yet; the coordinates
+  `io.github.thomas0903:tickertape` await the owner's confirmation.
 - C ABI (ADR 0028, `docs/c-api.md`): a new workspace crate, `crates/tickertape-ffi`, builds `libtickertape` as a
   shared and a static library with a committed, cbindgen-generated C99/C++11 header (`include/tickertape.h`, checked
   for drift in CI) and cargo-c metadata for installation with a pkg-config file. It covers the writer (append,

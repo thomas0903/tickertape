@@ -1,0 +1,312 @@
+# Java API
+
+tickertape has a Java binding for JDK 25 and newer, in [`bindings/java/`](../bindings/java/README.md). It calls the C
+ABI ([`c-api.md`](c-api.md)) through the Foreign Function and Memory API (`java.lang.foreign`), with no JNI and no
+native code of its own, and has no runtime dependencies. The Javadoc documents every class; this page explains the
+rules they share. The design and its reasons are in [ADR 0037](decisions/0037-java-binding.md).
+
+> **Status:** not stable before tickertape 1.0, like the C ABI it is built on. The binding requires exactly the
+> library version it was written for until then (see [Versioning](#versioning)). It is not published to Maven Central
+> yet: build it from source.
+
+Example: [`bindings/java/examples/Example.java`](../bindings/java/examples/Example.java) records, follows live and
+replays a journal; it runs from source with the `java` launcher.
+
+```java
+import io.github.thomas0903.tickertape.*;
+import java.lang.foreign.ValueLayout;
+import java.nio.file.Path;
+import java.util.concurrent.TimeUnit;
+
+public class Hello {
+    public static void main(String[] args) throws InterruptedException {
+        Path dir = Path.of("/tmp/journal");
+        try (Writer writer = Writer.open(dir)) {
+            long seq = writer.append(1, 0, Tickertape.realtimeNs(), "hello".getBytes());
+            writer.checkpoint(); // durable, not only visible
+
+            try (Reader reader = Reader.open(dir)) {
+                reader.seek(seq);
+                RecordView r = reader.next(1, TimeUnit.SECONDS); // null if nothing arrives in time
+                // The view is borrowed: valid until the next call on the reader. Copy what you keep.
+                System.out.println(r.seq() + " " + new String(r.payloadToArray()));
+            }
+        }
+    }
+}
+```
+
+## Building and running
+
+The binding needs `libtickertape`, built from source with Cargo (Rust 1.85 or newer), and a JDK 25 with Maven:
+
+```bash
+cargo build --release -p tickertape-ffi                    # target/release/libtickertape.{so,dylib}
+mvn -f bindings/java/pom.xml package -DskipTests           # bindings/java/target/tickertape-0.4.0.jar
+```
+
+Run with the JAR on the class path, native access enabled, and the library's location:
+
+```bash
+java --enable-native-access=ALL-UNNAMED -cp bindings/java/target/tickertape-0.4.0.jar:app.jar \
+     -Dtickertape.library.path=target/release/libtickertape.so com.example.App
+```
+
+On the module path the module is `io.github.thomas0903.tickertape` and the flag is
+`--enable-native-access=io.github.thomas0903.tickertape`. Without the flag, JDK 25 prints a warning on first use
+(and later JDKs refuse); `--illegal-native-access=deny` turns a missing flag into an error, which is how the tests run.
+
+**Finding the library.** The binding loads `libtickertape` on first use, in this order:
+
+1. `Tickertape.loadLibrary(path)`, called before any other use;
+2. the system property `tickertape.library.path` (a file);
+3. a natives JAR for this platform on the class path (see below);
+4. each directory of `java.library.path`;
+5. the operating system's own search (`LD_LIBRARY_PATH`, the loader cache, `DYLD_LIBRARY_PATH`).
+
+The first library found must be compatible or loading fails with an `UnsatisfiedLinkError` that says what was tried
+and why; the binding never falls back to a later candidate after a failure. `Tickertape.librarySource()` tells you
+where the library came from.
+
+**The natives JAR.** `tickertape-<version>-natives-<platform>.jar` (`linux-x86_64`, `linux-aarch64`,
+`macos-aarch64`, `macos-x86_64`) carries the library and its SHA-256. The binding extracts it into a new directory
+with a random name that only the current user can read (under `java.io.tmpdir`, or `-Dtickertape.library.extractDir`
+if the temporary directory does not allow executable files), checks the hash, loads it, and deletes the file and the
+directory at once. Build it with:
+
+```bash
+bindings/java/scripts/stage-natives.sh target/release linux-x86_64
+mvn -f bindings/java/pom.xml -Pnatives package -DskipTests
+```
+
+The Linux libraries are built for glibc.
+
+## Conventions
+
+- **Unsigned values.** Sequence numbers, timestamps and sizes are unsigned 64-bit in the format, and schema ids
+  unsigned 32-bit. Java has `long` and `int` with the same bits: use `Long.toUnsignedString`,
+  `Long.compareUnsigned` and `Integer.toUnsignedLong` where the top bit can be set (timestamps can be up to
+  2^64 - 1).
+- **Options** (`WriterOptions`, `ReaderOptions`, `Retention`) are immutable values: each setter returns a new value.
+  They are copied into the library when a writer or reader is opened.
+- **Paths** must be on the default file system; they are passed to the operating system as UTF-8.
+- **Timeouts** are a `long` with a `TimeUnit`, or a `Duration`. Zero or negative does not wait. A timeout bounds only
+  the wait for a record: validating the records skipped after a seek, and file I/O, are not interrupted.
+- **Errors** are unchecked exceptions (see [Errors](#errors)).
+
+## Ownership and lifetimes
+
+| Object | Create | Release |
+|---|---|---|
+| `Writer` | `Writer.open` | `close()` |
+| `Reader` | `Reader.open`, `Reader.openMappedUnsafe` | `close()` |
+| `RecordView` | returned by `tryNext`, `next`, `ReadBatch.get` | nothing to release; valid until the next call |
+| `AppendBatch`, `ReadBatch` | constructors | garbage collected (they own only memory) |
+
+- Writers and readers are `AutoCloseable`; use try-with-resources. `close()` is idempotent. A writer or reader that
+  becomes unreachable without being closed is closed by a `Cleaner` eventually; that is a safety net, not a way to
+  manage them (a forgotten writer keeps the journal locked until the garbage collector runs).
+- **A `RecordView` is borrowed.** The reader returns the same view object every time, so reading allocates nothing.
+  It is valid until the next call on that reader (any method except `position()` and `isClosed()`), or until the
+  reader is closed. Every accessor checks this and throws `IllegalStateException` on a view that is no longer valid.
+  Copy what you need to keep: `copy()` (a `RecordCopy`), `payloadToArray()`, or `copyPayloadTo(byte[] | ByteBuffer |
+  MemorySegment)`.
+- **Reading a payload in place.** Typed reads take a layout, as `MemorySegment` does:
+  `view.get(ValueLayout.JAVA_LONG_UNALIGNED, 8)`. Payloads have no alignment guarantee, so use the `_UNALIGNED`
+  layouts (in native byte order, or with `withOrder`). For code that needs a `MemorySegment`,
+  `view.withPayload(segment -> ...)` passes a read-only segment that is closed when the action returns, so it cannot
+  outlive the record; the action must not use the reader.
+- **Batches.** A `ReadBatch` holds the records of one `readBatch` call in its own memory; `get(i)` returns its one
+  reusable view, valid until the batch is filled again. An `AppendBatch` copies payloads in when they are added; reuse
+  it with `clear()`.
+- **Allocation.** Once warm, appends (all forms), `appendWith`, `appendBatch`, `tryNext`, a timed `next` that finds a
+  record, `readBatch` and the view accessors allocate nothing on the Java heap (`AllocationTest` checks this).
+
+## Writing
+
+```java
+WriterOptions options = WriterOptions.defaults()
+        .segmentSize(64L << 20)
+        .retention(Retention.delete().maxSegments(16));
+try (Writer writer = Writer.open(Path.of("/data/journal"), options)) {
+    long seq = writer.append(QUOTE, venueTs, Tickertape.realtimeNs(), payload);          // byte[]
+    writer.append(QUOTE, venueTs, Tickertape.realtimeNs(), segment);                      // MemorySegment
+    writer.append(QUOTE, venueTs, Tickertape.realtimeNs(), byteBuffer);                   // ByteBuffer, position kept
+    writer.appendWith(QUOTE, venueTs, Tickertape.realtimeNs(), 24, p -> {                 // zero-copy
+        p.set(ValueLayout.JAVA_LONG_UNALIGNED, 0, price);
+        p.set(ValueLayout.JAVA_LONG_UNALIGNED, 8, quantity);
+        p.set(ValueLayout.JAVA_LONG_UNALIGNED, 16, orderId);
+    });
+    writer.checkpoint();
+}
+```
+
+- `append` copies the payload into the journal. A native `MemorySegment` is passed to the library as it is; arrays,
+  heap segments and buffers are first copied into the writer's scratch memory.
+- `appendWith` avoids that copy: your `PayloadFiller` writes the payload straight into the journal's mapped segment
+  through a `PayloadBuffer` (zeroed, exactly the requested length, valid only while the filler runs). It costs an
+  upcall from the library into Java, so for small records the copying `append` is as fast or faster; it pays off when
+  you would otherwise build the payload in a temporary buffer first. **Throwing from the filler aborts the append:**
+  nothing is committed, the writer zeroes and syncs the reserved bytes (slow, so aborting is for exceptional cases),
+  and `appendWith` throws `FillAbortedException` with your exception as its cause. If that sync fails, it throws a
+  `JournalIoException` instead: a storage incident, after which the writer refuses appends and checkpoints (see
+  [`c-api.md`](c-api.md#a-failed-clean-up-after-an-aborted-fill)). The filler must not call its writer.
+- `appendBatch` appends an `AppendBatch` with one call into the library. Every record is checked first, so an argument
+  error appends nothing; if an append fails part-way, the records before it stay appended and
+  `BatchAppendException.appended()` says how many. Retry from that index.
+- `nextSeq()` is the sequence number the next append will get. `lastRetentionError()` returns the latest error of the
+  writer's retention, which never fails appends or checkpoints.
+
+## Reading
+
+```java
+try (Reader reader = Reader.open(Path.of("/data/journal"))) {   // at the oldest record
+    reader.seek(1000);                                         // next record is seq 1000
+    while (running) {
+        RecordView r;
+        try {
+            r = reader.next(100, TimeUnit.MILLISECONDS);       // null: nothing new yet
+        } catch (DiscardedHistoryException e) {                // recovery or retention replaced the segment
+            reader.seek(reader.position());                    // SequenceUnavailableException if retention removed it
+            continue;
+        }
+        if (r != null) {
+            handle(r.seq(), r.get(ValueLayout.JAVA_LONG_UNALIGNED, 0));
+        }
+    }
+}
+```
+
+- `Reader.open` is the **safe reader**: it reads the files with `pread` into its own buffer and validates the copy, so
+  it is memory-safe whatever other processes do to the files.
+- `Reader.openMappedUnsafe` is the **mapped reader**: payloads are read straight from a memory mapping, without a
+  copy. **Precondition: while it exists, no process other than a tickertape writer may modify the journal's segment
+  files.** A tickertape writer never changes committed bytes, so this holds in normal operation; if something else
+  truncates a segment, the JVM receives `SIGBUS` and dies. The binding cannot check this, hence the name.
+- `tryNext()` never waits; `next(timeout)` waits up to the timeout and returns `null` if nothing arrived; `next()`
+  waits as long as it takes. `readBatch(batch, timeout)` waits for the first record only, then takes what is already
+  committed.
+- **A failed read consumed nothing.** After any exception from a reader, the next read returns the record that was
+  next before. A batch read that hit an error after some records returns those records, and the next read throws the
+  error. A record too large for a `ReadBatch`'s buffer throws `BufferTooSmallException` with the size it needs and
+  stays next.
+- `ReaderOptions.defaults().durableOnly(true)` gives a reader that returns only records covered by a checkpoint (see
+  [Durability](#durability)).
+- **Starting before the writer.** Opening a journal whose writer has not started throws `JournalIoException` with
+  `osErrorCode()` 2 (`ENOENT`); while the writer creates the first segment, `JournalNotFoundException`. A loop that
+  waits for the writer retries on exactly these two (the example does).
+
+## Interruption and closing
+
+Blocking reads (`next` with a timeout or without, `readBatch`) wait in slices of at most
+`ReaderOptions.waitSlice(...)`, 10 ms by default. Between slices they check the thread's interrupt status and throw
+`InterruptedException` (clearing it), and notice a `close()` from another thread (throwing `IllegalStateException`).
+So an interrupt or a close ends a wait within one slice. A record that arrives during a slice is returned at once, even
+if the thread was interrupted meanwhile: the interrupt status then stays set, and the next blocking call throws. A
+blocking call on an already interrupted thread throws before doing anything. `tryNext()` and `tryReadBatch()` never
+wait and ignore the interrupt status.
+
+## Durability
+
+The binding uses the crash contract's two levels ([`crash-contract.md`](crash-contract.md)):
+
+| Level | Reached when | Means |
+|---|---|---|
+| **Visible** | an append returns | Readers on this host can read the record, and it survives the writer process dying. It can still be lost in a power loss or OS crash |
+| **Durable** | a later `checkpoint()` returns | The record is on stable storage, under the crash contract's storage assumptions |
+
+`close()` does not checkpoint. A failed checkpoint poisons the writer: later checkpoints throw
+`DurabilityLostException` while appends keep working; treat it as an incident. A durable-only reader returns only
+records below the checkpoint marker's `next_seq` (crash contract C13), and nothing without a valid marker; its records
+survive a power loss under the crash contract's conditions, including that no checkpoint failed earlier in the same
+boot.
+
+## Errors
+
+Every error from the library is a `TickertapeException` (unchecked), with one subclass per C status code:
+
+| Exception | Status | Meaning |
+|---|---|---|
+| `InvalidArgumentException` | `INVALID_ARGUMENT` | The library rejected an argument (Java checks most arguments itself first) |
+| `JournalIoException` | `IO` | A system call failed; `osErrorCode()` is its `errno` |
+| `StorageFullException` (a `JournalIoException`) | `STORAGE_FULL` | `ENOSPC` or `EDQUOT`; a failed append can be retried later |
+| `JournalLockedException` | `LOCKED` | Another writer has the journal open |
+| `CorruptJournalException` | `CORRUPT` | Journal bytes failed validation; `reason()` says why. A reader's position does not move |
+| `UnsupportedFormatVersionException` | `UNSUPPORTED_VERSION` | A segment has an unsupported format version |
+| `JournalNotFoundException` | `NOT_FOUND` | The directory has no segments yet (a missing directory is `JournalIoException` with `ENOENT`) |
+| `SequenceUnavailableException` | `SEQ_UNAVAILABLE` | The sequence number is older than the oldest segment |
+| `RecordTooLargeException` | `RECORD_TOO_LARGE` | The payload does not fit in a segment |
+| `DurabilityLostException` | `DURABILITY_LOST` | An earlier checkpoint, or the clean-up after an aborted fill, failed |
+| `SequenceExhaustedException` | `SEQUENCE_EXHAUSTED` | Sequence numbers are exhausted |
+| `DiscardedHistoryException` | `DISCARDED` | Recovery or retention replaced or removed the reader's segment; call `seek` |
+| `InvalidConfigException` | `INVALID_CONFIG` | A configuration value is out of range |
+| `BufferTooSmallException` | `BUFFER_TOO_SMALL` | A `ReadBatch` buffer is too small; `requiredBytes()` |
+| `FillAbortedException` | `ABORTED` | A `PayloadFiller` threw; nothing was appended |
+| `HandleBusyException` | `BUSY` | Not reachable through the binding (its guard throws `IllegalStateException` first) |
+| `InternalErrorException` | `PANIC` | A bug in tickertape was caught; the handle is broken, close it |
+| `TickertapeException` | `UNKNOWN` | A code this binding does not know; `code()` has it |
+
+`status()` and `code()` give the status on every exception; `BatchAppendException` reports a partial batch append. The
+`Status` and `CorruptReason` enums carry the C values and names. Mistakes Java can detect itself are the usual
+`NullPointerException`, `IllegalArgumentException`, `IndexOutOfBoundsException` and `IllegalStateException` (a closed
+writer or reader, a view that is no longer valid, concurrent use), thrown before the library is called.
+
+The C ABI records error details per operating-system thread; the binding reads them right after the failing call, on
+the same thread, so they are reliable on platform and virtual threads alike.
+
+## Threading
+
+- A `Writer` or `Reader` is used by one thread at a time. It may be handed to another thread between calls, with the
+  usual happens-before (an executor, a lock, a queue). The binding checks this on every call with one atomic
+  compare-and-set: a call that finds the handle in use by another thread, or closed, throws `IllegalStateException`
+  and does nothing. So misuse is an exception, never a crashed JVM.
+- `close()` may be called from any thread. It waits for a call in progress to finish (a blocked read ends within one
+  wait slice), then frees the handle.
+- Views follow their reader: use them on the thread that is using the reader. The binding cannot detect another thread
+  closing or advancing the reader while you read a view.
+- Separate readers are independent and can run on separate threads and processes. `Journal`'s functions can be called
+  from any thread, also while a writer is active.
+- A writer starts a background helper thread by default (prefaulting, and on macOS preparing the next segment);
+  `WriterOptions.prefault(false)` gives a writer that starts none.
+- **Virtual threads.** A call into the library pins a virtual thread to its carrier while it runs. Appends and
+  `tryNext()` are short. A blocking read pins its carrier for the whole wait, and `open`, `checkpoint` and an append
+  that rolls to a new segment pin it while they run. Follow live journals from platform threads, or poll with
+  `tryNext()` and park between polls.
+
+## Inspection and retention
+
+- `Journal.verify(dir)` checks every segment and returns a `VerifyReport` (records, sequence range, problems and the
+  first one). Corruption is in the report, not thrown.
+- `Journal.listSegments(dir)` lists the segments; `Journal.readCheckpoint(dir)` reads the checkpoint marker (empty if
+  there is none).
+- Retention (ADR 0016) removes a sealed, checkpoint-covered prefix of old segments. Build `Retention.delete()` or
+  `Retention.moveTo(dir)` with limits (`maxSegments`, `maxBytes`, `maxAge`); there is no default that deletes. Pass it
+  to `WriterOptions.retention` to run after every checkpoint, or to `Journal.applyRetention(dir, retention, dryRun)`
+  to run once.
+
+## Versioning
+
+The binding's version is the version of the C library it is written for (0.4.0 here), and it is released with the
+library. At load it checks the library with the C ABI's rule (ADR 0028):
+
+- **Before 1.0** the C ABI is unstable (ABI version 0), so the library must be exactly the binding's version.
+- **From 1.0** the ABI version must be equal and the library at least as new as the binding: binding 1.x works with
+  any 1.y library, y >= x.
+
+An incompatible library is refused with an `UnsatisfiedLinkError` that names both versions. `Tickertape.bindingVersion()`,
+`libraryVersion()` and `abiVersion()` report them.
+
+## Testing
+
+```bash
+bindings/java/scripts/build-native.sh                 # libtickertape, the CLI and the C test programs
+mvn -f bindings/java/pom.xml verify                   # with JAVA_HOME pointing at a JDK 25
+```
+
+The tests run on the module path with `--illegal-native-access=deny`. They check the binding against the C header
+(every function wrapped or deliberately not, descriptors, struct layouts, status codes, corruption reasons and
+versions), and include the cross-language fixtures: a journal written from Java reads back identically through the
+C ABI test program, the Rust CLI and the Python decoder; journals written through C and by every released version
+(`tests/compat/`) read back in Java. Tests that need the CLI, the C programs or Python are skipped when those are
+missing, unless `-Dtickertape.test.requireTools=true` (as in CI). `-Dtickertape.native.dir=<dir>` points at a library
+built elsewhere (for example with a different `CARGO_TARGET_DIR`).
