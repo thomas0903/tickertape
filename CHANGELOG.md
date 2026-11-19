@@ -14,8 +14,8 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   exit 1 and `export stopped at sequence N: records N to M were removed from the journal (by retention or archiving)
   before export read them` (`record N was ... read it` for one), after the records before N (a Parquet file is
   finalized, as on corruption). The check that the output file is not a journal file no longer fails (exit 1, "stat
-  journal entry") on a segment removed while it walks the directory; it skips that entry unless the directory that
-  listed it is on the output's filesystem and the inode number in its directory entry is the output's.
+  journal entry") on a segment removed while it walks the directory; it skips that entry unless the inode number in
+  its directory entry is the output's.
 - Fix: `tickertape export` could exit 0 with records from a different history: if recovery replaced records the
   startup scan had counted and the writer appended others with the same sequence numbers before the writing pass
   read them (crash contract C8, C11), the writing pass exported the other records. Both passes now compute a

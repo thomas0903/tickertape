@@ -51,7 +51,7 @@ Errors and recovery warnings go to stderr. JSON results go to stdout (or the sel
   inclusive range; JSONL defaults to stdout and `--output -` also selects stdout for JSONL. The output file is created or
   truncated, but a path naming an existing journal entry (including via symlinks/hard links), or any path inside
   the journal, is rejected (an entry that retention removes while this check walks the directory is skipped, unless
-  its directory is on the output file's filesystem and the inode number in its directory entry is the output file's).
+  the inode number in its directory entry is the output file's).
   `--to` must not precede `--from`.
   A first safe-reader pass, the startup scan, counts the selected records. It stops at `--to`, at the first empty
   slot it sees, or, with `--durable-only`, at the checkpoint bound described below; without `--to`, a visible scan
@@ -62,7 +62,8 @@ Errors and recovery warnings go to stderr. JSON results go to stdout (or the sel
   records the scan had read and the writer appended others with the same sequence numbers; crash contract C8, C11),
   the export ends with exit 1 and `journal changed during export: the records read differ from those the startup
   scan counted; the output is not a consistent export`, after writing what the second pass read (a Parquet file is
-  finalized). Under retention or archiving (crash contract C14), a segment that retention removed after a pass had
+  finalized). The fingerprint is a 64-bit hash that is not cryptographic: it catches a journal that changed in this
+  way, not records constructed to collide. Under retention or archiving (crash contract C14), a segment that retention removed after a pass had
   read it loses nothing: the pass continues at that position on the current chain. It does the same after recovery
   replaced the segment; records recovery replaced there are reported by the fingerprint check. Records removed before
   a pass read them end the export with exit 1 and `export stopped at sequence N: records N to M were removed from the

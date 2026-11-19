@@ -55,8 +55,9 @@ pub(crate) fn run(args: ExportArgs, stdout: &mut dyn Write) -> Result<()> {
     // oldest segment between the passes.
     let start = snapshot.position();
     let scan = capture(&mut snapshot, args.to, end_seq);
-    // Nothing to write before the failure: report it without creating or truncating the destination.
-    if scan.count == 0 {
+    // Nothing to write before the failure, or the checkpoint marker changed under the scan (the records counted are a
+    // shorter prefix than the one selected): report it without creating or truncating the destination.
+    if scan.count == 0 || scan.marker_changed {
         if let Some(failure) = scan.terminal {
             return Err(failure);
         }
@@ -143,6 +144,8 @@ struct Scan {
     count: u64,
     fingerprint: u64,
     terminal: Option<Failure>,
+    /// The scan ended below the frozen checkpoint bound (`terminal` says so): nothing is written, whatever was counted.
+    marker_changed: bool,
 }
 
 /// A running hash of the selected records (sequence number, schema id, both timestamps, payload length and bytes), in
@@ -208,6 +211,7 @@ impl Fingerprint {
 fn capture(reader: &mut Reader, to: Option<u64>, end_seq: Option<u64>) -> Scan {
     let mut count = 0;
     let mut fingerprint = Fingerprint::default();
+    let mut marker_changed = false;
     let terminal = loop {
         // Check the bounds before reading: a read past them could fail (retention) although nothing is selected.
         let position = reader.position();
@@ -224,7 +228,10 @@ fn capture(reader: &mut Reader, to: Option<u64>, end_seq: Option<u64>) -> Scan {
                 }
             }
             // Below the frozen checkpoint bound: the marker no longer covers records it covered at startup.
-            Ok(None) if end_seq.is_some() => break Some(changed(CHECKPOINT_CHANGED)),
+            Ok(None) if end_seq.is_some() => {
+                marker_changed = true;
+                break Some(changed(CHECKPOINT_CHANGED));
+            }
             Ok(None) => break None,
             Err(Error::Discarded { seq }) => {
                 if let Err(failure) = resume(reader, seq) {
@@ -238,6 +245,7 @@ fn capture(reader: &mut Reader, to: Option<u64>, end_seq: Option<u64>) -> Scan {
         count,
         fingerprint: fingerprint.finish(),
         terminal,
+        marker_changed,
     }
 }
 
@@ -375,15 +383,14 @@ fn destination(dir: &Path, path: &Path) -> Result<File> {
 /// failed. Everywhere else (segments, the checkpoint marker, `quarantine/`) the check fails closed, as in v0.4.0: a
 /// directory that can't be listed is an error, so evidence in an unreadable `quarantine/` is never truncated. An
 /// entry that vanishes between the listing and its `stat` (retention removing or archiving a segment) is skipped,
-/// unless the directory that listed it is on the output's device and the inode number in its directory entry is the
-/// output's: a segment that archiving moves out of the directory during the walk may be the output's other name. A
-/// directory entry's file is on its directory's filesystem unless the entry is a mount point, and a mount point can't
-/// be removed or renamed while it is mounted, so it doesn't vanish this way.
+/// unless the inode number in its directory entry is the output's: a segment that archiving moves out of the directory
+/// during the walk may be the output's other name. The device can't be compared for an entry that is gone (its
+/// directory's device is not always its own: overlayfs), so an unrelated output on another filesystem that happens to
+/// have a vanished entry's inode number is refused too; running the export again succeeds.
 fn reject_alias(dir: &Path, dev: u64, ino: u64) -> Result<()> {
     let readers = dir.join(tickertape::status::READERS_DIR);
-    let root = fs::metadata(dir).map_err(|e| output::io_error("stat journal directory", e))?;
-    let mut pending = vec![(dir.to_path_buf(), root.dev())];
-    while let Some((dir, dir_dev)) = pending.pop() {
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(dir) = pending.pop() {
         let tolerant = dir.starts_with(&readers);
         let entries = match fs::read_dir(&dir) {
             Ok(entries) => entries,
@@ -402,10 +409,7 @@ fn reject_alias(dir: &Path, dev: u64, ino: u64) -> Result<()> {
             let metadata = match fs::symlink_metadata(entry.path()) {
                 Ok(metadata) => metadata,
                 Err(e) if tolerant && e.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(e)
-                    if e.kind() == std::io::ErrorKind::NotFound
-                        && (dir_dev != dev || entry.ino() != ino) =>
-                {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound && entry.ino() != ino => {
                     continue;
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -417,7 +421,7 @@ fn reject_alias(dir: &Path, dev: u64, ino: u64) -> Result<()> {
                 return Err(Failure::usage("export output aliases a journal file"));
             }
             if metadata.is_dir() {
-                pending.push((entry.path(), metadata.dev()));
+                pending.push(entry.path());
             }
         }
     }
@@ -914,6 +918,50 @@ pub(crate) mod tests {
         }
     }
 
+    /// The newer checkpoint slot becomes invalid after export froze its bound, so the durable-only scan falls back to the
+    /// older slot and counts a shorter prefix before it ends below the bound. The destination is not touched.
+    #[test]
+    fn durable_scan_cut_short_after_counting_records_leaves_the_destination_alone() {
+        for format in [ExportFormat::Jsonl, ExportFormat::Parquet] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut writer =
+                Writer::open(dir.path(), WriterConfig::default().segment_size(65536)).unwrap();
+            for _ in 0..2 {
+                for _ in 0..3 {
+                    append_large(&mut writer);
+                }
+                writer.checkpoint().unwrap();
+            }
+            let out = tempfile::tempdir().unwrap();
+            let output = out.path().join("out");
+            fs::write(&output, b"keep").unwrap();
+            // The second checkpoint (generation 2) is in slot 0.
+            let marker = dir.path().join("checkpoint");
+            at(Point::ReaderCheckpoint, 0, move || {
+                use std::os::unix::fs::FileExt;
+                let file = OpenOptions::new().write(true).open(&marker).unwrap();
+                file.write_all_at(
+                    &[0; tickertape::format::CHECKPOINT_SLOT_LEN],
+                    tickertape::format::CHECKPOINT_SLOT_OFFSETS[0] as u64,
+                )
+                .unwrap();
+            });
+            let result = run(file_args(dir.path(), format, &output), &mut Vec::new());
+            tickertape::fault::clear();
+            let failure = result.unwrap_err();
+            assert_eq!(
+                (failure.code, failure.message.as_str()),
+                (
+                    1,
+                    "journal changed during export: the checkpoint marker no longer covers records it covered when \
+                     export started"
+                ),
+                "{format:?}"
+            );
+            assert_eq!(fs::read(&output).unwrap(), b"keep", "{format:?}");
+        }
+    }
+
     /// Review round 1, item 3 (a): `--to` is below the oldest record. Retention removes the segment while the startup
     /// scan would read it; the selection is still empty, so the export is empty with exit 0, not a failure naming
     /// records outside the range.
@@ -1016,7 +1064,7 @@ pub(crate) mod tests {
     /// output's on the output's device. The same inode number on another device (another filesystem) is not the
     /// output and is skipped.
     #[test]
-    fn alias_walk_compares_the_device_of_a_vanished_entry() {
+    fn alias_walk_refuses_a_vanished_entry_with_the_outputs_inode_number() {
         let (dir, _writer) = retained_journal();
         let out = tempfile::tempdir().unwrap();
         let segment = dir.path().join(tickertape::format::segment_file_name(0));
@@ -1024,7 +1072,7 @@ pub(crate) mod tests {
         fs::hard_link(&segment, &linked).unwrap();
         let meta = fs::metadata(&linked).unwrap();
         let archived = out.path().join("archived.tape");
-        for (dev, refused) in [(meta.dev() ^ 1, false), (meta.dev(), true)] {
+        for (dev, refused) in [(meta.dev() ^ 1, true), (meta.dev(), true)] {
             if !segment.exists() {
                 fs::rename(&archived, &segment).unwrap();
             }
