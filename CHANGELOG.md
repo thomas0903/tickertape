@@ -13,7 +13,10 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   crashing; closing a reader from another thread is safe while a view is being read (views read through the reader's
   shared arena, which close ends first); blocking reads honour `Thread.interrupt()` and a close from another thread
   without losing records; record views are reused and checked, keep their memory alive, and the hot paths allocate
-  nothing. What remains undefined (another thread advancing a reader while its view is read, sharing a batch between
+  nothing (checked with the JIT's escape analysis off too). A close refuses new calls from the moment it starts and
+  takes over from the call in progress without a gap; closing a reader costs a handshake with every JVM thread, so
+  readers are meant to be long-lived. Path names the JVM cannot decode are refused instead of converted to a different
+  name. What remains undefined (another thread advancing a reader while its view is read, sharing a batch between
   threads, the mapped reader's precondition) is listed in the guide. Reports from growable C structs are classes, not
   records, so they can gain fields after 1.0.
   Every C status and corruption reason has its own exception or constant, checked against the header. The library is
