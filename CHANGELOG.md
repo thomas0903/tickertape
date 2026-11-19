@@ -28,6 +28,16 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   - `export --output` no longer fails when an entry in the journal directory disappears during its alias check (a
     reader beacon dropped meanwhile) or a subdirectory can't be listed. v0.4.0 failed transiently in those cases.
   - `rustix` now also enables its `process` feature (for `kill(pid, 0)`); no new crates.
+- Benchmarks: the test of a lagging reader under retention no longer depends on machine speed (it failed on
+  macOS CI runners), and `tt-sustained` readers retry a seek when retention removes the segment they were about to
+  open.
+- Benchmarks: sustained workloads (ADR 0026). `tt-sustained` runs one writer and any mix of safe/mapped,
+  visible/durable-only and lagging reader processes for a fixed duration (default 10 minutes) with steady, bursty or
+  unpaced traffic, periodic checkpoints, segment rolls and writer retention, and reports latency percentiles, late
+  sends, reader lag, CPU time and a per-second wall-clock time series. `compare/run.py --sustained` adds a resumable
+  matrix of long probe, sustained-visibility and periodic-durability runs for every comparison tool, and
+  `benches/session.py` runs a whole recorded session with environment capture, a manifest and a time estimate. No
+  library or format change; the bench crate now depends on `nix`.
 - Docs: define the path to v1.0 around sustained performance, optional eBPF diagnostics, reader/checkpoint
   optimization, ARM measurements, interoperability, replay/recovery at scale and explicit stability/release gates.
 - Docs: v1.0 scope decisions of 2026-11-19. The external integration is an iceoryx2 recorder and replayer
