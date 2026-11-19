@@ -1,6 +1,7 @@
 # Playbook: add a feature
 
-1. **Branch.** Create a branch named `<area>/<slug>` (areas: `core`, `cli`, `test`, `bench`, `examples`, `docs`).
+1. **Branch.** Create a branch named `<area>/<slug>` (areas: `core`, `cli`, `ffi`, `test`, `bench`, `examples`,
+   `docs`).
 2. **Spec.** Write down the behaviour before the code:
    - Public API: the signature with full rustdoc (what it does, errors, panics: none, and an example), with a
      `todo!()` body if needed.
@@ -8,8 +9,11 @@
      (`record-decision.md`). A format change bumps the format version.
 3. **Tests.** Write tests that fail without the feature: unit tests next to the code, `proptest` for encode/decode,
    `tests/` for cross-process or crash behaviour, `assert_cmd` for CLI commands. Check that they fail.
-4. **Code.** Implement until the tests pass. Keep `unsafe` in `crates/tickertape/src/mmap.rs` only, with `// SAFETY:`
-   comments.
+4. **Code.** Implement until the tests pass. Keep `unsafe` in `crates/tickertape/src/mmap.rs` (and `crc.rs` for CPU
+   intrinsics) with `// SAFETY:` comments. The C ABI crate `crates/tickertape-ffi` is the one scoped exception (ADR
+   0028): its `unsafe` blocks stay small, each has a `// SAFETY:` comment, and each `unsafe extern "C" fn` has a
+   `# Safety` section. A feature that should reach C callers also needs the C function, a C test in
+   `crates/tickertape-ffi/tests/c/`, a regenerated header and an entry in `docs/c-api.md`.
 5. **Full check.** Run every command in `CONTRIBUTING.md` → "The checks CI runs", and the test suite on Linux too
    (`test-on-linux.md`).
 6. **Review.** Re-read your own diff. If the change touches `mmap.rs`, recovery, the format or the crash contract, get

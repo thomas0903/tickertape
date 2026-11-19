@@ -5,6 +5,26 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
+- C ABI (ADR 0028, `docs/c-api.md`): a new workspace crate, `crates/tickertape-ffi`, builds `libtickertape` as a
+  shared and a static library with a committed, cbindgen-generated C99/C++11 header (`include/tickertape.h`, checked
+  for drift in CI) and cargo-c metadata for installation with a pkg-config file. It covers the writer (append,
+  zero-copy append through a callback, batch append, checkpoint), the safe and mapped readers (seek, try-next and
+  timed next, copy-out and batch reads, durable-only), options, `verify`, segment listing, the checkpoint marker and
+  retention, with stable error codes, per-thread error details and no panics across the boundary. Not published to
+  crates.io and not stable before 1.0 (`TICKERTAPE_ABI_VERSION` 0, so programs require the exact library version;
+  the header has version macros and `tickertape_version_number()` for the check). Extensible report structs use a
+  `uint64_t struct_size` that the library fills in both directions; struct layouts are asserted at compile time in
+  Rust and C, and CI compares the header with a frozen baseline from 1.0. Examples in `examples/c/`, including a
+  C++11 RAII wrapper.
+- Library: `Writer::abandoned_write_error()` reports a failed clean-up after an abandoned write (a panicking
+  `append_with` fill), which until now only showed as refused appends and checkpoints; those errors now carry the OS
+  error as the inner error of an `io::Error` of kind `Other`, so `Error::is_storage_full()` is false for them even
+  after `ENOSPC` (freeing space does not make the writer accept appends again), and the `Error::DurabilityLost`
+  message no longer blames a failed checkpoint in that case. A failed clean-up is a storage incident like a failed
+  checkpoint: reopening gives a usable writer but no durability guarantee for the records since the last successful
+  checkpoint. The test-only `fault-injection` feature gains `fault::Point::AbandonedWriteSync`.
+- Repository: `unsafe` code is now also allowed in `crates/tickertape-ffi`, as a scoped extension of the rule (ADR
+  0028). The release tooling refuses workspace members that it does not release unless they have `publish = false`.
 - Release operations: install channels, part 1 (ADR 0031). Releases add static Linux CLI archives
   (`x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`) that need no C library, built and tested natively;
   cargo-binstall metadata in `tickertape-cli` (Linux resolves to the static archive; CI checks the templates against

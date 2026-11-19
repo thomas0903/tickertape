@@ -75,6 +75,14 @@ def validate_versions(source, version):
             package = tomllib.load(file)["package"]
         if package["name"] != name or package["version"] != {"workspace": True}:
             raise ValueError(f"{name} must inherit the workspace version")
+    # Members this workflow does not release (tests, benches, examples, the C ABI crate) must not be publishable,
+    # so that adding a crate is a deliberate decision rather than a crate silently left out of releases.
+    for member in workspace.get("members", []):
+        with (source / member / "Cargo.toml").open("rb") as file:
+            package = tomllib.load(file)["package"]
+        if package["name"] not in CRATES and package.get("publish", True) not in (False, []):
+            raise ValueError(f"{package['name']} is not released by this workflow; set publish = false "
+                             "or add it to CRATES")
 
 
 def require_green_ci(runs, sha):
