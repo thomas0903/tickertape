@@ -347,9 +347,10 @@ impl MapRo {
     ///
     /// The bytes must belong to a committed record that has already been validated (length, CRC, sequence) from
     /// `Relaxed` atomic loads ([`MapRo::load_u32`], [`MapRo::words`]) made after observing its non-zero commit word,
-    /// and no process may modify them while the returned slice lives. This is `Reader::open_mapped`'s safety contract; the tickertape writer never
-    /// modifies committed bytes. Validating first means a corrupted length can't make the slice cover bytes the
-    /// writer is still appending to (barring a CRC collision, about 2^-32 per corrupted record).
+    /// and no process may modify them while the returned slice lives. This is `Reader::open_mapped`'s safety
+    /// contract; the tickertape writer never modifies committed bytes. Validating first means a corrupted length
+    /// can't make the slice cover bytes the writer is still appending to (barring a CRC collision, about 2^-32 per
+    /// corrupted record).
     pub(crate) unsafe fn committed_bytes(&self, offset: u64, len: u64) -> Option<&[u8]> {
         let end = checked_range(self.len, offset, len)?;
         let start = offset as usize;

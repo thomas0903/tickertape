@@ -111,13 +111,19 @@ impl Reader {
     /// Like [`Reader::open`], but returned records borrow their payload directly from the memory-mapped segment,
     /// without copying.
     ///
+    /// Each record is validated (length, CRC32C, sequence number, flags) from atomic loads of the mapping before any
+    /// slice into it is created, so a corrupted length can't make a payload cover bytes the writer is still
+    /// appending (barring a CRC collision, about 2^-32 per corrupted record). The checks, their order and the errors
+    /// are those of [`Reader::open`] (ADR 0027).
+    ///
     /// # Safety
     ///
     /// While the returned reader exists, no process other than a tickertape [`Writer`](crate::Writer) may modify
     /// the journal's segment files (writing into them, truncating them, or replacing their contents through other
     /// tools). A tickertape writer never modifies bytes after committing them, including during crash recovery,
-    /// which repairs by replacing files (`docs/format.md` → Recovery). If a mapped file is truncated, the process
-    /// receives `SIGBUS`.
+    /// which repairs by replacing files (`docs/format.md` → Recovery). A returned payload is the bytes that were
+    /// validated only because nothing modifies them afterwards. If a mapped file is truncated, the process receives
+    /// `SIGBUS`.
     ///
     /// # Errors
     ///

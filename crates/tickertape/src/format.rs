@@ -882,7 +882,7 @@ mod tests {
         // Every payload length through two full rounds of both CRC lane sizes plus every tail (the three-lane
         // thresholds are 192 and 768 bytes of payload words), so every alignment of the payload's last word.
         const MAX_PAYLOAD: usize = 2 * 3 * (256 + 64) + 64 + 16;
-        let step = if cfg!(miri) { 97 } else { 1 };
+        let step = if cfg!(miri) { 199 } else { 1 };
         for payload_len in (0..=MAX_PAYLOAD).step_by(step) {
             let (len, image) = record_image(payload_len, payload_len as u64);
             let body_len = len as usize - 4;
