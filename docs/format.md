@@ -155,6 +155,13 @@ journal before it. Readers ignore this file unless `ReaderConfig::durable_only(t
 with `seq < next_seq` are returned, and a missing or invalid marker covers no records (ADR
 [0010](decisions/0010-durable-only-reads.md), crash contract C13).
 
+A slot describes the journal's **current** files: the segments that the segment paths named when it was written,
+and, because recovery never changes a record before the marker, the files those paths name at any later time. It says
+nothing about a file a reader opened earlier and that a repair has since replaced. A reader may therefore apply a
+marker to the segment it has open only if it has confirmed, after reading the marker, that the segment's path still
+names that file (ADR [0034](decisions/0034-durable-only-reads-check-segment-identity.md); see "What readers do about
+repairs").
+
 ## Publication
 
 The writer appends a record at `P` in this order:
@@ -266,9 +273,19 @@ different file or no file, the reader returns `Error::Discarded` and doesn't adv
 offset in the new file, because offsets after the repair point don't line up. The application calls `seek` to
 continue: `seek` scans the current chain from the start of a segment, so it only lands on validated positions.
 
-Until it checks, a reader may return records from a segment that recovery has just preserved and removed. Such
-records are like records lost to a power loss that a reader had already seen (`crash-contract.md` → C8). A reader
-never moves from a removed history into the repaired one without returning `Error::Discarded`.
+A durable-only reader also checks when a checkpoint marker it has just read moves past its cursor, after reading the
+marker and before it reads any record the marker newly covers. The order matters: recovery replaces files before the
+new writer's first checkpoint, so a successful check after the read shows that the open file was current after the
+marker was written, and so holds exactly the records the marker covers. A check before the read could pass just
+before a repair and a new checkpoint, and the reader would then apply the new marker to the old file (ADR
+[0034](decisions/0034-durable-only-reads-check-segment-identity.md) has the full argument). If the check fails, the
+reader returns `Error::Discarded` without applying the marker. This also applies when retention removed the segment:
+a durable-only reader may learn of it there rather than at the segment's end.
+
+Until it checks, a visible reader may return records from a segment that recovery has just preserved and removed.
+Such records are like records lost to a power loss that a reader had already seen (`crash-contract.md` → C8). A
+durable-only reader never does (C13). A reader never moves from a removed history into the repaired one without
+returning `Error::Discarded`.
 
 ## Versioning
 

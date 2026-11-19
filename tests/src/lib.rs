@@ -201,3 +201,36 @@ pub fn reopen_writer(dir: &Path, config: WriterConfig) -> Writer {
         }
     }
 }
+
+/// Makes record `seq` corrupt in the file that a later writer's recovery reads, without touching the file that open
+/// readers hold: writes a copy of the segment holding `seq` with one byte of the record's fields flipped (a checksum
+/// mismatch), and renames the copy over the segment. Readers that have the segment open keep valid bytes where
+/// recovery will find corruption, as when a reader's copy of a page outlives a storage failure (C11).
+pub fn corrupt_by_replacement(dir: &Path, seq: u64) {
+    let (base, path) = segments(dir)
+        .into_iter()
+        .rev()
+        .find(|(base, _)| *base <= seq)
+        .expect("a segment at or below seq");
+    let mut image = std::fs::read(&path).unwrap();
+    let (mut offset, mut at) = (format::SEGMENT_HEADER_LEN as u64, base);
+    while at < seq {
+        match format::read_slot(&image[..], offset, at) {
+            Ok(format::Slot::Record { next_offset, .. }) => offset = next_offset,
+            other => panic!("record {at} in {}: {other:?}", path.display()),
+        }
+        at += 1;
+    }
+    assert!(
+        matches!(
+            format::read_slot(&image[..], offset, seq),
+            Ok(format::Slot::Record { .. })
+        ),
+        "record {seq} in {}",
+        path.display()
+    );
+    image[offset as usize + 20] ^= 0xff;
+    let tmp = dir.join("corrupt-replacement");
+    std::fs::write(&tmp, &image).unwrap();
+    std::fs::rename(&tmp, &path).unwrap();
+}

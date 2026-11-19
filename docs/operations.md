@@ -123,7 +123,8 @@ copy sealed segments without changing the journal.
 
 Readers that are still inside a segment you delete keep reading it (they hold the file open), but when they reach
 its end they return `Error::Discarded`, because the file is gone; seek to their position to continue
-(`tickertape tail` does this automatically). Readers positioned before the oldest remaining segment get
+(`tickertape tail` does this automatically). Durable-only readers may return it earlier, when the checkpoint moves
+past their position (ADR 0034). Readers positioned before the oldest remaining segment get
 `Error::SeqUnavailable` from `seek`, also when the removal happens while `seek` runs. `Reader::open` starts at the
 oldest segment that exists. A removal never shows up as a corruption error or an I/O "not found" error in readers,
 `tickertape inspect` or `tickertape verify` (crash contract C14).
@@ -144,7 +145,8 @@ Never truncate or edit a segment in place while anything uses the journal: proce
   most a zeroed uncommitted tail, a completed seal or roll, and removed temporary files.
 - **Power loss or storage errors:** the writer validates the journal from the last checkpoint. Corrupt or
   disconnected data is moved to `quarantine/` (never deleted), or, with `RecoveryPolicy::Fail`, the writer refuses to
-  open so that a human can look first. Readers that had seen discarded records get `Error::Discarded`.
+  open so that a human can look first. Readers that had seen discarded records get `Error::Discarded`. Durable-only
+readers never return records that recovery discarded (C13).
 - **Refused to open** (missing checkpoint segment or a gap in the chain): restore the missing segments from a copy,
   or move the affected segments aside knowingly. tickertape won't discard history on its own.
 

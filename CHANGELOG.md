@@ -16,6 +16,15 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   inspection also list again when a directory listing of a live journal comes back empty (on btrfs a listing omits
   segments created after it started, so concurrent retention could make it miss all of them). New
   fault-injection hook points (`fault::run_at`) and a stress test with `max_segments(2)` retention cover this.
+- Fix: a durable-only reader (`ReaderConfig::durable_only`) could return records that were never checkpointed and
+  that recovery had moved to `quarantine/` (crash contract C13). When recovery replaced the segment the reader held
+  and the new writer checkpointed, the reader applied the new checkpoint marker to the old file it still had open.
+  A durable-only reader now confirms, after reading a marker that moves past its position, that its segment's path
+  still names the file it has open (one `stat`, never per record), and returns `Error::Discarded` otherwise
+  (ADR 0034). As a consequence, a durable-only reader overtaken by retention may get `Error::Discarded` when the
+  checkpoint moves past its position instead of at the end of the removed segment. New hook points
+  `ReaderCheckpoint` and `ReaderCheckpointIdentity`, deterministic tests and a stress test with corruption injected
+  between writer restarts cover this.
 - Benchmarks: the test of a lagging reader under retention no longer depends on machine speed (it failed on
   macOS CI runners), and `tt-sustained` readers retry a seek when retention removes the segment they were about to
   open.

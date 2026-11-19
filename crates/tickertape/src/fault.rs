@@ -38,6 +38,11 @@ pub enum Point {
     /// After a reader at a seal has checked that its segment is still in place and before it opens the successor.
     /// Arm with [`run_at`].
     ReaderSeal,
+    /// Before a durable-only reader reads the checkpoint marker. Arm with [`run_at`].
+    ReaderCheckpoint,
+    /// After a durable-only reader has read a checkpoint marker that moved past its cursor, before it checks that its
+    /// segment is still in place. Arm with [`run_at`].
+    ReaderCheckpointIdentity,
     /// After inspection (`inspect::list_segments`, `inspect::verify`) lists the segments, before it opens each one.
     /// Arm with [`run_at`].
     InspectOpen,

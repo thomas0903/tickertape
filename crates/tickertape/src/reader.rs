@@ -205,7 +205,10 @@ impl Reader {
     ///
     /// `Ok(None)` means there is no new record yet. Follows seals into the next segment transparently.
     /// With [`ReaderConfig::durable_only`] enabled, records wait at the cursor until covered by a checkpoint;
-    /// a missing or invalid checkpoint marker covers no records.
+    /// a missing or invalid checkpoint marker covers no records. A marker describes the journal's current files, so a
+    /// durable-only reader applies a marker that moves past its cursor only after confirming that its segment is still
+    /// in place; if recovery replaced it or retention removed it, the reader returns [`Error::Discarded`] then, instead
+    /// of reading on in the file it has open (ADR 0034).
     ///
     /// # Errors
     ///
@@ -379,9 +382,23 @@ impl Reader {
     }
 
     /// Read the marker through ordinary file I/O (never a mapping); invalid or missing means no coverage.
+    ///
+    /// A marker speaks about the journal's current files, not about the file this reader has open, which recovery
+    /// may have replaced (or retention removed) since. So a marker that moves past the cursor is applied only after
+    /// confirming, *after* reading it, that the segment's path still names the open file; otherwise this returns
+    /// `Error::Discarded` without applying it. Read first, then check: the check then proves the open file was current
+    /// at a moment after the marker was written, and recovery keeps every record a marker covers, byte for byte, in
+    /// the current files from then on. Checking first would let a repair and the new writer's checkpoint land between
+    /// the check and the read, applying the new marker to the old file. The open file's descriptor keeps its inode
+    /// allocated, so no later file can have its identity. ADR 0034 has the full argument.
     fn refresh_checkpoint(&mut self) -> Result<()> {
-        self.durable_next_seq =
-            crate::inspect::read_checkpoint(&self.dir)?.map_or(0, |c| c.next_seq);
+        crate::fault::hook(crate::fault::Point::ReaderCheckpoint);
+        let durable = crate::inspect::read_checkpoint(&self.dir)?.map_or(0, |c| c.next_seq);
+        if durable > self.next_seq {
+            crate::fault::hook(crate::fault::Point::ReaderCheckpointIdentity);
+            self.check_identity()?;
+        }
+        self.durable_next_seq = durable;
         Ok(())
     }
 
