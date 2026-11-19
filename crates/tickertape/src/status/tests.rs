@@ -1527,6 +1527,42 @@ fn only_what_a_beacon_writer_could_write_is_a_beacon() {
     drop(writer);
 }
 
+/// Round 3, item 6: a durable-only reader that replaces a visible one at the same slot of the same file is published
+/// (the mode is part of the cursor `update` compares), so its lag is measured against the checkpoint; and the reverse.
+#[test]
+fn a_change_of_reader_mode_is_published() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut writer = Writer::open(dir.path(), config()).unwrap();
+    append(&mut writer, 2, 10, 0);
+    writer.checkpoint().unwrap();
+    append(&mut writer, 3, 10, 0);
+    let mut visible = Reader::open(dir.path(), ReaderConfig::default()).unwrap();
+    visible.try_next().unwrap().unwrap();
+    let mut durable = Reader::open(dir.path(), ReaderConfig::default().durable_only(true)).unwrap();
+    durable.try_next().unwrap().unwrap();
+    assert_eq!(visible.position(), durable.position());
+    let mut beacon = ReaderBeacon::create(dir.path(), "r", &visible).unwrap();
+    beacon.set_interval(Duration::ZERO);
+    let reported = |dir: &Path| {
+        let s = status(dir).unwrap();
+        let r = &s.readers[0];
+        (r.report.unwrap().durable_only, r.lag.unwrap().records)
+    };
+    assert_eq!(reported(dir.path()), (false, 4));
+    assert!(
+        beacon.update(&durable).unwrap(),
+        "the durable-only reader was not published"
+    );
+    assert_eq!(reported(dir.path()), (true, 1));
+    assert!(
+        beacon.update(&visible).unwrap(),
+        "the visible reader was not published"
+    );
+    assert_eq!(reported(dir.path()), (false, 4));
+    assert!(!beacon.update(&visible).unwrap());
+    drop(writer);
+}
+
 /// Finding 7: unreadable beacons and unusable beacon directories never fail the sample.
 #[test]
 fn unreadable_beacons_and_directories() {

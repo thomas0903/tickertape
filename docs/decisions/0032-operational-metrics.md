@@ -125,8 +125,9 @@ inode numbers that ext4 reuses at once. A durable-only reader's lag is measured 
 it can never pass it; with no marker it can read nothing and its lag is zero.
 
 **Cost.** Readers without a beacon do no work: nothing changes in `Reader`'s read path. `update` compares the
-reader's whole cursor (slot, pending seek target, segment file) with the last one written, so a seek that resolves
-at the same sequence number is published too; if it moved, it reads the monotonic clock and writes only if at least
+reader's whole cursor (slot, pending seek target, segment file, and whether the reader is durable-only) with the last
+one written, so a seek that resolves at the same sequence number, or a reader of the other mode replacing one at the
+same place (round 3: its lag is measured against another position), is published too; if it moved, it reads the monotonic clock and writes only if at least
 the beacon's interval (default 1 s) has passed: one 128-byte `pwrite`, never synced (a beacon only has to survive
 the reader process, not a power loss), plus an `fstat` and a 64-byte header `pread` when the reader moved to another
 segment file. `flush` writes unconditionally.
@@ -200,8 +201,14 @@ name pattern justify deleting files in a directory the caller chose.
 names this beacon's file, unlink it; then close the file, which releases the lock.
 
 **Forked children.** A child created with `fork` gets a copy of the `ReaderBeacon` and of its descriptor. The beacon
-records its creator's process id: in any other process `update` and `flush` fail and dropping the copy does nothing,
-so a child that exits never unlinks its parent's live beacon (`a_forked_child_never_writes_or_removes_the_beacon`).
+records its creator's process id: in any other process the copy never writes the file, and dropping it does nothing,
+so a child that exits never unlinks its parent's live beacon. **Decision (round 3):** the process is checked where
+`update` would write, not on every call. A following reader may call `update` per record, and `getpid` is a system
+call on Linux (about 75 ns in an aarch64 VM, measured; 1 ns on macOS, which caches it), several times the rest of an
+`update` that writes nothing (a comparison, or a comparison and a 17 ns clock read). So in a child, `update` with an
+unchanged cursor or within the interval returns `Ok(false)` without writing, exactly as in the creator; it fails
+only when it would write, and `flush` always fails (`a_forked_child_never_writes_or_removes_the_beacon` asserts each
+case).
 The directory lock is released explicitly at step 8, so a child forked while its creator held it doesn't keep it
 once the creator is done (`a_forked_child_does_not_keep_the_directory_lock`). If the creator dies while holding the
 directory lock, a child forked meanwhile keeps it until the child exits or execs, and creators in that directory wait
@@ -308,7 +315,8 @@ call. `status()` keeps no file open after the call; a `Sampler` keeps one (below
 |---|---|---|
 | `Writer::metrics`, `Reader::cursor`, `Status::lag` | None (one monotonic clock read for `Writer::metrics`) | No |
 | `ReaderBeacon::update` | A comparison if the cursor has not moved; else one monotonic clock read, and at most once per interval a `getpid`, a wall-clock read and one 128-byte `pwrite`, plus `fstat` and a 64-byte `pread` of the segment header after the reader moved to another segment file | No |
-| `ReaderBeacon::create`/`create_in` | `mkdir` (`create` only); reading the reader's segment header (`fstat`, `pread`); `open` and `flock` of the directory (a second, blocking `flock` while another creator holds it); a `readdir` pass, plus per leftover temporary name `open`, `fstat`, two `flock`s, two `pread`s, `lstat` and `unlink`; `open` (exclusive create), `fstat`, `flock`, `pwrite`, `link`, `lstat`, `unlink` of the temporary file; `flock` (unlock) and `close` of the directory; two `getpid`s. A takeover adds `open`, `fstat`, two `flock`s, two `pread`s, `lstat`, `rename`, `lstat` | No |
+| `ReaderBeacon::create`/`create_in` | `mkdir` (`create` only); reading the reader's segment header (`fstat`, `pread`); `open` and `flock` of the directory (a second, blocking `flock` while another creator holds it); a `readdir` pass, plus per leftover temporary name `open`, `fstat`, two `flock`s, two `pread`s, `lstat` and `unlink`; `open` (exclusive create), `fstat`, `flock`, `pwrite`, `link`, `lstat`, `unlink` of the temporary file; `flock` (unlock) and `close` of the directory; one `getpid` (round 3: the source made three, the table said two; the
+redundant lookups are gone). A takeover adds `open`, `fstat`, two `flock`s, two `pread`s, `lstat`, `rename`, `lstat` | No |
 | `status()` / `Sampler::sample()`, normal path | Journal directory: a `readdir` pass and one `stat` per segment. Marker: `open`, three `fstat`s, two 64-byte `pread`s. Newest segment: `open`, three `fstat`s, a 64-byte header `pread`, and the scan: one `pread` per 1 MiB window. The checkpoint's segment and the oldest segment, if not the newest: `open`, three `fstat`s, a header `pread` each. With uncovered records the scan didn't pass: one record lookup (below). `statvfs`; `lstat` of the spare; `open`, `fstat` and two `read`s of `writer.lock`; `kill(pid, 0)`. Beacon directory: a `readdir` pass; per beacon `open`, `fstat`, two `pread`s (129 bytes, then the end of file), one `flock` (held: live) or two (free: stale, probe and release), `lstat`; per beacon whose segment isn't open yet, `open`, three `fstat`s, a header `pread`; per lagging beacon, one record lookup. A `Sampler` resuming in the same segment adds one 4 KiB `pread` (the last record it passed), and one more if the marker moved behind its head; one whose head moved to another segment opens the previous head's segment (`open`, three `fstat`s, `pread`) unless already open. It keeps the newest segment open until the next sample | The newest segment from the checkpoint (or its start); a `Sampler` only from its previous head. Bounded by one segment |
 | `status()` / `Sampler::sample()`, retries | Marker metadata changing under the read: `fstat`, two `pread`s, `fstat` again, at most twice more. The marker naming a segment the listing lacks: the listing and the marker again, at most 3 times. The newest segment sealed: an `lstat` of its successor; if it exists (the writer rolled), the listing and the marker again and the new newest segment opened and scanned, at most 16 times. A slot that fails validation: re-read with one `pread`, at most 3 times. A file that vanished during the sample (retention, recovery): the whole sample again, at most 3 attempts. A beacon with a bad checksum: two more `pread`s, and while its owner holds it, up to 6 more reads with a `flock` probe each; a beacon whose name is replaced meanwhile: observed again, at most 3 attempts | — |
 | Record lookup | One `pread` of 4 KiB, or of the whole record if it is larger (it is validated before its timestamp is used); following a seal adds an `open`, three `fstat`s, a header `pread` and another lookup | One record |

@@ -350,7 +350,9 @@ fn wait_child(pid: libc::pid_t) -> i32 {
 }
 
 /// Round 2, A5: a child created with `fork` gets a copy of its parent's beacon. Dropping the copy never removes the
-/// parent's live beacon, and updating it fails (the file belongs to the creator).
+/// parent's live beacon, and the copy never writes it (the file belongs to the creator). Round 3, item 5: the process
+/// is checked only where `update` would write, so in the child an unchanged cursor and a write held back by the
+/// interval return `Ok(false)` without writing, and `update` fails exactly when it would write; `flush` always fails.
 #[test]
 fn a_forked_child_never_writes_or_removes_the_beacon() {
     let _spawning = spawning();
@@ -365,11 +367,29 @@ fn a_forked_child_never_writes_or_removes_the_beacon() {
         // original (it leaves with `_exit`): reading it bitwise gives the child one owned value, which it drops as a
         // child whose code owned the beacon would.
         let mut copy = unsafe { std::ptr::read(&beacon) };
-        let refused = copy.update(&moved).is_err() && copy.flush(&moved).is_err();
+        // The cursor written last: nothing to write.
+        let unchanged = matches!(copy.update(&reader), Ok(false));
+        // A moved cursor within the interval: held back, nothing written.
+        copy.set_interval(Duration::from_secs(3600));
+        let held_back = matches!(copy.update(&moved), Ok(false));
+        // A write is due: refused.
+        copy.set_interval(Duration::ZERO);
+        let refused = copy.update(&moved).is_err()
+            && copy.flush(&moved).is_err()
+            && copy.flush(&reader).is_err();
         drop(copy);
-        if refused { 0 } else { 1 }
+        match (unchanged, held_back, refused) {
+            (true, true, true) => 0,
+            (false, _, _) => 1,
+            (_, false, _) => 2,
+            (_, _, false) => 3,
+        }
     });
-    assert_eq!(wait_child(pid), 0, "the child wrote the parent's beacon");
+    assert_eq!(
+        wait_child(pid),
+        0,
+        "1: unchanged cursor, 2: held back, 3: a due write was not refused"
+    );
     assert!(
         beacon.is_published(),
         "the child's drop removed the parent's beacon"

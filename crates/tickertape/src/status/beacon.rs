@@ -68,8 +68,9 @@ const OBSERVE_ATTEMPTS: u32 = 3;
 /// descriptor keeps the beacon live after its creator dies, until the child exits. The descriptor is close-on-exec,
 /// so `exec` drops it, but from `fork` to `exec` every child holds it: while another thread is spawning a process,
 /// a beacon that was just dropped can still look live for that moment. A forked child's copy of a `ReaderBeacon`
-/// never writes or removes the file (its creator's process id is recorded): [`ReaderBeacon::update`] fails there,
-/// and dropping it does nothing. On network filesystems `flock` may be emulated or unsupported (Linux NFS emulates it with
+/// never writes or removes the file (its creator's process id is recorded): [`ReaderBeacon::update`] fails there when
+/// it would write (it returns `Ok(false)` for an unchanged cursor or within the interval, without writing),
+/// [`ReaderBeacon::flush`] fails, and dropping it does nothing. On network filesystems `flock` may be emulated or unsupported (Linux NFS emulates it with
 /// byte-range locks, so a probe from the same process as the owner can release the owner's lock); beacons are
 /// supported on local filesystems only, like the journal. Where the lock can't be probed, observers report
 /// [`BeaconState::Uncertain`].
@@ -97,8 +98,8 @@ pub struct ReaderBeacon {
     identity: Identity,
     interval: Duration,
     last_write: Option<Instant>,
-    /// The cursor last written: slot sequence number, skip target, offset and segment file.
-    last_cursor: Option<(u64, u64, u64, Identity)>,
+    /// The cursor last written ([`cursor_key`]).
+    last_cursor: Option<CursorKey>,
     /// The reader's current segment file and its header's creation time and size, read once per segment.
     segment: Option<(Identity, u64, u64)>,
     /// The process that created the beacon. A child created with `fork` gets a copy of the beacon, but the file is
@@ -164,12 +165,14 @@ impl ReaderBeacon {
         check_name(name)?;
         let dir = beacons_dir.as_ref();
         let path = dir.join(name);
+        // One process-id lookup for the payload, the temporary name and the creator check.
+        let pid = std::process::id();
         let mut segment = None;
-        let bytes = encode(&payload_of(reader, &mut segment)?);
+        let bytes = encode(&payload_of(reader, &mut segment, pid)?);
 
         let dir_lock = DirLock::acquire(dir)?;
         remove_leftovers(dir);
-        let (mut tmp, file) = Temporary::create(dir, name)?;
+        let (mut tmp, file) = Temporary::create(dir, name, pid)?;
         file.write_all_at(&bytes, 0)
             .map_err(|e| Error::io("write reader beacon", &tmp.path, e))?;
         pause(Pause::CreatorWroteTemporary);
@@ -185,7 +188,7 @@ impl ReaderBeacon {
             last_write: Some(Instant::now()),
             last_cursor: Some(cursor_key(reader)),
             segment,
-            creator: std::process::id(),
+            creator: pid,
         })
     }
 
@@ -196,9 +199,9 @@ impl ReaderBeacon {
     }
 
     /// Publishes `reader`'s cursor if it moved since the last write and the interval has passed. Returns whether it
-    /// wrote. The whole cursor is compared (the slot, a pending seek's target and the segment file), not only
-    /// [`Reader::position`], so a seek that resolves, or a cursor that moves to another file at the same sequence
-    /// number, is published too.
+    /// wrote. The whole cursor is compared (the slot, a pending seek's target, the segment file and whether the reader
+    /// is durable-only), not only [`Reader::position`], so a seek that resolves, a cursor that moves to another file at
+    /// the same sequence number, or a reader of the other mode at the same place, is published too.
     ///
     /// Cost: a comparison if the cursor hasn't moved; otherwise one monotonic clock read, and at most once per
     /// interval a `getpid`, one 128-byte `pwrite` (no sync) and a wall-clock read, plus one `fstat` and a 64-byte
@@ -207,9 +210,15 @@ impl ReaderBeacon {
     ///
     /// # Errors
     ///
-    /// [`Error::Io`] if the write fails, or if this process is not the one that created the beacon (a child created
-    /// with `fork` holds a copy of the beacon but must not write it); [`Error::Corrupt`] if the reader's segment
-    /// header can't be read.
+    /// [`Error::Io`] if the write fails, or if it would write and this process is not the one that created the
+    /// beacon (a child created with `fork` holds a copy of the beacon but must not write it); [`Error::Corrupt`] if
+    /// the reader's segment header can't be read.
+    ///
+    /// **In a forked child**, the process is checked only when `update` would write, so that the common calls (an
+    /// unchanged cursor, or a write held back by the interval) cost no system call (`getpid` is one on Linux, about
+    /// 75 ns in an aarch64 VM, more than the rest of such a call). There `update` returns `Ok(false)`, as in the
+    /// creator, and writes nothing: a child's copy never writes the file, but its `update` is refused with an error
+    /// only when it would write. [`ReaderBeacon::flush`] always writes, so it always fails in a child.
     pub fn update(&mut self, reader: &Reader) -> Result<bool> {
         if self.last_cursor == Some(cursor_key(reader))
             || self
@@ -247,6 +256,7 @@ impl ReaderBeacon {
     }
 
     fn write(&mut self, reader: &Reader) -> Result<()> {
+        // One process-id lookup per write: the creator check (the pid written is the creator's).
         if std::process::id() != self.creator {
             return Err(Error::io(
                 "write reader beacon",
@@ -257,7 +267,7 @@ impl ReaderBeacon {
             ));
         }
         let key = cursor_key(reader);
-        let payload = payload_of(reader, &mut self.segment)?;
+        let payload = payload_of(reader, &mut self.segment, self.creator)?;
         self.file
             .write_all_at(&encode(&payload), 0)
             .map_err(|e| Error::io("write reader beacon", &self.path, e))?;
@@ -267,14 +277,21 @@ impl ReaderBeacon {
     }
 }
 
-/// What [`ReaderBeacon::update`] compares: the reader's slot sequence number, skip target, offset and segment file.
-fn cursor_key(reader: &Reader) -> (u64, u64, u64, Identity) {
+/// What [`ReaderBeacon::update`] compares: the reader's slot sequence number, skip target, offset, segment file and
+/// whether it is durable-only.
+type CursorKey = (u64, u64, u64, Identity, bool);
+
+/// The [`CursorKey`] of `reader`'s cursor. The mode is part of it (round 3): a durable-only reader that replaces a
+/// visible one at the same slot of the same file (or the reverse) is published, so observers measure its lag against
+/// the checkpoint, not the head.
+fn cursor_key(reader: &Reader) -> CursorKey {
     let parts = reader.cursor_parts();
     (
         parts.slot_seq,
         parts.skip_until,
         parts.offset,
         parts.identity,
+        parts.durable_only,
     )
 }
 
@@ -349,8 +366,12 @@ fn lstat_identity(path: &Path) -> Option<Identity> {
 }
 
 /// The reader's cursor and its segment's identity, reading the segment header when the reader moved to another
-/// file since `segment` was filled.
-fn payload_of(reader: &Reader, segment: &mut Option<(Identity, u64, u64)>) -> Result<Payload> {
+/// file since `segment` was filled; `pid` is the beacon's creator.
+fn payload_of(
+    reader: &Reader,
+    segment: &mut Option<(Identity, u64, u64)>,
+    pid: u32,
+) -> Result<Payload> {
     let parts = reader.cursor_parts();
     let cursor = parts.cursor();
     let (created, size) = match *segment {
@@ -364,7 +385,7 @@ fn payload_of(reader: &Reader, segment: &mut Option<(Identity, u64, u64)>) -> Re
     };
     Ok(Payload {
         report: BeaconReport {
-            pid: std::process::id(),
+            pid,
             next_seq: cursor.next_seq,
             position: cursor.position,
             seek_pending: cursor.seek_pending,
@@ -602,9 +623,8 @@ struct Temporary {
 }
 
 impl Temporary {
-    /// Creates a temporary beacon file exclusively and locks it.
-    fn create(dir: &Path, name: &str) -> Result<(Temporary, File)> {
-        let pid = std::process::id();
+    /// Creates a temporary beacon file exclusively and locks it; `pid` is the creating process.
+    fn create(dir: &Path, name: &str, pid: u32) -> Result<(Temporary, File)> {
         for n in 0u32.. {
             let path = dir.join(format!(".{name}.{pid}.{n}{TMP_SUFFIX}"));
             // `create_new` is O_CREAT | O_EXCL: it never follows a symlink and never opens an existing file.
