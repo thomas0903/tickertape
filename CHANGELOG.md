@@ -11,8 +11,11 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   bytes after an empty commit word for committed history (a later record that validates with a sequence number its
   position allows, a final seal, or a later segment) and treats it as corruption: `Quarantine` preserves the tail in
   `quarantine/` and replaces the segment, `Fail` refuses without changing a byte. Torn appends are still zeroed in
-  place. New `CorruptReason::EmptyCommitWord`, which `verify` also reports (ADR 0035). The newest record's commit
-  word zeroed with nothing after it remains indistinguishable from a torn append.
+  place. New `CorruptReason::EmptyCommitWord`, which `verify` also reports (ADR 0035); `verify` and `inspect` now
+  read the unwritten rest of the newest segment. Damage after which no record validates and no final seal or later
+  segment remains (such as the newest records' commit words zeroed) remains indistinguishable from a torn append. A
+  torn payload holding valid frames from another journal, with sequence numbers in the window, is preserved (or
+  refused under `Fail`) even after a plain process crash.
 - Benchmarks: the test of a lagging reader under retention no longer depends on machine speed (it failed on
   macOS CI runners), and `tt-sustained` readers retry a seek when retention removes the segment they were about to
   open.

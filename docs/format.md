@@ -220,10 +220,20 @@ Readers never modify a journal. Only the writer repairs it, on open, after takin
    `S` is the expected sequence number: (a) an 8-byte-aligned `Q > P` holding a record that is valid for some
    sequence number `T` with `S < T <= S + floor((Q - P) / 40)` (records `S` to `T - 1` must fit between, at least 40
    bytes each); (b) a valid seal for such a `T` that is the last non-zero item in `X`; or (c) a segment with a
-   `base_seq` greater than `S`, when `[P+4, Z)` holds any non-zero byte. A writer process crash never leaves any of
-   these: the bytes of a torn append lie inside the one frame being written, and a segment with base `B` exists only
-   once record `B - 1` was committed. The search reads only; its work is bounded (ADR 0035), and if candidate
-   records would need CRC32C over more than twice `Z - P` bytes it stops and counts the tail as committed history.
+   `base_seq` greater than `S`, when `[P+4, Z)` holds any non-zero byte, except when the segment named
+   `{S:020}.tape` exists and has not been scanned yet and every non-zero byte lies in `[P+4, P+8)` (a seal's CRC word:
+   what a crash between publishing that segment and sealing `X` leaves, and what a zeroed seal marker leaves; the
+   second row below rewrites the seal). Candidates (a) and (b) do not count when they lie inside a **completely
+   written torn frame** at `P`: its sequence number field is `S`, its flags are zero, and its stored CRC matches for a
+   frame length `L` that fits with `end <= P + L <= end + 63`, where `end` is the end of the last non-zero byte after
+   `P`, and does not also match for a length `L'` with `P + align8(L')` at the first candidate. A writer process crash
+   never leaves committed history, with one exception: a payload that holds an 8-byte-aligned, CRC-valid frame whose
+   sequence number falls in the window of (a), when the crash interrupted it before the body was complete (or the
+   payload ends in more than 63 zero bytes). No rule can tell those bytes from damage; they are preserved (or `Fail`
+   refuses) and nothing is lost. Otherwise the bytes of a torn append lie inside the one frame being written, and a
+   segment with base `B` exists only once record `B - 1` was committed. The search reads only; its work is bounded
+   (ADR 0035), and if candidate records would need CRC32C over more than twice `Z - P` bytes it stops and counts the
+   tail as committed history.
 
    | At `P` | Meaning | Action |
    |---|---|---|
@@ -234,9 +244,14 @@ Readers never modify a journal. Only the writer repairs it, on open, after takin
    | Valid seal, successor missing, a segment with a larger `base_seq` exists | A segment in the middle of the chain is missing (deleted by someone, or lost) | **Refuse** under every policy: tickertape doesn't discard a large part of a journal on its own |
    | Commit word non-zero, invalid record or seal | Not possible after a writer *process* crash. Power loss, storage corruption or outside modification | `Quarantine` (default): preserve `[P, Z)` in `quarantine/`, then **repair by replacement**: write a copy of `X` with `[P, Z)` zeroed to `X.tmp`, sync it, and `rename` it over `X`. `Fail`: refuse (see below) |
 
-   Bytes are zeroed in place only where no record was ever committed, so no reader can have seen them. The newest
-   record's commit word zeroed with nothing after it can't be told from an append killed just before its commit
-   store, and is zeroed like one.
+   Bytes are zeroed in place only after an empty commit word with no committed history after it. After a crash no
+   record was ever committed there, so no reader can have seen them. Damage can't always be recognised: **any damage
+   after which no record validates and no final seal or later segment remains** is byte for byte a torn append and is
+   zeroed like one, destroying the records it covers without preserving them. Examples, with 120 records and a
+   checkpoint at 100: the newest record's commit word zeroed (next sequence 119); the commit words of the two newest
+   records zeroed (next sequence 118); a zeroed block from the start of the third-newest record into the newest
+   record's header (next sequence 117). `verify` reports none of these, `Fail` does not refuse, and a zero-copy
+   reader holding one of those records sees its bytes change.
 
 5. **Disconnected segments.** Every segment in the recovery domain that the scan did not visit (whatever its
    `base_seq`, including one between visited segments) and every segment in the domain with an invalid header is

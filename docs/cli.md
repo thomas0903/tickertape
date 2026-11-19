@@ -31,7 +31,11 @@ Errors and recovery warnings go to stderr. JSON results go to stdout (or the sel
   Missing/invalid checkpoint slots yield `none` in text or `null` in JSON; a checkpoint I/O error fails the command.
 - `verify <DIR> [--json]`: checksum scan and chain validation, totals and every problem. Both inspect and verify
   return 2 when the scan reports problems. On a live journal the scan describes observations during the scan,
-  not an atomic snapshot.
+  not an atomic snapshot. Where a segment's records end at an empty commit word (always the newest segment), it
+  reads the rest of the segment up to its end, to find committed records hidden behind that word
+  (`EmptyCommitWord`, ADR 0035); it used to stop at the end of the records. On an empty 128 MiB segment this took
+  21 ms instead of 9 ms (warm page cache, Apple M4 Pro); with a cold cache or slow storage it costs reading the
+  unwritten rest of the newest segment. `inspect` runs the same scan.
 - `export <DIR> --format jsonl|parquet [--output <FILE>|-] [--from <SEQ>] [--to <SEQ>]
   [--decode market-demo] [--durable-only]`: writes records from the
   inclusive range; JSONL defaults to stdout and `--output -` also selects stdout for JSONL. The output file is created or

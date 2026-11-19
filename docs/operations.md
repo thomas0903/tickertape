@@ -132,18 +132,32 @@ Never truncate or edit a segment in place while anything uses the journal: proce
 ## Checking a journal
 
 - `tickertape verify <dir>` checks every header, record and seal and exits with code 2 if anything is wrong; it is
-  read-only and safe to run while the writer is active.
+  read-only and safe to run while the writer is active (records the writer commits while `verify` looks at the end
+  of the newest segment are followed, not reported; ADR 0035). It reads the whole newest segment, including the
+  unwritten part after the last record.
 - `tickertape inspect <dir>` lists segments, their sequence ranges and fill level, and the checkpoint marker.
 
 ## After a crash
 
 - **Writer process crash:** just start the writer again. It cleans up a partly written record and continues with the
   next sequence number (C1–C4). Its `recovery_report()` lists what it did; after a plain process crash it contains at
-  most a zeroed uncommitted tail, a completed seal or roll, and removed temporary files.
+  most a zeroed uncommitted tail, a completed seal or roll, and removed temporary files, with one exception: if the
+  record being written had a payload holding a valid record frame whose sequence number falls in recovery's window
+  (for example raw frames copied from another journal) and the crash interrupted it before the body was complete,
+  recovery cannot tell those bytes from damage (`EmptyCommitWord`, ADR 0035). With the default `Quarantine` it then
+  reports a `RepairedTail`, the torn record's bytes are in `quarantine/`, and nothing committed is lost. With
+  `RecoveryPolicy::Fail` the writer refuses to open: look at the frame at the reported file and offset (it should
+  carry the expected sequence number in its header, with the frames that count as evidence inside its payload); if
+  so, it was the record being written, so open the writer once with `RecoveryPolicy::Quarantine`, which preserves it
+  and continues. If not, treat it as the storage damage below.
 - **Power loss or storage errors:** the writer validates the journal from the last checkpoint. Corrupt or
   disconnected data is moved to `quarantine/` (never deleted), or, with `RecoveryPolicy::Fail`, the writer refuses to
   open so that a human can look first. That includes committed records hidden behind a zeroed commit word
-  (`EmptyCommitWord`): the quarantine file starts at the empty word and holds them byte for byte (ADR 0035).
+  (`EmptyCommitWord`): the quarantine file starts at the empty word and holds them byte for byte (ADR 0035). Damage
+  after which no record validates and no final seal or later segment remains (for example the commit words of the
+  newest records zeroed) can't be told from a crash and is zeroed like a torn append, under either policy. If
+  `quarantine/` holds two files with identical bytes for the same position, a repair was interrupted and repeated;
+  either copy can be deleted.
   Readers that had seen discarded records get `Error::Discarded`.
 - **Refused to open** (missing checkpoint segment or a gap in the chain): restore the missing segments from a copy,
   or move the affected segments aside knowingly. tickertape won't discard history on its own.
