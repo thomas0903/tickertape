@@ -225,6 +225,9 @@ fn deadline_below_the_cap_is_honoured() {
         ReaderConfig::default().backoff(blocking(Duration::from_secs(10))),
     )
     .unwrap();
+    // A wait that ignored the deadline would last the 100 ms cap every time. A busy machine can only make a wait
+    // longer, so the shortest of the five is the one compared with the cap.
+    let mut shortest = Duration::MAX;
     for _ in 0..5 {
         let started = Instant::now();
         assert!(
@@ -237,8 +240,12 @@ fn deadline_below_the_cap_is_honoured() {
             took >= Duration::from_millis(30),
             "returned early: {took:?}"
         );
-        assert!(took < Duration::from_millis(90), "overslept: {took:?}");
+        shortest = shortest.min(took);
     }
+    assert!(
+        shortest < Duration::from_millis(90),
+        "overslept every time: the shortest wait took {shortest:?}"
+    );
 }
 
 #[test]

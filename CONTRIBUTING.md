@@ -51,6 +51,7 @@ python3 .github/scripts/check_abi_baseline.py crates/tickertape-ffi/abi/tickerta
 python3 -m unittest discover -s .github/scripts -p 'test_*.py'  # release and ABI tooling
 tests/compat/generate.sh --check-old-readers                 # released readers on new journals (ADR 0033)
 go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12    # workflow lint
+bindings/java/scripts/build-native.sh && mvn -f bindings/java/pom.xml verify   # Java binding (JDK 25)
 ```
 
 `cargo test --workspace` compiles and runs C and C++ programs, so it needs a C/C++ compiler; it also runs the
@@ -73,6 +74,17 @@ TICKERTAPE_SOAK_SECS=1800 cargo test -p tickertape-tests --release --test soak -
 
 It prints its seed and what it exercised; on failure it keeps the journal and logs in `target/tmp/soak-failures/`
 and prints the command that replays the seed (`TICKERTAPE_TEST_SEED`).
+
+**Benchmark before and after (not run by CI).** Changes to the code the readers' per-record path is built from
+need the `replay` benchmark run before and after on the same machine (`cargo bench -p tickertape-bench --bench
+replay`, on the base commit and on the change), with both sets of figures in the pull request description. That
+code is `reader.rs` and `format.rs` in `crates/tickertape/src/`, and what the path inlines or carries in its return
+values: `error.rs` (`Error`, `CorruptReason`), `mmap.rs` and `crc.rs`. The path is short enough that a change
+elsewhere in these files can change how the compiler builds it: an unrelated change once made small records
+markedly slower to replay without touching the per-record code. The size and signature checks next to
+`SlotOutcome` in `reader.rs` catch only the record header moving back into the values that path returns; no test
+catches a slowdown, and CI records no timings. These figures are informal and belong in the pull request, not in
+the docs (`docs/playbooks/run-benchmark.md` describes recorded runs).
 
 On macOS, run the Linux checks in a VM or container too (`docs/playbooks/test-on-linux.md`), and keep test journals
 on a local filesystem (not tmpfs or a shared folder) when you test durability behaviour.

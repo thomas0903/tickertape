@@ -139,6 +139,9 @@ struct Chain {
     visited: Vec<(u64, PathBuf)>,
     /// Records from the scan start (the checkpoint, if any) to the end.
     uncovered: Vec<ChainRecord>,
+    /// Segments entered from an unsealed predecessor (killed between publishing a segment and sealing its
+    /// predecessor): `(base entered, predecessor, offset of the predecessor's empty slot)`.
+    unsealed: Vec<(u64, PathBuf, u64)>,
 }
 
 /// Walks the chain the way recovery does, from the checkpoint (or the oldest segment), without changing anything.
@@ -151,6 +154,7 @@ fn walk(dir: &Path) -> Result<Chain, String> {
             checkpoint: None,
             visited: Vec::new(),
             uncovered: Vec::new(),
+            unsealed: Vec::new(),
         });
     }
     let checkpoint = inspect::read_checkpoint(dir).map_err(|e| e.to_string())?;
@@ -168,6 +172,7 @@ fn walk(dir: &Path) -> Result<Chain, String> {
         checkpoint,
         visited: Vec::new(),
         uncovered: Vec::new(),
+        unsealed: Vec::new(),
     };
     loop {
         let path = dir.join(format::segment_file_name(base));
@@ -213,6 +218,7 @@ fn walk(dir: &Path) -> Result<Chain, String> {
                         && !chain.visited.iter().any(|v| v.0 == seq) =>
                 {
                     // Killed between publishing the next segment and sealing this one (C4).
+                    chain.unsealed.push((seq, path.clone(), offset));
                     base = seq;
                     offset = format::SEGMENT_HEADER_LEN as u64;
                     break;
@@ -256,6 +262,9 @@ enum Expect {
         old_end: u64,
         damaged: Vec<u8>,
         how: &'static str,
+        /// The unsealed predecessor of `file` (killed between publishing `file` and sealing it), if any: its file name
+        /// and the end of its records, where its seal belongs.
+        unsealed_predecessor: Option<(String, u64)>,
     },
     /// A middle segment damaged: recovery must refuse and change no segment byte; then the test restores it.
     Refuse {
@@ -962,6 +971,7 @@ impl Soak {
                     old_end,
                     damaged,
                     how,
+                    unsealed_predecessor,
                 },
                 Some(next),
             ) => {
@@ -969,7 +979,7 @@ impl Soak {
                     next, seq,
                     "writer {epoch}: after a {how} newest segment recovery continues at its base"
                 );
-                let (mut quarantined, mut completed) = (false, false);
+                let (mut quarantined, mut completed, mut preserved_seal) = (false, false, false);
                 for a in &actions {
                     match a[1].as_str() {
                         "quarantined" if a[2] == file => {
@@ -981,6 +991,37 @@ impl Soak {
                             quarantined = true;
                         }
                         "completed" if a[2] == file => completed = true,
+                        // Killed between the two stores of the predecessor's seal (its CRC word written, its marker
+                        // not): in front of a successor that no longer opens, recovery preserves that word and
+                        // replaces the predecessor (ADR 0035 → Damage around a seal), at the predecessor's end of
+                        // records, at most once. Nothing else may be repaired.
+                        "repaired" if a[2] != file && a[6] == format!("BrokenChain({seq})") => {
+                            assert!(
+                                !preserved_seal,
+                                "writer {epoch}: seal place repaired twice: {actions:?}"
+                            );
+                            preserved_seal = true;
+                            let (pred, end) = unsealed_predecessor.as_ref().unwrap_or_else(|| {
+                                panic!("writer {epoch}: {file} had no unsealed predecessor: {a:?}")
+                            });
+                            assert_eq!(
+                                (a[2].as_str(), a[3].parse::<u64>().unwrap()),
+                                (pred.as_str(), *end),
+                                "writer {epoch}: repaired at the predecessor's end of records"
+                            );
+                            let kept = fs::read(&a[5]).unwrap();
+                            let mut word = vec![0; 4];
+                            word.extend_from_slice(&format::seal_crc(seq).to_le_bytes());
+                            // The copy ends at the tail's last non-zero byte, and a CRC can end in zero bytes.
+                            while word.last() == Some(&0) {
+                                word.pop();
+                            }
+                            assert_eq!(
+                                kept, word,
+                                "writer {epoch}: preserved bytes in front of {file}"
+                            );
+                            self.c.quarantined_files_checked += 1;
+                        }
                         _ => self.count_benign(epoch, a),
                     }
                 }
@@ -1135,24 +1176,28 @@ impl Soak {
             };
             let snapshot = segment_snapshot(&self.journal);
             replace_file(&path, &damaged, &self.root);
-            self.expect = if middle {
-                let mut snapshot = snapshot;
-                snapshot.insert(file.clone(), damaged);
-                Expect::Refuse {
-                    file,
-                    original,
-                    snapshot,
-                    end: chain.end,
-                }
-            } else {
-                Expect::Replace {
-                    file,
-                    seq: base,
-                    old_end: chain.end,
-                    damaged,
-                    how: if truncate { "truncated" } else { "damaged" },
-                }
-            };
+            self.expect =
+                if middle {
+                    let mut snapshot = snapshot;
+                    snapshot.insert(file.clone(), damaged);
+                    Expect::Refuse {
+                        file,
+                        original,
+                        snapshot,
+                        end: chain.end,
+                    }
+                } else {
+                    Expect::Replace {
+                        file,
+                        seq: base,
+                        old_end: chain.end,
+                        damaged,
+                        how: if truncate { "truncated" } else { "damaged" },
+                        unsealed_predecessor: chain.unsealed.iter().find(|u| u.0 == base).map(
+                            |u| (u.1.file_name().unwrap().to_string_lossy().into_owned(), u.2),
+                        ),
+                    }
+                };
             (path, 0, how)
         };
         *self.c.injected.entry(kind).or_default() += 1;

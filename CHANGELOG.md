@@ -5,6 +5,29 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
+- Fixed: writer recovery no longer zeroes the bytes after an empty commit word in place when a segment for the
+  expected sequence number exists but does not open (an invalid header, for example) and recovery finds no committed
+  history after the word (ADR 0035 → Damage around a seal, crash contract C8 and C11 (3); it was recorded there as a
+  known gap). The chain is broken there, and those bytes can be the only ones left for diagnosis or salvage. With
+  `RecoveryPolicy::Quarantine` they are now preserved in `quarantine/` and the segment is replaced, as for any
+  corrupt tail (`RepairedTail` with `CorruptReason::BrokenChain`); then that next segment and the later ones are
+  moved to `quarantine/` as disconnected, as before. With `RecoveryPolicy::Fail` the open is refused with
+  `BrokenChain` at the empty commit word before any byte of that segment changes; it used to zero them, then refuse
+  at the next segment. With nothing non-zero after the word nothing changes. `verify` already reported this state as
+  `BrokenChain` at the same position. The on-disk format is unchanged.
+- Changed: when the segment that follows an empty commit word exists but cannot be opened for a reason other than
+  its content (an I/O error such as a permission or a failed mapping; also a directory or a dangling link under a
+  segment's name), `Writer::open` now fails with `Error::Io` without changing anything at that place, under both
+  recovery policies (what recovery did earlier in the same scan stays). Only a segment that is invalid (`Error::Corrupt`) or of an unsupported version ends the chain there.
+  Until now any failure to open it ended the chain: after a plain crash during a roll, a transient error could make
+  `Quarantine` move that healthy segment and every later one to `quarantine/` (crash contract C11).
+- Internal: the readers decode a record's header straight into their own state and pass only a small tag and the
+  length along the per-record path; the rare outcomes (empty slot, seal, failed validation, checkpoint boundary) are
+  handled outside it. Behaviour is unchanged. This undoes a slowdown for small records that the recovery change
+  (ADR 0035) had brought in on the way to this release (no released version had it): the per-record code had not
+  changed, but the compiler had started to copy the decoded header through memory in a way the CPU could not
+  forward. `CONTRIBUTING.md` now asks for the `replay` benchmark before and after a change to the code that path is
+  built from.
 - C++ binding (ADR 0036, `docs/cpp-api.md`): `crates/tickertape-ffi/include/tickertape.hpp`, a header-only C++17
   wrapper over the C ABI, shipped and installed (`cargo cinstall`) next to `tickertape.h`. It covers the whole C ABI:
   move-only `Writer`, `Reader`, option builders and `RecordBatch`; copying, zero-copy (a lambda) and batch appends
@@ -49,6 +72,26 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   `find_package` and `add_subdirectory`. The C++11 example wrapper `examples/c/tickertape.hpp` is removed;
   `examples/c/example.cpp` now records, follows live and replays with the binding, and the examples need C++17. On
   macOS, link the static library with Apple's toolchain defaults or use the shared library (`docs/c-api.md`).
+- Java binding (ADR 0037, `docs/java-api.md`): `bindings/java`, a Maven project (JDK 25, module
+  `io.github.thomas0903.tickertape`, no runtime dependencies) over the C ABI with the Foreign Function and Memory API
+  and no JNI. It covers the writer (copying, zero-copy and batch appends, checkpoint), the safe and mapped readers
+  (try, timed and blocking next, batch reads, seek, durable-only), inspection and retention. Use after close,
+  concurrent calls on a handle, a stale record view and a payload buffer used on another thread throw instead of
+  crashing; closing a reader from another thread is safe while a view is being read (views read through the reader's
+  shared arena, which close ends first); blocking reads honour `Thread.interrupt()` and a close from another thread
+  without losing records; record views are reused and checked, keep their memory alive, and the hot paths allocate
+  nothing (checked with the JIT's escape analysis off too). A close refuses new calls from the moment it starts and
+  takes over from the call in progress without a gap; closing a reader costs a handshake with every JVM thread, so
+  readers are meant to be long-lived. A path is passed to the library by the bytes the JDK holds for it (a relative
+  path stays relative), so a name the JVM cannot decode opens the journal of that name and not one of a similar
+  name; only the default file system is supported. What remains undefined (another thread advancing a reader while its view is read, sharing a batch between
+  threads, the mapped reader's precondition) is listed in the guide. Reports from growable C structs are classes, not
+  records, so they can gain fields after 1.0.
+  Every C status and corruption reason has its own exception or constant, checked against the header. The library is
+  found by explicit path, system property, a natives JAR (extracted privately and hash-checked) or the library path,
+  and a library of another version is refused. Tested on Linux x86-64, Linux arm64 and macOS in a new CI job, including
+  the cross-language fixtures and the released-format fixtures. Not published to Maven Central yet; the coordinates
+  `io.github.thomas0903:tickertape` await the owner's confirmation.
 - Fixed: a visible reader no longer reports `CorruptReason::BrokenChain` for a seal that is no longer in the file.
   When recovery repairs a tail in place, a seal can go with it while the successor is moved to `quarantine/`. The
   safe reader could still hold the seal in its read buffer (a zero-copy reader could load it just before the damage
@@ -58,9 +101,9 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   chain only if the seal is still there and the successor is still missing at a second attempt. Found by
   `reader_retention_stress::durable_readers_under_repairs` on CI (arm64 Linux and macOS, three times in one night),
   where one zeroed commit word in a sealed segment caused such a repair; with ADR 0035 recovery replaces that
-  segment instead. In-place repairs that remove a seal remain (one is a seal's marker emptied in front of a
-  successor that no longer opens; another is a zeroed stretch from a record through the seal), and the reader now
-  handles them. A failed refill of the safe reader's buffer also drops the buffer, so the next call reads from the
+  segment instead. A seal can still disappear from a file that recovery leaves in place (storage damage that zeroes
+  the whole seal in front of a successor that no longer opens, or a stretch from a record through the seal), and the
+  reader now handles it. A failed refill of the safe reader's buffer also drops the buffer, so the next call reads from the
   file.
 - Library: dropping a `Writer` now releases the journal lock explicitly (`flock(LOCK_UN)`), after its helper threads
   have stopped and readers have been told it has gone, and so does a `Writer::open` that fails after taking the lock.
@@ -145,8 +188,7 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   damaged slot claims. A seal whose marker is empty, in front of a successor segment that opens, is rewritten, keeping the records
   of its segment (non-zero bytes beyond the seal's CRC word are preserved first, or `Fail` refuses with `BadSeal`);
   a seal with its marker present and an invalid CRC is a corrupt tail like any other (crash contract C11 (1)). Some damage still cannot be told
-  from a torn append and is zeroed in place as before, and a known gap remains in front of a successor that does not
-  open (crash contract C8, C11). A torn record whose payload holds bytes the search counts as committed history (raw
+  from a torn append and is zeroed in place as before (crash contract C8, C11). A torn record whose payload holds bytes the search counts as committed history (raw
   frames copied from another journal, for example) can be preserved, or refused under `Fail`, even after a plain
   process crash (C1).
 - Fix: readers racing with retention (the writer's policy or `tickertape archive`) no longer report a removed segment

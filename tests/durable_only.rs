@@ -916,11 +916,13 @@ fn sealed_journal(dir: &std::path::Path) -> (u64, u64) {
     }
 }
 
-/// Storage damage zeroes segment 0's seal marker and the successor's header, so the successor no longer opens. The next
-/// writer's recovery can't tell the seal's leftover CRC word from a crash between publishing a successor and sealing
-/// with its header since damaged (ADR 0035 → Damage around a seal): it zeroes that word **in place**, so segment 0 keeps
-/// its identity and ends at the seal's place, and quarantines the successor as disconnected. The new writer begins
-/// there. A reader can't see this repair, and the journal it leaves is healthy.
+/// Storage damage zeroes segment 0's seal (its marker and its CRC word) and the successor's header, so the seal is gone
+/// from the file and the successor no longer opens. With nothing non-zero after the empty word there is nothing for the
+/// next writer's recovery to preserve or zero: the chain ends at the seal's place, segment 0 is left **in place** (it
+/// keeps its identity and its bytes), and the successor is quarantined as disconnected (crash contract C11 (3), ADR
+/// 0035 → Damage around a seal). The new writer begins there. A reader can't see this repair, and the journal it
+/// leaves is healthy. (Had the damage left any byte after the empty word, such as the seal's CRC word, recovery would
+/// preserve it and replace segment 0, and readers would get `Error::Discarded` instead.)
 fn remove_seal_in_place(dir: &std::path::Path, successor: u64, seal: u64) -> Writer {
     use std::os::unix::fs::{FileExt, MetadataExt};
     let identity = |path: &std::path::Path| {
@@ -929,23 +931,26 @@ fn remove_seal_in_place(dir: &std::path::Path, successor: u64, seal: u64) -> Wri
     };
     let segs = segments(dir);
     let before = identity(&segs[0].1);
-    open_raw(&segs[0].1).write_all_at(&[0; 4], seal).unwrap();
+    open_raw(&segs[0].1).write_all_at(&[0; 8], seal).unwrap();
     open_raw(&segs[1].1).write_all_at(b"X", 0).unwrap(); // damages the magic
+    let damaged = std::fs::read(&segs[0].1).unwrap();
     let writer = Writer::open(dir, small_config()).unwrap();
     let actions = &writer.recovery_report().actions;
     assert!(
         matches!(
             actions.as_slice(),
-            [
-                RecoveryAction::ZeroedUncommitted { offset, len: 4, .. },
-                RecoveryAction::QuarantinedSegment { .. },
-            ] if *offset == seal + 4
+            [RecoveryAction::QuarantinedSegment { reason: tickertape::CorruptReason::BrokenChain(s), .. }]
+                if *s == successor
         ),
         "{actions:?}"
     );
     assert_eq!(writer.next_seq(), successor);
     assert_eq!(segments(dir).len(), 1);
     assert_eq!(identity(&segs[0].1), before, "repaired in place");
+    assert!(
+        std::fs::read(&segs[0].1).unwrap() == damaged,
+        "segment 0 changed"
+    );
     writer
 }
 
@@ -954,9 +959,11 @@ fn remove_seal_in_place(dir: &std::path::Path, successor: u64, seal: u64) -> Wri
 /// segment 0 into its buffer up to the seal; recovery then removed the seal in place and quarantined the successor,
 /// and the reader followed the seal it still held, found no successor while its segment was in place, and reported a
 /// broken chain on every call until the new writer happened to roll to the same base again (forever, if it never
-/// does). Before ADR 0035 one zeroed commit word in a sealed segment was enough; now one in-place repair that
-/// removes a seal is the one in [`remove_seal_in_place`] (another is a zeroed stretch from a record through the
-/// seal). A zero-copy reader reads the current bytes, but can load the seal just before the damage.
+/// does). Before ADR 0035 one zeroed commit word in a sealed segment was enough. Recovery no longer zeroes the remains
+/// of a seal in front of a successor that does not open (it preserves them and replaces the segment), so the state
+/// is now reached as in [`remove_seal_in_place`]: storage damage takes the whole seal, and recovery leaves the file in
+/// place and quarantines the successor (a zeroed stretch from a record through the seal does the same). A zero-copy
+/// reader reads the current bytes, but can load the seal just before the damage.
 ///
 /// The seal it read is gone from the file, so it isn't corruption: the reader reads the slot again and waits there
 /// (`Ok(None)`), then continues in the new history, which kept the file's identity, without `Error::Discarded` (C11).
@@ -964,7 +971,7 @@ fn remove_seal_in_place(dir: &std::path::Path, successor: u64, seal: u64) -> Wri
 /// reader sees the empty slot), after it read the seal and before it opens the successor, and the same with the new
 /// writer rolling again before the reader reads the slot again (the seal is back, and its successor opens).
 #[test]
-fn visible_reader_does_not_follow_a_seal_an_in_place_repair_removed() {
+fn visible_reader_does_not_follow_a_seal_removed_in_place() {
     use std::cell::RefCell;
     use std::rc::Rc;
     #[derive(Debug, Clone, Copy, PartialEq)]
