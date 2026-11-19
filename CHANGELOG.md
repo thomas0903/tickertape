@@ -7,26 +7,33 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 - C++ binding (ADR 0036, `docs/cpp-api.md`): `crates/tickertape-ffi/include/tickertape.hpp`, a header-only C++17
   wrapper over the C ABI, shipped and installed (`cargo cinstall`) next to `tickertape.h`. It covers the whole C ABI:
-  move-only `Writer`, `Reader`, option builders and `RecordBatch`; copying, zero-copy (a lambda) and batch appends;
-  checkpoint; seek; next with `std::chrono` timeouts; durable-only reads; the zero-copy reader as
-  `Reader::open_mapped_unsafe`; `RecordView`s whose borrowed payload is checked in debug builds; copy-out and batch
-  reads; verify, segment listing, the checkpoint marker and retention. Errors are values (`tickertape::result<T>`,
-  `[[nodiscard]]`, with a `Status`, message, OS error and corruption reason) whose `value()` throws, so it works with
-  and without `-fno-exceptions`. An exception thrown by a fill never crosses the C ABI: it is rethrown after the
-  aborted append, nested inside the library error if the clean-up failed, and destroying or moving the writer inside
-  its own fill is defined. Negative timeouts do not wait (unlike C); a negative or NaN retention age is an error.
-  With GCC and Clang, units built with and without exceptions or debug checks can be linked into one program (the
-  mode-dependent inline functions carry an `abi_tag` per mode). `NewRecord` refuses temporaries that own their
-  bytes at compile time. The classes live in the inline namespace `tickertape::v1`, and no class gains a data
-  member within a major version. The header checks the C header's version at compile time and the library's in
-  every call that takes a journal path. Tested as C++17, C++20 and C++17 without exceptions under
-  AddressSanitizer, UBSan and Valgrind, compile-tested as C++17/20/23 with and without exceptions and `NDEBUG` with
-  GCC and Clang under `-Wconversion -Wshadow -Wpedantic`, with a layout pin for every class, a mixed-mode link test,
-  an allocation check for the hot path and cross-language fixtures; tests fail if a C function, struct field,
-  status or corruption reason is added without a decision for the binding. A CMake package
-  (`tickertape::tickertape`, `tickertape::cpp`) serves `find_package` and `add_subdirectory`. The C++11 example
-  wrapper `examples/c/tickertape.hpp` is removed; `examples/c/example.cpp` now records, follows live and replays
-  with the binding, and the examples need C++17.
+  move-only `Writer`, `Reader`, option builders and `RecordBatch`; copying, zero-copy (a lambda) and batch appends
+  (`NewRecord` is the C struct `tickertape_new_record`, built with `tickertape::new_record`); checkpoint; seek; next
+  with `std::chrono` timeouts; durable-only reads; the zero-copy reader as `Reader::open_mapped_unsafe`;
+  `RecordView`s whose borrowed payload is checked in debug builds; copy-out (into any memory or a writable byte
+  range) and batch reads; verify, segment listing, the checkpoint marker and retention. Errors are values
+  (`tickertape::result<T>`, `[[nodiscard]]`, with a `Status`, message, OS error and corruption reason) whose
+  `value()` throws, so it works with and without `-fno-exceptions`; a temporary result or error never lends a
+  reference, and `tickertape::Exception` copies without throwing. An exception thrown by a fill never crosses the C
+  ABI: it is rethrown after the aborted append, nested inside the library error if the clean-up failed, and
+  destroying or moving the writer inside its own fill is defined. Negative timeouts do not wait (unlike C); a
+  negative or NaN retention age is an error. With GCC and Clang, units built with and without exceptions or debug
+  checks can be linked into one program: the inline namespace is `tickertape::v1` with exceptions and
+  `tickertape::v1_noexcept` without (so binding types cannot be passed between those units: a link error), and the
+  debug-check-dependent functions carry an `abi_tag`. `new_record` refuses temporaries that own their bytes at
+  compile time; paths are passed directly (the parameter type is internal, so it cannot dangle in a variable). Every
+  translation unit of a program must use the same release of the header; no class gains a data member within a major
+  version. The header checks the C header's version at compile time and the library's in every call that takes a
+  journal path and in the option builders before they allocate. Tested as C++17, C++20 and C++17 without exceptions
+  under AddressSanitizer, UBSan and Valgrind, compile-tested as C++17/20/23 with and without exceptions and `NDEBUG`
+  with GCC and Clang under `-Wconversion -Wshadow -Wpedantic`, with a layout pin for every class, `static_assert`s and
+  compile-fail programs for the API's compile-time properties, mixed-mode link tests (including an allocation failure
+  inside a binding function), an allocation check for the hot path with a positive control and cross-language
+  fixtures; tests fail if a C function, struct field, status or corruption reason is added without a decision for the
+  binding. A CMake package (`tickertape::tickertape`, `tickertape::cpp`) serves `find_package` and
+  `add_subdirectory`. The C++11 example wrapper `examples/c/tickertape.hpp` is removed; `examples/c/example.cpp` now
+  records, follows live and replays with the binding, and the examples need C++17. On macOS, link the static library
+  with Apple's toolchain defaults or use the shared library (`docs/c-api.md`).
 - Fix: readers racing with retention (the writer's policy or `tickertape archive`) no longer report a removed segment
   as an error of the wrong kind. `Reader::seek` returned an I/O "not found" error when the segment it chose was
   removed before it opened it; it now lists the segments again and returns `Error::SeqUnavailable` with the new

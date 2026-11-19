@@ -9,7 +9,8 @@ every function, and [ADR 0036](decisions/0036-cpp-binding.md) gives the design a
 ABI underneath ([`c-api.md`](c-api.md)) still hold; this page repeats the ones you need.
 
 > **Status:** like the C ABI, the binding is not stable before tickertape 1.0. Use the header, the C header and the
-> library from one release (the header checks this; see [Versioning](#versioning)).
+> library from one release (the header checks this), and one release of the header in every part of a program (see
+> [Versioning](#versioning)).
 
 Example: [`examples/c/example.cpp`](../examples/c/example.cpp) records, follows a journal live from another process,
 and replays it.
@@ -60,6 +61,12 @@ c++ -std=c++17 app.cpp -I crates/tickertape-ffi/include -L target/release -ltick
 Static linking, installation with `cargo cinstall` (which installs `tickertape.hpp` next to `tickertape.h`) and
 pkg-config work as for C: see [`c-api.md` → Building and linking](c-api.md#building-and-linking).
 
+> **macOS and the static library:** link `libtickertape.a` with Apple's toolchain defaults (Apple Clang's `c++`), or
+> use the shared library. With the GCC driver (Homebrew `g++`), which passes `-no_compact_unwind` to the linker, an
+> `append_with` whose fill returns `false` (or throws) ends the process inside the library: the library aborts that
+> append by unwinding internally, and that link drops the unwind information it needs. Shared linkage works with
+> either compiler.
+
 **CMake.** `crates/tickertape-ffi/cmake/tickertapeConfig.cmake` defines `tickertape::tickertape` (the shared library
 and `tickertape.h`) and `tickertape::cpp` (plus `tickertape.hpp` and the C++17 requirement):
 
@@ -82,16 +89,33 @@ macOS 10.15 deployment target).
 
 A program may link translation units built with and without exceptions, and with and without debug checks (for
 example a component built with `-fno-exceptions` inside an application that catches `tickertape::Exception`). With
-GCC and Clang each unit keeps its own behaviour: the classes have the same layout in every mode and pass freely
-between units, and the few inline functions whose behaviour depends on the mode (`value()`, `operator*`, `error()`,
-`RecordView::data()`, `RecordBatch::operator[]`, `append_with`, ...) get a different symbol in each mode
-(`abi_tag`), so the linker never gives one unit another unit's copy. What it does not change:
+GCC and Clang each unit keeps its own behaviour:
+
+- **Exceptions on or off.** Everything in the header lives in an inline namespace named after the mode:
+  `tickertape::v1` with exceptions, `tickertape::v1_noexcept` without. You still write `tickertape::Writer`, but the
+  two modes have different symbols for every function, type and constant, so no unit ever runs code built for the
+  other mode (including the clean-up code the compiler generates, which an allocation failure passes through).
+- **So binding types do not cross that boundary.** A `tickertape::Writer` from a unit built with exceptions is a
+  different type from one built without. If a header of yours declares `void feed(tickertape::Writer &)`, defining
+  it in a `-fno-exceptions` component and calling it from an application built with exceptions fails to link
+  (undefined reference to `feed(tickertape::v1::Writer&)`). That is deliberate: the alternative is silently running
+  one mode's code in the other. Across such a boundary, pass C handles (`writer.native_handle()`, used through the
+  C API in `tickertape.h` on the other side) or plain data (sequence numbers, timestamps, payload bytes;
+  `tickertape::NewRecord`, which is the C struct).
+- **Debug checks on or off.** Debug and release units share the types and can pass them freely; the few inline
+  functions whose behaviour depends on the check (`operator*`, `error()`, `RecordView::data()`,
+  `RecordBatch::operator[]`, ...) get a different symbol in each mode (`abi_tag`).
+- Units that exchange binding types must use the same C++ standard library with the same layout-affecting settings
+  (such as `_GLIBCXX_USE_CXX11_ABI` or a standard-library debug mode), as for any C++ library.
+
+What it does not change:
 
 - Behaviour follows the code that acts on a value: `value()` called in a unit built without exceptions aborts on an
   error, whichever unit produced the result.
 - A fill function passed to `append_with` from code built without exceptions must not throw.
-- Your own inline functions that call these are yours to keep consistent across modes, as for any header.
-- Other compilers (MSVC) have no `abi_tag`: there, build the whole program in one mode.
+- Your own inline functions that call debug-checked ones are yours to keep consistent across modes, as for any
+  header.
+- MSVC is not covered (no `abi_tag`): there, build the whole program in one mode.
 
 ## Conventions
 
@@ -101,54 +125,64 @@ between units, and the few inline functions whose behaviour depends on the mode 
   `if (r)` or `r.has_value()`; take the value with `value()` (which throws `tickertape::Exception` for an error, or
   without exceptions prints the error and aborts), or with `*r` and `r->` (unchecked, except in debug builds); read
   the error with `r.error()`. `result<void>` has no value. Results are `[[nodiscard]]`: ignoring one is a compiler
-  warning, so errors are never silently lost. On a temporary result, `value()`, `*` and `error()` return by value,
-  so `for (auto &s : list_segments(dir).value())` is safe.
+  warning, so errors are never silently lost. On a temporary result, `value()`, `*` and `error()` return by value
+  (copies from a `const` temporary, and not at all for a `const` temporary of a type that cannot be copied, such as
+  `result<Writer>`), so `for (auto &s : list_segments(dir).value())` is safe. Likewise `error().message()` on a
+  temporary returns the string by value. A `result<T>` needs a `T` whose move cannot throw.
 - **Nothing else throws**, apart from `std::bad_alloc` (an error copies its message; `list_segments` returns a
   vector). The only other exceptions are from `value()`, and from `Writer::append_with`, which rethrows what your
   fill function threw.
-- **Paths** can be a `const char *`, `std::string`, `std::string_view` or `std::filesystem::path`. A path with a NUL
-  byte inside fails with `invalid_argument` (the C ABI would cut it short).
+- **Paths** can be a `const char *`, `std::string`, `std::string_view` or `std::filesystem::path`, passed directly
+  as the argument; temporaries such as `tt::Writer::open(root / "journal")` are fine. A path with a NUL byte inside
+  fails with `invalid_argument` (the C ABI would cut it short). The parameter type behind this is internal
+  (`tickertape::detail`), because a variable of it could point into a destroyed temporary; a function of yours that
+  forwards a path should take a path type such as `const std::filesystem::path &`.
 - **Payloads** can be any contiguous range of `char`, `unsigned char`, `signed char` or `std::byte`
   (`std::string_view`, `std::string`, `std::vector<std::uint8_t>`, `std::array`, `std::span`, `char8_t` ranges in
   C++20), or a pointer and a size. String literals and other C arrays are refused, because they would include the
   terminating NUL: write `std::string_view("text")`.
 - **Timeouts** are a `tickertape::Timeout`: `tickertape::no_wait` (the default), any `std::chrono` duration, or
   `tickertape::wait_forever`. **A zero or negative duration does not wait** (unlike the C ABI, where a negative
-  timeout waits forever): a deadline that has passed returns at once. Durations are rounded up to whole nanoseconds.
+  timeout waits forever): a deadline that has passed returns at once. Durations are rounded up to whole nanoseconds
+  (integral counts exactly; anything longer than `INT64_MAX` nanoseconds, about 292 years, waits that long).
   A timeout bounds only the wait for a record; catching up after a seek and file I/O can take longer.
 - **Timestamps** are `std::uint64_t` nanoseconds that you choose; `tickertape::realtime_ns()` reads the wall clock.
 
 ## Ownership and lifetimes
 
-| Object | Create | Owns |
-|---|---|---|
-| `Writer` | `Writer::open(dir[, options])` | a writer handle (and the journal's lock) |
-| `Reader` | `Reader::open(dir[, options])`, `Reader::open_mapped_unsafe(dir[, options])` | a reader handle |
-| `WriterOptions`, `ReaderOptions`, `Retention` | their constructors | an option handle |
-| `RecordBatch` | `RecordBatch(max_records, buffer_bytes)` | storage for batch reads |
+| Object | Create | Default-constructed | Owns |
+|---|---|---|---|
+| `Writer` | `Writer::open(dir[, options])` | empty | a writer handle (and the journal's lock) |
+| `Reader` | `Reader::open(dir[, options])`, `Reader::open_mapped_unsafe(dir[, options])` | empty | a reader handle |
+| `WriterOptions`, `ReaderOptions`, `Retention` | their constructors | the defaults | an option handle |
+| `RecordBatch` | `RecordBatch(max_records, buffer_bytes)` | (no default constructor) | C++ buffers for batch reads |
 
-- All of them are **move-only** and free what they own in their destructor. A moved-from or default-constructed
-  object is **empty**: you can destroy it or assign to it, and calls on it fail with `invalid_argument`.
-  `is_open()` tells whether a writer or reader holds a handle.
+- All of them are **move-only** and free what they own in their destructor. A moved-from object, and a
+  default-constructed `Writer` or `Reader`, is **empty**: you can destroy it or assign to it, and calls on it fail
+  with `invalid_argument`. `is_open()` tells whether a writer or reader holds a handle. A moved-from `RecordBatch`
+  has capacity 0.
 - The destructor of a `Writer` closes it **without checkpointing**: records stay visible, but only checkpointed
   records are durable. `close()` does the same now and reports the status.
 - Options and retention settings are copied by the functions that take them. A moved-from options object passed to
   `open` fails with `invalid_argument` rather than meaning "the defaults".
 - **`RecordView` borrows.** `Reader::next` returns a view whose payload points into the reader's buffer (safe reader)
   or into the memory-mapped segment (mapped reader). **It is valid until the next call on that reader other than
-  `position()`, or until the reader is moved or destroyed.** The view's `seq()`, `schema_id()`, `venue_ts_ns()` and
-  `local_ts_ns()` are copies and stay valid; `data()`, `size()` and `as_string_view()` read the payload. Copy what you
-  need to keep: `std::string(view.as_string_view())`.
-- **Debug check:** in builds without `NDEBUG` (or with `TICKERTAPE_DEBUG_CHECKS` defined to 1), reading the payload
-  of a view after its reader moved on aborts with a message. A view whose reader was destroyed is not detected. Code
-  built with and without the check can be linked together ([Mixing modes](#mixing-modes)).
-- **Copy-out instead:** `Reader::next_copy(buf, size)` copies one payload into your buffer, and
+  `position()`, or until the reader is moved or destroyed.** The view's `seq()`, `schema_id()`, `venue_ts_ns()`,
+  `local_ts_ns()`, `size()` and `empty()` are copies and stay valid; `data()`, `as_string_view()` and `as_span()`
+  read the payload. Copy what you need to keep: `std::string(view.as_string_view())`.
+- **Debug check:** in builds without `NDEBUG` (or with `TICKERTAPE_DEBUG_CHECKS` defined to 1), fetching the payload
+  through a view (`data()`, `as_string_view()`, `as_span()`) after its reader moved on aborts with a message, also
+  for an empty payload. The check runs at that call: a pointer, `string_view` or `span` you took from the view earlier
+  is a plain pointer with no continuing check. A view whose reader was destroyed is not detected. Code built with and
+  without the check can be linked together ([Mixing modes](#mixing-modes)).
+- **Copy-out instead:** `Reader::next_copy(buf, size)` (any memory, as `void *`) or `next_copy(buffer)` (a writable
+  `std::array`, `std::vector`, C array, ... of bytes or chars) copies one payload into your buffer, and
   `Reader::read_batch(batch)` copies many into a `RecordBatch`. Views from a batch are valid until the next read into
   that batch, or until it is moved or destroyed; views from `next_copy` as long as your buffer.
 - `data()` is null when the payload is empty. `as_string_view()` and `as_span()` handle that; guard it before
   passing the pointer to `memcpy` or `printf("%.*s")`.
-- `NewRecord` (for `append_batch`) does not copy its payload: keep the bytes alive until the append returns. It
-  refuses temporaries that own their bytes at compile time (see [Writing](#writing)).
+- `NewRecord` (for `append_batch`) does not copy its payload: keep the bytes alive until the append returns.
+  `new_record()` refuses temporaries that own their bytes at compile time (see [Writing](#writing)).
 - **No hidden allocation on the hot path.** `append`, `append_with`, `append_batch`, `next_seq`, `next`, `next_copy`,
   `read_batch` and `position` allocate nothing in the binding when they succeed (`tests/cpp/test_no_alloc.cpp`
   checks it by counting `operator new`). A failure allocates, to copy the error message. `RecordBatch` allocates its
@@ -185,16 +219,21 @@ tt::Writer writer = tt::Writer::open("/data/journal", options).value();
 
   ```cpp
   std::vector<tt::NewRecord> batch;
-  for (const std::string &message : messages) batch.emplace_back(7, venue_ts, tt::realtime_ns(), message);
+  for (const std::string &message : messages) batch.push_back(tt::new_record(7, venue_ts, tt::realtime_ns(), message));
   tt::BatchAppend appended = writer.append_batch(batch);
   appended.outcome.value();   // throws if it stopped early; appended.appended says how far it got
   ```
 
-  A `NewRecord` keeps a pointer to its payload, not a copy, so **the payload must be a named object** (an lvalue)
-  that outlives the append, or a view: an rvalue is accepted only if it is a `std::basic_string_view` or a
-  `std::span`. `batch.emplace_back(7, 0, 0, std::to_string(i) + "...")` does not compile (the string would be
-  destroyed at the end of the statement and the record would point into freed memory), and neither does a
-  temporary `std::vector` or `std::array`. Keep the strings in a container that lives until the append returns.
+  `tt::NewRecord` is the C struct `tickertape_new_record` itself (its fields `payload`, `payload_len`, `venue_ts_ns`,
+  `local_ts_ns` and `schema_id` are public), so a vector or array of records goes to the library as it is, without a
+  copy or an allocation. Build records with `tt::new_record(schema_id, venue_ts_ns, local_ts_ns, bytes)` or
+  `tt::new_record(schema_id, venue_ts_ns, local_ts_ns, data, size)`. A record keeps a pointer to its payload, not a
+  copy, so **the payload must be a named object** (an lvalue) that outlives the append, or a view: an rvalue is
+  accepted only if it is a `std::basic_string_view`, a `std::span` or, in C++20, a type for which
+  `std::ranges::enable_borrowed_range` is true (specialise it for your own view types). `tt::new_record(7, 0, 0,
+  std::to_string(i) + "...")` does not compile (the string would be destroyed at the end of the statement and the
+  record would point into freed memory), and neither does a temporary `std::string`, `std::vector` or `std::array`.
+  Keep the strings in a container that lives until the append returns.
 
 ## Reading
 
@@ -286,7 +325,8 @@ and returns nothing without a valid checkpoint marker. See [`c-api.md` → Durab
 | `needed_size()` | For `Status::buffer_too_small` from `next_copy` and `read_batch`: the bytes the record needs |
 | `name()`, `to_string()` | `"TICKERTAPE_E_IO"`, and `"TICKERTAPE_E_IO: <message>"` |
 
-`tickertape::Exception` (a `std::runtime_error`) holds an `Error`; `what()` is `to_string()`.
+`tickertape::Exception` (a `std::runtime_error`) holds an `Error`, shared between copies so that copying an exception
+never throws; `what()` is `to_string()`. `message()` on a temporary `Error` returns the string by value.
 
 `Status` and `CorruptReason` have one enumerator per C code: see the table in
 [`c-api.md` → Errors](c-api.md#errors) (`TICKERTAPE_E_SEQ_UNAVAILABLE` is `Status::seq_unavailable`, and so on). A
@@ -296,6 +336,8 @@ options, and `unsupported_version` when the loaded library does not match the he
 
 The option builders record the first error a setter reports (for example `backoff` with a minimum above the
 maximum), so you can chain setters; the open function that takes them returns it, and `options.error()` shows it.
+Each builder checks the loaded library before it creates its C handle: with a library that does not match the header
+it records `unsupported_version` instead, and calls no C function other than the version queries.
 Their `native_handle()` gives the C handle for a C setter the header does not wrap yet; errors from such calls are
 not recorded.
 
@@ -337,17 +379,23 @@ The header defines `TICKERTAPE_HPP_VERSION_MAJOR`, `_MINOR`, `_PATCH`, `TICKERTA
 that release, and follows the C ABI's rule ([`c-api.md` → Versioning](c-api.md#versioning)):
 
 - **Before 1.0** it needs exactly its own release's `tickertape.h` and library.
-- **From 1.0** it needs the same ABI version and a `tickertape.h` and library at least as new as itself. Within a
-  major version no public declaration is removed or changes meaning; new functions, member functions, types and
-  enumerators may be added, but **no class gains a data member**, so that components built against different minor
-  versions agree on every type.
-- The classes live in the inline namespace `tickertape::v1` (you write `tickertape::Writer`). A major version that
-  changes a layout moves to `v2`, so code built against both can be linked into one program. Do not forward-declare
-  the header's classes; include it.
+- **From 1.0** it needs the same ABI version and a `tickertape.h` and library at least as new as itself, so a newer
+  library under an older header keeps working. Within a major version no public declaration is removed or changes
+  meaning; new functions, member functions, types and enumerators may be added, and **no class gains a data member**,
+  so rebuilding against a newer minor release never changes the size of your own types that contain the binding's.
+- **One release of the header per program.** Every translation unit of a program that includes `tickertape.hpp` must
+  use the same release of it. Mixing releases breaks the one-definition rule, as with any header-only library: the
+  linker keeps one copy of each inline function, and those copies differ between releases (version checks, the sizes
+  of C structs), so a part built against 1.1 could end up running 1.0's code. Nothing detects this at build time.
+  Rebuild every part when you upgrade.
+- The inline namespace carries the major version (`v1`; a major version that changes a layout moves to `v2`) and the
+  exception mode ([Mixing modes](#mixing-modes)). You write `tickertape::Writer`; do not forward-declare the header's
+  classes or name the inline namespace.
 
 It checks `tickertape.h` at compile time (`#error`), and the loaded library at run time in every function that takes
-a journal path (`Status::unsupported_version`). `tickertape::check_library()` and `tickertape::library_compatible()` run the same
-check, and `library_version()` returns the library's version string.
+a journal path and in the option builders' constructors (`Status::unsupported_version`).
+`tickertape::check_library()` and `tickertape::library_compatible()` run the same check, and `library_version()`
+returns the library's version string. The header's own helper macros are undefined at its end.
 
 ## Testing
 
@@ -357,7 +405,10 @@ throwing fill, every status and corruption reason), the allocation check, a debu
 cross-language fixtures with Rust, Python and C, the example, and a compile-only matrix of C++17, C++20 and C++23
 with and without exceptions and `NDEBUG` for every C++ compiler it finds (`TICKERTAPE_FFI_CXX_COMPILERS` sets the
 list), which also pins every class's size and alignment (`tests/cpp/layout.cpp`). It links units built in different
-modes into one program, checks that `NewRecord` refuses owning temporaries, and fails if a C function, struct
-field, status code or corruption reason is added without a decision for the binding, or if a mode-dependent
-function lacks its mode tag (ADR 0036).
-`TICKERTAPE_FFI_SANITIZE=1` and `TICKERTAPE_FFI_VALGRIND=1` work as for the C tests.
+modes into one program (including an allocation failure inside a binding function), checks that binding types
+cannot be passed between exception modes, that `new_record` refuses owning temporaries and other unsafe code at
+compile time, and fails if a C function, struct field, status code or corruption reason is added without a decision
+for the binding, or if a debug-check-dependent function lacks its mode tag (ADR 0036).
+`TICKERTAPE_FFI_SANITIZE=1` and `TICKERTAPE_FFI_VALGRIND=1` work as for the C tests; under Valgrind the tests that
+replace `operator new` run with `--soname-synonyms=somalloc=nouserintercepts`. With the GCC driver on macOS, the
+statically linked test programs are skipped, for the reason in [Building and linking](#building-and-linking).

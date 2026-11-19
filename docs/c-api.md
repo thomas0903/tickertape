@@ -89,6 +89,13 @@ cc app.c $(pkg-config --cflags --libs tickertape) -o app
 The static library contains its own copy of the Rust standard library, so linking two Rust static libraries into one
 program can produce duplicate symbols; link one of them dynamically in that case.
 
+**macOS: link the static library with Apple's toolchain defaults, or use the shared library.** The GCC driver
+(Homebrew `gcc`/`g++`) passes `-no_compact_unwind` to the linker. The library aborts an append whose fill callback
+returns non-zero by unwinding internally, and with `libtickertape.a` linked that way the unwind information is gone,
+so such an `append_with` ends the process inside the library. Shared linkage with either compiler, and the static
+library linked by Apple Clang (`cc`, `c++`), work. (The tests skip their statically linked programs in that
+configuration for this reason.)
+
 C++ can use the same header (it has `extern "C"` guards), but the C++ binding
 [`tickertape.hpp`](../crates/tickertape-ffi/include/tickertape.hpp) (C++17, header-only, [`cpp-api.md`](cpp-api.md))
 wraps it with RAII and is the supported way. `examples/c/Makefile` shows both link styles (`writer` links the static

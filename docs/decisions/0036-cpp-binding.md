@@ -72,32 +72,58 @@ debug checks: a low-latency component built with `-fno-exceptions` inside an app
 exactly this binding's audience, so mixing is made safe rather than forbidden. The first version claimed this
 without doing it: the layouts matched, but inline functions whose bodies depend on the mode (`value()` throws or
 aborts) exist once per program, chosen by link order, so an application's `value()` aborted instead of throwing when
-a no-exceptions component came first on the link line (reproduced with Apple Clang at -O0 and -O2 and GCC 15 at
--O0). What is guaranteed now, with GCC and Clang (the Itanium C++ ABI: Linux, macOS):
+a no-exceptions component came first on the link line. The second version tagged the functions whose bodies mention a
+mode macro (`abi_tag`). That was not enough for the exception mode: any function can contain exception handling the
+compiler generates (`list_segments` calls `reserve()` while another vector is live, so it has a clean-up path), and
+when the linker kept the copy built with `-fno-exceptions`, a `std::bad_alloc` passing through it terminated the
+process (Clang, which marks such code as unable to unwind) or skipped its clean-up (GCC). What is guaranteed now, with
+GCC and Clang (the Itanium C++ ABI: Linux, macOS):
 
-- **The types are shared.** Every class has the same layout in every mode (the debug check's fields exist in every
-  build; `[[maybe_unused]]` keeps Clang quiet when `NDEBUG` leaves them unread), so objects, results and
-  `tickertape::Exception` pass between units built in different modes.
-- **Each unit keeps its own mode's behaviour.** Every inline function whose behaviour depends on the exception mode
-  or the debug-check mode is declared `TICKERTAPE_HPP_MODE_DEPENDENT`, which expands to
-  `__attribute__((abi_tag(E, D)))` with E `tickertape_exc` or `tickertape_noexc` and D `tickertape_dbg` or
-  `tickertape_nodbg`. The tags are part of the mangled name, so each mode's copy is a different symbol and the
-  linker cannot substitute one for another. This covers `result<T>::value()`, `operator*`, `operator->` and
-  `error()`, `result<void>::value()` and `error()`, `RecordView::data()` and `as_string_view()`, `as_span`,
-  `RecordBatch::operator[]` and its iterator's `operator*`, `Writer::append_with` and its trampoline, and the
-  internal `detail::fail` and `detail::debug_check`. The header's other functions do not call them (they read a
-  failed `result<void>` through an unchecked internal accessor), so their single copy behaves the same in every
-  mode. One macro carries both tags, so a function cannot get one and miss the other.
+- **The exception mode is part of every symbol's name.** Everything the header declares lives in an inline
+  namespace whose name carries the mode: `tickertape::v1` when exceptions are enabled (`__cpp_exceptions`),
+  `tickertape::v1_noexcept` when they are not. Every function, type and inline variable of the binding therefore has
+  a symbol per mode, and no definition is shared between units built in different exception modes, whatever the
+  compiler generates inside it. Code in one translation unit still writes `tickertape::Writer`.
+- **Units built in different exception modes can be linked into one program**, and each keeps its own behaviour for
+  everything: `value()` throws in the one and aborts in the other, a fill's exception is rethrown, and an allocation
+  failure inside any binding function reaches the caller's `catch`.
+- **Binding types do not cross an exception-mode boundary.** `tickertape::Writer` in a unit built with exceptions
+  and `tickertape::Writer` in one built without are different types (`v1::Writer` and `v1_noexcept::Writer`), so a
+  function declared as `bool is_open(const tickertape::Writer &)` in a shared header is a different function in each
+  mode: defining it in a `-fno-exceptions` unit and calling it from an exceptions unit is a link error (undefined
+  reference). That is the intended outcome: the alternative is one unit running the other's code in the wrong mode.
+  Across such a boundary pass C handles (`native_handle()`, used through the C API on the other side) or plain
+  data: `tickertape::NewRecord` is the C struct and is shared; sequence numbers, timestamps and payload bytes are
+  plain values.
+- **The debug-check mode is shared.** Debug and release units of one program commonly exchange the binding's types,
+  and only the check differs, so the types are the same in both modes (the debug check's fields exist in every
+  build; `[[maybe_unused]]` keeps Clang quiet when `NDEBUG` leaves them unread). Every inline function whose
+  behaviour depends on the debug-check mode is declared `TICKERTAPE_HPP_MODE_DEPENDENT`, which expands to
+  `__attribute__((abi_tag("tickertape_dbg")))` or `abi_tag("tickertape_nodbg")`, so each mode's copy is a different
+  symbol. This covers `result<T>::operator*`, `operator->`, `error()` and its private checked access,
+  `result<void>::error()`, `RecordView::data()` and `as_string_view()` (and the private check they call), `as_span`,
+  `RecordBatch::operator[]` and its iterator's `operator*`, and the internal `detail::debug_check`. The header's
+  other functions do not call them (they read a failed `result<void>` through an unchecked internal accessor), so
+  their single copy behaves the same in both debug-check modes.
+- **The C++ standard library must agree.** Units that exchange binding types (in the same exception mode) must use
+  the same standard library with the same settings that affect its layout (for example `_GLIBCXX_USE_CXX11_ABI`, or
+  libstdc++'s and libc++'s debug modes), as for any C++ library whose types contain `std::string`, `std::vector` or
+  `std::optional`.
 - **Not covered:** behaviour follows the code that acts on a value, not the code that made it (`value()` in a
   no-exceptions unit aborts, whichever unit produced the result); a fill passed to `append_with` from a
-  no-exceptions unit must not throw (nothing there catches it); your own inline functions that call mode-dependent
-  ones are yours to keep consistent; and compilers without `abi_tag` (MSVC) get no tag, so there one mode per
-  program is required and mixing is undefined behaviour.
-- **Enforced** by a source check in `tests/c_api.rs` (it fails if a function whose body mentions a mode macro, or
-  calls a tagged function by name, lacks the tag; calls through operators are not seen, so the operators are tagged
-  by hand), and by a link test that compiles units in each mode and links them into one program in both orders, at
-  -O0 and -O2, asserting each unit's behaviour (no-exceptions with exceptions; debug checks with none). Without the
-  tags it fails in every pair.
+  no-exceptions unit must not throw (nothing there catches it); your own inline functions that call debug-checked
+  ones are yours to keep consistent; and MSVC is out of scope (it has no `abi_tag`): there, build the whole program
+  in one mode.
+- **Enforced** by a source check in `tests/c_api.rs` (it fails if anything in `namespace tickertape` is outside the
+  mode-specific inline namespace, if a function whose body mentions a debug-check macro or calls a tagged function by
+  name lacks the tag, or if a tagged function has no such reason; calls through operators are not seen, so those
+  operators are tagged by hand), by `tests/cpp/layout.cpp` (the namespace name in each mode of the compile matrix),
+  and by link tests: units built in each mode are linked into one program in both orders, at -O0 and -O2, asserting
+  each unit's behaviour (no-exceptions with exceptions, including a `std::bad_alloc` injected by a replaced
+  `operator new` at each allocation inside `list_segments` in turn, which must reach the exceptions unit's `catch`;
+  debug checks with none); and passing a `tickertape::Writer` from a no-exceptions unit to an exceptions unit must
+  fail to link, while the same two units built in one mode link. With the round-2 namespace removed, the
+  allocation case terminates with Clang in one link order at -O0 and -O2.
 
 **Errors: one surface returning `tickertape::result<T>`** (option 3). `result<T>` holds a `T` or a
 `tickertape::Error`; it is `[[nodiscard]]`, so a discarded result is a compiler warning (an ignored error is never
@@ -106,7 +132,24 @@ with exceptions disabled it prints the error and calls `std::abort`. `operator*`
 debug builds. On an rvalue result, `value()`, `*` and `error()` return by value (one move) rather than a
 reference, unlike `std::optional` and `std::expected`: GCC's `-Wdangling-reference` caught
 `for (auto &s : list_segments(dir).value())` referring into a destroyed temporary in our own compile test, and the
-move costs nothing next to a call into the library. The header defines its own type rather than using
+move costs nothing next to a call into the library. These rules are fixed for 1.0:
+
+- **`T` must be nothrow move-constructible** (`static_assert`): `std::variant` becomes valueless when a move throws
+  during assignment, after which `value()` and `error()` would dereference null. Every `T` the binding returns
+  qualifies, and so does `Error`.
+- `result(const T &)` exists only for a copyable `T`, so `std::is_constructible_v<result<Writer>, const Writer &>`
+  is false instead of true-and-then-a-hard-error. The converting constructors `result(T &&)`, `result(Error)` and
+  `result<void>(Error)` are `noexcept` (`result(const T &)` is `noexcept` when `T`'s copy is).
+- **A const rvalue result** (`std::move(const_result).value()`, a function returning `const result<T>`) hands out
+  copies from `value()`, `*` and `error()`, and its `value()` and `*` are deleted when `T` cannot be copied
+  (`result<Writer>`), so it never lends a reference into a temporary.
+- **`Error::message()` is ref-qualified**: on an lvalue it returns `const std::string &`; on an rvalue it returns the
+  string by value, so `const auto &m = writer.checkpoint().error().message();` binds to a string that lives as long
+  as `m`. `name()` returns a `std::string_view` of static storage and the other accessors return values, so nothing
+  else lends a reference.
+- **`tickertape::Exception` is nothrow-copyable**, as every standard exception is (copying one during exception
+  handling must not throw, or the program terminates): it holds its `Error` through a `std::shared_ptr<const Error>`
+  created once in its constructor, so copies share it. This is a layout change, made before 1.0 for that reason. The header defines its own type rather than using
 `std::expected`, so that its types are the same at every language level. Apart from `std::bad_alloc` (an error copies
 its message; `list_segments` returns a vector), the binding never throws, except from `value()` and from
 `Writer::append_with`, which rethrows what the user's fill threw (below).
@@ -137,14 +180,22 @@ its message; `list_segments` returns a vector), the binding never throws, except
 | C++ | C |
 |---|---|
 | `Writer::open(dir[, options])`, `append` (pointer and size, or any byte range), `append_with`, `append_batch` (array or range of `NewRecord`, returns `BatchAppend`), `checkpoint`, `next_seq`, `last_retention_error`, `close`, destructor | `tickertape_writer_*` |
-| `Reader::open`, `Reader::open_mapped_unsafe`, `seek`, `next(Timeout)`, `next_copy`, `read_batch(RecordBatch&)`, `position`, `close`, destructor | `tickertape_reader_*` |
+| `Reader::open`, `Reader::open_mapped_unsafe`, `seek`, `next(Timeout)`, `next_copy` (untyped memory or a writable byte range), `read_batch(RecordBatch&)`, `position`, `close`, destructor | `tickertape_reader_*` |
 | `WriterOptions`, `ReaderOptions` (including `durable_only`), `Retention` | the option builders |
 | `verify`, `list_segments`, `read_checkpoint`, `apply_retention`, `plan_retention` | inspection and `tickertape_retention_apply` (`dry_run`) |
 | `library_abi_version`, `library_version_number`, `library_version`, `library_compatible`, `check_library`, `realtime_ns`, `status_name`, `corrupt_reason_name` | version and helper functions |
 | `Error` | `tickertape_last_error_message`, `_os_code`, `_corrupt_reason` |
 
-Paths are a `PathArg`: a `const char *`, `std::string`, `std::string_view` (copied for the NUL terminator; opening is
-not a hot path) or `std::filesystem::path`, without overload ambiguity. The inspection results are C++ structs with
+**Paths** are passed directly as the argument: a `const char *`, `std::string`, `std::string_view` (copied for the NUL
+terminator; opening is not a hot path) or `std::filesystem::path`, without overload ambiguity. The parameter type
+that accepts them, `detail::PathArg`, keeps a pointer into a `std::string` or `std::filesystem::path` argument,
+which is safe because a temporary argument lives until the call returns, but would dangle in a variable
+(`PathArg p = std::filesystem::path(root) / "journal";` points into a path destroyed at the end of the statement).
+Rather than refuse rvalues (which would also refuse `Writer::open(dir / "journal")`, the commonest form) or copy every
+path, the type is **not part of the API**: it lives in `tickertape::detail`, `tickertape::PathArg` does not exist
+(a compile-fail test), and the documented way to pass a path is the path itself. A function of yours that forwards a
+path takes a path type (`const std::filesystem::path &`, `const char *`), not the binding's parameter type. The
+inspection results are C++ structs with
 `std::optional` where the C struct has "valid only if" fields; `list_segments` returns a `std::vector` (it allocates,
 and retries if the list grows between its two calls). `apply_retention` and `plan_retention` replace the `dry_run`
 flag with two names.
@@ -163,30 +214,47 @@ names is a named `Status`), and `-Wswitch` makes a new enumerator break the test
 
 **Ownership and lifetimes.**
 
-- `Writer`, `Reader`, the three builders and `RecordBatch` are move-only owners of one C handle (or buffer) each. A
-  moved-from or default-constructed object is empty: destroying it or assigning to it is safe, and calls on it fail
-  with `invalid_argument` (the C ABI's answer to a NULL handle). `close()` reports the close's status; the
+- `Writer`, `Reader`, the three builders and `RecordBatch` are move-only owners of one C handle (or, for
+  `RecordBatch`, C++ buffers it allocates) each. A default-constructed `Writer` or `Reader` is empty; the builders
+  (`WriterOptions`, `ReaderOptions`, `Retention`) start with the library's defaults; `RecordBatch` has no default
+  constructor (it needs its capacities). A moved-from object is empty: destroying it or assigning to it is safe, and
+  calls on it fail with `invalid_argument` (the C ABI's answer to a NULL handle).
+- **The builders check the library before they allocate.** Each builder's constructor runs `check_library()` once,
+  before it creates its C handle. If the loaded library cannot be used with the header, it creates no handle and
+  records `unsupported_version` as its error, which the open (or retention) function that takes it returns; its
+  setters then call nothing. So a mismatched library is never given a call other than the version queries, even
+  through the builders (the stub test counts every other C call). `close()` reports the close's status; the
   destructor ignores it, as it must. `native_handle()` gives the C handle for code that calls C directly.
 - **`RecordView`** is what `Reader::next` returns. Its payload borrows the reader's memory and is valid until the next
   call on that reader other than `position()`, or until the reader is moved or destroyed (the C rule, plus moves,
   which the binding treats as invalidating). Views from a `RecordBatch` are valid until the next read into that batch;
-  views from `next_copy` point into the caller's buffer. The sequence number, schema id and timestamps are copies and
-  stay valid. **Debug check:** each reader and batch keeps a counter that every invalidating call and every move
+  views from `next_copy` point into the caller's buffer. The sequence number, schema id, timestamps, `size()` and
+  `empty()` are copies and stay valid; `data()`, `as_string_view()` and `as_span()` read the payload and are
+  checked. The check runs when the payload is fetched through the view: a pointer, `string_view` or `span` taken
+  from it earlier has no continuing check (it is a plain pointer). `as_span` fetches the pointer before it tests for an
+  empty payload, so a stale view of an empty record is caught too. **Debug check:** each reader and batch keeps a counter that every invalidating call and every move
   bumps; a view remembers the counter's address and value, and reading its payload after the counter moved calls
   `std::abort` with a message. This costs one increment per call and 16 bytes per view, in every build, so that the
   layout does not depend on the setting (see **Mixing modes**); the comparison runs when `TICKERTAPE_DEBUG_CHECKS` is 1 (the default
   unless `NDEBUG`). A view whose reader was destroyed is not detected (the counter is gone).
-- **Records.** `NewRecord` (for `append_batch`) does not copy its payload. It is standard-layout with the size and
-  alignment of `tickertape_new_record` (asserted), so an array of them is passed to the C ABI without copying.
-  Because it keeps a pointer, **a byte range that is an rvalue is accepted only if its type is a specialisation of
-  `std::basic_string_view` or `std::span`**; for any other range type the rvalue constructor is deleted, so
-  `batch.emplace_back(1, 0, 0, std::to_string(i) + "...")` (which used to store a pointer into a string destroyed at
-  the end of the statement, a heap use-after-free with no warning) does not compile. Lvalues of any byte range are
-  accepted, as are pointer-and-size pairs. An allowlist of view types rather than a rule such as "trivially
-  copyable": a trivially copyable type can own its bytes inline (`std::array`, a user's fixed buffer), and a rule
-  that lets one of those through would bring the dangling pointer back. A user's own view type is passed by name
-  (an lvalue) or as pointer and size. `Writer::append` copies the payload before it returns, so it takes
-  temporaries.
+- **Records.** `NewRecord` (for `append_batch`) **is `tickertape_new_record`**, an alias rather than a wrapper.
+  `append_batch` passes a pointer to its records to the C ABI, which indexes it as an array of `tickertape_new_record`;
+  an array of wrapper objects is not an array of their members, whatever their size and alignment (it works with
+  today's compilers, but the language does not promise it), so the element type must be the C type itself. The
+  fields are public (`payload`, `payload_len`, `venue_ts_ns`, `local_ts_ns`, `schema_id`; `reserved` must be 0), a
+  value-initialised record is empty, and it is plain data shared by both exception modes. The checked construction
+  moves into factory functions: `tickertape::new_record(schema_id, venue_ts_ns, local_ts_ns, bytes)` and
+  `new_record(schema_id, venue_ts_ns, local_ts_ns, data, size)`, so `batch.push_back(new_record(...))` and a
+  `std::array` or `std::vector` of records stay allocation-free and go to the C ABI as they are. A record keeps a
+  pointer, not a copy, so **`new_record` accepts an rvalue byte range only if its type is a view**: a specialisation
+  of `std::basic_string_view` or `std::span`, or, in C++20, any type for which `std::ranges::enable_borrowed_range` is
+  true (a user's own view type opts in by specialising it); for any other range type the rvalue overload is deleted,
+  so `new_record(1, 0, 0, std::to_string(i) + "...")` (a pointer into a string destroyed at the end of the statement)
+  and rvalues of `std::array`, `std::vector` and `std::string` do not compile. Lvalues of any byte range are
+  accepted, as are pointer-and-size pairs. A list of view types rather than a rule such as "trivially copyable": a
+  trivially copyable type can own its bytes inline (`std::array`, a user's fixed buffer), and a rule that let one of
+  those through would bring the dangling pointer back. `Writer::append` copies the payload before it returns, so it
+  takes temporaries. A record built by hand (its fields set directly) is not checked: it is the C struct.
 - **No hidden allocation on the append and read path**: `append`, `append_with`, `append_batch`, `next_seq`, `next`,
   `next_copy`, `read_batch` and `position` allocate nothing in the binding when they succeed. `RecordBatch` allocates
   its storage once, in its constructor. `tests/cpp/test_no_alloc.cpp` checks this by replacing `operator new` and
@@ -197,7 +265,9 @@ names is a named `Status`), and `-Wswitch` makes a new enumerator break the test
 exceptions). The C callback is a `noexcept` trampoline that catches every exception, stores it and returns non-zero,
 so no exception ever reaches the C ABI. After the call:
 
-- a clean abort after a throw rethrows the user's exception unchanged; after `false` it returns `aborted`;
+- a clean abort after a throw rethrows the user's exception unchanged; after `false` it returns `aborted`. The
+  rethrow happens before anything that allocates (the binding tests the C status, not an `Error` built from it), so a
+  failed allocation cannot replace the user's exception with `std::bad_alloc`;
 - if the clean-up after the abort failed (`Writer::abandoned_write_error` in the core; the C call returns
   `TICKERTAPE_E_IO` instead of `TICKERTAPE_E_ABORTED`), a throw becomes `std::throw_with_nested(Exception(io
   error))`, so the caller gets both the library error (the writer has stopped) and its own exception
@@ -214,7 +284,10 @@ nothing. Each case is tested with the real library (lock released, record presen
 and Valgrind).
 
 **Timeouts** are a `Timeout`: `no_wait` (the default), any `std::chrono::duration`, or `wait_forever`. Durations are
-rounded up to whole nanoseconds and saturate at `INT64_MAX` nanoseconds. **A zero or negative duration does not
+rounded up to whole nanoseconds and saturate at `INT64_MAX` nanoseconds; the unsigned conversion for retention ages
+and back-off sleeps saturates at `UINT64_MAX`. Integral counts are converted exactly (in integer arithmetic, so
+`std::chrono::nanoseconds{9'200'000'000'000'000'000}` stays that value); floating-point counts are compared with the
+first value the target cannot hold (2^63 or 2^64) before the cast. **A zero or negative duration does not
 wait.** This deliberately differs from the C ABI, where a negative timeout waits forever: in C++ a negative duration
 is usually a deadline that has passed, and waiting forever for it would be a bug that is hard to see. Waiting forever
 needs the explicit `wait_forever`.
@@ -237,16 +310,40 @@ message); `check_library()` runs the same check. The C++ surface follows the rel
 no public declaration is removed or changes meaning within a major version, and additions are new functions, new
 member functions, new types, new enumerators and new optional parameters.
 
+**One release of the C++ header per program.** Every translation unit of a program that includes `tickertape.hpp`
+must use the same release of it. Mixing releases is a one-definition-rule violation, as with any header-only
+library: the inline functions are emitted in every unit and the linker keeps one copy, and their behaviour depends on
+the release (`library_compatible()` and `check_library()` carry the header's version constants; `verify()` and
+retention pass the `sizeof` of C structs that grow in minor releases), so with mixed releases a 1.1 caller could run
+a 1.0 copy and accept a 1.0 library. The round-1 text promised that components built against different minor
+releases could be linked together because layouts are frozen; that cannot hold for inline functions and is
+withdrawn. A newer C library with an older C++ header remains supported, by the rule above. The mismatch is not
+detected at link time: an inline variable whose name carries the release would let two releases coexist silently,
+and a deliberately conflicting strong symbol would detect it but break legitimate uses (a header-only library
+included in several shared objects), so it is documented, not enforced.
+
 **No data member is added to an existing class within a major version** (`Error`, `Writer`, `RecordView`,
-`VerifyReport` and every other class), and none is removed or reordered: two components built against different
-minor versions of the header would otherwise have different definitions of one type in one program. A report that
-needs more information gets a new type or a new function. The classes live in an inline namespace named after
-their layout version, `tickertape::v1` (written as `tickertape::Writer`); a later major version that changes a
-layout moves to `tickertape::v2`, so components built against both can be linked into one program. (Before 1.0 the
-layout can still change within `v1`; the exact-version check forbids mixing those releases.)
-`tests/cpp/layout.cpp` pins the size and alignment of every public class against a mirror of its members, in every
-compiler, language level and mode of the compile matrix, and a test fails if a public class is missing from it. A test checks that the header's version macros match the
-crate version, so a release cannot ship a stale header; the release checklist says to bump them.
+`VerifyReport` and every other class), and none is removed or reordered. This no longer serves mixing releases; it
+keeps rebuilds safe: rebuilding against a newer minor release never changes the size or alignment of your own types
+that contain the binding's, so your own ABI does not change with a minor upgrade. A report that needs more
+information gets a new type or a new function. The inline namespace's name carries the major version (and the
+exception mode, above); a later major version that changes a layout moves to `tickertape::v2`. (Before 1.0 the
+layout can still change within `v1`; round 2 changed `Exception` and `NewRecord`.) `tests/cpp/layout.cpp` pins the
+size and alignment of every public class against a mirror of its members, in every compiler, language level and
+mode of the compile matrix, and a test fails if a public class is missing from it. A test checks that the header's
+version macros match the crate version, so a release cannot ship a stale header; the release checklist says to bump
+them.
+
+**The header's internal macros are undefined at its end** (`TICKERTAPE_HPP_MODE_DEPENDENT`, the tag and namespace
+helpers, `TICKERTAPE_HPP_EXCEPTIONS`), so they do not leak into the includer's code; the public macros stay
+(`TICKERTAPE_HPP_VERSION_*`, `TICKERTAPE_HPP_ABI_VERSION`, `TICKERTAPE_DEBUG_CHECKS`). The compile matrix checks both.
+
+**Static linking with the GCC driver on macOS** does not work for aborted fills: the GCC driver (Homebrew GCC) passes
+`-no_compact_unwind` to the linker, and the library aborts an append whose fill returns non-zero by unwinding
+internally, so with `libtickertape.a` linked that way the process ends inside the library. Apple's toolchain
+defaults and the shared library work. `docs/c-api.md` and `docs/cpp-api.md` say so, and the C++20 test program
+(the statically linked one) is skipped in that configuration with that reason. A change to the C library so that an
+ordinary abort does not unwind is a separate follow-up.
 
 ## Consequences
 
@@ -260,9 +357,15 @@ crate version, so a release cannot ship a stale header; the release checklist sa
   fixtures (C++ writes, Rust, Python and C read; Rust and C write, C++ reads), the C++ example (record, follow live,
   replay), a compile-only matrix (`compile_all.cpp` and `layout.cpp` as C++17, C++20 and C++23, with and without
   exceptions, with and without `NDEBUG`, with every C++ compiler found: GCC and Clang on Linux, Apple Clang on
-  macOS, under `-Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror`), the mixed-mode link test and the mode-tag
-  source check (**Mixing modes**), compile-fail and compile-pass programs for `NewRecord` (**Records**), and the
-  coverage, struct-field, layout, enumerator and version checks above. CI also builds the examples with make,
+  macOS, under `-Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror`, with `static_assert`s for the API's
+  compile-time properties), the mixed-mode link tests and the mode-tag source check (**Mixing modes**),
+  compile-fail and compile-pass programs (`new_record` and temporaries, a payload with a throwing move, a const
+  rvalue `result<Writer>`, `tickertape::PathArg`), and the coverage, struct-field, layout, enumerator and version
+  checks above. `test_no_alloc.cpp` replaces every form of `operator new` (plain, array, aligned, `nothrow`) and
+  first checks that a deliberate allocation of each kind is counted; under Valgrind it runs with
+  `--soname-synonyms=somalloc=nouserintercepts`, without which Valgrind replaces the test's operators and nothing is
+  counted (the positive control then fails), and the stub and link tests that inject allocation failures run the
+  same way. CI also builds the examples with make,
   with CMake through `find_package`, and through `add_subdirectory`.
 - The C header's C++11 promise (ADR 0028) is now tested by a small program of its own, since the example wrapper
   that used to cover it is gone.
