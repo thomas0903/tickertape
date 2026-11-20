@@ -436,7 +436,8 @@ def c_build_command(version, target):
 
 def native_static_libs(output):
     """The system libraries a static link needs, from rustc's `native-static-libs` note."""
-    match = re.search(r"native-static-libs: ([^\n]*)", output)
+    # With CARGO_TERM_COLOR=always (as in CI) the note ends in a colour reset: remove terminal escapes first.
+    match = re.search(r"native-static-libs: ([^\n]*)", re.sub(r"\x1b\[[0-9;]*m", "", output))
     if match is None or not match.group(1).strip():
         raise ValueError("rustc printed no native-static-libs note; was the library rebuilt?")
     return match.group(1).strip()

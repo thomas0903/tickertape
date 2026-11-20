@@ -297,6 +297,8 @@ class CLibraryTests(unittest.TestCase):
     def test_native_static_libs_come_from_rustcs_note(self):
         output = "   Compiling tickertape-ffi\nnote: native-static-libs: -lgcc_s -lutil -lc\n\n    Finished\n"
         self.assertEqual(release.native_static_libs(output), "-lgcc_s -lutil -lc")
+        coloured = "note: native-static-libs: -lSystem -lc -lm\x1b[0m\n\x1b[1m\x1b[92m    Finished\x1b[0m\n"
+        self.assertEqual(release.native_static_libs(coloured), "-lSystem -lc -lm")
         with self.assertRaisesRegex(ValueError, "native-static-libs"):
             release.native_static_libs("    Finished `release` profile\n")
 
