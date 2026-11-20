@@ -577,6 +577,7 @@ fn seek_races_retention() {
             Err(Error::SeqUnavailable {
                 requested: 2,
                 first: 4,
+                ..
             }) => {}
             other => panic!("mapped {mapped}: {other:?}"),
         }
@@ -604,7 +605,7 @@ fn seal_races_retention() {
         let path = dir.path().to_path_buf();
         at(Point::ReaderSeal, 0, move || retain(&path, 4));
         match reader.next_owned() {
-            Err(Error::Discarded { seq: 1 }) => {}
+            Err(Error::Discarded { seq: 1, .. }) => {}
             other => panic!("mapped {mapped}: {other:?}"),
         }
         assert!(matches!(
@@ -618,7 +619,7 @@ fn seal_races_retention() {
         at(Point::ReaderSeal, 0, move || retain(&path, 3));
         assert!(matches!(
             reader.next_owned(),
-            Err(Error::Discarded { seq: 3 })
+            Err(Error::Discarded { seq: 3, .. })
         ));
     }
 }

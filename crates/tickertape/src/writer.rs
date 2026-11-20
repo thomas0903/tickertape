@@ -2312,6 +2312,7 @@ pub enum RecoveryAction {
     /// they are preserved as for any evidence, with
     /// [`CorruptReason::EmptyCommitWord`](crate::CorruptReason::EmptyCommitWord) or
     /// [`CorruptReason::UncheckedTail`](crate::CorruptReason::UncheckedTail) (C11 (2)).
+    #[non_exhaustive]
     ZeroedUncommitted {
         /// The segment.
         segment: PathBuf,
@@ -2330,6 +2331,7 @@ pub enum RecoveryAction {
     /// when the search finds no evidence after it ([`CorruptReason::BrokenChain`](crate::CorruptReason::BrokenChain);
     /// `docs/crash-contract.md`, C11 (3)). What followed `offset` leaves the segment; the quarantine file keeps its
     /// bytes up to the last non-zero one.
+    #[non_exhaustive]
     RepairedTail {
         /// The segment.
         segment: PathBuf,
@@ -2343,6 +2345,7 @@ pub enum RecoveryAction {
         reason: crate::CorruptReason,
     },
     /// A segment with an invalid header, or one disconnected from the valid chain, was moved to `quarantine`.
+    #[non_exhaustive]
     QuarantinedSegment {
         /// Where the segment was.
         segment: PathBuf,
@@ -2352,11 +2355,13 @@ pub enum RecoveryAction {
         reason: crate::CorruptReason,
     },
     /// The previous segment was missing its seal (crash during a roll) and was sealed.
+    #[non_exhaustive]
     Sealed {
         /// The segment that was sealed.
         segment: PathBuf,
     },
     /// The newest segment was sealed but its successor was missing; the successor was created.
+    #[non_exhaustive]
     CompletedRoll {
         /// The new segment.
         segment: PathBuf,
@@ -2367,11 +2372,13 @@ pub enum RecoveryAction {
     /// written again (base from the name, size from the file, creation time at recovery) and synced; a segment
     /// holding only zeros whose length was not a valid segment size was replaced by a new empty segment instead.
     /// The scan then continued into it as into any segment.
+    #[non_exhaustive]
     RestoredHeader {
         /// The segment.
         segment: PathBuf,
     },
     /// A stale `*.tape.tmp` file from an interrupted roll was removed.
+    #[non_exhaustive]
     RemovedTemp {
         /// The removed file.
         file: PathBuf,

@@ -159,15 +159,15 @@ class UsedAfterForkError(TickertapeError):
 
 
 class BatchAppendError(TickertapeError):
-    """``Writer.append_many`` failed part-way.
+    """``Writer.append_batch`` failed part-way.
 
     Records ``payloads[:appended]`` were appended (sequence numbers ``first_seq`` to ``first_seq + appended - 1``,
     visible but not yet durable); ``payloads[failed_index:]`` were not. The error that stopped the batch is
     ``__cause__``.
 
-    To retry once the cause is resolved, call ``append_many`` again with ``payloads[failed_index:]`` and every
+    To retry once the cause is resolved, call ``append_batch`` again with ``payloads[failed_index:]`` and every
     per-record metadata sequence sliced the same way (``schema_id=schema_ids[failed_index:]``, ...); a single int
-    metadata value needs no slicing. ``append_many`` consumes its arguments, so a caller who may retry must pass
+    metadata value needs no slicing. ``append_batch`` consumes its arguments, so a caller who may retry must pass
     sequences it can slice (lists, tuples, arrays), not one-shot iterators or generators. Converting the arguments and
     checking the column lengths happens before anything is appended, but an append can still fail part-way, for
     example with :class:`RecordTooLargeError` for a payload that does not fit in a segment or

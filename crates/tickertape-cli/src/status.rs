@@ -1418,9 +1418,10 @@ mod tests {
         let journal = fs::canonicalize(dir.path()).unwrap();
         let sample = Sampler::new(&journal).sample().unwrap();
         let breaches = sample.breaches(&Thresholds::default());
-        let failed = tickertape::Error::NotFound {
-            dir: journal.clone(),
-        };
+        let failed = tickertape::samples::errors()
+            .into_iter()
+            .find(|e| matches!(e, tickertape::Error::NotFound { .. }))
+            .unwrap();
         let mut outputs = Vec::new();
         let mut text = String::new();
         render_text(&mut text, &journal, &sample, &breaches);

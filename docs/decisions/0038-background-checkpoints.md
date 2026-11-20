@@ -1,7 +1,8 @@
 # 0038: A checkpoint that does not stop appends
 
-- **Status:** proposed (the design is complete after the owner's Linux measurement; see "After the Linux
-  measurement")
+- **Status:** accepted on 2026-11-20 by the maintainers under the owner's delegation. Its Linux measurement is in the
+  comments of pull request #28; the recorded results will go to `docs/benchmarks.md` with the sustained session (see
+  "After the Linux measurement")
 - **Date:** 2026-11-20
 
 ## Context

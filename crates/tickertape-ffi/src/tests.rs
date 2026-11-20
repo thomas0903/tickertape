@@ -196,6 +196,15 @@ fn pure_status_and_reason_names() {
 }
 
 /// Variant names of `pub enum <name>` in the core crate's `error.rs`.
+/// The variant name of a value, from its derived `Debug` output.
+fn variant_name<T: std::fmt::Debug>(value: &T) -> String {
+    format!("{value:?}")
+        .split(|c: char| !c.is_alphanumeric())
+        .next()
+        .unwrap()
+        .to_string()
+}
+
 fn core_variants(name: &str) -> BTreeSet<String> {
     let source = include_str!("../../tickertape/src/error.rs");
     let start = source
@@ -225,92 +234,55 @@ fn core_variants(name: &str) -> BTreeSet<String> {
 #[test]
 fn pure_every_error_variant_has_a_code() {
     let path = PathBuf::from("/j");
-    let io = |kind_or_errno: Option<i32>| match kind_or_errno {
-        Some(errno) => io::Error::from_raw_os_error(errno),
-        None => io::Error::other("x"),
-    };
-    // One sample per variant; adding a variant to the core without a row here fails the name check below, and a
-    // row whose variant maps to TICKERTAPE_E_UNKNOWN fails the code check.
-    let samples: Vec<(&str, Error, tickertape_status_code)> = vec![
-        (
-            "Io",
-            Error::Io {
-                op: "op",
-                path: path.clone(),
-                source: io(Some(libc_eio())),
-            },
-            tickertape_status_code::TICKERTAPE_E_IO,
-        ),
-        (
-            "Locked",
-            Error::Locked {
-                dir: path.clone(),
-                pid: None,
-            },
-            tickertape_status_code::TICKERTAPE_E_LOCKED,
-        ),
-        (
-            "Corrupt",
-            Error::Corrupt {
-                path: path.clone(),
-                offset: 64,
-                reason: CorruptReason::BadChecksum,
-            },
-            tickertape_status_code::TICKERTAPE_E_CORRUPT,
-        ),
+    let io = |errno: i32| io::Error::from_raw_os_error(errno);
+    // One sample per variant (the core's `samples::errors`, in declaration order) and its code; adding a variant to
+    // the core without a row here fails the name check below, and a row whose variant maps to TICKERTAPE_E_UNKNOWN
+    // fails the code check.
+    let codes = [
+        ("Io", tickertape_status_code::TICKERTAPE_E_IO),
+        ("Locked", tickertape_status_code::TICKERTAPE_E_LOCKED),
+        ("Corrupt", tickertape_status_code::TICKERTAPE_E_CORRUPT),
         (
             "UnsupportedVersion",
-            Error::UnsupportedVersion {
-                path: path.clone(),
-                found: 2,
-                supported: 1,
-            },
             tickertape_status_code::TICKERTAPE_E_UNSUPPORTED_VERSION,
         ),
-        (
-            "NotFound",
-            Error::NotFound { dir: path.clone() },
-            tickertape_status_code::TICKERTAPE_E_NOT_FOUND,
-        ),
+        ("NotFound", tickertape_status_code::TICKERTAPE_E_NOT_FOUND),
         (
             "SeqUnavailable",
-            Error::SeqUnavailable {
-                requested: 1,
-                first: 5,
-            },
             tickertape_status_code::TICKERTAPE_E_SEQ_UNAVAILABLE,
         ),
         (
             "RecordTooLarge",
-            Error::RecordTooLarge { len: 10, max: 5 },
             tickertape_status_code::TICKERTAPE_E_RECORD_TOO_LARGE,
         ),
         (
             "DurabilityLost",
-            Error::DurabilityLost,
             tickertape_status_code::TICKERTAPE_E_DURABILITY_LOST,
         ),
         (
             "SequenceExhausted",
-            Error::SequenceExhausted,
             tickertape_status_code::TICKERTAPE_E_SEQUENCE_EXHAUSTED,
         ),
-        (
-            "Discarded",
-            Error::Discarded { seq: 3 },
-            tickertape_status_code::TICKERTAPE_E_DISCARDED,
-        ),
+        ("Discarded", tickertape_status_code::TICKERTAPE_E_DISCARDED),
         (
             "InvalidConfig",
-            Error::InvalidConfig("x".into()),
             tickertape_status_code::TICKERTAPE_E_INVALID_CONFIG,
         ),
         (
             "BeaconInUse",
-            Error::BeaconInUse { path: path.clone() },
             tickertape_status_code::TICKERTAPE_E_BEACON_IN_USE,
         ),
     ];
+    let errors = tickertape::samples::errors();
+    assert_eq!(errors.len(), codes.len());
+    let samples: Vec<(&str, Error, tickertape_status_code)> = errors
+        .into_iter()
+        .zip(codes)
+        .map(|(error, (name, code))| {
+            assert_eq!(variant_name(&error), name);
+            (name, error, code)
+        })
+        .collect();
     let names: BTreeSet<String> = samples.iter().map(|(n, _, _)| n.to_string()).collect();
     assert_eq!(
         names,
@@ -326,11 +298,7 @@ fn pure_every_error_variant_has_a_code() {
     }
     // The storage-full refinement of Io, and the details recorded with each error.
     for errno in [libc_enospc(), libc_edquot()] {
-        let full = Error::Io {
-            op: "op",
-            path: path.clone(),
-            source: io(Some(errno)),
-        };
+        let full = Error::io("op", path.clone(), io(errno));
         assert_eq!(
             status_of(&full),
             tickertape_status_code::TICKERTAPE_E_STORAGE_FULL
@@ -340,7 +308,7 @@ fn pure_every_error_variant_has_a_code() {
     assert_eq!(status, code(tickertape_status_code::TICKERTAPE_E_IO));
     assert_eq!(tickertape_last_error_code(), status);
     assert_eq!(tickertape_last_error_os_code(), libc_eio());
-    assert!(last_message().contains("/j"), "{}", last_message());
+    assert!(last_message().contains("/j/"), "{}", last_message());
     let status = guard(|| Err(FfiError::from(&samples[2].1)));
     assert_eq!(status, code(tickertape_status_code::TICKERTAPE_E_CORRUPT));
     assert_eq!(tickertape_last_error_os_code(), 0);
@@ -348,98 +316,44 @@ fn pure_every_error_variant_has_a_code() {
         tickertape_last_error_corrupt_reason(),
         tickertape_corrupt_reason::TICKERTAPE_CORRUPT_BAD_CHECKSUM as i32
     );
-    let _ = io(None);
 }
 
 #[test]
 fn pure_every_corrupt_reason_has_a_code() {
     use tickertape_corrupt_reason as R;
-    let samples: Vec<(&str, CorruptReason, R)> = vec![
-        (
-            "BadMagic",
-            CorruptReason::BadMagic,
-            R::TICKERTAPE_CORRUPT_BAD_MAGIC,
-        ),
-        (
-            "BadSegmentHeader",
-            CorruptReason::BadSegmentHeader("x"),
-            R::TICKERTAPE_CORRUPT_BAD_SEGMENT_HEADER,
-        ),
-        (
-            "SizeMismatch",
-            CorruptReason::SizeMismatch {
-                expected: 1,
-                actual: 2,
-            },
-            R::TICKERTAPE_CORRUPT_SIZE_MISMATCH,
-        ),
-        (
-            "BaseSeqMismatch",
-            CorruptReason::BaseSeqMismatch {
-                from_name: 1,
-                from_header: 2,
-            },
-            R::TICKERTAPE_CORRUPT_BASE_SEQ_MISMATCH,
-        ),
-        (
-            "BadOffset",
-            CorruptReason::BadOffset(3),
-            R::TICKERTAPE_CORRUPT_BAD_OFFSET,
-        ),
+    let codes = [
+        ("BadMagic", R::TICKERTAPE_CORRUPT_BAD_MAGIC),
+        ("BadSegmentHeader", R::TICKERTAPE_CORRUPT_BAD_SEGMENT_HEADER),
+        ("SizeMismatch", R::TICKERTAPE_CORRUPT_SIZE_MISMATCH),
+        ("BaseSeqMismatch", R::TICKERTAPE_CORRUPT_BASE_SEQ_MISMATCH),
+        ("BadOffset", R::TICKERTAPE_CORRUPT_BAD_OFFSET),
         (
             "SequenceExhausted",
-            CorruptReason::SequenceExhausted,
             R::TICKERTAPE_CORRUPT_SEQUENCE_EXHAUSTED,
         ),
-        (
-            "BadLength",
-            CorruptReason::BadLength(3),
-            R::TICKERTAPE_CORRUPT_BAD_LENGTH,
-        ),
-        (
-            "BadChecksum",
-            CorruptReason::BadChecksum,
-            R::TICKERTAPE_CORRUPT_BAD_CHECKSUM,
-        ),
-        (
-            "BadSequence",
-            CorruptReason::BadSequence {
-                expected: 1,
-                found: 2,
-            },
-            R::TICKERTAPE_CORRUPT_BAD_SEQUENCE,
-        ),
-        (
-            "BadFlags",
-            CorruptReason::BadFlags,
-            R::TICKERTAPE_CORRUPT_BAD_FLAGS,
-        ),
-        (
-            "BadSeal",
-            CorruptReason::BadSeal,
-            R::TICKERTAPE_CORRUPT_BAD_SEAL,
-        ),
-        (
-            "BrokenChain",
-            CorruptReason::BrokenChain(4),
-            R::TICKERTAPE_CORRUPT_BROKEN_CHAIN,
-        ),
+        ("BadLength", R::TICKERTAPE_CORRUPT_BAD_LENGTH),
+        ("BadChecksum", R::TICKERTAPE_CORRUPT_BAD_CHECKSUM),
+        ("BadSequence", R::TICKERTAPE_CORRUPT_BAD_SEQUENCE),
+        ("BadFlags", R::TICKERTAPE_CORRUPT_BAD_FLAGS),
+        ("BadSeal", R::TICKERTAPE_CORRUPT_BAD_SEAL),
+        ("BrokenChain", R::TICKERTAPE_CORRUPT_BROKEN_CHAIN),
         (
             "DanglingCheckpoint",
-            CorruptReason::DanglingCheckpoint(4),
             R::TICKERTAPE_CORRUPT_DANGLING_CHECKPOINT,
         ),
-        (
-            "EmptyCommitWord",
-            CorruptReason::EmptyCommitWord(4),
-            R::TICKERTAPE_CORRUPT_EMPTY_COMMIT_WORD,
-        ),
-        (
-            "UncheckedTail",
-            CorruptReason::UncheckedTail(4),
-            R::TICKERTAPE_CORRUPT_UNCHECKED_TAIL,
-        ),
+        ("EmptyCommitWord", R::TICKERTAPE_CORRUPT_EMPTY_COMMIT_WORD),
+        ("UncheckedTail", R::TICKERTAPE_CORRUPT_UNCHECKED_TAIL),
     ];
+    let reasons = tickertape::samples::corrupt_reasons();
+    assert_eq!(reasons.len(), codes.len());
+    let samples: Vec<(&str, CorruptReason, R)> = reasons
+        .into_iter()
+        .zip(codes)
+        .map(|(reason, (name, code))| {
+            assert_eq!(variant_name(&reason), name);
+            (name, reason, code)
+        })
+        .collect();
     let names: BTreeSet<String> = samples.iter().map(|(n, _, _)| n.to_string()).collect();
     assert_eq!(
         names,
@@ -466,11 +380,7 @@ fn pure_every_corrupt_reason_has_a_code() {
             R::TICKERTAPE_CORRUPT_UNCHECKED_TAIL,
         ),
     ] {
-        let error = Error::Corrupt {
-            path: std::path::PathBuf::from("/j/00000000000000000000.tape"),
-            offset: 64,
-            reason,
-        };
+        let error = Error::corrupt("/j/00000000000000000000.tape", 64, reason);
         let status = guard(|| Err(FfiError::from(&error)));
         assert_eq!(status, code(tickertape_status_code::TICKERTAPE_E_CORRUPT));
         assert_eq!(tickertape_last_error_corrupt_reason(), expected as i32);

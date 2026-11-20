@@ -246,7 +246,7 @@ class PathsTest {
                 "--illegal-native-access=deny", "-Dtickertape.library.path=" + TestSupport.LIBRARY.toAbsolutePath(),
                 "--class-path", TestSupport.CLASSES.toAbsolutePath().toString(), program.toString()), deep, 120);
         assertEquals(0, r.exit(), "stdout:\n" + r.stdout() + "\nstderr:\n" + r.stderr());
-        assertEquals(List.of("cwd " + target, "payload 42", "records 1", "absolute JournalIoException", "deleted"),
+        assertEquals(List.of("cwd " + target, "payload 42", "records 1", "absolute JournalIOException", "deleted"),
                 TestSupport.lines(r.stdout()), r.stderr());
     }
 

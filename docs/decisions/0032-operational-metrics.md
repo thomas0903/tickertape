@@ -1,6 +1,6 @@
 # 0032: Operational metrics and reader beacons
 
-- **Status:** proposed
+- **Status:** accepted on 2026-11-20 by the maintainers under the owner's delegation
 - **Date:** 2026-11-19 (revised the same day after review rounds 1 and 2 of PR #8, and on 2026-11-20 after rounds 3 and 4;
   amended on 2026-11-20 with the C ABI and the bindings, section "Bindings")
 
@@ -349,7 +349,7 @@ new C symbols only, nothing on the append or per-record read paths.
 - **C++** (`tickertape.hpp`): `JournalStatus::sample` (move-only, values read once into `StatusReport` and
   `std::vector<BeaconStatus>`), `Writer::metrics`, `Reader::metrics(const JournalStatus &)`; unknown values are empty
   `std::optional`s, ages `std::chrono::nanoseconds`.
-- **Python** (core crate directly, ADR 0029): `tickertape.status(path, readers_dir=None)` returns a frozen
+- **Python** (core crate directly, ADR 0029): `JournalStatus.sample(path, readers_dir=None)` returns a frozen
   `JournalStatus` dataclass of named tuples; `Writer.metrics()`, `Reader.metrics(status)`. Unknown values are `None`,
   reasons the CLI's JSON codes, durations integer nanoseconds.
 - **Java** (FFM over the C ABI, ADR 0037): `JournalStatus.sample` (`AutoCloseable`, values copied at sample time,

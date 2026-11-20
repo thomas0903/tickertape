@@ -5,7 +5,7 @@ tickertape guarantees when things go wrong, on each supported platform, and whic
 guarantee without a passing test is marked **untested**, and nothing is claimed beyond what is written here.
 Rationale: ADRs [0004](decisions/0004-durability-levels.md), [0007](decisions/0007-checkpoint-marker-and-recovery.md),
 [0035](decisions/0035-recovery-preserves-a-committed-tail.md) and, for background checkpoints,
-[0038](decisions/0038-background-checkpoints.md) (proposed).
+[0038](decisions/0038-background-checkpoints.md).
 Byte-level details: [`format.md`](format.md).
 
 Supported: Linux (x86-64, aarch64) and macOS (aarch64), on a **local** filesystem (Linux: ext4, xfs, btrfs; macOS:

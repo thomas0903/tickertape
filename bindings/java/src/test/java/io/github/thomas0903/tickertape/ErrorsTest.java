@@ -26,11 +26,11 @@ class ErrorsTest {
 
     @Test
     void missingDirectoryIsIoWithEnoent() {
-        JournalIoException e = assertThrows(JournalIoException.class, () -> Reader.open(tmp.resolve("missing")));
+        JournalIOException e = assertThrows(JournalIOException.class, () -> Reader.open(tmp.resolve("missing")));
         assertEquals(Status.IO, e.status());
         assertEquals(ENOENT, e.osErrorCode());
         assertTrue(e.getMessage().contains("missing"), e.getMessage());
-        JournalIoException v = assertThrows(JournalIoException.class, () -> Journal.verify(tmp.resolve("missing")));
+        JournalIOException v = assertThrows(JournalIOException.class, () -> Journal.verify(tmp.resolve("missing")));
         assertEquals(ENOENT, v.osErrorCode());
     }
 
@@ -45,7 +45,7 @@ class ErrorsTest {
     void secondWriterIsLocked() {
         Path dir = tmp.resolve("j");
         try (Writer w = Writer.open(dir, TestSupport.small())) {
-            JournalLockedException e = assertThrows(JournalLockedException.class,
+            LockedException e = assertThrows(LockedException.class,
                     () -> Writer.open(dir, TestSupport.small()));
             assertEquals(Status.LOCKED, e.status());
             assertEquals(0, w.nextSeq());
@@ -141,7 +141,7 @@ class ErrorsTest {
         List<SegmentInfo> segments = Journal.listSegments(dir);
         assertTrue(segments.get(0).baseSeq() > 0, "retention removed the oldest segments: " + segments);
         try (Reader r = Reader.open(dir)) {
-            SequenceUnavailableException e = assertThrows(SequenceUnavailableException.class, () -> r.seek(0));
+            SeqUnavailableException e = assertThrows(SeqUnavailableException.class, () -> r.seek(0));
             assertEquals(Status.SEQ_UNAVAILABLE, e.status());
             r.seek(segments.get(0).baseSeq());
             assertEquals(segments.get(0).baseSeq(), r.tryNext().seq());
@@ -161,7 +161,7 @@ class ErrorsTest {
             Files.writeString(archive.resolve(Journal.listSegments(dir).get(0).fileName()), "in the way");
             w.checkpoint();
             TickertapeException e = w.lastRetentionError().orElseThrow();
-            assertInstanceOf(JournalIoException.class, e);
+            assertInstanceOf(JournalIOException.class, e);
             assertEquals(Status.IO, e.status());
         }
     }
@@ -169,10 +169,10 @@ class ErrorsTest {
     @Test
     void theLastErrorDetailsComeFromTheFailingCall() {
         // Two different failures in a row on one thread: each exception carries its own details.
-        JournalIoException io = assertThrows(JournalIoException.class, () -> Reader.open(tmp.resolve("a")));
+        JournalIOException io = assertThrows(JournalIOException.class, () -> Reader.open(tmp.resolve("a")));
         Path dir = tmp.resolve("j");
         try (Writer w = Writer.open(dir, TestSupport.small())) {
-            JournalLockedException locked = assertThrows(JournalLockedException.class,
+            LockedException locked = assertThrows(LockedException.class,
                     () -> Writer.open(dir, TestSupport.small()));
             assertTrue(!locked.getMessage().equals(io.getMessage()));
             assertNull(locked.getCause());

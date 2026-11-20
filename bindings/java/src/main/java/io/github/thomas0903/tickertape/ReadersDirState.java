@@ -2,8 +2,8 @@ package io.github.thomas0903.tickertape;
 
 /**
  * Whether the beacon directory could be listed. Each value's {@link #cName()} is the C enumerator ({@code
- * TICKERTAPE_READERS_DIR_*}, ADR 0032). {@link #UNKNOWN} stands for a value from a newer library that this binding
- * does not name; it is not in the C header.
+ * TICKERTAPE_READERS_DIR_*}, ADR 0032). {@link #OTHER} is a state the C ABI does not name (a newer
+ * library); this binding reports a code it does not know as {@link #OTHER} too.
  */
 public enum ReadersDirState {
     /** Listed (possibly empty). */
@@ -12,8 +12,8 @@ public enum ReadersDirState {
     MISSING(1),
     /** It exists but could not be listed; no beacons are reported. */
     UNUSABLE(2),
-    /** A value from a newer library that this binding does not name. */
-    UNKNOWN(-1);
+    /** A state the C ABI does not name ({@code TICKERTAPE_READERS_DIR_OTHER}). */
+    OTHER(255);
 
     private final int code;
 
@@ -31,13 +31,13 @@ public enum ReadersDirState {
         return "TICKERTAPE_READERS_DIR_" + name();
     }
 
-    /** The value for a C code; {@link #UNKNOWN} for a code this binding does not name. */
+    /** The value for a C code; {@link #OTHER} for a code this binding does not name. */
     public static ReadersDirState of(int code) {
         for (ReadersDirState v : values()) {
             if (v.code == code) {
                 return v;
             }
         }
-        return UNKNOWN;
+        return OTHER;
     }
 }

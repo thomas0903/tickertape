@@ -247,6 +247,7 @@ fn tail_follows_live_writer() {
 fn inspect_and_verify_contracts() {
     let (dir, mut writer) = journal(10);
     let json: Value = serde_json::from_slice(&output(&["inspect", "--json"], &dir)).unwrap();
+    assert_eq!(json["schema_version"], 1);
     assert_eq!(json["totals"]["segments"], 4);
     assert_eq!(json["totals"]["records"], 10);
     assert_eq!(json["totals"]["first_seq"], 0);
@@ -280,6 +281,7 @@ fn inspect_and_verify_contracts() {
             "segments=4 records=10 first_seq=0 last_seq=9",
         ));
     let json: Value = serde_json::from_slice(&output(&["verify", "--json"], &dir)).unwrap();
+    assert_eq!(json["schema_version"], 1);
     assert_eq!(json["segments"], 4);
     assert_eq!(json["records"], 10);
     assert_eq!(json["problems"], serde_json::json!([]));
@@ -318,6 +320,7 @@ fn corruption_is_reported_and_export_preserves_prefix() {
             .assert()
             .code(2);
         let json: Value = serde_json::from_slice(&assertion.get_output().stdout).unwrap();
+        assert_eq!(json["schema_version"], 1);
         assert_eq!(json["problems"][0]["offset"], 20104);
         assert_eq!(json["problems"][0]["file"], "00000000000000000000.tape");
     }

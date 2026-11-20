@@ -1,6 +1,7 @@
 # 0029: Python bindings
 
-- **Status:** proposed (the distribution name and the PyPI publishing step need the owner's agreement)
+- **Status:** accepted on 2026-11-20 by the maintainers under the owner's delegation (the PyPI project name is
+  `tickertape`)
 - **Date:** 2026-11-19
 
 ## Context
@@ -49,10 +50,10 @@ install would then carry two readers with different semantics (a one-pass offlin
 copy could drift from the file users copy, and people who want the decoder want it because it needs no install.
 Docs present both (`docs/python.md`); the import names differ (`tickertape_reader` versus `tickertape`).
 
-**API.** `Writer(path, *, segment_size, recovery, notify, prefault, retention)` with `append`, `append_many`,
+**API.** `Writer(path, *, segment_size, recovery, notify, prefault, retention)` with `append`, `append_batch`,
 `checkpoint`, `next_seq`, `recovery_report`, `retention_report`, `last_retention_error` and `close`; `Reader(path, *,
 durable_only, notify, backoff)` with `seek`, `try_next`, `next(timeout=None)`, iteration, `read_many`, `read_batch`,
-`position` and `close`; `Backoff`, `Retention.delete(...)`/`Retention.archive(dir, ...)`; `verify`, `list_segments`
+`position` and `close`; `Backoff`, `Retention.delete(...)`/`Retention.move_to(dir, ...)`; `verify`, `list_segments`
 and `read_checkpoint` returning named tuples, and the writer's reports as named tuples too (`RecoveryReport` with a
 list of `RecoveryAction`, `RetentionReport`). Both classes are context managers; `close()` is idempotent; use after
 close raises `ValueError`, as for Python files. Closing a writer does **not** checkpoint, like the Rust `Drop` and like
@@ -68,7 +69,7 @@ protocol requires that). `next(reader)` is therefore a `TypeError`, which also a
 `reader.next()`, which waits. `RecordBatch` supports `len`, indexing and iteration; slicing raises `TypeError` (it may
 be added later without breaking callers).
 
-**Batches cross the boundary once.** `append_many(payloads, *, schema_id, venue_ts_ns, local_ts_ns)` takes an iterable
+**Batches cross the boundary once.** `append_batch(payloads, *, schema_id, venue_ts_ns, local_ts_ns)` takes an iterable
 of payloads and, for each metadata field, one int or a sequence of ints. Every argument is converted and checked
 before anything is appended (a bad argument appends nothing). It returns the `range` of assigned sequence numbers.
 `payloads` must not itself be a payload: `str` and every bytes-like object raise `TypeError`. A metadata iterable
@@ -102,7 +103,7 @@ writer modifies the files) cannot be checked from Python, a `SIGBUS` would kill 
 copied into `bytes` anyway, so it would save little.
 
 **GIL, threads and signals.** The GIL is released for `Writer` open (recovery), `checkpoint`, `close`, the append
-loop of `append_many`, the read loops of `read_many`/`read_batch`, `seek`, inspection, and every wait. A single
+loop of `append_batch`, the read loops of `read_many`/`read_batch`, `seek`, inspection, and every wait. A single
 `append` or `try_next` keeps the GIL (it is shorter than releasing it, except during a segment roll). `Writer` and
 `Reader` may be used from any thread: each holds its core object in a mutex, acquired without holding the GIL, so
 concurrent calls on one object serialize. The mutex is never held while Python code runs: exceptions, reports and

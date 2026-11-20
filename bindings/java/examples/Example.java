@@ -11,14 +11,14 @@
  * visible one. See bindings/java/README.md for the full commands.
  */
 
-import io.github.thomas0903.tickertape.DiscardedHistoryException;
+import io.github.thomas0903.tickertape.DiscardedException;
 import io.github.thomas0903.tickertape.Journal;
-import io.github.thomas0903.tickertape.JournalIoException;
+import io.github.thomas0903.tickertape.JournalIOException;
 import io.github.thomas0903.tickertape.JournalNotFoundException;
 import io.github.thomas0903.tickertape.Reader;
 import io.github.thomas0903.tickertape.ReaderOptions;
 import io.github.thomas0903.tickertape.RecordView;
-import io.github.thomas0903.tickertape.SequenceUnavailableException;
+import io.github.thomas0903.tickertape.SeqUnavailableException;
 import io.github.thomas0903.tickertape.Tickertape;
 import io.github.thomas0903.tickertape.Writer;
 import java.nio.charset.StandardCharsets;
@@ -95,11 +95,11 @@ public class Example {
                         print(r);
                         seen++;
                     }
-                } catch (DiscardedHistoryException e) {
+                } catch (DiscardedException e) {
                     // Recovery or retention replaced the segment at the position: continue on the current chain.
                     try {
                         reader.seek(reader.position());
-                    } catch (SequenceUnavailableException gone) {
+                    } catch (SeqUnavailableException gone) {
                         reader.seek(Journal.listSegments(dir).get(0).baseSeq());
                     }
                 }
@@ -114,7 +114,7 @@ public class Example {
                 return Reader.open(dir, options());
             } catch (JournalNotFoundException e) {
                 Thread.sleep(10);
-            } catch (JournalIoException e) {
+            } catch (JournalIOException e) {
                 if (e.osErrorCode() != ENOENT) {
                     throw e;
                 }

@@ -168,7 +168,9 @@ pub fn reason_fields(reason: &CorruptReason) -> (&'static str, Fields) {
             d.push(("what", Value::Str(what.to_string())));
             "bad_segment_header"
         }
-        CorruptReason::SizeMismatch { expected, actual } => {
+        CorruptReason::SizeMismatch {
+            expected, actual, ..
+        } => {
             d.push(("expected", expected.into()));
             d.push(("actual", actual.into()));
             "size_mismatch"
@@ -176,6 +178,7 @@ pub fn reason_fields(reason: &CorruptReason) -> (&'static str, Fields) {
         CorruptReason::BaseSeqMismatch {
             from_name,
             from_header,
+            ..
         } => {
             d.push(("from_name", from_name.into()));
             d.push(("from_header", from_header.into()));
@@ -191,7 +194,9 @@ pub fn reason_fields(reason: &CorruptReason) -> (&'static str, Fields) {
             "bad_length"
         }
         CorruptReason::BadChecksum => "bad_checksum",
-        CorruptReason::BadSequence { expected, found } => {
+        CorruptReason::BadSequence {
+            expected, found, ..
+        } => {
             d.push(("expected", expected.into()));
             d.push(("found", found.into()));
             "bad_sequence"
@@ -236,7 +241,9 @@ fn strerror(source: &std::io::Error) -> String {
 pub fn describe(err: &Error) -> ErrorSpec {
     let mut f: Fields = Vec::new();
     let class = match err {
-        Error::Io { op, path, source } => {
+        Error::Io {
+            op, path, source, ..
+        } => {
             f.push(("op", Value::Str((*op).to_string())));
             f.push(("filename", path.as_path().into()));
             f.push((
@@ -253,7 +260,7 @@ pub fn describe(err: &Error) -> ErrorSpec {
                 "JournalIOError"
             }
         }
-        Error::Locked { dir, pid } => {
+        Error::Locked { dir, pid, .. } => {
             f.push(("path", dir.as_path().into()));
             f.push(("pid", (*pid).into()));
             "LockedError"
@@ -262,6 +269,7 @@ pub fn describe(err: &Error) -> ErrorSpec {
             path,
             offset,
             reason,
+            ..
         } => {
             let (code, details) = reason_fields(reason);
             f.push(("path", path.as_path().into()));
@@ -274,34 +282,37 @@ pub fn describe(err: &Error) -> ErrorSpec {
             path,
             found,
             supported,
+            ..
         } => {
             f.push(("path", path.as_path().into()));
             f.push(("found", (*found).into()));
             f.push(("supported", (*supported).into()));
             "UnsupportedVersionError"
         }
-        Error::NotFound { dir } => {
+        Error::NotFound { dir, .. } => {
             f.push(("path", dir.as_path().into()));
             "JournalNotFoundError"
         }
-        Error::SeqUnavailable { requested, first } => {
+        Error::SeqUnavailable {
+            requested, first, ..
+        } => {
             f.push(("requested", (*requested).into()));
             f.push(("first", (*first).into()));
             "SeqUnavailableError"
         }
-        Error::RecordTooLarge { len, max } => {
+        Error::RecordTooLarge { len, max, .. } => {
             f.push(("length", (*len).into()));
             f.push(("max", (*max).into()));
             "RecordTooLargeError"
         }
         Error::DurabilityLost => "DurabilityLostError",
         Error::SequenceExhausted => "SequenceExhaustedError",
-        Error::Discarded { seq } => {
+        Error::Discarded { seq, .. } => {
             f.push(("seq", (*seq).into()));
             "DiscardedError"
         }
         Error::InvalidConfig(_) => "InvalidConfigError",
-        Error::BeaconInUse { path } => {
+        Error::BeaconInUse { path, .. } => {
             f.push(("path", path.as_path().into()));
             "TickertapeError"
         }
@@ -329,7 +340,7 @@ pub fn batch_append(
 ) -> PyErr {
     let cause_spec = describe(cause);
     let message = format!(
-        "append_many stopped at index {appended} after appending {appended} record(s): {}",
+        "append_batch stopped at index {appended} after appending {appended} record(s): {}",
         cause_spec.message
     );
     let spec = ErrorSpec {
@@ -389,69 +400,11 @@ mod tests {
     }
 
     fn one_of_each_reason() -> Vec<CorruptReason> {
-        vec![
-            CorruptReason::BadMagic,
-            CorruptReason::BadSegmentHeader("header_len"),
-            CorruptReason::SizeMismatch {
-                expected: 1,
-                actual: 2,
-            },
-            CorruptReason::BaseSeqMismatch {
-                from_name: 1,
-                from_header: 2,
-            },
-            CorruptReason::BadOffset(8),
-            CorruptReason::SequenceExhausted,
-            CorruptReason::BadLength(3),
-            CorruptReason::BadChecksum,
-            CorruptReason::BadSequence {
-                expected: 5,
-                found: 7,
-            },
-            CorruptReason::BadFlags,
-            CorruptReason::BadSeal,
-            CorruptReason::BrokenChain(9),
-            CorruptReason::DanglingCheckpoint(10),
-            CorruptReason::EmptyCommitWord(11),
-            CorruptReason::UncheckedTail(12),
-        ]
+        tickertape::samples::corrupt_reasons()
     }
 
     fn one_of_each_error() -> Vec<Error> {
-        vec![
-            Error::Io {
-                op: "open segment",
-                path: "/j/0.tape".into(),
-                source: io::Error::from_raw_os_error(2),
-            },
-            Error::Locked {
-                dir: "/j".into(),
-                pid: Some(42),
-            },
-            Error::Corrupt {
-                path: "/j/0.tape".into(),
-                offset: 64,
-                reason: CorruptReason::BadChecksum,
-            },
-            Error::UnsupportedVersion {
-                path: "/j/0.tape".into(),
-                found: 2,
-                supported: 1,
-            },
-            Error::NotFound { dir: "/j".into() },
-            Error::SeqUnavailable {
-                requested: 0,
-                first: 5,
-            },
-            Error::RecordTooLarge { len: 10, max: 5 },
-            Error::DurabilityLost,
-            Error::SequenceExhausted,
-            Error::Discarded { seq: 3 },
-            Error::InvalidConfig("segment_size".into()),
-            Error::BeaconInUse {
-                path: "/j/readers/a.beacon".into(),
-            },
-        ]
+        tickertape::samples::errors()
     }
 
     #[test]
@@ -486,11 +439,7 @@ mod tests {
             let (code, _) = reason_fields(&reason);
             assert_eq!(listed.get(name.as_str()), Some(&code), "{name}");
             // The code also reaches CorruptJournalError.reason.
-            let spec = describe(&Error::Corrupt {
-                path: "/p".into(),
-                offset: 0,
-                reason,
-            });
+            let spec = describe(&Error::corrupt("/p", 0, reason));
             assert!(
                 spec.fields
                     .contains(&("reason", Value::Str(code.to_string())))
@@ -503,7 +452,11 @@ mod tests {
 
     #[test]
     fn io_errors_carry_the_os_message() {
-        let spec = describe(&one_of_each_error().remove(0));
+        let spec = describe(&Error::io(
+            "open segment",
+            "/j/0.tape",
+            io::Error::from_raw_os_error(2),
+        ));
         let strerror = spec
             .fields
             .iter()

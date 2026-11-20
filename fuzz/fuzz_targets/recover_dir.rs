@@ -666,7 +666,7 @@ fn run(data: &[u8]) {
                 // A damaged seal whose successor opens is resealed after the repair (ADR 0035, "Damage around a
                 // seal"): the seal, then zeros.
                 let resealed = report.actions.iter().any(
-                    |a| matches!(a, RecoveryAction::Sealed { segment: s } if s == segment),
+                    |a| matches!(a, RecoveryAction::Sealed { segment: s, .. } if s == segment),
                 );
                 let zeros_from = if resealed {
                     // The eight bytes are a valid seal for an existing later segment's base.

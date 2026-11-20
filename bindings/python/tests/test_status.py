@@ -31,7 +31,7 @@ def test_status_writer_and_lagging_reader(journal: Path) -> None:
         with tt.Reader(journal) as lagging, tt.Reader(journal, durable_only=True) as durable:
             assert len(lagging.read_many(100)) == 100
             assert len(durable.read_many(30)) == 30
-            s = tt.status(journal)
+            s = tt.JournalStatus.sample(journal)
             assert isinstance(s, tt.JournalStatus)
             assert s.path == journal
             assert (s.head.next_seq, s.head.offset) == (1000, m.offset)
@@ -64,7 +64,7 @@ def test_status_writer_and_lagging_reader(journal: Path) -> None:
                 pass
             ahead = lagging.metrics(s)
             assert ahead.lag is None and ahead.lag_unknown == "ahead_of_sample"
-            fresher = tt.status(journal, readers_dir=journal / "readers")
+            fresher = tt.JournalStatus.sample(journal, readers_dir=journal / "readers")
             caught_up = lagging.metrics(fresher)
             assert caught_up.lag == tt.Lag(records=0, bytes=0)
 
@@ -78,10 +78,10 @@ def test_status_without_a_writer_and_errors(journal: Path, tmp_path: Path) -> No
     empty = tmp_path / "empty"
     empty.mkdir()
     with pytest.raises(tt.JournalNotFoundError):
-        tt.status(empty)
+        tt.JournalStatus.sample(empty)
     with tt.Writer(journal, segment_size=SMALL_SEGMENT) as w:
         append_pattern(w, 3)
-    s = tt.status(journal)
+    s = tt.JournalStatus.sample(journal)
     assert s.head.next_seq == 3
     assert s.checkpoint is None
     assert s.exposure.records == 3 and s.exposure.estimated_age_ns is None
@@ -92,7 +92,7 @@ def test_status_agrees_with_the_cli(journal: Path, cli: Path) -> None:
         append_pattern(w, 300)
         w.checkpoint()
         append_pattern(w, 200)
-        s = tt.status(journal)
+        s = tt.JournalStatus.sample(journal)
         out = subprocess.run([str(cli), "status", "--json", str(journal)], check=True, capture_output=True, text=True)
     data = json.loads(out.stdout.splitlines()[0])
     assert data["head"]["next_seq"] == s.head.next_seq

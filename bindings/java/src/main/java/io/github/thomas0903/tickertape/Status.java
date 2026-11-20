@@ -15,19 +15,19 @@ public enum Status {
     NONE(1),
     /** {@link InvalidArgumentException}. */
     INVALID_ARGUMENT(-1),
-    /** {@link JournalIoException}. */
+    /** {@link JournalIOException}. */
     IO(-2),
     /** {@link StorageFullException}. */
     STORAGE_FULL(-3),
-    /** {@link JournalLockedException}. */
+    /** {@link LockedException}. */
     LOCKED(-4),
     /** {@link CorruptJournalException}. */
     CORRUPT(-5),
-    /** {@link UnsupportedFormatVersionException}. */
+    /** {@link UnsupportedVersionException}. */
     UNSUPPORTED_VERSION(-6),
     /** {@link JournalNotFoundException}. */
     NOT_FOUND(-7),
-    /** {@link SequenceUnavailableException}. */
+    /** {@link SeqUnavailableException}. */
     SEQ_UNAVAILABLE(-8),
     /** {@link RecordTooLargeException}. */
     RECORD_TOO_LARGE(-9),
@@ -35,7 +35,7 @@ public enum Status {
     DURABILITY_LOST(-10),
     /** {@link SequenceExhaustedException}. */
     SEQUENCE_EXHAUSTED(-11),
-    /** {@link DiscardedHistoryException}. */
+    /** {@link DiscardedException}. */
     DISCARDED(-12),
     /** {@link InvalidConfigException}. */
     INVALID_CONFIG(-13),

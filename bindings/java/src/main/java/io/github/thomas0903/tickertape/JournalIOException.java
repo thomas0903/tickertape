@@ -6,16 +6,16 @@ package io.github.thomas0903.tickertape;
  * OS error is {@code ENOSPC}: freeing space does not make that writer accept appends again. Status
  * {@link Status#IO}; the subclass {@link StorageFullException} is {@link Status#STORAGE_FULL}.
  */
-public sealed class JournalIoException extends TickertapeException permits StorageFullException {
+public sealed class JournalIOException extends TickertapeException permits StorageFullException {
     private static final long serialVersionUID = 1L;
 
     private final int osErrorCode;
 
-    JournalIoException(String message, int osErrorCode, Throwable cause) {
+    JournalIOException(String message, int osErrorCode, Throwable cause) {
         this(Status.IO, message, osErrorCode, cause);
     }
 
-    JournalIoException(Status status, String message, int osErrorCode, Throwable cause) {
+    JournalIOException(Status status, String message, int osErrorCode, Throwable cause) {
         super(status, status.code(), message, cause);
         this.osErrorCode = osErrorCode;
     }

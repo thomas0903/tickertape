@@ -100,6 +100,7 @@ fn assert_repaired(
         len,
         quarantine_file,
         reason,
+        ..
     } = action
     else {
         panic!("expected RepairedTail, got {action:?}");
@@ -278,6 +279,7 @@ fn fail_policy_refuses_a_zeroed_commit_word_without_changing_a_byte() {
                 path: p,
                 offset: at,
                 reason: CorruptReason::EmptyCommitWord(found),
+                ..
             }) => {
                 assert_eq!((p, at, found), (path.clone(), offset, seq + 1), "{name}");
             }
@@ -326,7 +328,7 @@ fn live_readers_never_see_changed_bytes_across_the_repair() {
             let deadline = Instant::now() + Duration::from_secs(5);
             loop {
                 match r.try_next() {
-                    Err(Error::Discarded { seq }) => {
+                    Err(Error::Discarded { seq, .. }) => {
                         assert_eq!(seq, at);
                         break;
                     }
@@ -691,8 +693,8 @@ fn damage_around_a_seal_is_resealed_or_preserved_never_lost() {
                     (Expect::Resealed, _, Ok(w)) => {
                         // The surviving checksum word (if any) is zeroed in place, then the seal written again.
                         let actions = &w.recovery_report().actions;
-                        let sealed = |a: &RecoveryAction| matches!(a, RecoveryAction::Sealed { segment } if *segment == path);
-                        let zeroed_crc = |a: &RecoveryAction| matches!(a, RecoveryAction::ZeroedUncommitted { segment, offset, len: 4 } if *segment == path && *offset == seal + 4);
+                        let sealed = |a: &RecoveryAction| matches!(a, RecoveryAction::Sealed { segment, .. } if *segment == path);
+                        let zeroed_crc = |a: &RecoveryAction| matches!(a, RecoveryAction::ZeroedUncommitted { segment, offset, len: 4, .. } if *segment == path && *offset == seal + 4);
                         assert!(
                             match &actions[..] {
                                 [s] => sealed(s),
@@ -732,7 +734,7 @@ fn damage_around_a_seal_is_resealed_or_preserved_never_lost() {
                     }
                     (Expect::Removed(from), RecoveryPolicy::Fail, Err(e)) => {
                         assert!(
-                            matches!(&e, Error::Corrupt { path: p, offset, reason: CorruptReason::EmptyCommitWord(339) } if *p == path && *offset == recs[from as usize].0),
+                            matches!(&e, Error::Corrupt { path: p, offset, reason: CorruptReason::EmptyCommitWord(339), .. } if *p == path && *offset == recs[from as usize].0),
                             "{what}: {e:?}"
                         );
                         assert!(snapshot(dir.path()) == before, "{what}: bytes changed");
@@ -775,6 +777,7 @@ fn zeroed_block_ending_a_sealed_segment_is_preserved() {
                 path: p,
                 offset,
                 reason: CorruptReason::EmptyCommitWord(339),
+                ..
             }) => {
                 assert_eq!(policy, RecoveryPolicy::Fail);
                 assert_eq!((p, offset), (path.clone(), slots[336].0));
@@ -958,7 +961,7 @@ fn successor_that_does_not_open_ends_the_chain_at_the_seals_place() {
                 }
                 (Expect::BrokenAtSeal, RecoveryPolicy::Fail, Err(e)) => {
                     assert!(
-                        matches!(&e, Error::Corrupt { path: p, offset, reason: CorruptReason::BrokenChain(339) } if *p == path && *offset == seal),
+                        matches!(&e, Error::Corrupt { path: p, offset, reason: CorruptReason::BrokenChain(339), .. } if *p == path && *offset == seal),
                         "{what}: {e:?}"
                     );
                     assert!(files(dir.path()) == before_files, "{what}: files changed");
@@ -968,7 +971,7 @@ fn successor_that_does_not_open_ends_the_chain_at_the_seals_place() {
                 }
                 (Expect::Disconnected, RecoveryPolicy::Fail, Err(e)) => {
                     assert!(
-                        matches!(&e, Error::Corrupt { path: p, offset: 0, reason: CorruptReason::BrokenChain(339) } if *p == successor),
+                        matches!(&e, Error::Corrupt { path: p, offset: 0, reason: CorruptReason::BrokenChain(339), .. } if *p == successor),
                         "{what}: {e:?}"
                     );
                     assert!(files(dir.path()) == before_files, "{what}: files changed");
@@ -982,7 +985,7 @@ fn successor_that_does_not_open_ends_the_chain_at_the_seals_place() {
                 }
                 (Expect::Preserved(found), RecoveryPolicy::Fail, Err(e)) => {
                     assert!(
-                        matches!(&e, Error::Corrupt { path: p, offset, reason: CorruptReason::EmptyCommitWord(f) } if *p == path && *offset == seal && *f == found),
+                        matches!(&e, Error::Corrupt { path: p, offset, reason: CorruptReason::EmptyCommitWord(f), .. } if *p == path && *offset == seal && *f == found),
                         "{what}: {e:?}"
                     );
                     assert!(snapshot(dir.path()) == before, "{what}: bytes changed");
@@ -1045,8 +1048,8 @@ fn successor_that_fails_to_open_for_an_io_error_fails_the_open() {
             // Permissions restored: the roll completes (the CRC word, if any, zeroed in place, then the seal written).
             let w = Writer::open(dir.path(), small_config().recovery(policy)).unwrap();
             let actions = &w.recovery_report().actions;
-            let sealed = |a: &RecoveryAction| matches!(a, RecoveryAction::Sealed { segment } if *segment == path);
-            let zeroed_crc = |a: &RecoveryAction| matches!(a, RecoveryAction::ZeroedUncommitted { segment, offset, len: 4 } if *segment == path && *offset == seal + 4);
+            let sealed = |a: &RecoveryAction| matches!(a, RecoveryAction::Sealed { segment, .. } if *segment == path);
+            let zeroed_crc = |a: &RecoveryAction| matches!(a, RecoveryAction::ZeroedUncommitted { segment, offset, len: 4, .. } if *segment == path && *offset == seal + 4);
             assert!(
                 match &actions[..] {
                     [s] => whole && sealed(s),
@@ -1249,6 +1252,7 @@ fn payload_holding_another_journals_frames() {
                 path: at,
                 offset,
                 reason: CorruptReason::EmptyCommitWord(4),
+                ..
             }) => {
                 assert_eq!(policy, RecoveryPolicy::Fail);
                 assert_eq!((at, offset), (path.clone(), p));
@@ -1324,6 +1328,7 @@ fn payload_ending_in_a_seal_for_the_next_record() {
                 path: at,
                 offset,
                 reason: CorruptReason::EmptyCommitWord(4),
+                ..
             }) => {
                 assert_eq!(policy, RecoveryPolicy::Fail);
                 assert_eq!((at, offset), (path.clone(), p));
@@ -1672,7 +1677,7 @@ fn crash_in_the_middle_of_a_seal_repair() {
         actions.extend(w.recovery_report().actions.iter().cloned());
         assert_eq!(w.next_seq(), 50, "{point:?}: {actions:?}");
         drop(w);
-        let sealed = |a: &RecoveryAction| matches!(a, RecoveryAction::Sealed { segment } if *segment == path);
+        let sealed = |a: &RecoveryAction| matches!(a, RecoveryAction::Sealed { segment, .. } if *segment == path);
         let repaired = |a: &RecoveryAction| matches!(a, RecoveryAction::RepairedTail { segment, offset, reason: CorruptReason::BadSeal, .. } if *segment == path && *offset == seal);
         let removed_tmp = |a: &RecoveryAction| matches!(a, RecoveryAction::RemovedTemp { .. });
         assert!(
@@ -1733,7 +1738,7 @@ fn crash_in_the_middle_of_a_seal_repair() {
     let before = snapshot(dir.path());
     let err = Writer::open(dir.path(), small_config().recovery(RecoveryPolicy::Fail)).unwrap_err();
     assert!(
-        matches!(&err, Error::Corrupt { path: p, offset, reason: CorruptReason::BadSeal } if *p == path && *offset == seal),
+        matches!(&err, Error::Corrupt { path: p, offset, reason: CorruptReason::BadSeal, .. } if *p == path && *offset == seal),
         "{err:?}"
     );
     assert!(snapshot(dir.path()) == before, "Fail changed bytes");
@@ -1779,7 +1784,7 @@ proptest! {
         }
         let policy = if fail { RecoveryPolicy::Fail } else { RecoveryPolicy::Quarantine };
         match Writer::open(dir.path(), small_config().recovery(policy)) {
-            Err(Error::Corrupt { path: p, offset: at, reason: CorruptReason::EmptyCommitWord(_) }) => {
+            Err(Error::Corrupt { path: p, offset: at, reason: CorruptReason::EmptyCommitWord(_), .. }) => {
                 prop_assert!(fail && !newest);
                 prop_assert_eq!((p, at), (path.clone(), offset));
                 prop_assert!(snapshot(dir.path()) == before, "Fail changed bytes");

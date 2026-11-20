@@ -418,7 +418,10 @@ The exact system calls are in ADR 0032 → Sampling cost. Nothing is added to ap
   `TICKERTAPE_UNKNOWN` (`UINT64_MAX`), usually with a reason in an enum field (`tickertape_age_unknown`,
   `tickertape_lag_unknown`). A caller-supplied timestamp of `UINT64_MAX`, like one of 0 ("not set"), reads as
   unknown. Durations are nanoseconds; booleans are `uint32_t` 0 or 1. If `has_checkpoint` is 0, the `checkpoint_*`
-  values are `TICKERTAPE_UNKNOWN`.
+  values are `TICKERTAPE_UNKNOWN`. Each metrics enum has a value 255 (`TICKERTAPE_HEAD_OTHER`, `_CHECKPOINT_OTHER_PROBLEM`,
+  `_AGE_OTHER_REASON`, `_LAG_OTHER_REASON`, `_BEACON_OTHER`, `_READERS_DIR_OTHER`) for a value this version of the
+  C ABI does not name; a library built from one source tree does not return it. Handle it as unknown: a head that
+  ends `TICKERTAPE_HEAD_OTHER` is not known to be healthy.
 - **Corruption** is what a writer would refuse: `head_end == TICKERTAPE_HEAD_INVALID` (with `head_corrupt_reason`),
   `checkpoint_problem != TICKERTAPE_CHECKPOINT_USABLE`, or `head_chain_broken`. When the checkpoint is in an older
   segment the segments in between are not read: `head_verified` is then 0, and no corruption reported does not mean

@@ -1066,6 +1066,7 @@ enum class HeadEnd : std::int32_t {
     open = TICKERTAPE_HEAD_OPEN,        // at a slot with no record yet: the normal state
     sealed = TICKERTAPE_HEAD_SEALED,    // at a seal without a successor: a writer died during a roll
     invalid = TICKERTAPE_HEAD_INVALID,  // at invalid bytes (StatusReport::Head::corrupt_reason): corruption
+    other = TICKERTAPE_HEAD_OTHER,      // a state this ABI version does not name: unknown, not healthy
 };
 
 // Why the checkpoint marker cannot be used; anything but `usable` means a writer refuses the journal (corruption).
@@ -1108,6 +1109,7 @@ enum class BeaconState : std::int32_t {
     invalid = TICKERTAPE_BEACON_INVALID,
     unreadable = TICKERTAPE_BEACON_UNREADABLE,
     changing = TICKERTAPE_BEACON_CHANGING,
+    other = TICKERTAPE_BEACON_OTHER,  // a state this ABI version does not name: nothing reported
 };
 
 // Whether the beacon directory could be listed.
@@ -1115,6 +1117,7 @@ enum class ReadersDirState : std::int32_t {
     listed = TICKERTAPE_READERS_DIR_LISTED,
     missing = TICKERTAPE_READERS_DIR_MISSING,
     unusable = TICKERTAPE_READERS_DIR_UNUSABLE,
+    other = TICKERTAPE_READERS_DIR_OTHER,  // a state this ABI version does not name
 };
 
 // A position in the journal: the sequence number expected there, and where that is.

@@ -186,7 +186,7 @@ impl Backoff {
 }
 
 /// A retention policy and what to do with removed segments (ADR 0016). Build with `Retention.delete(...)` or
-/// `Retention.archive(directory, ...)`.
+/// `Retention.move_to(directory, ...)`.
 ///
 /// The writer runs it after open and after each successful checkpoint. It only ever removes a sealed prefix of
 /// segments strictly before the checkpoint segment. Failures never fail open or checkpoint; they are reported by
@@ -235,7 +235,7 @@ impl Retention {
     /// Move eligible segments into `directory`, which must already exist. Existing files there are never replaced.
     #[staticmethod]
     #[pyo3(signature = (directory, *, max_segments=None, max_bytes=None, max_age=None))]
-    fn archive(
+    fn move_to(
         directory: PathBuf,
         max_segments: Option<usize>,
         max_bytes: Option<u64>,
@@ -263,9 +263,9 @@ impl Retention {
         self.policy.max_age.map(|d| d.as_secs_f64())
     }
 
-    /// The archive directory, or `None` for deletion.
+    /// The directory segments are moved to, or `None` for deletion.
     #[getter]
-    fn archive_dir(&self) -> Option<PathBuf> {
+    fn move_to_directory(&self) -> Option<PathBuf> {
         match &self.action {
             tickertape::retention::Action::MoveTo(dir) => Some(dir.clone()),
             _ => None,
@@ -279,7 +279,12 @@ impl Retention {
 
     fn __hash__(&self) -> u64 {
         let p = &self.policy;
-        hash_of(&(p.max_segments, p.max_bytes, p.max_age, self.archive_dir()))
+        hash_of(&(
+            p.max_segments,
+            p.max_bytes,
+            p.max_age,
+            self.move_to_directory(),
+        ))
     }
 
     fn __repr__(&self) -> String {
@@ -288,7 +293,7 @@ impl Retention {
         }
         let action = match &self.action {
             tickertape::retention::Action::MoveTo(dir) => {
-                format!("archive({:?}, ", dir.display().to_string())
+                format!("move_to({:?}, ", dir.display().to_string())
             }
             _ => "delete(".to_string(),
         };

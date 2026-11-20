@@ -18,7 +18,7 @@ pub(crate) fn run(args: TailArgs, out: &mut dyn Write) -> Result<()> {
             match reader.try_next() {
                 Ok(Some(_)) => {}
                 Ok(None) => break,
-                Err(Error::Discarded { seq }) => resume(&mut reader, seq)?,
+                Err(Error::Discarded { seq, .. }) => resume(&mut reader, seq)?,
                 Err(error) => return Err(error.into()),
             }
         }
@@ -42,7 +42,7 @@ pub(crate) fn run(args: TailArgs, out: &mut dyn Write) -> Result<()> {
                 count += 1;
             }
             Ok(None) => break,
-            Err(Error::Discarded { seq }) => resume(&mut reader, seq)?,
+            Err(Error::Discarded { seq, .. }) => resume(&mut reader, seq)?,
             Err(error) => return Err(error.into()),
         }
     }

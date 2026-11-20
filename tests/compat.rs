@@ -353,6 +353,7 @@ fn current_writer_recovers_appends_and_checkpoints() {
                     segment,
                     offset,
                     len,
+                    ..
                 } if f.is_torn() => {
                     let torn = &f.json["torn"];
                     assert_eq!(segment.file_name().unwrap().to_str(), torn["file"].as_str());
@@ -365,7 +366,7 @@ fn current_writer_recovers_appends_and_checkpoints() {
                     assert!(offset + len >= end, "{}: {action:?}", f.name);
                     zeroed += 1;
                 }
-                RecoveryAction::RemovedTemp { file } if had_spare => {
+                RecoveryAction::RemovedTemp { file, .. } if had_spare => {
                     assert_eq!(file.file_name().unwrap(), "next-segment.tmp");
                 }
                 other => panic!("{}: unexpected recovery action {other:?}", f.name),
@@ -505,6 +506,7 @@ fn corrupt_tail_of_old_journal_is_quarantined_or_refused() {
                 len,
                 quarantine_file,
                 reason,
+                ..
             } = action
             {
                 assert_eq!(segment.file_name().unwrap().to_str(), Some(name));

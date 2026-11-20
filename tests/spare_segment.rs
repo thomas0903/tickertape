@@ -163,10 +163,9 @@ fn leftover_spare_is_removed_and_reported_at_open() {
     let w = Writer::open(dir.path(), small_config()).unwrap();
     assert!(!dir.path().join(SPARE).exists());
     assert!(
-        w.recovery_report()
-            .actions
-            .iter()
-            .any(|a| matches!(a, RecoveryAction::RemovedTemp { file } if file.ends_with(SPARE))),
+        w.recovery_report().actions.iter().any(
+            |a| matches!(a, RecoveryAction::RemovedTemp { file, .. } if file.ends_with(SPARE))
+        ),
         "{:?}",
         w.recovery_report().actions
     );

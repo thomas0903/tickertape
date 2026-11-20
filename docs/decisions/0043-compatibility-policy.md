@@ -1,7 +1,7 @@
 # 0043: The 1.0 compatibility policy
 
-- **Status:** proposed (needs the owner's agreement, together with the compatibility promise of
-  [0033](0033-format-compatibility-fixtures.md); takes effect at the 1.0 release)
+- **Status:** accepted on 2026-11-20 by the maintainers under the owner's delegation, together with the compatibility
+  promise of [0033](0033-format-compatibility-fixtures.md); takes effect at the 1.0 release
 - **Date:** 2026-11-20
 
 ## Context
@@ -51,3 +51,11 @@ the other JSON outputs or the crash contract, and nowhere in one place.
 - Fixed in the pull request that added this record: `format::LaterHistory` (added since v0.4.0) is
   `#[non_exhaustive]`; `c-api.md` lists all six extensible structs; `python.md` states the bindings' stability;
   ADR 0034's status says accepted.
+- Resolved when this record was accepted (2026-11-20): ADRs 0029 (PyPI project name `tickertape`), 0032, 0033, 0037
+  (Maven coordinates `io.github.thomas0903:tickertape`) and 0038 are accepted; the zero-copy reader's known
+  limitation ships in 1.0 as a documented limitation (`docs/compatibility.md` → Crash contract); the `format`
+  module's scanning and recovery helpers are crate-private or `#[doc(hidden)]`, and the struct-like variants of
+  `Error`, `CorruptReason` and `RecoveryAction` are `#[non_exhaustive]`; `tickertape_head_end`,
+  `tickertape_beacon_state` and `tickertape_readers_dir_state` have an `_OTHER` value (255); the bindings use the
+  Rust names in their own case convention (the renames are in the changelog); every CLI `--json` output carries
+  `schema_version` 1. What remains is in `docs/compatibility.md` → Before 1.0.

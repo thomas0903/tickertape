@@ -1,7 +1,7 @@
 # 0033: Format-v1 compatibility fixtures and the soak tier
 
-- **Status:** proposed (test strategy for the v1.0 readiness milestone; the compatibility promise needs the owner's
-  agreement)
+- **Status:** accepted on 2026-11-20 by the maintainers under the owner's delegation (test strategy for the v1.0
+  readiness milestone, with the compatibility promise as stated)
 - **Date:** 2026-11-19
 
 ## Context

@@ -103,12 +103,12 @@ public final class Reader implements AutoCloseable {
      *
      * @throws IllegalArgumentException if {@code dir} is not on the default file system (see
      *     {@linkplain Tickertape##paths Tickertape &rarr; Paths}, which also says how the path is passed)
-     * @throws JournalIoException with {@code ENOENT} if {@code dir} does not exist (a reader that starts before its
+     * @throws JournalIOException with {@code ENOENT} if {@code dir} does not exist (a reader that starts before its
      *     writer sees this, since the writer creates the directory)
      * @throws JournalNotFoundException if {@code dir} has no segment yet (the writer is creating it). A loop that waits
      *     for the writer retries on exactly these two.
      * @throws CorruptJournalException if the oldest segment's header is invalid
-     * @throws UnsupportedFormatVersionException if it has an unsupported format version
+     * @throws UnsupportedVersionException if it has an unsupported format version
      */
     public static Reader open(Path dir, ReaderOptions options) {
         return open(dir, options, false);
@@ -178,9 +178,9 @@ public final class Reader implements AutoCloseable {
      * @return the reader's view of the record, valid until the next call on this reader, or {@code null}
      * @throws CorruptJournalException if the bytes at the position fail validation (the position does not move, so
      *     calling again retries it, which may succeed after a writer recovery)
-     * @throws DiscardedHistoryException if writer recovery or retention replaced or removed the segment at the
+     * @throws DiscardedException if writer recovery or retention replaced or removed the segment at the
      *     position; call {@link #seek} to continue
-     * @throws JournalIoException if reading the files fails
+     * @throws JournalIOException if reading the files fails
      * @throws IllegalStateException if the reader is closed or in use by another thread
      */
     public RecordView tryNext() {
@@ -364,10 +364,10 @@ public final class Reader implements AutoCloseable {
      * follow. A successful seek also discards a record held back and an error deferred by {@link #readBatch}; a
      * failed seek leaves the reader as it was.
      *
-     * @throws SequenceUnavailableException if {@code seq} is older than the oldest segment (retention removed it);
+     * @throws SeqUnavailableException if {@code seq} is older than the oldest segment (retention removed it);
      *     seek to the oldest segment's {@link SegmentInfo#baseSeq()} from {@link Journal#listSegments} to continue
      * @throws CorruptJournalException if a segment header is invalid while locating it
-     * @throws JournalIoException if reading the files fails while locating it
+     * @throws JournalIOException if reading the files fails while locating it
      */
     public void seek(long seq) {
         handle.enter();
