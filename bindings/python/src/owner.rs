@@ -236,6 +236,38 @@ mod tests {
                 if name == "new" {
                     continue;
                 }
+                // `Writer::__exit__` only passes on what `Writer::close` returned (which has been through `settle`, or
+                // came from the forked-child branch) or drops it: it adds no value or exception of its own.
+                if (class, name) == ("Writer", "__exit__") {
+                    let statements: Vec<&str> = body.split('\n').map(str::trim).collect();
+                    assert!(
+                        statements.first() == Some(&"let closed = self.close(py);")
+                            && !body.contains('?')
+                            && !body.contains("return")
+                            && !body.contains("Err("),
+                        "Writer::__exit__ may only return `Ok(())` or what `self.close(py)` returned:\n{body}"
+                    );
+                    continue;
+                }
+                // `Writer::close` is the one method a forked child may call: there it releases the child's copies and
+                // must raise nothing, so that branch returns before `settle` (which raises in a child). It is the
+                // only statement allowed in front, after the flag store, and it must end in `return Ok(());`.
+                let body = if (class, name) == ("Writer", "close") {
+                    let start = body
+                        .find("if self.owner.is_foreign() {")
+                        .expect("Writer::close starts with its forked-child branch");
+                    let open = start + body[start..].find('{').unwrap();
+                    let close = open + 1 + matching(&body[open + 1..], '{', '}');
+                    assert!(
+                        body[..start].trim() == "self.closed.store(true, Ordering::Release);"
+                            && body[open..close].trim_end().ends_with("return Ok(());"),
+                        "Writer::close may only set its flag and return from the forked-child branch before \
+                         `settle`:\n{body}"
+                    );
+                    body[close + 1..].trim()
+                } else {
+                    body
+                };
                 // The statement that calls `settle`, and the statements before it.
                 let call = body.find(".settle(py, ").unwrap_or(body.len());
                 let line = body[..call].rfind('\n').map_or(0, |i| i + 1);

@@ -544,10 +544,12 @@ impl Writer {
             }
             return Ok(());
         }
-        let writer = lock(py, &self.inner).take();
-        // Closing waits for background checkpoints and joins helper threads; don't hold the GIL meanwhile.
-        let result = py.detach(move || writer.map_or(Ok(()), tickertape::Writer::close));
-        convert(py, result)
+        self.settle(py, || {
+            let writer = lock(py, &self.inner).take();
+            // Closing waits for background checkpoints and joins helper threads; don't hold the GIL meanwhile.
+            let result = py.detach(move || writer.map_or(Ok(()), tickertape::Writer::close));
+            convert(py, result)
+        })
     }
 
     fn __enter__(slf: Bound<'_, Self>) -> PyResult<Bound<'_, Self>> {
