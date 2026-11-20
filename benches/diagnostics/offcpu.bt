@@ -1,0 +1,62 @@
+#!/usr/bin/env bpftrace
+/*
+ * Off-CPU time of every thread of one process, by thread and kernel stack, and one line for every off-CPU interval
+ * of at least MIN_MS milliseconds, with its wall-clock start (Unix seconds), so it can be lined up with tt-sustained's
+ * series.jsonl. Part of docs/playbooks/diagnose-latency-with-ebpf.md.
+ *
+ *   sudo bpftrace benches/diagnostics/offcpu.bt <pid> <min-ms> <seconds>
+ *
+ * Event lines: <t_unix_s> offcpu tid=<tid> comm=<comm> state=<R|S|D|other> us=<microseconds>, then the kernel
+ * stack the thread left the CPU with. State R means the thread was preempted (it waited for a CPU, not for an
+ * event); S is an interruptible sleep (futex, nanosleep), D an uninterruptible one (I/O, journal commit).
+ * The summary at the end, @offcpu_us[comm, tid, state, stack], is the total time per stack.
+ *
+ * <pid> and the printed tids are as seen from bpftrace's PID namespace (what ps shows next to it). The scheduler
+ * tracepoint reports kernel-wide ids, which differ inside a container, so the script learns the process's
+ * kernel-wide id the first time one of its threads leaves a CPU and filters on that afterwards. Until then, inside a
+ * container, bpftrace can print "get_ns_current_pid_tgid" warnings for tasks of other namespaces.
+ */
+
+tracepoint:sched:sched_switch
+{
+  $g = @kernel_tgid[0];
+  if ($g == 0 && pid == $1) {
+    $g = curtask->tgid;
+    @kernel_tgid[0] = $g;
+  }
+  // The thread leaving the CPU is the current task.
+  if ($g != 0 && curtask->tgid == $g) {
+    $prev = args.prev_pid;
+    @start[$prev] = nsecs;
+    @stack[$prev] = kstack(20);
+    @state[$prev] = args.prev_state;
+    @ns_tid[$prev] = tid;
+  }
+  $next = args.next_pid;
+  $s = @start[$next];
+  if ($s != 0) {
+    $us = (nsecs - $s) / 1000;
+    $st = @state[$next];
+    $name = $st == 0 ? "R" : ($st == 1 ? "S" : ($st == 2 ? "D" : "other"));
+    @offcpu_us[args.next_comm, @ns_tid[$next], $name, @stack[$next]] = sum($us);
+    if ($us >= $2 * 1000) {
+      printf("%s offcpu tid=%d comm=%s state=%s us=%d\n%s\n", strftime("%s.%f", $s), @ns_tid[$next],
+        args.next_comm, $name, $us, @stack[$next]);
+    }
+    $deleted = delete(@start, $next);
+  }
+}
+
+interval:s:$3
+{
+  exit();
+}
+
+END
+{
+  clear(@kernel_tgid);
+  clear(@start);
+  clear(@stack);
+  clear(@state);
+  clear(@ns_tid);
+}
