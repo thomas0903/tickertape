@@ -158,6 +158,35 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   copy of a writer (which it must not do) leaves the lock with the parent. A writer process that exits or dies
   without dropping its writer still leaves the lock with such a child until it execs or exits, for its whole life if
   it never execs (crash contract C3).
+- Python: installable bindings (`bindings/python/`, PyPI name `tickertape`, not yet published; ADR 0029). `Writer` and
+  `Reader` classes over the Rust library with batch appends and reads that cross the language boundary once, explicit
+  partial-failure reporting (`BatchAppendError`), columnar `RecordBatch` output for NumPy, pyarrow and pandas (all
+  optional), durable-only reads, interruptible waits that release the GIL, an exception for every error variant, and
+  type stubs. Records are copied into `bytes`; the zero-copy mapped reader is not exposed. One abi3 wheel per platform
+  for CPython 3.11+; a wheel workflow builds manylinux, musllinux and macOS wheels and an sdist, with a Trusted
+  Publishing step that stays off until PyPI is configured. The pure-Python decoder in `python/` is unchanged. Handles
+  refuse use in a forked child (`UsedAfterForkError`, also after process-id reuse), and closing them there releases
+  the child's copies of the descriptors and mappings, so the journal can be reopened while the child runs (a handle
+  that another thread was using at the fork is never released there); a waiting read holds its reader only for 50 ms
+  slices, so signal handlers and other threads can use or close it; a read delivers its records only once its Python
+  result is complete and no signal is pending, so a record staged when Ctrl-C arrives (also while a large result is
+  built, or while the read waits for another thread to deliver) is returned by the next read; a read that a signal
+  handler interrupted to fork raises `UsedAfterForkError` in the child instead of waiting for the reader's lock or
+  reporting a timeout, and so does any call during which Python code forked, whatever it would have returned or
+  raised (the owner check is the last thing a method does, after its exception is built); once all staged records are delivered, a reader keeps at most 6 MiB of staging buffer (enough
+  for `read_batch(10_000)` to reuse it), and a larger one is freed with the GIL released before the read that
+  delivers them returns (records staged by a read that raised stay in their buffer until a later read returns them); the test-only methods that can wedge a handle exist only in
+  builds with the `test-hooks` feature, not in release wheels; the writer's reports are named tuples; every exception
+  survives `pickle` with its current attribute values, also after an attribute was deleted.
+- Core: `Reader::next_timeout` no longer panics for a timeout too large to add to `Instant::now()` (it waits
+  forever), and the reader's back-off no longer panics when doubling a sleep near `Duration::MAX`.
+- Core: new `Writer::release_after_fork`, only for a writer inherited across `fork` and only in the child: closes the
+  child's descriptors and unmaps its mappings without unlocking the shared lock, syncing, touching the helper threads
+  or changing any file. It frees heap memory, so it is not async-signal-safe; no call on the writer may be in
+  progress in another thread at the fork. Used by the Python bindings.
+- Release operations: `release.py prepare` also checks the Python bindings' version and lockfile against the tag, and
+  resolves only `refs/tags/<tag>`, so a branch named like a release tag is refused; the release workflows check out
+  the fully qualified tag. The release checklist adds a `v*` tag ruleset and required reviewers for `pypi`.
 - Operational metrics (ADR 0032), with no format change and nothing added to `append` or the reader's read path.
   Values a sample can't establish are reported as unknown, never guessed, and estimates are named as such:
   - `tickertape::status::status(dir)` and `status::Sampler` sample a journal from any process: the writer's head,

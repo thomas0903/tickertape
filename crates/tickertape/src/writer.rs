@@ -578,6 +578,47 @@ impl Writer {
         self.last_retention_error.as_ref()
     }
 
+    /// Releases this process's copy of a writer inherited across `fork`. **Call it only in a child process created
+    /// by `fork` from the process that opened the writer**; in the process that opened it, drop the writer instead.
+    ///
+    /// Closes the child's copies of the writer's file descriptors and unmaps its mappings, so that the lock is held
+    /// only by the parent's descriptor again and the journal can be reopened once the parent closes its writer. It
+    /// does not unlock the lock file (the lock belongs to the open file description that parent and child share),
+    /// does not sync, does not remove or change any file or the wake-up region, and does not join or signal the
+    /// helper threads, which exist only in the parent.
+    ///
+    /// # What it leaks
+    ///
+    /// Until the child exits: the helper threads' handles and the state they share with the writer, including the
+    /// prefault thread's reference to the active segment's mapping (so with prefaulting enabled that mapping stays
+    /// mapped in the child, although its file descriptor is closed), and a spare segment prepared in the background
+    /// (its file descriptor and mapping, which the spare thread's result owns).
+    ///
+    /// # Preconditions
+    ///
+    /// - **Not async-signal-safe.** It frees heap memory (paths, lists, reference counts of mappings) through the
+    ///   global allocator. In the child of a multithreaded process, call it only where the allocator is usable after
+    ///   `fork`: the glibc and macOS system allocators reinitialise their locks in the child, but with an allocator
+    ///   that does not, a lock held by another thread at the fork can stall the child here, and the journal then stays
+    ///   locked by the child's descriptor until the child is killed.
+    /// - **No call on the writer may have been in progress in another thread at the moment of the fork.** The child's
+    ///   copy could then be half-updated (for example in the middle of a roll), and releasing it is not supported.
+    ///   Code that shares a writer between threads must make sure of this itself (the Python bindings, for example,
+    ///   never release a copy whose lock was held at the fork).
+    /// - **Only in a forked child.** Called in the process that opened the writer, it releases the journal lock
+    ///   while the prefault thread and its mapping stay alive, a spare-segment thread may still be running (its
+    ///   spare file is then left for the next writer's recovery to remove), waiting readers are not told that the
+    ///   writer has gone, and on macOS the wake-up region's shared-memory name stays until the next writer opens the
+    ///   journal. Another writer could then open the journal while those threads still run.
+    pub fn release_after_fork(mut self) {
+        std::mem::forget(self.spare.take());
+        std::mem::forget(self.prefault.take());
+        if let Some(notify) = self.notify.take() {
+            notify.release_after_fork();
+        }
+        // `Drop` finds no spare; the remaining fields only close descriptors and unmap.
+    }
+
     /// Operational metrics only the writer knows: the head, the last checkpoint and its age by the monotonic clock,
     /// what the next checkpoint has to sync, whether the writer is poisoned, and retention failures (ADR 0032; see
     /// [`crate::status`] for what other processes can observe).

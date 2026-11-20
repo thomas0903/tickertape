@@ -309,15 +309,15 @@ impl Reader {
     }
 
     /// Returns the next record, polling with the configured [`Backoff`] until one is committed or
-    /// `timeout` passes (`None`: wait forever). `Ok(None)` means the timeout passed. With
-    /// [`ReaderConfig::durable_only`] enabled, also waits for checkpoint coverage, refreshing the marker at most
-    /// once per poll.
+    /// `timeout` passes (`None`, or a timeout too large to represent: wait forever). `Ok(None)` means the timeout
+    /// passed. With [`ReaderConfig::durable_only`] enabled, also waits for checkpoint coverage, refreshing the marker
+    /// at most once per poll.
     ///
     /// # Errors
     ///
     /// As for [`Reader::try_next`].
     pub fn next_timeout(&mut self, timeout: Option<Duration>) -> Result<Option<Record<'_>>> {
-        let deadline = timeout.map(|t| Instant::now() + t);
+        let deadline = timeout.and_then(|t| Instant::now().checked_add(t));
         let mut waiter = Waiter::new(self.config.backoff);
         loop {
             if self.advance()? {
@@ -1086,7 +1086,9 @@ impl Waiter {
             if !d.is_zero() {
                 std::thread::sleep(d);
             }
-            self.sleep = (self.sleep * 2)
+            self.sleep = self
+                .sleep
+                .saturating_mul(2)
                 .min(self.backoff.max_sleep)
                 .max(self.backoff.min_sleep);
         }
@@ -1174,6 +1176,32 @@ mod wake_tests {
         assert!(
             r.waker.is_none(),
             "wake-ups still on after an unsupported wait"
+        );
+    }
+
+    #[test]
+    fn huge_timeouts_and_sleeps_do_not_overflow() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w =
+            Writer::open(dir.path(), WriterConfig::default().segment_size(1 << 20)).unwrap();
+        w.append(&crate::NewRecord {
+            schema_id: 0,
+            venue_ts_ns: 0,
+            local_ts_ns: 0,
+            payload: b"x",
+        })
+        .unwrap();
+        let config = ReaderConfig::default()
+            .notify(false)
+            .backoff(blocking(Duration::MAX));
+        let mut r = Reader::open(dir.path(), config).unwrap();
+        // A timeout past the end of `Instant` means forever; a record is already there.
+        assert!(r.next_timeout(Some(Duration::MAX)).unwrap().is_some());
+        // Doubling the longest sleep saturates instead of panicking.
+        assert!(
+            r.next_timeout(Some(Duration::from_millis(30)))
+                .unwrap()
+                .is_none()
         );
     }
 }

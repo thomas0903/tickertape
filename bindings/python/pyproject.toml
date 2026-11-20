@@ -1,0 +1,66 @@
+[build-system]
+requires = ["maturin>=1.16,<2"]
+build-backend = "maturin"
+
+[project]
+# The PyPI distribution name, in one place (ADR 0029). Changing it does not change the import name `tickertape`.
+name = "tickertape"
+description = "Python bindings for tickertape: a local append-only event journal on memory-mapped files, with live cross-process readers and replay"
+readme = "README.md"
+# The version comes from Cargo.toml, which `release.py prepare` keeps in step with the release tag.
+dynamic = ["version"]
+# abi3-py311 in Cargo.toml must match this lower bound.
+requires-python = ">=3.11"
+license = "MIT OR Apache-2.0"
+license-files = ["LICENSE-MIT", "LICENSE-APACHE"]
+authors = [{ name = "The tickertape contributors" }]
+keywords = ["journal", "mmap", "event-log", "trading", "ipc"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Financial and Insurance Industry",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Rust",
+    "Topic :: Database",
+    "Topic :: Office/Business :: Financial",
+    "Typing :: Typed",
+]
+# No runtime dependencies. NumPy, pyarrow and pandas are optional (RecordBatch.to_numpy/to_arrow/to_pandas).
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[project.urls]
+Homepage = "https://github.com/thomas0903/tickertape"
+Documentation = "https://github.com/thomas0903/tickertape/blob/main/docs/python.md"
+Changelog = "https://github.com/thomas0903/tickertape/blob/main/CHANGELOG.md"
+Issues = "https://github.com/thomas0903/tickertape/issues"
+
+[tool.maturin]
+python-source = "python"
+module-name = "tickertape._native"
+# Strip symbols from release wheels; the source is public.
+strip = true
+locked = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+# Journals preallocate their segments (128 MiB by default): keep temporary directories only for failed tests.
+tmp_path_retention_policy = "failed"
+
+[tool.mypy]
+strict = true
+files = ["python/tickertape", "examples", "tests"]
+mypy_path = "tests"
+
+# The repository's dependency-free decoder, imported by the cross-language tests; it is not part of this package.
+[[tool.mypy.overrides]]
+module = ["tickertape_reader", "numpy", "pyarrow", "pandas", "duckdb"]
+ignore_missing_imports = true
+follow_imports = "skip"

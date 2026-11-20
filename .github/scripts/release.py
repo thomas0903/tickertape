@@ -19,6 +19,8 @@ import urllib.request
 
 
 CRATES = ("tickertape", "tickertape-cli")
+# The Python bindings (ADR 0029): outside the workspace, versioned with it, published to PyPI by python-wheels.yml.
+BINDINGS = Path("bindings") / "python"
 TARGETS = (
     "x86_64-unknown-linux-gnu",
     "aarch64-unknown-linux-gnu",
@@ -83,6 +85,20 @@ def validate_versions(source, version):
         if package["name"] not in CRATES and package.get("publish", True) not in (False, []):
             raise ValueError(f"{package['name']} is not released by this workflow; set publish = false "
                              "or add it to CRATES")
+    validate_bindings_version(source, version)
+
+
+def validate_bindings_version(source, version):
+    manifest = source / BINDINGS / "Cargo.toml"
+    if not manifest.exists():
+        return  # release tags from before the bindings existed
+    with manifest.open("rb") as file:
+        if tomllib.load(file)["package"]["version"] != version:
+            raise ValueError(f"{BINDINGS}/Cargo.toml version does not match the tag")
+    with (source / BINDINGS / "Cargo.lock").open("rb") as file:
+        locked = {package["name"]: package["version"] for package in tomllib.load(file)["package"]}
+    if locked.get("tickertape") != version or locked.get("tickertape-python") != version:
+        raise ValueError(f"{BINDINGS}/Cargo.lock is stale; run cargo update --workspace in {BINDINGS}")
 
 
 def require_green_ci(runs, sha):
@@ -103,6 +119,15 @@ def release_notes(changelog, version):
     return (notes + "\n\n```sh\ncargo add tickertape\ncargo install tickertape-cli --locked\n```\n\n"
             f"[API documentation](https://docs.rs/tickertape/{version}/tickertape/) · "
             "[CLI binary installation](https://github.com/thomas0903/tickertape/blob/main/docs/install.md)\n")
+
+
+def tag_commit(source, tag):
+    """The commit that the tag `refs/tags/<tag>` points to. Never a branch (or any other ref) with the same name."""
+    result = subprocess.run(["git", "rev-parse", "--verify", "--quiet", f"refs/tags/{tag}^{{commit}}"],
+                            cwd=source, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise ValueError(f"{tag} is not a tag in the source checkout")
+    return result.stdout.strip()
 
 
 BINSTALL_SUFFIXES = {"tgz": ".tar.gz", "tar.gz": ".tar.gz"}
@@ -157,7 +182,7 @@ def prepare(args):
     version = version_for_tag(args.tag)
     validate_versions(source, version)
     sha = run("git", "rev-parse", "HEAD", cwd=source)
-    if run("git", "rev-parse", f"{args.tag}^{{commit}}", cwd=source) != sha:
+    if tag_commit(source, args.tag) != sha:
         raise ValueError("source checkout does not match the release tag")
     subprocess.run(["git", "merge-base", "--is-ancestor", sha, "origin/main"], cwd=source, check=True)
     repo = os.environ["GITHUB_REPOSITORY"]

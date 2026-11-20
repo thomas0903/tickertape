@@ -272,6 +272,12 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check
+      # The Python bindings have their own lockfile (not a workspace member); same policy.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          manifest-path: bindings/python/Cargo.toml
+          arguments: --config deny.toml
+          command: check
 
   miri:
     # Also runs the C ABI's argument-handling tests. The name is a required status check on main; keep it.
@@ -345,6 +351,67 @@ jobs:
           TICKERTAPE_PYTHON: ${{ steps.python.outputs.python-path }}
       # M8: the README quickstart, end to end (producer, live consumer, verify, Parquet export, DuckDB query).
       - run: examples/quickstart.sh "${{ steps.python.outputs.python-path }}"
+
+  python-bindings:
+    name: python bindings (${{ matrix.os }}, Python ${{ matrix.python }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        # Oldest and newest supported CPython (ADR 0029); the abi3 wheel built with one serves both.
+        python: ['3.11', '3.15']
+    runs-on: ${{ matrix.os }}
+    env:
+      TICKERTAPE_BIN: ${{ github.workspace }}/target/release/tickertape
+      TICKERTAPE_PRODUCER: ${{ github.workspace }}/target/release/demo-producer
+      TICKERTAPE_DURABLE_HELPER: ${{ github.workspace }}/target/release/tt-durable-only
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            bindings/python -> target
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Lint the bindings crate (not a workspace member)
+        run: |
+          cargo fmt --manifest-path bindings/python/Cargo.toml --check
+          cargo clippy --manifest-path bindings/python/Cargo.toml --all-targets --locked -- -D warnings
+          cargo clippy --manifest-path bindings/python/Cargo.toml --all-targets --locked --all-features -- -D warnings
+      - name: Unit tests of the bindings crate (every error and report variant converts as listed)
+        run: |
+          # The test binary links libpython; make the runtime linker find it on Linux.
+          LD_LIBRARY_PATH="$(python -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          export LD_LIBRARY_PATH
+          cargo test --manifest-path bindings/python/Cargo.toml --locked
+      - name: Build the Rust CLI and fixture helpers for the cross-language tests
+        run: cargo build --release --locked -p tickertape-cli -p tickertape-examples -p tickertape-tests --bins
+      - name: Build the wheel with the test hooks and install it into a clean virtual environment
+        run: |
+          python -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/python" -m pip install --upgrade pip maturin==1.16.0 pytest mypy
+          # `test-hooks` adds the test-only methods that can wedge a handle; release wheels never have them (ADR 0029).
+          "$RUNNER_TEMP/venv/bin/maturin" build --release --locked --features test-hooks -m bindings/python/Cargo.toml \
+            -o "$RUNNER_TEMP/dist"
+          "$RUNNER_TEMP/venv/bin/python" -m pip install "$RUNNER_TEMP"/dist/*.whl
+          # Optional integrations; a package without a wheel for this Python only skips its tests.
+          for package in numpy pandas pyarrow duckdb; do
+            "$RUNNER_TEMP/venv/bin/python" -m pip install --only-binary :all: "$package" \
+              || echo "::notice::$package has no wheel for Python ${{ matrix.python }}; its tests are skipped"
+          done
+      - name: Binding tests (pytest)
+        working-directory: bindings/python
+        run: '"$RUNNER_TEMP/venv/bin/python" -m pytest -v'
+        env:
+          TMPDIR: ${{ runner.temp }}
+      - name: Type checks (mypy --strict, stubtest against the built module)
+        working-directory: bindings/python
+        run: |
+          "$RUNNER_TEMP/venv/bin/python" -m mypy
+          cd "$RUNNER_TEMP" && "$RUNNER_TEMP/venv/bin/python" -m mypy.stubtest tickertape
 
   # The iceoryx2 integration is outside the workspace (own lockfile and MSRV); these jobs only touch its directory.
   iceoryx2:

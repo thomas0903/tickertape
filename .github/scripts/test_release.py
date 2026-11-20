@@ -3,6 +3,7 @@ import hashlib
 import io
 import json
 from pathlib import Path
+import subprocess
 import tarfile
 import tempfile
 import unittest
@@ -18,6 +19,42 @@ class ReleaseTests(unittest.TestCase):
             with self.subTest(tag=tag), self.assertRaises(ValueError):
                 release.version_for_tag(tag)
 
+    def test_tag_commit_resolves_tags_only(self):
+        def git(*args, cwd):
+            return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", *args],
+                                  cwd=cwd, check=True, capture_output=True, text=True).stdout.strip()
+
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+            git("init", "-q", cwd=repo)
+            git("commit", "-q", "--allow-empty", "-m", "first", cwd=repo)
+            first = git("rev-parse", "HEAD", cwd=repo)
+            git("commit", "-q", "--allow-empty", "-m", "second", cwd=repo)
+            second = git("rev-parse", "HEAD", cwd=repo)
+            # A branch named like a release tag is not a tag.
+            git("branch", "v0.4.0", first, cwd=repo)
+            with self.assertRaisesRegex(ValueError, "not a tag"):
+                release.tag_commit(repo, "v0.4.0")
+            # With both a branch and a tag of that name, the tag wins (annotated tags resolve to their commit).
+            git("tag", "-a", "v0.4.0", second, "-m", "release", cwd=repo)
+            self.assertEqual(release.tag_commit(repo, "v0.4.0"), second)
+            git("tag", "v0.5.0", first, cwd=repo)
+            self.assertEqual(release.tag_commit(repo, "v0.5.0"), first)
+
+    def test_prepare_refuses_a_branch_named_like_the_tag(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-q",
+                            "--allow-empty", "-m", "c"], cwd=repo, check=True)
+            subprocess.run(["git", "branch", "v0.4.0"], cwd=repo, check=True)
+            args = argparse.Namespace(source=repo, tag="v0.4.0", notes=repo / "notes.md")
+            with patch.object(release, "validate_versions"), \
+                 patch.object(release, "gh_json") as gh, \
+                 self.assertRaisesRegex(ValueError, "not a tag"):
+                release.prepare(args)
+            gh.assert_not_called()
+
     def test_version_validation_checks_both_workspace_versions(self):
         source = Path(__file__).resolve().parents[2]
         with (source / "Cargo.toml").open("rb") as file:
@@ -31,6 +68,23 @@ class ReleaseTests(unittest.TestCase):
                                              '[workspace.dependencies]\ntickertape={version="0.3.0"}\n')
             with self.assertRaisesRegex(ValueError, "dependency"):
                 release.validate_versions(root, "0.4.0")
+
+    def test_python_bindings_version_and_lockfile_follow_the_tag(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            release.validate_bindings_version(root, "0.5.0")  # older tags have no bindings
+            bindings = root / "bindings" / "python"
+            bindings.mkdir(parents=True)
+            (bindings / "Cargo.toml").write_text('[package]\nname="tickertape-python"\nversion="0.4.0"\n')
+            with self.assertRaisesRegex(ValueError, "Cargo.toml version"):
+                release.validate_bindings_version(root, "0.5.0")
+            (bindings / "Cargo.toml").write_text('[package]\nname="tickertape-python"\nversion="0.5.0"\n')
+            lock = '[[package]]\nname="tickertape"\nversion="{}"\n[[package]]\nname="tickertape-python"\nversion="0.5.0"\n'
+            (bindings / "Cargo.lock").write_text(lock.format("0.4.0"))
+            with self.assertRaisesRegex(ValueError, "stale"):
+                release.validate_bindings_version(root, "0.5.0")
+            (bindings / "Cargo.lock").write_text(lock.format("0.5.0"))
+            release.validate_bindings_version(root, "0.5.0")
 
     def test_unreleased_workspace_members_must_not_be_publishable(self):
         with tempfile.TemporaryDirectory() as temporary:
