@@ -83,3 +83,81 @@ fn warn(message: std::fmt::Arguments<'_>) -> Result<()> {
         .map_err(|e| output::io_error("write recovery warning", e))?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::path::PathBuf;
+    use std::rc::Rc;
+    use tickertape::fault::Point;
+    use tickertape::retention::{self, Action, Policy};
+    use tickertape::{NewRecord, Writer, WriterConfig};
+
+    /// Retention overtakes a durable-only tail four times in a row: each time the tail has sought to the oldest
+    /// segment, retention removes it before the tail confirms that the segment is in place (after reading the
+    /// checkpoint marker, ADR 0034), so the tail gets `Error::Discarded` and resumes again without returning a record
+    /// (warning on standard error each time, with the records skipped). Here each resume follows a removal (a
+    /// recovery that replaces the segment causes one too), so once retention stops, the tail returns the records still
+    /// there and ends.
+    #[test]
+    fn durable_only_tail_resumes_once_per_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer =
+            Writer::open(dir.path(), WriterConfig::default().segment_size(65536)).unwrap();
+        for _ in 0..8 {
+            writer
+                .append(&NewRecord {
+                    schema_id: 1,
+                    venue_ts_ns: 0,
+                    local_ts_ns: 0,
+                    payload: &[7; 40_000],
+                })
+                .unwrap();
+        }
+        writer.checkpoint().unwrap();
+        // Records 0..=7, one per segment; the checkpoint is in segment 7, so retention may remove segments 0 to 6.
+        fn overtake(dir: PathBuf, removed: Rc<Cell<usize>>) {
+            tickertape::fault::run_at(Point::ReaderCheckpointIdentity, 0, move || {
+                removed.set(removed.get() + 1);
+                let policy = Policy::default().max_segments(8 - removed.get());
+                let plan = retention::plan(&dir, &policy).unwrap();
+                retention::apply(&dir, &plan, &Action::Delete).unwrap();
+                if removed.get() < 4 {
+                    overtake(dir, removed);
+                }
+            });
+        }
+        let removed = Rc::new(Cell::new(0));
+        tickertape::fault::clear();
+        overtake(dir.path().to_path_buf(), removed.clone());
+        let mut out = Vec::new();
+        let result = run(
+            TailArgs {
+                dir: dir.path().into(),
+                from: None,
+                from_end: false,
+                count: None,
+                no_follow: true,
+                durable_only: true,
+                format: TailFormat::Json,
+                decode: None,
+                timeout_secs: None,
+            },
+            &mut out,
+        );
+        tickertape::fault::clear();
+        assert!(result.is_ok(), "{:?}", result.err().map(|f| f.message));
+        assert_eq!(removed.get(), 4);
+        let seqs: Vec<u64> = String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line).unwrap()["seq"]
+                    .as_u64()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(seqs, [4, 5, 6, 7]);
+    }
+}
