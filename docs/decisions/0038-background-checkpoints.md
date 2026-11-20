@@ -165,11 +165,19 @@ there); it matters only for an OS crash or power loss. Item by item:
 - **C11 (corruption).** A header that is entirely zero, in a segment the scan enters, is now taken for the crash
   state above, also under `Fail`; a damaged header that is not all zero is handled as before. Only an all-zero file
   is ever replaced, so no non-zero byte is removed by this. The segment the scan starts in (the marker's) is never
-  restored: its header was synced before the marker, and an invalid header there still makes the open fail. At an
-  empty commit word in front of such a successor, recovery first checks without writing whether the header can be
-  restored, and restores it only once nothing in that scan step can still refuse: when the predecessor's bytes beyond
-  the seal make `Fail` refuse (`BadSeal`), no file has changed. Under `Fail` a restored header stays if the open
-  refuses for another reason in a later step (C11 lists what an open may change before it refuses).
+  restored: its header was synced before the marker, and an invalid header there still makes the open fail. Under
+  `Fail`, an open that refuses restores nothing (amended after the fuzzer found a refused open that had
+  replaced an empty successor and sealed the segment before it, then refused at a disconnected segment): from the
+  first segment whose header it would restore, it holds back that change and every change the scan decides after it
+  (zeroing an uncommitted tail, a seal, a created successor), scans as if they had been made (a segment whose header
+  is restored is mapped from its file as it is, since the scan does not read the header; a replacement or a created
+  successor is prepared and synced under its temporary name and mapped from there), and makes them in the order
+  decided once the open can no longer refuse, after the check for disconnected segments. A refused open, or one
+  that fails while making them, removes the prepared temporary files it did not publish. Each held change is the one `Quarantine` makes at the same point (the scans
+  differ only where `Fail` refuses), so an interruption between two of them leaves the journal that an interrupted
+  `Quarantine` open leaves there, which the next open handles the same way (new fault point
+  `fault::Point::BetweenHeldChanges`). What a refused open keeps from before that segment is unchanged (C11).
+  `Quarantine` makes each change when it decides it, as before.
 - **C9 (disk full while creating a segment).** Unchanged: preallocation happens before the link and fails there. An
   error writing the header back surfaces at the next checkpoint's `fdatasync` (C12).
 - **C13 and C14.** Unaffected: durable-only readers read below the marker, and retention removes only segments
