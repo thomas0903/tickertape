@@ -10,7 +10,9 @@
 //!
 //! Nothing here makes anything durable or is needed for a guarantee: what is durable when is decided by checkpoints
 //! alone. An I/O error from the call marks the writer's data lost (`Context::lost`), as a failed sync does, so that no
-//! later checkpoint writes a marker; the first such error is the next checkpoint's error.
+//! later checkpoint writes a marker; the first such error is returned once, by the next checkpoint or the writer's next
+//! `request_checkpoint`, `checkpoint_progress`, `checkpoint` or `close`. Once the helper exits (after such an error,
+//! or because the call is unsupported), it is marked stopped and holds no file, and rolls hand it nothing more.
 //!
 //! [`WriterConfig::early_writeback`]: crate::WriterConfig::early_writeback
 
@@ -50,14 +52,17 @@ struct Shared {
 
 #[derive(Debug)]
 struct State {
-    /// The active segment's file.
-    file: Arc<File>,
+    /// The active segment's file; `None` once the helper has stopped.
+    file: Option<Arc<File>>,
     /// The writer's position in `file`: everything before the page that holds it is finished.
     position: u64,
     /// Segments the writer rolled past since the helper last looked, with their end (after the seal): written back
     /// to the end before the helper moves on.
     rolled: Vec<(Arc<File>, u64)>,
     stop: bool,
+    /// Set by the helper when it exits on its own (the call is unsupported, or failed), with `file` and `rolled`
+    /// cleared under the same lock: from then on nothing is handed to it, so it keeps no segment file open.
+    stopped: bool,
 }
 
 /// The state is plain data that stays consistent even if a holder panicked, so a poisoned lock is still usable.
@@ -79,10 +84,11 @@ impl WriteBack {
         }
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
-                file,
+                file: Some(file),
                 position,
                 rolled: Vec::new(),
                 stop: false,
+                stopped: false,
             }),
             wake: Condvar::new(),
         });
@@ -113,14 +119,26 @@ impl WriteBack {
     }
 
     /// Called after a roll: write back the old segment `old` up to `old_end`, then follow the new one from `position`.
+    /// Nothing is handed to a helper that has stopped.
     pub(crate) fn switch(&mut self, old: Arc<File>, old_end: u64, file: Arc<File>, position: u64) {
         self.next_wake = position.saturating_add(STEP);
         let mut state = lock(&self.shared);
+        if state.stopped {
+            return;
+        }
         state.rolled.push((old, old_end));
-        state.file = file;
+        state.file = Some(file);
         state.position = position;
         drop(state);
         self.shared.wake.notify_one();
+    }
+
+    /// For tests: whether the helper has stopped on its own, how many rolled segments wait for it, and whether it
+    /// still holds the active segment's file.
+    #[cfg(test)]
+    pub(crate) fn held(&self) -> (bool, usize, bool) {
+        let state = lock(&self.shared);
+        (state.stopped, state.rolled.len(), state.file.is_some())
     }
 }
 
@@ -148,8 +166,18 @@ enum Work {
     Stop,
 }
 
-/// The helper thread: write back up to the page that holds the writer's position, then sleep until woken.
+/// The helper thread: write back up to the page that holds the writer's position, then sleep until woken. When it
+/// exits, it marks itself stopped and lets go of every file it was given.
 fn run(shared: &Shared, ctx: &Context) {
+    follow(shared, ctx);
+    let mut state = lock(shared);
+    state.stopped = true;
+    state.file = None;
+    state.rolled.clear();
+}
+
+/// Writes back what the writer hands over until told to stop, or until a call fails or is unsupported.
+fn follow(shared: &Shared, ctx: &Context) {
     #[cfg(target_os = "linux")]
     let page = crate::mmap::page_size() as u64;
     #[cfg(not(target_os = "linux"))]
@@ -177,12 +205,12 @@ fn run(shared: &Shared, ctx: &Context) {
                     }
                     continue;
                 }
-                if !current
-                    .as_ref()
-                    .is_some_and(|c| Arc::ptr_eq(c, &state.file))
-                {
+                let Some(file) = state.file.clone() else {
+                    break Work::Stop;
+                };
+                if !current.as_ref().is_some_and(|c| Arc::ptr_eq(c, &file)) {
                     // A new segment from its first page (its header too).
-                    current = Some(Arc::clone(&state.file));
+                    current = Some(Arc::clone(&file));
                     done = 0;
                 }
                 // Whole pages before the one that holds the position.
@@ -190,7 +218,7 @@ fn run(shared: &Shared, ctx: &Context) {
                 if done < limit {
                     let to = limit.min(done.saturating_add(STEP));
                     let from = std::mem::replace(&mut done, to);
-                    break Work::Range(Arc::clone(&state.file), from, to);
+                    break Work::Range(file, from, to);
                 }
                 state = shared.wake.wait(state).unwrap_or_else(|e| e.into_inner());
             }
@@ -215,7 +243,7 @@ fn run(shared: &Shared, ctx: &Context) {
             });
             drop(lost);
             ctx.writeback_failed
-                .store(true, std::sync::atomic::Ordering::Relaxed);
+                .store(true, std::sync::atomic::Ordering::Release);
             return;
         }
     }

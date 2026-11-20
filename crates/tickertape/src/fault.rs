@@ -37,6 +37,9 @@ pub enum Point {
     CheckpointBeforeMarker,
     /// Renaming a retention segment (inject EXDEV to exercise the copy path).
     RetentionRename,
+    /// Syncing the checkpoint marker in `retention::apply` (an archiver other than the writer), after reading the slot
+    /// that decides a removal and before removing anything.
+    RetentionMarkerSync,
     /// Syncing an archive copy before removing its source.
     RetentionCopySync,
     /// Syncing the destination directory after an archive rename or copy.
@@ -53,6 +56,10 @@ pub enum Point {
     /// Recovery repairing a corrupt tail, after the repaired copy replaced the segment, before later segments are
     /// handled (stands in for a crash there).
     RepairAfterRename,
+    /// Recovery replacing an all-zero segment file of invalid length (a header that never reached the disk) by a new
+    /// empty segment, after the new one was prepared and synced under a temporary name, before it is renamed over the
+    /// old file (stands in for a crash there).
+    RestoreBeforeRename,
     /// After a reader lists the segments and before it opens the one it chose (`Reader::open`,
     /// `Reader::open_mapped`, `Reader::seek`). Arm with [`run_at`].
     ReaderOpen,

@@ -897,3 +897,113 @@ fn two_unwritten_segments_restore_the_first_and_disconnect_the_second() {
     );
     assert_eq!(w.next_seq(), previous_base);
 }
+
+/// The regular files of `dir` (not `writer.lock`) and their contents.
+fn snapshot(dir: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+    let mut files: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.is_file() && p.file_name().unwrap() != "writer.lock")
+        .map(|p| {
+            let bytes = std::fs::read(&p).unwrap();
+            (p, bytes)
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+/// A copy of the regular files of `from` in a new directory.
+fn copy_journal(from: &std::path::Path) -> tempfile::TempDir {
+    let to = tempfile::tempdir().unwrap();
+    for (path, bytes) in snapshot(from) {
+        std::fs::write(to.path().join(path.file_name().unwrap()), bytes).unwrap();
+    }
+    to
+}
+
+/// A segment file of invalid length holding only zeros, with a later segment after it, is replaced by preparing the
+/// new segment under a temporary name and renaming it over the old file (C8): a failed allocation, or a crash after
+/// the copy is synced and before the rename, leaves the old file in place, and the next open recovers exactly as an
+/// uninterrupted one does (it does not find a missing middle segment).
+#[test]
+fn interrupted_replacement_of_an_unwritten_segment_leaves_no_gap() {
+    use tickertape::fault::{self, Point};
+    for (point, errno) in [(Point::Preallocate, 28), (Point::RestoreBeforeRename, 5)] {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, newest, previous) = rolled_after_checkpoint(dir.path(), 2);
+        let previous_base = segments(dir.path()).iter().rev().nth(1).unwrap().0;
+        open_raw(&previous).set_len(0).unwrap();
+        open_raw(&previous).set_len(100).unwrap();
+        let reference = copy_journal(dir.path());
+        let expected = Writer::open(reference.path(), small_config()).unwrap();
+        assert!(has_restored(
+            &expected,
+            &reference.path().join(previous.file_name().unwrap())
+        ));
+
+        fault::fail_next(point, errno);
+        let failed = Writer::open(dir.path(), small_config());
+        fault::clear();
+        assert!(failed.is_err(), "{point:?}: {failed:?}");
+        assert!(previous.exists() && newest.exists(), "{point:?}");
+        let w = Writer::open(dir.path(), small_config()).unwrap();
+        assert!(
+            has_restored(&w, &previous),
+            "{point:?}: {:?}",
+            w.recovery_report()
+        );
+        assert_eq!(w.next_seq(), previous_base, "{point:?}");
+        assert_eq!(w.next_seq(), expected.next_seq(), "{point:?}");
+        let names = |d: &std::path::Path| {
+            segments(d)
+                .into_iter()
+                .map(|(base, _)| base)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(dir.path()), names(reference.path()), "{point:?}");
+        assert_eq!(
+            std::fs::metadata(&previous).unwrap().len(),
+            SMALL_SEGMENT,
+            "{point:?}"
+        );
+        drop(w);
+        assert_eq!(read_all(dir.path()).len(), read_all(reference.path()).len());
+    }
+}
+
+/// Under `Fail`, a successor whose header never reached the disk is restored only once nothing in the scan step can
+/// still refuse (C11): in front of it, a segment whose seal's commit word is empty with non-zero bytes beyond the
+/// seal makes `Fail` refuse (`BadSeal`), and the refused open changes no file, byte for byte, whether the successor
+/// would have had its header written again or would have been replaced.
+#[test]
+fn fail_refusing_before_an_unwritten_successor_changes_no_file() {
+    for empty_file in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, newest, previous) = rolled_after_checkpoint(dir.path(), 1);
+        if empty_file {
+            open_raw(&newest).set_len(0).unwrap();
+        } else {
+            let len = std::fs::metadata(&newest).unwrap().len();
+            zero_range(&newest, 0, len);
+        }
+        let (end, _) = end_of_records(&previous);
+        zero_range(&previous, end, format::COMMIT_WORD_LEN as u64);
+        open_raw(&previous)
+            .write_all_at(&[0xAB; 8], end + format::SEAL_LEN as u64 + 16)
+            .unwrap();
+        let before = snapshot(dir.path());
+        match Writer::open(dir.path(), small_config().recovery(RecoveryPolicy::Fail)) {
+            Err(Error::Corrupt {
+                path,
+                offset,
+                reason: CorruptReason::BadSeal,
+            }) => assert_eq!((path, offset), (previous.clone(), end)),
+            other => panic!("empty file {empty_file}: expected BadSeal, got {other:?}"),
+        }
+        assert!(
+            snapshot(dir.path()) == before,
+            "empty file {empty_file}: a file changed"
+        );
+    }
+}

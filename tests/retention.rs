@@ -868,3 +868,25 @@ fn verify_tolerates_retention_after_a_roll_during_the_scan() {
     );
     tickertape::fault::clear();
 }
+
+/// An archiver's `retention::apply` syncs the checkpoint marker it read before it removes anything (C14): a writer
+/// writes a marker slot before its barrier, so without the sync a power loss could bring back the previous marker,
+/// naming a segment the archiver had removed durably. A failed sync removes nothing.
+#[test]
+fn archiver_syncs_the_marker_before_removing() {
+    use tickertape::fault::{self, Point};
+    let (dir, writer) = journal(true);
+    let before = segments(dir.path());
+    let plan = retention::plan(dir.path(), &Policy::default().max_segments(3)).unwrap();
+    assert_eq!(plan.segments().len(), 3);
+    fault::fail_next(Point::RetentionMarkerSync, 5); // EIO
+    match retention::apply(dir.path(), &plan, &Action::Delete) {
+        Err(Error::Io { op, .. }) => assert_eq!(op, "sync checkpoint marker"),
+        other => panic!("expected the marker sync error, got {other:?}"),
+    }
+    assert_eq!(segments(dir.path()), before);
+    let report = retention::apply(dir.path(), &plan, &Action::Delete).unwrap();
+    assert_eq!(report.removed_segments, 3);
+    fault::clear();
+    drop(writer);
+}

@@ -593,3 +593,63 @@ fn failed_early_writeback_fails_the_next_checkpoint() {
         assert_eq!(w.next_seq(), 10 + records + 5);
     }
 }
+
+/// A failure of the early write-back helper after the last checkpoint, with no background checkpoint pending, is
+/// returned once by the next of `request_checkpoint`, `checkpoint_progress`, `checkpoint` and `close` (Linux, ADR
+/// 0038 → Early write-back); after it, the others return `DurabilityLost`.
+#[cfg(target_os = "linux")]
+#[test]
+fn failed_early_writeback_reaches_the_next_call_once() {
+    let _serial = serial();
+    for call in [
+        "request_checkpoint",
+        "checkpoint_progress",
+        "checkpoint",
+        "close",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = Writer::open(dir.path(), small_config()).unwrap();
+        append_n(&mut w, 10);
+        w.request_checkpoint().unwrap();
+        wait_finished(&mut w);
+        fault::fail_next_background(Point::EarlyWriteback, EIO);
+        append_n(&mut w, 1_000);
+        wait_failed(&w);
+        let result = match call {
+            "request_checkpoint" => w.request_checkpoint().map(drop),
+            "checkpoint_progress" => w.checkpoint_progress().map(drop),
+            "checkpoint" => w.checkpoint(),
+            _ => {
+                let result = w.close();
+                match result {
+                    Err(Error::Io { op, .. }) => assert_eq!(op, "start write-back of segment data"),
+                    other => panic!("close: expected the write-back error, got {other:?}"),
+                }
+                assert_eq!(marker(dir.path()).unwrap().next_seq, 10);
+                continue;
+            }
+        };
+        match result {
+            Err(Error::Io { op, .. }) => {
+                assert_eq!(op, "start write-back of segment data", "{call}")
+            }
+            other => panic!("{call}: expected the write-back error, got {other:?}"),
+        }
+        {
+            assert!(
+                matches!(w.request_checkpoint(), Err(Error::DurabilityLost)),
+                "{call}"
+            );
+            assert!(
+                matches!(w.checkpoint_progress(), Err(Error::DurabilityLost)),
+                "{call}"
+            );
+            assert!(
+                matches!(w.checkpoint(), Err(Error::DurabilityLost)),
+                "{call}"
+            );
+            assert!(matches!(w.close(), Err(Error::DurabilityLost)), "{call}");
+        }
+        assert_eq!(marker(dir.path()).unwrap().next_seq, 10, "{call}");
+    }
+}

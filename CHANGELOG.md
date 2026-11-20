@@ -26,13 +26,20 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   header again under both policies where the scan enters the segment (or replaces a file holding only zeros whose
   length is not a valid segment size), reported as the new `RecoveryAction::RestoredHeader` (Python:
   `"restored_header"`); until a writer has opened the journal, readers and `verify` report that header as invalid
-  (crash contract C8, C11). The format is unchanged. Fault injection gains `Point::RollAfterLink`.
+  (crash contract C8, C11). A file it replaces is replaced by renaming a prepared copy over it, so an interrupted
+  open leaves no gap, and under `Fail` the header is restored only after the open has decided not to refuse at that
+  step. The format is unchanged. Fault injection gains `Point::RollAfterLink` and `Point::RestoreBeforeRename`.
 - Library: early write-back on Linux, `WriterConfig::early_writeback` (default on, with `prefault`): a helper thread
   (`tickertape-writeback`) starts the kernel's write-back of the whole pages behind the write position with
   `sync_file_range(SYNC_FILE_RANGE_WRITE)` every 1 MiB and of a segment the writer rolls past, so checkpoints find
-  little dirty data. It makes nothing durable; an I/O error from it fails the next checkpoint with that error and
-  poisons the writer (`metrics().poisoned` at once). No effect on macOS. Fault injection gains
-  `Point::EarlyWriteback`.
+  little dirty data. It makes nothing durable; an I/O error from it poisons the writer (`metrics().poisoned` at once)
+  and is returned once by the next `request_checkpoint`, `checkpoint_progress`, `checkpoint` or `close` (which joins
+  the helper first). A helper that stopped (that error, or the call unsupported) holds no segment file and is handed
+  none. No effect on macOS. Fault injection gains `Point::EarlyWriteback`.
+- Fixed: `retention::apply` (`tickertape archive`) syncs the checkpoint marker after reading the slot that decides a
+  removal and before removing anything, so a power loss right after a writer wrote a new marker slot, and before its
+  marker barrier, can no longer bring back a marker that names a segment the archiver removed (crash contract C14).
+  Fault injection gains `Point::RetentionMarkerSync`.
 - Library: `WriterConfig::helper_cpus(HelperCpus)` places the writer's helper threads (checkpoint, prefault,
   write-back, spare). Default `HelperCpus::Process`: on Linux each helper sets its affinity when it starts to every
   CPU the process's cpuset allows except the kernel's isolated CPUs, so a writer thread pinned to one CPU no longer

@@ -103,9 +103,12 @@ pub(crate) struct Context {
     /// failed `fdatasync` can mark pages clean without writing them, and the error is reported to one caller only).
     pub(crate) lost: Mutex<bool>,
     /// The error that made the early write-back helper set `lost` (Linux, ADR 0038 → Early write-back), returned
-    /// once by the next checkpoint instead of `DurabilityLost`. Locked only while `lost` is held.
+    /// once: taken by the next checkpoint (which then returns it instead of `DurabilityLost`) or by the writer's next
+    /// `request_checkpoint`, `checkpoint_progress`, `checkpoint` or `close`, whichever comes first. Never held while
+    /// waiting for `lost`.
     pub(crate) writeback_failure: Mutex<Option<Error>>,
-    /// Set (after `lost`) when the early write-back helper failed, for `Writer::metrics` without taking `lost`.
+    /// Set (after `lost` and `writeback_failure`, with release ordering) when the early write-back helper failed, for
+    /// `Writer::metrics` and the writer's collection without taking `lost`.
     pub(crate) writeback_failed: std::sync::atomic::AtomicBool,
     /// Wakes durable-only readers once a marker is durable (ADR 0017).
     pub(crate) notify: Option<NotifyPublisher>,
@@ -227,7 +230,7 @@ pub(crate) fn retention_pass(
     report: &mut Report,
 ) -> Option<Error> {
     crate::retention::plan(dir, policy)
-        .and_then(|plan| crate::retention::apply_into(dir, &plan, action, report))
+        .and_then(|plan| crate::retention::apply_into(dir, &plan, action, report, false))
         .err()
 }
 

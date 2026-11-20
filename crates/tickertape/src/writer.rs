@@ -515,8 +515,9 @@ impl Writer {
     ///
     /// [`Error::Io`] if a sync call fails. The writer is then poisoned: every later call returns
     /// [`Error::DurabilityLost`], because a failed sync can drop data that a retry
-    /// would not rewrite. Appends keep working. If a background checkpoint failed and no call has returned its error
-    /// yet, this returns that error (and the writer is poisoned).
+    /// would not rewrite. Appends keep working. If a background checkpoint or the early write-back helper (Linux,
+    /// [`WriterConfig::early_writeback`](crate::WriterConfig::early_writeback)) failed and no call has returned its
+    /// error yet, this returns that error (and the writer is poisoned).
     pub fn checkpoint(&mut self) -> Result<()> {
         self.finish_background()?;
         if self.poisoned {
@@ -599,8 +600,9 @@ impl Writer {
     ///
     /// # Errors
     ///
-    /// - The error of an earlier background checkpoint that failed, if no call has returned it yet. The writer is then
-    ///   poisoned, as after a failed [`Writer::checkpoint`], and nothing is requested.
+    /// - The error of an earlier background checkpoint that failed, or of the early write-back helper (Linux), if no
+    ///   call has returned it yet. The writer is then poisoned, as after a failed [`Writer::checkpoint`], and nothing
+    ///   is requested.
     /// - [`Error::DurabilityLost`] if the writer is poisoned.
     /// - [`Error::Io`] if the checkpoint thread cannot be started. Nothing is requested, and the writer is not
     ///   poisoned.
@@ -663,7 +665,8 @@ impl Writer {
     ///
     /// # Errors
     ///
-    /// The error of a background checkpoint that failed, the first time it is reported (the writer is then poisoned);
+    /// The error of a background checkpoint or of the early write-back helper (Linux) that failed, the first time it
+    /// is reported (the writer is then poisoned);
     /// [`Error::DurabilityLost`] whenever the writer is poisoned after that, also after a failed
     /// [`Writer::checkpoint`] or an abandoned write that could not be zeroed durably. A poisoned writer reports no
     /// progress: nothing it does is durable any more.
@@ -683,11 +686,17 @@ impl Writer {
     ///
     /// # Errors
     ///
-    /// - The error of a background checkpoint that failed, if no earlier call has returned it.
+    /// - The error of a background checkpoint or of the early write-back helper (Linux) that failed, if no earlier call
+    ///   has returned it. The helper is joined first, so an error from a call it was making is included.
     /// - [`Error::DurabilityLost`] if the writer is poisoned: a checkpoint failed earlier (and its error was returned
     ///   then), or an abandoned write could not be zeroed durably ([`Writer::abandoned_write_error`]).
     pub fn close(mut self) -> Result<()> {
-        let result = match self.finish_background() {
+        if let Some(background) = &self.background {
+            background.wait_idle();
+        }
+        // Join the early write-back helper first, so that an error from a call it was making is reported here.
+        drop(self.writeback.take());
+        let result = match self.collect() {
             Ok(()) if self.poisoned => Err(Error::DurabilityLost),
             other => other,
         };
@@ -704,8 +713,30 @@ impl Writer {
     }
 
     /// Takes what the checkpoint thread has finished since the last call: the newest durable marker, retention's
-    /// results, and the first failure, which is returned (once) and poisons the writer.
+    /// results, and the first failure, which is returned (once) and poisons the writer. A failure of the early
+    /// write-back helper that no checkpoint has returned yet is such a failure too (ADR 0038 → Early write-back).
     fn collect(&mut self) -> Result<()> {
+        let background = self.collect_background();
+        let writeback = if self.ctx.writeback_failed.load(Ordering::Acquire) {
+            // Taken once, here or by the checkpoint that found `lost` set (whichever comes first).
+            checkpoint::lock(&self.ctx.writeback_failure).take()
+        } else {
+            None
+        };
+        match background {
+            Err(error) => Err(error),
+            Ok(()) => match writeback {
+                Some(error) if !self.poisoned => {
+                    self.poisoned = true;
+                    Err(error)
+                }
+                _ => Ok(()),
+            },
+        }
+    }
+
+    /// The checkpoint thread's part of [`Writer::collect`].
+    fn collect_background(&mut self) -> Result<()> {
         let shared = match &self.background {
             Some(background)
                 if background.shared.posted.load(Ordering::Acquire) != self.collected =>
@@ -880,7 +911,13 @@ impl Writer {
             return;
         };
         let result = crate::retention::plan(&self.dir, policy).and_then(|plan| {
-            crate::retention::apply_into(&self.dir, &plan, action, &mut self.retention_report)
+            crate::retention::apply_into(
+                &self.dir,
+                &plan,
+                action,
+                &mut self.retention_report,
+                false,
+            )
         });
         if let Err(error) = result {
             self.last_retention_error = Some(error);
@@ -1234,6 +1271,15 @@ struct RecoveredState {
     dirty: Vec<DirtySegment>,
 }
 
+/// How [`Recovery::restore_unwritten_header`] restores a segment whose header never reached the disk.
+#[derive(Debug, Clone, Copy)]
+enum Restore {
+    /// Write the header again; the file's length `len` is a valid segment size.
+    Header { len: u64 },
+    /// Replace the file, which holds only zeros and whose length is not a valid segment size, by a new empty segment.
+    Replace,
+}
+
 /// Recovery context (`docs/format.md` → Recovery).
 struct Recovery<'a> {
     dir: &'a Path,
@@ -1364,18 +1410,34 @@ impl Recovery<'_> {
                         // other error (an I/O error opening, reading or mapping it: `EACCES`, `EMFILE`, `ENOMEM`) says
                         // nothing about the journal and is returned here, before anything is changed, under both
                         // policies.
-                        let opened = match self.open_successor(seq) {
-                            Ok(next) => Some(next),
-                            Err(Error::Corrupt { .. } | Error::UnsupportedVersion { .. }) => None,
+                        // A successor whose header never reached the disk counts as opening, but its header is
+                        // restored only below, once nothing in this step can still refuse: a refused open changes
+                        // nothing here (C11).
+                        let opened = match open_segment(self.dir, seq) {
+                            Ok(next) => Some(Ok(next)),
+                            Err(Error::Corrupt { .. }) => {
+                                self.probe_unwritten_header(seq)?.map(Err)
+                            }
+                            Err(Error::UnsupportedVersion { .. }) => None,
                             Err(e) => return Err(e),
                         };
-                        if let Some(next) = opened {
+                        if let Some(successor) = opened {
                             // The successor for exactly `seq` exists, is not this segment (at the first record slot
                             // `seq` is this segment's own base), has not been visited, and opens and maps: `offset`
                             // is where this segment's seal belongs, and the chain continues in the successor (ADR
                             // 0035, "Damage around a seal"). A valid header alone is not enough: `open_segment`
                             // must succeed.
-                            if tail_end.is_some_and(|end| end > offset + format::SEAL_LEN as u64) {
+                            let beyond_seal =
+                                tail_end.is_some_and(|end| end > offset + format::SEAL_LEN as u64);
+                            if beyond_seal && self.config.recovery == RecoveryPolicy::Fail {
+                                return Err(Error::corrupt(
+                                    &seg.path,
+                                    offset,
+                                    CorruptReason::BadSeal,
+                                ));
+                            }
+                            let next = self.enter(seq, successor)?;
+                            if beyond_seal {
                                 // Bytes beyond the seal: no crash leaves them (a roll writes nothing after the seal,
                                 // and records `seq` onwards are in the successor), so this is a damaged seal, not
                                 // missing history, and later segments are not evidence. They are never records of
@@ -1383,14 +1445,8 @@ impl Recovery<'_> {
                                 // them as any repair does, then reseal and continue into the successor in this open.
                                 // This is exactly where an interrupted repair leaves the next open (the segment ends
                                 // at `offset`, followed by the same branch below), so an interruption at any point
-                                // gives the same journal. `Fail` refuses: the bytes are damage.
-                                if self.config.recovery == RecoveryPolicy::Fail {
-                                    return Err(Error::corrupt(
-                                        &seg.path,
-                                        offset,
-                                        CorruptReason::BadSeal,
-                                    ));
-                                }
+                                // gives the same journal. `Fail` refuses (above, before anything is changed): the
+                                // bytes are damage.
                                 seg = self.repair_tail(seg, offset, CorruptReason::BadSeal)?;
                             } else {
                                 // A crash between publishing the successor and sealing this segment (or the seal's
@@ -1547,53 +1603,106 @@ impl Recovery<'_> {
     /// [`RecoveryAction::RestoredHeader`]. Any other failure to open is returned unchanged.
     fn open_successor(&mut self, base: u64) -> Result<Segment> {
         match open_segment(self.dir, base) {
-            Err(Error::Corrupt { .. }) if self.restore_unwritten_header(base)? => {
-                open_segment(self.dir, base)
-            }
+            Err(e @ Error::Corrupt { .. }) => match self.probe_unwritten_header(base)? {
+                Some(restore) => self.restore_unwritten_header(base, restore),
+                None => Err(e),
+            },
             other => other,
         }
     }
 
-    /// See [`Recovery::open_successor`]: true if the segment for `base` had an unwritten header and now has one.
-    fn restore_unwritten_header(&mut self, base: u64) -> Result<bool> {
+    /// The successor for `base` as [`Recovery::open_successor`] gives it: `Ok` if it opened as it is, `Err` if its
+    /// header must be restored first (found by [`Recovery::probe_unwritten_header`]), which this does.
+    fn enter(
+        &mut self,
+        base: u64,
+        successor: std::result::Result<Segment, Restore>,
+    ) -> Result<Segment> {
+        match successor {
+            Ok(next) => Ok(next),
+            Err(restore) => self.restore_unwritten_header(base, restore),
+        }
+    }
+
+    /// See [`Recovery::open_successor`]: whether the segment for `base`, which did not open, has a header that never
+    /// reached the disk, and how it would be restored. Reads only.
+    fn probe_unwritten_header(&mut self, base: u64) -> Result<Option<Restore>> {
         let path = journal::segment_path(self.dir, base);
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)
-            .map_err(|e| Error::io("open segment", &path, e))?;
+        let file = File::open(&path).map_err(|e| Error::io("open segment", &path, e))?;
         let len = file
             .metadata()
             .map_err(|e| Error::io("stat segment", &path, e))?
             .len();
         let head_len = len.min(format::SEGMENT_HEADER_LEN as u64);
         if !all_zero(&file, &path, 0, head_len)? {
-            return Ok(false);
+            return Ok(None);
         }
         if len >= format::SEGMENT_HEADER_LEN as u64 && format::validate_segment_size(len).is_ok() {
-            let header = format::encode_segment_header(&SegmentHeader {
-                segment_size: len,
-                base_seq: base,
-                created_unix_ns: crate::clock::realtime_ns(),
-            });
-            file.write_all_at(&header, 0)
-                .map_err(|e| Error::io("write segment header", &path, e))?;
-            mmap::sync_data(&file).map_err(|e| Error::io("sync segment", &path, e))?;
-        } else {
-            if !all_zero(&file, &path, head_len, len)? {
-                return Ok(false);
+            return Ok(Some(Restore::Header { len }));
+        }
+        if !all_zero(&file, &path, head_len, len)? {
+            return Ok(None);
+        }
+        Ok(Some(Restore::Replace))
+    }
+
+    /// Restores the header of the segment for `base` as `restore` says (see [`Recovery::open_successor`]), reports it
+    /// and opens the segment.
+    ///
+    /// A file replaced by a new empty segment is replaced by renaming a prepared, synced copy over it, as a tail repair
+    /// does, so that the name always holds a segment for `base`: an interruption leaves either the old all-zero file,
+    /// which the next open restores in the same way, or the new segment, and at most a temporary file, which the next
+    /// open removes.
+    fn restore_unwritten_header(&mut self, base: u64, restore: Restore) -> Result<Segment> {
+        let path = journal::segment_path(self.dir, base);
+        match restore {
+            Restore::Header { len } => {
+                let file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&path)
+                    .map_err(|e| Error::io("open segment", &path, e))?;
+                let header = format::encode_segment_header(&SegmentHeader {
+                    segment_size: len,
+                    base_seq: base,
+                    created_unix_ns: crate::clock::realtime_ns(),
+                });
+                file.write_all_at(&header, 0)
+                    .map_err(|e| Error::io("write segment header", &path, e))?;
+                mmap::sync_data(&file).map_err(|e| Error::io("sync segment", &path, e))?;
             }
-            drop(file);
-            fs::remove_file(&path).map_err(|e| Error::io("remove segment", &path, e))?;
-            let new = create_segment(self.dir, base, self.config.segment_size, true)?;
-            journal::sync_dir(self.dir)?;
-            drop(new);
-            self.dirty_dirs.insert(self.dir.to_path_buf());
+            Restore::Replace => {
+                let size = self.config.segment_size;
+                let tmp = journal::tmp_path(self.dir, base);
+                let _ = fs::remove_file(&tmp);
+                let file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .open(&tmp)
+                    .map_err(|e| Error::io("create segment", &tmp, e))?;
+                crate::fault::inject(crate::fault::Point::Preallocate)
+                    .and_then(|()| mmap::preallocate(&file, size))
+                    .map_err(|e| Error::io("preallocate segment", &tmp, e))?;
+                let header = format::encode_segment_header(&SegmentHeader {
+                    segment_size: size,
+                    base_seq: base,
+                    created_unix_ns: crate::clock::realtime_ns(),
+                });
+                file.write_all_at(&header, 0)
+                    .map_err(|e| Error::io("write segment header", &tmp, e))?;
+                mmap::sync_data(&file).map_err(|e| Error::io("sync segment", &tmp, e))?;
+                crate::fault::inject(crate::fault::Point::RestoreBeforeRename)
+                    .map_err(|e| Error::io("replace segment", &path, e))?;
+                fs::rename(&tmp, &path).map_err(|e| Error::io("replace segment", &path, e))?;
+                journal::sync_dir(self.dir)?;
+                self.dirty_dirs.insert(self.dir.to_path_buf());
+            }
         }
         self.report
             .actions
             .push(RecoveryAction::RestoredHeader { segment: path });
-        Ok(true)
+        open_segment(self.dir, base)
     }
 
     fn dangling(&self, c: CheckpointSlot) -> Error {
@@ -2139,6 +2248,41 @@ mod tests {
             reopened.recovery_report()
         );
         assert_eq!(reopened.next_seq(), 1);
+    }
+
+    /// An early write-back helper that stopped on its own (here as for an unsupported call) is handed nothing more:
+    /// after many rolls, with retention deleting the segments rolled past, no rolled segment waits for it and it holds
+    /// no segment file, so no descriptor or deleted segment's space is kept (Linux; ADR 0038 → Early write-back).
+    #[cfg(all(target_os = "linux", feature = "fault-injection"))]
+    #[test]
+    fn a_stopped_writeback_helper_is_handed_no_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = WriterConfig::default()
+            .segment_size(format::SEGMENT_SIZE_UNIT)
+            .retention(
+                crate::retention::Policy::default().max_segments(2),
+                crate::retention::Action::Delete,
+            );
+        let mut w = Writer::open(dir.path(), config).unwrap();
+        crate::fault::fail_next_background(crate::fault::Point::EarlyWriteback, libc::EINVAL);
+        let deadline = Instant::now() + std::time::Duration::from_secs(30);
+        let first = w.active.base;
+        while w.active.base == first {
+            append_one(&mut w);
+        }
+        while !w.writeback.as_ref().unwrap().held().0 {
+            assert!(Instant::now() < deadline, "the helper did not stop");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        for _ in 0..50 {
+            let base = w.active.base;
+            while w.active.base == base {
+                append_one(&mut w);
+            }
+            w.checkpoint().unwrap();
+        }
+        assert!(w.retention_report().removed_segments >= 40);
+        assert_eq!(w.writeback.as_ref().unwrap().held(), (true, 0, false));
     }
 
     /// Every helper thread started from a writer thread pinned to one CPU runs on the process's CPUs by default,

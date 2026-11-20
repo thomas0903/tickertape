@@ -154,7 +154,10 @@ there); it matters only for an OS crash or power loss. Item by item:
   either. Recovery now handles it where the scan enters a segment (by a valid seal, or as the successor at the seal's
   place): an all-zero header is written again (base from the name, size from the file, creation time at recovery)
   and synced, and a file holding only zeros whose length is not a valid segment size is replaced by a new empty
-  segment (`RecoveryAction::RestoredHeader`). The restored header is the one the roll wrote (the name gives the base,
+  segment (`RecoveryAction::RestoredHeader`). The replacement is prepared and synced under a temporary name and
+  renamed over the old file, as a tail repair is, so the name holds a segment for that base at every moment: an
+  interruption leaves the old file, which the next open restores the same way, and at most a temporary file, which it
+  removes (review round 1: unlinking first could leave a missing middle segment, which no later open accepts). The restored header is the one the roll wrote (the name gives the base,
   the file its size; only the creation time differs), so the scan then sees the state a durable header would have
   given and handles it by the existing rules: usually an empty commit word at the first record slot (the first
   records share the header's page), an uncommitted end; evidence of later records, or later segments disconnected,
@@ -162,20 +165,33 @@ there); it matters only for an OS crash or power loss. Item by item:
 - **C11 (corruption).** A header that is entirely zero, in a segment the scan enters, is now taken for the crash
   state above, also under `Fail`; a damaged header that is not all zero is handled as before. Only an all-zero file
   is ever replaced, so no non-zero byte is removed by this. The segment the scan starts in (the marker's) is never
-  restored: its header was synced before the marker, and an invalid header there still makes the open fail. Under
-  `Fail` the restored header stays if the open then refuses for another reason (C11 lists what an open may change
-  before it refuses).
+  restored: its header was synced before the marker, and an invalid header there still makes the open fail. At an
+  empty commit word in front of such a successor, recovery first checks without writing whether the header can be
+  restored, and restores it only once nothing in that scan step can still refuse: when the predecessor's bytes beyond
+  the seal make `Fail` refuse (`BadSeal`), no file has changed. Under `Fail` a restored header stays if the open
+  refuses for another reason in a later step (C11 lists what an open may change before it refuses).
 - **C9 (disk full while creating a segment).** Unchanged: preallocation happens before the link and fails there. An
   error writing the header back surfaces at the next checkpoint's `fdatasync` (C12).
 - **C13 and C14.** Unaffected: durable-only readers read below the marker, and retention removes only segments
   before it.
 
+**An archiver between a marker's write and its barrier** (review round 1; also true before this ADR). A checkpoint
+writes its marker slot and then syncs it. An external `retention::apply` (`tickertape archive --delete`) that read the
+new slot in between could remove the segments before it durably, and a power loss could then bring back the previous
+marker, naming a removed segment (`DanglingCheckpoint`). `retention::apply` now syncs the marker file after reading the
+slot that decides a removal and before removing anything (once per slot it has not synced yet); a sync covers every
+write the read saw, so the slot it relies on is durable. The writer's own retention runs after its marker barrier and
+does not sync again. Test: `tests/retention.rs::archiver_syncs_the_marker_before_removing` (new fault point
+`fault::Point::RetentionMarkerSync`).
+
 Until a writer has opened the journal after such a crash, a reader that follows the old segment's seal, and `verify`,
 see an invalid header in that segment where a durable header would have shown an empty segment. The format is
 unchanged; `format.md` → Rolling no longer lists the sync. Tests: `tests/recovery.rs::unwritten_newest_segment_is_restored_under_both_policies`,
 `::empty_newest_segment_file_is_replaced`, `::unwritten_first_page_with_later_records_is_a_committed_tail`,
-`::two_unwritten_segments_restore_the_first_and_disconnect_the_second`, and the kill test above (fault point
-`fault::Point::RollAfterLink`).
+`::two_unwritten_segments_restore_the_first_and_disconnect_the_second`,
+`::interrupted_replacement_of_an_unwritten_segment_leaves_no_gap` (fault points `fault::Point::Preallocate` and the new
+`fault::Point::RestoreBeforeRename`), `::fail_refusing_before_an_unwritten_successor_changes_no_file`, and the kill
+test above (fault point `fault::Point::RollAfterLink`).
 
 The alternative, syncing on the thread that prepares the spare, would not remove the state: the header names the base
 sequence number, known only at the roll, and the link must follow the header at once for readers to follow the seal.
@@ -203,11 +219,16 @@ writer's helper threads):
   flush, no promise. Records may reach the disk earlier than before, which C8 always allowed. Every checkpoint still
   runs all its steps. Without the wait flags the call neither checks nor advances the file's write-back error state,
   so a write-back failure it started is still reported to the checkpoint's `fdatasync`; and if the call itself
-  returns an I/O error, the helper marks the writer's data lost (`Context::lost`, as a failed sync does) and stops,
-  the next checkpoint returns that error and writes no marker, and later ones return `DurabilityLost`
-  (`tests/background_checkpoint.rs::failed_early_writeback_fails_the_next_checkpoint`, fault point
-  `fault::Point::EarlyWriteback`). Errors that mean "not supported here" (`EINVAL`, `ENOSYS`, `EOPNOTSUPP`, `ESPIPE`)
-  stop the helper and change nothing else.
+  returns an I/O error, the helper marks the writer's data lost (`Context::lost`, as a failed sync does) and stops.
+  That error is reported like a failed background checkpoint's: once, by the next checkpoint (which writes no marker)
+  or the next `request_checkpoint`, `checkpoint_progress` or `close`, whichever comes first, also when no checkpoint
+  is pending; later calls return `DurabilityLost`. `close` joins the helper before it checks, so an error from a call
+  the helper was making is not missed (`tests/background_checkpoint.rs::failed_early_writeback_fails_the_next_checkpoint`,
+  `::failed_early_writeback_reaches_the_next_call_once`, fault point `fault::Point::EarlyWriteback`). Errors that mean
+  "not supported here" (`EINVAL`, `ENOSYS`, `EOPNOTSUPP`, `ESPIPE`) stop the helper and change nothing else. A helper
+  that has stopped, for either reason, is marked stopped and lets go of every file under the state's lock, and rolls
+  hand it nothing more, so it keeps no descriptor or deleted segment open
+  (`writer::tests::a_stopped_writeback_helper_is_handed_no_files`).
 - Pages behind the writer are never stored into again, so starting their write-back does not make the writer take a
   write fault on them.
 - **macOS:** not built. macOS has no call that starts write-back of a file range without waiting for it, and its
@@ -252,6 +273,8 @@ page cache each second on Linux (`dirty_bytes`, `writeback_bytes` in the writer'
 - Helper threads no longer inherit a pinned caller's CPU mask unless asked to (`HelperCpus::Inherited`).
 - The abandoned-write path can wait for a background checkpoint to finish (it takes the same lock).
 - The C ABI, the bindings, the CLI and the iceoryx2 recorder adopt the API once this ADR is accepted.
+- An external `retention::apply` syncs the checkpoint marker once per new slot before it removes anything.
 - Tests: `tests/background_checkpoint.rs` (C7, C12, C13, C14 with a checkpoint in flight; the roll kill test; early
-  write-back failure), `tests/recovery.rs` (restored headers), the fork and placement tests in `writer.rs`, the loom
+  write-back failure), `tests/recovery.rs` (restored headers), `tests/retention.rs` (the archiver's marker sync), the
+  fork, placement and stopped-helper tests in `writer.rs`, the loom
   model, and `benches/tests/tools.rs` for the benchmark options.
