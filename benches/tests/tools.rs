@@ -600,3 +600,105 @@ fn sustained_rejects_invalid_configurations_before_creating_directories() {
         assert!(!root.path().join("out").exists(), "{options:?}");
     }
 }
+
+#[test]
+fn scale_measures_every_operation_on_a_tiny_journal() {
+    use std::os::unix::fs::PermissionsExt;
+    // Mock sudo so this test never requests privileges or changes the host cache.
+    for drop_succeeds in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let sudo = root.path().join("sudo");
+        let script = if drop_succeeds {
+            "#!/bin/sh\nexit 0\n"
+        } else {
+            "#!/bin/sh\nexit 1\n"
+        };
+        std::fs::write(&sudo, script).unwrap();
+        std::fs::set_permissions(&sudo, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let dir = root.path().join("journal");
+        let output = Command::new(env!("CARGO_BIN_EXE_tt-scale"))
+            .env("PATH", root.path())
+            .args(["run", "--dir"])
+            .arg(&dir)
+            .args([
+                "--segments",
+                "3",
+                "--segment-size",
+                "65536",
+                "--payload",
+                "100",
+                "--tail-records",
+                "7",
+                "--repeats",
+                "2",
+                "--cold",
+                "--json",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let built = &result["build"];
+        let capacity = built["records_per_segment"].as_u64().unwrap();
+        let records = built["records"].as_u64().unwrap();
+        assert_eq!(records, 2 * capacity + capacity / 2);
+        let measure = &result["measure"];
+        assert_eq!(measure["journal"]["segments"], 3);
+        assert_eq!(measure["journal"]["records"], records);
+        assert_eq!(measure["cold_unavailable"], !drop_succeeds);
+        let runs = measure["runs"].as_array().unwrap();
+        assert_eq!(runs.len(), 11 * 2);
+        for run in runs {
+            assert_eq!(run["cache_dropped"], drop_succeeds, "{run}");
+            assert!(run["wall_s"].as_f64().unwrap() >= 0.0, "{run}");
+            assert!(run["peak_rss_bytes"].as_i64().unwrap() > 0, "{run}");
+        }
+        let run = |op: &str, repeat: u64| {
+            runs.iter()
+                .find(|r| r["op"] == op && r["repeat"] == repeat)
+                .unwrap()
+        };
+        assert_eq!(run("seek-first", 0)["skipped_records"], 0);
+        assert_eq!(run("seek-last", 1)["seq"], records - 1);
+        assert_eq!(run("seek-last", 1)["skipped_records"], capacity / 2 - 1);
+        assert_eq!(run("replay", 0)["records"], records);
+        assert_eq!(run("verify", 1)["problems"], 0);
+        assert_eq!(run("writer-open-clean", 0)["scanned_from_seq"], records);
+        // Each kill leaves 7 records after the marker; each recovery keeps them and checkpoints.
+        let killed = run("writer-open-after-kill", 1);
+        assert_eq!(killed["tail_records"], 7);
+        assert_eq!(killed["scanned_from_seq"], records + 7);
+        assert_eq!(killed["next_seq"], records + 14);
+        let unmarked = run("writer-open-without-marker", 1);
+        assert_eq!(unmarked["had_checkpoint"], false);
+        assert_eq!(unmarked["next_seq"], records + 14);
+        // Measuring again works on what the first measurement left; building into it is refused.
+        let again = Command::new(env!("CARGO_BIN_EXE_tt-scale"))
+            .args(["measure", "--dir"])
+            .arg(&dir)
+            .args(["--ops", "replay,seek-middle", "--json"])
+            .output()
+            .unwrap();
+        assert!(again.status.success());
+        let again: Value = serde_json::from_slice(&again.stdout).unwrap();
+        assert_eq!(again["measure"]["runs"][0]["records"], records + 14);
+        for args in [
+            vec!["build", "--segments", "1"],
+            vec!["measure", "--ops", "wat"],
+            vec!["measure", "--repeats", "0"],
+        ] {
+            let refused = Command::new(env!("CARGO_BIN_EXE_tt-scale"))
+                .args(&args[..1])
+                .arg("--dir")
+                .arg(&dir)
+                .args(&args[1..])
+                .output()
+                .unwrap();
+            assert!(!refused.status.success(), "{args:?}");
+        }
+    }
+}

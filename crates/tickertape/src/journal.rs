@@ -51,6 +51,36 @@ pub(crate) fn list_segments(dir: &Path) -> Result<Vec<(u64, PathBuf)>> {
     Ok(out)
 }
 
+/// The base sequence numbers [`find_bases`] picks out of a listing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Bases {
+    /// The oldest segment's base (`None` if the listing has no segments).
+    pub(crate) oldest: Option<u64>,
+    /// The newest segment's base that is `<= seq` (`None` if there is none).
+    pub(crate) floor: Option<u64>,
+}
+
+/// Picks the oldest base and the newest base `<= seq` out of one listing of `dir`, as [`list_segments`] would list
+/// it, without collecting or sorting the names: time proportional to the directory's entries, memory constant.
+pub(crate) fn find_bases(dir: &Path, seq: u64) -> Result<Bases> {
+    let entries = fs::read_dir(dir).map_err(|e| Error::io("list journal directory", dir, e))?;
+    let mut out = Bases::default();
+    for entry in entries {
+        let entry = entry.map_err(|e| Error::io("list journal directory", dir, e))?;
+        if let Some(base) = entry
+            .file_name()
+            .to_str()
+            .and_then(format::parse_segment_file_name)
+        {
+            out.oldest = Some(out.oldest.map_or(base, |o| o.min(base)));
+            if base <= seq {
+                out.floor = Some(out.floor.map_or(base, |f| f.max(base)));
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Lists stale temporary segment files (`*.tape.tmp`) in `dir`.
 pub(crate) fn list_tmp_files(dir: &Path) -> Result<Vec<PathBuf>> {
     let entries = fs::read_dir(dir).map_err(|e| Error::io("list journal directory", dir, e))?;
@@ -318,6 +348,60 @@ fn with_pread_view<R>(file: &File, path: &Path, f: impl FnOnce(&PreadView<'_>) -
 mod scan_tests {
     use super::*;
     use crate::{NewRecord, Writer, WriterConfig};
+
+    #[test]
+    fn find_bases_agrees_with_the_sorted_listing() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(find_bases(dir.path(), 5).unwrap(), Bases::default());
+        // Names in no particular order, and files that are not segments: a temporary segment, the marker, the
+        // prepared next segment, a name that only looks like one.
+        let bases = [40u64, 7, 1000, 0, 123_456_789, 41];
+        for base in bases {
+            fs::write(segment_path(dir.path(), base), b"").unwrap();
+        }
+        for other in [
+            tmp_path(dir.path(), 3),
+            dir.path().join(CHECKPOINT_FILE),
+            dir.path().join(SPARE_FILE),
+            dir.path().join("00000000000000000002.tape.bak"),
+        ] {
+            fs::write(other, b"").unwrap();
+        }
+        let listed: Vec<u64> = list_segments(dir.path())
+            .unwrap()
+            .into_iter()
+            .map(|(b, _)| b)
+            .collect();
+        assert_eq!(listed, [0, 7, 40, 41, 1000, 123_456_789]);
+        for seq in [
+            0,
+            1,
+            6,
+            7,
+            8,
+            40,
+            41,
+            999,
+            1000,
+            1001,
+            123_456_789,
+            u64::MAX,
+        ] {
+            let expected = Bases {
+                oldest: listed.first().copied(),
+                floor: listed.iter().rev().find(|b| **b <= seq).copied(),
+            };
+            assert_eq!(find_bases(dir.path(), seq).unwrap(), expected, "seq {seq}");
+        }
+        fs::remove_file(segment_path(dir.path(), 0)).unwrap();
+        assert_eq!(
+            find_bases(dir.path(), 3).unwrap(),
+            Bases {
+                oldest: Some(7),
+                floor: None
+            }
+        );
+    }
 
     #[test]
     fn windowed_scan_matches_an_in_memory_scan() {
