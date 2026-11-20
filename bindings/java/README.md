@@ -4,8 +4,9 @@ The Java binding for tickertape: write, follow live and replay journals from Jav
 ABI and the Foreign Function and Memory API, with no JNI and no runtime dependencies. The API guide is
 [`docs/java-api.md`](../../docs/java-api.md); the design is [ADR 0037](../../docs/decisions/0037-java-binding.md).
 
-Not published to Maven Central yet, and not stable before tickertape 1.0. The planned coordinates are
-`io.github.thomas0903:tickertape` (module `io.github.thomas0903.tickertape`).
+Not published to Maven Central yet, and not stable before tickertape 1.0. The coordinates are
+`io.github.thomas0903:tickertape` (module `io.github.thomas0903.tickertape`); the release workflow publishes them once
+the owner enables Maven Central ([`docs/install.md`](../../docs/install.md#java-maven-central)).
 
 ## Build
 
@@ -49,4 +50,4 @@ TICKERTAPE_DURABLE_ONLY=1 example replay /tmp/tt-java
 | `src/test/java` | JUnit tests, including the header checks and the cross-language fixtures |
 | `examples/Example.java` | The runnable example |
 | `scripts/build-native.sh` | Builds the library, the CLI and the C test programs the tests use |
-| `scripts/stage-natives.sh` | Stages the library for the natives JAR (`mvn -Pnatives package`) |
+| `scripts/stage-natives.sh` | Stages one platform's library for its natives JAR (`mvn -Pnatives package`; add `-Prelease` for the sources and Javadoc JARs) |

@@ -191,9 +191,20 @@ jobs:
           cmake --build "$RUNNER_TEMP/cmake-subdir"
           "$RUNNER_TEMP/cmake-subdir/example" "$RUNNER_TEMP/journal" record 3
           "$RUNNER_TEMP/examples/example" "$RUNNER_TEMP/journal" replay
+      # The C library archive as the release workflow builds it (ADR 0031), for the runner's platform and the
+      # workspace version; the install test builds and runs the C and C++ examples from the unpacked archive alone,
+      # through pkg-config, shared and static.
+      - name: C library archive and its install test
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
+          target=$(rustc -vV | sed -n 's/^host: //p')
+          python3 .github/scripts/release.py c-build --source . --tag "v$version" --target "$target"
+          python3 .github/scripts/release.py c-package --source . --tag "v$version" --target "$target" --output "$RUNNER_TEMP/c-dist"
+          crates/tickertape-ffi/scripts/install-test.sh "$RUNNER_TEMP/c-dist/tickertape-c-v$version-$target.tar.gz" "$RUNNER_TEMP/c-install"
 
   # The Java binding (ADR 0037) on JDK 25 against the library built here: JUnit tests (with the cross-language and
-  # released-format fixtures), then the natives JAR and an install test that runs the example from the built JARs.
+  # released-format fixtures), then every Maven file the release publishes for this platform, unsigned (main JAR,
+  # natives JAR, sources and Javadoc JARs), and an install test that runs the example from the built JARs.
   # Nothing is published.
   java:
     name: java binding (${{ matrix.os }})
@@ -225,7 +236,7 @@ jobs:
       - name: Resolve Maven plugins and dependencies
         run: |
           for attempt in 1 2 3; do
-            if mvn -B -ntp -U -f bindings/java/pom.xml -Pnatives dependency:go-offline; then
+            if mvn -B -ntp -U -f bindings/java/pom.xml -Pnatives,release dependency:go-offline; then
               exit 0
             fi
             echo "::warning::Maven resolution failed (attempt $attempt of 3)"
@@ -235,7 +246,7 @@ jobs:
       # On the module path with --illegal-native-access=deny; missing tools (CLI, C programs, Python) fail the run.
       - name: Java tests
         run: mvn -B -ntp -f bindings/java/pom.xml verify -Dtickertape.native.dir="$TT_NATIVE_DIR" -Dtickertape.test.requireTools=true
-      - name: Natives JAR
+      - name: Natives, sources and Javadoc JARs
         run: |
           case "$RUNNER_OS-$RUNNER_ARCH" in
             Linux-X64) platform=linux-x86_64 ;;
@@ -245,7 +256,11 @@ jobs:
             *) echo "unsupported runner: $RUNNER_OS-$RUNNER_ARCH" >&2; exit 1 ;;
           esac
           bindings/java/scripts/stage-natives.sh "$TT_NATIVE_DIR" "$platform"
-          mvn -B -ntp -f bindings/java/pom.xml -Pnatives package -DskipTests
+          mvn -B -ntp -f bindings/java/pom.xml -Pnatives,release package -DskipTests
+          version=$(sed -n 's|^  <version>\(.*\)</version>$|\1|p' bindings/java/pom.xml)
+          for suffix in "" -sources -javadoc "-natives-$platform"; do
+            test -s "bindings/java/target/tickertape-$version$suffix.jar"
+          done
       - name: Install test from the built JARs
         run: bindings/java/scripts/install-test.sh "$RUNNER_TEMP/java-install"
 

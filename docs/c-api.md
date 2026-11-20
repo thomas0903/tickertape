@@ -53,7 +53,9 @@ int main(void) {
 
 ## Building and linking
 
-The library is built from source with Cargo (Rust 1.85 or newer). There is no prebuilt library yet.
+The library is built from source with Cargo (Rust 1.85 or newer). Releases after v0.4.0 will also ship a prebuilt
+library archive per platform, with both libraries, the headers and pkg-config files
+([`install.md` → C library](install.md#c-library); none is published yet).
 
 ```bash
 cargo build --release -p tickertape-ffi

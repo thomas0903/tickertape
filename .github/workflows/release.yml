@@ -43,6 +43,9 @@ jobs:
       sha: ${{ steps.prepare.outputs.sha }}
       # Whether the tag's CLI manifest has cargo-binstall metadata (older tags do not).
       binstall: ${{ steps.prepare.outputs.binstall }}
+      # Whether the tag can build the C library archives, and the Java binding's Maven files (older tags cannot).
+      c_library: ${{ steps.prepare.outputs.c_library }}
+      java: ${{ steps.prepare.outputs.java }}
       publish: ${{ github.event_name == 'push' || inputs.publish }}
     steps:
       - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
@@ -211,10 +214,249 @@ jobs:
           subject-path: dist/${{ env.FILE_STEM }}.tar.gz
           sbom-path: dist/${{ env.FILE_STEM }}.cdx.json
 
+  # The C library archive per platform (ADR 0031): shared library with its soname or install name, static library,
+  # tickertape.h, tickertape.hpp, pkg-config files and licences. The install test builds and runs the C and C++
+  # examples against the archive alone, shared and static, through pkg-config.
+  c-library:
+    needs: prepare
+    if: needs.prepare.outputs.c_library == 'true'
+    name: C library (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+      TARGET: ${{ matrix.target }}
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
+    steps:
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: '3.12'
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: automation
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          path: source
+          persist-credentials: false
+      - name: Install stable Rust and the native target
+        working-directory: source
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add "$TARGET"
+      - name: Install cargo-cyclonedx (checksum-verified prebuilt binary)
+        uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
+        with:
+          tool: cargo-cyclonedx@0.5.9
+          fallback: none
+      - name: Test the C ABI, then build both libraries with the soname or install name
+        working-directory: source
+        run: |
+          cargo test --locked --release -p tickertape-ffi --target "$TARGET"
+          python3 ../automation/.github/scripts/release.py c-build --source . --tag "$RELEASE_TAG" --target "$TARGET"
+      - name: Package libraries, headers, pkg-config files, licences and a README
+        run: python3 automation/.github/scripts/release.py c-package --source source --tag "$RELEASE_TAG" --target "$TARGET" --output dist
+      - name: Install test from the archive (C and C++ examples through pkg-config, shared and static)
+        run: source/crates/tickertape-ffi/scripts/install-test.sh "dist/tickertape-c-$RELEASE_TAG-$TARGET.tar.gz" "$RUNNER_TEMP/c-install"
+      - name: Write the CycloneDX SBOM of the C library's locked dependency graph for this target
+        run: python3 automation/.github/scripts/release.py sbom --source source --package c-library --tag "$RELEASE_TAG" --target "$TARGET" --output dist
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: c-library-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.cdx.json
+          if-no-files-found: error
+          retention-days: 7
+
+  attest-c-library:
+    needs: [prepare, c-library]
+    name: Attest (C library, ${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+          - x86_64-apple-darwin
+          - aarch64-apple-darwin
+    runs-on: ubuntu-22.04
+    permissions:
+      id-token: write
+      attestations: write
+    timeout-minutes: 10
+    env:
+      FILE_STEM: tickertape-c-${{ needs.prepare.outputs.tag }}-${{ matrix.target }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: c-library-${{ matrix.target }}
+          path: dist
+      - name: Build provenance for the archive and its SBOM
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/${{ env.FILE_STEM }}.tar.gz
+            dist/${{ env.FILE_STEM }}.cdx.json
+      - name: SBOM attestation for the archive
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: dist/${{ env.FILE_STEM }}.tar.gz
+          sbom-path: dist/${{ env.FILE_STEM }}.cdx.json
+
+  # The Java binding's Maven files (ADR 0037): main JAR, sources and Javadoc JARs, and one natives JAR per platform
+  # holding that platform's shared library from the C archive above. Built unsigned; `maven-central` signs them.
+  java:
+    needs: [prepare, c-library]
+    if: needs.prepare.outputs.java == 'true'
+    name: Java (Maven files)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    env:
+      RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: '3.12'
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: automation
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          path: source
+          persist-credentials: false
+      # No Maven cache: release jobs do not use dependency caches (cache-mode above).
+      - uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
+        with:
+          distribution: temurin
+          java-version: '25.0.5'
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: c-library-*
+          path: c-library
+          merge-multiple: true
+      - name: Stage each platform's shared library from its C archive
+        run: |
+          for pair in x86_64-unknown-linux-gnu:linux-x86_64 aarch64-unknown-linux-gnu:linux-aarch64 \
+                      x86_64-apple-darwin:macos-x86_64 aarch64-apple-darwin:macos-aarch64; do
+            target=${pair%%:*}
+            platform=${pair##*:}
+            mkdir -p "unpacked/$target"
+            tar -xzf "c-library/tickertape-c-$RELEASE_TAG-$target.tar.gz" -C "unpacked/$target"
+            source/bindings/java/scripts/stage-natives.sh "unpacked/$target/tickertape-c-$RELEASE_TAG-$target/lib" "$platform"
+          done
+      # The tests ran in CI on the tagged commit; this build packages what they tested.
+      - name: Build the JARs (main, sources, Javadoc, four natives)
+        run: mvn -B -ntp -f source/bindings/java/pom.xml -Pnatives,release package -DskipTests
+      - name: Collect the Maven files and write their SBOMs
+        run: |
+          mkdir -p maven sbom
+          cp source/bindings/java/target/tickertape-"$VERSION"*.jar maven/
+          cp source/bindings/java/pom.xml "maven/tickertape-$VERSION.pom"
+          ls -l maven
+          python3 automation/.github/scripts/release.py sbom --source source --package java --name java --output sbom
+          # A natives JAR holds exactly the C archive's shared library, so it shares that archive's SBOM.
+          for pair in x86_64-unknown-linux-gnu:linux-x86_64 aarch64-unknown-linux-gnu:linux-aarch64 \
+                      x86_64-apple-darwin:macos-x86_64 aarch64-apple-darwin:macos-aarch64; do
+            cp "c-library/tickertape-c-$RELEASE_TAG-${pair%%:*}.cdx.json" "sbom/natives-${pair##*:}.cdx.json"
+          done
+      - name: Check the file set (unsigned bundle, as maven-central builds it signed)
+        run: python3 automation/.github/scripts/release.py maven-bundle --tag "$RELEASE_TAG" --artifacts maven --output "$RUNNER_TEMP/unsigned.zip"
+      - name: Install test from the built JARs (Linux x86-64)
+        run: source/bindings/java/scripts/install-test.sh "$RUNNER_TEMP/java-install" "maven/tickertape-$VERSION.jar" "maven/tickertape-$VERSION-natives-linux-x86_64.jar"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: java-maven
+          path: maven/*
+          if-no-files-found: error
+          retention-days: 7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: java-sbom
+          path: sbom/*
+          if-no-files-found: error
+          retention-days: 7
+
+  attest-java:
+    needs: [prepare, java]
+    name: Attest (Java)
+    runs-on: ubuntu-22.04
+    permissions:
+      id-token: write
+      attestations: write
+    timeout-minutes: 10
+    env:
+      STEM: tickertape-${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: java-maven
+          path: maven
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: java-sbom
+          path: sbom
+      - name: Build provenance for every Maven file
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: maven/*
+      - name: SBOM attestation for the main, sources and Javadoc JARs
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: |
+            maven/${{ env.STEM }}.jar
+            maven/${{ env.STEM }}-sources.jar
+            maven/${{ env.STEM }}-javadoc.jar
+          sbom-path: sbom/java.cdx.json
+      - name: SBOM attestation for the linux-x86_64 natives JAR
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: maven/${{ env.STEM }}-natives-linux-x86_64.jar
+          sbom-path: sbom/natives-linux-x86_64.cdx.json
+      - name: SBOM attestation for the linux-aarch64 natives JAR
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: maven/${{ env.STEM }}-natives-linux-aarch64.jar
+          sbom-path: sbom/natives-linux-aarch64.cdx.json
+      - name: SBOM attestation for the macos-x86_64 natives JAR
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: maven/${{ env.STEM }}-natives-macos-x86_64.jar
+          sbom-path: sbom/natives-macos-x86_64.cdx.json
+      - name: SBOM attestation for the macos-aarch64 natives JAR
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: maven/${{ env.STEM }}-natives-macos-aarch64.jar
+          sbom-path: sbom/natives-macos-aarch64.cdx.json
+
   publish:
-    # After `attest`: publishing a crate cannot be undone, so every step that can fail without publishing runs first.
-    needs: [prepare, build, attest]
-    if: needs.prepare.outputs.publish == 'true' || inputs.verify_publishing
+    # After every build and attestation: publishing a crate cannot be undone, so every step that can fail without
+    # publishing runs first. The C library and Java jobs are skipped for tags from before they existed.
+    needs: [prepare, build, attest, c-library, attest-c-library, java, attest-java]
+    if: >-
+      always() && needs.prepare.result == 'success' && needs.build.result == 'success' &&
+      needs.attest.result == 'success' &&
+      contains(fromJSON('["success","skipped"]'), needs.c-library.result) &&
+      contains(fromJSON('["success","skipped"]'), needs.attest-c-library.result) &&
+      contains(fromJSON('["success","skipped"]'), needs.java.result) &&
+      contains(fromJSON('["success","skipped"]'), needs.attest-java.result) &&
+      (needs.prepare.outputs.publish == 'true' || inputs.verify_publishing)
     runs-on: ubuntu-22.04
     environment: release
     permissions:
@@ -253,11 +495,15 @@ jobs:
         run: python3 automation/.github/scripts/release.py publish --source source --version "$VERSION" --sha "$RELEASE_SHA"
 
   github-release:
-    needs: [prepare, build, attest, publish]
+    needs: [prepare, build, attest, c-library, attest-c-library, java, attest-java, publish]
     if: >-
       always() && needs.prepare.result == 'success' && needs.build.result == 'success' &&
       needs.attest.result == 'success' &&
-      (needs.publish.result == 'success' || needs.publish.result == 'skipped')
+      contains(fromJSON('["success","skipped"]'), needs.c-library.result) &&
+      contains(fromJSON('["success","skipped"]'), needs.attest-c-library.result) &&
+      contains(fromJSON('["success","skipped"]'), needs.java.result) &&
+      contains(fromJSON('["success","skipped"]'), needs.attest-java.result) &&
+      contains(fromJSON('["success","skipped"]'), needs.publish.result)
     runs-on: ubuntu-22.04
     permissions:
       contents: write
@@ -265,6 +511,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
       CREATE_RELEASE: ${{ needs.prepare.outputs.publish }}
+      C_LIBRARY: ${{ needs.prepare.outputs.c_library }}
     steps:
       - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
         with:
@@ -278,14 +525,21 @@ jobs:
           path: dist
           merge-multiple: true
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: needs.prepare.outputs.c_library == 'true'
+        with:
+          pattern: c-library-*
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: release-notes
           path: metadata
       - name: Attach archives, SBOMs and SHA256SUMS, then publish the release
         run: |
-          create=()
-          if [[ "$CREATE_RELEASE" == 'true' ]]; then create=(--create); fi
-          python3 .github/scripts/release.py github-release --tag "$RELEASE_TAG" --artifacts dist --notes metadata/release-notes.md "${create[@]}"
+          flags=()
+          if [[ "$CREATE_RELEASE" == 'true' ]]; then flags+=(--create); fi
+          if [[ "$C_LIBRARY" == 'true' ]]; then flags+=(--c-library); fi
+          python3 .github/scripts/release.py github-release --tag "$RELEASE_TAG" --artifacts dist --notes metadata/release-notes.md "${flags[@]}"
 
   verify:
     needs: [prepare, github-release]
@@ -337,6 +591,15 @@ jobs:
           root="$(mktemp -d)"
           cp "tickertape-$RELEASE_TAG-x86_64-unknown-linux-musl/tickertape" "$root/"
           test "$(sudo chroot "$root" /tickertape --version)" = "tickertape $VERSION"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: needs.prepare.outputs.c_library == 'true'
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          path: source
+          persist-credentials: false
+      - name: Install test of the Linux x86-64 C library archive from the release
+        if: needs.prepare.outputs.c_library == 'true'
+        run: source/crates/tickertape-ffi/scripts/install-test.sh "downloaded/tickertape-c-$RELEASE_TAG-x86_64-unknown-linux-gnu.tar.gz" "$RUNNER_TEMP/c-install"
       - name: Install cargo-binstall
         if: needs.prepare.outputs.binstall == 'true'
         uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
@@ -422,3 +685,103 @@ jobs:
           brew install thomas0903/tap/tickertape
           test "$(tickertape --version)" = "tickertape $VERSION"
           brew test thomas0903/tap/tickertape
+
+  # Maven Central (ADR 0031): signs the attested Maven files and uploads them through the Central Portal. Switched off
+  # until the owner's one-time set-up (docs/playbooks/release-checklist.md): skipped unless the repository variable
+  # MAVEN_CENTRAL_PUBLISHING is `enabled`, and its steps are skipped while any of the four secrets of the
+  # `maven-central` environment is absent. No build code runs here: the secrets only ever meet release.py and gpg.
+  maven-central:
+    needs: [prepare, java, attest-java, verify]
+    if: >-
+      always() && needs.verify.result == 'success' && needs.java.result == 'success' &&
+      needs.attest-java.result == 'success' && needs.prepare.outputs.publish == 'true' &&
+      vars.MAVEN_CENTRAL_PUBLISHING == 'enabled'
+    runs-on: ubuntu-22.04
+    environment: maven-central
+    permissions:
+      contents: read
+    timeout-minutes: 45
+    outputs:
+      uploaded: ${{ steps.upload.outcome == 'success' }}
+    env:
+      RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+    steps:
+      - id: secrets
+        name: Check that the Maven Central secrets are set
+        env:
+          MAVEN_CENTRAL_USERNAME: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          MAVEN_CENTRAL_PASSWORD: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+          MAVEN_GPG_PRIVATE_KEY: ${{ secrets.MAVEN_GPG_PRIVATE_KEY }}
+          MAVEN_GPG_PASSPHRASE: ${{ secrets.MAVEN_GPG_PASSPHRASE }}
+        run: |
+          ready=true
+          for name in MAVEN_CENTRAL_USERNAME MAVEN_CENTRAL_PASSWORD MAVEN_GPG_PRIVATE_KEY MAVEN_GPG_PASSPHRASE; do
+            if [ -z "${!name}" ]; then
+              echo "::warning::secret $name is not set in the maven-central environment; skipping the upload"
+              ready=false
+            fi
+          done
+          echo "ready=$ready" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        if: steps.secrets.outputs.ready == 'true'
+        with:
+          python-version: '3.12'
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.secrets.outputs.ready == 'true'
+        with:
+          path: automation
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: steps.secrets.outputs.ready == 'true'
+        with:
+          name: java-maven
+          path: maven
+      - name: Sign the files and write the bundle (Maven repository layout, checksums, signatures)
+        if: steps.secrets.outputs.ready == 'true'
+        env:
+          MAVEN_GPG_PRIVATE_KEY: ${{ secrets.MAVEN_GPG_PRIVATE_KEY }}
+          MAVEN_GPG_PASSPHRASE: ${{ secrets.MAVEN_GPG_PASSPHRASE }}
+        run: python3 automation/.github/scripts/release.py maven-bundle --tag "$RELEASE_TAG" --artifacts maven --output "$RUNNER_TEMP/bundle.zip" --sign
+      - id: upload
+        name: Upload to the Central Portal and wait for publication (a version already on Central is kept)
+        if: steps.secrets.outputs.ready == 'true'
+        env:
+          MAVEN_CENTRAL_USERNAME: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          MAVEN_CENTRAL_PASSWORD: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+        run: python3 automation/.github/scripts/release.py maven-upload --tag "$RELEASE_TAG" --bundle "$RUNNER_TEMP/bundle.zip"
+
+  # The per-release test of the channel: every file on Maven Central must equal the attested build, and the install
+  # test runs with the JARs downloaded from Central.
+  verify-maven-central:
+    needs: [prepare, maven-central]
+    if: always() && needs.maven-central.result == 'success' && needs.maven-central.outputs.uploaded == 'true'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 75
+    env:
+      RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: '3.12'
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: automation
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          path: source
+          persist-credentials: false
+      - uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
+        with:
+          distribution: temurin
+          java-version: '25.0.5'
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: java-maven
+          path: maven
+      - name: Download every file from Maven Central (waiting for it to appear) and compare it with the build
+        run: python3 automation/.github/scripts/release.py maven-verify --tag "$RELEASE_TAG" --artifacts maven --output central
+      - name: Install test with the JARs from Maven Central (Linux x86-64)
+        run: source/bindings/java/scripts/install-test.sh "$RUNNER_TEMP/java-install" "central/tickertape-$VERSION.jar" "central/tickertape-$VERSION-natives-linux-x86_64.jar"
