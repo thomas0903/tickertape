@@ -59,19 +59,52 @@ fn os_code(source: &std::io::Error) -> Option<i32> {
     })
 }
 
+/// How a test gives up on a record inside its fill closure.
+#[derive(Clone, Copy, Debug)]
+enum Abandon {
+    /// `append_with`'s closure panics.
+    Panic,
+    /// `try_append_with`'s closure returns `Err`.
+    Decline,
+}
+
 #[test]
 fn failed_cleanup_of_an_abandoned_write_is_reported() {
-    failed_cleanup_is_reported(5 /* EIO */);
+    failed_cleanup_is_reported(5 /* EIO */, Abandon::Panic);
 }
 
 #[test]
 fn failed_cleanup_on_a_full_volume_is_not_storage_full() {
     // `fsync` can fail with ENOSPC on a full APFS volume (docs/crash-contract.md). Freeing space does not make this
     // writer usable again, so neither the recorded error nor a refused append may say "storage full, retry".
-    failed_cleanup_is_reported(28 /* ENOSPC */);
+    failed_cleanup_is_reported(28 /* ENOSPC */, Abandon::Panic);
 }
 
-fn failed_cleanup_is_reported(errno: i32) {
+#[test]
+fn failed_cleanup_of_a_declined_write_is_reported() {
+    failed_cleanup_is_reported(5 /* EIO */, Abandon::Decline);
+}
+
+#[test]
+fn failed_cleanup_of_a_declined_write_on_a_full_volume_is_not_storage_full() {
+    failed_cleanup_is_reported(28 /* ENOSPC */, Abandon::Decline);
+}
+
+/// `refused` is the error of an append refused after a failed clean-up: it says why, carries the OS error `errno`,
+/// and is never storage-full.
+fn assert_refused_after_failed_cleanup(refused: &Error, errno: i32) {
+    assert!(!refused.is_storage_full(), "{refused:?}");
+    match refused {
+        Error::Io { op, source, .. } => {
+            assert!(op.contains("abandoned write"), "{op}");
+            assert_eq!(os_code(source), Some(errno));
+            assert_ne!(source.kind(), std::io::ErrorKind::StorageFull);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+fn failed_cleanup_is_reported(errno: i32, how: Abandon) {
     let dir = tempfile::tempdir().unwrap();
     let mut w = Writer::open(dir.path(), small_config()).unwrap();
     append_n(&mut w, 3);
@@ -82,10 +115,23 @@ fn failed_cleanup_is_reported(errno: i32) {
         payload: &[],
     };
     fault::fail_next(Point::AbandonedWriteSync, errno);
-    let abandoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        w.append_with(&record, 16, |_| std::panic::panic_any("abandon"))
-    }));
-    assert!(abandoned.is_err());
+    match how {
+        Abandon::Panic => {
+            let abandoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                w.append_with(&record, 16, |_| std::panic::panic_any("abandon"))
+            }));
+            assert!(abandoned.is_err());
+        }
+        Abandon::Decline => {
+            // A failed clean-up is the journal's error: the call returns the outer `Err`, the one every later append
+            // returns, and the caller's value is dropped.
+            let declined = w.try_append_with(&record, 16, |_| Err("abandon"));
+            match declined {
+                Err(e) => assert_refused_after_failed_cleanup(&e, errno),
+                Ok(other) => panic!("{other:?}"),
+            }
+        }
+    }
     let cause = w
         .abandoned_write_error()
         .expect("the failed clean-up is recorded");
@@ -96,17 +142,14 @@ fn failed_cleanup_is_reported(errno: i32) {
     assert!(!cause.is_storage_full(), "{cause:?}");
     // Later appends say why they are refused and carry the OS error, but are never storage-full: retrying after
     // freeing space would not help. Checkpoints say durability is lost.
+    let refused = w
+        .try_append_with(&record, 16, |_| -> Result<(), ()> {
+            panic!("fill must not be called on a stopped writer")
+        })
+        .unwrap_err();
+    assert_refused_after_failed_cleanup(&refused, errno);
     for _ in 0..3 {
-        let refused = w.append(&record).unwrap_err();
-        assert!(!refused.is_storage_full(), "{refused:?}");
-        match refused {
-            Error::Io { op, source, .. } => {
-                assert!(op.contains("abandoned write"), "{op}");
-                assert_eq!(os_code(&source), Some(errno));
-                assert_ne!(source.kind(), std::io::ErrorKind::StorageFull);
-            }
-            other => panic!("{other:?}"),
-        }
+        assert_refused_after_failed_cleanup(&w.append(&record).unwrap_err(), errno);
     }
     let lost = w.checkpoint().unwrap_err();
     assert!(matches!(lost, Error::DurabilityLost));

@@ -1212,7 +1212,7 @@ tickertape_status tickertape_writer_append(struct tickertape_writer *writer,
  *
  * If `fill` returns non-zero, nothing is committed and this returns `TICKERTAPE_E_ABORTED`: the writer zeroes the
  * buffer and syncs that zeroing to storage before returning (`docs/format.md` → Abandoned writes), so aborting is
- * slow; use it only for exceptional cases.
+ * slow; use it only for exceptional cases. Aborting does not unwind inside the library.
  *
  * If that sync fails, this call returns `TICKERTAPE_E_IO` instead of `TICKERTAPE_E_ABORTED`, with the OS error in
  * `tickertape_last_error_os_code` and a message saying the clean-up failed. The code is `TICKERTAPE_E_IO` even when

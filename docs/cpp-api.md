@@ -62,11 +62,12 @@ c++ -std=c++17 app.cpp -I crates/tickertape-ffi/include -L target/release -ltick
 Static linking, installation with `cargo cinstall` (which installs `tickertape.hpp` next to `tickertape.h`) and
 pkg-config work as for C: see [`c-api.md` → Building and linking](c-api.md#building-and-linking).
 
-> **macOS and the static library:** link `libtickertape.a` with Apple's toolchain defaults (Apple Clang's `c++`), or
-> use the shared library. With the GCC driver (Homebrew `g++`), which passes `-no_compact_unwind` to the linker, an
-> `append_with` whose fill returns `false` (or throws) ends the process inside the library: the library aborts that
-> append by unwinding internally, and that link drops the unwind information it needs. Shared linkage works with
-> either compiler.
+> **macOS and the static library:** the GCC driver (Homebrew `g++`) passes `-no_compact_unwind` to the linker, which
+> drops the static library's unwind information. An `append_with` whose fill returns `false` or throws does not need
+> it: the binding catches the exception in its callback, and the library aborts the append without unwinding
+> ([ADR 0039](decisions/0039-aborted-fill-without-unwinding.md)). A Rust panic inside the library (a bug, otherwise
+> `Status::panic`) does unwind, so with that link it ends the process instead. Shared linkage, or Apple Clang's
+> `c++`, keeps the unwind information.
 
 **CMake.** `crates/tickertape-ffi/cmake/tickertapeConfig.cmake` defines `tickertape::tickertape` (the shared library
 and `tickertape.h`) and `tickertape::cpp` (plus `tickertape.hpp` and the C++17 requirement):
@@ -445,4 +446,4 @@ field, status code or corruption reason is added without a decision for the bind
 function lacks its mode tag (ADR 0036).
 `TICKERTAPE_FFI_SANITIZE=1` and `TICKERTAPE_FFI_VALGRIND=1` work as for the C tests; under Valgrind the tests that
 replace `operator new` run with `--soname-synonyms=somalloc=nouserintercepts`. With the GCC driver on macOS, the
-statically linked test programs are skipped, for the reason in [Building and linking](#building-and-linking).
+statically linked test programs run too ([Building and linking](#building-and-linking)).

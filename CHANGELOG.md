@@ -34,6 +34,21 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   the scan early and exported fewer records (or none) with exit 0; that is now exit 1 with `journal changed during
   export: the checkpoint marker no longer covers records it covered when export started`, before the destination is
   opened.
+- Library: `Writer::try_append_with(&mut self, record, payload_len, fill)`, a zero-copy append whose closure
+  (`FnOnce(&mut [u8]) -> Result<(), E>`) can decline the record by returning `Err(e)`; the call then returns
+  `Ok(Err(e))`, and journal errors stay in the outer `Result<_, tickertape::Error>`. Declining does what a panic in an
+  `append_with` closure does (nothing committed, the bytes zeroed and the zeroing synced) without unwinding (ADR 0039).
+  If that sync fails, the writer stops (`abandoned_write_error`) and the call returns the outer `Err`, the same
+  `Error::Io` as every later append, dropping the caller's `e`: an outer `Err` means the journal failed, and `fill` did
+  not run except in that case. `append_with` and `append` now go through it; a panic in either closure behaves as
+  before.
+- C ABI: `tickertape_writer_append_with` aborts an append whose `fill` returns non-zero through `try_append_with`,
+  without unwinding inside the library (ADR 0039). Its signature, status codes and documented behaviour are
+  unchanged. Before, `libtickertape.a` linked by the GCC driver on macOS (Homebrew GCC, which passes
+  `-no_compact_unwind`) ended the process at the first aborted fill; that link now works, and the tests no longer skip
+  it. A Rust panic inside the library still unwinds (`TICKERTAPE_E_PANIC`). A test builds the static library with
+  `panic = "abort"` (through a private compiler cfg in that build's own rustflags, not a Cargo feature) and runs the
+  basic C test, including an aborted fill, against it.
 - Fixed: writer recovery no longer zeroes the bytes after an empty commit word in place when a segment for the
   expected sequence number exists but does not open (an invalid header, for example) and recovery finds no committed
   history after the word (ADR 0035 → Damage around a seal, crash contract C8 and C11 (3); it was recorded there as a
