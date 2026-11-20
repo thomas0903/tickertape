@@ -30,7 +30,9 @@ The design decisions are in [ADR 0029](decisions/0029-python-bindings.md). In br
 - **Copies.** Payloads are `bytes` or buffers of unsigned bytes (uint8 only). Every record returned to Python owns its
   payload as `bytes`. Batch columns are `bytes` objects that NumPy and pyarrow wrap without another copy. There is no
   live zero-copy access; the mapped Rust reader is not exposed.
-- **Batches cross the language boundary once.** `append_many` converts and checks all arguments first, then appends;
+- **Batches cross the language boundary once.** `append_many` converts and checks all arguments first, then appends
+  them as one batch (`Writer::append_batch`, ADR 0041: if at least one record is appended and wake-ups are enabled,
+  blocked readers are woken once after the last record appended, plus once at each roll inside the batch);
   on a failure part-way it raises `BatchAppendError` saying how many records were appended and from which sequence
   number. To retry, slice the payloads and every per-record metadata sequence at `failed_index`, so keep them in
   sequences rather than one-shot iterators. `read_many` and `read_batch` wait for the first record (up to a timeout,

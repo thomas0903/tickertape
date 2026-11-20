@@ -2028,11 +2028,14 @@ tickertape_status tickertape_writer_append_with(struct tickertape_writer *writer
  *
  * Every record is checked first (`payload` NULL with `payload_len` > 0, a length too large, `reserved` not 0): an
  * argument error returns `TICKERTAPE_E_INVALID_ARGUMENT`, naming the record's index in the message, and appends
- * nothing. Then the records are appended one by one, as with `tickertape_writer_append`. `*first_seq_out` (which may
- * be NULL) is set to the sequence number the first record gets, and `*appended_out` to the number of records
- * appended so far, updated as each one commits; the appended records are consecutive. On an error, the records
- * before the failing one (index `*appended_out`) **are appended** and stay appended: retry only from the failing
- * record.
+ * nothing. Then the records are appended in order in one batch (ADR 0041): each record is committed, and visible to
+ * readers, as it is written, as with `tickertape_writer_append`. Instead of one wake-up after each record, a batch
+ * that appends at least one record wakes blocked readers once (when wake-ups are enabled) after the last record
+ * appended, plus once at each roll inside the batch. `*first_seq_out` (which may be NULL) is set to the sequence
+ * number the first record gets, and `*appended_out` to the number of records appended; the appended records are
+ * consecutive.
+ * On an error, the records before the failing one (index `*appended_out`) **are appended** and stay appended: retry
+ * only from the failing record.
  *
  * If `appended_out` or `first_seq_out` overlaps another argument (each other, the `records` array or a payload),
  * returns `TICKERTAPE_E_INVALID_ARGUMENT` and writes nothing. Otherwise `*appended_out` is always set (0 on an

@@ -73,7 +73,7 @@ pub use config::{Backoff, HelperCpus, ReaderConfig, RecoveryPolicy, WriterConfig
 pub use error::{CorruptReason, Error, Result};
 pub use reader::{Reader, Records};
 pub use record::{NewRecord, OwnedRecord, Record};
-pub use writer::{CheckpointProgress, RecoveryAction, RecoveryReport, Writer};
+pub use writer::{BatchError, CheckpointProgress, RecoveryAction, RecoveryReport, Writer};
 
 /// The version of this crate, as set in `Cargo.toml`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

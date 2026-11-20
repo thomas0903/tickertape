@@ -65,6 +65,11 @@ fn wait_for_seq(dir: &Path, seq: u64) {
 /// One writer, two live readers (safe and zero-copy) from the start, and a late reader that starts when the writer
 /// is halfway (and paused) and must replay from 0 and catch up. All must see the identical gap-free sequence.
 fn run(count: u64, segment_size: u64, max_payload: usize) {
+    run_with(count, segment_size, max_payload, 1);
+}
+
+/// As [`run`], with the writer appending in batches of up to `batch` records (`Writer::append_batch`, ADR 0041).
+fn run_with(count: u64, segment_size: u64, max_payload: usize, batch: u64) {
     let dir = tempfile::tempdir().unwrap();
     let journal = dir.path().join("journal");
     let go = dir.path().join("go");
@@ -81,6 +86,7 @@ fn run(count: u64, segment_size: u64, max_payload: usize) {
             &half.to_string(),
             go.to_str().unwrap(),
         ])
+        .env("TT_WRITER_BATCH", batch.to_string())
         .spawn()
         .expect("spawn writer");
 
@@ -104,6 +110,13 @@ fn run(count: u64, segment_size: u64, max_payload: usize) {
 #[test]
 fn two_readers_and_a_late_reader_small() {
     run(50_000, 64 * 1024, 64);
+}
+
+/// Batches of up to 100 records, which roll inside a batch (64 KiB segments, payloads up to 64 bytes): readers in
+/// other processes see the same gap-free sequence.
+#[test]
+fn two_readers_and_a_late_reader_batched() {
+    run_with(50_000, 64 * 1024, 64, 100);
 }
 
 /// The M3 exit criterion: at least 1,000,000 records across segment rolls. Run with
