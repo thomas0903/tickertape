@@ -74,7 +74,8 @@ once); there `msync(MS_SYNC)` is a data sync of the same pages and adds nothing.
 reopened file again and calls `msync(MS_SYNC)` on the range before `fsync`, so that pages dirtied through the old
 mapping are written back as they were before; step 3 is unchanged. Such a segment is after the marker, so retention
 does not remove it (C14); if it is gone anyway (removed by hand), or the file at its path is not the one the writer held
-(replaced under the same name), the checkpoint fails as a failed sync does, before writing a marker, and poisons the
+(replaced under the same name; told by device and inode number, so a file removed and created again is not told
+apart where the file system gives it the removed file's inode number), the checkpoint fails as a failed sync does, before writing a marker, and poisons the
 writer. **The limit:** for such a segment the checkpoint does not report a write-back error that the kernel no longer
 remembers (while no descriptor or mapping of the file was open it may have evicted the cached inode, and the error with
 it) or that another descriptor of the file already observed (a sync through it reported the error, so a newly opened

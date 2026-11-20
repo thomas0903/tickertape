@@ -207,9 +207,12 @@ fn a_replaced_released_segment_fails_the_checkpoint_and_poisons() {
     let mut writer = Writer::open(&journal, small_config()).unwrap();
     roll(&mut writer, 12, 0);
     let (_, path) = segments(&journal)[1].clone();
+    // The copy exists before the original goes, so it has another inode number: a file system may give the number
+    // of a file just removed to the next file created (ext4 and tmpfs do), and the check compares device and inode.
     let bytes = std::fs::read(&path).unwrap();
-    std::fs::remove_file(&path).unwrap();
-    std::fs::write(&path, &bytes).unwrap();
+    let copy = path.with_extension("copy");
+    std::fs::write(&copy, &bytes).unwrap();
+    std::fs::rename(&copy, &path).unwrap();
     let marker = std::fs::read(journal.join("checkpoint")).unwrap();
     match writer.checkpoint() {
         Err(Error::Io { path: failed, .. }) => assert_eq!(failed, path),
