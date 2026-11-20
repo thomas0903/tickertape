@@ -104,6 +104,7 @@ jobs:
     timeout-minutes: 30
     env:
       MACOSX_DEPLOYMENT_TARGET: '11.0'
+      RUST_TARGET: ${{ matrix.platform == 'macos' && format('{0}-apple-darwin', matrix.target) || format('{0}-unknown-linux-{1}', matrix.target, matrix.platform == 'musllinux' && 'musl' || 'gnu') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
