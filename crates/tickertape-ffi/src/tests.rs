@@ -2256,10 +2256,13 @@ fn pure_append_batch_counts_each_commit_even_if_a_later_append_panics() {
     let mut calls = 0;
     let status = guard(|| {
         unsafe {
-            crate::writer::append_records(&records, &mut appended, |_| {
-                calls += 1;
-                assert!(calls < 3, "the third append fails inside the core");
-                Ok(calls)
+            crate::writer::append_records(&records, &mut appended, |taken| {
+                // The core appends each record it takes before taking the next; the third fails inside the core.
+                for _ in taken {
+                    calls += 1;
+                    assert!(calls < 3, "the third append fails inside the core");
+                }
+                (calls, Ok(()))
             })
         }?;
         Ok(tickertape_status_code::TICKERTAPE_OK)

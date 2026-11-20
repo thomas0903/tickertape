@@ -26,6 +26,10 @@ name = "recovery"
 path = "recovery.rs"
 
 [[test]]
+name = "batch"
+path = "batch.rs"
+
+[[test]]
 name = "wakeups"
 path = "wakeups.rs"
 

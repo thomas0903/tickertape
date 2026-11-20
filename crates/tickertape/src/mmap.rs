@@ -724,6 +724,12 @@ impl NotifyPublisher {
             wake_all(event);
         }
     }
+
+    /// The event counter, for tests that check when a wake-up was published.
+    #[cfg(test)]
+    pub(crate) fn event(&self) -> u32 {
+        self.word(NOTIFY_EVENT).load(Ordering::SeqCst)
+    }
 }
 
 impl Notify {

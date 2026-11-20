@@ -5,6 +5,18 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
+- Batched append (ADR 0041): `Writer::append_batch` appends an iterator of `NewRecord`s in order and returns the
+  range of sequence numbers they got. Each record is committed, and visible to readers, as it is written, as with
+  `append`. Instead of one wake-up after every record, a batch that commits at least one record publishes one
+  wake-up (when wake-ups are enabled) after the last record it appended, plus one at each roll inside the batch.
+  That saves the writer a wake-up system call per record while a reader is blocked, and delays a blocked reader's
+  view of a batch's first records until the batch ends or the next roll in it. A record that does not fit rolls, as
+  with `append`. On a failure the batch stops and returns a `BatchError` with the number of records appended (they
+  stay committed), the first sequence number and the cause. The C ABI's `tickertape_writer_append_batch` (signature
+  unchanged) and Python's `Writer.append_many` now use it; the C function's `*appended_out` is documented as the
+  count when it returns. `WriterConfig::notify`'s documentation says what a batch publishes. The `append` benchmark
+  gains an `append/batch` group. `demo-producer` encodes each event directly into its record with
+  `Writer::append_with` (new `Event::encode_into` and `Event::encoded_len` in the examples crate).
 - Diagnostics: `docs/playbooks/diagnose-latency-with-ebpf.md`, a Linux playbook for finding where the writer and
   reader threads wait during sustained runs or in an application (off-CPU time by kernel stack, block I/O, page
   faults, write-back throttling, run-queue latency), with bpftrace, bcc and libbpf-tools commands, requirements,
