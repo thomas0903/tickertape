@@ -1,7 +1,6 @@
 //! The writer handle.
 
 use std::ffi::{c_char, c_void};
-use std::panic::{self, AssertUnwindSafe};
 
 use tickertape::{Error, NewRecord, Writer, WriterConfig};
 
@@ -71,9 +70,6 @@ fn new_record_layout_is_frozen() {
 #[allow(non_camel_case_types)]
 pub type tickertape_fill_fn =
     Option<unsafe extern "C-unwind" fn(user_data: *mut c_void, buf: *mut u8, len: usize) -> i32>;
-
-/// The unwind payload that aborts an `append_with` whose callback returned non-zero.
-struct FillAborted;
 
 /// Borrows the writer behind a handle pointer.
 ///
@@ -236,7 +232,7 @@ pub unsafe extern "C" fn tickertape_writer_append(
 ///
 /// If `fill` returns non-zero, nothing is committed and this returns `TICKERTAPE_E_ABORTED`: the writer zeroes the
 /// buffer and syncs that zeroing to storage before returning (`docs/format.md` → Abandoned writes), so aborting is
-/// slow; use it only for exceptional cases.
+/// slow; use it only for exceptional cases. Aborting does not unwind inside the library.
 ///
 /// If that sync fails, this call returns `TICKERTAPE_E_IO` instead of `TICKERTAPE_E_ABORTED`, with the OS error in
 /// `tickertape_last_error_os_code` and a message saying the clean-up failed. The code is `TICKERTAPE_E_IO` even when
@@ -277,39 +273,44 @@ pub unsafe extern "C" fn tickertape_writer_append_with(
         };
         // SAFETY: forwarded caller contract.
         let seq = unsafe { handle(writer) }?.with(|w| {
-            let appended = panic::catch_unwind(AssertUnwindSafe(|| {
-                w.append_with(&record, payload_len, |buf| {
-                    let ptr = if buf.is_empty() {
-                        std::ptr::null_mut()
-                    } else {
-                        buf.as_mut_ptr()
-                    };
-                    // SAFETY: `fill` follows the callback contract (caller guarantee); `ptr` is NULL with length 0
-                    // or valid for `buf.len()` writable bytes for the duration of the call.
-                    let rc = unsafe { fill(user_data, ptr, buf.len()) };
-                    if rc != 0 {
-                        // The core treats an unwind out of the closure as an abandoned write: it zeroes and syncs
-                        // the bytes, then continues the unwind, which is caught just below.
-                        panic::resume_unwind(Box::new(FillAborted));
+            // A non-zero return declines the record through the core's `try_append_with`, which zeroes and syncs the
+            // bytes and returns: aborting needs no unwinding. A Rust panic out of `fill` is cleaned up by the core and
+            // resumed, then caught by `Handle::with` (the handle becomes broken; `TICKERTAPE_E_PANIC`). A foreign
+            // exception out of `fill` is unsupported (ADR 0028): with current Rust the core's `catch_unwind` ends the
+            // process.
+            let mut declined = false;
+            let appended = w.try_append_with(&record, payload_len, |buf| {
+                let ptr = if buf.is_empty() {
+                    std::ptr::null_mut()
+                } else {
+                    buf.as_mut_ptr()
+                };
+                // SAFETY: `fill` follows the callback contract (caller guarantee); `ptr` is NULL with length 0 or
+                // valid for `buf.len()` writable bytes for the duration of the call.
+                match unsafe { fill(user_data, ptr, buf.len()) } {
+                    0 => Ok(()),
+                    _ => {
+                        declined = true;
+                        Err(())
                     }
-                })
-            }));
+                }
+            });
             match appended {
-                Ok(result) => result.map_err(|e| writer_error(w, e)),
-                // The writer refuses appends once a clean-up failed, before calling `fill`, so an error recorded
-                // now comes from this call.
-                Err(payload) if payload.is::<FillAborted>() => Err(match w.abandoned_write_error() {
-                    Some(cause) => FfiError::from(cause).with_message(format!(
+                Ok(Ok(seq)) => Ok(seq),
+                Ok(Err(())) => Err(FfiError::new(
+                    S::TICKERTAPE_E_ABORTED,
+                    "the fill callback returned non-zero; nothing was appended",
+                )),
+                // `fill` declined and the clean-up failed: the core returns the error of a refused append; report
+                // the recorded cause (the same OS error) with a message that says what happened.
+                Err(e) => Err(match w.abandoned_write_error() {
+                    Some(cause) if declined => FfiError::from(cause).with_message(format!(
                         "the fill callback returned non-zero, and zeroing the abandoned bytes durably failed: \
                          {cause}; the writer refuses further appends and checkpoints: close it and reopen the \
                          journal"
                     )),
-                    None => FfiError::new(
-                        S::TICKERTAPE_E_ABORTED,
-                        "the fill callback returned non-zero; nothing was appended",
-                    ),
+                    _ => writer_error(w, e),
                 }),
-                Err(payload) => panic::resume_unwind(payload),
             }
         })?;
         // SAFETY: forwarded caller contract.
