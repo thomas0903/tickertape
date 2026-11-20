@@ -69,7 +69,7 @@ pub enum Point {
     /// past an empty commit word at the end of the newest segment, and the one before verify reads that commit word
     /// again (ADR 0035). Arm with [`run_at`].
     InspectRescan,
-    /// Syncing the zeroing of an abandoned write (a panicking `append_with` fill closure).
+    /// Syncing the zeroing of an abandoned write (a fill closure that panicked or declined).
     AbandonedWriteSync,
 }
 

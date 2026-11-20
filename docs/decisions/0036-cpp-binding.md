@@ -422,12 +422,12 @@ them.
 helpers, `TICKERTAPE_HPP_EXCEPTIONS`), so they do not leak into the includer's code; the public macros stay
 (`TICKERTAPE_HPP_VERSION_*`, `TICKERTAPE_HPP_ABI_VERSION`, `TICKERTAPE_DEBUG_CHECKS`). The compile matrix checks both.
 
-**Static linking with the GCC driver on macOS** does not work for aborted fills: the GCC driver (Homebrew GCC) passes
-`-no_compact_unwind` to the linker, and the library aborts an append whose fill returns non-zero by unwinding
-internally, so with `libtickertape.a` linked that way the process ends inside the library. Apple's toolchain
-defaults and the shared library work. `docs/c-api.md` and `docs/cpp-api.md` say so, and the C++20 test program
-(the statically linked one) is skipped in that configuration with that reason. A change to the C library so that an
-ordinary abort does not unwind is a separate follow-up.
+**Static linking with the GCC driver on macOS** did not work for aborted fills when this binding was added: the GCC
+driver (Homebrew GCC) passes `-no_compact_unwind` to the linker, and the library aborted an append whose fill
+returned non-zero by unwinding internally, so with `libtickertape.a` linked that way the process ended inside the
+library, and the statically linked C++20 test program was skipped in that configuration. The follow-up,
+[ADR 0039](0039-aborted-fill-without-unwinding.md), aborts the append without unwinding, and the skip is gone. A Rust
+panic inside the library still unwinds, so with that link it ends the process instead of returning `panic`.
 
 ## Consequences
 
