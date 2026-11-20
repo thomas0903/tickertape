@@ -80,7 +80,7 @@ pub struct Writer {
     poisoned: bool,
     /// Bytes of checkpoints that failed on this thread (for `metrics`): no checkpoint of this writer covers them.
     failed_bytes: u64,
-    /// Set if an abandoned write's zeroing could not be made durable; see `append_with`.
+    /// Set if an abandoned write's zeroing could not be made durable; see `abandon`.
     abandoned_write_error: Option<Error>,
     report: RecoveryReport,
     retention_report: crate::retention::Report,
@@ -257,6 +257,8 @@ impl Writer {
     /// stale bytes may still be on disk, and the writer refuses further appends and checkpoints
     /// ([`Writer::abandoned_write_error`]). `record.payload` is ignored.
     ///
+    /// To give up on a record without a panic, use [`Writer::try_append_with`].
+    ///
     /// # Errors
     ///
     /// As for [`Writer::append`].
@@ -269,27 +271,74 @@ impl Writer {
     where
         F: FnOnce(&mut [u8]),
     {
+        let filled = self.try_append_with(record, payload_len, |buf| {
+            fill(buf);
+            Ok::<(), std::convert::Infallible>(())
+        })?;
+        match filled {
+            Ok(seq) => Ok(seq),
+            Err(never) => match never {},
+        }
+    }
+
+    /// Appends a record whose payload is written in place by `fill`, which may decline to finish it.
+    ///
+    /// As [`Writer::append_with`], except that `fill` returns a `Result`: `Ok(())` commits the record, and
+    /// `Err(e)` abandons it, and once the abandoned bytes are cleaned up this returns `Ok(Err(e))`, without a panic or
+    /// any unwinding. The outer `Result` carries the journal's errors, so `?` passes those on and leaves the caller
+    /// with its own outcome.
+    ///
+    /// Declining does what a panic in the closure does, except that this returns instead of the panic continuing:
+    /// nothing is committed and the sequence number is not used. The writer zeroes the whole record it had begun (the
+    /// header fields it wrote and `fill`'s buffer: everything after the commit word, which was never written) and
+    /// syncs that zeroing (`docs/format.md` → Abandoned writes) before it returns, so no bytes from it can later be
+    /// mistaken for a record. The next record is written at the same place if it fits there. A roll that this call
+    /// completed before `fill` ran stays in place: the old segment is sealed and the writer is at the new segment's
+    /// first slot. The sync makes declining slow: keep it for exceptional cases.
+    ///
+    /// If `fill` declines and the zeroing cannot be made durable, this returns the outer `Err`: the [`Error::Io`]
+    /// that every later append returns, and the caller's `e` is dropped. The stale bytes may still be on disk and the
+    /// writer is stopped: [`Writer::abandoned_write_error`] returns the cause, and every later append fails with
+    /// [`Error::Io`] and every checkpoint with [`Error::DurabilityLost`]. A panic in `fill` behaves as in
+    /// [`Writer::append_with`]: the panic continues, and a failed clean-up is recorded the same way.
+    /// `record.payload` is ignored.
+    ///
+    /// ```no_run
+    /// # use tickertape::{NewRecord, Writer, WriterConfig};
+    /// # fn main() -> tickertape::Result<()> {
+    /// let mut writer = Writer::open("journal", WriterConfig::default())?;
+    /// let record = NewRecord { schema_id: 1, venue_ts_ns: 0, local_ts_ns: 0, payload: &[] };
+    /// let text = "price=101.5";
+    /// match writer.try_append_with(&record, 16, |buf| {
+    ///     if text.len() > buf.len() {
+    ///         return Err("does not fit");
+    ///     }
+    ///     buf[..text.len()].copy_from_slice(text.as_bytes());
+    ///     Ok(())
+    /// })? {
+    ///     Ok(seq) => println!("appended {seq}"),
+    ///     Err(reason) => println!("abandoned: {reason}"),
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// As for [`Writer::append`]. An outer `Err` means the journal failed. `fill` did not run, except when it
+    /// declined and the clean-up failed, which is the one case where [`Writer::abandoned_write_error`] is set by this
+    /// call.
+    pub fn try_append_with<F, E>(
+        &mut self,
+        record: &NewRecord<'_>,
+        payload_len: usize,
+        fill: F,
+    ) -> Result<std::result::Result<u64, E>>
+    where
+        F: FnOnce(&mut [u8]) -> std::result::Result<(), E>,
+    {
         if let Some(cause) = &self.abandoned_write_error {
-            let source = match cause {
-                Error::Io { source, .. } => {
-                    let os = source
-                        .get_ref()
-                        .and_then(|e| e.downcast_ref::<io::Error>())
-                        .unwrap_or(source);
-                    os.raw_os_error().map_or_else(
-                        || io::Error::new(os.kind(), os.to_string()),
-                        io::Error::from_raw_os_error,
-                    )
-                }
-                other => io::Error::other(other.to_string()),
-            };
-            // Wrapped, like the cause, so that the OS error (say ENOSPC) is never `is_storage_full`: freeing space
-            // does not make this writer accept appends again.
-            return Err(Error::io(
-                "append (refused: an earlier abandoned write could not be zeroed durably; reopen the journal)",
-                &self.active.path,
-                io::Error::other(source),
-            ));
+            return Err(refused_append(cause, &self.active.path));
         }
         if self.next_seq == u64::MAX {
             return Err(Error::SequenceExhausted);
@@ -331,34 +380,18 @@ impl Writer {
         format::write_record_fields(&header, body);
         let payload_start = format::RECORD_HEADER_LEN - format::COMMIT_WORD_LEN;
         let filled = panic::catch_unwind(AssertUnwindSafe(|| fill(&mut body[payload_start..])));
-        if let Err(cause) = filled {
-            body.fill(0);
-            // The zeroing must be durable (full platform barrier) before this space is reused. Under the lock a
-            // checkpoint holds from its first sync to its marker (it waits for a background checkpoint in flight): a
-            // failed sync here must keep any later marker from being written (`Context::lost`).
-            let synced = {
-                let mut lost = checkpoint::lock(&self.ctx.lost);
-                let synced = crate::fault::inject(crate::fault::Point::AbandonedWriteSync)
-                    .and_then(|()| self.active.map.sync_range(offset, u64::from(len)))
-                    .and_then(|()| mmap::sync_data(&self.active.file))
-                    .and_then(|()| mmap::full_barrier(&self.active.file));
-                if synced.is_err() {
-                    *lost = true;
-                }
-                synced
-            };
-            if let Err(e) = synced {
-                // Stale bytes could resurface after a power loss and be read as a record after a shorter one,
-                // so this writer must not reuse the space: refuse further appends and checkpoints.
-                self.poisoned = true;
-                // The OS error is wrapped (kind `Other`) so that it is never `is_storage_full`.
-                self.abandoned_write_error = Some(Error::io(
-                    "sync the zeroing of an abandoned write",
-                    &self.active.path,
-                    io::Error::other(e),
-                ));
+        match filled {
+            Ok(Ok(())) => {}
+            Ok(Err(declined)) => {
+                // A failed clean-up is the journal's error: the caller's value is dropped.
+                self.abandon(offset, len)?;
+                return Ok(Err(declined));
             }
-            panic::resume_unwind(cause);
+            Err(cause) => {
+                // The panic continues even if the clean-up failed; the cause is recorded all the same.
+                let _ = self.abandon(offset, len);
+                panic::resume_unwind(cause);
+            }
         }
         format::finish_record_body(len, body);
         crate::fault::pause_before_publish();
@@ -385,7 +418,58 @@ impl Writer {
             self.spare = crate::prefault::prepare_spare(&self.dir, self.config.segment_size);
         }
         self.next_seq = seq + 1;
-        Ok(seq)
+        Ok(Ok(seq))
+    }
+
+    /// Abandons the uncommitted record of frame length `len` at `offset` (its fill closure declined or panicked):
+    /// zeroes its body and makes the zeroing durable (full platform barrier) before the space can be reused
+    /// (`docs/format.md` → Abandoned writes). If that fails, stops the writer ([`Writer::abandoned_write_error`]) and
+    /// returns the error that every later append returns. The one clean-up for both ways of abandoning a record.
+    #[cold]
+    #[inline(never)]
+    fn abandon(&mut self, offset: u64, len: u32) -> Result<()> {
+        let body_len = u64::from(len) - format::COMMIT_WORD_LEN as u64;
+        let zeroed = match self
+            .active
+            .map
+            .bytes_mut(offset + format::COMMIT_WORD_LEN as u64, body_len)
+        {
+            Some(body) => {
+                body.fill(0);
+                Ok(())
+            }
+            None => Err(io::Error::other("record body out of bounds")),
+        };
+        // The zeroing must be durable (full platform barrier) before this space is reused. Under the lock a
+        // checkpoint holds from its first sync to its marker (it waits for a background checkpoint in flight): a
+        // failed sync here must keep any later marker from being written (`Context::lost`).
+        let synced = {
+            let mut lost = checkpoint::lock(&self.ctx.lost);
+            let synced = zeroed
+                .and_then(|()| crate::fault::inject(crate::fault::Point::AbandonedWriteSync))
+                .and_then(|()| self.active.map.sync_range(offset, u64::from(len)))
+                .and_then(|()| mmap::sync_data(&self.active.file))
+                .and_then(|()| mmap::full_barrier(&self.active.file));
+            if synced.is_err() {
+                *lost = true;
+            }
+            synced
+        };
+        let Err(e) = synced else {
+            return Ok(());
+        };
+        // Stale bytes could resurface after a power loss and be read as a record after a shorter one,
+        // so this writer must not reuse the space: refuse further appends and checkpoints.
+        self.poisoned = true;
+        // The OS error is wrapped (kind `Other`) so that it is never `is_storage_full`.
+        let cause = Error::io(
+            "sync the zeroing of an abandoned write",
+            &self.active.path,
+            io::Error::other(e),
+        );
+        let refused = refused_append(&cause, &self.active.path);
+        self.abandoned_write_error = Some(cause);
+        Err(refused)
     }
 
     /// Makes every record appended so far durable, using the platform's sync calls (see
@@ -638,8 +722,9 @@ impl Writer {
         &self.retention_report
     }
 
-    /// The error that stopped this writer when the zeroing of an abandoned write (a panic in an
-    /// [`append_with`](Writer::append_with) fill closure) could not be made durable, if that happened.
+    /// The error that stopped this writer when the zeroing of an abandoned write (a fill closure of
+    /// [`append_with`](Writer::append_with) that panicked, or one of [`try_append_with`](Writer::try_append_with)
+    /// that declined or panicked) could not be made durable, if that happened.
     ///
     /// Treat this as a storage incident, like a failed checkpoint (`docs/crash-contract.md` → Errors are sticky).
     /// While it is set, appends fail with [`Error::Io`] and checkpoints with [`Error::DurabilityLost`], and the
@@ -658,6 +743,47 @@ impl Writer {
     /// Retention errors never poison the writer or fail open, append or checkpoint.
     pub fn last_retention_error(&self) -> Option<&Error> {
         self.last_retention_error.as_ref()
+    }
+
+    /// Releases this process's copy of a writer inherited across `fork`. **Call it only in a child process created
+    /// by `fork` from the process that opened the writer**; in the process that opened it, drop the writer instead.
+    ///
+    /// Closes the child's copies of the writer's file descriptors and unmaps its mappings, so that the lock is held
+    /// only by the parent's descriptor again and the journal can be reopened once the parent closes its writer. It
+    /// does not unlock the lock file (the lock belongs to the open file description that parent and child share),
+    /// does not sync, does not remove or change any file or the wake-up region, and does not join or signal the
+    /// helper threads, which exist only in the parent.
+    ///
+    /// # What it leaks
+    ///
+    /// Until the child exits: the helper threads' handles and the state they share with the writer, including the
+    /// prefault thread's reference to the active segment's mapping (so with prefaulting enabled that mapping stays
+    /// mapped in the child, although its file descriptor is closed), and a spare segment prepared in the background
+    /// (its file descriptor and mapping, which the spare thread's result owns).
+    ///
+    /// # Preconditions
+    ///
+    /// - **Not async-signal-safe.** It frees heap memory (paths, lists, reference counts of mappings) through the
+    ///   global allocator. In the child of a multithreaded process, call it only where the allocator is usable after
+    ///   `fork`: the glibc and macOS system allocators reinitialise their locks in the child, but with an allocator
+    ///   that does not, a lock held by another thread at the fork can stall the child here, and the journal then stays
+    ///   locked by the child's descriptor until the child is killed.
+    /// - **No call on the writer may have been in progress in another thread at the moment of the fork.** The child's
+    ///   copy could then be half-updated (for example in the middle of a roll), and releasing it is not supported.
+    ///   Code that shares a writer between threads must make sure of this itself (the Python bindings, for example,
+    ///   never release a copy whose lock was held at the fork).
+    /// - **Only in a forked child.** Called in the process that opened the writer, it releases the journal lock
+    ///   while the prefault thread and its mapping stay alive, a spare-segment thread may still be running (its
+    ///   spare file is then left for the next writer's recovery to remove), waiting readers are not told that the
+    ///   writer has gone, and on macOS the wake-up region's shared-memory name stays until the next writer opens the
+    ///   journal. Another writer could then open the journal while those threads still run.
+    pub fn release_after_fork(mut self) {
+        std::mem::forget(self.spare.take());
+        std::mem::forget(self.prefault.take());
+        if let Some(notify) = self.notify.take() {
+            notify.release_after_fork();
+        }
+        // `Drop` finds no spare; the remaining fields only close descriptors and unmap.
     }
 
     /// Operational metrics only the writer knows: the head, the last checkpoint and its age by the monotonic clock,
@@ -881,6 +1007,34 @@ fn publish_spare(dir: &Path, base: u64, size: u64, spare: Spare) -> Result<Segme
         file: Arc::new(spare.file),
         map: spare.map,
     })
+}
+
+/// The error of an append refused because the zeroing of an abandoned write could not be made durable (`cause`, the
+/// writer's [`Writer::abandoned_write_error`]): an [`Error::Io`] with the cause's OS error. Returned by every append
+/// from then on, and by the `try_append_with` call whose decline left that clean-up failed.
+#[cold]
+#[inline(never)]
+fn refused_append(cause: &Error, path: &Path) -> Error {
+    let source = match cause {
+        Error::Io { source, .. } => {
+            let os = source
+                .get_ref()
+                .and_then(|e| e.downcast_ref::<io::Error>())
+                .unwrap_or(source);
+            os.raw_os_error().map_or_else(
+                || io::Error::new(os.kind(), os.to_string()),
+                io::Error::from_raw_os_error,
+            )
+        }
+        other => io::Error::other(other.to_string()),
+    };
+    // Wrapped, like the cause, so that the OS error (say ENOSPC) is never `is_storage_full`: freeing space does not
+    // make this writer accept appends again.
+    Error::io(
+        "append (refused: an earlier abandoned write could not be zeroed durably; reopen the journal)",
+        path,
+        io::Error::other(source),
+    )
 }
 
 /// An internal bounds check failed (a bug, reported as an error rather than a panic).
@@ -1143,8 +1297,22 @@ impl Recovery<'_> {
                         &RwView(&seg.map),
                         offset + format::COMMIT_WORD_LEN as u64,
                     );
-                    if seq != seg.base && bases.contains(&seq) && !visited.contains(&seq) {
-                        if let Ok(next) = open_segment(self.dir, seq) {
+                    // A segment for exactly `seq` that is not this one (at the first record slot `seq` is this
+                    // segment's own base) and has not been visited.
+                    let successor_pending =
+                        seq != seg.base && bases.contains(&seq) && !visited.contains(&seq);
+                    if successor_pending {
+                        // "Does not open" means the successor itself is invalid: `Corrupt` (a short file, a bad
+                        // header, a size or base mismatch) or `UnsupportedVersion`, as in the seal branch below. Any
+                        // other error (an I/O error opening, reading or mapping it: `EACCES`, `EMFILE`, `ENOMEM`) says
+                        // nothing about the journal and is returned here, before anything is changed, under both
+                        // policies.
+                        let opened = match open_segment(self.dir, seq) {
+                            Ok(next) => Some(next),
+                            Err(Error::Corrupt { .. } | Error::UnsupportedVersion { .. }) => None,
+                            Err(e) => return Err(e),
+                        };
+                        if let Some(next) = opened {
                             // The successor for exactly `seq` exists, is not this segment (at the first record slot
                             // `seq` is this segment's own base), has not been visited, and opens and maps: `offset`
                             // is where this segment's seal belongs, and the chain continues in the successor (ADR
@@ -1184,7 +1352,7 @@ impl Recovery<'_> {
                         }
                     }
                     if let Some(reason) = tail_end.and_then(|end| {
-                        committed_after_empty(&seg, offset, seq, end, &bases, &visited)
+                        committed_after_empty(&seg, offset, seq, end, &bases, successor_pending)
                     }) {
                         // Evidence of committed history, or a search stopped at its work bound: a committed tail (ADR
                         // 0035; usually storage damage, but a torn payload can lead here too, crash contract C1).
@@ -1194,12 +1362,29 @@ impl Recovery<'_> {
                         seg = self.repair_tail(seg, offset, reason)?;
                         break;
                     }
+                    if successor_pending && tail_end.is_some() {
+                        // The successor for exactly `seq` exists but did not open (it would have been entered above),
+                        // and the search found no evidence: the chain is broken here, at the seal's place, and cannot
+                        // continue. The non-zero bytes after the commit word can be the only ones left for diagnosis
+                        // or salvage, so they are a corrupt tail, not an uncommitted one:
+                        // `Fail` refuses before changing a byte of this segment, and `Quarantine` preserves them and
+                        // replaces the segment (ADR 0035, "Damage around a seal"). Either way it is reported as
+                        // `BrokenChain` at `offset`, where `verify` reports this state. The successor and every later
+                        // segment are then disconnected and quarantined below. An interrupted repair leaves this
+                        // segment ending at `offset` with nothing after it, which the next open handles as below, with
+                        // the same result.
+                        let reason = CorruptReason::BrokenChain(seq);
+                        if self.config.recovery == RecoveryPolicy::Fail {
+                            return Err(Error::corrupt(&seg.path, offset, reason));
+                        }
+                        seg = self.repair_tail(seg, offset, reason)?;
+                        break;
+                    }
                     // The search completed without evidence: a torn append or the clean end, or damage that left no
-                    // evidence (ADR 0035, "What cannot be detected"). (A successor for exactly `seq` that does not
-                    // open, as before this change, ends the chain here: the bytes after `offset` are zeroed in place
-                    // without a copy even under `Fail`, then the successor is quarantined below, or refused as
-                    // disconnected under `Fail`. Known gap, ADR 0035: a later change will preserve them under
-                    // `Quarantine` and make `Fail` refuse before zeroing.)
+                    // evidence (ADR 0035, "What cannot be detected"). In front of a successor for exactly `seq` that
+                    // does not open, nothing after the commit word is non-zero here (that case is handled above), so
+                    // nothing is zeroed, the chain ends at `offset`, and the successor is quarantined below, or
+                    // refused as disconnected under `Fail`.
                     self.zero_uncommitted_tail(&mut seg, offset, tail_end)?;
                     break;
                 }
@@ -1485,21 +1670,21 @@ impl Recovery<'_> {
 /// A segment with a larger base counts only when the caller found non-zero bytes after the commit word (`tail_end`),
 /// and not in the case below.
 ///
-/// The caller has already handled a successor for exactly `seq` that opens (a seal belongs at `offset`). A later
-/// segment is still not evidence when that successor exists but does not open and the non-zero bytes end within a
-/// seal at `offset`: unchanged from before, the chain then ends at `offset`.
+/// The caller has already handled a successor for exactly `seq` that opens (a seal belongs at `offset`).
+/// `successor_pending` says that one exists, is not `seg` and has not been visited, so here it did not open. A later
+/// segment is still not evidence when the non-zero bytes then end within a seal at `offset` (what a crash between
+/// publishing the successor and sealing leaves): the caller reports that tail as a chain broken at `offset`.
 fn committed_after_empty(
     seg: &Segment,
     offset: u64,
     seq: u64,
     tail_end: u64,
     bases: &BTreeSet<u64>,
-    visited: &BTreeSet<u64>,
+    successor_pending: bool,
 ) -> Option<CorruptReason> {
     if let Some(found) = format::find_history_before(&RwView(&seg.map), offset, seq, tail_end) {
         return Some(found.reason());
     }
-    let successor_pending = seq != seg.base && bases.contains(&seq) && !visited.contains(&seq);
     if successor_pending && tail_end <= offset + format::SEAL_LEN as u64 {
         return None;
     }
@@ -1557,8 +1742,15 @@ pub enum RecoveryAction {
     /// Non-zero bytes after an empty commit word were zeroed in place, without a copy (`docs/crash-contract.md`, C8
     /// and C11). This describes the action taken on the evidence recovery found, not what readers saw: after a
     /// process crash in an otherwise intact journal the bytes are an unpublished record body (or what is left of one)
-    /// or the CRC word of a seal recovery is about to write, which no reader saw, but after storage damage that left no evidence they can be
-    /// published records a reader has already returned (C11 (3)).
+    /// or the CRC word of a seal recovery is about to write, which no reader saw, but after storage damage that left
+    /// no evidence they can be published records a reader has already returned (C11 (3)). Bytes after an empty commit
+    /// word in front of a segment for the expected sequence number that exists but does not open are not zeroed: when
+    /// the search finds no evidence of committed history after the word, they are preserved as
+    /// [`RecoveryAction::RepairedTail`] with [`CorruptReason::BrokenChain`](crate::CorruptReason::BrokenChain) (C11
+    /// (3)); when it finds some (other bytes after the seal's place and a segment with a higher base, for example),
+    /// they are preserved as for any evidence, with
+    /// [`CorruptReason::EmptyCommitWord`](crate::CorruptReason::EmptyCommitWord) or
+    /// [`CorruptReason::UncheckedTail`](crate::CorruptReason::UncheckedTail) (C11 (2)).
     ZeroedUncommitted {
         /// The segment.
         segment: PathBuf,
@@ -1571,9 +1763,12 @@ pub enum RecoveryAction {
     /// was replaced by a copy with the tail zeroed (never edited in place). The tail starts at an invalid record or
     /// seal; at an empty commit word with evidence of committed history after it, or after which the search stopped
     /// at its work bound ([`CorruptReason::EmptyCommitWord`](crate::CorruptReason::EmptyCommitWord),
-    /// [`CorruptReason::UncheckedTail`](crate::CorruptReason::UncheckedTail)); or at the place of a seal with damage
-    /// beyond it ([`CorruptReason::BadSeal`](crate::CorruptReason::BadSeal); `docs/crash-contract.md`, C11). What
-    /// followed `offset` leaves the segment; the quarantine file keeps its bytes up to the last non-zero one.
+    /// [`CorruptReason::UncheckedTail`](crate::CorruptReason::UncheckedTail)); at the place of a seal with damage
+    /// beyond it ([`CorruptReason::BadSeal`](crate::CorruptReason::BadSeal)); or at an empty commit word with
+    /// non-zero bytes after it in front of a segment for the expected sequence number that exists but does not open,
+    /// when the search finds no evidence after it ([`CorruptReason::BrokenChain`](crate::CorruptReason::BrokenChain);
+    /// `docs/crash-contract.md`, C11 (3)). What followed `offset` leaves the segment; the quarantine file keeps its
+    /// bytes up to the last non-zero one.
     RepairedTail {
         /// The segment.
         segment: PathBuf,

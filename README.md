@@ -60,17 +60,43 @@ Under minutes of sustained high-rate writing, ext4 itself occasionally stalls wr
 
 ## Quickstart
 
-Add the library to your project, or install the CLI from crates.io:
+Add the library to your project:
 
 ```bash
 cargo add tickertape
-cargo install tickertape-cli --locked
 ```
 
 [API documentation](https://docs.rs/tickertape/0.4.0/tickertape/) · [CLI reference](docs/cli.md)
 
-Prebuilt CLI downloads for Linux and macOS are available from the
-[GitHub releases](https://github.com/thomas0903/tickertape/releases/latest); see [installation and checksums](docs/install.md).
+Install the `tickertape` CLI (Linux x86-64 and ARM64, macOS Intel and Apple Silicon) in one of these ways.
+[Installation](docs/install.md) has the details, the static Linux builds and how to verify a download.
+
+From source with Cargo:
+
+```bash
+cargo install tickertape-cli --locked
+```
+
+A prebuilt binary with [cargo-binstall](https://github.com/cargo-bins/cargo-binstall) (releases after v0.4.0):
+
+```bash
+cargo binstall tickertape-cli
+```
+
+With Homebrew on macOS or Linux (releases after v0.4.0):
+
+```bash
+brew install thomas0903/tap/tickertape
+```
+
+With mise:
+
+```bash
+mise use github:thomas0903/tickertape
+```
+
+Or download an archive and `SHA256SUMS` from the
+[GitHub releases](https://github.com/thomas0903/tickertape/releases/latest).
 
 As a library:
 
@@ -119,7 +145,11 @@ From other languages:
 |---|---|---|---|
 | C (and others through FFI) | C ABI: `libtickertape` and `tickertape.h` | not stable before 1.0 | [`docs/c-api.md`](docs/c-api.md) |
 | C++ | Header-only C++17 binding over the C ABI: `tickertape.hpp` (RAII handles, borrowed views, works without exceptions) | not stable before 1.0 | [`docs/cpp-api.md`](docs/cpp-api.md) |
+| Python | Installable bindings that write, follow and replay journals | not yet published | [`bindings/python/`](bindings/python/README.md) |
+| Java (JDK 25+) | Binding over the C ABI with the Foreign Function and Memory API, in `bindings/java` | not yet on Maven Central | [`docs/java-api.md`](docs/java-api.md) |
 | Python | Read-only decoder without dependencies | | [`python/`](python/README.md) |
+
+[`docs/python.md`](docs/python.md) compares the two Python options.
 
 ## iceoryx2 integration
 
@@ -180,8 +210,9 @@ Background research: [`docs/research/2026-10-31-market-review.md`](docs/research
 ## Project layout
 
 `crates/tickertape` (library) · `crates/tickertape-cli` (the `tickertape` binary) · `crates/tickertape-ffi` (C ABI,
-C header and C++ binding) · `tests/` (cross-process and crash tests) · `fuzz/` · `benches/` · `examples/` ·
-`integrations/iceoryx2` (separate crate) · `docs/` (format, crash contract, decisions, playbooks).
+C header and C++ binding) · `bindings/java` (Java binding) · `tests/` (cross-process and crash tests) · `fuzz/` ·
+`benches/` · `examples/` · `integrations/iceoryx2` (separate crate) · `docs/` (format, crash contract, decisions,
+playbooks).
 Contributions: [`CONTRIBUTING.md`](CONTRIBUTING.md). Security issues: [`SECURITY.md`](SECURITY.md).
 
 ## Licence

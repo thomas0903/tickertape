@@ -32,8 +32,28 @@ tempfile = "3"
 parquet = { version = "59", default-features = false, features = ["snap"] }
 
 [dev-dependencies]
+# The unit tests race retention against the export and tail passes at the reader's hook points (src/fault.rs).
+tickertape = { workspace = true, features = ["fault-injection"] }
 assert_cmd = "2"
 predicates = "3"
 
 [lints]
 workspace = true
+
+# `cargo binstall tickertape-cli` installs the CLI archive from the GitHub release instead of compiling it. On Linux it
+# always uses the static musl archive, which needs no particular glibc. CI checks these templates against the names
+# that `.github/scripts/release.py package` gives the archives.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/tickertape-v{ version }-{ target }{ archive-suffix }"
+bin-dir = "tickertape-v{ version }-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+# Never a third-party build service: only the project's own archives (or, if the user agrees, a source build).
+disabled-strategies = ["quick-install"]
+
+[package.metadata.binstall.overrides.x86_64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/tickertape-v{ version }-x86_64-unknown-linux-musl{ archive-suffix }"
+bin-dir = "tickertape-v{ version }-x86_64-unknown-linux-musl/{ bin }{ binary-ext }"
+
+[package.metadata.binstall.overrides.aarch64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/tickertape-v{ version }-aarch64-unknown-linux-musl{ archive-suffix }"
+bin-dir = "tickertape-v{ version }-aarch64-unknown-linux-musl/{ bin }{ binary-ext }"

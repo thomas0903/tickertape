@@ -5,3 +5,6 @@ paths:
   .github/workflows/release.yml:
     ignore:
       - '^unexpected key "cache-mode" for "workflow" section\.'
+  .github/workflows/python-wheels.yml:
+    ignore:
+      - '^unexpected key "cache-mode" for "workflow" section\.'

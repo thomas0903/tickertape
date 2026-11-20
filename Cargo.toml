@@ -8,7 +8,7 @@ members = [
     "benches",
     "examples",
 ]
-exclude = ["fuzz", "compare", "integrations"]
+exclude = ["fuzz", "compare", "bindings/python", "integrations"]
 
 [workspace.package]
 version = "0.4.0"
@@ -25,7 +25,13 @@ tickertape = { path = "crates/tickertape", version = "0.4.0" }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)", "cfg(fuzzing)", "cfg(tickertape_force_soft_crc)"] }
+# `tickertape_test_panic_abort` is private to one test of the C ABI crate (crates/tickertape-ffi/src/lib.rs).
+unexpected_cfgs = { level = "warn", check-cfg = [
+    "cfg(loom)",
+    "cfg(fuzzing)",
+    "cfg(tickertape_force_soft_crc)",
+    "cfg(tickertape_test_panic_abort)",
+] }
 missing_debug_implementations = "warn"
 rust_2018_idioms = { level = "warn", priority = -1 }
 

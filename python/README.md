@@ -4,6 +4,9 @@
 dependencies. It opens journal files only for reading, never takes the writer lock and never repairs a journal.
 The on-disk specification is [`docs/format.md`](../docs/format.md); only format version 1 is supported.
 
+To write journals or follow them live from Python, use the installable bindings instead (`pip install tickertape`,
+[`bindings/python/`](../bindings/python/README.md)). [`docs/python.md`](../docs/python.md) compares the two.
+
 Add this directory to your Python import path (or copy the module into your project):
 
 ```python

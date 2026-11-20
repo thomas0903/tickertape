@@ -89,12 +89,13 @@ cc app.c $(pkg-config --cflags --libs tickertape) -o app
 The static library contains its own copy of the Rust standard library, so linking two Rust static libraries into one
 program can produce duplicate symbols; link one of them dynamically in that case.
 
-**macOS: link the static library with Apple's toolchain defaults, or use the shared library.** The GCC driver
-(Homebrew `gcc`/`g++`) passes `-no_compact_unwind` to the linker. The library aborts an append whose fill callback
-returns non-zero by unwinding internally, and with `libtickertape.a` linked that way the unwind information is gone,
-so such an `append_with` ends the process inside the library. Shared linkage with either compiler, and the static
-library linked by Apple Clang (`cc`, `c++`), work. (The tests skip their statically linked programs in that
-configuration for this reason.)
+**macOS and the GCC driver.** The GCC driver (Homebrew `gcc`/`g++`) passes `-no_compact_unwind` to the linker, so
+`libtickertape.a` linked that way loses its unwind information. No ordinary result depends on it: an append whose
+fill callback returns non-zero returns without unwinding (ADR 0039), with `TICKERTAPE_E_ABORTED` when the clean-up
+succeeds and `TICKERTAPE_E_IO` when it fails (see `tickertape_writer_append_with` below). The library still unwinds to
+catch a Rust panic (a bug in tickertape, otherwise reported as `TICKERTAPE_E_PANIC`), so with that link such a panic
+ends the process instead. Shared linkage, or the static library linked by Apple Clang (`cc`, `c++`), keeps the unwind
+information.
 
 C++ can use the same header (it has `extern "C"` guards), but the C++ binding
 [`tickertape.hpp`](../crates/tickertape-ffi/include/tickertape.hpp) (C++17, header-only, [`cpp-api.md`](cpp-api.md))
@@ -177,7 +178,8 @@ tickertape_writer_options_free(options);
 - `tickertape_writer_append_with` avoids that copy: it calls your `tickertape_fill_fn` once with a zeroed buffer
   inside the mapped segment (NULL for an empty payload); you write the payload and return 0. Returning non-zero
   aborts the append (`TICKERTAPE_E_ABORTED`): nothing is committed, but the writer zeroes the buffer and syncs that to
-  storage first (the format requires it), so aborting is slow. If that sync fails, the call returns
+  storage first (the format requires it), so aborting is slow. Aborting does not unwind inside the library: the
+  library returns from the call as from any other error. If that sync fails, the call returns
   `TICKERTAPE_E_IO` with the OS error instead (even for `ENOSPC`), and the writer refuses further appends and
   checkpoints: a storage incident, see [A failed clean-up](#a-failed-clean-up-after-an-aborted-fill). The callback
   runs on the calling thread, must not keep the buffer, and must not call into the same writer (that, including
@@ -304,8 +306,9 @@ history all the same). `tickertape_verify` reports both as `first_problem_reason
 thread between two foreign calls (Go goroutines, Java virtual threads) can read another thread's state, or none. Read
 the details on the same OS thread, in the same foreign call sequence as the failing call: in Go, call through a small C
 function in the cgo preamble that makes the call and captures the code, message, OS error and corruption reason
-together (or hold `runtime.LockOSThread` across the call and the reads); in Java, read them in the same downcall
-sequence on a platform thread, or through such a C shim.
+together (or hold `runtime.LockOSThread` across the call and the reads); in Java, read them in the same sequence of
+downcalls, with no Java code in between that can block, as the Java binding does
+([ADR 0037](decisions/0037-java-binding.md)).
 
 | Code | Meaning |
 |---|---|
@@ -348,9 +351,11 @@ Errors are sticky):
   cache can hold the zeroed bytes as clean pages while the disk still holds the stale ones; recovery then reads zeros
   and has no reason to rewrite them, so reopening does not establish that the clean-up reached the disk.
 
-Later versions may add codes; treat any unknown negative value as an error. No Rust panic ever unwinds into C: every
+Later versions may add codes; treat any unknown negative value as an error. No Rust panic unwinds into C: every
 function catches panics and returns `TICKERTAPE_E_PANIC` (the library must be built with Rust's default
-`panic = "unwind"`, which the crate enforces). The Rust panic message is also printed to standard error.
+`panic = "unwind"`, which the crate enforces). The exception is the static library linked by the GCC driver on macOS,
+where a panic ends the process instead (see [Building and linking](#building-and-linking)). The Rust panic message is
+also printed to standard error.
 
 ## Threading
 

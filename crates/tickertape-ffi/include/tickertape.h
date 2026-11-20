@@ -245,7 +245,10 @@ enum tickertape_corrupt_reason
    */
   TICKERTAPE_CORRUPT_BAD_SEAL = 11,
   /**
-   * A sealed segment's successor is missing while later segments exist, or does not start where the seal says.
+   * A sealed segment's successor is missing while later segments exist, or does not start where the seal says; or
+   * the chain ends at an empty commit word in a segment that is not the newest, such as one in front of a successor
+   * segment that does not open (writer recovery then preserves the non-zero bytes after that word, or refuses:
+   * `docs/crash-contract.md` C11 (3)), or a segment is disconnected from the chain.
    */
   TICKERTAPE_CORRUPT_BROKEN_CHAIN = 12,
   /**
@@ -1209,7 +1212,7 @@ tickertape_status tickertape_writer_append(struct tickertape_writer *writer,
  *
  * If `fill` returns non-zero, nothing is committed and this returns `TICKERTAPE_E_ABORTED`: the writer zeroes the
  * buffer and syncs that zeroing to storage before returning (`docs/format.md` → Abandoned writes), so aborting is
- * slow; use it only for exceptional cases.
+ * slow; use it only for exceptional cases. Aborting does not unwind inside the library.
  *
  * If that sync fails, this call returns `TICKERTAPE_E_IO` instead of `TICKERTAPE_E_ABORTED`, with the OS error in
  * `tickertape_last_error_os_code` and a message saying the clean-up failed. The code is `TICKERTAPE_E_IO` even when

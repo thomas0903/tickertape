@@ -70,3 +70,10 @@ gains little from one); Windows channels.
   workflow must stay tag-driven and must not need long-lived secrets where keyless publishing exists.
 - Musl builds use a different memory allocator. Parquet export speed under musl must be measured before the musl
   build is recommended for it.
+
+## Amendment (2026-11-19): version of the Python bindings
+
+The Python bindings (ADR 0029) bind the Rust library directly, not the C ABI, so the version rule above does not fit
+them. Their version follows the Rust workspace version, and `release.py prepare` refuses a release tag whose
+bindings version differs. The other criteria for a delivered binding apply unchanged. Bindings built on the C ABI
+(C++, Java) keep the rule above.
