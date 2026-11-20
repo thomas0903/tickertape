@@ -321,43 +321,72 @@ pub unsafe extern "C" fn tickertape_writer_append_with(
     })
 }
 
-/// Appends `records` in order with `append`, storing the number committed in `*appended_out` after each one, so that
-/// it is right whenever this returns or unwinds.
+/// Hands `records` to `append_batch` (one call to `Writer::append_batch`) as an iterator of `NewRecord`s and stores
+/// the number appended in `*appended_out`. The iterator stores, before each record it hands out, the number handed
+/// out so far: the core appends a record before it takes the next, so that is the number committed if
+/// `append_batch` unwinds. When `append_batch` returns, the count it reports is stored.
 ///
 /// # Safety
 ///
 /// Every record must have been checked by `tickertape_writer_append_batch` (payload not NULL when its length is not
 /// 0, length within `isize::MAX`), and its payload must be readable and unmodified during the call. `appended_out`
 /// must be valid for writing a `usize` and must not overlap `records` or any payload.
-pub(crate) unsafe fn append_records(
-    records: &[tickertape_new_record],
+pub(crate) unsafe fn append_records<'r>(
+    records: &'r [tickertape_new_record],
     appended_out: *mut usize,
-    mut append: impl FnMut(&NewRecord<'_>) -> Result<u64, FfiError>,
+    append_batch: impl FnOnce(&mut Taken<'r>) -> (usize, Result<(), FfiError>),
 ) -> Result<(), FfiError> {
-    for (index, r) in records.iter().enumerate() {
-        // SAFETY: checked before (see the function's contract); cannot fail here.
-        let payload = unsafe { args::bytes(r.payload, r.payload_len, "payload") }?;
-        append(&NewRecord {
+    let mut taken = Taken {
+        records: records.iter(),
+        taken: 0,
+        appended_out,
+    };
+    let (appended, result) = append_batch(&mut taken);
+    // SAFETY: valid for writes and disjoint from every input (the function's contract).
+    unsafe { appended_out.write(appended) };
+    result
+}
+
+/// The records of a batch, as `append_records` hands them to the core.
+pub(crate) struct Taken<'r> {
+    records: std::slice::Iter<'r, tickertape_new_record>,
+    taken: usize,
+    /// Valid for writes and disjoint from every input (the contract of `append_records`).
+    appended_out: *mut usize,
+}
+
+impl<'r> Iterator for Taken<'r> {
+    type Item = NewRecord<'r>;
+
+    fn next(&mut self) -> Option<NewRecord<'r>> {
+        // SAFETY: see the field.
+        unsafe { self.appended_out.write(self.taken) };
+        let r = self.records.next()?;
+        self.taken += 1;
+        // SAFETY: every record was checked before (the contract of `append_records`), so this cannot fail.
+        let payload = unsafe { args::bytes(r.payload, r.payload_len, "payload") }
+            .expect("payload checked before the batch");
+        Some(NewRecord {
             schema_id: r.schema_id,
             venue_ts_ns: r.venue_ts_ns,
             local_ts_ns: r.local_ts_ns,
             payload,
-        })?;
-        // SAFETY: valid for writes and disjoint from every input (the function's contract).
-        unsafe { appended_out.write(index + 1) };
+        })
     }
-    Ok(())
 }
 
 /// Appends `count` records in order, stopping at the first failure.
 ///
 /// Every record is checked first (`payload` NULL with `payload_len` > 0, a length too large, `reserved` not 0): an
 /// argument error returns `TICKERTAPE_E_INVALID_ARGUMENT`, naming the record's index in the message, and appends
-/// nothing. Then the records are appended one by one, as with `tickertape_writer_append`. `*first_seq_out` (which may
-/// be NULL) is set to the sequence number the first record gets, and `*appended_out` to the number of records
-/// appended so far, updated as each one commits; the appended records are consecutive. On an error, the records
-/// before the failing one (index `*appended_out`) **are appended** and stay appended: retry only from the failing
-/// record.
+/// nothing. Then the records are appended in order in one batch (ADR 0041): each record is committed, and visible to
+/// readers, as it is written, as with `tickertape_writer_append`. Instead of one wake-up after each record, a batch
+/// that appends at least one record wakes blocked readers once (when wake-ups are enabled) after the last record
+/// appended, plus once at each roll inside the batch. `*first_seq_out` (which may be NULL) is set to the sequence
+/// number the first record gets, and `*appended_out` to the number of records appended; the appended records are
+/// consecutive.
+/// On an error, the records before the failing one (index `*appended_out`) **are appended** and stay appended: retry
+/// only from the failing record.
 ///
 /// If `appended_out` or `first_seq_out` overlaps another argument (each other, the `records` array or a payload),
 /// returns `TICKERTAPE_E_INVALID_ARGUMENT` and writes nothing. Otherwise `*appended_out` is always set (0 on an
@@ -437,8 +466,9 @@ pub unsafe extern "C" fn tickertape_writer_append_batch(
             unsafe { args::write_optional(first_seq_out, w.next_seq()) };
             // SAFETY: every record was checked above, and `appended_out` overlaps no input.
             unsafe {
-                append_records(records, appended_out, |record| {
-                    w.append(record).map_err(|e| writer_error(w, e))
+                append_records(records, appended_out, |taken| match w.append_batch(taken) {
+                    Ok(_) => (records.len(), Ok(())),
+                    Err(e) => (e.appended, Err(writer_error(w, e.error))),
                 })
             }
         })?;

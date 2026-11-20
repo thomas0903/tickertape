@@ -58,8 +58,30 @@ impl Event {
         }
     }
 
-    /// Encodes the payload.
+    /// The payload's length in bytes: 32 for a trade, 24 for a book update.
+    pub fn encoded_len(&self) -> usize {
+        match self {
+            Event::Trade { .. } => 32,
+            Event::Book { .. } => 24,
+        }
+    }
+
+    /// Encodes the payload into a new vector.
     pub fn encode(&self) -> Vec<u8> {
+        let mut b = vec![0u8; self.encoded_len()];
+        self.encode_into(&mut b);
+        b
+    }
+
+    /// Encodes the payload into `b`, which must be exactly [`Event::encoded_len`] bytes long. Writes every byte, the
+    /// padding included, so `b` need not be zeroed. The demo producer uses this with `Writer::append_with` to encode
+    /// directly into the journal's record, without an intermediate buffer.
+    ///
+    /// # Panics
+    ///
+    /// If `b.len()` is not [`Event::encoded_len`].
+    pub fn encode_into(&self, b: &mut [u8]) {
+        assert_eq!(b.len(), self.encoded_len(), "payload buffer length");
         match *self {
             Event::Trade {
                 instrument_id,
@@ -68,13 +90,12 @@ impl Event {
                 qty,
                 trade_id,
             } => {
-                let mut b = vec![0u8; 32];
                 b[0..4].copy_from_slice(&instrument_id.to_le_bytes());
                 b[4] = if buy { 1 } else { 2 };
+                b[5..8].fill(0);
                 b[8..16].copy_from_slice(&price.to_le_bytes());
                 b[16..24].copy_from_slice(&qty.to_le_bytes());
                 b[24..32].copy_from_slice(&trade_id.to_le_bytes());
-                b
             }
             Event::Book {
                 instrument_id,
@@ -83,13 +104,12 @@ impl Event {
                 price,
                 qty,
             } => {
-                let mut b = vec![0u8; 24];
                 b[0..4].copy_from_slice(&instrument_id.to_le_bytes());
                 b[4] = if bid { 1 } else { 2 };
                 b[5] = if delete { 2 } else { 1 };
+                b[6..8].fill(0);
                 b[8..16].copy_from_slice(&price.to_le_bytes());
                 b[16..24].copy_from_slice(&qty.to_le_bytes());
-                b
             }
         }
     }
@@ -192,12 +212,55 @@ mod tests {
         ];
         for e in events {
             assert_eq!(Event::decode(e.schema_id(), &e.encode()), Some(e));
+            // In place, over a buffer that is not zeroed, the padding included.
+            let mut dirty = vec![0xff; e.encoded_len()];
+            e.encode_into(&mut dirty);
+            assert_eq!(dirty, e.encode());
         }
         assert_eq!(Event::decode(TRADE, &[0; 24]), None);
         assert_eq!(Event::decode(9, &[0; 32]), None);
         let mut bad = events[2].encode();
         bad[5] = 9;
         assert_eq!(Event::decode(BOOK, &bad), None);
+    }
+
+    #[test]
+    fn append_with_encodes_into_the_record() {
+        use tickertape::{NewRecord, Reader, ReaderConfig, Writer, WriterConfig};
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = Writer::open(dir.path(), WriterConfig::default()).unwrap();
+        let events = [
+            Event::Trade {
+                instrument_id: 1,
+                buy: false,
+                price: 5,
+                qty: 6,
+                trade_id: 7,
+            },
+            Event::Book {
+                instrument_id: 2,
+                bid: true,
+                delete: true,
+                price: 8,
+                qty: 0,
+            },
+        ];
+        for e in events {
+            let record = NewRecord {
+                schema_id: e.schema_id(),
+                venue_ts_ns: 0,
+                local_ts_ns: 0,
+                payload: &[],
+            };
+            writer
+                .append_with(&record, e.encoded_len(), |buf| e.encode_into(buf))
+                .unwrap();
+        }
+        let mut reader = Reader::open(dir.path(), ReaderConfig::default()).unwrap();
+        for e in events {
+            let r = reader.try_next().unwrap().unwrap();
+            assert_eq!(Event::decode(r.schema_id, r.payload), Some(e));
+        }
     }
 
     #[test]

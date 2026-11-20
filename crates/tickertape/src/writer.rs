@@ -3,6 +3,7 @@
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
+use std::ops::Range;
 use std::os::unix::fs::FileExt;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
@@ -361,6 +362,98 @@ impl Writer {
     where
         F: FnOnce(&mut [u8]) -> std::result::Result<(), E>,
     {
+        // `write_record` publishes the wake-up right after the commit, before its helper work.
+        self.write_record::<_, _, true>(record, payload_len, fill)
+    }
+
+    /// Appends `records` in order, as consecutive calls to [`Writer::append`] would, and returns the range of
+    /// sequence numbers they got. Blocked readers are woken once for the batch, and at each roll inside it, instead of
+    /// once per record.
+    ///
+    /// Each record is committed as soon as it is written, exactly as [`Writer::append`] commits it, so the records
+    /// become visible one by one and in order: a reader that polls can read the first records of a batch before this
+    /// call returns, and no reader can see a later record of the batch without the earlier ones. What is batched is
+    /// the wake-up of blocked readers (ADRs 0017 and 0021). When wake-ups are enabled
+    /// ([`WriterConfig::notify`](crate::WriterConfig::notify)), a batch that commits at least one record publishes one
+    /// wake-up after the last record it appended, plus one at each roll inside the batch (a roll publishes as it does
+    /// for [`Writer::append`]), instead of one after each record. So a blocked reader learns of the batch's first
+    /// records at the first roll inside the batch, or when the batch ends if it does not roll. Keep batches short where
+    /// that latency matters. See ADR 0041 for what is batched and what is not.
+    ///
+    /// A record that does not fit in the current segment rolls to a new one, as [`Writer::append`] does; a batch can
+    /// span several segments. Durability is as for [`Writer::append`]: the writer's thread syncs nothing (on macOS a
+    /// roll can wait for the thread preparing the next segment, which syncs it), and the records are durable once a
+    /// later checkpoint covers them.
+    ///
+    /// An empty `records` returns the empty range at [`Writer::next_seq`] and wakes nobody.
+    ///
+    /// # Errors
+    ///
+    /// The batch stops at the first record that cannot be appended, for any reason [`Writer::append`] gives. The
+    /// returned [`BatchError`] says how many records were appended: the first [`BatchError::appended`] records are
+    /// committed and stay committed, with sequence numbers from [`BatchError::first_seq`]; the failing record (the
+    /// next one) and the records after it are not, and the iterator is not advanced past the failing record. Blocked
+    /// readers are woken for the records that were appended.
+    pub fn append_batch<'a, I>(&mut self, records: I) -> std::result::Result<Range<u64>, BatchError>
+    where
+        I: IntoIterator<Item = NewRecord<'a>>,
+    {
+        let first_seq = self.next_seq;
+        let mut appended = 0;
+        // The iterator lives outside the `catch_unwind` and is dropped only after the publication, so that neither its
+        // destructor (which may wait for a reader to see the committed records) nor a panic from it delays or prevents
+        // the wake-up for the records already committed.
+        let mut records = records.into_iter();
+        let written = panic::catch_unwind(AssertUnwindSafe(|| {
+            for record in &mut records {
+                let payload = record.payload;
+                match self.write_record::<_, _, false>(&record, payload.len(), |buf| {
+                    buf.copy_from_slice(payload);
+                    Ok::<(), std::convert::Infallible>(())
+                }) {
+                    Ok(Ok(_)) => appended += 1,
+                    Ok(Err(never)) => match never {},
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(())
+        }));
+        if appended > 0 {
+            self.publish();
+        }
+        drop(records);
+        match written {
+            Ok(Ok(())) => Ok(first_seq..self.next_seq),
+            Ok(Err(error)) => Err(BatchError {
+                appended,
+                first_seq,
+                error,
+            }),
+            Err(cause) => panic::resume_unwind(cause),
+        }
+    }
+
+    /// Wakes blocked readers (ADRs 0017 and 0021), if the wake-up region is enabled.
+    #[inline]
+    fn publish(&self) {
+        if let Some(notify) = &self.notify {
+            notify.publish();
+        }
+    }
+
+    /// The append path. With `PUBLISH`, it publishes the wake-up right after the commit, before the helper work that
+    /// follows ([`Writer::try_append_with`]); without, the caller publishes once for many records
+    /// ([`Writer::append_batch`]).
+    #[inline(always)]
+    fn write_record<F, E, const PUBLISH: bool>(
+        &mut self,
+        record: &NewRecord<'_>,
+        payload_len: usize,
+        fill: F,
+    ) -> Result<std::result::Result<u64, E>>
+    where
+        F: FnOnce(&mut [u8]) -> std::result::Result<(), E>,
+    {
         if let Some(cause) = &self.abandoned_write_error {
             return Err(refused_append(cause, &self.active.path));
         }
@@ -424,8 +517,12 @@ impl Writer {
             .store_commit_word(offset, len)
             .ok_or_else(|| internal(&self.active.path, "commit word out of bounds"))?;
         self.offset = offset + format::align8(u64::from(len));
-        if let Some(notify) = &self.notify {
-            notify.publish();
+        if PUBLISH {
+            self.publish();
+        }
+        #[cfg(test)]
+        if let Some(hook) = tests::AFTER_COMMIT.with(std::cell::Cell::take) {
+            hook();
         }
         if let Some(prefault) = &mut self.prefault {
             prefault.advanced(self.offset);
@@ -983,9 +1080,7 @@ impl Writer {
         if let Some(prefault) = &mut self.prefault {
             prefault.switch(self.active.map.advice(), self.offset);
         }
-        if let Some(notify) = &self.notify {
-            notify.publish();
-        }
+        self.publish();
         Ok(())
     }
 }
@@ -1952,6 +2047,24 @@ fn inherited(seg: Segment, from: u64, seal_at: u64) -> DirtySegment {
     }
 }
 
+/// [`Writer::append_batch`] stopped at a record it could not append.
+///
+/// The first [`appended`](BatchError::appended) records of the batch are committed, with sequence numbers
+/// `first_seq..first_seq + appended`; the record at index `appended` and the records after it are not. To retry once
+/// the cause is resolved, append again from index `appended`.
+#[derive(Debug, thiserror::Error)]
+#[error("append_batch stopped at record {appended} after appending {appended} record(s)")]
+#[non_exhaustive]
+pub struct BatchError {
+    /// How many records of the batch were appended, which is also the index of the record that failed.
+    pub appended: usize,
+    /// The sequence number of the batch's first record: [`Writer::next_seq`] when the call began.
+    pub first_seq: u64,
+    /// Why the record at index `appended` was not appended: an error [`Writer::append`] can return.
+    #[source]
+    pub error: Error,
+}
+
 /// Where a writer's checkpoints stand ([`Writer::checkpoint_progress`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -2073,6 +2186,9 @@ mod tests {
     thread_local! {
         /// Called (once) by [`Writer::open`] on this thread right after it has taken the lock.
         pub(super) static AFTER_LOCK: Cell<Option<Box<dyn FnOnce()>>> = const { Cell::new(None) };
+        /// Called (once) by an append on this thread right after a record's commit (and, for a single-record append,
+        /// its wake-up), before the prefault, write-back and spare-segment work.
+        pub(super) static AFTER_COMMIT: Cell<Option<Box<dyn FnOnce()>>> = const { Cell::new(None) };
         /// The writer's lock descriptor, for a forked child's probe.
         static LOCK_FD: Cell<RawFd> = const { Cell::new(-1) };
     }
@@ -2444,6 +2560,114 @@ mod tests {
             })
             .unwrap();
             assert_eq!(child.wait(), Some(0), "{cpus:?}");
+        }
+    }
+
+    fn record(payload: &[u8]) -> NewRecord<'_> {
+        NewRecord {
+            schema_id: 1,
+            venue_ts_ns: 0,
+            local_ts_ns: 0,
+            payload,
+        }
+    }
+
+    /// A single-record append publishes its wake-up right after the commit, before the prefault, write-back and
+    /// spare-segment work; a batch publishes once, after its last record.
+    #[test]
+    fn append_wakes_readers_before_the_helper_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer =
+            Writer::open(dir.path(), WriterConfig::default().segment_size(1 << 20)).unwrap();
+        let notify = writer
+            .notify
+            .as_ref()
+            .expect("wake-ups are enabled")
+            .publisher();
+        let seen = Rc::new(Cell::new(None));
+
+        let before = notify.event();
+        let (at_hook, n) = (Rc::clone(&seen), notify.clone());
+        AFTER_COMMIT.set(Some(Box::new(move || at_hook.set(Some(n.event())))));
+        append_one(&mut writer);
+        assert_eq!(
+            seen.take(),
+            Some(before.wrapping_add(1)),
+            "published before the helper work"
+        );
+
+        let before = notify.event();
+        let (at_hook, n) = (Rc::clone(&seen), notify.clone());
+        AFTER_COMMIT.set(Some(Box::new(move || at_hook.set(Some(n.event())))));
+        writer.append_batch([record(b"a"), record(b"b")]).unwrap();
+        assert_eq!(
+            seen.take(),
+            Some(before),
+            "a batch does not publish per record"
+        );
+        assert_eq!(
+            notify.event(),
+            before.wrapping_add(1),
+            "one publication per batch"
+        );
+    }
+
+    /// Yields its records, then optionally panics; when dropped, notes whether the batch's wake-up was published.
+    struct CheckedOnDrop {
+        records: std::vec::IntoIter<NewRecord<'static>>,
+        panic_at_end: bool,
+        notify: mmap::NotifyPublisher,
+        expected: u32,
+        published_before_drop: Rc<Cell<Option<bool>>>,
+    }
+
+    impl Iterator for CheckedOnDrop {
+        type Item = NewRecord<'static>;
+
+        fn next(&mut self) -> Option<NewRecord<'static>> {
+            match self.records.next() {
+                None if self.panic_at_end => panic!("the caller's iterator fails"),
+                next => next,
+            }
+        }
+    }
+
+    impl Drop for CheckedOnDrop {
+        fn drop(&mut self) {
+            self.published_before_drop
+                .set(Some(self.notify.event() == self.expected));
+        }
+    }
+
+    /// `append_batch` publishes the wake-up before it drops the caller's iterator, also when the iterator panics.
+    #[test]
+    fn batch_wakes_readers_before_dropping_the_iterator() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer =
+            Writer::open(dir.path(), WriterConfig::default().segment_size(1 << 20)).unwrap();
+        let notify = writer
+            .notify
+            .as_ref()
+            .expect("wake-ups are enabled")
+            .publisher();
+        for panic_at_end in [false, true] {
+            let published_before_drop = Rc::new(Cell::new(None));
+            let records = CheckedOnDrop {
+                records: vec![record(b"a"), record(b"b"), record(b"c")].into_iter(),
+                panic_at_end,
+                notify: notify.clone(),
+                expected: notify.event().wrapping_add(1),
+                published_before_drop: Rc::clone(&published_before_drop),
+            };
+            let next_seq = writer.next_seq();
+            let result = panic::catch_unwind(AssertUnwindSafe(|| writer.append_batch(records)));
+            assert_eq!(result.is_err(), panic_at_end);
+            assert_eq!(writer.next_seq(), next_seq + 3);
+            assert_eq!(
+                published_before_drop.get(),
+                Some(true),
+                "panic_at_end {panic_at_end}"
+            );
         }
     }
 }
