@@ -682,6 +682,7 @@ pub fn scan_segment<V: SegmentView + ?Sized>(
 /// Evidence, found by [`find_history_after_empty`], that an empty slot (commit word 0) is not where the committed
 /// part of a segment ends (`docs/format.md` → Recovery, ADR 0035).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LaterHistory {
     /// A record at `offset` that validates completely (length, CRC32C, flags) with sequence number `seq`, which is
     /// above the empty slot's expected sequence number by no more than the records the space between them can hold.

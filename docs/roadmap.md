@@ -107,6 +107,9 @@ version numbers and dates are not fixed. Performance changes must preserve valid
 contract. An optimization investigation can close with a documented, measured decision that the proposed change
 does not help or cannot preserve those guarantees; such a decision must be explicit in the roadmap and its ADR.
 
+Status of each item as of the review of 2026-11-20 ([`compatibility.md`](compatibility.md)): an item is ticked only when every
+criterion holds; each open item says what is still missing.
+
 ### Next release: sustained performance
 
 - [ ] **Make sustained performance the next release's main objective.**
@@ -116,6 +119,8 @@ does not help or cannot preserve those guarantees; such a decision must be expli
     reader lag. Record p50/p99/p99.9/p99.99 and maxima for latency, with the workload's durability and wait settings.
   - Publish the remaining bottlenecks and supported operating envelope, including overload behavior, rather than
     treating a short peak-throughput result as evidence of sustainable capacity.
+  - Missing: the workloads exist (`tt-sustained`, ADR 0026, #11), but no results are recorded in `docs/benchmarks.md`
+    and no bottlenecks or operating envelope are published.
 - [ ] **Sustained-load comparison benchmarks.**
   - Extend the comparison suite with repeated runs of at least 10 minutes per configuration for every compatible
     tool, covering both existing payload sizes and rates below and near sustainable storage throughput.
@@ -123,6 +128,8 @@ does not help or cannot preserve those guarantees; such a decision must be expli
     visibility-only workloads from periodic durability workloads and document unequal guarantees or unsupported cases.
   - Preserve raw results, environment, exact commands, achieved rates and late sends. Investigate the ext4 stalls
     observed in ADR 0025 and publish comparisons without coordinated omission or hidden dropped records.
+  - Missing: the comparison mode exists (#11); the repeated 10-minute runs are not recorded in `docs/benchmarks.md`
+    (a cloud session is running) and the ext4 stall investigation is not published.
 - [ ] **Performance diagnostics with eBPF.**
   - Add a reproducible Linux diagnostic playbook using existing eBPF tools to investigate scheduler delays,
     page faults, filesystem/write-back stalls and block I/O during the sustained workloads.
@@ -130,6 +137,8 @@ does not help or cannot preserve those guarantees; such a decision must be expli
     tracing overhead, and confirm performance conclusions with tracing disabled.
   - Keep diagnostics optional: the library and CLI must work without eBPF, elevated tracing permissions or a
     collector. Kernel-event recording and XDP/AF_XDP ingestion remain separate proposals.
+  - Missing: the playbook is in place (`docs/playbooks/diagnose-latency-with-ebpf.md`, #31); the tracing overhead has
+    not been measured on a cloud Linux machine running the sustained workloads (#31 has informal OrbStack figures).
 - [ ] **Remove the mapped reader's validation copy.**
   - Compute CRC and validate record fields directly from atomic loads, eliminating the per-record scratch copy
     while retaining validation before creating any borrowed slice into the mapping.
@@ -140,6 +149,8 @@ does not help or cannot preserve those guarantees; such a decision must be expli
     is storing (ADR 0027 → "Which loads can race"). A protocol change: its own ADR, measurements and review. A
     reader-side frontier alone does not close the other known limitation, a zeroed commit word that lets recovery
     rewrite published records in place under a live reader.
+  - Missing: the copy is gone (ADR 0027, #9); replay and live-reader results on x86-64 and aarch64 are not recorded
+    in `docs/benchmarks.md`, and the publication-frontier follow-up has no ADR yet.
 - [ ] **Cheaper checkpoints with prefaulting.**
   - Measure how much prefaulted, unwritten dirty data contributes to checkpoint cost on each platform. The current
     implementation already restricts `msync` to written ranges, then performs file-wide sync/barrier operations.
@@ -147,22 +158,31 @@ does not help or cannot preserve those guarantees; such a decision must be expli
     contract. Record before/after checkpoint and durable-only reader latency, or document platform limitations.
   - A checkpoint that does not stop appends (`Writer::request_checkpoint`, ADR 0038, proposed): prototype in review;
     the design is finished after the Linux measurement the ADR describes (`tt-sustained --checkpoint-mode`).
+  - Missing: background checkpoints are merged (#28) but ADR 0038 is still proposed; the prefaulted-data measurement
+    and before/after checkpoint and durable-only reader latency are not recorded in `docs/benchmarks.md`.
 - [ ] **Finish eliminating avoidable work.**
   - Profile append, both readers, notification and serialization paths under the sustained workloads; document
     allocations, copies and synchronization that remain on those paths.
   - Evaluate batched append and batched notifications with explicit publication, partial-failure and latency
     semantics. Ship changes supported by measurements; document rejected approaches and their tradeoffs.
   - Exercise the existing `append_with` API in integration examples so encoders can write directly into a record.
+  - Missing: batched append with one wake-up per batch is done (ADR 0041, #32) and `append_with` is used by
+    `demo-producer`, the C++ example and the iceoryx2 recorder; the profiles of the readers, notification and
+    serialization paths under the sustained workloads are not documented (ADR 0041 → Consequences).
 - [ ] **ARM server measurements.**
   - Run correctness/crash checks and the sustained comparison suite on an aarch64 Linux server, targeting
     Google Axion (`c4a` with local SSD), alongside the existing x86-64 and macOS evidence. (Until 2026-11-19 this
     item named bare-metal Graviton, `c7gd.metal`.)
   - Record CPU, kernel, filesystem, storage, affinity, CRC implementation and commands; resolve architecture-specific
     correctness failures and explain material performance differences before claiming cross-architecture results.
+  - Missing: correctness, crash and soak checks run on aarch64 Linux in CI (#12); the sustained comparison on Axion is
+    not recorded in `docs/benchmarks.md` (cloud runs of tickertape exist; the comparison is running).
 
 ### Following milestones: adoption and scale
 
-- [ ] **Build a small interoperability layer.**
+- [x] **Build a small interoperability layer.** (done 2026-11-20: C ABI #10, Python #7, C++ #19, Java #21, iceoryx2
+  #13, metrics through the bindings #30, install tests #29; publishing is the next item, the names in ADRs 0029 and
+  0037 are in `docs/compatibility.md` → Before 1.0)
   - Provide a C ABI with documented ownership, record lifetimes, errors, threading, durability and versioning, plus
     a C/C++ example. Keep bindings and framework adapters outside the core crate.
   - Provide installable Python bindings with batch operations and explicit copy/lifetime behavior. Preserve the
@@ -182,6 +202,7 @@ does not help or cannot preserve those guarantees; such a decision must be expli
   - Status: the release tooling for every channel exists (static builds, cargo-binstall and Homebrew in part 1; the
     CLI wheel, the C library archives and Maven Central in part 2), each publishing step switched off until the
     owner's one-time set-up (`docs/playbooks/release-checklist.md`). Done when a release has shipped through each.
+  - Missing: no release has shipped through any of the new channels, and none has been installed from.
 - [ ] **Make replay and recovery excellent at scale.**
   - Measure startup, seek, catch-up, replay and crash recovery across many segments and journals larger than RAM,
     including retention, archived history and missing/corrupt segments. Publish dataset sizes and resource usage.
@@ -189,6 +210,9 @@ does not help or cannot preserve those guarantees; such a decision must be expli
     validation or allow stale positions after recovery/replacement.
   - Address measured bottlenecks while keeping memory bounded and preserving the rule that recovery does not
     silently discard committed history. Record regression workloads and remaining limits.
+  - Missing: `tt-scale` and the growth table are in place (ADR 0042, proposed, #33); no cloud run on local SSD with
+    a journal larger than RAM is recorded, archived history, missing or corrupt segments, catch-up and the zero-copy
+    reader are not measured, and the sparse-index decision waits for that run.
 
 ### v1.0 readiness
 
@@ -201,6 +225,10 @@ does not help or cannot preserve those guarantees; such a decision must be expli
     failures, with documented sampling costs and no mandatory telemetry service.
   - Exercise release/installation/upgrade instructions and the external integration against a release candidate.
     Complete the release checklist and publish guarantees, measured operating limits and known issues.
+  - Missing: the surfaces are reviewed and documented in [`compatibility.md`](compatibility.md) (ADR 0043, proposed), with the
+    fixtures and soak tier (#12) and the metrics (#8, #30) in place; the list under "Before 1.0" there is not
+    resolved (ADRs 0029, 0032, 0033, 0037, 0038, 0042 and 0043 still proposed, among others), the release-candidate
+    exercise has not been done (a tag needs the owner's approval), and no measured operating limits are published.
 
 **v1.0 release gate:** all milestones above are complete under their stated criteria, CI is green on Linux and
 macOS, the aarch64 checks pass, and no known unresolved issue violates the published safety, corruption-detection,

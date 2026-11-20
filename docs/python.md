@@ -20,6 +20,9 @@ without Python in the loop, `tickertape export --format parquet` (see `cli.md`) 
 
 ## Bindings
 
+> **Status:** like the C ABI, the bindings are not stable before tickertape 1.0. What they promise from 1.0 is in
+> [`compatibility.md`](compatibility.md#python-and-java).
+
 The package's own guide, which is also its PyPI page, is [`bindings/python/README.md`](../bindings/python/README.md).
 The design decisions are in [ADR 0029](decisions/0029-python-bindings.md). In brief:
 

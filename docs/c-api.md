@@ -156,8 +156,9 @@ CMake package in `crates/tickertape-ffi/cmake/`, which finds the repository's bu
 - Strings returned by `tickertape_version`, `tickertape_status_name` and `tickertape_corrupt_reason_name` are static.
   `tickertape_last_error_message` returns a per-thread string, valid until the next failing call on that thread.
   Never free them.
-- Extensible structs (`tickertape_verify_report`, `tickertape_retention_report`) start with a `uint64_t struct_size`:
-  set it to `sizeof` the struct before the call; after the call it holds the number of bytes the library filled (see
+- Extensible structs (`tickertape_verify_report`, `tickertape_retention_report`, `tickertape_journal_status_report`,
+  `tickertape_beacon_status`, `tickertape_writer_metrics`, `tickertape_reader_metrics`) start with a `uint64_t
+  struct_size`: set it to `sizeof` the struct before the call; after the call it holds the number of bytes the library filled (see
   [Versioning](#versioning)).
 
 **Misuse.** NULL where a pointer is required returns `TICKERTAPE_E_INVALID_ARGUMENT`, as do out-of-range values and
@@ -463,9 +464,11 @@ int compatible = tickertape_abi_version() == TICKERTAPE_ABI_VERSION &&
 - Configuration that may grow is behind opaque builders. The record structs (`tickertape_record`,
   `tickertape_new_record`), `tickertape_segment_info` and `tickertape_checkpoint` describe format version 1 and are
   frozen; a new format version would come with new types. Reserved fields must be zero.
-- **Extensible structs** (`tickertape_verify_report`, `tickertape_retention_report`) start with a `uint64_t
-  struct_size`. Each has a minimum size, its size in the first stable release (72 and 32 bytes), below which the call
-  returns `TICKERTAPE_E_INVALID_ARGUMENT`. The library writes `min(struct_size, its own size)` bytes and stores the
+- **Extensible structs** (`tickertape_verify_report`, `tickertape_retention_report`,
+  `tickertape_journal_status_report`, `tickertape_beacon_status`, `tickertape_writer_metrics` and
+  `tickertape_reader_metrics`) start with a `uint64_t struct_size`. Each has a minimum size, its size in the first
+  stable release (now 72, 32, 272, 120, 112 and 72 bytes; each struct's comment in the header names it), below which
+  the call returns `TICKERTAPE_E_INVALID_ARGUMENT`. The library writes `min(struct_size, its own size)` bytes and stores the
   number of bytes it filled back into `struct_size`. So a program built against an older, smaller struct works with
   a newer library, and a program built against a newer, larger struct can tell that an older library did not write
   the newer fields: check `struct_size` after the call before reading a field added later.

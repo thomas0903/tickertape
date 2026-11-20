@@ -150,6 +150,8 @@ From other languages:
 | Python | Read-only decoder without dependencies | | [`python/`](python/README.md) |
 
 [`docs/python.md`](docs/python.md) compares the two Python options.
+What each of these, the Rust API, the CLI's JSON and the on-disk format promise from 1.0:
+[`docs/compatibility.md`](docs/compatibility.md).
 
 ## iceoryx2 integration
 
