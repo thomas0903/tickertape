@@ -15,9 +15,9 @@
 use std::collections::BTreeSet;
 use std::fs::File;
 use std::io;
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::panic::{self, AssertUnwindSafe};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
@@ -30,22 +30,62 @@ use crate::mmap::{self, Flush, NotifyPublisher};
 use crate::retention::{Action, Policy, Report};
 
 /// How many of the most recent dirty segments a [`DirtySegments`] list keeps open (file and mapping handle); older
-/// ones are remembered by path and range only, and the checkpoint that covers them reopens them. Four, because a
-/// writer that checkpoints at least once per roll then never reopens a segment (a list holds the segments rolled past
-/// since the last request and the job adds the active one), the early write-back helper has usually finished a
-/// segment within a roll or two of leaving it, and a background checkpoint queued behind a running one still finds
-/// its newest segments open; and because it is small: each list costs at most four descriptors and four segment
+/// ones are remembered by path, file identity and range only, and the checkpoint that covers them reopens them. A
+/// segment is released by the push that makes its list longer than four: usually a roll, but also a request that adds
+/// the active segment to a list already holding four, or that joins a job queued behind a slow checkpoint
+/// ([`Job::absorb`]); that request may then close or unmap the segment. Four, because a writer that checkpoints at
+/// least once per roll then does not reopen a segment unless its requests pile up behind a slow checkpoint (a list
+/// holds the segments rolled past since the last request and the job adds the active one), the early write-back
+/// helper has usually finished a segment within a roll or two of leaving it, and a background checkpoint queued
+/// behind a running one still finds its newest segments open; and because it is small: each list costs at most four descriptors and four segment
 /// mappings of address space whatever the number of rolls between checkpoints, so a writer with a few lists (its own,
 /// a running and a queued background checkpoint) stays far below the usual descriptor limits (commonly 256 or 1,024).
 pub(crate) const OPEN_SEGMENTS: usize = 4;
 
+/// A file's identity (device and inode number), read through a descriptor of it, to tell whether a path still names
+/// that file when it is opened again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FileId {
+    dev: u64,
+    ino: u64,
+}
+
+impl FileId {
+    pub(crate) fn of(file: &File) -> io::Result<FileId> {
+        let meta = file.metadata()?;
+        Ok(FileId {
+            dev: meta.dev(),
+            ino: meta.ino(),
+        })
+    }
+}
+
+/// Opens `path` read-write again and checks that it is still the file `id` was read from (not a file that replaced
+/// it under the same name).
+pub(crate) fn reopen(path: &Path, id: FileId) -> io::Result<File> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)?;
+    if FileId::of(&file)? != id {
+        return Err(io::Error::other(
+            "the file at this path is not the one the writer held: it was replaced",
+        ));
+    }
+    Ok(file)
+}
+
 /// A segment with data a checkpoint must sync: `[from, to)` of its mapping through `flush` (if any), then the whole
 /// file's data. Segments inherited from an earlier writer have no `flush`: only their file is synced. A released
-/// segment ([`DirtySegments`]) has neither `file` nor `flush`: the checkpoint reopens it by `path` (see [`steps`]).
+/// segment ([`DirtySegments`]) has neither `file` nor `flush`: the checkpoint reopens it by `path`, which is absolute,
+/// and checks that it is still the file `id` names (see [`steps`]).
 #[derive(Debug)]
 pub(crate) struct DirtySegment {
     pub(crate) file: Option<Arc<File>>,
     pub(crate) flush: Option<Flush>,
+    /// The file's identity, read when the segment was released (`None` while it is held, or if it could not be read,
+    /// which fails the checkpoint that covers the segment).
+    pub(crate) id: Option<FileId>,
     /// Whether this writer stored into the segment through its own mapping (false for inherited segments).
     pub(crate) mapped: bool,
     pub(crate) from: u64,
@@ -65,6 +105,7 @@ impl DirtySegment {
         DirtySegment {
             file: Some(file),
             flush: Some(flush),
+            id: None,
             mapped: true,
             from,
             to,
@@ -72,8 +113,11 @@ impl DirtySegment {
         }
     }
 
-    /// Lets go of the file and the mapping handle: the segment is remembered by path and range only.
+    /// Lets go of the file and the mapping handle: the segment is remembered by path, file identity and range only.
     fn release(&mut self) {
+        if let Some(file) = &self.file {
+            self.id = FileId::of(file).ok();
+        }
         self.file = None;
         self.flush = None;
     }
@@ -109,6 +153,13 @@ impl DirtySegments {
                 last.to = seg.to;
             }
             _ => self.push(seg),
+        }
+    }
+
+    /// Replaces each segment's path by `resolve(path)` (the writer makes them absolute after recovery).
+    pub(crate) fn map_paths(&mut self, resolve: impl Fn(&Path) -> PathBuf) {
+        for seg in &mut self.list {
+            seg.path = resolve(&seg.path);
         }
     }
 
@@ -239,18 +290,20 @@ fn steps(job: &Job, ctx: &Context, on: On) -> Result<CheckpointSlot> {
         ));
     };
     // 1. Data. A segment still held is synced through its own mapping handle and descriptor. A released one is
-    // reopened by path; it is after the marker, so retention never removes it, and if it is gone anyway (removed by
-    // hand) the open fails and so does the checkpoint. Syncing a reopened descriptor is enough because the data lives
+    // reopened by its absolute path and must be the file it was (device and inode, read before it was released); it is
+    // after the marker, so retention never removes it, and if it is gone or replaced anyway (by hand) the checkpoint
+    // fails before any marker. Syncing a reopened descriptor is enough because the data lives
     // in the file's page cache, not in a descriptor or a mapping: a store through a shared mapping dirties the
     // file's cached page (on Linux the page is marked dirty at the write fault on filesystems that track dirty pages,
     // and unmapping transfers any dirty bit left in the page tables to the page), so `fdatasync` on any descriptor of
     // the file writes back every dirty page of it and waits; on Linux it also reports a write-back error recorded on
-    // the file that no earlier sync reported, also one recorded before the descriptor was opened. On Linux `msync(MS_SYNC)` is a data sync of the range's file pages and adds nothing to
+    // the file that no descriptor has observed yet, also one recorded before the descriptor was opened (`errseq`). On Linux `msync(MS_SYNC)` is a data sync of the range's file pages and adds nothing to
     // that. On macOS the writer does not rely on `fsync` alone for pages a mapping dirtied: it maps the reopened file
     // again and `msync`s the range first, which writes back the dirty pages of the file's memory object whichever
-    // mapping dirtied them, then `fsync`s; `F_FULLFSYNC` (step 3) is unchanged. One thing a held descriptor gave that
-    // a reopened one does not: while no descriptor or mapping of a file is open, the kernel may drop its cached inode,
-    // and with it a write-back error recorded there that nobody has reported yet.
+    // mapping dirtied them, then `fsync`s; `F_FULLFSYNC` (step 3) is unchanged. What a held descriptor gave that a
+    // reopened one does not: a write-back error is not reported here if the kernel dropped the cached inode, and the
+    // error with it, while no descriptor or mapping of the file was open, or if another descriptor of the file already
+    // observed it (crash contract → Segments the writer no longer holds → the limit).
     inject(on, crate::fault::Point::CheckpointSync)
         .map_err(|e| Error::io("sync segment", &last.path, e))?;
     let mut barrier = None;
@@ -265,10 +318,10 @@ fn steps(job: &Job, ctx: &Context, on: On) -> Result<CheckpointSlot> {
                 Arc::clone(file)
             }
             None => {
-                let file = std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open(&seg.path)
+                let file = seg
+                    .id
+                    .ok_or_else(|| io::Error::other("the segment's file identity is unknown"))
+                    .and_then(|id| reopen(&seg.path, id))
                     .map_err(|e| Error::io("reopen segment", &seg.path, e))?;
                 if cfg!(target_vendor = "apple") && seg.mapped {
                     mmap::msync_file(&file, seg.from, seg.to - seg.from)
@@ -569,6 +622,7 @@ mod tests {
         DirtySegment {
             file: Some(Arc::new(file)),
             flush: None,
+            id: None,
             mapped: false,
             from: 0,
             to: 8,

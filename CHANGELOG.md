@@ -12,7 +12,12 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   ADR 0042). v0.4.0 has the same defect. A writer now keeps only the four most recent dirty segments open, also in
   recovery, in background checkpoints and in the early write-back helper; the checkpoint that covers an older one
   reopens and syncs it (on macOS also `msync`s it through a new mapping), and fails, poisoning the writer, if it is gone
-  (crash contract → Segments the writer no longer holds; ADR 0038 → Bounded open segments).
+  or replaced by another file under its name (device and inode are checked). The writer makes the journal directory
+  absolute at open for the files it opens later, so a writer opened with a relative path keeps using its own journal
+  after the process changes its working directory (`Writer::dir` still returns the path as given). Under
+  `RecoveryPolicy::Fail` the changes held back after a restored header no longer keep a file open each. Limit: for a
+  segment it no longer holds, a checkpoint does not report a write-back error that the kernel forgot or that another
+  descriptor already observed (crash contract → Segments the writer no longer holds; ADR 0038 → Bounded open segments).
 - The "Before 1.0" list of `docs/compatibility.md` is resolved except for what the release itself does (ADR 0043,
   now accepted, effective at 1.0):
   - Changed (Rust API): the `format` module's recovery helpers `nonzero_end`, `find_history_after_empty`,

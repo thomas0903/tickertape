@@ -7,6 +7,9 @@
 //!   number, then the change in open descriptors and (on Linux) in mappings from the first roll to the end.
 //! - `tt-open-segments open <dir> <fail|quarantine>`: opens a writer (recovery), appends one record, checkpoints, and
 //!   prints the next sequence number.
+//! - `tt-open-segments chdir <parent> <other>`: changes to `<parent>`, opens a writer on the relative path `j`, rolls
+//!   12 times without a checkpoint, changes to `<other>` (which holds another journal `j`), checkpoints, and prints
+//!   the next sequence number.
 
 use tickertape::{RecoveryPolicy, Writer};
 use tickertape_tests::{append_n, small_config};
@@ -68,6 +71,25 @@ fn main() {
             let mut writer = Writer::open(dir, small_config().recovery(recovery))
                 .unwrap_or_else(|e| fail("open", e));
             append_n(&mut writer, 1);
+            writer
+                .checkpoint()
+                .unwrap_or_else(|e| fail("checkpoint", e));
+            println!("{}", writer.next_seq());
+        }
+        "chdir" => {
+            std::env::set_current_dir(dir).expect("change to <parent>");
+            let mut writer = Writer::open("j", small_config()).unwrap_or_else(|e| fail("open", e));
+            let mut base = writer.metrics().head.segment_base_seq;
+            let mut rolled = 0;
+            while rolled < 12 {
+                append_n(&mut writer, 1);
+                let now = writer.metrics().head.segment_base_seq;
+                if now != base {
+                    base = now;
+                    rolled += 1;
+                }
+            }
+            std::env::set_current_dir(&args[3]).expect("change to <other>");
             writer
                 .checkpoint()
                 .unwrap_or_else(|e| fail("checkpoint", e));
