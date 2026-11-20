@@ -5,6 +5,16 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
+- Docs: `docs/compatibility.md`, the 1.0 compatibility contract (ADR 0043, **proposed**): for the Rust API (its public
+  items by module, what is `#[non_exhaustive]`, what is test-only and not covered, the MSRV policy), the C ABI, the
+  C++ header, the Python and Java bindings, the CLI's machine-readable outputs and exit statuses, the on-disk format
+  (ADR 0033; upgrading and downgrading) and the crash contract, what is promised from 1.0 and how each may change
+  afterwards, and a "Before 1.0" list of what still blocks declaring them stable. The roadmap marks the
+  interoperability layer done and says for each open item what is missing.
+- Changed: `format::LaterHistory` (added since v0.4.0) is `#[non_exhaustive]`.
+- Docs: `c-api.md` lists all six extensible structs and their minimum sizes (it named two); `python.md` says the
+  bindings are not stable before 1.0; ADR 0034's status says accepted (its pull request was merged).
+
 - Replay and recovery at scale (ADR 0042, **proposed**): a new benchmark tool, `tt-scale` (`benches/README.md`),
   builds a journal of a given segment count, segment size and payload and times, each in its own process, listing,
   reader open, seeks to the first, middle and last record, replay, `verify`, a retention plan, and writer open after a

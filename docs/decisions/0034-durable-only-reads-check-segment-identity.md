@@ -1,6 +1,6 @@
 # 0034: Durable-only reads check the segment's identity when the checkpoint moves
 
-- **Status:** proposed (accepted when the pull request that adds it is merged)
+- **Status:** accepted (the pull request that added it, #14, was merged on 2026-11-19)
 - **Date:** 2026-11-19
 - **Amends:** [0010](0010-durable-only-reads.md) (durable-only reads) and, for durable-only readers, the "Readers"
   paragraph of [0016](0016-retention-and-archiving.md) (retention)
