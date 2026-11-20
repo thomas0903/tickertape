@@ -21,6 +21,15 @@ The workflow exchanges GitHub OIDC identity for a short-lived crates.io token. N
 stored as a repository secret. See the [crates.io setup documentation](https://crates.io/docs/trusted-publishing).
 New crate names still need an initial, explicitly authorized API-token publish before Trusted Publishing can be configured.
 
+The Homebrew tap is the public repository `thomas0903/homebrew-tap`. The `release` environment holds the secret
+`HOMEBREW_TAP_TOKEN`: a fine-grained token for that repository only, with contents read and write. Only the step
+that pushes `Formula/tickertape.rb` sees it, and only in runs that publish. Renew it before it expires; an expired
+token fails the `homebrew` job after everything else is published (rerun that job with a new token).
+
+Build provenance and SBOM attestations need no setting: artifact attestations are available to public repositories.
+They are signed through the public Sigstore instance, so each attestation is also recorded in its public
+transparency log.
+
 `main` requires pull requests and all CI checks, including release tooling. No approving review is required for this
 single-maintainer repository. Administrators are subject to the checks; force pushes and branch deletion are disabled.
 
@@ -45,6 +54,25 @@ single-maintainer repository. Administrators are subject to the checks; force pu
    python3 -m unittest discover -s .github/scripts -p 'test_*.py' -v
    go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
    gitleaks git --redact --no-banner
+   ```
+
+   The release tooling tests include the check that the CLI's cargo-binstall templates resolve to the archive names
+   that `release.py package` writes (`python3 .github/scripts/release.py check-binstall --source . --tag vX.Y.Z`
+   runs the same check by hand).
+
+   If `.github/scripts/homebrew.py` changed, render the formula from the latest release and lint it from a throwaway
+   local tap (never push it). Releases up to v0.4.0 have no musl archives, so stand in their glibc sums for them:
+
+   ```sh
+   gh release download vX.Y.Z --pattern SHA256SUMS --dir /tmp/sums
+   sed -n 's/-gnu.tar.gz$/-musl.tar.gz/p' /tmp/sums/SHA256SUMS > /tmp/sums/musl  # v0.4.0 and older only
+   cat /tmp/sums/musl >> /tmp/sums/SHA256SUMS                                      # v0.4.0 and older only
+   mkdir -p /tmp/homebrew-local && git -C /tmp/homebrew-local init
+   python3 .github/scripts/homebrew.py --tag vX.Y.Z --checksums /tmp/sums/SHA256SUMS --output /tmp/homebrew-local/Formula/tickertape.rb
+   git -C /tmp/homebrew-local add -A && git -C /tmp/homebrew-local commit -m formula
+   brew tap local/tap /tmp/homebrew-local
+   brew audit --strict local/tap/tickertape && brew style local/tap/tickertape
+   brew untap local/tap
    ```
 
    Each crate must include both licences and its README, and exclude local agent tooling. Other workspace members
@@ -92,12 +120,33 @@ For the 1.0 release, and checked again for every later release that ships the C 
 The tag workflow:
 
 1. Checks stable `vX.Y.Z` syntax, both workspace versions, tag ancestry on `main`, and successful CI on the tag commit.
-2. Runs library/CLI tests and builds native Linux x86-64/ARM64 and macOS Intel/Apple Silicon binaries.
-3. Authenticates through Trusted Publishing, verifies package preparation, then publishes the library and CLI in order.
-4. Creates a draft GitHub release from the matching changelog section, uploads four archives plus `SHA256SUMS`,
-   then publishes it. Existing release notes are preserved.
-5. Verifies published package checksums and source commits, waits up to 15 minutes for both docs.rs builds, installs
-   the CLI from crates.io, and downloads/checks/runs the Linux binary archive.
+2. Runs library/CLI tests and builds native binaries for Linux x86-64/ARM64 (glibc and static musl) and macOS
+   Intel/Apple Silicon, each on its own architecture, through `cargo auditable` so that each binary carries its
+   dependency list. It checks that the musl binaries have no dynamic loader or shared libraries and runs them in an
+   empty root directory, then packages each archive and writes its CycloneDX SBOM (`release.py sbom`).
+3. Attests build provenance for every archive and SBOM, and the SBOM for every archive, in a job that runs no build
+   code.
+4. Authenticates through Trusted Publishing, verifies package preparation, then publishes the library and CLI in order.
+5. Creates a draft GitHub release from the matching changelog section, uploads six archives, six SBOMs and
+   `SHA256SUMS`, then publishes it. Existing release notes are preserved.
+6. Verifies published package checksums and source commits, waits up to 15 minutes for both docs.rs builds, installs
+   the CLI from crates.io, checks `SHA256SUMS` and the attestations of every released file
+   (`gh attestation verify`), runs the Linux glibc and static archives, and installs with `cargo binstall` (if the
+   tag has the metadata), checking that it installed the static archive's binary.
+7. Writes `Formula/tickertape.rb` from the release's `SHA256SUMS` and pushes it to `thomas0903/homebrew-tap` (only in
+   runs that publish, and never replacing a formula for a newer version), then installs it on macOS with
+   `brew install thomas0903/tap/tickertape` and runs `brew test`.
+
+How each channel is tested at release:
+
+| Channel | Test in the release workflow |
+|---|---|
+| crates.io | `cargo install tickertape-cli --locked`, then `--version` and `--help` |
+| Archives | `SHA256SUMS`, provenance and SBOM attestations; Linux x86-64 glibc and static archives run |
+| Static Linux builds | CLI tests with the musl binary on x86-64 and ARM64, `file`/`readelf`, run in an empty root |
+| cargo-binstall | Installs on Linux x86-64; the binary must equal the static archive's |
+| Homebrew | `brew install` and `brew test` on macOS Apple Silicon (the Linux formula blocks are not installed) |
+| mise | Not tested by the workflow; documented after a manual check |
 
 Monitor the [release workflow](https://github.com/thomas0903/tickertape/actions/workflows/release.yml). Publication is
 complete only when its verification job passes. These are release checks, not timing benchmarks.
@@ -106,7 +155,11 @@ complete only when its verification job passes. These are release checks, not ti
 
 From the Actions page, dispatch `release` from `main` with an existing `tag`:
 
-- `publish=false` (default): build binaries and attach them to an existing GitHub release. No crate upload occurs.
+- `publish=false` (default): build binaries and SBOMs, attest them and attach them to an existing GitHub release. No
+  crate upload occurs and the Homebrew tap is not touched. Missing files are added and `SHA256SUMS` is replaced
+  only by a superset of itself. The run rebuilds every archive, so it can add files only to a release whose existing
+  archives it reproduces byte for byte (same compiler and tools); otherwise it stops before uploading anything.
+  The v0.4.0 archives were built without `cargo auditable`, so v0.4.0 cannot gain static archives this way.
 - `verify_publishing=true`: also test the OIDC exchange and package dry run without uploading crates.
 - `publish=true`: resume an authorized release. Already-published crate versions are skipped only when their
   checksum-verified source commit matches the tag. Missing crates are published in dependency order.
