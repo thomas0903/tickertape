@@ -616,8 +616,9 @@ def test_reader_closed_at_the_deadline_raises(journal: Path, call: str, closer: 
             # or thread ran about 40 ms late on a loaded machine), so the timeout was right. Wait for it and try again.
             late += 1
             assert late < 200, "the closer kept running late"
+            # Not signal.pause(): the handler can run between the check and the pause, and no other signal follows.
             while not reader.closed:
-                signal.pause() if closer == "signal" else threading.Event().wait(0.01)
+                time.sleep(0.001)
         print("ok")
     """
     assert run_script(script, journal, call, closer).strip() == "ok"
