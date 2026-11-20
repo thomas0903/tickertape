@@ -60,6 +60,9 @@ pub enum Point {
     /// empty segment, after the new one was prepared and synced under a temporary name, before it is renamed over the
     /// old file (stands in for a crash there).
     RestoreBeforeRename,
+    /// Recovery under `RecoveryPolicy::Fail` making the changes it held back until the open could no longer refuse
+    /// (crash contract C11), after one of them and before the next (stands in for a crash there).
+    BetweenHeldChanges,
     /// After a reader lists the segments and before it opens the one it chose (`Reader::open`,
     /// `Reader::open_mapped`, `Reader::seek`). Arm with [`run_at`].
     ReaderOpen,

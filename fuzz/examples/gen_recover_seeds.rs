@@ -477,6 +477,16 @@ fn main() {
         seeds.push((name, input(policy, &[continuing(ops)], 0, &[])));
     }
 
+    // Found by the fuzzer (CI, after the header restoration of ADR 0038): segment 0 holds one record and no seal,
+    // segment 1 is an empty file (a header that never reached the disk) and segment 16 is a valid empty segment. Under
+    // `Fail` recovery would seal segment 0 and replace segment 1, which ends the chain, then refuses at segment 16
+    // (disconnected): the refused open must change no file (crash contract C11). Kept as the raw input the fuzzer
+    // reported (its records op runs on the truncated file, so sequence numbers advance without bytes).
+    seeds.push((
+        "unwritten_successor_then_disconnected_fail",
+        vec![0x0a, 0x0a, 0x28, 0x01, 0x00, 0x00, 0x00, 0xfc, 0x00, 0x21, 0x0e],
+    ));
+
     for (name, bytes) in seeds {
         fs::write(dir.join(name), bytes).unwrap();
     }

@@ -68,8 +68,15 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   length is not a valid segment size), reported as the new `RecoveryAction::RestoredHeader` (Python:
   `"restored_header"`); until a writer has opened the journal, readers and `verify` report that header as invalid
   (crash contract C8, C11). A file it replaces is replaced by renaming a prepared copy over it, so an interrupted
-  open leaves no gap, and under `Fail` the header is restored only after the open has decided not to refuse at that
-  step. The format is unchanged. Fault injection gains `Point::RollAfterLink` and `Point::RestoreBeforeRename`.
+  open leaves no gap, and under `Fail` an open that refuses restores no header (next entry). The format is
+  unchanged. Fault injection gains `Point::RollAfterLink` and `Point::RestoreBeforeRename`.
+- Fixed (ADR 0038, crash contract C8, C11): under `RecoveryPolicy::Fail`, an open that restored a segment's header
+  (or replaced an empty successor) and sealed the segment before it could still refuse at a later segment, such as a
+  disconnected one, leaving the refused journal changed (found by the `recover_dir` fuzz target). From the first
+  header it would restore, `Fail` now holds back that change and every later one the scan decides (zeroing, seals,
+  created successors) and makes them, in order, only once the open can no longer refuse. A refused open makes none of
+  them and removes what it prepared under temporary names. `Quarantine` is unchanged. Fault injection gains
+  `Point::BetweenHeldChanges`. New fuzz seed `unwritten_successor_then_disconnected_fail`.
 - Library: early write-back on Linux, `WriterConfig::early_writeback` (default on, with `prefault`): a helper thread
   (`tickertape-writeback`) starts the kernel's write-back of the whole pages behind the write position with
   `sync_file_range(SYNC_FILE_RANGE_WRITE)` every 1 MiB and of a segment the writer rolls past, so checkpoints find
