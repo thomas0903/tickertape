@@ -41,6 +41,25 @@ brew install thomas0903/tap/tickertape
 The formula installs the release archives (the static musl ones on Linux) and checks their SHA-256 sums. The release
 workflow updates it, then installs it on macOS (Apple Silicon) and runs `brew test`.
 
+## CLI with pipx or uv (PyPI)
+
+> Not yet published: the PyPI project `tickertape-cli` starts with the first release after v0.4.0.
+
+The same CLI, packaged as a Python wheel that contains only the `tickertape` executable (no Python code), for Linux
+x86-64 and ARM64 (manylinux: glibc 2.17 or newer; musllinux: musl 1.2 or newer, such as Alpine) and macOS 11 or newer
+(Intel and Apple Silicon):
+
+```sh
+pipx install tickertape-cli
+tickertape --version
+uvx --from tickertape-cli tickertape --version    # run without installing
+```
+
+The wheels are built with maturin from the same source as the archives (they are not the archives' binaries).
+`python-wheels.yml` installs each wheel on its own platform (the musllinux ones in Alpine) and runs `--version`,
+`verify` and `tail` on a journal written by v0.4.0; after a release it installs the published CLI with pipx. On
+other platforms, pip finds no wheel: use Cargo instead.
+
 ## mise
 
 ```sh
@@ -92,13 +111,91 @@ macOS 14.4+ uses kernel reader wake-ups; earlier macOS versions use the document
 [crash contract](crash-contract.md) describes the supported storage configurations and validation coverage;
 shipping a CLI for an architecture does not establish power-loss durability.
 
+## C library
+
+> Not yet published: the archives start with the first release after v0.4.0. Until then, build the library from
+> source ([`c-api.md`](c-api.md#building-and-linking)).
+
+The C ABI ([`c-api.md`](c-api.md)) and the C++ binding ([`cpp-api.md`](cpp-api.md)) as one archive per platform in
+the [GitHub release](https://github.com/thomas0903/tickertape/releases/latest), listed in the same `SHA256SUMS`:
+
+| Platform | Archive | Requirement |
+|---|---|---|
+| Linux, Intel/AMD 64-bit | `tickertape-c-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz` | glibc 2.35+ |
+| Linux, ARM64 | `tickertape-c-vX.Y.Z-aarch64-unknown-linux-gnu.tar.gz` | glibc 2.35+ |
+| macOS, Intel | `tickertape-c-vX.Y.Z-x86_64-apple-darwin.tar.gz` | macOS 11+ |
+| macOS, Apple Silicon | `tickertape-c-vX.Y.Z-aarch64-apple-darwin.tar.gz` | macOS 11+ |
+
+There is no musl archive: Rust's musl targets build no usable shared library. Each archive has one top-level
+directory with:
+
+- `include/tickertape.h` (C99, C++11) and `include/tickertape.hpp` (the C++17 binding);
+- `lib/libtickertape.so.X.Y.Z` with the links `libtickertape.so.0.Y` (the soname before 1.0; `libtickertape.so.1`
+  from 1.0) and `libtickertape.so`; on macOS `lib/libtickertape.X.Y.Z.dylib` with the install name
+  `@rpath/libtickertape.0.Y.dylib` and the same links;
+- `lib/libtickertape.a`;
+- `lib/pkgconfig/tickertape.pc` (shared) and `tickertape-static.pc` (static, with the system libraries it needs),
+  which find the directories relative to themselves, so the archive works wherever it is unpacked;
+- both licences and a README.
+
+```sh
+tar -xzf tickertape-c-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz
+export PKG_CONFIG_PATH="$PWD/tickertape-c-vX.Y.Z-x86_64-unknown-linux-gnu/lib/pkgconfig"
+cc app.c $(pkg-config --cflags --libs tickertape) -Wl,-rpath,"$(pkg-config --variable=libdir tickertape)" -o app
+cc app.c $(pkg-config --cflags --libs tickertape-static) -o app-static
+c++ -std=c++17 app.cpp $(pkg-config --cflags --libs tickertape-static) -o app-cpp
+```
+
+The shared library is not on the system's search path, hence the `-rpath` (or copy `lib/` to a directory the loader
+searches). Before 1.0 the C ABI is unstable, and a program requires exactly the library version of its header.
+`crates/tickertape-ffi/scripts/install-test.sh` checks each archive the way it is used: it unpacks it, checks the
+soname or install name, builds the C examples and the C++ example through pkg-config against the shared and the static
+library, checks which library each program loads, and records, follows live and replays journals with them. CI runs
+it on Linux x86-64 and macOS (Apple Silicon) with every change, the release workflow on every archive, and again on
+the published Linux x86-64 archive.
+
+## Java (Maven Central)
+
+> Not yet published: `io.github.thomas0903:tickertape` reaches Maven Central with the first release after v0.4.0
+> for which the owner has enabled it. Until then, build it from source ([`java-api.md`](java-api.md)).
+
+The binding JAR and the natives JAR of your platform (`linux-x86_64`, `linux-aarch64`, `macos-x86_64` or
+`macos-aarch64`; the Linux libraries need glibc 2.35+), on JDK 25 or newer:
+
+```xml
+<dependency>
+  <groupId>io.github.thomas0903</groupId>
+  <artifactId>tickertape</artifactId>
+  <version>X.Y.Z</version>
+</dependency>
+<dependency>
+  <groupId>io.github.thomas0903</groupId>
+  <artifactId>tickertape</artifactId>
+  <version>X.Y.Z</version>
+  <classifier>natives-linux-x86_64</classifier>
+</dependency>
+```
+
+Run with `--enable-native-access=io.github.thomas0903.tickertape` (or `ALL-UNNAMED` on the class path); see
+[`java-api.md`](java-api.md) for how the binding finds the library. Each natives JAR holds the shared library of the
+matching C archive above. The files on Central are signed with the project's GPG key. The release workflow checks
+that every file on Central is identical to the attested build and runs the binding's install test with the JARs
+downloaded from Central.
+
 ## Verify provenance and the SBOM
 
-For releases after v0.4.0, every archive and SBOM has a [build provenance
-attestation](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations) signed
-by the release workflow, and every archive has a CycloneDX software bill of materials (`<archive name>.cdx.json` in
-the same release), generated from the locked dependency graph and also attested. With the
-[GitHub CLI](https://cli.github.com/):
+For releases after v0.4.0, every archive, wheel and JAR a release produces has a [build provenance
+attestation](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations) and an
+attested CycloneDX software bill of materials generated from the locked dependency graph (the Java binding has no
+runtime dependencies, so its SBOM lists none):
+
+| Files | Signed by | SBOM |
+|---|---|---|
+| CLI and C library archives (GitHub release) | `release.yml` | `<archive name>.cdx.json` in the same release, itself attested |
+| Python wheels and sdist, CLI wheels (PyPI) | `python-wheels.yml` | in the attestation |
+| JARs (Maven Central) | `release.yml` | in the attestation (the natives JARs share their C archive's SBOM); the pom has provenance only |
+
+With the [GitHub CLI](https://cli.github.com/):
 
 ```sh
 gh attestation verify tickertape-vX.Y.Z-x86_64-unknown-linux-musl.tar.gz --repo thomas0903/tickertape \
@@ -108,7 +205,9 @@ gh attestation verify tickertape-vX.Y.Z-x86_64-unknown-linux-musl.tar.gz --repo 
 ```
 
 The first command checks that the file was built by the release workflow of this repository; the second that the
-SBOM was attested for it. The release workflow runs both for every file it publishes. The CLI binary also carries
+SBOM was attested for it (`gh attestation verify --format json` prints it). For a wheel, use
+`--signer-workflow thomas0903/tickertape/.github/workflows/python-wheels.yml`. The release workflow runs both
+commands for every archive and SBOM it attaches to the release. The CLI binary also carries
 its locked dependency list, embedded by [`cargo auditable`](https://github.com/rust-secure-code/cargo-auditable)
 (its README lists the tools that read it).
 

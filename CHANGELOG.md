@@ -40,6 +40,34 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   `HelperCpus::List` names CPUs. No effect on macOS. `tt-sustained` gains `--no-early-writeback` and `--helper-cpus`
   (so pinned runs need no `taskset`) and records the system's dirty and write-back page cache per second on Linux
   (`dirty_bytes`, `writeback_bytes`; maxima in `writer.page_cache`).
+- Release operations: install channels, part 2 (ADR 0031). Every new publishing step is switched off until the owner
+  enables it (repository variables `PYPI_CLI_PUBLISHING` and `MAVEN_CENTRAL_PUBLISHING`, environments `pypi-cli` and
+  `maven-central`; the release checklist has the one-time set-up), and none runs for pull requests or `main`.
+  - The CLI as a wheel, PyPI project `tickertape-cli` (`pipx install tickertape-cli`,
+    `uvx --from tickertape-cli tickertape`): maturin's `bin` bindings, manylinux and musllinux (x86-64, aarch64) and
+    macOS (x86-64, arm64), built in `python-wheels.yml`, which installs each wheel on its runner (musllinux in
+    Alpine) and runs `--version`, `verify` and `tail` on a released journal fixture. Published with Trusted
+    Publishing from the environment `pypi-cli`, then installed from PyPI with pipx.
+  - A C library archive per platform (`tickertape-c-vX.Y.Z-<target>.tar.gz`, glibc Linux x86-64 and aarch64, macOS
+    x86-64 and arm64): the shared library with its soname or install name (`libtickertape.so.0.4`,
+    `@rpath/libtickertape.0.4.dylib` before 1.0), the static library, `tickertape.h`, `tickertape.hpp`, the
+    relocatable pkg-config files `tickertape.pc` and `tickertape-static.pc`, licences and a README. New
+    `release.py c-build` and `c-package`; `crates/tickertape-ffi/scripts/install-test.sh` builds and runs the C and
+    C++ examples from the unpacked archive through pkg-config, shared and static, in CI (`c abi` job), in the
+    release workflow and against the published release.
+  - Maven Central for the Java binding (`io.github.thomas0903:tickertape`): the main, sources and Javadoc JARs and
+    four natives JARs, whose libraries come from the C archives. CI builds them unsigned with every change (new
+    Maven profile `release`; the `natives` profile builds one JAR per staged platform) and runs the install test.
+    The release workflow signs them with gpg and uploads them through the Central Portal API (`release.py
+    maven-bundle`, `maven-upload`) in a job that runs no build code and is skipped while the `maven-central`
+    environment's secrets are absent, then compares every file on Central with the build and runs the install test
+    with the downloaded JARs. `stage-natives.sh` now stages into `target/natives/<platform>`, and
+    `install-test.sh` takes an optional JAR pair. The pom gains `developers`, `scm` and `issueManagement`.
+  - Build provenance and CycloneDX SBOM attestations for every new file: the Python bindings' wheels and sdist, the
+    CLI wheels, the C archives (whose SBOMs are also release assets) and the Maven files. `release.py sbom` takes
+    `--package` (`cli`, `c-library`, `python`, `java`) and `--name`; `release.py prepare` also checks the Java
+    binding's version against the tag.
+
 - Fix: `tickertape export` under retention or archiving (crash contract C14). Without `--from`, the writing pass
   opened the journal again and started at whatever segment was oldest then, so retention between the startup scan and
   the writing pass shifted the exported window (exit 0 with the wrong records) or failed with "journal changed during

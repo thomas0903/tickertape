@@ -179,6 +179,9 @@ does not help or cannot preserve those guarantees; such a decision must be expli
     bindings and for the CLI, a C library archive per platform, and Maven Central for the Java binding.
   - Build provenance attestations with a software bill of materials for every released file.
   - Every channel is tested at release by installing from it; a channel that isn't tested isn't announced.
+  - Status: the release tooling for every channel exists (static builds, cargo-binstall and Homebrew in part 1; the
+    CLI wheel, the C library archives and Maven Central in part 2), each publishing step switched off until the
+    owner's one-time set-up (`docs/playbooks/release-checklist.md`). Done when a release has shipped through each.
 - [ ] **Make replay and recovery excellent at scale.**
   - Measure startup, seek, catch-up, replay and crash recovery across many segments and journals larger than RAM,
     including retention, archived history and missing/corrupt segments. Publish dataset sizes and resource usage.

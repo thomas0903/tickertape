@@ -1,12 +1,16 @@
 name: python-wheels
 
-# Builds the Python bindings' sdist and wheels (ADR 0029) and, for an accepted release tag, publishes them to PyPI.
+# Builds the Python bindings' sdist and wheels (ADR 0029) and the CLI's wheels (PyPI project `tickertape-cli`,
+# ADR 0031) and, for an accepted release tag, attests them and publishes them to PyPI.
 #
-# - Pull requests that touch the bindings and on-demand runs only build and smoke-test; nothing is uploaded.
-# - A `v*` tag push (the release, alongside release.yml) builds from the tag. The PyPI step runs only if the tag
-#   passes `release.py prepare` (stable syntax, versions, ancestry on main, green CI) AND the repository variable
-#   PYPI_PUBLISHING is `enabled`, which the maintainer sets after the one-time PyPI setup in
-#   docs/playbooks/release-checklist.md. It never runs for pull requests or branch pushes.
+# - Pull requests that touch the bindings, the CLI or the core, and on-demand runs only build and smoke-test; nothing
+#   is attested or uploaded.
+# - A `v*` tag push (the release, alongside release.yml) builds from the tag. Attestation runs only if the tag passes
+#   `release.py prepare` (stable syntax, versions, ancestry on main, green CI). Each PyPI upload also needs its own
+#   repository variable, which the maintainer sets after the one-time PyPI setup in
+#   docs/playbooks/release-checklist.md: PYPI_PUBLISHING = `enabled` for the bindings (environment `pypi`),
+#   PYPI_CLI_PUBLISHING = `enabled` for the CLI (environment `pypi-cli`). Neither runs for pull requests or branch
+#   pushes.
 
 on:
   push:
@@ -17,9 +21,11 @@ on:
     paths:
       - 'bindings/python/**'
       - 'crates/tickertape/**'
+      - 'crates/tickertape-cli/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/python-wheels.yml'
+      - '.github/scripts/release.py'
   workflow_dispatch:
     inputs:
       ref:
@@ -27,7 +33,7 @@ on:
         required: false
         type: string
       publish:
-        description: Publish to PyPI (only for an existing release tag given as ref, after the one-time PyPI setup)
+        description: Attest and publish to PyPI (only for an existing release tag given as ref, after the one-time PyPI setup)
         type: boolean
         default: false
 
@@ -44,6 +50,8 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   MATURIN_VERSION: 1.16.0
+  # Writes the SBOM attested with each wheel (release.py sbom), as release.yml does for the archives.
+  CARGO_CYCLONEDX: cargo-cyclonedx@0.5.9
 
 jobs:
   prepare:
@@ -55,6 +63,7 @@ jobs:
       actions: read
     outputs:
       sha: ${{ steps.prepare.outputs.sha }}
+      version: ${{ steps.prepare.outputs.version }}
     steps:
       - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
         with:
@@ -95,6 +104,7 @@ jobs:
     timeout-minutes: 30
     env:
       MACOSX_DEPLOYMENT_TARGET: '11.0'
+      RUST_TARGET: ${{ matrix.platform == 'macos' && format('{0}-apple-darwin', matrix.target) || format('{0}-unknown-linux-{1}', matrix.target, matrix.platform == 'musllinux' && 'musl' || 'gnu') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -143,10 +153,107 @@ jobs:
               (cd bindings/python && /tmp/venv/bin/python -m pytest -p no:cacheprovider)
               /tmp/venv/bin/python bindings/python/examples/end_to_end.py /tmp/journal'
           done
+      - name: Install cargo-cyclonedx (checksum-verified prebuilt binary)
+        uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
+        with:
+          tool: ${{ env.CARGO_CYCLONEDX }}
+          fallback: none
+      - name: Write the CycloneDX SBOM of the bindings' locked dependency graph for this target
+        run: python3 .github/scripts/release.py sbom --source . --package python --target "$RUST_TARGET" --name python-wheel --output sbom
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: python-wheel-${{ matrix.platform }}-${{ matrix.target }}
           path: dist/*.whl
+          if-no-files-found: error
+          retention-days: 7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sbom-python-wheel-${{ matrix.platform }}-${{ matrix.target }}
+          path: sbom/python-wheel.cdx.json
+          if-no-files-found: error
+          retention-days: 7
+
+  # The CLI as a wheel (ADR 0031): maturin's `bin` bindings put the `tickertape` executable in the wheel's scripts,
+  # so pipx and uvx install it. It holds no Python code and runs with any Python version (tag py3-none).
+  cli-wheels:
+    needs: prepare
+    if: always() && (needs.prepare.result == 'success' || needs.prepare.result == 'skipped')
+    name: cli wheel (${{ matrix.platform }} ${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-22.04, platform: manylinux, target: x86_64, manylinux: auto }
+          - { os: ubuntu-22.04-arm, platform: manylinux, target: aarch64, manylinux: auto }
+          - { os: ubuntu-22.04, platform: musllinux, target: x86_64, manylinux: musllinux_1_2 }
+          - { os: ubuntu-22.04-arm, platform: musllinux, target: aarch64, manylinux: musllinux_1_2 }
+          - { os: macos-15-intel, platform: macos, target: x86_64 }
+          - { os: macos-15, platform: macos, target: aarch64 }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
+      RUST_TARGET: ${{ matrix.platform == 'macos' && format('{0}-apple-darwin', matrix.target) || format('{0}-unknown-linux-{1}', matrix.target, matrix.platform == 'musllinux' && 'musl' || 'gnu') }}
+      # A journal written by tickertape 0.4.0 (tests/compat), for the end-to-end check.
+      FIXTURE: tests/compat/fixtures/v0.4.0-linux-x86_64-clean.ttfx
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.sha || inputs.ref || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: '3.12'
+      - name: Build the wheel
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          maturin-version: ${{ env.MATURIN_VERSION }}
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: --release --locked --out dist -m crates/tickertape-cli/Cargo.toml
+      - name: Read the version the wheel must report
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+      - name: Install the wheel on the runner, run --version and an end-to-end check
+        if: matrix.platform != 'musllinux'
+        run: |
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/python" -m pip install dist/tickertape_cli-*.whl
+          cli="$RUNNER_TEMP/venv/bin/tickertape"
+          test "$("$cli" --version)" = "tickertape $VERSION"
+          python3 tests/compat/pack.py unpack "$FIXTURE" "$RUNNER_TEMP/journal"
+          "$cli" verify "$RUNNER_TEMP/journal"
+          test "$("$cli" tail "$RUNNER_TEMP/journal" --no-follow --format json | wc -l)" -eq 128
+      - name: Install the musllinux wheel in Alpine, run --version and an end-to-end check
+        if: matrix.platform == 'musllinux'
+        run: |
+          # The image of the bindings' musllinux test (above); update the digests together.
+          docker run --rm -e VERSION -e FIXTURE -v "$PWD:/src:ro" -w /src \
+              python:3.11-alpine@sha256:7fbad8e4652eae0186429a6f26cf5b23e27e8c6fd7ac4d0cfd7a6988cdeea1e1 sh -ec '
+            python -m venv /tmp/venv
+            /tmp/venv/bin/pip install dist/tickertape_cli-*.whl
+            test "$(/tmp/venv/bin/tickertape --version)" = "tickertape $VERSION"
+            python tests/compat/pack.py unpack "$FIXTURE" /tmp/journal
+            /tmp/venv/bin/tickertape verify /tmp/journal
+            test "$(/tmp/venv/bin/tickertape tail /tmp/journal --no-follow --format json | wc -l)" -eq 128'
+      - name: Install cargo-cyclonedx (checksum-verified prebuilt binary)
+        uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
+        with:
+          tool: ${{ env.CARGO_CYCLONEDX }}
+          fallback: none
+      - name: Write the CycloneDX SBOM of the CLI's locked dependency graph for this target
+        run: python3 .github/scripts/release.py sbom --source . --package cli --target "$RUST_TARGET" --name cli-wheel --output sbom
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cli-wheel-${{ matrix.platform }}-${{ matrix.target }}
+          path: dist/*.whl
+          if-no-files-found: error
+          retention-days: 7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sbom-cli-wheel-${{ matrix.platform }}-${{ matrix.target }}
+          path: sbom/cli-wheel.cdx.json
           if-no-files-found: error
           retention-days: 7
 
@@ -175,19 +282,83 @@ jobs:
           python -m venv "$RUNNER_TEMP/venv"
           "$RUNNER_TEMP/venv/bin/python" -m pip install dist/*.tar.gz
           "$RUNNER_TEMP/venv/bin/python" bindings/python/examples/end_to_end.py "$RUNNER_TEMP/journal"
+      - name: Install cargo-cyclonedx (checksum-verified prebuilt binary)
+        uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
+        with:
+          tool: ${{ env.CARGO_CYCLONEDX }}
+          fallback: none
+      # The sdist builds on any platform, so its SBOM covers the dependencies of every platform.
+      - name: Write the CycloneDX SBOM of the bindings' locked dependency graph
+        run: python3 .github/scripts/release.py sbom --source . --package python --name python-sdist --output sbom
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: python-sdist
           path: dist/*.tar.gz
           if-no-files-found: error
           retention-days: 7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sbom-python-sdist
+          path: sbom/python-sdist.cdx.json
+          if-no-files-found: error
+          retention-days: 7
+
+  # Build provenance for every wheel and the sdist, and an SBOM attestation for each, as release.yml does for the
+  # archives: only for an accepted tag, in a job that runs no build code, before anything reaches PyPI.
+  attest:
+    needs: [prepare, wheels, cli-wheels, sdist]
+    if: >-
+      always() && needs.prepare.result == 'success' && needs.wheels.result == 'success' &&
+      needs.cli-wheels.result == 'success' && needs.sdist.result == 'success'
+    name: attest (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        name: [manylinux-x86_64, manylinux-aarch64, musllinux-x86_64, musllinux-aarch64, macos-x86_64, macos-aarch64, sdist]
+    runs-on: ubuntu-22.04
+    permissions:
+      id-token: write
+      attestations: write
+    timeout-minutes: 10
+    steps:
+      # Every artefact of this platform: python-wheel-, cli-wheel-, sbom-python-wheel- and sbom-cli-wheel-<name>,
+      # or python-sdist and sbom-python-sdist.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: '*-${{ matrix.name }}'
+          path: dist
+          merge-multiple: true
+      - name: List the files
+        run: ls -l dist
+      - name: Build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ matrix.name == 'sdist' && 'dist/*.tar.gz' || 'dist/*.whl' }}
+      - name: SBOM attestation for the bindings wheel
+        if: matrix.name != 'sdist'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: dist/tickertape-*.whl
+          sbom-path: dist/python-wheel.cdx.json
+      - name: SBOM attestation for the CLI wheel
+        if: matrix.name != 'sdist'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: dist/tickertape_cli-*.whl
+          sbom-path: dist/cli-wheel.cdx.json
+      - name: SBOM attestation for the sdist
+        if: matrix.name == 'sdist'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: dist/*.tar.gz
+          sbom-path: dist/python-sdist.cdx.json
 
   publish:
-    needs: [prepare, wheels, sdist]
+    needs: [prepare, wheels, sdist, attest]
     # Never for pull requests or branches: only a tag accepted by `prepare`, and only once PyPI is configured.
     if: >-
       always() && needs.prepare.result == 'success' && needs.wheels.result == 'success' &&
-      needs.sdist.result == 'success' && vars.PYPI_PUBLISHING == 'enabled' &&
+      needs.sdist.result == 'success' && needs.attest.result == 'success' && vars.PYPI_PUBLISHING == 'enabled' &&
       (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish))
     runs-on: ubuntu-22.04
     environment: pypi
@@ -209,3 +380,55 @@ jobs:
         with:
           packages-dir: dist
           skip-existing: true
+
+  # The CLI wheels, to the PyPI project `tickertape-cli`, with its own environment and switch.
+  publish-cli:
+    needs: [prepare, cli-wheels, attest]
+    # Never for pull requests or branches: only a tag accepted by `prepare`, and only once PyPI is configured.
+    if: >-
+      always() && needs.prepare.result == 'success' && needs.cli-wheels.result == 'success' &&
+      needs.attest.result == 'success' && vars.PYPI_CLI_PUBLISHING == 'enabled' &&
+      (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish))
+    runs-on: ubuntu-22.04
+    environment: pypi-cli
+    permissions:
+      contents: read
+      id-token: write
+    timeout-minutes: 15
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: cli-wheel-*
+          path: dist
+          merge-multiple: true
+      - name: List the distributions
+        run: ls -l dist
+      # Trusted Publishing, as for the bindings; existing files are skipped so that a rerun completes the release.
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        with:
+          packages-dir: dist
+          skip-existing: true
+
+  # The per-release test of the channel: install the published CLI from PyPI as users do.
+  verify-cli:
+    needs: [prepare, publish-cli]
+    if: always() && needs.publish-cli.result == 'success'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: '3.12'
+      - name: Install tickertape-cli from PyPI with pipx (retrying while PyPI's index catches up)
+        run: |
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            if pipx install "tickertape-cli==$VERSION"; then
+              break
+            fi
+            if [ "$attempt" -eq 10 ]; then exit 1; fi
+            sleep 30
+          done
+          test "$(tickertape --version)" = "tickertape $VERSION"
+          tickertape --help > /dev/null

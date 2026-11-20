@@ -4,13 +4,15 @@
   dependencies. Build the C library first, then run mvn verify; README.md has the commands.
 
   The version is the C library version this binding is written against (ADR 0037 -> Versioning); a test fails if
-  it differs from crates/tickertape-ffi/include/tickertape.h. Nothing here publishes anything.
+  it differs from crates/tickertape-ffi/include/tickertape.h, and the release tooling if it differs from the release
+  tag. Nothing here publishes anything: the release workflow signs and uploads the built files to Maven Central
+  (ADR 0031, docs/playbooks/release-checklist.md).
 -->
 <project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
   <modelVersion>4.0.0</modelVersion>
 
-  <!-- io.github.<user> needs no domain; the owner has not registered a Maven Central namespace yet (ADR 0037). -->
+  <!-- io.github.<user> needs no domain: Maven Central verifies the namespace through the GitHub account (ADR 0037). -->
   <groupId>io.github.thomas0903</groupId>
   <artifactId>tickertape</artifactId>
   <version>0.4.0</version>
@@ -23,7 +25,23 @@
     <license><name>MIT</name><url>https://opensource.org/licenses/MIT</url></license>
     <license><name>Apache-2.0</name><url>https://www.apache.org/licenses/LICENSE-2.0</url></license>
   </licenses>
-  <scm><url>https://github.com/thomas0903/tickertape</url></scm>
+  <!-- Maven Central requires developers and scm in every published pom. -->
+  <developers>
+    <developer>
+      <id>thomas0903</id>
+      <name>The tickertape contributors</name>
+      <url>https://github.com/thomas0903/tickertape</url>
+    </developer>
+  </developers>
+  <scm>
+    <url>https://github.com/thomas0903/tickertape</url>
+    <connection>scm:git:https://github.com/thomas0903/tickertape.git</connection>
+    <developerConnection>scm:git:ssh://git@github.com/thomas0903/tickertape.git</developerConnection>
+  </scm>
+  <issueManagement>
+    <system>GitHub</system>
+    <url>https://github.com/thomas0903/tickertape/issues</url>
+  </issueManagement>
 
   <properties>
     <maven.compiler.release>25</maven.compiler.release>
@@ -179,9 +197,10 @@
     <profile><id>macos-aarch64</id><activation><os><family>mac</family><arch>aarch64</arch></os></activation><properties><tickertape.platform>macos-aarch64</tickertape.platform></properties></profile>
     <profile><id>macos-x86_64</id><activation><os><family>mac</family><arch>x86_64</arch></os></activation><properties><tickertape.platform>macos-x86_64</tickertape.platform></properties></profile>
 
-    <!-- The natives profile also builds tickertape-<version>-natives-<platform>.jar, which carries the library
-         staged by scripts/stage-natives.sh (library plus its SHA-256) for extraction at run time. Built locally and
-         in CI only; publishing it is a later release step (ADR 0037). -->
+    <!-- The natives profile also builds tickertape-<version>-natives-<platform>.jar for each platform whose library
+         scripts/stage-natives.sh has staged (library plus its SHA-256, in target/natives/<platform>), for extraction
+         at run time. CI stages its own platform; the release workflow stages all four, from the C library archives,
+         and publishes them to Maven Central (ADR 0031). -->
     <profile>
       <id>natives</id>
       <build>
@@ -191,18 +210,101 @@
             <artifactId>maven-jar-plugin</artifactId>
             <executions>
               <execution>
-                <id>natives</id>
+                <id>natives-linux-x86_64</id>
                 <phase>package</phase>
                 <goals><goal>jar</goal></goals>
                 <configuration>
-                  <classifier>natives-${tickertape.platform}</classifier>
-                  <classesDirectory>${project.build.directory}/natives-staging</classesDirectory>
+                  <classifier>natives-linux-x86_64</classifier>
+                  <classesDirectory>${project.build.directory}/natives/linux-x86_64</classesDirectory>
+                  <skipIfEmpty>true</skipIfEmpty>
                   <archive>
                     <manifestEntries>
                       <Automatic-Module-Name>io.github.thomas0903.tickertape.natives</Automatic-Module-Name>
                     </manifestEntries>
                   </archive>
                 </configuration>
+              </execution>
+              <execution>
+                <id>natives-linux-aarch64</id>
+                <phase>package</phase>
+                <goals><goal>jar</goal></goals>
+                <configuration>
+                  <classifier>natives-linux-aarch64</classifier>
+                  <classesDirectory>${project.build.directory}/natives/linux-aarch64</classesDirectory>
+                  <skipIfEmpty>true</skipIfEmpty>
+                  <archive>
+                    <manifestEntries>
+                      <Automatic-Module-Name>io.github.thomas0903.tickertape.natives</Automatic-Module-Name>
+                    </manifestEntries>
+                  </archive>
+                </configuration>
+              </execution>
+              <execution>
+                <id>natives-macos-x86_64</id>
+                <phase>package</phase>
+                <goals><goal>jar</goal></goals>
+                <configuration>
+                  <classifier>natives-macos-x86_64</classifier>
+                  <classesDirectory>${project.build.directory}/natives/macos-x86_64</classesDirectory>
+                  <skipIfEmpty>true</skipIfEmpty>
+                  <archive>
+                    <manifestEntries>
+                      <Automatic-Module-Name>io.github.thomas0903.tickertape.natives</Automatic-Module-Name>
+                    </manifestEntries>
+                  </archive>
+                </configuration>
+              </execution>
+              <execution>
+                <id>natives-macos-aarch64</id>
+                <phase>package</phase>
+                <goals><goal>jar</goal></goals>
+                <configuration>
+                  <classifier>natives-macos-aarch64</classifier>
+                  <classesDirectory>${project.build.directory}/natives/macos-aarch64</classesDirectory>
+                  <skipIfEmpty>true</skipIfEmpty>
+                  <archive>
+                    <manifestEntries>
+                      <Automatic-Module-Name>io.github.thomas0903.tickertape.natives</Automatic-Module-Name>
+                    </manifestEntries>
+                  </archive>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+
+    <!-- The sources and Javadoc JARs that Maven Central requires. CI builds them with every change; the release
+         workflow signs them (outside Maven, with no build code running) and uploads them. -->
+    <profile>
+      <id>release</id>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-source-plugin</artifactId>
+            <version>3.3.1</version>
+            <executions>
+              <execution>
+                <id>sources</id>
+                <goals><goal>jar-no-fork</goal></goals>
+              </execution>
+            </executions>
+          </plugin>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-javadoc-plugin</artifactId>
+            <version>3.11.2</version>
+            <configuration>
+              <doclint>all,-missing</doclint>
+              <failOnWarnings>true</failOnWarnings>
+              <quiet>true</quiet>
+            </configuration>
+            <executions>
+              <execution>
+                <id>javadoc</id>
+                <goals><goal>jar</goal></goals>
               </execution>
             </executions>
           </plugin>
