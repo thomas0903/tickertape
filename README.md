@@ -60,17 +60,43 @@ Under minutes of sustained high-rate writing, ext4 itself occasionally stalls wr
 
 ## Quickstart
 
-Add the library to your project, or install the CLI from crates.io:
+Add the library to your project:
 
 ```bash
 cargo add tickertape
-cargo install tickertape-cli --locked
 ```
 
 [API documentation](https://docs.rs/tickertape/0.4.0/tickertape/) · [CLI reference](docs/cli.md)
 
-Prebuilt CLI downloads for Linux and macOS are available from the
-[GitHub releases](https://github.com/thomas0903/tickertape/releases/latest); see [installation and checksums](docs/install.md).
+Install the `tickertape` CLI (Linux x86-64 and ARM64, macOS Intel and Apple Silicon) in one of these ways.
+[Installation](docs/install.md) has the details, the static Linux builds and how to verify a download.
+
+From source with Cargo:
+
+```bash
+cargo install tickertape-cli --locked
+```
+
+A prebuilt binary with [cargo-binstall](https://github.com/cargo-bins/cargo-binstall) (releases after v0.4.0):
+
+```bash
+cargo binstall tickertape-cli
+```
+
+With Homebrew on macOS or Linux (releases after v0.4.0):
+
+```bash
+brew install thomas0903/tap/tickertape
+```
+
+With mise:
+
+```bash
+mise use github:thomas0903/tickertape
+```
+
+Or download an archive and `SHA256SUMS` from the
+[GitHub releases](https://github.com/thomas0903/tickertape/releases/latest).
 
 As a library:
 

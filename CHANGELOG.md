@@ -278,6 +278,14 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   the three-lane CRC; tests check that the word-fed CRC takes the hardware path and the three-lane blocks; Miri runs
   `MapRo`'s loads over an anonymous mapping; `--cfg tickertape_force_soft_crc` runs the suite on tickertape's CRC
   fallback (the `crc32c` crate still uses the CPU instruction where it has one).
+- Release operations: install channels, part 1 (ADR 0031). Releases add static Linux CLI archives
+  (`x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`) that need no C library, built and tested natively;
+  cargo-binstall metadata in `tickertape-cli` (Linux resolves to the static archive; CI checks the templates against
+  the archive names); a Homebrew tap (`brew install thomas0903/tap/tickertape`) updated by the release workflow;
+  build provenance attestations for every archive and SBOM, a CycloneDX SBOM per archive (attached and attested),
+  and the dependency list embedded in the binary with `cargo auditable`. The release workflow verifies each
+  channel by installing from it. mise is documented. A backfill run now compares every existing asset before
+  uploading anything.
 - Benchmarks: the test of a lagging reader under retention no longer depends on machine speed (it failed on
   macOS CI runners). `tt-sustained` readers no longer need to retry a seek when retention removes the segment they
   were about to open: `Reader::seek` now lists again by itself.
