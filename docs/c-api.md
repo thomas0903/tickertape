@@ -194,8 +194,9 @@ tickertape_writer_options_free(options);
 - `tickertape_writer_append_batch` appends an array of `tickertape_new_record`s in order. It checks every element
   first, so an argument error appends nothing (the message names the element's index). It then stops at the first
   failure and returns that error, with `*appended_out` records already appended (sequence numbers `*first_seq_out`
-  onwards; `*appended_out` is updated as each record commits). Those records stay in the journal: retry from the
-  failing one, not from the start.
+  onwards). Those records stay in the journal: retry from the failing one, not from the start. Each record becomes
+  visible to readers as it is committed, as with `tickertape_writer_append`; blocked readers are woken once, after
+  the last record appended (ADR 0041).
 
 ## Reading
 

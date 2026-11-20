@@ -396,19 +396,17 @@ impl Writer {
             let local = column(local_ts_ns, "local_ts_ns")?;
 
             let (first, appended, failure) = self.with_detached(py, |writer| {
-                let first = writer.next_seq();
-                for (i, payload) in items.iter().enumerate() {
-                    let record = NewRecord {
-                        schema_id: schema_ids.get(i),
-                        venue_ts_ns: venue.get(i),
-                        local_ts_ns: local.get(i),
-                        payload: payload.as_slice(),
-                    };
-                    if let Err(e) = writer.append(&record) {
-                        return (first, i, Some(e));
-                    }
+                // One batch: blocked readers are woken once, after the last record (ADR 0041).
+                let records = items.iter().enumerate().map(|(i, payload)| NewRecord {
+                    schema_id: schema_ids.get(i),
+                    venue_ts_ns: venue.get(i),
+                    local_ts_ns: local.get(i),
+                    payload: payload.as_slice(),
+                });
+                match writer.append_batch(records) {
+                    Ok(seqs) => (seqs.start, items.len(), None),
+                    Err(e) => (e.first_seq, e.appended, Some(e.error)),
                 }
-                (first, items.len(), None)
             })?;
             if let Some(err) = failure {
                 return Err(errors::batch_append(

@@ -3,6 +3,7 @@
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
+use std::ops::Range;
 use std::os::unix::fs::FileExt;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
@@ -361,6 +362,91 @@ impl Writer {
     where
         F: FnOnce(&mut [u8]) -> std::result::Result<(), E>,
     {
+        let written = self.write_record(record, payload_len, fill)?;
+        if written.is_ok() {
+            self.publish();
+        }
+        Ok(written)
+    }
+
+    /// Appends `records` in order, as consecutive calls to [`Writer::append`] would, and returns the range of
+    /// sequence numbers they got. Readers are woken once for the batch instead of once per record.
+    ///
+    /// Each record is committed as soon as it is written, exactly as [`Writer::append`] commits it, so the records
+    /// become visible one by one and in order: a reader that polls can read the first records of a batch before this
+    /// call returns, and no reader can see a later record of the batch without the earlier ones. What is batched is
+    /// the wake-up of blocked readers (ADRs 0017 and 0021): one publication after the last record this call appends
+    /// (and one at each roll, as for [`Writer::append`]) instead of one after each record, so a blocked reader learns
+    /// of the first record of a batch only when the batch ends. Keep batches short where that latency matters. See
+    /// ADR 0041 for what is batched and what is not.
+    ///
+    /// A record that does not fit in the current segment rolls to a new one, as [`Writer::append`] does; a batch can
+    /// span several segments. Durability is as for [`Writer::append`]: nothing here syncs.
+    ///
+    /// An empty `records` returns the empty range at [`Writer::next_seq`] and wakes nobody.
+    ///
+    /// # Errors
+    ///
+    /// The batch stops at the first record that cannot be appended, for any reason [`Writer::append`] gives. The
+    /// returned [`BatchError`] says how many records were appended: the first [`BatchError::appended`] records are
+    /// committed and stay committed, with sequence numbers from [`BatchError::first_seq`]; the failing record (the
+    /// next one) and the records after it are not, and the iterator is not advanced past the failing record. Blocked
+    /// readers are woken for the records that were appended.
+    pub fn append_batch<'a, I>(&mut self, records: I) -> std::result::Result<Range<u64>, BatchError>
+    where
+        I: IntoIterator<Item = NewRecord<'a>>,
+    {
+        let first_seq = self.next_seq;
+        let mut appended = 0;
+        // A panic from the caller's iterator after some records were committed still wakes blocked readers.
+        let written = panic::catch_unwind(AssertUnwindSafe(|| {
+            for record in records {
+                let payload = record.payload;
+                match self.write_record(&record, payload.len(), |buf| {
+                    buf.copy_from_slice(payload);
+                    Ok::<(), std::convert::Infallible>(())
+                }) {
+                    Ok(Ok(_)) => appended += 1,
+                    Ok(Err(never)) => match never {},
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(())
+        }));
+        if appended > 0 {
+            self.publish();
+        }
+        match written {
+            Ok(Ok(())) => Ok(first_seq..self.next_seq),
+            Ok(Err(error)) => Err(BatchError {
+                appended,
+                first_seq,
+                error,
+            }),
+            Err(cause) => panic::resume_unwind(cause),
+        }
+    }
+
+    /// Wakes blocked readers (ADRs 0017 and 0021), if the wake-up region is enabled.
+    #[inline]
+    fn publish(&self) {
+        if let Some(notify) = &self.notify {
+            notify.publish();
+        }
+    }
+
+    /// The append path without the wake-up publication: [`Writer::try_append_with`] publishes after each record,
+    /// [`Writer::append_batch`] once per batch.
+    #[inline(always)]
+    fn write_record<F, E>(
+        &mut self,
+        record: &NewRecord<'_>,
+        payload_len: usize,
+        fill: F,
+    ) -> Result<std::result::Result<u64, E>>
+    where
+        F: FnOnce(&mut [u8]) -> std::result::Result<(), E>,
+    {
         if let Some(cause) = &self.abandoned_write_error {
             return Err(refused_append(cause, &self.active.path));
         }
@@ -424,9 +510,6 @@ impl Writer {
             .store_commit_word(offset, len)
             .ok_or_else(|| internal(&self.active.path, "commit word out of bounds"))?;
         self.offset = offset + format::align8(u64::from(len));
-        if let Some(notify) = &self.notify {
-            notify.publish();
-        }
         if let Some(prefault) = &mut self.prefault {
             prefault.advanced(self.offset);
         }
@@ -983,9 +1066,7 @@ impl Writer {
         if let Some(prefault) = &mut self.prefault {
             prefault.switch(self.active.map.advice(), self.offset);
         }
-        if let Some(notify) = &self.notify {
-            notify.publish();
-        }
+        self.publish();
         Ok(())
     }
 }
@@ -1950,6 +2031,24 @@ fn inherited(seg: Segment, from: u64, seal_at: u64) -> DirtySegment {
         flush: None,
         path: seg.path,
     }
+}
+
+/// [`Writer::append_batch`] stopped at a record it could not append.
+///
+/// The first [`appended`](BatchError::appended) records of the batch are committed, with sequence numbers
+/// `first_seq..first_seq + appended`; the record at index `appended` and the records after it are not. To retry once
+/// the cause is resolved, append again from index `appended`.
+#[derive(Debug, thiserror::Error)]
+#[error("append_batch stopped at record {appended} after appending {appended} record(s)")]
+#[non_exhaustive]
+pub struct BatchError {
+    /// How many records of the batch were appended, which is also the index of the record that failed.
+    pub appended: usize,
+    /// The sequence number of the batch's first record: [`Writer::next_seq`] when the call began.
+    pub first_seq: u64,
+    /// Why the record at index `appended` was not appended: an error [`Writer::append`] can return.
+    #[source]
+    pub error: Error,
 }
 
 /// Where a writer's checkpoints stand ([`Writer::checkpoint_progress`]).

@@ -4,7 +4,8 @@
 //!
 //! Prices follow a random walk per instrument. About one event in five is a trade. `venue_ts_ns` is a synthetic
 //! exchange timestamp (a little before the local one); `local_ts_ns` is the local wall clock at write time. The
-//! producer checkpoints (makes data durable) every 10,000 records and at the end.
+//! producer checkpoints (makes data durable) every 10,000 records and at the end. Each event is encoded directly into
+//! its record in the journal with `Writer::append_with`.
 
 use std::time::{Duration, Instant};
 
@@ -111,13 +112,15 @@ fn main() -> tickertape::Result<()> {
             }
         };
         let local = tickertape::clock::realtime_ns();
-        let payload = event.encode();
-        writer.append(&NewRecord {
+        // Encode straight into the record in the mapped segment: no intermediate buffer, no copy. `payload` is
+        // ignored by `append_with`; the length comes from the event.
+        let record = NewRecord {
             schema_id: event.schema_id(),
             venue_ts_ns: local.saturating_sub(200_000 + rng.below(800_000)),
             local_ts_ns: local,
-            payload: &payload,
-        })?;
+            payload: &[],
+        };
+        writer.append_with(&record, event.encoded_len(), |buf| event.encode_into(buf))?;
         if (i + 1) % 10_000 == 0 {
             writer.checkpoint()?;
         }

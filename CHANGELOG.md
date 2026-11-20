@@ -5,6 +5,17 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
+- Batched append (ADR 0041): `Writer::append_batch` appends an iterator of `NewRecord`s in order and returns the
+  range of sequence numbers they got. Each record is committed, and visible to readers, as it is written, as with
+  `append`; blocked readers are woken once, after the last record appended (and at each roll), instead of after
+  every record, which saves the writer a wake-up system call per record while a reader is blocked, and delays a
+  blocked reader's view of a batch's first record until the batch ends. A record that does not fit rolls, as with
+  `append`. On a failure the batch stops and returns a `BatchError` with the number of records appended (they stay
+  committed), the first sequence number and the cause. The C ABI's `tickertape_writer_append_batch` (signature
+  unchanged) and Python's `Writer.append_many` now use it; the C function's `*appended_out` is documented as the
+  count when it returns. `WriterConfig::notify`'s documentation says what a batch publishes. The `append` benchmark
+  gains an `append/batch` group. `demo-producer` encodes each event directly into its record with
+  `Writer::append_with` (new `Event::encode_into` and `Event::encoded_len` in the examples crate).
 - Background checkpoints (ADR 0038, **proposed**):
   `Writer::request_checkpoint` starts a checkpoint of every record appended so far on the writer's checkpoint thread
   (`tickertape-checkpoint`, started by the first request) and returns the sequence number it covers up to, so appends

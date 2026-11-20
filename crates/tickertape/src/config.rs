@@ -53,8 +53,10 @@ pub struct WriterConfig {
     /// What to do with a corrupt tail on open. Default: [`RecoveryPolicy::Quarantine`].
     pub recovery: RecoveryPolicy,
     /// Create a shared-memory wake-up region, named in the journal's `notify` record, so that blocked readers wake up
-    /// as soon as a record is published (ADRs 0017 and 0021).
-    /// Costs one atomic increment and one load per append, plus a wake-up system call when readers are blocked.
+    /// as soon as a record is published (ADRs 0017 and 0021), or, for
+    /// [`Writer::append_batch`](crate::Writer::append_batch), once the batch's last record is (ADR 0041).
+    /// Costs one atomic increment and one load per append (per batch for `append_batch`), plus a wake-up system call
+    /// when readers are blocked.
     /// Default: true.
     pub notify: bool,
     /// Do segment work in a background thread, off the writer's thread. That thread never writes records.
