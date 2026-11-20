@@ -208,6 +208,7 @@ class HeaderTest {
         assertEquals(120, Signatures.BEACON_STATUS.byteSize());
         assertEquals(112, Signatures.WRITER_METRICS.byteSize());
         assertEquals(72, Signatures.READER_METRICS.byteSize());
+        assertEquals(56, Signatures.CHECKPOINT_PROGRESS.byteSize());
     }
 
     /** The enumerators of a C enum, by name. */
@@ -289,6 +290,9 @@ class HeaderTest {
         for (RecoveryPolicy p : RecoveryPolicy.values()) {
             assertEquals(p.code, policies.get("TICKERTAPE_RECOVERY_" + p.name()), p.toString());
         }
+        assertEquals(Map.of("TICKERTAPE_HELPER_CPUS_PROCESS", HelperCpus.PROCESS, "TICKERTAPE_HELPER_CPUS_INHERITED",
+                HelperCpus.INHERITED, "TICKERTAPE_HELPER_CPUS_LIST", HelperCpus.LIST),
+                enumerators("tickertape_helper_cpus"));
         Map<String, Integer> timeouts = enumerators("tickertape_timeout");
         assertEquals(Map.of("TICKERTAPE_NO_WAIT", 0, "TICKERTAPE_WAIT_FOREVER", -1), timeouts,
                 "the binding passes 0 for no wait and only finite slices otherwise");

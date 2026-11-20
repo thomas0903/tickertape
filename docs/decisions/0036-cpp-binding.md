@@ -458,3 +458,13 @@ panic inside the library still unwinds, so with that link it ends the process in
 - Not covered yet: the install test from a built package on every platform that ADR 0031 requires; it needs the C
   library archive, which also brings installed CMake files. The binding is otherwise delivered.
 - New docs: `docs/cpp-api.md`; `docs/c-api.md` and `examples/c/` point to the binding.
+
+## Amendment: background checkpoints (2026-11-20)
+
+`Writer::request_checkpoint()` (`result<std::uint64_t>`) and `Writer::checkpoint_progress()`
+(`result<CheckpointProgress>`, a new struct of `std::optional<Checkpoint> durable` and
+`std::optional<std::uint64_t> pending`) wrap the new C functions; `WriterOptions::early_writeback(bool)`,
+`WriterOptions::helper_cpus(HelperCpus)` (a new enum class of `process` and `inherited`) and
+`WriterOptions::helper_cpus(const std::vector<std::uint32_t> &)` (the C ABI's `TICKERTAPE_HELPER_CPUS_LIST`) wrap
+the new options. `Writer::close()` already returned the close's status, which now includes a background failure
+(ADR 0028's amendment); the destructor still ignores it. `layout.cpp` pins `CheckpointProgress` and `HelperCpus`.

@@ -177,18 +177,30 @@ final class Signatures {
             JAVA_LONG.withName("lag_records"),
             JAVA_LONG.withName("lag_bytes")).withName("tickertape_reader_metrics");
 
+    /** {@code tickertape_checkpoint_progress}, an extensible struct; 56 bytes in this ABI version. */
+    static final StructLayout CHECKPOINT_PROGRESS = MemoryLayout.structLayout(
+            JAVA_LONG.withName("struct_size"),
+            JAVA_INT.withName("has_durable"),
+            JAVA_INT.withName("has_pending"),
+            JAVA_LONG.withName("durable_generation"),
+            JAVA_LONG.withName("durable_next_seq"),
+            JAVA_LONG.withName("durable_segment_base_seq"),
+            JAVA_LONG.withName("durable_offset"),
+            JAVA_LONG.withName("pending_next_seq")).withName("tickertape_checkpoint_progress");
+
     /** Every struct, by its C name (for the layout test). */
-    static final Map<String, StructLayout> STRUCTS = Map.of(
-            "tickertape_record", RECORD,
-            "tickertape_new_record", NEW_RECORD,
-            "tickertape_segment_info", SEGMENT_INFO,
-            "tickertape_checkpoint", CHECKPOINT,
-            "tickertape_verify_report", VERIFY_REPORT,
-            "tickertape_retention_report", RETENTION_REPORT,
-            "tickertape_journal_status_report", JOURNAL_STATUS_REPORT,
-            "tickertape_beacon_status", BEACON_STATUS,
-            "tickertape_writer_metrics", WRITER_METRICS,
-            "tickertape_reader_metrics", READER_METRICS);
+    static final Map<String, StructLayout> STRUCTS = Map.ofEntries(
+            Map.entry("tickertape_record", RECORD),
+            Map.entry("tickertape_new_record", NEW_RECORD),
+            Map.entry("tickertape_segment_info", SEGMENT_INFO),
+            Map.entry("tickertape_checkpoint", CHECKPOINT),
+            Map.entry("tickertape_verify_report", VERIFY_REPORT),
+            Map.entry("tickertape_retention_report", RETENTION_REPORT),
+            Map.entry("tickertape_journal_status_report", JOURNAL_STATUS_REPORT),
+            Map.entry("tickertape_beacon_status", BEACON_STATUS),
+            Map.entry("tickertape_writer_metrics", WRITER_METRICS),
+            Map.entry("tickertape_reader_metrics", READER_METRICS),
+            Map.entry("tickertape_checkpoint_progress", CHECKPOINT_PROGRESS));
 
     /**
      * A pointer received as a 64-bit integer: on the supported (LP64) platforms both are passed in the same integer
@@ -239,6 +251,9 @@ final class Signatures {
         f.put("tickertape_writer_options_set_recovery_policy", FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT));
         f.put("tickertape_writer_options_set_notify", FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT));
         f.put("tickertape_writer_options_set_prefault", FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT));
+        f.put("tickertape_writer_options_set_early_writeback", FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT));
+        f.put("tickertape_writer_options_set_helper_cpus",
+                FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT, ADDRESS, SIZE_T));
         f.put("tickertape_writer_options_set_retention", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS));
         // Reader options.
         f.put("tickertape_reader_options_new", FunctionDescriptor.of(ADDRESS));
@@ -275,6 +290,8 @@ final class Signatures {
         f.put("tickertape_writer_append_batch",
                 FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, SIZE_T, ADDRESS, ADDRESS));
         f.put("tickertape_writer_checkpoint", FunctionDescriptor.of(JAVA_INT, ADDRESS));
+        f.put("tickertape_writer_request_checkpoint", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS));
+        f.put("tickertape_writer_checkpoint_progress", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS));
         f.put("tickertape_writer_next_seq", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS));
         f.put("tickertape_writer_last_retention_error", FunctionDescriptor.of(JAVA_INT, ADDRESS));
         // Operational metrics (ADR 0032).

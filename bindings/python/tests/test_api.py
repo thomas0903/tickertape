@@ -285,6 +285,70 @@ def test_durable_only_waits_for_checkpoints(journal: Path) -> None:
         assert as_tuples(r.read_many(1000)) == [pattern_tuple(s) for s in range(501, 800)]
 
 
+def wait_finished(w: tt.Writer, frontier: int) -> tt.CheckpointProgress:
+    deadline = time.monotonic() + 30
+    progress = w.checkpoint_progress()
+    while progress.pending is not None:
+        assert progress.pending == frontier
+        assert time.monotonic() < deadline, "the background checkpoint did not finish"
+        time.sleep(0.001)
+        progress = w.checkpoint_progress()
+    return progress
+
+
+def test_background_checkpoint(journal: Path) -> None:
+    """ADR 0038: the request returns its frontier at once, appends continue, the progress reports the pending frontier
+    and then the marker, a durable-only reader sees the marker move, and close waits for a checkpoint in flight. (The
+    binding's build has no fault injection: failures on the background path are tested in the core and the C ABI.)"""
+    with tt.Writer(journal, segment_size=SMALL_SEGMENT, early_writeback=True, helper_cpus="process") as w:
+        assert w.checkpoint_progress() == tt.CheckpointProgress(durable=None, pending=None)
+        r = tt.Reader(journal, durable_only=True)
+        append_pattern(w, 500)
+        assert r.try_next() is None
+        assert w.request_checkpoint() == 500
+        append_pattern(w, 300)  # rolls while the checkpoint may still run
+        done = wait_finished(w, 500)
+        assert done.pending is None and done.durable is not None
+        assert done.durable.next_seq == 500
+        assert done.durable == tt.read_checkpoint(journal)
+        assert as_tuples(r.read_many(1000)) == [pattern_tuple(s) for s in range(500)]
+        assert r.try_next() is None
+        # Requests in a row queue or join; each covers what was appended before it.
+        assert w.request_checkpoint() == 800
+        w.append(b"x")
+        assert w.request_checkpoint() == 801
+        assert wait_finished(w, 801).durable.next_seq == 801  # type: ignore[union-attr]
+        w.append(b"y")
+        assert w.request_checkpoint() == 802
+        w.checkpoint()  # waits for it, then checkpoints
+        assert w.checkpoint_progress().pending is None
+        w.append(b"z")
+        assert w.request_checkpoint() == 803
+        r.close()
+    # Leaving the block closed the writer, which waited for the checkpoint in flight.
+    assert tt.read_checkpoint(journal).next_seq == 803  # type: ignore[union-attr]
+    with pytest.raises(ValueError, match="closed writer"):
+        w.request_checkpoint()
+    with pytest.raises(ValueError, match="closed writer"):
+        w.checkpoint_progress()
+    w.close()  # again: does nothing
+
+
+def test_writer_thread_options(journal: Path) -> None:
+    for cpus in ("process", "inherited", [0], (), range(1)):
+        with tt.Writer(journal, prefault=True, early_writeback=False, helper_cpus=cpus) as w:
+            w.append(b"a")
+            assert w.request_checkpoint() == w.next_seq
+    with pytest.raises(ValueError, match="helper_cpus"):
+        tt.Writer(journal, helper_cpus="all")  # type: ignore[arg-type]
+    for bad in (1, b"0", None):
+        with pytest.raises(TypeError, match="helper_cpus"):
+            tt.Writer(journal, helper_cpus=bad)  # type: ignore[arg-type]
+    with pytest.raises((OverflowError, TypeError)):
+        tt.Writer(journal, helper_cpus=[-1])
+    assert "early_writeback=True, helper_cpus='process'" in str(inspect.signature(tt.Writer))
+
+
 def test_open_errors(journal: Path) -> None:
     journal.mkdir()
     with pytest.raises(tt.JournalNotFoundError) as raised:
@@ -619,6 +683,8 @@ def test_signatures_show_the_real_defaults() -> None:
     assert "..." not in str(inspect.signature(tt.Writer.append_batch))
     assert default(tt.Writer, "segment_size") == tt.DEFAULT_SEGMENT_SIZE
     assert default(tt.Writer, "recovery") == "quarantine"
+    assert default(tt.Writer, "helper_cpus") == "process"
+    assert default(tt.Writer, "early_writeback") is True
 
 
 def test_equality_and_hashing() -> None:

@@ -29,6 +29,7 @@
 #include <ratio>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <string_view>
 #include <vector>
 
@@ -1142,6 +1143,52 @@ static void metrics(const std::string &root) {
     CHECK_FAILS(tt::JournalStatus::sample(root + "/metrics-empty"), tt::Status::not_found);
 }
 
+// Background checkpoints (ADR 0038): the request returns its frontier at once, appends continue, the progress
+// reports the pending frontier and then the marker, a durable-only reader sees the marker move, and close waits for
+// a checkpoint in flight. (Failures on the background path are tested through the C ABI with fault injection, in the
+// library's Rust tests.)
+static void background_checkpoints(const std::string &root) {
+    const std::string dir = root + "/background";
+    tt::WriterOptions options = small_segments();
+    options.early_writeback(true).helper_cpus(tt::HelperCpus::process);
+    tt::Writer writer = MUST(tt::Writer::open(dir, options));
+    const tt::CheckpointProgress fresh = MUST(writer.checkpoint_progress());
+    CHECK(!fresh.durable && !fresh.pending);
+    const std::string payload(200, 'x');
+    for (std::uint64_t seq = 0; seq < 400; seq++) MUST(writer.append(1, 0, 0, payload));
+    tt::ReaderOptions durable_only;
+    durable_only.durable_only(true);
+    tt::Reader reader = MUST(tt::Reader::open(dir, durable_only));
+    CHECK(!MUST(reader.next()).has_value());
+
+    CHECK(MUST(writer.request_checkpoint()) == 400);
+    for (std::uint64_t seq = 400; seq < 800; seq++) MUST(writer.append(1, 0, 0, payload));  // rolls meanwhile
+    tt::CheckpointProgress progress = MUST(writer.checkpoint_progress());
+    for (int polls = 0; progress.pending && polls < 30000; polls++) {
+        CHECK(*progress.pending == 400);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        progress = MUST(writer.checkpoint_progress());
+    }
+    CHECK(!progress.pending && progress.durable && progress.durable->next_seq == 400);
+    const std::optional<tt::Checkpoint> marker = MUST(tt::read_checkpoint(dir));
+    CHECK(marker && marker->generation == progress.durable->generation && marker->offset == progress.durable->offset);
+    std::uint64_t durable = 0;
+    while (const std::optional<tt::RecordView> r = MUST(reader.next())) {
+        CHECK(r->seq() == durable);
+        durable++;
+    }
+    CHECK(durable == 400);
+
+    CHECK(MUST(writer.request_checkpoint()) == 800);
+    MUST(writer.close());  // waits for the checkpoint in flight
+    CHECK(MUST(tt::read_checkpoint(dir))->next_seq == 800);
+    CHECK_FAILS(writer.request_checkpoint(), tt::Status::invalid_argument);
+    CHECK_FAILS(writer.checkpoint_progress(), tt::Status::invalid_argument);
+    tt::WriterOptions cpus;
+    cpus.helper_cpus({0});
+    CHECK(!cpus.error());
+}
+
 int main(int argc, char **argv) {
     if (argc == 3 && std::string(argv[1]) == "write-fixture") return write_fixture(argv[2]) ? 1 : 0;
     if (argc == 5 && std::string(argv[1]) == "read-fixture") {
@@ -1172,6 +1219,7 @@ int main(int argc, char **argv) {
     fill_callbacks(root);
     move_semantics(root);
     metrics(root);
+    background_checkpoints(root);
 #if defined(__cpp_exceptions)
     exceptions(root);
 #endif

@@ -125,6 +125,10 @@ struct Checkpoint {
     std::uint64_t segment_base_seq;
     std::uint64_t offset;
 };
+struct CheckpointProgress {
+    std::optional<Checkpoint> durable;
+    std::optional<std::uint64_t> pending;
+};
 struct RetentionReport {
     std::uint64_t removed_segments;
     std::uint64_t removed_bytes;
@@ -236,9 +240,11 @@ struct JournalStatus {
 TT_PIN(tt::Status, std::int32_t);
 TT_PIN(tt::CorruptReason, std::int32_t);
 TT_PIN(tt::RecoveryPolicy, std::int32_t);
+TT_PIN(tt::HelperCpus, std::int32_t);
 static_assert(std::is_same_v<std::underlying_type_t<tt::Status>, std::int32_t> &&
                   std::is_same_v<std::underlying_type_t<tt::CorruptReason>, std::int32_t> &&
-                  std::is_same_v<std::underlying_type_t<tt::RecoveryPolicy>, std::int32_t>,
+                  std::is_same_v<std::underlying_type_t<tt::RecoveryPolicy>, std::int32_t> &&
+                  std::is_same_v<std::underlying_type_t<tt::HelperCpus>, std::int32_t>,
               "the enumerations' underlying types are part of the layout");
 TT_PIN(tt::Error, mirror::Error);
 TT_PIN(tt::Exception, mirror::Exception);
@@ -269,6 +275,8 @@ TT_PIN(tt::VerifyReport::Problem, mirror::Problem);
 TT_PIN(tt::VerifyReport, mirror::VerifyReport);
 TT_PIN(tt::SegmentInfo, mirror::SegmentInfo);
 TT_PIN(tt::Checkpoint, mirror::Checkpoint);
+TT_PIN(tt::CheckpointProgress, mirror::CheckpointProgress);
+TT_PIN(tt::result<tt::CheckpointProgress>, mirror::Result<tt::CheckpointProgress>);
 TT_PIN(tt::RetentionReport, mirror::RetentionReport);
 TT_PIN(tt::HeadEnd, std::int32_t);
 TT_PIN(tt::CheckpointProblem, std::int32_t);

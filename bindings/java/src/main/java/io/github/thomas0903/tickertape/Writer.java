@@ -2,10 +2,12 @@ package io.github.thomas0903.tickertape;
 
 import static io.github.thomas0903.tickertape.Memory.BYTE;
 import static java.lang.foreign.ValueLayout.ADDRESS;
+import static java.lang.foreign.ValueLayout.JAVA_INT;
 import static java.lang.foreign.ValueLayout.JAVA_LONG;
 
 import java.lang.foreign.Arena;
 import java.lang.foreign.Linker;
+import java.lang.foreign.MemoryLayout;
 import java.lang.foreign.MemorySegment;
 import java.lang.invoke.MethodHandle;
 import java.lang.invoke.MethodHandles;
@@ -15,6 +17,7 @@ import java.nio.ByteBuffer;
 import java.nio.file.Path;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.OptionalLong;
 
 /**
  * Appends records to a journal. Only one writer may have a journal open at a time, across processes.
@@ -28,13 +31,18 @@ import java.util.Optional;
  *
  * <p><b>Durability.</b> When an append returns, the record is <b>visible</b>: readers in any process on this host can
  * read it, and it survives this process dying. It is <b>durable</b> (survives a power loss, under the crash contract's
- * storage assumptions) only after a later {@link #checkpoint()} returns. {@link #close()} does not checkpoint.
+ * storage assumptions) only after a later {@link #checkpoint()} returns, or once a checkpoint requested with
+ * {@link #requestCheckpoint()} has finished ({@link #checkpointProgress()}). {@link #close()} does not checkpoint.
  *
  * <p><b>Threads.</b> A writer is used by one thread at a time; it may be handed to another thread between calls (with
  * the usual happens-before, such as through an executor or a lock). A call that finds the writer in use by another
  * thread, or closed, throws {@link IllegalStateException} and does nothing; it never reaches the library. Blocking
  * calls ({@link #open}, {@link #checkpoint()}, an append that rolls to a new segment) pin a virtual thread to its
- * carrier while they run.
+ * carrier while they run. A background checkpoint ({@link #requestCheckpoint()}) runs on a thread the library starts
+ * and owns; while it runs, every method may be called (by the thread using the writer): appends continue,
+ * {@link #checkpointProgress()}, {@link #nextSeq()}, {@link #metrics()} and {@link #lastRetentionError()} return at
+ * once, {@link #requestCheckpoint()} queues or joins a request, and {@link #checkpoint()} and {@link #close()} wait
+ * for it.
  *
  * <p><b>Allocation.</b> The writer reuses one scratch buffer, its output memory and one {@link PayloadBuffer}, so once
  * warm the appends allocate nothing on the Java heap under the conditions that {@code docs/java-api.md} &rarr;
@@ -448,7 +456,8 @@ public final class Writer implements AutoCloseable {
     /**
      * Makes every record appended so far <b>durable</b>, with the platform's sync calls, and blocks until they finish.
      * Configured retention then runs; its failures are reported by {@link #lastRetentionError()} and do not change
-     * this result.
+     * this result. Background checkpoints in flight ({@link #requestCheckpoint()}) are waited for first, and the error
+     * of one that failed is thrown here if no call has thrown it yet.
      *
      * @throws JournalIOException if a sync fails ({@link StorageFullException} for lack of space). The writer is then
      *     poisoned: every later checkpoint throws {@link DurabilityLostException}, while appends keep working. Treat a
@@ -464,6 +473,75 @@ public final class Writer implements AutoCloseable {
             handle.exit();
             Reference.reachabilityFence(this);
         }
+    }
+
+    /**
+     * Starts a checkpoint of every record appended so far on the library's checkpoint thread and returns without
+     * waiting for its syncs (ADR 0038). Returns the sequence number it covers up to: once it has finished (see
+     * {@link #checkpointProgress()}), every record with a smaller sequence number is durable, exactly as after
+     * {@link #checkpoint()}. Records appended after this call are not covered; appends continue while it runs.
+     *
+     * <p>One checkpoint runs at a time: a request made while one runs waits for it, and requests made meanwhile join
+     * the waiting one, which then covers up to the newest of them. {@link #checkpoint()} waits for the background
+     * checkpoints in flight before it checkpoints itself, and {@link #close()} waits for them and reports how they
+     * ended. Configured retention runs on the checkpoint thread after each successful background checkpoint; its
+     * errors reach {@link #lastRetentionError()} at the writer's next call to this method, {@link #checkpointProgress()},
+     * {@link #checkpoint()} or {@link #close()}. The first call starts the checkpoint thread; later calls make no system
+     * call.
+     *
+     * @throws JournalIOException the error of an earlier background checkpoint (or of early write-back on Linux) that
+     *     failed and that no call has thrown yet ({@link StorageFullException} for lack of space); thrown once, after
+     *     which the writer is poisoned as after a failed {@link #checkpoint()}. Also if the checkpoint thread cannot be
+     *     started (the writer is then not poisoned). Nothing is requested.
+     * @throws DurabilityLostException if the writer is poisoned
+     * @throws SequenceExhaustedException if checkpoint generations are exhausted
+     * @throws IllegalStateException if the writer is closed or in use by another thread
+     */
+    public long requestCheckpoint() {
+        handle.enter();
+        try {
+            Errors.check(Native.writerRequestCheckpoint(handle.ptr, seqOut));
+            return seqOut.get(JAVA_LONG, 0);
+        } finally {
+            handle.exit();
+            Reference.reachabilityFence(this);
+        }
+    }
+
+    /**
+     * Where this writer's checkpoints stand: the marker it last made durable (or read when it opened), and the
+     * frontier of a background checkpoint still in flight. Makes no system call; allocates the result.
+     *
+     * @throws JournalIOException the error of a background checkpoint (or of early write-back on Linux) that failed,
+     *     the first time it is reported; the writer is then poisoned
+     * @throws DurabilityLostException whenever the writer is poisoned after that, also after a failed
+     *     {@link #checkpoint()} or a failed clean-up of an aborted fill: a poisoned writer reports no progress
+     * @throws IllegalStateException if the writer is closed or in use by another thread
+     */
+    public CheckpointProgress checkpointProgress() {
+        handle.enter();
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment out = MetricsValues.sized(arena, Signatures.CHECKPOINT_PROGRESS);
+            Errors.check(Native.writerCheckpointProgress(handle.ptr, out));
+            Optional<Checkpoint> durable = Optional.empty();
+            if (out.get(JAVA_INT, field("has_durable")) != 0) {
+                durable = Optional.of(new Checkpoint(out.get(JAVA_LONG, field("durable_generation")),
+                        out.get(JAVA_LONG, field("durable_next_seq")),
+                        out.get(JAVA_LONG, field("durable_segment_base_seq")),
+                        out.get(JAVA_LONG, field("durable_offset"))));
+            }
+            OptionalLong pending = out.get(JAVA_INT, field("has_pending")) != 0
+                    ? OptionalLong.of(out.get(JAVA_LONG, field("pending_next_seq")))
+                    : OptionalLong.empty();
+            return new CheckpointProgress(durable, pending);
+        } finally {
+            handle.exit();
+            Reference.reachabilityFence(this);
+        }
+    }
+
+    private static long field(String name) {
+        return Signatures.CHECKPOINT_PROGRESS.byteOffset(MemoryLayout.PathElement.groupElement(name));
     }
 
     /** The sequence number the next append will get. */
@@ -516,8 +594,11 @@ public final class Writer implements AutoCloseable {
     }
 
     /**
-     * Closes the writer and releases the journal's lock. Does <b>not</b> checkpoint: appended records stay visible and
-     * survive, but only those covered by a successful {@link #checkpoint()} are durable. Idempotent, and callable from
+     * Closes the writer and releases the journal's lock, as Rust's {@code Writer::close} does. Does <b>not</b>
+     * checkpoint: appended records stay visible and survive, but only those covered by a successful checkpoint are
+     * durable. If background checkpoints ({@link #requestCheckpoint()}) are queued or running, it first waits for them
+     * (it does not cancel them), then reports how this writer's checkpoints ended; the journal is released in every
+     * case. Idempotent, and callable from
      * any thread. From the moment it starts, the writer refuses every new call and {@link #isClosed()} is true. If
      * another thread is inside a call on this writer, waits for that call to finish, without spinning (an interrupt does
      * not end the wait, and the thread's interrupt status is kept); if another thread is closing it, waits until the
@@ -525,6 +606,10 @@ public final class Writer implements AutoCloseable {
      * of {@link #appendWith} too, which lives in a shared arena: closing a writer that used {@code appendWith} costs a
      * handshake with every thread of the JVM, as closing a reader does.
      *
+     * @throws JournalIOException the error of a background checkpoint (or of early write-back on Linux) that failed and
+     *     that no earlier call threw ({@link StorageFullException} for lack of space); the writer is closed all the same
+     * @throws DurabilityLostException if the writer was poisoned: a checkpoint failed and its error was thrown earlier,
+     *     or the clean-up of an aborted fill failed; the writer is closed all the same
      * @throws InternalErrorException if the library reported an internal error while closing (the handle is freed
      *     all the same)
      * @throws IllegalStateException if called from inside a {@link PayloadFiller} of this writer

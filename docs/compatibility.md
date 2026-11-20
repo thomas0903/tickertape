@@ -74,7 +74,7 @@ version 1.
   later stable release it becomes the shipped header, and `.github/scripts/check_abi_baseline.py` then fails CI if
   a declaration in it is removed or changed (`docs/playbooks/release-checklist.md` → C ABI at 1.0).
 - **Extensible structs** start with `uint64_t struct_size`; the library fills `min(struct_size, its own size)` and
-  writes back what it filled, so a newer program can tell which fields an older library wrote. Six structs are
+  writes back what it filled, so a newer program can tell which fields an older library wrote. Seven structs are
   extensible (`c-api.md` → Versioning lists them with their minimum sizes). The record structs,
   `tickertape_segment_info` and `tickertape_checkpoint` describe format version 1 and are frozen.
 - **Status codes and corruption reasons** keep their values; new ones may be added. Treat an unknown negative status
@@ -86,9 +86,8 @@ version 1.
   `TICKERTAPE_LAG_OTHER_REASON`, `TICKERTAPE_BEACON_OTHER`, `TICKERTAPE_READERS_DIR_OTHER`) where a value the core
   added after the C mapping was written would land; a library built from one source tree does not return them,
   since its tests name every core variant. A program should handle them as "unknown" (for the head, not as healthy).
-- **Not in the C ABI:** `status::Sampler` (rates, time to full), `Status::breaches`, creating reader beacons,
-  `Writer::request_checkpoint` and `Writer::checkpoint_progress` (ADR 0038). `c-api.md` → Operational metrics says
-  so for the first three.
+- **Not in the C ABI:** `status::Sampler` (rates, time to full), `Status::breaches` and creating reader beacons.
+  `c-api.md` → Operational metrics says so.
 
 ## C++ header
 
@@ -191,10 +190,9 @@ Consequences).
 
 1. ADR 0042 (replay and recovery at scale) stays proposed until the cloud run on local SSD decides on the sparse
    index. No public API depends on it: accept or close it with that decision.
-2. Features that reach no binding yet: background checkpoints (`Writer::request_checkpoint`, `checkpoint_progress`,
-   ADR 0038) through the C ABI and the bindings, `status::Sampler` (rates, time to full) with `Status::breaches`, and
-   creating reader beacons. None is promised to the bindings and each can be added in 1.x: decide which 1.0 needs,
-   and add background checkpoints to the C ABI first, as ADR 0038's Consequences say.
+2. Features that reach no binding yet: `status::Sampler` (rates, time to full) with `Status::breaches`, and creating
+   reader beacons. Neither is promised to the bindings and each can be added in 1.x: decide which 1.0 needs.
+   (Background checkpoints, ADR 0038, reached the C ABI and the three bindings on 2026-11-20.)
 3. The C ABI at 1.0: set `TICKERTAPE_ABI_VERSION` to 1 and freeze the ABI baseline
    (`crates/tickertape-ffi/abi/tickertape-baseline.h` becomes the shipped header). Do both in the release
    preparation pull request (`docs/playbooks/release-checklist.md` → C ABI at 1.0).

@@ -47,6 +47,17 @@ A record is **visible** to readers, and survives the writer process dying, as so
 `checkpoint()` returns. Closing a writer does not checkpoint. Readers that must never act on a record a power loss
 could erase use `Reader(path, durable_only=True)`, which returns only records covered by the last checkpoint.
 
+`request_checkpoint()` starts the same checkpoint on a thread of the library and returns at once with the sequence
+number it covers up to, so appends go on while it syncs; `checkpoint_progress()` returns a `CheckpointProgress`
+(`durable`: the last durable `Checkpoint` or `None`; `pending`: the frontier still in flight or `None`). One runs at a
+time; a request made while one runs waits for it, and later requests join it. `checkpoint()` and `close()` wait for
+it. A background checkpoint that fails is raised once, by the next `request_checkpoint()`, `checkpoint_progress()`,
+`checkpoint()` or `close()`, and poisons the writer like a failed `checkpoint()`. `close()` raises that error, or
+`DurabilityLostError` if the writer was already poisoned (the writer is closed either way); leaving a `with` block
+raises it too, unless the block raised. On Linux, `Writer(early_writeback=True)` (the default) starts the kernel's
+write-back as the writer goes, so a checkpoint finds less to write, and `helper_cpus` (`"process"`, the default,
+`"inherited"` or a list of CPU numbers) places the writer's helper threads; both do nothing on macOS.
+
 A failed `checkpoint()` poisons the writer: later checkpoints raise `DurabilityLostError`, appends keep working. The
 failure is not undone by reopening: records appended before a failed checkpoint may not be durable even if a writer
 opened later in the same boot checkpoints successfully (on Linux a failed `fsync` can drop the dirty pages). Treat a

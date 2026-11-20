@@ -1,5 +1,7 @@
 package io.github.thomas0903.tickertape;
 
+import static java.lang.foreign.ValueLayout.JAVA_INT;
+
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.util.Objects;
@@ -14,24 +16,32 @@ import java.util.Objects;
  * }</pre>
  */
 public final class WriterOptions {
-    private static final WriterOptions DEFAULTS = new WriterOptions(128L << 20, RecoveryPolicy.QUARANTINE, true, true, null);
+    private static final WriterOptions DEFAULTS =
+            new WriterOptions(128L << 20, RecoveryPolicy.QUARANTINE, true, true, true, HelperCpus.process(), null);
 
     private final long segmentSize;
     private final RecoveryPolicy recoveryPolicy;
     private final boolean notify;
     private final boolean prefault;
+    private final boolean earlyWriteback;
+    private final HelperCpus helperCpus;
     private final Retention retention;
 
     private WriterOptions(long segmentSize, RecoveryPolicy recoveryPolicy, boolean notify, boolean prefault,
-            Retention retention) {
+            boolean earlyWriteback, HelperCpus helperCpus, Retention retention) {
         this.segmentSize = segmentSize;
         this.recoveryPolicy = recoveryPolicy;
         this.notify = notify;
         this.prefault = prefault;
+        this.earlyWriteback = earlyWriteback;
+        this.helperCpus = helperCpus;
         this.retention = retention;
     }
 
-    /** 128 MiB segments, {@link RecoveryPolicy#QUARANTINE}, notify on, prefault on, no retention. */
+    /**
+     * 128 MiB segments, {@link RecoveryPolicy#QUARANTINE}, notify on, prefault on, early write-back on,
+     * {@link HelperCpus#process()}, no retention.
+     */
     public static WriterOptions defaults() {
         return DEFAULTS;
     }
@@ -44,25 +54,44 @@ public final class WriterOptions {
         if (bytes <= 0) {
             throw new IllegalArgumentException("segment size must be positive: " + bytes);
         }
-        return new WriterOptions(bytes, recoveryPolicy, notify, prefault, retention);
+        return new WriterOptions(bytes, recoveryPolicy, notify, prefault, earlyWriteback, helperCpus, retention);
     }
 
     /** What to do with a corrupt committed tail on open. */
     public WriterOptions recoveryPolicy(RecoveryPolicy policy) {
-        return new WriterOptions(segmentSize, Objects.requireNonNull(policy, "policy"), notify, prefault, retention);
+        return new WriterOptions(segmentSize, Objects.requireNonNull(policy, "policy"), notify, prefault, earlyWriteback,
+                helperCpus, retention);
     }
 
     /** Whether the writer wakes blocked readers through its shared-memory wake-up region (ADRs 0017, 0021). */
     public WriterOptions notify(boolean enabled) {
-        return new WriterOptions(segmentSize, recoveryPolicy, enabled, prefault, retention);
+        return new WriterOptions(segmentSize, recoveryPolicy, enabled, prefault, earlyWriteback, helperCpus, retention);
     }
 
     /**
      * Whether the writer prefaults pages (and on macOS prepares the next segment) in a background thread it starts.
-     * {@code false} gives a writer that starts no threads.
+     * {@code false} gives a writer that starts no threads, except the checkpoint thread that
+     * {@link Writer#requestCheckpoint()} starts, and turns off early write-back.
      */
     public WriterOptions prefault(boolean enabled) {
-        return new WriterOptions(segmentSize, recoveryPolicy, notify, enabled, retention);
+        return new WriterOptions(segmentSize, recoveryPolicy, notify, enabled, earlyWriteback, helperCpus, retention);
+    }
+
+    /**
+     * <b>Linux:</b> whether the writer starts the kernel's write-back of the pages behind it as it goes, so that a
+     * checkpoint finds little left to write (ADR 0038 &rarr; Early write-back; needs {@link #prefault(boolean)}). It
+     * makes nothing durable earlier: only a checkpoint does. If it fails with an I/O error, no later checkpoint of the
+     * writer succeeds: the error is thrown once, by the next checkpoint, {@link Writer#requestCheckpoint()},
+     * {@link Writer#checkpointProgress()} or {@link Writer#close()}. <b>macOS:</b> no effect. Default: on.
+     */
+    public WriterOptions earlyWriteback(boolean enabled) {
+        return new WriterOptions(segmentSize, recoveryPolicy, notify, prefault, enabled, helperCpus, retention);
+    }
+
+    /** Where the writer's helper threads run (Linux; see {@link HelperCpus}). Default: {@link HelperCpus#process()}. */
+    public WriterOptions helperCpus(HelperCpus cpus) {
+        return new WriterOptions(segmentSize, recoveryPolicy, notify, prefault, earlyWriteback,
+                Objects.requireNonNull(cpus, "cpus"), retention);
     }
 
     /**
@@ -71,7 +100,7 @@ public final class WriterOptions {
      * already exist.
      */
     public WriterOptions retention(Retention retention) {
-        return new WriterOptions(segmentSize, recoveryPolicy, notify, prefault, retention);
+        return new WriterOptions(segmentSize, recoveryPolicy, notify, prefault, earlyWriteback, helperCpus, retention);
     }
 
     /** The size of new segment files in bytes. */
@@ -94,6 +123,16 @@ public final class WriterOptions {
         return prefault;
     }
 
+    /** Whether early write-back is on (see {@link #earlyWriteback(boolean)}). */
+    public boolean isEarlyWritebackEnabled() {
+        return earlyWriteback;
+    }
+
+    /** Where the writer's helper threads run. */
+    public HelperCpus helperCpus() {
+        return helperCpus;
+    }
+
     /** The retention settings, or {@code null} if retention is off. */
     public Retention retention() {
         return retention;
@@ -107,6 +146,10 @@ public final class WriterOptions {
             Errors.check(Native.writerOptionsSetRecoveryPolicy(o, recoveryPolicy.code));
             Errors.check(Native.writerOptionsSetNotify(o, notify ? 1 : 0));
             Errors.check(Native.writerOptionsSetPrefault(o, prefault ? 1 : 0));
+            Errors.check(Native.writerOptionsSetEarlyWriteback(o, earlyWriteback ? 1 : 0));
+            int[] cpus = helperCpus.cpuArray();
+            MemorySegment list = cpus.length == 0 ? MemorySegment.NULL : arena.allocateFrom(JAVA_INT, cpus);
+            Errors.check(Native.writerOptionsSetHelperCpus(o, helperCpus.placement, list, cpus.length));
             if (retention != null) {
                 MemorySegment r = retention.toNative(arena);
                 try {
@@ -125,17 +168,19 @@ public final class WriterOptions {
     @Override
     public boolean equals(Object o) {
         return o instanceof WriterOptions w && segmentSize == w.segmentSize && recoveryPolicy == w.recoveryPolicy
-                && notify == w.notify && prefault == w.prefault && Objects.equals(retention, w.retention);
+                && notify == w.notify && prefault == w.prefault && earlyWriteback == w.earlyWriteback
+                && helperCpus.equals(w.helperCpus) && Objects.equals(retention, w.retention);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(segmentSize, recoveryPolicy, notify, prefault, retention);
+        return Objects.hash(segmentSize, recoveryPolicy, notify, prefault, earlyWriteback, helperCpus, retention);
     }
 
     @Override
     public String toString() {
         return "WriterOptions[segmentSize=" + segmentSize + ", recoveryPolicy=" + recoveryPolicy + ", notify=" + notify
-                + ", prefault=" + prefault + ", retention=" + retention + "]";
+                + ", prefault=" + prefault + ", earlyWriteback=" + earlyWriteback + ", helperCpus=" + helperCpus
+                + ", retention=" + retention + "]";
     }
 }

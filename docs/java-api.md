@@ -349,7 +349,17 @@ The binding uses the crash contract's two levels ([`crash-contract.md`](crash-co
 | Level | Reached when | Means |
 |---|---|---|
 | **Visible** | an append returns | Readers on this host can read the record, and it survives the writer process dying. It can still be lost in a power loss or OS crash |
-| **Durable** | a later `checkpoint()` returns | The record is on stable storage, under the crash contract's storage assumptions |
+| **Durable** | a later `checkpoint()` returns, or a later `requestCheckpoint()` has finished | The record is on stable storage, under the crash contract's storage assumptions |
+
+**Background checkpoints** (ADR 0038; [`c-api.md` → Background checkpoints](c-api.md#background-checkpoints) has the
+rules): `Writer.requestCheckpoint()` starts a checkpoint on a thread of the library and returns at once with the
+sequence number it covers up to, so appends go on while it syncs; `Writer.checkpointProgress()` returns a
+`CheckpointProgress` (`durable()`: the last durable `Checkpoint`, if any; `pending()`: the frontier still in flight,
+if any). A failure is thrown once (`JournalIOException`), by the next `requestCheckpoint()`, `checkpointProgress()`,
+`checkpoint()` or `close()`, then `DurabilityLostException`. `close()` waits for a checkpoint in flight and throws
+that failure (or `DurabilityLostException` for a poisoned writer) after releasing the journal; the `Cleaner` path
+waits too but reports nothing. `WriterOptions.earlyWriteback(boolean)` and `WriterOptions.helperCpus(HelperCpus)` set
+the Linux-only options of ADR 0038.
 
 `close()` does not checkpoint. A failed checkpoint poisons the writer: later checkpoints throw
 `DurabilityLostException` while appends keep working; treat it as an incident. A durable-only reader returns only
@@ -444,8 +454,8 @@ What it cannot detect, and is undefined:
   record being written) and an unsealed segment whose successor exists (a roll in progress). The pauses are 10 ms
   doubling to 320 ms, 630 ms in total, so only a writer stalled in such a state for longer can make it report a
   problem that is not there; verify again to tell (see [`operations.md`](operations.md)).
-- `VerifyReport` and `RetentionReport` are final classes with accessor methods, not records, because their C structs
-  can gain fields in later versions; `Checkpoint`, `SegmentInfo` and `RecordCopy` are records, since their structs are
+- `VerifyReport`, `RetentionReport` and `CheckpointProgress` are final classes with accessor methods, not records,
+  because their C structs can gain fields in later versions; `Checkpoint`, `SegmentInfo` and `RecordCopy` are records, since their structs are
   frozen.
 - `Journal.listSegments(dir)` lists the segments; `Journal.readCheckpoint(dir)` reads the checkpoint marker (empty if
   there is none).

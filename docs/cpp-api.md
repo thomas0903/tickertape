@@ -184,7 +184,8 @@ What it does not change:
   with `invalid_argument`. `is_open()` tells whether a writer or reader holds a handle. A moved-from `RecordBatch`
   has capacity 0.
 - The destructor of a `Writer` closes it **without checkpointing**: records stay visible, but only checkpointed
-  records are durable. `close()` does the same now and reports the status.
+  records are durable. `close()` does the same now and reports the status, including the failure of a background
+  checkpoint (see [Durability](#durability)).
 - Options and retention settings are copied by the functions that take them. A moved-from options object passed to
   `open` fails with `invalid_argument` rather than meaning "the defaults".
 - **`RecordView` borrows.** `Reader::next` returns a view whose payload points into the reader's buffer (safe reader)
@@ -336,7 +337,17 @@ while (std::size_t n = reader.read_batch(batch, 10ms).value()) {
 | Level | Reached when | Means |
 |---|---|---|
 | **Visible** | an append returns a value | Readers on this host can read the record, and it survives the writer process dying. It can still be lost in a power loss or OS crash |
-| **Durable** | a later `Writer::checkpoint()` succeeds | The record is on stable storage, under the crash contract's storage assumptions |
+| **Durable** | a later `Writer::checkpoint()` succeeds, or a later `Writer::request_checkpoint()` has finished | The record is on stable storage, under the crash contract's storage assumptions |
+
+**Background checkpoints** (ADR 0038; [`c-api.md` → Background checkpoints](c-api.md#background-checkpoints) has the
+rules): `Writer::request_checkpoint()` starts a checkpoint on a thread of the library and returns at once with the
+sequence number it covers up to, so appends go on while it syncs; `Writer::checkpoint_progress()` returns a
+`CheckpointProgress` (`durable`: the last durable `Checkpoint`, if any; `pending`: the frontier still in flight, if
+any). A failure is returned once, by the next `request_checkpoint`, `checkpoint_progress`, `checkpoint` or `close`,
+then `Status::durability_lost`. `close()` waits for a checkpoint in flight and returns that failure (or
+`durability_lost` for a poisoned writer); the destructor waits too but cannot report, so call `close()` when you need
+to know. `WriterOptions::early_writeback(bool)` and `WriterOptions::helper_cpus(HelperCpus)` (or a list of CPUs) set
+the Linux-only options of ADR 0038.
 
 Closing or destroying a writer does not checkpoint. A failed checkpoint poisons the writer: later checkpoints fail
 with `Status::durability_lost` while appends keep working; treat it as an incident. `ReaderOptions::durable_only(true)`

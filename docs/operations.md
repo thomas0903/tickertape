@@ -91,14 +91,20 @@ writer process crashing, but not a power loss (crash contract C1, C7, C8).
 A common pattern is a time- or count-based checkpoint (for example every second or every N records, whichever comes
 first) plus one before a clean shutdown. Dropping a `Writer` does not checkpoint.
 
-**Background checkpoints** (Rust API, ADR 0038): `Writer::request_checkpoint()` starts a checkpoint of
+**Background checkpoints** (ADR 0038): `Writer::request_checkpoint()` starts a checkpoint of
 everything appended so far on the writer's own checkpoint thread and returns at once, so appends go on while the sync
 calls run; `Writer::checkpoint_progress()` reports when it is durable. Records appended after the request are not
 covered. A failure is reported by the next of these calls (or `checkpoint()`, or `Writer::close()`), and poisons the
 writer as above. Dropping the writer waits for the requested checkpoints; `close()` waits and reports how they ended
 (it does not checkpoint). A request made while one checkpoint waits joins it. To wait for a checkpoint, poll
 `checkpoint_progress()`. On Linux, combine background checkpoints with early write-back (the default) and keep the
-checkpoint thread off a pinned writer's CPU (the default; "Pinned writers" above).
+checkpoint thread off a pinned writer's CPU (the default; "Pinned writers" above). The bindings have the same calls
+with the same rules: in C `tickertape_writer_request_checkpoint` and `tickertape_writer_checkpoint_progress`
+(`c-api.md` → Background checkpoints), in C++ `Writer::request_checkpoint` and `Writer::checkpoint_progress`, in
+Python `Writer.request_checkpoint` and `Writer.checkpoint_progress`, in Java `Writer.requestCheckpoint` and
+`Writer.checkpointProgress`; each binding's close reports a failure as `Writer::close` does. Early write-back and
+the helper placement are writer options in each (`early_writeback` / `earlyWriteback`, `helper_cpus` /
+`helperCpus`).
 
 If `checkpoint()` returns an error, the writer refuses all later checkpoints (`Error::DurabilityLost`) while appends
 keep working. Treat it as an incident: see "Errors are sticky" in the crash contract.

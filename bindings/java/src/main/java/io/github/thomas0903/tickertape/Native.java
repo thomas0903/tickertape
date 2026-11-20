@@ -61,6 +61,8 @@ final class Native {
     private static final MethodHandle WRITER_OPTIONS_SET_RECOVERY_POLICY = h("tickertape_writer_options_set_recovery_policy");
     private static final MethodHandle WRITER_OPTIONS_SET_NOTIFY = h("tickertape_writer_options_set_notify");
     private static final MethodHandle WRITER_OPTIONS_SET_PREFAULT = h("tickertape_writer_options_set_prefault");
+    private static final MethodHandle WRITER_OPTIONS_SET_EARLY_WRITEBACK = h("tickertape_writer_options_set_early_writeback");
+    private static final MethodHandle WRITER_OPTIONS_SET_HELPER_CPUS = h("tickertape_writer_options_set_helper_cpus");
     private static final MethodHandle WRITER_OPTIONS_SET_RETENTION = h("tickertape_writer_options_set_retention");
     private static final MethodHandle READER_OPTIONS_NEW = h("tickertape_reader_options_new");
     private static final MethodHandle READER_OPTIONS_FREE = h("tickertape_reader_options_free");
@@ -88,6 +90,8 @@ final class Native {
     private static final MethodHandle WRITER_APPEND_WITH = h("tickertape_writer_append_with");
     private static final MethodHandle WRITER_APPEND_BATCH = h("tickertape_writer_append_batch");
     private static final MethodHandle WRITER_CHECKPOINT = h("tickertape_writer_checkpoint");
+    private static final MethodHandle WRITER_REQUEST_CHECKPOINT = h("tickertape_writer_request_checkpoint");
+    private static final MethodHandle WRITER_CHECKPOINT_PROGRESS = h("tickertape_writer_checkpoint_progress");
     private static final MethodHandle WRITER_NEXT_SEQ = h("tickertape_writer_next_seq");
     private static final MethodHandle WRITER_LAST_RETENTION_ERROR = h("tickertape_writer_last_retention_error");
 
@@ -230,6 +234,22 @@ final class Native {
     static int writerOptionsSetPrefault(MemorySegment a0, int a1) {
         try {
             return (int) WRITER_OPTIONS_SET_PREFAULT.invokeExact(a0, a1);
+        } catch (Throwable t) {
+            throw rethrow(t);
+        }
+    }
+
+    static int writerOptionsSetEarlyWriteback(MemorySegment a0, int a1) {
+        try {
+            return (int) WRITER_OPTIONS_SET_EARLY_WRITEBACK.invokeExact(a0, a1);
+        } catch (Throwable t) {
+            throw rethrow(t);
+        }
+    }
+
+    static int writerOptionsSetHelperCpus(MemorySegment a0, int a1, MemorySegment a2, long a3) {
+        try {
+            return (int) WRITER_OPTIONS_SET_HELPER_CPUS.invokeExact(a0, a1, a2, a3);
         } catch (Throwable t) {
             throw rethrow(t);
         }
@@ -446,6 +466,22 @@ final class Native {
     static int writerCheckpoint(MemorySegment a0) {
         try {
             return (int) WRITER_CHECKPOINT.invokeExact(a0);
+        } catch (Throwable t) {
+            throw rethrow(t);
+        }
+    }
+
+    static int writerRequestCheckpoint(MemorySegment a0, MemorySegment a1) {
+        try {
+            return (int) WRITER_REQUEST_CHECKPOINT.invokeExact(a0, a1);
+        } catch (Throwable t) {
+            throw rethrow(t);
+        }
+    }
+
+    static int writerCheckpointProgress(MemorySegment a0, MemorySegment a1) {
+        try {
+            return (int) WRITER_CHECKPOINT_PROGRESS.invokeExact(a0, a1);
         } catch (Throwable t) {
             throw rethrow(t);
         }

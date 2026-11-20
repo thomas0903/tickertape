@@ -342,7 +342,8 @@ pub struct tickertape_writer_metrics {
     /// 1 if there is a checkpoint marker (as this writer last wrote it or read it at open). If 0, the
     /// `checkpoint_*` values are `TICKERTAPE_UNKNOWN`.
     pub has_checkpoint: u32,
-    /// 1 after a failed checkpoint: later checkpoints fail with `TICKERTAPE_E_DURABILITY_LOST`.
+    /// 1 after a failed checkpoint (a background one or early write-back from the moment it failed, before a call has
+    /// returned its error): later checkpoints fail with `TICKERTAPE_E_DURABILITY_LOST`.
     pub poisoned: u32,
     /// The marker's generation.
     pub checkpoint_generation: u64,

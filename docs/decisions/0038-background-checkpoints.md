@@ -332,7 +332,10 @@ segments after the process changes into a directory holding another journal with
 - The abandoned-write path can wait for a background checkpoint to finish (it takes the same lock).
 - Between checkpoints a writer holds at most four rolled or inherited segments open per dirty list; a checkpoint
   reopens the others, and fails if one is gone or replaced.
-- The C ABI, the bindings, the CLI and the iceoryx2 recorder adopt the API once this ADR is accepted.
+- The C ABI, the bindings, the CLI and the iceoryx2 recorder adopt the API once this ADR is accepted. Done for the C
+  ABI, the C++, Python and Java bindings and the iceoryx2 recorder on 2026-11-20 (amendments to ADRs 0028, 0029,
+  0030, 0036 and 0037): the same names, coalescing and failure reporting, and each binding's close reports as
+  `close` does.
 - An external `retention::apply` syncs the checkpoint marker once per new slot before it removes anything.
 - Tests: `tests/background_checkpoint.rs` (C7, C12, C13, C14 with a checkpoint in flight; the roll kill test; early
   write-back failure), `tests/recovery.rs` (restored headers), `tests/retention.rs` (the archiver's marker sync), the

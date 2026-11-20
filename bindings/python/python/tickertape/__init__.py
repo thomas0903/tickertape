@@ -35,6 +35,7 @@ from ._errors import (
 )
 from ._inspect import (
     Checkpoint,
+    CheckpointProgress,
     Problem,
     RecoveryAction,
     RecoveryReport,
@@ -84,6 +85,7 @@ __all__ = [
     "CORE_VERSION",
     "CORRUPT_REASONS",
     "Checkpoint",
+    "CheckpointProgress",
     "CheckpointStatus",
     "CorruptJournalError",
     "DEFAULT_SEGMENT_SIZE",

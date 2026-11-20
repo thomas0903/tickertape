@@ -274,3 +274,15 @@ requests or branches. The one-time setup is in `docs/playbooks/release-checklist
   why). The read-only `_staging_capacity_for_testing`, and `_set_owner_pid_for_testing`, which can only make a handle
   refuse use, stay in every build. `cargo test --manifest-path bindings/python/Cargo.toml` runs the conversion unit
   tests and the source check that every method of a handle returns through `Owner::settle`.
+
+## Amendment: background checkpoints (2026-11-20)
+
+`Writer` gains `request_checkpoint()` (returns the frontier, an `int`) and `checkpoint_progress()` (a
+`CheckpointProgress` named tuple: `durable`, a `Checkpoint` or `None`, and `pending`, an `int` or `None`), and the
+keyword options `early_writeback=True` and `helper_cpus='process'` (`'inherited'` or a sequence of CPU numbers), as
+ADR 0038 defines them. `close()` now calls `tickertape::Writer::close` with the GIL released and raises what it
+reports (a background failure not raised yet, or `DurabilityLostError` for a poisoned writer); it used to drop the
+writer silently. `__exit__` raises that error only when the block did not raise, so it never hides the block's
+exception. The binding's build has no fault injection, so its tests cover the request, progress, coalescing, a
+durable-only reader and close waiting (`tests/test_api.py::test_background_checkpoint`); the failure path is tested in
+the core and through the C ABI.

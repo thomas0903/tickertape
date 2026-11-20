@@ -5,6 +5,28 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
+- Background checkpoints (ADR 0038) reach the C ABI and the bindings, and the iceoryx2 recorder uses them:
+  - Added (C ABI): `tickertape_writer_request_checkpoint`, `tickertape_writer_checkpoint_progress` with the
+    extensible struct `tickertape_checkpoint_progress` (minimum size 56), `tickertape_writer_options_set_early_writeback`,
+    `tickertape_writer_options_set_helper_cpus` and the enum `tickertape_helper_cpus`. A background failure is
+    returned once by the next request, progress, checkpoint or close, then `TICKERTAPE_E_DURABILITY_LOST`, as in Rust.
+  - Changed (C ABI): `tickertape_writer_close` behaves as `Writer::close`: it waits for background checkpoints in
+    flight and returns a failure no call has returned yet, or `TICKERTAPE_E_DURABILITY_LOST` if the writer is
+    poisoned (after a failed checkpoint or a failed clean-up of an aborted fill). It returned `TICKERTAPE_OK` in those
+    cases before. It still frees the handle.
+  - Added (C++): `Writer::request_checkpoint`, `Writer::checkpoint_progress`, `CheckpointProgress`,
+    `WriterOptions::early_writeback`, `WriterOptions::helper_cpus` and `HelperCpus`; `Writer::close` reports what the
+    C close reports.
+  - Added (Python): `Writer.request_checkpoint`, `Writer.checkpoint_progress`, `CheckpointProgress`, and the
+    `early_writeback` and `helper_cpus` options. Changed: `Writer.close()` raises a background failure not raised yet,
+    or `DurabilityLostError` for a poisoned writer (it closed silently before); leaving a `with` block raises it only
+    if the block did not raise.
+  - Added (Java): `Writer.requestCheckpoint`, `Writer.checkpointProgress`, `CheckpointProgress`, `HelperCpus`,
+    `WriterOptions.earlyWriteback` and `WriterOptions.helperCpus`. Changed: `Writer.close()` throws a background
+    failure, or `DurabilityLostException` for a poisoned writer.
+  - Changed (iceoryx2 recorder): the periodic checkpoints are background requests, so recording no longer pauses
+    while one syncs; the checkpoint at a stop stays blocking. A failed background checkpoint stops the recorder with
+    `Error::Journal`. `RecorderReport::checkpoints` counts the requests and the final checkpoint.
 - Fixed: a writer held one open file per segment after its checkpoint marker until the next checkpoint: one file and
   one segment mapping per roll, and one file per segment recovery scanned. A writer that checkpointed rarely or never
   failed with "Too many open files" after about as many rolls without a checkpoint as its descriptor limit, and

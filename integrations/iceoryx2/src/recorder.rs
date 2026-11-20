@@ -45,8 +45,9 @@
 //! equal to its buffer size; if a publisher created it first, the publisher's setting wins. When the buffer is
 //! full, a service with safe overflow (iceoryx2's default) replaces the oldest unread sample, which the recorder
 //! never sees; without safe overflow, the publisher's backpressure strategy decides (block, retry or discard).
-//! A checkpoint runs on the recording thread (tickertape has no background checkpoint yet), so everything that
-//! arrives while one syncs to disk must fit in the buffer. The descriptor records both the service's settings and
+//! The periodic checkpoints run in the background (`tickertape::Writer::request_checkpoint`, ADR 0038), so recording
+//! continues while one syncs to disk; only the final checkpoint at a stop blocks the recording thread, after the last
+//! message is taken. The descriptor records both the service's settings and
 //! the buffer size the recorder got. To detect loss, give each publisher a counter and configure a
 //! [`CounterField`]: each gap becomes a [`crate::layout::LossRecord`].
 //!
@@ -76,8 +77,12 @@
 //! history again; such repeats are recorded as messages again, and with a counter configured they are not reported
 //! as losses (counters are tracked per publisher within one run, and a new run starts afresh). Records are visible
 //! to readers as soon as they are written and durable after a checkpoint: every
-//! [`RecorderBuilder::checkpoint_interval`] (1 s by default) and once more on a clean stop (`SIGINT`, `SIGTERM`, a
-//! stop flag, or a limit).
+//! [`RecorderBuilder::checkpoint_interval`] (1 s by default) the recorder requests a background checkpoint of what it
+//! has recorded, which becomes durable when that checkpoint finishes (a request made while the previous one still
+//! runs waits for it, and is joined by later ones), and on a clean stop (`SIGINT`, `SIGTERM`, a stop flag, or a limit)
+//! it takes a blocking checkpoint, which first waits for the background one. A background checkpoint that fails is
+//! reported as [`Error::Journal`] by the next periodic request (or by the final checkpoint, whichever comes first),
+//! and stops the recorder as any journal error does.
 
 use std::collections::HashMap;
 use std::marker::PhantomData;
@@ -459,7 +464,8 @@ pub struct RecorderReport {
     pub next_seq: u64,
     /// Messages recorded, all services.
     pub messages: u64,
-    /// Checkpoints taken, including the final one.
+    /// Checkpoints: the background checkpoints requested every [`RecorderBuilder::checkpoint_interval`] (requests
+    /// made while an earlier one had not started share its checkpoint), plus the final blocking one.
     pub checkpoints: u64,
     /// Filler records written: each ends a segment early so that the descriptors start the next one (see
     /// [where descriptors lie](crate::layout#where-descriptors-lie)).
@@ -536,7 +542,8 @@ impl RecorderBuilder {
         self
     }
 
-    /// How often to checkpoint, making recorded messages durable. Default: 1 s.
+    /// How often to request a background checkpoint, making recorded messages durable without pausing recording.
+    /// Default: 1 s.
     pub fn checkpoint_interval(mut self, interval: Duration) -> Self {
         self.checkpoint_interval = interval;
         self
@@ -779,7 +786,8 @@ impl Recorder {
             &mut state,
             signalled.as_deref(),
         );
-        // Make everything durable on the way out, also after an error.
+        // Make everything durable on the way out, also after an error: a blocking checkpoint, which first waits for a
+        // background one in flight (and returns its failure if no request has).
         let checkpoint = journal.writer.checkpoint();
         drop(signals);
         let stop_reason = result?;
@@ -912,7 +920,9 @@ fn record(
                 budget,
             )?;
             if last_checkpoint.elapsed() >= config.checkpoint_interval {
-                journal.writer.checkpoint()?;
+                // In the background: recording goes on while it syncs. A failure of the previous one is returned
+                // here, once, and stops the recorder (the final checkpoint then reports `DurabilityLost`).
+                journal.writer.request_checkpoint()?;
                 state.checkpoints += 1;
                 last_checkpoint = Instant::now();
             }
