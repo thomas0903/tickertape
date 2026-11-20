@@ -265,10 +265,11 @@ The C ABI uses the crash contract's two levels ([`crash-contract.md`](crash-cont
 | Level | Reached when | Means |
 |---|---|---|
 | **Visible** | an append function returns `TICKERTAPE_OK` | Readers on this host can read the record, and it survives the writer process dying. It can still be lost in a power loss or OS crash, and the writer then reuses its sequence number |
-| **Durable** | a later `tickertape_writer_checkpoint` returns `TICKERTAPE_OK` | The record is on stable storage, under the crash contract's storage assumptions |
+| **Durable** | a later `tickertape_writer_checkpoint` returns `TICKERTAPE_OK`, or a checkpoint requested later with `tickertape_writer_request_checkpoint` has finished | The record is on stable storage, under the crash contract's storage assumptions |
 
-Closing a writer does not checkpoint. A failed checkpoint poisons the writer: later checkpoints return
-`TICKERTAPE_E_DURABILITY_LOST` while appends keep working; treat it as an incident. A failed clean-up of an aborted
+Closing a writer does not checkpoint (it waits for a background checkpoint in flight; see below). A failed checkpoint
+poisons the writer: later checkpoints return `TICKERTAPE_E_DURABILITY_LOST` while appends keep working; treat it as
+an incident. A failed clean-up of an aborted
 fill is the same kind of incident, and also stops appends (see
 [A failed clean-up](#a-failed-clean-up-after-an-aborted-fill)).
 
@@ -281,6 +282,38 @@ write caches); a block made durable is not damaged by an interrupted later write
 checkpoint, and no clean-up of an aborted fill, has failed earlier in the same boot (a failed sync can drop data that
 a later successful checkpoint, even by a new writer, does not detect). See
 [`crash-contract.md`](crash-contract.md) → Storage assumptions for durability, and → Errors are sticky.
+
+### Background checkpoints
+
+`tickertape_writer_checkpoint` runs its sync calls on the calling thread, so nothing can be appended until it
+returns. `tickertape_writer_request_checkpoint` (ADR 0038) hands the same work to a thread the library starts and
+owns (`tickertape-checkpoint`, started by the first request) and returns at once, with the sequence number the
+checkpoint covers up to; appends continue while it runs. It is `Writer::request_checkpoint` in Rust, with the same
+rules:
+
+- **Coverage.** Once it has finished, every record below the returned sequence number is durable, exactly as after
+  `tickertape_writer_checkpoint`. Records appended after the request belong to the next checkpoint.
+- **Progress.** `tickertape_writer_checkpoint_progress` fills a `tickertape_checkpoint_progress` (an extensible
+  struct, see [Versioning](#versioning)): the marker the writer last made durable (`has_durable`, `durable_*`) and the
+  frontier of a checkpoint still in flight (`has_pending`, `pending_next_seq`). It makes no system call. A
+  durable-only reader sees the new marker once the checkpoint has finished.
+- **Coalescing.** One checkpoint runs at a time. A request made while one runs waits for it; requests made meanwhile
+  join the waiting one, which then covers up to the newest of them (one marker for all).
+- **Waiting.** `tickertape_writer_checkpoint` waits for the background checkpoints in flight, then checkpoints on the
+  calling thread. `tickertape_writer_close` waits for them too (it does not cancel them) and reports how they ended.
+- **Failure.** A failed background checkpoint poisons the writer as a failed `tickertape_writer_checkpoint` does. Its
+  error (`TICKERTAPE_E_IO` or `TICKERTAPE_E_STORAGE_FULL`, with the OS error) is returned once, by the next call
+  among `tickertape_writer_request_checkpoint`, `tickertape_writer_checkpoint_progress`,
+  `tickertape_writer_checkpoint` and `tickertape_writer_close`; every later one returns
+  `TICKERTAPE_E_DURABILITY_LOST`. The `poisoned` field of `tickertape_writer_metrics` is 1 from the moment it
+  failed. A failure of early write-back (Linux, `tickertape_writer_options_set_early_writeback`) is
+  reported the same way.
+- **Close.** `tickertape_writer_close` returns `TICKERTAPE_OK` if every checkpoint of the writer succeeded, the
+  failure that no call has returned yet, or `TICKERTAPE_E_DURABILITY_LOST` if the writer was already poisoned (also
+  after a failed clean-up of an aborted fill). It frees the handle in each case.
+- **Retention** configured with `tickertape_writer_options_set_retention` runs on the checkpoint thread after each
+  successful background checkpoint; its errors reach `tickertape_writer_last_retention_error` at the writer's next
+  request, progress, checkpoint or close.
 
 ## Errors
 
@@ -374,8 +407,16 @@ also printed to standard error.
   `tickertape_list_segments`, `tickertape_read_checkpoint`, `tickertape_retention_apply`, and the version and error
   functions) can be called from any thread.
 - With the default options, a writer starts background helper threads (prefaulting, on Linux early write-back, and
-  on macOS preparing the next segment; on Linux each resets its CPU affinity to the process's CPUs when it starts,
-  ADR 0038); `tickertape_writer_options_set_prefault(options, 0)` gives a writer that starts no threads.
+  on macOS preparing the next segment), and the first `tickertape_writer_request_checkpoint` starts its checkpoint
+  thread. On Linux each sets its CPU affinity when it starts, as `tickertape_writer_options_set_helper_cpus` says (by
+  default the process's CPUs except isolated ones, ADR 0038). `tickertape_writer_options_set_prefault(options, 0)`
+  gives a writer that starts no threads other than the checkpoint thread.
+- These threads belong to the library: the program never calls into them, and every call on the writer handle is
+  still made by one thread at a time. While a background checkpoint runs, that thread may call any writer function:
+  appends continue, `tickertape_writer_request_checkpoint` queues or joins a request,
+  `tickertape_writer_checkpoint_progress`, `tickertape_writer_next_seq`, `tickertape_writer_get_metrics` and
+  `tickertape_writer_last_retention_error` return at once, and `tickertape_writer_checkpoint` and
+  `tickertape_writer_close` wait for it.
 - **`fork()`:** do not use or close handles created before a fork in the child. Two processes appending through one
   writer would corrupt the journal, and a writer's helper threads do not exist in the child. A child of a
   multithreaded process (as a process with a writer usually is, through its helper thread) may call only
@@ -468,9 +509,10 @@ int compatible = tickertape_abi_version() == TICKERTAPE_ABI_VERSION &&
   `tickertape_new_record`), `tickertape_segment_info` and `tickertape_checkpoint` describe format version 1 and are
   frozen; a new format version would come with new types. Reserved fields must be zero.
 - **Extensible structs** (`tickertape_verify_report`, `tickertape_retention_report`,
-  `tickertape_journal_status_report`, `tickertape_beacon_status`, `tickertape_writer_metrics` and
-  `tickertape_reader_metrics`) start with a `uint64_t struct_size`. Each has a minimum size, its size in the first
-  stable release (now 72, 32, 272, 120, 112 and 72 bytes; each struct's comment in the header names it), below which
+  `tickertape_journal_status_report`, `tickertape_beacon_status`, `tickertape_writer_metrics`,
+  `tickertape_reader_metrics` and `tickertape_checkpoint_progress`) start with a `uint64_t struct_size`. Each has a
+  minimum size, its size in the first stable release (now 72, 32, 272, 120, 112, 72 and 56 bytes; each struct's
+  comment in the header names it), below which
   the call returns `TICKERTAPE_E_INVALID_ARGUMENT`. The library writes `min(struct_size, its own size)` bytes and stores the
   number of bytes it filled back into `struct_size`. So a program built against an older, smaller struct works with
   a newer library, and a program built against a newer, larger struct can tell that an older library did not write

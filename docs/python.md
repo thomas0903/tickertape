@@ -27,7 +27,11 @@ The package's own guide, which is also its PyPI page, is [`bindings/python/READM
 The design decisions are in [ADR 0029](decisions/0029-python-bindings.md). In brief:
 
 - **Visible versus durable** is exactly as in the crash contract: visible when `append` returns, durable when a later
-  `checkpoint()` returns. Closing a writer does not checkpoint. `Reader(durable_only=True)` returns only checkpointed
+  `checkpoint()` returns, or once a later `request_checkpoint()` has finished (`checkpoint_progress()`; ADR 0038:
+  the checkpoint runs on a library thread while appends go on, and a failure is raised once by the next
+  `request_checkpoint()`, `checkpoint_progress()`, `checkpoint()` or `close()`, then `DurabilityLostError`). Closing
+  a writer does not checkpoint; `close()` waits for a background checkpoint in flight and raises a failure as Rust's
+  `Writer::close` does. `Writer(early_writeback=..., helper_cpus=...)` set the Linux-only writer options of ADR 0038. `Reader(durable_only=True)` returns only checkpointed
   records. After a failed checkpoint, records appended before it may not be durable even if a writer opened later in
   the same boot checkpoints successfully.
 - **Copies.** Payloads are `bytes` or buffers of unsigned bytes (uint8 only). Every record returned to Python owns its

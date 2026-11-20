@@ -399,6 +399,11 @@ impl<T> Handle<T> {
     pub(crate) fn is_busy(&self) -> bool {
         self.busy.get()
     }
+
+    /// Takes the state out of the handle, to close it (the caller has checked that no call is running).
+    pub(crate) fn into_inner(self) -> T {
+        self.inner.into_inner()
+    }
 }
 
 /// Returns the code of the last error on the calling thread, or `TICKERTAPE_OK` if no call on this thread has

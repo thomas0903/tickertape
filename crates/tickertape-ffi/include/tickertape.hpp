@@ -204,6 +204,13 @@ enum class RecoveryPolicy : std::int32_t {
     fail = TICKERTAPE_RECOVERY_FAIL,              // fail the open with Status::corrupt
 };
 
+// Where the writer's helper threads run (WriterOptions::helper_cpus; tickertape_helper_cpus). A list of CPUs is
+// given to the overload that takes one. Linux only; no effect on macOS.
+enum class HelperCpus : std::int32_t {
+    process = TICKERTAPE_HELPER_CPUS_PROCESS,      // the process's CPUs except isolated ones (the default)
+    inherited = TICKERTAPE_HELPER_CPUS_INHERITED,  // the mask of the thread that creates the helper
+};
+
 // The library's name for a status, such as "TICKERTAPE_E_IO" (static storage; never empty).
 inline std::string_view status_name(Status status) noexcept {
     return tickertape_status_name(static_cast<tickertape_status>(status));
@@ -862,8 +869,8 @@ private:
     std::optional<Error> error_;
 };
 
-// Writer options: segment size, recovery policy, wake-ups, background prefaulting, retention. Starts with the
-// defaults.
+// Writer options: segment size, recovery policy, wake-ups, background prefaulting, early write-back, helper thread
+// placement, retention. Starts with the defaults.
 class WriterOptions {
 public:
     WriterOptions() {
@@ -903,9 +910,31 @@ public:
         return usable() ? record(tickertape_writer_options_set_notify(h_, enabled ? 1 : 0)) : *this;
     }
     // Prefault pages (and on macOS prepare the next segment) in background threads (default on). Off gives a writer
-    // that starts no threads.
+    // that starts no threads except the checkpoint thread of Writer::request_checkpoint(), and turns off early
+    // write-back.
     WriterOptions &prefault(bool enabled) {
         return usable() ? record(tickertape_writer_options_set_prefault(h_, enabled ? 1 : 0)) : *this;
+    }
+    // Linux: start the kernel's write-back of the pages behind the writer as it goes, so that a checkpoint finds
+    // little left to write (default on; needs prefault). It makes nothing durable earlier. If it fails with an I/O
+    // error, no later checkpoint succeeds (the error is reported once, as a background checkpoint's is). No effect on
+    // macOS. See tickertape_writer_options_set_early_writeback.
+    WriterOptions &early_writeback(bool enabled) {
+        return usable() ? record(tickertape_writer_options_set_early_writeback(h_, enabled ? 1 : 0)) : *this;
+    }
+    // Where the writer's helper threads run (checkpoint, prefault, write-back and spare threads; Linux only).
+    WriterOptions &helper_cpus(HelperCpus placement) {
+        return usable() ? record(tickertape_writer_options_set_helper_cpus(h_, static_cast<std::int32_t>(placement),
+                                                                           nullptr, 0))
+                        : *this;
+    }
+    // On these CPUs (intersected with the process's cpuset; a list the kernel refuses falls back to
+    // HelperCpus::process). The list is copied.
+    WriterOptions &helper_cpus(const std::vector<std::uint32_t> &cpus) {
+        const std::uint32_t *first = cpus.empty() ? nullptr : &cpus.front();
+        return usable() ? record(tickertape_writer_options_set_helper_cpus(h_, TICKERTAPE_HELPER_CPUS_LIST, first,
+                                                                           cpus.size()))
+                        : *this;
     }
     // Apply `retention` (copied) after open and after every successful checkpoint. Its failures never fail the
     // writer; see Writer::last_retention_error(). Settings with an error (or moved from) record that error here.
@@ -1057,6 +1086,12 @@ struct Checkpoint {
     std::uint64_t next_seq = 0;  // every record below this was durable when the marker was written
     std::uint64_t segment_base_seq = 0;
     std::uint64_t offset = 0;
+};
+
+// Where a writer's checkpoints stand (Writer::checkpoint_progress).
+struct CheckpointProgress {
+    std::optional<Checkpoint> durable;     // the marker this writer last made durable, or read at open
+    std::optional<std::uint64_t> pending;  // the frontier of the newest requested background checkpoint not finished
 };
 
 // ---- Operational metrics (ADR 0032) ----
@@ -1550,7 +1585,12 @@ struct CloseOnExit {
 
 // The journal's single writer (one per journal, across processes). Move-only; the destructor closes the writer
 // without checkpointing: appended records stay visible and survive the process, but only checkpointed ones are
-// durable.
+// durable. The destructor waits for a background checkpoint in flight but cannot report how it ended; close() can.
+//
+// Threads: one thread at a time uses a Writer. A background checkpoint (request_checkpoint) runs on a thread the
+// library owns; while it runs, every member may be called: appends continue, checkpoint_progress, next_seq, metrics
+// and last_retention_error return at once, request_checkpoint queues or joins a request, and checkpoint and close
+// wait for it.
 class Writer {
 public:
     // An empty writer; calls on it fail with Status::invalid_argument.
@@ -1652,7 +1692,39 @@ public:
     // Makes every record appended so far **durable** (blocks until the syncs finish), then runs configured
     // retention. Errors: Status::io or storage_full if a sync fails; the writer is then poisoned and every later
     // checkpoint returns durability_lost (appends keep working). Treat a checkpoint error as an incident.
+    // Background checkpoints in flight are waited for first; a background failure no call has returned yet is
+    // returned here (and poisons the writer).
     result<void> checkpoint() { return detail::status_to_result(tickertape_writer_checkpoint(h_)); }
+
+    // Starts a checkpoint of every record appended so far on the library's checkpoint thread and returns without
+    // waiting for its syncs (ADR 0038). Returns the sequence number it covers up to: once it has finished
+    // (checkpoint_progress), every record below it is durable, exactly as after checkpoint(). Appends continue
+    // meanwhile. One runs at a time; a request made while one runs waits for it, and later requests join the waiting
+    // one. Errors: the error of an earlier background checkpoint (or early write-back) that failed, once, then
+    // Status::durability_lost; Status::io if the checkpoint thread cannot be started.
+    result<std::uint64_t> request_checkpoint() {
+        std::uint64_t seq = 0;
+        const tickertape_status status = tickertape_writer_request_checkpoint(h_, &seq);
+        if (status < 0) return Error::from_last_call(status);
+        return seq;
+    }
+
+    // Where this writer's checkpoints stand: the marker it last made durable, and the frontier of a background
+    // checkpoint still in flight. No system calls. Errors: a background failure the first time it is reported (the
+    // writer is then poisoned), Status::durability_lost whenever the writer is poisoned after that.
+    result<CheckpointProgress> checkpoint_progress() {
+        tickertape_checkpoint_progress raw{};
+        raw.struct_size = sizeof raw;
+        const tickertape_status status = tickertape_writer_checkpoint_progress(h_, &raw);
+        if (status < 0) return Error::from_last_call(status);
+        CheckpointProgress progress;
+        if (raw.has_durable != 0) {
+            progress.durable = Checkpoint{raw.durable_generation, raw.durable_next_seq, raw.durable_segment_base_seq,
+                                          raw.durable_offset};
+        }
+        if (raw.has_pending != 0) progress.pending = raw.pending_next_seq;
+        return progress;
+    }
 
     // The sequence number the next append will get.
     result<std::uint64_t> next_seq() const {
@@ -1691,8 +1763,10 @@ public:
         return std::nullopt;
     }
 
-    // Closes the writer now (without checkpointing) and reports the close's status; the writer is empty afterwards.
-    // From inside this writer's fill it fails with Status::busy and closes nothing.
+    // Closes the writer now (without checkpointing) and reports the close's status, as Rust's Writer::close: it waits
+    // for background checkpoints in flight, then returns the error of one that failed (or of early write-back) if no
+    // call returned it yet, or Status::durability_lost if the writer is poisoned. The writer is empty afterwards in
+    // every case except Status::busy: from inside this writer's fill it fails with that and closes nothing.
     result<void> close() {
         if (h_ == nullptr) return {};
         const tickertape_status status = tickertape_writer_close(h_);

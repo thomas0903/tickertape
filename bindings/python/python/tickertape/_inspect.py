@@ -111,6 +111,18 @@ class RecoveryReport(NamedTuple):
     """Every repair, in order. Empty for a cleanly closed journal."""
 
 
+class CheckpointProgress(NamedTuple):
+    """Where a writer's checkpoints stand (:meth:`Writer.checkpoint_progress`)."""
+
+    durable: Optional[Checkpoint]
+    """The checkpoint marker this writer last made durable, or read when it opened; ``None`` if the journal has none
+    yet. Every record with a sequence number below its ``next_seq`` is durable."""
+    pending: Optional[int]
+    """The sequence number the newest requested background checkpoint covers up to (what
+    :meth:`Writer.request_checkpoint` returned for it), while it has not finished; ``None`` when every requested
+    checkpoint has finished."""
+
+
 class RetentionReport(NamedTuple):
     """Cumulative retention removals since the writer opened (:attr:`Writer.retention_report`)."""
 

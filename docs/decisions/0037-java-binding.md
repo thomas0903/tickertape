@@ -518,3 +518,13 @@ rule does not force.
   needs a decision here before CI passes.
 - Not covered: publishing to Maven Central and the release pipeline for the natives JARs (they need the owner's
   namespace, a signing key and a token; ADR 0031), musl Linux, Windows, JDKs before 25.
+
+## Amendment: background checkpoints (2026-11-20)
+
+`Writer.requestCheckpoint()` (returns the frontier) and `Writer.checkpointProgress()` (a `CheckpointProgress`, a final
+class with `Optional<Checkpoint> durable()` and `OptionalLong pending()`, since its C struct is extensible) wrap the
+new C functions; `WriterOptions.earlyWriteback(boolean)` and `WriterOptions.helperCpus(HelperCpus)` (a value class
+with `process()`, `inherited()` and `list(int...)`) wrap the new options. `close()` throws what the C close now
+reports (a background failure, or `DurabilityLostException` for a poisoned writer), after the journal is released; the
+Cleaner path still reports nothing. Tests: `BackgroundCheckpointTest`; `HeaderTest` covers the new functions, the
+struct layout and the enum.

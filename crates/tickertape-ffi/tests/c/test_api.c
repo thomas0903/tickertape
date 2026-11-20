@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 /* The frozen struct layouts, checked at compile time (C99 has no _Static_assert). The Rust side asserts the same
@@ -70,6 +71,12 @@ STATIC_ASSERT(beacon_status_unread_age, offsetof(tickertape_beacon_status, unrea
 STATIC_ASSERT(writer_metrics_size, sizeof(tickertape_writer_metrics) == 112);
 STATIC_ASSERT(writer_metrics_has_checkpoint, offsetof(tickertape_writer_metrics, has_checkpoint) == 40);
 STATIC_ASSERT(writer_metrics_failures, offsetof(tickertape_writer_metrics, retention_failures) == 104);
+STATIC_ASSERT(progress_size, sizeof(tickertape_checkpoint_progress) == 56);
+STATIC_ASSERT(progress_has_durable, offsetof(tickertape_checkpoint_progress, has_durable) == 8);
+STATIC_ASSERT(progress_has_pending, offsetof(tickertape_checkpoint_progress, has_pending) == 12);
+STATIC_ASSERT(progress_durable, offsetof(tickertape_checkpoint_progress, durable_generation) == 16);
+STATIC_ASSERT(progress_durable_offset, offsetof(tickertape_checkpoint_progress, durable_offset) == 40);
+STATIC_ASSERT(progress_pending, offsetof(tickertape_checkpoint_progress, pending_next_seq) == 48);
 STATIC_ASSERT(reader_metrics_size, sizeof(tickertape_reader_metrics) == 72);
 STATIC_ASSERT(reader_metrics_seek_pending, offsetof(tickertape_reader_metrics, seek_pending) == 40);
 STATIC_ASSERT(reader_metrics_lag_unknown, offsetof(tickertape_reader_metrics, lag_unknown) == 52);
@@ -269,6 +276,16 @@ static void test_misuse(const char *scratch) {
     CHECK_STATUS(tickertape_writer_open(missing, NULL, NULL), TICKERTAPE_E_INVALID_ARGUMENT);
     CHECK_STATUS(tickertape_writer_append(NULL, 1, 0, 0, NULL, 0, &seq), TICKERTAPE_E_INVALID_ARGUMENT);
     CHECK_STATUS(tickertape_writer_checkpoint(NULL), TICKERTAPE_E_INVALID_ARGUMENT);
+    CHECK_STATUS(tickertape_writer_request_checkpoint(NULL, &seq), TICKERTAPE_E_INVALID_ARGUMENT);
+    {
+        tickertape_checkpoint_progress progress;
+        memset(&progress, 0, sizeof progress);
+        progress.struct_size = sizeof progress;
+        CHECK_STATUS(tickertape_writer_checkpoint_progress(NULL, &progress), TICKERTAPE_E_INVALID_ARGUMENT);
+        progress.struct_size = 8;
+        CHECK_STATUS(tickertape_writer_checkpoint_progress(NULL, &progress), TICKERTAPE_E_INVALID_ARGUMENT);
+        CHECK(strstr(tickertape_last_error_message(), "struct_size") != NULL);
+    }
     CHECK_STATUS(tickertape_writer_close(NULL), TICKERTAPE_OK);
 
     CHECK_STATUS(tickertape_reader_open(missing, NULL, &reader), TICKERTAPE_E_IO);
@@ -303,7 +320,16 @@ static void test_misuse(const char *scratch) {
                  TICKERTAPE_E_INVALID_ARGUMENT);
     {
         tickertape_writer_options *options = tickertape_writer_options_new();
+        const uint32_t cpus[2] = {0, 1};
         CHECK_STATUS(tickertape_writer_options_set_recovery_policy(options, 42), TICKERTAPE_E_INVALID_ARGUMENT);
+        CHECK_STATUS(tickertape_writer_options_set_early_writeback(options, 0), TICKERTAPE_OK);
+        CHECK_STATUS(tickertape_writer_options_set_helper_cpus(options, TICKERTAPE_HELPER_CPUS_LIST, cpus, 2),
+                     TICKERTAPE_OK);
+        CHECK_STATUS(tickertape_writer_options_set_helper_cpus(options, TICKERTAPE_HELPER_CPUS_INHERITED, cpus, 2),
+                     TICKERTAPE_E_INVALID_ARGUMENT);
+        CHECK_STATUS(tickertape_writer_options_set_helper_cpus(options, 9, NULL, 0), TICKERTAPE_E_INVALID_ARGUMENT);
+        CHECK_STATUS(tickertape_writer_options_set_helper_cpus(options, TICKERTAPE_HELPER_CPUS_PROCESS, NULL, 0),
+                     TICKERTAPE_OK);
         CHECK_STATUS(tickertape_writer_options_set_segment_size(options, 1000), TICKERTAPE_OK);
         CHECK_STATUS(tickertape_writer_open(missing, options, &writer), TICKERTAPE_E_INVALID_CONFIG);
         tickertape_writer_options_free(options);
@@ -434,6 +460,37 @@ static void test_roundtrip(const char *scratch) {
         }
         CHECK_STATUS(tickertape_reader_next(reader, 1000000, &record), TICKERTAPE_NONE);
         REQUIRE_OK(tickertape_reader_close(reader));
+    }
+
+    /* A background checkpoint: the request returns its frontier at once, appends continue, the progress reports the
+     * pending frontier and then the marker, and a durable-only reader sees the marker move. */
+    {
+        tickertape_checkpoint_progress progress;
+        uint64_t frontier = 0;
+        int polls = 0;
+        const struct timespec millisecond = {0, 1000000};
+        reader = open_reader(dir, 1, 0);
+        REQUIRE_OK(tickertape_reader_seek(reader, 406));
+        REQUIRE_OK(tickertape_writer_request_checkpoint(writer, &frontier));
+        CHECK(frontier == 407);
+        append_pattern(writer, 407);
+        for (;;) {
+            memset(&progress, 0xA5, sizeof progress);
+            progress.struct_size = sizeof progress;
+            REQUIRE_OK(tickertape_writer_checkpoint_progress(writer, &progress));
+            CHECK(progress.struct_size == sizeof progress);
+            if (!progress.has_pending || ++polls > 30000) break;
+            CHECK(progress.pending_next_seq == 407);
+            nanosleep(&millisecond, NULL);
+        }
+        CHECK(progress.has_pending == 0 && progress.pending_next_seq == 0);
+        CHECK(progress.has_durable == 1 && progress.durable_next_seq == 407 && progress.durable_generation == 2);
+        CHECK_STATUS(tickertape_reader_next(reader, 0, &record), TICKERTAPE_OK);
+        CHECK(record.seq == 406);
+        CHECK_STATUS(tickertape_reader_next(reader, 0, &record), TICKERTAPE_NONE);
+        REQUIRE_OK(tickertape_reader_close(reader));
+        /* Close waits for a checkpoint in flight. */
+        REQUIRE_OK(tickertape_writer_request_checkpoint(writer, NULL));
     }
     REQUIRE_OK(tickertape_writer_close(writer));
 }

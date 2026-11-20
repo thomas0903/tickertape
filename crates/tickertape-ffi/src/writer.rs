@@ -2,7 +2,7 @@
 
 use std::ffi::{c_char, c_void};
 
-use tickertape::{Error, NewRecord, Writer, WriterConfig};
+use tickertape::{CheckpointProgress, Error, NewRecord, Writer, WriterConfig};
 
 use crate::args::{self, Region};
 use crate::options::tickertape_writer_options;
@@ -12,9 +12,83 @@ use crate::status::{FfiError, Handle, guard, tickertape_status, tickertape_statu
 ///
 /// Only one writer can have a journal open at a time (across processes). A writer handle may move to another thread
 /// between calls but must never be used by two threads at once.
+///
+/// Background checkpoints (`tickertape_writer_request_checkpoint`) run on a thread the library starts and owns
+/// (`tickertape-checkpoint`); the program never calls into it, and the rule above still applies to every call on the
+/// handle. While one runs, every writer function may be called (from the one thread using the handle): appends
+/// continue at once; `tickertape_writer_request_checkpoint` queues another request or joins the queued one;
+/// `tickertape_writer_checkpoint_progress`, `tickertape_writer_next_seq`, `tickertape_writer_get_metrics` and
+/// `tickertape_writer_last_retention_error` return without waiting; `tickertape_writer_checkpoint` and
+/// `tickertape_writer_close` wait for it to finish.
 #[allow(non_camel_case_types)]
 #[derive(Debug)]
 pub struct tickertape_writer(Handle<Writer>);
+
+/// Where a writer's checkpoints stand, an extensible struct filled by `tickertape_writer_checkpoint_progress`.
+///
+/// Set `struct_size` to `sizeof(tickertape_checkpoint_progress)` before the call. The library rejects a `struct_size`
+/// below 56 with `TICKERTAPE_E_INVALID_ARGUMENT`, writes `min(struct_size, the library's own size)` bytes, and stores
+/// the number of bytes it filled back into `struct_size`. Later versions only append fields.
+#[allow(non_camel_case_types)]
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct tickertape_checkpoint_progress {
+    /// In: the size of the caller's struct. Out: the number of bytes the library filled.
+    pub struct_size: u64,
+    /// 1 if the `durable_*` fields hold a checkpoint marker; 0 if the journal has none yet (they are then 0).
+    pub has_durable: u32,
+    /// 1 while a requested background checkpoint has not finished (`pending_next_seq` is then its frontier); 0 when
+    /// every requested checkpoint has finished (`pending_next_seq` is then 0).
+    pub has_pending: u32,
+    /// The generation of the checkpoint marker as this writer last made it durable, or read it at open.
+    pub durable_generation: u64,
+    /// That marker's `next_seq`: every record with a smaller sequence number is durable.
+    pub durable_next_seq: u64,
+    /// The segment of that marker's position.
+    pub durable_segment_base_seq: u64,
+    /// The offset of that marker's position.
+    pub durable_offset: u64,
+    /// The sequence number the newest requested background checkpoint covers up to (the value
+    /// `tickertape_writer_request_checkpoint` returned for it), while it has not finished.
+    pub pending_next_seq: u64,
+}
+
+/// The smallest accepted `struct_size` of `tickertape_checkpoint_progress`: its size when it was added. (A function,
+/// not a constant, so that cbindgen skips it.)
+const fn checkpoint_progress_min_size() -> usize {
+    56
+}
+
+// The layout (ADR 0028 → Versioning); tests/c/test_api.c asserts the same values with offsetof and sizeof. The
+// struct has no padding, which `args::write_struct` relies on.
+#[allow(dead_code)]
+fn checkpoint_progress_layout_is_fixed() {
+    // Inside a function so that cbindgen does not parse it; the constant is evaluated all the same.
+    const _: () = {
+        use std::mem::{align_of, offset_of, size_of};
+        type P = tickertape_checkpoint_progress;
+        assert!(size_of::<P>() == checkpoint_progress_min_size() && align_of::<P>() == 8);
+        assert!(offset_of!(P, has_durable) == 8 && offset_of!(P, has_pending) == 12);
+        assert!(offset_of!(P, durable_generation) == 16 && offset_of!(P, durable_offset) == 40);
+        assert!(offset_of!(P, pending_next_seq) == 48);
+    };
+}
+
+impl From<CheckpointProgress> for tickertape_checkpoint_progress {
+    fn from(progress: CheckpointProgress) -> Self {
+        let durable = progress.durable;
+        tickertape_checkpoint_progress {
+            struct_size: 0,
+            has_durable: u32::from(durable.is_some()),
+            has_pending: u32::from(progress.pending.is_some()),
+            durable_generation: durable.map_or(0, |slot| slot.generation),
+            durable_next_seq: durable.map_or(0, |slot| slot.next_seq),
+            durable_segment_base_seq: durable.map_or(0, |slot| slot.segment_base_seq),
+            durable_offset: durable.map_or(0, |slot| slot.offset),
+            pending_next_seq: progress.pending.unwrap_or(0),
+        }
+    }
+}
 
 /// One record for `tickertape_writer_append_batch`. The layout is frozen for format version 1.
 #[allow(non_camel_case_types)]
@@ -141,11 +215,22 @@ pub unsafe extern "C" fn tickertape_writer_open(
     })
 }
 
-/// Closes a writer and frees the handle. NULL is ignored.
+/// Closes a writer and frees the handle, as `Writer::close` does in Rust. NULL is ignored.
 ///
 /// Closing does **not** checkpoint: every appended record stays visible to readers and survives the process exiting,
-/// but only records covered by a successful `tickertape_writer_checkpoint` are durable. Returns `TICKERTAPE_E_BUSY`
-/// (and closes nothing; the handle stays valid) if called from a fill callback of the same writer.
+/// but only records covered by a successful checkpoint are durable. If background checkpoints
+/// (`tickertape_writer_request_checkpoint`) are queued or running, it first waits for them to finish (it does not
+/// cancel them), then reports how this writer's checkpoints ended:
+///
+/// - `TICKERTAPE_OK` if none failed;
+/// - the error of a background checkpoint, or of early write-back (Linux, `tickertape_writer_options_set_early_writeback`),
+///   that failed and that no earlier call returned: `TICKERTAPE_E_IO` or `TICKERTAPE_E_STORAGE_FULL`, with the OS
+///   error. The write-back helper is stopped first, so an error from a call it was making is included;
+/// - `TICKERTAPE_E_DURABILITY_LOST` if the writer was already poisoned: a checkpoint failed and an earlier call
+///   returned its error, or the clean-up of an aborted fill failed (the message says which).
+///
+/// The handle is freed in all three cases. Returns `TICKERTAPE_E_BUSY` (and closes nothing; the handle stays valid)
+/// if called from a fill callback of the same writer.
 ///
 /// # Safety
 ///
@@ -169,8 +254,19 @@ pub unsafe extern "C" fn tickertape_writer_close(
         }
         // SAFETY: a live handle from `Box::into_raw` in `tickertape_writer_open`, not inside a call (checked above);
         // the caller gives up the pointer.
-        drop(unsafe { Box::from_raw(writer) });
-        Ok(S::TICKERTAPE_OK)
+        let writer = unsafe { Box::from_raw(writer) }.0.into_inner();
+        let abandoned = writer.abandoned_write_error().map(ToString::to_string);
+        match writer.close() {
+            Ok(()) => Ok(S::TICKERTAPE_OK),
+            Err(Error::DurabilityLost) if abandoned.is_some() => {
+                Err(FfiError::from(&Error::DurabilityLost).with_message(format!(
+                    "durability can no longer be guaranteed for this writer: the clean-up after an aborted fill \
+                     callback failed ({}); the writer is closed",
+                    abandoned.unwrap_or_default()
+                )))
+            }
+            Err(e) => Err(FfiError::from(e)),
+        }
     })
 }
 
@@ -478,13 +574,17 @@ pub unsafe extern "C" fn tickertape_writer_append_batch(
 
 /// Makes every record appended so far **durable**, using the platform's sync calls (`docs/crash-contract.md` → What
 /// `checkpoint()` does), and blocks until they finish. Configured retention then runs; its failures are reported by
-/// `tickertape_writer_last_retention_error` and do not change this result.
+/// `tickertape_writer_last_retention_error` and do not change this result. If background checkpoints
+/// (`tickertape_writer_request_checkpoint`) are queued or running, it first waits for them, then checkpoints on the
+/// calling thread as without them.
 ///
 /// Errors: `TICKERTAPE_E_IO` or `TICKERTAPE_E_STORAGE_FULL` if a sync fails. The writer is then poisoned: every later
 /// checkpoint returns `TICKERTAPE_E_DURABILITY_LOST`, because a failed sync can drop data that a retry would not
 /// rewrite. Appends keep working. Treat a checkpoint error as an incident: records written before it may not be
-/// durable even if a later writer's checkpoint succeeds. `TICKERTAPE_E_DURABILITY_LOST` is also returned after a
-/// failed clean-up of an aborted fill (the message says which happened).
+/// durable even if a later writer's checkpoint succeeds. If a background checkpoint or early write-back failed and no
+/// call has returned its error yet, this returns that error (and the writer is poisoned).
+/// `TICKERTAPE_E_DURABILITY_LOST` is also returned after a failed clean-up of an aborted fill (the message says which
+/// happened).
 ///
 /// # Safety
 ///
@@ -497,6 +597,83 @@ pub unsafe extern "C" fn tickertape_writer_checkpoint(
         // SAFETY: forwarded caller contract.
         unsafe { writer_handle(writer) }?
             .with(|w| w.checkpoint().map_err(|e| writer_error(w, e)))?;
+        Ok(S::TICKERTAPE_OK)
+    })
+}
+
+/// Starts a checkpoint of every record appended so far on the writer's checkpoint thread, and returns without waiting
+/// for its sync calls (ADR 0038). Stores in `*next_seq_out` (which may be NULL) the sequence number it covers up to:
+/// once it has finished, every record with a smaller sequence number is durable, exactly as after
+/// `tickertape_writer_checkpoint`. Records appended after this call are not covered. Appends continue while it runs.
+///
+/// Observe completion with `tickertape_writer_checkpoint_progress`; `tickertape_writer_checkpoint` waits for it before
+/// checkpointing itself, and `tickertape_writer_close` waits for it and reports how it ended. The first call starts
+/// the thread that runs them (`tickertape-checkpoint`, placed as `tickertape_writer_options_set_helper_cpus` says). One
+/// checkpoint runs at a time: a request made while one runs waits for it, and requests made meanwhile join the waiting
+/// one, which then covers up to the newest of them (one marker for all of them). Configured retention runs on the
+/// checkpoint thread after each successful background checkpoint; what it did reaches
+/// `tickertape_writer_last_retention_error` at the writer's next call to this function,
+/// `tickertape_writer_checkpoint_progress`, `tickertape_writer_checkpoint` or `tickertape_writer_close`
+/// (`tickertape_writer_get_metrics` counts its failures at once).
+///
+/// Cost on the calling thread: one lock and a few small moves; no system call (except for starting the thread at the
+/// first call). See `tickertape_writer` for which calls may be made while a checkpoint runs.
+///
+/// Errors (nothing is requested): the error of an earlier background checkpoint that failed, or of early write-back
+/// (Linux), if no call has returned it yet: `TICKERTAPE_E_IO` or `TICKERTAPE_E_STORAGE_FULL`, returned once, after
+/// which the writer is poisoned as after a failed `tickertape_writer_checkpoint`; `TICKERTAPE_E_DURABILITY_LOST` if
+/// the writer is poisoned; `TICKERTAPE_E_IO` if the checkpoint thread cannot be started (the writer is not poisoned);
+/// `TICKERTAPE_E_SEQUENCE_EXHAUSTED` if checkpoint generations are exhausted.
+///
+/// # Safety
+///
+/// `writer` must be NULL or a live writer handle. `next_seq_out` must be NULL or valid for writing a `uint64_t`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tickertape_writer_request_checkpoint(
+    writer: *mut tickertape_writer,
+    next_seq_out: *mut u64,
+) -> tickertape_status {
+    guard(|| {
+        // SAFETY: forwarded caller contract.
+        let seq = unsafe { writer_handle(writer) }?
+            .with(|w| w.request_checkpoint().map_err(|e| writer_error(w, e)))?;
+        // SAFETY: forwarded caller contract.
+        unsafe { args::write_optional(next_seq_out, seq) };
+        Ok(S::TICKERTAPE_OK)
+    })
+}
+
+/// Reports where this writer's checkpoints stand in `*progress`: the marker it last made durable (or read at open),
+/// and the frontier of a background checkpoint still in flight. Collects what the checkpoint thread has finished.
+///
+/// Cost: one atomic load when the checkpoint thread has finished nothing since the last call; otherwise one lock. No
+/// system calls.
+///
+/// Errors: `TICKERTAPE_E_INVALID_ARGUMENT` if `progress` is NULL or `progress->struct_size` is below the minimum (see
+/// `tickertape_checkpoint_progress`); the error of a background checkpoint or of early write-back (Linux) that failed,
+/// the first time it is reported (`TICKERTAPE_E_IO` or `TICKERTAPE_E_STORAGE_FULL`; the writer is then poisoned);
+/// `TICKERTAPE_E_DURABILITY_LOST` whenever the writer is poisoned after that, also after a failed
+/// `tickertape_writer_checkpoint` or a failed clean-up of an aborted fill. A poisoned writer reports no progress
+/// (nothing it does is durable any more): on an error `*progress` is not written.
+///
+/// # Safety
+///
+/// `writer` must be NULL or a live writer handle. `progress` must be NULL or point to a caller-owned struct whose
+/// first `progress->struct_size` bytes are writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tickertape_writer_checkpoint_progress(
+    writer: *mut tickertape_writer,
+    progress: *mut tickertape_checkpoint_progress,
+) -> tickertape_status {
+    guard(|| {
+        // SAFETY: forwarded caller contract.
+        let filled =
+            unsafe { args::struct_size(progress, checkpoint_progress_min_size(), "progress") }?;
+        // SAFETY: forwarded caller contract.
+        let value = unsafe { writer_handle(writer) }?
+            .with(|w| w.checkpoint_progress().map_err(|e| writer_error(w, e)))?;
+        // SAFETY: `filled` comes from `struct_size` for this type; the caller guarantees the bytes are writable.
+        unsafe { args::write_struct(progress, value.into(), filled) };
         Ok(S::TICKERTAPE_OK)
     })
 }

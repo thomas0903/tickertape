@@ -166,6 +166,23 @@ pub fn recovery_report<'py>(
     ))
 }
 
+/// `CheckpointProgress(durable, pending)`, with `durable` a `Checkpoint` or `None`.
+pub fn checkpoint_progress<'py>(
+    py: Python<'py>,
+    progress: &tickertape::CheckpointProgress,
+) -> PyResult<Bound<'py, PyAny>> {
+    let durable = match progress.durable {
+        Some(slot) => Some(class(py, "Checkpoint")?.call1((
+            slot.generation,
+            slot.next_seq,
+            slot.segment_base_seq,
+            slot.offset,
+        ))?),
+        None => None,
+    };
+    class(py, "CheckpointProgress")?.call1((durable, progress.pending))
+}
+
 /// `RetentionReport(removed_segments, removed_bytes, already_removed_segments)`.
 pub fn retention_report<'py>(
     py: Python<'py>,

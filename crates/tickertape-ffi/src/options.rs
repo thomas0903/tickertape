@@ -4,7 +4,7 @@ use std::ffi::c_char;
 use std::time::Duration;
 
 use tickertape::retention::{Action, Policy};
-use tickertape::{Backoff, ReaderConfig, RecoveryPolicy, WriterConfig};
+use tickertape::{Backoff, HelperCpus, ReaderConfig, RecoveryPolicy, WriterConfig};
 
 use crate::args;
 use crate::status::{FfiError, guard, tickertape_status, tickertape_status_code as S};
@@ -25,6 +25,27 @@ pub enum tickertape_recovery_policy {
     /// in that segment, are left untouched and no file is moved. The open is not read-only: C11 lists what it may
     /// still change.
     TICKERTAPE_RECOVERY_FAIL = 1,
+}
+
+/// Where the writer's helper threads run, for `tickertape_writer_options_set_helper_cpus` (`HelperCpus` in Rust,
+/// ADR 0038 → Helper threads and CPU affinity). The helper threads are the checkpoint thread
+/// (`tickertape-checkpoint`), the prefault and write-back helpers (`tickertape-prefault`, `tickertape-writeback`) and
+/// the spare-segment thread (`tickertape-spare`). **Linux:** each helper sets its affinity when it starts, and the
+/// kernel intersects the mask with the CPUs the process's cpuset allows. **macOS:** no effect.
+#[allow(non_camel_case_types)]
+#[repr(i32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum tickertape_helper_cpus {
+    /// Every CPU the process's cpuset allows, except the CPUs the kernel lists as isolated
+    /// (`/sys/devices/system/cpu/isolated`), unless that would leave none. Not limited by a mask set with `taskset` or
+    /// `sched_setaffinity` on the process or the calling thread (such a mask belongs to each thread). The default.
+    TICKERTAPE_HELPER_CPUS_PROCESS = 0,
+    /// Keep the mask inherited from the thread that creates the helper (the writer's thread).
+    TICKERTAPE_HELPER_CPUS_INHERITED = 1,
+    /// The CPUs listed (numbers as the kernel counts them, below 8,192), intersected with the process's cpuset. If the
+    /// kernel refuses the mask (no listed CPU is allowed, or the list is empty), the helper uses
+    /// `TICKERTAPE_HELPER_CPUS_PROCESS` instead.
+    TICKERTAPE_HELPER_CPUS_LIST = 2,
 }
 
 /// Special `timeout_ns` values for the reader functions. Any positive value waits up to that many nanoseconds.
@@ -113,7 +134,7 @@ fn new<T: Default>() -> *mut T {
 }
 
 /// Creates writer options with the defaults: 128 MiB segments, `TICKERTAPE_RECOVERY_QUARANTINE`, notify on,
-/// prefault on, no retention. Never returns NULL: if memory cannot be allocated, the process aborts.
+/// prefault on, early write-back on, helper threads on `TICKERTAPE_HELPER_CPUS_PROCESS`, no retention. Never returns NULL: if memory cannot be allocated, the process aborts.
 #[unsafe(no_mangle)]
 pub extern "C" fn tickertape_writer_options_new() -> *mut tickertape_writer_options {
     new()
@@ -200,7 +221,9 @@ pub unsafe extern "C" fn tickertape_writer_options_set_notify(
 }
 
 /// Sets whether the writer does segment work (prefaulting pages, and on macOS preparing the next segment) in
-/// background threads it starts. Zero gives a writer that starts no threads. Default: on.
+/// background threads it starts. Zero gives a writer that starts no threads, except the checkpoint thread that
+/// `tickertape_writer_request_checkpoint` starts; it also turns off early write-back
+/// (`tickertape_writer_options_set_early_writeback`). Default: on.
 ///
 /// # Safety
 ///
@@ -214,6 +237,84 @@ pub unsafe extern "C" fn tickertape_writer_options_set_prefault(
         // SAFETY: forwarded caller contract.
         let o = unsafe { object(options, "options") }?;
         o.config.prefault = enabled != 0;
+        Ok(S::TICKERTAPE_OK)
+    })
+}
+
+/// Sets whether the writer starts the kernel's write-back of the pages it has finished with as it goes, so that a
+/// checkpoint finds little left to write (ADR 0038 → Early write-back). Non-zero enables it. Default: on.
+///
+/// **Linux:** applies only with prefault on (`tickertape_writer_options_set_prefault`), the switch for the writer's
+/// helper threads. A helper thread (`tickertape-writeback`) calls `sync_file_range(SYNC_FILE_RANGE_WRITE)` over the
+/// whole pages behind the write position each time it has moved 1 MiB, and over the rest of a segment when the writer
+/// rolls past it. That call only starts writing: what is durable when is unchanged, and only a checkpoint promises it
+/// (`docs/crash-contract.md`). If the call fails with an I/O error, no later checkpoint of this writer succeeds: the
+/// error is returned once, by the next checkpoint, `tickertape_writer_request_checkpoint`,
+/// `tickertape_writer_checkpoint_progress` or `tickertape_writer_close`, and `TICKERTAPE_E_DURABILITY_LOST` after
+/// that. If the filesystem does not support the call, the helper stops. **macOS:** no effect.
+///
+/// # Safety
+///
+/// `options` must be NULL or live writer options, not used by another thread during the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tickertape_writer_options_set_early_writeback(
+    options: *mut tickertape_writer_options,
+    enabled: i32,
+) -> tickertape_status {
+    guard(|| {
+        // SAFETY: forwarded caller contract.
+        let o = unsafe { object(options, "options") }?;
+        o.config.early_writeback = enabled != 0;
+        Ok(S::TICKERTAPE_OK)
+    })
+}
+
+/// Sets where the writer's helper threads run: `placement` is a `tickertape_helper_cpus` value. With
+/// `TICKERTAPE_HELPER_CPUS_LIST`, `cpus` points to `cpu_count` CPU numbers (copied; `cpus` may be NULL when
+/// `cpu_count` is 0); with the other values, `cpu_count` must be 0. Default: `TICKERTAPE_HELPER_CPUS_PROCESS`.
+///
+/// Errors: `TICKERTAPE_E_INVALID_ARGUMENT` for an unknown `placement`, CPUs given with a placement other than
+/// `TICKERTAPE_HELPER_CPUS_LIST`, `cpus` NULL with `cpu_count` > 0, or a `cpu_count` too large. The options are then
+/// unchanged.
+///
+/// # Safety
+///
+/// `options` must be NULL or live writer options, not used by another thread during the call. `cpus` must be NULL or
+/// point to `cpu_count` readable `uint32_t` values that stay unmodified until the call returns.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tickertape_writer_options_set_helper_cpus(
+    options: *mut tickertape_writer_options,
+    placement: i32,
+    cpus: *const u32,
+    cpu_count: usize,
+) -> tickertape_status {
+    guard(|| {
+        // SAFETY: forwarded caller contract.
+        let o = unsafe { object(options, "options") }?;
+        let list = tickertape_helper_cpus::TICKERTAPE_HELPER_CPUS_LIST as i32;
+        if placement != list && cpu_count != 0 {
+            return Err(FfiError::invalid(
+                "cpus are given only with TICKERTAPE_HELPER_CPUS_LIST; cpu_count must be 0",
+            ));
+        }
+        o.config.helper_cpus = match placement {
+            p if p == tickertape_helper_cpus::TICKERTAPE_HELPER_CPUS_PROCESS as i32 => {
+                HelperCpus::Process
+            }
+            p if p == tickertape_helper_cpus::TICKERTAPE_HELPER_CPUS_INHERITED as i32 => {
+                HelperCpus::Inherited
+            }
+            p if p == list => {
+                // SAFETY: forwarded caller contract.
+                let cpus = unsafe { args::slice(cpus, cpu_count, "cpus", "cpu_count") }?;
+                HelperCpus::List(cpus.iter().map(|&cpu| cpu as usize).collect())
+            }
+            _ => {
+                return Err(FfiError::invalid(format!(
+                    "unknown helper CPU placement {placement}"
+                )));
+            }
+        };
         Ok(S::TICKERTAPE_OK)
     })
 }

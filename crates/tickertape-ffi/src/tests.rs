@@ -550,6 +550,64 @@ fn pure_options_validate_their_values() {
         assert!((*w).config.prefault);
         assert_eq!(tickertape_writer_options_set_segment_size(w, 65_536), OK);
         assert_eq!((*w).config.segment_size, 65_536);
+        assert!((*w).config.early_writeback);
+        assert_eq!(tickertape_writer_options_set_early_writeback(w, 0), OK);
+        assert!(!(*w).config.early_writeback);
+        assert_eq!(tickertape_writer_options_set_early_writeback(w, 3), OK);
+        assert!((*w).config.early_writeback);
+        assert_eq!((*w).config.helper_cpus, tickertape::HelperCpus::Process);
+        let process = tickertape_helper_cpus::TICKERTAPE_HELPER_CPUS_PROCESS as i32;
+        let inherited = tickertape_helper_cpus::TICKERTAPE_HELPER_CPUS_INHERITED as i32;
+        let list = tickertape_helper_cpus::TICKERTAPE_HELPER_CPUS_LIST as i32;
+        assert_eq!(
+            tickertape_writer_options_set_helper_cpus(w, inherited, null(), 0),
+            OK
+        );
+        assert_eq!((*w).config.helper_cpus, tickertape::HelperCpus::Inherited);
+        let cpus = [3u32, 0, 7];
+        assert_eq!(
+            tickertape_writer_options_set_helper_cpus(w, list, cpus.as_ptr(), cpus.len()),
+            OK
+        );
+        assert_eq!(
+            (*w).config.helper_cpus,
+            tickertape::HelperCpus::List(vec![3, 0, 7])
+        );
+        // Refused values leave the options unchanged.
+        assert_eq!(
+            tickertape_writer_options_set_helper_cpus(w, process, cpus.as_ptr(), 1),
+            INVALID
+        );
+        assert!(last_message().contains("cpu_count"), "{}", last_message());
+        assert_eq!(
+            tickertape_writer_options_set_helper_cpus(w, list, null(), 2),
+            INVALID
+        );
+        assert_eq!(
+            tickertape_writer_options_set_helper_cpus(w, 3, null(), 0),
+            INVALID
+        );
+        assert_eq!(
+            tickertape_writer_options_set_helper_cpus(null_mut(), process, null(), 0),
+            INVALID
+        );
+        assert_eq!(
+            (*w).config.helper_cpus,
+            tickertape::HelperCpus::List(vec![3, 0, 7])
+        );
+        assert_eq!(
+            tickertape_writer_options_set_helper_cpus(w, list, null(), 0),
+            OK
+        );
+        assert_eq!(
+            (*w).config.helper_cpus,
+            tickertape::HelperCpus::List(vec![])
+        );
+        assert_eq!(
+            tickertape_writer_options_set_helper_cpus(w, process, null(), 0),
+            OK
+        );
+        assert_eq!((*w).config.helper_cpus, tickertape::HelperCpus::Process);
 
         let r = tickertape_retention_new();
         assert_eq!(tickertape_retention_set_max_segments(r, 3), OK);
@@ -2315,7 +2373,16 @@ fn failed_cleanup_is_reported(errno: i32) {
         message.contains("aborted fill") && !message.contains("earlier checkpoint"),
         "{message}"
     );
-    assert_eq!(unsafe { tickertape_writer_close(writer) }, OK);
+    // Closing reports it too (as `Writer::close` does), and frees the handle.
+    assert_eq!(
+        unsafe { tickertape_writer_close(writer) },
+        code(S::TICKERTAPE_E_DURABILITY_LOST)
+    );
+    assert!(
+        last_message().contains("aborted fill"),
+        "{}",
+        last_message()
+    );
     // Reopening recovers.
     let writer = j.writer(65_536);
     assert_eq!(append_raw(writer, b"second"), 1);
@@ -2896,4 +2963,237 @@ fn status_errors_and_a_journal_without_a_writer() {
     assert_eq!(r.exposure_estimated_age_ns, TICKERTAPE_UNKNOWN);
     assert_eq!(r.writer_pid, u64::from(std::process::id()));
     unsafe { tickertape_journal_status_free(status) };
+}
+
+// ---- Background checkpoints (ADR 0038) ----
+
+/// The background hold and failure points are process-wide: the tests that use them, and every test that requests a
+/// background checkpoint, run one at a time.
+#[cfg(feature = "fault-injection")]
+static BACKGROUND: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(feature = "fault-injection")]
+fn background_serial() -> std::sync::MutexGuard<'static, ()> {
+    let guard = BACKGROUND.lock().unwrap_or_else(|e| e.into_inner());
+    tickertape::fault::clear();
+    guard
+}
+
+#[cfg(not(feature = "fault-injection"))]
+fn background_serial() {}
+
+const LONG: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn progress_of(writer: *mut tickertape_writer) -> Result<tickertape_checkpoint_progress, i32> {
+    let mut progress = tickertape_checkpoint_progress {
+        struct_size: size_of::<tickertape_checkpoint_progress>() as u64,
+        ..Default::default()
+    };
+    match unsafe { tickertape_writer_checkpoint_progress(writer, &mut progress) } {
+        OK => {
+            assert_eq!(
+                progress.struct_size,
+                size_of::<tickertape_checkpoint_progress>() as u64
+            );
+            Ok(progress)
+        }
+        status => Err(status),
+    }
+}
+
+fn request(writer: *mut tickertape_writer) -> Result<u64, i32> {
+    let mut seq = u64::MAX;
+    match unsafe { tickertape_writer_request_checkpoint(writer, &mut seq) } {
+        OK => Ok(seq),
+        status => Err(status),
+    }
+}
+
+/// Polls until no background checkpoint is pending.
+fn wait_finished(writer: *mut tickertape_writer) -> tickertape_checkpoint_progress {
+    let deadline = std::time::Instant::now() + LONG;
+    loop {
+        let progress = progress_of(writer).unwrap_or_else(|s| panic!("{s}: {}", last_message()));
+        if progress.has_pending == 0 {
+            assert_eq!(progress.pending_next_seq, 0);
+            return progress;
+        }
+        assert!(std::time::Instant::now() < deadline, "did not finish");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+/// Reads every record a durable-only reader returns now, and returns the next sequence number.
+fn durable_frontier(j: &Journal) -> u64 {
+    let reader = j.reader(true, false);
+    let mut record = empty_record();
+    let mut next = 0;
+    while unsafe { tickertape_reader_next(reader, 0, &mut record) } == OK {
+        assert_eq!(record.seq, next);
+        next += 1;
+    }
+    assert_eq!(unsafe { tickertape_reader_close(reader) }, OK);
+    next
+}
+
+#[test]
+fn pure_checkpoint_progress_arguments_are_checked() {
+    unsafe {
+        assert_eq!(
+            tickertape_writer_request_checkpoint(null_mut(), null_mut()),
+            INVALID
+        );
+        let mut progress = tickertape_checkpoint_progress {
+            struct_size: size_of::<tickertape_checkpoint_progress>() as u64,
+            ..Default::default()
+        };
+        assert_eq!(
+            tickertape_writer_checkpoint_progress(null_mut(), &mut progress),
+            INVALID
+        );
+        progress.struct_size = 55;
+        assert_eq!(
+            tickertape_writer_checkpoint_progress(null_mut(), &mut progress),
+            INVALID
+        );
+        assert!(last_message().contains("struct_size"), "{}", last_message());
+    }
+}
+
+/// A request returns its frontier at once; appends continue; the progress reports the pending frontier, then the
+/// marker; a durable-only reader sees the marker move; a struct larger than the library's is filled up to its size.
+#[test]
+fn background_checkpoint_through_the_c_abi() {
+    let _serial = background_serial();
+    let j = Journal::new();
+    let writer = j.writer(65_536);
+    let none = progress_of(writer).unwrap();
+    assert_eq!((none.has_durable, none.has_pending), (0, 0));
+    assert_eq!(none.durable_next_seq, 0);
+    for seq in 0..100 {
+        append(writer, seq);
+    }
+    assert_eq!(durable_frontier(&j), 0);
+    #[cfg(feature = "fault-injection")]
+    let hold = tickertape::fault::hold_background(tickertape::fault::Point::CheckpointSync);
+    assert_eq!(request(writer), Ok(100));
+    #[cfg(feature = "fault-injection")]
+    {
+        assert!(hold.wait_reached(LONG));
+        let pending = progress_of(writer).unwrap();
+        assert_eq!((pending.has_durable, pending.has_pending), (0, 1));
+        assert_eq!(pending.pending_next_seq, 100);
+        // Appends (rolls included) continue while the checkpoint is held before its first sync.
+        for seq in 100..400 {
+            append(writer, seq);
+        }
+        assert_eq!(durable_frontier(&j), 0, "no marker before the syncs");
+        // A request made while one runs queues; the next one joins it.
+        assert_eq!(request(writer), Ok(400));
+        append(writer, 400);
+        assert_eq!(request(writer), Ok(401));
+        assert_eq!(progress_of(writer).unwrap().pending_next_seq, 401);
+        hold.release();
+    }
+    #[cfg(not(feature = "fault-injection"))]
+    {
+        for seq in 100..401 {
+            append(writer, seq);
+        }
+        assert_eq!(request(writer), Ok(401));
+    }
+    let done = wait_finished(writer);
+    assert_eq!(done.has_durable, 1);
+    assert_eq!(done.durable_next_seq, 401);
+    let mut on_disk = tickertape_checkpoint::default();
+    assert_eq!(
+        unsafe { tickertape_read_checkpoint(j.c_dir.as_ptr(), &mut on_disk) },
+        OK
+    );
+    assert_eq!(
+        (on_disk.generation, on_disk.next_seq, on_disk.offset),
+        (done.durable_generation, 401, done.durable_offset)
+    );
+    assert_eq!(durable_frontier(&j), 401);
+
+    // A caller's struct larger than the library's: filled up to the library's size, the rest untouched.
+    #[repr(C)]
+    struct Larger {
+        progress: tickertape_checkpoint_progress,
+        later: u64,
+    }
+    let mut larger = Larger {
+        progress: tickertape_checkpoint_progress {
+            struct_size: size_of::<Larger>() as u64,
+            ..Default::default()
+        },
+        later: 7,
+    };
+    assert_eq!(
+        unsafe { tickertape_writer_checkpoint_progress(writer, &mut larger.progress) },
+        OK
+    );
+    assert_eq!(
+        larger.progress.struct_size,
+        size_of::<tickertape_checkpoint_progress>() as u64
+    );
+    assert_eq!(larger.progress.durable_next_seq, 401);
+    assert_eq!(larger.later, 7);
+
+    // NULL `next_seq_out` is allowed; the blocking checkpoint and close wait for it.
+    append(writer, 401);
+    assert_eq!(
+        unsafe { tickertape_writer_request_checkpoint(writer, null_mut()) },
+        OK
+    );
+    assert_eq!(unsafe { tickertape_writer_close(writer) }, OK);
+    assert_eq!(durable_frontier(&j), 402, "close waited for the checkpoint");
+}
+
+/// A failure on the background path reaches the C caller once, through whichever call reports first (as in Rust),
+/// then `TICKERTAPE_E_DURABILITY_LOST`; appends keep working; close reports a failure no call has returned.
+#[cfg(feature = "fault-injection")]
+#[test]
+fn background_checkpoint_failure_reaches_the_caller_once() {
+    use tickertape::fault::{self, Point};
+    let _serial = background_serial();
+    const EIO: i32 = 5;
+    let lost = code(S::TICKERTAPE_E_DURABILITY_LOST);
+    let io = code(S::TICKERTAPE_E_IO);
+    for reporter in ["progress", "request", "checkpoint", "close"] {
+        let j = Journal::new();
+        let writer = j.writer(65_536);
+        for seq in 0..10 {
+            append(writer, seq);
+        }
+        assert_eq!(unsafe { tickertape_writer_checkpoint(writer) }, OK);
+        append(writer, 10);
+        fault::fail_next_background(Point::CheckpointSync, EIO);
+        assert_eq!(request(writer), Ok(11));
+        // Wait for the failure without collecting it: metrics read it at once.
+        let deadline = std::time::Instant::now() + LONG;
+        while writer_metrics(writer).poisoned == 0 {
+            assert!(std::time::Instant::now() < deadline, "did not fail");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let status = match reporter {
+            "progress" => progress_of(writer).err().unwrap_or(OK),
+            "request" => request(writer).err().unwrap_or(OK),
+            "checkpoint" => unsafe { tickertape_writer_checkpoint(writer) },
+            _ => {
+                assert_eq!(unsafe { tickertape_writer_close(writer) }, io);
+                assert_eq!(tickertape_last_error_os_code(), EIO);
+                assert_eq!(durable_frontier(&j), 10, "the marker is the last good one");
+                continue;
+            }
+        };
+        assert_eq!(status, io, "{reporter}");
+        assert_eq!(tickertape_last_error_os_code(), EIO);
+        assert_eq!(progress_of(writer).err(), Some(lost), "{reporter}");
+        assert_eq!(request(writer).err(), Some(lost), "{reporter}");
+        assert_eq!(unsafe { tickertape_writer_checkpoint(writer) }, lost);
+        append(writer, 11);
+        assert_eq!(durable_frontier(&j), 10, "{reporter}");
+        assert_eq!(unsafe { tickertape_writer_close(writer) }, lost);
+    }
 }

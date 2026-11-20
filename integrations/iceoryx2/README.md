@@ -479,11 +479,14 @@ limit. Raising them later is compatible; lowering them would refuse recordings t
   publisher's backpressure strategy decides. The recorder drains its buffers every poll interval (1 ms by default; on
   Linux iceoryx2's WaitSet can wake noticeably less often), taking at most 4,096 messages per service per pass so a
   busy service can't starve the others.
-- **A checkpoint pauses recording.** tickertape has no background checkpoint yet, so the recorder syncs on its own
-  thread (every `--checkpoint-interval-ms`, 1 s by default), and every message that arrives meanwhile must fit in the
-  subscriber buffer. With iceoryx2's default of 2 slots, expect loss even at a few hundred messages per second;
-  create services with a larger `subscriber_max_buffer_size` (or let the recorder create them). `record` prints, and
-  each descriptor stores, the buffer size it got and the overflow policy.
+- **Periodic checkpoints do not pause recording.** Every `--checkpoint-interval-ms` (1 s by default) the recorder
+  requests a background checkpoint (tickertape's `Writer::request_checkpoint`, ADR 0038), which syncs on a thread of
+  the library while recording goes on; a request made while the previous checkpoint still runs waits for it. Only the
+  final checkpoint, on a stop, blocks. A background checkpoint that fails stops the recorder at the next request (or
+  at the final checkpoint) with the journal error, as a full volume does. Between wake-ups messages still wait in the
+  subscriber buffer: with iceoryx2's default of 2 slots, expect loss even at modest rates; create services with a
+  larger `subscriber_max_buffer_size` (or let the recorder create them). `record` prints, and each descriptor
+  stores, the buffer size it got and the overflow policy.
 - **Make loss detectable with a counter.** If each publisher puts a counter in its user header or payload (an
   unsigned little-endian integer, +1 per message, wrapping at its width), pass its position (`--counter header:0:8`,
   or `TypedService::counter`). The recorder then writes a loss record for every gap and reports gaps and missing
@@ -498,7 +501,7 @@ limit. Raising them later is compatible; lowering them would refuse recordings t
   stops.
 - **Visible is not durable**, exactly as in tickertape's [crash contract](../../docs/crash-contract.md): a recorded
   message is visible to readers as soon as it is written and survives the recorder being killed, but it is durable
-  only after the next checkpoint (and on SIGINT/SIGTERM). Readers that must not act on records a power loss could take
+  only once a checkpoint requested after it has finished (and after the final checkpoint on SIGINT/SIGTERM). Readers that must not act on records a power loss could take
   back use `durable_only` (`follow --durable-only`).
 - **Restarts.** A recorder restarted on the same journal continues it after recovery as a new recording run, with no
   gap or duplicate in sequence numbers. Messages published while no recorder runs are not recorded. If the service

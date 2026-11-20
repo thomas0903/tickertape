@@ -301,3 +301,13 @@ gigabytes, and found a few more integrity gaps. Nothing was released; the layout
   its expected cost per connected subscriber is `connection_bytes` at the publisher's samples and segments (checked
   to be the capacity-based charge per subscriber), with a lower bound from what each connection holds whatever the
   rounding (its used-chunk lists and queues).
+
+## Amendment: background checkpoints (2026-11-20)
+
+The recorder's periodic checkpoints (every `checkpoint_interval`) are now background requests
+(`Writer::request_checkpoint`, ADR 0038), so recording no longer pauses while a checkpoint syncs; the checkpoint at a
+stop stays blocking (it first waits for the background one). A background checkpoint that fails reaches the recorder
+through its existing journal error path: the next periodic request (or the final checkpoint) returns the error, and
+the recorder stops with `Error::Journal`, as on a full volume. `RecorderReport::checkpoints` counts the requests plus
+the final checkpoint. Test: `tests/background_checkpoint.rs` (the core's fault injection, enabled for the
+integration's test builds only).

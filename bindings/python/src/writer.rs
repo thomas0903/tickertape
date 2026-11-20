@@ -16,7 +16,7 @@ use pyo3::types::{
 };
 use tickertape::{NewRecord, WriterConfig};
 
-use crate::config::{self, Retention};
+use crate::config::{self, HelperCpusArg, Retention};
 use crate::errors;
 use crate::owner::Owner;
 use crate::reports;
@@ -301,12 +301,13 @@ impl Writer {
     #[pyo3(
         signature = (
             path, *, segment_size=WriterConfig::DEFAULT_SEGMENT_SIZE, recovery="quarantine", notify=true,
-            prefault=true, retention=None
+            prefault=true, early_writeback=true, helper_cpus=HelperCpusArg::PROCESS, retention=None
         ),
         // Spelled out so that `inspect.signature` shows the default size (DEFAULT_SEGMENT_SIZE, checked by a test).
         text_signature = "(path, *, segment_size=134217728, recovery='quarantine', notify=True, prefault=True, \
-                          retention=None)"
+                          early_writeback=True, helper_cpus='process', retention=None)"
     )]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
         path: PathBuf,
@@ -314,13 +315,17 @@ impl Writer {
         recovery: &str,
         notify: bool,
         prefault: bool,
+        early_writeback: bool,
+        helper_cpus: HelperCpusArg,
         retention: Option<PyRef<'_, Retention>>,
     ) -> PyResult<Self> {
         let mut config = WriterConfig::default()
             .segment_size(segment_size)
             .recovery(config::recovery(recovery)?)
             .notify(notify)
-            .prefault(prefault);
+            .prefault(prefault)
+            .early_writeback(early_writeback)
+            .helper_cpus(helper_cpus.0);
         if let Some(r) = retention {
             config = config.retention(r.policy.clone(), r.action.clone());
         }
@@ -434,13 +439,38 @@ impl Writer {
     }
 
     /// Makes every record appended so far durable (see `docs/crash-contract.md`). Blocks until the sync calls
-    /// finish, with the GIL released. After a failure the writer is poisoned: later checkpoints raise
-    /// `DurabilityLostError`, appends keep working. Records appended before a failed checkpoint may not be durable
+    /// finish, with the GIL released. Background checkpoints in flight are waited for first, and the error of one that
+    /// failed is raised here if no call has raised it yet. After a failure the writer is poisoned: later checkpoints
+    /// raise `DurabilityLostError`, appends keep working. Records appended before a failed checkpoint may not be durable
     /// even if a writer opened later in the same boot checkpoints successfully.
     fn checkpoint(&self, py: Python<'_>) -> PyResult<()> {
         self.settle(py, || {
             let result = self.with_detached(py, tickertape::Writer::checkpoint)?;
             convert(py, result)
+        })
+    }
+
+    /// Starts a checkpoint of every record appended so far on the writer's checkpoint thread and returns without
+    /// waiting for its syncs (ADR 0038). Returns the sequence number it covers up to: once it has finished (see
+    /// `checkpoint_progress()`), every record with a smaller sequence number is durable, exactly as after
+    /// `checkpoint()`. Appends continue meanwhile. One runs at a time; a request made while one runs waits for it, and
+    /// later requests join the waiting one. Raises the error of an earlier background checkpoint (or of early
+    /// write-back on Linux) that failed, once, then `DurabilityLostError`.
+    fn request_checkpoint(&self, py: Python<'_>) -> PyResult<u64> {
+        self.settle(py, || {
+            let result = self.with(py, tickertape::Writer::request_checkpoint)?;
+            convert(py, result)
+        })
+    }
+
+    /// Where this writer's checkpoints stand, as a `CheckpointProgress`: the marker it last made durable, and the
+    /// frontier of a background checkpoint still in flight. No system calls. Raises the error of a background
+    /// checkpoint that failed the first time it is reported (the writer is then poisoned), and `DurabilityLostError`
+    /// whenever the writer is poisoned after that.
+    fn checkpoint_progress<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        self.settle(py, || {
+            let result = self.with(py, tickertape::Writer::checkpoint_progress)?;
+            reports::checkpoint_progress(py, &convert(py, result)?)
         })
     }
 
@@ -499,22 +529,25 @@ impl Writer {
     }
 
     /// Releases the lock and closes the journal files, without a checkpoint: records appended since the last
-    /// checkpoint stay visible but are not made durable. Calling it again does nothing. In a child created by
-    /// `fork`, it closes only this process's copies of the descriptors and mappings: the parent keeps the lock, and
-    /// nothing is synced, joined or removed; if another thread was using the writer at the fork, it releases nothing
-    /// there.
-    fn close(&self, py: Python<'_>) {
+    /// checkpoint stay visible but are not made durable. As `tickertape::Writer::close`, it first waits for background
+    /// checkpoints in flight (with the GIL released), then raises the error of one that failed (or of early
+    /// write-back on Linux) if no call has raised it yet, or `DurabilityLostError` if the writer is poisoned; the
+    /// writer is closed in every case. Calling it again does nothing. In a child created by `fork`, it closes only
+    /// this process's copies of the descriptors and mappings: the parent keeps the lock, and nothing is synced,
+    /// joined, removed or raised; if another thread was using the writer at the fork, it releases nothing there.
+    fn close(&self, py: Python<'_>) -> PyResult<()> {
         self.closed.store(true, Ordering::Release);
         if self.owner.is_foreign() {
             // A writer that was busy in another thread at the fork stays in place (see `take_inherited`).
             if let Ok(Some(writer)) = take_inherited(&self.inner) {
                 writer.release_after_fork();
             }
-            return;
+            return Ok(());
         }
         let writer = lock(py, &self.inner).take();
-        // Dropping joins helper threads; don't hold the GIL meanwhile.
-        py.detach(move || drop(writer));
+        // Closing waits for background checkpoints and joins helper threads; don't hold the GIL meanwhile.
+        let result = py.detach(move || writer.map_or(Ok(()), tickertape::Writer::close));
+        convert(py, result)
     }
 
     fn __enter__(slf: Bound<'_, Self>) -> PyResult<Bound<'_, Self>> {
@@ -538,10 +571,21 @@ impl Writer {
         std::mem::forget(lock(py, &self.inner));
     }
 
-    /// Closes the writer (see `close()`); does not checkpoint and does not suppress exceptions.
-    #[pyo3(signature = (*_args))]
-    fn __exit__(&self, py: Python<'_>, _args: &Bound<'_, PyTuple>) {
-        self.close(py);
+    /// Closes the writer (see `close()`); does not checkpoint and does not suppress exceptions. If the block raised,
+    /// that exception propagates and an error from `close()` is not raised over it; otherwise `close()`'s error is.
+    #[pyo3(signature = (exc_type=None, _exc_value=None, _traceback=None))]
+    fn __exit__(
+        &self,
+        py: Python<'_>,
+        exc_type: Option<&Bound<'_, PyAny>>,
+        _exc_value: Option<&Bound<'_, PyAny>>,
+        _traceback: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        let closed = self.close(py);
+        match exc_type {
+            Some(t) if !t.is_none() => Ok(()),
+            _ => closed,
+        }
     }
 
     /// Never blocks: shows `next_seq` only when no other call holds the writer.

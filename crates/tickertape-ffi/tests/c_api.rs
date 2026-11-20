@@ -1142,6 +1142,14 @@ const CPP_WRAPPED: &[(&str, &str)] = &[
         "WriterOptions::prefault",
     ),
     (
+        "tickertape_writer_options_set_early_writeback",
+        "WriterOptions::early_writeback",
+    ),
+    (
+        "tickertape_writer_options_set_helper_cpus",
+        "WriterOptions::helper_cpus (both overloads)",
+    ),
+    (
         "tickertape_writer_options_set_retention",
         "WriterOptions::retention, no_retention",
     ),
@@ -1207,6 +1215,14 @@ const CPP_WRAPPED: &[(&str, &str)] = &[
         "Writer::append_batch, NewRecord",
     ),
     ("tickertape_writer_checkpoint", "Writer::checkpoint"),
+    (
+        "tickertape_writer_request_checkpoint",
+        "Writer::request_checkpoint",
+    ),
+    (
+        "tickertape_writer_checkpoint_progress",
+        "Writer::checkpoint_progress",
+    ),
     ("tickertape_writer_next_seq", "Writer::next_seq"),
     (
         "tickertape_writer_last_retention_error",
@@ -1565,6 +1581,22 @@ const C_STRUCT_FIELDS: &[(&str, &[(&str, FieldUse)])] = {
                     "retention_failures",
                     Used("WriterMetrics::retention_failures"),
                 ),
+            ],
+        ),
+        (
+            "tickertape_checkpoint_progress",
+            &[
+                ("struct_size", Used("set by Writer::checkpoint_progress")),
+                ("has_durable", Used("CheckpointProgress::durable")),
+                ("has_pending", Used("CheckpointProgress::pending")),
+                ("durable_generation", Used("CheckpointProgress::durable")),
+                ("durable_next_seq", Used("CheckpointProgress::durable")),
+                (
+                    "durable_segment_base_seq",
+                    Used("CheckpointProgress::durable"),
+                ),
+                ("durable_offset", Used("CheckpointProgress::durable")),
+                ("pending_next_seq", Used("CheckpointProgress::pending")),
             ],
         ),
         (

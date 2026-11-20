@@ -316,3 +316,36 @@ pub fn recovery(value: &str) -> PyResult<tickertape::RecoveryPolicy> {
         ))),
     }
 }
+
+/// The `helper_cpus` argument of `Writer`: `"process"`, `"inherited"`, or an iterable of CPU numbers
+/// (`HelperCpus::List`). A `str` other than the two names is refused, not iterated.
+#[derive(Debug)]
+pub struct HelperCpusArg(pub tickertape::HelperCpus);
+
+impl HelperCpusArg {
+    pub const PROCESS: HelperCpusArg = HelperCpusArg(tickertape::HelperCpus::Process);
+}
+
+impl<'a, 'py> FromPyObject<'a, 'py> for HelperCpusArg {
+    type Error = PyErr;
+
+    fn extract(obj: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
+        const EXPECTED: &str =
+            "helper_cpus must be 'process', 'inherited' or a sequence of CPU numbers";
+        if let Ok(name) = obj.extract::<String>() {
+            return match name.as_str() {
+                "process" => Ok(HelperCpusArg(tickertape::HelperCpus::Process)),
+                "inherited" => Ok(HelperCpusArg(tickertape::HelperCpus::Inherited)),
+                other => Err(PyValueError::new_err(format!("{EXPECTED}, not {other:?}"))),
+            };
+        }
+        if obj.is_instance_of::<PyInt>() || obj.is_instance_of::<pyo3::types::PyBytes>() {
+            return Err(PyTypeError::new_err(EXPECTED));
+        }
+        let mut cpus = Vec::new();
+        for item in obj.try_iter().map_err(|_| PyTypeError::new_err(EXPECTED))? {
+            cpus.push(item?.extract::<usize>()?);
+        }
+        Ok(HelperCpusArg(tickertape::HelperCpus::List(cpus)))
+    }
+}
