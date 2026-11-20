@@ -1,0 +1,74 @@
+#!/usr/bin/env bpftrace
+/*
+ * The journal's sync calls and segment publications, per thread of one process, with wall-clock start times (Unix
+ * seconds) and durations, so checkpoints and rolls can be placed exactly inside a second of tt-sustained's
+ * series.jsonl. Part of docs/playbooks/diagnose-latency-with-ebpf.md.
+ *
+ *   sudo bpftrace benches/diagnostics/events.bt <pid> <seconds>
+ *
+ * Lines: <t_unix_s> <call> tid=<tid> comm=<comm> us=<microseconds>
+ *   fdatasync, fsync, msync: the checkpoint's syncs (on the writer thread for Writer::checkpoint, on
+ *     `tickertape-chec` for a background checkpoint), and syncs on other paths (the spare segment's preparation on
+ *     `tickertape-spar`, for example);
+ *   sync_file_range: early write-back on `tickertape-writ` (WriterConfig::early_writeback);
+ *   linkat: a segment name being linked, which is how the writer publishes a new segment at a roll
+ *     (`us` is the time spent in the call).
+ * Thread names are cut to 15 characters by the kernel. <pid> and the printed tids are as seen from bpftrace's PID
+ * namespace; inside a container, bpftrace can print "get_ns_current_pid_tgid" warnings when tasks of other namespaces
+ * make these calls (their events are not counted).
+ */
+
+tracepoint:syscalls:sys_enter_fdatasync,
+tracepoint:syscalls:sys_enter_fsync,
+tracepoint:syscalls:sys_enter_msync,
+tracepoint:syscalls:sys_enter_sync_file_range,
+tracepoint:syscalls:sys_enter_linkat
+/pid == $1/
+{
+  @t[tid] = nsecs;
+}
+
+tracepoint:syscalls:sys_exit_fdatasync
+/pid == $1 && @t[tid]/
+{
+  printf("%s fdatasync tid=%d comm=%s us=%d\n", strftime("%s.%f", @t[tid]), tid, comm, (nsecs - @t[tid]) / 1000);
+  $deleted = delete(@t, tid);
+}
+
+tracepoint:syscalls:sys_exit_fsync
+/pid == $1 && @t[tid]/
+{
+  printf("%s fsync tid=%d comm=%s us=%d\n", strftime("%s.%f", @t[tid]), tid, comm, (nsecs - @t[tid]) / 1000);
+  $deleted = delete(@t, tid);
+}
+
+tracepoint:syscalls:sys_exit_msync
+/pid == $1 && @t[tid]/
+{
+  printf("%s msync tid=%d comm=%s us=%d\n", strftime("%s.%f", @t[tid]), tid, comm, (nsecs - @t[tid]) / 1000);
+  $deleted = delete(@t, tid);
+}
+
+tracepoint:syscalls:sys_exit_sync_file_range
+/pid == $1 && @t[tid]/
+{
+  printf("%s sync_file_range tid=%d comm=%s us=%d\n", strftime("%s.%f", @t[tid]), tid, comm, (nsecs - @t[tid]) / 1000);
+  $deleted = delete(@t, tid);
+}
+
+tracepoint:syscalls:sys_exit_linkat
+/pid == $1 && @t[tid]/
+{
+  printf("%s linkat tid=%d comm=%s us=%d\n", strftime("%s.%f", @t[tid]), tid, comm, (nsecs - @t[tid]) / 1000);
+  $deleted = delete(@t, tid);
+}
+
+interval:s:$2
+{
+  exit();
+}
+
+END
+{
+  clear(@t);
+}
