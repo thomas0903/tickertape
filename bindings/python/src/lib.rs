@@ -12,6 +12,7 @@ mod inspect;
 mod owner;
 mod reader;
 mod reports;
+mod status;
 mod writer;
 
 use pyo3::prelude::*;
@@ -29,6 +30,13 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("CORRUPT_REASONS", errors::CORRUPT_REASONS.to_vec())?;
     m.add("RECOVERY_ACTIONS", reports::RECOVERY_ACTIONS.to_vec())?;
     m.add("SEGMENT_ENDS", reports::SEGMENT_ENDS.to_vec())?;
+    m.add(
+        "STATUS_ENUMS",
+        status::STATUS_ENUMS
+            .iter()
+            .map(|(name, variants)| (*name, variants.to_vec()))
+            .collect::<Vec<_>>(),
+    )?;
     m.add_class::<writer::Writer>()?;
     m.add_class::<reader::Reader>()?;
     m.add_class::<reader::Record>()?;
@@ -38,6 +46,8 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(inspect::list_segments, m)?)?;
     m.add_function(wrap_pyfunction!(inspect::read_checkpoint, m)?)?;
     m.add_function(wrap_pyfunction!(inspect::verify, m)?)?;
+    m.add_class::<status::StatusSample>()?;
+    m.add_function(wrap_pyfunction!(status::sample_status, m)?)?;
     owner::register(m)?;
     Ok(())
 }

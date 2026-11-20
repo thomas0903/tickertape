@@ -44,6 +44,13 @@ final class Native {
     private static final MethodHandle LAST_ERROR_MESSAGE = h("tickertape_last_error_message");
     private static final MethodHandle LAST_ERROR_OS_CODE = h("tickertape_last_error_os_code");
     private static final MethodHandle LAST_ERROR_CORRUPT_REASON = h("tickertape_last_error_corrupt_reason");
+    private static final MethodHandle JOURNAL_STATUS_SAMPLE = h("tickertape_journal_status_sample");
+    private static final MethodHandle JOURNAL_STATUS_FREE = h("tickertape_journal_status_free");
+    private static final MethodHandle JOURNAL_STATUS_GET_REPORT = h("tickertape_journal_status_get_report");
+    private static final MethodHandle JOURNAL_STATUS_GET_BEACON = h("tickertape_journal_status_get_beacon");
+    private static final MethodHandle JOURNAL_STATUS_BEACON_NAME = h("tickertape_journal_status_beacon_name");
+    private static final MethodHandle WRITER_GET_METRICS = h("tickertape_writer_get_metrics");
+    private static final MethodHandle READER_GET_METRICS = h("tickertape_reader_get_metrics");
     private static final MethodHandle VERIFY = h("tickertape_verify");
     private static final MethodHandle LIST_SEGMENTS = h("tickertape_list_segments");
     private static final MethodHandle READ_CHECKPOINT = h("tickertape_read_checkpoint");
@@ -460,4 +467,59 @@ final class Native {
         }
     }
 
+    static int journalStatusSample(MemorySegment a0, MemorySegment a1, MemorySegment a2) {
+        try {
+            return (int) JOURNAL_STATUS_SAMPLE.invokeExact(a0, a1, a2);
+        } catch (Throwable t) {
+            throw rethrow(t);
+        }
+    }
+
+    static void journalStatusFree(MemorySegment a0) {
+        try {
+            JOURNAL_STATUS_FREE.invokeExact(a0);
+        } catch (Throwable t) {
+            throw rethrow(t);
+        }
+    }
+
+    static int journalStatusGetReport(MemorySegment a0, MemorySegment a1) {
+        try {
+            return (int) JOURNAL_STATUS_GET_REPORT.invokeExact(a0, a1);
+        } catch (Throwable t) {
+            throw rethrow(t);
+        }
+    }
+
+    static int journalStatusGetBeacon(MemorySegment a0, long a1, MemorySegment a2) {
+        try {
+            return (int) JOURNAL_STATUS_GET_BEACON.invokeExact(a0, a1, a2);
+        } catch (Throwable t) {
+            throw rethrow(t);
+        }
+    }
+
+    static MemorySegment journalStatusBeaconName(MemorySegment a0, long a1) {
+        try {
+            return (MemorySegment) JOURNAL_STATUS_BEACON_NAME.invokeExact(a0, a1);
+        } catch (Throwable t) {
+            throw rethrow(t);
+        }
+    }
+
+    static int writerGetMetrics(MemorySegment a0, MemorySegment a1) {
+        try {
+            return (int) WRITER_GET_METRICS.invokeExact(a0, a1);
+        } catch (Throwable t) {
+            throw rethrow(t);
+        }
+    }
+
+    static int readerGetMetrics(MemorySegment a0, MemorySegment a1, MemorySegment a2) {
+        try {
+            return (int) READER_GET_METRICS.invokeExact(a0, a1, a2);
+        } catch (Throwable t) {
+            throw rethrow(t);
+        }
+    }
 }

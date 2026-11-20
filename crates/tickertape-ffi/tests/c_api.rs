@@ -1212,6 +1212,22 @@ const CPP_WRAPPED: &[(&str, &str)] = &[
         "tickertape_writer_last_retention_error",
         "Writer::last_retention_error",
     ),
+    ("tickertape_journal_status_sample", "JournalStatus::sample"),
+    ("tickertape_journal_status_free", "~JournalStatus"),
+    (
+        "tickertape_journal_status_get_report",
+        "JournalStatus::sample (StatusReport)",
+    ),
+    (
+        "tickertape_journal_status_get_beacon",
+        "JournalStatus::sample (BeaconStatus)",
+    ),
+    (
+        "tickertape_journal_status_beacon_name",
+        "JournalStatus::sample (BeaconStatus::name)",
+    ),
+    ("tickertape_writer_get_metrics", "Writer::metrics"),
+    ("tickertape_reader_get_metrics", "Reader::metrics"),
 ];
 
 /// C functions the C++ binding deliberately does not call; ADR 0036 lists each with the same reason.
@@ -1362,6 +1378,211 @@ const C_STRUCT_FIELDS: &[(&str, &[(&str, FieldUse)])] = {
                 ),
             ],
         ),
+        (
+            "tickertape_journal_status_report",
+            &[
+                ("struct_size", Used("set by JournalStatus::sample")),
+                ("sampled_unix_ns", Used("StatusReport::sampled_unix_ns")),
+                ("head_next_seq", Used("StatusReport::Head::position")),
+                (
+                    "head_segment_base_seq",
+                    Used("StatusReport::Head::position"),
+                ),
+                ("head_offset", Used("StatusReport::Head::position")),
+                (
+                    "head_segment_size",
+                    Used("StatusReport::Head::segment_size"),
+                ),
+                (
+                    "head_last_local_ts_ns",
+                    Used("StatusReport::Head::last_local_ts_ns"),
+                ),
+                ("head_end", Used("StatusReport::Head::end")),
+                (
+                    "head_corrupt_reason",
+                    Used("StatusReport::Head::corrupt_reason"),
+                ),
+                ("head_verified", Used("StatusReport::Head::verified")),
+                (
+                    "head_chain_broken",
+                    Used("StatusReport::Head::chain_broken"),
+                ),
+                ("segment_count", Used("StatusReport::Segments::count")),
+                ("first_seq", Used("StatusReport::Segments::first_seq")),
+                (
+                    "segments_total_bytes",
+                    Used("StatusReport::Segments::total_bytes"),
+                ),
+                (
+                    "oldest_segment_created_unix_ns",
+                    Used("StatusReport::Segments::oldest_created_unix_ns"),
+                ),
+                (
+                    "segments_before_checkpoint",
+                    Used("StatusReport::Segments::before_checkpoint"),
+                ),
+                ("has_checkpoint", Used("StatusReport::checkpoint")),
+                (
+                    "checkpoint_problem",
+                    Used("StatusReport::CheckpointState::problem"),
+                ),
+                (
+                    "checkpoint_generation",
+                    Used("StatusReport::CheckpointState::marker"),
+                ),
+                (
+                    "checkpoint_next_seq",
+                    Used("StatusReport::CheckpointState::marker"),
+                ),
+                (
+                    "checkpoint_segment_base_seq",
+                    Used("StatusReport::CheckpointState::marker"),
+                ),
+                (
+                    "checkpoint_offset",
+                    Used("StatusReport::CheckpointState::marker"),
+                ),
+                (
+                    "checkpoint_modified_unix_ns",
+                    Used("StatusReport::CheckpointState::modified_unix_ns"),
+                ),
+                (
+                    "checkpoint_estimated_age_ns",
+                    Used("StatusReport::CheckpointState::estimated_age"),
+                ),
+                (
+                    "checkpoint_age_unknown",
+                    Used("StatusReport::CheckpointState::age_unknown"),
+                ),
+                (
+                    "exposure_verified",
+                    Used("StatusReport::Exposure::verified"),
+                ),
+                ("exposure_records", Used("StatusReport::Exposure::records")),
+                ("exposure_bytes", Used("StatusReport::Exposure::bytes")),
+                (
+                    "exposure_estimated_age_ns",
+                    Used("StatusReport::Exposure::estimated_age"),
+                ),
+                (
+                    "exposure_oldest_local_ts_ns",
+                    Used("StatusReport::Exposure::oldest_local_ts_ns"),
+                ),
+                (
+                    "storage_available_bytes",
+                    Used("StatusReport::Storage::available_bytes"),
+                ),
+                (
+                    "storage_total_bytes",
+                    Used("StatusReport::Storage::total_bytes"),
+                ),
+                (
+                    "storage_next_segment_size",
+                    Used("StatusReport::Storage::next_segment_size"),
+                ),
+                (
+                    "storage_estimated_rolls_left",
+                    Used("StatusReport::Storage::estimated_rolls_left"),
+                ),
+                (
+                    "storage_spare_segment",
+                    Used("StatusReport::Storage::spare_segment"),
+                ),
+                ("readers_dir_state", Used("StatusReport::readers_dir_state")),
+                ("writer_pid", Used("StatusReport::writer_pid")),
+                ("writer_alive", Used("StatusReport::writer_alive")),
+                ("beacon_count", Used("JournalStatus::beacons")),
+            ],
+        ),
+        (
+            "tickertape_beacon_status",
+            &[
+                ("struct_size", Used("set by JournalStatus::sample")),
+                ("state", Used("BeaconStatus::state")),
+                ("has_report", Used("BeaconStatus::report")),
+                (
+                    "report_seek_pending",
+                    Used("BeaconStatus::Report::seek_pending"),
+                ),
+                (
+                    "report_durable_only",
+                    Used("BeaconStatus::Report::durable_only"),
+                ),
+                ("lag_unknown", Used("BeaconStatus::lag_unknown")),
+                ("reserved", Unused("always 0")),
+                ("report_pid", Used("BeaconStatus::Report::pid")),
+                ("report_next_seq", Used("BeaconStatus::Report::next_seq")),
+                ("report_slot_seq", Used("BeaconStatus::Report::slot")),
+                (
+                    "report_segment_base_seq",
+                    Used("BeaconStatus::Report::slot"),
+                ),
+                ("report_offset", Used("BeaconStatus::Report::slot")),
+                (
+                    "report_updated_unix_ns",
+                    Used("BeaconStatus::Report::updated_unix_ns"),
+                ),
+                ("update_age_ns", Used("BeaconStatus::update_age")),
+                ("lag_records", Used("BeaconStatus::lag")),
+                ("lag_bytes", Used("BeaconStatus::lag")),
+                (
+                    "oldest_unread_local_ts_ns",
+                    Used("BeaconStatus::oldest_unread_local_ts_ns"),
+                ),
+                ("unread_age_ns", Used("BeaconStatus::unread_age")),
+            ],
+        ),
+        (
+            "tickertape_writer_metrics",
+            &[
+                ("struct_size", Used("set by Writer::metrics")),
+                ("head_next_seq", Used("WriterMetrics::head")),
+                ("head_segment_base_seq", Used("WriterMetrics::head")),
+                ("head_offset", Used("WriterMetrics::head")),
+                ("segment_size", Used("WriterMetrics::segment_size")),
+                ("has_checkpoint", Used("WriterMetrics::checkpoint")),
+                ("poisoned", Used("WriterMetrics::poisoned")),
+                ("checkpoint_generation", Used("WriterMetrics::checkpoint")),
+                ("checkpoint_next_seq", Used("WriterMetrics::checkpoint")),
+                (
+                    "checkpoint_segment_base_seq",
+                    Used("WriterMetrics::checkpoint"),
+                ),
+                ("checkpoint_offset", Used("WriterMetrics::checkpoint")),
+                (
+                    "since_checkpoint_ns",
+                    Used("WriterMetrics::since_checkpoint"),
+                ),
+                (
+                    "uncheckpointed_records",
+                    Used("WriterMetrics::uncheckpointed_records"),
+                ),
+                (
+                    "uncheckpointed_bytes",
+                    Used("WriterMetrics::uncheckpointed_bytes"),
+                ),
+                (
+                    "retention_failures",
+                    Used("WriterMetrics::retention_failures"),
+                ),
+            ],
+        ),
+        (
+            "tickertape_reader_metrics",
+            &[
+                ("struct_size", Used("set by Reader::metrics")),
+                ("next_seq", Used("ReaderMetrics::next_seq")),
+                ("slot_seq", Used("ReaderMetrics::slot")),
+                ("segment_base_seq", Used("ReaderMetrics::slot")),
+                ("offset", Used("ReaderMetrics::slot")),
+                ("seek_pending", Used("ReaderMetrics::seek_pending")),
+                ("durable_only", Used("ReaderMetrics::durable_only")),
+                ("held_record", Used("ReaderMetrics::held_record")),
+                ("lag_unknown", Used("ReaderMetrics::lag_unknown")),
+                ("lag_records", Used("ReaderMetrics::lag")),
+                ("lag_bytes", Used("ReaderMetrics::lag")),
+            ],
+        ),
     ]
 };
 
@@ -1461,7 +1682,8 @@ fn enumerators(text: &str, start: &str) -> Vec<String> {
         .collect()
 }
 
-/// Every status code, corruption reason and recovery policy of the C ABI has a C++ enumerator.
+/// Every status code, corruption reason, recovery policy and metrics enumeration value of the C ABI has a C++
+/// enumerator.
 #[test]
 fn cpp_binding_maps_every_status_and_reason() {
     let c = c_header();
@@ -1477,6 +1699,20 @@ fn cpp_binding_maps_every_status_and_reason() {
             "enum tickertape_recovery_policy",
             "enum class RecoveryPolicy",
             2,
+        ),
+        ("enum tickertape_head_end", "enum class HeadEnd", 3),
+        (
+            "enum tickertape_checkpoint_problem",
+            "enum class CheckpointProblem",
+            5,
+        ),
+        ("enum tickertape_age_unknown", "enum class AgeUnknown", 8),
+        ("enum tickertape_lag_unknown", "enum class LagUnknown", 7),
+        ("enum tickertape_beacon_state", "enum class BeaconState", 6),
+        (
+            "enum tickertape_readers_dir_state",
+            "enum class ReadersDirState",
+            3,
         ),
     ] {
         let mut from_c = enumerators(&c, c_enum);

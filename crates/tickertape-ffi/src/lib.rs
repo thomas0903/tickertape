@@ -25,6 +25,7 @@ compile_error!(
 
 mod args;
 mod inspect;
+mod metrics;
 mod options;
 mod reader;
 mod status;
@@ -34,6 +35,7 @@ mod writer;
 mod tests;
 
 pub use inspect::*;
+pub use metrics::*;
 pub use options::*;
 pub use reader::*;
 pub use status::*;

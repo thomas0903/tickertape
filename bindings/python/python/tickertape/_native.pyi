@@ -10,6 +10,7 @@ from typing_extensions import Buffer  # collections.abc.Buffer from Python 3.12;
 
 from ._errors import TickertapeError
 from ._inspect import RecoveryReport, RetentionReport
+from ._status import JournalStatus, ReaderMetrics, WriterMetrics
 
 
 _Path: TypeAlias = str | os.PathLike[str]
@@ -26,15 +27,18 @@ __all__ = [
     "FORMAT_VERSION",
     "RECOVERY_ACTIONS",
     "SEGMENT_ENDS",
+    "STATUS_ENUMS",
     "Backoff",
     "Reader",
     "Record",
     "RecordBatch",
     "Retention",
+    "StatusSample",
     "Writer",
     "__version__",
     "list_segments",
     "read_checkpoint",
+    "sample_status",
     "verify",
 ]
 
@@ -46,6 +50,7 @@ ERROR_VARIANTS: Final[list[tuple[str, str]]]
 CORRUPT_REASONS: Final[list[tuple[str, str]]]
 RECOVERY_ACTIONS: Final[list[tuple[str, str]]]
 SEGMENT_ENDS: Final[list[tuple[str, str]]]
+STATUS_ENUMS: Final[list[tuple[str, list[tuple[str, str]]]]]
 
 class _VerifyDict(TypedDict):
     records: int
@@ -142,6 +147,7 @@ class Writer:
     def retention_report(self) -> RetentionReport: ...
     @property
     def last_retention_error(self) -> TickertapeError | None: ...
+    def metrics(self) -> WriterMetrics: ...
     def close(self) -> None: ...
     def __enter__(self) -> Self: ...
     def __exit__(self, *args: object) -> None: ...
@@ -208,6 +214,7 @@ class Reader:
         """Like ``read_many``, as a columnar batch."""
     @property
     def position(self) -> int: ...
+    def metrics(self, status: JournalStatus) -> ReaderMetrics: ...
     @property
     def durable_only(self) -> bool: ...
     @property
@@ -223,3 +230,8 @@ class Reader:
 def list_segments(path: _Path) -> list[tuple[Path, int, int, int, int]]: ...
 def read_checkpoint(path: _Path) -> tuple[int, int, int, int] | None: ...
 def verify(path: _Path) -> _VerifyDict: ...
+@final
+class StatusSample:
+    def fields(self) -> dict[str, Any]: ...
+
+def sample_status(path: _Path, readers_dir: _Path | None = None) -> StatusSample: ...

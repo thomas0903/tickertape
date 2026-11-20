@@ -10,7 +10,8 @@
  * - Handles are opaque. Free each with its *_close / *_free function; NULL is ignored there. A close that returns
  *   anything but TICKERTAPE_E_BUSY has freed the handle: never retry it. NULL where a pointer is required returns
  *   TICKERTAPE_E_INVALID_ARGUMENT. Use after close, double close and concurrent use of one handle from several
- *   threads are undefined behaviour. Allocation failure aborts the process; no function returns NULL for it.
+ *   threads are undefined behaviour (a journal status sample is the exception: see tickertape_journal_status).
+ *   Allocation failure aborts the process; no function returns NULL for it.
  * - Pointers must be valid and aligned for their type. Paths are NUL-terminated byte strings.
  * - Input and output memory of one call must not overlap, and inputs must stay unmodified until the call returns.
  *   Output storage is the caller's. Each function's Safety section names its regions.
@@ -67,6 +68,13 @@
  * `TICKERTAPE_ABI_VERSION` for the rule.
  */
 #define TICKERTAPE_VERSION_NUMBER (((TICKERTAPE_VERSION_MAJOR * 1000000) + (TICKERTAPE_VERSION_MINOR * 1000)) + TICKERTAPE_VERSION_PATCH)
+
+/**
+ * The value of an optional `uint64_t` field that the library could not establish (ADR 0032: nothing reported is
+ * guessed). Fields that can hold it say so. A caller-supplied timestamp of `UINT64_MAX` (like one of 0, which means
+ * "not set") also reads as this value.
+ */
+#define TICKERTAPE_UNKNOWN 18446744073709551615ull
 
 /**
  * Status codes returned as `tickertape_status`.
@@ -341,6 +349,254 @@ typedef int32_t tickertape_timeout;
 #endif // __cplusplus
 
 /**
+ * How the newest segment ends, as `tickertape_journal_status_sample` saw it (`head_end`).
+ */
+enum tickertape_head_end
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : int32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  /**
+   * At a slot with no record yet: the normal state.
+   */
+  TICKERTAPE_HEAD_OPEN = 0,
+  /**
+   * At a seal whose successor did not exist when the sample checked: a writer died during a roll. The next
+   * writer creates the successor (`docs/format.md` → Recovery).
+   */
+  TICKERTAPE_HEAD_SEALED = 1,
+  /**
+   * At bytes that still failed validation after re-reading (`head_corrupt_reason` says why): a corruption
+   * breach. Not possible after a writer process crash; seen after a power loss or storage corruption, until the
+   * next writer repairs it.
+   */
+  TICKERTAPE_HEAD_INVALID = 2,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum tickertape_head_end tickertape_head_end;
+#else
+typedef int32_t tickertape_head_end;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/**
+ * Why the checkpoint marker cannot be used (`checkpoint_problem`). Any value but `TICKERTAPE_CHECKPOINT_USABLE`
+ * means that a writer refuses to open the journal under every recovery policy: a corruption breach.
+ */
+enum tickertape_checkpoint_problem
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : int32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  /**
+   * No problem was found, or there is no checkpoint marker (`has_checkpoint` is 0).
+   */
+  TICKERTAPE_CHECKPOINT_USABLE = 0,
+  /**
+   * The marker's segment does not exist.
+   */
+  TICKERTAPE_CHECKPOINT_MISSING_SEGMENT = 1,
+  /**
+   * The marker's segment exists but its header is invalid.
+   */
+  TICKERTAPE_CHECKPOINT_INVALID_SEGMENT_HEADER = 2,
+  /**
+   * The marker's offset is misaligned or outside its segment's record area.
+   */
+  TICKERTAPE_CHECKPOINT_INVALID_OFFSET = 3,
+  /**
+   * A problem this version of the C ABI does not name (not returned by a library built from one source tree).
+   */
+  TICKERTAPE_CHECKPOINT_OTHER_PROBLEM = 255,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum tickertape_checkpoint_problem tickertape_checkpoint_problem;
+#else
+typedef int32_t tickertape_checkpoint_problem;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/**
+ * Why the checkpoint's age could not be estimated from the marker's modification time (`checkpoint_age_unknown`).
+ */
+enum tickertape_age_unknown
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : int32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  /**
+   * The age is known, or there is no checkpoint marker (`has_checkpoint` is 0).
+   */
+  TICKERTAPE_AGE_KNOWN = 0,
+  /**
+   * The filesystem does not report a modification time.
+   */
+  TICKERTAPE_AGE_NO_MODIFICATION_TIME = 1,
+  /**
+   * The modification time is later than the observer's wall clock.
+   */
+  TICKERTAPE_AGE_IN_FUTURE = 2,
+  /**
+   * The modification time is earlier than the creation time of the marker's segment, which a checkpoint cannot
+   * predate (a copy that did not keep times, or a clock step).
+   */
+  TICKERTAPE_AGE_BEFORE_SEGMENT = 3,
+  /**
+   * The marker file does not have its full length, so its time is when it was cut, not a checkpoint's.
+   */
+  TICKERTAPE_AGE_MARKER_RESIZED = 4,
+  /**
+   * The marker's metadata kept changing while it was read: a writer checkpointing very often.
+   */
+  TICKERTAPE_AGE_CHANGING = 5,
+  /**
+   * The marker lost bytes (its older slot does not hold the previous generation), so its time is not known to
+   * be a checkpoint's.
+   */
+  TICKERTAPE_AGE_OLDER_SLOT_LOST = 6,
+  /**
+   * A reason this version of the C ABI does not name (not returned by a library built from one source tree).
+   */
+  TICKERTAPE_AGE_OTHER_REASON = 255,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum tickertape_age_unknown tickertape_age_unknown;
+#else
+typedef int32_t tickertape_age_unknown;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/**
+ * Why a reader's lag is unknown (`lag_unknown`).
+ */
+enum tickertape_lag_unknown
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : int32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  /**
+   * The lag is known (or, for a beacon, its contents could not be read: see `has_report`).
+   */
+  TICKERTAPE_LAG_KNOWN = 0,
+  /**
+   * The reader's segment is no longer in the journal: retention removed it, or recovery moved it to
+   * `quarantine/`.
+   */
+  TICKERTAPE_LAG_SEGMENT_GONE = 1,
+  /**
+   * The segment with the reader's base sequence number is a different file: another journal sharing the beacon
+   * directory, a journal replaced at the same path, or a segment that recovery repaired after the reader read it.
+   */
+  TICKERTAPE_LAG_OTHER_HISTORY = 2,
+  /**
+   * The reader's segment exists but its header could not be read.
+   */
+  TICKERTAPE_LAG_SEGMENT_UNREADABLE = 3,
+  /**
+   * A durable-only reader, and the checkpoint marker cannot be used.
+   */
+  TICKERTAPE_LAG_CHECKPOINT_UNUSABLE = 4,
+  /**
+   * The reader's segment is newer than every segment the sample listed: take a new sample.
+   */
+  TICKERTAPE_LAG_AHEAD_OF_SAMPLE = 5,
+  /**
+   * A reason this version of the C ABI does not name (not returned by a library built from one source tree).
+   */
+  TICKERTAPE_LAG_OTHER_REASON = 255,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum tickertape_lag_unknown tickertape_lag_unknown;
+#else
+typedef int32_t tickertape_lag_unknown;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/**
+ * Whether a reader beacon's owner is still running, and whether the beacon could be read (`state`).
+ */
+enum tickertape_beacon_state
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : int32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  /**
+   * A process holds the beacon's lock: its owner (or a child that inherited its descriptor).
+   */
+  TICKERTAPE_BEACON_LIVE = 0,
+  /**
+   * Nobody holds the lock: the owner died without removing the file. Its position is history, not lag.
+   */
+  TICKERTAPE_BEACON_STALE = 1,
+  /**
+   * A valid beacon whose lock state could not be established (the filesystem refused the probe).
+   */
+  TICKERTAPE_BEACON_UNCERTAIN = 2,
+  /**
+   * The file is not a valid beacon (length, magic, version or checksum), even after re-reading.
+   */
+  TICKERTAPE_BEACON_INVALID = 3,
+  /**
+   * The file could not be opened or read (for example another user's beacon created under umask 077).
+   */
+  TICKERTAPE_BEACON_UNREADABLE = 4,
+  /**
+   * The name was replaced by another file during every attempt to observe it: nothing is reported.
+   */
+  TICKERTAPE_BEACON_CHANGING = 5,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum tickertape_beacon_state tickertape_beacon_state;
+#else
+typedef int32_t tickertape_beacon_state;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/**
+ * Whether the beacon directory could be listed (`readers_dir_state`).
+ */
+enum tickertape_readers_dir_state
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : int32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  /**
+   * Listed (possibly empty).
+   */
+  TICKERTAPE_READERS_DIR_LISTED = 0,
+  /**
+   * It does not exist: no reader has created a beacon there.
+   */
+  TICKERTAPE_READERS_DIR_MISSING = 1,
+  /**
+   * It exists but could not be listed (not a directory, no permission, an I/O error). No beacons are reported.
+   */
+  TICKERTAPE_READERS_DIR_UNUSABLE = 2,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum tickertape_readers_dir_state tickertape_readers_dir_state;
+#else
+typedef int32_t tickertape_readers_dir_state;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/**
+ * One sample of a journal's operational state (an opaque, immutable handle): what `tickertape status` prints.
+ * Take one with `tickertape_journal_status_sample`, free it with `tickertape_journal_status_free`.
+ *
+ * The functions that take a `const tickertape_journal_status *` only read it, so several threads may call them on
+ * one sample at once; `tickertape_journal_status_free` must not run at the same time as any of them. The sample does
+ * not keep any file open.
+ */
+typedef struct tickertape_journal_status tickertape_journal_status;
+
+/**
  * A journal reader (an opaque handle). Open with `tickertape_reader_open` or
  * `tickertape_reader_open_mapped_unsafe`, close with `tickertape_reader_close`.
  *
@@ -523,11 +779,418 @@ typedef struct tickertape_retention_report {
 } tickertape_retention_report;
 
 /**
+ * The values of a journal status sample, an extensible struct (ADR 0028 → Versioning), filled by
+ * `tickertape_journal_status_get_report`.
+ *
+ * Set `struct_size` to `sizeof(tickertape_journal_status_report)` before the call. The library rejects a
+ * `struct_size` below 272 with `TICKERTAPE_E_INVALID_ARGUMENT`, writes `min(struct_size, the library's own size)`
+ * bytes, and stores the number of bytes it filled back into `struct_size`. Later versions only append fields.
+ *
+ * Fields marked "or `TICKERTAPE_UNKNOWN`" hold that value when the sample could not establish them. Ages and
+ * timestamps are nanoseconds; ages are estimates from file times and the observer's wall clock (ADR 0032 → What is
+ * measured). Booleans are 0 or 1.
+ */
+typedef struct tickertape_journal_status_report {
+  /**
+   * In: the size of the caller's struct. Out: the number of bytes the library filled.
+   */
+  uint64_t struct_size;
+  /**
+   * The observer's wall clock after reading the checkpoint marker and the beacons, nanoseconds since the Unix
+   * epoch. Ages are measured from it.
+   */
+  uint64_t sampled_unix_ns;
+  /**
+   * The head: the sequence number the next record will get, as far as the newest segment shows.
+   */
+  uint64_t head_next_seq;
+  /**
+   * Base sequence number of the newest segment.
+   */
+  uint64_t head_segment_base_seq;
+  /**
+   * Offset of the head in that segment.
+   */
+  uint64_t head_offset;
+  /**
+   * Size of the newest segment, in bytes.
+   */
+  uint64_t head_segment_size;
+  /**
+   * `local_ts_ns` of the last record the scan passed in the newest segment (caller-supplied, in the producer's
+   * clock), or `TICKERTAPE_UNKNOWN` if it passed none or the timestamp is not set.
+   */
+  uint64_t head_last_local_ts_ns;
+  /**
+   * What the sample found at the head: a `tickertape_head_end`.
+   */
+  int32_t head_end;
+  /**
+   * The `tickertape_corrupt_reason` if `head_end` is `TICKERTAPE_HEAD_INVALID`, else `TICKERTAPE_CORRUPT_NONE`.
+   */
+  int32_t head_corrupt_reason;
+  /**
+   * 1 if the sample validated every record from the checkpoint marker's position (without a marker, from the
+   * start of the oldest segment) to the head. 0 means the segments in between were not read (or the head is at
+   * invalid bytes): a missing or damaged one would not have been noticed, and 0 with no breach does **not** mean
+   * that a writer would open the journal.
+   */
+  uint32_t head_verified;
+  /**
+   * 1 if the segment listing alone proves a segment missing between the checkpoint (or the oldest segment) and
+   * the head: a writer refuses the journal (a corruption breach).
+   */
+  uint32_t head_chain_broken;
+  /**
+   * Number of segment files.
+   */
+  uint64_t segment_count;
+  /**
+   * Base sequence number of the oldest segment.
+   */
+  uint64_t first_seq;
+  /**
+   * Sum of the segment files' (preallocated) sizes.
+   */
+  uint64_t segments_total_bytes;
+  /**
+   * Creation time from the oldest segment's header (the writer's wall clock), or `TICKERTAPE_UNKNOWN` if its
+   * header could not be read.
+   */
+  uint64_t oldest_segment_created_unix_ns;
+  /**
+   * Segments older than the checkpoint marker's segment (the ones retention could remove). 0 without a marker.
+   */
+  uint64_t segments_before_checkpoint;
+  /**
+   * 1 if there is a valid checkpoint marker. If 0, the `checkpoint_*` values are `TICKERTAPE_UNKNOWN` and the
+   * `checkpoint_*` enums 0.
+   */
+  uint32_t has_checkpoint;
+  /**
+   * A `tickertape_checkpoint_problem`: why the marker cannot be used, if it cannot (a corruption breach).
+   */
+  int32_t checkpoint_problem;
+  /**
+   * The marker's generation.
+   */
+  uint64_t checkpoint_generation;
+  /**
+   * The marker's `next_seq`: every record below it was durable when the marker was written.
+   */
+  uint64_t checkpoint_next_seq;
+  /**
+   * The segment of the marker's position.
+   */
+  uint64_t checkpoint_segment_base_seq;
+  /**
+   * The offset of the marker's position in that segment.
+   */
+  uint64_t checkpoint_offset;
+  /**
+   * The marker file's modification time, nanoseconds since the Unix epoch, or `TICKERTAPE_UNKNOWN`.
+   */
+  uint64_t checkpoint_modified_unix_ns;
+  /**
+   * Estimated time since the last checkpoint (the observer's clock minus `checkpoint_modified_unix_ns`), or
+   * `TICKERTAPE_UNKNOWN` with the reason in `checkpoint_age_unknown`.
+   */
+  uint64_t checkpoint_estimated_age_ns;
+  /**
+   * A `tickertape_age_unknown`: why `checkpoint_estimated_age_ns` is unknown.
+   */
+  int32_t checkpoint_age_unknown;
+  /**
+   * 1 if the exposure values are counted over records the sample validated (`head_verified`); 0 if they are
+   * what the newest segment implies.
+   */
+  uint32_t exposure_verified;
+  /**
+   * Committed records a power loss now could remove (not covered by the marker), or `TICKERTAPE_UNKNOWN` (the
+   * marker cannot be used, a segment in between is proven missing, or the head is at invalid bytes).
+   */
+  uint64_t exposure_records;
+  /**
+   * Segment-file footprint between the marker's position and the head, or `TICKERTAPE_UNKNOWN`.
+   */
+  uint64_t exposure_bytes;
+  /**
+   * Estimated upper bound on how long the uncovered records have been exposed (0 if there are none), or
+   * `TICKERTAPE_UNKNOWN`.
+   */
+  uint64_t exposure_estimated_age_ns;
+  /**
+   * `local_ts_ns` of the oldest uncovered record (producer's clock), or `TICKERTAPE_UNKNOWN`.
+   */
+  uint64_t exposure_oldest_local_ts_ns;
+  /**
+   * Bytes available to unprivileged users on the journal's filesystem (`statvfs`).
+   */
+  uint64_t storage_available_bytes;
+  /**
+   * Size of that filesystem.
+   */
+  uint64_t storage_total_bytes;
+  /**
+   * Size assumed for the segments still to come (the prepared spare's, else the newest segment's).
+   */
+  uint64_t storage_next_segment_size;
+  /**
+   * Estimated number of further segment rolls that fit: `storage_available_bytes / storage_next_segment_size`.
+   * Optimistic on btrfs (ADR 0032 → Headroom).
+   */
+  uint64_t storage_estimated_rolls_left;
+  /**
+   * 1 if a fully allocated prepared next segment exists (not counted in `storage_estimated_rolls_left`).
+   */
+  uint32_t storage_spare_segment;
+  /**
+   * A `tickertape_readers_dir_state`: whether the beacon directory could be listed.
+   */
+  int32_t readers_dir_state;
+  /**
+   * The PID the most recent writer recorded in `writer.lock` (it stays after that writer exits), or
+   * `TICKERTAPE_UNKNOWN`. Informational, never used for health.
+   */
+  uint64_t writer_pid;
+  /**
+   * 1 if a process with `writer_pid` exists (a PID can be reused), 0 if not, or `TICKERTAPE_UNKNOWN`.
+   */
+  uint64_t writer_alive;
+  /**
+   * Number of reader beacons in the beacon directory: valid indexes for `tickertape_journal_status_get_beacon`.
+   */
+  uint64_t beacon_count;
+} tickertape_journal_status_report;
+
+/**
+ * A reader in another process, from its beacon (ADR 0032 → Reader positions from other processes), an extensible
+ * struct filled by `tickertape_journal_status_get_beacon`.
+ *
+ * Set `struct_size` to `sizeof(tickertape_beacon_status)` before the call. The library rejects a `struct_size`
+ * below 120 with `TICKERTAPE_E_INVALID_ARGUMENT`, writes `min(struct_size, the library's own size)` bytes, and
+ * stores the number of bytes it filled back into `struct_size`. Later versions only append fields.
+ */
+typedef struct tickertape_beacon_status {
+  /**
+   * In: the size of the caller's struct. Out: the number of bytes the library filled.
+   */
+  uint64_t struct_size;
+  /**
+   * A `tickertape_beacon_state`.
+   */
+  int32_t state;
+  /**
+   * 1 if the beacon's contents were read (not for `TICKERTAPE_BEACON_INVALID`, `_UNREADABLE` or `_CHANGING`).
+   * If 0, the `report_*` values are `TICKERTAPE_UNKNOWN` (the flags 0) and so is every lag value.
+   */
+  uint32_t has_report;
+  /**
+   * 1 if a seek was pending at the last write: the byte lag and unread age are then unknown.
+   */
+  uint32_t report_seek_pending;
+  /**
+   * 1 if the reader is durable-only: its lag is measured against the checkpoint marker.
+   */
+  uint32_t report_durable_only;
+  /**
+   * A `tickertape_lag_unknown`: why `lag_records` is unknown for a beacon that could be read.
+   */
+  int32_t lag_unknown;
+  /**
+   * Always 0.
+   */
+  uint32_t reserved;
+  /**
+   * The owner's PID as it recorded it (informational), or `TICKERTAPE_UNKNOWN`.
+   */
+  uint64_t report_pid;
+  /**
+   * Sequence number of the next record the reader returns, or `TICKERTAPE_UNKNOWN`.
+   */
+  uint64_t report_next_seq;
+  /**
+   * Sequence number expected at the slot the reader reads next (differs from `report_next_seq` while a seek is
+   * pending), or `TICKERTAPE_UNKNOWN`.
+   */
+  uint64_t report_slot_seq;
+  /**
+   * That slot's segment, or `TICKERTAPE_UNKNOWN`.
+   */
+  uint64_t report_segment_base_seq;
+  /**
+   * That slot's offset, or `TICKERTAPE_UNKNOWN`.
+   */
+  uint64_t report_offset;
+  /**
+   * The owner's wall-clock time of the last write, nanoseconds since the Unix epoch, or `TICKERTAPE_UNKNOWN`.
+   */
+  uint64_t report_updated_unix_ns;
+  /**
+   * Time since the last write by the observer's clock, or `TICKERTAPE_UNKNOWN` (no report, or a write time in
+   * the future).
+   */
+  uint64_t update_age_ns;
+  /**
+   * Records the reader could return now but had not at its last write, or `TICKERTAPE_UNKNOWN` (see
+   * `lag_unknown`).
+   */
+  uint64_t lag_records;
+  /**
+   * Segment-file footprint between the reader's cursor and its target, or `TICKERTAPE_UNKNOWN` (a pending seek,
+   * or a segment of either end not listed).
+   */
+  uint64_t lag_bytes;
+  /**
+   * `local_ts_ns` of the first record the reader has not returned, or `TICKERTAPE_UNKNOWN`.
+   */
+  uint64_t oldest_unread_local_ts_ns;
+  /**
+   * The observer's clock minus `oldest_unread_local_ts_ns` (0 if the reader has caught up), or
+   * `TICKERTAPE_UNKNOWN`. Meaningful when the producer stamps `local_ts_ns` from this host's wall clock.
+   */
+  uint64_t unread_age_ns;
+} tickertape_beacon_status;
+
+/**
+ * What only the writer knows, an extensible struct filled by `tickertape_writer_get_metrics`.
+ *
+ * Set `struct_size` to `sizeof(tickertape_writer_metrics)` before the call. The library rejects a `struct_size`
+ * below 112 with `TICKERTAPE_E_INVALID_ARGUMENT`, writes `min(struct_size, the library's own size)` bytes, and stores
+ * the number of bytes it filled back into `struct_size`. Later versions only append fields.
+ */
+typedef struct tickertape_writer_metrics {
+  /**
+   * In: the size of the caller's struct. Out: the number of bytes the library filled.
+   */
+  uint64_t struct_size;
+  /**
+   * The sequence number the next append gets.
+   */
+  uint64_t head_next_seq;
+  /**
+   * Base sequence number of the active segment.
+   */
+  uint64_t head_segment_base_seq;
+  /**
+   * Where the next record will be written in that segment.
+   */
+  uint64_t head_offset;
+  /**
+   * Size of the active segment.
+   */
+  uint64_t segment_size;
+  /**
+   * 1 if there is a checkpoint marker (as this writer last wrote it or read it at open). If 0, the
+   * `checkpoint_*` values are `TICKERTAPE_UNKNOWN`.
+   */
+  uint32_t has_checkpoint;
+  /**
+   * 1 after a failed checkpoint: later checkpoints fail with `TICKERTAPE_E_DURABILITY_LOST`.
+   */
+  uint32_t poisoned;
+  /**
+   * The marker's generation.
+   */
+  uint64_t checkpoint_generation;
+  /**
+   * The marker's `next_seq`.
+   */
+  uint64_t checkpoint_next_seq;
+  /**
+   * The segment of the marker's position.
+   */
+  uint64_t checkpoint_segment_base_seq;
+  /**
+   * The offset of the marker's position.
+   */
+  uint64_t checkpoint_offset;
+  /**
+   * Nanoseconds since this writer's last successful checkpoint by the monotonic clock (immune to wall-clock
+   * steps), or `TICKERTAPE_UNKNOWN` if this writer has not checkpointed yet.
+   */
+  uint64_t since_checkpoint_ns;
+  /**
+   * Records appended but not covered by the marker (with no marker, every record from the start of the oldest
+   * segment when the writer opened).
+   */
+  uint64_t uncheckpointed_records;
+  /**
+   * Bytes of records and seals appended after the marker, in every segment: what a power loss could remove.
+   */
+  uint64_t uncheckpointed_bytes;
+  /**
+   * Retention runs that failed since open; the last error is `tickertape_writer_last_retention_error`.
+   */
+  uint64_t retention_failures;
+} tickertape_writer_metrics;
+
+/**
+ * A reader's cursor and its lag behind a journal status sample, an extensible struct filled by
+ * `tickertape_reader_get_metrics`.
+ *
+ * Set `struct_size` to `sizeof(tickertape_reader_metrics)` before the call. The library rejects a `struct_size`
+ * below 72 with `TICKERTAPE_E_INVALID_ARGUMENT`, writes `min(struct_size, the library's own size)` bytes, and stores
+ * the number of bytes it filled back into `struct_size`. Later versions only append fields.
+ */
+typedef struct tickertape_reader_metrics {
+  /**
+   * In: the size of the caller's struct. Out: the number of bytes the library filled.
+   */
+  uint64_t struct_size;
+  /**
+   * Sequence number of the next record the reader returns (as `tickertape_reader_position`).
+   */
+  uint64_t next_seq;
+  /**
+   * Sequence number expected at the slot the reader reads next. Equal to `next_seq` unless a seek is pending,
+   * or the handle holds a record back (`held_record`), when it is `next_seq + 1`.
+   */
+  uint64_t slot_seq;
+  /**
+   * That slot's segment.
+   */
+  uint64_t segment_base_seq;
+  /**
+   * That slot's offset.
+   */
+  uint64_t offset;
+  /**
+   * 1 while the target of a seek is still ahead of the slot (the byte lag is then unknown).
+   */
+  uint32_t seek_pending;
+  /**
+   * 1 if the reader is durable-only: its lag is measured against the checkpoint marker, not the head.
+   */
+  uint32_t durable_only;
+  /**
+   * 1 if the handle holds a record that did not fit the caller's buffer (`tickertape_reader_next_copy`,
+   * `tickertape_reader_read_batch`); the next read returns it. It counts in `lag_records`.
+   */
+  uint32_t held_record;
+  /**
+   * A `tickertape_lag_unknown`: why `lag_records` is unknown.
+   */
+  int32_t lag_unknown;
+  /**
+   * Records the reader could return now but has not (committed records, or for a durable-only reader, records
+   * covered by the marker), as of the sample, or `TICKERTAPE_UNKNOWN` (see `lag_unknown`).
+   */
+  uint64_t lag_records;
+  /**
+   * Segment-file footprint between the cursor and its target (0 when `lag_records` is), or `TICKERTAPE_UNKNOWN`
+   * (a pending seek, a held record, or a segment of either end not listed).
+   */
+  uint64_t lag_bytes;
+} tickertape_reader_metrics;
+
+/**
  * A committed, validated record. The layout is frozen for format version 1.
  *
  * Returned by `tickertape_reader_next` as a **borrowed view**: `payload` points into the reader's buffer or, for a
  * mapped reader, into the memory-mapped segment, and stays valid only until the next call that takes the same
- * reader (other than `tickertape_reader_position`) or until the reader is closed. Copy what you need to keep. Returned
+ * reader (other than `tickertape_reader_position` and `tickertape_reader_get_metrics`) or until the reader is closed.
+ * Copy what you need to keep. Returned
  * by `tickertape_reader_next_copy` and `tickertape_reader_read_batch` with `payload` pointing into the caller's
  * buffer. When `payload_len` is 0, `payload` is NULL.
  */
@@ -709,6 +1372,123 @@ tickertape_status tickertape_retention_apply(const char *dir,
                                              const struct tickertape_retention *retention,
                                              int32_t dry_run,
                                              struct tickertape_retention_report *report);
+
+/**
+ * Takes one read-only sample of the journal in directory `dir` (ADR 0032; what `tickertape status` prints) and
+ * stores a new handle in `*status_out` (NULL on failure). No writer is needed and none is disturbed: the sample
+ * takes no lock anybody waits for, never writes, and opens every file non-blocking.
+ *
+ * Beacons are read from `readers_dir`, or from `<dir>/readers` if it is NULL. A beacon that cannot be read, or a
+ * beacon directory that cannot be listed, is reported in the sample and never fails it.
+ *
+ * Cost (the full list is in ADR 0032 → Sampling cost): a listing of `dir`; the checkpoint marker (up to two 64-byte
+ * `pread`s); a `pread` scan of the newest segment from the marker's position if the marker is in it, otherwise from
+ * its first record, so the cost grows with what was appended since the last checkpoint; the headers of the oldest
+ * segment and the marker's segment; `statvfs`; `writer.lock` (the PID, read without locking) and `kill(pid, 0)`; a
+ * listing of the beacon directory and each beacon (129 bytes and a lock probe), plus one record read per lagging
+ * beacon. Segments between the marker's segment and the newest are listed, not read. No file stays open after the
+ * call.
+ *
+ * Errors: `TICKERTAPE_E_NOT_FOUND` if `dir` has no segments; `TICKERTAPE_E_CORRUPT` if it has none but the marker
+ * names one, or if the newest segment's header is invalid; `TICKERTAPE_E_UNSUPPORTED_VERSION`; `TICKERTAPE_E_IO`
+ * (including when the writer rolled 16 times during one sample).
+ *
+ * # Safety
+ *
+ * `dir` must be NULL or a NUL-terminated string, and `readers_dir` NULL or a NUL-terminated string; both stay
+ * unmodified until the call returns. `status_out` must be NULL or valid for writing a pointer, and must not overlap
+ * either string.
+ */
+tickertape_status tickertape_journal_status_sample(const char *dir,
+                                                   const char *readers_dir,
+                                                   struct tickertape_journal_status **status_out);
+
+/**
+ * Frees a journal status sample. NULL is ignored.
+ *
+ * # Safety
+ *
+ * `status` must be NULL or a live sample from `tickertape_journal_status_sample`, not in use by another thread.
+ * Using or freeing it again afterwards is undefined behaviour; so is using a beacon name it returned.
+ */
+void tickertape_journal_status_free(struct tickertape_journal_status *status);
+
+/**
+ * Writes the values of a journal status sample to `*report`. No system calls.
+ *
+ * Errors: `TICKERTAPE_E_INVALID_ARGUMENT` if a pointer is NULL or `report->struct_size` is below the minimum (see
+ * `tickertape_journal_status_report`).
+ *
+ * # Safety
+ *
+ * `status` must be NULL or a live sample. `report` must be NULL or point to a caller-owned, 8-byte aligned struct
+ * of `report->struct_size` writable bytes whose `struct_size` is set.
+ */
+tickertape_status tickertape_journal_status_get_report(const struct tickertape_journal_status *status,
+                                                       struct tickertape_journal_status_report *report);
+
+/**
+ * Writes what beacon `index` (0 to `beacon_count - 1`, sorted by name) of a journal status sample says to
+ * `*beacon`. No system calls.
+ *
+ * Errors: `TICKERTAPE_E_INVALID_ARGUMENT` if a pointer is NULL, `index` is out of range, or `beacon->struct_size`
+ * is below the minimum (see `tickertape_beacon_status`).
+ *
+ * # Safety
+ *
+ * `status` must be NULL or a live sample. `beacon` must be NULL or point to a caller-owned, 8-byte aligned struct
+ * of `beacon->struct_size` writable bytes whose `struct_size` is set.
+ */
+tickertape_status tickertape_journal_status_get_beacon(const struct tickertape_journal_status *status,
+                                                       size_t index,
+                                                       struct tickertape_beacon_status *beacon);
+
+/**
+ * Returns the name of beacon `index` of a journal status sample (its file name in the beacon directory: 1 to 64
+ * ASCII letters, digits, `.`, `_` and `-`), or NULL if `status` is NULL or `index` is out of range. The string
+ * belongs to the sample and stays valid until it is freed. Does not set the last error.
+ *
+ * # Safety
+ *
+ * `status` must be NULL or a live sample.
+ */
+const char *tickertape_journal_status_beacon_name(const struct tickertape_journal_status *status, size_t index);
+
+/**
+ * Writes the writer's metrics to `*metrics`: what only the writer knows (its head, the last checkpoint by the
+ * monotonic clock, uncheckpointed records and bytes, whether it is poisoned, retention failures). No system calls
+ * (one monotonic clock read).
+ *
+ * Errors: `TICKERTAPE_E_INVALID_ARGUMENT` if a pointer is NULL or `metrics->struct_size` is below the minimum (see
+ * `tickertape_writer_metrics`); `TICKERTAPE_E_BUSY` from a fill callback of the same writer.
+ *
+ * # Safety
+ *
+ * `writer` must be NULL or a live writer handle. `metrics` must be NULL or point to a caller-owned, 8-byte aligned
+ * struct of `metrics->struct_size` writable bytes whose `struct_size` is set.
+ */
+tickertape_status tickertape_writer_get_metrics(struct tickertape_writer *writer,
+                                                struct tickertape_writer_metrics *metrics);
+
+/**
+ * Writes the reader's cursor and its lag behind the journal status sample `status` to `*metrics`: how many records
+ * it could return now but has not, as of the sample (behind the head, or for a durable-only reader, behind the
+ * checkpoint marker). The reader's segment must be the file the sample listed under that name; otherwise the lag is
+ * unknown, with the reason in `lag_unknown`. Take the sample after the reader's last read for an up-to-date lag. No
+ * system calls (a search of the sample's segment list). Does not invalidate a record view returned by
+ * `tickertape_reader_next`.
+ *
+ * Errors: `TICKERTAPE_E_INVALID_ARGUMENT` if a pointer is NULL or `metrics->struct_size` is below the minimum (see
+ * `tickertape_reader_metrics`).
+ *
+ * # Safety
+ *
+ * `reader` must be NULL or a live reader handle, and `status` NULL or a live sample. `metrics` must be NULL or point
+ * to a caller-owned, 8-byte aligned struct of `metrics->struct_size` writable bytes whose `struct_size` is set.
+ */
+tickertape_status tickertape_reader_get_metrics(struct tickertape_reader *reader,
+                                                const struct tickertape_journal_status *status,
+                                                struct tickertape_reader_metrics *metrics);
 
 /**
  * Creates writer options with the defaults: 128 MiB segments, `TICKERTAPE_RECOVERY_QUARANTINE`, notify on,
@@ -1003,7 +1783,8 @@ tickertape_status tickertape_reader_seek(struct tickertape_reader *reader, uint6
  * covered by a checkpoint (**durable**) and treats the rest as not written yet.
  *
  * The view's `payload` is valid until the next call that takes this reader (other than
- * `tickertape_reader_position`) or until the reader is closed. It is NULL when `payload_len` is 0.
+ * `tickertape_reader_position` and `tickertape_reader_get_metrics`) or until the reader is closed. It is NULL when
+ * `payload_len` is 0.
  *
  * Errors: `TICKERTAPE_E_CORRUPT` if the bytes at the cursor fail validation (the cursor does not move, so calling
  * again retries the same position, which may succeed after a writer recovery); `TICKERTAPE_E_DISCARDED` if writer

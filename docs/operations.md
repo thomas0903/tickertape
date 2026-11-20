@@ -172,6 +172,12 @@ step), or after the marker was cut short. A clock stepped forward, a later `touc
 was created can't be detected and make the estimate too large or too small. Inside the writer,
 `Writer::metrics().since_checkpoint` uses the monotonic clock instead.
 
+From C, C++, Python and Java the same values come from `tickertape_journal_status_sample`,
+`tickertape_writer_get_metrics` and `tickertape_reader_get_metrics` and their wrappers (see
+[`c-api.md`](c-api.md#operational-metrics), [`cpp-api.md`](cpp-api.md#operational-metrics),
+[`python.md`](python.md#operational-metrics), [`java-api.md`](java-api.md#operational-metrics)); they report unknown
+values the same way, and cost what `status()`, `Writer::metrics()` and `Status::lag()` cost.
+
 ### Cost of sampling
 
 | Call | Cost |

@@ -189,8 +189,8 @@ What it does not change:
   `open` fails with `invalid_argument` rather than meaning "the defaults".
 - **`RecordView` borrows.** `Reader::next` returns a view whose payload points into the reader's buffer (safe reader)
   or into the memory-mapped segment (mapped reader). **It is valid until the next call on that reader other than
-  `position()`, or until the reader is moved or destroyed.** The view's `seq()`, `schema_id()`, `venue_ts_ns()`,
-  `local_ts_ns()`, `size()` and `empty()` are copies and stay valid; `data()`, `as_string_view()` and `as_span()`
+  `position()` and `metrics()`, or until the reader is moved or destroyed.** The view's `seq()`, `schema_id()`,
+  `venue_ts_ns()`, `local_ts_ns()`, `size()` and `empty()` are copies and stay valid; `data()`, `as_string_view()` and `as_span()`
   read the payload. Copy what you need to keep: `std::string(view.as_string_view())`.
 - **Debug check:** in builds without `NDEBUG` (or with `TICKERTAPE_DEBUG_CHECKS` defined to 1), fetching the payload
   through a view (`data()`, `as_string_view()`, `as_span()`) after its reader moved on aborts with a message, also
@@ -404,6 +404,35 @@ not recorded.
   `Writer::last_retention_error()`), or to `tickertape::apply_retention(dir, settings)` to run once.
   `tickertape::plan_retention(dir, settings)` says what would be removed, without an action and without changing
   anything.
+
+## Operational metrics
+
+The values `tickertape status` prints (ADR [0032](decisions/0032-operational-metrics.md); their meaning and accuracy:
+[`operations.md`](operations.md#monitoring)), over the C calls in [`c-api.md` → Operational
+metrics](c-api.md#operational-metrics), which also lists what each costs:
+
+```cpp
+tickertape::JournalStatus status = tickertape::JournalStatus::sample(dir).value();  // no writer needed
+const tickertape::StatusReport &r = status.report();
+if (r.exposure.records) std::printf("not durable yet: %llu records\n", (unsigned long long)*r.exposure.records);
+if (auto lag = reader.metrics(status).value().lag) std::printf("behind: %llu\n", (unsigned long long)lag->records);
+tickertape::WriterMetrics w = writer.metrics().value();  // in the writer's process: no system calls
+```
+
+- `JournalStatus::sample(dir)` (or `sample(dir, readers_dir)`) reads the values once into a `StatusReport` and the
+  reader beacons into `beacons()` (a `std::vector<BeaconStatus>`, sorted by name), and keeps the C sample for
+  `Reader::metrics`. It is move-only and keeps no file open; its const member functions may be called from several
+  threads at once.
+- Unknown values are empty `std::optional`s, never guesses; ages are `std::chrono::nanoseconds`. Enumerations
+  (`HeadEnd`, `CheckpointProblem`, `AgeUnknown`, `LagUnknown`, `BeaconState`, `ReadersDirState`) name every C value.
+- Corruption is `report().head.end == HeadEnd::invalid`, a `checkpoint->problem` other than `usable`, or
+  `head.chain_broken`. `head.verified == false` means the segments between the checkpoint and the newest were not
+  read: no corruption reported then does not mean that a writer would open the journal.
+- `Reader::metrics(status)` measures against the sample: take it after the reads you want counted. Its `lag` is empty,
+  with the reason in `lag_unknown`, when the reader's segment is not the one the sample listed (removed by retention,
+  another file, or newer than the sample). It does not invalidate a `RecordView`.
+- `Writer::metrics()` makes no system call. Like every value type of the binding, these structs gain no members
+  within a major version (ADR 0036 → Versioning); later values come as new types or functions.
 
 ## Versioning
 

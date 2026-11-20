@@ -5,6 +5,26 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
+- Operational metrics through the C ABI and the bindings (ADR 0032 → Bindings; ADR 0028 amended), additively: new
+  symbols only, nothing on the append or per-record read paths.
+  - C ABI: `tickertape_journal_status_sample` (an immutable sample handle that several threads may read at once,
+    freed by `tickertape_journal_status_free`), `tickertape_journal_status_get_report`, `_get_beacon` and
+    `_beacon_name`, `tickertape_writer_get_metrics` and `tickertape_reader_get_metrics`; the extensible structs
+    `tickertape_journal_status_report`, `tickertape_beacon_status`, `tickertape_writer_metrics` and
+    `tickertape_reader_metrics`; the enums `tickertape_head_end`, `tickertape_checkpoint_problem`,
+    `tickertape_age_unknown`, `tickertape_lag_unknown`, `tickertape_beacon_state` and `tickertape_readers_dir_state`;
+    `TICKERTAPE_UNKNOWN` (`UINT64_MAX`) for values a sample could not establish. `tickertape_reader_get_metrics` does
+    not invalidate a record view (the documentation of `tickertape_reader_next` and `tickertape_record` says so).
+  - C++: `tickertape::JournalStatus::sample`, `StatusReport`, `BeaconStatus`, `Writer::metrics`,
+    `Reader::metrics(const JournalStatus &)`, and the matching enumerations. `Checkpoint` moved up in the header
+    (unchanged).
+  - Python: `tickertape.status(path, readers_dir=None)` returning `JournalStatus`, `Writer.metrics()`,
+    `Reader.metrics(status)`, and their named tuples.
+  - Java: `JournalStatus.sample`, `Writer.metrics()`, `Reader.metrics(JournalStatus)`, `WriterMetrics`,
+    `ReaderMetrics`, `BeaconStatus`, `Position`, `Lag` and the enums `HeadEnd`, `CheckpointProblem`, `AgeUnknown`,
+    `LagUnknown`, `BeaconState`, `ReadersDirState`.
+  - Not exposed outside Rust yet: `Sampler` (rates, time to full), `Status::breaches` and creating reader beacons.
+
 - Release operations: install channels, part 2 (ADR 0031). Every new publishing step is switched off until the owner
   enables it (repository variables `PYPI_CLI_PUBLISHING` and `MAVEN_CENTRAL_PUBLISHING`, environments `pypi-cli` and
   `maven-central`; the release checklist has the one-time set-up), and none runs for pull requests or `main`.
