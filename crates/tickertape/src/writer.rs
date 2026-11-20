@@ -171,6 +171,7 @@ impl Writer {
             config: &config,
             report: &mut report,
             dirty_dirs: BTreeSet::new(),
+            held: Vec::new(),
         };
         rec.remove_tmp_files()?;
         let (checkpoint_file, checkpoint, checkpoint_file_short) = rec.open_checkpoint_file()?;
@@ -1378,12 +1379,47 @@ enum Restore {
     Replace,
 }
 
+/// A change to the journal that recovery under [`RecoveryPolicy::Fail`] holds back once it has decided to restore a
+/// header, until the open can no longer refuse (crash contract C11; [`Recovery::commit_held`]).
+enum Held {
+    /// Write the header of the segment for `base`, whose file `file` has the valid segment size `len`, again.
+    Header {
+        file: Arc<File>,
+        path: PathBuf,
+        base: u64,
+        len: u64,
+    },
+    /// Rename the segment prepared and synced under `tmp` over the all-zero file at `path` (`Restore::Replace`).
+    Rename { tmp: PathBuf, path: PathBuf },
+    /// Publish the segment prepared and synced under `tmp` as `path`, which does not exist: a created successor.
+    Link { tmp: PathBuf, path: PathBuf },
+    /// Zero `len` bytes at `start` of the segment in `file` (of size `size`): an uncommitted tail.
+    Zero {
+        file: Arc<File>,
+        path: PathBuf,
+        size: u64,
+        start: u64,
+        len: u64,
+    },
+    /// Write a seal for `next_seq` at `offset` of the segment in `file` (of size `size`).
+    Seal {
+        file: Arc<File>,
+        path: PathBuf,
+        size: u64,
+        offset: u64,
+        next_seq: u64,
+    },
+}
+
 /// Recovery context (`docs/format.md` → Recovery).
 struct Recovery<'a> {
     dir: &'a Path,
     config: &'a WriterConfig,
     report: &'a mut RecoveryReport,
     dirty_dirs: BTreeSet<PathBuf>,
+    /// Under [`RecoveryPolicy::Fail`]: every change the scan decided from its first restored header on, in order, not
+    /// yet made (C11). Empty under `Quarantine`, which makes each change when it decides it.
+    held: Vec<Held>,
 }
 
 impl Recovery<'_> {
@@ -1438,7 +1474,21 @@ impl Recovery<'_> {
         Ok((file, checkpoint, len < format::CHECKPOINT_FILE_LEN as u64))
     }
 
+    /// Runs the scan. Under `Fail`, a scan that restores a header holds back that change and every later one
+    /// ([`Held`]) and makes them only once nothing can refuse the open any more; when the open is refused, or fails,
+    /// before they are all made, the segments it prepared under temporary names are removed (an interrupted removal
+    /// leaves temporary files, which the next open removes).
     fn recover(&mut self, checkpoint: Option<CheckpointSlot>) -> Result<RecoveredState> {
+        let result = self.scan(checkpoint);
+        for held in self.held.drain(..) {
+            if let Held::Rename { tmp, .. } | Held::Link { tmp, .. } = held {
+                let _ = fs::remove_file(tmp);
+            }
+        }
+        result
+    }
+
+    fn scan(&mut self, checkpoint: Option<CheckpointSlot>) -> Result<RecoveredState> {
         let segments = journal::list_segments(self.dir)?;
         let bases: BTreeSet<u64> = segments.iter().map(|(b, _)| *b).collect();
         if bases.is_empty() {
@@ -1508,18 +1558,14 @@ impl Recovery<'_> {
                         // other error (an I/O error opening, reading or mapping it: `EACCES`, `EMFILE`, `ENOMEM`) says
                         // nothing about the journal and is returned here, before anything is changed, under both
                         // policies.
-                        // A successor whose header never reached the disk counts as opening, but its header is
-                        // restored only below, once nothing in this step can still refuse: a refused open changes
-                        // nothing here (C11).
-                        let opened = match open_segment(self.dir, seq) {
-                            Ok(next) => Some(Ok(next)),
-                            Err(Error::Corrupt { .. }) => {
-                                self.probe_unwritten_header(seq)?.map(Err)
-                            }
-                            Err(Error::UnsupportedVersion { .. }) => None,
+                        // A successor whose header never reached the disk counts as opening once its header is
+                        // restored (under `Fail` that change is held back until nothing can refuse the open, C11).
+                        let opened = match self.open_successor(seq) {
+                            Ok(next) => Some(next),
+                            Err(Error::Corrupt { .. } | Error::UnsupportedVersion { .. }) => None,
                             Err(e) => return Err(e),
                         };
-                        if let Some(successor) = opened {
+                        if let Some(next) = opened {
                             // The successor for exactly `seq` exists, is not this segment (at the first record slot
                             // `seq` is this segment's own base), has not been visited, and opens and maps: `offset`
                             // is where this segment's seal belongs, and the chain continues in the successor (ADR
@@ -1534,7 +1580,6 @@ impl Recovery<'_> {
                                     CorruptReason::BadSeal,
                                 ));
                             }
-                            let next = self.enter(seq, successor)?;
                             if beyond_seal {
                                 // Bytes beyond the seal: no crash leaves them (a roll writes nothing after the seal,
                                 // and records `seq` onwards are in the successor), so this is a damaged seal, not
@@ -1637,10 +1682,21 @@ impl Recovery<'_> {
                             CorruptReason::BrokenChain(seq),
                         ));
                     }
-                    // Crash or power loss during a roll: create the successor.
-                    let next = create_segment(self.dir, seq, self.config.segment_size, true)?;
+                    // Crash or power loss during a roll: create the successor (held back under `Fail` after a
+                    // restored header, C11).
+                    let next = if self.held.is_empty() {
+                        let next = create_segment(self.dir, seq, self.config.segment_size, true)?;
+                        journal::sync_dir(self.dir)?;
+                        next
+                    } else {
+                        let (tmp, next) = self.prepare_segment(seq, self.config.segment_size)?;
+                        self.held.push(Held::Link {
+                            tmp,
+                            path: next.path.clone(),
+                        });
+                        next
+                    };
                     self.dirty_dirs.insert(self.dir.to_path_buf());
-                    journal::sync_dir(self.dir)?;
                     self.report.actions.push(RecoveryAction::CompletedRoll {
                         segment: next.path.clone(),
                     });
@@ -1669,6 +1725,8 @@ impl Recovery<'_> {
                 self.quarantine_segment(path, CorruptReason::BrokenChain(*base))?;
             }
         }
+        // Nothing can refuse the open from here on.
+        self.commit_held()?;
         if !self.report.actions.is_empty() {
             for d in &self.dirty_dirs {
                 journal::sync_dir(d)?;
@@ -1694,11 +1752,12 @@ impl Recovery<'_> {
     /// Opens the segment for `base` that the scan enters after the segment it scanned (named by a valid seal, or the
     /// successor for exactly the expected sequence number at the seal's place). A roll does not sync the new
     /// segment's header (ADR 0038 → Rolls without a sync), so after an OS crash or power loss its name can be on disk
-    /// while its header is not: its first 64 bytes read as zeros. Such a header is written again here (base from
-    /// the name, size from the file, creation time now) and synced, and the segment opens as if it had reached the
-    /// disk; a file that is shorter than a header or whose length is not a valid segment size, and that holds only
-    /// zeros, is replaced by a new empty segment for `base`. Both are reported as
-    /// [`RecoveryAction::RestoredHeader`]. Any other failure to open is returned unchanged.
+    /// while its header is not: its first 64 bytes read as zeros. Such a header is written again (base from the
+    /// name, size from the file, creation time now) and synced, and the segment opens as if it had reached the disk;
+    /// a file that is shorter than a header or whose length is not a valid segment size, and that holds only zeros,
+    /// is replaced by a new empty segment for `base`. Both are reported as [`RecoveryAction::RestoredHeader`]. Under
+    /// `Fail` the change is held back ([`Held`]) and the segment is scanned as if it had been made. Any other failure
+    /// to open is returned unchanged.
     fn open_successor(&mut self, base: u64) -> Result<Segment> {
         match open_segment(self.dir, base) {
             Err(e @ Error::Corrupt { .. }) => match self.probe_unwritten_header(base)? {
@@ -1706,19 +1765,6 @@ impl Recovery<'_> {
                 None => Err(e),
             },
             other => other,
-        }
-    }
-
-    /// The successor for `base` as [`Recovery::open_successor`] gives it: `Ok` if it opened as it is, `Err` if its
-    /// header must be restored first (found by [`Recovery::probe_unwritten_header`]), which this does.
-    fn enter(
-        &mut self,
-        base: u64,
-        successor: std::result::Result<Segment, Restore>,
-    ) -> Result<Segment> {
-        match successor {
-            Ok(next) => Ok(next),
-            Err(restore) => self.restore_unwritten_header(base, restore),
         }
     }
 
@@ -1745,7 +1791,8 @@ impl Recovery<'_> {
     }
 
     /// Restores the header of the segment for `base` as `restore` says (see [`Recovery::open_successor`]), reports it
-    /// and opens the segment.
+    /// and opens the segment. Under `Fail` the change is held back: the segment is mapped from its file as it is
+    /// (`Restore::Header`; the scan does not read the header), or from the prepared replacement (`Restore::Replace`).
     ///
     /// A file replaced by a new empty segment is replaced by renaming a prepared, synced copy over it, as a tail repair
     /// does, so that the name always holds a segment for `base`: an interruption leaves either the old all-zero file,
@@ -1753,54 +1800,164 @@ impl Recovery<'_> {
     /// open removes.
     fn restore_unwritten_header(&mut self, base: u64, restore: Restore) -> Result<Segment> {
         let path = journal::segment_path(self.dir, base);
-        match restore {
+        let hold = self.config.recovery == RecoveryPolicy::Fail;
+        let seg = match restore {
             Restore::Header { len } => {
                 let file = OpenOptions::new()
                     .read(true)
                     .write(true)
                     .open(&path)
                     .map_err(|e| Error::io("open segment", &path, e))?;
-                let header = format::encode_segment_header(&SegmentHeader {
-                    segment_size: len,
-                    base_seq: base,
-                    created_unix_ns: crate::clock::realtime_ns(),
-                });
-                file.write_all_at(&header, 0)
-                    .map_err(|e| Error::io("write segment header", &path, e))?;
-                mmap::sync_data(&file).map_err(|e| Error::io("sync segment", &path, e))?;
+                if hold {
+                    let map = usize::try_from(len)
+                        .map_err(|_| io::Error::other("segment too large"))
+                        .and_then(|len| MapRw::new(&file, len))
+                        .map_err(|e| Error::io("map segment", &path, e))?;
+                    let file = Arc::new(file);
+                    self.held.push(Held::Header {
+                        file: Arc::clone(&file),
+                        path: path.clone(),
+                        base,
+                        len,
+                    });
+                    Segment {
+                        base,
+                        size: len,
+                        path: path.clone(),
+                        file,
+                        map,
+                    }
+                } else {
+                    write_header(&file, &path, base, len)?;
+                    drop(file);
+                    open_segment(self.dir, base)?
+                }
             }
             Restore::Replace => {
-                let size = self.config.segment_size;
-                let tmp = journal::tmp_path(self.dir, base);
-                let _ = fs::remove_file(&tmp);
-                let file = OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create_new(true)
-                    .open(&tmp)
-                    .map_err(|e| Error::io("create segment", &tmp, e))?;
-                crate::fault::inject(crate::fault::Point::Preallocate)
-                    .and_then(|()| mmap::preallocate(&file, size))
-                    .map_err(|e| Error::io("preallocate segment", &tmp, e))?;
-                let header = format::encode_segment_header(&SegmentHeader {
-                    segment_size: size,
-                    base_seq: base,
-                    created_unix_ns: crate::clock::realtime_ns(),
-                });
-                file.write_all_at(&header, 0)
-                    .map_err(|e| Error::io("write segment header", &tmp, e))?;
-                mmap::sync_data(&file).map_err(|e| Error::io("sync segment", &tmp, e))?;
-                crate::fault::inject(crate::fault::Point::RestoreBeforeRename)
-                    .map_err(|e| Error::io("replace segment", &path, e))?;
-                fs::rename(&tmp, &path).map_err(|e| Error::io("replace segment", &path, e))?;
-                journal::sync_dir(self.dir)?;
-                self.dirty_dirs.insert(self.dir.to_path_buf());
+                let (tmp, seg) = self.prepare_segment(base, self.config.segment_size)?;
+                if hold {
+                    self.held.push(Held::Rename {
+                        tmp,
+                        path: path.clone(),
+                    });
+                } else {
+                    self.rename_prepared(&tmp, &path)?;
+                }
+                seg
             }
-        }
+        };
         self.report
             .actions
             .push(RecoveryAction::RestoredHeader { segment: path });
-        open_segment(self.dir, base)
+        Ok(seg)
+    }
+
+    /// Prepares a new empty segment for `base` of `size` bytes under its temporary name, synced and mapped, not yet
+    /// under its name ([`Recovery::rename_prepared`] does that). Returns the temporary name and the segment, whose
+    /// `path` is already its name.
+    fn prepare_segment(&mut self, base: u64, size: u64) -> Result<(PathBuf, Segment)> {
+        let tmp = journal::tmp_path(self.dir, base);
+        let _ = fs::remove_file(&tmp);
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .map_err(|e| Error::io("create segment", &tmp, e))?;
+        let prepared = (|| {
+            crate::fault::inject(crate::fault::Point::Preallocate)
+                .and_then(|()| mmap::preallocate(&file, size))
+                .map_err(|e| Error::io("preallocate segment", &tmp, e))?;
+            write_header(&file, &tmp, base, size)?;
+            usize::try_from(size)
+                .map_err(|_| io::Error::other("segment too large"))
+                .and_then(|len| MapRw::new(&file, len))
+                .map_err(|e| Error::io("map segment", &tmp, e))
+        })();
+        let map = match prepared {
+            Ok(map) => map,
+            Err(e) => {
+                let _ = fs::remove_file(&tmp);
+                return Err(e);
+            }
+        };
+        let seg = Segment {
+            base,
+            size,
+            path: journal::segment_path(self.dir, base),
+            file: Arc::new(file),
+            map,
+        };
+        Ok((tmp, seg))
+    }
+
+    /// Renames a segment prepared by [`Recovery::prepare_segment`] to its name, durably.
+    fn rename_prepared(&mut self, tmp: &Path, path: &Path) -> Result<()> {
+        crate::fault::inject(crate::fault::Point::RestoreBeforeRename)
+            .map_err(|e| Error::io("replace segment", path, e))?;
+        fs::rename(tmp, path).map_err(|e| Error::io("replace segment", path, e))?;
+        journal::sync_dir(self.dir)?;
+        self.dirty_dirs.insert(self.dir.to_path_buf());
+        Ok(())
+    }
+
+    /// Makes the changes held back under `Fail` ([`Held`]), in the order the scan decided them. Each is a change the
+    /// scan would have made at that point under `Quarantine`, so an interruption leaves the journal an interrupted
+    /// `Quarantine` scan leaves at the same point, which the next open handles the same way.
+    fn commit_held(&mut self) -> Result<()> {
+        let held = std::mem::take(&mut self.held);
+        let result = held.iter().enumerate().try_for_each(|(n, change)| {
+            if n > 0 {
+                crate::fault::inject(crate::fault::Point::BetweenHeldChanges)
+                    .map_err(|e| Error::io("recover", self.dir, e))?;
+            }
+            self.make_held(change)
+        });
+        if result.is_err() {
+            // `recover` removes the temporary files of the changes not made (the others no longer exist).
+            self.held = held;
+        }
+        result
+    }
+
+    /// Makes one change held back under `Fail` (see [`Recovery::commit_held`]).
+    fn make_held(&mut self, change: &Held) -> Result<()> {
+        match change {
+            Held::Header {
+                file,
+                path,
+                base,
+                len,
+            } => write_header(file, path, *base, *len),
+            Held::Rename { tmp, path } => self.rename_prepared(tmp, path),
+            Held::Link { tmp, path } => {
+                // As `create_segment` publishes: a link that replaces nothing, then the temporary name removed (a
+                // leftover one is removed by the next open).
+                fs::hard_link(tmp, path).map_err(|e| Error::io("publish segment", path, e))?;
+                let _ = fs::remove_file(tmp);
+                journal::sync_dir(self.dir)
+            }
+            Held::Zero {
+                file,
+                path,
+                size,
+                start,
+                len,
+            } => zero_bytes(&mut map_held(file, path, *size)?, file, path, *start, *len),
+            Held::Seal {
+                file,
+                path,
+                size,
+                offset,
+                next_seq,
+            } => put_seal(
+                &mut map_held(file, path, *size)?,
+                file,
+                path,
+                *offset,
+                *next_seq,
+            ),
+        }
     }
 
     fn dangling(&self, c: CheckpointSlot) -> Error {
@@ -1824,14 +1981,17 @@ impl Recovery<'_> {
             return Ok(());
         };
         let len = end - start;
-        seg.map
-            .bytes_mut(start, len)
-            .ok_or_else(|| Error::io("zero tail", &seg.path, io::Error::other("out of bounds")))?
-            .fill(0);
-        seg.map
-            .sync_range(start, len)
-            .and_then(|()| mmap::sync_data(&seg.file))
-            .map_err(|e| Error::io("sync zeroed tail", &seg.path, e))?;
+        if self.held.is_empty() {
+            zero_bytes(&mut seg.map, &seg.file, &seg.path, start, len)?;
+        } else {
+            self.held.push(Held::Zero {
+                file: Arc::clone(&seg.file),
+                path: seg.path.clone(),
+                size: seg.size,
+                start,
+                len,
+            });
+        }
         self.report.actions.push(RecoveryAction::ZeroedUncommitted {
             segment: seg.path.clone(),
             offset: start,
@@ -1840,20 +2000,19 @@ impl Recovery<'_> {
         Ok(())
     }
 
-    /// Writes a seal for `next_seq` at `offset` and syncs it.
+    /// Writes a seal for `next_seq` at `offset` and syncs it (held back under `Fail` after a restored header, C11).
     fn write_seal(&mut self, seg: &mut Segment, offset: u64, next_seq: u64) -> Result<()> {
-        let oob = || Error::io("write seal", &seg.path, io::Error::other("out of bounds"));
-        seg.map
-            .bytes_mut(offset + format::COMMIT_WORD_LEN as u64, 4)
-            .ok_or_else(oob)?
-            .copy_from_slice(&format::seal_crc(next_seq).to_le_bytes());
-        seg.map
-            .store_commit_word(offset, format::SEAL_MARKER)
-            .ok_or_else(oob)?;
-        seg.map
-            .sync_range(offset, format::SEAL_LEN as u64)
-            .and_then(|()| mmap::sync_data(&seg.file))
-            .map_err(|e| Error::io("sync seal", &seg.path, e))
+        if self.held.is_empty() {
+            return put_seal(&mut seg.map, &seg.file, &seg.path, offset, next_seq);
+        }
+        self.held.push(Held::Seal {
+            file: Arc::clone(&seg.file),
+            path: seg.path.clone(),
+            size: seg.size,
+            offset,
+            next_seq,
+        });
+        Ok(())
     }
 
     /// Creates `quarantine/` if needed, durably.
@@ -1997,6 +2156,50 @@ impl Recovery<'_> {
 /// `successor_pending` says that one exists, is not `seg` and has not been visited, so here it did not open. A later
 /// segment is still not evidence when the non-zero bytes then end within a seal at `offset` (what a crash between
 /// publishing the successor and sealing leaves): the caller reports that tail as a chain broken at `offset`.
+/// Writes a segment header for `base` and size `len` at the start of `file` and syncs it.
+fn write_header(file: &File, path: &Path, base: u64, len: u64) -> Result<()> {
+    let header = format::encode_segment_header(&SegmentHeader {
+        segment_size: len,
+        base_seq: base,
+        created_unix_ns: crate::clock::realtime_ns(),
+    });
+    file.write_all_at(&header, 0)
+        .map_err(|e| Error::io("write segment header", path, e))?;
+    mmap::sync_data(file).map_err(|e| Error::io("sync segment", path, e))
+}
+
+/// Maps the segment in `file` (of size `size`) to make a held-back change ([`Held`]).
+fn map_held(file: &File, path: &Path, size: u64) -> Result<MapRw> {
+    usize::try_from(size)
+        .map_err(|_| io::Error::other("segment too large"))
+        .and_then(|len| MapRw::new(file, len))
+        .map_err(|e| Error::io("map segment", path, e))
+}
+
+/// Zeroes `len` bytes at `start` of a mapped segment and syncs them.
+fn zero_bytes(map: &mut MapRw, file: &File, path: &Path, start: u64, len: u64) -> Result<()> {
+    map.bytes_mut(start, len)
+        .ok_or_else(|| Error::io("zero tail", path, io::Error::other("out of bounds")))?
+        .fill(0);
+    map.sync_range(start, len)
+        .and_then(|()| mmap::sync_data(file))
+        .map_err(|e| Error::io("sync zeroed tail", path, e))
+}
+
+/// Writes a seal for `next_seq` at `offset` of a mapped segment (its CRC word first, then its marker, so a reader
+/// never sees the marker without the CRC) and syncs it.
+fn put_seal(map: &mut MapRw, file: &File, path: &Path, offset: u64, next_seq: u64) -> Result<()> {
+    let oob = || Error::io("write seal", path, io::Error::other("out of bounds"));
+    map.bytes_mut(offset + format::COMMIT_WORD_LEN as u64, 4)
+        .ok_or_else(oob)?
+        .copy_from_slice(&format::seal_crc(next_seq).to_le_bytes());
+    map.store_commit_word(offset, format::SEAL_MARKER)
+        .ok_or_else(oob)?;
+    map.sync_range(offset, format::SEAL_LEN as u64)
+        .and_then(|()| mmap::sync_data(file))
+        .map_err(|e| Error::io("sync seal", path, e))
+}
+
 /// Whether bytes `[from, to)` of `file` are all zero (read in chunks; used only for a segment whose header is
 /// missing).
 fn all_zero(file: &File, path: &Path, from: u64, to: u64) -> Result<bool> {

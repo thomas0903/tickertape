@@ -827,12 +827,14 @@ fn empty_newest_segment_file_is_replaced() {
 /// Later pages of the new segment reached the disk, its first page (header and first records) did not: once the
 /// header is restored this is the state a durable header with a lost first page gives, and it is handled the same
 /// way (C8, C11 (2)): evidence of committed records after an empty commit word, so `Fail` refuses at the first
-/// record slot without changing a byte after the header, and `Quarantine` preserves the records in `quarantine/`.
+/// record slot, and `Quarantine` preserves the records in `quarantine/`. The refused open changes no file, the
+/// header included (C11: under `Fail` a restoration is made only when the open succeeds).
 #[test]
 fn unwritten_first_page_with_later_records_is_a_committed_tail() {
     let dir = tempfile::tempdir().unwrap();
     let (base, newest, _) = rolled_after_checkpoint(dir.path(), 1);
     zero_range(&newest, 0, 4096);
+    let before = snapshot(dir.path());
     match Writer::open(dir.path(), small_config().recovery(RecoveryPolicy::Fail)) {
         Err(Error::Corrupt { path, offset, .. }) => {
             assert_eq!(
@@ -842,9 +844,10 @@ fn unwritten_first_page_with_later_records_is_a_committed_tail() {
         }
         other => panic!("expected a corruption error, got {other:?}"),
     }
-    let image = std::fs::read(&newest).unwrap();
-    assert!(format::decode_segment_header(image[..64].try_into().unwrap()).is_ok());
-    assert!(image[64..4096].iter().all(|&b| b == 0));
+    assert!(
+        snapshot(dir.path()) == before,
+        "the refused open changed a file"
+    );
     assert!(!dir.path().join("quarantine").exists());
 
     let w = Writer::open(dir.path(), small_config()).unwrap();
@@ -871,8 +874,9 @@ fn two_unwritten_segments_restore_the_first_and_disconnect_the_second() {
         let len = std::fs::metadata(path).unwrap().len();
         zero_range(path, 0, len);
     }
-    // `Fail` restores the first header (a crash state, as a missing seal is), then refuses at the disconnected
-    // segment, which it leaves in place (C11 lists what an open may change before it refuses).
+    // `Fail` would restore the first header, then refuses at the disconnected segment: the restoration is held back
+    // and never made, so the refused open changes no file (C11).
+    let before = snapshot(dir.path());
     match Writer::open(dir.path(), small_config().recovery(RecoveryPolicy::Fail)) {
         Err(Error::Corrupt {
             path,
@@ -881,11 +885,12 @@ fn two_unwritten_segments_restore_the_first_and_disconnect_the_second() {
         }) => assert_eq!((path, b), (newest.clone(), base)),
         other => panic!("expected BrokenChain, got {other:?}"),
     }
-    let image = std::fs::read(&previous).unwrap();
-    assert!(format::decode_segment_header(image[..64].try_into().unwrap()).is_ok());
-    assert!(std::fs::read(&newest).unwrap().iter().all(|&b| b == 0));
+    assert!(
+        snapshot(dir.path()) == before,
+        "the refused open changed a file"
+    );
     let w = Writer::open(dir.path(), small_config()).unwrap();
-    assert!(!has_restored(&w, &previous), "{:?}", w.recovery_report());
+    assert!(has_restored(&w, &previous), "{:?}", w.recovery_report());
     assert!(
         w.recovery_report().actions.iter().any(|a| matches!(
             a,
@@ -1005,5 +1010,113 @@ fn fail_refusing_before_an_unwritten_successor_changes_no_file() {
             snapshot(dir.path()) == before,
             "empty file {empty_file}: a file changed"
         );
+    }
+}
+
+/// The state the fuzzer found (`fuzz/seeds/recover_dir/unwritten_successor_then_disconnected_fail`): a segment whose
+/// records end at an empty commit word (its seal never reached the disk), the successor at the seal's place whose
+/// header never reached the disk (an empty file, or a file of zeros), and a later segment, which is disconnected once
+/// the restored successor ends the chain. `Fail` would seal the first segment and restore the successor, then refuses
+/// at the disconnected segment (`BrokenChain`): both changes are held back and never made, so no file changes, byte
+/// for byte, and no temporary file is left (C11). `Quarantine` restores, seals and quarantines the later segment.
+#[test]
+fn fail_refusing_after_an_unwritten_successor_changes_no_file() {
+    for empty_file in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let (newest_base, newest, previous) = rolled_after_checkpoint(dir.path(), 2);
+        let segs = segments(dir.path());
+        let previous_base = segs[segs.len() - 2].0;
+        let first = segs[segs.len() - 3].1.clone();
+        let (end, _) = end_of_records(&first);
+        zero_range(&first, end, format::SEAL_LEN as u64);
+        if empty_file {
+            open_raw(&previous).set_len(0).unwrap();
+        } else {
+            let len = std::fs::metadata(&previous).unwrap().len();
+            zero_range(&previous, 0, len);
+        }
+        let before = snapshot(dir.path());
+        match Writer::open(dir.path(), small_config().recovery(RecoveryPolicy::Fail)) {
+            Err(Error::Corrupt {
+                path,
+                offset: 0,
+                reason: CorruptReason::BrokenChain(b),
+            }) => assert_eq!((path, b), (newest.clone(), newest_base)),
+            other => panic!("empty file {empty_file}: expected BrokenChain, got {other:?}"),
+        }
+        assert!(
+            snapshot(dir.path()) == before,
+            "empty file {empty_file}: the refused open changed a file"
+        );
+
+        let w = Writer::open(dir.path(), small_config()).unwrap();
+        let report = w.recovery_report();
+        assert!(has_restored(&w, &previous), "{empty_file}: {report:?}");
+        assert!(
+            report
+                .actions
+                .iter()
+                .any(|a| matches!(a, RecoveryAction::Sealed { segment } if *segment == first)),
+            "{empty_file}: {report:?}"
+        );
+        assert!(
+            report.actions.iter().any(|a| matches!(
+                a,
+                RecoveryAction::QuarantinedSegment { segment, .. } if *segment == newest
+            )),
+            "{empty_file}: {report:?}"
+        );
+        assert_eq!(w.next_seq(), previous_base, "{empty_file}");
+    }
+}
+
+/// Under `Fail`, the changes held back after a restoration are made in the order the scan decided them, once the open
+/// can no longer refuse (C11). An interruption between two of them (here: after the successor's restoration, before
+/// the seal in front of it) leaves a journal that the next open recovers to the same end, by making the rest.
+#[test]
+fn interrupted_held_changes_are_finished_by_the_next_open() {
+    use tickertape::fault::{self, Point};
+    for empty_file in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let (base, newest, previous) = rolled_after_checkpoint(dir.path(), 1);
+        if empty_file {
+            open_raw(&newest).set_len(0).unwrap();
+        } else {
+            let len = std::fs::metadata(&newest).unwrap().len();
+            zero_range(&newest, 0, len);
+        }
+        let (end, _) = end_of_records(&previous);
+        zero_range(&previous, end, format::SEAL_LEN as u64);
+        let fail = || small_config().recovery(RecoveryPolicy::Fail);
+
+        fault::fail_next(Point::BetweenHeldChanges, 5);
+        let failed = Writer::open(dir.path(), fail());
+        fault::clear();
+        assert!(failed.is_err(), "empty file {empty_file}: {failed:?}");
+        let image = std::fs::read(&newest).unwrap();
+        assert!(
+            format::decode_segment_header(image[..64].try_into().unwrap()).is_ok(),
+            "empty file {empty_file}: the restoration, decided first, was made"
+        );
+        assert_eq!(
+            end_of_records(&previous).0,
+            end,
+            "empty file {empty_file}: the seal was not written"
+        );
+
+        let mut w = Writer::open(dir.path(), fail()).unwrap();
+        let report = w.recovery_report();
+        assert!(!has_restored(&w, &newest), "{empty_file}: {report:?}");
+        assert!(
+            report
+                .actions
+                .iter()
+                .any(|a| matches!(a, RecoveryAction::Sealed { segment } if *segment == previous)),
+            "{empty_file}: {report:?}"
+        );
+        assert_eq!(w.next_seq(), base, "{empty_file}");
+        append_n(&mut w, 5);
+        drop(w);
+        assert_sequence(&read_all(dir.path()), base + 5);
     }
 }
