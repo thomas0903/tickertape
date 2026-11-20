@@ -9,8 +9,9 @@ use parquet::errors::ParquetError;
 use parquet::file::properties::WriterProperties;
 use parquet::file::writer::{SerializedFileWriter, SerializedRowGroupWriter};
 use parquet::schema::parser::parse_message_type;
-use tickertape::{OwnedRecord, Reader};
+use tickertape::OwnedRecord;
 
+use crate::export::Pass;
 use crate::{Decoder, Failure, Result, output};
 
 pub(crate) const SCHEMA: &str = "message tickertape_record {
@@ -35,13 +36,8 @@ fn error(e: ParquetError) -> Failure {
     output::io_error("write Parquet export", e)
 }
 
-/// Export exactly the captured count, closing partial row groups and the file even on a reader error.
-pub(crate) fn write(
-    reader: &mut Reader,
-    count: u64,
-    file: File,
-    decoder: Option<Decoder>,
-) -> Result<()> {
+/// Export exactly the captured records, closing partial row groups and the file even on a reader error.
+pub(crate) fn write(pass: &mut Pass<'_>, file: File, decoder: Option<Decoder>) -> Result<()> {
     let schema = if decoder.is_some() {
         format!("{}\n{}\n}}", SCHEMA.trim_end_matches('}'), DECODED_SCHEMA)
     } else {
@@ -55,45 +51,31 @@ pub(crate) fn write(
     );
     let mut writer = SerializedFileWriter::new(file, schema, properties).map_err(error)?;
     // Keep reader failures separate from writer failures so a readable prefix gets its footer first.
-    let result = write_records(reader, count, &mut writer, decoder);
+    let result = write_records(pass, &mut writer, decoder);
     writer.close().map_err(error)?;
     result
 }
 
 fn write_records(
-    reader: &mut Reader,
-    mut remaining: u64,
+    pass: &mut Pass<'_>,
     writer: &mut SerializedFileWriter<File>,
     decoder: Option<Decoder>,
 ) -> Result<()> {
-    while remaining > 0 {
-        let capacity = remaining.min(ROW_GROUP_ROWS as u64) as usize;
-        let mut rows = Vec::with_capacity(capacity);
-        let mut terminal = None;
-        for _ in 0..capacity {
-            match reader.next_owned() {
-                Ok(Some(record)) => rows.push(record),
-                Ok(None) => {
-                    terminal = Some(Failure::usage(
-                        "journal changed during export: captured records are no longer available",
-                    ));
-                    break;
-                }
-                Err(e) => {
-                    terminal = Some(e.into());
-                    break;
-                }
-            }
+    let mut rows = Vec::with_capacity(pass.count().min(ROW_GROUP_ROWS as u64) as usize);
+    let result = pass.each(|record| {
+        rows.push(record.to_owned());
+        if rows.len() < ROW_GROUP_ROWS {
+            return Ok(());
         }
-        if !rows.is_empty() {
-            write_group(writer, &rows, decoder).map_err(error)?;
-            remaining -= rows.len() as u64;
-        }
-        if let Some(e) = terminal {
-            return Err(e);
-        }
+        let written = write_group(writer, &rows, decoder);
+        rows.clear();
+        written.map_err(error)
+    });
+    // After a reader failure (or a changed journal), the rows read since the last full group are still written.
+    if !rows.is_empty() {
+        write_group(writer, &rows, decoder).map_err(error)?;
     }
-    Ok(())
+    result
 }
 
 fn write_group(
@@ -204,9 +186,10 @@ fn column<T: DataType>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::export;
     use parquet::file::reader::{FileReader, SerializedFileReader};
     use std::io::{Seek, SeekFrom, Write};
-    use tickertape::{NewRecord, ReaderConfig, Writer, WriterConfig};
+    use tickertape::{NewRecord, Reader, ReaderConfig, Writer, WriterConfig};
 
     fn append(writer: &mut Writer) {
         writer
@@ -228,7 +211,9 @@ mod tests {
         let mut reader = Reader::open(dir.path(), ReaderConfig::default()).unwrap();
         append(&mut writer);
         let file = tempfile::NamedTempFile::new().unwrap();
-        write(&mut reader, 1, file.reopen().unwrap(), None).unwrap();
+        let mut pass = export::tests::writing_pass(dir.path(), &mut reader, 1);
+        write(&mut pass, file.reopen().unwrap(), None).unwrap();
+        drop(pass);
         let exported = SerializedFileReader::new(file.reopen().unwrap()).unwrap();
         assert_eq!(exported.metadata().file_metadata().num_rows(), 1);
         assert_eq!(reader.next_owned().unwrap().unwrap().seq, 1);
@@ -251,13 +236,9 @@ mod tests {
                 file.write_all(&[1]).unwrap();
             }
             let file = tempfile::NamedTempFile::new().unwrap();
-            let failure = write(
-                &mut reader,
-                3,
-                file.reopen().unwrap(),
-                Some(Decoder::MarketDemo),
-            )
-            .unwrap_err();
+            let mut pass = export::tests::writing_pass(dir.path(), &mut reader, 3);
+            let failure =
+                write(&mut pass, file.reopen().unwrap(), Some(Decoder::MarketDemo)).unwrap_err();
             assert_eq!(failure.code, if corrupt { 2 } else { 1 });
             let exported = SerializedFileReader::new(file.reopen().unwrap()).unwrap();
             assert_eq!(
@@ -269,5 +250,92 @@ mod tests {
                 if corrupt { 1 } else { 2 }
             );
         }
+    }
+
+    /// Retention removes the segment the writing pass has just read: the export continues in the next segment and is
+    /// complete. If retention also removed the next segment, the export fails naming its first record, after
+    /// finalizing the records before it as a readable file.
+    #[test]
+    fn writing_pass_continues_past_a_removed_segment_it_has_read() {
+        use tickertape::fault::Point;
+        use tickertape::retention::{self, Action, Policy};
+        for (keep, rows) in [(5, 6), (3, 1)] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut writer =
+                Writer::open(dir.path(), WriterConfig::default().segment_size(65536)).unwrap();
+            for _ in 0..6 {
+                writer
+                    .append(&NewRecord {
+                        schema_id: 1,
+                        venue_ts_ns: 0,
+                        local_ts_ns: 0,
+                        payload: &[7; 40_000],
+                    })
+                    .unwrap();
+            }
+            writer.checkpoint().unwrap();
+            let mut reader = Reader::open(dir.path(), ReaderConfig::default()).unwrap();
+            let mut pass = export::tests::writing_pass(dir.path(), &mut reader, 6);
+            let path = dir.path().to_path_buf();
+            tickertape::fault::clear();
+            // At the seal of segment 0, after the reader checked that its segment is in place.
+            tickertape::fault::run_at(Point::ReaderSeal, 0, move || {
+                let plan = retention::plan(&path, &Policy::default().max_segments(keep)).unwrap();
+                retention::apply(&path, &plan, &Action::Delete).unwrap();
+            });
+            let file = tempfile::NamedTempFile::new().unwrap();
+            let result = write(&mut pass, file.reopen().unwrap(), None);
+            tickertape::fault::clear();
+            if keep == 5 {
+                assert!(result.is_ok(), "{:?}", result.err().map(|f| f.message));
+            } else {
+                let failure = result.unwrap_err();
+                assert_eq!(failure.code, 1);
+                assert_eq!(
+                    failure.message,
+                    "export stopped at sequence 1: records 1 to 2 were removed from the journal (by retention or \
+                     archiving) before export read them"
+                );
+            }
+            let exported = SerializedFileReader::new(file.reopen().unwrap()).unwrap();
+            assert_eq!(exported.metadata().file_metadata().num_rows(), rows);
+        }
+    }
+
+    /// Review round 1, item 2: recovery replaces records the startup scan counted and the writer appends records with
+    /// the same sequence numbers before the writing pass. The export fails with "journal changed during export" after
+    /// finalizing what the writing pass read as a readable file.
+    #[test]
+    fn writing_pass_detects_a_different_history() {
+        let (dir, replace) = export::tests::journal_with_replaced_suffix();
+        tickertape::fault::clear();
+        tickertape::fault::run_at(tickertape::fault::Point::ReaderOpen, 1, replace);
+        let out = tempfile::tempdir().unwrap();
+        let output = out.path().join("out.parquet");
+        let result = export::run(
+            crate::ExportArgs {
+                dir: dir.path().into(),
+                format: crate::ExportFormat::Parquet,
+                decode: None,
+                output: output.clone(),
+                from: None,
+                to: None,
+                durable_only: false,
+            },
+            &mut Vec::new(),
+        );
+        tickertape::fault::clear();
+        let failure = result.unwrap_err();
+        assert_eq!(failure.code, 1);
+        assert!(
+            failure
+                .message
+                .starts_with("journal changed during export: ")
+                && failure.message.contains("not a consistent export"),
+            "{}",
+            failure.message
+        );
+        let exported = SerializedFileReader::new(std::fs::File::open(&output).unwrap()).unwrap();
+        assert_eq!(exported.metadata().file_metadata().num_rows(), 6);
     }
 }
