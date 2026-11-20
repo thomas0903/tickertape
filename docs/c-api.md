@@ -195,8 +195,9 @@ tickertape_writer_options_free(options);
   first, so an argument error appends nothing (the message names the element's index). It then stops at the first
   failure and returns that error, with `*appended_out` records already appended (sequence numbers `*first_seq_out`
   onwards). Those records stay in the journal: retry from the failing one, not from the start. Each record becomes
-  visible to readers as it is committed, as with `tickertape_writer_append`; blocked readers are woken once, after
-  the last record appended (ADR 0041).
+  visible to readers as it is committed, as with `tickertape_writer_append`. Instead of one wake-up per record, a
+  batch that appends at least one record wakes blocked readers once (when wake-ups are enabled) after the last record
+  appended, plus once at each roll inside the batch (ADR 0041).
 
 ## Reading
 

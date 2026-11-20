@@ -54,7 +54,8 @@ pub struct WriterConfig {
     pub recovery: RecoveryPolicy,
     /// Create a shared-memory wake-up region, named in the journal's `notify` record, so that blocked readers wake up
     /// as soon as a record is published (ADRs 0017 and 0021), or, for
-    /// [`Writer::append_batch`](crate::Writer::append_batch), once the batch's last record is (ADR 0041).
+    /// [`Writer::append_batch`](crate::Writer::append_batch), once the batch's last record is, plus at each roll inside
+    /// the batch (ADR 0041).
     /// Costs one atomic increment and one load per append (per batch for `append_batch`), plus a wake-up system call
     /// when readers are blocked.
     /// Default: true.

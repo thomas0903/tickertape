@@ -367,18 +367,23 @@ impl Writer {
     }
 
     /// Appends `records` in order, as consecutive calls to [`Writer::append`] would, and returns the range of
-    /// sequence numbers they got. Readers are woken once for the batch instead of once per record.
+    /// sequence numbers they got. Blocked readers are woken once for the batch, and at each roll inside it, instead of
+    /// once per record.
     ///
     /// Each record is committed as soon as it is written, exactly as [`Writer::append`] commits it, so the records
     /// become visible one by one and in order: a reader that polls can read the first records of a batch before this
     /// call returns, and no reader can see a later record of the batch without the earlier ones. What is batched is
-    /// the wake-up of blocked readers (ADRs 0017 and 0021): one publication after the last record this call appends
-    /// (and one at each roll, as for [`Writer::append`]) instead of one after each record, so a blocked reader learns
-    /// of the first record of a batch only when the batch ends. Keep batches short where that latency matters. See
-    /// ADR 0041 for what is batched and what is not.
+    /// the wake-up of blocked readers (ADRs 0017 and 0021). When wake-ups are enabled
+    /// ([`WriterConfig::notify`](crate::WriterConfig::notify)), a batch that commits at least one record publishes one
+    /// wake-up after the last record it appended, plus one at each roll inside the batch (a roll publishes as it does
+    /// for [`Writer::append`]), instead of one after each record. So a blocked reader learns of the batch's first
+    /// records at the first roll inside the batch, or when the batch ends if it does not roll. Keep batches short where
+    /// that latency matters. See ADR 0041 for what is batched and what is not.
     ///
     /// A record that does not fit in the current segment rolls to a new one, as [`Writer::append`] does; a batch can
-    /// span several segments. Durability is as for [`Writer::append`]: nothing here syncs.
+    /// span several segments. Durability is as for [`Writer::append`]: the writer's thread syncs nothing (on macOS a
+    /// roll can wait for the thread preparing the next segment, which syncs it), and the records are durable once a
+    /// later checkpoint covers them.
     ///
     /// An empty `records` returns the empty range at [`Writer::next_seq`] and wakes nobody.
     ///
@@ -2572,22 +2577,39 @@ mod tests {
     #[test]
     fn append_wakes_readers_before_the_helper_work() {
         let dir = tempfile::tempdir().unwrap();
-        let mut writer = Writer::open(dir.path(), WriterConfig::default().segment_size(1 << 20)).unwrap();
-        let notify = writer.notify.as_ref().expect("wake-ups are enabled").publisher();
+        let mut writer =
+            Writer::open(dir.path(), WriterConfig::default().segment_size(1 << 20)).unwrap();
+        let notify = writer
+            .notify
+            .as_ref()
+            .expect("wake-ups are enabled")
+            .publisher();
         let seen = Rc::new(Cell::new(None));
 
         let before = notify.event();
         let (at_hook, n) = (Rc::clone(&seen), notify.clone());
         AFTER_COMMIT.set(Some(Box::new(move || at_hook.set(Some(n.event())))));
         append_one(&mut writer);
-        assert_eq!(seen.take(), Some(before.wrapping_add(1)), "published before the helper work");
+        assert_eq!(
+            seen.take(),
+            Some(before.wrapping_add(1)),
+            "published before the helper work"
+        );
 
         let before = notify.event();
         let (at_hook, n) = (Rc::clone(&seen), notify.clone());
         AFTER_COMMIT.set(Some(Box::new(move || at_hook.set(Some(n.event())))));
         writer.append_batch([record(b"a"), record(b"b")]).unwrap();
-        assert_eq!(seen.take(), Some(before), "a batch does not publish per record");
-        assert_eq!(notify.event(), before.wrapping_add(1), "one publication per batch");
+        assert_eq!(
+            seen.take(),
+            Some(before),
+            "a batch does not publish per record"
+        );
+        assert_eq!(
+            notify.event(),
+            before.wrapping_add(1),
+            "one publication per batch"
+        );
     }
 
     /// Yields its records, then optionally panics; when dropped, notes whether the batch's wake-up was published.
@@ -2621,8 +2643,13 @@ mod tests {
     #[test]
     fn batch_wakes_readers_before_dropping_the_iterator() {
         let dir = tempfile::tempdir().unwrap();
-        let mut writer = Writer::open(dir.path(), WriterConfig::default().segment_size(1 << 20)).unwrap();
-        let notify = writer.notify.as_ref().expect("wake-ups are enabled").publisher();
+        let mut writer =
+            Writer::open(dir.path(), WriterConfig::default().segment_size(1 << 20)).unwrap();
+        let notify = writer
+            .notify
+            .as_ref()
+            .expect("wake-ups are enabled")
+            .publisher();
         for panic_at_end in [false, true] {
             let published_before_drop = Rc::new(Cell::new(None));
             let records = CheckedOnDrop {
@@ -2636,7 +2663,11 @@ mod tests {
             let result = panic::catch_unwind(AssertUnwindSafe(|| writer.append_batch(records)));
             assert_eq!(result.is_err(), panic_at_end);
             assert_eq!(writer.next_seq(), next_seq + 3);
-            assert_eq!(published_before_drop.get(), Some(true), "panic_at_end {panic_at_end}");
+            assert_eq!(
+                published_before_drop.get(),
+                Some(true),
+                "panic_at_end {panic_at_end}"
+            );
         }
     }
 }
