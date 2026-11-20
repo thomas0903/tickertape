@@ -38,17 +38,17 @@ final class Errors {
         Status s = Status.of(status);
         return switch (s) {
             case INVALID_ARGUMENT -> new InvalidArgumentException(message, cause);
-            case IO -> new JournalIoException(message, osErrorCode, cause);
+            case IO -> new JournalIOException(message, osErrorCode, cause);
             case STORAGE_FULL -> new StorageFullException(message, osErrorCode, cause);
-            case LOCKED -> new JournalLockedException(message, cause);
+            case LOCKED -> new LockedException(message, cause);
             case CORRUPT -> new CorruptJournalException(message, corruptReason, cause);
-            case UNSUPPORTED_VERSION -> new UnsupportedFormatVersionException(message, cause);
+            case UNSUPPORTED_VERSION -> new UnsupportedVersionException(message, cause);
             case NOT_FOUND -> new JournalNotFoundException(message, cause);
-            case SEQ_UNAVAILABLE -> new SequenceUnavailableException(message, cause);
+            case SEQ_UNAVAILABLE -> new SeqUnavailableException(message, cause);
             case RECORD_TOO_LARGE -> new RecordTooLargeException(message, cause);
             case DURABILITY_LOST -> new DurabilityLostException(message, cause);
             case SEQUENCE_EXHAUSTED -> new SequenceExhaustedException(message, cause);
-            case DISCARDED -> new DiscardedHistoryException(message, cause);
+            case DISCARDED -> new DiscardedException(message, cause);
             case INVALID_CONFIG -> new InvalidConfigException(message, cause);
             case BUFFER_TOO_SMALL -> new BufferTooSmallException(message, requiredBytes, cause);
             case ABORTED -> new FillAbortedException(message, cause);

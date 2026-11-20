@@ -67,6 +67,7 @@ pub fn describe_action(action: &RecoveryAction) -> Action {
             segment,
             offset,
             len,
+            ..
         } => Action {
             kind: "zeroed_uncommitted",
             segment: Some(segment.clone()),
@@ -80,6 +81,7 @@ pub fn describe_action(action: &RecoveryAction) -> Action {
             len,
             quarantine_file,
             reason,
+            ..
         } => Action {
             kind: "repaired_tail",
             segment: Some(segment.clone()),
@@ -93,6 +95,7 @@ pub fn describe_action(action: &RecoveryAction) -> Action {
             segment,
             quarantine_file,
             reason,
+            ..
         } => Action {
             kind: "quarantined_segment",
             segment: Some(segment.clone()),
@@ -100,22 +103,22 @@ pub fn describe_action(action: &RecoveryAction) -> Action {
             reason: Some(errors::reason_fields(reason).0),
             ..Action::default()
         },
-        RecoveryAction::Sealed { segment } => Action {
+        RecoveryAction::Sealed { segment, .. } => Action {
             kind: "sealed",
             segment: Some(segment.clone()),
             ..Action::default()
         },
-        RecoveryAction::CompletedRoll { segment } => Action {
+        RecoveryAction::CompletedRoll { segment, .. } => Action {
             kind: "completed_roll",
             segment: Some(segment.clone()),
             ..Action::default()
         },
-        RecoveryAction::RestoredHeader { segment } => Action {
+        RecoveryAction::RestoredHeader { segment, .. } => Action {
             kind: "restored_header",
             segment: Some(segment.clone()),
             ..Action::default()
         },
-        RecoveryAction::RemovedTemp { file } => Action {
+        RecoveryAction::RemovedTemp { file, .. } => Action {
             kind: "removed_temp",
             file: Some(file.clone()),
             ..Action::default()
@@ -178,7 +181,6 @@ pub fn retention_report<'py>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tickertape::CorruptReason;
 
     fn variant<T: std::fmt::Debug>(value: &T) -> String {
         format!("{value:?}")
@@ -190,33 +192,8 @@ mod tests {
 
     #[test]
     fn every_listed_recovery_action_converts_to_its_kind() {
-        let p = PathBuf::from("/j/0.tape");
         let q = PathBuf::from("/j/quarantine/x.bin");
-        let reason = CorruptReason::BadChecksum;
-        let actions = vec![
-            RecoveryAction::Created,
-            RecoveryAction::ZeroedUncommitted {
-                segment: p.clone(),
-                offset: 64,
-                len: 8,
-            },
-            RecoveryAction::RepairedTail {
-                segment: p.clone(),
-                offset: 64,
-                len: 8,
-                quarantine_file: q.clone(),
-                reason,
-            },
-            RecoveryAction::QuarantinedSegment {
-                segment: p.clone(),
-                quarantine_file: q.clone(),
-                reason,
-            },
-            RecoveryAction::Sealed { segment: p.clone() },
-            RecoveryAction::CompletedRoll { segment: p.clone() },
-            RecoveryAction::RestoredHeader { segment: p.clone() },
-            RecoveryAction::RemovedTemp { file: p.clone() },
-        ];
+        let actions = tickertape::samples::recovery_actions();
         let mut seen = Vec::new();
         for action in &actions {
             let name = variant(action);

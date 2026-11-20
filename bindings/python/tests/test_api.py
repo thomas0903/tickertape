@@ -115,45 +115,45 @@ def test_segment_rolls_are_transparent(journal: Path) -> None:
                                                         tt.read_checkpoint(journal).offset)  # type: ignore[union-attr]
 
 
-def test_append_many_returns_range_and_accepts_columns(journal: Path) -> None:
+def test_append_batch_returns_range_and_accepts_columns(journal: Path) -> None:
     with tt.Writer(journal) as w:
-        assert w.append_many([]) == range(0, 0)
-        assert w.append_many([b"a", b"b"], schema_id=5, venue_ts_ns=[1, 2], local_ts_ns=(3, 4)) == range(0, 2)
-        assert w.append_many(iter([b"c"])) == range(2, 3)
+        assert w.append_batch([]) == range(0, 0)
+        assert w.append_batch([b"a", b"b"], schema_id=5, venue_ts_ns=[1, 2], local_ts_ns=(3, 4)) == range(0, 2)
+        assert w.append_batch(iter([b"c"])) == range(2, 3)
     with tt.Reader(journal) as r:
         assert as_tuples(r) == [(0, 5, 1, 3, b"a"), (1, 5, 2, 4, b"b"), (2, 0, 0, 0, b"c")]
 
 
-def test_append_many_checks_everything_before_appending(journal: Path) -> None:
+def test_append_batch_checks_everything_before_appending(journal: Path) -> None:
     with tt.Writer(journal) as w:
         with pytest.raises(TypeError):
-            w.append_many([b"a", 3])  # type: ignore[list-item]
+            w.append_batch([b"a", 3])  # type: ignore[list-item]
         with pytest.raises(TypeError):
-            w.append_many(b"not a list of payloads")  # type: ignore[arg-type]
+            w.append_batch(b"not a list of payloads")  # type: ignore[arg-type]
         with pytest.raises(ValueError, match="2 values for 3 payloads"):
-            w.append_many([b"a", b"b", b"c"], schema_id=[1, 2])
+            w.append_batch([b"a", b"b", b"c"], schema_id=[1, 2])
         with pytest.raises(OverflowError):
-            w.append_many([b"a", b"b"], venue_ts_ns=[1, -1])
+            w.append_batch([b"a", b"b"], venue_ts_ns=[1, -1])
         with pytest.raises(OverflowError):
-            w.append_many([b"a"], schema_id=2**32)
+            w.append_batch([b"a"], schema_id=2**32)
         assert w.next_seq == 0
 
 
-def test_append_many_partial_failure(journal: Path) -> None:
+def test_append_batch_partial_failure(journal: Path) -> None:
     with tt.Writer(journal, segment_size=SMALL_SEGMENT) as w:
         w.append(b"before")
         too_large = b"x" * SMALL_SEGMENT
         with pytest.raises(tt.BatchAppendError) as raised:
-            w.append_many([b"a", b"b", too_large, b"c"], schema_id=[1, 2, 3, 4])
+            w.append_batch([b"a", b"b", too_large, b"c"], schema_id=[1, 2, 3, 4])
         error = raised.value
         assert (error.appended, error.first_seq, error.failed_index) == (2, 1, 2)
         assert isinstance(error.__cause__, tt.RecordTooLargeError)
         assert isinstance(error.__cause__, ValueError)
         assert w.next_seq == 3
         # The caller retries the rest after fixing the cause.
-        assert w.append_many([b"c"], schema_id=4) == range(3, 4)
+        assert w.append_batch([b"c"], schema_id=4) == range(3, 4)
         with pytest.raises(tt.BatchAppendError) as raised:
-            w.append_many([too_large])
+            w.append_batch([too_large])
         assert (raised.value.appended, raised.value.first_seq) == (0, None)
     with tt.Reader(journal) as r:
         assert [(x.seq, x.schema_id, x.payload) for x in r] == [
@@ -175,7 +175,7 @@ def test_read_many_and_timeouts(journal: Path) -> None:
 
         def later() -> None:
             time.sleep(0.2)
-            w.append_many([b"x", b"y"])
+            w.append_batch([b"x", b"y"])
 
         thread = threading.Thread(target=later)
         thread.start()
@@ -338,10 +338,10 @@ def test_recovery_report_and_config_objects(journal: Path, tmp_path: Path) -> No
     with tt.Reader(journal, notify=False, backoff=backoff) as r:
         assert r.next(timeout=0.01) is None
     archive = tmp_path / "archive"
-    retention = tt.Retention.archive(archive, max_bytes=10, max_age=3.5)
-    assert (retention.archive_dir, retention.max_bytes, retention.max_age, retention.max_segments) == (
+    retention = tt.Retention.move_to(archive, max_bytes=10, max_age=3.5)
+    assert (retention.move_to_directory, retention.max_bytes, retention.max_age, retention.max_segments) == (
         archive, 10, 3.5, None)
-    assert tt.Retention.delete().archive_dir is None
+    assert tt.Retention.delete().move_to_directory is None
     import datetime
     assert tt.Retention.delete(max_age=datetime.timedelta(minutes=1)).max_age == 60.0
 
@@ -349,7 +349,7 @@ def test_recovery_report_and_config_objects(journal: Path, tmp_path: Path) -> No
 def test_retention_error_is_reported_not_raised(journal: Path, tmp_path: Path) -> None:
     missing = tmp_path / "no-such-archive"
     with tt.Writer(journal, segment_size=SMALL_SEGMENT,
-                   retention=tt.Retention.archive(missing, max_segments=1)) as w:
+                   retention=tt.Retention.move_to(missing, max_segments=1)) as w:
         append_pattern(w, 2000)
         w.checkpoint()  # succeeds although retention fails
         error = w.last_retention_error
@@ -364,41 +364,41 @@ def test_module_metadata() -> None:
 
 
 @pytest.mark.parametrize("base", [2**63 - 1, 2**63, 2**64 - 4])
-def test_append_many_range_beyond_isize(tmp_path: Path, base: int) -> None:
+def test_append_batch_range_beyond_isize(tmp_path: Path, base: int) -> None:
     """The returned range is built from Python ints when the numbers don't fit in a C ssize_t."""
     journal = tmp_path / "journal"
     synthetic_journal(journal, base)
     with tt.Writer(journal) as w:
         assert w.next_seq == base
-        assert w.append_many([b"a"]) == range(base, base + 1)
-        assert w.append_many([]) == range(base + 1, base + 1)
-        assert w.append_many([b"b", b"c"]) == range(base + 1, base + 3)
+        assert w.append_batch([b"a"]) == range(base, base + 1)
+        assert w.append_batch([]) == range(base + 1, base + 1)
+        assert w.append_batch([b"b", b"c"]) == range(base + 1, base + 3)
         assert w.next_seq == base + 3
     with tt.Reader(journal) as r:
         assert [x.seq for x in r] == [base, base + 1, base + 2]
 
 
-def test_append_many_rejects_a_single_payload_as_container(journal: Path) -> None:
+def test_append_batch_rejects_a_single_payload_as_container(journal: Path) -> None:
     with tt.Writer(journal) as w:
         for single in (b"", b"ab", bytearray(), bytearray(b"ab"), memoryview(b""), memoryview(b"ab"), "", "ab",
                        array.array("B"), array.array("B", b"ab")):
             with pytest.raises(TypeError, match="iterable of payloads"):
-                w.append_many(single)  # type: ignore[arg-type]
+                w.append_batch(single)  # type: ignore[arg-type]
         assert w.next_seq == 0
 
 
-def test_append_many_stops_reading_an_endless_metadata_column(journal: Path) -> None:
+def test_append_batch_stops_reading_an_endless_metadata_column(journal: Path) -> None:
     with tt.Writer(journal) as w:
         started = time.monotonic()
         with pytest.raises(ValueError, match="schema_id has more values than the 1 payloads"):
-            w.append_many([b"a"], schema_id=itertools.count())
+            w.append_batch([b"a"], schema_id=itertools.count())
         with pytest.raises(ValueError, match="venue_ts_ns has more values than the 2 payloads"):
-            w.append_many([b"a", b"b"], venue_ts_ns=iter(range(3)))
+            w.append_batch([b"a", b"b"], venue_ts_ns=iter(range(3)))
         assert time.monotonic() - started < 1
         assert w.next_seq == 0
 
 
-def test_append_many_propagates_the_metadata_iterators_own_exception(journal: Path) -> None:
+def test_append_batch_propagates_the_metadata_iterators_own_exception(journal: Path) -> None:
     def values_then(error: BaseException, count: int) -> Iterator[int]:
         yield from range(count)
         raise error
@@ -406,14 +406,14 @@ def test_append_many_propagates_the_metadata_iterators_own_exception(journal: Pa
     with tt.Writer(journal) as w:
         for error in (KeyboardInterrupt(), RuntimeError("metadata source failed")):
             with pytest.raises(type(error)) as caught:
-                w.append_many([b"a", b"b"], schema_id=values_then(error, 2))
+                w.append_batch([b"a", b"b"], schema_id=values_then(error, 2))
             assert caught.value is error
             with pytest.raises(type(error)):
-                w.append_many([b"a", b"b"], local_ts_ns=values_then(error, 1))
+                w.append_batch([b"a", b"b"], local_ts_ns=values_then(error, 1))
         assert w.next_seq == 0
 
 
-def test_append_many_propagates_the_exception_of_a_metadata_objects_iter(journal: Path) -> None:
+def test_append_batch_propagates_the_exception_of_a_metadata_objects_iter(journal: Path) -> None:
     class Unreadable:
         def __init__(self, error: BaseException) -> None:
             self.error = error
@@ -459,16 +459,16 @@ def test_append_many_propagates_the_exception_of_a_metadata_objects_iter(journal
             for cls in makers:
                 for name in ("schema_id", "venue_ts_ns", "local_ts_ns"):
                     with pytest.raises(type(error)) as caught:
-                        w.append_many([b"a", b"b"], **{name: cls(error)})
+                        w.append_batch([b"a", b"b"], **{name: cls(error)})
                     assert caught.value is error
         # An object that is not iterable at all still gets the TypeError that names the argument.
         for value in (object(), 1.5, NotIterable(), match):
             with pytest.raises(TypeError, match="venue_ts_ns must be an int or a sequence of ints"):
-                w.append_many([b"a"], venue_ts_ns=value)  # type: ignore[arg-type]
+                w.append_batch([b"a"], venue_ts_ns=value)  # type: ignore[arg-type]
         assert w.next_seq == 0
 
 
-def test_append_many_looks_up_a_metadata_types_iter_once(journal: Path) -> None:
+def test_append_batch_looks_up_a_metadata_types_iter_once(journal: Path) -> None:
     """A successful call does one `__iter__` lookup on the type of a metadata argument that is not a list or tuple
     (and none for a list or tuple, which cannot be observed from Python: see `iterate` in `writer.rs`)."""
     lookups: list[str] = []
@@ -487,10 +487,10 @@ def test_append_many_looks_up_a_metadata_types_iter_once(journal: Path) -> None:
             return iter(self.values)
 
     with tt.Writer(journal) as w:
-        assert w.append_many([b"a", b"b"], schema_id=Values(1, 2), venue_ts_ns=[3, 4], local_ts_ns=(5, 6)) == range(2)
+        assert w.append_batch([b"a", b"b"], schema_id=Values(1, 2), venue_ts_ns=[3, 4], local_ts_ns=(5, 6)) == range(2)
         assert lookups == ["__iter__"]
         lookups.clear()
-        w.append_many([b"c"], schema_id=Values(7), venue_ts_ns=Values(8), local_ts_ns=Values(9))
+        w.append_batch([b"c"], schema_id=Values(7), venue_ts_ns=Values(8), local_ts_ns=Values(9))
         assert lookups == ["__iter__"] * 3
 
 
@@ -506,9 +506,9 @@ def test_closed_writer_consumes_nothing(journal: Path) -> None:
     w.close()
     started = time.monotonic()
     with pytest.raises(ValueError, match="closed writer"):
-        w.append_many(endless())
+        w.append_batch(endless())
     with pytest.raises(ValueError, match="closed writer"):
-        w.append_many([b"a"], schema_id=itertools.count())
+        w.append_batch([b"a"], schema_id=itertools.count())
     with pytest.raises(ValueError, match="closed writer"):
         w.append(12345)  # type: ignore[arg-type]  # not a payload, but the closed state is checked first
     assert consumed == [] and time.monotonic() - started < 1
@@ -541,7 +541,7 @@ FOREVER = [None, math.inf, 1e19, 1e300, float(sys.maxsize), sys.maxsize, 2**64, 
 def test_timeouts_too_large_to_represent_wait_forever(journal: Path, timeout: object) -> None:
     with tt.Writer(journal) as w:
         r = tt.Reader(journal)
-        thread = later(0.15, lambda: w.append_many([b"a", b"b", b"c"]))
+        thread = later(0.15, lambda: w.append_batch([b"a", b"b", b"c"]))
         record = r.next(timeout=timeout)  # type: ignore[arg-type]
         thread.join()
         assert record is not None and record.seq == 0
@@ -616,7 +616,7 @@ def test_signatures_show_the_real_defaults() -> None:
     assert default(tt.Reader.read_batch, "timeout") == 0
     assert str(inspect.signature(tt.Reader.read_many)).endswith("max_records, *, timeout=0)")
     assert str(inspect.signature(tt.Reader.next)).endswith("timeout=None)")
-    assert "..." not in str(inspect.signature(tt.Writer.append_many))
+    assert "..." not in str(inspect.signature(tt.Writer.append_batch))
     assert default(tt.Writer, "segment_size") == tt.DEFAULT_SEGMENT_SIZE
     assert default(tt.Writer, "recovery") == "quarantine"
 
@@ -628,8 +628,8 @@ def test_equality_and_hashing() -> None:
     assert len({tt.Backoff(), tt.Backoff(), tt.Backoff.busy_spin()}) == 2
     a, b = tt.Retention.delete(max_segments=2), tt.Retention.delete(max_segments=2)
     assert a == b and hash(a) == hash(b) and a.__eq__("x") is NotImplemented
-    assert a != tt.Retention.delete(max_segments=3) and a != tt.Retention.archive("/tmp", max_segments=2)
-    assert tt.Retention.archive("/a", max_age=1) == tt.Retention.archive("/a", max_age=1.0)
+    assert a != tt.Retention.delete(max_segments=3) and a != tt.Retention.move_to("/tmp", max_segments=2)
+    assert tt.Retention.move_to("/a", max_age=1) == tt.Retention.move_to("/a", max_age=1.0)
     assert len({a, b, tt.Retention.delete()}) == 2
 
 
@@ -667,7 +667,7 @@ def test_two_threads_share_one_writer(journal: Path) -> None:
                 if i % 2:
                     w.append(tag + str(i).encode())
                 else:
-                    w.append_many([tag + str(i).encode()])
+                    w.append_batch([tag + str(i).encode()])
 
         threads = [threading.Thread(target=appender, args=(tag,)) for tag in (b"a", b"b")]
         for thread in threads:
@@ -719,9 +719,9 @@ RETAINED_CAPACITY = 6 << 20  # `RETAINED_CAPACITY` in src/reader.rs
 @pytest.mark.parametrize("call", ["read_batch", "read_many", "next"])
 def test_an_idle_reader_does_not_keep_a_large_delivered_batch(journal: Path, call: str) -> None:
     with tt.Writer(journal, segment_size=64 << 20) as w:
-        w.append_many([bytes([i % 251]) * 4096 for i in range(2048)])  # 8 MiB
+        w.append_batch([bytes([i % 251]) * 4096 for i in range(2048)])  # 8 MiB
         w.append(b"z" * (8 << 20))  # one 8 MiB record
-        w.append_many([b"small"] * 300)
+        w.append_batch([b"small"] * 300)
     with tt.Reader(journal) as r:
         capacity = getattr(r, "_staging_capacity_for_testing")  # a test hook, not in the stubs
         if call == "next":
@@ -747,7 +747,7 @@ def test_the_staging_bound_depends_on_capacity_not_on_the_record_count(journal: 
     freed. A reader that first read 2,049 empty records keeps the buffer of 131,073 more (4,721,408 bytes): the
     vectors grow from the capacity they had, so no record count decides."""
     with tt.Writer(journal, segment_size=64 << 20) as w:
-        w.append_many([b""] * 300_000)
+        w.append_batch([b""] * 300_000)
     with tt.Reader(journal) as r:
         capacity = getattr(r, "_staging_capacity_for_testing")  # a test hook, not in the stubs
         assert len(r.read_batch(100_000)) == 100_000
@@ -767,7 +767,7 @@ def test_a_read_that_raised_keeps_its_staged_batch_until_it_is_delivered(journal
     however large, and so does a smaller read that delivers only some of them; the read that delivers the last frees
     it."""
     with tt.Writer(journal, segment_size=64 << 20) as w:
-        w.append_many([b"x" * 7168] * 1024)  # 7 MiB: more than RETAINED_CAPACITY
+        w.append_batch([b"x" * 7168] * 1024)  # 7 MiB: more than RETAINED_CAPACITY
 
     class Interrupt(Exception):
         pass
@@ -801,7 +801,7 @@ def test_a_read_that_raised_keeps_its_staged_batch_until_it_is_delivered(journal
 def test_common_batches_reuse_their_staging_buffer(journal: Path, payload_len: int) -> None:
     """`read_batch(10_000)` keeps its staging buffer for the next call instead of allocating a new one each time."""
     with tt.Writer(journal, segment_size=64 << 20) as w:
-        w.append_many([bytes([i % 251]) * payload_len for i in range(50_000)])
+        w.append_batch([bytes([i % 251]) * payload_len for i in range(50_000)])
     with tt.Reader(journal) as r:
         capacity = getattr(r, "_staging_capacity_for_testing")  # a test hook, not in the stubs
         assert len(r.read_batch(10_000)) == 10_000
@@ -833,7 +833,7 @@ def test_freeing_a_large_delivered_batch_starts_no_thread(journal: Path, call: s
     starts one per read is caught with near certainty (an earlier version was, in every trial, within 70 reads).
     """
     with tt.Writer(journal, segment_size=64 << 20) as w:
-        w.append_many([b"x" * 7168] * 1024)  # 7 MiB: more than RETAINED_CAPACITY
+        w.append_batch([b"x" * 7168] * 1024)  # 7 MiB: more than RETAINED_CAPACITY
         w.append(b"y" * (7 << 20))
     with tt.Reader(journal) as r:
         before = native_threads()

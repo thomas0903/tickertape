@@ -41,7 +41,7 @@ def append_pattern(writer: tt.Writer, count: int) -> None:
     """Append `count` pattern records in one batch (the same records as `append_n`)."""
     start = writer.next_seq
     seqs = range(start, start + count)
-    got = writer.append_many(
+    got = writer.append_batch(
         [pattern_payload(s) for s in seqs],
         schema_id=[s % 7 for s in seqs],
         venue_ts_ns=[s * 10 for s in seqs],

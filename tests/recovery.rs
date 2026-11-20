@@ -370,7 +370,7 @@ fn malformed_checksum_is_quarantined_and_repaired() {
     assert_eq!(w.next_seq(), 7);
 
     // The old reader notices the replacement instead of reading the new history at its old offset.
-    assert!(matches!(r.try_next(), Err(Error::Discarded { seq: 7 })));
+    assert!(matches!(r.try_next(), Err(Error::Discarded { seq: 7, .. })));
     append_n(&mut w, 3);
     r.seek(7).unwrap();
     let rec = r.next_owned().unwrap().unwrap();
@@ -749,7 +749,7 @@ fn has_restored(w: &Writer, segment: &std::path::Path) -> bool {
     w.recovery_report()
         .actions
         .iter()
-        .any(|a| matches!(a, RecoveryAction::RestoredHeader { segment: s } if s == segment))
+        .any(|a| matches!(a, RecoveryAction::RestoredHeader { segment: s, .. } if s == segment))
 }
 
 /// A roll does not sync the new segment (ADR 0038): after an OS crash or power loss before the next checkpoint, the
@@ -1003,6 +1003,7 @@ fn fail_refusing_before_an_unwritten_successor_changes_no_file() {
                 path,
                 offset,
                 reason: CorruptReason::BadSeal,
+                ..
             }) => assert_eq!((path, offset), (previous.clone(), end)),
             other => panic!("empty file {empty_file}: expected BadSeal, got {other:?}"),
         }
@@ -1041,6 +1042,7 @@ fn fail_refusing_after_an_unwritten_successor_changes_no_file() {
                 path,
                 offset: 0,
                 reason: CorruptReason::BrokenChain(b),
+                ..
             }) => assert_eq!((path, b), (newest.clone(), newest_base)),
             other => panic!("empty file {empty_file}: expected BrokenChain, got {other:?}"),
         }
@@ -1056,7 +1058,7 @@ fn fail_refusing_after_an_unwritten_successor_changes_no_file() {
             report
                 .actions
                 .iter()
-                .any(|a| matches!(a, RecoveryAction::Sealed { segment } if *segment == first)),
+                .any(|a| matches!(a, RecoveryAction::Sealed { segment, .. } if *segment == first)),
             "{empty_file}: {report:?}"
         );
         assert!(
@@ -1108,10 +1110,9 @@ fn interrupted_held_changes_are_finished_by_the_next_open() {
         let report = w.recovery_report();
         assert!(!has_restored(&w, &newest), "{empty_file}: {report:?}");
         assert!(
-            report
-                .actions
-                .iter()
-                .any(|a| matches!(a, RecoveryAction::Sealed { segment } if *segment == previous)),
+            report.actions.iter().any(
+                |a| matches!(a, RecoveryAction::Sealed { segment, .. } if *segment == previous)
+            ),
             "{empty_file}: {report:?}"
         );
         assert_eq!(w.next_seq(), base, "{empty_file}");

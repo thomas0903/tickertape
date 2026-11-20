@@ -89,10 +89,28 @@ fn dry_run_json_delete_and_nothing_to_do() {
         .stdout
         .clone();
     let json: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(json["schema_version"], 1);
     assert_eq!(json["dry_run"], true);
     assert_eq!(json["report"], Value::Null);
     assert_eq!(json["segments"].as_array().unwrap().len(), 3);
     assert_eq!(json["segments"][0]["file"], "00000000000000000000.tape");
+    // Each candidate's base and size are its header's; it was sealed when its successor's header was created.
+    let listed = inspect::list_segments(dir.path()).unwrap();
+    for (i, segment) in json["segments"].as_array().unwrap().iter().enumerate() {
+        assert_eq!(segment["base_seq"], listed[i].base_seq, "{segment}");
+        assert_eq!(segment["size_bytes"], 65536, "{segment}");
+        assert_eq!(segment["size_bytes"], listed[i].segment_size, "{segment}");
+        assert_eq!(
+            segment["sealed_unix_ns"],
+            listed[i + 1].created_unix_ns,
+            "{segment}"
+        );
+        assert!(segment["sealed_unix_ns"].as_u64().unwrap() > 0, "{segment}");
+    }
+    assert!(
+        listed[0].base_seq < listed[1].base_seq,
+        "distinct bases: {listed:?}"
+    );
     assert_eq!(
         json["segments"][0]["reasons"],
         serde_json::json!(["max_segments", "max_bytes"])
@@ -108,6 +126,8 @@ fn dry_run_json_delete_and_nothing_to_do() {
         .stdout
         .clone();
     let json: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(json["schema_version"], 1);
+    assert_eq!(json["dry_run"], false);
     assert_eq!(json["report"]["removed_segments"], 3);
     assert_eq!(json["report"]["removed_bytes"], 3 * 65536);
     assert_eq!(json["report"]["already_removed_segments"], 0);

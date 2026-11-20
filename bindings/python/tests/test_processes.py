@@ -340,7 +340,7 @@ FORKED = """
         results = {}
         for name, call in [
             ("append", lambda: writer.append(b"child")),
-            ("append_many", lambda: writer.append_many([b"child"])),
+            ("append_batch", lambda: writer.append_batch([b"child"])),
             ("checkpoint", writer.checkpoint),
             ("next_seq", lambda: writer.next_seq),
             ("recovery_report", lambda: writer.recovery_report),
@@ -422,7 +422,7 @@ INTERRUPTED_WHILE_BUILDING = """
     else:
         count, size, segment = 20_000, 1024, 64 << 20
     with tt.Writer(path, segment_size=segment) as writer:
-        writer.append_many([i.to_bytes(8, "little") * (size // 8) for i in range(count)])
+        writer.append_batch([i.to_bytes(8, "little") * (size // 8) for i in range(count)])
     reader = tt.Reader(path)
 
     def read():
@@ -518,7 +518,7 @@ def test_signal_handler_reading_during_iteration_does_not_end_it(journal: Path) 
 
         path, count = sys.argv[1], 50_000
         with tt.Writer(path, segment_size=16 << 20) as writer:
-            writer.append_many([b"%d" % i for i in range(count)])
+            writer.append_batch([b"%d" % i for i in range(count)])
         reader = tt.Reader(path)
         taken_by_handler = []
 
@@ -544,7 +544,7 @@ def test_non_blocking_reads_in_two_threads_never_return_empty_early(journal: Pat
     records it found staged."""
     count = 10_000
     with tt.Writer(journal, segment_size=SMALL_SEGMENT * 64) as w:
-        w.append_many([b"%d" % i for i in range(count)])
+        w.append_batch([b"%d" % i for i in range(count)])
     for _ in range(10):
         reader = tt.Reader(journal)
         results: dict[int, list[int]] = {0: [], 1: []}
@@ -786,7 +786,7 @@ SIGNAL_DURING_DELIVERY = """
 
     path, call, runs = sys.argv[1], sys.argv[2], int(sys.argv[3])
     with tt.Writer(path, segment_size=1 << 20) as writer:
-        writer.append_many([i.to_bytes(4, "little") for i in range(runs + 10)])
+        writer.append_batch([i.to_bytes(4, "little") for i in range(runs + 10)])
     reader = tt.Reader(path)
     read = {
         "try_next": reader.try_next,
@@ -904,7 +904,7 @@ FORKED_DURING_CALLS = """
     warnings.simplefilter("ignore", DeprecationWarning)
     path = sys.argv[1]
     writer = tt.Writer(path, segment_size=64 << 20)
-    writer.append_many([b"x" * 1000] * 20_000)
+    writer.append_batch([b"x" * 1000] * 20_000)
     waiting = tt.Reader(path)
     filling = tt.Reader(path)
     stop = threading.Event()
@@ -921,7 +921,7 @@ FORKED_DURING_CALLS = """
 
     def append_loop():
         while not stop.is_set():
-            writer.append_many([b"y" * 100] * 2000)
+            writer.append_batch([b"y" * 100] * 2000)
             time.sleep(0.002)
 
     threads = [threading.Thread(target=f) for f in (wait_loop, fill_loop, append_loop)]
@@ -997,7 +997,7 @@ FORK_IN_HANDLER = """
     signal.signal(signal.SIGUSR1, handler)
     signal.signal(signal.SIGALRM, handler)
     with tt.Writer(path, segment_size=1 << 20) as writer:
-        writer.append_many([b"record"] * 10)
+        writer.append_batch([b"record"] * 10)
     outcomes = []
     for run in range(runs):
         reader = tt.Reader(path)
@@ -1137,7 +1137,7 @@ def test_nothing_runs_python_code_between_the_delivery_and_the_return(journal: P
         if count == 1:
             w.append(b"x" * ((7 << 20) if big else 100))
         else:
-            w.append_many([b"x" * (7168 if big else 16)] * count)  # 7 MiB in all: more than RETAINED_CAPACITY
+            w.append_batch([b"x" * (7168 if big else 16)] * count)  # 7 MiB in all: more than RETAINED_CAPACITY
     seen: list[tuple[bool, int]] = []
     runs = int(os.environ.get("TICKERTAPE_DELIVERY_RUNS", "20"))
     with tt.Reader(journal) as reader:

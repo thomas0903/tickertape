@@ -26,8 +26,9 @@ ties choose the first pair. UTC strings use RFC 3339 with nine fractional digits
 Exact second counts use bounded RAM and anonymous temporary sort files outside the journal when
 needed (temporary disk space grows with timestamp count). Per-schema aggregates stay in memory.
 
-JSON schema (one object; u64 integers unless schema_id:u32; number = floating point):
-{"totals":{"records":u64,"first_seq":u64|null,"last_seq":u64|null,"payload_bytes":u64},
+JSON schema (one object, schema_version 1, fields may be added: see docs/cli.md; u64 integers unless schema_id:u32;
+number = floating point):
+{"schema_version":1,"totals":{"records":u64,"first_seq":u64|null,"last_seq":u64|null,"payload_bytes":u64},
  "schemas":[{"schema_id":u32,"records":u64,"share_percent":number,"payload_bytes":u64,
  "min_payload_bytes":u64,"mean_payload_bytes":number,"max_payload_bytes":u64}],
  "payload_length":{"min_bytes":u64|null,"p50_bytes":u64|null,"p90_bytes":u64|null,
@@ -339,7 +340,7 @@ pub(crate) fn run(args: StatsArgs, out: &mut dyn Write) -> Result<()> {
     }
     let stats = stats.finish()?;
     if args.json {
-        output::json(out, &stats)
+        output::json_document(out, &stats)
     } else {
         stats
             .text(out)

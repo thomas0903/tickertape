@@ -131,12 +131,12 @@ public final class Writer implements AutoCloseable {
      *
      * @throws IllegalArgumentException if {@code dir} is not on the default file system (see
      *     {@linkplain Tickertape##paths Tickertape &rarr; Paths}, which also says how the path is passed)
-     * @throws JournalLockedException if another writer has the journal open
+     * @throws LockedException if another writer has the journal open
      * @throws InvalidConfigException if an option is out of range
      * @throws CorruptJournalException if the journal is damaged in a way recovery does not repair, or the tail is
      *     corrupt and the policy is {@link RecoveryPolicy#FAIL}
-     * @throws UnsupportedFormatVersionException if a segment has an unsupported format version
-     * @throws JournalIoException if an operating-system call fails
+     * @throws UnsupportedVersionException if a segment has an unsupported format version
+     * @throws JournalIOException if an operating-system call fails
      * @throws UnsatisfiedLinkError if libtickertape cannot be found or is not compatible (see {@link Tickertape})
      */
     public static Writer open(Path dir, WriterOptions options) {
@@ -203,7 +203,7 @@ public final class Writer implements AutoCloseable {
      * @return the record's sequence number
      * @throws RecordTooLargeException if the payload does not fit in one segment
      * @throws StorageFullException if a roll fails for lack of space (the journal is unchanged; retry later)
-     * @throws JournalIoException if a roll fails (the journal is unchanged), or for every append after a failed
+     * @throws JournalIOException if a roll fails (the journal is unchanged), or for every append after a failed
      *     clean-up of an aborted fill (retrying does not help)
      * @throws SequenceExhaustedException if sequence numbers are exhausted
      * @throws IllegalStateException if the writer is closed or in use by another thread
@@ -321,7 +321,7 @@ public final class Writer implements AutoCloseable {
      * record is committed. If it throws, nothing is committed: the writer zeroes the reserved bytes and syncs that to
      * storage (slow; aborting is for exceptional cases), and this method throws {@link FillAbortedException} with the
      * filler's exception as its cause (an {@link Error} is rethrown as it is). If that sync fails, it throws
-     * {@link JournalIoException} instead, with the filler's exception as its cause: treat it as a storage incident
+     * {@link JournalIOException} instead, with the filler's exception as its cause: treat it as a storage incident
      * like a failed checkpoint; the writer then refuses every further append and checkpoint (see
      * {@code docs/c-api.md} &rarr; A failed clean-up).
      *
@@ -450,7 +450,7 @@ public final class Writer implements AutoCloseable {
      * Configured retention then runs; its failures are reported by {@link #lastRetentionError()} and do not change
      * this result.
      *
-     * @throws JournalIoException if a sync fails ({@link StorageFullException} for lack of space). The writer is then
+     * @throws JournalIOException if a sync fails ({@link StorageFullException} for lack of space). The writer is then
      *     poisoned: every later checkpoint throws {@link DurabilityLostException}, while appends keep working. Treat a
      *     checkpoint error as an incident: records written before it may not be durable even if a later writer's
      *     checkpoint succeeds.

@@ -65,6 +65,10 @@ mod protocol_model;
 mod reader;
 mod record;
 pub mod retention;
+// Hidden: not covered by the compatibility promise (docs/compatibility.md → Rust API). One value of each error and
+// recovery variant, for the tests of the C ABI and the Python bindings.
+#[doc(hidden)]
+pub mod samples;
 pub mod status;
 mod writeback;
 mod writer;

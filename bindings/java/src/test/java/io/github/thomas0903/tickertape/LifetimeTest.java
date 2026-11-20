@@ -321,7 +321,7 @@ class LifetimeTest {
             System.gc();
             try {
                 again = Writer.open(dir, TestSupport.small());
-            } catch (JournalLockedException e) {
+            } catch (LockedException e) {
                 if (System.nanoTime() > deadline) {
                     throw e;
                 }

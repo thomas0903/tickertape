@@ -159,7 +159,7 @@ fn main() {
                     }
                 }
             }
-            Err(Error::Discarded { seq }) => {
+            Err(Error::Discarded { seq, .. }) => {
                 log.flush_run();
                 log.line(&format!("D {seq}"));
                 pending_seek = Some(expected);

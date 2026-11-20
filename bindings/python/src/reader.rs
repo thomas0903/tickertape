@@ -1189,7 +1189,7 @@ impl Reader {
         })
     }
 
-    /// This reader's cursor and its lag behind `status` (a `JournalStatus` from `tickertape.status`), as a
+    /// This reader's cursor and its lag behind `status` (a `JournalStatus` from `JournalStatus.sample`), as a
     /// `ReaderMetrics` (ADR 0032): behind the head, or behind the checkpoint marker for a durable-only reader, as of
     /// that sample. Records the reader has read from the journal but not yet returned count in the lag. No system
     /// calls.

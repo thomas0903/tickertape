@@ -236,7 +236,7 @@ fn drain(reader: &mut Reader, end: u64) -> (Vec<OwnedRecord>, Vec<u64>) {
         {
             Ok(Some(record)) => records.push(record),
             Ok(None) => panic!("no record at {} (end {end})", reader.position()),
-            Err(Error::Discarded { seq }) => {
+            Err(Error::Discarded { seq, .. }) => {
                 assert_eq!(seq, reader.position());
                 assert!(discarded.len() < 10, "discarded again and again at {seq}");
                 discarded.push(seq);
@@ -315,7 +315,7 @@ fn repair_before_the_marker_read_is_discarded() {
             repair(&path, 15, 10, 0, 99)
         });
         match reader.next_owned() {
-            Err(Error::Discarded { seq: 10 }) => {}
+            Err(Error::Discarded { seq: 10, .. }) => {}
             other => panic!(
                 "mapped {mapped}: {:?}",
                 other.map(|r| r.map(|r| (r.seq, r.schema_id)))
@@ -544,13 +544,14 @@ fn durable_only_reader_overtaken_by_retention_is_discarded_when_the_checkpoint_m
         assert!(first > second);
 
         match durable.next_owned() {
-            Err(Error::Discarded { seq: 10 }) => {}
+            Err(Error::Discarded { seq: 10, .. }) => {}
             other => panic!("mapped {mapped}: {other:?}"),
         }
         match durable.seek(10) {
             Err(Error::SeqUnavailable {
                 requested: 10,
                 first: f,
+                ..
             }) => assert_eq!(f, first),
             other => panic!("mapped {mapped}: {other:?}"),
         }
@@ -566,7 +567,7 @@ fn durable_only_reader_overtaken_by_retention_is_discarded_when_the_checkpoint_m
                         check_record(&record);
                         expected += 1;
                     }
-                    Err(Error::Discarded { seq }) => {
+                    Err(Error::Discarded { seq, .. }) => {
                         assert_eq!(seq, second, "discarded at the removed segment's end");
                         break;
                     }
@@ -641,7 +642,7 @@ fn durable_only_reader_at_a_removed_segment_end_with_an_empty_successor_is_disca
         // A reader that hadn't looked since the roll finds segment 0 gone, as the visible reader does.
         for reader in [&mut stale, &mut visible] {
             match reader.try_next() {
-                Err(Error::Discarded { seq: 3 }) => {}
+                Err(Error::Discarded { seq: 3, .. }) => {}
                 other => panic!("mapped {mapped}: {:?}", other.map(|r| r.map(|r| r.seq))),
             }
             reader.seek(3).unwrap();
@@ -792,7 +793,7 @@ fn identity_check_that_fails_leaves_the_marker_unapplied() {
         std::fs::copy(&segment, &copy).unwrap();
         std::fs::rename(&copy, &segment).unwrap();
         match reader.next_owned() {
-            Err(Error::Discarded { seq: 10 }) => {}
+            Err(Error::Discarded { seq: 10, .. }) => {}
             other => panic!("mapped {mapped}: {:?}", other.map(|r| r.map(|r| r.seq))),
         }
         reader.seek(10).unwrap();
@@ -880,7 +881,7 @@ fn visible_reader_after_a_repair_is_discarded_at_the_old_end() {
         }
         let started = std::time::Instant::now();
         match reader.next_timeout(Some(Duration::from_secs(5))) {
-            Err(Error::Discarded { seq: 20 }) => {}
+            Err(Error::Discarded { seq: 20, .. }) => {}
             other => panic!("mapped {mapped}: {:?}", other.map(|r| r.map(|r| r.seq))),
         }
         assert!(

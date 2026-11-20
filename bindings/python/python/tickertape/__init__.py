@@ -58,7 +58,6 @@ from ._status import (
     Segments,
     Storage,
     WriterMetrics,
-    status,
 )
 from ._native import (
     CORE_VERSION,
@@ -125,6 +124,5 @@ __all__ = [
     "__version__",
     "list_segments",
     "read_checkpoint",
-    "status",
     "verify",
 ]

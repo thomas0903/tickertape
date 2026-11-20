@@ -254,7 +254,7 @@ class HeaderTest {
             assertTrue(codes.containsKey(s.cName()), s + " is not in the header");
         }
         // Details carried by the exceptions.
-        assertEquals(5, ((JournalIoException) Errors.create(-2, "", 5, 0, -1, null)).osErrorCode());
+        assertEquals(5, ((JournalIOException) Errors.create(-2, "", 5, 0, -1, null)).osErrorCode());
         assertEquals(28, ((StorageFullException) Errors.create(-3, "", 28, 0, -1, null)).osErrorCode());
         CorruptJournalException c = (CorruptJournalException) Errors.create(-5, "", 0, 8, -1, null);
         assertEquals(CorruptReason.BAD_CHECKSUM, c.reason());
@@ -320,12 +320,12 @@ class HeaderTest {
                 assertEquals((int) v.getValue(), e.code().applyAsInt(j));
             }
             for (Enum<?> j : e.java().getEnumConstants()) {
-                // UNKNOWN (-1) stands for a value of a newer library; it is the only Java value the header lacks.
-                assertTrue(c.containsKey(e.cName().apply(j)) || (j.name().equals("UNKNOWN") && e.code().applyAsInt(j) == -1),
-                        j + " is not in the header");
+                assertTrue(c.containsKey(e.cName().apply(j)), j + " is not in the header");
             }
         }
-        assertEquals(HeadEnd.UNKNOWN, HeadEnd.of(7));
+        assertEquals(HeadEnd.OTHER, HeadEnd.of(7));
+        assertEquals(BeaconState.OTHER, BeaconState.of(7));
+        assertEquals(ReadersDirState.OTHER, ReadersDirState.of(7));
         assertEquals(LagUnknown.OTHER_REASON, LagUnknown.of(7));
     }
 

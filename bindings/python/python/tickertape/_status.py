@@ -36,7 +36,8 @@ class Head(NamedTuple):
     offset: int
     segment_size: int
     end: str
-    """``"open"`` (the normal state), ``"sealed"`` (a writer died during a roll) or ``"invalid"`` (corruption)."""
+    """``"open"`` (the normal state), ``"sealed"`` (a writer died during a roll) or ``"invalid"`` (corruption);
+    ``"other"`` stands for a state this version does not name (treat it as unknown, not as healthy)."""
     invalid_reason: Optional[str]
     """For ``"invalid"``: a reason code, as in :attr:`CorruptJournalError.reason`."""
     last_local_ts_ns: Optional[int]
@@ -166,7 +167,7 @@ class ReaderMetrics(NamedTuple):
 
 @dataclass(frozen=True)
 class JournalStatus:
-    """One read-only sample of a journal's operational state, from :func:`status`. The values never change; pass it to
+    """One read-only sample of a journal's operational state, from :meth:`JournalStatus.sample`. The values never change; pass it to
     :meth:`Reader.metrics` for a reader's lag as of the sample."""
 
     path: Path
@@ -183,22 +184,23 @@ class JournalStatus:
     writer_alive: Optional[bool]
     readers_dir: Path
     readers_dir_state: str
-    """``"listed"``, ``"missing"`` or ``"unusable"``."""
+    """``"listed"``, ``"missing"`` or ``"unusable"``; ``"other"`` stands for a state this version does not name."""
     readers: list[BeaconStatus]
     """Reader beacons, sorted by name."""
     _sample: Any = field(repr=False, compare=False)
 
+    @staticmethod
+    def sample(path: PathLike, readers_dir: Optional[PathLike] = None) -> JournalStatus:
+        """Takes one read-only sample of the journal in ``path``: what ``tickertape status`` prints. Needs no writer and
+        disturbs none. Beacons are read from ``readers_dir`` (default ``path/readers``).
 
-def status(path: PathLike, readers_dir: Optional[PathLike] = None) -> JournalStatus:
-    """Takes one read-only sample of the journal in ``path``: what ``tickertape status`` prints. Needs no writer and
-    disturbs none. Beacons are read from ``readers_dir`` (default ``path/readers``).
+        Cost: a listing of the directory, the checkpoint marker, a scan of the newest segment from the checkpoint (so
+        it grows with what was appended since the last checkpoint), two segment headers, ``statvfs``, ``writer.lock``
+        and the beacons. Segments between the checkpoint's and the newest are listed, not read. Runs with the GIL
+        released.
 
-    Cost: a listing of the directory, the checkpoint marker, a scan of the newest segment from the checkpoint (so it
-    grows with what was appended since the last checkpoint), two segment headers, ``statvfs``, ``writer.lock`` and the
-    beacons. Segments between the checkpoint's and the newest are listed, not read. Runs with the GIL released.
-
-    Raises :class:`JournalNotFoundError` if there are no segments, :class:`CorruptJournalError` if the newest segment's
-    header is invalid, :class:`UnsupportedVersionError` or :class:`JournalIOError`.
-    """
-    sample = _native.sample_status(os.fspath(path), None if readers_dir is None else os.fspath(readers_dir))
-    return JournalStatus(**sample.fields(), _sample=sample)
+        Raises :class:`JournalNotFoundError` if there are no segments, :class:`CorruptJournalError` if the newest
+        segment's header is invalid, :class:`UnsupportedVersionError` or :class:`JournalIOError`.
+        """
+        sample = _native.sample_status(os.fspath(path), None if readers_dir is None else os.fspath(readers_dir))
+        return JournalStatus(**sample.fields(), _sample=sample)

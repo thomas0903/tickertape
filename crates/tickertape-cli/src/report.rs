@@ -6,8 +6,8 @@ use tickertape::inspect::{self, SegmentEnd, VerifyReport};
 
 use crate::{Failure, ReportArgs, Result, output};
 
-pub(crate) const VERIFY_HELP: &str = "JSON schema: {\"segments\":u64,\"records\":u64,\"first_seq\":u64|null,\"last_seq\":u64|null,\"problems\":[{\"file\":string,\"offset\":u64,\"reason\":string}]}. file is a basename; reason is a human-readable diagnostic.\n\nExit codes: 0 intact (or help); 1 usage, I/O or missing journal; 2 corruption found.";
-pub(crate) const INSPECT_HELP: &str = "JSON schema: {\"segments\":[{\"file\":string,\"base_seq\":u64|null,\"size_bytes\":u64|null,\"created_unix_ns\":u64|null,\"created_utc\":string|null,\"records\":u64,\"end_seq\":u64,\"used_bytes\":u64,\"used_percent\":number|null,\"end_state\":\"sealed\"|\"open\"|\"damaged\"|\"unknown\"}],\"totals\":{\"segments\":u64,\"records\":u64,\"first_seq\":u64|null,\"last_seq\":u64|null},\"checkpoint\":{\"generation\":u64,\"next_seq\":u64,\"segment_base_seq\":u64,\"offset\":u64}|null,\"problems\":[{\"file\":string,\"offset\":u64,\"reason\":string}]}. Metadata is null for invalid headers. created_utc is RFC 3339 UTC with nine fractional digits. end_seq is exclusive. used_bytes includes header and seal; used_percent = 100 * used_bytes / size_bytes. file is a basename; reason is a human-readable diagnostic.\n\nExit codes: 0 intact (or help); 1 usage, I/O or missing journal; 2 corruption found.";
+pub(crate) const VERIFY_HELP: &str = "JSON schema (schema_version 1; fields may be added, see docs/cli.md): {\"schema_version\":1,\"segments\":u64,\"records\":u64,\"first_seq\":u64|null,\"last_seq\":u64|null,\"problems\":[{\"file\":string,\"offset\":u64,\"reason\":string}]}. file is a basename; reason is a human-readable diagnostic.\n\nExit codes: 0 intact (or help); 1 usage, I/O or missing journal; 2 corruption found.";
+pub(crate) const INSPECT_HELP: &str = "JSON schema (schema_version 1; fields may be added, see docs/cli.md): {\"schema_version\":1,\"segments\":[{\"file\":string,\"base_seq\":u64|null,\"size_bytes\":u64|null,\"created_unix_ns\":u64|null,\"created_utc\":string|null,\"records\":u64,\"end_seq\":u64,\"used_bytes\":u64,\"used_percent\":number|null,\"end_state\":\"sealed\"|\"open\"|\"damaged\"|\"unknown\"}],\"totals\":{\"segments\":u64,\"records\":u64,\"first_seq\":u64|null,\"last_seq\":u64|null},\"checkpoint\":{\"generation\":u64,\"next_seq\":u64,\"segment_base_seq\":u64,\"offset\":u64}|null,\"problems\":[{\"file\":string,\"offset\":u64,\"reason\":string}]}. Metadata is null for invalid headers. created_utc is RFC 3339 UTC with nine fractional digits. end_seq is exclusive. used_bytes includes header and seal; used_percent = 100 * used_bytes / size_bytes. file is a basename; reason is a human-readable diagnostic.\n\nExit codes: 0 intact (or help); 1 usage, I/O or missing journal; 2 corruption found.";
 
 #[derive(Serialize)]
 struct Totals {
@@ -98,7 +98,7 @@ pub(crate) fn verify(args: ReportArgs, out: &mut dyn Write) -> Result<()> {
         problems: problems(&report),
     };
     if args.json {
-        output::json(out, &result)?;
+        output::json_document(out, &result)?;
     } else {
         write_totals(out, &result.totals)?;
         write_problems(out, &result.problems)?;
@@ -144,7 +144,7 @@ pub(crate) fn inspect(args: ReportArgs, out: &mut dyn Write) -> Result<()> {
         problems: problems(&report),
     };
     if args.json {
-        output::json(out, &result)?;
+        output::json_document(out, &result)?;
     } else {
         for segment in &result.segments {
             writeln!(out, "{} base_seq={} size={} created={} records={} end_seq={} used_bytes={} used_percent={} end_state={}",

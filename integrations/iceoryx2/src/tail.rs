@@ -27,8 +27,11 @@ pub(crate) struct Tail {
 /// [`Error::Journal`] if the journal can't be read.
 pub(crate) fn read(dir: &Path) -> Result<Tail, Error> {
     let segments = tickertape::inspect::list_segments(dir)?;
-    let last = segments.last().ok_or_else(|| tickertape::Error::NotFound {
-        dir: dir.to_path_buf(),
+    // `list_segments` reports a journal without segments as `tickertape::Error::NotFound`, so this is defensive.
+    let last = segments.last().ok_or_else(|| Error::Io {
+        op: "list segments of",
+        path: dir.to_path_buf(),
+        source: std::io::ErrorKind::NotFound.into(),
     })?;
     let mut reader = Reader::open(dir, ReaderConfig::default())?;
     reader.seek(last.base_seq)?;

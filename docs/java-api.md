@@ -264,7 +264,7 @@ try (Writer writer = Writer.open(Path.of("/data/journal"), options)) {
   you would otherwise build the payload in a temporary buffer first. **Throwing from the filler aborts the append:**
   nothing is committed, the writer zeroes and syncs the reserved bytes (slow, so aborting is for exceptional cases),
   and `appendWith` throws `FillAbortedException` with your exception as its cause. If that sync fails, it throws a
-  `JournalIoException` instead: a storage incident, after which the writer refuses appends and checkpoints (see
+  `JournalIOException` instead: a storage incident, after which the writer refuses appends and checkpoints (see
   [`c-api.md`](c-api.md#a-failed-clean-up-after-an-aborted-fill)). The filler must not call its writer. The
   `PayloadBuffer` belongs to the filler's thread: on any other thread each of its methods (and its `segment()`) throws
   `WrongThreadException`, and after the filler returns, `IllegalStateException`. Nothing a filler does, including
@@ -285,8 +285,8 @@ try (Reader reader = Reader.open(Path.of("/data/journal"))) {   // at the oldest
         RecordView r;
         try {
             r = reader.next(100, TimeUnit.MILLISECONDS);       // null: nothing new yet
-        } catch (DiscardedHistoryException e) {                // recovery or retention replaced the segment
-            reader.seek(reader.position());                    // SequenceUnavailableException if retention removed it
+        } catch (DiscardedException e) {                       // recovery or retention replaced the segment
+            reader.seek(reader.position());                    // SeqUnavailableException if retention removed it
             continue;
         }
         if (r != null) {
@@ -311,7 +311,7 @@ try (Reader reader = Reader.open(Path.of("/data/journal"))) {   // at the oldest
   stays next.
 - `ReaderOptions.defaults().durableOnly(true)` gives a reader that returns only records covered by a checkpoint (see
   [Durability](#durability)).
-- **Starting before the writer.** Opening a journal whose writer has not started throws `JournalIoException` with
+- **Starting before the writer.** Opening a journal whose writer has not started throws `JournalIOException` with
   `osErrorCode()` 2 (`ENOENT`); while the writer creates the first segment, `JournalNotFoundException`. A loop that
   waits for the writer retries on exactly these two (the example does).
 
@@ -364,17 +364,17 @@ Every error from the library is a `TickertapeException` (unchecked), with one su
 | Exception | Status | Meaning |
 |---|---|---|
 | `InvalidArgumentException` | `INVALID_ARGUMENT` | The library rejected an argument (Java checks most arguments itself first) |
-| `JournalIoException` | `IO` | A system call failed; `osErrorCode()` is its `errno` |
-| `StorageFullException` (a `JournalIoException`) | `STORAGE_FULL` | `ENOSPC` or `EDQUOT`; a failed append can be retried later |
-| `JournalLockedException` | `LOCKED` | Another writer has the journal open |
+| `JournalIOException` | `IO` | A system call failed; `osErrorCode()` is its `errno` |
+| `StorageFullException` (a `JournalIOException`) | `STORAGE_FULL` | `ENOSPC` or `EDQUOT`; a failed append can be retried later |
+| `LockedException` | `LOCKED` | Another writer has the journal open |
 | `CorruptJournalException` | `CORRUPT` | Journal bytes failed validation; `reason()` says why. A reader's position does not move |
-| `UnsupportedFormatVersionException` | `UNSUPPORTED_VERSION` | A segment has an unsupported format version |
-| `JournalNotFoundException` | `NOT_FOUND` | The directory has no segments yet (a missing directory is `JournalIoException` with `ENOENT`) |
-| `SequenceUnavailableException` | `SEQ_UNAVAILABLE` | The sequence number is older than the oldest segment |
+| `UnsupportedVersionException` | `UNSUPPORTED_VERSION` | A segment has an unsupported format version |
+| `JournalNotFoundException` | `NOT_FOUND` | The directory has no segments yet (a missing directory is `JournalIOException` with `ENOENT`) |
+| `SeqUnavailableException` | `SEQ_UNAVAILABLE` | The sequence number is older than the oldest segment |
 | `RecordTooLargeException` | `RECORD_TOO_LARGE` | The payload does not fit in a segment |
 | `DurabilityLostException` | `DURABILITY_LOST` | An earlier checkpoint, or the clean-up after an aborted fill, failed |
 | `SequenceExhaustedException` | `SEQUENCE_EXHAUSTED` | Sequence numbers are exhausted |
-| `DiscardedHistoryException` | `DISCARDED` | Recovery or retention replaced or removed the reader's segment; call `seek` |
+| `DiscardedException` | `DISCARDED` | Recovery or retention replaced or removed the reader's segment; call `seek` |
 | `InvalidConfigException` | `INVALID_CONFIG` | A configuration value is out of range |
 | `BufferTooSmallException` | `BUFFER_TOO_SMALL` | A `ReadBatch` buffer is too small; `requiredBytes()` |
 | `FillAbortedException` | `ABORTED` | A `PayloadFiller` threw; nothing was appended |
@@ -473,8 +473,8 @@ WriterMetrics w = writer.metrics();                       // in the writer's pro
   `Cleaner` frees an unreachable sample too). Every method may be called from any thread, concurrently; `close()`
   waits for `Reader.metrics` calls that use the sample.
 - Unknown values are empty (`OptionalLong`, `Optional<Duration>`), never guesses. The enums (`HeadEnd`,
-  `CheckpointProblem`, `AgeUnknown`, `LagUnknown`, `BeaconState`, `ReadersDirState`) name every C value; `UNKNOWN`
-  (or the `OTHER_*` value) stands for one from a newer library.
+  `CheckpointProblem`, `AgeUnknown`, `LagUnknown`, `BeaconState`, `ReadersDirState`) name every C value; the `OTHER`
+  value (`OTHER_PROBLEM`, `OTHER_REASON` for three of them) stands for one the C ABI or this binding does not name.
 - Corruption is `headEnd() == HeadEnd.INVALID`, a `checkpointProblem()` other than `USABLE`, or
   `isHeadChainBroken()`. `isHeadVerified()` false means the segments between the checkpoint and the newest were not
   read: no corruption reported then does not mean that a writer would open the journal.

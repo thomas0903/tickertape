@@ -8,7 +8,7 @@ There are two ways to use tickertape journals from Python. Both read the same on
 | Import | `import tickertape` | `import tickertape_reader` |
 | Write | Yes: `Writer`, the single writer, with the journal lock and crash recovery | No |
 | Read | Live cursor: replay from any sequence, follow the writer, wait with a timeout | One pass over what is committed when it runs; doesn't follow or wait |
-| Batches | `append_many`, `read_many`, columnar `read_batch` for NumPy/Arrow/pandas | Generator of named tuples |
+| Batches | `append_batch`, `read_many`, columnar `read_batch` for NumPy/Arrow/pandas | Generator of named tuples |
 | Durable-only reads | `Reader(durable_only=True)`, waits for checkpoints | `durable_only=True`, capped at the checkpoint seen at startup |
 | Validation | The Rust reader's (shared with the CLI) | An independent implementation of the specification |
 | Implementation | Compiled Rust | Pure Python (slower) |
@@ -33,7 +33,7 @@ The design decisions are in [ADR 0029](decisions/0029-python-bindings.md). In br
 - **Copies.** Payloads are `bytes` or buffers of unsigned bytes (uint8 only). Every record returned to Python owns its
   payload as `bytes`. Batch columns are `bytes` objects that NumPy and pyarrow wrap without another copy. There is no
   live zero-copy access; the mapped Rust reader is not exposed.
-- **Batches cross the language boundary once.** `append_many` converts and checks all arguments first, then appends
+- **Batches cross the language boundary once.** `append_batch` converts and checks all arguments first, then appends
   them as one batch (`Writer::append_batch`, ADR 0041: if at least one record is appended and wake-ups are enabled,
   blocked readers are woken once after the last record appended, plus once at each roll inside the batch);
   on a failure part-way it raises `BatchAppendError` saying how many records were appended and from which sequence
@@ -64,13 +64,13 @@ The design decisions are in [ADR 0029](decisions/0029-python-bindings.md). In br
 
 ### Operational metrics
 
-`tickertape.status(path)` takes the read-only sample that `tickertape status` prints (ADR
+`tickertape.JournalStatus.sample(path)` takes the read-only sample that `tickertape status` prints (ADR
 [0032](decisions/0032-operational-metrics.md); meaning and accuracy of each value:
 [`operations.md`](operations.md#monitoring)). It needs no writer and releases the GIL. `Writer.metrics()` returns what
 only the writer knows, and `Reader.metrics(status)` a reader's cursor and lag behind a sample:
 
 ```python
-s = tickertape.status("/data/journal")
+s = tickertape.JournalStatus.sample("/data/journal")
 print(s.exposure.records, s.checkpoint and s.checkpoint.estimated_age_ns, s.storage.estimated_rolls_left)
 lag = reader.metrics(s).lag          # None, with reader.metrics(s).lag_unknown, if it can't be established
 w = writer.metrics()                 # in the writer's process: no system calls
@@ -83,9 +83,9 @@ w = writer.metrics()                 # in the writer's process: no system calls
   that a writer would open the journal.
 - `Reader.metrics` measures against the sample, so take it after the reads you want counted. Records the reader has
   read from the journal but not returned yet (`buffered`) count in the lag.
-- Cost: `status()` lists the directory, reads the checkpoint marker, scans the newest segment from the checkpoint (so
-  it grows with what was appended since the last checkpoint), reads two segment headers, `writer.lock` and the
-  beacons, and calls `statvfs`; the metrics calls make no system calls. The Python bindings call the core crate
+- Cost: `JournalStatus.sample()` lists the directory, reads the checkpoint marker, scans the newest segment from the
+  checkpoint (so it grows with what was appended since the last checkpoint), reads two segment headers, `writer.lock`
+  and the beacons, and calls `statvfs`; the metrics calls make no system calls. The Python bindings call the core crate
   directly (ADR 0029), not the C ABI.
 
 ### End-to-end example

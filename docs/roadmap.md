@@ -156,10 +156,10 @@ criterion holds; each open item says what is still missing.
     implementation already restricts `msync` to written ranges, then performs file-wide sync/barrier operations.
   - Investigate reducing the remaining flush work without weakening data-before-marker ordering or the crash
     contract. Record before/after checkpoint and durable-only reader latency, or document platform limitations.
-  - A checkpoint that does not stop appends (`Writer::request_checkpoint`, ADR 0038, proposed): prototype in review;
-    the design is finished after the Linux measurement the ADR describes (`tt-sustained --checkpoint-mode`).
-  - Missing: background checkpoints are merged (#28) but ADR 0038 is still proposed; the prefaulted-data measurement
-    and before/after checkpoint and durable-only reader latency are not recorded in `docs/benchmarks.md`.
+  - A checkpoint that does not stop appends (`Writer::request_checkpoint`, ADR 0038, accepted): merged (#28), with
+    the Linux measurement the ADR describes (`tt-sustained --checkpoint-mode`) in the pull request's comments.
+  - Missing: the Linux results of ADR 0038, the prefaulted-data measurement and before/after checkpoint and
+    durable-only reader latency are not recorded in `docs/benchmarks.md`.
 - [ ] **Finish eliminating avoidable work.**
   - Profile append, both readers, notification and serialization paths under the sustained workloads; document
     allocations, copies and synchronization that remain on those paths.
@@ -181,8 +181,8 @@ criterion holds; each open item says what is still missing.
 ### Following milestones: adoption and scale
 
 - [x] **Build a small interoperability layer.** (done 2026-11-20: C ABI #10, Python #7, C++ #19, Java #21, iceoryx2
-  #13, metrics through the bindings #30, install tests #29; publishing is the next item, the names in ADRs 0029 and
-  0037 are in `docs/compatibility.md` → Before 1.0)
+  #13, metrics through the bindings #30, install tests #29; publishing is the next item; the names in ADRs 0029 and
+  0037 are accepted)
   - Provide a C ABI with documented ownership, record lifetimes, errors, threading, durability and versioning, plus
     a C/C++ example. Keep bindings and framework adapters outside the core crate.
   - Provide installable Python bindings with batch operations and explicit copy/lifetime behavior. Preserve the
@@ -225,9 +225,9 @@ criterion holds; each open item says what is still missing.
     failures, with documented sampling costs and no mandatory telemetry service.
   - Exercise release/installation/upgrade instructions and the external integration against a release candidate.
     Complete the release checklist and publish guarantees, measured operating limits and known issues.
-  - Missing: the surfaces are reviewed and documented in [`compatibility.md`](compatibility.md) (ADR 0043, proposed), with the
-    fixtures and soak tier (#12) and the metrics (#8, #30) in place; the list under "Before 1.0" there is not
-    resolved (ADRs 0029, 0032, 0033, 0037, 0038, 0042 and 0043 still proposed, among others), the release-candidate
+  - Missing: the surfaces are reviewed and documented in [`compatibility.md`](compatibility.md) (ADR 0043,
+    accepted), with the fixtures and soak tier (#12) and the metrics (#8, #30) in place; its "Before 1.0" list still
+    holds ADR 0042, the features no binding reaches yet, the ABI freeze and the 1.0 fixtures; the release-candidate
     exercise has not been done (a tag needs the owner's approval), and no measured operating limits are published.
 
 **v1.0 release gate:** all milestones above are complete under their stated criteria, CI is green on Linux and

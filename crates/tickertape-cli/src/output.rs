@@ -22,6 +22,29 @@ pub(crate) fn io_error(context: &str, error: impl std::fmt::Display) -> Failure 
     Failure::usage(format!("{context}: {error}"))
 }
 
+/// The `schema_version` of the JSON documents of `verify`, `inspect`, `stats` and `archive` (`docs/cli.md` →
+/// Machine-readable contracts). `status` has its own. Within a version, fields are only added.
+pub(crate) const SCHEMA_VERSION: u32 = 1;
+
+/// A JSON document with `schema_version` as its first field.
+#[derive(Serialize)]
+struct Versioned<'a, T: Serialize> {
+    schema_version: u32,
+    #[serde(flatten)]
+    document: &'a T,
+}
+
+/// Writes `value` as one JSON document on a line, with `"schema_version"` first.
+pub(crate) fn json_document(out: &mut dyn Write, value: &impl Serialize) -> Result<()> {
+    json(
+        out,
+        &Versioned {
+            schema_version: SCHEMA_VERSION,
+            document: value,
+        },
+    )
+}
+
 pub(crate) fn json(out: &mut dyn Write, value: &impl Serialize) -> Result<()> {
     serde_json::to_writer(&mut *out, value).map_err(|e| io_error("write JSON output", e))?;
     writeln!(out).map_err(|e| io_error("write output newline", e))
