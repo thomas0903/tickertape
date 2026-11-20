@@ -296,6 +296,10 @@ stay unpinned. On macOS the run continues unpinned and the result says so. A pac
 
 Example: on a 64 GiB machine at 100,000 records/s of 1,024 B (106.4 MB/s of journal data), 1.5 × RAM (103 GB) takes about 16 minutes.
 
+**Where a stall comes from.** To find what the writer or a reader waits on during a run (scheduler, page faults,
+filesystem and write-back, block I/O), trace it with
+[the eBPF diagnostics playbook](../docs/playbooks/diagnose-latency-with-ebpf.md) and the scripts in `diagnostics/`.
+
 ## Recorded sustained session
 
 `benches/session.py` runs a whole session on the filesystem under test: the tickertape scenarios with `tt-sustained`,
