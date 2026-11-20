@@ -43,7 +43,8 @@ use crate::retention::{Action, Policy, Report};
 pub(crate) const OPEN_SEGMENTS: usize = 4;
 
 /// A file's identity (device and inode number), read through a descriptor of it, to tell whether a path still names
-/// that file when it is opened again.
+/// that file when it is opened again. A file system may give a removed file's inode number to the next file it
+/// creates, so a file removed and created again under the same name is not always told apart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FileId {
     dev: u64,
