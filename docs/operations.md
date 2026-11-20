@@ -17,6 +17,12 @@ draws conclusions from those two.
 - **Disk reservation.** Every segment reserves its full size on disk when it is created, even if it is mostly empty.
 - **Open time.** When the writer opens, it reads the part of the newest segment after the last record to clean up
   after a crash, so very large segments make opening slower.
+- **Seek time.** `Reader::seek` opens the segment holding the target and reads every record before it in that
+  segment, validating each, so larger segments make a seek slower (ADR 0042).
+- **Segment count.** Opening a reader or a writer and each seek read the whole journal directory; `list_segments`,
+  `verify` and each retention run (when retention is configured, at writer open and after checkpoints) open every
+  segment's file; replay opens each segment it enters. These costs grow with the number of segments, so very small
+  segments in a long-lived journal make them add up (ADR 0042).
 - **Granularity of archiving.** You archive or delete whole segments (below).
 
 For most uses the default is a reasonable start. Pick smaller segments (a few MiB) for low-volume journals you
