@@ -473,6 +473,15 @@ impl Writer {
         })
     }
 
+    /// What only the writer knows, as a `WriterMetrics` (ADR 0032): its head, the last checkpoint by the monotonic
+    /// clock, uncheckpointed records and bytes, whether it is poisoned, failed retention runs. No system calls.
+    fn metrics<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        self.settle(py, || {
+            let metrics = self.with(py, |w| w.metrics())?;
+            crate::status::writer_metrics(py, &metrics)
+        })
+    }
+
     /// Cumulative retention removals since open, as a `RetentionReport`.
     #[getter]
     fn retention_report<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {

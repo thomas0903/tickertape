@@ -1189,6 +1189,33 @@ impl Reader {
         })
     }
 
+    /// This reader's cursor and its lag behind `status` (a `JournalStatus` from `tickertape.status`), as a
+    /// `ReaderMetrics` (ADR 0032): behind the head, or behind the checkpoint marker for a durable-only reader, as of
+    /// that sample. Records the reader has read from the journal but not yet returned count in the lag. No system
+    /// calls.
+    fn metrics<'py>(
+        &self,
+        py: Python<'py>,
+        status: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        self.settle(py, || {
+            self.check(py)?;
+            let sample = status
+                .getattr("_sample")
+                .ok()
+                .and_then(|s| s.cast_into::<crate::status::StatusSample>().ok())
+                .ok_or_else(|| {
+                    pyo3::exceptions::PyTypeError::new_err(
+                        "status must be a tickertape.JournalStatus",
+                    )
+                })?;
+            let (position, cursor, buffered) = self
+                .locked(py, |s| (s.position(), s.reader.cursor(), s.buffer.len()))?
+                .ok_or_else(|| errors::closed("reader"))?;
+            crate::status::reader_metrics(py, position, cursor, buffered, &sample.get().status)
+        })
+    }
+
     /// The sequence number of the next record this reader will return. Never blocks.
     #[getter]
     fn position(&self, py: Python<'_>) -> PyResult<u64> {

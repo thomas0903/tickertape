@@ -2409,3 +2409,578 @@ fn failed_cleanup_is_reported(errno: i32) {
     assert_eq!(unsafe { tickertape_writer_checkpoint(writer) }, OK);
     assert_eq!(unsafe { tickertape_writer_close(writer) }, OK);
 }
+
+// ---- Operational metrics (ADR 0032) ----
+
+/// The variants of a core enum in `status.rs`, as `core_variants` reads them from `error.rs`.
+fn status_variants(name: &str) -> BTreeSet<String> {
+    let source = include_str!("../../tickertape/src/status.rs");
+    let start = source
+        .find(&format!("pub enum {name} {{"))
+        .expect("enum in status.rs");
+    let mut variants = BTreeSet::new();
+    for line in source[start..].lines().skip(1) {
+        if line.starts_with('}') {
+            break;
+        }
+        let Some(rest) = line.strip_prefix("    ") else {
+            continue;
+        };
+        if rest.starts_with(|c: char| c.is_ascii_uppercase()) {
+            variants.insert(
+                rest.chars()
+                    .take_while(|c| c.is_ascii_alphanumeric())
+                    .collect(),
+            );
+        }
+    }
+    assert!(!variants.is_empty(), "no variants parsed for {name}");
+    variants
+}
+
+fn names(list: &[(&str, i32)]) -> BTreeSet<String> {
+    list.iter().map(|(n, _)| n.to_string()).collect()
+}
+
+#[test]
+fn pure_every_status_enum_variant_has_a_code() {
+    use tickertape::status::{
+        AgeUnknown, BeaconDirState, BeaconState, CheckpointProblem, HeadEnd, LagUnknown,
+    };
+    let head = [
+        ("Open", head_end_of(HeadEnd::Open).0 as i32),
+        ("Sealed", head_end_of(HeadEnd::Sealed).0 as i32),
+        (
+            "Invalid",
+            head_end_of(HeadEnd::Invalid(CorruptReason::BadChecksum)).0 as i32,
+        ),
+    ];
+    assert_eq!(names(&head), status_variants("HeadEnd"));
+    assert_eq!(head.map(|(_, c)| c), [0, 1, 2]);
+    assert_eq!(
+        head_end_of(HeadEnd::Invalid(CorruptReason::BadChecksum)).1,
+        tickertape_corrupt_reason::TICKERTAPE_CORRUPT_BAD_CHECKSUM
+    );
+    let problems = [
+        (
+            "MissingSegment",
+            checkpoint_problem_of(Some(CheckpointProblem::MissingSegment)) as i32,
+        ),
+        (
+            "InvalidSegmentHeader",
+            checkpoint_problem_of(Some(CheckpointProblem::InvalidSegmentHeader)) as i32,
+        ),
+        (
+            "InvalidOffset",
+            checkpoint_problem_of(Some(CheckpointProblem::InvalidOffset)) as i32,
+        ),
+    ];
+    assert_eq!(names(&problems), status_variants("CheckpointProblem"));
+    assert_eq!(problems.map(|(_, c)| c), [1, 2, 3]);
+    assert_eq!(checkpoint_problem_of(None) as i32, 0);
+    let ages = [
+        (
+            "NoModificationTime",
+            age_unknown_of(Some(AgeUnknown::NoModificationTime)) as i32,
+        ),
+        (
+            "InFuture",
+            age_unknown_of(Some(AgeUnknown::InFuture)) as i32,
+        ),
+        (
+            "BeforeSegment",
+            age_unknown_of(Some(AgeUnknown::BeforeSegment)) as i32,
+        ),
+        (
+            "MarkerResized",
+            age_unknown_of(Some(AgeUnknown::MarkerResized)) as i32,
+        ),
+        (
+            "Changing",
+            age_unknown_of(Some(AgeUnknown::Changing)) as i32,
+        ),
+        (
+            "OlderSlotLost",
+            age_unknown_of(Some(AgeUnknown::OlderSlotLost)) as i32,
+        ),
+    ];
+    assert_eq!(names(&ages), status_variants("AgeUnknown"));
+    assert_eq!(ages.map(|(_, c)| c), [1, 2, 3, 4, 5, 6]);
+    assert_eq!(age_unknown_of(None) as i32, 0);
+    let lags = [
+        (
+            "SegmentGone",
+            lag_unknown_of(LagUnknown::SegmentGone) as i32,
+        ),
+        (
+            "OtherHistory",
+            lag_unknown_of(LagUnknown::OtherHistory) as i32,
+        ),
+        (
+            "SegmentUnreadable",
+            lag_unknown_of(LagUnknown::SegmentUnreadable) as i32,
+        ),
+        (
+            "CheckpointUnusable",
+            lag_unknown_of(LagUnknown::CheckpointUnusable) as i32,
+        ),
+        (
+            "AheadOfSample",
+            lag_unknown_of(LagUnknown::AheadOfSample) as i32,
+        ),
+    ];
+    assert_eq!(names(&lags), status_variants("LagUnknown"));
+    assert_eq!(lags.map(|(_, c)| c), [1, 2, 3, 4, 5]);
+    let states = [
+        ("Live", beacon_state_of(BeaconState::Live) as i32),
+        ("Stale", beacon_state_of(BeaconState::Stale) as i32),
+        ("Uncertain", beacon_state_of(BeaconState::Uncertain) as i32),
+        ("Invalid", beacon_state_of(BeaconState::Invalid) as i32),
+        (
+            "Unreadable",
+            beacon_state_of(BeaconState::Unreadable) as i32,
+        ),
+        ("Changing", beacon_state_of(BeaconState::Changing) as i32),
+    ];
+    assert_eq!(names(&states), status_variants("BeaconState"));
+    assert_eq!(states.map(|(_, c)| c), [0, 1, 2, 3, 4, 5]);
+    let dirs = [
+        (
+            "Listed",
+            readers_dir_state_of(BeaconDirState::Listed) as i32,
+        ),
+        (
+            "Missing",
+            readers_dir_state_of(BeaconDirState::Missing) as i32,
+        ),
+        (
+            "Unusable",
+            readers_dir_state_of(BeaconDirState::Unusable(io::ErrorKind::PermissionDenied)) as i32,
+        ),
+    ];
+    assert_eq!(names(&dirs), status_variants("BeaconDirState"));
+    assert_eq!(dirs.map(|(_, c)| c), [0, 1, 2]);
+}
+
+#[test]
+fn pure_metrics_arguments_are_checked() {
+    let mut out = null_mut();
+    assert_eq!(
+        unsafe { tickertape_journal_status_sample(null(), null(), &mut out) },
+        INVALID
+    );
+    assert!(out.is_null());
+    assert_eq!(
+        unsafe { tickertape_journal_status_sample(c"/x".as_ptr(), null(), null_mut()) },
+        INVALID
+    );
+    let mut report = tickertape_journal_status_report {
+        struct_size: std::mem::size_of::<tickertape_journal_status_report>() as u64,
+        ..Default::default()
+    };
+    assert_eq!(
+        unsafe { tickertape_journal_status_get_report(null(), &mut report) },
+        INVALID
+    );
+    let mut beacon = tickertape_beacon_status {
+        struct_size: 119,
+        ..Default::default()
+    };
+    assert_eq!(
+        unsafe { tickertape_journal_status_get_beacon(null(), 0, &mut beacon) },
+        INVALID
+    );
+    assert!(last_message().contains("struct_size"), "{}", last_message());
+    assert!(unsafe { tickertape_journal_status_beacon_name(null(), 0) }.is_null());
+    unsafe { tickertape_journal_status_free(null_mut()) };
+    let mut wm = tickertape_writer_metrics {
+        struct_size: std::mem::size_of::<tickertape_writer_metrics>() as u64,
+        ..Default::default()
+    };
+    assert_eq!(
+        unsafe { tickertape_writer_get_metrics(null_mut(), &mut wm) },
+        INVALID
+    );
+    let mut rm = tickertape_reader_metrics {
+        struct_size: 71,
+        ..Default::default()
+    };
+    assert_eq!(
+        unsafe { tickertape_reader_get_metrics(null_mut(), null(), &mut rm) },
+        INVALID
+    );
+    assert!(last_message().contains("struct_size"), "{}", last_message());
+}
+
+fn sample(j: &Journal) -> *mut tickertape_journal_status {
+    let mut status = null_mut();
+    let code = unsafe { tickertape_journal_status_sample(j.c_dir.as_ptr(), null(), &mut status) };
+    assert_eq!(code, OK, "{}", last_message());
+    assert!(!status.is_null());
+    status
+}
+
+fn report(status: *const tickertape_journal_status) -> tickertape_journal_status_report {
+    let mut r = tickertape_journal_status_report {
+        struct_size: std::mem::size_of::<tickertape_journal_status_report>() as u64,
+        ..Default::default()
+    };
+    assert_eq!(
+        unsafe { tickertape_journal_status_get_report(status, &mut r) },
+        OK
+    );
+    assert_eq!(r.struct_size, 272);
+    r
+}
+
+fn writer_metrics(writer: *mut tickertape_writer) -> tickertape_writer_metrics {
+    let mut m = tickertape_writer_metrics {
+        struct_size: std::mem::size_of::<tickertape_writer_metrics>() as u64,
+        ..Default::default()
+    };
+    assert_eq!(unsafe { tickertape_writer_get_metrics(writer, &mut m) }, OK);
+    m
+}
+
+fn reader_metrics(
+    reader: *mut tickertape_reader,
+    status: *const tickertape_journal_status,
+) -> tickertape_reader_metrics {
+    let mut m = tickertape_reader_metrics {
+        struct_size: std::mem::size_of::<tickertape_reader_metrics>() as u64,
+        ..Default::default()
+    };
+    assert_eq!(
+        unsafe { tickertape_reader_get_metrics(reader, status, &mut m) },
+        OK,
+        "{}",
+        last_message()
+    );
+    m
+}
+
+fn read_n(reader: *mut tickertape_reader, n: u64) {
+    let mut record = empty_record();
+    for _ in 0..n {
+        assert_eq!(
+            unsafe { tickertape_reader_next(reader, 0, &mut record) },
+            OK
+        );
+    }
+}
+
+#[test]
+fn status_and_metrics_with_a_writer_and_a_lagging_reader() {
+    use tickertape_lag_unknown as L;
+    let j = Journal::new();
+    let writer = j.writer(65_536);
+    let fresh = writer_metrics(writer);
+    assert_eq!((fresh.head_next_seq, fresh.has_checkpoint), (0, 0));
+    assert_eq!(fresh.checkpoint_next_seq, TICKERTAPE_UNKNOWN);
+    assert_eq!(fresh.since_checkpoint_ns, TICKERTAPE_UNKNOWN);
+    for seq in 0..400 {
+        append(writer, seq);
+    }
+    assert_eq!(unsafe { tickertape_writer_checkpoint(writer) }, OK);
+    for seq in 400..1000 {
+        append(writer, seq);
+    }
+    let lagging = j.reader(false, false);
+    read_n(lagging, 150);
+    let durable = j.reader(true, true);
+    read_n(durable, 30);
+
+    // The writer's view.
+    let w = writer_metrics(writer);
+    assert_eq!(w.struct_size, 112);
+    assert_eq!(w.head_next_seq, 1000);
+    assert!(w.head_segment_base_seq > 0, "the journal rolled");
+    assert_eq!((w.has_checkpoint, w.poisoned), (1, 0));
+    assert_eq!(w.checkpoint_next_seq, 400);
+    assert_ne!(w.since_checkpoint_ns, TICKERTAPE_UNKNOWN);
+    assert_eq!(w.uncheckpointed_records, 600);
+    assert!(w.uncheckpointed_bytes > 0);
+    assert_eq!(w.retention_failures, 0);
+    let core_writer = unsafe { writer_handle(writer) }
+        .unwrap()
+        .with_ref(|w| Ok(w.metrics()))
+        .unwrap();
+    assert_eq!(w.uncheckpointed_bytes, core_writer.uncheckpointed_bytes);
+    assert_eq!(w.segment_size, core_writer.segment_size);
+
+    // The sample, against the core's.
+    let status = sample(&j);
+    let r = report(status);
+    let core = tickertape::status::status(&j.dir).unwrap();
+    assert_eq!(r.head_next_seq, 1000);
+    assert_eq!(r.head_segment_base_seq, w.head_segment_base_seq);
+    assert_eq!(r.head_offset, w.head_offset);
+    assert_eq!(r.head_end, tickertape_head_end::TICKERTAPE_HEAD_OPEN as i32);
+    assert_eq!(r.head_corrupt_reason, 0);
+    assert_eq!(r.head_last_local_ts_ns, 2_000_000 + 3 * 999);
+    assert_eq!(r.head_chain_broken, 0);
+    assert_eq!(r.head_verified, u32::from(core.head.verified));
+    assert_eq!(r.segment_count, core.segments.count);
+    assert!(r.segment_count > 2);
+    assert_eq!(r.first_seq, 0);
+    assert_eq!(r.segments_total_bytes, core.segments.total_bytes);
+    assert_ne!(r.oldest_segment_created_unix_ns, TICKERTAPE_UNKNOWN);
+    assert_eq!(
+        r.segments_before_checkpoint,
+        core.segments.before_checkpoint
+    );
+    assert_eq!((r.has_checkpoint, r.checkpoint_problem), (1, 0));
+    assert_eq!(r.checkpoint_next_seq, 400);
+    assert_eq!(r.checkpoint_generation, w.checkpoint_generation);
+    assert_eq!(r.exposure_records, 600);
+    assert_eq!(r.exposure_bytes, core.exposure.bytes.unwrap());
+    assert_eq!(r.exposure_oldest_local_ts_ns, 2_000_000 + 3 * 400);
+    if r.checkpoint_age_unknown == 0 {
+        assert_ne!(r.checkpoint_estimated_age_ns, TICKERTAPE_UNKNOWN);
+        assert_eq!(r.exposure_estimated_age_ns, r.checkpoint_estimated_age_ns);
+    }
+    assert!(r.storage_available_bytes > 0 && r.storage_total_bytes >= r.storage_available_bytes);
+    assert_eq!(r.storage_next_segment_size, 65_536);
+    assert_eq!(r.writer_pid, u64::from(std::process::id()));
+    assert_eq!(r.writer_alive, 1);
+    assert_eq!(
+        r.readers_dir_state,
+        tickertape_readers_dir_state::TICKERTAPE_READERS_DIR_MISSING as i32
+    );
+    assert_eq!(r.beacon_count, 0);
+    assert!(r.sampled_unix_ns > 1_600_000_000_000_000_000);
+
+    // The lagging reader, with a view handed out before: the metrics call does not invalidate it.
+    let mut view = empty_record();
+    assert_eq!(unsafe { tickertape_reader_next(lagging, 0, &mut view) }, OK);
+    let m = reader_metrics(lagging, status);
+    check_record(&view, 150);
+    assert_eq!(m.struct_size, 72);
+    assert_eq!((m.next_seq, m.slot_seq), (151, 151));
+    assert_eq!((m.seek_pending, m.durable_only, m.held_record), (0, 0, 0));
+    assert_eq!(m.lag_unknown, L::TICKERTAPE_LAG_KNOWN as i32);
+    assert_eq!(m.lag_records, 1000 - 151);
+    assert!(m.lag_bytes > 0 && m.lag_bytes != TICKERTAPE_UNKNOWN);
+    let mut position = 0;
+    assert_eq!(
+        unsafe { tickertape_reader_position(lagging, &mut position) },
+        OK
+    );
+    assert_eq!(position, m.next_seq);
+
+    // The durable-only reader lags behind the checkpoint, not the head.
+    let d = reader_metrics(durable, status);
+    assert_eq!((d.next_seq, d.durable_only), (30, 1));
+    assert_eq!(d.lag_records, 400 - 30);
+
+    // A record held back for the next read counts in the lag; its footprint is not known.
+    let mut small = [0u8; 4];
+    let mut record = empty_record();
+    let mut copied = 0;
+    while copied < 300 {
+        let code =
+            unsafe { tickertape_reader_next_copy(lagging, 0, small.as_mut_ptr(), 4, &mut record) };
+        if code == code_of_buffer_too_small() {
+            break;
+        }
+        assert_eq!(code, OK);
+        copied += 1;
+    }
+    let held = reader_metrics(lagging, status);
+    assert_eq!(held.held_record, 1);
+    assert_eq!(held.next_seq, record.seq);
+    assert_eq!(held.slot_seq, record.seq + 1);
+    assert_eq!(held.lag_records, 1000 - record.seq);
+    assert_eq!(held.lag_bytes, TICKERTAPE_UNKNOWN);
+
+    // A sample taken before the reader moved on to a segment the sample did not list.
+    for seq in 1000..1400 {
+        append(writer, seq);
+    }
+    let mut buf = vec![0u8; 512];
+    while unsafe {
+        tickertape_reader_next_copy(lagging, 0, buf.as_mut_ptr(), buf.len(), &mut record)
+    } == OK
+    {}
+    let ahead = reader_metrics(lagging, status);
+    assert_eq!(ahead.next_seq, 1400);
+    assert_eq!(ahead.lag_unknown, L::TICKERTAPE_LAG_AHEAD_OF_SAMPLE as i32);
+    assert_eq!(
+        (ahead.lag_records, ahead.lag_bytes),
+        (TICKERTAPE_UNKNOWN, TICKERTAPE_UNKNOWN)
+    );
+    let fresh = sample(&j);
+    let caught_up = reader_metrics(lagging, fresh);
+    assert_eq!((caught_up.lag_records, caught_up.lag_bytes), (0, 0));
+
+    unsafe {
+        tickertape_journal_status_free(status);
+        tickertape_journal_status_free(fresh);
+        tickertape_reader_close(lagging);
+        tickertape_reader_close(durable);
+        tickertape_writer_close(writer);
+    }
+}
+
+fn code_of_buffer_too_small() -> i32 {
+    code(tickertape_status_code::TICKERTAPE_E_BUFFER_TOO_SMALL)
+}
+
+#[test]
+fn status_reports_beacons_and_lag_across_retention() {
+    use tickertape_lag_unknown as L;
+    let j = Journal::new();
+    let writer = j.writer(65_536);
+    for seq in 0..1000 {
+        append(writer, seq);
+    }
+    assert_eq!(unsafe { tickertape_writer_checkpoint(writer) }, OK);
+    // A reader that publishes a beacon (from the core API: the C ABI reads beacons, it does not create them).
+    let mut core_reader =
+        tickertape::Reader::open(&j.dir, tickertape::ReaderConfig::default()).unwrap();
+    for _ in 0..10 {
+        core_reader.try_next().unwrap().unwrap();
+    }
+    let mut beacon =
+        tickertape::status::ReaderBeacon::create(&j.dir, "replayer", &core_reader).unwrap();
+    beacon.flush(&core_reader).unwrap();
+    // A C reader left at the oldest segment.
+    let stuck = j.reader(false, false);
+
+    let status = sample(&j);
+    let r = report(status);
+    assert_eq!(r.readers_dir_state, 0);
+    assert_eq!(r.beacon_count, 1);
+    let name = unsafe { CStr::from_ptr(tickertape_journal_status_beacon_name(status, 0)) };
+    assert_eq!(name.to_str().unwrap(), "replayer");
+    assert!(unsafe { tickertape_journal_status_beacon_name(status, 1) }.is_null());
+    let mut b = tickertape_beacon_status {
+        struct_size: std::mem::size_of::<tickertape_beacon_status>() as u64,
+        ..Default::default()
+    };
+    assert_eq!(
+        unsafe { tickertape_journal_status_get_beacon(status, 0, &mut b) },
+        OK
+    );
+    assert_eq!(b.struct_size, 120);
+    assert_eq!(
+        b.state,
+        tickertape_beacon_state::TICKERTAPE_BEACON_LIVE as i32
+    );
+    assert_eq!(
+        (b.has_report, b.report_seek_pending, b.report_durable_only),
+        (1, 0, 0)
+    );
+    assert_eq!(b.report_pid, u64::from(std::process::id()));
+    assert_eq!((b.report_next_seq, b.report_slot_seq), (10, 10));
+    assert_eq!(b.report_segment_base_seq, 0);
+    assert_eq!(b.lag_unknown, 0);
+    assert_eq!(b.lag_records, 990);
+    assert_ne!(b.lag_bytes, TICKERTAPE_UNKNOWN);
+    assert_eq!(b.oldest_unread_local_ts_ns, 2_000_000 + 30);
+    assert_ne!(b.update_age_ns, TICKERTAPE_UNKNOWN);
+    assert_eq!(b.reserved, 0);
+    assert_eq!(
+        unsafe { tickertape_journal_status_get_beacon(status, 1, &mut b) },
+        INVALID
+    );
+    assert_eq!(reader_metrics(stuck, status).lag_records, 1000);
+
+    // Retention removes the segments both readers are in: their lag is unknown, never guessed.
+    let retention = tickertape_retention_new();
+    assert_eq!(
+        unsafe { tickertape_retention_set_max_segments(retention, 1) },
+        OK
+    );
+    assert_eq!(unsafe { tickertape_retention_set_delete(retention) }, OK);
+    assert_eq!(
+        unsafe { tickertape_retention_apply(j.c_dir.as_ptr(), retention, 0, null_mut()) },
+        OK,
+        "{}",
+        last_message()
+    );
+    unsafe { tickertape_retention_free(retention) };
+    let after = sample(&j);
+    assert!(report(after).first_seq > 0);
+    let gone = reader_metrics(stuck, after);
+    assert_eq!(gone.lag_unknown, L::TICKERTAPE_LAG_SEGMENT_GONE as i32);
+    assert_eq!(gone.lag_records, TICKERTAPE_UNKNOWN);
+    assert_eq!(
+        unsafe { tickertape_journal_status_get_beacon(after, 0, &mut b) },
+        OK
+    );
+    assert_eq!(b.lag_unknown, L::TICKERTAPE_LAG_SEGMENT_GONE as i32);
+    assert_eq!(
+        (b.lag_records, b.lag_bytes),
+        (TICKERTAPE_UNKNOWN, TICKERTAPE_UNKNOWN)
+    );
+
+    // A dropped beacon is gone from the next sample; a beacon directory given explicitly is used.
+    drop(beacon);
+    let mut other = null_mut();
+    let readers = cstr(&j.dir.join("readers"));
+    assert_eq!(
+        unsafe { tickertape_journal_status_sample(j.c_dir.as_ptr(), readers.as_ptr(), &mut other) },
+        OK
+    );
+    assert_eq!(report(other).beacon_count, 0);
+
+    // A struct from a newer header: the library fills its own part and says so.
+    #[repr(C)]
+    struct Newer {
+        v1: tickertape_journal_status_report,
+        added_later: u64,
+    }
+    let mut newer = Newer {
+        v1: tickertape_journal_status_report {
+            struct_size: std::mem::size_of::<Newer>() as u64,
+            ..Default::default()
+        },
+        added_later: 0xCDCD,
+    };
+    assert_eq!(
+        unsafe { tickertape_journal_status_get_report(other, &mut newer.v1) },
+        OK
+    );
+    assert_eq!(newer.v1.struct_size, 272);
+    assert_eq!(newer.added_later, 0xCDCD);
+
+    unsafe {
+        tickertape_journal_status_free(status);
+        tickertape_journal_status_free(after);
+        tickertape_journal_status_free(other);
+        tickertape_reader_close(stuck);
+        tickertape_writer_close(writer);
+    }
+}
+
+#[test]
+fn status_errors_and_a_journal_without_a_writer() {
+    let j = Journal::new();
+    let mut status = null_mut();
+    std::fs::create_dir_all(&j.dir).unwrap();
+    assert_eq!(
+        unsafe { tickertape_journal_status_sample(j.c_dir.as_ptr(), null(), &mut status) },
+        code(tickertape_status_code::TICKERTAPE_E_NOT_FOUND)
+    );
+    assert!(status.is_null());
+    let writer = j.writer(65_536);
+    for seq in 0..5 {
+        append(writer, seq);
+    }
+    unsafe { tickertape_writer_close(writer) };
+    // No writer is needed; without a checkpoint every record is exposed.
+    let status = sample(&j);
+    let r = report(status);
+    assert_eq!(r.head_next_seq, 5);
+    assert_eq!(r.has_checkpoint, 0);
+    assert_eq!(
+        (r.checkpoint_generation, r.checkpoint_estimated_age_ns),
+        (TICKERTAPE_UNKNOWN, TICKERTAPE_UNKNOWN)
+    );
+    assert_eq!((r.checkpoint_problem, r.checkpoint_age_unknown), (0, 0));
+    assert_eq!(r.exposure_records, 5);
+    assert_eq!(r.exposure_estimated_age_ns, TICKERTAPE_UNKNOWN);
+    assert_eq!(r.writer_pid, u64::from(std::process::id()));
+    unsafe { tickertape_journal_status_free(status) };
+}

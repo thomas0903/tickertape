@@ -204,6 +204,10 @@ class HeaderTest {
         assertEquals(32, Signatures.CHECKPOINT.byteSize());
         assertEquals(72, Signatures.VERIFY_REPORT.byteSize());
         assertEquals(32, Signatures.RETENTION_REPORT.byteSize());
+        assertEquals(272, Signatures.JOURNAL_STATUS_REPORT.byteSize());
+        assertEquals(120, Signatures.BEACON_STATUS.byteSize());
+        assertEquals(112, Signatures.WRITER_METRICS.byteSize());
+        assertEquals(72, Signatures.READER_METRICS.byteSize());
     }
 
     /** The enumerators of a C enum, by name. */
@@ -288,6 +292,41 @@ class HeaderTest {
         Map<String, Integer> timeouts = enumerators("tickertape_timeout");
         assertEquals(Map.of("TICKERTAPE_NO_WAIT", 0, "TICKERTAPE_WAIT_FOREVER", -1), timeouts,
                 "the binding passes 0 for no wait and only finite slices otherwise");
+    }
+
+    /** The metrics enumerations (ADR 0032): every C value has a Java value of the same name and code, and back. */
+    @Test
+    void everyMetricsEnumeratorIsMapped() {
+        record E(String cEnum, Class<? extends Enum<?>> java, java.util.function.IntFunction<Enum<?>> of,
+                java.util.function.Function<Enum<?>, String> cName, java.util.function.ToIntFunction<Enum<?>> code) {}
+        List<E> enums = List.of(
+                new E("tickertape_head_end", HeadEnd.class, HeadEnd::of, e -> ((HeadEnd) e).cName(), e -> ((HeadEnd) e).code()),
+                new E("tickertape_checkpoint_problem", CheckpointProblem.class, CheckpointProblem::of,
+                        e -> ((CheckpointProblem) e).cName(), e -> ((CheckpointProblem) e).code()),
+                new E("tickertape_age_unknown", AgeUnknown.class, AgeUnknown::of, e -> ((AgeUnknown) e).cName(),
+                        e -> ((AgeUnknown) e).code()),
+                new E("tickertape_lag_unknown", LagUnknown.class, LagUnknown::of, e -> ((LagUnknown) e).cName(),
+                        e -> ((LagUnknown) e).code()),
+                new E("tickertape_beacon_state", BeaconState.class, BeaconState::of, e -> ((BeaconState) e).cName(),
+                        e -> ((BeaconState) e).code()),
+                new E("tickertape_readers_dir_state", ReadersDirState.class, ReadersDirState::of,
+                        e -> ((ReadersDirState) e).cName(), e -> ((ReadersDirState) e).code()));
+        for (E e : enums) {
+            Map<String, Integer> c = enumerators(e.cEnum());
+            assertTrue(c.size() >= 3, e.cEnum() + ": " + c);
+            for (Map.Entry<String, Integer> v : c.entrySet()) {
+                Enum<?> j = e.of().apply(v.getValue());
+                assertEquals(v.getKey(), e.cName().apply(j), e.cEnum() + " " + v);
+                assertEquals((int) v.getValue(), e.code().applyAsInt(j));
+            }
+            for (Enum<?> j : e.java().getEnumConstants()) {
+                // UNKNOWN (-1) stands for a value of a newer library; it is the only Java value the header lacks.
+                assertTrue(c.containsKey(e.cName().apply(j)) || (j.name().equals("UNKNOWN") && e.code().applyAsInt(j) == -1),
+                        j + " is not in the header");
+            }
+        }
+        assertEquals(HeadEnd.UNKNOWN, HeadEnd.of(7));
+        assertEquals(LagUnknown.OTHER_REASON, LagUnknown.of(7));
     }
 
     private static int define(String name) {

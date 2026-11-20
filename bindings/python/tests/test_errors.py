@@ -61,6 +61,23 @@ def test_every_rust_enum_variant_of_the_reports_is_listed() -> None:
         assert f'``"{code}"``' in source, code
 
 
+def test_every_rust_status_enum_variant_is_listed() -> None:
+    """The same for the status enums (ADR 0032); the Rust unit tests in `src/status.rs` check every listed variant's
+    code, and every code is documented where the named tuple field is declared."""
+    source = (CORE_SRC / "status.rs").read_text()
+    listed = dict(_native.STATUS_ENUMS)
+    assert sorted(listed) == sorted(
+        ["HeadEnd", "CheckpointProblem", "AgeUnknown", "LagUnknown", "BeaconState", "BeaconDirState"]
+    )
+    documented = Path(tt._status.__file__).read_text()
+    for name, variants in listed.items():
+        found = enum_variants(source, name)
+        assert len(found) >= 3, f"the parser no longer understands status.rs ({name})"
+        assert sorted(found) == sorted(dict(variants)), f"update STATUS_ENUMS in src/status.rs for {name}"
+        for _, code in variants:
+            assert f'``"{code}"``' in documented, code
+
+
 def test_hierarchy_matches_builtins() -> None:
     assert issubclass(tt.JournalIOError, OSError)
     assert issubclass(tt.StorageFullError, tt.JournalIOError)

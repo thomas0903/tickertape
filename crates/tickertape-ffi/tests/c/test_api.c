@@ -53,6 +53,27 @@ STATIC_ASSERT(checkpoint_generation, offsetof(tickertape_checkpoint, generation)
 STATIC_ASSERT(checkpoint_next_seq, offsetof(tickertape_checkpoint, next_seq) == 8);
 STATIC_ASSERT(checkpoint_segment_base_seq, offsetof(tickertape_checkpoint, segment_base_seq) == 16);
 STATIC_ASSERT(checkpoint_offset, offsetof(tickertape_checkpoint, offset) == 24);
+/* The metrics structs (ADR 0032): their sizes when they were added, which only grow at the end. */
+STATIC_ASSERT(status_report_size, sizeof(tickertape_journal_status_report) == 272);
+STATIC_ASSERT(status_report_last_ts, offsetof(tickertape_journal_status_report, head_last_local_ts_ns) == 48);
+STATIC_ASSERT(status_report_head_end, offsetof(tickertape_journal_status_report, head_end) == 56);
+STATIC_ASSERT(status_report_verified, offsetof(tickertape_journal_status_report, head_verified) == 64);
+STATIC_ASSERT(status_report_has_checkpoint, offsetof(tickertape_journal_status_report, has_checkpoint) == 112);
+STATIC_ASSERT(status_report_age_unknown, offsetof(tickertape_journal_status_report, checkpoint_age_unknown) == 168);
+STATIC_ASSERT(status_report_spare, offsetof(tickertape_journal_status_report, storage_spare_segment) == 240);
+STATIC_ASSERT(status_report_beacons, offsetof(tickertape_journal_status_report, beacon_count) == 264);
+STATIC_ASSERT(beacon_status_size, sizeof(tickertape_beacon_status) == 120);
+STATIC_ASSERT(beacon_status_state, offsetof(tickertape_beacon_status, state) == 8);
+STATIC_ASSERT(beacon_status_lag_unknown, offsetof(tickertape_beacon_status, lag_unknown) == 24);
+STATIC_ASSERT(beacon_status_pid, offsetof(tickertape_beacon_status, report_pid) == 32);
+STATIC_ASSERT(beacon_status_unread_age, offsetof(tickertape_beacon_status, unread_age_ns) == 112);
+STATIC_ASSERT(writer_metrics_size, sizeof(tickertape_writer_metrics) == 112);
+STATIC_ASSERT(writer_metrics_has_checkpoint, offsetof(tickertape_writer_metrics, has_checkpoint) == 40);
+STATIC_ASSERT(writer_metrics_failures, offsetof(tickertape_writer_metrics, retention_failures) == 104);
+STATIC_ASSERT(reader_metrics_size, sizeof(tickertape_reader_metrics) == 72);
+STATIC_ASSERT(reader_metrics_seek_pending, offsetof(tickertape_reader_metrics, seek_pending) == 40);
+STATIC_ASSERT(reader_metrics_lag_unknown, offsetof(tickertape_reader_metrics, lag_unknown) == 52);
+STATIC_ASSERT(reader_metrics_lag_bytes, offsetof(tickertape_reader_metrics, lag_bytes) == 64);
 STATIC_ASSERT(verify_report_size, sizeof(tickertape_verify_report) == 72);
 STATIC_ASSERT(verify_report_struct_size, offsetof(tickertape_verify_report, struct_size) == 0);
 STATIC_ASSERT(verify_report_segments, offsetof(tickertape_verify_report, segments) == 8);
@@ -488,11 +509,80 @@ static void test_corruption_and_inspection(const char *scratch) {
     }
 }
 
+/* Operational metrics (ADR 0032): a status sample with a live writer and a lagging reader. */
+static void test_metrics(const char *scratch) {
+    char dir[4096];
+    tickertape_writer *writer;
+    tickertape_reader *reader;
+    tickertape_journal_status *status = NULL;
+    tickertape_journal_status_report report;
+    tickertape_writer_metrics wm;
+    tickertape_reader_metrics rm;
+    tickertape_record record;
+    uint64_t seq;
+    join(dir, sizeof dir, scratch, "metrics");
+
+    writer = open_writer(dir, FIXTURE_SEGMENT_SIZE);
+    for (seq = 0; seq < 400; seq++) append_pattern(writer, seq);
+    REQUIRE_OK(tickertape_writer_checkpoint(writer));
+    for (seq = 400; seq < 1000; seq++) append_pattern(writer, seq);
+    reader = open_reader(dir, 0, 0);
+    for (seq = 0; seq < 100; seq++) CHECK_STATUS(tickertape_reader_next(reader, 0, &record), TICKERTAPE_OK);
+
+    memset(&wm, 0, sizeof wm);
+    wm.struct_size = sizeof wm;
+    REQUIRE_OK(tickertape_writer_get_metrics(writer, &wm));
+    CHECK(wm.struct_size == sizeof wm);
+    CHECK(wm.head_next_seq == 1000 && wm.has_checkpoint == 1 && wm.checkpoint_next_seq == 400);
+    CHECK(wm.uncheckpointed_records == 600 && wm.poisoned == 0 && wm.since_checkpoint_ns != TICKERTAPE_UNKNOWN);
+
+    REQUIRE_OK(tickertape_journal_status_sample(dir, NULL, &status));
+    memset(&report, 0, sizeof report);
+    report.struct_size = sizeof report;
+    REQUIRE_OK(tickertape_journal_status_get_report(status, &report));
+    CHECK(report.head_next_seq == 1000 && report.head_end == TICKERTAPE_HEAD_OPEN);
+    CHECK(report.head_offset == wm.head_offset && report.head_segment_base_seq == wm.head_segment_base_seq);
+    CHECK(report.head_last_local_ts_ns == 2000000 + 3 * 999);
+    CHECK(report.has_checkpoint == 1 && report.checkpoint_problem == TICKERTAPE_CHECKPOINT_USABLE);
+    CHECK(report.checkpoint_next_seq == 400 && report.exposure_records == 600);
+    CHECK(report.exposure_bytes != TICKERTAPE_UNKNOWN && report.exposure_bytes > 0);
+    CHECK(report.writer_alive == 1 && report.writer_pid == (uint64_t)getpid());
+    CHECK(report.readers_dir_state == TICKERTAPE_READERS_DIR_MISSING && report.beacon_count == 0);
+    CHECK(tickertape_journal_status_beacon_name(status, 0) == NULL);
+
+    /* The lag does not invalidate the view returned just before. */
+    CHECK_STATUS(tickertape_reader_next(reader, 0, &record), TICKERTAPE_OK);
+    memset(&rm, 0, sizeof rm);
+    rm.struct_size = sizeof rm;
+    REQUIRE_OK(tickertape_reader_get_metrics(reader, status, &rm));
+    CHECK(pattern_matches(&record, 100));
+    CHECK(rm.next_seq == 101 && rm.slot_seq == 101 && rm.held_record == 0 && rm.durable_only == 0);
+    CHECK(rm.lag_unknown == TICKERTAPE_LAG_KNOWN && rm.lag_records == 899);
+    CHECK(rm.lag_bytes != TICKERTAPE_UNKNOWN && rm.lag_bytes > 0);
+
+    /* Misuse. */
+    rm.struct_size = 8;
+    CHECK_STATUS(tickertape_reader_get_metrics(reader, status, &rm), TICKERTAPE_E_INVALID_ARGUMENT);
+    rm.struct_size = sizeof rm;
+    CHECK_STATUS(tickertape_reader_get_metrics(reader, NULL, &rm), TICKERTAPE_E_INVALID_ARGUMENT);
+    {
+        tickertape_beacon_status beacon;
+        memset(&beacon, 0, sizeof beacon);
+        beacon.struct_size = sizeof beacon;
+        CHECK_STATUS(tickertape_journal_status_get_beacon(status, 0, &beacon), TICKERTAPE_E_INVALID_ARGUMENT);
+    }
+    tickertape_journal_status_free(status);
+    tickertape_journal_status_free(NULL);
+    REQUIRE_OK(tickertape_reader_close(reader));
+    REQUIRE_OK(tickertape_writer_close(writer));
+}
+
 static int run_basic(const char *scratch) {
     test_versions_and_names();
     test_misuse(scratch);
     test_roundtrip(scratch);
     test_corruption_and_inspection(scratch);
+    test_metrics(scratch);
     return failures;
 }
 

@@ -154,7 +154,7 @@ sources and Javadoc JARs that Maven Central requires. The Linux libraries are bu
   becomes unreachable without being closed is closed by a `Cleaner` eventually; that is a safety net, not a way to
   manage them (a forgotten writer keeps the journal locked until the garbage collector runs).
 - **A `RecordView` is borrowed.** The reader returns the same view object every time, so reading allocates nothing.
-  It is valid until the next call on that reader (any method except `position()` and `isClosed()`), or until the
+  It is valid until the next call on that reader (any method except `position()`, `metrics(JournalStatus)` and `isClosed()`), or until the
   reader is closed. Every accessor checks this and throws `IllegalStateException` on a view that is no longer valid.
   Copy what you need to keep: `copy()` (a `RecordCopy`), `payloadToArray()`, or `copyPayloadTo(byte[] | ByteBuffer |
   MemorySegment)`.
@@ -453,6 +453,36 @@ What it cannot detect, and is undefined:
   `Retention.moveTo(dir)` with limits (`maxSegments`, `maxBytes`, `maxAge`); there is no default that deletes. Pass it
   to `WriterOptions.retention` to run after every checkpoint, or to `Journal.applyRetention(dir, retention, dryRun)`
   to run once.
+
+## Operational metrics
+
+The values `tickertape status` prints (ADR [0032](decisions/0032-operational-metrics.md); their meaning and accuracy:
+[`operations.md`](operations.md#monitoring)), over the C calls in [`c-api.md` → Operational
+metrics](c-api.md#operational-metrics), which also lists what each costs:
+
+```java
+try (JournalStatus status = JournalStatus.sample(dir)) {   // no writer needed
+    status.exposureRecords().ifPresent(n -> System.out.println("not durable yet: " + n));
+    reader.metrics(status).lag().ifPresent(lag -> System.out.println("behind: " + lag.records()));
+}
+WriterMetrics w = writer.metrics();                       // in the writer's process: no system calls
+```
+
+- `JournalStatus.sample(dir)` (or `sample(dir, readersDir)`) reads every value once; they never change and stay
+  readable after `close()`, which frees the library's copy that `Reader.metrics(JournalStatus)` measures against (a
+  `Cleaner` frees an unreachable sample too). Every method may be called from any thread, concurrently; `close()`
+  waits for `Reader.metrics` calls that use the sample.
+- Unknown values are empty (`OptionalLong`, `Optional<Duration>`), never guesses. The enums (`HeadEnd`,
+  `CheckpointProblem`, `AgeUnknown`, `LagUnknown`, `BeaconState`, `ReadersDirState`) name every C value; `UNKNOWN`
+  (or the `OTHER_*` value) stands for one from a newer library.
+- Corruption is `headEnd() == HeadEnd.INVALID`, a `checkpointProblem()` other than `USABLE`, or
+  `isHeadChainBroken()`. `isHeadVerified()` false means the segments between the checkpoint and the newest were not
+  read: no corruption reported then does not mean that a writer would open the journal.
+- `Reader.metrics(status)` measures against the sample: take it after the reads you want counted. Its `lag()` is
+  empty, with the reason in `lagUnknown()`, when the reader's segment is not the one the sample listed. It does not
+  invalidate the current view.
+- `JournalStatus`, `WriterMetrics`, `ReaderMetrics` and `BeaconStatus` are final classes, because their C structs can
+  grow; `Position` and `Lag` are records.
 
 ## Versioning
 

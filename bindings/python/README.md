@@ -184,7 +184,9 @@ example from a `multiprocessing` worker); `JournalIOError.strerror` is the OS me
 ## Inspection
 
 `tt.verify(path)`, `tt.list_segments(path)` and `tt.read_checkpoint(path)` never take the writer lock and are safe
-while a writer runs.
+while a writer runs. So is `tt.status(path)`, the sample that `tickertape status` prints (head, checkpoint age,
+exposure, storage headroom, reader beacons); `Writer.metrics()` and `Reader.metrics(status)` add what only the writer
+knows and a reader's lag. Unknown values are `None`, never guesses.
 
 ## More
 
