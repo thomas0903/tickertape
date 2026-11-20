@@ -1082,6 +1082,66 @@ static int stale_view(const std::string &dir) {
     return 0;
 }
 
+// Operational metrics (ADR 0032): a status sample, the writer's metrics and a lagging reader's.
+static void metrics(const std::string &root) {
+    const std::string dir = root + "/metrics";
+    tt::Writer writer = MUST(tt::Writer::open(dir, small_segments()));
+    const tt::WriterMetrics fresh = MUST(writer.metrics());
+    CHECK(fresh.head.next_seq == 0 && !fresh.checkpoint && !fresh.since_checkpoint);
+    const std::string payload(200, 'x');
+    for (std::uint64_t seq = 0; seq < 400; seq++) MUST(writer.append(1, 0, 2000000 + seq, payload));
+    MUST(writer.checkpoint());
+    for (std::uint64_t seq = 400; seq < 1000; seq++) MUST(writer.append(1, 0, 2000000 + seq, payload));
+    tt::Reader lagging = MUST(tt::Reader::open(dir));
+    for (int i = 0; i < 100; i++) CHECK(MUST(lagging.next()).has_value());
+
+    const tt::WriterMetrics w = MUST(writer.metrics());
+    CHECK(w.head.next_seq == 1000 && w.head.segment_base_seq > 0);
+    CHECK(w.checkpoint && w.checkpoint->next_seq == 400);
+    CHECK(w.since_checkpoint && w.since_checkpoint->count() >= 0);
+    CHECK(w.uncheckpointed_records == 600 && w.uncheckpointed_bytes > 0);
+    CHECK(!w.poisoned && w.retention_failures == 0 && w.segment_size == 65536);
+
+    tt::JournalStatus status = MUST(tt::JournalStatus::sample(dir));
+    const tt::StatusReport &r = status.report();
+    CHECK(r.head.position.next_seq == 1000 && r.head.position.offset == w.head.offset);
+    CHECK(r.head.end == tt::HeadEnd::open && r.head.corrupt_reason == tt::CorruptReason::none);
+    CHECK(r.head.last_local_ts_ns == std::optional<std::uint64_t>(2000999));
+    CHECK(!r.head.chain_broken && r.segments.count > 2 && r.segments.first_seq == 0);
+    CHECK(r.checkpoint && r.checkpoint->marker.next_seq == 400 && r.checkpoint->problem == tt::CheckpointProblem::usable);
+    CHECK(r.exposure.records == std::optional<std::uint64_t>(600) && r.exposure.bytes.value_or(0) > 0);
+    CHECK(r.exposure.oldest_local_ts_ns == std::optional<std::uint64_t>(2000400));
+    CHECK(r.storage.available_bytes > 0 && r.storage.next_segment_size == 65536);
+    CHECK(r.writer_alive == std::optional<bool>(true) && r.writer_pid.has_value());
+    CHECK(r.readers_dir_state == tt::ReadersDirState::missing && status.beacons().empty());
+
+    // The reader's lag; the metrics call does not invalidate a view.
+    const std::optional<tt::RecordView> view = MUST(lagging.next());
+    const tt::ReaderMetrics m = MUST(lagging.metrics(status));
+    CHECK(view && view->seq() == 100 && view->size() == 200 && view->data()[0] == 'x');
+    CHECK(m.next_seq == 101 && m.slot.next_seq == 101 && !m.seek_pending && !m.durable_only && !m.held_record);
+    CHECK(m.lag && m.lag->records == 899 && m.lag->bytes.value_or(0) > 0 && m.lag_unknown == tt::LagUnknown::known);
+
+    // Past the sample: unknown until a new sample.
+    for (std::uint64_t seq = 1000; seq < 1400; seq++) MUST(writer.append(1, 0, 0, payload));
+    while (MUST(lagging.next()).has_value()) {
+    }
+    const tt::ReaderMetrics ahead = MUST(lagging.metrics(status));
+    CHECK(!ahead.lag && ahead.lag_unknown == tt::LagUnknown::ahead_of_sample);
+    status = MUST(tt::JournalStatus::sample(dir, fs::path(dir) / "readers"));
+    const tt::ReaderMetrics caught_up = MUST(lagging.metrics(status));
+    CHECK(caught_up.lag && caught_up.lag->records == 0 && caught_up.lag->bytes == std::optional<std::uint64_t>(0));
+
+    // Empty objects and errors.
+    tt::JournalStatus moved = std::move(status);
+    CHECK(moved && !status.is_open());
+    CHECK_FAILS(lagging.metrics(status), tt::Status::invalid_argument);
+    CHECK_FAILS(tt::Reader().metrics(moved), tt::Status::invalid_argument);
+    CHECK_FAILS(tt::Writer().metrics(), tt::Status::invalid_argument);
+    fs::create_directories(root + "/metrics-empty");
+    CHECK_FAILS(tt::JournalStatus::sample(root + "/metrics-empty"), tt::Status::not_found);
+}
+
 int main(int argc, char **argv) {
     if (argc == 3 && std::string(argv[1]) == "write-fixture") return write_fixture(argv[2]) ? 1 : 0;
     if (argc == 5 && std::string(argv[1]) == "read-fixture") {
@@ -1111,6 +1171,7 @@ int main(int argc, char **argv) {
     errors(root);
     fill_callbacks(root);
     move_semantics(root);
+    metrics(root);
 #if defined(__cpp_exceptions)
     exceptions(root);
 #endif

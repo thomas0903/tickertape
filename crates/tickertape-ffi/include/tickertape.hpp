@@ -16,7 +16,8 @@
 // - Every translation unit of a program that includes this header must use the same release of it (ADR 0036 ->
 //   Versioning).
 // - `Reader::next` returns a `RecordView` that borrows the reader's memory: its payload is valid until the next call
-//   on the same reader (other than `position`), or until the reader is moved or destroyed. Debug builds check this.
+//   on the same reader (other than `position` and `metrics`), or until the reader is moved or destroyed. Debug
+//   builds check this.
 // - Visible is not durable: a record is visible to readers when an append returns, and durable only after a later
 //   successful `Writer::checkpoint()` (docs/crash-contract.md).
 // - A writer or reader may move between threads, but must not be used by two threads at once, including through
@@ -1050,12 +1051,321 @@ template <class Bytes, std::enable_if_t<detail::is_byte_range_v<Bytes> && !std::
 NewRecord new_record(std::uint32_t schema_id, std::uint64_t venue_ts_ns, std::uint64_t local_ts_ns,
                      Bytes &&payload) = delete;
 
+// The checkpoint marker (docs/format.md -> Checkpoint marker).
+struct Checkpoint {
+    std::uint64_t generation = 0;
+    std::uint64_t next_seq = 0;  // every record below this was durable when the marker was written
+    std::uint64_t segment_base_seq = 0;
+    std::uint64_t offset = 0;
+};
+
+// ---- Operational metrics (ADR 0032) ----
+
+// How the newest segment ends, as a status sample saw it.
+enum class HeadEnd : std::int32_t {
+    open = TICKERTAPE_HEAD_OPEN,        // at a slot with no record yet: the normal state
+    sealed = TICKERTAPE_HEAD_SEALED,    // at a seal without a successor: a writer died during a roll
+    invalid = TICKERTAPE_HEAD_INVALID,  // at invalid bytes (StatusReport::Head::corrupt_reason): corruption
+};
+
+// Why the checkpoint marker cannot be used; anything but `usable` means a writer refuses the journal (corruption).
+enum class CheckpointProblem : std::int32_t {
+    usable = TICKERTAPE_CHECKPOINT_USABLE,
+    missing_segment = TICKERTAPE_CHECKPOINT_MISSING_SEGMENT,
+    invalid_segment_header = TICKERTAPE_CHECKPOINT_INVALID_SEGMENT_HEADER,
+    invalid_offset = TICKERTAPE_CHECKPOINT_INVALID_OFFSET,
+    other = TICKERTAPE_CHECKPOINT_OTHER_PROBLEM,
+};
+
+// Why the checkpoint's age could not be estimated from the marker's modification time.
+enum class AgeUnknown : std::int32_t {
+    known = TICKERTAPE_AGE_KNOWN,
+    no_modification_time = TICKERTAPE_AGE_NO_MODIFICATION_TIME,
+    in_future = TICKERTAPE_AGE_IN_FUTURE,
+    before_segment = TICKERTAPE_AGE_BEFORE_SEGMENT,
+    marker_resized = TICKERTAPE_AGE_MARKER_RESIZED,
+    changing = TICKERTAPE_AGE_CHANGING,  // a writer checkpointing very often: not a stale checkpoint
+    older_slot_lost = TICKERTAPE_AGE_OLDER_SLOT_LOST,
+    other = TICKERTAPE_AGE_OTHER_REASON,
+};
+
+// Why a reader's lag is unknown.
+enum class LagUnknown : std::int32_t {
+    known = TICKERTAPE_LAG_KNOWN,
+    segment_gone = TICKERTAPE_LAG_SEGMENT_GONE,              // retention or recovery removed the reader's segment
+    other_history = TICKERTAPE_LAG_OTHER_HISTORY,            // the segment is another file of that name
+    segment_unreadable = TICKERTAPE_LAG_SEGMENT_UNREADABLE,  // its header could not be read
+    checkpoint_unusable = TICKERTAPE_LAG_CHECKPOINT_UNUSABLE,  // durable-only reader, unusable marker
+    ahead_of_sample = TICKERTAPE_LAG_AHEAD_OF_SAMPLE,        // the reader is past the sample: take a new one
+    other = TICKERTAPE_LAG_OTHER_REASON,
+};
+
+// Whether a reader beacon's owner is running, and whether the beacon could be read.
+enum class BeaconState : std::int32_t {
+    live = TICKERTAPE_BEACON_LIVE,
+    stale = TICKERTAPE_BEACON_STALE,  // the owner died: its position is history, not lag
+    uncertain = TICKERTAPE_BEACON_UNCERTAIN,
+    invalid = TICKERTAPE_BEACON_INVALID,
+    unreadable = TICKERTAPE_BEACON_UNREADABLE,
+    changing = TICKERTAPE_BEACON_CHANGING,
+};
+
+// Whether the beacon directory could be listed.
+enum class ReadersDirState : std::int32_t {
+    listed = TICKERTAPE_READERS_DIR_LISTED,
+    missing = TICKERTAPE_READERS_DIR_MISSING,
+    unusable = TICKERTAPE_READERS_DIR_UNUSABLE,
+};
+
+// A position in the journal: the sequence number expected there, and where that is.
+struct Position {
+    std::uint64_t next_seq = 0;
+    std::uint64_t segment_base_seq = 0;
+    std::uint64_t offset = 0;
+};
+
+// How far a reader is behind what it could read now.
+struct Lag {
+    std::uint64_t records = 0;           // records it could return now but has not
+    std::optional<std::uint64_t> bytes;  // segment-file footprint up to the target, if known
+};
+
+namespace detail {
+inline std::optional<std::uint64_t> known(std::uint64_t value) noexcept {
+    if (value == TICKERTAPE_UNKNOWN) return std::nullopt;
+    return value;
+}
+inline std::optional<std::chrono::nanoseconds> known_ns(std::uint64_t value) noexcept {
+    if (value == TICKERTAPE_UNKNOWN) return std::nullopt;
+    constexpr std::uint64_t max = static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max());
+    return std::chrono::nanoseconds(static_cast<std::int64_t>(value < max ? value : max));
+}
+}  // namespace detail
+
+// The values of one status sample (docs/operations.md; ADR 0032). Unknown values are empty optionals, never guesses.
+struct StatusReport {
+    struct Head {
+        Position position;  // where the next record goes, as far as the newest segment shows
+        std::uint64_t segment_size = 0;
+        HeadEnd end = HeadEnd::open;
+        CorruptReason corrupt_reason = CorruptReason::none;  // for HeadEnd::invalid
+        std::optional<std::uint64_t> last_local_ts_ns;      // of the last record the scan passed
+        bool verified = false;      // every record from the checkpoint to the head was validated
+        bool chain_broken = false;  // the listing proves a segment missing: corruption
+    };
+    struct Segments {
+        std::uint64_t count = 0;
+        std::uint64_t first_seq = 0;
+        std::uint64_t total_bytes = 0;
+        std::optional<std::uint64_t> oldest_created_unix_ns;
+        std::uint64_t before_checkpoint = 0;
+    };
+    struct CheckpointState {
+        Checkpoint marker;
+        CheckpointProblem problem = CheckpointProblem::usable;
+        std::optional<std::uint64_t> modified_unix_ns;
+        std::optional<std::chrono::nanoseconds> estimated_age;
+        AgeUnknown age_unknown = AgeUnknown::known;
+    };
+    struct Exposure {
+        std::optional<std::uint64_t> records;  // what a power loss now could remove
+        std::optional<std::uint64_t> bytes;
+        std::optional<std::chrono::nanoseconds> estimated_age;  // an upper bound
+        std::optional<std::uint64_t> oldest_local_ts_ns;
+        bool verified = false;
+    };
+    struct Storage {
+        std::uint64_t available_bytes = 0;
+        std::uint64_t total_bytes = 0;
+        std::uint64_t next_segment_size = 0;
+        std::uint64_t estimated_rolls_left = 0;  // optimistic on btrfs
+        bool spare_segment = false;
+    };
+    std::uint64_t sampled_unix_ns = 0;
+    Head head;
+    Segments segments;
+    std::optional<CheckpointState> checkpoint;  // none if there is no valid marker
+    Exposure exposure;
+    Storage storage;
+    std::optional<std::uint64_t> writer_pid;  // the last writer's PID from writer.lock (informational)
+    std::optional<bool> writer_alive;
+    ReadersDirState readers_dir_state = ReadersDirState::missing;
+};
+
+// A reader in another process, from its beacon.
+struct BeaconStatus {
+    struct Report {
+        std::uint64_t pid = 0;
+        std::uint64_t next_seq = 0;  // the next record it returns
+        Position slot;               // the slot it reads next
+        bool seek_pending = false;
+        bool durable_only = false;
+        std::uint64_t updated_unix_ns = 0;
+    };
+    std::string name;
+    BeaconState state = BeaconState::invalid;
+    std::optional<Report> report;  // none for invalid, unreadable or changing beacons
+    std::optional<std::chrono::nanoseconds> update_age;
+    std::optional<Lag> lag;  // as of the beacon's last write
+    LagUnknown lag_unknown = LagUnknown::known;
+    std::optional<std::uint64_t> oldest_unread_local_ts_ns;
+    std::optional<std::chrono::nanoseconds> unread_age;
+};
+
+// What only the writer knows (Writer::metrics).
+struct WriterMetrics {
+    Position head;
+    std::uint64_t segment_size = 0;
+    std::optional<Checkpoint> checkpoint;  // as this writer last wrote or read it
+    std::optional<std::chrono::nanoseconds> since_checkpoint;  // monotonic; none before this writer's first
+    std::uint64_t uncheckpointed_records = 0;
+    std::uint64_t uncheckpointed_bytes = 0;
+    bool poisoned = false;  // a checkpoint failed: later ones fail with Status::durability_lost
+    std::uint64_t retention_failures = 0;
+};
+
+// A reader's cursor and its lag behind a status sample (Reader::metrics).
+struct ReaderMetrics {
+    std::uint64_t next_seq = 0;  // as Reader::position()
+    Position slot;               // the slot it reads next
+    bool seek_pending = false;
+    bool durable_only = false;  // lag is measured against the checkpoint
+    bool held_record = false;   // a record that did not fit a buffer is held for the next read
+    std::optional<Lag> lag;
+    LagUnknown lag_unknown = LagUnknown::known;
+};
+
+// One read-only sample of a journal's operational state: what `tickertape status` prints. Taking it needs no writer
+// and disturbs none; its cost grows with what was appended since the last checkpoint (docs/c-api.md lists the files
+// it reads). The values are read once, at sample(); the sample keeps no file open. Move-only; a moved-from sample is
+// empty (Reader::metrics on it fails with Status::invalid_argument).
+class JournalStatus {
+public:
+    JournalStatus() noexcept = default;
+    JournalStatus(JournalStatus &&other) noexcept
+        : h_(detail::take_handle(other.h_)), report_(std::move(other.report_)), beacons_(std::move(other.beacons_)) {}
+    JournalStatus &operator=(JournalStatus &&other) noexcept {
+        if (this != &other) {
+            tickertape_journal_status_free(h_);
+            h_ = detail::take_handle(other.h_);
+            report_ = std::move(other.report_);
+            beacons_ = std::move(other.beacons_);
+        }
+        return *this;
+    }
+    JournalStatus(const JournalStatus &) = delete;
+    JournalStatus &operator=(const JournalStatus &) = delete;
+    ~JournalStatus() { tickertape_journal_status_free(h_); }
+
+    // Samples the journal in `dir`, reading reader beacons from `<dir>/readers` (or from `readers_dir`). Errors:
+    // Status::not_found if it has no segments, corrupt, unsupported_version, io.
+    static result<JournalStatus> sample(const detail::PathArg &dir) { return sample_impl(dir, nullptr); }
+    static result<JournalStatus> sample(const detail::PathArg &dir, const detail::PathArg &readers_dir) {
+        if (auto checked = readers_dir.check(); !checked) return detail::take_error(std::move(checked));
+        return sample_impl(dir, &readers_dir);
+    }
+
+    bool is_open() const noexcept { return h_ != nullptr; }
+    explicit operator bool() const noexcept { return is_open(); }
+
+    const StatusReport &report() const noexcept { return report_; }
+    // Reader beacons, sorted by name.
+    const std::vector<BeaconStatus> &beacons() const noexcept { return beacons_; }
+
+    // The C handle, for calling C functions the binding does not cover. Do not free it.
+    const tickertape_journal_status *native_handle() const noexcept { return h_; }
+
+private:
+    static result<JournalStatus> sample_impl(const detail::PathArg &dir, const detail::PathArg *readers_dir) {
+        if (auto compatible = check_library(); !compatible) return detail::take_error(std::move(compatible));
+        if (auto checked = dir.check(); !checked) return detail::take_error(std::move(checked));
+        JournalStatus out;
+        const tickertape_status status = tickertape_journal_status_sample(
+            dir.c_str(), readers_dir != nullptr ? readers_dir->c_str() : nullptr, &out.h_);
+        if (status < 0) return Error::from_last_call(status);
+        tickertape_journal_status_report raw{};
+        raw.struct_size = sizeof raw;
+        if (const tickertape_status s = tickertape_journal_status_get_report(out.h_, &raw); s < 0) {
+            return Error::from_last_call(s);
+        }
+        StatusReport &r = out.report_;
+        r.sampled_unix_ns = raw.sampled_unix_ns;
+        r.head.position = Position{raw.head_next_seq, raw.head_segment_base_seq, raw.head_offset};
+        r.head.segment_size = raw.head_segment_size;
+        r.head.end = static_cast<HeadEnd>(raw.head_end);
+        r.head.corrupt_reason = static_cast<CorruptReason>(raw.head_corrupt_reason);
+        r.head.last_local_ts_ns = detail::known(raw.head_last_local_ts_ns);
+        r.head.verified = raw.head_verified != 0;
+        r.head.chain_broken = raw.head_chain_broken != 0;
+        r.segments.count = raw.segment_count;
+        r.segments.first_seq = raw.first_seq;
+        r.segments.total_bytes = raw.segments_total_bytes;
+        r.segments.oldest_created_unix_ns = detail::known(raw.oldest_segment_created_unix_ns);
+        r.segments.before_checkpoint = raw.segments_before_checkpoint;
+        if (raw.has_checkpoint != 0) {
+            StatusReport::CheckpointState c;
+            c.marker = Checkpoint{raw.checkpoint_generation, raw.checkpoint_next_seq, raw.checkpoint_segment_base_seq,
+                                  raw.checkpoint_offset};
+            c.problem = static_cast<CheckpointProblem>(raw.checkpoint_problem);
+            c.modified_unix_ns = detail::known(raw.checkpoint_modified_unix_ns);
+            c.estimated_age = detail::known_ns(raw.checkpoint_estimated_age_ns);
+            c.age_unknown = static_cast<AgeUnknown>(raw.checkpoint_age_unknown);
+            r.checkpoint = c;
+        }
+        r.exposure.records = detail::known(raw.exposure_records);
+        r.exposure.bytes = detail::known(raw.exposure_bytes);
+        r.exposure.estimated_age = detail::known_ns(raw.exposure_estimated_age_ns);
+        r.exposure.oldest_local_ts_ns = detail::known(raw.exposure_oldest_local_ts_ns);
+        r.exposure.verified = raw.exposure_verified != 0;
+        r.storage.available_bytes = raw.storage_available_bytes;
+        r.storage.total_bytes = raw.storage_total_bytes;
+        r.storage.next_segment_size = raw.storage_next_segment_size;
+        r.storage.estimated_rolls_left = raw.storage_estimated_rolls_left;
+        r.storage.spare_segment = raw.storage_spare_segment != 0;
+        r.writer_pid = detail::known(raw.writer_pid);
+        if (raw.writer_alive != TICKERTAPE_UNKNOWN) r.writer_alive = raw.writer_alive != 0;
+        r.readers_dir_state = static_cast<ReadersDirState>(raw.readers_dir_state);
+        out.beacons_.reserve(static_cast<std::size_t>(raw.beacon_count));
+        for (std::size_t i = 0; i < raw.beacon_count; i++) {
+            tickertape_beacon_status b{};
+            b.struct_size = sizeof b;
+            if (const tickertape_status s = tickertape_journal_status_get_beacon(out.h_, i, &b); s < 0) {
+                return Error::from_last_call(s);
+            }
+            BeaconStatus beacon;
+            beacon.name = tickertape_journal_status_beacon_name(out.h_, i);
+            beacon.state = static_cast<BeaconState>(b.state);
+            if (b.has_report != 0) {
+                beacon.report = BeaconStatus::Report{
+                    b.report_pid,
+                    b.report_next_seq,
+                    Position{b.report_slot_seq, b.report_segment_base_seq, b.report_offset},
+                    b.report_seek_pending != 0,
+                    b.report_durable_only != 0,
+                    b.report_updated_unix_ns};
+            }
+            beacon.update_age = detail::known_ns(b.update_age_ns);
+            if (b.lag_records != TICKERTAPE_UNKNOWN) beacon.lag = Lag{b.lag_records, detail::known(b.lag_bytes)};
+            beacon.lag_unknown = static_cast<LagUnknown>(b.lag_unknown);
+            beacon.oldest_unread_local_ts_ns = detail::known(b.oldest_unread_local_ts_ns);
+            beacon.unread_age = detail::known_ns(b.unread_age_ns);
+            out.beacons_.push_back(std::move(beacon));
+        }
+        return out;
+    }
+
+    tickertape_journal_status *h_ = nullptr;
+    StatusReport report_;
+    std::vector<BeaconStatus> beacons_;
+};
+
 class Reader;
 class RecordBatch;
 
 // A validated record. Its payload is **borrowed**:
 // - from Reader::next: it points into the reader's buffer (or, for a mapped reader, into the mapped segment) and
-//   is valid until the next call on that reader other than position(), or until the reader is moved or destroyed;
+//   is valid until the next call on that reader other than position() and metrics(), or until the reader is moved
+//   or destroyed;
 // - from a RecordBatch: it points into the batch's buffer and is valid until the next read into that batch, or
 //   until the batch is moved or destroyed;
 // - from Reader::next_copy: it points into your buffer and is valid as long as that is.
@@ -1349,6 +1659,28 @@ public:
         return seq;
     }
 
+    // What only the writer knows: its head, the last checkpoint by the monotonic clock, uncheckpointed records and
+    // bytes, whether it is poisoned, failed retention runs. No system calls.
+    result<WriterMetrics> metrics() const {
+        tickertape_writer_metrics raw{};
+        raw.struct_size = sizeof raw;
+        const tickertape_status status = tickertape_writer_get_metrics(h_, &raw);
+        if (status < 0) return Error::from_last_call(status);
+        WriterMetrics m;
+        m.head = Position{raw.head_next_seq, raw.head_segment_base_seq, raw.head_offset};
+        m.segment_size = raw.segment_size;
+        if (raw.has_checkpoint != 0) {
+            m.checkpoint = Checkpoint{raw.checkpoint_generation, raw.checkpoint_next_seq,
+                                      raw.checkpoint_segment_base_seq, raw.checkpoint_offset};
+        }
+        m.since_checkpoint = detail::known_ns(raw.since_checkpoint_ns);
+        m.uncheckpointed_records = raw.uncheckpointed_records;
+        m.uncheckpointed_bytes = raw.uncheckpointed_bytes;
+        m.poisoned = raw.poisoned != 0;
+        m.retention_failures = raw.retention_failures;
+        return m;
+    }
+
     // The most recent retention error since the writer was opened, if any (retention never fails the writer).
     std::optional<Error> last_retention_error() const {
         const tickertape_status status = tickertape_writer_last_retention_error(h_);
@@ -1591,6 +1923,25 @@ public:
         return seq;
     }
 
+    // This reader's cursor and its lag behind `status` (behind the head, or the checkpoint for a durable-only
+    // reader), as of that sample: take the sample after the reads you want counted. No system calls; does not
+    // invalidate a view. Errors: Status::invalid_argument for an empty reader or sample.
+    result<ReaderMetrics> metrics(const JournalStatus &status) const {
+        tickertape_reader_metrics raw{};
+        raw.struct_size = sizeof raw;
+        const tickertape_status code = tickertape_reader_get_metrics(h_, status.native_handle(), &raw);
+        if (code < 0) return Error::from_last_call(code);
+        ReaderMetrics m;
+        m.next_seq = raw.next_seq;
+        m.slot = Position{raw.slot_seq, raw.segment_base_seq, raw.offset};
+        m.seek_pending = raw.seek_pending != 0;
+        m.durable_only = raw.durable_only != 0;
+        m.held_record = raw.held_record != 0;
+        if (raw.lag_records != TICKERTAPE_UNKNOWN) m.lag = Lag{raw.lag_records, detail::known(raw.lag_bytes)};
+        m.lag_unknown = static_cast<LagUnknown>(raw.lag_unknown);
+        return m;
+    }
+
     // Closes the reader now and reports the close's status; the reader is empty afterwards.
     result<void> close() {
         generation_++;
@@ -1641,14 +1992,6 @@ struct SegmentInfo {
     std::uint64_t segment_size = 0;
     std::uint64_t created_unix_ns = 0;  // from the segment header, by the writer's wall clock
     std::uint32_t format_version = 0;
-};
-
-// The checkpoint marker (docs/format.md -> Checkpoint marker).
-struct Checkpoint {
-    std::uint64_t generation = 0;
-    std::uint64_t next_seq = 0;  // every record below this was durable when the marker was written
-    std::uint64_t segment_base_seq = 0;
-    std::uint64_t offset = 0;
 };
 
 // What apply_retention() removed, or plan_retention() would remove.

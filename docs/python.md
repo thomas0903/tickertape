@@ -57,6 +57,32 @@ The design decisions are in [ADR 0029](decisions/0029-python-bindings.md). In br
   descriptors stay open until the child exits or calls `exec`). Open handles after forking, or use the `spawn` start
   method of `multiprocessing`.
 
+### Operational metrics
+
+`tickertape.status(path)` takes the read-only sample that `tickertape status` prints (ADR
+[0032](decisions/0032-operational-metrics.md); meaning and accuracy of each value:
+[`operations.md`](operations.md#monitoring)). It needs no writer and releases the GIL. `Writer.metrics()` returns what
+only the writer knows, and `Reader.metrics(status)` a reader's cursor and lag behind a sample:
+
+```python
+s = tickertape.status("/data/journal")
+print(s.exposure.records, s.checkpoint and s.checkpoint.estimated_age_ns, s.storage.estimated_rolls_left)
+lag = reader.metrics(s).lag          # None, with reader.metrics(s).lag_unknown, if it can't be established
+w = writer.metrics()                 # in the writer's process: no system calls
+```
+
+- Results are named tuples (`JournalStatus` is a frozen dataclass); unknown values are `None`, never guesses, often
+  with a reason code (`age_unknown`, `lag_unknown`: the codes of the CLI's JSON). Durations are integer nanoseconds.
+- Corruption is `s.head.end == "invalid"`, a `s.checkpoint.problem`, or `s.head.chain_broken`. `s.head.verified` false
+  means the segments between the checkpoint and the newest were not read: no corruption reported then does not mean
+  that a writer would open the journal.
+- `Reader.metrics` measures against the sample, so take it after the reads you want counted. Records the reader has
+  read from the journal but not returned yet (`buffered`) count in the lag.
+- Cost: `status()` lists the directory, reads the checkpoint marker, scans the newest segment from the checkpoint (so
+  it grows with what was appended since the last checkpoint), reads two segment headers, `writer.lock` and the
+  beacons, and calls `statvfs`; the metrics calls make no system calls. The Python bindings call the core crate
+  directly (ADR 0029), not the C ABI.
+
 ### End-to-end example
 
 [`bindings/python/examples/end_to_end.py`](../bindings/python/examples/end_to_end.py) writes market-style events in

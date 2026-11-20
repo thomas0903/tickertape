@@ -392,6 +392,27 @@ public final class Reader implements AutoCloseable {
         }
     }
 
+    /**
+     * This reader's cursor and its lag behind {@code status} (behind the head, or behind the checkpoint marker for a
+     * durable-only reader), as of that sample (ADR 0032): take the sample after the reads you want counted. If the
+     * reader's segment is not the file the sample listed under that name, the lag is empty with the reason. Makes no
+     * system call, allocates the result, and does not invalidate the current view.
+     *
+     * @throws IllegalStateException if {@code status} is closed, or as for every call on a closed or busy reader
+     */
+    public ReaderMetrics metrics(JournalStatus status) {
+        Objects.requireNonNull(status, "status");
+        handle.enter();
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment out = MetricsValues.sized(arena, Signatures.READER_METRICS);
+            Errors.check(status.withHandle(s -> Native.readerGetMetrics(handle.ptr, s, out)));
+            return new ReaderMetrics(new MetricsValues.Struct(out, Signatures.READER_METRICS));
+        } finally {
+            handle.exit();
+            Reference.reachabilityFence(this);
+        }
+    }
+
     void enterForView() {
         handle.enter();
     }

@@ -213,6 +213,50 @@ std::uint64_t use_everything(const std::filesystem::path &dir) {
     for (auto it = records_in.begin(); it != records_in.end(); it++) sum += (*it).size();
     if (!records_in.empty()) sum += records_in[0].seq();
     sum += reader.position().value() + (reader.native_handle() != nullptr ? 1u : 0u);
+    {
+        tt::JournalStatus status = tt::JournalStatus::sample(dir).value();
+        tt::JournalStatus moved(std::move(status));
+        status = tt::JournalStatus::sample(dir, std::filesystem::path(dir) / "readers").value();
+        sum += (status.is_open() && moved && moved.native_handle() != nullptr) ? 1u : 0u;
+        const tt::StatusReport &r = moved.report();
+        sum += r.sampled_unix_ns + r.head.position.next_seq + r.head.position.segment_base_seq;
+        sum += r.head.position.offset + r.head.segment_size + r.head.last_local_ts_ns.value_or(0);
+        sum += static_cast<std::uint64_t>(r.head.end) + static_cast<std::uint64_t>(r.head.corrupt_reason);
+        sum += (r.head.verified ? 1u : 0u) + (r.head.chain_broken ? 1u : 0u);
+        sum += r.segments.count + r.segments.first_seq + r.segments.total_bytes + r.segments.before_checkpoint;
+        sum += r.segments.oldest_created_unix_ns.value_or(0);
+        if (r.checkpoint) {
+            sum += r.checkpoint->marker.next_seq + static_cast<std::uint64_t>(r.checkpoint->problem);
+            sum += r.checkpoint->modified_unix_ns.value_or(0) + static_cast<std::uint64_t>(r.checkpoint->age_unknown);
+            sum += static_cast<std::uint64_t>(r.checkpoint->estimated_age.value_or(1ns).count());
+        }
+        sum += r.exposure.records.value_or(0) + r.exposure.bytes.value_or(0) + r.exposure.oldest_local_ts_ns.value_or(0);
+        sum += static_cast<std::uint64_t>(r.exposure.estimated_age.value_or(1ns).count()) + (r.exposure.verified ? 1u : 0u);
+        sum += r.storage.available_bytes + r.storage.total_bytes + r.storage.next_segment_size;
+        sum += r.storage.estimated_rolls_left + (r.storage.spare_segment ? 1u : 0u);
+        sum += r.writer_pid.value_or(0) + (r.writer_alive.value_or(false) ? 1u : 0u);
+        sum += static_cast<std::uint64_t>(r.readers_dir_state);
+        for (const tt::BeaconStatus &beacon : moved.beacons()) {
+            sum += beacon.name.size() + static_cast<std::uint64_t>(beacon.state) + static_cast<std::uint64_t>(beacon.lag_unknown);
+            if (beacon.report) {
+                sum += beacon.report->pid + beacon.report->next_seq + beacon.report->slot.offset + beacon.report->updated_unix_ns;
+                sum += (beacon.report->seek_pending ? 1u : 0u) + (beacon.report->durable_only ? 1u : 0u);
+            }
+            if (beacon.lag) sum += beacon.lag->records + beacon.lag->bytes.value_or(0);
+            sum += static_cast<std::uint64_t>(beacon.update_age.value_or(1ns).count() + beacon.unread_age.value_or(1ns).count());
+            sum += beacon.oldest_unread_local_ts_ns.value_or(0);
+        }
+        const tt::ReaderMetrics rm = reader.metrics(moved).value();
+        sum += rm.next_seq + rm.slot.next_seq + (rm.seek_pending ? 1u : 0u) + (rm.durable_only ? 1u : 0u);
+        sum += (rm.held_record ? 1u : 0u) + static_cast<std::uint64_t>(rm.lag_unknown);
+        if (rm.lag) sum += rm.lag->records + rm.lag->bytes.value_or(0);
+        const tt::WriterMetrics wm = writer.metrics().value();
+        sum += wm.head.next_seq + wm.segment_size + wm.uncheckpointed_records + wm.uncheckpointed_bytes;
+        sum += wm.retention_failures + (wm.poisoned ? 1u : 0u);
+        sum += static_cast<std::uint64_t>(wm.since_checkpoint.value_or(1ns).count());
+        if (wm.checkpoint) sum += wm.checkpoint->generation;
+        status = tt::JournalStatus();
+    }
     reader.close().value();
     writer.close().value();
 

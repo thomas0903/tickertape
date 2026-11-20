@@ -479,6 +479,22 @@ public final class Writer implements AutoCloseable {
     }
 
     /**
+     * What only the writer knows (ADR 0032): its head, the last checkpoint by the monotonic clock, uncheckpointed
+     * records and bytes, whether it is poisoned, and failed retention runs. Makes no system call; allocates the result.
+     */
+    public WriterMetrics metrics() {
+        handle.enter();
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment out = MetricsValues.sized(arena, Signatures.WRITER_METRICS);
+            Errors.check(Native.writerGetMetrics(handle.ptr, out));
+            return new WriterMetrics(new MetricsValues.Struct(out, Signatures.WRITER_METRICS));
+        } finally {
+            handle.exit();
+            Reference.reachabilityFence(this);
+        }
+    }
+
+    /**
      * The most recent retention error since the writer was opened, as an exception value (not thrown), or empty if
      * there was none. Retention errors never fail open, appends or checkpoints, and a later successful run does not
      * clear the error.

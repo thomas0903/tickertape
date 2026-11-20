@@ -76,7 +76,9 @@ pub type tickertape_fill_fn =
 /// # Safety
 ///
 /// `ptr` must be NULL or a live handle from `tickertape_writer_open` that stays open during the borrow.
-unsafe fn handle<'a>(ptr: *mut tickertape_writer) -> Result<&'a Handle<Writer>, FfiError> {
+pub(crate) unsafe fn writer_handle<'a>(
+    ptr: *mut tickertape_writer,
+) -> Result<&'a Handle<Writer>, FfiError> {
     if ptr.is_null() {
         return Err(FfiError::null("writer"));
     }
@@ -159,7 +161,7 @@ pub unsafe extern "C" fn tickertape_writer_close(
             return Ok(S::TICKERTAPE_OK);
         }
         // SAFETY: forwarded caller contract.
-        if unsafe { handle(writer) }?.is_busy() {
+        if unsafe { writer_handle(writer) }?.is_busy() {
             return Err(FfiError::new(
                 S::TICKERTAPE_E_BUSY,
                 "cannot close a writer from inside one of its own calls",
@@ -214,7 +216,7 @@ pub unsafe extern "C" fn tickertape_writer_append(
             payload,
         };
         // SAFETY: forwarded caller contract.
-        let seq = unsafe { handle(writer) }?
+        let seq = unsafe { writer_handle(writer) }?
             .with(|w| w.append(&record).map_err(|e| writer_error(w, e)))?;
         // SAFETY: forwarded caller contract.
         unsafe { args::write_optional(seq_out, seq) };
@@ -272,7 +274,7 @@ pub unsafe extern "C" fn tickertape_writer_append_with(
             payload: &[],
         };
         // SAFETY: forwarded caller contract.
-        let seq = unsafe { handle(writer) }?.with(|w| {
+        let seq = unsafe { writer_handle(writer) }?.with(|w| {
             // A non-zero return declines the record through the core's `try_append_with`, which zeroes and syncs the
             // bytes and returns: aborting needs no unwinding. A Rust panic out of `fill` is cleaned up by the core and
             // resumed, then caught by `Handle::with` (the handle becomes broken; `TICKERTAPE_E_PANIC`). A foreign
@@ -430,7 +432,7 @@ pub unsafe extern "C" fn tickertape_writer_append_batch(
             })?;
         }
         // SAFETY: forwarded caller contract.
-        unsafe { handle(writer) }?.with(|w| {
+        unsafe { writer_handle(writer) }?.with(|w| {
             // SAFETY: `first_seq_out` is NULL or writable (caller guarantee) and overlaps no input (checked above).
             unsafe { args::write_optional(first_seq_out, w.next_seq()) };
             // SAFETY: every record was checked above, and `appended_out` overlaps no input.
@@ -463,7 +465,8 @@ pub unsafe extern "C" fn tickertape_writer_checkpoint(
 ) -> tickertape_status {
     guard(|| {
         // SAFETY: forwarded caller contract.
-        unsafe { handle(writer) }?.with(|w| w.checkpoint().map_err(|e| writer_error(w, e)))?;
+        unsafe { writer_handle(writer) }?
+            .with(|w| w.checkpoint().map_err(|e| writer_error(w, e)))?;
         Ok(S::TICKERTAPE_OK)
     })
 }
@@ -480,7 +483,7 @@ pub unsafe extern "C" fn tickertape_writer_next_seq(
 ) -> tickertape_status {
     guard(|| {
         // SAFETY: forwarded caller contract.
-        let seq = unsafe { handle(writer) }?.with_ref(|w| Ok(w.next_seq()))?;
+        let seq = unsafe { writer_handle(writer) }?.with_ref(|w| Ok(w.next_seq()))?;
         // SAFETY: forwarded caller contract.
         unsafe { args::write(seq_out, seq, "seq_out") }?;
         Ok(S::TICKERTAPE_OK)
@@ -500,7 +503,7 @@ pub unsafe extern "C" fn tickertape_writer_last_retention_error(
 ) -> tickertape_status {
     guard(|| {
         // SAFETY: forwarded caller contract.
-        unsafe { handle(writer) }?.with_ref(|w| match w.last_retention_error() {
+        unsafe { writer_handle(writer) }?.with_ref(|w| match w.last_retention_error() {
             None => Ok(S::TICKERTAPE_OK),
             Some(error) => Err(FfiError::from(error)),
         })

@@ -9,6 +9,7 @@
 // mirror within a major version. A test in tests/c_api.rs fails if a public class is missing here.
 #include "tickertape.hpp"
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -129,6 +130,107 @@ struct RetentionReport {
     std::uint64_t removed_bytes;
     std::uint64_t already_removed_segments;
 };
+struct Position {
+    std::uint64_t next_seq;
+    std::uint64_t segment_base_seq;
+    std::uint64_t offset;
+};
+struct Lag {
+    std::uint64_t records;
+    std::optional<std::uint64_t> bytes;
+};
+using OptNs = std::optional<std::chrono::nanoseconds>;
+using OptU64 = std::optional<std::uint64_t>;
+struct Head {
+    tt::Position position;
+    std::uint64_t segment_size;
+    tt::HeadEnd end;
+    tt::CorruptReason corrupt_reason;
+    OptU64 last_local_ts_ns;
+    bool verified;
+    bool chain_broken;
+};
+struct Segments {
+    std::uint64_t count;
+    std::uint64_t first_seq;
+    std::uint64_t total_bytes;
+    OptU64 oldest_created_unix_ns;
+    std::uint64_t before_checkpoint;
+};
+struct CheckpointState {
+    tt::Checkpoint marker;
+    tt::CheckpointProblem problem;
+    OptU64 modified_unix_ns;
+    OptNs estimated_age;
+    tt::AgeUnknown age_unknown;
+};
+struct Exposure {
+    OptU64 records;
+    OptU64 bytes;
+    OptNs estimated_age;
+    OptU64 oldest_local_ts_ns;
+    bool verified;
+};
+struct Storage {
+    std::uint64_t available_bytes;
+    std::uint64_t total_bytes;
+    std::uint64_t next_segment_size;
+    std::uint64_t estimated_rolls_left;
+    bool spare_segment;
+};
+struct StatusReport {
+    std::uint64_t sampled_unix_ns;
+    tt::StatusReport::Head head;
+    tt::StatusReport::Segments segments;
+    std::optional<tt::StatusReport::CheckpointState> checkpoint;
+    tt::StatusReport::Exposure exposure;
+    tt::StatusReport::Storage storage;
+    OptU64 writer_pid;
+    std::optional<bool> writer_alive;
+    tt::ReadersDirState readers_dir_state;
+};
+struct BeaconReport {
+    std::uint64_t pid;
+    std::uint64_t next_seq;
+    tt::Position slot;
+    bool seek_pending;
+    bool durable_only;
+    std::uint64_t updated_unix_ns;
+};
+struct BeaconStatus {
+    std::string name;
+    tt::BeaconState state;
+    std::optional<tt::BeaconStatus::Report> report;
+    OptNs update_age;
+    std::optional<tt::Lag> lag;
+    tt::LagUnknown lag_unknown;
+    OptU64 oldest_unread_local_ts_ns;
+    OptNs unread_age;
+};
+struct WriterMetrics {
+    tt::Position head;
+    std::uint64_t segment_size;
+    std::optional<tt::Checkpoint> checkpoint;
+    OptNs since_checkpoint;
+    std::uint64_t uncheckpointed_records;
+    std::uint64_t uncheckpointed_bytes;
+    bool poisoned;
+    std::uint64_t retention_failures;
+};
+struct ReaderMetrics {
+    std::uint64_t next_seq;
+    tt::Position slot;
+    bool seek_pending;
+    bool durable_only;
+    bool held_record;
+    std::optional<tt::Lag> lag;
+    tt::LagUnknown lag_unknown;
+};
+struct JournalStatus {
+    void *handle;
+    tt::StatusReport report;
+    std::vector<tt::BeaconStatus> beacons;
+};
 }  // namespace mirror
 
 TT_PIN(tt::Status, std::int32_t);
@@ -168,3 +270,32 @@ TT_PIN(tt::VerifyReport, mirror::VerifyReport);
 TT_PIN(tt::SegmentInfo, mirror::SegmentInfo);
 TT_PIN(tt::Checkpoint, mirror::Checkpoint);
 TT_PIN(tt::RetentionReport, mirror::RetentionReport);
+TT_PIN(tt::HeadEnd, std::int32_t);
+TT_PIN(tt::CheckpointProblem, std::int32_t);
+TT_PIN(tt::AgeUnknown, std::int32_t);
+TT_PIN(tt::LagUnknown, std::int32_t);
+TT_PIN(tt::BeaconState, std::int32_t);
+TT_PIN(tt::ReadersDirState, std::int32_t);
+TT_PIN(tt::Position, mirror::Position);
+TT_PIN(tt::Lag, mirror::Lag);
+TT_PIN(tt::StatusReport::Head, mirror::Head);
+TT_PIN(tt::StatusReport::Segments, mirror::Segments);
+TT_PIN(tt::StatusReport::CheckpointState, mirror::CheckpointState);
+TT_PIN(tt::StatusReport::Exposure, mirror::Exposure);
+TT_PIN(tt::StatusReport::Storage, mirror::Storage);
+TT_PIN(tt::StatusReport, mirror::StatusReport);
+TT_PIN(tt::BeaconStatus::Report, mirror::BeaconReport);
+TT_PIN(tt::BeaconStatus, mirror::BeaconStatus);
+TT_PIN(tt::WriterMetrics, mirror::WriterMetrics);
+TT_PIN(tt::ReaderMetrics, mirror::ReaderMetrics);
+TT_PIN(tt::JournalStatus, mirror::JournalStatus);
+TT_PIN(tt::result<tt::JournalStatus>, mirror::Result<tt::JournalStatus>);
+TT_PIN(tt::result<tt::WriterMetrics>, mirror::Result<tt::WriterMetrics>);
+TT_PIN(tt::result<tt::ReaderMetrics>, mirror::Result<tt::ReaderMetrics>);
+static_assert(std::is_same_v<std::underlying_type_t<tt::HeadEnd>, std::int32_t> &&
+                  std::is_same_v<std::underlying_type_t<tt::CheckpointProblem>, std::int32_t> &&
+                  std::is_same_v<std::underlying_type_t<tt::AgeUnknown>, std::int32_t> &&
+                  std::is_same_v<std::underlying_type_t<tt::LagUnknown>, std::int32_t> &&
+                  std::is_same_v<std::underlying_type_t<tt::BeaconState>, std::int32_t> &&
+                  std::is_same_v<std::underlying_type_t<tt::ReadersDirState>, std::int32_t>,
+              "the metrics enumerations' underlying types are part of the layout");

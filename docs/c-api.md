@@ -146,7 +146,7 @@ CMake package in `crates/tickertape-ffi/cmake/`, which finds the repository's bu
 - Options and retention settings are copied by the functions that take them, so they can be freed right after.
 - **Records returned by `tickertape_reader_next` are borrowed views.** `record.payload` points into the reader's
   buffer (safe reader) or straight into the memory-mapped segment (mapped reader). It is valid until the next call
-  that takes the same reader (any `tickertape_reader_*` function except `tickertape_reader_position`), or until the
+  that takes the same reader (any `tickertape_reader_*` function except `tickertape_reader_position` and `tickertape_reader_get_metrics`), or until the
   reader is closed. Copy what you need to keep.
 - **Copy-out instead:** `tickertape_reader_next_copy` copies one payload into a buffer you own, and
   `tickertape_reader_read_batch` copies many records' payloads one after another into one buffer. The returned
@@ -365,6 +365,8 @@ also printed to standard error.
   the same time. Synchronise yourself if you share one; a writer is single-threaded in this sense.
 - Different readers are independent and can be used from different threads, in any number of processes.
 - The last-error state is per OS thread; see [Errors](#errors) for runtimes that move tasks between threads.
+- A journal status sample is immutable and may be read by several threads at once (see
+  [Operational metrics](#operational-metrics)); only its free must not overlap other calls on it.
 - Option builders follow the same rule as handles. The free-standing functions (`tickertape_verify`,
   `tickertape_list_segments`, `tickertape_read_checkpoint`, `tickertape_retention_apply`, and the version and error
   functions) can be called from any thread.
@@ -393,6 +395,45 @@ also printed to standard error.
 
 The reports `tickertape_verify_report` and `tickertape_retention_report` start with `struct_size`: set it to
 `sizeof` the struct before the call (see [Versioning](#versioning) for what the library writes back).
+
+## Operational metrics
+
+The values `tickertape status` prints (ADR [0032](decisions/0032-operational-metrics.md); what each means and how
+accurate it is: [`operations.md`](operations.md#monitoring)) are available through three calls. Each fills an
+extensible struct: set `struct_size` to `sizeof` the struct first (see [Versioning](#versioning)).
+
+| Call | What | Cost |
+|---|---|---|
+| `tickertape_journal_status_sample(dir, readers_dir, &status)` | A read-only sample of the journal: head, segments, checkpoint marker and its estimated age, exposure (what a power loss could remove), storage headroom, the last writer's PID, and reader beacons. Needs no writer, takes no lock anybody waits for, never writes | Lists `dir`; reads the checkpoint marker (up to two 64-byte `pread`s); scans the newest segment with `pread` from the marker's position if the marker is in it, otherwise from its first record, so the cost grows with what was appended since the last checkpoint; reads the headers of the oldest segment and the marker's segment; `statvfs`; reads `writer.lock` (without locking it) and `kill(pid, 0)`; lists the beacon directory and reads each beacon (129 bytes, a lock probe), plus one record per lagging beacon. Segments in between are listed, not read. No file stays open |
+| `tickertape_writer_get_metrics(writer, &metrics)` | What only the writer knows: its head, the checkpoint marker it last wrote, the time since its last successful checkpoint by the monotonic clock, uncheckpointed records and bytes, whether it is poisoned, failed retention runs | No system calls (one monotonic clock read) |
+| `tickertape_reader_get_metrics(reader, status, &metrics)` | The reader's cursor and its lag behind the sample `status` (behind the head, or the checkpoint marker for a durable-only reader). Does not invalidate a record view | No system calls |
+
+The exact system calls are in ADR 0032 → Sampling cost. Nothing is added to appends or to the per-record read path.
+
+- **Unknown values.** Nothing is guessed: an optional `uint64_t` field the sample could not establish holds
+  `TICKERTAPE_UNKNOWN` (`UINT64_MAX`), usually with a reason in an enum field (`tickertape_age_unknown`,
+  `tickertape_lag_unknown`). A caller-supplied timestamp of `UINT64_MAX`, like one of 0 ("not set"), reads as
+  unknown. Durations are nanoseconds; booleans are `uint32_t` 0 or 1. If `has_checkpoint` is 0, the `checkpoint_*`
+  values are `TICKERTAPE_UNKNOWN`.
+- **Corruption** is what a writer would refuse: `head_end == TICKERTAPE_HEAD_INVALID` (with `head_corrupt_reason`),
+  `checkpoint_problem != TICKERTAPE_CHECKPOINT_USABLE`, or `head_chain_broken`. When the checkpoint is in an older
+  segment the segments in between are not read: `head_verified` is then 0, and no corruption reported does not mean
+  that a writer would open the journal (`tickertape_verify` checks everything).
+- **Ownership.** `tickertape_journal_status_sample` returns a handle; free it with `tickertape_journal_status_free`.
+  The sample is immutable: `tickertape_journal_status_get_report`, `_get_beacon` (by index, `0` to
+  `beacon_count - 1`), `_beacon_name` (a string owned by the sample) and `tickertape_reader_get_metrics` only read it,
+  so several threads may use one sample at once; freeing it must not overlap any of them. It keeps no file open.
+- **Lag.** A reader's lag is measured against the sample, so take the sample after the reads you want counted. It is
+  unknown (`lag_unknown`) if the reader's segment is not the file the sample listed under that name: retention
+  removed it (`TICKERTAPE_LAG_SEGMENT_GONE`), it is another file of that name (`_OTHER_HISTORY`), or the reader is
+  already in a segment the sample did not list (`_AHEAD_OF_SAMPLE`: take a new sample). A record held back for the
+  next read (`held_record`, after a buffer that was too small) counts in `lag_records`, and makes `lag_bytes`
+  unknown.
+- **Beacons** of readers in other processes are reported, sorted by name (`tickertape_beacon_status`); a
+  `TICKERTAPE_BEACON_STALE` beacon belongs to a process that died, so its position is history, not lag. The C ABI
+  reads beacons; creating one (`tickertape::status::ReaderBeacon`) is available from Rust only.
+- Not in the C ABI yet: the repeated `Sampler` (append rates, time until the volume is full) and the health
+  thresholds of `Status::breaches`. Both can be added without changing these structs.
 
 ## Versioning
 

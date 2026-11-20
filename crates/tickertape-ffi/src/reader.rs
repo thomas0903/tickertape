@@ -23,7 +23,8 @@ pub struct tickertape_reader(Handle<ReaderState>);
 ///
 /// Returned by `tickertape_reader_next` as a **borrowed view**: `payload` points into the reader's buffer or, for a
 /// mapped reader, into the memory-mapped segment, and stays valid only until the next call that takes the same
-/// reader (other than `tickertape_reader_position`) or until the reader is closed. Copy what you need to keep. Returned
+/// reader (other than `tickertape_reader_position` and `tickertape_reader_get_metrics`) or until the reader is closed.
+/// Copy what you need to keep. Returned
 /// by `tickertape_reader_next_copy` and `tickertape_reader_read_batch` with `payload` pointing into the caller's
 /// buffer. When `payload_len` is 0, `payload` is NULL.
 #[allow(non_camel_case_types)]
@@ -117,6 +118,12 @@ impl Next<'_> {
 }
 
 impl ReaderState {
+    /// The core reader's cursor, and the sequence number of the record held back for the next read, if any (the
+    /// core reader has already moved past it).
+    pub(crate) fn cursor(&self) -> (tickertape::status::Cursor, Option<u64>) {
+        (self.reader.cursor(), self.pending.as_ref().map(|p| p.seq))
+    }
+
     /// Starts a call that may return records: invalidates the previous view and reports a deferred error.
     fn begin(&mut self) -> Result<(), FfiError> {
         self.returned = None;
@@ -146,7 +153,9 @@ fn next_record<'a>(
 /// # Safety
 ///
 /// `ptr` must be NULL or a live handle from a reader open function that stays open during the borrow.
-unsafe fn handle<'a>(ptr: *mut tickertape_reader) -> Result<&'a Handle<ReaderState>, FfiError> {
+pub(crate) unsafe fn reader_handle<'a>(
+    ptr: *mut tickertape_reader,
+) -> Result<&'a Handle<ReaderState>, FfiError> {
     if ptr.is_null() {
         return Err(FfiError::null("reader"));
     }
@@ -265,7 +274,7 @@ pub unsafe extern "C" fn tickertape_reader_close(
             return Ok(S::TICKERTAPE_OK);
         }
         // SAFETY: forwarded caller contract.
-        if unsafe { handle(reader) }?.is_busy() {
+        if unsafe { reader_handle(reader) }?.is_busy() {
             return Err(FfiError::new(
                 S::TICKERTAPE_E_BUSY,
                 "cannot close a reader from inside one of its own calls",
@@ -302,7 +311,7 @@ pub unsafe extern "C" fn tickertape_reader_seek(
 ) -> tickertape_status {
     guard(|| {
         // SAFETY: forwarded caller contract.
-        unsafe { handle(reader) }?.with(|state| {
+        unsafe { reader_handle(reader) }?.with(|state| {
             state.returned = None;
             // The core leaves its cursor unchanged when a seek fails; keep what belongs to that cursor too.
             state.reader.seek(seq)?;
@@ -331,7 +340,8 @@ pub unsafe extern "C" fn tickertape_reader_seek(
 /// covered by a checkpoint (**durable**) and treats the rest as not written yet.
 ///
 /// The view's `payload` is valid until the next call that takes this reader (other than
-/// `tickertape_reader_position`) or until the reader is closed. It is NULL when `payload_len` is 0.
+/// `tickertape_reader_position` and `tickertape_reader_get_metrics`) or until the reader is closed. It is NULL when
+/// `payload_len` is 0.
 ///
 /// Errors: `TICKERTAPE_E_CORRUPT` if the bytes at the cursor fail validation (the cursor does not move, so calling
 /// again retries the same position, which may succeed after a writer recovery); `TICKERTAPE_E_DISCARDED` if writer
@@ -353,7 +363,7 @@ pub unsafe extern "C" fn tickertape_reader_next(
             return Err(FfiError::null("record_out"));
         }
         // SAFETY: forwarded caller contract.
-        unsafe { handle(reader) }?.with(|state| {
+        unsafe { reader_handle(reader) }?.with(|state| {
             state.begin()?;
             let view = match next_record(&mut state.reader, &mut state.pending, timeout_ns)? {
                 None => return Ok(S::TICKERTAPE_NONE),
@@ -410,7 +420,7 @@ pub unsafe extern "C" fn tickertape_reader_next_copy(
             Region::of(record_out, 1, "record_out"),
         ])?;
         // SAFETY: forwarded caller contract.
-        unsafe { handle(reader) }?.with(|state| {
+        unsafe { reader_handle(reader) }?.with(|state| {
             state.begin()?;
             let Some(next) = next_record(&mut state.reader, &mut state.pending, timeout_ns)? else {
                 return Ok(S::TICKERTAPE_NONE);
@@ -503,7 +513,7 @@ pub unsafe extern "C" fn tickertape_reader_read_batch(
         unsafe { count_out.write(0) };
         checked?;
         // SAFETY: forwarded caller contract.
-        unsafe { handle(reader) }?.with(|state| {
+        unsafe { reader_handle(reader) }?.with(|state| {
             state.begin()?;
             let mut count = 0usize;
             let mut used = 0usize;
@@ -577,7 +587,7 @@ pub unsafe extern "C" fn tickertape_reader_position(
 ) -> tickertape_status {
     guard(|| {
         // SAFETY: forwarded caller contract.
-        let seq = unsafe { handle(reader) }?.with_ref(|state| {
+        let seq = unsafe { reader_handle(reader) }?.with_ref(|state| {
             Ok(state
                 .pending
                 .as_ref()

@@ -82,6 +82,101 @@ final class Signatures {
             JAVA_LONG.withName("removed_bytes"),
             JAVA_LONG.withName("already_removed_segments")).withName("tickertape_retention_report");
 
+    /** {@code tickertape_journal_status_report}, an extensible struct; 272 bytes in this ABI version. */
+    static final StructLayout JOURNAL_STATUS_REPORT = MemoryLayout.structLayout(
+            JAVA_LONG.withName("struct_size"),
+            JAVA_LONG.withName("sampled_unix_ns"),
+            JAVA_LONG.withName("head_next_seq"),
+            JAVA_LONG.withName("head_segment_base_seq"),
+            JAVA_LONG.withName("head_offset"),
+            JAVA_LONG.withName("head_segment_size"),
+            JAVA_LONG.withName("head_last_local_ts_ns"),
+            JAVA_INT.withName("head_end"),
+            JAVA_INT.withName("head_corrupt_reason"),
+            JAVA_INT.withName("head_verified"),
+            JAVA_INT.withName("head_chain_broken"),
+            JAVA_LONG.withName("segment_count"),
+            JAVA_LONG.withName("first_seq"),
+            JAVA_LONG.withName("segments_total_bytes"),
+            JAVA_LONG.withName("oldest_segment_created_unix_ns"),
+            JAVA_LONG.withName("segments_before_checkpoint"),
+            JAVA_INT.withName("has_checkpoint"),
+            JAVA_INT.withName("checkpoint_problem"),
+            JAVA_LONG.withName("checkpoint_generation"),
+            JAVA_LONG.withName("checkpoint_next_seq"),
+            JAVA_LONG.withName("checkpoint_segment_base_seq"),
+            JAVA_LONG.withName("checkpoint_offset"),
+            JAVA_LONG.withName("checkpoint_modified_unix_ns"),
+            JAVA_LONG.withName("checkpoint_estimated_age_ns"),
+            JAVA_INT.withName("checkpoint_age_unknown"),
+            JAVA_INT.withName("exposure_verified"),
+            JAVA_LONG.withName("exposure_records"),
+            JAVA_LONG.withName("exposure_bytes"),
+            JAVA_LONG.withName("exposure_estimated_age_ns"),
+            JAVA_LONG.withName("exposure_oldest_local_ts_ns"),
+            JAVA_LONG.withName("storage_available_bytes"),
+            JAVA_LONG.withName("storage_total_bytes"),
+            JAVA_LONG.withName("storage_next_segment_size"),
+            JAVA_LONG.withName("storage_estimated_rolls_left"),
+            JAVA_INT.withName("storage_spare_segment"),
+            JAVA_INT.withName("readers_dir_state"),
+            JAVA_LONG.withName("writer_pid"),
+            JAVA_LONG.withName("writer_alive"),
+            JAVA_LONG.withName("beacon_count")).withName("tickertape_journal_status_report");
+
+    /** {@code tickertape_beacon_status}, an extensible struct; 120 bytes in this ABI version. */
+    static final StructLayout BEACON_STATUS = MemoryLayout.structLayout(
+            JAVA_LONG.withName("struct_size"),
+            JAVA_INT.withName("state"),
+            JAVA_INT.withName("has_report"),
+            JAVA_INT.withName("report_seek_pending"),
+            JAVA_INT.withName("report_durable_only"),
+            JAVA_INT.withName("lag_unknown"),
+            JAVA_INT.withName("reserved"),
+            JAVA_LONG.withName("report_pid"),
+            JAVA_LONG.withName("report_next_seq"),
+            JAVA_LONG.withName("report_slot_seq"),
+            JAVA_LONG.withName("report_segment_base_seq"),
+            JAVA_LONG.withName("report_offset"),
+            JAVA_LONG.withName("report_updated_unix_ns"),
+            JAVA_LONG.withName("update_age_ns"),
+            JAVA_LONG.withName("lag_records"),
+            JAVA_LONG.withName("lag_bytes"),
+            JAVA_LONG.withName("oldest_unread_local_ts_ns"),
+            JAVA_LONG.withName("unread_age_ns")).withName("tickertape_beacon_status");
+
+    /** {@code tickertape_writer_metrics}, an extensible struct; 112 bytes in this ABI version. */
+    static final StructLayout WRITER_METRICS = MemoryLayout.structLayout(
+            JAVA_LONG.withName("struct_size"),
+            JAVA_LONG.withName("head_next_seq"),
+            JAVA_LONG.withName("head_segment_base_seq"),
+            JAVA_LONG.withName("head_offset"),
+            JAVA_LONG.withName("segment_size"),
+            JAVA_INT.withName("has_checkpoint"),
+            JAVA_INT.withName("poisoned"),
+            JAVA_LONG.withName("checkpoint_generation"),
+            JAVA_LONG.withName("checkpoint_next_seq"),
+            JAVA_LONG.withName("checkpoint_segment_base_seq"),
+            JAVA_LONG.withName("checkpoint_offset"),
+            JAVA_LONG.withName("since_checkpoint_ns"),
+            JAVA_LONG.withName("uncheckpointed_records"),
+            JAVA_LONG.withName("uncheckpointed_bytes"),
+            JAVA_LONG.withName("retention_failures")).withName("tickertape_writer_metrics");
+
+    /** {@code tickertape_reader_metrics}, an extensible struct; 72 bytes in this ABI version. */
+    static final StructLayout READER_METRICS = MemoryLayout.structLayout(
+            JAVA_LONG.withName("struct_size"),
+            JAVA_LONG.withName("next_seq"),
+            JAVA_LONG.withName("slot_seq"),
+            JAVA_LONG.withName("segment_base_seq"),
+            JAVA_LONG.withName("offset"),
+            JAVA_INT.withName("seek_pending"),
+            JAVA_INT.withName("durable_only"),
+            JAVA_INT.withName("held_record"),
+            JAVA_INT.withName("lag_unknown"),
+            JAVA_LONG.withName("lag_records"),
+            JAVA_LONG.withName("lag_bytes")).withName("tickertape_reader_metrics");
+
     /** Every struct, by its C name (for the layout test). */
     static final Map<String, StructLayout> STRUCTS = Map.of(
             "tickertape_record", RECORD,
@@ -89,7 +184,11 @@ final class Signatures {
             "tickertape_segment_info", SEGMENT_INFO,
             "tickertape_checkpoint", CHECKPOINT,
             "tickertape_verify_report", VERIFY_REPORT,
-            "tickertape_retention_report", RETENTION_REPORT);
+            "tickertape_retention_report", RETENTION_REPORT,
+            "tickertape_journal_status_report", JOURNAL_STATUS_REPORT,
+            "tickertape_beacon_status", BEACON_STATUS,
+            "tickertape_writer_metrics", WRITER_METRICS,
+            "tickertape_reader_metrics", READER_METRICS);
 
     /**
      * A pointer received as a 64-bit integer: on the supported (LP64) platforms both are passed in the same integer
@@ -178,6 +277,14 @@ final class Signatures {
         f.put("tickertape_writer_checkpoint", FunctionDescriptor.of(JAVA_INT, ADDRESS));
         f.put("tickertape_writer_next_seq", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS));
         f.put("tickertape_writer_last_retention_error", FunctionDescriptor.of(JAVA_INT, ADDRESS));
+        // Operational metrics (ADR 0032).
+        f.put("tickertape_journal_status_sample", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS));
+        f.put("tickertape_journal_status_free", FunctionDescriptor.ofVoid(ADDRESS));
+        f.put("tickertape_journal_status_get_report", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS));
+        f.put("tickertape_journal_status_get_beacon", FunctionDescriptor.of(JAVA_INT, ADDRESS, SIZE_T, ADDRESS));
+        f.put("tickertape_journal_status_beacon_name", FunctionDescriptor.of(ADDRESS, ADDRESS, SIZE_T));
+        f.put("tickertape_writer_get_metrics", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS));
+        f.put("tickertape_reader_get_metrics", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS));
         FUNCTIONS = Collections.unmodifiableMap(f);
     }
 }

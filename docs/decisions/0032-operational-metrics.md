@@ -1,7 +1,8 @@
 # 0032: Operational metrics and reader beacons
 
 - **Status:** proposed
-- **Date:** 2026-11-19 (revised the same day after review rounds 1 and 2 of PR #8, and on 2026-11-20 after rounds 3 and 4)
+- **Date:** 2026-11-19 (revised the same day after review rounds 1 and 2 of PR #8, and on 2026-11-20 after rounds 3 and 4;
+  amended on 2026-11-20 with the C ABI and the bindings, section "Bindings")
 
 ## Context
 
@@ -314,6 +315,46 @@ Retention that waits for slow readers would be a separate, explicitly designed o
 No metrics crate is a dependency. The docs show how to export a `Status` to Prometheus or OpenTelemetry in a few
 lines of application code. An optional `metrics`-facade feature is possible later; it is left out because the
 facade would fix metric names and types in the core crate before 1.0 for little gain over those few lines.
+
+## Bindings
+
+Added on 2026-11-20 (pull request "ffi: journal status and metrics through the C ABI and the bindings"), additively:
+new C symbols only, nothing on the append or per-record read paths.
+
+- **C ABI** (`crates/tickertape-ffi/src/metrics.rs`, `docs/c-api.md` → Operational metrics):
+  `tickertape_journal_status_sample` returns an opaque, immutable handle for one `status()` sample (with an optional
+  beacon directory), freed by `tickertape_journal_status_free`; `tickertape_journal_status_get_report` and
+  `_get_beacon` copy its values into extensible structs (`tickertape_journal_status_report`,
+  `tickertape_beacon_status`), and `_beacon_name` returns a beacon's name owned by the sample.
+  `tickertape_writer_get_metrics` fills `tickertape_writer_metrics` from `Writer::metrics`, and
+  `tickertape_reader_get_metrics` fills `tickertape_reader_metrics` with `Reader::cursor` and `Status::lag` against a
+  sample. Decisions, each for the reason given:
+  - *A handle for the sample, not only a struct:* `Status::lag` needs the sample's segment identities, which a plain
+    struct would have to expose or copy per call. The handle is immutable, so it may be read by several threads at once
+    (the one exception to the ABI's one-thread-per-handle rule, stated in the header); only its free must not overlap.
+  - *Flat structs with `struct_size`, no nested structs and no pointers:* they grow by appending fields (ADR 0028 →
+    Versioning), keep the same layout on 32-bit targets, and stay readable by bindings that parse the header (the Java
+    binding's layout test).
+  - *Unknown is `TICKERTAPE_UNKNOWN` (`UINT64_MAX`), with reason enums:* one rule for every optional value instead of a
+    flag per field. Durations saturate one below it. A known value equal to `UINT64_MAX` (a caller-supplied timestamp
+    of `UINT64_MAX`, or a count no journal reaches) reads as unknown, as a timestamp of 0 ("not set") already does:
+    less information, never a wrong value (rule 1).
+  - *Every core reason has a C value, plus an `OTHER` value* for a variant the core might add before the ABI names it;
+    such a variant is never mapped to a healthy value (an unknown head end reads as invalid bytes). Unit tests parse the
+    core's enums and check that each variant maps.
+  - *A record the C reader holds back* (it did not fit the caller's buffer) counts in the reader's lag, whose bytes are
+    then unknown: the core reader has already passed it. The Python binding treats its read-ahead buffer the same way.
+  - *Not exposed yet:* `Sampler` (rates and time to full), `Status::breaches` and creating beacons
+    (`ReaderBeacon`). Each can be added later without changing these structs.
+- **C++** (`tickertape.hpp`): `JournalStatus::sample` (move-only, values read once into `StatusReport` and
+  `std::vector<BeaconStatus>`), `Writer::metrics`, `Reader::metrics(const JournalStatus &)`; unknown values are empty
+  `std::optional`s, ages `std::chrono::nanoseconds`.
+- **Python** (core crate directly, ADR 0029): `tickertape.status(path, readers_dir=None)` returns a frozen
+  `JournalStatus` dataclass of named tuples; `Writer.metrics()`, `Reader.metrics(status)`. Unknown values are `None`,
+  reasons the CLI's JSON codes, durations integer nanoseconds.
+- **Java** (FFM over the C ABI, ADR 0037): `JournalStatus.sample` (`AutoCloseable`, values copied at sample time,
+  the C handle freed by `close()` or a `Cleaner`, guarded by a read-write lock so that `close()` waits for
+  `Reader.metrics`), `Writer.metrics()`, `Reader.metrics(JournalStatus)`; final classes with `Optional` values.
 
 ## Sampling cost
 
