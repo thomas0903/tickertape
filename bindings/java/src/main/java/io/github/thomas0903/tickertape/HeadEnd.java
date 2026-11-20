@@ -2,8 +2,8 @@ package io.github.thomas0903.tickertape;
 
 /**
  * How the newest segment ends, as a {@link JournalStatus} saw it. Each value's {@link #cName()} is the C enumerator
- * ({@code TICKERTAPE_HEAD_*}, ADR 0032). {@link #UNKNOWN} stands for a value from a newer library that this binding
- * does not name; it is not in the C header.
+ * ({@code TICKERTAPE_HEAD_*}, ADR 0032). {@link #OTHER} is a state the C ABI does not name (a newer
+ * library); this binding reports a code it does not know as {@link #OTHER} too.
  */
 public enum HeadEnd {
     /** At a slot with no record yet: the normal state. */
@@ -12,8 +12,8 @@ public enum HeadEnd {
     SEALED(1),
     /** At bytes that failed validation even after re-reading ({@link JournalStatus#headCorruptReason}): corruption. */
     INVALID(2),
-    /** A value from a newer library that this binding does not name. */
-    UNKNOWN(-1);
+    /** A state the C ABI does not name ({@code TICKERTAPE_HEAD_OTHER}). */
+    OTHER(255);
 
     private final int code;
 
@@ -31,13 +31,13 @@ public enum HeadEnd {
         return "TICKERTAPE_HEAD_" + name();
     }
 
-    /** The value for a C code; {@link #UNKNOWN} for a code this binding does not name. */
+    /** The value for a C code; {@link #OTHER} for a code this binding does not name. */
     public static HeadEnd of(int code) {
         for (HeadEnd v : values()) {
             if (v.code == code) {
                 return v;
             }
         }
-        return UNKNOWN;
+        return OTHER;
     }
 }

@@ -93,7 +93,7 @@ class Retention:
         *, max_segments: int | None = None, max_bytes: int | None = None, max_age: _Seconds | None = None
     ) -> Retention: ...
     @staticmethod
-    def archive(
+    def move_to(
         directory: _Path,
         *,
         max_segments: int | None = None,
@@ -107,7 +107,7 @@ class Retention:
     @property
     def max_age(self) -> float | None: ...
     @property
-    def archive_dir(self) -> Path | None: ...
+    def move_to_directory(self) -> Path | None: ...
     def __eq__(self, other: object, /) -> bool: ...
     def __hash__(self) -> int: ...
 
@@ -126,7 +126,7 @@ class Writer:
         retention: Retention | None = None,
     ) -> Writer: ...
     def append(self, payload: _Bytes, *, schema_id: int = 0, venue_ts_ns: int = 0, local_ts_ns: int = 0) -> int: ...
-    def append_many(
+    def append_batch(
         self,
         payloads: Iterable[_Bytes],
         *,

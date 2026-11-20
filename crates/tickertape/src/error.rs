@@ -17,6 +17,7 @@ pub enum Error {
     /// A reader also reports a read buffer it cannot allocate this way, with kind
     /// [`OutOfMemory`](std::io::ErrorKind::OutOfMemory): a frame too large for the address space of a 32-bit target.
     #[error("{op} failed for {}: {source}", path.display())]
+    #[non_exhaustive]
     Io {
         /// What tickertape was doing, e.g. `"preallocate segment"`.
         op: &'static str,
@@ -36,6 +37,7 @@ pub enum Error {
     /// Python `multiprocessing` with the fork start method), and the same for a grandchild. A writer opened
     /// meanwhile sees this error (see `docs/crash-contract.md` → C3 and Known risks and limits).
     #[error("journal {} is locked by another writer (pid {pid:?})", dir.display())]
+    #[non_exhaustive]
     Locked {
         /// The journal directory.
         dir: PathBuf,
@@ -45,6 +47,7 @@ pub enum Error {
 
     /// Bytes in a segment failed validation.
     #[error("corrupt journal data in {} at offset {offset}: {reason}", path.display())]
+    #[non_exhaustive]
     Corrupt {
         /// The segment file.
         path: PathBuf,
@@ -56,6 +59,7 @@ pub enum Error {
 
     /// A segment was written by an incompatible format version.
     #[error("{} has format version {found}; this build supports version {supported}", path.display())]
+    #[non_exhaustive]
     UnsupportedVersion {
         /// The segment file.
         path: PathBuf,
@@ -67,6 +71,7 @@ pub enum Error {
 
     /// The directory contains no segments.
     #[error("no journal segments found in {}", dir.display())]
+    #[non_exhaustive]
     NotFound {
         /// The directory that was searched.
         dir: PathBuf,
@@ -74,6 +79,7 @@ pub enum Error {
 
     /// A requested sequence number is older than the oldest segment in the journal.
     #[error("sequence number {requested} is before the first available record {first}")]
+    #[non_exhaustive]
     SeqUnavailable {
         /// The requested sequence number.
         requested: u64,
@@ -83,6 +89,7 @@ pub enum Error {
 
     /// A payload does not fit in one segment.
     #[error("record of {len} payload bytes exceeds the maximum of {max} for this segment size")]
+    #[non_exhaustive]
     RecordTooLarge {
         /// Requested payload length.
         len: usize,
@@ -109,6 +116,7 @@ pub enum Error {
     /// so records from this sequence number on may belong to a discarded history. Call
     /// [`Reader::seek`](crate::Reader::seek) to continue on the current chain.
     #[error("the segment at sequence {seq} was replaced or removed by recovery or retention")]
+    #[non_exhaustive]
     Discarded {
         /// The reader's position when it noticed.
         seq: u64,
@@ -121,6 +129,7 @@ pub enum Error {
     /// A reader beacon with this name is held by a running reader (or a process that inherited its descriptor), so
     /// [`ReaderBeacon::create`](crate::status::ReaderBeacon::create) won't take the name.
     #[error("reader beacon {} is held by a running reader", path.display())]
+    #[non_exhaustive]
     BeaconInUse {
         /// The beacon file.
         path: PathBuf,
@@ -140,7 +149,10 @@ impl Error {
         matches!(self, Error::Io { source, .. } if source.kind() == io::ErrorKind::NotFound)
     }
 
-    pub(crate) fn io(op: &'static str, path: impl Into<PathBuf>, source: io::Error) -> Error {
+    /// An [`Error::Io`]. Hidden: not covered by the compatibility promise; for the tests of the C ABI and the
+    /// bindings, which cannot build the `#[non_exhaustive]` variant.
+    #[doc(hidden)]
+    pub fn io(op: &'static str, path: impl Into<PathBuf>, source: io::Error) -> Error {
         Error::Io {
             op,
             path: path.into(),
@@ -148,7 +160,10 @@ impl Error {
         }
     }
 
-    pub(crate) fn corrupt(path: impl Into<PathBuf>, offset: u64, reason: CorruptReason) -> Error {
+    /// An [`Error::Corrupt`]. Hidden: not covered by the compatibility promise; for the tests of the C ABI and the
+    /// bindings, which cannot build the `#[non_exhaustive]` variant.
+    #[doc(hidden)]
+    pub fn corrupt(path: impl Into<PathBuf>, offset: u64, reason: CorruptReason) -> Error {
         Error::Corrupt {
             path: path.into(),
             offset,
@@ -169,6 +184,7 @@ pub enum CorruptReason {
     BadSegmentHeader(&'static str),
     /// The segment file is shorter or longer than its header says.
     #[error("segment file size {actual} differs from header size {expected}")]
+    #[non_exhaustive]
     SizeMismatch {
         /// `segment_size` from the header.
         expected: u64,
@@ -177,6 +193,7 @@ pub enum CorruptReason {
     },
     /// The file name and the header's `base_seq` disagree.
     #[error("file name says base sequence {from_name}, header says {from_header}")]
+    #[non_exhaustive]
     BaseSeqMismatch {
         /// From the file name.
         from_name: u64,
@@ -197,6 +214,7 @@ pub enum CorruptReason {
     BadChecksum,
     /// A record has an unexpected sequence number.
     #[error("expected sequence {expected}, found {found}")]
+    #[non_exhaustive]
     BadSequence {
         /// The sequence number the position implies.
         expected: u64,

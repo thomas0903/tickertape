@@ -8,7 +8,7 @@ use tickertape::retention::{self, Action, Policy, Reason};
 
 use crate::{Result, output};
 
-pub(crate) const HELP: &str = "Remove a sealed prefix strictly before the checkpoint segment. Without a valid checkpoint nothing is eligible. Limits combine with OR; checkpoint and newer segments are always kept. No writer lock is taken. The destination directory must exist; existing files are never replaced.\n\nJSON schema: {\"dry_run\":bool,\"segments\":[{\"file\":string,\"base_seq\":u64,\"size_bytes\":u64,\"sealed_unix_ns\":u64,\"reasons\":[\"max_segments\"|\"max_bytes\"|\"max_age\"]}],\"report\":{\"removed_segments\":u64,\"removed_bytes\":u64,\"already_removed_segments\":u64}|null}. report is null for --dry-run.\n\nExit codes: 0 success (including nothing eligible or help); 1 usage or I/O error; 2 corruption or unsupported journal format. On failure earlier removals remain in effect; diagnostics go to stderr.";
+pub(crate) const HELP: &str = "Remove a sealed prefix strictly before the checkpoint segment. Without a valid checkpoint nothing is eligible. Limits combine with OR; checkpoint and newer segments are always kept. No writer lock is taken. The destination directory must exist; existing files are never replaced.\n\nJSON schema (schema_version 1; fields may be added, see docs/cli.md): {\"schema_version\":1,\"dry_run\":bool,\"segments\":[{\"file\":string,\"base_seq\":u64,\"size_bytes\":u64,\"sealed_unix_ns\":u64,\"reasons\":[\"max_segments\"|\"max_bytes\"|\"max_age\"]}],\"report\":{\"removed_segments\":u64,\"removed_bytes\":u64,\"already_removed_segments\":u64}|null}. report is null for --dry-run.\n\nExit codes: 0 success (including nothing eligible or help); 1 usage or I/O error; 2 corruption or unsupported journal format. On failure earlier removals remain in effect; diagnostics go to stderr.";
 
 #[derive(Debug, Args)]
 #[command(group(ArgGroup::new("action").required(true).args(["to", "delete"])))]
@@ -151,7 +151,7 @@ pub(crate) fn run(args: ArchiveArgs, out: &mut impl Write) -> Result<()> {
         report,
     };
     if args.json {
-        output::json(out, &result)?;
+        output::json_document(out, &result)?;
     } else {
         for segment in &result.segments {
             writeln!(

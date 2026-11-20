@@ -36,6 +36,9 @@ pub enum tickertape_head_end {
     /// breach. Not possible after a writer process crash; seen after a power loss or storage corruption, until the
     /// next writer repairs it.
     TICKERTAPE_HEAD_INVALID = 2,
+    /// A state this version of the C ABI does not name (not returned by a library built from one source tree).
+    /// Treat it as unknown, not as a healthy head.
+    TICKERTAPE_HEAD_OTHER = 255,
 }
 
 /// Why the checkpoint marker cannot be used (`checkpoint_problem`). Any value but `TICKERTAPE_CHECKPOINT_USABLE`
@@ -121,6 +124,9 @@ pub enum tickertape_beacon_state {
     TICKERTAPE_BEACON_UNREADABLE = 4,
     /// The name was replaced by another file during every attempt to observe it: nothing is reported.
     TICKERTAPE_BEACON_CHANGING = 5,
+    /// A state this version of the C ABI does not name (not returned by a library built from one source tree).
+    /// Nothing is reported, as for `TICKERTAPE_BEACON_CHANGING`.
+    TICKERTAPE_BEACON_OTHER = 255,
 }
 
 /// Whether the beacon directory could be listed (`readers_dir_state`).
@@ -134,6 +140,8 @@ pub enum tickertape_readers_dir_state {
     TICKERTAPE_READERS_DIR_MISSING = 1,
     /// It exists but could not be listed (not a directory, no permission, an I/O error). No beacons are reported.
     TICKERTAPE_READERS_DIR_UNUSABLE = 2,
+    /// A state this version of the C ABI does not name (not returned by a library built from one source tree).
+    TICKERTAPE_READERS_DIR_OTHER = 255,
 }
 
 /// One sample of a journal's operational state (an opaque, immutable handle): what `tickertape status` prints.
@@ -496,9 +504,8 @@ pub(crate) fn head_end_of(end: HeadEnd) -> (tickertape_head_end, tickertape_corr
         HeadEnd::Open => (H::TICKERTAPE_HEAD_OPEN, R::TICKERTAPE_CORRUPT_NONE),
         HeadEnd::Sealed => (H::TICKERTAPE_HEAD_SEALED, R::TICKERTAPE_CORRUPT_NONE),
         HeadEnd::Invalid(reason) => (H::TICKERTAPE_HEAD_INVALID, corrupt_reason_of(&reason)),
-        // Added to the core after this mapping (the tests name every variant): reported as invalid bytes, never as
-        // a healthy head.
-        _ => (H::TICKERTAPE_HEAD_INVALID, R::TICKERTAPE_CORRUPT_UNKNOWN),
+        // Added to the core after this mapping (the tests name every variant).
+        _ => (H::TICKERTAPE_HEAD_OTHER, R::TICKERTAPE_CORRUPT_NONE),
     }
 }
 
@@ -541,8 +548,8 @@ pub(crate) fn beacon_state_of(state: BeaconState) -> tickertape_beacon_state {
         BeaconState::Invalid => B::TICKERTAPE_BEACON_INVALID,
         BeaconState::Unreadable => B::TICKERTAPE_BEACON_UNREADABLE,
         BeaconState::Changing => B::TICKERTAPE_BEACON_CHANGING,
-        // Added to the core after this mapping: reported like `Changing`, with nothing that was seen.
-        _ => B::TICKERTAPE_BEACON_CHANGING,
+        // Added to the core after this mapping: reported with nothing that was seen, like `Changing`.
+        _ => B::TICKERTAPE_BEACON_OTHER,
     }
 }
 
@@ -551,8 +558,9 @@ pub(crate) fn readers_dir_state_of(state: BeaconDirState) -> tickertape_readers_
     match state {
         BeaconDirState::Listed => D::TICKERTAPE_READERS_DIR_LISTED,
         BeaconDirState::Missing => D::TICKERTAPE_READERS_DIR_MISSING,
-        // Unusable, and a state added to the core later: no beacons are reported.
-        _ => D::TICKERTAPE_READERS_DIR_UNUSABLE,
+        BeaconDirState::Unusable(_) => D::TICKERTAPE_READERS_DIR_UNUSABLE,
+        // Added to the core after this mapping.
+        _ => D::TICKERTAPE_READERS_DIR_OTHER,
     }
 }
 
@@ -639,7 +647,11 @@ fn beacon_of(r: &ReaderStatus) -> tickertape_beacon_status {
         oldest_unread_local_ts_ns: known(r.oldest_unread_local_ts_ns),
         unread_age_ns: known_ns(r.unread_age),
     };
-    if state == tickertape_beacon_state::TICKERTAPE_BEACON_CHANGING {
+    if matches!(
+        state,
+        tickertape_beacon_state::TICKERTAPE_BEACON_CHANGING
+            | tickertape_beacon_state::TICKERTAPE_BEACON_OTHER
+    ) {
         // No contents and no lag, as the core reports `Changing` (and for a state added to the core later).
         out.update_age_ns = TICKERTAPE_UNKNOWN;
         out.lag_records = TICKERTAPE_UNKNOWN;

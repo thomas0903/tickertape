@@ -102,8 +102,9 @@ pub fn head_end(end: HeadEnd) -> &'static str {
         HeadEnd::Open => "open",
         HeadEnd::Sealed => "sealed",
         HeadEnd::Invalid(_) => "invalid",
-        // Added to the core after this mapping (the tests named in the module docs fail).
-        _ => "unknown",
+        // Added to the core after this mapping (the tests named in the module docs fail), as the C ABI's
+        // `TICKERTAPE_HEAD_OTHER`.
+        _ => "other",
     }
 }
 
@@ -112,7 +113,8 @@ pub fn readers_dir_state(state: BeaconDirState) -> &'static str {
         BeaconDirState::Listed => "listed",
         BeaconDirState::Missing => "missing",
         BeaconDirState::Unusable(_) => "unusable",
-        _ => "unknown",
+        // As the C ABI's `TICKERTAPE_READERS_DIR_OTHER`.
+        _ => "other",
     }
 }
 
@@ -120,7 +122,7 @@ fn lag_unknown(reason: LagUnknown) -> &'static str {
     reason.code()
 }
 
-/// One sample of a journal (an opaque native object; `tickertape.status` returns it inside a `JournalStatus`).
+/// One sample of a journal (an opaque native object; `JournalStatus.sample` returns it inside a `JournalStatus`).
 #[pyclass(frozen, module = "tickertape._native")]
 #[derive(Debug)]
 pub struct StatusSample {

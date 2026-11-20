@@ -20,7 +20,7 @@ import tickertape as tt
 
 with tt.Writer("/tmp/journal") as writer:
     seq = writer.append(b"hello", schema_id=1, local_ts_ns=time.time_ns())
-    seqs = writer.append_many([b"a", b"b", b"c"], schema_id=[2, 2, 3])  # one call, returns range(1, 4)
+    seqs = writer.append_batch([b"a", b"b", b"c"], schema_id=[2, 2, 3])  # one call, returns range(1, 4)
     writer.checkpoint()  # durable, not only visible
 
 with tt.Reader("/tmp/journal") as reader:
@@ -54,17 +54,17 @@ checkpoint error as an incident.
 
 ## Batches and columns
 
-`append_many(payloads, *, schema_id, venue_ts_ns, local_ts_ns)` takes an iterable of payloads (not a single `bytes`,
+`append_batch(payloads, *, schema_id, venue_ts_ns, local_ts_ns)` takes an iterable of payloads (not a single `bytes`,
 `bytearray`, `memoryview` or other bytes-like object, and not a `str`: those raise `TypeError`). Each metadata
 argument is one int for all records or an iterable with exactly one per record. All arguments are converted and
 their lengths checked before anything is appended, so a bad argument appends nothing. A record can still fail during
 the append, for example one that doesn't fit in a segment (`RecordTooLargeError`) or a full disk
-(`StorageFullError`). Then `append_many` raises `BatchAppendError`: `payloads[:e.appended]` were appended (from
+(`StorageFullError`). Then `append_batch` raises `BatchAppendError`: `payloads[:e.appended]` were appended (from
 sequence number `e.first_seq`), the rest were not, and `e.__cause__` is the error.
 
 To retry after resolving the cause, pass `payloads[e.failed_index:]` and slice every per-record metadata sequence at
 the same index (`schema_id=schema_ids[e.failed_index:]`, ...); a single-int metadata value needs no slicing.
-`append_many` consumes its arguments, so if you may retry, pass lists, tuples or arrays, not one-shot iterators or
+`append_batch` consumes its arguments, so if you may retry, pass lists, tuples or arrays, not one-shot iterators or
 generators. An exception raised by an argument's iterator (including `KeyboardInterrupt`) propagates as it is, with
 nothing appended. A closed writer, or one used in a forked child, raises before consuming any argument.
 
@@ -184,7 +184,7 @@ example from a `multiprocessing` worker); `JournalIOError.strerror` is the OS me
 ## Inspection
 
 `tt.verify(path)`, `tt.list_segments(path)` and `tt.read_checkpoint(path)` never take the writer lock and are safe
-while a writer runs. So is `tt.status(path)`, the sample that `tickertape status` prints (head, checkpoint age,
+while a writer runs. So is `tt.JournalStatus.sample(path)`, the sample that `tickertape status` prints (head, checkpoint age,
 exposure, storage headroom, reader beacons); `Writer.metrics()` and `Reader.metrics(status)` add what only the writer
 knows and a reader's lag. Unknown values are `None`, never guesses.
 

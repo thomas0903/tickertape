@@ -2,11 +2,13 @@
 //!
 //! This module mirrors `docs/format.md` and is the only place that knows byte offsets. It never touches files or
 //! memory maps and contains no `unsafe`, so it runs under Miri and is the target of the fuzzers. Most users never
-//! need it; it is public for tools that decode journals themselves.
+//! need it; it is public for tools that decode journals themselves. The constants, the header types
+//! (`SegmentHeader`, `RecordHeader`, `CheckpointSlot`) and the encoders and decoders are covered by the compatibility promise (`docs/compatibility.md`); the segment scanning
+//! helpers that recovery and `verify` use are crate-private or `#[doc(hidden)]`.
 //!
 //! Live mappings are shared with other processes, so (ADR 0003) nothing here takes a slice that covers a commit
 //! word or a whole live segment. Single-record functions take the commit word as a value and the record **body**
-//! (`[P+4, P+len)`) as a slice. Whole-segment functions go through [`SegmentView`], which an in-memory image and the
+//! (`[P+4, P+len)`) as a slice. Whole-segment functions go through `SegmentView`, which an in-memory image and the
 //! crate's mapping wrapper both implement.
 
 use crate::error::CorruptReason;
@@ -441,6 +443,9 @@ pub(crate) fn decode_checkpoint_slot(buf: &[u8]) -> Option<CheckpointSlot> {
 /// least everything written before that commit word was stored (ADR 0003). Implementations over live shared memory
 /// never hand out slices that another process may still write; they copy, unless (as for the writer) no other
 /// process writes the file.
+// Hidden: not covered by the compatibility promise (docs/compatibility.md → Rust API). Public only for the
+// workspace's integration tests (`tests/`) and the fuzz targets, which scan segment images.
+#[doc(hidden)]
 pub trait SegmentView {
     /// Total size in bytes.
     fn len(&self) -> u64;
@@ -481,6 +486,9 @@ impl SegmentView for [u8] {
 }
 
 /// What [`read_slot`] found at a position.
+// Hidden: not covered by the compatibility promise (docs/compatibility.md → Rust API). Public only for the
+// workspace's integration tests (`tests/`) and the fuzz targets, which scan segment images.
+#[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Slot {
     /// Commit word 0: no record (yet).
@@ -500,6 +508,9 @@ pub enum Slot {
 
 /// Reads and fully validates the slot at `offset` of a segment, expecting sequence number `expected_seq`
 /// (`docs/format.md` → Record, Seal).
+// Hidden: not covered by the compatibility promise (docs/compatibility.md → Rust API). Public only for the
+// workspace's integration tests (`tests/`) and the fuzz targets, which scan segment images.
+#[doc(hidden)]
 pub fn read_slot<V: SegmentView + ?Sized>(
     segment: &V,
     offset: u64,
@@ -608,6 +619,9 @@ fn decode_record_in_pieces<V: SegmentView + ?Sized>(
 }
 
 /// Where a forward scan of one segment stopped.
+// Hidden: not covered by the compatibility promise (docs/compatibility.md → Rust API). Public only for the
+// workspace's integration tests (`tests/`) and the fuzz targets, which scan segment images.
+#[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScanEnd {
     /// A zero commit word: the clean end of the written part.
@@ -619,6 +633,9 @@ pub enum ScanEnd {
 }
 
 /// The result of [`scan_segment`].
+// Hidden: not covered by the compatibility promise (docs/compatibility.md → Rust API). Public only for the
+// workspace's integration tests (`tests/`) and the fuzz targets, which scan segment images.
+#[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScanResult {
     /// Offset of the first slot that is not a valid record.
@@ -634,6 +651,9 @@ pub struct ScanResult {
 /// Scans a segment from `start_offset`, expecting `start_seq` there, validating each record, and reports where the
 /// valid run ends. Used by writer recovery, `verify` and the fuzzers.
 /// A record with sequence `u64::MAX` stops the scan as invalid because it has no representable successor.
+// Hidden: not covered by the compatibility promise (docs/compatibility.md → Rust API). Public only for the
+// workspace's integration tests (`tests/`) and the fuzz targets, which scan segment images.
+#[doc(hidden)]
 pub fn scan_segment<V: SegmentView + ?Sized>(
     segment: &V,
     start_offset: u64,
@@ -683,7 +703,7 @@ pub fn scan_segment<V: SegmentView + ?Sized>(
 /// part of a segment ends (`docs/format.md` → Recovery, ADR 0035).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum LaterHistory {
+pub(crate) enum LaterHistory {
     /// A record at `offset` that validates completely (length, CRC32C, flags) with sequence number `seq`, which is
     /// above the empty slot's expected sequence number by no more than the records the space between them can hold.
     Record {
@@ -715,7 +735,7 @@ pub enum LaterHistory {
 
 impl LaterHistory {
     /// The sequence number this evidence carries.
-    pub fn seq(&self) -> u64 {
+    pub(crate) fn seq(&self) -> u64 {
         match *self {
             LaterHistory::Record { seq, .. } | LaterHistory::Unchecked { seq, .. } => seq,
             LaterHistory::Seal { next_seq, .. } => next_seq,
@@ -724,7 +744,7 @@ impl LaterHistory {
 
     /// How recovery and `verify` report this evidence: [`CorruptReason::EmptyCommitWord`] for a record or seal that
     /// validated, [`CorruptReason::UncheckedTail`] when the search stopped at its work bound before deciding.
-    pub fn reason(&self) -> CorruptReason {
+    pub(crate) fn reason(&self) -> CorruptReason {
         match *self {
             LaterHistory::Unchecked { seq, .. } => CorruptReason::UncheckedTail(seq),
             _ => CorruptReason::EmptyCommitWord(self.seq()),
@@ -737,7 +757,7 @@ const ZERO_SCAN_CHUNK: u64 = 1 << 20;
 
 /// The end (exclusive) of the last non-zero byte in `[from, len)` of `segment`, or `None` if all of it is zero (or
 /// `from` is out of bounds). Reads backwards in 1 MiB chunks, so a windowed view never needs more than one chunk.
-pub fn nonzero_end<V: SegmentView + ?Sized>(segment: &V, from: u64) -> Option<u64> {
+pub(crate) fn nonzero_end<V: SegmentView + ?Sized>(segment: &V, from: u64) -> Option<u64> {
     let mut end = segment.len();
     while end > from {
         let start = end.saturating_sub(ZERO_SCAN_CHUNK).max(from);
@@ -784,7 +804,7 @@ pub fn nonzero_end<V: SegmentView + ?Sized>(segment: &V, from: u64) -> Option<u6
 /// [`LaterHistory::Unchecked`]), plus one CRC of 12 bytes for each of at most [`SEAL_SEARCH_RECORDS`] next sequence
 /// numbers for a final seal (inside the same bound), and, once,
 /// CRC32C over the torn frame at `offset` up to the first candidate and up to the last non-zero byte.
-pub fn find_history_after_empty<V: SegmentView + ?Sized>(
+pub(crate) fn find_history_after_empty<V: SegmentView + ?Sized>(
     segment: &V,
     offset: u64,
     expected_seq: u64,
@@ -883,7 +903,7 @@ pub(crate) fn find_history_before<V: SegmentView + ?Sized>(
 /// lost too. Each number tried is a `2^-32` chance match for a torn payload that ends, as far as it was written, in a
 /// seal marker at an 8-byte-aligned position and four arbitrary bytes, followed only by zeros, so this bounds that
 /// false positive by `2^-25`.
-pub const SEAL_SEARCH_RECORDS: u64 = 128;
+pub(crate) const SEAL_SEARCH_RECORDS: u64 = 128;
 
 /// CRC32C bytes per sequence number tried by the final-seal search (the marker and the sequence number).
 const SEAL_CRC_BYTES: u64 = 12;

@@ -142,7 +142,7 @@ def test_edge_payloads_and_metadata(journal: Path, cli: Path) -> None:
     payloads = [bytes((i * 7 + n) & 0xFF for n in range(size)) for i, size in enumerate(sizes)]
     largest = SMALL_SEGMENT - 64 - 40 - 8  # header, record header, room for a seal
     with tt.Writer(journal, segment_size=SMALL_SEGMENT) as w:
-        w.append_many(payloads, schema_id=[0, 2**32 - 1] * 5 + [1],
+        w.append_batch(payloads, schema_id=[0, 2**32 - 1] * 5 + [1],
                       venue_ts_ns=[2**64 - 1] * len(sizes), local_ts_ns=list(range(len(sizes))))
         big = w.append(b"\xa5" * largest, schema_id=9)  # fills a fresh segment
         tail = w.append(b"after the big one", schema_id=10)

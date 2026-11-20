@@ -1,6 +1,7 @@
 # 0037: Java binding over the C ABI
 
-- **Status:** proposed (the Maven coordinates need the owner's agreement; the public API becomes stable at v1.0)
+- **Status:** accepted on 2026-11-20 by the maintainers under the owner's delegation (Maven coordinates
+  `io.github.thomas0903:tickertape`; the public API becomes stable at v1.0)
 - **Date:** 2026-11-20
 
 ## Context
@@ -102,7 +103,7 @@ alive forever: never cleaned, its journal locked for the life of the process. Th
 payload buffer's clean-up included, inside a catch of `Throwable`, records what it caught inside another, and returns
 non-zero; so nothing ever unwinds through native frames (an exception escaping an FFM upcall terminates the JVM).
 After the call, `appendWith` throws `FillAbortedException` with the filler's exception as its cause (an `Error` is
-rethrown as it is), or, if the abort's clean-up failed, the library's `JournalIoException` with the filler's exception
+rethrown as it is), or, if the abort's clean-up failed, the library's `JournalIOException` with the filler's exception
 as its cause. The `PayloadBuffer` is one object per writer, valid only on the thread running the filler and only while
 it runs: it records that thread when the fill begins, and every method throws `WrongThreadException` on any other
 thread and `IllegalStateException` after the filler returned. It writes through checked offsets into the mapped bytes,
@@ -308,10 +309,10 @@ fine on virtual threads.
 
 **Errors.** Unchecked: `TickertapeException extends RuntimeException`, like Chronicle Queue and Aeron, so appends and
 reads work inside lambdas and streams; every method documents what it throws. Each error status has its own subclass
-(`InvalidArgumentException`, `JournalIoException` with `osErrorCode()` and its subclass `StorageFullException`,
-`JournalLockedException`, `CorruptJournalException` with `reason()`, `UnsupportedFormatVersionException`,
-`JournalNotFoundException`, `SequenceUnavailableException`, `RecordTooLargeException`, `DurabilityLostException`,
-`SequenceExhaustedException`, `DiscardedHistoryException`, `InvalidConfigException`, `BufferTooSmallException` with
+(`InvalidArgumentException`, `JournalIOException` with `osErrorCode()` and its subclass `StorageFullException`,
+`LockedException`, `CorruptJournalException` with `reason()`, `UnsupportedVersionException`,
+`JournalNotFoundException`, `SeqUnavailableException`, `RecordTooLargeException`, `DurabilityLostException`,
+`SequenceExhaustedException`, `DiscardedException`, `InvalidConfigException`, `BufferTooSmallException` with
 `requiredBytes()`, `FillAbortedException`, `HandleBusyException`, `InternalErrorException`, and
 `BeaconInUseException`, which nothing throws until the C ABI creates reader beacons); a code the binding does not
 know (a newer library) is a plain `TickertapeException` with `Status.UNKNOWN` and the raw `code()`. `Status` and

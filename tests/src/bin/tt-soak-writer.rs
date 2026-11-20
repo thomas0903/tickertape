@@ -69,6 +69,7 @@ fn main() {
                 segment,
                 offset,
                 len,
+                ..
             } => {
                 format!("act zeroed {} {offset} {len} -", name(segment))
             }
@@ -78,6 +79,7 @@ fn main() {
                 len,
                 quarantine_file,
                 reason,
+                ..
             } => format!(
                 "act repaired {} {offset} {len} {} {reason:?}",
                 name(segment),
@@ -87,19 +89,22 @@ fn main() {
                 segment,
                 quarantine_file,
                 reason,
+                ..
             } => format!(
                 "act quarantined {} 0 0 {} {reason:?}",
                 name(segment),
                 quarantine_file.display()
             ),
-            RecoveryAction::Sealed { segment } => format!("act sealed {} 0 0 -", name(segment)),
-            RecoveryAction::CompletedRoll { segment } => {
+            RecoveryAction::Sealed { segment, .. } => format!("act sealed {} 0 0 -", name(segment)),
+            RecoveryAction::CompletedRoll { segment, .. } => {
                 format!("act completed {} 0 0 -", name(segment))
             }
-            RecoveryAction::RestoredHeader { segment } => {
+            RecoveryAction::RestoredHeader { segment, .. } => {
                 format!("act restoredheader {} 0 0 -", name(segment))
             }
-            RecoveryAction::RemovedTemp { file } => format!("act removedtemp {} 0 0 -", name(file)),
+            RecoveryAction::RemovedTemp { file, .. } => {
+                format!("act removedtemp {} 0 0 -", name(file))
+            }
             other => format!("act other - 0 0 {other:?}"),
         };
         writeln!(out, "{line}").unwrap();

@@ -2,8 +2,8 @@ package io.github.thomas0903.tickertape;
 
 /**
  * Whether a reader beacon's owner is running, and whether the beacon could be read. Each value's {@link #cName()} is
- * the C enumerator ({@code TICKERTAPE_BEACON_*}, ADR 0032). {@link #UNKNOWN} stands for a value from a newer library
- * that this binding does not name; it is not in the C header.
+ * the C enumerator ({@code TICKERTAPE_BEACON_*}, ADR 0032). {@link #OTHER} is a state the C ABI does not name (a newer
+ * library); this binding reports a code it does not know as {@link #OTHER} too.
  */
 public enum BeaconState {
     /** A process holds the beacon's lock. */
@@ -18,8 +18,8 @@ public enum BeaconState {
     UNREADABLE(4),
     /** The name was replaced during every attempt to observe it: nothing is reported. */
     CHANGING(5),
-    /** A value from a newer library that this binding does not name. */
-    UNKNOWN(-1);
+    /** A state the C ABI does not name ({@code TICKERTAPE_BEACON_OTHER}). */
+    OTHER(255);
 
     private final int code;
 
@@ -37,13 +37,13 @@ public enum BeaconState {
         return "TICKERTAPE_BEACON_" + name();
     }
 
-    /** The value for a C code; {@link #UNKNOWN} for a code this binding does not name. */
+    /** The value for a C code; {@link #OTHER} for a code this binding does not name. */
     public static BeaconState of(int code) {
         for (BeaconState v : values()) {
             if (v.code == code) {
                 return v;
             }
         }
-        return UNKNOWN;
+        return OTHER;
     }
 }

@@ -10,7 +10,7 @@ The roadmap ("Path to v1.0" → "Finish eliminating avoidable work") asks for an
 batched notifications, with explicit publication, partial-failure and latency semantics, shipping only what
 measurements support.
 
-Before this record the C ABI's `tickertape_writer_append_batch` and the Python binding's `Writer.append_many` each
+Before this record the C ABI's `tickertape_writer_append_batch` and the Python binding's `Writer.append_batch` each
 called `Writer::append` once per record. Each `append` does, for its one record:
 
 1. Checks the writer state and the sequence number, computes the frame length and checks that the record fits in the
@@ -100,7 +100,7 @@ Option 2: `Writer::append_batch(records) -> Result<Range<u64>, BatchError>`, whe
   its delay for the batch's first record grows by the time the writer takes to write the records up to that point.
   Callers for whom that matters keep batches short.
 
-The C ABI's `tickertape_writer_append_batch` (signature unchanged) and Python's `Writer.append_many` call
+The C ABI's `tickertape_writer_append_batch` (signature unchanged) and Python's `Writer.append_batch` call
 `append_batch`. The C function's `*appended_out` is set to the number appended when it returns; its documentation no
 longer says it is updated as each record commits (a caller could not observe that during the call). If the call
 unwinds inside the library (a bug), `*appended_out` still holds the number of records committed before the record

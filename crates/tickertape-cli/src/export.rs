@@ -233,7 +233,7 @@ fn capture(reader: &mut Reader, to: Option<u64>, end_seq: Option<u64>) -> Scan {
                 break Some(changed(CHECKPOINT_CHANGED));
             }
             Ok(None) => break None,
-            Err(Error::Discarded { seq }) => {
+            Err(Error::Discarded { seq, .. }) => {
                 if let Err(failure) = resume(reader, seq) {
                     break Some(failure);
                 }
@@ -264,7 +264,7 @@ impl<'r> Pass<'r> {
         while scan.count > 0 && first.is_none() {
             match reader.next_owned() {
                 Ok(record) => first = Some(record.ok_or_else(|| changed(MISSING))?),
-                Err(Error::Discarded { seq }) => resume(reader, seq)?,
+                Err(Error::Discarded { seq, .. }) => resume(reader, seq)?,
                 Err(error) => return Err(error.into()),
             }
         }
@@ -306,7 +306,7 @@ impl<'r> Pass<'r> {
                     written += 1;
                 }
                 Ok(None) => return Err(changed(MISSING)),
-                Err(Error::Discarded { seq }) => resume(self.reader, seq)?,
+                Err(Error::Discarded { seq, .. }) => resume(self.reader, seq)?,
                 Err(error) => return Err(error.into()),
             }
         }

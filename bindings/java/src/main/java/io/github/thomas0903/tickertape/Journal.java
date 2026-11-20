@@ -34,7 +34,7 @@ public final class Journal {
      * @throws IllegalArgumentException if {@code dir} is not on the default file system (see
      *     {@linkplain Tickertape##paths Tickertape &rarr; Paths}, which also says how the path is passed)
      * @throws JournalNotFoundException if {@code dir} has no segments
-     * @throws JournalIoException if reading fails (with {@code ENOENT} if {@code dir} does not exist)
+     * @throws JournalIOException if reading fails (with {@code ENOENT} if {@code dir} does not exist)
      */
     public static VerifyReport verify(Path dir) {
         Objects.requireNonNull(dir, "dir");
@@ -59,8 +59,8 @@ public final class Journal {
      *     {@linkplain Tickertape##paths Tickertape &rarr; Paths}, which also says how the path is passed)
      * @throws JournalNotFoundException if there are no segments
      * @throws CorruptJournalException if a segment header is invalid
-     * @throws UnsupportedFormatVersionException if a segment has an unsupported format version
-     * @throws JournalIoException if reading fails
+     * @throws UnsupportedVersionException if a segment has an unsupported format version
+     * @throws JournalIOException if reading fails
      */
     public static List<SegmentInfo> listSegments(Path dir) {
         Objects.requireNonNull(dir, "dir");
@@ -98,7 +98,7 @@ public final class Journal {
      *
      * @throws IllegalArgumentException if {@code dir} is not on the default file system (see
      *     {@linkplain Tickertape##paths Tickertape &rarr; Paths}, which also says how the path is passed)
-     * @throws JournalIoException if the marker exists but cannot be read
+     * @throws JournalIOException if the marker exists but cannot be read
      */
     public static Optional<Checkpoint> readCheckpoint(Path dir) {
         Objects.requireNonNull(dir, "dir");
@@ -127,7 +127,7 @@ public final class Journal {
      *     {@linkplain Tickertape##paths Tickertape &rarr; Paths}, which also says how the path is passed)
      * @throws JournalNotFoundException if there are no segments
      * @throws CorruptJournalException if a segment header is invalid
-     * @throws JournalIoException if a removal fails (including an existing destination file for a move)
+     * @throws JournalIOException if a removal fails (including an existing destination file for a move)
      */
     public static RetentionReport applyRetention(Path dir, Retention retention, boolean dryRun) {
         Objects.requireNonNull(dir, "dir");

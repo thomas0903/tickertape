@@ -116,7 +116,7 @@ fn reference(events: &[Event]) -> Value {
     let gap = events.windows(2).filter(|p| p[0].local != 0 && p[1].local != 0 && p[1].local >= p[0].local)
         .min_by_key(|p| (std::cmp::Reverse(p[1].local - p[0].local), p[0].seq))
         .map(|p| json!({"gap_s": (p[1].local - p[0].local) as f64 / SECOND as f64, "from_seq": p[0].seq, "to_seq": p[1].seq}));
-    json!({"totals": {"records": events.len(), "first_seq": events.first().map(|e| e.seq), "last_seq": events.last().map(|e| e.seq),
+    json!({"schema_version": 1, "totals": {"records": events.len(), "first_seq": events.first().map(|e| e.seq), "last_seq": events.last().map(|e| e.seq),
         "payload_bytes": lengths.iter().sum::<u64>()}, "schemas": schemas,
         "payload_length": {"min_bytes": lengths.first(), "p50_bytes": percentile(50), "p90_bytes": percentile(90), "p99_bytes": percentile(99), "max_bytes": lengths.last()},
         "venue_ts": time_reference(events, |e| e.venue), "local_ts": time_reference(events, |e| e.local), "largest_local_gap": gap})
@@ -133,6 +133,10 @@ fn check(dir: &TempDir, args: &[&str], events: &[Event]) {
     let bytes = &result.get_output().stdout;
     assert_eq!(bytes.last(), Some(&b'\n'));
     assert_eq!(bytes.iter().filter(|&&b| b == b'\n').count(), 1);
+    assert!(
+        bytes.starts_with(b"{\"schema_version\":1,"),
+        "schema_version first"
+    );
     let actual: Value = serde_json::from_slice(bytes).unwrap();
     // Normalize the reference through the same JSON wire representation for floating-point round trips.
     let expected: Value =

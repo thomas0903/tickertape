@@ -52,8 +52,8 @@ def write(journal: Path, follower: subprocess.Popen[str]) -> int:
                 payloads.append(struct.pack(TRADE_FORMAT, 10_000 + i % 50, 1 + i % 7))
                 schemas.append(TRADE if is_trade else QUOTE)
                 venue.append(1_700_000_000_000_000_000 + (second * 2_000 + i) * 1_000)
-            # One call per batch. Each record is visible to readers when append_many returns...
-            seqs = writer.append_many(payloads, schema_id=schemas, venue_ts_ns=venue, local_ts_ns=time.time_ns())
+            # One call per batch. Each record is visible to readers when append_batch returns...
+            seqs = writer.append_batch(payloads, schema_id=schemas, venue_ts_ns=venue, local_ts_ns=time.time_ns())
             # ...and durable once a later checkpoint returns.
             writer.checkpoint()
             print(f"appended {seqs.start}..{seqs.stop - 1}, checkpointed")

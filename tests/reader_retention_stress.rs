@@ -260,7 +260,9 @@ fn reposition(shared: &Shared<'_>, reader: &mut Reader, mut target: u64) -> u64 
     loop {
         match reader.seek(target) {
             Ok(()) => return target,
-            Err(Error::SeqUnavailable { requested, first }) => {
+            Err(Error::SeqUnavailable {
+                requested, first, ..
+            }) => {
                 shared.unavailable.fetch_add(1, Ordering::SeqCst);
                 assert_eq!(requested, target);
                 assert!(first > target, "first {first} <= requested {target}");
@@ -288,7 +290,7 @@ fn follow(shared: &Shared<'_>, progress: &AtomicU64, mapped: bool, slow: bool, d
                 }
             }
             Ok(None) => {}
-            Err(Error::Discarded { seq }) => {
+            Err(Error::Discarded { seq, .. }) => {
                 shared.discarded.fetch_add(1, Ordering::SeqCst);
                 assert_eq!(seq, expected);
                 expected = reposition(shared, &mut reader, seq);
@@ -318,7 +320,7 @@ fn seek_loop(shared: &Shared<'_>, progress: &AtomicU64, mapped: bool, rng: &mut 
                             check_record(&record);
                         }
                         Ok(None) => break,
-                        Err(Error::Discarded { seq }) => {
+                        Err(Error::Discarded { seq, .. }) => {
                             shared.discarded.fetch_add(1, Ordering::SeqCst);
                             assert_eq!(seq, target + i);
                             break;
@@ -327,7 +329,9 @@ fn seek_loop(shared: &Shared<'_>, progress: &AtomicU64, mapped: bool, rng: &mut 
                     }
                 }
             }
-            Err(Error::SeqUnavailable { requested, first }) => {
+            Err(Error::SeqUnavailable {
+                requested, first, ..
+            }) => {
                 shared.unavailable.fetch_add(1, Ordering::SeqCst);
                 assert_eq!(requested, target);
                 assert!(first > target, "first {first} <= requested {target}");
@@ -352,7 +356,7 @@ fn reopen_loop(shared: &Shared<'_>, progress: &AtomicU64, mapped: bool, rng: &mu
                     check_record(&record);
                 }
                 Ok(None) => break,
-                Err(Error::Discarded { seq }) => {
+                Err(Error::Discarded { seq, .. }) => {
                     shared.discarded.fetch_add(1, Ordering::SeqCst);
                     assert_eq!(seq, first + i);
                     break;
@@ -789,7 +793,7 @@ fn durable_follow(shared: &Repairs<'_>, mapped: bool, slow: bool) -> Vec<(u64, u
                 }
             }
             Ok(None) => {}
-            Err(Error::Discarded { seq }) => {
+            Err(Error::Discarded { seq, .. }) => {
                 shared.discarded.fetch_add(1, Ordering::SeqCst);
                 assert_eq!(seq, expected);
                 expected = seek_or_oldest(&mut reader, seq);
@@ -848,7 +852,7 @@ fn visible_follow(shared: &Repairs<'_>, mapped: bool) {
                 expected += 1;
             }
             Ok(None) => {}
-            Err(Error::Discarded { seq }) => {
+            Err(Error::Discarded { seq, .. }) => {
                 assert_eq!(seq, expected);
                 expected = seek_or_oldest(&mut reader, seq);
                 previous = None;

@@ -5,6 +5,48 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
+- The "Before 1.0" list of `docs/compatibility.md` is resolved except for what the release itself does (ADR 0043,
+  now accepted, effective at 1.0):
+  - Changed (Rust API): the `format` module's recovery helpers `nonzero_end`, `find_history_after_empty`,
+    `LaterHistory` and `SEAL_SEARCH_RECORDS` are crate-private. The scanning helpers `SegmentView`, `read_slot`,
+    `Slot`, `scan_segment`, `ScanResult` and `ScanEnd` (released in v0.4.0) stay public for the workspace's tests and
+    fuzz targets but are `#[doc(hidden)]` and not covered by the compatibility promise. The struct-like variants of
+    `Error`, `CorruptReason` and `RecoveryAction` are `#[non_exhaustive]`: patterns need `..`, and only the crate
+    builds them. A hidden `samples` module and hidden `Error::io` and `Error::corrupt` give the tests of the C ABI
+    and the Python bindings one value of each variant (not covered either).
+  - Added (C ABI): `TICKERTAPE_HEAD_OTHER`, `TICKERTAPE_BEACON_OTHER` and `TICKERTAPE_READERS_DIR_OTHER` (255), where
+    a state the core adds later lands; before, such a state was reported as `TICKERTAPE_HEAD_INVALID`,
+    `TICKERTAPE_BEACON_CHANGING` or `TICKERTAPE_READERS_DIR_UNUSABLE`. C++ `HeadEnd::other`, `BeaconState::other`
+    and `ReadersDirState::other`; Java `HeadEnd.OTHER`, `BeaconState.OTHER` and `ReadersDirState.OTHER` (255) replace
+    `UNKNOWN` (-1); Python reports `"other"` instead of `"unknown"` for `Head.end` and `readers_dir_state`. A build
+    from one source tree returns none of them.
+  - Changed (CLI): `verify --json`, `inspect --json`, `stats --json` and `archive --json` start with
+    `"schema_version":1`, as `status --json` does; `docs/cli.md` states the rule (fields may be added; removing one
+    or changing its meaning bumps the command's version). Tests assert it for each command, and `archive --json`'s
+    `base_seq`, `size_bytes` and `sealed_unix_ns`.
+  - Changed (bindings, unreleased names): the bindings use the Rust name in their own case convention:
+
+    | Binding | Before | Now |
+    |---|---|---|
+    | Java | `DiscardedHistoryException` | `DiscardedException` |
+    | Java | `SequenceUnavailableException` | `SeqUnavailableException` |
+    | Java | `UnsupportedFormatVersionException` | `UnsupportedVersionException` |
+    | Java | `JournalLockedException` | `LockedException` |
+    | Java | `JournalIoException` | `JournalIOException` |
+    | Java | `HeadEnd.UNKNOWN`, `BeaconState.UNKNOWN`, `ReadersDirState.UNKNOWN` (-1) | `.OTHER` (255) |
+    | Python | `tickertape.status(path, readers_dir=None)` | `tickertape.JournalStatus.sample(path, readers_dir=None)` |
+    | Python | `Writer.append_many` | `Writer.append_batch` |
+    | Python | `Retention.archive(directory, ...)` | `Retention.move_to(directory, ...)` |
+    | Python | `Retention.archive_dir` | `Retention.move_to_directory` |
+    | Python | `"unknown"` in `Head.end` and `readers_dir_state` | `"other"` |
+
+  - Decisions: ADRs 0029 (the PyPI project name `tickertape`), 0032, 0033, 0037 (Maven coordinates
+    `io.github.thomas0903:tickertape`), 0038 and 0043 are accepted (by the maintainers under the owner's delegation,
+    2026-11-20); ADR 0042 stays proposed. The zero-copy reader's known limitation ships in 1.0 as a documented
+    limitation. What remains before 1.0: ADR 0042, the features no binding reaches yet (background checkpoints
+    through the C ABI and the bindings, `Sampler`, beacons), the ABI version and baseline freeze, the 1.0 fixtures
+    and the release-candidate exercise.
+
 - Docs: `docs/compatibility.md`, the 1.0 compatibility contract (ADR 0043, **proposed**): for the Rust API (its public
   items by module, what is `#[non_exhaustive]`, what is test-only and not covered, the MSRV policy), the C ABI, the
   C++ header, the Python and Java bindings, the CLI's machine-readable outputs and exit statuses, the on-disk format

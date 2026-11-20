@@ -87,7 +87,7 @@ impl Payload {
     }
 }
 
-/// A metadata argument of `append_many`: one value for every record, or one per record.
+/// A metadata argument of `append_batch`: one value for every record, or one per record.
 enum Column<T> {
     All(T),
     Each(Vec<T>),
@@ -209,7 +209,7 @@ fn check_payloads_container(payloads: &Bound<'_, PyAny>) -> PyResult<()> {
             .is_ok();
     if single {
         return Err(PyTypeError::new_err(format!(
-            "append_many takes an iterable of payloads, not a single {} (use append for one payload, or pass \
+            "append_batch takes an iterable of payloads, not a single {} (use append for one payload, or pass \
              iter(...) to append the rows of an array)",
             payloads.get_type().name()?
         )));
@@ -368,7 +368,7 @@ impl Writer {
     /// raises `BatchAppendError`: records `[0, appended)` are committed (with sequence numbers starting at
     /// `first_seq`), the rest are not, and the underlying error is its `__cause__`.
     #[pyo3(signature = (payloads, *, schema_id=None, venue_ts_ns=None, local_ts_ns=None))]
-    fn append_many<'py>(
+    fn append_batch<'py>(
         &self,
         py: Python<'py>,
         payloads: &Bound<'py, PyAny>,

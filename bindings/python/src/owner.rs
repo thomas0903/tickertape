@@ -267,7 +267,7 @@ mod tests {
             "Reader::__iter__",
             "ReaderIterator::__next__",
             "Writer::append",
-            "Writer::append_many",
+            "Writer::append_batch",
             "Writer::next_seq",
         ] {
             assert!(

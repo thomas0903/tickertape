@@ -371,6 +371,11 @@ enum tickertape_head_end
    * next writer repairs it.
    */
   TICKERTAPE_HEAD_INVALID = 2,
+  /**
+   * A state this version of the C ABI does not name (not returned by a library built from one source tree).
+   * Treat it as unknown, not as a healthy head.
+   */
+  TICKERTAPE_HEAD_OTHER = 255,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L
@@ -548,6 +553,11 @@ enum tickertape_beacon_state
    * The name was replaced by another file during every attempt to observe it: nothing is reported.
    */
   TICKERTAPE_BEACON_CHANGING = 5,
+  /**
+   * A state this version of the C ABI does not name (not returned by a library built from one source tree).
+   * Nothing is reported, as for `TICKERTAPE_BEACON_CHANGING`.
+   */
+  TICKERTAPE_BEACON_OTHER = 255,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L
@@ -577,6 +587,10 @@ enum tickertape_readers_dir_state
    * It exists but could not be listed (not a directory, no permission, an I/O error). No beacons are reported.
    */
   TICKERTAPE_READERS_DIR_UNUSABLE = 2,
+  /**
+   * A state this version of the C ABI does not name (not returned by a library built from one source tree).
+   */
+  TICKERTAPE_READERS_DIR_OTHER = 255,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L

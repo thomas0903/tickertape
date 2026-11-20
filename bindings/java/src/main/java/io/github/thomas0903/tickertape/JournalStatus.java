@@ -133,8 +133,8 @@ public final class JournalStatus implements AutoCloseable {
      * @throws JournalNotFoundException if {@code dir} has no segments
      * @throws CorruptJournalException if the newest segment's header is invalid, or there is no segment but the
      *     checkpoint marker names one
-     * @throws UnsupportedFormatVersionException if the newest segment has an unsupported format version
-     * @throws JournalIoException if reading fails
+     * @throws UnsupportedVersionException if the newest segment has an unsupported format version
+     * @throws JournalIOException if reading fails
      */
     @SuppressWarnings("restricted") // reads the beacon names (at most 64 bytes and a NUL) the library returns
     public static JournalStatus sample(Path dir, Path readersDir) {

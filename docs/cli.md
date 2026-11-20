@@ -185,6 +185,11 @@ widths listed below; nullable fields use JSON `null`. Consumers must preserve u6
 is fixed for record JSONL; consumers of inspect/verify should use names. File names are basenames, converted to
 UTF-8 with replacement characters for non-UTF-8 names. Reason strings are human-readable diagnostics, not codes.
 
+Every `--json` document (`verify`, `inspect`, `stats`, `archive` and `status`) starts with `"schema_version":1`. Each
+command's schema is versioned on its own. Within a version, fields may be added and, where this page says a set may
+grow, enumerated string values; consumers must ignore fields they do not know. Removing a field or changing its
+meaning bumps that command's `schema_version`. Record JSONL has no `schema_version`: its keys are fixed.
+
 ### Record JSONL (`tail --format json`, `export --format jsonl`)
 
 Exactly one object per record, keys in this order:
@@ -199,7 +204,7 @@ with padding (empty payload becomes `""`). No wrapper, metadata lines or summary
 ### `verify --json`
 
 ```text
-{"segments":u64,"records":u64,"first_seq":u64|null,"last_seq":u64|null,
+{"schema_version":1,"segments":u64,"records":u64,"first_seq":u64|null,"last_seq":u64|null,
  "problems":[{"file":string,"offset":u64,"reason":string}, ...]}
 ```
 
@@ -209,7 +214,7 @@ journal may contain valid records in later segments; totals do not imply a conti
 ### `inspect --json`
 
 ```text
-{"segments":[{"file":string,"base_seq":u64|null,"size_bytes":u64|null,
+{"schema_version":1,"segments":[{"file":string,"base_seq":u64|null,"size_bytes":u64|null,
  "created_unix_ns":u64|null,"created_utc":string|null,"records":u64,"end_seq":u64,
  "used_bytes":u64,"used_percent":number|null,"end_state":"sealed"|"open"|"damaged"|"unknown"}, ...],
  "totals":{"segments":u64,"records":u64,"first_seq":u64|null,"last_seq":u64|null},
@@ -225,7 +230,7 @@ is `100 * used_bytes / size_bytes`. `unknown` reserves handling of future librar
 ### `stats --json`
 
 ```text
-{"totals":{"records":u64,"first_seq":u64|null,"last_seq":u64|null,"payload_bytes":u64},
+{"schema_version":1,"totals":{"records":u64,"first_seq":u64|null,"last_seq":u64|null,"payload_bytes":u64},
  "schemas":[{"schema_id":u32,"records":u64,"share_percent":number,"payload_bytes":u64,
  "min_payload_bytes":u64,"mean_payload_bytes":number,"max_payload_bytes":u64}, ...],
  "payload_length":{"min_bytes":u64|null,"p50_bytes":u64|null,"p90_bytes":u64|null,
@@ -268,7 +273,7 @@ A field with no set timestamps likewise has null time summaries and zero counts/
 ### `archive --json`
 
 ```text
-{"dry_run":bool,
+{"schema_version":1,"dry_run":bool,
  "segments":[{"file":string,"base_seq":u64,"size_bytes":u64,"sealed_unix_ns":u64,
               "reasons":["max_segments"|"max_bytes"|"max_age", ...]}, ...],
  "report":{"removed_segments":u64,"removed_bytes":u64,"already_removed_segments":u64}|null}
