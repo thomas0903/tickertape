@@ -117,6 +117,73 @@ records/s includes appends, per-call instrumentation and dirty checkpoints, excl
 writer opening and the final empty checkpoint. Durations use a monotonic clock.
 The filesystem and storage determine what sync costs; this is not a power-loss test.
 
+## Replay and recovery at scale (`tt-scale`)
+
+```sh
+cargo run -p tickertape-bench --release --bin tt-scale -- --help
+cargo run -p tickertape-bench --release --bin tt-scale -- run --dir /tmp/tt-scale --segments 1000 --segment-size 65536 --repeats 2
+```
+
+`tt-scale build` generates a journal of exactly the requested number of segments (all full but the newest, which is
+`--fill-last` percent full) with fixed-size records and leaves a checkpoint at its end; `measure` times, each in a
+process of its own: `list-segments`, `reader-open`, `seek-first`/`seek-middle`/`seek-last` (the seek and the first
+record after it), `replay` (safe reader), `verify`, `retention-plan` (a plan under a limit no journal reaches),
+`writer-open-clean`, `writer-open-after-kill` (after a child writer appended `--tail-records` records without a
+checkpoint and was killed with `SIGKILL`) and `writer-open-without-marker` (the marker moved aside). `run` is both.
+`measure` changes the journal (writer operations append and checkpoint), so repeated measurements see a few more
+records. ADR 0042 lists what each operation's cost grows with.
+
+Each run reports `wall_s`, `user_cpu_s`, `system_cpu_s`, `minor_faults`, `major_faults` (reads from storage),
+`peak_rss_bytes` (the operation's own peak: on Linux `VmHWM` after a reset, which includes mapped journal pages;
+on macOS `ru_maxrss`) and `cache_dropped`. Seeks add `seq` and `skipped_records` (records read before the target in
+its segment), replay `records_per_s` and `payload_bytes_per_s`, writer operations `scanned_from_seq`, `next_seq` and
+`recovery_actions`. The top level states `journal` (segments, bytes, records), `ram_bytes`,
+`cgroup_memory_max_bytes` (Linux), `cold_requested` and `cold_unavailable`.
+
+`--cold` drops the page cache before every run with `sudo -n` (Linux `drop_caches`, macOS `purge`); without
+password-less sudo the runs continue warm and say so. In a VM, dropping the guest's cache leaves the host's cache
+warm, so those runs are not storage-cold. On Linux, a journal larger than the memory a run may use can be had on a
+smaller machine with a cgroup limit (page cache counts against it), for example
+`sudo systemd-run --scope -p MemoryMax=1G -p MemorySwapMax=0 sudo -u "$USER" target/release/tt-scale measure ...`;
+a recorded run uses a machine whose RAM is smaller than the journal.
+
+### Cloud run (larger than RAM, local SSD)
+
+On a cloud VM with local SSD (the playbook's machine rules apply), with less RAM than the largest journal below and
+at least 100 GiB free on the SSD, for example a 4-vCPU, 16 GB machine with one local SSD:
+
+```sh
+sudo mkfs.ext4 -F -E lazy_itable_init=0,lazy_journal_init=0 /dev/nvme0n1   # the local SSD's device
+sudo mkdir -p /mnt/ssd && sudo mount /dev/nvme0n1 /mnt/ssd && sudo chown "$USER" /mnt/ssd
+sudo -n true                                   # cold runs need password-less sudo
+cargo build --release -p tickertape-bench --bin tt-scale
+T=target/release/tt-scale; OUT=~/tt-scale-out; mkdir -p "$OUT"
+# Segment count at a fixed segment size (1 MiB): 10 to 20,000 segments.
+for n in 10 1000 10000 20000; do
+  $T run --dir /mnt/ssd/seg-$n --segments $n --segment-size 1048576 --repeats 2 --json > "$OUT/seg-$n-warm.json"
+  $T measure --dir /mnt/ssd/seg-$n --cold --repeats 2 --json > "$OUT/seg-$n-cold.json"
+  rm -rf /mnt/ssd/seg-$n
+done
+# Segment size at a fixed count: 1 MiB to 1 GiB segments.
+for size in 1048576 16777216 134217728 1073741824; do
+  $T run --dir /mnt/ssd/size-$size --segments 10 --segment-size $size --repeats 2 --json > "$OUT/size-$size-warm.json"
+  $T measure --dir /mnt/ssd/size-$size --cold --repeats 2 --json > "$OUT/size-$size-cold.json"
+  rm -rf /mnt/ssd/size-$size
+done
+# Larger than RAM: 64 GiB at the default segment size (512 x 128 MiB).
+$T build --dir /mnt/ssd/big --segments 512 --segment-size 134217728 --json > "$OUT/big-build.json"
+$T measure --dir /mnt/ssd/big --cold --repeats 2 --json > "$OUT/big-cold.json"
+$T measure --dir /mnt/ssd/big --repeats 2 --json > "$OUT/big-warm.json"
+rm -rf /mnt/ssd/big
+```
+
+Check first that `cold_unavailable` is `false`, every cold run has `cache_dropped: true`, and `journal.bytes` of the
+big journal exceeds `ram_bytes`. Then read, per operation and segment count or size: `wall_s` and CPU time (how
+`reader-open`, the seeks, `writer-open-*`, `list-segments` and `retention-plan` grow with segments, and how
+`seek-last`, `replay`, `verify` and `writer-open-without-marker` grow with bytes); `major_faults` (what came from the
+SSD); `peak_rss_bytes` (whether memory stays bounded on the big journal); `records_per_s` of cold `replay` (catch-up
+rate from storage); and cold `seek-last` against cold `reader-open` (the cost a sparse index would remove, ADR 0042).
+
 ## Sustained workloads (`tt-sustained`)
 
 Design and rejected alternatives: [ADR 0026](../docs/decisions/0026-sustained-workloads.md).

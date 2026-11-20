@@ -190,8 +190,8 @@ impl Reader {
     }
 
     fn open_inner(dir: &Path, config: ReaderConfig, mapped: bool) -> Result<Reader> {
-        let (base, seg) = open_listed(dir, mapped, |segments| match segments.first() {
-            Some((base, _)) => Ok(*base),
+        let (base, seg) = open_listed(dir, mapped, 0, |bases| match bases.oldest {
+            Some(base) => Ok(base),
             None => Err(Error::NotFound {
                 dir: dir.to_path_buf(),
             }),
@@ -244,19 +244,16 @@ impl Reader {
     /// [`Error::Corrupt`] or [`Error::Io`] while locating it. An I/O "not found" error for a segment that `seek`
     /// listed is returned only if the chosen segment disappeared on each of 8 listings in a row.
     pub fn seek(&mut self, seq: u64) -> Result<()> {
-        let (base, seg) = open_listed(&self.dir, self.mapped, |segments| {
-            let Some((first, _)) = segments.first() else {
+        let (base, seg) = open_listed(&self.dir, self.mapped, seq, |bases| {
+            let Some(first) = bases.oldest else {
                 return Err(Error::NotFound {
                     dir: self.dir.clone(),
                 });
             };
-            match segments.iter().rev().find(|(b, _)| *b <= seq) {
-                Some((base, _)) => Ok(*base),
-                None => Err(Error::SeqUnavailable {
-                    requested: seq,
-                    first: *first,
-                }),
-            }
+            bases.floor.ok_or(Error::SeqUnavailable {
+                requested: seq,
+                first,
+            })
         })?;
         self.seg = seg;
         self.offset = format::SEGMENT_HEADER_LEN as u64;
@@ -840,27 +837,29 @@ impl Reader {
     }
 }
 
-/// Lists the segments, lets `choose` pick one, and opens it. If the chosen segment has disappeared by the time it is
-/// opened (retention or archiving removed it, or writer recovery quarantined it), lists again, so that `choose` sees
-/// the journal as it is now (and likewise if the listing was empty). Retention removes the oldest segments first, so
+/// Lists the segments, keeping only the oldest base and the newest base `<= seq` ([`journal::find_bases`]), lets
+/// `choose` pick one, and opens it. If the chosen segment has disappeared by the time it is opened (retention or
+/// archiving removed it, or writer recovery quarantined it), lists again, so that `choose` sees the journal as it is
+/// now (and likewise if the listing was empty). Retention removes the oldest segments first, so
 /// the second listing already reflects a removal; after [`LISTING_ATTEMPTS`] listings in a row whose chosen segment
 /// vanished, the last "not found" error is returned.
 fn open_listed(
     dir: &Path,
     mapped: bool,
-    choose: impl Fn(&[(u64, PathBuf)]) -> Result<u64>,
+    seq: u64,
+    choose: impl Fn(journal::Bases) -> Result<u64>,
 ) -> Result<(u64, OpenSegment)> {
     let mut attempts = 1;
     loop {
-        let segments = journal::list_segments(dir)?;
+        let bases = journal::find_bases(dir, seq)?;
         // On a live journal a directory read can come back empty: btrfs returns only entries that existed when the
         // directory was opened and still exist when it is read, so retention removing them all while new segments
         // are created leaves none. List again.
-        if segments.is_empty() && attempts < LISTING_ATTEMPTS {
+        if bases.oldest.is_none() && attempts < LISTING_ATTEMPTS {
             attempts += 1;
             continue;
         }
-        let base = choose(&segments)?;
+        let base = choose(bases)?;
         crate::fault::hook(crate::fault::Point::ReaderOpen);
         match open_segment(dir, base, mapped) {
             Err(e) if e.is_not_found() && attempts < LISTING_ATTEMPTS => attempts += 1,

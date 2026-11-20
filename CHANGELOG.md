@@ -5,6 +5,17 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
+- Replay and recovery at scale (ADR 0042, **proposed**): a new benchmark tool, `tt-scale` (`benches/README.md`),
+  builds a journal of a given segment count, segment size and payload and times, each in its own process, listing,
+  reader open, seeks to the first, middle and last record, replay, `verify`, a retention plan, and writer open after a
+  clean close, after a `SIGKILL` and without a checkpoint marker, with CPU time, page faults, peak RSS and whether the
+  page cache was dropped, as JSON. ADR 0042 records what each cost grows with and proposes, without building them, a
+  rebuildable sparse index for seeks, a bounded read of the newest segment's unwritten part at writer open, and fewer
+  per-segment opens in retention.
+- Changed: `Reader::open` and `Reader::seek` pick their segment in one pass over the journal directory instead of
+  collecting and sorting every segment's path, so their memory no longer grows with the number of segments. The
+  segment chosen and the errors are unchanged. `docs/operations.md` now says how seek time grows with the segment
+  size and which operations grow with the segment count.
 - Background checkpoints (ADR 0038, **proposed**):
   `Writer::request_checkpoint` starts a checkpoint of every record appended so far on the writer's checkpoint thread
   (`tickertape-checkpoint`, started by the first request) and returns the sequence number it covers up to, so appends
