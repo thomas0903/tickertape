@@ -827,7 +827,7 @@ const READER_OPS: [(&str, &str); 4] = [
     ("skipped_records", "skipped_records"),
 ];
 /// Fields copied from `sample` lines (written by each process's sampler thread).
-const SAMPLE_FIELDS: [&str; 9] = [
+const SAMPLE_FIELDS: [&str; 11] = [
     "position",
     "writer_position",
     "lag_max_records",
@@ -837,6 +837,8 @@ const SAMPLE_FIELDS: [&str; 9] = [
     "system_fraction",
     "minor_faults",
     "major_faults",
+    "dirty_bytes",
+    "writeback_bytes",
 ];
 
 /// Merges per-process series lines (index 0: writer, then readers in order) into one line per wall-clock second,

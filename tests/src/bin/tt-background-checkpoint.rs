@@ -7,6 +7,10 @@
 //!   writes its marker. `before`: appends `during` records (rolling segments) while it is held, prints `ready` and
 //!   waits to be killed, so the process dies between the checkpoint's syncs and its marker. `after`: lets the
 //!   checkpoint finish first, then appends `during` records, prints `ready` and waits to be killed.
+//! - `roll-crash <dir> <plain|background> <checkpointed>`: appends `checkpointed` records and checkpoints them, then
+//!   (`background`: with a background checkpoint of 50 more records held before its syncs) appends until the next
+//!   roll has linked the new segment, and stops there, before the old segment is sealed and before anything syncs
+//!   the new segment: prints `ready <n>` (`n` records appended) and waits to be killed.
 
 use std::io::Write;
 use std::time::{Duration, Instant};
@@ -79,6 +83,35 @@ fn main() {
             std::io::stdout().flush().unwrap();
             std::thread::sleep(Duration::from_secs(600));
             panic!("not killed");
+        }
+        "roll-crash" => {
+            let checkpointed: u64 = args[4].parse().expect("count");
+            let mut writer = Writer::open(&args[2], small_config()).unwrap();
+            append_n(&mut writer, checkpointed);
+            writer.checkpoint().unwrap();
+            let _hold = match args[3].as_str() {
+                "plain" => None,
+                "background" => {
+                    append_n(&mut writer, 50);
+                    let hold = fault::hold_background(Point::CheckpointSync);
+                    writer.request_checkpoint().unwrap();
+                    assert!(hold.wait_reached(Duration::from_secs(30)));
+                    Some(hold)
+                }
+                other => panic!("unknown roll-crash variant {other}"),
+            };
+            let appended = std::rc::Rc::new(std::cell::Cell::new(writer.next_seq()));
+            let at_link = std::rc::Rc::clone(&appended);
+            fault::run_at(Point::RollAfterLink, 0, move || {
+                println!("ready {}", at_link.get());
+                std::io::stdout().flush().unwrap();
+                std::thread::sleep(Duration::from_secs(600));
+                panic!("not killed");
+            });
+            loop {
+                appended.set(writer.next_seq());
+                append_n(&mut writer, 1);
+            }
         }
         other => panic!("unknown mode {other}"),
     }

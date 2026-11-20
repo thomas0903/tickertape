@@ -366,8 +366,9 @@ also printed to standard error.
 - Option builders follow the same rule as handles. The free-standing functions (`tickertape_verify`,
   `tickertape_list_segments`, `tickertape_read_checkpoint`, `tickertape_retention_apply`, and the version and error
   functions) can be called from any thread.
-- With the default options, a writer starts a background helper thread (prefaulting, and on macOS preparing the next
-  segment); `tickertape_writer_options_set_prefault(options, 0)` gives a writer that starts no threads.
+- With the default options, a writer starts background helper threads (prefaulting, on Linux early write-back, and
+  on macOS preparing the next segment; on Linux each resets its CPU affinity to the process's CPUs when it starts,
+  ADR 0038); `tickertape_writer_options_set_prefault(options, 0)` gives a writer that starts no threads.
 - **`fork()`:** do not use or close handles created before a fork in the child. Two processes appending through one
   writer would corrupt the journal, and a writer's helper threads do not exist in the child. A child of a
   multithreaded process (as a process with a writer usually is, through its helper thread) may call only

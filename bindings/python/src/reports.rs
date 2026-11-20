@@ -23,6 +23,7 @@ pub const RECOVERY_ACTIONS: &[(&str, &str)] = &[
     ("QuarantinedSegment", "quarantined_segment"),
     ("Sealed", "sealed"),
     ("CompletedRoll", "completed_roll"),
+    ("RestoredHeader", "restored_header"),
     ("RemovedTemp", "removed_temp"),
 ];
 
@@ -106,6 +107,11 @@ pub fn describe_action(action: &RecoveryAction) -> Action {
         },
         RecoveryAction::CompletedRoll { segment } => Action {
             kind: "completed_roll",
+            segment: Some(segment.clone()),
+            ..Action::default()
+        },
+        RecoveryAction::RestoredHeader { segment } => Action {
+            kind: "restored_header",
             segment: Some(segment.clone()),
             ..Action::default()
         },
@@ -208,6 +214,7 @@ mod tests {
             },
             RecoveryAction::Sealed { segment: p.clone() },
             RecoveryAction::CompletedRoll { segment: p.clone() },
+            RecoveryAction::RestoredHeader { segment: p.clone() },
             RecoveryAction::RemovedTemp { file: p.clone() },
         ];
         let mut seen = Vec::new();

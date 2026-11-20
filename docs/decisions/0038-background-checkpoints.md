@@ -1,6 +1,7 @@
 # 0038: A checkpoint that does not stop appends
 
-- **Status:** proposed (prototype; the design is finished after the Linux measurement below)
+- **Status:** proposed (the design is complete after the owner's Linux measurement; see "After the Linux
+  measurement")
 - **Date:** 2026-11-20
 
 ## Context
@@ -31,13 +32,15 @@ threads do (crash contract, "The writer lock and `fork`"); `unsafe` stays in `mm
 3. **(c) No concurrency, less work per call** (start write-back early, e.g. `sync_file_range(SYNC_FILE_RANGE_WRITE)`
    on Linux, so the blocking part is short). Cheap and keeps one thread, but a checkpoint has a floor that early
    write-back does not remove: on macOS two `F_FULLFSYNC` drive-cache flushes (data barrier and marker), on ext4 the
-   journal commit that `fdatasync` forces, and on both the marker's own sync. Not measured on Linux yet (the local
-   Linux machine is out of service); the commands to measure it are below. **Not built**; it can be added under (a)
-   later (the checkpoint thread can start write-back of a request's ranges before it waits on them).
+   journal commit that `fdatasync` forces, and on both the marker's own sync. **Not chosen as the alternative to
+   (a)**, but the Linux measurement showed it matters as much as (a), so it is built under (a) as early write-back
+   (below).
 
 ## Decision
 
-**(a)**, as a prototype in `crates/tickertape/src/checkpoint.rs`.
+**(a)**, in `crates/tickertape/src/checkpoint.rs`, with three changes that followed the Linux measurement: rolls no
+longer sync on the writer's thread, early write-back on Linux, and placement of the helper threads (section "After
+the Linux measurement").
 
 **API** (new public items: `Writer::request_checkpoint`, `Writer::checkpoint_progress`, `Writer::close`,
 `CheckpointProgress`):
@@ -100,28 +103,155 @@ appends and rolls; `CheckpointSync` and `CheckpointMarkerSync` work on the check
 `fault::fail_next_background`. The loom model gained the hand-over of the frontier to another thread that stores the
 marker (`protocol_model::marker_stored_by_the_checkpoint_thread_covers_only_committed_records`). Format: unchanged.
 
-**What Linux does to the writer during another thread's sync: known, and to measure.** Known from the kernel's
-write-back path: writing a dirty page back write-protects it again (`folio_clear_dirty_for_io` → `folio_mkclean`), so
-the writer's next store into that page takes a write fault and calls the filesystem's `page_mkwrite`; the fault waits
-for the write-back to finish only when the device or filesystem requires stable pages (`folio_wait_stable`; not the
-usual case for ext4 or xfs on NVMe). `fdatasync` writes back the whole file's dirty pages, including those the Linux
-prefault helper dirtied ahead of the writer (`MADV_POPULATE_WRITE`, ADR 0025), so after every checkpoint, blocking or
-not, the writer may fault again on up to a prefault window of pages. ext4's `page_mkwrite` starts a journal handle
-when it does not take the delayed-allocation path (`data=journal`, delayed allocation off, or switched off as the
-filesystem fills up), and a handle can wait while the journal commits (the commit `fdatasync` forces); xfs converts
-unwritten extents at I/O completion, in a transaction of its own. Whether any of this makes the writer wait during a background checkpoint, for
-how long, and how ext4 and xfs differ, is exactly what the prototype is for. **Nothing is claimed for Linux** until the
-sustained comparison (`tt-sustained --checkpoint-mode blocking|background`, fields `checkpoint_pause`,
-`append_latency`, `checkpoint_durable_latency` and the readers' latency) has been run on both.
+**What Linux does to the writer during another thread's sync.** Known from the kernel's write-back path: writing a
+dirty page back write-protects it again (`folio_clear_dirty_for_io` → `folio_mkclean`), so the writer's next store
+into that page takes a write fault and calls the filesystem's `page_mkwrite`; the fault waits for the write-back to
+finish only when the device or filesystem requires stable pages (`folio_wait_stable`; not the usual case for ext4 or
+xfs on NVMe). `fdatasync` writes back the whole file's dirty pages, including those the Linux prefault helper dirtied
+ahead of the writer (`MADV_POPULATE_WRITE`, ADR 0025). ext4's `page_mkwrite` starts a journal handle when it does not
+take the delayed-allocation path, and a handle can wait while the journal commits; xfs converts unwritten extents at
+I/O completion, in a transaction of its own. The measurement below found the writer's remaining waits elsewhere.
+
+## Decisions on the open questions
+
+The owner decided the questions this ADR left open:
+
+- `close()` waits for the checkpoints in flight and reports how they ended; it does not checkpoint.
+- No separate public call that waits without checkpointing: polling `checkpoint_progress` does that.
+- Retention stays on the checkpoint thread, after each successful background checkpoint.
+- Coalescing (a request made while one checkpoint waits joins it) is the semantics the bindings will expose.
+- The abandoned-write path may wait for a background checkpoint (it takes the same lock); it is a rare path.
+
+## After the Linux measurement
+
+The owner ran the sustained comparison on cloud Linux machines (x86-64 and aarch64, local NVMe, ext4 and xfs; the
+figures are in the pull request, not here). Background checkpoints removed the long stop of the writer at each
+checkpoint, and showed three things to fix.
+
+### Rolls without a sync
+
+**What the sync was for.** A roll wrote the new segment's header, then called `fdatasync` on the writer's thread, then
+linked the file under its name (`format.md` → Rolling). On ext4 that `fdatasync` waits for a journal commit, at every
+roll, also with no checkpoint at all, and during a background checkpoint it waits behind that checkpoint's write-back.
+The sync guaranteed one thing: **if the new segment's name is on disk, so are its header and its preallocated size**.
+A process crash does not need it (the header is in the page cache before the link, and the next writer reads it from
+there); it matters only for an OS crash or power loss. Item by item:
+
+- **C7 (durable after a checkpoint).** A marker vouches for every segment from the scan start to the segment it
+  names, so their headers must be durable before the marker. The checkpoint now provides that: every segment linked
+  before a checkpoint's request is in its job (rolled-past segments in the dirty list, the active one last), and the
+  job calls `fdatasync` on each of their files, which writes the header page and the metadata needed to read the
+  data (size and extents), before it syncs the directory and writes the marker. A segment linked after the request
+  is not named by that marker, and belongs to the next checkpoint, which syncs it in the same way. The blocking
+  checkpoint runs the same steps.
+- **C1 and C2 (process crash).** Unaffected: the header is written with `pwrite` before the link, so a crash at any
+  later point leaves it readable to the next writer
+  (`tests/background_checkpoint.rs::writer_killed_between_a_rolls_link_and_the_sync_of_the_new_segment`, which also
+  kills with a background checkpoint in flight; and every kill test that rolls).
+- **C8 (power loss, records not covered).** One new crash state: a segment after the marker whose name reached the
+  disk while its header did not. Its first 64 bytes then read as zeros (the filesystem returns zeros for allocated
+  blocks that were never written), or the file is shorter than its size if the preallocation did not reach the disk
+  either. Recovery now handles it where the scan enters a segment (by a valid seal, or as the successor at the seal's
+  place): an all-zero header is written again (base from the name, size from the file, creation time at recovery)
+  and synced, and a file holding only zeros whose length is not a valid segment size is replaced by a new empty
+  segment (`RecoveryAction::RestoredHeader`). The restored header is the one the roll wrote (the name gives the base,
+  the file its size; only the creation time differs), so the scan then sees the state a durable header would have
+  given and handles it by the existing rules: usually an empty commit word at the first record slot (the first
+  records share the header's page), an uncommitted end; evidence of later records, or later segments disconnected,
+  as before. Records after the marker may be lost (C8), as before; nothing a checkpoint covered is involved.
+- **C11 (corruption).** A header that is entirely zero, in a segment the scan enters, is now taken for the crash
+  state above, also under `Fail`; a damaged header that is not all zero is handled as before. Only an all-zero file
+  is ever replaced, so no non-zero byte is removed by this. The segment the scan starts in (the marker's) is never
+  restored: its header was synced before the marker, and an invalid header there still makes the open fail. Under
+  `Fail` the restored header stays if the open then refuses for another reason (C11 lists what an open may change
+  before it refuses).
+- **C9 (disk full while creating a segment).** Unchanged: preallocation happens before the link and fails there. An
+  error writing the header back surfaces at the next checkpoint's `fdatasync` (C12).
+- **C13 and C14.** Unaffected: durable-only readers read below the marker, and retention removes only segments
+  before it.
+
+Until a writer has opened the journal after such a crash, a reader that follows the old segment's seal, and `verify`,
+see an invalid header in that segment where a durable header would have shown an empty segment. The format is
+unchanged; `format.md` → Rolling no longer lists the sync. Tests: `tests/recovery.rs::unwritten_newest_segment_is_restored_under_both_policies`,
+`::empty_newest_segment_file_is_replaced`, `::unwritten_first_page_with_later_records_is_a_committed_tail`,
+`::two_unwritten_segments_restore_the_first_and_disconnect_the_second`, and the kill test above (fault point
+`fault::Point::RollAfterLink`).
+
+The alternative, syncing on the thread that prepares the spare, would not remove the state: the header names the base
+sequence number, known only at the roll, and the link must follow the header at once for readers to follow the seal.
+So that thread could only sync after the link, and recovery would need the same rule.
+
+### Early write-back
+
+With the kernel's flusher forced to write back continuously, blocking checkpoints stopped the writer for a small
+fraction of the time they took without it, and background checkpoints hardly at all. Option (c) is therefore built in
+on Linux, as `WriterConfig::early_writeback` (default on; it needs `WriterConfig::prefault`, the switch for the
+writer's helper threads):
+
+- A helper thread, `tickertape-writeback`, calls `sync_file_range(SYNC_FILE_RANGE_WRITE)` over the whole pages behind
+  the write position (never the page that holds it) each time the position has moved 1 MiB, and over the rest of a
+  segment, up to the end of its seal, when the writer rolls past it. A new segment is followed from its first page,
+  header included. The writer's thread only compares its offset with the next step after each append, and once per
+  step takes a lock and wakes the helper: the call itself, which can block in the block layer's throttling, is off
+  the writer's thread.
+- **Step size.** 1 MiB spreads the cost of a call (a lock, a wake-up, a system call) over about a thousand 1 KiB
+  appends and lets the kernel build large requests; it leaves a checkpoint at most one step of unwritten data per
+  segment beyond what the kernel's own write-back left, a few milliseconds of appends at the rates this is for; and it
+  starts each step's write-back long before the kernel's flusher would (it waits for `dirty_background_*` or
+  `dirty_expire_centisecs`).
+- **What is durable when does not change.** `SYNC_FILE_RANGE_WRITE` only starts writing: no metadata, no device cache
+  flush, no promise. Records may reach the disk earlier than before, which C8 always allowed. Every checkpoint still
+  runs all its steps. Without the wait flags the call neither checks nor advances the file's write-back error state,
+  so a write-back failure it started is still reported to the checkpoint's `fdatasync`; and if the call itself
+  returns an I/O error, the helper marks the writer's data lost (`Context::lost`, as a failed sync does) and stops,
+  the next checkpoint returns that error and writes no marker, and later ones return `DurabilityLost`
+  (`tests/background_checkpoint.rs::failed_early_writeback_fails_the_next_checkpoint`, fault point
+  `fault::Point::EarlyWriteback`). Errors that mean "not supported here" (`EINVAL`, `ENOSYS`, `EOPNOTSUPP`, `ESPIPE`)
+  stop the helper and change nothing else.
+- Pages behind the writer are never stored into again, so starting their write-back does not make the writer take a
+  write fault on them.
+- **macOS:** not built. macOS has no call that starts write-back of a file range without waiting for it, and its
+  checkpoint has a floor of two `F_FULLFSYNC` calls that early write-back would not remove. The option has no effect
+  there.
+
+### Helper threads and CPU affinity
+
+A new thread inherits the CPU mask of the thread that creates it. The writer creates its helpers from the calling
+thread: the prefault and write-back helpers in `Writer::open`, the checkpoint thread at the first
+`request_checkpoint`, the spare thread during an append. A writer thread pinned to one CPU, as low-latency
+applications pin it, therefore got its checkpoint thread on its own CPU, where the checkpoint's work delayed appends
+for as long as it ran. `WriterConfig::helper_cpus(HelperCpus)` now places every helper thread:
+
+- `HelperCpus::Process` (default): on Linux each helper sets its affinity when it starts to every CPU, minus those the
+  kernel lists as isolated (`/sys/devices/system/cpu/isolated`), unless that would leave none. The kernel keeps only
+  the CPUs the process's cpuset allows. A mask set with `taskset` or `sched_setaffinity` belongs to each thread and
+  does not limit this; the rustdoc and `operations.md` say how to keep helpers inside one.
+- `HelperCpus::Inherited`: the previous behaviour.
+- `HelperCpus::List(cpus)`: those CPUs (within the cpuset); a mask the kernel refuses falls back to `Process`.
+- macOS has no call to bind a thread to CPUs; the option has no effect there.
+
+The prefault and spare threads had the same problem (the prefault helper's `MADV_POPULATE_WRITE` work ran on the
+writer's CPU) and are treated the same way. `tt-sustained --helper-cpus` passes the option through, so the
+measurement needs no `taskset`. Tests: `affinity::tests` and `writer::tests::helper_threads_of_a_pinned_writer_are_placed_as_configured`
+(Linux; each helper's `Cpus_allowed_list` in `/proc`).
+
+### What the benchmark records
+
+`tt-sustained` gained `--no-early-writeback` and `--helper-cpus`, and records the system's dirty and under-write-back
+page cache each second on Linux (`dirty_bytes`, `writeback_bytes` in the writer's samples; maxima in
+`writer.page_cache`). A roll's cost on the writer's thread already shows as `roll_append_latency`.
 
 ## Consequences
 
 - One more thread per writer once `request_checkpoint` is used (none otherwise); drop can wait for a checkpoint.
-- The abandoned-write path can wait for a background checkpoint to finish (it takes the same lock); it is a panic path.
+- On Linux, one more helper thread by default (`tickertape-writeback`), started with the prefault helper; both are
+  off with `prefault(false)`.
+- A roll's append no longer waits for a sync; after an OS crash or power loss recovery may restore a header
+  (`RecoveryAction::RestoredHeader`), and until a writer opens, readers and `verify` see that segment's header as
+  invalid.
+- Helper threads no longer inherit a pinned caller's CPU mask unless asked to (`HelperCpus::Inherited`).
+- The abandoned-write path can wait for a background checkpoint to finish (it takes the same lock).
 - The C ABI, the bindings, the CLI and the iceoryx2 recorder adopt the API once this ADR is accepted.
-- Open questions for the owner: whether `close` should also checkpoint (today it only waits and reports, like drop);
-  whether a `wait_checkpoint()` that waits without checkpointing the rest is worth a public item (polling
-  `checkpoint_progress` does it now); whether retention should rather run on the writer's thread at the next poll
-  (smaller change, but the writer then pays for it); whether early write-back (option c) is added under (a).
-- Tests: `tests/background_checkpoint.rs` (C7, C12, C13, C14 with a checkpoint in flight), the fork test in
-  `writer.rs`, the loom model, and `benches/tests/tools.rs` for the benchmark option.
+- Tests: `tests/background_checkpoint.rs` (C7, C12, C13, C14 with a checkpoint in flight; the roll kill test; early
+  write-back failure), `tests/recovery.rs` (restored headers), the fork and placement tests in `writer.rs`, the loom
+  model, and `benches/tests/tools.rs` for the benchmark options.

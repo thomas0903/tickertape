@@ -25,7 +25,7 @@ A journal is one directory. Only these names have a meaning; anything else is ig
 |---|---|
 | `{base_seq:020}.tape` | A segment. `base_seq` is the sequence number of its first record, zero-padded to 20 decimal digits so that lexicographic order equals numeric order, e.g. `00000000000001048576.tape` |
 | `{base_seq:020}.tape.tmp` | A segment being created or repaired by the writer. Never read by readers |
-| `next-segment.tmp` | The next segment, prepared in the background before it is needed (ADR 0022): preallocated, synced and all zeros. At roll the writer writes its header, syncs it and links it to `{base_seq:020}.tape`. Never read by readers |
+| `next-segment.tmp` | The next segment, prepared in the background before it is needed (ADR 0022): preallocated, synced and all zeros. At roll the writer writes its header and links it to `{base_seq:020}.tape` (the next checkpoint syncs it, ADR 0038). Never read by readers |
 | `checkpoint` | The checkpoint marker: where the last successful checkpoint ended (see "Checkpoint marker") |
 | `notify` | Wake-up record (ADRs 0017, 0021): 80 bytes naming the running writer's shared-memory wake-up region (magic `TTNOTIFY`, version, kind, nonce, pid and descriptor on Linux or object name on macOS, journal directory identity, CRC32C; layout in ADR 0021). Readers only read it with `pread`; it is replaced by rename, never written in place. Carries no journal data; deleting it or damage to it only affects reader latency |
 | `writer.lock` | Lock file. The writer holds an exclusive `flock` on it while open and writes its PID (decimal ASCII) into it. The PID is informational; the lock is the authority |
@@ -74,7 +74,8 @@ except by a repair (see "Recovery").
 | 40 | 20 | `reserved` | Zero |
 | 60 | 4 | `header_crc` | CRC32C of bytes `[0, 60)` |
 
-The header is written before the segment becomes visible (see "Rolling") and is never modified.
+The header is written before the segment becomes visible (see "Rolling") and is not modified afterwards; recovery
+writes it again only where it never reached the disk (crash contract C8).
 
 A segment is **rejected** (an error, not a silent skip) if: the magic differs; `format_version` is not supported
 (version 1 readers support exactly `1`); `header_len != 64`; `flags != 0`; any `reserved` byte is non-zero;
@@ -203,8 +204,11 @@ When the next record doesn't fit in the current segment's record area, the write
    name). This only happens when the configured segment size was raised since the segment was created.
 2. Remove any existing `{next_seq:020}.tape.tmp` name (`unlink`; it may be a leftover hard link to an already
    published segment, which is unaffected), then create it with `O_CREAT | O_EXCL`, preallocate it to `segment_size`
-   (Linux: `fallocate`; macOS: `fcntl(F_PREALLOCATE)` then `ftruncate`), write the segment header with `pwrite`, and
-   `fdatasync` it. A temporary file is never truncated or reopened, so a published inode can't be damaged through it.
+   (Linux: `fallocate`; macOS: `fcntl(F_PREALLOCATE)` then `ftruncate`) and write the segment header with `pwrite`.
+   The roll does not sync it: the next checkpoint syncs every segment linked before it is requested, before it writes
+   its marker, and recovery restores a header that an OS crash kept from the disk (ADR 0038; crash contract C8). A
+   segment that recovery creates is synced before it is linked. A temporary file is never truncated or reopened, so a
+   published inode can't be damaged through it.
 3. Publish it under its final name **without replacing anything**: `link` the temporary file to
    `{next_seq:020}.tape`, which fails if that name exists. **A successful `link` is the publication point.** Then
    `unlink` the temporary name; if that fails, the leftover name is ignored (it is removed at the next open).
@@ -230,7 +234,8 @@ Readers never modify a journal. Only the writer repairs it, on open, after takin
    that segment's `base_seq`. The **recovery domain** is the start segment and every segment with a larger
    `base_seq`.
 3. **Scan forward** through the chain, validating every record and seal: record by record within a segment; at a
-   valid seal, into the segment it names. The scan stops at the first position `P` (in segment `X`, of size `Z`)
+   valid seal, into the segment it names. A segment the scan enters whose header never reached the disk (all zero)
+   gets its header back first (crash contract C8). The scan stops at the first position `P` (in segment `X`, of size `Z`)
    that is not a valid record and not a valid seal whose successor exists.
 4. **Classify what is at `P`.** At a commit word `0`, where `S` is the expected sequence number, recovery decides
    in a fixed order, stated exactly in crash contract C11 and ADR 0035 ("How recovery tells them apart", "Damage

@@ -25,6 +25,9 @@ pub enum Point {
     Link,
     /// Syncing segment data during `checkpoint()`.
     CheckpointSync,
+    /// A roll right after the new segment was linked into place, before the old segment is sealed (and before any
+    /// sync of the new segment, which the next checkpoint does). Arm with [`run_at`] on the writer's thread.
+    RollAfterLink,
     /// Syncing the checkpoint marker after writing its slot, during `checkpoint()`.
     CheckpointMarkerSync,
     /// A background checkpoint (`Writer::request_checkpoint`) after its data, names and barrier are durable, before it
@@ -78,6 +81,10 @@ pub enum Point {
     InspectRescan,
     /// Syncing the zeroing of an abandoned write (a fill closure that panicked or declined).
     AbandonedWriteSync,
+    /// Starting the early write-back of segment data on the write-back helper thread (Linux; arm with
+    /// [`fail_next_background`]).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    EarlyWriteback,
 }
 
 /// Points in the reader-beacon protocol (ADR 0032 → "The beacon protocol") where a test's pause hook runs.

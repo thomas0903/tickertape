@@ -369,31 +369,54 @@ fn sustained_steady_run_with_checkpoints_rolls_and_two_readers() {
 }
 
 /// Both checkpoint modes record the call time, the call-to-durable time and the writer's pause, per checkpoint; a
-/// durable-only reader receives every record in background mode too.
+/// durable-only reader receives every record in background mode too. The helper-thread and early write-back switches
+/// reach the writer's configuration and the result, which carries the page cache's maxima (Linux; null elsewhere).
 #[test]
 fn sustained_checkpoint_modes_record_durable_time_and_pause() {
-    for mode in ["blocking", "background"] {
+    for (mode, extra, early_writeback, helper_cpus) in [
+        (
+            "blocking",
+            &["--no-early-writeback", "--helper-cpus", "inherited"][..],
+            false,
+            serde_json::json!("inherited"),
+        ),
+        (
+            "background",
+            &["--helper-cpus", "0"][..],
+            true,
+            serde_json::json!([0]),
+        ),
+    ] {
         let root = tempfile::tempdir().unwrap();
-        let result = sustained(
-            root.path(),
-            &[
-                "--rate",
-                "5000",
-                "--duration",
-                "1s",
-                "--payload",
-                "256",
-                "--segment-size",
-                "65536",
-                "--checkpoint-every",
-                "100ms",
-                "--checkpoint-mode",
-                mode,
-                "--readers",
-                "safe:durable:wait=block",
-            ],
-        );
+        let mut options = extra.to_vec();
+        options.extend([
+            "--rate",
+            "5000",
+            "--duration",
+            "1s",
+            "--payload",
+            "256",
+            "--segment-size",
+            "65536",
+            "--checkpoint-every",
+            "100ms",
+            "--checkpoint-mode",
+            mode,
+            "--readers",
+            "safe:durable:wait=block",
+        ]);
+        let result = sustained(root.path(), &options);
         let writer = &result["writer"];
+        assert_eq!(result["config"]["early_writeback"], early_writeback);
+        assert_eq!(result["config"]["helper_cpus"], helper_cpus);
+        for field in ["dirty_max_bytes", "writeback_max_bytes"] {
+            assert_eq!(
+                writer["page_cache"][field].is_u64(),
+                cfg!(target_os = "linux"),
+                "{mode}: {}",
+                writer["page_cache"]
+            );
+        }
         assert_eq!(writer["checkpoint_mode"], mode);
         assert_eq!(result["config"]["checkpoint"]["mode"], mode);
         assert_eq!(writer["count"], 5_000);
@@ -560,6 +583,7 @@ fn sustained_rejects_invalid_configurations_before_creating_directories() {
             "--checkpoint-mode",
             "later",
         ],
+        vec!["--rate", "100", "--helper-cpus", "some"],
     ] {
         let root = tempfile::tempdir().unwrap();
         let output = Command::new(env!("CARGO_BIN_EXE_tt-sustained"))

@@ -83,7 +83,7 @@ class RecoveryAction(NamedTuple):
 
     kind: str
     """``"created"``, ``"zeroed_uncommitted"``, ``"repaired_tail"``, ``"quarantined_segment"``, ``"sealed"``,
-    ``"completed_roll"`` or ``"removed_temp"``."""
+    ``"completed_roll"``, ``"restored_header"`` or ``"removed_temp"``."""
     segment: Optional[Path] = None
     """The segment concerned (for ``"quarantined_segment"``, where it was)."""
     offset: Optional[int] = None

@@ -1161,7 +1161,9 @@ impl Soak {
             let original = fs::read(&path).unwrap();
             let truncate = rng.below(2) == 0;
             let damaged = if truncate {
-                original[..rng.below(original.len() as u64) as usize].to_vec()
+                // At least one byte of the header stays: an empty file is what a crash after a roll can leave (the
+                // roll does not sync the new segment; ADR 0038), and recovery replaces it without a quarantine copy.
+                original[..1 + rng.below(original.len() as u64 - 1) as usize].to_vec()
             } else {
                 let mut d = original.clone();
                 d[rng.below(60) as usize] ^= 1 << rng.below(8);

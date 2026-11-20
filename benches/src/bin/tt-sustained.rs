@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use hdrhistogram::Histogram;
 use serde_json::{Value, json};
 use tickertape::retention::{Action, Policy};
-use tickertape::{Error, NewRecord, Reader, Writer, WriterConfig, clock};
+use tickertape::{Error, HelperCpus, NewRecord, Reader, Writer, WriterConfig, clock};
 use tickertape_bench::sustained::{
     CpuSnapshot, PositionFile, ReaderSpec, Schedule, Seconds, SeriesFile, WaitMode,
     format_duration, free_bytes, lag_json, lag_records, merge_series, parse_cpu_list,
@@ -59,6 +59,12 @@ Writer:
   --retain-segments <N>   writer retention: delete the oldest segments beyond N (needs checkpoints)
   --retain-bytes <B>      writer retention: delete the oldest segments beyond B bytes (needs checkpoints)
   --no-prefault           WriterConfig::prefault(false)
+  --no-early-writeback    WriterConfig::early_writeback(false): no sync_file_range behind the writer (Linux;
+                          no effect elsewhere)
+  --helper-cpus <C>       WriterConfig::helper_cpus for the writer's helper threads (checkpoint, prefault,
+                          write-back): process (the default: every CPU the cpuset allows), inherited (the
+                          creating thread's mask, so a pinned writer's checkpoint thread shares its CPU), or a
+                          CPU list such as 4 or 4,5 (Linux; no effect elsewhere)
 
 Readers:
   --readers <LIST>        comma-separated reader specs (default mapped; none for no readers):
@@ -90,6 +96,10 @@ durable (background: from the library's completion time, observed at the next po
 checkpoint, the writer thread's longest stretch of work around it: blocking, the call; background, the longest of
 the request and every append plus poll while it was in flight. The final checkpoint is always blocking.
 A paced writer busy-waits for each intended time; schedule_wait_s is that spinning, included in its CPU time.
+Rolls do not sync the new segment on the writer thread (ADR 0038); roll_append_latency shows what a roll still
+costs. On Linux the writer's per-second samples carry dirty_bytes and writeback_bytes (/proc/meminfo Dirty and
+Writeback, the whole system), and writer.page_cache has their maxima over the measured part: with early write-back
+the dirty data a checkpoint finds stays small.
 Lag samples are the writer's next sequence (published by the writer about every 1 ms) minus the reader's,
 in records and journal bytes. CPU usage comes from getrusage for each process (all threads) and, on Linux,
 for the measuring thread alone. The series has one line per wall-clock second (UTC), keyed by when each
@@ -140,6 +150,8 @@ struct Config {
     retain_segments: Option<usize>,
     retain_bytes: Option<u64>,
     prefault: bool,
+    early_writeback: bool,
+    helper_cpus: HelperCpus,
     readers: Vec<ReaderSpec>,
     default_wait: WaitMode,
     lag_interval: Duration,
@@ -174,6 +186,7 @@ impl Config {
             "--wait",
             "--lag-interval",
             "--cpus",
+            "--helper-cpus",
         ];
         if child {
             values.extend(["--control", "--index"]);
@@ -181,7 +194,13 @@ impl Config {
         let options = Options::parse(
             args,
             &values,
-            &["--unpaced", "--no-prefault", "--no-disk-check", "--json"],
+            &[
+                "--unpaced",
+                "--no-prefault",
+                "--no-early-writeback",
+                "--no-disk-check",
+                "--json",
+            ],
         )?;
         let duration_of = |key: &str, default: &str| {
             parse_duration(options.optional(key).unwrap_or(default))
@@ -308,6 +327,13 @@ impl Config {
             )
             .into());
         }
+        let helper_cpus = match options.optional("--helper-cpus") {
+            None | Some("process") => HelperCpus::Process,
+            Some("inherited") => HelperCpus::Inherited,
+            Some(list) => HelperCpus::List(parse_cpu_list(list).map_err(|e| {
+                format!("--helper-cpus {list}: {e} (process, inherited or a CPU list)")
+            })?),
+        };
         let control = options.path("--control");
         let index = options
             .optional("--index")
@@ -335,6 +361,8 @@ impl Config {
             retain_segments,
             retain_bytes,
             prefault: !options.flag("--no-prefault"),
+            early_writeback: !options.flag("--no-early-writeback"),
+            helper_cpus,
             readers,
             default_wait,
             lag_interval,
@@ -426,7 +454,12 @@ impl Config {
             "retention": {"max_segments": self.retain_segments, "max_bytes": self.retain_bytes,
                 "action": if self.retention().is_some() { "delete" } else { "none" }},
             "writer_durability": "visible on append; durable only through checkpoints (crash contract)",
-            "prefault": self.prefault, "notify": true,
+            "prefault": self.prefault, "notify": true, "early_writeback": self.early_writeback,
+            "helper_cpus": match &self.helper_cpus {
+                HelperCpus::List(list) => json!(list),
+                HelperCpus::Inherited => json!("inherited"),
+                _ => json!("process"),
+            },
             "readers": self.readers.iter().map(ReaderSpec::to_json).collect::<Vec<_>>(),
             "default_wait": self.default_wait.name(), "lag_interval_ms": self.lag_interval.as_secs_f64() * 1e3,
             "writer_position_publish_interval_ms": 1, "cpus": self.cpus,
@@ -622,6 +655,11 @@ fn run(config: &Config, args: &[String]) -> Result<()> {
             &config.out.join(format!("reader-{index}.series.jsonl")),
         )?);
     }
+    let mut writer_result = writer_result;
+    writer_result["page_cache"] = page_cache_maxima(
+        &processes[0],
+        t0.saturating_add(u64::try_from(config.warmup.as_nanos())?) / 1_000_000_000,
+    );
     let series = merge_series(&processes);
     let mut file = SeriesFile::create(&config.out.join(SERIES))?;
     for line in &series {
@@ -695,6 +733,10 @@ fn print_text(config: &Config, result: &Value) {
     );
     stats_line("Append latency", &w["append_latency"], "us");
     stats_line("Roll append latency", &w["roll_append_latency"], "us");
+    println!(
+        "Page cache (system): dirty max {} B, write-back max {} B",
+        w["page_cache"]["dirty_max_bytes"], w["page_cache"]["writeback_max_bytes"]
+    );
     stats_line(
         &format!("Checkpoint latency ({})", w["checkpoint_mode"]),
         &w["checkpoint_latency"],
@@ -838,6 +880,11 @@ impl Sampler {
                             "cpu_fraction": usage["cpu_fraction"], "user_fraction": usage["user_fraction"],
                             "system_fraction": usage["system_fraction"], "minor_faults": usage["minor_faults"],
                             "major_faults": usage["major_faults"]});
+                        if let Sampled::Writer { .. } = &sampled {
+                            let (dirty, writeback) = page_cache_bytes();
+                            line["dirty_bytes"] = json!(dirty);
+                            line["writeback_bytes"] = json!(writeback);
+                        }
                         if let Sampled::Reader { record_bytes, .. } = &sampled {
                             line["writer_position"] = json!(writer_position);
                             line["lag_max_records"] = json!(lag_max);
@@ -926,7 +973,9 @@ fn writer(config: &Config) -> Result<()> {
     let control = config.control.as_ref().ok_or("missing control directory")?;
     let mut writer_config = WriterConfig::default()
         .segment_size(config.segment_size)
-        .prefault(config.prefault);
+        .prefault(config.prefault)
+        .early_writeback(config.early_writeback)
+        .helper_cpus(config.helper_cpus.clone());
     if let Some(policy) = config.retention() {
         writer_config = writer_config.retention(policy, Action::Delete);
     }
@@ -1362,4 +1411,35 @@ fn main() {
         eprintln!("tt-sustained: {error}");
         std::process::exit(1);
     }
+}
+
+/// The system's dirty and under-write-back page cache in bytes (`/proc/meminfo` `Dirty` and `Writeback`; Linux only).
+fn page_cache_bytes() -> (Option<u64>, Option<u64>) {
+    let Ok(meminfo) = fs::read_to_string("/proc/meminfo") else {
+        return (None, None);
+    };
+    let field = |name: &str| {
+        meminfo
+            .lines()
+            .find_map(|l| l.strip_prefix(name))
+            .and_then(|rest| rest.split_whitespace().next()?.parse::<u64>().ok())
+            .and_then(|kib| kib.checked_mul(1024))
+    };
+    (field("Dirty:"), field("Writeback:"))
+}
+
+/// The largest `dirty_bytes` and `writeback_bytes` of the writer's samples from `from_second` on (null without
+/// samples, as on macOS).
+fn page_cache_maxima(writer_lines: &[Value], from_second: u64) -> Value {
+    let max = |field: &str| {
+        writer_lines
+            .iter()
+            .filter(|l| {
+                l["kind"] == "sample" && l["second"].as_u64().is_some_and(|s| s >= from_second)
+            })
+            .filter_map(|l| l[field].as_u64())
+            .max()
+    };
+    json!({"dirty_max_bytes": max("dirty_bytes"), "writeback_max_bytes": max("writeback_bytes"),
+        "source": "/proc/meminfo Dirty and Writeback (whole system), sampled once per second by the writer process"})
 }

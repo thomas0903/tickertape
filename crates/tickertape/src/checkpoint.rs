@@ -102,6 +102,11 @@ pub(crate) struct Context {
     /// path holds it around its syncs, so a marker is never written after a failed sync of the same files (on Linux a
     /// failed `fdatasync` can mark pages clean without writing them, and the error is reported to one caller only).
     pub(crate) lost: Mutex<bool>,
+    /// The error that made the early write-back helper set `lost` (Linux, ADR 0038 → Early write-back), returned
+    /// once by the next checkpoint instead of `DurabilityLost`. Locked only while `lost` is held.
+    pub(crate) writeback_failure: Mutex<Option<Error>>,
+    /// Set (after `lost`) when the early write-back helper failed, for `Writer::metrics` without taking `lost`.
+    pub(crate) writeback_failed: std::sync::atomic::AtomicBool,
     /// Wakes durable-only readers once a marker is durable (ADR 0017).
     pub(crate) notify: Option<NotifyPublisher>,
 }
@@ -133,7 +138,9 @@ pub(crate) fn run(job: &Job, ctx: &Context, on: On) -> Result<CheckpointSlot> {
     }
     let mut lost = lock(&ctx.lost);
     if *lost {
-        return Err(Error::DurabilityLost);
+        return Err(lock(&ctx.writeback_failure)
+            .take()
+            .unwrap_or(Error::DurabilityLost));
     }
     let result = steps(job, ctx, on);
     if result.is_err() {
@@ -297,12 +304,16 @@ impl Background {
     pub(crate) fn start(
         ctx: Arc<Context>,
         retention: Option<(Policy, Action)>,
+        cpus: crate::config::HelperCpus,
     ) -> io::Result<Background> {
         let shared = Arc::new(Shared::default());
         let thread_shared = Arc::clone(&shared);
         let thread = std::thread::Builder::new()
             .name("tickertape-checkpoint".into())
-            .spawn(move || run_thread(&thread_shared, &ctx, retention.as_ref()))?;
+            .spawn(move || {
+                crate::affinity::place_helper(&cpus);
+                run_thread(&thread_shared, &ctx, retention.as_ref());
+            })?;
         Ok(Background {
             shared,
             thread: Some(thread),

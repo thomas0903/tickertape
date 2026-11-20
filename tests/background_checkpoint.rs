@@ -324,6 +324,61 @@ fn writer_killed_between_the_syncs_and_the_marker() {
     }
 }
 
+/// A roll does not sync the new segment on the writer's thread (ADR 0038): the writer process killed right after a
+/// roll linked the new segment, before it sealed the old one and before any checkpoint synced the new one, with no
+/// checkpoint in flight and with one held before its syncs. The next writer opens under `Fail`, seals the old
+/// segment (the header is in the page cache, so nothing is restored) and finds every record.
+#[test]
+fn writer_killed_between_a_rolls_link_and_the_sync_of_the_new_segment() {
+    let _serial = serial();
+    for (variant, marker_at) in [("plain", 300), ("background", 300)] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_tt-background-checkpoint"))
+            .args(["roll-crash"])
+            .arg(dir.path())
+            .args([variant, "300"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let appended: u64 = line
+            .trim()
+            .strip_prefix("ready ")
+            .unwrap_or_else(|| panic!("{variant}: {line:?}"))
+            .parse()
+            .unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(marker(dir.path()).unwrap().next_seq, marker_at, "{variant}");
+        let w = Writer::open(
+            dir.path(),
+            small_config().recovery(tickertape::RecoveryPolicy::Fail),
+        )
+        .unwrap();
+        let actions = &w.recovery_report().actions;
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, tickertape::RecoveryAction::Sealed { .. })),
+            "{variant}: {actions:?}"
+        );
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, tickertape::RecoveryAction::RestoredHeader { .. })),
+            "{variant}: {actions:?}"
+        );
+        assert_eq!(w.next_seq(), appended, "{variant}");
+        drop(w);
+        let records = read_all(dir.path());
+        assert_eq!(records.len() as u64, appended, "{variant}");
+        records.iter().for_each(check_record);
+    }
+}
+
 /// Dropping the writer waits for a checkpoint in flight (holding the lock meanwhile) and lets it write its marker.
 #[test]
 fn drop_waits_for_a_checkpoint_in_flight() {
@@ -506,4 +561,35 @@ fn durable_only_reader_process_sees_the_marker_move_while_appends_continue() {
     assert!(output.status.success(), "{output:?}");
     assert_eq!(String::from_utf8(output.stdout).unwrap(), "1500\n");
     drop(w);
+}
+
+/// Early write-back (Linux, ADR 0038): an I/O error from starting the write-back of segment data, behind the writer
+/// (1 MiB steps in a large segment) or of a segment rolled past, poisons the writer at once (`metrics().poisoned`);
+/// the next checkpoint returns that error and writes no marker, later ones `DurabilityLost`; appends continue.
+#[cfg(target_os = "linux")]
+#[test]
+fn failed_early_writeback_fails_the_next_checkpoint() {
+    let _serial = serial();
+    for (config, records) in [
+        (tickertape::WriterConfig::default(), 20_000),
+        (small_config(), 1_000),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = Writer::open(dir.path(), config.clone()).unwrap();
+        append_n(&mut w, 10);
+        w.checkpoint().unwrap();
+        fault::fail_next_background(Point::EarlyWriteback, EIO);
+        append_n(&mut w, records);
+        wait_failed(&w);
+        match w.checkpoint() {
+            Err(Error::Io { op, .. }) => assert_eq!(op, "start write-back of segment data"),
+            other => panic!("expected the write-back error, got {other:?}"),
+        }
+        assert!(matches!(w.checkpoint(), Err(Error::DurabilityLost)));
+        assert_eq!(marker(dir.path()).unwrap().next_seq, 10);
+        append_n(&mut w, 5);
+        drop(w);
+        let w = Writer::open(dir.path(), config).unwrap();
+        assert_eq!(w.next_seq(), 10 + records + 5);
+    }
 }

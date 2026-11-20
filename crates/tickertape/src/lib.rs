@@ -43,6 +43,7 @@ compile_error!(
 #[cfg(not(unix))]
 compile_error!("tickertape supports Unix (Linux and macOS) only");
 
+mod affinity;
 mod checkpoint;
 pub mod clock;
 mod config;
@@ -65,9 +66,10 @@ mod reader;
 mod record;
 pub mod retention;
 pub mod status;
+mod writeback;
 mod writer;
 
-pub use config::{Backoff, ReaderConfig, RecoveryPolicy, WriterConfig};
+pub use config::{Backoff, HelperCpus, ReaderConfig, RecoveryPolicy, WriterConfig};
 pub use error::{CorruptReason, Error, Result};
 pub use reader::{Reader, Records};
 pub use record::{NewRecord, OwnedRecord, Record};

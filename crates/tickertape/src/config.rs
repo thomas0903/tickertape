@@ -65,8 +65,26 @@ pub struct WriterConfig {
     ///   half full, a short-lived thread (`tickertape-spare`) also preallocates the next segment, so a roll only
     ///   writes and links its header (ADR 0022). That spare isn't used on Linux (ADR 0023).
     ///
-    /// Set to `false` for a writer that starts no threads. Default: true.
+    /// Set to `false` for a writer that starts no threads, except the checkpoint thread that
+    /// [`Writer::request_checkpoint`](crate::Writer::request_checkpoint) starts; that also turns off
+    /// [`WriterConfig::early_writeback`]. Default: true.
     pub prefault: bool,
+    /// **Linux:** start the kernel's write-back of the pages the writer has finished with, as it goes, so that a
+    /// checkpoint finds little left to write (ADR 0038 → Early write-back). Applies only with
+    /// [`WriterConfig::prefault`] on, which is the switch for the writer's helper threads. A helper thread
+    /// (`tickertape-writeback`)
+    /// calls `sync_file_range(SYNC_FILE_RANGE_WRITE)` over the whole pages behind the write position each time it
+    /// has moved 1 MiB, and over the rest of a segment when the writer rolls past it. That call only starts writing;
+    /// it makes nothing durable: what is durable when is unchanged, and only a checkpoint promises it
+    /// (`docs/crash-contract.md`). If the call fails with an I/O error, no later checkpoint of this writer succeeds
+    /// (the error is returned by the next checkpoint, as a failed sync would be); if the filesystem does not support
+    /// it, the helper stops. **macOS:** no effect (it has no call that starts write-back of a range without waiting
+    /// for it). Default: true.
+    pub early_writeback: bool,
+    /// Where the writer's helper threads run: the checkpoint thread (`tickertape-checkpoint`), the prefault and
+    /// write-back helpers (`tickertape-prefault`, `tickertape-writeback`) and the spare-segment thread
+    /// (`tickertape-spare`). See [`HelperCpus`]. Default: [`HelperCpus::Process`].
+    pub helper_cpus: HelperCpus,
     /// Optional retention policy and action, run after open and successful checkpoints. Default: none.
     pub retention: Option<(crate::retention::Policy, crate::retention::Action)>,
 }
@@ -110,6 +128,47 @@ impl WriterConfig {
         self.prefault = on;
         self
     }
+
+    /// Sets whether to start write-back early on Linux (see [`WriterConfig::early_writeback`]).
+    pub fn early_writeback(mut self, on: bool) -> Self {
+        self.early_writeback = on;
+        self
+    }
+
+    /// Sets where the writer's helper threads run (see [`HelperCpus`]).
+    pub fn helper_cpus(mut self, cpus: HelperCpus) -> Self {
+        self.helper_cpus = cpus;
+        self
+    }
+}
+
+/// Where the writer's helper threads run ([`WriterConfig::helper_cpus`]).
+///
+/// A new thread starts with the CPU affinity of the thread that creates it. The writer creates its helpers from the
+/// calling thread: the prefault and write-back helpers in [`Writer::open`](crate::Writer::open), the checkpoint thread
+/// at the first [`Writer::request_checkpoint`](crate::Writer::request_checkpoint), the spare-segment thread during an
+/// append. An application that pins its writer thread to one CPU would otherwise get every helper on that CPU, where
+/// it competes with the writer: a checkpoint's sync calls and their CPU time then delay appends.
+///
+/// **Linux:** each helper sets its own affinity when it starts (`sched_setaffinity`). The kernel always intersects
+/// the mask with the CPUs the process's cpuset (cgroup) allows. **macOS:** no effect; the platform has no call to
+/// bind a thread to CPUs.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum HelperCpus {
+    /// Every CPU the process's cpuset allows, except the CPUs the kernel lists as isolated
+    /// (`/sys/devices/system/cpu/isolated`, from the `isolcpus` boot parameter), unless that would leave none. This
+    /// is not limited by a mask set with `taskset` or `sched_setaffinity` on the process or the calling thread: such a
+    /// mask belongs to each thread, and the calling thread's may be one CPU. To keep the helpers inside such a mask,
+    /// use [`HelperCpus::Inherited`] from a thread that has it, or name the CPUs. The default.
+    #[default]
+    Process,
+    /// Keep the mask inherited from the creating thread (the behaviour before this option existed).
+    Inherited,
+    /// These CPUs (numbers as the kernel counts them, below 8,192), intersected with the process's cpuset. If the
+    /// kernel refuses the mask (no listed CPU is allowed, or the list is empty), the helper uses
+    /// [`HelperCpus::Process`] instead.
+    List(Vec<usize>),
 }
 
 impl Default for WriterConfig {
@@ -119,6 +178,8 @@ impl Default for WriterConfig {
             recovery: RecoveryPolicy::default(),
             notify: true,
             prefault: true,
+            early_writeback: true,
+            helper_cpus: HelperCpus::default(),
             retention: None,
         }
     }

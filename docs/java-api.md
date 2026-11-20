@@ -425,8 +425,8 @@ What it cannot detect, and is undefined:
   `SIGBUS`.
 - Separate readers are independent and can run on separate threads and processes. `Journal`'s functions can be called
   from any thread, also while a writer is active.
-- A writer starts a background helper thread by default (prefaulting, and on macOS preparing the next segment);
-  `WriterOptions.prefault(false)` gives a writer that starts none.
+- A writer starts background helper threads by default (prefaulting, on Linux early write-back, and on macOS
+  preparing the next segment); `WriterOptions.prefault(false)` gives a writer that starts none.
 - **Virtual threads.** A call into the library pins a virtual thread to its carrier while it runs. Appends and
   `tryNext()` are short. A blocking read pins its carrier for the whole wait, and `open`, `checkpoint` and an append
   that rolls to a new segment pin it while they run. Follow live journals from platform threads, or poll with
