@@ -5,6 +5,14 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
+- Diagnostics: `docs/playbooks/diagnose-latency-with-ebpf.md`, a Linux playbook for finding where the writer and
+  reader threads wait during sustained runs or in an application (off-CPU time by kernel stack, block I/O, page
+  faults, write-back throttling, run-queue latency), with bpftrace, bcc and libbpf-tools commands, requirements,
+  how to line traces up with `tt-sustained`'s `series.jsonl` and with checkpoints and rolls, how to measure the
+  tracing overhead and confirm with tracing off, and the investigation that led to rolls without a sync (ADR 0038).
+  Scripts in `benches/diagnostics/`: `offcpu.bt`, `events.bt`, `stack-sampler.py` (no eBPF), `find-threads.sh`,
+  `align.py` and `trace-sustained.sh`. Optional; nothing in the library or the CLI changes.
+
 - Background checkpoints (ADR 0038, **proposed**):
   `Writer::request_checkpoint` starts a checkpoint of every record appended so far on the writer's checkpoint thread
   (`tickertape-checkpoint`, started by the first request) and returns the sequence number it covers up to, so appends
