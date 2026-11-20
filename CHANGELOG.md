@@ -35,7 +35,9 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   little dirty data. It makes nothing durable; an I/O error from it poisons the writer (`metrics().poisoned` at once)
   and is returned once by the next `request_checkpoint`, `checkpoint_progress`, `checkpoint` or `close` (which joins
   the helper first). A helper that stopped (that error, or the call unsupported) holds no segment file and is handed
-  none. No effect on macOS. Fault injection gains `Point::EarlyWriteback`.
+  none. A forked child's `Writer::release_after_fork` closes its descriptors of the files the helper follows (unless
+  the fork came while the helper held its lock or was starting a write-back). No effect on macOS. Fault injection
+  gains `Point::EarlyWriteback`.
 - Fixed: `retention::apply` (`tickertape archive`) syncs the checkpoint marker after reading the slot that decides a
   removal and before removing anything, so a power loss right after a writer wrote a new marker slot, and before its
   marker barrier, can no longer bring back a marker that names a segment the archiver removed (crash contract C14).

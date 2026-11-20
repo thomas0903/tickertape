@@ -823,10 +823,11 @@ impl Writer {
     ///
     /// Until the child exits: the helper threads' handles and the state they share with the writer, including the
     /// prefault thread's reference to the active segment's mapping (so with prefaulting enabled that mapping stays
-    /// mapped in the child, although its file descriptor is closed), the write-back helper's references to the
-    /// segment files it follows and the checkpoint thread's reference to the checkpoint marker (Linux and after
-    /// [`Writer::request_checkpoint`] respectively: those descriptors stay open in the child), and a spare segment
-    /// prepared in the background (its file descriptor and mapping, which the spare thread's result owns).
+    /// mapped in the child, although its file descriptor is closed), the checkpoint thread's reference to the
+    /// checkpoint marker (after [`Writer::request_checkpoint`]: that descriptor stays open in the child), a spare
+    /// segment prepared in the background (its file descriptor and mapping, which the spare thread's result owns),
+    /// and on Linux, if the fork came while the early write-back helper held its lock or was starting a write-back,
+    /// the segment files it was following (their descriptors stay open in the child).
     ///
     /// # Preconditions
     ///
@@ -847,7 +848,9 @@ impl Writer {
     pub fn release_after_fork(mut self) {
         std::mem::forget(self.spare.take());
         std::mem::forget(self.prefault.take());
-        std::mem::forget(self.writeback.take());
+        // In a child, dropping the write-back helper's handle neither stops nor joins it: it only drops the child's
+        // references to the segment files the helper follows, if the helper's lock was free at the fork.
+        drop(self.writeback.take());
         if let Some(notify) = self.notify.take() {
             notify.release_after_fork();
         }
@@ -2210,6 +2213,83 @@ mod tests {
                 .scanned_from_seq,
             2
         );
+    }
+
+    /// A forked child that releases its copy of a writer whose early write-back helper runs (Linux; ADR 0038) closes
+    /// its descriptor of the active segment, which the helper's shared state also refers to, without stopping,
+    /// joining or signalling the helper, which does not exist in the child. The parent's helper is left as it was.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_forked_child_releasing_its_copy_closes_the_writeback_helpers_files() {
+        const CLOSED: i32 = 42;
+        const STILL_OPEN: i32 = 43;
+        let _forked = forked::LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let config = WriterConfig::default()
+            .segment_size(1 << 20)
+            .prefault(true)
+            .early_writeback(true)
+            .notify(false);
+        let mut writer = Some(Writer::open(dir.path(), config.clone()).unwrap());
+        let open = writer.as_mut().unwrap();
+        append_one(open);
+        assert!(
+            open.writeback.is_some(),
+            "the helper must run for this test"
+        );
+        let fd = open.active.file.as_raw_fd();
+        // Fork while the helper waits to be woken: it then holds no file of its own, and its lock is free.
+        drop(open.writeback.as_ref().unwrap().test_handle().idle());
+        let child = forked::fork(|| {
+            writer.take().unwrap().release_after_fork();
+            forked::exit(if forked::is_open(fd) {
+                STILL_OPEN
+            } else {
+                CLOSED
+            });
+        })
+        .unwrap();
+        assert_eq!(
+            child.wait_within(std::time::Duration::from_secs(20)),
+            Some(CLOSED),
+            "the child must close its descriptor of the segment the helper follows"
+        );
+        let mut writer = writer.unwrap();
+        for _ in 0..3000 {
+            append_one(&mut writer);
+        }
+        writer.close().unwrap();
+        assert_eq!(Writer::open(dir.path(), config).unwrap().next_seq(), 3001);
+    }
+
+    /// A forked child that releases its copy of a writer whose early write-back helper's lock was held at the fork
+    /// (here by this test) must not wait for that lock, which stays held in the child for good (Linux; ADR 0038).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_forked_child_releasing_its_copy_leaves_a_writeback_lock_held_at_the_fork_alone() {
+        let _forked = forked::LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let config = WriterConfig::default()
+            .segment_size(1 << 20)
+            .prefault(true)
+            .early_writeback(true)
+            .notify(false);
+        let mut writer = Some(Writer::open(dir.path(), config.clone()).unwrap());
+        let open = writer.as_mut().unwrap();
+        append_one(open);
+        let handle = open.writeback.as_ref().unwrap().test_handle();
+        let held = handle.idle();
+        let child = forked::fork(|| writer.take().unwrap().release_after_fork()).unwrap();
+        drop(held);
+        assert_eq!(
+            child.wait_within(std::time::Duration::from_secs(20)),
+            Some(0),
+            "the child must not wait for the write-back helper's lock"
+        );
+        let mut writer = writer.unwrap();
+        append_one(&mut writer);
+        writer.close().unwrap();
+        assert_eq!(Writer::open(dir.path(), config).unwrap().next_seq(), 2);
     }
 
     /// An open that fails after taking the lock (here: `RecoveryPolicy::Fail` refusing a damaged journal) must

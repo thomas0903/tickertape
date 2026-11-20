@@ -229,6 +229,13 @@ writer's helper threads):
   that has stopped, for either reason, is marked stopped and lets go of every file under the state's lock, and rolls
   hand it nothing more, so it keeps no descriptor or deleted segment open
   (`writer::tests::a_stopped_writeback_helper_is_handed_no_files`).
+- **`fork`.** The helper does not exist in a forked child, so the child's copy of the writer neither stops, joins
+  nor signals it. Between calls the helper keeps no reference of its own to a segment file (it follows the active one
+  by a weak reference), so `Writer::release_after_fork` in the child drops the state's references to the files and
+  closes their descriptors, provided the state's lock is free; a lock held at the fork stays held in the child, and
+  the child then only tries it and leaves those files open until it exits
+  (`writer::tests::a_forked_child_releasing_its_copy_closes_the_writeback_helpers_files`,
+  `::a_forked_child_releasing_its_copy_leaves_a_writeback_lock_held_at_the_fork_alone`).
 - Pages behind the writer are never stored into again, so starting their write-back does not make the writer take a
   write fault on them.
 - **macOS:** not built. macOS has no call that starts write-back of a file range without waiting for it, and its

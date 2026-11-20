@@ -1123,7 +1123,9 @@ fn writer(config: &Config) -> Result<()> {
             let wall = clock::realtime_ns();
             let start = Instant::now();
             let measured = wall >= measure_from;
-            match config.checkpoint_mode {
+            // One clock reading for the call, used for its latency and its pause alike: a second reading would add
+            // whatever ran (or preempted the thread) in between to one of them only.
+            let ns = match config.checkpoint_mode {
                 CheckpointMode::Blocking => {
                     writer.checkpoint()?;
                     let ns = elapsed_ns(start.elapsed())?;
@@ -1131,19 +1133,21 @@ fn writer(config: &Config) -> Result<()> {
                         durable.record(ns)?;
                         pause.record(ns)?;
                     }
+                    ns
                 }
                 CheckpointMode::Background => {
                     requests_while_in_flight += u64::from(!in_flight.is_empty());
                     let covers = writer.request_checkpoint()?;
+                    let ns = elapsed_ns(start.elapsed())?;
                     in_flight.push_back(InFlight {
                         covers,
                         requested: start,
                         measured,
-                        pause_ns: elapsed_ns(start.elapsed())?,
+                        pause_ns: ns,
                     });
+                    ns
                 }
-            }
-            let ns = elapsed_ns(start.elapsed())?;
+            };
             checkpoints += 1;
             if measured {
                 checkpoint.record(ns)?;
