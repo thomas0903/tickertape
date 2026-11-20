@@ -86,8 +86,9 @@ version 1.
   `TICKERTAPE_LAG_OTHER_REASON`, `TICKERTAPE_BEACON_OTHER`, `TICKERTAPE_READERS_DIR_OTHER`) where a value the core
   added after the C mapping was written would land; a library built from one source tree does not return them,
   since its tests name every core variant. A program should handle them as "unknown" (for the head, not as healthy).
-- **Not in the C ABI:** `status::Sampler` (rates, time to full), `Status::breaches` and creating reader beacons.
-  `c-api.md` → Operational metrics says so.
+- **Not in the C ABI:** `status::Sampler` (rates, time to full), `Status::breaches` and creating reader beacons; they
+  stay in Rust only in 1.0 and may be added in 1.x ([Before 1.0](#before-10)). `c-api.md` → Operational metrics says
+  so.
 
 ## C++ header
 
@@ -184,18 +185,19 @@ release with its own ADR.
 
 ## Before 1.0
 
-What must still be resolved, or explicitly accepted, before the surfaces above are declared stable. Each line ends
-with a recommendation. The rest of the list this review produced was resolved on 2026-11-20 (ADR 0043 →
-Consequences).
+What must still be resolved, or explicitly accepted, before the surfaces above are declared stable. The rest of the
+list this review produced was resolved on 2026-11-20 (ADR 0043 → Consequences), and so were two later lines: ADR 0042
+is accepted (no sparse index for 1.0; the sparse index stays possible later work), and `status::Sampler` (rates, time
+to full) with `Status::breaches`, and creating reader beacons, stay in Rust only in 1.0 (decided by the maintainers
+under the owner's delegation, 2026-11-20). A program using a binding can compute rates from two status samples (each
+has its sampling time, the head's next sequence number, the segments' total bytes and the storage headroom) and
+compare them with its own thresholds; any of the three can be added to the C ABI and the bindings in 1.x.
 
-1. ADR 0042 (replay and recovery at scale) stays proposed until the cloud run on local SSD decides on the sparse
-   index. No public API depends on it: accept or close it with that decision.
-2. Features that reach no binding yet: `status::Sampler` (rates, time to full) with `Status::breaches`, and creating
-   reader beacons. Neither is promised to the bindings and each can be added in 1.x: decide which 1.0 needs.
-   (Background checkpoints, ADR 0038, reached the C ABI and the three bindings on 2026-11-20.)
-3. The C ABI at 1.0: set `TICKERTAPE_ABI_VERSION` to 1 and freeze the ABI baseline
+1. The C ABI at 1.0: set `TICKERTAPE_ABI_VERSION` to 1 and freeze the ABI baseline
    (`crates/tickertape-ffi/abi/tickertape-baseline.h` becomes the shipped header). Do both in the release
    preparation pull request (`docs/playbooks/release-checklist.md` → C ABI at 1.0).
-4. The 1.0 fixtures: add them at release (`docs/playbooks/release-checklist.md`, ADR 0033), as for every release.
-5. The roadmap's release-candidate exercise (release, installation and upgrade instructions and the external
+2. The 1.0 fixtures: add them at release (`docs/playbooks/release-checklist.md`, ADR 0033), as for every release.
+3. The roadmap's release-candidate exercise (release, installation and upgrade instructions and the external
    integration against a release candidate): an RC tag needs the owner's approval. Run it before tagging 1.0.
+4. Record the sustained session's results (`benches/README.md` → Recorded sustained session) in
+   `docs/benchmarks.md`, with the operating limits the roadmap's 1.0 contract item asks to publish.
