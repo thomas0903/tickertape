@@ -5,6 +5,15 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
+- Fixed: a writer held one open file per segment after its checkpoint marker until the next checkpoint: one file and
+  one segment mapping per roll, and one file per segment recovery scanned. A writer that checkpointed rarely or never
+  failed with "Too many open files" after about as many rolls without a checkpoint as its descriptor limit, and
+  `Writer::open` failed the same way on a journal with more segments than that after its marker (found by `tt-scale`,
+  ADR 0042). v0.4.0 has the same defect. A writer now keeps only the four most recent dirty segments open, also in
+  recovery, in background checkpoints and in the early write-back helper; the checkpoint that covers an older one
+  reopens and syncs it (on macOS also `msync`s it through a new mapping), and fails, poisoning the writer, if it is gone
+  (crash contract → Segments the writer no longer holds; ADR 0038 → Bounded open segments).
+
 - Docs: `docs/compatibility.md`, the 1.0 compatibility contract (ADR 0043, **proposed**): for the Rust API (its public
   items by module, what is `#[non_exhaustive]`, what is test-only and not covered, the MSRV policy), the C ABI, the
   C++ header, the Python and Java bindings, the CLI's machine-readable outputs and exit statuses, the on-disk format

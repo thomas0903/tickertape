@@ -24,7 +24,7 @@ request that added this record; recorded results belong in `docs/benchmarks.md` 
 | Replay | bytes, plus a fixed cost per segment entered (open, header, identity) that dominates with very small segments | constant (safe reader) |
 | `Writer::open` after a clean close | directory entries (two directory reads: temporary files, then segments), plus the unwritten remainder of the newest segment, which `format::nonzero_end` reads in full | that remainder is mapped and read, so RSS and page cache grow up to one segment |
 | `Writer::open` after a kill | as above, plus the records written since the marker | up to one segment mapped |
-| `Writer::open` without a valid marker | every byte of the journal | one segment mapped at a time |
+| `Writer::open` without a valid marker | every byte of the journal | one segment mapped at a time, and at most four scanned segments' files held open until the first checkpoint (before ADR 0038 → Bounded open segments, one per scanned segment, which failed with `EMFILE` at about a thousand segments) |
 | `inspect::verify` | bytes, plus one file open per segment | a report per segment |
 | `inspect::list_segments`, `retention::plan` | segments: one open, `fstat` and header read per segment (the largest per-segment cost measured) | a list of every segment |
 | Removing a segment by retention | the bytes of each removed segment (the plan scans each candidate for its seal) | constant |

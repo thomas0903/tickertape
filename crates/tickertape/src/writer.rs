@@ -11,7 +11,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use crate::checkpoint::{self, Background, Context, DirtySegment, Job, Marker, On};
+use crate::checkpoint::{self, Background, Context, DirtySegment, DirtySegments, Job, Marker, On};
 use crate::config::{RecoveryPolicy, WriterConfig};
 use crate::error::{CorruptReason, Error, Result};
 use crate::format::{self, CheckpointSlot, RecordHeader, ScanEnd, SegmentHeader, SegmentView};
@@ -63,8 +63,9 @@ pub struct Writer {
     next_seq: u64,
     /// Start of the not-yet-checkpointed range of `active`.
     active_dirty_from: u64,
-    /// Segments with not-yet-checkpointed data other than `active`, since the last checkpoint was requested.
-    dirty: Vec<DirtySegment>,
+    /// Segments with not-yet-checkpointed data other than `active`, since the last checkpoint was requested. Only the
+    /// newest few keep their file and mapping open ([`checkpoint::OPEN_SEGMENTS`]).
+    dirty: DirtySegments,
     /// Directories whose entries changed since the last checkpoint was requested.
     dirty_dirs: BTreeSet<PathBuf>,
     /// The marker file, the lost-durability flag and the notify publisher, shared with the checkpoint thread.
@@ -653,13 +654,13 @@ impl Writer {
     /// a new dirty list.
     fn take_job(&mut self, generation: u64) -> Job {
         let mut segments = std::mem::take(&mut self.dirty);
-        segments.push(DirtySegment {
-            file: Arc::clone(&self.active.file),
-            flush: Some(self.active.map.flush_handle()),
-            from: self.active_dirty_from,
-            to: self.offset,
-            path: self.active.path.clone(),
-        });
+        segments.push(DirtySegment::written(
+            Arc::clone(&self.active.file),
+            self.active.map.flush_handle(),
+            self.active_dirty_from,
+            self.offset,
+            self.active.path.clone(),
+        ));
         self.active_dirty_from = self.offset;
         Job {
             slot: CheckpointSlot {
@@ -1069,13 +1070,15 @@ impl Writer {
                 format::SEGMENT_HEADER_LEN as u64,
             );
         }
-        self.dirty.push(DirtySegment {
-            file: old.file,
-            flush: Some(old.map.flush_handle()),
-            from: self.active_dirty_from,
-            to: seal_at + format::SEAL_LEN as u64,
-            path: old.path,
-        });
+        // The list keeps only the newest few segments open: pushing this one releases the file and mapping of the one
+        // that leaves its window (`checkpoint::OPEN_SEGMENTS`), and the checkpoint that covers that one reopens it.
+        self.dirty.push(DirtySegment::written(
+            old.file,
+            old.map.flush_handle(),
+            self.active_dirty_from,
+            seal_at + format::SEAL_LEN as u64,
+            old.path,
+        ));
         self.offset = format::SEGMENT_HEADER_LEN as u64;
         self.active_dirty_from = self.offset;
         if let Some(prefault) = &mut self.prefault {
@@ -1367,7 +1370,7 @@ struct RecoveredState {
     offset: u64,
     next_seq: u64,
     active_dirty_from: u64,
-    dirty: Vec<DirtySegment>,
+    dirty: DirtySegments,
 }
 
 /// How [`Recovery::restore_unwritten_header`] restores a segment whose header never reached the disk.
@@ -1505,7 +1508,7 @@ impl Recovery<'_> {
                 offset: format::SEGMENT_HEADER_LEN as u64,
                 next_seq: 0,
                 active_dirty_from: format::SEGMENT_HEADER_LEN as u64,
-                dirty: Vec::new(),
+                dirty: DirtySegments::default(),
             });
         }
 
@@ -1533,7 +1536,9 @@ impl Recovery<'_> {
             }
         }
         let mut visited = BTreeSet::new();
-        let mut dirty = Vec::new();
+        // Segments after the marker, synced by the first checkpoint; only the newest few stay open, so a scan of any
+        // number of segments holds a bounded number of descriptors.
+        let mut dirty = DirtySegments::default();
         // Where this writer's uncheckpointed data starts in `seg` (for `Writer::metrics`).
         let mut seg_from = offset;
 
@@ -2239,13 +2244,14 @@ fn committed_after_empty(
 
 /// A segment inherited from an earlier writer: the next checkpoint syncs its whole file. `[from, seal_at)` holds the
 /// records an earlier writer appended after the marker, followed by the seal at `seal_at`; the range only feeds
-/// [`Writer::metrics`] (`uncheckpointed_bytes`).
+/// [`Writer::metrics`] (`uncheckpointed_bytes`). The segment's mapping is dropped here.
 fn inherited(seg: Segment, from: u64, seal_at: u64) -> DirtySegment {
     DirtySegment {
         from,
         to: seal_at + format::SEAL_LEN as u64,
-        file: seg.file,
+        file: Some(seg.file),
         flush: None,
+        mapped: false,
         path: seg.path,
     }
 }

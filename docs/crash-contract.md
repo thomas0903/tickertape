@@ -26,13 +26,13 @@ returns only records covered by the last successful checkpoint (C13).
 ### What `checkpoint()` does
 
 Everything written since the last successful checkpoint is "dirty": records and seals in every segment touched
-(including segments the writer has already rolled past, whose mappings it keeps until the checkpoint), files and
+(including segments the writer has already rolled past; see "Segments the writer no longer holds" below), files and
 directories created or renamed, and repairs made at open. A new writer treats everything after the current
 checkpoint marker as dirty, including records an earlier writer appended but never checkpointed.
 
 | Step | Linux | macOS |
 |---|---|---|
-| 1. Data | `msync(MS_SYNC)` on each dirty range, then `fdatasync` on each dirty segment | `msync(MS_SYNC)` on each dirty range, then `fsync` on each dirty segment |
+| 1. Data | `msync(MS_SYNC)` on each dirty range of a segment the writer still holds, then `fdatasync` on each dirty segment | `msync(MS_SYNC)` on each dirty range, then `fsync` on each dirty segment |
 | 2. Names | `fsync` on the journal directory, `quarantine/`, and the parent of any directory the writer created, if any entry in them changed | `fsync` on the same directories |
 | 3. Barrier | (the `fdatasync`/`fsync` calls above already flush the device cache on filesystems mounted with barriers, the default) | `fcntl(F_FULLFSYNC)` on the last dirty segment, after all of the above. It asks the drive to flush its whole write cache, which covers the earlier writes and directory updates too |
 | 4. Marker | Write the next `checkpoint` slot with `pwrite`, then `fdatasync` it | Write the next `checkpoint` slot with `pwrite`, then `fcntl(F_FULLFSYNC)` on it |
@@ -59,6 +59,21 @@ write-back early (`WriterConfig::early_writeback`, `sync_file_range(SYNC_FILE_RA
 position). That makes nothing durable and changes none of the steps above; an I/O error from it poisons the writer as
 a failed step 1 would, and is returned once, by the next checkpoint (which writes no marker) or the next
 `request_checkpoint`, `checkpoint_progress` or `close`, also when no checkpoint is pending.
+
+**Segments the writer no longer holds.** Between checkpoints each dirty list (the writer's own, and that of each
+background checkpoint requested and not yet run) keeps the file and mapping of only its four most recent segments;
+older ones, whether it rolled past them or recovery inherited them, are remembered by path
+and range, and the checkpoint that covers them opens them again for step 1 (ADR 0038 → Bounded open segments). This is
+enough because the data is in the file's page cache, not in a descriptor or a mapping: a store through a shared mapping
+dirties the file's cached page, and unmapping keeps it dirty, so on Linux `fdatasync` on a newly opened descriptor
+writes back every dirty page of the file and waits, and reports a write-back error recorded on the file that no sync
+has reported yet; there `msync(MS_SYNC)` is a data sync of the same pages and adds nothing. On macOS the writer maps the
+reopened file again and calls `msync(MS_SYNC)` on the range before `fsync`, so that pages dirtied through the old
+mapping are written back as they were before; step 3 is unchanged. Such a segment is after the marker, so retention
+does not remove it (C14); if it is gone anyway (removed by hand), opening it fails and the checkpoint fails as a failed
+sync does, poisoning the writer. One difference remains: while no descriptor or mapping of a file is open, the kernel
+may drop its cached inode, and with it a write-back error recorded there that nobody had reported, so a checkpoint
+cannot report a write-back failure of such a segment that happened, and was forgotten, in between.
 
 The marker is written only after steps 1–3 succeed, so it never points past data that isn't durable. On macOS,
 plain `fsync` does not flush the drive's write cache; `F_FULLFSYNC` does, and is much slower. tickertape always uses

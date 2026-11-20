@@ -277,6 +277,35 @@ measurement needs no `taskset`. Tests: `affinity::tests` and `writer::tests::hel
 page cache each second on Linux (`dirty_bytes`, `writeback_bytes` in the writer's samples; maxima in
 `writer.page_cache`). A roll's cost on the writer's thread already shows as `roll_append_latency`.
 
+## After the scale measurement
+
+### Bounded open segments
+
+`tt-scale` (ADR 0042) failed to open a writer on a journal of 10,000 segments without a marker: `EMFILE` at about
+the thousandth segment. Recovery kept every segment after the marker in the writer's dirty list with its file open, for
+the first checkpoint to sync, and so did every roll (file and mapping) until the next checkpoint, also in v0.4.0. A
+writer that checkpoints rarely or never therefore held one more descriptor and one more segment mapping per roll, and
+failed at the descriptor limit; the background checkpoint's job and the early write-back helper's list of rolled
+segments held the same files.
+
+Now a dirty list (`checkpoint::DirtySegments`) keeps the file and mapping handle of its four most recent segments
+only; pushing a fifth releases the oldest held one, which stays in the list by path and range. Rolls do the release,
+nothing is added to an append, and recovery's inherited segments go into the same list. The background checkpoint's
+job is such a list too (a queued job that absorbs later requests merges them through it), and the write-back helper
+keeps at most four rolled segments, skipping the oldest one's early write-back if it falls that far behind (it is
+only a head start). **Four** because a writer that checkpoints at least once per roll then never reopens a segment,
+and because a few lists of four (the writer's, a running and a queued job's, the helper's) stay far below the usual
+descriptor limits, whatever the segment count.
+
+A checkpoint opens each released segment again by path and syncs it there; on macOS it also maps it again and calls
+`msync` on the range first. Why that is enough, and the one thing a held descriptor gave that a reopened one does not
+(a write-back error the kernel forgets with an evicted inode), is in `docs/crash-contract.md` → Segments the writer no
+longer holds. A released segment is after the marker, so retention leaves it; if it is gone at the checkpoint, the
+checkpoint fails as an I/O error and poisons the writer. Tests: `tests/open_segments.rs` (300 rolls with a descriptor
+limit of 64, without checkpoints and with background checkpoints every 25 rolls, then a durable-only reader reads
+everything; recovery over more segments than the limit under both policies; a removed released segment fails a
+blocking and a background checkpoint and poisons the writer).
+
 ## Consequences
 
 - One more thread per writer once `request_checkpoint` is used (none otherwise); drop can wait for a checkpoint.
@@ -287,6 +316,8 @@ page cache each second on Linux (`dirty_bytes`, `writeback_bytes` in the writer'
   invalid.
 - Helper threads no longer inherit a pinned caller's CPU mask unless asked to (`HelperCpus::Inherited`).
 - The abandoned-write path can wait for a background checkpoint to finish (it takes the same lock).
+- Between checkpoints a writer holds at most four rolled or inherited segments open per dirty list; a checkpoint
+  reopens the others, and fails if one is gone.
 - The C ABI, the bindings, the CLI and the iceoryx2 recorder adopt the API once this ADR is accepted.
 - An external `retention::apply` syncs the checkpoint marker once per new slot before it removes anything.
 - Tests: `tests/background_checkpoint.rs` (C7, C12, C13, C14 with a checkpoint in flight; the roll kill test; early
