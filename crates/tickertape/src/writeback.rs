@@ -58,7 +58,7 @@ struct State {
     /// The writer's position in `file`: everything before the page that holds it is finished.
     position: u64,
     /// Segments the writer rolled past since the helper last looked, with their end (after the seal): written back
-    /// to the end before the helper moves on.
+    /// to the end before the helper moves on. At most [`crate::checkpoint::OPEN_SEGMENTS`] (see `WriteBack::switch`).
     rolled: Vec<(Arc<File>, u64)>,
     stop: bool,
     /// Set by the helper when it exits on its own (the call is unsupported, or failed), with `file` and `rolled`
@@ -130,6 +130,12 @@ impl WriteBack {
         let mut state = lock(&self.shared);
         if state.stopped {
             return;
+        }
+        // Bounded like the writer's dirty list: if the helper has fallen this far behind, the oldest segment's early
+        // write-back is skipped (it is only a head start; the checkpoint syncs that segment anyway), so the helper
+        // never holds more than a few segment files open.
+        if state.rolled.len() >= crate::checkpoint::OPEN_SEGMENTS {
+            state.rolled.remove(0);
         }
         state.rolled.push((old, old_end));
         state.file = Some(file);

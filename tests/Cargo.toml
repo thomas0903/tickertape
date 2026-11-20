@@ -103,3 +103,7 @@ path = "committed_tail.rs"
 [[test]]
 name = "background_checkpoint"
 path = "background_checkpoint.rs"
+
+[[test]]
+name = "open_segments"
+path = "open_segments.rs"

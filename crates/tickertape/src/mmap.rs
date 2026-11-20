@@ -1366,6 +1366,16 @@ pub(crate) fn preallocate(file: &File, len: u64) -> io::Result<()> {
     }
 }
 
+/// `msync(MS_SYNC)` on the pages covering `[offset, offset + len)` of `file` (opened read-write), through a new shared
+/// mapping of the whole file: for a segment whose earlier mapping is gone (a checkpoint of a released segment on macOS,
+/// `checkpoint::steps`). The mapping is the file's, not the old one's, so the call writes back the file's dirty pages
+/// in the range whichever mapping dirtied them.
+pub(crate) fn msync_file(file: &File, offset: u64, len: u64) -> io::Result<()> {
+    let size = usize::try_from(file.metadata()?.len())
+        .map_err(|_| io::Error::other("file too large to map"))?;
+    MapRw::new(file, size)?.sync_range(offset, len)
+}
+
 /// Flushes a file's data (and the metadata needed to read it) to the device: `fdatasync` on Linux, `fsync`
 /// elsewhere. On macOS this does not flush the drive's cache; see [`full_barrier`].
 pub(crate) fn sync_data(file: &File) -> io::Result<()> {

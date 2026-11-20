@@ -49,7 +49,8 @@ the Linux measurement").
 - `request_checkpoint(&mut self) -> Result<u64>` captures the frontier (active segment, offset, next sequence number),
   moves the dirty list (ranges, files, directories) into a job, and queues it; it returns the `next_seq` the job covers.
   The first call starts the thread (`tickertape-checkpoint`). The calling thread takes one lock and moves a few small
-  values; no system call.
+  values; no system call, except when the request leaves a dirty list more than four segments long (Bounded open
+  segments, below).
 - `checkpoint_progress(&mut self) -> Result<CheckpointProgress>` reports `durable` (the marker this writer last made
   durable) and `pending` (the `next_seq` of the newest request not finished). One atomic load when nothing changed.
 - `checkpoint()` waits for the jobs in flight, then checkpoints on the calling thread exactly as before (same steps,
@@ -278,6 +279,47 @@ measurement needs no `taskset`. Tests: `affinity::tests` and `writer::tests::hel
 page cache each second on Linux (`dirty_bytes`, `writeback_bytes` in the writer's samples; maxima in
 `writer.page_cache`). A roll's cost on the writer's thread already shows as `roll_append_latency`.
 
+## After the scale measurement
+
+### Bounded open segments
+
+`tt-scale` (ADR 0042) failed to open a writer on a journal of 10,000 segments without a marker: `EMFILE` at about
+the thousandth segment. Recovery kept every segment after the marker in the writer's dirty list with its file open, for
+the first checkpoint to sync, and so did every roll (file and mapping) until the next checkpoint, also in v0.4.0. A
+writer that checkpoints rarely or never therefore held one more descriptor and one more segment mapping per roll, and
+failed at the descriptor limit; the background checkpoint's job and the early write-back helper's list of rolled
+segments held the same files.
+
+Now a dirty list (`checkpoint::DirtySegments`) keeps the file and mapping handle of its four most recent segments
+only; pushing a fifth releases the oldest held one, which stays in the list by absolute path, file identity (device
+and inode, from an `fstat` before it lets go) and range. Rolls usually do the release; so does a request that leaves a
+list longer than four, after many rolls since the previous request or when requests join a checkpoint queued behind a
+slow one: that request may then drop the last reference to the released segment's file and mapping (a `close` and a
+`munmap` on the calling thread), and the job reopens the segment later. Nothing is added to an append, and recovery's
+inherited segments go into the same list. The background checkpoint's
+job is such a list too (a queued job that absorbs later requests merges them through it), and the write-back helper
+keeps at most four rolled segments, skipping the oldest one's early write-back if it falls that far behind (it is
+only a head start). **Four** because a writer that checkpoints at least once per roll then does not reopen a segment (unless its
+requests pile up behind a slow background checkpoint, above),
+and because a few lists of four (the writer's, a running and a queued job's, the helper's) stay far below the usual
+descriptor limits, whatever the segment count.
+
+A checkpoint opens each released segment again by path, checks that it is the same file (device and inode), and
+syncs it there; on macOS it also maps it again and calls `msync` on the range first. The journal directory is made
+absolute at `Writer::open` for everything the writer opens later, so a writer opened with a relative path is not
+redirected by a change of the working directory (`Writer::dir` still returns the path as given). Why that is enough,
+and what a held descriptor gave that a reopened one does not (a write-back error the kernel forgets with an evicted
+inode, or that another descriptor already observed, goes unreported), is in `docs/crash-contract.md` → Segments the
+writer no longer holds. A released segment is after the marker, so retention leaves it; if it is gone at the
+checkpoint, or replaced by another file under its name, the checkpoint fails as an I/O error before any marker and
+poisons the writer. Under `RecoveryPolicy::Fail` the changes held back after a restored header (C11) keep only the
+path and identity of their segment too, and reopen it, one at a time, when they are made. Tests: `tests/open_segments.rs` (300 rolls with a descriptor
+limit of 64, without checkpoints and with background checkpoints every 25 rolls, then a durable-only reader reads
+everything; recovery over more segments than the limit under both policies, and under `Fail` with a header to
+restore and a seal to write in every segment; a removed released segment fails a blocking and a background checkpoint
+and poisons the writer, and so does one replaced by a copy; a writer opened with a relative path checkpoints its own
+segments after the process changes into a directory holding another journal with the same file names).
+
 ## Consequences
 
 - One more thread per writer once `request_checkpoint` is used (none otherwise); drop can wait for a checkpoint.
@@ -288,6 +330,8 @@ page cache each second on Linux (`dirty_bytes`, `writeback_bytes` in the writer'
   invalid.
 - Helper threads no longer inherit a pinned caller's CPU mask unless asked to (`HelperCpus::Inherited`).
 - The abandoned-write path can wait for a background checkpoint to finish (it takes the same lock).
+- Between checkpoints a writer holds at most four rolled or inherited segments open per dirty list; a checkpoint
+  reopens the others, and fails if one is gone or replaced.
 - The C ABI, the bindings, the CLI and the iceoryx2 recorder adopt the API once this ADR is accepted.
 - An external `retention::apply` syncs the checkpoint marker once per new slot before it removes anything.
 - Tests: `tests/background_checkpoint.rs` (C7, C12, C13, C14 with a checkpoint in flight; the roll kill test; early

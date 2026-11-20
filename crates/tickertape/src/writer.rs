@@ -11,7 +11,9 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use crate::checkpoint::{self, Background, Context, DirtySegment, Job, Marker, On};
+use crate::checkpoint::{
+    self, Background, Context, DirtySegment, DirtySegments, FileId, Job, Marker, On,
+};
 use crate::config::{RecoveryPolicy, WriterConfig};
 use crate::error::{CorruptReason, Error, Result};
 use crate::format::{self, CheckpointSlot, RecordHeader, ScanEnd, SegmentHeader, SegmentView};
@@ -55,6 +57,10 @@ pub struct Writer {
     collected: u64,
     /// The generation and the covered `next_seq` of the newest background checkpoint requested.
     requested: Option<(u64, u64)>,
+    /// The journal directory made absolute at the open: the files the writer creates, reopens or syncs after the open
+    /// are named under it, so a change of the process's working directory does not redirect them.
+    root: PathBuf,
+    /// The path given to [`Writer::open`], which [`Writer::dir`] returns.
     dir: PathBuf,
     config: WriterConfig,
     active: Segment,
@@ -63,8 +69,9 @@ pub struct Writer {
     next_seq: u64,
     /// Start of the not-yet-checkpointed range of `active`.
     active_dirty_from: u64,
-    /// Segments with not-yet-checkpointed data other than `active`, since the last checkpoint was requested.
-    dirty: Vec<DirtySegment>,
+    /// Segments with not-yet-checkpointed data other than `active`, since the last checkpoint was requested. Only the
+    /// newest few keep their file and mapping open ([`checkpoint::OPEN_SEGMENTS`]).
+    dirty: DirtySegments,
     /// Directories whose entries changed since the last checkpoint was requested.
     dirty_dirs: BTreeSet<PathBuf>,
     /// The marker file, the lost-durability flag and the notify publisher, shared with the checkpoint thread.
@@ -148,6 +155,21 @@ impl Writer {
             Error::InvalidConfig(format!("segment_size {}: {r}", config.segment_size))
         })?;
         let dir = dir.as_ref().to_path_buf();
+        // Recovery uses `dir` as given (its report and errors name paths as before); what the writer keeps for later
+        // (its segments' paths, the directories to sync, the directory it rolls and runs retention in) is made
+        // absolute against the working directory now.
+        let cwd = if dir.is_relative() {
+            Some(
+                std::env::current_dir()
+                    .map_err(|e| Error::io("resolve journal directory", &dir, e))?,
+            )
+        } else {
+            None
+        };
+        let resolve = |p: &Path| match &cwd {
+            Some(cwd) if p.is_relative() => cwd.join(p),
+            _ => p.to_path_buf(),
+        };
         let mut report = RecoveryReport::default();
 
         let created_dirs = create_dirs(&dir)?;
@@ -175,14 +197,17 @@ impl Writer {
         };
         rec.remove_tmp_files()?;
         let (checkpoint_file, checkpoint, checkpoint_file_short) = rec.open_checkpoint_file()?;
-        let state = rec.recover(checkpoint)?;
-        let mut dirty_dirs = rec.dirty_dirs;
+        let mut state = rec.recover(checkpoint)?;
+        let mut dirty_dirs: BTreeSet<PathBuf> = rec.dirty_dirs.iter().map(|d| resolve(d)).collect();
         // A new writer can't know whether directory entries made by earlier writers are durable, including the
         // journal directory's own entry in its parent (an earlier writer may have died right after creating it).
-        dirty_dirs.insert(dir.clone());
+        dirty_dirs.insert(resolve(&dir));
         if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
-            dirty_dirs.insert(parent.to_path_buf());
+            dirty_dirs.insert(resolve(parent));
         }
+        state.active.path = resolve(&state.active.path);
+        state.dirty.map_paths(resolve);
+        let root = resolve(&dir);
 
         report.next_seq = state.next_seq;
         let notify = crate::notify::open_for_writer(&dir, config.notify);
@@ -197,7 +222,7 @@ impl Writer {
             })
             .flatten();
         let ctx = Arc::new(Context {
-            dir: dir.clone(),
+            dir: root.clone(),
             marker: Mutex::new(Marker {
                 file: checkpoint_file,
                 short: checkpoint_file_short,
@@ -219,6 +244,7 @@ impl Writer {
             })
             .flatten();
         let mut writer = Writer {
+            root,
             dir,
             config,
             lock,
@@ -541,7 +567,7 @@ impl Writer {
         {
             self.spare_requested = true;
             self.spare = crate::prefault::prepare_spare(
-                &self.dir,
+                &self.root,
                 self.config.segment_size,
                 self.config.helper_cpus.clone(),
             );
@@ -653,13 +679,13 @@ impl Writer {
     /// a new dirty list.
     fn take_job(&mut self, generation: u64) -> Job {
         let mut segments = std::mem::take(&mut self.dirty);
-        segments.push(DirtySegment {
-            file: Arc::clone(&self.active.file),
-            flush: Some(self.active.map.flush_handle()),
-            from: self.active_dirty_from,
-            to: self.offset,
-            path: self.active.path.clone(),
-        });
+        segments.push(DirtySegment::written(
+            Arc::clone(&self.active.file),
+            self.active.map.flush_handle(),
+            self.active_dirty_from,
+            self.offset,
+            self.active.path.clone(),
+        ));
         self.active_dirty_from = self.offset;
         Job {
             slot: CheckpointSlot {
@@ -694,7 +720,10 @@ impl Writer {
     /// [`Writer::checkpoint`], [`Writer::close`] and dropping the writer wait for it.
     ///
     /// Cost on the calling thread: one lock of the state shared with the checkpoint thread and a few small moves; no
-    /// system call (except for starting the thread at the first call).
+    /// system call, except for starting the thread at the first call, and when the request leaves a checkpoint's list
+    /// of dirty segments longer than four (many rolls since the last request, or requests that join one waiting behind
+    /// a slow checkpoint): then it reads the identity (`fstat`) of each segment it lets go of, and, if it dropped the
+    /// last reference to that segment's file or mapping, closes or unmaps it; the checkpoint later reopens it.
     ///
     /// # Errors
     ///
@@ -1011,9 +1040,9 @@ impl Writer {
         let Some((policy, action)) = &self.config.retention else {
             return;
         };
-        let result = crate::retention::plan(&self.dir, policy).and_then(|plan| {
+        let result = crate::retention::plan(&self.root, policy).and_then(|plan| {
             crate::retention::apply_into(
-                &self.dir,
+                &self.root,
                 &plan,
                 action,
                 &mut self.retention_report,
@@ -1026,7 +1055,7 @@ impl Writer {
         }
     }
 
-    /// The journal directory.
+    /// The journal directory, as given to [`Writer::open`].
     pub fn dir(&self) -> &Path {
         &self.dir
     }
@@ -1042,12 +1071,12 @@ impl Writer {
         // segment linked before its request before it writes a marker; recovery restores a header that a crash kept
         // from reaching the disk (ADR 0038 → Rolls without a sync; crash contract C8).
         let new = match self.take_spare() {
-            Some(spare) => publish_spare(&self.dir, next_base, self.config.segment_size, spare)?,
-            None => create_segment(&self.dir, next_base, self.config.segment_size, false)?,
+            Some(spare) => publish_spare(&self.root, next_base, self.config.segment_size, spare)?,
+            None => create_segment(&self.root, next_base, self.config.segment_size, false)?,
         };
         crate::fault::hook(crate::fault::Point::RollAfterLink);
         self.spare_requested = false;
-        self.dirty_dirs.insert(self.dir.clone());
+        self.dirty_dirs.insert(self.root.clone());
         // After the link, the roll always completes: seal the old segment, then switch.
         let seal_at = self.offset;
         let crc = format::seal_crc(next_base).to_le_bytes();
@@ -1069,13 +1098,15 @@ impl Writer {
                 format::SEGMENT_HEADER_LEN as u64,
             );
         }
-        self.dirty.push(DirtySegment {
-            file: old.file,
-            flush: Some(old.map.flush_handle()),
-            from: self.active_dirty_from,
-            to: seal_at + format::SEAL_LEN as u64,
-            path: old.path,
-        });
+        // The list keeps only the newest few segments open: pushing this one releases the file and mapping of the one
+        // that leaves its window (`checkpoint::OPEN_SEGMENTS`), and the checkpoint that covers that one reopens it.
+        self.dirty.push(DirtySegment::written(
+            old.file,
+            old.map.flush_handle(),
+            self.active_dirty_from,
+            seal_at + format::SEAL_LEN as u64,
+            old.path,
+        ));
         self.offset = format::SEGMENT_HEADER_LEN as u64;
         self.active_dirty_from = self.offset;
         if let Some(prefault) = &mut self.prefault {
@@ -1092,7 +1123,7 @@ impl Writer {
         match self.spare.take()?.join() {
             Ok(Ok(spare)) if spare.size == self.config.segment_size => Some(spare),
             Ok(Ok(_)) => {
-                let _ = fs::remove_file(self.dir.join(journal::SPARE_FILE));
+                let _ = fs::remove_file(self.root.join(journal::SPARE_FILE));
                 None
             }
             // Preparing failed (it removed its own file) or the thread panicked: create the segment synchronously.
@@ -1122,7 +1153,7 @@ impl Drop for Writer {
             drop(self.background.take());
             if let Some(Ok(Ok(spare))) = self.spare.take().map(|h| h.join()) {
                 drop(spare);
-                let _ = fs::remove_file(self.dir.join(journal::SPARE_FILE));
+                let _ = fs::remove_file(self.root.join(journal::SPARE_FILE));
             }
             drop(self.prefault.take());
             drop(self.writeback.take());
@@ -1367,7 +1398,7 @@ struct RecoveredState {
     offset: u64,
     next_seq: u64,
     active_dirty_from: u64,
-    dirty: Vec<DirtySegment>,
+    dirty: DirtySegments,
 }
 
 /// How [`Recovery::restore_unwritten_header`] restores a segment whose header never reached the disk.
@@ -1382,9 +1413,11 @@ enum Restore {
 /// A change to the journal that recovery under [`RecoveryPolicy::Fail`] holds back once it has decided to restore a
 /// header, until the open can no longer refuse (crash contract C11; [`Recovery::commit_held`]).
 enum Held {
-    /// Write the header of the segment for `base`, whose file `file` has the valid segment size `len`, again.
+    /// Write the header of the segment for `base`, whose file at `path` (identity `id`) has the valid segment size
+    /// `len`, again. The file is not kept open: a scan may hold back many of these (one per restored header), and
+    /// each is reopened when it is made.
     Header {
-        file: Arc<File>,
+        id: FileId,
         path: PathBuf,
         base: u64,
         len: u64,
@@ -1393,17 +1426,17 @@ enum Held {
     Rename { tmp: PathBuf, path: PathBuf },
     /// Publish the segment prepared and synced under `tmp` as `path`, which does not exist: a created successor.
     Link { tmp: PathBuf, path: PathBuf },
-    /// Zero `len` bytes at `start` of the segment in `file` (of size `size`): an uncommitted tail.
+    /// Zero `len` bytes at `start` of the segment at `path` (identity `id`, of size `size`): an uncommitted tail.
     Zero {
-        file: Arc<File>,
+        id: FileId,
         path: PathBuf,
         size: u64,
         start: u64,
         len: u64,
     },
-    /// Write a seal for `next_seq` at `offset` of the segment in `file` (of size `size`).
+    /// Write a seal for `next_seq` at `offset` of the segment at `path` (identity `id`, of size `size`).
     Seal {
-        file: Arc<File>,
+        id: FileId,
         path: PathBuf,
         size: u64,
         offset: u64,
@@ -1505,7 +1538,7 @@ impl Recovery<'_> {
                 offset: format::SEGMENT_HEADER_LEN as u64,
                 next_seq: 0,
                 active_dirty_from: format::SEGMENT_HEADER_LEN as u64,
-                dirty: Vec::new(),
+                dirty: DirtySegments::default(),
             });
         }
 
@@ -1533,7 +1566,9 @@ impl Recovery<'_> {
             }
         }
         let mut visited = BTreeSet::new();
-        let mut dirty = Vec::new();
+        // Segments after the marker, synced by the first checkpoint; only the newest few stay open, so a scan of any
+        // number of segments holds a bounded number of descriptors.
+        let mut dirty = DirtySegments::default();
         // Where this writer's uncheckpointed data starts in `seg` (for `Writer::metrics`).
         let mut seg_from = offset;
 
@@ -1813,9 +1848,10 @@ impl Recovery<'_> {
                         .map_err(|_| io::Error::other("segment too large"))
                         .and_then(|len| MapRw::new(&file, len))
                         .map_err(|e| Error::io("map segment", &path, e))?;
+                    let id = FileId::of(&file).map_err(|e| Error::io("stat segment", &path, e))?;
                     let file = Arc::new(file);
                     self.held.push(Held::Header {
-                        file: Arc::clone(&file),
+                        id,
                         path: path.clone(),
                         base,
                         len,
@@ -1924,11 +1960,11 @@ impl Recovery<'_> {
     fn make_held(&mut self, change: &Held) -> Result<()> {
         match change {
             Held::Header {
-                file,
+                id,
                 path,
                 base,
                 len,
-            } => write_header(file, path, *base, *len),
+            } => write_header(&reopen_held(path, *id)?, path, *base, *len),
             Held::Rename { tmp, path } => self.rename_prepared(tmp, path),
             Held::Link { tmp, path } => {
                 // As `create_segment` publishes: a link that replaces nothing, then the temporary name removed (a
@@ -1938,25 +1974,37 @@ impl Recovery<'_> {
                 journal::sync_dir(self.dir)
             }
             Held::Zero {
-                file,
+                id,
                 path,
                 size,
                 start,
                 len,
-            } => zero_bytes(&mut map_held(file, path, *size)?, file, path, *start, *len),
+            } => {
+                let file = reopen_held(path, *id)?;
+                zero_bytes(
+                    &mut map_held(&file, path, *size)?,
+                    &file,
+                    path,
+                    *start,
+                    *len,
+                )
+            }
             Held::Seal {
-                file,
+                id,
                 path,
                 size,
                 offset,
                 next_seq,
-            } => put_seal(
-                &mut map_held(file, path, *size)?,
-                file,
-                path,
-                *offset,
-                *next_seq,
-            ),
+            } => {
+                let file = reopen_held(path, *id)?;
+                put_seal(
+                    &mut map_held(&file, path, *size)?,
+                    &file,
+                    path,
+                    *offset,
+                    *next_seq,
+                )
+            }
         }
     }
 
@@ -1985,7 +2033,7 @@ impl Recovery<'_> {
             zero_bytes(&mut seg.map, &seg.file, &seg.path, start, len)?;
         } else {
             self.held.push(Held::Zero {
-                file: Arc::clone(&seg.file),
+                id: held_id(seg)?,
                 path: seg.path.clone(),
                 size: seg.size,
                 start,
@@ -2006,7 +2054,7 @@ impl Recovery<'_> {
             return put_seal(&mut seg.map, &seg.file, &seg.path, offset, next_seq);
         }
         self.held.push(Held::Seal {
-            file: Arc::clone(&seg.file),
+            id: held_id(seg)?,
             path: seg.path.clone(),
             size: seg.size,
             offset,
@@ -2168,6 +2216,17 @@ fn write_header(file: &File, path: &Path, base: u64, len: u64) -> Result<()> {
     mmap::sync_data(file).map_err(|e| Error::io("sync segment", path, e))
 }
 
+/// The identity of `seg`'s file, for a change held back on it ([`Held`]).
+fn held_id(seg: &Segment) -> Result<FileId> {
+    FileId::of(&seg.file).map_err(|e| Error::io("stat segment", &seg.path, e))
+}
+
+/// Opens the segment at `path` again to make a held-back change ([`Held`]), checking that it is still the file `id`
+/// was read from.
+fn reopen_held(path: &Path, id: FileId) -> Result<File> {
+    checkpoint::reopen(path, id).map_err(|e| Error::io("open segment", path, e))
+}
+
 /// Maps the segment in `file` (of size `size`) to make a held-back change ([`Held`]).
 fn map_held(file: &File, path: &Path, size: u64) -> Result<MapRw> {
     usize::try_from(size)
@@ -2239,13 +2298,15 @@ fn committed_after_empty(
 
 /// A segment inherited from an earlier writer: the next checkpoint syncs its whole file. `[from, seal_at)` holds the
 /// records an earlier writer appended after the marker, followed by the seal at `seal_at`; the range only feeds
-/// [`Writer::metrics`] (`uncheckpointed_bytes`).
+/// [`Writer::metrics`] (`uncheckpointed_bytes`). The segment's mapping is dropped here.
 fn inherited(seg: Segment, from: u64, seal_at: u64) -> DirtySegment {
     DirtySegment {
         from,
         to: seal_at + format::SEAL_LEN as u64,
-        file: seg.file,
+        file: Some(seg.file),
         flush: None,
+        id: None,
+        mapped: false,
         path: seg.path,
     }
 }
