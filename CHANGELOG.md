@@ -5,6 +5,13 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
+- Docs: ADR 0042 (replay and recovery at scale) is accepted after the cloud run of `tt-scale` (informal figures in
+  pull request #33): no sparse index for 1.0, since a seek costs at most one scan of the segment holding its target
+  (`docs/operations.md` → Choosing a segment size); the sparse index, a bounded read of the newest segment at writer
+  open and fewer per-segment opens stay possible later work. `status::Sampler` with `Status::breaches`, and creating
+  reader beacons, stay in Rust only in 1.0. The "Before 1.0" list of `docs/compatibility.md` now holds the ABI version
+  and baseline freeze, the 1.0 fixtures, the release-candidate exercise and recording the sustained session's
+  results; the roadmap's status lines are updated to pull request #40.
 - Background checkpoints (ADR 0038) reach the C ABI and the bindings, and the iceoryx2 recorder uses them:
   - Added (C ABI): `tickertape_writer_request_checkpoint`, `tickertape_writer_checkpoint_progress` with the
     extensible struct `tickertape_checkpoint_progress` (minimum size 56), `tickertape_writer_options_set_early_writeback`,
@@ -88,7 +95,6 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   (ADR 0033; upgrading and downgrading) and the crash contract, what is promised from 1.0 and how each may change
   afterwards, and a "Before 1.0" list of what still blocks declaring them stable. The roadmap marks the
   interoperability layer done and says for each open item what is missing.
-- Changed: `format::LaterHistory` (added since v0.4.0) is `#[non_exhaustive]`.
 - Docs: `c-api.md` lists all six extensible structs and their minimum sizes (it named two); `python.md` says the
   bindings are not stable before 1.0; ADR 0034's status says accepted (its pull request was merged).
 
@@ -111,7 +117,7 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   view of a batch's first records until the batch ends or the next roll in it. A record that does not fit rolls, as
   with `append`. On a failure the batch stops and returns a `BatchError` with the number of records appended (they
   stay committed), the first sequence number and the cause. The C ABI's `tickertape_writer_append_batch` (signature
-  unchanged) and Python's `Writer.append_many` now use it; the C function's `*appended_out` is documented as the
+  unchanged) and Python's `Writer.append_batch` now use it; the C function's `*appended_out` is documented as the
   count when it returns. `WriterConfig::notify`'s documentation says what a batch publishes. The `append` benchmark
   gains an `append/batch` group. `demo-producer` encodes each event directly into its record with
   `Writer::append_with` (new `Event::encode_into` and `Event::encoded_len` in the examples crate).
@@ -187,7 +193,7 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   - C++: `tickertape::JournalStatus::sample`, `StatusReport`, `BeaconStatus`, `Writer::metrics`,
     `Reader::metrics(const JournalStatus &)`, and the matching enumerations. `Checkpoint` moved up in the header
     (unchanged).
-  - Python: `tickertape.status(path, readers_dir=None)` returning `JournalStatus`, `Writer.metrics()`,
+  - Python: `tickertape.JournalStatus.sample(path, readers_dir=None)`, `Writer.metrics()`,
     `Reader.metrics(status)`, and their named tuples.
   - Java: `JournalStatus.sample`, `Writer.metrics()`, `Reader.metrics(JournalStatus)`, `WriterMetrics`,
     `ReaderMetrics`, `BeaconStatus`, `Position`, `Lag` and the enums `HeadEnd`, `CheckpointProblem`, `AgeUnknown`,

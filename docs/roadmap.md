@@ -107,8 +107,8 @@ version numbers and dates are not fixed. Performance changes must preserve valid
 contract. An optimization investigation can close with a documented, measured decision that the proposed change
 does not help or cannot preserve those guarantees; such a decision must be explicit in the roadmap and its ADR.
 
-Status of each item as of the review of 2026-11-20 ([`compatibility.md`](compatibility.md)): an item is ticked only when every
-criterion holds; each open item says what is still missing.
+Status of each item as of 2026-11-20, after pull request #40 ([`compatibility.md`](compatibility.md)): an item is
+ticked only when every criterion holds; each open item says what is still missing.
 
 ### Next release: sustained performance
 
@@ -137,8 +137,10 @@ criterion holds; each open item says what is still missing.
     tracing overhead, and confirm performance conclusions with tracing disabled.
   - Keep diagnostics optional: the library and CLI must work without eBPF, elevated tracing permissions or a
     collector. Kernel-event recording and XDP/AF_XDP ingestion remain separate proposals.
-  - Missing: the playbook is in place (`docs/playbooks/diagnose-latency-with-ebpf.md`, #31); the tracing overhead has
-    not been measured on a cloud Linux machine running the sustained workloads (#31 has informal OrbStack figures).
+  - Missing: the playbook, with its tool and kernel requirements and how to measure the overhead and confirm with
+    tracing off, is in place (`docs/playbooks/diagnose-latency-with-ebpf.md`, #31); the tracing overhead during the
+    sustained workloads on a cloud Linux machine, and a conclusion confirmed with tracing off, are not recorded in
+    `docs/benchmarks.md` (#31 has informal OrbStack figures).
 - [ ] **Remove the mapped reader's validation copy.**
   - Compute CRC and validate record fields directly from atomic loads, eliminating the per-record scratch copy
     while retaining validation before creating any borrowed slice into the mapping.
@@ -156,8 +158,11 @@ criterion holds; each open item says what is still missing.
     implementation already restricts `msync` to written ranges, then performs file-wide sync/barrier operations.
   - Investigate reducing the remaining flush work without weakening data-before-marker ordering or the crash
     contract. Record before/after checkpoint and durable-only reader latency, or document platform limitations.
-  - A checkpoint that does not stop appends (`Writer::request_checkpoint`, ADR 0038, accepted): merged (#28), with
-    the Linux measurement the ADR describes (`tt-sustained --checkpoint-mode`) in the pull request's comments.
+  - A checkpoint that does not stop appends (`Writer::request_checkpoint`, ADR 0038, accepted): merged (#28, with
+    the Linux measurement the ADR describes, `tt-sustained --checkpoint-mode`, in the pull request's comments), with
+    a bounded number of open segments between checkpoints (#38), `RecoveryPolicy::Fail` holding back the changes from
+    the first header it would restore until the open can no longer refuse (#35), and exposed through the C ABI, C++,
+    Python, Java and the iceoryx2 recorder (#39).
   - Missing: the Linux results of ADR 0038, the prefaulted-data measurement and before/after checkpoint and
     durable-only reader latency are not recorded in `docs/benchmarks.md`.
 - [ ] **Finish eliminating avoidable work.**
@@ -182,7 +187,7 @@ criterion holds; each open item says what is still missing.
 
 - [x] **Build a small interoperability layer.** (done 2026-11-20: C ABI #10, Python #7, C++ #19, Java #21, iceoryx2
   #13, metrics through the bindings #30, install tests #29; publishing is the next item; the names in ADRs 0029 and
-  0037 are accepted)
+  0037 are accepted; since then, names aligned with Rust #37 and background checkpoints through the bindings #39)
   - Provide a C ABI with documented ownership, record lifetimes, errors, threading, durability and versioning, plus
     a C/C++ example. Keep bindings and framework adapters outside the core crate.
   - Provide installable Python bindings with batch operations and explicit copy/lifetime behavior. Preserve the
@@ -210,9 +215,13 @@ criterion holds; each open item says what is still missing.
     validation or allow stale positions after recovery/replacement.
   - Address measured bottlenecks while keeping memory bounded and preserving the rule that recovery does not
     silently discard committed history. Record regression workloads and remaining limits.
-  - Missing: `tt-scale` and the growth table are in place (ADR 0042, proposed, #33); no cloud run on local SSD with
-    a journal larger than RAM is recorded, archived history, missing or corrupt segments, catch-up and the zero-copy
-    reader are not measured, and the sparse-index decision waits for that run.
+  - Status: `tt-scale` and the growth table are in place (#33), and the cloud run on local SSD with a journal larger
+    than RAM is done (informal figures in #33); ADR 0042 is accepted with no sparse index for 1.0, since a seek costs
+    at most one segment's scan (`docs/operations.md` → Choosing a segment size). The defect the run found, one open
+    file per segment between checkpoints, is fixed (#38).
+  - Missing: the dataset sizes and resource usage are not recorded in `docs/benchmarks.md`; archived history, missing
+    or corrupt segments, catch-up under a live writer, the zero-copy reader and the 10,000- and 20,000-segment
+    journals (unmeasurable before #38) are not measured.
 
 ### v1.0 readiness
 
@@ -226,9 +235,10 @@ criterion holds; each open item says what is still missing.
   - Exercise release/installation/upgrade instructions and the external integration against a release candidate.
     Complete the release checklist and publish guarantees, measured operating limits and known issues.
   - Missing: the surfaces are reviewed and documented in [`compatibility.md`](compatibility.md) (ADR 0043,
-    accepted), with the fixtures and soak tier (#12) and the metrics (#8, #30) in place; its "Before 1.0" list still
-    holds ADR 0042, the features no binding reaches yet, the ABI freeze and the 1.0 fixtures; the release-candidate
-    exercise has not been done (a tag needs the owner's approval), and no measured operating limits are published.
+    accepted; resolved in #37), with the fixtures and soak tier (#12) and the metrics (#8, #30) in place; its
+    "Before 1.0" list still holds the ABI version and baseline freeze, the 1.0 fixtures, the release-candidate
+    exercise (a tag needs the owner's approval) and recording the sustained session's results, so no measured
+    operating limits are published.
 
 **v1.0 release gate:** all milestones above are complete under their stated criteria, CI is green on Linux and
 macOS, the aarch64 checks pass, and no known unresolved issue violates the published safety, corruption-detection,
