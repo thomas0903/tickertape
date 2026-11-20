@@ -6,7 +6,11 @@ use std::io::{self, Read, Write};
 use std::os::unix::fs::FileExt;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
+use crate::checkpoint::{self, Background, Context, DirtySegment, Job, Marker, On};
 use crate::config::{RecoveryPolicy, WriterConfig};
 use crate::error::{CorruptReason, Error, Result};
 use crate::format::{self, CheckpointSlot, RecordHeader, ScanEnd, SegmentHeader, SegmentView};
@@ -14,6 +18,7 @@ use crate::journal::{self, CHECKPOINT_FILE, LOCK_FILE, QUARANTINE_DIR};
 use crate::mmap::{self, MapRw};
 use crate::prefault::{Prefaulter, Spare};
 use crate::record::NewRecord;
+use crate::writeback::WriteBack;
 
 /// The only process allowed to append to a journal.
 ///
@@ -32,13 +37,23 @@ use crate::record::NewRecord;
 /// safety).
 ///
 /// Dropping a writer does **not** checkpoint. Everything appended stays visible and survives the process exiting,
-/// but is durable only after [`Writer::checkpoint`]. See `docs/crash-contract.md`.
+/// but is durable only after [`Writer::checkpoint`], or after a background checkpoint started with
+/// [`Writer::request_checkpoint`] has finished. Dropping waits for the background checkpoints already requested
+/// (and joins the thread that runs them, ADR 0038); [`Writer::close`] does the same and reports how they ended. See
+/// `docs/crash-contract.md`.
 #[derive(Debug)]
 pub struct Writer {
     /// Holds the `flock` for the writer's lifetime. Keep this field first: fields drop in declaration order, and in a
     /// forked child the guard's descriptor must close before any field whose drop could block there (see the
     /// `Drop` implementation).
     lock: JournalLock,
+    /// The checkpoint thread, once a background checkpoint has been requested (ADR 0038). Dropped (finishing the
+    /// requested checkpoints and joining the thread) first in `Drop`, while the lock is still held.
+    background: Option<Background>,
+    /// The value of the checkpoint thread's `posted` counter when the writer last collected its results.
+    collected: u64,
+    /// The generation and the covered `next_seq` of the newest background checkpoint requested.
+    requested: Option<(u64, u64)>,
     dir: PathBuf,
     config: WriterConfig,
     active: Segment,
@@ -47,24 +62,27 @@ pub struct Writer {
     next_seq: u64,
     /// Start of the not-yet-checkpointed range of `active`.
     active_dirty_from: u64,
-    /// Segments with not-yet-checkpointed data other than `active`.
+    /// Segments with not-yet-checkpointed data other than `active`, since the last checkpoint was requested.
     dirty: Vec<DirtySegment>,
-    /// Directories whose entries changed since the last checkpoint.
+    /// Directories whose entries changed since the last checkpoint was requested.
     dirty_dirs: BTreeSet<PathBuf>,
-    checkpoint_file: File,
-    /// The marker file is shorter than its full length (something cut it): it is extended after the next checkpoint's
-    /// marker barrier, never at open (ADR 0032 → Checkpoint age).
-    checkpoint_file_short: bool,
+    /// The marker file, the lost-durability flag and the notify publisher, shared with the checkpoint thread.
+    ctx: Arc<Context>,
     /// The wake-up region, if enabled and available (ADRs 0017 and 0021).
     notify: Option<mmap::Notify>,
     /// The background prefault thread, if enabled and started (ADR 0020).
     prefault: Option<Prefaulter>,
+    /// The early write-back thread, if enabled and started (Linux; ADR 0038).
+    writeback: Option<WriteBack>,
     /// The next segment being prepared in the background, if requested (ADR 0022).
     spare: Option<std::thread::JoinHandle<io::Result<Spare>>>,
     /// Whether a spare has been requested for the current active segment.
     spare_requested: bool,
+    /// The generation of the newest checkpoint this writer started (or of the marker read at open).
     generation: u64,
     poisoned: bool,
+    /// Bytes of checkpoints that failed on this thread (for `metrics`): no checkpoint of this writer covers them.
+    failed_bytes: u64,
     /// Set if an abandoned write's zeroing could not be made durable; see `abandon`.
     abandoned_write_error: Option<Error>,
     report: RecoveryReport,
@@ -84,19 +102,9 @@ struct Segment {
     base: u64,
     size: u64,
     path: PathBuf,
-    file: File,
+    /// Shared with a background checkpoint that syncs this segment.
+    file: Arc<File>,
     map: MapRw,
-}
-
-/// A segment with data that the next checkpoint must sync. Rolled-past segments keep their mapping (so `msync`
-/// covers it); segments inherited from an earlier writer only need their file synced.
-#[derive(Debug)]
-struct DirtySegment {
-    file: File,
-    map: Option<MapRw>,
-    from: u64,
-    to: u64,
-    path: PathBuf,
 }
 
 /// Read-only view of the writer's own mapping for the format module's scanner. Sound because only this process
@@ -178,26 +186,58 @@ impl Writer {
         let notify = crate::notify::open_for_writer(&dir, config.notify);
         // The helper runs on macOS (ADR 0020) and Linux (ADR 0025); elsewhere it would have no advice to give.
         let prefault = (config.prefault && cfg!(any(target_vendor = "apple", target_os = "linux")))
-            .then(|| Prefaulter::start(state.active.map.advice(), state.offset))
+            .then(|| {
+                Prefaulter::start(
+                    state.active.map.advice(),
+                    state.offset,
+                    config.helper_cpus.clone(),
+                )
+            })
+            .flatten();
+        let ctx = Arc::new(Context {
+            dir: dir.clone(),
+            marker: Mutex::new(Marker {
+                file: checkpoint_file,
+                short: checkpoint_file_short,
+            }),
+            lost: Mutex::new(false),
+            writeback_failure: Mutex::new(None),
+            writeback_failed: std::sync::atomic::AtomicBool::new(false),
+            notify: notify.as_ref().map(mmap::Notify::publisher),
+        });
+        // Linux only (`WriteBack::start` returns `None` elsewhere); `prefault(false)` means no helper threads.
+        let writeback = (config.early_writeback && config.prefault)
+            .then(|| {
+                WriteBack::start(
+                    Arc::clone(&state.active.file),
+                    state.offset,
+                    Arc::clone(&ctx),
+                    config.helper_cpus.clone(),
+                )
+            })
             .flatten();
         let mut writer = Writer {
             dir,
             config,
             lock,
+            background: None,
+            collected: 0,
+            requested: None,
             active_dirty_from: state.active_dirty_from,
             offset: state.offset,
             next_seq: state.next_seq,
             active: state.active,
             dirty: state.dirty,
             dirty_dirs,
-            checkpoint_file,
-            checkpoint_file_short,
+            ctx,
             notify,
             prefault,
+            writeback,
             spare: None,
             spare_requested: false,
             generation: checkpoint.map_or(0, |c| c.generation),
             poisoned: false,
+            failed_bytes: 0,
             abandoned_write_error: None,
             report,
             retention_report: crate::retention::Report::default(),
@@ -214,7 +254,8 @@ impl Writer {
     ///
     /// When this returns `Ok`, the record is committed: visible to all readers and safe from a crash of this process.
     /// It is not durable until a later [`Writer::checkpoint`]. If the record doesn't fit in the current segment, this
-    /// call rolls to a new segment first (slower: it creates and syncs a file).
+    /// call rolls to a new segment first (slower: it creates or publishes a file; it does not sync it, the next
+    /// checkpoint does).
     ///
     /// # Errors
     ///
@@ -389,6 +430,9 @@ impl Writer {
         if let Some(prefault) = &mut self.prefault {
             prefault.advanced(self.offset);
         }
+        if let Some(writeback) = &mut self.writeback {
+            writeback.advanced(self.offset);
+        }
         // Once the active segment is half full, prepare the next one off the writer's thread (ADR 0022). macOS only: on
         // ext4 a synchronous roll costs about 1 ms, and the spare's preallocation sync occasionally stalled the writer
         // for tens of milliseconds (ADR 0023).
@@ -398,7 +442,11 @@ impl Writer {
             && self.offset >= self.active.size / 2
         {
             self.spare_requested = true;
-            self.spare = crate::prefault::prepare_spare(&self.dir, self.config.segment_size);
+            self.spare = crate::prefault::prepare_spare(
+                &self.dir,
+                self.config.segment_size,
+                self.config.helper_cpus.clone(),
+            );
         }
         self.next_seq = seq + 1;
         Ok(Ok(seq))
@@ -423,11 +471,21 @@ impl Writer {
             }
             None => Err(io::Error::other("record body out of bounds")),
         };
-        let synced = zeroed
-            .and_then(|()| crate::fault::inject(crate::fault::Point::AbandonedWriteSync))
-            .and_then(|()| self.active.map.sync_range(offset, u64::from(len)))
-            .and_then(|()| mmap::sync_data(&self.active.file))
-            .and_then(|()| mmap::full_barrier(&self.active.file));
+        // The zeroing must be durable (full platform barrier) before this space is reused. Under the lock a
+        // checkpoint holds from its first sync to its marker (it waits for a background checkpoint in flight): a
+        // failed sync here must keep any later marker from being written (`Context::lost`).
+        let synced = {
+            let mut lost = checkpoint::lock(&self.ctx.lost);
+            let synced = zeroed
+                .and_then(|()| crate::fault::inject(crate::fault::Point::AbandonedWriteSync))
+                .and_then(|()| self.active.map.sync_range(offset, u64::from(len)))
+                .and_then(|()| mmap::sync_data(&self.active.file))
+                .and_then(|()| mmap::full_barrier(&self.active.file));
+            if synced.is_err() {
+                *lost = true;
+            }
+            synced
+        };
         let Err(e) = synced else {
             return Ok(());
         };
@@ -450,12 +508,18 @@ impl Writer {
     /// Configured retention then runs; its failures are recorded by [`Writer::last_retention_error`] and do not
     /// change the successful checkpoint result or poison the writer.
     ///
+    /// If background checkpoints ([`Writer::request_checkpoint`]) are in flight, this first waits for them; it then
+    /// checkpoints on the calling thread, as without them.
+    ///
     /// # Errors
     ///
     /// [`Error::Io`] if a sync call fails. The writer is then poisoned: every later call returns
     /// [`Error::DurabilityLost`], because a failed sync can drop data that a retry
-    /// would not rewrite. Appends keep working.
+    /// would not rewrite. Appends keep working. If a background checkpoint or the early write-back helper (Linux,
+    /// [`WriterConfig::early_writeback`](crate::WriterConfig::early_writeback)) failed and no call has returned its
+    /// error yet, this returns that error (and the writer is poisoned).
     pub fn checkpoint(&mut self) -> Result<()> {
+        self.finish_background()?;
         if self.poisoned {
             return Err(Error::DurabilityLost);
         }
@@ -472,72 +536,240 @@ impl Writer {
         if self.generation >= u64::MAX - 1 {
             return Err(Error::SequenceExhausted);
         }
-        // 1. Data.
-        crate::fault::inject(crate::fault::Point::CheckpointSync)
-            .map_err(|e| Error::io("sync segment", &self.active.path, e))?;
-        for seg in &self.dirty {
-            if let Some(map) = &seg.map {
-                map.sync_range(seg.from, seg.to - seg.from)
-                    .map_err(|e| Error::io("msync segment", &seg.path, e))?;
+        self.generation += 1;
+        let job = self.take_job(self.generation);
+        match checkpoint::run(&job, &self.ctx, On::Writer) {
+            Ok(slot) => {
+                self.checkpointed = Some(slot);
+                self.last_checkpoint_at = Some(Instant::now());
+                Ok(())
             }
-            mmap::sync_data(&seg.file).map_err(|e| Error::io("sync segment", &seg.path, e))?;
+            Err(e) => {
+                self.failed_bytes = self.failed_bytes.saturating_add(job.bytes());
+                Err(e)
+            }
         }
-        if self.offset > self.active_dirty_from {
-            self.active
-                .map
-                .sync_range(self.active_dirty_from, self.offset - self.active_dirty_from)
-                .map_err(|e| Error::io("msync segment", &self.active.path, e))?;
-        }
-        mmap::sync_data(&self.active.file)
-            .map_err(|e| Error::io("sync segment", &self.active.path, e))?;
-        // 2. Names.
-        for dir in &self.dirty_dirs {
-            journal::sync_dir(dir)?;
-        }
-        // 3. Barrier (macOS: F_FULLFSYNC flushes the drive cache, covering all of the above).
-        mmap::full_barrier(&self.active.file)
-            .map_err(|e| Error::io("full sync segment", &self.active.path, e))?;
-        // 4. Marker.
-        let generation = self.generation + 1;
-        let slot = CheckpointSlot {
-            generation,
-            next_seq: self.next_seq,
-            segment_base_seq: self.active.base,
-            offset: self.offset,
-        };
-        let bytes = format::encode_checkpoint_slot(&slot);
-        let marker_path = self.dir.join(CHECKPOINT_FILE);
-        let at = format::CHECKPOINT_SLOT_OFFSETS[(generation % 2) as usize] as u64;
-        self.checkpoint_file
-            .write_all_at(&bytes, at)
-            .map_err(|e| Error::io("write checkpoint marker", &marker_path, e))?;
-        crate::fault::inject(crate::fault::Point::CheckpointMarkerSync)
-            .map_err(|e| Error::io("sync checkpoint marker", &marker_path, e))?;
-        mmap::full_barrier(&self.checkpoint_file)
-            .map_err(|e| Error::io("sync checkpoint marker", &marker_path, e))?;
-        // 5. A marker that something cut short is extended only now, after its slot is durable: observers take a
-        // full-length marker's modification time as the checkpoint's time (ADR 0032), so the extension must not
-        // happen before a checkpoint has succeeded (a short marker's age is unknown). Best effort: the checkpoint has
-        // succeeded, and a marker left short is still valid (each slot is read on its own); a later checkpoint tries
-        // again.
-        if self.checkpoint_file_short
-            && mmap::preallocate(&self.checkpoint_file, format::CHECKPOINT_FILE_LEN as u64).is_ok()
-            && mmap::sync_data(&self.checkpoint_file).is_ok()
-        {
-            self.checkpoint_file_short = false;
-        }
+    }
 
-        self.generation = generation;
-        self.checkpointed = Some(slot);
-        self.last_checkpoint_at = Some(std::time::Instant::now());
-        // Durable-only readers wait for the marker to move.
-        if let Some(notify) = &self.notify {
-            notify.publish();
-        }
-        self.dirty.clear();
-        self.dirty_dirs.clear();
+    /// Hands what is dirty now to a checkpoint with `generation` whose marker names the current position, and starts
+    /// a new dirty list.
+    fn take_job(&mut self, generation: u64) -> Job {
+        let mut segments = std::mem::take(&mut self.dirty);
+        segments.push(DirtySegment {
+            file: Arc::clone(&self.active.file),
+            flush: Some(self.active.map.flush_handle()),
+            from: self.active_dirty_from,
+            to: self.offset,
+            path: self.active.path.clone(),
+        });
         self.active_dirty_from = self.offset;
+        Job {
+            slot: CheckpointSlot {
+                generation,
+                next_seq: self.next_seq,
+                segment_base_seq: self.active.base,
+                offset: self.offset,
+            },
+            segments,
+            dirs: std::mem::take(&mut self.dirty_dirs),
+        }
+    }
+
+    /// Starts a checkpoint of every record appended so far on the writer's checkpoint thread, and returns without
+    /// waiting for its sync calls (ADR 0038). Returns the sequence number it covers up to: once it has finished, every
+    /// record with a smaller sequence number is durable, exactly as after [`Writer::checkpoint`]. Records appended after
+    /// this call are not covered. Appends continue while the checkpoint runs.
+    ///
+    /// Observe completion with [`Writer::checkpoint_progress`]. [`Writer::checkpoint`] waits for background checkpoints
+    /// in flight before it checkpoints itself, and [`Writer::close`] waits for them and reports how they ended. The
+    /// first call starts the thread that runs them (`tickertape-checkpoint`); dropping the writer finishes the
+    /// requested checkpoints, then joins it.
+    ///
+    /// One checkpoint runs at a time. A request made while one runs waits for it, and further requests made meanwhile
+    /// join the waiting one, which then covers up to the newest of them (one marker for all of them).
+    ///
+    /// Configured retention runs on the checkpoint thread after each successful background checkpoint. What it did
+    /// reaches [`Writer::retention_report`] and [`Writer::last_retention_error`] when the writer next collects the
+    /// thread's results: in this method, [`Writer::checkpoint_progress`], [`Writer::checkpoint`] and
+    /// [`Writer::close`] ([`Writer::metrics`] includes it at once). Retention runs after the marker is durable, so
+    /// [`Writer::checkpoint_progress`] can report a checkpoint finished while its retention run goes on;
+    /// [`Writer::checkpoint`], [`Writer::close`] and dropping the writer wait for it.
+    ///
+    /// Cost on the calling thread: one lock of the state shared with the checkpoint thread and a few small moves; no
+    /// system call (except for starting the thread at the first call).
+    ///
+    /// # Errors
+    ///
+    /// - The error of an earlier background checkpoint that failed, or of the early write-back helper (Linux), if no
+    ///   call has returned it yet. The writer is then poisoned, as after a failed [`Writer::checkpoint`], and nothing
+    ///   is requested.
+    /// - [`Error::DurabilityLost`] if the writer is poisoned.
+    /// - [`Error::Io`] if the checkpoint thread cannot be started. Nothing is requested, and the writer is not
+    ///   poisoned.
+    /// - [`Error::SequenceExhausted`] if checkpoint generations are exhausted.
+    pub fn request_checkpoint(&mut self) -> Result<u64> {
+        self.collect()?;
+        if self.poisoned {
+            return Err(Error::DurabilityLost);
+        }
+        let shared = match &self.background {
+            Some(background) => Arc::clone(&background.shared),
+            None => {
+                let started = Background::start(
+                    Arc::clone(&self.ctx),
+                    self.config.retention.clone(),
+                    self.config.helper_cpus.clone(),
+                )
+                .map_err(|e| Error::io("start checkpoint thread", &self.dir, e))?;
+                let shared = Arc::clone(&started.shared);
+                self.background = Some(started);
+                shared
+            }
+        };
+        let mut state = checkpoint::lock(&shared.state);
+        if state.failed {
+            // A failure arrived after `collect` above.
+            drop(state);
+            self.collect()?;
+            return Err(Error::DurabilityLost);
+        }
+        let next_seq = self.next_seq;
+        let generation = match state.queued.as_ref().map(|queued| queued.slot.generation) {
+            Some(generation) => {
+                let job = self.take_job(generation);
+                if let Some(queued) = state.queued.as_mut() {
+                    queued.absorb(job);
+                }
+                generation
+            }
+            None => {
+                if self.generation >= u64::MAX - 1 {
+                    return Err(Error::SequenceExhausted);
+                }
+                self.generation += 1;
+                state.queued = Some(self.take_job(self.generation));
+                self.generation
+            }
+        };
+        drop(state);
+        shared.wake();
+        self.requested = Some((generation, next_seq));
+        Ok(next_seq)
+    }
+
+    /// Where this writer's checkpoints stand: the marker it last made durable, and whether a background checkpoint
+    /// ([`Writer::request_checkpoint`]) is still in flight. Collects what the checkpoint thread has finished.
+    ///
+    /// Cost: one atomic load when the checkpoint thread has finished nothing since the last call; otherwise one lock
+    /// of the state shared with it. No system calls. Nothing is added to [`Writer::append`].
+    ///
+    /// # Errors
+    ///
+    /// The error of a background checkpoint or of the early write-back helper (Linux) that failed, the first time it
+    /// is reported (the writer is then poisoned);
+    /// [`Error::DurabilityLost`] whenever the writer is poisoned after that, also after a failed
+    /// [`Writer::checkpoint`] or an abandoned write that could not be zeroed durably. A poisoned writer reports no
+    /// progress: nothing it does is durable any more.
+    pub fn checkpoint_progress(&mut self) -> Result<CheckpointProgress> {
+        self.collect()?;
+        if self.poisoned {
+            return Err(Error::DurabilityLost);
+        }
+        Ok(CheckpointProgress {
+            durable: self.checkpointed,
+            pending: self.pending(),
+        })
+    }
+
+    /// Waits for the background checkpoints in flight, drops the writer, and reports whether every checkpoint of this
+    /// writer succeeded. Like dropping, it does not checkpoint records that no checkpoint was requested for.
+    ///
+    /// # Errors
+    ///
+    /// - The error of a background checkpoint or of the early write-back helper (Linux) that failed, if no earlier call
+    ///   has returned it. The helper is joined first, so an error from a call it was making is included.
+    /// - [`Error::DurabilityLost`] if the writer is poisoned: a checkpoint failed earlier (and its error was returned
+    ///   then), or an abandoned write could not be zeroed durably ([`Writer::abandoned_write_error`]).
+    pub fn close(mut self) -> Result<()> {
+        if let Some(background) = &self.background {
+            background.wait_idle();
+        }
+        // Join the early write-back helper first, so that an error from a call it was making is reported here.
+        drop(self.writeback.take());
+        let result = match self.collect() {
+            Ok(()) if self.poisoned => Err(Error::DurabilityLost),
+            other => other,
+        };
+        drop(self);
+        result
+    }
+
+    /// Waits until no background checkpoint is queued or running, then collects.
+    fn finish_background(&mut self) -> Result<()> {
+        if let Some(background) = &self.background {
+            background.wait_idle();
+        }
+        self.collect()
+    }
+
+    /// Takes what the checkpoint thread has finished since the last call: the newest durable marker, retention's
+    /// results, and the first failure, which is returned (once) and poisons the writer. A failure of the early
+    /// write-back helper that no checkpoint has returned yet is such a failure too (ADR 0038 → Early write-back).
+    fn collect(&mut self) -> Result<()> {
+        let background = self.collect_background();
+        let writeback = if self.ctx.writeback_failed.load(Ordering::Acquire) {
+            // Taken once, here or by the checkpoint that found `lost` set (whichever comes first).
+            checkpoint::lock(&self.ctx.writeback_failure).take()
+        } else {
+            None
+        };
+        match background {
+            Err(error) => Err(error),
+            Ok(()) => match writeback {
+                Some(error) if !self.poisoned => {
+                    self.poisoned = true;
+                    Err(error)
+                }
+                _ => Ok(()),
+            },
+        }
+    }
+
+    /// The checkpoint thread's part of [`Writer::collect`].
+    fn collect_background(&mut self) -> Result<()> {
+        let shared = match &self.background {
+            Some(background)
+                if background.shared.posted.load(Ordering::Acquire) != self.collected =>
+            {
+                Arc::clone(&background.shared)
+            }
+            _ => return Ok(()),
+        };
+        let mut state = checkpoint::lock(&shared.state);
+        self.collected = shared.posted.load(Ordering::Relaxed);
+        if let Some((slot, at)) = state.done.take() {
+            self.checkpointed = Some(slot);
+            self.last_checkpoint_at = Some(at);
+        }
+        if let Some(outcome) = state.retention.take() {
+            self.retention_report.absorb(&outcome.report);
+            if let Some(error) = outcome.last_error {
+                self.last_retention_error = Some(error);
+            }
+            self.retention_failures = self.retention_failures.saturating_add(outcome.failures);
+        }
+        if let Some(error) = state.failure.take() {
+            self.poisoned = true;
+            return Err(error);
+        }
         Ok(())
+    }
+
+    /// The `next_seq` of the newest requested background checkpoint, if it has not finished.
+    fn pending(&self) -> Option<u64> {
+        let (generation, next_seq) = self.requested?;
+        let done = self.checkpointed.map_or(0, |c| c.generation);
+        (generation > done).then_some(next_seq)
     }
 
     /// The sequence number the next append will get, including history already removed by retention.
@@ -591,8 +823,11 @@ impl Writer {
     ///
     /// Until the child exits: the helper threads' handles and the state they share with the writer, including the
     /// prefault thread's reference to the active segment's mapping (so with prefaulting enabled that mapping stays
-    /// mapped in the child, although its file descriptor is closed), and a spare segment prepared in the background
-    /// (its file descriptor and mapping, which the spare thread's result owns).
+    /// mapped in the child, although its file descriptor is closed), the checkpoint thread's reference to the
+    /// checkpoint marker (after [`Writer::request_checkpoint`]: that descriptor stays open in the child), a spare
+    /// segment prepared in the background (its file descriptor and mapping, which the spare thread's result owns),
+    /// and on Linux, if the fork came while the early write-back helper held its lock or was starting a write-back,
+    /// the segment files it was following (their descriptors stay open in the child).
     ///
     /// # Preconditions
     ///
@@ -613,6 +848,9 @@ impl Writer {
     pub fn release_after_fork(mut self) {
         std::mem::forget(self.spare.take());
         std::mem::forget(self.prefault.take());
+        // In a child, dropping the write-back helper's handle neither stops nor joins it: it only drops the child's
+        // references to the segment files the helper follows, if the helper's lock was free at the fork.
+        drop(self.writeback.take());
         if let Some(notify) = self.notify.take() {
             notify.release_after_fork();
         }
@@ -623,26 +861,51 @@ impl Writer {
     /// what the next checkpoint has to sync, whether the writer is poisoned, and retention failures (ADR 0032; see
     /// [`crate::status`] for what other processes can observe).
     ///
-    /// Cost: no system calls; one monotonic clock read, and a sum over the segments touched since the last
-    /// checkpoint. Nothing is added to [`Writer::append`].
+    /// With background checkpoints ([`Writer::request_checkpoint`]), the metrics include what the checkpoint thread
+    /// has finished even if the writer has not collected it yet: the checkpoint is the newest durable marker, the
+    /// uncheckpointed bytes include those of checkpoints still in flight (and of failed ones), and `poisoned` is true
+    /// as soon as one has failed.
+    ///
+    /// Cost: no system calls; one monotonic clock read, a sum over the segments touched since the last
+    /// checkpoint, and, once a background checkpoint has been requested, one lock of the state shared with the
+    /// checkpoint thread. Nothing is added to [`Writer::append`].
     pub fn metrics(&self) -> crate::status::WriterMetrics {
         let dirty = self.dirty.iter().fold(0u64, |sum, seg| {
             sum.saturating_add(seg.to.saturating_sub(seg.from))
         });
+        let mut checkpoint = self.checkpointed;
+        let mut last_at = self.last_checkpoint_at;
+        let mut elsewhere = self.failed_bytes;
+        let mut poisoned = self.poisoned || self.ctx.writeback_failed.load(Ordering::Relaxed);
+        let mut retention_failures = self.retention_failures;
+        if let Some(background) = &self.background {
+            let state = checkpoint::lock(&background.shared.state);
+            if let Some((slot, at)) = state.done {
+                checkpoint = Some(slot);
+                last_at = Some(at);
+            }
+            elsewhere = elsewhere
+                .saturating_add(state.in_flight_bytes())
+                .saturating_add(state.failed_bytes);
+            poisoned |= state.failed;
+            if let Some(outcome) = &state.retention {
+                retention_failures = retention_failures.saturating_add(outcome.failures);
+            }
+        }
         crate::status::WriterMetrics {
             head: crate::status::Position::new(self.next_seq, self.active.base, self.offset),
             segment_size: self.active.size,
-            checkpoint: self.checkpointed,
-            since_checkpoint: self.last_checkpoint_at.map(|at| at.elapsed()),
+            checkpoint,
+            since_checkpoint: last_at.map(|at| at.elapsed()),
             // Without a marker, everything from where recovery started (the oldest retained segment) is uncovered.
-            uncheckpointed_records: self.next_seq.saturating_sub(
-                self.checkpointed
-                    .map_or(self.report.scanned_from_seq, |c| c.next_seq),
-            ),
+            uncheckpointed_records: self
+                .next_seq
+                .saturating_sub(checkpoint.map_or(self.report.scanned_from_seq, |c| c.next_seq)),
             uncheckpointed_bytes: dirty
-                .saturating_add(self.offset.saturating_sub(self.active_dirty_from)),
-            poisoned: self.poisoned,
-            retention_failures: self.retention_failures,
+                .saturating_add(self.offset.saturating_sub(self.active_dirty_from))
+                .saturating_add(elsewhere),
+            poisoned,
+            retention_failures,
         }
     }
 
@@ -651,7 +914,13 @@ impl Writer {
             return;
         };
         let result = crate::retention::plan(&self.dir, policy).and_then(|plan| {
-            crate::retention::apply_into(&self.dir, &plan, action, &mut self.retention_report)
+            crate::retention::apply_into(
+                &self.dir,
+                &plan,
+                action,
+                &mut self.retention_report,
+                false,
+            )
         });
         if let Err(error) = result {
             self.last_retention_error = Some(error);
@@ -671,10 +940,14 @@ impl Writer {
     /// Rolls to a new segment (`docs/format.md` → Rolling).
     fn roll(&mut self) -> Result<()> {
         let next_base = self.next_seq;
+        // No sync here: the new segment's header and size become durable at the next checkpoint, which syncs every
+        // segment linked before its request before it writes a marker; recovery restores a header that a crash kept
+        // from reaching the disk (ADR 0038 → Rolls without a sync; crash contract C8).
         let new = match self.take_spare() {
             Some(spare) => publish_spare(&self.dir, next_base, self.config.segment_size, spare)?,
-            None => create_segment(&self.dir, next_base, self.config.segment_size)?,
+            None => create_segment(&self.dir, next_base, self.config.segment_size, false)?,
         };
+        crate::fault::hook(crate::fault::Point::RollAfterLink);
         self.spare_requested = false;
         self.dirty_dirs.insert(self.dir.clone());
         // After the link, the roll always completes: seal the old segment, then switch.
@@ -690,9 +963,17 @@ impl Writer {
             .store_commit_word(seal_at, format::SEAL_MARKER)
             .ok_or_else(|| internal(&self.active.path, "seal out of bounds"))?;
         let old = std::mem::replace(&mut self.active, new);
+        if let Some(writeback) = &mut self.writeback {
+            writeback.switch(
+                Arc::clone(&old.file),
+                seal_at + format::SEAL_LEN as u64,
+                Arc::clone(&self.active.file),
+                format::SEGMENT_HEADER_LEN as u64,
+            );
+        }
         self.dirty.push(DirtySegment {
             file: old.file,
-            map: Some(old.map),
+            flush: Some(old.map.flush_handle()),
             from: self.active_dirty_from,
             to: seal_at + format::SEAL_LEN as u64,
             path: old.path,
@@ -727,23 +1008,28 @@ impl Writer {
 impl Drop for Writer {
     fn drop(&mut self) {
         // The order of what follows:
-        // - In the process that took the lock: join the spare-segment thread and remove a prepared spare (so the
+        // - In the process that took the lock: finish the requested background checkpoints and join their thread
+        //   (ADR 0038), join the spare-segment thread and remove a prepared spare (so the
         //   next writer's recovery has nothing to clean up), stop the helper and tell waiting readers that this
         //   writer has gone, all here, while the lock is still held, so that a new writer never overlaps them. Then
         //   the fields drop in declaration order: first the lock guard, which unlocks explicitly and closes its
         //   descriptor, then the others, which only unmap and close.
         // - In any other process (a forked child that dropped its copy, which it must not do): nothing is torn down
         //   here. The spare belongs to the parent's writer and its thread does not exist in the child, so it is
-        //   neither joined nor removed. The lock guard drops first, without unlocking (the lock still protects the
+        //   neither joined nor removed; nor is the checkpoint thread, whose handle leaves it alone in another process. The lock guard drops first, without unlocking (the lock still protects the
         //   parent's writer), and closes the child's copy of the descriptor before the later fields `notify` and
         //   `prefault` drop, since joining the helper there can block forever and must not keep the journal locked
         //   once the parent has gone.
         if self.lock.owned_here() {
+            // Finish the requested background checkpoints and join their thread first: the last marker must be
+            // written while the lock is held, and before readers are told that this writer has gone.
+            drop(self.background.take());
             if let Some(Ok(Ok(spare))) = self.spare.take().map(|h| h.join()) {
                 drop(spare);
                 let _ = fs::remove_file(self.dir.join(journal::SPARE_FILE));
             }
             drop(self.prefault.take());
+            drop(self.writeback.take());
             drop(self.notify.take());
         }
     }
@@ -776,8 +1062,9 @@ impl Drop for JournalLock {
     }
 }
 
-/// Publishes a prepared spare as segment `base` (ADR 0022): write and sync its header, then link it into place, as
-/// [`create_segment`] does for a new file. If the header can't be written or synced, the spare is discarded and the
+/// Publishes a prepared spare as segment `base` (ADR 0022): write its header, then link it into place, as
+/// [`create_segment`] does at a roll. The header is not synced here: the next checkpoint syncs it before its marker
+/// (the spare's size was synced when it was prepared). If the header can't be written, the spare is discarded and the
 /// segment is created synchronously instead; a failed link is reported like [`create_segment`]'s.
 fn publish_spare(dir: &Path, base: u64, size: u64, spare: Spare) -> Result<Segment> {
     let spare_path = dir.join(journal::SPARE_FILE);
@@ -788,12 +1075,11 @@ fn publish_spare(dir: &Path, base: u64, size: u64, spare: Spare) -> Result<Segme
         created_unix_ns: crate::clock::realtime_ns(),
     });
     let prepared = crate::fault::inject(crate::fault::Point::SpareHeader)
-        .and_then(|()| spare.file.write_all_at(&header, 0))
-        .and_then(|()| mmap::sync_data(&spare.file));
+        .and_then(|()| spare.file.write_all_at(&header, 0));
     if prepared.is_err() {
         drop(spare);
         let _ = fs::remove_file(&spare_path);
-        return create_segment(dir, base, size);
+        return create_segment(dir, base, size, false);
     }
     if let Err(e) = crate::fault::inject(crate::fault::Point::Link)
         .and_then(|()| fs::hard_link(&spare_path, &path))
@@ -808,7 +1094,7 @@ fn publish_spare(dir: &Path, base: u64, size: u64, spare: Spare) -> Result<Segme
         base,
         size,
         path,
-        file: spare.file,
+        file: Arc::new(spare.file),
         map: spare.map,
     })
 }
@@ -897,7 +1183,12 @@ fn take_lock(dir: &Path) -> Result<JournalLock> {
 
 /// Creates and publishes a new segment (`docs/format.md` → Rolling, steps 2–3). Returns the open file (read-write)
 /// and its final path.
-fn create_segment(dir: &Path, base: u64, size: u64) -> Result<Segment> {
+///
+/// With `sync`, the header and the preallocated size are made durable before the link, as recovery needs for a
+/// segment it creates (a new journal's first segment, a completed roll). A roll passes `false`: the writer's thread
+/// does not wait for the sync there, and the next checkpoint syncs the segment before its marker (ADR 0038 → Rolls
+/// without a sync).
+fn create_segment(dir: &Path, base: u64, size: u64, sync: bool) -> Result<Segment> {
     let tmp = journal::tmp_path(dir, base);
     let path = journal::segment_path(dir, base);
     match fs::remove_file(&tmp) {
@@ -922,7 +1213,9 @@ fn create_segment(dir: &Path, base: u64, size: u64) -> Result<Segment> {
         });
         file.write_all_at(&header, 0)
             .map_err(|e| Error::io("write segment header", &tmp, e))?;
-        mmap::sync_data(&file).map_err(|e| Error::io("sync segment", &tmp, e))?;
+        if sync {
+            mmap::sync_data(&file).map_err(|e| Error::io("sync segment", &tmp, e))?;
+        }
         // Map before publishing, so that nothing fallible is left after the link (the publication point).
         let len = usize::try_from(size)
             .map_err(|_| Error::io("map segment", &tmp, io::Error::other("segment too large")))?;
@@ -947,7 +1240,7 @@ fn create_segment(dir: &Path, base: u64, size: u64) -> Result<Segment> {
         base,
         size,
         path,
-        file,
+        file: Arc::new(file),
         map,
     })
 }
@@ -967,7 +1260,7 @@ fn open_segment(dir: &Path, base: u64) -> Result<Segment> {
         base,
         size: header.segment_size,
         path,
-        file,
+        file: Arc::new(file),
         map,
     })
 }
@@ -979,6 +1272,15 @@ struct RecoveredState {
     next_seq: u64,
     active_dirty_from: u64,
     dirty: Vec<DirtySegment>,
+}
+
+/// How [`Recovery::restore_unwritten_header`] restores a segment whose header never reached the disk.
+#[derive(Debug, Clone, Copy)]
+enum Restore {
+    /// Write the header again; the file's length `len` is a valid segment size.
+    Header { len: u64 },
+    /// Replace the file, which holds only zeros and whose length is not a valid segment size, by a new empty segment.
+    Replace,
 }
 
 /// Recovery context (`docs/format.md` → Recovery).
@@ -1048,7 +1350,7 @@ impl Recovery<'_> {
             if let Some(c) = checkpoint {
                 return Err(self.dangling(c));
             }
-            let active = create_segment(self.dir, 0, self.config.segment_size)?;
+            let active = create_segment(self.dir, 0, self.config.segment_size, true)?;
             journal::sync_dir(self.dir)?;
             mmap::full_barrier(&active.file)
                 .map_err(|e| Error::io("full sync segment", &active.path, e))?;
@@ -1111,18 +1413,34 @@ impl Recovery<'_> {
                         // other error (an I/O error opening, reading or mapping it: `EACCES`, `EMFILE`, `ENOMEM`) says
                         // nothing about the journal and is returned here, before anything is changed, under both
                         // policies.
+                        // A successor whose header never reached the disk counts as opening, but its header is
+                        // restored only below, once nothing in this step can still refuse: a refused open changes
+                        // nothing here (C11).
                         let opened = match open_segment(self.dir, seq) {
-                            Ok(next) => Some(next),
-                            Err(Error::Corrupt { .. } | Error::UnsupportedVersion { .. }) => None,
+                            Ok(next) => Some(Ok(next)),
+                            Err(Error::Corrupt { .. }) => {
+                                self.probe_unwritten_header(seq)?.map(Err)
+                            }
+                            Err(Error::UnsupportedVersion { .. }) => None,
                             Err(e) => return Err(e),
                         };
-                        if let Some(next) = opened {
+                        if let Some(successor) = opened {
                             // The successor for exactly `seq` exists, is not this segment (at the first record slot
                             // `seq` is this segment's own base), has not been visited, and opens and maps: `offset`
                             // is where this segment's seal belongs, and the chain continues in the successor (ADR
                             // 0035, "Damage around a seal"). A valid header alone is not enough: `open_segment`
                             // must succeed.
-                            if tail_end.is_some_and(|end| end > offset + format::SEAL_LEN as u64) {
+                            let beyond_seal =
+                                tail_end.is_some_and(|end| end > offset + format::SEAL_LEN as u64);
+                            if beyond_seal && self.config.recovery == RecoveryPolicy::Fail {
+                                return Err(Error::corrupt(
+                                    &seg.path,
+                                    offset,
+                                    CorruptReason::BadSeal,
+                                ));
+                            }
+                            let next = self.enter(seq, successor)?;
+                            if beyond_seal {
                                 // Bytes beyond the seal: no crash leaves them (a roll writes nothing after the seal,
                                 // and records `seq` onwards are in the successor), so this is a damaged seal, not
                                 // missing history, and later segments are not evidence. They are never records of
@@ -1130,14 +1448,8 @@ impl Recovery<'_> {
                                 // them as any repair does, then reseal and continue into the successor in this open.
                                 // This is exactly where an interrupted repair leaves the next open (the segment ends
                                 // at `offset`, followed by the same branch below), so an interruption at any point
-                                // gives the same journal. `Fail` refuses: the bytes are damage.
-                                if self.config.recovery == RecoveryPolicy::Fail {
-                                    return Err(Error::corrupt(
-                                        &seg.path,
-                                        offset,
-                                        CorruptReason::BadSeal,
-                                    ));
-                                }
+                                // gives the same journal. `Fail` refuses (above, before anything is changed): the
+                                // bytes are damage.
                                 seg = self.repair_tail(seg, offset, CorruptReason::BadSeal)?;
                             } else {
                                 // A crash between publishing the successor and sealing this segment (or the seal's
@@ -1203,7 +1515,7 @@ impl Recovery<'_> {
                     }
                     let later_exists = bases.range(seq.saturating_add(1)..).next().is_some();
                     if bases.contains(&seq) {
-                        match open_segment(self.dir, seq) {
+                        match self.open_successor(seq) {
                             Ok(next) => {
                                 dirty.push(inherited(seg, seg_from, offset));
                                 seg = next;
@@ -1231,7 +1543,7 @@ impl Recovery<'_> {
                         ));
                     }
                     // Crash or power loss during a roll: create the successor.
-                    let next = create_segment(self.dir, seq, self.config.segment_size)?;
+                    let next = create_segment(self.dir, seq, self.config.segment_size, true)?;
                     self.dirty_dirs.insert(self.dir.to_path_buf());
                     journal::sync_dir(self.dir)?;
                     self.report.actions.push(RecoveryAction::CompletedRoll {
@@ -1282,6 +1594,118 @@ impl Recovery<'_> {
             active_dirty_from: active_dirty_from.min(offset),
             dirty,
         })
+    }
+
+    /// Opens the segment for `base` that the scan enters after the segment it scanned (named by a valid seal, or the
+    /// successor for exactly the expected sequence number at the seal's place). A roll does not sync the new
+    /// segment's header (ADR 0038 → Rolls without a sync), so after an OS crash or power loss its name can be on disk
+    /// while its header is not: its first 64 bytes read as zeros. Such a header is written again here (base from
+    /// the name, size from the file, creation time now) and synced, and the segment opens as if it had reached the
+    /// disk; a file that is shorter than a header or whose length is not a valid segment size, and that holds only
+    /// zeros, is replaced by a new empty segment for `base`. Both are reported as
+    /// [`RecoveryAction::RestoredHeader`]. Any other failure to open is returned unchanged.
+    fn open_successor(&mut self, base: u64) -> Result<Segment> {
+        match open_segment(self.dir, base) {
+            Err(e @ Error::Corrupt { .. }) => match self.probe_unwritten_header(base)? {
+                Some(restore) => self.restore_unwritten_header(base, restore),
+                None => Err(e),
+            },
+            other => other,
+        }
+    }
+
+    /// The successor for `base` as [`Recovery::open_successor`] gives it: `Ok` if it opened as it is, `Err` if its
+    /// header must be restored first (found by [`Recovery::probe_unwritten_header`]), which this does.
+    fn enter(
+        &mut self,
+        base: u64,
+        successor: std::result::Result<Segment, Restore>,
+    ) -> Result<Segment> {
+        match successor {
+            Ok(next) => Ok(next),
+            Err(restore) => self.restore_unwritten_header(base, restore),
+        }
+    }
+
+    /// See [`Recovery::open_successor`]: whether the segment for `base`, which did not open, has a header that never
+    /// reached the disk, and how it would be restored. Reads only.
+    fn probe_unwritten_header(&mut self, base: u64) -> Result<Option<Restore>> {
+        let path = journal::segment_path(self.dir, base);
+        let file = File::open(&path).map_err(|e| Error::io("open segment", &path, e))?;
+        let len = file
+            .metadata()
+            .map_err(|e| Error::io("stat segment", &path, e))?
+            .len();
+        let head_len = len.min(format::SEGMENT_HEADER_LEN as u64);
+        if !all_zero(&file, &path, 0, head_len)? {
+            return Ok(None);
+        }
+        if len >= format::SEGMENT_HEADER_LEN as u64 && format::validate_segment_size(len).is_ok() {
+            return Ok(Some(Restore::Header { len }));
+        }
+        if !all_zero(&file, &path, head_len, len)? {
+            return Ok(None);
+        }
+        Ok(Some(Restore::Replace))
+    }
+
+    /// Restores the header of the segment for `base` as `restore` says (see [`Recovery::open_successor`]), reports it
+    /// and opens the segment.
+    ///
+    /// A file replaced by a new empty segment is replaced by renaming a prepared, synced copy over it, as a tail repair
+    /// does, so that the name always holds a segment for `base`: an interruption leaves either the old all-zero file,
+    /// which the next open restores in the same way, or the new segment, and at most a temporary file, which the next
+    /// open removes.
+    fn restore_unwritten_header(&mut self, base: u64, restore: Restore) -> Result<Segment> {
+        let path = journal::segment_path(self.dir, base);
+        match restore {
+            Restore::Header { len } => {
+                let file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&path)
+                    .map_err(|e| Error::io("open segment", &path, e))?;
+                let header = format::encode_segment_header(&SegmentHeader {
+                    segment_size: len,
+                    base_seq: base,
+                    created_unix_ns: crate::clock::realtime_ns(),
+                });
+                file.write_all_at(&header, 0)
+                    .map_err(|e| Error::io("write segment header", &path, e))?;
+                mmap::sync_data(&file).map_err(|e| Error::io("sync segment", &path, e))?;
+            }
+            Restore::Replace => {
+                let size = self.config.segment_size;
+                let tmp = journal::tmp_path(self.dir, base);
+                let _ = fs::remove_file(&tmp);
+                let file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .open(&tmp)
+                    .map_err(|e| Error::io("create segment", &tmp, e))?;
+                crate::fault::inject(crate::fault::Point::Preallocate)
+                    .and_then(|()| mmap::preallocate(&file, size))
+                    .map_err(|e| Error::io("preallocate segment", &tmp, e))?;
+                let header = format::encode_segment_header(&SegmentHeader {
+                    segment_size: size,
+                    base_seq: base,
+                    created_unix_ns: crate::clock::realtime_ns(),
+                });
+                file.write_all_at(&header, 0)
+                    .map_err(|e| Error::io("write segment header", &tmp, e))?;
+                mmap::sync_data(&file).map_err(|e| Error::io("sync segment", &tmp, e))?;
+                crate::fault::inject(crate::fault::Point::RestoreBeforeRename)
+                    .map_err(|e| Error::io("replace segment", &path, e))?;
+                fs::rename(&tmp, &path).map_err(|e| Error::io("replace segment", &path, e))?;
+                journal::sync_dir(self.dir)?;
+                self.dirty_dirs.insert(self.dir.to_path_buf());
+            }
+        }
+        self.report
+            .actions
+            .push(RecoveryAction::RestoredHeader { segment: path });
+        open_segment(self.dir, base)
     }
 
     fn dangling(&self, c: CheckpointSlot) -> Error {
@@ -1478,6 +1902,23 @@ impl Recovery<'_> {
 /// `successor_pending` says that one exists, is not `seg` and has not been visited, so here it did not open. A later
 /// segment is still not evidence when the non-zero bytes then end within a seal at `offset` (what a crash between
 /// publishing the successor and sealing leaves): the caller reports that tail as a chain broken at `offset`.
+/// Whether bytes `[from, to)` of `file` are all zero (read in chunks; used only for a segment whose header is
+/// missing).
+fn all_zero(file: &File, path: &Path, from: u64, to: u64) -> Result<bool> {
+    let mut buf = vec![0u8; 1 << 16];
+    let mut at = from;
+    while at < to {
+        let n = usize::try_from((to - at).min(buf.len() as u64)).unwrap_or(buf.len());
+        file.read_exact_at(&mut buf[..n], at)
+            .map_err(|e| Error::io("read segment", path, e))?;
+        if buf[..n].iter().any(|&b| b != 0) {
+            return Ok(false);
+        }
+        at += n as u64;
+    }
+    Ok(true)
+}
+
 fn committed_after_empty(
     seg: &Segment,
     offset: u64,
@@ -1506,9 +1947,21 @@ fn inherited(seg: Segment, from: u64, seal_at: u64) -> DirtySegment {
         from,
         to: seal_at + format::SEAL_LEN as u64,
         file: seg.file,
-        map: None,
+        flush: None,
         path: seg.path,
     }
+}
+
+/// Where a writer's checkpoints stand ([`Writer::checkpoint_progress`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct CheckpointProgress {
+    /// The checkpoint marker as this writer last made it durable, or read it at open; `None` if there is none. Every
+    /// record with a sequence number below its `next_seq` is durable.
+    pub durable: Option<CheckpointSlot>,
+    /// The sequence number the newest requested background checkpoint covers up to, while it has not finished; `None`
+    /// when every requested checkpoint has finished.
+    pub pending: Option<u64>,
 }
 
 /// What [`Writer::open`] found and did.
@@ -1590,6 +2043,16 @@ pub enum RecoveryAction {
     /// The newest segment was sealed but its successor was missing; the successor was created.
     CompletedRoll {
         /// The new segment.
+        segment: PathBuf,
+    },
+    /// A segment that the scan entered after the previous one had no header: its first 64 bytes were zeros, because
+    /// a roll does not sync the new segment's header and an OS crash or power loss kept it from reaching the disk
+    /// before a checkpoint did (ADR 0038 → Rolls without a sync; `docs/crash-contract.md`, C8). Its header was
+    /// written again (base from the name, size from the file, creation time at recovery) and synced; a segment
+    /// holding only zeros whose length was not a valid segment size was replaced by a new empty segment instead.
+    /// The scan then continued into it as into any segment.
+    RestoredHeader {
+        /// The segment.
         segment: PathBuf,
     },
     /// A stale `*.tape.tmp` file from an interrupted roll was removed.
@@ -1715,6 +2178,120 @@ mod tests {
         append_one(&mut writer);
     }
 
+    /// A forked child that drops its copy of a writer whose checkpoint thread runs (ADR 0038), which it must not do,
+    /// must leave that thread alone: it does not exist in the child, and the state it shares with the writer may have
+    /// been locked at the fork (here it is, by this test), so locking, joining or detaching anything there could hang.
+    #[test]
+    fn a_forked_child_dropping_its_copy_leaves_the_checkpoint_thread_alone() {
+        let _forked = forked::LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let config = WriterConfig::default()
+            .segment_size(1 << 20)
+            .prefault(false)
+            .notify(false);
+        let mut writer = Some(Writer::open(dir.path(), config.clone()).unwrap());
+        let open = writer.as_mut().unwrap();
+        append_one(open);
+        assert_eq!(open.request_checkpoint().unwrap(), 1);
+        let shared = Arc::clone(&open.background.as_ref().unwrap().shared);
+        let held = checkpoint::lock(&shared.state);
+        let child = forked::fork(|| drop(writer.take())).unwrap();
+        drop(held);
+        assert_eq!(
+            child.wait_within(std::time::Duration::from_secs(20)),
+            Some(0),
+            "the child must not wait for the checkpoint thread"
+        );
+        let mut writer = writer.unwrap();
+        append_one(&mut writer);
+        assert_eq!(writer.request_checkpoint().unwrap(), 2);
+        writer.close().unwrap();
+        assert_eq!(
+            Writer::open(dir.path(), config)
+                .unwrap()
+                .recovery_report()
+                .scanned_from_seq,
+            2
+        );
+    }
+
+    /// A forked child that releases its copy of a writer whose early write-back helper runs (Linux; ADR 0038) closes
+    /// its descriptor of the active segment, which the helper's shared state also refers to, without stopping,
+    /// joining or signalling the helper, which does not exist in the child. The parent's helper is left as it was.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_forked_child_releasing_its_copy_closes_the_writeback_helpers_files() {
+        const CLOSED: i32 = 42;
+        const STILL_OPEN: i32 = 43;
+        let _forked = forked::LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let config = WriterConfig::default()
+            .segment_size(1 << 20)
+            .prefault(true)
+            .early_writeback(true)
+            .notify(false);
+        let mut writer = Some(Writer::open(dir.path(), config.clone()).unwrap());
+        let open = writer.as_mut().unwrap();
+        append_one(open);
+        assert!(
+            open.writeback.is_some(),
+            "the helper must run for this test"
+        );
+        let fd = open.active.file.as_raw_fd();
+        // Fork while the helper waits to be woken: it then holds no file of its own, and its lock is free.
+        drop(open.writeback.as_ref().unwrap().test_handle().idle());
+        let child = forked::fork(|| {
+            writer.take().unwrap().release_after_fork();
+            forked::exit(if forked::is_open(fd) {
+                STILL_OPEN
+            } else {
+                CLOSED
+            });
+        })
+        .unwrap();
+        assert_eq!(
+            child.wait_within(std::time::Duration::from_secs(20)),
+            Some(CLOSED),
+            "the child must close its descriptor of the segment the helper follows"
+        );
+        let mut writer = writer.unwrap();
+        for _ in 0..3000 {
+            append_one(&mut writer);
+        }
+        writer.close().unwrap();
+        assert_eq!(Writer::open(dir.path(), config).unwrap().next_seq(), 3001);
+    }
+
+    /// A forked child that releases its copy of a writer whose early write-back helper's lock was held at the fork
+    /// (here by this test) must not wait for that lock, which stays held in the child for good (Linux; ADR 0038).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_forked_child_releasing_its_copy_leaves_a_writeback_lock_held_at_the_fork_alone() {
+        let _forked = forked::LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let config = WriterConfig::default()
+            .segment_size(1 << 20)
+            .prefault(true)
+            .early_writeback(true)
+            .notify(false);
+        let mut writer = Some(Writer::open(dir.path(), config.clone()).unwrap());
+        let open = writer.as_mut().unwrap();
+        append_one(open);
+        let handle = open.writeback.as_ref().unwrap().test_handle();
+        let held = handle.idle();
+        let child = forked::fork(|| writer.take().unwrap().release_after_fork()).unwrap();
+        drop(held);
+        assert_eq!(
+            child.wait_within(std::time::Duration::from_secs(20)),
+            Some(0),
+            "the child must not wait for the write-back helper's lock"
+        );
+        let mut writer = writer.unwrap();
+        append_one(&mut writer);
+        writer.close().unwrap();
+        assert_eq!(Writer::open(dir.path(), config).unwrap().next_seq(), 2);
+    }
+
     /// An open that fails after taking the lock (here: `RecoveryPolicy::Fail` refusing a damaged journal) must
     /// release the lock explicitly too, so that the next open (here with `Quarantine`) succeeds at once while a child
     /// forked during the failed open still holds a copy of the descriptor.
@@ -1727,7 +2304,7 @@ mod tests {
         append_one(&mut writer);
         drop(writer);
         // A segment off the chain, which `Fail` refuses and `Quarantine` moves away.
-        drop(create_segment(dir.path(), 500, 1 << 20).unwrap());
+        drop(create_segment(dir.path(), 500, 1 << 20, true).unwrap());
         let child = Rc::new(RefCell::new(None));
         let slot = Rc::clone(&child);
         AFTER_LOCK.set(Some(Box::new(move || {
@@ -1751,5 +2328,122 @@ mod tests {
             reopened.recovery_report()
         );
         assert_eq!(reopened.next_seq(), 1);
+    }
+
+    /// An early write-back helper that stopped on its own (here as for an unsupported call) is handed nothing more:
+    /// after many rolls, with retention deleting the segments rolled past, no rolled segment waits for it and it holds
+    /// no segment file, so no descriptor or deleted segment's space is kept (Linux; ADR 0038 → Early write-back).
+    #[cfg(all(target_os = "linux", feature = "fault-injection"))]
+    #[test]
+    fn a_stopped_writeback_helper_is_handed_no_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = WriterConfig::default()
+            .segment_size(format::SEGMENT_SIZE_UNIT)
+            .retention(
+                crate::retention::Policy::default().max_segments(2),
+                crate::retention::Action::Delete,
+            );
+        let mut w = Writer::open(dir.path(), config).unwrap();
+        crate::fault::fail_next_background(crate::fault::Point::EarlyWriteback, libc::EINVAL);
+        let deadline = Instant::now() + std::time::Duration::from_secs(30);
+        let first = w.active.base;
+        while w.active.base == first {
+            append_one(&mut w);
+        }
+        while !w.writeback.as_ref().unwrap().held().0 {
+            assert!(Instant::now() < deadline, "the helper did not stop");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        for _ in 0..50 {
+            let base = w.active.base;
+            while w.active.base == base {
+                append_one(&mut w);
+            }
+            w.checkpoint().unwrap();
+        }
+        assert!(w.retention_report().removed_segments >= 40);
+        assert_eq!(w.writeback.as_ref().unwrap().held(), (true, 0, false));
+    }
+
+    /// Every helper thread started from a writer thread pinned to one CPU runs on the process's CPUs by default,
+    /// keeps the pin with `HelperCpus::Inherited`, and runs on the named CPU with `HelperCpus::List` (Linux; ADR 0038).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn helper_threads_of_a_pinned_writer_are_placed_as_configured() {
+        use crate::config::HelperCpus;
+        let allowed = mmap::thread_affinity().unwrap();
+        if allowed.len() < 2 {
+            eprintln!("skipped: one CPU available");
+            return;
+        }
+        let (pinned, other) = (allowed[0], allowed[1]);
+        /// The CPU list of each of this process's threads whose name starts with `tickertape-` (as `comm` keeps it).
+        fn helpers() -> Vec<(String, Vec<usize>)> {
+            let mut out = Vec::new();
+            for task in fs::read_dir("/proc/self/task").unwrap() {
+                let task = task.unwrap().path();
+                let Ok(name) = fs::read_to_string(task.join("comm")) else {
+                    continue;
+                };
+                if !name.starts_with("tickertape-") {
+                    continue;
+                }
+                let status = fs::read_to_string(task.join("status")).unwrap();
+                let list = status
+                    .lines()
+                    .find_map(|l| l.strip_prefix("Cpus_allowed_list:"))
+                    .unwrap();
+                out.push((
+                    name.trim().to_string(),
+                    crate::affinity::parse_cpu_list(list).unwrap(),
+                ));
+            }
+            out.sort();
+            out
+        }
+        for (cpus, expect_pinned) in [
+            (HelperCpus::Inherited, Some(vec![pinned])),
+            (HelperCpus::List(vec![other]), Some(vec![other])),
+            (HelperCpus::Process, None),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let config = WriterConfig::default()
+                .segment_size(format::SEGMENT_SIZE_UNIT)
+                .helper_cpus(cpus.clone());
+            // In a forked child, whose only threads are the writer's thread and the helpers it starts (other tests
+            // in this process run writers of their own).
+            let _forked = forked::LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let child = forked::fork(|| {
+                mmap::set_thread_affinity([pinned]).unwrap();
+                let mut writer = Writer::open(dir.path(), config).unwrap();
+                append_one(&mut writer);
+                writer.request_checkpoint().unwrap();
+                // The helpers place themselves when they start: wait until each has.
+                let deadline = Instant::now() + std::time::Duration::from_secs(10);
+                let seen = loop {
+                    let seen = helpers();
+                    let names: Vec<&str> = seen.iter().map(|(n, _)| n.as_str()).collect();
+                    let started = ["tickertape-chec", "tickertape-pref", "tickertape-writ"]
+                        .iter()
+                        .all(|n| names.contains(n));
+                    let settled = matches!(cpus, HelperCpus::Inherited)
+                        || seen.iter().all(|(_, l)| l != &vec![pinned]);
+                    if started && settled {
+                        break seen;
+                    }
+                    assert!(Instant::now() < deadline, "{cpus:?}: {seen:?}");
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                };
+                for (name, list) in &seen {
+                    match &expect_pinned {
+                        Some(expected) => assert_eq!(list, expected, "{cpus:?}: {name}"),
+                        None => assert!(list.len() > 1, "{cpus:?}: {name} on {list:?}"),
+                    }
+                }
+                drop(writer);
+            })
+            .unwrap();
+            assert_eq!(child.wait(), Some(0), "{cpus:?}");
+        }
     }
 }

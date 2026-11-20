@@ -115,6 +115,17 @@ pub struct Report {
     pub already_removed_segments: u64,
 }
 
+impl Report {
+    /// Adds another report's counts to this one (saturating).
+    pub(crate) fn absorb(&mut self, other: &Report) {
+        self.removed_segments = self.removed_segments.saturating_add(other.removed_segments);
+        self.removed_bytes = self.removed_bytes.saturating_add(other.removed_bytes);
+        self.already_removed_segments = self
+            .already_removed_segments
+            .saturating_add(other.already_removed_segments);
+    }
+}
+
 /// Plans eligible removals without changing files or taking the writer lock.
 ///
 /// Only a contiguous sealed prefix strictly before a valid checkpoint segment qualifies. Age uses wall clock
@@ -209,6 +220,10 @@ fn reasons(policy: &Policy, count: usize, bytes: u128, now: u64, sealed: u64) ->
 /// synced, its directory synced, then the source removed and the journal directory synced. Partial copies stay
 /// in the destination on error; they never justify removing the source. No existing destination is replaced.
 ///
+/// Before the first removal that relies on a checkpoint marker slot, the marker file is synced (once per slot), so
+/// that the slot is durable: a writer writes a slot before it syncs it, and a power loss in between must not bring back
+/// an earlier marker naming a segment removed here (crash contract C14).
+///
 /// # Errors
 ///
 /// [`Error::InvalidConfig`] for a plan used on a different/replaced journal, or lost eligibility;
@@ -217,21 +232,25 @@ fn reasons(policy: &Policy, count: usize, bytes: u128, now: u64, sealed: u64) ->
 /// A missing source counts as already removed only when no older segment remains.
 pub fn apply(dir: impl AsRef<Path>, plan: &Plan, action: &Action) -> Result<Report> {
     let mut report = Report::default();
-    apply_into(dir.as_ref(), plan, action, &mut report)?;
+    apply_into(dir.as_ref(), plan, action, &mut report, true)?;
     Ok(report)
 }
 
+/// `external` is true for a caller other than the writer itself (which runs retention only after its own marker is
+/// durable): the marker that decides each removal is then made durable first ([`durable_checkpoint`]).
 pub(crate) fn apply_into(
     dir: &Path,
     plan: &Plan,
     action: &Action,
     report: &mut Report,
+    external: bool,
 ) -> Result<()> {
     if directory_identity(dir)? != plan.directory {
         return Err(Error::InvalidConfig(
             "retention plan belongs to a different journal directory".into(),
         ));
     }
+    let mut synced = None;
     for segment in &plan.segments {
         let paths = journal::list_segments(dir)?;
         // A missing file is harmless only if the entire older prefix has also gone.
@@ -246,7 +265,12 @@ pub(crate) fn apply_into(
                 CorruptReason::BrokenChain(segment.base_seq),
             ));
         }
-        let Some(marker) = checkpoint(dir)? else {
+        let marker = if external {
+            durable_checkpoint(dir, &mut synced)?
+        } else {
+            checkpoint(dir)?
+        };
+        let Some(marker) = marker else {
             return Err(Error::InvalidConfig(
                 "retention requires a valid checkpoint".into(),
             ));
@@ -319,6 +343,30 @@ fn already_removed(paths: &[(u64, PathBuf)], base: u64) -> bool {
 fn directory_identity(dir: &Path) -> Result<journal::Identity> {
     let meta = fs::metadata(dir).map_err(|e| Error::io("stat journal directory", dir, e))?;
     Ok((meta.dev(), meta.ino()))
+}
+
+/// [`checkpoint`], made durable before it is used: a writer writes a marker slot and syncs it afterwards (its marker
+/// barrier), so a slot read in between can still be lost to a power loss, and removing the segments before it would
+/// then leave the marker that comes back naming a removed segment. The marker file is synced after the read, which
+/// makes durable every write the read saw. `synced` is the slot last made durable this way, which needs no new sync.
+fn durable_checkpoint(
+    dir: &Path,
+    synced: &mut Option<CheckpointSlot>,
+) -> Result<Option<CheckpointSlot>> {
+    let path = dir.join(journal::CHECKPOINT_FILE);
+    let file = match File::open(&path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(Error::io("open checkpoint", &path, e)),
+    };
+    let slot = checkpoint(dir)?;
+    if slot.is_some() && slot != *synced {
+        crate::fault::inject(crate::fault::Point::RetentionMarkerSync)
+            .and_then(|()| mmap::full_barrier(&file))
+            .map_err(|e| Error::io("sync checkpoint marker", &path, e))?;
+        *synced = slot;
+    }
+    Ok(slot)
 }
 
 /// Validate the position to the same extent as writer recovery, without scanning the mutable active tail.

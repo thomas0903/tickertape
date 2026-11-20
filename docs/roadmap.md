@@ -145,6 +145,8 @@ does not help or cannot preserve those guarantees; such a decision must be expli
     implementation already restricts `msync` to written ranges, then performs file-wide sync/barrier operations.
   - Investigate reducing the remaining flush work without weakening data-before-marker ordering or the crash
     contract. Record before/after checkpoint and durable-only reader latency, or document platform limitations.
+  - A checkpoint that does not stop appends (`Writer::request_checkpoint`, ADR 0038, proposed): prototype in review;
+    the design is finished after the Linux measurement the ADR describes (`tt-sustained --checkpoint-mode`).
 - [ ] **Finish eliminating avoidable work.**
   - Profile append, both readers, notification and serialization paths under the sustained workloads; document
     allocations, copies and synchronization that remain on those paths.

@@ -368,6 +368,84 @@ fn sustained_steady_run_with_checkpoints_rolls_and_two_readers() {
     assert!(series[0]["t_utc"].as_str().unwrap().ends_with('Z'));
 }
 
+/// Both checkpoint modes record the call time, the call-to-durable time and the writer's pause, per checkpoint; a
+/// durable-only reader receives every record in background mode too. The helper-thread and early write-back switches
+/// reach the writer's configuration and the result, which carries the page cache's maxima (Linux; null elsewhere).
+#[test]
+fn sustained_checkpoint_modes_record_durable_time_and_pause() {
+    for (mode, extra, early_writeback, helper_cpus) in [
+        (
+            "blocking",
+            &["--no-early-writeback", "--helper-cpus", "inherited"][..],
+            false,
+            serde_json::json!("inherited"),
+        ),
+        (
+            "background",
+            &["--helper-cpus", "0"][..],
+            true,
+            serde_json::json!([0]),
+        ),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let mut options = extra.to_vec();
+        options.extend([
+            "--rate",
+            "5000",
+            "--duration",
+            "1s",
+            "--payload",
+            "256",
+            "--segment-size",
+            "65536",
+            "--checkpoint-every",
+            "100ms",
+            "--checkpoint-mode",
+            mode,
+            "--readers",
+            "safe:durable:wait=block",
+        ]);
+        let result = sustained(root.path(), &options);
+        let writer = &result["writer"];
+        assert_eq!(result["config"]["early_writeback"], early_writeback);
+        assert_eq!(result["config"]["helper_cpus"], helper_cpus);
+        for field in ["dirty_max_bytes", "writeback_max_bytes"] {
+            assert_eq!(
+                writer["page_cache"][field].is_u64(),
+                cfg!(target_os = "linux"),
+                "{mode}: {}",
+                writer["page_cache"]
+            );
+        }
+        assert_eq!(writer["checkpoint_mode"], mode);
+        assert_eq!(result["config"]["checkpoint"]["mode"], mode);
+        assert_eq!(writer["count"], 5_000);
+        let checkpoints = writer["checkpoints"].as_u64().unwrap();
+        assert!(checkpoints >= 5, "{mode}: {checkpoints}");
+        assert_eq!(writer["checkpoint_latency"]["count"], checkpoints, "{mode}");
+        assert_eq!(
+            writer["checkpoint_durable_latency"]["count"], checkpoints,
+            "{mode}"
+        );
+        assert_eq!(writer["checkpoint_pause"]["count"], checkpoints, "{mode}");
+        let call = writer["checkpoint_latency"]["max_us"].as_f64().unwrap();
+        let pause = writer["checkpoint_pause"]["max_us"].as_f64().unwrap();
+        assert!(pause >= call * 0.99, "{mode}: pause {pause} < call {call}");
+        assert!(
+            writer["checkpoint_durable_latency"]["max_us"]
+                .as_f64()
+                .unwrap()
+                > 0.0
+        );
+        if mode == "blocking" {
+            assert_eq!(writer["checkpoint_requests_while_in_flight"], 0);
+        }
+        let reader = &result["readers"][0];
+        assert_eq!(reader["latency_kind"], "durable_only");
+        assert_eq!(reader["records_read"], 5_000, "{mode}");
+    }
+}
+
 #[test]
 fn sustained_bursty_schedule_is_stored_in_the_journal() {
     let root = tempfile::tempdir().unwrap();
@@ -496,6 +574,16 @@ fn sustained_rejects_invalid_configurations_before_creating_directories() {
         vec!["--rate", "100", "--cpus", "0", "--readers", "safe"],
         vec!["--rate", "100", "--segment-size", "1000"],
         vec!["--rate", "100", "--lag-interval", "10us"],
+        vec!["--rate", "100", "--checkpoint-mode", "background"],
+        vec![
+            "--rate",
+            "100",
+            "--checkpoint-every",
+            "1s",
+            "--checkpoint-mode",
+            "later",
+        ],
+        vec!["--rate", "100", "--helper-cpus", "some"],
     ] {
         let root = tempfile::tempdir().unwrap();
         let output = Command::new(env!("CARGO_BIN_EXE_tt-sustained"))

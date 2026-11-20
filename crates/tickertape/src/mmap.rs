@@ -218,6 +218,37 @@ impl MapRw {
     pub(crate) fn sync_range(&self, offset: u64, len: u64) -> io::Result<()> {
         msync(self.ptr, self.len, offset, len)
     }
+
+    /// A handle that can `msync` ranges of this mapping from another thread while the writer keeps storing into it,
+    /// and keeps the mapping alive while it lives (ADR 0038).
+    pub(crate) fn flush_handle(&self) -> Flush {
+        Flush {
+            region: Arc::clone(&self.region),
+        }
+    }
+}
+
+/// Writes back ranges of a writer mapping from any thread (the background checkpoint, ADR 0038). Like [`Advice`], it
+/// never reads or writes the mapped bytes, and it keeps the mapping alive while it exists.
+///
+/// Why `msync` on one thread while the writer stores into the same pages on another is sound: `msync` passes an
+/// address range to the kernel and creates no reference into the mapping, so in Rust's terms this thread accesses no
+/// memory at all, and the writer's `&mut` slices stay the only access from this process. What the kernel writes to the
+/// file is whatever the pages hold when it copies them: every byte the writer stored before the checkpoint was
+/// requested (ordered before the `msync` by the hand-over of the request between the threads), and, for bytes stored
+/// during the call, old or new contents in any mixture. The checkpoint marker names only positions before the request,
+/// so the bytes written during the call are never claimed durable; they are records not covered by a checkpoint
+/// (`docs/crash-contract.md`, C8).
+#[derive(Debug, Clone)]
+pub(crate) struct Flush {
+    region: Arc<Region>,
+}
+
+impl Flush {
+    /// `msync(MS_SYNC)` on the pages covering `[offset, offset + len)` of the mapping.
+    pub(crate) fn sync_range(&self, offset: u64, len: u64) -> io::Result<()> {
+        msync(self.region.ptr, self.region.len, offset, len)
+    }
 }
 
 /// Asks the kernel to fault in part of a writer mapping ahead of the writer (ADR 0020), from any thread. It never
@@ -608,6 +639,14 @@ impl Notify {
             | u64::from(self.word(NOTIFY_NONCE_HI).load(Ordering::SeqCst)) << 32
     }
 
+    /// Writer: a handle that publishes on this region from another thread (the background checkpoint, ADR 0038). It
+    /// keeps the region mapped while it lives; clearing the writer flag stays with this `Notify`'s drop.
+    pub(crate) fn publisher(&self) -> NotifyPublisher {
+        NotifyPublisher {
+            region: Arc::clone(&self.map.region),
+        }
+    }
+
     /// Reader: whether the writer that created the region still maintains the counter.
     pub(crate) fn writer_notifies(&self) -> bool {
         self.word(NOTIFY_WRITER_FLAG).load(Ordering::SeqCst) != 0
@@ -655,6 +694,34 @@ impl Notify {
                 Ok(_) => break,
                 Err(actual) => current = actual,
             }
+        }
+    }
+}
+
+/// Publishes on the writer's wake-up region from another thread ([`Notify::publisher`]): the same event-count step as
+/// [`Notify::publish`], so the writer's own handle, and its appends, are unchanged.
+#[derive(Debug, Clone)]
+pub(crate) struct NotifyPublisher {
+    region: Arc<Region>,
+}
+
+impl NotifyPublisher {
+    fn word(&self, offset: u64) -> &AtomicU32 {
+        let off = checked_word(self.region.len, offset)
+            .unwrap_or_else(|| unreachable!("notify offsets are in bounds"));
+        // SAFETY: as in `MapRw::word`: `off` is 8-aligned and `[off, off + 4)` lies inside the region, which stays mapped
+        // and writable while `self.region` lives (the returned reference borrows `self`). The region's words are only
+        // ever accessed atomically, by this process (`Notify`, this handle) and by readers in others; nothing creates a
+        // non-atomic reference into a notify region.
+        unsafe { AtomicU32::from_ptr(self.region.ptr.as_ptr().add(off).cast::<u32>()) }
+    }
+
+    /// Bumps the event counter and wakes blocked readers if any, as [`Notify::publish`] does.
+    pub(crate) fn publish(&self) {
+        let event = self.word(NOTIFY_EVENT);
+        event.fetch_add(1, Ordering::SeqCst);
+        if self.word(NOTIFY_WAITERS).load(Ordering::SeqCst) != 0 {
+            wake_all(event);
         }
     }
 }
@@ -1338,6 +1405,88 @@ pub(crate) fn full_barrier(file: &File) -> io::Result<()> {
     {
         sync_data(file)
     }
+}
+
+/// Starts write-back of the dirty pages of `file` that overlap `[offset, offset + len)` without waiting for it:
+/// `sync_file_range(SYNC_FILE_RANGE_WRITE)` (ADR 0038 → Early write-back). It makes nothing durable (no metadata,
+/// no device cache flush) and reports no earlier write-back error: without the wait flags it does not check or
+/// advance the file's write-back error state, so a later `fdatasync` on the same file still reports any failure of
+/// this write-back. Linux only.
+#[cfg(target_os = "linux")]
+pub(crate) fn start_writeback(file: &File, offset: u64, len: u64) -> io::Result<()> {
+    let (Ok(offset), Ok(len)) = (
+        libc::off64_t::try_from(offset),
+        libc::off64_t::try_from(len),
+    ) else {
+        return Err(io::Error::from(io::ErrorKind::InvalidInput));
+    };
+    // SAFETY: sync_file_range on a valid descriptor reads no memory of this process and has no memory-safety
+    // preconditions; the range need not be mapped.
+    let rc = unsafe {
+        libc::sync_file_range(file.as_raw_fd(), offset, len, libc::SYNC_FILE_RANGE_WRITE)
+    };
+    if rc != 0 {
+        Err(last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// The CPUs a thread affinity mask can name here: 8,192, the largest `NR_CPUS` of the kernels tickertape supports.
+/// The kernel ignores bits past its own number of CPUs.
+#[cfg(target_os = "linux")]
+pub(crate) const AFFINITY_CPUS: usize = 8192;
+
+/// Sets the calling thread's CPU affinity to `cpus` (CPU numbers below [`AFFINITY_CPUS`]) with the
+/// `sched_setaffinity` system call. The kernel intersects the mask with the CPUs the thread's cpuset allows and fails
+/// with `EINVAL` if nothing is left. Linux only.
+#[cfg(target_os = "linux")]
+pub(crate) fn set_thread_affinity(cpus: impl IntoIterator<Item = usize>) -> io::Result<()> {
+    let mut mask = vec![0u64; AFFINITY_CPUS / 64];
+    for cpu in cpus {
+        let word = mask
+            .get_mut(cpu / 64)
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
+        *word |= 1 << (cpu % 64);
+    }
+    // SAFETY: the kernel reads `size_of_val(&mask)` bytes from `mask`'s buffer, which is that long and stays alive
+    // for the call; pid 0 is the calling thread. The raw system call is used so that the C library cannot reject a
+    // mask longer than its own `cpu_set_t`.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_sched_setaffinity,
+            0 as libc::pid_t,
+            std::mem::size_of_val(mask.as_slice()),
+            mask.as_ptr(),
+        )
+    };
+    if rc != 0 {
+        Err(last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// The calling thread's CPU affinity: the CPU numbers in its mask (`sched_getaffinity`). Linux only; for tests.
+#[cfg(all(target_os = "linux", test))]
+pub(crate) fn thread_affinity() -> io::Result<Vec<usize>> {
+    let mut mask = vec![0u64; AFFINITY_CPUS / 64];
+    // SAFETY: the kernel writes at most `size_of_val(&mask)` bytes into `mask`'s buffer, which is that long and
+    // stays alive for the call; pid 0 is the calling thread.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_sched_getaffinity,
+            0 as libc::pid_t,
+            std::mem::size_of_val(mask.as_slice()),
+            mask.as_mut_ptr(),
+        )
+    };
+    if rc < 0 {
+        return Err(last_os_error());
+    }
+    Ok((0..AFFINITY_CPUS)
+        .filter(|cpu| mask[cpu / 64] & (1 << (cpu % 64)) != 0)
+        .collect())
 }
 
 /// True if `err` means "no space" or "quota exceeded".

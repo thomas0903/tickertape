@@ -7,7 +7,8 @@
 //! - The byte layout is specified in `docs/format.md` in the repository, and mirrored by the [`mod@format`] module.
 //! - What survives a process crash or power loss is specified in `docs/crash-contract.md`. In short: a record is
 //!   *visible* to readers, and survives the writer process dying, as soon as [`Writer::append`] returns; it is
-//!   *durable* only after a later [`Writer::checkpoint`] returns.
+//!   *durable* only after a later [`Writer::checkpoint`] returns, or after a background checkpoint started with
+//!   [`Writer::request_checkpoint`] has finished.
 //!
 //! ```no_run
 //! use tickertape::{NewRecord, Reader, ReaderConfig, Writer, WriterConfig};
@@ -42,6 +43,8 @@ compile_error!(
 #[cfg(not(unix))]
 compile_error!("tickertape supports Unix (Linux and macOS) only");
 
+mod affinity;
+mod checkpoint;
 pub mod clock;
 mod config;
 mod crc;
@@ -63,13 +66,14 @@ mod reader;
 mod record;
 pub mod retention;
 pub mod status;
+mod writeback;
 mod writer;
 
-pub use config::{Backoff, ReaderConfig, RecoveryPolicy, WriterConfig};
+pub use config::{Backoff, HelperCpus, ReaderConfig, RecoveryPolicy, WriterConfig};
 pub use error::{CorruptReason, Error, Result};
 pub use reader::{Reader, Records};
 pub use record::{NewRecord, OwnedRecord, Record};
-pub use writer::{RecoveryAction, RecoveryReport, Writer};
+pub use writer::{CheckpointProgress, RecoveryAction, RecoveryReport, Writer};
 
 /// The version of this crate, as set in `Cargo.toml`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

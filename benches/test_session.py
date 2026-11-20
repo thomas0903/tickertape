@@ -86,6 +86,29 @@ class ScenarioTests(unittest.TestCase):
             self.args_for("steady-50", host={"ram": GIB, "free": GIB})
 
 
+class CheckpointModeTests(unittest.TestCase):
+    host = {"ram": 64 * GIB, "free": 1000 * GIB}
+
+    def args_for(self, scenario, argv):
+        run = session.TtRun(f"tt-{scenario}-64-r1", scenario, 64, 1)
+        return session.scenario_args(run, None if scenario == "probe" else 1_000_000, self.host,
+                                     params(argv=argv))[0]
+
+    def test_background_mode_reaches_every_run_that_checkpoints(self):
+        for scenario in session.SCENARIOS:
+            background = self.args_for(scenario, ["--checkpoint-mode", "background"])
+            blocking = self.args_for(scenario, [])
+            self.assertNotIn("--checkpoint-mode", blocking)
+            if "--checkpoint-every" in blocking:
+                self.assertEqual(background, [*blocking, "--checkpoint-mode", "background"])
+            else:
+                self.assertEqual(background, blocking)
+
+    def test_default_mode_keeps_the_parameters_of_older_sessions(self):
+        self.assertNotIn("checkpoint_mode", params())
+        self.assertEqual(params(argv=["--checkpoint-mode", "background"])["checkpoint_mode"], "background")
+
+
 class EstimateAndResumeTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

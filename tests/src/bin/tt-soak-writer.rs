@@ -96,6 +96,9 @@ fn main() {
             RecoveryAction::CompletedRoll { segment } => {
                 format!("act completed {} 0 0 -", name(segment))
             }
+            RecoveryAction::RestoredHeader { segment } => {
+                format!("act restoredheader {} 0 0 -", name(segment))
+            }
             RecoveryAction::RemovedTemp { file } => format!("act removedtemp {} 0 0 -", name(file)),
             other => format!("act other - 0 0 {other:?}"),
         };

@@ -87,7 +87,16 @@ def round_down(value, unit):
 
 def scenario_args(run, probe_rate, host, params):
     """tt-sustained arguments and scheduled seconds for one run. `probe_rate` is None for the probe itself;
-    `host` has "ram" and "free" (bytes free on the journal filesystem)."""
+    `host` has "ram" and "free" (bytes free on the journal filesystem). With --checkpoint-mode background, every run
+    that checkpoints gets `--checkpoint-mode background` (ADR 0038)."""
+    args_, seconds = _scenario_args(run, probe_rate, host, params)
+    mode = params.get("checkpoint_mode", "blocking")
+    if mode != "blocking" and "--checkpoint-every" in args_:
+        args_ = [*args_, "--checkpoint-mode", mode]
+    return args_, seconds
+
+
+def _scenario_args(run, probe_rate, host, params):
     payload, rb = run.payload, record_bytes(run.payload)
     duration, warmup = params["duration_s"], params["warmup_s"]
     retain = round_down(min(int(host["free"] * 0.4), 64 * GIB), DEFAULT_SEGMENT)
@@ -376,6 +385,9 @@ def parse_args(argv=None):
     parser.add_argument("--repeats", type=int, help="repeats of every tickertape scenario (default from the matrix)")
     parser.add_argument("--max-run", type=int, default=7200, help="longest beyond-ram run in seconds (default 7200)")
     parser.add_argument("--cpus", help="passed to tt-sustained --cpus (writer, then readers; Linux only)")
+    parser.add_argument("--checkpoint-mode", choices=("blocking", "background"), default="blocking",
+                        help="passed to tt-sustained --checkpoint-mode in every run that checkpoints (default "
+                             "blocking); compare the modes with one session per mode, each with its own --out")
     parser.add_argument("--dry-run", action="store_true", help="print the plan and estimate, run nothing")
     parser.add_argument("--yes", action="store_true", help="start without asking (required when not interactive)")
     args = parser.parse_args(argv)
@@ -399,6 +411,9 @@ def parameters(args):
     if matrix["duration_s"] <= 0 or matrix["repeats"] < 1:
         raise SystemExit("session: duration and repeats must be positive")
     matrix["max_run_s"] = args.max_run
+    if args.checkpoint_mode != "blocking":
+        # Only when not the default, so sessions started before the option existed still resume.
+        matrix["checkpoint_mode"] = args.checkpoint_mode
     matrix["only"] = args.only
     matrix["compare_tools"] = args.compare_tools
     return matrix

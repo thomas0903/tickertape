@@ -5,6 +5,7 @@
 //! Everything here is a hint: if the thread can't start, falls behind or stops, the writer faults pages itself, as it
 //! would without prefaulting.
 
+use crate::config::HelperCpus;
 use crate::mmap::{self, Advice, MapRw};
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -61,7 +62,7 @@ struct State {
 
 impl Prefaulter {
     /// Starts the helper for `advice`'s segment with the writer at `offset`. `None` if the thread can't be spawned.
-    pub(crate) fn start(advice: Advice, offset: u64) -> Option<Prefaulter> {
+    pub(crate) fn start(advice: Advice, offset: u64, cpus: HelperCpus) -> Option<Prefaulter> {
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
                 advice,
@@ -77,7 +78,10 @@ impl Prefaulter {
         let helper = Arc::clone(&shared);
         let thread = std::thread::Builder::new()
             .name("tickertape-prefault".into())
-            .spawn(move || run(&helper))
+            .spawn(move || {
+                crate::affinity::place_helper(&cpus);
+                run(&helper);
+            })
             .ok()?;
         Some(Prefaulter {
             shared,
@@ -188,7 +192,7 @@ fn run(shared: &Shared) {
 }
 
 /// A preallocated, synced and mapped segment file that is not published yet (ADR 0022): all zeros, named
-/// [`crate::journal::SPARE_FILE`]. At roll the writer writes its header, syncs it and links it into place.
+/// [`crate::journal::SPARE_FILE`]. At roll the writer writes its header and links it into place (the next checkpoint syncs it).
 #[derive(Debug)]
 pub(crate) struct Spare {
     pub(crate) file: File,
@@ -198,11 +202,18 @@ pub(crate) struct Spare {
 
 /// Starts preparing a spare segment of `size` bytes in `dir` on a short-lived thread. `None` if the thread can't be
 /// spawned (the writer then creates the next segment itself, as without a spare).
-pub(crate) fn prepare_spare(dir: &Path, size: u64) -> Option<JoinHandle<io::Result<Spare>>> {
+pub(crate) fn prepare_spare(
+    dir: &Path,
+    size: u64,
+    cpus: HelperCpus,
+) -> Option<JoinHandle<io::Result<Spare>>> {
     let dir = dir.to_path_buf();
     std::thread::Builder::new()
         .name("tickertape-spare".into())
-        .spawn(move || make_spare(&dir, size))
+        .spawn(move || {
+            crate::affinity::place_helper(&cpus);
+            make_spare(&dir, size)
+        })
         .ok()
 }
 
@@ -303,7 +314,7 @@ mod tests {
     fn helper_follows_rolls_and_stops_on_drop() {
         let (_dir1, _file1, map1) = mapping(4 << 20);
         let (_dir2, _file2, map2) = mapping(32 << 20);
-        let mut prefaulter = Prefaulter::start(map1.advice(), 64).unwrap();
+        let mut prefaulter = Prefaulter::start(map1.advice(), 64, HelperCpus::Inherited).unwrap();
         let shared = Arc::clone(&prefaulter.shared);
         wait_for_call(&shared, 4 << 20);
         if !supported(map1.advice().prefault(0, 4096)) {

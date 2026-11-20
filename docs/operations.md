@@ -8,10 +8,11 @@ draws conclusions from those two.
 
 `WriterConfig::segment_size` (default 128 MiB; a multiple of 64 KiB) trades these against each other:
 
-- **Rolls.** The append that fills a segment publishes the next one: write and sync its header, then link it. With
-  the default `prefault(true)`, the next segment has been preallocated in the background (see "Writer threads");
-  otherwise the roll also preallocates and syncs a whole new file. Either way that append takes milliseconds
-  instead of microseconds (see "roll appends" in `benchmarks.md`). Larger segments roll less often.
+- **Rolls.** The append that fills a segment publishes the next one: write its header, then link it. On macOS with
+  the default `prefault(true)` the next segment has been preallocated in the background (see "Writer threads");
+  otherwise the roll also preallocates a new file. The roll does not sync the new segment; the next checkpoint does
+  (ADR 0038). A roll append is still slower than other appends (see "roll appends" in `benchmarks.md`, measured
+  before rolls stopped syncing). Larger segments roll less often.
 - **Largest record.** A record must fit in one segment: at most `segment_size - 112` bytes of payload.
 - **Disk reservation.** Every segment reserves its full size on disk when it is created, even if it is mostly empty.
 - **Open time.** When the writer opens, it reads the part of the newest segment after the last record to clean up
@@ -32,12 +33,36 @@ With `WriterConfig::prefault(true)` (the default), the writer moves segment work
   - **macOS:** the next 8 MiB, with `MADV_WILLNEED` (ADR 0020). On APFS, writing into a preallocated segment otherwise
     faults once per 16 KiB page, slowly.
 - **The next segment (macOS only).** Once the active segment is half full, a short-lived thread, `tickertape-spare`,
-  creates, preallocates and syncs `next-segment.tmp` (ADR 0022). The roll then only writes and syncs the header and
-  links the file into place; preallocating and syncing a whole segment on APFS takes about 50 ms. The spare
+  creates, preallocates and syncs `next-segment.tmp` (ADR 0022). The roll then only writes the header and links the
+  file into place; preallocating and syncing a whole segment on APFS takes about 50 ms. The spare
   reserves one more segment's worth of disk space from that point on. On Linux a synchronous roll costs about a
   millisecond on ext4, and the spare occasionally stalled the writer, so Linux doesn't use it (ADR 0023).
 
-Neither thread ever writes records. Set `prefault(false)` if you pin threads and want a writer that starts none.
+- **Early write-back (Linux).** A helper thread, `tickertape-writeback`, asks the kernel to start writing back the
+  pages behind the write position (`sync_file_range(SYNC_FILE_RANGE_WRITE)`, every 1 MiB, and the rest of a segment
+  when the writer rolls past it), so that a checkpoint, blocking or background, finds little dirty data left
+  (`WriterConfig::early_writeback`, default on; ADR 0038). It makes nothing durable: only checkpoints do. An I/O
+  error from it makes the next checkpoint fail, as a failed sync would. On macOS the option does nothing.
+
+None of these threads ever writes records. Set `prefault(false)` if you want a writer that starts none (it also turns
+off early write-back); `Writer::request_checkpoint` still starts the checkpoint thread.
+
+**Pinned writers.** A new thread inherits the CPU mask of the thread that creates it, and the writer creates its
+helpers from the calling thread (the checkpoint thread at the first `request_checkpoint`). So that a writer thread
+pinned to one CPU does not get its helpers on the same CPU, each helper resets its own affinity on Linux when it
+starts (`WriterConfig::helper_cpus`, ADR 0038):
+
+- `HelperCpus::Process` (default): every CPU the process's cpuset allows, except the CPUs in
+  `/sys/devices/system/cpu/isolated` (`isolcpus`), unless no other is allowed. A mask set with `taskset` or
+  `sched_setaffinity` does not limit this, because it belongs to threads, not the process: to keep the helpers inside
+  such a mask, name its CPUs or create the writer from a thread that has it and use `HelperCpus::Inherited`. A cpuset
+  (cgroup, container CPU limit) does limit it.
+- `HelperCpus::List(cpus)`: put the helpers on CPUs of your choice, for example a housekeeping CPU next to the
+  writer's. A list the kernel refuses (no listed CPU in the cpuset) falls back to `Process`.
+- `HelperCpus::Inherited`: the creating thread's mask, as before this option existed.
+
+macOS has no call to bind threads to CPUs; the option does nothing there. `tt-sustained --helper-cpus` takes the same
+choices.
 
 **Sustained high byte rates on Linux.** Under steady write-back (minutes of writing, gigabytes of dirty pages), ext4
 itself occasionally stalls the writer for milliseconds, with or without prefaulting (ADR 0025). Plan disk
@@ -59,6 +84,15 @@ writer process crashing, but not a power loss (crash contract C1, C7, C8).
 
 A common pattern is a time- or count-based checkpoint (for example every second or every N records, whichever comes
 first) plus one before a clean shutdown. Dropping a `Writer` does not checkpoint.
+
+**Background checkpoints** (Rust API, ADR 0038, proposed): `Writer::request_checkpoint()` starts a checkpoint of
+everything appended so far on the writer's own checkpoint thread and returns at once, so appends go on while the sync
+calls run; `Writer::checkpoint_progress()` reports when it is durable. Records appended after the request are not
+covered. A failure is reported by the next of these calls (or `checkpoint()`, or `Writer::close()`), and poisons the
+writer as above. Dropping the writer waits for the requested checkpoints; `close()` waits and reports how they ended
+(it does not checkpoint). A request made while one checkpoint waits joins it. To wait for a checkpoint, poll
+`checkpoint_progress()`. On Linux, combine background checkpoints with early write-back (the default) and keep the
+checkpoint thread off a pinned writer's CPU (the default; "Pinned writers" above).
 
 If `checkpoint()` returns an error, the writer refuses all later checkpoints (`Error::DurabilityLost`) while appends
 keep working. Treat it as an incident: see "Errors are sticky" in the crash contract.

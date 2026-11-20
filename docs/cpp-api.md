@@ -384,7 +384,7 @@ not recorded.
   returns, even if the fill hands it to another thread: that thread must not call it before then.
 - The binding reads the C ABI's per-thread error state inside the call that failed, so `Error` is always the right
   one, whatever your threading. The header adds no global state of its own.
-- With the default options a writer starts a background helper thread; `WriterOptions::prefault(false)` gives one
+- With the default options a writer starts background helper threads; `WriterOptions::prefault(false)` gives one
   that starts none.
 - **`fork()`:** the C rules apply unchanged ([`c-api.md` → Threading](c-api.md#threading)): never use or destroy, in
   the child, objects created before the fork. Destroying a `Writer` closes its handle, so a child that does not

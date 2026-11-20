@@ -574,7 +574,9 @@ pub struct WriterMetrics {
     /// in every segment: what a power loss could remove. The next checkpoint syncs at least these (whole files for
     /// segments an earlier writer left).
     pub uncheckpointed_bytes: u64,
-    /// True after a failed checkpoint: later checkpoints fail with [`Error::DurabilityLost`].
+    /// True after a failed checkpoint (also as soon as a background checkpoint, or the early write-back of segment
+    /// data on Linux, has failed): later checkpoints fail with [`Error::DurabilityLost`] (the first one after a
+    /// failure not yet returned fails with that failure's error).
     pub poisoned: bool,
     /// Retention runs that failed since open. The last error is [`Writer::last_retention_error`](crate::Writer::last_retention_error).
     pub retention_failures: u64,

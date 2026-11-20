@@ -711,3 +711,299 @@ fn records_iterator_yields_committed_records_and_stops() {
         (700..705).collect::<Vec<_>>()
     );
 }
+
+/// A journal whose newest segment was linked by the last of `rolls` rolls after the checkpoint and holds about 100
+/// records: returns the newest segment's base and path, and the previous segment's path.
+fn rolled_after_checkpoint(
+    dir: &std::path::Path,
+    rolls: usize,
+) -> (u64, std::path::PathBuf, std::path::PathBuf) {
+    let mut w = Writer::open(dir, small_config()).unwrap();
+    append_n(&mut w, 600);
+    w.checkpoint().unwrap();
+    for _ in 0..rolls {
+        let before = segments(dir).len();
+        while segments(dir).len() == before {
+            append_n(&mut w, 1);
+        }
+    }
+    append_n(&mut w, 100);
+    drop(w);
+    let segs = segments(dir);
+    let (base, newest) = segs[segs.len() - 1].clone();
+    let previous = segs[segs.len() - 2].1.clone();
+    assert!(
+        end_of_records(&newest).0 > 8192,
+        "the newest segment holds more than two pages of records"
+    );
+    (base, newest, previous)
+}
+
+fn zero_range(path: &std::path::Path, from: u64, len: u64) {
+    open_raw(path)
+        .write_all_at(&vec![0u8; len as usize], from)
+        .unwrap();
+}
+
+fn has_restored(w: &Writer, segment: &std::path::Path) -> bool {
+    w.recovery_report()
+        .actions
+        .iter()
+        .any(|a| matches!(a, RecoveryAction::RestoredHeader { segment: s } if s == segment))
+}
+
+/// A roll does not sync the new segment (ADR 0038): after an OS crash or power loss before the next checkpoint, the
+/// new segment's name can be on disk while none of its bytes are. Recovery writes its header again and continues as
+/// if the header had been there, under both policies: the records before it are intact and nothing is quarantined.
+/// With the old segment's seal on disk, and without it (the scan then reaches the new segment at the seal's place).
+#[test]
+fn unwritten_newest_segment_is_restored_under_both_policies() {
+    for seal_on_disk in [true, false] {
+        for policy in [RecoveryPolicy::Fail, RecoveryPolicy::Quarantine] {
+            let dir = tempfile::tempdir().unwrap();
+            let (base, newest, previous) = rolled_after_checkpoint(dir.path(), 1);
+            let len = std::fs::metadata(&newest).unwrap().len();
+            zero_range(&newest, 0, len);
+            if !seal_on_disk {
+                let (end, _) = end_of_records(&previous);
+                zero_range(&previous, end, format::SEAL_LEN as u64);
+            }
+            let mut w = Writer::open(dir.path(), small_config().recovery(policy)).unwrap();
+            let case = format!("seal on disk {seal_on_disk}, {policy:?}");
+            assert!(
+                has_restored(&w, &newest),
+                "{case}: {:?}",
+                w.recovery_report()
+            );
+            assert_eq!(
+                w.recovery_report()
+                    .actions
+                    .iter()
+                    .any(|a| matches!(a, RecoveryAction::Sealed { .. })),
+                !seal_on_disk,
+                "{case}: {:?}",
+                w.recovery_report()
+            );
+            assert_eq!(w.next_seq(), base, "{case}");
+            assert!(!dir.path().join("quarantine").exists(), "{case}");
+            append_n(&mut w, 10);
+            w.checkpoint().unwrap();
+            drop(w);
+            let w =
+                Writer::open(dir.path(), small_config().recovery(RecoveryPolicy::Fail)).unwrap();
+            assert!(
+                w.recovery_report().actions.is_empty(),
+                "{case}: {:?}",
+                w.recovery_report()
+            );
+            assert_sequence(&read_all(dir.path()), base + 10);
+        }
+    }
+}
+
+/// The new segment's file is empty (its preallocated size did not reach the disk either): it holds only zeros, so
+/// recovery replaces it by a new empty segment of the configured size, under both policies.
+#[test]
+fn empty_newest_segment_file_is_replaced() {
+    for policy in [RecoveryPolicy::Fail, RecoveryPolicy::Quarantine] {
+        let dir = tempfile::tempdir().unwrap();
+        let (base, newest, _) = rolled_after_checkpoint(dir.path(), 1);
+        open_raw(&newest).set_len(0).unwrap();
+        let mut w = Writer::open(dir.path(), small_config().recovery(policy)).unwrap();
+        assert!(
+            has_restored(&w, &newest),
+            "{policy:?}: {:?}",
+            w.recovery_report()
+        );
+        assert_eq!(w.next_seq(), base);
+        assert_eq!(std::fs::metadata(&newest).unwrap().len(), SMALL_SEGMENT);
+        assert!(!dir.path().join("quarantine").exists());
+        append_n(&mut w, 5);
+        drop(w);
+        assert_sequence(&read_all(dir.path()), base + 5);
+    }
+}
+
+/// Later pages of the new segment reached the disk, its first page (header and first records) did not: once the
+/// header is restored this is the state a durable header with a lost first page gives, and it is handled the same
+/// way (C8, C11 (2)): evidence of committed records after an empty commit word, so `Fail` refuses at the first
+/// record slot without changing a byte after the header, and `Quarantine` preserves the records in `quarantine/`.
+#[test]
+fn unwritten_first_page_with_later_records_is_a_committed_tail() {
+    let dir = tempfile::tempdir().unwrap();
+    let (base, newest, _) = rolled_after_checkpoint(dir.path(), 1);
+    zero_range(&newest, 0, 4096);
+    match Writer::open(dir.path(), small_config().recovery(RecoveryPolicy::Fail)) {
+        Err(Error::Corrupt { path, offset, .. }) => {
+            assert_eq!(
+                (path, offset),
+                (newest.clone(), format::SEGMENT_HEADER_LEN as u64)
+            );
+        }
+        other => panic!("expected a corruption error, got {other:?}"),
+    }
+    let image = std::fs::read(&newest).unwrap();
+    assert!(format::decode_segment_header(image[..64].try_into().unwrap()).is_ok());
+    assert!(image[64..4096].iter().all(|&b| b == 0));
+    assert!(!dir.path().join("quarantine").exists());
+
+    let w = Writer::open(dir.path(), small_config()).unwrap();
+    assert!(
+        w.recovery_report().actions.iter().any(|a| matches!(
+            a,
+            RecoveryAction::RepairedTail { segment, offset: 64, .. } if *segment == newest
+        )),
+        "{:?}",
+        w.recovery_report()
+    );
+    assert_eq!(w.next_seq(), base);
+    assert_sequence(&read_all(dir.path()), base);
+}
+
+/// Two segments linked after the checkpoint whose bytes never reached the disk: the first is restored and is the end
+/// of the chain, so the second is disconnected and handled as a disconnected segment with a header is (C8).
+#[test]
+fn two_unwritten_segments_restore_the_first_and_disconnect_the_second() {
+    let dir = tempfile::tempdir().unwrap();
+    let (base, newest, previous) = rolled_after_checkpoint(dir.path(), 2);
+    let previous_base = segments(dir.path()).iter().rev().nth(1).unwrap().0;
+    for path in [&previous, &newest] {
+        let len = std::fs::metadata(path).unwrap().len();
+        zero_range(path, 0, len);
+    }
+    // `Fail` restores the first header (a crash state, as a missing seal is), then refuses at the disconnected
+    // segment, which it leaves in place (C11 lists what an open may change before it refuses).
+    match Writer::open(dir.path(), small_config().recovery(RecoveryPolicy::Fail)) {
+        Err(Error::Corrupt {
+            path,
+            reason: CorruptReason::BrokenChain(b),
+            ..
+        }) => assert_eq!((path, b), (newest.clone(), base)),
+        other => panic!("expected BrokenChain, got {other:?}"),
+    }
+    let image = std::fs::read(&previous).unwrap();
+    assert!(format::decode_segment_header(image[..64].try_into().unwrap()).is_ok());
+    assert!(std::fs::read(&newest).unwrap().iter().all(|&b| b == 0));
+    let w = Writer::open(dir.path(), small_config()).unwrap();
+    assert!(!has_restored(&w, &previous), "{:?}", w.recovery_report());
+    assert!(
+        w.recovery_report().actions.iter().any(|a| matches!(
+            a,
+            RecoveryAction::QuarantinedSegment { segment, reason: CorruptReason::BrokenChain(b), .. }
+                if *segment == newest && *b == base
+        )),
+        "{:?}",
+        w.recovery_report()
+    );
+    assert_eq!(w.next_seq(), previous_base);
+}
+
+/// The regular files of `dir` (not `writer.lock`) and their contents.
+fn snapshot(dir: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+    let mut files: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.is_file() && p.file_name().unwrap() != "writer.lock")
+        .map(|p| {
+            let bytes = std::fs::read(&p).unwrap();
+            (p, bytes)
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+/// A copy of the regular files of `from` in a new directory.
+fn copy_journal(from: &std::path::Path) -> tempfile::TempDir {
+    let to = tempfile::tempdir().unwrap();
+    for (path, bytes) in snapshot(from) {
+        std::fs::write(to.path().join(path.file_name().unwrap()), bytes).unwrap();
+    }
+    to
+}
+
+/// A segment file of invalid length holding only zeros, with a later segment after it, is replaced by preparing the
+/// new segment under a temporary name and renaming it over the old file (C8): a failed allocation, or a crash after
+/// the copy is synced and before the rename, leaves the old file in place, and the next open recovers exactly as an
+/// uninterrupted one does (it does not find a missing middle segment).
+#[test]
+fn interrupted_replacement_of_an_unwritten_segment_leaves_no_gap() {
+    use tickertape::fault::{self, Point};
+    for (point, errno) in [(Point::Preallocate, 28), (Point::RestoreBeforeRename, 5)] {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, newest, previous) = rolled_after_checkpoint(dir.path(), 2);
+        let previous_base = segments(dir.path()).iter().rev().nth(1).unwrap().0;
+        open_raw(&previous).set_len(0).unwrap();
+        open_raw(&previous).set_len(100).unwrap();
+        let reference = copy_journal(dir.path());
+        let expected = Writer::open(reference.path(), small_config()).unwrap();
+        assert!(has_restored(
+            &expected,
+            &reference.path().join(previous.file_name().unwrap())
+        ));
+
+        fault::fail_next(point, errno);
+        let failed = Writer::open(dir.path(), small_config());
+        fault::clear();
+        assert!(failed.is_err(), "{point:?}: {failed:?}");
+        assert!(previous.exists() && newest.exists(), "{point:?}");
+        let w = Writer::open(dir.path(), small_config()).unwrap();
+        assert!(
+            has_restored(&w, &previous),
+            "{point:?}: {:?}",
+            w.recovery_report()
+        );
+        assert_eq!(w.next_seq(), previous_base, "{point:?}");
+        assert_eq!(w.next_seq(), expected.next_seq(), "{point:?}");
+        let names = |d: &std::path::Path| {
+            segments(d)
+                .into_iter()
+                .map(|(base, _)| base)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(dir.path()), names(reference.path()), "{point:?}");
+        assert_eq!(
+            std::fs::metadata(&previous).unwrap().len(),
+            SMALL_SEGMENT,
+            "{point:?}"
+        );
+        drop(w);
+        assert_eq!(read_all(dir.path()).len(), read_all(reference.path()).len());
+    }
+}
+
+/// Under `Fail`, a successor whose header never reached the disk is restored only once nothing in the scan step can
+/// still refuse (C11): in front of it, a segment whose seal's commit word is empty with non-zero bytes beyond the
+/// seal makes `Fail` refuse (`BadSeal`), and the refused open changes no file, byte for byte, whether the successor
+/// would have had its header written again or would have been replaced.
+#[test]
+fn fail_refusing_before_an_unwritten_successor_changes_no_file() {
+    for empty_file in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, newest, previous) = rolled_after_checkpoint(dir.path(), 1);
+        if empty_file {
+            open_raw(&newest).set_len(0).unwrap();
+        } else {
+            let len = std::fs::metadata(&newest).unwrap().len();
+            zero_range(&newest, 0, len);
+        }
+        let (end, _) = end_of_records(&previous);
+        zero_range(&previous, end, format::COMMIT_WORD_LEN as u64);
+        open_raw(&previous)
+            .write_all_at(&[0xAB; 8], end + format::SEAL_LEN as u64 + 16)
+            .unwrap();
+        let before = snapshot(dir.path());
+        match Writer::open(dir.path(), small_config().recovery(RecoveryPolicy::Fail)) {
+            Err(Error::Corrupt {
+                path,
+                offset,
+                reason: CorruptReason::BadSeal,
+            }) => assert_eq!((path, offset), (previous.clone(), end)),
+            other => panic!("empty file {empty_file}: expected BadSeal, got {other:?}"),
+        }
+        assert!(
+            snapshot(dir.path()) == before,
+            "empty file {empty_file}: a file changed"
+        );
+    }
+}

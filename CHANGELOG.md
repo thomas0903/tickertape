@@ -5,6 +5,50 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
+- Background checkpoints (ADR 0038, **proposed**):
+  `Writer::request_checkpoint` starts a checkpoint of every record appended so far on the writer's checkpoint thread
+  (`tickertape-checkpoint`, started by the first request) and returns the sequence number it covers up to, so appends
+  continue while the sync calls run; `Writer::checkpoint_progress` returns a `CheckpointProgress` (the durable marker,
+  and the request still pending); `Writer::close` waits for the checkpoints in flight and reports whether every
+  checkpoint of the writer succeeded. Requests made while one checkpoint runs join into one more. A failed background
+  checkpoint poisons the writer and is returned once by the next of these calls or `checkpoint()`. `checkpoint()`
+  keeps its meaning (it waits for background checkpoints first), dropping the writer waits for requested checkpoints,
+  and the writer's retention runs on the checkpoint thread after each background checkpoint. No format change. The
+  crash contract names the background path in "Two levels", "What `checkpoint()` does", "Errors are sticky", C1, C7,
+  C12, C13 and C14. Fault injection gains `Point::CheckpointBeforeMarker` and `fault::hold_background`.
+  `tt-sustained --checkpoint-mode blocking|background` (and `benches/session.py --checkpoint-mode`) compares both, with
+  new result fields `checkpoint_mode`, `checkpoint_durable_latency`, `checkpoint_pause` and
+  `checkpoint_requests_while_in_flight`.
+- Changed (ADR 0038): a roll no longer syncs the new segment on the writer's thread (on ext4 that sync waited for a
+  journal commit at every roll, and behind a background checkpoint's write-back). The next checkpoint syncs every
+  segment linked before its request, before its marker, so what a checkpoint covers is unchanged. After an OS crash
+  or power loss, a segment after the marker can have its name on disk and not its header: recovery writes that
+  header again under both policies where the scan enters the segment (or replaces a file holding only zeros whose
+  length is not a valid segment size), reported as the new `RecoveryAction::RestoredHeader` (Python:
+  `"restored_header"`); until a writer has opened the journal, readers and `verify` report that header as invalid
+  (crash contract C8, C11). A file it replaces is replaced by renaming a prepared copy over it, so an interrupted
+  open leaves no gap, and under `Fail` the header is restored only after the open has decided not to refuse at that
+  step. The format is unchanged. Fault injection gains `Point::RollAfterLink` and `Point::RestoreBeforeRename`.
+- Library: early write-back on Linux, `WriterConfig::early_writeback` (default on, with `prefault`): a helper thread
+  (`tickertape-writeback`) starts the kernel's write-back of the whole pages behind the write position with
+  `sync_file_range(SYNC_FILE_RANGE_WRITE)` every 1 MiB and of a segment the writer rolls past, so checkpoints find
+  little dirty data. It makes nothing durable; an I/O error from it poisons the writer (`metrics().poisoned` at once)
+  and is returned once by the next `request_checkpoint`, `checkpoint_progress`, `checkpoint` or `close` (which joins
+  the helper first). A helper that stopped (that error, or the call unsupported) holds no segment file and is handed
+  none. A forked child's `Writer::release_after_fork` closes its descriptors of the files the helper follows (unless
+  the fork came while the helper held its lock or was starting a write-back). No effect on macOS. Fault injection
+  gains `Point::EarlyWriteback`.
+- Fixed: `retention::apply` (`tickertape archive`) syncs the checkpoint marker after reading the slot that decides a
+  removal and before removing anything, so a power loss right after a writer wrote a new marker slot, and before its
+  marker barrier, can no longer bring back a marker that names a segment the archiver removed (crash contract C14).
+  Fault injection gains `Point::RetentionMarkerSync`.
+- Library: `WriterConfig::helper_cpus(HelperCpus)` places the writer's helper threads (checkpoint, prefault,
+  write-back, spare). Default `HelperCpus::Process`: on Linux each helper sets its affinity when it starts to every
+  CPU the process's cpuset allows except the kernel's isolated CPUs, so a writer thread pinned to one CPU no longer
+  gets its helpers on that CPU; `HelperCpus::Inherited` keeps the creating thread's mask (the previous behaviour),
+  `HelperCpus::List` names CPUs. No effect on macOS. `tt-sustained` gains `--no-early-writeback` and `--helper-cpus`
+  (so pinned runs need no `taskset`) and records the system's dirty and write-back page cache per second on Linux
+  (`dirty_bytes`, `writeback_bytes`; maxima in `writer.page_cache`).
 - Operational metrics through the C ABI and the bindings (ADR 0032 → Bindings; ADR 0028 amended), additively: new
   symbols only, nothing on the append or per-record read paths.
   - C ABI: `tickertape_journal_status_sample` (an immutable sample handle that several threads may read at once,

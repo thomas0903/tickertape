@@ -4,6 +4,7 @@
 //! send time in `local_ts_ns` and never skip or rebase sends, as `tt-latency` does. Per-run JSON plus a
 //! per-second, wall-clock time series locate stalls in time.
 
+use std::collections::VecDeque;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -15,7 +16,7 @@ use std::time::{Duration, Instant};
 use hdrhistogram::Histogram;
 use serde_json::{Value, json};
 use tickertape::retention::{Action, Policy};
-use tickertape::{Error, NewRecord, Reader, Writer, WriterConfig, clock};
+use tickertape::{Error, HelperCpus, NewRecord, Reader, Writer, WriterConfig, clock};
 use tickertape_bench::sustained::{
     CpuSnapshot, PositionFile, ReaderSpec, Schedule, Seconds, SeriesFile, WaitMode,
     format_duration, free_bytes, lag_json, lag_records, merge_series, parse_cpu_list,
@@ -52,9 +53,18 @@ Writer:
   --segment-size <B>      segment size (default 134217728 = 128 MiB); smaller sizes roll more often
   --checkpoint-every <D>  checkpoint on a fixed wall-clock grid, or
   --checkpoint-records <N> checkpoint after every N records (default: no checkpoints)
+  --checkpoint-mode <M>   how periodic checkpoints run: blocking (Writer::checkpoint on the writer thread, the
+                          default) or background (Writer::request_checkpoint, ADR 0038: the writer thread only
+                          requests, the syncs run on the writer's checkpoint thread while appends continue)
   --retain-segments <N>   writer retention: delete the oldest segments beyond N (needs checkpoints)
   --retain-bytes <B>      writer retention: delete the oldest segments beyond B bytes (needs checkpoints)
   --no-prefault           WriterConfig::prefault(false)
+  --no-early-writeback    WriterConfig::early_writeback(false): no sync_file_range behind the writer (Linux;
+                          no effect elsewhere)
+  --helper-cpus <C>       WriterConfig::helper_cpus for the writer's helper threads (checkpoint, prefault,
+                          write-back): process (the default: every CPU the cpuset allows), inherited (the
+                          creating thread's mask, so a pinned writer's checkpoint thread shares its CPU), or a
+                          CPU list such as 4 or 4,5 (Linux; no effect elsewhere)
 
 Readers:
   --readers <LIST>        comma-separated reader specs (default mapped; none for no readers):
@@ -78,8 +88,18 @@ Coordinated omission: paced records carry their intended send time in local_ts_n
 it, never skips or rebases, and readers measure now - intended, so backlog counts as latency. Unpaced records
 carry their actual send start time. Late sends start more than 1 us after their intended time. Append latency
 is one Writer::append, timed with the monotonic clock; roll appends are the appends that created a segment.
-Checkpoints run on the writer thread, as an application would run them, so they delay later sends.
+Checkpoints run on the writer thread, as an application would run them, so they delay later sends; in background
+mode the writer thread only requests them and polls Writer::checkpoint_progress after each append while one is in
+flight. checkpoint_latency is the writer thread's time in the checkpoint call (blocking: the whole checkpoint;
+background: the request). checkpoint_durable_latency is each checkpoint's time from its call to its marker being
+durable (background: from the library's completion time, observed at the next poll). checkpoint_pause is, per
+checkpoint, the writer thread's longest stretch of work around it: blocking, the call; background, the longest of
+the request and every append plus poll while it was in flight. The final checkpoint is always blocking.
 A paced writer busy-waits for each intended time; schedule_wait_s is that spinning, included in its CPU time.
+Rolls do not sync the new segment on the writer thread (ADR 0038); roll_append_latency shows what a roll still
+costs. On Linux the writer's per-second samples carry dirty_bytes and writeback_bytes (/proc/meminfo Dirty and
+Writeback, the whole system), and writer.page_cache has their maxima over the measured part: with early write-back
+the dirty data a checkpoint finds stays small.
 Lag samples are the writer's next sequence (published by the writer about every 1 ms) minus the reader's,
 in records and journal bytes. CPU usage comes from getrusage for each process (all threads) and, on Linux,
 for the measuring thread alone. The series has one line per wall-clock second (UTC), keyed by when each
@@ -96,6 +116,21 @@ enum Checkpoint {
     Records(u64),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum CheckpointMode {
+    Blocking,
+    Background,
+}
+
+impl CheckpointMode {
+    fn name(self) -> &'static str {
+        match self {
+            CheckpointMode::Blocking => "blocking",
+            CheckpointMode::Background => "background",
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Config {
     dir: PathBuf,
@@ -109,11 +144,14 @@ struct Config {
     schedule: Schedule,
     planned: Option<u64>,
     checkpoint: Checkpoint,
+    checkpoint_mode: CheckpointMode,
     segment_size: u64,
     capacity: u64,
     retain_segments: Option<usize>,
     retain_bytes: Option<u64>,
     prefault: bool,
+    early_writeback: bool,
+    helper_cpus: HelperCpus,
     readers: Vec<ReaderSpec>,
     default_wait: WaitMode,
     lag_interval: Duration,
@@ -141,12 +179,14 @@ impl Config {
             "--segment-size",
             "--checkpoint-every",
             "--checkpoint-records",
+            "--checkpoint-mode",
             "--retain-segments",
             "--retain-bytes",
             "--readers",
             "--wait",
             "--lag-interval",
             "--cpus",
+            "--helper-cpus",
         ];
         if child {
             values.extend(["--control", "--index"]);
@@ -154,7 +194,13 @@ impl Config {
         let options = Options::parse(
             args,
             &values,
-            &["--unpaced", "--no-prefault", "--no-disk-check", "--json"],
+            &[
+                "--unpaced",
+                "--no-prefault",
+                "--no-early-writeback",
+                "--no-disk-check",
+                "--json",
+            ],
         )?;
         let duration_of = |key: &str, default: &str| {
             parse_duration(options.optional(key).unwrap_or(default))
@@ -222,6 +268,20 @@ impl Config {
             },
             (None, None) => Checkpoint::None,
         };
+        let checkpoint_mode = match options.optional("--checkpoint-mode") {
+            None | Some("blocking") => CheckpointMode::Blocking,
+            Some("background") => CheckpointMode::Background,
+            Some(other) => {
+                return Err(
+                    format!("--checkpoint-mode {other}: choose blocking or background").into(),
+                );
+            }
+        };
+        if checkpoint == Checkpoint::None && options.optional("--checkpoint-mode").is_some() {
+            return Err(
+                "--checkpoint-mode needs --checkpoint-every or --checkpoint-records".into(),
+            );
+        }
         let retain_segments = options
             .optional("--retain-segments")
             .map(|_| {
@@ -267,6 +327,13 @@ impl Config {
             )
             .into());
         }
+        let helper_cpus = match options.optional("--helper-cpus") {
+            None | Some("process") => HelperCpus::Process,
+            Some("inherited") => HelperCpus::Inherited,
+            Some(list) => HelperCpus::List(parse_cpu_list(list).map_err(|e| {
+                format!("--helper-cpus {list}: {e} (process, inherited or a CPU list)")
+            })?),
+        };
         let control = options.path("--control");
         let index = options
             .optional("--index")
@@ -288,11 +355,14 @@ impl Config {
             schedule,
             planned,
             checkpoint,
+            checkpoint_mode,
             segment_size,
             capacity,
             retain_segments,
             retain_bytes,
             prefault: !options.flag("--no-prefault"),
+            early_writeback: !options.flag("--no-early-writeback"),
+            helper_cpus,
             readers,
             default_wait,
             lag_interval,
@@ -375,14 +445,21 @@ impl Config {
             "record_bytes": self.record_bytes, "schedule": self.schedule.to_json(), "planned_records": self.planned,
             "checkpoint": match self.checkpoint {
                 Checkpoint::None => json!({"kind": "none"}),
-                Checkpoint::Every(d) => json!({"kind": "time", "every_ms": d.as_secs_f64() * 1e3}),
-                Checkpoint::Records(n) => json!({"kind": "records", "every_records": n}),
+                Checkpoint::Every(d) => json!({"kind": "time", "every_ms": d.as_secs_f64() * 1e3,
+                    "mode": self.checkpoint_mode.name()}),
+                Checkpoint::Records(n) => json!({"kind": "records", "every_records": n,
+                    "mode": self.checkpoint_mode.name()}),
             },
             "segment_size_bytes": self.segment_size, "records_per_segment": self.capacity,
             "retention": {"max_segments": self.retain_segments, "max_bytes": self.retain_bytes,
                 "action": if self.retention().is_some() { "delete" } else { "none" }},
             "writer_durability": "visible on append; durable only through checkpoints (crash contract)",
-            "prefault": self.prefault, "notify": true,
+            "prefault": self.prefault, "notify": true, "early_writeback": self.early_writeback,
+            "helper_cpus": match &self.helper_cpus {
+                HelperCpus::List(list) => json!(list),
+                HelperCpus::Inherited => json!("inherited"),
+                _ => json!("process"),
+            },
             "readers": self.readers.iter().map(ReaderSpec::to_json).collect::<Vec<_>>(),
             "default_wait": self.default_wait.name(), "lag_interval_ms": self.lag_interval.as_secs_f64() * 1e3,
             "writer_position_publish_interval_ms": 1, "cpus": self.cpus,
@@ -578,6 +655,11 @@ fn run(config: &Config, args: &[String]) -> Result<()> {
             &config.out.join(format!("reader-{index}.series.jsonl")),
         )?);
     }
+    let mut writer_result = writer_result;
+    writer_result["page_cache"] = page_cache_maxima(
+        &processes[0],
+        t0.saturating_add(u64::try_from(config.warmup.as_nanos())?) / 1_000_000_000,
+    );
     let series = merge_series(&processes);
     let mut file = SeriesFile::create(&config.out.join(SERIES))?;
     for line in &series {
@@ -651,7 +733,21 @@ fn print_text(config: &Config, result: &Value) {
     );
     stats_line("Append latency", &w["append_latency"], "us");
     stats_line("Roll append latency", &w["roll_append_latency"], "us");
-    stats_line("Checkpoint latency", &w["checkpoint_latency"], "us");
+    println!(
+        "Page cache (system): dirty max {} B, write-back max {} B",
+        w["page_cache"]["dirty_max_bytes"], w["page_cache"]["writeback_max_bytes"]
+    );
+    stats_line(
+        &format!("Checkpoint latency ({})", w["checkpoint_mode"]),
+        &w["checkpoint_latency"],
+        "us",
+    );
+    stats_line(
+        "Checkpoint durable latency",
+        &w["checkpoint_durable_latency"],
+        "us",
+    );
+    stats_line("Checkpoint pause", &w["checkpoint_pause"], "us");
     println!(
         "Final checkpoint: {} µs; retention removed {} segments; last retention error: {}",
         w["final_checkpoint_us"], w["retention"]["removed_segments"], w["retention"]["last_error"]
@@ -784,6 +880,11 @@ impl Sampler {
                             "cpu_fraction": usage["cpu_fraction"], "user_fraction": usage["user_fraction"],
                             "system_fraction": usage["system_fraction"], "minor_faults": usage["minor_faults"],
                             "major_faults": usage["major_faults"]});
+                        if let Sampled::Writer { .. } = &sampled {
+                            let (dirty, writeback) = page_cache_bytes();
+                            line["dirty_bytes"] = json!(dirty);
+                            line["writeback_bytes"] = json!(writeback);
+                        }
                         if let Sampled::Reader { record_bytes, .. } = &sampled {
                             line["writer_position"] = json!(writer_position);
                             line["lag_max_records"] = json!(lag_max);
@@ -824,11 +925,57 @@ fn hist() -> Result<Histogram<u64>> {
     Ok(Histogram::<u64>::new(3)?)
 }
 
+/// A background checkpoint requested by the writer loop whose marker is not durable yet.
+struct InFlight {
+    /// The sequence number it covers up to.
+    covers: u64,
+    requested: Instant,
+    /// Requested after the warm-up.
+    measured: bool,
+    /// The writer thread's longest stretch of work since the request (the request itself, then append plus poll).
+    pause_ns: u64,
+}
+
+/// Records the requests a durable marker now covers: their call-to-durable time, from the library's completion time
+/// (`Writer::metrics().since_checkpoint`, measured from when the marker became durable), and their longest pause.
+fn settle(
+    writer: &Writer,
+    progress: &tickertape::CheckpointProgress,
+    in_flight: &mut VecDeque<InFlight>,
+    durable: &mut Histogram<u64>,
+    pause: &mut Histogram<u64>,
+) -> Result<()> {
+    let Some(marker) = progress.durable else {
+        return Ok(());
+    };
+    if in_flight.front().is_none_or(|r| r.covers > marker.next_seq) {
+        return Ok(());
+    }
+    let now = Instant::now();
+    let since = writer.metrics().since_checkpoint.unwrap_or_default();
+    let durable_at = now.checked_sub(since).unwrap_or(now);
+    while let Some(request) = in_flight.front() {
+        if request.covers > marker.next_seq {
+            break;
+        }
+        if request.measured {
+            durable.record(elapsed_ns(
+                durable_at.saturating_duration_since(request.requested),
+            )?)?;
+            pause.record(request.pause_ns)?;
+        }
+        in_flight.pop_front();
+    }
+    Ok(())
+}
+
 fn writer(config: &Config) -> Result<()> {
     let control = config.control.as_ref().ok_or("missing control directory")?;
     let mut writer_config = WriterConfig::default()
         .segment_size(config.segment_size)
-        .prefault(config.prefault);
+        .prefault(config.prefault)
+        .early_writeback(config.early_writeback)
+        .helper_cpus(config.helper_cpus.clone());
     if let Some(policy) = config.retention() {
         writer_config = writer_config.retention(policy, Action::Delete);
     }
@@ -869,8 +1016,12 @@ fn writer(config: &Config) -> Result<()> {
     };
     let mut seconds = Seconds::new()?;
     let (mut append, mut roll, mut checkpoint) = (hist()?, hist()?, hist()?);
+    let (mut durable, mut pause) = (hist()?, hist()?);
     let (mut late, mut max_delay, mut rolls, mut checkpoints, mut overruns) =
         (0u64, 0u64, 0u64, 0u64, 0u64);
+    // Background mode: requests whose markers are not durable yet, oldest first.
+    let mut in_flight: VecDeque<InFlight> = VecDeque::new();
+    let mut requests_while_in_flight = 0u64;
     let mut next_checkpoint = match config.checkpoint {
         Checkpoint::Every(every) => t0.saturating_add(u64::try_from(every.as_nanos())?),
         _ => u64::MAX,
@@ -954,6 +1105,15 @@ fn writer(config: &Config) -> Result<()> {
             bucket.rolls += 1;
             bucket.roll_max_ns = bucket.roll_max_ns.max(append_ns);
         }
+        if !in_flight.is_empty() {
+            let polled = Instant::now();
+            let progress = writer.checkpoint_progress()?;
+            let work = append_ns.saturating_add(elapsed_ns(polled.elapsed())?);
+            for request in &mut in_flight {
+                request.pause_ns = request.pause_ns.max(work);
+            }
+            settle(&writer, &progress, &mut in_flight, &mut durable, &mut pause)?;
+        }
         let due = match config.checkpoint {
             Checkpoint::None => false,
             Checkpoint::Every(_) => sent >= next_checkpoint,
@@ -962,10 +1122,34 @@ fn writer(config: &Config) -> Result<()> {
         if due {
             let wall = clock::realtime_ns();
             let start = Instant::now();
-            writer.checkpoint()?;
-            let ns = elapsed_ns(start.elapsed())?;
+            let measured = wall >= measure_from;
+            // One clock reading for the call, used for its latency and its pause alike: a second reading would add
+            // whatever ran (or preempted the thread) in between to one of them only.
+            let ns = match config.checkpoint_mode {
+                CheckpointMode::Blocking => {
+                    writer.checkpoint()?;
+                    let ns = elapsed_ns(start.elapsed())?;
+                    if measured {
+                        durable.record(ns)?;
+                        pause.record(ns)?;
+                    }
+                    ns
+                }
+                CheckpointMode::Background => {
+                    requests_while_in_flight += u64::from(!in_flight.is_empty());
+                    let covers = writer.request_checkpoint()?;
+                    let ns = elapsed_ns(start.elapsed())?;
+                    in_flight.push_back(InFlight {
+                        covers,
+                        requested: start,
+                        measured,
+                        pause_ns: ns,
+                    });
+                    ns
+                }
+            };
             checkpoints += 1;
-            if wall >= measure_from {
+            if measured {
                 checkpoint.record(ns)?;
             }
             let bucket = seconds.bucket(wall, &mut emit);
@@ -984,6 +1168,18 @@ fn writer(config: &Config) -> Result<()> {
         }
     }
     seconds.finish(&mut emit);
+    // Let the background checkpoints in flight finish, so each gets its durable time.
+    let drain_deadline = Instant::now() + Duration::from_secs(120);
+    while !in_flight.is_empty() {
+        let progress = writer.checkpoint_progress()?;
+        settle(&writer, &progress, &mut in_flight, &mut durable, &mut pause)?;
+        if Instant::now() >= drain_deadline {
+            return Err(
+                "background checkpoints did not finish within 120 s of the run's end".into(),
+            );
+        }
+        std::thread::sleep(Duration::from_micros(100));
+    }
     let final_checkpoint_us = if config.checkpoint == Checkpoint::None {
         None
     } else {
@@ -1010,7 +1206,12 @@ fn writer(config: &Config) -> Result<()> {
         "late_records": config.planned.map(|_| late), "max_schedule_delay_us": config.planned.map(|_| max_delay as f64 / 1e3),
         "append_latency": quantiles_json(&append, "us", 1e3), "roll_append_latency": quantiles_json(&roll, "us", 1e3),
         "rolls": rolls, "checkpoints": checkpoints, "checkpoint_grid_overruns": overruns,
-        "checkpoint_latency": quantiles_json(&checkpoint, "us", 1e3), "final_checkpoint_us": final_checkpoint_us,
+        "checkpoint_mode": config.checkpoint_mode.name(),
+        "checkpoint_latency": quantiles_json(&checkpoint, "us", 1e3),
+        "checkpoint_durable_latency": quantiles_json(&durable, "us", 1e3),
+        "checkpoint_pause": quantiles_json(&pause, "us", 1e3),
+        "checkpoint_requests_while_in_flight": requests_while_in_flight,
+        "final_checkpoint_us": final_checkpoint_us,
         "retention": {"removed_segments": report.removed_segments, "removed_bytes": report.removed_bytes,
             "already_removed_segments": report.already_removed_segments,
             "last_error": writer.last_retention_error().map(|e| e.to_string())},
@@ -1214,4 +1415,35 @@ fn main() {
         eprintln!("tt-sustained: {error}");
         std::process::exit(1);
     }
+}
+
+/// The system's dirty and under-write-back page cache in bytes (`/proc/meminfo` `Dirty` and `Writeback`; Linux only).
+fn page_cache_bytes() -> (Option<u64>, Option<u64>) {
+    let Ok(meminfo) = fs::read_to_string("/proc/meminfo") else {
+        return (None, None);
+    };
+    let field = |name: &str| {
+        meminfo
+            .lines()
+            .find_map(|l| l.strip_prefix(name))
+            .and_then(|rest| rest.split_whitespace().next()?.parse::<u64>().ok())
+            .and_then(|kib| kib.checked_mul(1024))
+    };
+    (field("Dirty:"), field("Writeback:"))
+}
+
+/// The largest `dirty_bytes` and `writeback_bytes` of the writer's samples from `from_second` on (null without
+/// samples, as on macOS).
+fn page_cache_maxima(writer_lines: &[Value], from_second: u64) -> Value {
+    let max = |field: &str| {
+        writer_lines
+            .iter()
+            .filter(|l| {
+                l["kind"] == "sample" && l["second"].as_u64().is_some_and(|s| s >= from_second)
+            })
+            .filter_map(|l| l[field].as_u64())
+            .max()
+    };
+    json!({"dirty_max_bytes": max("dirty_bytes"), "writeback_max_bytes": max("writeback_bytes"),
+        "source": "/proc/meminfo Dirty and Writeback (whole system), sampled once per second by the writer process"})
 }
