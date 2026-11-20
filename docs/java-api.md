@@ -7,7 +7,8 @@ rules they share. The design and its reasons are in [ADR 0037](decisions/0037-ja
 
 > **Status:** not stable before tickertape 1.0, like the C ABI it is built on. The binding requires exactly the
 > library version it was written for until then (see [Versioning](#versioning)). It is not published to Maven Central
-> yet: build it from source.
+> yet: build it from source. Releases after v0.4.0 will publish it as `io.github.thomas0903:tickertape` once the owner
+> enables Maven Central ([`install.md` → Java](install.md#java-maven-central)).
 
 Example: [`bindings/java/examples/Example.java`](../bindings/java/examples/Example.java) records, follows live and
 replays a journal; it runs from source with the `java` launcher.
@@ -75,19 +76,21 @@ library you built yourself.
 
 **The natives JAR.** `tickertape-<version>-natives-<platform>.jar` carries the library and its SHA-256. CI builds and
 tests it for `linux-x86_64`, `linux-aarch64` and `macos-aarch64`; the loader also recognises `macos-x86_64`, and the
-scripts can stage it, but no CI runner tests that platform. The binding extracts it into a new directory
-with a random name that only the current user can read (under `java.io.tmpdir`, or `-Dtickertape.library.extractDir`
-if the temporary directory does not allow executable files), checks the hash, loads it, and deletes the file and the
-directory at once. If the extracted library fails to load although its hash matched (typically a `noexec` temporary
-directory), the error names `-Dtickertape.library.extractDir`; a library that loads but is of another version, or
-lacks a function, gets no such hint. Build it with:
+scripts can stage it, but no CI runner tests that platform. The release workflow builds all four from the libraries of
+the C library archives (it runs the install test with the `linux-x86_64` one only). The binding extracts it into a new
+directory with a random name that only the current user can read (under `java.io.tmpdir`, or
+`-Dtickertape.library.extractDir` if the temporary directory does not allow executable files), checks the hash, loads
+it, and deletes the file and the directory at once. If the extracted library fails to load although its hash matched
+(typically a `noexec` temporary directory), the error names `-Dtickertape.library.extractDir`; a library that loads
+but is of another version, or lacks a function, gets no such hint. Build it with:
 
 ```bash
 bindings/java/scripts/stage-natives.sh target/release linux-x86_64
 mvn -f bindings/java/pom.xml -Pnatives package -DskipTests
 ```
 
-The Linux libraries are built for glibc.
+Each staged platform (`target/natives/<platform>`) gets its own natives JAR. Add the profile `release` for the
+sources and Javadoc JARs that Maven Central requires. The Linux libraries are built for glibc.
 
 ## Conventions
 

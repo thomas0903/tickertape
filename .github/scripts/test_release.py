@@ -184,12 +184,17 @@ class ReleaseTests(unittest.TestCase):
     def test_release_rejects_incomplete_binary_sets(self):
         with tempfile.TemporaryDirectory() as temporary, \
              patch.dict(release.os.environ, GITHUB_REPOSITORY="owner/repo"):
-            args = argparse.Namespace(tag="v0.4.0", artifacts=Path(temporary), create=False)
+            args = argparse.Namespace(tag="v0.4.0", artifacts=Path(temporary), create=False, c_library=True)
             with self.assertRaisesRegex(ValueError, "each release target"):
                 release.github_release(args)
             for name in release.release_files("v0.4.0") - {"tickertape-v0.4.0-x86_64-apple-darwin.cdx.json"}:
                 Path(temporary, name).write_text(name)
             with self.assertRaisesRegex(ValueError, "SBOM for each release target"):
+                release.github_release(args)
+            Path(temporary, "tickertape-v0.4.0-x86_64-apple-darwin.cdx.json").write_text("sbom")
+            # A tag from before the C library archives: the C files are then unexpected.
+            args.c_library = False
+            with self.assertRaisesRegex(ValueError, "each release target"):
                 release.github_release(args)
 
     def release_run(self, existing_assets, uploads=None):
@@ -214,7 +219,7 @@ class ReleaseTests(unittest.TestCase):
                     uploads.append(command)
 
             published = {"tag_name": "v0.4.0", "draft": False, "assets": [{"name": n} for n in existing_assets]}
-            args = argparse.Namespace(tag="v0.4.0", artifacts=artifacts, create=False, notes=None)
+            args = argparse.Namespace(tag="v0.4.0", artifacts=artifacts, create=False, notes=None, c_library=True)
             with patch.object(release, "gh_json", return_value=[[published]]), \
                  patch.object(release.subprocess, "run", side_effect=run):
                 release.github_release(args)
@@ -243,11 +248,20 @@ class ReleaseTests(unittest.TestCase):
             self.assertEqual(uploads, [])
 
     def test_release_files_cover_every_target_including_static_linux(self):
-        files = release.release_files("v0.5.0")
+        files = release.release_files("v0.5.0", c_library=False)
         self.assertEqual(len(files), 2 * len(release.TARGETS))
         for target in ("x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"):
             self.assertIn(f"tickertape-v0.5.0-{target}.tar.gz", files)
             self.assertIn(f"tickertape-v0.5.0-{target}.cdx.json", files)
+
+    def test_release_files_include_a_c_archive_and_sbom_per_c_target(self):
+        files = release.release_files("v0.5.0")
+        self.assertEqual(len(files), 2 * len(release.TARGETS) + 2 * len(release.C_TARGETS))
+        self.assertEqual(set(release.C_TARGETS), set(release.JAVA_PLATFORMS))
+        for target in release.C_TARGETS:
+            self.assertIn(f"tickertape-c-v0.5.0-{target}.tar.gz", files)
+            self.assertIn(f"tickertape-c-v0.5.0-{target}.cdx.json", files)
+        self.assertFalse(any("-c-" in name and "musl" in name for name in files))
 
     def test_checksums_may_only_gain_lines(self):
         old = "a  one.tar.gz\nb  two.tar.gz\n"
@@ -260,6 +274,319 @@ class ReleaseTests(unittest.TestCase):
         self.assertIn("statically linked", release.requirement("x86_64-unknown-linux-musl"))
         self.assertIn("glibc 2.35", release.requirement("aarch64-unknown-linux-gnu"))
         self.assertIn("macOS 11", release.requirement("x86_64-apple-darwin"))
+
+
+class CLibraryTests(unittest.TestCase):
+    def test_soname_has_the_minor_version_before_1_0_and_the_major_version_after(self):
+        self.assertEqual(release.shared_library_names("0.4.0", "x86_64-unknown-linux-gnu"),
+                         ("libtickertape.so.0.4.0", "libtickertape.so.0.4", "libtickertape.so"))
+        self.assertEqual(release.shared_library_names("1.2.3", "aarch64-unknown-linux-gnu"),
+                         ("libtickertape.so.1.2.3", "libtickertape.so.1", "libtickertape.so"))
+        self.assertEqual(release.shared_library_names("0.4.0", "aarch64-apple-darwin"),
+                         ("libtickertape.0.4.0.dylib", "libtickertape.0.4.dylib", "libtickertape.dylib"))
+        self.assertEqual(release.shared_library_names("1.2.3", "x86_64-apple-darwin")[1], "libtickertape.1.dylib")
+
+    def test_build_sets_the_soname_or_install_name_and_builds_both_libraries(self):
+        linux = release.c_build_command("0.4.0", "x86_64-unknown-linux-gnu")
+        self.assertIn("link-arg=-Wl,-soname,libtickertape.so.0.4", linux)
+        self.assertEqual(linux[linux.index("--crate-type") + 1], "cdylib,staticlib")
+        self.assertIn("--locked", linux)
+        macos = release.c_build_command("1.0.0", "aarch64-apple-darwin")
+        self.assertIn("link-arg=-Wl,-install_name,@rpath/libtickertape.1.dylib", macos)
+
+    def test_native_static_libs_come_from_rustcs_note(self):
+        output = "   Compiling tickertape-ffi\nnote: native-static-libs: -lgcc_s -lutil -lc\n\n    Finished\n"
+        self.assertEqual(release.native_static_libs(output), "-lgcc_s -lutil -lc")
+        with self.assertRaisesRegex(ValueError, "native-static-libs"):
+            release.native_static_libs("    Finished `release` profile\n")
+
+    def test_unsupported_targets_are_refused(self):
+        for function in (release.c_build, release.c_package):
+            args = argparse.Namespace(source=Path("."), tag="v0.4.0", target="x86_64-unknown-linux-musl",
+                                      output=Path("dist"))
+            with self.subTest(function=function.__name__), self.assertRaisesRegex(ValueError, "C library target"):
+                function(args)
+
+    def test_pkg_config_files_are_relocatable(self):
+        shared = release.pkg_config("0.4.0", "-lgcc_s -lc", static=False)
+        static = release.pkg_config("0.4.0", "-lgcc_s -lc", static=True)
+        for text in (shared, static):
+            self.assertTrue(text.startswith("prefix=${pcfiledir}/../..\n"))
+            self.assertIn("Version: 0.4.0\n", text)
+            self.assertIn("Cflags: -I${includedir}\n", text)
+        self.assertIn("Libs: -L${libdir} -ltickertape\nLibs.private: -lgcc_s -lc\n", shared)
+        self.assertIn("Name: tickertape-static\n", static)
+        self.assertIn("Libs: ${libdir}/libtickertape.a -lgcc_s -lc\n", static)
+
+    def package(self, source, target):
+        built = source / "target" / target / "release"
+        built.mkdir(parents=True, exist_ok=True)
+        extension = "dylib" if target.endswith("-apple-darwin") else "so"
+        (built / f"libtickertape.{extension}").write_bytes(b"shared library")
+        (built / "libtickertape.a").write_bytes(b"static library")
+        (built / "native-static-libs.txt").write_text("-lgcc_s -lc\n")
+        include = source / release.FFI / "include"
+        include.mkdir(parents=True, exist_ok=True)
+        for name in ("tickertape.h", "tickertape.hpp", "LICENSE-MIT", "LICENSE-APACHE"):
+            (include / name if name.startswith("tickertape") else source / name).write_text(name)
+        args = argparse.Namespace(source=source, tag="v0.4.0", target=target, output=source / "dist")
+        environment = {key: value for key, value in release.os.environ.items() if key != "CARGO_TARGET_DIR"}
+        with patch.object(release, "run", return_value="1234567890"), \
+             patch.dict(release.os.environ, environment, clear=True):
+            release.c_package(args)
+        return args.output / f"tickertape-c-v0.4.0-{target}.tar.gz"
+
+    def test_archive_layout_links_and_reproducibility(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary)
+            archive = self.package(source, "x86_64-unknown-linux-gnu")
+            first = archive.read_bytes()
+            self.assertEqual(first, self.package(source, "x86_64-unknown-linux-gnu").read_bytes())
+            stem = "tickertape-c-v0.4.0-x86_64-unknown-linux-gnu"
+            with tarfile.open(archive) as tar:
+                members = {member.name.removeprefix(stem).lstrip("/"): member for member in tar}
+                self.assertEqual(set(members), {
+                    "", "include", "include/tickertape.h", "include/tickertape.hpp", "lib",
+                    "lib/libtickertape.so.0.4.0", "lib/libtickertape.so.0.4", "lib/libtickertape.so",
+                    "lib/libtickertape.a", "lib/pkgconfig", "lib/pkgconfig/tickertape.pc",
+                    "lib/pkgconfig/tickertape-static.pc", "LICENSE-MIT", "LICENSE-APACHE", "README.txt"})
+                self.assertTrue(all(member.name.startswith(stem) for member in tar))
+                self.assertEqual(members["lib/libtickertape.so.0.4"].linkname, "libtickertape.so.0.4.0")
+                self.assertEqual(members["lib/libtickertape.so"].linkname, "libtickertape.so.0.4")
+                self.assertTrue(members["lib/libtickertape.so.0.4"].issym())
+                self.assertEqual(members["lib/libtickertape.so.0.4.0"].mode, 0o755)
+                self.assertEqual(tar.extractfile(members["lib/libtickertape.so.0.4.0"]).read(), b"shared library")
+                pc = tar.extractfile(members["lib/pkgconfig/tickertape.pc"]).read().decode()
+                self.assertIn("Libs.private: -lgcc_s -lc", pc)
+                readme = tar.extractfile(members["README.txt"]).read().decode()
+                self.assertIn("glibc 2.35", readme)
+            macos = self.package(source, "aarch64-apple-darwin")
+            with tarfile.open(macos) as tar:
+                names = {Path(member.name).name for member in tar}
+            self.assertLessEqual({"libtickertape.0.4.0.dylib", "libtickertape.0.4.dylib", "libtickertape.dylib"}, names)
+
+    def test_tags_have_the_c_library_once_its_install_test_exists(self):
+        self.assertTrue(release.has_c_library(Path(__file__).resolve().parents[2]))
+        with tempfile.TemporaryDirectory() as temporary:
+            self.assertFalse(release.has_c_library(Path(temporary)))
+
+
+class SbomTests(unittest.TestCase):
+    def test_default_names_are_the_archive_stems(self):
+        def name(**kwargs):
+            values = {"package": "cli", "tag": "v0.4.0", "target": "x86_64-apple-darwin", "name": None} | kwargs
+            return release.sbom_name(argparse.Namespace(**values))
+
+        self.assertEqual(name(), "tickertape-v0.4.0-x86_64-apple-darwin")
+        self.assertEqual(name(package="c-library"), "tickertape-c-v0.4.0-x86_64-apple-darwin")
+        self.assertEqual(name(package="python", name="python-wheel"), "python-wheel")
+        with self.assertRaisesRegex(ValueError, "--name"):
+            name(package="python")
+        with self.assertRaisesRegex(ValueError, "--tag or --name"):
+            name(tag=None)
+
+    def test_cargo_packages_write_the_file_release_py_reads(self):
+        """cargo-cyclonedx names its output after the package's targets; check it against the manifests."""
+        source = Path(__file__).resolve().parents[2]
+        for package, (manifest, generated, component) in release.SBOM_PACKAGES.items():
+            with self.subTest(package=package), (source / manifest).open("rb") as file:
+                cargo = release.tomllib.load(file)
+                if "bin" in cargo:
+                    self.assertEqual(generated, f"{cargo['bin'][0]['name']}_bin.cdx.json")
+                else:
+                    kinds = "-".join(cargo["lib"]["crate-type"])
+                    self.assertEqual(generated, f"{cargo['lib']['name']}_{kinds}.cdx.json")
+                self.assertEqual(component, cargo.get("bin", [cargo.get("lib")])[0]["name"])
+
+    def test_java_sbom_is_reproducible_and_describes_the_maven_coordinates(self):
+        source = Path(__file__).resolve().parents[2]
+        first = release.java_sbom(source, "1234567890")
+        self.assertEqual(first, release.java_sbom(source, "1234567890"))
+        document = json.loads(first)
+        version = release.pom_version(source)
+        component = document["metadata"]["component"]
+        self.assertEqual(component["purl"], f"pkg:maven/io.github.thomas0903/tickertape@{version}")
+        self.assertEqual(document["metadata"]["timestamp"], "2009-02-13T23:31:30Z")
+        self.assertEqual(document["components"], [])
+
+    def test_java_binding_has_no_runtime_dependencies(self):
+        """The Java SBOM lists no components; that is true only while every pom dependency is test-scoped."""
+        source = Path(__file__).resolve().parents[2]
+        namespace = {"m": "http://maven.apache.org/POM/4.0.0"}
+        root = release.ElementTree.parse(source / release.JAVA / "pom.xml").getroot()
+        dependencies = root.findall("m:dependencies/m:dependency", namespace)
+        self.assertTrue(dependencies)
+        for dependency in dependencies:
+            self.assertEqual(dependency.findtext("m:scope", namespaces=namespace), "test")
+
+
+class MavenTests(unittest.TestCase):
+    def write_pom(self, root, group="io.github.thomas0903", artifact="tickertape", version="0.4.0"):
+        pom = root / "bindings" / "java" / "pom.xml"
+        pom.parent.mkdir(parents=True, exist_ok=True)
+        pom.write_text(f'<project xmlns="http://maven.apache.org/POM/4.0.0"><groupId>{group}</groupId>'
+                       f"<artifactId>{artifact}</artifactId><version>{version}</version></project>")
+
+    def test_pom_version_follows_the_tag(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            release.validate_java_version(root, "0.5.0")  # older tags have no Java binding
+            self.write_pom(root)
+            release.validate_java_version(root, "0.4.0")
+            with self.assertRaisesRegex(ValueError, "pom.xml version"):
+                release.validate_java_version(root, "0.5.0")
+            self.write_pom(root, group="com.example")
+            with self.assertRaisesRegex(ValueError, "coordinates"):
+                release.pom_version(root)
+
+    def test_pom_builds_a_natives_jar_for_every_platform(self):
+        pom = (Path(__file__).resolve().parents[2] / release.JAVA / "pom.xml").read_text()
+        for platform in release.JAVA_PLATFORMS.values():
+            self.assertIn(f"<classifier>natives-{platform}</classifier>", pom)
+            self.assertIn(f"<classesDirectory>${{project.build.directory}}/natives/{platform}</classesDirectory>", pom)
+
+    def artifacts(self, directory, version="0.4.0"):
+        directory.mkdir(parents=True, exist_ok=True)
+        for name in release.maven_files(version):
+            (directory / name).write_bytes(name.encode())
+
+    def test_bundle_has_the_repository_layout_and_every_checksum(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            artifacts = Path(temporary, "maven")
+            self.artifacts(artifacts)
+            self.assertEqual(len(release.maven_files("0.4.0")), 8)
+            args = argparse.Namespace(tag="v0.4.0", artifacts=artifacts, output=Path(temporary, "a.zip"), sign=False)
+            release.maven_bundle(args)
+            first = args.output.read_bytes()
+            release.maven_bundle(args)
+            self.assertEqual(first, args.output.read_bytes())
+            with release.zipfile.ZipFile(args.output) as bundle:
+                names = set(bundle.namelist())
+                prefix = "io/github/thomas0903/tickertape/0.4.0/"
+                self.assertTrue(all(name.startswith(prefix) for name in names))
+                self.assertEqual(len(names), 8 * 5)
+                jar = "tickertape-0.4.0-natives-linux-aarch64.jar"
+                self.assertEqual(bundle.read(prefix + jar + ".sha1").decode(),
+                                 hashlib.sha1(jar.encode()).hexdigest())
+                self.assertEqual(bundle.read(prefix + jar + ".md5").decode(), hashlib.md5(jar.encode()).hexdigest())
+
+    def test_bundle_refuses_missing_or_extra_files(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            artifacts = Path(temporary, "maven")
+            self.artifacts(artifacts)
+            args = argparse.Namespace(tag="v0.4.0", artifacts=artifacts, output=Path(temporary, "a.zip"), sign=False)
+            (artifacts / "tickertape-0.4.0-javadoc.jar").unlink()
+            with self.assertRaisesRegex(ValueError, "expected exactly"):
+                release.maven_bundle(args)
+            self.artifacts(artifacts)
+            (artifacts / "tickertape-0.4.0-natives-windows-x86_64.jar").write_text("x")
+            with self.assertRaisesRegex(ValueError, "expected exactly"):
+                release.maven_bundle(args)
+            args.tag = "v0.5.0"
+            (artifacts / "tickertape-0.4.0-natives-windows-x86_64.jar").unlink()
+            with self.assertRaisesRegex(ValueError, "expected exactly"):
+                release.maven_bundle(args)
+
+    def test_signed_bundle_has_a_signature_per_file(self):
+        def sign(paths, home):
+            for path in paths:
+                Path(f"{path}.asc").write_text("signature")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            artifacts = Path(temporary, "maven")
+            self.artifacts(artifacts)
+            args = argparse.Namespace(tag="v0.4.0", artifacts=artifacts, output=Path(temporary, "a.zip"), sign=True)
+            with patch.object(release, "gpg_sign", side_effect=sign) as gpg:
+                release.maven_bundle(args)
+            self.assertEqual(len(gpg.call_args.args[0]), 8)
+            with release.zipfile.ZipFile(args.output) as bundle:
+                names = bundle.namelist()
+            self.assertEqual(len(names), 8 * 6)
+            self.assertIn("io/github/thomas0903/tickertape/0.4.0/tickertape-0.4.0.pom.asc", names)
+            self.assertFalse(any(name.endswith(".asc.sha1") for name in names))
+            # Signing works on copies: the attested files stay as they were.
+            self.assertEqual(sorted(path.name for path in artifacts.iterdir()), sorted(release.maven_files("0.4.0")))
+
+    @unittest.skipUnless(release.subprocess.run(["sh", "-c", "command -v gpg"], capture_output=True).returncode == 0,
+                         "gpg is not installed")
+    def test_gpg_signs_with_the_key_and_passphrase_from_the_environment(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            keyring = Path(temporary, "maker")
+            keyring.mkdir(mode=0o700)
+            gpg = ["gpg", "--homedir", str(keyring), "--batch", "--quiet", "--pinentry-mode", "loopback"]
+            subprocess.run([*gpg, "--passphrase", "secret", "--quick-gen-key", "Test <test@example.invalid>",
+                            "ed25519", "sign", "never"], check=True, capture_output=True)
+            key = subprocess.run([*gpg, "--passphrase", "secret", "--armor", "--export-secret-keys"],
+                                 check=True, capture_output=True, text=True).stdout
+            file = Path(temporary, "tickertape-0.4.0.jar")
+            file.write_bytes(b"jar")
+            home = Path(temporary, "signer")
+            home.mkdir(mode=0o700)
+            with patch.dict(release.os.environ, MAVEN_GPG_PRIVATE_KEY=key, MAVEN_GPG_PASSPHRASE="secret"):
+                release.gpg_sign([file], home)
+            self.assertIn("BEGIN PGP SIGNATURE", Path(f"{file}.asc").read_text())
+            unsigned = Path(temporary, "tickertape-0.4.0.pom")
+            unsigned.write_bytes(b"pom")
+            other = Path(temporary, "other")
+            other.mkdir(mode=0o700)
+            with patch.dict(release.os.environ, MAVEN_GPG_PRIVATE_KEY=key, MAVEN_GPG_PASSPHRASE="wrong"), \
+                 self.assertRaises(subprocess.CalledProcessError):
+                release.gpg_sign([unsigned], other)
+            self.assertFalse(Path(f"{unsigned}.asc").exists())
+
+    def test_multipart_body_carries_the_bundle(self):
+        body, content_type = release.multipart("bundle", "bundle.zip", b"zip bytes")
+        boundary = content_type.split("boundary=")[1]
+        self.assertTrue(body.startswith(f"--{boundary}\r\n".encode()))
+        self.assertIn(b'name="bundle"; filename="bundle.zip"', body)
+        self.assertIn(b"\r\n\r\nzip bytes\r\n", body)
+        self.assertTrue(body.endswith(f"--{boundary}--\r\n".encode()))
+
+    def upload(self, responses):
+        calls = []
+
+        def request(url, data=None, headers=None):
+            calls.append(url)
+            return responses.pop(0)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            bundle = Path(temporary, "bundle.zip")
+            bundle.write_bytes(b"zip")
+            args = argparse.Namespace(tag="v0.4.0", bundle=bundle, timeout=600)
+            with patch.object(release, "central_request", side_effect=request), \
+                 patch.object(release.time, "sleep"):
+                release.maven_upload(args)
+        return calls
+
+    def test_upload_waits_until_published(self):
+        calls = self.upload([b'{"published": false}', b"deployment-id\n",
+                             b'{"deploymentState": "VALIDATING"}', b'{"deploymentState": "PUBLISHED"}'])
+        self.assertIn("namespace=io.github.thomas0903&name=tickertape&version=0.4.0", calls[0])
+        self.assertIn("publishingType=AUTOMATIC", calls[1])
+        self.assertTrue(calls[2].endswith("status?id=deployment-id"))
+        self.assertEqual(len(calls), 4)
+
+    def test_upload_keeps_a_published_version_and_reports_a_refusal(self):
+        self.assertEqual(len(self.upload([b'{"published": true}'])), 1)
+        with self.assertRaisesRegex(ValueError, "refused"):
+            self.upload([b'{"published": false}', b"id", b'{"deploymentState": "FAILED", "errors": {"x": ["y"]}}'])
+
+    def test_verify_compares_every_file_with_the_build(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            artifacts = Path(temporary, "maven")
+            self.artifacts(artifacts)
+            args = argparse.Namespace(tag="v0.4.0", artifacts=artifacts, output=Path(temporary, "central"),
+                                      timeout=600)
+
+            def fetch(url):
+                return io.BytesIO(url.rsplit("/", 1)[1].encode())
+
+            with patch.object(release, "fetch", side_effect=fetch):
+                release.maven_verify(args)
+            self.assertEqual({path.name for path in args.output.iterdir()}, release.maven_files("0.4.0"))
+            (artifacts / "tickertape-0.4.0.jar").write_text("rebuilt")
+            with patch.object(release, "fetch", side_effect=fetch), self.assertRaisesRegex(ValueError, "differs"):
+                release.maven_verify(args)
 
 
 class BinstallTests(unittest.TestCase):

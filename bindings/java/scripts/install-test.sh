@@ -3,17 +3,27 @@
 # the two built JARs, the binding and the natives JAR for this platform, first on the class path and then on the
 # module path, and fails on any output to standard error (such as a restricted-method warning).
 #
-#   install-test.sh <work dir>      after: mvn -f bindings/java/pom.xml -Pnatives package
+#   install-test.sh <work dir>                          after: mvn -f bindings/java/pom.xml -Pnatives package
+#   install-test.sh <work dir> <jar> <natives jar>      any built or downloaded pair, such as the release's
 set -eu
 
-if [ $# -ne 1 ]; then
-    echo "usage: $0 <work dir>" >&2
+if [ $# -ne 1 ] && [ $# -ne 3 ]; then
+    echo "usage: $0 <work dir> [<jar> <natives jar>]" >&2
     exit 2
 fi
 work=$1
 here=$(cd "$(dirname "$0")/.." && pwd)
-natives=$(ls "$here"/target/tickertape-*-natives-*.jar)
-main=${natives%-natives-*}.jar
+if [ $# -eq 3 ]; then
+    main=$(cd "$(dirname "$2")" && pwd)/$(basename "$2")
+    natives=$(cd "$(dirname "$3")" && pwd)/$(basename "$3")
+else
+    natives=$(ls "$here"/target/tickertape-*-natives-*.jar)
+    if [ "$(echo "$natives" | wc -l | tr -d ' ')" != 1 ]; then
+        echo "more than one natives JAR in $here/target; name the pair to test" >&2
+        exit 2
+    fi
+    main=${natives%-natives-*}.jar
+fi
 example="$here/examples/Example.java"
 dir="$work/journal"
 rm -rf "$work"
