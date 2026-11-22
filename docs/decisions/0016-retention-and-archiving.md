@@ -17,6 +17,10 @@ proceeds from the oldest end, one segment at a time, and stops at the first segm
 failure). Without a valid checkpoint marker nothing is eligible. This keeps the journal a contiguous chain that the
 writer can always open (`docs/format.md` → Recovery refuses a missing checkpoint segment or a gap).
 
+(Amended 2026-11-22 by ADR [0044](0044-retention-without-a-backlog-wait.md): "sealed" is checked from the end of the
+file for a deletion, which no longer reads the records it discards; a move still reads and validates the whole
+segment.)
+
 **Policy** (`tickertape::retention::Policy`): any combination of `max_segments` (keep at most N segments in total),
 `max_bytes` (keep total segment bytes at or below B), and `max_age` (remove segments sealed longer ago than D, where a
 segment's seal time is its successor's `created_unix_ns`). A segment is removed if any configured limit asks for it
@@ -33,7 +37,9 @@ destination (they fail instead).
   eligible segments again (they are older than its last checkpoint).
 - **Writer:** opt-in `WriterConfig::retention(policy, action)`; applied after each successful checkpoint (when the
   marker moves) and on open. Failures never fail an append or a checkpoint; the last error is available from
-  `Writer::last_retention_error()`.
+  `Writer::last_retention_error()`. (Amended 2026-11-22 by ADR [0044](0044-retention-without-a-backlog-wait.md): a
+  run on the background checkpoint thread stops early when a checkpoint or `close` waits for it, and the next run
+  continues.)
 - **CLI:** `tickertape archive <DIR> (--to <DEST> | --delete) [--keep-segments N] [--max-bytes B] [--older-than DUR]
   [--dry-run]`. It is the only CLI command that changes a journal; it takes no writer lock (it doesn't need one).
 

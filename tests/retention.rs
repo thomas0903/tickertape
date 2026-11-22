@@ -891,3 +891,168 @@ fn archiver_syncs_the_marker_before_removing() {
     fault::clear();
     drop(writer);
 }
+
+// What is read of a segment before it is removed (C14, ADR 0044). `journal` writes one record of 40,000 bytes per
+// segment: the record at offset 64, the seal right after it, at 40,104, then zeros.
+
+/// Offset of the seal in the segments `journal` writes.
+const SEAL_AT: u64 = 64 + 40 + 40_000;
+
+fn write_at(path: &std::path::Path, offset: u64, bytes: &[u8]) {
+    use std::os::unix::fs::FileExt;
+    fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .write_all_at(bytes, offset)
+        .unwrap();
+}
+
+/// The eight bytes of a seal naming `next_seq`.
+fn seal(next_seq: u64) -> Vec<u8> {
+    let mut bytes = tickertape::format::SEAL_MARKER.to_le_bytes().to_vec();
+    bytes.extend_from_slice(&tickertape::format::seal_crc(next_seq).to_le_bytes());
+    bytes
+}
+
+fn bases(dir: &std::path::Path) -> Vec<u64> {
+    segments(dir).iter().map(|s| s.0).collect()
+}
+
+/// A damaged record inside a sealed segment: a deletion checks the seal, not the records it discards, and removes the
+/// segment; a move reads the whole segment first and refuses to move it. The plan, which reads no records, lists it.
+#[test]
+fn damaged_record_in_a_sealed_segment_is_deleted_but_never_moved() {
+    let (dir, writer) = journal(true);
+    let policy = Policy::default().max_segments(2);
+    let first = segments(dir.path())[0].1.clone();
+    write_at(&first, 64 + 40 + 1_000, &[0]);
+    let plan = retention::plan(dir.path(), &policy).unwrap();
+    assert_eq!(plan.segments().len(), 4);
+    let dest = tempfile::tempdir().unwrap();
+    match retention::apply(dir.path(), &plan, &Action::MoveTo(dest.path().into())) {
+        Err(Error::Corrupt {
+            path,
+            offset: 64,
+            reason: tickertape::CorruptReason::BadChecksum,
+            ..
+        }) => assert_eq!(path.file_name(), first.file_name()),
+        other => panic!("expected the damaged record, got {other:?}"),
+    }
+    assert_eq!(bases(dir.path()), [0, 1, 2, 3, 4, 5]);
+    assert!(segments(dest.path()).is_empty());
+    let report = retention::apply(dir.path(), &plan, &Action::Delete).unwrap();
+    assert_eq!(report.removed_segments, 4);
+    assert_eq!(bases(dir.path()), [4, 5]);
+    assert!(
+        tickertape::inspect::verify(dir.path())
+            .unwrap()
+            .problems
+            .is_empty()
+    );
+    drop(writer);
+    assert_eq!(
+        Writer::open(dir.path(), small_config()).unwrap().next_seq(),
+        6
+    );
+}
+
+/// A segment whose seal is damaged, gone, or names another segment is removed by neither action, whether the damage
+/// is there when the plan is made (the plan fails) or appears between the plan and the removal (the removal fails and
+/// removes nothing). The error is what a scan of the whole segment finds.
+#[test]
+fn broken_seal_is_never_removed() {
+    use tickertape::CorruptReason;
+    let mut wrong_checksum = seal(1);
+    wrong_checksum[4] ^= 1;
+    let damages = [
+        ("damaged seal", wrong_checksum, CorruptReason::BadSeal),
+        ("no seal", vec![0; 8], CorruptReason::BrokenChain(1)),
+        ("seal naming segment 2", seal(2), CorruptReason::BadSeal),
+    ];
+    let policy = Policy::default().max_segments(2);
+    for (what, bytes, reason) in &damages {
+        for move_it in [false, true] {
+            for before_plan in [true, false] {
+                let case = format!("{what}, move {move_it}, before the plan {before_plan}");
+                let (dir, writer) = journal(true);
+                let dest = tempfile::tempdir().unwrap();
+                let action = if move_it {
+                    Action::MoveTo(dest.path().into())
+                } else {
+                    Action::Delete
+                };
+                let first = segments(dir.path())[0].1.clone();
+                let result = if before_plan {
+                    write_at(&first, SEAL_AT, bytes);
+                    retention::plan(dir.path(), &policy).map(|_| ())
+                } else {
+                    let plan = retention::plan(dir.path(), &policy).unwrap();
+                    assert_eq!(plan.segments().len(), 4, "{case}");
+                    write_at(&first, SEAL_AT, bytes);
+                    retention::apply(dir.path(), &plan, &action).map(|_| ())
+                };
+                match result {
+                    Err(Error::Corrupt {
+                        offset,
+                        reason: found,
+                        ..
+                    }) => {
+                        assert_eq!(found, *reason, "{case}");
+                        assert_eq!(offset, SEAL_AT, "{case}");
+                    }
+                    other => panic!("{case}: expected corruption, got {other:?}"),
+                }
+                assert_eq!(bases(dir.path()), [0, 1, 2, 3, 4, 5], "{case}");
+                assert!(segments(dest.path()).is_empty(), "{case}");
+                drop(writer);
+            }
+        }
+    }
+}
+
+/// What a deletion takes for a seal: the last non-zero eight bytes of the segment, a valid seal naming the successor.
+/// So a segment whose own seal is gone, and whose last record ends with exactly the bytes of such a seal, is deleted as
+/// if it were sealed (it lies before the checkpoint segment and its successor is in place, so the journal stays a
+/// chain); a move, which reads every record, finds the chain broken there and refuses it.
+#[test]
+fn deletion_takes_the_last_non_zero_bytes_for_the_seal() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut writer = Writer::open(dir.path(), small_config()).unwrap();
+    let mut payload = vec![42; 40_000 - 8];
+    payload.extend_from_slice(&seal(1));
+    writer
+        .append(&NewRecord {
+            schema_id: 1,
+            venue_ts_ns: 0,
+            local_ts_ns: 0,
+            payload: &payload,
+        })
+        .unwrap();
+    for _ in 1..6 {
+        append(&mut writer);
+    }
+    writer.checkpoint().unwrap();
+    write_at(&segments(dir.path())[0].1, SEAL_AT, &[0; 8]);
+    let policy = Policy::default().max_segments(2);
+    let plan = retention::plan(dir.path(), &policy).unwrap();
+    assert_eq!(plan.segments().len(), 4);
+    let dest = tempfile::tempdir().unwrap();
+    assert!(matches!(
+        retention::apply(dir.path(), &plan, &Action::MoveTo(dest.path().into())),
+        Err(Error::Corrupt {
+            offset: SEAL_AT,
+            reason: tickertape::CorruptReason::BrokenChain(1),
+            ..
+        })
+    ));
+    assert_eq!(bases(dir.path()), [0, 1, 2, 3, 4, 5]);
+    let report = retention::apply(dir.path(), &plan, &Action::Delete).unwrap();
+    assert_eq!(report.removed_segments, 4);
+    assert_eq!(bases(dir.path()), [4, 5]);
+    drop(writer);
+    assert_eq!(
+        Writer::open(dir.path(), small_config()).unwrap().next_seq(),
+        6
+    );
+}

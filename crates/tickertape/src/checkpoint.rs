@@ -10,7 +10,9 @@
 //!
 //! The checkpoint thread is started by the first request, named `tickertape-checkpoint`, runs one job at a time in
 //! request order (at most one more waits, and later requests extend it), runs the configured retention after each
-//! successful job, and is joined when the writer is dropped, after it has finished every requested job.
+//! successful job, and is joined when the writer is dropped, after it has finished every requested job. A retention
+//! run there stops before its next removal once a job is queued or the writer waits for the thread (ADR 0044):
+//! the rest is left for the run after the next job, so neither a checkpoint nor `close` waits for a retention backlog.
 
 use std::collections::BTreeSet;
 use std::fs::File;
@@ -392,15 +394,19 @@ pub(crate) struct RetentionOutcome {
     pub(crate) failures: u64,
 }
 
-/// One retention run: plan, then apply into `report`; the error, if any.
+/// One retention run on the checkpoint thread: plan, then apply into `report`, stopping after the first planned segment
+/// as soon as `stop` returns true; the error, if any.
 pub(crate) fn retention_pass(
     dir: &std::path::Path,
     policy: &Policy,
     action: &Action,
     report: &mut Report,
+    stop: &dyn Fn() -> bool,
 ) -> Option<Error> {
-    crate::retention::plan(dir, policy)
-        .and_then(|plan| crate::retention::apply_into(dir, &plan, action, report, false))
+    crate::retention::plan_until(dir, policy, stop)
+        .and_then(|plan| {
+            crate::retention::apply_into(dir, &plan, action, report, false, Some(stop))
+        })
         .err()
 }
 
@@ -439,6 +445,8 @@ pub(crate) struct State {
     pub(crate) failed_bytes: u64,
     /// Retention runs since the writer last collected.
     pub(crate) retention: Option<RetentionOutcome>,
+    /// Calls waiting for the thread to be idle ([`Background::wait_idle`]): a retention run stops early for them.
+    waiters: usize,
     stop: bool,
 }
 
@@ -453,6 +461,12 @@ impl State {
         self.running
             .unwrap_or(0)
             .saturating_add(self.queued.as_ref().map_or(0, Job::bytes))
+    }
+
+    /// Whether a retention run should stop before its next removal: a job waits, the writer waits for the thread to
+    /// be idle, or the thread is stopping.
+    fn retention_should_stop(&self) -> bool {
+        self.queued.is_some() || self.waiters > 0 || self.stop
     }
 
     fn add_retention(&mut self, report: &Report, error: Option<Error>) {
@@ -494,8 +508,18 @@ impl Background {
         })
     }
 
-    /// Blocks until no job is queued or running.
+    /// Blocks until no job is queued or running. A retention run in progress stops after the removal in progress.
     pub(crate) fn wait_idle(&self) {
+        /// Counts the caller out of `waiters` when it returns, also if a fault hook unwinds.
+        struct Waiting<'a>(&'a Shared);
+        impl Drop for Waiting<'_> {
+            fn drop(&mut self) {
+                lock(&self.0.state).waiters -= 1;
+            }
+        }
+        lock(&self.shared.state).waiters += 1;
+        let _waiting = Waiting(&self.shared);
+        crate::fault::hook(crate::fault::Point::CheckpointWait);
         let mut state = lock(&self.shared.state);
         while state.busy() {
             state = self
@@ -504,6 +528,7 @@ impl Background {
                 .wait(state)
                 .unwrap_or_else(|e| e.into_inner());
         }
+        drop(state); // Before `_waiting` takes the lock again.
     }
 }
 
@@ -579,8 +604,9 @@ fn run_thread(shared: &Shared, ctx: &Context, retention: Option<&(Policy, Action
                 });
                 if let Some((policy, action)) = retention {
                     let mut report = Report::default();
+                    let stop = || lock(&shared.state).retention_should_stop();
                     let error = panic::catch_unwind(AssertUnwindSafe(|| {
-                        retention_pass(&ctx.dir, policy, action, &mut report)
+                        retention_pass(&ctx.dir, policy, action, &mut report, &stop)
                     }))
                     .unwrap_or_else(|_| {
                         Some(Error::io(

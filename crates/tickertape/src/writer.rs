@@ -629,8 +629,9 @@ impl Writer {
 
     /// Makes every record appended so far durable, using the platform's sync calls (see
     /// `docs/crash-contract.md` → What `checkpoint()` does). Blocks until they finish.
-    /// Configured retention then runs; its failures are recorded by [`Writer::last_retention_error`] and do not
-    /// change the successful checkpoint result or poison the writer.
+    /// Configured retention then runs on the calling thread until it has removed what the policy asks for or fails;
+    /// its failures are recorded by [`Writer::last_retention_error`] and do not change the successful checkpoint
+    /// result or poison the writer.
     ///
     /// If background checkpoints ([`Writer::request_checkpoint`]) are in flight, this first waits for them; it then
     /// checkpoints on the calling thread, as without them.
@@ -716,8 +717,12 @@ impl Writer {
     /// reaches [`Writer::retention_report`] and [`Writer::last_retention_error`] when the writer next collects the
     /// thread's results: in this method, [`Writer::checkpoint_progress`], [`Writer::checkpoint`] and
     /// [`Writer::close`] ([`Writer::metrics`] includes it at once). Retention runs after the marker is durable, so
-    /// [`Writer::checkpoint_progress`] can report a checkpoint finished while its retention run goes on;
-    /// [`Writer::checkpoint`], [`Writer::close`] and dropping the writer wait for it.
+    /// [`Writer::checkpoint_progress`] can report a checkpoint finished while its retention run goes on. The run
+    /// stops before its next removal, once it has handled the first segment of its plan, when another checkpoint is requested
+    /// or when [`Writer::checkpoint`], [`Writer::close`] or dropping the writer waits for the thread; the run after the
+    /// next checkpoint plans again and continues (ADR 0044). So a checkpoint and `close` wait for the removal in
+    /// progress (and the planning before it), never for a backlog of removals; segments still eligible when the
+    /// writer closes stay until a later retention run (a writer's at open or after a checkpoint, or an archiver's).
     ///
     /// Cost on the calling thread: one lock of the state shared with the checkpoint thread and a few small moves; no
     /// system call, except for starting the thread at the first call, and when the request leaves a checkpoint's list
@@ -1047,6 +1052,7 @@ impl Writer {
                 action,
                 &mut self.retention_report,
                 false,
+                None,
             )
         });
         if let Err(error) = result {

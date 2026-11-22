@@ -4,6 +4,11 @@
 //! the first error. Limits are best effort: the checkpoint segment and everything after it are always retained.
 //! A move never replaces a destination file, even an identical copy left by an interrupted move. Resolve that
 //! conflict before retrying, or use a fresh destination. Destination directories must already exist.
+//!
+//! What is read of a segment before it goes (ADR 0044, crash contract C14): a deletion, and [`plan`], check its header
+//! and its successor's, and that its last non-zero bytes are a valid seal naming the successor, without reading its
+//! records; a move reads the whole segment and validates every record and the seal first, as the copy it leaves must be
+//! a valid segment.
 
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -50,9 +55,10 @@ impl Policy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Action {
-    /// Permanently delete the segment.
+    /// Permanently delete the segment. Its seal is checked first, its records are not read ([`apply`]).
     Delete,
-    /// Move it to an existing directory, preserving its basename. Existing destination entries are errors.
+    /// Move it to an existing directory, preserving its basename. Existing destination entries are errors. Every
+    /// record and the seal are read and validated first ([`apply`]).
     MoveTo(PathBuf),
 }
 
@@ -131,16 +137,28 @@ impl Report {
 /// Only a contiguous sealed prefix strictly before a valid checkpoint segment qualifies. Age uses wall clock
 /// time at planning; a nonmonotonic creation clock never allows skipping an ineligible oldest segment.
 ///
+/// Reads every segment's header, and of each candidate the end of the file back to its seal (the bytes after the
+/// seal are zeros): a candidate is sealed when its last non-zero eight bytes are a valid seal naming the next segment.
+/// Its records are not read, so a damaged record inside a sealed candidate does not stop the plan; a move
+/// ([`Action::MoveTo`]) reads and validates the whole segment before moving it. When the end of a candidate is not
+/// such a seal, the whole segment is scanned as before, and the error names what the scan found.
+///
 /// # Errors
 ///
 /// [`Error::NotFound`] for an empty journal; [`Error::Corrupt`] or [`Error::UnsupportedVersion`] for an invalid
-/// header, checkpoint position, or candidate chain; [`Error::Io`] for filesystem errors, including concurrent
+/// header, checkpoint position, or candidate seal or chain; [`Error::Io`] for filesystem errors, including concurrent
 /// changes while observing the directory. An absent/invalid checkpoint slot yields an empty plan.
 pub fn plan(dir: impl AsRef<Path>, policy: &Policy) -> Result<Plan> {
-    plan_at(dir.as_ref(), policy, crate::clock::realtime_ns())
+    plan_at(dir.as_ref(), policy, crate::clock::realtime_ns(), &|| false)
 }
 
-fn plan_at(dir: &Path, policy: &Policy, now: u64) -> Result<Plan> {
+/// [`plan`] for the writer's retention run on its checkpoint thread: once one segment is planned, planning stops as
+/// soon as `stop` returns true (ADR 0044).
+pub(crate) fn plan_until(dir: &Path, policy: &Policy, stop: &dyn Fn() -> bool) -> Result<Plan> {
+    plan_at(dir, policy, crate::clock::realtime_ns(), stop)
+}
+
+fn plan_at(dir: &Path, policy: &Policy, now: u64, stop: &dyn Fn() -> bool) -> Result<Plan> {
     let directory = directory_identity(dir)?;
     let paths = journal::list_segments(dir)?;
     if paths.is_empty() {
@@ -178,10 +196,11 @@ fn plan_at(dir: &Path, policy: &Policy, now: u64) -> Result<Plan> {
         let (header, identity) = headers[i];
         let sealed = headers[i + 1].0.created_unix_ns;
         let reasons = reasons(policy, count, bytes, now, sealed);
-        if reasons.is_empty() {
+        if reasons.is_empty() || (!plan.segments.is_empty() && stop()) {
             break;
         }
-        validate_sealed(path, *base, paths[i + 1].0)?;
+        let file = File::open(path).map_err(|e| Error::io("open segment", path, e))?;
+        check_seal(&file, path, header.segment_size, *base, paths[i + 1].0)?;
         plan.segments.push(PlannedSegment {
             path: path.clone(),
             base_seq: *base,
@@ -216,6 +235,12 @@ fn reasons(policy: &Policy, count: usize, bytes: u128, now: u64, sealed: u64) ->
 
 /// Applies a plan, revalidating the current checkpoint, segment identity, seal and oldest-end ordering.
 ///
+/// Before each removal: the segment is the oldest in the journal and still the file planned (same identity), its
+/// header and its successor's are valid, the successor is the next segment in the journal, and the segment is
+/// strictly older than the checkpoint segment. [`Action::Delete`] then checks the seal as [`plan`] does, without
+/// reading the records it discards; [`Action::MoveTo`] reads the whole segment and validates every record and the seal
+/// naming the successor, so that only a valid segment is moved.
+///
 /// Same-filesystem moves use an atomic no-replace rename. On `EXDEV`, a newly created destination copy is
 /// synced, its directory synced, then the source removed and the journal directory synced. Partial copies stay
 /// in the destination on error; they never justify removing the source. No existing destination is replaced.
@@ -232,18 +257,23 @@ fn reasons(policy: &Policy, count: usize, bytes: u128, now: u64, sealed: u64) ->
 /// A missing source counts as already removed only when no older segment remains.
 pub fn apply(dir: impl AsRef<Path>, plan: &Plan, action: &Action) -> Result<Report> {
     let mut report = Report::default();
-    apply_into(dir.as_ref(), plan, action, &mut report, true)?;
+    apply_into(dir.as_ref(), plan, action, &mut report, true, None)?;
     Ok(report)
 }
 
 /// `external` is true for a caller other than the writer itself (which runs retention only after its own marker is
 /// durable): the marker that decides each removal is then made durable first ([`durable_checkpoint`]).
+///
+/// `stop` is given by the writer's retention run on its checkpoint thread: after the first planned segment, the run
+/// ends before the next one once it returns true (a checkpoint is waiting, or the writer is closing; ADR 0044). The rest of
+/// the plan is left for the next run, which plans again.
 pub(crate) fn apply_into(
     dir: &Path,
     plan: &Plan,
     action: &Action,
     report: &mut Report,
     external: bool,
+    stop: Option<&dyn Fn() -> bool>,
 ) -> Result<()> {
     if directory_identity(dir)? != plan.directory {
         return Err(Error::InvalidConfig(
@@ -251,7 +281,13 @@ pub(crate) fn apply_into(
         ));
     }
     let mut synced = None;
-    for segment in &plan.segments {
+    for (i, segment) in plan.segments.iter().enumerate() {
+        if let Some(stop) = stop {
+            if i > 0 && stop() {
+                break;
+            }
+            crate::fault::hold_point(crate::fault::Point::RetentionRemove);
+        }
         let paths = journal::list_segments(dir)?;
         // A missing file is harmless only if the entire older prefix has also gone.
         if already_removed(&paths, segment.base_seq) {
@@ -290,7 +326,7 @@ pub(crate) fn apply_into(
                     "planned segment has been replaced".into(),
                 ));
             }
-            journal::read_header(&file, &path, segment.base_seq)?;
+            let header = journal::read_header(&file, &path, segment.base_seq)?;
             // Check the expected successor before any destructive operation; a missing middle is never tolerated.
             let successor = journal::segment_path(dir, segment.successor);
             if paths.get(1).map(|(base, _)| *base) != Some(segment.successor) {
@@ -303,7 +339,18 @@ pub(crate) fn apply_into(
             let next = File::open(&successor)
                 .map_err(|e| Error::io("open retention successor", &successor, e))?;
             journal::read_header(&next, &successor, segment.successor)?;
-            validate_sealed(&path, segment.base_seq, segment.successor)?;
+            match action {
+                Action::Delete => check_seal(
+                    &file,
+                    &path,
+                    header.segment_size,
+                    segment.base_seq,
+                    segment.successor,
+                )?,
+                Action::MoveTo(_) => {
+                    check_records(&file, &path, segment.base_seq, segment.successor)?
+                }
+            }
             match action {
                 Action::Delete => {
                     fs::remove_file(&path)
@@ -400,9 +447,60 @@ fn checkpoint(dir: &Path) -> Result<Option<CheckpointSlot>> {
     Ok(Some(slot))
 }
 
-fn validate_sealed(path: &Path, base: u64, successor: u64) -> Result<()> {
-    // Bounded memory: segments can be up to 2^40 bytes, and this runs on the writer's thread.
-    let scan = journal::scan_file(path, base)?;
+/// The first read of [`seal_at_end`], in bytes; each further read doubles, up to [`TAIL_READ_MAX`].
+const TAIL_READ: u64 = 4096;
+/// The largest read of [`seal_at_end`].
+const TAIL_READ_MAX: u64 = 1 << 20;
+
+/// Checks that segment `base` (open as `file`, `size` bytes, header already validated) is sealed and its seal names
+/// `successor`, reading only the end of the file back to the seal ([`seal_at_end`]). If the end is not such a seal,
+/// it falls back to [`check_records`], which reads the whole segment and reports exactly what is wrong (or accepts a
+/// valid chain of records ending in a valid seal that has non-zero bytes after it).
+fn check_seal(file: &File, path: &Path, size: u64, base: u64, successor: u64) -> Result<()> {
+    if seal_at_end(file, path, size, successor)? {
+        return Ok(());
+    }
+    check_records(file, path, base, successor)
+}
+
+/// Whether the last non-zero eight bytes of the record area of a segment of `size` bytes are a valid seal for
+/// `successor` (`docs/format.md` → Seal) with room for at least one record before it. A seal is eight bytes at an 8-byte-aligned
+/// offset with only zeros after it, so the 8-byte word holding the last non-zero byte is the seal. Reads backwards
+/// from the end of the file, 4 KiB first and twice as much each time up to 1 MiB, so it reads the zeros after the seal
+/// and the seal (normally a single read): what was left free when the segment rolled, less than the frame that did
+/// not fit, plus the trailer.
+fn seal_at_end(file: &File, path: &Path, size: u64, successor: u64) -> Result<bool> {
+    let first_slot = format::SEGMENT_HEADER_LEN as u64;
+    let mut end = size;
+    let mut chunk = TAIL_READ;
+    let mut buffer = Vec::new();
+    while end > first_slot {
+        // `size` is a multiple of 64 KiB and `chunk` of 4 KiB, so every read starts and ends 8-byte aligned.
+        let start = end.saturating_sub(chunk).max(first_slot);
+        buffer.resize((end - start) as usize, 0);
+        file.read_exact_at(&mut buffer, start)
+            .map_err(|e| Error::io("read segment end", path, e))?;
+        if let Some(word) = buffer.chunks_exact(8).rposition(|w| w != [0; 8]) {
+            let at = start + word as u64 * 8;
+            let bytes = &buffer[word * 8..word * 8 + 8];
+            let commit = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+            let crc = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+            // The earliest seal follows one record with an empty payload.
+            return Ok(at >= first_slot + format::RECORD_HEADER_LEN as u64
+                && commit == format::SEAL_MARKER
+                && crc == format::seal_crc(successor));
+        }
+        end = start;
+        chunk = (chunk * 2).min(TAIL_READ_MAX);
+    }
+    Ok(false)
+}
+
+/// Reads segment `base` (open as `file`) from its first record and validates every record and the seal, which must
+/// name `successor`.
+fn check_records(file: &File, path: &Path, base: u64, successor: u64) -> Result<()> {
+    // Bounded memory: segments can be up to 2^40 bytes, and this runs on the writer's threads.
+    let scan = journal::scan_open(file, path, base)?;
     match scan.end {
         ScanEnd::Seal if scan.next_seq == successor => Ok(()),
         ScanEnd::Invalid(reason) => Err(Error::corrupt(path, scan.end_offset, reason)),
@@ -490,5 +588,67 @@ mod tests {
             reasons(&p.max_segments(3).max_bytes(0), 4, 100, 111, 100),
             [Reason::MaxSegments, Reason::MaxBytes, Reason::MaxAge]
         );
+    }
+
+    /// A file of `size` zero bytes with `words` (offset, eight bytes) written into it.
+    fn image(size: u64, words: &[(u64, [u8; 8])]) -> (tempfile::TempDir, File) {
+        let dir = tempfile::tempdir().unwrap();
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(dir.path().join("segment"))
+            .unwrap();
+        file.set_len(size).unwrap();
+        for (offset, word) in words {
+            file.write_all_at(word, *offset).unwrap();
+        }
+        (dir, file)
+    }
+
+    fn seal(successor: u64) -> [u8; 8] {
+        let mut word = [0; 8];
+        word[..4].copy_from_slice(&format::SEAL_MARKER.to_le_bytes());
+        word[4..].copy_from_slice(&format::seal_crc(successor).to_le_bytes());
+        word
+    }
+
+    /// The edges of [`seal_at_end`]: where a seal can be, what counts as the last non-zero word, and which successor
+    /// it must name. (Whether the records before it are valid is not its business: `tests/retention.rs`.)
+    #[test]
+    fn seal_at_end_accepts_only_a_seal_for_the_successor_as_the_last_non_zero_word() {
+        const SIZE: u64 = 4 << 20;
+        let first = format::SEGMENT_HEADER_LEN as u64;
+        let earliest = first + format::RECORD_HEADER_LEN as u64;
+        let found = |words: &[(u64, [u8; 8])]| {
+            let (dir, file) = image(SIZE, words);
+            seal_at_end(&file, &dir.path().join("segment"), SIZE, 7).unwrap()
+        };
+        // In the last word of the file, in the first read; further back, after several doubling reads (more than
+        // 1 MiB of zeros behind it); and at the earliest offset a seal can have.
+        assert!(found(&[(SIZE - 8, seal(7))]));
+        assert!(found(&[(SIZE - (2 << 20), seal(7))]));
+        assert!(found(&[(earliest, seal(7))]));
+        // Earlier content does not matter, valid or not.
+        assert!(found(&[(first, [0xAB; 8]), (4096, seal(7))]));
+        // No room for a record before it: the first slot, and the words up to the earliest seal.
+        for at in (first..earliest).step_by(8) {
+            assert!(!found(&[(at, seal(7))]), "seal at {at}");
+        }
+        // Nothing but zeros after the header; a seal for another successor; a damaged seal.
+        assert!(!found(&[]));
+        assert!(!found(&[(4096, seal(8))]));
+        let mut damaged = seal(7);
+        damaged[7] ^= 1;
+        assert!(!found(&[(4096, damaged)]));
+        // Anything non-zero after a valid seal, even one byte in the last word of the file, is not this shape (the
+        // caller then reads the whole segment).
+        assert!(!found(&[(4096, seal(7)), (4104, [0, 0, 0, 0, 0, 0, 0, 1])]));
+        assert!(!found(&[
+            (4096, seal(7)),
+            (SIZE - 8, [1, 0, 0, 0, 0, 0, 0, 0])
+        ]));
+        // A later seal for the successor is the one that counts.
+        assert!(found(&[(4096, seal(8)), (8192, seal(7))]));
     }
 }

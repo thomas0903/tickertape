@@ -141,7 +141,10 @@ let config = WriterConfig::default().retention(
 );
 ```
 
-The writer runs retention once after recovery on open and after every successful checkpoint. Retention errors
+The writer runs retention once after recovery on open and after every successful checkpoint. After a background
+checkpoint the run is on the checkpoint thread and gives way, after the removal in progress, to the next checkpoint
+and to `close`; the run after the next checkpoint continues it, so a backlog shows as `segments.before_checkpoint`
+staying high in `tickertape status`, not as slower checkpoints (ADR 0044). Retention errors
 never fail open, append or checkpoint and never poison the writer. Check `Writer::last_retention_error()` for the
 most recent error (retained even after later successes), and `Writer::retention_report()` for cumulative counts,
 including removals completed before a subsequent failure. Neither is part of the recovery report.
@@ -152,6 +155,9 @@ The same rules apply to the library and CLI, without taking the writer lock:
   remove a middle segment, since that leaves a gap in the chain.
 - Only sealed segments **strictly older than the checkpoint segment** qualify. Without a valid checkpoint marker
   nothing is eligible; a dangling marker is an error. Never remove the marker's segment or anything newer.
+- A deletion checks the segment's seal from the end of the file and does not read its records; a move reads and
+  validates the whole segment first (crash contract C14). Run `tickertape verify` first to find damaged records
+  before deleting them.
 - Limits combine with OR: keep at most N total segments, at most B total segment file bytes, or remove segments
   sealed longer ago than D. Seal time is the successor header's creation time, not file modification time.
   Counts and bytes include the active segment. Checkpoint eligibility can prevent reaching the requested limit.
