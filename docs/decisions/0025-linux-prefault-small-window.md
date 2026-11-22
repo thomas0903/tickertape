@@ -1,7 +1,7 @@
 # 0025: Prefault on Linux again, with a small window
 
 - **Status:** accepted (supersedes the prefault-advice decision of [0023](0023-no-prefault-advice-on-linux.md); the
-  spare-segment decision there stands)
+  spare-segment decision there stands; amended 2026-11-22: the ext4 roll stall, closed by pull request #28)
 - **Date:** 2026-11-02
 
 ## Context
@@ -76,4 +76,17 @@ under continuous write-back:
 - Linux benchmarks must be re-recorded.
 - The cross-provider review required for `mmap.rs` applies.
 - The steady-state stalls of ext4 at high byte rates are a separate, open problem. A steady-state workload for the
-  comparison suite would show how other tools behave there.
+  comparison suite would show how other tools behave there. (Closed for rolls: see the amendment below.)
+
+## Amendment (2026-11-22): the ext4 stall at a roll
+
+The sustained runs of ADR 0038 on cloud Linux VMs with local NVMe sampled the writer thread's kernel stack. On ext4
+its longest waits were in the `fdatasync` that a roll made of the new segment, inside `ext4_sync_file` →
+`ext4_fc_commit` → `jbd2_complete_transaction` → `jbd2_log_wait_commit`: the roll waited for the ext4 journal to
+commit, on x86-64 and aarch64 alike, also in runs without checkpoints. The same sync on xfs waited in its log force for
+much less. Pull request #28 removed that sync from the roll (ADR 0038 → Rolls without a sync; the new segment's header
+is made durable by the next checkpoint) and added early write-back on a helper thread; in the runs after it the writer
+thread no longer waited there, and roll appends without checkpoints stayed short. The measurements and the stacks are
+in `docs/benchmarks.md` → "2026-11-19 to 2026-11-22, sustained workloads on Google Cloud VMs" → Checkpoints. Those runs
+were on cloud VMs; the bare-metal experiments above were not repeated. Checkpoints still call `fdatasync`, which on ext4
+can wait for the journal to commit; with early write-back the measured blocking checkpoints were short.

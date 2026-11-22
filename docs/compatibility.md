@@ -199,5 +199,7 @@ compare them with its own thresholds; any of the three can be added to the C ABI
 2. The 1.0 fixtures: add them at release (`docs/playbooks/release-checklist.md`, ADR 0033), as for every release.
 3. The roadmap's release-candidate exercise (release, installation and upgrade instructions and the external
    integration against a release candidate): an RC tag needs the owner's approval. Run it before tagging 1.0.
-4. Record the sustained session's results (`benches/README.md` → Recorded sustained session) in
-   `docs/benchmarks.md`, with the operating limits the roadmap's 1.0 contract item asks to publish.
+4. The open part of the sustained session: its results and the operating envelope are recorded in
+   `docs/benchmarks.md` (2026-11-19 to 2026-11-22), for 64 B. Still to do: run the 1,024 B scenarios with background
+   checkpoints at the release's code, and explain the record checksum mismatch that stopped a reader of the 1,024 B
+   probe on both aarch64 VMs at `279f59a` (and the time-out of the same probe on x86-64).

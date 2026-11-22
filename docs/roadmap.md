@@ -107,8 +107,9 @@ version numbers and dates are not fixed. Performance changes must preserve valid
 contract. An optimization investigation can close with a documented, measured decision that the proposed change
 does not help or cannot preserve those guarantees; such a decision must be explicit in the roadmap and its ADR.
 
-Status of each item as of 2026-11-20, after pull request #40 ([`compatibility.md`](compatibility.md)): an item is
-ticked only when every criterion holds; each open item says what is still missing.
+Status of each item as of 2026-11-22, after the cloud results of the sustained session, the checkpoint work, the
+comparison, the readers and the scale run were recorded in [`benchmarks.md`](benchmarks.md): an item is ticked only
+when every criterion holds; each open item says what is still missing.
 
 ### Next release: sustained performance
 
@@ -119,8 +120,11 @@ ticked only when every criterion holds; each open item says what is still missin
     reader lag. Record p50/p99/p99.9/p99.99 and maxima for latency, with the workload's durability and wait settings.
   - Publish the remaining bottlenecks and supported operating envelope, including overload behavior, rather than
     treating a short peak-throughput result as evidence of sustainable capacity.
-  - Missing: the workloads exist (`tt-sustained`, ADR 0026, #11), but no results are recorded in `docs/benchmarks.md`
-    and no bottlenecks or operating envelope are published.
+  - Missing: the workloads exist (`tt-sustained`, ADR 0026, #11) and the session's results, operating envelope and
+    remaining bottlenecks are recorded in `docs/benchmarks.md` (2026-11-19 to 2026-11-22), for 64 B only with background
+    checkpoints: the 1,024 B scenarios did not run because their probe failed at `279f59a` (a reader reported a record
+    checksum mismatch on both aarch64 VMs, the probe timed out on x86-64; neither is explained), and the lagging and
+    beyond-RAM scenarios are recorded with blocking checkpoints only.
 - [ ] **Sustained-load comparison benchmarks.**
   - Extend the comparison suite with repeated runs of at least 10 minutes per configuration for every compatible
     tool, covering both existing payload sizes and rates below and near sustainable storage throughput.
@@ -128,8 +132,10 @@ ticked only when every criterion holds; each open item says what is still missin
     visibility-only workloads from periodic durability workloads and document unequal guarantees or unsupported cases.
   - Preserve raw results, environment, exact commands, achieved rates and late sends. Investigate the ext4 stalls
     observed in ADR 0025 and publish comparisons without coordinated omission or hidden dropped records.
-  - Missing: the comparison mode exists (#11); the repeated 10-minute runs are not recorded in `docs/benchmarks.md`
-    (a cloud session is running) and the ext4 stall investigation is not published.
+  - Missing: macOS results. The repeated 10-minute runs on Linux ext4 and xfs, x86-64 and aarch64, are recorded in
+    `docs/benchmarks.md` (2026-11-19 to 2026-11-22), with tickertape's rows from a second session at a newer commit (the
+    first session's failed on the open-files defect fixed in #38), and the ext4 stall investigation is published (ADR
+    0025 → Amendment).
 - [ ] **Performance diagnostics with eBPF.**
   - Add a reproducible Linux diagnostic playbook using existing eBPF tools to investigate scheduler delays,
     page faults, filesystem/write-back stalls and block I/O during the sustained workloads.
@@ -151,8 +157,9 @@ ticked only when every criterion holds; each open item says what is still missin
     is storing (ADR 0027 → "Which loads can race"). A protocol change: its own ADR, measurements and review. A
     reader-side frontier alone does not close the other known limitation, a zeroed commit word that lets recovery
     rewrite published records in place under a live reader.
-  - Missing: the copy is gone (ADR 0027, #9); replay and live-reader results on x86-64 and aarch64 are not recorded
-    in `docs/benchmarks.md`, and the publication-frontier follow-up has no ADR yet.
+  - Missing: the publication-frontier follow-up has no ADR yet. The copy is gone (ADR 0027, #9); replay results for both
+    readers on x86-64 and aarch64 and the live latency of both readers on both architectures (the sustained session) are
+    recorded in `docs/benchmarks.md` (2026-11-19 to 2026-11-22).
 - [ ] **Cheaper checkpoints with prefaulting.**
   - Measure how much prefaulted, unwritten dirty data contributes to checkpoint cost on each platform. The current
     implementation already restricts `msync` to written ranges, then performs file-wide sync/barrier operations.
@@ -163,8 +170,9 @@ ticked only when every criterion holds; each open item says what is still missin
     a bounded number of open segments between checkpoints (#38), `RecoveryPolicy::Fail` holding back the changes from
     the first header it would restore until the open can no longer refuse (#35), and exposed through the C ABI, C++,
     Python, Java and the iceoryx2 recorder (#39).
-  - Missing: the Linux results of ADR 0038, the prefaulted-data measurement and before/after checkpoint and
-    durable-only reader latency are not recorded in `docs/benchmarks.md`.
+  - Missing: the measurement of how much prefaulted, unwritten data adds to a checkpoint, and any macOS result. The
+    Linux results of ADR 0038 and before/after checkpoint and durable-only reader latency are recorded in
+    `docs/benchmarks.md` (2026-11-19 to 2026-11-22).
 - [ ] **Finish eliminating avoidable work.**
   - Profile append, both readers, notification and serialization paths under the sustained workloads; document
     allocations, copies and synchronization that remain on those paths.
@@ -180,8 +188,11 @@ ticked only when every criterion holds; each open item says what is still missin
     item named bare-metal Graviton, `c7gd.metal`.)
   - Record CPU, kernel, filesystem, storage, affinity, CRC implementation and commands; resolve architecture-specific
     correctness failures and explain material performance differences before claiming cross-architecture results.
-  - Missing: correctness, crash and soak checks run on aarch64 Linux in CI (#12); the sustained comparison on Axion is
-    not recorded in `docs/benchmarks.md` (cloud runs of tickertape exist; the comparison is running).
+  - Missing: an explanation of the record checksum mismatch that stopped a reader of the 1,024 B probe on both aarch64
+    VMs at `279f59a` (a possible architecture-specific correctness failure; x86-64 timed out instead), and of the
+    aarch64 mapped reader's constant maximum in the checkpoint runs. Correctness, crash and soak checks run on aarch64
+    Linux in CI (#12); the sustained session and comparison on Axion are recorded in `docs/benchmarks.md` (2026-11-19 to
+    2026-11-22) with CPU, kernel, filesystem, storage, affinity, CRC path and commands.
 
 ### Following milestones: adoption and scale
 
@@ -216,12 +227,11 @@ ticked only when every criterion holds; each open item says what is still missin
   - Address measured bottlenecks while keeping memory bounded and preserving the rule that recovery does not
     silently discard committed history. Record regression workloads and remaining limits.
   - Status: `tt-scale` and the growth table are in place (#33), and the cloud run on local SSD with a journal larger
-    than RAM is done (informal figures in #33); ADR 0042 is accepted with no sparse index for 1.0, since a seek costs
-    at most one segment's scan (`docs/operations.md` → Choosing a segment size). The defect the run found, one open
-    file per segment between checkpoints, is fixed (#38).
-  - Missing: the dataset sizes and resource usage are not recorded in `docs/benchmarks.md`; archived history, missing
-    or corrupt segments, catch-up under a live writer, the zero-copy reader and the 10,000- and 20,000-segment
-    journals (unmeasurable before #38) are not measured.
+    than RAM is recorded in [`benchmarks.md`](benchmarks.md) with dataset sizes and resource usage; ADR 0042 is accepted
+    with no sparse index for 1.0, since a seek costs at most one segment's scan (`docs/operations.md` → Choosing a
+    segment size). The defect the run found, one open file per segment between checkpoints, is fixed (#38).
+  - Missing: archived history, missing or corrupt segments, catch-up under a live writer, the zero-copy reader and the
+    10,000- and 20,000-segment journals (they failed before #38 and are reported as failed) are not measured.
 
 ### v1.0 readiness
 
@@ -234,11 +244,12 @@ ticked only when every criterion holds; each open item says what is still missin
     failures, with documented sampling costs and no mandatory telemetry service.
   - Exercise release/installation/upgrade instructions and the external integration against a release candidate.
     Complete the release checklist and publish guarantees, measured operating limits and known issues.
-  - Missing: the surfaces are reviewed and documented in [`compatibility.md`](compatibility.md) (ADR 0043,
-    accepted; resolved in #37), with the fixtures and soak tier (#12) and the metrics (#8, #30) in place; its
-    "Before 1.0" list still holds the ABI version and baseline freeze, the 1.0 fixtures, the release-candidate
-    exercise (a tag needs the owner's approval) and recording the sustained session's results, so no measured
-    operating limits are published.
+  - Missing: the surfaces are reviewed and documented in [`compatibility.md`](compatibility.md) (ADR 0043, accepted;
+    resolved in #37), with the fixtures and soak tier (#12) and the metrics (#8, #30) in place; its "Before 1.0" list
+    still holds the ABI version and baseline freeze, the 1.0 fixtures, the release-candidate exercise (a tag needs the
+    owner's approval) and the open part of the sustained session (the 1,024 B scenarios and the unexplained checksum
+    mismatch on aarch64). Measured operating limits are published for 64 B ([`benchmarks.md`](benchmarks.md) → Operating
+    envelope and remaining bottlenecks).
 
 **v1.0 release gate:** all milestones above are complete under their stated criteria, CI is green on Linux and
 macOS, the aarch64 checks pass, and no known unresolved issue violates the published safety, corruption-detection,
