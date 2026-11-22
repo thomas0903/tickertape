@@ -18,11 +18,14 @@ use serde_json::{Value, json};
 use tickertape::retention::{Action, Policy};
 use tickertape::{Error, HelperCpus, NewRecord, Reader, Writer, WriterConfig, clock};
 use tickertape_bench::sustained::{
-    CpuSnapshot, PositionFile, ReaderSpec, Schedule, Seconds, SeriesFile, WaitMode,
+    CpuSnapshot, PositionFile, ReaderSpec, Schedule, Seconds, SeriesFile, WaitMode, describe_slot,
     format_duration, free_bytes, lag_json, lag_records, merge_series, parse_cpu_list,
     parse_duration, pin_current_thread, quantiles_json, record_bytes, total_ram_bytes,
 };
 use tickertape_bench::{Options, Result, elapsed_ns, fresh_directory, segment_capacity};
+
+/// Every payload byte the writer sends; a reader that reports a corrupt slot checks the file against it.
+const PAYLOAD_BYTE: u8 = 0x5a;
 
 const HELP: &str = "tt-sustained: sustained writer + readers workload (ADR 0026)
 
@@ -982,7 +985,7 @@ fn writer(config: &Config) -> Result<()> {
     let mut writer = Writer::open(&config.dir, writer_config)?;
     let position_file = PositionFile::open(&control.join("writer.pos"))?;
     let series = SeriesFile::create(&config.out.join("writer.series.jsonl"))?;
-    let payload = vec![0x5a; config.payload];
+    let payload = vec![PAYLOAD_BYTE; config.payload];
     let setup_deadline = Instant::now() + Duration::from_secs(120);
     fs::write(control.join("writer.ready"), [])?;
     let t0 = start_time(control, setup_deadline)?;
@@ -1360,7 +1363,47 @@ fn reader(config: &Config) -> Result<()> {
                     }
                 }
             }
-            Err(e) => return Err(e.into()),
+            Err(e) => {
+                if let Error::Corrupt {
+                    path,
+                    offset,
+                    reason,
+                    ..
+                } = &e
+                {
+                    // Say which reader saw it and what the file holds there now and a little later, so that a
+                    // wrong file can be told from a reader that saw the bytes wrong (issue #43).
+                    let kind = if spec.mapped { "mapped" } else { "safe" };
+                    eprintln!(
+                        "tt-sustained: reader {index} ({kind}) expected seq {expected} at {} offset {offset}: {reason}",
+                        path.display()
+                    );
+                    // The reader reads the slot again through its own view (the same mapping for a mapped
+                    // reader) until it gets the record, to tell a view that stays wrong from one that catches up.
+                    let mut reread = true;
+                    for delay_ms in [0u64, 1, 10, 100, 1000] {
+                        std::thread::sleep(Duration::from_millis(delay_ms));
+                        match describe_slot(path, *offset, config.payload, PAYLOAD_BYTE) {
+                            Ok(slot) => eprintln!("tt-sustained: file after {delay_ms} ms: {slot}"),
+                            Err(e) => eprintln!("tt-sustained: file after {delay_ms} ms: {e}"),
+                        }
+                        if reread {
+                            let again = match reader.try_next() {
+                                Ok(Some(record)) => {
+                                    reread = false;
+                                    format!("record seq {} (valid)", record.seq)
+                                }
+                                Ok(None) => "no record".to_string(),
+                                Err(e) => e.to_string(),
+                            };
+                            eprintln!(
+                                "tt-sustained: reader {index} reads it again after {delay_ms} ms: {again}"
+                            );
+                        }
+                    }
+                }
+                return Err(e.into());
+            }
         }
     };
     seconds.finish(&mut emit);

@@ -201,5 +201,7 @@ compare them with its own thresholds; any of the three can be added to the C ABI
    integration against a release candidate): an RC tag needs the owner's approval. Run it before tagging 1.0.
 4. The open part of the sustained session: its results and the operating envelope are recorded in
    `docs/benchmarks.md` (2026-11-19 to 2026-11-22), for 64 B. Still to do: run the 1,024 B scenarios with background
-   checkpoints at the release's code, and explain the record checksum mismatch that stopped a reader of the 1,024 B
-   probe on both aarch64 VMs at `279f59a` (and the time-out of the same probe on x86-64).
+   checkpoints at the release's code, with the journal verified from the file after each run. The record checksum
+   mismatch that stopped a reader of the 1,024 B probe on both aarch64 VMs at `279f59a` is issue #43 (readers now
+   tolerate the lagging view; the platform mechanism and a long verified run on aarch64 are open), and the time-out of
+   the same probe on x86-64 is issue #45 (open).
