@@ -464,7 +464,7 @@ fn check_seal(file: &File, path: &Path, size: u64, base: u64, successor: u64) ->
 }
 
 /// Whether the last non-zero eight bytes of the record area of a segment of `size` bytes are a valid seal for
-/// `successor` (`docs/format.md` → Seal) that is not at the first slot. A seal is eight bytes at an 8-byte-aligned
+/// `successor` (`docs/format.md` → Seal) with room for at least one record before it. A seal is eight bytes at an 8-byte-aligned
 /// offset with only zeros after it, so the 8-byte word holding the last non-zero byte is the seal. Reads backwards
 /// from the end of the file, 4 KiB first and twice as much each time up to 1 MiB, so it reads the zeros after the seal
 /// and the seal (normally a single read): what was left free when the segment rolled, less than the frame that did
@@ -485,7 +485,8 @@ fn seal_at_end(file: &File, path: &Path, size: u64, successor: u64) -> Result<bo
             let bytes = &buffer[word * 8..word * 8 + 8];
             let commit = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
             let crc = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
-            return Ok(at > first_slot
+            // The earliest seal follows one record with an empty payload.
+            return Ok(at >= first_slot + format::RECORD_HEADER_LEN as u64
                 && commit == format::SEAL_MARKER
                 && crc == format::seal_crc(successor));
         }
@@ -587,5 +588,67 @@ mod tests {
             reasons(&p.max_segments(3).max_bytes(0), 4, 100, 111, 100),
             [Reason::MaxSegments, Reason::MaxBytes, Reason::MaxAge]
         );
+    }
+
+    /// A file of `size` zero bytes with `words` (offset, eight bytes) written into it.
+    fn image(size: u64, words: &[(u64, [u8; 8])]) -> (tempfile::TempDir, File) {
+        let dir = tempfile::tempdir().unwrap();
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(dir.path().join("segment"))
+            .unwrap();
+        file.set_len(size).unwrap();
+        for (offset, word) in words {
+            file.write_all_at(word, *offset).unwrap();
+        }
+        (dir, file)
+    }
+
+    fn seal(successor: u64) -> [u8; 8] {
+        let mut word = [0; 8];
+        word[..4].copy_from_slice(&format::SEAL_MARKER.to_le_bytes());
+        word[4..].copy_from_slice(&format::seal_crc(successor).to_le_bytes());
+        word
+    }
+
+    /// The edges of [`seal_at_end`]: where a seal can be, what counts as the last non-zero word, and which successor
+    /// it must name. (Whether the records before it are valid is not its business: `tests/retention.rs`.)
+    #[test]
+    fn seal_at_end_accepts_only_a_seal_for_the_successor_as_the_last_non_zero_word() {
+        const SIZE: u64 = 4 << 20;
+        let first = format::SEGMENT_HEADER_LEN as u64;
+        let earliest = first + format::RECORD_HEADER_LEN as u64;
+        let found = |words: &[(u64, [u8; 8])]| {
+            let (dir, file) = image(SIZE, words);
+            seal_at_end(&file, &dir.path().join("segment"), SIZE, 7).unwrap()
+        };
+        // In the last word of the file, in the first read; further back, after several doubling reads (more than
+        // 1 MiB of zeros behind it); and at the earliest offset a seal can have.
+        assert!(found(&[(SIZE - 8, seal(7))]));
+        assert!(found(&[(SIZE - (2 << 20), seal(7))]));
+        assert!(found(&[(earliest, seal(7))]));
+        // Earlier content does not matter, valid or not.
+        assert!(found(&[(first, [0xAB; 8]), (4096, seal(7))]));
+        // No room for a record before it: the first slot, and the words up to the earliest seal.
+        for at in (first..earliest).step_by(8) {
+            assert!(!found(&[(at, seal(7))]), "seal at {at}");
+        }
+        // Nothing but zeros after the header; a seal for another successor; a damaged seal.
+        assert!(!found(&[]));
+        assert!(!found(&[(4096, seal(8))]));
+        let mut damaged = seal(7);
+        damaged[7] ^= 1;
+        assert!(!found(&[(4096, damaged)]));
+        // Anything non-zero after a valid seal, even one byte in the last word of the file, is not this shape (the
+        // caller then reads the whole segment).
+        assert!(!found(&[(4096, seal(7)), (4104, [0, 0, 0, 0, 0, 0, 0, 1])]));
+        assert!(!found(&[
+            (4096, seal(7)),
+            (SIZE - 8, [1, 0, 0, 0, 0, 0, 0, 0])
+        ]));
+        // A later seal for the successor is the one that counts.
+        assert!(found(&[(4096, seal(8)), (8192, seal(7))]));
     }
 }

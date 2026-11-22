@@ -510,7 +510,15 @@ impl Background {
 
     /// Blocks until no job is queued or running. A retention run in progress stops after the removal in progress.
     pub(crate) fn wait_idle(&self) {
+        /// Counts the caller out of `waiters` when it returns, also if a fault hook unwinds.
+        struct Waiting<'a>(&'a Shared);
+        impl Drop for Waiting<'_> {
+            fn drop(&mut self) {
+                lock(&self.0.state).waiters -= 1;
+            }
+        }
         lock(&self.shared.state).waiters += 1;
+        let _waiting = Waiting(&self.shared);
         crate::fault::hook(crate::fault::Point::CheckpointWait);
         let mut state = lock(&self.shared.state);
         while state.busy() {
@@ -520,7 +528,7 @@ impl Background {
                 .wait(state)
                 .unwrap_or_else(|e| e.into_inner());
         }
-        state.waiters -= 1;
+        drop(state); // Before `_waiting` takes the lock again.
     }
 }
 

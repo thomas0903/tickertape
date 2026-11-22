@@ -92,7 +92,10 @@ its next removal, once it has handled one planned segment, as soon as a checkpoi
 or `Writer::close` waits for the thread, or the writer is dropped. The run after the next checkpoint plans again and
 continues. Planning stops early in the same way once it has one candidate. So the time from a request to a durable
 marker, and the time `close` takes, include at most the run's planning (one directory listing and one header read per
-segment, plus the end of one candidate) and one removal, not the backlog. A run that was not interrupted removes
+segment, plus the end of one candidate) and one removal for each job still to finish, not the backlog: when one job
+is running and another is queued, each is followed by such a bounded run, so the wait covers at most two. A candidate
+whose end is not a valid seal costs that run a full read of the segment, and every later run again until the segment
+is repaired or removed by hand (`Writer::last_retention_error` reports it). A run that was not interrupted removes
 everything the policy asks for, as before. Each run handles at least one planned segment, so under a constant queue of
 checkpoints retention still makes progress, one segment per checkpoint at least.
 
@@ -112,7 +115,8 @@ field is added.
 - Callers can see: `plan` (and `tickertape archive --dry-run`) lists a sealed segment with damaged records instead of
   failing; `apply` with `Delete` removes it, and with `MoveTo` stops at it with `Error::Corrupt` after moving the
   segments before it; with background checkpoints, `Writer::checkpoint`, `Writer::close` and drop no longer wait for
-  the whole retention run, and segments that were eligible can remain after `close` until a later run. No API item
+  the whole retention run of the checkpoint thread (a blocking `Writer::checkpoint` then runs retention to the end on
+  the calling thread, as before), and segments that were eligible can remain after `close` until a later run. No API item
   changes; the `fault-injection` feature gains `Point::RetentionRemove` and `Point::CheckpointWait`.
 - Tests: `tests/background_checkpoint.rs::retention_backlog_holds_up_neither_a_checkpoint_nor_close` (28 eligible
   segments, each with a damaged record; the queued checkpoint reaches its marker after one removal, `close` returns

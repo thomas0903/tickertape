@@ -125,7 +125,8 @@ The owner decided the questions this ADR left open:
 - No separate public call that waits without checkpointing: polling `checkpoint_progress` does that.
 - Retention stays on the checkpoint thread, after each successful background checkpoint. (Amended 2026-11-22 by ADR
   [0044](0044-retention-without-a-backlog-wait.md): `checkpoint()`, `close()` and drop no longer wait for the whole
-  run, only for the removal in progress; a run also gives way to a queued job.)
+  run on the checkpoint thread, only for the removal in progress; a run also gives way to a queued job. A blocking
+  `checkpoint()` still runs retention to the end on the calling thread afterwards.)
 - Coalescing (a request made while one checkpoint waits joins it) is the semantics the bindings will expose.
 - The abandoned-write path may wait for a background checkpoint (it takes the same lock); it is a rare path.
 
