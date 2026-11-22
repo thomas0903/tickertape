@@ -119,8 +119,8 @@ What happens next is an **assumption about the implementation on the supported m
 
 Under that assumption, a frame that mixes bytes from different writes fails the CRC, and the reader reports
 corruption. How likely a chance match is depends on the corruption and on what the writer is storing; a reader
-retries `VALIDATION_RETRIES` times before reporting it, but a retry can read the same bytes, so retries are not
-independent attempts. A frame that passes would hand out a slice over bytes that are still being written. In the
+reads the slot again for at least `VALIDATION_WINDOW` (50 ms) before reporting it, but a retry can read the same
+bytes, so retries are not independent attempts. A frame that passes would hand out a slice over bytes that are still being written. In the
 zeroed-word case the reader can also return records that validate and then change. **The copying reader before this
 decision had exactly the same exposure**, since it copied the same range with the same atomic loads and relied on
 the same immutability after validation; this decision does not introduce it, and it removes the old reader's one

@@ -20,8 +20,19 @@ const CHUNK: usize = 64 * 1024;
 /// Longest single block on the wake-up region when the writer maintains it (bounded so that a writer that died, or a
 /// missed wake-up, costs at most this much latency; the identity check also runs at least this often).
 const NOTIFY_MAX_WAIT: Duration = Duration::from_millis(100);
-/// Re-reads before a validation failure is reported as corruption (the copy may predate the commit).
+/// Re-reads, back to back, of a slot that failed validation (the copy may predate the commit).
 const VALIDATION_RETRIES: u32 = 3;
+/// How long a reader keeps reading a slot again, with growing pauses, after its back-to-back re-reads also failed,
+/// before it reports corruption (issue #43). On aarch64 Linux under memory compaction and reclaim, readers that map a
+/// segment (the zero-copy reader, and an independent mapped reader) have seen a record whose commit word was already
+/// visible with bytes in its next page that were not, while the file held the record intact; the view caught up
+/// within microseconds, after more than `VALIDATION_RETRIES` back-to-back re-reads. The window is far longer than
+/// that, and costs only a slot that stays invalid: corruption is reported this much later.
+const VALIDATION_WINDOW: Duration = Duration::from_millis(50);
+/// The first pause between the re-reads of [`VALIDATION_WINDOW`]; each pause doubles, up to [`VALIDATION_PAUSE_MAX`].
+const VALIDATION_PAUSE_MIN: Duration = Duration::from_micros(10);
+/// The longest pause between the re-reads of [`VALIDATION_WINDOW`].
+const VALIDATION_PAUSE_MAX: Duration = Duration::from_millis(5);
 /// Listings `open` and `seek` make when the segment they chose disappears before they can open it.
 const LISTING_ATTEMPTS: u32 = 8;
 
@@ -545,8 +556,8 @@ impl Reader {
     /// Reads and validates the slot at the cursor, following seals. Returns `true` with the record in `self.found`
     /// (cursor moved past it), or `false` at an empty slot.
     ///
-    /// A slot that fails validation is read again from the file up to [`VALIDATION_RETRIES`] times before it is
-    /// reported. The record path is kept short: the other outcomes are handled in functions that are never inlined.
+    /// A slot that fails validation is read again from the file, for at least [`VALIDATION_WINDOW`], before it is
+    /// reported ([`Reader::read_slot_again`]). The record path is kept short: the other outcomes are handled in functions that are never inlined.
     /// (They are not marked `#[cold]`: that moved them to the end of the code and, on the machine where this was
     /// measured, made the unrelated append path slower by changing where its code landed.)
     fn next_slot(&mut self) -> Result<bool> {
@@ -571,19 +582,33 @@ impl Reader {
         }
     }
 
-    /// The retries of a slot whose first read failed validation: up to [`VALIDATION_RETRIES`] fresh reads, until one
-    /// gives something other than `Invalid` (the last outcome is returned either way).
+    /// The retries of a slot whose first read failed validation: fresh reads until one gives something other than
+    /// `Invalid`, first [`VALIDATION_RETRIES`] back to back, then with growing pauses until [`VALIDATION_WINDOW`] has
+    /// passed since the last of those (the last outcome is returned either way, and the slot is read at least once
+    /// after the window has passed).
     #[inline(never)]
     fn read_slot_again(&mut self) -> Result<SlotOutcome> {
         let mut attempt = 1;
+        let mut window: Option<(Instant, Duration)> = None;
         loop {
             let read = self.read_slot(true)?;
             #[cfg(test)]
             let read = tests::scripted(read);
-            match read {
-                SlotOutcome::Invalid(_) if attempt < VALIDATION_RETRIES => attempt += 1,
-                other => return Ok(other),
+            if !matches!(read, SlotOutcome::Invalid(_)) {
+                return Ok(read);
             }
+            if attempt < VALIDATION_RETRIES {
+                attempt += 1;
+                continue;
+            }
+            let now = Instant::now();
+            let (deadline, pause) =
+                window.get_or_insert((now + VALIDATION_WINDOW, VALIDATION_PAUSE_MIN));
+            if now >= *deadline {
+                return Ok(read);
+            }
+            std::thread::sleep((*pause).min(*deadline - now));
+            *pause = (*pause * 2).min(VALIDATION_PAUSE_MAX);
         }
     }
 
@@ -1207,10 +1232,11 @@ mod wake_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{Reader, SlotOutcome, VALIDATION_RETRIES, resize_buf};
+    use super::{Reader, SlotOutcome, VALIDATION_RETRIES, VALIDATION_WINDOW, resize_buf};
     use crate::mmap::MAPPED_READS;
     use crate::{CorruptReason, Error, NewRecord, ReaderConfig, Writer, WriterConfig};
     use std::cell::Cell;
+    use std::time::Instant;
 
     thread_local! {
         /// How many of this thread's next non-empty slot reads [`scripted`] turns into a validation failure.
@@ -1247,18 +1273,23 @@ mod tests {
         dir
     }
 
+    fn open_reader(dir: &std::path::Path, mapped: bool) -> Reader {
+        if mapped {
+            // SAFETY: only the tickertape writer in `journal_of` modifies the journal, and it has been dropped.
+            unsafe { Reader::open_mapped(dir, ReaderConfig::default()) }.unwrap()
+        } else {
+            Reader::open(dir, ReaderConfig::default()).unwrap()
+        }
+    }
+
     /// A slot that fails validation once and validates on the re-read is returned, by both readers: neither reports
-    /// corruption for a transient failure. After `VALIDATION_RETRIES` re-reads that all fail, both report it.
+    /// corruption for a transient failure. A slot that keeps failing is reported, by both, once it has been read again
+    /// for `VALIDATION_WINDOW`.
     #[test]
     fn a_failed_validation_is_retried_by_both_readers() {
         let dir = journal_of(3);
         for mapped in [false, true] {
-            let mut reader = if mapped {
-                // SAFETY: only the tickertape writer above modifies the journal, and it has been dropped.
-                unsafe { Reader::open_mapped(dir.path(), ReaderConfig::default()) }.unwrap()
-            } else {
-                Reader::open(dir.path(), ReaderConfig::default()).unwrap()
-            };
+            let mut reader = open_reader(dir.path(), mapped);
             assert_eq!(reader.try_next().unwrap().unwrap().seq, 0);
             FAIL_READS.with(|n| n.set(1));
             let record = reader.try_next().unwrap().unwrap();
@@ -1267,7 +1298,8 @@ mod tests {
                 (1, &[1u8; 100][..]),
                 "mapped: {mapped}"
             );
-            FAIL_READS.with(|n| n.set(VALIDATION_RETRIES + 1));
+            FAIL_READS.with(|n| n.set(u32::MAX));
+            let start = Instant::now();
             match reader.try_next() {
                 Err(Error::Corrupt {
                     reason: CorruptReason::BadChecksum,
@@ -1275,7 +1307,31 @@ mod tests {
                 }) => {}
                 other => panic!("mapped: {mapped}: {other:?}"),
             }
+            assert!(start.elapsed() >= VALIDATION_WINDOW, "mapped: {mapped}");
             FAIL_READS.with(|n| n.set(0));
+        }
+    }
+
+    /// Issue #43: a committed record whose bytes a reader sees wrong for longer than its back-to-back re-reads (on
+    /// aarch64 Linux under memory compaction, a mapped view showed a freshly committed record with stale bytes in its
+    /// next page for a few microseconds) is returned once the view is right, by both readers, instead of being
+    /// reported as corrupt. Before the fix, a fourth failed read was reported as corruption.
+    #[test]
+    fn a_view_that_catches_up_after_the_back_to_back_re_reads_is_not_reported() {
+        let dir = journal_of(3);
+        for mapped in [false, true] {
+            let mut reader = open_reader(dir.path(), mapped);
+            assert_eq!(reader.try_next().unwrap().unwrap().seq, 0);
+            // The first read and every back-to-back re-read fail, and a few of the paced ones after them.
+            FAIL_READS.with(|n| n.set(VALIDATION_RETRIES + 4));
+            let record = reader.try_next().unwrap().unwrap();
+            assert_eq!(
+                (record.seq, record.payload),
+                (1, &[1u8; 100][..]),
+                "mapped: {mapped}"
+            );
+            assert_eq!(FAIL_READS.with(Cell::get), 0, "mapped: {mapped}");
+            assert_eq!(reader.try_next().unwrap().unwrap().seq, 2);
         }
     }
 

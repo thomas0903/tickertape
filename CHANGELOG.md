@@ -5,6 +5,23 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
+- Fixed: a reader could report a record checksum mismatch (`Error::Corrupt`) for a record the writer had published
+  correctly (issue #43). On aarch64 Linux (Google Cloud Axion VMs, kernel 7.0, ext4 and xfs) under memory pressure,
+  readers that map a segment, including one written without tickertape code, saw a record whose commit word was
+  visible while the bytes in its next page still read as zeros, with the file holding the record intact; the view
+  caught up, but only after the three back-to-back re-reads a reader made before reporting corruption. A reader now
+  reads a slot that fails validation again for at least 50 ms, with growing pauses, and reports corruption only if
+  every re-read fails; it returns the record as soon as one validates. Real corruption is reported up to 50 ms later
+  than before, also by `Reader::try_next`. The mechanism is not identified (`crash-contract.md` → Known risks and
+  limits). The zero-copy reader reported it at `279f59a`; at `ddcbe49` the independent reader saw the same lag, and
+  the zero-copy reader re-reads the same way there. **Known issue of v0.4.0** (and of every earlier release): their
+  readers re-read the same way, so a reader's view lagging like this makes them report the same false corruption; it
+  has not been tried with their writers, which have no background checkpoints.
+- Added (bench tooling): when a `tt-sustained` reader reports corruption, it names the reader and its kind, prints
+  what the file holds at that slot (commit word, stored and recomputed CRC, header fields, and the payload bytes that
+  differ from what the writer sent, with their pages) right away and after 1 ms, 10 ms, 100 ms and 1 s, and reads the
+  slot again through its own view at the same times, so that a wrong file can be told from a reader that saw the
+  bytes wrong. The journal is kept as before.
 - Docs: `docs/benchmarks.md` records the cloud results of 2026-11-19 to 2026-11-22 (Google Cloud VMs with local
   NVMe SSD, x86-64 and aarch64, ext4 and xfs): the sustained session with background checkpoints (64 B; its 1,024 B
   scenarios did not run because their probe failed), the reference session with blocking checkpoints before ADR 0038,

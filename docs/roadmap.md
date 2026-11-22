@@ -123,8 +123,10 @@ when every criterion holds; each open item says what is still missing.
   - Missing: the workloads exist (`tt-sustained`, ADR 0026, #11) and the session's results, operating envelope and
     remaining bottlenecks are recorded in `docs/benchmarks.md` (2026-11-19 to 2026-11-22), for 64 B only with background
     checkpoints: the 1,024 B scenarios did not run because their probe failed at `279f59a` (a reader reported a record
-    checksum mismatch on both aarch64 VMs, the probe timed out on x86-64; neither is explained), and the lagging and
-    beyond-RAM scenarios are recorded with blocking checkpoints only.
+    checksum mismatch on both aarch64 VMs, the probe timed out on x86-64; both explained in issue #43: the mismatch was
+    a reader giving up on a view that lagged a correctly published record, fixed; the time-out was retention behind an
+    overloaded writer holding up the final checkpoint), and the lagging and beyond-RAM scenarios are recorded with
+    blocking checkpoints only.
 - [ ] **Sustained-load comparison benchmarks.**
   - Extend the comparison suite with repeated runs of at least 10 minutes per configuration for every compatible
     tool, covering both existing payload sizes and rates below and near sustainable storage throughput.
@@ -188,9 +190,9 @@ when every criterion holds; each open item says what is still missing.
     item named bare-metal Graviton, `c7gd.metal`.)
   - Record CPU, kernel, filesystem, storage, affinity, CRC implementation and commands; resolve architecture-specific
     correctness failures and explain material performance differences before claiming cross-architecture results.
-  - Missing: an explanation of the record checksum mismatch that stopped a reader of the 1,024 B probe on both aarch64
-    VMs at `279f59a` (a possible architecture-specific correctness failure; x86-64 timed out instead), and of the
-    aarch64 mapped reader's constant maximum in the checkpoint runs. Correctness, crash and soak checks run on aarch64
+  - Missing: an explanation of the aarch64 mapped reader's constant maximum in the checkpoint runs. The record checksum
+    mismatch that stopped a reader of the 1,024 B probe on both aarch64 VMs at `279f59a` is explained and fixed (issue
+    #43; `crash-contract.md` → Known risks and limits), apart from the platform mechanism behind the lagging view. Correctness, crash and soak checks run on aarch64
     Linux in CI (#12); the sustained session and comparison on Axion are recorded in `docs/benchmarks.md` (2026-11-19 to
     2026-11-22) with CPU, kernel, filesystem, storage, affinity, CRC path and commands.
 

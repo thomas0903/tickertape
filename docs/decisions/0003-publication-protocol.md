@@ -37,7 +37,9 @@ the same mechanism, published only after the next segment file exists, so reader
   aarch64, which orders this thread's later loads, including those the kernel performs in the next `pread`), and only
   then trusts body bytes read after the fence. Within a chunk, a record's body may have been copied before its commit
   word; such a record fails its CRC, so the reader re-reads from that position before ever reporting corruption, and
-  reports `Error::Corrupt` only if the commit word is unchanged and the CRC still fails on a re-read after the fence.
+  reports `Error::Corrupt` only if the commit word is unchanged and the CRC still fails on re-reads after the fence
+  for at least 50 ms (issue #43: on aarch64 Linux a mapped view of a record just committed was seen to lag for longer
+  than a few back-to-back re-reads; `crash-contract.md` → Known risks and limits).
 - The **zero-copy reader** (`unsafe Reader::open_mapped`) maps segments `PROT_READ`, `MAP_SHARED` (a read-only file
   handle, so it works without write permission). It loads a commit word with `Ordering::Relaxed` through a
   `&AtomicU32` made by casting the pointer (not `from_ptr`, which requires writable memory), then issues
