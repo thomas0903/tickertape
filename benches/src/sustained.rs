@@ -542,6 +542,38 @@ pub struct SecondBucket {
     pub roll_max_ns: u64,
     /// Records skipped because retention removed them before this reader got there.
     pub skipped: u64,
+    /// The writer's checkpoint and retention state at the end of the second (writer only; set just before the
+    /// bucket is emitted).
+    pub state: Option<WriterState>,
+}
+
+/// The writer's checkpoint and retention counters at one moment: what a failed run would otherwise leave unknown
+/// (issue #45). Cumulative since the writer opened.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WriterState {
+    /// Checkpoints whose marker is durable (the marker's generation minus the one at open; checkpoints that absorbed
+    /// later requests count once).
+    pub checkpoints_completed: u64,
+    /// Every record below this sequence number is durable (the marker's `next_seq`), if there is a marker.
+    pub checkpoint_next_seq: Option<u64>,
+    /// The segment the marker names (its first sequence number), if there is a marker.
+    pub checkpoint_segment: Option<u64>,
+    /// Segments retention removed.
+    pub retention_removed_segments: u64,
+    /// Retention runs that failed.
+    pub retention_failures: u64,
+    /// The most recent retention error, if any.
+    pub retention_last_error: Option<String>,
+}
+
+impl WriterState {
+    /// The fields as JSON object members.
+    pub fn to_json(&self) -> Value {
+        json!({"checkpoints_completed": self.checkpoints_completed,
+            "checkpoint_next_seq": self.checkpoint_next_seq, "checkpoint_segment": self.checkpoint_segment,
+            "retention_removed_segments": self.retention_removed_segments,
+            "retention_failures": self.retention_failures, "retention_last_error": self.retention_last_error})
+    }
 }
 
 impl SecondBucket {
@@ -557,6 +589,7 @@ impl SecondBucket {
             rolls: 0,
             roll_max_ns: 0,
             skipped: 0,
+            state: None,
         })
     }
 
@@ -571,6 +604,7 @@ impl SecondBucket {
         self.rolls = 0;
         self.roll_max_ns = 0;
         self.skipped = 0;
+        self.state = None;
     }
 
     /// The bucket as one `ops` line of a per-process series file.
@@ -579,11 +613,17 @@ impl SecondBucket {
         let latency_max = (!self.latency.is_empty()).then(|| us(self.latency.max()));
         let latency_p99 =
             (!self.latency.is_empty()).then(|| us(self.latency.value_at_quantile(0.99)));
-        json!({"kind": "ops", "second": self.second, "records": self.records, "late_records": self.late,
+        let mut line = json!({"kind": "ops", "second": self.second, "records": self.records, "late_records": self.late,
             "schedule_delay_max_us": us(self.schedule_delay_max_ns), "latency_max_us": latency_max,
             "latency_p99_us": latency_p99, "checkpoints": self.checkpoints,
             "checkpoint_max_us": us(self.checkpoint_max_ns), "rolls": self.rolls, "roll_max_us": us(self.roll_max_ns),
-            "skipped_records": self.skipped})
+            "skipped_records": self.skipped});
+        if let (Some(state), Value::Object(fields)) = (&self.state, &mut line) {
+            if let Value::Object(extra) = state.to_json() {
+                fields.extend(extra);
+            }
+        }
+        line
     }
 }
 
@@ -616,6 +656,18 @@ impl Seconds {
             self.current.reset(second);
         }
         &mut self.current
+    }
+
+    /// Whether `t_ns` falls in another second than the current bucket, so that [`Seconds::bucket`] would emit it.
+    pub fn is_new_second(&self, t_ns: u64) -> bool {
+        self.started && t_ns / NS_PER_S != self.current.second
+    }
+
+    /// Sets the writer state of the current bucket (no effect before the first bucket).
+    pub fn set_state(&mut self, state: WriterState) {
+        if self.started {
+            self.current.state = Some(state);
+        }
     }
 
     /// Emits the last bucket, if any.
@@ -882,6 +934,15 @@ const WRITER_OPS: [(&str, &str); 9] = [
     ("rolls", "rolls"),
     ("roll_max_us", "roll_max_us"),
 ];
+/// Writer state fields of an `ops` line ([`WriterState`]), copied as they are (the last line of a second wins).
+const WRITER_STATE: [&str; 6] = [
+    "checkpoints_completed",
+    "checkpoint_next_seq",
+    "checkpoint_segment",
+    "retention_removed_segments",
+    "retention_failures",
+    "retention_last_error",
+];
 /// Per-second fields of a reader `ops` line in the merged series.
 const READER_OPS: [(&str, &str); 4] = [
     ("records", "records"),
@@ -938,6 +999,13 @@ pub fn merge_series(processes: &[Vec<Value>]) -> Vec<Value> {
                             _ => value.clone(),
                         };
                         slot.insert((*to).into(), merged);
+                    }
+                    if index == 0 {
+                        for field in WRITER_STATE {
+                            if let Some(value) = line.get(field) {
+                                slot.insert(field.into(), value.clone());
+                            }
+                        }
                     }
                 }
                 Some("sample") => {
@@ -1265,6 +1333,36 @@ mod tests {
         assert_eq!(lines[0]["latency_max_us"], 2.0);
         assert_eq!(lines[2]["latency_max_us"], Value::Null);
         assert_eq!(lines[2]["checkpoints"], 1);
+    }
+
+    #[test]
+    fn writer_state_reaches_the_ops_line_and_the_merged_series() {
+        let mut seconds = Seconds::new().unwrap();
+        let mut lines = Vec::new();
+        let mut emit = |v: Value| lines.push(v);
+        seconds.bucket(5_000_000_000, &mut emit).records += 1;
+        assert!(!seconds.is_new_second(5_999_999_999));
+        assert!(seconds.is_new_second(6_000_000_000));
+        let state = WriterState {
+            checkpoints_completed: 3,
+            checkpoint_next_seq: Some(120),
+            checkpoint_segment: Some(100),
+            retention_removed_segments: 7,
+            retention_failures: 1,
+            retention_last_error: Some("broken".into()),
+        };
+        seconds.set_state(state.clone());
+        seconds.bucket(6_000_000_000, &mut emit).records += 1;
+        seconds.finish(&mut emit);
+        assert_eq!(lines[0]["checkpoints_completed"], 3);
+        assert_eq!(lines[0]["retention_last_error"], "broken");
+        // A bucket whose state was not set has none (the state does not carry over to the next second).
+        assert!(lines[1].get("checkpoints_completed").is_none());
+        let merged = merge_series(&[lines]);
+        assert_eq!(merged[0]["writer"]["checkpoint_segment"], 100);
+        assert_eq!(merged[0]["writer"]["retention_removed_segments"], 7);
+        assert!(merged[1]["writer"].get("checkpoint_segment").is_none());
+        assert_eq!(state.to_json()["checkpoint_next_seq"], 120);
     }
 
     #[test]

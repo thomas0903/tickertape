@@ -142,9 +142,14 @@ let config = WriterConfig::default().retention(
 ```
 
 The writer runs retention once after recovery on open and after every successful checkpoint. After a background
-checkpoint the run is on the checkpoint thread and gives way, after the removal in progress, to the next checkpoint
-and to `close`; the run after the next checkpoint continues it, so a backlog shows as `segments.before_checkpoint`
-staying high in `tickertape status`, not as slower checkpoints (ADR 0044). Retention errors
+checkpoint the run is on the checkpoint thread and gives way, after the removal in progress, to `close`, and to the
+next checkpoint once it has removed as many segments as the checkpoint before it covered or has taken as long as that
+checkpoint, so that it keeps level with the writer even when checkpoints take longer than the interval between them,
+unless removing segments is slower than the checkpoints; the run after the next checkpoint
+continues it, so a backlog shows as `segments.before_checkpoint` staying high in `tickertape status`, not as slower
+checkpoints (ADR 0044). Segments at or after the checkpoint segment are never removed, so a writer whose checkpoints
+fall behind (it writes faster than the disk) also holds what it wrote since the last durable marker (`exposure`).
+Retention errors
 never fail open, append or checkpoint and never poison the writer. Check `Writer::last_retention_error()` for the
 most recent error (retained even after later successes), and `Writer::retention_report()` for cumulative counts,
 including removals completed before a subsequent failure. Neither is part of the recovery report.

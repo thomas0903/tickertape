@@ -5,6 +5,20 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
+- Fixed: with background checkpoints and size-based retention, retention removed only one segment per completed
+  checkpoint whenever checkpoints took longer than the interval between requests (a writer that outruns the disk), so
+  the journal grew far past its limit until the disk was full (issue #45; the long 1,024 B runs at `3fea1c0`). A
+  retention run on the checkpoint thread now gives way to a queued checkpoint only after it has handled as many
+  segments as the checkpoint it follows covered, or has taken as long as that checkpoint took, so it removes as many
+  segments as the writer fills unless removals are slower than the checkpoints; it still stops after the removal in
+  progress when `Writer::checkpoint`, `Writer::close` or dropping the writer waits for the thread. A queued background
+  checkpoint can therefore wait for that many removals, and up to about as long again as the checkpoint before it,
+  instead of one removal. ADR 0044 is amended; crash contract C14, ADR 0038, `docs/operations.md` and the `Writer::request_checkpoint` documentation
+  say the same. Nothing changes in the C ABI or the bindings, which run the same code.
+- Added (`tt-sustained`): the writer's per-second series and result record the checkpoints completed, the marker's
+  position, the segments retention removed, its failures and last error, also as they stood before the final blocking
+  checkpoint (`at_run_end`); a writer that stops with an error writes them to `writer-failure.json`, and the command
+  prints them.
 - Changed: retention no longer holds up checkpoints and `close` behind a writer that outruns the disk, and deleting a
   segment no longer reads it in full (issue #45, ADR 0044). The C ABI and the bindings run the same code, so the same
   applies to them; nothing is added to them. Not additive; every change a caller can see:

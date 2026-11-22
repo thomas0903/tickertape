@@ -78,7 +78,9 @@ as they are, and the bytes stored during the call lie after the frontier, which 
 `Flush`'s documentation). Rolled-past segments stay open and mapped (through their `Flush`) until their job has synced
 them. Retention: the writer's retention runs on the checkpoint thread after each successful job, so it is ordered with
 the jobs (amended 2026-11-22 by ADR [0044](0044-retention-without-a-backlog-wait.md): the run stops before its next
-removal when a job is queued or the writer waits for the thread, and the run after the next job continues it); any
+removal when the writer waits for the thread, or when a job is queued and the run has handled as many segments as the
+job before it covered or has taken as long as that job (amended 2026-11-23), and the run after the next job continues
+it); any
 retention (the writer's or `tickertape archive`) removes only sealed segments strictly before the marker on disk, and
 every segment a job syncs is at or after that marker's segment, so retention cannot remove one (and the
 job holds the file open in any case). The abandoned-write path syncs on the writer's thread under the same lock that a
@@ -125,7 +127,8 @@ The owner decided the questions this ADR left open:
 - No separate public call that waits without checkpointing: polling `checkpoint_progress` does that.
 - Retention stays on the checkpoint thread, after each successful background checkpoint. (Amended 2026-11-22 by ADR
   [0044](0044-retention-without-a-backlog-wait.md): `checkpoint()`, `close()` and drop no longer wait for the whole
-  run on the checkpoint thread, only for the removal in progress; a run also gives way to a queued job. A blocking
+  run on the checkpoint thread, only for the removal in progress; a run also gives way to a queued job once it has
+  removed as many segments as the job before it covered, or taken as long as that job. A blocking
   `checkpoint()` still runs retention to the end on the calling thread afterwards.)
 - Coalescing (a request made while one checkpoint waits joins it) is the semantics the bindings will expose.
 - The abandoned-write path may wait for a background checkpoint (it takes the same lock); it is a rare path.

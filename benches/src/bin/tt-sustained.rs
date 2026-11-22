@@ -18,9 +18,10 @@ use serde_json::{Value, json};
 use tickertape::retention::{Action, Policy};
 use tickertape::{Error, HelperCpus, NewRecord, Reader, Writer, WriterConfig, clock};
 use tickertape_bench::sustained::{
-    CpuSnapshot, PositionFile, ReaderSpec, Schedule, Seconds, SeriesFile, WaitMode, describe_slot,
-    format_duration, free_bytes, lag_json, lag_records, merge_series, parse_cpu_list,
-    parse_duration, pin_current_thread, quantiles_json, record_bytes, total_ram_bytes,
+    CpuSnapshot, PositionFile, ReaderSpec, Schedule, Seconds, SeriesFile, WaitMode, WriterState,
+    describe_slot, format_duration, free_bytes, lag_json, lag_records, merge_series,
+    parse_cpu_list, parse_duration, pin_current_thread, quantiles_json, record_bytes,
+    total_ram_bytes,
 };
 use tickertape_bench::{Options, Result, elapsed_ns, fresh_directory, segment_capacity};
 
@@ -106,7 +107,10 @@ the dirty data a checkpoint finds stays small.
 Lag samples are the writer's next sequence (published by the writer about every 1 ms) minus the reader's,
 in records and journal bytes. CPU usage comes from getrusage for each process (all threads) and, on Linux,
 for the measuring thread alone. The series has one line per wall-clock second (UTC), keyed by when each
-operation started in its process. CI runs are functional smoke checks, never results.
+operation started in its process. The writer's series lines and result also carry its checkpoint and retention
+counters (at_run_end: before the final blocking checkpoint, which runs retention to the end). A writer that stops
+with an error writes them to OUT/writer-failure.json, and the command prints them. CI runs are functional smoke
+checks, never results.
 
 Internal child commands: writer|reader with the same options plus --control <DIR> (and --index <N>).";
 
@@ -543,6 +547,17 @@ fn host_json(config: &Config) -> Value {
 }
 
 fn run(config: &Config, args: &[String]) -> Result<()> {
+    run_session(config, args).inspect_err(|_| {
+        if let Ok(failure) = fs::read_to_string(config.out.join(WRITER_FAILURE)) {
+            eprintln!(
+                "tt-sustained: writer counters at the failure: {}",
+                failure.trim()
+            );
+        }
+    })
+}
+
+fn run_session(config: &Config, args: &[String]) -> Result<()> {
     fresh_directory(&config.dir)?;
     fresh_directory(&config.out)?;
     let (dir, out) = (config.dir.canonicalize()?, config.out.canonicalize()?);
@@ -972,6 +987,51 @@ fn settle(
     Ok(())
 }
 
+/// The writer's checkpoint and retention counters now, for the per-second series and for a failed run's
+/// `writer-failure.json`. `generation_at_open` is the marker's generation when the writer opened (0 without one).
+fn writer_state(writer: &Writer, generation_at_open: u64) -> WriterState {
+    let metrics = writer.metrics();
+    let report = writer.retention_report();
+    WriterState {
+        checkpoints_completed: metrics
+            .checkpoint
+            .map_or(0, |c| c.generation.saturating_sub(generation_at_open)),
+        checkpoint_next_seq: metrics.checkpoint.map(|c| c.next_seq),
+        checkpoint_segment: metrics.checkpoint.map(|c| c.segment_base_seq),
+        retention_removed_segments: report.removed_segments,
+        retention_failures: metrics.retention_failures,
+        retention_last_error: writer.last_retention_error().map(|e| e.to_string()),
+    }
+}
+
+/// Written to `<out>/writer-failure.json` when the writer stops with an error, so that a failed run still records
+/// where its checkpoints and retention stood (issue #45).
+fn write_failure(
+    config: &Config,
+    writer: &Writer,
+    generation_at_open: u64,
+    error: &dyn std::fmt::Display,
+    counts: Value,
+) {
+    let state = writer_state(writer, generation_at_open);
+    let mut failure = json!({"error": error.to_string(), "next_seq": writer.next_seq(),
+        "uncheckpointed_bytes": writer.metrics().uncheckpointed_bytes,
+        "retention_removed_bytes": writer.retention_report().removed_bytes});
+    if let (Value::Object(fields), Value::Object(extra), Value::Object(counts)) =
+        (&mut failure, state.to_json(), counts)
+    {
+        fields.extend(extra);
+        fields.extend(counts);
+    }
+    let path = config.out.join(WRITER_FAILURE);
+    if let Err(e) = fs::write(&path, format!("{failure}\n")) {
+        eprintln!("tt-sustained: could not write {}: {e}", path.display());
+    }
+}
+
+/// The writer's counters when it stopped with an error (see [`write_failure`]).
+const WRITER_FAILURE: &str = "writer-failure.json";
+
 fn writer(config: &Config) -> Result<()> {
     let control = config.control.as_ref().ok_or("missing control directory")?;
     let mut writer_config = WriterConfig::default()
@@ -983,6 +1043,7 @@ fn writer(config: &Config) -> Result<()> {
         writer_config = writer_config.retention(policy, Action::Delete);
     }
     let mut writer = Writer::open(&config.dir, writer_config)?;
+    let generation_at_open = writer.metrics().checkpoint.map_or(0, |c| c.generation);
     let position_file = PositionFile::open(&control.join("writer.pos"))?;
     let series = SeriesFile::create(&config.out.join("writer.series.jsonl"))?;
     let payload = vec![PAYLOAD_BYTE; config.payload];
@@ -1038,157 +1099,190 @@ fn writer(config: &Config) -> Result<()> {
     let mut last_end = None;
     let mut sent_count = 0u64;
     let mut schedule_wait_ns = 0u64;
-    let stopped_by;
-    loop {
-        let (intended, sent) = match config.planned {
-            Some(planned) => {
-                if sent_count == planned {
-                    stopped_by = "schedule_end";
-                    break;
-                }
-                let intended = config.schedule.intended_ns(t0, sent_count)?;
-                let mut entered = None;
-                let sent = loop {
-                    let now = clock::realtime_ns();
-                    entered.get_or_insert(now);
-                    if now >= intended {
-                        break now;
+    // The loop runs in a closure so that an error still reaches `write_failure` with the writer's counters.
+    let outcome = (|| -> Result<&'static str> {
+        let stopped_by;
+        loop {
+            let (intended, sent) = match config.planned {
+                Some(planned) => {
+                    if sent_count == planned {
+                        stopped_by = "schedule_end";
+                        break;
                     }
-                    std::hint::spin_loop();
-                };
-                schedule_wait_ns += sent - entered.unwrap_or(sent);
-                if sent > overrun_end {
-                    stopped_by = "overrun_limit";
-                    break;
-                }
-                (intended, sent)
-            }
-            None => {
-                let sent = clock::realtime_ns();
-                if sent >= end {
-                    stopped_by = "duration";
-                    break;
-                }
-                (sent, sent)
-            }
-        };
-        let delay = sent - intended;
-        let seq = writer.next_seq();
-        let is_roll = seq != 0 && seq % config.capacity == 0;
-        let start = Instant::now();
-        writer.append(&NewRecord {
-            schema_id: 1,
-            venue_ts_ns: 0,
-            local_ts_ns: intended,
-            payload: &payload,
-        })?;
-        let elapsed = start.elapsed();
-        let append_ns = elapsed_ns(elapsed)?;
-        position.store(seq + 1, Ordering::Release);
-        first.get_or_insert(start);
-        last_end = Some(start + elapsed);
-        sent_count += 1;
-        if delay > 1_000 {
-            late += 1;
-        }
-        max_delay = max_delay.max(delay);
-        if intended >= measure_from {
-            append.record(append_ns)?;
-            if is_roll {
-                roll.record(append_ns)?;
-            }
-        }
-        rolls += u64::from(is_roll);
-        let bucket = seconds.bucket(sent, &mut emit);
-        bucket.records += 1;
-        bucket.late += u64::from(delay > 1_000);
-        bucket.schedule_delay_max_ns = bucket.schedule_delay_max_ns.max(delay);
-        bucket.latency.record(append_ns)?;
-        if is_roll {
-            bucket.rolls += 1;
-            bucket.roll_max_ns = bucket.roll_max_ns.max(append_ns);
-        }
-        if !in_flight.is_empty() {
-            let polled = Instant::now();
-            let progress = writer.checkpoint_progress()?;
-            let work = append_ns.saturating_add(elapsed_ns(polled.elapsed())?);
-            for request in &mut in_flight {
-                request.pause_ns = request.pause_ns.max(work);
-            }
-            settle(&writer, &progress, &mut in_flight, &mut durable, &mut pause)?;
-        }
-        let due = match config.checkpoint {
-            Checkpoint::None => false,
-            Checkpoint::Every(_) => sent >= next_checkpoint,
-            Checkpoint::Records(n) => sent_count % n == 0,
-        };
-        if due {
-            let wall = clock::realtime_ns();
-            let start = Instant::now();
-            let measured = wall >= measure_from;
-            // One clock reading for the call, used for its latency and its pause alike: a second reading would add
-            // whatever ran (or preempted the thread) in between to one of them only.
-            let ns = match config.checkpoint_mode {
-                CheckpointMode::Blocking => {
-                    writer.checkpoint()?;
-                    let ns = elapsed_ns(start.elapsed())?;
-                    if measured {
-                        durable.record(ns)?;
-                        pause.record(ns)?;
+                    let intended = config.schedule.intended_ns(t0, sent_count)?;
+                    let mut entered = None;
+                    let sent = loop {
+                        let now = clock::realtime_ns();
+                        entered.get_or_insert(now);
+                        if now >= intended {
+                            break now;
+                        }
+                        std::hint::spin_loop();
+                    };
+                    schedule_wait_ns += sent - entered.unwrap_or(sent);
+                    if sent > overrun_end {
+                        stopped_by = "overrun_limit";
+                        break;
                     }
-                    ns
+                    (intended, sent)
                 }
-                CheckpointMode::Background => {
-                    requests_while_in_flight += u64::from(!in_flight.is_empty());
-                    let covers = writer.request_checkpoint()?;
-                    let ns = elapsed_ns(start.elapsed())?;
-                    in_flight.push_back(InFlight {
-                        covers,
-                        requested: start,
-                        measured,
-                        pause_ns: ns,
-                    });
-                    ns
+                None => {
+                    let sent = clock::realtime_ns();
+                    if sent >= end {
+                        stopped_by = "duration";
+                        break;
+                    }
+                    (sent, sent)
                 }
             };
-            checkpoints += 1;
-            if measured {
-                checkpoint.record(ns)?;
+            if seconds.is_new_second(sent) {
+                seconds.set_state(writer_state(&writer, generation_at_open));
             }
-            let bucket = seconds.bucket(wall, &mut emit);
-            bucket.checkpoints += 1;
-            bucket.checkpoint_max_ns = bucket.checkpoint_max_ns.max(ns);
-            if let Checkpoint::Every(every) = config.checkpoint {
-                // Keep the fixed grid; count grid points that passed while the writer was busy.
-                let every = u64::try_from(every.as_nanos())?;
-                next_checkpoint = next_checkpoint.saturating_add(every);
-                let now = clock::realtime_ns();
-                while next_checkpoint <= now {
+            let delay = sent - intended;
+            let seq = writer.next_seq();
+            let is_roll = seq != 0 && seq % config.capacity == 0;
+            let start = Instant::now();
+            writer.append(&NewRecord {
+                schema_id: 1,
+                venue_ts_ns: 0,
+                local_ts_ns: intended,
+                payload: &payload,
+            })?;
+            let elapsed = start.elapsed();
+            let append_ns = elapsed_ns(elapsed)?;
+            position.store(seq + 1, Ordering::Release);
+            first.get_or_insert(start);
+            last_end = Some(start + elapsed);
+            sent_count += 1;
+            if delay > 1_000 {
+                late += 1;
+            }
+            max_delay = max_delay.max(delay);
+            if intended >= measure_from {
+                append.record(append_ns)?;
+                if is_roll {
+                    roll.record(append_ns)?;
+                }
+            }
+            rolls += u64::from(is_roll);
+            let bucket = seconds.bucket(sent, &mut emit);
+            bucket.records += 1;
+            bucket.late += u64::from(delay > 1_000);
+            bucket.schedule_delay_max_ns = bucket.schedule_delay_max_ns.max(delay);
+            bucket.latency.record(append_ns)?;
+            if is_roll {
+                bucket.rolls += 1;
+                bucket.roll_max_ns = bucket.roll_max_ns.max(append_ns);
+            }
+            if !in_flight.is_empty() {
+                let polled = Instant::now();
+                let progress = writer.checkpoint_progress()?;
+                let work = append_ns.saturating_add(elapsed_ns(polled.elapsed())?);
+                for request in &mut in_flight {
+                    request.pause_ns = request.pause_ns.max(work);
+                }
+                settle(&writer, &progress, &mut in_flight, &mut durable, &mut pause)?;
+            }
+            let due = match config.checkpoint {
+                Checkpoint::None => false,
+                Checkpoint::Every(_) => sent >= next_checkpoint,
+                Checkpoint::Records(n) => sent_count % n == 0,
+            };
+            if due {
+                let wall = clock::realtime_ns();
+                let start = Instant::now();
+                let measured = wall >= measure_from;
+                // One clock reading for the call, used for its latency and its pause alike: a second reading would add
+                // whatever ran (or preempted the thread) in between to one of them only.
+                let ns = match config.checkpoint_mode {
+                    CheckpointMode::Blocking => {
+                        writer.checkpoint()?;
+                        let ns = elapsed_ns(start.elapsed())?;
+                        if measured {
+                            durable.record(ns)?;
+                            pause.record(ns)?;
+                        }
+                        ns
+                    }
+                    CheckpointMode::Background => {
+                        requests_while_in_flight += u64::from(!in_flight.is_empty());
+                        let covers = writer.request_checkpoint()?;
+                        let ns = elapsed_ns(start.elapsed())?;
+                        in_flight.push_back(InFlight {
+                            covers,
+                            requested: start,
+                            measured,
+                            pause_ns: ns,
+                        });
+                        ns
+                    }
+                };
+                checkpoints += 1;
+                if measured {
+                    checkpoint.record(ns)?;
+                }
+                if seconds.is_new_second(wall) {
+                    seconds.set_state(writer_state(&writer, generation_at_open));
+                }
+                let bucket = seconds.bucket(wall, &mut emit);
+                bucket.checkpoints += 1;
+                bucket.checkpoint_max_ns = bucket.checkpoint_max_ns.max(ns);
+                if let Checkpoint::Every(every) = config.checkpoint {
+                    // Keep the fixed grid; count grid points that passed while the writer was busy.
+                    let every = u64::try_from(every.as_nanos())?;
                     next_checkpoint = next_checkpoint.saturating_add(every);
-                    overruns += 1;
+                    let now = clock::realtime_ns();
+                    while next_checkpoint <= now {
+                        next_checkpoint = next_checkpoint.saturating_add(every);
+                        overruns += 1;
+                    }
                 }
             }
         }
-    }
+        Ok(stopped_by)
+    })();
+    // Where checkpoints and retention stood when the writer stopped sending, before the drain and the final blocking
+    // checkpoint below (which runs retention to the end on this thread and so hides a backlog; issue #45).
+    let at_run_end = writer_state(&writer, generation_at_open);
+    seconds.set_state(at_run_end.clone());
     seconds.finish(&mut emit);
-    // Let the background checkpoints in flight finish, so each gets its durable time.
-    let drain_deadline = Instant::now() + Duration::from_secs(120);
-    while !in_flight.is_empty() {
-        let progress = writer.checkpoint_progress()?;
-        settle(&writer, &progress, &mut in_flight, &mut durable, &mut pause)?;
-        if Instant::now() >= drain_deadline {
-            return Err(
-                "background checkpoints did not finish within 120 s of the run's end".into(),
-            );
+    let finished = outcome.and_then(|stopped_by| {
+        // Let the background checkpoints in flight finish, so each gets its durable time.
+        let drain_deadline = Instant::now() + Duration::from_secs(120);
+        while !in_flight.is_empty() {
+            let progress = writer.checkpoint_progress()?;
+            settle(&writer, &progress, &mut in_flight, &mut durable, &mut pause)?;
+            if Instant::now() >= drain_deadline {
+                return Err(
+                    "background checkpoints did not finish within 120 s of the run's end".into(),
+                );
+            }
+            std::thread::sleep(Duration::from_micros(100));
         }
-        std::thread::sleep(Duration::from_micros(100));
-    }
-    let final_checkpoint_us = if config.checkpoint == Checkpoint::None {
-        None
-    } else {
-        let start = Instant::now();
-        writer.checkpoint()?;
-        Some(start.elapsed().as_secs_f64() * 1e6)
+        let final_checkpoint_us = if config.checkpoint == Checkpoint::None {
+            None
+        } else {
+            let start = Instant::now();
+            writer.checkpoint()?;
+            Some(start.elapsed().as_secs_f64() * 1e6)
+        };
+        Ok((stopped_by, final_checkpoint_us))
+    });
+    let (stopped_by, final_checkpoint_us) = match finished {
+        Ok(finished) => finished,
+        Err(error) => {
+            write_failure(
+                config,
+                &writer,
+                generation_at_open,
+                &error,
+                json!({"count": sent_count, "rolls": rolls, "checkpoints_requested": checkpoints,
+                    "at_run_end": at_run_end.to_json()}),
+            );
+            drop(tx);
+            let _ = sampler.finish();
+            return Err(error);
+        }
     };
     drop(tx);
     let cpu_end = CpuSnapshot::process()?;
@@ -1215,6 +1309,7 @@ fn writer(config: &Config) -> Result<()> {
         "checkpoint_pause": quantiles_json(&pause, "us", 1e3),
         "checkpoint_requests_while_in_flight": requests_while_in_flight,
         "final_checkpoint_us": final_checkpoint_us,
+        "at_run_end": at_run_end.to_json(),
         "retention": {"removed_segments": report.removed_segments, "removed_bytes": report.removed_bytes,
             "already_removed_segments": report.already_removed_segments,
             "last_error": writer.last_retention_error().map(|e| e.to_string())},

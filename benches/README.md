@@ -244,7 +244,10 @@ facts, the start time, and
 - writer: `count`, `planned_records`, `unsent_records`, `stopped_by`, `achieved_records_per_s`,
   `achieved_payload_mb_per_s` (decimal, payload only), `intended_records_per_s`, `late_records` (more than 1 µs after
   the intended time), `max_schedule_delay_us`, `append_latency`, `roll_append_latency`, `checkpoint_latency`,
-  `final_checkpoint_us`, `rolls`, `checkpoints`, retention counts and last error;
+  `final_checkpoint_us`, `rolls`, `checkpoints`, retention counts and last error, and `at_run_end`: where checkpoints
+  and retention stood when the writer stopped sending, before the final blocking checkpoint, which runs retention to
+  the end and so hides a backlog (`checkpoints_completed`, `checkpoint_next_seq`, `checkpoint_segment`,
+  `retention_removed_segments`, `retention_failures`, `retention_last_error`);
 - per reader: `latency` (`latency_kind` is `visible` or `durable_only`), `lag` (`samples`, then
   min/p50/.../max in `_records` and `_bytes`; bytes are records × journal bytes per record), read/skipped/remaining
   counts and `drained`;
@@ -260,10 +263,15 @@ Latency and lag statistics are min/p50/p90/p99/p99.9/p99.99/max from HdrHistogra
 **Time series.** `OUT/series.jsonl` has one line per wall-clock second (`t_unix_s`, `t_utc`), from the first to the
 last second of the run, with the writer's records, late sends, maximum schedule delay, append maximum and p99,
 checkpoints and rolls (count and maximum), position and CPU fractions, and per reader the records received, latency
-maximum and p99, skipped records, maximum lag in records and bytes, and CPU fractions. Operations are attributed to
+maximum and p99, skipped records, maximum lag in records and bytes, and CPU fractions. The writer's line also has the
+`at_run_end` fields as they stood at the end of that second. Operations are attributed to
 the second in which they started in their process (a reader: when it received the record), so a writer stall shows
 at its start and the readers' latency where they saw it. Timestamps are `CLOCK_REALTIME`, the clock eBPF tools print
 with wall-clock timestamps. The raw per-process files (`writer.series.jsonl`, `reader-N.series.jsonl`) stay next to it.
+
+**A failed run** writes no `result.json`. If the writer stopped with an error (for example a full disk), it writes
+`OUT/writer-failure.json` with the error, the counts so far and the `at_run_end` fields at the failure, and the
+command prints it; the per-process series files are kept.
 
 **Measurement cost.** Per append: two monotonic clock reads, two histogram increments (three on a roll), a
 per-second bucket update and one release store of the position. Per received record: one wall-clock read, two

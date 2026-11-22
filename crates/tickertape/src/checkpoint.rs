@@ -11,8 +11,11 @@
 //! The checkpoint thread is started by the first request, named `tickertape-checkpoint`, runs one job at a time in
 //! request order (at most one more waits, and later requests extend it), runs the configured retention after each
 //! successful job, and is joined when the writer is dropped, after it has finished every requested job. A retention
-//! run there stops before its next removal once a job is queued or the writer waits for the thread (ADR 0044):
-//! the rest is left for the run after the next job, so neither a checkpoint nor `close` waits for a retention backlog.
+//! run there stops before its next removal once the writer waits for the thread, or once a job is queued and the run
+//! has handled as many planned segments as the job before it covered or has taken as long as that job (ADR 0044,
+//! amended for issue #45): the rest is left for the run after the next job, so neither a checkpoint nor `close` waits
+//! for a retention backlog, and under a constant queue of checkpoints retention still removes as many segments as the
+//! writer fills unless removing them takes longer than the checkpoints.
 
 use std::collections::BTreeSet;
 use std::fs::File;
@@ -394,14 +397,15 @@ pub(crate) struct RetentionOutcome {
     pub(crate) failures: u64,
 }
 
-/// One retention run on the checkpoint thread: plan, then apply into `report`, stopping after the first planned segment
-/// as soon as `stop` returns true; the error, if any.
+/// One retention run on the checkpoint thread: plan, then apply into `report`, stopping before the next planned
+/// segment once `stop(handled)` returns true for the number of planned segments handled so far (never before the
+/// first); the error, if any.
 pub(crate) fn retention_pass(
     dir: &std::path::Path,
     policy: &Policy,
     action: &Action,
     report: &mut Report,
-    stop: &dyn Fn() -> bool,
+    stop: &dyn Fn(usize) -> bool,
 ) -> Option<Error> {
     crate::retention::plan_until(dir, policy, stop)
         .and_then(|plan| {
@@ -463,10 +467,18 @@ impl State {
             .saturating_add(self.queued.as_ref().map_or(0, Job::bytes))
     }
 
-    /// Whether a retention run should stop before its next removal: a job waits, the writer waits for the thread to
-    /// be idle, or the thread is stopping.
-    fn retention_should_stop(&self) -> bool {
-        self.queued.is_some() || self.waiters > 0 || self.stop
+    /// Whether a retention run that has handled `handled` planned segments should stop before its next removal: the
+    /// writer waits for the thread to be idle or the thread is stopping, or a job waits and the run has either handled
+    /// `covered` segments, the number the job it follows covered, or used its time (`out_of_time`: as long as that job
+    /// took); at least one segment in every case (ADR 0044). Removing what each checkpoint covered keeps retention
+    /// level with the writer when checkpoints are slower than the requests and a job always waits (issue #45); the
+    /// time limit keeps a waiting checkpoint from waiting longer again than the one before it took when removals are
+    /// slow.
+    fn retention_should_stop(&self, handled: usize, covered: usize, out_of_time: bool) -> bool {
+        handled >= 1
+            && (self.waiters > 0
+                || self.stop
+                || (self.queued.is_some() && (handled >= covered || out_of_time)))
     }
 
     fn add_retention(&mut self, report: &Report, error: Option<Error>) {
@@ -584,6 +596,7 @@ fn run_thread(shared: &Shared, ctx: &Context, retention: Option<&(Policy, Action
                     .unwrap_or_else(|e| e.into_inner());
             }
         };
+        let started = Instant::now();
         let outcome = panic::catch_unwind(AssertUnwindSafe(|| run(&job, ctx, On::Background)))
             .unwrap_or_else(|_| {
                 *lock(&ctx.lost) = true;
@@ -595,6 +608,7 @@ fn run_thread(shared: &Shared, ctx: &Context, retention: Option<&(Policy, Action
             });
         let finished = Instant::now();
         let bytes = job.bytes();
+        let covered = job.segments.iter().count();
         drop(job);
         match outcome {
             Ok(slot) => {
@@ -604,7 +618,12 @@ fn run_thread(shared: &Shared, ctx: &Context, retention: Option<&(Policy, Action
                 });
                 if let Some((policy, action)) = retention {
                     let mut report = Report::default();
-                    let stop = || lock(&shared.state).retention_should_stop();
+                    // While a job waits, the run may take as long as this job took.
+                    let deadline = Instant::now() + finished.saturating_duration_since(started);
+                    let stop = |handled| {
+                        let out_of_time = Instant::now() >= deadline;
+                        lock(&shared.state).retention_should_stop(handled, covered, out_of_time)
+                    };
                     let error = panic::catch_unwind(AssertUnwindSafe(|| {
                         retention_pass(&ctx.dir, policy, action, &mut report, &stop)
                     }))
