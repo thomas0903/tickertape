@@ -1,8 +1,10 @@
 """Session runner: plan order, scenario sizing, estimates and resume. Run: python3 -m unittest discover -s benches"""
 import json
 from pathlib import Path
+import signal
 import tempfile
 import unittest
+from unittest import mock
 
 import session
 
@@ -179,6 +181,38 @@ class EstimateAndResumeTests(unittest.TestCase):
         (again / "owner.txt").write_text("someone else")
         with self.assertRaises(SystemExit):
             session.reset_scratch(journal, self.out / "o")
+
+
+class CompareOnlyTests(unittest.TestCase):
+    def test_compare_only_session_creates_its_log_directory(self):
+        """--only compare on a fresh output directory opens logs/compare.log without a tickertape run before it."""
+        class Runner:  # Stands in for compare/run.py's process.
+            pid = 0
+
+            def __init__(self, command, stdout, **kwargs):
+                stdout.write("comparison ran\n")
+
+            def wait(self):
+                return 0
+
+            def poll(self):
+                return 0
+        handlers = {sig: signal.getsignal(sig) for sig in (signal.SIGTERM, signal.SIGHUP)}
+        self.addCleanup(lambda: [signal.signal(sig, h) for sig, h in handlers.items()])
+        with tempfile.TemporaryDirectory() as tmp:
+            journal, out = Path(tmp) / "fs", Path(tmp) / "out"
+            journal.mkdir()
+            # Every other subprocess of the session is replaced too, since Popen is patched for the whole module.
+            with mock.patch.object(session, "compare_estimate", return_value=0), \
+                    mock.patch.object(session, "capture_environment"), \
+                    mock.patch.object(session, "capture", return_value=""), \
+                    mock.patch.object(session, "host_facts", return_value={"ram": 16 * GIB, "free": 500 * GIB}), \
+                    mock.patch.object(session.subprocess, "Popen", Runner):
+                status = session.main(["--journal-dir", str(journal), "--out", str(out), "--quick", "--only", "compare",
+                                       "--yes"])
+            self.assertEqual(status, 0)
+            self.assertEqual((out / "logs" / "compare.log").read_text(), "comparison ran\n")
+            self.assertEqual(json.loads((out / "manifest.json").read_text())["compare"]["status"], "done")
 
 
 if __name__ == "__main__":
