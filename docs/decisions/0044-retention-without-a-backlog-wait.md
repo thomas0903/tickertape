@@ -125,14 +125,15 @@ field is added.
   `damaged_record_in_a_sealed_segment_is_deleted_but_never_moved`, `::broken_seal_is_never_removed` (a damaged seal, no
   seal, and a seal naming another segment, before and after the plan, under each action),
   `::deletion_takes_the_last_non_zero_bytes_for_the_seal`.
-- Still to measure: the 1,024-byte sustained scenarios with background checkpoints and 64 GiB of retention on the
-  machines of issue #45, and the 64-byte runs at 90 % of the probe rate (`docs/benchmarks.md` → Operating envelope).
-  Under sustained overload retention can now fall behind instead of holding up the checkpoints; whether it keeps up
-  there, and the storage it needs meanwhile, is what those runs show. They are recorded in `docs/benchmarks.md` →
+- Measured after this decision: the 1,024-byte sustained scenarios with background checkpoints and 64 GiB of
+  retention on the machines of issue #45, and the 64-byte runs at 90 % of the probe rate (`docs/benchmarks.md` →
+  Operating envelope). Under sustained overload retention can now fall behind instead of holding up the
+  checkpoints; whether it keeps up there, and the storage it needs meanwhile, is what those runs show. They are recorded in `docs/benchmarks.md` →
   Second sustained session and → Long verified runs (`3fea1c0`): every session run finished; in the long runs
   retention removed almost nothing and the disk filled. The 10-minute probes did not keep the journal at its limit
   either: the benchmark's final blocking checkpoint removed the backlog before the result was written. The cause and
-  the change are the amendment of 2026-11-23 below (issue #45).
+  the change are the amendment of 2026-11-23 below (issue #45); the long runs at the amended code are recorded in
+  `docs/benchmarks.md` → Confirming long runs (`fbe5785`).
 - Format version 1 is unchanged; no `unsafe` was added; nothing changes in the C ABI or the bindings, which use the
   Rust retention code.
 
@@ -203,3 +204,9 @@ for a second, far longer than the removals take.
 records, each second and in the result, the checkpoints completed, the marker's position, the segments retention
 removed, its failures and last error, also as they stood before the final blocking checkpoint (`at_run_end`), and a
 writer that stops with an error writes them to `writer-failure.json` (`benches/README.md`).
+
+**Measured.** The long runs that filled the disk, repeated for the full hour at the amended code (`fbe5785`, x86-64
+ext4 and aarch64 xfs), completed: retention removed segments while the writer ran, with no error, and kept the journal
+at its limit plus what the writer wrote since the last durable checkpoint, checkpoints became durable tens of seconds
+after their request, and `tickertape verify` found both journals intact (`docs/benchmarks.md` → Confirming long runs,
+and → Operating envelope). An archiving writer under a constant queue of checkpoints is not measured.

@@ -199,10 +199,11 @@ compare them with its own thresholds; any of the three can be added to the C ABI
 2. The 1.0 fixtures: add them at release (`docs/playbooks/release-checklist.md`, ADR 0033), as for every release.
 3. The roadmap's release-candidate exercise (release, installation and upgrade instructions and the external
    integration against a release candidate): an RC tag needs the owner's approval. Run it before tagging 1.0.
-4. The open part of the sustained session: its results and the operating envelope are recorded in
-   `docs/benchmarks.md` (2026-11-19 to 2026-11-22) for both payloads, the 1,024 B scenarios with background checkpoints
-   at `3fea1c0` (every run finished). The record checksum mismatch of the 1,024 B probe at `279f59a` is resolved
-   (issue #43, closed after the long verified runs; the platform mechanism is not confirmed). Retention removed almost
-   nothing in the long runs because, with a checkpoint always queued, it removed one segment per checkpoint (issue #45;
-   ADR 0044, amendment of 2026-11-23). Still to do: a long run with background checkpoints that completes at the
-   release's code, its journal verified from the file afterwards.
+4. The sustained session: its results and the operating envelope are recorded in `docs/benchmarks.md` (2026-11-19 to
+   2026-11-22) for both payloads, the 1,024 B scenarios with background checkpoints at `3fea1c0` (every run finished).
+   The record checksum mismatch of the 1,024 B probe at `279f59a` is resolved (issue #43, closed after the long verified
+   runs; the platform mechanism is not confirmed). Retention behind an overloaded writer is resolved (issue #45, closed;
+   ADR 0044, amendment of 2026-11-23): long runs with background checkpoints that complete, each journal verified from
+   the file afterwards, are recorded at `fbe5785` (`docs/benchmarks.md` → Confirming long runs). Still to do, only if
+   the writer's checkpoint or retention code changes after `fbe5785`: repeat that run at the release's code before
+   tagging 1.0.

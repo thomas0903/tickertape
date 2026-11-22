@@ -5,6 +5,15 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
+- Docs: `docs/benchmarks.md` records the confirming long runs for issue #45 at `fbe5785` (Google Cloud VMs with local
+  NVMe SSD, x86-64 ext4 and aarch64 xfs; the unpaced 1,024 B long run that filled the disk at `3fea1c0`, for the full
+  3,600 s): both runs completed, retention removed 8,796–8,965 segments with no error and kept the journal at
+  64.3–82.3 GiB against its 64 GiB limit, checkpoints were durable 39–71 s after their request at p50, no reader
+  reported corruption and `tickertape verify` found both journals intact. The operating envelope now states the
+  retention limit of `3fea1c0` as addressed and measured, and what remains (durability tens of seconds behind a writer
+  that outruns the disk, the journal over its limit by what was written since the last durable checkpoint, an
+  archiving writer under queued checkpoints not measured). The roadmap ticks "Make sustained performance the next
+  release's main objective"; `docs/compatibility.md` → Before 1.0 item 4 and ADR 0044 point to the runs.
 - Fixed: with background checkpoints and size-based retention, retention removed only one segment per completed
   checkpoint whenever checkpoints took longer than the interval between requests (a writer that outruns the disk), so
   the journal grew far past its limit until the disk was full (issue #45; the long 1,024 B runs at `3fea1c0`). A
