@@ -5,6 +5,31 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
+- Changed: retention no longer holds up checkpoints and `close` behind a writer that outruns the disk, and deleting a
+  segment no longer reads it in full (issue #45, ADR 0044). The C ABI and the bindings run the same code, so the same
+  applies to them; nothing is added to them. Not additive; every change a caller can see:
+  - A deletion (`Action::Delete`, the writer's retention, `tickertape archive --delete`) checks the segment's header,
+    its successor's header and position, the checkpoint, and that the segment's last non-zero eight bytes, read back
+    from the end of the file, are a valid seal naming the successor; it no longer reads the records it discards. A
+    sealed segment with a damaged record is therefore deleted, where it was refused with `Error::Corrupt`; so is one
+    whose seal was lost if its last record ends, at an 8-byte boundary, with exactly the bytes of such a seal. When
+    the end is not such a seal, the whole segment is scanned as before and the error is unchanged.
+  - A move (`Action::MoveTo`, `tickertape archive --to`) still reads and validates the whole segment, now once instead
+    of twice (in `plan` and again in `apply`).
+  - `retention::plan` (and `tickertape archive --dry-run`) checks candidates as a deletion does: a sealed candidate with
+    a damaged record is listed instead of failing the plan, and a move then stops at it with `Error::Corrupt` after
+    moving the segments before it, where nothing was moved before.
+  - With background checkpoints, the writer's retention run on the checkpoint thread stops before its next removal
+    (after at least one planned segment) when another checkpoint is requested or `Writer::checkpoint`,
+    `Writer::close` or dropping the writer waits for the thread; the run after the next checkpoint continues. These
+    calls therefore wait for the removal in progress instead of the whole run, and segments that were eligible can
+    remain after `close` until a later retention run (for example the next writer's at open). Retention at open and
+    after a blocking `Writer::checkpoint` still runs to the end.
+  - Added (`fault-injection` feature, not covered by the compatibility promise): `fault::Point::RetentionRemove` and
+    `fault::Point::CheckpointWait`.
+  - Docs: crash contract C14 states what is checked before a deletion and before a move; ADRs 0016 and 0038 are
+    amended; `docs/benchmarks.md` (operating envelope), `docs/operations.md`, `docs/cli.md`, `docs/roadmap.md` and
+    `docs/compatibility.md` say what changed and that the 1,024 B sustained scenarios are still to be measured.
 - Fixed: a reader could report a record checksum mismatch (`Error::Corrupt`) for a record the writer had published
   correctly (issue #43). On aarch64 Linux (Google Cloud Axion VMs, kernel 7.0, ext4 and xfs) under memory pressure,
   readers that map a segment, including one written without tickertape code, saw a record whose commit word was

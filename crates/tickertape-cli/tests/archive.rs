@@ -170,13 +170,41 @@ fn move_with_age_and_conflict() {
     assert_eq!(inspect::list_segments(dest.path()).unwrap().len(), 4);
 }
 
+/// A damaged record in a candidate stops a move (exit 2), which validates every record; a deletion checks the seal
+/// and not the records it discards, so it removes the segment (ADR 0044). A damaged seal stops a deletion too.
 #[test]
 fn corrupt_candidate_exit_two_missing_journal_exit_one() {
     let (dir, _writer) = journal();
     let path = dir.path().join("00000000000000000000.tape");
     let mut data = fs::read(&path).unwrap();
     data[110] ^= 1;
-    fs::write(path, data).unwrap();
+    fs::write(&path, data).unwrap();
+    let dest = tempfile::tempdir().unwrap();
+    command()
+        .arg("archive")
+        .arg(dir.path())
+        .arg("--to")
+        .arg(dest.path())
+        .args(["--keep-segments", "0"])
+        .assert()
+        .code(2)
+        .stdout(predicate::str::is_empty());
+    assert_eq!(inspect::list_segments(dir.path()).unwrap().len(), 5);
+    assert_eq!(fs::read_dir(dest.path()).unwrap().count(), 0);
+    command()
+        .arg("archive")
+        .arg(dir.path())
+        .args(["--delete", "--keep-segments", "0"])
+        .assert()
+        .success();
+    assert_eq!(inspect::list_segments(dir.path()).unwrap().len(), 1);
+
+    // The seal right after the segment's one record (header 64 bytes, frame 40 + 40,000 bytes).
+    let (dir, _writer) = journal();
+    let path = dir.path().join("00000000000000000000.tape");
+    let mut data = fs::read(&path).unwrap();
+    data[64 + 40 + 40_000 + 4] ^= 1;
+    fs::write(&path, data).unwrap();
     command()
         .arg("archive")
         .arg(dir.path())
@@ -184,6 +212,7 @@ fn corrupt_candidate_exit_two_missing_journal_exit_one() {
         .assert()
         .code(2)
         .stdout(predicate::str::is_empty());
+    assert_eq!(inspect::list_segments(dir.path()).unwrap().len(), 5);
     command()
         .arg("archive")
         .arg(dir.path().join("missing"))

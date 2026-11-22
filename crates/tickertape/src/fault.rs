@@ -44,6 +44,13 @@ pub enum Point {
     RetentionCopySync,
     /// Syncing the destination directory after an archive rename or copy.
     RetentionDestinationSync,
+    /// Before each removal of the writer's retention run on its checkpoint thread, once the run has decided not to
+    /// stop there (ADR 0044). Hold it there with [`hold_background`].
+    RetentionRemove,
+    /// `Writer::checkpoint` or `Writer::close` has told the checkpoint thread that it is waiting for it (a retention
+    /// run there then stops after the removal in progress), and is about to wait. Arm with [`run_at`] on the thread
+    /// that calls them.
+    CheckpointWait,
     /// Preallocating the spare next segment on its background thread (arm with [`fail_next_background`]).
     SparePreallocate,
     /// Mapping the spare next segment on its background thread (arm with [`fail_next_background`]).

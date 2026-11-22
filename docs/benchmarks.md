@@ -999,8 +999,18 @@ commits stated above). Rates are of these machines and do not carry over to othe
   stall of 0.10–0.67 s in six of the eight 10-minute runs without checkpoints at `279f59a`, not explained and not
   re-measured after #38; the aarch64 mapped reader's 10 ms maximum in the finish round, not investigated.
 - **Remaining, open:** the record checksum mismatch that stopped a reader of the 1,024 B probe on both aarch64 VMs at
-  `279f59a`, and the time-out of the same probe on x86-64, are not explained; the 10,000- and 20,000-segment journals
-  and the 1,024 B sustained scenarios at the current code are not measured.
+  `279f59a` is issue #43 (readers now tolerate the lagging view, `crash-contract.md` → Known risks and limits); the
+  10,000- and 20,000-segment journals and the 1,024 B sustained scenarios at the
+  current code are not measured.
+- **Retention behind an overloaded writer (issue #45; being addressed by ADR 0044).** The time-out of the 1,024 B
+  probe on x86-64 (it also occurs on aarch64) comes from retention: before deleting a segment it read the whole segment
+  on the checkpoint thread, behind a writer that outran the disk the old segments were no longer in memory, retention
+  fell far behind, and the final checkpoint and the writer's shutdown waited for it; probably also the 64 B runs at
+  90 % of the probe that failed because background checkpoints did not finish in time. ADR 0044 changes this: a
+  deletion reads only the end of the segment back to its seal, and the writer's retention run gives way to a waiting
+  checkpoint and to `close` after the removal in progress. Not yet measured: the 1,024 B sustained scenarios with
+  background checkpoints and 64 GiB of retention, the 64 B scenarios at 90 % of the probe, and how far retention falls
+  behind under sustained overload now that it no longer holds up the checkpoints (the journal's size meanwhile).
 
 ## 2026-11-02, v0.3.0 on Linux (AWS) and macOS
 

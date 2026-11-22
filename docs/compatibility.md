@@ -204,4 +204,4 @@ compare them with its own thresholds; any of the three can be added to the C ABI
    checkpoints at the release's code, with the journal verified from the file after each run. The record checksum
    mismatch that stopped a reader of the 1,024 B probe on both aarch64 VMs at `279f59a` is issue #43 (readers now
    tolerate the lagging view; the platform mechanism and a long verified run on aarch64 are open), and the time-out of
-   the same probe on x86-64 is issue #45 (open).
+   the same probe on x86-64 is issue #45 (addressed by ADR 0044; open until the 1,024 B scenarios have run).

@@ -185,13 +185,13 @@ pub(crate) fn sync_dir(dir: &Path) -> Result<()> {
     crate::mmap::sync_all(&f).map_err(|e| Error::io("sync directory", dir, e))
 }
 
-/// Window size for [`scan_file`].
+/// Window size for [`scan_open`].
 pub(crate) const SCAN_WINDOW: usize = 1 << 20;
 
 /// A [`format::SegmentView`] over a segment file read with `pread` in windows, so that scanning a segment needs memory
 /// for one window of at most [`SCAN_WINDOW`] bytes, never the whole file: callers read a larger record in pieces of
 /// at most that size ([`format::SegmentView::max_piece`]). An I/O error makes the view return `None`; the
-/// error is kept and reported by [`scan_file`].
+/// error is kept and reported by [`scan_open`].
 pub(crate) struct PreadView<'f> {
     file: &'f File,
     len: u64,
@@ -278,14 +278,15 @@ impl format::SegmentView for PreadView<'_> {
     }
 }
 
-/// Scans a segment file from its first record slot, expecting `base` there, reading it with `pread` in bounded
-/// windows (the file is never mapped, so other processes can't affect memory safety).
+/// [`scan_open`] of the segment file at `path` (used by this module's tests).
+#[cfg(test)]
 pub(crate) fn scan_file(path: &Path, base: u64) -> Result<format::ScanResult> {
     let file = File::open(path).map_err(|e| Error::io("open segment", path, e))?;
     scan_open(&file, path, base)
 }
 
-/// Like [`scan_file`], for a segment file that is already open (`path` names it in errors).
+/// Scans an open segment file from its first record slot, expecting `base` there, reading it with `pread` in bounded
+/// windows (the file is never mapped, so other processes can't affect memory safety); `path` names it in errors.
 pub(crate) fn scan_open(file: &File, path: &Path, base: u64) -> Result<format::ScanResult> {
     scan_open_from(file, path, format::SEGMENT_HEADER_LEN as u64, base)
 }

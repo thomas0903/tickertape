@@ -125,9 +125,9 @@ when every criterion holds; each open item says what is still missing.
     checkpoints: the 1,024 B scenarios did not run because their probe failed at `279f59a` (a reader reported a record
     checksum mismatch on both aarch64 VMs, the probe timed out on x86-64; the mismatch was a reader giving up on a
     view that lagged a correctly published record, which readers now tolerate (issue #43; the platform mechanism is
-    not confirmed); the time-out was retention behind an overloaded writer holding up the final checkpoint (issue #45,
-    open)), and the lagging and beyond-RAM scenarios are recorded with
-    blocking checkpoints only.
+    not confirmed); the time-out was retention behind an overloaded writer holding up the final checkpoint (issue #45:
+    since ADR 0044 a deletion no longer reads the segment in full and retention gives way to checkpoints and `close`;
+    not yet re-measured)), and the lagging and beyond-RAM scenarios are recorded with blocking checkpoints only.
 - [ ] **Sustained-load comparison benchmarks.**
   - Extend the comparison suite with repeated runs of at least 10 minutes per configuration for every compatible
     tool, covering both existing payload sizes and rates below and near sustainable storage throughput.

@@ -489,6 +489,70 @@ fn retention_with_a_checkpoint_in_flight() {
     assert_eq!(w.next_seq(), 2_700);
 }
 
+/// Appends one record of 40,000 bytes: with `small_config`, each one rolls to a new segment.
+fn append_big(w: &mut Writer) {
+    w.append(&NewRecord {
+        schema_id: 1,
+        venue_ts_ns: 0,
+        local_ts_ns: 0,
+        payload: &[42; 40_000],
+    })
+    .unwrap();
+}
+
+/// Neither a checkpoint nor `close` waits for a backlog of retention work, and deleting a segment does not read its
+/// records (ADR 0044, issue #45). A checkpoint makes 28 segments eligible at once; every one has a damaged record, so
+/// a deletion that read the records would refuse it. The retention run on the checkpoint thread stops after one
+/// removal when another checkpoint is requested, and again after one removal when `close` waits for the thread; a
+/// later writer's retention at open removes the rest.
+#[test]
+fn retention_backlog_holds_up_neither_a_checkpoint_nor_close() {
+    use std::os::unix::fs::FileExt;
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let config = small_config().retention(Policy::default().max_segments(2), Action::Delete);
+    let mut w = Writer::open(dir.path(), config.clone()).unwrap();
+    for _ in 0..30 {
+        append_big(&mut w);
+    }
+    let bases = |dir: &Path| -> Vec<u64> { segments(dir).into_iter().map(|(b, _)| b).collect() };
+    assert_eq!(bases(dir.path()), (0..30).collect::<Vec<_>>());
+    for (_, path) in &segments(dir.path())[..28] {
+        let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.write_all_at(&[0], 64 + 40 + 1_000).unwrap();
+    }
+
+    // The first checkpoint makes segments 0 to 27 eligible; its retention run holds before its first removal.
+    let first = fault::hold_background(Point::RetentionRemove);
+    assert_eq!(w.request_checkpoint().unwrap(), 30);
+    assert!(first.wait_reached(LONG));
+    append_big(&mut w);
+    let at_marker = fault::hold_background(Point::CheckpointBeforeMarker);
+    assert_eq!(w.request_checkpoint().unwrap(), 31);
+    first.release();
+    // The queued checkpoint reaches its marker after a single removal.
+    assert!(at_marker.wait_reached(LONG));
+    assert_eq!(bases(dir.path()), (1..31).collect::<Vec<_>>());
+
+    let second = fault::hold_background(Point::RetentionRemove);
+    at_marker.release();
+    assert!(second.wait_reached(LONG));
+    assert_eq!(wait_finished(&mut w).durable.unwrap().next_seq, 31);
+    assert_eq!(w.retention_report().removed_segments, 1);
+    assert!(w.last_retention_error().is_none());
+
+    // `close` tells the thread it waits; the run stops after the removal in progress.
+    fault::run_at(Point::CheckpointWait, 0, move || second.release());
+    w.close().unwrap();
+    assert_eq!(bases(dir.path()), (2..31).collect::<Vec<_>>());
+
+    let w = Writer::open(dir.path(), config).unwrap();
+    assert!(w.last_retention_error().is_none());
+    assert_eq!(w.retention_report().removed_segments, 27);
+    assert_eq!(bases(dir.path()), [29, 30]);
+    assert_eq!(w.next_seq(), 31);
+}
+
 /// An abandoned write whose zeroing cannot be synced while a background checkpoint waits to start: the checkpoint must
 /// not write its marker afterwards (a failed sync may have dropped dirty pages of the same file).
 #[test]

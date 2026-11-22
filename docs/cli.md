@@ -110,8 +110,9 @@ Errors and recovery warnings go to stderr. JSON results go to stdout (or the sel
   the active one, so checkpoint eligibility can prevent reaching the limit. Age uses the successor header's
   creation time as seal time. `DUR` is a nonnegative integer followed by `d`, `h`, `m` or `s` (for example `30d`,
   `12h`, `90m`, `3600s`). `B` is a nonnegative integer with an optional uppercase `K`, `M`, `G` or `T` suffix
-  multiplying by 1024, 1024², 1024³ or 1024⁴. Overflow is a usage error. `--dry-run` prints only the plan and
-  changes no files; otherwise the command applies the plan and reports removal counts. `--to` requires an
+  multiplying by 1024, 1024², 1024³ or 1024⁴. Overflow is a usage error. `--delete` and the plan check each
+  segment's seal from the end of the file and do not read its records; `--to` reads and validates the whole segment
+  before moving it (crash contract C14). `--dry-run` prints only the plan and changes no files; otherwise the command applies the plan and reports removal counts. `--to` requires an
   existing directory; moves never replace existing entries, even identical copies from an interrupted move.
   Same-filesystem moves use a no-replace rename; `EXDEV` uses a synced copy before source removal. Earlier
   removals remain in effect on failure. Exit **0** includes nothing to do, **1** is usage/I/O/conflict, **2** is
