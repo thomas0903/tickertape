@@ -276,9 +276,13 @@ impl Reader {
         Ok(())
     }
 
-    /// Returns the next record if one is committed, without waiting.
+    /// Returns the next record if one is committed, without waiting for one.
     ///
     /// `Ok(None)` means there is no new record yet. Follows seals into the next segment transparently.
+    /// One case does wait: a committed slot that fails validation is read again for at least 50 ms before it is
+    /// reported, because a reader's view of a record just committed can lag (`docs/crash-contract.md` → Known risks
+    /// and limits). A call that ends in [`Error::Corrupt`], or in [`Error::Discarded`] after a repair, can therefore
+    /// take that long, and [`Reader::next_timeout`] can pass its timeout by the same amount.
     /// With [`ReaderConfig::durable_only`] enabled, records wait at the cursor until covered by a checkpoint;
     /// a missing or invalid checkpoint marker covers no records. A marker describes the journal's current files, so a
     /// durable-only reader applies a marker that moves past its cursor only after confirming that its segment is still

@@ -196,11 +196,19 @@ journal; the durability and restart guarantees below apply to retained history.
   checksum mismatch for a record that was published correctly (issue #43; reported at `279f59a`, and the same lag
   seen by the independent reader at `ddcbe49`). A reader now reads a slot that fails validation again for at least 50 ms, with growing pauses, before it
   reports corruption, and returns the record as soon as a re-read validates; real corruption is reported that much
-  later. The mechanism is not identified: it was not seen on x86-64 in the same session, nor on the Apple M4 Linux VMs
-  tried, nor with a writer and a reader both written without tickertape code on the same Axion VM. A view that stays
-  wrong for longer than the window is still reported as corruption. Nothing invalid is returned either way: a record
-  is returned only after its bytes have validated (`reader.rs`:
-  `a_view_that_catches_up_after_the_back_to_back_re_reads_is_not_reported`).
+  later, also by `try_next`, and `next_timeout` can pass its timeout by the window. The mechanism is not confirmed.
+  The most plausible one is that Linux defers the TLB invalidation of clean pages it reclaims or moves, so a reader
+  can keep reading the old copy of a page for a moment while the writer already writes to the new one; Linux does this
+  on x86-64 too. It was not seen on x86-64 in the same session, but that run ended in a time-out there (issue #45),
+  so its absence is weak evidence; nor on the Apple M4 Linux VMs tried, nor with a writer and a reader both written
+  without tickertape code on the same Axion VM. A view that stays wrong for longer than the window is still reported
+  as corruption. What holds either way: a record is returned only after its bytes have validated (`reader.rs`:
+  `a_view_that_catches_up_after_the_back_to_back_re_reads_is_not_reported`). What is known about the file: every slot
+  examined held the record intact, and two 600 s runs with the fix validated every record; a long run under forced
+  compaction whose journal is verified from the file afterwards, to show that the writer loses no write to the same
+  effect, is still to be done (issue #43). A lagging view of a commit word reads as an empty slot: `try_next` returns
+  `Ok(None)` and `records()` ends although the record is committed, as it does for a record committed a moment later.
+  The copying reader (`Reader::open`) reads with `pread` and did not fail in any of these runs.
 - **Readers after a repair.** A reader whose segment recovery replaced or moved to `quarantine/` returns
   `Error::Discarded` once it notices (on a validation error, after 100 ms of waiting, or at the next segment
   boundary; a durable-only reader also when the checkpoint moves past its cursor); it never silently continues into
