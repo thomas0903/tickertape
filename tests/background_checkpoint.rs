@@ -611,7 +611,9 @@ fn retention_keeps_pace_under_a_constant_queue_of_checkpoints() {
         // Queued behind the held checkpoint.
         let next = fault::hold_background(Point::CheckpointSync);
         assert_eq!(w.request_checkpoint().unwrap(), 10 * (round + 1));
-        std::thread::sleep(HOLD);
+        // The held checkpoint takes at least this long, which is the time its retention run then has for ten
+        // removals: generous, so that a slow directory sync on a busy machine does not cut the run short.
+        std::thread::sleep(3 * HOLD);
         running.release();
         // The queued checkpoint starts only after the retention run that follows the one released.
         assert!(next.wait_reached(LONG));
@@ -654,12 +656,16 @@ fn slow_retention_holds_up_a_queued_checkpoint_only_as_long_as_the_checkpoint_be
     }
     let bases = |dir: &Path| -> Vec<u64> { segments(dir).into_iter().map(|(b, _)| b).collect() };
     let slow = fault::hold_background(Point::RetentionRemove);
+    let requested = Instant::now();
     assert_eq!(w.request_checkpoint().unwrap(), 30);
     assert!(slow.wait_reached(LONG));
+    // The checkpoint took at most this long, however slow the machine, so the run's time is over once the hold has
+    // lasted longer than that.
+    let took = requested.elapsed();
     append_big(&mut w);
     let at_marker = fault::hold_background(Point::CheckpointBeforeMarker);
     assert_eq!(w.request_checkpoint().unwrap(), 31);
-    std::thread::sleep(HOLD);
+    std::thread::sleep(took + HOLD);
     slow.release();
     assert!(at_marker.wait_reached(LONG));
     assert_eq!(bases(dir.path()), (1..31).collect::<Vec<_>>());

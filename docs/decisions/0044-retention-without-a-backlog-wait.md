@@ -162,14 +162,19 @@ filled meanwhile: retention keeps level with the writer however slow the checkpo
 checkpoint's segments takes less time than the checkpoint, works off a backlog by at least one segment per such
 checkpoint, and entirely whenever no job is waiting.
 
-**What a queued job waits for.** Planning, then removals for at most as long as the job before it took, and at most
-as many as that job covered; then the removal in progress. The original decision allowed one removal. A removal costs
+**What a queued job waits for.** Planning and removals for at most as long as the job before it took, counted from
+the start of planning, and at most as many removals as that job covered; then the removal in progress, and the planning
+itself if it alone takes longer (it reads one header per segment in the journal, so it grows with the number of
+segments). The original decision allowed one removal. A removal costs
 a few small reads, the unlink, a directory sync and a barrier on the removed file, usually far less than the job before
 it spent syncing the data of the same number of segments, so usually the count ends the run. The time limit is for
 when it does not: a directory sync can take far longer under heavy write-back or a stalling disk (seen on a Linux VM
 whose virtual disk stalled under an unpaced writer), and a queued checkpoint then waits about as long again as the one
 before it at most, instead of for every removal its predecessor made possible. Retention then falls behind, which shows
-in `status`, rather than the checkpoints: durability before disk space. `close` and drop wait as before.
+in `status`, rather than the checkpoints: durability before disk space. With `Action::MoveTo` this is the expected
+case, not the rare one: a move reads and validates the whole segment, and copies and syncs it when the destination
+is on another filesystem, which can take as long as the checkpoint that covered it, so under a constant queue of
+checkpoints an archiving writer can fall behind for as long as the queue lasts and catches up when it ends. `close` and drop wait as before.
 
 **Options not taken.** A time limit alone: it bounds the wait as well, but no test could pin how many segments a run
 removes, and a long checkpoint would let a run spend that long on a backlog. A count alone: when removals are slow, a

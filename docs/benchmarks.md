@@ -667,8 +667,9 @@ What this session shows (`3fea1c0`):
 - **1,024 B unpaced** (the probe, 262,421–346,239 records/s, 269–355 MB/s): checkpoints fall behind. 598 of the 599
   requests found one in flight and joined it; a checkpoint became durable 35–73 s (p50) and at most 107 s after its
   request, the writer was held up for up to 372 ms (rolls on x86-64), and dirty page cache reached 10.6 GB (x86-64) and
-  6.2 GB (aarch64). Retention kept up over these 10 minutes: it removed 737–1,135 segments for 1,248–1,646 rolls (511
-  fewer on every VM), so the journal ended at its 64 GiB limit. The final checkpoint took 0.53–1.44 s. Without
+  6.2 GB (aarch64). Retention did not keep up while the probes ran (issue #45, below): the 737–1,135 segments the
+  results show as removed, for 1,248–1,646 rolls (511 fewer on every VM), were removed by the blocking checkpoint that
+  ends a run, which took 0.53–1.44 s and left the journal at its 64 GiB limit. Without
   checkpoints, the comparison's 10-minute probes at `88b3304` reached 0.34–0.35 million records/s on the same machine
   types; here x86-64 and aarch64 ext4 reach 0.34–0.35 million and aarch64 xfs 0.26 million.
 - **64 B** (probe 3,207,061–3,455,547 records/s, so the paced rates are 11–15 % above the first session's): at half the
@@ -704,12 +705,14 @@ when the writer could not create its next segment, for example on x86-64 ext4
 `tt-sustained` therefore wrote no `result.json`; the figures below come from the per-second series, the output of
 `tickertape verify`, the segment listing and `/proc/vmstat`. Retention had fallen behind: it removed 20 segments
 (x86-64) and 35–36 (aarch64) while the writer rolled 2,809–2,972, so the journal grew to 349–368 GiB (`du -sh`) on a
-375 GB SSD, against a limit of 64 GiB. The cause is not known yet (issue #45, open). The same command, without forced
-compaction, kept the journal at its limit in the session's 10-minute probes on the same machines (737–1,135 segments
-removed over 599 checkpoints, no retention error), so the one-segment yield of ADR 0044 alone does not explain it.
-What the two runs differ in is the forced compaction and the duration; whether checkpoints stopped completing (a
-segment is removed only once a checkpoint has passed it), retention failed repeatedly, or something else held it
-back, was not recorded, because the failed runs wrote no result.
+375 GB SSD, against a limit of 64 GiB. The cause (issue #45): at `3fea1c0` a retention run on the checkpoint thread
+stopped after one segment whenever a checkpoint was queued (ADR 0044 as first decided). Behind this writer a
+checkpoint was always queued and one completed every 24–43 s, so retention removed one segment in the time the writer
+filled dozens; the forced compaction played no part. The session's 10-minute probes ran the same command and had the
+same shortfall while they ran: the 737–1,135 segments their results show as removed were removed by the single
+blocking checkpoint that ends a run, after the journal had grown to about 200 GB, which still fitted the disk. ADR
+0044 was amended after these runs (a run now removes as many segments as the checkpoint before it covered, within the
+time that checkpoint took); a long run at the amended code is still to be recorded.
 
 | VM | Ran (s) | Records written | Mean rate (records/s) | MB/s of payload | Segments removed / left | Journal at the end | Append max | Reader max (mapped / safe) | `verify` | Pages migrated | Compactions |
 |---|---|---|---|---|---|---|---|---|---|---|---|
@@ -731,7 +734,7 @@ What the runs show, until the disk filled:
 - So, with the reader's re-read window of #44, a view that lags (`crash-contract.md` → Known risks and limits) stopped
   no reader, and no write was lost, in about 1.5 TB of payload written under forced compaction on aarch64 and x86-64.
   This is the evidence that closed issue #43; the platform mechanism stays unconfirmed.
-- Retention did not keep up in these runs, for a reason not yet known (above); the operating envelope below says so.
+- Retention did not keep up in these runs (cause above, since addressed); the operating envelope below says so.
 
 ### Reference before the checkpoint work: blocking checkpoints (`29960a3`)
 
@@ -1311,12 +1314,16 @@ commits stated above). Rates are of these machines and do not carry over to othe
   checkpoint and the writer's shutdown waited for it; probably also the 64 B runs at 90 % of the probe that failed
   because background checkpoints did not finish in time. Since ADR 0044 (`3fea1c0`) a deletion reads only the end of
   the segment back to its seal, and the writer's retention run gives way to a waiting checkpoint and to `close` after
-  one removal; every run of the second session finished, and in the 10-minute 1,024 B probes the journal stayed at its
-  64 GiB limit. **The open point:** in the long verified runs, the same writer under forced memory compaction, retention
-  removed 20–36 segments while the writer rolled 2,809–2,972, and the runs ended after 1,075–1,304 s with the disk full
-  at 349–368 GiB (above). The cause is not known yet. Until it is found and fixed, watch the journal's size under
-  sustained overload: `tickertape status` shows the growth (`segments.before_checkpoint`, `segments.total_bytes` and
-  the storage headroom thresholds). A long run that completes is still to be recorded.
+  one removal; every run of the second session finished. **The limit that showed at `3fea1c0`:** with a checkpoint always
+  queued, as behind an unpaced writer, that yield let retention remove one segment per completed checkpoint, fewer
+  than the writer filled. In the long verified runs it removed 20–36 segments while the writer rolled 2,809–2,972, and
+  the runs ended after 1,075–1,304 s with the disk full at 349–368 GiB (above); the 10-minute probes grew the same way
+  and were brought back to their limit only by the blocking checkpoint that ends a run. ADR 0044 was amended after
+  these runs: a run now removes as many segments as the checkpoint before it covered, within the time that checkpoint
+  took. Not yet measured at the amended code: a long run that completes with the journal near its limit. Whatever the
+  retention rule, a journal exceeds its limit by everything written since the last durable checkpoint; under sustained
+  overload watch `tickertape status` (`segments.before_checkpoint`, `segments.total_bytes`, the checkpoint's age and
+  the storage headroom thresholds).
 
 ## 2026-11-02, v0.3.0 on Linux (AWS) and macOS
 
