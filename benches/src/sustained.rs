@@ -406,6 +406,69 @@ pub fn record_bytes(payload: usize) -> Result<u64> {
     Ok(format::align8(u64::from(frame)))
 }
 
+/// What the file holds at a slot a reader reported as corrupt, read again with `pread` (the page cache, not the
+/// reader's own view): the commit word, the stored and the recomputed CRC, the header fields and, for a record whose
+/// payload should be `payload_len` bytes of `payload_byte` (as `tt-sustained` writes them), the file ranges whose
+/// bytes differ from that, with the page they start in. Reading the same slot again after a delay tells a slot whose
+/// bytes are wrong in the file from one that only a reader saw wrong.
+pub fn describe_slot(
+    path: &Path,
+    offset: u64,
+    payload_len: usize,
+    payload_byte: u8,
+) -> Result<Value> {
+    let file = File::open(path)?;
+    let frame = format::frame_len(payload_len).ok_or("payload too large")?;
+    let mut bytes = vec![0u8; format::align8(u64::from(frame)) as usize];
+    let read = file.read_at(&mut bytes, offset)?;
+    bytes.truncate(read);
+    let word = |at: usize| -> Option<u32> {
+        Some(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?))
+    };
+    let long = |at: usize| -> Option<u64> {
+        Some(u64::from_le_bytes(bytes.get(at..at + 8)?.try_into().ok()?))
+    };
+    let commit = word(0);
+    // The CRC of the bytes as they are now, for the length in the commit word if it is the expected one.
+    let computed = match commit {
+        Some(len) if len == frame && bytes.len() >= frame as usize => {
+            let mut body = bytes[4..frame as usize].to_vec();
+            format::finish_record_body(len, &mut body);
+            u32::from_le_bytes([body[0], body[1], body[2], body[3]]).into()
+        }
+        _ => Value::Null,
+    };
+    let page = 4096u64;
+    let mut wrong = Vec::new();
+    let payload_at = format::RECORD_HEADER_LEN;
+    let mut i = payload_at;
+    let end = (payload_at + payload_len).min(bytes.len());
+    while i < end {
+        if bytes[i] == payload_byte {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < end && bytes[i] != payload_byte {
+            i += 1;
+        }
+        let distinct: std::collections::BTreeSet<u8> = bytes[start..i].iter().copied().collect();
+        let file_start = offset + start as u64;
+        wrong.push(
+            json!({"file_from": file_start, "file_to": offset + i as u64,
+            "page": file_start / page, "page_offset": file_start % page,
+            "values": distinct.into_iter().take(8).collect::<Vec<_>>()}),
+        );
+    }
+    Ok(
+        json!({"path": path.display().to_string(), "offset": offset, "bytes_read": read,
+        "commit_word": commit, "stored_crc": word(4), "computed_crc": computed, "seq": long(8),
+        "schema_id": word(16), "flags": word(20), "venue_ts_ns": long(24), "local_ts_ns": long(32),
+        "frame_crosses_page": offset / page != (offset + u64::from(frame) - 1) / page,
+        "payload_ranges_not_expected": wrong}),
+    )
+}
+
 /// Records a reader is behind the writer: the writer's next sequence number minus the reader's, never negative.
 ///
 /// The two positions are sampled at slightly different times; a reader that has just caught up can appear ahead
@@ -925,6 +988,45 @@ pub fn merge_series(processes: &[Vec<Value>]) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_slot_is_described_from_the_file_with_the_bytes_that_differ() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer =
+            tickertape::Writer::open(dir.path(), tickertape::WriterConfig::default()).unwrap();
+        let payload = vec![0x5a; 1024];
+        for _ in 0..4 {
+            writer
+                .append(&tickertape::NewRecord {
+                    schema_id: 7,
+                    venue_ts_ns: 0,
+                    local_ts_ns: 0,
+                    payload: &payload,
+                })
+                .unwrap();
+        }
+        writer.close().unwrap();
+        let path = dir.path().join(format::segment_file_name(0));
+        // The record at offset 64 + 3 * 1064 = 3256 crosses the first page boundary.
+        let offset = 64 + 3 * 1064;
+        let good = describe_slot(&path, offset, 1024, 0x5a).unwrap();
+        assert_eq!(good["commit_word"], 1064);
+        assert_eq!(good["seq"], 3);
+        assert_eq!(good["schema_id"], 7);
+        assert_eq!(good["stored_crc"], good["computed_crc"]);
+        assert_eq!(good["frame_crosses_page"], true);
+        assert_eq!(good["payload_ranges_not_expected"], json!([]));
+
+        // Zero the part of the payload in the second page, as a lost page would read.
+        let file = OpenOptions::new().write(true).open(&path).unwrap();
+        file.write_all_at(&[0u8; 100], 4096).unwrap();
+        let bad = describe_slot(&path, offset, 1024, 0x5a).unwrap();
+        assert_ne!(bad["stored_crc"], bad["computed_crc"]);
+        assert_eq!(
+            bad["payload_ranges_not_expected"],
+            json!([{"file_from": 4096, "file_to": 4196, "page": 1, "page_offset": 0, "values": [0]}])
+        );
+    }
 
     #[test]
     fn durations_parse_with_units_and_round_trip() {
