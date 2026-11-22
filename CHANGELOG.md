@@ -58,6 +58,17 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   aarch64 VMs at `279f59a`, and the same probe timed out on x86-64. ADRs 0025 (the ext4 stall at a roll: the roll's
   `fdatasync` waited for the ext4 journal commit; closed by #28), 0026, 0038 and 0042 point to the recorded results;
   the roadmap's status lines and the "Before 1.0" list of `docs/compatibility.md` are updated.
+- Docs: `docs/benchmarks.md` records a second sustained session at `3fea1c0` (Google Cloud VMs with local NVMe SSD,
+  x86-64 and aarch64, ext4 and xfs; tickertape with background checkpoints, both payloads): every run finished, and
+  the 1,024 B scenarios ran for the first time (steady-50 and steady-90 keep their schedule on every VM); at 64 B and
+  90 % of the probe the writer fell behind on aarch64 xfs. It also records the long verified runs (an unpaced 1,024 B
+  writer under forced memory compaction, then `tickertape verify`): no reader reported corruption and every retained
+  record verified, the evidence that closed issue #43, but every run failed after 1,075–1,304 s with the disk full,
+  because retention under a constant queue of checkpoints removes about one segment per completed checkpoint (issue
+  #45, open). The operating envelope now covers 1,024 B and states that limit. The roadmap's status lines,
+  `docs/compatibility.md` → Before 1.0, `docs/crash-contract.md` → Known risks and limits and ADRs 0026, 0038 and
+  0044 point to the results. The first session's definition of the checkpoint "pause" now matches what `tt-sustained`
+  measures (the longest stretch of the writer thread's work while a checkpoint is in flight, not only the request).
 - Fixed (bench tooling): `benches/session.py --only compare` failed with `FileNotFoundError` on `<out>/logs/compare.log`
   when no tickertape run had created `<out>/logs` first; the session now creates it before any run.
 

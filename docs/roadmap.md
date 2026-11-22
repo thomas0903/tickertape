@@ -107,9 +107,9 @@ version numbers and dates are not fixed. Performance changes must preserve valid
 contract. An optimization investigation can close with a documented, measured decision that the proposed change
 does not help or cannot preserve those guarantees; such a decision must be explicit in the roadmap and its ADR.
 
-Status of each item as of 2026-11-22, after the cloud results of the sustained session, the checkpoint work, the
-comparison, the readers and the scale run were recorded in [`benchmarks.md`](benchmarks.md): an item is ticked only
-when every criterion holds; each open item says what is still missing.
+Status of each item as of 2026-11-23, after the cloud results of the sustained sessions, the checkpoint work, the
+comparison, the readers, the scale run and the long verified runs were recorded in [`benchmarks.md`](benchmarks.md):
+an item is ticked only when every criterion holds; each open item says what is still missing.
 
 ### Next release: sustained performance
 
@@ -120,14 +120,13 @@ when every criterion holds; each open item says what is still missing.
     reader lag. Record p50/p99/p99.9/p99.99 and maxima for latency, with the workload's durability and wait settings.
   - Publish the remaining bottlenecks and supported operating envelope, including overload behavior, rather than
     treating a short peak-throughput result as evidence of sustainable capacity.
-  - Missing: the workloads exist (`tt-sustained`, ADR 0026, #11) and the session's results, operating envelope and
-    remaining bottlenecks are recorded in `docs/benchmarks.md` (2026-11-19 to 2026-11-22), for 64 B only with background
-    checkpoints: the 1,024 B scenarios did not run because their probe failed at `279f59a` (a reader reported a record
-    checksum mismatch on both aarch64 VMs, the probe timed out on x86-64; the mismatch was a reader giving up on a
-    view that lagged a correctly published record, which readers now tolerate (issue #43; the platform mechanism is
-    not confirmed); the time-out was retention behind an overloaded writer holding up the final checkpoint (issue #45:
-    since ADR 0044 a deletion no longer reads the segment in full and retention gives way to checkpoints and `close`;
-    not yet re-measured)), and the lagging and beyond-RAM scenarios are recorded with blocking checkpoints only.
+  - Missing: the overload behaviour of retention. The workloads exist (`tt-sustained`, ADR 0026, #11), and the
+    sessions' results, operating envelope and remaining bottlenecks are recorded in `docs/benchmarks.md` (2026-11-19 to
+    2026-11-22) for both payloads with background checkpoints (the 1,024 B scenarios in the second session, at
+    `3fea1c0`, where every run finished). Open: with a checkpoint always queued, retention removes about one segment per
+    completed checkpoint, so behind an unpaced writer the journal outgrows its retention limit and the long runs at
+    `3fea1c0` ended with the disk full (issue #45, being fixed); a long run that completes is still to be recorded. The
+    lagging and beyond-RAM scenarios are recorded with blocking checkpoints only.
 - [ ] **Sustained-load comparison benchmarks.**
   - Extend the comparison suite with repeated runs of at least 10 minutes per configuration for every compatible
     tool, covering both existing payload sizes and rates below and near sustainable storage throughput.
@@ -191,13 +190,14 @@ when every criterion holds; each open item says what is still missing.
     item named bare-metal Graviton, `c7gd.metal`.)
   - Record CPU, kernel, filesystem, storage, affinity, CRC implementation and commands; resolve architecture-specific
     correctness failures and explain material performance differences before claiming cross-architecture results.
-  - Missing: an explanation of the aarch64 mapped reader's constant maximum in the checkpoint runs. The record checksum
-    mismatch that stopped a reader of the 1,024 B probe on both aarch64 VMs at `279f59a` no longer stops a reader:
-    readers tolerate a view that lags (issue #43; `crash-contract.md` → Known risks and limits). Still missing for it:
-    confirmation of the platform mechanism, and a long run on aarch64 under forced compaction whose journal is
-    verified from the file afterwards, to show that the writer loses no write to the same effect. Correctness, crash and soak checks run on aarch64
-    Linux in CI (#12); the sustained session and comparison on Axion are recorded in `docs/benchmarks.md` (2026-11-19 to
-    2026-11-22) with CPU, kernel, filesystem, storage, affinity, CRC path and commands.
+  - Missing: an explanation of the aarch64 mapped reader's constant maximum in the checkpoint runs, of the appends of
+    50–128 ms in the 1,024 B steady-90 runs on aarch64 ext4 (second session), and confirmation of the platform
+    mechanism behind the lagging view of issue #43. That view no longer stops a reader (readers tolerate it;
+    `crash-contract.md` → Known risks and limits), and the long verified runs under forced compaction (`3fea1c0`, on
+    aarch64 and x86-64) showed no false corruption and no lost write (issue #43, closed). Correctness, crash and soak
+    checks run on aarch64 Linux in CI (#12); the sustained sessions and comparison on Axion are recorded in
+    `docs/benchmarks.md` (2026-11-19 to 2026-11-22) with CPU, kernel, filesystem, storage, affinity, CRC path and
+    commands.
 
 ### Following milestones: adoption and scale
 
@@ -252,9 +252,9 @@ when every criterion holds; each open item says what is still missing.
   - Missing: the surfaces are reviewed and documented in [`compatibility.md`](compatibility.md) (ADR 0043, accepted;
     resolved in #37), with the fixtures and soak tier (#12) and the metrics (#8, #30) in place; its "Before 1.0" list
     still holds the ABI version and baseline freeze, the 1.0 fixtures, the release-candidate exercise (a tag needs the
-    owner's approval) and the open part of the sustained session (the 1,024 B scenarios and the unexplained checksum
-    mismatch on aarch64). Measured operating limits are published for 64 B ([`benchmarks.md`](benchmarks.md) → Operating
-    envelope and remaining bottlenecks).
+    owner's approval) and the open part of the sustained session (retention under a constant queue of checkpoints,
+    issue #45, and a long run that completes). Measured operating limits are published for 64 B and 1,024 B
+    ([`benchmarks.md`](benchmarks.md) → Operating envelope and remaining bottlenecks).
 
 **v1.0 release gate:** all milestones above are complete under their stated criteria, CI is green on Linux and
 macOS, the aarch64 checks pass, and no known unresolved issue violates the published safety, corruption-detection,

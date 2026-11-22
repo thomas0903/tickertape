@@ -89,7 +89,8 @@ and needs confirmation (`--yes` when not interactive). `--quick` validates a mac
   playbook, never into this ADR. The first recorded session (Google Cloud VMs, x86-64 and aarch64, ext4 and xfs) is in
   `docs/benchmarks.md` → "2026-11-19 to 2026-11-22, sustained workloads on Google Cloud VMs", with the operating
   envelope it supports; its 1,024 B scenarios did not run (their probe failed) and its comparison rows for tickertape
-  were measured again in a second session, as that section says.
+  were measured again in a second session, as that section says. A second sustained session at `3fea1c0` ran the
+  tickertape scenarios at both payloads (same section → Second sustained session).
 - Busy-waiting writers and spinning readers burn whole cores: CPU numbers include `schedule_wait_s` for the writer,
   and readers that should show realistic CPU use `wait=block` or `wait=default`.
 - Wall-clock steps distort latency and the series; a backwards step fails a run (the comparison runner retries it up
