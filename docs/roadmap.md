@@ -123,10 +123,11 @@ an item is ticked only when every criterion holds; each open item says what is s
   - Missing: the overload behaviour of retention. The workloads exist (`tt-sustained`, ADR 0026, #11), and the
     sessions' results, operating envelope and remaining bottlenecks are recorded in `docs/benchmarks.md` (2026-11-19 to
     2026-11-22) for both payloads with background checkpoints (the 1,024 B scenarios in the second session, at
-    `3fea1c0`, where every run finished). Open: in the long runs at `3fea1c0`, under forced compaction, retention removed
-    almost nothing, the journal outgrew its retention limit and the runs ended with the disk full (issue #45; cause
-    not known yet); a long run that completes is still to be recorded. The
-    lagging and beyond-RAM scenarios are recorded with blocking checkpoints only.
+    `3fea1c0`, where every run finished). Open: in the long runs at `3fea1c0` retention removed almost nothing, the
+    journal outgrew its retention limit and the runs ended with the disk full (issue #45: with a checkpoint always
+    queued, retention removed one segment per checkpoint; changed by the amendment of ADR 0044 of 2026-11-23); a long
+    run that completes is still to be recorded. The lagging and beyond-RAM scenarios are recorded with blocking
+    checkpoints only.
 - [ ] **Sustained-load comparison benchmarks.**
   - Extend the comparison suite with repeated runs of at least 10 minutes per configuration for every compatible
     tool, covering both existing payload sizes and rates below and near sustainable storage throughput.

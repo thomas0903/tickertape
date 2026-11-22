@@ -718,11 +718,16 @@ impl Writer {
     /// thread's results: in this method, [`Writer::checkpoint_progress`], [`Writer::checkpoint`] and
     /// [`Writer::close`] ([`Writer::metrics`] includes it at once). Retention runs after the marker is durable, so
     /// [`Writer::checkpoint_progress`] can report a checkpoint finished while its retention run goes on. The run
-    /// stops before its next removal, once it has handled the first segment of its plan, when another checkpoint is requested
-    /// or when [`Writer::checkpoint`], [`Writer::close`] or dropping the writer waits for the thread; the run after the
-    /// next checkpoint plans again and continues (ADR 0044). So a checkpoint and `close` wait for the removal in
-    /// progress (and the planning before it), never for a backlog of removals; segments still eligible when the
-    /// writer closes stay until a later retention run (a writer's at open or after a checkpoint, or an archiver's).
+    /// stops before its next removal when [`Writer::checkpoint`], [`Writer::close`] or dropping the writer waits for
+    /// the thread, once it has handled the first segment of its plan, and when another checkpoint is requested, once
+    /// it has handled as many segments as the checkpoint it follows covered (the segments filled since the checkpoint
+    /// before, and the one being written) or has taken as long as that checkpoint, at least one segment; the run after
+    /// the next checkpoint plans again and continues (ADR 0044). So `close` waits for the removal in progress (and the
+    /// planning before it) and a requested checkpoint for at most as many removals as the checkpoint before it covered
+    /// and about as long as that checkpoint took, never for a backlog of removals, while retention still removes as
+    /// many segments as the writer fills when checkpoints take longer than the interval between requests, unless
+    /// removing them takes longer than the checkpoints; segments still eligible when the writer closes stay until a
+    /// later retention run (a writer's at open or after a checkpoint, or an archiver's).
     ///
     /// Cost on the calling thread: one lock of the state shared with the checkpoint thread and a few small moves; no
     /// system call, except for starting the thread at the first call, and when the request leaves a checkpoint's list

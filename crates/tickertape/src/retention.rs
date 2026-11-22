@@ -149,16 +149,22 @@ impl Report {
 /// header, checkpoint position, or candidate seal or chain; [`Error::Io`] for filesystem errors, including concurrent
 /// changes while observing the directory. An absent/invalid checkpoint slot yields an empty plan.
 pub fn plan(dir: impl AsRef<Path>, policy: &Policy) -> Result<Plan> {
-    plan_at(dir.as_ref(), policy, crate::clock::realtime_ns(), &|| false)
+    plan_at(dir.as_ref(), policy, crate::clock::realtime_ns(), &|_| {
+        false
+    })
 }
 
-/// [`plan`] for the writer's retention run on its checkpoint thread: once one segment is planned, planning stops as
-/// soon as `stop` returns true (ADR 0044).
-pub(crate) fn plan_until(dir: &Path, policy: &Policy, stop: &dyn Fn() -> bool) -> Result<Plan> {
+/// [`plan`] for the writer's retention run on its checkpoint thread: once at least one segment is planned, planning
+/// stops as soon as `stop(planned)` returns true for the number of segments planned so far (ADR 0044).
+pub(crate) fn plan_until(
+    dir: &Path,
+    policy: &Policy,
+    stop: &dyn Fn(usize) -> bool,
+) -> Result<Plan> {
     plan_at(dir, policy, crate::clock::realtime_ns(), stop)
 }
 
-fn plan_at(dir: &Path, policy: &Policy, now: u64, stop: &dyn Fn() -> bool) -> Result<Plan> {
+fn plan_at(dir: &Path, policy: &Policy, now: u64, stop: &dyn Fn(usize) -> bool) -> Result<Plan> {
     let directory = directory_identity(dir)?;
     let paths = journal::list_segments(dir)?;
     if paths.is_empty() {
@@ -196,7 +202,7 @@ fn plan_at(dir: &Path, policy: &Policy, now: u64, stop: &dyn Fn() -> bool) -> Re
         let (header, identity) = headers[i];
         let sealed = headers[i + 1].0.created_unix_ns;
         let reasons = reasons(policy, count, bytes, now, sealed);
-        if reasons.is_empty() || (!plan.segments.is_empty() && stop()) {
+        if reasons.is_empty() || (!plan.segments.is_empty() && stop(plan.segments.len())) {
             break;
         }
         let file = File::open(path).map_err(|e| Error::io("open segment", path, e))?;
@@ -265,15 +271,16 @@ pub fn apply(dir: impl AsRef<Path>, plan: &Plan, action: &Action) -> Result<Repo
 /// durable): the marker that decides each removal is then made durable first ([`durable_checkpoint`]).
 ///
 /// `stop` is given by the writer's retention run on its checkpoint thread: after the first planned segment, the run
-/// ends before the next one once it returns true (a checkpoint is waiting, or the writer is closing; ADR 0044). The rest of
-/// the plan is left for the next run, which plans again.
+/// ends before the next one once `stop(handled)` returns true for the number of planned segments handled so far (a
+/// checkpoint is waiting and the run has removed what the checkpoint before it covered, or the writer is closing;
+/// ADR 0044). The rest of the plan is left for the next run, which plans again.
 pub(crate) fn apply_into(
     dir: &Path,
     plan: &Plan,
     action: &Action,
     report: &mut Report,
     external: bool,
-    stop: Option<&dyn Fn() -> bool>,
+    stop: Option<&dyn Fn(usize) -> bool>,
 ) -> Result<()> {
     if directory_identity(dir)? != plan.directory {
         return Err(Error::InvalidConfig(
@@ -283,7 +290,7 @@ pub(crate) fn apply_into(
     let mut synced = None;
     for (i, segment) in plan.segments.iter().enumerate() {
         if let Some(stop) = stop {
-            if i > 0 && stop() {
+            if i > 0 && stop(i) {
                 break;
             }
             crate::fault::hold_point(crate::fault::Point::RetentionRemove);

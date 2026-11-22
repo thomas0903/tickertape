@@ -87,7 +87,8 @@ before the checkpoint segment and its successor is in place, so the journal is s
 damaged records found before they are deleted runs `inspect::verify` (CLI `tickertape verify`) first, or moves instead
 of deleting; no option is added for it.
 
-**Retention on the checkpoint thread yields.** The writer's retention run after a background checkpoint stops before
+**Retention on the checkpoint thread yields** (amended 2026-11-23, below: a queued job no longer stops the run after
+one planned segment). The writer's retention run after a background checkpoint stops before
 its next removal, once it has handled one planned segment, as soon as a checkpoint is queued, or `Writer::checkpoint`
 or `Writer::close` waits for the thread, or the writer is dropped. The run after the next checkpoint plans again and
 continues. Planning stops early in the same way once it has one candidate. So the time from a request to a durable
@@ -128,8 +129,77 @@ field is added.
   machines of issue #45, and the 64-byte runs at 90 % of the probe rate (`docs/benchmarks.md` → Operating envelope).
   Under sustained overload retention can now fall behind instead of holding up the checkpoints; whether it keeps up
   there, and the storage it needs meanwhile, is what those runs show. They are recorded in `docs/benchmarks.md` →
-  Second sustained session and → Long verified runs (`3fea1c0`): every session run finished and retention held the
-  10-minute probes at their limit; in the long runs under forced compaction it removed almost nothing, for a reason
-  not yet known (issue #45).
+  Second sustained session and → Long verified runs (`3fea1c0`): every session run finished; in the long runs
+  retention removed almost nothing and the disk filled. The 10-minute probes did not keep the journal at its limit
+  either: the benchmark's final blocking checkpoint removed the backlog before the result was written. The cause and
+  the change are the amendment of 2026-11-23 below (issue #45).
 - Format version 1 is unchanged; no `unsafe` was added; nothing changes in the C ABI or the bindings, which use the
   Rust retention code.
+
+## Amendment, 2026-11-23: retention keeps level with the writer under a queue of checkpoints
+
+- **Status:** Accepted by the maintainers under the owner's delegation, 2026-11-23
+
+**What happened** (issue #45). Long unpaced 1,024-byte runs with 64 GiB of retention and a checkpoint requested every
+second, on the machines of issue #45, stopped with a full disk: retention had removed a few dozen segments while the
+writer rolled thousands. Checkpoints there take far longer than the interval between requests (tens of seconds from a
+request to its durable marker), so whenever a retention run started a job was queued, and the run stopped after its
+first planned segment: one removal per completed checkpoint. The counts fit exactly: removals start only once the
+journal exceeds its limit, and from then on the number removed equals the number of checkpoints completed. The
+10-minute runs of the same command seemed to keep the journal at its limit only because the benchmark's final, blocking
+checkpoint runs retention to the end before the result is written; their journals had grown far past the limit too,
+but still fitted the disk. The forced memory compaction the long runs added is not needed: the growth reproduces without
+it, on Linux, whenever checkpoints are slower than the requests. No retention error was involved.
+
+**Decision.** While a job is queued, the run after a checkpoint continues until it has handled as many planned
+segments as that checkpoint covered (the segments whose records it made durable, counting the one its marker names),
+or until it has run as long as that checkpoint took (from the start of its job to its durable marker), whichever comes
+first, and then stops before its next removal as before; planning stops in the same way. The writer waiting for the
+thread (`Writer::checkpoint`, `Writer::close`, drop) still stops the run after the removal in progress. In every case
+the run handles at least one planned segment. A checkpoint covers the segments the writer filled since the checkpoint
+before it, plus the one it was writing, so a run that is not out of time may remove one segment more than the writer
+filled meanwhile: retention keeps level with the writer however slow the checkpoints are, as long as removing a
+checkpoint's segments takes less time than the checkpoint, works off a backlog by at least one segment per such
+checkpoint, and entirely whenever no job is waiting.
+
+**What a queued job waits for.** Planning and removals for at most as long as the job before it took, counted from
+the start of planning, and at most as many removals as that job covered; then the removal in progress, and the planning
+itself if it alone takes longer (it reads one header per segment in the journal, so it grows with the number of
+segments). The original decision allowed one removal. A removal costs
+a few small reads, the unlink, a directory sync and a barrier on the removed file, usually far less than the job before
+it spent syncing the data of the same number of segments, so usually the count ends the run. The time limit is for
+when it does not: a directory sync can take far longer under heavy write-back or a stalling disk (seen on a Linux VM
+whose virtual disk stalled under an unpaced writer), and a queued checkpoint then waits about as long again as the one
+before it at most, instead of for every removal its predecessor made possible. Retention then falls behind, which shows
+in `status`, rather than the checkpoints: durability before disk space. With `Action::MoveTo` this is the expected
+case, not the rare one: a move reads and validates the whole segment, and copies and syncs it when the destination
+is on another filesystem, which can take as long as the checkpoint that covered it, so under a constant queue of
+checkpoints an archiving writer can fall behind for as long as the queue lasts and catches up when it ends. `close` and drop wait as before.
+
+**Options not taken.** A time limit alone: it bounds the wait as well, but no test could pin how many segments a run
+removes, and a long checkpoint would let a run spend that long on a backlog. A count alone: when removals are slow, a
+queued checkpoint would wait for all of them (above). No yield for a queued job: the backlog wait of the original
+context returns. A retention thread of its own: it would keep up without delaying any checkpoint, but adds a thread,
+its shutdown, and ordering with the markers it reads.
+
+**Unchanged.** What is checked before a removal; retention at open, after a blocking `Writer::checkpoint` and in an
+archiver; no API item, counter or field (a backlog still shows in `status` → `segments.before_checkpoint`). The journal
+still exceeds its limit by everything at or after the checkpoint segment, which no retention may remove: with a writer
+that outruns the disk, that is all it wrote since the last durable marker, which `status` shows as `exposure` and the
+checkpoint's age, and `Writer::metrics` as `uncheckpointed_bytes` and `since_checkpoint`.
+
+**Tests.** `tests/background_checkpoint.rs::retention_keeps_pace_under_a_constant_queue_of_checkpoints` (each
+checkpoint is requested while the one before it is held, so a job always waits; each run must remove every segment its
+checkpoint made eligible; before this amendment it removed one).
+`::slow_retention_holds_up_a_queued_checkpoint_only_as_long_as_the_checkpoint_before_it` (a quick checkpoint makes 28
+segments eligible; its retention run is held far longer than the checkpoint took while another is queued, and stops
+after one removal). `::retention_backlog_holds_up_neither_a_checkpoint_nor_close` now builds its backlog behind a
+damaged seal on the oldest segment, so that the backlog is larger than what the next checkpoint covers: the queued
+checkpoint reaches its marker after two removals, as many as the checkpoint before it covered, and `close` returns
+after one more. Where a test needs the count rather than the time to end a run, it holds the checkpoint before the run
+for a second, far longer than the removals take.
+
+**Benchmark tool.** A failed run of `tt-sustained` used to leave no checkpoint or retention counters. Its writer now
+records, each second and in the result, the checkpoints completed, the marker's position, the segments retention
+removed, its failures and last error, also as they stood before the final blocking checkpoint (`at_run_end`), and a
+writer that stops with an error writes them to `writer-failure.json` (`benches/README.md`).

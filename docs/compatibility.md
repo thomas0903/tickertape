@@ -202,7 +202,7 @@ compare them with its own thresholds; any of the three can be added to the C ABI
 4. The open part of the sustained session: its results and the operating envelope are recorded in
    `docs/benchmarks.md` (2026-11-19 to 2026-11-22) for both payloads, the 1,024 B scenarios with background checkpoints
    at `3fea1c0` (every run finished). The record checksum mismatch of the 1,024 B probe at `279f59a` is resolved
-   (issue #43, closed after the long verified runs; the platform mechanism is not confirmed). Still to do: find and fix why
-   retention removed almost nothing in the long runs (issue #45: under forced compaction the journal outgrew its
-   retention limit and the runs ended with the disk full; cause not known yet), and a long run with background checkpoints that
-   completes, its journal verified from the file afterwards.
+   (issue #43, closed after the long verified runs; the platform mechanism is not confirmed). Retention removed almost
+   nothing in the long runs because, with a checkpoint always queued, it removed one segment per checkpoint (issue #45;
+   ADR 0044, amendment of 2026-11-23). Still to do: a long run with background checkpoints that completes at the
+   release's code, its journal verified from the file afterwards.
