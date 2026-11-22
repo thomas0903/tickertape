@@ -15,7 +15,7 @@
   <!-- io.github.<user> needs no domain: Maven Central verifies the namespace through the GitHub account (ADR 0037). -->
   <groupId>io.github.thomas0903</groupId>
   <artifactId>tickertape</artifactId>
-  <version>0.4.0</version>
+  <version>0.5.0</version>
   <packaging>jar</packaging>
 
   <name>tickertape</name>

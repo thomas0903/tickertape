@@ -56,7 +56,7 @@
 /**
  * The minor version of the library this header belongs to.
  */
-#define TICKERTAPE_VERSION_MINOR 4
+#define TICKERTAPE_VERSION_MINOR 5
 
 /**
  * The patch version of the library this header belongs to.

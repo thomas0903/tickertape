@@ -27,7 +27,7 @@ dynamic = ["iceoryx2", "dep:toml"]
 cli = ["dynamic", "dep:clap", "dep:serde_json"]
 
 [dependencies]
-tickertape = { path = "../../crates/tickertape", version = "0.4.0" }
+tickertape = { path = "../../crates/tickertape", version = "0.5.0" }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 # Pinned exactly: iceoryx2 is 0.x, breaks its API between minor releases, and the `dynamic` feature uses API it
@@ -46,7 +46,7 @@ serde_json = { version = "1", optional = true }
 [dev-dependencies]
 # The core's failure points, for the test of a failed background checkpoint (`tests/background_checkpoint.rs`). They
 # do nothing unless a test arms them, and only test builds have them.
-tickertape = { path = "../../crates/tickertape", version = "0.4.0", features = ["fault-injection"] }
+tickertape = { path = "../../crates/tickertape", version = "0.5.0", features = ["fault-injection"] }
 # Lists and sizes iceoryx2's shared-memory objects in the allocation measurement test (`tests/allocation.rs`); on
 # macOS they are not files, and this is how iceoryx2 itself finds them. Already in iceoryx2's dependency tree.
 iceoryx2-bb-posix = "=0.10.0"
