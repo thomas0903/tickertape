@@ -13,8 +13,9 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   segments as the writer fills unless removals are slower than the checkpoints; it still stops after the removal in
   progress when `Writer::checkpoint`, `Writer::close` or dropping the writer waits for the thread. A queued background
   checkpoint can therefore wait for that many removals, and up to about as long again as the checkpoint before it,
-  instead of one removal. ADR 0044 is amended; crash contract C14, ADR 0038, `docs/operations.md` and the `Writer::request_checkpoint` documentation
-  say the same. Nothing changes in the C ABI or the bindings, which run the same code.
+  instead of one removal. ADR 0044 is amended; crash contract C14, ADR 0038, `docs/operations.md` and the
+  `Writer::request_checkpoint` documentation say the same. Nothing changes in the C ABI or the bindings, which run
+  the same code.
 - Added (`tt-sustained`): the writer's per-second series and result record the checkpoints completed, the marker's
   position, the segments retention removed, its failures and last error, also as they stood before the final blocking
   checkpoint (`at_run_end`); a writer that stops with an error writes them to `writer-failure.json`, and the command
@@ -78,9 +79,9 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   90 % of the probe the writer fell behind on aarch64 xfs. It also records the long verified runs (an unpaced 1,024 B
   writer under forced memory compaction, then `tickertape verify`): no reader reported corruption and every retained
   record verified, the evidence that closed issue #43, but every run failed after 1,075–1,304 s with the disk full,
-  because retention removed almost nothing there; the cause is not known yet (the same command without forced
-  compaction kept the journal at its limit for 10 minutes; issue #45, open). The operating envelope now covers
-  1,024 B and states that open point. The roadmap's status lines,
+  because retention removed almost nothing there (issue #45; the cause and the change are in the first entry of this
+  section: the 10-minute runs of the same command only seemed to keep the journal at its limit). The operating
+  envelope now covers 1,024 B and states that open point. The roadmap's status lines,
   `docs/compatibility.md` → Before 1.0, `docs/crash-contract.md` → Known risks and limits and ADRs 0026, 0038 and
   0044 point to the results. The first session's definition of the checkpoint "pause" now matches what `tt-sustained`
   measures (the longest stretch of the writer thread's work while a checkpoint is in flight, not only the request).

@@ -129,9 +129,10 @@ field is added.
   machines of issue #45, and the 64-byte runs at 90 % of the probe rate (`docs/benchmarks.md` → Operating envelope).
   Under sustained overload retention can now fall behind instead of holding up the checkpoints; whether it keeps up
   there, and the storage it needs meanwhile, is what those runs show. They are recorded in `docs/benchmarks.md` →
-  Second sustained session and → Long verified runs (`3fea1c0`): every session run finished and retention held the
-  10-minute probes at their limit; in the long runs under forced compaction it removed almost nothing, for a reason
-  not yet known (issue #45).
+  Second sustained session and → Long verified runs (`3fea1c0`): every session run finished; in the long runs
+  retention removed almost nothing and the disk filled. The 10-minute probes did not keep the journal at its limit
+  either: the benchmark's final blocking checkpoint removed the backlog before the result was written. The cause and
+  the change are the amendment of 2026-11-23 below (issue #45).
 - Format version 1 is unchanged; no `unsafe` was added; nothing changes in the C ABI or the bindings, which use the
   Rust retention code.
 
