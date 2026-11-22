@@ -11,13 +11,14 @@ The roadmap item "Make replay and recovery excellent at scale" asks to measure s
 crash recovery across many segments and journals larger than RAM, to build rebuildable sparse indexes only if
 measured seek costs justify them, and to address measured bottlenecks while keeping memory bounded.
 
-`tt-scale` (`benches/README.md`) builds a journal of a given shape (segment count, segment size, payload) and times
-each operation in a process of its own, with CPU time, page faults, peak RSS and the page-cache state. It was run
-on macOS (APFS) and in the OrbStack Linux VM (btrfs), with 10 to 20,000 segments, segment sizes from 64 KiB to
-1 GiB, and, in the VM, a journal four times larger than a cgroup memory limit. It was then run on cloud machines with
-local SSD, up to a journal four times larger than their memory (`benches/README.md`, "Replay and recovery at
-scale"). The informal figures of all these runs are in pull request #33; recorded results belong in
-`docs/benchmarks.md`. What the code does, and what the runs showed about how each cost grows:
+`tt-scale` (`benches/README.md`) builds a journal of a given shape (segment count, segment size, payload) and times each
+operation in a process of its own, with CPU time, page faults, peak RSS and the page-cache state. It was run on macOS
+(APFS) and in the OrbStack Linux VM (btrfs), with 10 to 20,000 segments, segment sizes from 64 KiB to 1 GiB, and, in the
+VM, a journal four times larger than a cgroup memory limit. It was then run on cloud machines with local SSD, up to a
+journal four times larger than their memory (`benches/README.md`, "Replay and recovery at scale"). The informal figures
+of all these runs are in pull request #33; the cloud run's results are recorded in `docs/benchmarks.md` → "2026-11-19 to
+2026-11-22, sustained workloads on Google Cloud VMs" → Replay and recovery at scale, with dataset sizes and resource
+use. What the code does, and what the runs showed about how each cost grows:
 
 | Operation | Grows with | Memory |
 | --- | --- | --- |
@@ -74,14 +75,15 @@ with the segment count are directory reads and file opens with a header read, no
 
 Keep option 1 (no contract change). Record the growth table above as the current behaviour.
 
-**No sparse index for 1.0** (option 2 not built). Measured on cloud machines with local SSD (see pull request #33),
-including a journal larger than the machine's memory, with the page cache dropped before each operation: opening a
-reader did not grow with the journal's size in bytes, and a seek cost at most one scan of the segment holding its
-target, proportional to the segment size the user chooses and paid once when a reader starts or seeks. That bound
-does not justify a new file kind and a new crash-contract case before 1.0. `docs/operations.md` (Choosing a segment
-size → Seek time, Segment count) documents the cost so users can size segments for it. The sparse index (option 2),
-skipping the unwritten part of the newest segment at writer open (option 3) and fewer file opens per retention run
-and writer open (option 4) stay possible later work, each with its own review; none of them changes format version 1.
+**No sparse index for 1.0** (option 2 not built). Measured on cloud machines with local SSD (`docs/benchmarks.md`,
+recorded from the run of pull request #33), including a journal larger than the machine's memory, with the page cache
+dropped before each operation: opening a reader did not grow with the journal's size in bytes, and a seek cost at most
+one scan of the segment holding its target, proportional to the segment size the user chooses and paid once when a
+reader starts or seeks. That bound does not justify a new file kind and a new crash-contract case before 1.0.
+`docs/operations.md` (Choosing a segment size → Seek time, Segment count) documents the cost so users can size segments
+for it. The sparse index (option 2), skipping the unwritten part of the newest segment at writer open (option 3) and
+fewer file opens per retention run and writer open (option 4) stay possible later work, each with its own review; none
+of them changes format version 1.
 
 **A defect the run found.** The journals with 10,000 and 20,000 segments could not be measured: a writer held one open
 file per segment after its checkpoint marker, so `Writer::open` without a valid marker failed with "Too many open
@@ -95,4 +97,5 @@ Bounded open segments; crash contract → Segments the writer no longer holds).
 - `docs/operations.md` states that seek time grows with the segment size and that listing, verification and
   retention costs grow with the segment count.
 - Follow-up work, each needing its own review: options 2 to 4, the cases in option 5, and measuring the journals
-  with 10,000 and 20,000 segments that the cloud run could not open before #38.
+  with 10,000 and 20,000 segments that the cloud run could not open before #38 (`docs/benchmarks.md` reports them as
+  failed).

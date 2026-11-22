@@ -460,6 +460,7 @@ def main(argv=None):
         if input("Start? [y/N] ").strip().lower() != "y":
             return 1
     out.mkdir(parents=True, exist_ok=True)
+    (out / "logs").mkdir(exist_ok=True)  # Build, run and comparison logs, also for --only compare.
     first = not manifest
     if first:
         manifest = {"matrix": args.matrix, "parameters": params, "created_utc": now_utc(), "journal_dir": str(journal),
@@ -476,7 +477,6 @@ def main(argv=None):
     scratch = reset_scratch(journal, out)
     failed = 0
     if runs:
-        (out / "logs").mkdir(exist_ok=True)
         with (out / "logs" / "build.log").open("a") as log:
             subprocess.run(["cargo", "build", "--locked", "--release", "-p", "tickertape-bench", "--bin",
                             "tt-sustained"], cwd=ROOT, stdout=log, stderr=subprocess.STDOUT, check=True)

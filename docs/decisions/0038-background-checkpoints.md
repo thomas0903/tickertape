@@ -1,8 +1,9 @@
 # 0038: A checkpoint that does not stop appends
 
-- **Status:** accepted on 2026-11-20 by the maintainers under the owner's delegation. Its Linux measurement is in the
-  comments of pull request #28; the recorded results will go to `docs/benchmarks.md` with the sustained session (see
-  "After the Linux measurement")
+- **Status:** accepted on 2026-11-20 by the maintainers under the owner's delegation. Its Linux results (the prototype,
+  the finish round and the sustained session with background checkpoints) are recorded in `docs/benchmarks.md` →
+  "2026-11-19 to 2026-11-22, sustained workloads on Google Cloud VMs" → Checkpoints and → Sustained session (see "After
+  the Linux measurement")
 - **Date:** 2026-11-20
 
 ## Context
@@ -127,8 +128,9 @@ The owner decided the questions this ADR left open:
 ## After the Linux measurement
 
 The owner ran the sustained comparison on cloud Linux machines (x86-64 and aarch64, local NVMe, ext4 and xfs; the
-figures are in the pull request, not here). Background checkpoints removed the long stop of the writer at each
-checkpoint, and showed three things to fix.
+figures, first posted in the pull request, are recorded in `docs/benchmarks.md` → "2026-11-19 to 2026-11-22, sustained
+workloads on Google Cloud VMs" → Checkpoints, not here). Background checkpoints removed the long stop of the writer at
+each checkpoint, and showed three things to fix.
 
 ### Rolls without a sync
 

@@ -85,8 +85,11 @@ and needs confirmation (`--yes` when not interactive). `--quick` validates a mac
 
 - No library or format change. The bench crate gains `nix` (MIT; `fs`, `resource`, `sched`). Calling
   `Reader::open_mapped` still needs an `unsafe` block at the call site, as in `tt-latency`.
-- Results depend on the machine; CI only smoke-tests the tools. Measured numbers go to `docs/benchmarks.md` through
-  the playbook, never into this ADR.
+- Results depend on the machine; CI only smoke-tests the tools. Measured numbers go to `docs/benchmarks.md` through the
+  playbook, never into this ADR. The first recorded session (Google Cloud VMs, x86-64 and aarch64, ext4 and xfs) is in
+  `docs/benchmarks.md` → "2026-11-19 to 2026-11-22, sustained workloads on Google Cloud VMs", with the operating
+  envelope it supports; its 1,024 B scenarios did not run (their probe failed) and its comparison rows for tickertape
+  were measured again in a second session, as that section says.
 - Busy-waiting writers and spinning readers burn whole cores: CPU numbers include `schedule_wait_s` for the writer,
   and readers that should show realistic CPU use `wait=block` or `wait=default`.
 - Wall-clock steps distort latency and the series; a backwards step fails a run (the comparison runner retries it up

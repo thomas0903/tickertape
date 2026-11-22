@@ -5,6 +5,20 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
+- Docs: `docs/benchmarks.md` records the cloud results of 2026-11-19 to 2026-11-22 (Google Cloud VMs with local
+  NVMe SSD, x86-64 and aarch64, ext4 and xfs): the sustained session with background checkpoints (64 B; its 1,024 B
+  scenarios did not run because their probe failed), the reference session with blocking checkpoints before ADR 0038,
+  the checkpoint measurements of ADR 0038, the sustained comparison with Chronicle Queue, Aeron, yaque, queue-file and
+  plain files (tickertape's rows from a second session at a newer commit, since the first session's failed on the
+  open-files defect fixed in #38), the readers' per-record cost, and replay and recovery at scale (the 10,000- and
+  20,000-segment journals failed on the same defect). A new section states the operating envelope and the remaining
+  bottlenecks. Open and not explained: a reader of the 1,024 B probe stopped with a record checksum mismatch on both
+  aarch64 VMs at `279f59a`, and the same probe timed out on x86-64. ADRs 0025 (the ext4 stall at a roll: the roll's
+  `fdatasync` waited for the ext4 journal commit; closed by #28), 0026, 0038 and 0042 point to the recorded results;
+  the roadmap's status lines and the "Before 1.0" list of `docs/compatibility.md` are updated.
+- Fixed (bench tooling): `benches/session.py --only compare` failed with `FileNotFoundError` on `<out>/logs/compare.log`
+  when no tickertape run had created `<out>/logs` first; the session now creates it before any run.
+
 - Docs: ADR 0042 (replay and recovery at scale) is accepted after the cloud run of `tt-scale` (informal figures in
   pull request #33): no sparse index for 1.0, since a seek costs at most one scan of the segment holding its target
   (`docs/operations.md` → Choosing a segment size); the sparse index, a bounded read of the newest segment at writer
