@@ -5,6 +5,14 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
+- Fixed (C++ binding): `tickertape.hpp` compiled with a warning under GCC 11 and older (`'maybe_unused' attribute
+  ignored`, from `-Wattributes`, which is on by default), so a program built with `-Werror` did not compile. The two
+  members of `RecordView` that only the debug checks read are now marked for Clang only, which is the compiler that
+  warns about them unmarked. Class layouts are unchanged. Found by the release build of the `v0.5.0` tag, which runs
+  on Ubuntu 22.04 (GCC 11.4, Clang 14) and stopped there, before anything was published; CI used only newer
+  compilers. CI now runs the C ABI job on Ubuntu 22.04 as well, and the tests' C++23 configurations use `-std=c++2b`
+  where the compiler does not know `-std=c++23` (Clang 16 and older).
+
 ## [0.5.0] - 2026-11-23
 
 This release is the release candidate for 1.0: the first release through every install channel (crates.io, the

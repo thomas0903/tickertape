@@ -147,7 +147,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        # ubuntu-22.04 is the release workflow's build image: its older compilers (GCC 11, Clang 14) must accept
+        # the headers too (the v0.5.0 tag's C library jobs failed on a warning only GCC 11 gives).
+        os: [ubuntu-latest, ubuntu-22.04, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
