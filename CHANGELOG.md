@@ -12,6 +12,11 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   on Ubuntu 22.04 (GCC 11.4, Clang 14) and stopped there, before anything was published; CI used only newer
   compilers. CI now runs the C ABI job on Ubuntu 22.04 as well, and the tests' C++23 configurations use `-std=c++2b`
   where the compiler does not know `-std=c++23` (Clang 16 and older).
+- Fixed (release tooling): the SBOMs that `release.py sbom` writes from cargo-cyclonedx had no `serialNumber`
+  (cargo-cyclonedx leaves it out when `SOURCE_DATE_EPOCH` is set), and the attestation action accepts a CycloneDX
+  document only with one, so every SBOM attestation of the `v0.5.0` tag's runs failed (archives, wheels and sdist).
+  The script now adds one, derived from the component, its version, the target and the file's name, so the output
+  stays reproducible. The SBOM attestations had not run before: they need a release tag.
 
 ## [0.5.0] - 2026-11-23
 
