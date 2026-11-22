@@ -132,7 +132,8 @@ single-maintainer repository. Administrators are subject to the checks; force pu
 ## Prepare
 
 1. Set `[workspace.package].version` and `[workspace.dependencies].tickertape.version` in `Cargo.toml`,
-   `[package].version` in `bindings/python/Cargo.toml` and `<version>` in `bindings/java/pom.xml`; then refresh the
+   `[package].version` in `bindings/python/Cargo.toml`, `<version>` in `bindings/java/pom.xml` and both `VERSION`
+   and `VERSION_NUMBER` in the Java binding's `NativeLibrary.java` (its tests compare them with the header); then refresh the
    bindings' lockfile with `cargo update --workspace --manifest-path bindings/python/Cargo.toml`. `release.py prepare`
    refuses a tag whose versions or bindings lockfile disagree. The CLI wheel takes its version from the workspace.
    Set the C header's version macros to match (`TICKERTAPE_VERSION_MAJOR`, `_MINOR`, `_PATCH` in

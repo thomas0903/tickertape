@@ -308,9 +308,13 @@ fn samples_during_retention_are_never_corrupt() {
     eprintln!("{samples} samples, {errors} I/O errors, {segments} rolls");
     assert!(segments >= 20, "retention had little to do");
     assert!(samples > 100);
+    // A sample gives up only after several attempts, each overtaken by a later change of the journal (a removal,
+    // a checkpoint or a roll: one of each per roll here), so the two samplers together cannot fail more often than
+    // the writer rolls. Where it rolls about as fast as a sample runs (fast runners), that is more than the usual
+    // one in twenty.
     assert!(
-        errors * 20 <= samples,
-        "{errors} of {samples} samples failed"
+        errors * 20 <= samples || errors <= segments,
+        "{errors} of {samples} samples failed over {segments} rolls"
     );
 }
 
