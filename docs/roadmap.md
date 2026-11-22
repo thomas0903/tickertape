@@ -123,9 +123,9 @@ an item is ticked only when every criterion holds; each open item says what is s
   - Missing: the overload behaviour of retention. The workloads exist (`tt-sustained`, ADR 0026, #11), and the
     sessions' results, operating envelope and remaining bottlenecks are recorded in `docs/benchmarks.md` (2026-11-19 to
     2026-11-22) for both payloads with background checkpoints (the 1,024 B scenarios in the second session, at
-    `3fea1c0`, where every run finished). Open: with a checkpoint always queued, retention removes about one segment per
-    completed checkpoint, so behind an unpaced writer the journal outgrows its retention limit and the long runs at
-    `3fea1c0` ended with the disk full (issue #45, being fixed); a long run that completes is still to be recorded. The
+    `3fea1c0`, where every run finished). Open: in the long runs at `3fea1c0`, under forced compaction, retention removed
+    almost nothing, the journal outgrew its retention limit and the runs ended with the disk full (issue #45; cause
+    not known yet); a long run that completes is still to be recorded. The
     lagging and beyond-RAM scenarios are recorded with blocking checkpoints only.
 - [ ] **Sustained-load comparison benchmarks.**
   - Extend the comparison suite with repeated runs of at least 10 minutes per configuration for every compatible
@@ -252,8 +252,8 @@ an item is ticked only when every criterion holds; each open item says what is s
   - Missing: the surfaces are reviewed and documented in [`compatibility.md`](compatibility.md) (ADR 0043, accepted;
     resolved in #37), with the fixtures and soak tier (#12) and the metrics (#8, #30) in place; its "Before 1.0" list
     still holds the ABI version and baseline freeze, the 1.0 fixtures, the release-candidate exercise (a tag needs the
-    owner's approval) and the open part of the sustained session (retention under a constant queue of checkpoints,
-    issue #45, and a long run that completes). Measured operating limits are published for 64 B and 1,024 B
+    owner's approval) and the open part of the sustained session (retention in the long runs, issue #45, and a
+    long run that completes). Measured operating limits are published for 64 B and 1,024 B
     ([`benchmarks.md`](benchmarks.md) → Operating envelope and remaining bottlenecks).
 
 **v1.0 release gate:** all milestones above are complete under their stated criteria, CI is green on Linux and

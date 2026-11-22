@@ -704,9 +704,12 @@ when the writer could not create its next segment, for example on x86-64 ext4
 `tt-sustained` therefore wrote no `result.json`; the figures below come from the per-second series, the output of
 `tickertape verify`, the segment listing and `/proc/vmstat`. Retention had fallen behind: it removed 20 segments
 (x86-64) and 35–36 (aarch64) while the writer rolled 2,809–2,972, so the journal grew to 349–368 GiB (`du -sh`) on a
-375 GB SSD, against a limit of 64 GiB. The cause is known and open: with a checkpoint always queued, the writer's
-retention run on the checkpoint thread stops after one segment (ADR 0044), so it removes about one segment per
-completed checkpoint, far fewer than the writer fills (issue #45, being fixed).
+375 GB SSD, against a limit of 64 GiB. The cause is not known yet (issue #45, open). The same command, without forced
+compaction, kept the journal at its limit in the session's 10-minute probes on the same machines (737–1,135 segments
+removed over 599 checkpoints, no retention error), so the one-segment yield of ADR 0044 alone does not explain it.
+What the two runs differ in is the forced compaction and the duration; whether checkpoints stopped completing (a
+segment is removed only once a checkpoint has passed it), retention failed repeatedly, or something else held it
+back, was not recorded, because the failed runs wrote no result.
 
 | VM | Ran (s) | Records written | Mean rate (records/s) | MB/s of payload | Segments removed / left | Journal at the end | Append max | Reader max (mapped / safe) | `verify` | Pages migrated | Compactions |
 |---|---|---|---|---|---|---|---|---|---|---|---|
@@ -728,7 +731,7 @@ What the runs show, until the disk filled:
 - So, with the reader's re-read window of #44, a view that lags (`crash-contract.md` → Known risks and limits) stopped
   no reader, and no write was lost, in about 1.5 TB of payload written under forced compaction on aarch64 and x86-64.
   This is the evidence that closed issue #43; the platform mechanism stays unconfirmed.
-- Retention under a constant queue of checkpoints does not keep up (above); the operating envelope below says so.
+- Retention did not keep up in these runs, for a reason not yet known (above); the operating envelope below says so.
 
 ### Reference before the checkpoint work: blocking checkpoints (`29960a3`)
 
@@ -1302,20 +1305,18 @@ commits stated above). Rates are of these machines and do not carry over to othe
   runs at `3fea1c0` showed no false corruption and no lost write (issue #43, closed; the platform mechanism is not
   confirmed, `crash-contract.md` → Known risks and limits). Not measured: the 10,000- and 20,000-segment journals, and
   the lagging and beyond-RAM scenarios with background checkpoints.
-- **Retention behind an overloaded writer (issue #45, open, being fixed).** The time-out of the 1,024 B probe at
+- **Retention behind an overloaded writer (issue #45, open).** The time-out of the 1,024 B probe at
   `279f59a` came from retention: before deleting a segment it read the whole segment on the checkpoint thread, behind a
   writer that outran the disk the old segments were no longer in memory, retention fell far behind, and the final
   checkpoint and the writer's shutdown waited for it; probably also the 64 B runs at 90 % of the probe that failed
   because background checkpoints did not finish in time. Since ADR 0044 (`3fea1c0`) a deletion reads only the end of
   the segment back to its seal, and the writer's retention run gives way to a waiting checkpoint and to `close` after
   one removal; every run of the second session finished, and in the 10-minute 1,024 B probes the journal stayed at its
-  64 GiB limit. **The open limit:** with a checkpoint always queued (requested every second while the previous one is
-  still in flight, as behind an unpaced writer), retention removes about one segment per completed checkpoint, fewer
-  than the writer fills, so the journal outgrows the retention limit without bound. In the long verified runs it
+  64 GiB limit. **The open point:** in the long verified runs, the same writer under forced memory compaction, retention
   removed 20–36 segments while the writer rolled 2,809–2,972, and the runs ended after 1,075–1,304 s with the disk full
-  at 349–368 GiB (above). Until this is fixed, an application that requests checkpoints faster than they complete can
-  run out of disk; `tickertape status` shows the growth (`segments.before_checkpoint`, `segments.total_bytes` and the
-  storage headroom thresholds). A long run that completes is still to be recorded.
+  at 349–368 GiB (above). The cause is not known yet. Until it is found and fixed, watch the journal's size under
+  sustained overload: `tickertape status` shows the growth (`segments.before_checkpoint`, `segments.total_bytes` and
+  the storage headroom thresholds). A long run that completes is still to be recorded.
 
 ## 2026-11-02, v0.3.0 on Linux (AWS) and macOS
 

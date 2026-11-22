@@ -64,8 +64,9 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   90 % of the probe the writer fell behind on aarch64 xfs. It also records the long verified runs (an unpaced 1,024 B
   writer under forced memory compaction, then `tickertape verify`): no reader reported corruption and every retained
   record verified, the evidence that closed issue #43, but every run failed after 1,075–1,304 s with the disk full,
-  because retention under a constant queue of checkpoints removes about one segment per completed checkpoint (issue
-  #45, open). The operating envelope now covers 1,024 B and states that limit. The roadmap's status lines,
+  because retention removed almost nothing there; the cause is not known yet (the same command without forced
+  compaction kept the journal at its limit for 10 minutes; issue #45, open). The operating envelope now covers
+  1,024 B and states that open point. The roadmap's status lines,
   `docs/compatibility.md` → Before 1.0, `docs/crash-contract.md` → Known risks and limits and ADRs 0026, 0038 and
   0044 point to the results. The first session's definition of the checkpoint "pause" now matches what `tt-sustained`
   measures (the longest stretch of the writer thread's work while a checkpoint is in flight, not only the request).
