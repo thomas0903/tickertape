@@ -311,6 +311,7 @@ hardware path on both architectures (`lscpu` lists `sse4_2` and `crc32`). Proces
 |---|---|---|---|---|
 | Sustained session and comparison, first session | 2026-11-20 | `279f59a` | x86-64: `c4-standard-16-lssd` (ext4 in us-east1-b, xfs in us-central1-b); aarch64: `c4a-standard-8-lssd` (us-east1-b); one VM per architecture and filesystem | Intel Xeon 6985P-C, 16 vCPUs, 63 GB; Google Axion (Neoverse-V2), 8 vCPUs, 34 GB |
 | Second sustained session (both payloads) and long verified runs | 2026-11-22 | `3fea1c0` | x86-64: `c4-standard-16-lssd` (ext4 in us-east1-b, xfs in us-central1-b); aarch64: `c4a-standard-8-lssd` (ext4 in us-central1-b, xfs in us-east1-d); one VM per architecture and filesystem | as the first session |
+| Confirming long runs (issue #45) | 2026-11-22 | `fbe5785` | x86-64: `c4-standard-16-lssd` (ext4 in us-east1-b); aarch64: `c4a-standard-8-lssd` (xfs in us-east1-d); two new VMs | as the first session |
 | tickertape's rows of the comparison, second session | 2026-11-22 | `88b3304`, with the one-line `benches/session.py` fix of this change applied locally | the same machine types: x86-64 ext4 in us-east1-b, xfs in us-central1-b; aarch64 in us-east1-d | as above |
 | Reference before the checkpoint work | 2026-11-19 | `29960a3` | `c4-standard-16-lssd` (us-central1-b), `c4a-standard-16-lssd` (us-east1-b); ext4, then xfs on the same VM | Xeon 6985P-C, 16 vCPUs, 63 GB; Axion, 16 vCPUs, 67 GB |
 | Checkpoint prototype | 2026-11-19 to 20 | `552ed71` (branch of pull request #28) | as the reference | as the reference |
@@ -712,7 +713,7 @@ filled dozens; the forced compaction played no part. The session's 10-minute pro
 same shortfall while they ran: the 737–1,135 segments their results show as removed were removed by the single
 blocking checkpoint that ends a run, after the journal had grown to about 200 GB, which still fitted the disk. ADR
 0044 was amended after these runs (a run now removes as many segments as the checkpoint before it covered, within the
-time that checkpoint took); a long run at the amended code is still to be recorded.
+time that checkpoint took); the long runs at the amended code are recorded below (Confirming long runs, `fbe5785`).
 
 | VM | Ran (s) | Records written | Mean rate (records/s) | MB/s of payload | Segments removed / left | Journal at the end | Append max | Reader max (mapped / safe) | `verify` | Pages migrated | Compactions |
 |---|---|---|---|---|---|---|---|---|---|---|---|
@@ -734,7 +735,79 @@ What the runs show, until the disk filled:
 - So, with the reader's re-read window of #44, a view that lags (`crash-contract.md` → Known risks and limits) stopped
   no reader, and no write was lost, in about 1.5 TB of payload written under forced compaction on aarch64 and x86-64.
   This is the evidence that closed issue #43; the platform mechanism stays unconfirmed.
-- Retention did not keep up in these runs (cause above, since addressed); the operating envelope below says so.
+- Retention did not keep up in these runs (cause above, since addressed and measured in the confirming runs below).
+
+### Confirming long runs (`fbe5785`, issue #45)
+
+After the amendment of ADR 0044 (#48), the run that filled the disk at `3fea1c0`, for the full hour, on two new VMs
+(2026-11-22, from 17:36 to 18:37 UTC): x86-64 `c4-standard-16-lssd` with the journal on ext4 (us-east1-b) and
+aarch64 `c4a-standard-8-lssd` with the journal on xfs (us-east1-d). They are of the machine types and in the zones of
+two of the `3fea1c0` runs, but not the same VMs, and no session ran before them. The command is that of the runs above,
+with the same compaction loop; in addition the journal directory was sampled every 30 s while the run lasted:
+
+```sh
+( while true; do echo 1 | sudo tee /proc/sys/vm/compact_memory > /dev/null; sleep 1; done ) &
+( while true; do echo "$(date -u +%T) $(du -sb /data/tt/long | cut -f1) $(ls /data/tt/long | wc -l)"; sleep 30; done ) &
+tt-sustained run --dir /data/tt/long --out /data/results/long --unpaced --duration 3600s --payload 1024 \
+  --checkpoint-every 1s --retain-bytes 68719476736 --readers mapped,safe:wait=default \
+  --checkpoint-mode background --cpus 1,2,3,4,5,6 --json
+tickertape status --json /data/tt/long
+tickertape verify /data/tt/long
+```
+
+(`/data2/tt/long` on xfs). **Both runs completed** (exit status 0, stopped by the duration after 3,600 s, with a
+`result.json`) and both journals verified clean. Latencies in µs unless marked.
+
+| | x86-64 ext4 | aarch64 xfs |
+|---|---|---|
+| Records written | 1,195,456,588 | 1,174,040,477 |
+| Mean rate | 332,071 records/s, 340 MB/s of payload | 326,122 records/s, 334 MB/s of payload |
+| Rolls / segments removed by retention / left | 9,476 / 8,965 / 512 | 9,307 / 8,796 / 512 |
+| Removed before the final blocking checkpoint (`at_run_end`) | 8,899 | 8,743 |
+| Retention errors | none (0 failures, no last error, in every second of the series) | none (as x86-64) |
+| Journal size from the first sample above the limit to the end of the run: min / max / mean | 65.1 / 82.3 / 73.0 GiB (115 samples, from 180 s) | 64.3 / 73.1 / 68.6 GiB (114 samples, from 210 s) |
+| Journal after the run (`tickertape status`) | 512 segments, 64 GiB, 511 before the checkpoint segment, health ok | as x86-64 |
+| Checkpoints requested (while one was in flight) / completed before the final one | 3,599 (3,598) / 73 | 3,599 (3,598) / 133 |
+| Request to durable p50 / p90 / p99 / max | 71.2 s / 91.2 s / 98.0 s / 104.4 s | 39.3 s / 50.2 s / 57.5 s / 65.3 s |
+| Pause p50 / p99 / max | 320 ms / 399 ms / 399 ms | 26.4 ms / 209 ms / 209 ms |
+| Append p50 / p99 / p99.9 / p99.99 / max | 0.51 / 1.97 / 14.4 / 12.8 ms / 399 ms | 0.30 / 1.92 / 3.8 / 14.0 ms / 209 ms |
+| Roll p50 / max | 3.8 ms / 399 ms | 175 / 205 ms |
+| Mapped reader, spin: p50 / p99 / p99.9 / p99.99 / max; lag max | 0.89 / 247 / 509 / 12.8 ms / 400 ms; 1,850 records | 0.49 / 466 / 803 / 14.0 ms / 209 ms; 1,792 records |
+| Safe reader, default wait: p50 / p99 / p99.9 / p99.99 / max; lag max | 5.3 / 26.9 / 63 / 12.8 ms / 399 ms; 2,403 records | 5.3 / 18.2 / 43 / 14.0 ms / 209 ms; 614 records |
+| Readers at the end | both read all 1,195,456,588 records: none skipped, none remaining | both read all 1,174,040,477 records: none skipped, none remaining |
+| Dirty page cache, max | 10.5 GB | 6.4 GB |
+| `tickertape verify` | 512 segments, 64,575,628 records (1,130,880,960 to 1,195,456,587), no problem | 512 segments, 64,477,853 records (1,109,562,624 to 1,174,040,476), no problem |
+| Pages migrated / compactions | 2,843,730 / 731 | 3,178,390 / 2,582 |
+
+The journal size is `du -sb` of the journal directory, sampled every 30 s from the start of the run; the statistics
+start at the first sample at or above the 64 GiB limit (68,719,476,736 bytes) and end at the last sample before the
+run ended. "Pause" and "to durable" are as in the sessions' tables; here a checkpoint was always in flight, for tens
+of seconds, so a checkpoint's pause is the longest append in that time and its maximum is the append maximum.
+"Removed before the final blocking checkpoint" is where retention stood when the writer stopped sending; the final
+checkpoint removed the other 66 and 53 segments, so these runs, unlike the 10-minute probes at `3fea1c0`, kept the
+journal near its limit during the run. The dirty page cache is `Dirty` from `/proc/meminfo` (whole
+system), sampled every second by the writer. "Pages migrated" and "Compactions" are as in the table above, counted since
+the VM booted, which here covers the build and this run. `verify`'s first sequence number is exactly the 8,965 and
+8,796 removed segments of 126,144 records each, and its last is the writer's last record.
+
+What the runs show:
+- **Retention keeps level with the writer.** It began removing about 200 s in, when the journal first passed its
+  limit, removed 8,743–8,899 segments while the writer ran, with no retention error, and the journal stayed between
+  64.3 and 82.3 GiB for the rest of the hour. At `3fea1c0` the same command, on other VMs of the same types in the same
+  zones, removed 20 (x86-64 ext4) and 35 (aarch64 xfs) segments and ended after 1,075 and 1,304 s with the disk full at
+  349 and 368 GiB (above).
+- **The journal exceeds its limit by what was written since the last durable checkpoint.** Retention runs after each
+  completed checkpoint, which came about every 49 s on x86-64 and 27 s on aarch64; between two of them the journal grows
+  by what the writer writes (up to 18.3 GiB over the limit on x86-64, 9.1 GiB on aarch64), and the next run brings it
+  back.
+- **Durability stays tens of seconds behind** a writer that outruns the disk: a request is durable 39–71 s after it at
+  p50 and at most 104 s, as in the unpaced 10-minute probes at `3fea1c0` (35–73 s at p50); requests join the queued
+  checkpoint.
+- **No reader reported corruption**, both readers of each run reached the writer's last position with no record
+  skipped, and `tickertape verify` found every retained record valid and the chain intact, in about 2.4 TB of payload
+  written under forced compaction.
+- Not measured: an archiving writer (`Action::MoveTo`) under a constant queue of checkpoints, and this run on x86-64
+  xfs and aarch64 ext4.
 
 ### Reference before the checkpoint work: blocking checkpoints (`29960a3`)
 
@@ -1294,7 +1367,8 @@ commits stated above). Rates are of these machines and do not carry over to othe
   from storage without loss while retention keeps it (beyond-RAM, `29960a3`).
 - **Storage-bound.** At 1,024 B for 10 minutes on these VMs (see the comparison's probe and the second session's);
   unpaced with a checkpoint requested every second, checkpoints fall about a minute behind (durable 35–73 s after the
-  request at p50, `3fea1c0`) with up to 10.6 GB of dirty page cache; with blocking checkpoints
+  request at p50, `3fea1c0`, and 39–71 s over the hour-long runs at `fbe5785`) with up to 10.6 GB of dirty page cache;
+  with blocking checkpoints
   without early write-back the stop at each checkpoint grows with the dirty data it syncs (0.24–0.27 s at 64 B and
   0.37–0.40 s at 1,024 B per second of half-rate data at `29960a3`, 0.75–0.80 s at about 250 MB/s in the finish round).
 - **Remaining, measured:** a helper thread on the writer's CPU still delays it (up to 3.0 ms with
@@ -1305,25 +1379,28 @@ commits stated above). Rates are of these machines and do not carry over to othe
   the finish round (16-vCPU VMs), not investigated and not seen in the second session (8-vCPU VMs).
 - **Remaining, open:** the record checksum mismatch that stopped a reader of the 1,024 B probe on both aarch64 VMs at
   `279f59a` was a reader's view lagging a correctly published record; readers now tolerate it, and the long verified
-  runs at `3fea1c0` showed no false corruption and no lost write (issue #43, closed; the platform mechanism is not
-  confirmed, `crash-contract.md` → Known risks and limits). Not measured: the 10,000- and 20,000-segment journals, and
-  the lagging and beyond-RAM scenarios with background checkpoints.
-- **Retention behind an overloaded writer (issue #45, open).** The time-out of the 1,024 B probe at
-  `279f59a` came from retention: before deleting a segment it read the whole segment on the checkpoint thread, behind a
-  writer that outran the disk the old segments were no longer in memory, retention fell far behind, and the final
-  checkpoint and the writer's shutdown waited for it; probably also the 64 B runs at 90 % of the probe that failed
-  because background checkpoints did not finish in time. Since ADR 0044 (`3fea1c0`) a deletion reads only the end of
-  the segment back to its seal, and the writer's retention run gives way to a waiting checkpoint and to `close` after
-  one removal; every run of the second session finished. **The limit that showed at `3fea1c0`:** with a checkpoint always
-  queued, as behind an unpaced writer, that yield let retention remove one segment per completed checkpoint, fewer
-  than the writer filled. In the long verified runs it removed 20–36 segments while the writer rolled 2,809–2,972, and
-  the runs ended after 1,075–1,304 s with the disk full at 349–368 GiB (above); the 10-minute probes grew the same way
-  and were brought back to their limit only by the blocking checkpoint that ends a run. ADR 0044 was amended after
-  these runs: a run now removes as many segments as the checkpoint before it covered, within the time that checkpoint
-  took. Not yet measured at the amended code: a long run that completes with the journal near its limit. Whatever the
-  retention rule, a journal exceeds its limit by everything written since the last durable checkpoint; under sustained
-  overload watch `tickertape status` (`segments.before_checkpoint`, `segments.total_bytes`, the checkpoint's age and
-  the storage headroom thresholds).
+  runs at `3fea1c0` and the confirming runs at `fbe5785` showed no false corruption and no lost write (issue #43,
+  closed; the platform mechanism is not confirmed, `crash-contract.md` → Known risks and limits). Not measured: the
+  10,000- and 20,000-segment journals, and the lagging and beyond-RAM scenarios with background checkpoints.
+- **Retention behind an overloaded writer (issue #45, closed).** The time-out of the 1,024 B probe at `279f59a` came
+  from retention: before deleting a segment it read the whole segment on the checkpoint thread, behind a writer that
+  outran the disk the old segments were no longer in memory, retention fell far behind, and the final checkpoint and the
+  writer's shutdown waited for it; probably also the 64 B runs at 90 % of the probe that failed because background
+  checkpoints did not finish in time. Since ADR 0044 (`3fea1c0`) a deletion reads only the end of the segment back to
+  its seal, and the writer's retention run gives way to a waiting checkpoint and to `close`; every run of the second
+  session finished. At `3fea1c0` that run gave way after one removal, so with a checkpoint always queued, as behind an
+  unpaced writer, retention removed one segment per completed checkpoint: the long verified runs ended after
+  1,075–1,304 s with the disk full at 349–368 GiB (above). **Addressed and measured:** since the amendment of ADR 0044
+  (`fbe5785`) a run removes as many segments as the checkpoint before it covered, within the time that checkpoint took.
+  The same command for the full hour (x86-64 ext4, aarch64 xfs) completed: retention removed 8,796–8,965 of the
+  9,307–9,476 segments rolled with no error, and the journal stayed at 64.3–82.3 GiB (mean 68.6–73.0 GiB) against its
+  64 GiB limit (Confirming long runs, above). **What remains true:** behind a writer that outruns the disk a checkpoint
+  becomes durable tens of seconds after its request (39–71 s at p50, at most 104 s, in those runs), and the journal
+  exceeds its limit by what was written since the last durable checkpoint (up to 18.3 GiB there), as it would under
+  any retention rule, since no retention may remove the checkpoint segment or anything after it. An archiving writer
+  (`Action::MoveTo`) can fall behind for as long as checkpoints stay queued (ADR 0044 → Amendment): not measured.
+  Under sustained overload watch `tickertape status` (`segments.before_checkpoint`, `segments.total_bytes`, the
+  checkpoint's age and the storage headroom thresholds).
 
 ## 2026-11-02, v0.3.0 on Linux (AWS) and macOS
 

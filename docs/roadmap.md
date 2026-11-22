@@ -108,26 +108,29 @@ contract. An optimization investigation can close with a documented, measured de
 does not help or cannot preserve those guarantees; such a decision must be explicit in the roadmap and its ADR.
 
 Status of each item as of 2026-11-23, after the cloud results of the sustained sessions, the checkpoint work, the
-comparison, the readers, the scale run and the long verified runs were recorded in [`benchmarks.md`](benchmarks.md):
+comparison, the readers, the scale run, the long verified runs and the confirming long runs were recorded in
+[`benchmarks.md`](benchmarks.md):
 an item is ticked only when every criterion holds; each open item says what is still missing.
 
 ### Next release: sustained performance
 
-- [ ] **Make sustained performance the next release's main objective.**
+- [x] **Make sustained performance the next release's main objective.** (done 2026-11-23: the confirming long runs
+  of issue #45)
   - Establish reproducible workloads for bursty and sustained traffic, periodic checkpoints, segment rolls,
     multiple readers and a reader falling behind. Include datasets larger than RAM.
   - Report append throughput, visible and durable-only reader latency, checkpoint/roll latency, CPU usage and
     reader lag. Record p50/p99/p99.9/p99.99 and maxima for latency, with the workload's durability and wait settings.
   - Publish the remaining bottlenecks and supported operating envelope, including overload behavior, rather than
     treating a short peak-throughput result as evidence of sustainable capacity.
-  - Missing: the overload behaviour of retention. The workloads exist (`tt-sustained`, ADR 0026, #11), and the
-    sessions' results, operating envelope and remaining bottlenecks are recorded in `docs/benchmarks.md` (2026-11-19 to
-    2026-11-22) for both payloads with background checkpoints (the 1,024 B scenarios in the second session, at
-    `3fea1c0`, where every run finished). Open: in the long runs at `3fea1c0` retention removed almost nothing, the
-    journal outgrew its retention limit and the runs ended with the disk full (issue #45: with a checkpoint always
-    queued, retention removed one segment per checkpoint; changed by the amendment of ADR 0044 of 2026-11-23); a long
-    run that completes is still to be recorded. The lagging and beyond-RAM scenarios are recorded with blocking
-    checkpoints only.
+  - Status: the workloads exist (`tt-sustained`, ADR 0026, #11), and the sessions' results, operating envelope and
+    remaining bottlenecks, including the overload behaviour of retention, are recorded in `docs/benchmarks.md`
+    (2026-11-19 to 2026-11-22) for both payloads with background checkpoints (the 1,024 B scenarios in the second
+    session, at `3fea1c0`, where every run finished). In the long runs at `3fea1c0` retention fell behind and the disk
+    filled (issue #45); after the amendment of ADR 0044 the same runs for the full hour at `fbe5785` completed with the
+    journal at its limit plus what was written since the last durable checkpoint, verified from the file afterwards
+    (issue #45, closed). Recorded as not measured in the operating envelope: an archiving writer under a constant queue
+    of checkpoints, and the lagging and beyond-RAM scenarios with background checkpoints (recorded with blocking
+    checkpoints).
 - [ ] **Sustained-load comparison benchmarks.**
   - Extend the comparison suite with repeated runs of at least 10 minutes per configuration for every compatible
     tool, covering both existing payload sizes and rates below and near sustainable storage throughput.
@@ -253,8 +256,8 @@ an item is ticked only when every criterion holds; each open item says what is s
   - Missing: the surfaces are reviewed and documented in [`compatibility.md`](compatibility.md) (ADR 0043, accepted;
     resolved in #37), with the fixtures and soak tier (#12) and the metrics (#8, #30) in place; its "Before 1.0" list
     still holds the ABI version and baseline freeze, the 1.0 fixtures, the release-candidate exercise (a tag needs the
-    owner's approval) and the open part of the sustained session (retention in the long runs, issue #45, and a
-    long run that completes). Measured operating limits are published for 64 B and 1,024 B
+    owner's approval) and, only if the writer's checkpoint or retention code changes after `fbe5785`, a repeat of the
+    confirming long run (issue #45) at the release's code. Measured operating limits are published for 64 B and 1,024 B
     ([`benchmarks.md`](benchmarks.md) → Operating envelope and remaining bottlenecks).
 
 **v1.0 release gate:** all milestones above are complete under their stated criteria, CI is green on Linux and
