@@ -10,9 +10,10 @@ and [0018](decisions/0018-competitive-benchmarks.md).
 **Linux results come first** because that is where tickertape is meant to run, and **bare metal comes first** among
 them. The cloud-VM and macOS results are secondary.
 
-The sustained-workload, checkpoint, comparison, reader and scale results of 2026-11-19 to 2026-11-22 ran on Google
-Cloud VMs ([below](#2026-11-19-to-2026-11-22-sustained-workloads-on-google-cloud-vms-linux-x86-64-and-aarch64)), after
-the bare-metal sections.
+The sustained-workload, checkpoint, comparison, reader and scale results and the long verified runs of 2026-11-19 to
+2026-11-22 ran on Google Cloud VMs
+([below](#2026-11-19-to-2026-11-22-sustained-workloads-on-google-cloud-vms-linux-x86-64-and-aarch64)), after the
+bare-metal sections.
 
 ## 2026-11-02, v0.4.0 on bare-metal Linux (AWS `z1d.metal`)
 
@@ -288,12 +289,13 @@ Other results, ext4 / xfs:
 
 ## 2026-11-19 to 2026-11-22, sustained workloads on Google Cloud VMs (Linux, x86-64 and aarch64)
 
-Results of the sustained session (ADR 0026), the checkpoint work (ADR 0038), the comparison with other tools, the
-readers' per-record cost and replay and recovery at scale (ADR 0042). All of them ran on **Google Cloud virtual machines
-with local NVMe SSD, not bare metal**, on other CPUs and with other commits than the bare-metal v0.4.0 results above;
-the two are not compared. The raw output of every run (results, time series, environment, commands, logs) is kept
-outside the repository. Latency tools schedule sends at a fixed rate and measure from the intended send time
-(coordinated omission handled at the source; no skipped sends or rebasing), as in the sections above.
+Results of the sustained sessions (ADR 0026), the checkpoint work (ADR 0038), the comparison with other tools, the
+readers' per-record cost, replay and recovery at scale (ADR 0042), and long verified runs (issues #43 and #45). All of
+them ran on **Google Cloud virtual machines with local NVMe SSD, not bare metal**, on other CPUs and with other commits
+than the bare-metal v0.4.0 results above; the two are not compared. The raw output of every run (results, time series,
+environment, commands, logs) is kept outside the repository. Latency tools schedule sends at a fixed rate and measure
+from the intended send time (coordinated omission handled at the source; no skipped sends or rebasing), as in the
+sections above.
 
 ### Environments
 
@@ -308,6 +310,7 @@ hardware path on both architectures (`lscpu` lists `sse4_2` and `crc32`). Proces
 | Recording | Dates (UTC) | Commit | Machine type, zone | CPU, vCPUs, memory |
 |---|---|---|---|---|
 | Sustained session and comparison, first session | 2026-11-20 | `279f59a` | x86-64: `c4-standard-16-lssd` (ext4 in us-east1-b, xfs in us-central1-b); aarch64: `c4a-standard-8-lssd` (us-east1-b); one VM per architecture and filesystem | Intel Xeon 6985P-C, 16 vCPUs, 63 GB; Google Axion (Neoverse-V2), 8 vCPUs, 34 GB |
+| Second sustained session (both payloads) and long verified runs | 2026-11-22 | `3fea1c0` | x86-64: `c4-standard-16-lssd` (ext4 in us-east1-b, xfs in us-central1-b); aarch64: `c4a-standard-8-lssd` (ext4 in us-central1-b, xfs in us-east1-d); one VM per architecture and filesystem | as the first session |
 | tickertape's rows of the comparison, second session | 2026-11-22 | `88b3304`, with the one-line `benches/session.py` fix of this change applied locally | the same machine types: x86-64 ext4 in us-east1-b, xfs in us-central1-b; aarch64 in us-east1-d | as above |
 | Reference before the checkpoint work | 2026-11-19 | `29960a3` | `c4-standard-16-lssd` (us-central1-b), `c4a-standard-16-lssd` (us-east1-b); ext4, then xfs on the same VM | Xeon 6985P-C, 16 vCPUs, 63 GB; Axion, 16 vCPUs, 67 GB |
 | Checkpoint prototype | 2026-11-19 to 20 | `552ed71` (branch of pull request #28) | as the reference | as the reference |
@@ -316,8 +319,8 @@ hardware path on both architectures (`lscpu` lists `sse4_2` and `crc32`). Proces
 | Replay and recovery at scale | 2026-11-20 | `dd450d1` | `c3-standard-4-lssd` (us-central1-a), `c4a-standard-4-lssd` (us-east1-b); ext4 | Xeon Platinum 8481C, 4 vCPUs, 16 GB; Axion, 4 vCPUs, 16 GB |
 
 Pull request #28 was squash-merged as `279f59a` and #24 as `6ee9a0e`; the branch commits named above are not in `main`'s
-history. In the sustained sessions `--out` was on the ext4 SSD (`/data`), so on the ext4 VMs the results were written to
-the filesystem under test (the playbook prefers another filesystem).
+history. In the sustained sessions and the long runs `--out` was on the ext4 SSD (`/data`), so on the ext4 VMs the
+results were written to the filesystem under test (the playbook prefers another filesystem).
 
 ### Sustained session: tickertape with background checkpoints (`279f59a`)
 
@@ -351,11 +354,13 @@ the reference session below, with blocking checkpoints.
 aarch64 (ext4 and xfs) a reader of the 1,024 B probe stopped with
 `corrupt journal data in …/00000000000103942656.tape at offset 14036352: record checksum mismatch`** (xfs:
 `…/00000000000094355712.tape` at offset 44317792), in the active segment near the writer's position, with neither reader
-lagging. This is not explained yet. The 1,024 B probes of the reference session (`29960a3`, on `c4a-standard-16-lssd`)
-and of the comparison's tickertape rows (`88b3304`, on `c4a-standard-8-lssd`, without checkpoints) completed, but
-neither is this scenario at this commit. Three 64 B runs failed: steady-90 repeat 1 on both xfs VMs
+lagging. It was later traced to the reader's view lagging a correctly published record (issue #43, closed;
+`crash-contract.md` → Known risks and limits). The 1,024 B probes of the reference session (`29960a3`, on
+`c4a-standard-16-lssd`) and of the comparison's tickertape rows (`88b3304`, on `c4a-standard-8-lssd`, without
+checkpoints) completed, but neither is this scenario at this commit. Three 64 B runs failed: steady-90 repeat 1 on both xfs VMs
 (`background checkpoints did not finish within 120 s of the run's end`) and steady-90 repeat 2 on aarch64 ext4
-(`reader timed out`); their rows show one run.
+(`reader timed out`); their rows show one run. The 1,024 B scenarios ran in the second session, at `3fea1c0`
+([below](#second-sustained-session-both-payloads-background-checkpoints-3fea1c0)).
 
 Cells are ext4 / xfs, with the range over the two repeats (the probe ran once). Latencies in µs unless marked ms or s;
 "to" separates two repeats that differ by more than one unit. Late sends are sends more than 1 µs after their intended
@@ -391,8 +396,9 @@ time. CPU is the fraction of one CPU over the run: the process (all threads) and
 | visibility-only | x86-64 | 0.19–0.20 / 0.12 | 1.39–1.41 / 1.24–1.25 | 1.88–2.00 / 1.79–1.88 | 6.2–6.6 / 5.9–6.1 | 2.7–103 ms / 13.9–113 ms |
 | visibility-only | aarch64 | 0.13 / 0.13 | 0.21 / 0.22 | 1.98–2.00 / 1.94 | 3.3 / 3.7 | 309–671 ms / 557–666 ms |
 
-**Checkpoints and rolls (64 B).** "Pause" is the time the writer's thread spends in `request_checkpoint`; "to durable"
-is from the request until the checkpoint is durable (its marker synced).
+**Checkpoints and rolls (64 B).** "Pause" is, per checkpoint, the writer thread's longest stretch of work around it:
+the request, and every append and progress poll while the checkpoint was in flight; "to durable" is from the request
+until the checkpoint is durable (its marker synced).
 
 | Scenario | Arch | Pause p50 | Pause p99 | Pause max | To durable p50 | To durable p99 | To durable max | Rolls | Roll p50 | Roll max |
 |---|---|---|---|---|---|---|---|---|---|---|
@@ -443,8 +449,289 @@ The single slow appends of visibility-only, from `series.jsonl` (UTC): x86-64 ex
 2026-11-20T04:25:10Z; x86-64 xfs repeat 2, 113 ms at 05:26:29Z; aarch64 ext4, 671 ms at 04:12:47Z and 309 ms at
 04:57:33Z; aarch64 xfs, 557 ms at 04:21:24Z and 666 ms at 05:05:55Z. At most one such append per run (x86-64 ext4 repeat
 2 and x86-64 xfs repeat 1 had none above 14 ms); no roll append in these runs took longer than 7.2 ms. At `279f59a` a
-writer that never checkpoints kept every rolled segment open (the defect fixed in #38); these runs have not been
-repeated since, so whether the stall remains is not known.
+writer that never checkpoints kept every rolled segment open (the defect fixed in #38). In the second session's
+visibility-only runs, at `3fea1c0`, no append took longer than 13.2 ms (below).
+
+### Second sustained session: both payloads, background checkpoints (`3fea1c0`)
+
+The tickertape scenarios of the first session again, at `3fea1c0` (after ADR 0044, the reader's re-read window of #44
+and the bounded open segments of #38), now with both payloads, on four new VMs (one per architecture and filesystem;
+Environments above). The 1,024 B scenarios ran here for the first time (issues #43 and #45). The 64 B scenarios repeat
+the first session's at a newer commit and at other rates: every figure in this section is from `3fea1c0`, and the first
+session's tables above are from `279f59a`; the two are not merged. Command, on each VM (`/data2/tt` and
+`session-xfs` on xfs), run twice by the VM's script (the first run finished every run, the second found nothing left):
+
+```sh
+python3 benches/session.py --journal-dir /data/tt --out /data/results/session-ext4 --only tickertape \
+  --scenarios steady-50,steady-90,bursty,visibility-only --checkpoint-mode background \
+  --cpus 1,2,3,4,5,6 --max-run 2400 --yes
+```
+
+for example steady-50 at 1,024 B on x86-64 ext4:
+
+```sh
+tt-sustained run --dir … --out … --rate 173119 --duration 600s --warmup 10s --payload 1024 --checkpoint-every 1s \
+  --retain-bytes 68719476736 --readers mapped,safe:wait=default,safe:durable:wait=block \
+  --checkpoint-mode background --cpus 1,2,3,4,5,6 --json
+```
+
+Settings, readers and scenarios as in the first session. Each VM's open-files limit was 1,024 and transparent huge pages
+were set to `madvise`. R, the probe's achieved rate, is per VM: the aarch64 xfs VM (us-east1-d) reached 262,421
+records/s at 1,024 B against 338,412 on aarch64 ext4, so its paced 1,024 B rates are lower.
+
+**What did not run or failed.** Nothing failed: all 18 runs finished on every VM (`manifest.json`: 18 done, 0 failed;
+the logs hold no error), no reader reported corruption, `read + skipped + remaining = written` held for every reader,
+no reader lost a record to retention, and no checkpoint grid point was missed. **One configuration did not keep its
+schedule:** steady-90 at 64 B on aarch64 xfs, where in both repeats the writer fell more than the overrun limit (60 s)
+behind its schedule's end and stopped there (`stopped_by: overrun_limit`), with 479,481,119 and 419,590,582 records
+unsent; its rows describe what was sent.
+
+Cells are ext4 / xfs, with the range over the two repeats (the probe ran once); units, "to", late sends, CPU, "pause"
+and "to durable" as in the first session. The final checkpoint of each run is blocking. Where the ends of a range differ
+by more than about 10 %, the two repeats differed that much.
+
+**Writer schedule and CPU (1,024 B):**
+
+| Scenario | Arch | Rate (records/s) | Achieved (records/s) | Late sends (%) | Max schedule delay | Writer CPU (process) | Writer CPU (measuring thread) |
+|---|---|---|---|---|---|---|---|
+| probe (unpaced) | x86-64 | unpaced | 346,239 / 345,942 | – | – | 0.34 / 0.29 | 0.25 / 0.22 |
+| probe (unpaced) | aarch64 | unpaced | 338,412 / 262,421 | – | – | 0.25 / 0.17 | 0.20 / 0.14 |
+| steady-50 | x86-64 | 173,119 / 172,970 | 173,119 / 172,970 | 1.1–1.2 / 1.5–1.7 | 21–24 ms / 0.92–1.70 ms | 1.14–1.16 / 1.17 | 1.00 / 1.00 |
+| steady-50 | aarch64 | 169,206 / 131,210 | 169,206 / 131,210 | 0.7 / 0.5 | 1.24–2.7 ms / 0.29–1.93 ms | 1.08 / 1.06 | 1.00 / 1.00 |
+| steady-90 | x86-64 | 311,614 / 311,347 | 311,614 / 311,347 | 2.4–2.5 / 2.7–2.9 | 13.0–30 ms / 8.3–27 ms | 1.31 / 1.32–1.35 | 1.00 / 1.00 |
+| steady-90 | aarch64 | 304,571 / 236,178 | 304,571 / 236,178 | 6.9 / 0.7 | 112–128 ms / 122–148 ms | 1.09 / 1.09–1.10 | 0.95 / 1.00 |
+| bursty | x86-64 | 138,495 / 138,376 | 138,677 / 138,558 | 29.1–32.2 / 30.4–31.0 | 71–125 ms / 7.8–45 ms | 1.15 / 1.15–1.16 | 1.00 / 1.00 |
+| bursty | aarch64 | 135,364 / 104,968 | 135,542 / 105,106 | 2.6–2.9 / 0.9 | 13.5–26 ms / 6.9–11.6 ms | 1.06 / 1.05 | 1.00 / 1.00 |
+| visibility-only | x86-64 | 173,119 / 172,970 | 173,119 / 172,970 | 1.3–1.5 / 1.5–1.8 | 1.63–16.1 ms / 1.45–1.66 ms | 1.15 / 1.16–1.17 | 1.00 / 1.00 |
+| visibility-only | aarch64 | 169,206 / 131,210 | 169,206 / 131,210 | 0.8 / 0.6 | 1.22–1.27 ms / 1.02–1.50 ms | 1.07–1.08 / 1.05 | 1.00 / 1.00 |
+
+**Append latency (1,024 B, every append timed, µs):**
+
+| Scenario | Arch | p50 | p99 | p99.9 | p99.99 | max |
+|---|---|---|---|---|---|---|
+| probe (unpaced) | x86-64 | 0.51 / 0.45 | 1.96 / 1.79 | 9.2 / 4.3 | 11.9 ms / 14.0 ms | 370 ms / 100 ms |
+| probe (unpaced) | aarch64 | 0.33 / 0.30 | 2.0 / 1.99 | 11.2 / 3.6 | 13.6 ms / 15.6 ms | 372 ms / 86 ms |
+| steady-50 | x86-64 | 0.64 / 0.54–0.55 | 2.1–2.5 / 1.96–2.2 | 6.4–7.9 / 6.0–6.1 | 25–28 / 17.6–18.8 | 7.3–24 ms / 0.92–1.15 ms |
+| steady-50 | aarch64 | 0.54 / 0.52 | 2.8 / 2.5 | 7.8–8.1 / 9.2–9.6 | 31–33 / 30–31 | 1.24–1.34 ms / 0.27–1.93 ms |
+| steady-90 | x86-64 | 0.59–0.61 / 0.52 | 2.4–2.6 / 2.1–2.3 | 6.0–6.2 / 5.7–5.9 | 8.8–9.3 / 8.5–9.1 | 12.9–14.6 ms / 2.8–27 ms |
+| steady-90 | aarch64 | 0.39 / 0.37–0.38 | 2.4 / 2.2–2.3 | 4.2 / 4.1–5.8 | 26–28 / 25–26 | 112–128 ms / 122–149 ms |
+| bursty | x86-64 | 0.60–0.61 / 0.53–0.54 | 2.4–2.8 / 2.6 | 6.4–7.0 / 7.1–7.4 | 11.1–11.7 / 41–58 | 71–125 ms / 7.6–45 ms |
+| bursty | aarch64 | 0.36–0.37 / 0.34 | 2.2–2.3 / 2.2 | 2.8–3.0 / 2.7–2.8 | 5.6–6.0 / 17.0–17.1 | 13.5–26 ms / 6.9–11.5 ms |
+| visibility-only | x86-64 | 0.54–0.56 / 0.43 | 2.2 / 2.0 | 6.1 / 5.7–5.9 | 22–23 / 16.3–16.5 | 1.42–7.4 ms / 1.44–1.66 ms |
+| visibility-only | aarch64 | 0.33 / 0.30 | 2.4–2.5 / 2.2 | 6.5 / 8.0 | 28–31 / 28 | 1.17–1.25 ms / 1.01–1.42 ms |
+
+**Checkpoints and rolls (1,024 B).**
+
+| Scenario | Arch | Pause p50 | Pause p99 | Pause max | To durable p50 | To durable p99 | To durable max | Rolls | Roll p50 | Roll max |
+|---|---|---|---|---|---|---|---|---|---|---|
+| probe (unpaced) | x86-64 | 277 ms / 26 ms | 370 ms / 100 ms | 370 ms / 100 ms | 67 s / 73 s | 93 s / 104 s | 94 s / 107 s | 1,646 / 1,645 | 3.3 ms / 763 | 370 ms / 100 ms |
+| probe (unpaced) | aarch64 | 292 ms / 28 ms | 372 ms / 86 ms | 372 ms / 86 ms | 35 s / 49 s | 49 s / 97 s | 51 s / 99 s | 1,609 / 1,248 | 2.2 ms / 613 | 287 ms / 36 ms |
+| steady-50 | x86-64 | 77–80 / 90–91 | 214–243 / 245–248 | 0.67–1.41 ms / 315–644 | 1.45–1.48 ms / 1.57–1.96 ms | 3.0–4.0 ms / 3.3–3.7 ms | 4.2–16.6 ms / 3.6–4.2 ms | 837 / 836 | 226–228 / 139–148 | 0.40–2.9 ms / 315–411 |
+| steady-50 | aarch64 | 42–50 / 48–53 | 92–233 / 227–235 | 256–357 / 0.27–1.93 ms | 868–919 / 0.93–4.5 ms | 1.15–1.27 ms / 3.8 ms to 1.55 s | 1.23–5.5 ms / 0.53–3.9 s | 818 / 634 | 274–278 / 151–158 | 376–470 / 267–303 |
+| steady-90 | x86-64 | 93 / 102–107 | 162–294 / 178–193 | 1.17–2.1 ms / 359–905 | 1.57–1.67 ms / 2.0–2.6 ms | 3.2–4.0 ms / 3.9–4.9 ms | 4.3–166 ms / 27–225 ms | 1,506 / 1,505 | 220–221 / 131–163 | 1.17–2.6 ms / 0.36–1.05 ms |
+| steady-90 | aarch64 | 3.4–3.8 ms / 60–140 | 100 ms / 232 | 112–128 ms / 0.28–18.4 ms | 331–342 ms / 0.99–274 ms | 618–719 ms / 0.84–1.74 s | 720–838 ms / 1.24–2.6 s | 1,472 / 1,142 | 1.20–1.27 ms / 152 | 35–68 ms / 1.28–10.0 ms |
+| bursty | x86-64 | 70–75 / 59–66 | 1.26–1.93 ms / 199–250 | 5.8–34 ms / 0.41–1.02 ms | 2.6–3.3 ms / 2.0–2.7 ms | 27–277 ms / 6.8–7.4 ms | 408–427 ms / 8.6–9.9 ms | 669 / 669 | 0.60–1.23 ms / 141–155 | 71–125 ms / 7.6–7.8 ms |
+| bursty | aarch64 | 53–59 / 73–137 | 253–272 / 181–189 | 1.89–26 ms / 1.60–11.5 ms | 1.06–1.09 ms / 12.6–25 ms | 2.6–5.3 ms / 333–396 ms | 157–255 ms / 353–406 ms | 654 / 507 | 1.08–1.24 ms / 150 | 6.0–6.2 ms / 0.38–11.5 ms |
+| visibility-only | x86-64 | – | – | – | – | – | – | 837 / 836 | 1.01–1.02 ms / 0.97–1.05 ms | 1.28–1.37 ms / 1.32–1.44 ms |
+| visibility-only | aarch64 | – | – | – | – | – | – | 818 / 634 | 964–970 / 822 | 1.17–1.25 ms / 1.01–1.42 ms |
+
+**Readers (1,024 B).**
+
+| Scenario | Arch | Reader | p50 | p99 | p99.9 | p99.99 | max | Lag max (records) | CPU |
+|---|---|---|---|---|---|---|---|---|---|
+| probe (unpaced) | x86-64 | mapped, spin | 0.90 / 0.82 | 218 / 245 | 461 / 493 | 12.0 ms / 14.0 ms | 370 ms / 101 ms | 1,266 / 1,568 | 1.00 / 1.00 |
+| probe (unpaced) | x86-64 | safe, default | 5.6 / 5.8 | 28 / 35 | 98 / 73 | 12.0 ms / 14.0 ms | 370 ms / 100 ms | 241 / 124 | 0.25 / 0.22 |
+| probe (unpaced) | aarch64 | mapped, spin | 0.52 / 0.49 | 328 / 338 | 690 / 690 | 13.6 ms / 15.6 ms | 372 ms / 86 ms | 1,424 / 1,188 | 1.00 / 1.00 |
+| probe (unpaced) | aarch64 | safe, default | 5.1 / 5.2 | 14.6 / 16.1 | 31 / 32 | 13.6 ms / 15.6 ms | 372 ms / 86 ms | 45 / 118 | 0.20 / 0.14 |
+| steady-50 | x86-64 | mapped, spin | 0.89 / 0.82–0.83 | 3.2–3.5 / 3.0–3.4 | 108–178 / 98–144 | 732–827 / 706–757 | 21–24 ms / 1.76–2.1 ms | 113–117 / 126–128 | 1.00 / 1.00 |
+| steady-50 | x86-64 | safe, default | 2.6 / 2.6–2.7 | 5.1–6.1 / 4.9–5.0 | 24–26 / 15.9–16.8 | 285–287 / 166–179 | 21–24 ms / 1.28–1.72 ms | 1–3 / 0–3 | 1.00 / 1.00 |
+| steady-50 | x86-64 | safe, durable-only, block | 522 ms / 523–524 ms | 992 ms / 992 ms | 1.00 s / 1.00 s | 1.00 s / 1.00 s | 1.00–1.02 s / 1.00 s | 173,695–174,591 / 173,439–173,567 | 1.00 / 1.00 |
+| steady-50 | aarch64 | mapped, spin | 0.57 / 0.54 | 2.9 / 2.3 | 244–256 / 31 | 887–896 / 733–742 | 1.24–2.7 ms / 0.95–1.93 ms | 134–153 / 93–102 | 1.00 / 1.00 |
+| steady-50 | aarch64 | safe, default | 2.8 / 2.8 | 5.8–6.1 / 5.1 | 27–28 / 21–22 | 259–274 / 123–124 | 1.27–2.7 ms / 0.31–1.95 ms | 0–4 / 0 | 1.00 / 1.00 |
+| steady-50 | aarch64 | safe, durable-only, block | 522 ms / 519–530 ms | 991 ms / 0.99–2.3 s | 1.00 s / 1.00–4.3 s | 1.00 s / 1.47–4.8 s | 1.00–1.01 s / 1.52–4.8 s | 169,343–169,599 / 199,807–634,367 | 1.00 / 1.00 |
+| steady-90 | x86-64 | mapped, spin | 0.89–0.91 / 0.82–0.83 | 3.9–4.0 / 3.5 | 399–436 / 307–381 | 0.76–8.2 ms / 656–744 | 13.0–30 ms / 8.3–27 ms | 197–214 / 170–214 | 1.00 / 1.00 |
+| steady-90 | x86-64 | safe, default | 2.6 / 2.6–2.7 | 6.6–6.8 / 6.0–6.2 | 69–89 / 45–61 | 0.30–8.4 ms / 230–279 | 13.0–31 ms / 9.1–27 ms | 2–288 / 80–123 | 1.00 / 1.00 |
+| steady-90 | x86-64 | safe, durable-only, block | 541 ms / 542–545 ms | 993 ms / 994 ms | 1.00 s / 1.00 s | 1.00–1.11 s / 1.00–1.17 s | 1.00–1.17 s / 1.03–1.22 s | 312,831–363,519 / 317,951–378,879 | 1.00 / 1.00 |
+| steady-90 | aarch64 | mapped, spin | 0.57 / 0.54 | 47–50 ms / 2.2–2.3 | 80–82 ms / 439–489 | 99–109 ms / 70–96 ms | 112–128 ms / 122–149 ms | 958–985 / 149–179 | 1.00 / 1.00 |
+| steady-90 | aarch64 | safe, default | 2.8 / 2.8 | 47–50 ms / 5.3 | 80–82 ms / 27 | 99–109 ms / 70–96 ms | 112–128 ms / 122–149 ms | 2,791–4,931 / 30–56 | 0.95 / 1.00 |
+| steady-90 | aarch64 | safe, durable-only, block | 866–883 ms / 597–821 ms | 1.48–1.50 s / 1.57–2.4 s | 1.58–1.61 s / 1.83–3.1 s | 1.66–1.70 s / 2.2–3.5 s | 1.72 s / 2.2–3.6 s | 520,959 / 523,263–845,311 | 0.96 / 1.00 |
+| bursty | x86-64 | mapped, spin | 0.98–1.00 / 0.90–0.92 | 1.38–1.44 ms / 652–679 | 17.3–26 ms / 2.8–17.5 ms | 67–118 ms / 5.7–41 ms | 72–125 ms / 8.2–45 ms | 2,457–3,021 / 3,599–3,791 | 1.00 / 1.00 |
+| bursty | x86-64 | safe, default | 4.1–4.3 / 4.3–4.7 | 1.27–1.34 ms / 613–637 | 17.3–26 ms / 1.06–17.5 ms | 67–118 ms / 4.1–41 ms | 71–125 ms / 7.8–45 ms | 103–127 / 61–195 | 0.20 / 0.20 |
+| bursty | x86-64 | safe, durable-only, block | 922 ms / 920–921 ms | 1.00–1.22 s / 1.00 s | 1.31–1.39 s / 1.00 s | 1.40–1.42 s / 1.01 s | 1.41–1.43 s / 1.01 s | 276,991 / 141,311–142,847 | 0.20 / 0.20 |
+| bursty | aarch64 | mapped, spin | 0.57 / 0.54 | 472–665 / 2.5–2.6 | 2.9–3.3 ms / 632–646 | 8.0–19.8 ms / 1.61–3.6 ms | 13.6–26 ms / 6.9–12.2 ms | 867–1,171 / 355–380 | 1.00 / 1.00 |
+| bursty | aarch64 | safe, default | 3.8 / 3.7 | 197–374 / 6.4–6.7 | 2.6–3.0 ms / 79–85 | 8.0–19.8 ms / 1.68–3.6 ms | 13.6–26 ms / 7.0–11.6 ms | 1–4 / 0–1 | 0.20 / 0.20 |
+| bursty | aarch64 | safe, durable-only, block | 919 ms / 950–978 ms | 1.00 s / 1.27–1.34 s | 1.01–1.16 s / 1.33–1.39 s | 1.07–1.25 s / 1.34–1.40 s | 1.09–1.26 s / 1.35–1.41 s | 189,439–270,847 / 210,047 | 0.20 / 0.20–0.21 |
+| visibility-only | x86-64 | mapped, spin | 0.93–0.95 / 0.81–0.83 | 3.3 / 2.8–3.1 | 418–441 / 372–441 | 1.01–1.03 ms / 0.96–1.04 ms | 1.63–17.1 ms / 1.46–1.66 ms | 0–142 / 0 | 1.00 / 1.00 |
+| visibility-only | x86-64 | safe, default | 2.6 / 2.6–2.7 | 5.6–5.7 / 5.3–5.6 | 427–450 / 383–453 | 1.02–1.05 ms / 0.98–1.05 ms | 1.64–16.1 ms / 1.47–1.68 ms | 1–191 / 1 | 1.00 / 1.00 |
+| visibility-only | aarch64 | mapped, spin | 0.57 / 0.53–0.54 | 2.8–2.9 / 2.2 | 324–335 / 31 | 940–948 / 775–779 | 1.22–1.28 ms / 1.03–1.50 ms | 0 / 0 | 1.00 / 1.00 |
+| visibility-only | aarch64 | safe, default | 2.8 / 2.8 | 5.6–5.9 / 5.2 | 335–345 / 36 | 947–956 / 782–784 | 1.23–1.30 ms / 1.40–1.50 ms | 0 / 0–1 | 1.00 / 1.00 |
+
+**Writer schedule and CPU (64 B):**
+
+| Scenario | Arch | Rate (records/s) | Achieved (records/s) | Late sends (%) | Max schedule delay | Writer CPU (process) | Writer CPU (measuring thread) |
+|---|---|---|---|---|---|---|---|
+| probe (unpaced) | x86-64 | unpaced | 3,207,061 / 3,455,547 | – | – | 1.29 / 1.17 | 0.99 / 0.98 |
+| probe (unpaced) | aarch64 | unpaced | 3,345,229 / 3,252,565 | – | – | 1.10 / 1.10 | 0.94 / 0.99 |
+| steady-50 | x86-64 | 1,603,530 / 1,727,773 | 1,603,530 / 1,727,773 | 11.1–11.7 / 11.2–11.7 | 5.0–5.9 ms / 1.56–2.0 ms | 1.14–1.15 / 1.17 | 1.00 / 1.00 |
+| steady-50 | aarch64 | 1,672,614 / 1,626,282 | 1,672,614 / 1,626,282 | 2.9–3.1 / 2.2–2.3 | 0.63–2.3 ms / 2.6–5.5 ms | 1.08–1.09 / 1.07 | 1.00 / 1.00 |
+| steady-90 | x86-64 | 2,886,355 / 3,109,992 | 2,886,180–2,886,260 / 3,109,990 | 85.5–94.5 / 61.4–63.8 | 44–514 ms / 28–56 ms | 1.26–1.27 / 1.29 | 1.00 / 1.00 |
+| steady-90 | aarch64 | 3,010,706 / 2,927,308 | 3,010,499–3,010,524 / 1,949,485–2,038,906 | 71.7–75.9 / 99.6–99.9 | 49–51 ms / 203–224 s | 1.13–1.14 / 0.80–0.82 | 1.00 / 0.76–0.78 |
+| bursty | x86-64 | 1,282,824 / 1,382,218 | 1,283,997–1,284,050 / 1,383,566–1,383,576 | 100.0 / 100.0 | 281–288 ms / 232–243 ms | 1.12 / 1.14 | 1.00 / 1.00 |
+| bursty | aarch64 | 1,338,091 / 1,301,026 | 1,339,375–1,339,379 / 1,302,332–1,302,372 | 100.0 / 100.0 | 258–260 ms / 367–408 ms | 1.06–1.07 / 1.05–1.06 | 1.00 / 1.00 |
+| visibility-only | x86-64 | 1,603,530 / 1,727,773 | 1,603,530 / 1,727,773 | 9.2–9.3 / 6.5–8.8 | 16.5–20 ms / 1.27–28 ms | 1.14–1.15 / 1.16–1.17 | 1.00 / 1.00 |
+| visibility-only | aarch64 | 1,672,614 / 1,626,282 | 1,672,614 / 1,626,282 | 1.7 / 1.2–1.3 | 1.14–1.17 ms / 1.17–1.21 ms | 1.07–1.08 / 1.06 | 1.00 / 1.00 |
+
+**Append latency (64 B, every append timed, µs):**
+
+| Scenario | Arch | p50 | p99 | p99.9 | p99.99 | max |
+|---|---|---|---|---|---|---|
+| probe (unpaced) | x86-64 | 0.18 / 0.12 | 1.40 / 0.54 | 1.90 / 1.85 | 6.8 / 5.7 | 132 ms / 74 ms |
+| probe (unpaced) | aarch64 | 0.14 / 0.13 | 0.23 / 0.21 | 1.86 / 1.75 | 2.9 / 2.5 | 219 ms / 8.1 ms |
+| steady-50 | x86-64 | 0.24–0.25 / 0.20 | 1.41–1.44 / 1.43–1.44 | 2.1 / 1.91–1.96 | 6.7–7.0 / 6.5–6.7 | 2.3–5.8 ms / 0.69–1.60 ms |
+| steady-50 | aarch64 | 0.15 / 0.14 | 0.65–0.66 / 0.63–0.64 | 2.4 / 2.2 | 4.0–4.2 / 3.9–4.0 | 0.61–1.40 ms / 2.6–5.5 ms |
+| steady-90 | x86-64 | 0.20–0.21 / 0.13 | 1.37–1.47 / 1.39–1.40 | 2.0–2.1 / 1.85–2.0 | 6.7–7.1 / 6.3–6.5 | 6.8–19.7 ms / 23–24 ms |
+| steady-90 | aarch64 | 0.14 / 0.13 | 0.61–0.62 / 0.56–0.59 | 2.1–2.2 / 1.96–2.0 | 3.5–3.6 / 3.6–3.7 | 7.7–15.5 ms / 68–288 ms |
+| bursty | x86-64 | 0.21 / 0.12 | 1.40–1.41 / 1.36 | 1.99–2.1 / 1.89–1.98 | 6.6–6.9 / 6.4–6.5 | 4.3–12.5 ms / 8.1–21 ms |
+| bursty | aarch64 | 0.14 / 0.13 | 0.57–0.63 / 0.54–0.56 | 2.2 / 1.99–2.0 | 3.6 / 3.2–3.3 | 7.7–8.9 ms / 26–45 ms |
+| visibility-only | x86-64 | 0.21 / 0.12 | 1.32–1.33 / 1.33–1.35 | 1.93 / 1.81–1.87 | 6.3 / 5.9–6.2 | 12.3–13.2 ms / 1.23–10.2 ms |
+| visibility-only | aarch64 | 0.14 / 0.13 | 0.23 / 0.21 | 2.0–2.1 / 1.83–1.88 | 3.5 / 3.0–3.3 | 1.11–1.12 ms / 1.12–1.17 ms |
+
+**Checkpoints and rolls (64 B).**
+
+| Scenario | Arch | Pause p50 | Pause p99 | Pause max | To durable p50 | To durable p99 | To durable max | Rolls | Roll p50 | Roll max |
+|---|---|---|---|---|---|---|---|---|---|---|
+| probe (unpaced) | x86-64 | 1.26 ms / 1.85 ms | 114 ms / 74 ms | 132 ms / 74 ms | 230 ms / 27 s | 570 ms / 51 s | 592 ms / 53 s | 1,491 / 1,606 | 102 / 109 | 4.5 ms / 74 ms |
+| probe (unpaced) | aarch64 | 1.09 ms / 165 | 142 ms / 8.1 ms | 219 ms / 8.1 ms | 548 ms / 1.01 s | 939 ms / 11.8 s | 1.04 s / 14.6 s | 1,555 / 1,512 | 198 / 157 | 135 ms / 8.1 ms |
+| steady-50 | x86-64 | 71–78 / 85–86 | 151–229 / 230–243 | 324–453 / 268–557 | 1.41–2.4 ms / 1.83–2.0 ms | 3.6–5.9 ms / 3.7–4.4 ms | 4.2–6.8 ms / 4.0–5.2 ms | 757 / 816 | 189–215 / 123–127 | 453–503 / 447–557 |
+| steady-50 | aarch64 | 49–61 / 50–52 | 113–163 / 167–229 | 453–529 / 2.6–2.9 ms | 917–978 / 0.85–1.29 ms | 1.19–1.29 ms / 0.24–1.14 s | 1.26–1.93 ms / 0.28–1.44 s | 790 / 768 | 262–275 / 150–156 | 603–607 / 2.6–2.9 ms |
+| steady-90 | x86-64 | 95–837 / 94–96 | 3.5–4.4 ms / 2.0–2.9 ms | 5.9–6.8 ms / 3.4–6.6 ms | 1.76–22 ms / 6.4–7.5 ms | 40–63 ms / 32–79 ms | 60–79 ms / 103–440 ms | 1,364 / 1,469 | 189–192 / 101–106 | 4.1–4.2 ms / 833–882 |
+| steady-90 | aarch64 | 1.13–1.19 ms / 24–27 ms | 6.7–6.9 ms / 68–288 ms | 7.7–8.3 ms / 68–288 ms | 37–50 ms / 58–62 s | 61–62 ms / 96–121 s | 64–66 ms / 99–127 s | 1,423 / 1,012–1,058 | 295–337 / 160–162 | 5.9–15.5 ms / 68–288 ms |
+| bursty | x86-64 | 100–116 / 70–82 | 2.5–2.6 ms / 178 | 4.3–4.4 ms / 6.8–8.1 ms | 2.9–4.2 ms / 58 ms | 39–44 ms / 70–71 ms | 45–68 ms / 73–76 ms | 606 / 653 | 197–220 / 105–115 | 3.9–4.2 ms / 524–701 |
+| bursty | aarch64 | 1.30–1.32 ms / 138–142 | 6.5–6.9 ms / 2.3–4.6 ms | 7.7–8.9 ms / 26–45 ms | 36–38 ms / 75–77 ms | 50–51 ms / 708–977 ms | 53 ms / 0.79–1.42 s | 632 / 614 | 1.13–1.17 ms / 147–154 | 4.2–5.3 ms / 349–430 |
+| visibility-only | x86-64 | – | – | – | – | – | – | 757 / 816 | 1.03 ms / 982–996 | 1.30–5.1 ms / 1.19–1.23 ms |
+| visibility-only | aarch64 | – | – | – | – | – | – | 790 / 768 | 957 / 807–821 | 1.11–1.12 ms / 1.12–1.17 ms |
+
+**Readers (64 B).**
+
+| Scenario | Arch | Reader | p50 | p99 | p99.9 | p99.99 | max | Lag max (records) | CPU |
+|---|---|---|---|---|---|---|---|---|---|
+| probe (unpaced) | x86-64 | mapped, spin | 0.34 / 0.26 | 1.77 / 1.55 | 183 / 347 | 477 / 476 | 132 ms / 75 ms | 5,775 / 8,151 | 1.00 / 1.00 |
+| probe (unpaced) | x86-64 | safe, default | 4.8 / 4.3 | 9.4 / 6.7 | 51 / 11.5 | 85 / 222 | 132 ms / 74 ms | 5,663 / 9,223 | 0.99 / 0.97 |
+| probe (unpaced) | aarch64 | mapped, spin | 0.28 / 0.26 | 1.28 / 0.86 | 483 / 370 | 646 / 547 | 219 ms / 8.7 ms | 2,341 / 1,941 | 1.00 / 1.00 |
+| probe (unpaced) | aarch64 | safe, default | 5.3 / 5.0 | 8.4 / 7.8 | 11.4 / 10.0 | 2.2 ms / 36 | 219 ms / 8.2 ms | 13,351 / 12 | 0.94 / 0.99 |
+| steady-50 | x86-64 | mapped, spin | 0.42 / 0.34 | 127–132 / 104–119 | 194–205 / 180–191 | 728–802 / 635–641 | 5.0–8.6 ms / 1.57–2.1 ms | 903–11,391 / 754–920 | 1.00 / 1.00 |
+| steady-50 | x86-64 | safe, default | 3.1–3.3 / 3.2 | 129–134 / 107–121 | 176–188 / 161–177 | 271–287 / 209–285 | 6.0–6.8 ms / 1.87–2.3 ms | 3–60 / 11–1,397 | 1.00 / 1.00 |
+| steady-50 | x86-64 | safe, durable-only, block | 589–596 ms / 598–599 ms | 994–995 ms / 994 ms | 1.00 s / 1.00 s | 1.00 s / 1.00 s | 1.00–1.01 s / 1.00–1.01 s | 1,608,703–1,611,775 / 1,732,607–1,734,655 | 1.00 / 1.00 |
+| steady-50 | aarch64 | mapped, spin | 0.31 / 0.30 | 3.2–5.9 / 2.5–2.6 | 334–380 / 225–238 | 871–908 / 773–783 | 1.32–2.3 ms / 3.4–5.5 ms | 1,316–1,499 / 1,168–1,190 | 1.00 / 1.00 |
+| steady-50 | aarch64 | safe, default | 3.7 / 3.8 | 7.6–8.7 / 7.1–7.4 | 47–63 / 39 | 267–293 / 171–181 | 0.68–2.3 ms / 2.7–5.5 ms | 5–19 / 2–4 | 1.00 / 1.00 |
+| steady-50 | aarch64 | safe, durable-only, block | 613–614 ms / 632–635 ms | 994 ms / 1.08–1.78 s | 1.00 s / 1.21–2.2 s | 1.00 s / 1.25–2.4 s | 1.00 s / 1.28–2.4 s | 1,674,239 / 2,074,623–3,958,783 | 1.00 / 1.00 |
+| steady-90 | x86-64 | mapped, spin | 5.6–27 ms / 41–54 | 28–454 ms / 0.83–2.1 ms | 35–494 ms / 4.7–27 ms | 40–509 ms / 24–50 ms | 44–514 ms / 29–56 ms | 901–1,890 / 669–1,626 | 1.00 / 1.00 |
+| steady-90 | x86-64 | safe, default | 5.6–27 ms / 45–59 | 28–454 ms / 0.84–2.1 ms | 35–494 ms / 4.7–27 ms | 40–509 ms / 24–50 ms | 44–514 ms / 29–56 ms | 585–1,515 / 621–5,987 | 1.00 / 1.00 |
+| steady-90 | x86-64 | safe, durable-only, block | 685–813 ms / 683–686 ms | 1.02–1.38 s / 1.00–1.01 s | 1.05–1.48 s / 1.02–1.17 s | 1.07–1.53 s / 1.09–1.40 s | 1.10–1.55 s / 1.13–1.44 s | 3,057,663–3,190,783 / 3,446,783–4,292,607 | 1.00 / 1.00 |
+| steady-90 | aarch64 | mapped, spin | 7.9–11.4 ms / 43–122 s | 38–45 ms / 201–219 s | 43–49 ms / 203–223 s | 46–50 ms / 203–224 s | 49–51 ms / 203–224 s | 1,962–2,387 / 1,336–1,436 | 1.00 / 1.00 |
+| steady-90 | aarch64 | safe, default | 7.9–11.4 ms / 43–122 s | 38–45 ms / 201–219 s | 43–49 ms / 203–223 s | 46–50 ms / 203–224 s | 49–51 ms / 203–224 s | 14–1,525 / 347–388 | 1.00 / 0.76–0.78 |
+| steady-90 | aarch64 | safe, durable-only, block | 772–783 ms / 119–194 s | 1.06–1.08 s / 288–322 s | 1.08–1.09 s / 291–324 s | 1.08–1.09 s / 291–324 s | 1.09–1.10 s / 291–324 s | 3,143,679–3,149,823 / 188,088,319–308,019,199 | 1.00 / 0.61–0.77 |
+| bursty | x86-64 | mapped, spin | 102–107 ms / 92–93 ms | 236–248 ms / 203–205 ms | 242–254 ms / 207–210 ms | 246–275 ms / 210–228 ms | 249–288 ms / 213–243 ms | 545–1,338 / 586–613 | 1.00 / 1.00 |
+| bursty | x86-64 | safe, default | 102–107 ms / 92–93 ms | 236–248 ms / 203–205 ms | 242–254 ms / 207–210 ms | 246–275 ms / 210–228 ms | 249–288 ms / 213–243 ms | 57–551 / 15–1,571 | 0.44–0.45 / 0.41 |
+| bursty | x86-64 | safe, durable-only, block | 981–983 ms / 1.03 s | 1.03 s / 1.06 s | 1.04 s / 1.07 s | 1.04–1.06 s / 1.07–1.08 s | 1.05–1.07 s / 1.07–1.08 s | 1,382,399–1,419,263 / 1,562,623–1,573,887 | 0.44–0.45 / 0.40–0.41 |
+| bursty | aarch64 | mapped, spin | 88–89 ms / 100–102 ms | 212 ms / 341–343 ms | 217 ms / 359–361 ms | 219–220 ms / 365–387 ms | 222–223 ms / 367–409 ms | 2,057–2,475 / 1,419–1,858 | 1.00 / 1.00 |
+| bursty | aarch64 | safe, default | 88–89 ms / 100–102 ms | 212 ms / 341–343 ms | 217 ms / 359–361 ms | 219–220 ms / 365–387 ms | 222–223 ms / 367–409 ms | 10–15 / 14–2,197 | 0.41 / 0.43 |
+| bursty | aarch64 | safe, durable-only, block | 1.02–1.03 s / 1.06–1.08 s | 1.05 s / 1.70–1.96 s | 1.05 s / 1.78–2.3 s | 1.05 s / 1.79–2.4 s | 1.05 s / 1.79–2.4 s | 1,449,983–1,454,079 / 2,603,007–3,440,639 | 0.41 / 0.47–0.48 |
+| visibility-only | x86-64 | mapped, spin | 0.43 / 0.33 | 68–72 / 14.5–28 | 612–618 / 559–583 | 1.06 ms / 0.99–1.07 ms | 16.5–20 ms / 1.27–28 ms | 0 / 0 | 1.00 / 1.00 |
+| visibility-only | x86-64 | safe, default | 3.2 / 3.1 | 71–75 / 17.8–31 | 618–623 / 567–591 | 1.08–1.09 ms / 1.01–1.09 ms | 17.7–20 ms / 1.43–30 ms | 4–1,839 / 8–4,367 | 1.00 / 1.00 |
+| visibility-only | aarch64 | mapped, spin | 0.30 / 0.30 | 2.2–2.3 / 1.71–1.81 | 540–541 / 358–366 | 944 / 796–803 | 1.15–1.32 ms / 1.18–1.25 ms | 0 / 0 | 1.00 / 1.00 |
+| visibility-only | aarch64 | safe, default | 3.7 / 3.7–3.8 | 7.3–7.5 / 6.9–7.0 | 546–547 / 365–372 | 957–958 / 805–815 | 1.16–1.18 ms / 1.17–1.23 ms | 4–5 / 3 | 1.00 / 1.00 |
+
+The longest appends of the paced runs, from `series.jsonl` (2026-11-22, UTC), every one of 100 ms or more:
+- aarch64 ext4, steady-90 at 1,024 B: appends of 50 ms or more in 148 of the 600 seconds of repeat 1 (11:42:56Z to
+  11:52:44Z) and 172 of repeat 2 (13:04:27Z to 13:14:34Z), up to 112 ms (11:48:19Z) and 128 ms (13:04:56Z); none was a
+  roll. Their checkpoints took 331–342 ms (p50) to become durable, against 1.57–2.6 ms on x86-64. Not investigated.
+- aarch64 xfs, steady-90 at 1,024 B: one append of 149 ms (11:46:01Z) and one of 122 ms (13:08:35Z), not rolls.
+- aarch64 xfs, steady-90 at 64 B, repeat 1: roll appends of 288 ms (11:06:15Z) and 115 ms (11:12:48Z).
+- x86-64 ext4, bursty at 1,024 B, repeat 1: a roll append of 125 ms (11:59:50Z).
+
+What this session shows (`3fea1c0`):
+- **1,024 B, half the probe rate** (steady-50, 131,210–173,119 records/s, 134–177 MB/s of payload): the writer keeps its
+  schedule (every scheduled record sent, 0.5–1.7 % of sends late, at most 24 ms behind on x86-64 ext4 and 2.7 ms
+  elsewhere); a checkpoint pauses the writer for 42–91 µs (p50) and at most 1.93 ms, and is durable 0.87–4.5 ms (p50)
+  after its request, at most 16.6 ms, except on aarch64 xfs, where the slowest took 0.53–3.9 s; the
+  visible readers see p99.9 of 15.9–256 µs and at most 24 ms; durable-only readers trail by 0.52–0.53 s (p50).
+- **1,024 B, 90 % of the probe** (steady-90, 236,178–311,614 records/s, 242–319 MB/s): every scheduled record was
+  sent, 0.7–6.9 % late, at most 148 ms behind. On x86-64 a checkpoint is durable 1.57–2.6 ms (p50) after its request
+  (at most 225 ms) and the visible readers' p99.9 is 45–436 µs; on aarch64 the writer is held up for up to 112–149 ms
+  (above), checkpoints are durable 0.99–342 ms (p50) and at most 2.6 s after the request, and the readers' p99.9 is up
+  to 82 ms.
+- **1,024 B bursts** at twice the probe rate for 200 ms of every second: unlike at 64 B, the writer keeps up with most
+  of each burst (29–32 % of sends late on x86-64, 0.9–2.9 % on aarch64; at most 125 ms behind), and the readers' p50
+  of the visible readers stays at 0.54–4.7 µs.
+- **1,024 B unpaced** (the probe, 262,421–346,239 records/s, 269–355 MB/s): checkpoints fall behind. 598 of the 599
+  requests found one in flight and joined it; a checkpoint became durable 35–73 s (p50) and at most 107 s after its
+  request, the writer was held up for up to 372 ms (rolls on x86-64), and dirty page cache reached 10.6 GB (x86-64) and
+  6.2 GB (aarch64). Retention kept up over these 10 minutes: it removed 737–1,135 segments for 1,248–1,646 rolls (511
+  fewer on every VM), so the journal ended at its 64 GiB limit. The final checkpoint took 0.53–1.44 s. Without
+  checkpoints, the comparison's 10-minute probes at `88b3304` reached 0.34–0.35 million records/s on the same machine
+  types; here x86-64 and aarch64 ext4 reach 0.34–0.35 million and aarch64 xfs 0.26 million.
+- **64 B** (probe 3,207,061–3,455,547 records/s, so the paced rates are 11–15 % above the first session's): at half the
+  probe rate (1,603,530–1,727,773 records/s, 103–111 MB/s) the writer keeps its schedule (2.2–11.7 % late, at most
+  5.9 ms behind), a checkpoint pauses it for 49–86 µs (p50) and at most 2.9 ms and is durable 0.85–2.4 ms (p50) after
+  its request, at most 6.8 ms except on aarch64 xfs (up to 1.44 s); visible readers see p99.9 of 39–380 µs and at most
+  8.6 ms. At 90 % of the probe, x86-64 (ext4 and xfs) and aarch64 ext4 sent every scheduled record within 0.01 % of
+  the rate although 61–95 % of sends were late (at most 514 ms behind); their checkpoints were durable 1.76–50 ms
+  (p50) and at most 440 ms after the request, and the final checkpoint took at most 52 ms (at `279f59a`, at lower
+  rates, the same scenario fell 23–52 s behind and three runs failed). aarch64 xfs fell behind and stopped (above):
+  checkpoints durable 58–62 s (p50) after the request, the writer 203–224 s behind its schedule. Bursts: every send in
+  a burst is late and the backlog (at most 232–408 ms) drains before the next burst, as before.
+- **Without checkpoints** (visibility-only), no append took longer than 13.2 ms at 64 B and 7.4 ms at 1,024 B: the
+  single stalls of 0.10–0.67 s seen in six of the eight 64 B runs at `279f59a` did not recur.
+
+### Long verified runs (`3fea1c0`, issues #43 and #45)
+
+On the same four VMs, right after the session (2026-11-22, from 13:35 to 14:00 UTC), one run each: an unpaced 1,024 B
+writer with a background checkpoint requested every second and retention of 64 GiB, a zero-copy and a copying reader,
+memory compaction forced every second, then `tickertape verify` of the journal from the file:
+
+```sh
+( while true; do echo 1 | sudo tee /proc/sys/vm/compact_memory > /dev/null; sleep 1; done ) &
+tt-sustained run --dir /data/tt/long --out /data/results/long --unpaced --duration 3600s --payload 1024 \
+  --checkpoint-every 1s --retain-bytes 68719476736 --readers mapped,safe:wait=default \
+  --checkpoint-mode background --cpus 1,2,3,4,5,6 --json
+tickertape verify /data/tt/long
+```
+
+(`/data2/tt/long` on xfs). **Every run failed: the disk filled.** Planned for 3,600 s, each ended after 1,075–1,304 s
+when the writer could not create its next segment, for example on x86-64 ext4
+`preallocate segment failed for /data/tt/long/00000000000354464640.tape.tmp: No space left on device (os error 28)`.
+`tt-sustained` therefore wrote no `result.json`; the figures below come from the per-second series, the output of
+`tickertape verify`, the segment listing and `/proc/vmstat`. Retention had fallen behind: it removed 20 segments
+(x86-64) and 35–36 (aarch64) while the writer rolled 2,809–2,972, so the journal grew to 349–368 GiB (`du -sh`) on a
+375 GB SSD, against a limit of 64 GiB. The cause is not known yet (issue #45, open). The same command, without forced
+compaction, kept the journal at its limit in the session's 10-minute probes on the same machines (737–1,135 segments
+removed over 599 checkpoints, no retention error), so the one-segment yield of ADR 0044 alone does not explain it.
+What the two runs differ in is the forced compaction and the duration; whether checkpoints stopped completing (a
+segment is removed only once a checkpoint has passed it), retention failed repeatedly, or something else held it
+back, was not recorded, because the failed runs wrote no result.
+
+| VM | Ran (s) | Records written | Mean rate (records/s) | MB/s of payload | Segments removed / left | Journal at the end | Append max | Reader max (mapped / safe) | `verify` | Pages migrated | Compactions |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| x86-64 ext4 | 1,075 | 354,464,640 | 329,735 | 338 | 20 / 2,790 | 349 GiB | 397 ms | 397 ms / 397 ms | 351,941,760 records, no problem | 2,059,684 | 593 |
+| x86-64 xfs | 1,134 | 373,133,952 | 329,042 | 337 | 20 / 2,938 | 368 GiB | 239 ms | 240 ms / 239 ms | 370,611,072 records, no problem | 1,790,957 | 2,291 |
+| aarch64 ext4 | 1,083 | 356,482,944 | 329,162 | 337 | 36 / 2,790 | 349 GiB | 389 ms | 390 ms / 389 ms | 351,941,760 records, no problem | 2,013,771 | 2,713 |
+| aarch64 xfs | 1,304 | 375,026,112 | 287,597 | 294 | 35 / 2,938 | 368 GiB | 183 ms | 183 ms / 183 ms | 370,611,072 records, no problem | 2,135,480 | 3,904 |
+
+"Records written" is the writer's last position; "Pages migrated" and "Compactions" are `pgmigrate_success` and
+`compact_success` from `/proc/vmstat` after the run, counted since the VM booted (so they include the session before
+it). Reader lag peaked at 1,406–1,726 records for the zero-copy reader and 61–2,025 for the copying reader.
+
+What the runs show, until the disk filled:
+- **No reader reported corruption**, and both readers of every run reached the writer's last position with no record
+  skipped.
+- **`tickertape verify`** of each journal (exit status 0, no problem listed) found every retained record valid and
+  the chain intact: its last sequence number is the writer's last record, and the records it counts plus those
+  retention removed are every record written.
+- So, with the reader's re-read window of #44, a view that lags (`crash-contract.md` → Known risks and limits) stopped
+  no reader, and no write was lost, in about 1.5 TB of payload written under forced compaction on aarch64 and x86-64.
+  This is the evidence that closed issue #43; the platform mechanism stays unconfirmed.
+- Retention did not keep up in these runs, for a reason not yet known (above); the operating envelope below says so.
 
 ### Reference before the checkpoint work: blocking checkpoints (`29960a3`)
 
@@ -969,48 +1256,67 @@ commits stated above). Rates are of these machines and do not carry over to othe
   payload, `279f59a`): the writer keeps its schedule (every scheduled record sent, at most 4.0 ms behind; 1.9–9.8 % of
   sends more than 1 µs late), appends take at most 3.4 ms, a checkpoint pauses the writer for at most 0.79 ms and is
   durable within 7.2 ms of its request, and the visible readers see p99.9 of 32–230 µs and at most 4.0 ms. Durable-only
-  readers trail by up to the checkpoint interval (p50 0.58–0.60 s, at most about 1 s).
-- **1,024 B with background checkpoints** at half a 60-second probe (about 250 MB/s, the finish round's builds, 3-minute
-  runs): checkpoint pauses of at most 0.34 ms, durable within 5 ms. The 10-minute 1,024 B scenarios of the sustained
-  session did not run (their probe failed, above), so a 10-minute envelope at 1,024 B with background checkpoints is not
-  established; the comparison's 10-minute probes at 1,024 B (the probe has no checkpoints) settle at 0.34–0.35 million
-  records/s, the same rate as the other tools that write to files.
+  readers trail by up to the checkpoint interval (p50 0.58–0.60 s, at most about 1 s). At `3fea1c0` (second session,
+  1.60–1.73 million records/s, 103–111 MB/s) the same holds with pauses of at most 2.9 ms, durable within 6.8 ms and
+  readers' p99.9 of 39–380 µs, except that on aarch64 xfs the slowest checkpoint of each repeat took 0.28–1.44 s to
+  become durable.
+- **1,024 B with a background checkpoint every second** (second session, `3fea1c0`, 10-minute runs): at half the probe
+  rate (131,210–173,119 records/s, 134–177 MB/s) the writer keeps its schedule (0.5–1.7 % late, at most 24 ms behind),
+  a checkpoint pauses it for at most 1.93 ms and is durable within 16.6 ms of its request (on aarch64 xfs the slowest
+  took 0.53–3.9 s), and the visible readers see p99.9 of 15.9–256 µs and at most 24 ms. At 90 % of the probe
+  (236,178–311,614 records/s, 242–319 MB/s) every scheduled record is sent (0.7–6.9 % late, at most 148 ms behind);
+  checkpoints are durable within 225 ms on x86-64 and 2.6 s on aarch64, where appends of 50–128 ms recur on ext4
+  (above). The unpaced 10-minute probe reaches 262,421–346,239 records/s (269–355 MB/s), the comparison's probes
+  without checkpoints 0.34–0.35 million records/s (`88b3304`). The finish round's 3-minute runs at about 250 MB/s
+  (16-vCPU VMs) had pauses of at most 0.34 ms, durable within 5 ms.
 - **At 90 % of the probe** (64 B, 2.60–2.79 million records/s, background checkpoints) the writer does not keep its
   schedule: it reaches 92–97 % of the rate, 72–83 % of sends are late and the backlog grows to 23–52 s by the end;
   background checkpoints fall behind (requests join the queued one; durable 9.6–21 s after the request at p50, up to
   141–236 s), the final checkpoint takes 54–103 s, and three of the eight runs failed (above). The probe therefore
   overstates what the writer sustains with periodic durability; with blocking checkpoints and early write-back (the
   comparison's SD at 90 %, `88b3304`) the writer kept up at 64 B on both aarch64 VMs and on x86-64 ext4, and fell behind
-  on x86-64 xfs.
+  on x86-64 xfs. At `3fea1c0` (second session, 2.89–3.11 million records/s) the writer sent every scheduled record on
+  x86-64 and aarch64 ext4, 61–95 % of sends late and at most 514 ms behind, with checkpoints durable within 440 ms; on
+  aarch64 xfs it fell more than 60 s behind and stopped, with checkpoints durable about a minute after their request.
+  At 1,024 B the writer kept its schedule at 90 % on every VM (above).
 - **Bursts** at twice the probe rate for 200 ms of every second (mean 0.4R): every send in a burst is late, the writer's
   backlog reaches 178–232 ms within a burst and drains before the next one; readers follow the writer (lag at most
-  15,159 records), so their latency (p50 58–82 ms, at most 153–226 ms) is the writer's backlog.
+  15,159 records), so their latency (p50 58–82 ms, at most 153–226 ms) is the writer's backlog. At 1,024 B
+  (`3fea1c0`) the writer keeps up with most of each burst: 0.9–32 % of sends late, at most 125 ms behind.
 - **Reader lag.** Readers that keep up (steady-50, bursty, visibility-only) lagged by at most 15,159 records (mapped)
-  and 33,887 (safe), and their latency is the writer's. A reader that reads slower than the writer appends loses records
-  to retention once the segments it has not read are removed: by design, reported as skipped records (lagging scenario,
-  `29960a3`). A reader that stalls and resumes catches up without loss; a reader at half the rate that falls minutes
-  behind into data no longer in memory reads it from storage without loss while retention keeps it (beyond-RAM,
-  `29960a3`).
-- **Storage-bound.** At 1,024 B for 10 minutes on these VMs (see the comparison's probe); with blocking checkpoints
+  and 33,887 (safe) at `279f59a`, and by at most 11,391 and 4,367 at `3fea1c0`, and their latency is the writer's. A
+  reader that reads slower than the writer appends loses records to retention once the segments it has not read are
+  removed: by design, reported as skipped records (lagging scenario, `29960a3`). A reader that stalls and resumes
+  catches up without loss; a reader at half the rate that falls minutes behind into data no longer in memory reads it
+  from storage without loss while retention keeps it (beyond-RAM, `29960a3`).
+- **Storage-bound.** At 1,024 B for 10 minutes on these VMs (see the comparison's probe and the second session's);
+  unpaced with a checkpoint requested every second, checkpoints fall about a minute behind (durable 35–73 s after the
+  request at p50, `3fea1c0`) with up to 10.6 GB of dirty page cache; with blocking checkpoints
   without early write-back the stop at each checkpoint grows with the dirty data it syncs (0.24–0.27 s at 64 B and
   0.37–0.40 s at 1,024 B per second of half-rate data at `29960a3`, 0.75–0.80 s at about 250 MB/s in the finish round).
 - **Remaining, measured:** a helper thread on the writer's CPU still delays it (up to 3.0 ms with
-  `HelperCpus::Inherited`; the default places helpers elsewhere); at 90 % durability falls minutes behind; a single
-  stall of 0.10–0.67 s in six of the eight 10-minute runs without checkpoints at `279f59a`, not explained and not
-  re-measured after #38; the aarch64 mapped reader's 10 ms maximum in the finish round, not investigated.
+  `HelperCpus::Inherited`; the default places helpers elsewhere); at 90 % of the 64 B probe durability fell minutes
+  behind at `279f59a` and, at `3fea1c0`, on aarch64 xfs; appends of 50–128 ms in 148–172 seconds of each 1,024 B
+  steady-90 run on aarch64 ext4 (`3fea1c0`), not rolls, not investigated; the single stalls of 0.10–0.67 s without
+  checkpoints at `279f59a` did not recur at `3fea1c0` (at most 13.2 ms); the aarch64 mapped reader's 10 ms maximum in
+  the finish round (16-vCPU VMs), not investigated and not seen in the second session (8-vCPU VMs).
 - **Remaining, open:** the record checksum mismatch that stopped a reader of the 1,024 B probe on both aarch64 VMs at
-  `279f59a` is issue #43 (readers now tolerate the lagging view, `crash-contract.md` → Known risks and limits); the
-  10,000- and 20,000-segment journals and the 1,024 B sustained scenarios at the
-  current code are not measured.
-- **Retention behind an overloaded writer (issue #45; being addressed by ADR 0044).** The time-out of the 1,024 B
-  probe on x86-64 (it also occurs on aarch64) comes from retention: before deleting a segment it read the whole segment
-  on the checkpoint thread, behind a writer that outran the disk the old segments were no longer in memory, retention
-  fell far behind, and the final checkpoint and the writer's shutdown waited for it; probably also the 64 B runs at
-  90 % of the probe that failed because background checkpoints did not finish in time. ADR 0044 changes this: a
-  deletion reads only the end of the segment back to its seal, and the writer's retention run gives way to a waiting
-  checkpoint and to `close` after the removal in progress. Not yet measured: the 1,024 B sustained scenarios with
-  background checkpoints and 64 GiB of retention, the 64 B scenarios at 90 % of the probe, and how far retention falls
-  behind under sustained overload now that it no longer holds up the checkpoints (the journal's size meanwhile).
+  `279f59a` was a reader's view lagging a correctly published record; readers now tolerate it, and the long verified
+  runs at `3fea1c0` showed no false corruption and no lost write (issue #43, closed; the platform mechanism is not
+  confirmed, `crash-contract.md` → Known risks and limits). Not measured: the 10,000- and 20,000-segment journals, and
+  the lagging and beyond-RAM scenarios with background checkpoints.
+- **Retention behind an overloaded writer (issue #45, open).** The time-out of the 1,024 B probe at
+  `279f59a` came from retention: before deleting a segment it read the whole segment on the checkpoint thread, behind a
+  writer that outran the disk the old segments were no longer in memory, retention fell far behind, and the final
+  checkpoint and the writer's shutdown waited for it; probably also the 64 B runs at 90 % of the probe that failed
+  because background checkpoints did not finish in time. Since ADR 0044 (`3fea1c0`) a deletion reads only the end of
+  the segment back to its seal, and the writer's retention run gives way to a waiting checkpoint and to `close` after
+  one removal; every run of the second session finished, and in the 10-minute 1,024 B probes the journal stayed at its
+  64 GiB limit. **The open point:** in the long verified runs, the same writer under forced memory compaction, retention
+  removed 20–36 segments while the writer rolled 2,809–2,972, and the runs ended after 1,075–1,304 s with the disk full
+  at 349–368 GiB (above). The cause is not known yet. Until it is found and fixed, watch the journal's size under
+  sustained overload: `tickertape status` shows the growth (`segments.before_checkpoint`, `segments.total_bytes` and
+  the storage headroom thresholds). A long run that completes is still to be recorded.
 
 ## 2026-11-02, v0.3.0 on Linux (AWS) and macOS
 

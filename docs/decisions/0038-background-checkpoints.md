@@ -1,9 +1,9 @@
 # 0038: A checkpoint that does not stop appends
 
 - **Status:** accepted on 2026-11-20 by the maintainers under the owner's delegation. Its Linux results (the prototype,
-  the finish round and the sustained session with background checkpoints) are recorded in `docs/benchmarks.md` →
-  "2026-11-19 to 2026-11-22, sustained workloads on Google Cloud VMs" → Checkpoints and → Sustained session (see "After
-  the Linux measurement")
+  the finish round and the sustained sessions with background checkpoints, the second with both payloads) are recorded
+  in `docs/benchmarks.md` → "2026-11-19 to 2026-11-22, sustained workloads on Google Cloud VMs" → Checkpoints, →
+  Sustained session and → Second sustained session (see "After the Linux measurement")
 - **Date:** 2026-11-20
 
 ## Context
