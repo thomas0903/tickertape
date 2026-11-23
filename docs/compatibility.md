@@ -145,7 +145,7 @@ The format is version 1 ([`format.md`](format.md); `format_version` changes when
 misread a file written by new code, `format.md` → Versioning). What "compatible" is tested to mean is ADR 0033: on
 Linux x86-64, Linux aarch64 and macOS, with the fixture shapes the ADR lists,
 
-- **new code reads and continues old journals:** journals written by every released version (v0.1.0 to v0.4.0, and v0.5.1) are
+- **new code reads and continues old journals:** journals written by every released version (v0.1.0 to v0.4.0, v0.5.1 and v1.0.0) are
   read identically by the current readers, CLI and Python decoder, and the current writer recovers and continues
   them as the crash contract says (`tests/compat.rs`, `crates/tickertape-cli/tests/compat_fixtures.rs`);
 - **old code reads new journals:** each released version's readers and `verify` read what the current writer wrote,
@@ -197,14 +197,15 @@ compare them with its own thresholds; any of the three can be added to the C ABI
 1. The C ABI at 1.0: done in the 1.0.0 release preparation. `TICKERTAPE_ABI_VERSION` is 1 and the ABI baseline
    (`crates/tickertape-ffi/abi/tickertape-baseline.h`) is the header shipped in 1.0.0, with 177 frozen declarations
    (`docs/playbooks/release-checklist.md` → C ABI at 1.0).
-2. The 1.0 fixtures: added after the release, written by the released version (`docs/playbooks/release-checklist.md`,
-   ADR 0033), as for every release.
+2. The 1.0 fixtures: added on 2026-11-23, written by the released version on macOS and Linux aarch64
+   (`docs/playbooks/release-checklist.md`, ADR 0033), as for every release.
 3. The roadmap's release-candidate exercise (release, installation and upgrade instructions and the external
    integration against a release candidate): done with v0.5.1 on 2026-11-23, the first release through every
    channel (`docs/playbooks/release-checklist.md` → What the v0.5.1 release found). Each channel was installed from
    after publication, the v0.4.0 fixture journals are read and continued by the released code, and the iceoryx2
    integration's tests pass against the crate from crates.io. Four defects were found and fixed, all in steps
-   that until then ran only for a release tag. The exercise's manual checks are repeated for 1.0.0 itself.
+   that until then ran only for a release tag. The exercise's manual checks were repeated for 1.0.0 itself after its
+   publication.
 4. The sustained session: its results and the operating envelope are recorded in `docs/benchmarks.md` (2026-11-19 to
    2026-11-22) for both payloads, the 1,024 B scenarios with background checkpoints at `3fea1c0` (every run finished).
    The record checksum mismatch of the 1,024 B probe at `279f59a` is resolved (issue #43, closed after the long verified

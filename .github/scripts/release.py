@@ -587,6 +587,10 @@ def checksums_extend(existing, new):
     return set(existing.splitlines()) <= set(new.splitlines())
 
 
+# How often a newly created draft is looked up in the listing, five seconds apart.
+NEW_RELEASE_LOOKUPS = 13
+
+
 def find_release(repo, tag):
     """The GitHub release for `tag`, draft or published, or None.
 
@@ -611,8 +615,14 @@ def github_release(args):
         subprocess.run(["gh", "release", "create", args.tag, "--repo", repo, "--verify-tag",
                         "--draft", "--title", f"tickertape {args.tag}",
                         "--notes-file", str(args.notes)], check=True)
-        existing = find_release(repo, args.tag)
-        if existing is None:
+        # The listing can lag the creation (the v1.0.0 run asked once, at once, and failed here): ask for a minute.
+        for attempt in range(NEW_RELEASE_LOOKUPS):
+            if attempt:
+                time.sleep(5)
+            existing = find_release(repo, args.tag)
+            if existing is not None:
+                break
+        else:
             raise ValueError(f"the draft release for {args.tag} was created but is not listed")
     asset_names = {asset["name"] for asset in existing["assets"]}
     # Compare every existing asset before uploading anything, so that a refused run leaves the release unchanged.

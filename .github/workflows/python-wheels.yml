@@ -422,12 +422,14 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install tickertape-cli from PyPI with pipx (retrying while PyPI's index catches up)
+        # The v1.0.0 run saw only the previous version for its five minutes of retries, although the upload had
+        # succeeded (the cause is not confirmed; rerunning the job passed). So: without pip's cache, and for ten minutes.
         run: |
-          for attempt in 1 2 3 4 5 6 7 8 9 10; do
-            if pipx install "tickertape-cli==$VERSION"; then
+          for attempt in $(seq 1 20); do
+            if pipx install --pip-args=--no-cache-dir "tickertape-cli==$VERSION"; then
               break
             fi
-            if [ "$attempt" -eq 10 ]; then exit 1; fi
+            if [ "$attempt" -eq 20 ]; then exit 1; fi
             sleep 30
           done
           test "$(tickertape --version)" = "tickertape $VERSION"
