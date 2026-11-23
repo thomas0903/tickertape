@@ -261,8 +261,7 @@ released with seven items open, accepted by the owner as known gaps
     (ADR 0043, accepted; resolved in #37), with the fixtures and soak tier (#12) and the metrics (#8, #30) in place.
     The release preparation set the C ABI to version 1 and froze its baseline; the release-candidate exercise was
     done with v0.5.1; the confirming long run (issue #45) was not repeated, since the library's code is unchanged
-    since `fbe5785`. The 1.0.0 fixtures follow the release, as for every release (they are written by the released
-    version). Measured operating limits are published for 64 B and 1,024 B
+    since `fbe5785`. The 1.0.0 fixtures were added after the release, written by the released version. Measured operating limits are published for 64 B and 1,024 B
     ([`benchmarks.md`](benchmarks.md) → Operating envelope and remaining bottlenecks); known issues are in
     [`crash-contract.md`](crash-contract.md) → Known risks and limits.
 

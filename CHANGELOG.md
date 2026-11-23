@@ -5,6 +5,14 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
+- Fixed (release tooling): `release.py github-release` asked the release listing for its new draft once, immediately
+  after creating it, and the v1.0.0 run failed there because the listing did not show the draft yet (after the
+  crates were published; rerunning the job completed the release). It now asks for up to a minute.
+- Fixed (release tooling): the `verify-cli` job of the v1.0.0 run saw only the previous version of `tickertape-cli`
+  on PyPI for its five minutes of retries, although the upload had succeeded. It now installs without pip's cache
+  and retries for ten minutes.
+- Added: the v1.0.0 compatibility fixtures (macOS and Linux aarch64), written by the released version (ADR 0033).
+
 ## [1.0.0] - 2026-11-23
 
 The first stable release. The library's code is the code of 0.5.1; what changes is the promise. From this version the

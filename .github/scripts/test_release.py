@@ -225,12 +225,14 @@ class ReleaseTests(unittest.TestCase):
                 release.github_release(args)
             return uploads
 
-    def test_a_new_release_is_found_as_a_draft_through_the_listing(self):
+    def test_a_new_release_is_found_as_a_draft_through_the_listing_once_it_appears(self):
         with tempfile.TemporaryDirectory() as temporary:
             artifacts = Path(temporary)
             for name in release.release_files("v0.5.1"):
                 (artifacts / name).write_text(name)
-            commands, listings = [], [[[]], [[{"tag_name": "v0.5.1", "draft": True, "assets": []}]]]
+            # The listing shows the new draft only at the third lookup after its creation.
+            commands, waits = [], []
+            listings = [[[]], [[]], [[]], [[{"tag_name": "v0.5.1", "draft": True, "assets": []}]]]
 
             def gh_json(*arguments):
                 # `releases/tags/<tag>` answers 404 for a draft; only the listing shows it.
@@ -241,8 +243,10 @@ class ReleaseTests(unittest.TestCase):
                                       c_library=True)
             with patch.dict(release.os.environ, GITHUB_REPOSITORY="owner/repo"), \
                  patch.object(release, "gh_json", side_effect=gh_json), \
+                 patch.object(release.time, "sleep", side_effect=waits.append), \
                  patch.object(release.subprocess, "run", side_effect=lambda command, check: commands.append(command)):
                 release.github_release(args)
+            self.assertEqual(waits, [5, 5])
             self.assertEqual(commands[0][:5], ["gh", "release", "create", "v0.5.1", "--repo"])
             self.assertIn("--draft", commands[0])
             uploaded = [Path(command[4]).name for command in commands[1:-1]]

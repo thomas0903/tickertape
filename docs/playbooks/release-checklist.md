@@ -335,6 +335,18 @@ A tag whose run fails before `publish` has published nothing (`publish` needs ev
 the defect in a pull request and release the next patch version; leave the failed tag in place. After `publish`,
 resume with "Rerun failed jobs" or the dispatch below; never tag again for the same version.
 
+## What the v1.0.0 release found
+
+Two steps failed after the publication they follow; nothing published was wrong:
+
+- `github-release`, again: the listing that v0.5.1's fix introduced did not yet show the draft when it was asked
+  immediately after the creation, so the job failed after `publish`. "Rerun failed jobs" completed the release.
+  `release.py` now asks the listing for up to a minute.
+- `verify-cli` saw only the previous version of `tickertape-cli` on PyPI for its five minutes of retries, although
+  the upload had succeeded (cause not confirmed). "Rerun failed jobs" then skipped the job instead of running it,
+  so the check was made by hand: `uvx --from tickertape-cli==1.0.0 tickertape --version` on macOS and Linux. The
+  job now installs without pip's cache and retries for ten minutes. If it is skipped again, check by hand.
+
 ## After publishing
 
 - Add the release's format-v1 compatibility fixtures, written by the tagged version on macOS and Linux
