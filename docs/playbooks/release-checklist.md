@@ -315,6 +315,26 @@ are refused rather than overwritten. A failed docs.rs build needs a patch releas
 If docs.rs is merely delayed, rerun the failed verification job. Inspect partial publication before retrying:
 crates.io uploads are immutable, and rerunning does not undo published versions.
 
+## What the v0.5.1 release found
+
+v0.5.1 (2026-11-23) was the first release through every channel and the release-candidate exercise for 1.0. The
+`v0.5.0` tag before it was pushed but never published: its runs stopped at the first two points, before the
+publishing jobs. All four defects were in steps that had only ever run for a release tag:
+
+- The Linux C library jobs build on Ubuntu 22.04, whose compilers (GCC 11.4, Clang 14) CI did not use:
+  `tickertape.hpp` gave a warning with GCC 11, and the tests passed `-std=c++23` to a compiler that only knows
+  `-std=c++2b`. CI's `c abi` job now also runs on that image.
+- Every SBOM attestation failed: the attestation action requires a `serialNumber` that cargo-cyclonedx does not
+  write under `SOURCE_DATE_EPOCH`. `release.py sbom` adds one.
+- `github-release` created its draft and then looked it up by tag, which never finds a draft. Rerunning the failed
+  job completed the release (the listing found the draft); `release.py` now uses the listing.
+- In preparation, the Java binding's `NativeLibrary.VERSION_NUMBER` was missed, and the library then refused to
+  load (step 1 above names it now).
+
+A tag whose run fails before `publish` has published nothing (`publish` needs every build and attestation job). Fix
+the defect in a pull request and release the next patch version; leave the failed tag in place. After `publish`,
+resume with "Rerun failed jobs" or the dispatch below; never tag again for the same version.
+
 ## After publishing
 
 - Add the release's format-v1 compatibility fixtures, written by the tagged version on macOS and Linux

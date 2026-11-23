@@ -225,6 +225,32 @@ class ReleaseTests(unittest.TestCase):
                 release.github_release(args)
             return uploads
 
+    def test_a_new_release_is_found_as_a_draft_through_the_listing(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            artifacts = Path(temporary)
+            for name in release.release_files("v0.5.1"):
+                (artifacts / name).write_text(name)
+            commands, listings = [], [[[]], [[{"tag_name": "v0.5.1", "draft": True, "assets": []}]]]
+
+            def gh_json(*arguments):
+                # `releases/tags/<tag>` answers 404 for a draft; only the listing shows it.
+                self.assertEqual(arguments[1], "repos/owner/repo/releases?per_page=100")
+                return listings.pop(0)
+
+            args = argparse.Namespace(tag="v0.5.1", artifacts=artifacts, create=True, notes=artifacts / "notes.md",
+                                      c_library=True)
+            with patch.dict(release.os.environ, GITHUB_REPOSITORY="owner/repo"), \
+                 patch.object(release, "gh_json", side_effect=gh_json), \
+                 patch.object(release.subprocess, "run", side_effect=lambda command, check: commands.append(command)):
+                release.github_release(args)
+            self.assertEqual(commands[0][:5], ["gh", "release", "create", "v0.5.1", "--repo"])
+            self.assertIn("--draft", commands[0])
+            uploaded = [Path(command[4]).name for command in commands[1:-1]]
+            self.assertEqual(set(uploaded), release.release_files("v0.5.1") | {"SHA256SUMS"})
+            self.assertEqual(uploaded[-1], "SHA256SUMS")
+            self.assertEqual(commands[-1][:4], ["gh", "release", "edit", "v0.5.1"])
+            self.assertIn("--draft=false", commands[-1])
+
     def test_backfill_adds_missing_files_and_extends_checksums(self):
         old = "tickertape-v0.4.0-x86_64-apple-darwin.tar.gz"
         sums = f"{hashlib.sha256(old.encode()).hexdigest()}  {old}\n"

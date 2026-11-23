@@ -587,6 +587,15 @@ def checksums_extend(existing, new):
     return set(existing.splitlines()) <= set(new.splitlines())
 
 
+def find_release(repo, tag):
+    """The GitHub release for `tag`, draft or published, or None.
+
+    From the listing: `releases/tags/<tag>` answers 404 for a draft (the first v0.5.1 run created its draft and then
+    failed there), and a listing does not treat every `release view` failure as a missing release."""
+    releases = gh_json("api", f"repos/{repo}/releases?per_page=100", "--paginate", "--slurp")
+    return next((release for page in releases for release in page if release["tag_name"] == tag), None)
+
+
 def github_release(args):
     repo = os.environ["GITHUB_REPOSITORY"]
     files = sorted([*args.artifacts.glob("*.tar.gz"), *args.artifacts.glob("*.cdx.json")])
@@ -595,17 +604,16 @@ def github_release(args):
     checksums = args.artifacts / "SHA256SUMS"
     checksums.write_text("".join(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}\n"
                                  for path in files))
-    # List instead of treating every `release view` failure as a missing release.
-    releases = gh_json("api", f"repos/{repo}/releases?per_page=100", "--paginate", "--slurp")
-    existing = next((release for page in releases for release in page
-                     if release["tag_name"] == args.tag), None)
+    existing = find_release(repo, args.tag)
     if existing is None:
         if not args.create:
             raise ValueError("binary-only runs require an existing GitHub release")
         subprocess.run(["gh", "release", "create", args.tag, "--repo", repo, "--verify-tag",
                         "--draft", "--title", f"tickertape {args.tag}",
                         "--notes-file", str(args.notes)], check=True)
-        existing = gh_json("api", f"repos/{repo}/releases/tags/{args.tag}")
+        existing = find_release(repo, args.tag)
+        if existing is None:
+            raise ValueError(f"the draft release for {args.tag} was created but is not listed")
     asset_names = {asset["name"] for asset in existing["assets"]}
     # Compare every existing asset before uploading anything, so that a refused run leaves the release unchanged.
     uploads = []

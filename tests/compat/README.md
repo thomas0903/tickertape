@@ -56,6 +56,9 @@ docker run --rm --platform linux/amd64 -v "$HOME:$HOME" -w "$PWD" -e TMPDIR=/wor
            tests/compat/generate.sh v0.1.0 v0.2.0 v0.3.0 v0.4.0'           # x86-64 under Rosetta emulation
 ```
 
+The v0.5.1 fixtures were generated on 2026-11-23 with the first two commands (macOS and the OrbStack VM); there is
+no Linux x86-64 set for v0.5.1.
+
 ## Pack format
 
 `TTFXPACK` version 1, little-endian: magic, version (u32), file count (u32); per file, sorted by name: name length

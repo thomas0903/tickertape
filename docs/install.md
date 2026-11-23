@@ -19,7 +19,7 @@ tickertape --version
 ## Prebuilt CLI with cargo-binstall
 
 [cargo-binstall](https://github.com/cargo-bins/cargo-binstall) downloads the archive for your platform from the
-GitHub release instead of compiling it. This works for releases after v0.4.0.
+GitHub release instead of compiling it. This works from v0.5.1.
 
 ```sh
 cargo binstall tickertape-cli
@@ -31,8 +31,7 @@ on Linux x86-64 and checks that the installed binary is the one in the release.
 
 ## Homebrew
 
-For macOS (Apple Silicon and Intel) and Linux (x86-64 and ARM64), from the project's tap. This works for releases
-after v0.4.0.
+For macOS (Apple Silicon and Intel) and Linux (x86-64 and ARM64), from the project's tap. This works from v0.5.1.
 
 ```sh
 brew install thomas0903/tap/tickertape
@@ -43,7 +42,7 @@ workflow updates it, then installs it on macOS (Apple Silicon) and runs `brew te
 
 ## CLI with pipx or uv (PyPI)
 
-> Not yet published: the PyPI project `tickertape-cli` starts with the first release after v0.4.0.
+Published from v0.5.1.
 
 The same CLI, packaged as a Python wheel that contains only the `tickertape` executable (no Python code), for Linux
 x86-64 and ARM64 (manylinux: glibc 2.17 or newer; musllinux: musl 1.2 or newer, such as Alpine) and macOS 11 or newer
@@ -84,7 +83,7 @@ Each archive contains the `tickertape` executable, both licences and installatio
 | macOS, Intel | `x86_64-apple-darwin.tar.gz` | macOS 11+ |
 | macOS, Apple Silicon | `aarch64-apple-darwin.tar.gz` | macOS 11+ |
 
-The static archives (from releases after v0.4.0) contain the same CLI, statically linked with the musl C library
+The static archives (from v0.5.1) contain the same CLI, statically linked with the musl C library
 that Rust bundles (musl 1.2.5 for current Rust; see the
 [Rust platform support table](https://doc.rust-lang.org/stable/rustc/platform-support.html)). The release workflow
 checks that each one has no dynamic loader and no shared-library dependencies, runs the CLI's tests with it, and
@@ -96,9 +95,9 @@ For example, on Linux x86-64, after downloading both files:
 
 ```sh
 grep 'x86_64-unknown-linux-gnu.tar.gz$' SHA256SUMS | sha256sum --check --strict
-tar -xzf tickertape-v0.4.0-x86_64-unknown-linux-gnu.tar.gz
+tar -xzf tickertape-v0.5.1-x86_64-unknown-linux-gnu.tar.gz
 mkdir -p "$HOME/.local/bin"
-cp tickertape-v0.4.0-x86_64-unknown-linux-gnu/tickertape "$HOME/.local/bin/"
+cp tickertape-v0.5.1-x86_64-unknown-linux-gnu/tickertape "$HOME/.local/bin/"
 "$HOME/.local/bin/tickertape" --version
 ```
 
@@ -113,8 +112,8 @@ shipping a CLI for an architecture does not establish power-loss durability.
 
 ## C library
 
-> Not yet published: the archives start with the first release after v0.4.0. Until then, build the library from
-> source ([`c-api.md`](c-api.md#building-and-linking)).
+Published from v0.5.1; to build the library from source instead, see
+[`c-api.md`](c-api.md#building-and-linking).
 
 The C ABI ([`c-api.md`](c-api.md)) and the C++ binding ([`cpp-api.md`](cpp-api.md)) as one archive per platform in
 the [GitHub release](https://github.com/thomas0903/tickertape/releases/latest), listed in the same `SHA256SUMS`:
@@ -156,8 +155,7 @@ the published Linux x86-64 archive.
 
 ## Java (Maven Central)
 
-> Not yet published: `io.github.thomas0903:tickertape` reaches Maven Central with the first release after v0.4.0
-> for which the owner has enabled it. Until then, build it from source ([`java-api.md`](java-api.md)).
+Published from v0.5.1; to build it from source instead, see [`java-api.md`](java-api.md).
 
 The binding JAR and the natives JAR of your platform (`linux-x86_64`, `linux-aarch64`, `macos-x86_64` or
 `macos-aarch64`; the Linux libraries need glibc 2.35+), on JDK 25 or newer:
@@ -184,7 +182,7 @@ downloaded from Central.
 
 ## Verify provenance and the SBOM
 
-For releases after v0.4.0, every archive, wheel and JAR a release produces has a [build provenance
+From v0.5.1, every archive, wheel and JAR a release produces has a [build provenance
 attestation](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations) and an
 attested CycloneDX software bill of materials generated from the locked dependency graph (the Java binding has no
 runtime dependencies, so its SBOM lists none):
