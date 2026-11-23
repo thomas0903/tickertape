@@ -6,9 +6,9 @@ with one header, [`crates/tickertape-ffi/include/tickertape.h`](../crates/ticker
 compiles as C99 and C++11. The header documents every function; this page explains the rules they share. The design
 and its reasons are in [ADR 0028](decisions/0028-c-abi.md).
 
-> **Status:** the C ABI is not stable before tickertape 1.0. `TICKERTAPE_ABI_VERSION` is 0, which means unstable: any
-> release may change it (the changelog says when), so load exactly the library version your header came from. See
-> [Versioning](#versioning).
+> **Status:** the C ABI is stable from tickertape 1.0. `TICKERTAPE_ABI_VERSION` is 1: within it, declarations are
+> only added, so a program works with any 1.x library at least as new as its header. Releases before 1.0 had ABI
+> version 0 (unstable) and needed exactly the library version of their header. See [Versioning](#versioning).
 
 Examples: [`examples/c/`](../examples/c/README.md) (a C writer, a C reader that replays or follows live, and a C++
 example). **From C++, use the C++ binding** ([`cpp-api.md`](cpp-api.md)): the header-only `tickertape.hpp` next to
@@ -72,7 +72,7 @@ cc -std=c99 app.c -I crates/tickertape-ffi/include -L target/release -ltickertap
 
 A plain `cargo build` gives the Linux library no soname, and on macOS an install name that is the absolute path of
 the file in `target/release/deps`. That is fine for building and testing in place. To install it, use cargo-c, which
-sets a soname (`libtickertape.so.0.4` before 1.0) or install name and writes a pkg-config file:
+sets a soname (`libtickertape.so.1`) or install name and writes a pkg-config file:
 
 ```bash
 cargo install cargo-c
@@ -486,7 +486,7 @@ The exact system calls are in ADR 0032 → Sampling cost. Nothing is added to ap
 ## Versioning
 
 The header defines `TICKERTAPE_ABI_VERSION`, `TICKERTAPE_VERSION_MAJOR`, `_MINOR`, `_PATCH` and
-`TICKERTAPE_VERSION_NUMBER` (`MAJOR * 1000000 + MINOR * 1000 + PATCH`, so 0.4.0 is 4000). The library returns its
+`TICKERTAPE_VERSION_NUMBER` (`MAJOR * 1000000 + MINOR * 1000 + PATCH`, so 0.4.0 is 4000 and 1.0.0 is 1000000). The library returns its
 own values from `tickertape_abi_version()` and `tickertape_version_number()` (and the string from
 `tickertape_version()`). Check them at start-up:
 
@@ -497,8 +497,8 @@ int compatible = tickertape_abi_version() == TICKERTAPE_ABI_VERSION &&
                                               : lib >= TICKERTAPE_VERSION_NUMBER); /* from 1.0: at least */
 ```
 
-- **Before 1.0** the ABI version is 0, which means *unstable*: any release may change the ABI (the changelog says
-  so). A program or binding must load exactly the library version its header came from.
+- **Before 1.0** (releases 0.x) the ABI version was 0, which means *unstable*: any release could change the ABI (the
+  changelog says so). A program or binding had to load exactly the library version its header came from.
 - **From 1.0** the ABI version is 1 and the shared library's soname is `libtickertape.so.1` (macOS:
   `libtickertape.1.dylib`). No function, constant or struct field is removed or changes meaning or layout; new
   functions, constants, option setters, status codes and fields at the end of extensible structs may be added. A

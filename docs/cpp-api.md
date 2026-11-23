@@ -451,7 +451,7 @@ The header defines `TICKERTAPE_HPP_VERSION_MAJOR`, `_MINOR`, `_PATCH`, `TICKERTA
 `TICKERTAPE_HPP_ABI_VERSION`: the release it ships in. It has the same version as the `tickertape.h` and library of
 that release, and follows the C ABI's rule ([`c-api.md` → Versioning](c-api.md#versioning)):
 
-- **Before 1.0** it needs exactly its own release's `tickertape.h` and library.
+- **Before 1.0** (releases 0.x) it needed exactly its own release's `tickertape.h` and library.
 - **From 1.0** it needs the same ABI version and a `tickertape.h` and library at least as new as itself, so a newer
   library under an older header keeps working. Within a major version no public declaration is removed or changes
   meaning; new functions, member functions, types and enumerators may be added, and **no class gains a data member**,

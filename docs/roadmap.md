@@ -110,7 +110,9 @@ does not help or cannot preserve those guarantees; such a decision must be expli
 Status of each item as of 2026-11-23, after the cloud results of the sustained sessions, the checkpoint work, the
 comparison, the readers, the scale run, the long verified runs and the confirming long runs were recorded in
 [`benchmarks.md`](benchmarks.md):
-an item is ticked only when every criterion holds; each open item says what is still missing.
+an item is ticked only when every criterion holds; each open item says what is still missing. Version 1.0.0 was
+released with seven items open, accepted by the owner as known gaps
+([Released as 1.0.0 with known gaps](#released-as-100-with-known-gaps)).
 
 ### Next release: sustained performance
 
@@ -246,7 +248,7 @@ an item is ticked only when every criterion holds; each open item says what is s
 
 ### v1.0 readiness
 
-- [ ] **Work toward a dependable 1.0 contract.**
+- [x] **Work toward a dependable 1.0 contract.**
   - Review and document the supported Rust API, delivered binding APIs/ABI, CLI machine-readable output, on-disk
     format compatibility and upgrade policy. Resolve known breaking changes before declaring those surfaces stable.
   - Add compatibility fixtures for previously released format-v1 journals and longer-running crash, corruption,
@@ -255,17 +257,38 @@ an item is ticked only when every criterion holds; each open item says what is s
     failures, with documented sampling costs and no mandatory telemetry service.
   - Exercise release/installation/upgrade instructions and the external integration against a release candidate.
     Complete the release checklist and publish guarantees, measured operating limits and known issues.
-  - Missing: the surfaces are reviewed and documented in [`compatibility.md`](compatibility.md) (ADR 0043, accepted;
-    resolved in #37), with the fixtures and soak tier (#12) and the metrics (#8, #30) in place; its "Before 1.0" list
-    still holds the ABI version and baseline freeze, the 1.0 fixtures and, the release-candidate exercise being done
-    with v0.5.1 (2026-11-23), only if the writer's checkpoint or retention code changes after `fbe5785`, a repeat of the
-    confirming long run (issue #45) at the release's code. Measured operating limits are published for 64 B and 1,024 B
-    ([`benchmarks.md`](benchmarks.md) → Operating envelope and remaining bottlenecks).
+  - Done with 1.0.0 (2026-11-23): the surfaces are reviewed and documented in [`compatibility.md`](compatibility.md)
+    (ADR 0043, accepted; resolved in #37), with the fixtures and soak tier (#12) and the metrics (#8, #30) in place.
+    The release preparation set the C ABI to version 1 and froze its baseline; the release-candidate exercise was
+    done with v0.5.1; the confirming long run (issue #45) was not repeated, since the library's code is unchanged
+    since `fbe5785`. The 1.0.0 fixtures follow the release, as for every release (they are written by the released
+    version). Measured operating limits are published for 64 B and 1,024 B
+    ([`benchmarks.md`](benchmarks.md) → Operating envelope and remaining bottlenecks); known issues are in
+    [`crash-contract.md`](crash-contract.md) → Known risks and limits.
 
 **v1.0 release gate:** all milestones above are complete under their stated criteria, CI is green on Linux and
 macOS, the aarch64 checks pass, and no known unresolved issue violates the published safety, corruption-detection,
 durability or compatibility contract. Completing the feature list makes v1.0 a release candidate; satisfying this
 gate makes it ready to release. Universal adoption and being fastest in every workload are not release criteria.
+
+### Released as 1.0.0 with known gaps
+
+Version 1.0.0 (2026-11-23) was released on the owner's decision with seven milestones above still open, so the gate's
+first condition was waived for them; its other conditions held (CI green on Linux and macOS, the aarch64 checks
+passing, no known unresolved issue violating the published contract). None of the seven changes what 1.0 promises:
+they are measurements, explanations and one design record. They stay open and continue in 1.x:
+
+- **Sustained-load comparison:** no macOS results.
+- **eBPF diagnostics:** the tracing overhead during the sustained workloads, and a conclusion confirmed with tracing
+  off, are not recorded.
+- **Mapped reader:** the publication-frontier follow-up has no ADR. The limitation it would narrow is part of the 1.0
+  contract ([`compatibility.md`](compatibility.md); `crash-contract.md` → Known risks and limits).
+- **Cheaper checkpoints:** how much prefaulted, unwritten data adds to a checkpoint is not measured, and there is no
+  macOS result.
+- **Avoidable work:** the profiles of the readers, notification and serialization paths are not documented.
+- **ARM servers:** two latency observations on aarch64 and the platform mechanism behind issue #43 are not explained.
+- **Replay and recovery at scale:** archived history, missing or corrupt segments, catch-up under a live writer, the
+  zero-copy reader and journals of 10,000 segments or more are not measured.
 
 ## Later (explicitly out of scope for v0.1)
 

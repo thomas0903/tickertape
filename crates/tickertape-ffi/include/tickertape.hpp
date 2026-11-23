@@ -62,12 +62,12 @@
 // 1.0 (ABI version 0) it needs exactly that release's tickertape.h and library; from 1.0 the same ABI version and a
 // tickertape.h and library at least as new as this header (ADR 0036 -> Versioning).
 
-#define TICKERTAPE_HPP_VERSION_MAJOR 0
-#define TICKERTAPE_HPP_VERSION_MINOR 5
-#define TICKERTAPE_HPP_VERSION_PATCH 1
+#define TICKERTAPE_HPP_VERSION_MAJOR 1
+#define TICKERTAPE_HPP_VERSION_MINOR 0
+#define TICKERTAPE_HPP_VERSION_PATCH 0
 #define TICKERTAPE_HPP_VERSION_NUMBER \
     ((TICKERTAPE_HPP_VERSION_MAJOR * 1000000) + (TICKERTAPE_HPP_VERSION_MINOR * 1000) + TICKERTAPE_HPP_VERSION_PATCH)
-#define TICKERTAPE_HPP_ABI_VERSION 0
+#define TICKERTAPE_HPP_ABI_VERSION 1
 
 #if TICKERTAPE_ABI_VERSION != TICKERTAPE_HPP_ABI_VERSION
 #error "tickertape.hpp and tickertape.h have different ABI versions; use the files from one release"
@@ -472,7 +472,7 @@ inline result<void> status_to_result(tickertape_status status) {
 
 // ---- Library version ----
 
-// The C ABI version of the loaded library (0 before 1.0: unstable).
+// The C ABI version of the loaded library (1 from 1.0; 0 before: unstable).
 inline std::uint32_t library_abi_version() noexcept { return tickertape_abi_version(); }
 // The loaded library's version as MAJOR * 1000000 + MINOR * 1000 + PATCH.
 inline std::uint32_t library_version_number() noexcept { return tickertape_version_number(); }

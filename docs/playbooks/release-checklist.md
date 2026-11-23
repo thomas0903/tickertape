@@ -7,8 +7,9 @@ bindings' wheels and sdist, and the CLI wheels).
 
 ## One-time configuration
 
-The GitHub `release` environment allows the `main` branch and tags matching `v*`. It has no required reviewer;
-the explicit version tag (or manual workflow dispatch with `publish=true`) authorizes publishing.
+The GitHub `release` environment allows the `main` branch and tags matching `v*`. Like the three other publishing
+environments (`pypi`, `pypi-cli`, `maven-central`) it has the maintainer as required reviewer: the explicit version
+tag (or manual workflow dispatch with `publish=true`) starts a release, and each publishing job waits for approval.
 
 Each crate, `tickertape` and `tickertape-cli`, has its own crates.io Trusted Publisher entry:
 
@@ -177,9 +178,8 @@ single-maintainer repository. Administrators are subject to the checks; force pu
    Each crate must include both licences and its README, and exclude local agent tooling. Other workspace members
    (tests, benches, examples and the C ABI crate `tickertape-ffi`) have `publish = false`; the release script refuses
    a member that is neither released nor marked so. The C library ships as archives in the GitHub release, not as a
-   crate (ADR 0028, 0031). Before 1.0 the
-   C ABI is unstable (ABI version 0) and programs require the exact library version; if it changed, the changelog
-   must say so. Bump `TICKERTAPE_HPP_VERSION_*` in `crates/tickertape-ffi/include/tickertape.hpp` with the crate
+   crate (ADR 0028, 0031). From 1.0 the
+   C ABI is frozen (ABI version 1): the baseline check must pass, and the changelog lists what was added. Bump `TICKERTAPE_HPP_VERSION_*` in `crates/tickertape-ffi/include/tickertape.hpp` with the crate
    version (a test fails otherwise); the C++ binding has the release's version (ADR 0036). Dry-running both packages together requires Cargo 1.90+. The release scripts require Python 3.11+; CI
    selects Python 3.12.
 

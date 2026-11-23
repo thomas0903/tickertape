@@ -58,6 +58,12 @@ static std::string stub_message;
 static std::int32_t stub_os_code = 0;
 static std::int32_t stub_reason = 0;
 static std::uint32_t stub_version = TICKERTAPE_HPP_VERSION_NUMBER;
+// A library version this header refuses: before 1.0 any other version, from 1.0 an older one.
+#if TICKERTAPE_HPP_ABI_VERSION == 0
+static const std::uint32_t incompatible_version = TICKERTAPE_HPP_VERSION_NUMBER + 1;
+#else
+static const std::uint32_t incompatible_version = TICKERTAPE_HPP_VERSION_NUMBER - 1;
+#endif
 static int stub_opens = 0;
 static int stub_closes = 0;
 static int stub_inspections = 0;  // calls of the inspection and retention functions
@@ -362,7 +368,11 @@ static void every_status_and_reason() {
 
 static void mismatched_library() {
     const int opens = stub_opens;
-    stub_version = TICKERTAPE_HPP_VERSION_NUMBER + 1;
+#if TICKERTAPE_HPP_ABI_VERSION != 0
+    stub_version = TICKERTAPE_HPP_VERSION_NUMBER + 1;  // from 1.0 a newer library of the same ABI version is accepted
+    CHECK(tt::library_compatible() && tt::check_library());
+#endif
+    stub_version = incompatible_version;
     auto refused = tt::Writer::open("unused");
     CHECK(!refused && refused.error().status() == tt::Status::unsupported_version);
     CHECK(!refused && refused.error().message().find("stub") != std::string::npos);
@@ -396,7 +406,7 @@ static void mismatched_library() {
 // The option builders check the library before they create their C handle: with a mismatched library neither they
 // nor their setters call any C function other than the version queries, and the open that uses them reports it.
 static void builders_check_the_library_first() {
-    stub_version = TICKERTAPE_HPP_VERSION_NUMBER + 1;
+    stub_version = incompatible_version;
     const int calls = stub_calls;
     {
         tt::Retention retention;

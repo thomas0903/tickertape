@@ -46,22 +46,22 @@
  *                                               : lib >= TICKERTAPE_VERSION_NUMBER);
  * ```
  */
-#define TICKERTAPE_ABI_VERSION 0
+#define TICKERTAPE_ABI_VERSION 1
 
 /**
  * The major version of the library this header belongs to.
  */
-#define TICKERTAPE_VERSION_MAJOR 0
+#define TICKERTAPE_VERSION_MAJOR 1
 
 /**
  * The minor version of the library this header belongs to.
  */
-#define TICKERTAPE_VERSION_MINOR 5
+#define TICKERTAPE_VERSION_MINOR 0
 
 /**
  * The patch version of the library this header belongs to.
  */
-#define TICKERTAPE_VERSION_PATCH 1
+#define TICKERTAPE_VERSION_PATCH 0
 
 /**
  * The version of the library this header belongs to as one comparable number: `MAJOR * 1000000 + MINOR * 1000 +

@@ -4,7 +4,7 @@
 records events, other processes on the same machine follow them live, and everything can be replayed later or
 exported to Parquet for DuckDB and Python.
 
-> Status: [v0.5.1](https://crates.io/crates/tickertape/0.5.1), published to crates.io. Linux and macOS. The on-disk format is version 1.
+> Status: [v1.0.0](https://crates.io/crates/tickertape/1.0.0), stable. Linux and macOS. The on-disk format is version 1. What 1.x keeps compatible: [`docs/compatibility.md`](docs/compatibility.md).
 
 Think of it as a flight recorder for a trading system or any other latency-sensitive program:
 
@@ -66,7 +66,7 @@ Add the library to your project:
 cargo add tickertape
 ```
 
-[API documentation](https://docs.rs/tickertape/0.5.1/tickertape/) · [CLI reference](docs/cli.md)
+[API documentation](https://docs.rs/tickertape/1.0.0/tickertape/) · [CLI reference](docs/cli.md)
 
 Install the `tickertape` CLI (Linux x86-64 and ARM64, macOS Intel and Apple Silicon) in one of these ways.
 [Installation](docs/install.md) has the details, the static Linux builds and how to verify a download.
@@ -143,10 +143,10 @@ From other languages:
 
 | Language | What | Status | Docs |
 |---|---|---|---|
-| C (and others through FFI) | C ABI: `libtickertape` and `tickertape.h` | not stable before 1.0 | [`docs/c-api.md`](docs/c-api.md) |
-| C++ | Header-only C++17 binding over the C ABI: `tickertape.hpp` (RAII handles, borrowed views, works without exceptions) | not stable before 1.0 | [`docs/cpp-api.md`](docs/cpp-api.md) |
+| C (and others through FFI) | C ABI: `libtickertape` and `tickertape.h` | stable from 1.0 (ABI version 1) | [`docs/c-api.md`](docs/c-api.md) |
+| C++ | Header-only C++17 binding over the C ABI: `tickertape.hpp` (RAII handles, borrowed views, works without exceptions) | stable from 1.0 | [`docs/cpp-api.md`](docs/cpp-api.md) |
 | Python | Installable bindings that write, follow and replay journals | on PyPI as `tickertape` (from v0.5.1) | [`bindings/python/`](bindings/python/README.md) |
-| Java (JDK 25+) | Binding over the C ABI with the Foreign Function and Memory API, in `bindings/java` | on Maven Central as `io.github.thomas0903:tickertape` (from v0.5.1); not stable before 1.0 | [`docs/java-api.md`](docs/java-api.md) |
+| Java (JDK 25+) | Binding over the C ABI with the Foreign Function and Memory API, in `bindings/java` | on Maven Central as `io.github.thomas0903:tickertape` (from v0.5.1); stable from 1.0 | [`docs/java-api.md`](docs/java-api.md) |
 | Python | Read-only decoder without dependencies | | [`python/`](python/README.md) |
 
 [`docs/python.md`](docs/python.md) compares the two Python options.
