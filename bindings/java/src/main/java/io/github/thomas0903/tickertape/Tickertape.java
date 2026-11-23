@@ -14,9 +14,9 @@ import java.util.Objects;
  * compatible (see below), or loading fails with an {@link UnsatisfiedLinkError} that says why; the binding never falls
  * through to a later candidate after a failure, so the library you configured is the one you get.
  *
- * <p><b>Versions.</b> The binding's version is the version of the C library it is written against. Before 1.0 the C
- * ABI is unstable (ABI version 0), so the binding requires exactly that library version. From 1.0 it requires the same
- * ABI version and a library at least as new as itself. See {@code docs/java-api.md} &rarr; Versioning.
+ * <p><b>Versions.</b> The binding's version is the version of the C library it is written against. From 1.0 (ABI version
+ * 1) it requires the same ABI version and a library at least as new as itself. Releases before 1.0 had the unstable
+ * ABI version 0 and required exactly their own library version. See {@code docs/java-api.md} &rarr; Versioning.
  *
  * <p id="paths"><b>Paths.</b> Every method that takes the {@link Path} of a journal, or of a retention destination,
  * passes the C library the bytes the JDK itself uses for that path, so a name in any encoding or Unicode normalization
@@ -86,7 +86,7 @@ public final class Tickertape {
         return Native.versionNumber();
     }
 
-    /** The loaded library's C ABI version (0 before 1.0: unstable). */
+    /** The loaded library's C ABI version (1 from 1.0; 0 before: unstable). */
     public static int abiVersion() {
         NativeLibrary.lookup();
         return Native.abiVersion();

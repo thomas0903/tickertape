@@ -2,9 +2,9 @@
 
 What tickertape promises to keep working from 1.0 on, for each surface, and how each may change after 1.0. The policy
 is [ADR 0043](decisions/0043-compatibility-policy.md) (accepted, effective at 1.0). Each section points to the
-document that holds the rules; this page does not restate them. Nothing below is stable yet: before 1.0 any release
-may change any surface, and the changelog says when. [Before 1.0](#before-10) lists what still has to be resolved
-before these surfaces can be declared stable.
+document that holds the rules; this page does not restate them. The surfaces below are stable from 1.0.0
+(2026-11-23); releases 0.x could change any of them, and the changelog says when they did.
+[Before 1.0](#before-10) records how the last open points were resolved.
 
 | Surface | Versioned by | Rules |
 |---|---|---|
@@ -70,9 +70,9 @@ with a changelog entry; a patch release does not.
 library your header came from), ABI version 1 and soname `libtickertape.so.1` from 1.0; additions only within ABI
 version 1.
 
-- **The baseline check.** `crates/tickertape-ffi/abi/tickertape-baseline.h` is empty before 1.0. At 1.0 and at every
-  later stable release it becomes the shipped header, and `.github/scripts/check_abi_baseline.py` then fails CI if
-  a declaration in it is removed or changed (`docs/playbooks/release-checklist.md` → C ABI at 1.0).
+- **The baseline check.** `crates/tickertape-ffi/abi/tickertape-baseline.h` is the header shipped in 1.0.0 (it
+  declared nothing before 1.0). At every later stable release it becomes that release's header, and
+  `.github/scripts/check_abi_baseline.py` fails CI if a declaration in it is removed or changed (`docs/playbooks/release-checklist.md` → C ABI at 1.0).
 - **Extensible structs** start with `uint64_t struct_size`; the library fills `min(struct_size, its own size)` and
   writes back what it filled, so a newer program can tell which fields an older library wrote. Seven structs are
   extensible (`c-api.md` → Versioning lists them with their minimum sizes). The record structs,
@@ -185,7 +185,8 @@ release with its own ADR.
 
 ## Before 1.0
 
-What must still be resolved, or explicitly accepted, before the surfaces above are declared stable. The rest of the
+What had to be resolved, or explicitly accepted, before the surfaces above were declared stable, and how each point
+was closed for 1.0.0. The rest of the
 list this review produced was resolved on 2026-11-20 (ADR 0043 → Consequences), and so were two later lines: ADR 0042
 is accepted (no sparse index for 1.0; the sparse index stays possible later work), and `status::Sampler` (rates, time
 to full) with `Status::breaches`, and creating reader beacons, stay in Rust only in 1.0 (decided by the maintainers
@@ -193,21 +194,21 @@ under the owner's delegation, 2026-11-20). A program using a binding can compute
 has its sampling time, the head's next sequence number, the segments' total bytes and the storage headroom) and
 compare them with its own thresholds; any of the three can be added to the C ABI and the bindings in 1.x.
 
-1. The C ABI at 1.0: set `TICKERTAPE_ABI_VERSION` to 1 and freeze the ABI baseline
-   (`crates/tickertape-ffi/abi/tickertape-baseline.h` becomes the shipped header). Do both in the release
-   preparation pull request (`docs/playbooks/release-checklist.md` → C ABI at 1.0).
-2. The 1.0 fixtures: add them at release (`docs/playbooks/release-checklist.md`, ADR 0033), as for every release.
+1. The C ABI at 1.0: done in the 1.0.0 release preparation. `TICKERTAPE_ABI_VERSION` is 1 and the ABI baseline
+   (`crates/tickertape-ffi/abi/tickertape-baseline.h`) is the header shipped in 1.0.0, with 177 frozen declarations
+   (`docs/playbooks/release-checklist.md` → C ABI at 1.0).
+2. The 1.0 fixtures: added after the release, written by the released version (`docs/playbooks/release-checklist.md`,
+   ADR 0033), as for every release.
 3. The roadmap's release-candidate exercise (release, installation and upgrade instructions and the external
    integration against a release candidate): done with v0.5.1 on 2026-11-23, the first release through every
    channel (`docs/playbooks/release-checklist.md` → What the v0.5.1 release found). Each channel was installed from
    after publication, the v0.4.0 fixture journals are read and continued by the released code, and the iceoryx2
    integration's tests pass against the crate from crates.io. Four defects were found and fixed, all in steps
-   that until then ran only for a release tag. Repeat the exercise's manual checks for 1.0.0 itself.
+   that until then ran only for a release tag. The exercise's manual checks are repeated for 1.0.0 itself.
 4. The sustained session: its results and the operating envelope are recorded in `docs/benchmarks.md` (2026-11-19 to
    2026-11-22) for both payloads, the 1,024 B scenarios with background checkpoints at `3fea1c0` (every run finished).
    The record checksum mismatch of the 1,024 B probe at `279f59a` is resolved (issue #43, closed after the long verified
    runs; the platform mechanism is not confirmed). Retention behind an overloaded writer is resolved (issue #45, closed;
    ADR 0044, amendment of 2026-11-23): long runs with background checkpoints that complete, each journal verified from
-   the file afterwards, are recorded at `fbe5785` (`docs/benchmarks.md` → Confirming long runs). Still to do, only if
-   the writer's checkpoint or retention code changes after `fbe5785`: repeat that run at the release's code before
-   tagging 1.0.
+   the file afterwards, are recorded at `fbe5785` (`docs/benchmarks.md` → Confirming long runs). The library's code
+   (`crates/tickertape/src`) is unchanged between `fbe5785` and 1.0.0, so that run was not repeated.

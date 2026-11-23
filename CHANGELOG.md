@@ -5,6 +5,27 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-11-23
+
+The first stable release. The library's code is the code of 0.5.1; what changes is the promise. From this version the
+Rust API, the C ABI, the C++, Python and Java bindings, the CLI's machine-readable output and the on-disk format
+(version 1, unchanged since v0.1.0) follow the compatibility policy in `docs/compatibility.md` (ADR 0043): within
+1.x, nothing documented there is removed or changes meaning.
+
+- Changed (C ABI, C++ and Java bindings): the C ABI is now ABI version 1 and frozen. `TICKERTAPE_ABI_VERSION` and
+  `tickertape_abi_version()` are 1, the shared library's soname is `libtickertape.so.1` (macOS install name
+  `@rpath/libtickertape.1.dylib`), and the start-up check accepts any 1.x library at least as new as the header or
+  binding, where 0.x releases required exactly their own version. A program built against a 0.x header must be
+  rebuilt against this one; no declaration changed between 0.5.1 and 1.0.0 apart from the version constants. From
+  now on CI compares every change with the header shipped in the latest stable release
+  (`crates/tickertape-ffi/abi/tickertape-baseline.h`, 177 declarations) and fails if one is removed or changed.
+- Known gaps: 1.0.0 is released with seven roadmap items open, accepted by the owner. They are measurements,
+  explanations and one design record, and none changes the contract (`docs/roadmap.md` → Released as 1.0.0 with
+  known gaps). The known limitations of the contract itself are in `docs/crash-contract.md` → Known risks and limits.
+
+The entries below were made after 0.5.1:
+
+
 - Fixed (release tooling): `release.py github-release` looked up the draft release it had just created through
   `releases/tags/<tag>`, which answers 404 for a draft, so the first v0.5.1 run failed after publishing the crates
   and before attaching any file; rerunning the job completed the release. It now finds the draft through the
@@ -829,6 +850,7 @@ First release. Repository tag only; not published to crates.io.
 - Snappy Parquet export with raw unsigned metadata, bounded row groups, and opt-in `--decode market-demo` columns
   (also a `decoded` object in JSONL). Default JSONL output is unchanged by `--decode`.
 
+[1.0.0]: https://github.com/thomas0903/tickertape/compare/v0.5.1...v1.0.0
 [0.5.1]: https://github.com/thomas0903/tickertape/compare/v0.4.0...v0.5.1
 [0.4.0]: https://github.com/thomas0903/tickertape/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/thomas0903/tickertape/compare/v0.2.0...v0.3.0

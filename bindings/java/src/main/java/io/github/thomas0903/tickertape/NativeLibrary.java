@@ -48,11 +48,11 @@ final class NativeLibrary {
     private NativeLibrary() {}
 
     /** The C ABI version of the header this binding is written against ({@code TICKERTAPE_ABI_VERSION}). */
-    static final int ABI_VERSION = 0;
+    static final int ABI_VERSION = 1;
     /** {@code TICKERTAPE_VERSION_NUMBER} of that header: {@code MAJOR * 1000000 + MINOR * 1000 + PATCH}. */
-    static final int VERSION_NUMBER = 5001;
+    static final int VERSION_NUMBER = 1000000;
     /** The binding's own version: always the library version it is written against. */
-    static final String VERSION = "0.5.1";
+    static final String VERSION = "1.0.0";
 
     static final String PATH_PROPERTY = "tickertape.library.path";
     static final String EXTRACT_DIR_PROPERTY = "tickertape.library.extractDir";

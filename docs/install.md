@@ -129,9 +129,9 @@ There is no musl archive: Rust's musl targets build no usable shared library. Ea
 directory with:
 
 - `include/tickertape.h` (C99, C++11) and `include/tickertape.hpp` (the C++17 binding);
-- `lib/libtickertape.so.X.Y.Z` with the links `libtickertape.so.0.Y` (the soname before 1.0; `libtickertape.so.1`
-  from 1.0) and `libtickertape.so`; on macOS `lib/libtickertape.X.Y.Z.dylib` with the install name
-  `@rpath/libtickertape.0.Y.dylib` and the same links;
+- `lib/libtickertape.so.X.Y.Z` with the links `libtickertape.so.1` (the soname from 1.0; `libtickertape.so.0.Y`
+  in releases 0.Y) and `libtickertape.so`; on macOS `lib/libtickertape.X.Y.Z.dylib` with the install name
+  `@rpath/libtickertape.1.dylib` (`libtickertape.0.Y.dylib` in releases 0.Y) and the same links;
 - `lib/libtickertape.a`;
 - `lib/pkgconfig/tickertape.pc` (shared) and `tickertape-static.pc` (static, with the system libraries it needs),
   which find the directories relative to themselves, so the archive works wherever it is unpacked;
@@ -146,7 +146,8 @@ c++ -std=c++17 app.cpp $(pkg-config --cflags --libs tickertape-static) -o app-cp
 ```
 
 The shared library is not on the system's search path, hence the `-rpath` (or copy `lib/` to a directory the loader
-searches). Before 1.0 the C ABI is unstable, and a program requires exactly the library version of its header.
+searches). From 1.0 a program works with any 1.x library at least as new as its header; releases 0.x required
+exactly the library version of their header.
 `crates/tickertape-ffi/scripts/install-test.sh` checks each archive the way it is used: it unpacks it, checks the
 soname or install name, builds the C examples and the C++ example through pkg-config against the shared and the static
 library, checks which library each program loads, and records, follows live and replays journals with them. CI runs
