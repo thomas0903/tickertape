@@ -400,6 +400,25 @@ class SbomTests(unittest.TestCase):
                     self.assertEqual(generated, f"{cargo['lib']['name']}_{kinds}.cdx.json")
                 self.assertEqual(component, cargo.get("bin", [cargo.get("lib")])[0]["name"])
 
+    def test_sbom_gets_a_reproducible_serial_number_the_attestation_action_requires(self):
+        generated = json.dumps({"bomFormat": "CycloneDX", "specVersion": "1.5", "version": 1,
+                                "metadata": {"component": {"name": "tickertape",
+                                                           "purl": "pkg:cargo/tickertape-cli@0.5.0"}}}, indent=2)
+        first = release.with_serial_number(generated, "x86_64-unknown-linux-gnu|cli-wheel")
+        self.assertEqual(first, release.with_serial_number(generated, "x86_64-unknown-linux-gnu|cli-wheel"))
+        document = json.loads(first)
+        # What actions/attest checks before it accepts a CycloneDX document (src/sbom.ts, checkIsCycloneDX).
+        self.assertTrue(document["bomFormat"] and document["specVersion"] and document["serialNumber"])
+        self.assertRegex(document["serialNumber"], r"^urn:uuid:[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$")
+        self.assertEqual(list(document)[:3], ["bomFormat", "specVersion", "serialNumber"])
+        self.assertEqual({k: v for k, v in document.items() if k != "serialNumber"}, json.loads(generated))
+        other = json.loads(release.with_serial_number(generated, "aarch64-apple-darwin|cli-wheel"))
+        self.assertNotEqual(document["serialNumber"], other["serialNumber"])
+        self.assertEqual(release.with_serial_number(first, "anything"), first)
+        with self.assertRaises(ValueError):
+            release.with_serial_number('{"specVersion": "1.5"}', "x")
+        self.assertTrue(json.loads(release.java_sbom(Path(__file__).resolve().parents[2], "1"))["serialNumber"])
+
     def test_java_sbom_is_reproducible_and_describes_the_maven_coordinates(self):
         source = Path(__file__).resolve().parents[2]
         first = release.java_sbom(source, "1234567890")

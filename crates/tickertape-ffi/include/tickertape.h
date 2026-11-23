@@ -61,7 +61,7 @@
 /**
  * The patch version of the library this header belongs to.
  */
-#define TICKERTAPE_VERSION_PATCH 0
+#define TICKERTAPE_VERSION_PATCH 1
 
 /**
  * The version of the library this header belongs to as one comparable number: `MAJOR * 1000000 + MINOR * 1000 +

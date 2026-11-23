@@ -1823,6 +1823,16 @@ fn cpp_compilers() -> Vec<PathBuf> {
     compilers
 }
 
+/// The `-std=` value for C++23 with `compiler`: `c++23`, or `c++2b` where the compiler is from before the standard
+/// had its name (Clang 16 and older, as on Ubuntu 22.04, the release workflow's build image).
+fn cpp23(compiler: &Path) -> &'static str {
+    let accepted = Command::new(compiler)
+        .args(["-std=c++23", "-fsyntax-only", "-x", "c++", "/dev/null"])
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if accepted { "c++23" } else { "c++2b" }
+}
+
 /// The header compiles without warnings as C++17, C++20 and C++23, with and without exceptions, with and without
 /// `NDEBUG` (which turns the debug checks off), with every C++ compiler found (GCC and Clang on Linux CI), under
 /// -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror. `layout.cpp` pins every public class's size and
@@ -1836,7 +1846,7 @@ fn cpp_header_compiles_at_every_language_level() {
     assert!(!compilers.is_empty(), "no C++ compiler found");
     let mut jobs = Vec::new();
     for (i, compiler) in compilers.iter().enumerate() {
-        for std in ["c++17", "c++20", "c++23"] {
+        for std in ["c++17", "c++20", cpp23(compiler)] {
             for exceptions in ["-fexceptions", "-fno-exceptions"] {
                 for debug in ["-UNDEBUG", "-DNDEBUG"] {
                     for source in &sources {
@@ -2193,7 +2203,7 @@ fn cpp_header_definitions_do_not_depend_on_the_language_level() {
                     scratch.path(),
                 )
             };
-            let (cpp17, cpp20, cpp23) = (at("c++17"), at("c++20"), at("c++23"));
+            let (cpp17, cpp20, cpp23) = (at("c++17"), at("c++20"), at(cpp23(compiler)));
             for (lower, higher, what) in [
                 (&cpp17, &cpp20, "C++17 -> C++20"),
                 (&cpp20, &cpp23, "C++20 -> C++23"),

@@ -372,10 +372,32 @@ def sbom(args):
         document = (source / manifest.parent / generated).read_text().replace(f"file://{source}", "file://.")
         if json.loads(document)["metadata"]["component"]["name"] != component:
             raise ValueError(f"the SBOM does not describe {component}")
+        document = with_serial_number(document, f"{args.target or 'any'}|{sbom_name(args)}")
     args.output.mkdir(parents=True, exist_ok=True)
     destination = args.output / f"{sbom_name(args)}.cdx.json"
     destination.write_text(document)
     print(destination)
+
+
+def with_serial_number(document, variant):
+    """The CycloneDX document with a `serialNumber`, added after `specVersion` if it has none.
+
+    cargo-cyclonedx writes none when SOURCE_DATE_EPOCH is set, and the attestation action (actions/attest) accepts a
+    CycloneDX document only with `bomFormat`, `specVersion` and `serialNumber`. Reproducible: the number derives
+    from the described component's purl (which holds the version) and `variant` (the target and the file's name)."""
+    bom = json.loads(document)
+    if not bom.get("bomFormat") or not bom.get("specVersion"):
+        raise ValueError("the SBOM has no bomFormat or specVersion")
+    if bom.get("serialNumber"):
+        return document
+    purl = bom["metadata"]["component"]["purl"]
+    serial = f"urn:uuid:{uuid.uuid5(uuid.NAMESPACE_URL, f'{purl}|{variant}')}"
+    ordered = {}
+    for key, value in bom.items():
+        ordered[key] = value
+        if key == "specVersion":
+            ordered["serialNumber"] = serial
+    return json.dumps(ordered, indent=2, ensure_ascii=False) + "\n"
 
 
 def java_sbom(source, epoch):

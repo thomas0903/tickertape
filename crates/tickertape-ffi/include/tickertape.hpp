@@ -64,7 +64,7 @@
 
 #define TICKERTAPE_HPP_VERSION_MAJOR 0
 #define TICKERTAPE_HPP_VERSION_MINOR 5
-#define TICKERTAPE_HPP_VERSION_PATCH 0
+#define TICKERTAPE_HPP_VERSION_PATCH 1
 #define TICKERTAPE_HPP_VERSION_NUMBER \
     ((TICKERTAPE_HPP_VERSION_MAJOR * 1000000) + (TICKERTAPE_HPP_VERSION_MINOR * 1000) + TICKERTAPE_HPP_VERSION_PATCH)
 #define TICKERTAPE_HPP_ABI_VERSION 0
@@ -130,6 +130,15 @@
     __attribute__((abi_tag(TICKERTAPE_HPP_DEBUG_CHECKS_TAG_)))
 #else
 #define TICKERTAPE_HPP_MODE_DEPENDENT
+#endif
+
+// For a private member that only the debug checks read. Clang warns about such a member in the other mode
+// (-Wunused-private-field) unless it is marked; GCC has no such warning, and GCC 11 and older warn that they ignore
+// the attribute on a member (-Wattributes).
+#if defined(__clang__)
+#define TICKERTAPE_HPP_DEBUG_ONLY_MEMBER [[maybe_unused]]
+#else
+#define TICKERTAPE_HPP_DEBUG_ONLY_MEMBER
 #endif
 
 #if TICKERTAPE_HPP_EXCEPTIONS
@@ -1448,8 +1457,8 @@ private:
     }
     tickertape_record rec_;
     // Read only by the debug check, but present in every build so that the layout is the same in every mode.
-    [[maybe_unused]] const std::uint64_t *generation_;
-    [[maybe_unused]] std::uint64_t snapshot_;
+    TICKERTAPE_HPP_DEBUG_ONLY_MEMBER const std::uint64_t *generation_;
+    TICKERTAPE_HPP_DEBUG_ONLY_MEMBER std::uint64_t snapshot_;
 };
 
 #if __cplusplus >= 202002L && defined(__cpp_lib_span) && __cpp_lib_span >= 202002L
