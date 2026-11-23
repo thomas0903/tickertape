@@ -66,7 +66,7 @@ pub const TICKERTAPE_VERSION_MAJOR: u32 = 0;
 pub const TICKERTAPE_VERSION_MINOR: u32 = 5;
 
 /// The patch version of the library this header belongs to.
-pub const TICKERTAPE_VERSION_PATCH: u32 = 0;
+pub const TICKERTAPE_VERSION_PATCH: u32 = 1;
 
 /// The version of the library this header belongs to as one comparable number: `MAJOR * 1000000 + MINOR * 1000 +
 /// PATCH` (0.4.0 is 4000, 1.2.3 is 1002003). Compare it with `tickertape_version_number()`; see

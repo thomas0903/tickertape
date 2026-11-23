@@ -5,6 +5,22 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-11-23
+
+This release is the release candidate for 1.0: the first release through every install channel (crates.io, the
+GitHub release archives with static Linux builds, cargo-binstall, Homebrew, the C library archives, the Python
+bindings and the CLI wheel on PyPI, the Java binding on Maven Central). The on-disk format is unchanged (version 1).
+The C ABI stays at ABI version 0: it is not frozen yet, and a program must run with exactly the library version it
+was built with (`docs/c-api.md` → Versioning). It also fixes two defects of v0.4.0, described below: a reader that
+maps segments could report a correctly written record as corrupt on aarch64 Linux under memory pressure (issue #43),
+and a writer held one open file per segment after its checkpoint marker until the next checkpoint (#38). Retention
+no longer reads a segment in full before deleting it (issue #45, ADR 0044); that entry lists every change a caller
+can see.
+
+Version 0.5.0 was tagged (`v0.5.0`) but never published: its release build stopped at the two defects that the
+first two entries below fix, before any file reached a registry or a GitHub release. 0.5.1 is 0.5.0 with those two
+fixes.
+
 - Fixed (C++ binding): `tickertape.hpp` compiled with a warning under GCC 11 and older (`'maybe_unused' attribute
   ignored`, from `-Wattributes`, which is on by default), so a program built with `-Werror` did not compile. The two
   members of `RecordView` that only the debug checks read are now marked for Clang only, which is the compiler that
@@ -17,19 +33,6 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   document only with one, so every SBOM attestation of the `v0.5.0` tag's runs failed (archives, wheels and sdist).
   The script now adds one, derived from the component, its version, the target and the file's name, so the output
   stays reproducible. The SBOM attestations had not run before: they need a release tag.
-
-## [0.5.0] - 2026-11-23
-
-This release is the release candidate for 1.0: the first release through every install channel (crates.io, the
-GitHub release archives with static Linux builds, cargo-binstall, Homebrew, the C library archives, the Python
-bindings and the CLI wheel on PyPI, the Java binding on Maven Central). The on-disk format is unchanged (version 1).
-The C ABI stays at ABI version 0: it is not frozen yet, and a program must run with exactly the library version it
-was built with (`docs/c-api.md` → Versioning). It also fixes two defects of v0.4.0, described below: a reader that
-maps segments could report a correctly written record as corrupt on aarch64 Linux under memory pressure (issue #43),
-and a writer held one open file per segment after its checkpoint marker until the next checkpoint (#38). Retention
-no longer reads a segment in full before deleting it (issue #45, ADR 0044); that entry lists every change a caller
-can see.
-
 - Docs: `docs/benchmarks.md` records the confirming long runs for issue #45 at `fbe5785` (Google Cloud VMs with local
   NVMe SSD, x86-64 ext4 and aarch64 xfs; the unpaced 1,024 B long run that filled the disk at `3fea1c0`, for the full
   3,600 s): both runs completed, retention removed 8,796–8,965 segments with no error and kept the journal at
@@ -816,7 +819,7 @@ First release. Repository tag only; not published to crates.io.
 - Snappy Parquet export with raw unsigned metadata, bounded row groups, and opt-in `--decode market-demo` columns
   (also a `decoded` object in JSONL). Default JSONL output is unchanged by `--decode`.
 
-[0.5.0]: https://github.com/thomas0903/tickertape/compare/v0.4.0...v0.5.0
+[0.5.1]: https://github.com/thomas0903/tickertape/compare/v0.4.0...v0.5.1
 [0.4.0]: https://github.com/thomas0903/tickertape/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/thomas0903/tickertape/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/thomas0903/tickertape/compare/v0.1.0...v0.2.0
