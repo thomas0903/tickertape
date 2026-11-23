@@ -77,13 +77,13 @@ From source with Cargo:
 cargo install tickertape-cli --locked
 ```
 
-A prebuilt binary with [cargo-binstall](https://github.com/cargo-bins/cargo-binstall) (releases after v0.4.0):
+A prebuilt binary with [cargo-binstall](https://github.com/cargo-bins/cargo-binstall) (from v0.5.1):
 
 ```bash
 cargo binstall tickertape-cli
 ```
 
-With Homebrew on macOS or Linux (releases after v0.4.0):
+With Homebrew on macOS or Linux (from v0.5.1):
 
 ```bash
 brew install thomas0903/tap/tickertape
@@ -145,8 +145,8 @@ From other languages:
 |---|---|---|---|
 | C (and others through FFI) | C ABI: `libtickertape` and `tickertape.h` | not stable before 1.0 | [`docs/c-api.md`](docs/c-api.md) |
 | C++ | Header-only C++17 binding over the C ABI: `tickertape.hpp` (RAII handles, borrowed views, works without exceptions) | not stable before 1.0 | [`docs/cpp-api.md`](docs/cpp-api.md) |
-| Python | Installable bindings that write, follow and replay journals | not yet published | [`bindings/python/`](bindings/python/README.md) |
-| Java (JDK 25+) | Binding over the C ABI with the Foreign Function and Memory API, in `bindings/java` | not yet on Maven Central | [`docs/java-api.md`](docs/java-api.md) |
+| Python | Installable bindings that write, follow and replay journals | on PyPI as `tickertape` (from v0.5.1) | [`bindings/python/`](bindings/python/README.md) |
+| Java (JDK 25+) | Binding over the C ABI with the Foreign Function and Memory API, in `bindings/java` | on Maven Central as `io.github.thomas0903:tickertape` (from v0.5.1); not stable before 1.0 | [`docs/java-api.md`](docs/java-api.md) |
 | Python | Read-only decoder without dependencies | | [`python/`](python/README.md) |
 
 [`docs/python.md`](docs/python.md) compares the two Python options.

@@ -6,9 +6,9 @@ native code of its own, and has no runtime dependencies. The Javadoc documents e
 rules they share. The design and its reasons are in [ADR 0037](decisions/0037-java-binding.md).
 
 > **Status:** not stable before tickertape 1.0, like the C ABI it is built on. The binding requires exactly the
-> library version it was written for until then (see [Versioning](#versioning)). It is not published to Maven Central
-> yet: build it from source. Releases after v0.4.0 will publish it as `io.github.thomas0903:tickertape` once the owner
-> enables Maven Central ([`install.md` → Java](install.md#java-maven-central)).
+> library version it was written for until then (see [Versioning](#versioning)). It is on Maven Central as
+> `io.github.thomas0903:tickertape` from v0.5.1 ([`install.md` → Java](install.md#java-maven-central)), and can be
+> built from source as described here.
 
 Example: [`bindings/java/examples/Example.java`](../bindings/java/examples/Example.java) records, follows live and
 replays a journal; it runs from source with the `java` launcher.

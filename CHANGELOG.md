@@ -5,6 +5,16 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
+- Fixed (release tooling): `release.py github-release` looked up the draft release it had just created through
+  `releases/tags/<tag>`, which answers 404 for a draft, so the first v0.5.1 run failed after publishing the crates
+  and before attaching any file; rerunning the job completed the release. It now finds the draft through the
+  listing.
+- Added: the v0.5.1 compatibility fixtures (macOS and Linux aarch64), written by the released version (ADR 0033).
+- Docs: the install channels are described as published from v0.5.1 (`docs/install.md`, README, `docs/c-api.md`,
+  `docs/java-api.md`); the roadmap ticks "Make installation easy"; `docs/compatibility.md` → Before 1.0 records the
+  release-candidate exercise as done with v0.5.1, and `docs/playbooks/release-checklist.md` → What the v0.5.1
+  release found lists its four defects and how a failed tag is handled.
+
 ## [0.5.1] - 2026-11-23
 
 This release is the release candidate for 1.0: the first release through every install channel (crates.io, the

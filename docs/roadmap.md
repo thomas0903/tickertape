@@ -219,7 +219,7 @@ an item is ticked only when every criterion holds; each open item says what is s
     for iceoryx2 publish/subscribe services (ADR 0030).
   - Add cross-language fixtures that verify payloads, metadata, checksums, sequence boundaries and durable-only
     behavior. Validate installation and a documented end-to-end example for each delivered binding.
-- [ ] **Make installation easy** (ADR 0031).
+- [x] **Make installation easy** (ADR 0031).
   - Static musl builds of the CLI for Linux, cargo-binstall metadata, a Homebrew tap, PyPI wheels for the Python
     bindings and for the CLI, a C library archive per platform, and Maven Central for the Java binding.
   - Build provenance attestations with a software bill of materials for every released file.
@@ -227,7 +227,9 @@ an item is ticked only when every criterion holds; each open item says what is s
   - Status: the release tooling for every channel exists (static builds, cargo-binstall and Homebrew in part 1; the
     CLI wheel, the C library archives and Maven Central in part 2), each publishing step switched off until the
     owner's one-time set-up (`docs/playbooks/release-checklist.md`). Done when a release has shipped through each.
-  - Missing: no release has shipped through any of the new channels, and none has been installed from.
+  - Done with v0.5.1 (2026-11-23): crates.io, the GitHub release archives (static builds included),
+    cargo-binstall, Homebrew, the C library archives, both PyPI projects and Maven Central, each installed from
+    after publication (by the release workflows, and by hand where they do not test). mise is not tested.
 - [ ] **Make replay and recovery excellent at scale.**
   - Measure startup, seek, catch-up, replay and crash recovery across many segments and journals larger than RAM,
     including retention, archived history and missing/corrupt segments. Publish dataset sizes and resource usage.
@@ -255,8 +257,8 @@ an item is ticked only when every criterion holds; each open item says what is s
     Complete the release checklist and publish guarantees, measured operating limits and known issues.
   - Missing: the surfaces are reviewed and documented in [`compatibility.md`](compatibility.md) (ADR 0043, accepted;
     resolved in #37), with the fixtures and soak tier (#12) and the metrics (#8, #30) in place; its "Before 1.0" list
-    still holds the ABI version and baseline freeze, the 1.0 fixtures, the release-candidate exercise (a tag needs the
-    owner's approval) and, only if the writer's checkpoint or retention code changes after `fbe5785`, a repeat of the
+    still holds the ABI version and baseline freeze, the 1.0 fixtures and, the release-candidate exercise being done
+    with v0.5.1 (2026-11-23), only if the writer's checkpoint or retention code changes after `fbe5785`, a repeat of the
     confirming long run (issue #45) at the release's code. Measured operating limits are published for 64 B and 1,024 B
     ([`benchmarks.md`](benchmarks.md) → Operating envelope and remaining bottlenecks).
 
