@@ -96,6 +96,12 @@ pub enum Point {
     /// After a durable-only reader has read a checkpoint marker that moved past its cursor, before it checks that its
     /// segment is still in place. Arm with [`run_at`].
     ReaderCheckpointIdentity,
+    /// Before a visible zero-copy reader reads the checkpoint marker for the bound on its loads (ADR 0048). Arm with
+    /// [`run_at`], or with [`fail_next`] to make that read fail.
+    ReaderLimitMarker,
+    /// After a visible zero-copy reader that has reached its bound has read the marker again, before it checks that its
+    /// segment is still in place. Arm with [`run_at`], or with [`fail_next`] to make that check fail.
+    ReaderLimitIdentity,
     /// After inspection (`inspect::list_segments`, `inspect::verify`) lists the segments, before it opens each one.
     /// Arm with [`run_at`].
     InspectOpen,

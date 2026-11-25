@@ -570,6 +570,8 @@ struct Repairs<'a> {
     durable_records: &'a AtomicU64,
     /// Records the zero-copy visible reader returned whose payload an in-place repair changed under it.
     changed_payloads: &'a AtomicU64,
+    /// Payloads a durable-only zero-copy reader held over two restarts.
+    held_over_restarts: &'a AtomicU64,
 }
 
 /// How a writer restart changed the segment files, as far as a reader holding them open can tell.
@@ -607,6 +609,7 @@ fn repairs(duration: Duration) {
     let starts = Mutex::new(vec![0]);
     let restarts = Mutex::new(vec![Restart::Clean]);
     let window = AtomicU64::new(0);
+    let held_over_restarts = AtomicU64::new(0);
     let (repairs, in_place_repairs, discarded, durable_records, changed_payloads) = (
         AtomicU64::new(0),
         AtomicU64::new(0),
@@ -626,6 +629,7 @@ fn repairs(duration: Duration) {
         discarded: &discarded,
         durable_records: &durable_records,
         changed_payloads: &changed_payloads,
+        held_over_restarts: &held_over_restarts,
     };
     let config = small_config().retention(Policy::default().max_segments(6), Action::Delete);
     let mut writer = Writer::open(dir.path(), config.clone()).unwrap();
@@ -667,6 +671,7 @@ fn repairs(duration: Duration) {
             repairs.load(Ordering::SeqCst) >= 3
                 && in_place_repairs.load(Ordering::SeqCst) > 0
                 && discarded.load(Ordering::SeqCst) > 0
+                && held_over_restarts.load(Ordering::SeqCst) > 0
         };
         while (started.elapsed() < duration
             || (!exercised() && started.elapsed() < duration + GRACE))
@@ -738,10 +743,16 @@ fn repairs(duration: Duration) {
     );
     eprintln!(
         "durable_readers_under_repairs: {} generations, {repairs} repairs, {in_place_repairs} in place, {} \
-         durable-only records, {discarded} discarded, {} zero-copy payloads changed under the reader",
+         durable-only records, {discarded} discarded, {} zero-copy payloads changed under the reader, {} held over \
+         two restarts",
         starts.len(),
         durable_records.into_inner(),
         changed_payloads.into_inner(),
+        held_over_restarts.load(Ordering::SeqCst),
+    );
+    assert!(
+        held_over_restarts.into_inner() > 0,
+        "no payload was held over two restarts"
     );
     assert!(repairs >= 3, "only {repairs} repairs");
     assert!(in_place_repairs > 0, "no in-place repairs");
@@ -877,9 +888,27 @@ fn durable_follow(shared: &Repairs<'_>, mapped: bool, slow: bool) -> Vec<(u64, u
     while !shared.stop.load(Ordering::SeqCst) {
         match reader.next_timeout(Some(Duration::from_millis(20))) {
             Ok(Some(record)) => {
-                let record = record.to_owned();
+                let held = record;
+                let record = held.to_owned();
                 assert_eq!(record.seq, expected, "mapped {mapped}");
                 check_generation(&record);
+                if mapped && record.seq % 512 == 0 {
+                    // No restart changes a payload that a durable-only zero-copy reader holds, whatever it repairs (C13):
+                    // hold this one over two of them.
+                    let window = shared.window.load(Ordering::SeqCst);
+                    let until = Instant::now() + Duration::from_secs(2);
+                    while shared.window.load(Ordering::SeqCst) < window + 4
+                        && Instant::now() < until
+                        && !shared.stop.load(Ordering::SeqCst)
+                    {
+                        assert_eq!(held.payload, record.payload, "held payload changed");
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    assert_eq!(held.payload, record.payload, "held payload changed");
+                    if shared.window.load(Ordering::SeqCst) >= window + 4 {
+                        shared.held_over_restarts.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
                 match runs.last_mut() {
                     Some((_, end, generation))
                         if *end == record.seq && *generation == record.schema_id =>

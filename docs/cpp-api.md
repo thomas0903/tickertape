@@ -313,7 +313,9 @@ There are two readers, as in C:
   segment, without a copy. **Precondition: while it exists, no process other than a tickertape writer may modify the
   journal's segment files.** A tickertape writer never changes committed bytes, so this holds in normal operation. If
   something else writes into or truncates a segment, payloads can change under you, and truncation kills the process
-  with `SIGBUS`. The `_unsafe` suffix is there so that it is never chosen by accident.
+  with `SIGBUS`. The `_unsafe` suffix is there so that it is never chosen by accident. "Never" is for a journal whose
+  commit words are intact: what storage damage to one can lead to, and for which readers, is the known limitation in
+  `crash-contract.md` → Readers, the writer and memory safety.
 
 **Starting before the writer.** Opening a journal whose writer has not started fails with `Status::io` and
 `os_code() == ENOENT`; while the writer creates the first segment it fails with `Status::not_found`. A loop that waits

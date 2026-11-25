@@ -160,7 +160,8 @@ slot. If neither slot is valid, or the file is missing, there is no checkpoint. 
 everything it describes is durable (see `crash-contract.md` → What `checkpoint()` does), so recovery can trust the
 journal before it. Readers ignore this file unless `ReaderConfig::durable_only(true)` is enabled (and except that seeks read it to decide
 where to start: ADR [0046](decisions/0046-seeks-that-need-no-index.md), and, with a seek index, which segments a
-durable-only or mapped reader may use one for: crash contract C15): then only records
+durable-only or mapped reader may use one for: crash contract C15; a visible zero-copy reader also bounds its loads by
+it, ADR [0048](decisions/0048-publication-frontier.md), which changes no record or error it returns): then only records
 with `seq < next_seq` are returned, and a missing or invalid marker covers no records (ADR
 [0010](decisions/0010-durable-only-reads.md), crash contract C13).
 

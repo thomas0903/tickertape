@@ -315,6 +315,11 @@ jobs:
       # The format code, the CRC over shared words that the zero-copy reader validates with, and that reader's loads
       # over an anonymous mapping (ADR 0027). The latency histogram (ADR 0047), which has no unsafe code.
       - run: cargo +nightly miri test -p tickertape --lib -- format crc map_ro latency decode_boundaries floor_finds
+      # The bound on those loads (ADR 0048): no race with a writer thread in 32 schedules, and one without the bound.
+      - run: cargo +nightly miri test -p tickertape --lib -- map_ro_bounded
+        env:
+          MIRIFLAGS: -Zmiri-many-seeds=0..32
+      - run: .github/scripts/miri_must_report.sh
       # The C ABI's argument handling, error mapping and option builders (the tests that touch no files).
       - run: cargo +nightly miri test -p tickertape-ffi --lib pure_
 

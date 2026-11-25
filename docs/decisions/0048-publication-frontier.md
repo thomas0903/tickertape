@@ -1,6 +1,7 @@
 # 0048: The zero-copy reader's publication frontier
 
-- **Status:** accepted on 2026-11-25 (design only, nothing is built; issue #62)
+- **Status:** accepted on 2026-11-25; the bound is built (2026-11-26, issue #62; "As built" at the end), the shared word
+  is not
 - **Date:** 2026-11-25
 - **Follows up:** [0027](0027-mapped-reader-validates-in-place.md), "Which loads can race". It narrows the known
   limitation stated there; 0027's decision stands.
@@ -8,7 +9,7 @@
 **In short.** No shared frontier word in 1.x: deferred. The checkpoint marker, which exists already, will bound the
 zero-copy reader's loads. **The gain is for replay and catch-up. A caught-up reader tailing the head, the common
 low-latency case, gets nothing from the bound.** A durable-only zero-copy reader is outside the limitation for damaged
-commit words, as long as the journal's markers are intact.
+commit words, as long as the journal's markers are intact (one two-fault case aside: "As built").
 
 ## Context
 
@@ -179,6 +180,10 @@ re-read in the 50 ms retry loop is the same `pread`s again.
 | Case 1 | closed for slots below the `limit` it holds | closed |
 | 2a, 2b | open | do not arise: it returns nothing at or after the marker, and recovery changes nothing before it |
 
+(Corrected on 2026-11-26: as decided here, "closed" for a durable-only reader did not hold behind a crossing frame that
+passes its CRC by chance. The gate goes by sequence numbers, so the reader went on past the marker through the mapping.
+The bound as built gives up the mapping there; "As built" has what is left.)
+
 **What stays open for a visible reader:** a commit word at or after the bound it holds has a value that no writer
 stored there. The bound it holds is
 
@@ -197,7 +202,8 @@ result. Damage to both slots, or to the newer one, breaks it. So does a marker s
 readable for a while and later revert. C13's exception names only damage that also destroys the marker, so this is
 wider than C13's text ("Readers after a repair" also names a marker set back to an older one).
 
-**Scope.** A durable-only zero-copy reader is outside the limitation *for damaged commit words*; for case 2 that is
+**Scope.** A durable-only zero-copy reader is outside the limitation *for damaged commit words* (one two-fault case
+aside: "As built"); for case 2 that is
 true of 1.0.0 already. No marker helps against storage that returns different bytes for a page read again (evicted and
 read back): that changes a payload slice the caller holds, covered or not, for every zero-copy reader.
 
@@ -357,3 +363,79 @@ These narrow the limitation. No item, error value, precondition or on-disk byte 
   the bar covers. `mmap.rs` does not change, but the change alters a safety argument and needs the independent review
   that module's changes get.
 - No decision is left open in this record.
+
+## As built (2026-11-26)
+
+What differs from the text above, or that it left open:
+
+- *No comparison is added.* The per-record path already checks that the claimed frame fits in the segment. It now checks
+  it against `Reader::bound`, the smaller of the segment's size and `limit` plus the 8-byte trailer. A frame that does not
+  fit is invalid before any load, and the retry of an invalid slot, off that path, finds out whether the bound is the
+  reason: there the limit is renewed, or the frame is read with `pread`. So a crossing frame's commit word is loaded
+  through the mapping twice, and nothing else of it. Rows 2 and 3 of the `limit` table are then the same: a segment
+  before the marker's is bounded by its size, like every segment. `materialize` has no choice to make either: a copied
+  record's payload offset is out of the mapping's bounds, which the bounds check for the slice finds.
+- *A durable-only reader gives up its mapping where its place contradicts the marker* (correction of 2026-11-26, found
+  while building and reproduced in review). A covered record's length is enlarged past the marker and the frame passes
+  its CRC by chance (about 2⁻³² a try). The reader returns it from the buffer, a wrong record, as the safe reader does.
+  Its cursor is then past the marker while its sequence number is below the marker's `next_seq`, so the gate, which goes
+  by sequence numbers, lets it on, to commit words and frames that a writer may be storing. So a durable-only reader drops
+  the segment's mapping after a crossing record, where it reaches the limit, and where an applied marker bounds nothing
+  ahead of a cursor that it covers; it reads the rest of the segment with `pread`, with the safe reader's results. The
+  next segment is mapped again, unless the applied marker does not fit that one either. Refreshing the bound alone would
+  not do (a marker behind the cursor bounds nothing), nor would refusing a crossing frame (the results would differ from
+  the safe reader's where the marker does not fit the files). The per-record path is unchanged: `try_next`, `advance` and
+  `read_slot` compile to the same instructions with and without this, on aarch64 and x86-64.
+  *What is left* takes two faults: a chance-CRC frame that ends **exactly** at the limit, so that it does not cross it, and
+  a seal marker damaged into the empty slot there, which makes the reader load the 4 bytes after that marker. Without the
+  second, it loads only the commit word at the limit before it gives the mapping up (when the limit is the segment's
+  last slot the bound equals the segment size, so the mapping is kept and that word is loaded on every read: still no
+  other byte), and writers store that word only as the same 4-byte atomic: appends and seals do, and recovery from this marker zeroes only from behind an empty slot's
+  commit word on. The contract says so.
+- *Where the bound is renewed.* Reached means: at the first slot read at or after `limit` that is not a seal (at the seal
+  the next segment's open reads the marker). After a marker read again has bounded nothing ahead of the cursor, a visible reader has
+  no bound until the 100 ms check, a seek or the next segment. A valid marker file that has become invalid, or a marker
+  that has moved back, sets the bound as the table says, also where a bound ahead of the cursor was held.
+- *Fences.* `fence(Acquire)` follows every read of the marker that can become the bound: also ADR 0045's step 2, ADR
+  0046's `covered_now` and `seek_to_end`, and a durable-only reader's refresh.
+- *An index landing* of a visible reader sets the bound to the segment's size (its step 2 and step 5 establish row 2).
+- *The Python binding* does not expose the mapped reader, so it has nothing to say about it.
+- *Test plan:* the counting view of item 3 records the ranges of each mapped load in test builds of `mmap.rs`.
+  ThreadSanitizer was not run: it keeps its state per virtual address and does not model fences.
+
+## Amendment of 2026-11-26: the cost bar
+
+The bar asked for bare-metal x86-64 and aarch64. It was measured on one 4-vCPU cloud VM (`c4-standard-4-lssd`, Xeon
+6985P-C), old build (A, A′, the same binary) against new (B), 20 interleaved rounds, pinned, medians over the runs:
+
+| Measurement | A | A′ | B | A′ − A | B − A | Limit | Machine counts | Inside |
+|---|---|---|---|---|---|---|---|---|
+| `replay`, mapped, 64 B, ns per record | 43.87 | 43.96 | 43.10 | +0.10 | −0.77 | +0.5 | yes | yes |
+| `replay`, mapped, 1,024 B, ns per record | 100.76 | 100.59 | 100.20 | −0.16 % | −0.56 % | +1 % | yes | yes |
+| latency p50, no checkpoints, ns | 319 | 319 | 323 | 0 | +4 | +10 | yes | yes |
+| latency p99.9, no checkpoints, ns | 2,838 | 3,338 | 2,720 | +500 | −118 | +100 | no | not decided |
+| latency p50, checkpoints every 100 ms, ns | 319 | 319 | 322 | 0 | +3 | +10 | yes | yes |
+| latency p99.9, checkpoints every 100 ms, ns | 6,141 | 7,115 | 5,947 | +974 | −194 | +100 | no | not decided |
+| opening a reader, mapped, warm, µs | 202.4 | 202.2 | 203.8 | −0.2 | +1.4 | +10 | yes | yes |
+| rolling into the next segment, mapped, warm, µs | 12.35 | 12.30 | 13.34 | −0.05 | +0.99 | +10 | yes | yes |
+
+Old against old differed by 500 and 974 ns at p99.9, so by the bar's own rule those two rows decide nothing. (Single
+replay runs spread more than the 0.5 ns limit too; the medians agree.)
+
+**The bound was accepted on other evidence.** The independent review traced one mapped `try_next` instruction
+by instruction, natively on aarch64 and in an x86-64 build:
+
+| Instructions per record, old → new | 64 B | 1,024 B |
+|---|---|---|
+| aarch64 | 440 → 439 | 773 → 772 |
+| x86-64 | 520 → 514 | 844 → 838 |
+
+The load and store counts are identical. `read_slot`'s load of the segment's size becomes a load of `bound` (the same
+comparison, another operand); `advance` gains one unconditional branch on aarch64; and in `materialize` an existing bounds
+check that compiled to a conditional select (`csel`, `cmov`) is now a conditional branch, always taken the same way for
+records in the mapping (the two extra jumps on x86-64). No work is added on the record path. Off it: one `at_limit` check
+per empty poll; one marker read per 100 ms idle, per segment open, seek or roll; at each limit reached one failed slot
+read, one marker read and one `stat`; and `pread`s and a buffer for a crossing frame.
+
+So the change was accepted with the two p99.9 rows recorded as undecidable on that machine. Nothing was measured on
+aarch64 or on bare metal.

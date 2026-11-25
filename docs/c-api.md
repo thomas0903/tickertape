@@ -234,7 +234,8 @@ There are two readers:
   modify the journal's segment files.** A tickertape writer never changes committed bytes, including during
   recovery, so this holds in normal operation. If something else writes into or truncates a segment, payloads can
   change under you, and truncation kills the process with `SIGBUS`. The `_unsafe` suffix is there so that this is
-  never chosen by accident.
+  never chosen by accident. "Never" is for a journal whose commit words are intact: what storage damage to one can lead
+  to, and for which readers, is the known limitation in `crash-contract.md` → Readers, the writer and memory safety.
 
 Both validate every record (length, CRC32C, sequence number) before returning it, follow segment rolls, and wait with
 the configured back-off, blocking on the writer's wake-up region when it is available.

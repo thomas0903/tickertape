@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use crate::config::{Backoff, ReaderConfig};
 use crate::error::{CorruptReason, Error, Result};
-use crate::format::{self, RecordHeader};
+use crate::format::{self, CheckpointSlot, RecordHeader};
 use crate::journal::{self, Identity};
 use crate::mmap::MapRo;
 use crate::record::{OwnedRecord, Record};
@@ -74,6 +74,16 @@ pub struct Reader {
     durable_next_seq: u64,
     /// The segment the marker that set `durable_next_seq` names (0 if there was no valid marker).
     durable_segment_base: u64,
+    /// The offset in it that the marker names (0 if there was no valid marker).
+    durable_offset: u64,
+    /// The bound on the zero-copy reader's loads (ADR 0048): the size that `seg` has for them. No frame that would end
+    /// after `bound - SEGMENT_TRAILER_LEN` is loaded through the mapping; that is the checkpoint position in `seg` (the
+    /// ADR's `limit`). It is the size of `seg`, that is no bound of its own, if the marker bounds nothing at or after the
+    /// cursor, if it names a later segment (whose `limit` is `seg`'s size), or once the cursor has reached `limit` and the
+    /// marker was read again there (a durable-only reader then has no mapping of `seg`). Checking a frame against this instead of `seg`'s size costs the per-record
+    /// path no comparison. Set only by [`Reader::set_limit`], and where a failed `seek_to_end` is undone. The `pread`
+    /// reader does not use it.
+    bound: u64,
     /// When a durable-only reader waiting at the checkpoint last checked a segment that the marker has moved past.
     superseded_checked: Option<Instant>,
     /// Records before this are skipped (set by `seek`).
@@ -85,7 +95,8 @@ pub struct Reader {
     seek_covered: u64,
     /// Whether the last `seek` landed through a seek index ([`Reader::seek_used_index`]).
     used_index: bool,
-    /// `pread` buffer: bytes of `seg` starting at file offset `buf_start`.
+    /// `pread` buffer: bytes of `seg` starting at file offset `buf_start`. A zero-copy reader uses it only for a record
+    /// whose frame crosses `bound` ([`Reader::read_crossing`]), while that record is the current one.
     buf: Vec<u8>,
     buf_start: u64,
     /// The journal's wake-up region, if wake-ups are enabled (ADRs 0017 and 0021).
@@ -105,6 +116,8 @@ struct OpenSegment {
     size: u64,
     file: File,
     identity: Identity,
+    /// `None` for the `pread` reader, and for a durable-only zero-copy reader that gave it up
+    /// ([`Reader::give_up_mapping`]).
     map: Option<MapRo>,
 }
 
@@ -112,10 +125,16 @@ struct OpenSegment {
 #[derive(Debug, Clone, Copy)]
 struct Found {
     header: RecordHeader,
-    /// Offset of the payload in the segment file.
+    /// Offset of the payload in the segment file, plus [`COPIED`] if it is to be handed out from the zero-copy reader's
+    /// buffer ([`SlotOutcome::Copied`]).
     payload_at: u64,
     payload_len: usize,
 }
+
+/// Marks `Found::payload_at` of a record that the zero-copy reader has in its buffer, not in its mapping: an offset that no
+/// mapping reaches, so that the bounds check that every payload in the mapping gets is the only check that record path
+/// makes for it.
+const COPIED: u64 = 1 << 63;
 
 /// Where [`Reader::seek_to_end`] started, to go back to if it fails.
 struct Place {
@@ -126,6 +145,8 @@ struct Place {
     seek_covered: u64,
     durable_next_seq: u64,
     durable_segment_base: u64,
+    durable_offset: u64,
+    bound: u64,
     superseded_checked: Option<Instant>,
     buf: Vec<u8>,
     buf_start: u64,
@@ -144,9 +165,15 @@ struct Place {
 /// change to this file, to `format.rs` or to what this path inlines or returns (`error.rs`, `mmap.rs`, `crc.rs`)
 /// needs the `replay` benchmark before and after (`CONTRIBUTING.md`).
 #[derive(Debug, Clone, Copy)]
-enum SlotOutcome {
+pub(crate) enum SlotOutcome {
     Empty,
-    Record { len: u32 },
+    Record {
+        len: u32,
+    },
+    /// A record that the zero-copy reader read into its buffer, because its frame crosses `Reader::bound` (ADR 0048).
+    Copied {
+        len: u32,
+    },
     Seal,
     Invalid(CorruptReason),
 }
@@ -182,6 +209,10 @@ impl Reader {
     ///
     /// Each record is validated (length, CRC32C, sequence number, flags) from atomic loads of the mapping before any
     /// slice into it is created. The checks, their order and the errors are those of [`Reader::open`] (ADR 0027).
+    /// Below the checkpoint position the reader took last, no load reaches past that position. A record whose frame
+    /// crosses that position is copied into the reader's buffer instead (ADR 0048), and a durable-only reader then reads
+    /// the rest of that segment through its buffer as well: on an intact journal whose marker fits its files there is
+    /// none.
     ///
     /// Segments are mapped only on x86-64 and aarch64. On other targets this opens the same reader as
     /// [`Reader::open`] (same API and results; payloads borrow from a buffer the reader owns and nothing is mapped),
@@ -222,6 +253,14 @@ impl Reader {
     ///   writer's stores. (When recovery finds evidence of the records, it usually replaces the segment by a new
     ///   file instead, and mappings of the old file do not change. ADR 0035.)
     ///
+    /// The bound that ADR 0048 puts on the loads helps replay and catch-up. A caught-up visible reader tailing the head
+    /// gets nothing from it. As long as the journal's `checkpoint` file holds the markers the writer wrote and no earlier
+    /// one becomes current, neither case concerns a reader with `durable_only(true)`, and the first does not concern a slot below the
+    /// checkpoint position the reader last took (at a segment's open, on reaching that position, and while it waits).
+    /// Without that, the limitation is as stated. (For a durable-only reader one case is left, and it takes two faults: a
+    /// damaged record that ends exactly at the checkpoint position and passes its CRC32C by chance, and a seal marker
+    /// damaged into the empty slot there. The reader then loads the 4 bytes that follow that marker.) ADR 0048.
+    ///
     /// That such loads return some mixture of old and new bytes, which the CRC then rejects, is an assumption about
     /// the implementation on the supported targets, not a guarantee. Earlier releases had the same exposure.
     ///
@@ -233,6 +272,10 @@ impl Reader {
     }
 
     fn open_inner(dir: &Path, config: ReaderConfig, mapped: bool) -> Result<Reader> {
+        // Before the segment is opened by its path: the segment was then current after the marker was written.
+        let marker = (mapped && !config.durable_only)
+            .then(|| marker_for_limit(dir))
+            .flatten();
         let (base, seg) = open_listed(dir, mapped, 0, |bases| match bases.oldest {
             Some(base) => Ok(base),
             None => Err(Error::NotFound {
@@ -240,7 +283,7 @@ impl Reader {
             }),
         })?;
         let waker = config.notify.then(|| crate::notify::Waker::new(dir));
-        Ok(Reader {
+        let mut reader = Reader {
             dir: dir.to_path_buf(),
             config,
             mapped,
@@ -249,6 +292,8 @@ impl Reader {
             next_seq: base,
             durable_next_seq: 0,
             durable_segment_base: 0,
+            durable_offset: 0,
+            bound: 0,
             superseded_checked: None,
             skip_until: base,
             seek_covered: 0,
@@ -267,7 +312,9 @@ impl Reader {
                 payload_at: 0,
                 payload_len: 0,
             },
-        })
+        };
+        reader.set_limit(limit_of(marker.flatten().as_ref(), &reader.seg));
+        Ok(reader)
     }
 
     /// Positions the reader so that the next record returned is `seq`.
@@ -311,6 +358,7 @@ impl Reader {
     /// [`Error::Corrupt`] or [`Error::Io`] while locating it. An I/O "not found" error for a segment that `seek`
     /// listed is returned only if the chosen segment disappeared on each of 8 listings in a row.
     pub fn seek(&mut self, seq: u64) -> Result<()> {
+        let marker = self.marker_before_open();
         let (base, seg) = open_listed(&self.dir, self.mapped, seq, |bases| {
             let Some(first) = bases.oldest else {
                 return Err(Error::NotFound {
@@ -327,6 +375,7 @@ impl Reader {
             self.seg = seg;
             self.offset = format::SEGMENT_HEADER_LEN as u64;
             self.next_seq = base;
+            self.set_limit(limit_of(marker.as_ref(), &self.seg));
         }
         self.used_index = self.config.seek_index && self.land_through_index(seq, continues);
         if self.used_index {
@@ -334,7 +383,11 @@ impl Reader {
             self.seek_covered = 0;
         } else if !continues || seq >= self.seek_covered {
             // A seek that continues to a target the known marker covers needs no newer one.
-            self.seek_covered = self.covered_now();
+            let marker = self.covered_now();
+            self.seek_covered = marker.map_or(0, |m| m.next_seq);
+            if marker.is_some() && self.visible_mapped() {
+                self.set_limit(limit_of(marker.as_ref(), &self.seg));
+            }
         }
         self.skip_until = seq;
         self.cursor_moved();
@@ -579,15 +632,108 @@ impl Reader {
             && self.last_record_in_place()
     }
 
-    /// The exclusive bound of the checkpoint's coverage, if the reader's segment is still in place after the marker
-    /// was read (0 otherwise, and if either can't be established: later seeks then scan).
-    fn covered_now(&self) -> u64 {
+    /// The checkpoint marker, whose `next_seq` is the exclusive bound of the checkpoint's coverage, if the reader's
+    /// segment is still in place after the marker was read (`None` otherwise, and if either can't be established: later
+    /// seeks then scan).
+    fn covered_now(&self) -> Option<CheckpointSlot> {
         let marker = crate::inspect::read_checkpoint(&self.dir);
+        // The marker may become the bound on the loads (ADR 0048 → Ordering).
+        fence(Ordering::Acquire);
         crate::fault::hook(crate::fault::Point::ReaderSeekCoverage);
         match marker {
-            Ok(Some(marker)) if self.check_identity().is_ok() => marker.next_seq,
-            _ => 0,
+            Ok(Some(marker)) if self.check_identity().is_ok() => Some(marker),
+            _ => None,
         }
+    }
+
+    /// Whether the reader bounds its loads by markers it reads for that purpose: a zero-copy reader that is not
+    /// durable-only (a durable-only one uses the marker it has applied).
+    fn visible_mapped(&self) -> bool {
+        self.mapped && !self.config.durable_only
+    }
+
+    /// For the bound of a segment about to be opened by its path, which proves that it was current after the marker was
+    /// written (ADR 0034): the marker, or `None` if there is no valid one, it can't be read, or the reader has no bound.
+    /// A durable-only reader does not read it again: files it opens after it read the marker it has applied are current.
+    fn marker_before_open(&self) -> Option<CheckpointSlot> {
+        if self.config.durable_only {
+            return self.durable_marker();
+        }
+        self.mapped
+            .then(|| marker_for_limit(&self.dir))
+            .flatten()
+            .flatten()
+    }
+
+    /// The position of the marker a durable-only reader has applied, as a slot for [`limit_of`].
+    fn durable_marker(&self) -> Option<CheckpointSlot> {
+        Some(CheckpointSlot {
+            generation: 0,
+            next_seq: self.durable_next_seq,
+            segment_base_seq: self.durable_segment_base,
+            offset: self.durable_offset,
+        })
+    }
+
+    /// Sets the bound for the segment at the cursor, from a `limit` of [`limit_of`]. A limit at or before the cursor has
+    /// been reached, and its marker just read, so it bounds nothing: a visible reader then reads without a bound. A
+    /// durable-only reader comes to that only while its gate stops it (the marker does not move past its cursor, so it
+    /// reads nothing there); otherwise its place and the marker contradict each other, and it gives up its mapping.
+    fn set_limit(&mut self, limit: u64) {
+        self.drop_copy();
+        let size = self.seg.size;
+        self.bound = size;
+        if self.seg.map.is_none() {
+            return;
+        }
+        if limit > self.offset {
+            self.bound = size.min(limit + format::SEGMENT_TRAILER_LEN as u64);
+        } else if self.config.durable_only && self.next_seq < self.durable_next_seq {
+            self.give_up_mapping();
+        }
+    }
+
+    /// A durable-only reader whose cursor is at or past the applied marker's position, while its sequence number is below
+    /// the marker's: a frame that the marker does not cover was counted as one record (a damaged length that passed its
+    /// CRC32C by chance), or the marker does not fit the files. The gate in [`Reader::advance`], which goes by sequence
+    /// numbers, does not stop the reader there, where a writer may be storing. So nothing more of this segment is loaded
+    /// through the mapping: it is read with `pread`, as the safe reader reads it. The next segment is mapped again.
+    fn give_up_mapping(&mut self) {
+        self.seg.map = None;
+        self.bound = self.seg.size;
+    }
+
+    /// Whether there is a bound and the cursor is at or past it.
+    fn at_limit(&self) -> bool {
+        self.bound < self.seg.size && self.offset + format::SEGMENT_TRAILER_LEN as u64 >= self.bound
+    }
+
+    /// Frees the buffer of a zero-copy reader: it has no use for it but the record copied into it last.
+    fn drop_copy(&mut self) {
+        if self.seg.map.is_some() {
+            self.buf = Vec::new();
+        }
+    }
+
+    /// The cursor has reached the bound. A durable-only reader gives up its mapping. A visible reader reads the marker again, once (the bound is moved or removed either way), and
+    /// then checks that the segment is still in place. If either fails, the bound that stays is the one the cursor has
+    /// reached, so there is none, and nothing is reported: a reader overtaken by retention reads its segment to the end (crash contract
+    /// C14).
+    #[inline(never)]
+    fn limit_reached(&mut self) {
+        if self.config.durable_only {
+            return self.give_up_mapping();
+        }
+        let mut limit = 0;
+        if let Some(marker) = marker_for_limit(&self.dir) {
+            crate::fault::hook(crate::fault::Point::ReaderLimitIdentity);
+            let in_place = crate::fault::inject(crate::fault::Point::ReaderLimitIdentity).is_ok()
+                && self.check_identity().is_ok();
+            if in_place {
+                limit = limit_of(marker.as_ref(), &self.seg);
+            }
+        }
+        self.set_limit(limit);
     }
 
     /// Whether the last [`Reader::seek`] landed through a seek index. Hidden: for the workspace's tests and benchmarks.
@@ -607,6 +753,11 @@ impl Reader {
         self.indexed_place(target, continues).is_some_and(|entry| {
             self.offset = entry.offset;
             self.next_seq = entry.seq;
+            if self.visible_mapped() {
+                // Step 2's marker names a later segment, and step 5 found this one in place after it was read (the
+                // table in ADR 0048, second row). A durable-only reader keeps the bound of the marker it has applied.
+                self.set_limit(self.seg.size);
+            }
             true
         })
     }
@@ -628,6 +779,8 @@ impl Reader {
             if marker.segment_base_seq <= base {
                 return None;
             }
+            // Loads up to the segment's size then need this read of the marker (ADR 0048 → Ordering).
+            fence(Ordering::Acquire);
         }
         crate::fault::hook(crate::fault::Point::ReaderSeekIndexMarker);
         // Steps 3 and 4.
@@ -652,11 +805,9 @@ impl Reader {
         crate::fault::hook(crate::fault::Point::ReaderSeekIndexLanding);
         self.buf.clear();
         let valid = self.holds_record(&entry).unwrap_or(false);
-        // What was read is not kept: every seek leaves the buffer empty, and a mapped reader has no other use for it.
+        // What was read is not kept: every seek leaves the buffer empty, and a mapped reader has no use for it here.
         self.buf.clear();
-        if self.mapped {
-            self.buf = Vec::new();
-        }
+        self.drop_copy();
         valid.then_some(entry)
     }
 
@@ -712,9 +863,7 @@ impl Reader {
     /// (checked where the reader last passed a record). An I/O error counts as no.
     fn last_record_in_place(&self) -> bool {
         let (Some(at), Some(seq)) = (
-            self.found
-                .payload_at
-                .checked_sub(format::RECORD_HEADER_LEN as u64),
+            (self.found.payload_at & !COPIED).checked_sub(format::RECORD_HEADER_LEN as u64),
             self.next_seq.checked_sub(1),
         ) else {
             return false;
@@ -731,6 +880,7 @@ impl Reader {
     /// and the timers of a wait there.
     fn cursor_moved(&mut self) {
         self.buf.clear();
+        self.drop_copy();
         self.waiting_since = None;
         self.superseded_checked = None;
     }
@@ -745,6 +895,8 @@ impl Reader {
             // For a visible reader the marker is only a shortcut.
             Err(_) => None,
         };
+        // It also bounds a visible zero-copy reader's loads (ADR 0048 → Ordering).
+        fence(Ordering::Acquire);
         let newest = match marker {
             _ if !self.config.durable_only => u64::MAX,
             Some(marker) => marker.next_seq,
@@ -774,6 +926,8 @@ impl Reader {
             // A durable-only reader's end is the marker as it is now: an earlier, higher one may be gone.
             durable_next_seq: std::mem::take(&mut self.durable_next_seq),
             durable_segment_base: std::mem::take(&mut self.durable_segment_base),
+            durable_offset: std::mem::take(&mut self.durable_offset),
+            bound: self.bound,
             superseded_checked: self.superseded_checked,
             buf: std::mem::take(&mut self.buf),
             buf_start: self.buf_start,
@@ -781,6 +935,9 @@ impl Reader {
             found: self.found,
         };
         self.cursor_moved();
+        // For a durable-only reader, until it applies a marker on the way: none (nothing is read before that).
+        let limit = marker.filter(|_| self.visible_mapped());
+        self.set_limit(limit_of(limit.as_ref(), &self.seg));
         // Without a marker nothing is covered, so a durable-only reader is there. It doesn't look for a marker again:
         // one that has appeared since would make it read the journal from here.
         let end = if self.config.durable_only && marker.is_none() {
@@ -797,6 +954,8 @@ impl Reader {
             // A marker applied on the way was checked against the segment read there, not against this one (C13).
             self.durable_next_seq = before.durable_next_seq;
             self.durable_segment_base = before.durable_segment_base;
+            self.durable_offset = before.durable_offset;
+            self.bound = before.bound;
             self.superseded_checked = before.superseded_checked;
             self.buf = before.buf;
             self.buf_start = before.buf_start;
@@ -891,7 +1050,10 @@ impl Reader {
         // `fresh`: the safe reader reads the slot from the file, not its buffer. The buffer can hold a record past the
         // checkpoint that recovery has since zeroed in place and that the seal now covers; probed from the buffer, it
         // would hide the seal on every call. The mapping shows the current bytes anyway.
-        match self.read_slot(true)? {
+        let slot = self.read_slot_bounded()?;
+        // A record found here is not returned.
+        self.drop_copy();
+        match slot {
             SlotOutcome::Seal => self.follow_seal(),
             _ => self.check_identity(),
         }
@@ -916,8 +1078,10 @@ impl Reader {
     /// the current history. The mapping needs nothing: it shows the current bytes. ADR 0034 has the full argument.
     fn refresh_checkpoint(&mut self) -> Result<()> {
         crate::fault::hook(crate::fault::Point::ReaderCheckpoint);
-        let (durable, segment_base) = crate::inspect::read_checkpoint(&self.dir)?
-            .map_or((0, 0), |c| (c.next_seq, c.segment_base_seq));
+        let (durable, segment_base, offset) = crate::inspect::read_checkpoint(&self.dir)?
+            .map_or((0, 0, 0), |c| (c.next_seq, c.segment_base_seq, c.offset));
+        // The marker also bounds a zero-copy reader's loads (ADR 0048 → Ordering).
+        fence(Ordering::Acquire);
         if durable > self.next_seq {
             crate::fault::hook(crate::fault::Point::ReaderCheckpointIdentity);
             self.check_identity()?;
@@ -926,6 +1090,10 @@ impl Reader {
         }
         self.durable_next_seq = durable;
         self.durable_segment_base = segment_base;
+        self.durable_offset = offset;
+        if self.seg.map.is_some() {
+            self.set_limit(limit_of(self.durable_marker().as_ref(), &self.seg));
+        }
         Ok(())
     }
 
@@ -948,6 +1116,7 @@ impl Reader {
             };
             match outcome {
                 SlotOutcome::Record { len } => return self.step_past_record(len),
+                SlotOutcome::Copied { len } => return self.step_past_copied(len),
                 SlotOutcome::Empty => {
                     self.at_empty_slot()?;
                     return Ok(false);
@@ -967,7 +1136,7 @@ impl Reader {
         let mut attempt = 1;
         let mut window: Option<(Instant, Duration)> = None;
         loop {
-            let read = self.read_slot(true)?;
+            let read = self.read_slot_bounded()?;
             #[cfg(test)]
             let read = tests::scripted(read);
             if !matches!(read, SlotOutcome::Invalid(_)) {
@@ -1003,6 +1172,19 @@ impl Reader {
         Ok(true)
     }
 
+    /// [`Reader::step_past_record`] for a record whose payload is in the zero-copy reader's buffer. The cursor is then past
+    /// the bound: a durable-only reader gives up its mapping (and hands the payload out as the `pread` reader does).
+    #[inline(never)]
+    fn step_past_copied(&mut self, len: u32) -> Result<bool> {
+        let stepped = self.step_past_record(len);
+        if self.config.durable_only {
+            self.give_up_mapping();
+        } else {
+            self.found.payload_at |= COPIED;
+        }
+        stepped
+    }
+
     #[inline(never)]
     fn sequence_exhausted(&self) -> Error {
         Error::corrupt(
@@ -1012,14 +1194,26 @@ impl Reader {
         )
     }
 
-    /// At an empty slot: checks the segment's identity once per [`IDENTITY_CHECK_INTERVAL`] of waiting there.
+    /// At an empty slot: checks the segment's identity once per [`IDENTITY_CHECK_INTERVAL`] of waiting there. A visible
+    /// zero-copy reader reads the marker again before that check, for its bound (and, as at any slot, when it has just
+    /// reached the bound): if the marker can't be read, the old bound stays.
     #[inline(never)]
     fn at_empty_slot(&mut self) -> Result<()> {
+        if self.at_limit() {
+            self.limit_reached();
+        }
         let now = Instant::now();
         let since = *self.waiting_since.get_or_insert(now);
         if now.duration_since(since) >= IDENTITY_CHECK_INTERVAL {
             self.waiting_since = Some(now);
+            let marker = self
+                .visible_mapped()
+                .then(|| marker_for_limit(&self.dir))
+                .flatten();
             self.check_identity()?;
+            if let Some(marker) = marker {
+                self.set_limit(limit_of(marker.as_ref(), &self.seg));
+            }
         }
         Ok(())
     }
@@ -1042,6 +1236,7 @@ impl Reader {
     fn follow_seal(&mut self) -> Result<()> {
         self.check_identity()?;
         crate::fault::hook(crate::fault::Point::ReaderSeal);
+        let marker = self.marker_before_open();
         let next = match open_segment(&self.dir, self.next_seq, self.mapped) {
             Ok(next) => next,
             Err(e) if e.is_not_found() => {
@@ -1059,7 +1254,10 @@ impl Reader {
                 // again and come back here without end.
                 self.buf.clear();
                 crate::fault::hook(crate::fault::Point::ReaderSealReread);
-                if !matches!(self.read_slot(true)?, SlotOutcome::Seal) {
+                let sealed = matches!(self.read_slot_bounded()?, SlotOutcome::Seal);
+                // A record found here is read again by the caller.
+                self.drop_copy();
+                if !sealed {
                     return Ok(());
                 }
                 // The seal is in the file now. A live writer stores a seal only after linking the successor, so a
@@ -1088,6 +1286,7 @@ impl Reader {
         self.seg = next;
         self.offset = format::SEGMENT_HEADER_LEN as u64;
         self.buf.clear();
+        self.set_limit(limit_of(marker.as_ref(), &self.seg));
         self.waiting_since = None;
         self.superseded_checked = None;
         Ok(())
@@ -1108,11 +1307,13 @@ impl Reader {
             // copied. A damaged length is normally rejected by the bounds checks and the CRC before any slice
             // exists; validation is not proof, and ADR 0027 → "Which loads can race" says what a damaged commit
             // word can lead to.
+            // A frame that would end after `bound` fails the bounds checks, so nothing of it is loaded; the retry then
+            // looks at why (ADR 0048, `Reader::read_slot_bounded`).
             return Ok(read_mapped(
                 map,
                 word,
                 offset,
-                size,
+                self.bound,
                 expected,
                 &mut self.found.header,
             ));
@@ -1172,6 +1373,79 @@ impl Reader {
         ))
     }
 
+    /// A fresh [`Reader::read_slot`] of a slot that is perhaps invalid only because of the bound: where the cursor has
+    /// reached the limit, renews the bound and reads the slot again, and where the slot's frame crosses the bound, going by
+    /// its commit word, reads it with `pread`. (A slot at or past the limit, or whose frame ends after it, is always
+    /// `Invalid` for `read_slot`, except an empty one and a seal at the limit. So it is the retry of an invalid slot that
+    /// comes here, and the per-record path pays nothing for it.)
+    #[inline(never)]
+    fn read_slot_bounded(&mut self) -> Result<SlotOutcome> {
+        let mut read = self.read_slot(true)?;
+        if self.bound == self.seg.size || !matches!(read, SlotOutcome::Invalid(_)) {
+            return Ok(read);
+        }
+        if self.at_limit() {
+            self.limit_reached();
+            read = self.read_slot(true)?;
+        }
+        match read {
+            // A length that no frame has, and a seal in front of the limit (which ends at or before it, since the limit is
+            // a multiple of 8), are invalid wherever the bound is.
+            SlotOutcome::Invalid(CorruptReason::BadLength(word))
+                if self.bound < self.seg.size && word >= format::RECORD_HEADER_LEN as u32 =>
+            {
+                self.read_crossing()
+            }
+            read => Ok(read),
+        }
+    }
+
+    /// Reads the slot at the cursor of a mapped segment as the `pread` reader reads a fresh slot, commit word included,
+    /// and with the same outcome, into the buffer. Nothing of it but the commit word has been loaded through the mapping
+    /// (ADR 0048): the frame crosses the checkpoint position, so its length is damaged, or the marker does not fit the
+    /// files. The buffer holds no more than the claimed frame, which lies in the segment, and is kept only for a valid
+    /// record, until the next slot is read.
+    fn read_crossing(&mut self) -> Result<SlotOutcome> {
+        let outcome = self.read_into_buf();
+        if !matches!(outcome, Ok(SlotOutcome::Copied { .. })) {
+            self.drop_copy();
+        }
+        outcome
+    }
+
+    fn read_into_buf(&mut self) -> Result<SlotOutcome> {
+        let io = |e| Error::io("read segment", &self.seg.path, e);
+        let offset = self.offset;
+        let mut word = [0u8; format::COMMIT_WORD_LEN];
+        self.seg.file.read_exact_at(&mut word, offset).map_err(io)?;
+        let word = u32::from_le_bytes(word);
+        if word == 0 {
+            return Ok(SlotOutcome::Empty);
+        }
+        fence(Ordering::Acquire);
+        let pending = classify(word, offset, self.seg.size);
+        let body_len = pending_len(pending);
+        resize_buf(&mut self.buf, format::COMMIT_WORD_LEN as u64 + body_len)
+            .map_err(|e| Error::io("allocate read buffer", &self.seg.path, e))?;
+        self.buf_start = offset;
+        let body = &mut self.buf[format::COMMIT_WORD_LEN..];
+        self.seg
+            .file
+            .read_exact_at(body, offset + format::COMMIT_WORD_LEN as u64)
+            .map_err(io)?;
+        let outcome = finish(
+            pending,
+            word,
+            self.next_seq,
+            Some(body),
+            &mut self.found.header,
+        );
+        Ok(match outcome {
+            SlotOutcome::Record { len } => SlotOutcome::Copied { len },
+            other => other,
+        })
+    }
+
     /// Fills the `pread` buffer from `offset`: at least the frame of commit word `word`, normally a whole chunk,
     /// but never past the end of the segment.
     fn fill_buf(&mut self, offset: u64, word: u32) -> Result<()> {
@@ -1195,16 +1469,35 @@ impl Reader {
         Ok(())
     }
 
+    /// The payload of a record that the zero-copy reader found last and has in its buffer (from the commit word on).
+    #[inline(never)]
+    fn copied_payload(&self) -> &[u8] {
+        (self.found.payload_at & !COPIED)
+            .checked_sub(self.buf_start)
+            .and_then(|start| usize::try_from(start).ok())
+            .and_then(|start| {
+                self.buf
+                    .get(start..start.checked_add(self.found.payload_len)?)
+            })
+            .unwrap_or(&[])
+    }
+
     /// The record [`Reader::advance`] just found, borrowing its payload from the mapping or the buffer.
     fn materialize(&self) -> Record<'_> {
         let found = &self.found;
         let payload: &[u8] = match &self.seg.map {
             Some(map) => {
-                // SAFETY: the payload is part of a record validated after observing its non-zero commit word;
-                // on an intact publication chain `open_mapped`'s contract makes it immutable while the reader
-                // exists (ADR 0027 → "Which loads can race" describes both cases after storage damage).
-                unsafe { map.committed_bytes(found.payload_at, found.payload_len as u64) }
-                    .unwrap_or(&[])
+                // SAFETY: the payload is part of a record validated through this mapping after observing its non-zero
+                // commit word; on an intact publication chain `open_mapped`'s contract makes it immutable while the
+                // reader exists (ADR 0027 → "Which loads can race" describes both cases after storage damage, which
+                // ADR 0048 narrows). The only records not validated through the mapping are those marked `COPIED`,
+                // whose offset is out of the mapping's bounds: for them this is `None`.
+                let mapped =
+                    unsafe { map.committed_bytes(found.payload_at, found.payload_len as u64) };
+                match mapped {
+                    Some(payload) => payload,
+                    None => self.copied_payload(),
+                }
             }
             None => {
                 let start = (found.payload_at - self.buf_start) as usize;
@@ -1296,6 +1589,36 @@ fn open_segment(dir: &Path, base: u64, mapped: bool) -> Result<OpenSegment> {
     })
 }
 
+/// The checkpoint marker for the bound of a visible zero-copy reader (ADR 0048): `Some(None)` if there is no valid one,
+/// `None` if it can't be read, which is never reported.
+///
+/// The marker's writer stored everything before the marker's position before it wrote the marker. The `pread` returned
+/// the marker, and the fence orders the mapped loads that follow after it, so those below the position meet no store,
+/// also where the reader has not acquired the commit word of the record they touch (ADR 0048 → Ordering).
+#[inline(never)]
+fn marker_for_limit(dir: &Path) -> Option<Option<CheckpointSlot>> {
+    crate::fault::hook(crate::fault::Point::ReaderLimitMarker);
+    crate::fault::inject(crate::fault::Point::ReaderLimitMarker).ok()?;
+    let marker = crate::inspect::read_checkpoint(dir).ok()?;
+    fence(Ordering::Acquire);
+    Some(marker)
+}
+
+/// How far `marker` covers `seg` (the table in ADR 0048): the marker's offset if it names `seg`, `seg`'s size if it names
+/// a later segment (then no writer stores to `seg` and no recovery from this marker changes it), and otherwise 0.
+fn limit_of(marker: Option<&CheckpointSlot>, seg: &OpenSegment) -> u64 {
+    match marker {
+        Some(m) if m.segment_base_seq > seg.base => seg.size,
+        Some(m)
+            if m.segment_base_seq == seg.base
+                && crate::status::valid_offset(m.offset, seg.size) =>
+        {
+            m.offset
+        }
+        _ => 0,
+    }
+}
+
 /// Resizes the `pread` buffer to `len` bytes without panicking: a frame longer than the address space allows (on a
 /// 32-bit target, a valid record of more than `isize::MAX` bytes in a large segment) is reported as an
 /// [`std::io::ErrorKind::OutOfMemory`] error, leaving `buf` unchanged, instead of aborting in `Vec::resize`.
@@ -1312,8 +1635,9 @@ fn resize_buf(buf: &mut Vec<u8>, len: u64) -> std::io::Result<()> {
 
 /// Finishes classifying a slot of a mapped segment, given its observed commit word (the zero-copy reader, ADR 0027).
 /// Every byte is read with a `Relaxed` atomic load, each at most once; the results are those [`finish`] gives for
-/// the same bytes. A record's header goes to `header`.
-fn read_mapped(
+/// the same bytes. A record's header goes to `header`. `size` is the segment's, or less (`Reader::bound`): no byte of a
+/// frame that does not fit in it is loaded, and the frame is `Invalid`.
+pub(crate) fn read_mapped(
     map: &MapRo,
     word: u32,
     offset: u64,
@@ -1503,6 +1827,10 @@ fn earliest(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
         (a, b) => a.or(b),
     }
 }
+
+#[cfg(test)]
+#[path = "reader_bound_tests.rs"]
+mod bound_tests;
 
 #[cfg(test)]
 mod wake_tests {
@@ -1771,6 +2099,7 @@ mod tests {
                 (r.seg.path.clone(), r.seg.identity, r.offset, r.next_seq),
                 (r.skip_until, r.seek_covered, r.buf.clone(), r.buf_start),
                 (r.durable_next_seq, r.durable_segment_base),
+                (r.durable_offset, r.bound),
                 (
                     r.waiting_since,
                     r.superseded_checked,
@@ -1786,6 +2115,8 @@ mod tests {
             reader.seek_covered = 3;
             reader.durable_next_seq = 7;
             reader.durable_segment_base = 8;
+            reader.durable_offset = 9;
+            reader.bound = 1 << 12;
             reader.waiting_since = Some(Instant::now());
             reader.superseded_checked = Some(Instant::now() - VALIDATION_WINDOW);
             let before = state(&reader);
