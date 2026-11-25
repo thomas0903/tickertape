@@ -1,6 +1,8 @@
 # 0045: A sparse, rebuildable seek index next to sealed segments
 
-- **Status:** accepted on 2026-11-25 (design only, nothing is built; issue #59)
+- **Status:** accepted on 2026-11-25 (issue #59); corrected on 2026-11-25 to match the final ADR
+  [0046](0046-seeks-that-need-no-index.md) and on 2026-11-26 (which descriptor the barrier at writer open is on), marked
+  where it applies, and built as described
 - **Date:** 2026-11-25
 - **Follows up:** [0042](0042-replay-and-recovery-at-scale.md), option 2 (deferred there for 1.0; that decision
   stands, this record takes the option up for 1.x)
@@ -163,8 +165,13 @@ It is never returned as an error.
      allocates or reads a body (a function of its own: `reader.rs` pins `read_slot`'s signature with a compile-time
      check). It must be a valid record as `format.md` defines (length, bounds, CRC32C over the whole frame, `seq`,
      `flags`), and its stored CRC must equal `crc`. An empty word fails.
-9. Keep the cursor; set `skip_until = target`. From here nothing is new: the next read validates the landing record
-   again and every record after it, and follows seals with the identity checks of today.
+9. Keep the cursor; set `skip_until = target` and `seek_covered = 0`, and empty the read buffer. From here nothing is
+   new: the next read validates the landing record again and every record after it, and follows seals with the
+   identity checks of today. (Corrected 2026-11-25. `seek_covered` is ADR 0046's: the value below which a later forward
+   seek may start at the cursor without looking again. A marker read in step 2 and confirmed in step 5 would justify a
+   higher value for the cursor a correct index gives, but not for one that T5's coincidence or T6 gives, and the gain
+   is one index lookup. With 0, the next forward seek does not start at this cursor: it uses an index again, or scans.
+   Where 8b or an earlier step fails, `seek_covered` is set as by a seek without an index.)
 
 **Which reads use the mapping.** The marker, the index, `F`'s header (step 4), the seal (6) and 8a are `pread`s into
 the reader's own memory, for mapped readers too. Only 8b and the reads after it go through a mapped reader's mapping,
@@ -172,7 +179,7 @@ and by step 2 only in a segment to which no writer stores: the marker names a la
 before it was written, and recovery from it changes nothing in `F`.
 
 The index is read again at each seek that uses it and not cached, so the only state a jump leaves in the reader is the
-cursor.
+cursor, the target, and `seek_covered` at 0 (corrected 2026-11-25; what else a seek resets, it resets as today).
 
 ## Trust: what a wrong index can and cannot do
 
@@ -269,11 +276,13 @@ whose commit word damage has emptied, `Q` an indexed record.
   the old seal in `F`'s present bytes and 8a and 8b the old frame. Passing both with a cursor that is no boundary is
   T5's coincidence, and for a segment that is not sealed it needs a payload holding the old seal's 8 bytes at that
   offset as well.
-- *The next forward seek from the cursor* does not trust it: ADR 0046 requires the marker to cover it and the record
-  before it to be in place.
+- *The next forward seek from the cursor* does not trust it: ADR 0046 requires the cursor to be at or below
+  `seek_covered`, which an earlier seek of that reader set, and the landing sets to 0 (step 9; corrected 2026-11-25).
 
 So no new check is needed. `seek` still puts a reader back on the current chain after a repair in place, except for
-T5's coincidence and T6.
+T5's coincidence, T6, and (corrected 2026-11-25) the exception ADR 0046 states for every reader: damage that destroyed
+the marker or set it back to an older one, together with covered records that recovery then removed in place, where
+the new history's bytes right before the cursor form the record expected there.
 
 **Durable-only (C13, ADR 0034).** The argument there needs a cursor that is a boundary of the current history and
 never past an applied marker, with an identity check after the marker read. Step 2 reads a marker `M` with `F` open,
@@ -424,6 +433,10 @@ segment), which serves the more common seek.
   was removed (an earlier open may have died between unlink and sync). Today recovery's final directory syncs and
   `full_barrier` run only when `actions` is not empty; the barrier now also runs, best effort if `actions` is empty,
   when `seek-index/` exists, so on macOS the unlink is on the drive before anything is appended to a repaired segment.
+  (Corrected 2026-11-26: that barrier is applied to the descriptor of `seek-index/`, never to a segment's. A best-effort
+  sync of the active segment would consume a write-back error that the first checkpoint must report, crash contract C7
+  and "Errors are sticky", since Linux reports one once per open file description. If `seek-index/` cannot be opened there
+  is no barrier: nothing was removed.)
   (If a power loss before the barrier brings the index back, the segment holds no new history yet: step 6, 8a or 8b
   rejects the entry, or it points at a record recovery kept.)
 - **Retention and `archive`** unlink `{base}.idx` (a later kind's file is left to the next writer open) after the
@@ -624,8 +637,9 @@ the reader's step 4), `ReaderSeekIndexMarker` (after its step 2).
    equal and with different record sizes, sealed at the same and at another offset. Never a removed record; every
    result equals a scan's. The same with a reader that keeps the old `F` open while an index is built from the
    repaired file. **Fallback:** a failure at each reader step, a missing file included, for a forward seek from a
-   cursor the marker covers with a stale buffer across an in-place repair (cursor 100, marker 150, record 200
-   buffered, removed in place and appended anew, `seek(180)`): the new record 200 is returned.
+   cursor covered by a marker that an earlier seek of that reader read (otherwise the seek scans instead of
+   continuing, ADR 0046; corrected 2026-11-25) with a stale buffer across an in-place repair (cursor 100, marker 150,
+   record 200 buffered, removed in place and appended anew, `seek(180)`): the new record 200 is returned.
 7. **Removal (T4):** marker lost, older slot current, both with damage below the old marker; `Quarantine` and `Fail`;
    kill after 2a, during the repair, before the barrier; a reader paused at `ReaderSeekIndexLoaded` across each
    repair; `{base}.idx2` is removed too, `foo.idx-tmp` and a user's own names are not; a dangling marker leaves every

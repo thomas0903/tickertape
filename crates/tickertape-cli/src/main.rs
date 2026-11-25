@@ -3,6 +3,7 @@
 mod age;
 mod archive;
 mod export;
+mod index;
 mod output;
 mod parquet_export;
 mod report;
@@ -34,6 +35,9 @@ enum Command {
     /// Archive or delete old sealed segments covered by a checkpoint (changes the journal)
     #[command(after_help = archive::HELP)]
     Archive(archive::ArchiveArgs),
+    /// Write, check or remove the seek indexes of sealed segments
+    #[command(after_help = index::HELP)]
+    Index(index::IndexArgs),
     /// Follow committed records, starting at the oldest record by default
     #[command(after_help = RECORD_SCHEMA)]
     Tail(TailArgs),
@@ -76,6 +80,9 @@ struct TailArgs {
     /// Return only checkpointed records; wait for coverage (no valid checkpoint means no records)
     #[arg(long)]
     durable_only: bool,
+    /// Let seeks (--from) start at a record named by a seek index (docs/operations.md: damage before it goes unnoticed)
+    #[arg(long)]
+    seek_index: bool,
     /// Text: metadata and first 32 payload bytes as hex; json: record JSONL
     #[arg(long, value_enum, default_value = "text")]
     format: TailFormat,
@@ -124,6 +131,9 @@ struct ExportArgs {
     /// Export only records below the checkpoint's next_seq captured at startup (both formats; no valid checkpoint means no records)
     #[arg(long)]
     durable_only: bool,
+    /// Let seeks (--from) start at a record named by a seek index (docs/operations.md: damage before it goes unnoticed)
+    #[arg(long)]
+    seek_index: bool,
 }
 
 #[derive(Debug, Args)]
@@ -139,6 +149,9 @@ struct StatsArgs {
     /// Include only records below the checkpoint's next_seq captured at startup
     #[arg(long)]
     durable_only: bool,
+    /// Let seeks (--from) start at a record named by a seek index (docs/operations.md: damage before it goes unnoticed)
+    #[arg(long)]
+    seek_index: bool,
     /// Emit one JSON object instead of aligned text (schema below)
     #[arg(long)]
     json: bool,
@@ -226,6 +239,7 @@ fn run(cli: Cli) -> Result<()> {
     let mut out = stdout.lock();
     match cli.command {
         Command::Archive(args) => archive::run(args, &mut out)?,
+        Command::Index(args) => index::run(args, &mut out)?,
         Command::Tail(args) => tail::run(args, &mut out)?,
         Command::Inspect(args) => report::inspect(args, &mut out)?,
         Command::Verify(args) => report::verify(args, &mut out)?,

@@ -37,6 +37,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "decode_seek_index"
+path = "fuzz_targets/decode_seek_index.rs"
+test = false
+doc = false
+bench = false
+
 [lints.rust]
 # `cargo fuzz` builds with `--cfg fuzzing`, which enables test hooks in tickertape.
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }

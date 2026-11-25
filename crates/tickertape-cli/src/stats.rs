@@ -318,6 +318,7 @@ pub(crate) fn run(args: StatsArgs, out: &mut dyn Write) -> Result<()> {
         &args.dir,
         ReaderConfig::default()
             .durable_only(args.durable_only)
+            .seek_index(args.seek_index)
             .notify(false),
     )?;
     if let Some(from) = args.from {

@@ -284,6 +284,20 @@ def test_closing_without_checkpoint_keeps_records_visible_not_durable(journal: P
         assert [x.payload for x in r] == [b"a"]
 
 
+def test_seek_index_option(journal: Path) -> None:
+    with tt.Writer(journal, segment_size=2 * SMALL_SEGMENT) as w:
+        append_pattern(w, 3000)
+        w.checkpoint()
+    for seek_index in (False, True):
+        with tt.Reader(journal, seek_index=seek_index, durable_only=True) as r:
+            for seq in (2500, 1200, 0, 1201):
+                r.seek(seq)
+                record = r.try_next()
+                assert record is not None and record.seq == seq
+    with pytest.raises(TypeError):
+        tt.Reader(journal, True)  # type: ignore[call-arg]
+
+
 def test_durable_only_waits_for_checkpoints(journal: Path) -> None:
     with tt.Writer(journal, segment_size=SMALL_SEGMENT) as w:
         r = tt.Reader(journal, durable_only=True)

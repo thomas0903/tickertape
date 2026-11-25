@@ -141,7 +141,7 @@ std::uint64_t use_everything(const std::filesystem::path &dir) {
     writer_options.segment_size(1 << 20).recovery_policy(tt::RecoveryPolicy::fail).notify(true).prefault(false);
     writer_options.retention(retention).no_retention();
     tt::ReaderOptions reader_options;
-    reader_options.durable_only(true).notify(false).backoff(100, 10, 10us, 1ms).busy_spin();
+    reader_options.durable_only(true).seek_index(true).notify(false).backoff(100, 10, 10us, 1ms).busy_spin();
     sum += writer_options.error() ? 1u : 0u;
     sum += reader_options.native_handle() != nullptr ? 1u : 0u;
     // The non-const handles take the C setters the binding does not wrap, without a const_cast.

@@ -22,7 +22,7 @@ use tickertape::fault::{self, Point};
 use tickertape::retention::{Action, Policy};
 use tickertape::{NewRecord, RecoveryAction, Writer, WriterConfig};
 use tickertape_tests::Rng;
-use tickertape_tests::soak::{self, SEGMENT};
+use tickertape_tests::soak::{self, INDEXED_SEGMENT, INDEXES, SEGMENT};
 
 const ENOSPC: i32 = 28; // Linux and macOS
 
@@ -40,7 +40,11 @@ fn main() {
     let stop_file = PathBuf::from(&args[5]);
 
     let config = WriterConfig::default()
-        .segment_size(SEGMENT)
+        .segment_size(if std::env::var_os(INDEXES).is_some() {
+            INDEXED_SEGMENT
+        } else {
+            SEGMENT
+        })
         .prefault(rng.below(4) != 0)
         .retention(
             Policy::default().max_segments(3 + rng.below(6) as usize),

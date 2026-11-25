@@ -26,12 +26,13 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use tickertape::retention::{Action, Policy};
+use tickertape::seek_index::{self, IndexState};
 use tickertape::{
     Error, NewRecord, OwnedRecord, Reader, ReaderConfig, RecoveryAction, Writer, inspect,
 };
 use tickertape_tests::{
-    Rng, append_n, check_record, corrupt_by_replacement, end_of_records, payload_len, segments,
-    small_config, zero_commit_words_from,
+    Rng, SMALL_SEGMENT, append_n, check_record, corrupt_by_replacement, end_of_records,
+    payload_len, segments, small_config, zero_commit_words_from,
 };
 
 /// A reader that hasn't made progress for this long while the writer has is stuck. Time during which the writer
@@ -43,13 +44,26 @@ const GRACE: Duration = Duration::from_secs(60);
 
 #[test]
 fn readers_under_retention() {
-    stress(Duration::from_secs(3));
+    stress(Duration::from_secs(3), false);
+}
+
+/// The same with `tickertape index` in a loop (beside the writer's retention), and readers of which every second one
+/// uses the indexes (ADR 0045): the records are the same.
+#[test]
+fn readers_with_seek_indexes_under_retention() {
+    stress(Duration::from_secs(3), true);
+}
+
+#[test]
+#[ignore = "long: one minute of readers racing with retention and index builds; run with --release -- --ignored"]
+fn readers_with_seek_indexes_under_retention_long() {
+    stress(Duration::from_secs(60), true);
 }
 
 #[test]
 #[ignore = "long: one minute of readers racing with retention; run with --release -- --ignored"]
 fn readers_under_retention_long() {
-    stress(Duration::from_secs(60));
+    stress(Duration::from_secs(60), false);
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -111,6 +125,10 @@ struct Shared<'a> {
     unavailable: &'a AtomicU64,
     /// Segments removed by the writer's retention so far.
     removed: &'a AtomicU64,
+    /// Whether indexes are built, how many have been, and how many seeks used one.
+    indexes: bool,
+    built: &'a AtomicU64,
+    used: &'a AtomicU64,
 }
 
 /// Sets the stop flag when dropped, so that a panic on any thread ends the others too.
@@ -122,7 +140,7 @@ impl Drop for StopOnDrop<'_> {
     }
 }
 
-fn stress(duration: Duration) {
+fn stress(duration: Duration, indexes: bool) {
     let dir = tempfile::tempdir().unwrap();
     let stop = AtomicBool::new(false);
     let head = AtomicU64::new(0);
@@ -130,8 +148,13 @@ fn stress(duration: Duration) {
     let unavailable = AtomicU64::new(0);
     let removed = AtomicU64::new(0);
     let progress: Vec<AtomicU64> = ROLES.iter().map(|_| AtomicU64::new(0)).collect();
+    let (built, used) = (AtomicU64::new(0), AtomicU64::new(0));
     let mut rng = Rng::from_env("readers_under_retention");
-    let config = small_config().retention(Policy::default().max_segments(2), Action::Delete);
+    // With indexes, segments of two blocks (a smaller one gets none), and one more, so that one is before the marker's.
+    let (factor, keep) = if indexes { (2, 3) } else { (1, 2) };
+    let config = small_config()
+        .segment_size(factor * SMALL_SEGMENT)
+        .retention(Policy::default().max_segments(keep), Action::Delete);
     let mut writer = Writer::open(dir.path(), config).unwrap();
     append_n(&mut writer, 64);
     writer.checkpoint().unwrap();
@@ -143,10 +166,19 @@ fn stress(duration: Duration) {
         discarded: &discarded,
         unavailable: &unavailable,
         removed: &removed,
+        indexes,
+        built: &built,
+        used: &used,
     };
 
     thread::scope(|s| {
         let _stop = StopOnDrop(&stop);
+        if indexes {
+            s.spawn(|| {
+                let _stop = StopOnDrop(&stop);
+                index_loop(&shared);
+            });
+        }
         let writer = s.spawn(|| {
             let _stop = StopOnDrop(&stop);
             write(&mut writer, &shared)
@@ -177,6 +209,7 @@ fn stress(duration: Duration) {
             removed.load(Ordering::SeqCst) >= 3
                 && discarded.load(Ordering::SeqCst) > 0
                 && unavailable.load(Ordering::SeqCst) > 0
+                && (!indexes || used.load(Ordering::SeqCst) > 0)
         };
         let mut seen: Vec<u64> = progress.iter().map(|_| 0).collect();
         let mut stalled = vec![Duration::ZERO; ROLES.len()];
@@ -227,6 +260,52 @@ fn stress(duration: Duration) {
         discarded > 0 && unavailable > 0,
         "readers never raced with retention"
     );
+    let (built, used) = (built.into_inner(), used.into_inner());
+    if indexes {
+        eprintln!("readers_under_retention: {built} indexes built, {used} seeks used one");
+        assert!(
+            built > 0 && used > 0,
+            "{built} indexes built, {used} seeks used one"
+        );
+    }
+}
+
+/// Builds indexes until stopped. Nothing but a segment that retention removes meanwhile is in its way.
+fn index_loop(shared: &Shared<'_>) {
+    let mut runs = 0_u64;
+    while !shared.stop.load(Ordering::SeqCst) {
+        match seek_index::build(shared.dir, runs % 4 == 3) {
+            Ok(report) => {
+                let state = |s: &&seek_index::SegmentIndex| s.state == IndexState::Built;
+                let built = report.segments.iter().filter(state).count() as u64;
+                shared.built.fetch_add(built, Ordering::SeqCst);
+                for s in &report.segments {
+                    assert!(
+                        matches!(
+                            s.state,
+                            IndexState::Built
+                                | IndexState::Valid
+                                | IndexState::NotCovered
+                                | IndexState::Vanished
+                        ),
+                        "{s:?}"
+                    );
+                }
+            }
+            Err(e) => panic!("index: {e:?}"),
+        }
+        if runs % 8 == 7 {
+            match seek_index::check(shared.dir) {
+                Ok(report) => assert!(
+                    report.segments.iter().all(|s| s.state != IndexState::Wrong),
+                    "{report:?}"
+                ),
+                Err(e) => panic!("check: {e:?}"),
+            }
+        }
+        runs += 1;
+        thread::sleep(Duration::from_millis(1));
+    }
 }
 
 /// Appends and checkpoints (running retention) until stopped.
@@ -245,7 +324,23 @@ fn write(writer: &mut Writer, shared: &Shared<'_>) {
 }
 
 fn open(dir: &std::path::Path, mapped: bool, durable: bool) -> Reader {
-    let config = ReaderConfig::default().durable_only(durable);
+    open_with(dir, mapped, durable, false)
+}
+
+/// A reader that uses seek indexes, if they are built, every second time one is opened.
+fn open_either(shared: &Shared<'_>, mapped: bool, durable: bool, rng: &mut Rng) -> Reader {
+    open_with(
+        shared.dir,
+        mapped,
+        durable,
+        shared.indexes && rng.below(2) == 0,
+    )
+}
+
+fn open_with(dir: &std::path::Path, mapped: bool, durable: bool, indexed: bool) -> Reader {
+    let config = ReaderConfig::default()
+        .durable_only(durable)
+        .seek_index(indexed);
     let reader = if mapped {
         // SAFETY: only this process's tickertape writer modifies the journal while the reader exists.
         unsafe { Reader::open_mapped(dir, config) }
@@ -304,14 +399,21 @@ fn follow(shared: &Shared<'_>, progress: &AtomicU64, mapped: bool, slow: bool, d
 fn seek_loop(shared: &Shared<'_>, progress: &AtomicU64, mapped: bool, rng: &mut Rng) {
     let mut reader = open(shared.dir, mapped, false);
     while !shared.stop.load(Ordering::SeqCst) {
+        if shared.indexes && rng.below(8) == 0 {
+            reader = open_either(shared, mapped, rng.below(4) == 0, rng);
+        }
         // Two segments hold about 700 records: aim at the oldest end and just before it.
+        let factor = if shared.indexes { 2 } else { 1 };
         let target = shared
             .head
             .load(Ordering::SeqCst)
-            .saturating_sub(300 + rng.below(1200));
+            .saturating_sub(factor * (300 + rng.below(1200)));
         match reader.seek(target) {
             Ok(()) => {
                 progress.fetch_add(1, Ordering::SeqCst);
+                shared
+                    .used
+                    .fetch_add(u64::from(reader.seek_used_index()), Ordering::SeqCst);
                 for i in 0..rng.below(4) {
                     match reader.try_next() {
                         Ok(Some(record)) => {
@@ -345,7 +447,7 @@ fn seek_loop(shared: &Shared<'_>, progress: &AtomicU64, mapped: bool, rng: &mut 
 /// Opens a new reader in a loop and reads a few records from the oldest segment.
 fn reopen_loop(shared: &Shared<'_>, progress: &AtomicU64, mapped: bool, rng: &mut Rng) {
     while !shared.stop.load(Ordering::SeqCst) {
-        let mut reader = open(shared.dir, mapped, false);
+        let mut reader = open_either(shared, mapped, false, rng);
         let first = reader.position();
         progress.fetch_add(1, Ordering::SeqCst);
         for i in 0..rng.below(8) {

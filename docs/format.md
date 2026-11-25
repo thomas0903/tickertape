@@ -31,6 +31,7 @@ A journal is one directory. Only these names have a meaning; anything else is ig
 | `writer.lock` | Lock file. The writer holds an exclusive `flock` on it while open and writes its PID (decimal ASCII) into it. The PID is informational; the lock is the authority |
 | `quarantine/` | Bytes and segments removed from the journal by recovery, kept so that they are not destroyed (bytes recovery zeroes in place are not kept: "Recovery (writer open)", step 4). Never read by readers, never deleted by tickertape |
 | `readers/` | Optional reader beacons (ADR [0032](decisions/0032-operational-metrics.md)): 128-byte files (magic `TTREADER`) in which applications that opt in publish a reader's position for monitoring, plus hidden temporary files (`.<name>.<pid>.<n>.beacon-tmp`) while one is created. Not part of format version 1: the writer, readers, recovery and retention never read or modify it (v0.4.0 included) |
+| `seek-index/` | Optional seek indexes, one file per sealed segment (ADR [0045](decisions/0045-sparse-seek-index.md), "Seek index" below), derived from the segments and safe to delete. Not part of format version 1: readers read it only with `ReaderConfig::seek_index`, the writer's open removes the files of segments that recovery may change (Recovery, step 2a), and retention removes a segment's file after the segment. Version 1.0.0 ignores it |
 
 Segments are never removed automatically unless a writer retention policy is configured.
 `tickertape archive` or `tickertape::retention` can remove a contiguous prefix of sealed segments strictly before
@@ -157,7 +158,9 @@ The **current checkpoint** is the valid slot (magic, version, CRC, reserved fiel
 offset 65,536 wins. Each slot is checked on its own, so a file too short for one slot can still hold a valid other
 slot. If neither slot is valid, or the file is missing, there is no checkpoint. A slot is written only after
 everything it describes is durable (see `crash-contract.md` → What `checkpoint()` does), so recovery can trust the
-journal before it. Readers ignore this file unless `ReaderConfig::durable_only(true)` is enabled: then only records
+journal before it. Readers ignore this file unless `ReaderConfig::durable_only(true)` is enabled (and except that seeks read it to decide
+where to start: ADR [0046](decisions/0046-seeks-that-need-no-index.md), and, with a seek index, which segments a
+durable-only or mapped reader may use one for: crash contract C15): then only records
 with `seq < next_seq` are returned, and a missing or invalid marker covers no records (ADR
 [0010](decisions/0010-durable-only-reads.md), crash contract C13).
 
@@ -234,6 +237,15 @@ Readers never modify a journal. Only the writer repairs it, on open, after takin
    trusts everything before. Without a current checkpoint, it starts at offset 64 of the oldest segment, expecting
    that segment's `base_seq`. The **recovery domain** is the start segment and every segment with a larger
    `base_seq`.
+
+   **2a. Remove the seek indexes of the recovery domain.** After the marker's segment and offset have been validated,
+   and before anything below changes a segment: if `seek-index/` exists and is a directory (not a symlink), list it
+   twice, each time through a directory stream opened for that pass, and unlink in each pass every temporary name and
+   every name beginning `{base:020}.idx` whose base is at or above the start of the recovery domain (every base, if there
+   is no current checkpoint). Then sync it. All of it is best effort: what fails is counted in the `RecoveryReport` and
+   never stops the open. Indexes of segments older than the oldest one go after recovery. ("Seek index" below; the two
+   passes, and why they suffice against a builder running meanwhile: ADR
+   [0045](decisions/0045-sparse-seek-index.md).)
 3. **Scan forward** through the chain, validating every record and seal: record by record within a segment; at a
    valid seal, into the segment it names. A segment the scan enters whose header never reached the disk (all zero)
    gets its header back first (crash contract C8). The scan stops at the first position `P` (in segment `X`, of size `Z`)
@@ -273,7 +285,10 @@ Readers never modify a journal. Only the writer repairs it, on open, after takin
    means are outside the contract.
 6. **Persist the repairs** before returning: every in-place zeroing, seal and new file is synced, and the journal
    directory (and `quarantine/`) is synced after any create, rename or link, with the platform barrier
-   (`crash-contract.md` → What `checkpoint()` does, steps 1–3).
+   (`crash-contract.md` → What `checkpoint()` does, steps 1–3). If nothing was repaired but `seek-index/` exists, the
+   barrier is applied to that directory's own descriptor, best effort, so that the removals of step 2a reach the drive
+   before anything is appended. No segment is synced for it: a discarded sync error of a segment's data could hide from
+   the next checkpoint that the data is lost (`crash-contract.md` → Errors are sticky).
 
 **Preserving data in `quarantine/`.** Before replacing or moving a segment, and aborting the repair with an error if
 any step fails (bytes zeroed in place are not preserved: crash contract C8):
@@ -304,7 +319,9 @@ offset in the new file, because offsets after the repair point don't line up. Th
 continue: `seek` scans the current chain from the start of a segment, so it only lands on validated positions. (A
 forward seek in the reader's own segment may scan from the reader's position instead, but only if a marker that the
 reader read before it passed the records before that position covers them, the path still names the file the reader
-has open, and the record before the position is still there. ADR [0046](decisions/0046-seeks-that-need-no-index.md).)
+has open, and the record before the position is still there. ADR [0046](decisions/0046-seeks-that-need-no-index.md).
+With `ReaderConfig::seek_index`, a seek may start at a record a seek index names; the records before it are not read,
+and the place is on the current chain except as crash contract C15 states.)
 
 A durable-only reader also checks when a checkpoint marker it has just read moves past its cursor, after reading the
 marker and before it reads any record the marker newly covers. The order matters: recovery replaces files before the
@@ -363,3 +380,92 @@ returning `Error::Discarded`, except across an in-place repair, which it can't n
 `format_version` changes whenever a version 1 reader could misread a file written by the new code. A reader accepts
 only versions it knows and fails clearly on others. Reserved fields and flags must be zero, so a future version can
 give them a meaning. The CRC algorithm, endianness and header lengths are fixed for version 1.
+
+## Seek index (not part of format version 1)
+
+Optional files, one per sealed segment, that let a reader which opts in (`ReaderConfig::seek_index`) start a seek in the
+middle of a segment. They are derived from the segments and may be deleted at any time; a journal means the same with and
+without them. They have a version of their own (below) and `format_version` says nothing about them. What a reader
+requires of one before it uses it, and what a wrong one can do: crash contract C15 and ADR
+[0045](decisions/0045-sparse-seek-index.md), which also has the reasons. Conventions are those above (little-endian,
+unsigned, offsets from the start of the file, CRC32C).
+
+In the subdirectory `seek-index/` of the journal directory only these names have a meaning; anything else there is
+ignored and never touched:
+
+| Name | What it is |
+|---|---|
+| `{base_seq:020}.idx` | The index of segment `{base_seq:020}.tape`: exactly 20 ASCII digits, value at most `u64::MAX - 1`, then `.idx` |
+| `{base_seq:020}.idx*` | Any other name that begins so is reserved for later kinds of index. Never read; removed by the writer's open like an index |
+| `.{base_seq:020}.{pid}.{n}.idx-tmp` | An index of any kind, now or later, being written: exactly this form, `pid` and `n` decimal, 1 to 20 digits each (`n` starts at the builder's `CLOCK_REALTIME` in nanoseconds). Never read by readers |
+
+**File.** A 128-byte header, then `entry_count` entries of 24 bytes. The file is exactly `128 + 24 * entry_count`
+bytes long.
+
+| Offset | Size | Field | Value in version 1 |
+|---|---|---|---|
+| 0 | 8 | `magic` | ASCII `TICKTIDX` (`54 49 43 4B 54 49 44 58`) |
+| 8 | 2 | `index_version` | `1` |
+| 10 | 2 | `header_len` | `128` |
+| 12 | 2 | `entry_len` | `24` |
+| 14 | 2 | `reserved` | `0` |
+| 16 | 4 | `entry_count` | 1 to 65,535 |
+| 20 | 4 | `spacing` | Block size in bytes, a power of two (rule below) |
+| 24 | 8 | `seal_offset` | Offset of the segment's seal |
+| 32 | 8 | `next_seq` | The sequence number the seal names. The segment holds `next_seq - base_seq` records |
+| 40 | 20 | `reserved` | Zero |
+| 60 | 4 | `file_crc` | CRC32C of bytes `[0, 60)` followed by bytes `[64, file length)` |
+| 64 | 64 | `segment_header` | The segment's bytes `[0, 64)`, verbatim (its size, `base_seq`, `created_unix_ns` and CRC) |
+
+| Offset in entry | Size | Field | Value |
+|---|---|---|---|
+| 0 | 8 | `seq` | Sequence number of the record |
+| 8 | 8 | `offset` | Offset `P` of its commit word in the segment |
+| 16 | 4 | `len` | The record's commit word, bytes `[P, P+4)` |
+| 20 | 4 | `crc` | The record's stored CRC32C, bytes `[P+4, P+8)` |
+
+**Spacing.** For a segment of size `Z`, `spacing(Z)` is the smallest power of two that is at least 65,536 and at least
+`Z / 65,536`, so 64 KiB up to 4 GiB and 16 MiB at 2^40. Block `k` is `[k * spacing, (k+1) * spacing)`. There is one
+entry for each `k >= 1` in which a record of the chain starts: the first that does. Block 0 needs none (its first
+record is at 64). An index therefore has at most 65,535 entries (1,572,968 bytes) whatever the segment size. A segment
+that would have no entry (every 64 KiB segment) gets no file. For a given spacing the content is a function of the
+segment's bytes alone, so two builders of one version write the same file.
+
+**Validity.** A reader uses an index only if all of this holds; otherwise it does what it does without one:
+
+1. It is a regular file, owned by the segment's owner or root, and not writable by its group or others; its length is
+   `128 + 24n` for `n` in 1 to 65,535, and `entry_count` is `n`.
+2. The magic, `index_version` (exactly 1), lengths, reserved fields and `file_crc` are as above; `spacing` is a power of
+   two from 4,096 to 2^30.
+3. `segment_header` equals the first 64 bytes of the segment, byte for byte. With `Z` and `base` from it: `seal_offset`
+   is a multiple of 8 in `[104, Z - 8]` and `next_seq > base`.
+4. Every entry has `base < seq < next_seq`, `offset` a multiple of 8 and at least `spacing`, `40 <= len <= 0xFFFFFFFE`
+   and `offset + align8(len) <= seal_offset`. Both `seq` and `offset / spacing` increase strictly. The records between
+   fit: `64 + 40 * (seq - base) <= offset` for the first entry, and from each entry to the next, and from the last to
+   `(next_seq, seal_offset)`, `offset_i + align8(len_i) + 40 * (seq_{i+1} - seq_i - 1) <= offset_{i+1}`.
+5. The 8 bytes of the segment at `seal_offset` are the seal for `next_seq`.
+6. The 8 bytes of the segment at the chosen entry's `offset` are its `len` and `crc`, and the record there is valid
+   (above) with sequence number `seq`.
+
+**Versions.** The version changes when a version 1 reader could misread the file. A reader ignores every version but its
+own. Readers do not depend on `spacing` (they search `seq`), so a later builder may choose another power of two. Removal
+goes by name and ignores content. A builder writes the file completely under its temporary name and renames it into
+place; the files are not synced, so a power loss can leave an empty, torn or zero file, which the checks above reject.
+
+**Test vector.** Segment `00000000000000001000.tape`: size 131,072, `base_seq` 1000, `created_unix_ns`
+1700000000000000000; 1,259 records with `schema_id` 1, both timestamps equal to `seq`, payload 64 bytes of `0x5A`;
+seal at 131,000 for 2259. Only record 1630, at 65,584, is indexed. The index, 152 bytes (released v1.0.0's `verify`
+accepts this segment):
+
+```
+0000  54 49 43 4b 54 49 44 58 01 00 80 00 18 00 00 00
+0010  01 00 00 00 00 00 01 00 b8 ff 01 00 00 00 00 00
+0020  d3 08 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+0030  00 00 00 00 00 00 00 00 00 00 00 00 c3 ec 87 c9
+0040  54 49 43 4b 54 41 50 45 01 00 40 00 00 00 00 00
+0050  00 00 02 00 00 00 00 00 e8 03 00 00 00 00 00 00
+0060  00 00 2a 36 fe 9c 97 17 00 00 00 00 00 00 00 00
+0070  00 00 00 00 00 00 00 00 00 00 00 00 5c f1 81 ff
+0080  5e 06 00 00 00 00 00 00 30 00 01 00 00 00 00 00
+0090  68 00 00 00 92 7f f1 5a
+```

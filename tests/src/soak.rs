@@ -7,6 +7,13 @@
 /// Segment size used by the soak: the smallest allowed, so rolls and retention happen often.
 pub const SEGMENT: u64 = 65_536;
 
+/// Segment size of the soak with seek indexes: a segment of one block gets none.
+pub const INDEXED_SEGMENT: u64 = 2 * SEGMENT;
+
+/// Set in the environment of the soak's processes when it runs with seek indexes: writers use [`INDEXED_SEGMENT`], and
+/// readers for which it is `reader` use the indexes.
+pub const INDEXES: &str = "TT_SOAK_INDEXES";
+
 fn mix(mut z: u64) -> u64 {
     // splitmix64
     z = z.wrapping_add(0x9e37_79b9_7f4a_7c15);

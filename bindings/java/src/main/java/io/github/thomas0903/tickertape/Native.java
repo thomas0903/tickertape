@@ -67,6 +67,7 @@ final class Native {
     private static final MethodHandle READER_OPTIONS_NEW = h("tickertape_reader_options_new");
     private static final MethodHandle READER_OPTIONS_FREE = h("tickertape_reader_options_free");
     private static final MethodHandle READER_OPTIONS_SET_DURABLE_ONLY = h("tickertape_reader_options_set_durable_only");
+    private static final MethodHandle READER_OPTIONS_SET_SEEK_INDEX = h("tickertape_reader_options_set_seek_index");
     private static final MethodHandle READER_OPTIONS_SET_NOTIFY = h("tickertape_reader_options_set_notify");
     private static final MethodHandle READER_OPTIONS_SET_BACKOFF = h("tickertape_reader_options_set_backoff");
     private static final MethodHandle READER_OPTIONS_SET_BUSY_SPIN = h("tickertape_reader_options_set_busy_spin");
@@ -283,6 +284,14 @@ final class Native {
     static int readerOptionsSetDurableOnly(MemorySegment a0, int a1) {
         try {
             return (int) READER_OPTIONS_SET_DURABLE_ONLY.invokeExact(a0, a1);
+        } catch (Throwable t) {
+            throw rethrow(t);
+        }
+    }
+
+    static int readerOptionsSetSeekIndex(MemorySegment a0, int a1) {
+        try {
+            return (int) READER_OPTIONS_SET_SEEK_INDEX.invokeExact(a0, a1);
         } catch (Throwable t) {
             throw rethrow(t);
         }

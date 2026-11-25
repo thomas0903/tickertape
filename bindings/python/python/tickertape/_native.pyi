@@ -206,7 +206,13 @@ class Reader:
     """An independent cursor over a journal (safe ``pread`` reader)."""
 
     def __new__(
-        cls, path: _Path, *, durable_only: bool = False, notify: bool = True, backoff: Backoff | None = None
+        cls,
+        path: _Path,
+        *,
+        durable_only: bool = False,
+        notify: bool = True,
+        backoff: Backoff | None = None,
+        seek_index: bool = False,
     ) -> Reader: ...
     def seek(self, seq: int) -> None: ...
     def seek_to_end(self) -> None:
