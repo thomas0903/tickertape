@@ -2509,7 +2509,9 @@ fn the_segment_stays_open_until_its_identity_is_checked() {
             }
             // SAFETY: filled by the call, which succeeded.
             let stat = unsafe { stat.assume_init() };
-            (stat.st_dev as u64, stat.st_ino) == (meta.dev(), meta.ino())
+            #[allow(clippy::unnecessary_cast)] // Signed and 32 bits wide on macOS.
+            let dev = stat.st_dev as u64;
+            (dev, stat.st_ino) == (meta.dev(), meta.ino())
         }));
     });
     // The journal's writer is closed: it would hold segments of its own open, though not this one.
