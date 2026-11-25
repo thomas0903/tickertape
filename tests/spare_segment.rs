@@ -1,7 +1,5 @@
-//! ADR 0022: the next segment is prepared in the background and published at roll (macOS only, ADR 0023).
-
-// The helpers below serve the macOS tests; Linux only runs `no_spare_on_linux`.
-#![cfg_attr(not(target_vendor = "apple"), allow(dead_code, unused_imports))]
+//! ADR 0022: the next segment is prepared in the background and published at roll (macOS; Linux since the amendment
+//! of 2026-11-25 to ADR 0023).
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -56,6 +54,21 @@ fn wait_until_spare_is_ready(dir: &Path) {
         || std::fs::metadata(&spare).is_ok_and(|m| m.len() == size && m.blocks() * 512 >= size),
         "a preallocated spare",
     );
+    wait_for_spare_thread_to_end();
+}
+
+/// Linux: waits until no spare thread is left in this process, since a roll there does not wait for one that has not
+/// finished (the file has its size before that). Elsewhere the roll waits for it.
+fn wait_for_spare_thread_to_end() {
+    if cfg!(target_os = "linux") {
+        let running = || {
+            std::fs::read_dir("/proc/self/task").unwrap().any(|task| {
+                std::fs::read_to_string(task.unwrap().path().join("comm"))
+                    .is_ok_and(|comm| comm.trim_end() == "tickertape-spar")
+            })
+        };
+        wait_for(|| !running(), "the spare thread to finish");
+    }
 }
 
 fn read_count(dir: &Path) -> u64 {
@@ -107,7 +120,6 @@ fn fill_until_roll(w: &mut Writer, dir: &Path, rolls: usize) {
     }
 }
 
-#[cfg(target_vendor = "apple")]
 #[test]
 fn spare_is_prepared_at_half_full_and_published_at_roll() {
     let _serial = serial();
@@ -133,6 +145,7 @@ fn spare_is_prepared_at_half_full_and_published_at_roll() {
     );
     // The next segment gets its own spare once it is half full, and every record reads back.
     fill_until_roll(&mut w, dir.path(), 2);
+    wait_for_spare_thread_to_end();
     for _ in 0..40 {
         append(&mut w, 1024); // past half of the new segment
     }
@@ -153,7 +166,6 @@ fn spare_is_prepared_at_half_full_and_published_at_roll() {
     assert_eq!(n, total);
 }
 
-#[cfg(target_vendor = "apple")]
 #[test]
 fn leftover_spare_is_removed_and_reported_at_open() {
     let _serial = serial();
@@ -171,7 +183,6 @@ fn leftover_spare_is_removed_and_reported_at_open() {
     );
 }
 
-#[cfg(target_vendor = "apple")]
 #[test]
 fn roll_falls_back_when_no_spare_can_be_prepared() {
     let _serial = serial();
@@ -190,7 +201,6 @@ fn roll_falls_back_when_no_spare_can_be_prepared() {
     assert_eq!(n, total);
 }
 
-#[cfg(target_vendor = "apple")]
 #[test]
 fn failed_spare_preparation_is_cleaned_up_and_the_roll_falls_back() {
     let _serial = serial();
@@ -204,6 +214,7 @@ fn failed_spare_preparation_is_cleaned_up_and_the_roll_falls_back() {
         for _ in 0..40 {
             append(&mut w, 1024); // past half: the spare is requested and its preparation fails
         }
+        wait_for_spare_thread_to_end();
         fill_until_roll(&mut w, dir.path(), 1);
         assert!(
             !dir.path().join(SPARE).exists(),
@@ -220,7 +231,6 @@ fn failed_spare_preparation_is_cleaned_up_and_the_roll_falls_back() {
     }
 }
 
-#[cfg(target_vendor = "apple")]
 #[test]
 fn failed_header_write_discards_the_spare_and_creates_the_segment() {
     let _serial = serial();
@@ -247,13 +257,11 @@ fn failed_header_write_discards_the_spare_and_creates_the_segment() {
     assert_eq!(read_count(dir.path()), total);
 }
 
-#[cfg(not(target_vendor = "apple"))]
 #[test]
-fn no_spare_on_linux() {
-    // ADR 0023: on ext4 the spare occasionally stalled the writer, so other systems roll synchronously.
+fn prefault_off_prepares_no_spare() {
     let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
-    let mut w = Writer::open(dir.path(), small_config()).unwrap();
+    let mut w = Writer::open(dir.path(), small_config().prefault(false)).unwrap();
     for _ in 0..40 {
         append(&mut w, 1024); // past half of the first segment
     }
@@ -263,4 +271,53 @@ fn no_spare_on_linux() {
     let total = w.next_seq();
     drop(w);
     assert_eq!(read_count(dir.path()), total);
+}
+
+/// Linux: a roll that finds its spare still being prepared creates the segment itself instead of waiting, and the
+/// spare is the next roll's. The hold keeps the spare thread from finishing, so a roll that waited would never return.
+#[cfg(target_os = "linux")]
+#[test]
+fn roll_does_not_wait_for_an_unfinished_spare() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let mut w = Writer::open(dir.path(), small_config()).unwrap();
+    let hold = fault::hold_background(Point::SparePreallocate);
+    for _ in 0..40 {
+        append(&mut w, 1024);
+    }
+    assert!(hold.wait_reached(Duration::from_secs(10)));
+    let prepared = identity(&dir.path().join(SPARE));
+    // Two rolls pass it by; no second preparation starts, which would remove the first one's file.
+    fill_until_roll(&mut w, dir.path(), 2);
+    for _ in 0..40 {
+        append(&mut w, 1024);
+    }
+    assert_eq!(identity(&dir.path().join(SPARE)), prepared);
+    assert_ne!(identity(&newest_segment(dir.path())), prepared);
+    hold.release();
+    wait_until_spare_is_ready(dir.path());
+    fill_until_roll(&mut w, dir.path(), 1);
+    assert_eq!(identity(&newest_segment(dir.path())), prepared);
+    let total = w.next_seq();
+    drop(w);
+    assert_eq!(read_count(dir.path()), total);
+}
+
+/// A spare still being prepared when the writer is dropped is waited for and removed.
+#[test]
+fn dropping_the_writer_waits_for_the_spare_and_removes_it() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let mut w = Writer::open(dir.path(), small_config()).unwrap();
+    let hold = fault::hold_background(Point::SparePreallocate);
+    for _ in 0..40 {
+        append(&mut w, 1024);
+    }
+    assert!(hold.wait_reached(Duration::from_secs(10)));
+    let dropping = std::thread::spawn(move || drop(w));
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(!dropping.is_finished(), "drop left the spare thread behind");
+    hold.release();
+    dropping.join().unwrap();
+    assert!(!dir.path().join(SPARE).exists());
 }

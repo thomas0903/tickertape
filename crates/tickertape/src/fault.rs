@@ -51,7 +51,8 @@ pub enum Point {
     /// run there then stops after the removal in progress), and is about to wait. Arm with [`run_at`] on the thread
     /// that calls them.
     CheckpointWait,
-    /// Preallocating the spare next segment on its background thread (arm with [`fail_next_background`]).
+    /// Preallocating the spare next segment on its background thread (arm with [`fail_next_background`],
+    /// or stop it there with [`hold_background`]).
     SparePreallocate,
     /// Mapping the spare next segment on its background thread (arm with [`fail_next_background`]).
     SpareMap,

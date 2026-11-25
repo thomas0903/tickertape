@@ -191,8 +191,8 @@ fn run(shared: &Shared) {
     }
 }
 
-/// A preallocated, synced and mapped segment file that is not published yet (ADR 0022): all zeros, named
-/// [`crate::journal::SPARE_FILE`]. At roll the writer writes its header and links it into place (the next checkpoint syncs it).
+/// A preallocated and mapped segment file that is not published yet (ADR 0022): all zeros, named
+/// [`crate::journal::SPARE_FILE`]; synced on macOS only. At roll the writer writes its header and links it into place (the next checkpoint syncs it).
 #[derive(Debug)]
 pub(crate) struct Spare {
     pub(crate) file: File,
@@ -231,9 +231,15 @@ fn make_spare(dir: &Path, size: u64) -> io::Result<Spare> {
         .open(&path)?;
     let made = (|| {
         let len = usize::try_from(size).map_err(|_| io::Error::other("segment too large"))?;
+        crate::fault::hold_point(crate::fault::Point::SparePreallocate);
         crate::fault::inject_background(crate::fault::Point::SparePreallocate)?;
         mmap::preallocate(&file, size)?;
-        mmap::sync_data(&file)?;
+        // Not on Linux: the sync forces a journal commit, which ADR 0023 found stalling the writer, and nothing needs
+        // it there. `fallocate` has allocated the blocks (C10), and the checkpoint that first covers the segment syncs
+        // its size and header, as for a segment a roll creates itself (ADR 0038 → Rolls without a sync).
+        if cfg!(target_vendor = "apple") {
+            mmap::sync_data(&file)?;
+        }
         crate::fault::inject_background(crate::fault::Point::SpareMap)?;
         let map = MapRw::new(&file, len)?;
         let _ = map.advice().prefault(0, WINDOW);

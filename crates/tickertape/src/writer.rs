@@ -82,9 +82,9 @@ pub struct Writer {
     prefault: Option<Prefaulter>,
     /// The early write-back thread, if enabled and started (Linux; ADR 0038).
     writeback: Option<WriteBack>,
-    /// The next segment being prepared in the background, if requested (ADR 0022).
+    /// The next segment being prepared in the background, or prepared, if requested (ADR 0022).
     spare: Option<std::thread::JoinHandle<io::Result<Spare>>>,
-    /// Whether a spare has been requested for the current active segment.
+    /// Whether a spare has been requested for the current active segment, or one requested earlier is still there.
     spare_requested: bool,
     /// The generation of the newest checkpoint this writer started (or of the marker read at open).
     generation: u64,
@@ -557,11 +557,10 @@ impl Writer {
         if let Some(writeback) = &mut self.writeback {
             writeback.advanced(self.offset);
         }
-        // Once the active segment is half full, prepare the next one off the writer's thread (ADR 0022). macOS only: on
-        // ext4 a synchronous roll costs about 1 ms, and the spare's preallocation sync occasionally stalled the writer
-        // for tens of milliseconds (ADR 0023).
+        // Once the active segment is half full, prepare the next one off the writer's thread (ADR 0022; on Linux
+        // without a sync, ADR 0023 → Amendment of 2026-11-25).
         if self.config.prefault
-            && cfg!(target_vendor = "apple")
+            && cfg!(any(target_vendor = "apple", target_os = "linux"))
             && !self.spare_requested
             && self.offset >= self.active.size / 2
         {
@@ -1086,7 +1085,8 @@ impl Writer {
             None => create_segment(&self.root, next_base, self.config.segment_size, false)?,
         };
         crate::fault::hook(crate::fault::Point::RollAfterLink);
-        self.spare_requested = false;
+        // A spare that was not ready (Linux) is still being prepared: it is the next roll's.
+        self.spare_requested = self.spare.is_some();
         self.dirty_dirs.insert(self.root.clone());
         // After the link, the roll always completes: seal the old segment, then switch.
         let seal_at = self.offset;
@@ -1129,9 +1129,17 @@ impl Writer {
 }
 
 impl Writer {
-    /// Waits for the spare being prepared, if any, and returns it if it is usable for this journal's segment size.
+    /// Returns the prepared spare, if any, if it is usable for this journal's segment size. On macOS it waits for one
+    /// still being prepared. On Linux it never waits: preparing it can take as long as the filesystem's journal makes
+    /// it (ADR 0023 → Amendment of 2026-11-25), so the roll creates its segment itself, and the spare stays with the
+    /// writer for the next roll.
     fn take_spare(&mut self) -> Option<Spare> {
-        match self.spare.take()?.join() {
+        let preparing = self.spare.take()?;
+        if cfg!(not(target_vendor = "apple")) && !preparing.is_finished() {
+            self.spare = Some(preparing);
+            return None;
+        }
+        match preparing.join() {
             Ok(Ok(spare)) if spare.size == self.config.segment_size => Some(spare),
             Ok(Ok(_)) => {
                 let _ = fs::remove_file(self.root.join(journal::SPARE_FILE));
@@ -1202,7 +1210,7 @@ impl Drop for JournalLock {
 
 /// Publishes a prepared spare as segment `base` (ADR 0022): write its header, then link it into place, as
 /// [`create_segment`] does at a roll. The header is not synced here: the next checkpoint syncs it before its marker
-/// (the spare's size was synced when it was prepared). If the header can't be written, the spare is discarded and the
+/// (and the file's size, which only macOS syncs when it prepares the spare). If the header can't be written, the spare is discarded and the
 /// segment is created synchronously instead; a failed link is reported like [`create_segment`]'s.
 fn publish_spare(dir: &Path, base: u64, size: u64, spare: Spare) -> Result<Segment> {
     let spare_path = dir.join(journal::SPARE_FILE);
