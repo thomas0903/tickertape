@@ -143,7 +143,9 @@ says whether its last seek did). Seek indexes (ADR 0045): `seek-sealed` (the las
 `index-build` (every index anew; `states`, `index_files`, `index_bytes`) and `seek-sealed-indexed`, the last two after
 everything else so that the other operations run without indexes (`--ops unindexed`: all but them), and on request
 `index-refresh` (a build with nothing left to do) and `index-check`. Reader operations run once per reader in
-`--readers safe,mapped` (default safe). Optional operations: `retention-delete` (deletes the `--count` oldest segments), `cli-verify`, `cli-export` and
+`--readers safe,mapped` (default safe). Optional operations: `retention-delete` (deletes the `--count` oldest segments),
+`checkpoint-loop-age` and `checkpoint-loop-bytes` (the checkpoint loop with another limit that removes nothing),
+`checkpoint-loop-remove-count` and `checkpoint-loop-remove-age` (every checkpoint finds one segment to delete), `cli-verify`, `cli-export` and
 `cli-stats` (the program given by `--cli`). `--end <seq>` measures a directory without a checkpoint marker, such as an
 archive, up to that sequence number.
 
