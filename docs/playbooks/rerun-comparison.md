@@ -45,16 +45,16 @@ below repeat it.
 
 **Cut, and why.**
 
-- SV at 90 % of the probe. The README does not use it; the saturated runs of the earlier sessions only showed large
-  seconds-long backlogs. The SD run at 90 % stays.
-- Unpinned rows in the sustained mode. Ten minutes average out what the scheduler does in single runs, and the short
-  mode answers the pinning question for every tool.
+- SV at 90 % of the probe, for cost (12 runs per round and filesystem). The README quotes no figure from it. It was
+  measured in the earlier sessions and some tools look bad in it, tickertape on x86-64 xfs among them (p99 of 21 to
+  22 ms at 64 B), so the old SV 90 % rows stay in `docs/benchmarks.md`, dated. The SD run at 90 % stays.
+- Unpinned rows in the sustained mode, for cost. The short mode has them for every tool; what pinning does over ten
+  minutes is not answered.
 - Aeron in the sustained xfs rows (it uses no journal file: only its shared buffers live there).
 - `microTouch()` alone in the sustained mode, the opt-in JVM experiments (`--java-experiment`), and a bare-metal run
   (the owner skipped it).
-- `--threads-per-core=1` as a separate machine shape. `nosmt` on the same VM gives one online thread per core, keeps
-  one machine per architecture, and needs no second machine. The difference to the Google Cloud option is that the
-  sibling threads exist but are offline.
+- `--threads-per-core=1`, as a separate machine shape. The tuned boot uses `nosmt` on the same VM instead: one online
+  thread per core, no second machine. The Google Cloud option was not tried.
 - Windows, macOS and other shapes.
 
 ## Repeats, order and failures
@@ -158,7 +158,8 @@ costs cells and not money. If the owner prefers a smaller bill, the fallback is:
 `short` (one round: pinned, unpinned, jvm-old, microtouch-only), `sustained` (round 1: tickertape, Chronicle, Aeron),
 `sustained-journals` (xfs), and the `tuned-short` part. It leaves out the second round (so no repeats hours apart),
 the 90 % runs, the sustained jvm-old rows, the xfs short mode, the other three tools' sustained rows, and the tuned
-sustained rows. Every README sentence it would leave untouched is listed below, and stays labelled with its date.
+sustained rows. The README's 90 % sentence then stays as
+it is, with its date.
 
 **Data volume and disk.** A 10-minute run of 64 B records writes about 110 GB for tickertape at 1.77 million records/s
 and 75 GB for Chronicle Queue at 1.5 million (measured in the dry run). Unpaced 1,024 B runs reach about 350 MB/s of
@@ -228,27 +229,32 @@ Machine `c4-standard-16-lssd` (us-central1-b), 2026-11-25, Ubuntu 24.04, kernel 
   CPU choice, with named CPUs (writer 3, reader 5, helpers `0-2,8-10`), and with the two threads of one core named
   (writer 1, reader 9), plus `--no-pin`: every run finished. Automatic: writer 1, reader 2, helpers `0,3-8,11-15`, in
   the sibling layout of the machine (`1,9` is one core).
-- **Placement.** An independent sampler (reads `/proc` every 5 ms and knows nothing of the harness) saw the measured
-  threads of every tool only on their CPU and the helpers (compilers, GC, Aeron's driver, tickertape's helpers) on the
-  helper CPUs in the quick matrix, and in three ten-minute runs (tickertape SD, Chronicle SD with the old settings,
-    Chronicle SV with the new ones). yaque's file watchers start on the measured CPU and are moved, as documented (one
-  to four times per run in the sustained matrix; `notify-rs` was also seen on the reader's CPU for a moment).
-  Threads on a measured CPU other than the measured one were JVM shutdown hooks (`Thread-0`, `Logging-Cleaner`), after
-  the measurement.
+- **Placement.** An independent sampler that reads `/proc` every 5 ms and lists running threads, and knows nothing of
+  the
+  harness, saw the measured threads only on their CPU and every other thread on the helper CPUs, in the quick matrices
+  and in five ten-minute runs (tickertape SD on #65 and on `1e9846d`, Chronicle SD on #65 alone, Chronicle SV on #67
+  and on `1e9846d`). Exceptions: yaque's file watchers start on the reader's CPU and are moved (up to three per run,
+  recorded in `moved_threads`), tickertape's helpers in `W1-cold`, both documented; and short-lived JVM threads
+  (`Thread-0`, `Logging-Cleaner`) on a measured CPU, which are probably shutdown hooks: the harness does not judge
+  threads after the read-back.
 - **Isolated boot.** The reboot with `isolcpus`, `nohz_full`, `rcu_nocbs`, `irqaffinity` and `nosmt` for CPUs 1 and 2
-  worked: `isolated` was `1-2`, SMT off, and every result of the tuned run records `isolated_cpus: [1, 2]`, the writer
-  on CPU 1 and the reader on CPU 2 (sampler: same), with helpers `0,3-7`. The automatic choice on that boot ignores
-  the isolated CPUs (it picks 3 and 4, helpers `0,5-7`), as documented; so a tuned run must name them.
+  worked: the kernel reported CPUs 1-2 as isolated and SMT off, and all 258 results of the tuned runs record
+  `isolated_cpus: [1, 2]`, writer 1, reader 2 and helpers `0,3-7` read back from `/proc`; the sampler saw the same.
+  The automatic choice on that boot avoids the isolated CPUs (it picks 3 and 4, helpers `0,5-7`), as documented, so a
+  tuned run must name them.
 - **Ten-minute cells.** tickertape SD at 1.77 million records/s of 64 B took 613 s in all; Chronicle SV at 1.5 million
   624 s; their disk use, JVM logs (about 5.5 MB) and timeouts are in the disk paragraph above. Nothing timed out.
 - **Full-size timing.** A short-mode unit of Chronicle took 1,117 s and of Aeron 1,070 s (the JVM warm-up runs in
   every process). The quick short matrix takes about 190 s with the new harness (about 40 s before #67).
-- **The driver** (`rerun.py`, `rerun-vm.sh`): a signal during a unit kills the runner and its children, the manifest
-  shows the unit as interrupted, the next run starts the unfinished one again (the old partial directory is kept as
-  `.incomplete-1`) and skips finished ones; then the untuned parts ended, the VM rebooted itself, continued on the
-  isolated boot and wrote `DONE`. The driver and the sampler need `python3` only.
-- **Not checked.** aarch64 (no machine was booked; its kernel configuration was read from the package); a full-size
-  pinned short run of tickertape, yaque and plain file; no run longer than 10 minutes.
+- **The driver.** SIGTERM in a unit marked it interrupted, the next start kept the partial directory as
+  `.incomplete-1`, ran the unit again and skipped the finished ones. The untuned parts ended, the VM rebooted itself,
+  mounted its disks, continued on the isolated boot and wrote `DONE`. This was with `--quick` units; after SIGTERM of
+  one tickertape unit no harness process was left (the check did not cover `tt-latency`).
+- **Not checked.** aarch64 (no machine was booked; only its kernel configuration was read from the package); full-size
+  short runs of tickertape, yaque and the plain file; the launch wrapper `start.sh` with its watcher (syntax check only,
+  including the tar pull, the deletion after `DONE`), the power-off after `DONE`, the deadline and the retry of a failed
+  unit on a real machine (unit tests only); a full-length tuned run; a tickertape and Chronicle run near their
+  saturation, where earlier sessions had failures. Start the watcher's first pull by hand and check it.
 - **Sampler.** The sampler used for the placement checks is not part of the repository.
 
 Defects found, with reproduction, in the PR description: one in the short mode's signal handling, one missing option.
