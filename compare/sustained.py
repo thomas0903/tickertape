@@ -261,6 +261,8 @@ def run_attempt(run, params, out, env, commands):
             return {"skipped": f"predicted {predicted} B of data exceeds 80 % of the {free} B free on {tmp_root} "
                                f"minus 1 GiB; use a larger disk or a shorter duration"}
     timeout = params["duration_s"] + params["warmup_s"] + 300
+    if run.tool in JAVA_TOOLS:
+        timeout += javaopts.WARMUP_ALLOWANCE_S
     started = datetime.datetime.now(datetime.timezone.utc).isoformat()
     with tempfile.TemporaryDirectory(prefix="run-", dir=tmp_root) as tmp, \
             (out / "children.log").open("a") as error_log:
@@ -316,7 +318,8 @@ def run_attempt(run, params, out, env, commands):
             result = {"writer": parse_one(outputs["writer"]),
                       "reader_result": parse_one(outputs["reader"]) if reader is not None else None}
             result["java"] = javaopts.collect(run.tool, params["java"],
-                                              {"writer": result["writer"], "reader": result["reader_result"]})
+                                              {"writer": result["writer"], "reader": result["reader_result"]},
+                                              params["quick"], True, True)
         finally:
             for proc in children:
                 if proc.poll() is None:

@@ -13,7 +13,8 @@ def args(**overrides):
     values = dict(outdir=Path("/unused"), quick=False, duration=None, warmup=None, repeats=None, tools=None,
                   workloads=None, payloads=None, rates=None, fractions=None, sync_every_ms=1000, tt_readers=None,
                   resume=False, dry_run=False, keep_going=False, no_long_warmup=False, no_micro_touch=False,
-                  chronicle_block_size="1073741824", no_jvm_logs=False, java_experiment=[])
+                  chronicle_block_size="1073741824", aeron_sparse_terms=False, no_aeron_pre_touch=False, no_jvm_logs=False,
+                  java_experiment=[])
     values.update(overrides)
     return argparse.Namespace(**values)
 

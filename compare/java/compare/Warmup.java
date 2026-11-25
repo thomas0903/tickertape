@@ -38,10 +38,10 @@ final class Warmup {
         measured.recordValue(HISTOGRAM_NS);
         measured.reset();
         // Exercise the episode log until it overflows, which a run near saturation does.
-        Harness.Episodes log=new Harness.Episodes();
-        for (int i=0;i<Harness.Episodes.CAPACITY*4;i++) {
+        Harness.Episodes log=Harness.episodes();
+        for (int i=0;log!=null && i<Harness.Episodes.CAPACITY*4;i++) {
             long ns=(i&1)==0 ? 2_000 : 2_000_000;
-            log.open=false; log.over(i,i,ns); log.over(i,i,ns);
+            log.open=false; log.over(i,i,ns); log.over(i,i,ns); log.over(i,i,ns+1);
         }
         Warmup warmup=new Warmup(factory,dir,spec);
         try {
@@ -71,7 +71,7 @@ final class Warmup {
         // A run syncs once a second; a warm-up of a few seconds needs more than one to have taken that path.
         long syncNs=Math.min(spec.syncEveryNs,200_000_000L);
         return new Harness.Sender(endpoint,data,ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN),spec.live,spec.probe,
-            spec.rate,Harness.TIMEOUT,syncNs);
+            spec.rate,Harness.BARRIER_TIMEOUT,syncNs);
     }
     /** Paced at the run's rate, then a backlog (every send late), then paced again; unpaced modes just send. */
     private void send(Harness.Sender sender, long records) throws Exception {
@@ -131,7 +131,7 @@ final class Warmup {
         try (Harness.Endpoint reader=factory.open("reader",scratch)) {
             subscribed.countDown();
             Harness.Poller poller=new Harness.Poller(reader,receiver(records),records,spec.probe?done:null,
-                System.nanoTime()+Harness.TIMEOUT);
+                System.nanoTime()+Harness.BARRIER_TIMEOUT);
             while (poller.poll(Harness.BATCH)) feed.check();
         } finally { read.countDown(); subscribed.countDown(); }
         feed.finish();
@@ -141,7 +141,7 @@ final class Warmup {
         // A pass over the 64 B records crosses a 64 MiB chunk once, so one pass per round is too few.
         for (int pass=0;pass<4;pass++) {
             try (Harness.Endpoint reader=factory.open("reader",scratch)) {
-                Harness.Poller poller=new Harness.Poller(reader,receiver(records),records,null,System.nanoTime()+Harness.TIMEOUT);
+                Harness.Poller poller=new Harness.Poller(reader,receiver(records),records,null,System.nanoTime()+Harness.BARRIER_TIMEOUT);
                 while (poller.poll(Harness.BATCH)) { }
             }
         }
@@ -164,7 +164,7 @@ final class Warmup {
         @Override public void run() { try { body.run(); } catch (Throwable t) { failure=t; } }
         void check() { if (failure!=null) throw new IllegalStateException(getName()+" failed",failure); }
         void finish() throws Exception {
-            join(Harness.TIMEOUT/1_000_000);
+            join(Harness.BARRIER_TIMEOUT/1_000_000);
             check();
             if (isAlive()) throw new IllegalStateException(getName()+" did not stop");
         }

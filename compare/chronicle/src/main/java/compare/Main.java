@@ -17,7 +17,7 @@ public final class Main {
         /** The open-source appender's substitute for the Enterprise pretoucher; null when switched off. */
         final MicroTouched microTouch;
         final long blockSize;
-        long touched;
+        long attempts; // Calls that reached a new page; the touch is only made if that page is mapped.
         QueueEndpoint(String role, Path dir) {
             // Periodic durability (SD) uses msync(MS_SYNC) through SyncMode.SYNC; otherwise the default.
             SingleChronicleQueueBuilder builder = SingleChronicleQueueBuilder.binary(dir.toFile());
@@ -49,11 +49,11 @@ public final class Main {
                 return true;
             }
         }
-        public void idle() { if (microTouch!=null && microTouch.microTouch()) touched++; }
+        public void idle() { if (microTouch!=null && microTouch.microTouch()) attempts++; }
         public Map<String,Object> settings() {
             Map<String,Object> m=new LinkedHashMap<>();
             m.put("block_size",blockSize);
-            if (appender!=null) { m.put("micro_touch",microTouch!=null); m.put("micro_touched_pages",touched); }
+            if (appender!=null) { m.put("micro_touch",microTouch!=null); m.put("micro_touch_attempts",attempts); }
             return m;
         }
         public String syncOperation() { return "ExcerptAppender.sync (MS_ASYNC submission)"; }

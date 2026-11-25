@@ -158,6 +158,8 @@ def run_attempt(tool, workload, payload, reader, rate, repeat, out, env, quick, 
         outputs = []
         java = None
         deadline = time.monotonic() + count / max(rate, 1) + 120
+        if tool in javaopts.JAVA_TOOLS:
+            deadline += javaopts.WARMUP_ALLOWANCE_S
 
         def spawn(role, mode_override=None):
             cmd = command(tool, role, data, control, count, payload, rate, warmup,
@@ -208,13 +210,14 @@ def run_attempt(tool, workload, payload, reader, rate, repeat, out, env, quick, 
                     wait(writer)
                     result = {"latency": parse_result(read_path), "writer": parse_result(writer_path),
                               "coordinated_omission": "intended timestamps; no skipped sends or rebasing"}
-                    java = javaopts.collect(tool, JAVA, {"writer": result["writer"], "reader": result["latency"]})
+                    java = javaopts.collect(tool, JAVA, {"writer": result["writer"], "reader": result["latency"]},
+                                            quick, False, True)
                 else:
                     writer, writer_path = spawn("writer", "append")
                     wait(writer)
                     if workload == "W1":
                         result = {"append": parse_result(writer_path)}
-                        java = javaopts.collect(tool, JAVA, {"writer": result["append"]})
+                        java = javaopts.collect(tool, JAVA, {"writer": result["append"]}, quick, False, False)
                     else:
                         # Full untimed read warms the page cache. QueueIter and
                         # queue-file iteration leave the fixture unconsumed.
@@ -223,7 +226,7 @@ def run_attempt(tool, workload, payload, reader, rate, repeat, out, env, quick, 
                         read, read_path = spawn("reader")
                         wait(read)
                         result = {"replay": parse_result(read_path)}
-                        java = javaopts.collect(tool, JAVA, {"reader": result["replay"]})
+                        java = javaopts.collect(tool, JAVA, {"reader": result["replay"]}, quick, False, False)
             finally:
                 for proc in children:
                     if proc.poll() is None:

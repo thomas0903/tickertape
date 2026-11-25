@@ -37,6 +37,7 @@ public final class Harness {
     public static volatile boolean periodicSyncRequested = false;
     /** The run's options, set before endpoints open. */
     public static volatile Map<String,String> options = Map.of();
+    static volatile boolean live = false;
     public enum Phase { MEASURED, FULL_WARMUP, FRESH_WARMUP }
     /** What endpoints are opened for now; the long warm-up opens scratch endpoints of its own. */
     public static volatile Phase phase = Phase.MEASURED;
@@ -44,9 +45,11 @@ public final class Harness {
         Instant t = Instant.now();
         return t.getEpochSecond() * 1_000_000_000L + t.getNano();
     }
+    /** The writer waits here while the reader warms up; the runner bounds the whole run. */
+    static final long BARRIER_TIMEOUT = 5*TIMEOUT;
     static long barrier(Path control, String role) throws Exception {
         Files.write(control.resolve(role + ".ready"), new byte[0]);
-        long deadline = System.nanoTime() + TIMEOUT;
+        long deadline = System.nanoTime() + BARRIER_TIMEOUT;
         while (!Files.exists(control.resolve("start"))) {
             if (System.nanoTime() > deadline) throw new IllegalStateException("barrier timed out");
             Thread.sleep(1);
@@ -77,11 +80,12 @@ public final class Harness {
     static final long SLOW_NS = 100_000;
 
     /** Runs of consecutive late sends or slow receives, for attributing tail samples after the run. Kept in
-     * preallocated arrays; the hot path pays one comparison per record and no I/O. A run near saturation has far
+     * preallocated arrays, and only with --events; the hot path does no I/O. A run near saturation has far
      * more short episodes than fit, so the fuller the log, the longer an episode must have been to keep its place. */
     static final class Episodes {
-        static final int CAPACITY=1<<16, FIELDS=5;
-        final long[] data=new long[CAPACITY*FIELDS]; // first seq, start wall ns, records, max ns, end wall ns
+        static final List<String> FIELD_NAMES=List.of("first_seq","start_wall_ns","records","max_ns","end_wall_ns","max_wall_ns");
+        static final int CAPACITY=1<<16, FIELDS=6;
+        final long[] data=new long[CAPACITY*FIELDS]; // see FIELD_NAMES
         int used; long dropped; boolean open, kept;
         long floor() {
             return used<CAPACITY/2 ? 0 : used<CAPACITY/4*3 ? 10_000 : used<CAPACITY/8*7 ? 100_000 : 1_000_000;
@@ -94,19 +98,22 @@ public final class Harness {
                 kept=used<CAPACITY;
                 if (!kept) { dropped++; return; }
                 int at=used++*FIELDS;
-                data[at]=seq; data[at+1]=wall; data[at+2]=1; data[at+3]=ns; data[at+4]=wall;
+                data[at]=seq; data[at+1]=wall; data[at+2]=1; data[at+3]=ns; data[at+4]=wall; data[at+5]=wall;
             } else if (kept) {
                 int at=(used-1)*FIELDS;
-                data[at+2]++; data[at+3]=Math.max(data[at+3],ns); data[at+4]=wall;
+                data[at+2]++; data[at+4]=wall;
+                if (ns>data[at+3]) { data[at+3]=ns; data[at+5]=wall; }
             }
         }
     }
+    /** Null without --events: only the paced writer and the live reader have episodes, and only when asked. */
+    static Episodes episodes() { return live && options.containsKey("--events") ? new Episodes() : null; }
     /** The writer's loop. The long warm-up runs the same object code on scratch endpoints. */
     static final class Sender {
         final Endpoint endpoint; final byte[] data; final ByteBuffer buffer;
         final boolean live, probe; final long rate, durationNs, syncEveryNs;
         final Histogram syncHist=new Histogram(3);
-        final Episodes episodes=new Episodes();
+        final Episodes episodes=episodes();
         long t0, start, sent, late, maxLate, nextSync, syncOverruns;
         String stoppedBy="count", syncOp;
         Sender(Endpoint endpoint, byte[] data, ByteBuffer buffer, boolean live, boolean probe, long rate,
@@ -127,7 +134,8 @@ public final class Harness {
                     intended=Math.addExact(t0, Math.multiplyExact(i,1_000_000_000L)/rate);
                     while (now()<intended) { endpoint.idle(); Thread.onSpinWait(); }
                     long wall=now(), delay=wall-intended;
-                    if (delay>LATE_NS) { late++; episodes.over(i,wall,delay); } else episodes.open=false;
+                    if (delay>LATE_NS) { late++; if (episodes!=null) episodes.over(i,wall,delay); }
+                    else if (episodes!=null) episodes.open=false;
                     maxLate=Math.max(maxLate,delay);
                 } else intended=0;
                 buffer.putLong(0,i); buffer.putLong(8,intended);
@@ -151,7 +159,7 @@ public final class Harness {
     /** The reader's per-record check and histogram. */
     static final class Receiver implements Observer {
         final int payload; final boolean live; final long warmup; final Histogram hist;
-        final Episodes episodes=new Episodes();
+        final Episodes episodes=episodes();
         long expected;
         Receiver(int payload, boolean live, long warmup, Histogram hist) {
             this.payload=payload; this.live=live; this.warmup=warmup; this.hist=hist;
@@ -162,7 +170,7 @@ public final class Harness {
                 long wall=now(), latency=wall-ts;
                 if (latency<0) throw new IllegalStateException("wall clock moved backwards");
                 hist.recordValue(latency);
-                if (latency>SLOW_NS) episodes.over(seq,wall,latency); else episodes.open=false;
+                if (episodes!=null) { if (latency>SLOW_NS) episodes.over(seq,wall,latency); else episodes.open=false; }
             }
             expected++;
         }
@@ -198,25 +206,37 @@ public final class Harness {
         Map<String,Object> block=new LinkedHashMap<>();
         block.put("warmup",warmup);
         block.put("tool",endpoint.settings());
-        block.put("episodes",episodes.used);
-        block.put("episodes_dropped",episodes.dropped);
+        block.put("episodes",episodes==null?null:episodes.used);
+        block.put("episodes_dropped",episodes==null?null:episodes.dropped);
+        // After the measurement: the management classes load here.
+        block.put("jvm_arguments",java.lang.management.ManagementFactory.getRuntimeMXBean().getInputArguments());
         return block;
+    }
+    /** {wall, nano} read together: of a few tries, the one with the least time around it. */
+    static long[] clockAnchor() {
+        long best=Long.MAX_VALUE, wall=0, nano=0;
+        for (int i=0;i<10;i++) {
+            long before=System.nanoTime(), w=now(), after=System.nanoTime();
+            if (after-before<best) { best=after-before; wall=w; nano=before+(after-before)/2; }
+        }
+        return new long[]{wall,nano};
     }
     /** Writes the episodes and the measured window beside the JVM logs, after the measurement. Window times are
      * System.nanoTime() values, the clock of the logs' timenanos decoration. */
-    static void writeEvents(Map<String,String> opts, String role, long threshold, long start, long measuredFrom,
+    static void writeEvents(Map<String,String> opts, String role, long threshold, long[] anchor, long start, long measuredFrom,
                             long end, Episodes e) throws Exception {
         String path=opts.get("--events");
         if (path==null) return;
         Map<String,Object> m=new LinkedHashMap<>();
         m.put("role",role); m.put("threshold_ns",threshold);
-        // The wall clock may be slewed during a long run: one anchor at the end is off by at most the slew.
-        m.put("anchor_wall_ns",now()); m.put("anchor_nano",System.nanoTime());
+        // Wall clock and System.nanoTime() at the same moment, before and after the run: NTP may slew the wall clock.
+        long[] last=clockAnchor();
+        m.put("anchors",List.of(anchor==null?last:anchor,last));
         m.put("start_nano",start); m.put("measured_from_nano",measuredFrom); m.put("end_nano",end);
-        m.put("fields",List.of("first_seq","start_wall_ns","records","max_ns","end_wall_ns"));
+        m.put("fields",Episodes.FIELD_NAMES);
         List<long[]> rows=new ArrayList<>();
-        for (int i=0;i<e.used;i++) rows.add(Arrays.copyOfRange(e.data,i*Episodes.FIELDS,(i+1)*Episodes.FIELDS));
-        m.put("episodes",rows); m.put("episodes_dropped",e.dropped);
+        for (int i=0;e!=null && i<e.used;i++) rows.add(Arrays.copyOfRange(e.data,i*Episodes.FIELDS,(i+1)*Episodes.FIELDS));
+        m.put("episodes",rows); m.put("episodes_dropped",e==null?0:e.dropped);
         Files.writeString(Path.of(path),JSON.writeValueAsString(m)+"\n");
     }
     public static void run(String[] args, Factory factory) throws Exception {
@@ -226,7 +246,7 @@ public final class Harness {
         Map<String,String> opts = new HashMap<>();
         Set<String> allowed = Set.of("--dir","--control","--count","--payload","--rate","--warmup","--reader","--mode","--jit-warmup",
             "--duration-ms","--sync-every-ms",
-            "--warmup-mode","--events","--micro-touch","--block-size");
+            "--warmup-mode","--events","--micro-touch","--block-size","--sparse-terms","--pre-touch");
         for (int i=1;i<args.length;i+=2) {
             if (!allowed.contains(args[i]) || i+1>=args.length || opts.put(args[i],args[i+1])!=null)
                 throw new IllegalArgumentException("bad option " + args[i]);
@@ -239,7 +259,7 @@ public final class Harness {
         long warmup = Long.parseLong(opts.getOrDefault("--warmup","0"));
         // sustained_probe: unpaced sends with a concurrent reader until --duration-ms passes or --count is reached.
         boolean probe = opts.get("--mode").equals("sustained_probe");
-        boolean live = opts.get("--mode").equals("visible_latency") || probe;
+        live = opts.get("--mode").equals("visible_latency") || probe;
         long durationNs = Long.parseLong(opts.getOrDefault("--duration-ms","0"))*1_000_000L;
         long syncEveryNs = Long.parseLong(opts.getOrDefault("--sync-every-ms","0"))*1_000_000L;
         if (count<=0 || rate<=0 || warmup<0 || warmup>=count || (payload!=64 && payload!=1024)
@@ -287,11 +307,13 @@ public final class Harness {
                 byte[] data = new byte[payload+16];
                 Arrays.fill(data,(byte)0x5a);
                 ByteBuffer buffer = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN);
+                // Everything the loop needs exists before t0, which a paced run must not miss.
+                Sender sender=new Sender(endpoint,data,buffer,live,probe,rate,durationNs,syncEveryNs);
+                long[] anchor=live ? clockAnchor() : null;
                 long t0 = live ? barrier(control,"writer") : 0;
                 endpoint.connected();
-                if (live) while (now()<t0) Thread.onSpinWait();
-                Sender sender=new Sender(endpoint,data,buffer,live,probe,rate,durationNs,syncEveryNs);
                 sender.t0=t0;
+                if (live) while (now()<t0) Thread.onSpinWait();
                 long start=sender.begin();
                 for (long i=0;i<count && sender.send(i,Math.min(count,i+BATCH));i+=BATCH) { }
                 long sent=sender.sent;
@@ -323,7 +345,7 @@ public final class Harness {
                 result.put("flush_operation",sync);
                 result.put("flush_seconds",flushSeconds);
                 result.put("java",javaBlock(warmupInfo,endpoint,sender.episodes));
-                writeEvents(opts,"writer",LATE_NS,start,
+                writeEvents(opts,"writer",LATE_NS,anchor,start,
                     !probe && live ? start+Math.multiplyExact(warmup,1_000_000_000L)/rate : start,end,sender.episodes);
                 resultOut.println(JSON.writeValueAsString(result));
                 if (live) {
@@ -335,6 +357,7 @@ public final class Harness {
                 }
             } else if (role.equals("reader")) {
                 Receiver receiver=new Receiver(payload,live,warmup,hist);
+                long[] anchor=live ? clockAnchor() : null;
                 long t0 = live ? barrier(control,"reader") : 0;
                 long pollStart = live ? System.nanoTime()+(t0-now()) : replayStart;
                 // A probe's count is only a disk cap: its deadline follows the duration instead.
@@ -354,7 +377,7 @@ public final class Harness {
                 } else result=live?histogram(hist):new LinkedHashMap<>(Map.of("count",count,"seconds",seconds,
                     "records_per_s",count/seconds,"payload_mb_per_s",count*payload/seconds/1e6));
                 result.put("java",javaBlock(warmupInfo,endpoint,receiver.episodes));
-                writeEvents(opts,"reader",SLOW_NS,pollStart,
+                writeEvents(opts,"reader",SLOW_NS,anchor,pollStart,
                     live && !probe ? pollStart+Math.multiplyExact(warmup,1_000_000_000L)/rate : pollStart,end,receiver.episodes);
                 resultOut.println(JSON.writeValueAsString(result));
                 if (live) Files.write(control.resolve("reader.done"),new byte[0]);
