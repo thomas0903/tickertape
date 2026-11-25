@@ -112,6 +112,11 @@ check_old_readers() {
     for kind in clean torn; do
       # A copy, so an old version can't change the journal the next one reads.
       rm -rf "$work/copy" && cp -R "$work/new-$kind" "$work/copy"
+      # With files in seek-index/ (ADR 0045), which every version must ignore. (Segments this small get no index.)
+      mkdir "$work/copy/seek-index"
+      for segment in "$work/copy"/*.tape; do
+        cp "$segment" "$work/copy/seek-index/$(basename "$segment" .tape).idx"
+      done
       "$bin" read "$work/copy" >"$work/old-$tag-$kind.json"
       if ! python3 -I - "$work/new-$kind.read.json" "$work/old-$tag-$kind.json" "$tag" "$kind" <<'EOF'; then failed=1; fi
 import json, sys

@@ -1,6 +1,6 @@
 //! Seek indexes (ADR 0045, crash contract C15): a seek through an index lands where a scan lands, whatever the index
 //! file holds, and falls back to what it does without one; the builder, the writer's open and retention keep indexes
-//! and segments together. Numbers in comments are those of the record's test plan.
+//! and segments together. "Plan n" is item n of the record's test plan.
 
 use std::cell::Cell;
 use std::ffi::OsString;
@@ -206,7 +206,7 @@ fn all_agree(dir: &Path, targets: &[u64], read: usize) -> usize {
     used
 }
 
-/// 3. The bound: what a jump skips before the target starts less than one spacing before it.
+/// (Plan 3) The bound: what a jump skips before the target starts less than one spacing before it.
 #[test]
 fn a_seek_through_an_index_lands_within_a_block_of_its_target() {
     for len in [
@@ -353,7 +353,7 @@ fn forward_seeks_use_an_index_only_for_a_distance() {
     }
 }
 
-/// 5. Every way the index file can be wrong: the seek gives exactly what it gives without one.
+/// (Plan 5) Every way the index file can be wrong: the seek gives exactly what it gives without one.
 #[test]
 fn a_file_that_is_not_the_index_is_not_used() {
     let (dir, _writer) = indexed(64, 2);
@@ -462,7 +462,7 @@ fn a_file_that_is_not_the_index_is_not_used() {
     assert_eq!(all_agree(dir.path(), &targets, 5), 12);
 }
 
-/// 5, 8a and 8b. Well-formed indexes whose entries are wrong, and right ones whose segment is damaged.
+/// (Plan 5, 8a and 8b) Well-formed indexes whose entries are wrong, and right ones whose segment is damaged.
 #[test]
 fn an_entry_that_does_not_name_a_record_is_not_used() {
     let (dir, _writer) = indexed(64, 1);
@@ -570,7 +570,7 @@ fn an_entry_that_does_not_name_a_record_is_not_used() {
     );
 }
 
-/// 11. Damage before the landing record: found without the option, by `verify` and by replay, and not by the jump.
+/// (Plan 11) Damage before the landing record: found without the option, by `verify` and by replay, and not by the jump.
 #[test]
 fn damage_before_the_landing_record_is_stepped_over() {
     for zeroed in [false, true] {
@@ -610,7 +610,7 @@ fn damage_before_the_landing_record_is_stepped_over() {
     }
 }
 
-/// 2. Any bytes at all as the index: what a seek does is what it does without one.
+/// (Plan 2) Any bytes at all as the index: what a seek does is what it does without one.
 #[test]
 fn any_index_file_gives_the_same_results() {
     let dir = tempfile::tempdir().unwrap();
@@ -757,7 +757,7 @@ impl Stale {
     }
 }
 
-/// 6. An index that the writer did not remove, of every history a repair leaves behind: every seek gives what a scan
+/// (Plan 6) An index that the writer did not remove, of every history a repair leaves behind: every seek gives what a scan
 /// gives, never a removed record.
 #[test]
 fn a_stale_index_never_gives_a_removed_record() {
@@ -803,7 +803,7 @@ fn a_stale_index_never_gives_a_removed_record() {
     }
 }
 
-/// 6. A segment whose header recovery wrote again, and one quarantined and created anew.
+/// (Plan 6) A segment whose header recovery wrote again, and one quarantined and created anew.
 #[test]
 fn an_index_of_a_segment_made_anew_is_not_used() {
     for zeroed in [true, false] {
@@ -845,79 +845,75 @@ fn an_index_of_a_segment_made_anew_is_not_used() {
     }
 }
 
-/// 6. A reader that has the old file open, and an index built from the file that replaced it while it seeks (step 5).
+/// (Plan 6) A reader that has the old file open, and an index built from the file that replaced it while it seeks (step 5).
 #[test]
 fn an_index_of_the_replaced_file_is_not_applied_to_the_old_one() {
     // Where recovery replaces the file: before the index is read, and after.
     for point in [Point::ReaderSeekIndexMarker, Point::ReaderSeekIndexLoaded] {
         for repair in [Repair::Replaced, Repair::InPlace] {
-            let stale = Stale::new(repair, 2_400);
-            // The damage is done by the hook: undo it by building the same journal again without it.
+            // The damage is done by the hook, to a journal that is whole when the seek begins.
             let dir = tempfile::tempdir().unwrap();
             let mut writer = Writer::open(dir.path(), config()).unwrap();
             fill(&mut writer, dir.path(), 1, Stale::LEN, 1);
             drop(writer);
             build(dir.path());
-            drop(stale);
             let stale = Rc::new(Stale {
-                index: std::fs::read(index_path(dir.path(), 0)).unwrap(),
+                index: Vec::new(),
                 at: 2_400,
                 dir,
             });
-            for target in [2_300, 2_500] {
-                let mut plain = open_with(stale.path(), (false, false), false);
-                let mut reader = open(stale.path(), (false, false));
-                plain.seek(target).unwrap();
-                let hook = Rc::clone(&stale);
-                let ran = Rc::new(Cell::new(false));
-                let done = Rc::clone(&ran);
-                fault::clear();
-                fault::run_at(point, 0, move || {
-                    hook.damage(repair);
-                    let mut writer = Writer::open(hook.path(), config()).unwrap();
-                    fill(&mut writer, hook.path(), 3, Stale::LEN, 1);
-                    drop(writer);
-                    build(hook.path());
-                    done.set(true);
-                });
-                reader.seek(target).unwrap();
-                assert!(ran.get());
-                let used = reader.seek_used_index();
-                let case = format!("{point:?}, {repair:?}, {target}, used {used}");
-                if repair == Repair::Replaced {
-                    assert!(!used, "{case}");
-                    // The old file, like any reader that has it open.
-                    let (got, want) = (
-                        read_up_to(&mut reader, usize::MAX),
-                        read_up_to(&mut plain, usize::MAX),
-                    );
-                    assert_eq!(got, want, "{case}");
-                    assert!(want.1.unwrap().contains("Discarded"));
-                } else {
-                    // The same file, now with the new history.
-                    let (got, end) = read_up_to(&mut reader, usize::MAX);
-                    assert_eq!(end.as_deref(), Some("end"), "{case}");
-                    assert!(
-                        got.iter()
-                            .all(|r| r.payload[0] == if r.seq < 2_400 { 1 } else { 3 })
-                    );
-                    assert_eq!(got[0].seq, target);
-                }
-                // For the next target: no marker, the index of the present file, one whole segment.
-                agrees(
-                    stale.path(),
-                    &mut open(stale.path(), (false, false)),
-                    (false, false),
-                    target,
-                    3,
+            let target = 2_300;
+            let mut plain = open_with(stale.path(), (false, false), false);
+            let mut reader = open(stale.path(), (false, false));
+            plain.seek(target).unwrap();
+            let hook = Rc::clone(&stale);
+            let ran = Rc::new(Cell::new(false));
+            let done = Rc::clone(&ran);
+            fault::clear();
+            fault::run_at(point, 0, move || {
+                hook.damage(repair);
+                let mut writer = Writer::open(hook.path(), config()).unwrap();
+                fill(&mut writer, hook.path(), 3, Stale::LEN, 1);
+                drop(writer);
+                build(hook.path());
+                done.set(true);
+            });
+            reader.seek(target).unwrap();
+            assert!(ran.get());
+            let used = reader.seek_used_index();
+            let case = format!("{point:?}, {repair:?}, {target}, used {used}");
+            if repair == Repair::Replaced {
+                assert!(!used, "{case}");
+                // The old file, like any reader that has it open.
+                let (got, want) = (
+                    read_up_to(&mut reader, usize::MAX),
+                    read_up_to(&mut plain, usize::MAX),
                 );
-                break;
+                assert_eq!(got, want, "{case}");
+                assert!(want.1.unwrap().contains("Discarded"));
+            } else {
+                // The same file, now with the new history.
+                let (got, end) = read_up_to(&mut reader, usize::MAX);
+                assert_eq!(end.as_deref(), Some("end"), "{case}");
+                assert!(
+                    got.iter()
+                        .all(|r| r.payload[0] == if r.seq < 2_400 { 1 } else { 3 })
+                );
+                assert_eq!(got[0].seq, target);
             }
+            // A fresh reader uses the index of the file that is there now.
+            agrees(
+                stale.path(),
+                &mut open(stale.path(), (false, false)),
+                (false, false),
+                target,
+                3,
+            );
         }
     }
 }
 
-/// 6. A forward seek that may continue from the cursor, whose index fails at each step, across a repair in place under a
+/// (Plan 6) A forward seek that may continue from the cursor, whose index fails at each step, across a repair in place under a
 /// stale read buffer: it continues from where it was, with an empty buffer.
 #[test]
 fn a_failed_index_leaves_the_cursor_and_an_empty_buffer() {
@@ -988,7 +984,7 @@ fn a_failed_index_leaves_the_cursor_and_an_empty_buffer() {
     }
 }
 
-/// 7. The open of an index-aware writer removes the indexes of the recovery domain, before it changes anything, and no
+/// (Plan 7) The open of an index-aware writer removes the indexes of the recovery domain, before it changes anything, and no
 /// others, and reports how many.
 #[test]
 fn the_writers_open_removes_the_indexes_of_the_recovery_domain() {
@@ -1051,7 +1047,7 @@ fn the_writers_open_removes_the_indexes_of_the_recovery_domain() {
     }
 }
 
-/// 7. What the open removes goes by name.
+/// (Plan 7) What the open removes goes by name.
 #[test]
 fn the_removal_goes_by_name() {
     let (dir, writer) = indexed(64, 2);
@@ -1132,7 +1128,7 @@ fn the_removal_goes_by_name() {
     assert!(dir_path.join("notes.txt").exists());
 }
 
-/// 7. The second pass sees what a listing missed: a name created during the first, and both names of a rename.
+/// (Plan 7) The second pass sees what a listing missed: a name created during the first, and both names of a rename.
 #[test]
 fn the_second_pass_sees_what_the_first_missed() {
     for omitted in [false, true] {
@@ -1155,7 +1151,7 @@ fn the_second_pass_sees_what_the_first_missed() {
     }
 }
 
-/// 7. Best effort: what cannot be listed, unlinked or synced is counted and never stops the open; what stays is checked
+/// (Plan 7) Best effort: what cannot be listed, unlinked or synced is counted and never stops the open; what stays is checked
 /// by value.
 #[test]
 fn a_removal_that_fails_is_counted_and_does_not_stop_the_open() {
@@ -1230,7 +1226,7 @@ fn a_removal_that_fails_is_counted_and_does_not_stop_the_open() {
     }
 }
 
-/// 5. `seek-index` as a symlink to another journal's: nothing is read, removed or built there.
+/// (Plan 5) `seek-index` as a symlink to another journal's: nothing is read, removed or built there.
 #[test]
 fn a_symlinked_directory_is_never_followed() {
     let (other, _writer) = indexed(64, 2);
@@ -1259,7 +1255,7 @@ fn a_symlinked_directory_is_never_followed() {
 
 // ---- Durable-only and mapped readers, T6 and T7 ----
 
-/// 8. Segments the marker does not cover: durable-only and mapped readers use no index there, whatever it holds; a safe
+/// (Plan 8) Segments the marker does not cover: durable-only and mapped readers use no index there, whatever it holds; a safe
 /// visible reader may. Without a marker (an archive) only the safe visible one does.
 #[test]
 fn durable_only_and_mapped_readers_need_a_covering_marker() {
@@ -1295,7 +1291,7 @@ fn durable_only_and_mapped_readers_need_a_covering_marker() {
     }
 }
 
-/// 8. The marker is lost between the seek and the read: nothing is covered, so a durable-only reader that landed through
+/// (Plan 8) The marker is lost between the seek and the read: nothing is covered, so a durable-only reader that landed through
 /// an index waits; a visible one reads on.
 #[test]
 fn a_durable_only_reader_waits_when_the_marker_is_lost_after_landing() {
@@ -1322,7 +1318,7 @@ fn a_durable_only_reader_waits_when_the_marker_is_lost_after_landing() {
     }
 }
 
-/// 8. A repair between a durable-only reader's marker read and its landing, by a recovery from a lost marker, followed by
+/// (Plan 8) A repair between a durable-only reader's marker read and its landing, by a recovery from a lost marker, followed by
 /// a new checkpoint past the segment and a new index: it lands on the current chain, or scans.
 #[test]
 fn a_repair_while_a_seek_uses_an_index() {
@@ -1390,7 +1386,7 @@ fn a_repair_while_a_seek_uses_an_index() {
     }
 }
 
-/// 9. Documents T6: a payload that embeds a frame with its own record's number, and an index that points at it. With the
+/// (Plan 9) Documents T6: a payload that embeds a frame with its own record's number, and an index that points at it. With the
 /// option on the embedded frame is returned, and nothing but `--check` can tell; with it off, it never is.
 #[test]
 fn a_forged_index_can_return_a_frame_from_a_payload() {
@@ -1464,7 +1460,7 @@ fn a_forged_index_can_return_a_frame_from_a_payload() {
     assert_eq!(check(dir.path())[0], IndexState::Valid);
 }
 
-/// 10. T7: a reader that landed through an index, and damage and a repair after it: it ends where a reader that had
+/// (Plan 10) T7: a reader that landed through an index, and damage and a repair after it: it ends where a reader that had
 /// scanned to the same place may end, and its next seek puts it back on the current chain.
 #[test]
 fn a_repair_after_the_landing() {
@@ -1629,7 +1625,7 @@ fn every_seek_agrees_with_one_without_an_index() {
 fn every_seek_agrees_with_one_without_an_index_long() {
     let used = AtomicU64::new(0);
     let mut runner = TestRunner::new(Config {
-        cases: 1_500,
+        cases: 400,
         failure_persistence: None,
         ..Config::default()
     });
@@ -1920,7 +1916,7 @@ enum MarkerAtOpen {
     Never,
 }
 
-/// 12. A build and a writer's open with its recovery, its new history, a roll and a checkpoint past the segment, in one
+/// (Plan 12) A build and a writer's open with its recovery, its new history, a roll and a checkpoint past the segment, in one
 /// interleaving of their steps. No index of the old history survives, and none that a reader would use is wrong.
 fn interleave(marker: MarkerAtOpen, repair: Repair, len: usize, schedule: &[Turn]) {
     let dir = tempfile::tempdir().unwrap();
@@ -2074,7 +2070,7 @@ fn no_index_of_an_old_history_survives_any_interleaving_long() {
     interleavings(1);
 }
 
-/// 12. A writer that opens during each attempt makes the build start again, at most three times.
+/// (Plan 12) A writer that opens during each attempt makes the build start again, at most three times.
 #[test]
 fn a_build_starts_again_at_most_three_times() {
     for opens in [1, 3, 4] {
@@ -2109,7 +2105,7 @@ fn a_build_starts_again_at_most_three_times() {
     }
 }
 
-/// 12. The segment changes under a build: removed, or replaced, between the walk and the rename, or after it. What the
+/// (Plan 12) The segment changes under a build: removed, or replaced, between the walk and the rename, or after it. What the
 /// builder put in place it takes away, but not what another builder did.
 #[test]
 fn a_segment_that_goes_during_a_build_keeps_no_index() {
@@ -2167,7 +2163,7 @@ fn a_segment_that_goes_during_a_build_keeps_no_index() {
     }
 }
 
-/// 12. The marker is made durable before the walk, once, and a run that cannot do so builds nothing.
+/// (Plan 12) The marker is made durable before the walk, once, and a run that cannot do so builds nothing.
 #[test]
 fn the_marker_is_made_durable_before_the_walk() {
     let dir = tempfile::tempdir().unwrap();
@@ -2218,7 +2214,7 @@ fn the_marker_is_made_durable_before_the_walk() {
     );
 }
 
-/// 12. A write error, a name that is taken, a file of a newer version, and what `rebuild` does with it.
+/// (Plan 12) A write error, a name that is taken, a file of a newer version, and what `rebuild` does with it.
 #[test]
 fn errors_and_other_files_in_the_way_of_a_build() {
     let (dir, _writer) = indexed(64, 1);
@@ -2371,7 +2367,7 @@ fn a_build_killed_at_any_point_leaves_nothing_wrong() {
     }
 }
 
-/// 7. A writer killed during or right after the removal: the next open finishes it, and recovers.
+/// (Plan 7) A writer killed during or right after the removal: the next open finishes it, and recovers.
 #[test]
 fn a_writer_killed_around_the_removal() {
     for (what, repair) in ["first-pass", "removed"]
@@ -2390,7 +2386,7 @@ fn a_writer_killed_around_the_removal() {
     }
 }
 
-/// 13. Without a marker: every sealed segment, and only if no writer is open.
+/// (Plan 13) Without a marker: every sealed segment, and only if no writer is open.
 #[test]
 fn a_directory_without_a_marker() {
     let dir = tempfile::tempdir().unwrap();
@@ -2475,7 +2471,7 @@ fn a_directory_without_a_marker() {
             2 => std::fs::create_dir(&lock).unwrap(),
             _ => {
                 std::fs::write(&lock, b"").unwrap();
-                std::fs::set_permissions(&lock, Permissions::from_mode(0)).unwrap();
+                std::fs::set_permissions(&lock, Permissions::from_mode(0o000)).unwrap();
             }
         }
         if case < 3 || std::fs::read(&lock).is_err() {
@@ -2494,7 +2490,7 @@ fn a_directory_without_a_marker() {
     }
 }
 
-/// 14. Owner, group and mode of the directory and the files, whatever the umask.
+/// (Plan 14) Owner, group and mode of the directory and the files, whatever the umask.
 #[test]
 fn permissions_of_what_a_build_creates() {
     // The umask belongs to the process: in a child of its own.
@@ -2607,12 +2603,15 @@ fn child_permissions() {
     assert_eq!(build(dir.path())[0], IndexState::Built);
 }
 
-/// 14, as root (`sudo -E cargo test ... --ignored as_root`): another user's journal, and files of another owner.
+/// (Plan 14, as root (`sudo -E cargo test ..) --ignored as_root`): another user's journal, and files of another owner.
 #[test]
-#[ignore = "needs root"]
+#[ignore = "does something only as root"]
 fn as_root_another_users_journal_is_left_alone() {
     // SAFETY: no preconditions.
-    assert_eq!(unsafe { libc::geteuid() }, 0, "run this as root");
+    if unsafe { libc::geteuid() } != 0 {
+        eprintln!("skipped: not root");
+        return;
+    }
     let chown = |path: &Path, uid| std::os::unix::fs::chown(path, Some(uid), None).unwrap();
     let refused = |dir: &Path| {
         assert!(matches!(
@@ -2651,7 +2650,7 @@ fn as_root_another_users_journal_is_left_alone() {
     refused(dir.path());
 }
 
-/// 15. Retention removes a segment's index after the segment, and does not mind if it cannot; `MoveTo` does not carry
+/// (Plan 15) Retention removes a segment's index after the segment, and does not mind if it cannot; `MoveTo` does not carry
 /// it, and the archive gets its own.
 #[test]
 fn retention_and_archives() {

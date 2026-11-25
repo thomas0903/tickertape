@@ -276,7 +276,7 @@ fn export_does_not_descend_into_the_index_directory() {
     command().arg("index").arg(dir.path()).assert().success();
     let indexes = dir.path().join(seek_index::DIR_NAME);
     let out = tempfile::tempdir().unwrap();
-    fs::set_permissions(&indexes, fs::Permissions::from_mode(0)).unwrap();
+    fs::set_permissions(&indexes, fs::Permissions::from_mode(0o000)).unwrap();
     let export = |file: &str| {
         command()
             .arg("export")
@@ -291,7 +291,7 @@ fn export_does_not_descend_into_the_index_directory() {
     // Another subdirectory that cannot be read still does.
     let other = dir.path().join("quarantine");
     fs::create_dir(&other).unwrap();
-    fs::set_permissions(&other, fs::Permissions::from_mode(0)).unwrap();
+    fs::set_permissions(&other, fs::Permissions::from_mode(0o000)).unwrap();
     if fs::read_dir(&other).is_err() {
         export("c.jsonl").code(1);
     }
