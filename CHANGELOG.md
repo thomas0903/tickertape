@@ -5,6 +5,9 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
+- Docs: `docs/benchmarks.md` has profiles of both readers, the notification path and the serialization paths under
+  the sustained workloads (x86-64 and aarch64 cloud VMs) and lists the allocations, copies, system calls and
+  synchronization that remain, with whether each is necessary (issue #62; roadmap "Finish eliminating avoidable work").
 - Added (benchmarks): `benches/diagnostics/profile-sustained.sh` profiles the threads of a sustained run or counts their
   system calls and heap allocations; `tt-sustained` has `--encode` (how payloads are made) and the reader option
   `owned`. `tests/allocation.rs` checks that appending, following and replaying allocate nothing per record.

@@ -184,15 +184,19 @@ released with seven items open, accepted by the owner as known gaps
   - Missing: the measurement of how much prefaulted, unwritten data adds to a checkpoint, and any macOS result. The
     Linux results of ADR 0038 and before/after checkpoint and durable-only reader latency are recorded in
     `docs/benchmarks.md` (2026-11-19 to 2026-11-22).
-- [ ] **Finish eliminating avoidable work.**
+- [x] **Finish eliminating avoidable work.** (done 2026-11-26: the profiles, issue #62)
   - Profile append, both readers, notification and serialization paths under the sustained workloads; document
     allocations, copies and synchronization that remain on those paths.
   - Evaluate batched append and batched notifications with explicit publication, partial-failure and latency
     semantics. Ship changes supported by measurements; document rejected approaches and their tradeoffs.
   - Exercise the existing `append_with` API in integration examples so encoders can write directly into a record.
-  - Missing: batched append with one wake-up per batch is done (ADR 0041, #32) and `append_with` is used by
-    `demo-producer`, the C++ example and the iceoryx2 recorder; the profiles of the readers, notification and
-    serialization paths under the sustained workloads are not documented (ADR 0041 → Consequences).
+  - Batched append with one wake-up per batch is done (ADR 0041, #32), and `append_with` is used by `demo-producer`,
+    the C++ example and the iceoryx2 recorder. The profiles of both readers (spinning, blocking, durable-only), the
+    notification path and the serialization paths, with the allocations, copies, system calls and synchronization that
+    remain and whether each is necessary, are in `docs/benchmarks.md` (2026-11-25). Candidates found there and not
+    taken: a smaller read of the safe reader at the tail (measured, mixed result, branch
+    `core/safe-reader-tail-reads`), a shared clock read in the spin loop, and durable-only readers that keep their
+    checkpoint descriptor and are woken only by checkpoints.
 - [ ] **ARM server measurements.**
   - Run correctness/crash checks and the sustained comparison suite on an aarch64 Linux server, targeting
     Google Axion (`c4a` with local SSD), alongside the existing x86-64 and macOS evidence. (Until 2026-11-19 this
@@ -291,7 +295,8 @@ where a line says it is closed:
   the 1.0 contract ([`compatibility.md`](compatibility.md); `crash-contract.md` → Readers, the writer and memory safety).
 - **Cheaper checkpoints:** how much prefaulted, unwritten data adds to a checkpoint is not measured, and there is no
   macOS result.
-- **Avoidable work:** the profiles of the readers, notification and serialization paths are not documented.
+- **Avoidable work:** the profiles of the readers, notification and serialization paths were not documented; done
+  since ([above](#next-release-sustained-performance), `docs/benchmarks.md` 2026-11-25).
 - **ARM servers:** two latency observations on aarch64 and the platform mechanism behind issue #43 are not explained.
 - **Replay and recovery at scale:** archived history, missing or corrupt segments, catch-up under a live writer, the
   zero-copy reader and journals of 10,000 segments or more are not measured.
