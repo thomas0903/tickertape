@@ -168,7 +168,9 @@ C15).
 
 **Upgrading and downgrading.**
 
-- *Upgrade:* no migration. Close the writer (a journal whose writer did not close is recovered at the next open as
+- *Upgrade:* no migration. (From 1.1 a reader returns an error where an earlier one waited for ever or ended a replay
+  without one: at a zeroed commit word in older history, crash contract C11 and ADR 0050. The contract promised the
+  report, so this is a fix; a program that treats `Error::Corrupt` as fatal can stop at damage it did not see before.) Close the writer (a journal whose writer did not close is recovered at the next open as
   after a crash, crash contract C1/C2), install the new version and open the journal with it. Readers
   and CLI commands of either version can read the result. Tested: old readers on journals the new writer left.
   Not tested: an old reader process following a new writer live.

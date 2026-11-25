@@ -41,8 +41,8 @@ public enum CorruptReason {
     /** The checkpoint marker points to a missing segment or an impossible offset. */
     DANGLING_CHECKPOINT(13),
     /**
-     * A commit word reads 0, and recovery or verify found evidence of committed records after it (usually storage
-     * damage; {@code docs/crash-contract.md} C1 and C11).
+     * A commit word reads 0, and recovery, verify or (from 1.1) a reader found evidence of committed records after it
+     * (usually storage damage; {@code docs/crash-contract.md} C1 and C11).
      */
     EMPTY_COMMIT_WORD(14),
     /**

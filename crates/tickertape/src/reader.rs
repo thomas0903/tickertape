@@ -16,6 +16,9 @@ use crate::seek_index::{self, codec::Entry, dir::IndexDir, lookup};
 
 /// How long a reader waits at an empty slot before checking that its segment wasn't replaced by recovery.
 const IDENTITY_CHECK_INTERVAL: Duration = Duration::from_millis(100);
+/// How long a reader waiting at an empty slot goes without listing the segments to see whether the journal continues
+/// after that slot ([`Reader::check_head`]). Only journals whose marker does not say so need the listing.
+const SEGMENT_LIST_INTERVAL: Duration = Duration::from_secs(1);
 /// Bytes the `pread` reader fetches at a time (more if a record is larger).
 const CHUNK: usize = 64 * 1024;
 /// Longest single block on the wake-up region when the writer maintains it (bounded so that a writer that died, or a
@@ -103,6 +106,9 @@ pub struct Reader {
     waker: Option<crate::notify::Waker>,
     /// When the reader started waiting at an empty slot.
     waiting_since: Option<Instant>,
+    /// When [`Reader::check_head`] listed the segments last: `None` if it has not run since the reader was opened or
+    /// moved by a seek, or if it ended in an error. It then runs at the next empty slot without waiting first.
+    segments_listed: Option<Instant>,
     /// The record [`Reader::advance`] found last (valid only after it returned `true`). The slot reads decode a
     /// record's header straight into it, so that the per-record path passes only small values around (see
     /// [`SlotOutcome`]).
@@ -151,6 +157,7 @@ struct Place {
     buf: Vec<u8>,
     buf_start: u64,
     waiting_since: Option<Instant>,
+    segments_listed: Option<Instant>,
     found: Found,
 }
 
@@ -302,6 +309,7 @@ impl Reader {
             buf_start: 0,
             waker,
             waiting_since: None,
+            segments_listed: None,
             found: Found {
                 header: RecordHeader {
                     seq: 0,
@@ -446,9 +454,21 @@ impl Reader {
     /// Returns the next record if one is committed, without waiting for one.
     ///
     /// `Ok(None)` means there is no new record yet. Follows seals into the next segment transparently.
+    ///
+    /// An empty slot that cannot be the head of the journal is an error, [`Error::Corrupt`] with
+    /// [`CorruptReason::EmptyCommitWord`] (from 1.1; before, the reader waited there for ever): the checkpoint marker
+    /// covers it, or a later segment exists that a writer creates only after the slot is filled. The reader looks for that
+    /// at the first empty slot after it was opened or moved by a seek, in that call, so that a replay up to the first
+    /// `Ok(None)` is told; and at later ones after it has waited there for 100 ms (by the segments alone: at most once a
+    /// second). No reader gets past such a slot: the records between it and the end of its segment can't be found, and
+    /// every call returns the error again. `inspect::verify` reports it too; records after the checkpoint marker can be
+    /// repaired by the writer's recovery, covered ones only from a copy of the segment. A slot that was emptied where
+    /// nothing above covers it (in the newest segment at or after the marker, for example) can't be told from the head.
+    /// `docs/crash-contract.md`, C11.
+    ///
     /// One case does wait: a committed slot that fails validation is read again for at least 50 ms before it is
     /// reported, because a reader's view of a record just committed can lag (`docs/crash-contract.md` → Known risks
-    /// and limits). A call that ends in [`Error::Corrupt`], or in [`Error::Discarded`] after a repair, can therefore
+    /// and limits), and so is an empty slot that is about to be reported. A call that ends in [`Error::Corrupt`], or in [`Error::Discarded`] after a repair, can therefore
     /// take that long, and [`Reader::next_timeout`] can pass its timeout by the same amount.
     /// With [`ReaderConfig::durable_only`] enabled, records wait at the cursor until covered by a checkpoint;
     /// a missing or invalid checkpoint marker covers no records. A marker describes the journal's current files, so a
@@ -458,7 +478,8 @@ impl Reader {
     /// newly covers from the file's current bytes, so records that recovery removed in place are never returned
     /// (crash contract C13 states the exception: damage that also destroys the checkpoint marker).
     /// A visible reader can't notice such an in-place repair (storage damage that emptied a commit word; crash
-    /// contract C11): it may return records it had already read, then continue in the new history, wait, or report
+    /// contract C11): it may return records it had already read, then continue in the new history, wait, return
+    /// [`Error::Discarded`] once the checkpoint or a later segment shows that its position is not the head, or report
     /// corruption at a position that no longer starts a record; [`Reader::seek`] to its position puts it back on the
     /// current chain. (The exceptions of [`Reader::seek`] apply. A reader with [`ReaderConfig::seek_index`] can also have
     /// entered the segment behind the damage, before the repair, where another reader's scan would have stopped; it is
@@ -466,10 +487,11 @@ impl Reader {
     ///
     /// # Errors
     ///
-    /// [`Error::Corrupt`] if the bytes at the cursor fail validation. The cursor doesn't move,
-    /// so calling again retries the same position (which may succeed after a writer recovery).
+    /// [`Error::Corrupt`] if the bytes at the cursor fail validation, or if the slot there is empty and can't be the head of
+    /// the journal (above). The cursor doesn't move, so calling again retries the same position (which may succeed after a writer recovery).
     /// [`Error::Discarded`] if writer recovery or retention replaced or removed the segment at the cursor
-    /// (including when retention removed both it and the next segment while the reader was moving between them);
+    /// (including when retention removed both it and the next segment while the reader was moving between them), or if
+    /// the slot at the cursor is empty, can't be the head, and the record the reader passed last is no longer before it;
     /// call [`Reader::seek`] to continue on the current chain. A removal is never reported as corruption or as an
     /// I/O "not found" error.
     /// [`Error::Corrupt`] with [`CorruptReason::BrokenChain`] if the segment at the cursor is sealed and still in
@@ -583,7 +605,7 @@ impl Reader {
 
     /// An iterator over the records committed so far, copied out of the reader, starting at the current position.
     ///
-    /// It ends at the first slot with no committed record (it doesn't wait for more; call `records()` again later
+    /// It ends at the first slot with no committed record yet (it doesn't wait for more; call `records()` again later
     /// or use [`Reader::next_timeout`] to follow live). After an error it yields that error once and ends; the
     /// reader's position is where [`Reader::try_next`] left it, so you can handle the error and continue.
     ///
@@ -629,7 +651,7 @@ impl Reader {
             && self.next_seq <= self.seek_covered
             && seg.base == self.seg.base
             && seg.identity == self.seg.identity
-            && self.last_record_in_place()
+            && self.last_record_in_place().unwrap_or(false)
     }
 
     /// The checkpoint marker, whose `next_seq` is the exclusive bound of the checkpoint's coverage, if the reader's
@@ -860,20 +882,23 @@ impl Reader {
     }
 
     /// Whether the file holds, right before the cursor, a valid record with the sequence number before the cursor's
-    /// (checked where the reader last passed a record). An I/O error counts as no.
-    fn last_record_in_place(&self) -> bool {
+    /// (checked where the reader last passed a record).
+    fn last_record_in_place(&self) -> std::io::Result<bool> {
         let (Some(at), Some(seq)) = (
             (self.found.payload_at & !COPIED).checked_sub(format::RECORD_HEADER_LEN as u64),
             self.next_seq.checked_sub(1),
         ) else {
-            return false;
+            return Ok(false);
         };
         let window = (format::RECORD_HEADER_LEN + self.found.payload_len).min(CHUNK);
         let view = journal::PreadView::new(&self.seg.file, self.seg.size, window);
-        matches!(
-            format::read_slot(&view, at, seq),
-            Ok(format::Slot::Record { next_offset, .. }) if next_offset == self.offset
-        )
+        let slot = format::read_slot(&view, at, seq);
+        match view.take_error() {
+            Some(e) => Err(e),
+            None => Ok(
+                matches!(slot, Ok(format::Slot::Record { next_offset, .. }) if next_offset == self.offset),
+            ),
+        }
     }
 
     /// Forgets what belongs to the slot the cursor was at: the read buffer (a seek reads the file's current bytes)
@@ -882,6 +907,7 @@ impl Reader {
         self.buf.clear();
         self.drop_copy();
         self.waiting_since = None;
+        self.segments_listed = None;
         self.superseded_checked = None;
     }
 
@@ -932,6 +958,7 @@ impl Reader {
             buf: std::mem::take(&mut self.buf),
             buf_start: self.buf_start,
             waiting_since: self.waiting_since,
+            segments_listed: self.segments_listed,
             found: self.found,
         };
         self.cursor_moved();
@@ -960,6 +987,7 @@ impl Reader {
             self.buf = before.buf;
             self.buf_start = before.buf_start;
             self.waiting_since = before.waiting_since;
+            self.segments_listed = before.segments_listed;
             self.found = before.found;
         }
         end
@@ -1055,6 +1083,14 @@ impl Reader {
         self.drop_copy();
         match slot {
             SlotOutcome::Seal => self.follow_seal(),
+            SlotOutcome::Empty => {
+                self.check_identity()?;
+                // The seal of a segment before the marker's is missing. Asked again by the next call if so.
+                self.superseded_checked = None;
+                self.report_unless_head(false)?;
+                self.superseded_checked = Some(now);
+                Ok(())
+            }
             _ => self.check_identity(),
         }
     }
@@ -1194,9 +1230,10 @@ impl Reader {
         )
     }
 
-    /// At an empty slot: checks the segment's identity once per [`IDENTITY_CHECK_INTERVAL`] of waiting there. A visible
-    /// zero-copy reader reads the marker again before that check, for its bound (and, as at any slot, when it has just
-    /// reached the bound): if the marker can't be read, the old bound stays.
+    /// At an empty slot: [`Reader::check_head`], once per [`IDENTITY_CHECK_INTERVAL`] of waiting there, and without
+    /// waiting at the first empty slot after the reader was opened or moved by a seek: an application that replays until
+    /// `Ok(None)` polls it once. Like any slot, it renews a visible zero-copy reader's bound when that has just been
+    /// reached.
     #[inline(never)]
     fn at_empty_slot(&mut self) -> Result<()> {
         if self.at_limit() {
@@ -1204,18 +1241,144 @@ impl Reader {
         }
         let now = Instant::now();
         let since = *self.waiting_since.get_or_insert(now);
-        if now.duration_since(since) >= IDENTITY_CHECK_INTERVAL {
+        let waited = now.duration_since(since) >= IDENTITY_CHECK_INTERVAL;
+        if waited || self.segments_listed.is_none() {
+            self.check_head(now, waited)?;
+        }
+        Ok(())
+    }
+
+    /// Whether the empty slot at the cursor can be the head of the journal (ADR 0050): an error if the checkpoint marker
+    /// or a later segment shows that it is not. If the reader has `waited`, also checks that its segment is still in
+    /// place, and a visible zero-copy reader takes its bound from the marker read before that check; if the marker
+    /// can't be read, the old bound stays.
+    #[inline(never)]
+    fn check_head(&mut self, now: Instant, waited: bool) -> Result<()> {
+        crate::fault::hook(crate::fault::Point::ReaderEmptySlotCheck);
+        let bounds = waited && self.visible_mapped();
+        let marker = if bounds {
+            marker_for_limit(&self.dir)
+        } else {
+            read_marker(&self.dir)
+        };
+        if waited {
             self.waiting_since = Some(now);
-            let marker = self
-                .visible_mapped()
-                .then(|| marker_for_limit(&self.dir))
-                .flatten();
             self.check_identity()?;
-            if let Some(marker) = marker {
+            if let Some(marker) = marker.as_ref().filter(|_| bounds) {
                 self.set_limit(limit_of(marker.as_ref(), &self.seg));
             }
         }
+        let list = self
+            .segments_listed
+            .is_none_or(|at| now.duration_since(at) >= SEGMENT_LIST_INTERVAL);
+        let listed = if list {
+            Some(now)
+        } else {
+            self.segments_listed
+        };
+        if self
+            .history_after(marker.flatten().as_ref(), list)
+            .is_some()
+        {
+            // After an error the next call checks again at once, and so reports the slot again.
+            self.segments_listed = None;
+            self.report_unless_head(list)?;
+        }
+        self.segments_listed = listed;
         Ok(())
+    }
+
+    /// What shows that the journal continues after the empty slot at the cursor, if its segment is still in place and the
+    /// slot is still empty when it is read after this (ADR 0050): the marker's `next_seq`, or the base of a later segment.
+    ///
+    /// - The marker covers the slot, or names a later segment. A writer stores a record, and the seal in front of a
+    ///   segment it rolls to, before it writes a marker that covers them, and no recovery from that marker changes them
+    ///   (ADR 0034, F2).
+    /// - If `list`: a segment with a base above the cursor exists, which a writer links only after it committed every
+    ///   record below it; or one with the cursor's sequence number, not the reader's own, that holds a record, which a
+    ///   writer appends only after it sealed the segment before. (One without a record does not count: a writer links it
+    ///   before it stores the seal, and may die in between.)
+    ///
+    /// What can't be read, the marker or a segment, shows nothing.
+    fn history_after(&self, marker: Option<&CheckpointSlot>, list: bool) -> Option<u64> {
+        if let Some(m) = marker {
+            if m.next_seq > self.next_seq || m.segment_base_seq > self.seg.base {
+                return Some(m.next_seq);
+            }
+        }
+        if !list {
+            return None;
+        }
+        let newest = journal::find_bases(&self.dir, u64::MAX).ok()?.floor?;
+        (newest > self.next_seq
+            || (newest == self.next_seq
+                && newest != self.seg.base
+                && holds_a_record(&self.dir, newest)))
+        .then_some(newest)
+    }
+
+    /// [`Reader::history_after`] found something: reports the empty slot at the cursor if that stands.
+    ///
+    /// The slot is read again from the file (not the mapping, which can lag), for [`VALIDATION_WINDOW`] like any slot
+    /// about to be reported, then once more after the evidence and the segment's identity were checked again: a writer
+    /// stores the record or the seal before it produces the evidence, so a slot that is empty when read after it, in a file
+    /// that is still in place, was emptied. `Ok` if any of this fails to hold: the reader waits on.
+    ///
+    /// A visible reader whose records were removed by a repair in place can be at an offset that starts no record of the
+    /// new history (crash contract, "Readers after a repair"). What is there is no damage. That cursor is told by the
+    /// record before it, which is no longer there: then `Error::Discarded`.
+    #[inline(never)]
+    fn report_unless_head(&mut self, list: bool) -> Result<()> {
+        crate::fault::hook(crate::fault::Point::ReaderEmptySlot);
+        let deadline = Instant::now() + VALIDATION_WINDOW;
+        let mut pause = VALIDATION_PAUSE_MIN;
+        loop {
+            if !self.slot_is_empty()? {
+                return Ok(());
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            std::thread::sleep(pause.min(deadline - now));
+            pause = (pause * 2).min(VALIDATION_PAUSE_MAX);
+        }
+        let marker = read_marker(&self.dir).flatten();
+        let Some(later) = self.history_after(marker.as_ref(), list) else {
+            return Ok(());
+        };
+        crate::fault::hook(crate::fault::Point::ReaderEmptySlotConfirm);
+        self.check_identity()?;
+        fence(Ordering::Acquire);
+        if !self.slot_is_empty()? {
+            return Ok(());
+        }
+        // At a segment's first slot, and at or below what a seek knows to be covered, the cursor is a record boundary.
+        if self.offset == format::SEGMENT_HEADER_LEN as u64
+            || self.next_seq <= self.seek_covered
+            || self
+                .last_record_in_place()
+                .map_err(|e| Error::io("read segment", &self.seg.path, e))?
+        {
+            return Err(Error::corrupt(
+                &self.seg.path,
+                self.offset,
+                CorruptReason::EmptyCommitWord(later),
+            ));
+        }
+        Err(Error::Discarded {
+            seq: self.position(),
+        })
+    }
+
+    /// Whether the commit word at the cursor is 0 in the file.
+    fn slot_is_empty(&self) -> Result<bool> {
+        let mut word = [0; format::COMMIT_WORD_LEN];
+        self.seg
+            .file
+            .read_exact_at(&mut word, self.offset)
+            .map_err(|e| Error::io("read segment", &self.seg.path, e))?;
+        Ok(word == [0; format::COMMIT_WORD_LEN])
     }
 
     /// The error for a slot that still fails validation after the retries (`Error::Discarded` if the segment was
@@ -1589,6 +1752,31 @@ fn open_segment(dir: &Path, base: u64, mapped: bool) -> Result<OpenSegment> {
     })
 }
 
+/// The checkpoint marker, as [`marker_for_limit`] reads it.
+fn read_marker(dir: &Path) -> Option<Option<CheckpointSlot>> {
+    let marker = crate::inspect::read_checkpoint(dir).ok()?;
+    fence(Ordering::Acquire);
+    Some(marker)
+}
+
+/// Whether the segment with base `base` has a valid record in its first slot. Anything that can't be read is a no.
+fn holds_a_record(dir: &Path, base: u64) -> bool {
+    let path = journal::segment_path(dir, base);
+    let Ok(file) = File::open(&path) else {
+        return false;
+    };
+    let Ok(header) = journal::read_header(&file, &path, base) else {
+        return false;
+    };
+    let view = journal::PreadView::new(&file, header.segment_size, CHUNK);
+    let holds = matches!(
+        format::read_slot(&view, format::SEGMENT_HEADER_LEN as u64, base),
+        Ok(format::Slot::Record { .. })
+    );
+    fence(Ordering::Acquire);
+    holds
+}
+
 /// The checkpoint marker for the bound of a visible zero-copy reader (ADR 0048): `Some(None)` if there is no valid one,
 /// `None` if it can't be read, which is never reported.
 ///
@@ -1599,9 +1787,7 @@ fn open_segment(dir: &Path, base: u64, mapped: bool) -> Result<OpenSegment> {
 fn marker_for_limit(dir: &Path) -> Option<Option<CheckpointSlot>> {
     crate::fault::hook(crate::fault::Point::ReaderLimitMarker);
     crate::fault::inject(crate::fault::Point::ReaderLimitMarker).ok()?;
-    let marker = crate::inspect::read_checkpoint(dir).ok()?;
-    fence(Ordering::Acquire);
-    Some(marker)
+    read_marker(dir)
 }
 
 /// How far `marker` covers `seg` (the table in ADR 0048): the marker's offset if it names `seg`, `seg`'s size if it names
@@ -2101,7 +2287,7 @@ mod tests {
                 (r.durable_next_seq, r.durable_segment_base),
                 (r.durable_offset, r.bound),
                 (
-                    r.waiting_since,
+                    (r.waiting_since, r.segments_listed),
                     r.superseded_checked,
                     format!("{:?}", r.found),
                 ),
@@ -2118,6 +2304,7 @@ mod tests {
             reader.durable_offset = 9;
             reader.bound = 1 << 12;
             reader.waiting_since = Some(Instant::now());
+            reader.segments_listed = Some(Instant::now());
             reader.superseded_checked = Some(Instant::now() - VALIDATION_WINDOW);
             let before = state(&reader);
             assert!(matches!(reader.seek_to_end(), Err(Error::Corrupt { .. })));

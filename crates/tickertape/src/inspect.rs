@@ -221,7 +221,8 @@ pub struct Problem {
 /// not a problem. Anything that a reader would reject is, and so are states that only a crash leaves behind and the
 /// next writer repairs (a sealed newest segment without a successor, or an unsealed segment that has one), and
 /// evidence of committed records after an empty commit word ([`CorruptReason::EmptyCommitWord`], or
-/// [`CorruptReason::UncheckedTail`] when the search stops at its work bound, reported at the empty word).
+/// [`CorruptReason::UncheckedTail`] when the search stops at its work bound, reported at the empty word; from 1.1 also
+/// a newest segment that ends before what the checkpoint marker covers, ADR 0050).
 ///
 /// Against a live journal, the report describes the segments listed when the scan started, as the scan found them.
 /// A writer appending or rolling during the scan is not a problem: a segment that ends in a state a writer passes
@@ -269,6 +270,9 @@ pub fn verify(dir: impl AsRef<Path>) -> Result<VerifyReport> {
 /// One attempt at [`verify`]: `Ok(None)` if the listing was empty, or a listed segment disappeared other than from
 /// the oldest end, or the newest listed segment did.
 fn verify_once(dir: &Path, last: bool) -> Result<Option<VerifyReport>> {
+    // Read before the segments are listed and opened: what it covers is then in them (ADR 0034), so a newest segment that
+    // ends before it has lost records. It is only evidence: one that can't be read, or is not there, changes nothing.
+    let marker = read_checkpoint(dir).ok().flatten();
     let Some(segments) = list_nonempty(dir, last)? else {
         return Ok(None);
     };
@@ -425,7 +429,17 @@ fn verify_once(dir: &Path, last: bool) -> Result<Option<VerifyReport>> {
                 offset: scan.end_offset,
                 reason: later.map_or(CorruptReason::EmptyCommitWord(0), |h| h.reason()),
             }),
-            ScanEnd::Empty if newest => seg.end = SegmentEnd::Open,
+            ScanEnd::Empty if newest => {
+                match marker.filter(|m| m.next_seq > scan.next_seq || m.segment_base_seq > base) {
+                    // The checkpoint marker covers the empty slot (ADR 0050), as a reader reports it.
+                    Some(m) => report.problems.push(Problem {
+                        path: path.clone(),
+                        offset: scan.end_offset,
+                        reason: CorruptReason::EmptyCommitWord(m.next_seq),
+                    }),
+                    None => seg.end = SegmentEnd::Open,
+                }
+            }
             ScanEnd::Empty => report.problems.push(Problem {
                 path: path.clone(),
                 offset: scan.end_offset,

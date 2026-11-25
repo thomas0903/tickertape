@@ -127,3 +127,7 @@ path = "seek.rs"
 [[test]]
 name = "seek_index"
 path = "seek_index.rs"
+
+[[test]]
+name = "empty_slot"
+path = "empty_slot.rs"

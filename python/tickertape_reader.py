@@ -215,7 +215,7 @@ def read_journal(path, start_seq=None, end_seq=None, durable_only=False) -> Iter
     those before start_seq; do not open earlier segments. Capture segment names and
     (if requested) the checkpoint once when iteration begins. With no valid
     checkpoint, durable_only yields nothing. End at the newest segment's empty slot
-    or the requested boundary. A live append may be that empty slot; invoke again for
+    (an empty slot that the checkpoint covers is corrupt) or the requested boundary. A live append may be that empty slot; invoke again for
     later records. CorruptJournal is raised only after one retry of a failing segment
     read. This is not an atomic snapshot or a reader that follows live appends.
     """
@@ -229,6 +229,7 @@ def read_journal(path, start_seq=None, end_seq=None, durable_only=False) -> Iter
                       if len(entry.name) == 25 and entry.name[20:] == ".tape"
                       and all("0" <= char <= "9" for char in entry.name[:20]))
     limit = None if end_seq is None else end_seq + 1
+    durable_end = 0
     if durable_only:
         checkpoint = read_checkpoint(path)
         durable_end = 0 if checkpoint is None else checkpoint.next_seq
@@ -253,6 +254,8 @@ def read_journal(path, start_seq=None, end_seq=None, durable_only=False) -> Iter
                 if sealed:
                     break
                 if record is None:
+                    if expected < durable_end:
+                        raise CorruptJournal(segment_path, offset, f"empty slot below the checkpoint ({durable_end})")
                     return
                 expected += 1
                 offset = next_offset

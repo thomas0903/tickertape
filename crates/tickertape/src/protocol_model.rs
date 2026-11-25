@@ -12,8 +12,10 @@
 //! thread that committed the records it covers; [`marker_stored_by_the_checkpoint_thread_covers_only_committed_records`]
 //! models that hand-over.
 //!
-//! The last models are about a commit word that no writer stored (ADR 0048): a frame it claims is loaded only as far as
+//! The models after that are about a commit word that no writer stored (ADR 0048): a frame it claims is loaded only as far as
 //! the checkpoint marker reaches. They run no reader code: they model what `Reader` does. The variants without the bound, or without the order that the marker gives, must fail.
+//!
+//! The last ones are about when an empty slot cannot be the head of the journal (ADR 0050).
 
 use loom::cell::UnsafeCell;
 use loom::sync::atomic::{AtomicU32, Ordering, fence};
@@ -351,5 +353,77 @@ fn without_the_fence_after_the_marker_a_damaged_frame_races_with_the_writer() {
         reached: true,
         marker_fence: false,
         durable_only: false,
+    });
+}
+
+/// An empty slot that cannot be the head of the journal (ADR 0050). The writer fills a segment of one record, rolls (links
+/// the successor, seals, appends to it), rolls again and checkpoints. A reader that has found the slot of the record, or of
+/// the seal, empty looks for evidence of what came after it and then reads the slot again (`again`): it is never empty.
+fn empty_slot(slot: usize, again: bool) {
+    loom::model(move || {
+        // Slots: the record, the seal, the successor's first record. `linked`: the newest segment there is.
+        let j = Arc::new(Journal::new());
+        let linked = Arc::new(AtomicU32::new(0));
+        let marker = Arc::new(AtomicU32::new(0));
+        let writer = {
+            let (j, linked, marker) = (j.clone(), linked.clone(), marker.clone());
+            thread::spawn(move || {
+                j.append(0, 11);
+                linked.store(1, Ordering::Release);
+                j.seal(1);
+                j.append(2, 22);
+                linked.store(2, Ordering::Release);
+                marker.store(1, Ordering::Release);
+            })
+        };
+        if j.read(slot).is_none() {
+            // A marker in the second segment; a segment whose base is above the slot's sequence number (the successor
+            // is, for the record, and is the cursor's own number for the seal); the successor with a record.
+            let evidence = marker.load(Ordering::Relaxed) == 1
+                || linked.load(Ordering::Relaxed) > slot as u32
+                || j.commit[2].load(Ordering::Relaxed) != 0;
+            fence(Ordering::Acquire);
+            if evidence && again {
+                assert_ne!(j.commit[slot].load(Ordering::Relaxed), 0);
+            } else {
+                assert!(!evidence, "reported a slot that was filled");
+            }
+        }
+        writer.join().unwrap();
+    });
+}
+
+#[test]
+fn an_empty_slot_with_evidence_after_it_is_not_empty_when_read_again() {
+    empty_slot(0, true);
+    empty_slot(1, true);
+}
+
+#[test]
+#[should_panic(expected = "reported a slot that was filled")]
+fn without_reading_the_slot_again_a_filled_slot_is_reported() {
+    empty_slot(0, false);
+}
+
+/// A successor that is linked but holds no record is no evidence about the seal's slot: here it is taken for some.
+#[test]
+#[should_panic(expected = "a roll in progress")]
+fn the_successor_alone_is_no_evidence_for_the_seal() {
+    loom::model(|| {
+        let j = Arc::new(Journal::new());
+        let linked = Arc::new(AtomicU32::new(0));
+        let writer = {
+            let (j, linked) = (j.clone(), linked.clone());
+            thread::spawn(move || {
+                j.append(0, 11);
+                linked.store(1, Ordering::Release);
+                j.seal(1);
+            })
+        };
+        if linked.load(Ordering::Acquire) == 1 {
+            let word = j.commit[1].load(Ordering::Relaxed);
+            assert_ne!(word, 0, "a roll in progress");
+        }
+        writer.join().unwrap();
     });
 }

@@ -150,6 +150,29 @@ def test_read_many_returns_records_before_an_error_then_raises(journal: Path) ->
         assert len(r.read_many(3)) == 3
 
 
+def test_emptied_commit_word_raises_instead_of_returning_none(journal: Path) -> None:
+    """A zeroed commit word that the checkpoint covers (ADR 0050)."""
+    with tt.Writer(journal, segment_size=SMALL_SEGMENT) as w:
+        append_pattern(w, 20)
+        w.checkpoint()
+    segment = next(journal.glob("*.tape"))
+    at = record_offsets(segment)[10]
+    data = bytearray(segment.read_bytes())
+    data[at : at + 4] = bytes(4)
+    segment.write_bytes(data)
+    for durable_only in (False, True):
+        with tt.Reader(journal, durable_only=durable_only) as r:
+            for seq in range(10):
+                assert r.try_next().seq == seq
+            for read in (r.try_next, lambda: r.next(timeout=0.2), lambda: r.read_batch(10)):
+                with pytest.raises(tt.CorruptJournalError) as raised:
+                    read()
+                assert raised.value.reason == "empty_commit_word"
+                assert raised.value.offset == at
+                assert raised.value.details["seq"] == 20
+            assert r.position == 10
+
+
 def test_corrupt_header_and_unsupported_version(journal: Path) -> None:
     with tt.Writer(journal, segment_size=SMALL_SEGMENT) as w:
         w.append(b"a")

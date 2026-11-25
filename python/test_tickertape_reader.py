@@ -122,6 +122,23 @@ class FormatTests(unittest.TestCase):
         self.assertEqual([r.seq for r in reader.read_journal(
             self.path, start_seq=1, end_seq=2, durable_only=True)], [1, 2])
 
+    def test_empty_slot_below_the_checkpoint(self):
+        contents = bytearray(b"".join(frame(i) for i in range(4)))
+        contents[2 * 48:2 * 48 + 4] = bytes(4)
+        self.write_segment(contents=bytes(contents))
+        path = self.path / "checkpoint"
+        path.write_bytes(marker(slot(1, 4, offset=64 + 4 * 48), bytes(64)))
+        got = []
+        with self.assertRaises(reader.CorruptJournal) as raised:
+            for record in reader.read_journal(self.path, durable_only=True):
+                got.append(record.seq)
+        self.assertEqual((got, raised.exception.offset), ([0, 1], 64 + 2 * 48))
+        self.assertIn("below the checkpoint", raised.exception.reason)
+        # Not past what is selected or covered.
+        self.assertEqual(len(list(reader.read_journal(self.path, end_seq=1, durable_only=True))), 2)
+        path.write_bytes(marker(slot(1, 2, offset=64 + 2 * 48), bytes(64)))
+        self.assertEqual(len(list(reader.read_journal(self.path, durable_only=True))), 2)
+
     def test_record_fields_empty_payload_and_unsigned_values(self):
         self.write_segment(contents=frame(0, b"") + frame(
             1, b"\x00\xff", schema_id=(1 << 32) - 1, venue=(1 << 64) - 1, local=1 << 63))

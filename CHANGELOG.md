@@ -5,6 +5,19 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
+- Fixed: a reader no longer stops silently at a zeroed commit word in older history (issue #79, ADR 0050). An empty slot
+  that the checkpoint marker covers, or that a later segment shows to have been filled, is `Error::Corrupt` with
+  `CorruptReason::EmptyCommitWord` at its offset; before, `try_next` returned `Ok(None)` there for ever, and a replay ended
+  without an error. **What callers see changes:** an error where a wait was. It comes in the call that meets the first
+  empty slot after opening or seeking, otherwise after at most 100 ms at the slot (1.1 s if only a later segment shows
+  it), plus 50 ms in which the slot is read again; it is returned on every call, since no reader gets past it. `export`,
+  `stats`, `tail` and `age` exit 2 where they ended with 0, and `export --durable-only` names the damage instead of
+  "journal changed". After a repair in place, a visible reader whose position is inside a record of the new history gets
+  `Error::Discarded` where it waited until it was seeked. `verify` also reports a newest segment that ends before what the
+  marker covers, and the pure-Python decoder, with `durable_only`, an empty slot below the marker. Not detected: a zeroed
+  word that nothing covers, such as in the newest segment at or after the marker (`docs/crash-contract.md`, C11). A waiting
+  reader now reads the marker ten times a second and lists the segments at most once a second; the record path, the C
+  ABI's declarations and the on-disk format are unchanged, and any writer works, 1.0.0 included.
 - Changed: the zero-copy reader (`Reader::open_mapped`, and the mapped readers of the C, C++ and Java bindings) bounds its
   loads by the checkpoint marker (ADR 0048, issue #62). A damaged length in a record that the marker covers no longer
   makes it load bytes past the marker's position, where a writer may be storing: such a frame is read with `pread` into a
