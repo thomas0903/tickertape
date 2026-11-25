@@ -327,6 +327,20 @@ fn archive(options: &Options) -> Result<Value> {
     Ok(out)
 }
 
+/// Marks a directory `damage` made, so that a probe that changes a journal refuses any other.
+const DAMAGE_ROOT: &str = ".tt-scale-damage";
+
+/// Fails unless `dir` is the journal of a case inside a directory `damage` made.
+fn check_damage_dir(dir: &Path) -> Result<()> {
+    match dir.parent() {
+        Some(root) if root.join(DAMAGE_ROOT).is_file() => Ok(()),
+        _ => Err(
+            "a probe that changes a journal runs only inside a directory made by tt-scale damage"
+                .into(),
+        ),
+    }
+}
+
 fn shape(options: &Options) -> Result<Shape> {
     Ok(Shape {
         segments: options.number("--segments", Some(64))?,
@@ -345,6 +359,7 @@ fn damage(options: &Options) -> Result<Value> {
         Some(list) => list.split(',').map(damage::find).collect::<Result<_>>()?,
     };
     tickertape_bench::fresh_directory(&root)?;
+    std::fs::write(root.join(DAMAGE_ROOT), [])?;
     let base_dir = |base: Base| {
         root.join(match base {
             Base::MarkerInNewest => "marker-in-newest",
@@ -651,7 +666,11 @@ fn run(args: &[String]) -> Result<()> {
                 &[],
             )?;
             let dir = PathBuf::from(options.required("--dir")?);
-            let out = match options.required("--probe")? {
+            let probe = options.required("--probe")?;
+            if probe.starts_with("writer-open-") || probe.starts_with("index-") {
+                check_damage_dir(&dir)?;
+            }
+            let out = match probe {
                 name @ ("verify" | "status") => damage::check_probe(&dir, name)?,
                 name @ ("index-build" | "index-check") => damage::index_probe(&dir, name)?,
                 "writer-open-quarantine" => {

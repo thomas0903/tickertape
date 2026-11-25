@@ -172,7 +172,7 @@ what both readers do at open, replay, four seeks and `seek_to_end`, what `verify
 seeks with them do. After each writer probe it compares every record of the intact journal, byte for byte, with the
 journal and `quarantine/`: `census` says how many are in a segment, only in quarantine, or in neither, and `gone` counts
 those that were in a segment before the writer opened and are in neither afterwards (it must be 0; the unit test checks
-every case).
+every case). The internal probes that change a journal run only inside a directory `damage` made.
 
 **Catch-up.** `tt-scale catch-up` opens a writer on a journal `build` left and appends records at `--rate` with a
 background checkpoint every `--checkpoint-every`. After `--warmup` and `--baseline` it starts a reader process

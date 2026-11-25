@@ -28,13 +28,15 @@ draws conclusions from those two.
   segment's file; replay opens each segment it enters. These costs grow with the number of segments, so very small
   segments in a long-lived journal make them add up (ADR 0042). Measured on local SSD (`benchmarks.md`, 2026-11-25):
   journals of 10,000, 20,000 and 100,000 segments open, recover, replay and checkpoint, and no operation held more
-  than 12 open files at 10 to 20,000 segments, so the limit on open files (`ulimit -n`) is not a constraint on the number
-  of segments. The directory read is: each seek costs about 3 ms at 10,000 segments, 6 ms at 20,000 and 29 ms at 100,000,
-  also with a seek index, and each retention run opens every header (29 ms at 10,000 segments, 67 ms at 20,000, 0.34 s
-  at 100,000 with a warm cache; seconds when it is cold, as at the open of a writer after a reboot), which a writer with
-  a retention policy pays at every checkpoint. Deleting a segment reads the directory again, about 8 ms each at 20,000
-  segments. So plan for at most a few thousand segments in a journal with retention (a larger segment, or fewer kept),
-  and prefer one large segment over many small ones where seeks or checkpoints matter.
+  than 12 open files at 10 to 20,000 segments (not sampled at 100,000), so the limit on open files (`ulimit -n`) is not
+  a constraint on the number of segments. The directory read is: each seek costs about 3 ms at 10,000 segments, 6 ms at 20,000 and 29 ms at 100,000,
+  also with a seek index, and each retention run opens every header (x86-64: 29 ms at 10,000 segments, 67 ms at 20,000,
+  0.34 s at 100,000 with a warm cache; seconds when it is cold, as at the open of a writer after a reboot). The appending
+  thread pays for that in `checkpoint()` and in the open; a background checkpoint (`request_checkpoint`) runs retention
+  on the checkpoint thread. Deleting a segment reads the directory again, about 8 ms each at 20,000 segments (x86-64).
+  So plan for at most a few thousand segments in a journal with retention (a larger segment, or fewer kept). The costs
+  are issue #80. Fewer, larger segments make checkpoints with retention cheaper. They make a seek without a seek index
+  slower (up to a whole segment is read). So use an index with large segments.
 - **Granularity of archiving.** You archive or delete whole segments (below).
 
 For most uses the default is a reasonable start. Pick smaller segments (a few MiB) for low-volume journals you
@@ -660,6 +662,11 @@ the writer or retention.
   checkpoint slot decodes). Where a segment's records end at an empty
   commit word, `verify` also searches the rest of that segment: it reads backward from the segment's end to find the
   last non-zero byte, then checks the candidates up to it, and can stop early (`cli.md` → `verify`).
+- Until issue #79 is fixed, a zeroed commit word reads as an empty slot: a reader stops there with `Ok(None)`, also in an
+  older segment and below the checkpoint. `export` and `stats` can then exit 0 with part of the journal. Only `verify`
+  reports it, so run `verify` before trusting a full replay.
+- A damaged header of the oldest segment makes `Reader::open` fail, and with it every seek of a new reader, although no
+  other segment is damaged; retention cannot remove that segment either (it reads its header; by the code, not run).
 - `tickertape inspect <dir>` lists segments, their sequence ranges and fill level, and the checkpoint marker.
 - `tickertape status <dir>` is the cheap, frequent check: head, checkpoint age, exposure, headroom and reader lag
   (see "Monitoring"). Unlike `inspect` and `verify`, it does not scan the whole journal.
@@ -677,6 +684,9 @@ the writer or retention.
   damage can leave the same bytes (ADR 0035). Decide from what the application knows it was writing when the process
   died: if it was such a payload, open the writer once with `RecoveryPolicy::Quarantine`, which preserves those bytes
   and continues; if not, treat it as the storage damage below.
+- **A missing newest segment after the marker:** under both policies, also `Fail`, the open creates that segment again,
+  empty, and uses the sequence numbers of the records it held again (reported as a completed roll, as after a crash
+  during a roll). No record the marker covers is dropped.
 - **Power loss or storage errors:** the writer validates the journal from the last checkpoint. Corrupt or
   disconnected data it detects is usually moved to `quarantine/`, not deleted, or, with `RecoveryPolicy::Fail`, the
   writer refuses to open so that a human can look first. That includes committed records hidden behind a zeroed

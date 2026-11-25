@@ -114,6 +114,6 @@ Option 5's cases are measured (`docs/benchmarks.md` → "2026-11-25, replay and 
 history, missing and corrupt segments, catch-up under a live writer, the zero-copy reader, and the journals of 10,000 and
 20,000 segments (and 100,000), which work since #38 with a bounded number of open files. Nothing here changes the
 decision on the sparse index, which was built later as a separate design (ADR 0045). The rows added to the table above are
-the costs that grow with the segment count and have no remedy yet; options 3 and 4 remain possible later work, and a
+the costs that grow with the segment count and have no remedy yet (issue #80); options 3 and 4 remain possible later work, and a
 removal that does not read the directory again for each segment (`retention::apply`) and a seek that does not list it
 belong to the same list.

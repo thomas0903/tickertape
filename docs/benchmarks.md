@@ -349,7 +349,8 @@ seeks compare big` on aarch64 (stopped during the archive of `big`), followed th
 10000 --segment-size 1048576` (warm). On x86-64 the `seeks` stage of `e7bba3e` (without an index) is not reported, and
 two things ran after the session on the same VM: the stage `compare`, with the script of `20163aa` (which corrected the
 order of the warm runs: in the x86-64 session each warm run of the 1.0.0 core came right after a cold run, so only its
-cold figures and `compare` are used), and the stage `seeks` and `tt-scale damage --segments 10000 --segment-size
+cold figures and `compare` are used; `compare` ran the script of `20163aa` as an untracked copy in a tree at `e7bba3e`,
+so not a clean tree), and the stage `seeks` and `tt-scale damage --segments 10000 --segment-size
 1048576` at `01c6495`. Files: `seg-*`, `size-*`, `big-*`, `catchup-*`, `damage-*`, `compare-*`, `index-*` `.json` with
 `environment.txt` and `progress.txt` per session, kept outside the repository.
 
@@ -365,13 +366,15 @@ the mapped journal pages.
 ### Journals of 10,000 segments and more
 
 **They work now**, on both machines, with every operation of the list, and up to 100,000 segments of 64 KiB. No
-operation failed; every operation was repeated with the soft limit on open files lowered to 64 (readers, `status`,
-`verify`, retention plan, writer open with and without a marker, checkpoints with retention) and none failed. With the
-limit at 1,024, the most files a process had open, counted about every millisecond (3 of them are the process's own),
-was 5 for a reader or a seek, 4 for `status`, `verify` and a retention plan, 8 for a writer, and 12 for a writer
-opening without a marker, at 10 and at 20,000 segments alike. A writer that built 20,000 segments without a checkpoint
-in between held 7 files; its first checkpoint, at the end, covered 19.5 GiB and took 6.7 s (x86-64) and 7.8 s
-(aarch64).
+operation failed. With the soft limit on open files lowered to 64, at 10 to 20,000 segments, `reader-open`, the seeks,
+`status`, `verify`, a retention plan, the writer open after a clean close and without a marker, and the checkpoint loop
+with retention ran, and none failed (`replay`, `list-segments`, the open after a kill and the checkpoint loop without
+retention did not run under that limit). With the limit at 1,024, at 10 to 20,000 segments, the most files a process
+had open, counted about every millisecond (3 of them are the process's own), was 5 for a reader or a seek, 4 for
+`status`, `verify` and a retention plan, 8 for a writer, and for a writer opening without a marker 12, also at 1,000,
+10,000 and 20,000 segments (10 on x86-64 and 11 on aarch64 at 10 segments). Open files were not sampled at 100,000
+segments. A writer that built 20,000 segments without a checkpoint in between held 7 files; its first checkpoint, at
+the end, covered 19.5 GiB and took 6.7 s (x86-64) and 7.8 s (aarch64).
 
 What grows, and where it becomes a limit:
 
@@ -380,13 +383,15 @@ What grows, and where it becomes a limit:
   that and nothing else matters: 16 forward seeks (ADR 0046) cost 16 listings, and the seek index does not help either
   ("Seek index" below). With nothing cached, reading the directory took 18 ms and 35 ms (x86-64; 6 to 7 ms and 13 to 15
   ms on aarch64) at 10,000 and 20,000 segments, and 215 ms (70 to 78 ms) at 100,000.
-- **Headers.** `list_segments`, a retention plan and `verify` open every segment: 30 ms at 10,000 and 60 ms at 20,000
-  segments with a warm cache, but 2 s and 4 s (x86-64) or 0.9 s and 1.9 s (aarch64) when the segments' metadata is
-  cold.
+- **Headers.** `list_segments` and a retention plan open every segment: 30 ms at 10,000 and 60 ms at 20,000 segments
+  with a warm cache, but 2 s and 4 s (x86-64) or 0.9 s and 1.9 s (aarch64) when the segments' metadata is cold. `verify`
+  opens them too, and reads every record: 2.2 s warm (x86-64) at 10,000 segments.
 - **Retention.** With a retention policy configured, every checkpoint makes a plan: a blocking checkpoint of one record
   went from 0.3 ms to 29 ms at 10,000 segments, 67 ms at 20,000 and 336 ms at 100,000 (x86-64; aarch64 alike), and a
   cold writer open from 28 ms to 2.1 s, 50 ms to 4.0 s and 0.25 s to 21 s. Without retention a checkpoint does not
-  depend on the number of segments.
+  depend on the number of segments. (On aarch64 the median checkpoint without retention was 0.04 ms in every cold
+  measurement and in both warm ones of the 100,000-segment journal and one of the 20,000-segment one's two, and 0.43 to
+  0.49 ms otherwise; unexplained.)
 - **Removing segments** reads the directory again before every removal (`retention::apply`), so the cost of deleting a
   segment grows with the number of segments left: 0.6 ms at 1,000, 2 ms at 4,000 to 5,000, 8 ms at 20,000 (x86-64; the
   journal of 10,000 had been halved by `archive` before). Deleting a tenth of the 20,000 took 14 to 16 s.
@@ -396,7 +401,7 @@ What grows, and where it becomes a limit:
 
 Every operation on journals of every shape:
 
-x86-64:
+x86-64 (`85726e3`):
 
 | Journal | Cache | read directory | `list_segments` | `status` | retention plan | `verify` | writer open, clean | after kill | without marker | checkpoint after that | Peak RSS |
 |---|---|---|---|---|---|---|---|---|---|---|---|
@@ -419,7 +424,7 @@ x86-64:
 | 512 × 128 MiB | cold | 714 µs–1.45 ms | 105 ms | 6.68–6.82 ms | 108–115 ms | 93.1 s | 27.4–28.9 ms | 94.2–118 ms | 93.4 s | 10.3–14.5 ms | 132 MiB |
 | 512 × 128 MiB | warm | 190–218 µs | 1.19–1.25 ms | 1.31–3.85 ms | 1.69–75.9 ms | 77.2 s | 10.0–10.5 ms | 54.0–64.2 ms | 93.6 s | 14.8–15.9 ms | 132 MiB |
 
-aarch64:
+aarch64 (`d2074c1`):
 
 | Journal | Cache | read directory | `list_segments` | `status` | retention plan | `verify` | writer open, clean | after kill | without marker | checkpoint after that | Peak RSS |
 |---|---|---|---|---|---|---|---|---|---|---|---|
@@ -447,23 +452,23 @@ checkpoints every 64 segments; the deletion plans and deletes a tenth of the seg
 
 | Machine | Journal | Build (checkpoint every 64 segments) | checkpoint p50, no retention | checkpoint p50 / max, retention configured | writer open with retention, cold / warm | delete a tenth of the segments (cold): plan + apply, per segment |
 |---|---|---|---|---|---|---|
-| x86-64 | 10 × 1 MiB | 25.1 ms (417 MB/s) | 297–299 µs | 305–393 µs / 957 µs–2.15 ms | 3.10–3.56 ms / 439–444 µs | 1 of 16: 257 µs + 573 µs (573 µs); 1 of 15: 371 µs + 644 µs (644 µs) |
-| x86-64 | 1,000 × 1 MiB | 2.57 s (408 MB/s) | 298–347 µs | 2.79–2.80 ms / 3.45–4.11 ms | 191–204 ms / 3.66–4.41 ms | 100 of 1,006: 16.8 ms + 67.3 ms (673 µs); 100 of 906: 16.7 ms + 63.9 ms (639 µs) |
-| x86-64 | 10,000 × 1 MiB | 25.7 s (408 MB/s) | 281–282 µs | 29.1–30.3 ms / 35.6 ms | 2.10–2.20 s / 38.0–42.4 ms | 1,000 of 5,000: 139 ms + 2.12 s (2.12 ms); 1,000 of 4,000: 146 ms + 1.72 s (1.72 ms) |
-| x86-64 | 20,000 × 1 MiB | 51.6 s (406 MB/s) | 289–290 µs | 66.7–67.6 ms / 69.8–70.9 ms | 3.90–4.07 s / 83.6 ms–2.87 s | 2,000 of 20,006: 338 ms + 16.0 s (8.01 ms); 2,000 of 18,006: 305 ms + 14.5 s (7.25 ms) |
-| x86-64 | 100,000 × 64 KiB | 19.4 s (339 MB/s) | 217–222 µs | 335–336 ms / 342–352 ms | 21.1–21.6 s / 414–417 ms | – |
-| aarch64 | 10 × 1 MiB | 25.2 ms (416 MB/s) | 433–494 µs | 375–485 µs / 506–557 µs | 2.03–2.56 ms / 405–431 µs | 1 of 16: 221 µs + 231 µs (231 µs); 1 of 15: 205 µs + 158 µs (158 µs) |
-| aarch64 | 1,000 × 1 MiB | 2.99 s (350 MB/s) | 431–493 µs | 2.83–2.86 ms / 3.22–3.36 ms | 94.4–95.2 ms / 4.16–4.90 ms | 100 of 1,006: 10.3 ms + 44.1 ms (441 µs); 100 of 906: 9.85 ms + 40.1 ms (401 µs) |
-| aarch64 | 10,000 × 1 MiB | 30.1 s (349 MB/s) | 430–447 µs | 31.4–31.6 ms / 37.0–37.1 ms | 960 ms–1.42 s / 39.3–43.9 ms | 1,000 of 5,000: 87.7 ms + 1.79 s (1.79 ms); 1,000 of 4,000: 84.1 ms + 1.39 s (1.39 ms) |
-| aarch64 | 20,000 × 1 MiB | 60.4 s (347 MB/s) | 39.7–430 µs | 62.9–66.9 ms / 72.0 ms–1.93 s | 1.88–2.20 s / 81.4 ms–1.84 s | 2,000 of 20,006: 210 ms + 14.9 s (7.44 ms); 2,000 of 18,006: 207 ms + 13.3 s (6.66 ms) |
-| aarch64 | 100,000 × 64 KiB | 21.1 s (310 MB/s) | 40.9–41.7 µs | 359–363 ms / 365–367 ms | 9.21–10.2 s / 432–437 ms | – |
+| x86-64 (`85726e3`) | 10 × 1 MiB | 25.1 ms (417 MB/s) | 297–299 µs | 305–393 µs / 957 µs–2.15 ms | 3.10–3.56 ms / 439–444 µs | 1 of 16: 257 µs + 573 µs (573 µs); 1 of 15: 371 µs + 644 µs (644 µs) |
+| x86-64 (`85726e3`) | 1,000 × 1 MiB | 2.57 s (408 MB/s) | 298–347 µs | 2.79–2.80 ms / 3.45–4.11 ms | 191–204 ms / 3.66–4.41 ms | 100 of 1,006: 16.8 ms + 67.3 ms (673 µs); 100 of 906: 16.7 ms + 63.9 ms (639 µs) |
+| x86-64 (`85726e3`) | 10,000 × 1 MiB | 25.7 s (408 MB/s) | 281–282 µs | 29.1–30.3 ms / 35.6 ms | 2.10–2.20 s / 38.0–42.4 ms | 1,000 of 5,000: 139 ms + 2.12 s (2.12 ms); 1,000 of 4,000: 146 ms + 1.72 s (1.72 ms) |
+| x86-64 (`85726e3`) | 20,000 × 1 MiB | 51.6 s (406 MB/s) | 289–290 µs | 66.7–67.6 ms / 69.8–70.9 ms | 3.90–4.07 s / 83.6 ms–2.87 s | 2,000 of 20,006: 338 ms + 16.0 s (8.01 ms); 2,000 of 18,006: 305 ms + 14.5 s (7.25 ms) |
+| x86-64 (`85726e3`) | 100,000 × 64 KiB | 19.4 s (339 MB/s) | 217–222 µs | 335–336 ms / 342–352 ms | 21.1–21.6 s / 414–417 ms | – |
+| aarch64 (`d2074c1`) | 10 × 1 MiB | 25.2 ms (416 MB/s) | 433–494 µs | 375–485 µs / 506–557 µs | 2.03–2.56 ms / 405–431 µs | 1 of 16: 221 µs + 231 µs (231 µs); 1 of 15: 205 µs + 158 µs (158 µs) |
+| aarch64 (`d2074c1`) | 1,000 × 1 MiB | 2.99 s (350 MB/s) | 431–493 µs | 2.83–2.86 ms / 3.22–3.36 ms | 94.4–95.2 ms / 4.16–4.90 ms | 100 of 1,006: 10.3 ms + 44.1 ms (441 µs); 100 of 906: 9.85 ms + 40.1 ms (401 µs) |
+| aarch64 (`d2074c1`) | 10,000 × 1 MiB | 30.1 s (349 MB/s) | 430–447 µs | 31.4–31.6 ms / 37.0–37.1 ms | 960 ms–1.42 s / 39.3–43.9 ms | 1,000 of 5,000: 87.7 ms + 1.79 s (1.79 ms); 1,000 of 4,000: 84.1 ms + 1.39 s (1.39 ms) |
+| aarch64 (`d2074c1`) | 20,000 × 1 MiB | 60.4 s (347 MB/s) | 39.7–430 µs | 62.9–66.9 ms / 72.0 ms–1.93 s | 1.88–2.20 s / 81.4 ms–1.84 s | 2,000 of 20,006: 210 ms + 14.9 s (7.44 ms); 2,000 of 18,006: 207 ms + 13.3 s (6.66 ms) |
+| aarch64 (`d2074c1`) | 100,000 × 64 KiB | 21.1 s (310 MB/s) | 40.9–41.7 µs | 359–363 ms / 365–367 ms | 9.21–10.2 s / 432–437 ms | – |
 
 ### Readers: opening, seeking, replay
 
 Both readers. `16 forward seeks` is a seek through a full segment in 16 equal steps (after a seek to its first record),
 the total of the 16 seeks, each with the record after it.
 
-x86-64:
+x86-64 (`85726e3`):
 
 | Journal | Cache | Reader | open | seek first | seek middle | seek across a full segment | seek last | 16 forward seeks | `seek_to_end` | replay | replay rate (M records/s) |
 |---|---|---|---|---|---|---|---|---|---|---|---|
@@ -504,7 +509,7 @@ x86-64:
 | 512 × 128 MiB | warm | safe | 213–214 µs | 213–219 µs | 5.51–45.1 ms | 24.7–140 ms | 12.2–90.4 ms | 27.5–28.1 ms | 177–185 µs | 83.5–93.2 s | 0.69–0.77 |
 | 512 × 128 MiB | warm | zero-copy | 213–216 µs | 196–257 µs | 3.89–4.00 ms | 16.1–16.2 ms | 8.09–8.29 ms | 18.6–18.9 ms | 180–185 µs | 93.1 s | 0.69 |
 
-aarch64:
+aarch64 (`d2074c1`):
 
 | Journal | Cache | Reader | open | seek first | seek middle | seek across a full segment | seek last | 16 forward seeks | `seek_to_end` | replay | replay rate (M records/s) |
 |---|---|---|---|---|---|---|---|---|---|---|---|
@@ -550,14 +555,14 @@ storage both are limited by the SSD (0.69 million records/s, 707 MB/s of payload
 with 128 MiB segments; 0.5 to 0.55 million with 1 MiB segments on x86-64) and equal. The 128 MiB journal's zero-copy
 reader maps one segment at a time (peak RSS about one segment).
 
-Compared with the 1.0.0 core, on the same warm journals, median of 5 runs (range); `main`, then the 1.0.0 core, then
-`main` again, to show drift. Only the forward seeks (ADR 0046) and the retention plan changed: with segments of 16 MiB
-and more the plan of ten segments takes about half the time, since reading the marker now reads its two 64-byte slots
-instead of the whole file (128 KiB).
+Compared with the 1.0.0 core, on the same warm journals, median of 5 runs (range): the core of this section (`85726e3`
+on x86-64, `d2074c1` on aarch64), then the 1.0.0 core, then the first again, to show drift. Only the forward seeks (ADR
+0046) and the retention plan changed: with segments of 16 MiB and more the plan of ten segments takes about half the
+time, since reading the marker now reads its two 64-byte slots instead of the whole file (128 KiB).
 
-x86-64:
+x86-64 (`85726e3`):
 
-| Journal (warm) | Reader | Operation | main | 1.0.0 core | main again |
+| Journal (warm) | Reader | Operation | 85726e3 | 1.0.0 core | 85726e3 again |
 |---|---|---|---|---|---|
 | 1,000 × 1 MiB | safe | seek across a full segment | 494 µs (482–516 µs) | 512 µs (482–535 µs) | 476 µs (467–493 µs) |
 | 1,000 × 1 MiB | safe | 16 forward seeks | 4.56 ms (4.52–4.61 ms) | 5.41 ms (5.37–5.44 ms) | 4.58 ms (4.52–4.60 ms) |
@@ -595,9 +600,9 @@ x86-64:
 | 10 × 1 GiB | zero-copy | replay | 1.31 s (1.31–1.32 s) | 1.31 s (1.31–1.32 s) | 1.31 s (1.30–1.31 s) |
 | 10 × 1 GiB | – | retention plan | 82.2 µs (79.6–119 µs) | 183 µs (176–205 µs) | 78.9 µs (78.1–81.5 µs) |
 
-aarch64:
+aarch64 (`d2074c1`):
 
-| Journal (warm) | Reader | Operation | main | 1.0.0 core | main again |
+| Journal (warm) | Reader | Operation | d2074c1 | 1.0.0 core | d2074c1 again |
 |---|---|---|---|---|---|
 | 1,000 × 1 MiB | safe | seek across a full segment | 467 µs (444–496 µs) | 454 µs (444–461 µs) | 448 µs (440–466 µs) |
 | 1,000 × 1 MiB | safe | 16 forward seeks | 4.35 ms (4.33–4.41 ms) | 5.25 ms (5.20–5.35 ms) | 4.37 ms (4.33–4.41 ms) |
@@ -639,16 +644,16 @@ aarch64:
 
 | Machine | Journal | Indexes built | Size of the index files | Build all, cold | warm | Refresh (nothing to do), cold | warm | Check, warm |
 |---|---|---|---|---|---|---|---|---|
-| x86-64 | 10,000 × 1 MiB | 10,000 | 4.88 MB | 14.3–14.4 s | 3.11–3.15 s | 5.68–5.69 s | 88.1–90.4 ms | 2.52–2.53 s |
-| x86-64 | 20,000 × 1 MiB | 20,000 | 9.76 MB | 28.6–28.8 s | 25.5–25.6 s | 11.6–12.1 s | 181 ms–2.01 s | 25.4–25.5 s |
-| x86-64 | 160 × 128 MiB | 159 | 7.83 MB | 28.9–29.0 s | 25.5 s | 109–120 ms | 3.56–21.6 ms | 25.5 s |
-| x86-64 | 10 × 1 GiB | 9 | 3.54 MB | 13.1 s | 1.93 s | 11.9–12.8 ms | 1.47–1.53 ms | 1.94 s |
-| aarch64 | 10,000 × 1 MiB | 10,000 | 4.88 MB | 15.4–15.5 s | 2.32–2.35 s | 3.07–3.19 s | 94.2–94.9 ms | 1.69–1.71 s |
-| aarch64 | 20,000 × 1 MiB | 20,000 | 9.76 MB | 30.9–31.1 s | 27.2–27.3 s | 6.14–6.38 s | 177 ms–1.15 s | 26.8–26.9 s |
-| aarch64 | 160 × 128 MiB | 159 | 7.83 MB | 31.3 s | 27.1–27.2 s | 62.2–63.4 ms | 3.56–13.9 ms | 27.2 s |
-| aarch64 | 10 × 1 GiB | 9 | 3.54 MB | 14.2 s | 1.37–1.38 s | 7.68–7.82 ms | 1.09–1.10 ms | 1.38–1.40 s |
+| x86-64 (`d2074c1`) | 10,000 × 1 MiB | 10,000 | 4.88 MB | 14.3–14.4 s | 3.11–3.15 s | 5.68–5.69 s | 88.1–90.4 ms | 2.52–2.53 s |
+| x86-64 (`d2074c1`) | 20,000 × 1 MiB | 20,000 | 9.76 MB | 28.6–28.8 s | 25.5–25.6 s | 11.6–12.1 s | 181 ms–2.01 s | 25.4–25.5 s |
+| x86-64 (`d2074c1`) | 160 × 128 MiB | 159 | 7.83 MB | 28.9–29.0 s | 25.5 s | 109–120 ms | 3.56–21.6 ms | 25.5 s |
+| x86-64 (`d2074c1`) | 10 × 1 GiB | 9 | 3.54 MB | 13.1 s | 1.93 s | 11.9–12.8 ms | 1.47–1.53 ms | 1.94 s |
+| aarch64 (`d2074c1`) | 10,000 × 1 MiB | 10,000 | 4.88 MB | 15.4–15.5 s | 2.32–2.35 s | 3.07–3.19 s | 94.2–94.9 ms | 1.69–1.71 s |
+| aarch64 (`d2074c1`) | 20,000 × 1 MiB | 20,000 | 9.76 MB | 30.9–31.1 s | 27.2–27.3 s | 6.14–6.38 s | 177 ms–1.15 s | 26.8–26.9 s |
+| aarch64 (`d2074c1`) | 160 × 128 MiB | 159 | 7.83 MB | 31.3 s | 27.1–27.2 s | 62.2–63.4 ms | 3.56–13.9 ms | 27.2 s |
+| aarch64 (`d2074c1`) | 10 × 1 GiB | 9 | 3.54 MB | 14.2 s | 1.37–1.38 s | 7.68–7.82 ms | 1.09–1.10 ms | 1.38–1.40 s |
 
-x86-64, median of 5 (range):
+x86-64 (`d2074c1`), median of 5 (range):
 
 | Journal | Cache | Reader | Index | seek across a full segment | seek to the last sealed record | 16 forward seeks | seek last (newest segment) | read from storage, full segment |
 |---|---|---|---|---|---|---|---|---|
@@ -685,7 +690,7 @@ x86-64, median of 5 (range):
 | 10 × 1 GiB | warm | zero-copy | off | 128 ms (128–136 ms) | 129 ms (129–130 ms) | 129 ms (129 ms) | 63.9 ms (63.9–64.8 ms) | – |
 | 10 × 1 GiB | warm | zero-copy | on | 305 µs (303–387 µs) * | 318 µs (307–369 µs) * | 2.16 ms (2.12–2.19 ms) * | 64.8 ms (64.5–65.2 ms) | – |
 
-aarch64, median of 5 (range):
+aarch64 (`d2074c1`), median of 5 (range):
 
 | Journal | Cache | Reader | Index | seek across a full segment | seek to the last sealed record | 16 forward seeks | seek last (newest segment) | read from storage, full segment |
 |---|---|---|---|---|---|---|---|---|
@@ -722,19 +727,22 @@ aarch64, median of 5 (range):
 | 10 × 1 GiB | warm | zero-copy | off | 93.2 ms (92.3–94.1 ms) | 92.4 ms (91.9–92.8 ms) | 92.7 ms (92.3–93.2 ms) | 46.4 ms (45.8–46.5 ms) | – |
 | 10 × 1 GiB | warm | zero-copy | on | 267 µs (240–285 µs) * | 289 µs (247–314 µs) * | 1.93 ms (1.91–1.97 ms) * | 46.4 ms (46.2–46.7 ms) | – |
 
-\* All five runs used the index (`seek_used_index`). At 1 MiB the index makes no difference (the directory listing is
-the cost, and the index lowers the read from 1.1 MiB to about 0.5 MiB, not the time); at 128 MiB a seek across a full
-segment falls from 182 to 1.3 ms cold and at 1 GiB from 1.46 s to about 2 ms (x86-64), and forward seeks through a
-segment from 181 ms to 9 ms. A seek to the last record of the journal lands in the newest segment, which has no index,
-and does not change. The index files take 488 B for a segment of 1 MiB and 49 KB for one of 128 MiB (0.04 to 0.05 %).
-`tickertape index` built every index anew in about the time of `verify`, which also reads every segment (cold, 14.3 s
-for 10,000 segments; warm, 3.1 s against 2.2 s); a run with nothing left to do (`index-refresh`) cost 0.09 to 0.18 s
-when cached, but 6 to 12 s cold with 10,000 and 20,000 segments (x86-64; 3 to 6 s on aarch64), since it opens every
-segment and index. With index files, a writer open took 13.6 ms instead of 7.5 ms at 10,000 segments and 26.2 ms
-instead of 14.6 ms at 20,000 (x86-64; aarch64 12.8 for 7.0 and 25.0 for 13.5), since it lists `seek-index/`; with 160
-segments or fewer there was no difference. Checkpoints with retention did not change (27 ms and 61 ms on x86-64).
-Deleting 2,000 of 20,001 segments with their indexes took 15.5 and 13.9 s (x86-64; 16.0 and 14.5 s without), and 1,000
-of 10,001 took 4.0 and 3.6 s.
+\* All five runs used the index (`seek_used_index`). At 1 MiB the index gains nothing (the directory listing is the
+cost, and the index lowers the read from 1.1 MiB to about 0.5 MiB, not the time), and the cold zero-copy reader on
+aarch64 is slower with it across a full segment (3.70 to 3.95 ms at 10,000 segments, 6.32 to 6.66 ms at 20,000, ranges
+apart); at 128 MiB a seek across a full segment falls from 182 to 1.3 ms cold and at 1 GiB from 1.46 s to about 2 ms
+(x86-64), and forward seeks through a segment from 181 ms to 9 ms. A seek to the last record of the journal lands in
+the newest segment, which has no index, and does not change. The index files take 488 B for a segment of 1 MiB and 49
+KB for one of 128 MiB (0.04 to 0.05 %). `tickertape index` built every index anew in about the time of `verify`, which
+also reads every segment (cold, 14.3 s for 10,000 segments; warm, 3.1 s against 2.2 s); a run with nothing left to do
+(`index-refresh`) cost 0.09 to 0.18 s when cached, but 6 to 12 s cold with 10,000 and 20,000 segments (x86-64; 3 to 6 s
+on aarch64), since it opens every segment and index. With index files, a writer open took 13.6 ms instead of 7.5 ms at
+10,000 segments and 26.2 ms instead of 14.6 ms at 20,000 (x86-64; aarch64 12.8 for 7.0 and 25.0 for 13.5), since it
+lists `seek-index/`; with 160 segments or fewer there was no difference. Checkpoints with retention: 27.2 ms without
+and 26.9 ms with index files at 10,000 segments and 61.3 ms both at 20,000 on x86-64; 30.0 and 35.6 ms, and 69.9 and
+69.3 ms, on aarch64. Deleting 2,000 of 20,001 segments with their indexes took 15.5 and 13.9 s on x86-64 (`d2074c1`;
+16.0 and 14.5 s without indexes at `85726e3`, another core) and 13.9 and 12.4 s on aarch64 (14.9 and 13.3 s without,
+the same core); 1,000 of 10,001 took 4.0 and 3.6 s (x86-64), with no run without indexes at that count.
 
 **`tickertape index` on the journals below (missing and corrupt segments)**, 10,000 segments, warm, at `01c6495`: in
 every case but two it built an index for every sealed segment it could (2.8 to 5.3 s) and `index --check` found them
@@ -749,44 +757,44 @@ with `seek_index(true)` had the same outcome as without (for the five seeks of e
 `tt-scale archive` moved the oldest half of a journal of 10,000 segments of 1 MiB (both machines), and on x86-64 the
 oldest 256 of the 1,554 segments of 128 MiB of the journal larger than memory (its size after the catch-up runs). The
 move validates every byte of what it moves. The second journal was not measured on aarch64: the session there was
-stopped by hand during that step, 35 minutes before its end. The "archive then journal" columns read the whole history
-in two parts, checking every sequence number; the safe reader ran first, and the zero-copy one after it found the
-smaller journal in the page cache.
+stopped by hand during that step, 11 minutes into the step (20:03:39 to 20:14:39). The "archive then journal" columns
+read the whole history in two parts, checking every sequence number; the safe reader ran first, and the zero-copy one
+after it found the smaller journal in the page cache.
 
 | Machine | Journal | Moved | plan (cold) | move (cold) | per segment | Peak RSS | archive then journal, safe | zero-copy |
 |---|---|---|---|---|---|---|---|---|
-| x86-64 | 1 MiB segments | 5,006 of 10,006 (4.9 GiB) | 2.82 s | 20.2 s | 4.04 ms | 6 MiB | 9,855,835 records in 8.09 s | 9,855,835 records in 1.53 s |
-| x86-64 | 128 MiB segments | 256 of 1,554 (32.0 GiB) | 345 ms | 46.6 s | 182 ms | 5 MiB | 196,000,450 records in 279 s | 196,000,450 records in 281 s |
-| aarch64 | 1 MiB segments | 5,006 of 10,006 (4.9 GiB) | 1.30 s | 17.6 s | 3.51 ms | 6 MiB | 9,855,835 records in 8.42 s | 9,855,835 records in 1.16 s |
+| x86-64 (`85726e3`) | 1 MiB segments | 5,006 of 10,006 (4.9 GiB) | 2.82 s | 20.2 s | 4.04 ms | 6 MiB | 9,855,835 records in 8.09 s | 9,855,835 records in 1.53 s |
+| x86-64 (`85726e3`) | 128 MiB segments | 256 of 1,554 (32.0 GiB) | 345 ms | 46.6 s | 182 ms | 5 MiB | 196,000,450 records in 279 s | 196,000,450 records in 281 s |
+| aarch64 (`d2074c1`) | 1 MiB segments | 5,006 of 10,006 (4.9 GiB) | 1.30 s | 17.6 s | 3.51 ms | 6 MiB | 9,855,835 records in 8.42 s | 9,855,835 records in 1.16 s |
 
 Reading the archive directory up to its last record (`measure --end`), the reader operations and the checks:
 
 | Machine | Archive | Cache | Reader | open | seek first | seek middle | seek across a full segment | seek last | 16 forward seeks | replay | replay rate (M records/s) |
 |---|---|---|---|---|---|---|---|---|---|---|---|
-| x86-64 | 1 MiB segments | cold | safe | 9.52–10.3 ms | 1.83–1.85 ms | 2.46–2.54 ms | 3.65–3.84 ms | 3.61–3.62 ms | 25.1–25.2 ms | 9.45–9.56 s | 0.52 |
-| x86-64 | 1 MiB segments | cold | zero-copy | 9.39–11.1 ms | 1.53–1.56 ms | 2.08 ms | 3.67–3.71 ms | 3.62–3.65 ms | 25.4–25.7 ms | 9.29–9.66 s | 0.51–0.53 |
-| x86-64 | 1 MiB segments | warm | safe | 1.52–1.54 ms | 1.56–1.59 ms | 1.51–1.52 ms | 1.70–1.75 ms | 1.70–1.74 ms | 23.9 ms | 1.08–1.09 s | 4.54–4.58 |
-| x86-64 | 1 MiB segments | warm | zero-copy | 1.54 ms | 1.49–1.55 ms | 1.49–1.50 ms | 1.63–1.64 ms | 1.63–1.64 ms | 23.9–24.2 ms | 800–816 ms | 6.04–6.16 |
-| x86-64 | 128 MiB segments | cold | safe | 1.76–1.94 ms | 374–401 µs | 796–823 µs | 181 ms | 181–182 ms | 331–339 ms | 46.6 s | 0.69 |
-| x86-64 | 128 MiB segments | cold | zero-copy | 1.89–1.95 ms | 129–160 µs | 355–361 µs | 181 ms | 182 ms | 284–285 ms | 46.6 s | 0.69 |
-| x86-64 | 128 MiB segments | warm | safe | 126 µs | 139–144 µs | 135–424 µs | 25.0–180 ms | 25.2–25.4 ms | 189–199 ms | 35.4–46.3 s | 0.70–0.91 |
-| x86-64 | 128 MiB segments | warm | zero-copy | 131–133 µs | 122–126 µs | 122–129 µs | 16.1–16.3 ms | 16.2–16.4 ms | 134 ms | 46.6 s | 0.69 |
-| aarch64 | 1 MiB segments | cold | safe | 4.28–4.37 ms | 1.52–1.53 ms | 1.74–1.83 ms | 2.23–2.29 ms | 2.23–2.26 ms | 22.8 ms | 7.70 s | 0.64 |
-| aarch64 | 1 MiB segments | cold | zero-copy | 4.49–5.17 ms | 1.40–1.41 ms | 1.58–1.59 ms | 2.18–2.23 ms | 2.22–2.24 ms | 22.8 ms | 7.70 s | 0.64 |
-| aarch64 | 1 MiB segments | warm | safe | 1.41 ms | 1.41–1.44 ms | 1.41 ms | 1.52–1.56 ms | 1.54–1.56 ms | 22.3–22.4 ms | 795–836 ms | 5.90–6.21 |
-| aarch64 | 1 MiB segments | warm | zero-copy | 1.43 ms | 1.40–1.42 ms | 1.41 ms | 1.49–1.50 ms | 1.51–1.52 ms | 22.1 ms | 574–585 ms | 8.42–8.59 |
+| x86-64 (`85726e3`) | 1 MiB segments | cold | safe | 9.52–10.3 ms | 1.83–1.85 ms | 2.46–2.54 ms | 3.65–3.84 ms | 3.61–3.62 ms | 25.1–25.2 ms | 9.45–9.56 s | 0.52 |
+| x86-64 (`85726e3`) | 1 MiB segments | cold | zero-copy | 9.39–11.1 ms | 1.53–1.56 ms | 2.08 ms | 3.67–3.71 ms | 3.62–3.65 ms | 25.4–25.7 ms | 9.29–9.66 s | 0.51–0.53 |
+| x86-64 (`85726e3`) | 1 MiB segments | warm | safe | 1.52–1.54 ms | 1.56–1.59 ms | 1.51–1.52 ms | 1.70–1.75 ms | 1.70–1.74 ms | 23.9 ms | 1.08–1.09 s | 4.54–4.58 |
+| x86-64 (`85726e3`) | 1 MiB segments | warm | zero-copy | 1.54 ms | 1.49–1.55 ms | 1.49–1.50 ms | 1.63–1.64 ms | 1.63–1.64 ms | 23.9–24.2 ms | 800–816 ms | 6.04–6.16 |
+| x86-64 (`85726e3`) | 128 MiB segments | cold | safe | 1.76–1.94 ms | 374–401 µs | 796–823 µs | 181 ms | 181–182 ms | 331–339 ms | 46.6 s | 0.69 |
+| x86-64 (`85726e3`) | 128 MiB segments | cold | zero-copy | 1.89–1.95 ms | 129–160 µs | 355–361 µs | 181 ms | 182 ms | 284–285 ms | 46.6 s | 0.69 |
+| x86-64 (`85726e3`) | 128 MiB segments | warm | safe | 126 µs | 139–144 µs | 135–424 µs | 25.0–180 ms | 25.2–25.4 ms | 189–199 ms | 35.4–46.3 s | 0.70–0.91 |
+| x86-64 (`85726e3`) | 128 MiB segments | warm | zero-copy | 131–133 µs | 122–126 µs | 122–129 µs | 16.1–16.3 ms | 16.2–16.4 ms | 134 ms | 46.6 s | 0.69 |
+| aarch64 (`d2074c1`) | 1 MiB segments | cold | safe | 4.28–4.37 ms | 1.52–1.53 ms | 1.74–1.83 ms | 2.23–2.29 ms | 2.23–2.26 ms | 22.8 ms | 7.70 s | 0.64 |
+| aarch64 (`d2074c1`) | 1 MiB segments | cold | zero-copy | 4.49–5.17 ms | 1.40–1.41 ms | 1.58–1.59 ms | 2.18–2.23 ms | 2.22–2.24 ms | 22.8 ms | 7.70 s | 0.64 |
+| aarch64 (`d2074c1`) | 1 MiB segments | warm | safe | 1.41 ms | 1.41–1.44 ms | 1.41 ms | 1.52–1.56 ms | 1.54–1.56 ms | 22.3–22.4 ms | 795–836 ms | 5.90–6.21 |
+| aarch64 (`d2074c1`) | 1 MiB segments | warm | zero-copy | 1.43 ms | 1.40–1.42 ms | 1.41 ms | 1.49–1.50 ms | 1.51–1.52 ms | 22.1 ms | 574–585 ms | 8.42–8.59 |
 
-`tickertape` on the archive directory, one run each, bounded by `--to` except for `verify`, which exits with 2 because of
-the one problem:
+`tickertape` on the archive directory, one run each, bounded by `--to` except for `verify`, which exits with 2 because
+of the one problem:
 
 | Machine | Archive | Cache | `list_segments` | `verify` (library) | `tickertape verify` | `tickertape stats --to` | `tickertape export --format jsonl --to` | Peak RSS |
 |---|---|---|---|---|---|---|---|---|
-| x86-64 | 1 MiB segments | cold | 1.07–1.13 s | 7.13 s | 7.14 s | 10.6 s | 21.2 s | 6 MiB |
-| x86-64 | 1 MiB segments | warm | 15.5–16.1 ms | 1.10 s | 1.10 s | 2.38 s | 13.2 s | 7 MiB |
-| x86-64 | 128 MiB segments | cold | 53.6–53.7 ms | 46.6 s | 46.6 s | 56.9 s | 127 s | 5 MiB |
-| x86-64 | 128 MiB segments | warm | 695–765 µs | 31.8 s | 31.8 s | 42.7 s | 113 s | 5 MiB |
-| aarch64 | 1 MiB segments | cold | 467–472 ms | 7.70 s | 7.71 s | 8.79 s | 18.4 s | 6 MiB |
-| aarch64 | 1 MiB segments | warm | 13.3–14.1 ms | 770–786 ms | 791 ms | 1.99 s | 11.9 s | 6 MiB |
+| x86-64 (`85726e3`) | 1 MiB segments | cold | 1.07–1.13 s | 7.13 s | 7.14 s | 10.6 s | 21.2 s | 6 MiB |
+| x86-64 (`85726e3`) | 1 MiB segments | warm | 15.5–16.1 ms | 1.10 s | 1.10 s | 2.38 s | 13.2 s | 7 MiB |
+| x86-64 (`85726e3`) | 128 MiB segments | cold | 53.6–53.7 ms | 46.6 s | 46.6 s | 56.9 s | 127 s | 5 MiB |
+| x86-64 (`85726e3`) | 128 MiB segments | warm | 695–765 µs | 31.8 s | 31.8 s | 42.7 s | 113 s | 5 MiB |
+| aarch64 (`d2074c1`) | 1 MiB segments | cold | 467–472 ms | 7.70 s | 7.71 s | 8.79 s | 18.4 s | 6 MiB |
+| aarch64 (`d2074c1`) | 1 MiB segments | warm | 13.3–14.1 ms | 770–786 ms | 791 ms | 1.99 s | 11.9 s | 6 MiB |
 
 What a reader does at the boundary, the same for both readers in all three runs:
 
@@ -816,7 +824,7 @@ segments of 128 MiB cold on x86-64; in the last only the counts differ). The sam
 64 segments of 1 MiB gave the same outcomes, with nothing lost, on APFS (macOS, aarch64) and on btrfs in the OrbStack
 VM (Linux on macOS); their times are not recorded.
 
-| Damage | replay from the oldest record | seek to first / middle / after the damage / last | `seek_to_end` | `verify` problems | `status` | `Writer::open`, `Quarantine` | `Writer::open`, `Fail` | Records in quarantine / in neither (`Quarantine`) |
+| Damage | replay from the oldest record | seek to first / middle / after the damage / last | `seek_to_end` | `verify` problems | `status` | `Writer::open`, `Quarantine` | `Writer::open`, `Fail` | Records in quarantine / newly in neither after the open (`Quarantine`) |
 |---|---|---|---|---|---|---|---|---|
 | nothing (marker in the newest segment) | 9,849,507, then end | ok / ok / ok / ok | ok | 0 | no breach | opens | opens | 0 / 0 |
 | oldest segment missing | 9,848,522, then end | SeqUnavailable / ok / ok / ok | ok | 0 | no breach | opens | opens | 0 / 0 |
@@ -841,28 +849,38 @@ VM (Linux on macOS); their times are not recorded.
 | marker two back, header of the newest | 9,849,015, then `Corrupt` | ok / ok / Corrupt / Corrupt | `Corrupt` | 1 | error: `Corrupt` | opens at 9,849,015, CompletedRoll, QuarantinedSegment | refused: `Corrupt` | 492 / 0 |
 
 In every case, for both policies, every record that was in a segment before the writer opened was afterwards byte for
-byte in a segment or in `quarantine/` ("in neither" is 0 in all 21 × 2 × 5 cells, also after the writer had appended a
-record and checkpointed). **In these cases nothing committed was silently discarded.** What the table also shows:
+byte in a segment or in `quarantine/` ("newly in neither" is 0 in all 21 × 2 × 5 cells, also after the writer had
+appended a record and checkpointed). Records the damage itself removed (a missing segment, a damaged record) are not
+counted. "In a segment" does not mean readable: records behind damage are counted too. A quarantined record is out of
+the journal and its sequence number is used again. **In these 21 cases recovery discarded nothing that was still in a
+segment when the writer opened.** Damage that recovery cannot tell from a torn append (C11 (3)) is not among them: it
+is zeroed without a copy under either policy. Run by hand on a small journal on macOS (2026-11-26): with the newest
+record's commit word zeroed, after the marker, an open under `Fail`, and with the newest two under `Quarantine`,
+reported `ZeroedUncommitted`, created no `quarantine/` and used the sequence numbers again; `verify` before the open
+had reported no problem. What the table also shows:
 
 - **Damage that the open does not look at is not reported.** With the marker past it, damage in an older segment (or a
-  missing one) does not stop `Writer::open` under either policy, `seek_to_end` or `status` ("no breach"), as documented
-  (`operations.md` → Monitoring); `verify` reports every case except a missing oldest segment, which looks like
-  retention. Readers stop at the damage, and a reader can pass it with a seek to a record in a later segment.
+  missing one) does not stop `Writer::open` under either policy, `seek_to_end` (the header of the oldest segment is the
+  exception, below) or `status` ("no breach"), as documented (`operations.md` → Monitoring); `verify` reports every
+  case except a missing oldest segment, which looks like retention, and a removed marker. Readers stop at the damage,
+  and a reader can pass it with a seek to a record in a later segment.
 - **A zeroed commit word in an older segment makes a reader stop without an error** (`Ok(None)`, the sign of the end of
-  the journal), here at half of the journal, while the writer continues beyond it; `verify` finds it
-  (`crash-contract.md` → Known risks and limits).
+  the journal), here at half of the journal, while the writer continues beyond it; `verify` finds it. No document says
+  this yet: C11 and `try_next` describe an empty slot only as "no new record yet". It is a defect, issue #79.
 - **A damaged header of the oldest segment** makes `Reader::open` fail, and with it every seek and `seek_to_end` of a
-  new reader, although no other segment is damaged. The writer opens.
+  new reader, although no other segment is damaged. The writer opens. By the code (not run), retention cannot remove
+  that segment either: `retention::plan` reads every header and fails.
 - **A missing newest segment after the marker** is not refused by either policy: the writer creates it again, empty
   (reported as `CompletedRoll`, the same report as after a crash during a roll), and gives the 492 records it held
   (never covered by a checkpoint, but readable until then) their sequence numbers again. With the marker in that
-  segment the open is refused.
+  segment the open is refused. By design: `format.md` (Recovery, step 4), C8 and C11 allow a missing successor to be
+  created, and no record the marker covers is dropped.
 - **No marker and one damaged record in the middle:** `Quarantine` keeps the records before it in the journal and moves
   every later segment into `quarantine/` (4,999 segments; 3.0 s warm, 11.3 s cold), because without a marker the chain
   ends there. `Fail` refuses. With the marker past the damage the open does not touch it.
 
-Times on x86-64, 10,000 segments warm / 10,000 segments cold / 64 segments of 128 MiB cold, for one run each. Where
-damage cut the replay short, it stopped there; a `Corrupt` result waits 50 ms before it is returned (the reader reads
+Times on x86-64 (`85726e3`), 10,000 segments warm / 10,000 segments cold / 64 segments of 128 MiB cold, for one run
+each. Where damage cut the replay short, it stopped there; a `Corrupt` result waits 50 ms before it is returned (the reader reads
 the record again), which shows in seeks of a few milliseconds. The warm replays of the first row are not from a warm
 cache: the journals of both groups together are larger than memory. In the 10,000-segment cold runs the directory had
 just been written, so the cold writer opens are faster than in the table above.
@@ -903,22 +921,22 @@ late schedule counts, no skipped sends), in µs or ms; "caught up" is the first 
 
 | Machine | Backlog | Reader | Wait | Time to catch up | Records read | Rate while catching up | Read from storage | Reader CPU | Append p99 / p99.9 / max: before | while catching up | after (live) | Visible latency live, p50 / p99 / p99.9 / max |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
-| x86-64 | 32 M records (31.7 GiB), cold | safe | spin | 67.4–67.6 s | 41.2 M | 625–626 MB/s | 31.8 GiB | 14.5 s | 2.55–4.05 µs / 25.7–28.9 µs / 480–961 µs | 2.94–5.08 µs / 36.7–46.3 µs / 1.94–2.56 ms | 3.27–5.32 µs / 31.0–31.2 µs / 621 µs–2.06 ms | 3.44–3.45 µs / 6.72–8.46 µs / 35.5–36.2 µs / 653 µs–2.06 ms |
-| x86-64 | 32 M records (31.7 GiB), cold | safe | block | 67.4 s | 41.2 M | 626–627 MB/s | 31.8 GiB | 14.5 s | 1.81–2.39 µs / 28.5–30.1 µs / 1.56–2.17 ms | 2.14–2.27 µs / 34.8–39.8 µs / 1.65–2.49 ms | 5.78–7.93 µs / 29.2–31.9 µs / 1.07–1.99 ms | 8.18–8.20 µs / 14.8–14.9 µs / 38.7–96.4 µs / 1.10–3.05 ms |
-| x86-64 | 32 M records (31.7 GiB), cold | zero-copy | spin | 78.9 s | 42.4 M | 550 MB/s | 38.0 GiB | 14.5 s | 3.21–5.11 µs / 24.7–27.0 µs / 593–657 µs | 4.33–6.17 µs / 34.3–39.8 µs / 2.33–2.53 ms | 4.37–6.73 µs / 27.1–27.5 µs / 636 µs–1.52 ms | 0.91–0.92 µs / 4.88–7.28 µs / 119–283 µs / 2.83–5.37 ms |
-| x86-64 | 32 M records (31.7 GiB), cold | zero-copy | block | 79.0 s | 42.4 M | 550 MB/s | 38.1 GiB | 14.4 s | 2.06–2.23 µs / 26.6–28.8 µs / 588 µs–1.94 ms | 2.08–2.46 µs / 36.2–61.0 µs / 2.56–2.70 ms | 6.00–6.08 µs / 29.5–31.5 µs / 772 µs–1.69 ms | 5.33–5.42 µs / 11.5 µs / 474–605 µs / 6.08–6.25 ms |
-| x86-64 | 2 M records (2.0 GiB), in the page cache | safe | spin | 1.01–1.03 s | 4.6 M | 4,596–4,669 MB/s | 0.0 GiB | 1.0 s | 1.85–5.05 µs / 24.8–29.7 µs / 476–582 µs | 1.96–6.22 µs / 28.9–34.7 µs / 410–463 µs | 2.93–6.34 µs / 29.3–31.6 µs / 680–760 µs | 3.44–3.45 µs / 6.76–10.1 µs / 34.0–36.3 µs / 716–770 µs |
-| x86-64 | 2 M records (2.0 GiB), in the page cache | safe | block | 1.00–1.02 s | 4.6 M | 4,636–4,706 MB/s | 0.0 GiB | 1.0 s | 4.22–4.85 µs / 26.5–28.5 µs / 757 µs–1.93 ms | 4.51–6.12 µs / 23.7–25.6 µs / 94.3–233 µs | 6.80–7.23 µs / 28.1–29.1 µs / 498–536 µs | 8.21–8.23 µs / 14.2–14.5 µs / 38.4–52.4 µs / 530 µs–3.58 ms |
-| x86-64 | 2 M records (2.0 GiB), in the page cache | zero-copy | spin | 649–664 ms | 4.6 M | 7,043–7,202 MB/s | 0.0 GiB | 0.6 s | 1.88–3.72 µs / 25.8–27.2 µs / 485–700 µs | 2.56–5.03 µs / 38.0–40.8 µs / 450–488 µs | 2.87–5.33 µs / 26.8–26.9 µs / 503–514 µs | 0.91 µs / 3.15–5.80 µs / 64.4–65.8 µs / 1.37 ms |
-| x86-64 | 2 M records (2.0 GiB), in the page cache | zero-copy | block | 659–672 ms | 4.6 M | 6,956–7,091 MB/s | 0.0 GiB | 0.7 s | 2.02–2.85 µs / 26.9–27.4 µs / 586 µs–1.89 ms | 2.74–3.30 µs / 16.8 µs–1.27 ms / 52.2 µs–1.88 ms | 6.26–7.56 µs / 27.6–28.5 µs / 600–667 µs | 5.29–5.35 µs / 10.5–12.1 µs / 179–278 µs / 1.38–3.58 ms |
-| aarch64 | 32 M records (31.7 GiB), cold | safe | spin | 77.4–77.7 s | 42.3 M | 557–559 MB/s | 31.8 GiB | 7.0 s | 2.56–2.67 µs / 17.5–17.6 µs / 289–323 µs | 2.63–2.73 µs / 205–223 µs / 2.10–3.51 ms | 2.79–2.90 µs / 19.8–23.3 µs / 309–315 µs | 2.77–2.79 µs / 5.34–5.95 µs / 22.8–26.5 µs / 337–342 µs |
-| aarch64 | 32 M records (31.7 GiB), cold | safe | block | 77.4–77.5 s | 42.2 M | 558–559 MB/s | 31.8 GiB | 6.8 s | 2.53–3.05 µs / 18.9–19.6 µs / 292–298 µs | 2.55–3.16 µs / 151–231 µs / 3.01–3.53 ms | 4.43–5.33 µs / 19.8–21.6 µs / 299–335 µs | 6.61–6.64 µs / 9.46–10.2 µs / 24.8–26.9 µs / 331–556 µs |
-| aarch64 | 32 M records (31.7 GiB), cold | zero-copy | spin | 93.3–94.6 s | 44.0 M | 476–481 MB/s | 39.4 GiB | 6.1 s | 2.47–2.57 µs / 17.5–20.3 µs / 294–338 µs | 2.53–2.71 µs / 190–285 µs / 3.53–3.99 ms | 2.53–3.01 µs / 18.0–23.2 µs / 303–318 µs | 0.57–0.58 µs / 2.19–3.04 µs / 26.3–33.2 µs / 1.09–1.10 ms |
-| aarch64 | 32 M records (31.7 GiB), cold | zero-copy | block | 77.2 s | 42.2 M | 560 MB/s | 31.9 GiB | 5.6 s | 2.54–2.62 µs / 20.8–24.4 µs / 306–411 µs | 2.52–2.64 µs / 140–294 µs / 3.39–11.6 ms | 4.20–4.24 µs / 26.8–29.6 µs / 303–720 µs | 3.93–4.08 µs / 5.78–7.28 µs / 48.4–91.6 µs / 1.29–1.51 ms |
-| aarch64 | 2 M records (2.0 GiB), in the page cache | safe | spin | 737–882 ms | 4.6 M | 5,328–6,358 MB/s | 0.0 GiB | 0.7 s | 2.46–2.50 µs / 17.5–19.7 µs / 300–319 µs | 2.50–2.52 µs / 18.5–23.5 µs / 216 µs | 2.78–2.80 µs / 19.4–20.9 µs / 318 µs | 2.75–2.76 µs / 5.16–6.72 µs / 22.4–24.2 µs / 354–477 µs |
-| aarch64 | 2 M records (2.0 GiB), in the page cache | safe | block | 721–737 ms | 4.6 M | 6,352–6,496 MB/s | 0.0 GiB | 0.7 s | 2.52–2.64 µs / 17.3–17.7 µs / 311–318 µs | 2.50–2.60 µs / 18.8–24.3 µs / 46.5–296 µs | 4.23–4.25 µs / 19.9–20.6 µs / 303–449 µs | 6.46–6.54 µs / 9.14–9.75 µs / 25.1–35.4 µs / 610 µs–4.02 ms |
-| aarch64 | 2 M records (2.0 GiB), in the page cache | zero-copy | spin | 465–476 ms | 4.5 M | 9,790–10,015 MB/s | 0.0 GiB | 0.5 s | 2.51–2.60 µs / 18.0–23.9 µs / 301–323 µs | 2.46–2.66 µs / 23.0–24.5 µs / 45.4–196 µs | 2.57–2.63 µs / 18.8–20.8 µs / 288–314 µs | 0.57–0.58 µs / 2.21–2.40 µs / 28.5–32.1 µs / 1.06–1.14 ms |
-| aarch64 | 2 M records (2.0 GiB), in the page cache | zero-copy | block | 466–487 ms | 4.5 M | 9,565–9,983 MB/s | 0.0 GiB | 0.5 s | 2.39–2.66 µs / 19.6–20.5 µs / 362–365 µs | 2.49–2.62 µs / 19.7–26.7 µs / 61.1–230 µs | 4.50–5.36 µs / 21.5–28.7 µs / 311–336 µs | 3.93–4.05 µs / 6.52–6.76 µs / 56.2–888 µs / 1.13–4.01 ms |
+| x86-64 (`85726e3`) | 32 M records (31.7 GiB), cold | safe | spin | 67.4–67.6 s | 41.2 M | 625–626 MB/s | 31.8 GiB | 14.5 s | 2.55–4.05 µs / 25.7–28.9 µs / 480–961 µs | 2.94–5.08 µs / 36.7–46.3 µs / 1.94–2.56 ms | 3.27–5.32 µs / 31.0–31.2 µs / 621 µs–2.06 ms | 3.44–3.45 µs / 6.72–8.46 µs / 35.5–36.2 µs / 653 µs–2.06 ms |
+| x86-64 (`85726e3`) | 32 M records (31.7 GiB), cold | safe | block | 67.4 s | 41.2 M | 626–627 MB/s | 31.8 GiB | 14.5 s | 1.81–2.39 µs / 28.5–30.1 µs / 1.56–2.17 ms | 2.14–2.27 µs / 34.8–39.8 µs / 1.65–2.49 ms | 5.78–7.93 µs / 29.2–31.9 µs / 1.07–1.99 ms | 8.18–8.20 µs / 14.8–14.9 µs / 38.7–96.4 µs / 1.10–3.05 ms |
+| x86-64 (`85726e3`) | 32 M records (31.7 GiB), cold | zero-copy | spin | 78.9 s | 42.4 M | 550 MB/s | 38.0 GiB | 14.5 s | 3.21–5.11 µs / 24.7–27.0 µs / 593–657 µs | 4.33–6.17 µs / 34.3–39.8 µs / 2.33–2.53 ms | 4.37–6.73 µs / 27.1–27.5 µs / 636 µs–1.52 ms | 0.91–0.92 µs / 4.88–7.28 µs / 119–283 µs / 2.83–5.37 ms |
+| x86-64 (`85726e3`) | 32 M records (31.7 GiB), cold | zero-copy | block | 79.0 s | 42.4 M | 550 MB/s | 38.1 GiB | 14.4 s | 2.06–2.23 µs / 26.6–28.8 µs / 588 µs–1.94 ms | 2.08–2.46 µs / 36.2–61.0 µs / 2.56–2.70 ms | 6.00–6.08 µs / 29.5–31.5 µs / 772 µs–1.69 ms | 5.33–5.42 µs / 11.5 µs / 474–605 µs / 6.08–6.25 ms |
+| x86-64 (`85726e3`) | 2 M records (2.0 GiB), in the page cache | safe | spin | 1.01–1.03 s | 4.6 M | 4,596–4,669 MB/s | 0.0 GiB | 1.0 s | 1.85–5.05 µs / 24.8–29.7 µs / 476–582 µs | 1.96–6.22 µs / 28.9–34.7 µs / 410–463 µs | 2.93–6.34 µs / 29.3–31.6 µs / 680–760 µs | 3.44–3.45 µs / 6.76–10.1 µs / 34.0–36.3 µs / 716–770 µs |
+| x86-64 (`85726e3`) | 2 M records (2.0 GiB), in the page cache | safe | block | 1.00–1.02 s | 4.6 M | 4,636–4,706 MB/s | 0.0 GiB | 1.0 s | 4.22–4.85 µs / 26.5–28.5 µs / 757 µs–1.93 ms | 4.51–6.12 µs / 23.7–25.6 µs / 94.3–233 µs | 6.80–7.23 µs / 28.1–29.1 µs / 498–536 µs | 8.21–8.23 µs / 14.2–14.5 µs / 38.4–52.4 µs / 530 µs–3.58 ms |
+| x86-64 (`85726e3`) | 2 M records (2.0 GiB), in the page cache | zero-copy | spin | 649–664 ms | 4.6 M | 7,043–7,202 MB/s | 0.0 GiB | 0.6 s | 1.88–3.72 µs / 25.8–27.2 µs / 485–700 µs | 2.56–5.03 µs / 38.0–40.8 µs / 450–488 µs | 2.87–5.33 µs / 26.8–26.9 µs / 503–514 µs | 0.91 µs / 3.15–5.80 µs / 64.4–65.8 µs / 1.37 ms |
+| x86-64 (`85726e3`) | 2 M records (2.0 GiB), in the page cache | zero-copy | block | 659–672 ms | 4.6 M | 6,956–7,091 MB/s | 0.0 GiB | 0.7 s | 2.02–2.85 µs / 26.9–27.4 µs / 586 µs–1.89 ms | 2.74–3.30 µs / 16.8 µs–1.27 ms / 52.2 µs–1.88 ms | 6.26–7.56 µs / 27.6–28.5 µs / 600–667 µs | 5.29–5.35 µs / 10.5–12.1 µs / 179–278 µs / 1.38–3.58 ms |
+| aarch64 (`d2074c1`) | 32 M records (31.7 GiB), cold | safe | spin | 77.4–77.7 s | 42.3 M | 557–559 MB/s | 31.8 GiB | 7.0 s | 2.56–2.67 µs / 17.5–17.6 µs / 289–323 µs | 2.63–2.73 µs / 205–223 µs / 2.10–3.51 ms | 2.79–2.90 µs / 19.8–23.3 µs / 309–315 µs | 2.77–2.79 µs / 5.34–5.95 µs / 22.8–26.5 µs / 337–342 µs |
+| aarch64 (`d2074c1`) | 32 M records (31.7 GiB), cold | safe | block | 77.4–77.5 s | 42.2 M | 558–559 MB/s | 31.8 GiB | 6.8 s | 2.53–3.05 µs / 18.9–19.6 µs / 292–298 µs | 2.55–3.16 µs / 151–231 µs / 3.01–3.53 ms | 4.43–5.33 µs / 19.8–21.6 µs / 299–335 µs | 6.61–6.64 µs / 9.46–10.2 µs / 24.8–26.9 µs / 331–556 µs |
+| aarch64 (`d2074c1`) | 32 M records (31.7 GiB), cold | zero-copy | spin | 93.3–94.6 s | 44.0 M | 476–481 MB/s | 39.4 GiB | 6.1 s | 2.47–2.57 µs / 17.5–20.3 µs / 294–338 µs | 2.53–2.71 µs / 190–285 µs / 3.53–3.99 ms | 2.53–3.01 µs / 18.0–23.2 µs / 303–318 µs | 0.57–0.58 µs / 2.19–3.04 µs / 26.3–33.2 µs / 1.09–1.10 ms |
+| aarch64 (`d2074c1`) | 32 M records (31.7 GiB), cold | zero-copy | block | 77.2 s | 42.2 M | 560 MB/s | 31.9 GiB | 5.6 s | 2.54–2.62 µs / 20.8–24.4 µs / 306–411 µs | 2.52–2.64 µs / 140–294 µs / 3.39–11.6 ms | 4.20–4.24 µs / 26.8–29.6 µs / 303–720 µs | 3.93–4.08 µs / 5.78–7.28 µs / 48.4–91.6 µs / 1.29–1.51 ms |
+| aarch64 (`d2074c1`) | 2 M records (2.0 GiB), in the page cache | safe | spin | 737–882 ms | 4.6 M | 5,328–6,358 MB/s | 0.0 GiB | 0.7 s | 2.46–2.50 µs / 17.5–19.7 µs / 300–319 µs | 2.50–2.52 µs / 18.5–23.5 µs / 216 µs | 2.78–2.80 µs / 19.4–20.9 µs / 318 µs | 2.75–2.76 µs / 5.16–6.72 µs / 22.4–24.2 µs / 354–477 µs |
+| aarch64 (`d2074c1`) | 2 M records (2.0 GiB), in the page cache | safe | block | 721–737 ms | 4.6 M | 6,352–6,496 MB/s | 0.0 GiB | 0.7 s | 2.52–2.64 µs / 17.3–17.7 µs / 311–318 µs | 2.50–2.60 µs / 18.8–24.3 µs / 46.5–296 µs | 4.23–4.25 µs / 19.9–20.6 µs / 303–449 µs | 6.46–6.54 µs / 9.14–9.75 µs / 25.1–35.4 µs / 610 µs–4.02 ms |
+| aarch64 (`d2074c1`) | 2 M records (2.0 GiB), in the page cache | zero-copy | spin | 465–476 ms | 4.5 M | 9,790–10,015 MB/s | 0.0 GiB | 0.5 s | 2.51–2.60 µs / 18.0–23.9 µs / 301–323 µs | 2.46–2.66 µs / 23.0–24.5 µs / 45.4–196 µs | 2.57–2.63 µs / 18.8–20.8 µs / 288–314 µs | 0.57–0.58 µs / 2.21–2.40 µs / 28.5–32.1 µs / 1.06–1.14 ms |
+| aarch64 (`d2074c1`) | 2 M records (2.0 GiB), in the page cache | zero-copy | block | 466–487 ms | 4.5 M | 9,565–9,983 MB/s | 0.0 GiB | 0.5 s | 2.39–2.66 µs / 19.6–20.5 µs / 362–365 µs | 2.49–2.62 µs / 19.7–26.7 µs / 61.1–230 µs | 4.50–5.36 µs / 21.5–28.7 µs / 311–336 µs | 3.93–4.05 µs / 6.52–6.76 µs / 56.2–888 µs / 1.13–4.01 ms |
 
 - Catching up took 67 to 79 s (x86-64) and 77 to 95 s (aarch64) for the 31.7 GiB on the SSD and 0.5 to 1.0 s for the 2
   GiB in the page cache. The writer kept its rate: 0.2 to 0.6 % of the sends were more than 1 µs late, in every phase.
@@ -926,7 +944,7 @@ late schedule counts, no skipped sends), in µs or ms; "caught up" is the first 
   on aarch64) and the p99 from the intended time (1.8 to 6.2 µs) did not change. **The p99.9 rose**, from 25 to 30 µs
   before the reader started to 34 to 61 µs on x86-64 and from 17 to 24 µs to 140 to 294 µs on aarch64, and so did the
   maximum there (0.5 to 2.2 ms before, 1.6 to 2.7 ms on x86-64; 0.3 to 0.4 ms before, 2.1 to 11.6 ms on aarch64), while
-  the reader competed for the SSD. From the page cache, the phase is under a second and 65,000 to 100,000 appends:
+  the reader competed for the SSD. From the page cache, the phase is 0.46 to 1.03 s and 46,000 to 103,000 appends:
   p99.9 was 17 to 41 µs, except for one run (x86-64, zero-copy, blocking: 1.3 ms).
 - After the catch-up, a reader that waits costs the writer: the median of `append` was 0.43 to 0.46 µs with a spinning
   reader and 1.4 to 1.5 µs with a blocking one on x86-64 (0.29 to 0.35 and 2.1 to 2.2 µs on aarch64). With a blocking
@@ -939,9 +957,12 @@ late schedule counts, no skipped sends), in µs or ms; "caught up" is the first 
 
 ### Still not measured
 
-Archiving under a live writer at this scale, retention by age or bytes with a large backlog, catch-up of a durable-only
-reader, a reader of a journal of more than 100,000 segments, damage on xfs (these runs are ext4), and a seek index on a
-journal a writer is sealing segments of. Power loss is not tested (`crash-contract.md`).
+Archiving under a live writer at this scale, the archive of the 128 MiB journal on aarch64, retention by age or bytes
+with a large backlog, catch-up of a durable-only reader, a reader of a journal of more than 100,000 segments, other
+filesystems than ext4 (xfs in particular; APFS and btrfs only for the damage outcomes), open files at 100,000 segments,
+and a seek index on a journal a writer is sealing segments of. Nothing here was measured with #74 to #77; #76 changes
+the zero-copy reader. Damage that recovery zeroes in place (C11 (3)) is not among the damage cases. Power loss is not
+tested (`crash-contract.md`). The costs that grow with the number of segments are issue #80.
 
 ## 2026-11-19 to 2026-11-22, sustained workloads on Google Cloud VMs (Linux, x86-64 and aarch64)
 

@@ -933,6 +933,26 @@ fn scale_damage_reports_every_probe_of_a_case() {
             assert_eq!(writer["gone"], 0, "{writer}");
         }
     }
+    // Only inside what `damage` made: a probe that writes refuses any other journal.
+    let other = root.path().join("journal");
+    let other = other.to_str().unwrap();
+    tt_scale(&[
+        "build",
+        "--dir",
+        other,
+        "--segments",
+        "2",
+        "--segment-size",
+        "65536",
+    ]);
+    for probe in ["writer-open-fail", "index-build"] {
+        let refused = Command::new(env!("CARGO_BIN_EXE_tt-scale"))
+            .args(["probe", "--dir", other, "--probe", probe])
+            .output()
+            .unwrap();
+        assert!(!refused.status.success(), "{probe}");
+        assert!(String::from_utf8_lossy(&refused.stderr).contains("made by tt-scale damage"));
+    }
     let fail = &cases[1]["writers"][1];
     assert!(
         fail["outcome"].as_str().unwrap().starts_with("Corrupt"),
