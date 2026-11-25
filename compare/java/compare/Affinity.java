@@ -37,7 +37,8 @@ final class Affinity {
 
     /** As report() in benches/src/affinity.rs. */
     static Map<String,Object> report() throws Exception {
-        if (!LINUX) return Map.of("unsupported","affinity: unsupported on " + System.getProperty("os.name"));
+        String os=System.getProperty("os.name");
+        if (!LINUX) return Map.of("unsupported","affinity: unsupported on " + (os.startsWith("Mac") ? "macOS" : os));
         String tid=tid();
         Map<String,Object> result=thread(Path.of("/proc/thread-self"));
         String stat=Files.readString(Path.of("/proc/thread-self/stat"));

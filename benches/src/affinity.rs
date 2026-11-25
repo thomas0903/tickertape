@@ -58,9 +58,11 @@ pub fn thread_id() -> Result<u64> {
 /// started on its CPU (`compare/README.md`, Thread pinning).
 pub fn report() -> Result<Value> {
     if !cfg!(target_os = "linux") {
-        return Ok(
-            json!({"unsupported": format!("affinity: unsupported on {}", std::env::consts::OS)}),
-        );
+        let os = match std::env::consts::OS {
+            "macos" => "macOS",
+            other => other,
+        };
+        return Ok(json!({"unsupported": format!("affinity: unsupported on {os}")}));
     }
     let tid = thread_id()?.to_string();
     let mut report = thread_json(Path::new("/proc/thread-self"))?;
