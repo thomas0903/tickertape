@@ -33,6 +33,8 @@ public final class Harness {
     public interface Factory { Endpoint open(String role, Path dir) throws Exception; }
     static final ObjectMapper JSON = new ObjectMapper();
     static final long TIMEOUT = 120_000_000_000L;
+    /** Records append_steady writes before its timer starts (compare/src/lib.rs has the same value). */
+    static final long PRIMING_RECORDS = 1_000;
     /** Set before endpoints open when the run requests periodic durability (--sync-every-ms). */
     public static volatile boolean periodicSyncRequested = false;
     /** The run's options, set before endpoints open. */
@@ -49,12 +51,15 @@ public final class Harness {
     static final long BARRIER_TIMEOUT = 5*TIMEOUT;
     static long barrier(Path control, String role) throws Exception {
         Files.write(control.resolve(role + ".ready"), new byte[0]);
+        await(control,"start");
+        return Long.parseLong(Files.readString(control.resolve("start")));
+    }
+    private static void await(Path control, String name) throws Exception {
         long deadline = System.nanoTime() + BARRIER_TIMEOUT;
-        while (!Files.exists(control.resolve("start"))) {
-            if (System.nanoTime() > deadline) throw new IllegalStateException("barrier timed out");
+        while (!Files.exists(control.resolve(name))) {
+            if (System.nanoTime() > deadline) throw new IllegalStateException("waiting for " + name + " timed out");
             Thread.sleep(1);
         }
-        return Long.parseLong(Files.readString(control.resolve("start")));
     }
     static Map<String,Object> emptyHistogram() {
         Map<String,Object> r = new LinkedHashMap<>();
@@ -114,7 +119,7 @@ public final class Harness {
         final boolean live, probe; final long rate, durationNs, syncEveryNs;
         final Histogram syncHist=new Histogram(3);
         final Episodes episodes=episodes();
-        long t0, start, sent, late, maxLate, nextSync, syncOverruns;
+        long t0, seqBase, start, sent, late, maxLate, nextSync, syncOverruns;
         String stoppedBy="count", syncOp;
         Sender(Endpoint endpoint, byte[] data, ByteBuffer buffer, boolean live, boolean probe, long rate,
                long durationNs, long syncEveryNs) {
@@ -138,7 +143,7 @@ public final class Harness {
                     else if (episodes!=null) episodes.open=false;
                     maxLate=Math.max(maxLate,delay);
                 } else intended=0;
-                buffer.putLong(0,i); buffer.putLong(8,intended);
+                buffer.putLong(0,seqBase+i); buffer.putLong(8,intended);
                 endpoint.send(data);
                 sent++;
                 if (syncEveryNs>0) {
@@ -245,7 +250,7 @@ public final class Harness {
         String role = args[0];
         Map<String,String> opts = new HashMap<>();
         Set<String> allowed = Set.of("--dir","--control","--count","--payload","--rate","--warmup","--reader","--mode","--jit-warmup",
-            "--duration-ms","--sync-every-ms",
+            "--duration-ms","--sync-every-ms","--cpu",
             "--warmup-mode","--events","--micro-touch","--block-size","--sparse-terms","--pre-touch");
         for (int i=1;i<args.length;i+=2) {
             if (!allowed.contains(args[i]) || i+1>=args.length || opts.put(args[i],args[i+1])!=null)
@@ -280,7 +285,15 @@ public final class Harness {
         // W1 uses a separate scratch queue; W3 reads the existing fixture without
         // consuming it, then reopens a fresh endpoint for the timed traversal.
         if (longWarmup) {
+            // Live runs: the writer process warms up, then the reader process, and only then the writer opens the
+            // measured endpoint. A warm-up writes a lot and ends with `sync`; write-back while the endpoint is open
+            // would write-protect its dirty pages again, for example the term buffers that Aeron pre-touched.
+            if (live && role.equals("reader")) await(control,"writer.warm");
             Warmup.run(role,factory,dir,new Warmup.Spec(payload,rate,live,probe,syncEveryNs,jitWarmup),hist,warmupInfo);
+            if (live) {
+                Files.write(control.resolve(role+".warm"),new byte[0]);
+                await(control,role.equals("writer") ? "reader.warm" : "writer.ready");
+            }
         } else if (!live) {
             if (role.equals("writer")) {
                 Path scratch=dir.resolveSibling(dir.getFileName()+".jit");
@@ -301,8 +314,15 @@ public final class Harness {
                 }
             }
         }
+        // Pinning (README, Thread pinning): after open, so that threads the tool starts inherit the process's helper CPUs,
+        // except where open is inside the timer (the cold append and W3's reader).
+        boolean cold=opts.get("--mode").equals("append_cold");
+        boolean openIsTimed=cold || (role.equals("reader") && !live);
+        if (openIsTimed) Affinity.pin(opts.get("--cpu"),control,role);
+        long priming=opts.get("--mode").equals("append_steady") ? PRIMING_RECORDS : 0;
         long replayStart = System.nanoTime();
         try (Endpoint endpoint = factory.open(role,dir)) {
+            if (!openIsTimed) Affinity.pin(opts.get("--cpu"),control,role);
             if (role.equals("writer")) {
                 byte[] data = new byte[payload+16];
                 Arrays.fill(data,(byte)0x5a);
@@ -313,8 +333,11 @@ public final class Harness {
                 long t0 = live ? barrier(control,"writer") : 0;
                 endpoint.connected();
                 sender.t0=t0;
+                for (long i=0;i<priming;i++) { buffer.putLong(0,i); endpoint.send(data); }
+                sender.seqBase=priming;
                 if (live) while (now()<t0) Thread.onSpinWait();
                 long start=sender.begin();
+                if (cold) start=replayStart;
                 for (long i=0;i<count && sender.send(i,Math.min(count,i+BATCH));i+=BATCH) { }
                 long sent=sender.sent;
                 long end=System.nanoTime();
@@ -344,6 +367,9 @@ public final class Harness {
                 } else result.put("periodic_sync",null);
                 result.put("flush_operation",sync);
                 result.put("flush_seconds",flushSeconds);
+                result.put("timer_starts",cold?"before open, in an empty directory":priming>0
+                    ?"at the first record after open and the priming records":"at the first record after open");
+                result.put("priming_records",priming); result.put("affinity",Affinity.report(opts.get("--cpu"),control,role));
                 result.put("java",javaBlock(warmupInfo,endpoint,sender.episodes));
                 writeEvents(opts,"writer",LATE_NS,anchor,start,
                     !probe && live ? start+Math.multiplyExact(warmup,1_000_000_000L)/rate : start,end,sender.episodes);
@@ -376,6 +402,7 @@ public final class Harness {
                     result=m;
                 } else result=live?histogram(hist):new LinkedHashMap<>(Map.of("count",count,"seconds",seconds,
                     "records_per_s",count/seconds,"payload_mb_per_s",count*payload/seconds/1e6));
+                result.put("affinity",Affinity.report(opts.get("--cpu"),control,role));
                 result.put("java",javaBlock(warmupInfo,endpoint,receiver.episodes));
                 writeEvents(opts,"reader",SLOW_NS,anchor,pollStart,
                     live && !probe ? pollStart+Math.multiplyExact(warmup,1_000_000_000L)/rate : pollStart,end,receiver.episodes);

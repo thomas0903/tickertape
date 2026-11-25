@@ -15,6 +15,29 @@ The sustained-workload, checkpoint, comparison, reader and scale results and the
 ([below](#2026-11-19-to-2026-11-22-sustained-workloads-on-google-cloud-vms-linux-x86-64-and-aarch64)), after the
 bare-metal sections.
 
+**How Chronicle Queue and tickertape were configured in the comparisons below.** Open-source Chronicle Queue (2026.8,
+the version `compare/chronicle/pom.xml` pins) ran with its default queue options, except `SyncMode.SYNC` in the
+sustained SD runs (`compare/chronicle/src/main/java/compare/Main.java`):
+- no page pre-touching: the pretoucher has been Enterprise-only since Chronicle Queue 5.24 (upstream commit
+  `5056836a1`, first tagged `5.24ea0`; the open-source version has only the interface), and the harness did not call
+  the open-source `microTouch()`. That method touches the next 4 KiB page from the calling thread
+  (`MicroToucher.execute()`), so it is a smaller mechanism than a background pretoucher;
+- the default `blockSize` of 64 MiB, where Chronicle's README says that in production a larger one may reduce the
+  jitter of creating chunks;
+- a JIT warm-up only before W1 and W3 (100,000 records through the queue, `compare/java/compare/Harness.java`). W2 and
+  the sustained runs do not warm up the queue before the first send. W2 and the paced runs leave the first records out
+  of the histogram instead (the unpaced probe leaves none out), so the reader first takes the branch that records a
+  latency at the first measured record.
+
+tickertape ran with its defaults: on Linux, prefaulting 256 KiB ahead in the v0.4.0 and later comparisons (it was off
+on Linux in v0.3.0, ADR 0023), and early write-back in tickertape's rows of the sustained comparison (`88b3304`, ADR
+0038).
+
+In W1, tickertape's `Writer::open` preallocates the first segment before the timer starts. That segment is 128 MiB and
+holds the whole run (about 104 MB of records at 64 B and 106 MB at 1,024 B). Chronicle Queue creates its first cycle
+file at the first append, inside the timed part. The harness is to be corrected (issue #56) and the comparison rerun
+(issue #57).
+
 ## 2026-11-02, v0.4.0 on bare-metal Linux (AWS `z1d.metal`)
 
 The primary results for v0.4.0, recorded at `c9ec640`, the code released as v0.4.0. The environment and commands are
@@ -96,7 +119,8 @@ Two changes since v0.3.0 drive the differences:
 What changed against v0.3.0 on the same machine type, and where tickertape now stands:
 
 **Append.** 26.7–26.9 million records/s at 64 B (v0.3.0: 17.1–17.3), 5.6× Chronicle Queue. At 1,024 B,
-3.1–3.2 million records/s (v0.3.0: 1.9), 2.2× Chronicle Queue.
+3.1–3.2 million records/s (v0.3.0: 1.9), 2.2× Chronicle Queue. This is a short burst into a segment preallocated
+before the timer starts (above).
 
 **Replay.**
 - 64 B: tickertape is fastest, 22.0–23.1 against Chronicle Queue's 18.8–20.4.
@@ -108,10 +132,12 @@ IPC included:
 - 2.1 µs at 10,000 records/s;
 - 0.5–1.8 µs at 100,000 records/s, against 36–37 µs for Chronicle Queue and 92–133 µs for Aeron.
 
-At 1,024 B, Aeron IPC (which persists nothing) has the lowest tails: p99.9 0.8–5 µs. tickertape comes next and well
-ahead of Chronicle Queue:
-- 16–26 µs against 47–48 µs at 10,000 records/s;
-- 7.4–9.2 µs (`safe` reader) against 48–55 µs at 100,000 records/s.
+At 1,024 B, Aeron IPC (which persists nothing) has the lowest tails: p99.9 0.8–5 µs. Against Chronicle Queue:
+- at 10,000 records/s, tickertape's p99.9 is 16–26 µs (`safe` reader) and 20–21 µs (zero-copy reader), against
+  47–48 µs; the plain file's is lower, at 8.2–8.3 µs;
+- at 100,000 records/s, the `safe` reader's is 7.4–9.2 µs against 48–55 µs, but the zero-copy reader's is 36–76 µs,
+  around Chronicle Queue's. The comparison runs `tt-latency` for tickertape; in the separate `tt-latency` runs below
+  (the same program and settings, run outside the comparison suite) it was 110–243 µs on ext4 and 10–11 µs on xfs.
 
 Late sends at 1,024 B and 100,000 records/s fell from about 28,000 to about 700 for the zero-copy reader.
 
@@ -134,7 +160,13 @@ All at 100,000 records/s; µs; ext4 / xfs; ranges over two runs. On Linux `prefa
 What these rows show:
 - **Prefaulting helps at 64 B on both filesystems**, cutting the zero-copy reader's p99.9 by more than 15×.
 - **At 1,024 B it cuts p99 from 23–31 µs to 1.2–2.2 µs.** The zero-copy reader's p99.9 at 1,024 B is the exception
-  on ext4: 110–243 µs with prefaulting against 97–122 µs without. On xfs prefaulting helps there too.
+  on ext4: 110–243 µs with prefaulting against 97–122 µs without. On xfs prefaulting helps there too. **Open:** why
+  it is worse with prefaulting on ext4 has not been explained. With prefaulting on, the two runs differ by more than
+  2× (110 and 243 µs), against 97 and 122 µs with it off, and the comparison suite's own `tt-latency` runs above
+  measured 36–76 µs.
+- **With prefaulting off, the zero-copy reader's p99.9 on ext4 is close to Chronicle Queue's only at 64 B**: 31–34 µs
+  against 36–37 µs. At 1,024 B it is 97–122 µs against 48–55 µs. (Chronicle Queue's figures are the comparison's above,
+  on ext4; it was not run on xfs on this machine.)
 
 Other results, ext4 / xfs:
 - **`tt-checkpoint`** (16 MiB segments, 1,000 records per checkpoint):
@@ -1270,9 +1302,14 @@ the sustained session above.
 
 ### Replay and recovery at scale (`tt-scale`, `dd450d1`)
 
-The commands of `benches/README.md` → "Cloud run (larger than RAM, local SSD)", with `--repeats 2`, on ext4 on the local
-SSD; 1,024 B records; cold runs drop the page cache before every operation (`cache_dropped` true in every cold run,
-`cold_unavailable` false). The big journal is 512 segments of 128 MiB (64 GiB, 64,522,656 records) on machines with
+The commands of `benches/README.md` → "Cloud run (larger than RAM, local SSD)", with `--repeats 2`, on ext4 on the
+local SSD; 1,024 B records; cold runs drop the page cache before every operation (`cache_dropped` true in every cold
+run, `cold_unavailable` false). The journals were built with the default `--fill-last 50`: **the newest segment is
+half full**, so "seek last" reads about half a segment (`skipped_records`: 63,071 of the 126,144 records of a 128 MiB
+segment, about 64 MiB), not a whole one. "seek middle" targets the middle record, 25 % (31,536 records of a 128 MiB
+segment) or 75 % (94,608) into its segment, depending on how many records the journal held when it was measured: 75 %
+cold and 25 % warm in the 64 GiB journal, 25 % cold and 75 % warm in the other journals. No recorded run measured a
+seek across a full segment. The big journal is 512 segments of 128 MiB (64 GiB, 64,522,656 records) on machines with
 16 GB of memory; it took 168 s to build on x86-64 (409 MB/s). Wall time per operation, each in a process of its own,
 range over the two repeats (µs unless marked); peak RSS is the largest of any operation on that journal. `measure`'s
 writer operations append and checkpoint, so a later measurement of the same journal can see one more segment.
@@ -1283,7 +1320,7 @@ wrote no result for them. That is the open-files defect fixed afterwards in #38;
 
 x86-64:
 
-| Journal | Cache | list | reader open | seek first | seek middle | seek last | replay | verify | retention plan | writer open, clean | after kill | without marker | Peak RSS |
+| Journal | Cache | list | reader open | seek first | seek middle (25 or 75 % of a segment) | seek last (half a segment) | replay | verify | retention plan | writer open, clean | after kill | without marker | Peak RSS |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|
 | 10 × 1 MiB | cold | 2.7–3.0 ms | 921–940 | 360–382 | 1.22–1.25 ms | 1.36–1.43 ms | 19.6–22 ms | 15.3–15.5 ms | 3.1–3.4 ms | 2.1–2.8 ms | 1.59–2.4 ms | 22 ms | 4 MiB |
 | 10 × 1 MiB | warm | 59–70 | 50–54 | 66–101 | 203 | 155–167 | 1.93–1.98 ms | 2.5–2.6 ms | 175–186 | 382–395 | 423–486 | 2.2 ms | 4 MiB |
@@ -1300,7 +1337,7 @@ x86-64:
 
 aarch64:
 
-| Journal | Cache | list | reader open | seek first | seek middle | seek last | replay | verify | retention plan | writer open, clean | after kill | without marker | Peak RSS |
+| Journal | Cache | list | reader open | seek first | seek middle (25 or 75 % of a segment) | seek last (half a segment) | replay | verify | retention plan | writer open, clean | after kill | without marker | Peak RSS |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|
 | 10 × 1 MiB | cold | 1.10–1.64 ms | 451–904 | 224–341 | 649–683 | 618–634 | 10.9–11.9 ms | 12.4–13.1 ms | 1.43–1.50 ms | 1.39–2.4 ms | 1.20–1.81 ms | 14.2–14.4 ms | 3 MiB |
 | 10 × 1 MiB | warm | 69–70 | 51–57 | 62–63 | 169–172 | 119–131 | 1.51–1.70 ms | 2.00–2.0 ms | 152–210 | 361–379 | 399–424 | 1.56–1.73 ms | 3 MiB |
@@ -1318,10 +1355,12 @@ aarch64:
 Cold replay of the big journal: 0.69 million records/s (709–710 MB/s of payload) on x86-64 and 0.64 million (656 MB/s)
 on aarch64, with a peak RSS of 2 MiB for the replay itself; warm, 0.76 and 0.71 million, since most of the journal is
 not in memory either way. Opening a reader takes 1.1–1.7 ms cold on the big journal (1.7–2.0 ms with 1,000 segments of
-1 MiB); seeking to the last record costs one scan of its segment (90–93 ms cold for a 128 MiB segment, 0.73–0.78 s for
-1 GiB); `list-segments` and `retention-plan` grow with the segment count (49–108 ms cold for 512 segments, 97–231 ms for
-1,000). Recovery without a marker reads every byte (93–101 s cold for 64 GiB). Peak RSS stays at about one segment
-(130–131 MiB with 128 MiB segments, 1,026–1,027 MiB with 1 GiB segments), whatever the journal's size.
+1 MiB); a seek scans its segment up to the target: to the last record of the half-full newest segment it took 90–93 ms
+cold with 128 MiB segments (about 64 MiB read) and 0.73–0.78 s with 1 GiB segments (about 512 MiB), and 137–142 ms to
+a record 75 % into a 128 MiB segment (the 64 GiB journal); `list-segments` and `retention-plan` grow with the segment
+count (49–108 ms cold for 512 segments, 97–231 ms for 1,000). Recovery without a marker reads every byte (93–101 s
+cold for 64 GiB). Peak RSS stays at about one segment (130–131 MiB with 128 MiB segments, 1,026–1,027 MiB with 1 GiB
+segments), whatever the journal's size.
 
 ### Operating envelope and remaining bottlenecks
 
@@ -1819,6 +1858,8 @@ checkpoints the journal, the tool drops the page cache, then a fresh reader proc
 
 ### Not measured
 
-Bare-metal Linux; Intel/AMD x86-64; ext4 or xfs on real disks; core pinning or isolated CPUs; checkpoint durability
-on real Linux hardware; power-loss behaviour. CI runners only run smoke versions of these tools, and their numbers
-are never recorded.
+In this v0.1.0 recording: bare-metal Linux; Intel/AMD x86-64; ext4 or xfs on real disks; core pinning or isolated
+CPUs; checkpoint durability on real Linux hardware; power-loss behaviour. Since then bare-metal x86-64 Linux, ext4 and
+xfs on local NVMe, and runs bound to a NUMA node or pinned to cores have been recorded (the sections above). Isolated
+CPUs and whether checkpointed data survives a power loss still have not. CI runners only run smoke versions
+of these tools, and their numbers are never recorded.

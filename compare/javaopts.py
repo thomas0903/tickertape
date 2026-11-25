@@ -71,6 +71,12 @@ def warmup_records(java, quick, sustained):
     return 1000 if quick or sustained else 100_000
 
 
+def warms_up_before_open(tool, java):
+    """True if the writer waits for the reader process's warm-up before it opens the measured endpoint (Harness.java),
+    so the runner has to start the reader without waiting for the writer."""
+    return tool in JAVA_TOOLS and java["long_warmup"]
+
+
 def adapter_arguments(tool, java, quick, sustained, events):
     args = ["--jit-warmup", str(warmup_records(java, quick, sustained)),
             "--warmup-mode", "long" if java["long_warmup"] else "short"]
@@ -93,8 +99,9 @@ def log_paths(out, name):
 
 
 def wrap(cmd, tool, java, quick, sustained, out, name):
-    """Adds the JVM flags and adapter options to a child command [run.sh, role, ...] of a JVM tool."""
-    log, events = log_paths(out, name) if java["jvm_logs"] else (None, None)
+    """Adds the JVM flags and adapter options to a child command [run.sh, role, ...] of a JVM tool. Without `out` (a
+    command that is only looked at) it has no log files."""
+    log, events = log_paths(out, name) if java["jvm_logs"] and out is not None else (None, None)
     return [cmd[0], *(f"--jvm={flag}" for flag in jvm_flags(java, log)), *cmd[1:],
             *adapter_arguments(tool, java, quick, sustained, events)]
 

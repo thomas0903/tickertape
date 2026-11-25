@@ -32,19 +32,25 @@ extrapolation. Where tickertape loses, the docs say so.
 
 A former Chronicle Queue user pointed out that the suite ran Chronicle on its defaults, so it did not follow the
 fairness rule above, and that its short JVM warm-up left rarely taken paths to be compiled in the measured window
-(issue #56). The rule stands. For the JVM tools it now means, in `compare/` (details and sources in
-`compare/README.md`):
+(issue #56). Review found the same for Aeron: its term buffers were sparse. The rule stands. For the JVM tools it now
+means, in `compare/` (details and sources in `compare/README.md`):
 
-- **Chronicle's documented settings, open-source edition.** `blockSize` is 1 GiB: Chronicle's README says the 64 MB
-  default should be higher in production and gives 1G as an example, and Chronicle's own latency benchmark uses
-  `1 << 30`. The documented pretoucher cannot be used: it is part of the licensed Enterprise edition only (since
-  5.24), and this suite compares what runs without a licence. The writer calls the open-source appender's
-  `microTouch()` in its busy-wait instead, which takes the write fault of the next 4 KiB page. It is a weaker
-  substitute, and every comparison with Chronicle says that its pretoucher did not run.
+- **Chronicle's documented settings, open-source edition.** `blockSize` is 1 GiB. Chronicle's README says about the
+  64 MB default "in production you may want this to be high to reduce jitter from creating new chunks", and also "You
+  should avoid changing `blockSize` unnecessarily"; 1 GiB is the README's `system.properties` example and what one of
+  Chronicle's benchmarks sets (others set 128 MiB and 512 GiB). The documented pretoucher cannot be used: it is part
+  of the licensed Enterprise edition only (since 5.24), and this suite compares what runs without a licence. The
+  writer calls the open-source appender's `microTouch()` in its busy-wait instead, which takes the write fault of the next 4 KiB page. It is a weaker
+  substitute, and every comparison with Chronicle says that its pretoucher did not run. Chronicle's own
+  `bench/results.txt` shows it lowering the tail in one group of runs (p99.9 of about 15 to 16 down to 1.5) and not in
+  a later one; the rerun publishes it alone as well.
+- **Aeron's documented settings.** `termBufferSparseFile(false)`, as Aeron's `LowLatencyMediaDriver` sets it, and
+  `preTouchMappedMemory(true)` in the clients: the driver touches the pages of its own mapping of the term buffers only,
+  and the writer's faults are in the client's mapping.
 - **The same warm-up for all** refers to the workload: the same unmeasured records at the same rate. In addition every
   JVM process first warms up its compiler on scratch data that crosses the rare paths (index arrays, chunks, terms,
-  the histogram), and deletes that data untimed. The other tools are compiled ahead of time and have no equivalent.
-- **Evidence.** Every Java process logs GC, safepoints, compilations and deoptimisations and its late sends, so that a
+  the histogram), deletes that data untimed, and finishes before the writer opens the measured endpoint. The other tools are compiled ahead of time and have no equivalent.
+- **Evidence.** Every Java process logs GC, safepoints, handshakes, compilations and deoptimisations and its late sends, so that a
   tail sample can be attributed. Results recorded before this amendment did not have these settings; each can be
   switched off alone and is recorded in the result, so a rerun can publish both rows.
 

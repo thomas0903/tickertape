@@ -60,7 +60,8 @@ final class Warmup {
             }
         } finally { Harness.phase=Harness.Phase.MEASURED; }
         System.gc();
-        new ProcessBuilder("sync").inheritIO().redirectOutput(ProcessBuilder.Redirect.DISCARD).start().waitFor();
+        // Not in the W3 reader: it would write back the fixture that the other tools replay as their writer left it.
+        if (spec.live || role.equals("writer")) new ProcessBuilder("sync").inheritIO().redirectOutput(ProcessBuilder.Redirect.DISCARD).start().waitFor();
         info.put("full_rounds",FULL_ROUNDS);
         info.put("fresh_rounds",FRESH_ROUNDS);
         info.put("seconds",(System.nanoTime()-begin)/1e9);

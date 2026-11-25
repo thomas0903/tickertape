@@ -12,7 +12,11 @@ use std::time::{Duration, Instant};
 
 use hdrhistogram::Histogram;
 use serde_json::{Value, json};
-use tickertape::{Backoff, NewRecord, Reader, ReaderConfig, Writer, WriterConfig, clock};
+use tickertape::{
+    Backoff, HelperCpus, NewRecord, Reader, ReaderConfig, Writer, WriterConfig, clock,
+};
+use tickertape_bench::affinity::{pin_or_fail, report};
+use tickertape_bench::sustained::parse_cpu_list;
 use tickertape_bench::{
     Options, Result, fresh_directory, histogram_json, intended_ns, print_histogram,
     segment_capacity,
@@ -24,6 +28,7 @@ Usage: tt-latency run --dir <DIR> --rate <records/s> --count <N>
                      --payload <bytes> --reader safe|mapped
                      [--warmup <N>] [--segment-size <bytes>] [--json] [--cold]
                      [--wait spin|default|block|sleep] [--no-prefault]
+                     [--writer-cpu N] [--reader-cpu N] [--helper-cpus LIST]
        tt-latency --help
 
 --dir must be new or empty; data is retained. --count includes --warmup (default 0),
@@ -37,6 +42,10 @@ releases a shared future start time.
   block    no spins or yields: block on the notify file at once (kernel wake-up only)
   sleep    Backoff::default() with notify off: spins, yields, then 10 us..1 ms sleeps
 --no-prefault starts the writer with WriterConfig::prefault(false) (no helper thread).
+--writer-cpu and --reader-cpu pin the measured threads (Linux; an error elsewhere), each after it has opened its
+endpoint and before it is ready. --helper-cpus places the writer's helper threads (HelperCpus::List), for example
+4,5; without it they may run on any CPU the cpuset allows, except isolated ones. The JSON result has the affinity in
+effect for the threads of both processes, read back from /proc at the end of the run.
 
 Coordinated omission: record i is scheduled at t0 + floor(i * 1e9 / rate) using
 tickertape::clock::realtime_ns() on one host. local_ts_ns stores the INTENDED time,
@@ -47,7 +56,7 @@ is in microseconds. Visibility is measured after reader validation, not durabili
 Writer rate covers first append start through last append completion, including
 scheduled waits; late_records counts sends starting >1 us after their intended time
 (including warmup). Wall-clock jumps can distort results; backwards observations
-fail. No core pinning is performed. The writer busy-waits for its schedule; with
+fail. No core pinning is performed by default. The writer busy-waits for its schedule; with
 --wait spin the reader also busy-polls.
 
 --cold: writer pre-writes, checkpoints and exits before a fresh reader is spawned.
@@ -74,6 +83,9 @@ struct Config {
     segment_size: u64,
     json: bool,
     cold: bool,
+    writer_cpu: Option<u64>,
+    reader_cpu: Option<u64>,
+    helper_cpus: Option<Vec<usize>>,
     control: Option<PathBuf>,
     timeout: Duration,
 }
@@ -89,6 +101,9 @@ impl Config {
             "--warmup",
             "--segment-size",
             "--wait",
+            "--writer-cpu",
+            "--reader-cpu",
+            "--helper-cpus",
         ];
         if child {
             values.push("--control");
@@ -120,6 +135,12 @@ impl Config {
         if cold && warmup != 0 {
             return Err("--cold does not support --warmup".into());
         }
+        let cpu = |key: &str| -> Result<Option<u64>> {
+            options
+                .optional(key)
+                .map(|_| options.number(key, None))
+                .transpose()
+        };
         let control = options.path("--control");
         if child && control.is_none() {
             return Err("internal child needs --control".into());
@@ -136,6 +157,12 @@ impl Config {
             segment_size,
             json: options.flag("--json"),
             cold,
+            writer_cpu: cpu("--writer-cpu")?,
+            reader_cpu: cpu("--reader-cpu")?,
+            helper_cpus: options
+                .optional("--helper-cpus")
+                .map(parse_cpu_list)
+                .transpose()?,
             control,
             timeout,
         })
@@ -215,7 +242,7 @@ fn run(config: &Config, args: &[String]) -> Result<()> {
     let control = tempfile::tempdir()?;
     let deadline = Instant::now() + config.timeout;
     let mut writer = spawn("writer", args, control.path())?;
-    let reader_result = if config.cold {
+    let mut reader_result = if config.cold {
         wait_for(|| writer.check(), deadline)?;
         if !purge_cache() {
             println!("cold cache unavailable (needs root)");
@@ -262,11 +289,20 @@ fn run(config: &Config, args: &[String]) -> Result<()> {
     let mut result = json!({"mode": if config.cold { "cold_replay" } else { "visible_latency" },
         "count": config.count, "rate": config.rate, "payload": config.payload, "reader": config.reader,
         "wait": config.wait, "prefault": config.prefault, "warmup": config.warmup, "segment_size": config.segment_size});
+    result["affinity"] = json!({"reader": reader_result["affinity"].take()});
+    if let Some(fields) = reader_result.as_object_mut() {
+        fields.remove("affinity");
+    }
     if config.cold {
         result["replay"] = reader_result;
     } else {
         result["latency"] = reader_result;
-        result["writer"] = read_json(control.path().join("writer.json"))?;
+        let mut writer = read_json(control.path().join("writer.json"))?;
+        result["affinity"]["writer"] = writer["affinity"].take();
+        if let Some(fields) = writer.as_object_mut() {
+            fields.remove("affinity");
+        }
+        result["writer"] = writer;
         result["coordinated_omission"] = json!("intended timestamps; no skipped sends or rebasing");
     }
     if config.json {
@@ -310,12 +346,14 @@ fn start_time(control: &Path, deadline: Instant) -> Result<u64> {
 
 fn writer(config: &Config) -> Result<()> {
     let control = config.control.as_ref().ok_or("missing control directory")?;
-    let mut writer = Writer::open(
-        &config.dir,
-        WriterConfig::default()
-            .segment_size(config.segment_size)
-            .prefault(config.prefault),
-    )?;
+    let mut writer_config = WriterConfig::default()
+        .segment_size(config.segment_size)
+        .prefault(config.prefault);
+    if let Some(cpus) = &config.helper_cpus {
+        writer_config = writer_config.helper_cpus(HelperCpus::List(cpus.clone()));
+    }
+    let mut writer = Writer::open(&config.dir, writer_config)?;
+    pin_or_fail(config.writer_cpu)?;
     let payload = vec![0x5a; config.payload];
     let deadline = Instant::now() + config.timeout;
     let t0 = if config.cold {
@@ -357,7 +395,7 @@ fn writer(config: &Config) -> Result<()> {
     fs::write(
         control.join("writer.json"),
         json!({"achieved_records_per_s": config.count as f64 / elapsed,
-        "late_records": late, "count": config.count})
+        "late_records": late, "count": config.count, "affinity": report()?})
         .to_string(),
     )?;
     Ok(())
@@ -386,6 +424,7 @@ fn reader(config: &Config) -> Result<()> {
     } else {
         Reader::open(&config.dir, reader_config)?
     };
+    pin_or_fail(config.reader_cpu)?;
     let mut histogram = Histogram::<u64>::new(3)?;
     if !config.cold {
         fs::write(control.join("reader.ready"), [])?;
@@ -411,13 +450,14 @@ fn reader(config: &Config) -> Result<()> {
             histogram.record(latency)?;
         }
     }
-    let result = if config.cold {
+    let mut result = if config.cold {
         let seconds = start.elapsed().as_secs_f64();
         json!({"count": config.count, "seconds": seconds, "records_per_s": config.count as f64 / seconds,
             "payload_mb_per_s": config.count as f64 * config.payload as f64 / seconds / 1_000_000.0})
     } else {
         histogram_json(&histogram)
     };
+    result["affinity"] = report()?;
     fs::write(control.join("reader.json"), result.to_string())?;
     Ok(())
 }
