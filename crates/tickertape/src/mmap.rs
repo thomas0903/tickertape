@@ -315,7 +315,9 @@ pub(crate) const MAPPED_READS: bool = cfg!(any(target_arch = "x86_64", target_ar
 /// Reads before validation go only through [`MapRo::commit_word`], [`MapRo::load_u32`] and [`MapRo::words`], all
 /// `Relaxed` atomic loads through references that assert no immutability. What makes those loads sound on an intact
 /// publication chain, and the cases in which they are not covered by Rust's memory model (commit words damaged on
-/// storage), is set out in ADR 0027 → "Which loads can race".
+/// storage), is set out in ADR 0027 → "Which loads can race". Where the checkpoint marker covers a slot, the reader asks
+/// for no frame that ends after the marker's position (ADR 0048), so for such a slot those cases do not arise, under
+/// the conditions stated there. These functions do not know the bound: the reader checks it before it calls them.
 #[derive(Debug)]
 pub(crate) struct MapRo {
     ptr: NonNull<u8>,
@@ -344,6 +346,8 @@ impl MapRo {
     /// bounds.
     pub(crate) fn commit_word(&self, offset: u64) -> Option<u32> {
         let off = checked_word(self.len, offset)?;
+        #[cfg(test)]
+        test_hooks::loaded(offset, 4);
         // SAFETY: aligned and in bounds (checked); the mapping lives as long as `self`. The reference is created by a
         // pointer cast, not `AtomicU32::from_ptr` (which requires writable memory), and is used only for a 4-byte
         // `Relaxed` load, which `core::sync::atomic` documents as permitted on read-only memory on the targets that
@@ -369,6 +373,8 @@ impl MapRo {
             return None;
         }
         checked_range(self.len, offset, 4)?;
+        #[cfg(test)]
+        test_hooks::loaded(offset, 4);
         // SAFETY: memory. `offset` is 4-aligned, as `AtomicU32` requires (the mapping is page-aligned), and
         // `[offset, offset + 4)` is inside the mapping (checked above), which stays mapped while `self` lives. The
         // temporary `&AtomicU32` comes from a pointer cast (`AtomicU32::from_ptr` requires writable memory), lives
@@ -395,6 +401,8 @@ impl MapRo {
             return None;
         }
         let end = checked_range(self.len, offset, count.checked_mul(8)?)?;
+        #[cfg(test)]
+        test_hooks::loaded(offset, count * 8);
         let start = offset as usize;
         // SAFETY: memory. `start` is 8-aligned, as `AtomicU64` requires (the mapping is page-aligned), and
         // `[start, end)` is inside the mapping (checked above, with the multiplication overflow-checked), which stays
@@ -417,7 +425,9 @@ impl MapRo {
         // on these targets, which cannot fault inside the mapping and returns some mixture of old and new bytes; that
         // the compiler does not split, repeat or invent an atomic load; and that, since no reference asserting
         // immutability exists, the CRC then rejects the mixed frame. The copying reader before ADR 0027 loaded the same bytes the same way. A known
-        // limitation: ADR 0027 → "Which loads can race".
+        // limitation: ADR 0027 → "Which loads can race". It does not concern a frame that ends inside the reader's
+        // bound (ADR 0048): those bytes were stored before the checkpoint marker the reader read, with a fence after
+        // it, and are not stored to again, whatever the commit word says.
         let words = unsafe {
             std::slice::from_raw_parts(
                 self.ptr.as_ptr().add(start).cast::<AtomicU64>(),
@@ -439,6 +449,8 @@ impl MapRo {
     /// appending to, under the assumption about racing loads in ADR 0027 → "Which loads can race".
     pub(crate) unsafe fn committed_bytes(&self, offset: u64, len: u64) -> Option<&[u8]> {
         let end = checked_range(self.len, offset, len)?;
+        #[cfg(test)]
+        test_hooks::loaded(offset, len);
         let start = offset as usize;
         // SAFETY: memory: in bounds (checked) and readable for `self`'s lifetime; `u8` has no alignment or validity
         // requirement. Unlike the atomic references used during validation, this `&[u8]` asserts that the bytes do
@@ -765,6 +777,28 @@ pub(crate) mod test_hooks {
     pub(crate) static FORCE_UNSUPPORTED: AtomicBool = AtomicBool::new(false);
     /// Serialises the tests that use these hooks.
     pub(crate) static LOCK: Mutex<()> = Mutex::new(());
+
+    thread_local! {
+        /// The ranges this thread has loaded, or got a view of, through a `MapRo`, while a test records them.
+        static LOADED: std::cell::RefCell<Option<Vec<(u64, u64)>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(crate) fn loaded(offset: u64, len: u64) {
+        LOADED.with(|l| {
+            if let Some(ranges) = l.borrow_mut().as_mut() {
+                ranges.push((offset, offset + len));
+            }
+        });
+    }
+
+    /// What `f` returned, and the ranges `[from, to)` it loaded, or got a view of, through any `MapRo` on this thread.
+    pub(crate) fn record_loads<R>(f: impl FnOnce() -> R) -> (R, Vec<(u64, u64)>) {
+        LOADED.with(|l| *l.borrow_mut() = Some(Vec::new()));
+        let result = f();
+        let ranges = LOADED.with(|l| l.borrow_mut().take()).unwrap_or_default();
+        (result, ranges)
+    }
 }
 
 /// Removes a macOS shared-memory name left by an earlier writer of the journal (best effort; nothing elsewhere).
@@ -1522,6 +1556,17 @@ impl MapRo {
     /// An anonymous private mapping holding `bytes` (zero-padded to whole pages), made read-only where segments are
     /// mapped for reading ([`MAPPED_READS`]) and outside Miri (which doesn't model page protection).
     fn anonymous(bytes: &[u8]) -> MapRo {
+        let map = MapRo::anonymous_writable(bytes);
+        if MAPPED_READS && !cfg!(miri) {
+            // SAFETY: changes the protection of exactly this fresh mapping; no reference into it exists yet.
+            let rc = unsafe { libc::mprotect(map.ptr.as_ptr().cast(), map.len, libc::PROT_READ) };
+            assert_eq!(rc, 0, "{}", last_os_error());
+        }
+        map
+    }
+
+    /// The same, left writable: for models with a writer thread.
+    fn anonymous_writable(bytes: &[u8]) -> MapRo {
         let page = page_size();
         let len = bytes.len().max(1).div_ceil(page) * page;
         // SAFETY: an anonymous private mapping with a null hint and a non-zero length has no memory-safety
@@ -1540,11 +1585,6 @@ impl MapRo {
         let ptr = NonNull::new(ptr.cast::<u8>()).expect("mmap returned null");
         // SAFETY: the fresh mapping is writable, at least `bytes.len()` long, and no reference into it exists yet.
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.as_ptr(), bytes.len()) };
-        if MAPPED_READS && !cfg!(miri) {
-            // SAFETY: changes the protection of exactly this fresh mapping; no reference into it exists yet.
-            let rc = unsafe { libc::mprotect(ptr.as_ptr().cast(), len, libc::PROT_READ) };
-            assert_eq!(rc, 0, "{}", last_os_error());
-        }
         MapRo { ptr, len }
     }
 }
@@ -1617,6 +1657,147 @@ mod tests {
         assert!(map.commit_word(last - 4).is_none());
         // SAFETY: out-of-bounds requests return None without touching memory.
         assert!(unsafe { map.committed_bytes(last - 1, 2) }.is_none());
+    }
+
+    /// A record for the models below: its frame, commit word included.
+    fn model_frame(seq: u64) -> Vec<u8> {
+        use crate::format::{self, RecordHeader};
+        let header = RecordHeader {
+            seq,
+            schema_id: 1,
+            venue_ts_ns: 2,
+            local_ts_ns: 3,
+        };
+        let mut frame = vec![0; 64];
+        format::encode_record_body(&header, &[seq as u8; 24], &mut frame[4..]);
+        frame[..4].copy_from_slice(&64u32.to_le_bytes());
+        frame
+    }
+
+    /// ADR 0048, test plan 2: a writer thread stores records as the writer does (body with plain stores, then the commit
+    /// word) while a reader thread reads the first one through a `MapRo`, with the checks of `Reader::read_slot`. The
+    /// first record's commit word is damaged to `claimed` after it was committed; a marker covers the first `covered`
+    /// records (handed over through an atomic with release and acquire: that the writer's `pwrite` of it is a release
+    /// is the assumption ADR 0048 states). With `bounded`, the marker's position bounds the loads. Miri reports the data
+    /// race, or the mixed-size one, if the loads meet the writer's stores.
+    fn damaged_length_under_a_writer(claimed: u32, covered: u64, bounded: bool) {
+        use crate::reader::read_mapped;
+        use std::sync::atomic::AtomicU64;
+
+        const FIRST: u64 = 64;
+        const RECORDS: u64 = 4;
+        struct Shared(MapRo);
+        // SAFETY: in this test the two threads access the memory only through the mapping's own loads and through raw
+        // pointers, as two processes access a file; which of these accesses race is what the test is about.
+        unsafe impl Sync for Shared {}
+
+        let shared = Shared(MapRo::anonymous_writable(&[0; 64 + 64 * 6]));
+        let marker = AtomicU64::new(0);
+        let frames: Vec<_> = (0..RECORDS).map(model_frame).collect();
+        // Both threads run before either accesses the memory: a thread that started after the other ended would be
+        // ordered after it.
+        let start = std::sync::Barrier::new(2);
+        std::thread::scope(|s| {
+            let (shared, marker, frames, start) = (&shared, &marker, &frames, &start);
+            s.spawn(move || {
+                start.wait();
+                let commit = |at: u64, word: u32, order: Ordering| {
+                    // SAFETY: aligned, inside the writable mapping, which outlives the thread; only atomic accesses to
+                    // commit words are made through this reference.
+                    let cell =
+                        unsafe { &*shared.0.ptr.as_ptr().add(at as usize).cast::<AtomicU32>() };
+                    cell.store(word, order);
+                };
+                for (seq, frame) in frames.iter().enumerate() {
+                    let at = FIRST + 64 * seq as u64;
+                    // SAFETY: inside the writable mapping, and no reference to these bytes exists that asserts that
+                    // they do not change.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            frame.as_ptr().add(4),
+                            shared.0.ptr.as_ptr().add(at as usize + 4),
+                            frame.len() - 4,
+                        );
+                    }
+                    commit(at, 64, Ordering::Release);
+                    if seq as u64 + 1 == covered {
+                        commit(FIRST, claimed, Ordering::Relaxed);
+                        marker.store(FIRST + 64 * covered, Ordering::Release);
+                    }
+                }
+            });
+            s.spawn(move || {
+                start.wait();
+                // The marker as `pread` and then the fence of `marker_for_limit`.
+                let limit = loop {
+                    let limit = marker.load(Ordering::Relaxed);
+                    if limit > 0 {
+                        break limit;
+                    }
+                    std::thread::yield_now();
+                };
+                fence(Ordering::Acquire);
+                let mut header = crate::format::RecordHeader {
+                    seq: 0,
+                    schema_id: 0,
+                    venue_ts_ns: 0,
+                    local_ts_ns: 0,
+                };
+                let map = &shared.0;
+                let size = map.len as u64;
+                // The damaged record: its frame may be loaded only inside the bound.
+                let word = map.commit_word(FIRST).unwrap();
+                assert_eq!(word, claimed);
+                let bound = if bounded { limit + 8 } else { size };
+                let outcome = read_mapped(map, word, FIRST, bound, 0, &mut header);
+                let reason = match outcome {
+                    crate::reader::SlotOutcome::Invalid(reason) => reason,
+                    other => panic!("{other:?}"),
+                };
+                // Refused before any load, or loaded and found wrong.
+                assert_eq!(
+                    matches!(reason, crate::CorruptReason::BadChecksum),
+                    !bounded || FIRST + u64::from(claimed) <= limit,
+                    "{reason:?}"
+                );
+                // The records after it, as today: inside the bound and past it.
+                for seq in 1..RECORDS {
+                    let at = FIRST + 64 * seq;
+                    let word = map.commit_word(at).unwrap();
+                    if word == 0 {
+                        assert!(seq >= covered);
+                        break;
+                    }
+                    let outcome = read_mapped(map, word, at, size, seq, &mut header);
+                    assert!(matches!(
+                        outcome,
+                        crate::reader::SlotOutcome::Record { len: 64 }
+                    ));
+                    assert_eq!(header.seq, seq);
+                }
+            });
+        });
+    }
+
+    /// A damaged length that stays inside the bound (the loads need the marker, not the commit words of the records they
+    /// touch), and lengths that cross it by one slot and by more.
+    #[test]
+    fn map_ro_bounded_loads_meet_no_store() {
+        if !MAPPED_READS {
+            return;
+        }
+        for (claimed, covered) in [(128, 2), (192, 2), (256, 2), (192, 3), (256, 1)] {
+            damaged_length_under_a_writer(claimed, covered, true);
+        }
+    }
+
+    /// The same without the bound. Undefined behaviour, so only under Miri, where it must be reported (CI checks that it
+    /// is, "data race" or "racing mixed-size accesses"): otherwise the test above would show nothing.
+    #[test]
+    #[cfg(miri)]
+    #[ignore = "must fail under Miri: run by itself, and expect the report"]
+    fn map_ro_unbounded_loads_are_reported() {
+        damaged_length_under_a_writer(192, 2, false);
     }
 
     fn temp_file(len: u64) -> (tempfile::TempDir, File) {

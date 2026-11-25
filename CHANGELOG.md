@@ -5,6 +5,15 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
+- Changed: the zero-copy reader (`Reader::open_mapped`, and the mapped readers of the C, C++ and Java bindings) bounds its
+  loads by the checkpoint marker (ADR 0048, issue #62). A damaged length in a record that the marker covers no longer
+  makes it load bytes past the marker's position, where a writer may be storing: such a frame is read with `pread` into a
+  private buffer, with the safe reader's result. This narrows the known limitation of `open_mapped`
+  (`docs/crash-contract.md` → Readers, the writer and memory safety): as long as the journal's markers are intact, a
+  durable-only zero-copy reader is outside it, and a visible one is for slots below the checkpoint position it last took.
+  A reader at the head of the journal gains nothing. A visible zero-copy reader now reads the marker at each segment it
+  opens, when it reaches the marker's position, and ten times a second while it waits. No record, error, API, ABI or
+  on-disk byte changes, and any writer works, 1.0.0 included.
 - Added: seek indexes (ADR 0045, crash contract C15). `tickertape index <DIR>` (library: `seek_index::build`, `check`,
   `remove`) writes a small file per sealed segment into `seek-index/` of the journal, and a reader opened with
   `ReaderConfig::seek_index(true)` (C `tickertape_reader_options_set_seek_index`, C++ and Python `seek_index`, Java
@@ -86,7 +95,7 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 - Added (CLI): `tickertape age` follows a live journal from its end and reports record ages as text or JSON (from 1.1).
   By default it polls, so that it never makes the watched writer's appends wake it (`--wait`). `live` in each report
   tells an idle journal from a reader that is not at the end of the journal yet and measured nothing.
-- Docs: ADR 0048 (accepted, nothing built) settles the zero-copy reader's publication frontier (issue #62). With it, the
+- Docs: ADR 0048 (accepted; built as above) settles the zero-copy reader's publication frontier (issue #62). With it, the
   text of the zero-copy reader's known limitation is corrected (`Reader::open_mapped`, `crash-contract.md`,
   `compatibility.md`): the damage can appear whether or not a writer runs, it includes the empty slot at the head, and a
   zeroed commit word is only one of the two cases. No behaviour changes and no guarantee is weakened: all of this damage

@@ -100,6 +100,10 @@ writers touch the files.
    under it: the bytes it validated are not the bytes it hands back. Its later commit-word loads, and the loads that
    validate the records it then reads, meet the recovering and the new writer's stores to the same bytes.
 
+(Since ADR [0048](0048-publication-frontier.md) the checkpoint marker bounds the loads: the first case does not concern a
+slot that the marker the reader last took covers, nor either case a durable-only reader, under the condition on the
+marker stated there.)
+
 In both cases a mapped load touches bytes a writer is storing to without synchronisation. When the writer runs in
 the same process, that is a data race in Rust's memory model **before any CRC runs**, and overlapping atomic accesses
 of different sizes are undefined as well; a reviewer confirmed both with Miri on a small model. When the writer is

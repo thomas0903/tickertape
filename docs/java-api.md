@@ -307,7 +307,9 @@ try (Reader reader = Reader.open(Path.of("/data/journal"))) {   // at the oldest
 - `Reader.openMappedUnsafe` is the **mapped reader**: payloads are read straight from a memory mapping, without a
   copy. **Precondition: while it exists, no process other than a tickertape writer may modify the journal's segment
   files.** A tickertape writer never changes committed bytes, so this holds in normal operation; if something else
-  truncates a segment, the JVM receives `SIGBUS` and dies. The binding cannot check this, hence the name.
+  truncates a segment, the JVM receives `SIGBUS` and dies. The binding cannot check this, hence the name. "Never" is for
+  a journal whose commit words are intact: what storage damage to one can lead to, and for which readers, is the known
+  limitation in `crash-contract.md` → Readers, the writer and memory safety.
 - `tryNext()` never waits; `next(timeout)` waits up to the timeout and returns `null` if nothing arrived; `next()`
   waits as long as it takes. `readBatch(batch, timeout)` waits for the first record only, then takes what is already
   committed.

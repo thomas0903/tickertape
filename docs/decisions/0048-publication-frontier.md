@@ -1,6 +1,7 @@
 # 0048: The zero-copy reader's publication frontier
 
-- **Status:** accepted on 2026-11-25 (design only, nothing is built; issue #62)
+- **Status:** accepted on 2026-11-25; the bound is built (2026-11-26, issue #62; "As built" at the end), the shared word
+  is not
 - **Date:** 2026-11-25
 - **Follows up:** [0027](0027-mapped-reader-validates-in-place.md), "Which loads can race". It narrows the known
   limitation stated there; 0027's decision stands.
@@ -357,3 +358,34 @@ These narrow the limitation. No item, error value, precondition or on-disk byte 
   the bar covers. `mmap.rs` does not change, but the change alters a safety argument and needs the independent review
   that module's changes get.
 - No decision is left open in this record.
+
+## As built (2026-11-26)
+
+What differs from the text above, or that it left open:
+
+- *No comparison is added.* The per-record path already checks that the claimed frame fits in the segment. It now checks
+  it against `Reader::bound`, the smaller of the segment's size and `limit` plus the 8-byte trailer. A frame that does not
+  fit is invalid before any load, and the retry of an invalid slot, off that path, finds out whether the bound is the
+  reason: there the limit is renewed, or the frame is read with `pread`. So a crossing frame's commit word is loaded
+  through the mapping twice, and nothing else of it. Rows 2 and 3 of the `limit` table are then the same: a segment
+  before the marker's is bounded by its size, like every segment. `materialize` has no choice to make either: a copied
+  record's payload offset is out of the mapping's bounds, which the bounds check for the slice finds.
+- *A durable-only reader is closed for case 1 up to a frame that passes its CRC by chance.* If one does that crosses the
+  marker, the record is returned from the buffer (a wrong record, as the safe reader returns it), and the cursor is
+  behind the frame, possibly past the marker, while the sequence number after it is still below the marker's: the reader
+  then loads commit words past the marker through the mapping. "Closed" in the table, and the sentence for
+  `open_mapped` and `crash-contract.md`, did not except this; the contract's text now does.
+- *Where the bound is renewed.* Reached means: at the first slot read at or after `limit` that is not a seal (at the seal
+  the next segment's open reads the marker). After a marker read again has bounded nothing ahead of the cursor, there is
+  no bound until the 100 ms check, a seek or the next segment. A valid marker file that has become invalid, or a marker
+  that has moved back, sets the bound as the table says, also where a bound ahead of the cursor was held.
+- *Fences.* `fence(Acquire)` follows every read of the marker that can become the bound: also ADR 0045's step 2, ADR
+  0046's `covered_now` and `seek_to_end`, and a durable-only reader's refresh.
+- *An index landing* of a visible reader sets the bound to the segment's size (its step 2 and step 5 establish row 2).
+- *The Python binding* does not expose the mapped reader, so it has nothing to say about it.
+- *Test plan:* the counting view of item 3 records the ranges of each mapped load in test builds of `mmap.rs`.
+  ThreadSanitizer was not run: it keeps its state per virtual address and does not model fences.
+- *The cost bar* was measured on one cloud VM, not on bare metal, and on x86-64 only (`c4-standard-4-lssd`, figures in
+  the pull request). Replay, p50 and segment opens are inside their limits, with A and A′ inside them too. For p99.9 the
+  machine does not count: A and A′ differ by more than the 100 ns limit (500 ns without checkpoints, 974 ns with them).
+  B's p99.9 was below A's in both, which shows nothing at that noise. So that part of the condition is open.
