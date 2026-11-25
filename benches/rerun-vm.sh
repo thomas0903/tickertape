@@ -67,8 +67,14 @@ finish() {
 
 driver() {  # driver <options...>
   local deadline=(); [ -n "$DEADLINE" ] && deadline=(--deadline "$DEADLINE")
-  # shellcheck disable=SC2086
-  python3 "$REPO/benches/rerun.py" --out "$RESULTS/rerun" "${deadline[@]}" $EXTRA "$@" >> "$RESULTS/driver.log" 2>&1
+  # An interrupted driver (exit 130) resumes, at most twice, so a signal does not start the next stage early.
+  for _ in 1 2 3; do
+    # shellcheck disable=SC2086
+    python3 "$REPO/benches/rerun.py" --out "$RESULTS/rerun" "${deadline[@]}" $EXTRA "$@" >> "$RESULTS/driver.log" 2>&1
+    rc=$?; [ $rc -ne 130 ] && break
+    note "the driver was interrupted; resuming"
+  done
+  return $rc
 }
 
 case "${1:-run}" in

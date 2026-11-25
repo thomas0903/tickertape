@@ -42,10 +42,12 @@ CONFIGS = {
     "tuned": [],
 }
 
-# Seconds per short-mode unit (two repeats) without Java warm-up and build, measured in the dry run of 2026-11-25 for
-# W1/W3 and scheduled for W2 (10,000/s: 110 s, 100,000/s: 11 s per run). Estimates only.
+# Estimates only, for --list and the deadline. Seconds of a short-mode unit (two repeats): the W2 schedule (110 s per
+# run at 10,000/s, 11 s at 100,000/s) and the rest (W1, W3, process starts, JVM warm-up). Measured on
+# c4-standard-16-lssd on 2026-11-25: chronicle 1,117 s, aeron 1,070 s with the new JVM settings (long warm-up).
 W2_S = {"tickertape": 2 * 484, "chronicle": 484, "aeron": 484, "yaque": 484, "queue-file": 0, "plain-file": 484}
-SHORT_REST_S = {"tickertape": 60, "chronicle": 150, "aeron": 90, "yaque": 75, "queue-file": 60, "plain-file": 60}
+SHORT_REST_S = {"tickertape": 60, "chronicle": 640, "aeron": 600, "yaque": 75, "queue-file": 60, "plain-file": 60}
+SHORT_REST_OLD_JVM_S = 160  # jvm-old and microtouch-only: the short JVM warm-up
 SUSTAINED_OVERHEAD_S = {"chronicle": 30, "aeron": 30}
 SUSTAINED_DEFAULT_OVERHEAD_S = 15
 NO_SD = ("aeron", "yaque")
@@ -83,7 +85,8 @@ class Unit:
 
     def estimate(self, quick):
         if self.mode == "short":
-            return 90 if quick else W2_S[self.tool] + SHORT_REST_S[self.tool]
+            rest = SHORT_REST_OLD_JVM_S if self.config in ("jvm-old", "microtouch-only") else SHORT_REST_S[self.tool]
+            return 90 if quick else W2_S[self.tool] + rest
         overhead = SUSTAINED_OVERHEAD_S.get(self.tool, SUSTAINED_DEFAULT_OVERHEAD_S)
         return self.sustained_runs(quick) * ((6 if quick else 610) + overhead)
 
