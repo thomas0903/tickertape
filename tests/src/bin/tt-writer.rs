@@ -7,6 +7,8 @@
 //!
 //! With `TT_WRITER_BATCH=<n>` (n > 1) in the environment, it appends with `Writer::append_batch` in batches of up to
 //! `n` records (a batch ends at `pause_at` and at `count`) instead of one `append` per record.
+//!
+//! With `TT_WRITER_SPARE` set, it turns the spare segment on (`WriterConfig::spare_segment`).
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -28,8 +30,11 @@ fn main() {
         .map(|s| s.parse().expect("TT_WRITER_BATCH"))
         .unwrap_or(1);
 
-    let mut writer = Writer::open(&dir, WriterConfig::default().segment_size(segment_size))
-        .expect("open writer");
+    let mut config = WriterConfig::default().segment_size(segment_size);
+    if std::env::var_os("TT_WRITER_SPARE").is_some() {
+        config = config.spare_segment(true);
+    }
+    let mut writer = Writer::open(&dir, config).expect("open writer");
     while writer.next_seq() < count {
         let seq = writer.next_seq();
         if Some(seq) == pause_at {

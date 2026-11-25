@@ -375,6 +375,11 @@ def test_writer_thread_options(journal: Path) -> None:
         with tt.Writer(journal, prefault=True, early_writeback=False, helper_cpus=cpus) as w:
             w.append(b"a")
             assert w.request_checkpoint() == w.next_seq
+    for spare in (None, True, False):
+        with tt.Writer(journal, segment_size=SMALL_SEGMENT, spare_segment=spare) as w:
+            append_pattern(w, 300)  # rolls
+    with pytest.raises(TypeError):
+        tt.Writer(journal, spare_segment="yes")  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="helper_cpus"):
         tt.Writer(journal, helper_cpus="all")  # type: ignore[arg-type]
     for bad in (1, b"0", None):
@@ -721,6 +726,7 @@ def test_signatures_show_the_real_defaults() -> None:
     assert default(tt.Writer, "recovery") == "quarantine"
     assert default(tt.Writer, "helper_cpus") == "process"
     assert default(tt.Writer, "early_writeback") is True
+    assert default(tt.Writer, "spare_segment") is None
 
 
 def test_equality_and_hashing() -> None:

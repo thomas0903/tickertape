@@ -611,6 +611,40 @@ fn sustained_unpaced_retention_removes_segments_under_a_lagging_reader() {
     );
 }
 
+/// Every way of making a payload writes the same bytes (a partial last field included), and a reader that copies
+/// records out reads them all.
+#[test]
+fn sustained_encode_modes_write_the_same_payload() {
+    for encode in ["prepared", "buffer", "in-place"] {
+        let root = tempfile::tempdir().unwrap();
+        let result = sustained(
+            root.path(),
+            &[
+                "--rate",
+                "2000",
+                "--duration",
+                "500ms",
+                "--payload",
+                "61",
+                "--encode",
+                encode,
+                "--readers",
+                "mapped,safe:owned",
+            ],
+        );
+        assert_eq!(result["config"]["encode"], encode);
+        assert_eq!(result["readers"][1]["spec"], "safe:wait=spin:owned");
+        for reader in 0..2 {
+            assert_eq!(result["readers"][reader]["records_read"], 1000, "{encode}");
+        }
+        let mut reader =
+            tickertape::Reader::open(root.path().join("journal"), Default::default()).unwrap();
+        while let Some(record) = reader.try_next().unwrap() {
+            assert_eq!(record.payload, [0x5a; 61], "{encode}");
+        }
+    }
+}
+
 #[test]
 fn sustained_rejects_invalid_configurations_before_creating_directories() {
     for options in [
@@ -644,6 +678,7 @@ fn sustained_rejects_invalid_configurations_before_creating_directories() {
             "later",
         ],
         vec!["--rate", "100", "--helper-cpus", "some"],
+        vec!["--rate", "100", "--encode", "json"],
     ] {
         let root = tempfile::tempdir().unwrap();
         let output = Command::new(env!("CARGO_BIN_EXE_tt-sustained"))

@@ -9,7 +9,7 @@
 **In short.** No shared frontier word in 1.x: deferred. The checkpoint marker, which exists already, will bound the
 zero-copy reader's loads. **The gain is for replay and catch-up. A caught-up reader tailing the head, the common
 low-latency case, gets nothing from the bound.** A durable-only zero-copy reader is outside the limitation for damaged
-commit words, as long as the journal's markers are intact.
+commit words, as long as the journal's markers are intact (one two-fault case aside: "As built").
 
 ## Context
 
@@ -202,7 +202,8 @@ result. Damage to both slots, or to the newer one, breaks it. So does a marker s
 readable for a while and later revert. C13's exception names only damage that also destroys the marker, so this is
 wider than C13's text ("Readers after a repair" also names a marker set back to an older one).
 
-**Scope.** A durable-only zero-copy reader is outside the limitation *for damaged commit words*; for case 2 that is
+**Scope.** A durable-only zero-copy reader is outside the limitation *for damaged commit words* (one two-fault case
+aside: "As built"); for case 2 that is
 true of 1.0.0 already. No marker helps against storage that returns different bytes for a page read again (evicted and
 read back): that changes a payload slice the caller holds, covered or not, for every zero-copy reader.
 
@@ -387,8 +388,9 @@ What differs from the text above, or that it left open:
   `read_slot` compile to the same instructions with and without this, on aarch64 and x86-64.
   *What is left* takes two faults: a chance-CRC frame that ends **exactly** at the limit, so that it does not cross it, and
   a seal marker damaged into the empty slot there, which makes the reader load the 4 bytes after that marker. Without the
-  second, it loads only the commit word at the limit before it gives the mapping up, and writers store that word only as
-  the same 4-byte atomic: appends and seals do, and recovery from this marker zeroes only from behind an empty slot's
+  second, it loads only the commit word at the limit before it gives the mapping up (when the limit is the segment's
+  last slot the bound equals the segment size, so the mapping is kept and that word is loaded on every read: still no
+  other byte), and writers store that word only as the same 4-byte atomic: appends and seals do, and recovery from this marker zeroes only from behind an empty slot's
   commit word on. The contract says so.
 - *Where the bound is renewed.* Reached means: at the first slot read at or after `limit` that is not a seal (at the seal
   the next segment's open reads the marker). After a marker read again has bounded nothing ahead of the cursor, a visible reader has

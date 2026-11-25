@@ -556,6 +556,15 @@ fn pure_options_validate_their_values() {
         assert!(!(*w).config.early_writeback);
         assert_eq!(tickertape_writer_options_set_early_writeback(w, 3), OK);
         assert!((*w).config.early_writeback);
+        assert_eq!((*w).config.spare_segment, cfg!(target_vendor = "apple"));
+        assert_eq!(tickertape_writer_options_set_spare_segment(w, 1), OK);
+        assert!((*w).config.spare_segment);
+        assert_eq!(tickertape_writer_options_set_spare_segment(w, 0), OK);
+        assert!(!(*w).config.spare_segment);
+        assert_eq!(
+            tickertape_writer_options_set_spare_segment(std::ptr::null_mut(), 1),
+            INVALID
+        );
         assert_eq!((*w).config.helper_cpus, tickertape::HelperCpus::Process);
         let process = tickertape_helper_cpus::TICKERTAPE_HELPER_CPUS_PROCESS as i32;
         let inherited = tickertape_helper_cpus::TICKERTAPE_HELPER_CPUS_INHERITED as i32;

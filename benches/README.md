@@ -228,15 +228,20 @@ far more than the disk holds. The tool refuses to start if its estimated peak di
 set) exceeds 90 % of free space (`--no-disk-check` overrides); an unpaced run without retention has no bound and
 only gets a warning.
 
+**Payloads.** By default every record's payload is made before the run and `Writer::append` copies it. With
+`--encode buffer` a stand-in encoder stores each payload field by field into a reused buffer, which `append` then
+copies; with `--encode in-place` it stores the same fields straight into the record (`Writer::append_with`). The
+encoding is timed with the append.
+
 **Readers.** `--readers` takes a comma-separated list of `kind[:option]...`: `safe` (`pread`) or `mapped`
 (zero-copy), with `durable` (durable-only, needs checkpoints), `wait=spin|default|block|sleep` (as `tt-latency
---wait`; `--wait` sets the default, spin), `delay=<D>` (pause after every record: busy-wait below 1 ms, sleep above)
-and `stall=<pause>/<every>`. A reader with a delay or stall is *lagging*: it stops when the writer finishes and reports
-how far behind it was. When retention removes the segment a reader is in, the reader gets `Error::Discarded`, seeks
-to the oldest record still present and counts the records it never saw (`skipped_by_retention`,
-`discard_events`). Other readers get `--drain-timeout` (default 60 s) to catch up after the writer finishes; a reader
-that doesn't is reported with `drained: false`. For every reader, `records_read + skipped_by_retention +
-remaining_records` must equal the records written, or the run fails.
+--wait`; `--wait` sets the default, spin), `delay=<D>` (pause after every record: busy-wait below 1 ms, sleep above),
+`stall=<pause>/<every>` and `owned` (copy every record out with `Record::to_owned`). A reader with a delay or stall is
+*lagging*: it stops when the writer finishes and reports how far behind it was. When retention removes the segment a
+reader is in, the reader gets `Error::Discarded`, seeks to the oldest record still present and counts the records it
+never saw (`skipped_by_retention`, `discard_events`). Other readers get `--drain-timeout` (default 60 s) to catch up
+after the writer finishes; a reader that doesn't is reported with `drained: false`. For every reader, `records_read +
+skipped_by_retention + remaining_records` must equal the records written, or the run fails.
 
 **What it reports.** Text, or with `--json` one object (also always written to `OUT/result.json`) with explicit
 unit suffixes: the full configuration (schedule, durability, retention, readers and wait modes, prefault, CPUs), host
@@ -304,6 +309,11 @@ stay unpinned. On macOS the run continues unpinned and the result says so. A pac
   `benches/session.py`'s `beyond-ram` scenario sizes this automatically.
 
 Example: on a 64 GiB machine at 100,000 records/s of 1,024 B (106.4 MB/s of journal data), 1.5 × RAM (103 GB) takes about 16 minutes.
+
+**Where the CPU time goes.** `benches/diagnostics/profile-sustained.sh` runs `tt-sustained`, samples the writer's and
+the reader's measuring threads with perf, or counts their system calls, the bytes they read and their heap allocations
+(two separate runs: counting distorts a profile); `benches/diagnostics/fold-stacks.py` folds the samples. The results
+are profiles, not throughput or latency figures.
 
 **Where a stall comes from.** To find what the writer or a reader waits on during a run (scheduler, page faults,
 filesystem and write-back, block I/O), trace it with

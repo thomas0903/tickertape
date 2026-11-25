@@ -54,6 +54,9 @@ Length:
 
 Writer:
   --payload <B>           payload bytes per record (default 64)
+  --encode <E>            how each payload is made: prepared (append copies bytes made before the run, the default),
+                          buffer (encoded per record into a reused buffer, which append copies) or in-place (encoded
+                          per record straight into the record, append_with); the encoding is timed with the append
   --segment-size <B>      segment size (default 134217728 = 128 MiB); smaller sizes roll more often
   --checkpoint-every <D>  checkpoint on a fixed wall-clock grid, or
   --checkpoint-records <N> checkpoint after every N records (default: no checkpoints)
@@ -65,6 +68,8 @@ Writer:
   --no-prefault           WriterConfig::prefault(false)
   --no-early-writeback    WriterConfig::early_writeback(false): no sync_file_range behind the writer (Linux;
                           no effect elsewhere)
+  --spare-segment         WriterConfig::spare_segment(true): prepare the next segment in the background (ADR 0049;
+                          the default is the platform's: on on macOS, off on Linux)
   --helper-cpus <C>       WriterConfig::helper_cpus for the writer's helper threads (checkpoint, prefault,
                           write-back): process (the default: every CPU the cpuset allows), inherited (the
                           creating thread's mask, so a pinned writer's checkpoint thread shares its CPU), or a
@@ -77,6 +82,7 @@ Readers:
                             wait=spin|default|block|sleep  (as tt-latency --wait)
                             delay=<D>           pause after every record (busy-wait below 1ms, else sleep)
                             stall=<D>/<D>       pause for the first duration once every second duration
+                            owned               copy every record out (Record::to_owned, one allocation)
                           a reader with delay or stall is a lagging reader: it stops when the writer finishes
                           and reports how far behind it was
   --wait <MODE>           default wait mode for readers (default spin)
@@ -123,6 +129,37 @@ enum Checkpoint {
     Records(u64),
 }
 
+/// How the writer makes each payload (`--encode`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Encode {
+    Prepared,
+    Buffer,
+    InPlace,
+}
+
+impl Encode {
+    fn name(self) -> &'static str {
+        match self {
+            Encode::Prepared => "prepared",
+            Encode::Buffer => "buffer",
+            Encode::InPlace => "in-place",
+        }
+    }
+}
+
+/// A stand-in for an application's encoder: stores the payload one 8-byte field at a time (the last one shorter). The
+/// value of each field is hidden from the compiler, so it cannot turn the loop into one fill. Every byte is
+/// [`PAYLOAD_BYTE`], which the check of corrupt slots expects.
+#[inline(always)]
+fn encode_fields(payload: &mut [u8]) {
+    const FIELD: u64 = u64::from_ne_bytes([PAYLOAD_BYTE; 8]);
+    let mut fields = payload.chunks_exact_mut(8);
+    for field in &mut fields {
+        field.copy_from_slice(&std::hint::black_box(FIELD).to_le_bytes());
+    }
+    fields.into_remainder().fill(PAYLOAD_BYTE);
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum CheckpointMode {
     Blocking,
@@ -147,6 +184,7 @@ struct Config {
     overrun: Duration,
     drain: Duration,
     payload: usize,
+    encode: Encode,
     record_bytes: u64,
     schedule: Schedule,
     planned: Option<u64>,
@@ -158,6 +196,7 @@ struct Config {
     retain_bytes: Option<u64>,
     prefault: bool,
     early_writeback: bool,
+    spare_segment: bool,
     helper_cpus: HelperCpus,
     readers: Vec<ReaderSpec>,
     default_wait: WaitMode,
@@ -179,6 +218,7 @@ impl Config {
             "--overrun-limit",
             "--drain-timeout",
             "--payload",
+            "--encode",
             "--rate",
             "--burst-rate",
             "--burst-period",
@@ -205,6 +245,7 @@ impl Config {
                 "--unpaced",
                 "--no-prefault",
                 "--no-early-writeback",
+                "--spare-segment",
                 "--no-disk-check",
                 "--json",
             ],
@@ -252,6 +293,16 @@ impl Config {
             schedule.intended_ns(clock::realtime_ns(), count - 1)?;
         }
         let payload: usize = options.number("--payload", Some(64))?.try_into()?;
+        let encode = match options.optional("--encode") {
+            None | Some("prepared") => Encode::Prepared,
+            Some("buffer") => Encode::Buffer,
+            Some("in-place") => Encode::InPlace,
+            Some(other) => {
+                return Err(
+                    format!("--encode {other}: choose prepared, buffer or in-place").into(),
+                );
+            }
+        };
         let segment_size =
             options.number("--segment-size", Some(WriterConfig::DEFAULT_SEGMENT_SIZE))?;
         let capacity = segment_capacity(segment_size, payload)?;
@@ -358,6 +409,7 @@ impl Config {
             overrun: duration_of("--overrun-limit", "60s")?,
             drain: duration_of("--drain-timeout", "60s")?,
             payload,
+            encode,
             record_bytes: record_bytes(payload)?,
             schedule,
             planned,
@@ -369,6 +421,7 @@ impl Config {
             retain_bytes,
             prefault: !options.flag("--no-prefault"),
             early_writeback: !options.flag("--no-early-writeback"),
+            spare_segment: options.flag("--spare-segment") || WriterConfig::default().spare_segment,
             helper_cpus,
             readers,
             default_wait,
@@ -449,6 +502,7 @@ impl Config {
         json!({"dir": self.dir, "out": self.out, "duration_s": self.duration.as_secs_f64(),
             "warmup_s": self.warmup.as_secs_f64(), "overrun_limit_s": self.overrun.as_secs_f64(),
             "drain_timeout_s": self.drain.as_secs_f64(), "payload_bytes": self.payload,
+            "encode": self.encode.name(),
             "record_bytes": self.record_bytes, "schedule": self.schedule.to_json(), "planned_records": self.planned,
             "checkpoint": match self.checkpoint {
                 Checkpoint::None => json!({"kind": "none"}),
@@ -461,7 +515,7 @@ impl Config {
             "retention": {"max_segments": self.retain_segments, "max_bytes": self.retain_bytes,
                 "action": if self.retention().is_some() { "delete" } else { "none" }},
             "writer_durability": "visible on append; durable only through checkpoints (crash contract)",
-            "prefault": self.prefault, "notify": true, "early_writeback": self.early_writeback,
+            "prefault": self.prefault, "notify": true, "early_writeback": self.early_writeback, "spare_segment": self.spare_segment,
             "helper_cpus": match &self.helper_cpus {
                 HelperCpus::List(list) => json!(list),
                 HelperCpus::Inherited => json!("inherited"),
@@ -1038,6 +1092,7 @@ fn writer(config: &Config) -> Result<()> {
         .segment_size(config.segment_size)
         .prefault(config.prefault)
         .early_writeback(config.early_writeback)
+        .spare_segment(config.spare_segment)
         .helper_cpus(config.helper_cpus.clone());
     if let Some(policy) = config.retention() {
         writer_config = writer_config.retention(policy, Action::Delete);
@@ -1046,7 +1101,7 @@ fn writer(config: &Config) -> Result<()> {
     let generation_at_open = writer.metrics().checkpoint.map_or(0, |c| c.generation);
     let position_file = PositionFile::open(&control.join("writer.pos"))?;
     let series = SeriesFile::create(&config.out.join("writer.series.jsonl"))?;
-    let payload = vec![PAYLOAD_BYTE; config.payload];
+    let mut payload = vec![PAYLOAD_BYTE; config.payload];
     let setup_deadline = Instant::now() + Duration::from_secs(120);
     fs::write(control.join("writer.ready"), [])?;
     let t0 = start_time(control, setup_deadline)?;
@@ -1142,12 +1197,20 @@ fn writer(config: &Config) -> Result<()> {
             let seq = writer.next_seq();
             let is_roll = seq != 0 && seq % config.capacity == 0;
             let start = Instant::now();
-            writer.append(&NewRecord {
+            if config.encode == Encode::Buffer {
+                encode_fields(&mut payload);
+            }
+            let record = NewRecord {
                 schema_id: 1,
                 venue_ts_ns: 0,
                 local_ts_ns: intended,
                 payload: &payload,
-            })?;
+            };
+            if config.encode == Encode::InPlace {
+                writer.append_with(&record, config.payload, encode_fields)?;
+            } else {
+                writer.append(&record)?;
+            }
             let elapsed = start.elapsed();
             let append_ns = elapsed_ns(elapsed)?;
             position.store(seq + 1, Ordering::Release);
@@ -1408,7 +1471,11 @@ fn reader(config: &Config) -> Result<()> {
                     )
                     .into());
                 }
-                std::hint::black_box(record.payload);
+                if spec.owned {
+                    std::hint::black_box(record.to_owned());
+                } else {
+                    std::hint::black_box(record.payload);
+                }
                 let sample = now
                     .checked_sub(record.local_ts_ns)
                     .ok_or("wall clock moved backwards; invalid latency run")?;

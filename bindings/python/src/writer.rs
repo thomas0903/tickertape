@@ -297,15 +297,18 @@ fn convert<T>(py: Python<'_>, result: Result<T, tickertape::Error>) -> PyResult<
 #[pymethods]
 impl Writer {
     /// Opens (creating if needed) the journal in `path` for writing and recovers it. Releases the GIL meanwhile.
+    /// `spare_segment` (from 1.1): whether to prepare the next segment in a background thread; `None` is the platform's
+    /// default (on on macOS, off on Linux).
     #[new]
     #[pyo3(
         signature = (
             path, *, segment_size=WriterConfig::DEFAULT_SEGMENT_SIZE, recovery="quarantine", notify=true,
-            prefault=true, early_writeback=true, helper_cpus=HelperCpusArg::PROCESS, retention=None
+            prefault=true, early_writeback=true, helper_cpus=HelperCpusArg::PROCESS, retention=None,
+            spare_segment=None
         ),
         // Spelled out so that `inspect.signature` shows the default size (DEFAULT_SEGMENT_SIZE, checked by a test).
         text_signature = "(path, *, segment_size=134217728, recovery='quarantine', notify=True, prefault=True, \
-                          early_writeback=True, helper_cpus='process', retention=None)"
+                          early_writeback=True, helper_cpus='process', retention=None, spare_segment=None)"
     )]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -318,6 +321,7 @@ impl Writer {
         early_writeback: bool,
         helper_cpus: HelperCpusArg,
         retention: Option<PyRef<'_, Retention>>,
+        spare_segment: Option<bool>,
     ) -> PyResult<Self> {
         let mut config = WriterConfig::default()
             .segment_size(segment_size)
@@ -326,6 +330,9 @@ impl Writer {
             .prefault(prefault)
             .early_writeback(early_writeback)
             .helper_cpus(helper_cpus.0);
+        if let Some(on) = spare_segment {
+            config = config.spare_segment(on);
+        }
         if let Some(r) = retention {
             config = config.retention(r.policy.clone(), r.action.clone());
         }

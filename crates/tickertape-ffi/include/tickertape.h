@@ -1642,16 +1642,17 @@ tickertape_status tickertape_writer_options_set_recovery_policy(struct tickertap
 tickertape_status tickertape_writer_options_set_notify(struct tickertape_writer_options *options, int32_t enabled);
 
 /**
- * Sets whether the writer does segment work (prefaulting pages, and on macOS preparing the next segment) in
- * background threads it starts. Zero gives a writer that starts no threads, except the checkpoint thread that
- * `tickertape_writer_request_checkpoint` starts; it also turns off early write-back
- * (`tickertape_writer_options_set_early_writeback`). Default: on.
+ * Sets whether the writer does segment work (prefaulting pages) in background threads it starts. Zero gives a writer
+ * that starts no threads, except the checkpoint thread that `tickertape_writer_request_checkpoint` starts; it also turns
+ * off early write-back (`tickertape_writer_options_set_early_writeback`) and the spare segment
+ * (`tickertape_writer_options_set_spare_segment`). Default: on.
  *
  * # Safety
  *
  * `options` must be NULL or live writer options, not used by another thread during the call.
  */
-tickertape_status tickertape_writer_options_set_prefault(struct tickertape_writer_options *options, int32_t enabled);
+tickertape_status tickertape_writer_options_set_prefault(struct tickertape_writer_options *options,
+                                                         int32_t enabled);
 
 /**
  * Sets whether the writer starts the kernel's write-back of the pages it has finished with as it goes, so that a
@@ -1672,6 +1673,25 @@ tickertape_status tickertape_writer_options_set_prefault(struct tickertape_write
  */
 tickertape_status tickertape_writer_options_set_early_writeback(struct tickertape_writer_options *options,
                                                                 int32_t enabled);
+
+/**
+ * Sets whether the writer prepares the next segment in a background thread (`tickertape-spare`) once the active one is
+ * half full, so that a roll writes its header and links it instead of creating a file (ADR 0022; on Linux ADR 0049).
+ * Non-zero enables it. Default: on on macOS, **off on Linux**. Applies only with prefault on
+ * (`tickertape_writer_options_set_prefault`).
+ *
+ * It reserves one more segment's worth of disk space from the time the active segment is half full, and holds one more
+ * file descriptor and segment mapping. **Linux:** the thread lives as long as the writer; a roll that finds the
+ * segment not ready creates one itself, and waits for the prepared one only if that fails for lack of space; closing
+ * the writer waits for one being prepared. Whether it helps depends on the load and the disk: measure first (ADR
+ * 0049). Added in 1.1.
+ *
+ * # Safety
+ *
+ * `options` must be NULL or live writer options, not used by another thread during the call.
+ */
+tickertape_status tickertape_writer_options_set_spare_segment(struct tickertape_writer_options *options,
+                                                              int32_t enabled);
 
 /**
  * Sets where the writer's helper threads run: `placement` is a `tickertape_helper_cpus` value. With

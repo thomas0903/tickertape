@@ -10,10 +10,27 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   makes it load bytes past the marker's position, where a writer may be storing: such a frame is read with `pread` into a
   private buffer, with the safe reader's result. This narrows the known limitation of `open_mapped`
   (`docs/crash-contract.md` → Readers, the writer and memory safety): as long as the journal's markers are intact, a
-  durable-only zero-copy reader is outside it, and a visible one is for slots below the checkpoint position it last took.
+  durable-only zero-copy reader is outside it (except for one case that takes two faults, stated there), and a visible
+  one is for slots below the checkpoint position it last took.
   A reader at the head of the journal gains nothing. A visible zero-copy reader now reads the marker at each segment it
   opens, when it reaches the marker's position, and ten times a second while it waits. No record, error, API, ABI or
   on-disk byte changes, and any writer works, 1.0.0 included.
+- Added: `WriterConfig::spare_segment` (C `tickertape_writer_options_set_spare_segment`, C++ and Python `spare_segment`,
+  Java `spareSegment`; `tt-sustained` and `tt-latency` `--spare-segment`): on Linux, prepare the next segment in a
+  background thread so that a roll does not create and preallocate a file (ADR 0049, issue #60). **Off by default on
+  Linux**, where the writer behaves as before; on by default on macOS, as today, and now separate from `prefault`. On
+  cloud VMs it made rolls cheaper away from the disk's limit, made the one saturated case worse and was not measured in others. The
+  file format and the crash contract's guarantees are unchanged.
+- Docs: the stalls of sustained runs on ext4 are attributed (issue #60): the write fault's modification-time update and
+  a roll's file operations wait for the ext4 journal; that the holder of `mmap_lock` in the unpaced rolls is the prefault
+  helper is inferred, and why the device queues on one machine shape is not explained. With the measured effect of
+  `lazytime` and the tracing overhead of the eBPF playbook's tools; `benches/diagnostics/stalls.bt` is new.
+- Docs: `docs/benchmarks.md` has profiles of both readers, the notification path and the serialization paths under
+  the sustained workloads (x86-64 and aarch64 cloud VMs) and lists the allocations, copies, system calls and
+  synchronization that remain, with whether each is necessary (issue #62; roadmap "Finish eliminating avoidable work").
+- Added (benchmarks): `benches/diagnostics/profile-sustained.sh` profiles the threads of a sustained run or counts their
+  system calls and heap allocations; `tt-sustained` has `--encode` (how payloads are made) and the reader option
+  `owned`. `tests/allocation.rs` checks that appending, following and replaying allocate nothing per record.
 - Added: seek indexes (ADR 0045, crash contract C15). `tickertape index <DIR>` (library: `seek_index::build`, `check`,
   `remove`) writes a small file per sealed segment into `seek-index/` of the journal, and a reader opened with
   `ReaderConfig::seek_index(true)` (C `tickertape_reader_options_set_seek_index`, C++ and Python `seek_index`, Java

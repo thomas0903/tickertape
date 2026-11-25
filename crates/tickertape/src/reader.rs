@@ -210,8 +210,9 @@ impl Reader {
     /// Each record is validated (length, CRC32C, sequence number, flags) from atomic loads of the mapping before any
     /// slice into it is created. The checks, their order and the errors are those of [`Reader::open`] (ADR 0027).
     /// Below the checkpoint position the reader took last, no load reaches past that position. A record whose frame
-    /// crosses that position is copied into the reader's buffer instead (ADR 0048): on an intact journal whose marker
-    /// fits its files there is none.
+    /// crosses that position is copied into the reader's buffer instead (ADR 0048), and a durable-only reader then reads
+    /// the rest of that segment through its buffer as well: on an intact journal whose marker fits its files there is
+    /// none.
     ///
     /// Segments are mapped only on x86-64 and aarch64. On other targets this opens the same reader as
     /// [`Reader::open`] (same API and results; payloads borrow from a buffer the reader owns and nothing is mapped),

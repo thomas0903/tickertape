@@ -102,7 +102,7 @@ writers touch the files.
 
 (Since ADR [0048](0048-publication-frontier.md) the checkpoint marker bounds the loads: the first case does not concern a
 slot that the marker the reader last took covers, nor either case a durable-only reader, under the condition on the
-marker stated there.)
+marker stated there and except for the two-fault case in its "As built".)
 
 In both cases a mapped load touches bytes a writer is storing to without synchronisation. When the writer runs in
 the same process, that is a data race in Rust's memory model **before any CRC runs**, and overlapping atomic accesses
