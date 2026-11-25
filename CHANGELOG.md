@@ -5,6 +5,19 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
+- Changed: a forward `Reader::seek` within the reader's segment continues from the reader's position instead of
+  reading the segment from its start again, when that position is known to be on the current chain: a checkpoint
+  covers it, the segment file is still in place, and the record before it is still there (ADR 0046). Results are the
+  same; records before the position, which the reader validated when it passed them, are not validated again. All
+  bindings get this through the Rust reader.
+- Added: `Reader::seek_to_end` (C `tickertape_reader_seek_to_end`, C++ and Python `seek_to_end`, Java `seekToEnd`)
+  places a reader at the end of the journal, reading at most the newest segment, from the checkpoint on. The C ABI
+  stays at ABI version 1 (an added function).
+- Changed (CLI): `tail --from-end` uses it, so it no longer reads every retained segment, and damage in an older
+  segment no longer makes it fail.
+- Changed (Python decoder): `read_journal(start_seq=...)` in `python/tickertape_reader.py` starts at the segment that
+  holds `start_seq`, chosen by file name as the Rust reader does, instead of reading every segment from the oldest. It
+  still validates that segment's records before `start_seq`; damage in earlier segments is no longer reported.
 - Fixed (release tooling): `release.py github-release` asked the release listing for its new draft once, immediately
   after creating it, and the v1.0.0 run failed there because the listing did not show the draft yet (after the
   crates were published; rerunning the job completed the release). It now asks for up to a minute.
