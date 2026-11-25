@@ -558,7 +558,7 @@ impl Writer {
             writeback.advanced(self.offset);
         }
         // Once the active segment is half full, prepare the next one off the writer's thread (ADR 0022; on Linux
-        // without a sync: issue #60).
+        // without a sync, ADR 0023 → Amendment of 2026-11-25).
         if let Some(spares) = &mut self.spares {
             if self.offset >= self.active.size / 2 && !spares.requested() {
                 spares.request();
@@ -1198,8 +1198,8 @@ impl Drop for JournalLock {
 
 /// Publishes a prepared spare as segment `base` (ADR 0022): write its header, then link it into place, as
 /// [`create_segment`] does at a roll. The header is not synced here: the next checkpoint syncs it before its marker
-/// (and the file's size, which only macOS syncs when it prepares the spare). If the header can't be written, the spare is discarded and the
-/// segment is created synchronously instead; a failed link is reported like [`create_segment`]'s.
+/// (and the file's size, which only macOS syncs when it prepares the spare). If the header can't be written, the spare
+/// is discarded and the segment is created synchronously instead; a failed link is reported like [`create_segment`]'s.
 fn publish_spare(dir: &Path, base: u64, size: u64, spare: Spare) -> Result<Segment> {
     let spare_path = dir.join(journal::SPARE_FILE);
     let path = journal::segment_path(dir, base);
@@ -2817,9 +2817,14 @@ mod tests {
                 let seen = loop {
                     let seen = helpers();
                     let names: Vec<&str> = seen.iter().map(|(n, _)| n.as_str()).collect();
-                    let started = ["tickertape-chec", "tickertape-pref", "tickertape-writ"]
-                        .iter()
-                        .all(|n| names.contains(n));
+                    let started = [
+                        "tickertape-chec",
+                        "tickertape-pref",
+                        "tickertape-spar",
+                        "tickertape-writ",
+                    ]
+                    .iter()
+                    .all(|n| names.contains(n));
                     let settled = matches!(cpus, HelperCpus::Inherited)
                         || seen.iter().all(|(_, l)| l != &vec![pinned]);
                     if started && settled {

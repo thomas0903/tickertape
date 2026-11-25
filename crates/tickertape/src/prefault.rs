@@ -192,7 +192,8 @@ fn run(shared: &Shared) {
 }
 
 /// A preallocated and mapped segment file that is not published yet (ADR 0022): all zeros, named
-/// [`crate::journal::SPARE_FILE`]; synced on macOS only. At roll the writer writes its header and links it into place (the next checkpoint syncs it).
+/// [`crate::journal::SPARE_FILE`]; synced on macOS only. At roll the writer writes its header and links it into
+/// place (the next checkpoint syncs it).
 #[derive(Debug)]
 pub(crate) struct Spare {
     pub(crate) file: File,
@@ -203,8 +204,8 @@ pub(crate) struct Spare {
 /// The writer's side of preparing the next segment in the background (ADR 0022).
 ///
 /// - **macOS:** a short-lived thread per spare, and [`Spares::take`] waits for it.
-/// - **Linux:** one thread for the writer's life, woken for each spare, and `take` never waits (issue #60). Starting a
-///   thread costs the writer more than a roll does there, so it starts none while it appends.
+/// - **Linux:** one thread for the writer's life, woken for each spare, and `take` never waits (ADR 0023 → Amendment of
+///   2026-11-25). A thread started for each spare made the writer's worst appends longer there than the roll it saved.
 #[derive(Debug)]
 pub(crate) struct Spares {
     dir: PathBuf,
