@@ -246,7 +246,8 @@ released with seven items open, accepted by the owner as known gaps
   - Missing: archived history, missing or corrupt segments, catch-up under a live writer, the zero-copy reader and the
     10,000- and 20,000-segment journals (they failed before #38 and are reported as failed) are not measured.
   - Accepted after 1.0 (issue #59): a sparse seek index per sealed segment,
-    [ADR 0045](decisions/0045-sparse-seek-index.md) (accepted design, not built).
+    [ADR 0045](decisions/0045-sparse-seek-index.md): built by `tickertape index`, used by readers that opt in. Deferred
+    there: the checkpoint marker as a jump point in the newest segment, then building from the writer.
 
 ### v1.0 readiness
 

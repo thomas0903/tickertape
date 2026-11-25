@@ -255,6 +255,12 @@ segment, from the checkpoint on, so a follower that wants only new records does 
 record committed before the call is behind the reader; none committed after it returns is. A failure leaves the
 reader as it was, as for a seek.
 
+`tickertape_reader_options_set_seek_index` (from 1.1, off by default) lets `tickertape_reader_seek` start at a record named
+by a seek index, one of the files `tickertape index` writes (`operations.md` → Seek indexes, crash contract C15). Records
+before it are then not read, so damage there goes unnoticed. For a mapped reader the precondition of
+`tickertape_reader_open_mapped_unsafe` then also covers `seek-index/` and `checkpoint`: no process other than a tickertape
+writer or index builder modifies them.
+
 `tickertape_reader_read_batch` waits up to the timeout for the first record only, then takes what is already
 committed, up to the array size or until the next payload does not fit in the buffer. A record that does not fit is
 held back and returned first by the next call (`TICKERTAPE_E_BUFFER_TOO_SMALL` if even the first one does not fit,

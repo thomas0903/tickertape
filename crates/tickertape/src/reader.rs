@@ -193,6 +193,12 @@ impl Reader {
     /// the journal's segment files (writing into them, truncating them, or replacing their contents through other
     /// tools). If a mapped file is truncated, the process receives `SIGBUS`.
     ///
+    /// With [`ReaderConfig::seek_index`] this also covers `seek-index/` and the checkpoint marker: no process other than
+    /// a tickertape writer or index builder ([`seek_index::build`](crate::seek_index::build)) may modify them. Such a
+    /// reader uses an index only for a segment before the one the marker names, to which no writer stores; if the marker
+    /// is damaged later and a recovery changes such a segment in place, the known limitation below applies. With the
+    /// option off, nothing changes.
+    ///
     /// What follows holds for an intact publication chain, where every commit word the reader follows is one a
     /// writer published. A tickertape writer then never modifies committed bytes, including during crash recovery,
     /// which in place only zeroes bytes after an empty slot (never committed, on an intact chain) and writes a seal
@@ -282,6 +288,13 @@ impl Reader {
     /// place, and the new history holds, right before the cursor, bytes that form a record with the sequence number
     /// expected there, the cursor can be off the current chain without the seek noticing. A seek to the last record
     /// the reader passed (returned or skipped), or an earlier one, scans the segment, and so does a new reader.
+    ///
+    /// With [`ReaderConfig::seek_index`] (off by default), the way may start at a record before the target that a seek
+    /// index names, if there is an index and nothing about it is in doubt (ADR 0045). The record landed on and every
+    /// record from there are validated as always. **Records before it are not read:** damage there, at which a seek
+    /// without the option stops, goes unnoticed, and the landing place is on the current chain except where a stale or
+    /// a forged index coincides with suitable bytes in a payload (`docs/crash-contract.md`, C15). A reader that landed
+    /// this way is not at a place a later seek starts from. No seek fails because of an index.
     ///
     /// Retention may remove the segment holding `seq` while `seek` runs (between listing the segments and opening
     /// the chosen one). `seek` then lists the segments again, so it returns [`Error::SeqUnavailable`] with the new
@@ -392,7 +405,9 @@ impl Reader {
     /// A visible reader can't notice such an in-place repair (storage damage that emptied a commit word; crash
     /// contract C11): it may return records it had already read, then continue in the new history, wait, or report
     /// corruption at a position that no longer starts a record; [`Reader::seek`] to its position puts it back on the
-    /// current chain.
+    /// current chain. (The exceptions of [`Reader::seek`] apply. A reader with [`ReaderConfig::seek_index`] can also have
+    /// entered the segment behind the damage, before the repair, where another reader's scan would have stopped; it is
+    /// then where a reader that had already passed the damaged record would be. Crash contract C15.)
     ///
     /// # Errors
     ///

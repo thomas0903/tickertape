@@ -1,8 +1,9 @@
 # Command-line interface (M5–M6)
 
 Install/build the `tickertape-cli` package; its binary is `tickertape`. Commands use the public library API
-and never take the writer lock. **`archive` is the only command that changes a journal**; all other commands never
-write segments, the checkpoint marker or any other journal data. Paths may name a journal with an active writer.
+and never take the writer lock (`index`, in a directory without a checkpoint marker, tests it). **`archive` is the only
+command that changes a journal's data**, and `index` writes only the seek indexes in its `seek-index/`; all other
+commands never write segments, the checkpoint marker or anything else there. Paths may name a journal with an active writer.
 The one other write is that a following `tail`, while it waits for new records, registers itself as a waiter in the
 writer's shared-memory wake-up region (ADRs 0017, 0021), which is outside the journal directory and holds no
 journal data. `status --output` writes a file that must be outside the journal directory.
@@ -15,7 +16,7 @@ Errors and recovery warnings go to stderr. JSON results go to stdout (or the sel
 ## Commands
 
 - `tail <DIR> [--from <SEQ> | --from-end] [--count <N>] [--no-follow] [--format text|json]
-  [--timeout-secs <S>] [--durable-only] [--decode market-demo]`: default starts at the oldest record and follows forever. `--from` includes SEQ;
+  [--timeout-secs <S>] [--durable-only] [--seek-index] [--decode market-demo]`: default starts at the oldest record and follows forever. `--from` includes SEQ;
   `--from-end` starts at the end of the journal as observed at startup (`Reader::seek_to_end`): it reads the newest
   segment from the checkpoint on, not the records of the segments before it, so
   damaged records there are not reported (the oldest segment's header is still checked when the journal is opened). `--count 0` writes nothing. `--no-follow` stops when
@@ -49,11 +50,12 @@ Errors and recovery warnings go to stderr. JSON results go to stdout (or the sel
   21 ms instead of 9 ms (warm page cache, Apple M4 Pro); with a cold cache or slow storage it costs reading the
   unwritten rest of the newest segment. `inspect` runs the same scan.
 - `export <DIR> --format jsonl|parquet [--output <FILE>|-] [--from <SEQ>] [--to <SEQ>]
-  [--decode market-demo] [--durable-only]`: writes records from the
+  [--decode market-demo] [--durable-only] [--seek-index]`: writes records from the
   inclusive range; JSONL defaults to stdout and `--output -` also selects stdout for JSONL. The output file is created or
   truncated, but a path naming an existing journal entry (including via symlinks/hard links), or any path inside
   the journal, is rejected (an entry that retention removes while this check walks the directory is skipped, unless
-  the inode number in its directory entry is the output file's).
+  the inode number in its directory entry is the output file's; the files in `seek-index/` are not journal data and are
+  not compared).
   `--to` must not precede `--from`.
   A first safe-reader pass, the startup scan, counts the selected records. It stops at `--to`, at the first empty
   slot it sees, or, with `--durable-only`, at the checkpoint bound described below; without `--to`, a visible scan
@@ -89,7 +91,7 @@ Errors and recovery warnings go to stderr. JSON results go to stdout (or the sel
   Tail and export use the durability guarantee and storage assumptions in [crash contract C13](crash-contract.md)
   and [ADR 0010](decisions/0010-durable-only-reads.md); if the writer never checkpoints, neither exposes records.
 
-- `stats <DIR> [--from <SEQ>] [--to <SEQ>] [--durable-only] [--json]`: summarize committed records
+- `stats <DIR> [--from <SEQ>] [--to <SEQ>] [--durable-only] [--seek-index] [--json]`: summarize committed records
   with totals, per-schema counts/shares/payload lengths, overall payload percentiles, separate venue/local
   timestamp summaries, and the largest gap between consecutive local timestamps. Ranges are inclusive;
   `--to` must not precede `--from`. One nonblocking startup scan accumulates the selected records once,
@@ -183,6 +185,26 @@ Errors and recovery warnings go to stderr. JSON results go to stdout (or the sel
   On a one-shot sample, `last_local_ts_ns` of the head is null when the checkpoint is at the head (the scan starts
   there and sees no record).
 
+- `index <DIR> [--rebuild | --check | --remove] [--json]`: writes, checks or removes the seek indexes of sealed segments
+  (ADR 0045, crash contract C15): files in `<DIR>/seek-index/` that let a reader which opts in start a seek inside a
+  segment (`--seek-index` of `tail`, `export` and `stats`; `ReaderConfig::seek_index`). Without an option it builds what
+  is missing or outdated: for the sealed segments before the segment of the checkpoint marker, which it makes durable
+  first, also beside a live writer; without a valid marker, for every sealed segment, if no writer has the journal open
+  (an archive). Each segment it indexes is read and validated once. An index that is right is kept (it checks the
+  index, the seal and the last indexed record); `--rebuild` writes every one anew, also one of a newer version, which is
+  otherwise kept. The user running it must own the journal's files (root gets no exception); it creates `seek-index/`
+  only as the journal directory's owner, with that directory's group and mode, if the user is in that group and the
+  directory is not writable by everyone. `--check` changes nothing, reads every segment that has or could have an index,
+  and compares every entry with it. `--remove` deletes every index and leaves the directory; what else is in it stays.
+  Text output is one line per segment: the file, the state, and the reason if there is one. Exit **0** also for segments
+  that have or get no index; **1** usage or I/O error, missing journal, no marker and an open writer, a `seek-index/` that
+  may not be used, or a segment of another user (`not_permitted`); **2** a marker that names a missing segment or
+  position, or with `--check` a wrong index. Indexes built before a failure stay. The states are below.
+
+`--seek-index` (`tail`, `export`, `stats`) lets the command's seek to `--from` start at an indexed record. The output is
+the same; records before that one are not read, so damage there, which otherwise stops the command with exit 2, goes
+unnoticed. Do not use it where someone who may not write the segments can write `seek-index/` (crash contract C15).
+
 ## Machine-readable contracts
 
 All JSON is UTF-8, compact, and ends with a newline. Integer fields are unsigned JSON numbers with their Rust
@@ -190,7 +212,7 @@ widths listed below; nullable fields use JSON `null`. Consumers must preserve u6
 is fixed for record JSONL; consumers of inspect/verify should use names. File names are basenames, converted to
 UTF-8 with replacement characters for non-UTF-8 names. Reason strings are human-readable diagnostics, not codes.
 
-Every `--json` document (`verify`, `inspect`, `stats`, `archive` and `status`) starts with `"schema_version":1`. Each
+Every `--json` document (`verify`, `inspect`, `stats`, `archive`, `index` and `status`) starts with `"schema_version":1`. Each
 command's schema is versioned on its own. Within a version, fields may be added and, where this page says a set may
 grow, enumerated string values; consumers must ignore fields they do not know. Removing a field or changing its
 meaning bumps that command's `schema_version`. Record JSONL has no `schema_version`: its keys are fixed.
@@ -290,6 +312,31 @@ in count, bytes, age order, evaluated after preceding planned removals. `report`
 it counts files and full bytes removed by this run, and planned files already absent at the oldest end due to a
 concurrent archiver. A successful empty plan yields an empty `segments` array and zero report counts (or null in
 a dry run). JSON numbers preserve their u64 interpretation; consumers should use field names.
+
+### `index --json`
+
+```text
+{"schema_version":1,"action":"build"|"check"|"remove",
+ "segments":[{"file":string,"base_seq":u64,"state":string,"ignored_by_readers":bool,"reason":string|null}, ...],
+ "removed":u64|null}
+```
+
+`segments` has one element per segment, oldest first (empty for `remove`). `file` is the segment's basename, `reason` a
+human-readable diagnostic. `removed` counts the files `--remove` deleted and is null otherwise. The set of states may
+grow:
+
+| `state` | Action | Meaning |
+|---|---|---|
+| `built` | build | An index was written |
+| `valid` | both | The index is right; with `--check`, every entry was compared with the segment. `ignored_by_readers` (`--check`): it is right, but readers ignore the file for its owner or mode (`reason` says which); a build writes it anew |
+| `missing` | check | The segment could have an index and has none |
+| `ignored` | both | A file that readers do not use because of its content: damaged, stale, another version, not a regular file. A build reports only a newer version, which it keeps |
+| `wrong` | check | A reader would use the index, and an entry in it is not on the segment's chain: forged. Exit 2 |
+| `not_needed` | both | No record starts outside the segment's first block (every 64 KiB segment) |
+| `not_sealed` | both | The segment does not end in a valid seal: it is being written, or is damaged (`reason`) |
+| `not_covered` | both | Not before the checkpoint marker's segment |
+| `not_permitted` | build | The segment is another user's, or the index cannot be given its group. Exit 1 |
+| `vanished` | both | Removed or replaced meanwhile; run it again |
 
 ### `status --json`
 

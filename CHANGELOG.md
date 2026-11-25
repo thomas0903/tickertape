@@ -5,6 +5,18 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
+- Added: seek indexes (ADR 0045, crash contract C15). `tickertape index <DIR>` (library: `seek_index::build`, `check`,
+  `remove`) writes a small file per sealed segment into `seek-index/` of the journal, and a reader opened with
+  `ReaderConfig::seek_index(true)` (C `tickertape_reader_options_set_seek_index`, C++ and Python `seek_index`, Java
+  `seekIndex`, CLI `--seek-index` of `tail`, `export` and `stats`) starts a seek in such a segment less than 64 KiB of
+  records before the target. Off by default: records before the place a seek lands on are then not read, so damage there
+  no longer stops the reader, and a forged index can mislead it. Segments of the recovery domain and the newest segment
+  have no index. The on-disk format stays version 1, released versions ignore the files (except that 1.0.0's
+  `export --output` fails if it cannot list the directory), and the C ABI stays at ABI version 1 (an added function).
+- Added: `RecoveryReport::seek_indexes_removed` and `seek_index_errors`. When it opens, the writer removes the seek
+  indexes of segments that recovery may change (`docs/format.md` → Recovery, step 2a), best effort; retention and
+  `archive` remove a segment's index after the segment. Without a `seek-index/` directory this is one failed `open` each.
+- Changed (CLI): the alias check of `export --output` no longer descends into `seek-index/`.
 - Changed: a forward `Reader::seek` within the reader's segment continues from the reader's position instead of
   reading the segment from its start again, when that position is known to be on the current chain: an earlier seek
   of the reader read a checkpoint marker that covers it, the segment file is still in place, and the record before it

@@ -245,6 +245,8 @@ pub unsafe extern "C" fn tickertape_reader_open(
 /// by replacing files), so the precondition holds in normal operation. If it is broken, returned payloads can change
 /// under the caller, and if a mapped file is truncated the process receives `SIGBUS` and dies. Use
 /// `tickertape_reader_open` when you cannot rule this out (for example, for journals on shared or untrusted storage).
+/// With `tickertape_reader_options_set_seek_index` enabled, the precondition also covers the journal's `seek-index/`
+/// directory and its `checkpoint` file, and an index builder (`tickertape index`) counts as a writer.
 ///
 /// The pointer rules of `tickertape_reader_open` also apply.
 #[unsafe(no_mangle)]
