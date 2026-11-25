@@ -490,6 +490,12 @@ pub enum Sync {
     All,
     /// The platform barrier (`F_FULLFSYNC` on macOS; on Linux it is a [`Sync::Data`] as well).
     Barrier,
+    /// Data through a mapping made for it (`msync`; a [`Sync::Msync`] as well).
+    MsyncFile,
+    /// The start of early write-back (`sync_file_range`).
+    Writeback,
+    /// Part of a mapping (`msync`). Its file is not known here: recorded with device and inode 0.
+    Msync,
 }
 
 #[cfg(feature = "fault-injection")]
@@ -535,3 +541,18 @@ pub(crate) fn note_sync(sync: Sync, file: &std::fs::File) {
 #[cfg(not(feature = "fault-injection"))]
 #[inline(always)]
 pub(crate) fn note_sync(_sync: Sync, _file: &std::fs::File) {}
+
+/// Called at each `msync`.
+#[cfg(feature = "fault-injection")]
+pub(crate) fn note_msync() {
+    syncs::LOG.with(|l| {
+        if let Some(log) = l.borrow_mut().as_mut() {
+            log.push((Sync::Msync, (0, 0)));
+        }
+    });
+}
+
+/// Called at each `msync` (no-op without the `fault-injection` feature).
+#[cfg(not(feature = "fault-injection"))]
+#[inline(always)]
+pub(crate) fn note_msync() {}

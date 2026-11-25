@@ -369,9 +369,13 @@ impl Builder<'_> {
             Err(e) => return Err(io_error("publish seek index", e).into()),
         }
         fault::hook(Point::SeekIndexAfterRename);
+        // The index stays only if the path is known to name the file that was walked.
         let identity = (meta.dev(), meta.ino());
-        if journal::path_identity(path)? != Some(identity) {
+        let in_place = journal::path_identity(path).map(|now| now == Some(identity));
+        if !matches!(in_place, Ok(true)) {
             unlink_if_same(indexes, base, &fence.file);
+        }
+        if !in_place? {
             return Ok(Some(because(
                 IndexState::Vanished,
                 "the segment was removed or replaced while its index was built",
