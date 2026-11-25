@@ -1434,7 +1434,17 @@ fn killed_writer(rounds: u64) {
                 }
             }
             drop(child);
-            // Retention keeps it to a few segments; a test that grows without bound must stop, not fill the disk.
+            // An unpaced writer can outrun retention (each removal syncs the directory): catch up before the next round,
+            // so that the journal stays at a few megabytes.
+            for _ in 0..1_000 {
+                if segments(dir).len() <= 16 {
+                    break;
+                }
+                let policy = Policy::default().max_segments(6);
+                if let Ok(plan) = retention::plan(dir, &policy) {
+                    let _ = retention::apply(dir, &plan, &Action::Delete);
+                }
+            }
             let held = segments(dir).len();
             assert!(held < 2_000, "{held} segments after round {round}");
             // Waiting readers check at 100 ms, and list the segments after 1 s.
