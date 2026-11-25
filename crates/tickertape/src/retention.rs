@@ -430,6 +430,7 @@ pub(crate) fn checkpoint(dir: &Path) -> Result<Option<CheckpointSlot>> {
     let Some(slot) = inspect::read_checkpoint(dir)? else {
         return Ok(None);
     };
+    crate::fault::hook(crate::fault::Point::MarkerRead);
     let path = journal::segment_path(dir, slot.segment_base_seq);
     let file = match File::open(&path) {
         Ok(file) => file,

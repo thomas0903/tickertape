@@ -7,7 +7,7 @@ use tickertape::seek_index::{self, IndexState, SegmentIndex};
 
 use crate::{Failure, Result, output};
 
-pub(crate) const HELP: &str = "Write seek indexes (files in seek-index/ of the journal that let a reader with the seek_index option start a seek inside a sealed segment; ADR 0045). Only sealed segments before the segment of the checkpoint marker are indexed, or, without a marker and without a running writer (an archive), every sealed segment. Safe beside a live writer and readers; run it from a timer or after archive, as the journal's owner. An index that is right is kept, unless --rebuild. Deleting the files is always safe (--remove).\n\nJSON schema (schema_version 1; fields may be added, see docs/cli.md): {\"schema_version\":1,\"action\":\"build\"|\"check\"|\"remove\",\"segments\":[{\"file\":string,\"base_seq\":u64,\"state\":\"built\"|\"valid\"|\"missing\"|\"ignored\"|\"wrong\"|\"not_needed\"|\"not_sealed\"|\"not_covered\"|\"not_permitted\"|\"vanished\",\"ignored_by_readers\":bool,\"reason\":string|null}],\"removed\":u64|null}. segments is empty for remove; removed is null otherwise. file is the segment's basename; reason is a human-readable diagnostic. The set of states may grow.\n\nExit codes: 0 success (also for segments that have or get no index); 1 usage or I/O error, missing journal, a writer is open and there is no checkpoint marker, the directory may not be used, or a segment is not_permitted; 2 corruption (a checkpoint marker that names a missing position) or, with --check, a wrong index. Segments built before a failure keep their indexes; diagnostics go to stderr.";
+pub(crate) const HELP: &str = "Write seek indexes (files in seek-index/ of the journal that let a reader with the seek_index option start a seek inside a sealed segment; ADR 0045). Only sealed segments before the segment of the checkpoint marker are indexed, or, without a marker and without a running writer (an archive), every sealed segment. Safe beside a live writer and readers; run it from a timer or after archive, as the journal's owner. An index that is right is kept, unless --rebuild. Deleting the files is always safe (--remove).\n\nJSON schema (schema_version 1; fields may be added, see docs/cli.md): {\"schema_version\":1,\"action\":\"build\"|\"check\"|\"remove\",\"segments\":[{\"file\":string,\"base_seq\":u64,\"state\":\"built\"|\"valid\"|\"missing\"|\"ignored\"|\"wrong\"|\"not_needed\"|\"not_sealed\"|\"not_covered\"|\"not_permitted\"|\"vanished\"|\"failed\",\"ignored_by_readers\":bool,\"reason\":string|null}],\"removed\":u64|null,\"unfinished\":u64|null}. segments is empty for remove; removed is null otherwise. unfinished (check only) counts files a killed build left, or one running now. file is the segment's basename; reason is a human-readable diagnostic. The set of states may grow.\n\nExit codes: 0 success (also for segments that have or get no index); 1 usage or I/O error, missing journal, a writer is open and there is no checkpoint marker, the directory may not be used, or a segment is not_permitted or failed (the others are handled all the same); 2 corruption (a checkpoint marker that names a missing position) or, with --check, a wrong index. Segments built before a failure keep their indexes; diagnostics go to stderr.";
 
 #[derive(Debug, Args)]
 #[command(group(ArgGroup::new("action").args(["rebuild", "check", "remove"])))]
@@ -20,7 +20,7 @@ pub(crate) struct IndexArgs {
     /// Change nothing: read every segment and compare every entry of every index with it
     #[arg(long)]
     check: bool,
-    /// Delete every index and leave the (then empty) directory
+    /// Delete every index, also unfinished ones; the directory and anything else in it stay
     #[arg(long)]
     remove: bool,
     /// Emit the JSON object documented below
@@ -42,6 +42,7 @@ struct Index {
     action: &'static str,
     segments: Vec<Segment>,
     removed: Option<u64>,
+    unfinished: Option<u64>,
 }
 
 fn state(state: IndexState) -> &'static str {
@@ -56,18 +57,21 @@ fn state(state: IndexState) -> &'static str {
         IndexState::NotCovered => "not_covered",
         IndexState::NotPermitted => "not_permitted",
         IndexState::Vanished => "vanished",
+        IndexState::Failed => "failed",
         _ => "unknown",
     }
 }
 
 pub(crate) fn run(args: IndexArgs, out: &mut impl Write) -> Result<()> {
-    let (action, segments, removed) = if args.remove {
-        ("remove", Vec::new(), Some(seek_index::remove(&args.dir)?))
+    let (action, segments, removed, unfinished) = if args.remove {
+        let removed = seek_index::remove(&args.dir)?;
+        ("remove", Vec::new(), Some(removed), None)
     } else if args.check {
-        ("check", seek_index::check(&args.dir)?.segments, None)
+        let report = seek_index::check(&args.dir)?;
+        ("check", report.segments, None, Some(report.unfinished))
     } else {
         let report = seek_index::build(&args.dir, args.rebuild)?;
-        ("build", report.segments, None)
+        ("build", report.segments, None, None)
     };
     let result = Index {
         action,
@@ -82,6 +86,7 @@ pub(crate) fn run(args: IndexArgs, out: &mut impl Write) -> Result<()> {
             })
             .collect(),
         removed,
+        unfinished,
     };
     if args.json {
         output::json_document(out, &result)?;
@@ -105,18 +110,36 @@ fn write_text(out: &mut impl Write, result: &Index) -> std::io::Result<()> {
     if let Some(removed) = result.removed {
         writeln!(out, "Removed {removed} files")?;
     }
+    if let Some(unfinished) = result.unfinished.filter(|n| *n > 0) {
+        writeln!(
+            out,
+            "{unfinished} unfinished index file(s), left by a killed build or being written now; --remove deletes them"
+        )?;
+    }
     Ok(())
 }
 
 fn finish(segments: &[SegmentIndex]) -> Result<()> {
     let count = |state| segments.iter().filter(|s| s.state == state).count();
     let failure = |code, message| Err(Failure { code, message });
-    match (count(IndexState::Wrong), count(IndexState::NotPermitted)) {
-        (0, 0) => Ok(()),
-        (0, n) => failure(1, format!("{n} segment(s) may not be indexed by this user")),
-        (n, _) => failure(
+    let (wrong, failed, refused) = (
+        count(IndexState::Wrong),
+        count(IndexState::Failed),
+        count(IndexState::NotPermitted),
+    );
+    if wrong > 0 {
+        failure(
             2,
-            format!("{n} seek index(es) are wrong; run with --rebuild"),
-        ),
+            format!("{wrong} seek index(es) are wrong; run with --rebuild"),
+        )
+    } else if failed > 0 {
+        failure(1, format!("{failed} segment(s) failed; see the reasons"))
+    } else if refused > 0 {
+        failure(
+            1,
+            format!("{refused} segment(s) may not be indexed by this user"),
+        )
+    } else {
+        Ok(())
     }
 }

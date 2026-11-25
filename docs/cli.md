@@ -251,8 +251,10 @@ Errors and recovery warnings go to stderr. JSON results go to stdout (or the sel
   and compares every entry with it. `--remove` deletes every index and leaves the directory; what else is in it stays.
   Text output is one line per segment: the file, the state, and the reason if there is one. Exit **0** also for segments
   that have or get no index; **1** usage or I/O error, missing journal, no marker and an open writer, a `seek-index/` that
-  may not be used, or a segment of another user (`not_permitted`); **2** a marker that names a missing segment or
-  position, or with `--check` a wrong index. Indexes built before a failure stay. The states are below.
+  may not be used, a segment of another user (`not_permitted`), or one that failed (`failed`); **2** a marker that names a missing segment or
+  position, or with `--check` a wrong index. One segment that cannot be read or indexed does not stop the others.
+  Indexes built before a failure stay. `--check` also counts unfinished files of killed builds, which `--remove` deletes.
+  The states are below.
 
 `--seek-index` (`tail`, `export`, `stats`) lets the command's seek to `--from` start at an indexed record. The output is
 the same; records before that one are not read, so damage there, which otherwise stops the command with exit 2, goes
@@ -371,12 +373,13 @@ a dry run). JSON numbers preserve their u64 interpretation; consumers should use
 ```text
 {"schema_version":1,"action":"build"|"check"|"remove",
  "segments":[{"file":string,"base_seq":u64,"state":string,"ignored_by_readers":bool,"reason":string|null}, ...],
- "removed":u64|null}
+ "removed":u64|null,"unfinished":u64|null}
 ```
 
 `segments` has one element per segment, oldest first (empty for `remove`). `file` is the segment's basename, `reason` a
-human-readable diagnostic. `removed` counts the files `--remove` deleted and is null otherwise. The set of states may
-grow:
+human-readable diagnostic. `removed` counts the files `--remove` deleted and is null otherwise. `unfinished` counts the
+temporary files that killed builds left (or that one is writing now) and is null except for `check`. The set of states
+may grow:
 
 | `state` | Action | Meaning |
 |---|---|---|
@@ -390,6 +393,7 @@ grow:
 | `not_covered` | both | Not before the checkpoint marker's segment |
 | `not_permitted` | build | The segment is another user's, or the index cannot be given its group. Exit 1 |
 | `vanished` | both | Removed or replaced meanwhile; run it again |
+| `failed` | both | Reading the segment or its index, or writing the index, failed (`reason`). The other segments are handled all the same. Exit 1 |
 
 ### `status --json`
 

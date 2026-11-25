@@ -126,19 +126,26 @@ impl IndexDir {
 
     /// The names with a meaning, by one listing through a directory stream opened for it (on btrfs a stream shows the
     /// entries of the moment it was opened, so one that is read again would not do). Collected before anything is
-    /// removed: removing entries while reading the stream can make it skip others.
-    pub(crate) fn list(&self) -> io::Result<Vec<(OsString, Name)>> {
-        fault::inject(Point::SeekIndexList)?;
+    /// removed: removing entries while reading the stream can make it skip others. A listing that fails partway gives
+    /// the names it had returned, and the error.
+    pub(crate) fn list(&self) -> (Vec<(OsString, Name)>, io::Result<()>) {
         let mut out = Vec::new();
+        let result = self.list_into(&mut out);
+        fault::filter_listing(&mut out, |(name, _)| name.as_os_str());
+        (out, result)
+    }
+
+    fn list_into(&self, out: &mut Vec<(OsString, Name)>) -> io::Result<()> {
+        fault::inject(Point::SeekIndexList)?;
         for entry in rustix::fs::Dir::read_from(&self.0)? {
             let entry = entry?;
             let name = entry.file_name().to_bytes();
             if let Some(kind) = parse_name(name) {
                 out.push((OsString::from_vec(name.to_vec()), kind));
+                fault::inject(Point::SeekIndexListEntry)?;
             }
         }
-        fault::filter_listing(&mut out, |(name, _)| name.as_os_str());
-        Ok(out)
+        Ok(())
     }
 }
 
@@ -157,8 +164,8 @@ fn retry<T>(call: impl FnMut() -> rustix::io::Result<T>) -> rustix::io::Result<T
 pub(crate) struct Swept {
     /// The directory, if there is one.
     dir: Option<IndexDir>,
-    /// Indexes of segments older than the journal's oldest, seen by the second pass.
-    orphans: Vec<OsString>,
+    /// Indexes of segments older than the journal's oldest.
+    orphans: BTreeSet<OsString>,
     removed: u64,
     /// Names that could not be removed (until a later attempt does), and other failures.
     stuck: BTreeSet<OsString>,
@@ -166,14 +173,15 @@ pub(crate) struct Swept {
 }
 
 impl Swept {
-    /// Whether the journal has a `seek-index/`, also one that could not be opened.
-    pub(crate) fn exists(&self) -> bool {
-        self.dir.is_some() || self.errors > 0
-    }
-
-    /// Counts a failed sync that belongs to the removal.
-    pub(crate) fn sync_failed(&mut self) {
-        self.errors = self.errors.saturating_add(1);
+    /// Applies the platform barrier to the directory, if there is one: best effort, a failure is counted.
+    pub(crate) fn barrier(&mut self) {
+        let applied = self.dir.as_ref().map(|dir| {
+            fault::inject(Point::SeekIndexBarrier)
+                .and_then(|()| crate::mmap::full_barrier(dir.file()))
+        });
+        if matches!(applied, Some(Err(_))) {
+            self.errors = self.errors.saturating_add(1);
+        }
     }
 
     /// After recovery: removes the indexes of segments that are gone.
@@ -222,24 +230,21 @@ pub(crate) fn sweep(journal: &Path, domain: u64, oldest: Option<u64>) -> Swept {
         }
     }
     for _ in 0..2 {
-        let Some(listed) = swept.dir.as_ref().map(IndexDir::list) else {
+        let Some((names, listed)) = swept.dir.as_ref().map(IndexDir::list) else {
             return swept;
         };
-        match listed {
-            Ok(names) => {
-                swept.orphans.clear();
-                for (name, kind) in names {
-                    match kind {
-                        Name::Temporary => swept.unlink(name),
-                        Name::Index(base) if base >= domain => swept.unlink(name),
-                        Name::Index(base) if oldest.is_some_and(|o| base < o) => {
-                            swept.orphans.push(name);
-                        }
-                        Name::Index(_) => {}
-                    }
+        for (name, kind) in names {
+            match kind {
+                Name::Temporary => swept.unlink(name),
+                Name::Index(base) if base >= domain => swept.unlink(name),
+                Name::Index(base) if oldest.is_some_and(|o| base < o) => {
+                    swept.orphans.insert(name);
                 }
+                Name::Index(_) => {}
             }
-            Err(_) => swept.errors = swept.errors.saturating_add(1),
+        }
+        if listed.is_err() {
+            swept.errors = swept.errors.saturating_add(1);
         }
         fault::hook(Point::SeekIndexListed);
     }
@@ -247,7 +252,7 @@ pub(crate) fn sweep(journal: &Path, domain: u64, oldest: Option<u64>) -> Swept {
         fault::inject(Point::SeekIndexSync).and_then(|()| crate::mmap::sync_all(dir.file()))
     });
     if matches!(synced, Some(Err(_))) {
-        swept.sync_failed();
+        swept.errors = swept.errors.saturating_add(1);
     }
     fault::hook(Point::SeekIndexRemoved);
     swept

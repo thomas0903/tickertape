@@ -286,7 +286,9 @@ Readers never modify a journal. Only the writer repairs it, on open, after takin
 6. **Persist the repairs** before returning: every in-place zeroing, seal and new file is synced, and the journal
    directory (and `quarantine/`) is synced after any create, rename or link, with the platform barrier
    (`crash-contract.md` → What `checkpoint()` does, steps 1–3). If nothing was repaired but `seek-index/` exists, the
-   barrier alone is applied, best effort, so that the removals of step 2a reach the drive before anything is appended.
+   barrier is applied to that directory's own descriptor, best effort, so that the removals of step 2a reach the drive
+   before anything is appended. No segment is synced for it: a discarded sync error of a segment's data could hide from
+   the next checkpoint that the data is lost (`crash-contract.md` → Errors are sticky).
 
 **Preserving data in `quarantine/`.** Before replacing or moving a segment, and aborting the repair with an error if
 any step fails (bytes zeroed in place are not preserved: crash contract C8):

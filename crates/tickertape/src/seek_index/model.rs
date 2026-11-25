@@ -6,6 +6,12 @@
 //! explore, and the nondeterminism that matters (what a directory listing shows of a rename that runs meanwhile, when a
 //! marker is damaged, when a process dies) is the model's own.
 //!
+//! **This model is a re-implementation of the protocol, not a proof of the code.** The code itself is driven through every
+//! interleaving of its fault points by `tests/seek_index.rs` (`no_index_of_an_old_history_survives_any_interleaving`), with
+//! one builder and one writer. Only the model has two builders, damage to the marker at any moment (also between a
+//! builder's two reads of it; the code has one case of that, `the_marker_behind_the_fence_decides`), and a listing that runs while a name is renamed; the last is also driven in the code through
+//! a stub that leaves names out of one listing.
+//!
 //! One segment `S` is modelled, sealed at first, with two builders and writers opening, dying and opening again. The
 //! variants that leave one part of the protocol out show that the model can see the failures the protocol excludes.
 

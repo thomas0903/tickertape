@@ -126,8 +126,16 @@ pub enum Point {
     SeekIndexList,
     /// Removing a name in `seek-index/`: arm with [`fail_next`].
     SeekIndexUnlink,
+    /// Reading on in a listing of `seek-index/` after a name with a meaning: arm with [`fail_next`].
+    SeekIndexListEntry,
     /// Syncing `seek-index/` after the removal at the writer's open: arm with [`fail_next`].
     SeekIndexSync,
+    /// The platform barrier on `seek-index/` at the end of an open that repaired nothing: arm with [`fail_next`].
+    SeekIndexBarrier,
+    /// Giving a new `seek-index/` its group and mode: arm with [`fail_next`].
+    SeekIndexDirMode,
+    /// Reading the checkpoint marker for retention or a seek index builder, before its segment is opened.
+    MarkerRead,
     /// The writer's open has finished one of its two passes over `seek-index/` (recovery step 2a).
     SeekIndexListed,
     /// The writer's open has finished step 2a, before recovery changes anything.
@@ -471,3 +479,59 @@ pub(crate) fn filter_listing<T>(entries: &mut Vec<T>, name: impl Fn(&T) -> &std:
 #[cfg(not(feature = "fault-injection"))]
 #[inline(always)]
 pub(crate) fn filter_listing<T>(_entries: &mut Vec<T>, _name: impl Fn(&T) -> &std::ffi::OsStr) {}
+
+/// A sync that a thread made ([`take_syncs`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Sync {
+    /// The data of a file (`fdatasync`, `fsync` on macOS).
+    Data,
+    /// A file or directory (`fsync`).
+    All,
+    /// The platform barrier (`F_FULLFSYNC` on macOS; on Linux it is a [`Sync::Data`] as well).
+    Barrier,
+}
+
+#[cfg(feature = "fault-injection")]
+mod syncs {
+    use std::cell::RefCell;
+
+    /// A sync and the device and inode of the file it was made on.
+    pub(super) type Made = (super::Sync, (u64, u64));
+
+    thread_local! {
+        pub(super) static LOG: RefCell<Option<Vec<Made>>> = const { RefCell::new(None) };
+    }
+}
+
+/// Starts recording this thread's syncs, forgetting the ones recorded before.
+#[cfg(feature = "fault-injection")]
+pub fn record_syncs() {
+    syncs::LOG.with(|l| *l.borrow_mut() = Some(Vec::new()));
+}
+
+/// Stops recording this thread's syncs and returns them, each with the device and inode of the file it was made on.
+#[cfg(feature = "fault-injection")]
+pub fn take_syncs() -> Vec<(Sync, (u64, u64))> {
+    syncs::LOG
+        .with(|l| l.borrow_mut().take())
+        .unwrap_or_default()
+}
+
+/// Called at each sync of a file.
+#[cfg(feature = "fault-injection")]
+pub(crate) fn note_sync(sync: Sync, file: &std::fs::File) {
+    use std::os::unix::fs::MetadataExt;
+    syncs::LOG.with(|l| {
+        if let Some(log) = l.borrow_mut().as_mut() {
+            if let Ok(meta) = file.metadata() {
+                log.push((sync, (meta.dev(), meta.ino())));
+            }
+        }
+    });
+}
+
+/// Called at each sync of a file (no-op without the `fault-injection` feature).
+#[cfg(not(feature = "fault-injection"))]
+#[inline(always)]
+pub(crate) fn note_sync(_sync: Sync, _file: &std::fs::File) {}

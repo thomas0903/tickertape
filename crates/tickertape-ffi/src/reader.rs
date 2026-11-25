@@ -298,7 +298,9 @@ pub unsafe extern "C" fn tickertape_reader_close(
 /// the current chain (from 1.1). Records before that position are then not validated again, and if storage damage
 /// destroyed the checkpoint marker, or set it back to an older one, together with covered records, the position can be
 /// off the current chain unnoticed (`docs/crash-contract.md`, "Readers after a repair"); a seek to the last record the
-/// reader passed, or an earlier one, scans the segment, and so does a new reader. Any call invalidates the record view
+/// reader passed, or an earlier one, scans the segment, and so does a new reader. With the seek-index option
+/// (`tickertape_reader_options_set_seek_index`, from 1.1), the way may start at an indexed record before `seq`. Records
+/// before it are not read, and crash contract C15 says where the landing place can be off the chain. Any call invalidates the record view
 /// returned by `tickertape_reader_next`. A successful seek also discards a record held back by
 /// `tickertape_reader_next_copy` or `tickertape_reader_read_batch`, and an error deferred by
 /// `tickertape_reader_read_batch`; a failed seek leaves the reader exactly as it was (same position, held-back

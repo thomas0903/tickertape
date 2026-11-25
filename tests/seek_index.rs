@@ -1047,6 +1047,73 @@ fn the_writers_open_removes_the_indexes_of_the_recovery_domain() {
     }
 }
 
+/// (Plan 7, durability of the removal) At an open that repairs nothing, the only syncs for `seek-index/` are on that
+/// directory: never on the active segment, whose first sync must be the first checkpoint's, to report a write-back error
+/// of data that an earlier writer left (crash contract C7, C12, "Errors are sticky").
+#[test]
+fn a_clean_open_syncs_the_index_directory_and_no_segment() {
+    use tickertape::fault::Sync;
+    let identity = |path: &Path| {
+        let meta = std::fs::metadata(path).unwrap();
+        (meta.dev(), meta.ino())
+    };
+    // Without `seek-index/`, with an empty one, with one that holds something, and with one that cannot be opened.
+    for case in 0..4 {
+        let (dir, mut writer) = indexed(64, 1);
+        for _ in 0..60 {
+            append(&mut writer, 1, 64);
+        }
+        // Not checkpointed, as after a kill.
+        drop(writer);
+        let indexes = index_dir(dir.path());
+        if case < 2 {
+            std::fs::remove_dir_all(&indexes).unwrap();
+        }
+        if case == 1 {
+            std::fs::create_dir(&indexes).unwrap();
+        }
+        if case == 3 {
+            std::fs::set_permissions(&indexes, Permissions::from_mode(0o000)).unwrap();
+        }
+        fault::clear();
+        fault::record_syncs();
+        let mut writer = Writer::open(dir.path(), config()).unwrap();
+        let syncs = fault::take_syncs();
+        assert_eq!(writer.recovery_report().actions, []);
+        // The barrier works on a directory, also on macOS (`F_FULLFSYNC`).
+        assert!(case == 3 || writer.recovery_report().seek_index_errors == 0);
+        if case == 3 {
+            std::fs::set_permissions(&indexes, Permissions::from_mode(0o755)).unwrap();
+        }
+        for (_, path) in segments(dir.path()) {
+            let of_segment: Vec<_> = syncs.iter().filter(|s| s.1 == identity(&path)).collect();
+            assert!(of_segment.is_empty(), "case {case}: {of_segment:?}");
+        }
+        if indexes.exists() {
+            let id = identity(&indexes);
+            let opened = case != 3 || syncs.iter().any(|s| s.1 == id);
+            for kind in [Sync::All, Sync::Barrier] {
+                let made = syncs.contains(&(kind, id));
+                assert_eq!(made, opened, "case {case}: {kind:?}");
+            }
+            // The sync of the removal, then the barrier.
+            let at = |kind| syncs.iter().position(|s| *s == (kind, id));
+            assert!(at(Sync::All) <= at(Sync::Barrier));
+        }
+        writer.checkpoint().unwrap();
+        drop(writer);
+        if case == 2 {
+            // Both are best effort, and counted.
+            for point in [Point::SeekIndexSync, Point::SeekIndexBarrier] {
+                fault::clear();
+                fault::fail_next(point, libc::EIO);
+                let writer = Writer::open(dir.path(), config()).unwrap();
+                assert_eq!(writer.recovery_report().seek_index_errors, 1, "{point:?}");
+            }
+        }
+    }
+}
+
 /// (Plan 7) What the open removes goes by name.
 #[test]
 fn the_removal_goes_by_name() {
@@ -1083,6 +1150,26 @@ fn the_removal_goes_by_name() {
 
     // A dangling marker refuses the open and leaves every index; so does a marker whose offset is not one.
     std::fs::write(dir_path.join(&names[0]), b"x").unwrap();
+    let marker = dir.path().join("checkpoint");
+    let good = std::fs::read(&marker).unwrap();
+    let slot = tickertape::inspect::read_checkpoint(dir.path())
+        .unwrap()
+        .unwrap();
+    for offset in [65, 56, SEGMENT] {
+        let mut bad = slot;
+        bad.generation += 1;
+        bad.offset = offset;
+        let mut bytes = good.clone();
+        let at = format::CHECKPOINT_SLOT_OFFSETS[(bad.generation % 2) as usize];
+        bytes[at..at + 64].copy_from_slice(&format::encode_checkpoint_slot(&bad));
+        std::fs::write(&marker, bytes).unwrap();
+        assert!(matches!(
+            Writer::open(dir.path(), config()),
+            Err(Error::Corrupt { .. })
+        ));
+        assert_eq!(index_names(dir.path()).len(), left.len() + 1, "{offset}");
+    }
+    std::fs::write(&marker, good).unwrap();
     let moved = dir.path().join("moved");
     std::fs::rename(&segs[2].1, &moved).unwrap();
     assert!(matches!(
@@ -1126,6 +1213,62 @@ fn the_removal_goes_by_name() {
     assert_eq!(seek_index::remove(dir.path()).unwrap(), 3);
     assert_eq!(seek_index::remove(dir.path()).unwrap(), 0);
     assert!(dir_path.join("notes.txt").exists());
+}
+
+/// (Plan 7) Orphans go after recovery: an open that recovery refuses leaves them.
+#[test]
+fn orphans_are_removed_after_recovery() {
+    let (dir, mut writer) = indexed(64, 2);
+    for _ in 0..20 {
+        append(&mut writer, 1, 64);
+    }
+    let last = writer.next_seq() - 10;
+    drop(writer);
+    std::fs::remove_file(&segments(dir.path())[0].1).unwrap();
+    let (path, at) = tickertape_tests::locate_record(dir.path(), last);
+    open_raw(&path).write_all_at(&[0xEE], at + 50).unwrap();
+    let refusing = config().recovery(RecoveryPolicy::Fail);
+    assert!(matches!(
+        Writer::open(dir.path(), refusing),
+        Err(Error::Corrupt { .. })
+    ));
+    assert!(index_path(dir.path(), 0).exists());
+    let writer = Writer::open(dir.path(), config()).unwrap();
+    assert_eq!(writer.recovery_report().seek_indexes_removed, 1);
+    assert!(!index_path(dir.path(), 0).exists());
+}
+
+/// (Plan 7) A listing that fails partway: what it had returned is removed, and the failure counted.
+#[test]
+fn a_listing_that_fails_partway_removes_what_it_returned() {
+    let (dir, writer) = indexed(64, 1);
+    drop(writer);
+    let temporary = |n: u64| index_dir(dir.path()).join(format!(".{n:020}.1.1.idx-tmp"));
+    for n in 0..3 {
+        std::fs::write(temporary(n), b"x").unwrap();
+    }
+    std::fs::remove_file(index_path(dir.path(), 0)).unwrap();
+    fault::clear();
+    // Both passes fail after their first name.
+    fault::fail_next(Point::SeekIndexListEntry, libc::EIO);
+    fault::fail_next(Point::SeekIndexListEntry, libc::EIO);
+    let writer = Writer::open(dir.path(), config()).unwrap();
+    let report = writer.recovery_report();
+    assert_eq!(
+        (report.seek_indexes_removed, report.seek_index_errors),
+        (2, 2)
+    );
+    assert_eq!(index_names(dir.path()).len(), 1);
+    // `remove` alike.
+    for n in 0..3 {
+        std::fs::write(temporary(n), b"x").unwrap();
+    }
+    fault::fail_next(Point::SeekIndexListEntry, libc::EIO);
+    assert!(matches!(
+        seek_index::remove(dir.path()),
+        Err(Error::Io { .. })
+    ));
+    assert_eq!(index_names(dir.path()).len(), 2);
 }
 
 /// (Plan 7) The second pass sees what a listing missed: a name created during the first, and both names of a rename.
@@ -2123,14 +2266,14 @@ fn a_build_starts_again_at_most_three_times() {
                 });
             }
         }
-        let result = seek_index::build(dir.path(), false);
+        let result = seek_index::build(dir.path(), false).unwrap();
         fault::clear();
         assert_eq!(fences.get(), 4.min(opens + 1));
         if opens == 4 {
-            assert!(matches!(result, Err(Error::Io { .. })), "{result:?}");
+            assert_eq!(result.segments[0].state, IndexState::Failed, "{result:?}");
             assert!(index_names(dir.path()).is_empty());
         } else {
-            assert_eq!(result.unwrap().segments[0].state, IndexState::Built);
+            assert_eq!(result.segments[0].state, IndexState::Built);
             assert_eq!(check(dir.path())[0], IndexState::Valid);
             assert_eq!(index_names(dir.path()).len(), 1);
         }
@@ -2246,6 +2389,190 @@ fn the_marker_is_made_durable_before_the_walk() {
     );
 }
 
+/// One segment or name that fails does not end a build or a check: the others are handled, and it is reported.
+#[test]
+fn one_failure_does_not_stop_the_other_segments() {
+    let (dir, _writer) = indexed(64, 4);
+    seek_index::remove(dir.path()).unwrap();
+    let segs = segments(dir.path());
+    let mode = |path: &Path, m| std::fs::set_permissions(path, Permissions::from_mode(m)).unwrap();
+    // A directory with the name of an index, and a segment that cannot be read.
+    std::fs::create_dir(index_path(dir.path(), 0)).unwrap();
+    mode(&segs[2].1, 0o000);
+    if std::fs::read(&segs[2].1).is_ok() {
+        return; // root
+    }
+    use IndexState::*;
+    let report = seek_index::build(dir.path(), false).unwrap();
+    let got = states(&report.segments);
+    assert_eq!(got, [Failed, Built, Failed, Built, NotCovered]);
+    assert!(
+        report.segments[2]
+            .reason
+            .as_ref()
+            .unwrap()
+            .contains("denied")
+    );
+    mode(&index_path(dir.path(), segs[1].0), 0o000);
+    let checked = check(dir.path());
+    assert_eq!(checked, [Ignored, Failed, Failed, Valid, NotCovered]);
+    mode(&segs[2].1, 0o644);
+    mode(&index_path(dir.path(), segs[1].0), 0o644);
+    std::fs::remove_dir(index_path(dir.path(), 0)).unwrap();
+    assert_eq!(build(dir.path()), [Built, Valid, Built, Valid, NotCovered]);
+}
+
+/// What a killed build left is reported by `check` (in an archive nothing else removes it) and cleared by `remove`.
+#[test]
+fn unfinished_indexes_are_reported() {
+    let (dir, writer) = indexed(64, 1);
+    drop(writer);
+    let archive = tempfile::tempdir().unwrap();
+    let name = format::segment_file_name(0);
+    std::fs::copy(dir.path().join(&name), archive.path().join(&name)).unwrap();
+    build(archive.path());
+    assert_eq!(seek_index::check(archive.path()).unwrap().unfinished, 0);
+    kill_child("fence", archive.path());
+    kill_child("before-rename", archive.path());
+    let report = seek_index::check(archive.path()).unwrap();
+    assert_eq!(
+        (report.unfinished, report.segments[0].state),
+        (2, IndexState::Valid)
+    );
+    assert_eq!(seek_index::remove(archive.path()).unwrap(), 3);
+    assert_eq!(seek_index::check(archive.path()).unwrap().unfinished, 0);
+}
+
+/// Beside a live writer with retention, the segment of a marker just read can be gone when it is opened: the marker has
+/// moved on, and is read again.
+#[test]
+fn a_marker_that_moves_on_is_not_dangling() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut writer = Writer::open(dir.path(), config()).unwrap();
+    fill(&mut writer, dir.path(), 1, 64, 1);
+    writer.checkpoint().unwrap();
+    let marker = dir.path().join("checkpoint");
+    let older = std::fs::read(&marker).unwrap();
+    fill(&mut writer, dir.path(), 1, 64, 4);
+    writer.checkpoint().unwrap();
+    let newer = std::fs::read(&marker).unwrap();
+    drop(writer);
+    let segs = segments(dir.path());
+    let hidden = dir.path().join("hidden");
+    std::fs::create_dir(&hidden).unwrap();
+    let run = |what: &dyn Fn()| {
+        // The older marker, which names segment 1; as it is about to be opened, retention has run and the marker moved.
+        std::fs::write(&marker, &older).unwrap();
+        let (marker, newer, hide) = (marker.clone(), newer.clone(), hidden.clone());
+        let gone = segs[..2].to_vec();
+        fault::clear();
+        fault::run_at(Point::MarkerRead, 0, move || {
+            std::fs::write(&marker, &newer).unwrap();
+            for (_, path) in &gone {
+                std::fs::rename(path, hide.join(path.file_name().unwrap())).unwrap();
+            }
+        });
+        what();
+        for (_, path) in &segs[..2] {
+            std::fs::rename(hidden.join(path.file_name().unwrap()), path).unwrap();
+        }
+    };
+    run(&|| {
+        let built = build(dir.path());
+        assert_eq!(built[..2], [IndexState::Vanished; 2]);
+        assert_eq!(built[2..4], [IndexState::Built; 2]);
+    });
+    run(&|| assert_eq!(check(dir.path())[2..4], [IndexState::Valid; 2]));
+    // A marker that stays and names a segment that is gone is one.
+    std::fs::write(&marker, &older).unwrap();
+    std::fs::remove_file(&segs[1].1).unwrap();
+    assert!(matches!(
+        seek_index::build(dir.path(), false),
+        Err(Error::Corrupt { .. })
+    ));
+}
+
+/// The descriptor of the walked segment stays open until the identity check, so that no other file can have its inode.
+#[test]
+fn the_segment_stays_open_until_its_identity_is_checked() {
+    let (dir, _writer) = indexed(64, 1);
+    let meta = std::fs::metadata(&segments(dir.path())[0].1).unwrap();
+    let held = Rc::new(Cell::new(false));
+    let seen = Rc::clone(&held);
+    fault::clear();
+    fault::run_at(Point::SeekIndexAfterRename, 0, move || {
+        seen.set((0..1024).any(|fd| {
+            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+            // SAFETY: `stat` is valid for writing; a descriptor that is not open is an error.
+            if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
+                return false;
+            }
+            // SAFETY: filled by the call, which succeeded.
+            let stat = unsafe { stat.assume_init() };
+            (stat.st_dev as u64, stat.st_ino) == (meta.dev(), meta.ino())
+        }));
+    });
+    // The journal's writer is closed: it would hold segments of its own open, though not this one.
+    assert_eq!(
+        states(&seek_index::build(dir.path(), true).unwrap().segments)[0],
+        IndexState::Built
+    );
+    assert!(held.get());
+}
+
+/// If a new `seek-index/` cannot be given its group and mode, it is removed again.
+#[test]
+fn a_new_directory_that_cannot_be_set_up_is_removed() {
+    let (dir, _writer) = indexed(64, 1);
+    seek_index::remove(dir.path()).unwrap();
+    std::fs::remove_dir(index_dir(dir.path())).unwrap();
+    fault::clear();
+    fault::fail_next(Point::SeekIndexDirMode, libc::EPERM);
+    assert!(matches!(
+        seek_index::build(dir.path(), false),
+        Err(Error::Io { .. })
+    ));
+    assert!(!index_dir(dir.path()).exists());
+    assert_eq!(build(dir.path())[0], IndexState::Built);
+}
+
+/// An entry whose 8 bytes are in the segment, inside a payload, but not at the start of a valid frame: no reader lands
+/// there, so it is not `Wrong`.
+#[test]
+fn an_entry_whose_bytes_start_no_frame_is_not_wrong() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut writer = Writer::open(dir.path(), config()).unwrap();
+    for _ in 0..1_000 {
+        append(&mut writer, 1, 64);
+    }
+    let mut payload = [0; 64];
+    payload[..4].copy_from_slice(&40_u32.to_le_bytes());
+    payload[4..8].copy_from_slice(&0x1234_5678_u32.to_le_bytes());
+    writer
+        .append(&NewRecord {
+            schema_id: 7,
+            venue_ts_ns: 0,
+            local_ts_ns: 0,
+            payload: &payload,
+        })
+        .unwrap();
+    fill(&mut writer, dir.path(), 1, 64, 1);
+    writer.checkpoint().unwrap();
+    build(dir.path());
+    let path = segments(dir.path())[0].1.clone();
+    let (records, seal) = chain(&path);
+    let entry = Entry {
+        seq: 1_000,
+        offset: records[1_000].offset + 40,
+        len: 40,
+        crc: 0x1234_5678,
+    };
+    let index = forge(&path, &[entry], (seal, records.last().unwrap().seq + 1));
+    std::fs::write(index_path(dir.path(), 0), index).unwrap();
+    assert_eq!(all_agree(dir.path(), &[1_000, 2_000], 3), 0);
+    assert_eq!(check(dir.path())[0], IndexState::Ignored);
+}
+
 /// (Plan 12) What decides is the marker read behind the fence, not the one read before it: here the marker goes back to
 /// an older one, which names the segment itself, in between.
 #[test]
@@ -2277,8 +2604,10 @@ fn errors_and_other_files_in_the_way_of_a_build() {
     let good = std::fs::read(&index).unwrap();
     fault::clear();
     fault::fail_next(Point::SeekIndexWrite, libc::ENOSPC);
-    let error = seek_index::build(dir.path(), true).unwrap_err();
-    assert!(error.is_storage_full(), "{error}");
+    let report = seek_index::build(dir.path(), true).unwrap();
+    assert_eq!(report.segments[0].state, IndexState::Failed);
+    let reason = report.segments[0].reason.as_ref().unwrap();
+    assert!(reason.contains("No space left"), "{reason}");
     assert_eq!(index_names(dir.path()).len(), 1);
     assert_eq!(std::fs::read(&index).unwrap(), good, "the old one stays");
     // A newer version is kept, whatever else is in it; `rebuild` replaces it.
@@ -2314,13 +2643,10 @@ fn errors_and_other_files_in_the_way_of_a_build() {
     // A directory there cannot be replaced.
     std::fs::remove_file(&index).unwrap();
     std::fs::create_dir(&index).unwrap();
-    assert!(matches!(
-        seek_index::build(dir.path(), false),
-        Err(Error::Io { .. })
-    ));
+    assert_eq!(build(dir.path())[0], IndexState::Failed);
     assert_eq!(index_names(dir.path()).len(), 1);
     std::fs::remove_dir(&index).unwrap();
-    // Names a builder would take: each is skipped.
+    // The name a builder takes. (One that is taken: `seek_index::tests::a_taken_name_is_skipped`.)
     let path = dir.path().to_path_buf();
     let taken = Rc::new(Cell::new(0));
     let count = Rc::clone(&taken);
@@ -2462,6 +2788,17 @@ fn a_directory_without_a_marker() {
     assert!(index_names(dir.path()).is_empty());
     drop(writer);
     let built = [IndexState::Built, IndexState::Built, IndexState::NotSealed];
+    // The lock is probed behind the fence.
+    let path = dir.path().to_path_buf();
+    let fenced = Rc::new(Cell::new(false));
+    let seen = Rc::clone(&fenced);
+    fault::clear();
+    fault::run_at(Point::SeekIndexProbe, 0, move || {
+        seen.set(index_names(&path).iter().any(|n| n.ends_with(".idx-tmp")));
+    });
+    assert_eq!(build(dir.path()), built);
+    assert!(fenced.get());
+    seek_index::remove(dir.path()).unwrap();
     // While another builder probes: shared locks do not refuse each other. And a child forked then holds a copy of the
     // descriptor, not the lock.
     let path = dir.path().to_path_buf();

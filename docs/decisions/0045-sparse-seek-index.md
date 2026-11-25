@@ -1,7 +1,8 @@
 # 0045: A sparse, rebuildable seek index next to sealed segments
 
 - **Status:** accepted on 2026-11-25 (issue #59); corrected on 2026-11-25 to match the final ADR
-  [0046](0046-seeks-that-need-no-index.md), marked where it applies, and then built as described
+  [0046](0046-seeks-that-need-no-index.md) and on 2026-11-26 (which descriptor the barrier at writer open is on), marked
+  where it applies, and built as described
 - **Date:** 2026-11-25
 - **Follows up:** [0042](0042-replay-and-recovery-at-scale.md), option 2 (deferred there for 1.0; that decision
   stands, this record takes the option up for 1.x)
@@ -432,6 +433,10 @@ segment), which serves the more common seek.
   was removed (an earlier open may have died between unlink and sync). Today recovery's final directory syncs and
   `full_barrier` run only when `actions` is not empty; the barrier now also runs, best effort if `actions` is empty,
   when `seek-index/` exists, so on macOS the unlink is on the drive before anything is appended to a repaired segment.
+  (Corrected 2026-11-26: that barrier is applied to the descriptor of `seek-index/`, never to a segment's. A best-effort
+  sync of the active segment would consume a write-back error that the first checkpoint must report, crash contract C7
+  and "Errors are sticky", since Linux reports one once per open file description. If `seek-index/` cannot be opened there
+  is no barrier: nothing was removed.)
   (If a power loss before the barrier brings the index back, the segment holds no new history yet: step 6, 8a or 8b
   rejects the entry, or it points at a record recovery kept.)
 - **Retention and `archive`** unlink `{base}.idx` (a later kind's file is left to the next writer open) after the

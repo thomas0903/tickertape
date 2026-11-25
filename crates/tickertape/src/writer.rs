@@ -1789,9 +1789,11 @@ impl Recovery<'_> {
             }
             mmap::full_barrier(&seg.file)
                 .map_err(|e| Error::io("full sync segment", &seg.path, e))?;
-        } else if swept.exists() && mmap::full_barrier(&seg.file).is_err() {
+        } else {
             // The removal of indexes reaches the drive before anything is appended; best effort, as the removal is.
-            swept.sync_failed();
+            // Through the directory's own descriptor, never the segment's: a sync here that fails would consume the
+            // write-back error that the first checkpoint must report (crash contract, "Errors are sticky").
+            swept.barrier();
         }
         self.count_swept(&mut swept);
 

@@ -652,8 +652,11 @@ impl Reader {
         crate::fault::hook(crate::fault::Point::ReaderSeekIndexLanding);
         self.buf.clear();
         let valid = self.holds_record(&entry).unwrap_or(false);
-        // What was read is not kept: every seek leaves the buffer empty.
+        // What was read is not kept: every seek leaves the buffer empty, and a mapped reader has no other use for it.
         self.buf.clear();
+        if self.mapped {
+            self.buf = Vec::new();
+        }
         valid.then_some(entry)
     }
 
@@ -1934,6 +1937,80 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// 8b fails where the file ends inside the record by then (no panic, no error, no landing), and where it holds another
+    /// valid record with the same sequence number and length: its stored CRC is not the entry's.
+    #[test]
+    #[cfg(feature = "fault-injection")]
+    fn eight_b_reads_the_record_that_was_indexed_or_nothing() {
+        let (dir, entry) = indexed_journal(1 << 20);
+        let path = crate::journal::segment_path(dir.path(), 0);
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        let image = std::fs::read(crate::journal::segment_path(dir.path(), 0)).unwrap();
+        let mut other = vec![0; entry.len as usize];
+        let fields = crate::format::RecordHeader {
+            seq: entry.seq,
+            schema_id: 1,
+            venue_ts_ns: 0,
+            local_ts_ns: 0,
+        };
+        crate::format::encode_record_body(&fields, &[0x22; 64], &mut other[4..]);
+        other[..4].copy_from_slice(&entry.len.to_le_bytes());
+        let scan = |reader: &mut Reader| {
+            let mut got = Vec::new();
+            while let Ok(Some(record)) = reader.next_owned() {
+                got.push(record);
+            }
+            got
+        };
+        // A mapped reader must not meet a truncated file.
+        let cases = [0, 2, 4, 50]
+            .map(|cut| (false, Some(entry.offset + cut)))
+            .into_iter()
+            .chain([(false, None), (true, None)]);
+        for (mapped, cut) in cases {
+            let mut reader = open_indexed(dir.path(), mapped);
+            let (at, frame) = (file.try_clone().unwrap(), other.clone());
+            crate::fault::clear();
+            crate::fault::run_at(
+                crate::fault::Point::ReaderSeekIndexLanding,
+                0,
+                move || match cut {
+                    Some(len) => at.set_len(len).unwrap(),
+                    None => at.write_all_at(&frame, entry.offset).unwrap(),
+                },
+            );
+            reader.seek(900).unwrap();
+            assert!(!reader.used_index, "mapped {mapped}, cut {cut:?}");
+            assert_eq!((reader.offset, reader.next_seq), (64, 0));
+            assert!(reader.buf.is_empty());
+            file.set_len(image.len() as u64).unwrap();
+            file.write_all_at(&image, 0).unwrap();
+            let mut plain = open_reader(dir.path(), mapped);
+            plain.seek(900).unwrap();
+            let want = scan(&mut plain);
+            assert_eq!(want.len(), 100);
+            assert_eq!(scan(&mut reader), want);
+        }
+    }
+
+    /// A mapped reader reads nothing into its buffer but the landing record: it does not keep it.
+    #[test]
+    #[cfg(feature = "fault-injection")]
+    fn a_mapped_reader_does_not_keep_the_landing_record() {
+        let (dir, _) = indexed_journal(1 << 20);
+        let mut reader = open_indexed(dir.path(), true);
+        reader.seek(900).unwrap();
+        assert!(reader.used_index);
+        if MAPPED_READS {
+            assert_eq!(reader.buf.capacity(), 0);
+        }
+        assert_eq!(reader.try_next().unwrap().unwrap().seq, 900);
     }
 
     /// A seek that lands through an index forgets what an earlier seek knew to be covered, and empties the buffer (step

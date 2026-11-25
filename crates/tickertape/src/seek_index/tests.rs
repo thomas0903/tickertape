@@ -134,6 +134,31 @@ fn test_vector() {
     );
 }
 
+/// A fence takes the next number where a name is taken, and the file it finds there stays.
+#[test]
+#[cfg_attr(miri, ignore = "files")]
+fn a_taken_name_is_skipped() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join(DIR_NAME);
+    std::fs::create_dir(&path).unwrap();
+    let indexes = IndexDir::open(root.path()).unwrap().unwrap();
+    let name = |n| dir::tmp_name(7, std::process::id(), n);
+    for n in [10, 11] {
+        std::fs::write(path.join(name(n)), b"another builder's").unwrap();
+    }
+    let fence = Fence::create(&indexes, 7, 10).unwrap();
+    assert_eq!(fence.name, name(12));
+    assert!(path.join(name(12)).exists());
+    drop(fence);
+    assert!(!path.join(name(12)).exists());
+    for n in [10, 11] {
+        assert_eq!(
+            std::fs::read(path.join(name(n))).unwrap(),
+            b"another builder's"
+        );
+    }
+}
+
 #[test]
 fn spacing() {
     let gib = 1_u64 << 30;

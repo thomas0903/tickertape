@@ -1933,6 +1933,8 @@ public:
     // segment files (no writing into, truncating or replacing their contents). A tickertape writer never changes
     // committed bytes, so this holds in normal operation. If it is broken, payloads can change under you, and a
     // truncated file kills the process with SIGBUS. Use open() when you cannot rule this out.
+    // With ReaderOptions::seek_index enabled, the precondition also covers the journal's `seek-index/` directory and its
+    // `checkpoint` file, and an index builder (`tickertape index`) counts as a writer.
     static result<Reader> open_mapped_unsafe(const detail::PathArg &dir) { return open_impl(dir, nullptr, true); }
     static result<Reader> open_mapped_unsafe(const detail::PathArg &dir, const ReaderOptions &options) {
         if (auto checked = detail::check_options(options); !checked) {
@@ -1949,6 +1951,8 @@ public:
     // then not validated again, and after storage damage that also destroyed the checkpoint marker, or set it back to
     // an older one, the position can be off the current chain unnoticed (see tickertape_reader_seek). A seek to the
     // last record the reader passed, or an earlier one, scans the segment, and so does a new reader.
+    // With the seek-index option (ReaderOptions::seek_index, from 1.1), the way may start at an indexed record before
+    // `seq`. Records before it are not read, and crash contract C15 says where the landing place can be off the chain.
     // A successful seek discards a record held back and an error deferred by next_copy or read_batch; a failed
     // one changes nothing. Errors: Status::seq_unavailable (retention removed it: seek to list_segments()'s first
     // base_seq to continue), not_found, corrupt, io.

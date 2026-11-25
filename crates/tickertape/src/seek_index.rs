@@ -12,7 +12,6 @@
 //! The file format and everything a wrong index can and cannot do are in `docs/format.md` (Seek index),
 //! `docs/crash-contract.md` (C15) and ADR 0045.
 
-use std::ffi::OsString;
 use std::fs::File;
 use std::io;
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
@@ -68,6 +67,9 @@ pub enum IndexState {
     NotPermitted,
     /// The segment was removed or replaced meanwhile.
     Vanished,
+    /// Reading the segment or its index, or writing the index, failed (the reason says how). The other segments are
+    /// handled all the same.
+    Failed,
 }
 
 /// One segment in a [`BuildReport`] or [`CheckReport`].
@@ -110,6 +112,9 @@ pub struct BuildReport {
 pub struct CheckReport {
     /// The segments.
     pub segments: Vec<SegmentIndex>,
+    /// Unfinished indexes: what a build that was killed left, or one running now. Nobody reads them. The next open of a
+    /// writer removes them, and so does [`remove`], which is the only way where no writer opens (an archive).
+    pub unfinished: u64,
 }
 
 /// A segment's state and the reason for it.
@@ -137,9 +142,10 @@ fn because(state: IndexState, reason: impl ToString) -> Outcome {
 ///
 /// [`Error::NotFound`] if the journal has no segments; [`Error::Corrupt`] for a checkpoint marker whose segment or
 /// position does not exist; [`Error::Locked`] if there is no marker and a writer has the journal open; [`Error::Io`]
-/// for I/O errors, if the directory may not be used or created, or if writers kept opening the journal during a build.
-/// Indexes written before the error stay. A segment whose header or records are damaged is not an error
-/// ([`IndexState::NotSealed`]).
+/// if the journal directory or the marker cannot be read, the marker cannot be synced, or the index directory may not be
+/// used or created. Indexes written before the error stay. What fails for one segment does not end the run
+/// ([`IndexState::Failed`]: an I/O error, or writers that kept opening the journal during its build), and a segment whose
+/// header or records are damaged is no failure at all ([`IndexState::NotSealed`]).
 pub fn build(dir: impl AsRef<Path>, rebuild: bool) -> Result<BuildReport> {
     let dir = dir.as_ref();
     let segments = journal::list_segments(dir)?;
@@ -162,7 +168,11 @@ pub fn build(dir: impl AsRef<Path>, rebuild: bool) -> Result<BuildReport> {
         let outcome = if marker.is_some_and(|m| base >= m.segment_base_seq) {
             (IndexState::NotCovered, None)
         } else {
-            builder.segment(base, &path)?
+            match builder.segment(base, &path) {
+                Ok(outcome) => outcome,
+                Err(Stop::Segment(e)) => because(IndexState::Failed, e),
+                Err(Stop::Run(e)) => return Err(e),
+            }
         };
         report.segments.push(SegmentIndex::new(base, outcome));
     }
@@ -190,8 +200,8 @@ struct Fence<'d> {
 }
 
 impl Fence<'_> {
-    fn create(dir: &IndexDir, base: u64) -> io::Result<Fence<'_>> {
-        let mut n = crate::clock::realtime_ns();
+    /// Creates the file under the first free name from `n` on.
+    fn create(dir: &IndexDir, base: u64, mut n: u64) -> io::Result<Fence<'_>> {
         loop {
             let name = dir::tmp_name(base, std::process::id(), n);
             match dir.create(&name) {
@@ -218,8 +228,20 @@ impl Drop for Fence<'_> {
     }
 }
 
+/// Why a build stopped: for one segment, or for all of them.
+enum Stop {
+    Segment(Error),
+    Run(Error),
+}
+
+impl From<Error> for Stop {
+    fn from(e: Error) -> Stop {
+        Stop::Segment(e)
+    }
+}
+
 impl Builder<'_> {
-    fn segment(&mut self, base: u64, path: &Path) -> Result<Outcome> {
+    fn segment(&mut self, base: u64, path: &Path) -> std::result::Result<Outcome, Stop> {
         let (file, header) = match open_segment(base, path)? {
             Ok(opened) => opened,
             Err(outcome) => return Ok(outcome),
@@ -244,7 +266,7 @@ impl Builder<'_> {
         drop(file);
         let indexes = match self.indexes.take() {
             Some(indexes) => indexes,
-            None => create_index_dir(self.dir, &self.root, self.euid)?,
+            None => create_index_dir(self.dir, &self.root, self.euid).map_err(Stop::Run)?,
         };
         let mut outcome = None;
         for _ in 0..=RESTARTS {
@@ -255,11 +277,11 @@ impl Builder<'_> {
         }
         self.indexes = Some(indexes);
         outcome.unwrap_or_else(|| {
-            Err(Error::io(
+            Err(Stop::Segment(Error::io(
                 "build seek index",
                 path,
                 io::Error::other("writers kept opening the journal during the build; run it again"),
-            ))
+            )))
         })
     }
 
@@ -271,22 +293,28 @@ impl Builder<'_> {
     }
 
     /// Steps 2 to 6. `None`: the temporary file is gone, so a writer has opened the journal meanwhile; start again.
-    fn attempt(&mut self, indexes: &IndexDir, base: u64, path: &Path) -> Result<Option<Outcome>> {
+    fn attempt(
+        &mut self,
+        indexes: &IndexDir,
+        base: u64,
+        path: &Path,
+    ) -> std::result::Result<Option<Outcome>, Stop> {
         let index_path = self.dir.join(DIR_NAME).join(dir::index_name(base));
         let io_error = |op, e| Error::io(op, &index_path, e);
         // The fence comes before everything below (ADR 0045 → Why the fence is enough).
-        let mut fence =
-            Fence::create(indexes, base).map_err(|e| io_error("create seek index", e))?;
+        let mut fence = Fence::create(indexes, base, crate::clock::realtime_ns())
+            .map_err(|e| io_error("create seek index", e))?;
         fault::hook(Point::SeekIndexFence);
         let marker = settled(self.dir, || {
             retention::durable_checkpoint(self.dir, &mut self.synced)
-        })?;
+        })
+        .map_err(Stop::Run)?;
         match marker {
             Some(marker) if base >= marker.segment_base_seq => {
                 return Ok(Some((IndexState::NotCovered, None)));
             }
             Some(_) => {}
-            None => probe_lock(self.dir)?,
+            None => probe_lock(self.dir).map_err(Stop::Run)?,
         }
         fault::hook(Point::SeekIndexEligible);
 
@@ -308,7 +336,7 @@ impl Builder<'_> {
                     "the index cannot be given the segment's group",
                 )));
             }
-            return Err(io_error("set the group of seek index", e));
+            return Err(io_error("set the group of seek index", e).into());
         }
         let mut encoder = Encoder::new(header.segment_size);
         let end = walk(&segment, path, &header, |entry| {
@@ -338,7 +366,7 @@ impl Builder<'_> {
         match indexes.rename(&fence.name, &dir::index_name(base)) {
             Ok(()) => fence.published = true,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(io_error("publish seek index", e)),
+            Err(e) => return Err(io_error("publish seek index", e).into()),
         }
         fault::hook(Point::SeekIndexAfterRename);
         let identity = (meta.dev(), meta.ino());
@@ -639,7 +667,8 @@ fn create_index_dir(dir: &Path, root: &File, euid: u32) -> Result<IndexDir> {
     };
     let ready = opened.and_then(|indexes| {
         check_index_dir(dir, &indexes, euid)?;
-        set_group(indexes.file(), gid)
+        fault::inject(Point::SeekIndexDirMode)
+            .and_then(|()| set_group(indexes.file(), gid))
             .and_then(|()| set_mode(indexes.file(), mode))
             .map_err(io_error("set the group and mode of seek index directory"))?;
         Ok(indexes)
@@ -663,7 +692,8 @@ fn create_index_dir(dir: &Path, root: &File, euid: u32) -> Result<IndexDir> {
 /// # Errors
 ///
 /// [`Error::NotFound`] if the journal has no segments; [`Error::Corrupt`] for a checkpoint marker whose segment or
-/// position does not exist; [`Error::Io`].
+/// position does not exist; [`Error::Io`] if the journal directory, its `seek-index/` or the marker cannot be read. What
+/// cannot be read of one segment does not end the run ([`IndexState::Failed`]).
 pub fn check(dir: impl AsRef<Path>) -> Result<CheckReport> {
     let dir = dir.as_ref();
     let segments = journal::list_segments(dir)?;
@@ -674,11 +704,18 @@ pub fn check(dir: impl AsRef<Path>) -> Result<CheckReport> {
     let indexes = IndexDir::open(dir)
         .map_err(|e| Error::io("open seek index directory", dir.join(DIR_NAME), e))?;
     let mut report = CheckReport::default();
+    if let Some(indexes) = &indexes {
+        let (names, listed) = indexes.list();
+        listed.map_err(|e| Error::io("list seek index directory", dir.join(DIR_NAME), e))?;
+        let unfinished = names.iter().filter(|(_, n)| *n == dir::Name::Temporary);
+        report.unfinished = unfinished.count() as u64;
+    }
     for (base, path) in segments {
         let covered = marker.is_none_or(|m| base < m.segment_base_seq);
-        report
-            .segments
-            .push(check_segment(dir, indexes.as_ref(), base, &path, covered)?);
+        let checked = check_segment(dir, indexes.as_ref(), base, &path, covered);
+        report.segments.push(
+            checked.unwrap_or_else(|e| SegmentIndex::new(base, because(IndexState::Failed, e))),
+        );
     }
     Ok(report)
 }
@@ -819,10 +856,11 @@ pub fn remove(dir: impl AsRef<Path>) -> Result<u64> {
         }
         Err(e) => return Err(Error::io("open seek index directory", path, e)),
     };
-    let names: Vec<(OsString, dir::Name)> = indexes
-        .list()
-        .map_err(|e| Error::io("list seek index directory", &path, e))?;
-    let (mut removed, mut failed) = (0, None);
+    let (names, listed) = indexes.list();
+    let mut failed = listed
+        .err()
+        .map(|e| Error::io("list seek index directory", &path, e));
+    let mut removed = 0;
     for (name, _) in names {
         match indexes.unlink(&name) {
             Ok(gone) => removed += u64::from(gone),

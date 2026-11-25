@@ -222,6 +222,8 @@ tickertape index /data/journal --remove    # deletes them
 - The directory `seek-index/` is created with the journal directory's group and mode. If the command refuses to create it
   (the journal directory belongs to another user, is writable by everyone, or its group is not one of this user's, as for
   a directory made under `/tmp` on macOS), create it yourself with the journal directory's owner, group and mode.
+- A build that is killed leaves a temporary file. The next open of a writer removes it; in an archive, where no writer
+  opens, `tickertape index --check` reports it and `--remove` clears it (with the indexes: run `index` again).
 - Delete the files whenever you like. Do not delete the directory while a 1.0.0 `export --output` runs: that fails with
   exit 1 and must be run again. A separate mount at `seek-index/` is not supported.
 - Retention and `archive` remove a segment's index with the segment. `archive --to` does not move it: run `index` there.

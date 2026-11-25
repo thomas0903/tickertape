@@ -7,6 +7,7 @@
 # checkout builds and removes indexes in a loop.
 #
 # Usage: tests/compat/v1.0.0-ignores-seek-index.sh [work_dir]   (from the repository root; needs git and cargo)
+# Run weekly (.github/workflows/soak.yml).
 # Builds into <work_dir>/target-v1.0.0 and <work_dir>/target; delete <work_dir> afterwards. EXPORTS sets how many exports
 # run beside the loop (default 100).
 set -euo pipefail
