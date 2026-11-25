@@ -16,7 +16,8 @@ Errors and recovery warnings go to stderr. JSON results go to stdout (or the sel
 
 - `tail <DIR> [--from <SEQ> | --from-end] [--count <N>] [--no-follow] [--format text|json]
   [--timeout-secs <S>] [--durable-only] [--decode market-demo]`: default starts at the oldest record and follows forever. `--from` includes SEQ;
-  `--from-end` skips records observed in a startup scan. `--count 0` writes nothing. `--no-follow` stops when
+  `--from-end` starts at the end of the journal as observed at startup (`Reader::seek_to_end`): it reads the newest
+  segment from the checkpoint on, not the segments before it, so damage in those is not reported. `--count 0` writes nothing. `--no-follow` stops when
   the reader reaches the current committed end. `--timeout-secs` accepts a nonnegative decimal number and stops
   after that many idle seconds; it resets after each record. Text shows sequence, schema, timestamps, payload
   length and the first 32 payload bytes as lowercase hex, followed by `…` when truncated. JSON is the record
@@ -29,7 +30,7 @@ Errors and recovery warnings go to stderr. JSON results go to stdout (or the sel
   market-demo event; with `--format json` it adds the same `decoded` object as `export --decode` (see below).
   `--durable-only` returns only records below the current checkpoint marker's `next_seq` and waits for later
   checkpoints using the usual idle timeout. With no valid checkpoint, it returns nothing until one appears;
-  `--no-follow` stops at that boundary and `--from-end` skips the checkpointed prefix observed at startup.
+  `--no-follow` stops at that boundary and `--from-end` starts at the checkpoint observed at startup.
 - `inspect <DIR> [--json]`: checksum scan with per-segment metadata, totals, checkpoint and problems. Text
   displays creation time as RFC 3339 UTC, used bytes and percent. An invalid header has unavailable metadata.
   Missing/invalid checkpoint slots yield `none` in text or `null` in JSON; a checkpoint I/O error fails the command.
