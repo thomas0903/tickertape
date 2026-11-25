@@ -20,10 +20,10 @@ use std::path::Path;
 
 use rustix::fs::{AtFlags, FlockOperation, Gid, Mode};
 
-use crate::error::{Error, Result};
+use crate::error::{CorruptReason, Error, Result};
 use crate::fault::{self, Point};
 use crate::format::{self, SEGMENT_HEADER_LEN, SEGMENT_SIZE_UNIT, SegmentView, Slot};
-use crate::{journal, retention};
+use crate::{inspect, journal, retention};
 
 #[doc(hidden)]
 pub mod codec;
@@ -148,7 +148,7 @@ pub fn build(dir: impl AsRef<Path>, rebuild: bool) -> Result<BuildReport> {
     }
     let root = open_root(dir)?;
     // Only to leave the segments alone that are not covered now; what counts is read behind the fence.
-    let marker = retention::checkpoint(dir)?;
+    let marker = settled(dir, || retention::checkpoint(dir))?;
     let mut builder = Builder {
         dir,
         indexes: open_index_dir(dir, &root)?,
@@ -278,7 +278,10 @@ impl Builder<'_> {
         let mut fence =
             Fence::create(indexes, base).map_err(|e| io_error("create seek index", e))?;
         fault::hook(Point::SeekIndexFence);
-        match retention::durable_checkpoint(self.dir, &mut self.synced)? {
+        let marker = settled(self.dir, || {
+            retention::durable_checkpoint(self.dir, &mut self.synced)
+        })?;
+        match marker {
             Some(marker) if base >= marker.segment_base_seq => {
                 return Ok(Some((IndexState::NotCovered, None)));
             }
@@ -347,6 +350,22 @@ impl Builder<'_> {
             )));
         }
         Ok(Some((IndexState::Built, None)))
+    }
+}
+
+/// `read`, which reads the marker and opens its segment, again if the marker moved on meanwhile: the writer's retention
+/// can then have removed the segment in between, which is no dangling marker.
+fn settled<T>(dir: &Path, mut read: impl FnMut() -> Result<T>) -> Result<T> {
+    let mut attempts = 8;
+    loop {
+        let before = inspect::read_checkpoint(dir)?;
+        match read() {
+            Err(Error::Corrupt {
+                reason: CorruptReason::DanglingCheckpoint(_),
+                ..
+            }) if attempts > 0 && inspect::read_checkpoint(dir)? != before => attempts -= 1,
+            result => return result,
+        }
     }
 }
 
@@ -651,7 +670,7 @@ pub fn check(dir: impl AsRef<Path>) -> Result<CheckReport> {
     if segments.is_empty() {
         return Err(Error::NotFound { dir: dir.into() });
     }
-    let marker = retention::checkpoint(dir)?;
+    let marker = settled(dir, || retention::checkpoint(dir))?;
     let indexes = IndexDir::open(dir)
         .map_err(|e| Error::io("open seek index directory", dir.join(DIR_NAME), e))?;
     let mut report = CheckReport::default();

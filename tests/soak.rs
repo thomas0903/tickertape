@@ -31,10 +31,13 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use tickertape::format::{self, CheckpointSlot, Slot};
+use tickertape::seek_index::{self, IndexState};
 use tickertape::{Reader, ReaderConfig, inspect};
 use tickertape_tests::{Rng, segments, soak};
 
@@ -332,10 +335,63 @@ struct Soak {
     writer: Option<Child>,
     final_end: u64,
     c: Counters,
+    /// Builds seek indexes in a loop, until told to stop; returns how many it built.
+    indexer: Option<Indexer>,
+}
+
+type Indexer = (Arc<AtomicBool>, std::thread::JoinHandle<u64>);
+
+/// `tickertape index` in a loop, beside writers that die and recover, damage and retention. Anything may fail; what is
+/// there at the end must be right.
+fn start_indexer(journal: PathBuf) -> Indexer {
+    let stop = Arc::new(AtomicBool::new(false));
+    let stopped = Arc::clone(&stop);
+    let thread = std::thread::spawn(move || {
+        let mut built = 0;
+        while !stopped.load(Ordering::SeqCst) {
+            // Without a marker it would probe the lock and could make a writer's open fail.
+            if matches!(inspect::read_checkpoint(&journal), Ok(Some(_))) {
+                if let Ok(report) = seek_index::build(&journal, built % 5 == 4) {
+                    let state = |s: &&seek_index::SegmentIndex| s.state == IndexState::Built;
+                    built += report.segments.iter().filter(state).count() as u64;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        built
+    });
+    (stop, thread)
+}
+
+impl Soak {
+    /// Stops the indexer and checks what it left.
+    fn finish_indexer(&mut self) {
+        let Some((stop, thread)) = self.indexer.take() else {
+            return;
+        };
+        stop.store(true, Ordering::SeqCst);
+        let built = thread.join().expect("indexer");
+        let report = seek_index::check(&self.journal).unwrap();
+        for segment in &report.segments {
+            assert!(
+                !matches!(segment.state, IndexState::Wrong | IndexState::Ignored),
+                "{segment:?}"
+            );
+        }
+        eprintln!(
+            "soak: {built} seek indexes built; at the end {:?}",
+            report.segments
+        );
+        assert!(built > 0, "no seek index was built");
+    }
 }
 
 impl Drop for Soak {
     fn drop(&mut self) {
+        if let Some((stop, thread)) = self.indexer.take() {
+            stop.store(true, Ordering::SeqCst);
+            let _ = thread.join();
+        }
         for r in self.readers.iter_mut().chain(self.late.iter_mut()) {
             let _ = r.child.kill();
             let _ = r.child.wait();
@@ -354,11 +410,11 @@ fn dir_bytes(dir: &Path) -> u64 {
     entries
         .filter_map(|e| e.ok())
         .map(|e| {
-            let m = e.metadata().unwrap();
-            if m.is_dir() {
-                dir_bytes(&e.path())
-            } else {
-                m.len()
+            match e.metadata() {
+                Ok(m) if m.is_dir() => dir_bytes(&e.path()),
+                Ok(m) => m.len(),
+                // A seek index being written.
+                Err(_) => 0,
             }
         })
         .sum()
@@ -421,7 +477,14 @@ impl Soak {
         } else {
             "reader-stop".to_string()
         });
-        let child = Command::new(READER)
+        let mut command = Command::new(READER);
+        if self.indexer.is_some() {
+            // Half of them.
+            let readers = self.readers.len() + self.late.len() + self.c.late_readers as usize;
+            let used = if readers % 2 == 0 { "reader" } else { "no" };
+            command.env(soak::INDEXES, used);
+        }
+        let child = command
             .arg(&self.journal)
             .arg(if mapped { "mapped" } else { "safe" })
             .arg(if durable { "durable" } else { "visible" })
@@ -642,6 +705,7 @@ impl Soak {
                 break end;
             }
         };
+        self.finish_indexer();
         let chain = walk(&self.journal).unwrap();
         assert_eq!(chain.end, end, "final chain end");
         let report = inspect::verify(&self.journal).unwrap();
@@ -717,7 +781,11 @@ impl Soak {
             self.root
                 .join(format!("writer-{}.out", epoch.saturating_sub(8))),
         );
-        let mut child = Command::new(WRITER)
+        let mut command = Command::new(WRITER);
+        if self.indexer.is_some() {
+            command.env(soak::INDEXES, "writer");
+        }
+        let mut child = command
             .arg(&self.journal)
             .arg(&self.archive)
             .arg(rng.next_u64().to_string())
@@ -1317,6 +1385,17 @@ impl Soak {
 #[test]
 #[ignore = "soak: runs for TICKERTAPE_SOAK_SECS (default 20); run with --release -- --ignored"]
 fn soak() {
+    run_soak(false);
+}
+
+/// The same with `tickertape index` in a loop and half the readers using the indexes (ADR 0045).
+#[test]
+#[ignore = "soak: runs for TICKERTAPE_SOAK_SECS (default 20); run with --release -- --ignored"]
+fn soak_with_seek_indexes() {
+    run_soak(true);
+}
+
+fn run_soak(indexes: bool) {
     let secs: u64 = std::env::var("TICKERTAPE_SOAK_SECS")
         .ok()
         .map(|s| s.parse().expect("TICKERTAPE_SOAK_SECS"))
@@ -1350,7 +1429,11 @@ fn soak() {
         writer: None,
         final_end: 0,
         c: Counters::default(),
+        indexer: None,
     };
+    if indexes {
+        soak.indexer = Some(start_indexer(soak.journal.clone()));
+    }
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| soak.run(&mut rng)));
     match result {
         Ok(()) => eprint!("{}", soak.report()),
