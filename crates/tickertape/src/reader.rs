@@ -1940,7 +1940,8 @@ mod tests {
     }
 
     /// 8b fails where the file ends inside the record by then (no panic, no error, no landing), and where it holds another
-    /// valid record with the same sequence number and length: its stored CRC is not the entry's.
+    /// valid record with the same sequence number and length (its stored CRC is not the entry's), or the record with its
+    /// stored CRC damaged.
     #[test]
     #[cfg(feature = "fault-injection")]
     fn eight_b_reads_the_record_that_was_indexed_or_nothing() {
@@ -1970,12 +1971,17 @@ mod tests {
         };
         // A mapped reader must not meet a truncated file.
         let cases = [0, 2, 4, 50]
-            .map(|cut| (false, Some(entry.offset + cut)))
+            .map(|cut| (false, Some(entry.offset + cut), 0))
             .into_iter()
-            .chain([(false, None), (true, None)]);
-        for (mapped, cut) in cases {
+            .chain(
+                [104, 8]
+                    .into_iter()
+                    .flat_map(|n| [(false, None, n), (true, None, n)]),
+            );
+        for (mapped, cut, len) in cases {
             let mut reader = open_indexed(dir.path(), mapped);
-            let (at, frame) = (file.try_clone().unwrap(), other.clone());
+            let (at, mut frame) = (file.try_clone().unwrap(), other.clone());
+            frame.truncate(len);
             crate::fault::clear();
             crate::fault::run_at(
                 crate::fault::Point::ReaderSeekIndexLanding,
@@ -1986,7 +1992,7 @@ mod tests {
                 },
             );
             reader.seek(900).unwrap();
-            assert!(!reader.used_index, "mapped {mapped}, cut {cut:?}");
+            assert!(!reader.used_index, "mapped {mapped}, cut {cut:?}, {len}");
             assert_eq!((reader.offset, reader.next_seq), (64, 0));
             assert!(reader.buf.is_empty());
             file.set_len(image.len() as u64).unwrap();
