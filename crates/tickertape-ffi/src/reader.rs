@@ -323,6 +323,48 @@ pub unsafe extern "C" fn tickertape_reader_seek(
     })
 }
 
+/// Positions the reader at the end of the journal, without reading the segments before it: the next record returned
+/// is the first one this call did not find committed (with durable-only, the first one it did not find covered by a
+/// checkpoint). Added in 1.1.
+///
+/// Under a live writer, "the end" is an observation made during the call: every record committed before the call is
+/// behind the reader, every record committed after it returns is ahead of it, and one committed during the call can
+/// be on either side. No record is skipped or repeated from there on. The call reads at most the newest segment, from
+/// the checkpoint's position if the checkpoint is in it, and any segments the writer rolls to meanwhile, validating
+/// every record it reads; damage in records before that is not noticed. If the writer keeps committing as fast as the
+/// reader validates, the call runs until it catches up; it cannot be interrupted. With durable-only and no valid
+/// checkpoint, the reader is placed at the first record of the oldest segment.
+///
+/// Any call invalidates the record view returned by `tickertape_reader_next`. On success this also discards a record
+/// held back by `tickertape_reader_next_copy` or `tickertape_reader_read_batch`, and an error deferred by
+/// `tickertape_reader_read_batch`; on failure the reader is left exactly as it was (same position, held-back record
+/// and deferred error).
+///
+/// Errors: `TICKERTAPE_E_NOT_FOUND`; `TICKERTAPE_E_CORRUPT`, `TICKERTAPE_E_UNSUPPORTED_VERSION` or `TICKERTAPE_E_IO`
+/// while locating it; `TICKERTAPE_E_DISCARDED` if recovery or retention replaced or removed the segment on each of 8
+/// attempts in a row.
+///
+/// # Safety
+///
+/// `reader` must be NULL or a live reader handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tickertape_reader_seek_to_end(
+    reader: *mut tickertape_reader,
+) -> tickertape_status {
+    guard(|| {
+        // SAFETY: forwarded caller contract.
+        unsafe { reader_handle(reader) }?.with(|state| {
+            state.returned = None;
+            // As in `tickertape_reader_seek`: a failure leaves the core's cursor unchanged.
+            state.reader.seek_to_end()?;
+            state.pending = None;
+            state.deferred = None;
+            Ok(())
+        })?;
+        Ok(S::TICKERTAPE_OK)
+    })
+}
+
 /// Returns the next record as a borrowed view in `*record_out`.
 ///
 /// `timeout_ns` 0 (`TICKERTAPE_NO_WAIT`) does not wait; a positive value waits up to that many nanoseconds, using

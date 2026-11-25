@@ -301,6 +301,9 @@ while (!stop_requested()) {
 }
 ```
 
+`seek_to_end()` (from 1.1) places the reader at the end of the journal instead, reading at most the newest segment
+(`tickertape_reader_seek_to_end` in [`c-api.md`](c-api.md#reading)).
+
 There are two readers, as in C:
 
 - `Reader::open`, the **safe reader**, reads the files with `pread` into a buffer it owns and validates the copy. It

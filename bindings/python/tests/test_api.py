@@ -99,6 +99,28 @@ def test_seek_and_position(journal: Path) -> None:
         assert r.position == 1005
 
 
+def test_seek_to_end(journal: Path) -> None:
+    with tt.Writer(journal, segment_size=SMALL_SEGMENT) as w:
+        append_pattern(w, 1000)
+        with tt.Reader(journal) as r, tt.Reader(journal, durable_only=True) as durable:
+            assert r.try_next() is not None
+            r.seek_to_end()
+            assert r.position == 1000
+            assert r.try_next() is None
+            durable.seek_to_end()  # no checkpoint yet: nothing is covered
+            assert durable.position == 0
+            w.checkpoint()
+            durable.seek_to_end()
+            assert durable.position == 1000
+            w.append(b"next")
+            record = r.try_next()
+            assert record is not None and (record.seq, record.payload) == (1000, b"next")
+            assert durable.try_next() is None
+            r.close()
+            with pytest.raises(ValueError):
+                r.seek_to_end()
+
+
 def test_segment_rolls_are_transparent(journal: Path) -> None:
     with tt.Writer(journal, segment_size=SMALL_SEGMENT) as w:
         append_pattern(w, 2000)

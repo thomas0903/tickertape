@@ -51,6 +51,7 @@ class LifetimeTest {
         assertThrows(IllegalStateException.class, r::tryNext);
         assertThrows(IllegalStateException.class, () -> r.next(1, java.util.concurrent.TimeUnit.MILLISECONDS));
         assertThrows(IllegalStateException.class, () -> r.seek(0));
+        assertThrows(IllegalStateException.class, r::seekToEnd);
         assertThrows(IllegalStateException.class, r::position);
         assertThrows(IllegalStateException.class, () -> r.tryReadBatch(new ReadBatch(1, 16)));
     }

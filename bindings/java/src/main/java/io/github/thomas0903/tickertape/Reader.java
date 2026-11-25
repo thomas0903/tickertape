@@ -380,6 +380,34 @@ public final class Reader implements AutoCloseable {
         }
     }
 
+    /**
+     * Positions the reader at the end of the journal, without reading the segments before it: the next record returned
+     * is the first one this call did not find committed (for a durable-only reader, the first one it did not find
+     * covered by a checkpoint).
+     *
+     * <p>Under a live writer, every record committed before the call is behind the reader, and every record committed
+     * after it returns is ahead of it; one committed during the call can be on either side. The call reads at most the
+     * newest segment, from the checkpoint's position if the checkpoint is in it, and any segments the writer rolls to
+     * meanwhile. It cannot be interrupted. A success also discards a record held back and an error deferred by
+     * {@link #readBatch}; a failure leaves the reader as it was.
+     *
+     * @throws CorruptJournalException if a segment header, or a record it reads, is invalid
+     * @throws JournalIOException if reading the files fails
+     * @throws DiscardedException if recovery or retention replaced or removed the segment on each of 8 attempts in a
+     *     row
+     * @since 1.1
+     */
+    public void seekToEnd() {
+        handle.enter();
+        try {
+            generation.advance();
+            Errors.check(Native.readerSeekToEnd(handle.ptr));
+        } finally {
+            handle.exit();
+            Reference.reachabilityFence(this);
+        }
+    }
+
     /** The sequence number of the next record this reader will return. Does not invalidate the current view. */
     public long position() {
         handle.enter();

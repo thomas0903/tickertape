@@ -1122,6 +1122,29 @@ impl Reader {
         })
     }
 
+    /// Positions the reader at the end of the journal, without reading the segments before it: the next record
+    /// returned is the first one this call did not find committed (with `durable_only`, the first one it did not find
+    /// covered by a checkpoint). Every record committed before the call is behind the reader, every record committed
+    /// after it returns is ahead of it. Reads at most the newest segment (from the checkpoint on, if that is in it)
+    /// with the GIL released, and can't be interrupted. If it succeeds, it also drops records held for an interrupted
+    /// read and an error held back by a batch call; if it fails, the reader is unchanged.
+    fn seek_to_end(&self, py: Python<'_>) -> PyResult<()> {
+        self.settle(py, || {
+            self.check(py)?;
+            let result = self
+                .locked(py, |s| {
+                    let result = s.reader.seek_to_end();
+                    if result.is_ok() {
+                        s.buffer.reset();
+                        s.pending = None;
+                    }
+                    result
+                })?
+                .ok_or_else(|| errors::closed("reader"))?;
+            result.map_err(|e| errors::to_py(py, &e))
+        })
+    }
+
     /// Returns the next committed record, or `None` if there is none yet. Never waits.
     fn try_next(&self, py: Python<'_>) -> PyResult<Option<Py<Record>>> {
         self.settle(py, || self.read_one(py, Timeout::ZERO))

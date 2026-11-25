@@ -497,6 +497,7 @@ fn pure_null_arguments_are_rejected() {
             INVALID
         );
         assert_eq!(tickertape_reader_seek(null_mut(), 0), INVALID);
+        assert_eq!(tickertape_reader_seek_to_end(null_mut()), INVALID);
         assert_eq!(tickertape_reader_next(null_mut(), 0, &mut record), INVALID);
         assert_eq!(
             tickertape_reader_next_copy(null_mut(), 0, null_mut(), 0, &mut record),
@@ -703,6 +704,12 @@ fn write_read_roundtrip_with_both_readers() {
             OK
         );
         check_record(&record, 123);
+        assert_eq!(unsafe { tickertape_reader_seek_to_end(reader) }, OK);
+        assert_eq!(self::position(reader), 500);
+        assert_eq!(
+            unsafe { tickertape_reader_next(reader, 0, &mut untouched) },
+            NONE
+        );
         assert_eq!(unsafe { tickertape_reader_close(reader) }, OK);
     }
     // More than one segment was written.
@@ -1440,6 +1447,19 @@ fn failed_seek_keeps_the_held_back_record() {
         OK
     );
     check_record(&record, 1);
+    // The same for a failed seek to the end; a successful one discards the held-back record.
+    assert_eq!(
+        unsafe {
+            tickertape_reader_next_copy(reader, 0, small.as_mut_ptr(), small.len(), &mut record)
+        },
+        code(S::TICKERTAPE_E_BUFFER_TOO_SMALL)
+    );
+    let status = with_journal_moved(&j, || unsafe { tickertape_reader_seek_to_end(reader) });
+    assert_eq!(status, code(S::TICKERTAPE_E_IO), "{}", last_message());
+    assert_eq!(position(reader), 2);
+    assert_eq!(unsafe { tickertape_reader_seek_to_end(reader) }, OK);
+    assert_eq!(position(reader), 4);
+    assert_eq!(unsafe { tickertape_reader_seek(reader, 2) }, OK);
     // A failed seek with SEQ_UNAVAILABLE behaves the same way: nothing is lost.
     assert_eq!(
         unsafe {
@@ -1487,6 +1507,13 @@ fn failed_seek_keeps_the_deferred_error() {
     assert_eq!((status, count), (OK, 3));
     let status = with_journal_moved(&j, || unsafe { tickertape_reader_seek(reader, 0) });
     assert_eq!(status, code(S::TICKERTAPE_E_IO), "{}", last_message());
+    // Also by a seek to the end, which fails at the damaged record. (The writer did not checkpoint, so it reads the
+    // segment from its start.)
+    assert_eq!(
+        unsafe { tickertape_reader_seek_to_end(reader) },
+        code(S::TICKERTAPE_E_CORRUPT)
+    );
+    assert_eq!(position(reader), 3);
     // Repair the record: the error deferred by the batch is still reported (once), then reading continues.
     flip(&segment);
     let mut record = empty_record();

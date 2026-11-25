@@ -276,6 +276,7 @@ final class Signatures {
         f.put("tickertape_reader_open_mapped_unsafe", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS));
         f.put("tickertape_reader_close", FunctionDescriptor.of(JAVA_INT, ADDRESS));
         f.put("tickertape_reader_seek", FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_LONG));
+        f.put("tickertape_reader_seek_to_end", FunctionDescriptor.of(JAVA_INT, ADDRESS));
         f.put("tickertape_reader_next", FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_LONG, ADDRESS));
         f.put("tickertape_reader_read_batch",
                 FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_LONG, ADDRESS, SIZE_T, ADDRESS, SIZE_T, ADDRESS));

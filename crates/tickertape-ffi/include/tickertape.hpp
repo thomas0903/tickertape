@@ -1947,6 +1947,16 @@ public:
         return detail::status_to_result(tickertape_reader_seek(h_, seq));
     }
 
+    // Positions the reader at the end of the journal, without reading the segments before it: the next record
+    // returned is the first one this call did not find committed (with durable-only, not covered by a checkpoint).
+    // Every record committed before the call is behind the reader, every record committed after it returns is ahead
+    // of it. A success discards a record held back and an error deferred by next_copy or read_batch; a failure
+    // changes nothing. Errors: not_found, corrupt, unsupported_version, io, discarded. Added in 1.1.
+    result<void> seek_to_end() {
+        generation_++;
+        return detail::status_to_result(tickertape_reader_seek_to_end(h_));
+    }
+
     // The next record as a borrowed view, or nullopt if none arrived within `timeout` (see Timeout). Without
     // durable-only it returns **visible** records, including ones a power loss can still erase; with it, only
     // **durable** ones. Errors: Status::corrupt (the cursor does not move: calling again retries), discarded

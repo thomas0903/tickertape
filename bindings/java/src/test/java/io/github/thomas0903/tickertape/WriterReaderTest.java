@@ -170,6 +170,24 @@ class WriterReaderTest {
     }
 
     @Test
+    void seekToEndSkipsWhatIsCommitted() throws Exception {
+        Path dir = tmp.resolve("j");
+        try (Writer w = Writer.open(dir, TestSupport.small()); Reader r = Reader.open(dir)) {
+            for (int i = 0; i < 1000; i++) {
+                w.append(1, i, i, new byte[] {(byte) i});
+            }
+            RecordView first = r.tryNext();
+            assertEquals(0, first.seq());
+            r.seekToEnd();
+            assertFalse(first.isValid());
+            assertEquals(1000, r.position());
+            assertNull(r.tryNext());
+            w.append(1, 0, 0, new byte[] {7});
+            assertEquals(1000, r.tryNext().seq());
+        }
+    }
+
+    @Test
     void followsLiveAcrossThreadsAndRolls() throws Exception {
         Path dir = tmp.resolve("j");
         int count = 3000;
