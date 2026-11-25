@@ -317,7 +317,8 @@ def run_attempt(run, params, out, env, commands):
             wait(writer)
             result = {"writer": parse_one(outputs["writer"]),
                       "reader_result": parse_one(outputs["reader"]) if reader is not None else None}
-            result["affinity"] = affinity.record(params["affinity"], result["writer"], result["reader_result"], keeper)
+            result["affinity"] = affinity.record(params["affinity"], run.tool, result["writer"], result["reader_result"],
+                                                 keeper)
         finally:
             for proc in children:
                 if proc.poll() is None:
@@ -479,7 +480,7 @@ def main(args, env, build):
     """Entry point from run.py --sustained."""
     import run as short
     params = parameters(args)
-    params["affinity"] = affinity.resolve(args)
+    params["affinity"] = args.affinity
     out = args.outdir.resolve()
     runs = plan(params)
     pending = [r for r in runs if not (out.exists() and finished(r, out))]
@@ -494,7 +495,6 @@ def main(args, env, build):
         for run in pending:
             print(f"  {run.label}")
         return
-    affinity.check(params["affinity"], params["tools"])
     first = prepare_output(out, params, args.resume)
     # A terminated session (SIGTERM, or SIGHUP when the terminal goes away) unwinds so that every child process
     # group is killed and reaped; finished results are already on disk.

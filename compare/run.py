@@ -193,8 +193,9 @@ def run_attempt(tool, workload, payload, reader, rate, repeat, out, env, quick, 
                     commands.write(shlex.join(cmd) + "\n")
                     result = json.loads(execute(cmd, stdout=subprocess.PIPE, stderr=error_log, env=env,
                                                 timeout=count/rate+120, text=True).stdout)
-                    result["affinity"] = affinity.record(pinning, *[{"affinity": result["affinity"][role]}
-                                                                    for role in ("writer", "reader")])
+                    # Not watched by the keeper: tt-latency starts its own processes (moved_threads is null).
+                    result["affinity"] = affinity.record(pinning, tool, *[{"affinity": result["affinity"][role]}
+                                                                          for role in ("writer", "reader")])
                 elif workload == "W2":
                     writer, writer_path = spawn("writer")
                     ready("writer")
@@ -205,14 +206,15 @@ def run_attempt(tool, workload, payload, reader, rate, repeat, out, env, quick, 
                     wait(read)
                     wait(writer)
                     sent, received = parse_result(writer_path), parse_result(read_path)
-                    result = {"affinity": affinity.record(pinning, sent, received, keeper), "latency": received, "writer": sent,
+                    result = {"affinity": affinity.record(pinning, tool, sent, received, keeper),
+                              "latency": received, "writer": sent,
                               "coordinated_omission": "intended timestamps; no skipped sends or rebasing"}
                 else:
                     writer, writer_path = spawn("writer", "append" if workload == "W3" else mode)
                     wait(writer)
                     sent = parse_result(writer_path)
                     if workload != "W3":
-                        result = {"affinity": affinity.record(pinning, sent, None, keeper), "append": sent}
+                        result = {"affinity": affinity.record(pinning, tool, sent, None, keeper), "append": sent}
                     else:
                         # Full untimed read warms the page cache. QueueIter and
                         # queue-file iteration leave the fixture unconsumed.
@@ -221,7 +223,7 @@ def run_attempt(tool, workload, payload, reader, rate, repeat, out, env, quick, 
                         read, read_path = spawn("reader")
                         wait(read)
                         received = parse_result(read_path)
-                        result = {"affinity": affinity.record(pinning, sent, received, keeper), "replay": received}
+                        result = {"affinity": affinity.record(pinning, tool, sent, received, keeper), "replay": received}
             finally:
                 for proc in children:
                     if proc.poll() is None:
@@ -321,10 +323,18 @@ def main():
     sustained_args.add_argument("--tt-readers", help="tickertape readers: safe,mapped (default mapped)")
     affinity.add_options(parser)
     args = parser.parse_args()
+    tools = args.tools.split(",") if args.tools else TOOLS
+    try:
+        args.affinity = affinity.resolve(args)
+        if not args.dry_run:
+            affinity.check(args.affinity, tools)
+    except ValueError as error:
+        parser.error(str(error))
+    for line in affinity.warnings(args.affinity, tools):
+        print(f"warning: {line}", file=sys.stderr)
     if args.sustained:
         import sustained
         env = dict(os.environ)
-        tools = args.tools.split(",") if args.tools else TOOLS
         java_environment(env, any(t in ("chronicle", "aeron") for t in tools) and not args.dry_run, parser)
         sustained.main(args, env, build)
         return
@@ -338,8 +348,7 @@ def main():
         parser.error("OUTDIR must be new or empty")
     env = dict(os.environ)
     java_environment(env, True, parser)
-    pinning = affinity.resolve(args)
-    affinity.check(pinning, TOOLS)
+    pinning = args.affinity
     print(pinning["summary"], file=sys.stderr)
     environment(out, env, args.quick, pinning=pinning)
     build(out, env, ("chronicle", "aeron"), tt_latency=True)

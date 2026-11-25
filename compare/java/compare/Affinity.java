@@ -12,9 +12,7 @@ final class Affinity {
     static void pin(String cpu, Path control, String role) throws Exception {
         if (cpu==null) return;
         if (!LINUX) throw new IllegalStateException("CPU pinning is unsupported on this OS");
-        // The runner moves every other thread off this CPU, so it has to know this one before it moves there.
-        Files.writeString(control.resolve("tid.tmp"),tid());
-        Files.move(control.resolve("tid.tmp"),control.resolve(role+".tid"),StandardCopyOption.ATOMIC_MOVE);
+        announce(control,role+".tid");
         String[] command={"taskset","-p","-c",Integer.toString(Integer.parseInt(cpu)),tid()};
         // From another thread: the JDK starts its "process reaper" thread from the thread that starts the process,
         // while taskset already runs, and it would inherit the new CPU.
@@ -31,12 +29,19 @@ final class Affinity {
         if (status[0]!=0) throw new IllegalStateException("cannot pin to CPU " + cpu,failure[0]);
     }
 
+    /** Tells the runner's Keeper about this thread: role.tid before it is pinned, role.measured after the read-back. */
+    private static void announce(Path control, String name) throws Exception {
+        Files.writeString(control.resolve(name+".tmp"),tid());
+        Files.move(control.resolve(name+".tmp"),control.resolve(name),StandardCopyOption.ATOMIC_MOVE);
+    }
+
     private static String tid() throws Exception {
         return Files.readSymbolicLink(Path.of("/proc/thread-self")).getFileName().toString();
     }
 
-    /** As report() in benches/src/affinity.rs. */
-    static Map<String,Object> report() throws Exception {
+    /** As report() in benches/src/affinity.rs; the endpoint must still be open. Then tells the Keeper that the
+     * measurement is over: the JVM's shutdown hooks start later, from this pinned thread. */
+    static Map<String,Object> report(String cpu, Path control, String role) throws Exception {
         String os=System.getProperty("os.name");
         if (!LINUX) return Map.of("unsupported","affinity: unsupported on " + (os.startsWith("Mac") ? "macOS" : os));
         String tid=tid();
@@ -58,6 +63,7 @@ final class Affinity {
             }
         }
         result.put("other_threads",others);
+        if (cpu!=null) announce(control,role+".measured");
         return result;
     }
 

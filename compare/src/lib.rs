@@ -249,25 +249,37 @@ fn run(tool: &str) -> Result<()> {
         .optional("--helper-cpus")
         .map(parse_cpu_list)
         .transpose()?;
-    // Pinning (README, Thread pinning): after open in the live modes, so that threads the tool starts inherit the
-    // process's helper CPUs; before open in the others, where open can be inside the timer.
+    // Pinning (README, Thread pinning): after open, so that threads the tool starts inherit the process's helper CPUs,
+    // except where open is inside the timer (the cold append and W3's reader).
     let cpu = match opts.optional("--cpu") {
         Some(_) => Some(opts.number("--cpu", None)?),
         None => None,
     };
-    let pin = || -> Result<()> {
-        // The runner moves every other thread off this CPU, so it has to know this one before it moves there.
+    // Tells the runner's Keeper about this thread: <role>.tid before it is pinned, <role>.measured after the read-back.
+    let announce = |event: &str| -> Result<()> {
         if let (Some(_), Some(control)) = (cpu, control.as_deref()) {
-            fs::write(control.join("tid.tmp"), thread_id()?.to_string())?;
-            fs::rename(control.join("tid.tmp"), control.join(format!("{role}.tid")))?;
+            let tmp = control.join(format!("{role}.{event}.tmp"));
+            fs::write(&tmp, thread_id()?.to_string())?;
+            fs::rename(tmp, control.join(format!("{role}.{event}")))?;
         }
+        Ok(())
+    };
+    let pin = || -> Result<()> {
+        announce("tid")?;
         pin_or_fail(cpu)
     };
-    if !live {
+    // While the endpoint is open: closing it ends the tool's threads, and the read-back could not judge them.
+    let read_back = || -> Result<Value> {
+        let affinity = report()?;
+        announce("measured")?;
+        Ok(affinity)
+    };
+    let cold = mode == "append_cold";
+    let open_is_timed = cold || (role == "reader" && !live);
+    if open_is_timed {
         pin()?;
     }
     if role == "writer" {
-        let cold = mode == "append_cold";
         let priming = if mode == "append_steady" {
             PRIMING_RECORDS
         } else {
@@ -275,7 +287,7 @@ fn run(tool: &str) -> Result<()> {
         };
         let mut start = cold.then(Instant::now);
         let mut sink = Sink::open(tool, &dir, helper_cpus, priming > 0)?;
-        if live {
+        if !open_is_timed {
             pin()?;
         }
         let mut bytes = vec![0x5a; payload + 16 + usize::from(tool == "plain-file") * 4];
@@ -369,7 +381,7 @@ fn run(tool: &str) -> Result<()> {
             "max_late_us": if probe || !live { Value::Null } else { json!(max_late as f64 / 1e3) },
             "stopped_by": stopped_by, "periodic_sync": periodic,
             "flush_seconds": flush_seconds, "flush_operation": sync,
-            "timer_starts": timer_starts(mode), "priming_records": priming, "affinity": report()?})
+            "timer_starts": timer_starts(mode), "priming_records": priming, "affinity": read_back()?})
         );
         return Ok(());
     }
@@ -421,7 +433,7 @@ fn run(tool: &str) -> Result<()> {
     };
     // `received` mirrors `expected` (which `observe` borrows) for the loop conditions.
     let mut received = 0u64;
-    let seconds = match tool {
+    let (seconds, affinity) = match tool {
         "tickertape" => {
             let cfg = ReaderConfig::default();
             let mut r = if opts.required("--reader")? == "mapped" {
@@ -440,7 +452,7 @@ fn run(tool: &str) -> Result<()> {
                     idle(&mut target)?;
                 }
             }
-            start.elapsed().as_secs_f64()
+            (start.elapsed().as_secs_f64(), read_back()?)
         }
         "plain-file" => {
             let mut r = FileReader {
@@ -461,7 +473,7 @@ fn run(tool: &str) -> Result<()> {
                     idle(&mut target)?;
                 }
             }
-            start.elapsed().as_secs_f64()
+            (start.elapsed().as_secs_f64(), read_back()?)
         }
         "yaque" if live => {
             let mut r = yaque::ReceiverBuilder::new()
@@ -484,7 +496,7 @@ fn run(tool: &str) -> Result<()> {
                     Err(e) => return Err(e.unwrap_io().into()),
                 }
             }
-            start.elapsed().as_secs_f64()
+            (start.elapsed().as_secs_f64(), read_back()?)
         }
         "yaque" => {
             let r = yaque::QueueIter::open(&dir)?;
@@ -498,7 +510,7 @@ fn run(tool: &str) -> Result<()> {
                 )?;
                 received += 1;
             }
-            start.elapsed().as_secs_f64()
+            (start.elapsed().as_secs_f64(), read_back()?)
         }
         "queue-file" => {
             if live {
@@ -511,7 +523,7 @@ fn run(tool: &str) -> Result<()> {
                 observe(i, validate(bytes, i, payload)?, bytes.len() - 16)?;
                 received += 1;
             }
-            start.elapsed().as_secs_f64()
+            (start.elapsed().as_secs_f64(), read_back()?)
         }
         _ => return Err("unknown tool".into()),
     };
@@ -527,7 +539,7 @@ fn run(tool: &str) -> Result<()> {
         json!({"count": count, "seconds": seconds,
         "records_per_s": count as f64 / seconds, "payload_mb_per_s": count as f64 * payload as f64 / seconds / 1e6})
     };
-    result["affinity"] = report()?;
+    result["affinity"] = affinity;
     println!("{result}");
     Ok(())
 }

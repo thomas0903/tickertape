@@ -114,14 +114,15 @@ public final class Harness {
                 }
             }
         }
-        // Pinning (README, Thread pinning): after open in the live modes, so that threads the tool starts inherit the
-        // process's helper CPUs; before open in the others, where open can be inside the timer.
-        if (!live) Affinity.pin(opts.get("--cpu"),control,role);
+        // Pinning (README, Thread pinning): after open, so that threads the tool starts inherit the process's helper CPUs,
+        // except where open is inside the timer (the cold append and W3's reader).
         boolean cold=opts.get("--mode").equals("append_cold");
+        boolean openIsTimed=cold || (role.equals("reader") && !live);
+        if (openIsTimed) Affinity.pin(opts.get("--cpu"),control,role);
         long priming=opts.get("--mode").equals("append_steady") ? PRIMING_RECORDS : 0;
         long replayStart = System.nanoTime();
         try (Endpoint endpoint = factory.open(role,dir)) {
-            if (live) Affinity.pin(opts.get("--cpu"),control,role);
+            if (!openIsTimed) Affinity.pin(opts.get("--cpu"),control,role);
             if (role.equals("writer")) {
                 byte[] data = new byte[payload+16];
                 Arrays.fill(data,(byte)0x5a);
@@ -191,7 +192,7 @@ public final class Harness {
                 result.put("flush_seconds",flushSeconds);
                 result.put("timer_starts",cold?"before open, in an empty directory":priming>0
                     ?"at the first record after open and the priming records":"at the first record after open");
-                result.put("priming_records",priming); result.put("affinity",Affinity.report());
+                result.put("priming_records",priming); result.put("affinity",Affinity.report(opts.get("--cpu"),control,role));
                 resultOut.println(JSON.writeValueAsString(result));
                 if (live) {
                     long deadline=System.nanoTime()+TIMEOUT;
@@ -238,7 +239,7 @@ public final class Harness {
                     result=m;
                 } else result=live?histogram(hist):new LinkedHashMap<>(Map.of("count",count,"seconds",seconds,
                     "records_per_s",count/seconds,"payload_mb_per_s",count*payload/seconds/1e6));
-                result.put("affinity",Affinity.report());
+                result.put("affinity",Affinity.report(opts.get("--cpu"),control,role));
                 resultOut.println(JSON.writeValueAsString(result));
                 if (live) Files.write(control.resolve("reader.done"),new byte[0]);
             } else throw new IllegalArgumentException("expected writer/reader");

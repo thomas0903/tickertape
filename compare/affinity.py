@@ -12,6 +12,7 @@ import threading
 
 SYS_CPU = Path("/sys/devices/system/cpu")
 JAVA_TOOLS = ("chronicle", "aeron")
+AERON_HELPER_CPUS = 4  # Three busy-spinning driver threads, and the clients' conductors and the JVM.
 
 
 def parse_cpus(text):
@@ -20,7 +21,10 @@ def parse_cpus(text):
     for part in text.strip().split(","):
         if part:
             first, _, last = part.partition("-")
-            first, last = int(first), int(last or first)
+            try:
+                first, last = int(first), int(last or first)
+            except ValueError:
+                raise ValueError(f"invalid CPU list {text!r}; use for example 0-3,8") from None
             if first > last:
                 raise ValueError(f"invalid CPU range {part}")
             cpus.update(range(first, last + 1))
@@ -169,12 +173,14 @@ class Keeper:
 
     A thread starts on the CPUs of the thread that created it, so one that a tool starts from its measured thread after
     that was pinned starts on the measured CPU (yaque's reader: a file watcher per segment). Every INTERVAL_S this
-    moves such threads of the watched processes to the helper CPUs, and counts them for the result."""
-    INTERVAL_S = 0.01
+    moves such threads of the watched processes to the helper CPUs, and counts them for the result. It leaves a process
+    alone once its measured thread has read back the affinity (<role>.measured): threads that start while a process
+    exits, such as the JVM's shutdown hooks, are not part of the measurement."""
+    INTERVAL_S = 0.002
 
     def __init__(self, plan, control):
         self.plan, self.control = plan, Path(control)
-        self.processes, self.measured, self.moved = [], {}, {}
+        self.processes, self.measured, self.moved, self.error = [], {}, {}, None
         self.stop = threading.Event()
         self.thread = threading.Thread(target=self._run, daemon=True) if plan["mode"] == "pinned" else None
 
@@ -190,22 +196,40 @@ class Keeper:
 
     def watch(self, pid, role):
         self.processes.append((pid, role))
+        if self.thread:
+            self.measured[pid] = None  # Its measured thread's id, once known.
+
+    def check(self):
+        """Fails if this did not watch every process from its pinning on: then nothing says the CPUs were kept free."""
+        if self.thread is None:
+            return
+        if self.error is not None or not self.thread.is_alive():
+            raise RuntimeError(f"the affinity keeper failed: {self.error!r}") from self.error
+        unseen = [pid for pid, tid in self.measured.items() if tid is None]
+        if unseen:
+            raise RuntimeError(f"the affinity keeper never saw the measured thread of processes {unseen}")
 
     def _run(self):
-        while not self.stop.wait(self.INTERVAL_S):
-            for pid, role in list(self.processes):
-                try:
-                    self.sweep(pid, role)
-                except OSError:
-                    self.processes.remove((pid, role))  # It has ended.
+        try:
+            while not self.stop.wait(self.INTERVAL_S):
+                for pid, role in list(self.processes):
+                    try:
+                        over = self.sweep(pid, role)
+                    except (FileNotFoundError, ProcessLookupError):
+                        over = True  # The process has ended.
+                    if over:
+                        self.processes.remove((pid, role))
+        except BaseException as error:  # Whatever it is, check() reports it and the run fails.
+            self.error = error
 
     def sweep(self, pid, role):
+        """Moves this process's misplaced threads. True once its measurement is over."""
         tasks = Path(f"/proc/{pid}/task")
-        if pid not in self.measured:
+        if self.measured[pid] is None:
             tid = int(_read(self.control / f"{role}.tid", "0"))
             # Not pinned yet, or the id an earlier process of this role left: there is nothing to move before that.
             if not tid or not (tasks / str(tid)).exists():
-                return
+                return False
             self.measured[pid] = tid
         cpus = {self.plan["writer_cpu"], self.plan["reader_cpu"]}
         for task in os.listdir(tasks):
@@ -213,12 +237,17 @@ class Keeper:
             if tid == self.measured[pid]:
                 continue
             try:
-                if cpus & os.sched_getaffinity(tid):
-                    os.sched_setaffinity(tid, self.plan["helper_cpus"])
-                    key = role, _read(tasks / task / "comm", "?")
-                    self.moved[key] = self.moved.get(key, 0) + 1
-            except OSError:
+                if not cpus & os.sched_getaffinity(tid):
+                    continue
+                # Asked after seeing the thread, so one that started during the measurement is never taken for later.
+                if _read(self.control / f"{role}.measured") == str(self.measured[pid]):
+                    return True
+                os.sched_setaffinity(tid, self.plan["helper_cpus"])
+                key = role, _read(tasks / task / "comm", "?")
+                self.moved[key] = self.moved.get(key, 0) + 1
+            except ProcessLookupError:
                 pass  # This thread has ended.
+        return False
 
 
 def adapter_options(plan, tool, role):
@@ -237,11 +266,24 @@ def latency_options(plan):
             "--helper-cpus", cpu_list(plan["helper_cpus"])]
 
 
-def record(plan, writer, reader, keeper=None):
+def warnings(plan, tools):
+    """What a reader of the results has to know about this plan."""
+    if plan is None or plan["mode"] != "pinned" or "aeron" not in tools:
+        return []
+    helpers = plan["helper_cpus"]
+    if len(helpers) >= AERON_HELPER_CPUS:
+        return []
+    return [f"Aeron has {len(helpers)} helper CPUs; its media driver and clients need {AERON_HELPER_CPUS}. Do not "
+            f"publish Aeron figures from this plan"]
+
+
+def record(plan, tool, writer, reader, keeper=None):
     """The result's affinity section: the plan and what the processes read back. Takes `affinity` out of the raw
-    child results. Fails if the plan is pinned and a measured thread or a helper thread was somewhere else."""
-    section = dict(plan)
+    child results. Fails if the plan is pinned and a measured thread or a helper thread was somewhere else, or if the
+    keeper (None: the processes were not watched) did not work."""
+    section = dict(plan, warnings=warnings(plan, [tool]), moved_threads=None)
     if keeper is not None and plan["mode"] == "pinned":
+        keeper.check()
         section["moved_threads"] = [{"role": role, "name": name, "count": count}
                                     for (role, name), count in sorted(keeper.moved.items())]
     for role, result in (("writer", writer), ("reader", reader)):

@@ -355,8 +355,8 @@ the repository, and run each benchmark at least twice. Record:
 - CPU model/architecture, memory, OS version, kernel and journal filesystem.
 - Cache mode, reader kind, payload, segment size, rate, count, warmup and checkpoint
   batch settings; whether coordinated omission is handled by intended timestamps.
-- Host load, power state and any external affinity settings. Only `tt-sustained --cpus`
-  applies affinity, and its result records it.
+- Host load, power state and any external affinity settings. `tt-sustained --cpus` and
+  `tt-latency --writer-cpu`/`--reader-cpu` apply affinity, and their results record it.
 - Virtualization explicitly: **OrbStack VM (Linux on macOS)** plus host Mac model,
   never bare-metal Linux. CI is smoke only. In the OrbStack VM use its own disk
   (`TMPDIR=$HOME/tmp`); `/tmp` is tmpfs and unsuitable for storage measurements.

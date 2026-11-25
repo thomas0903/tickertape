@@ -91,11 +91,17 @@ watchers, and the runner itself.
 - **How.** After the build the runner moves itself to the helper CPUs, so every process and thread it starts inherits
   them; tickertape also gets them as `WriterConfig::helper_cpus`, since its default would use every CPU of the cpuset.
   The measured thread then pins itself (`sched_setaffinity`; from Java with `taskset` on its thread id, so no tool needs
-  an extra native library): after opening its endpoint in W2 and the sustained mode, before opening it in W1 and W3,
-  where opening can be inside the timer. A thread that a tool starts later from a measured thread starts on the measured
-  CPU. Every 10 ms the runner moves such threads to the helper CPUs and counts them in `moved_threads`. Known ones are
-  yaque's reader (one file watcher per segment) and Chronicle (`Thread-0`, in some runs). Until it is moved, such a
-  thread competes with the measured one.
+  an extra native library): after opening its endpoint, except in `W1-cold` and in W3's reader, where opening is inside
+  the timer. There it pins itself first, so threads that the tool starts in the timed open begin on the measured CPU.
+- **Threads that start on a measured CPU.** A thread begins on the CPUs of the thread that starts it. Every 2 ms the
+  runner moves such threads to the helper CPUs and counts them in `moved_threads`, until the measured thread has read
+  back the affinity. Known ones are yaque's reader (one file watcher per segment) and, in `W1-cold`, tickertape's
+  helpers, which also place themselves. Until it is moved, such a thread competes with the measured one: in functional
+  VM runs yaque's reader waited for a CPU for up to a few milliseconds per run, at 1 ms as at 10 ms, because the kernel
+  runs the new thread first. That can be in yaque's tail latency; no other tool's
+  thread was moved outside a timed open in those runs. `moved_threads` is `null`
+  where nothing was watched: in unpinned runs, and in tickertape's W2, where `tt-latency` starts its own processes (its
+  read-back is checked like the others).
 - **Which CPUs.** Without options, two physical cores in one L3 cache, not CPU 0's core if others are free, not isolated
   CPUs; the helpers get every other allowed, non-isolated CPU outside those two cores, so no hyperthread sibling of a
   measured core. The topology comes from `/sys/devices/system/cpu`. A machine without a third physical core needs
@@ -103,12 +109,15 @@ watchers, and the runner itself.
 - **Named CPUs** are used exactly, for example isolated ones (`isolcpus`):
   `--writer-cpu 2 --reader-cpu 3 --helper-cpus 0-1,4-7`. Helper CPUs should not be isolated (the kernel does not balance
   threads between isolated CPUs) and, for Aeron, at least four: its driver alone busy-spins on three, as its
-  documentation recommends with a core for each. Fewer is allowed, and slows the tools with busy helpers.
+  documentation recommends with a core for each. With fewer, Aeron's latency is that of threads sharing CPUs: the runner
+  prints a warning and records it in `affinity.warnings`. **Do not publish Aeron figures from such a machine**; the
+  automatic choice on four cores without hyperthreads is one.
   `measured_cpus_sharing_a_physical_core` lists measured CPUs whose hyperthread sibling a named choice uses too.
-- **What is recorded.** `affinity` in every result has the plan and, under `writer` and `reader`, what `/proc` said at
-  the end of the run: `cpus_allowed` and `last_cpu` of the measured thread and `cpus_allowed` of every other thread of
-  its process. The runner fails a pinned run if a measured thread was not on exactly its CPU, or another thread may run
-  on a measured CPU. `environment.txt` has the plan, and the sustained mode resumes only with the same one.
+- **What is recorded.** `affinity` in every result has the plan and, under `writer` and `reader`, what `/proc` said after
+  the last measured record, with the tool still open: `cpus_allowed` and `last_cpu` of the measured thread and
+  `cpus_allowed` of every other thread of its process. The runner fails a pinned run if a measured thread was not on
+  exactly its CPU, if another thread may run on a measured CPU, or if the part of the runner that moves threads did not
+  work. `environment.txt` has the plan, and the sustained mode resumes only with the same one.
 - **`--no-pin`** leaves scheduling to the kernel, as in all results recorded before this option existed. On macOS, which
   has no hard affinity, nothing is pinned and results say `affinity: unsupported on macOS`.
 - The JVM sizes its GC and JIT thread pools from the CPUs it may use, so in pinned runs from the helper CPUs. Pinning
@@ -216,8 +225,8 @@ as possible. There are **two figures per tool**, from separate runs (`W1-cold`,
 
 | Before the first timed append | tickertape | Chronicle | yaque | queue-file | plain file |
 |---|---|---|---|---|---|
-| by open | 128 MiB segment preallocated, synced and mapped; helper prefaults the first 256 KiB (Linux) | `metadata.cq4t` only | empty segment file | 8 KiB file, synced | empty file |
-| by the first append | nothing | cycle file, index and first mapping created | nothing | nothing | nothing |
+| by open | 128 MiB segment preallocated, synced and mapped; helper prefaults the first 256 KiB (Linux) | `metadata.cq4t` only | empty segment file | 8 KiB file, not synced | empty file |
+| by the first append | nothing | cycle file, index and first mapping created | nothing | file doubled and synced | nothing |
 | by later appends | first-touch faults beyond the prefault window; a new segment at each roll | first-touch faults; next mapped chunk | file growth | file doubled **and synced** each time it is full | file growth |
 
 - **`W1-cold`, cold start:** the timer starts before open, in an empty directory, and stops after the last append.
@@ -225,10 +234,15 @@ as possible. There are **two figures per tool**, from separate runs (`W1-cold`,
   queue in the same JVM: files are cold, code is not. The record buffer and an empty histogram are created inside it.
 - **`W1-steady`, steady burst:** the tool is opened and 1,000 priming records are appended before the timer starts, for
   every tool, so files, first mappings and first pages exist. queue-file is opened with 128 MiB capacity (as large as a
-  tickertape or yaque segment); as `QueueFile::open` creates it, it would double and sync its file inside the timer. The
-  others have no public setting for more, so growth, rolls, chunk mappings and first-touch page faults beyond the
-  priming records stay inside the timer, except where the tool itself prefaults. This is a short burst into ready
-  files, not a long-run rate (see the sustained mode).
+  tickertape or yaque segment); as `QueueFile::open` creates it, it would double and sync its file inside the timer. Beyond
+  that the tools keep their settings (Chronicle's mapped chunk is `blockSize`, at its default here), so growth, rolls,
+  chunk mappings and first-touch page faults beyond the priming records stay inside the timer, except where the tool
+  itself prefaults. This is a short burst into ready files, not a long-run rate (see the sustained mode).
+
+W1 is short. At the rates recorded with the old W1 (`docs/benchmarks.md`, v0.4.0 on bare metal) tickertape's 100,000 ×
+1,024 B take 31–32 ms, and a faster machine takes less, so one scheduler delay, page-fault stall or helper thread that
+starts late is a visible share of the figure. W1 shows what a burst costs, with that noise in it; it cannot show a
+steady rate, and differences of a few percent between tools or versions mean nothing here.
 
 Results recorded before this split (`W1` without a suffix) opened the endpoint before the timer and primed nothing:
 tickertape's preallocation was outside the timer and Chronicle's cycle file inside. They are comparable with neither

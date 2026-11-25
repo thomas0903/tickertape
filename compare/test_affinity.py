@@ -133,9 +133,38 @@ class RecordTests(unittest.TestCase):
         self.reader = {"count": 1, "affinity": {"cpus_allowed": [2], "last_cpu": 2, "other_threads": []}}
 
     def test_the_read_back_affinity_moves_from_the_child_results_into_the_section(self):
-        section = affinity.record(self.plan, self.writer, self.reader)
+        section = affinity.record(self.plan, "yaque", self.writer, self.reader)
         self.assertEqual((self.writer, self.reader), ({"count": 1}, {"count": 1}))
         self.assertEqual((section["writer"]["cpus_allowed"], section["reader"]["last_cpu"]), ([1], 2))
+        self.assertIsNone(section["moved_threads"])  # Nothing watched these processes.
+
+    def test_aeron_without_enough_helper_cpus_is_marked(self):
+        few = FakeSys([[0], [1], [2], [3]]).resolve()
+        self.assertEqual(few["helper_cpus"], [0, 3])
+        self.assertIn("2 helper CPUs", affinity.warnings(few, ["yaque", "aeron"])[0])
+        self.assertEqual(affinity.warnings(few, ["yaque"]), [])
+        self.assertEqual(affinity.warnings(self.plan, ["aeron"]), [])
+        section = affinity.record(dict(self.plan, helper_cpus=[0, 3]), "aeron", self.writer, self.reader)
+        self.assertEqual(len(section["warnings"]), 1)
+
+    def test_a_keeper_that_failed_or_saw_nothing_fails_the_run(self):
+        class Failing(affinity.Keeper):
+            def sweep(self, pid, role):
+                raise PermissionError("refused")
+
+        with tempfile.TemporaryDirectory() as control:
+            with Failing(self.plan, control) as keeper:
+                keeper.watch(os.getpid(), "writer")
+                keeper.thread.join(30)
+                with self.assertRaisesRegex(RuntimeError, "refused"):
+                    affinity.record(self.plan, "yaque", copy.deepcopy(self.writer), None, keeper)
+            with affinity.Keeper(self.plan, control) as keeper:  # No writer.tid: the thread it has to spare is unknown.
+                keeper.watch(os.getpid(), "writer")
+                with self.assertRaisesRegex(RuntimeError, "never saw"):
+                    affinity.record(self.plan, "yaque", copy.deepcopy(self.writer), None, keeper)
+            # It ended too early.
+            with self.assertRaisesRegex(RuntimeError, "failed"):
+                affinity.record(self.plan, "yaque", copy.deepcopy(self.writer), None, keeper)
 
     def test_a_thread_that_was_elsewhere_fails_the_run(self):
         for change in [lambda w, r: w.update(cpus_allowed=[0, 1]), lambda w, r: w.update(last_cpu=3),
@@ -147,47 +176,69 @@ class RecordTests(unittest.TestCase):
             writer, reader = copy.deepcopy(self.writer), copy.deepcopy(self.reader)
             change(writer["affinity"], reader["affinity"])
             with self.assertRaises(AssertionError):
-                affinity.record(self.plan, writer, reader)
+                affinity.record(self.plan, "yaque", writer, reader)
             # The same read-back is only recorded, not judged, in an unpinned run.
             writer, reader = copy.deepcopy(self.writer), copy.deepcopy(self.reader)
             change(writer["affinity"], reader["affinity"])
-            self.assertEqual(affinity.record({"mode": "none"}, writer, reader)["mode"], "none")
+            self.assertEqual(affinity.record({"mode": "none"}, "yaque", writer, reader)["mode"], "none")
 
 
+# Starts a thread from its pinned thread, and another one after announcing the end of its measurement.
 CHILD = """
 import os, sys, threading, time
 control, cpu = sys.argv[1], int(sys.argv[2])
-open(control + "/writer.tmp", "w").write(str(threading.get_native_id()))
-os.rename(control + "/writer.tmp", control + "/writer.tid")
+def announce(event):
+    open(control + "/writer.tmp", "w").write(str(threading.get_native_id()))
+    os.rename(control + "/writer.tmp", control + "/writer." + event)
+def start():
+    threading.Thread(target=time.sleep, args=(60,), daemon=True).start()
+announce("tid")
 os.sched_setaffinity(0, {cpu})
-threading.Thread(target=time.sleep, args=(60,), daemon=True).start()
+start()
+sys.stdin.readline()
+announce("measured")
+start()
+print("late", flush=True)
 time.sleep(60)
 """
 
 
 @unittest.skipUnless(platform.system() == "Linux", "Linux only")
 class KeeperTests(unittest.TestCase):
-    def test_a_thread_started_from_the_pinned_thread_is_moved_to_the_helper_cpus(self):
+    def test_threads_are_moved_to_the_helper_cpus_until_the_measurement_is_over(self):
         cpus = sorted(os.sched_getaffinity(0))
         if len(cpus) < 3:
             self.skipTest("needs three CPUs")
         plan = {"mode": "pinned", "writer_cpu": cpus[0], "reader_cpu": cpus[1], "helper_cpus": cpus[2:]}
         affinity.check(plan, ["yaque"])
         self.assertEqual(sorted(os.sched_getaffinity(0)), cpus)  # check() leaves the runner where it was.
-        with tempfile.TemporaryDirectory() as control, affinity.Keeper(plan, control) as keeper:
-            child = subprocess.Popen([sys.executable, "-c", CHILD, control, str(cpus[0])])
+        with tempfile.TemporaryDirectory() as control, affinity.Keeper(plan, control) as keeper, \
+                subprocess.Popen([sys.executable, "-c", CHILD, control, str(cpus[0])], stdin=subprocess.PIPE,
+                                 stdout=subprocess.PIPE, text=True) as child:
+            def masks():
+                return {tid: os.sched_getaffinity(int(tid)) for tid in os.listdir(f"/proc/{child.pid}/task")}
+
+            def wait(condition):
+                deadline = time.monotonic() + 30
+                while not condition() and time.monotonic() < deadline:
+                    time.sleep(0.01)
             try:
                 keeper.watch(child.pid, "writer")
-                deadline = time.monotonic() + 30
-                while not keeper.moved and time.monotonic() < deadline:
-                    time.sleep(0.01)
+                wait(lambda: keeper.moved)
                 self.assertEqual([(key[0], n) for key, n in keeper.moved.items()], [("writer", 1)])
-                masks = {tid: os.sched_getaffinity(int(tid)) for tid in os.listdir(f"/proc/{child.pid}/task")}
-                self.assertEqual(masks.pop(str(child.pid)), {cpus[0]})  # The measured thread stays.
-                self.assertEqual(list(masks.values()), [set(cpus[2:])])
+                before = masks()
+                self.assertEqual(before.pop(str(child.pid)), {cpus[0]})  # The measured thread stays.
+                self.assertEqual(list(before.values()), [set(cpus[2:])])
+                child.stdin.write("\n")
+                child.stdin.flush()
+                self.assertEqual(child.stdout.readline(), "late\n")
+                wait(lambda: not keeper.processes)
+                after = masks()
+                self.assertEqual(sorted(map(sorted, after.values())), sorted([[cpus[0]], [cpus[0]], cpus[2:]]))
+                self.assertEqual(sum(keeper.moved.values()), 1)  # Not counted as a thread that competed.
+                keeper.check()
             finally:
                 child.kill()
-                child.wait()
 
 
 if __name__ == "__main__":
