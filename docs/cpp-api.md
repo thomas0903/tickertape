@@ -301,6 +301,9 @@ while (!stop_requested()) {
 }
 ```
 
+`seek_to_end()` (from 1.1) places the reader at the end of the journal instead, reading at most the newest segment
+(`tickertape_reader_seek_to_end` in [`c-api.md`](c-api.md#reading)).
+
 There are two readers, as in C:
 
 - `Reader::open`, the **safe reader**, reads the files with `pread` into a buffer it owns and validates the copy. It
@@ -322,8 +325,8 @@ thread while it waits is undefined behaviour. Loop with a finite timeout and che
 already committed, up to `batch.capacity()` records or until the next payload does not fit in the batch's buffer (it
 is then returned first by the next read). If even the first does not fit, it fails with `Status::buffer_too_small`
 and `error().needed_size()`. If an error happens after some records were read, the call returns those records, and
-the next read returns the error: records handed out are never lost. A successful `seek` discards a held-back record
-and a deferred error.
+the next read returns the error: records handed out are never lost. A successful `seek` or `seek_to_end`
+discards a held-back record and a deferred error.
 
 ```cpp
 tt::RecordBatch batch(256, 1 << 20);   // allocated once
@@ -444,6 +447,10 @@ tickertape::WriterMetrics w = writer.metrics().value();  // in the writer's proc
   another file, or newer than the sample). It does not invalidate a `RecordView`.
 - `Writer::metrics()` makes no system call. Like every value type of the binding, these structs gain no members
   within a major version (ADR 0036 → Versioning); later values come as new types or functions.
+
+The latency histograms and record ages of the Rust crate (`tickertape::latency`, from 1.1, ADR
+[0047](decisions/0047-latency-histograms.md)) are not available from C++ yet; `tickertape age` (see [`cli.md`](cli.md))
+reports ages from the command line.
 
 ## Versioning
 

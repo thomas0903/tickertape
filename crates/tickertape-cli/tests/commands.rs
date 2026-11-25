@@ -1,6 +1,7 @@
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::process::{Command as ProcessCommand, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use assert_cmd::Command;
@@ -202,6 +203,62 @@ fn tail_ranges_formats_and_idle_exit() {
     assert!(output(&["tail", "--from", "100", "--no-follow"], &dir).is_empty());
 }
 
+/// `tail --from-end` reads the newest segment only: a damaged record in an older one does not stop it, while damage in the newest
+/// is reported. Following from there returns what is appended after it started, with nothing left out.
+#[test]
+fn tail_from_end_does_not_read_older_segments() {
+    let (dir, mut writer) = journal(10);
+    corrupt(&dir, 64 + 40);
+    command()
+        .args(["tail", "--no-follow"])
+        .arg(dir.path())
+        .assert()
+        .code(2);
+    assert!(output(&["tail", "--from-end", "--no-follow"], &dir).is_empty());
+    let done = AtomicBool::new(false);
+    let stdout = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            for n in 10.. {
+                append(&mut writer, n);
+                if done.load(Ordering::SeqCst) || n > 10_000 {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+        let output = command()
+            .args(["tail", "--from-end", "--count", "3", "--format", "json"])
+            .arg(dir.path())
+            .timeout(Duration::from_secs(30))
+            .output()
+            .unwrap();
+        done.store(true, Ordering::SeqCst);
+        assert!(output.status.success());
+        output.stdout
+    });
+    let records = lines(&stdout);
+    let first = records[0]["seq"].as_u64().unwrap() as usize;
+    assert!(first >= 10, "{first}");
+    assert_eq!(records.len(), 3);
+    for (record, n) in records.iter().zip(first..) {
+        check_record(record, n);
+    }
+    // The newest segment is read: damage its first record.
+    drop(writer);
+    let newest = fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(|e| e.unwrap().file_name().into_string().ok())
+        .filter(|name| name.ends_with(".tape"))
+        .max()
+        .unwrap();
+    corrupt_file(&dir.path().join(newest), 64 + 40);
+    command()
+        .args(["tail", "--from-end", "--no-follow"])
+        .arg(dir.path())
+        .assert()
+        .code(2);
+}
+
 fn check_record(record: &Value, n: usize) {
     assert_eq!(record["seq"], n as u64);
     assert_eq!(record["schema_id"], n as u32 + 1);
@@ -288,7 +345,10 @@ fn inspect_and_verify_contracts() {
 }
 
 fn corrupt(dir: &TempDir, offset: u64) {
-    let path = dir.path().join("00000000000000000000.tape");
+    corrupt_file(&dir.path().join("00000000000000000000.tape"), offset);
+}
+
+fn corrupt_file(path: &std::path::Path, offset: u64) {
     let mut file = fs::OpenOptions::new()
         .read(true)
         .write(true)

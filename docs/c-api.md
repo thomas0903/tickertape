@@ -249,13 +249,19 @@ interrupted, and closing the reader from another thread while it waits is undefi
 stoppable (a binding that offers cancellation, a service that shuts down), loop with a finite timeout and check for
 a stop request between calls.
 
+`tickertape_reader_seek_to_end` (from 1.1) places the reader at the end of the journal: the next record is the first
+one the call did not find committed (with durable-only, not covered by a checkpoint). It reads at most the newest
+segment, from the checkpoint on, so a follower that wants only new records does not read the retained segments. Every
+record committed before the call is behind the reader; none committed after it returns is. A failure leaves the
+reader as it was, as for a seek.
+
 `tickertape_reader_read_batch` waits up to the timeout for the first record only, then takes what is already
 committed, up to the array size or until the next payload does not fit in the buffer. A record that does not fit is
 held back and returned first by the next call (`TICKERTAPE_E_BUFFER_TOO_SMALL` if even the first one does not fit,
 with the size it needs in `records[0].payload_len`). If an error occurs after some records were read, the call
 returns `TICKERTAPE_OK` with those records, and the next read call (`next`, `next_copy` or `read_batch`) returns the
-error: records handed out are never lost to an error. A successful `tickertape_reader_seek` discards a held-back
-record and a deferred error; a failed seek changes nothing. The reader stays at the failing position, so a
+error: records handed out are never lost to an error. A successful `tickertape_reader_seek` or
+`tickertape_reader_seek_to_end` discards a held-back record and a deferred error; a failed one changes nothing. The reader stays at the failing position, so a
 persistent error (corruption) is returned again by the following calls until you seek elsewhere.
 
 ## Durability
@@ -481,7 +487,9 @@ The exact system calls are in ADR 0032 → Sampling cost. Nothing is added to ap
   `TICKERTAPE_BEACON_STALE` beacon belongs to a process that died, so its position is history, not lag. The C ABI
   reads beacons; creating one (`tickertape::status::ReaderBeacon`) is available from Rust only.
 - Not in the C ABI yet: the repeated `Sampler` (append rates, time until the volume is full) and the health
-  thresholds of `Status::breaches`. Both can be added without changing these structs.
+  thresholds of `Status::breaches`. Both can be added without changing these structs. Nor are the latency histograms
+  and record ages of `tickertape::latency` (ADR [0047](decisions/0047-latency-histograms.md)), which are available from
+  Rust only.
 
 ## Versioning
 

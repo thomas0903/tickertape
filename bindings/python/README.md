@@ -28,6 +28,7 @@ with tt.Reader("/tmp/journal") as reader:
         print(record.seq, record.schema_id, record.payload)
     reader.seek(2)
     batch = reader.read_many(1000)  # up to 1000 records, one call
+    reader.seek_to_end()  # from here on only what is written next (reads at most the newest segment)
     live = reader.next(timeout=5.0)  # waits for the writer (Ctrl-C works), None on timeout
 ```
 
@@ -122,7 +123,8 @@ NumPy, pyarrow and pandas are optional and imported only when these methods are 
   in between; `closed`, `position` and `repr` never wait at all. Reads from several threads share the one cursor:
   each record goes to exactly one of them, in order, and which one gets it is unspecified. A read that does not wait
   returns nothing only when no committed record is left, even if another thread took the records it had found.
-  Give each consumer its own reader. Changing the class of an argument (for example adding or removing its
+  Give each consumer its own reader. `seek_to_end()` holds its reader, with the GIL released, until it has read the
+  newest segment from the checkpoint on, and can't be interrupted meanwhile. Changing the class of an argument (for example adding or removing its
   `__iter__`) from another thread while a call is using that argument is not supported.
 - `close()` from another thread (or from a signal handler) ends a read that is waiting on that reader within about
   50 ms; the waiting call raises `ValueError`, also when its timeout has passed meanwhile.

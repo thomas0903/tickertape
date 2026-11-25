@@ -67,7 +67,7 @@ enum StatusFormat {
     Prometheus,
 }
 
-fn parse_interval(value: &str) -> std::result::Result<Duration, String> {
+pub(crate) fn parse_interval(value: &str) -> std::result::Result<Duration, String> {
     let duration = match value.strip_suffix("ms") {
         Some(ms) if !ms.is_empty() && ms.bytes().all(|b| b.is_ascii_digit()) => ms
             .parse::<u64>()

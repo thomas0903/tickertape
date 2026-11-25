@@ -18,7 +18,10 @@ draws conclusions from those two.
 - **Open time.** When the writer opens, it reads the part of the newest segment after the last record to clean up
   after a crash, so very large segments make opening slower.
 - **Seek time.** `Reader::seek` opens the segment holding the target and reads every record before it in that
-  segment, validating each, so larger segments make a seek slower (ADR 0042).
+  segment, validating each, so larger segments make a seek slower (ADR 0042). A forward seek within the reader's
+  segment reads only from the reader's position on, when an earlier seek of that reader found that position covered by
+  the checkpoint (ADR 0046), so seeking forward through a checkpointed segment reads it once, not once for each seek. `Reader::seek_to_end` reads at most
+  the newest segment, from the checkpoint on.
 - **Segment count.** Opening a reader or a writer and each seek read the whole journal directory; `list_segments`,
   `verify` and each retention run (when retention is configured, at writer open and after checkpoints) open every
   segment's file; replay opens each segment it enters. These costs grow with the number of segments, so very small
@@ -196,6 +199,105 @@ removal.
 Never truncate or edit a segment in place while anything uses the journal: processes that map it can receive
 `SIGBUS`.
 
+## Moving a tape to another machine
+
+A journal is its `*.tape` files and `checkpoint`; nothing in them depends on the machine they were written on
+(`format.md`). Copy those files. The other entries of the directory (`format.md` → Journal directory) are not needed
+to read or continue the journal: `writer.lock` and `notify` describe a writer on the old machine, and a new writer
+creates its own. `quarantine/`, if present, holds bytes that recovery removed; keep it if they matter to you. The
+commands below
+were run with tickertape 1.0.0 from macOS (aarch64, APFS) to Linux (aarch64, btrfs, a local VM) over SSH, with 1 MiB
+segments; the first recipe's copy, checksum and `verify` steps also in the other direction.
+
+### A whole journal, with the writer stopped
+
+1. Checkpoint, close the writer, and check the source: `verify` exits with 0 and `status` reports an exposure of 0
+   records. Records after the last checkpoint are copied too, but the marker does not cover them on either machine.
+
+   ```sh
+   tickertape verify journal
+   tickertape status journal
+   (cd journal && shasum -a 256 *.tape checkpoint) > journal.sha256
+   ```
+
+2. Copy. `sync` makes the new machine write the copy to its disk: the marker came along with the copy, so it calls
+   records durable there before they are. This was run with a Linux destination; on macOS plain sync calls do not
+   flush the drive's write cache (crash contract → What `checkpoint()` does), so with a macOS destination keep the
+   source until the copy has been made durable some other way.
+
+   ```sh
+   ssh newhost 'mkdir journal'
+   (cd journal && COPYFILE_DISABLE=1 tar --no-xattrs -cf - *.tape checkpoint) | ssh newhost 'tar -xpf - -C journal && sync'
+   ```
+
+   `COPYFILE_DISABLE` and `--no-xattrs` keep macOS metadata out of the archive; leave them out on Linux. `tar` keeps
+   modification times, from which `status` estimates the checkpoint's age.
+
+3. Check the copy against the list, then the journal:
+
+   ```sh
+   ssh newhost 'cd journal && sha256sum -c -' < journal.sha256
+   ssh newhost 'tickertape verify journal && tickertape status journal'
+   ```
+
+   Both checks are needed. The records' CRC32C lets `verify` find a damaged record, but `verify` accepts an older,
+   complete prefix of a journal and does not check that `checkpoint` names an existing segment (`status` does). The
+   list shows that the listed files arrived unchanged; make it from all of them.
+
+Readers then start at the oldest segment, durable-only readers see the records the marker covers, and a writer opened
+there continues at the next sequence number (all three were run). **From then on use only one of the two
+copies for writing.** The writer lock does not reach across machines: two writers give different records the same
+sequence numbers, and the copies can't be joined again.
+
+### Old segments, with the writer running
+
+`tickertape archive` moves sealed segments that are strictly older than the checkpoint segment out of the journal. They
+no longer change, so copy them from the archive directory (it must exist; the commands below are for a first run):
+
+```sh
+mkdir archive
+tickertape archive journal --to archive --keep-segments 4
+(cd archive && shasum -a 256 *.tape) > archive.sha256
+ssh newhost 'mkdir archive'
+(cd archive && COPYFILE_DISABLE=1 tar --no-xattrs -cf - *.tape) | ssh newhost 'tar -xpf - -C archive && sync'
+ssh newhost 'cd archive && sha256sum -c -' < archive.sha256
+```
+
+What a reader on the new machine sees:
+
+- The records of the archived segments, up to the seal of the last one. The seal names the next segment, which is not
+  there, so `verify`, an unbounded `export` and `tail` report `next segment … missing or inconsistent` and exit with 2
+  after the last record. That problem, at the last segment and alone, is expected; any other is not. Bounded reads
+  succeed: `tickertape export archive --format jsonl --to <last sequence number>` and `stats … --to`. The last sequence
+  number is one less than the sequence number in the name of the oldest segment left in the journal.
+- Nothing with `--durable-only`: an archive has no marker.
+- With the remaining files of the journal, copied once the writer has stopped, in the same directory, the whole journal
+  again: `verify` exits with 0.
+
+Do not open a writer on an archive copy: it creates the missing next segment and continues with sequence numbers the
+original journal already uses.
+
+### Limits
+
+- **Do not copy a journal a writer is using as a whole.** The files change during the copy, so it is no snapshot.
+  Copying the segments before `checkpoint` is dangerous: the marker can cover records the copied segments lack. If the
+  marker names a segment the copy lacks, the writer refuses the copy. If it points into a segment that was copied
+  earlier, `verify` and `status` can both exit with 0 and the writer opens, continues at the marker's sequence number
+  and leaves a hole that readers cannot pass. A sign of this is a `verify` `last_seq` + 1 lower than the checkpoint's
+  `next seq` in `status`. Copying `checkpoint` first avoids that, but the records after the marker may be incomplete,
+  `verify` can fail because the next segment is missing, and retention may remove segments during the copy. Stop the
+  writer, or use the archive recipe above.
+- A copy that lacks a segment in the middle, or the newest one after a sealed one, fails `verify`; one that lacks only
+  its oldest segments passes, like a journal after retention. The writer refuses a copy whose marker's segment is
+  missing, but accepts one that lacks only older segments, and one that lacks only a newest segment after the
+  marker's: in the last case it creates that segment again, empty. So run the checks before you open a writer, and do
+  not rely on them for a copy of a live journal.
+- A writer preallocates the segments it creates, not one it finds. Do not copy with options that make sparse files
+  (`tar -S`, `rsync --sparse`) if a writer will continue on the copy: the newest segment may then have no disk
+  space reserved (crash contract C10). Not tested.
+- Not tested: x86-64 machines, and other filesystems than APFS and btrfs. Network filesystems are not supported, and
+  tickertape does not build for big-endian machines.
+
 ## Monitoring
 
 `tickertape status` and the `tickertape::status` module report what an operator needs to know about a running
@@ -344,6 +446,77 @@ let _exposure = meter
     })
     .build();
 ```
+
+### How old records are when they are read
+
+From 1.1 (ADR [0047](decisions/0047-latency-histograms.md)). `latency::RecordAge` in the process that reads, or
+`tickertape age` from the command line, measure the **age** of each record when a reader returns it: this machine's wall
+clock at that moment, minus the record's `local_ts_ns`.
+
+```sh
+tickertape age /data/journal --duration 60s            # one report, as text
+tickertape age /data/journal --interval 10s --json     # one JSON object every 10 s, until interrupted
+```
+
+**What age is not.**
+
+- **It is not the writer-to-reader latency.** It starts where the caller took `local_ts_ns`, which can be long before the
+  append (the receive time of a market-data packet is the usual choice), and the time of the commit is not recorded
+  anywhere. The two are equal only if the caller stamps right before `append`.
+- **It is not the delay of your reader, if you use the command.** `tickertape age` measures its own reader, on the CPU it
+  happens to run on and with the wait it was told to use (`--wait`, [`cli.md`](cli.md)). It says whether the writer, the
+  clock and the machine are healthy. Your reader's ages need `RecordAge` around your reader.
+- **It is not how long a replay takes.** Records read before the reader has caught up, or after a seek or discarded
+  history, are counted apart (`before_live`, `after_discontinuity`): their age says when they were recorded. With
+  `RecordAge` that rests on the application's own declaration (`set_live`); a forgotten `set_live(false)` before a seek
+  backwards puts a replay into the histogram. A backlog that builds up while the reader is live does count.
+- **It shows nothing about a record that has not been read**, such as one a stuck reader has not reached. `status` shows
+  that (reader lag, unread age).
+- **It is nothing at all** if records are appended again with their original timestamps, or stamped with something other
+  than nanoseconds since 1970 (uptime nanoseconds give ages of decades, and a `mean_ns` of null). The library can't tell.
+
+**Clocks.** Both times must come from the same clock, or from clocks that agree.
+
+- Two processes on one machine (also in different containers) that both use `CLOCK_REALTIME`
+  (`tickertape::clock::realtime_ns()`) share it. If it is stepped, the result moves by the step: a step forward shows as
+  a false maximum, a step backward as records ahead of the clock. Slew the clock (chrony and ntpd do by default, after
+  their start) rather than step it.
+- **Timestamps ahead of the observer's clock** (`ahead`, in JSON `ahead_of_clock`) have no age and are never counted as 0.
+  **When that count is not 0, the minimum and every percentile are biased upwards**, because the records left out are the
+  fastest ones. A few after a backward step are harmless; a steady share means that the stamping clock runs ahead: a
+  hardware timestamp (NIC, PHC), a clock on TAI (37 s ahead of UTC), or a clock a few microseconds fast.
+- A clock that runs behind by a constant adds that constant to every age, and nothing shows it.
+- On macOS the wall clock advances in steps of 1 µs: shorter ages are 0, and a finer timestamp can look ahead.
+- A tape copied from another machine has no live records unless something appends to it, so nothing counts there.
+
+**Exporting.** A `View` (or `RecordAgeView`) can be kept by a monitoring thread while the reading thread records. It
+copies about 30 KB per snapshot and takes no lock; once a second or slower is the intended use. The histograms only grow:
+subtract the previous snapshot for the values of an interval. Export quantiles and the extremes rather than the mean of a
+short interval: values recorded while a snapshot is taken can be in its sum and not in its count, so the mean of a busy
+recorder's interval can be off either way, even outside the extremes (the longer the interval, the less). With the `prometheus` crate, for example:
+
+```rust
+use prometheus::{Gauge, IntGauge, register_gauge, register_int_gauge};
+
+let p99 = register_gauge!("tickertape_record_age_p99_seconds", "Age of records when read, last interval")?;
+let max = register_gauge!("tickertape_record_age_max_seconds", "Age of records when read, last interval")?;
+let ahead = register_int_gauge!("tickertape_records_ahead_of_clock", "If it grows, the ages are biased upwards")?;
+let view = age.view(); // `age` is the reading thread's RecordAge
+let mut previous = view.snapshot();
+// On each scrape or timer tick, on another thread:
+let now = view.snapshot();
+let interval = now.age.since(&previous.age);
+// An interval without records has no quantiles.
+let seconds = |d: Option<std::time::Duration>| d.map_or(f64::NAN, |d| d.as_secs_f64());
+p99.set(seconds(interval.value_at_quantile(0.99)));
+max.set(seconds(interval.max()));
+ahead.set(now.ahead as i64);
+previous = now;
+```
+
+An application can time anything else with a `latency::Recorder` of its own, for example its `checkpoint()` calls, or an
+event's handling from when it was due (see the module's documentation for why that differs from the call's duration). The
+library records nothing by itself: no histogram of appends, rolls or checkpoints is kept in the writer.
 
 ### Making readers in other processes visible
 

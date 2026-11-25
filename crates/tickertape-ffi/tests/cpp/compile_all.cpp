@@ -188,6 +188,7 @@ std::uint64_t use_everything(const std::filesystem::path &dir) {
     tt::Reader reader = tt::Reader::open(dir, reader_options).value();
     tt::Reader mapped = tt::Reader::open_mapped_unsafe(dir.string()).value();
     if (auto m = tt::Reader::open_mapped_unsafe(dir.c_str(), reader_options)) mapped = std::move(*m);
+    reader.seek_to_end().value();
     reader.seek(0).value();
     for (tt::Timeout timeout : {tt::Timeout(), tt::no_wait, tt::Timeout(tt::wait_forever), tt::Timeout(5ms),
                                 tt::Timeout(std::chrono::duration<double>(0.25)), tt::Timeout(-1s)}) {

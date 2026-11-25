@@ -181,6 +181,66 @@ class FormatTests(unittest.TestCase):
         self.write_segment(contents=frame(0) + b"\xff" * 8)
         self.assert_corrupt(112, "seal CRC")
 
+    def test_start_seq_picks_the_segment_from_the_file_names(self):
+        def seal(successor):
+            return struct.pack("<II", 0xFFFFFFFF, crc(b"\xff" * 4 + struct.pack("<Q", successor)))
+
+        def frames(*seqs):
+            return b"".join(frame(seq) for seq in seqs)
+
+        for base in (0, 3, 6):
+            self.write_segment(base, frames(*range(base, base + 3)) + (seal(base + 3) if base < 6 else b""))
+
+        def read(**kwargs):
+            opened = []
+            original = reader._Segment
+
+            def segment(path, base):
+                opened.append(base)
+                return original(path, base)
+
+            with patch.object(reader, "_Segment", side_effect=segment):
+                return [r.seq for r in reader.read_journal(self.path, **kwargs)], opened
+
+        everything = list(range(9))
+        self.assertEqual(read(), (everything, [0, 3, 6]))
+        for start in range(12):
+            first = min(start // 3, 2) * 3
+            with self.subTest(start=start):
+                self.assertEqual(read(start_seq=start),
+                                 (everything[start:], list(range(first, 9, 3))))
+        self.assertEqual(read(start_seq=4, end_seq=4), ([4], [3]))
+        # A checkpoint before the chosen segment covers nothing in it; one inside the segment caps it.
+        (self.path / "checkpoint").write_bytes(marker(slot(1, 2), bytes(64)))
+        self.assertEqual(read(start_seq=4, durable_only=True)[0], [])
+        (self.path / "checkpoint").write_bytes(marker(slot(1, 5, 3, 64), bytes(64)))
+        self.assertEqual(read(start_seq=4, durable_only=True), ([4], [3]))
+
+        # The prefix inside the chosen segment is validated; earlier segments are not opened.
+        damaged = bytearray(frames(0, 1, 2) + seal(3))
+        damaged[40] ^= 1
+        self.write_segment(0, damaged)
+        self.assert_corrupt(64, "CRC")
+        self.assertEqual(read(start_seq=3)[0], everything[3:])
+        damaged = bytearray(frames(3, 4, 5) + seal(6))
+        damaged[40] ^= 1
+        self.write_segment(3, damaged)
+        with self.assertRaises(reader.CorruptJournal) as raised:
+            read(start_seq=5)
+        self.assertEqual(raised.exception.offset, 64)
+        self.assertEqual(raised.exception.path, self.path / f"{3:020}.tape")
+        self.assertEqual(read(start_seq=6)[0], [6, 7, 8])
+        # A missing segment: the newest one below the target is scanned, and its seal's successor is not there.
+        (self.path / f"{3:020}.tape").unlink()
+        self.write_segment(0, frames(0, 1, 2) + seal(3))
+        with self.assertRaisesRegex(reader.CorruptJournal, "successor"):
+            read(start_seq=4)
+        # An archived prefix.
+        (self.path / f"{0:020}.tape").unlink()
+        self.assertEqual(read(start_seq=7), ([7, 8], [6]))
+        with self.assertRaisesRegex(ValueError, "before the first available record 6"):
+            read(start_seq=5)
+
     def test_seal_in_trailer(self):
         payload = bytes(65536 - 64 - 8 - 40)
         seal = struct.pack("<II", 0xFFFFFFFF, crc(b"\xff" * 4 + struct.pack("<Q", 1)))
@@ -279,7 +339,7 @@ class RealJournalTests(unittest.TestCase):
         self.assertEqual(len(list(reader.read_journal(self.path, durable_only=True))), 20000)
 
     def test_inclusive_ranges(self):
-        for first, last in ((10, 20), (0, 0), (19999, 20010), (20000, 20001)):
+        for first, last in ((10, 20), (0, 0), (9000, 9003), (19999, 20010), (20000, 20001)):
             with self.subTest(first=first, last=last):
                 args = ["--from", str(first), "--to", str(last)]
                 rust = subprocess.check_output([self.binary, "export", str(self.path),

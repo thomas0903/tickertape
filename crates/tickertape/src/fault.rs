@@ -72,7 +72,7 @@ pub enum Point {
     /// (crash contract C11), after one of them and before the next (stands in for a crash there).
     BetweenHeldChanges,
     /// After a reader lists the segments and before it opens the one it chose (`Reader::open`,
-    /// `Reader::open_mapped`, `Reader::seek`). Arm with [`run_at`].
+    /// `Reader::open_mapped`, `Reader::seek`, `Reader::seek_to_end`). Arm with [`run_at`].
     ReaderOpen,
     /// After a reader at a seal has checked that its segment is still in place and before it opens the successor.
     /// Arm with [`run_at`].
@@ -81,6 +81,12 @@ pub enum Point {
     /// slot at the cursor again from the file (the seal may have come from bytes an in-place repair has since
     /// zeroed). Arm with [`run_at`].
     ReaderSealReread,
+    /// In `Reader::seek`, after it has read the checkpoint marker that later seeks may rely on, before it checks that
+    /// its segment is still in place. Arm with [`run_at`].
+    ReaderSeekCoverage,
+    /// `inspect::read_checkpoint` found no valid slot in an existing marker, before it reads the slots once more. Arm
+    /// with [`run_at`].
+    CheckpointReread,
     /// Before a durable-only reader reads the checkpoint marker. Arm with [`run_at`].
     ReaderCheckpoint,
     /// After a durable-only reader has read a checkpoint marker that moved past its cursor, before it checks that its

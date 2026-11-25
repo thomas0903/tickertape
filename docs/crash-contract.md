@@ -157,9 +157,10 @@ journal; the durability and restart guarantees below apply to retained history.
   a data race in Rust's terms, before any CRC runs; for a writer in another process the language says nothing. Two
   cases:
 
-  - *An enlarged length.* If storage damage enlarges the length in an earlier record's commit word while no writer
-    runs, and a writer later appends after that record, validating it makes the reader load bytes the writer is
-    storing at that moment.
+  - *A non-zero value that no writer stored.* If storage damage enlarges the length in an earlier record's commit word,
+    or puts a length or a seal marker into the empty slot at the head, so that the claimed frame reaches bytes a writer
+    stores, validating that slot makes the reader load bytes the writer is storing at that moment. The damage can appear
+    whether or not a writer runs.
   - *A zeroed commit word.* If storage damage zeroes the commit word of a record that was published but not yet
     covered by a checkpoint, the next writer's recovery usually replaces the segment by a new file when it finds
     evidence of the records after it (or `Fail` refuses), and readers' mappings of the old file do not change. When
@@ -171,8 +172,9 @@ journal; the durability and restart guarantees below apply to retained history.
   That such loads return some mixture of old and new bytes, which the CRC then rejects, is an assumption about the
   implementation on the supported targets (aligned single-instruction loads), not a guarantee; how likely a chance
   match is depends on the corruption, and a retry can read the same bytes. Every earlier release, which copied the
-  same range with the same atomic loads, had the same exposure. A separately synchronised publication frontier, a
-  planned protocol change, would bound the loads in the first case; it does not close the second, where the bytes
+  same range with the same atomic loads, had the same exposure. ADR
+  [0048](decisions/0048-publication-frontier.md) (accepted, not built) would bound the loads in the first case by the
+  checkpoint marker, for the records it covers; it does not close the second for visible readers, where the bytes
   change because recovery rewrites them (ADR 0027 → "Which loads can race").
 - **The writer** maps the segments it writes. Its API is safe, following the Rust standard library's position that
   its safety guarantees "only cover what the program itself can do, and not what entities outside the program can
@@ -226,9 +228,14 @@ journal; the durability and restart guarantees below apply to retained history.
   the file keeps its identity. A visible reader may then return the removed records it had already read or buffered
   and continue in the new history without `Error::Discarded`;
   if its position falls inside a record of the new history it waits there (`Ok(None)`) or reports
-  `Error::Corrupt` for bytes that aren't corrupt, until the application seeks to its position. It returns a record
+  `Error::Corrupt` for bytes that aren't corrupt, until the application seeks to its position. (If damage also
+  destroyed the checkpoint marker, or set it back to an older one, recovery can remove *covered* records in place, and
+  a seek forward in the reader's segment, or to its position, may then go on from that position when the new history
+  holds, right before it, bytes that form a record with the sequence number expected there. A seek to the last record
+  the reader passed, or an earlier one, scans the segment, and so does a new reader: ADR
+  [0046](decisions/0046-seeks-that-need-no-index.md).) It returns a record
   that isn't in the journal only if the new history holds, at that position, bytes forming a frame with a valid
-  checksum and the expected sequence number. Durable-only readers are unaffected (ADR
+  checksum and the expected sequence number. Except for that case, durable-only readers are unaffected (ADR
   [0034](decisions/0034-durable-only-reads-check-segment-identity.md) → In-place repairs).
 - **Missing segments.** If the checkpoint marker's segment, or a segment in the middle of the chain, is missing,
   the writer refuses to open (under every recovery policy) rather than discard history on its own. A reader that
