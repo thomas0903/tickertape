@@ -1,4 +1,4 @@
-# 0050: How much the safe reader reads at the tail
+# 0052: How much the safe reader reads at the tail
 
 - **Status:** proposed
 - **Date:** 2026-11-26

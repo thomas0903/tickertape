@@ -107,7 +107,7 @@ pub struct Reader {
     buf: Vec<u8>,
     buf_start: u64,
     /// How many fills in a row found the reader following the writer with time to spare, counted from 1 up to
-    /// `TAIL_FILLS + TAIL_PROBE - 1` and then from `TAIL_FILLS` again ([`Reader::fill_size`], ADR 0050). Read and written only by fills of the `pread` buffer, and by a `seek_to_end` that fails.
+    /// `TAIL_FILLS + TAIL_PROBE - 1` and then from `TAIL_FILLS` again ([`Reader::fill_size`], ADR 0052). Read and written only by fills of the `pread` buffer, and by a `seek_to_end` that fails.
     tail_fills: u8,
     /// The journal's wake-up region, if wake-ups are enabled (ADRs 0017 and 0021).
     waker: Option<crate::notify::Waker>,
@@ -1461,7 +1461,7 @@ impl Reader {
     }
 
     /// How many bytes the fill at `offset` asks for: [`CHUNK`], unless the reader follows the writer with time to spare,
-    /// when it is [`TAIL_CHUNK`]. Not observable except through timing and system calls (ADR 0050).
+    /// when it is [`TAIL_CHUNK`]. Not observable except through timing and system calls (ADR 0052).
     ///
     /// A fill *follows* if the slot at the cursor was found empty before it (so the reader was waiting for this record)
     /// and what the reader used of the last fill, at least one record, would have fitted in a tail read. After
