@@ -203,7 +203,7 @@ fn tail_ranges_formats_and_idle_exit() {
     assert!(output(&["tail", "--from", "100", "--no-follow"], &dir).is_empty());
 }
 
-/// `tail --from-end` reads the newest segment only: damage in an older one does not stop it, while damage in the newest
+/// `tail --from-end` reads the newest segment only: a damaged record in an older one does not stop it, while damage in the newest
 /// is reported. Following from there returns what is appended after it started, with nothing left out.
 #[test]
 fn tail_from_end_does_not_read_older_segments() {

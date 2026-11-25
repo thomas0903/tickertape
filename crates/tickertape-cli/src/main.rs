@@ -60,7 +60,7 @@ struct TailArgs {
     /// Start at this sequence number, inclusive
     #[arg(long, value_name = "SEQ", conflicts_with = "from_end")]
     from: Option<u64>,
-    /// Start after the last record in the journal at startup (older segments are not read)
+    /// Start after the last record in the journal at startup (records in older segments are not read)
     #[arg(long)]
     from_end: bool,
     /// Stop after N records (zero writes nothing)
