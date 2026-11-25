@@ -2214,6 +2214,29 @@ fn the_marker_is_made_durable_before_the_walk() {
     );
 }
 
+/// (Plan 12) What decides is the marker read behind the fence, not the one read before it: here the marker goes back to
+/// an older one, which names the segment itself, in between.
+#[test]
+fn the_marker_behind_the_fence_decides() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut writer = Writer::open(dir.path(), config()).unwrap();
+    fill(&mut writer, dir.path(), 1, 64, 1);
+    writer.checkpoint().unwrap();
+    let marker = dir.path().join("checkpoint");
+    let older = std::fs::read(&marker).unwrap();
+    fill(&mut writer, dir.path(), 1, 64, 2);
+    writer.checkpoint().unwrap();
+    drop(writer);
+    fault::clear();
+    // The second segment's fence.
+    fault::run_at(Point::SeekIndexFence, 1, move || {
+        std::fs::write(&marker, &older).unwrap();
+    });
+    let built = build(dir.path());
+    assert_eq!(built[..2], [IndexState::Built, IndexState::NotCovered]);
+    assert_eq!(index_names(dir.path()).len(), 1);
+}
+
 /// (Plan 12) A write error, a name that is taken, a file of a newer version, and what `rebuild` does with it.
 #[test]
 fn errors_and_other_files_in_the_way_of_a_build() {
