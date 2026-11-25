@@ -178,11 +178,13 @@ journal; the durability and restart guarantees below apply to retained history.
     place, under a live zero-copy reader. A payload slice the caller still holds changes, and the reader's later
     commit-word loads meet the new writer's stores.
 
-  As long as the journal's `checkpoint` file holds the markers the writer wrote and no earlier one becomes current,
-  neither case concerns a reader with `durable_only(true)`, and the first does not concern a slot below the checkpoint
+  The bound that ADR 0048 puts on the loads helps replay and catch-up. A caught-up visible reader tailing the head gets
+  nothing from it. As long as the journal's `checkpoint` file holds the markers the writer wrote and no earlier one
+  becomes current, neither case concerns a reader with `durable_only(true)`, and the first does not concern a slot below the checkpoint
   position the reader last took (at a segment's open, on reaching that position, and while it waits). Without that, the
-  limitation is as stated. (This does not cover what follows a damaged record that passes its CRC32C by chance: every
-  reader then goes on behind the frame it claims, which can be past the checkpoint position.) Tests:
+  limitation is as stated. (For a durable-only reader one case is left, and it takes two faults: a damaged record that
+  ends exactly at the checkpoint position and passes its CRC32C by chance, and a seal marker damaged into the empty slot
+  there. The reader then loads the 4 bytes that follow that marker.) Tests:
   `crates/tickertape/src/reader_bound_tests.rs`, `tests/mapped_bound.rs`, the `damaged_frame` models in
   `protocol_model.rs` (loom), and `map_ro_bounded_loads_meet_no_store` (Miri).
 

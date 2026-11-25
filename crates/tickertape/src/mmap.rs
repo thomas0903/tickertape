@@ -1678,7 +1678,8 @@ mod tests {
     /// word) while a reader thread reads the first one through a `MapRo`, with the checks of `Reader::read_slot`. The
     /// first record's commit word is damaged to `claimed` after it was committed; a marker covers the first `covered`
     /// records (handed over through an atomic with release and acquire: that the writer's `pwrite` of it is a release
-    /// is the assumption ADR 0048 states). With `bounded`, the marker's position bounds the loads. Miri reports the data
+    /// is the assumption ADR 0048 states). It runs the reader's `read_mapped` and `MapRo`, but not `Reader::set_limit` or
+    /// `marker_for_limit`: the marker's load and fence are the model's own. With `bounded`, the marker's position bounds the loads. Miri reports the data
     /// race, or the mixed-size one, if the loads meet the writer's stores.
     fn damaged_length_under_a_writer(claimed: u32, covered: u64, bounded: bool) {
         use crate::reader::read_mapped;

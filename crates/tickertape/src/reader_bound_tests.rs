@@ -247,16 +247,133 @@ fn a_crossing_frame_that_validates_is_returned_from_the_buffer() {
         assert_eq!(record.1, body[36..]);
         let buf = reader.buf.as_ptr_range();
         assert!(buf.start <= record.2.start && record.2.end <= buf.end);
-        assert!(is_copied(&reader));
+        // A durable-only reader has given up its mapping; a visible one has marked the record.
+        assert_eq!(is_copied(&reader), !durable);
+        assert_eq!(reader.seg.map.is_none(), durable);
         assert_eq!(reader.buf.len(), len as usize, "only the claimed frame");
         assert!(reader.try_next().unwrap().is_none());
-        assert_eq!(reader.buf.capacity(), 0);
+        assert!(durable || reader.buf.capacity() == 0);
         // The cursor is past the bound (a durable-only reader's too: it counts records, and this one was not one).
         assert_eq!(limit_now(&reader), NO_LIMIT);
         let mut safe = open(dir.path(), false, durable);
         let (want, end) = drain(&mut safe);
         let (got, got_end) = drain(&mut open(dir.path(), true, durable));
         assert_eq!((got, got_end), (want, end));
+    }
+}
+
+/// The gate of a durable-only reader goes by sequence numbers, so a covered record that claims several frames, with a CRC32C
+/// that matches by chance, takes its cursor past the marker while its sequence number is still below the marker's. Nothing
+/// there is loaded through the mapping, where a writer may be storing: not the commit word, not on a retry, not at an empty
+/// slot, not where the frame ends exactly at the marker.
+#[test]
+fn a_durable_only_reader_behind_the_marker_loads_nothing_through_the_mapping() {
+    if !MAPPED_READS {
+        return;
+    }
+    // Where record 5's frame ends: inside record 9 (at 1,400), at the head (an empty slot), and at the marker.
+    let after = |records: u64| FIRST + records * 144;
+    for end in [1_400, after(12), after(8)] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = writer(dir.path());
+        for _ in 0..8 {
+            append(&mut w, 100);
+        }
+        w.checkpoint().unwrap();
+        for _ in 0..4 {
+            append(&mut w, 100);
+        }
+        drop(w);
+        let (at, limit) = (after(5), after(8));
+        let file = raw(&segment(dir.path(), 0));
+        let len = (end - at) as u32;
+        let mut body = vec![0; len as usize - 4];
+        file.read_exact_at(&mut body, at + 4).unwrap();
+        format::finish_record_body(len, &mut body);
+        file.write_all_at(&len.to_le_bytes(), at).unwrap();
+        file.write_all_at(&body, at + 4).unwrap();
+
+        let mut mapped = open(dir.path(), true, true);
+        let mut safe = open(dir.path(), false, true);
+        for _ in 0..5 {
+            mapped.try_next().unwrap().unwrap();
+            safe.try_next().unwrap().unwrap();
+        }
+        let (got, loads) = record_loads(|| {
+            let got: Vec<_> = (0..3).map(|_| drain(&mut mapped)).collect();
+            idle(&mut mapped);
+            (got, drain(&mut mapped))
+        });
+        // (At `limit` itself there is a commit word, and nothing else is loaded.)
+        let allowed = |&(from, to): &(u64, u64)| to <= limit || (from, to) == (limit, limit + 4);
+        assert!(loads.iter().all(allowed), "{end}: {loads:?}");
+        let want: Vec<_> = (0..3).map(|_| drain(&mut safe)).collect();
+        idle(&mut safe);
+        assert_eq!(got, (want, drain(&mut safe)), "{end}");
+        assert_eq!(got.0[0].0.len(), 1, "{end}");
+        assert!(mapped.seg.map.is_none());
+        // A seek opens the segment again, with a mapping and the bound; nothing in the state of the reader stays behind.
+        for target in [0, 4] {
+            mapped.seek(target).unwrap();
+            safe.seek(target).unwrap();
+            assert!(mapped.seg.map.is_some() || target > 0);
+            let (got, loads) = record_loads(|| drain(&mut mapped));
+            assert!(loads.iter().all(allowed), "{end}: {loads:?}");
+            assert_eq!(got, drain(&mut safe), "{end}");
+        }
+        let (got, loads) = record_loads(|| {
+            mapped.seek_to_end().unwrap();
+            mapped.try_next().unwrap().is_none()
+        });
+        assert!(got && loads.is_empty(), "{loads:?}");
+        assert_eq!(mapped.offset, limit);
+        assert!(mapped.seg.map.is_some());
+    }
+}
+
+/// A durable-only reader that has given up its mapping maps the next segment again, also one it enters by a seek, and a
+/// failed `seek_to_end` leaves it without one.
+#[test]
+fn the_segment_after_a_given_up_mapping_is_mapped() {
+    if !MAPPED_READS {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let mut w = writer(dir.path());
+    while !segment(dir.path(), w.next_seq().max(1) - 1).exists() || w.next_seq() < 10 {
+        append(&mut w, 100);
+    }
+    let (base, after) = (w.next_seq() - 1, |records: u64| FIRST + records * 144);
+    append(&mut w, 100);
+    for how in ["roll", "seek"] {
+        // A marker that cuts record 3, and covers the first segment's records by its number.
+        put_marker(dir.path(), 0, after(3) + 8, base);
+        let mut reader = open(dir.path(), true, true);
+        for seq in 0..10 {
+            let record = reader.try_next().unwrap().unwrap();
+            assert_eq!((record.seq, record.payload), (seq, &payload(seq, 100)[..]));
+            assert_eq!(reader.seg.map.is_none(), seq >= 3);
+        }
+        assert!(!reader.buf.is_empty() && reader.bound == SEGMENT);
+        let path = dir.path().join(crate::journal::CHECKPOINT_FILE);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(matches!(reader.seek_to_end(), Err(Error::Io { .. })));
+        assert!(reader.seg.map.is_none());
+        std::fs::remove_dir(&path).unwrap();
+        assert_eq!(reader.try_next().unwrap().unwrap().seq, 10);
+        while reader.position() < base {
+            reader.try_next().unwrap().unwrap();
+            assert!(reader.seg.map.is_none());
+        }
+        put_marker(dir.path(), base, after(1), base + 1);
+        if how == "seek" {
+            reader.seek(base).unwrap();
+        }
+        assert_eq!(reader.try_next().unwrap().unwrap().seq, base);
+        assert!(reader.seg.map.is_some() && reader.seg.base == base);
+        assert_eq!((limit_now(&reader), reader.buf.capacity()), (after(1), 0));
+        assert!(reader.try_next().unwrap().is_none());
     }
 }
 
@@ -302,11 +419,24 @@ fn a_marker_at_every_offset_costs_at_most_one_copy() {
                 let len = lens.get(seq as usize).copied().unwrap_or(500);
                 assert_eq!(record.seq, seq);
                 assert_eq!(record.payload, payload(seq, len), "marker {offset}");
-                if is_copied(&reader) {
+                // A durable-only reader gives its mapping up instead.
+                if is_copied(&reader) || reader.seg.map.is_none() {
                     copied.push(seq);
                 }
             }
             assert!(reader.try_next().unwrap().is_none());
+            if durable {
+                // From the first record that does not end at or before the marker on; also in the segments after the one
+                // that the marker names, since it says that the records there are covered.
+                let first = frames
+                    .iter()
+                    .position(|&(at, len)| at + format::align8(u64::from(len)) > offset)
+                    .unwrap_or(frames.len());
+                let first = if valid { first as u64 } else { 0 };
+                let want: Vec<u64> = (first..total).collect();
+                assert_eq!(copied, want, "marker {offset}, durable-only");
+                continue;
+            }
             let cut = frames
                 .iter()
                 .position(|&(at, len)| at < offset && offset < at + format::align8(u64::from(len)))
@@ -317,7 +447,7 @@ fn a_marker_at_every_offset_costs_at_most_one_copy() {
             assert_eq!(reader.buf.capacity(), 0);
         }
     }
-    assert!(copies > 1_000, "{copies}");
+    assert!(copies > 500, "{copies}");
 }
 
 proptest! {
@@ -910,6 +1040,11 @@ fn a_repair_around_the_marker_read() {
                     reader.try_next(),
                     Err(Error::Discarded { seq: 10 | 12, .. })
                 ));
+                assert_eq!(
+                    limit_now(&reader),
+                    NO_LIMIT,
+                    "{case}: not for a file that is not in place"
+                );
             } else {
                 // The commit word was read before the repair; the slot is read again, and is the new history's.
                 for seq in 10..14 {

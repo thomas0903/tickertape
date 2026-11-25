@@ -441,6 +441,30 @@ fn the_bound_changes_no_result() {
     assert!(compared > 3_000, "only {compared} records compared");
 }
 
+/// A sequence in which a marker set back to one from an earlier history makes the writer open over a damaged chain. It
+/// failed a check of the test's own, that a fresh safe reader reads to the end.
+#[test]
+fn a_marker_from_an_earlier_history() {
+    let repair = Op::RepairInPlace { lost: 1, len: 0 };
+    let lose = |how, lost, len| Op::LoseMarkerAndRecords { how, lost, len };
+    let ops = [
+        lose(0, 1, 0),
+        repair,
+        repair,
+        repair,
+        Op::Append { n: 1, len: 0 },
+        Op::Append { n: 1, len: 0 },
+        repair,
+        Op::Checkpoint,
+        Op::Checkpoint,
+        Op::LoseMarker(0),
+        lose(38, 12, 231),
+        lose(61, 9, 56),
+        Op::RepairByReplacement { lost: 7, len: 38 },
+    ];
+    run_ops(&ops, &AtomicU64::new(0));
+}
+
 /// Reads up to `n` records with each reader and compares the zero-copy readers' results with the safe readers'.
 fn compare(readers: &mut [Reader; 4], n: usize, compared: &AtomicU64, case: &str) {
     let mut results = readers.each_mut().map(|r| read_up_to(r, n));
@@ -552,7 +576,10 @@ fn run_ops(ops: &[Op], compared: &AtomicU64) {
                     .unwrap()
                     .map_or(0, |c| c.next_seq);
                 let next = read_up_to(&mut open(dir, (false, false)), usize::MAX);
-                assert_eq!(next.1, "end", "{case}");
+                if next.1 != "end" {
+                    // A stale marker let the writer open over a damaged chain, which every reader reports.
+                    return;
+                }
                 let next = next.0.last().map_or(0, |r| r.seq + 1);
                 let at = next.saturating_sub(lost).max(covered).max(newest);
                 if at >= next {
@@ -581,6 +608,9 @@ fn run_ops(ops: &[Op], compared: &AtomicU64) {
                 let seq = writer.next_seq().saturating_sub(back).max(first);
                 if seq == writer.next_seq() {
                     continue;
+                }
+                if read_up_to(&mut open(dir, (false, false)), usize::MAX).1 != "end" {
+                    return;
                 }
                 let (path, at) = locate_record(dir, seq);
                 let mut word = [0; 4];

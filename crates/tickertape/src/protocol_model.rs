@@ -13,7 +13,7 @@
 //! models that hand-over.
 //!
 //! The last models are about a commit word that no writer stored (ADR 0048): a frame it claims is loaded only as far as
-//! the checkpoint marker reaches. The variants without the bound, or without the order that the marker gives, must fail.
+//! the checkpoint marker reaches. They run no reader code: they model what `Reader` does. The variants without the bound, or without the order that the marker gives, must fail.
 
 use loom::cell::UnsafeCell;
 use loom::sync::atomic::{AtomicU32, Ordering, fence};
