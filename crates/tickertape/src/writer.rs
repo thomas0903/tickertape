@@ -19,7 +19,7 @@ use crate::error::{CorruptReason, Error, Result};
 use crate::format::{self, CheckpointSlot, RecordHeader, ScanEnd, SegmentHeader, SegmentView};
 use crate::journal::{self, CHECKPOINT_FILE, LOCK_FILE, QUARANTINE_DIR};
 use crate::mmap::{self, MapRw};
-use crate::prefault::{Prefaulter, Spare};
+use crate::prefault::{Prefaulter, Spare, Spares};
 use crate::record::NewRecord;
 use crate::writeback::WriteBack;
 
@@ -82,10 +82,8 @@ pub struct Writer {
     prefault: Option<Prefaulter>,
     /// The early write-back thread, if enabled and started (Linux; ADR 0038).
     writeback: Option<WriteBack>,
-    /// The next segment being prepared in the background, or prepared, if requested (ADR 0022).
-    spare: Option<std::thread::JoinHandle<io::Result<Spare>>>,
-    /// Whether a spare has been requested for the current active segment, or one requested earlier is still there.
-    spare_requested: bool,
+    /// Prepares the next segment in the background, if enabled and started (ADR 0022).
+    spares: Option<Spares>,
     /// The generation of the newest checkpoint this writer started (or of the marker read at open).
     generation: u64,
     poisoned: bool,
@@ -221,6 +219,9 @@ impl Writer {
                 )
             })
             .flatten();
+        let spares = (config.prefault && cfg!(any(target_vendor = "apple", target_os = "linux")))
+            .then(|| Spares::start(&root, config.segment_size, config.helper_cpus.clone()))
+            .flatten();
         let ctx = Arc::new(Context {
             dir: root.clone(),
             marker: Mutex::new(Marker {
@@ -261,8 +262,7 @@ impl Writer {
             notify,
             prefault,
             writeback,
-            spare: None,
-            spare_requested: false,
+            spares,
             generation: checkpoint.map_or(0, |c| c.generation),
             poisoned: false,
             failed_bytes: 0,
@@ -559,17 +559,10 @@ impl Writer {
         }
         // Once the active segment is half full, prepare the next one off the writer's thread (ADR 0022; on Linux
         // without a sync: issue #60).
-        if self.config.prefault
-            && cfg!(any(target_vendor = "apple", target_os = "linux"))
-            && !self.spare_requested
-            && self.offset >= self.active.size / 2
-        {
-            self.spare_requested = true;
-            self.spare = crate::prefault::prepare_spare(
-                &self.root,
-                self.config.segment_size,
-                self.config.helper_cpus.clone(),
-            );
+        if let Some(spares) = &mut self.spares {
+            if self.offset >= self.active.size / 2 && !spares.requested() {
+                spares.request();
+            }
         }
         self.next_seq = seq + 1;
         Ok(Ok(seq))
@@ -982,7 +975,9 @@ impl Writer {
     ///   writer has gone, and on macOS the wake-up region's shared-memory name stays until the next writer opens the
     ///   journal. Another writer could then open the journal while those threads still run.
     pub fn release_after_fork(mut self) {
-        std::mem::forget(self.spare.take());
+        if let Some(spares) = self.spares.take() {
+            spares.release_after_fork();
+        }
         std::mem::forget(self.prefault.take());
         // In a child, dropping the write-back helper's handle neither stops nor joins it: it only drops the child's
         // references to the segment files the helper follows, if the helper's lock was free at the fork.
@@ -1085,8 +1080,6 @@ impl Writer {
             None => create_segment(&self.root, next_base, self.config.segment_size, false)?,
         };
         crate::fault::hook(crate::fault::Point::RollAfterLink);
-        // A spare that was not ready (Linux) is still being prepared: it is the next roll's.
-        self.spare_requested = self.spare.is_some();
         self.dirty_dirs.insert(self.root.clone());
         // After the link, the roll always completes: seal the old segment, then switch.
         let seal_at = self.offset;
@@ -1130,23 +1123,22 @@ impl Writer {
 
 impl Writer {
     /// Returns the prepared spare, if any, if it is usable for this journal's segment size. On macOS it waits for one
-    /// still being prepared. On Linux it never waits: the roll then creates its segment itself, and the spare stays with
-    /// the writer for the next roll.
+    /// still being prepared; on Linux never ([`Spares::take`]).
     fn take_spare(&mut self) -> Option<Spare> {
-        let preparing = self.spare.take()?;
-        if cfg!(not(target_vendor = "apple")) && !preparing.is_finished() {
-            self.spare = Some(preparing);
-            return None;
+        let spare = self.spares.as_mut()?.take()?;
+        if spare.size == self.config.segment_size {
+            return Some(spare);
         }
-        match preparing.join() {
-            Ok(Ok(spare)) if spare.size == self.config.segment_size => Some(spare),
-            Ok(Ok(_)) => {
-                let _ = fs::remove_file(self.root.join(journal::SPARE_FILE));
-                None
-            }
-            // Preparing failed (it removed its own file) or the thread panicked: create the segment synchronously.
-            _ => None,
-        }
+        drop(spare);
+        let _ = fs::remove_file(self.root.join(journal::SPARE_FILE));
+        None
+    }
+
+    /// Test support: whether no spare segment is being prepared.
+    #[cfg(feature = "fault-injection")]
+    #[doc(hidden)]
+    pub fn spare_settled(&self) -> bool {
+        self.spares.as_ref().is_none_or(Spares::settled)
     }
 }
 
@@ -1169,10 +1161,7 @@ impl Drop for Writer {
             // Finish the requested background checkpoints and join their thread first: the last marker must be
             // written while the lock is held, and before readers are told that this writer has gone.
             drop(self.background.take());
-            if let Some(Ok(Ok(spare))) = self.spare.take().map(|h| h.join()) {
-                drop(spare);
-                let _ = fs::remove_file(self.root.join(journal::SPARE_FILE));
-            }
+            drop(self.spares.take());
             drop(self.prefault.take());
             drop(self.writeback.take());
             drop(self.notify.take());

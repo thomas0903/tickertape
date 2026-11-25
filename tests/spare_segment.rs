@@ -42,32 +42,18 @@ fn wait_for_ready_spare(w: &mut Writer, dir: &Path) {
     for _ in 0..40 {
         append(w, 1024);
     }
-    wait_until_spare_is_ready(dir);
+    wait_until_spare_is_ready(w, dir);
 }
 
-/// Waits until the spare exists with its full size and allocated blocks (not sparse).
-fn wait_until_spare_is_ready(dir: &Path) {
+/// Waits until the spare is ready for the next roll, with its full size and allocated blocks (not sparse).
+fn wait_until_spare_is_ready(w: &Writer, dir: &Path) {
     let spare = dir.join(SPARE);
     let size = small_config().segment_size;
     wait_for(
         || std::fs::metadata(&spare).is_ok_and(|m| m.len() == size && m.blocks() * 512 >= size),
         "a preallocated spare",
     );
-    wait_for_spare_thread_to_end();
-}
-
-/// Linux: waits until no spare thread is left in this process, since a roll there does not wait for one that has not
-/// finished (the file has its size before that). Elsewhere the roll waits for it.
-fn wait_for_spare_thread_to_end() {
-    if cfg!(target_os = "linux") {
-        let running = || {
-            std::fs::read_dir("/proc/self/task").unwrap().any(|task| {
-                std::fs::read_to_string(task.unwrap().path().join("comm"))
-                    .is_ok_and(|comm| comm.trim_end() == "tickertape-spar")
-            })
-        };
-        wait_for(|| !running(), "the spare thread to finish");
-    }
+    wait_for(|| w.spare_settled(), "the spare's preparation to end");
 }
 
 fn read_count(dir: &Path) -> u64 {
@@ -132,7 +118,7 @@ fn spare_is_prepared_at_half_full_and_published_at_roll() {
         append(&mut w, 1024);
         written += 1064;
     }
-    wait_until_spare_is_ready(dir.path());
+    wait_until_spare_is_ready(&w, dir.path());
     // The spare is really preallocated (not sparse), and the roll publishes that very file.
     let prepared = identity(&spare);
     fill_until_roll(&mut w, dir.path(), 1);
@@ -144,7 +130,7 @@ fn spare_is_prepared_at_half_full_and_published_at_roll() {
     );
     // The next segment gets its own spare once it is half full, and every record reads back.
     fill_until_roll(&mut w, dir.path(), 2);
-    wait_for_spare_thread_to_end();
+    wait_for(|| w.spare_settled(), "the spare's preparation to end");
     for _ in 0..40 {
         append(&mut w, 1024); // past half of the new segment
     }
@@ -213,7 +199,7 @@ fn failed_spare_preparation_is_cleaned_up_and_the_roll_falls_back() {
         for _ in 0..40 {
             append(&mut w, 1024); // past half: the spare is requested and its preparation fails
         }
-        wait_for_spare_thread_to_end();
+        wait_for(|| w.spare_settled(), "the spare's preparation to end");
         fill_until_roll(&mut w, dir.path(), 1);
         assert!(
             !dir.path().join(SPARE).exists(),
@@ -294,7 +280,7 @@ fn roll_does_not_wait_for_an_unfinished_spare() {
     assert_eq!(identity(&dir.path().join(SPARE)), prepared);
     assert_ne!(identity(&newest_segment(dir.path())), prepared);
     hold.release();
-    wait_until_spare_is_ready(dir.path());
+    wait_until_spare_is_ready(&w, dir.path());
     fill_until_roll(&mut w, dir.path(), 1);
     assert_eq!(identity(&newest_segment(dir.path())), prepared);
     let total = w.next_seq();

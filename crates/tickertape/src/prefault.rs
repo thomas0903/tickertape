@@ -9,7 +9,7 @@ use crate::config::HelperCpus;
 use crate::mmap::{self, Advice, MapRw};
 use std::fs::{self, File, OpenOptions};
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 
@@ -200,21 +200,203 @@ pub(crate) struct Spare {
     pub(crate) size: u64,
 }
 
-/// Starts preparing a spare segment of `size` bytes in `dir` on a short-lived thread. `None` if the thread can't be
-/// spawned (the writer then creates the next segment itself, as without a spare).
-pub(crate) fn prepare_spare(
-    dir: &Path,
-    size: u64,
-    cpus: HelperCpus,
-) -> Option<JoinHandle<io::Result<Spare>>> {
-    let dir = dir.to_path_buf();
-    std::thread::Builder::new()
-        .name("tickertape-spare".into())
-        .spawn(move || {
-            crate::affinity::place_helper(&cpus);
-            make_spare(&dir, size)
+/// The writer's side of preparing the next segment in the background (ADR 0022).
+///
+/// - **macOS:** a short-lived thread per spare, and [`Spares::take`] waits for it.
+/// - **Linux:** one thread for the writer's life, woken for each spare, and `take` never waits (issue #60). Starting a
+///   thread costs the writer more than a roll does there, so it starts none while it appends.
+#[derive(Debug)]
+pub(crate) struct Spares {
+    dir: PathBuf,
+    /// Whether a spare has been requested that [`Spares::take`] has not returned or given up on.
+    requested: bool,
+    source: Source,
+    /// The process that started the threads: in a forked child they do not exist, so they are not joined there.
+    pid: u32,
+}
+
+#[derive(Debug)]
+enum Source {
+    /// Starts a thread for each request; the handle is the one in progress.
+    PerRequest {
+        size: u64,
+        cpus: HelperCpus,
+        preparing: Option<JoinHandle<io::Result<Spare>>>,
+    },
+    Thread {
+        shared: Arc<SpareShared>,
+        thread: Option<JoinHandle<()>>,
+    },
+}
+
+#[derive(Debug)]
+struct SpareShared {
+    state: Mutex<SpareState>,
+    wake: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct SpareState {
+    /// Requested or being prepared.
+    pending: bool,
+    ready: Option<Spare>,
+    stop: bool,
+}
+
+fn lock_spares(shared: &SpareShared) -> MutexGuard<'_, SpareState> {
+    shared.state.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+impl Spares {
+    /// `None` if the thread can't be spawned (the writer then creates every segment itself).
+    pub(crate) fn start(dir: &Path, size: u64, cpus: HelperCpus) -> Option<Spares> {
+        let source = if cfg!(target_vendor = "apple") {
+            Source::PerRequest {
+                size,
+                cpus,
+                preparing: None,
+            }
+        } else {
+            let shared = Arc::new(SpareShared {
+                state: Mutex::new(SpareState::default()),
+                wake: Condvar::new(),
+            });
+            let helper = Arc::clone(&shared);
+            let dir = dir.to_path_buf();
+            let thread = std::thread::Builder::new()
+                .name("tickertape-spare".into())
+                .spawn(move || {
+                    crate::affinity::place_helper(&cpus);
+                    prepare_spares(&helper, &dir, size);
+                })
+                .ok()?;
+            Source::Thread {
+                shared,
+                thread: Some(thread),
+            }
+        };
+        Some(Spares {
+            dir: dir.to_path_buf(),
+            requested: false,
+            source,
+            pid: std::process::id(),
         })
-        .ok()
+    }
+
+    /// Whether a spare has been requested and not used yet.
+    #[inline]
+    pub(crate) fn requested(&self) -> bool {
+        self.requested
+    }
+
+    /// Asks for a spare. Call only while none is [`Spares::requested`].
+    pub(crate) fn request(&mut self) {
+        self.requested = true;
+        match &mut self.source {
+            Source::PerRequest {
+                size,
+                cpus,
+                preparing,
+            } => {
+                let (dir, size, cpus) = (self.dir.clone(), *size, cpus.clone());
+                // If the thread can't be spawned, the writer creates the next segment itself, as without a spare.
+                *preparing = std::thread::Builder::new()
+                    .name("tickertape-spare".into())
+                    .spawn(move || {
+                        crate::affinity::place_helper(&cpus);
+                        make_spare(&dir, size)
+                    })
+                    .ok();
+            }
+            Source::Thread { shared, .. } => {
+                lock_spares(shared).pending = true;
+                shared.wake.notify_one();
+            }
+        }
+    }
+
+    /// The prepared spare, if there is one, and afterwards none is requested. On Linux a spare that is still being
+    /// prepared is not waited for: the result is `None` and it stays requested, for the next roll.
+    pub(crate) fn take(&mut self) -> Option<Spare> {
+        match &mut self.source {
+            Source::PerRequest { preparing, .. } => {
+                self.requested = false;
+                // A preparation that failed removed its own file; one that panicked left it to the next preparation.
+                preparing.take()?.join().ok()?.ok()
+            }
+            Source::Thread { shared, .. } => {
+                let mut state = lock_spares(shared);
+                let spare = state.ready.take();
+                self.requested = state.pending;
+                spare
+            }
+        }
+    }
+
+    /// Whether no spare is being prepared, for tests.
+    #[cfg(feature = "fault-injection")]
+    pub(crate) fn settled(&self) -> bool {
+        match &self.source {
+            Source::PerRequest { preparing, .. } => {
+                preparing.as_ref().is_none_or(JoinHandle::is_finished)
+            }
+            Source::Thread { shared, .. } => !lock_spares(shared).pending,
+        }
+    }
+
+    /// Lets go of everything without joining or removing anything, in a forked child (the threads are the parent's).
+    pub(crate) fn release_after_fork(self) {
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for Spares {
+    /// Waits for the thread and removes a prepared spare, in the process that started it.
+    fn drop(&mut self) {
+        if self.pid != std::process::id() {
+            // A forked child: the thread does not exist here, and the spare is the parent writer's.
+            match &mut self.source {
+                Source::PerRequest { preparing, .. } => std::mem::forget(preparing.take()),
+                Source::Thread { thread, .. } => std::mem::forget(thread.take()),
+            }
+            return;
+        }
+        let spare = match &mut self.source {
+            Source::PerRequest { preparing, .. } => preparing
+                .take()
+                .and_then(|preparing| preparing.join().ok()?.ok()),
+            Source::Thread { shared, thread } => {
+                lock_spares(shared).stop = true;
+                shared.wake.notify_one();
+                if let Some(thread) = thread.take() {
+                    let _ = thread.join();
+                }
+                lock_spares(shared).ready.take()
+            }
+        };
+        if spare.is_some() {
+            let _ = fs::remove_file(self.dir.join(crate::journal::SPARE_FILE));
+        }
+    }
+}
+
+/// The spare thread (Linux): prepares one spare per request.
+fn prepare_spares(shared: &SpareShared, dir: &Path, size: u64) {
+    let mut state = lock_spares(shared);
+    loop {
+        if state.stop {
+            return;
+        }
+        if !state.pending {
+            state = shared.wake.wait(state).unwrap_or_else(|e| e.into_inner());
+            continue;
+        }
+        drop(state);
+        let made = make_spare(dir, size).ok();
+        state = lock_spares(shared);
+        state.pending = false;
+        state.ready = made;
+    }
 }
 
 fn make_spare(dir: &Path, size: u64) -> io::Result<Spare> {
