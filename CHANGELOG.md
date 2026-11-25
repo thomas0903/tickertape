@@ -21,6 +21,8 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   no longer stops the reader, and a forged index can mislead it. Segments of the recovery domain and the newest segment
   have no index. The on-disk format stays version 1, released versions ignore the files (except that 1.0.0's
   `export --output` fails if it cannot list the directory), and the C ABI stays at ABI version 1 (an added function).
+- Fixed (seek indexes, unreleased): `seek_index::build` also removes an index it has just published if it cannot check,
+  for another reason than "not found", that the segment is still in place; it reported `Failed` and left the index.
 - Added: `RecoveryReport::seek_indexes_removed` and `seek_index_errors`. When it opens, the writer removes the seek
   indexes of segments that recovery may change (`docs/format.md` → Recovery, step 2a), best effort; retention and
   `archive` remove a segment's index after the segment. Without a `seek-index/` directory this is one failed `open` each.
