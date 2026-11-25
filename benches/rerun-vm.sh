@@ -82,7 +82,7 @@ driver() {  # driver <options...>
 }
 
 case "${1:-run}" in
-  status) tail -5 "$RESULTS/progress.txt" "$RESULTS/driver.log"; isolated_now; exit 0 ;;
+  status) tail -n 5 "$RESULTS/progress.txt"; tail -n 5 "$RESULTS/driver.log"; isolated_now; exit 0 ;;
   tune) tune; exit $? ;;
   untune) untune; exit 0 ;;
   run) ;;
