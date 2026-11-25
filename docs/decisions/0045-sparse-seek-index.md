@@ -22,7 +22,8 @@ and the type's says that readers never write. Both bind this design.
 ## Decision in brief
 
 - One file per **sealed** segment, `seek-index/{base_seq:020}.idx` in the journal directory: one entry for the first
-  record in each 64 KiB block of the segment. 0.04 % of the segment, deterministic, derived, deletable at any time.
+  record in each 64 KiB block of the segment. 0.04 % of the segment, deterministic, derived; the files can be deleted
+  at any time.
 - Built only for segments **strictly before the checkpoint marker's segment**, which no recovery with that marker
   changes (the command also indexes a directory that has no marker while no writer has it open). Built by a writer
   helper thread (opt-in) or by `tickertape index`. **Never by a reader.** Building never syncs.
@@ -44,8 +45,8 @@ else there is ignored and never touched:
 | `{base_seq:020}.idx` | The index of segment `{base_seq:020}.tape`: exactly 20 ASCII digits, value at most `u64::MAX - 1`, then `.idx` |
 | `.{base_seq:020}.{pid}.{n}.idx-tmp` | An index being written (`pid`, `n`: decimal, 1 to 20 digits each). Never read by readers |
 
-**File.** A 128-byte header, then `entry_count` entries of 24 bytes. The file is exactly
-`128 + 24 * entry_count` bytes long.
+**File.** A 128-byte header, then `entry_count` entries of 24 bytes. The file is exactly `128 + 24 * entry_count`
+bytes long.
 
 | Offset | Size | Field | Value in version 1 |
 |---|---|---|---|
@@ -117,9 +118,9 @@ accepts this segment):
 ## What a reader does
 
 With `seek_index(true)`, `seek(target)` does this after it has chosen and **opened** segment `F` as today (header read
-and validated). Any failure below, of any kind (missing file, I/O error, failed check, no memory),
-means **what the seek does without an index**: scan from offset 64, or continue from the cursor where that is the rule,
-with the cursor and buffer put back. It is never returned as an error.
+and validated). Any failure below, of any kind (missing file, I/O error, failed check, no memory), means **what the
+seek does without an index**: scan from offset 64, or continue from the cursor where that is the rule, with the cursor
+and buffer put back. It is never returned as an error.
 
 1. **Choose whether to look.** Not for `target == base`, nor in a segment of at most 64 KiB. If forward seeks continue
    from the cursor (the parallel change), the index is consulted for a target in the current segment only when the
@@ -244,7 +245,9 @@ The default is off because this changes what `seek` documents. When this is buil
 2. Walk it from offset 64 with `pread` in windows of at most 1 MiB, validating every record. It must end in a valid
    seal. Any other end: no index for this segment.
 3. Stop if `{base}.idx` already equals the result, or holds a higher version.
-4. Create `seek-index/` if missing (`mkdir`, default mode; the directory is not synced), create the temporary file
+4. Create `seek-index/` if missing and give a directory it created the journal directory's permission bits (`mkdir`,
+   then `fchmod`; not synced), so that whoever can list the journal can list it: 1.0.0's `export --output` fails
+   otherwise (Compatibility). tickertape never removes the directory, for the same reason. Create the temporary file
    (`O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC`, default mode), write it, close it, `rename` it over `{base}.idx`.
    **Nothing is synced.**
 5. After the rename, check again that the segment's path names the same device and inode and (the command) that the
@@ -279,12 +282,11 @@ and the index would vouch for what the writer remembers rather than for the byte
 **The command.** `tickertape index DIR` builds what is missing or invalid.
 
 - **With a valid marker** (that passes retention's position check; a dangling one is exit 2): every sealed segment
-  with `base < marker.segment_base_seq`, also beside a live writer,
-  without the lock. The order against a recovery with a damaged marker: the builder renames, **then** reads the
-  marker; the writer reads the marker, **then** lists `seek-index/`. If the builder still reads a valid covering
-  marker, its rename came before the damage and so before the writer's listing, which removes the file; otherwise the
-  builder unlinks it. (A builder killed between its rename and its check, at the moment a marker is damaged, can leave
-  a file; T5 covers it.)
+  with `base < marker.segment_base_seq`, also beside a live writer, without the lock. The order against a recovery
+  with a damaged marker: the builder renames, **then** reads the marker; the writer reads the marker, **then** lists
+  `seek-index/`. If the builder still reads a valid covering marker, its rename came before the damage and so before
+  the writer's listing, which removes the file; otherwise the builder unlinks it. (A builder killed between its rename
+  and its check, at the moment a marker is damaged, can leave a file; T5 covers it.)
 - **Without one** (an archive directory, a journal never checkpointed): if `writer.lock` exists, the command takes its
   `flock` without blocking, writes nothing into it, and holds it until it ends; a running writer makes it fail with
   exit 1, and a writer opened meanwhile gets `Error::Locked`. If it does not exist, the command checks again after
@@ -313,7 +315,9 @@ read-only media, and a slow reader must not create files in a journal it only re
   and `checkpoint` loses only the index. Restored segments under newer indexes, or the reverse, fall under T5.
 - **Read-only media:** an existing index works; nothing is written. `tickertape index` fails there with exit 1.
 - **Replacement, quarantine, restored headers:** only inside the recovery domain, so step 2a has removed the index.
-- **Deleting `seek-index/`** is safe at any time, with readers and writers running.
+- **Deleting the files in `seek-index/`** is safe at any time, with readers and writers running. Deleting the
+  directory is too, except that an `export --output` of 1.0.0 walking the journal at that moment can fail with exit 1
+  and must be run again. Documentation says to delete the files (`tickertape index DIR --remove`).
 
 ## The active segment
 
@@ -330,7 +334,9 @@ reader, which continuing from the cursor mostly covers. The marker already names
 
 | 1.0.0 component | What it does with a name it does not expect |
 |---|---|
-| Readers' open and seek, writer's open and recovery, retention, `archive`, `inspect`, `verify`, `stats`, `export`, `tail`, `status` | List only through `journal::list_segments` and `find_bases`: an entry counts only if `parse_segment_file_name` accepts the whole name (20 digits + `.tape`, 25 bytes); others are skipped without `stat` or open. No recursion: names inside a subdirectory are never seen |
+| Readers' open and seek, writer's open and recovery, retention, `archive`, `inspect`, `verify`, `stats`, `tail`, `export`'s and `status`'s reading of the journal | List only through `journal::list_segments` and `find_bases`: an entry counts only if `parse_segment_file_name` accepts the whole name (20 digits + `.tape`, 25 bytes); others are skipped without `stat` or open. No recursion |
+| **`export --output FILE`** (`reject_alias`, an output that is a hard link of a journal file is refused) | **Walks the whole tree below the journal directory**: lists every directory and `lstat`s every entry, opening none. Skips an entry that vanishes. **Fails (exit 1, before truncating the output) if a directory other than `readers/` cannot be listed or vanishes** |
+| `status --output FILE` (`reached_from`) | For an existing output, lists the journal directory, `quarantine/` and the beacon directory, one level, following and `stat`ing each entry; it does not enter `seek-index/` |
 | Recovery's removal of temporary files | `list_tmp_files`: only segment name + `.tmp`, and `next-segment.tmp` |
 | Retention and `archive --to` | Remove or move the planned segment path only; the destination is not listed |
 | `status` | Lists segments as above and `readers/` only; storage bytes are sums over segments |
@@ -355,19 +361,30 @@ dangling symlink, a FIFO), and, to learn whether it would also be safe, files be
   missing middle segment; retention by deletion and by move; `archive --delete` and `--to`.
 - A live 1.0.0 writer with background checkpoints and four followers while a thread created, renamed and removed files
   in both places, then 22 opens and seeks.
+- Output files: `export --output` (JSONL, Parquet) and `status --output` (JSON, Prometheus), to a new, an empty and an
+  earlier output file, in both layouts; then 150 runs of each of two while a thread renamed and removed index files,
+  and 150 while one removed and recreated `seek-index/`; then with the directory and with an index file at mode 000.
 
-Result: **macOS 27 (APFS, arm64): 62 comparisons, 0 differences. Linux 7.2 (OrbStack VM, btrfs, aarch64): 56
-comparisons, 0 differences** (without the two PyPI packages and the C program, in both layouts). No planted file was
-changed. Every follower reached the end and every seek hit. Not run: Java and C++ 1.0.0 packages (they load the same
-library), ext4 and xfs, a 1.0.0 writer overtaken by power loss.
+Result with files that are present, readable and at most created, renamed and removed: **macOS 27 (APFS, arm64): 62 +
+24 comparisons, 0 differences. Linux 7.2 (OrbStack VM, btrfs, aarch64): 56 + 24 comparisons, 0 differences** (without
+the two PyPI packages and the C program, in both layouts); the 300 runs per platform under renaming files all
+succeeded. No planted file was changed. Every follower reached the end and every seek hit. Also not run: Java and C++
+1.0.0 packages (they load the same library), ext4 and xfs, a 1.0.0 writer overtaken by power loss.
+
+**The exception, confirmed by test:** 1.0.0's `export --output` failed with exit 1 when
+`seek-index/` was at mode 000, and in 21 (macOS) and 18 (Linux) of 150 runs while the directory itself was removed and
+recreated in a loop. `status --output` did not. So a builder gives the directory the journal directory's mode and
+nothing in tickertape removes it; files inside may come and go. What remains is an operator who makes the directory
+unlistable for the exporting user (or builds as another user under a mode that does) or deletes it during an export.
+`quarantine/` has the same effect on that command today.
 
 **Two consequences of an index-unaware writer:** it does not remove indexes before repairing (T5 covers this;
 continuing a newer writer's journal with an older writer is not promised anyway, `compatibility.md`), and its
 retention leaves orphans until a newer writer opens.
 
-**Why a subdirectory, since both layouts are safe:** the directory listing dominates opens and seeks in large
-journals, and files beside the segments double it for every version. Time of 1.0.0's `seek(0)` (listing, open,
-header):
+**Why a subdirectory**, when files beside the segments would avoid even that exception: the directory listing
+dominates opens and seeks in large journals, and files beside the segments double it for every version. Time of
+1.0.0's `seek(0)` (listing, open, header):
 
 | Segment files | No index files | Beside the segments | In `seek-index/` |
 |---|---|---|---|
@@ -416,7 +433,8 @@ adds today's listing and open (34 µs on the Mac, 6 µs in the VM with two segme
 4. **An index in the segment's footer.** Travels with the segment and is retained, moved and copied with it. But the
    trailer is 8 bytes and "every byte that holds no record or seal is zero": recovery, `nonzero_end`, retention's
    `seal_at_end` and every released reader rely on that, so it is format version 2. Rejected.
-5. **An index beside each segment** (`….tape.idx`). Equally safe with 1.0.0, but doubles every listing. Rejected.
+5. **An index beside each segment** (`….tape.idx`). Safe with 1.0.0 without the exception above, but doubles every
+   listing for every version. Rejected.
 6. **One index for the journal.** Needs rewriting or compaction at retention and locking between builders, and one
    damaged byte loses all of it. Rejected.
 7. **Entry every N records** (256, as Chronicle). Unbounded bytes per seek at large records. Rejected.
@@ -442,8 +460,9 @@ All additive (ADR 0043); C ABI version 1 and the existing baseline unchanged.
 - **CLI.** `tickertape index DIR [--rebuild | --check | --remove] [--json]` (`schema_version` 1). `--check` scans each
   segment, changes nothing, and compares every entry. `Ignored`: a reader would not use the file (reason given).
   `Wrong`: it would, but an entry is not on the chain; exit 2. I/O errors exit 1; otherwise 0. `--remove` deletes
-  recognised names, then the directory if empty. `tail`, `export` and `stats` gain `--seek-index`, for their `--from`.
-  No other command changes.
+  recognised names and leaves the directory. `tail`, `export` and `stats` gain `--seek-index`, for their `--from`.
+  `export --output` treats `seek-index/` in its alias walk as it treats `readers/`: it holds no journal data, so a
+  part that vanished or cannot be listed is skipped. No other command changes.
 - **Metrics.** `WriterMetrics` (NE) gains `seek_indexes_built`, `seek_index_failures`, `seek_indexes_dropped`; the
   same three `uint64_t` at the end of `tickertape_writer_metrics`, and in the bindings. Nothing in `status`, which
   observes other processes' journals.
@@ -494,8 +513,9 @@ Names are suggestions; `tests/seek_index.rs` unless stated. New fault points: `S
     on an archive; `reader_retention_stress` and `soak` with the option on, half the readers without, results
     compared.
 13. **1.0.0:** `tests/compat/v1.0.0-ignores-seek-index.sh`, modelled on `v0.4.0-ignores-readers.sh`, with the
-    operations above; `generate.sh --check-old-readers` on journals with indexes; C ABI baseline; C, C++, Python and
-    Java option tests.
+    operations above, including `export --output` under renaming index files; the directory's mode equals the journal
+    directory's under umask 077; no code path removes the directory; `generate.sh --check-old-readers` on journals
+    with indexes; C ABI baseline; C, C++, Python and Java option tests.
 14. **Regression workload:** `tt-scale` gains seeks with and without the index, warm and cold.
 
 ## Consequences
@@ -520,3 +540,5 @@ and retention's unlink when the directory exists.
    does it.
 7. **Carrying the index in `MoveTo`.** Recommended: no; build it at the destination.
 8. **Rate limit for the builder thread.** Recommended: decide from the `tt-sustained` runs required above.
+9. **Subdirectory or beside the segments,** given the `export --output` exception. Recommended: the subdirectory (the
+   exception needs an unlistable or deleted directory; the listing cost would be paid by everyone).
