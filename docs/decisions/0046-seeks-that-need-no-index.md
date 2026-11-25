@@ -58,12 +58,14 @@ seek, since its path was just opened (F4). The last-record check adds nothing to
 1. Records the reader has passed are not validated a second time. If a covered record behind the cursor is damaged
    after the reader passed it (and it is not the last one), a scan stops there and the continued seek does not. What it
    returns is still covered, validated and part of the journal: recovery starts at the marker and does not remove it.
-2. Damage to the marker is outside ADR 0034's argument. If it destroys the marker and covered records, recovery can
-   remove those in place, under a cursor that was trusted. The last-record check is there for this case: the seek
+2. Damage to the marker is outside ADR 0034's argument. If it destroys the marker, or sets it back to an older one
+   (the newest slot lost, so that the other one counts), and destroys covered records, recovery can remove those in
+   place, under a cursor that was trusted. The last-record check is there for this case: the seek
    scans, unless the new history has, right before the cursor, bytes that form a record with a valid CRC32C and
    exactly the expected sequence number. If they are its own record, the cursor is a boundary. If they are inside
-   another record's payload, the seek goes on from a wrong position, again on every seek to it or forward. A seek to
-   an earlier position, or a new reader, gets out. `crash-contract.md` (Readers after a repair) and `format.md` (What
+   another record's payload, the seek goes on from a wrong position, again on every seek to it or forward. This holds for
+   every kind of reader. A seek to the last record the reader passed (returned or skipped), or an earlier one, or a new
+   reader, gets out; a target before `position()` is not enough after a seek the reader has not caught up with. `crash-contract.md` (Readers after a repair) and `format.md` (What
    readers do about repairs) say so.
 
 **The end.** `Reader::seek_to_end` opens the newest listed segment (a durable-only reader: the segment holding the

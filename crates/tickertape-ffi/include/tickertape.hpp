@@ -1940,8 +1940,9 @@ public:
 
     // Positions the reader so that the next record returned is `seq` (waiting for it if it is not written yet).
     // A forward seek within the reader's segment may start at the reader's position (from 1.1): records before it are
-    // then not validated again, and after storage damage that also destroyed the checkpoint marker the position can
-    // be off the current chain unnoticed (see tickertape_reader_seek). A seek to an earlier position scans.
+    // then not validated again, and after storage damage that also destroyed the checkpoint marker, or set it back to
+    // an older one, the position can be off the current chain unnoticed (see tickertape_reader_seek). A seek to the
+    // last record the reader passed, or an earlier one, scans the segment, and so does a new reader.
     // A successful seek discards a record held back and an error deferred by next_copy or read_batch; a failed
     // one changes nothing. Errors: Status::seq_unavailable (retention removed it: seek to list_segments()'s first
     // base_seq to continue), not_found, corrupt, io.

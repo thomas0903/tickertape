@@ -10,9 +10,9 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   of the reader read a checkpoint marker that covers it, the segment file is still in place, and the record before it
   is still there (ADR 0046). It lands on the same record, with two exceptions after storage damage: records before the
   position, which the reader validated when it passed them, are not validated again; and if damage destroyed the
-  checkpoint marker together with covered records, the seek may go on from a position that recovery has made invalid
-  (`docs/crash-contract.md` → Readers after a repair). A seek to an earlier position or a new reader scans the
-  segment. All bindings get this through the Rust reader.
+  checkpoint marker, or set it back to an older one, together with covered records, the seek may go on from a position
+  that recovery has made invalid (`docs/crash-contract.md` → Readers after a repair). A seek to the last record the
+  reader passed, or an earlier one, scans the segment, and so does a new reader. All bindings get this through the Rust reader.
 - Changed: `inspect::read_checkpoint` (and so each refresh of a durable-only reader) reads the marker's two 64-byte
   slots instead of the whole 128 KiB file.
 - Added: `Reader::seek_to_end` (C `tickertape_reader_seek_to_end`, C++ and Python `seek_to_end`, Java `seekToEnd`)

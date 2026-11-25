@@ -326,10 +326,10 @@ record boundary of the new history, so it simply reads on. A visible reader may 
 already read or buffered, and then continue at its old position in the new history without `Error::Discarded`. Where
 the records of the two histories line up it reads the new ones; otherwise its position falls inside a record, and it
 waits there (`Ok(None)`) or reports `Error::Corrupt` for bytes that aren't corrupt, until the application seeks to its
-position. (Damage that also destroyed the marker can let recovery remove covered records in place; a seek to the
-reader's position or forward in its segment then goes on from there if the new history holds, right before it, bytes
-that form a record with the expected sequence number. A seek to an earlier position, or a new reader, scans the
-segment. ADR [0046](decisions/0046-seeks-that-need-no-index.md).) It would return a record that is not in the journal only if the new history held a frame with a valid
+position. (Damage that also destroyed the marker, or set it back to an older one, can let recovery remove covered
+records in place; a seek to the reader's position or forward in its segment then goes on from there if the new history
+holds, right before it, bytes that form a record with the expected sequence number, also for a durable-only reader. A
+seek to the last record the reader passed, or an earlier one, scans the segment, and so does a new reader. ADR [0046](decisions/0046-seeks-that-need-no-index.md).) It would return a record that is not in the journal only if the new history held a frame with a valid
 checksum and the expected sequence number at that position (ADR
 [0034](decisions/0034-durable-only-reads-check-segment-identity.md) → In-place repairs).
 

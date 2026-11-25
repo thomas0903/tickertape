@@ -118,15 +118,27 @@ fn list_once(dir: &Path, last: bool) -> Result<Option<Vec<SegmentInfo>>> {
 ///
 /// [`Error::Io`] if the marker cannot be opened or read for a reason other than a missing file.
 pub fn read_checkpoint(dir: impl AsRef<Path>) -> Result<Option<format::CheckpointSlot>> {
-    use std::os::unix::fs::FileExt;
-
     let path = dir.as_ref().join(journal::CHECKPOINT_FILE);
     let file = match File::open(&path) {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(Error::io("open checkpoint", &path, e)),
     };
-    // Only the two slots, not the 128 KiB file around them: seeks and durable-only readers read the marker often.
+    let read = || read_checkpoint_slots(&file).map_err(|e| Error::io("read checkpoint", &path, e));
+    if let Some(slot) = read()? {
+        return Ok(Some(slot));
+    }
+    // The two slots are read one after the other, and a writer checkpointing meanwhile writes them in turn: both reads
+    // can meet a slot being written. Once more before this counts as no marker.
+    crate::fault::hook(crate::fault::Point::CheckpointReread);
+    read()
+}
+
+/// One read of the marker's two slots (not of the 128 KiB file around them: seeks and durable-only readers read the
+/// marker often). The result is that of [`format::decode_checkpoint`] on the file's contents.
+fn read_checkpoint_slots(file: &File) -> std::io::Result<Option<format::CheckpointSlot>> {
+    use std::os::unix::fs::FileExt;
+
     let mut current: Option<format::CheckpointSlot> = None;
     for offset in format::CHECKPOINT_SLOT_OFFSETS {
         let mut slot = [0; format::CHECKPOINT_SLOT_LEN];
@@ -134,9 +146,9 @@ pub fn read_checkpoint(dir: impl AsRef<Path>) -> Result<Option<format::Checkpoin
             Ok(()) => {}
             // A truncated marker: this slot isn't (completely) there.
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => continue,
-            Err(e) => return Err(Error::io("read checkpoint", &path, e)),
+            Err(e) => return Err(e),
         }
-        // The higher generation; on a tie the later slot, as in `format::decode_checkpoint`.
+        // The higher generation; on a tie the later slot.
         current = match (current, format::decode_checkpoint_slot(&slot)) {
             (Some(a), Some(b)) if a.generation > b.generation => Some(a),
             (a, b) => b.or(a),

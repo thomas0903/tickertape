@@ -17,8 +17,8 @@ use tickertape::{
     format,
 };
 use tickertape_tests::{
-    append_n, check_record, corrupt_by_replacement, locate_record, open_raw, segments,
-    small_config, zero_commit_words_from,
+    SMALL_SEGMENT, append_n, check_record, corrupt_by_replacement, end_of_records, locate_record,
+    open_raw, segments, small_config, zero_commit_words_from,
 };
 
 const FIRST_SLOT: u64 = format::SEGMENT_HEADER_LEN as u64;
@@ -70,6 +70,17 @@ fn append_tagged(writer: &mut Writer, n: u64, tag: u32, len: usize) {
             })
             .unwrap();
     }
+}
+
+fn append_payload(writer: &mut Writer, tag: u32, payload: &[u8]) {
+    writer
+        .append(&NewRecord {
+            schema_id: tag,
+            venue_ts_ns: 0,
+            local_ts_ns: 0,
+            payload,
+        })
+        .unwrap();
 }
 
 /// Up to `limit` records from the cursor, and how reading ended (`None`: the limit; `Some("end")`: nothing more to
@@ -339,14 +350,7 @@ fn a_seek_after_an_in_place_repair_lands_on_the_current_chain() {
             if embed {
                 let mut payload = image[at as usize + format::RECORD_HEADER_LEN..end].to_vec();
                 payload.extend_from_slice(&[0; 100]);
-                writer
-                    .append(&NewRecord {
-                        schema_id: 2,
-                        venue_ts_ns: 0,
-                        local_ts_ns: 0,
-                        payload: &payload,
-                    })
-                    .unwrap();
+                append_payload(&mut writer, 2, &payload);
             }
             while writer.next_seq() < 33 {
                 append_tagged(&mut writer, 1, 2, len);
@@ -378,11 +382,11 @@ fn expect_histories(reader: &mut Reader, from: u64, to: u64, case: &str) {
     assert_eq!(got, want, "{case}");
 }
 
-/// Damage that also destroys the checkpoint marker lets recovery remove *covered* records in place. The seek still
+/// Damage that also destroys the checkpoint marker, or sets it back to an older one, lets recovery remove *covered* records in place. The seek still
 /// notices, because the record before the cursor is not there any more, unless the new history put one there.
 #[test]
 fn a_seek_after_covered_records_were_removed_in_place_lands_on_the_current_chain() {
-    for kind in KINDS {
+    for (kind, set_back) in KINDS.into_iter().flat_map(|k| [(k, false), (k, true)]) {
         // `last`: the length of the new record before the cursor, which starts where the old one did if `len` fits.
         for (len, last, continues) in [
             (64, 64, true),
@@ -393,13 +397,21 @@ fn a_seek_after_covered_records_were_removed_in_place_lands_on_the_current_chain
         ] {
             let dir = tempfile::tempdir().unwrap();
             let mut writer = Writer::open(dir.path(), small_config()).unwrap();
-            append_tagged(&mut writer, 20, 1, 64);
+            let marker = dir.path().join("checkpoint");
+            append_tagged(&mut writer, 5, 1, 64);
+            writer.checkpoint().unwrap();
+            let older = std::fs::read(&marker).unwrap();
+            append_tagged(&mut writer, 15, 1, 64);
             writer.checkpoint().unwrap();
             drop(writer);
             let mut reader = open_sought(dir.path(), kind);
             assert_eq!(read_up_to(&mut reader, 18).0.len(), 18);
 
-            std::fs::remove_file(dir.path().join("checkpoint")).unwrap();
+            if set_back {
+                std::fs::write(&marker, older).unwrap();
+            } else {
+                std::fs::remove_file(&marker).unwrap();
+            }
             zero_commit_words_from(dir.path(), 13);
             let mut writer = Writer::open(dir.path(), small_config()).unwrap();
             assert_eq!(writer.next_seq(), 13);
@@ -408,7 +420,7 @@ fn a_seek_after_covered_records_were_removed_in_place_lands_on_the_current_chain
             writer.checkpoint().unwrap();
             let at = offset(&reader);
             reader.seek(18).unwrap();
-            let case = format!("{kind:?}, {len}, {last}");
+            let case = format!("{kind:?}, {len}, {last}, set back {set_back}");
             assert_eq!(
                 offset(&reader),
                 if continues { at } else { FIRST_SLOT },
@@ -549,6 +561,15 @@ enum Op {
         lost: u64,
         len: usize,
     },
+    /// A repair in place under readers that have read everything; the new history's first record holds the removed
+    /// records' bytes in its payload at their old offsets, and is checkpointed. Then every reader seeks to its
+    /// position.
+    ForgeInPlace {
+        lost: u64,
+        len: usize,
+    },
+    /// The writer closes the journal and opens it again.
+    Restart,
     /// Retention removes the oldest segments, keeping this many.
     Retain(usize),
     ToEnd,
@@ -563,6 +584,8 @@ fn op() -> impl Strategy<Value = Op> {
         10 => (0u64..40, 0usize..20).prop_map(|(by, read)| Op::Ahead { by, read }),
         1 => (1u64..20, 0usize..300).prop_map(|(lost, len)| Op::RepairInPlace { lost, len }),
         1 => (1u64..20, 0usize..300).prop_map(|(lost, len)| Op::RepairByReplacement { lost, len }),
+        2 => (1u64..20, 0usize..300).prop_map(|(lost, len)| Op::ForgeInPlace { lost, len }),
+        1 => Just(Op::Restart),
         1 => (1usize..4).prop_map(Op::Retain),
         1 => Just(Op::ToEnd),
     ]
@@ -624,7 +647,19 @@ fn run_ops(ops: &[Op], continued: &AtomicU64) {
                     seek_both(dir.path(), reader, kind, target, read, continued);
                 }
             }
-            Op::RepairInPlace { lost, len } | Op::RepairByReplacement { lost, len } => {
+            Op::Restart => {
+                drop(writer);
+                writer = Writer::open(dir.path(), small_config()).unwrap();
+            }
+            Op::RepairInPlace { lost, len }
+            | Op::RepairByReplacement { lost, len }
+            | Op::ForgeInPlace { lost, len } => {
+                let forge = matches!(op, Op::ForgeInPlace { .. });
+                if forge {
+                    for reader in &mut readers {
+                        let _ = read_up_to(reader, usize::MAX);
+                    }
+                }
                 // Records that may be lost: in the newest segment, not covered by the checkpoint.
                 let newest = segments(dir.path()).last().unwrap().0;
                 let covered = tickertape::inspect::read_checkpoint(dir.path())
@@ -636,15 +671,35 @@ fn run_ops(ops: &[Op], continued: &AtomicU64) {
                     continue;
                 }
                 drop(writer);
-                if matches!(op, Op::RepairInPlace { .. }) {
-                    zero_commit_words_from(dir.path(), at);
-                } else {
+                let (path, start) = locate_record(dir.path(), at);
+                let (end, _) = end_of_records(&path);
+                let removed = std::fs::read(&path).unwrap()
+                    [start as usize + format::RECORD_HEADER_LEN..end as usize]
+                    .to_vec();
+                if matches!(op, Op::RepairByReplacement { .. }) {
                     corrupt_by_replacement(dir.path(), at);
+                } else {
+                    zero_commit_words_from(dir.path(), at);
                 }
                 writer = Writer::open(dir.path(), small_config()).unwrap();
                 assert_eq!(writer.next_seq(), at);
                 tag += 1;
+                if forge {
+                    let mut payload = removed;
+                    payload.resize(payload.len() + 48, 0);
+                    // Into the same file, unless it no longer fits: then it is in the next segment, and harmless.
+                    if payload.len() <= SMALL_SEGMENT as usize - 112 {
+                        append_payload(&mut writer, tag, &payload);
+                    }
+                }
                 append_tagged(&mut writer, lost + 3, tag, len);
+                if forge {
+                    writer.checkpoint().unwrap();
+                    for (reader, kind) in readers.iter_mut().zip(KINDS) {
+                        let target = reader.position();
+                        seek_both(dir.path(), reader, kind, target, 5, continued);
+                    }
+                }
             }
             Op::Retain(keep) => {
                 let policy = Policy::default().max_segments(keep);
@@ -1113,4 +1168,60 @@ fn a_failed_seek_to_end_restores_the_seek_coverage() {
     reader.seek(20).unwrap();
     assert_eq!(offset(&reader), FIRST_SLOT);
     expect(&mut reader, 20, 1);
+}
+
+/// The documented exception (ADR 0046, difference 2), and the way out of it: the reader goes on from a cursor that the
+/// damage has taken off the chain, for a seek to its position or forward, also to a target before `position()` that is
+/// past the cursor; a seek to the last record it passed scans.
+#[test]
+fn a_seek_to_the_last_record_passed_gets_out_of_a_forged_cursor() {
+    for kind in KINDS {
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = Writer::open(dir.path(), small_config()).unwrap();
+        append_tagged(&mut writer, 20, 1, 64);
+        writer.checkpoint().unwrap();
+        drop(writer);
+        let mut reader = open_sought(dir.path(), kind);
+        assert_eq!(read_up_to(&mut reader, 18).0.len(), 18);
+        let cursor = offset(&reader);
+        let (path, at) = locate_record(dir.path(), 13);
+        let image = std::fs::read(path).unwrap();
+        std::fs::remove_file(dir.path().join("checkpoint")).unwrap();
+        zero_commit_words_from(dir.path(), 13);
+        let mut writer = Writer::open(dir.path(), small_config()).unwrap();
+        let mut payload = image[at as usize + format::RECORD_HEADER_LEN..cursor as usize].to_vec();
+        payload.extend_from_slice(&[0; 100]);
+        append_payload(&mut writer, 2, &payload);
+        append_tagged(&mut writer, 30, 2, 64);
+        writer.checkpoint().unwrap();
+        for target in [18, 40, 30] {
+            reader.seek(target).unwrap();
+            assert_eq!(offset(&reader), cursor, "{kind:?}: {target}");
+            assert!(reader.try_next().unwrap().is_none(), "{kind:?}: {target}");
+        }
+        reader.seek(17).unwrap();
+        assert_eq!(offset(&reader), FIRST_SLOT, "{kind:?}");
+        expect_histories(&mut reader, 17, 44, &format!("{kind:?}"));
+    }
+}
+
+/// A marker whose slots both read as invalid (a writer was writing them) is read once more before it counts as missing.
+#[test]
+fn a_marker_caught_while_written_is_read_again() {
+    for mapped in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = Writer::open(dir.path(), small_config()).unwrap();
+        append_n(&mut writer, 100);
+        writer.checkpoint().unwrap();
+        let mut reader = open(dir.path(), (mapped, true));
+        let marker = dir.path().join("checkpoint");
+        let valid = std::fs::read(&marker).unwrap();
+        std::fs::write(&marker, vec![0x5a; valid.len()]).unwrap();
+        tickertape::fault::clear();
+        tickertape::fault::run_at(Point::CheckpointReread, 0, move || {
+            std::fs::write(&marker, valid).unwrap();
+        });
+        reader.seek_to_end().unwrap();
+        assert_eq!(reader.position(), 100);
+    }
 }

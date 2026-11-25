@@ -1106,8 +1106,9 @@ impl Reader {
     /// to continue after `DiscardedError`. If it succeeds, it also drops records held for an interrupted read and
     /// an error held back by a batch call; if it fails, the reader is unchanged. A forward seek within the reader's
     /// segment may start at the reader's position (from 1.1): records before it are then not validated again, and
-    /// after storage damage that also destroyed the checkpoint marker the position can be off the current chain
-    /// unnoticed. A seek to an earlier position, or a new reader, scans the segment.
+    /// after storage damage that also destroyed the checkpoint marker, or set it back to an older one, the position can
+    /// be off the current chain unnoticed. A seek to the last record the reader passed, or an earlier one, scans the
+    /// segment, and so does a new reader.
     fn seek(&self, py: Python<'_>, seq: u64) -> PyResult<()> {
         self.settle(py, || {
             self.check(py)?;

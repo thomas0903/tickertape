@@ -363,9 +363,9 @@ public final class Reader implements AutoCloseable {
      * reads return nothing until the writer gets there. Every record on the way is validated by the reads that
      * follow. The way starts at the segment's first record or, for a forward seek within the reader's segment, at the
      * reader's position if the reader can tell that it is on the journal's current chain (from 1.1). Records before
-     * that position are then not validated again, and if storage damage destroyed the checkpoint marker together with
-     * covered records, the position can be off the current chain unnoticed; a seek to an earlier position, or a new
-     * reader, scans the segment. A successful seek also discards a record held back and an error deferred by
+     * that position are then not validated again, and if storage damage destroyed the checkpoint marker, or set it back
+     * to an older one, together with covered records, the position can be off the current chain unnoticed; a seek to
+     * the last record the reader passed, or an earlier one, scans the segment, and so does a new reader. A successful seek also discards a record held back and an error deferred by
      * {@link #readBatch}; a failed seek leaves the reader as it was.
      *
      * @throws SeqUnavailableException if {@code seq} is older than the oldest segment (retention removed it);

@@ -262,7 +262,7 @@ impl Reader {
     ///
     /// If `seq` hasn't been written yet, the reader waits for it: [`Reader::try_next`] returns `None` until the
     /// writer gets there, and records before `seq` are skipped. Every record on the way is validated, so the reader
-    /// only lands on positions along the journal's current chain.
+    /// only lands on positions along the journal's current chain, except as below.
     ///
     /// The way starts at the first record of the segment that holds `seq` (or will hold it), so a seek can cost
     /// reading and validating up to one segment. A forward seek within the reader's segment starts at the reader's
@@ -274,10 +274,10 @@ impl Reader {
     /// The reader then lands on the same record as by scanning, except after storage damage of two kinds. Records
     /// before the cursor, which the reader validated when it passed them, are not validated again, so damage done to
     /// covered ones since is not noticed (nor is it by a reader that reads on without seeking). And if damage destroyed
-    /// the checkpoint marker and covered records, recovery removed those in place, and the new history holds, right
-    /// before the cursor, bytes that form a record with the sequence number expected there, the cursor can be off the
-    /// current chain without the seek noticing. A seek to an earlier position, or opening a new reader, scans the
-    /// segment.
+    /// the checkpoint marker, or set it back to an older one, and destroyed covered records, recovery removed those in
+    /// place, and the new history holds, right before the cursor, bytes that form a record with the sequence number
+    /// expected there, the cursor can be off the current chain without the seek noticing. A seek to the last record
+    /// the reader passed (returned or skipped), or an earlier one, scans the segment, and so does a new reader.
     ///
     /// Retention may remove the segment holding `seq` while `seek` runs (between listing the segments and opening
     /// the chosen one). `seek` then lists the segments again, so it returns [`Error::SeqUnavailable`] with the new
@@ -540,7 +540,7 @@ impl Reader {
     ///   when it was read, by a marker read before, from a file current after that. No recovery changes such records
     ///   (ADR 0034, F2, F3 and F5), and the file is still current, since its path was just opened.
     /// - The record before the cursor is still right before it, read from the file now. This adds nothing while the
-    ///   marker is intact; it catches recovery that removed covered records in place because damage had also destroyed
+    ///   marker is intact; it catches recovery that removed covered records in place because damage had also destroyed or set back
     ///   the marker (outside ADR 0034's argument).
     ///
     /// Anything that can't be established, an I/O error included, is a no: the seek then starts at the segment's first
@@ -1469,6 +1469,7 @@ mod tests {
     use crate::mmap::MAPPED_READS;
     use crate::{CorruptReason, Error, NewRecord, ReaderConfig, Writer, WriterConfig};
     use std::cell::Cell;
+    use std::os::unix::fs::FileExt;
     use std::time::Instant;
 
     thread_local! {
@@ -1602,6 +1603,53 @@ mod tests {
             "the records span more than one segment"
         );
         assert_eq!(mapped.seg.map.is_some(), MAPPED_READS);
+    }
+
+    /// A failed `seek_to_end` puts back every field that describes the reader's place, the timers of a wait and the last
+    /// record passed included (no observable behaviour depends on each of these alone, so they are compared here).
+    #[test]
+    fn a_failed_seek_to_end_restores_every_field() {
+        let dir = journal_of(1_000);
+        let mut newest: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|e| e == "tape"))
+            .collect();
+        newest.sort();
+        assert!(newest.len() > 1);
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(newest.last().unwrap())
+            .unwrap();
+        // The second record of the newest segment (140-byte frames), so that the call passes one first.
+        file.write_all_at(&[0xEE; 8], 64 + 144 + 9).unwrap();
+        let state = |r: &Reader| {
+            (
+                (r.seg.path.clone(), r.seg.identity, r.offset, r.next_seq),
+                (r.skip_until, r.seek_covered, r.buf.clone(), r.buf_start),
+                (r.durable_next_seq, r.durable_segment_base),
+                (
+                    r.waiting_since,
+                    r.superseded_checked,
+                    format!("{:?}", r.found),
+                ),
+            )
+        };
+        for mapped in [false, true] {
+            let mut reader = open_reader(dir.path(), mapped);
+            for _ in 0..5 {
+                reader.try_next().unwrap().unwrap();
+            }
+            reader.seek_covered = 3;
+            reader.durable_next_seq = 7;
+            reader.durable_segment_base = 8;
+            reader.waiting_since = Some(Instant::now());
+            reader.superseded_checked = Some(Instant::now() - VALIDATION_WINDOW);
+            let before = state(&reader);
+            assert!(matches!(reader.seek_to_end(), Err(Error::Corrupt { .. })));
+            assert_eq!(state(&reader), before, "mapped: {mapped}");
+            assert_eq!(reader.try_next().unwrap().unwrap().seq, 5);
+        }
     }
 
     /// A frame the address space can't hold is an error, not a `capacity overflow` panic in `Vec::resize`, and the

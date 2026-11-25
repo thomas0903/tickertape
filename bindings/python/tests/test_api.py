@@ -776,8 +776,22 @@ def test_two_threads_share_one_reader(journal: Path) -> None:
     with tt.Writer(journal, segment_size=SMALL_SEGMENT) as w:
         r = tt.Reader(journal)
         seen: dict[str, list[int]] = {"next": [], "many": []}
+        # Each thread takes one turn on records that are already there, so that both get some whatever the scheduler
+        # does afterwards.
+        append_pattern(w, 100)
+        turn_taken = threading.Barrier(3, timeout=30)
+
+        def take_turn(kind: str) -> None:
+            if kind == "next":
+                record = r.next(timeout=0.05)
+                assert record is not None
+                seen[kind].append(record.seq)
+            else:
+                seen[kind].extend(x.seq for x in r.read_many(37, timeout=0.05))
+            turn_taken.wait()
 
         def consume(kind: str) -> None:
+            take_turn(kind)
             while sum(map(len, seen.values())) < 3000:
                 if kind == "next":
                     record = r.next(timeout=0.05)
@@ -789,7 +803,8 @@ def test_two_threads_share_one_reader(journal: Path) -> None:
         threads = [threading.Thread(target=consume, args=(kind,)) for kind in seen]
         for thread in threads:
             thread.start()
-        for _ in range(30):
+        turn_taken.wait()
+        for _ in range(29):
             append_pattern(w, 100)
             time.sleep(0.002)
         for thread in threads:

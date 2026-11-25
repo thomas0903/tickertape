@@ -1895,12 +1895,12 @@ tickertape_status tickertape_reader_close(struct tickertape_reader *reader);
  *
  * If `seq` has not been written yet, the reader waits for it: reads return `TICKERTAPE_NONE` until the writer gets
  * there, and records before `seq` are skipped. Every record on the way is validated (by the reads that follow), so
- * the reader only lands on positions along the journal's current chain. The way starts at the segment's first record
+ * the reader only lands on positions along the journal's current chain, except as below. The way starts at the segment's first record
  * or, for a forward seek within the reader's segment, at the reader's position if the reader can tell that it is on
  * the current chain (from 1.1). Records before that position are then not validated again, and if storage damage
- * destroyed the checkpoint marker together with covered records, the position can be off the current chain unnoticed
- * (`docs/crash-contract.md`, "Readers after a repair"); a seek to an earlier position, or a new reader, scans the
- * segment. Any call invalidates the record view
+ * destroyed the checkpoint marker, or set it back to an older one, together with covered records, the position can be
+ * off the current chain unnoticed (`docs/crash-contract.md`, "Readers after a repair"); a seek to the last record the
+ * reader passed, or an earlier one, scans the segment, and so does a new reader. Any call invalidates the record view
  * returned by `tickertape_reader_next`. A successful seek also discards a record held back by
  * `tickertape_reader_next_copy` or `tickertape_reader_read_batch`, and an error deferred by
  * `tickertape_reader_read_batch`; a failed seek leaves the reader exactly as it was (same position, held-back
@@ -1914,7 +1914,8 @@ tickertape_status tickertape_reader_close(struct tickertape_reader *reader);
  *
  * `reader` must be NULL or a live reader handle.
  */
-tickertape_status tickertape_reader_seek(struct tickertape_reader *reader, uint64_t seq);
+tickertape_status tickertape_reader_seek(struct tickertape_reader *reader,
+                                         uint64_t seq);
 
 /**
  * Positions the reader at the end of the journal, without reading the segments before it: the next record returned

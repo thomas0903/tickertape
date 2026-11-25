@@ -83,6 +83,9 @@ pub enum Point {
     /// In `Reader::seek`, after it has read the checkpoint marker that later seeks may rely on, before it checks that
     /// its segment is still in place. Arm with [`run_at`].
     ReaderSeekCoverage,
+    /// `inspect::read_checkpoint` found no valid slot in an existing marker, before it reads the slots once more. Arm
+    /// with [`run_at`].
+    CheckpointReread,
     /// Before a durable-only reader reads the checkpoint marker. Arm with [`run_at`].
     ReaderCheckpoint,
     /// After a durable-only reader has read a checkpoint marker that moved past its cursor, before it checks that its
