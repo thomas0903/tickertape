@@ -165,7 +165,9 @@ released with seven items open, accepted by the owner as known gaps
     is storing (ADR 0027 → "Which loads can race"). A protocol change: its own ADR, measurements and review. A
     reader-side frontier alone does not close the other known limitation, a zeroed commit word that lets recovery
     rewrite published records in place under a live reader.
-  - Missing: the publication-frontier follow-up has no ADR yet. The copy is gone (ADR 0027, #9); replay results for both
+  - The follow-up's record is [ADR 0048](decisions/0048-publication-frontier.md) (proposed, nothing built): no shared
+    word in 1.x, the checkpoint marker bounds the loads instead.
+  - Missing: ADR 0048 is not accepted yet. The copy is gone (ADR 0027, #9); replay results for both
     readers on x86-64 and aarch64 and the live latency of both readers on both architectures (the sustained session) are
     recorded in `docs/benchmarks.md` (2026-11-19 to 2026-11-22).
 - [ ] **Cheaper checkpoints with prefaulting.**
@@ -280,8 +282,9 @@ they are measurements, explanations and one design record. They stay open and co
 - **Sustained-load comparison:** no macOS results.
 - **eBPF diagnostics:** the tracing overhead during the sustained workloads, and a conclusion confirmed with tracing
   off, are not recorded.
-- **Mapped reader:** the publication-frontier follow-up has no ADR. The limitation it would narrow is part of the 1.0
-  contract ([`compatibility.md`](compatibility.md); `crash-contract.md` → Known risks and limits).
+- **Mapped reader:** the publication-frontier follow-up had no ADR; [0048](decisions/0048-publication-frontier.md) is
+  proposed, not accepted. The limitation it would narrow is part of the 1.0 contract
+  ([`compatibility.md`](compatibility.md); `crash-contract.md` → Readers, the writer and memory safety).
 - **Cheaper checkpoints:** how much prefaulted, unwritten data adds to a checkpoint is not measured, and there is no
   macOS result.
 - **Avoidable work:** the profiles of the readers, notification and serialization paths are not documented.
