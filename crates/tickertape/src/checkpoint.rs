@@ -384,7 +384,7 @@ fn steps(job: &Job, ctx: &Context, on: On) -> Result<CheckpointSlot> {
     drop(marker);
     // Durable-only readers wait for the marker to move.
     if let Some(notify) = &ctx.notify {
-        notify.publish();
+        notify.publish_marker();
     }
     Ok(slot)
 }

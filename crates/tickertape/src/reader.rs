@@ -549,10 +549,19 @@ impl Reader {
         notify: &crate::mmap::Notify,
         deadline: Option<Instant>,
     ) -> (Result<bool>, bool) {
-        let seen = notify.begin_wait();
+        // At the marker only a checkpoint helps: not being registered with the appends spares the writer a wake-up call
+        // per record.
+        let on = if self.waits_for_marker() && notify.writer_bumps_marker() {
+            crate::mmap::WaitOn::Marker
+        } else {
+            crate::mmap::WaitOn::Record
+        };
+        let seen = notify.begin_wait(on);
         let found = self.advance();
-        if !matches!(found, Ok(false)) {
-            notify.end_wait();
+        if !matches!(found, Ok(false))
+            || (on == crate::mmap::WaitOn::Marker && !self.waits_for_marker())
+        {
+            notify.end_wait(on);
             return (found, true);
         }
         let cap = if notify.writer_notifies() {
@@ -564,12 +573,17 @@ impl Reader {
             cap.min(d.saturating_duration_since(Instant::now()))
         });
         let mut supported = true;
-        if !wait.is_zero() && notify.wait(seen, wait) == crate::mmap::WaitOutcome::Unsupported {
+        if !wait.is_zero() && notify.wait(on, seen, wait) == crate::mmap::WaitOutcome::Unsupported {
             supported = false;
             std::thread::sleep(wait.min(self.config.backoff.max_sleep));
         }
-        notify.end_wait();
+        notify.end_wait(on);
         (Ok(false), supported)
+    }
+
+    /// Whether the cursor is at the checkpoint boundary a durable-only reader knows.
+    fn waits_for_marker(&self) -> bool {
+        self.config.durable_only && self.next_seq >= self.durable_next_seq
     }
 
     /// Like [`Reader::try_next`], but copies the record out of the reader.
