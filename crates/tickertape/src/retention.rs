@@ -146,7 +146,9 @@ impl Report {
 /// names (nothing but the listing when the policy has no limit):
 ///
 /// - [`Policy::max_segments`]: nothing more while the number of names is within the limit.
-/// - [`Policy::max_bytes`]: the size of every segment file (its metadata, the file is not opened).
+/// - [`Policy::max_bytes`]: the size of every segment file (its metadata), and the header of each file whose size is
+///   not confirmed otherwise: the marker's segment and those after it, and a file whose size is not a segment size or
+///   differs from the size of the one before it. In a journal of one segment size, that is only the newest segments.
 /// - [`Policy::max_age`]: the headers of the oldest segments, up to the first one that is young enough and its
 ///   successor, whose creation time says so.
 /// - A combination of limits: what each of them needs.
@@ -160,14 +162,16 @@ impl Report {
 /// before, and the error names what the scan found.
 ///
 /// So an invalid header, or a file that cannot be opened, is an error when it belongs to a candidate, to a candidate's
-/// successor, to the marker's segment, or (with `max_age`) to the first segment that is young enough or its successor.
-/// Other segments are not opened, and damage in them does not stop retention (ADR 0051): run
-/// [`inspect::verify`] to find it.
+/// successor, to the marker's segment, (with `max_age`) to the first segment that is young enough or its successor, or
+/// (with `max_bytes`) to a file whose header it reads as above, or whose metadata cannot be read. Other segments are not
+/// opened, and damage in them does not stop retention (ADR 0051; up to 1.0 this read every header and failed for any
+/// invalid one): run [`inspect::verify`] to find it. Where there is more than one such error, it is the one of the
+/// oldest segment among those read.
 ///
 /// # Errors
 ///
 /// [`Error::NotFound`] for an empty journal; [`Error::Corrupt`] or [`Error::UnsupportedVersion`] for an invalid
-/// header, checkpoint position, or candidate seal or chain; [`Error::Io`] for filesystem errors, including concurrent
+/// header of a segment it reads (above), an invalid checkpoint position, or a candidate's invalid seal or chain; [`Error::Io`] for filesystem errors, including concurrent
 /// changes while observing the directory. An absent/invalid checkpoint slot yields an empty plan.
 pub fn plan(dir: impl AsRef<Path>, policy: &Policy) -> Result<Plan> {
     plan_at(
@@ -183,37 +187,74 @@ pub fn plan(dir: impl AsRef<Path>, policy: &Policy) -> Result<Plan> {
 /// only for the files it has not seen (ADR 0051).
 ///
 /// A size is used only while the run's own listing shows the same name with the same inode number, as a regular file.
-/// A file the listing no longer shows is forgotten, whoever removed it. That is enough because a segment file is never
-/// resized (`docs/format.md` → Segment file) and only a recovery replaces one, which needs the lock the writer holds. The
-/// sizes only decide which segments a limit asks to remove; nothing that protects a segment from removal uses them.
+/// A file the listing no longer shows is forgotten, whoever removed it, so another process's retention or archive cannot
+/// make a size stale, and a recovery, the only thing that replaces a segment, needs the lock the writer holds. A segment
+/// file is never resized (`docs/format.md` → Segment file). **The exception:** a file changed without a new inode number
+/// (written over in place, or removed and created again where the file system gives the new file the old number, as ext4
+/// and xfs do) keeps its old size here until the segment is removed or the writer opens again. That is outside what a
+/// journal allows (`docs/operations.md`: segment files are not edited); the sum is then off by the difference in size,
+/// which only shifts which segments the limit asks to remove (nothing that protects a segment from removal uses a size),
+/// and the segment's header is checked when the plan reaches it.
 #[derive(Debug, Default)]
 pub(crate) struct Sizes {
-    /// (base, inode, size), by base.
-    known: Vec<(u64, u64, u64)>,
+    /// (base, inode, size, header checked against that size), by base.
+    known: Vec<(u64, u64, u64, bool)>,
 }
 
 impl Sizes {
-    /// The size of each listed segment file.
-    fn of(&mut self, dir: &Path, listed: &[Listed]) -> Result<Vec<u64>> {
-        let mut known = std::mem::take(&mut self.known).into_iter().peekable();
-        let mut sizes = Vec::with_capacity(listed.len());
+    /// The size of each listed segment file, its metadata asked for once.
+    ///
+    /// So that a file whose length is not its header's size cannot make the limit remove more than the headers allow,
+    /// the header of a file is read and checked against its length, once, when the file is the marker's segment or after
+    /// it (`marker`), when its length is not a valid segment size, or when its length differs from the one before it.
+    /// Every length summed is then one a header confirms, or equals the length before it: in a journal of one segment
+    /// size, only the newest segments are read.
+    ///
+    /// On an error, the place of the segment and the error: the error opening the segment gives, where its metadata
+    /// cannot be read (the same as when every header was read).
+    fn of(
+        &mut self,
+        dir: &Path,
+        listed: &[Listed],
+        marker: u64,
+    ) -> std::result::Result<Vec<u64>, (usize, Error)> {
+        let mut known = self.known.iter().peekable();
+        let mut sizes: Vec<u64> = Vec::with_capacity(listed.len());
         let mut keep = Vec::with_capacity(listed.len());
-        for segment in listed {
-            while known.next_if(|(base, _, _)| *base < segment.base).is_some() {}
-            let seen = known.next_if(|(base, _, _)| *base == segment.base);
-            let size = match (seen, segment.inode) {
-                (Some((_, inode, size)), Some(now)) if inode == now => size,
-                _ => {
+        for (i, segment) in listed.iter().enumerate() {
+            while known.next_if(|(base, ..)| *base < segment.base).is_some() {}
+            let seen = known
+                .next_if(|(base, ..)| *base == segment.base)
+                .filter(|(_, inode, ..)| Some(*inode) == segment.inode);
+            let (size, mut checked) = match seen {
+                Some((_, _, size, checked)) => (*size, *checked),
+                None => {
                     let path = journal::segment_path(dir, segment.base);
                     crate::fault::note_access(crate::fault::Access::StatSegment);
-                    fs::metadata(&path)
-                        .map_err(|e| Error::io("stat segment", &path, e))?
-                        .len()
+                    match fs::metadata(&path) {
+                        Ok(meta) => (meta.len(), false),
+                        Err(e) => {
+                            let error = match open_header(dir, segment.base) {
+                                Err(opening) => opening,
+                                Ok(_) => Error::io("stat segment", &path, e),
+                            };
+                            return Err((i, error));
+                        }
+                    }
                 }
             };
+            let differs = i.checked_sub(1).is_some_and(|before| sizes[before] != size);
+            if !checked
+                && (segment.base >= marker
+                    || format::validate_segment_size(size).is_err()
+                    || differs)
+            {
+                open_header(dir, segment.base).map_err(|e| (i, e))?;
+                checked = true;
+            }
             sizes.push(size);
             if let Some(inode) = segment.inode {
-                keep.push((segment.base, inode, size));
+                keep.push((segment.base, inode, size, checked));
             }
         }
         self.known = keep;
@@ -281,7 +322,16 @@ fn plan_at(
     };
     let mut count = listed.len();
     let sizes = match policy.max_bytes {
-        Some(_) => sizes.of(dir, &listed)?,
+        Some(_) => match sizes.of(dir, &listed, checkpoint.segment_base_seq) {
+            Ok(sizes) => sizes,
+            // The error of the oldest invalid header before it, if there is one, as when every header was read.
+            Err((place, error)) => {
+                for segment in &listed[..place] {
+                    open_header(dir, segment.base)?;
+                }
+                return Err(error);
+            }
+        },
         None => Vec::new(),
     };
     let mut bytes: u128 = sizes.iter().map(|s| u128::from(*s)).sum();
@@ -359,10 +409,9 @@ fn reasons(policy: &Policy, count: usize, bytes: u128, now: u64, sealed: u64) ->
 /// Before each removal: the segment is the oldest in the journal and still the file planned (same identity), its
 /// header and its successor's are valid, the successor is the next segment in the journal, and the segment is
 /// strictly older than the checkpoint segment. Which segment is the oldest, and which is next, comes from a listing taken
-/// when this starts and kept up to date: while a run removes segments, names older than the checkpoint segment only
-/// disappear (no writer, recovery or archiver creates one there). The directory is listed again, before anything else is
-/// removed, when a segment is missing, when a check fails, or when a segment removed before is back (ADR 0051). Do not
-/// put segment files back into the journal while this runs. [`Action::Delete`] then checks the seal as [`plan`] does, without
+/// when this starts and kept up to date with its own removals (ADR 0051 says why that is enough). The directory is listed
+/// again, before anything else is removed, when a segment is missing, when a check fails, or when a segment removed
+/// before is back (ADR 0051). Do not put segment files back into the journal while this runs. [`Action::Delete`] then checks the seal as [`plan`] does, without
 /// reading the records it discards; [`Action::MoveTo`] reads the whole segment and validates every record and the seal
 /// naming the successor, so that only a valid segment is moved.
 ///
@@ -397,11 +446,16 @@ pub fn apply(dir: impl AsRef<Path>, plan: &Plan, action: &Action) -> Result<Repo
 /// What a run knows of the oldest segments: their bases in order, from its last listing, without those it has removed
 /// since. Empty: it has to list the directory.
 ///
-/// Why this replaces a listing before each removal (ADR 0051): the bases before the marker's segment only disappear
-/// while the run goes on. A writer creates segments only after the newest one, a recovery only in what it recovers
-/// (from the marker's segment on), and archivers only remove. So a segment that was the oldest in a listing, or became
-/// it because every older one is gone, is the oldest for as long as it exists, and no segment appears between it and
-/// the one listed next. Whether the two still exist is checked by opening both before each removal.
+/// Why this replaces a listing before each removal (ADR 0051). While a valid marker is in place, the bases before its
+/// segment only disappear: a writer creates segments only after the newest one, a recovery from that marker only from
+/// the marker's segment on, and archivers only remove. So a segment that was the oldest in a listing, or became it
+/// because every older one is gone, is the oldest for as long as it exists, and no segment appears between it and the
+/// one listed next. A recovery without a valid marker starts at the oldest segment and can replace and create segments
+/// before the old marker's segment, but: no removal happens while the marker is invalid (it is read before each one); a
+/// segment it replaced fails the identity check; and a segment it creates is the successor that a seal names, so it is
+/// never in front of the oldest segment, and never between a segment and the successor that segment's seal names, which
+/// every removal requires to be the planned one. Whether the segment and its successor still exist is checked by opening
+/// both before each removal.
 #[derive(Debug, Default)]
 struct Known(VecDeque<u64>);
 

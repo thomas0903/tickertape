@@ -977,7 +977,11 @@ NVMe SSD, not bare metal.**
   lazy_itable_init=0,lazy_journal_init=0`, mounted `rw,noatime`; `vm.dirty_ratio` 20, `vm.dirty_background_ratio` 10. The
   result files were written to the same filesystem. 2026-11-25, 21:00 to 21:23 UTC.
 - **Commits.** After: `9a3a6ed` (clean tree; the branch of the pull request that adds this section). Before: the same tree
-  with the core of `main` at `f1ea454` (`git checkout f1ea454 -- crates/tickertape`), so the tool is the same.
+  with the core of `main` at `f1ea454` (`git checkout f1ea454 -- crates/tickertape`), so the tool is the same. The raw
+  output (`environment.txt`) records only `9a3a6ed`: the "before" core is stated here, not in it. The branch later added,
+  after review, the header checks of `max_bytes` (ADR 0051 → Lengths a header confirms), which read the header of each new
+  segment once; that code was not run on this machine (on macOS, informally, the checkpoint loop with `max_bytes` did not
+  change within its noise).
 - **Command.** `benches/scale-session.sh /data/j <out> retention` with `TT_SCALE` and `TT_SCALE_BASE` (`benches/README.md`).
 - **How it ran.** One journal per shape (`tt-scale build`, 1,024 B records), both cores in turn on it, five rounds, which of
   the two goes first alternating; each operation in a process of its own. The cells are the median over the five rounds
@@ -989,7 +993,7 @@ NVMe SSD, not bare metal.**
   cache before the process starts, but the process lists the journal before it opens the writer, so the directory itself
   is cached by then (which is why the open without a policy is shorter than above).
 
-Checkpoints:
+Checkpoints, p50:
 
 | | | 10,000 × 1 MiB | 20,000 × 1 MiB | 100,000 × 64 KiB |
 |---|---|---|---|---|
@@ -1005,6 +1009,23 @@ Checkpoints:
 |  | after | 5.32 ms (5.03 ms–5.48 ms) | 8.51 ms (8.16 ms–8.86 ms) | 32.8 ms (32.3 ms–33.1 ms) |
 | checkpoint, `max_age`, removes one | before | 38.5 ms (36.9 ms–40.8 ms) | 77.7 ms (76.0 ms–79.1 ms) | 372 ms (371 ms–375 ms) |
 |  | after | 4.22 ms (4.16 ms–4.44 ms) | 7.63 ms (7.48 ms–7.82 ms) | 33.4 ms (32.9 ms–33.4 ms) |
+
+Checkpoints, p99 and p99.9 (with 20 checkpoints per round, both are the largest of the 20, as printed):
+
+| | | 10,000 × 1 MiB | 20,000 × 1 MiB | 100,000 × 64 KiB |
+|---|---|---|---|---|
+| checkpoint, no policy | before | 926 µs (785 µs–971 µs) | 1.05 ms (867 µs–2.25 ms) | 846 µs (770 µs–2.18 ms) |
+|  | after | 978 µs (866 µs–2.47 ms) | 998 µs (954 µs–1.67 ms) | 875 µs (819 µs–907 µs) |
+| checkpoint, `max_segments`, nothing to remove | before | 32.3 ms (30.5 ms–32.8 ms) | 66.4 ms (65.3 ms–67.4 ms) | 333 ms (330 ms–339 ms) |
+|  | after | 3.96 ms (3.90 ms–5.35 ms) | 7.06 ms (6.88 ms–7.30 ms) | 32.0 ms (32.0 ms–32.5 ms) |
+| checkpoint, `max_age`, nothing to remove | before | 28.6 ms (28.1 ms–30.5 ms) | 65.9 ms (65.5 ms–68.5 ms) | 332 ms (331 ms–341 ms) |
+|  | after | 3.96 ms (3.83 ms–4.19 ms) | 7.11 ms (6.90 ms–7.30 ms) | 32.1 ms (32.0 ms–32.7 ms) |
+| checkpoint, `max_bytes`, nothing to remove | before | 29.6 ms (28.4 ms–31.7 ms) | 65.2 ms (64.1 ms–68.1 ms) | 333 ms (330 ms–340 ms) |
+|  | after | 4.12 ms (3.95 ms–6.18 ms) | 7.51 ms (7.26 ms–7.90 ms) | 34.1 ms (34.0 ms–34.5 ms) |
+| checkpoint, `max_segments`, removes one | before | 36.3 ms (35.2 ms–38.7 ms) | 77.7 ms (74.8 ms–85.1 ms) | 379 ms (375 ms–399 ms) |
+|  | after | 6.99 ms (6.46 ms–7.59 ms) | 10.1 ms (9.44 ms–10.8 ms) | 33.4 ms (33.4 ms–38.1 ms) |
+| checkpoint, `max_age`, removes one | before | 39.2 ms (37.8 ms–41.3 ms) | 78.8 ms (76.9 ms–80.1 ms) | 379 ms (374 ms–383 ms) |
+|  | after | 4.58 ms (4.46 ms–4.84 ms) | 8.34 ms (7.66 ms–9.49 ms) | 33.7 ms (33.3 ms–34.2 ms) |
 
 `Writer::open`:
 

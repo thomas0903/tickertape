@@ -55,7 +55,7 @@ const DAY: Duration = Duration::from_secs(86_400);
 
 /// A checkpoint of a writer whose policy removes nothing costs the same at any number of segments: one listing, the
 /// marker's segment, and by age the oldest segment and its successor. With a size limit, the sizes of the segments the
-/// writer has not seen, once.
+/// writer has not seen, once, and the headers of those from the marker's segment on, once.
 #[test]
 fn a_checkpoint_that_removes_nothing_reads_the_same_at_any_size() {
     for n in [5, 60] {
@@ -80,7 +80,13 @@ fn a_checkpoint_that_removes_nothing_reads_the_same_at_any_size() {
             });
             let mut writer = writer.unwrap();
             let sized = if sizes { n as usize } else { 0 };
-            assert_eq!((open.1, open.2), (opened, sized), "{n}: {policy:?}");
+            // With a size limit, every file's size, and the header of the newest (the marker's segment), once.
+            let checked = usize::from(sizes);
+            assert_eq!(
+                (open.1, open.2),
+                (opened + checked, sized),
+                "{n}: {policy:?}"
+            );
             for _ in 0..3 {
                 // Without a roll, and with one.
                 let idle = accesses(|| writer.checkpoint().unwrap());
@@ -88,7 +94,8 @@ fn a_checkpoint_that_removes_nothing_reads_the_same_at_any_size() {
                 append(&mut writer);
                 let rolled = accesses(|| writer.checkpoint().unwrap());
                 let new = usize::from(sizes);
-                assert_eq!(rolled, (1, opened, new), "{n}: {policy:?}");
+                // The new segment's size and header.
+                assert_eq!(rolled, (1, opened + new, new), "{n}: {policy:?}");
             }
             assert_eq!(writer.retention_report().removed_segments, 0);
             assert!(writer.last_retention_error().is_none());
@@ -111,9 +118,11 @@ fn a_checkpoint_that_removes_one_segment_lists_once() {
             for i in 1..4 {
                 append(&mut writer);
                 let removed = accesses(|| writer.checkpoint().unwrap());
-                // Planning: the marker's segment, the oldest and its successor, the oldest's seal. Removing: the
-                // marker's segment, the oldest and its successor.
-                assert_eq!(removed, (1, 7, usize::from(sized)), "{n}: sized {sized}");
+                // Planning: the marker's segment, the oldest and its successor, the oldest's seal (and with a size
+                // limit the new segment's size and header). Removing: the marker's segment, the oldest and its
+                // successor.
+                let new = usize::from(sized);
+                assert_eq!(removed, (1, 7 + new, new), "{n}: sized {sized}");
                 assert_eq!(writer.retention_report().removed_segments, i);
             }
         }
@@ -564,4 +573,63 @@ fn archivers_and_a_writer_at_once() {
         Writer::open(dir.path(), small_config()).unwrap().next_seq(),
         rounds + 1
     );
+}
+
+/// The successor's header is damaged after the plan, before any removal or before a later one: the removal that needs
+/// it fails with the header's error, and the segment before it stays.
+#[test]
+fn a_successor_damaged_after_the_plan_stops_the_removal() {
+    use std::os::unix::fs::FileExt;
+    for at in 0..REMOVED {
+        let dir = journal(N);
+        let policy = Policy::default().max_segments((N - REMOVED) as usize);
+        let plan = retention::plan(dir.path(), &policy).unwrap();
+        let successor = segments(dir.path())[at as usize + 1].1.clone();
+        fault::clear();
+        let damaged = successor.clone();
+        fault::run_at(Point::RetentionRemove, at as usize, move || {
+            let file = fs::OpenOptions::new().write(true).open(&damaged).unwrap();
+            file.write_all_at(b"X", 0).unwrap();
+        });
+        let result = retention::apply(dir.path(), &plan, &Action::Delete);
+        fault::clear();
+        match result {
+            Err(Error::Corrupt {
+                path,
+                offset: 0,
+                reason: CorruptReason::BadMagic,
+                ..
+            }) => assert_eq!(path, successor, "{at}"),
+            other => panic!("{at}: {other:?}"),
+        }
+        assert_eq!(bases(dir.path()), (at..N).collect::<Vec<_>>(), "{at}");
+    }
+}
+
+/// A move whose destination goes away after the checks: the rename fails with "not found" although the segment is in
+/// place, so it is not taken for a segment another archiver removed. The run stops there, and removes nothing after it.
+#[test]
+fn a_move_into_a_destination_that_went_away_is_an_error() {
+    for at in 0..REMOVED {
+        let dir = journal(N);
+        let parent = tempfile::tempdir().unwrap();
+        let dest = parent.path().join("archive");
+        fs::create_dir(&dest).unwrap();
+        let policy = Policy::default().max_segments((N - REMOVED) as usize);
+        let plan = retention::plan(dir.path(), &policy).unwrap();
+        fault::clear();
+        let gone = dest.clone();
+        fault::run_at(Point::RetentionChecked, at as usize, move || {
+            fs::remove_dir_all(gone).unwrap()
+        });
+        let result = retention::apply(dir.path(), &plan, &Action::MoveTo(dest.clone()));
+        fault::clear();
+        match result {
+            Err(Error::Io { source, .. }) => {
+                assert_eq!(source.kind(), std::io::ErrorKind::NotFound, "{at}")
+            }
+            other => panic!("{at}: {other:?}"),
+        }
+        assert_eq!(bases(dir.path()), (at..N).collect::<Vec<_>>(), "{at}");
+    }
 }

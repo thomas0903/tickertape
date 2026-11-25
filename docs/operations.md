@@ -209,7 +209,9 @@ The same rules apply to the library and CLI, without taking the writer lock:
   The cost of a run grows with the number of segments left in the journal ("Segment count" above).
 - A run reads only what the limits need (ADR 0051). Damage in a segment they do not need does not stop it and is not
   reported by it: run `tickertape verify` regularly. Damage in a segment to remove, in the one after it or in the marker's
-  stops it, as does, with an age limit, damage in the first segment that is young enough or its successor.
+  stops it, as does, with an age limit, damage in the first segment that is young enough or its successor, and with a
+  size limit, damage in the marker's segment and those after it, and in a file whose length differs from the one before
+  it (their headers are read to confirm their sizes).
 - Do not put segment files back into a journal while retention or `archive` runs on it: a run lists the directory once
   and does not notice every file that appears in front of the oldest segment (crash contract C14).
 - Moves preserve the segment basename and require an existing destination directory. Same-filesystem moves use

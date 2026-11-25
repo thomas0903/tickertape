@@ -103,6 +103,28 @@ fn considered(dir: &Path, policy: &Policy, stop: &dyn Fn(usize) -> bool) -> usiz
     }
 }
 
+/// With `max_bytes`, the segments whose headers are read to confirm their sizes: from the marker's segment on, and those
+/// whose length is not a segment size or differs from the one before.
+fn read_for_size(dir: &Path, policy: &Policy) -> BTreeSet<usize> {
+    if policy.max_bytes.is_none() {
+        return BTreeSet::new();
+    }
+    let marker = checkpoint(dir).unwrap().unwrap().segment_base_seq;
+    let lengths: Vec<u64> = journal::list_segments(dir)
+        .unwrap()
+        .iter()
+        .map(|(_, path)| fs::metadata(path).unwrap().len())
+        .collect();
+    let bases = bases(dir);
+    (0..lengths.len())
+        .filter(|&i| {
+            bases[i] >= marker
+                || format::validate_segment_size(lengths[i]).is_err()
+                || (i > 0 && lengths[i] != lengths[i - 1])
+        })
+        .collect()
+}
+
 fn bases(dir: &Path) -> Vec<u64> {
     journal::list_bases(dir)
         .unwrap()
@@ -129,6 +151,8 @@ enum Header {
     Directory,
     /// A name for a file that is not there.
     Dangling,
+    /// Valid, in a file that cannot be opened (no permissions; root can open it anyway).
+    Unreadable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,6 +219,7 @@ fn header() -> impl Strategy<Value = Header> {
         1 => prop_oneof![Just(0), Just(63), Just(64), Just(SIZE / 2)].prop_map(Header::Short),
         1 => Just(Header::Directory),
         1 => Just(Header::Dangling),
+        1 => Just(Header::Unreadable),
     ]
 }
 
@@ -331,6 +356,10 @@ fn write_segment(path: &Path, s: &Segment, base: u64, next: u64) {
     if let Header::Short(len) = s.header {
         file.set_len(len).unwrap();
     }
+    if s.header == Header::Unreadable {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o000)).unwrap();
+    }
 }
 
 fn write(dir: &Path, case: &Case) {
@@ -424,19 +453,29 @@ fn compare(
             panic!("{old:?} became {new:?}");
         };
         // Make that header valid for the file there is, of any creation time: nothing else of the result may change.
-        let size = fs::metadata(&path).map_or(0, |m| if m.is_dir() { 0 } else { m.len() });
-        if size == 0 || size % SIZE != 0 {
-            // No header makes a segment of this one. With `max_bytes` its length counts either way: make the file the
-            // length of no segment's, and take what the planner says of that journal.
-            if policy.max_bytes.is_some() {
-                return Ok(());
-            }
-            let _ = fs::remove_dir(&path);
-            let _ = fs::remove_file(&path);
-            File::create(&path).unwrap().set_len(SIZE).unwrap();
-        }
-        let size = fs::metadata(&path).unwrap().len();
+        // A new file goes in by a rename, so that it has an inode number of its own (ext4 gives a file removed and
+        // created again its old number, and the sizes a writer keeps would take it for the old file).
+        let length = fs::metadata(&path)
+            .ok()
+            .filter(|m| m.is_file())
+            .map(|m| m.len());
         let base = bases(dir)[place];
+        let size = match length.filter(|l| format::validate_segment_size(*l).is_ok()) {
+            Some(size) => {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+                size
+            }
+            None => {
+                // With `max_bytes` every length counts and such a file is always read, so no difference is allowed.
+                prop_assert!(policy.max_bytes.is_none(), "{old:?} became {new:?}");
+                let replacement = dir.join("replacement");
+                File::create(&replacement).unwrap().set_len(SIZE).unwrap();
+                let _ = fs::remove_dir(&path);
+                fs::rename(&replacement, &path).unwrap();
+                SIZE
+            }
+        };
         let header = format::encode_segment_header(&SegmentHeader {
             segment_size: size,
             base_seq: base,
@@ -449,10 +488,15 @@ fn compare(
     if !repaired.is_empty() {
         // Every header is valid now, at least up to what matters.
         let considered = considered(dir, policy, stop);
+        let read = read_for_size(dir, policy);
         for place in &repaired {
             prop_assert!(
                 *place >= considered,
                 "the header of segment {place} is one of the {considered} considered, but was not an error"
+            );
+            prop_assert!(
+                !read.contains(place),
+                "the header of segment {place} is read for its size, but was not an error"
             );
         }
     }
@@ -612,4 +656,121 @@ fn a_stop_while_the_seals_are_read_ends_the_plan() {
     assert_eq!(at(7).unwrap().segments.len(), 2);
     assert_eq!(at(8).unwrap().segments.len(), 3);
     assert!(matches!(at(9), Err(Error::Corrupt { .. })));
+}
+
+/// Makes segment `at` of a [`journal_of`] journal `factor` times as long, without changing its header.
+fn inflate(paths: &[PathBuf], at: usize, factor: u64) {
+    let file = OpenOptions::new().write(true).open(&paths[at]).unwrap();
+    file.set_len(factor * SIZE).unwrap();
+}
+
+/// With `max_bytes`, a file longer than its header says cannot make the limit remove segments it would keep: its header
+/// is read, and the plan fails as when every header was read. (a) The file is the marker's segment, or after it: a stray
+/// name, or an active segment extended. (b) It is before the marker's segment, beyond where a run stops early.
+#[test]
+#[cfg_attr(miri, ignore = "files")]
+fn a_file_longer_than_its_header_is_an_error_not_a_removal() {
+    let size_mismatch = |result: Result<Plan>, path: &Path| match result {
+        Err(Error::Corrupt {
+            path: found,
+            reason: CorruptReason::SizeMismatch { .. },
+            ..
+        }) if found == path => {}
+        other => panic!("{other:?}"),
+    };
+    // Ten segments: the limit holds all ten, so only the extra length could ask for a removal.
+    let limit = Policy::default().max_bytes(10 * SIZE);
+    // (a) The marker's segment.
+    let (dir, paths) = journal_of(10);
+    inflate(&paths, 9, 5);
+    let result = plan_at(dir.path(), &limit, NOW, &|_| false, &mut Sizes::default());
+    size_mismatch(result, &paths[9]);
+    // (a) After it: a segment named after the newest, with the header of no segment.
+    let (dir, paths) = journal_of(10);
+    let stray = journal::segment_path(dir.path(), 1_000);
+    File::create(&stray).unwrap().set_len(4 * SIZE).unwrap();
+    let result = plan_at(dir.path(), &limit, NOW, &|_| false, &mut Sizes::default());
+    assert!(matches!(result, Err(Error::Corrupt { path, .. }) if path == stray));
+    drop(paths);
+    // (b) Before the marker's segment, behind where a run that stops after one segment ends.
+    let (dir, paths) = journal_of(10);
+    inflate(&paths, 6, 5);
+    let stop = |planned: usize| planned >= 1;
+    let result = plan_at(dir.path(), &limit, NOW, &stop, &mut Sizes::default());
+    size_mismatch(result, &paths[6]);
+    // The same with the sizes a writer kept from before the file grew: it is a new length, so it is read.
+    let (dir, paths) = journal_of(10);
+    let mut sizes = Sizes::default();
+    let plan = plan_at(dir.path(), &limit, NOW, &stop, &mut sizes).unwrap();
+    assert!(plan.segments.is_empty());
+    let grown = dir.path().join("grown");
+    fs::copy(&paths[6], &grown).unwrap();
+    OpenOptions::new()
+        .write(true)
+        .open(&grown)
+        .unwrap()
+        .set_len(5 * SIZE)
+        .unwrap();
+    fs::rename(&grown, &paths[6]).unwrap();
+    size_mismatch(
+        plan_at(dir.path(), &limit, NOW, &stop, &mut sizes),
+        &paths[6],
+    );
+    // A journal of one size reads no header but the marker's segment's.
+    #[cfg(feature = "fault-injection")]
+    {
+        use crate::fault;
+        let (dir, _) = journal_of(10);
+        fault::record_accesses();
+        plan_at(dir.path(), &limit, NOW, &|_| false, &mut Sizes::default()).unwrap();
+        let opened = fault::take_accesses()
+            .iter()
+            .filter(|a| **a == fault::Access::OpenSegment)
+            .count();
+        assert_eq!(
+            opened, 2,
+            "the marker's segment, by the marker and for its size"
+        );
+    }
+}
+
+/// The exception to the sizes a writer keeps (ADR 0051): a file changed in place, with the same inode number, keeps its
+/// old size until the segment goes or the writer opens again. Here a segment of 1 unit is written over in place with 5
+/// units (not something a journal allows): the kept sizes count 1, a new plan counts 5.
+#[test]
+#[cfg_attr(miri, ignore = "files")]
+fn a_file_changed_in_place_keeps_its_old_size() {
+    let (dir, paths) = journal_of(10);
+    let limit = Policy::default().max_bytes(11 * SIZE);
+    let mut sizes = Sizes::default();
+    assert!(
+        plan_at(dir.path(), &limit, NOW, &|_| false, &mut sizes)
+            .unwrap()
+            .segments
+            .is_empty()
+    );
+    let before = fs::metadata(&paths[4]).unwrap();
+    inflate(&paths, 4, 5);
+    // The header still says 1 unit: write it for 5, as a copy put over it in place would.
+    let header = format::encode_segment_header(&SegmentHeader {
+        segment_size: 5 * SIZE,
+        base_seq: 4,
+        created_unix_ns: 40,
+    });
+    let file = OpenOptions::new().write(true).open(&paths[4]).unwrap();
+    file.write_all_at(&header, 0).unwrap();
+    // (The seal of the inflated copy is where a 5-unit segment has it.)
+    let mut seal = [0; 8];
+    seal[..4].copy_from_slice(&format::SEAL_MARKER.to_le_bytes());
+    seal[4..].copy_from_slice(&format::seal_crc(5).to_le_bytes());
+    file.write_all_at(&seal, 5 * SIZE - 8).unwrap();
+    assert_eq!(
+        std::os::unix::fs::MetadataExt::ino(&fs::metadata(&paths[4]).unwrap()),
+        std::os::unix::fs::MetadataExt::ino(&before)
+    );
+    let stale = plan_at(dir.path(), &limit, NOW, &|_| false, &mut sizes).unwrap();
+    let fresh = plan_at(dir.path(), &limit, NOW, &|_| false, &mut Sizes::default()).unwrap();
+    assert!(stale.segments.is_empty(), "{stale:?}");
+    // 14 units against a limit of 11: the oldest three go (the fifth, the inflated one, is not reached).
+    assert_eq!(fresh.segments.len(), 3, "{fresh:?}");
 }

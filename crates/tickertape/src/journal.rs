@@ -66,7 +66,9 @@ pub(crate) struct Listed {
     pub(crate) inode: Option<u64>,
 }
 
-/// Lists the segments in `dir` by name only, sorted by base, as [`list_segments`] does.
+/// Lists the segments in `dir` by name only, sorted by base, as [`list_segments`] does. (The type of each entry comes with
+/// the listing on the supported file systems; where a file system reports none, `file_type` asks with an `lstat` per
+/// entry.)
 pub(crate) fn list_bases(dir: &Path) -> Result<Vec<Listed>> {
     let mut out = Vec::new();
     for entry in list_entries(dir)? {
