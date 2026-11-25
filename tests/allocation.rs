@@ -6,7 +6,8 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::hint::black_box;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use tickertape::{Backoff, NewRecord, Reader, ReaderConfig, Writer, WriterConfig};
 
@@ -70,15 +71,46 @@ fn record(payload: &[u8]) -> NewRecord<'_> {
     }
 }
 
+/// The records [`journal`] appends before it returns.
+const WARM_UP: u64 = 1_200;
+
 /// A fresh journal in the default 128 MiB segments, which no test here fills (nor half fills: on macOS the writer then
-/// starts a thread that prepares the next segment, ADR 0022), with two records: a short one, and one long enough for
-/// the CRC's tables, which the first long record of the process builds in one allocation (ADR 0024).
+/// starts a thread that prepares the next segment, ADR 0022), with [`WARM_UP`] records. They make every one-off
+/// allocation happen before a test counts: the CRC's tables, which the first long record of the process builds
+/// (ADR 0024), and on macOS the mutex and condition variable the writer shares with the prefault helper. Those two are
+/// boxed when they are first used, by whichever thread comes first, and the writer uses them when it has appended
+/// 1 MiB (`prefault::STEP`; 64 KiB on Linux), so the warm-up goes past that.
 fn journal() -> (tempfile::TempDir, Writer) {
     let dir = tempfile::tempdir().unwrap();
     let mut writer = Writer::open(dir.path(), WriterConfig::default()).unwrap();
-    writer.append(&record(&[0; 64])).unwrap();
-    writer.append(&record(&[0; 1024])).unwrap();
+    let payload = [0; 1024];
+    for _ in 0..WARM_UP {
+        writer.append(&record(&payload)).unwrap();
+    }
     (dir, writer)
+}
+
+/// Reads the records [`journal`] appended.
+fn skip_warm_up(reader: &mut Reader) {
+    for _ in 0..WARM_UP {
+        assert!(reader.try_next().unwrap().is_some());
+    }
+}
+
+fn open(dir: &std::path::Path, mapped: bool, config: ReaderConfig) -> Reader {
+    if mapped {
+        // SAFETY: only the test's writer modifies the journal.
+        unsafe { Reader::open_mapped(dir, config).unwrap() }
+    } else {
+        Reader::open(dir, config).unwrap()
+    }
+}
+
+fn blocking() -> Backoff {
+    let mut backoff = Backoff::default();
+    backoff.spins = 0;
+    backoff.yields = 0;
+    backoff
 }
 
 #[test]
@@ -113,26 +145,16 @@ fn appending_allocates_nothing() {
     }
 }
 
-/// Every reader and wait mode, following the writer record by record and then replaying a backlog.
+/// Every reader, with every wait mode configured, reading records that are already committed: the reader follows the
+/// writer record by record (it never waits here) and then replays a backlog.
 #[test]
 fn reading_allocates_nothing() {
-    let mut blocking = Backoff::default();
-    blocking.spins = 0;
-    blocking.yields = 0;
     for mapped in [false, true] {
-        for backoff in [Backoff::busy_spin(), Backoff::default(), blocking] {
+        for backoff in [Backoff::busy_spin(), Backoff::default(), blocking()] {
             let (dir, mut writer) = journal();
             let config = ReaderConfig::default().backoff(backoff);
-            let mut reader = if mapped {
-                // SAFETY: only `writer` modifies the journal.
-                unsafe { Reader::open_mapped(dir.path(), config).unwrap() }
-            } else {
-                Reader::open(dir.path(), config).unwrap()
-            };
-            // The first read allocates the safe reader's buffer.
-            for _ in 0..2 {
-                assert!(reader.try_next().unwrap().is_some());
-            }
+            let mut reader = open(dir.path(), mapped, config);
+            skip_warm_up(&mut reader);
             let mut followed = 0;
             for _ in 0..RECORDS {
                 writer.append(&record(&[7; 64])).unwrap();
@@ -169,9 +191,7 @@ fn waiting_allocates_only_to_refresh_the_wake_up_record() {
     .unwrap();
     let mut block = Reader::open(dir.path(), ReaderConfig::default()).unwrap();
     for reader in [&mut spin, &mut block] {
-        for _ in 0..2 {
-            assert!(reader.try_next().unwrap().is_some());
-        }
+        skip_warm_up(reader);
         // The first wait can initialise state that lives as long as the process (the macOS wake-up functions).
         assert!(
             reader
@@ -186,7 +206,7 @@ fn waiting_allocates_only_to_refresh_the_wake_up_record() {
     });
     assert_eq!(spinning, 0);
     let timeout = Duration::from_millis(350);
-    let before = std::time::Instant::now();
+    let before = Instant::now();
     let blocking = allocations(|| assert!(block.next_timeout(Some(timeout)).unwrap().is_none()));
     // One refresh per 100 ms of the wait, however late it ended; each opens the record by its path, and the identity
     // check of the segment, every 100 ms too, converts its path.
@@ -197,6 +217,65 @@ fn waiting_allocates_only_to_refresh_the_wake_up_record() {
     );
 }
 
+/// A blocking reader that is woken for each record: the writer appends only once the reader has had time to block for
+/// the next one. Any allocation on the way into the wait, in it, or out of it happens once per record; the reader
+/// allocates only where it re-reads the wake-up record, every 100 ms.
+#[test]
+fn blocking_for_each_record_allocates_only_to_refresh_the_wake_up_record() {
+    const BLOCKED: u64 = 1_000;
+    for mapped in [false, true] {
+        let (dir, mut writer) = journal();
+        let mut reader = open(
+            dir.path(),
+            mapped,
+            ReaderConfig::default().backoff(blocking()),
+        );
+        skip_warm_up(&mut reader);
+        let consumed = AtomicU64::new(0);
+        let (allocated, elapsed) = std::thread::scope(|scope| {
+            let handle = scope.spawn(|| {
+                // The first wait can initialise state that lives as long as the process or the thread.
+                assert!(
+                    reader
+                        .next_timeout(Some(Duration::from_millis(1)))
+                        .unwrap()
+                        .is_none()
+                );
+                consumed.store(1, Ordering::Release);
+                let before = Instant::now();
+                let mut allocated = 0;
+                for n in 0..BLOCKED {
+                    allocated += allocations(|| {
+                        let found = reader.next_timeout(Some(Duration::from_secs(60))).unwrap();
+                        assert!(found.is_some());
+                    });
+                    consumed.store(n + 2, Ordering::Release);
+                }
+                (allocated, before.elapsed())
+            });
+            for n in 0..BLOCKED {
+                while consumed.load(Ordering::Acquire) <= n {
+                    if handle.is_finished() {
+                        break;
+                    }
+                    std::thread::yield_now();
+                }
+                std::thread::sleep(Duration::from_micros(200));
+                writer.append(&record(&[7; 64])).unwrap();
+            }
+            handle.join().unwrap()
+        });
+        // About three allocator calls per re-read of the wake-up record, and the identity check's path, both at most
+        // every 100 ms. The bound is far below one per record unless the machine is so slow that the waits alone
+        // exceed it.
+        let intervals = elapsed.as_millis() as u64 / 100 + 2;
+        assert!(
+            allocated <= 8 * intervals,
+            "mapped {mapped}: {allocated} allocations in {BLOCKED} waits, {intervals} refresh intervals"
+        );
+    }
+}
+
 /// Copying a record out is the one allocation a caller can ask for.
 #[test]
 fn an_owned_record_is_one_allocation() {
@@ -205,9 +284,7 @@ fn an_owned_record_is_one_allocation() {
         writer.append(&record(&[7; 64])).unwrap();
     }
     let mut reader = Reader::open(dir.path(), ReaderConfig::default()).unwrap();
-    for _ in 0..2 {
-        assert!(reader.try_next().unwrap().is_some());
-    }
+    skip_warm_up(&mut reader);
     let owned = allocations(|| {
         for _ in 0..RECORDS {
             assert!(black_box(reader.next_owned().unwrap()).is_some());

@@ -193,9 +193,11 @@ released with seven items open, accepted by the owner as known gaps
   - Batched append with one wake-up per batch is done (ADR 0041, #32), and `append_with` is used by `demo-producer`,
     the C++ example and the iceoryx2 recorder. The profiles of both readers (spinning, blocking, durable-only), the
     notification path and the serialization paths, with the allocations, copies, system calls and synchronization that
-    remain and whether each is necessary, are in `docs/benchmarks.md` (2026-11-25). Candidates found there and not
-    taken: a smaller read of the safe reader at the tail (measured, mixed result, branch
-    `core/safe-reader-tail-reads`), a shared clock read in the spin loop, and durable-only readers that keep their
+    remain and whether each is necessary, are in `docs/benchmarks.md` (2026-11-25). They are of v1.0.0; the
+    durable-only reader has not been profiled since #66 changed how it reads the checkpoint marker. Candidates found
+    there and not taken: a smaller read of the safe reader at the tail (measured, mixed result, branch
+    `core/safe-reader-tail-reads`), a shared clock read in the spin loop, wakes sent to readers that are registered but
+    not asleep, the outlined atomic call on aarch64 (`-C target-feature=+lse`), and durable-only readers that keep their
     checkpoint descriptor and are woken only by checkpoints.
 - [ ] **ARM server measurements.**
   - Run correctness/crash checks and the sustained comparison suite on an aarch64 Linux server, targeting
@@ -299,7 +301,8 @@ where a line says it is closed:
 - **Cheaper checkpoints:** how much prefaulted, unwritten data adds to a checkpoint is not measured, and there is no
   macOS result.
 - **Avoidable work:** the profiles of the readers, notification and serialization paths were not documented; done
-  since ([above](#next-release-sustained-performance), `docs/benchmarks.md` 2026-11-25).
+  since for v1.0.0 ([above](#next-release-sustained-performance), `docs/benchmarks.md` 2026-11-25); the durable-only
+  reader has not been profiled since #66.
 - **ARM servers:** two latency observations on aarch64 and the platform mechanism behind issue #43 are not explained.
 - **Replay and recovery at scale:** archived history, missing or corrupt segments, catch-up under a live writer, the
   zero-copy reader and journals of 10,000 segments or more are not measured. The sparse seek index is implemented (ADR

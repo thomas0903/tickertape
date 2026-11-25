@@ -1448,7 +1448,8 @@ Profiles of v1.0.0's library under the sustained workloads (`tt-sustained`, ADR 
 eliminating avoidable work" (issue #62). They show where CPU time goes and what work remains per record. **The machines
 have 4 vCPUs: the latencies, rates and CPU shares here are not comparable with the published tables above**, and nothing
 here is a throughput or latency result. The comparisons inside this section are between runs on the same machine in the
-same session.
+same session. **Current `main` was not profiled; only v1.0.0's library was.** Since then #66 changed how a durable-only
+reader reads the checkpoint marker, and later merges changed other files of the library.
 
 ### Environment and method
 
@@ -1460,33 +1461,41 @@ same session.
 | Writer, reader CPU | 0, 1 (two cores); helper threads unpinned | 0, 1 (two cores); helper threads unpinned |
 | rustc, perf, bpftrace | 1.100.0, 7.0.14, 0.20.2 | the same |
 
-Commit `2a9b428`: v1.0.0's `crates/tickertape/src` (no difference) with the tools of this change in `benches/`.
-**Virtual machines, not bare metal.** The guests expose no CPU cycles counter (`perf stat -e cycles` reports it as not
-supported), so the profiles are `cpu-clock` samples at 1999 Hz: an interrupt in a section with interrupts off is taken
-when they are turned on again, which blames short kernel sections on the instruction after them (on aarch64
-`finish_task_switch`, where a thread returning from a block is sampled, holds most of the mapped blocking reader's
-samples). The profiled binaries are built with `RUSTFLAGS="-C force-frame-pointers=yes" CARGO_PROFILE_RELEASE_DEBUG=1`;
-the encoding and candidate comparisons below use the ordinary release build.
+Commit `2a9b428`: v1.0.0's `crates/tickertape/src` (no difference) with the tools of this change in `benches/`. The
+candidate below is `751ee43`. Both commits are kept by the branch `core/safe-reader-tail-reads` (`2a9b428` is an
+ancestor of `751ee43`); do not delete it. **Virtual machines, not bare metal.** The guests expose no CPU cycles counter
+(`perf stat -e cycles` reports it as not supported), so the profiles are `cpu-clock` samples at 1999 Hz: an interrupt in
+a section with interrupts off is taken when they are turned on again, which blames short kernel sections on the
+instruction after them (on aarch64 `finish_task_switch`, where a thread switched in is sampled, holds most of the
+blocking zero-copy reader's samples below 1.5 million records/s). The profiled binaries are built with `RUSTFLAGS="-C
+force-frame-pointers=yes" CARGO_PROFILE_RELEASE_DEBUG=1`; the encoding and candidate comparisons below use the ordinary
+release build.
 
-Every workload is `tt-sustained run --duration 28s --warmup 5s --checkpoint-every 1s --checkpoint-mode background
---retain-bytes 34359738368 --cpus 0,1` with `--rate` or `--unpaced`, `--payload` and `--readers` as in the tables (a 20
-s sample, starting 8 s in). `benches/diagnostics/profile-sustained.sh DIR perf 20 -- <run>` records the CPU profiles of
-the writer's and the reader's measuring thread with frame-pointer call graphs and folds them (`fold-stacks.py`, which
-names inlined functions); `... counts 8 -- <run>` is a separate run that counts system calls and bytes read
-(`counts.bt`), heap allocations with their stacks (`allocs.bt`) and `perf trace -s`, each for 8 s, so that counting does
-not distort a profile. The kernel-side `bpftrace` counts slow the threads somewhat at high rates, so per-record counts
-of a reader that falls behind are those of the observed run. Each pass is a complete run of the list; two passes on both
-machines (on aarch64 one pass for the `default` wait mode, the `owned` readers and the no-reader runs). Cells show the
-range over the two passes, x86-64 first, then aarch64, which is how far the passes differ. Three counting runs whose `bpftrace` ran past its 8 s (windows of 9.6, 17 and 41 s; one
-of them on the candidate below) are left out. Raw output (folded stacks, count files, `result.json` and series) is kept
-outside the repository.
+The runs are `tt-sustained run --dir /data/j --warmup 5s --checkpoint-every 1s --checkpoint-mode background
+--retain-bytes 34359738368 --cpus 0,1` with `--rate` or `--unpaced`, `--payload` and `--readers` as in the tables, and
+`--duration 28s` for the CPU profiles (a 20 s sample, starting 8 s in), 36 s for the counts, 20 s for the encoding
+comparison and 25 s for the candidate; `/data` is the local SSD and `/data/j` is removed after each run. The replay
+benchmark ran as `TMPDIR=/data/tmp taskset -c 1 <replay benchmark binary> --bench records`.
+`benches/diagnostics/profile-sustained.sh DIR perf 20 -- <run>` records the CPU profiles of the writer's and the
+reader's measuring thread with frame-pointer call graphs and folds them (`fold-stacks.py`, which names inlined
+functions); `... counts 8 -- <run>` is a separate run that counts system calls and bytes read (`counts.bt`), heap
+allocations with their stacks (`allocs.bt`) and `perf trace -s`, each for 8 s, so that counting does not distort a
+profile. The kernel-side `bpftrace` counts slow the threads somewhat at high rates, so per-record counts of a reader
+that falls behind are those of the observed run. Each pass is a complete run of the list; two passes on both machines
+(on aarch64 one pass for the `default` wait mode, the `owned` readers and the no-reader runs). Cells show the range over
+the two passes, x86-64 first, then aarch64 after a slash. One value for a machine means that its passes are equal, and
+one value without a slash that both machines are. Rows marked † have one pass on aarch64. Counting runs whose window,
+measured from before `bpftrace` started, was longer than 9.5 s are left out: three, of 9.6, 17 and 41 s (the last on the
+candidate below), in which `bpftrace` ran past its 8 s. Windows of 8.5 to 9.3 s were kept; they include attaching the
+probes, and the counts in them can cover slightly more than 8 s, which is why a count of exactly one per record can read
+1.00 to 1.03. Raw output (folded stacks, count files, `result.json` and series) is kept outside the repository.
 
 ### The readers
 
-Share of the reader thread's CPU samples (%), and CPU of a core it used (%). "64 KiB reads" are the safe reader's fills
-of its buffer; the wait mode is that of `--readers` (`spin`: wake-ups off; `block`: blocks at once; `default`: spins and
-yields, then blocks). The rest of each row is the tool's latency recording, loop bookkeeping and registration as a
-waiter.
+Share of the reader thread's samples (%), and CPU of a core the thread used (%, from `getrusage`, not from the samples).
+"64 KiB reads" are the safe reader's fills of its buffer; the wait mode is that of `--readers` (`spin`: wake-ups off;
+`block`: blocks at once; `default`: spins and yields, then blocks). The rest of each row is the tool's latency
+recording, loop bookkeeping and registration as a waiter.
 
 | Reader, wait | Payload | Records/s | CPU of a core | Commit-word polls | 64 KiB reads: copy | 64 KiB reads: rest | Futex wait | Clock reads | CRC and decode | Checkpoint marker |
 |---|---|---|---|---|---|---|---|---|---|---|
@@ -1510,8 +1519,8 @@ waiter.
 | safe block | 1024 B | 200,000 | 74 / 81 | 15 / 18 | 39 / 41–43 | 5 / 9 | 27 / 19–21 | 2 / 3 | 3 / 2–3 | 0 |
 | mapped spin | 1024 B | 200,000 | 100 | 4 | 0 | 0 | 0 | 56–57 / 68 | 6 / 2 | 0 |
 | mapped block | 1024 B | 200,000 | 46–47 / 48–49 | 1 / 0 | 0 | 0 | 69–70 / 97–98 | 4 / 1 | 8 / 1 | 0 |
-| safe default | 64 B | 200,000 | 99 | 50 / 46 | 27–28 / 31 | 5 / 7 | 0 | 9 | 0 | 0 |
-| mapped default | 64 B | 200,000 | 99 | 2 / 3 | 0 | 0 | 0 | 59 / 70 | 2 / 1 | 0 |
+| safe default † | 64 B | 200,000 | 99 | 50 / 46 | 27–28 / 31 | 5 / 7 | 0 | 9 | 0 | 0 |
+| mapped default † | 64 B | 200,000 | 99 | 2 / 3 | 0 | 0 | 0 | 59 / 70 | 2 / 1 | 0 |
 | safe durable spin | 64 B | 200,000 | 100 | 0 | 0 | 0 | 0 | 1 | 0 | 97 |
 | mapped durable spin | 64 B | 200,000 | 100 | 0 | 0 | 0 | 0 | 1 | 1 | 97 |
 | mapped durable block | 64 B | 200,000 | 99 | 0 | 0 | 0 | 3 | 1 | 1 | 92 / 93 |
@@ -1541,42 +1550,47 @@ a value below 0.01 is shown as `<0.01`):
 | safe block | 1024 B | 200,000 | 1.73–1.88 / 2.12–2.22 | 0.84–0.91 / 0.95–0.97 | 55,100–59,800 / 62,800–64,100 | 0.42–0.47 / 0.51–0.53 | <0.01 |
 | mapped spin | 1024 B | 200,000 | 0 | 0 | <0.01 | 0 | <0.01 |
 | mapped block | 1024 B | 200,000 | 0 | 0 | <0.01 | 0.98 / 0.97 | <0.01 |
-| safe default | 64 B | 200,000 | 6.45–6.60 / 4.15 | 1.01 | 66,200–66,400 / 66,600 | <0.01 | <0.01 |
-| mapped default | 64 B | 200,000 | 0 | 0 | <0.01 | <0.01 | <0.01 |
+| safe default † | 64 B | 200,000 | 6.45–6.60 / 4.15 | 1.01 | 66,200–66,400 / 66,600 | <0.01 | <0.01 |
+| mapped default † | 64 B | 200,000 | 0 | 0 | <0.01 | <0.01 | <0.01 |
 | safe durable spin | 64 B | 200,000 | <0.01 | <0.01 | 104 | 0 | 0.55–0.58 / 0.42–0.43 |
 | mapped durable spin | 64 B | 200,000 | 0 | 0 | <0.01 | 0 | 0.56–0.57 / 0.43 |
 | mapped durable block | 64 B | 200,000 | 0 | 0 | <0.01 | 0.26–0.28 / 0.20 | 0.52–0.55 / 0.41 |
 
 What the profiles show:
 
-- **The safe reader copies 64 KiB for every record it follows live.** At the tail it has one buffer fill per record at
-  20,000 and 200,000 records/s, and 66 KB read per record, whatever the payload: 1.3 GB/s to follow 2 MB/s of 104-byte
-  records. The copy alone is 24–59 % of the reader's samples, except in the spin runs at 20,000 records/s, where polling
-  is most of them (3 %). At 1.5 million records/s the reader has caught up in batches: 0.2 fills and 12–15 KB per
-  record. It also issues a 4-byte `pread` for every poll of an empty slot: 73–107 per record when spinning at 20,000
-  records/s, and three per record when blocking (the poll, the second check after registering as a waiter that the
-  wake-up protocol needs, and the poll after the wake-up).
+- **The safe reader reads up to 64 KiB for each record it follows live.** At 20,000 and 200,000 records/s it has
+  0.84–1.01 buffer fills and reads 55–67 KB per record; spinning at 20,000 records/s that is 1.3 GB/s to follow 2 MB/s
+  of 104-byte records. The copy alone is 24–59 % of the reader's samples, except in the spin runs at 20,000 records/s,
+  where polling is most of them (3 %). At 1.5 million records/s the reader has caught up in batches: 0.2 fills and 12–15
+  KB per record. It also issues a 4-byte `pread` for every poll of an empty slot: 73–107 per record when spinning at
+  20,000 records/s, and three per record when blocking (the poll, the second check after registering as a waiter that
+  the wake-up protocol needs, and the poll after the wake-up).
 - **The zero-copy reader copies nothing** and makes no system call while it spins. Its spin loop is mostly clock reads:
   two `Instant::now` calls per empty poll (the timeout of `next_timeout` and the 100 ms identity check) take 41–63 % of
   the samples on x86-64 and 56–72 % on aarch64. Checking a record (CRC and decode) is 4–15 % at 1.5 million records/s of
-  64 B, and 1–8 % at 1,024 B.
-- **Blocking readers** spend much of their CPU in the futex wait and the wake-up: 19–41 % for the safe reader (none at
-  1.5 million records/s, where it hardly blocks), 43–85 % for the zero-copy reader on x86-64 and nearly all of its
-  samples on aarch64, where it is on a CPU for a few µs per record. At 200,000 records/s the safe reader makes about one
-  futex wait per two records, the zero-copy reader one per record.
-- **Durable-only readers** (64 B, 200,000 records/s, a checkpoint every second) spend 92–97 % of their CPU reading the
-  checkpoint marker: while at the boundary, every poll opens the marker file and reads all 128 KiB of it in 13 `read`
-  calls (0.4–0.6 opens per record appended), with about two heap allocations on x86-64 and eight on aarch64 per poll. A
-  blocking durable-only reader is also woken by appends although only a checkpoint can give it records. Since #66 a
-  refresh reads only the marker's slots, not the whole file; that has not been profiled again, and the open and close
-  remain.
+  64 B, and 0–8 % at 1,024 B.
+- **Blocking readers**: the futex wait and the wake-up are 19–41 % of the samples of the safe reader (none at 1.5
+  million records/s, where it hardly blocks) and 43–85 % of the zero-copy reader's on x86-64. On aarch64 they are 97–100
+  % of the zero-copy reader's samples up to 200,000 records/s and 44 % at 1.5 million; 70–73 % of the samples at 200,000
+  records/s are in `finish_task_switch`, where `cpu-clock` sampling lands when a thread is switched in, so those shares
+  do not measure what that function costs. At 200,000 records/s the safe reader makes about one futex wait per two
+  records, the zero-copy reader one per record.
+- **Durable-only readers** (64 B, 200,000 records/s, a checkpoint every second): 92–97 % of the samples are in reading
+  the checkpoint marker: while at the boundary, every poll opens the marker file and reads all 128 KiB of it in 13
+  `read` calls (0.4–0.6 opens per record appended), with about 16 allocator calls per poll on both machines (two
+  `malloc`, the rest `realloc`: mostly the read buffer growing, and two that build the path). These are counted in a
+  window of their own, in which the probes slowed the reader. A blocking durable-only reader is also woken by appends
+  although only a checkpoint can give it records. Since #66 a refresh reads only the marker's slots, not the whole file;
+  that has not been profiled again, and the open and close remain.
 
-Allocations: none per record on either reader (`tests/allocation.rs` counts them with a counting allocator, in every
-wait mode, and asserts zero). `allocs.bt` on the live runs finds 130–240 allocations in 8 s in the reader thread that make no copies of records: the tool's once-a-second JSON series, the
-re-read of the wake-up record every 100 ms by a blocking reader (`notify::read_record`, 80 in 8 s) and a few per
-segment change. `Record::to_owned` (the `owned` reader option) is one allocation per record: 1.02–1.03 per record
-appended on aarch64. On x86-64 it counted 0.65–0.68, which we take to be the probe slowing the reader, so that it read
-fewer records than were appended in the window.
+Allocations: none per record on either reader. `tests/allocation.rs`, with a counting allocator, asserts zero for
+records already committed, with each wait mode configured, and for a spinning wait, and bounds a reader that blocks for
+every record by the re-read of the wake-up record (every 100 ms). On the live runs `allocs.bt` finds 128–385 allocator
+calls in 8 s in the reader thread (128–252 of them `malloc`): the tool's once-a-second JSON series, the re-read of the
+wake-up record by a blocking reader (`notify::read_record`, about 80 times, two calls each) and a few per segment
+change. `Record::to_owned` (the `owned` reader option) is one allocation per record. On aarch64 it counted 1.02–1.03 per
+record appended, above 1 because the count covers slightly more than 8 s; on x86-64 it counted 0.65–0.68, because in
+that window the reader read only 123,000–131,000 of the 200,000 records/s (its series), so about one per record read.
 
 ### The writer, notification and serialization
 
@@ -1591,8 +1605,8 @@ is most of a paced run. Futex wakes include the helper thread's signals, about o
 | mapped-wait-spin-64-1500000 | 12.1–12.3 / 1.6 | 0.3–0.4 / 0.2 | 0.0 | 2.8 / 12.3–12.4 | 0.1–0.2 / 0.2–0.4 | 0.2 / 0.4 | 0.0 | <0.01 |
 | mapped-wait-block-64-1500000 | 10.7–10.9 / 1.6–1.7 | 0.3 / 0.2–0.3 | 0.0 | 3.4–4.2 / 13.5–14.4 | 33.6–33.8 / 36.6 | 0.3–0.4 / 0.4–0.5 | 0.0 | 0.48–0.50 / 0.41–0.46 |
 | mapped-wait-block-1024-200000 | 5.7 / 2.3–2.4 | 0.4 / 1.4 | 0.0 | 0.9–1.2 / 1.0–1.4 | 11.1–11.2 / 32.2–32.8 | 0.1 / 0.5–0.6 | 0.0 | 1.01 |
-| none-64-200000 | 0.3–0.4 / 0.2 | 0.0 | 0.0 | 0.1 / 1.0 | 0.0 / 0.1 | 0.1 | 0.0 | — |
-| none-1024-200000 | 2.5–3.2 / 2.4 | 0.3–0.4 / 1.4 | 0.0 | 0.1 / 0.3 | 0.4 / 0.5 | 0.1 / 0.6 | 0.0 | — |
+| none-64-200000 † | 0.3–0.4 / 0.2 | 0.0 | 0.0 | 0.1 / 1.0 | 0.0 / 0.1 | 0.1 | 0.0 | — |
+| none-1024-200000 † | 2.5–3.2 / 2.4 | 0.3–0.4 / 1.4 | 0.0 | 0.1 / 0.3 | 0.4 / 0.5 | 0.1 / 0.6 | 0.0 | — |
 | unpaced-prepared-64 | 7.8–8.0 / 4.2–4.6 | 0.6–0.7 / 0.5 | 0.0 | 2.8–2.9 / 28.2 | 0.6–1.0 / 0.8–0.9 | 0.0–2.6 / 0.3 | 3.1–3.3 / 0.4–0.5 | <0.01 |
 | unpaced-buffer-64 | 6.7–7.0 / 4.2–4.3 | 1.6–1.7 / 0.5 | 1.7–1.9 / 1.1–1.2 | 2.6–2.7 / 27.2–27.3 | 0.6 / 0.8–0.9 | 2.7–2.9 / 0.2–0.3 | 2.9–3.1 / 0.5–0.6 | <0.01 |
 | unpaced-in-place-64 | 7.3–7.6 / 4.2–4.3 | 0.4 / 0.1 | 0.8–0.9 / 1.1–1.2 | 2.7–2.9 / 25.5–26.1 | 0.6–0.7 / 0.9 | 2.3–3.3 / 0.2–0.3 | 3.2–3.6 / 0.5–0.6 | <0.01 |
@@ -1606,19 +1620,25 @@ is most of a paced run. Futex wakes include the helper thread's signals, about o
 - **The wake-up's atomic increment.** `publish` is one sequentially consistent increment of the event counter and one
   load per `append` (a `lock incl` on x86-64, the only locked instruction per record in the disassembly of the append
   path: the commit word's release store is a plain store there, and the helpers' mutex is taken once per 64 KiB). It is
-  1–4 % of the samples on x86-64. On aarch64 it is 12–14 % at 1.5 million records/s and 26–28 % unpaced at 64 B. The
-  sampled instruction is the `ldaddal` in the runtime's `__aarch64_ldadd4_acq_rel`, called out of line because the
-  default target selects LSE atomics at run time. Samples at such an instruction also include the time it waits for the
-  thread's earlier stores, so these shares are not the cost of the instruction alone.
+  1–4 % of the writer's samples on x86-64 at 1.5 million records/s and unpaced, and at most 1.4 % at 200,000 records/s
+  and below. On aarch64 it is 11–14 % at 1.5 million records/s, 26–28 % unpaced at 64 B, and at most 2.0 % at 200,000
+  records/s and below. Almost all the aarch64 samples are at one address in the runtime's `__aarch64_ldadd4_acq_rel`
+  (called out of line because the default target selects LSE atomics at run time), which in the ordinary build's layout
+  is just after the `ldaddal`; the profiled binary's own disassembly was not kept. Samples at such an instruction also
+  include the time it waits for the thread's earlier stores, so these shares are not the cost of the instruction alone.
 - **Wake-ups of a blocked reader.** The writer makes one futex wake per record while a reader blocks between records
-  (20,000 records/s). With the zero-copy reader blocking, the wake-ups take 9–11 % of the writer's samples on x86-64 and
-  33 % on aarch64 at 200,000 records/s, and 34 % and 37 % at 1.5 million. A reader that spins costs the writer none of
-  this; `append_batch` publishes one wake-up for a batch (ADR 0041).
+  (20,000 records/s). It makes more wakes than the reader makes waits where the reader blocks often: 0.48–0.50 against
+  0.39–0.42 per record for the zero-copy reader at 1.5 million records/s on x86-64 (0.41–0.46 against 0.35–0.39 on
+  aarch64), and 0.63–0.68 against 0.55–0.57 for the safe reader at 200,000 records/s of 64 B on aarch64. With the
+  zero-copy reader blocking, the wake-ups take 9–11 % of the writer's samples on x86-64 and 33 % on aarch64 at 200,000
+  records/s, and 34 % and 37 % at 1.5 million. A reader that spins costs the writer none of this; `append_batch`
+  publishes one wake-up for a batch (ADR 0041).
 - **System calls on the steady path.** None per record without a blocked reader. `request_checkpoint` once a second, a
   roll about every 1.3 million records of 104 B.
 
-Copies of the payload and allocations (a process allocates once for the CRC's tables, at its first record long enough
-to use them, ADR 0024):
+Copies of the payload and allocations. Allocated once and not per record: the CRC's tables, by a process's first record
+long enough to use them (ADR 0024), and on macOS, once per writer, the mutex and condition variable shared with the
+helper thread:
 
 | Path | Copies of the payload | Allocations per record | System calls per record | Locks and atomics per record |
 |---|---|---|---|---|
@@ -1628,7 +1648,9 @@ to use them, ADR 0024):
 | `append_batch` | 1 per record | 0 | one futex wake per batch at most | the commit word per record; the wake-up once per batch |
 | safe reader | 1 in the kernel (`pread` to the reader's buffer, at the tail 64 KiB for each record) | 0 | 2 or more `pread` at the tail, one per 64 KiB when behind | one acquire fence per poll that finds a record |
 | zero-copy reader | 0 | 0 | 0 | a relaxed load of the commit word and an acquire fence; relaxed loads of the record's words |
-| blocking wait, reader side | as the reader | 0, apart from the wake-up record's re-read every 100 ms | one futex wait per wait, plus 4 at each re-read | increment and compare-and-swap of the waiter count, load of the event counter and of the writer's flag |
+| blocking wait, reader side | as the reader | 0, apart from the wake-up record's re-read every 100 ms (two allocator calls) | one futex wait per wait, plus 4 at each re-read | increment and compare-and-swap of the waiter count, load of the event counter and of the writer's flag |
+| clocks, reader side | – | 0 | 0 (vDSO) | one clock read when `next_timeout` is called with a finite timeout, one per empty poll for that timeout and one for the 100 ms identity check; per block, one in `refresh_if_due` and one in `block_on` with a timeout |
+| identity check, reader side | – | 0 | one `stat` per 100 ms at an empty slot | – |
 | helper signals (prefault, early write-back) | – | 0 | one futex wake per 64 KiB appended, if the helper waits | one mutex lock per 64 KiB |
 
 Where the writer's append time goes in the three ways of making a payload, unobserved release builds, three alternated
@@ -1644,8 +1666,9 @@ runs each (median of each run's append p50 in ns, encoding included, range over 
 | 1,024 B, 200,000/s | aarch64 | 231 (231–232) | 316 (315–317) | 268 (265–268) |
 
 `prepared` does no encoding, so it is a floor, not a competitor; a field-by-field stand-in encoder (`--encode`) is what
-the other two run. At 64 B the copy that `append_with` saves is within the noise; at 1,024 B it is 8 ns on x86-64 and 48
-ns on aarch64.
+the other two run. At 64 B the difference in p50 between `append_with` and encoding into a buffer is −2 to +2 ns and
+changes sign between configurations (the run ranges are 0–7 ns wide). At 1,024 B `append_with` is faster by 8 ns on
+x86-64 (ranges 160–163 against 167–174) and 48 ns on aarch64, net; the copy alone was not isolated.
 
 ### What remains, and whether it can go
 
@@ -1655,7 +1678,7 @@ ns on aarch64.
 |---|---|
 | A `pread` per empty poll, a second one of the slot after registering as a waiter | Necessary: the safe reader does not map files (ADR 0003), and the check after registering is the wake-up protocol's (ADR 0017). The first of the three polls of a blocking reader that blocks at once could be skipped |
 | A 64 KiB `pread` for every record at the tail | Avoidable: a smaller fill there. Tried below, mixed result, not changed |
-| Opening, reading (128 KiB in v1.0.0) and closing the marker file at every poll of a durable-only reader at the boundary | Avoidable: less of it since #66; not opening the file again at every poll would need the descriptor kept and its identity checked (recovery can replace the marker file) |
+| Opening, reading (128 KiB in v1.0.0) and closing the marker file at every poll of a durable-only reader at the boundary | Avoidable: less of it since #66; the descriptor could be kept open (the marker file is only created or written in place; only something outside the library replaces it) |
 | Copying a record out (`Record::to_owned`) | Asked for by the caller |
 | The payload's copy into the reader's buffer | Necessary for the safe reader; the zero-copy reader does without it |
 
@@ -1663,7 +1686,7 @@ ns on aarch64.
 
 | Work | Necessary? |
 |---|---|
-| A clock read per empty poll for the 100 ms identity check, and one for the timeout | Avoidable in part: share one clock read between both. The spin loop burns the core anyway, so the gain is a shorter poll, not less CPU; not measured |
+| A clock read per empty poll for the 100 ms identity check, and one for the timeout of `next_timeout` (which also reads the clock once per call with a finite timeout) | Avoidable in part: share one clock read between both. The spin loop burns the core anyway, so the gain is a shorter poll, not less CPU; not measured |
 | CRC of every record before it is handed out | Necessary: it is what validates a record before any reference to it exists (ADR 0027) |
 | Page faults (0.0008 per record of 104 B, 0.008 of 1,064 B) | Necessary: the first touch of the mapping; the kernel maps around a fault |
 
@@ -1671,10 +1694,10 @@ ns on aarch64.
 
 | Work | Necessary? |
 |---|---|
-| The sequentially consistent increment and load per `append` | Necessary for the wake-up protocol (it orders the commit before the waiter check). On aarch64 it is an outlined call (`-C target-feature=+lse` removes the call, for a build that does not need to run on ARMv8.0); not measured |
-| A futex wake per record while a reader blocks between records | Necessary for a single `append`; avoided by `append_batch` (ADR 0041) |
+| The sequentially consistent increment and load per `append` | The ordering of the commit before the waiter check is necessary while wake-ups are on. The unconditional increment is how ADR 0017 does it; a fence, with the increment only when a reader waits, is untested. `notify(false)` removes both. On aarch64 the increment is an outlined call (`-C target-feature=+lse` removes the call, for a build that does not need to run on ARMv8.0); not measured |
+| Futex wakes while a reader blocks between records | One wake per sleeping reader is necessary for a single `append`; `append_batch` sends one per batch (ADR 0041). Wakes sent while a reader is registered but presumably not asleep, up to about a fifth of them (more wakes than waits, above), are avoidable; not measured |
 | Wake-ups of a blocking durable-only reader by `append` | Avoidable: only a checkpoint (or a roll) can give it records; it needs its own event counter or waiter count, which changes the shared notify region's layout (ADR 0021) |
-| Four system calls and a small allocation every 100 ms per blocked reader (re-read of the `notify` record) | Necessary to follow a restarted writer; bounded by the interval |
+| Four system calls and two small allocator calls every 100 ms per blocked reader (re-read of the `notify` record), and a `stat` per 100 ms at an empty slot (identity check) | Necessary to follow a restarted writer and to notice a replaced segment; bounded by the interval |
 
 **Serialization and append**
 
@@ -1717,16 +1740,19 @@ anything.
 | block, x86-64 | 1,024 B | 200,000 | 4.5 → 3.41 | 10.6 → 9.2 | 31.6 → 22.6 | 1.72 → 1.83 % | 74 → 59 % |
 | block, aarch64 | 1,024 B | 200,000 | 3.95 → 4.57 | 9.15 → 7.47 | 27.5 → 25.3 | 0.55 → 0.94 % | 82 → 56 % |
 
-It reads 16 times fewer bytes per record at the tail (4.1–4.2 KB in a pass of the counts over it at 64 B, 20,000 and
-200,000 records/s) and lowers p50 to 25–87 % of the base, except for the blocking reader at 200,000 records/s on
-aarch64, where it rises to 115–116 %; the CPU of the blocking reader falls at 200,000 records/s (72 → 56 % and 74 → 59 %
-of a core on x86-64, 80 → 56 % and 82 → 56 % on aarch64). The cost: on x86-64 at 1.5 million records/s the tails grow
-(blocking p99 11 → 102 µs and p99.9 53 → 155 µs, spinning p99.9 46 → 65 µs). In the blocking run the reader was caught
-up, and blocked, more often (3,046 → 48,531 voluntary context switches in one run) and the writer made more futex wakes
-(0.002 → 0.011 per record) and more late sends (3.6 → 8.9 %); that fits the larger blocking tail but not the spinning
-one, which is not explained. On aarch64 no tail grew. The replay benchmark (`cargo bench --bench replay`, filter
-`records`, three interleaved variants, 8 rounds, base, a second copy of the base binary, new; median of the rounds, ms
-per pass of 1,000,000 records of 64 B or 100,000 of 1,024 B):
+It reads about 14–18 times fewer bytes per record at the tail (3.5–4.6 KB per record of 64 B at 20,000 and 200,000
+records/s, polls included, one counting pass) and lowers p50 to 25–87 % of the base, except for the blocking reader at
+200,000 records/s on aarch64, where it rises to 115–116 %; the CPU of the blocking reader falls at 200,000 records/s (72
+→ 56 % and 74 → 59 % of a core on x86-64, 80 → 56 % and 82 → 56 % on aarch64). The cost: on x86-64 at 1.5 million
+records/s the tails grow (blocking p99 11 → 102 µs and p99.9 53 → 155 µs, spinning p99.9 46 → 65 µs). On x86-64 at
+200,000 records/s of 64 B the blocking reader also costs about twice the futex wakes (0.51 → 0.98 per record, one counting pass;
+aarch64 falls from 0.63–0.68 to 0.52). At 1.5 million records/s the blocking reader blocked more often (2,700–3,200 →
+47,000–50,000 voluntary context switches a run on x86-64) and the writer made more futex wakes (0.002 → 0.011 per
+record) and more late sends (3.6 → 8.9 %). But aarch64 shows the same rise in blocking (2,400 → 30,000–39,000 switches,
+wakes 0.002 → 0.0075) and no tail growth, and the spinning tail on x86-64 grew too, so the extra wakes alone do not
+explain the tail; it is not explained. The replay benchmark (`cargo bench --bench replay`, filter `records`, three
+interleaved variants, 8 rounds, base, a second copy of the base binary, new; median of the rounds, ms per pass of
+1,000,000 records of 64 B or 100,000 of 1,024 B):
 
 | Machine | Case | Base | Second copy of base | New | New against base, paired by round |
 |---|---|---|---|---|---|
@@ -1741,9 +1767,11 @@ per pass of 1,000,000 records of 64 B or 100,000 of 1,024 B):
 
 On x86-64 the second copy of the base differs from the base by −0.0 to +3.6 % (medians of the rounds; −0.3 to +2.0 %
 paired), so the replay is slightly slower there for both readers, also the zero-copy one, whose code the change does not
-touch, beyond what that floor explains in some cases; on aarch64 nothing differs beyond it. A smaller read is worth
-having only if it can be had without the x86-64 tail and replay cost; a hysteresis (shrink only after several empty
-polls) and a layout that keeps the per-record path's code unchanged are what to try first. Not changed.
+touch, beyond what that floor explains in some cases; on aarch64 nothing differs beyond it. **Next step.** Worth
+pursuing, because the p50 and CPU gains are large and the 64 KiB read is confirmed by count, but not as a fixed 4 KiB
+read. Try hysteresis (shrink only after several empty polls, grow on the first fully consumed buffer) with the code of
+the per-record path unchanged, gated on x86-64 p99 at 1.5 million records/s and on replay (the view of the review of
+this change and of the maintainers' agent). Not changed here.
 
 ## 2026-11-02, v0.3.0 on Linux (AWS) and macOS
 
