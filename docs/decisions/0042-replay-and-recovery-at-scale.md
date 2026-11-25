@@ -79,11 +79,13 @@ Keep option 1 (no contract change). Record the growth table above as the current
 recorded from the run of pull request #33), including a journal larger than the machine's memory, with the page cache
 dropped before each operation: opening a reader did not grow with the journal's size in bytes, and a seek cost at most
 one scan of the segment holding its target, proportional to the segment size the user chooses and paid once when a
-reader starts or seeks. That bound does not justify a new file kind and a new crash-contract case before 1.0.
-`docs/operations.md` (Choosing a segment size → Seek time, Segment count) documents the cost so users can size segments
-for it. The sparse index (option 2), skipping the unwritten part of the newest segment at writer open (option 3) and
-fewer file opens per retention run and writer open (option 4) stay possible later work, each with its own review; none
-of them changes format version 1.
+reader starts or seeks. (Clarified 2026-11-25: the newest segment of those journals was half full, so the recorded
+seeks to the last record, 90–93 ms cold with 128 MiB segments, read about 64 MiB; the largest share of a segment a cold seek crossed was 75 % of
+a 128 MiB segment, 137–142 ms cold. A seek across a full segment was not measured.) That bound does not justify a new
+file kind and a new crash-contract case before 1.0. `docs/operations.md` (Choosing a segment size → Seek time, Segment
+count) documents the cost so users can size segments for it. The sparse index (option 2), skipping the unwritten part
+of the newest segment at writer open (option 3) and fewer file opens per retention run and writer open (option 4) stay
+possible later work, each with its own review; none of them changes format version 1.
 
 **A defect the run found.** The journals with 10,000 and 20,000 segments could not be measured: a writer held one open
 file per segment after its checkpoint marker, so `Writer::open` without a valid marker failed with "Too many open
