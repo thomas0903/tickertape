@@ -43,11 +43,18 @@ The numbers describe specific machines on specific days. They are not guarantees
 tickertape has two readers: the safe one (`Reader::open`, which reads with `pread`) and the zero-copy one
 (`Reader::open_mapped`, which is `unsafe`).
 
-In all these runs Chronicle Queue used its default queue options (plus `SyncMode.SYNC` where a sync every second is
-measured): no page pre-touching (its pretoucher is Enterprise-only since Chronicle Queue 5.24, and the harness did not
-call the open-source `microTouch()`), the default 64 MiB `blockSize`, and a warm-up that left some code paths cold.
-tickertape ran with its default prefaulting on. In its own benchmark on the same machine as the short runs below,
-turning it off raised the zero-copy reader's 64-byte p99.9 from 1.7–2.0 µs to 31–34 µs, close to Chronicle Queue's.
+In all these runs open-source Chronicle Queue 2026.8 used its default queue options (plus `SyncMode.SYNC` where a
+sync every second is measured). It had the default 64 MiB `blockSize` and no page pre-touching: its pretoucher has
+been Enterprise-only since Chronicle Queue 5.24, and the harness did not call the open-source `microTouch()`, which
+touches the next page from the calling thread. The harness ran a JIT warm-up of 100,000 records before the append and
+replay runs only; the latency runs leave their first records out of the percentiles instead.
+
+tickertape ran with its own defaults on Linux: prefaulting (256 KiB ahead) and, in the ten-minute runs, early
+write-back. Both matter. In separate tickertape-only runs on the bare-metal machine (ext4, 100,000 records/s), turning
+prefaulting off raised the zero-copy reader's p99.9 from 1.7–2.0 µs to 31–34 µs at 64 bytes, close to Chronicle
+Queue's 36–37 µs, and gave 97–122 µs at 1,024 bytes, above Chronicle Queue's 48–55 µs. On the cloud VMs a blocking
+checkpoint took 2.8–2.9 ms (median) with early write-back and 745–800 ms without.
+
 The harness is to be corrected ([#56](https://github.com/thomas0903/tickertape/issues/56)) and the comparison rerun
 ([#57](https://github.com/thomas0903/tickertape/issues/57)).
 
@@ -56,21 +63,22 @@ The harness is to be corrected ([#56](https://github.com/thomas0903/tickertape/i
 The machine was bare-metal Linux: an AWS `z1d.metal` (Xeon Platinum 8151), ext4 on local NVMe, every process bound to
 one socket. Each result is the range of two runs. They have not been repeated on bare metal since v0.4.0.
 
-- **Append:** 26.7 million 64-byte records/s, 5.6× Chronicle Queue; 2.2× at 1,024 bytes. This is a short burst in
-  which tickertape's first segment, large enough for the whole run, is preallocated before the timer starts, while
-  Chronicle Queue creates its first cycle file inside the timed part. A run appends 1,000,000 records of 64 bytes or
+- **Append:** 26.7 million 64-byte records/s (5.6× Chronicle Queue in this burst; 2.2× at 1,024 bytes). It is a
+  short burst in which tickertape's first segment, large enough for the whole run, is preallocated before the timer
+  starts, while Chronicle Queue creates its first cycle file inside the timed part. A run appends 1,000,000 records of 64 bytes or
   100,000 of 1,024 bytes into the page cache, which takes tickertape 31–37 ms. The final checkpoint is not timed, and
   the disk does not have to keep up in a run this short.
 - **Replay:** fastest of the tools at 64 bytes (23.1 million records/s with the zero-copy reader). At 1,024 bytes the
   safe reader is close to Chronicle Queue (4.8–5.0 against 5.0–5.3 million records/s), while validating a checksum on
   every record. The record counts are those of the append runs, read from a warm page cache.
-- **Writer-to-reader latency, 100,000 records/s for 11 seconds:**
-  - 64 bytes: the zero-copy reader's p99.9 was 0.5–1.8 µs, the lowest of all tools measured, and the safe reader's
-    was 4.3–6.3 µs. Chronicle Queue's was 36–37 µs and Aeron IPC's 92–133 µs.
-  - 1,024 bytes: the zero-copy reader's p99.9 was 36–76 µs, around Chronicle Queue's 48–55 µs. It is not stable:
-    tickertape's own benchmark program (`tt-latency`), on the same machine and filesystem with the same rate and
-    record size, measured 110–243 µs. Chronicle Queue was not run in that program. The safe reader's p99.9 was
-    7.4–9.2 µs. Aeron's in-memory IPC was lower, at 0.8 µs.
+- **Latency from the scheduled send time to the read, at 100,000 records/s** (runs of about 11 seconds; the first
+  second is not counted):
+  - 64 bytes: the zero-copy reader's p99.9 was 0.5–1.8 µs, the lowest of the tools measured at this rate, and the safe
+    reader's was 4.3–6.3 µs. Chronicle Queue's was 36–37 µs and Aeron IPC's 92–133 µs. At 10,000 records/s Chronicle
+    Queue's was 3–3.9 µs, against 2.1 µs for the zero-copy reader.
+  - 1,024 bytes: the zero-copy reader's p99.9 was 36–76 µs, around Chronicle Queue's 48–55 µs. Separate runs of the
+    same benchmark (`tt-latency`) on the same machine, without the other tools, measured 110–243 µs on ext4 and
+    10–11 µs on xfs. The safe reader's p99.9 was 7.4–9.2 µs. Aeron's in-memory IPC was lower, at 0.8 µs.
 
 ### Ten-minute runs on cloud VMs (after v0.4.0)
 

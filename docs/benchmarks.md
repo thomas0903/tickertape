@@ -15,17 +15,22 @@ The sustained-workload, checkpoint, comparison, reader and scale results and the
 ([below](#2026-11-19-to-2026-11-22-sustained-workloads-on-google-cloud-vms-linux-x86-64-and-aarch64)), after the
 bare-metal sections.
 
-**How Chronicle Queue was configured in every comparison below.** Its queue options were the defaults, except
-`SyncMode.SYNC` in the sustained SD runs (`compare/chronicle/src/main/java/compare/Main.java`):
-- no page pre-touching: the pretoucher has been Enterprise-only since Chronicle Queue 5.24 (the open-source version
-  has only the interface), and the harness did not call the open-source `microTouch()`; tickertape's default
-  prefaulting (256 KiB ahead, from v0.4.0 on Linux) was on;
+**How Chronicle Queue and tickertape were configured in the comparisons below.** Open-source Chronicle Queue (2026.8,
+the version `compare/chronicle/pom.xml` pins) ran with its default queue options, except `SyncMode.SYNC` in the
+sustained SD runs (`compare/chronicle/src/main/java/compare/Main.java`):
+- no page pre-touching: the pretoucher has been Enterprise-only since Chronicle Queue 5.24 (upstream commit
+  `5056836a1`, first tagged `5.24ea0`; the open-source version has only the interface), and the harness did not call
+  the open-source `microTouch()`. That method touches the next 4 KiB page from the calling thread
+  (`MicroToucher.execute()`), so it is a smaller mechanism than a background pretoucher;
 - the default `blockSize` of 64 MiB, where Chronicle's README says that in production a larger one may reduce the
   jitter of creating chunks;
-- a JIT warm-up that did not cover every path (`compare/java/compare/Harness.java`): W1 and W3 warm up with 100,000
-  records; W2 and the sustained runs do not warm up the queue before the first send (W2 and the paced runs leave the
-  first records out of the histogram instead), so the reader first takes the branch that records a latency at the
-  first measured record.
+- a JIT warm-up only before W1 and W3 (100,000 records through the queue, `compare/java/compare/Harness.java`). W2 and
+  the sustained runs do not warm up the queue before the first send. W2 and the paced runs leave the first records out
+  of the histogram instead (the unpaced probe leaves none out), so the reader first takes the branch that records a
+  latency at the first measured record.
+
+tickertape ran with its defaults: on Linux, prefaulting 256 KiB ahead in the v0.4.0 and later comparisons (it was off
+on Linux in v0.3.0, ADR 0023), and early write-back in the sustained runs from the finish round on (ADR 0038).
 
 In W1, tickertape's `Writer::open` preallocates the first segment before the timer starts. That segment is 128 MiB and
 holds the whole run (about 104 MB of records at 64 B and 106 MB at 1,024 B). Chronicle Queue creates its first cycle
@@ -130,7 +135,8 @@ At 1,024 B, Aeron IPC (which persists nothing) has the lowest tails: p99.9 0.8�
 - at 10,000 records/s, tickertape's p99.9 is 16–26 µs (`safe` reader) and 20–21 µs (zero-copy reader), against
   47–48 µs; the plain file's is lower, at 8.2–8.3 µs;
 - at 100,000 records/s, the `safe` reader's is 7.4–9.2 µs against 48–55 µs, but the zero-copy reader's is 36–76 µs,
-  around Chronicle Queue's. In `tt-latency` (below), a different program with the same settings, it was 110–243 µs.
+  around Chronicle Queue's. The comparison runs `tt-latency` for tickertape; in the separate `tt-latency` runs below
+  (the same program and settings, run outside the comparison suite) it was 110–243 µs on ext4 and 10–11 µs on xfs.
 
 Late sends at 1,024 B and 100,000 records/s fell from about 28,000 to about 700 for the zero-copy reader.
 
@@ -155,8 +161,8 @@ What these rows show:
 - **At 1,024 B it cuts p99 from 23–31 µs to 1.2–2.2 µs.** The zero-copy reader's p99.9 at 1,024 B is the exception
   on ext4: 110–243 µs with prefaulting against 97–122 µs without. On xfs prefaulting helps there too. **Open:** why
   it is worse with prefaulting on ext4 has not been explained. With prefaulting on, the two runs differ by more than
-  2× (110 and 243 µs), against 97 and 122 µs with it off, and the comparison above measured 36–76 µs with the same
-  settings.
+  2× (110 and 243 µs), against 97 and 122 µs with it off, and the comparison suite's own `tt-latency` runs above
+  measured 36–76 µs.
 - **With prefaulting off, the zero-copy reader's p99.9 on ext4 is close to Chronicle Queue's only at 64 B**: 31–34 µs
   against 36–37 µs. At 1,024 B it is 97–122 µs against 48–55 µs. (Chronicle Queue's figures are the comparison's above,
   on ext4; it was not run on xfs on this machine.)
