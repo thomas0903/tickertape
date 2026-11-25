@@ -39,7 +39,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 cargo +1.85 check --workspace --all-features --all-targets   # MSRV
 cargo deny check
 cargo test -p tickertape-tests --release -- --ignored        # long tests: 1M records, 250-kill loop, 20 s soak
-cargo +nightly miri test -p tickertape --lib -- format crc map_ro   # Miri: format, CRC, mapped loads
+cargo +nightly miri test -p tickertape --lib -- format crc map_ro latency   # Miri: format, CRC, mapped loads, histogram
 RUSTFLAGS="--cfg loom" cargo test -p tickertape --lib --release protocol_model
 cargo check -p tickertape --all-features --target i686-unknown-linux-gnu   # 32-bit: no read-only mappings
 cargo +nightly miri test -p tickertape-ffi --lib pure_         # Miri on the C ABI's argument handling

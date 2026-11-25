@@ -107,3 +107,7 @@ path = "background_checkpoint.rs"
 [[test]]
 name = "open_segments"
 path = "open_segments.rs"
+
+[[test]]
+name = "record_age"
+path = "record_age.rs"
