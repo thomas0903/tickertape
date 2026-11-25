@@ -691,6 +691,8 @@ fn scale_measures_every_operation_on_a_tiny_journal() {
                 "7",
                 "--repeats",
                 "2",
+                "--count",
+                "1",
                 "--cold",
                 "--json",
             ])
@@ -711,7 +713,7 @@ fn scale_measures_every_operation_on_a_tiny_journal() {
         assert_eq!(measure["journal"]["records"], records);
         assert_eq!(measure["cold_unavailable"], !drop_succeeds);
         let runs = measure["runs"].as_array().unwrap();
-        assert_eq!(runs.len(), 11 * 2);
+        assert_eq!(runs.len(), tickertape_bench::scale::OPS.len() * 2);
         for run in runs {
             assert_eq!(run["cache_dropped"], drop_succeeds, "{run}");
             assert!(run["wall_s"].as_f64().unwrap() >= 0.0, "{run}");
@@ -745,7 +747,8 @@ fn scale_measures_every_operation_on_a_tiny_journal() {
             .unwrap();
         assert!(again.status.success());
         let again: Value = serde_json::from_slice(&again.stdout).unwrap();
-        assert_eq!(again["measure"]["runs"][0]["records"], records + 14);
+        // The kills left 14 records, and the two checkpoint loops appended one in each of their two runs.
+        assert_eq!(again["measure"]["runs"][0]["records"], records + 18);
         for args in [
             vec!["build", "--segments", "1"],
             vec!["measure", "--ops", "wat"],
@@ -760,5 +763,186 @@ fn scale_measures_every_operation_on_a_tiny_journal() {
                 .unwrap();
             assert!(!refused.status.success(), "{args:?}");
         }
+    }
+}
+
+fn tt_scale(args: &[&str]) -> Value {
+    let output = Command::new(env!("CARGO_BIN_EXE_tt-scale"))
+        .args(args)
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+#[test]
+fn scale_measures_both_readers_under_a_low_open_files_limit() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("journal");
+    let result = tt_scale(&[
+        "run",
+        "--dir",
+        dir.to_str().unwrap(),
+        "--segments",
+        "80",
+        "--segment-size",
+        "65536",
+        "--checkpoint-every",
+        "0",
+        "--readers",
+        "safe,mapped",
+        "--count",
+        "3",
+        "--max-open-files",
+        "48",
+        "--sample-open-files",
+    ]);
+    let measure = &result["measure"];
+    assert_eq!(measure["errors"], 0, "{measure}");
+    let runs = measure["runs"].as_array().unwrap();
+    for op in tickertape_bench::scale::READER_OPS {
+        for reader in ["safe", "mapped"] {
+            assert!(
+                runs.iter()
+                    .any(|r| r["op"] == *op && r["reader"] == reader && r["error"].is_null()),
+                "{op} {reader}"
+            );
+        }
+    }
+    for run in runs {
+        assert_eq!(run["open_files_limit"], 48);
+        assert!(run["open_files_most"].as_u64().unwrap() <= 48, "{run}");
+    }
+}
+
+#[test]
+fn scale_archive_then_measure_the_archive() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("journal");
+    let to = root.path().join("archive");
+    let (dir, to) = (dir.to_str().unwrap(), to.to_str().unwrap());
+    tt_scale(&[
+        "build",
+        "--dir",
+        dir,
+        "--segments",
+        "8",
+        "--segment-size",
+        "65536",
+    ]);
+    let archived = tt_scale(&["archive", "--dir", dir, "--to", to]);
+    let end = archived["boundary_seq"].as_u64().unwrap();
+    let result = tt_scale(&[
+        "measure",
+        "--dir",
+        to,
+        "--end",
+        &end.to_string(),
+        "--ops",
+        "seek-first,seek-segment-end,seek-last,replay,verify",
+        "--readers",
+        "safe,mapped",
+    ]);
+    let runs = result["measure"]["runs"].as_array().unwrap();
+    assert_eq!(result["measure"]["errors"], 0, "{result}");
+    for run in runs.iter().filter(|r| r["op"] == "replay") {
+        assert_eq!(run["records"], end);
+    }
+    // Reading on past the archive's last record is an error, reported and not hidden.
+    let output = Command::new(env!("CARGO_BIN_EXE_tt-scale"))
+        .args(["measure", "--dir", to, "--end", &(end + 1).to_string()])
+        .args(["--ops", "replay", "--json"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        result["measure"]["runs"][0]["error"].is_string(),
+        "{result}"
+    );
+}
+
+#[test]
+fn scale_damage_reports_every_probe_of_a_case() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("damage");
+    let result = tt_scale(&[
+        "damage",
+        "--dir",
+        dir.to_str().unwrap(),
+        "--segments",
+        "8",
+        "--segment-size",
+        "65536",
+        "--payload",
+        "256",
+        "--cases",
+        "intact,record-newest-after-marker",
+    ]);
+    let cases = result["cases"].as_array().unwrap();
+    assert_eq!(cases.len(), 2);
+    for case in cases {
+        assert_eq!(case["probes"].as_array().unwrap().len(), 16);
+        for writer in case["writers"].as_array().unwrap() {
+            assert_eq!(writer["gone"], 0, "{writer}");
+        }
+    }
+    let fail = &cases[1]["writers"][1];
+    assert!(
+        fail["outcome"].as_str().unwrap().starts_with("Corrupt"),
+        "{fail}"
+    );
+}
+
+#[test]
+fn scale_catch_up_reads_every_record() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("journal");
+    let dir = dir.to_str().unwrap();
+    tt_scale(&[
+        "build",
+        "--dir",
+        dir,
+        "--segments",
+        "8",
+        "--segment-size",
+        "65536",
+    ]);
+    for (reader, wait) in [("safe", "spin"), ("mapped", "block")] {
+        let result = tt_scale(&[
+            "catch-up",
+            "--dir",
+            dir,
+            "--reader",
+            reader,
+            "--wait",
+            wait,
+            "--rate",
+            "2000",
+            "--backlog",
+            "300",
+            "--warmup",
+            "100ms",
+            "--baseline",
+            "300ms",
+            "--live",
+            "300ms",
+            "--checkpoint-every",
+            "100ms",
+        ]);
+        assert_eq!(result["outcome"], "done", "{result}");
+        let caught_up = result["caught_up"]["records"].as_u64().unwrap();
+        assert!(caught_up >= 300, "{result}");
+        assert_eq!(
+            caught_up + result["live"]["records"].as_u64().unwrap(),
+            300 + result["records_appended"].as_u64().unwrap(),
+            "{result}"
+        );
+        assert!(result["writer"]["live"]["records"].as_u64().unwrap() > 0);
     }
 }
