@@ -207,13 +207,14 @@ bounds(i) = [i, i]                                    // i < 128
   `Snapshot`: it loads every bucket with `Acquire`, then the sum, minimum and maximum. No lock, and the recorder never
   waits. Its count is the sum of its buckets, so its quantiles are consistent with it, but a snapshot taken during
   recording is not a prefix of the samples: the scan can miss sample n and count sample n + 1. The sum (hence the mean)
-  and the extremes can already include a sample that is not counted yet; with a count of 0 everything is reported as
-  absent. The one disturbance: the next update of a cache line that a snapshot read misses the cache once. Snapshots
+  and the extremes can already include samples that are not counted, any number of those recorded during the scan
+  (corrected 2026-11-25, see the amendment); with a count of 0 everything is reported as absent. The one disturbance: the next update of a cache line that a snapshot read misses the cache once. Snapshots
   once a second or slower are the intended use. A `View` outlives its writer. In a forked child it is a frozen copy.
 - **Intervals.** Histograms only grow; there is no reset, which would need the recorder's cooperation or lose samples.
   `later.since(&earlier)` subtracts. The interval's maximum is exact when the overall maximum rose in it, otherwise the
   upper bound of its highest bucket, capped at the overall maximum, so it is never too small (the minimum likewise,
-  never too large). It can be the maximum of a sample that this interval does not count yet.
+  never too large). It can be that of samples recorded during the later snapshot, which this interval does not count
+  (corrected 2026-11-25). The interval's sum and mean can be off either way (amendment).
 
 Rejected: **`hdrhistogram`** (used by the bench tools). `deny.toml` accepts it, and in the prototype it recorded as
 fast as this one. But reading it needs exclusive access, or its `SyncHistogram`, where a refresh waits until every
@@ -512,3 +513,25 @@ gets a second observer in the library (after `status`'s unread age), which still
 in one process cannot be seen from another, and a service-time histogram can look better than what a queue behind it
 experienced; both are stated where the numbers are. Implementation adds the module to the `compatibility.md` surface,
 so its names are then kept for 1.x.
+
+## Amendment (2026-11-25): steps 1 and 2 as built, and a correction
+
+Found in the review of the implementation (PR #70). The decision does not change.
+
+- **Correction: the accuracy of the sum and the mean.** This record said that the sum can include *a* sample that is not
+  counted yet. The sum is loaded after all the buckets, so it can include every sample recorded during the scan into a
+  bucket the scan had passed. A snapshot's mean is then too large; an interval's sum has the excess of its later snapshot
+  and lacks that of its earlier one, so its mean can be off either way and lie outside `[min, max]` (seen in about half of
+  2,000 intervals nearly 50 µs apart, up to 20 % off, with a thread that does nothing but record). The error is a number
+  of samples that does not grow with the count, so it shrinks as the count grows. Quantiles are not affected. The rustdoc
+  says so and a test checks the bound. A tighter snapshot (a retry while the count moves) was not built: it would not end
+  under exactly this load.
+- **`live` in the output of `tickertape age`** (JSON, `"live":bool` after `final`, and text). A startup scan that outlasts
+  `--duration` otherwise reports zero records with exit 0, like an idle journal.
+- **`--duration` runs from the command's start**, and the command reads the clock about every 1,024 records while it does
+  not wait, instead of once per record. Not-live records are counted without a wall-clock read.
+- **The command reads on one thread and writes reports on another**, and skips an interval report while standard output is
+  behind. The final report also precedes exit 1 for an error met while following.
+- **`poll` and `spin` "cost the writer nothing"** claimed more than is known. They make no system call in its appends and
+  never register as a waiter; what a spinning reader costs through shared cache lines is not measured.
+- `sum()` of an interval without samples is zero also after saturation. `Debug` is written by hand.

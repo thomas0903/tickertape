@@ -485,7 +485,9 @@ tickertape age /data/journal --interval 10s --json     # one JSON object every 1
 
 **Exporting.** A `View` (or `RecordAgeView`) can be kept by a monitoring thread while the reading thread records. It
 copies about 30 KB per snapshot and takes no lock; once a second or slower is the intended use. The histograms only grow:
-subtract the previous snapshot for the values of an interval. With the `prometheus` crate, for example:
+subtract the previous snapshot for the values of an interval. Export quantiles and the extremes rather than the mean of a
+short interval: values recorded while a snapshot is taken can be in its sum and not in its count, so the mean of a busy
+recorder's interval can be off either way, even outside the extremes (the longer the interval, the less). With the `prometheus` crate, for example:
 
 ```rust
 use prometheus::{Gauge, IntGauge, register_gauge, register_int_gauge};

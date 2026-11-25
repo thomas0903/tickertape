@@ -185,29 +185,35 @@ Errors and recovery warnings go to stderr. JSON results go to stdout (or the sel
   (from 1.1): follows the journal with the safe reader, starting after the records found in a startup scan (as
   `tail --from-end`), and reports how old its records are when it gets them: this machine's wall clock when the reader
   returned the record, minus the record's `local_ts_ns`, which whoever appended it supplied (ADR
-  [0047](decisions/0047-latency-histograms.md)). It prints no records, and reports are written by another thread than
-  the one that reads, so output speed is not part of the numbers.
+  [0047](decisions/0047-latency-histograms.md)). It prints no records, and reports are formatted and written by another
+  thread than the one that reads, so output speed is not part of the numbers. The snapshot behind a report is taken by
+  the thread that reads, between two records, so that its numbers are from one moment; that pause (copying about 30 KB)
+  is in the ages of records that arrive meanwhile.
   **It measures this command's reader on the CPU it happens to run on, not the application's reader.** It says whether
   the writer, the clock and the machine are healthy; an application measures its own reader with
   `tickertape::latency::RecordAge`. Age is not the writer-to-reader latency unless the writer stamps `local_ts_ns` right
   before it appends; what else it is not, and what the clocks do to it, is in
   [`operations.md`](operations.md#how-old-records-are-when-they-are-read).
   Records count from the first time the reader has nothing more to read ("live"), so the startup scan of a long journal
-  comes first, and takes time. After discarded or removed history it resumes as `tail` does, with the same warnings on
+  comes first, and takes time. A report that is not live and has no records **measured nothing**: the scan outlasted
+  `--duration`, or the reader never caught up with the writer. It is not an idle journal, which is live; the text says
+  `not live yet: nothing measured`, the JSON `"live":false`. The exit code is 0 either way. After discarded or removed history it resumes as `tail` does, with the same warnings on
   standard error, and counts again once it has caught up. Records without a `local_ts_ns`, and records whose
   `local_ts_ns` is later than this machine's clock, are counted apart and have no age.
   `--durable-only` gives the age at which a durable-only reader gets records (it includes the wait for the checkpoint).
   It ends after `--duration` (from the command's start, so it includes the startup scan), or after `--count` records
   returned while live, whichever comes first, with a final report; `--count 0` reports at once. `--interval` prints a
   report each interval before that; an interval report is skipped while earlier ones are still waiting for standard
-  output. With none of the three it reports every 10 s until interrupted. An interrupt ends it without a final report
+  output, so compute rates from differences of `elapsed_s`, not from the nominal interval. The final report is not
+  skipped: output that stalls can hold the command past `--duration`. While it reads without waiting it checks the time
+  about every 1,024 records. With none of the three it reports every 10 s until interrupted. An interrupt ends it without a final report
   (there is no signal handler), so at most one interval is lost. `DUR` is an integer followed by `ms`, `s`, `m` or `h`.
-  **Waiting must not slow the writer it watches.** `--wait` says how it waits for records:
+  **Waiting must not add a system call to the writer it watches.** `--wait` says how it waits for records:
 
   | `--wait` | What it adds to the ages | What it costs the writer |
   |---|---|---|
-  | `poll` (default) | Up to one sleep: 10 µs, doubling to 1 ms while idle (the default back-off), as long as the system makes them | Nothing: it never registers as a waiter |
-  | `spin` | No sleep, so no such floor; keeps one core busy | Nothing: it never registers as a waiter |
+  | `poll` (default) | Up to one sleep: 10 µs, doubling to 1 ms while idle (the default back-off), as long as the system makes them | No system call; never registers as a waiter |
+  | `spin` | No sleep, so no such floor; keeps one core busy | No system call; never registers as a waiter. Not measured: like any reader that keeps up, it reads cache lines the writer is writing |
   | `block` | The wake-up, in the kernel | An append that finds it waiting makes a wake-up system call before it returns, as for any blocking reader (`tail` too) |
 
   Exit codes as `tail`: 0, 1, or 2 on corruption or an unsupported format. An error met while following (or during the
@@ -423,7 +429,7 @@ From 1.1. One object per report and line:
 
 ```text
 {"schema_version":1,"journal":string,"sampled_unix_ns":u64,"elapsed_s":number,"final":bool,
- "durable_only":bool,"wait":"poll"|"spin"|"block",
+ "live":bool,"durable_only":bool,"wait":"poll"|"spin"|"block",
  "records":u64,"first_seq":u64|null,"last_seq":u64|null,
  "before_live":u64,"after_discontinuity":u64,"unset_timestamp":u64,"ahead_of_clock":u64,"discontinuities":u64,
  "age":HIST,"interval_age":HIST|null}
@@ -433,7 +439,8 @@ HIST = {"count":u64,"min_ns":u64|null,"mean_ns":number|null,"p50_ns":u64|null,"p
 ```
 
 `journal` is the canonical absolute path and `sampled_unix_ns` the time of the report. `final` is true on the last
-report and only there. Everything is cumulative since the command started, except `interval_age`: the ages counted since
+report and only there. `live` is whether the reader was live at the report: whether it had caught up, so that records
+it returned counted. With `"live":false` and `records` 0, nothing was measured. Everything is cumulative since the command started, except `interval_age`: the ages counted since
 the previous report that was written; null without an interval. `wait` may gain values.
 
 - `records` counts the records returned while live, and `first_seq`/`last_seq` are theirs (null when there are none). It
