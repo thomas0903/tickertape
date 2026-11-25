@@ -9,7 +9,7 @@
 
 The safe reader (`Reader::open`) fetches 64 KiB per `pread` and takes records from that buffer. On replay that is one
 system call per 64 KiB. A reader that has caught up finds one new record per read, and zeros after it: it copies 64 KiB
-for nearly every record, about 1.3 GB/s to follow 20 MB/s of frames at 200,000 records/s (`docs/benchmarks.md`, the
+for nearly every record, about 1.3 GB/s to follow 2 MB/s of frames at 20,000 records/s (`docs/benchmarks.md`, the
 profiles of 2026-11-25).
 
 The first attempt (branch `core/safe-reader-tail-reads`, not merged) read 4 KiB after any read that reached past the
@@ -41,7 +41,8 @@ reader too, whose code was the same); the change had added code to the function 
 
 A read of the buffer (a *fill*) **follows** if the slot at the cursor was found empty before it and what the reader used
 of the last fill, at least one record, is at most 4 KiB. After 16 fills in a row that follow, the 16th included, a fill
-asks for 4 KiB, as long as each fill follows; the first one that does not asks for 64 KiB, and the count starts over.
+asks for 4 KiB, as long as each fill follows, except one in 128 of them (a *probe*), which asks for 64 KiB; the first
+fill that does not follow asks for 64 KiB, and the count starts over.
 A fill always covers the frame at the cursor and never passes the segment's end, as before.
 
 - **Where nothing changes.** On replay and catch-up no slot is empty before its fill, so no fill follows. A fill
@@ -49,11 +50,19 @@ A fill always covers the frame at the cursor and never passes the segment's end,
   seek, nor one of the same slot again (its record failed validation). A durable-only reader comes to no empty slot. A
   reader that now and then finds its next record at once while it reads whole chunks is at the limit of what it can
   follow, and stays there: a blocking reader at 200,000 records/s, every reader at 1.5 million.
+- **Why the probe.** Without it, small reads can hold themselves in place. Measured on x86-64 without the probe: at
+  200,000 records/s a blocking reader that a pause of the writer had brought to small reads waited for every record,
+  because its reads were now fast, so every fill followed, and it stayed there (the context switches of the reader
+  thread rose by 66–85 %, the waits of the first attempt), while in other runs of the same configuration it never left
+  whole chunks. A probe gives such a reader the time of a whole chunk; it then finds the next record at once and goes back
+  to whole chunks. A reader with real slack still waits after the probe and keeps its small reads; the probe costs it
+  64 KiB in 128 fills, about 500 bytes per fill.
 - **State.** One byte, and no extra work per record or per empty poll: whether the slot was empty is the existing
   `waiting_since` (set at an empty slot, cleared when the cursor moves), and what was used is the cursor less `buf_start`.
   All of it is in the function that fills the buffer. The functions on the record path (`try_next`, `advance`, `next_slot`,
   `read_slot`, `next_timeout`, `at_empty_slot`) compile to the same instructions as before on aarch64 and x86-64.
-- **Cost of growing.** The buffer is zero-filled from 4 KiB to 64 KiB once, at most once in 17 fills.
+- **Cost of growing.** The buffer is zero-filled from 4 KiB to 64 KiB at a probe and when the reads grow back: at most
+  once in 16 fills.
 - **Not observable.** The same records and errors: the size decides only which bytes are in the buffer after the frame at
   the cursor, and bytes there are used only as before (a commit word that is zero there is read again from the file, and a
   frame that does not validate is read again, at 64 KiB). It is how the buffer always behaved at a segment's end.

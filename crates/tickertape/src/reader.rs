@@ -23,6 +23,8 @@ const CHUNK: usize = 64 * 1024;
 const TAIL_CHUNK: usize = 4 * 1024;
 /// How many fills in a row must show that the reader has time to spare before it reads [`TAIL_CHUNK`] ([`Reader::fill_size`]).
 const TAIL_FILLS: u8 = 16;
+/// While the reads are tail reads, one fill in this many reads a whole chunk anyway ([`Reader::fill_size`]).
+const TAIL_PROBE: u8 = 128;
 /// Longest single block on the wake-up region when the writer maintains it (bounded so that a writer that died, or a
 /// missed wake-up, costs at most this much latency; the identity check also runs at least this often).
 const NOTIFY_MAX_WAIT: Duration = Duration::from_millis(100);
@@ -104,8 +106,8 @@ pub struct Reader {
     /// whose frame crosses `bound` ([`Reader::read_crossing`]), while that record is the current one.
     buf: Vec<u8>,
     buf_start: u64,
-    /// How many fills in a row, up to [`TAIL_FILLS`], found the reader following the writer with time to spare
-    /// ([`Reader::fill_size`], ADR 0050). Read and written only by fills of the `pread` buffer, and by a `seek_to_end` that fails.
+    /// How many fills in a row found the reader following the writer with time to spare, counted from 1 up to
+    /// `TAIL_FILLS + TAIL_PROBE - 1` and then from `TAIL_FILLS` again ([`Reader::fill_size`], ADR 0050). Read and written only by fills of the `pread` buffer, and by a `seek_to_end` that fails.
     tail_fills: u8,
     /// The journal's wake-up region, if wake-ups are enabled (ADRs 0017 and 0021).
     waker: Option<crate::notify::Waker>,
@@ -1463,10 +1465,13 @@ impl Reader {
     ///
     /// A fill *follows* if the slot at the cursor was found empty before it (so the reader was waiting for this record)
     /// and what the reader used of the last fill, at least one record, would have fitted in a tail read. After
-    /// [`TAIL_FILLS`] such fills in a row, that one included, the reads are tail reads, for as long as every fill follows.
-    /// The first one that does not is a whole chunk again, and the count starts over: the reader found the next record
-    /// without waiting, or used more than a tail read. So the reader takes tail reads only where it has shown that it
-    /// waits for the writer even when it reads whole chunks, and a fill always reads a whole chunk if it is
+    /// [`TAIL_FILLS`] such fills in a row, that one included, the reads are tail reads, for as long as every fill follows,
+    /// except that one in [`TAIL_PROBE`] of them reads a whole chunk anyway. The first one that does not follow is a whole
+    /// chunk again, and the count starts over: the reader found the next record without waiting, or used more than a tail
+    /// read. So the reader takes tail reads only where it has shown that it waits for the writer even when it reads whole
+    /// chunks, and keeps showing it: a blocking reader that waits for every record only because its tail reads are fast
+    /// would not, after a whole chunk, wait for the next one, and goes back to whole chunks. A fill always reads a whole
+    /// chunk if it is
     ///
     /// - on replay or catch-up, where no slot is empty before its fill;
     /// - the first one after a seek and in a segment, and one of a durable-only reader, which comes to no empty slot
@@ -1477,12 +1482,14 @@ impl Reader {
         // or before the start of the last fill, in the segment before.
         let used = offset.saturating_sub(self.buf_start);
         let follows = self.waiting_since.is_some() && (1..=TAIL_CHUNK as u64).contains(&used);
-        self.tail_fills = if follows {
-            (self.tail_fills + 1).min(TAIL_FILLS)
-        } else {
-            0
+        // The fill counted `probe` reads a whole chunk; the count then goes on as from the first tail read.
+        let probe = TAIL_FILLS + TAIL_PROBE - 1;
+        self.tail_fills = match self.tail_fills {
+            _ if !follows => 0,
+            n if n == probe => TAIL_FILLS,
+            n => n + 1,
         };
-        if self.tail_fills == TAIL_FILLS {
+        if (TAIL_FILLS..probe).contains(&self.tail_fills) {
             TAIL_CHUNK as u64
         } else {
             CHUNK as u64
@@ -1982,8 +1989,8 @@ mod wake_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        CHUNK, Reader, SlotOutcome, TAIL_CHUNK, TAIL_FILLS, VALIDATION_RETRIES, VALIDATION_WINDOW,
-        resize_buf,
+        CHUNK, Reader, SlotOutcome, TAIL_CHUNK, TAIL_FILLS, TAIL_PROBE, VALIDATION_RETRIES,
+        VALIDATION_WINDOW, resize_buf,
     };
     use crate::mmap::MAPPED_READS;
     use crate::{CorruptReason, Error, NewRecord, ReaderConfig, Writer, WriterConfig};
@@ -2239,7 +2246,16 @@ mod tests {
         // The last chunk was used beyond a tail read, so the first fill at the tail does not follow.
         assert_eq!(f.follow(64), CHUNK as u64);
         f.shrink();
-        for _ in 0..100 {
+        // One fill in `TAIL_PROBE` reads a whole chunk (the one after `TAIL_PROBE - 1` tail reads), and the reads stay tail
+        // reads as long as the reader still waits after it.
+        for cycle in 0..3 {
+            // The first cycle's first tail read was the last fill of `shrink`.
+            for _ in u8::from(cycle == 0) + 1..TAIL_PROBE {
+                assert_eq!(f.follow(64), TAIL_CHUNK as u64);
+            }
+            assert_eq!(f.follow(64), CHUNK as u64);
+        }
+        for _ in 0..50 {
             assert_eq!(f.follow(64), TAIL_CHUNK as u64);
         }
         // Several records at once, that a tail read holds.
@@ -2247,7 +2263,8 @@ mod tests {
         f.append(39, 64);
         assert_eq!(f.read(39, 64), [TAIL_CHUNK as u64]);
         assert_eq!(f.follow(64), TAIL_CHUNK as u64);
-        // A record that was there at once: whole chunks again, and the count starts over.
+        // A record that was there at once (after a whole chunk, as when a probe found that the reader no longer waits):
+        // whole chunks again, and the count starts over.
         f.at_once(64);
         f.shrink();
         // A backlog: the tail read is consumed, and the rest is read in whole chunks (the 40th record crosses its end).
