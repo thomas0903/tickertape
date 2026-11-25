@@ -1,17 +1,18 @@
 # 0053: Durable-only readers wake on checkpoints only
 
-- **Status:** proposed
+- **Status:** accepted on 2026-11-26 (by the orchestrating agent on the owner's delegation, after one independent review)
 - **Date:** 2026-11-26
 - **Amends:** [0017](0017-reader-wake-ups.md) and [0021](0021-notify-shared-memory.md) (the wake-up region gets three
-  more words; nothing in it changes meaning). Issue #82.
+  more words; nothing in it changes meaning). Issue #82; built in the pull request that fixes it.
 
 **In short.** A durable-only reader that waits for a checkpoint is woken today by every append, although only a
 checkpoint can give it a record. Since 1.0.0 the reader got faster at checking the marker, so it now sleeps between
 appends, and the writer pays a wake-up system call for almost every record. This record adds a second event count to
 the wake-up region that only checkpoints bump, and a capability word that says which writers bump it. A durable-only
-reader at the checkpoint boundary waits on it if the writer has the capability, and on the old count otherwise. The
-`notify` record, the region's existing words, appends and visible readers do not change, and every pairing of 1.0.0 and
-new processes keeps working.
+reader at the checkpoint boundary waits on it if the writer has the capability; beside a writer without it (1.0.0) it
+sleeps `Backoff::max_sleep` at a time without registering, so that writer's appends make no wake-up call for it either.
+The `notify` record, the region's existing words, appends and visible readers do not change, and every pairing of 1.0.0
+and new processes keeps working, none of them costing the writer more than 1.0.0 with 1.0.0 readers.
 
 ## Context
 
@@ -119,16 +120,20 @@ words. Neither looks at offsets 256 to 4,095.
    check) for three words. Rejected.
 6. **Linux `FUTEX_WAKE_BITSET`, durable-only readers in their own bit.** Linux only (macOS has no equivalent), and the
    futex word is still the event count that every append moves: as option 3. Rejected.
-7. **Let a durable-only reader at the boundary sleep instead of blocking** (`Backoff::max_sleep`, 1 ms by default).
-   Up to a millisecond more before a durable record arrives, and an idle reader waking 1,000 times a second. Rejected.
+7. **Let a durable-only reader at the boundary always sleep instead of blocking** (`Backoff::max_sleep`, 1 ms by
+   default). Up to a millisecond more before a durable record arrives, with any writer, and an idle reader waking 1,000
+   times a second. Rejected as the design; kept as the fallback beside a writer that does not bump the marker words
+   (below), where the alternative is the cost of #82.
 8. **A second event count and waiter count bumped only by checkpoints, and a capability word** (chosen).
 
 ## Decision
 
 ### The region
 
-Three more `u32` words, each on a 64-byte line of its own, and together on a 128-byte line pair apart from the
-existing words (cache lines are 128 bytes on Apple's cores, and adjacent-line prefetch pairs them elsewhere):
+Three more `u32` words, on cache lines apart from the existing words. The marker event and waiter counts mirror the
+event and waiter counts at 0 and 64 on purpose: on CPUs with 64-byte lines each has a line of its own; on Apple's cores,
+whose lines are 128 bytes, the two counts of a pair share one, exactly as the words at 0 and 64 already do. The
+capability word at 384 is read once per block and written once per writer:
 
 | Offset | `u32` word | Written by | Read by |
 |---|---|---|---|
@@ -140,6 +145,19 @@ Everything else stays: the words at 0 to 200 keep their meaning, the rest of the
 created fresh at every open, and the capability word is never cleared (the writer flag says whether anyone still
 maintains either count). The `notify` record does not change at all: same 80 bytes, version 1.
 
+**The capability word is how the region is versioned from now on,** since the region has no version of its own and the
+record's version must stay 1 for 1.0.0 readers:
+
+- Bit 0 is defined here. Bits 1 to 31 are reserved: writers leave them 0, readers ignore them. A later change that a
+  reader must know about sets a new bit, and a reader falls back to what it does without that bit.
+- A reader that sees a bit as 0 must fall back to something that works with every older writer. That is the safe
+  direction: a stale or missing 0 costs time (here, `max_sleep` per poll), never a wake-up, while a reader that assumed
+  a bit the writer does not honour could sleep until the 100 ms cap on every wait. A bit is never cleared while its
+  writer lives, and a region is never reused by another writer (it is created fresh, with a new nonce, at every open),
+  so a set bit cannot outlive the writer that set it.
+- Writers keep bumping the event count at 0 at every checkpoint, for as long as 1.0.0 readers can exist, which is the
+  life of format version 1: a 1.0.0 durable-only reader waits there and nowhere else.
+
 ### Who bumps and who waits
 
 - **Appends and seals** bump the event count at 0, as now. Nothing else; the append path is unchanged.
@@ -147,11 +165,25 @@ maintains either count). The `notify` record does not change at all: same 80 byt
   `marker_waiters.load(SeqCst)`, a wake of all waiters on the marker event word if that is non-zero; then the existing
   bump of the event count at 0 (a 1.0.0 durable-only reader waits there).
 - **When dropped**, the writer stores 0 in the writer flag, then bumps the marker words, then the event count.
-- **A reader** that is about to block chooses the pair before it registers: the marker pair if it is durable-only, its
-  cursor is at the checkpoint boundary it knows (`next_seq >= durable_next_seq`) and the capability bit is set; the
-  event pair otherwise. It registers, loads that pair's event count, and looks once more, as now. If it chose the
-  marker pair and the look moved it off the boundary (a new marker), it returns without waiting and chooses again.
-  The wait caps are unchanged: 100 ms with the writer flag set, `Backoff::max_sleep` without.
+- **A reader** that is about to block chooses before it registers:
+  - durable-only, its cursor at the checkpoint boundary it knows (`next_seq >= durable_next_seq`), capability bit set:
+    the marker pair;
+  - durable-only, at the boundary, capability bit clear (a 1.0.0 writer): it registers nowhere. It looks once more
+    and, if there is still nothing, sleeps `min(Backoff::max_sleep, deadline, next record re-read)`, as it already does
+    when the writer flag is 0. That writer's appends find no waiter and make no wake-up call for it; its records arrive
+    at most about `max_sleep` (1 ms by default) after the checkpoint;
+  - otherwise (a visible reader, or a durable-only one behind its boundary): the event pair, as now.
+
+  It registers, loads that pair's event count, and looks once more, as now. If it chose the marker pair and the look
+  moved it off the boundary (a new marker whose records it could not read yet), it returns without waiting and chooses
+  again: it must not wait on the marker words for a record. The wait caps are unchanged: 100 ms with the writer flag
+  set, `Backoff::max_sleep` without.
+
+  *A refinement considered and rejected:* beside a writer without the capability, wait on the event word with a timeout
+  of `max_sleep` but without registering, so that the reader also wakes for free whenever the writer wakes a visible
+  reader. The futex compares the event word, which every append moves: at high rates the word has changed between the
+  reader's load and its wait nearly every time, the wait returns at once, and the reader polls the marker on a full core
+  (option 3's flaw). A plain sleep is simpler and bounded.
 
 **Orderings.** Each pair is the protocol above, unchanged: the four accesses of one pair are sequentially consistent.
 The marker bytes are written with `pwrite` and made durable before the checkpoint thread's increment, and a reader reads
@@ -164,7 +196,7 @@ increment, so the read sees the marker. The two pairs need no order between them
 |---|---|---|
 | Visible reader blocked between records | event count (0) | Every append can give it a record. Unchanged. |
 | Durable-only reader at the boundary, writer with the capability | marker count (256) | Only a checkpoint moves the marker. |
-| Durable-only reader at the boundary, writer without it (1.0.0) | event count (0) | That writer bumps nothing else. As 1.0.0. |
+| Durable-only reader at the boundary, writer without it (1.0.0) | nothing: sleeps `max_sleep` at a time | That writer bumps nothing else, and registering on the event count would cost it a wake-up call per append (#82). |
 | Durable-only reader inside covered history (a slot it reads again after a failed validation, an empty slot under ADR 0050) | event count (0) | Rare and bounded by those rules' windows; as now. |
 
 No reader needs both: a roll does not move the marker (rolls do not sync, ADR 0038), so a durable-only reader at the
@@ -184,7 +216,9 @@ woken by the appends; 100 ms is the bound that `leave_superseded_segment` docume
 ### Mixed versions
 
 The region is shared by processes of different versions. What each pairing does, checked with a small program built
-once against `v1.0.0` and once against the prototype (`exp/append-marker-wake`), one process per role, on a
+once against `v1.0.0` and once against the prototype (`exp/append-marker-wake`; the row for a 1.0.0 writer with a new
+durable-only reader with the implementation, since the prototype registered on the event count there), one process
+per role, on a
 `c4-standard-16-lssd` (x86-64): "ping" appends one record, checkpoints it and sleeps 23–63 ms, 60 times (a lost wake-up
 would show as a delivery of about 100 ms); "steady" appends 500,000 records of 1,024 B at 100,000/s with a background
 checkpoint every second. Delivery is the record's age when the reader returned it; the ping checkpoints took 0.30–0.65
@@ -193,30 +227,45 @@ ms at p50 and up to 2.9 ms.
 | Writer, reader | What happens | Measured |
 |---|---|---|
 | 1.0.0, 1.0.0 durable-only | As today: the reader waits on the event count. | ping 60/60, p50 0.50 ms, max 2.1 ms; steady: writer p50 0.43 µs, reader 136,249 sleeps |
-| 1.0.0, new durable-only | Capability bit 0, so the event count, as a 1.0.0 reader. **Costs the writer more than a 1.0.0 reader does**: the new reader's marker read is fast (#66), so it sleeps between appends. | ping 60/60, p50 0.82 ms; steady: writer p50 0.98 µs, 435,623 sleeps |
+| 1.0.0, new durable-only | Capability bit 0: the reader registers nowhere and sleeps `max_sleep` (1 ms) at a time. The writer makes no wake-up call for it. | MATRIX_ROW |
 | new, 1.0.0 durable-only | The 1.0.0 reader waits on the event count, which checkpoints still bump. As 1.0.0. | ping 60/60, p50 0.50 ms, max 1.9 ms; steady: writer p50 0.43 µs, 150,244 sleeps |
 | new, new durable-only | The marker count. The appends make no wake call for it. | ping 60/60, p50 0.48 ms, max 2.4 ms; steady: writer p50 0.14 µs, 61 sleeps, 0.13 s of CPU in 5 s |
 | either, a new durable-only reader beside a 1.0.0 visible one | Independent pairs: each is woken by what it needs. The visible reader costs what it costs today. | 60/60 each; steady: writer p50 1.61 µs (1.0.0 writer) and 1.14 µs (new), durable reader 432,406 and 60 sleeps |
 | either, visible readers of either version | Unchanged. | steady: writer p50 1.20–1.21 µs in all four pairings |
-| A region created by 1.0.0, attached by a new reader | Capability word zero: the event count. | as the second row |
+| A region created by 1.0.0, attached by a new reader | Capability word zero: the unregistered sleep. | as the second row |
 | A region created by the new code, attached by 1.0.0 | 1.0.0 ignores offsets 256 to 447 and maps 4,096 bytes as before. | as the third row |
 | Readers of both versions attached while the writer changes from 1.0.0 to new and back | Each new writer creates a new region; readers follow within the 100 ms record re-read; nothing is lost or repeated. | 120 of 120 records for each of four readers (both versions, durable-only and visible), both orders; durable max 2.9 ms |
 | A durable-only reader killed while asleep | A 1.0.0 one leaves the event waiter count raised: a wake call per append (ADR 0017's documented cost). A new one leaves the marker waiter count raised: a wake call per checkpoint. | writer p50 0.28 against 0.14 µs |
 
 The same matrix on a `c4a-standard-8-lssd` (aarch64) gave the same results: every ping and restart run complete, steady
-writer p50 0.59 µs (both 1.0.0), 2.03 µs (1.0.0 writer, new durable-only reader), 0.59 µs (new writer, 1.0.0 reader) and
-0.26 µs (both new, 60 sleeps); a killed 1.0.0 durable-only reader 0.51 µs, a killed new one 0.27 µs.
+writer p50 0.59 µs (both 1.0.0), 0.59 µs (new writer, 1.0.0 reader) and 0.26 µs (both new, 60 sleeps)MATRIX_ARM; a
+killed 1.0.0 durable-only reader 0.51 µs, a killed new one 0.27 µs.
 
-No pairing loses a wake-up or leaves a reader spinning; the worst delivery in every ping run is the checkpoint's own
-time. The cost goes away only when both the writer and the durable-only reader are new: **upgrade the writer first**
-(the second row is the one pairing that is worse than all-1.0.0).
+No pairing loses a wake-up or leaves a reader spinning, and none costs the writer more than 1.0.0 with 1.0.0 readers;
+the worst delivery in every ping run is the checkpoint's own time plus, beside a 1.0.0 writer, up to `max_sleep`.
+Writers and readers can be upgraded in either order (ADR 0043).
 
 **Compatibility (`docs/compatibility.md`, ADR 0043).** No documented behaviour of 1.0.0 changes. The region is not a
 stable surface and not part of format version 1; the `notify` record, which `format.md` does describe, is byte for byte
-the same, so neither `format_version` nor the record's version changes. What does change, and is documented when it is
-built: ADR 0021's region table ("all others zero") gains the three words; `format.md`'s row for `notify` points to this
-record too; `WriterConfig::notify` and the CLI's `age` help, which say that a waiting reader costs a wake call per
-append, add that a durable-only reader waiting for a checkpoint costs one per checkpoint from 1.1.
+the same, so neither `format_version` nor the record's version changes, and `format.md` needs no version, only a
+pointer to this record. Crash contract C14 and `crash-contract.md` → "Readers after a repair" already say that a
+durable-only reader notices a removed or replaced segment "after 100 ms of waiting", which still holds: no change.
+
+**What the implementation changes in the documents:**
+
+- ADRs 0017 and 0021: a status line saying that this record amends them; 0021's region table gains the three words.
+- `docs/format.md`, the row for `notify`: the region's layout is in ADRs 0021 and 0053.
+- Rustdoc of `WriterConfig::notify` (a waiting reader costs a wake-up call per append; a durable-only one at the
+  boundary only per checkpoint) and of `ReaderConfig::durable_only` and `ReaderConfig::notify` (what such a reader waits
+  for, the delivery delay below and how to avoid it, the fallback beside a 1.0.0 writer).
+- `docs/operations.md`: durable-only readers and the choice of a checkpoint interval point to the pinned-writers
+  section and `WriterConfig::helper_cpus` for the delivery delay.
+- The CLI: `tail --durable-only` and `age --wait block` help texts and `docs/cli.md`.
+- The bindings' documentation of `durable_only`: `docs/python.md` (and the Python docstrings), `docs/java-api.md` (and
+  the Javadoc), `docs/c-api.md` and the header comment of `tickertape_reader_options_set_durable_only`,
+  `docs/cpp-api.md`.
+- `CHANGELOG.md`, and `docs/benchmarks.md`'s profile section, whose table lists the wake-ups of a blocking durable-only
+  reader by `append` as avoidable.
 
 ## The prototype's two costs
 
@@ -236,60 +285,80 @@ the pages the writer is about to store into is the likely source; not traced), n
 reader's CPU busy with an idle-priority spinner did not change the maximum either (median 154 µs).
 
 **Records reach the durable-only reader later (first session: about 2 ms on aarch64, 0.4 ms on x86-64). Explained:
-the woken reader waits for its CPU.** On aarch64 (169,206/s) the reader's first look at a new marker comes 373 µs (p50
-of the runs' medians; at most 694 µs) after the checkpoint thread starts its wake-ups, where 1.0.0's polling reader sees
-the marker as soon as it is written (11 µs before that point); reading up to the marker then takes 43.4 against 41.6 ms,
-and the first record of a checkpoint arrives 1.9 ms later (43.65 against 41.75 ms). With the writer's helper threads
-(checkpoint, prefault, write-back) on a CPU of their own (`--helper-cpus 7`), the first look comes after 10 µs (at most
-15 µs) and the first record arrives when it does with 1.0.0 under the same placement (42.09 against 42.06 ms). So the
-delay is not the wake-up: a sleeping reader leaves its CPU idle, the scheduler puts the writer's helper threads there
-(1.0.0's reader never sleeps, so its CPU is never free), and when the checkpoint wakes the reader it waits until that
-thread gives the CPU up, then shares it while it reads the backlog. The VMs' kernel is built with `PREEMPT_LAZY` and a
-1,000 Hz tick, under which a woken thread can wait for the next tick, up to 1 ms, before it preempts another ordinary
-thread; that fits the maxima (an idle-priority spinner on the reader's CPU, which the woken reader should preempt at
-once, gave a first look after 788 µs, at most 1.0 ms), but the preemption mode was not recorded, so this part is
-inferred. On x86-64 (16 vCPUs, more of them idle) the first look comes after 20 µs (at most 93 µs), and the first
-record arrives 0.43 ms later than with 1.0.0 (42.83 against 42.40 ms), of which 0.2 ms is a slower read of the backlog.
-No checkpoint in any run was noticed more than 1.0 ms after its wake-up, so none waited for the 100 ms timeout: no
-wake-up was lost. The delay grows with what there is to read: on aarch64 0.10 ms with a checkpoint every 100 ms and
-0.01 ms every 20 ms, on x86-64 0.13 and 0.05 ms (five runs each).
+the woken reader waits for its CPU.** Measured as latency from "checkpoint complete" (the marker durable, the moment the
+checkpoint thread starts its wake-ups) to "delivered" (the reader returns the record), medians of 10 runs; 1.0.0's
+reader polls the marker, so its clock starts when the marker is written, 11–33 µs before that moment:
 
-**Acceptable, and documented.** A durable-only reader gets records once per checkpoint interval and, on average, half an
-interval after they were appended (522–524 ms here). A delay of 0.4 to 2 ms on a 1-second interval is 0.04–0.2 % of it.
-An application that wants it back keeps the reader's CPU to the reader (the writer's helpers on other CPUs with
-`WriterConfig::helper_cpus`, or the reader's CPU in `isolcpus`; `docs/operations.md` → Pinned writers), or uses a spinning durable-only reader
-(`Backoff::busy_spin`), which never blocks and is not affected by this change.
+| Machine, helper threads | First record of a checkpoint: 1.0.0 / new | Last record (the backlog of 169,000–173,000): 1.0.0 / new |
+|---|---|---|
+| aarch64, any CPU (default) | at once / 373 µs (at most 694 µs) | 41.6 / 43.8 ms |
+| aarch64, a CPU of their own (`--helper-cpus 7`) | at once / 10 µs (at most 15 µs) | 42.1 / 42.1 ms |
+| x86-64, any CPU (default) | at once / 20 µs (at most 93 µs) | 42.4 / 42.8 ms |
+
+So the delay is not the wake-up: a sleeping reader leaves its CPU idle, the scheduler puts the writer's helper threads
+(checkpoint, prefault, write-back) there (1.0.0's reader never sleeps, so its CPU is never free), and when the
+checkpoint wakes the reader it waits until that thread gives the CPU up, then shares it while it reads the backlog. With
+the helpers elsewhere the delay is gone. The VMs' kernel is built with `PREEMPT_LAZY` and a 1,000 Hz tick, under which a
+woken thread can wait for the next tick, up to 1 ms, before it preempts another ordinary thread; that fits the maxima
+(an idle-priority spinner on the reader's CPU, which the woken reader should preempt at once, gave a first look after
+788 µs, at most 1.0 ms), but the preemption mode was not recorded, so this part is inferred. On x86-64, with 16 vCPUs
+and more of them idle, the first look comes after 20 µs, and the 0.4 ms on the last record is mostly a slower read of
+the backlog (41.9 against 41.7 ms); that a CPU coming out of idle runs slowly at first is plausible but not measured,
+so this part is inferred too. No checkpoint in any run was noticed more than 1.0 ms after its wake-up, so none waited
+for the 100 ms timeout: no wake-up was lost. The delay shrinks with the backlog: on the last record, 0.10 ms with a
+checkpoint every 100 ms and 0.01 ms every 20 ms on aarch64, 0.13 and 0.05 ms on x86-64 (five runs each).
+
+**Accepted, and documented.** The delay adds directly to the acknowledgement latency of a consumer that acts on durable
+records (fills, risk, replication): up to about 0.4 ms (x86-64) and 2 ms (aarch64) on the last record of a 1-second
+checkpoint's backlog with the default helper placement, less with a shorter interval, and nothing measurable with the
+writer's helper threads on CPUs other than the reader's (`WriterConfig::helper_cpus`, or the reader's CPU in
+`isolcpus`; `docs/operations.md` → Pinned writers), which is the set-up a latency-sensitive deployment uses anyway. A
+spinning durable-only reader (`Backoff::busy_spin`) is not affected by this change either, but it pays for that with a
+full core spent reading the marker in a loop (two `pread` calls and an `open` per poll), so it is a last resort, not
+a recommendation.
 
 ## Test plan
 
-- **Model.** A `loom` model of both event counts (`notify_model.rs` on the prototype branch; futexes modelled with a
-  mutex and condition variable, so a lost wake-up is a deadlock that loom reports): a checkpoint wakes a durable-only
-  reader on the marker words while an append races and never sees it as a waiter; a checkpoint wakes a 1.0.0 reader on
-  the event count; a visible and a durable-only reader waiting at once each get their wake-up. Two variants must fail:
-  without the single order of the `SeqCst` accesses, and a reader on the marker words of a writer that does not bump
-  them (the case the capability bit prevents). All five pass on the prototype.
+- **Model.** `notify_model.rs`, a `loom` model of both event counts with the reader's choice itself (futexes modelled
+  with a mutex and condition variable, so a lost wake-up is a deadlock that loom reports; timed sleeps as yields). It
+  checks: a checkpoint wakes a durable-only reader on the marker words, and the appends racing with it never find it
+  registered on theirs; a stale choice (the marker words chosen from an old boundary while the marker has moved, the
+  look seeing the new marker before its records) chooses again instead of waiting; a reader behind its boundary (a
+  marker set back) that reaches it during its look and waits on the event count is still woken; a writer that goes
+  away wakes a reader on the marker words; beside a writer without the capability the reader never registers and still
+  gets its record; a visible and a durable-only reader waiting at once each get their wake-up. Two variants must fail:
+  without the single order of the `SeqCst` accesses, and a reader that ignores the capability bit beside a writer that
+  does not bump the marker words. Each test also checks that some interleaving reached the path it is about.
 - **Unit and process tests.** The existing notify tests (ping-pong, deadlines, a reader started before the writer,
-  truncated record) for both pairs; a test that the event waiter count stays 0 while a durable-only reader waits at the
-  boundary under appends; a test that a region with the capability word 0 makes the reader use the event count; the
-  drop wakes a reader on either pair.
-- **Mixed versions.** The matrix above, as a script in `tests/compat/` that builds `v1.0.0` from the tag next to the
-  current tree (as `generate.sh --check-old-readers` does) and runs the ping and restart cases with every pairing; ping
-  deliveries must stay under 50 ms (a lost wake-up shows as about 100 ms). Linux and macOS.
+  truncated record) unchanged; a durable-only reader blocking at the boundary under appends registers only on the
+  marker words, and the checkpoint wakes it within the 100 ms cap's margin; with the capability word 0 it registers
+  nowhere and still gets the record soon after the checkpoint.
+- **Mixed versions.** `tests/compat/v1.0.0-wake-ups.sh`, weekly in the soak workflow on Linux and macOS: builds a
+  helper from the `v1.0.0` tag and from the tree, runs every pairing of writer and reader versions, durable-only and
+  visible, one record per checkpoint, and readers of both versions while the writer changes version both ways. It fails
+  on a missed or repeated record or on more than two deliveries of 50 ms or more (a lost wake-up costs the 100 ms
+  cap), and on Linux if a new durable-only reader beside a new writer wakes per record.
 - **Acceptance measurement.** The table at the top again with the implementation, on the same shapes, 10 interleaved
-  rounds against 1.0.0 and a copy of it: append p50 / p99 / p99.9 / maximum at both rates and both architectures with
-  the durable-only reader blocking; the same load without it, which must be unchanged; `tt-latency` at the README's
-  workloads, unchanged; the durable-only reader's CPU and voluntary context switches; and the delivery delay of durable
-  records against 1.0.0.
+  rounds against 1.0.0, a copy of it and current `main`: append p50 / p99 / p99.9 / maximum at both rates and both
+  architectures with the durable-only reader blocking; the same load without it; the mixed pairings; the durable-only
+  reader's CPU and voluntary context switches; and the delivery latency above, with and without `helper_cpus`. Pass
+  rules: p50 and p99 with the durable-only reader no worse than 1.0.0 by more than the gap between the two 1.0.0
+  copies; without it, every percentile within that gap; a 1.0.0 writer with a new durable-only reader no worse for the
+  writer than with a 1.0.0 one. **The maximum**: on each of two separate VMs per architecture, the number of runs (of
+  10) with an append maximum of 200 µs or more is no larger for the implementation than for 1.0.0 plus the difference
+  between the two 1.0.0 copies.
 
 ## Consequences
 
-- Appends do not wake durable-only readers once writer and reader are both from a release with this change; the
-  prototype's appends at 169,206/s on aarch64 cost 0.31 µs at p50 with the durable-only reader blocking, against 0.54
-  µs with 1.0.0, and the reader uses 4 % of a core instead of 99 %.
-- Durable records arrive 0.4–2 ms later on a 1-second checkpoint interval when the reader's CPU is shared with other
-  threads (above); documented with `ReaderConfig::durable_only` and the operations guide.
-- A new durable-only reader with a 1.0.0 writer costs that writer more than a 1.0.0 reader did; the upgrade note says to
-  upgrade the writer first.
+- Appends do not wake durable-only readers once the writer has this change, whichever version the reader is from
+  (a 1.0.0 durable-only reader still costs what it costs today); the prototype's appends at 169,206/s on aarch64 cost
+  0.31 µs at p50 with the durable-only reader blocking, against 0.54 µs with 1.0.0, and the reader uses 4 % of a core
+  instead of 99 %.
+- Beside a 1.0.0 writer a new durable-only reader polls the marker once per `max_sleep` (1 ms by default) at the
+  boundary: up to that much later delivery, and about 1,000 marker reads a second while it waits, instead of the
+  writer paying for every append.
+- The last record of a checkpoint reaches a durable-only reader up to 0.4–2 ms later when the reader's CPU is shared
+  with the writer's helper threads (above); documented with `ReaderConfig::durable_only` and the operations guide.
 - `mmap.rs` changes (new words, a second wait target): it needs the cross-provider review its `unsafe` code requires.
 - Wake calls for a durable-only reader that is registered but not yet asleep go with the rest: it registers on the
   marker words, which only a checkpoint looks at. Not addressed: the same calls for visible readers (`docs/benchmarks.md` → profiles,
