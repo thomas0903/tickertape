@@ -57,6 +57,9 @@ pub enum Point {
     /// Mapping the spare next segment on its background thread, after its blocks are allocated (arm with
     /// [`fail_next_background`], or stop it there with [`hold_background`]).
     SpareMap,
+    /// Panics the thread that prepares the spare next segment, after its blocks are allocated (arm with
+    /// [`fail_next_background`]; the error is not used).
+    SparePanic,
     /// Writing the spare's header when the writer publishes it at roll (arm with [`fail_next`]).
     SpareHeader,
     /// Recovery repairing a corrupt tail, after the tail was preserved in `quarantine/` and the repaired copy written,

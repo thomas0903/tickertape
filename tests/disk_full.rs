@@ -349,6 +349,82 @@ fn a_roll_does_not_fail_because_the_spare_took_the_last_space() {
     );
 }
 
+/// ADR 0049, on a real small filesystem (Linux, tmpfs): the spare and the roll preallocate at the same time, and the
+/// volume has room for about one and a half more. Both can run out of space; the roll then tries again.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "needs passwordless sudo (Linux); run with -- --ignored"]
+fn a_roll_racing_the_spare_for_the_last_space_does_not_fail() {
+    use tickertape::fault::{self, Point};
+    let payload = vec![7u8; 1 << 20];
+    let record = tickertape::NewRecord {
+        schema_id: 1,
+        venue_ts_ns: 0,
+        local_ts_ns: 0,
+        payload: &payload,
+    };
+    for round in 0..10 {
+        let Some(vol) = SmallVolume::create(170) else {
+            eprintln!("skipped, no small filesystem available");
+            return;
+        };
+        let config = tickertape::WriterConfig::default()
+            .segment_size(64 << 20)
+            .spare_segment(true);
+        let mut w = tickertape::Writer::open(vol.path.join("journal"), config).unwrap();
+        let hold = fault::hold_background(Point::SparePreallocate);
+        for _ in 0..63 {
+            w.append(&record).unwrap();
+        }
+        assert!(hold.wait_reached(std::time::Duration::from_secs(10)));
+        hold.release();
+        w.append(&record)
+            .unwrap_or_else(|e| panic!("round {round}: {e}"));
+    }
+}
+
+/// ADR 0049, on a real small filesystem (Linux): the spare holds the last free segment, and the preparation then fails
+/// and gives it back. The roll, which found no space meanwhile, tries again: no append fails.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "needs passwordless sudo (Linux); run with -- --ignored"]
+fn a_roll_does_not_fail_when_the_spare_gives_the_last_space_back() {
+    use tickertape::fault::{self, Point};
+    let Some(vol) = SmallVolume::create(3) else {
+        eprintln!("skipped, no small filesystem available");
+        return;
+    };
+    let config = tickertape::WriterConfig::default()
+        .segment_size(1 << 20)
+        .spare_segment(true);
+    let mut w = tickertape::Writer::open(vol.path.join("journal"), config).unwrap();
+    fault::fail_next_background(Point::SpareMap, 12 /* ENOMEM */);
+    let hold = fault::hold_background(Point::SpareMap);
+    let record = tickertape::NewRecord {
+        schema_id: 1,
+        venue_ts_ns: 0,
+        local_ts_ns: 0,
+        payload: &[7; 4096],
+    };
+    for _ in 0..200 {
+        w.append(&record).unwrap(); // past half of the first of 1 MiB
+    }
+    assert!(hold.wait_reached(std::time::Duration::from_secs(10)));
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        hold.release();
+    });
+    for n in 0..100 {
+        w.append(&record)
+            .unwrap_or_else(|e| panic!("append {n}: {e}"));
+    }
+    releaser.join().unwrap();
+    assert!(
+        w.metrics().head.segment_base_seq > 0,
+        "the writer has rolled"
+    );
+}
+
 /// Crash-contract C10 on a prepared segment (ADR 0022; on Linux ADR 0049): the writer prepares the next segment in the
 /// background, the volume then fills up, and the writer rolls into the prepared segment and keeps writing. A sparse
 /// spare would fail here like an unpreallocated segment. Runs the writer in a child process, as above.

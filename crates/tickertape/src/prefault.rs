@@ -210,11 +210,21 @@ pub(crate) struct Spare {
 #[derive(Debug)]
 pub(crate) struct Spares {
     dir: PathBuf,
-    /// Whether a spare has been requested that [`Spares::take`] has not returned or given up on.
+    /// Whether a spare has been requested since the last roll that succeeded, or cannot be asked for any more.
     requested: bool,
     source: Source,
     /// The process that started the threads: in a forked child they do not exist, so they are not joined there.
     pid: u32,
+}
+
+/// What came of waiting for a spare ([`Spares::wait`]).
+#[derive(Debug)]
+pub(crate) enum Waited {
+    Ready(Spare),
+    /// A file that a panicked spare thread had left was removed.
+    Freed,
+    /// There was no spare, or preparing it failed.
+    Nothing,
 }
 
 #[derive(Debug)]
@@ -325,38 +335,66 @@ impl Spares {
         }
     }
 
-    /// The prepared spare, if there is one, and afterwards none is requested. On Linux a spare that is still being
-    /// prepared is not waited for: the result is `None` and it stays requested, for the next roll.
+    /// The prepared spare, if there is one. On macOS one still being prepared is waited for; on Linux not, and it is the
+    /// next roll's. The request stays until [`Spares::rolled`], so a roll that fails asks for no further spare.
     pub(crate) fn take(&mut self) -> Option<Spare> {
         match &mut self.source {
             Source::PerRequest { preparing, .. } => {
-                self.requested = false;
                 // A preparation that failed removed its own file; one that panicked left it to the next preparation.
                 preparing.take()?.join().ok()?.ok()
             }
-            Source::Thread { shared, .. } => {
-                let mut state = lock_spares(shared);
-                let spare = state.ready.take();
-                // Stays requested for good once the thread has ended by a panic: no further spare will come.
-                self.requested = state.pending || (state.ended && spare.is_none());
-                spare
-            }
+            Source::Thread { shared, .. } => lock_spares(shared).ready.take(),
         }
     }
 
-    /// Waits for a spare that is being prepared, and returns it, or `None` if there is none or preparing it failed. For
-    /// a roll that could not create its segment for lack of space: the spare may have taken it (ADR 0049). On macOS
-    /// [`Spares::take`] has waited already.
-    pub(crate) fn wait(&mut self) -> Option<Spare> {
+    /// The roll has published a segment: the new active one may ask for a spare, unless one is still being prepared or
+    /// the thread has ended by a panic and no further spare will come.
+    pub(crate) fn rolled(&mut self) {
+        self.requested = match &self.source {
+            Source::PerRequest { .. } => false,
+            Source::Thread { shared, .. } => {
+                let state = lock_spares(shared);
+                state.pending || state.ended || state.ready.is_some()
+            }
+        };
+    }
+
+    /// Whether a spare is being prepared now and has blocks of its own, or will have them. Never on macOS after
+    /// [`Spares::take`], which has waited for it.
+    pub(crate) fn preparing(&self) -> bool {
+        match &self.source {
+            Source::PerRequest { .. } => false,
+            Source::Thread { shared, .. } => lock_spares(shared).pending,
+        }
+    }
+
+    /// Waits for a spare that is being prepared, and returns what came of it: for a roll that could not create its
+    /// segment for lack of space, which the spare may have taken (ADR 0049). There is no time limit: it lasts as
+    /// long as the filesystem's `fallocate`. On macOS [`Spares::take`] has waited already.
+    pub(crate) fn wait(&mut self) -> Waited {
         match &mut self.source {
-            Source::PerRequest { .. } => None,
+            Source::PerRequest { .. } => Waited::Nothing,
             Source::Thread { shared, .. } => {
                 let mut state = lock_spares(shared);
                 while state.pending {
                     state = shared.done.wait(state).unwrap_or_else(|e| e.into_inner());
                 }
-                self.requested = false;
-                state.ready.take()
+                let spare = state.ready.take();
+                let ended = state.ended;
+                drop(state);
+                match spare {
+                    Some(spare) => Waited::Ready(spare),
+                    // A thread that panicked leaves its file, and the blocks it took: they are freed here.
+                    None if ended => {
+                        let removed = fs::remove_file(self.dir.join(crate::journal::SPARE_FILE));
+                        if removed.is_ok() {
+                            Waited::Freed
+                        } else {
+                            Waited::Nothing
+                        }
+                    }
+                    None => Waited::Nothing,
+                }
             }
         }
     }
@@ -390,6 +428,7 @@ impl Drop for Spares {
             }
             return;
         }
+        let mut panicked = false;
         let spare = match &mut self.source {
             Source::PerRequest { preparing, .. } => preparing
                 .take()
@@ -397,13 +436,12 @@ impl Drop for Spares {
             Source::Thread { shared, thread } => {
                 lock_spares(shared).stop = true;
                 shared.wake.notify_one();
-                if let Some(thread) = thread.take() {
-                    let _ = thread.join();
-                }
+                // A thread that panicked leaves its file, as a spare that is not used does.
+                panicked = thread.take().is_some_and(|thread| thread.join().is_err());
                 lock_spares(shared).ready.take()
             }
         };
-        if spare.is_some() {
+        if spare.is_some() || panicked {
             let _ = fs::remove_file(self.dir.join(crate::journal::SPARE_FILE));
         }
     }
@@ -467,6 +505,9 @@ fn make_spare(dir: &Path, size: u64) -> io::Result<Spare> {
             mmap::sync_data(&file)?;
         }
         crate::fault::hold_point(crate::fault::Point::SpareMap);
+        if crate::fault::inject_background(crate::fault::Point::SparePanic).is_err() {
+            panic!("injected panic of the spare thread");
+        }
         crate::fault::inject_background(crate::fault::Point::SpareMap)?;
         let map = MapRw::new(&file, len)?;
         let _ = map.advice().prefault(0, WINDOW);
@@ -528,12 +569,11 @@ mod tests {
             pid: std::process::id(),
         };
         spares.request();
-        assert!(spares.wait().is_none());
-        spares.request(); // the next segment's request: no thread serves it
-        assert!(spares.wait().is_none());
-        spares.request();
-        assert!(spares.take().is_none());
+        assert!(matches!(spares.wait(), Waited::Nothing));
+        spares.rolled();
         assert!(spares.requested(), "asked for a spare again and again");
+        assert!(spares.take().is_none());
+        assert!(!spares.preparing());
     }
 
     /// Whether the platform supports the prefault advice: Linux before 5.14 rejects `MADV_POPULATE_WRITE` with

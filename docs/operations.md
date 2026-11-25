@@ -43,19 +43,21 @@ With `WriterConfig::prefault(true)` (the default), the writer moves segment work
   - **macOS:** the next 8 MiB, with `MADV_WILLNEED` (ADR 0020). On APFS, writing into a preallocated segment otherwise
     faults once per 16 KiB page, slowly.
 - **The next segment** (`WriterConfig::spare_segment`; on by default on macOS, **off on Linux**, from 1.1). Once the
-  active segment is half full, a thread, `tickertape-spare`, creates and preallocates `next-segment.tmp` (ADRs 0022 and
-  0049), and the roll then only writes the header and links the file into place. Off, a roll creates its file itself.
-  - **What it costs:** one more segment's worth of disk space from the time the active segment is half full
-    ("Disk space" below), one more file descriptor and one more segment mapping. Dropping the `Writer` waits for a
-    spare being prepared.
+  active segment is half full, a thread, `tickertape-spare`, creates and preallocates `next-segment.tmp` (ADRs 0022
+  and 0049), and the roll then only writes the header and links the file into place. Off, a roll creates its file
+  itself.
+  - **What it costs:** one more segment's worth of disk space from the time the active segment is half full ("Disk
+    space" below), one more file descriptor and one more segment mapping. Dropping the `Writer` waits for a spare
+    being prepared.
   - **Linux:** one thread for the writer's life. The spare is not synced; the checkpoint that first covers the segment
     syncs it, as it does a segment a roll creates itself (ADR 0038). A roll that finds its spare not ready creates the
     segment itself, without waiting, and the spare is used by the next roll; only if that fails for lack of space does
-    it wait for the spare and use it. Away from the disk's limit it made rolls cheaper in the recorded runs; near
-    the limit it made them stall more often, and unpaced the mapped reader's p99.9 was worse with an earlier build of it
-    (`docs/benchmarks.md` → "2026-11-25, roll and journal stalls"). Measure on your machine before turning it on.
-  - **macOS:** a thread is started for each spare; it also syncs the file (preallocating and syncing a whole segment on
-    APFS takes about 50 ms), and a roll waits for a spare that is still being prepared.
+    it wait for the spare (with no time limit, as long as the preallocation takes) and use it, or try once more. Away
+    from the disk's limit it made rolls cheaper in the recorded runs; near the limit it made them stall more often,
+    and unpaced the mapped reader's p99.9 was worse with an earlier build of it (`docs/benchmarks.md` → "2026-11-25,
+    roll and journal stalls"). Measure on your machine before turning it on.
+  - **macOS:** a thread is started for each spare; it also syncs the file (preallocating and syncing a whole segment
+    on APFS takes about 50 ms), and a roll waits for a spare that is still being prepared.
 - **Early write-back (Linux).** A helper thread, `tickertape-writeback`, asks the kernel to start writing back the
   pages behind the write position (`sync_file_range(SYNC_FILE_RANGE_WRITE)`, every 1 MiB, and the rest of a segment
   when the writer rolls past it), so that a checkpoint, blocking or background, finds little dirty data left

@@ -94,10 +94,11 @@ pub struct WriterConfig {
     /// - **macOS:** a thread is started for each spare and syncs it, and a roll waits for one still being prepared.
     /// - **Linux:** one thread lives as long as the writer, started in [`Writer::open`](crate::Writer::open), and does
     ///   not sync the spare: the checkpoint that first covers the segment syncs it, as it does a segment a roll creates
-    ///   (ADR 0038). A roll that finds the spare not ready creates the segment itself, without waiting, and the spare is
-    ///   the next roll's; only if creating it then fails for lack of space (or over a quota) does the roll wait for the
-    ///   spare, which may have taken that space, and use it. Dropping the writer waits for a spare being prepared
-    ///   (a `fallocate` that the filesystem may hold up). If the thread panics, that writer prepares no more spares.
+    ///   (ADR 0038). A roll that finds the spare not ready creates the segment itself, without waiting, and the spare
+    ///   is the next roll's; only if creating it then fails for lack of space (or over a quota) does the roll wait for
+    ///   the spare, which may have taken that space, and use it, or, if the spare came to nothing, try once more. That
+    ///   wait has no time limit: it lasts as long as a `fallocate` that the filesystem holds up. Dropping the writer
+    ///   waits for a spare being prepared in the same way. If the thread panics, that writer prepares no more spares.
     ///   Whether it helps depends on the load and the disk: measure before turning it on (ADR 0049 and
     ///   `docs/benchmarks.md` say what is and is not known, including cases where it was worse).
     pub spare_segment: bool,
@@ -171,10 +172,11 @@ impl WriterConfig {
 /// Where the writer's helper threads run ([`WriterConfig::helper_cpus`]).
 ///
 /// A new thread starts with the CPU affinity of the thread that creates it. The writer creates its helpers from the
-/// calling thread: the prefault and write-back helpers in [`Writer::open`](crate::Writer::open), the checkpoint thread
-/// at the first [`Writer::request_checkpoint`](crate::Writer::request_checkpoint), the spare-segment thread
-/// ([`WriterConfig::spare_segment`]) in `Writer::open` on Linux and during an append on macOS. An application that pins its writer thread to one CPU would otherwise get every helper on that CPU, where
-/// it competes with the writer: a checkpoint's sync calls and their CPU time then delay appends.
+/// calling thread: the prefault and write-back helpers in [`Writer::open`](crate::Writer::open), the checkpoint
+/// thread at the first [`Writer::request_checkpoint`](crate::Writer::request_checkpoint), the spare-segment thread
+/// ([`WriterConfig::spare_segment`]) in `Writer::open` on Linux and during an append on macOS. An application that
+/// pins its writer thread to one CPU would otherwise get every helper on that CPU, where it competes with the writer:
+/// a checkpoint's sync calls and their CPU time then delay appends.
 ///
 /// **Linux:** each helper sets its own affinity when it starts (`sched_setaffinity`). The kernel always intersects
 /// the mask with the CPUs the process's cpuset (cgroup) allows. **macOS:** no effect; the platform has no call to

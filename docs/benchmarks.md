@@ -1471,14 +1471,16 @@ spare segment with one thread for the writer's life, always on (later commits on
 the storage-full fallback and tests; the code the measured runs took is otherwise the same). Builds: the "before" VMs
 checked out `85726e34` from the repository; the "after" binaries were built from a `git archive` of `03334481` sent
 over SSH. The runs record the sha256 of the line that names the archive (`3d123edb…`, in `binaries-v.txt`); `git
-archive --format=tar.gz 03334481` reproduces exactly that line (archive sha256 `2b49c851…`), and the `tt-sustained`
-binaries of the two later scripts have the same hash, so the identity is verified, not only asserted. Two builds
-preceded that are **not** the after build and are kept for that reason: the directories named `INVALIDmainB` (a stale
-Cargo cache gave the binary of `main`; rerun), and the runs of the 18 visibility-only cells per machine (`m7-vis-*`,
-`q2-vis-*`) stopped at once with "retention runs only after checkpoints" because the script passed `--retain-bytes`
-without checkpoints (`main` and the kept build were rerun as `v-vis-*`; the thread-per-spare build was not).
-Experiments used the branch `exp/roll-60` (`b22c8fe9`, `v1.0.0` with switches, never merged), the scripts are in its
-`exp60/` directory.
+archive --format=tar.gz 03334481` reproduces exactly that line (archive sha256 `2b49c851…`): the source archive's
+identity is verified; that the measured binary was built from it is not. What is recorded is that its `tt-sustained`
+hash differs from `main`'s on the same VM (aarch64 `d52317c4…` against `f230c344…`, x86-64 `c348e7c5…` against
+`83a87b49…`), that both later scripts recorded the same hash for it, and that its traced rolls do not create or
+preallocate a file on the writer. Two builds preceded that are **not** the after build and are kept for that reason:
+the directories named `INVALIDmainB` (a stale Cargo cache gave the binary of `main`; rerun), and the runs of the 18
+visibility-only cells per machine (`m7-vis-*`, `q2-vis-*`) stopped at once with "retention runs only after
+checkpoints" because the script passed `--retain-bytes` without checkpoints (`main` and the kept build were rerun as
+`v-vis-*`; the thread-per-spare build was not). Experiments used the branch `exp/roll-60` (`b22c8fe9`, `v1.0.0` with
+switches, never merged), the scripts are in its `exp60/` directory.
 
 ```sh
 tt-sustained run --dir … --out … --json --payload 1024 --duration 60s --warmup 10s --retain-bytes 68719476736 \
@@ -1489,7 +1491,7 @@ tt-latency run --dir … --rate 100000 --count 1100000 --warmup 100000 --payload
 
 The rates are the published steady-50 and steady-90 rates of the second sustained session above (half and 90 % of the
 10-minute probe of these machine types). Runs of 60 s, so a 10-minute run has ten times the rolls and stalls. Every
-run started on a deleted journal after `sync`; configurations were interleaved; In every before/after pair the
+run started on a deleted journal after `sync`; configurations were interleaved. In every before/after pair the
 "before" build ran first (a future run should alternate); latencies in µs unless a cell says ms; "late" is sends more
 than 1 µs late; ranges are over the runs. Coordinated omission is handled as above.
 

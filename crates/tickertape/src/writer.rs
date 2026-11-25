@@ -19,7 +19,7 @@ use crate::error::{CorruptReason, Error, Result};
 use crate::format::{self, CheckpointSlot, RecordHeader, ScanEnd, SegmentHeader, SegmentView};
 use crate::journal::{self, CHECKPOINT_FILE, LOCK_FILE, QUARANTINE_DIR};
 use crate::mmap::{self, MapRw};
-use crate::prefault::{Prefaulter, Spare, Spares};
+use crate::prefault::{Prefaulter, Spare, Spares, Waited};
 use crate::record::NewRecord;
 use crate::seek_index;
 use crate::writeback::WriteBack;
@@ -1078,21 +1078,31 @@ impl Writer {
         // No sync here: the new segment's header and size become durable at the next checkpoint, which syncs every
         // segment linked before its request before it writes a marker; recovery restores a header that a crash kept
         // from reaching the disk (ADR 0038 → Rolls without a sync; crash contract C8).
+        let size = self.config.segment_size;
         let new = match self.take_spare() {
-            Some(spare) => publish_spare(&self.root, next_base, self.config.segment_size, spare)?,
-            None => match create_segment(&self.root, next_base, self.config.segment_size, false) {
-                // A spare still being prepared may hold the space this needed: only now is it worth waiting for
-                // (ADR 0049).
-                Err(full) if full.is_storage_full() => match self.wait_for_spare() {
-                    Some(spare) => {
-                        publish_spare(&self.root, next_base, self.config.segment_size, spare)?
-                    }
-                    None => return Err(full),
-                },
-                created => created?,
-            },
+            Some(spare) => publish_spare(&self.root, next_base, size, spare)?,
+            None => {
+                // Whether a spare may hold space while this one is created. Asked before: a preparation that has ended
+                // by now has given its blocks back or is ready.
+                let preparing = self.spares.as_ref().is_some_and(Spares::preparing);
+                match create_segment(&self.root, next_base, size, false) {
+                    // Only now is the spare worth waiting for: it may hold the space this needed, or, when both
+                    // preallocate at the same time, have run out of it and given it back (ADR 0049).
+                    Err(full) if full.is_storage_full() => match self.wait_for_spare() {
+                        Waited::Ready(spare) => publish_spare(&self.root, next_base, size, spare)?,
+                        Waited::Nothing if !preparing => return Err(full),
+                        Waited::Freed | Waited::Nothing => {
+                            create_segment(&self.root, next_base, size, false)?
+                        }
+                    },
+                    created => created?,
+                }
+            }
         };
         crate::fault::hook(crate::fault::Point::RollAfterLink);
+        if let Some(spares) = &mut self.spares {
+            spares.rolled();
+        }
         self.dirty_dirs.insert(self.root.clone());
         // After the link, the roll always completes: seal the old segment, then switch.
         let seal_at = self.offset;
@@ -1143,9 +1153,15 @@ impl Writer {
     }
 
     /// As [`Writer::take_spare`], but waits for a spare being prepared ([`Spares::wait`]).
-    fn wait_for_spare(&mut self) -> Option<Spare> {
-        let spare = self.spares.as_mut()?.wait()?;
-        self.usable(spare)
+    fn wait_for_spare(&mut self) -> Waited {
+        let Some(spares) = &mut self.spares else {
+            return Waited::Nothing;
+        };
+        match spares.wait() {
+            // Discarding one of another size frees its space.
+            Waited::Ready(spare) => self.usable(spare).map_or(Waited::Freed, Waited::Ready),
+            other => other,
+        }
     }
 
     /// The spare, if it has this journal's segment size; otherwise it is discarded.
