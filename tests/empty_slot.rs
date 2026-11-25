@@ -745,6 +745,35 @@ fn a_zeroed_stretch_under_a_reader_is_reported_after_a_seek() {
     }
 }
 
+/// `seek_to_end` places a reader at the marker, behind no record that it has passed: it is at a record's start all the
+/// same, and the record there is reported when it is emptied.
+#[test]
+fn a_reader_at_the_marker_after_seek_to_end_reports_the_slot() {
+    for kind in KINDS {
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = journal(dir.path(), 1);
+        writer.checkpoint().unwrap();
+        let seq = writer.next_seq();
+        let mut reader = open(dir.path(), kind);
+        reader.seek_to_end().unwrap();
+        append_n(&mut writer, 5);
+        writer.checkpoint().unwrap();
+        let (path, at) = locate_record(dir.path(), seq);
+        zero(&path, at, 4);
+        std::thread::sleep(CHECK);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let end = loop {
+            match reader.try_next() {
+                Ok(None) if Instant::now() < deadline => {}
+                Ok(r) => panic!("{kind:?}: {}", r.is_some()),
+                Err(e) => break Err(e),
+            }
+        };
+        assert!(is_report(&end, &path, at), "{kind:?}: {end:?}");
+        expect_report(&mut reader, &path, at, seq, &format!("{kind:?}"));
+    }
+}
+
 /// Landing through a seek index, and the next record emptied.
 #[test]
 fn a_reader_that_landed_through_an_index_reports_the_slot() {
@@ -847,6 +876,66 @@ fn the_delay_and_the_number_of_checks_are_bounded() {
             let (_, end) = drain(&mut reader);
             assert!(is_report(&end, &path, at), "{end:?}");
         }
+    }
+}
+
+/// The directory is listed only if it has changed since it was found to show nothing: a journal can have many thousand
+/// segments. A segment linked later is seen within the same bound.
+#[test]
+fn an_unchanged_directory_is_not_listed_again() {
+    fn count(listings: Rc<Cell<u32>>) {
+        fault::run_at(Point::ReaderEmptySlotList, 0, move || {
+            listings.set(listings.get() + 1);
+            count(listings);
+        });
+    }
+    let idle = |reader: &mut Reader, time: Duration| {
+        let start = Instant::now();
+        while start.elapsed() < time {
+            assert!(reader.try_next().unwrap().is_none());
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    };
+    for kind in VISIBLE {
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = journal(dir.path(), 2);
+        let listings = Rc::new(Cell::new(0));
+        fault::clear();
+        count(listings.clone());
+        // Modified just now: another change might not show. Listed at most once a second.
+        let mut reader = at_the_end(dir.path(), &[kind]).pop().unwrap();
+        idle(&mut reader, Duration::from_millis(1_400));
+        assert!((2..=3).contains(&listings.get()), "{}", listings.get());
+        std::thread::sleep(Duration::from_millis(1_000));
+        idle(&mut reader, Duration::from_millis(1_200));
+        let settled = listings.get();
+        idle(&mut reader, Duration::from_millis(2_500));
+        assert_eq!(listings.get(), settled, "{kind:?}");
+        // A roll, followed by the reader, and a checkpoint: nothing that shows damage.
+        while segments(dir.path()).len() < 3 {
+            append_n(&mut writer, 10);
+        }
+        writer.checkpoint().unwrap();
+        assert!(drain(&mut reader).1.is_ok());
+        idle(&mut reader, Duration::from_millis(1_200));
+        assert!(listings.get() > settled, "{kind:?}");
+        // The directory settles again, and a later segment appears.
+        std::thread::sleep(Duration::from_millis(2_100));
+        idle(&mut reader, Duration::from_millis(1_200));
+        create_raw_segment(dir.path(), writer.next_seq() + 100, SMALL_SEGMENT);
+        let start = Instant::now();
+        let end = loop {
+            match reader.try_next() {
+                Ok(None) => std::thread::sleep(Duration::from_millis(5)),
+                Ok(Some(r)) => panic!("{}", r.seq),
+                Err(e) => break Err(e),
+            }
+            assert!(start.elapsed() < Duration::from_secs(4), "{kind:?}");
+        };
+        let path = segments(dir.path())[2].1.clone();
+        let at = end_of_records(&path).0;
+        assert!(is_report(&end, &path, at), "{kind:?}: {end:?}");
+        fault::clear();
     }
 }
 

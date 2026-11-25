@@ -16,7 +16,8 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   `Error::Discarded` where it waited until it was seeked. `verify` also reports a newest segment that ends before what the
   marker covers, and the pure-Python decoder, with `durable_only`, an empty slot below the marker. Not detected: a zeroed
   word that nothing covers, such as in the newest segment at or after the marker (`docs/crash-contract.md`, C11). A waiting
-  reader now reads the marker ten times a second and lists the segments at most once a second; the record path, the C
+  reader now reads the marker ten times a second and lists the segments when the directory has changed, at most once a
+  second; the record path, the C
   ABI's declarations and the on-disk format are unchanged, and any writer works, 1.0.0 included.
 - Changed: the zero-copy reader (`Reader::open_mapped`, and the mapped readers of the C, C++ and Java bindings) bounds its
   loads by the checkpoint marker (ADR 0048, issue #62). A damaged length in a record that the marker covers no longer

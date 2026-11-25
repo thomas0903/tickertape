@@ -1,24 +1,27 @@
 //! Readers: replay and live tailing.
 
 use std::fs::File;
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{Ordering, fence};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::config::{Backoff, ReaderConfig};
 use crate::error::{CorruptReason, Error, Result};
 use crate::format::{self, CheckpointSlot, RecordHeader};
-use crate::journal::{self, Identity};
+use crate::journal::{self, Bases, Identity};
 use crate::mmap::MapRo;
 use crate::record::{OwnedRecord, Record};
 use crate::seek_index::{self, codec::Entry, dir::IndexDir, lookup};
 
 /// How long a reader waits at an empty slot before checking that its segment wasn't replaced by recovery.
 const IDENTITY_CHECK_INTERVAL: Duration = Duration::from_millis(100);
-/// How long a reader waiting at an empty slot goes without listing the segments to see whether the journal continues
-/// after that slot ([`Reader::check_head`]). Only journals whose marker does not say so need the listing.
+/// How long a reader waiting at an empty slot goes without looking for a later segment that shows that the journal
+/// continues after that slot ([`Reader::check_head`]). It then lists the directory only if that has changed.
 const SEGMENT_LIST_INTERVAL: Duration = Duration::from_secs(1);
+/// How long a directory must have gone unmodified before it is listed for its modification time to tell a later change:
+/// well above the granularity of file systems' clocks.
+const DIRECTORY_SETTLED: Duration = Duration::from_secs(2);
 /// Bytes the `pread` reader fetches at a time (more if a record is larger).
 const CHUNK: usize = 64 * 1024;
 /// Longest single block on the wake-up region when the writer maintains it (bounded so that a writer that died, or a
@@ -106,9 +109,9 @@ pub struct Reader {
     waker: Option<crate::notify::Waker>,
     /// When the reader started waiting at an empty slot.
     waiting_since: Option<Instant>,
-    /// When [`Reader::check_head`] listed the segments last: `None` if it has not run since the reader was opened or
-    /// moved by a seek, or if it ended in an error. It then runs at the next empty slot without waiting first.
-    segments_listed: Option<Instant>,
+    /// The last time [`Reader::check_head`] looked for later segments: `None` if it has not run since the reader was
+    /// opened or moved by a seek, or if it ended in an error. It then runs at the next empty slot without waiting first.
+    segments_listed: Option<Listed>,
     /// The record [`Reader::advance`] found last (valid only after it returned `true`). The slot reads decode a
     /// record's header straight into it, so that the per-record path passes only small values around (see
     /// [`SlotOutcome`]).
@@ -142,6 +145,27 @@ struct Found {
 /// makes for it.
 const COPIED: u64 = 1 << 63;
 
+/// What [`Reader::history_after`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum After {
+    /// The journal continues after the slot (if that is still empty when read again).
+    Shown(u64),
+    /// Nothing shows that. If the segments were listed, nothing will while there are the same segments.
+    Nothing,
+    /// The segments could not be listed, or there is a successor that may come to hold a record.
+    Unknown,
+}
+
+/// When a reader at an empty slot looked for later segments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Listed {
+    at: Instant,
+    /// The directory's inode and modification time, if the listing found nothing that could count as evidence later and
+    /// another modification would show: while they are the same, there are the same segments. (The cursor only moves
+    /// forward until a seek, which forgets this.)
+    unchanged: Option<(u64, SystemTime)>,
+}
+
 /// Where [`Reader::seek_to_end`] started, to go back to if it fails.
 struct Place {
     seg: OpenSegment,
@@ -157,7 +181,7 @@ struct Place {
     buf: Vec<u8>,
     buf_start: u64,
     waiting_since: Option<Instant>,
-    segments_listed: Option<Instant>,
+    segments_listed: Option<Listed>,
     found: Found,
 }
 
@@ -1268,23 +1292,30 @@ impl Reader {
                 self.set_limit(limit_of(marker.as_ref(), &self.seg));
             }
         }
-        let list = self
+        let due = self
             .segments_listed
-            .is_none_or(|at| now.duration_since(at) >= SEGMENT_LIST_INTERVAL);
-        let listed = if list {
-            Some(now)
-        } else {
-            self.segments_listed
+            .is_none_or(|l| now.duration_since(l.at) >= SEGMENT_LIST_INTERVAL);
+        // Before the listing.
+        let directory = due.then(|| directory_stamp(&self.dir)).flatten();
+        let unchanged = self.segments_listed.and_then(|l| l.unchanged);
+        let list = due && (unchanged.is_none() || unchanged != directory);
+        let follows = self.history_after(marker.flatten().as_ref(), list);
+        let listed = match self.segments_listed {
+            Some(listed) if !list => Listed {
+                at: if due { now } else { listed.at },
+                ..listed
+            },
+            _ => Listed {
+                at: now,
+                unchanged: directory.filter(|d| follows == After::Nothing && settled(d.1)),
+            },
         };
-        if self
-            .history_after(marker.flatten().as_ref(), list)
-            .is_some()
-        {
+        if matches!(follows, After::Shown(_)) {
             // After an error the next call checks again at once, and so reports the slot again.
             self.segments_listed = None;
             self.report_unless_head(list)?;
         }
-        self.segments_listed = listed;
+        self.segments_listed = Some(listed);
         Ok(())
     }
 
@@ -1300,21 +1331,33 @@ impl Reader {
     ///   before it stores the seal, and may die in between.)
     ///
     /// What can't be read, the marker or a segment, shows nothing.
-    fn history_after(&self, marker: Option<&CheckpointSlot>, list: bool) -> Option<u64> {
+    fn history_after(&self, marker: Option<&CheckpointSlot>, list: bool) -> After {
         if let Some(m) = marker {
             if m.next_seq > self.next_seq || m.segment_base_seq > self.seg.base {
-                return Some(m.next_seq);
+                return After::Shown(m.next_seq);
             }
         }
         if !list {
-            return None;
+            return After::Nothing;
         }
-        let newest = journal::find_bases(&self.dir, u64::MAX).ok()?.floor?;
-        (newest > self.next_seq
-            || (newest == self.next_seq
-                && newest != self.seg.base
-                && holds_a_record(&self.dir, newest)))
-        .then_some(newest)
+        crate::fault::hook(crate::fault::Point::ReaderEmptySlotList);
+        match journal::find_bases(&self.dir, u64::MAX) {
+            Ok(Bases {
+                floor: Some(newest),
+                ..
+            }) => {
+                if newest > self.next_seq {
+                    After::Shown(newest)
+                } else if newest < self.next_seq || newest == self.seg.base {
+                    After::Nothing
+                } else if holds_a_record(&self.dir, newest) {
+                    After::Shown(newest)
+                } else {
+                    After::Unknown
+                }
+            }
+            _ => After::Unknown,
+        }
     }
 
     /// [`Reader::history_after`] found something: reports the empty slot at the cursor if that stands.
@@ -1344,7 +1387,7 @@ impl Reader {
             pause = (pause * 2).min(VALIDATION_PAUSE_MAX);
         }
         let marker = read_marker(&self.dir).flatten();
-        let Some(later) = self.history_after(marker.as_ref(), list) else {
+        let After::Shown(later) = self.history_after(marker.as_ref(), list) else {
             return Ok(());
         };
         crate::fault::hook(crate::fault::Point::ReaderEmptySlotConfirm);
@@ -1750,6 +1793,19 @@ fn open_segment(dir: &Path, base: u64, mapped: bool) -> Result<OpenSegment> {
         identity,
         map,
     })
+}
+
+/// The inode and modification time of the journal's directory (which linking, renaming or removing a segment changes).
+fn directory_stamp(dir: &Path) -> Option<(u64, SystemTime)> {
+    let meta = std::fs::metadata(dir).ok()?;
+    Some((meta.ino(), meta.modified().ok()?))
+}
+
+/// Whether a directory modified at `modified` would get another modification time if it were modified now.
+fn settled(modified: SystemTime) -> bool {
+    SystemTime::now()
+        .duration_since(modified)
+        .is_ok_and(|age| age >= DIRECTORY_SETTLED)
 }
 
 /// The checkpoint marker, as [`marker_for_limit`] reads it.
@@ -2304,7 +2360,10 @@ mod tests {
             reader.durable_offset = 9;
             reader.bound = 1 << 12;
             reader.waiting_since = Some(Instant::now());
-            reader.segments_listed = Some(Instant::now());
+            reader.segments_listed = Some(super::Listed {
+                at: Instant::now(),
+                unchanged: None,
+            });
             reader.superseded_checked = Some(Instant::now() - VALIDATION_WINDOW);
             let before = state(&reader);
             assert!(matches!(reader.seek_to_end(), Err(Error::Corrupt { .. })));

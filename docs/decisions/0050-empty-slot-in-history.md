@@ -92,7 +92,10 @@ later segment, is newer than its earlier segments. In each of them the files do 
 
 - at the first empty slot after the reader was opened or moved by `seek` or `seek_to_end`, at once;
 - then with the identity check that a reader makes after each 100 ms at an empty slot. The marker is read each time (an
-  `open` and two 64-byte reads), the segments are listed at most once a second, and only if the marker shows nothing;
+  `open` and two 64-byte reads). The segments are listed at most once a second, only if the marker shows nothing, and only
+  if the directory's modification time is not the one it had when a listing showed nothing (counted only if it was at
+  least 2 s old then, so that another change must show; not while a successor without a record exists). So an idle
+  reader of a journal with many segments lists them once or twice after each roll, and then makes one `stat` a second;
 - for a durable-only reader that waits at the marker while it names a later segment, with the check that exists there.
 
 A visible reader that keeps up with a writer and never waits 100 ms makes no check after its first. One comparison

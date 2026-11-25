@@ -105,6 +105,8 @@ pub enum Point {
     /// A reader has read an empty slot, before it checks whether that slot can be the head of the journal (ADR 0050), that
     /// is before it reads the checkpoint marker for it. Arm with [`run_at`].
     ReaderEmptySlotCheck,
+    /// A reader at an empty slot is about to list the segments. Arm with [`run_at`].
+    ReaderEmptySlotList,
     /// A reader at an empty slot has found that the journal continues after it (ADR 0050), before it reads the slot again.
     /// Arm with [`run_at`].
     ReaderEmptySlot,
