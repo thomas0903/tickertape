@@ -553,7 +553,8 @@ fn check_index_dir(dir: &Path, indexes: &IndexDir, euid: u32) -> Result<()> {
         return Err(refused(
             dir,
             io::ErrorKind::PermissionDenied,
-            "it must belong to the user running this and not be writable by everyone",
+            "it must belong to the user running this and not be writable by everyone; create it with the journal \
+             directory's owner, group and mode",
         ));
     }
     Ok(())
@@ -575,13 +576,27 @@ fn create_index_dir(dir: &Path, root: &File, euid: u32) -> Result<IndexDir> {
             .map_err(|e| Error::io("read the process's groups", dir, e.into()))?
             .iter()
             .any(|g| g.as_raw() == gid);
-    if meta.uid() != euid || meta.mode() & 0o002 != 0 || !own_group {
-        return Err(refused(
-            dir,
-            io::ErrorKind::PermissionDenied,
-            "only the journal directory's owner, who is in its group, creates it, and not in a directory writable by \
-             everyone; otherwise create it with the journal directory's owner, group and mode",
-        ));
+    // Asked to make it, nobody else's directory, or one whose group could not be given to it, gets one.
+    let why = if meta.uid() != euid {
+        Some(
+            "the journal directory belongs to another user: its owner must create it, with the journal directory's \
+             owner, group and mode",
+        )
+    } else if meta.mode() & 0o002 != 0 {
+        Some(
+            "the journal directory is writable by everyone: create it by hand, with the journal directory's owner and \
+             group, not writable by everyone",
+        )
+    } else if !own_group {
+        Some(
+            "this user is not in the journal directory's group: create it by hand, with the journal directory's owner, \
+             group and mode",
+        )
+    } else {
+        None
+    };
+    if let Some(why) = why {
+        return Err(refused(dir, io::ErrorKind::PermissionDenied, why));
     }
     let mode = meta.mode() & 0o777;
     let raw = Mode::from_raw_mode(mode as rustix::fs::RawMode);

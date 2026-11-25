@@ -31,6 +31,7 @@ Operations (--ops takes a comma-separated subset; default all, in this order):
   reader-open                 Reader::open (lists the directory, opens the oldest segment)
   seek-first|middle|last      Reader::seek to the first, middle or last record, then the first try_next
                               (the reader skips the records before the target in its segment)
+  seek-sealed                 the same for the last record of the newest sealed segment
   replay                      Reader::open and try_next to the end (safe reader, pread)
   verify                      inspect::verify (scans every record)
   retention-plan              retention::plan under a max_segments limit no journal reaches: the cost every
@@ -40,6 +41,8 @@ Operations (--ops takes a comma-separated subset; default all, in this order):
                               checkpoint and is killed with SIGKILL; then Writer::open (recovery) is timed
   writer-open-without-marker  the checkpoint marker is moved aside, Writer::open recovers from the oldest
                               segment; the marker is rewritten by a checkpoint afterwards
+  index-build                 seek_index::build, writing every index anew (segments before the checkpoint's)
+  seek-sealed-indexed         seek-sealed by a reader that may use a seek index (used_index says whether it did)
 
 Every operation runs --repeats times (default 1), each in a new process, so that its peak RSS is its own
 (macOS: getrusage ru_maxrss; Linux: VmHWM, reset through /proc/self/clear_refs just before the operation,

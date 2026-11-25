@@ -1768,6 +1768,170 @@ mod tests {
         }
     }
 
+    /// A journal whose only sealed segment, of `size` bytes, has an index with one entry, and the entry.
+    #[cfg(feature = "fault-injection")]
+    fn indexed_journal(size: u64) -> (tempfile::TempDir, crate::seek_index::codec::Entry) {
+        use crate::format;
+        let dir = tempfile::tempdir().unwrap();
+        let path = crate::journal::segment_path(dir.path(), 0);
+        let file = std::fs::File::create_new(&path).unwrap();
+        file.set_len(size).unwrap(); // Sparse.
+        let header = format::encode_segment_header(&format::SegmentHeader {
+            segment_size: size,
+            base_seq: 0,
+            created_unix_ns: 3,
+        });
+        file.write_all_at(&header, 0).unwrap();
+        let (mut at, mut entry) = (format::SEGMENT_HEADER_LEN as u64, None);
+        for seq in 0..1_000 {
+            let mut frame = [0; 104];
+            let len = frame.len() as u32;
+            let fields = crate::format::RecordHeader {
+                seq,
+                schema_id: 0,
+                venue_ts_ns: 0,
+                local_ts_ns: 0,
+            };
+            format::encode_record_body(&fields, &[0x11; 64], &mut frame[4..]);
+            frame[..4].copy_from_slice(&len.to_le_bytes());
+            file.write_all_at(&frame, at).unwrap();
+            if seq == 700 {
+                entry = Some(crate::seek_index::codec::Entry {
+                    seq,
+                    offset: at,
+                    len,
+                    crc: u32::from_le_bytes(frame[4..8].try_into().unwrap()),
+                });
+            }
+            at += u64::from(len);
+        }
+        file.write_all_at(&format::SEAL_MARKER.to_le_bytes(), at)
+            .unwrap();
+        file.write_all_at(&format::seal_crc(1_000).to_le_bytes(), at + 4)
+            .unwrap();
+        let entry = entry.unwrap();
+        let mut encoder = crate::seek_index::codec::Encoder::with_spacing(4_096);
+        encoder.push(entry);
+        let index = encoder.finish(&header, at, 1_000).unwrap();
+        let indexes = dir.path().join(crate::seek_index::DIR_NAME);
+        std::fs::create_dir(&indexes).unwrap();
+        std::fs::write(indexes.join("00000000000000000000.idx"), index).unwrap();
+        // A successor and a marker in it, for mapped and durable-only readers.
+        std::fs::write(
+            crate::journal::segment_path(dir.path(), 1_000),
+            [
+                &format::encode_segment_header(&format::SegmentHeader {
+                    segment_size: 65_536,
+                    base_seq: 1_000,
+                    created_unix_ns: 4,
+                })[..],
+                &[0; 65_536 - 64],
+            ]
+            .concat(),
+        )
+        .unwrap();
+        let slot = format::encode_checkpoint_slot(&format::CheckpointSlot {
+            generation: 1,
+            next_seq: 1_000,
+            segment_base_seq: 1_000,
+            offset: 64,
+        });
+        std::fs::write(dir.path().join("checkpoint"), slot).unwrap();
+        (dir, entry)
+    }
+
+    #[cfg(feature = "fault-injection")]
+    fn open_indexed(dir: &std::path::Path, mapped: bool) -> Reader {
+        let config = ReaderConfig::default().seek_index(true);
+        if mapped {
+            // SAFETY: nothing but this test changes the journal, and it holds no payload.
+            unsafe { Reader::open_mapped(dir, config) }.unwrap()
+        } else {
+            Reader::open(dir, config).unwrap()
+        }
+    }
+
+    /// 8a before 8b (ADR 0045, test plan 4): where an index names bytes inside a payload of another history that decode
+    /// to a length near the segment's size, nothing is allocated or read for a frame; nor where the commit word changes
+    /// to one between 8a and 8b.
+    #[test]
+    #[cfg(feature = "fault-injection")]
+    fn a_length_that_was_not_compared_sizes_no_buffer() {
+        for size in [1 << 20, 4 << 30] {
+            for word in [0xF000_0000_u32, (size - 100_000).min(0xFFFF_FFFE) as u32, 0] {
+                let (dir, entry) = indexed_journal(size);
+                let path = crate::journal::segment_path(dir.path(), 0);
+                let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+                for mapped in [false, true] {
+                    let mut reader = open_indexed(dir.path(), mapped);
+                    reader.seek(900).unwrap();
+                    assert!(reader.used_index, "{size}, mapped {mapped}");
+                    assert_eq!(reader.offset, entry.offset);
+                    assert_eq!(reader.try_next().unwrap().unwrap().seq, 900);
+                    // Found by 8a.
+                    let write = |word: u32| {
+                        file.write_all_at(&word.to_le_bytes(), entry.offset)
+                            .unwrap();
+                    };
+                    write(word);
+                    let mut reader = open_indexed(dir.path(), mapped);
+                    reader.seek(900).unwrap();
+                    assert!(!reader.used_index);
+                    assert_eq!((reader.offset, reader.buf.capacity()), (64, 0));
+                    write(entry.len);
+                    // Changed after 8a.
+                    let mut reader = open_indexed(dir.path(), mapped);
+                    let other = file.try_clone().unwrap();
+                    crate::fault::clear();
+                    crate::fault::run_at(
+                        crate::fault::Point::ReaderSeekIndexLanding,
+                        0,
+                        move || {
+                            other
+                                .write_all_at(&word.to_le_bytes(), entry.offset)
+                                .unwrap();
+                        },
+                    );
+                    reader.seek(900).unwrap();
+                    assert!(!reader.used_index);
+                    assert_eq!((reader.offset, reader.buf.capacity()), (64, 0));
+                    write(entry.len);
+                }
+            }
+        }
+    }
+
+    /// A seek that lands through an index forgets what an earlier seek knew to be covered, and empties the buffer (step
+    /// 9); one whose index fails sets it as without an index. Neither touches the checkpoint a durable-only reader has
+    /// applied.
+    #[test]
+    #[cfg(feature = "fault-injection")]
+    fn a_landing_leaves_nothing_a_later_seek_trusts() {
+        for mapped in [false, true] {
+            let (dir, _) = indexed_journal(1 << 20);
+            let mut reader = open_indexed(dir.path(), mapped);
+            reader.durable_next_seq = 5;
+            reader.seek(0).unwrap();
+            assert_eq!(reader.seek_covered, 1_000);
+            reader.try_next().unwrap().unwrap();
+            reader.seek(900).unwrap();
+            assert!(!reader.used_index, "too close");
+            reader.seek_covered = 0;
+            reader.seek(900).unwrap();
+            assert!(reader.used_index);
+            assert_eq!(
+                (reader.seek_covered, reader.next_seq, reader.skip_until),
+                (0, 700, 900)
+            );
+            assert!(reader.buf.is_empty());
+            assert_eq!(reader.durable_next_seq, 5);
+            std::fs::remove_dir_all(dir.path().join(crate::seek_index::DIR_NAME)).unwrap();
+            reader.seek(900).unwrap();
+            assert!(!reader.used_index);
+            assert_eq!((reader.seek_covered, reader.offset), (1_000, 64));
+        }
+    }
+
     /// A frame the address space can't hold is an error, not a `capacity overflow` panic in `Vec::resize`, and the
     /// buffer is left as it was. On 64-bit targets these lengths fit in `usize` but exceed `isize::MAX`; on 32-bit
     /// targets the first already fails the conversion to `usize`.
