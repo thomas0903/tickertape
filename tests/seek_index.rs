@@ -1460,6 +1460,38 @@ fn a_forged_index_can_return_a_frame_from_a_payload() {
     assert_eq!(check(dir.path())[0], IndexState::Valid);
 }
 
+/// (Plan 9) An index whose entries are right and whose seal is bytes inside a payload is wrong, too.
+#[test]
+fn an_index_that_names_seal_bytes_in_a_payload_is_wrong() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut writer = Writer::open(dir.path(), config()).unwrap();
+    for _ in 0..1_000 {
+        append(&mut writer, 1, 64);
+    }
+    let mut payload = [0; 64];
+    payload[..4].copy_from_slice(&format::SEAL_MARKER.to_le_bytes());
+    payload[4..8].copy_from_slice(&format::seal_crc(1_000).to_le_bytes());
+    writer
+        .append(&NewRecord {
+            schema_id: 7,
+            venue_ts_ns: 0,
+            local_ts_ns: 0,
+            payload: &payload,
+        })
+        .unwrap();
+    fill(&mut writer, dir.path(), 1, 64, 1);
+    writer.checkpoint().unwrap();
+    build(dir.path());
+    assert_eq!(check(dir.path())[0], IndexState::Valid);
+    let path = segments(dir.path())[0].1.clone();
+    let (records, _) = chain(&path);
+    let index = forge(&path, &[records[700]], (records[1_000].offset + 40, 1_000));
+    std::fs::write(index_path(dir.path(), 0), index).unwrap();
+    // A reader cannot tell; the place it lands on is right all the same.
+    assert_eq!(all_agree(dir.path(), &[900, 2_000], 3), 8);
+    assert_eq!(check(dir.path())[0], IndexState::Wrong);
+}
+
 /// (Plan 10) T7: a reader that landed through an index, and damage and a repair after it: it ends where a reader that had
 /// scanned to the same place may end, and its next seek puts it back on the current chain.
 #[test]
