@@ -70,11 +70,10 @@ pub(crate) fn x8n(mut n: u64) -> u32 {
 /// Continues `crc` over `head`, then the bytes of `words` (word `i` is bytes `[8i, 8i + 8)`, little-endian), then
 /// `tail`: the same value as [`crc32c_append`] over the concatenation. Each word is loaded exactly once.
 ///
-/// The inlining of this function (never) and of the hardware path below it (into this one) is fixed by attributes.
-/// Without them it depended on how the crate is split into codegen units: adding the seek index, which does not call
-/// it, moved the boundary between this function and the mapped reader's record decoder, and replaying 64-byte
-/// records became 3 to 4 % slower on an M4 Pro, with the rest of the per-record path unchanged instruction by instruction.
-#[inline(never)]
+/// The hardware path below is marked `#[inline]` so that it can be inlined into this function whichever codegen unit each
+/// is in. Measured with the default release profile (16 codegen units), mapped reader, 64-byte records, M4 Pro: after the
+/// seek index, which does not call this function, had changed how the crate is split, replay was 3 to 4 % slower than
+/// before, and level with it again with these attributes.
 pub(crate) fn crc32c_append_parts(
     crc: u32,
     head: &[u8],
