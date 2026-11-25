@@ -2565,7 +2565,9 @@ fn child_permissions() {
             drop(writer);
             let segment = segments(dir.path())[0].1.clone();
             std::os::unix::fs::chown(&segment, None, Some(*group)).unwrap();
-            std::os::unix::fs::chown(dir.path(), None, Some(*group)).unwrap();
+            // Another group than the segment's, where there is one: a file made there can inherit it.
+            let other = *groups.iter().take(2).find(|g| *g != group).unwrap_or(group);
+            std::os::unix::fs::chown(dir.path(), None, Some(other)).unwrap();
             chmod(&segment, file_mode);
             chmod(dir.path(), dir_mode);
             if mode(dir.path()) != dir_mode {
@@ -2574,7 +2576,7 @@ fn child_permissions() {
             assert_eq!(build(dir.path())[0], IndexState::Built);
             let (made, index) = (index_dir(dir.path()), index_path(dir.path(), 0));
             assert_eq!(mode(&made), dir_mode & 0o777, "{dir_mode:o}");
-            assert_eq!(gid(&made), *group);
+            assert_eq!(gid(&made), other);
             assert_eq!(mode(&index), expected);
             assert_eq!(gid(&index), *group);
             chmod(&segment, 0o644);
