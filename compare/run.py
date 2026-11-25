@@ -18,6 +18,7 @@ import tempfile
 import time
 
 import affinity
+import javaopts
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
@@ -48,6 +49,10 @@ GUARANTEES = {
 }
 
 
+# Settings of the JVM tools in this session (see javaopts.py); main() replaces them with the command line's.
+JAVA = dict(javaopts.DEFAULTS)
+
+
 def execute(command, *, timeout=180, **kwargs):
     return subprocess.run([str(x) for x in command], check=True, timeout=timeout, **kwargs)
 
@@ -76,6 +81,7 @@ def environment(out, env, quick, name="environment.txt", pinning=None):
         f.write(f"date_utc: {datetime.datetime.now(datetime.timezone.utc).isoformat()}\n")
         f.write(f"quick: {quick}\nTMPDIR: {tempfile.gettempdir()}\nJAVA_HOME: {env['JAVA_HOME']}\n")
         f.write("versions: " + json.dumps(VERSIONS) + "\n")
+        f.write("JVM tool settings: " + json.dumps(JAVA) + "\n")
         f.write("command: " + shlex.join(sys.argv) + "\n")
         f.write("JVM flags (exact shared array):\n" + (HERE / "java-flags.sh").read_text() + "\n")
         for command in commands:
@@ -85,12 +91,13 @@ def environment(out, env, quick, name="environment.txt", pinning=None):
         f.write((pinning or {"summary": "affinity: none"})["summary"] + "; power/load: record manually for publication\n")
 
 
-def command(tool, role, data, control, count, payload, rate, warmup, reader, mode, quick, pinning=None):
+def command(tool, role, data, control, count, payload, rate, warmup, reader, mode, quick, pinning=None, out=None,
+            name=None):
     cmd = [str(HERE / tool / "run.sh"), role, "--dir", str(data), "--control", str(control),
            "--count", str(count), "--payload", str(payload), "--rate", str(rate),
            "--warmup", str(warmup), "--reader", reader, "--mode", mode]
-    if tool in ("chronicle", "aeron"):
-        cmd += ["--jit-warmup", "1000" if quick else "100000"]
+    if tool in javaopts.JAVA_TOOLS:
+        cmd = javaopts.wrap(cmd, tool, JAVA, quick, False, out, name)
     return cmd + affinity.adapter_options(pinning, tool, role)
 
 
@@ -152,11 +159,14 @@ def run_attempt(tool, workload, payload, reader, rate, repeat, out, env, quick, 
         children = []
         handles = []
         outputs = []
+        java = None
         deadline = time.monotonic() + count / max(rate, 1) + 120
+        if tool in javaopts.JAVA_TOOLS:
+            deadline += javaopts.WARMUP_ALLOWANCE_S
 
         def spawn(role, mode_override=None):
             cmd = command(tool, role, data, control, count, payload, rate, warmup,
-                          reader, mode_override or mode, quick, pinning)
+                          reader, mode_override or mode, quick, pinning, out, f"{label}-{role}-{len(children)}")
             commands.write(shlex.join(cmd) + "\n")
             commands.flush()
             output = base / f"{role}-{len(children)}.json"
@@ -198,14 +208,17 @@ def run_attempt(tool, workload, payload, reader, rate, repeat, out, env, quick, 
                                                                           for role in ("writer", "reader")])
                 elif workload == "W2":
                     writer, writer_path = spawn("writer")
-                    ready("writer")
+                    if not javaopts.warms_up_before_open(tool, JAVA):
+                        ready("writer")
                     read, read_path = spawn("reader")
+                    ready("writer")
                     ready("reader")
                     (control / "start.tmp").write_text(str(time.time_ns() + 50_000_000))
                     (control / "start.tmp").rename(control / "start")
                     wait(read)
                     wait(writer)
                     sent, received = parse_result(writer_path), parse_result(read_path)
+                    java = javaopts.collect(tool, JAVA, {"writer": sent, "reader": received}, quick, False, True)
                     result = {"affinity": affinity.record(pinning, tool, sent, received, keeper),
                               "latency": received, "writer": sent,
                               "coordinated_omission": "intended timestamps; no skipped sends or rebasing"}
@@ -214,6 +227,7 @@ def run_attempt(tool, workload, payload, reader, rate, repeat, out, env, quick, 
                     wait(writer)
                     sent = parse_result(writer_path)
                     if workload != "W3":
+                        java = javaopts.collect(tool, JAVA, {"writer": sent}, quick, False, False)
                         result = {"affinity": affinity.record(pinning, tool, sent, None, keeper), "append": sent}
                     else:
                         # Full untimed read warms the page cache. QueueIter and
@@ -223,6 +237,7 @@ def run_attempt(tool, workload, payload, reader, rate, repeat, out, env, quick, 
                         read, read_path = spawn("reader")
                         wait(read)
                         received = parse_result(read_path)
+                        java = javaopts.collect(tool, JAVA, {"reader": received}, quick, False, False)
                         result = {"affinity": affinity.record(pinning, tool, sent, received, keeper), "replay": received}
             finally:
                 for proc in children:
@@ -243,7 +258,7 @@ def run_attempt(tool, workload, payload, reader, rate, repeat, out, env, quick, 
     result.update(tool=tool, tool_version=VERSIONS[tool], guarantees=guarantees,
                   mode=mode, workload=workload, payload=payload, count=count, warmup=warmup,
                   rate=rate if workload == "W2" else None, reader=reader, segment_size=134_217_728 if tool in ("tickertape", "yaque") else None,
-                  repeat=repeat, quick=quick)
+                  repeat=repeat, quick=quick, java=java)
     validate_result(result)
     with (out / f"{tool}-{workload}.jsonl").open("a") as f:
         f.write(json.dumps(result, allow_nan=False, separators=(",", ":")) + "\n")
@@ -322,7 +337,9 @@ def main():
     sustained_args.add_argument("--sync-every-ms", type=int, default=1000, help="SD sync interval (default 1000)")
     sustained_args.add_argument("--tt-readers", help="tickertape readers: safe,mapped (default mapped)")
     affinity.add_options(parser)
+    javaopts.add_arguments(parser)
     args = parser.parse_args()
+    JAVA.update(javaopts.settings(args))
     tools = args.tools.split(",") if args.tools else TOOLS
     try:
         args.affinity = affinity.resolve(args)

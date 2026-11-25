@@ -24,6 +24,15 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 - Docs: the README's Performance section now says that the bare-metal append and replay figures come from short runs
   in the page cache (31–37 ms for tickertape's append), names the reader behind each latency figure, and adds the
   10-minute comparison on cloud VMs from `docs/benchmarks.md`. No figure changed and nothing new was measured.
+- Changed (comparison harness): Chronicle and Aeron in `compare/` follow their own documentation (issue #56, ADR 0018
+  amendment). Chronicle's `blockSize` is 1 GiB and its writer calls `microTouch()` in the busy-wait (the pretoucher is
+  Enterprise-only); Aeron's term buffers are not sparse and its clients pre-touch mapped memory. Aeron's reader uses
+  one fragment handler instead of a lambda per poll, which changes the measured reader. The JVM tools warm up across
+  index arrays, chunks, terms and the histogram branch in every workload, on scratch data, before the writer opens the
+  measured endpoint, and the paced writer's state exists before its start time. Every Java process logs GC, safepoints,
+  handshakes, compilations, deoptimisations and late sends beside the results (`compare/attribute.py` joins them). Each
+  can be switched off and is recorded in the result under `java`. No published figure changed and nothing new was
+  measured.
 - Docs: corrections to benchmark notes, with no new measurement (issue #58). The README and `docs/benchmarks.md` say
   how Chronicle Queue was configured (defaults, no page pre-touching) and that tickertape's first segment is
   preallocated before the append timer starts, and that tickertape's prefaulting was on; that at 1,024 bytes and
