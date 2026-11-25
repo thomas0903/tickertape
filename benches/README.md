@@ -142,8 +142,8 @@ stands for `reader-open` and all of them, and `--seek-index` lets the reader of 
 says whether its last seek did). Seek indexes (ADR 0045): `seek-sealed` (the last record of the newest sealed segment),
 `index-build` (every index anew; `states`, `index_files`, `index_bytes`) and `seek-sealed-indexed`, the last two after
 everything else so that the other operations run without indexes (`--ops unindexed`: all but them), and on request
-`index-refresh` (a build with nothing left to do) and `index-check`. Reader operations run once per reader in `--readers safe,mapped` (default
-safe). Optional operations: `retention-delete` (deletes the `--count` oldest segments), `cli-verify`, `cli-export` and
+`index-refresh` (a build with nothing left to do) and `index-check`. Reader operations run once per reader in
+`--readers safe,mapped` (default safe). Optional operations: `retention-delete` (deletes the `--count` oldest segments), `cli-verify`, `cli-export` and
 `cli-stats` (the program given by `--cli`). `--end <seq>` measures a directory without a checkpoint marker, such as an
 archive, up to that sequence number.
 
@@ -168,11 +168,11 @@ archive and then the rest of the journal, `verify` on both, and the rejoined dir
 **Missing and corrupt segments.** `tt-scale damage --dir D --segments N` builds two intact journals (the checkpoint
 marker in the newest segment, and two segments before it) and, for every case, a damaged copy per probe. It reports
 what both readers do at open, replay, four seeks and `seek_to_end`, what `verify` and `status` say, and what
-`Writer::open` does under each recovery policy, with the time of each, and what building and checking seek indexes and seeks with them
-do. After each writer probe it compares every record
-of the intact journal, byte for byte, with the journal and `quarantine/`: `census` says how many are in a segment, only
-in quarantine, or in neither, and `gone` counts those that were in a segment before the writer opened and are in
-neither afterwards (it must be 0; the unit test checks every case). `cargo run ... tt-scale --help` lists the options.
+`Writer::open` does under each recovery policy, with the time of each, and what building and checking seek indexes and
+seeks with them do. After each writer probe it compares every record of the intact journal, byte for byte, with the
+journal and `quarantine/`: `census` says how many are in a segment, only in quarantine, or in neither, and `gone` counts
+those that were in a segment before the writer opened and are in neither afterwards (it must be 0; the unit test checks
+every case).
 
 **Catch-up.** `tt-scale catch-up` opens a writer on a journal `build` left and appends records at `--rate` with a
 background checkpoint every `--checkpoint-every`. After `--warmup` and `--baseline` it starts a reader process
@@ -204,7 +204,7 @@ sudo mkdir -p /mnt/ssd && sudo mount -o noatime /dev/nvme0n1 /mnt/ssd && sudo ch
 sudo -n true                                   # cold runs need password-less sudo
 cargo build --release -p tickertape-bench --bin tt-scale
 cargo build --release -p tickertape-cli
-benches/scale-session.sh /mnt/ssd/journals ~/tt-scale-out            # every stage, about three hours
+benches/scale-session.sh /mnt/ssd/journals ~/tt-scale-out            # every stage: 3.5 hours or so
 benches/scale-session.sh /mnt/ssd/journals ~/tt-scale-out seeks      # one stage: the seeks alone
 ```
 

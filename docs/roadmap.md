@@ -246,8 +246,13 @@ released with seven items open, accepted by the owner as known gaps
     than RAM is recorded in [`benchmarks.md`](benchmarks.md) with dataset sizes and resource usage; ADR 0042 is accepted
     with no sparse index for 1.0, since a seek costs at most one segment's scan (`docs/operations.md` → Choosing a
     segment size). The defect the run found, one open file per segment between checkpoints, is fixed (#38).
-  - Missing: archived history, missing or corrupt segments, catch-up under a live writer, the zero-copy reader and the
-    10,000- and 20,000-segment journals (they failed before #38 and are reported as failed) are not measured.
+  - Measured on 2026-11-25 ([`benchmarks.md`](benchmarks.md) → Replay and recovery at scale: the gaps of 1.0.0): the
+    10,000- and 20,000-segment journals (and 100,000), archived history, missing and corrupt segments, catch-up under a
+    live writer, the zero-copy reader, and seeks with the seek index (issue #62). The rule that recovery does not silently
+    discard committed history held in every measured case.
+  - Still missing: the limits those runs found are not changed: every seek reads the whole directory, every checkpoint
+    with retention opens every segment's header, and `retention::apply` reads the directory before every removal, so a
+    journal of more than a few thousand segments pays for them.
   - Accepted after 1.0 (issue #59): a sparse seek index per sealed segment,
     [ADR 0045](decisions/0045-sparse-seek-index.md): built by `tickertape index`, used by readers that opt in. Deferred
     there: the checkpoint marker as a jump point in the newest segment, then building from the writer.
@@ -294,8 +299,10 @@ where a line says it is closed:
   macOS result.
 - **Avoidable work:** the profiles of the readers, notification and serialization paths are not documented.
 - **ARM servers:** two latency observations on aarch64 and the platform mechanism behind issue #43 are not explained.
-- **Replay and recovery at scale:** archived history, missing or corrupt segments, catch-up under a live writer, the
-  zero-copy reader and journals of 10,000 segments or more are not measured.
+- **Replay and recovery at scale:** measured on 2026-11-25: archived history, missing and corrupt segments, catch-up
+  under a live writer, the zero-copy reader and journals of 10,000 to 100,000 segments ([`benchmarks.md`](benchmarks.md)).
+  Not measured: archiving under a live writer at this scale, catch-up of a durable-only reader, and other filesystems
+  than ext4.
 
 ## Later (explicitly out of scope for v0.1)
 

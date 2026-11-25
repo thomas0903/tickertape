@@ -89,6 +89,12 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   `compatibility.md`): the damage can appear whether or not a writer runs, it includes the empty slot at the head, and a
   zeroed commit word is only one of the two cases. No behaviour changes and no guarantee is weakened: all of this damage
   breaks the intact chain on which the guarantee depends.
+- Bench: `tt-scale` measures the zero-copy reader, journals of 10,000 segments and more under a low limit on open files,
+  seeks with seek indexes, archived history (`tt-scale archive`), missing and corrupt segments (`tt-scale damage`,
+  which checks after every writer open that no committed record is lost) and catch-up under a live writer
+  (`tt-scale catch-up`); `benches/scale-session.sh` runs the recorded session. No library change.
+- Docs: the 1.0.0 gap "replay and recovery at scale" is measured (issue #62): results of 2026-11-25 in
+  `docs/benchmarks.md`, with the limits the segment count sets in `docs/operations.md`, ADR 0042 and the roadmap.
 
 ## [1.0.0] - 2026-11-23
 

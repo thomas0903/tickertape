@@ -26,7 +26,15 @@ draws conclusions from those two.
 - **Segment count.** Opening a reader or a writer and each seek read the whole journal directory; `list_segments`,
   `verify` and each retention run (when retention is configured, at writer open and after checkpoints) open every
   segment's file; replay opens each segment it enters. These costs grow with the number of segments, so very small
-  segments in a long-lived journal make them add up (ADR 0042).
+  segments in a long-lived journal make them add up (ADR 0042). Measured on local SSD (`benchmarks.md`, 2026-11-25):
+  journals of 10,000, 20,000 and 100,000 segments open, recover, replay and checkpoint, and no operation held more
+  than 12 open files at 10 to 20,000 segments, so the limit on open files (`ulimit -n`) is not a constraint on the number
+  of segments. The directory read is: each seek costs about 3 ms at 10,000 segments, 6 ms at 20,000 and 29 ms at 100,000,
+  also with a seek index, and each retention run opens every header (29 ms at 10,000 segments, 67 ms at 20,000, 0.34 s
+  at 100,000 with a warm cache; seconds when it is cold, as at the open of a writer after a reboot), which a writer with
+  a retention policy pays at every checkpoint. Deleting a segment reads the directory again, about 8 ms each at 20,000
+  segments. So plan for at most a few thousand segments in a journal with retention (a larger segment, or fewer kept),
+  and prefer one large segment over many small ones where seeks or checkpoints matter.
 - **Granularity of archiving.** You archive or delete whole segments (below).
 
 For most uses the default is a reasonable start. Pick smaller segments (a few MiB) for low-volume journals you
@@ -170,6 +178,7 @@ The same rules apply to the library and CLI, without taking the writer lock:
 - Limits combine with OR: keep at most N total segments, at most B total segment file bytes, or remove segments
   sealed longer ago than D. Seal time is the successor header's creation time, not file modification time.
   Counts and bytes include the active segment. Checkpoint eligibility can prevent reaching the requested limit.
+  The cost of a run grows with the number of segments left in the journal ("Segment count" above).
 - Moves preserve the segment basename and require an existing destination directory. Same-filesystem moves use
   an atomic no-replace rename. `EXDEV` selects copy, sync the copy, sync the destination directory, remove the
   source, sync the journal directory. Existing files (including symlinks and identical copies) are errors.
@@ -219,6 +228,10 @@ tickertape index /data/journal --remove    # deletes them
   restarts near the head gains nothing (`seek_to_end` starts at the marker).
 - The size is 24 bytes per 64 KiB of segment (0.04 %); a build reads each new segment once. Nothing is added to the writer
   while it runs; its open lists `seek-index/` and removes what recovery could invalidate.
+- In a journal of 10,000 to 20,000 segments a run with nothing new to index opens every segment and index: 0.1 to
+  0.2 s with a warm cache, 3 to 12 s when it is cold (`benchmarks.md`, 2026-11-25). The index shortens a seek that
+  crosses much of a segment (128 MiB: from 0.18 s to about 1 ms, cold), not the directory read that every seek starts
+  with, so it does not help where segments are small and many.
 - The directory `seek-index/` is created with the journal directory's group and mode. If the command refuses to create it
   (the journal directory belongs to another user, is writable by everyone, or its group is not one of this user's, as for
   a directory made under `/tmp` on macOS), create it yourself with the journal directory's owner, group and mode.
@@ -311,6 +324,7 @@ What a reader on the new machine sees:
   after the last record. That problem, at the last segment and alone, is expected; any other is not. Bounded reads
   succeed: `tickertape export archive --format jsonl --to <last sequence number>` and `stats … --to`. The last sequence
   number is one less than the sequence number in the name of the oldest segment left in the journal.
+  `Reader::seek_to_end` fails the same way, and without a marker each forward seek reads its segment again (ADR 0046).
 - Nothing with `--durable-only`: an archive has no marker.
 - With the remaining files of the journal, copied once the writer has stopped, in the same directory, the whole journal
   again: `verify` exits with 0.

@@ -13,7 +13,9 @@ them. The cloud-VM and macOS results are secondary.
 The sustained-workload, checkpoint, comparison, reader and scale results and the long verified runs of 2026-11-19 to
 2026-11-22 ran on Google Cloud VMs
 ([below](#2026-11-19-to-2026-11-22-sustained-workloads-on-google-cloud-vms-linux-x86-64-and-aarch64)), after the
-bare-metal sections.
+bare-metal sections. The scale cases that run left out (10,000 segments and more, archived history, damage, catch-up, the
+zero-copy reader, seek indexes) ran on 2026-11-25 on machines of the same types
+([below](#2026-11-25-replay-and-recovery-at-scale-the-gaps-of-100-google-cloud-vms)).
 
 **How Chronicle Queue and tickertape were configured in the comparisons below.** Open-source Chronicle Queue (2026.8,
 the version `compare/chronicle/pom.xml` pins) ran with its default queue options, except `SyncMode.SYNC` in the
@@ -1316,7 +1318,8 @@ writer operations append and checkpoint, so a later measurement of the same jour
 
 **The journals of 10,000 and 20,000 segments could not be measured**: `writer-open-without-marker` failed with
 `open segment failed for …/00000000000001003715.tape: Too many open files (os error 24)` on both machines, so `tt-scale`
-wrote no result for them. That is the open-files defect fixed afterwards in #38; they have not been measured since.
+wrote no result for them. That is the open-files defect fixed afterwards in #38; they were measured on 2026-11-25
+([above](#2026-11-25-replay-and-recovery-at-scale-the-gaps-of-100-google-cloud-vms)), with the cases this run left out.
 
 x86-64:
 
@@ -1419,8 +1422,9 @@ commits stated above). Rates are of these machines and do not carry over to othe
 - **Remaining, open:** the record checksum mismatch that stopped a reader of the 1,024 B probe on both aarch64 VMs at
   `279f59a` was a reader's view lagging a correctly published record; readers now tolerate it, and the long verified
   runs at `3fea1c0` and the confirming runs at `fbe5785` showed no false corruption and no lost write (issue #43,
-  closed; the platform mechanism is not confirmed, `crash-contract.md` → Known risks and limits). Not measured: the
-  10,000- and 20,000-segment journals, and the lagging and beyond-RAM scenarios with background checkpoints.
+  closed; the platform mechanism is not confirmed, `crash-contract.md` → Known risks and limits). Not measured:
+  the lagging and beyond-RAM scenarios with background checkpoints. (The 10,000- and 20,000-segment journals were
+  measured on 2026-11-25.)
 - **Retention behind an overloaded writer (issue #45, closed).** The time-out of the 1,024 B probe at `279f59a` came
   from retention: before deleting a segment it read the whole segment on the checkpoint thread, behind a writer that
   outran the disk the old segments were no longer in memory, retention fell far behind, and the final checkpoint and the
