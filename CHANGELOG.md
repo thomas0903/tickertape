@@ -72,6 +72,11 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 - Added (CLI): `tickertape age` follows a live journal from its end and reports record ages as text or JSON (from 1.1).
   By default it polls, so that it never makes the watched writer's appends wake it (`--wait`). `live` in each report
   tells an idle journal from a reader that is not at the end of the journal yet and measured nothing.
+- Docs: ADR 0048 (accepted, nothing built) settles the zero-copy reader's publication frontier (issue #62). With it, the
+  text of the zero-copy reader's known limitation is corrected (`Reader::open_mapped`, `crash-contract.md`,
+  `compatibility.md`): the damage can appear whether or not a writer runs, it includes the empty slot at the head, and a
+  zeroed commit word is only one of the two cases. No behaviour changes and no guarantee is weakened: all of this damage
+  breaks the intact chain on which the guarantee depends.
 
 ## [1.0.0] - 2026-11-23
 

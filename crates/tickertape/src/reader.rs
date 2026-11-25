@@ -201,8 +201,10 @@ impl Reader {
     /// undefined behaviour in Rust's terms, before any CRC runs; for a writer in another process the language says
     /// nothing. Two cases (ADR 0027 → "Which loads can race"):
     ///
-    /// - The length in an earlier record's commit word is enlarged while no writer runs, and a writer then appends
-    ///   after that record: validating it loads bytes the writer is storing.
+    /// - A commit word holds a non-zero value that no writer stored there, and the frame it claims reaches bytes that
+    ///   a writer stores: an earlier record's length, enlarged, or a length or a seal marker in the empty slot at the
+    ///   head. The damage can appear whether or not a writer runs. Validating that slot loads bytes the writer is
+    ///   storing.
     /// - The commit word of a published record not yet covered by a checkpoint is zeroed, and the next writer's
     ///   recovery cannot tell that from a torn append (damage after which nothing validates, such as the newest
     ///   record's commit word zeroed; `docs/crash-contract.md`, C11 (3), has the cases). It then takes the slot for
