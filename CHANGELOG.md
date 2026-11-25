@@ -15,6 +15,9 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 - Docs: the README's Performance section now says that the bare-metal append and replay figures come from short runs
   in the page cache (31–37 ms for tickertape's append), names the reader behind each latency figure, and adds the
   10-minute comparison on cloud VMs from `docs/benchmarks.md`. No figure changed and nothing new was measured.
+- Changed (CLI, dependencies): `Cargo.lock` moves parquet from 59.3.2 to 59.3.3 for RUSTSEC-2026-0595 (bloom filters
+  written in plaintext into encrypted Parquet files), which `cargo deny` started to report. The CLI builds parquet
+  without its encryption feature and never wrote such files.
 
 ## [1.0.0] - 2026-11-23
 
