@@ -17,6 +17,8 @@ import sys
 import tempfile
 import time
 
+import affinity
+
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 TOOLS = ("tickertape", "chronicle", "aeron", "yaque", "queue-file", "plain-file")
@@ -59,7 +61,7 @@ def capture(command):
         return f"unavailable: {e}"
 
 
-def environment(out, env, quick, name="environment.txt"):
+def environment(out, env, quick, name="environment.txt", pinning=None):
     commands = [["git", "rev-parse", "HEAD"], ["git", "status", "--short"],
                 ["uname", "-a"], ["rustc", "--version"], ["cargo", "--version"],
                 [str(Path(env["JAVA_HOME"]) / "bin/java"), "-version"], ["mvn", "-version"]]
@@ -80,16 +82,16 @@ def environment(out, env, quick, name="environment.txt"):
             f.write("\n$ " + shlex.join(command) + "\n" + capture(command) + "\n")
         if "orbstack" in platform.release().lower():
             f.write("environment: OrbStack VM (Linux on macOS)\n")
-        f.write("affinity: none; power/load: record manually for publication\n")
+        f.write((pinning or {"summary": "affinity: none"})["summary"] + "; power/load: record manually for publication\n")
 
 
-def command(tool, role, data, control, count, payload, rate, warmup, reader, mode, quick):
+def command(tool, role, data, control, count, payload, rate, warmup, reader, mode, quick, pinning=None):
     cmd = [str(HERE / tool / "run.sh"), role, "--dir", str(data), "--control", str(control),
            "--count", str(count), "--payload", str(payload), "--rate", str(rate),
            "--warmup", str(warmup), "--reader", reader, "--mode", mode]
     if tool in ("chronicle", "aeron"):
         cmd += ["--jit-warmup", "1000" if quick else "100000"]
-    return cmd
+    return cmd + affinity.adapter_options(pinning, tool, role)
 
 
 def parse_result(path):
@@ -103,7 +105,7 @@ CLOCK_STEP = "wall clock moved backwards"
 CLOCK_RETRIES = 3
 
 
-def run_one(tool, workload, payload, reader, rate, repeat, out, env, quick, commands):
+def run_one(tool, workload, payload, reader, rate, repeat, out, env, quick, commands, pinning=None):
     """Runs one measurement. A latency run that saw the wall clock step backwards (an NTP adjustment; latency is
     measured against intended wall-clock send times) is invalid: it is discarded and measured again, at most
     CLOCK_RETRIES times, and each discarded attempt is recorded in retries.jsonl. Any other failure stops the suite."""
@@ -112,7 +114,7 @@ def run_one(tool, workload, payload, reader, rate, repeat, out, env, quick, comm
         start = log.stat().st_size if log.exists() else 0
         try:
             try:
-                return run_attempt(tool, workload, payload, reader, rate, repeat, out, env, quick, commands)
+                return run_attempt(tool, workload, payload, reader, rate, repeat, out, env, quick, commands, pinning)
             finally:
                 # The measurement's scratch directory is gone by now; wait until the kernel has written back what it
                 # wrote, so the next measurement (often another tool) doesn't pay for it.
@@ -130,8 +132,9 @@ def run_one(tool, workload, payload, reader, rate, repeat, out, env, quick, comm
             print(f"{label}: discarded attempt {attempt} ({CLOCK_STEP}); retrying", file=sys.stderr, flush=True)
 
 
-def run_attempt(tool, workload, payload, reader, rate, repeat, out, env, quick, commands):
-    mode = {"W1": "append", "W2": "visible_latency", "W3": "warm_replay"}[workload]
+def run_attempt(tool, workload, payload, reader, rate, repeat, out, env, quick, commands, pinning=None):
+    pinning = pinning or {"mode": "none", "summary": "affinity: none"}
+    mode = {"W1-cold": "append_cold", "W1-steady": "append_steady", "W2": "visible_latency", "W3": "warm_replay"}[workload]
     count = (1_000_000 if payload == 64 else 100_000)
     warmup = 100_000 if workload == "W2" else 0
     if workload == "W2":
@@ -153,7 +156,7 @@ def run_attempt(tool, workload, payload, reader, rate, repeat, out, env, quick, 
 
         def spawn(role, mode_override=None):
             cmd = command(tool, role, data, control, count, payload, rate, warmup,
-                          reader, mode_override or mode, quick)
+                          reader, mode_override or mode, quick, pinning)
             commands.write(shlex.join(cmd) + "\n")
             commands.flush()
             output = base / f"{role}-{len(children)}.json"
@@ -162,6 +165,7 @@ def run_attempt(tool, workload, payload, reader, rate, repeat, out, env, quick, 
             handles.append(handle)
             proc = subprocess.Popen(cmd, stdout=handle, stderr=error_log, env=env, start_new_session=True)
             children.append(proc)
+            keeper.watch(proc.pid, role)
             return proc, output
 
         def wait(proc):
@@ -178,17 +182,20 @@ def run_attempt(tool, workload, payload, reader, rate, repeat, out, env, quick, 
                     raise TimeoutError(f"{label}: readiness timed out")
                 time.sleep(0.002)
 
-        with (out / "children.log").open("a") as error_log:
+        with (out / "children.log").open("a") as error_log, affinity.Keeper(pinning, control) as keeper:
             error_log.write(f"\n{label}\n")
             error_log.flush()
             try:
                 if tool == "tickertape" and workload == "W2":
                     cmd = [str(HERE / "target/release/tt-latency"), "run", "--dir", str(data),
                            "--rate", str(rate), "--count", str(count), "--warmup", str(warmup),
-                           "--payload", str(payload), "--reader", reader, "--json"]
+                           "--payload", str(payload), "--reader", reader, "--json", *affinity.latency_options(pinning)]
                     commands.write(shlex.join(cmd) + "\n")
                     result = json.loads(execute(cmd, stdout=subprocess.PIPE, stderr=error_log, env=env,
                                                 timeout=count/rate+120, text=True).stdout)
+                    # Not watched by the keeper: tt-latency starts its own processes (moved_threads is null).
+                    result["affinity"] = affinity.record(pinning, tool, *[{"affinity": result["affinity"][role]}
+                                                                          for role in ("writer", "reader")])
                 elif workload == "W2":
                     writer, writer_path = spawn("writer")
                     ready("writer")
@@ -198,13 +205,16 @@ def run_attempt(tool, workload, payload, reader, rate, repeat, out, env, quick, 
                     (control / "start.tmp").rename(control / "start")
                     wait(read)
                     wait(writer)
-                    result = {"latency": parse_result(read_path), "writer": parse_result(writer_path),
+                    sent, received = parse_result(writer_path), parse_result(read_path)
+                    result = {"affinity": affinity.record(pinning, tool, sent, received, keeper),
+                              "latency": received, "writer": sent,
                               "coordinated_omission": "intended timestamps; no skipped sends or rebasing"}
                 else:
-                    writer, writer_path = spawn("writer", "append")
+                    writer, writer_path = spawn("writer", "append" if workload == "W3" else mode)
                     wait(writer)
-                    if workload == "W1":
-                        result = {"append": parse_result(writer_path)}
+                    sent = parse_result(writer_path)
+                    if workload != "W3":
+                        result = {"affinity": affinity.record(pinning, tool, sent, None, keeper), "append": sent}
                     else:
                         # Full untimed read warms the page cache. QueueIter and
                         # queue-file iteration leave the fixture unconsumed.
@@ -212,7 +222,8 @@ def run_attempt(tool, workload, payload, reader, rate, repeat, out, env, quick, 
                         wait(warm)
                         read, read_path = spawn("reader")
                         wait(read)
-                        result = {"replay": parse_result(read_path)}
+                        received = parse_result(read_path)
+                        result = {"affinity": affinity.record(pinning, tool, sent, received, keeper), "replay": received}
             finally:
                 for proc in children:
                     if proc.poll() is None:
@@ -251,7 +262,7 @@ def validate_result(result):
         assert values == sorted(values)
         assert math.isfinite(result["writer"]["achieved_records_per_s"]) and result["writer"]["achieved_records_per_s"] > 0
     else:
-        stats = result["append" if result["workload"] == "W1" else "replay"]
+        stats = result["append" if result["workload"].startswith("W1") else "replay"]
         assert stats["count"] == result["count"]
         assert math.isfinite(stats["records_per_s"]) and stats["records_per_s"] > 0
         expected = stats["records_per_s"] * result["payload"] / 1e6
@@ -310,11 +321,20 @@ def main():
                                 help="paced rates as fractions of each probe's achieved rate (default 0.5,0.9)")
     sustained_args.add_argument("--sync-every-ms", type=int, default=1000, help="SD sync interval (default 1000)")
     sustained_args.add_argument("--tt-readers", help="tickertape readers: safe,mapped (default mapped)")
+    affinity.add_options(parser)
     args = parser.parse_args()
+    tools = args.tools.split(",") if args.tools else TOOLS
+    try:
+        args.affinity = affinity.resolve(args)
+        if not args.dry_run:
+            affinity.check(args.affinity, tools)
+    except ValueError as error:
+        parser.error(str(error))
+    for line in affinity.warnings(args.affinity, tools):
+        print(f"warning: {line}", file=sys.stderr)
     if args.sustained:
         import sustained
         env = dict(os.environ)
-        tools = args.tools.split(",") if args.tools else TOOLS
         java_environment(env, any(t in ("chronicle", "aeron") for t in tools) and not args.dry_run, parser)
         sustained.main(args, env, build)
         return
@@ -328,21 +348,28 @@ def main():
         parser.error("OUTDIR must be new or empty")
     env = dict(os.environ)
     java_environment(env, True, parser)
-    environment(out, env, args.quick)
+    pinning = args.affinity
+    print(pinning["summary"], file=sys.stderr)
+    environment(out, env, args.quick, pinning=pinning)
     build(out, env, ("chronicle", "aeron"), tt_latency=True)
+    affinity.place_runner(pinning)
     with (out / "commands.txt").open("w") as commands:
         for repeat in (1, 2):
             for payload in (64, 1024):
                 for tool in TOOLS:
                     if tool != "aeron":
-                        run_one(tool, "W1", payload, "default", 100_000, repeat, out, env, args.quick, commands)
+                        for workload in ("W1-cold", "W1-steady"):
+                            run_one(tool, workload, payload, "default", 100_000, repeat, out, env, args.quick, commands,
+                                    pinning)
                         for reader in (("safe", "mapped") if tool == "tickertape" else ("default",)):
-                            run_one(tool, "W3", payload, reader, 100_000, repeat, out, env, args.quick, commands)
+                            run_one(tool, "W3", payload, reader, 100_000, repeat, out, env, args.quick, commands,
+                                    pinning)
                     if tool != "queue-file":
                         for reader in (("safe", "mapped") if tool == "tickertape" else ("default",)):
                             for rate in (100_000, 10_000):
-                                run_one(tool, "W2", payload, reader, rate, repeat, out, env, args.quick, commands)
-    (out / "skipped.json").write_text(json.dumps({"aeron": {"W1": "Archive not implemented; IPC has no persistent append workload",
+                                run_one(tool, "W2", payload, reader, rate, repeat, out, env, args.quick, commands,
+                                        pinning)
+    (out / "skipped.json").write_text(json.dumps({"aeron": {**{w: "Archive not implemented; IPC has no persistent append workload" for w in ("W1-cold", "W1-steady")},
         "W3": "Archive not implemented; IPC cannot replay"}, "queue-file": {"W2": "upstream forbids concurrent process access"}}, indent=2) + "\n")
     elapsed = time.monotonic() - suite_start
     with (out / "environment.txt").open("a") as f:
