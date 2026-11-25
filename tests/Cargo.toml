@@ -109,6 +109,10 @@ name = "open_segments"
 path = "open_segments.rs"
 
 [[test]]
+name = "allocation"
+path = "allocation.rs"
+
+[[test]]
 name = "record_age"
 path = "record_age.rs"
 

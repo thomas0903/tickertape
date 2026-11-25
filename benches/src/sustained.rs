@@ -266,8 +266,9 @@ pub struct Stall {
 /// One reader process of a sustained run, parsed from `kind[:option]...`.
 ///
 /// `kind` is `safe` (`Reader::open`, `pread`) or `mapped` (`Reader::open_mapped`). Options: `durable`
-/// (`ReaderConfig::durable_only`), `wait=spin|default|block|sleep`, `delay=<duration>` (after every record) and
-/// `stall=<pause>/<every>` (a periodic pause). A reader with a delay or stall is a *lagging* reader.
+/// (`ReaderConfig::durable_only`), `wait=spin|default|block|sleep`, `delay=<duration>` (after every record),
+/// `stall=<pause>/<every>` (a periodic pause) and `owned` (copy every record out). A reader with a delay or stall is
+/// a *lagging* reader.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReaderSpec {
     /// Zero-copy mapped reader instead of the safe `pread` reader.
@@ -280,6 +281,8 @@ pub struct ReaderSpec {
     pub delay: Option<Duration>,
     /// Artificial periodic stall.
     pub stall: Option<Stall>,
+    /// Copy every record out of the reader ([`tickertape::Record::to_owned`]).
+    pub owned: bool,
 }
 
 impl ReaderSpec {
@@ -297,6 +300,7 @@ impl ReaderSpec {
             wait: default_wait,
             delay: None,
             stall: None,
+            owned: false,
         };
         let mut seen = Vec::new();
         for part in parts {
@@ -307,6 +311,7 @@ impl ReaderSpec {
             seen.push(key);
             match (key, value) {
                 ("durable", "") => spec.durable_only = true,
+                ("owned", "") => spec.owned = true,
                 ("wait", value) => spec.wait = WaitMode::parse(value)?,
                 ("delay", value) => {
                     let delay = parse_duration(value)?;
@@ -367,6 +372,9 @@ impl ReaderSpec {
                 format_duration(stall.every)
             ));
         }
+        if self.owned {
+            label.push_str(":owned");
+        }
         label
     }
 
@@ -396,7 +404,7 @@ impl ReaderSpec {
             "delay_us": self.delay.map(|d| d.as_secs_f64() * 1e6),
             "stall_pause_ms": self.stall.map(|s| s.pause.as_secs_f64() * 1e3),
             "stall_every_ms": self.stall.map(|s| s.every.as_secs_f64() * 1e3),
-            "lagging": self.lagging()})
+            "lagging": self.lagging(), "owned": self.owned})
     }
 }
 
@@ -1209,7 +1217,7 @@ mod tests {
     #[test]
     fn reader_specs_parse_and_round_trip() {
         let specs = ReaderSpec::parse_list(
-            "mapped,safe:durable:wait=block,safe:delay=20us,mapped:stall=200ms/5s:wait=sleep",
+            "mapped,safe:durable:wait=block,safe:delay=20us,mapped:stall=200ms/5s:wait=sleep:owned",
             WaitMode::Spin,
         )
         .unwrap();

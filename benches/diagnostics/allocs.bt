@@ -1,0 +1,12 @@
+#!/usr/bin/env bpftrace
+// Heap allocations of one thread: calls into the C library's allocator, which Rust's System allocator uses, with the
+// bytes asked for and the user stacks they come from. Part of profile-sustained.sh.
+//   sudo bpftrace allocs.bt TID SECONDS
+// Counts are totals over SECONDS. No output means no allocation. `free` is counted too (no stacks).
+
+uprobe:libc:malloc /tid == $1/ { @malloc = count(); @malloc_bytes = sum(arg0); @stack[ustack(10)] = count(); }
+uprobe:libc:calloc /tid == $1/ { @calloc = count(); @calloc_bytes = sum(arg0 * arg1); @stack[ustack(10)] = count(); }
+uprobe:libc:realloc /tid == $1/ { @realloc = count(); @realloc_bytes = sum(arg1); @stack[ustack(10)] = count(); }
+uprobe:libc:posix_memalign /tid == $1/ { @posix_memalign = count(); @stack[ustack(10)] = count(); }
+uprobe:libc:free /tid == $1/ { @free = count(); }
+interval:s:$2 { exit(); }
