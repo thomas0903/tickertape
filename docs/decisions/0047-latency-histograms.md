@@ -104,10 +104,10 @@ market-data packet is the usual choice). It equals writer-to-reader latency only
 - `local_ts_ns` later than the observer's clock: counted as `ahead`, not in the histogram. It is never recorded as 0.
 
 **When `ahead` is not 0, the minimum and every percentile are biased upwards**: the fastest records are the ones
-missing. That happens after a backward clock step, and with a constant offset: a NIC or PHC hardware stamp, a clock on TAI (37 s
-ahead of UTC), or another clock a few microseconds fast. A constant offset the other way adds itself to every age,
-unseen. On macOS `realtime_ns` ticks in 1 µs steps (measured), so ages below that show as 0 and a finer stamp can look
-ahead.
+missing. That happens after a backward clock step, and with a constant offset: a NIC or PHC hardware stamp, a clock on
+TAI (37 s ahead of UTC), or another clock a few microseconds fast. A constant offset the other way adds itself to every
+age, unseen. On macOS `realtime_ns` ticks in 1 µs steps (measured), so ages below that show as 0 and a finer stamp can
+look ahead.
 
 Two processes on one machine (also in different containers) that both stamp and observe with `CLOCK_REALTIME` share the
 clock, and a step moves the result by the step: forward shows as a false maximum, backward as `ahead`. Use a slewed
@@ -144,9 +144,9 @@ The test is on the append recorder only (`append_latency: Option<Recorder>`, set
 field, behind a `Box`. `append_batch` makes the same test once per call. `write_record` changes in one place, inside
 its existing roll branch: `self.roll()?` becomes a call to a `#[cold]` function that times the roll if the mode asks
 for it; `roll` itself and the rest of the path stay as they are. `Job` gains `requested_at: Option<Instant>` (`absorb`
-keeps the earlier one). `run_thread` reuses its `finished` and `checkpoint_inner` the time it stores in `last_checkpoint_at`;
-each records only after success, the thread before it posts the result, so a caller that sees the checkpoint finished
-also finds the sample.
+keeps the earlier one). `run_thread` reuses its `finished` and `checkpoint_inner` the time it stores in
+`last_checkpoint_at`; each records only after success, the thread before it posts the result, so a caller that sees the
+checkpoint finished also finds the sample.
 
 If an off-cost gate below fails, the fallback is to fold the test into the one for `abandoned_write_error` (one flag,
 "this append takes the slow entry", kept in step with both), which leaves the path with as many tests as today. If that
@@ -172,8 +172,8 @@ Rejected:
 **Clock reads and "no system call".** With a vDSO clock source (`tsc`, `kvm-clock`, `hyperv_clocksource_tsc_page`,
 `arch_sys_counter`) Linux answers `Instant::now()` without entering the kernel. With others (`hpet`, `acpi_pm`, some
 Xen guests) each read is a system call. The library does not test for this; `operations.md` names
-`/sys/devices/system/clocksource/clocksource0/current_clocksource` and says not to use `LatencyMode::All` there. macOS reads
-the clock without a system call.
+`/sys/devices/system/clocksource/clocksource0/current_clocksource` and says not to use `LatencyMode::All` there. macOS
+reads the clock without a system call.
 
 ## The histogram
 
@@ -374,14 +374,15 @@ HIST = {"count":u64,"min_ns":u64|null,"mean_ns":number|null,"p50_ns":u64|null,"p
 ```
 
 `journal` is the canonical path and `sampled_unix_ns` the time of the report, as in `status --json`. `records` counts
-the records returned while live and `first_seq`/`last_seq` are theirs (null when there are none). `records` is
-the sum of `age.count`, `unset_timestamp` and `ahead_of_clock`; `before_live` and `after_discontinuity` count the other
+the records returned while live and `first_seq`/`last_seq` are theirs (null when there are none). `records` is the sum
+of `age.count`, `unset_timestamp` and `ahead_of_clock`; `before_live` and `after_discontinuity` count the other
 records. Everything is cumulative since the command started, except `interval_age`: the samples since the previous
 report, null without an interval. `final` is true on the last report. `discontinuities` counts discarded histories the
-command resumed after. `min_ns` and `max_ns` are exact in `age`; in `interval_age` they can be bucket bounds. Percentiles are nearest rank, bucket upper bounds,
-at most 1.6 % high; with a small `count` the high ones equal the maximum. An empty histogram has nulls; `mean_ns` is also null once
-the sum has saturated. A non-zero `ahead_of_clock` biases `min_ns` and the percentiles upwards (above). `wait` may gain
-values; fields may be added. The text output shows the same values and is not a stable surface.
+command resumed after. `min_ns` and `max_ns` are exact in `age`; in `interval_age` they can be bucket bounds.
+Percentiles are nearest rank, bucket upper bounds, at most 1.6 % high; with a small `count` the high ones equal the
+maximum. An empty histogram has nulls; `mean_ns` is also null once the sum has saturated. A non-zero `ahead_of_clock`
+biases `min_ns` and the percentiles upwards (above). `wait` may gain values; fields may be added. The text output shows
+the same values and is not a stable surface.
 
 No Prometheus output in the first version. `operations.md` shows an application exporting a `Snapshot` as gauges with
 the client library it already has, as it does for `Status`.
