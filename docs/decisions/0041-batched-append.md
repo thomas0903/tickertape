@@ -122,4 +122,5 @@ burst can encode the burst into its own buffers and pass them to `append_batch`,
 - `benches/benches/append.rs` gains an `append/batch` group (with and without a reader that blocks); `append` must
   not get slower, which the pull request shows with before and after runs.
 - The roadmap item's other parts (profiling the readers and serialization paths under the sustained workloads)
-  stay open.
+  stayed open. Done 2026-11-26: the profiles are in `docs/benchmarks.md` (2026-11-25), which also has the wake-ups'
+  share of the writer's time with a blocked reader.
