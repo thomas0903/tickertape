@@ -193,10 +193,10 @@ bounds(i) = [i, i]                                    // i < 128
 Rejected: **`hdrhistogram`** (used by the bench tools). `deny.toml` accepts it, and in the prototype it recorded as fast
 as this one. But reading it needs exclusive access, or its `SyncHistogram`, where a refresh waits until every recorder
 has made a record (a writer that is idle holds the monitor up) and the recording thread hands its histogram over a
-channel; that also adds `crossbeam-channel`. Its type would either become part of the stable API or be wrapped completely; recording returns a `Result`; at
-three significant digits it takes 221 KB for 1 ns to 60 s, and the core crate has four dependencies today. **Moving the
-bench tools' code** is not possible, as it is that crate. The bench tools stay on it, with three significant digits, so
-that published results remain comparable. **Locked atomic updates everywhere** cost about 3 to 5 ns more per append for
+channel; that also adds `crossbeam-channel`. Its type would either become part of the stable API or be wrapped
+completely; recording returns a `Result`; at three significant digits it takes 221 KB for 1 ns to 60 s, and the core
+crate has four dependencies today. **Moving the bench tools' code** is not possible, as it is that crate. The bench
+tools stay on it, with three significant digits, so that published results remain comparable. **Locked atomic updates everywhere** cost about 3 to 5 ns more per append for
 nothing, since there is one writer.
 
 ## Public surface
