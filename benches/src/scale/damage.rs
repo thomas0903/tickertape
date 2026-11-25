@@ -16,7 +16,7 @@ use tickertape::{
 };
 
 use super::archive::error_text;
-use super::{ReaderKind, build, record, timed};
+use super::{ReaderKind, build, record, timed, used_index, with_index};
 use crate::sustained::record_bytes;
 use crate::{Result, segment_capacity};
 
@@ -374,7 +374,15 @@ pub fn seek_target(probe: &str, shape: Shape, case: Case) -> Result<Option<u64>>
 }
 
 /// Runs one read probe in this process: its cost, and what it returned (`outcome`: `ok`, `end` or the error).
-pub fn read_probe(dir: &Path, probe: &str, kind: ReaderKind, seq: Option<u64>) -> Result<Value> {
+/// A seek may use seek indexes if `indexed`.
+pub fn read_probe(
+    dir: &Path,
+    probe: &str,
+    kind: ReaderKind,
+    seq: Option<u64>,
+    indexed: bool,
+) -> Result<Value> {
+    let config = with_index(ReaderConfig::default(), indexed)?;
     let mut out = timed(|| {
         Ok(match probe {
             "open" => match kind.open(dir, ReaderConfig::default()) {
@@ -382,26 +390,31 @@ pub fn read_probe(dir: &Path, probe: &str, kind: ReaderKind, seq: Option<u64>) -
                 Err(e) => json!({"outcome": error_text(&e)}),
             },
             "replay" => replay(dir, kind),
-            "seek-to-end" => seek_to_end(dir, kind),
+            "seek-to-end" => seek_to_end(dir, kind, config),
             _ => {
                 let seq = seq.ok_or("a seek probe needs --seq")?;
-                match kind.open(dir, ReaderConfig::default()) {
+                match kind.open(dir, config) {
                     Err(e) => json!({"outcome": error_text(&e), "at": "open"}),
-                    Ok(mut reader) => match reader.seek(seq) {
-                        Err(e) => json!({"outcome": error_text(&e), "at": "seek"}),
-                        Ok(()) => match reader.try_next() {
-                            Ok(Some(r)) if r.seq == seq => json!({"outcome": "ok"}),
-                            Ok(Some(r)) => json!({"outcome": format!("record {}", r.seq)}),
-                            Ok(None) => json!({"outcome": "end", "at": "next"}),
-                            Err(e) => json!({"outcome": error_text(&e), "at": "next"}),
-                        },
-                    },
+                    Ok(mut reader) => {
+                        let mut out = match reader.seek(seq) {
+                            Err(e) => json!({"outcome": error_text(&e), "at": "seek"}),
+                            Ok(()) => match reader.try_next() {
+                                Ok(Some(r)) if r.seq == seq => json!({"outcome": "ok"}),
+                                Ok(Some(r)) => json!({"outcome": format!("record {}", r.seq)}),
+                                Ok(None) => json!({"outcome": "end", "at": "next"}),
+                                Err(e) => json!({"outcome": error_text(&e), "at": "next"}),
+                            },
+                        };
+                        out["used_index"] = used_index(&reader);
+                        out
+                    }
                 }
             }
         })
     })?;
     out["probe"] = json!(probe);
     out["reader"] = json!(kind.name());
+    out["seek_index"] = json!(indexed);
     out["seq"] = json!(seq);
     Ok(out)
 }
@@ -429,8 +442,8 @@ fn replay(dir: &Path, kind: ReaderKind) -> Value {
 }
 
 #[cfg(feature = "core-1-1")]
-fn seek_to_end(dir: &Path, kind: ReaderKind) -> Value {
-    match kind.open(dir, ReaderConfig::default()) {
+fn seek_to_end(dir: &Path, kind: ReaderKind, config: ReaderConfig) -> Value {
+    match kind.open(dir, config) {
         Err(e) => json!({"outcome": error_text(&e), "at": "open"}),
         Ok(mut reader) => match reader.seek_to_end() {
             Ok(()) => json!({"outcome": "ok", "position": reader.position()}),
@@ -442,7 +455,7 @@ fn seek_to_end(dir: &Path, kind: ReaderKind) -> Value {
 }
 
 #[cfg(not(feature = "core-1-1"))]
-fn seek_to_end(_: &Path, _: ReaderKind) -> Value {
+fn seek_to_end(_: &Path, _: ReaderKind, _: ReaderConfig) -> Value {
     json!({"outcome": "not measured: this core has no Reader::seek_to_end"})
 }
 
@@ -473,6 +486,20 @@ pub fn check_probe(dir: &Path, probe: &str) -> Result<Value> {
             }
         })
     })?;
+    out["probe"] = json!(probe);
+    Ok(out)
+}
+
+/// Builds every seek index of the damaged journal anew, or checks them, in this process.
+pub fn index_probe(dir: &Path, probe: &str) -> Result<Value> {
+    let mut out = timed(|| {
+        let mut out = super::index(dir, probe)?;
+        out["outcome"] = json!("ok");
+        Ok(out)
+    })?;
+    if let Some(error) = out.get("error").cloned() {
+        out["outcome"] = error;
+    }
     out["probe"] = json!(probe);
     Ok(out)
 }
@@ -742,7 +769,7 @@ mod tests {
             for probe in READ_PROBES {
                 let seq = seek_target(probe, SHAPE, case).unwrap();
                 for kind in [ReaderKind::Safe, ReaderKind::Mapped] {
-                    let out = read_probe(&dir, probe, kind, seq).unwrap();
+                    let out = read_probe(&dir, probe, kind, seq, false).unwrap();
                     assert!(out["outcome"].is_string(), "{name} {probe} {out}");
                 }
             }
@@ -752,13 +779,18 @@ mod tests {
                 "{name} {verify}"
             );
             assert!(check_probe(&dir, "status").unwrap()["outcome"].is_string());
+            for probe in ["index-build", "index-check"] {
+                let out = index_probe(&dir, probe).unwrap();
+                assert!(out["outcome"].is_string(), "{name} {probe} {out}");
+            }
         }
         assert!(
             read_probe(
                 &bases.journal(find("intact").unwrap()),
                 "seek-last",
                 ReaderKind::Safe,
-                None
+                None,
+                false
             )
             .unwrap()["error"]
                 .is_string()

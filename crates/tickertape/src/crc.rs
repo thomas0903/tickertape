@@ -69,6 +69,11 @@ pub(crate) fn x8n(mut n: u64) -> u32 {
 
 /// Continues `crc` over `head`, then the bytes of `words` (word `i` is bytes `[8i, 8i + 8)`, little-endian), then
 /// `tail`: the same value as [`crc32c_append`] over the concatenation. Each word is loaded exactly once.
+///
+/// The hardware path below is marked `#[inline]` so that it can be inlined into this function whichever codegen unit each
+/// is in. Measured with the default release profile (16 codegen units), mapped reader, 64-byte records, M4 Pro: after the
+/// seek index, which does not call this function, had changed how the crate is split, replay was 3 to 4 % slower than
+/// before, and level with it again with these attributes.
 pub(crate) fn crc32c_append_parts(
     crc: u32,
     head: &[u8],
@@ -265,6 +270,7 @@ macro_rules! three_lane_crc {
         /// As `update`, over words loaded one at a time from shared memory: each load feeds the CRC instruction
         /// directly, with the same three-lane blocks (in words) and the same serial tail.
         #[target_feature(enable = $feature)]
+        #[inline]
         #[allow(unused_unsafe)]
         unsafe fn update_words(
             mut crc: u32,
@@ -307,6 +313,7 @@ macro_rules! three_lane_crc {
         /// `update` over `head`, then `update_words` over `words`, then `update` over `tail`, in one function
         /// compiled with the feature.
         #[target_feature(enable = $feature)]
+        #[inline]
         #[allow(unused_unsafe)]
         unsafe fn update_parts(
             crc: u32,
@@ -324,6 +331,7 @@ macro_rules! three_lane_crc {
         }
 
         /// `None` if the CPU lacks the feature; otherwise [`super::crc32c_append_parts`].
+        #[inline]
         pub(super) fn append_parts(
             crc: u32,
             head: &[u8],

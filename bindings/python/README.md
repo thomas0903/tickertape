@@ -48,6 +48,10 @@ A record is **visible** to readers, and survives the writer process dying, as so
 `checkpoint()` returns. Closing a writer does not checkpoint. Readers that must never act on a record a power loss
 could erase use `Reader(path, durable_only=True)`, which returns only records covered by the last checkpoint.
 
+`Reader(path, seek_index=True)` (from 1.1) lets `seek` start at a record named by a seek index, one of the files
+`tickertape index` writes (`docs/operations.md` → Seek indexes). Records before it are then not read, so damage there
+goes unnoticed; not for journals where someone who may not write the segments can write `seek-index/`.
+
 `request_checkpoint()` starts the same checkpoint on a thread of the library and returns at once with the sequence
 number it covers up to, so appends go on while it syncs; `checkpoint_progress()` returns a `CheckpointProgress`
 (`durable`: the last durable `Checkpoint` or `None`; `pending`: the frontier still in flight or `None`). One runs at a

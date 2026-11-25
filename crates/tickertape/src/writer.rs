@@ -21,6 +21,7 @@ use crate::journal::{self, CHECKPOINT_FILE, LOCK_FILE, QUARANTINE_DIR};
 use crate::mmap::{self, MapRw};
 use crate::prefault::{Prefaulter, Spare};
 use crate::record::NewRecord;
+use crate::seek_index;
 use crate::writeback::WriteBack;
 
 /// The only process allowed to append to a journal.
@@ -1539,6 +1540,9 @@ impl Recovery<'_> {
             if let Some(c) = checkpoint {
                 return Err(self.dangling(c));
             }
+            // Nothing is left that an index could belong to.
+            let mut swept = seek_index::dir::sweep(self.dir, 0, None);
+            self.count_swept(&mut swept);
             let active = create_segment(self.dir, 0, self.config.segment_size, true)?;
             journal::sync_dir(self.dir)?;
             mmap::full_barrier(&active.file)
@@ -1576,6 +1580,12 @@ impl Recovery<'_> {
                 return Err(self.dangling(c));
             }
         }
+        // Step 2a: the seek indexes of every segment recovery may change go before it changes anything (ADR 0045, T4).
+        let mut swept = seek_index::dir::sweep(
+            self.dir,
+            checkpoint.map_or(0, |c| c.segment_base_seq),
+            bases.first().copied(),
+        );
         let mut visited = BTreeSet::new();
         // Segments after the marker, synced by the first checkpoint; only the newest few stay open, so a scan of any
         // number of segments holds a bounded number of descriptors.
@@ -1779,7 +1789,13 @@ impl Recovery<'_> {
             }
             mmap::full_barrier(&seg.file)
                 .map_err(|e| Error::io("full sync segment", &seg.path, e))?;
+        } else {
+            // The removal of indexes reaches the drive before anything is appended; best effort, as the removal is.
+            // Through the directory's own descriptor, never the segment's: a sync here that fails would consume the
+            // write-back error that the first checkpoint must report (crash contract, "Errors are sticky").
+            swept.barrier();
         }
+        self.count_swept(&mut swept);
 
         let active_dirty_from = if seg.base == start_base {
             checkpoint.map_or(format::SEGMENT_HEADER_LEN as u64, |c| c.offset)
@@ -1793,6 +1809,15 @@ impl Recovery<'_> {
             active_dirty_from: active_dirty_from.min(offset),
             dirty,
         })
+    }
+
+    /// After recovery: removes the seek indexes of segments that are gone, and reports what the removal did.
+    fn count_swept(&mut self, swept: &mut seek_index::dir::Swept) {
+        swept.remove_orphans();
+        (
+            self.report.seek_indexes_removed,
+            self.report.seek_index_errors,
+        ) = swept.counts();
     }
 
     /// Opens the segment for `base` that the scan enters after the segment it scanned (named by a valid seal, or the
@@ -2364,6 +2389,13 @@ pub struct RecoveryReport {
     pub had_checkpoint: bool,
     /// Every repair action, in the order performed. Empty for a cleanly closed journal.
     pub actions: Vec<RecoveryAction>,
+    /// Names removed from `seek-index/` (ADR 0045): the seek indexes of segments that recovery may change, those of
+    /// segments that are gone, and indexes left unfinished. Not repairs, so not in [`RecoveryReport::actions`]. Added
+    /// in 1.1.
+    pub seek_indexes_removed: u64,
+    /// What failed of that removal (a name that could not be removed, a listing, a sync). It never fails the open: an
+    /// index that stays is still checked against its segment by every reader that uses it. Added in 1.1.
+    pub seek_index_errors: u64,
 }
 
 /// One repair performed by [`Writer::open`].

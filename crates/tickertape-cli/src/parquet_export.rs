@@ -321,6 +321,7 @@ mod tests {
                 from: None,
                 to: None,
                 durable_only: false,
+                seek_index: false,
             },
             &mut Vec::new(),
         );

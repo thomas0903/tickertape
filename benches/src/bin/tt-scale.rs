@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use tickertape::{RecoveryPolicy, WriterConfig};
 use tickertape_bench::scale::damage::{self, Base, Shape};
 use tickertape_bench::scale::{
-    self, Journal, OPS, OPTIONAL_OPS, Op, READER_OPS, ReaderKind, SEEK_OPS, catch_up,
+    self, INDEX_OPS, Journal, OPS, OPTIONAL_OPS, Op, READER_OPS, ReaderKind, SEEK_OPS, catch_up,
 };
 use tickertape_bench::sustained::{WaitMode, total_ram_bytes};
 use tickertape_bench::{Options, Result};
@@ -20,7 +20,7 @@ Usage: tt-scale build    --dir <DIR> --segments <N> [--segment-size <bytes>] [--
                          [--checkpoint-every <segments>] [--fill-last <percent>] [--json]
        tt-scale measure  --dir <DIR> [--ops <list>] [--readers <list>] [--repeats <N>] [--tail-records <N>]
                          [--count <N>] [--end <seq>] [--cli <program>] [--max-open-files <N>] [--label <text>]
-                         [--cold] [--sample-open-files] [--allow-errors] [--json]
+                         [--cold] [--seek-index] [--sample-open-files] [--allow-errors] [--json]
        tt-scale run      <build options> <measure options>
        tt-scale archive  --dir <DIR> --to <DIR> [--keep-segments <N>] [--cold] [--json]
        tt-scale damage   --dir <DIR> [--segments <N>] [--segment-size <bytes>] [--payload <bytes>]
@@ -39,7 +39,8 @@ tail, or --end, the sequence number after the last record, for a directory witho
 changes it: writer operations append records and checkpoint.
 
 Operations (--ops takes a comma-separated subset; default all but the optional ones, in this order; `seeks`
-stands for reader-open and every seek):
+stands for reader-open and every seek, `unindexed` for the default operations without the last two, and --seek-index
+lets the reader of every seek use seek indexes):
   list-directory              reads the journal directory
   list-segments               inspect::list_segments (opens every segment header)
   reader-open                 Reader::open (lists the directory, opens the oldest segment)
@@ -49,6 +50,7 @@ stands for reader-open and every seek):
                               longest scan a seek costs
   seek-forward                seeks to that segment's first record, then through it in 16 equal forward steps,
                               reading one record after each (steps_s, steps_total_s)
+  seek-sealed                 the same to the last record of the newest sealed segment
   seek-to-end                 Reader::seek_to_end and one try_next
   replay                      opens a reader and calls try_next to the end (or to --end)
   status                      status::status, one sample
@@ -64,8 +66,12 @@ stands for reader-open and every seek):
                               open is not timed (writer_open_s)
   checkpoint-loop-retention   the same with a retention limit no journal reaches, so that every checkpoint also
                               makes a retention plan
+  index-build                 seek_index::build, writing every index anew (segments before the checkpoint's)
+  seek-sealed-indexed         seek-sealed by a reader that may use a seek index (used_index says whether it did)
 Optional operations:
   retention-delete            plans and deletes the --count oldest segments (shrinks the journal)
+  index-refresh               seek_index::build of what is missing or outdated (a run with nothing new to index)
+  index-check                 seek_index::check, which reads every segment
   cli-verify|export|stats     the tickertape program given by --cli, as a process: verify, export --format jsonl
                               to a pipe nobody reads (bounded by --end), stats
 
@@ -113,7 +119,12 @@ const MEASURE_VALUES: &[&str] = &[
     "--max-open-files",
     "--label",
 ];
-const MEASURE_FLAGS: &[&str] = &["--cold", "--sample-open-files", "--allow-errors"];
+const MEASURE_FLAGS: &[&str] = &[
+    "--cold",
+    "--seek-index",
+    "--sample-open-files",
+    "--allow-errors",
+];
 const BUILD_VALUES: &[&str] = &[
     "--segments",
     "--segment-size",
@@ -182,6 +193,10 @@ fn operations(list: Option<&str>) -> Result<Vec<&'static str>> {
     for name in list.split(',') {
         if name == "seeks" {
             ops.extend(SEEK_OPS);
+            continue;
+        }
+        if name == "unindexed" {
+            ops.extend(OPS.iter().filter(|op| !INDEX_OPS.contains(op)));
             continue;
         }
         let known = OPS.iter().chain(OPTIONAL_OPS).find(|op| **op == name);
@@ -256,8 +271,10 @@ fn measure(dir: &Path, options: &Options) -> Result<Value> {
                 "--max-open-files",
                 options.optional("--max-open-files").map(str::to_owned),
             );
-            if options.flag("--sample-open-files") {
-                args.push("--sample-open-files".to_owned());
+            for flag in ["--sample-open-files", "--seek-index"] {
+                if options.flag(flag) {
+                    args.push(flag.to_owned());
+                }
             }
             let mut run = child(&args)?;
             run["repeat"] = json!(repeat);
@@ -280,7 +297,7 @@ fn measure(dir: &Path, options: &Options) -> Result<Value> {
         "journal": journal.json(), "payload": payload, "cold_requested": cold, "cold_unavailable": cold_unavailable,
         "ram_bytes": total_ram_bytes(), "cgroup_memory_max_bytes": scale::cgroup_memory_limit(),
         "os": std::env::consts::OS, "arch": std::env::consts::ARCH, "dir": dir, "label": options.optional("--label"),
-        "end": end, "core_1_1": cfg!(feature = "core-1-1"), "errors": errors, "runs": runs,
+        "end": end, "seek_index": options.flag("--seek-index"), "core_1_1": cfg!(feature = "core-1-1"), "errors": errors, "runs": runs,
     }))
 }
 
@@ -380,6 +397,26 @@ fn damage(options: &Options) -> Result<Value> {
         }
         for name in ["verify", "status"] {
             probes.push(probe(&[("--probe", name.to_owned())], cold)?);
+        }
+        // `tickertape index` on the damaged journal, and what a reader that uses the result then does.
+        for name in ["index-build", "index-check"] {
+            probes.push(probe(&[("--probe", name.to_owned())], cold)?);
+        }
+        for name in damage::READ_PROBES
+            .iter()
+            .filter(|n| n.starts_with("seek-"))
+        {
+            for kind in [ReaderKind::Safe, ReaderKind::Mapped] {
+                let mut args = vec![
+                    ("--probe", (*name).to_owned()),
+                    ("--reader", kind.name().to_owned()),
+                    ("--seek-index", "on".to_owned()),
+                ];
+                if let Some(seq) = damage::seek_target(name, shape, case)? {
+                    args.push(("--seq", seq.to_string()));
+                }
+                probes.push(probe(&args, cold)?);
+            }
         }
         let mut writers = Vec::new();
         for policy in [RecoveryPolicy::Quarantine, RecoveryPolicy::Fail] {
@@ -565,7 +602,7 @@ fn run(args: &[String]) -> Result<()> {
                     "--cli",
                     "--max-open-files",
                 ],
-                &["--sample-open-files"],
+                &["--sample-open-files", "--seek-index"],
             )?;
             if options.optional("--max-open-files").is_some() {
                 scale::limit_open_files(options.number("--max-open-files", None)?)?;
@@ -582,6 +619,7 @@ fn run(args: &[String]) -> Result<()> {
                     .number("--segment-size", Some(WriterConfig::DEFAULT_SEGMENT_SIZE))?,
                 count: options.number("--count", Some(100))?,
                 cli: options.path("--cli"),
+                seek_index: options.flag("--seek-index"),
                 sample_files: options.flag("--sample-open-files"),
             })?;
             println!("{out}");
@@ -604,6 +642,7 @@ fn run(args: &[String]) -> Result<()> {
                     "--dir",
                     "--probe",
                     "--reader",
+                    "--seek-index",
                     "--seq",
                     "--segments",
                     "--segment-size",
@@ -614,6 +653,7 @@ fn run(args: &[String]) -> Result<()> {
             let dir = PathBuf::from(options.required("--dir")?);
             let out = match options.required("--probe")? {
                 name @ ("verify" | "status") => damage::check_probe(&dir, name)?,
+                name @ ("index-build" | "index-check") => damage::index_probe(&dir, name)?,
                 "writer-open-quarantine" => {
                     damage::writer_probe(&dir, RecoveryPolicy::Quarantine, shape(&options)?)?
                 }
@@ -625,6 +665,7 @@ fn run(args: &[String]) -> Result<()> {
                     name,
                     ReaderKind::parse(options.required("--reader")?)?,
                     options.optional("--seq").map(str::parse).transpose()?,
+                    options.optional("--seek-index").is_some(),
                 )?,
             };
             println!("{out}");

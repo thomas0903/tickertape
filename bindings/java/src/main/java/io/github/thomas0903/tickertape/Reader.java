@@ -127,7 +127,9 @@ public final class Reader implements AutoCloseable {
      * tools. A tickertape writer never modifies committed bytes, including during recovery, so this holds in normal
      * operation. If it is broken, payloads can change under you, and if a mapped file is truncated the JVM receives
      * {@code SIGBUS} and dies. The binding cannot check this. Use {@link #open(Path, ReaderOptions)} when you cannot
-     * rule it out (for example, for journals on shared or untrusted storage).
+     * rule it out (for example, for journals on shared or untrusted storage). With {@link ReaderOptions#seekIndex}
+     * enabled, the precondition also covers the journal's {@code seek-index/} directory and its {@code checkpoint} file,
+     * and an index builder ({@code tickertape index}) counts as a writer.
      *
      * <p>Errors are as for {@link #open(Path, ReaderOptions)}.
      */
@@ -365,7 +367,10 @@ public final class Reader implements AutoCloseable {
      * reader's position if the reader can tell that it is on the journal's current chain (from 1.1). Records before
      * that position are then not validated again, and if storage damage destroyed the checkpoint marker, or set it back
      * to an older one, together with covered records, the position can be off the current chain unnoticed; a seek to
-     * the last record the reader passed, or an earlier one, scans the segment, and so does a new reader. A successful seek also discards a record held back and an error deferred by
+     * the last record the reader passed, or an earlier one, scans the segment, and so does a new reader. With the
+     * seek-index option ({@link ReaderOptions#seekIndex}, from 1.1), the way may start at an indexed record before
+     * {@code seq}. Records before it are not read, and crash contract C15 says where the landing place can be off the
+     * chain. A successful seek also discards a record held back and an error deferred by
      * {@link #readBatch}; a failed seek leaves the reader as it was.
      *
      * @throws SeqUnavailableException if {@code seq} is older than the oldest segment (retention removed it);

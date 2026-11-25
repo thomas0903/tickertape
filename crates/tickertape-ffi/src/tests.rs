@@ -644,6 +644,15 @@ fn pure_options_validate_their_values() {
         assert_eq!((*o).config.backoff, tickertape::Backoff::busy_spin());
         assert_eq!(tickertape_reader_options_set_durable_only(o, 1), OK);
         assert!((*o).config.durable_only);
+        assert!(!(*o).config.seek_index);
+        assert_eq!(tickertape_reader_options_set_seek_index(o, 1), OK);
+        assert!((*o).config.seek_index);
+        assert_eq!(tickertape_reader_options_set_seek_index(o, 0), OK);
+        assert!(!(*o).config.seek_index);
+        assert_eq!(
+            tickertape_reader_options_set_seek_index(null_mut(), 1),
+            INVALID
+        );
         tickertape_reader_options_free(o);
     }
 }

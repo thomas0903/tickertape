@@ -28,7 +28,8 @@ use crate::{Result, elapsed_ns, fresh_directory, histogram_json, segment_capacit
 pub const SAVED_MARKER: &str = "checkpoint.tt-scale-saved";
 
 /// Every operation `measure` runs by default, in this order. Writer operations come last because they change the
-/// journal: `writer-open-after-kill` appends a tail first, and every writer operation leaves a checkpoint at the end.
+/// journal: `writer-open-after-kill` appends a tail first, and every writer operation leaves a checkpoint at the end. The
+/// seek index operations (ADR 0045) come after them, so that every other operation of a new journal runs without indexes.
 pub const OPS: &[&str] = &[
     "list-directory",
     "list-segments",
@@ -37,6 +38,7 @@ pub const OPS: &[&str] = &[
     "seek-middle",
     "seek-segment-end",
     "seek-last",
+    "seek-sealed",
     "seek-forward",
     "seek-to-end",
     "replay",
@@ -48,10 +50,22 @@ pub const OPS: &[&str] = &[
     "writer-open-without-marker",
     "checkpoint-loop",
     "checkpoint-loop-retention",
+    "index-build",
+    "seek-sealed-indexed",
 ];
 
+/// The operations of [`OPS`] that write or use a seek index.
+pub const INDEX_OPS: &[&str] = &["index-build", "seek-sealed-indexed"];
+
 /// Operations `measure` runs only when asked: `retention-delete` shrinks the journal, the `cli-` ones need `--cli`.
-pub const OPTIONAL_OPS: &[&str] = &["retention-delete", "cli-verify", "cli-export", "cli-stats"];
+pub const OPTIONAL_OPS: &[&str] = &[
+    "retention-delete",
+    "index-refresh",
+    "index-check",
+    "cli-verify",
+    "cli-export",
+    "cli-stats",
+];
 
 /// The operations that open a reader, and so run once for each requested [`ReaderKind`].
 pub const READER_OPS: &[&str] = &[
@@ -60,6 +74,8 @@ pub const READER_OPS: &[&str] = &[
     "seek-middle",
     "seek-segment-end",
     "seek-last",
+    "seek-sealed",
+    "seek-sealed-indexed",
     "seek-forward",
     "seek-to-end",
     "replay",
@@ -72,6 +88,7 @@ pub const SEEK_OPS: &[&str] = &[
     "seek-middle",
     "seek-segment-end",
     "seek-last",
+    "seek-sealed",
     "seek-forward",
     "seek-to-end",
 ];
@@ -376,9 +393,14 @@ impl Journal {
     }
 
     /// The sequence number a seek operation targets: the first, middle or last record, the last record of a full
-    /// segment in the middle (the longest scan a seek can cost), or that segment's first record for `seek-forward`.
+    /// segment in the middle (the longest scan a seek can cost), that segment's first record for `seek-forward`, or
+    /// the last record of the newest sealed segment (of the newest segment, if it is the only one).
     pub fn seek_target(&self, op: &str) -> Option<u64> {
         match op {
+            "seek-sealed" | "seek-sealed-indexed" => Some(match self.bases[..] {
+                [.., newest] if self.bases.len() > 1 => newest - 1,
+                _ => self.next_seq - 1,
+            }),
             "seek-segment-end" => Some(self.middle_segment().1 - 1),
             "seek-forward" => Some(self.middle_segment().0),
             "seek-first" => Some(self.first_seq),
@@ -428,6 +450,8 @@ pub struct Op {
     pub count: u64,
     /// The `tickertape` program for the `cli-` operations.
     pub cli: Option<PathBuf>,
+    /// Let the reader of a seek use seek indexes.
+    pub seek_index: bool,
     /// Count open files while the operation runs (not for timings).
     pub sample_files: bool,
 }
@@ -445,6 +469,7 @@ impl Op {
             segment_size,
             count: 1,
             cli: None,
+            seek_index: false,
             sample_files: false,
         }
     }
@@ -494,7 +519,12 @@ fn dispatch(op: &Op) -> Result<Value> {
             let reader = op.reader.open(dir, ReaderConfig::default())?;
             Ok(json!({"position": reader.position()}))
         }),
-        "seek-first" | "seek-middle" | "seek-segment-end" | "seek-last" => {
+        "seek-first"
+        | "seek-middle"
+        | "seek-segment-end"
+        | "seek-last"
+        | "seek-sealed"
+        | "seek-sealed-indexed" => {
             let seq = op.target()?;
             seek_op(op, |reader| {
                 reader.seek(seq)?;
@@ -546,6 +576,7 @@ fn dispatch(op: &Op) -> Result<Value> {
             writer_open(op)
         }
         "checkpoint-loop" | "checkpoint-loop-retention" => checkpoint_loop(op),
+        "index-build" | "index-refresh" | "index-check" => timed(|| index(dir, &op.name)),
         "cli-verify" | "cli-export" | "cli-stats" => cli(op),
         other => Err(format!("unknown operation {other}").into()),
     }
@@ -567,11 +598,80 @@ fn expect_next(reader: &mut Reader, seq: u64) -> Result<()> {
 /// records before the target in it are read by the first `try_next`, so `f` reads one record too.
 fn seek_op(op: &Op, f: impl FnOnce(&mut Reader) -> Result<Value>) -> Result<Value> {
     let open = Instant::now();
-    let mut reader = op.reader.open(&op.dir, ReaderConfig::default())?;
+    let config = with_index(
+        ReaderConfig::default(),
+        op.seek_index || op.name == "seek-sealed-indexed",
+    )?;
+    let mut reader = op.reader.open(&op.dir, config)?;
     let open_s = open.elapsed().as_secs_f64();
     let mut out = timed(|| f(&mut reader))?;
     out["reader_open_s"] = json!(open_s);
+    out["used_index"] = used_index(&reader);
     Ok(out)
+}
+
+/// `config`, for a reader that may use seek indexes if `on` (1.1).
+#[cfg(feature = "core-1-1")]
+pub(crate) fn with_index(config: ReaderConfig, on: bool) -> Result<ReaderConfig> {
+    Ok(config.seek_index(on))
+}
+
+#[cfg(not(feature = "core-1-1"))]
+pub(crate) fn with_index(config: ReaderConfig, on: bool) -> Result<ReaderConfig> {
+    if on {
+        return Err("not measured: this core has no seek index".into());
+    }
+    Ok(config)
+}
+
+/// Whether the reader's last seek started at an indexed record.
+#[cfg(feature = "core-1-1")]
+pub(crate) fn used_index(reader: &Reader) -> Value {
+    json!(reader.seek_used_index())
+}
+
+#[cfg(not(feature = "core-1-1"))]
+pub(crate) fn used_index(_: &Reader) -> Value {
+    Value::Null
+}
+
+/// `index-build` (every index anew), `index-refresh` (what is missing or outdated) and `index-check`: the states of the
+/// segments, counted, and the size of the index files.
+#[cfg(feature = "core-1-1")]
+pub(crate) fn index(dir: &Path, name: &str) -> Result<Value> {
+    use tickertape::seek_index;
+    let segments = if name == "index-check" {
+        seek_index::check(dir)?.segments
+    } else {
+        seek_index::build(dir, name == "index-build")?.segments
+    };
+    let mut states = std::collections::BTreeMap::<String, u64>::new();
+    let mut reasons = Vec::new();
+    for segment in &segments {
+        *states.entry(format!("{:?}", segment.state)).or_default() += 1;
+        if let (Some(reason), true) = (&segment.reason, reasons.len() < 5) {
+            reasons.push(format!(
+                "{}: {:?}: {reason}",
+                segment.base_seq, segment.state
+            ));
+        }
+    }
+    let (mut files, mut bytes) = (0u64, 0u64);
+    if let Ok(entries) = std::fs::read_dir(dir.join(seek_index::DIR_NAME)) {
+        for entry in entries {
+            files += 1;
+            bytes += entry?.metadata()?.len();
+        }
+    }
+    Ok(
+        json!({"segments": segments.len(), "states": states, "reasons": reasons,
+        "built": states.get("Built").copied().unwrap_or(0), "index_files": files, "index_bytes": bytes}),
+    )
+}
+
+#[cfg(not(feature = "core-1-1"))]
+pub(crate) fn index(_: &Path, _: &str) -> Result<Value> {
+    Err("not measured: this core has no seek index".into())
 }
 
 /// Seeks to the first record of a full segment and then forward through it in equal steps, reading one record after
@@ -835,10 +935,19 @@ mod tests {
             built["records_per_segment"].as_u64().unwrap()
         );
         assert_eq!(payload_size(&dir).unwrap(), 100);
-        for op in ["seek-first", "seek-middle", "seek-last"] {
+        let indexes = run_op(&Op::new(&dir, "index-build", None, SIZE)).unwrap();
+        for op in [
+            "seek-first",
+            "seek-middle",
+            "seek-last",
+            "seek-sealed",
+            "seek-sealed-indexed",
+        ] {
             let seq = journal.seek_target(op).unwrap();
             let out = run_op(&Op::new(&dir, op, Some(seq), SIZE)).unwrap();
             assert_eq!(out["seq"], seq);
+            let indexed = op == "seek-sealed-indexed" && indexes["built"] != 0;
+            assert_eq!(out["used_index"], indexed, "{op}");
             assert!(out["wall_s"].as_f64().unwrap() >= 0.0);
             assert!(out["peak_rss_bytes"].as_i64().unwrap() > 0);
         }

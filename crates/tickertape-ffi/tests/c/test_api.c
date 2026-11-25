@@ -178,6 +178,9 @@ static tickertape_reader *open_reader(const char *dir, int durable_only, int map
     tickertape_reader_options *options = tickertape_reader_options_new();
     tickertape_reader *reader = NULL;
     REQUIRE_OK(tickertape_reader_options_set_durable_only(options, durable_only));
+    /* Without index files this changes nothing; with them, no test may see a difference either. */
+    REQUIRE_OK(tickertape_reader_options_set_seek_index(options, 1));
+    CHECK_STATUS(tickertape_reader_options_set_seek_index(NULL, 1), TICKERTAPE_E_INVALID_ARGUMENT);
     if (mapped) {
         REQUIRE_OK(tickertape_reader_open_mapped_unsafe(dir, options, &reader));
     } else {

@@ -37,6 +37,7 @@ step() {
 # empty cache.
 both() {
   local name="$1" dir="$2"; shift 2
+  [[ " $* " == *" --ops "* ]] || set -- "$@" --ops unindexed
   step "$name-warm" "$T" measure --dir "$dir" --readers safe,mapped --label main --allow-errors --json "$@"
   [ -n "$BASE" ] && step "$name-warm-base" "$BASE" measure --dir "$dir" --readers safe,mapped --label base --allow-errors --json "$@"
   step "$name-cold" "$T" measure --dir "$dir" --readers safe,mapped --label main --allow-errors --cold --json "$@"
@@ -65,7 +66,7 @@ counts() {
     dir="$ROOT/seg-$n"
     step "seg-$n-build" "$T" build --dir "$dir" --segments "$n" --segment-size $MIB --json
     both "seg-$n" "$dir" --repeats 2
-    step "seg-$n-files" "$T" measure --dir "$dir" --readers safe,mapped --sample-open-files --allow-errors --json
+    step "seg-$n-files" "$T" measure --dir "$dir" --readers safe,mapped --sample-open-files --allow-errors --json --ops unindexed
     step "seg-$n-files64" "$T" measure --dir "$dir" --readers safe,mapped --max-open-files 64 --allow-errors --json \
       --ops seeks,status,verify,retention-plan,writer-open-clean,writer-open-without-marker,checkpoint-loop-retention
     if [ "$n" = 10000 ]; then
@@ -97,8 +98,8 @@ archived() {
 many() {
   local dir="$ROOT/seg-100000"
   step "seg-100000-build" "$T" build --dir "$dir" --segments 100000 --segment-size 65536 --json
-  step "seg-100000-warm" "$T" measure --dir "$dir" --readers safe,mapped --repeats 2 --allow-errors --json
-  step "seg-100000-cold" "$T" measure --dir "$dir" --readers safe,mapped --repeats 2 --allow-errors --cold --json
+  step "seg-100000-warm" "$T" measure --dir "$dir" --readers safe,mapped --repeats 2 --allow-errors --json --ops unindexed
+  step "seg-100000-cold" "$T" measure --dir "$dir" --readers safe,mapped --repeats 2 --allow-errors --cold --json --ops unindexed
   rm -rf "${dir:?}"
 }
 
@@ -113,12 +114,28 @@ sizes() {
   done
 }
 
-# The seeks alone, on a journal larger than RAM if it exists (`big` leaves none): to repeat with and without an index.
+# Seek indexes (ADR 0045): the seeks without and with them, warm and cold, on the same journals; what building, refreshing
+# and checking costs; and what index files add to writer open, checkpoints with retention and deleting segments.
 seeks() {
-  local dir="$ROOT/seeks"
-  step "seeks-build" "$T" build --dir "$dir" --segments 160 --segment-size 134217728 --json
-  both "seeks" "$dir" --ops seeks --repeats 5
-  rm -rf "${dir:?}"
+  local shape name dir cache
+  for shape in "10000 $MIB" "20000 $MIB" "160 134217728" "10 1073741824"; do
+    set -- $shape
+    name="index-$1x$2"; dir="$ROOT/$name"
+    step "$name-build" "$T" build --dir "$dir" --segments "$1" --segment-size "$2" --json
+    for cache in "" --cold; do
+      step "$name-off${cache#-}" "$T" measure --dir "$dir" --readers safe,mapped --ops seeks --repeats 5 --allow-errors --json $cache
+    done
+    step "$name-writer-off" "$T" measure --dir "$dir" --ops writer-open-clean,checkpoint-loop-retention --repeats 5 --allow-errors --json
+    step "$name-make-cold" "$T" measure --dir "$dir" --ops index-build --cold --repeats 2 --allow-errors --json
+    step "$name-make-warm" "$T" measure --dir "$dir" --ops index-build,index-refresh,index-check --repeats 2 --allow-errors --json
+    step "$name-refresh-cold" "$T" measure --dir "$dir" --ops index-refresh --cold --repeats 2 --allow-errors --json
+    for cache in "" --cold; do
+      step "$name-on${cache#-}" "$T" measure --dir "$dir" --readers safe,mapped --ops seeks --seek-index --repeats 5 --allow-errors --json $cache
+    done
+    step "$name-writer-on" "$T" measure --dir "$dir" --ops writer-open-clean,checkpoint-loop-retention --repeats 5 --allow-errors --json
+    [ "$1" -ge 1000 ] && step "$name-retention" "$T" measure --dir "$dir" --ops retention-delete --count $(($1 / 10)) --repeats 2 --cold --allow-errors --json
+    rm -rf "${dir:?}"
+  done
 }
 
 # Missing and corrupt segments, with many small segments and with the default segment size.
@@ -135,8 +152,8 @@ damage() {
 big() {
   local dir="$ROOT/big" reader wait run cpus w r size
   step big-build "$T" build --dir "$dir" --segments 512 --segment-size 134217728 --json
-  step big-cold "$T" measure --dir "$dir" --readers safe,mapped --repeats 2 --allow-errors --cold --json
-  step big-warm "$T" measure --dir "$dir" --readers safe,mapped --repeats 2 --allow-errors --json
+  step big-cold "$T" measure --dir "$dir" --readers safe,mapped --repeats 2 --allow-errors --cold --json --ops unindexed
+  step big-warm "$T" measure --dir "$dir" --readers safe,mapped --repeats 2 --allow-errors --json --ops unindexed
   if [ -n "$BASE" ]; then
     step big-cold-base "$BASE" measure --dir "$dir" --readers safe,mapped --allow-errors --cold --json --ops seeks,replay
   fi

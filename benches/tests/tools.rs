@@ -727,6 +727,11 @@ fn scale_measures_every_operation_on_a_tiny_journal() {
         assert_eq!(run("seek-first", 0)["skipped_records"], 0);
         assert_eq!(run("seek-last", 1)["seq"], records - 1);
         assert_eq!(run("seek-last", 1)["skipped_records"], capacity / 2 - 1);
+        assert_eq!(run("seek-sealed", 0)["seq"], 2 * capacity - 1);
+        assert_eq!(run("seek-sealed", 0)["used_index"], false);
+        assert_eq!(run("seek-sealed-indexed", 1)["seq"], 2 * capacity - 1);
+        let indexed = run("index-build", 0)["built"] != 0;
+        assert_eq!(run("seek-sealed-indexed", 1)["used_index"], indexed);
         assert_eq!(run("replay", 0)["records"], records);
         assert_eq!(run("verify", 1)["problems"], 0);
         assert_eq!(run("writer-open-clean", 0)["scanned_from_seq"], records);
@@ -887,7 +892,8 @@ fn scale_damage_reports_every_probe_of_a_case() {
     let cases = result["cases"].as_array().unwrap();
     assert_eq!(cases.len(), 2);
     for case in cases {
-        assert_eq!(case["probes"].as_array().unwrap().len(), 16);
+        // 16 without indexes, then the build, the check and every seek again with them.
+        assert_eq!(case["probes"].as_array().unwrap().len(), 28);
         for writer in case["writers"].as_array().unwrap() {
             assert_eq!(writer["gone"], 0, "{writer}");
         }

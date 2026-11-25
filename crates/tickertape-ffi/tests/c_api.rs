@@ -1160,6 +1160,10 @@ const CPP_WRAPPED: &[(&str, &str)] = &[
         "ReaderOptions::durable_only",
     ),
     (
+        "tickertape_reader_options_set_seek_index",
+        "ReaderOptions::seek_index",
+    ),
+    (
         "tickertape_reader_options_set_notify",
         "ReaderOptions::notify",
     ),
