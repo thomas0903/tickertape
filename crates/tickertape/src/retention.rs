@@ -369,6 +369,8 @@ pub(crate) fn apply_into(
             journal::sync_dir(dir)?;
             mmap::full_barrier(&file)
                 .map_err(|e| Error::io("full sync retention segment", &path, e))?;
+            // Its seek index, best effort (ADR 0045): a leftover is harmless, and the writer's next open removes it.
+            crate::seek_index::dir::remove_index(dir, segment.base_seq);
             Ok(())
         })();
         // Count the unlink/rename even if a subsequent sync fails.
