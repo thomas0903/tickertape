@@ -369,6 +369,11 @@ static void test_roundtrip(const char *scratch) {
     REQUIRE_OK(tickertape_reader_seek(reader, 7));
     CHECK_STATUS(tickertape_reader_next(reader, 0, &record), TICKERTAPE_OK);
     CHECK(pattern_matches(&record, 7));
+    REQUIRE_OK(tickertape_reader_seek_to_end(reader));
+    REQUIRE_OK(tickertape_reader_position(reader, &position));
+    CHECK(position == 401);
+    CHECK_STATUS(tickertape_reader_next(reader, TICKERTAPE_NO_WAIT, &record), TICKERTAPE_NONE);
+    CHECK_STATUS(tickertape_reader_seek_to_end(NULL), TICKERTAPE_E_INVALID_ARGUMENT);
     REQUIRE_OK(tickertape_reader_close(reader));
 
     /* Zero-copy append through a callback; a callback that aborts commits nothing. */

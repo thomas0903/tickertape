@@ -349,6 +349,7 @@ FORKED = """
             ("next", lambda: reader.next(timeout=0)),
             ("read_many", lambda: reader.read_many(10)),
             ("seek", lambda: reader.seek(0)),
+            ("seek_to_end", reader.seek_to_end),
             ("position", lambda: reader.position),
             ("iter", lambda: iter(reader)),
         ]:

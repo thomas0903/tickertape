@@ -301,8 +301,8 @@ public final class Reader implements AutoCloseable {
      * (it is returned first by the next read). Returns 0 if no record arrived in time.
      *
      * <p>An error before the first record is thrown. An error after one or more records is not: this returns the
-     * records read so far, and the next read on this reader throws the error (a successful {@link #seek} discards
-     * it). No record handed out is ever lost to an error.
+     * records read so far, and the next read on this reader throws the error (a successful {@link #seek} or
+     * {@link #seekToEnd} discards it). No record handed out is ever lost to an error.
      *
      * @throws BufferTooSmallException if the first record's payload does not fit in the batch's buffer;
      *     {@link BufferTooSmallException#requiredBytes()} says how large it is, and it stays next
@@ -361,8 +361,12 @@ public final class Reader implements AutoCloseable {
     /**
      * Positions the reader so that the next record returned is {@code seq}. If {@code seq} has not been written yet,
      * reads return nothing until the writer gets there. Every record on the way is validated by the reads that
-     * follow. A successful seek also discards a record held back and an error deferred by {@link #readBatch}; a
-     * failed seek leaves the reader as it was.
+     * follow. The way starts at the segment's first record or, for a forward seek within the reader's segment, at the
+     * reader's position if the reader can tell that it is on the journal's current chain (from 1.1). Records before
+     * that position are then not validated again, and if storage damage destroyed the checkpoint marker, or set it back
+     * to an older one, together with covered records, the position can be off the current chain unnoticed; a seek to
+     * the last record the reader passed, or an earlier one, scans the segment, and so does a new reader. A successful seek also discards a record held back and an error deferred by
+     * {@link #readBatch}; a failed seek leaves the reader as it was.
      *
      * @throws SeqUnavailableException if {@code seq} is older than the oldest segment (retention removed it);
      *     seek to the oldest segment's {@link SegmentInfo#baseSeq()} from {@link Journal#listSegments} to continue
@@ -374,6 +378,36 @@ public final class Reader implements AutoCloseable {
         try {
             generation.advance();
             Errors.check(Native.readerSeek(handle.ptr, seq));
+        } finally {
+            handle.exit();
+            Reference.reachabilityFence(this);
+        }
+    }
+
+    /**
+     * Positions the reader at the end of the journal, without reading the segments before it: the next record returned
+     * is the first one this call did not find committed (for a durable-only reader, the first one it did not find
+     * covered by a checkpoint).
+     *
+     * <p>Under a live writer, every record committed before the call is behind the reader, and every record committed
+     * after it returns is ahead of it; one committed during the call can be on either side. The call reads at most the
+     * newest segment, from the checkpoint's position if the checkpoint is in it, and any segments the writer rolls to
+     * meanwhile. It cannot be interrupted. A success also discards a record held back and an error deferred by
+     * {@link #readBatch}; a failure leaves the reader as it was.
+     *
+     * @throws JournalNotFoundException if the journal has no segments
+     * @throws CorruptJournalException if a segment header, or a record it reads, is invalid
+     * @throws UnsupportedVersionException if the segment has a format version this library does not read
+     * @throws JournalIOException if reading the files fails
+     * @throws DiscardedException if recovery or retention replaced or removed the segment on each of 8 attempts in a
+     *     row (its message names where the call was reading, not the reader's position)
+     * @since 1.1
+     */
+    public void seekToEnd() {
+        handle.enter();
+        try {
+            generation.advance();
+            Errors.check(Native.readerSeekToEnd(handle.ptr));
         } finally {
             handle.exit();
             Reference.reachabilityFence(this);

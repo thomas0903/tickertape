@@ -291,7 +291,12 @@ pub unsafe extern "C" fn tickertape_reader_close(
 ///
 /// If `seq` has not been written yet, the reader waits for it: reads return `TICKERTAPE_NONE` until the writer gets
 /// there, and records before `seq` are skipped. Every record on the way is validated (by the reads that follow), so
-/// the reader only lands on positions along the journal's current chain. Any call invalidates the record view
+/// the reader only lands on positions along the journal's current chain, except as below. The way starts at the segment's first record
+/// or, for a forward seek within the reader's segment, at the reader's position if the reader can tell that it is on
+/// the current chain (from 1.1). Records before that position are then not validated again, and if storage damage
+/// destroyed the checkpoint marker, or set it back to an older one, together with covered records, the position can be
+/// off the current chain unnoticed (`docs/crash-contract.md`, "Readers after a repair"); a seek to the last record the
+/// reader passed, or an earlier one, scans the segment, and so does a new reader. Any call invalidates the record view
 /// returned by `tickertape_reader_next`. A successful seek also discards a record held back by
 /// `tickertape_reader_next_copy` or `tickertape_reader_read_batch`, and an error deferred by
 /// `tickertape_reader_read_batch`; a failed seek leaves the reader exactly as it was (same position, held-back
@@ -315,6 +320,48 @@ pub unsafe extern "C" fn tickertape_reader_seek(
             state.returned = None;
             // The core leaves its cursor unchanged when a seek fails; keep what belongs to that cursor too.
             state.reader.seek(seq)?;
+            state.pending = None;
+            state.deferred = None;
+            Ok(())
+        })?;
+        Ok(S::TICKERTAPE_OK)
+    })
+}
+
+/// Positions the reader at the end of the journal, without reading the segments before it: the next record returned
+/// is the first one this call did not find committed (with durable-only, the first one it did not find covered by a
+/// checkpoint). Added in 1.1.
+///
+/// Under a live writer, "the end" is an observation made during the call: every record committed before the call is
+/// behind the reader, every record committed after it returns is ahead of it, and one committed during the call can
+/// be on either side. No record is skipped or repeated from there on. The call reads at most the newest segment, from
+/// the checkpoint's position if the checkpoint is in it, and any segments the writer rolls to meanwhile, validating
+/// every record it reads; damage in records before that is not noticed. If the writer keeps committing as fast as the
+/// reader validates, the call runs until it catches up; it cannot be interrupted. With durable-only and no valid
+/// checkpoint, the reader is placed at the first record of the oldest segment.
+///
+/// Any call invalidates the record view returned by `tickertape_reader_next`. On success this also discards a record
+/// held back by `tickertape_reader_next_copy` or `tickertape_reader_read_batch`, and an error deferred by
+/// `tickertape_reader_read_batch`; on failure the reader is left exactly as it was (same position, held-back record
+/// and deferred error).
+///
+/// Errors: `TICKERTAPE_E_NOT_FOUND`; `TICKERTAPE_E_CORRUPT`, `TICKERTAPE_E_UNSUPPORTED_VERSION` or `TICKERTAPE_E_IO`
+/// while locating it; `TICKERTAPE_E_DISCARDED` if recovery or retention replaced or removed the segment on each of 8
+/// attempts in a row (its message names where the call was reading, not the reader's position).
+///
+/// # Safety
+///
+/// `reader` must be NULL or a live reader handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tickertape_reader_seek_to_end(
+    reader: *mut tickertape_reader,
+) -> tickertape_status {
+    guard(|| {
+        // SAFETY: forwarded caller contract.
+        unsafe { reader_handle(reader) }?.with(|state| {
+            state.returned = None;
+            // As in `tickertape_reader_seek`: a failure leaves the core's cursor unchanged.
+            state.reader.seek_to_end()?;
             state.pending = None;
             state.deferred = None;
             Ok(())
@@ -465,7 +512,7 @@ pub unsafe extern "C" fn tickertape_reader_next_copy(
 /// Partial failure: an error that happens before any record is read is returned directly. An error after one or
 /// more records is **not** returned by this call: it returns `TICKERTAPE_OK` with the records read so far, and the
 /// next read call on this reader (`next`, `next_copy` or `read_batch`) returns the error. A successful
-/// `tickertape_reader_seek` discards it instead. The reader does not advance past the failing position, so a
+/// `tickertape_reader_seek` or `tickertape_reader_seek_to_end` discards it instead. The reader does not advance past the failing position, so a
 /// persistent error (such as corruption) is returned again by the calls after that. No record handed out is ever
 /// lost to an error.
 ///

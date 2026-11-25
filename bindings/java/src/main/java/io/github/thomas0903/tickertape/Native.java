@@ -81,6 +81,7 @@ final class Native {
     private static final MethodHandle READER_OPEN_MAPPED_UNSAFE = h("tickertape_reader_open_mapped_unsafe");
     private static final MethodHandle READER_CLOSE = h("tickertape_reader_close");
     private static final MethodHandle READER_SEEK = h("tickertape_reader_seek");
+    private static final MethodHandle READER_SEEK_TO_END = h("tickertape_reader_seek_to_end");
     private static final MethodHandle READER_NEXT = h("tickertape_reader_next");
     private static final MethodHandle READER_READ_BATCH = h("tickertape_reader_read_batch");
     private static final MethodHandle READER_POSITION = h("tickertape_reader_position");
@@ -394,6 +395,14 @@ final class Native {
     static int readerSeek(MemorySegment a0, long a1) {
         try {
             return (int) READER_SEEK.invokeExact(a0, a1);
+        } catch (Throwable t) {
+            throw rethrow(t);
+        }
+    }
+
+    static int readerSeekToEnd(MemorySegment a0) {
+        try {
+            return (int) READER_SEEK_TO_END.invokeExact(a0);
         } catch (Throwable t) {
             throw rethrow(t);
         }
