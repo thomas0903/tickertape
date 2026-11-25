@@ -234,13 +234,13 @@ encoding is timed with the append.
 
 **Readers.** `--readers` takes a comma-separated list of `kind[:option]...`: `safe` (`pread`) or `mapped`
 (zero-copy), with `durable` (durable-only, needs checkpoints), `wait=spin|default|block|sleep` (as `tt-latency
---wait`; `--wait` sets the default, spin), `delay=<D>` (pause after every record: busy-wait below 1 ms, sleep above)
-`stall=<pause>/<every>` and `owned` (copy every record out with `Record::to_owned`). A reader with a delay or stall is *lagging*: it stops when the writer finishes and reports
-how far behind it was. When retention removes the segment a reader is in, the reader gets `Error::Discarded`, seeks
-to the oldest record still present and counts the records it never saw (`skipped_by_retention`,
-`discard_events`). Other readers get `--drain-timeout` (default 60 s) to catch up after the writer finishes; a reader
-that doesn't is reported with `drained: false`. For every reader, `records_read + skipped_by_retention +
-remaining_records` must equal the records written, or the run fails.
+--wait`; `--wait` sets the default, spin), `delay=<D>` (pause after every record: busy-wait below 1 ms, sleep above),
+`stall=<pause>/<every>` and `owned` (copy every record out with `Record::to_owned`). A reader with a delay or stall is
+*lagging*: it stops when the writer finishes and reports how far behind it was. When retention removes the segment a
+reader is in, the reader gets `Error::Discarded`, seeks to the oldest record still present and counts the records it
+never saw (`skipped_by_retention`, `discard_events`). Other readers get `--drain-timeout` (default 60 s) to catch up
+after the writer finishes; a reader that doesn't is reported with `drained: false`. For every reader, `records_read +
+skipped_by_retention + remaining_records` must equal the records written, or the run fails.
 
 **What it reports.** Text, or with `--json` one object (also always written to `OUT/result.json`) with explicit
 unit suffixes: the full configuration (schedule, durability, retention, readers and wait modes, prefault, CPUs), host

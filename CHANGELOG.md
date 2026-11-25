@@ -5,6 +5,12 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
+- Changed: a safe reader (`Reader::open`) that has caught up with the writer fetches 4 KiB per read instead of 64 KiB,
+  so following a live journal no longer copies 64 KiB for every record. A reader with a backlog grows its reads back to
+  64 KiB, and replay reads 64 KiB from the start (issue #62).
+- Added (benchmarks): `benches/diagnostics/profile-sustained.sh` profiles the threads of a sustained run or counts their
+  system calls and heap allocations; `tt-sustained` has `--encode` (how payloads are made) and the reader option
+  `owned`. `tests/allocation.rs` checks that appending, following and replaying allocate nothing per record.
 - Fixed (release tooling): `release.py github-release` asked the release listing for its new draft once, immediately
   after creating it, and the v1.0.0 run failed there because the listing did not show the draft yet (after the
   crates were published; rerunning the job completed the release). It now asks for up to a minute.
