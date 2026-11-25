@@ -127,7 +127,9 @@ public final class Reader implements AutoCloseable {
      * tools. A tickertape writer never modifies committed bytes, including during recovery, so this holds in normal
      * operation. If it is broken, payloads can change under you, and if a mapped file is truncated the JVM receives
      * {@code SIGBUS} and dies. The binding cannot check this. Use {@link #open(Path, ReaderOptions)} when you cannot
-     * rule it out (for example, for journals on shared or untrusted storage). With {@link ReaderOptions#seekIndex}
+     * rule it out (for example, for journals on shared or untrusted storage). "Never" is for a journal whose commit
+     * words are intact: what storage damage to one can lead to, and for which readers, is the known limitation in
+     * {@code docs/crash-contract.md} (Readers, the writer and memory safety). With {@link ReaderOptions#seekIndex}
      * enabled, the precondition also covers the journal's {@code seek-index/} directory and its {@code checkpoint} file,
      * and an index builder ({@code tickertape index}) counts as a writer.
      *

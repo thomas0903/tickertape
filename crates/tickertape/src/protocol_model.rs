@@ -11,6 +11,9 @@
 //! Since ADR 0038 a background checkpoint stores the checkpoint marker on the writer's checkpoint thread, not on the
 //! thread that committed the records it covers; [`marker_stored_by_the_checkpoint_thread_covers_only_committed_records`]
 //! models that hand-over.
+//!
+//! The last models are about a commit word that no writer stored (ADR 0048): a frame it claims is loaded only as far as
+//! the checkpoint marker reaches. They run no reader code: they model what `Reader` does. The variants without the bound, or without the order that the marker gives, must fail.
 
 use loom::cell::UnsafeCell;
 use loom::sync::atomic::{AtomicU32, Ordering, fence};
@@ -215,5 +218,138 @@ fn marker_stored_by_the_checkpoint_thread_covers_only_committed_records() {
         writer.join().unwrap();
         checkpointer.join().unwrap();
         assert_eq!(marker.load(Ordering::Acquire), 1);
+    });
+}
+
+/// ADR 0048: the writer commits slots 0 and 1, the commit word of slot 0 is damaged to claim `claimed` slots, the
+/// position 2 is handed to the checkpoint thread through a mutex, and the writer appends slot 2. The checkpoint thread
+/// stores the marker. That store is a release here: in the journal it is a `pwrite` after `msync` and `fsync`, and that
+/// it acts as one is an assumption (ADR 0048 → Ordering) that this model makes and does not test.
+///
+/// The reader takes its bound from the marker, with a `Relaxed` load and an `Acquire` fence, as `marker_for_limit`
+/// does after its `pread`, either before it loads the commit word of slot 0 (a bound it holds), or after (`reached`: the
+/// cursor has reached the old bound, and `Reader::slot_past_limit` reads the marker again). Then it reads the claimed
+/// frame through the mapping if that ends inside the bound, and nothing of it otherwise (it would be read with `pread`).
+/// A visible reader then reads on past the marker by the commit words; a durable-only reader stops there.
+#[derive(Clone, Copy)]
+struct Reads {
+    claimed: usize,
+    bounded: bool,
+    reached: bool,
+    marker_fence: bool,
+    durable_only: bool,
+}
+
+fn damaged_frame(reads: Reads) {
+    loom::model(move || {
+        let j = Arc::new(Journal::new());
+        let requested = Arc::new(Mutex::new(None::<u32>));
+        let marker = Arc::new(AtomicU32::new(0));
+        let writer = {
+            let (j, requested) = (j.clone(), requested.clone());
+            thread::spawn(move || {
+                j.append(0, 11);
+                j.append(1, 22);
+                // The damage. Not a release: nobody who sees this value synchronises with the writer through it.
+                j.commit[0].store(100 + reads.claimed as u32, Ordering::Relaxed);
+                *requested.lock().unwrap() = Some(2);
+                j.append(2, 33);
+            })
+        };
+        let checkpointer = {
+            let (requested, marker) = (requested.clone(), marker.clone());
+            thread::spawn(move || {
+                // (One look: a model in which it waits has many more interleavings of the same accesses.)
+                if let Some(next) = *requested.lock().unwrap() {
+                    marker.store(next, Ordering::Release);
+                }
+            })
+        };
+        let read_word = || {
+            let word = j.commit[0].load(Ordering::Relaxed) as usize;
+            fence(Ordering::Acquire);
+            word
+        };
+        let read_marker = || {
+            let limit = marker.load(Ordering::Relaxed) as usize;
+            if reads.marker_fence {
+                fence(Ordering::Acquire);
+            }
+            limit
+        };
+        let (word, limit) = if reads.reached {
+            let word = read_word();
+            (word, read_marker())
+        } else {
+            let limit = read_marker();
+            (read_word(), limit)
+        };
+        // Without a marker the reader is as it was before the bound, and this model is not about it.
+        if limit > 0 {
+            assert!(reads.reached || word == 100 + reads.claimed);
+            if word == 100 + reads.claimed && (!reads.bounded || reads.claimed <= limit) {
+                for (slot, value) in [11, 22, 33].into_iter().enumerate().take(reads.claimed) {
+                    // SAFETY: as above: loom reports any read that races with the writer's store.
+                    let body = j.body[slot].with(|p| unsafe { *p });
+                    assert!(body == value || slot >= limit);
+                }
+            }
+            if reads.marker_fence {
+                assert_eq!(j.read(1), Some(22));
+                if !reads.durable_only {
+                    assert!(j.read(2).is_none_or(|v| v == 33));
+                }
+            }
+        }
+        writer.join().unwrap();
+        checkpointer.join().unwrap();
+    });
+}
+
+/// The frame claims 3 slots, one past the marker; `a_damaged_frame_inside_the_marker_meets_no_store` claims 2, and covers
+/// slot 1, whose commit word the reader has not acquired: there the order comes from the marker.
+fn all_readers(claimed: usize) {
+    for (reached, durable_only) in [(false, false), (false, true), (true, false), (true, true)] {
+        damaged_frame(Reads {
+            claimed,
+            bounded: true,
+            reached,
+            marker_fence: true,
+            durable_only,
+        });
+    }
+}
+
+#[test]
+fn a_damaged_frame_is_not_loaded_past_the_marker() {
+    all_readers(3);
+}
+
+#[test]
+fn a_damaged_frame_inside_the_marker_meets_no_store() {
+    all_readers(2);
+}
+
+#[test]
+#[should_panic(expected = "Causality violation")]
+fn without_the_bound_a_damaged_frame_races_with_the_writer() {
+    damaged_frame(Reads {
+        claimed: 3,
+        bounded: false,
+        reached: false,
+        marker_fence: true,
+        durable_only: false,
+    });
+}
+
+#[test]
+#[should_panic(expected = "Causality violation")]
+fn without_the_fence_after_the_marker_a_damaged_frame_races_with_the_writer() {
+    damaged_frame(Reads {
+        claimed: 2,
+        bounded: true,
+        reached: true,
+        marker_fence: false,
+        durable_only: false,
     });
 }

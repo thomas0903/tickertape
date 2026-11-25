@@ -69,6 +69,10 @@ path = "durable_only.rs"
 name = "mapped_reader"
 path = "mapped_reader.rs"
 
+[[test]]
+name = "mapped_bound"
+path = "mapped_bound.rs"
+
 [lints]
 workspace = true
 

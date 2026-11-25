@@ -1938,6 +1938,8 @@ public:
     // segment files (no writing into, truncating or replacing their contents). A tickertape writer never changes
     // committed bytes, so this holds in normal operation. If it is broken, payloads can change under you, and a
     // truncated file kills the process with SIGBUS. Use open() when you cannot rule this out.
+    // "Never" is for a journal whose commit words are intact: what storage damage to one can lead to, and for which
+    // readers, is the known limitation in docs/crash-contract.md (Readers, the writer and memory safety).
     // With ReaderOptions::seek_index enabled, the precondition also covers the journal's `seek-index/` directory and its
     // `checkpoint` file, and an index builder (`tickertape index`) counts as a writer.
     static result<Reader> open_mapped_unsafe(const detail::PathArg &dir) { return open_impl(dir, nullptr, true); }

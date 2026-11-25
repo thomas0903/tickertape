@@ -562,6 +562,30 @@ fn every_corruption_class_is_reported_identically() {
         corrupt(&file, placed);
         let trace = both(&dir);
         check_expect(&trace, expect, total, name);
+        // The marker bounds the zero-copy reader's loads (ADR 0048) and changes no result: one right before the target,
+        // one right after it, one inside it, and one in the last segment.
+        let base_seq = format::parse_segment_file_name(path.file_name().unwrap().to_str().unwrap());
+        let (here, after) = (
+            base_seq.unwrap(),
+            placed.offset + align8(u64::from(placed.len)),
+        );
+        for (segment_base_seq, offset) in [
+            (here, placed.offset),
+            (here, after),
+            (here, placed.offset + 24),
+            (segs[segs.len() - 1].0, tail.offset),
+        ] {
+            let slot = format::encode_checkpoint_slot(&format::CheckpointSlot {
+                generation: 1,
+                next_seq: u64::MAX,
+                segment_base_seq,
+                offset,
+            });
+            fs::write(dir.join("checkpoint"), slot).unwrap();
+            let bounded = both(&dir);
+            assert_eq!(bounded, trace, "{name}, marker at {offset}");
+        }
+        fs::remove_file(dir.join("checkpoint")).unwrap();
         if let Expect::Corrupt(_, reason) = expect {
             // Re-read the typed error from the mapped reader (the trace keeps only its text).
             // SAFETY: nothing modifies the journal while this reader exists.
@@ -582,7 +606,8 @@ fn every_corruption_class_is_reported_identically() {
     };
     // Each case works on its own copy of the journal, so they run on several threads.
     let next = std::sync::atomic::AtomicUsize::new(0);
-    let workers = std::thread::available_parallelism().map_or(4, |n| n.get().min(8));
+    // They mostly sleep: a reader reads a corrupt slot again for 50 ms.
+    let workers = 24;
     std::thread::scope(|scope| {
         for _ in 0..workers {
             scope.spawn(|| {
