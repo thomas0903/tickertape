@@ -33,15 +33,29 @@ step() {
   "$@" > "$OUT/$name.json" 2> "$OUT/$name.err"
   log "end $name exit=$?"
 }
-# Both readers, warm and cold, and the same with the other core.
+# Both readers, warm and cold, and the same with the other core. The warm runs come first: every cold run ends with an
+# empty cache.
 both() {
   local name="$1" dir="$2"; shift 2
   step "$name-warm" "$T" measure --dir "$dir" --readers safe,mapped --label main --allow-errors --json "$@"
+  [ -n "$BASE" ] && step "$name-warm-base" "$BASE" measure --dir "$dir" --readers safe,mapped --label base --allow-errors --json "$@"
   step "$name-cold" "$T" measure --dir "$dir" --readers safe,mapped --label main --allow-errors --cold --json "$@"
-  if [ -n "$BASE" ]; then
-    step "$name-warm-base" "$BASE" measure --dir "$dir" --readers safe,mapped --label base --allow-errors --json "$@"
-    step "$name-cold-base" "$BASE" measure --dir "$dir" --readers safe,mapped --label base --allow-errors --cold --json "$@"
-  fi
+  [ -n "$BASE" ] && step "$name-cold-base" "$BASE" measure --dir "$dir" --readers safe,mapped --label base --allow-errors --cold --json "$@"
+}
+
+# Before and after on the same warm journal, which these operations do not change: the tool, the other core, the tool.
+compare() {
+  local shape name dir
+  for shape in "1000 $MIB" "10000 $MIB" "10 16777216" "10 134217728" "10 1073741824"; do
+    set -- $shape
+    name="compare-$1x$2"; dir="$ROOT/$name"
+    step "$name-build" "$T" build --dir "$dir" --segments "$1" --segment-size "$2" --json
+    step "$name-warmup" "$T" measure --dir "$dir" --ops verify --json
+    step "$name-main-1" "$T" measure --dir "$dir" --readers safe,mapped --repeats 5 --allow-errors --json --ops seeks,replay,status,verify,list-segments,retention-plan
+    step "$name-base" "$BASE" measure --dir "$dir" --readers safe,mapped --repeats 5 --allow-errors --json --ops seeks,replay,status,verify,list-segments,retention-plan
+    step "$name-main-2" "$T" measure --dir "$dir" --readers safe,mapped --repeats 5 --allow-errors --json --ops seeks,replay,status,verify,list-segments,retention-plan
+    rm -rf "${dir:?}"
+  done
 }
 
 # Segment count at a fixed segment size (1 MiB): 10 to 20,000 segments.
@@ -147,6 +161,7 @@ big() {
   rm -rf "${dir:?}" "${ROOT:?}/big-archive"
 }
 
+[ -n "$BASE" ] && [ $# -eq 0 ] && STAGES+=(compare)
 for stage in "${STAGES[@]}"; do
   log "stage $stage"
   "$stage"
