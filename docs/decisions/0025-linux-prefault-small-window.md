@@ -68,7 +68,7 @@ under continuous write-back:
 - macOS keeps `MADV_WILLNEED` 8 MiB ahead (ADR 0020).
 - On kernels before Linux 5.14 the advice fails with `EINVAL`, and the helper stops for the rest of the writer's
   life, as before ADR 0023.
-- Linux still prepares no spare segment (ADR 0023 amendment).
+- Linux still prepares no spare segment (ADR 0023 amendment; it does since ADR 0023 → Amendment of 2026-11-25).
 
 ## Consequences
 

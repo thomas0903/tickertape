@@ -48,6 +48,7 @@ runs (`run-benchmark.md`), and conclusions are confirmed with tracing off (step 
 | When does each checkpoint sync, write-back request and segment roll happen, on which thread, for how long? | `events.bt` | `fsslower-libbpf -t ext4 -p PID -m 1` (`-t xfs`, `btrfs`, `nfs`, `f2fs`; any file operation slower than 1 ms) |
 | Is the device slow? | block I/O one-liner below, `/usr/sbin/biolatency.bt` | `biolatency-libbpf -D -m 10 1`, `biosnoop-libbpf -t -m 5` (each I/O slower than 5 ms, with its process) |
 | Does the writer take page faults, and how long are they? Do readers take major faults (data not in RAM)? | page-fault one-liner below | `funclatency-libbpf -u -p PID handle_mm_fault` |
+| Does a page fault or a file system call (create, `fallocate`, link) of a thread wait, and for which journal commit (ext4)? | `stalls.bt` | |
 | Does write-back throttle the process (`balance_dirty_pages`)? | throttling one-liner below | |
 | Does a thread wait in the run queue for a CPU? | run-queue one-liner below, `/usr/sbin/runqlat.bt` (whole system) | `runqlat-libbpf -L -p PID 5 1` (per thread), `runqslower-libbpf -p PID 1000` (each wait over 1 ms) |
 | No eBPF at all | `stack-sampler.py` | |
@@ -195,6 +196,12 @@ by process inside the probe), and
    `sudo sysctl -w kernel.bpf_stats_enabled=1`, then `sudo bpftool prog show` while the tracer runs (`run_time_ns` and
    `run_cnt` per program), then `sudo sysctl -w kernel.bpf_stats_enabled=0`.
 
+**Measured once** (2026-11-25, `docs/benchmarks.md` → "2026-11-25, roll and journal stalls", tracing overhead): with
+`offcpu.bt` (`MIN_MS` 3), `events.bt`, `handle_mm_fault` and file system calls (`stalls.bt` of that session) and every
+block request attached at the same time (bpftrace 0.20.2, kernel 7.0.0-1017-gcp), the writer's achieved rate, p50 and
+stall counts were unchanged, and its p99.9 rose by about 0.5 µs (at 90 % of the probe) to 1.1 µs (unpaced). That is one tool set on two
+machines; measure yours.
+
 **Confirm every conclusion with tracing off.** A trace explains *why*; the evidence that the explanation is right must
 come from untraced runs. State what the explanation predicts in `series.jsonl` or `result.json` and check it there:
 for example, "the stalls are the roll's sync" predicts that the worst seconds of an untraced run are seconds with a
@@ -253,6 +260,10 @@ waits depends on the filesystem and the device; the ext4 journal-commit waits ne
   kernel where that function is not traceable it stops with `Failed to attach BPF program b'oncpu' to kprobe`. Use
   `offcputime-libbpf` or `offcpu.bt` there. `offcputime-libbpf` prints `failed to get syms` for user-space stacks it
   cannot symbolize; the kernel stacks are still printed.
+- The scripts do not parse on bpftrace 0.20.2 (Ubuntu 24.04's package): its `delete` takes one argument,
+  `delete(@map[key])`, and is a statement. Rewriting those calls (`$d = delete(@t, tid)` to `delete(@t[tid])`) and the
+  `args.x` accesses to `args->x` was enough for `offcpu.bt`, `events.bt` and `stalls.bt`; a newer release build of
+  bpftrace needs no change.
 - bpftrace 0.25 warns `Return value discarded` when `delete()`'s result is unused; the scripts assign it to a variable.
 - Inside a container, `offcpu.bt` can print a few `get_ns_current_pid_tgid` warnings when it starts (tasks of other
   namespaces, before it has seen the target process); `events.bt` can print them when such tasks make the traced

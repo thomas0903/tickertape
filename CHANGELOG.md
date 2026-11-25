@@ -5,6 +5,14 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
+- Changed: on Linux the writer prepares the next segment in the background (`WriterConfig::prefault`, on by default), as
+  on macOS: a thread that lives as long as the writer preallocates it once the active segment is half full, unsynced, and
+  a roll uses it or, if it is not ready, creates the segment itself without waiting (ADR 0023 → Amendment of 2026-11-25,
+  issue #60). In the before/after runs on cloud VMs a roll append took about a third of the time and the zero-copy
+  reader's p99.9 fell. The file format and the crash contract's guarantees are unchanged.
+- Docs: the stalls of sustained runs on ext4 are attributed (the write fault's modification-time update and a roll's file
+  creation wait for the ext4 journal), with the measured effect of the `lazytime` mount option and the tracing
+  overhead of the eBPF playbook's tools (issue #60); `benches/diagnostics/stalls.bt` is new.
 - Added: seek indexes (ADR 0045, crash contract C15). `tickertape index <DIR>` (library: `seek_index::build`, `check`,
   `remove`) writes a small file per sealed segment into `seek-index/` of the journal, and a reader opened with
   `ReaderConfig::seek_index(true)` (C `tickertape_reader_options_set_seek_index`, C++ and Python `seek_index`, Java

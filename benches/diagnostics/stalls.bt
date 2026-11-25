@@ -1,0 +1,45 @@
+#!/usr/bin/env bpftrace
+/*
+ * Where the threads of one process stall in file system calls and page faults, and what the ext4 journal does at the
+ * time, with wall-clock start times (Unix seconds) to line up with offcpu.bt, events.bt and tt-sustained's
+ * series.jsonl. Part of docs/playbooks/diagnose-latency-with-ebpf.md. Needs the jbd2 module loaded (a mounted ext4).
+ *
+ *   sudo bpftrace benches/diagnostics/stalls.bt <pid> <min-us> <seconds>
+ *
+ * Lines:
+ *   <t> <call> tid= comm= us=     openat, fallocate, pwrite64, unlink, munmap, close, mmap, each of at least <min-us>,
+ *                                 and every linkat
+ *   <t> fault tid= comm= us=      a page fault (handle_mm_fault) of at least <min-us>
+ *   <t> jbd2_commit dev= trans= ms: ... locked= flushing= logging= ...   each journal commit of the whole system, at
+ *                                 its end; "logging" is the phase in which it writes the log
+ *   <t> bdp tid= comm= pause_ms=  write-back throttling of a thread of the process
+ * A fault that lies inside a commit's logging phase waited for a block that the commit was writing to the log
+ * (do_get_write_access in offcpu.bt's stacks; ext4 updates the file's modification time at a write fault).
+ */
+tracepoint:syscalls:sys_enter_openat, tracepoint:syscalls:sys_enter_fallocate, tracepoint:syscalls:sys_enter_pwrite64,
+tracepoint:syscalls:sys_enter_linkat, tracepoint:syscalls:sys_enter_unlink*, tracepoint:syscalls:sys_enter_munmap,
+tracepoint:syscalls:sys_enter_close, tracepoint:syscalls:sys_enter_mmap
+/pid == $1/ { @t[tid] = nsecs; }
+
+tracepoint:syscalls:sys_exit_openat /pid == $1 && @t[tid]/ { if ((nsecs - @t[tid]) / 1000 >= $2) { printf("%s openat tid=%d comm=%s us=%d\n", strftime("%s.%f", @t[tid]), tid, comm, (nsecs - @t[tid]) / 1000); } $d = delete(@t, tid); }
+tracepoint:syscalls:sys_exit_fallocate /pid == $1 && @t[tid]/ { if ((nsecs - @t[tid]) / 1000 >= $2) { printf("%s fallocate tid=%d comm=%s us=%d\n", strftime("%s.%f", @t[tid]), tid, comm, (nsecs - @t[tid]) / 1000); } $d = delete(@t, tid); }
+tracepoint:syscalls:sys_exit_pwrite64 /pid == $1 && @t[tid]/ { if ((nsecs - @t[tid]) / 1000 >= $2) { printf("%s pwrite64 tid=%d comm=%s us=%d\n", strftime("%s.%f", @t[tid]), tid, comm, (nsecs - @t[tid]) / 1000); } $d = delete(@t, tid); }
+tracepoint:syscalls:sys_exit_linkat /pid == $1 && @t[tid]/ { printf("%s linkat tid=%d comm=%s us=%d\n", strftime("%s.%f", @t[tid]), tid, comm, (nsecs - @t[tid]) / 1000); $d = delete(@t, tid); }
+tracepoint:syscalls:sys_exit_unlink* /pid == $1 && @t[tid]/ { if ((nsecs - @t[tid]) / 1000 >= $2) { printf("%s unlink tid=%d comm=%s us=%d\n", strftime("%s.%f", @t[tid]), tid, comm, (nsecs - @t[tid]) / 1000); } $d = delete(@t, tid); }
+tracepoint:syscalls:sys_exit_munmap /pid == $1 && @t[tid]/ { if ((nsecs - @t[tid]) / 1000 >= $2) { printf("%s munmap tid=%d comm=%s us=%d\n", strftime("%s.%f", @t[tid]), tid, comm, (nsecs - @t[tid]) / 1000); } $d = delete(@t, tid); }
+tracepoint:syscalls:sys_exit_close /pid == $1 && @t[tid]/ { if ((nsecs - @t[tid]) / 1000 >= $2) { printf("%s close tid=%d comm=%s us=%d\n", strftime("%s.%f", @t[tid]), tid, comm, (nsecs - @t[tid]) / 1000); } $d = delete(@t, tid); }
+tracepoint:syscalls:sys_exit_mmap /pid == $1 && @t[tid]/ { if ((nsecs - @t[tid]) / 1000 >= $2) { printf("%s mmap tid=%d comm=%s us=%d\n", strftime("%s.%f", @t[tid]), tid, comm, (nsecs - @t[tid]) / 1000); } $d = delete(@t, tid); }
+
+kprobe:handle_mm_fault /pid == $1/ { @f[tid] = nsecs; }
+kretprobe:handle_mm_fault /@f[tid]/ {
+  if ((nsecs - @f[tid]) / 1000 >= $2) { printf("%s fault tid=%d comm=%s us=%d\n", strftime("%s.%f", @f[tid]), tid, comm, (nsecs - @f[tid]) / 1000); }
+  @fault_us[comm, tid] = hist((nsecs - @f[tid]) / 1000);
+  $d = delete(@f, tid);
+}
+tracepoint:jbd2:jbd2_run_stats {
+  printf("%s jbd2_commit dev=%d trans=%d ms: wait=%d request_delay=%d running=%d locked=%d flushing=%d logging=%d handles=%d blocks=%d\n",
+    strftime("%s.%f", nsecs), args.dev, args.tid, args.wait, args.request_delay, args.running, args.locked, args.flushing, args.logging, args.handle_count, args.blocks_logged);
+}
+tracepoint:writeback:balance_dirty_pages /pid == $1/ { printf("%s bdp tid=%d comm=%s pause_ms=%d\n", strftime("%s.%f", nsecs), tid, comm, args.pause); }
+interval:s:$3 { exit(); }
+END { clear(@t); clear(@f); }

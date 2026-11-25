@@ -1,6 +1,7 @@
 # 0022: Prepare the next segment in the background
 
-- **Status:** accepted; limited to macOS by [0023](0023-no-prefault-advice-on-linux.md) (amendment)
+- **Status:** accepted; limited to macOS by [0023](0023-no-prefault-advice-on-linux.md) (first amendment), and on
+  Linux again since its amendment of 2026-11-25
 - **Date:** 2026-11-01
 
 ## Context

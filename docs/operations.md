@@ -56,6 +56,13 @@ With `WriterConfig::prefault(true)` (the default), the writer moves segment work
   (`WriterConfig::early_writeback`, default on; ADR 0038). It makes nothing durable: only checkpoints do. An I/O
   error from it makes the next checkpoint fail, as a failed sync would. On macOS the option does nothing.
 
+**ext4 under a load near what the disk takes.** A store into a page of a mapped file updates the file's modification
+time through the ext4 journal and can wait while the journal commits, for as long as the disk takes to write the log
+(50–140 ms appends in the recorded runs, `docs/benchmarks.md` → "2026-11-25, roll and journal stalls"). Mounting with
+`lazytime` keeps modification times in memory and removed those waits there; the roll's own file operations still wait.
+After a power loss a file's modification time can then be older than its last write, and `tickertape status` takes the
+marker's modification time as the checkpoint's time.
+
 None of these threads ever writes records. Set `prefault(false)` if you want a writer that starts none (it also turns
 off early write-back); `Writer::request_checkpoint` still starts the checkpoint thread.
 

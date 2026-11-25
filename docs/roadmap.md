@@ -144,17 +144,17 @@ released with seven items open, accepted by the owner as known gaps
     `docs/benchmarks.md` (2026-11-19 to 2026-11-22), with tickertape's rows from a second session at a newer commit (the
     first session's failed on the open-files defect fixed in #38), and the ext4 stall investigation is published (ADR
     0025 → Amendment).
-- [ ] **Performance diagnostics with eBPF.**
+- [x] **Performance diagnostics with eBPF.** (done 2026-11-25: the overhead and an untraced confirmation, issue #60)
   - Add a reproducible Linux diagnostic playbook using existing eBPF tools to investigate scheduler delays,
     page faults, filesystem/write-back stalls and block I/O during the sustained workloads.
   - Correlate traces with application latency and checkpoint/roll events; record tool/kernel requirements and
     tracing overhead, and confirm performance conclusions with tracing disabled.
   - Keep diagnostics optional: the library and CLI must work without eBPF, elevated tracing permissions or a
     collector. Kernel-event recording and XDP/AF_XDP ingestion remain separate proposals.
-  - Missing: the playbook, with its tool and kernel requirements and how to measure the overhead and confirm with
-    tracing off, is in place (`docs/playbooks/diagnose-latency-with-ebpf.md`, #31); the tracing overhead during the
-    sustained workloads on a cloud Linux machine, and a conclusion confirmed with tracing off, are not recorded in
-    `docs/benchmarks.md` (#31 has informal OrbStack figures).
+  - Done 2026-11-25 (issue #60, `docs/benchmarks.md` → "2026-11-25, roll and journal stalls" → Tracing overhead): the
+    tracing overhead of the probes attached at a sustained workload on a cloud aarch64 and x86-64 Linux machine, off and
+    on interleaved, and a conclusion (the aarch64 ext4 stalls) confirmed with tracing off. The playbook, with its
+    tool and kernel requirements and how to measure both, is #31.
 - [x] **Remove the mapped reader's validation copy.**
   - Compute CRC and validate record fields directly from atomic loads, eliminating the per-record scratch copy
     while retaining validation before creating any borrowed slice into the mapping.
@@ -199,9 +199,10 @@ released with seven items open, accepted by the owner as known gaps
     item named bare-metal Graviton, `c7gd.metal`.)
   - Record CPU, kernel, filesystem, storage, affinity, CRC implementation and commands; resolve architecture-specific
     correctness failures and explain material performance differences before claiming cross-architecture results.
-  - Missing: an explanation of the aarch64 mapped reader's constant maximum in the checkpoint runs, of the appends of
-    50–128 ms in the 1,024 B steady-90 runs on aarch64 ext4 (second session), and confirmation of the platform
-    mechanism behind the lagging view of issue #43. That view no longer stops a reader (readers tolerate it;
+  - Missing: an explanation of the aarch64 mapped reader's constant maximum in the checkpoint runs (not reproduced on
+    8 vCPUs, 2026-11-25) and confirmation of the platform
+    mechanism behind the lagging view of issue #43. (The appends of 50–128 ms in the 1,024 B steady-90 runs on aarch64
+    ext4 are attributed since 2026-11-25: `docs/benchmarks.md` → "roll and journal stalls".) That view no longer stops a reader (readers tolerate it;
     `crash-contract.md` → Known risks and limits), and the long verified runs under forced compaction (`3fea1c0`, on
     aarch64 and x86-64) showed no false corruption and no lost write (issue #43, closed). Correctness, crash and soak
     checks run on aarch64 Linux in CI (#12); the sustained sessions and comparison on Axion are recorded in
@@ -285,15 +286,16 @@ they are measurements, explanations and one design record. They stay open and co
 where a line says it is closed:
 
 - **Sustained-load comparison:** no macOS results.
-- **eBPF diagnostics:** the tracing overhead during the sustained workloads, and a conclusion confirmed with tracing
-  off, are not recorded.
+- **eBPF diagnostics:** closed on 2026-11-25; the tracing overhead during the sustained workloads and a conclusion
+  confirmed with tracing off are recorded (`docs/benchmarks.md` → "2026-11-25, roll and journal stalls").
 - **Mapped reader:** closed on 2026-11-25. The publication-frontier follow-up had no ADR; it has
   [0048](decisions/0048-publication-frontier.md) (accepted, nothing built). The limitation it would narrow is part of
   the 1.0 contract ([`compatibility.md`](compatibility.md); `crash-contract.md` → Readers, the writer and memory safety).
 - **Cheaper checkpoints:** how much prefaulted, unwritten data adds to a checkpoint is not measured, and there is no
   macOS result.
 - **Avoidable work:** the profiles of the readers, notification and serialization paths are not documented.
-- **ARM servers:** two latency observations on aarch64 and the platform mechanism behind issue #43 are not explained.
+- **ARM servers:** one of the two latency observations on aarch64 (the 10 ms reader maximum) and the platform mechanism
+  behind issue #43 are not explained; the appends of 50–128 ms are (issue #60, 2026-11-25).
 - **Replay and recovery at scale:** archived history, missing or corrupt segments, catch-up under a live writer, the
   zero-copy reader and journals of 10,000 segments or more are not measured.
 
