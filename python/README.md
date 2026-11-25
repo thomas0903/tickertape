@@ -21,8 +21,9 @@ for record in read_journal("/tmp/tt-demo", durable_only=True):
 ```
 
 `Record` is an immutable named tuple with `seq`, `schema_id`, `venue_ts_ns`, `local_ts_ns` and `payload` (bytes).
-Timestamps stay unsigned integer nanoseconds. Both sequence bounds are inclusive; the reader validates the
-prefix before `start_seq` and stops after `end_seq`. `Checkpoint` exposes `generation`, `next_seq`,
+Timestamps stay unsigned integer nanoseconds. Both sequence bounds are inclusive. The reader starts at the segment
+that holds `start_seq`, chosen by file name as the Rust reader does, and validates that segment's records before
+`start_seq` too; earlier segments are not opened, so damage in them is not reported. It stops after `end_seq`. `Checkpoint` exposes `generation`, `next_seq`,
 `segment_base_seq` and `offset`. With `durable_only=True`, only records below the checkpoint's `next_seq`
 observed at startup are returned. A missing or invalid checkpoint covers no records.
 

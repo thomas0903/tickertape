@@ -1104,13 +1104,41 @@ impl Reader {
 
     /// Positions the reader so that the next record returned is `seq` (which may not be written yet). Also the way
     /// to continue after `DiscardedError`. If it succeeds, it also drops records held for an interrupted read and
-    /// an error held back by a batch call; if it fails, the reader is unchanged.
+    /// an error held back by a batch call; if it fails, the reader is unchanged. A forward seek within the reader's
+    /// segment may start at the reader's position (from 1.1): records before it are then not validated again, and
+    /// after storage damage that also destroyed the checkpoint marker, or set it back to an older one, the position can
+    /// be off the current chain unnoticed. A seek to the last record the reader passed, or an earlier one, scans the
+    /// segment, and so does a new reader.
     fn seek(&self, py: Python<'_>, seq: u64) -> PyResult<()> {
         self.settle(py, || {
             self.check(py)?;
             let result = self
                 .locked(py, |s| {
                     let result = s.reader.seek(seq);
+                    if result.is_ok() {
+                        s.buffer.reset();
+                        s.pending = None;
+                    }
+                    result
+                })?
+                .ok_or_else(|| errors::closed("reader"))?;
+            result.map_err(|e| errors::to_py(py, &e))
+        })
+    }
+
+    /// Positions the reader at the end of the journal, without reading the segments before it: the next record
+    /// returned is the first one this call did not find committed (with `durable_only`, the first one it did not find
+    /// covered by a checkpoint). Every record committed before the call is behind the reader, every record committed
+    /// after it returns is ahead of it. Reads at most the newest segment (from the checkpoint on, if that is in it)
+    /// with the GIL released, and can't be interrupted. If it succeeds, it also drops records held for an interrupted
+    /// read and an error held back by a batch call; if it fails, the reader is unchanged (the `seq` of a
+    /// `DiscardedError` is then where the call was reading). Added in 1.1.
+    fn seek_to_end(&self, py: Python<'_>) -> PyResult<()> {
+        self.settle(py, || {
+            self.check(py)?;
+            let result = self
+                .locked(py, |s| {
+                    let result = s.reader.seek_to_end();
                     if result.is_ok() {
                         s.buffer.reset();
                         s.pending = None;

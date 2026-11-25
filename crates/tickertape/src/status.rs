@@ -1345,7 +1345,7 @@ fn open_segment(dir: &Path, base: u64) -> Result<Opened> {
 }
 
 /// Whether `offset` can hold a slot in a segment of `size` bytes.
-fn valid_offset(offset: u64, size: u64) -> bool {
+pub(crate) fn valid_offset(offset: u64, size: u64) -> bool {
     offset % format::RECORD_ALIGN as u64 == 0
         && offset >= format::SEGMENT_HEADER_LEN as u64
         && offset <= size.saturating_sub(format::SEGMENT_TRAILER_LEN as u64)
