@@ -1,5 +1,4 @@
-//! ADR 0022: the next segment is prepared in the background and published at roll (macOS; Linux since the amendment
-//! of 2026-11-25 to ADR 0023).
+//! ADR 0022: the next segment is prepared in the background and published at roll (macOS, and Linux: issue #60).
 
 use std::path::Path;
 use std::time::{Duration, Instant};

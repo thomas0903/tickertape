@@ -38,11 +38,14 @@ With `WriterConfig::prefault(true)` (the default), the writer moves segment work
     use).
   - **macOS:** the next 8 MiB, with `MADV_WILLNEED` (ADR 0020). On APFS, writing into a preallocated segment otherwise
     faults once per 16 KiB page, slowly.
-- **The next segment (macOS only).** Once the active segment is half full, a short-lived thread, `tickertape-spare`,
-  creates, preallocates and syncs `next-segment.tmp` (ADR 0022). The roll then only writes the header and links the
-  file into place; preallocating and syncing a whole segment on APFS takes about 50 ms. The spare
-  reserves one more segment's worth of disk space from that point on. On Linux a synchronous roll costs about a
-  millisecond on ext4, and the spare occasionally stalled the writer, so Linux doesn't use it (ADR 0023).
+- **The next segment.** Once the active segment is half full, a short-lived thread, `tickertape-spare`,
+  creates and preallocates `next-segment.tmp` (ADR 0022). The roll then only writes the header and links the file into
+  place. The spare reserves one more segment's worth of disk space from that point on.
+  - **Linux:** the spare is not synced; the checkpoint that first covers the segment syncs it, as it does a segment a
+    roll creates itself (ADR 0038). A roll that finds its spare not ready creates the segment itself, without waiting,
+    and the spare is used by the next roll.
+  - **macOS:** the thread also syncs the file (preallocating and syncing a whole segment on APFS takes about 50 ms),
+    and a roll waits for a spare that is still being prepared.
 
 - **Early write-back (Linux).** A helper thread, `tickertape-writeback`, asks the kernel to start writing back the
   pages behind the write position (`sync_file_range(SYNC_FILE_RANGE_WRITE)`, every 1 MiB, and the rest of a segment

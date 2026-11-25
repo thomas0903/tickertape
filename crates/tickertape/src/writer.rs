@@ -558,7 +558,7 @@ impl Writer {
             writeback.advanced(self.offset);
         }
         // Once the active segment is half full, prepare the next one off the writer's thread (ADR 0022; on Linux
-        // without a sync, ADR 0023 → Amendment of 2026-11-25).
+        // without a sync: issue #60).
         if self.config.prefault
             && cfg!(any(target_vendor = "apple", target_os = "linux"))
             && !self.spare_requested
@@ -1130,9 +1130,8 @@ impl Writer {
 
 impl Writer {
     /// Returns the prepared spare, if any, if it is usable for this journal's segment size. On macOS it waits for one
-    /// still being prepared. On Linux it never waits: preparing it can take as long as the filesystem's journal makes
-    /// it (ADR 0023 → Amendment of 2026-11-25), so the roll creates its segment itself, and the spare stays with the
-    /// writer for the next roll.
+    /// still being prepared. On Linux it never waits: the roll then creates its segment itself, and the spare stays with
+    /// the writer for the next roll.
     fn take_spare(&mut self) -> Option<Spare> {
         let preparing = self.spare.take()?;
         if cfg!(not(target_vendor = "apple")) && !preparing.is_finished() {

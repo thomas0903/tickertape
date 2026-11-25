@@ -64,9 +64,11 @@ pub struct WriterConfig {
     /// - **Linux:** a helper thread (`tickertape-prefault`) faults in the 256 KiB ahead of the write position with
     ///   `MADV_POPULATE_WRITE`, so `append` rarely takes a page fault (ADR 0025). On kernels before 5.14 the helper
     ///   stops on first use.
-    /// - **macOS:** the helper keeps 8 MiB ahead with `madvise(MADV_WILLNEED)` (ADR 0020). Once the active segment is
-    ///   half full, a short-lived thread (`tickertape-spare`) also preallocates the next segment, so a roll only
-    ///   writes and links its header (ADR 0022). That spare isn't used on Linux (ADR 0023).
+    /// - **macOS:** the helper keeps 8 MiB ahead with `madvise(MADV_WILLNEED)` (ADR 0020).
+    /// - **Both:** once the active segment is half full, a short-lived thread (`tickertape-spare`) preallocates the
+    ///   next segment, so a roll only writes its header and links it (ADR 0022). On Linux the thread does not sync it
+    ///   (the checkpoint that first covers the segment does), and a roll never waits for a spare that is not ready:
+    ///   it creates the segment itself.
     ///
     /// Set to `false` for a writer that starts no threads, except the checkpoint thread that
     /// [`Writer::request_checkpoint`](crate::Writer::request_checkpoint) starts; that also turns off
