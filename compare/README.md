@@ -25,7 +25,8 @@ once, then executes every implemented tool × workload × payload × reader × r
 **twice**, sequentially. W1 has one tickertape writer, not one duplicate per reader.
 It emits **112 result lines in 20 JSONL files**, `environment.txt`, `commands.txt`,
 `build.log`, `children.log`, `retries.jsonl` (latency runs discarded and repeated because the wall clock stepped
-backwards, at most three per run), Java dependency inventories, and a machine-readable
+backwards, at most three per run), Java dependency inventories, `jvm-logs/` (JVM log and late-send events of every
+Java process, see "JVM warm-up, tool settings and JVM logs"), and a machine-readable
 `skipped.json`. Any build, child,
 validation, timeout, or missing-tool failure fails the suite; missing measurements
 are never substituted with zero. Results already completed remain available.
@@ -37,12 +38,13 @@ the threads are pinned (below). Failed child groups are terminated and reaped.
 
 `--quick` uses 2,000 records for W1/W3, and 100 warmup + 1,000 measured for W2.
 It covers the full matrix and is a functional smoke check, **not publication data**.
-Java W1/W3 hot-path JIT warmup is reduced to 1,000 operations. With dependencies
-cached it targets less than three minutes; initial downloads/builds depend on the
+The long JVM warm-up is reduced to 4,000 records, which crosses none of the paths it exists for. With
+dependencies cached it takes a few minutes; initial downloads/builds depend on the
 network and machine. Full mode uses the counts below. The requested full matrix
 cannot finish within 30 minutes without overlapping competing benchmarks or
 reducing counts: 24 runs at 10,000/s × 1,100,000 sends require **44 minutes** of
-scheduled time alone, plus 4.4 minutes at 100,000/s and all throughput/startup work.
+scheduled time alone, plus 4.4 minutes at 100,000/s and all throughput/startup work (every Java process also
+warms up for a few seconds).
 The harness preserves isolation and counts; budget roughly an hour for full mode.
 
 Build/check only (no Java in CI):
@@ -52,7 +54,7 @@ cargo build --locked --release --manifest-path compare/Cargo.toml
 cargo fmt --manifest-path compare/Cargo.toml --check
 cargo clippy --manifest-path compare/Cargo.toml --all-targets -- -D warnings
 cargo test --manifest-path compare/Cargo.toml
-python3 -m unittest discover -s compare -p 'test_*.py'   # short and sustained mode
+python3 -m unittest discover -s compare -p 'test_*.py'   # short and sustained mode, JVM settings
 # Java builds, if invoking an adapter directly:
 JAVA_HOME=/path/to/jdk21 mvn -B -q -f compare/chronicle/pom.xml package dependency:build-classpath -Dmdep.outputFile=target/classpath.txt
 JAVA_HOME=/path/to/jdk21 mvn -B -q -f compare/aeron/pom.xml package dependency:build-classpath -Dmdep.outputFile=target/classpath.txt
@@ -192,7 +194,7 @@ and `results.jsonl` (all `runs/` results concatenated at the end; `runs/` is the
 `r10000` (explicit).
 
 Each result has `writer` (`count`, `planned_count`, `achieved_records_per_s`, `late_records`, `max_late_us`,
-`stopped_by`, `periodic_sync`) and `reader_result` (the latency histogram as in W2; for the probe, `count` and
+`stopped_by`, `periodic_sync`), `java` (as in the short mode) and `reader_result` (the latency histogram as in W2; for the probe, `count` and
 `latency`; `null` for queue-file), plus `tool`, `tool_version`, `guarantees`, `workload`, `payload`, `reader`,
 `concurrent_reader`, `rate_tag`, `rate`, `count`, `warmup`, `duration_s`, `warmup_s`, `sync_every_ms`,
 `periodic_sync_operation`, `repeat`, `quick`, start and finish times, the data directory and free space before the run.
@@ -235,7 +237,7 @@ as possible. There are **two figures per tool**, from separate runs (`W1-cold`,
 - **`W1-steady`, steady burst:** the tool is opened and 1,000 priming records are appended before the timer starts, for
   every tool, so files, first mappings and first pages exist. queue-file is opened with 128 MiB capacity (as large as a
   tickertape or yaque segment); as `QueueFile::open` creates it, it would double and sync its file inside the timer. Beyond
-  that the tools keep their settings (Chronicle's mapped chunk is `blockSize`, at its default here), so growth, rolls,
+  that the tools keep their settings (Chronicle's mapped chunk is `blockSize`, 1 GiB here unless switched back), so growth, rolls,
   chunk mappings and first-touch page faults beyond the priming records stay inside the timer, except where the tool
   itself prefaults. This is a short burst into ready files, not a long-run rate (see the sustained mode).
 
@@ -278,8 +280,8 @@ Late means send starts **more than 1 µs** after intended, including warmup.
 Achieved writer rate covers first send start to last completion including pacing,
 encoding and backpressure; it includes warmup. Short quick runs make this noisy.
 Every result additionally has `tool`, `tool_version`, structured `guarantees`,
-`workload`, `repeat`, `quick` and `affinity`. W1 has `append` (with `timer_starts` and `priming_records`); W3 has
-`replay`; each contains
+`workload`, `repeat`, `quick`, `affinity`, and `java` (`null` for tools without a JVM: the requested settings and what
+each Java process ran with). W1 has `append` (with `timer_starts` and `priming_records`); W3 has `replay`; each contains
 `count`, `seconds`, `records_per_s`, `payload_mb_per_s`. Throughput `rate` is null
 because W1/W3 are unpaced. W1 adds `flush_operation` and `flush_seconds`.
 The runner rejects truncated counts, invalid histogram ordering, and inconsistent
@@ -289,10 +291,8 @@ payload byte rates before writing a result line.
 complete traversal warms the page cache, then a **fresh reader process** times
 open plus traversal from the start and validation, excluding process startup and
 reader teardown.
-Java additionally warms the real read path in that reader JVM before reopening the
-endpoint for timing; this avoids measuring only interpreter startup. It reads up
-to 100,000 records for JIT warmup (1,000 in quick). W1 Java JIT warmup uses a separate
-scratch queue. These finite warmups do not prove compilation has converged.
+Java additionally warms the read path in that reader JVM before it opens the fixture for timing (next section);
+this avoids measuring only interpreter startup. Finite warm-ups do not prove that compilation has converged.
 
 `payload` means **application bytes only** (64 or 1,024). Tickertape uses its native
 sequence and local timestamp fields. All other tools carry an additional **16 B
@@ -305,6 +305,135 @@ Readers validate sequence and length and observe payload views/buffers; they do 
 perform an application computation or checksum the full application payload. Native record
 validation still applies where the tool performs it.
 
+## JVM warm-up, tool settings and JVM logs
+
+Issue #56. Each of these is on by default and has its own switch. Every result of a JVM tool records under `java` what
+was requested and what each process reports (the endpoint's settings, the warm-up it ran, its JVM arguments), and the
+runner fails a run whose process reports something else.
+
+| Setting | Default | Switch back to |
+|---|---|---|
+| JVM warm-up (Chronicle, Aeron) | long: 3 × 1,200,000 records and 8 × 20,000 | `--no-long-warmup`: W1/W3 100,000 records, W2 and sustained runs none |
+| Chronicle `microTouch()` in the busy-wait | on | `--no-micro-touch` |
+| Chronicle `blockSize` | 1 GiB | `--chronicle-block-size default`: 64 MiB, Chronicle's default |
+| Aeron term buffers | not sparse | `--aeron-sparse-terms`: sparse, Aeron's default |
+| Aeron clients' `preTouchMappedMemory` | on | `--no-aeron-pre-touch`: off, Aeron's default |
+| JVM logs and late-send events | on | `--no-jvm-logs` |
+
+The old settings, with which the results in `docs/benchmarks.md` up to v1.0.0 were recorded, are all six switches
+together. One of them alone isolates its effect; for `microTouch()` alone, between all off and all on, leave out
+`--no-micro-touch` and pass the others:
+
+```sh
+# all off, then microTouch() alone, then all on (the default)
+python3 compare/run.py OUT ... --no-long-warmup --no-micro-touch --chronicle-block-size default --aeron-sparse-terms --no-aeron-pre-touch --no-jvm-logs
+python3 compare/run.py OUT ... --no-long-warmup --chronicle-block-size default --aeron-sparse-terms --no-aeron-pre-touch --no-jvm-logs
+python3 compare/run.py OUT ...
+```
+
+The old settings are not the old code. What still differs from the harness that recorded the old results: the measured
+loops are methods of their own that send or poll in batches of 256; a paced writer spins to the start time before its
+first record's busy-wait; the busy-wait calls `Endpoint.idle()`, which does nothing when `microTouch()` is off; Aeron's
+reader uses one fragment handler instead of a lambda per poll; the runner pins threads. `--no-jvm-logs` also switches
+off the episode log described below.
+
+**Warm-up.** HotSpot compiles a path it has not seen into an uncommon trap; the first time the path is taken, the
+compiled code is discarded in the middle of the run. The old warm-up (and the unmeasured start of W2, which is only
+100,000 records too) never reached these paths, so each was first taken in the measured window:
+
+- Chronicle's first 64 MiB chunk boundary, at about record 799,000 with 64 B records. With 1,024 B records the first
+  100,000 records do cross one, so this gap is specific to 64 B.
+- Chronicle's first index array boundary, at record 1,048,576 (4096 × 256).
+- The reader's histogram branch, at the first record after the warm-up part.
+- Aeron's first 16 MiB term boundary, at record 131,072 with 64 B records. Aeron therefore gets the same warm-up.
+
+The long warm-up runs in every Java process before it announces readiness or starts its timer, in every mode (W1, W2,
+W3, probe, SV, SD). It runs the measured loops themselves, in the run's mode and at its rate, on scratch endpoints:
+paced sends with the busy-wait, a backlog where every send is late, then paced again; the reader tails a feeder thread
+in the same JVM, or replays a scratch queue for W3. Three full rounds cross the index boundary and at least one chunk
+boundary each; eight short rounds repeat an endpoint's first records, because some traps only count on their fourth
+hit. Chronicle's scratch queues keep 64 MiB chunks in the full rounds (256 KiB in the short ones), whatever the
+measured queue uses.
+
+The warm-up must not help or disturb the measured run otherwise:
+
+- Every scratch directory is separate from the data directory and deleted before the measurement, and nothing of it is
+  timed. A scratch queue takes up to about 1.3 GB (1,024 B records) while it exists.
+- The process then collects its garbage and runs `sync`, so that neither its objects nor its write-back reach into the
+  measurement. The W3 reader does not run `sync`, and does not read the fixture: that would change what is replayed.
+- In live runs both processes have warmed up before the writer opens the measured endpoint. Write-back while it is open
+  would write-protect its dirty pages again, and the pre-touched term buffers of Aeron would fault once more.
+- The runner allows the JVM tools ten minutes more per run, because a slow disk can take minutes for the warm-up's
+  scratch data (about 4 GB per Java process, 12 GB for a W3 run, at 1,024 B).
+- With pinned threads (below) the warm-up and its helper threads run on the helper CPUs, before the measured thread
+  pins itself, so they cannot be confined to its core.
+
+It is not a proof: `attribute.py` (below) lists what still deoptimises. In checks of this harness the W2 window had no
+deoptimisation apart from the loop's own exit, or one of a small helper method (`MappedBytesStore.inside`) at an index
+boundary after a chunk change; 15 s sustained runs had up to two of those in the writer.
+
+**No Chronicle pretoucher.** Chronicle's documentation recommends its pretoucher against page-fault outliers. It is
+part of Chronicle Queue Enterprise only, since 5.24 (5.23 still had it in the open-source edition). In the
+open-source 2026.8 used here `appender.pretouch()` logs "Pretoucher is only supported in Chronicle Queue Enterprise"
+and then throws `StackOverflowError`, because the open-source fallback in `PretouchUtil` calls
+`queue.createPretoucher()`, which calls `PretouchUtil` again. The suite uses open-source editions without a licence
+(ADR 0018), so it calls what the open-source appender has instead: `microTouch()`, declared by `MicroTouched` (not by
+`ExcerptAppender`, hence a cast), on every iteration of the writer's busy-wait between records.
+
+In 2026.8 `microTouch()` (class `MicroToucher`) takes the position of the last written record's header, rounds it up
+to the next 4 KiB, and does one compare-and-swap of 0 to 0 on the long there, once per page, if the page lies in the
+chunk that is mapped now (with its overlap). That takes the write fault of the **next** data page on the waiting
+writer thread instead of inside the next record. It does not read ahead further than one page, does not map the next
+chunk, create the next cycle file or touch index pages, and it can only run while the writer waits: not in W1 and the
+probe, which never wait, and not while a paced writer is behind. On a system with 16 KiB pages three of four calls
+touch a page that is already there. What it costs the writer: each call that touches nothing does a volatile write
+(`lastPageToSync`), so Chronicle's busy-wait is slightly coarser than the other tools'; and the waiting thread pays more
+page faults (on aarch64 the compare-and-swap on an unmapped page takes a read fault and then a write fault of 4 KiB),
+where without it a fault on the record path covers more. `micro_touch_attempts` in the result counts the calls that
+reached a new page, whether or not the touch was made. Its companion `bgMicroTouch()` (a background `msync` of written
+pages) is not used.
+
+Chronicle's own evidence is `bench/results.txt` in its tests, whose sections have few labels and no machine or unit. In
+its first group the 99.9th percentile of ten runs is 15.2–16.5 without anything, 1.3–1.5 under "microtouch",
+15.2–16.3 under "pretouch" and 15.2–16.4 under "bgMicroTouch" (so no gain from the last two). A later group of five
+runs does not repeat it: 16.4–19.7 without anything, and 11.6–424,149 under "micro", with two runs above 20,000. The
+rerun therefore also publishes `microTouch()` alone, on both architectures.
+
+**`blockSize`.** Chronicle's README says about the default of 64 MB: "in production you may want this to be high to
+reduce jitter from creating new chunks". It also says "You should avoid changing `blockSize` unnecessarily". Its
+examples are `512G` on the command line and `1G` in `system.properties`, and the suite uses that 1 GiB for the writer
+and the reader. Chronicle's benchmarks differ: `InternalBenchmarkMain` also sets `1 << 30`,
+`ChronicleQueueLatencyDistribution` 128 MiB and `ThroughputPerfMain` 512 GiB on systems with sparse files, which needs
+a sparse file of that size and a matching address space on every test system. With 1 GiB, 64 B records cross a chunk
+boundary every 12.8 million records, and a W2 run of 1,100,000 × 1,024 B crosses one.
+
+**JVM logs.** Every Java process writes `jvm-logs/<label>-<role>.log` in OUTDIR with
+`-Xlog:gc*,safepoint,handshake*,jit+compilation=debug,deoptimization=debug` (`jit+compilation` logs nothing below debug;
+`deoptimization` adds the reason of each trap), decorated with UTC and `System.nanoTime()`. The file beside it,
+`<label>-<role>.events.json`, has the measured window, the wall clock and `System.nanoTime()` together before and after
+the run, and for live runs the **episodes**: runs of consecutive late sends (more than 1 µs, the definition of
+`late_records`) on the writer, or of receives slower than 100 µs on the reader, each with its first record, start,
+number of records, worst delay and the time of it, and end. Episodes rather than records, because one stall makes every
+record of the backlog late. There is room for 65,536 of them. A run near saturation has more, so a filling log keeps
+only longer ones: over 10 µs from half full, 100 µs from three quarters, 1 ms from seven eighths. `episodes_dropped`
+counts those left out; when it is not zero, the counts below describe the kept episodes only.
+
+```sh
+python3 compare/attribute.py OUTDIR/jvm-logs/chronicle-W2-64-default-100000-1-*.events.json
+```
+
+prints the pauses and C2 deoptimisations in the measured window, and how many episodes a GC, another safepoint, a
+handshake or a deoptimisation can explain (its docstring has the rule), or neither. Only the time in which an episode's
+worst delay built up counts, so an event elsewhere in a long episode explains nothing. A handshake's duration includes
+waiting for the other threads. Episodes are kept in preallocated arrays and written after the run. The JVM logs use
+`-Xlog:async`: the threads that log hand the line to a writer thread and never wait for the file. After the long
+warm-up there is next to nothing to log: checks on an OrbStack VM (Linux on macOS) had a handful of lines per process
+in the 10 s W2 window.
+
+**Opt-in experiments**, off by default: `--java-experiment always-pre-touch` (`-XX:+AlwaysPreTouch`), `epsilon`
+(Epsilon GC with a 4 GiB heap limit; proves that no collection ran, and fails the run if the heap fills) and
+`no-guaranteed-safepoint` (`-XX:GuaranteedSafepointInterval=0`). Repeat the option to combine them.
+
 ## Per-tool mapping and guarantees
 
 Pins were selected from Maven Central/crates.io release metadata on 2026-11-01.
@@ -314,7 +443,7 @@ power-loss guarantees**. Sync times alone establish no power-loss guarantee.
 | Tool / version | W1 | W2 | W3 | Final W1 operation |
 |---|---|---|---|---|
 | tickertape, current checkout (0.3.0) | `Writer::append`, 128 MiB segments | existing `tt-latency`, `safe` and `mapped` | `Reader::try_next`, `safe` and `open_mapped` | `Writer::checkpoint`, data + durable marker |
-| Chronicle Queue 2026.8, Apache-2.0 OSS | appender `writingDocument`, raw bytes | two JVMs; tailer `readingDocument`, read primitives directly from mapped bytes | new tailer `toStart`, same raw document API | `ExcerptAppender.sync`, default `MS_ASYNC` **submission**, not fsync completion |
+| Chronicle Queue 2026.8, Apache-2.0 OSS, `blockSize` 1 GiB | appender `writingDocument`, raw bytes | two JVMs, `microTouch()` in the busy-wait; tailer `readingDocument`, read primitives directly from mapped bytes | new tailer `toStart`, same raw document API | `ExcerptAppender.sync`, default `MS_ASYNC` **submission**, not fsync completion |
 | Aeron 1.54.0, Apache-2.0 | skipped | IPC publication `offer` / subscription `poll(256)`, two JVMs | skipped | none |
 | yaque 0.6.6 | unbounded `try_send`, 128 MiB segments | `Receiver::try_recv` + guard `commit`, no periodic state saves | non-consuming `QueueIter`, from initial saved queue head | none exposed; `try_send` flushes its user buffer to file per message, **not fsync** |
 | queue-file 2.0.0 | `add`, `set_sync_writes(false)`; default header publication retained | unsupported: upstream explicitly forbids concurrent process access | `iter().borrowed_next()`, non-consuming, reuses read buffer | `sync_all` |
@@ -330,8 +459,13 @@ power-loss guarantees**. Sync times alone establish no power-loss guarantee.
 | plain file | completed writes remain in OS cache; partial last frame possible, no recovery protocol | file / sequential scan only in this adapter | yes, no shared mutable reader metadata | no |
 
 Aeron's media driver is embedded in the writer JVM, with **DEDICATED** threading,
-`BusySpinIdleStrategy` for conductor and `NoOpIdleStrategy` for sender/receiver,
-following Aeron's `LowLatencyMediaDriver` recommendation. Both clients have their
+`BusySpinIdleStrategy` for conductor and `NoOpIdleStrategy` for sender/receiver and
+`termBufferSparseFile(false)`, as Aeron's `LowLatencyMediaDriver` sets them (the idle strategies
+are separate instances). Aeron's default is sparse term buffers, which Aeron says "can save space at
+the expense of latency"; the driver touches their pages only when they are not sparse. The clients also
+set `preTouchMappedMemory(true)`, which is not Aeron's default and not part of that class, because the
+client maps the same buffers a second time and takes its page faults in that mapping. Results up to
+v1.0.0 used Aeron's defaults for both (`--aeron-sparse-terms`, `--no-aeron-pre-touch`). Both clients have their
 own conductor threads; the reader busy-polls `Subscription.poll`. Messages here
 fit the IPC MTU; no fragmentation/reassembly path is needed. IPC term size is
 16 MiB. Publication backpressure is retried without dropping or changing intended
@@ -377,6 +511,8 @@ Both Java adapters use the exact array in [`java-flags.sh`](java-flags.sh):
 -Dorg.slf4j.simpleLogger.defaultLogLevel=warn
 ```
 
+The runner adds the logging flags and the opt-in experiments per process; `commands.txt` has them as `--jvm=...`.
+
 The nine classpath module flags follow OpenHFT's Java-version support document;
 `jdk.internal.misc` is additionally required by current Agrona, and the newer
 Chronicle article includes it and `jdk.internal.util`. Parallel GC and equal fixed
@@ -390,7 +526,8 @@ variation under the existing playbook. Do not publish quick-run rankings.
 
 Other limits to retain with any comparison:
 
-- Threads are pinned on Linux only, and to CPUs that other work may share. No isolation, power control, prefaulting, privileged cache eviction,
+- Threads are pinned on Linux only, and to CPUs that other work may share. No isolation, power control, harness
+  prefaulting (other than Chronicle's `microTouch()` and Aeron's own pre-touch), privileged cache eviction,
   replication, compression, or network transport. Busy polling and driver threads
   consume different CPU budgets. OS scheduling/thermal/load/clock effects remain.
 - W1 includes tool-specific record copies, CRC, syscall counts, indexing, metadata,
@@ -404,7 +541,7 @@ Other limits to retain with any comparison:
   total bytes written. Native field/index layouts have different overhead.
 - Java JIT, allocation, compiler threads and GC remain possible during measurements.
   W2 warmup follows the identical schedule and is excluded only from histogram;
-  its writer metrics still include warmup. W1/W3 same-JVM warmup is documented above.
+  its writer metrics still include warmup. The JVM warm-up before it is documented above.
   A short smoke run cannot characterize tail latency or steady-state Java behavior.
 - The plain file parser is deliberately unbuffered, since this baseline is `write(2)`
   + `read(2)`; tickertape's safe reader has its own chunked buffer. Polling EOF can
@@ -421,6 +558,8 @@ Upstream references:
 - [OpenHFT Java support and required flags](https://github.com/OpenHFT/OpenHFT/blob/ea/docs/Java-Version-Support.adoc)
 - [Chronicle's current JVM flags explanation](https://chronicle.software/insights/blogs/running-chronicle-on-java-17-and-later-the-required-jvm-arguments-explained)
 - [Chronicle Queue 2026.8 API examples and contracts](https://github.com/OpenHFT/Chronicle-Queue/blob/chronicle-queue-2026.8/README.adoc)
+- [Chronicle Queue 2026.8 `MicroToucher`](https://github.com/OpenHFT/Chronicle-Queue/blob/chronicle-queue-2026.8/src/main/java/net/openhft/chronicle/queue/impl/single/MicroToucher.java), [`PretouchUtil`](https://github.com/OpenHFT/Chronicle-Queue/blob/chronicle-queue-2026.8/src/main/java/net/openhft/chronicle/queue/util/PretouchUtil.java) and [`InternalBenchmarkMain`](https://github.com/OpenHFT/Chronicle-Queue/blob/chronicle-queue-2026.8/src/main/java/net/openhft/chronicle/queue/internal/main/InternalBenchmarkMain.java)
+- [Chronicle Queue 2026.8 README: block size, pretoucher](https://github.com/OpenHFT/Chronicle-Queue/blob/chronicle-queue-2026.8/README.adoc)
 - [Chronicle Queue Maven release metadata](https://repo.maven.apache.org/maven2/net/openhft/chronicle-queue/maven-metadata.xml)
 - [Aeron best practices: threading, polling, idle strategies and filesystem](https://github.com/aeron-io/aeron/wiki/Best-Practices-Guide)
 - [Aeron 1.54.0](https://github.com/aeron-io/aeron/tree/1.54.0)
