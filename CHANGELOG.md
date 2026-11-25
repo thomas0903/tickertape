@@ -73,7 +73,7 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 - Changed (CLI, dependencies): `Cargo.lock` moves parquet from 59.3.2 to 59.3.3 for RUSTSEC-2026-0595 (bloom filters
   written in plaintext into encrypted Parquet files), which `cargo deny` started to report. The CLI builds parquet
   without its encryption feature and never wrote such files.
-- Docs: ADR 0045 (accepted, nothing built) designs a sparse, rebuildable seek index next to sealed segments (issue #59).
+- Docs: ADR 0045 (accepted) designs a sparse, rebuildable seek index next to sealed segments (issue #59), built as above.
 - Docs: ADR 0048 (accepted, nothing built) settles the zero-copy reader's publication frontier (issue #62). With it, the
   text of the zero-copy reader's known limitation is corrected (`Reader::open_mapped`, `crash-contract.md`,
   `compatibility.md`): the damage can appear whether or not a writer runs, it includes the empty slot at the head, and a
