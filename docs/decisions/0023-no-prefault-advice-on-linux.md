@@ -1,8 +1,8 @@
 # 0023: No prefault advice (and no spare segment) on Linux
 
 - **Status:** accepted (amends [0020](0020-background-prefault.md)); the prefault-advice decision is superseded by
-  [0025](0025-linux-prefault-small-window.md); the spare-segment amendment is superseded by the amendment of 2026-11-25
-  below
+  [0025](0025-linux-prefault-small-window.md), and the spare-segment amendment stands as the
+  default (amended by [0049](0049-linux-spare-segment-option.md), which makes the spare an option)
 - **Date:** 2026-11-01
 
 ## Context
@@ -89,34 +89,3 @@ no effect there. Its doc comment says so.
 **Benchmarks:** formatting must disable lazy initialisation for any ext4 volume that is benchmarked right after
 creation. The AWS provisioning script does this from now on.
 
-
-## Amendment of 2026-11-25: the spare segment on Linux, prepared without a sync
-
-**Context.** The second experiment above ran while a roll synced the new segment's header on the writer's thread. Rolls
-have not synced since ADR 0038, so issue #60 asked whether the result changed. Evidence: `docs/benchmarks.md` →
-"2026-11-25, roll and journal stalls on Google Cloud VMs" (the spare segment, again; before and after).
-- The cell that failed here (one run in four) repeated 30 times per configuration on aarch64 and x86-64: no run above
-  35 µs at p99.9, with the spare's preallocation synced or not. Other machines than the ones above, so this does not
-  show which difference removed the failure.
-- The mechanism of the remaining long stalls is the ext4 journal (a write fault's modification-time update, and the
-  roll's `open`, `fallocate` and `link`), not the spare. A spare moves the create and the `fallocate` off the writer.
-
-**Decision.** On Linux the writer prepares a spare segment again (ADR 0022), with three differences from macOS:
-- **Not synced.** `fallocate` has allocated the blocks (C10), and the checkpoint that first covers the segment syncs
-  its size and header, as for a segment a roll creates itself (ADR 0038 → Rolls without a sync). No on-disk format or
-  guarantee changes: a spare that was linked but not synced is the state C8 already describes.
-- **Never waited for.** A roll that finds its spare not ready creates the segment itself; the spare stays for the next
-  roll. So a slow filesystem can only take away the benefit.
-- **Kept by one thread for the writer's life.** A thread started for each spare made the writer's worst append worse.
-
-**Consequences.**
-- Rolls: 137–182 µs become 44–54 µs (p50) on ext4, and the mapped reader's p99.9 falls (benchmarks, before and after).
-- On a saturated device (aarch64, 90 % of the probe) a roll meets the journal's stall more often; the writer's
-  stall time, maxima and late sends are unchanged.
-- One more idle thread per writer on Linux, and one more segment's worth of disk space from the time the active segment
-  is half full. With `prefault(false)` neither exists.
-- The remaining stalls are the filesystem's and the device's. An ext4 mounted `lazytime` keeps modification times out of
-  the journal and so removes the write-fault stalls (not the rolls'); `operations.md` says so.
-- Rejected, with the measurements: a larger prefault window, a ranged checkpoint sync, a spare thread per segment.
-
-Tests: `tests/spare_segment.rs`, `tests/disk_full.rs::full_volume_then_roll_into_prepared_spare`.

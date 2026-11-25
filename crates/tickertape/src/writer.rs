@@ -220,9 +220,11 @@ impl Writer {
                 )
             })
             .flatten();
-        let spares = (config.prefault && cfg!(any(target_vendor = "apple", target_os = "linux")))
-            .then(|| Spares::start(&root, config.segment_size, config.helper_cpus.clone()))
-            .flatten();
+        let spares = (config.prefault
+            && config.spare_segment
+            && cfg!(any(target_vendor = "apple", target_os = "linux")))
+        .then(|| Spares::start(&root, config.segment_size, config.helper_cpus.clone()))
+        .flatten();
         let ctx = Arc::new(Context {
             dir: root.clone(),
             marker: Mutex::new(Marker {
@@ -559,7 +561,7 @@ impl Writer {
             writeback.advanced(self.offset);
         }
         // Once the active segment is half full, prepare the next one off the writer's thread (ADR 0022; on Linux
-        // without a sync, ADR 0023 → Amendment of 2026-11-25).
+        // without a sync and only with `WriterConfig::spare_segment`, ADR 0049).
         if let Some(spares) = &mut self.spares {
             if self.offset >= self.active.size / 2 && !spares.requested() {
                 spares.request();
@@ -1078,7 +1080,17 @@ impl Writer {
         // from reaching the disk (ADR 0038 → Rolls without a sync; crash contract C8).
         let new = match self.take_spare() {
             Some(spare) => publish_spare(&self.root, next_base, self.config.segment_size, spare)?,
-            None => create_segment(&self.root, next_base, self.config.segment_size, false)?,
+            None => match create_segment(&self.root, next_base, self.config.segment_size, false) {
+                // A spare still being prepared may hold the space this needed: only now is it worth waiting for
+                // (ADR 0049).
+                Err(full) if full.is_storage_full() => match self.wait_for_spare() {
+                    Some(spare) => {
+                        publish_spare(&self.root, next_base, self.config.segment_size, spare)?
+                    }
+                    None => return Err(full),
+                },
+                created => created?,
+            },
         };
         crate::fault::hook(crate::fault::Point::RollAfterLink);
         self.dirty_dirs.insert(self.root.clone());
@@ -1127,6 +1139,17 @@ impl Writer {
     /// still being prepared; on Linux never ([`Spares::take`]).
     fn take_spare(&mut self) -> Option<Spare> {
         let spare = self.spares.as_mut()?.take()?;
+        self.usable(spare)
+    }
+
+    /// As [`Writer::take_spare`], but waits for a spare being prepared ([`Spares::wait`]).
+    fn wait_for_spare(&mut self) -> Option<Spare> {
+        let spare = self.spares.as_mut()?.wait()?;
+        self.usable(spare)
+    }
+
+    /// The spare, if it has this journal's segment size; otherwise it is discarded.
+    fn usable(&self, spare: Spare) -> Option<Spare> {
         if spare.size == self.config.segment_size {
             return Some(spare);
         }
@@ -2835,6 +2858,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let config = WriterConfig::default()
                 .segment_size(format::SEGMENT_SIZE_UNIT)
+                .spare_segment(true)
                 .helper_cpus(cpus.clone());
             // In a forked child, whose only threads are the writer's thread and the helpers it starts (other tests
             // in this process run writers of their own).

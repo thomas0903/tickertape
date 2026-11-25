@@ -1,4 +1,5 @@
-//! ADR 0022: the next segment is prepared in the background and published at roll (macOS, and Linux: issue #60).
+//! ADR 0022: the next segment is prepared in the background and published at roll (macOS by default;
+//! on Linux with `WriterConfig::spare_segment`, ADR 0049).
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -7,7 +8,7 @@ use std::os::unix::fs::MetadataExt;
 use std::sync::Mutex;
 
 use tickertape::fault::{self, Point};
-use tickertape::{NewRecord, Reader, ReaderConfig, RecoveryAction, Writer};
+use tickertape::{NewRecord, Reader, ReaderConfig, RecoveryAction, Writer, WriterConfig};
 use tickertape_tests::small_config;
 
 const SPARE: &str = "next-segment.tmp";
@@ -19,6 +20,11 @@ fn serial() -> std::sync::MutexGuard<'static, ()> {
     let guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     fault::clear();
     guard
+}
+
+/// The spare segment on, which is the default on macOS only.
+fn config() -> WriterConfig {
+    small_config().spare_segment(true)
 }
 
 fn identity(path: &Path) -> (u64, u64) {
@@ -109,7 +115,7 @@ fn fill_until_roll(w: &mut Writer, dir: &Path, rolls: usize) {
 fn spare_is_prepared_at_half_full_and_published_at_roll() {
     let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
-    let mut w = Writer::open(dir.path(), small_config()).unwrap();
+    let mut w = Writer::open(dir.path(), config()).unwrap();
     let spare = dir.path().join(SPARE);
     assert!(!spare.exists(), "no spare before the segment is half full");
     let half = small_config().segment_size / 2;
@@ -155,9 +161,9 @@ fn spare_is_prepared_at_half_full_and_published_at_roll() {
 fn leftover_spare_is_removed_and_reported_at_open() {
     let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
-    drop(Writer::open(dir.path(), small_config()).unwrap());
+    drop(Writer::open(dir.path(), config()).unwrap());
     std::fs::write(dir.path().join(SPARE), vec![0u8; 4096]).unwrap();
-    let w = Writer::open(dir.path(), small_config()).unwrap();
+    let w = Writer::open(dir.path(), config()).unwrap();
     assert!(!dir.path().join(SPARE).exists());
     assert!(
         w.recovery_report().actions.iter().any(
@@ -172,7 +178,7 @@ fn leftover_spare_is_removed_and_reported_at_open() {
 fn roll_falls_back_when_no_spare_can_be_prepared() {
     let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
-    let mut w = Writer::open(dir.path(), small_config()).unwrap();
+    let mut w = Writer::open(dir.path(), config()).unwrap();
     // A directory in the spare's place makes every preparation fail.
     std::fs::create_dir(dir.path().join(SPARE)).unwrap();
     fill_until_roll(&mut w, dir.path(), 2);
@@ -194,7 +200,7 @@ fn failed_spare_preparation_is_cleaned_up_and_the_roll_falls_back() {
         (Point::SpareMap, 12 /* ENOMEM */),
     ] {
         let dir = tempfile::tempdir().unwrap();
-        let mut w = Writer::open(dir.path(), small_config()).unwrap();
+        let mut w = Writer::open(dir.path(), config()).unwrap();
         fault::fail_next_background(point, errno);
         for _ in 0..40 {
             append(&mut w, 1024); // past half: the spare is requested and its preparation fails
@@ -220,7 +226,7 @@ fn failed_spare_preparation_is_cleaned_up_and_the_roll_falls_back() {
 fn failed_header_write_discards_the_spare_and_creates_the_segment() {
     let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
-    let mut w = Writer::open(dir.path(), small_config()).unwrap();
+    let mut w = Writer::open(dir.path(), config()).unwrap();
     wait_for_ready_spare(&mut w, dir.path());
     // Keep the spare open: otherwise a filesystem may give the replacement the freed inode number (ext4 does).
     let _hold = std::fs::File::open(dir.path().join(SPARE)).unwrap();
@@ -246,7 +252,7 @@ fn failed_header_write_discards_the_spare_and_creates_the_segment() {
 fn prefault_off_prepares_no_spare() {
     let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
-    let mut w = Writer::open(dir.path(), small_config().prefault(false)).unwrap();
+    let mut w = Writer::open(dir.path(), config().prefault(false)).unwrap();
     for _ in 0..40 {
         append(&mut w, 1024); // past half of the first segment
     }
@@ -265,7 +271,7 @@ fn prefault_off_prepares_no_spare() {
 fn roll_does_not_wait_for_an_unfinished_spare() {
     let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
-    let mut w = Writer::open(dir.path(), small_config()).unwrap();
+    let mut w = Writer::open(dir.path(), config()).unwrap();
     let hold = fault::hold_background(Point::SparePreallocate);
     for _ in 0..40 {
         append(&mut w, 1024);
@@ -288,12 +294,173 @@ fn roll_does_not_wait_for_an_unfinished_spare() {
     assert_eq!(read_count(dir.path()), total);
 }
 
+/// The names of this process's threads that start with `tickertape-` (as `comm` keeps them), and its descriptors.
+#[cfg(target_os = "linux")]
+fn helpers_and_descriptors() -> (Vec<String>, usize) {
+    let mut names: Vec<String> = std::fs::read_dir("/proc/self/task")
+        .unwrap()
+        .filter_map(|t| std::fs::read_to_string(t.unwrap().path().join("comm")).ok())
+        .map(|n| n.trim_end().to_owned())
+        .filter(|n| n.starts_with("tickertape-"))
+        .collect();
+    names.sort();
+    (names, std::fs::read_dir("/proc/self/fd").unwrap().count())
+}
+
+/// Linux: with the option off, which is the default, a writer has no spare thread, no spare file and no descriptor
+/// more than before 1.1 (ADR 0049); with it on it has one spare thread from `Writer::open`, and one descriptor more
+/// while a spare is ready. This is the only test of this file that counts threads: the others hold `SERIAL` too.
+#[cfg(target_os = "linux")]
+#[test]
+fn no_spare_by_default_on_linux() {
+    let _serial = serial();
+    assert!(!WriterConfig::default().spare_segment);
+    let mut measured = Vec::new();
+    for config in [small_config(), config()] {
+        let on = config.spare_segment;
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = Writer::open(dir.path(), config).unwrap();
+        // Threads set their own names when they start: the prefault and write-back helpers, and the spare thread.
+        let expected = if on {
+            vec!["tickertape-pref", "tickertape-spar", "tickertape-writ"]
+        } else {
+            vec!["tickertape-pref", "tickertape-writ"]
+        };
+        wait_for(
+            || helpers_and_descriptors().0 == expected,
+            "the helper threads' names",
+        );
+        for _ in 0..40 {
+            append(&mut w, 1024); // past half of the first segment
+        }
+        wait_for(|| w.spare_settled(), "the spare's preparation to end");
+        assert_eq!(dir.path().join(SPARE).exists(), on);
+        let (_, descriptors) = helpers_and_descriptors();
+        measured.push(descriptors);
+        fill_until_roll(&mut w, dir.path(), 2);
+        let total = w.next_seq();
+        drop(w);
+        assert_eq!(read_count(dir.path()), total);
+    }
+    assert_eq!(measured[1], measured[0] + 1);
+}
+
+/// macOS: the spare is on by default, as before the option existed, and `spare_segment(false)` turns it off.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn spare_is_on_by_default_on_macos_and_can_be_refused() {
+    let _serial = serial();
+    assert!(WriterConfig::default().spare_segment);
+    for (config, on) in [
+        (small_config(), true),
+        (small_config().spare_segment(false), false),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = Writer::open(dir.path(), config).unwrap();
+        for _ in 0..40 {
+            append(&mut w, 1024);
+        }
+        wait_for(|| w.spare_settled(), "the spare's preparation to end");
+        assert_eq!(dir.path().join(SPARE).exists(), on);
+        fill_until_roll(&mut w, dir.path(), 1);
+    }
+}
+
+#[cfg(target_os = "linux")]
+const ENOSPC: i32 = 28;
+
+/// Linux: the roll finds its spare not ready, and creating a segment fails because the spare being prepared has taken
+/// the last of the space. The roll then waits for the spare and uses it, instead of reporting a full disk (ADR 0049).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_roll_without_space_uses_the_spare_that_took_it() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let mut w = Writer::open(dir.path(), config()).unwrap();
+    let hold = fault::hold_background(Point::SpareMap); // its blocks are allocated
+    for _ in 0..40 {
+        append(&mut w, 1024);
+    }
+    assert!(hold.wait_reached(Duration::from_secs(10)));
+    let prepared = identity(&dir.path().join(SPARE));
+    fault::fail_next(Point::Preallocate, ENOSPC); // the roll's own segment finds no space
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(100));
+        hold.release();
+    });
+    fill_until_roll(&mut w, dir.path(), 1); // `append` panics on an error
+    releaser.join().unwrap();
+    fault::clear();
+    assert_eq!(identity(&newest_segment(dir.path())), prepared);
+    assert!(!dir.path().join(SPARE).exists());
+    // The next segment gets a spare again.
+    wait_for_ready_spare(&mut w, dir.path());
+    fill_until_roll(&mut w, dir.path(), 1);
+    let total = w.next_seq();
+    drop(w);
+    assert_eq!(read_count(dir.path()), total);
+}
+
+/// Linux: if preparing that spare fails too, or none is being prepared, the roll reports the full disk as before.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_roll_without_space_or_spare_reports_storage_full() {
+    let _serial = serial();
+    for spare_fails in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let config = if spare_fails {
+            config()
+        } else {
+            small_config()
+        };
+        let mut w = Writer::open(dir.path(), config).unwrap();
+        let hold = spare_fails.then(|| {
+            fault::fail_next_background(Point::SparePreallocate, ENOSPC);
+            fault::hold_background(Point::SparePreallocate)
+        });
+        for _ in 0..40 {
+            append(&mut w, 1024);
+        }
+        if let Some(hold) = &hold {
+            assert!(hold.wait_reached(Duration::from_secs(10)));
+        }
+        fault::fail_next(Point::Preallocate, ENOSPC);
+        let releaser = hold.map(|hold| {
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(100));
+                hold.release();
+            })
+        });
+        let record = NewRecord {
+            schema_id: 1,
+            venue_ts_ns: 0,
+            local_ts_ns: 0,
+            payload: &[0x5a; 1024],
+        };
+        let full = loop {
+            if let Err(e) = w.append(&record) {
+                break e;
+            }
+        };
+        assert!(full.is_storage_full(), "{full:?}");
+        if let Some(releaser) = releaser {
+            releaser.join().unwrap();
+        }
+        fault::clear();
+        // A later append retries the roll.
+        fill_until_roll(&mut w, dir.path(), 1);
+        let total = w.next_seq();
+        drop(w);
+        assert_eq!(read_count(dir.path()), total);
+    }
+}
+
 /// A spare still being prepared when the writer is dropped is waited for and removed.
 #[test]
 fn dropping_the_writer_waits_for_the_spare_and_removes_it() {
     let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
-    let mut w = Writer::open(dir.path(), small_config()).unwrap();
+    let mut w = Writer::open(dir.path(), config()).unwrap();
     let hold = fault::hold_background(Point::SparePreallocate);
     for _ in 0..40 {
         append(&mut w, 1024);

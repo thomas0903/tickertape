@@ -5,6 +5,7 @@ import static java.lang.foreign.ValueLayout.JAVA_INT;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.util.Objects;
+import java.util.Optional;
 
 /**
  * Options for {@link Writer#open(java.nio.file.Path, WriterOptions)}. Immutable; each method returns a new value.
@@ -17,30 +18,34 @@ import java.util.Objects;
  */
 public final class WriterOptions {
     private static final WriterOptions DEFAULTS =
-            new WriterOptions(128L << 20, RecoveryPolicy.QUARANTINE, true, true, true, HelperCpus.process(), null);
+            new WriterOptions(128L << 20, RecoveryPolicy.QUARANTINE, true, true, true, null, HelperCpus.process(),
+                    null);
 
     private final long segmentSize;
     private final RecoveryPolicy recoveryPolicy;
     private final boolean notify;
     private final boolean prefault;
     private final boolean earlyWriteback;
+    /** {@code null}: the platform's default. */
+    private final Boolean spareSegment;
     private final HelperCpus helperCpus;
     private final Retention retention;
 
     private WriterOptions(long segmentSize, RecoveryPolicy recoveryPolicy, boolean notify, boolean prefault,
-            boolean earlyWriteback, HelperCpus helperCpus, Retention retention) {
+            boolean earlyWriteback, Boolean spareSegment, HelperCpus helperCpus, Retention retention) {
         this.segmentSize = segmentSize;
         this.recoveryPolicy = recoveryPolicy;
         this.notify = notify;
         this.prefault = prefault;
         this.earlyWriteback = earlyWriteback;
+        this.spareSegment = spareSegment;
         this.helperCpus = helperCpus;
         this.retention = retention;
     }
 
     /**
-     * 128 MiB segments, {@link RecoveryPolicy#QUARANTINE}, notify on, prefault on, early write-back on,
-     * {@link HelperCpus#process()}, no retention.
+     * 128 MiB segments, {@link RecoveryPolicy#QUARANTINE}, notify on, prefault on, early write-back on, the
+     * platform's default for the spare segment, {@link HelperCpus#process()}, no retention.
      */
     public static WriterOptions defaults() {
         return DEFAULTS;
@@ -54,27 +59,30 @@ public final class WriterOptions {
         if (bytes <= 0) {
             throw new IllegalArgumentException("segment size must be positive: " + bytes);
         }
-        return new WriterOptions(bytes, recoveryPolicy, notify, prefault, earlyWriteback, helperCpus, retention);
+        return new WriterOptions(bytes, recoveryPolicy, notify, prefault, earlyWriteback, spareSegment, helperCpus,
+                retention);
     }
 
     /** What to do with a corrupt committed tail on open. */
     public WriterOptions recoveryPolicy(RecoveryPolicy policy) {
-        return new WriterOptions(segmentSize, Objects.requireNonNull(policy, "policy"), notify, prefault, earlyWriteback,
-                helperCpus, retention);
+        return new WriterOptions(segmentSize, Objects.requireNonNull(policy, "policy"), notify, prefault, earlyWriteback, spareSegment, helperCpus,
+                retention);
     }
 
     /** Whether the writer wakes blocked readers through its shared-memory wake-up region (ADRs 0017, 0021). */
     public WriterOptions notify(boolean enabled) {
-        return new WriterOptions(segmentSize, recoveryPolicy, enabled, prefault, earlyWriteback, helperCpus, retention);
+        return new WriterOptions(segmentSize, recoveryPolicy, enabled, prefault, earlyWriteback, spareSegment, helperCpus,
+                retention);
     }
 
     /**
-     * Whether the writer prefaults pages (and on macOS prepares the next segment) in a background thread it starts.
-     * {@code false} gives a writer that starts no threads, except the checkpoint thread that
-     * {@link Writer#requestCheckpoint()} starts, and turns off early write-back.
+     * Whether the writer prefaults pages in a background thread it starts. {@code false} gives a writer that starts no
+     * threads, except the checkpoint thread that {@link Writer#requestCheckpoint()} starts, and turns off early
+     * write-back and the spare segment.
      */
     public WriterOptions prefault(boolean enabled) {
-        return new WriterOptions(segmentSize, recoveryPolicy, notify, enabled, earlyWriteback, helperCpus, retention);
+        return new WriterOptions(segmentSize, recoveryPolicy, notify, enabled, earlyWriteback, spareSegment, helperCpus,
+                retention);
     }
 
     /**
@@ -85,12 +93,26 @@ public final class WriterOptions {
      * {@link Writer#checkpointProgress()} or {@link Writer#close()}. <b>macOS:</b> no effect. Default: on.
      */
     public WriterOptions earlyWriteback(boolean enabled) {
-        return new WriterOptions(segmentSize, recoveryPolicy, notify, prefault, enabled, helperCpus, retention);
+        return new WriterOptions(segmentSize, recoveryPolicy, notify, prefault, enabled, spareSegment, helperCpus,
+                retention);
+    }
+
+    /**
+     * Whether the writer prepares the next segment in a background thread once the active one is half full, so that a
+     * roll writes its header and links it instead of creating a file (ADRs 0022, 0049; needs
+     * {@link #prefault(boolean)}). It reserves one more segment's worth of disk space. Whether it helps depends on the
+     * load and the disk: measure first. Default: on on macOS, off on Linux.
+     *
+     * @since 1.1
+     */
+    public WriterOptions spareSegment(boolean enabled) {
+        return new WriterOptions(segmentSize, recoveryPolicy, notify, prefault, earlyWriteback, enabled, helperCpus,
+                retention);
     }
 
     /** Where the writer's helper threads run (Linux; see {@link HelperCpus}). Default: {@link HelperCpus#process()}. */
     public WriterOptions helperCpus(HelperCpus cpus) {
-        return new WriterOptions(segmentSize, recoveryPolicy, notify, prefault, earlyWriteback,
+        return new WriterOptions(segmentSize, recoveryPolicy, notify, prefault, earlyWriteback, spareSegment,
                 Objects.requireNonNull(cpus, "cpus"), retention);
     }
 
@@ -100,7 +122,8 @@ public final class WriterOptions {
      * already exist.
      */
     public WriterOptions retention(Retention retention) {
-        return new WriterOptions(segmentSize, recoveryPolicy, notify, prefault, earlyWriteback, helperCpus, retention);
+        return new WriterOptions(segmentSize, recoveryPolicy, notify, prefault, earlyWriteback, spareSegment, helperCpus,
+                retention);
     }
 
     /** The size of new segment files in bytes. */
@@ -128,6 +151,15 @@ public final class WriterOptions {
         return earlyWriteback;
     }
 
+    /**
+     * Whether the spare segment is on (see {@link #spareSegment(boolean)}); empty for the platform's default.
+     *
+     * @since 1.1
+     */
+    public Optional<Boolean> spareSegment() {
+        return Optional.ofNullable(spareSegment);
+    }
+
     /** Where the writer's helper threads run. */
     public HelperCpus helperCpus() {
         return helperCpus;
@@ -147,6 +179,9 @@ public final class WriterOptions {
             Errors.check(Native.writerOptionsSetNotify(o, notify ? 1 : 0));
             Errors.check(Native.writerOptionsSetPrefault(o, prefault ? 1 : 0));
             Errors.check(Native.writerOptionsSetEarlyWriteback(o, earlyWriteback ? 1 : 0));
+            if (spareSegment != null) {
+                Errors.check(Native.writerOptionsSetSpareSegment(o, spareSegment ? 1 : 0));
+            }
             int[] cpus = helperCpus.cpuArray();
             MemorySegment list = cpus.length == 0 ? MemorySegment.NULL : arena.allocateFrom(JAVA_INT, cpus);
             Errors.check(Native.writerOptionsSetHelperCpus(o, helperCpus.placement, list, cpus.length));
@@ -169,18 +204,21 @@ public final class WriterOptions {
     public boolean equals(Object o) {
         return o instanceof WriterOptions w && segmentSize == w.segmentSize && recoveryPolicy == w.recoveryPolicy
                 && notify == w.notify && prefault == w.prefault && earlyWriteback == w.earlyWriteback
-                && helperCpus.equals(w.helperCpus) && Objects.equals(retention, w.retention);
+                && Objects.equals(spareSegment, w.spareSegment) && helperCpus.equals(w.helperCpus)
+                && Objects.equals(retention, w.retention);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(segmentSize, recoveryPolicy, notify, prefault, earlyWriteback, helperCpus, retention);
+        return Objects.hash(segmentSize, recoveryPolicy, notify, prefault, earlyWriteback, spareSegment, helperCpus,
+                retention);
     }
 
     @Override
     public String toString() {
         return "WriterOptions[segmentSize=" + segmentSize + ", recoveryPolicy=" + recoveryPolicy + ", notify=" + notify
-                + ", prefault=" + prefault + ", earlyWriteback=" + earlyWriteback + ", helperCpus=" + helperCpus
+                + ", prefault=" + prefault + ", earlyWriteback=" + earlyWriteback
+                + ", spareSegment=" + (spareSegment == null ? "default" : spareSegment) + ", helperCpus=" + helperCpus
                 + ", retention=" + retention + "]";
     }
 }

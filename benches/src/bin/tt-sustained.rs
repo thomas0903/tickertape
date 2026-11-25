@@ -65,6 +65,8 @@ Writer:
   --no-prefault           WriterConfig::prefault(false)
   --no-early-writeback    WriterConfig::early_writeback(false): no sync_file_range behind the writer (Linux;
                           no effect elsewhere)
+  --spare-segment         WriterConfig::spare_segment(true): prepare the next segment in the background (ADR 0049;
+                          the default is the platform's: on on macOS, off on Linux)
   --helper-cpus <C>       WriterConfig::helper_cpus for the writer's helper threads (checkpoint, prefault,
                           write-back): process (the default: every CPU the cpuset allows), inherited (the
                           creating thread's mask, so a pinned writer's checkpoint thread shares its CPU), or a
@@ -158,6 +160,7 @@ struct Config {
     retain_bytes: Option<u64>,
     prefault: bool,
     early_writeback: bool,
+    spare_segment: bool,
     helper_cpus: HelperCpus,
     readers: Vec<ReaderSpec>,
     default_wait: WaitMode,
@@ -205,6 +208,7 @@ impl Config {
                 "--unpaced",
                 "--no-prefault",
                 "--no-early-writeback",
+                "--spare-segment",
                 "--no-disk-check",
                 "--json",
             ],
@@ -369,6 +373,7 @@ impl Config {
             retain_bytes,
             prefault: !options.flag("--no-prefault"),
             early_writeback: !options.flag("--no-early-writeback"),
+            spare_segment: options.flag("--spare-segment") || WriterConfig::default().spare_segment,
             helper_cpus,
             readers,
             default_wait,
@@ -461,7 +466,7 @@ impl Config {
             "retention": {"max_segments": self.retain_segments, "max_bytes": self.retain_bytes,
                 "action": if self.retention().is_some() { "delete" } else { "none" }},
             "writer_durability": "visible on append; durable only through checkpoints (crash contract)",
-            "prefault": self.prefault, "notify": true, "early_writeback": self.early_writeback,
+            "prefault": self.prefault, "notify": true, "early_writeback": self.early_writeback, "spare_segment": self.spare_segment,
             "helper_cpus": match &self.helper_cpus {
                 HelperCpus::List(list) => json!(list),
                 HelperCpus::Inherited => json!("inherited"),
@@ -1038,6 +1043,7 @@ fn writer(config: &Config) -> Result<()> {
         .segment_size(config.segment_size)
         .prefault(config.prefault)
         .early_writeback(config.early_writeback)
+        .spare_segment(config.spare_segment)
         .helper_cpus(config.helper_cpus.clone());
     if let Some(policy) = config.retention() {
         writer_config = writer_config.retention(policy, Action::Delete);

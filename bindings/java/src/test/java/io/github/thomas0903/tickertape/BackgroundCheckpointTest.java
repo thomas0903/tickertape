@@ -8,6 +8,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Optional;
 import java.util.OptionalLong;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -97,6 +98,12 @@ class BackgroundCheckpointTest {
         assertEquals(List.of(3, 1), custom.helperCpus().cpus());
         assertEquals(custom, defaults.earlyWriteback(false).helperCpus(HelperCpus.list(3, 1)));
         assertTrue(custom.toString().contains("earlyWriteback=false"), custom.toString());
+        assertTrue(defaults.spareSegment().isEmpty());
+        assertEquals(Optional.of(true), custom.spareSegment(true).spareSegment());
+        assertEquals(custom.spareSegment(false), custom.spareSegment(true).spareSegment(false));
+        assertTrue(!custom.equals(custom.spareSegment(false)));
+        assertTrue(custom.spareSegment(true).toString().contains("spareSegment=true"));
+        Writer.open(tmp.resolve("spare"), TestSupport.small().spareSegment(true)).close();
         assertEquals(List.of(), HelperCpus.inherited().cpus());
         assertThrows(IllegalArgumentException.class, () -> HelperCpus.list(-1));
         assertThrows(NullPointerException.class, () -> defaults.helperCpus(null));

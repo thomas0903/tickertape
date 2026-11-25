@@ -439,18 +439,12 @@ fn export_round_trip_range_and_file() {
 #[test]
 fn commands_do_not_modify_journal_and_reject_export_into_it() {
     let (dir, _writer) = journal(10);
-    // The open writer's own spare segment (ADR 0022) is left out: its thread may still be preparing it, on Linux also
-    // after the rolls that found it not ready.
-    let files = || {
-        fs::read_dir(dir.path())
-            .unwrap()
-            .map(|e| e.unwrap().path())
-            .filter(|path| !path.ends_with("next-segment.tmp"))
-            .collect::<Vec<_>>()
-    };
-    let before: Vec<_> = files()
-        .into_iter()
-        .map(|path| (path.clone(), fs::read(path).unwrap()))
+    let before: Vec<_> = fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| {
+            let path = e.unwrap().path();
+            (path.clone(), fs::read(path).unwrap())
+        })
         .collect();
     for args in [
         vec!["tail", "--no-follow"],
@@ -480,7 +474,7 @@ fn commands_do_not_modify_journal_and_reject_export_into_it() {
         assert_eq!(fs::read(path).unwrap(), bytes);
     }
     // Segments, checkpoint marker, lock file and the notify file (ADR 0017); nothing added by the commands.
-    assert_eq!(files().len(), 7);
+    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 7);
 }
 
 #[test]

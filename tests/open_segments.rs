@@ -66,7 +66,9 @@ fn roll(writer: &mut Writer, rolls: u64, checkpoint_every: u64) {
     }
 }
 
-fn rolls_under_a_low_limit(request_every: u64) {
+/// The bounds are what the writer held in these tests when they were written, not documented limits; under load they can
+/// be exceeded (issue #73).
+fn rolls_under_a_low_limit(request_every: u64, spare: &str, descriptors: i64) {
     let dir = tempfile::tempdir().unwrap();
     let journal = dir.path().join("j");
     let out = run_limited(&[
@@ -74,24 +76,33 @@ fn rolls_under_a_low_limit(request_every: u64) {
         journal.to_str().unwrap(),
         &ROLLS.to_string(),
         &request_every.to_string(),
+        spare,
     ]);
     let (next_seq, fds, maps) = (out[0] as u64, out[1], out[2]);
     assert!(segments(&journal).len() as u64 > ROLLS);
-    // From the first roll to the last, the descriptors and mappings held stay within a few segments: what the dirty
-    // lists and the write-back helper hold, and one segment file being prepared or ready (the spare, ADR 0022).
-    assert!(fds <= 9, "descriptors grew by {fds} over {ROLLS} rolls");
+    // From the first roll to the last, the descriptors and mappings held stay within a few segments.
+    assert!(
+        fds <= descriptors,
+        "descriptors grew by {fds} over {ROLLS} rolls (spare: {spare})"
+    );
     assert!(maps <= 16, "mappings grew by {maps} over {ROLLS} rolls");
     check_durable(&journal, next_seq);
 }
 
 #[test]
 fn many_rolls_without_a_checkpoint_under_a_low_descriptor_limit() {
-    rolls_under_a_low_limit(0);
+    rolls_under_a_low_limit(0, "default", 8);
 }
 
 #[test]
 fn many_rolls_with_background_checkpoints_under_a_low_descriptor_limit() {
-    rolls_under_a_low_limit(25);
+    rolls_under_a_low_limit(25, "default", 8);
+}
+
+/// With the spare segment on (off by default on Linux), one more descriptor: the spare being prepared or ready.
+#[test]
+fn many_rolls_with_the_spare_segment_under_a_low_descriptor_limit() {
+    rolls_under_a_low_limit(25, "on", 9);
 }
 
 /// Builds a journal of more than [`ROLLS`] segments (checkpointing every 50 rolls, so that building it holds few

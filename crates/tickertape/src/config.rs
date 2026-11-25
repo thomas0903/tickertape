@@ -65,15 +65,13 @@ pub struct WriterConfig {
     ///   `MADV_POPULATE_WRITE`, so `append` rarely takes a page fault (ADR 0025). On kernels before 5.14 the helper
     ///   stops on first use.
     /// - **macOS:** the helper keeps 8 MiB ahead with `madvise(MADV_WILLNEED)` (ADR 0020).
-    /// - **Both:** once the active segment is half full, a thread (`tickertape-spare`) preallocates the next segment, so
-    ///   a roll only writes its header and links it (ADR 0022). On macOS the thread is started for each spare. On Linux
-    ///   it lives as long as the writer and does not sync the spare (the checkpoint that first covers the segment
-    ///   does), and a roll never waits for a spare that is not ready: it creates the segment itself (ADR 0023 →
-    ///   Amendment of 2026-11-25).
+    ///
+    /// It is also the switch for [`WriterConfig::early_writeback`] and [`WriterConfig::spare_segment`], which have no
+    /// effect without it.
     ///
     /// Set to `false` for a writer that starts no threads, except the checkpoint thread that
     /// [`Writer::request_checkpoint`](crate::Writer::request_checkpoint) starts; that also turns off
-    /// [`WriterConfig::early_writeback`]. Default: true.
+    /// [`WriterConfig::early_writeback`] and [`WriterConfig::spare_segment`]. Default: true.
     pub prefault: bool,
     /// **Linux:** start the kernel's write-back of the pages the writer has finished with, as it goes, so that a
     /// checkpoint finds little left to write (ADR 0038 → Early write-back). Applies only with
@@ -87,6 +85,22 @@ pub struct WriterConfig {
     /// it, the helper stops. **macOS:** no effect (it has no call that starts write-back of a range without waiting
     /// for it). Default: true.
     pub early_writeback: bool,
+    /// Prepare the next segment in a background thread (`tickertape-spare`) once the active one is half full, so that a
+    /// roll writes its header and links it instead of creating and preallocating a file (ADR 0022; on Linux ADR 0049).
+    /// The thread preallocates `next-segment.tmp` in the journal directory, which reserves one more segment's worth of
+    /// disk space, and holds one more descriptor and one more segment mapping, until the roll. Applies only with
+    /// [`WriterConfig::prefault`] on. From 1.1. Default: on on macOS, **off on Linux**; no effect elsewhere.
+    ///
+    /// - **macOS:** a thread is started for each spare and syncs it, and a roll waits for one still being prepared.
+    /// - **Linux:** one thread lives as long as the writer, started in [`Writer::open`](crate::Writer::open), and does
+    ///   not sync the spare: the checkpoint that first covers the segment syncs it, as it does a segment a roll creates
+    ///   (ADR 0038). A roll that finds the spare not ready creates the segment itself, without waiting, and the spare is
+    ///   the next roll's; only if creating it then fails for lack of space (or over a quota) does the roll wait for the
+    ///   spare, which may have taken that space, and use it. Dropping the writer waits for a spare being prepared
+    ///   (a `fallocate` that the filesystem may hold up). If the thread panics, that writer prepares no more spares.
+    ///   Whether it helps depends on the load and the disk: measure before turning it on (ADR 0049 and
+    ///   `docs/benchmarks.md` say what is and is not known, including cases where it was worse).
+    pub spare_segment: bool,
     /// Where the writer's helper threads run: the checkpoint thread (`tickertape-checkpoint`), the prefault and
     /// write-back helpers (`tickertape-prefault`, `tickertape-writeback`) and the spare-segment thread
     /// (`tickertape-spare`). See [`HelperCpus`]. Default: [`HelperCpus::Process`].
@@ -141,6 +155,12 @@ impl WriterConfig {
         self
     }
 
+    /// Sets whether to prepare the next segment in a background thread (see [`WriterConfig::spare_segment`]; from 1.1).
+    pub fn spare_segment(mut self, on: bool) -> Self {
+        self.spare_segment = on;
+        self
+    }
+
     /// Sets where the writer's helper threads run (see [`HelperCpus`]).
     pub fn helper_cpus(mut self, cpus: HelperCpus) -> Self {
         self.helper_cpus = cpus;
@@ -152,8 +172,8 @@ impl WriterConfig {
 ///
 /// A new thread starts with the CPU affinity of the thread that creates it. The writer creates its helpers from the
 /// calling thread: the prefault and write-back helpers in [`Writer::open`](crate::Writer::open), the checkpoint thread
-/// at the first [`Writer::request_checkpoint`](crate::Writer::request_checkpoint), the spare-segment thread during an
-/// append. An application that pins its writer thread to one CPU would otherwise get every helper on that CPU, where
+/// at the first [`Writer::request_checkpoint`](crate::Writer::request_checkpoint), the spare-segment thread
+/// ([`WriterConfig::spare_segment`]) in `Writer::open` on Linux and during an append on macOS. An application that pins its writer thread to one CPU would otherwise get every helper on that CPU, where
 /// it competes with the writer: a checkpoint's sync calls and their CPU time then delay appends.
 ///
 /// **Linux:** each helper sets its own affinity when it starts (`sched_setaffinity`). The kernel always intersects
@@ -185,6 +205,7 @@ impl Default for WriterConfig {
             notify: true,
             prefault: true,
             early_writeback: true,
+            spare_segment: cfg!(target_vendor = "apple"),
             helper_cpus: HelperCpus::default(),
             retention: None,
         }

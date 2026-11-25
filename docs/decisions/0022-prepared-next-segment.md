@@ -1,7 +1,7 @@
 # 0022: Prepare the next segment in the background
 
-- **Status:** accepted; limited to macOS by [0023](0023-no-prefault-advice-on-linux.md) (first amendment), and on
-  Linux again since its amendment of 2026-11-25
+- **Status:** accepted; limited to macOS by [0023](0023-no-prefault-advice-on-linux.md) (amendment);
+  on Linux an option since [0049](0049-linux-spare-segment-option.md)
 - **Date:** 2026-11-01
 
 ## Context

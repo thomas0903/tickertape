@@ -1414,11 +1414,12 @@ commits stated above). Rates are of these machines and do not carry over to othe
   `HelperCpus::Inherited`; the default places helpers elsewhere); at 90 % of the 64 B probe durability fell minutes
   behind at `279f59a` and, at `3fea1c0`, on aarch64 xfs; appends of 50–128 ms in 148–172 seconds of each 1,024 B
   steady-90 run on aarch64 ext4 (`3fea1c0`), not rolls, since attributed (2026-11-25, below: the write fault's mtime
-  update waits for the ext4 journal's log writes, which the device completes late; `lazytime` removes them); the single stalls of 0.10–0.67 s without
+  update waits for the ext4 journal's log writes, which the device completes late; `lazytime` removes them, but not
+  the rolls'); the single stalls of 0.10–0.67 s without
   checkpoints at `279f59a` did not recur at `3fea1c0` (at most 13.2 ms); the aarch64 mapped reader's 10 ms maximum in
   the finish round (16-vCPU VMs), not seen in the second session or in a repeat at that round's commit on 8-vCPU VMs
-  (2026-11-25, below), not explained. A spare segment prepared on Linux since then makes rolls cheaper, not
-  the stalls rarer (same section).
+  (2026-11-25, below), not explained. A spare segment on Linux is an option from 1.1, off by default (ADR 0049): it
+  makes rolls cheaper away from the disk's limit, not the stalls rarer.
 - **Remaining, open:** the record checksum mismatch that stopped a reader of the 1,024 B probe on both aarch64 VMs at
   `279f59a` was a reader's view lagging a correctly published record; readers now tolerate it, and the long verified
   runs at `3fea1c0` and the confirming runs at `fbe5785` showed no false corruption and no lost write (issue #43,
@@ -1447,10 +1448,10 @@ commits stated above). Rates are of these machines and do not carry over to othe
 ## 2026-11-25, roll and journal stalls on Google Cloud VMs (Linux, x86-64 and aarch64)
 
 Where the stalls of the sustained runs come from (issue #60), the repeat of ADR 0023's spare-segment experiment now
-that rolls do not sync, and the before/after of the change that followed (ADR 0023 → Amendment of 2026-11-25). All of
-it ran on **Google Cloud virtual machines, not bare metal**, in one day's sessions; it is not compared with earlier
-sections except where the text says so. The raw output (results, time series, traces, scripts) is kept outside the
-repository.
+that rolls do not sync, and the before/after of the change that followed (ADR 0049; an option, off by default on
+Linux). All of it ran on **Google Cloud virtual machines, not bare metal**, in one day's sessions; it is not compared
+with earlier sections except where the text says so. The raw output (results, time series, traces, scripts) is kept
+outside the repository.
 
 ### Environment and commands
 
@@ -1465,10 +1466,19 @@ xfs with defaults on the second (`rw,noatime,inode64,logbufs=8,logbsize=32k`), I
 | `c4-standard-16-lssd`, us-east1-d | Xeon 6985P-C, 16 (8 cores), 58 GiB | 12:17–16:48 | everything x86-64 but the next row |
 | `c4-standard-16-lssd`, us-east1-d (a second VM) | the same | 16:50–17:39 | x86-64 without checkpoints; 10 more steady-50 pairs |
 
-Commits: `v1.0.0` (`1e8651d1`); `85726e34` (`main`, the "before" below); `03334481`, the "after" (that `main` plus
-this change; what followed it on the branch is comments, documentation, a test and later `main` commits). Experiments
-used the branch `exp/roll-60` (`b22c8fe9`, `v1.0.0` with switches, never merged), the scripts are in its `exp60/`
-directory.
+Commits: `v1.0.0` (`1e8651d1`); `85726e34` (`main`, the "before" below); `03334481`, the "after": that `main` plus the
+spare segment with one thread for the writer's life, always on (later commits on the branch made it an option, added
+the storage-full fallback and tests; the code the measured runs took is otherwise the same). Builds: the "before" VMs
+checked out `85726e34` from the repository; the "after" binaries were built from a `git archive` of `03334481` sent
+over SSH. The runs record the sha256 of the line that names the archive (`3d123edb…`, in `binaries-v.txt`); `git
+archive --format=tar.gz 03334481` reproduces exactly that line (archive sha256 `2b49c851…`), and the `tt-sustained`
+binaries of the two later scripts have the same hash, so the identity is verified, not only asserted. Two builds
+preceded that are **not** the after build and are kept for that reason: the directories named `INVALIDmainB` (a stale
+Cargo cache gave the binary of `main`; rerun), and the runs of the 18 visibility-only cells per machine (`m7-vis-*`,
+`q2-vis-*`) stopped at once with "retention runs only after checkpoints" because the script passed `--retain-bytes`
+without checkpoints (`main` and the kept build were rerun as `v-vis-*`; the thread-per-spare build was not).
+Experiments used the branch `exp/roll-60` (`b22c8fe9`, `v1.0.0` with switches, never merged), the scripts are in its
+`exp60/` directory.
 
 ```sh
 tt-sustained run --dir … --out … --json --payload 1024 --duration 60s --warmup 10s --retain-bytes 68719476736 \
@@ -1479,8 +1489,9 @@ tt-latency run --dir … --rate 100000 --count 1100000 --warmup 100000 --payload
 
 The rates are the published steady-50 and steady-90 rates of the second sustained session above (half and 90 % of the
 10-minute probe of these machine types). Runs of 60 s, so a 10-minute run has ten times the rolls and stalls. Every
-run started on a deleted journal after `sync`; configurations were interleaved; latencies in µs unless a cell says ms;
-"late" is sends more than 1 µs late; ranges are over the runs. Coordinated omission is handled as above.
+run started on a deleted journal after `sync`; configurations were interleaved; In every before/after pair the
+"before" build ran first (a future run should alternate); latencies in µs unless a cell says ms; "late" is sends more
+than 1 µs late; ranges are over the runs. Coordinated omission is handled as above.
 
 ### Where the writer's thread waits
 
@@ -1515,15 +1526,15 @@ runs showed the same stalls (below). Waits of the writer's thread of 3 ms or mor
   more, on x86-64 none reached 1 ms. **Why that device queues at 92 % of its probe, on this shape only, is not
   explained**; nothing traced inside the guest accounts for it.
 - **Test of that: `lazytime`.** With the filesystem remounted `lazytime`, which keeps modification times out of the
-  journal, the same workload has 3–10 seconds with a 50 ms append per run instead of 28–30 (three runs each,
-  interleaved), and every one of them is a roll. The roll appends do not improve (max 114–130 ms, against 0.2–59 ms
-  without `lazytime`): the waits that remain are the roll's own journalled calls. In an earlier session of the day
-  (the same machine type, a VM that has since been lost; three runs each) the figures were 2–7 against 32–39.
+  journal, the same workload has 3–10 seconds with a 50 ms append per run instead of 28–30 (three 60-second runs each,
+  interleaved, one VM shape), and every one of them is a roll. The roll appends get longer (max 114–130 ms, against
+  0.2–59 ms without `lazytime`): the waits that remain are the roll's own journalled calls. In an earlier session of
+  the day (the same machine type, a VM that has since been lost; three runs each) the figures were 2–7 against 32–39.
 - **Roll appends of 100–400 ms.** Seen unpaced, where the device is overloaded: 82–304 ms (aarch64) and 120–259 ms
   (x86-64) at most per run. Each call of a roll (create, `fallocate`, `mmap`, `link`, `unlink`) is a journalled
   operation or takes `mmap_lock`, and waits for the journal, for a buffer lock, or (for `mmap`) for a thread that
-  holds `mmap_lock`, most likely the prefault helper throttled in its `madvise` (not traced to the holder). Most of an unpaced writer's lost time is throttling in page faults, by
-  design of the kernel.
+  holds `mmap_lock`, most likely the prefault helper throttled in its `madvise` (not traced to the holder). Most of an
+  unpaced writer's lost time is throttling in page faults, by design of the kernel.
 - **Roll p50.** Without any stall a roll appends in 142–184 µs with checkpoints: creating the file, `fallocate` (about
   65–100 µs) and the link. Without checkpoints 0.9–1.0 ms: not traced here; unmapping a 128 MiB segment took 0.4–0.65
   ms where a trace caught it, which is the likely rest.
@@ -1559,19 +1570,40 @@ four had a p99.9 of 26 ms.
 | | spare, synced | 29–35 | 726–774 | 1,024–1,085 | 0 of 30 |
 | | spare, not synced | 29–31 | 719–795 | 1,028–1,106 | 0 of 30 |
 
-With a one-in-four chance, 30 clean runs have a probability of 0.02 %. This repeats the experiment on other machines
-(a 4-vCPU AWS VM then), so it does not show what changed. At steady-90 on x86-64 one of 8 runs with the synced spare
-had an append of 52 ms and a checkpoint that took 328 ms to become durable; of the 8 runs without a spare two had
-appends of 3.3 and 7.9 ms, and the 8 runs with an unsynced one at most 0.69 ms. One bad run proves nothing about the
-sync, but nothing needs it either, so the change does not sync.
+These 30 rounds used the build that starts a thread per spare, which was later rejected. They do **not** show that the
+failure of ADR 0023 is gone: that experiment ran on a `c6id.xlarge`, of which ADR 0025 says "The small VM cannot
+sustain about 106 MB/s for minutes: every configuration stalls there for hundreds of milliseconds. That is a disk
+limit", so its 100,000 records/s was near the device's limit, while it is about 30 % of the probe of the machines
+here. Only the 15 rounds below used the build that was kept. At steady-90 on x86-64 one of 8 runs with the synced
+spare had an append of 52 ms and a checkpoint that took 328 ms to become durable; of the 8 runs without a spare two
+had appends of 3.3 and 7.9 ms, and the 8 runs with an unsynced one at most 0.69 ms. One bad run proves nothing about
+the sync, but nothing needs it either, so the change does not sync.
 
-A spare prepared by a **new thread per segment** (as on macOS) cuts the roll append to about 50 µs but makes the writer's worst append
-worse at steady-50 in every run: append max 364–381 µs against 190–215 (aarch64), 571–698 against 170–346 (x86-64),
-and the mapped reader's p99.9 184–194 against 112–127 and 209–228 against 74–148. Traced, starting the thread costs
-the writer 26–40 µs; on aarch64 the writer took 60 page faults of about 370 µs over 88 rolls, which the kept variant
-does not have; their cause was not traced further. Rejected. The change keeps one thread for the writer's life.
+**Unpaced** (the same build with a thread per spare, unsynced; four 60-second runs per cell, interleaved, 1,024 B,
+readers mapped and safe, checkpoints every second), the mapped reader's p99.9 is worse with a spare and the rolls'
+median is better:
 
-### Before and after (`85726e34` against `03334481`)
+| Arch | Configuration | Roll append p50 | Roll append max | Mapped reader p99.9 |
+|---|---|---|---|---|
+| aarch64 | no spare | 0.22, 2.7, 2.8, 6.6 ms | 82–304 ms | 596, 598, 599, 602 |
+| | spare | 49–51 | 0.11–298 ms | 649, 656, 658, 664 |
+| | no spare, `lazytime` | 0.21, 4.2, 4.2, 5.3 ms | 279–336 ms | 604, 605, 605, 606 |
+| | spare, `lazytime` | 56–58 | 158–329 ms | 653, 657, 660, 663 |
+| x86-64 | no spare | 0.18, 0.21, 1.4, 1.5 ms | 120–259 ms | 528, 543, 549, 762 |
+| | spare | 55–60 | 0.10–303 ms | 604, 626, 628, 814 |
+| | no spare, `lazytime` | 3.5, 4.0, 4.9, 9.3 ms | 240–447 ms | 540, 543, 548, 746 |
+| | spare, `lazytime` | 60–63 | 14–264 ms | 605, 615, 617, 622 |
+
+The kept build was not run unpaced.
+
+A spare prepared by a **new thread per segment** (as on macOS) cuts the roll append to about 50 µs but makes the
+writer's worst append worse at steady-50 in every run: append max 364–381 µs against 190–215 (aarch64), 571–698
+against 170–346 (x86-64), and the mapped reader's p99.9 184–194 against 112–127 and 209–228 against 74–148. Traced,
+starting the thread costs the writer 26–40 µs; on aarch64 the writer took 60 page faults of about 370 µs over 88
+rolls, which the kept variant does not have; their cause was not traced further. Rejected. The change keeps one thread
+for the writer's life.
+
+### Before and after (`85726e34` against `03334481`: without and with the spare segment)
 
 aarch64 (interleaved, 1,024 B; checkpoints every second unless stated):
 
@@ -1608,15 +1640,16 @@ after.
 - Away from saturation the roll append (p50) falls from 137–182 to 44–54 µs with checkpoints on ext4 (150–167 to 59–69
   µs on xfs), and the mapped reader's p99.9 falls by roughly a quarter to 85 %, on both architectures and filesystems.
   Without checkpoints the roll stays long (0.72–0.94 ms against 0.88–1.04).
-- **Costs and limits.** (1) At the saturated aarch64 steady-90 a spare roll meets a stall more often: 16 of 22 runs
-  with a spare that had a roll of 20 ms or more, against 12 of 32 without (builds of the session pooled, spawned and
-  kept threads alike; two-sided Fisher p = 0.014, a test chosen after seeing the data). What the writer loses overall
-  does not change: 30.5 against 29.5 seconds with an append of 20 ms or more (medians, p = 0.87), append max 140 ms in
-  both, late sends 12.4 against 12.3 %. (2) On aarch64 xfs the append max is higher (227–340 against 190–232 µs, three
-  runs). (3) One x86-64 steady-50 run of 16 had a 2.7 ms append that was not a roll; it did not recur in the 10 later
-  ones.
-- Not measured: bare metal, other filesystems, payloads other than 1,024 B, `prefault(false)` (unchanged), and a
-  spare's effect near a full disk.
+- **Costs and limits.** (1) At the saturated aarch64 steady-90 the kept build met a stall at rolls more often: 5 of 6
+  runs with a roll of 20 ms or more against 2 of 6 for `main`, 10 against 3 seconds with one. Pooling the session's
+  builds, spawned and kept threads alike: 16 of 22 against 12 of 32 (two-sided Fisher p = 0.014, a test chosen after
+  seeing the data). What the writer loses overall does not change: 30.5 against 29.5 seconds with an append of 20 ms
+  or more (medians, p = 0.87), append max 140 ms in both, late sends 12.4 against 12.3 %. (2) On aarch64 xfs the
+  append max is higher (227–340 against 190–232 µs, three runs). (3) One x86-64 steady-50 run of 16 had a 2.7 ms
+  append that was not a roll; it did not recur in the 10 later ones.
+- **Not measured with the kept build:** unpaced, xfs at steady-90, `HelperCpus::Inherited`, 4 vCPUs, bare metal. Not
+  measured at all: other filesystems, payloads other than 1,024 B, and (beyond the functional tests) a full disk. For
+  that reason the spare segment is off by default on Linux (ADR 0049).
 
 ### Tracing overhead
 

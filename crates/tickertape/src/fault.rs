@@ -54,7 +54,8 @@ pub enum Point {
     /// Preallocating the spare next segment on its background thread (arm with [`fail_next_background`],
     /// or stop it there with [`hold_background`]).
     SparePreallocate,
-    /// Mapping the spare next segment on its background thread (arm with [`fail_next_background`]).
+    /// Mapping the spare next segment on its background thread, after its blocks are allocated (arm with
+    /// [`fail_next_background`], or stop it there with [`hold_background`]).
     SpareMap,
     /// Writing the spare's header when the writer publishes it at roll (arm with [`fail_next`]).
     SpareHeader,

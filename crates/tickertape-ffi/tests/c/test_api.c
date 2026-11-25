@@ -326,6 +326,8 @@ static void test_misuse(const char *scratch) {
         const uint32_t cpus[2] = {0, 1};
         CHECK_STATUS(tickertape_writer_options_set_recovery_policy(options, 42), TICKERTAPE_E_INVALID_ARGUMENT);
         CHECK_STATUS(tickertape_writer_options_set_early_writeback(options, 0), TICKERTAPE_OK);
+        CHECK_STATUS(tickertape_writer_options_set_spare_segment(options, 1), TICKERTAPE_OK);
+        CHECK_STATUS(tickertape_writer_options_set_spare_segment(NULL, 1), TICKERTAPE_E_INVALID_ARGUMENT);
         CHECK_STATUS(tickertape_writer_options_set_helper_cpus(options, TICKERTAPE_HELPER_CPUS_LIST, cpus, 2),
                      TICKERTAPE_OK);
         CHECK_STATUS(tickertape_writer_options_set_helper_cpus(options, TICKERTAPE_HELPER_CPUS_INHERITED, cpus, 2),

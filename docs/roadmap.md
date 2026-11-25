@@ -202,8 +202,8 @@ released with seven items open, accepted by the owner as known gaps
   - Missing: an explanation of the aarch64 mapped reader's constant maximum in the checkpoint runs (not reproduced on
     8 vCPUs, 2026-11-25) and confirmation of the platform
     mechanism behind the lagging view of issue #43. (The appends of 50–128 ms in the 1,024 B steady-90 runs on aarch64
-    ext4 are attributed since 2026-11-25: `docs/benchmarks.md` → "roll and journal stalls".) That view no longer stops a reader (readers tolerate it;
-    `crash-contract.md` → Known risks and limits), and the long verified runs under forced compaction (`3fea1c0`, on
+    ext4 are attributed since 2026-11-25: `docs/benchmarks.md` → "roll and journal stalls".) That view no longer
+    stops a reader (readers tolerate it; `crash-contract.md` → Known risks and limits), and the long verified runs under forced compaction (`3fea1c0`, on
     aarch64 and x86-64) showed no false corruption and no lost write (issue #43, closed). Correctness, crash and soak
     checks run on aarch64 Linux in CI (#12); the sustained sessions and comparison on Axion are recorded in
     `docs/benchmarks.md` (2026-11-19 to 2026-11-22) with CPU, kernel, filesystem, storage, affinity, CRC path and
