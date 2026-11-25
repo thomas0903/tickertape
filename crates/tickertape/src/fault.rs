@@ -44,9 +44,12 @@ pub enum Point {
     RetentionCopySync,
     /// Syncing the destination directory after an archive rename or copy.
     RetentionDestinationSync,
-    /// Before each removal of the writer's retention run on its checkpoint thread, once the run has decided not to
-    /// stop there (ADR 0044). Hold it there with [`hold_background`].
+    /// Before each planned segment of a retention run, before anything about it is checked: on the writer's checkpoint
+    /// thread once the run has decided not to stop there (ADR 0044; hold it there with [`hold_background`]), and in any
+    /// other run (arm with [`run_at`]).
     RetentionRemove,
+    /// Between the checks of a planned segment and its removal, in any retention run. Arm with [`run_at`].
+    RetentionChecked,
     /// `Writer::checkpoint` or `Writer::close` has told the checkpoint thread that it is waiting for it (a retention
     /// run there then stops after the removal in progress), and is about to wait. Arm with [`run_at`] on the thread
     /// that calls them.
@@ -567,3 +570,53 @@ pub(crate) fn note_msync() {
 #[cfg(not(feature = "fault-injection"))]
 #[inline(always)]
 pub(crate) fn note_msync() {}
+
+/// What a thread did to find out about the journal's segments ([`take_accesses`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Access {
+    /// Listed the journal directory.
+    ListJournal,
+    /// Retention opened a segment file.
+    OpenSegment,
+    /// Retention asked for a segment file's size or whether it is there, without opening it.
+    StatSegment,
+}
+
+#[cfg(feature = "fault-injection")]
+mod accesses {
+    use std::cell::RefCell;
+
+    thread_local! {
+        pub(super) static LOG: RefCell<Option<Vec<super::Access>>> = const { RefCell::new(None) };
+    }
+}
+
+/// Starts recording this thread's accesses, forgetting the ones recorded before.
+#[cfg(feature = "fault-injection")]
+pub fn record_accesses() {
+    accesses::LOG.with(|l| *l.borrow_mut() = Some(Vec::new()));
+}
+
+/// Stops recording this thread's accesses and returns them.
+#[cfg(feature = "fault-injection")]
+pub fn take_accesses() -> Vec<Access> {
+    accesses::LOG
+        .with(|l| l.borrow_mut().take())
+        .unwrap_or_default()
+}
+
+/// Called at each access.
+#[cfg(feature = "fault-injection")]
+pub(crate) fn note_access(access: Access) {
+    accesses::LOG.with(|l| {
+        if let Some(log) = l.borrow_mut().as_mut() {
+            log.push(access);
+        }
+    });
+}
+
+/// Called at each access (no-op without the `fault-injection` feature).
+#[cfg(not(feature = "fault-injection"))]
+#[inline(always)]
+pub(crate) fn note_access(_access: Access) {}

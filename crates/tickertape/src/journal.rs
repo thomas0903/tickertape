@@ -3,7 +3,7 @@
 
 use std::fs::{self, File};
 use std::io;
-use std::os::unix::fs::{FileExt, MetadataExt};
+use std::os::unix::fs::{DirEntryExt, FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 
 use crate::error::{CorruptReason, Error, Result};
@@ -37,9 +37,8 @@ pub(crate) fn tmp_path(dir: &Path, base_seq: u64) -> PathBuf {
 
 /// Lists the segments in `dir` as `(base_seq, path)`, sorted by `base_seq`.
 pub(crate) fn list_segments(dir: &Path) -> Result<Vec<(u64, PathBuf)>> {
-    let entries = fs::read_dir(dir).map_err(|e| Error::io("list journal directory", dir, e))?;
     let mut out = Vec::new();
-    for entry in entries {
+    for entry in list_entries(dir)? {
         let entry = entry.map_err(|e| Error::io("list journal directory", dir, e))?;
         if let Some(name) = entry.file_name().to_str() {
             if let Some(base) = format::parse_segment_file_name(name) {
@@ -48,6 +47,44 @@ pub(crate) fn list_segments(dir: &Path) -> Result<Vec<(u64, PathBuf)>> {
         }
     }
     out.sort_unstable_by_key(|(base, _)| *base);
+    Ok(out)
+}
+
+/// Starts a listing of `dir`.
+fn list_entries(dir: &Path) -> Result<fs::ReadDir> {
+    crate::fault::note_access(crate::fault::Access::ListJournal);
+    fs::read_dir(dir).map_err(|e| Error::io("list journal directory", dir, e))
+}
+
+/// A segment's name as one listing of the directory showed it ([`list_bases`]): nothing of the file was read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Listed {
+    /// Base sequence number, from the name.
+    pub(crate) base: u64,
+    /// The directory entry's inode number, if the entry names a regular file. Only meaningful compared with that of
+    /// another listing of the same directory: a different number is a different file.
+    pub(crate) inode: Option<u64>,
+}
+
+/// Lists the segments in `dir` by name only, sorted by base, as [`list_segments`] does.
+pub(crate) fn list_bases(dir: &Path) -> Result<Vec<Listed>> {
+    let mut out = Vec::new();
+    for entry in list_entries(dir)? {
+        let entry = entry.map_err(|e| Error::io("list journal directory", dir, e))?;
+        let Some(base) = entry
+            .file_name()
+            .to_str()
+            .and_then(format::parse_segment_file_name)
+        else {
+            continue;
+        };
+        let inode = entry
+            .file_type()
+            .is_ok_and(|t| t.is_file())
+            .then(|| entry.ino());
+        out.push(Listed { base, inode });
+    }
+    out.sort_unstable_by_key(|s| s.base);
     Ok(out)
 }
 
@@ -63,9 +100,8 @@ pub(crate) struct Bases {
 /// Picks the oldest base and the newest base `<= seq` out of one listing of `dir`, as [`list_segments`] would list
 /// it, without collecting or sorting the names: time proportional to the directory's entries, memory constant.
 pub(crate) fn find_bases(dir: &Path, seq: u64) -> Result<Bases> {
-    let entries = fs::read_dir(dir).map_err(|e| Error::io("list journal directory", dir, e))?;
     let mut out = Bases::default();
-    for entry in entries {
+    for entry in list_entries(dir)? {
         let entry = entry.map_err(|e| Error::io("list journal directory", dir, e))?;
         if let Some(base) = entry
             .file_name()
@@ -83,9 +119,8 @@ pub(crate) fn find_bases(dir: &Path, seq: u64) -> Result<Bases> {
 
 /// Lists stale temporary segment files (`*.tape.tmp`) in `dir`.
 pub(crate) fn list_tmp_files(dir: &Path) -> Result<Vec<PathBuf>> {
-    let entries = fs::read_dir(dir).map_err(|e| Error::io("list journal directory", dir, e))?;
     let mut out = Vec::new();
-    for entry in entries {
+    for entry in list_entries(dir)? {
         let entry = entry.map_err(|e| Error::io("list journal directory", dir, e))?;
         if let Some(name) = entry.file_name().to_str() {
             if let Some(stem) = name.strip_suffix(TMP_SUFFIX) {
@@ -374,6 +409,12 @@ mod scan_tests {
             .map(|(b, _)| b)
             .collect();
         assert_eq!(listed, [0, 7, 40, 41, 1000, 123_456_789]);
+        let by_name = list_bases(dir.path()).unwrap();
+        assert_eq!(by_name.iter().map(|s| s.base).collect::<Vec<_>>(), listed);
+        for s in by_name {
+            let meta = fs::metadata(segment_path(dir.path(), s.base)).unwrap();
+            assert_eq!(s.inode, Some(meta.ino()), "segment {}", s.base);
+        }
         for seq in [
             0,
             1,

@@ -5,6 +5,14 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
+- Changed: retention reads only what its policy needs and lists the journal directory once per run (ADR 0051, issue #80).
+  A checkpoint with a policy used to open every segment; now `max_segments` needs the file names, `max_age` the headers of
+  the oldest segments, and `max_bytes` the file sizes (which a writer keeps between its runs). Removing a segment no longer
+  lists the directory. The segments removed are the same. **Behaviour:** an invalid header, or a file that cannot be
+  opened, in a segment the policy does not need no longer makes retention, `retention::plan` and `tickertape archive` fail;
+  it still does in the segments to remove, the one after them and the marker's, and, with `max_age`, the first that stays
+  and its successor. Run `tickertape verify` to find damage. Do not put segment files back into a journal while retention
+  runs on it.
 - Changed: the zero-copy reader (`Reader::open_mapped`, and the mapped readers of the C, C++ and Java bindings) bounds its
   loads by the checkpoint marker (ADR 0048, issue #62). A damaged length in a record that the marker covers no longer
   makes it load bytes past the marker's position, where a writer may be storing: such a frame is read with `pread` into a
