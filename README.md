@@ -46,14 +46,16 @@ tickertape has two readers: the safe one (`Reader::open`, which reads with `prea
 In all these runs open-source Chronicle Queue 2026.8 used its default queue options (plus `SyncMode.SYNC` where a
 sync every second is measured). It had the default 64 MiB `blockSize` and no page pre-touching: its pretoucher has
 been Enterprise-only since Chronicle Queue 5.24, and the harness did not call the open-source `microTouch()`, which
-touches the next page from the calling thread. The harness ran a JIT warm-up of 100,000 records before the append and
-replay runs only; the latency runs leave their first records out of the percentiles instead.
+touches the next page from the calling thread. The harness ran a JIT warm-up of 100,000 records only before the short
+append and replay runs. The latency runs, short and ten-minute, leave their first records out of the percentiles
+instead; the ten-minute unpaced runs do neither.
 
 tickertape ran with its own defaults on Linux: prefaulting (256 KiB ahead) and, in the ten-minute runs, early
-write-back. Both matter. In separate tickertape-only runs on the bare-metal machine (ext4, 100,000 records/s), turning
-prefaulting off raised the zero-copy reader's p99.9 from 1.7–2.0 µs to 31–34 µs at 64 bytes, close to Chronicle
-Queue's 36–37 µs, and gave 97–122 µs at 1,024 bytes, above Chronicle Queue's 48–55 µs. On the cloud VMs a blocking
-checkpoint took 2.8–2.9 ms (median) with early write-back and 745–800 ms without.
+write-back. In separate tickertape-only runs on the bare-metal machine (ext4, 100,000 records/s), turning prefaulting
+off raised the zero-copy reader's p99.9 from 1.7–2.0 µs to 31–34 µs at 64 bytes, close to Chronicle Queue's 36–37 µs.
+At 1,024 bytes it did not raise it: 110–243 µs with prefaulting and 97–122 µs without, both above Chronicle Queue's
+48–55 µs. In other tickertape-only runs on cloud VMs (3 minutes, 1,024 bytes, about 250 MB/s; x86-64 ext4, aarch64
+ext4 and xfs), a blocking checkpoint took 2.8–2.9 ms (median) with early write-back and 745–800 ms without.
 
 The harness is to be corrected ([#56](https://github.com/thomas0903/tickertape/issues/56)) and the comparison rerun
 ([#57](https://github.com/thomas0903/tickertape/issues/57)).

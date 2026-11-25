@@ -30,7 +30,8 @@ sustained SD runs (`compare/chronicle/src/main/java/compare/Main.java`):
   latency at the first measured record.
 
 tickertape ran with its defaults: on Linux, prefaulting 256 KiB ahead in the v0.4.0 and later comparisons (it was off
-on Linux in v0.3.0, ADR 0023), and early write-back in the sustained runs from the finish round on (ADR 0038).
+on Linux in v0.3.0, ADR 0023), and early write-back in tickertape's rows of the sustained comparison (`88b3304`, ADR
+0038).
 
 In W1, tickertape's `Writer::open` preallocates the first segment before the timer starts. That segment is 128 MiB and
 holds the whole run (about 104 MB of records at 64 B and 106 MB at 1,024 B). Chronicle Queue creates its first cycle
