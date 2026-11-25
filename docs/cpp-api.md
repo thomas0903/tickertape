@@ -301,6 +301,9 @@ while (!stop_requested()) {
 }
 ```
 
+`seek_to_end()` (from 1.1) places the reader at the end of the journal instead, reading at most the newest segment
+(`tickertape_reader_seek_to_end` in [`c-api.md`](c-api.md#reading)).
+
 There are two readers, as in C:
 
 - `Reader::open`, the **safe reader**, reads the files with `pread` into a buffer it owns and validates the copy. It
@@ -322,8 +325,8 @@ thread while it waits is undefined behaviour. Loop with a finite timeout and che
 already committed, up to `batch.capacity()` records or until the next payload does not fit in the batch's buffer (it
 is then returned first by the next read). If even the first does not fit, it fails with `Status::buffer_too_small`
 and `error().needed_size()`. If an error happens after some records were read, the call returns those records, and
-the next read returns the error: records handed out are never lost. A successful `seek` discards a held-back record
-and a deferred error.
+the next read returns the error: records handed out are never lost. A successful `seek` or `seek_to_end`
+discards a held-back record and a deferred error.
 
 ```cpp
 tt::RecordBatch batch(256, 1 << 20);   // allocated once

@@ -70,7 +70,8 @@ suffixes on statistics and mode `visible_latency`.
 This is **visibility**, not checkpoint durability or network latency. Processes
 share one host's realtime clock; wall-clock adjustments can distort observations
 and negative latencies fail the run. Nanosecond units do not imply nanosecond
-accuracy. Busy polling consumes CPU; no core pinning is performed. Payload creation
+accuracy. Busy polling consumes CPU. Threads are not pinned unless `--writer-cpu`, `--reader-cpu` and
+`--helper-cpus` ask for it (Linux); the JSON result's `affinity` is what `/proc` said at the end of the run. Payload creation
 and process startup are outside measured latency, while page faults, writer rolls,
 scheduling delays and reader validation contribute. No checkpoint runs during live
 latency. Parent deadlines and child cleanup bound failed runs.
@@ -364,8 +365,8 @@ the repository, and run each benchmark at least twice. Record:
 - CPU model/architecture, memory, OS version, kernel and journal filesystem.
 - Cache mode, reader kind, payload, segment size, rate, count, warmup and checkpoint
   batch settings; whether coordinated omission is handled by intended timestamps.
-- Host load, power state and any external affinity settings. Only `tt-sustained --cpus`
-  applies affinity, and its result records it.
+- Host load, power state and any external affinity settings. `tt-sustained --cpus` and
+  `tt-latency --writer-cpu`/`--reader-cpu` apply affinity, and their results record it.
 - Virtualization explicitly: **OrbStack VM (Linux on macOS)** plus host Mac model,
   never bare-metal Linux. CI is smoke only. In the OrbStack VM use its own disk
   (`TMPDIR=$HOME/tmp`); `/tmp` is tmpfs and unsuitable for storage measurements.

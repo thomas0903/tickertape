@@ -36,6 +36,28 @@ class ResultTests(unittest.TestCase):
                 with self.assertRaises(AssertionError):
                     validate_result(bad)
 
+    def test_both_burst_figures_are_checked_like_the_replay(self):
+        for workload in ("W1-cold", "W1-steady"):
+            result = {"workload": workload, "count": 2000, "payload": 64,
+                      "append": {"count": 2000, "records_per_s": 1000000, "payload_mb_per_s": 64}}
+            validate_result(result)
+            result["append"]["count"] = 3000  # Priming records are not part of the figure.
+            with self.assertRaises(AssertionError):
+                validate_result(result)
+
+
+class PinningCommandTests(unittest.TestCase):
+    def test_the_adapters_get_their_cpu_only_when_pinned(self):
+        import run
+        plan = {"mode": "pinned", "writer_cpu": 2, "reader_cpu": 3, "helper_cpus": [0, 1]}
+
+        def options(tool, role, pinning):
+            return run.command(tool, role, "d", "c", 1, 64, 1, 0, "default", "append_cold", True, pinning)
+        self.assertEqual(options("yaque", "writer", plan)[-4:], ["--cpu", "2", "--helper-cpus", "0,1"])
+        self.assertEqual(options("chronicle", "reader", plan)[-2:], ["--cpu", "3"])
+        for pinning in (None, {"mode": "none"}, {"mode": "unsupported"}):
+            self.assertNotIn("--cpu", options("chronicle", "reader", pinning))
+
 
 if __name__ == "__main__":
     unittest.main()

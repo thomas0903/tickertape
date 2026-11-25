@@ -12,7 +12,9 @@ import sustained
 def args(**overrides):
     values = dict(outdir=Path("/unused"), quick=False, duration=None, warmup=None, repeats=None, tools=None,
                   workloads=None, payloads=None, rates=None, fractions=None, sync_every_ms=1000, tt_readers=None,
-                  resume=False, dry_run=False, keep_going=False)
+                  resume=False, dry_run=False, keep_going=False, no_long_warmup=False, no_micro_touch=False,
+                  chronicle_block_size="1073741824", aeron_sparse_terms=False, no_aeron_pre_touch=False, no_jvm_logs=False,
+                  java_experiment=[])
     values.update(overrides)
     return argparse.Namespace(**values)
 
@@ -66,6 +68,28 @@ class PlanTests(unittest.TestCase):
         params = sustained.parameters(args(quick=True))
         self.assertEqual((params["duration_s"], params["warmup_s"], params["repeats"], params["payloads"]),
                          (5, 1, 1, [64]))
+
+
+class JavaSettingsTests(unittest.TestCase):
+    def test_settings_are_part_of_the_matrix_and_of_every_child_command(self):
+        params = sustained.parameters(args(no_micro_touch=True))
+        self.assertEqual(params["java"], {**sustained.javaopts.DEFAULTS, "micro_touch": False})
+        probe = sustained.Run("probe-chronicle", "chronicle", "probe", 64, "default", "unpaced", 1)
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            cmd = sustained.adapter_command(probe, "writer", "d", "c", 10, 0, None, params, out)
+            # The probe warms up too, with the long warm-up.
+            self.assertEqual(cmd[cmd.index("--warmup-mode") + 1], "long")
+            self.assertEqual(cmd[cmd.index("--jit-warmup") + 1], "1200000")
+            self.assertEqual(cmd[cmd.index("--micro-touch") + 1], "off")
+            self.assertTrue(any(c.startswith("--jvm=-Xlog:gc*") for c in cmd))
+            rust = sustained.adapter_command(sustained.Run("x", "yaque", "probe", 64, "default", "unpaced", 1),
+                                             "writer", "d", "c", 10, 0, None, params, out)
+            self.assertFalse(any(c.startswith("--jvm=") or c == "--warmup-mode" for c in rust))
+            # A matrix started with other JVM settings is not continued.
+            sustained.prepare_output(out / "m", params, resume=False)
+            with self.assertRaises(ValueError):
+                sustained.prepare_output(out / "m", sustained.parameters(args()), resume=True)
 
 
 class RateTests(unittest.TestCase):
@@ -162,6 +186,19 @@ class ResumeTests(unittest.TestCase):
         other = dict(self.params, duration_s=60)
         with self.assertRaises(ValueError):
             sustained.prepare_output(self.out, other, resume=True)
+
+    def test_a_matrix_resumes_only_with_the_same_pinning(self):
+        none = {"mode": "none", "summary": "affinity: none (--no-pin)"}
+        pinned = {"mode": "pinned", "writer_cpu": 2, "reader_cpu": 3, "helper_cpus": [0, 1]}
+        # Started before pinning existed: unpinned.
+        sustained.prepare_output(self.out, self.params, resume=False)
+        self.assertFalse(sustained.prepare_output(self.out, dict(self.params, affinity=none), resume=True))
+        with self.assertRaises(ValueError):
+            sustained.prepare_output(self.out, dict(self.params, affinity=pinned), resume=True)
+        command = sustained.adapter_command(self.runs[0], "reader", "d", "c", 1, 0, 1, dict(self.params, affinity=pinned))
+        self.assertEqual(command[-4:], ["--cpu", "3", "--helper-cpus", "0,1"])
+        command = sustained.adapter_command(self.runs[0], "reader", "d", "c", 1, 0, 1, dict(self.params, affinity=none))
+        self.assertNotIn("--cpu", command)
 
     def test_estimate_counts_only_unfinished_runs(self):
         full = sustained.estimate_seconds(self.runs, self.params, self.out)

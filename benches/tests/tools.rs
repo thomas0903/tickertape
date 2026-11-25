@@ -2,6 +2,56 @@
 use serde_json::Value;
 use std::process::Command;
 
+/// Two threads on two CPUs, the writer's helpers on a third: what the kernel says, not what was asked for.
+#[cfg(target_os = "linux")]
+#[test]
+fn latency_threads_run_on_the_requested_cpus() {
+    let allowed = tickertape_bench::affinity::report().unwrap()["cpus_allowed"].clone();
+    let cpus: Vec<u64> = allowed
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c.as_u64().unwrap())
+        .collect();
+    let [.., writer, reader, helper] = cpus[..] else {
+        eprintln!("skipped: needs three CPUs");
+        return;
+    };
+    let root = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_tt-latency"))
+        .args(["run", "--dir"])
+        .arg(root.path().join("journal"))
+        .args(["--rate", "10000", "--count", "1000", "--payload", "64"])
+        .args(["--reader", "mapped", "--json"])
+        .args(["--writer-cpu", &writer.to_string()])
+        .args(["--reader-cpu", &reader.to_string()])
+        .args(["--helper-cpus", &helper.to_string()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    for (role, cpu) in [("writer", writer), ("reader", reader)] {
+        let affinity = &result["affinity"][role];
+        assert_eq!(affinity["cpus_allowed"], serde_json::json!([cpu]));
+        assert_eq!(affinity["last_cpu"], cpu);
+    }
+    let helpers = result["affinity"]["writer"]["other_threads"]
+        .as_array()
+        .unwrap();
+    assert!(!helpers.is_empty());
+    for thread in helpers {
+        assert_eq!(
+            thread["cpus_allowed"],
+            serde_json::json!([helper]),
+            "{thread}"
+        );
+    }
+}
+
 #[test]
 fn latency_both_readers_and_warmup() {
     for reader in ["safe", "mapped"] {
@@ -35,6 +85,15 @@ fn latency_both_readers_and_warmup() {
         assert_eq!(result["count"], 1000);
         assert_eq!(result["latency"]["count"], 900);
         assert_eq!(result["reader"], reader);
+        assert!(result["latency"].get("affinity").is_none());
+        for role in ["writer", "reader"] {
+            let affinity = &result["affinity"][role];
+            if cfg!(target_os = "linux") {
+                assert!(!affinity["cpus_allowed"].as_array().unwrap().is_empty());
+            } else {
+                assert!(affinity["unsupported"].is_string());
+            }
+        }
         assert!(result["writer"]["achieved_records_per_s"].as_f64().unwrap() > 0.0);
         assert!(result["writer"]["late_records"].as_u64().unwrap() <= 1000);
         assert!(

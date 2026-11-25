@@ -111,3 +111,7 @@ path = "open_segments.rs"
 [[test]]
 name = "allocation"
 path = "allocation.rs"
+
+[[test]]
+name = "seek"
+path = "seek.rs"

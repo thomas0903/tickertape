@@ -179,9 +179,11 @@ an ADR); weakening a guarantee, or turning an untested claim into a weaker one, 
 
 The zero-copy reader's known limitation ships in 1.0 as a documented limitation, part of the contract
 (`crash-contract.md` → "Readers, the writer and memory safety" → "Known limitation (commit words damaged on
-storage)"; ADR 0027 → "Which loads can race"): a zeroed commit word lets recovery rewrite published records in place
-under a live reader. The roadmap's publication frontier is not built; if it is, it narrows that limitation in a 1.x
-release with its own ADR.
+storage)"; ADR 0027 → "Which loads can race"): a commit word with a value that no writer stored there can make the
+reader load bytes a writer is storing or, if it is zero, let recovery rewrite published records in place under a live
+reader. (The text of 1.0.0 named less of this damage. Naming it is a correction, not a weakening: all of it breaks the
+intact chain on which the guarantee depends.) [ADR 0048](decisions/0048-publication-frontier.md) (accepted, not built)
+would narrow the first, by the checkpoint marker, in a 1.x release.
 
 ## Before 1.0
 
