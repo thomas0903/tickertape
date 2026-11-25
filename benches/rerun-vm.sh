@@ -51,6 +51,10 @@ untune() { sudo rm -f "$GRUB"; sudo update-grub > /dev/null 2>&1; crontab -l 2>/
 
 isolated_now() { cat /sys/devices/system/cpu/isolated; }
 
+expand_list() {  # 1-3,8 -> one CPU per line
+  local part; for part in ${1//,/ }; do seq "${part%-*}" "${part#*-}"; done
+}
+
 tuned_options() {
   local w r helpers; IFS=, read -r w r <<<"$ISOLATED"
   helpers=$(lscpu -p=CPU | grep -v '^#' | grep -vxE "$w|$r" | paste -sd, -)
@@ -85,6 +89,14 @@ case "${1:-run}" in
   *) echo "usage: rerun-vm.sh [run|tune|untune|status]" >&2; exit 2 ;;
 esac
 
+# Copying results to the watcher must not run on a measured CPU: every ssh session (tar, encryption) gets CPU 0, which
+# no configuration measures on; the drop-in keeps it so after the reboot. This script may itself come from such a
+# session, so it takes the other CPUs back first (all but isolated ones, as a process started at boot has them).
+sudo mkdir -p /etc/systemd/system/ssh.service.d
+printf '[Service]\nCPUAffinity=0\n' | sudo tee /etc/systemd/system/ssh.service.d/rerun-cpu.conf > /dev/null
+sudo systemctl daemon-reload
+for pid in $(pgrep -x sshd); do sudo taskset -cp 0 "$pid" > /dev/null 2>&1; done
+taskset -acp "$(comm -23 <(lscpu -p=CPU | grep -v '^#' | sort) <(expand_list "$(isolated_now)" | sort) | sort -n | paste -sd, -)" $$ > /dev/null
 exec 9> "$RESULTS/vm.lock"; flock -n 9 || { echo "already running"; exit 1; }
 [ -f "$RESULTS/DONE" ] && exit 0
 mount_disks
@@ -96,6 +108,7 @@ for unit in unattended-upgrades.service apt-daily.timer apt-daily-upgrade.timer 
             motd-news.timer fwupd-refresh.timer update-notifier-download.timer snapd.service snapd.socket \
             google-osconfig-agent.service; do sudo systemctl stop "$unit" > /dev/null 2>&1; done
 for dir in /data /data2; do mountpoint -q "$dir" && mkdir -p "$dir/tt"; done
+note "sshd CPUs: $(for pid in $(pgrep -x sshd | head -1); do taskset -cp "$pid"; done); driver CPUs: $(taskset -cp $$)"
 note "boot: isolated='$(isolated_now)' cmdline: $(cat /proc/cmdline)"
 failed=""
 if [ -z "$(isolated_now)" ]; then
