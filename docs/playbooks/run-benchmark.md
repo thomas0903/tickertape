@@ -54,3 +54,8 @@ Sustained runs last 10 minutes each and a full session about a day, so they run 
    `compare/README.md`. Point stalls out with their wall-clock times from `series.jsonl`.
 8. **Repeats.** The full matrix runs every paced configuration twice; flag differences above about 10 % as in the
    general procedure's sanity check. A single quick or CI run is never a result.
+
+## Comparison rerun (issue #57)
+
+The planned comparison rerun at v1.0.0 has its own plan: [`rerun-comparison.md`](rerun-comparison.md) (matrix, driver,
+machines, cost, what gets published).
