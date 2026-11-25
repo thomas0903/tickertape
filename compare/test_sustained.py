@@ -163,6 +163,19 @@ class ResumeTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             sustained.prepare_output(self.out, other, resume=True)
 
+    def test_a_matrix_resumes_only_with_the_same_pinning(self):
+        none = {"mode": "none", "summary": "affinity: none (--no-pin)"}
+        pinned = {"mode": "pinned", "writer_cpu": 2, "reader_cpu": 3, "helper_cpus": [0, 1]}
+        # Started before pinning existed: unpinned.
+        sustained.prepare_output(self.out, self.params, resume=False)
+        self.assertFalse(sustained.prepare_output(self.out, dict(self.params, affinity=none), resume=True))
+        with self.assertRaises(ValueError):
+            sustained.prepare_output(self.out, dict(self.params, affinity=pinned), resume=True)
+        command = sustained.adapter_command(self.runs[0], "reader", "d", "c", 1, 0, 1, dict(self.params, affinity=pinned))
+        self.assertEqual(command[-4:], ["--cpu", "3", "--helper-cpus", "0,1"])
+        command = sustained.adapter_command(self.runs[0], "reader", "d", "c", 1, 0, 1, dict(self.params, affinity=none))
+        self.assertNotIn("--cpu", command)
+
     def test_estimate_counts_only_unfinished_runs(self):
         full = sustained.estimate_seconds(self.runs, self.params, self.out)
         self.assertEqual(full, 3 * (600 + 10 + sustained.DEFAULT_OVERHEAD_S + sustained.SYNC_S))

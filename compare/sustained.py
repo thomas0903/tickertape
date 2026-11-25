@@ -27,6 +27,8 @@ import sys
 import tempfile
 import time
 
+import affinity
+
 HERE = Path(__file__).resolve().parent
 
 WORKLOADS = ("probe", "SV", "SD")
@@ -227,7 +229,7 @@ def adapter_command(run, role, data, control, count, warmup, rate, params):
         cmd += ["--sync-every-ms", str(params["sync_every_ms"])]
     if run.tool in JAVA_TOOLS:
         cmd += ["--jit-warmup", "1000"]
-    return cmd
+    return cmd + affinity.adapter_options(params.get("affinity"), run.tool, role)
 
 
 def parse_one(path):
@@ -261,7 +263,8 @@ def run_attempt(run, params, out, env, commands):
     timeout = params["duration_s"] + params["warmup_s"] + 300
     started = datetime.datetime.now(datetime.timezone.utc).isoformat()
     with tempfile.TemporaryDirectory(prefix="run-", dir=tmp_root) as tmp, \
-            (out / "children.log").open("a") as error_log:
+            (out / "children.log").open("a") as error_log, \
+            affinity.Keeper(params["affinity"], Path(tmp) / "control") as keeper:
         base = Path(tmp)
         data, control = base / "data", base / "control"
         data.mkdir()
@@ -281,6 +284,7 @@ def run_attempt(run, params, out, env, commands):
             outputs[role] = path
             proc = subprocess.Popen(cmd, stdout=handle, stderr=error_log, env=env, start_new_session=True)
             children.append(proc)
+            keeper.watch(proc.pid, role)
             return proc
 
         def ready(role):
@@ -313,6 +317,8 @@ def run_attempt(run, params, out, env, commands):
             wait(writer)
             result = {"writer": parse_one(outputs["writer"]),
                       "reader_result": parse_one(outputs["reader"]) if reader is not None else None}
+            result["affinity"] = affinity.record(params["affinity"], run.tool, result["writer"], result["reader_result"],
+                                                 keeper)
         finally:
             for proc in children:
                 if proc.poll() is None:
@@ -458,6 +464,9 @@ def prepare_output(out, params, resume):
         if not matrix.exists():
             raise ValueError("OUTDIR has no matrix.json; it was not started by the sustained mode")
         previous = json.loads(matrix.read_text())["parameters"]
+        if "affinity" in params:
+            # Matrices started before pinning existed were unpinned.
+            previous.setdefault("affinity", {"mode": "none", "summary": "affinity: none (--no-pin)"})
         if previous != params:
             raise ValueError(f"OUTDIR was started with different parameters:\n  {previous}\n  now {params}")
         return False
@@ -471,6 +480,7 @@ def main(args, env, build):
     """Entry point from run.py --sustained."""
     import run as short
     params = parameters(args)
+    params["affinity"] = args.affinity
     out = args.outdir.resolve()
     runs = plan(params)
     pending = [r for r in runs if not (out.exists() and finished(r, out))]
@@ -478,6 +488,7 @@ def main(args, env, build):
     print(f"sustained matrix: {len(runs)} runs, {len(runs) - len(pending)} already finished; "
           f"estimated remaining {format_seconds(estimate)}")
     print(f"estimated_seconds={int(estimate)}")
+    print(params["affinity"]["summary"])
     for case, reason in unsupported(params).items():
         print(f"  unsupported: {case}: {reason}")
     if args.dry_run:
@@ -492,10 +503,11 @@ def main(args, env, build):
     scratch = reset_scratch(out)
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     environment = out / ("environment.txt" if first else f"environment-resume-{stamp}.txt")
-    short.environment(out, env, params["quick"], environment.name)
+    short.environment(out, env, params["quick"], environment.name, params["affinity"])
     (out / "skipped").mkdir(exist_ok=True)
     (out / "runs").mkdir(exist_ok=True)
     build(out, env, [t for t in params["tools"] if t in JAVA_TOOLS])
+    affinity.place_runner(params["affinity"])
     suite_start = time.monotonic()
     counts = execute(runs, params, out, env, args.keep_going)
     total = collect(out)

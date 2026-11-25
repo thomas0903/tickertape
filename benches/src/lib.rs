@@ -1,5 +1,6 @@
 //! Shared validation, scheduling and reporting for the benchmark tools.
 
+pub mod affinity;
 pub mod scale;
 pub mod sustained;
 
