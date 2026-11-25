@@ -22,7 +22,7 @@ const DEFAULT_INTERVAL: Duration = Duration::from_secs(10);
 /// Reports that may wait for a slow standard output before interval reports are skipped.
 const PENDING_REPORTS: usize = 4;
 
-pub(crate) const HELP: &str = "Follows the journal from its end with the safe reader and reports record ages: this machine's wall clock when the command's reader returned a record, minus the record's local_ts_ns, which whoever appended it supplied. It prints no records. It measures THIS COMMAND'S READER on the CPU it happens to run on, not your application's reader: it says whether the writer, the clock and the machine are healthy. An application measures its own reader with tickertape::latency::RecordAge. Age is not the writer-to-reader latency, unless the writer stamps local_ts_ns right before it appends.\n\nRecords count from the first time the reader has nothing more to read, and not after discarded history until it has caught up again. Records without a local_ts_ns, or with one later than this machine's clock, are counted apart; if any were ahead of the clock, the minimum and the percentiles are biased upwards.\n\n--wait poll (default) and spin never register as a waiter, so they add no system call to the writer's appends. poll sleeps 10 us, doubling to 1 ms while idle, and those sleeps are in the ages; spin has no such floor and uses one core. block waits in the kernel on the writer's wake-up region: an append that finds it waiting makes a wake-up system call before it returns.\n\nEnds after --duration or after --count records counted while live, whichever comes first, with a final report; --interval prints reports before that. With none of the three it reports every 10s until interrupted; an interrupt ends it without a final report.\n\nJSON schema (schema_version 1; fields may be added; one object per report and line): {\"schema_version\":1,\"journal\":string,\"sampled_unix_ns\":u64,\"elapsed_s\":number,\"final\":bool,\"durable_only\":bool,\"wait\":\"poll\"|\"spin\"|\"block\",\"records\":u64,\"first_seq\":u64|null,\"last_seq\":u64|null,\"before_live\":u64,\"after_discontinuity\":u64,\"unset_timestamp\":u64,\"ahead_of_clock\":u64,\"discontinuities\":u64,\"age\":HIST,\"interval_age\":HIST|null} with HIST = {\"count\":u64,\"min_ns\":u64|null,\"mean_ns\":number|null,\"p50_ns\":u64|null,\"p90_ns\":u64|null,\"p99_ns\":u64|null,\"p99_9_ns\":u64|null,\"p99_99_ns\":u64|null,\"max_ns\":u64|null}; see docs/cli.md.\n\nExit codes: 0 success; 1 usage, I/O or missing journal; 2 corruption or unsupported journal format (an error while following comes after the report of what was measured).";
+pub(crate) const HELP: &str = "Follows the journal from its end with the safe reader and reports record ages: this machine's wall clock when the command's reader returned a record, minus the record's local_ts_ns, which whoever appended it supplied. It prints no records. It measures THIS COMMAND'S READER on the CPU it happens to run on, not your application's reader: it says whether the writer, the clock and the machine are healthy. An application measures its own reader with tickertape::latency::RecordAge. Age is not the writer-to-reader latency, unless the writer stamps local_ts_ns right before it appends.\n\nRecords count from the first time the reader has nothing more to read (live), and not after discarded history until it has caught up again. A report with live false and 0 records measured nothing: the startup scan outlasted --duration, or the reader never caught up with the writer. Records without a local_ts_ns, or with one later than this machine's clock, are counted apart; if any were ahead of the clock, the minimum and the percentiles are biased upwards.\n\n--wait poll (default) and spin make no system call in the writer's appends: they never register as a waiter. poll sleeps 10 us, doubling to 1 ms while idle, and those sleeps are in the ages; spin has no such floor and uses one core. block waits in the kernel on the writer's wake-up region: an append that finds it waiting makes a wake-up system call before it returns.\n\nEnds after --duration or after --count records counted while live, whichever comes first, with a final report; --interval prints reports before that. With none of the three it reports every 10s until interrupted; an interrupt ends it without a final report.\n\nJSON schema (schema_version 1; fields may be added; one object per report and line): {\"schema_version\":1,\"journal\":string,\"sampled_unix_ns\":u64,\"elapsed_s\":number,\"final\":bool,\"live\":bool,\"durable_only\":bool,\"wait\":\"poll\"|\"spin\"|\"block\",\"records\":u64,\"first_seq\":u64|null,\"last_seq\":u64|null,\"before_live\":u64,\"after_discontinuity\":u64,\"unset_timestamp\":u64,\"ahead_of_clock\":u64,\"discontinuities\":u64,\"age\":HIST,\"interval_age\":HIST|null} with HIST = {\"count\":u64,\"min_ns\":u64|null,\"mean_ns\":number|null,\"p50_ns\":u64|null,\"p90_ns\":u64|null,\"p99_ns\":u64|null,\"p99_9_ns\":u64|null,\"p99_99_ns\":u64|null,\"max_ns\":u64|null}; see docs/cli.md.\n\nExit codes: 0 success; 1 usage, I/O or missing journal; 2 corruption or unsupported journal format (an error while following comes after the report of what was measured).";
 
 #[derive(Debug, Args)]
 pub(crate) struct AgeArgs {
@@ -81,6 +81,7 @@ struct Report {
     sampled_unix_ns: u64,
     elapsed: Duration,
     last: bool,
+    live: bool,
     records: u64,
     seqs: Option<(u64, u64)>,
     discontinuities: u64,
@@ -136,6 +137,23 @@ pub(crate) fn run(args: AgeArgs, out: &mut dyn Write) -> Result<()> {
         .unwrap_or_else(|_| Err(crate::Failure::usage("the reading thread panicked")))
 }
 
+/// What has been read since the clock was.
+#[derive(Default)]
+struct Unchecked {
+    records: u32,
+    bytes: usize,
+}
+
+impl Unchecked {
+    /// Adds a record. Whether the clock is due: after 1,024 records, or fewer large ones, so that a deadline or a report
+    /// is late by about as little whatever the records' size.
+    fn add(&mut self, payload_len: usize) -> bool {
+        self.records += 1;
+        self.bytes = self.bytes.saturating_add(payload_len);
+        self.records >= 1024 || self.bytes >= 1 << 20
+    }
+}
+
 /// Follows the journal and counts ages.
 struct Follower {
     reader: Reader,
@@ -164,48 +182,70 @@ impl Follower {
 
     fn follow(&mut self) -> Result<()> {
         let mut next_report = self.interval.and_then(|i| self.start.checked_add(i));
+        // Whether the last read found nothing, so that the next one waits.
+        let mut wait = false;
+        let mut unchecked = Unchecked::default();
+        // The clock is read before every wait, and otherwise only now and then: neither a scan of what is in the journal
+        // nor a backlog should pay for a clock read per record.
+        let mut check_clock = true;
         loop {
-            let now = Instant::now();
-            if self.count.is_some_and(|n| self.records >= n)
-                || self.deadline.is_some_and(|d| now >= d)
-            {
+            if self.count.is_some_and(|n| self.records >= n) {
                 return Ok(());
             }
-            if let (Some(due), Some(interval)) = (next_report, self.interval) {
-                if now >= due {
-                    match self.reports.try_send(self.report(false)) {
-                        // Full: standard output is behind. Reports are cumulative, and the next one's interval starts
-                        // at the last report that was printed, so nothing is lost by skipping this one.
-                        Ok(()) | Err(TrySendError::Full(_)) => {}
-                        Err(TrySendError::Disconnected(_)) => return Ok(()),
-                    }
-                    // Keeps the phase, unless a whole interval has been missed.
-                    next_report = due
-                        .checked_add(interval)
-                        .filter(|next| *next > now)
-                        .or_else(|| now.checked_add(interval));
+            let mut timeout = None;
+            if wait || check_clock {
+                let now = Instant::now();
+                if self.deadline.is_some_and(|d| now >= d) {
+                    return Ok(());
                 }
-            }
-            let next = if self.live {
+                if let (Some(due), Some(interval)) = (next_report, self.interval) {
+                    if now >= due {
+                        match self.reports.try_send(self.report(false)) {
+                            // Full: standard output is behind. Reports are cumulative, and the next one's interval
+                            // starts at the last report that was printed, so nothing is lost by skipping this one.
+                            Ok(()) | Err(TrySendError::Full(_)) => {}
+                            Err(TrySendError::Disconnected(_)) => return Ok(()),
+                        }
+                        // Keeps the phase, unless a whole interval has been missed.
+                        next_report = due
+                            .checked_add(interval)
+                            .filter(|next| *next > now)
+                            .or_else(|| now.checked_add(interval));
+                    }
+                }
                 let until = [self.deadline, next_report].into_iter().flatten().min();
-                self.reader
-                    .next_timeout(until.map(|t| t.saturating_duration_since(now)))
+                timeout = until.map(|t| t.saturating_duration_since(now));
+                unchecked = Unchecked::default();
+                check_clock = false;
+            }
+            let next = if wait {
+                self.reader.next_timeout(timeout)
             } else {
                 self.reader.try_next()
             };
             match next {
                 Ok(Some(record)) => {
-                    self.age.observe(&record);
+                    wait = false;
+                    check_clock = unchecked.add(record.payload.len());
                     if self.live {
+                        self.age.observe(&record);
                         self.records += 1;
                         let first = self.seqs.map_or(record.seq, |(first, _)| first);
                         self.seqs = Some((first, record.seq));
+                    } else {
+                        // Only counted, as not live: what the time is makes no difference.
+                        self.age.observe_at(record.local_ts_ns, 0);
                     }
                 }
-                // Nothing more to read: caught up, so every record from here on is a new one.
-                Ok(None) => self.set_live(true),
+                Ok(None) => {
+                    // Nothing more to read: caught up, so every record from here on is a new one.
+                    self.set_live(true);
+                    wait = true;
+                }
                 Err(Error::Discarded { seq, .. }) => {
                     self.set_live(false);
+                    wait = false;
+                    check_clock = true;
                     tail::resume_as("age", &mut self.reader, seq)?;
                     self.discontinuities += 1;
                 }
@@ -224,6 +264,7 @@ impl Follower {
             sampled_unix_ns: tickertape::clock::realtime_ns(),
             elapsed: self.start.elapsed(),
             last,
+            live: self.live,
             records: self.records,
             seqs: self.seqs,
             discontinuities: self.discontinuities,
@@ -254,6 +295,7 @@ impl Printer<'_> {
             sampled_unix_ns: report.sampled_unix_ns,
             elapsed_s: report.elapsed.as_secs_f64(),
             last: report.last,
+            live: report.live,
             durable_only: self.durable_only,
             wait: self.wait,
             records: report.records,
@@ -293,6 +335,7 @@ struct JsonReport {
     elapsed_s: f64,
     #[serde(rename = "final")]
     last: bool,
+    live: bool,
     durable_only: bool,
     wait: Wait,
     records: u64,
@@ -373,6 +416,18 @@ fn render_text(text: &mut String, r: &JsonReport) {
     if let Some(interval) = &r.interval_age {
         render_hist(text, "interval", interval);
     }
+    if !r.live {
+        let _ = writeln!(
+            text,
+            "note        {}",
+            if r.records == 0 {
+                "not live yet: nothing measured (the records found at the start, or after a discontinuity, are not all \
+                 read)"
+            } else {
+                "not live: the records found after a discontinuity are not all read, and are not measured"
+            }
+        );
+    }
     if r.ahead_of_clock > 0 {
         let _ = writeln!(
             text,
@@ -452,6 +507,120 @@ mod tests {
         let mut text = String::new();
         render_hist(&mut text, "age", &saturated);
         assert!(text.contains(" mean=- "), "{text}");
+    }
+
+    /// Runs the command in this process; its standard output.
+    fn run_args(dir: &Path, json: bool, set: impl FnOnce(&mut AgeArgs)) -> String {
+        let mut args = AgeArgs {
+            dir: dir.into(),
+            duration: None,
+            count: None,
+            interval: None,
+            durable_only: false,
+            wait: Wait::Poll,
+            json,
+        };
+        set(&mut args);
+        let mut out = Vec::new();
+        run(args, &mut out).unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    fn journal(records: usize, payload: &[u8]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = tickertape::Writer::open(
+            dir.path(),
+            tickertape::WriterConfig::default().segment_size(4 << 20),
+        )
+        .unwrap();
+        for _ in 0..records {
+            writer
+                .append(&tickertape::NewRecord {
+                    schema_id: 1,
+                    venue_ts_ns: 0,
+                    local_ts_ns: 1,
+                    payload,
+                })
+                .unwrap();
+        }
+        dir
+    }
+
+    /// A startup scan that outlasts `--duration` measured nothing, and says so: it must not look like an idle journal.
+    #[test]
+    fn never_live_is_not_an_idle_journal() {
+        let dir = journal(5, b"x");
+        let never = |args: &mut AgeArgs| args.duration = Some(Duration::from_nanos(1));
+        let json: serde_json::Value =
+            serde_json::from_str(&run_args(dir.path(), true, never)).unwrap();
+        assert_eq!(
+            (&json["live"], &json["records"]),
+            (&false.into(), &0.into())
+        );
+        assert_eq!(json["before_live"], 0);
+        let text = run_args(dir.path(), false, never);
+        assert!(text.contains("not live yet: nothing measured"), "{text}");
+        let idle = |args: &mut AgeArgs| args.duration = Some(Duration::from_millis(500));
+        let json: serde_json::Value =
+            serde_json::from_str(&run_args(dir.path(), true, idle)).unwrap();
+        assert_eq!((&json["live"], &json["records"]), (&true.into(), &0.into()));
+        assert_eq!(json["before_live"], 5);
+        let text = run_args(dir.path(), false, idle);
+        assert!(!text.contains("not live"), "{text}");
+    }
+
+    /// The clock is read only now and then while there are records to read, but it is read.
+    #[test]
+    fn the_clock_is_checked_by_records_and_by_bytes() {
+        let due_after = |payload_len| {
+            let mut unchecked = Unchecked::default();
+            (1..=2000).find(|_| unchecked.add(payload_len))
+        };
+        assert_eq!(due_after(0), Some(1024));
+        assert_eq!(due_after(1023), Some(1024));
+        assert_eq!(due_after(1 << 18), Some(4));
+        assert_eq!(due_after(usize::MAX), Some(1));
+        // A scan of many records counts each one, and goes live.
+        let dir = journal(10_000, b"x");
+        let json: serde_json::Value = serde_json::from_str(&run_args(dir.path(), true, |args| {
+            args.duration = Some(Duration::from_secs(2));
+        }))
+        .unwrap();
+        assert_eq!(
+            (&json["live"], &json["before_live"]),
+            (&true.into(), &10_000.into())
+        );
+        // Due at every check, an interval report shows where in the scan the checks are.
+        let (mut follower, reports) = follower(dir.path());
+        follower.interval = Some(Duration::from_nanos(1));
+        follower.deadline = Instant::now().checked_add(Duration::from_secs(1));
+        follower.follow().unwrap();
+        let scanned: Vec<_> = reports
+            .try_iter()
+            .map(|r| (r.live, r.ages.before_live))
+            .collect();
+        assert_eq!(
+            scanned,
+            [(false, 0), (false, 1024), (false, 2048), (false, 3072)]
+        );
+    }
+
+    fn follower(dir: &Path) -> (Follower, mpsc::Receiver<Report>) {
+        let (sender, reports) = mpsc::sync_channel(PENDING_REPORTS);
+        let follower = Follower {
+            reader: Reader::open(dir, Wait::Poll.reader_config()).unwrap(),
+            age: RecordAge::new(),
+            live: false,
+            records: 0,
+            seqs: None,
+            discontinuities: 0,
+            start: Instant::now(),
+            deadline: None,
+            count: None,
+            interval: None,
+            reports: sender,
+        };
+        (follower, reports)
     }
 
     /// A standard output that fails ends the command with that error, whatever the reader is doing.

@@ -165,6 +165,7 @@ fn check(r: &Value) {
             "sampled_unix_ns",
             "elapsed_s",
             "final",
+            "live",
             "durable_only",
             "wait",
             "records",
@@ -183,7 +184,10 @@ fn check(r: &Value) {
     assert!(r["journal"].as_str().unwrap().starts_with('/'));
     assert!(u(r, "sampled_unix_ns") > 1_577_836_800_000_000_000);
     assert!(r["elapsed_s"].as_f64().unwrap() >= 0.0);
-    assert!(r["durable_only"].is_boolean());
+    assert!(r["durable_only"].is_boolean() && r["live"].is_boolean());
+    if !r["live"].as_bool().unwrap() && u(r, "discontinuities") == 0 {
+        assert_eq!(u(r, "records"), 0, "{r}");
+    }
     assert!(["poll", "spin", "block"].contains(&r["wait"].as_str().unwrap()));
     assert_eq!(
         u(r, "records"),
@@ -222,6 +226,10 @@ fn check_hist(h: &Value) {
     let ordered: Vec<u64> = values.iter().map(|k| u(h, k)).collect();
     assert!(ordered.windows(2).all(|w| w[0] <= w[1]), "{h}");
     assert!(h["mean_ns"].is_null() || h["mean_ns"].as_f64().unwrap() >= 0.0);
+}
+
+fn live(r: &Value) -> bool {
+    r["live"].as_bool().unwrap()
 }
 
 fn code(output: &Output) -> i32 {
@@ -376,6 +384,7 @@ fn a_tape_without_a_writer_counts_nothing() {
         let r = &reports[0];
         assert_eq!((u(r, "records"), u(&r["age"], "count")), (0, 0));
         assert_eq!(u(r, "before_live"), 7);
+        assert!(live(r), "an idle journal is live: {r}");
         assert!(r["elapsed_s"].as_f64().unwrap() >= 0.2);
         assert_eq!(r["durable_only"], args.contains(&"--durable-only"));
     }
@@ -385,25 +394,30 @@ fn a_tape_without_a_writer_counts_nothing() {
     drop(writer);
     let (reports, output) = Age::start(copy.path(), &["--count", "0"]).finish();
     assert_eq!((code(&output), u(&reports[0], "records")), (0, 0));
+    assert!(!live(&reports[0]), "it reports at once, before it reads");
 }
 
+/// Paced by the reports rather than by time, so that it does not depend on how fast the machine is.
 #[test]
 fn interval_reports() {
     let (dir, mut writer) = journal(2);
-    let age = Age::start(dir.path(), &["--interval", "100ms", "--duration", "1s"]);
-    let (reports, output) = run_with(age, || {
+    let mut age = Age::start(dir.path(), &["--interval", "20ms", "--count", "40"]);
+    age.until(|| (), live);
+    for _ in 0..3 {
         append(&mut writer, realtime_ns());
-    });
+        age.next().unwrap();
+    }
+    for _ in 0..40 {
+        append(&mut writer, realtime_ns());
+    }
+    let (reports, output) = age.finish();
     assert_eq!(code(&output), 0);
-    // Nine or ten; fewer on a machine that stalls.
-    assert!((3..=11).contains(&reports.len()), "{}", reports.len());
+    assert!(reports.len() >= 5, "{}", reports.len());
     let last = reports.last().unwrap();
-    assert!(u(last, "records") > 0, "{last}");
+    assert_eq!((u(last, "records"), u(last, "first_seq")), (40, 2));
     // The intervals add up to the whole.
     let sum: u64 = reports.iter().map(|r| u(&r["interval_age"], "count")).sum();
     assert_eq!(sum, u(&last["age"], "count"));
-    let elapsed = last["elapsed_s"].as_f64().unwrap();
-    assert!((1.0..30.0).contains(&elapsed), "{elapsed}");
 }
 
 /// With `--durable-only` the age includes the wait for the checkpoint.
@@ -415,9 +429,7 @@ fn durable_only_ages_span_the_wait_for_the_checkpoint() {
         dir.path(),
         &["--durable-only", "--interval", "20ms", "--count", "3"],
     );
-    age.until(|| (), |r| u(r, "before_live") == 1);
-    // One interval after everything checkpointed was read, so it is live.
-    age.next().unwrap();
+    age.until(|| (), live);
     for _ in 0..3 {
         append(&mut writer, realtime_ns());
     }
@@ -518,8 +530,7 @@ fn records_removed_while_following() {
         dir.path(),
         &["--durable-only", "--interval", "20ms", "--duration", "60s"],
     );
-    age.until(|| (), |r| u(r, "before_live") == 1);
-    age.next().unwrap();
+    age.until(|| (), live);
     let signal = |signal: &str| {
         let status = ProcessCommand::new("kill")
             .arg(signal)
@@ -546,7 +557,7 @@ fn records_removed_while_following() {
     };
     assert_eq!(u(&r, "records"), 0, "{r}");
     // Live again: what is appended now counts.
-    age.next().unwrap();
+    age.until(|| (), live);
     append(&mut writer, realtime_ns());
     writer.checkpoint().unwrap();
     let r = age.until(|| (), |r| u(r, "records") == 1);
@@ -579,9 +590,7 @@ fn only_block_registers_as_a_waiter() {
             dir.path(),
             &["--wait", wait, "--interval", "20ms", "--duration", "1s"],
         );
-        // Until it is following: it has read what there was, and one interval more.
-        age.until(|| (), |r| u(r, "before_live") == 3);
-        age.next().unwrap();
+        age.until(|| (), live);
         let mut seen = 0;
         let start = Instant::now();
         let mut samples = 0;
