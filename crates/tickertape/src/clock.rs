@@ -1,7 +1,11 @@
 //! Helpers for caller-supplied timestamps.
 //!
-//! tickertape never reads a clock on its own behalf, except for the informational `created_unix_ns` in segment
-//! headers. Timestamps in records are data supplied by the caller; sequence numbers are the only authority on order.
+//! tickertape never reads a clock for anything it writes into the journal, except for the informational
+//! `created_unix_ns` in segment headers. Timestamps in records are data supplied by the caller; sequence numbers are the
+//! only authority on order. Monitoring compares a record's `local_ts_ns` with a clock ([`latency::RecordAge`], and the
+//! unread age of [`status`](crate::status)); what is read, and in which order, never depends on it.
+//!
+//! [`latency::RecordAge`]: crate::latency::RecordAge
 
 /// Nanoseconds since the Unix epoch (1970-01-01T00:00:00Z) from the system wall clock.
 ///

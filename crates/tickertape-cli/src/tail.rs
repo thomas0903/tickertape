@@ -47,6 +47,11 @@ pub(crate) fn run(args: TailArgs, out: &mut dyn Write) -> Result<()> {
 /// removed it (a durable-only reader learns of a removal when the checkpoint moves past its position, ADR 0034), to
 /// the oldest record still in the journal. Warnings go to standard error, so standard output keeps its format.
 fn resume(reader: &mut Reader, seq: u64) -> Result<()> {
+    resume_as("tail", reader, seq)
+}
+
+/// As [`resume`], for another command that follows a journal; the warnings name it.
+pub(crate) fn resume_as(command: &str, reader: &mut Reader, seq: u64) -> Result<()> {
     warn(format_args!(
         "history discarded at sequence {seq}; seeking to the current chain"
     ))?;
@@ -57,11 +62,11 @@ fn resume(reader: &mut Reader, seq: u64) -> Result<()> {
             Err(Error::SeqUnavailable { first, .. }) if first > target => {
                 if first - 1 == seq {
                     warn(format_args!(
-                        "record {seq} was removed before tail read it; continuing at sequence {first}"
+                        "record {seq} was removed before {command} read it; continuing at sequence {first}"
                     ))?;
                 } else {
                     warn(format_args!(
-                        "records {seq} to {} were removed before tail read them; continuing at sequence {first}",
+                        "records {seq} to {} were removed before {command} read them; continuing at sequence {first}",
                         first - 1
                     ))?;
                 }
