@@ -252,8 +252,11 @@ released with seven items open, accepted by the owner as known gaps
     segment size). The defect the run found, one open file per segment between checkpoints, is fixed (#38).
   - Missing: archived history, missing or corrupt segments, catch-up under a live writer, the zero-copy reader and the
     10,000- and 20,000-segment journals (they failed before #38 and are reported as failed) are not measured.
-  - Accepted after 1.0 (issue #59): a sparse seek index per sealed segment,
-    [ADR 0045](decisions/0045-sparse-seek-index.md) (accepted design, not built).
+  - Implemented after 1.0 (issue #59, #72): the sparse, rebuildable seek index per sealed segment of
+    [ADR 0045](decisions/0045-sparse-seek-index.md), built by `tickertape index` and used by readers that opt in. Every
+    record from the landing record on is validated; the records before it are not read, which is why it is opt-in. Deferred
+    there: the checkpoint marker as a jump point in the newest segment, a cursor the caller saves, then building from the
+    writer.
 
 ### v1.0 readiness
 
@@ -299,7 +302,9 @@ where a line says it is closed:
   since ([above](#next-release-sustained-performance), `docs/benchmarks.md` 2026-11-25).
 - **ARM servers:** two latency observations on aarch64 and the platform mechanism behind issue #43 are not explained.
 - **Replay and recovery at scale:** archived history, missing or corrupt segments, catch-up under a live writer, the
-  zero-copy reader and journals of 10,000 segments or more are not measured.
+  zero-copy reader and journals of 10,000 segments or more are not measured. The sparse seek index is implemented (ADR
+  0045, for sealed segments; opt-in). Not built: building it from the writer, the checkpoint marker as a jump point in the
+  newest segment, a cursor the caller saves.
 
 ## Later (explicitly out of scope for v0.1)
 

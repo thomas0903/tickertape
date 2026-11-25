@@ -298,6 +298,10 @@ try (Reader reader = Reader.open(Path.of("/data/journal"))) {   // at the oldest
 
 - `seekToEnd()` (from 1.1) places the reader at the end of the journal, so that it returns only records it did not find
   committed yet. It reads at most the newest segment, from the checkpoint on.
+- `ReaderOptions.seekIndex(true)` (from 1.1, off by default) lets `seek` start at a record named by a seek index, one of
+  the files `tickertape index` writes (`operations.md` → Seek indexes, crash contract C15). Records before it are then not
+  read, so damage there goes unnoticed. The journal must not be one where someone who may not write the segments can
+  write `seek-index/`.
 - `Reader.open` is the **safe reader**: it reads the files with `pread` into its own buffer and validates the copy, so
   it is memory-safe whatever other processes do to the files.
 - `Reader.openMappedUnsafe` is the **mapped reader**: payloads are read straight from a memory mapping, without a
@@ -495,6 +499,10 @@ WriterMetrics w = writer.metrics();                       // in the writer's pro
   invalidate the current view.
 - `JournalStatus`, `WriterMetrics`, `ReaderMetrics` and `BeaconStatus` are final classes, because their C structs can
   grow; `Position` and `Lag` are records.
+
+The latency histograms and record ages of the Rust crate (`tickertape::latency`, from 1.1, ADR
+[0047](decisions/0047-latency-histograms.md)) are not available from Java yet; `tickertape age` (see [`cli.md`](cli.md))
+reports ages from the command line.
 
 ## Versioning
 

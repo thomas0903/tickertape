@@ -13,6 +13,7 @@ cargo install cargo-fuzz
 |---|---|
 | `parse_segment` | Segment header validation and the forward recovery scan over an in-memory segment image |
 | `decode_record` | Single-record header and frame decoding |
+| `decode_seek_index` | The seek index file (ADR 0045): any bytes, against any segment header |
 | `recover_dir` | Writer crash recovery on real directories: the input describes 1 to 4 segment files (valid records, seals, overwritten, zeroed or flipped bytes, forged CRCs, damaged headers, short files), an optional checkpoint marker, stray `*.tape.tmp` files and a `quarantine/` directory. Runs `Writer::open` with `Quarantine` or `Fail` and checks the invariants listed below |
 
 List them with `cargo +nightly fuzz list`.
@@ -33,7 +34,7 @@ cargo +nightly fuzz run recover_dir corpus/recover_dir seeds/recover_dir -- -max
 
 ### `recover_dir`
 
-Unlike the other two targets, this one writes files: it builds each journal in a fresh `tempfile` directory (so it
+Unlike the other targets, this one writes files: it builds each journal in a fresh `tempfile` directory (so it
 honours `TMPDIR`) and runs about 190 executions per second on a Mac (see "Recorded runs"), mostly in `fsync`, `mmap` and file creation.
 The input grammar is documented at the top of `fuzz/fuzz_targets/recover_dir.rs`. After `Writer::open` it checks:
 

@@ -369,6 +369,8 @@ pub(crate) fn apply_into(
             journal::sync_dir(dir)?;
             mmap::full_barrier(&file)
                 .map_err(|e| Error::io("full sync retention segment", &path, e))?;
+            // Its seek index, best effort (ADR 0045): a leftover is harmless, and the writer's next open removes it.
+            crate::seek_index::dir::remove_index(dir, segment.base_seq);
             Ok(())
         })();
         // Count the unlink/rename even if a subsequent sync fails.
@@ -403,7 +405,7 @@ fn directory_identity(dir: &Path) -> Result<journal::Identity> {
 /// barrier), so a slot read in between can still be lost to a power loss, and removing the segments before it would
 /// then leave the marker that comes back naming a removed segment. The marker file is synced after the read, which
 /// makes durable every write the read saw. `synced` is the slot last made durable this way, which needs no new sync.
-fn durable_checkpoint(
+pub(crate) fn durable_checkpoint(
     dir: &Path,
     synced: &mut Option<CheckpointSlot>,
 ) -> Result<Option<CheckpointSlot>> {
@@ -424,10 +426,11 @@ fn durable_checkpoint(
 }
 
 /// Validate the position to the same extent as writer recovery, without scanning the mutable active tail.
-fn checkpoint(dir: &Path) -> Result<Option<CheckpointSlot>> {
+pub(crate) fn checkpoint(dir: &Path) -> Result<Option<CheckpointSlot>> {
     let Some(slot) = inspect::read_checkpoint(dir)? else {
         return Ok(None);
     };
+    crate::fault::hook(crate::fault::Point::MarkerRead);
     let path = journal::segment_path(dir, slot.segment_base_seq);
     let file = match File::open(&path) {
         Ok(file) => file,

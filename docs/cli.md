@@ -1,11 +1,12 @@
 # Command-line interface (M5–M6)
 
 Install/build the `tickertape-cli` package; its binary is `tickertape`. Commands use the public library API
-and never take the writer lock. **`archive` is the only command that changes a journal**; all other commands never
-write segments, the checkpoint marker or any other journal data. Paths may name a journal with an active writer.
-The one other write is that a following `tail`, while it waits for new records, registers itself as a waiter in the
-writer's shared-memory wake-up region (ADRs 0017, 0021), which is outside the journal directory and holds no
-journal data. `status --output` writes a file that must be outside the journal directory.
+and never take the writer lock (`index`, in a directory without a checkpoint marker, tests it). **`archive` is the only
+command that changes a journal's data**, and `index` writes only the seek indexes in its `seek-index/`; all other
+commands never write segments, the checkpoint marker or anything else there. Paths may name a journal with an active writer.
+The one other write is that a following `tail`, and `age --wait block`, while they wait for new records, register
+themselves as a waiter in the writer's shared-memory wake-up region (ADRs 0017, 0021), which is outside the journal
+directory and holds no journal data. `status --output` writes a file that must be outside the journal directory.
 
 All commands support `--help`. Exit codes: **0** success (including help, exhausted input, count reached or idle
 timeout), **1** usage, I/O or missing-journal error, **2** corrupt data or an unsupported journal format (for
@@ -15,7 +16,7 @@ Errors and recovery warnings go to stderr. JSON results go to stdout (or the sel
 ## Commands
 
 - `tail <DIR> [--from <SEQ> | --from-end] [--count <N>] [--no-follow] [--format text|json]
-  [--timeout-secs <S>] [--durable-only] [--decode market-demo]`: default starts at the oldest record and follows forever. `--from` includes SEQ;
+  [--timeout-secs <S>] [--durable-only] [--seek-index] [--decode market-demo]`: default starts at the oldest record and follows forever. `--from` includes SEQ;
   `--from-end` starts at the end of the journal as observed at startup (`Reader::seek_to_end`): it reads the newest
   segment from the checkpoint on, not the records of the segments before it, so
   damaged records there are not reported (the oldest segment's header is still checked when the journal is opened). `--count 0` writes nothing. `--no-follow` stops when
@@ -49,11 +50,12 @@ Errors and recovery warnings go to stderr. JSON results go to stdout (or the sel
   21 ms instead of 9 ms (warm page cache, Apple M4 Pro); with a cold cache or slow storage it costs reading the
   unwritten rest of the newest segment. `inspect` runs the same scan.
 - `export <DIR> --format jsonl|parquet [--output <FILE>|-] [--from <SEQ>] [--to <SEQ>]
-  [--decode market-demo] [--durable-only]`: writes records from the
+  [--decode market-demo] [--durable-only] [--seek-index]`: writes records from the
   inclusive range; JSONL defaults to stdout and `--output -` also selects stdout for JSONL. The output file is created or
   truncated, but a path naming an existing journal entry (including via symlinks/hard links), or any path inside
   the journal, is rejected (an entry that retention removes while this check walks the directory is skipped, unless
-  the inode number in its directory entry is the output file's).
+  the inode number in its directory entry is the output file's; the files in `seek-index/` are not journal data and are
+  not compared).
   `--to` must not precede `--from`.
   A first safe-reader pass, the startup scan, counts the selected records. It stops at `--to`, at the first empty
   slot it sees, or, with `--durable-only`, at the checkpoint bound described below; without `--to`, a visible scan
@@ -89,7 +91,7 @@ Errors and recovery warnings go to stderr. JSON results go to stdout (or the sel
   Tail and export use the durability guarantee and storage assumptions in [crash contract C13](crash-contract.md)
   and [ADR 0010](decisions/0010-durable-only-reads.md); if the writer never checkpoints, neither exposes records.
 
-- `stats <DIR> [--from <SEQ>] [--to <SEQ>] [--durable-only] [--json]`: summarize committed records
+- `stats <DIR> [--from <SEQ>] [--to <SEQ>] [--durable-only] [--seek-index] [--json]`: summarize committed records
   with totals, per-schema counts/shares/payload lengths, overall payload percentiles, separate venue/local
   timestamp summaries, and the largest gap between consecutive local timestamps. Ranges are inclusive;
   `--to` must not precede `--from`. One nonblocking startup scan accumulates the selected records once,
@@ -183,6 +185,81 @@ Errors and recovery warnings go to stderr. JSON results go to stdout (or the sel
   On a one-shot sample, `last_local_ts_ns` of the head is null when the checkpoint is at the head (the scan starts
   there and sees no record).
 
+- `age <DIR> [--duration <DUR>] [--count <N>] [--interval <DUR>] [--durable-only] [--wait poll|spin|block] [--json]`
+  (from 1.1): follows the journal with the safe reader, starting at the end of the journal (as
+  `tail --from-end`), and reports how old its records are when it gets them: this machine's wall clock when the reader
+  returned the record, minus the record's `local_ts_ns`, which whoever appended it supplied (ADR
+  [0047](decisions/0047-latency-histograms.md)). It prints no records, and reports are formatted and written by another
+  thread than the one that reads, so output speed is not part of the numbers. The snapshot behind a report is taken by
+  the thread that reads, between two records, so that its numbers are from one moment; that pause (copying about 30 KB)
+  is in the ages of records that arrive meanwhile.
+  **It measures this command's reader on the CPU it happens to run on, not the application's reader.** It says whether
+  the writer, the clock and the machine are healthy; an application measures its own reader with
+  `tickertape::latency::RecordAge`. Age is not the writer-to-reader latency unless the writer stamps `local_ts_ns` right
+  before it appends; what else it is not, and what the clocks do to it, is in
+  [`operations.md`](operations.md#how-old-records-are-when-they-are-read).
+  **Where it starts.** At the end of the journal as observed at startup (`Reader::seek_to_end`, ADR
+  [0046](decisions/0046-seeks-that-need-no-index.md)): after every record committed before the command looked, and before
+  every record committed afterwards (one committed meanwhile can be on either side). It reads the newest segment from the
+  checkpoint on (from its first record if the checkpoint is in an older one), and any segments the writer rolls to
+  meanwhile; the records of older segments are not read, so damage there is not reported (the oldest segment's header is
+  still checked when the journal is opened). With `--durable-only` it starts at the end of what the checkpoint covers. With
+  no valid checkpoint marker nothing is covered: it then starts at the first record of the oldest segment, and the records
+  that the next checkpoint covers are new to it, so they count, however long ago they were appended. Where
+  `tail --from-end` fails, `age` fails with the same error and exit code and no final report: a journal without segments,
+  a damaged newest segment, a segment replaced or removed on each of 8 attempts in a row, for `--durable-only` also a
+  marker that can't be read.
+  **Which records count.** The command is *live* from the moment its reader is at the end, so every record it returns
+  from there on counts, a backlog that builds up later included. It is not live after discarded or removed history, where
+  it resumes as `tail` does, with the same warnings on standard error, until it has caught up again. A report that is not
+  live and has no records **measured nothing**, unlike one of an idle journal, which is live. The text says
+  `not live yet: nothing measured`, the JSON `"live":false`; the exit code is 0 either way. That is a reader not placed at
+  the end yet (or still catching up after a discontinuity): placing it usually takes milliseconds, but it lasts for as long as a writer commits as fast as the reader
+  validates. Records without a `local_ts_ns`, and records whose `local_ts_ns` is later than this machine's clock, are
+  counted apart and have no age.
+  `--durable-only` gives the age at which a durable-only reader gets records (it includes the wait for the checkpoint).
+  **When it ends.** `--duration` after its start, whether or not the reader is at the end by then, or after `--count`
+  records returned while live, whichever comes first, with a final report. `--count 0` reports as soon as the reader is at
+  the end. `--interval` prints a report each interval before that; an interval report is skipped while earlier ones are
+  still waiting for standard output, so compute rates from differences of `elapsed_s`, not from the nominal interval. The
+  final report is not skipped: output that stalls can hold the command past `--duration`. While it reads without waiting
+  (a backlog, or history after a discontinuity) it checks the time about every 1,024 records. With none of the three it
+  reports every 10 s until interrupted. An interrupt ends it without a final report (there is no signal handler), so at
+  most one interval is lost. `DUR` is an integer followed by `ms`, `s`, `m` or `h`.
+  **Waiting must not add a system call to the writer it watches.** `--wait` says how it waits for records:
+
+  | `--wait` | What it adds to the ages | What it costs the writer |
+  |---|---|---|
+  | `poll` (default) | Up to one sleep: 10 µs, doubling to 1 ms while idle (the default back-off), as long as the system makes them | No system call; never registers as a waiter |
+  | `spin` | No sleep, so no such floor; keeps one core busy | No system call; never registers as a waiter. Not measured: like any reader that keeps up, it reads cache lines the writer is writing |
+  | `block` | The wake-up, in the kernel | An append that finds it waiting makes a wake-up system call before it returns, as for any blocking reader (`tail` too) |
+
+  Exit codes as `tail`: 0, 1, or 2 on corruption or an unsupported format. An error met while following comes
+  after the final report of what was measured; an error while opening the journal or placing the reader at its end gets no
+  final report, since nothing was measured.
+
+- `index <DIR> [--rebuild | --check | --remove] [--json]`: writes, checks or removes the seek indexes of sealed segments
+  (ADR 0045, crash contract C15): files in `<DIR>/seek-index/` that let a reader which opts in start a seek inside a
+  segment (`--seek-index` of `tail`, `export` and `stats`; `ReaderConfig::seek_index`). Without an option it builds what
+  is missing or outdated: for the sealed segments before the segment of the checkpoint marker, which it makes durable
+  first, also beside a live writer; without a valid marker, for every sealed segment, if no writer has the journal open
+  (an archive). Each segment it indexes is read and validated once. An index that is right is kept (it checks the
+  index, the seal and the last indexed record); `--rebuild` writes every one anew, also one of a newer version, which is
+  otherwise kept. The user running it must own the journal's files (root gets no exception); it creates `seek-index/`
+  only as the journal directory's owner, with that directory's group and mode, if the user is in that group and the
+  directory is not writable by everyone. `--check` changes nothing, reads every segment that has or could have an index,
+  and compares every entry with it. `--remove` deletes every index and leaves the directory; what else is in it stays.
+  Text output is one line per segment: the file, the state, and the reason if there is one. Exit **0** also for segments
+  that have or get no index; **1** usage or I/O error, missing journal, no marker and an open writer, a `seek-index/` that
+  may not be used, a segment of another user (`not_permitted`), or one that failed (`failed`); **2** a marker that names a missing segment or
+  position, or with `--check` a wrong index. One segment that cannot be read or indexed does not stop the others.
+  Indexes built before a failure stay. `--check` also counts unfinished files of killed builds, which `--remove` deletes.
+  The states are below.
+
+`--seek-index` (`tail`, `export`, `stats`) lets the command's seek to `--from` start at an indexed record. The output is
+the same; records before that one are not read, so damage there, which otherwise stops the command with exit 2, goes
+unnoticed. Do not use it where someone who may not write the segments can write `seek-index/` (crash contract C15).
+
 ## Machine-readable contracts
 
 All JSON is UTF-8, compact, and ends with a newline. Integer fields are unsigned JSON numbers with their Rust
@@ -190,7 +267,7 @@ widths listed below; nullable fields use JSON `null`. Consumers must preserve u6
 is fixed for record JSONL; consumers of inspect/verify should use names. File names are basenames, converted to
 UTF-8 with replacement characters for non-UTF-8 names. Reason strings are human-readable diagnostics, not codes.
 
-Every `--json` document (`verify`, `inspect`, `stats`, `archive` and `status`) starts with `"schema_version":1`. Each
+Every `--json` document (`verify`, `inspect`, `stats`, `archive`, `index`, `status` and `age`) starts with `"schema_version":1`. Each
 command's schema is versioned on its own. Within a version, fields may be added and, where this page says a set may
 grow, enumerated string values; consumers must ignore fields they do not know. Removing a field or changing its
 meaning bumps that command's `schema_version`. Record JSONL has no `schema_version`: its keys are fixed.
@@ -291,6 +368,33 @@ it counts files and full bytes removed by this run, and planned files already ab
 concurrent archiver. A successful empty plan yields an empty `segments` array and zero report counts (or null in
 a dry run). JSON numbers preserve their u64 interpretation; consumers should use field names.
 
+### `index --json`
+
+```text
+{"schema_version":1,"action":"build"|"check"|"remove",
+ "segments":[{"file":string,"base_seq":u64,"state":string,"ignored_by_readers":bool,"reason":string|null}, ...],
+ "removed":u64|null,"unfinished":u64|null}
+```
+
+`segments` has one element per segment, oldest first (empty for `remove`). `file` is the segment's basename, `reason` a
+human-readable diagnostic. `removed` counts the files `--remove` deleted and is null otherwise. `unfinished` counts the
+temporary files that killed builds left (or that one is writing now) and is null except for `check`. The set of states
+may grow:
+
+| `state` | Action | Meaning |
+|---|---|---|
+| `built` | build | An index was written |
+| `valid` | both | The index is right; with `--check`, every entry was compared with the segment. `ignored_by_readers` (`--check`): it is right, but readers ignore the file for its owner or mode (`reason` says which); a build writes it anew |
+| `missing` | check | The segment could have an index and has none |
+| `ignored` | both | A file that readers do not use because of its content: damaged, stale, another version, not a regular file. A build reports only a newer version, which it keeps |
+| `wrong` | check | A reader would use the index, and an entry in it is not on the segment's chain: forged. Exit 2 |
+| `not_needed` | both | No record starts outside the segment's first block (every 64 KiB segment) |
+| `not_sealed` | both | The segment does not end in a valid seal: it is being written, or is damaged (`reason`) |
+| `not_covered` | both | Not before the checkpoint marker's segment |
+| `not_permitted` | build | The segment is another user's, or the index cannot be given its group. Exit 1 |
+| `vanished` | both | Removed or replaced meanwhile; run it again |
+| `failed` | both | Reading the segment or its index, or writing the index, failed (`reason`). The other segments are handled all the same. Exit 1 |
+
 ### `status --json`
 
 ```text
@@ -386,6 +490,41 @@ not be established.
 - `health`: `ok` if nothing is breached; `corrupt` if a breach is corruption (`head_invalid`, `checkpoint_invalid`,
   `chain_broken`, always checked; the command then exits 2); `verified` is `head.verified`: when false, `ok` means
   healthy as far as the sample can tell, not that the writer would open the journal.
+
+### `age --json`
+
+From 1.1. One object per report and line:
+
+```text
+{"schema_version":1,"journal":string,"sampled_unix_ns":u64,"elapsed_s":number,"final":bool,
+ "live":bool,"durable_only":bool,"wait":"poll"|"spin"|"block",
+ "records":u64,"first_seq":u64|null,"last_seq":u64|null,
+ "before_live":u64,"after_discontinuity":u64,"unset_timestamp":u64,"ahead_of_clock":u64,"discontinuities":u64,
+ "age":HIST,"interval_age":HIST|null}
+
+HIST = {"count":u64,"min_ns":u64|null,"mean_ns":number|null,"p50_ns":u64|null,"p90_ns":u64|null,"p99_ns":u64|null,
+        "p99_9_ns":u64|null,"p99_99_ns":u64|null,"max_ns":u64|null}
+```
+
+`journal` is the canonical absolute path and `sampled_unix_ns` the time of the report. `final` is true on the last
+report and only there. `live` is whether the records the reader returned counted at the time of the report: true
+once it was placed at the end of the journal, false before that, and after a discontinuity until it has caught up. With
+`"live":false` and `records` 0, nothing was measured. Everything is cumulative since the command started, except `interval_age`: the ages counted since
+the previous report that was written; null without an interval. `wait` may gain values.
+
+- `records` counts the records returned while live, and `first_seq`/`last_seq` are theirs (null when there are none). It
+  is the sum of `age.count`, `unset_timestamp` (live records with a `local_ts_ns` of 0) and `ahead_of_clock` (live
+  records with a `local_ts_ns` later than this machine's clock). **A non-zero `ahead_of_clock` biases `min_ns` and the
+  percentiles upwards:** the records left out are the fastest ones.
+- `before_live` and `after_discontinuity` count the other records: those returned before the command was live for the
+  first time (none, since it starts at the end: 0 in this version), and those returned after a discontinuity until it had
+  caught up again.
+- `discontinuities` counts discarded or removed histories the command resumed after.
+- `min_ns` and `max_ns` are exact in `age`; in `interval_age` they can be bucket bounds (never above the true minimum,
+  never below the true maximum, at most 1/64 off). Percentiles are nearest rank, given as bucket upper bounds: never
+  below the true value and at most 1.6 % above it, capped at `max_ns`; with a small `count` the high ones are `max_ns`.
+  A histogram with a `count` of 0 has nulls. `mean_ns` is also null once the sum of the ages has reached `u64::MAX` ns,
+  which only meaningless timestamps do.
 
 ### `status --format prometheus`
 

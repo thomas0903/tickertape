@@ -108,6 +108,44 @@ pub enum Point {
     /// [`fail_next_background`]).
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     EarlyWriteback,
+    /// A seek index builder has created its temporary file (the fence), before it reads the marker. The points of the
+    /// seek index (ADR 0045) are hooks ([`run_at`]) unless they say otherwise.
+    SeekIndexFence,
+    /// A seek index builder has read the marker (or probed the lock) and found the segment eligible, before it opens
+    /// and walks it.
+    SeekIndexEligible,
+    /// Writing the temporary index: arm with [`fail_next`].
+    SeekIndexWrite,
+    /// A seek index builder has written the temporary index, before it renames it.
+    SeekIndexBeforeRename,
+    /// A seek index builder has renamed the index into place, before it checks that the segment is still in place.
+    SeekIndexAfterRename,
+    /// A seek index builder holds the writer's lock shared, before it releases it (a directory without a marker).
+    SeekIndexProbe,
+    /// Listing `seek-index/` (by the writer's open, `seek_index::remove`): arm with [`fail_next`].
+    SeekIndexList,
+    /// Removing a name in `seek-index/`: arm with [`fail_next`].
+    SeekIndexUnlink,
+    /// Reading on in a listing of `seek-index/` after a name with a meaning: arm with [`fail_next`].
+    SeekIndexListEntry,
+    /// Syncing `seek-index/` after the removal at the writer's open: arm with [`fail_next`].
+    SeekIndexSync,
+    /// The platform barrier on `seek-index/` at the end of an open that repaired nothing: arm with [`fail_next`].
+    SeekIndexBarrier,
+    /// Giving a new `seek-index/` its group and mode: arm with [`fail_next`].
+    SeekIndexDirMode,
+    /// Reading the checkpoint marker for retention or a seek index builder, before its segment is opened.
+    MarkerRead,
+    /// The writer's open has finished one of its two passes over `seek-index/` (recovery step 2a).
+    SeekIndexListed,
+    /// The writer's open has finished step 2a, before recovery changes anything.
+    SeekIndexRemoved,
+    /// A seek that may use an index has read the checkpoint marker, or did not have to (its step 2).
+    ReaderSeekIndexMarker,
+    /// A seek has read and checked an index (its step 4), before it checks that its segment is still in place.
+    ReaderSeekIndexLoaded,
+    /// A seek has found the indexed record's first 8 bytes in place (its step 8a), before it reads the record.
+    ReaderSeekIndexLanding,
 }
 
 /// Points in the reader-beacon protocol (ADR 0032 → "The beacon protocol") where a test's pause hook runs.
@@ -235,6 +273,7 @@ pub fn clear() {
         .unwrap_or_else(|e| e.into_inner())
         .clear();
     publish::HOOK.with(|h| *h.borrow_mut() = None);
+    listing::OMIT.with(|o| o.borrow_mut().clear());
 }
 
 /// Makes the next operation at `point` on any of the writer's background threads fail with OS error `errno`.
@@ -406,3 +445,114 @@ pub(crate) fn pause_before_publish() {
 #[cfg(not(feature = "fault-injection"))]
 #[inline(always)]
 pub(crate) fn pause_before_publish() {}
+
+#[cfg(feature = "fault-injection")]
+mod listing {
+    use std::cell::RefCell;
+    use std::ffi::OsString;
+
+    thread_local! {
+        pub(super) static OMIT: RefCell<Vec<Vec<OsString>>> = const { RefCell::new(Vec::new()) };
+    }
+}
+
+/// Makes this thread's next listing of `seek-index/` leave out these names, as a listing may leave out both names of
+/// a rename that happens while it runs. Calls queue up, one per listing.
+#[cfg(feature = "fault-injection")]
+pub fn next_listing_omits(names: impl IntoIterator<Item = std::ffi::OsString>) {
+    listing::OMIT.with(|o| o.borrow_mut().push(names.into_iter().collect()));
+}
+
+/// Called on each listing of `seek-index/`.
+#[cfg(feature = "fault-injection")]
+pub(crate) fn filter_listing<T>(entries: &mut Vec<T>, name: impl Fn(&T) -> &std::ffi::OsStr) {
+    let omit = listing::OMIT.with(|o| {
+        let mut o = o.borrow_mut();
+        (!o.is_empty()).then(|| o.remove(0))
+    });
+    if let Some(omit) = omit {
+        entries.retain(|e| !omit.iter().any(|n| n == name(e)));
+    }
+}
+
+/// Called on each listing of `seek-index/` (no-op without the `fault-injection` feature).
+#[cfg(not(feature = "fault-injection"))]
+#[inline(always)]
+pub(crate) fn filter_listing<T>(_entries: &mut Vec<T>, _name: impl Fn(&T) -> &std::ffi::OsStr) {}
+
+/// A sync that a thread made ([`take_syncs`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Sync {
+    /// The data of a file (`fdatasync`, `fsync` on macOS).
+    Data,
+    /// A file or directory (`fsync`).
+    All,
+    /// The platform barrier (`F_FULLFSYNC` on macOS; on Linux it is a [`Sync::Data`] as well).
+    Barrier,
+    /// Data through a mapping made for it (`msync`; a [`Sync::Msync`] as well).
+    MsyncFile,
+    /// The start of early write-back (`sync_file_range`).
+    Writeback,
+    /// Part of a mapping (`msync`). Its file is not known here: recorded with device and inode 0.
+    Msync,
+}
+
+#[cfg(feature = "fault-injection")]
+mod syncs {
+    use std::cell::RefCell;
+
+    /// A sync and the device and inode of the file it was made on.
+    pub(super) type Made = (super::Sync, (u64, u64));
+
+    thread_local! {
+        pub(super) static LOG: RefCell<Option<Vec<Made>>> = const { RefCell::new(None) };
+    }
+}
+
+/// Starts recording this thread's syncs, forgetting the ones recorded before.
+#[cfg(feature = "fault-injection")]
+pub fn record_syncs() {
+    syncs::LOG.with(|l| *l.borrow_mut() = Some(Vec::new()));
+}
+
+/// Stops recording this thread's syncs and returns them, each with the device and inode of the file it was made on.
+#[cfg(feature = "fault-injection")]
+pub fn take_syncs() -> Vec<(Sync, (u64, u64))> {
+    syncs::LOG
+        .with(|l| l.borrow_mut().take())
+        .unwrap_or_default()
+}
+
+/// Called at each sync of a file.
+#[cfg(feature = "fault-injection")]
+pub(crate) fn note_sync(sync: Sync, file: &std::fs::File) {
+    use std::os::unix::fs::MetadataExt;
+    syncs::LOG.with(|l| {
+        if let Some(log) = l.borrow_mut().as_mut() {
+            if let Ok(meta) = file.metadata() {
+                log.push((sync, (meta.dev(), meta.ino())));
+            }
+        }
+    });
+}
+
+/// Called at each sync of a file (no-op without the `fault-injection` feature).
+#[cfg(not(feature = "fault-injection"))]
+#[inline(always)]
+pub(crate) fn note_sync(_sync: Sync, _file: &std::fs::File) {}
+
+/// Called at each `msync`.
+#[cfg(feature = "fault-injection")]
+pub(crate) fn note_msync() {
+    syncs::LOG.with(|l| {
+        if let Some(log) = l.borrow_mut().as_mut() {
+            log.push((Sync::Msync, (0, 0)));
+        }
+    });
+}
+
+/// Called at each `msync` (no-op without the `fault-injection` feature).
+#[cfg(not(feature = "fault-injection"))]
+#[inline(always)]
+pub(crate) fn note_msync() {}

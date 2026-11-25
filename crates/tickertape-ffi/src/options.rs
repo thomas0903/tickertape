@@ -389,6 +389,33 @@ pub unsafe extern "C" fn tickertape_reader_options_set_durable_only(
     })
 }
 
+/// Sets whether `tickertape_reader_seek` may start at a record named by a seek index, one of the optional files that
+/// `tickertape index` writes next to the journal (ADR 0045, crash contract C15). Non-zero enables it. Default: off.
+///
+/// A seek into a sealed segment that has an index then validates the record it lands on and every record from there,
+/// instead of every record from the segment's start. Records before that are not read, so damage there no longer stops
+/// the reader. Without an index, or if anything about it is in doubt, the seek does what it does without the option,
+/// and it never fails because of an index. A durable-only reader and a mapped one
+/// (`tickertape_reader_open_mapped_unsafe`) use an index only for a segment before the one the checkpoint marker
+/// names. Do not enable this where someone who may not write the segments can write `seek-index/`: a forged index can
+/// make the reader return bytes from inside a payload that form a valid record. Added in 1.1.
+///
+/// # Safety
+///
+/// `options` must be NULL or live reader options, not used by another thread during the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tickertape_reader_options_set_seek_index(
+    options: *mut tickertape_reader_options,
+    enabled: i32,
+) -> tickertape_status {
+    guard(|| {
+        // SAFETY: forwarded caller contract.
+        let o = unsafe { object(options, "options") }?;
+        o.config.seek_index = enabled != 0;
+        Ok(S::TICKERTAPE_OK)
+    })
+}
+
 /// Sets whether a waiting reader blocks on the writer's wake-up region instead of sleeping, so a new record wakes it
 /// at once (ADRs 0017 and 0021). Non-zero enables it. Default: on. Readers fall back to sleeping where the region
 /// is unavailable.

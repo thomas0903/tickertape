@@ -12,6 +12,7 @@ use crate::format::{self, RecordHeader};
 use crate::journal::{self, Identity};
 use crate::mmap::MapRo;
 use crate::record::{OwnedRecord, Record};
+use crate::seek_index::{self, codec::Entry, dir::IndexDir, lookup};
 
 /// How long a reader waits at an empty slot before checking that its segment wasn't replaced by recovery.
 const IDENTITY_CHECK_INTERVAL: Duration = Duration::from_millis(100);
@@ -80,8 +81,10 @@ pub struct Reader {
     /// The `next_seq` of a checkpoint marker read before the records the cursor has passed since the last seek that
     /// started at a segment's first record (or at the marker), from files confirmed current after it was read: while
     /// the cursor is at or below it, the cursor is a record boundary of the current chain (ADR 0046). Set only by
-    /// seeks, which drop the read buffer; 0 if none.
+    /// seeks, which drop the read buffer; 0 if none, and after a landing through a seek index (ADR 0045).
     seek_covered: u64,
+    /// Whether the last `seek` landed through a seek index ([`Reader::seek_used_index`]).
+    used_index: bool,
     /// `pread` buffer: bytes of `seg` starting at file offset `buf_start`.
     buf: Vec<u8>,
     buf_start: u64,
@@ -190,6 +193,12 @@ impl Reader {
     /// the journal's segment files (writing into them, truncating them, or replacing their contents through other
     /// tools). If a mapped file is truncated, the process receives `SIGBUS`.
     ///
+    /// With [`ReaderConfig::seek_index`] this also covers `seek-index/` and the checkpoint marker: no process other than
+    /// a tickertape writer or index builder ([`seek_index::build`](crate::seek_index::build)) may modify them. Such a
+    /// reader uses an index only for a segment before the one the marker names, to which no writer stores; if the marker
+    /// is damaged later and a recovery changes such a segment in place, the known limitation below applies. With the
+    /// option off, nothing changes.
+    ///
     /// What follows holds for an intact publication chain, where every commit word the reader follows is one a
     /// writer published. A tickertape writer then never modifies committed bytes, including during crash recovery,
     /// which in place only zeroes bytes after an empty slot (never committed, on an intact chain) and writes a seal
@@ -243,6 +252,7 @@ impl Reader {
             superseded_checked: None,
             skip_until: base,
             seek_covered: 0,
+            used_index: false,
             buf: Vec::new(),
             buf_start: 0,
             waker,
@@ -281,6 +291,13 @@ impl Reader {
     /// expected there, the cursor can be off the current chain without the seek noticing. A seek to the last record
     /// the reader passed (returned or skipped), or an earlier one, scans the segment, and so does a new reader.
     ///
+    /// With [`ReaderConfig::seek_index`] (off by default), the way may start at a record before the target that a seek
+    /// index names, if there is an index and nothing about it is in doubt (ADR 0045). The record landed on and every
+    /// record from there are validated as always. **Records before it are not read:** damage there, at which a seek
+    /// without the option stops, goes unnoticed, and the landing place is on the current chain except where a stale or
+    /// a forged index coincides with suitable bytes in a payload (`docs/crash-contract.md`, C15). A reader that landed
+    /// this way is not at a place a later seek starts from. No seek fails because of an index.
+    ///
     /// Retention may remove the segment holding `seq` while `seek` runs (between listing the segments and opening
     /// the chosen one). `seek` then lists the segments again, so it returns [`Error::SeqUnavailable`] with the new
     /// oldest sequence number, never an I/O error for the removed file. A segment removed just after `seek`
@@ -311,8 +328,12 @@ impl Reader {
             self.offset = format::SEGMENT_HEADER_LEN as u64;
             self.next_seq = base;
         }
-        // A seek that continues to a target the known marker covers needs no newer one.
-        if !continues || seq >= self.seek_covered {
+        self.used_index = self.config.seek_index && self.land_through_index(seq, continues);
+        if self.used_index {
+            // Nothing is claimed for a cursor that came from an index, so no later seek starts there (ADR 0045, step 9).
+            self.seek_covered = 0;
+        } else if !continues || seq >= self.seek_covered {
+            // A seek that continues to a target the known marker covers needs no newer one.
             self.seek_covered = self.covered_now();
         }
         self.skip_until = seq;
@@ -386,7 +407,9 @@ impl Reader {
     /// A visible reader can't notice such an in-place repair (storage damage that emptied a commit word; crash
     /// contract C11): it may return records it had already read, then continue in the new history, wait, or report
     /// corruption at a position that no longer starts a record; [`Reader::seek`] to its position puts it back on the
-    /// current chain.
+    /// current chain. (The exceptions of [`Reader::seek`] apply. A reader with [`ReaderConfig::seek_index`] can also have
+    /// entered the segment behind the damage, before the repair, where another reader's scan would have stopped; it is
+    /// then where a reader that had already passed the damaged record would be. Crash contract C15.)
     ///
     /// # Errors
     ///
@@ -565,6 +588,124 @@ impl Reader {
             Ok(Some(marker)) if self.check_identity().is_ok() => marker.next_seq,
             _ => 0,
         }
+    }
+
+    /// Whether the last [`Reader::seek`] landed through a seek index. Hidden: for the workspace's tests and benchmarks.
+    #[doc(hidden)]
+    pub fn seek_used_index(&self) -> bool {
+        self.used_index
+    }
+
+    /// Tries to place the cursor at an indexed record at or before `target`, in the reader's segment (ADR 0045, "What
+    /// a reader does"; the step numbers are those there). Returns whether it did. Otherwise the cursor is where it was,
+    /// whatever the reason: nothing about an index is an error.
+    ///
+    /// `continues`: the seek may start at the cursor, which is then a place to beat. Nothing the caller of `seek` can
+    /// see depends on an index except where the seek lands, and no seek does anything here without the option.
+    #[inline(never)]
+    fn land_through_index(&mut self, target: u64, continues: bool) -> bool {
+        self.indexed_place(target, continues).is_some_and(|entry| {
+            self.offset = entry.offset;
+            self.next_seq = entry.seq;
+            true
+        })
+    }
+
+    /// Steps 1 to 8 of [`Reader::land_through_index`]: the entry to land on, its record read and validated. Leaves the
+    /// cursor alone; the read buffer is dropped.
+    fn indexed_place(&mut self, target: u64, continues: bool) -> Option<Entry> {
+        // Step 1.
+        let base = self.seg.base;
+        if target <= base || self.seg.size <= format::SEGMENT_SIZE_UNIT {
+            return None;
+        }
+        if continues && !seek_index::far(target, base, self.next_seq, self.offset) {
+            return None;
+        }
+        // Step 2: with a marker that names a later segment, no writer stores to this one and no recovery changes it.
+        if self.config.durable_only || self.mapped {
+            let marker = crate::inspect::read_checkpoint(&self.dir).ok()??;
+            if marker.segment_base_seq <= base {
+                return None;
+            }
+        }
+        crate::fault::hook(crate::fault::Point::ReaderSeekIndexMarker);
+        // Steps 3 and 4.
+        let dir = IndexDir::open(&self.dir).ok()??;
+        let loaded = lookup::load(&dir, &self.seg.file, base, false).ok()?;
+        let index = loaded.index().ok()?;
+        crate::fault::hook(crate::fault::Point::ReaderSeekIndexLoaded);
+        // Step 5, after the index and the marker were read.
+        self.check_identity().ok()?;
+        // Steps 6 and 7.
+        if !lookup::sealed(&self.seg.file, &index).ok()? {
+            return None;
+        }
+        let entry = index.floor(target)?;
+        if continues && entry.seq <= self.next_seq {
+            return None;
+        }
+        // Step 8.
+        if !lookup::in_place(&self.seg.file, &entry).ok()? {
+            return None;
+        }
+        crate::fault::hook(crate::fault::Point::ReaderSeekIndexLanding);
+        self.buf.clear();
+        let valid = self.holds_record(&entry).unwrap_or(false);
+        // What was read is not kept: every seek leaves the buffer empty, and a mapped reader has no other use for it.
+        self.buf.clear();
+        if self.mapped {
+            self.buf = Vec::new();
+        }
+        valid.then_some(entry)
+    }
+
+    /// Step 8b: whether the slot holds exactly the record `entry` names, as one fresh slot read sees it. Unlike
+    /// [`Reader::read_slot`], whose signature is pinned, it is given the commit word to expect, and allocates and reads
+    /// nothing unless the slot holds it: the buffer is never sized by a word that was not compared.
+    fn holds_record(&mut self, entry: &Entry) -> std::io::Result<bool> {
+        let Entry {
+            seq,
+            offset,
+            len,
+            crc,
+        } = *entry;
+        if !(format::RECORD_HEADER_LEN as u32..=format::MAX_FRAME_LEN).contains(&len)
+            || !format::record_fits(self.seg.size, offset, len)
+        {
+            return Ok(false);
+        }
+        let body_len = u64::from(len) - format::COMMIT_WORD_LEN as u64;
+        if let Some(map) = &self.seg.map {
+            if map.commit_word(offset) != Some(len) || map.load_u32(offset + 4) != Some(crc) {
+                return Ok(false);
+            }
+            let count = (format::align8(u64::from(len)) - 8) / 8;
+            let Some(words) = map.words(offset + 8, count) else {
+                return Ok(false);
+            };
+            // Copied, each word loaded once, rather than decoded in place as the reads after it are: `decode_record_words`
+            // keeps its one caller, so that how the compiler builds the per-record path does not depend on this one.
+            resize_buf(&mut self.buf, 4 + count * 8)?;
+            self.buf[..4].copy_from_slice(&crc.to_le_bytes());
+            for (to, word) in self.buf[4..].chunks_exact_mut(8).zip(words.iter()) {
+                to.copy_from_slice(&word.to_le_bytes());
+            }
+            let body = self.buf.get(..body_len as usize);
+            return Ok(body.is_some_and(|b| format::decode_record_body(len, b, seq).is_ok()));
+        }
+        let mut word = [0; format::COMMIT_WORD_LEN];
+        self.seg.file.read_exact_at(&mut word, offset)?;
+        if u32::from_le_bytes(word) != len {
+            return Ok(false);
+        }
+        fence(Ordering::Acquire);
+        resize_buf(&mut self.buf, body_len)?;
+        self.seg
+            .file
+            .read_exact_at(&mut self.buf, offset + format::COMMIT_WORD_LEN as u64)?;
+        Ok(self.buf.starts_with(&crc.to_le_bytes())
+            && format::decode_record_body(len, &self.buf, seq).is_ok())
     }
 
     /// Whether the file holds, right before the cursor, a valid record with the sequence number before the cursor's
@@ -1651,6 +1792,261 @@ mod tests {
             assert!(matches!(reader.seek_to_end(), Err(Error::Corrupt { .. })));
             assert_eq!(state(&reader), before, "mapped: {mapped}");
             assert_eq!(reader.try_next().unwrap().unwrap().seq, 5);
+        }
+    }
+
+    /// A journal whose only sealed segment, of `size` bytes, has an index with one entry, and the entry.
+    #[cfg(feature = "fault-injection")]
+    fn indexed_journal(size: u64) -> (tempfile::TempDir, crate::seek_index::codec::Entry) {
+        use crate::format;
+        let dir = tempfile::tempdir().unwrap();
+        let path = crate::journal::segment_path(dir.path(), 0);
+        let file = std::fs::File::create_new(&path).unwrap();
+        file.set_len(size).unwrap(); // Sparse.
+        let header = format::encode_segment_header(&format::SegmentHeader {
+            segment_size: size,
+            base_seq: 0,
+            created_unix_ns: 3,
+        });
+        file.write_all_at(&header, 0).unwrap();
+        let (mut at, mut entry) = (format::SEGMENT_HEADER_LEN as u64, None);
+        for seq in 0..1_000 {
+            let mut frame = [0; 104];
+            let len = frame.len() as u32;
+            let fields = crate::format::RecordHeader {
+                seq,
+                schema_id: 0,
+                venue_ts_ns: 0,
+                local_ts_ns: 0,
+            };
+            format::encode_record_body(&fields, &[0x11; 64], &mut frame[4..]);
+            frame[..4].copy_from_slice(&len.to_le_bytes());
+            file.write_all_at(&frame, at).unwrap();
+            if seq == 700 {
+                entry = Some(crate::seek_index::codec::Entry {
+                    seq,
+                    offset: at,
+                    len,
+                    crc: u32::from_le_bytes(frame[4..8].try_into().unwrap()),
+                });
+            }
+            at += u64::from(len);
+        }
+        file.write_all_at(&format::SEAL_MARKER.to_le_bytes(), at)
+            .unwrap();
+        file.write_all_at(&format::seal_crc(1_000).to_le_bytes(), at + 4)
+            .unwrap();
+        let entry = entry.unwrap();
+        let mut encoder = crate::seek_index::codec::Encoder::with_spacing(4_096);
+        encoder.push(entry);
+        let index = encoder.finish(&header, at, 1_000).unwrap();
+        let indexes = dir.path().join(crate::seek_index::DIR_NAME);
+        std::fs::create_dir(&indexes).unwrap();
+        std::fs::write(indexes.join("00000000000000000000.idx"), index).unwrap();
+        // A successor and a marker in it, for mapped and durable-only readers.
+        std::fs::write(
+            crate::journal::segment_path(dir.path(), 1_000),
+            [
+                &format::encode_segment_header(&format::SegmentHeader {
+                    segment_size: 65_536,
+                    base_seq: 1_000,
+                    created_unix_ns: 4,
+                })[..],
+                &[0; 65_536 - 64],
+            ]
+            .concat(),
+        )
+        .unwrap();
+        let slot = format::encode_checkpoint_slot(&format::CheckpointSlot {
+            generation: 1,
+            next_seq: 1_000,
+            segment_base_seq: 1_000,
+            offset: 64,
+        });
+        std::fs::write(dir.path().join("checkpoint"), slot).unwrap();
+        (dir, entry)
+    }
+
+    #[cfg(feature = "fault-injection")]
+    fn open_indexed(dir: &std::path::Path, mapped: bool) -> Reader {
+        let config = ReaderConfig::default().seek_index(true);
+        if mapped {
+            // SAFETY: nothing but this test changes the journal, and it holds no payload.
+            unsafe { Reader::open_mapped(dir, config) }.unwrap()
+        } else {
+            Reader::open(dir, config).unwrap()
+        }
+    }
+
+    /// 8a before 8b (ADR 0045, test plan 4): where an index names bytes inside a payload of another history that decode
+    /// to a length near the segment's size, nothing is allocated or read for a frame; nor where the commit word changes
+    /// to one between 8a and 8b.
+    #[test]
+    #[cfg(feature = "fault-injection")]
+    fn a_length_that_was_not_compared_sizes_no_buffer() {
+        for size in [1 << 20, 4 << 30] {
+            for word in [0xF000_0000_u32, (size - 100_000).min(0xFFFF_FFFE) as u32, 0] {
+                let (dir, entry) = indexed_journal(size);
+                let path = crate::journal::segment_path(dir.path(), 0);
+                let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+                for mapped in [false, true] {
+                    let mut reader = open_indexed(dir.path(), mapped);
+                    reader.seek(900).unwrap();
+                    assert!(reader.used_index, "{size}, mapped {mapped}");
+                    assert_eq!(reader.offset, entry.offset);
+                    assert_eq!(reader.try_next().unwrap().unwrap().seq, 900);
+                    // Found by 8a.
+                    let write = |word: u32| {
+                        file.write_all_at(&word.to_le_bytes(), entry.offset)
+                            .unwrap();
+                    };
+                    write(word);
+                    let mut reader = open_indexed(dir.path(), mapped);
+                    reader.seek(900).unwrap();
+                    assert!(!reader.used_index);
+                    assert_eq!((reader.offset, reader.buf.capacity()), (64, 0));
+                    write(entry.len);
+                    // Another record of the same length: 8a sees its checksum, before the frame is read.
+                    let crc = |crc: u32| {
+                        file.write_all_at(&crc.to_le_bytes(), entry.offset + 4)
+                            .unwrap();
+                    };
+                    crc(entry.crc ^ 1);
+                    let mut reader = open_indexed(dir.path(), mapped);
+                    reader.seek(900).unwrap();
+                    assert!(!reader.used_index);
+                    assert_eq!((reader.offset, reader.buf.capacity()), (64, 0));
+                    crc(entry.crc);
+                    // Changed after 8a.
+                    let mut reader = open_indexed(dir.path(), mapped);
+                    let other = file.try_clone().unwrap();
+                    crate::fault::clear();
+                    crate::fault::run_at(
+                        crate::fault::Point::ReaderSeekIndexLanding,
+                        0,
+                        move || {
+                            other
+                                .write_all_at(&word.to_le_bytes(), entry.offset)
+                                .unwrap();
+                        },
+                    );
+                    reader.seek(900).unwrap();
+                    assert!(!reader.used_index);
+                    assert_eq!((reader.offset, reader.buf.capacity()), (64, 0));
+                    write(entry.len);
+                }
+            }
+        }
+    }
+
+    /// 8b fails where the file ends inside the record by then (no panic, no error, no landing), and where it holds another
+    /// valid record with the same sequence number and length (its stored CRC is not the entry's), or the record with its
+    /// stored CRC damaged.
+    #[test]
+    #[cfg(feature = "fault-injection")]
+    fn eight_b_reads_the_record_that_was_indexed_or_nothing() {
+        let (dir, entry) = indexed_journal(1 << 20);
+        let path = crate::journal::segment_path(dir.path(), 0);
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        let image = std::fs::read(crate::journal::segment_path(dir.path(), 0)).unwrap();
+        let mut other = vec![0; entry.len as usize];
+        let fields = crate::format::RecordHeader {
+            seq: entry.seq,
+            schema_id: 1,
+            venue_ts_ns: 0,
+            local_ts_ns: 0,
+        };
+        crate::format::encode_record_body(&fields, &[0x22; 64], &mut other[4..]);
+        other[..4].copy_from_slice(&entry.len.to_le_bytes());
+        let scan = |reader: &mut Reader| {
+            let mut got = Vec::new();
+            while let Ok(Some(record)) = reader.next_owned() {
+                got.push(record);
+            }
+            got
+        };
+        // A mapped reader must not meet a truncated file.
+        let cases = [0, 2, 4, 50]
+            .map(|cut| (false, Some(entry.offset + cut), 0))
+            .into_iter()
+            .chain(
+                [104, 8]
+                    .into_iter()
+                    .flat_map(|n| [(false, None, n), (true, None, n)]),
+            );
+        for (mapped, cut, len) in cases {
+            let mut reader = open_indexed(dir.path(), mapped);
+            let (at, mut frame) = (file.try_clone().unwrap(), other.clone());
+            frame.truncate(len);
+            crate::fault::clear();
+            crate::fault::run_at(
+                crate::fault::Point::ReaderSeekIndexLanding,
+                0,
+                move || match cut {
+                    Some(len) => at.set_len(len).unwrap(),
+                    None => at.write_all_at(&frame, entry.offset).unwrap(),
+                },
+            );
+            reader.seek(900).unwrap();
+            assert!(!reader.used_index, "mapped {mapped}, cut {cut:?}, {len}");
+            assert_eq!((reader.offset, reader.next_seq), (64, 0));
+            assert!(reader.buf.is_empty());
+            file.set_len(image.len() as u64).unwrap();
+            file.write_all_at(&image, 0).unwrap();
+            let mut plain = open_reader(dir.path(), mapped);
+            plain.seek(900).unwrap();
+            let want = scan(&mut plain);
+            assert_eq!(want.len(), 100);
+            assert_eq!(scan(&mut reader), want);
+        }
+    }
+
+    /// A mapped reader reads nothing into its buffer but the landing record: it does not keep it.
+    #[test]
+    #[cfg(feature = "fault-injection")]
+    fn a_mapped_reader_does_not_keep_the_landing_record() {
+        let (dir, _) = indexed_journal(1 << 20);
+        let mut reader = open_indexed(dir.path(), true);
+        reader.seek(900).unwrap();
+        assert!(reader.used_index);
+        if MAPPED_READS {
+            assert_eq!(reader.buf.capacity(), 0);
+        }
+        assert_eq!(reader.try_next().unwrap().unwrap().seq, 900);
+    }
+
+    /// A seek that lands through an index forgets what an earlier seek knew to be covered, and empties the buffer (step
+    /// 9); one whose index fails sets it as without an index. Neither touches the checkpoint a durable-only reader has
+    /// applied.
+    #[test]
+    #[cfg(feature = "fault-injection")]
+    fn a_landing_leaves_nothing_a_later_seek_trusts() {
+        for mapped in [false, true] {
+            let (dir, _) = indexed_journal(1 << 20);
+            let mut reader = open_indexed(dir.path(), mapped);
+            reader.durable_next_seq = 5;
+            reader.seek(0).unwrap();
+            assert_eq!(reader.seek_covered, 1_000);
+            reader.try_next().unwrap().unwrap();
+            reader.seek(900).unwrap();
+            assert!(!reader.used_index, "too close");
+            reader.seek_covered = 0;
+            reader.seek(900).unwrap();
+            assert!(reader.used_index);
+            assert_eq!(
+                (reader.seek_covered, reader.next_seq, reader.skip_until),
+                (0, 700, 900)
+            );
+            assert!(reader.buf.is_empty());
+            assert_eq!(reader.durable_next_seq, 5);
+            std::fs::remove_dir_all(dir.path().join(crate::seek_index::DIR_NAME)).unwrap();
+            reader.seek(900).unwrap();
+            assert!(!reader.used_index);
+            assert_eq!((reader.seek_covered, reader.offset), (1_000, 64));
         }
     }
 

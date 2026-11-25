@@ -21,7 +21,8 @@ draws conclusions from those two.
   segment, validating each, so larger segments make a seek slower (ADR 0042). A forward seek within the reader's
   segment reads only from the reader's position on, when an earlier seek of that reader found that position covered by
   the checkpoint (ADR 0046), so seeking forward through a checkpointed segment reads it once, not once for each seek. `Reader::seek_to_end` reads at most
-  the newest segment, from the checkpoint on.
+  the newest segment, from the checkpoint on. For seeks into sealed segments, seek indexes make the cost independent of
+  the segment size ("Seek indexes" below); they do nothing for the newest segment.
 - **Segment count.** Opening a reader or a writer and each seek read the whole journal directory; `list_segments`,
   `verify` and each retention run (when retention is configured, at writer open and after checkpoints) open every
   segment's file; replay opens each segment it enters. These costs grow with the number of segments, so very small
@@ -196,12 +197,55 @@ removal.
 Never truncate or edit a segment in place while anything uses the journal: processes that map it can receive
 `SIGBUS`.
 
+## Seek indexes
+
+A seek reads and validates its segment from the first record to the target. With a seek index it starts less than 64 KiB
+of records before the target, in any sealed segment (ADR [0045](decisions/0045-sparse-seek-index.md)). The index files
+are optional and derived; building them and using them are separate decisions.
+
+**Building.** Run `tickertape index` from a timer, as the user that owns the journal:
+
+```sh
+# every few minutes, beside the running writer; segments that already have an index cost a few small reads
+tickertape index /data/journal
+# in an archive, after each `tickertape archive --to`
+tickertape index /data/archive
+tickertape index /data/journal --check     # reads every segment and compares every entry
+tickertape index /data/journal --remove    # deletes them
+```
+
+- It indexes the sealed segments before the checkpoint marker's segment, so a writer that never checkpoints gets none
+  while it runs. Newly sealed segments have none until the next run, and the newest segment never has one: a consumer that
+  restarts near the head gains nothing (`seek_to_end` starts at the marker).
+- The size is 24 bytes per 64 KiB of segment (0.04 %); a build reads each new segment once. Nothing is added to the writer
+  while it runs; its open lists `seek-index/` and removes what recovery could invalidate.
+- The directory `seek-index/` is created with the journal directory's group and mode. If the command refuses to create it
+  (the journal directory belongs to another user, is writable by everyone, or its group is not one of this user's, as for
+  a directory made under `/tmp` on macOS), create it yourself with the journal directory's owner, group and mode.
+- A build that is killed leaves a temporary file. The next open of a writer removes it; in an archive, where no writer
+  opens, `tickertape index --check` reports it and `--remove` clears it (with the indexes: run `index` again).
+- Delete the files whenever you like. Do not delete the directory while a 1.0.0 `export --output` runs: that fails with
+  exit 1 and must be run again. A separate mount at `seek-index/` is not supported.
+- Retention and `archive` remove a segment's index with the segment. `archive --to` does not move it: run `index` there.
+- A 1.0.0 writer that repairs the journal does not remove outdated indexes. Readers check every index by value all the
+  same, and the next `tickertape index` replaces an outdated one.
+
+**Using.** Readers use them only with `ReaderConfig::seek_index(true)` (`--seek-index` in the CLI, and the same option in
+each binding). It is off by default because it gives something up: records between the segment's start and the place the
+seek lands are not read, so damage there no longer stops the reader. Run `tickertape verify` as before to find it. Do not
+enable it where someone who may not write the segments can write `seek-index/` (crash contract C15). A seek never fails
+because of an index: without one, or with one that fails a check, it scans. Mapped and durable-only readers use one only
+before the checkpoint marker's segment, so in an archive, which has no marker, only the safe visible reader does.
+
 ## Moving a tape to another machine
 
 A journal is its `*.tape` files and `checkpoint`; nothing in them depends on the machine they were written on
 (`format.md`). Copy those files. The other entries of the directory (`format.md` → Journal directory) are not needed
 to read or continue the journal: `writer.lock` and `notify` describe a writer on the old machine, and a new writer
-creates its own. `quarantine/`, if present, holds bytes that recovery removed; keep it if they matter to you. The
+creates its own. `quarantine/`, if present, holds bytes that recovery removed; keep it if they matter to you. Seek
+indexes (`seek-index/`) keep working in a copy that preserves owner and mode; readers ignore one that a umask of 0002 made
+group-writable, or that belongs to another user than the segments, without saying so (`tickertape index --check` does).
+Or leave them behind and run `tickertape index` on the copy. The
 commands below
 were run with tickertape 1.0.0 from macOS (aarch64, APFS) to Linux (aarch64, btrfs, a local VM) over SSH, with 1 MiB
 segments; the first recipe's copy, checksum and `verify` steps also in the other direction.
@@ -443,6 +487,77 @@ let _exposure = meter
     })
     .build();
 ```
+
+### How old records are when they are read
+
+From 1.1 (ADR [0047](decisions/0047-latency-histograms.md)). `latency::RecordAge` in the process that reads, or
+`tickertape age` from the command line, measure the **age** of each record when a reader returns it: this machine's wall
+clock at that moment, minus the record's `local_ts_ns`.
+
+```sh
+tickertape age /data/journal --duration 60s            # one report, as text
+tickertape age /data/journal --interval 10s --json     # one JSON object every 10 s, until interrupted
+```
+
+**What age is not.**
+
+- **It is not the writer-to-reader latency.** It starts where the caller took `local_ts_ns`, which can be long before the
+  append (the receive time of a market-data packet is the usual choice), and the time of the commit is not recorded
+  anywhere. The two are equal only if the caller stamps right before `append`.
+- **It is not the delay of your reader, if you use the command.** `tickertape age` measures its own reader, on the CPU it
+  happens to run on and with the wait it was told to use (`--wait`, [`cli.md`](cli.md)). It says whether the writer, the
+  clock and the machine are healthy. Your reader's ages need `RecordAge` around your reader.
+- **It is not how long a replay takes.** Records read before the reader has caught up, or after a seek or discarded
+  history, are counted apart (`before_live`, `after_discontinuity`): their age says when they were recorded. With
+  `RecordAge` that rests on the application's own declaration (`set_live`); a forgotten `set_live(false)` before a seek
+  backwards puts a replay into the histogram. A backlog that builds up while the reader is live does count.
+- **It shows nothing about a record that has not been read**, such as one a stuck reader has not reached. `status` shows
+  that (reader lag, unread age).
+- **It is nothing at all** if records are appended again with their original timestamps, or stamped with something other
+  than nanoseconds since 1970 (uptime nanoseconds give ages of decades, and a `mean_ns` of null). The library can't tell.
+
+**Clocks.** Both times must come from the same clock, or from clocks that agree.
+
+- Two processes on one machine (also in different containers) that both use `CLOCK_REALTIME`
+  (`tickertape::clock::realtime_ns()`) share it. If it is stepped, the result moves by the step: a step forward shows as
+  a false maximum, a step backward as records ahead of the clock. Slew the clock (chrony and ntpd do by default, after
+  their start) rather than step it.
+- **Timestamps ahead of the observer's clock** (`ahead`, in JSON `ahead_of_clock`) have no age and are never counted as 0.
+  **When that count is not 0, the minimum and every percentile are biased upwards**, because the records left out are the
+  fastest ones. A few after a backward step are harmless; a steady share means that the stamping clock runs ahead: a
+  hardware timestamp (NIC, PHC), a clock on TAI (37 s ahead of UTC), or a clock a few microseconds fast.
+- A clock that runs behind by a constant adds that constant to every age, and nothing shows it.
+- On macOS the wall clock advances in steps of 1 µs: shorter ages are 0, and a finer timestamp can look ahead.
+- A tape copied from another machine has no live records unless something appends to it, so nothing counts there.
+
+**Exporting.** A `View` (or `RecordAgeView`) can be kept by a monitoring thread while the reading thread records. It
+copies about 30 KB per snapshot and takes no lock; once a second or slower is the intended use. The histograms only grow:
+subtract the previous snapshot for the values of an interval. Export quantiles and the extremes rather than the mean of a
+short interval: values recorded while a snapshot is taken can be in its sum and not in its count, so the mean of a busy
+recorder's interval can be off either way, even outside the extremes (the longer the interval, the less). With the `prometheus` crate, for example:
+
+```rust
+use prometheus::{Gauge, IntGauge, register_gauge, register_int_gauge};
+
+let p99 = register_gauge!("tickertape_record_age_p99_seconds", "Age of records when read, last interval")?;
+let max = register_gauge!("tickertape_record_age_max_seconds", "Age of records when read, last interval")?;
+let ahead = register_int_gauge!("tickertape_records_ahead_of_clock", "If it grows, the ages are biased upwards")?;
+let view = age.view(); // `age` is the reading thread's RecordAge
+let mut previous = view.snapshot();
+// On each scrape or timer tick, on another thread:
+let now = view.snapshot();
+let interval = now.age.since(&previous.age);
+// An interval without records has no quantiles.
+let seconds = |d: Option<std::time::Duration>| d.map_or(f64::NAN, |d| d.as_secs_f64());
+p99.set(seconds(interval.value_at_quantile(0.99)));
+max.set(seconds(interval.max()));
+ahead.set(now.ahead as i64);
+previous = now;
+```
+
+An application can time anything else with a `latency::Recorder` of its own, for example its `checkpoint()` calls, or an
+event's handling from when it was due (see the module's documentation for why that differs from the call's duration). The
+library records nothing by itself: no histogram of appends, rolls or checkpoints is kept in the writer.
 
 ### Making readers in other processes visible
 

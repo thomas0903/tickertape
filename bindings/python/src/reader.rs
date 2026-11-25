@@ -1061,18 +1061,24 @@ impl Reader {
 #[pymethods]
 impl Reader {
     /// Opens the journal in `path`, positioned at the first record of the oldest segment.
+    ///
+    /// `seek_index=True` (from 1.1) lets `seek` start at a record named by a seek index, one of the files that
+    /// `tickertape index` writes. Records before it are then not read, so damage there goes unnoticed. Not for journals
+    /// where someone who may not write the segments can write `seek-index/` (crash contract C15).
     #[new]
-    #[pyo3(signature = (path, *, durable_only=false, notify=true, backoff=None))]
+    #[pyo3(signature = (path, *, durable_only=false, notify=true, backoff=None, seek_index=false))]
     fn new(
         py: Python<'_>,
         path: PathBuf,
         durable_only: bool,
         notify: bool,
         backoff: Option<PyRef<'_, Backoff>>,
+        seek_index: bool,
     ) -> PyResult<Self> {
         let mut config = ReaderConfig::default()
             .durable_only(durable_only)
-            .notify(notify);
+            .notify(notify)
+            .seek_index(seek_index);
         if let Some(b) = backoff {
             config = config.backoff(b.inner);
         }
@@ -1108,7 +1114,9 @@ impl Reader {
     /// segment may start at the reader's position (from 1.1): records before it are then not validated again, and
     /// after storage damage that also destroyed the checkpoint marker, or set it back to an older one, the position can
     /// be off the current chain unnoticed. A seek to the last record the reader passed, or an earlier one, scans the
-    /// segment, and so does a new reader.
+    /// segment, and so does a new reader. With the seek-index option (`seek_index=True`, from 1.1), the way may start at
+    /// an indexed record before `seq`. Records before it are not read, and crash contract C15 says where the landing
+    /// place can be off the chain.
     fn seek(&self, py: Python<'_>, seq: u64) -> PyResult<()> {
         self.settle(py, || {
             self.check(py)?;

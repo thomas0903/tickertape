@@ -259,6 +259,7 @@ final class Signatures {
         f.put("tickertape_reader_options_new", FunctionDescriptor.of(ADDRESS));
         f.put("tickertape_reader_options_free", FunctionDescriptor.ofVoid(ADDRESS));
         f.put("tickertape_reader_options_set_durable_only", FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT));
+        f.put("tickertape_reader_options_set_seek_index", FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT));
         f.put("tickertape_reader_options_set_notify", FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT));
         f.put("tickertape_reader_options_set_backoff",
                 FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT, JAVA_INT, JAVA_LONG, JAVA_LONG));

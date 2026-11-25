@@ -746,7 +746,7 @@ fn scale_measures_every_operation_on_a_tiny_journal() {
         assert_eq!(measure["journal"]["records"], records);
         assert_eq!(measure["cold_unavailable"], !drop_succeeds);
         let runs = measure["runs"].as_array().unwrap();
-        assert_eq!(runs.len(), 11 * 2);
+        assert_eq!(runs.len(), 14 * 2);
         for run in runs {
             assert_eq!(run["cache_dropped"], drop_succeeds, "{run}");
             assert!(run["wall_s"].as_f64().unwrap() >= 0.0, "{run}");
@@ -760,6 +760,11 @@ fn scale_measures_every_operation_on_a_tiny_journal() {
         assert_eq!(run("seek-first", 0)["skipped_records"], 0);
         assert_eq!(run("seek-last", 1)["seq"], records - 1);
         assert_eq!(run("seek-last", 1)["skipped_records"], capacity / 2 - 1);
+        assert_eq!(run("seek-sealed", 0)["seq"], 2 * capacity - 1);
+        assert_eq!(run("seek-sealed", 0)["used_index"], false);
+        assert_eq!(run("seek-sealed-indexed", 1)["seq"], 2 * capacity - 1);
+        let indexed = run("index-build", 0)["built"] != 0;
+        assert_eq!(run("seek-sealed-indexed", 1)["used_index"], indexed);
         assert_eq!(run("replay", 0)["records"], records);
         assert_eq!(run("verify", 1)["problems"], 0);
         assert_eq!(run("writer-open-clean", 0)["scanned_from_seq"], records);

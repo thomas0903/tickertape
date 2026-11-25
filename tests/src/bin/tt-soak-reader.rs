@@ -68,7 +68,10 @@ fn main() {
     };
     let stop_file = PathBuf::from(&args[6]);
 
-    let config = ReaderConfig::default().durable_only(durable);
+    let indexed = std::env::var(soak::INDEXES).is_ok_and(|v| v == "reader");
+    let config = ReaderConfig::default()
+        .durable_only(durable)
+        .seek_index(indexed);
     let open = || {
         if mapped {
             // SAFETY: in the soak only tickertape writers modify segment files in place; the test injects

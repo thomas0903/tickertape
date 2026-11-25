@@ -57,6 +57,7 @@ mod fault;
 pub mod format;
 pub mod inspect;
 mod journal;
+pub mod latency;
 mod mmap;
 mod notify;
 mod prefault;
@@ -69,6 +70,7 @@ pub mod retention;
 // recovery variant, for the tests of the C ABI and the Python bindings.
 #[doc(hidden)]
 pub mod samples;
+pub mod seek_index;
 pub mod status;
 mod writeback;
 mod writer;

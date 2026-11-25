@@ -113,5 +113,13 @@ name = "allocation"
 path = "allocation.rs"
 
 [[test]]
+name = "record_age"
+path = "record_age.rs"
+
+[[test]]
 name = "seek"
 path = "seek.rs"
+
+[[test]]
+name = "seek_index"
+path = "seek_index.rs"

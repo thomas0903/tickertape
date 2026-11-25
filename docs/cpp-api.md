@@ -302,7 +302,8 @@ while (!stop_requested()) {
 ```
 
 `seek_to_end()` (from 1.1) places the reader at the end of the journal instead, reading at most the newest segment
-(`tickertape_reader_seek_to_end` in [`c-api.md`](c-api.md#reading)).
+(`tickertape_reader_seek_to_end` in [`c-api.md`](c-api.md#reading)). `ReaderOptions::seek_index(true)` (from 1.1) lets
+`seek` start at a record named by a seek index (`tickertape_reader_options_set_seek_index` there has what that gives up).
 
 There are two readers, as in C:
 
@@ -447,6 +448,10 @@ tickertape::WriterMetrics w = writer.metrics().value();  // in the writer's proc
   another file, or newer than the sample). It does not invalidate a `RecordView`.
 - `Writer::metrics()` makes no system call. Like every value type of the binding, these structs gain no members
   within a major version (ADR 0036 → Versioning); later values come as new types or functions.
+
+The latency histograms and record ages of the Rust crate (`tickertape::latency`, from 1.1, ADR
+[0047](decisions/0047-latency-histograms.md)) are not available from C++ yet; `tickertape age` (see [`cli.md`](cli.md))
+reports ages from the command line.
 
 ## Versioning
 

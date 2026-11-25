@@ -1738,6 +1738,24 @@ tickertape_status tickertape_reader_options_set_durable_only(struct tickertape_r
                                                              int32_t enabled);
 
 /**
+ * Sets whether `tickertape_reader_seek` may start at a record named by a seek index, one of the optional files that
+ * `tickertape index` writes next to the journal (ADR 0045, crash contract C15). Non-zero enables it. Default: off.
+ *
+ * A seek into a sealed segment that has an index then validates the record it lands on and every record from there,
+ * instead of every record from the segment's start. Records before that are not read, so damage there no longer stops
+ * the reader. Without an index, or if anything about it is in doubt, the seek does what it does without the option,
+ * and it never fails because of an index. A durable-only reader and a mapped one
+ * (`tickertape_reader_open_mapped_unsafe`) use an index only for a segment before the one the checkpoint marker
+ * names. Do not enable this where someone who may not write the segments can write `seek-index/`: a forged index can
+ * make the reader return bytes from inside a payload that form a valid record. Added in 1.1.
+ *
+ * # Safety
+ *
+ * `options` must be NULL or live reader options, not used by another thread during the call.
+ */
+tickertape_status tickertape_reader_options_set_seek_index(struct tickertape_reader_options *options, int32_t enabled);
+
+/**
  * Sets whether a waiting reader blocks on the writer's wake-up region instead of sleeping, so a new record wakes it
  * at once (ADRs 0017 and 0021). Non-zero enables it. Default: on. Readers fall back to sleeping where the region
  * is unavailable.
@@ -1871,6 +1889,8 @@ tickertape_status tickertape_reader_open(const char *dir,
  * by replacing files), so the precondition holds in normal operation. If it is broken, returned payloads can change
  * under the caller, and if a mapped file is truncated the process receives `SIGBUS` and dies. Use
  * `tickertape_reader_open` when you cannot rule this out (for example, for journals on shared or untrusted storage).
+ * With `tickertape_reader_options_set_seek_index` enabled, the precondition also covers the journal's `seek-index/`
+ * directory and its `checkpoint` file, and an index builder (`tickertape index`) counts as a writer.
  *
  * The pointer rules of `tickertape_reader_open` also apply.
  */
@@ -1900,7 +1920,9 @@ tickertape_status tickertape_reader_close(struct tickertape_reader *reader);
  * the current chain (from 1.1). Records before that position are then not validated again, and if storage damage
  * destroyed the checkpoint marker, or set it back to an older one, together with covered records, the position can be
  * off the current chain unnoticed (`docs/crash-contract.md`, "Readers after a repair"); a seek to the last record the
- * reader passed, or an earlier one, scans the segment, and so does a new reader. Any call invalidates the record view
+ * reader passed, or an earlier one, scans the segment, and so does a new reader. With the seek-index option
+ * (`tickertape_reader_options_set_seek_index`, from 1.1), the way may start at an indexed record before `seq`. Records
+ * before it are not read, and crash contract C15 says where the landing place can be off the chain. Any call invalidates the record view
  * returned by `tickertape_reader_next`. A successful seek also discards a record held back by
  * `tickertape_reader_next_copy` or `tickertape_reader_read_batch`, and an error deferred by
  * `tickertape_reader_read_batch`; a failed seek leaves the reader exactly as it was (same position, held-back

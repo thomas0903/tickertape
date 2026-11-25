@@ -202,6 +202,10 @@ tickertape_status tickertape_reader_options_set_durable_only(struct tickertape_r
     stub_calls++;
     return TICKERTAPE_OK;
 }
+tickertape_status tickertape_reader_options_set_seek_index(struct tickertape_reader_options *, int32_t) {
+    stub_calls++;
+    return TICKERTAPE_OK;
+}
 tickertape_status tickertape_reader_options_set_notify(struct tickertape_reader_options *, int32_t) {
     stub_calls++;
     return TICKERTAPE_OK;
@@ -416,7 +420,7 @@ static void builders_check_the_library_first() {
         writer_options.retention(retention).no_retention();
         writer_options.early_writeback(false).helper_cpus(tt::HelperCpus::inherited).helper_cpus({0, 1});
         tt::ReaderOptions reader_options;
-        reader_options.durable_only(true).notify(false).backoff(1, 1, 1us, 2us).busy_spin();
+        reader_options.durable_only(true).seek_index(true).notify(false).backoff(1, 1, 1us, 2us).busy_spin();
         for (const std::optional<tt::Error> *error : {&retention.error(), &writer_options.error(), &reader_options.error()}) {
             CHECK(error->has_value() && (*error)->status() == tt::Status::unsupported_version);
             CHECK(error->has_value() && (*error)->message().find("stub") != std::string::npos);

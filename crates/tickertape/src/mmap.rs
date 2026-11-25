@@ -93,6 +93,7 @@ fn msync(ptr: NonNull<u8>, map_len: usize, offset: u64, len: u64) -> io::Result<
     if len == 0 {
         return Ok(());
     }
+    crate::fault::note_msync();
     let end = checked_range(map_len, offset, len)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "msync range out of bounds"))?;
     let page = page_size();
@@ -1371,6 +1372,7 @@ pub(crate) fn preallocate(file: &File, len: u64) -> io::Result<()> {
 /// `checkpoint::steps`). The mapping is the file's, not the old one's, so the call writes back the file's dirty pages
 /// in the range whichever mapping dirtied them.
 pub(crate) fn msync_file(file: &File, offset: u64, len: u64) -> io::Result<()> {
+    crate::fault::note_sync(crate::fault::Sync::MsyncFile, file);
     let size = usize::try_from(file.metadata()?.len())
         .map_err(|_| io::Error::other("file too large to map"))?;
     MapRw::new(file, size)?.sync_range(offset, len)
@@ -1379,6 +1381,7 @@ pub(crate) fn msync_file(file: &File, offset: u64, len: u64) -> io::Result<()> {
 /// Flushes a file's data (and the metadata needed to read it) to the device: `fdatasync` on Linux, `fsync`
 /// elsewhere. On macOS this does not flush the drive's cache; see [`full_barrier`].
 pub(crate) fn sync_data(file: &File) -> io::Result<()> {
+    crate::fault::note_sync(crate::fault::Sync::Data, file);
     #[cfg(any(target_os = "linux", target_os = "android"))]
     // SAFETY: fdatasync on a valid descriptor has no memory-safety preconditions.
     let rc = unsafe { libc::fdatasync(file.as_raw_fd()) };
@@ -1394,6 +1397,7 @@ pub(crate) fn sync_data(file: &File) -> io::Result<()> {
 
 /// `fsync` (used for directories, whose entries must be persisted).
 pub(crate) fn sync_all(file: &File) -> io::Result<()> {
+    crate::fault::note_sync(crate::fault::Sync::All, file);
     // SAFETY: fsync on a valid descriptor has no memory-safety preconditions.
     let rc = unsafe { libc::fsync(file.as_raw_fd()) };
     if rc != 0 {
@@ -1407,6 +1411,7 @@ pub(crate) fn sync_all(file: &File) -> io::Result<()> {
 /// cache (failing with `ENOTSUP` where unsupported, which callers report rather than downgrade); elsewhere
 /// [`sync_data`], because Linux's `fdatasync`/`fsync` already flush the device cache.
 pub(crate) fn full_barrier(file: &File) -> io::Result<()> {
+    crate::fault::note_sync(crate::fault::Sync::Barrier, file);
     #[cfg(target_vendor = "apple")]
     {
         // SAFETY: F_FULLFSYNC takes no argument and has no memory-safety preconditions.
@@ -1430,6 +1435,7 @@ pub(crate) fn full_barrier(file: &File) -> io::Result<()> {
 /// this write-back. Linux only.
 #[cfg(target_os = "linux")]
 pub(crate) fn start_writeback(file: &File, offset: u64, len: u64) -> io::Result<()> {
+    crate::fault::note_sync(crate::fault::Sync::Writeback, file);
     let (Ok(offset), Ok(len)) = (
         libc::off64_t::try_from(offset),
         libc::off64_t::try_from(len),
