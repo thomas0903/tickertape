@@ -1895,7 +1895,12 @@ tickertape_status tickertape_reader_close(struct tickertape_reader *reader);
  *
  * If `seq` has not been written yet, the reader waits for it: reads return `TICKERTAPE_NONE` until the writer gets
  * there, and records before `seq` are skipped. Every record on the way is validated (by the reads that follow), so
- * the reader only lands on positions along the journal's current chain. Any call invalidates the record view
+ * the reader only lands on positions along the journal's current chain. The way starts at the segment's first record
+ * or, for a forward seek within the reader's segment, at the reader's position if the reader can tell that it is on
+ * the current chain (from 1.1). Records before that position are then not validated again, and if storage damage
+ * destroyed the checkpoint marker together with covered records, the position can be off the current chain unnoticed
+ * (`docs/crash-contract.md`, "Readers after a repair"); a seek to an earlier position, or a new reader, scans the
+ * segment. Any call invalidates the record view
  * returned by `tickertape_reader_next`. A successful seek also discards a record held back by
  * `tickertape_reader_next_copy` or `tickertape_reader_read_batch`, and an error deferred by
  * `tickertape_reader_read_batch`; a failed seek leaves the reader exactly as it was (same position, held-back
@@ -1931,7 +1936,7 @@ tickertape_status tickertape_reader_seek(struct tickertape_reader *reader, uint6
  *
  * Errors: `TICKERTAPE_E_NOT_FOUND`; `TICKERTAPE_E_CORRUPT`, `TICKERTAPE_E_UNSUPPORTED_VERSION` or `TICKERTAPE_E_IO`
  * while locating it; `TICKERTAPE_E_DISCARDED` if recovery or retention replaced or removed the segment on each of 8
- * attempts in a row.
+ * attempts in a row (its message names where the call was reading, not the reader's position).
  *
  * # Safety
  *
@@ -2012,7 +2017,7 @@ tickertape_status tickertape_reader_next_copy(struct tickertape_reader *reader,
  * Partial failure: an error that happens before any record is read is returned directly. An error after one or
  * more records is **not** returned by this call: it returns `TICKERTAPE_OK` with the records read so far, and the
  * next read call on this reader (`next`, `next_copy` or `read_batch`) returns the error. A successful
- * `tickertape_reader_seek` discards it instead. The reader does not advance past the failing position, so a
+ * `tickertape_reader_seek` or `tickertape_reader_seek_to_end` discards it instead. The reader does not advance past the failing position, so a
  * persistent error (such as corruption) is returned again by the calls after that. No record handed out is ever
  * lost to an error.
  *

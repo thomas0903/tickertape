@@ -301,8 +301,8 @@ public final class Reader implements AutoCloseable {
      * (it is returned first by the next read). Returns 0 if no record arrived in time.
      *
      * <p>An error before the first record is thrown. An error after one or more records is not: this returns the
-     * records read so far, and the next read on this reader throws the error (a successful {@link #seek} discards
-     * it). No record handed out is ever lost to an error.
+     * records read so far, and the next read on this reader throws the error (a successful {@link #seek} or
+     * {@link #seekToEnd} discards it). No record handed out is ever lost to an error.
      *
      * @throws BufferTooSmallException if the first record's payload does not fit in the batch's buffer;
      *     {@link BufferTooSmallException#requiredBytes()} says how large it is, and it stays next
@@ -361,8 +361,12 @@ public final class Reader implements AutoCloseable {
     /**
      * Positions the reader so that the next record returned is {@code seq}. If {@code seq} has not been written yet,
      * reads return nothing until the writer gets there. Every record on the way is validated by the reads that
-     * follow. A successful seek also discards a record held back and an error deferred by {@link #readBatch}; a
-     * failed seek leaves the reader as it was.
+     * follow. The way starts at the segment's first record or, for a forward seek within the reader's segment, at the
+     * reader's position if the reader can tell that it is on the journal's current chain (from 1.1). Records before
+     * that position are then not validated again, and if storage damage destroyed the checkpoint marker together with
+     * covered records, the position can be off the current chain unnoticed; a seek to an earlier position, or a new
+     * reader, scans the segment. A successful seek also discards a record held back and an error deferred by
+     * {@link #readBatch}; a failed seek leaves the reader as it was.
      *
      * @throws SeqUnavailableException if {@code seq} is older than the oldest segment (retention removed it);
      *     seek to the oldest segment's {@link SegmentInfo#baseSeq()} from {@link Journal#listSegments} to continue
@@ -391,10 +395,12 @@ public final class Reader implements AutoCloseable {
      * meanwhile. It cannot be interrupted. A success also discards a record held back and an error deferred by
      * {@link #readBatch}; a failure leaves the reader as it was.
      *
+     * @throws JournalNotFoundException if the journal has no segments
      * @throws CorruptJournalException if a segment header, or a record it reads, is invalid
+     * @throws UnsupportedVersionException if the segment has a format version this library does not read
      * @throws JournalIOException if reading the files fails
      * @throws DiscardedException if recovery or retention replaced or removed the segment on each of 8 attempts in a
-     *     row
+     *     row (its message names where the call was reading, not the reader's position)
      * @since 1.1
      */
     public void seekToEnd() {

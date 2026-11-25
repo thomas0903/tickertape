@@ -1104,7 +1104,10 @@ impl Reader {
 
     /// Positions the reader so that the next record returned is `seq` (which may not be written yet). Also the way
     /// to continue after `DiscardedError`. If it succeeds, it also drops records held for an interrupted read and
-    /// an error held back by a batch call; if it fails, the reader is unchanged.
+    /// an error held back by a batch call; if it fails, the reader is unchanged. A forward seek within the reader's
+    /// segment may start at the reader's position (from 1.1): records before it are then not validated again, and
+    /// after storage damage that also destroyed the checkpoint marker the position can be off the current chain
+    /// unnoticed. A seek to an earlier position, or a new reader, scans the segment.
     fn seek(&self, py: Python<'_>, seq: u64) -> PyResult<()> {
         self.settle(py, || {
             self.check(py)?;
@@ -1127,7 +1130,8 @@ impl Reader {
     /// covered by a checkpoint). Every record committed before the call is behind the reader, every record committed
     /// after it returns is ahead of it. Reads at most the newest segment (from the checkpoint on, if that is in it)
     /// with the GIL released, and can't be interrupted. If it succeeds, it also drops records held for an interrupted
-    /// read and an error held back by a batch call; if it fails, the reader is unchanged.
+    /// read and an error held back by a batch call; if it fails, the reader is unchanged (the `seq` of a
+    /// `DiscardedError` is then where the call was reading). Added in 1.1.
     fn seek_to_end(&self, py: Python<'_>) -> PyResult<()> {
         self.settle(py, || {
             self.check(py)?;

@@ -1939,6 +1939,9 @@ public:
     explicit operator bool() const noexcept { return is_open(); }
 
     // Positions the reader so that the next record returned is `seq` (waiting for it if it is not written yet).
+    // A forward seek within the reader's segment may start at the reader's position (from 1.1): records before it are
+    // then not validated again, and after storage damage that also destroyed the checkpoint marker the position can
+    // be off the current chain unnoticed (see tickertape_reader_seek). A seek to an earlier position scans.
     // A successful seek discards a record held back and an error deferred by next_copy or read_batch; a failed
     // one changes nothing. Errors: Status::seq_unavailable (retention removed it: seek to list_segments()'s first
     // base_seq to continue), not_found, corrupt, io.
