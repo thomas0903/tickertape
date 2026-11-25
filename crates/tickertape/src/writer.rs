@@ -561,7 +561,8 @@ impl Writer {
         // ext4 a synchronous roll costs about 1 ms, and the spare's preallocation sync occasionally stalled the writer
         // for tens of milliseconds (ADR 0023).
         if self.config.prefault
-            && cfg!(target_vendor = "apple")
+            && (cfg!(target_vendor = "apple")
+                || crate::prefault::exp_spare() != crate::prefault::ExpSpare::Off)
             && !self.spare_requested
             && self.offset >= self.active.size / 2
         {
@@ -1086,7 +1087,7 @@ impl Writer {
             None => create_segment(&self.root, next_base, self.config.segment_size, false)?,
         };
         crate::fault::hook(crate::fault::Point::RollAfterLink);
-        self.spare_requested = false;
+        self.spare_requested = self.spare.is_some();
         self.dirty_dirs.insert(self.root.clone());
         // After the link, the roll always completes: seal the old segment, then switch.
         let seal_at = self.offset;
@@ -1131,7 +1132,14 @@ impl Writer {
 impl Writer {
     /// Waits for the spare being prepared, if any, and returns it if it is usable for this journal's segment size.
     fn take_spare(&mut self) -> Option<Spare> {
-        match self.spare.take()?.join() {
+        // EXPERIMENT: never wait; an unfinished spare stays for the next roll.
+        let handle = self.spare.take()?;
+        if !handle.is_finished() {
+            eprintln!("EXP spare not ready at roll");
+            self.spare = Some(handle);
+            return None;
+        }
+        match handle.join() {
             Ok(Ok(spare)) if spare.size == self.config.segment_size => Some(spare),
             Ok(Ok(_)) => {
                 let _ = fs::remove_file(self.root.join(journal::SPARE_FILE));

@@ -20,6 +20,34 @@ pub(crate) const WINDOW: u64 = if cfg!(target_vendor = "apple") {
 } else {
     256 << 10
 };
+/// EXPERIMENT (issue #60, never merged): the window from `TT_EXP_WINDOW_KIB`, else [`WINDOW`].
+pub(crate) fn window() -> u64 {
+    static W: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *W.get_or_init(|| {
+        std::env::var("TT_EXP_WINDOW_KIB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map_or(WINDOW, |k| k << 10)
+    })
+}
+
+/// EXPERIMENT: `TT_EXP_SPARE` = off | sync | nosync.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ExpSpare {
+    Off,
+    Sync,
+    NoSync,
+}
+pub(crate) fn exp_spare() -> ExpSpare {
+    static S: std::sync::OnceLock<ExpSpare> = std::sync::OnceLock::new();
+    *S.get_or_init(|| match std::env::var("TT_EXP_SPARE").as_deref() {
+        Ok("sync") => ExpSpare::Sync,
+        Ok("nosync") => ExpSpare::NoSync,
+        Ok("off") | Err(_) => ExpSpare::Off,
+        Ok(o) => panic!("TT_EXP_SPARE={o}"),
+    })
+}
+
 /// How far the write position moves between wake-ups of the helper.
 const STEP: u64 = if cfg!(target_vendor = "apple") {
     1 << 20
@@ -68,7 +96,7 @@ impl Prefaulter {
                 advice,
                 epoch: 0,
                 start: offset,
-                target: offset.saturating_add(WINDOW),
+                target: offset.saturating_add(window()),
                 stop: false,
             }),
             wake: Condvar::new(),
@@ -96,7 +124,7 @@ impl Prefaulter {
         if offset >= self.next_wake {
             self.next_wake = offset.saturating_add(STEP);
             let mut state = lock(&self.shared);
-            state.target = offset.saturating_add(WINDOW);
+            state.target = offset.saturating_add(window());
             drop(state);
             self.shared.wake.notify_one();
         }
@@ -109,7 +137,7 @@ impl Prefaulter {
         state.advice = advice;
         state.epoch = state.epoch.wrapping_add(1);
         state.start = offset;
-        state.target = offset.saturating_add(WINDOW);
+        state.target = offset.saturating_add(window());
         drop(state);
         self.shared.wake.notify_one();
     }
@@ -233,10 +261,12 @@ fn make_spare(dir: &Path, size: u64) -> io::Result<Spare> {
         let len = usize::try_from(size).map_err(|_| io::Error::other("segment too large"))?;
         crate::fault::inject_background(crate::fault::Point::SparePreallocate)?;
         mmap::preallocate(&file, size)?;
-        mmap::sync_data(&file)?;
+        if exp_spare() != ExpSpare::NoSync {
+            mmap::sync_data(&file)?;
+        }
         crate::fault::inject_background(crate::fault::Point::SpareMap)?;
         let map = MapRw::new(&file, len)?;
-        let _ = map.advice().prefault(0, WINDOW);
+        let _ = map.advice().prefault(0, window());
         Ok(map)
     })();
     match made {
