@@ -62,6 +62,16 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   written in plaintext into encrypted Parquet files), which `cargo deny` started to report. The CLI builds parquet
   without its encryption feature and never wrote such files.
 - Docs: ADR 0045 (accepted, nothing built) designs a sparse, rebuildable seek index next to sealed segments (issue #59).
+- Added (core): the `latency` module (from 1.1, issue #61), the first two steps of the new ADR 0047, which designs
+  opt-in latency histograms in the library and a `tickertape age` command (the third step, histograms in the writer, is
+  not built): `latency::Recorder`, a histogram of durations that one thread records and any thread reads through a `View` without a lock, with exact extremes,
+  quantiles at most 1.6 % above the true value and interval views (`Snapshot::since`); and `latency::RecordAge`, the
+  age of records as a reader returns them, with separate counts for records that are not live, not stamped or stamped
+  ahead of the clock. Nothing is recorded unless the application does it; the writer, the readers, the on-disk format
+  and the bindings are unchanged.
+- Added (CLI): `tickertape age` follows a live journal from its end and reports record ages as text or JSON (from 1.1).
+  By default it polls, so that it never makes the watched writer's appends wake it (`--wait`). `live` in each report
+  tells an idle journal from a reader that is not at the end of the journal yet and measured nothing.
 - Docs: ADR 0048 (accepted, nothing built) settles the zero-copy reader's publication frontier (issue #62). With it, the
   text of the zero-copy reader's known limitation is corrected (`Reader::open_mapped`, `crash-contract.md`,
   `compatibility.md`): the damage can appear whether or not a writer runs, it includes the empty slot at the head, and a

@@ -57,6 +57,7 @@ mod fault;
 pub mod format;
 pub mod inspect;
 mod journal;
+pub mod latency;
 mod mmap;
 mod notify;
 mod prefault;

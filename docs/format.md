@@ -101,7 +101,8 @@ The bytes `[P+4, P+len)` are the record's **body**. The next record or seal star
 **Timestamps** are data, not ordering: unsigned nanoseconds since the Unix epoch (1970-01-01T00:00:00Z) by
 convention, never interpreted by the library. The caller picks the clock; `tickertape::clock::realtime_ns()` reads
 the system wall clock (`CLOCK_REALTIME` semantics: it can jump, and nanosecond units do not imply nanosecond
-accuracy). **Sequence numbers are the only authority on order.**
+accuracy). **Sequence numbers are the only authority on order.** Monitoring (a reader's unread age in `status`,
+`latency::RecordAge`) compares `local_ts_ns` with a clock; no read, order or validity rule depends on it.
 
 A record at `P` in a segment of size `Z`, read while expecting sequence number `S`, is **valid** if and only if:
 

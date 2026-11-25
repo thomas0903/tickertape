@@ -1,5 +1,6 @@
 //! Command-line interface to tickertape journals.
 
+mod age;
 mod archive;
 mod export;
 mod output;
@@ -51,6 +52,9 @@ enum Command {
     /// Report head, checkpoint age, exposure, storage headroom and reader lag; usable as a health check
     #[command(after_help = status::HELP)]
     Status(status::StatusArgs),
+    /// Follow a journal from its end and report how old records are when this command's reader returns them
+    #[command(after_help = age::HELP)]
+    Age(age::AgeArgs),
 }
 
 #[derive(Debug, Args)]
@@ -228,6 +232,7 @@ fn run(cli: Cli) -> Result<()> {
         Command::Export(args) => export::run(args, &mut out)?,
         Command::Stats(args) => stats::run(args, &mut out)?,
         Command::Status(args) => status::run(args, &mut out)?,
+        Command::Age(args) => age::run(args, &mut out)?,
     }
     out.flush().map_err(|e| output::io_error("flush stdout", e))
 }

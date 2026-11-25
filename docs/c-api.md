@@ -487,7 +487,9 @@ The exact system calls are in ADR 0032 → Sampling cost. Nothing is added to ap
   `TICKERTAPE_BEACON_STALE` beacon belongs to a process that died, so its position is history, not lag. The C ABI
   reads beacons; creating one (`tickertape::status::ReaderBeacon`) is available from Rust only.
 - Not in the C ABI yet: the repeated `Sampler` (append rates, time until the volume is full) and the health
-  thresholds of `Status::breaches`. Both can be added without changing these structs.
+  thresholds of `Status::breaches`. Both can be added without changing these structs. Nor are the latency histograms
+  and record ages of `tickertape::latency` (ADR [0047](decisions/0047-latency-histograms.md)), which are available from
+  Rust only.
 
 ## Versioning
 
