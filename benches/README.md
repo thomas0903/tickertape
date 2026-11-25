@@ -214,7 +214,8 @@ benches/scale-session.sh /mnt/ssd/journals ~/tt-scale-out seeks      # one stage
 measures the same journals with it too: `counts` (10 to 20,000 segments of 1 MiB, an archive of 5,000 of them, retention,
 open files), `many` (100,000 segments of 64 KiB), `sizes` (10 segments of 1 MiB to 1 GiB), `seeks` (the seeks
 without and with seek indexes, and the cost of the indexes), `damage` and `big` (64 GiB in 512 segments of 128 MiB:
-operations, catch-up, an archive of 32 GiB). It writes one JSON file per command, `environment.txt` and `progress.txt`.
+operations, catch-up, an archive of 32 GiB), and, only when named, `retention` (both cores in turn, 25 minutes:
+checkpoints and writer opens with each retention limit, removals). It writes one JSON file per command, `environment.txt` and `progress.txt`.
 
 Check first that `cold_unavailable` is `false`, every cold run has `cache_dropped: true`, and `journal.bytes` of the
 big journal exceeds `ram_bytes`. Then read, per operation and segment count or size: `wall_s` and CPU time (how

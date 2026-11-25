@@ -259,9 +259,9 @@ released with seven items open, accepted by the owner as known gaps
     discard committed history held in the 21 measured cases, for records still in a segment when the writer opened. Damage
     that recovery cannot tell from a torn append (C11 (3)) is not among them: it is zeroed without a copy under either
     policy.
-  - Still missing: the limits those runs found are not changed (issue #80): every seek reads the whole directory, every
-    checkpoint with retention opens every segment's header, and `retention::apply` reads the directory before every
-    removal, so a journal of more than a few thousand segments pays for them. The readers stop silently at a zeroed
+  - Still missing: the limits those runs found are not changed (issue #80): every seek reads the whole directory, and so
+    does every checkpoint with retention (once; it no longer opens every segment, and removing a segment no longer reads
+    the directory: ADR 0051). The readers stop silently at a zeroed
     commit word in older history (issue #79).
   - Implemented after 1.0 (issue #59, #72): the sparse, rebuildable seek index per sealed segment of
     [ADR 0045](decisions/0045-sparse-seek-index.md), built by `tickertape index` and used by readers that opt in. Every

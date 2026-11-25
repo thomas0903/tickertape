@@ -96,7 +96,7 @@ is lost that was not to be removed, but the file put there is then in front of a
 ## Consequences
 
 - A checkpoint with a policy costs one listing more than one without, and a few reads; a removal no longer depends on the
-  number of segments. Measured: `benchmarks.md` → "2026-11-26, retention on journals of many segments".
+  number of segments. Measured: `benchmarks.md` → "2026-11-25, retention on journals of many segments".
 - The crash contract's C14 says how "the oldest" and "the next" are established. Its guarantees do not change.
 - Tests: `retention/planning_tests.rs` (the old planner is kept there; any journal, any policy),
   `tests/retention_at_scale.rs` (what is read per checkpoint and per removal, at two sizes; another archiver, a missing

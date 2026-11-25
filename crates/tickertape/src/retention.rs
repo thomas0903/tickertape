@@ -162,7 +162,7 @@ impl Report {
 /// So an invalid header, or a file that cannot be opened, is an error when it belongs to a candidate, to a candidate's
 /// successor, to the marker's segment, or (with `max_age`) to the first segment that is young enough or its successor.
 /// Other segments are not opened, and damage in them does not stop retention (ADR 0051): run
-/// [`inspect::verify`](crate::inspect::verify) to find it.
+/// [`inspect::verify`] to find it.
 ///
 /// # Errors
 ///

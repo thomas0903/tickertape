@@ -325,6 +325,8 @@ Other results, ext4 / xfs:
 
 ## 2026-11-25, replay and recovery at scale: the gaps of 1.0.0 (Google Cloud VMs)
 
+(The costs of retention in this section were changed afterwards by ADR 0051: [below](#2026-11-25-retention-on-journals-of-many-segments-google-cloud-vm-linux-x86-64).)
+
 What the scale run of 2026-11-20 ([below](#replay-and-recovery-at-scale-tt-scale-dd450d1)) left out: the journals of
 10,000 and 20,000 segments (they failed before #38), archived history, missing and corrupt segments, catch-up under a
 live writer, the zero-copy reader, and seeks with the seek index of ADR 0045 (issue #62). **Cloud virtual machines with
@@ -963,6 +965,82 @@ filesystems than ext4 (xfs in particular; APFS and btrfs only for the damage out
 and a seek index on a journal a writer is sealing segments of. Nothing here was measured with #74 to #77; #76 changes
 the zero-copy reader. Damage that recovery zeroes in place (C11 (3)) is not among the damage cases. Power loss is not
 tested (`crash-contract.md`). The costs that grow with the number of segments are issue #80.
+
+## 2026-11-25, retention on journals of many segments (Google Cloud VM, Linux x86-64)
+
+Before and after ADR 0051 (issue #80) on one machine of the type and zone the costs were found on
+([above](#2026-11-25-replay-and-recovery-at-scale-the-gaps-of-100-google-cloud-vms)). **A cloud virtual machine with local
+NVMe SSD, not bare metal.**
+
+- **Machine.** `c3-standard-4-lssd`, us-east4-a: Intel Xeon Platinum 8481C, 4 vCPUs (2 cores), 16.8 GB; Ubuntu 24.04,
+  kernel 7.0.0-1017-gcp, rustc 1.100.0; one local NVMe SSD (375 GB), ext4 formatted with `-E
+  lazy_itable_init=0,lazy_journal_init=0`, mounted `rw,noatime`; `vm.dirty_ratio` 20, `vm.dirty_background_ratio` 10. The
+  result files were written to the same filesystem. 2026-11-25, 21:00 to 21:23 UTC.
+- **Commits.** After: `9a3a6ed` (clean tree; the branch of the pull request that adds this section). Before: the same tree
+  with the core of `main` at `f1ea454` (`git checkout f1ea454 -- crates/tickertape`), so the tool is the same.
+- **Command.** `benches/scale-session.sh /data/j <out> retention` with `TT_SCALE` and `TT_SCALE_BASE` (`benches/README.md`).
+- **How it ran.** One journal per shape (`tt-scale build`, 1,024 B records), both cores in turn on it, five rounds, which of
+  the two goes first alternating; each operation in a process of its own. The cells are the median over the five rounds
+  and, in brackets, the smallest and largest. A checkpoint's value in a round is the p50 of 20 blocking checkpoints
+  (`Writer::checkpoint` alone, after one record; where one segment is removed by count, after the records that fill a
+  segment, so those also sync a segment's data). Every run was checked: no error, and the loops that remove removed
+  exactly one segment per checkpoint. There is no schedule to fall behind, so coordinated omission does not arise. The
+  removals shrink the journals by less than 2,000 segments over a shape's run, the same for both. "Cold" drops the page
+  cache before the process starts, but the process lists the journal before it opens the writer, so the directory itself
+  is cached by then (which is why the open without a policy is shorter than above).
+
+Checkpoints:
+
+| | | 10,000 × 1 MiB | 20,000 × 1 MiB | 100,000 × 64 KiB |
+|---|---|---|---|---|
+| checkpoint, no policy | before | 287 µs (248 µs–336 µs) | 298 µs (289 µs–348 µs) | 184 µs (179 µs–216 µs) |
+|  | after | 291 µs (191 µs–295 µs) | 321 µs (216 µs–399 µs) | 188 µs (183 µs–209 µs) |
+| checkpoint, `max_segments`, nothing to remove | before | 27.7 ms (26.6 ms–29.5 ms) | 64.3 ms (62.9 ms–66.0 ms) | 330 ms (327 ms–334 ms) |
+|  | after | 3.20 ms (3.10 ms–3.34 ms) | 6.36 ms (6.29 ms–6.64 ms) | 31.3 ms (31.3 ms–31.8 ms) |
+| checkpoint, `max_age`, nothing to remove | before | 27.5 ms (27.1 ms–28.4 ms) | 64.3 ms (62.5 ms–66.6 ms) | 329 ms (328 ms–334 ms) |
+|  | after | 3.21 ms (3.10 ms–3.35 ms) | 6.38 ms (6.30 ms–6.67 ms) | 31.4 ms (31.3 ms–31.8 ms) |
+| checkpoint, `max_bytes`, nothing to remove | before | 27.5 ms (26.5 ms–29.5 ms) | 63.9 ms (62.5 ms–67.2 ms) | 330 ms (327 ms–336 ms) |
+|  | after | 3.29 ms (3.18 ms–3.44 ms) | 6.48 ms (6.41 ms–6.75 ms) | 32.2 ms (32.0 ms–32.6 ms) |
+| checkpoint, `max_segments`, removes one | before | 33.8 ms (33.3 ms–36.5 ms) | 75.3 ms (73.7 ms–78.1 ms) | 373 ms (370 ms–375 ms) |
+|  | after | 5.32 ms (5.03 ms–5.48 ms) | 8.51 ms (8.16 ms–8.86 ms) | 32.8 ms (32.3 ms–33.1 ms) |
+| checkpoint, `max_age`, removes one | before | 38.5 ms (36.9 ms–40.8 ms) | 77.7 ms (76.0 ms–79.1 ms) | 372 ms (371 ms–375 ms) |
+|  | after | 4.22 ms (4.16 ms–4.44 ms) | 7.63 ms (7.48 ms–7.82 ms) | 33.4 ms (32.9 ms–33.4 ms) |
+
+`Writer::open`:
+
+| | | 10,000 × 1 MiB | 20,000 × 1 MiB | 100,000 × 64 KiB |
+|---|---|---|---|---|
+| cold, no policy | before | 8.67 ms (8.46 ms–8.85 ms) | 15.8 ms (15.7 ms–16.1 ms) | 72.9 ms (72.5 ms–73.4 ms) |
+|  | after | 8.26 ms (8.19 ms–8.65 ms) | 15.9 ms (15.6 ms–17.1 ms) | 73.0 ms (71.9 ms–73.6 ms) |
+| cold, `max_segments` | before | 1.6 s (1.5 s–1.7 s) | 3.9 s (3.9 s–4.0 s) | 20.3 s (20.1 s–20.9 s) |
+|  | after | 11.5 ms (11.3 ms–11.7 ms) | 22.3 ms (21.8 ms–22.6 ms) | 108 ms (107 ms–109 ms) |
+| cold, `max_age` | before | 1.6 s (1.6 s–1.7 s) | 3.9 s (3.9 s–4.1 s) | 20.1 s (19.9 s–20.8 s) |
+|  | after | 11.7 ms (11.4 ms–12.4 ms) | 22.5 ms (22.0 ms–23.0 ms) | 108 ms (108 ms–109 ms) |
+| cold, `max_bytes` | before | 1.6 s (1.6 s–1.7 s) | 4.0 s (3.9 s–4.1 s) | 20.1 s (20.0 s–20.5 s) |
+|  | after | 52.8 ms (52.3 ms–53.4 ms) | 111 ms (110 ms–113 ms) | 575 ms (574 ms–580 ms) |
+| warm, no policy | before | 6.99 ms (6.80 ms–7.32 ms) | 13.9 ms (13.7 ms–15.1 ms) | 71.5 ms (71.0 ms–73.3 ms) |
+|  | after | 7.11 ms (6.77 ms–7.40 ms) | 14.3 ms (13.9 ms–15.1 ms) | 71.6 ms (71.3 ms–72.0 ms) |
+| warm, `max_segments` | before | 39.5 ms (37.3 ms–40.3 ms) | 80.2 ms (78.2 ms–82.6 ms) | 408 ms (404 ms–411 ms) |
+|  | after | 10.4 ms (9.63 ms–10.6 ms) | 20.7 ms (20.2 ms–21.3 ms) | 106 ms (106 ms–107 ms) |
+| warm, `max_age` | before | 35.5 ms (34.9 ms–37.4 ms) | 79.9 ms (79.4 ms–82.0 ms) | 409 ms (407 ms–412 ms) |
+|  | after | 10.4 ms (9.89 ms–10.7 ms) | 20.9 ms (20.5 ms–21.4 ms) | 107 ms (107 ms–108 ms) |
+| warm, `max_bytes` | before | 35.8 ms (35.0 ms–38.9 ms) | 78.7 ms (78.4 ms–83.5 ms) | 415 ms (405 ms–416 ms) |
+|  | after | 21.2 ms (20.0 ms–22.2 ms) | 43.6 ms (42.7 ms–45.0 ms) | 222 ms (221 ms–223 ms) |
+
+Stand-alone planning and removal (warm; `retention::apply` includes its one listing, spread over 100 removals):
+
+| | | 10,000 × 1 MiB | 20,000 × 1 MiB | 100,000 × 64 KiB |
+|---|---|---|---|---|
+| `retention::plan`, nothing to remove | before | 31.4 ms (30.0 ms–32.6 ms) | 65.6 ms (63.8 ms–66.6 ms) | 319 ms (317 ms–322 ms) |
+|  | after | 3.32 ms (3.15 ms–3.40 ms) | 6.56 ms (6.39 ms–7.20 ms) | 33.0 ms (33.0 ms–33.1 ms) |
+| `retention::plan` of 100 removals | before | 30.1 ms (29.5 ms–32.7 ms) | 77.2 ms (75.8 ms–79.4 ms) | 322 ms (319 ms–323 ms) |
+|  | after | 3.72 ms (3.62 ms–3.94 ms) | 20.3 ms (19.5 ms–21.7 ms) | 36.4 ms (36.0 ms–37.3 ms) |
+| `retention::apply`, per segment (100 deleted) | before | 4.02 ms (3.91 ms–4.18 ms) | 7.87 ms (7.76 ms–8.14 ms) | 40.9 ms (40.7 ms–41.3 ms) |
+|  | after | 367 µs (351 µs–406 µs) | 371 µs (366 µs–377 µs) | 590 µs (578 µs–638 µs) |
+
+What remains is one directory listing per retention run, which grows with the number of segments (about 0.3 µs each): 3,
+6 and 31 ms here against 0.3 ms without a policy. With `max_bytes` an open and a stand-alone plan also ask for every
+file's size. Not measured: aarch64, xfs, background checkpoints, moves.
 
 ## 2026-11-19 to 2026-11-22, sustained workloads on Google Cloud VMs (Linux, x86-64 and aarch64)
 
