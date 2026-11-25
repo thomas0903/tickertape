@@ -56,9 +56,9 @@ recorded: the caller already has the error. Nothing is subtracted for the cost o
 blocked readers (a system call when one waits), the hand-off to the helper threads, page faults and the roll if there
 is one. It does not include building the record before the call, or the histogram's own update. A `fill` that declines
 or panics is not recorded, although its clean-up syncs and is slow. Cost: two monotonic clock reads and one histogram
-update per call. Parts of both reads fall inside the interval, together roughly one read, so an empty
-call would not show 0; the documentation must give that floor per platform. On Apple silicon the clock ticks every 41.7 ns, so short appends show
-as 0, 41 or 83 ns there.
+update per call. Parts of both reads fall inside the interval, together roughly one read, so an empty call would not
+show 0; the documentation must give that floor per platform. On Apple silicon the clock ticks every 41.7 ns, so short
+appends show as 0, 41 or 83 ns there.
 
 It is a **service time, not a response time**. If one append stalls for 5 ms, the events queued behind it are late too,
 but the histogram has one 5 ms sample, not a queue's worth (coordinated omission). The library cannot know when an
@@ -83,11 +83,11 @@ market-data packet is the usual choice). It equals writer-to-reader latency only
 - `local_ts_ns == 0`: counted as `unset`, not in the histogram.
 - `local_ts_ns` later than the observer's clock (a clock step, another machine's clock, another convention): counted
   as `ahead`, not in the histogram. It is never recorded as 0.
-- **Not live: counted as `not_live`, not in the histogram** (checked first). A replayed record's age says when it was recorded, not how
-  fast anything is. The counter starts not live, and the caller declares it live once its reader has caught up (or has
-  been placed at the end) and not live again after a `seek` or `Error::Discarded`. While live, every record counts,
-  including a backlog that builds up later: a slow consumer's lateness is the thing to measure, so it is not dropped
-  because the reader is behind.
+- **Not live: counted as `not_live`, not in the histogram** (checked first). A replayed record's age says when it was
+  recorded, not how fast anything is. The counter starts not live, and the caller declares it live once its reader has
+  caught up (or has been placed at the end) and not live again after a `seek` or `Error::Discarded`. While live, every
+  record counts, including a backlog that builds up later: a slow consumer's lateness is the thing to measure, so it
+  is not dropped because the reader is behind.
 
 What other clocks do to it: two processes on one machine (also in different containers) read the same
 `CLOCK_REALTIME`, so the result is as good as that clock, and an NTP or manual step moves it by the step: forward shows
@@ -196,8 +196,8 @@ has made a record (a writer that is idle holds the monitor up) and the recording
 channel; that also adds `crossbeam-channel`. Its type would either become part of the stable API or be wrapped
 completely; recording returns a `Result`; at three significant digits it takes 221 KB for 1 ns to 60 s, and the core
 crate has four dependencies today. **Moving the bench tools' code** is not possible, as it is that crate. The bench
-tools stay on it, with three significant digits, so that published results remain comparable. **Locked atomic updates everywhere** cost about 3 to 5 ns more per append for
-nothing, since there is one writer.
+tools stay on it, with three significant digits, so that published results remain comparable. **Locked atomic
+updates everywhere** cost about 3 to 5 ns more per append for nothing, since there is one writer.
 
 ## Public surface
 
