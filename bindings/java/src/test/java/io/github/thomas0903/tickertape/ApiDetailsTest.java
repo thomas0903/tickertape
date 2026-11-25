@@ -87,6 +87,9 @@ class ApiDetailsTest {
         assertTrue(!WriterOptions.defaults().prefault(false).isPrefaultEnabled());
         assertTrue(!ReaderOptions.defaults().notify(false).isNotifyEnabled());
         assertTrue(ReaderOptions.defaults().durableOnly(true).isDurableOnly());
+        assertTrue(!ReaderOptions.defaults().isSeekIndexEnabled());
+        assertTrue(ReaderOptions.defaults().seekIndex(true).durableOnly(true).isSeekIndexEnabled());
+        assertTrue(!ReaderOptions.defaults().equals(ReaderOptions.defaults().seekIndex(true)));
     }
 
     @Test

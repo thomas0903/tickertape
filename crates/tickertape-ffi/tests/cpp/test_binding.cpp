@@ -492,7 +492,7 @@ static void surface(const std::string &root) {
     // Durable-only, on the mapped reader: stops at the checkpoint.
     {
         tt::ReaderOptions durable;
-        durable.durable_only(true).notify(false).backoff(10, 2, 1us, 100us);
+        durable.durable_only(true).seek_index(true).notify(false).backoff(10, 2, 1us, 100us);
         tt::Reader mapped = MUST(tt::Reader::open_mapped_unsafe(dir, durable));
         MUST(mapped.seek(15));
         std::uint64_t last = 0;

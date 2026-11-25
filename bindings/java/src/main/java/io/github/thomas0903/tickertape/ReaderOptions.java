@@ -14,9 +14,10 @@ import java.util.Objects;
 public final class ReaderOptions {
     static final long DEFAULT_WAIT_SLICE_NS = 10_000_000L;
     private static final ReaderOptions DEFAULTS =
-            new ReaderOptions(false, true, false, 100, 10, 10_000, 1_000_000, DEFAULT_WAIT_SLICE_NS);
+            new ReaderOptions(false, false, true, false, 100, 10, 10_000, 1_000_000, DEFAULT_WAIT_SLICE_NS);
 
     private final boolean durableOnly;
+    private final boolean seekIndex;
     private final boolean notify;
     private final boolean busySpin;
     private final int spins;
@@ -25,9 +26,10 @@ public final class ReaderOptions {
     private final long maxSleepNs;
     private final long waitSliceNs;
 
-    private ReaderOptions(boolean durableOnly, boolean notify, boolean busySpin, int spins, int yields, long minSleepNs,
-            long maxSleepNs, long waitSliceNs) {
+    private ReaderOptions(boolean durableOnly, boolean seekIndex, boolean notify, boolean busySpin, int spins,
+            int yields, long minSleepNs, long maxSleepNs, long waitSliceNs) {
         this.durableOnly = durableOnly;
+        this.seekIndex = seekIndex;
         this.notify = notify;
         this.busySpin = busySpin;
         this.spins = spins;
@@ -52,12 +54,28 @@ public final class ReaderOptions {
      * valid checkpoint marker.
      */
     public ReaderOptions durableOnly(boolean enabled) {
-        return new ReaderOptions(enabled, notify, busySpin, spins, yields, minSleepNs, maxSleepNs, waitSliceNs);
+        return new ReaderOptions(enabled, seekIndex, notify, busySpin, spins, yields, minSleepNs, maxSleepNs,
+                waitSliceNs);
+    }
+
+    /**
+     * Whether {@link Reader#seek(long)} may start at a record named by a seek index, one of the optional files that
+     * {@code tickertape index} writes next to the journal (ADR 0045, crash contract C15). Off by default. Records before
+     * that one are then not read, so damage there goes unnoticed; without an index the seek is unchanged, and it never
+     * fails because of one. Do not enable this where someone who may not write the segments can write
+     * {@code seek-index/}.
+     *
+     * @since 1.1
+     */
+    public ReaderOptions seekIndex(boolean enabled) {
+        return new ReaderOptions(durableOnly, enabled, notify, busySpin, spins, yields, minSleepNs, maxSleepNs,
+                waitSliceNs);
     }
 
     /** Whether a waiting reader blocks on the writer's wake-up region, so a new record wakes it at once. */
     public ReaderOptions notify(boolean enabled) {
-        return new ReaderOptions(durableOnly, enabled, busySpin, spins, yields, minSleepNs, maxSleepNs, waitSliceNs);
+        return new ReaderOptions(durableOnly, seekIndex, enabled, busySpin, spins, yields, minSleepNs, maxSleepNs,
+                waitSliceNs);
     }
 
     /**
@@ -73,12 +91,13 @@ public final class ReaderOptions {
         if (min > max) {
             throw new IllegalArgumentException("minSleep must not exceed maxSleep");
         }
-        return new ReaderOptions(durableOnly, notify, false, spins, yields, min, max, waitSliceNs);
+        return new ReaderOptions(durableOnly, seekIndex, notify, false, spins, yields, min, max, waitSliceNs);
     }
 
     /** Makes a waiting reader spin without ever yielding or sleeping: lowest latency, one core kept busy. */
     public ReaderOptions busySpin() {
-        return new ReaderOptions(durableOnly, notify, true, spins, yields, minSleepNs, maxSleepNs, waitSliceNs);
+        return new ReaderOptions(durableOnly, seekIndex, notify, true, spins, yields, minSleepNs, maxSleepNs,
+                waitSliceNs);
     }
 
     /**
@@ -92,12 +111,21 @@ public final class ReaderOptions {
         if (ns == 0) {
             throw new IllegalArgumentException("the wait slice must be positive");
         }
-        return new ReaderOptions(durableOnly, notify, busySpin, spins, yields, minSleepNs, maxSleepNs, ns);
+        return new ReaderOptions(durableOnly, seekIndex, notify, busySpin, spins, yields, minSleepNs, maxSleepNs, ns);
     }
 
     /** Whether the reader returns only durable records (see {@link #durableOnly(boolean)}). */
     public boolean isDurableOnly() {
         return durableOnly;
+    }
+
+    /**
+     * Whether seeks may use a seek index (see {@link #seekIndex(boolean)}).
+     *
+     * @since 1.1
+     */
+    public boolean isSeekIndexEnabled() {
+        return seekIndex;
     }
 
     /** Whether a waiting reader blocks on the writer's wake-up region (see {@link #notify(boolean)}). */
@@ -131,6 +159,7 @@ public final class ReaderOptions {
         MemorySegment o = Native.readerOptionsNew();
         try {
             Errors.check(Native.readerOptionsSetDurableOnly(o, durableOnly ? 1 : 0));
+            Errors.check(Native.readerOptionsSetSeekIndex(o, seekIndex ? 1 : 0));
             Errors.check(Native.readerOptionsSetNotify(o, notify ? 1 : 0));
             if (busySpin) {
                 Errors.check(Native.readerOptionsSetBusySpin(o));
@@ -146,19 +175,19 @@ public final class ReaderOptions {
 
     @Override
     public boolean equals(Object o) {
-        return o instanceof ReaderOptions r && durableOnly == r.durableOnly && notify == r.notify
+        return o instanceof ReaderOptions r && durableOnly == r.durableOnly && seekIndex == r.seekIndex && notify == r.notify
                 && busySpin == r.busySpin && spins == r.spins && yields == r.yields && minSleepNs == r.minSleepNs
                 && maxSleepNs == r.maxSleepNs && waitSliceNs == r.waitSliceNs;
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(durableOnly, notify, busySpin, spins, yields, minSleepNs, maxSleepNs, waitSliceNs);
+        return Objects.hash(durableOnly, seekIndex, notify, busySpin, spins, yields, minSleepNs, maxSleepNs, waitSliceNs);
     }
 
     @Override
     public String toString() {
-        return "ReaderOptions[durableOnly=" + durableOnly + ", notify=" + notify
+        return "ReaderOptions[durableOnly=" + durableOnly + ", seekIndex=" + seekIndex + ", notify=" + notify
                 + (busySpin ? ", busySpin" : ", backoff=" + spins + "/" + yields + "/" + minSleepNs + "ns/" + maxSleepNs + "ns")
                 + ", waitSlice=" + Duration.ofNanos(waitSliceNs) + "]";
     }

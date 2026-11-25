@@ -1010,6 +1010,12 @@ public:
     ReaderOptions &durable_only(bool enabled) {
         return usable() ? record(tickertape_reader_options_set_durable_only(h_, enabled ? 1 : 0)) : *this;
     }
+    // Let Reader::seek start at a record named by a seek index, if there is one (default off). Records before it are
+    // then not read, so damage there goes unnoticed; not for journals where someone who may not write the segments can
+    // write seek-index/ (crash contract C15, tickertape_reader_options_set_seek_index). Added in 1.1.
+    ReaderOptions &seek_index(bool enabled) {
+        return usable() ? record(tickertape_reader_options_set_seek_index(h_, enabled ? 1 : 0)) : *this;
+    }
     // Block on the writer's wake-up region instead of sleeping (default on).
     ReaderOptions &notify(bool enabled) {
         return usable() ? record(tickertape_reader_options_set_notify(h_, enabled ? 1 : 0)) : *this;
