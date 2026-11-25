@@ -5,7 +5,7 @@ use std::fmt::Write as _;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, SyncSender, TrySendError};
+use std::sync::mpsc::{self, RecvTimeoutError, SyncSender, TrySendError};
 use std::time::{Duration, Instant};
 
 use clap::{Args, ValueEnum};
@@ -13,7 +13,7 @@ use serde::Serialize;
 use tickertape::latency::{RecordAge, RecordAgeSnapshot, Snapshot};
 use tickertape::{Backoff, Error, Reader, ReaderConfig};
 
-use crate::{Result, output, status, tail};
+use crate::{Failure, Result, output, status, tail};
 
 /// Version of the JSON object; bumped when a field is removed or changes meaning (adding fields doesn't bump it).
 const SCHEMA_VERSION: u32 = 1;
@@ -22,13 +22,13 @@ const DEFAULT_INTERVAL: Duration = Duration::from_secs(10);
 /// Reports that may wait for a slow standard output before interval reports are skipped.
 const PENDING_REPORTS: usize = 4;
 
-pub(crate) const HELP: &str = "Follows the journal from its end with the safe reader and reports record ages: this machine's wall clock when the command's reader returned a record, minus the record's local_ts_ns, which whoever appended it supplied. It prints no records. It measures THIS COMMAND'S READER on the CPU it happens to run on, not your application's reader: it says whether the writer, the clock and the machine are healthy. An application measures its own reader with tickertape::latency::RecordAge. Age is not the writer-to-reader latency, unless the writer stamps local_ts_ns right before it appends.\n\nRecords count from the first time the reader has nothing more to read (live), and not after discarded history until it has caught up again. A report with live false and 0 records measured nothing: the startup scan outlasted --duration, or the reader never caught up with the writer. Records without a local_ts_ns, or with one later than this machine's clock, are counted apart; if any were ahead of the clock, the minimum and the percentiles are biased upwards.\n\n--wait poll (default) and spin make no system call in the writer's appends: they never register as a waiter. poll sleeps 10 us, doubling to 1 ms while idle, and those sleeps are in the ages; spin has no such floor and uses one core. block waits in the kernel on the writer's wake-up region: an append that finds it waiting makes a wake-up system call before it returns.\n\nEnds after --duration or after --count records counted while live, whichever comes first, with a final report; --interval prints reports before that. With none of the three it reports every 10s until interrupted; an interrupt ends it without a final report.\n\nJSON schema (schema_version 1; fields may be added; one object per report and line): {\"schema_version\":1,\"journal\":string,\"sampled_unix_ns\":u64,\"elapsed_s\":number,\"final\":bool,\"live\":bool,\"durable_only\":bool,\"wait\":\"poll\"|\"spin\"|\"block\",\"records\":u64,\"first_seq\":u64|null,\"last_seq\":u64|null,\"before_live\":u64,\"after_discontinuity\":u64,\"unset_timestamp\":u64,\"ahead_of_clock\":u64,\"discontinuities\":u64,\"age\":HIST,\"interval_age\":HIST|null} with HIST = {\"count\":u64,\"min_ns\":u64|null,\"mean_ns\":number|null,\"p50_ns\":u64|null,\"p90_ns\":u64|null,\"p99_ns\":u64|null,\"p99_9_ns\":u64|null,\"p99_99_ns\":u64|null,\"max_ns\":u64|null}; see docs/cli.md.\n\nExit codes: 0 success; 1 usage, I/O or missing journal; 2 corruption or unsupported journal format (an error while following comes after the report of what was measured).";
+pub(crate) const HELP: &str = "Follows the journal from its end with the safe reader and reports record ages: this machine's wall clock when the command's reader returned a record, minus the record's local_ts_ns, which whoever appended it supplied. It prints no records. It measures THIS COMMAND'S READER on the CPU it happens to run on, not your application's reader: it says whether the writer, the clock and the machine are healthy. An application measures its own reader with tickertape::latency::RecordAge. Age is not the writer-to-reader latency, unless the writer stamps local_ts_ns right before it appends.\n\nIt starts at the end of the journal, as tail --from-end (Reader::seek_to_end: reads the newest segment from the checkpoint on), and every record from there on counts (live), except after discarded history, until it has caught up again. A report with live false and records 0 measured nothing: the reader was not at the end of the journal yet. Records without a local_ts_ns, or with one later than this machine's clock, are counted apart; if any were ahead of the clock, the minimum and the percentiles are biased upwards.\n\n--wait poll (default) and spin make no system call in the writer's appends: they never register as a waiter. poll sleeps 10 us, doubling to 1 ms while idle, and those sleeps are in the ages; spin has no such floor and uses one core. block waits in the kernel on the writer's wake-up region: an append that finds it waiting makes a wake-up system call before it returns.\n\nEnds --duration after its start or after --count records returned while live, whichever comes first, with a final report; --interval prints reports before that. With none of the three it reports every 10s until interrupted; an interrupt ends it without a final report.\n\nJSON schema (schema_version 1; fields may be added; one object per report and line): {\"schema_version\":1,\"journal\":string,\"sampled_unix_ns\":u64,\"elapsed_s\":number,\"final\":bool,\"live\":bool,\"durable_only\":bool,\"wait\":\"poll\"|\"spin\"|\"block\",\"records\":u64,\"first_seq\":u64|null,\"last_seq\":u64|null,\"before_live\":u64,\"after_discontinuity\":u64,\"unset_timestamp\":u64,\"ahead_of_clock\":u64,\"discontinuities\":u64,\"age\":HIST,\"interval_age\":HIST|null} with HIST = {\"count\":u64,\"min_ns\":u64|null,\"mean_ns\":number|null,\"p50_ns\":u64|null,\"p90_ns\":u64|null,\"p99_ns\":u64|null,\"p99_9_ns\":u64|null,\"p99_99_ns\":u64|null,\"max_ns\":u64|null}; see docs/cli.md.\n\nExit codes: 0 success; 1 usage, I/O or missing journal; 2 corruption or unsupported journal format (an error while following comes after the report of what was measured; a journal that can't be opened, or whose end can't be reached, gets no final report).";
 
 #[derive(Debug, Args)]
 pub(crate) struct AgeArgs {
     /// Journal directory (opened read-only; no writer lock)
     dir: PathBuf,
-    /// Stop after DUR (integer followed by ms, s, m or h), from the command's start
+    /// Stop DUR after the command's start (integer followed by ms, s, m or h)
     #[arg(long, value_name = "DUR", value_parser = parse_dur)]
     duration: Option<Duration>,
     /// Stop after N records returned while live
@@ -88,6 +88,22 @@ struct Report {
     ages: RecordAgeSnapshot,
 }
 
+impl Report {
+    /// While the reader is not at the end of the journal yet.
+    fn nothing(start: Instant, last: bool) -> Report {
+        Report {
+            sampled_unix_ns: tickertape::clock::realtime_ns(),
+            elapsed: start.elapsed(),
+            last,
+            live: false,
+            records: 0,
+            seqs: None,
+            discontinuities: 0,
+            ages: RecordAge::new().view().snapshot(),
+        }
+    }
+}
+
 pub(crate) fn run(args: AgeArgs, out: &mut dyn Write) -> Result<()> {
     let start = Instant::now();
     let interval = match (args.interval, args.duration, args.count) {
@@ -108,6 +124,22 @@ pub(crate) fn run(args: AgeArgs, out: &mut dyn Write) -> Result<()> {
         interval: interval.is_some(),
         previous: None,
     };
+    let deadline = args.duration.and_then(|d| start.checked_add(d));
+    let mut next_report = interval.and_then(|i| start.checked_add(i));
+    let placed = place(
+        move || {
+            let mut reader = reader;
+            reader.seek_to_end()?;
+            Ok(reader)
+        },
+        deadline,
+        &mut next_report,
+        interval,
+        |last| printer.print(&Report::nothing(start, last), out),
+    )?;
+    let Some(reader) = placed else {
+        return Ok(()); // `--duration` passed first.
+    };
     // Reports are formatted and written here, and the reader runs on its own thread: the time a report takes (a slow
     // terminal, a full pipe) must not be in the ages. If a report can't be written, this function returns at once and
     // the process ends, with the reader wherever it is.
@@ -120,8 +152,9 @@ pub(crate) fn run(args: AgeArgs, out: &mut dyn Write) -> Result<()> {
         seqs: None,
         discontinuities: 0,
         start,
-        deadline: args.duration.and_then(|d| start.checked_add(d)),
+        deadline,
         count: args.count,
+        next_report,
         interval,
         reports: sender,
     };
@@ -134,7 +167,61 @@ pub(crate) fn run(args: AgeArgs, out: &mut dyn Write) -> Result<()> {
     }
     reading
         .join()
-        .unwrap_or_else(|_| Err(crate::Failure::usage("the reading thread panicked")))
+        .unwrap_or_else(|_| Err(Failure::usage("the reading thread panicked")))
+}
+
+/// Runs `seek` (which places the reader at the end of the journal) on a thread of its own, and calls `report` (with
+/// whether it is the last) for the interval reports that fall due meanwhile, and at `deadline`.
+///
+/// `Ok(None)` if the deadline passed first: after the last report, with the thread still seeking. A seek can't be given a
+/// deadline, and against a writer that commits as fast as the reader validates, it lasts for as long as the writer does;
+/// `--duration` must end the command all the same. It usually takes milliseconds.
+fn place<T: Send + 'static>(
+    seek: impl FnOnce() -> Result<T> + Send + 'static,
+    deadline: Option<Instant>,
+    next_report: &mut Option<Instant>,
+    interval: Option<Duration>,
+    mut report: impl FnMut(bool) -> Result<()>,
+) -> Result<Option<T>> {
+    let (sender, placed) = mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("age-seek".into())
+        .spawn(move || {
+            // The receiver is gone if the deadline passed or a report could not be written.
+            let _ = sender.send(seek());
+        })
+        .map_err(|e| output::io_error("start the seeking thread", e))?;
+    loop {
+        let until = [deadline, *next_report].into_iter().flatten().min();
+        let received = match until {
+            None => placed.recv().map_err(|_| RecvTimeoutError::Disconnected),
+            Some(t) => placed.recv_timeout(t.saturating_duration_since(Instant::now())),
+        };
+        match received {
+            Ok(result) => return result.map(Some),
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(Failure::usage("the seeking thread panicked"));
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+        let now = Instant::now();
+        if deadline.is_some_and(|d| now >= d) {
+            report(true)?;
+            return Ok(None);
+        }
+        if next_report.is_some_and(|due| now >= due) {
+            report(false)?;
+            *next_report = following(*next_report, interval, Instant::now());
+        }
+    }
+}
+
+/// When the report after the one that was due at `due` is due: keeps the phase, unless a whole interval was missed.
+fn following(due: Option<Instant>, interval: Option<Duration>, now: Instant) -> Option<Instant> {
+    let interval = interval?;
+    due.and_then(|due| due.checked_add(interval))
+        .filter(|next| *next > now)
+        .or_else(|| now.checked_add(interval))
 }
 
 /// What has been read since the clock was.
@@ -166,13 +253,16 @@ struct Follower {
     start: Instant,
     deadline: Option<Instant>,
     count: Option<u64>,
+    next_report: Option<Instant>,
     interval: Option<Duration>,
     reports: SyncSender<Report>,
 }
 
 impl Follower {
-    /// Ends with a last report, also after an error (which follows it).
+    /// From a reader at the end of the journal, so live from the first record on. Ends with a last report, also after
+    /// an error (which follows it).
     fn run(mut self) -> Result<()> {
+        self.set_live(true);
         let result = self.follow();
         // Waits for room, unlike an interval report. The receiver is gone only if a report could not be written, which
         // is what the command then fails with.
@@ -181,12 +271,11 @@ impl Follower {
     }
 
     fn follow(&mut self) -> Result<()> {
-        let mut next_report = self.interval.and_then(|i| self.start.checked_add(i));
         // Whether the last read found nothing, so that the next one waits.
         let mut wait = false;
         let mut unchecked = Unchecked::default();
-        // The clock is read before every wait, and otherwise only now and then: neither a scan of what is in the journal
-        // nor a backlog should pay for a clock read per record.
+        // The clock is read before every wait, and otherwise only now and then: neither a backlog nor the
+        // history read after a discontinuity should pay for a clock read per record.
         let mut check_clock = true;
         loop {
             if self.count.is_some_and(|n| self.records >= n) {
@@ -198,22 +287,19 @@ impl Follower {
                 if self.deadline.is_some_and(|d| now >= d) {
                     return Ok(());
                 }
-                if let (Some(due), Some(interval)) = (next_report, self.interval) {
-                    if now >= due {
-                        match self.reports.try_send(self.report(false)) {
-                            // Full: standard output is behind. Reports are cumulative, and the next one's interval
-                            // starts at the last report that was printed, so nothing is lost by skipping this one.
-                            Ok(()) | Err(TrySendError::Full(_)) => {}
-                            Err(TrySendError::Disconnected(_)) => return Ok(()),
-                        }
-                        // Keeps the phase, unless a whole interval has been missed.
-                        next_report = due
-                            .checked_add(interval)
-                            .filter(|next| *next > now)
-                            .or_else(|| now.checked_add(interval));
+                if self.next_report.is_some_and(|due| now >= due) {
+                    match self.reports.try_send(self.report(false)) {
+                        // Full: standard output is behind. Reports are cumulative, and the next one's interval starts at
+                        // the last report that was printed, so nothing is lost by skipping this one.
+                        Ok(()) | Err(TrySendError::Full(_)) => {}
+                        Err(TrySendError::Disconnected(_)) => return Ok(()),
                     }
+                    self.next_report = following(self.next_report, self.interval, now);
                 }
-                let until = [self.deadline, next_report].into_iter().flatten().min();
+                let until = [self.deadline, self.next_report]
+                    .into_iter()
+                    .flatten()
+                    .min();
                 timeout = until.map(|t| t.saturating_duration_since(now));
                 unchecked = Unchecked::default();
                 check_clock = false;
@@ -421,8 +507,7 @@ fn render_text(text: &mut String, r: &JsonReport) {
             text,
             "note        {}",
             if r.records == 0 {
-                "not live yet: nothing measured (the records found at the start, or after a discontinuity, are not all \
-                 read)"
+                "not live yet: nothing measured"
             } else {
                 "not live: the records found after a discontinuity are not all read, and are not measured"
             }
@@ -546,26 +631,106 @@ mod tests {
         dir
     }
 
-    /// A startup scan that outlasts `--duration` measured nothing, and says so: it must not look like an idle journal.
+    /// A reader that can't be placed at the end before `--duration` has passed measured nothing, and the reports say so:
+    /// they must not look like an idle journal's. The command ends on time all the same.
     #[test]
-    fn never_live_is_not_an_idle_journal() {
-        let dir = journal(5, b"x");
-        let never = |args: &mut AgeArgs| args.duration = Some(Duration::from_nanos(1));
-        let json: serde_json::Value =
-            serde_json::from_str(&run_args(dir.path(), true, never)).unwrap();
-        assert_eq!(
-            (&json["live"], &json["records"]),
-            (&false.into(), &0.into())
+    fn duration_and_interval_hold_while_the_reader_is_being_placed() {
+        let start = Instant::now();
+        let after = |ms| start.checked_add(Duration::from_millis(ms));
+        let mut out = Vec::new();
+        let mut printer = Printer {
+            journal: Path::new("/j"),
+            durable_only: false,
+            wait: Wait::Poll,
+            json: true,
+            interval: true,
+            previous: None,
+        };
+        // Never sent: the seek does not end while the test runs.
+        let (hold, held) = mpsc::channel::<()>();
+        let mut next_report = after(10);
+        let placed = place(
+            move || {
+                let _ = held.recv();
+                Ok(())
+            },
+            after(200),
+            &mut next_report,
+            Some(Duration::from_millis(10)),
+            |last| printer.print(&Report::nothing(start, last), &mut out),
         );
-        assert_eq!(json["before_live"], 0);
-        let text = run_args(dir.path(), false, never);
+        assert!(matches!(placed, Ok(None)));
+        assert!(start.elapsed() >= Duration::from_millis(200));
+        drop(hold);
+        let reports: Vec<serde_json::Value> = String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let (last, earlier) = reports.split_last().unwrap();
+        assert_eq!(last["final"], true);
+        assert!(!earlier.is_empty());
+        assert!(earlier.iter().all(|r| r["final"] == false));
+        for r in &reports {
+            assert_eq!((&r["live"], &r["records"]), (&false.into(), &0.into()));
+            assert_eq!(r["interval_age"]["count"], 0);
+        }
+        let mut text = Vec::new();
+        printer.json = false;
+        printer
+            .print(&Report::nothing(start, true), &mut text)
+            .unwrap();
+        let text = String::from_utf8(text).unwrap();
         assert!(text.contains("not live yet: nothing measured"), "{text}");
-        let idle = |args: &mut AgeArgs| args.duration = Some(Duration::from_millis(500));
+    }
+
+    /// What placing the reader returns, a failure included; a report that can't be written; a panic.
+    #[test]
+    fn placing_the_reader_ends_with_its_result() {
+        let none = || (None, None::<Instant>, None);
+        let placed = |seek: fn() -> Result<u8>| {
+            let (deadline, mut next, interval) = none();
+            place(seek, deadline, &mut next, interval, |_| Ok(()))
+        };
+        assert!(matches!(placed(|| Ok(7)), Ok(Some(7))));
+        let failure = placed(|| {
+            Err(Failure {
+                code: 2,
+                message: String::new(),
+            })
+        });
+        assert!(matches!(failure, Err(Failure { code: 2, .. })));
+        assert!(placed(|| panic!("expected by the test")).is_err());
+        let (_hold, held) = mpsc::channel::<()>();
+        let mut due = Some(Instant::now());
+        let unwritten = place(
+            move || {
+                let _ = held.recv();
+                Ok(())
+            },
+            None,
+            &mut due,
+            Some(Duration::from_secs(1)),
+            |_| {
+                Err(Failure {
+                    code: 1,
+                    message: String::new(),
+                })
+            },
+        );
+        assert!(matches!(unwritten, Err(Failure { code: 1, .. })));
+    }
+
+    /// An idle journal is live, and the records found at the start are not read.
+    #[test]
+    fn starts_at_the_end_and_live() {
+        let dir = journal(5, b"x");
+        let set = |args: &mut AgeArgs| args.duration = Some(Duration::from_millis(500));
         let json: serde_json::Value =
-            serde_json::from_str(&run_args(dir.path(), true, idle)).unwrap();
+            serde_json::from_str(&run_args(dir.path(), true, set)).unwrap();
         assert_eq!((&json["live"], &json["records"]), (&true.into(), &0.into()));
-        assert_eq!(json["before_live"], 5);
-        let text = run_args(dir.path(), false, idle);
+        assert_eq!(json["before_live"], 0);
+        let text = run_args(dir.path(), false, set);
         assert!(!text.contains("not live"), "{text}");
     }
 
@@ -580,21 +745,16 @@ mod tests {
         assert_eq!(due_after(1023), Some(1024));
         assert_eq!(due_after(1 << 18), Some(4));
         assert_eq!(due_after(usize::MAX), Some(1));
-        // A scan of many records counts each one, and goes live.
+        // From the journal's start and not live, as after a discontinuity.
         let dir = journal(10_000, b"x");
-        let json: serde_json::Value = serde_json::from_str(&run_args(dir.path(), true, |args| {
-            args.duration = Some(Duration::from_secs(2));
-        }))
-        .unwrap();
-        assert_eq!(
-            (&json["live"], &json["before_live"]),
-            (&true.into(), &10_000.into())
-        );
         // Due at every check, an interval report shows where in the scan the checks are.
         let (mut follower, reports) = follower(dir.path());
         follower.interval = Some(Duration::from_nanos(1));
+        follower.next_report = Some(Instant::now());
         follower.deadline = Instant::now().checked_add(Duration::from_secs(1));
         follower.follow().unwrap();
+        assert!(follower.live, "caught up");
+        assert_eq!(follower.age.view().snapshot().before_live, 10_000);
         let scanned: Vec<_> = reports
             .try_iter()
             .map(|r| (r.live, r.ages.before_live))
@@ -617,6 +777,7 @@ mod tests {
             start: Instant::now(),
             deadline: None,
             count: None,
+            next_report: None,
             interval: None,
             reports: sender,
         };

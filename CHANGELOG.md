@@ -5,6 +5,24 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
+- Changed: a forward `Reader::seek` within the reader's segment continues from the reader's position instead of
+  reading the segment from its start again, when that position is known to be on the current chain: an earlier seek
+  of the reader read a checkpoint marker that covers it, the segment file is still in place, and the record before it
+  is still there (ADR 0046). It lands on the same record, with two exceptions after storage damage: records before the
+  position, which the reader validated when it passed them, are not validated again; and if damage destroyed the
+  checkpoint marker, or set it back to an older one, together with covered records, the seek may go on from a position
+  that recovery has made invalid (`docs/crash-contract.md` → Readers after a repair). A seek to the last record the
+  reader passed, or an earlier one, scans the segment, and so does a new reader. All bindings get this through the Rust reader.
+- Changed: `inspect::read_checkpoint` (and so each refresh of a durable-only reader) reads the marker's two 64-byte
+  slots instead of the whole 128 KiB file.
+- Added: `Reader::seek_to_end` (C `tickertape_reader_seek_to_end`, C++ and Python `seek_to_end`, Java `seekToEnd`)
+  places a reader at the end of the journal, reading at most the newest segment, from the checkpoint on. The C ABI
+  stays at ABI version 1 (an added function).
+- Changed (CLI): `tail --from-end` uses it, so it no longer reads every retained segment, and damaged records in an
+  older segment no longer make it fail (a damaged header of the oldest segment still does).
+- Changed (Python decoder): `read_journal(start_seq=...)` in `python/tickertape_reader.py` starts at the segment that
+  holds `start_seq`, chosen by file name as the Rust reader does, instead of reading every segment from the oldest. It
+  still validates that segment's records before `start_seq`; damage in earlier segments is no longer reported.
 - Added (comparison harness): writer and reader threads are pinned on Linux, the same way for every tool, and every
   other thread is kept off their CPUs (`--writer-cpu`, `--reader-cpu`, `--helper-cpus`, automatic choice from the
   topology, `--no-pin` for the old behaviour). Every result records the affinity read back from `/proc`, and a pinned
@@ -24,6 +42,15 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 - Docs: the README's Performance section now says that the bare-metal append and replay figures come from short runs
   in the page cache (31–37 ms for tickertape's append), names the reader behind each latency figure, and adds the
   10-minute comparison on cloud VMs from `docs/benchmarks.md`. No figure changed and nothing new was measured.
+- Changed (comparison harness): Chronicle and Aeron in `compare/` follow their own documentation (issue #56, ADR 0018
+  amendment). Chronicle's `blockSize` is 1 GiB and its writer calls `microTouch()` in the busy-wait (the pretoucher is
+  Enterprise-only); Aeron's term buffers are not sparse and its clients pre-touch mapped memory. Aeron's reader uses
+  one fragment handler instead of a lambda per poll, which changes the measured reader. The JVM tools warm up across
+  index arrays, chunks, terms and the histogram branch in every workload, on scratch data, before the writer opens the
+  measured endpoint, and the paced writer's state exists before its start time. Every Java process logs GC, safepoints,
+  handshakes, compilations, deoptimisations and late sends beside the results (`compare/attribute.py` joins them). Each
+  can be switched off and is recorded in the result under `java`. No published figure changed and nothing new was
+  measured.
 - Docs: corrections to benchmark notes, with no new measurement (issue #58). The README and `docs/benchmarks.md` say
   how Chronicle Queue was configured (defaults, no page pre-touching) and that tickertape's first segment is
   preallocated before the append timer starts, and that tickertape's prefaulting was on; that at 1,024 bytes and
@@ -34,17 +61,17 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 - Changed (CLI, dependencies): `Cargo.lock` moves parquet from 59.3.2 to 59.3.3 for RUSTSEC-2026-0595 (bloom filters
   written in plaintext into encrypted Parquet files), which `cargo deny` started to report. The CLI builds parquet
   without its encryption feature and never wrote such files.
+- Docs: ADR 0045 (accepted, nothing built) designs a sparse, rebuildable seek index next to sealed segments (issue #59).
 - Added (core): the `latency` module (from 1.1, issue #61), the first two steps of the new ADR 0047, which designs
   opt-in latency histograms in the library and a `tickertape age` command (the third step, histograms in the writer, is
-  not built): `latency::Recorder`, a histogram of
-  durations that one thread records and any thread reads through a `View` without a lock, with exact extremes,
+  not built): `latency::Recorder`, a histogram of durations that one thread records and any thread reads through a `View` without a lock, with exact extremes,
   quantiles at most 1.6 % above the true value and interval views (`Snapshot::since`); and `latency::RecordAge`, the
   age of records as a reader returns them, with separate counts for records that are not live, not stamped or stamped
   ahead of the clock. Nothing is recorded unless the application does it; the writer, the readers, the on-disk format
   and the bindings are unchanged.
 - Added (CLI): `tickertape age` follows a live journal from its end and reports record ages as text or JSON (from 1.1).
   By default it polls, so that it never makes the watched writer's appends wake it (`--wait`). `live` in each report
-  tells an idle journal from a reader that has not caught up yet and measured nothing.
+  tells an idle journal from a reader that is not at the end of the journal yet and measured nothing.
 
 ## [1.0.0] - 2026-11-23
 

@@ -301,7 +301,10 @@ segment's path still names the file it has open (same device and inode) when it 
 waited at an empty slot for 100 ms or more, and before it follows a seal into the next segment. If the path names a
 different file or no file, the reader returns `Error::Discarded` and doesn't advance; it never continues at its old
 offset in the new file, because offsets after the repair point don't line up. The application calls `seek` to
-continue: `seek` scans the current chain from the start of a segment, so it only lands on validated positions.
+continue: `seek` scans the current chain from the start of a segment, so it only lands on validated positions. (A
+forward seek in the reader's own segment may scan from the reader's position instead, but only if a marker that the
+reader read before it passed the records before that position covers them, the path still names the file the reader
+has open, and the record before the position is still there. ADR [0046](decisions/0046-seeks-that-need-no-index.md).)
 
 A durable-only reader also checks when a checkpoint marker it has just read moves past its cursor, after reading the
 marker and before it reads any record the marker newly covers. The order matters: recovery replaces files before the
@@ -324,7 +327,10 @@ record boundary of the new history, so it simply reads on. A visible reader may 
 already read or buffered, and then continue at its old position in the new history without `Error::Discarded`. Where
 the records of the two histories line up it reads the new ones; otherwise its position falls inside a record, and it
 waits there (`Ok(None)`) or reports `Error::Corrupt` for bytes that aren't corrupt, until the application seeks to its
-position. It would return a record that is not in the journal only if the new history held a frame with a valid
+position. (Damage that also destroyed the marker, or set it back to an older one, can let recovery remove covered
+records in place; a seek to the reader's position or forward in its segment then goes on from there if the new history
+holds, right before it, bytes that form a record with the expected sequence number, also for a durable-only reader. A
+seek to the last record the reader passed, or an earlier one, scans the segment, and so does a new reader. ADR [0046](decisions/0046-seeks-that-need-no-index.md).) It would return a record that is not in the journal only if the new history held a frame with a valid
 checksum and the expected sequence number at that position (ADR
 [0034](decisions/0034-durable-only-reads-check-segment-identity.md) → In-place repairs).
 

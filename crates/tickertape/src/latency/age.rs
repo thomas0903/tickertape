@@ -57,7 +57,7 @@ use std::time::Duration;
 ///    [`set_live(true)`](RecordAge::set_live), and as
 ///    [`after_discontinuity`](RecordAgeSnapshot::after_discontinuity) later. The age of a replayed record says when it
 ///    was recorded, not how fast anything is. A new counter is not live. Declare it live once the reader has caught up
-///    or has been placed at the end of the journal, and not live before reading on after a
+///    or has been placed at the end of the journal ([`Reader::seek_to_end`](crate::Reader::seek_to_end)), and not live before reading on after a
 ///    [`Reader::seek`](crate::Reader::seek) or [`Error::Discarded`](crate::Error::Discarded). While live, every record
 ///    counts, also those of a backlog that builds up later: a slow consumer's lateness is what there is to measure. The
 ///    declaration is not checked: a forgotten `set_live(false)` before a seek backwards puts a replay into the

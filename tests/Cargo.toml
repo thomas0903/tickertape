@@ -111,3 +111,7 @@ path = "open_segments.rs"
 [[test]]
 name = "record_age"
 path = "record_age.rs"
+
+[[test]]
+name = "seek"
+path = "seek.rs"

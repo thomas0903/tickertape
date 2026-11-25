@@ -13,15 +13,7 @@ pub(crate) fn run(args: TailArgs, out: &mut dyn Write) -> Result<()> {
         reader.seek(seq)?;
     }
     if args.from_end {
-        // Leave this cursor at the first uncommitted slot, without a race from reopening it.
-        loop {
-            match reader.try_next() {
-                Ok(Some(_)) => {}
-                Ok(None) => break,
-                Err(Error::Discarded { seq, .. }) => resume(&mut reader, seq)?,
-                Err(error) => return Err(error.into()),
-            }
-        }
+        reader.seek_to_end()?;
     }
     let mut count = 0;
     while args.count.is_none_or(|limit| count < limit) {

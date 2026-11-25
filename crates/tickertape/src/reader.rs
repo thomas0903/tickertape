@@ -77,6 +77,11 @@ pub struct Reader {
     superseded_checked: Option<Instant>,
     /// Records before this are skipped (set by `seek`).
     skip_until: u64,
+    /// The `next_seq` of a checkpoint marker read before the records the cursor has passed since the last seek that
+    /// started at a segment's first record (or at the marker), from files confirmed current after it was read: while
+    /// the cursor is at or below it, the cursor is a record boundary of the current chain (ADR 0046). Set only by
+    /// seeks, which drop the read buffer; 0 if none.
+    seek_covered: u64,
     /// `pread` buffer: bytes of `seg` starting at file offset `buf_start`.
     buf: Vec<u8>,
     buf_start: u64,
@@ -107,6 +112,22 @@ struct Found {
     /// Offset of the payload in the segment file.
     payload_at: u64,
     payload_len: usize,
+}
+
+/// Where [`Reader::seek_to_end`] started, to go back to if it fails.
+struct Place {
+    seg: OpenSegment,
+    offset: u64,
+    next_seq: u64,
+    skip_until: u64,
+    seek_covered: u64,
+    durable_next_seq: u64,
+    durable_segment_base: u64,
+    superseded_checked: Option<Instant>,
+    buf: Vec<u8>,
+    buf_start: u64,
+    waiting_since: Option<Instant>,
+    found: Found,
 }
 
 /// What is at the cursor. A record's header is not part of it: the slot read decodes it into `Reader::found`.
@@ -219,6 +240,7 @@ impl Reader {
             durable_segment_base: 0,
             superseded_checked: None,
             skip_until: base,
+            seek_covered: 0,
             buf: Vec::new(),
             buf_start: 0,
             waker,
@@ -240,7 +262,22 @@ impl Reader {
     ///
     /// If `seq` hasn't been written yet, the reader waits for it: [`Reader::try_next`] returns `None` until the
     /// writer gets there, and records before `seq` are skipped. Every record on the way is validated, so the reader
-    /// only lands on positions along the journal's current chain.
+    /// only lands on positions along the journal's current chain, except as below.
+    ///
+    /// The way starts at the first record of the segment that holds `seq` (or will hold it), so a seek can cost
+    /// reading and validating up to one segment. A forward seek within the reader's segment starts at the reader's
+    /// cursor instead, if the reader can tell that the cursor is on the current chain: an earlier seek of this reader
+    /// read a checkpoint marker that covers the cursor, the segment's path still names the file the reader has open,
+    /// and the last record the reader passed is still where it was (ADR 0046). So the first forward seek in a segment
+    /// scans it, and the ones after it continue, as far as the checkpoint reached.
+    ///
+    /// The reader then lands on the same record as by scanning, except after storage damage of two kinds. Records
+    /// before the cursor, which the reader validated when it passed them, are not validated again, so damage done to
+    /// covered ones since is not noticed (nor is it by a reader that reads on without seeking). And if damage destroyed
+    /// the checkpoint marker, or set it back to an older one, and destroyed covered records, recovery removed those in
+    /// place, and the new history holds, right before the cursor, bytes that form a record with the sequence number
+    /// expected there, the cursor can be off the current chain without the seek noticing. A seek to the last record
+    /// the reader passed (returned or skipped), or an earlier one, scans the segment, and so does a new reader.
     ///
     /// Retention may remove the segment holding `seq` while `seek` runs (between listing the segments and opening
     /// the chosen one). `seek` then lists the segments again, so it returns [`Error::SeqUnavailable`] with the new
@@ -266,14 +303,68 @@ impl Reader {
                 first,
             })
         })?;
-        self.seg = seg;
-        self.offset = format::SEGMENT_HEADER_LEN as u64;
-        self.next_seq = base;
+        let continues = self.continues_from_cursor(seq, &seg);
+        if !continues {
+            self.seg = seg;
+            self.offset = format::SEGMENT_HEADER_LEN as u64;
+            self.next_seq = base;
+        }
+        // A seek that continues to a target the known marker covers needs no newer one.
+        if !continues || seq >= self.seek_covered {
+            self.seek_covered = self.covered_now();
+        }
         self.skip_until = seq;
-        self.buf.clear();
-        self.waiting_since = None;
-        self.superseded_checked = None;
+        self.cursor_moved();
         Ok(())
+    }
+
+    /// Positions the reader at the end of the journal, without reading the segments before it: the next record
+    /// returned is the first one this call did not find committed (for a durable-only reader, the first one it did
+    /// not find covered by a checkpoint).
+    ///
+    /// Under a live writer, "the end" is an observation made during the call: the reader is placed at a slot that
+    /// held no committed record when this call read it. Every record committed before the call is behind the reader,
+    /// and every record committed after it returns is ahead of it; one committed during the call can be on either
+    /// side. No record is skipped or repeated from there on. A visible reader's end can lie past what a power loss
+    /// would keep, like every position of a visible reader.
+    ///
+    /// The call reads at most the newest segment (from the checkpoint marker's position if the marker points into
+    /// it, otherwise from its start) and any segments the writer rolls to meanwhile, validating every record it
+    /// reads; records before that are not read, so damage in them is not noticed. A durable-only reader starts at
+    /// the marker's position. If the writer keeps committing as fast as the reader validates, the call runs until it
+    /// catches up. If there is no valid marker when the call reads it, no record is covered, and a durable-only reader
+    /// is placed at the first record of the oldest segment.
+    ///
+    /// If recovery replaces or removes the segment while the call reads it, the call starts over, at most 8 times.
+    /// If it fails, the reader is left exactly as it was. Added in 1.1.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] if the journal has no segments; [`Error::Corrupt`], [`Error::UnsupportedVersion`] or
+    /// [`Error::Io`] as for [`Reader::open`] and [`Reader::try_next`]; [`Error::Discarded`] if the segment was
+    /// replaced or removed on each of 8 attempts in a row. Its `seq` is where the call was reading, not the reader's
+    /// position, which is [`Reader::position`] as before the call. A durable-only reader also returns [`Error::Io`] if
+    /// the marker can't be read.
+    ///
+    /// ```no_run
+    /// # use tickertape::{Reader, ReaderConfig};
+    /// # fn main() -> tickertape::Result<()> {
+    /// let mut reader = Reader::open("/tmp/journal", ReaderConfig::default())?;
+    /// reader.seek_to_end()?;
+    /// while let Some(record) = reader.next_timeout(None)? {
+    ///     println!("new: {}", record.seq);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn seek_to_end(&mut self) -> Result<()> {
+        let mut attempts = 1;
+        loop {
+            match self.try_seek_to_end() {
+                Err(Error::Discarded { .. }) if attempts < LISTING_ATTEMPTS => attempts += 1,
+                result => return result,
+            }
+        }
     }
 
     /// Returns the next record if one is committed, without waiting for one.
@@ -439,6 +530,144 @@ impl Reader {
     /// The sequence number of the next record this reader will return.
     pub fn position(&self) -> u64 {
         self.next_seq.max(self.skip_until)
+    }
+
+    /// Whether a seek to `seq`, which is in `seg` if it exists, can start at the cursor instead of at `seg`'s first
+    /// record: whether `seg` is the file the reader has open, with the cursor before `seq`, and the cursor is a record
+    /// boundary of the journal's current chain (ADR 0046):
+    ///
+    /// - The cursor is at or below [`Reader::seek_covered`]: every record the reader passed to get here was covered
+    ///   when it was read, by a marker read before, from a file current after that. No recovery changes such records
+    ///   (ADR 0034, F2, F3 and F5), and the file is still current, since its path was just opened.
+    /// - The record before the cursor is still right before it, read from the file now. This adds nothing while the
+    ///   marker is intact; it catches recovery that removed covered records in place because damage had also destroyed or set back
+    ///   the marker (outside ADR 0034's argument).
+    ///
+    /// Anything that can't be established, an I/O error included, is a no: the seek then starts at the segment's first
+    /// record. At that record there is nothing to save, and no record before the cursor.
+    fn continues_from_cursor(&self, seq: u64, seg: &OpenSegment) -> bool {
+        self.next_seq <= seq
+            && self.offset > format::SEGMENT_HEADER_LEN as u64
+            && self.next_seq <= self.seek_covered
+            && seg.base == self.seg.base
+            && seg.identity == self.seg.identity
+            && self.last_record_in_place()
+    }
+
+    /// The exclusive bound of the checkpoint's coverage, if the reader's segment is still in place after the marker
+    /// was read (0 otherwise, and if either can't be established: later seeks then scan).
+    fn covered_now(&self) -> u64 {
+        let marker = crate::inspect::read_checkpoint(&self.dir);
+        crate::fault::hook(crate::fault::Point::ReaderSeekCoverage);
+        match marker {
+            Ok(Some(marker)) if self.check_identity().is_ok() => marker.next_seq,
+            _ => 0,
+        }
+    }
+
+    /// Whether the file holds, right before the cursor, a valid record with the sequence number before the cursor's
+    /// (checked where the reader last passed a record). An I/O error counts as no.
+    fn last_record_in_place(&self) -> bool {
+        let (Some(at), Some(seq)) = (
+            self.found
+                .payload_at
+                .checked_sub(format::RECORD_HEADER_LEN as u64),
+            self.next_seq.checked_sub(1),
+        ) else {
+            return false;
+        };
+        let window = (format::RECORD_HEADER_LEN + self.found.payload_len).min(CHUNK);
+        let view = journal::PreadView::new(&self.seg.file, self.seg.size, window);
+        matches!(
+            format::read_slot(&view, at, seq),
+            Ok(format::Slot::Record { next_offset, .. }) if next_offset == self.offset
+        )
+    }
+
+    /// Forgets what belongs to the slot the cursor was at: the read buffer (a seek reads the file's current bytes)
+    /// and the timers of a wait there.
+    fn cursor_moved(&mut self) {
+        self.buf.clear();
+        self.waiting_since = None;
+        self.superseded_checked = None;
+    }
+
+    /// One attempt of [`Reader::seek_to_end`]; on an error the reader is put back where it was.
+    fn try_seek_to_end(&mut self) -> Result<()> {
+        // Read before the segment is opened by its path, which proves that the file was current after the marker was
+        // written: it then holds every record below the marker's position, which is a record boundary (ADR 0034).
+        let marker = match crate::inspect::read_checkpoint(&self.dir) {
+            Ok(marker) => marker,
+            Err(e) if self.config.durable_only => return Err(e),
+            // For a visible reader the marker is only a shortcut.
+            Err(_) => None,
+        };
+        let newest = match marker {
+            _ if !self.config.durable_only => u64::MAX,
+            Some(marker) => marker.next_seq,
+            None => 0,
+        };
+        let (base, seg) = open_listed(&self.dir, self.mapped, newest, |bases| {
+            bases.floor.or(bases.oldest).ok_or_else(|| Error::NotFound {
+                dir: self.dir.clone(),
+            })
+        })?;
+        let (next_seq, offset) = marker
+            .filter(|m| {
+                m.segment_base_seq == base && crate::status::valid_offset(m.offset, seg.size)
+            })
+            .map_or((base, format::SEGMENT_HEADER_LEN as u64), |m| {
+                (m.next_seq, m.offset)
+            });
+        let before = Place {
+            seg: std::mem::replace(&mut self.seg, seg),
+            offset: std::mem::replace(&mut self.offset, offset),
+            next_seq: std::mem::replace(&mut self.next_seq, next_seq),
+            skip_until: std::mem::replace(&mut self.skip_until, next_seq),
+            seek_covered: std::mem::replace(
+                &mut self.seek_covered,
+                marker.map_or(0, |m| m.next_seq),
+            ),
+            // A durable-only reader's end is the marker as it is now: an earlier, higher one may be gone.
+            durable_next_seq: std::mem::take(&mut self.durable_next_seq),
+            durable_segment_base: std::mem::take(&mut self.durable_segment_base),
+            superseded_checked: self.superseded_checked,
+            buf: std::mem::take(&mut self.buf),
+            buf_start: self.buf_start,
+            waiting_since: self.waiting_since,
+            found: self.found,
+        };
+        self.cursor_moved();
+        // Without a marker nothing is covered, so a durable-only reader is there. It doesn't look for a marker again:
+        // one that has appeared since would make it read the journal from here.
+        let end = if self.config.durable_only && marker.is_none() {
+            self.check_identity()
+        } else {
+            self.read_to_end()
+        };
+        if end.is_err() {
+            self.seg = before.seg;
+            self.offset = before.offset;
+            self.next_seq = before.next_seq;
+            self.skip_until = before.skip_until;
+            self.seek_covered = before.seek_covered;
+            // A marker applied on the way was checked against the segment read there, not against this one (C13).
+            self.durable_next_seq = before.durable_next_seq;
+            self.durable_segment_base = before.durable_segment_base;
+            self.superseded_checked = before.superseded_checked;
+            self.buf = before.buf;
+            self.buf_start = before.buf_start;
+            self.waiting_since = before.waiting_since;
+            self.found = before.found;
+        }
+        end
+    }
+
+    /// Moves the cursor past every record there is to read, then checks that it did so in a file that is still part
+    /// of the journal.
+    fn read_to_end(&mut self) -> Result<()> {
+        while self.advance()? {}
+        self.check_identity()
     }
 
     /// Returns `Error::Discarded` if the current segment's path no longer names the file the reader has open, and
@@ -1240,6 +1469,7 @@ mod tests {
     use crate::mmap::MAPPED_READS;
     use crate::{CorruptReason, Error, NewRecord, ReaderConfig, Writer, WriterConfig};
     use std::cell::Cell;
+    use std::os::unix::fs::FileExt;
     use std::time::Instant;
 
     thread_local! {
@@ -1373,6 +1603,53 @@ mod tests {
             "the records span more than one segment"
         );
         assert_eq!(mapped.seg.map.is_some(), MAPPED_READS);
+    }
+
+    /// A failed `seek_to_end` puts back every field that describes the reader's place, the timers of a wait and the last
+    /// record passed included (no observable behaviour depends on each of these alone, so they are compared here).
+    #[test]
+    fn a_failed_seek_to_end_restores_every_field() {
+        let dir = journal_of(1_000);
+        let mut newest: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|e| e == "tape"))
+            .collect();
+        newest.sort();
+        assert!(newest.len() > 1);
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(newest.last().unwrap())
+            .unwrap();
+        // The second record of the newest segment (140-byte frames), so that the call passes one first.
+        file.write_all_at(&[0xEE; 8], 64 + 144 + 9).unwrap();
+        let state = |r: &Reader| {
+            (
+                (r.seg.path.clone(), r.seg.identity, r.offset, r.next_seq),
+                (r.skip_until, r.seek_covered, r.buf.clone(), r.buf_start),
+                (r.durable_next_seq, r.durable_segment_base),
+                (
+                    r.waiting_since,
+                    r.superseded_checked,
+                    format!("{:?}", r.found),
+                ),
+            )
+        };
+        for mapped in [false, true] {
+            let mut reader = open_reader(dir.path(), mapped);
+            for _ in 0..5 {
+                reader.try_next().unwrap().unwrap();
+            }
+            reader.seek_covered = 3;
+            reader.durable_next_seq = 7;
+            reader.durable_segment_base = 8;
+            reader.waiting_since = Some(Instant::now());
+            reader.superseded_checked = Some(Instant::now() - VALIDATION_WINDOW);
+            let before = state(&reader);
+            assert!(matches!(reader.seek_to_end(), Err(Error::Corrupt { .. })));
+            assert_eq!(state(&reader), before, "mapped: {mapped}");
+            assert_eq!(reader.try_next().unwrap().unwrap().seq, 5);
+        }
     }
 
     /// A frame the address space can't hold is an error, not a `capacity overflow` panic in `Vec::resize`, and the

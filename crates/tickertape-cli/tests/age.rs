@@ -297,9 +297,9 @@ fn ages_of_a_live_writer_with_every_wait() {
             dir.path().canonicalize().unwrap().to_str().unwrap()
         );
         assert_eq!((u(r, "records"), u(&r["age"], "count")), (20, 20));
-        // The records found at the start are not measured, however old they are; the rest is without a gap.
-        assert!(u(r, "before_live") >= 5, "{r}");
-        assert_eq!(u(r, "first_seq"), u(r, "before_live"));
+        // The records found at the start are neither read nor measured; the rest is without a gap.
+        assert_eq!(u(r, "before_live"), 0, "{r}");
+        assert!(u(r, "first_seq") >= 5, "{r}");
         assert_eq!(u(r, "last_seq") - u(r, "first_seq"), 19);
         assert!(r["interval_age"].is_null());
         assert!(!r["age"]["mean_ns"].is_null());
@@ -383,18 +383,90 @@ fn a_tape_without_a_writer_counts_nothing() {
         assert_eq!(reports.len(), 1);
         let r = &reports[0];
         assert_eq!((u(r, "records"), u(&r["age"], "count")), (0, 0));
-        assert_eq!(u(r, "before_live"), 7);
+        assert_eq!(u(r, "before_live"), 0);
         assert!(live(r), "an idle journal is live: {r}");
         assert!(r["elapsed_s"].as_f64().unwrap() >= 0.2);
         assert_eq!(r["durable_only"], args.contains(&"--durable-only"));
     }
     let (empty, writer) = journal(0);
     let (reports, output) = Age::start(empty.path(), &["--duration", "100ms"]).finish();
-    assert_eq!((code(&output), u(&reports[0], "before_live")), (0, 0));
+    assert_eq!((code(&output), live(&reports[0])), (0, true));
     drop(writer);
     let (reports, output) = Age::start(copy.path(), &["--count", "0"]).finish();
     assert_eq!((code(&output), u(&reports[0], "records")), (0, 0));
-    assert!(!live(&reports[0]), "it reports at once, before it reads");
+    assert!(live(&reports[0]));
+}
+
+/// Where the reader can't be placed at the end, `age` fails as `tail --from-end` does, and has nothing to report. Damage
+/// in an older segment's records does not matter to either: they are not read.
+#[test]
+fn starts_where_tail_from_end_does() {
+    let both = |dir: &Path, options: &[&str]| {
+        let tail = command()
+            .args(["tail", "--from-end", "--no-follow"])
+            .args(options)
+            .arg(dir)
+            .output()
+            .unwrap();
+        let age = command()
+            .args(["age", "--json", "--duration", "100ms"])
+            .args(options)
+            .arg(dir)
+            .output()
+            .unwrap();
+        assert_eq!(code(&tail), code(&age), "{tail:?} {age:?}");
+        if code(&age) == 0 {
+            let report: Value = serde_json::from_slice(&age.stdout).unwrap();
+            check(&report);
+            assert!(live(&report) && u(&report, "records") == 0, "{report}");
+        } else {
+            assert!(age.stdout.is_empty(), "{age:?}");
+            assert_eq!(stderr(&age), stderr(&tail));
+        }
+        code(&age)
+    };
+    let damage = |dir: &Path, base: u64| {
+        fs::OpenOptions::new()
+            .write(true)
+            .open(dir.join(tickertape::format::segment_file_name(base)))
+            .unwrap()
+            .write_all_at(&[0xff; 8], 64 + 60)
+            .unwrap();
+    };
+    let empty = TempDir::new().unwrap();
+    assert_eq!(both(empty.path(), &[]), 1);
+    assert_eq!(both(&empty.path().join("absent"), &[]), 1);
+    let (dir, writer) = journal(0);
+    assert_eq!(both(dir.path(), &[]), 0);
+    assert_eq!(both(dir.path(), &["--durable-only"]), 0);
+    drop(writer);
+    // Two records in the newest segment, the fourth and fifth of the journal.
+    let (dir, writer) = journal(5);
+    drop(writer);
+    damage(dir.path(), 0);
+    assert_eq!(both(dir.path(), &[]), 0);
+    damage(dir.path(), 3);
+    assert_eq!(both(dir.path(), &[]), 2);
+}
+
+/// Durable-only without a checkpoint: nothing is covered, so the reader is at the start, and the records the first
+/// checkpoint covers are new to it, however long ago they were appended. That is their age when they became readable.
+#[test]
+fn durable_only_before_the_first_checkpoint() {
+    let (dir, mut writer) = journal(4);
+    let mut age = Age::start(
+        dir.path(),
+        &["--durable-only", "--interval", "20ms", "--count", "4"],
+    );
+    let r = age.until(|| (), live);
+    assert_eq!(u(&r, "records"), 0);
+    std::thread::sleep(Duration::from_millis(100));
+    writer.checkpoint().unwrap();
+    let (reports, output) = age.finish();
+    assert_eq!(code(&output), 0);
+    let r = reports.last().unwrap();
+    assert_eq!((u(r, "first_seq"), u(r, "last_seq")), (0, 3));
+    assert!(u(&r["age"], "min_ns") >= 100_000_000, "{r}");
 }
 
 /// Paced by the reports rather than by time, so that it does not depend on how fast the machine is.
@@ -469,11 +541,6 @@ fn corruption_while_following() {
     assert_eq!(code(&output), 2, "{output:?}");
     assert!(u(reports.last().unwrap(), "records") >= 1);
     assert!(stderr(&output).contains("tickertape: "), "{output:?}");
-    // Corruption in the records read before it is live: likewise, with nothing measured.
-    let (reports, output) = Age::start(dir.path(), &["--duration", "10s"]).finish();
-    assert_eq!(code(&output), 2);
-    assert_eq!(u(&reports[0], "records"), 0);
-    assert!(u(&reports[0], "before_live") >= 1);
 }
 
 /// History discarded by a recovery while following: the command resumes as `tail` does, and counts only what is
@@ -623,7 +690,7 @@ fn text_output() {
         .stdout(
             predicate::str::contains("journal     /")
                 .and(predicate::str::contains("wait=poll"))
-                .and(predicate::str::contains("before_live=4"))
+                .and(predicate::str::contains("before_live=0"))
                 .and(predicate::str::contains("interval    count=0"))
                 .and(predicate::str::contains("  final")),
         );

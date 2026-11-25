@@ -1191,6 +1191,7 @@ const CPP_WRAPPED: &[(&str, &str)] = &[
     ),
     ("tickertape_reader_close", "~Reader, Reader::close"),
     ("tickertape_reader_seek", "Reader::seek"),
+    ("tickertape_reader_seek_to_end", "Reader::seek_to_end"),
     ("tickertape_reader_next", "Reader::next"),
     ("tickertape_reader_next_copy", "Reader::next_copy"),
     (

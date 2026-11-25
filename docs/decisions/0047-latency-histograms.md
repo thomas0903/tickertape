@@ -514,7 +514,7 @@ in one process cannot be seen from another, and a service-time histogram can loo
 experienced; both are stated where the numbers are. Implementation adds the module to the `compatibility.md` surface,
 so its names are then kept for 1.x.
 
-## Amendment (2026-11-25): steps 1 and 2 as built, and a correction
+## Amendment (2026-11-25, 2026-11-26): steps 1 and 2 as built, and a correction
 
 Found in the review of the implementation (PR #70). The decision does not change.
 
@@ -526,10 +526,14 @@ Found in the review of the implementation (PR #70). The decision does not change
   of samples that does not grow with the count, so it shrinks as the count grows. Quantiles are not affected. The rustdoc
   says so and a test checks the bound. A tighter snapshot (a retry while the count moves) was not built: it would not end
   under exactly this load.
-- **`live` in the output of `tickertape age`** (JSON, `"live":bool` after `final`, and text). A startup scan that outlasts
-  `--duration` otherwise reports zero records with exit 0, like an idle journal.
-- **`--duration` runs from the command's start**, and the command reads the clock about every 1,024 records while it does
-  not wait, instead of once per record. Not-live records are counted without a wall-clock read.
+- **`tickertape age` starts with `seek_to_end`** (ADR 0046), so it is live at once, as this record foresaw, and
+  `before_live` in its output is 0.
+- **`live` in its output** (JSON, `"live":bool` after `final`, and text). `seek_to_end` has no deadline and lasts for as
+  long as a writer commits as fast as the reader validates, so it runs on a thread of its own: `--duration` and
+  `--interval` hold meanwhile, and the reports then say that nothing was measured, which zero records and exit 0 alone
+  would not (an idle journal looks the same). An error while the reader is being placed gets no final report.
+- **The clock is read about every 1,024 records** while the command does not wait, instead of once per record, and
+  not-live records are counted without a wall-clock read.
 - **The command reads on one thread and writes reports on another**, and skips an interval report while standard output is
   behind. The final report also precedes exit 1 for an error met while following.
 - **`poll` and `spin` "cost the writer nothing"** claimed more than is known. They make no system call in its appends and

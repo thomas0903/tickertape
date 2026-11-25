@@ -209,8 +209,11 @@ class _Segment:
 def read_journal(path, start_seq=None, end_seq=None, durable_only=False) -> Iterator[Record]:
     """Yield validated records in an inclusive range, reading files only in 'rb' mode.
 
-    Scan from sequence zero, validating the prefix before start_seq. Capture segment
-    names and (if requested) the checkpoint once when iteration begins. With no valid
+    Scan from the segment that holds start_seq, chosen by file name like the Rust
+    reader's seek: the newest whose base sequence is not above it (without start_seq,
+    the oldest segment). Validate every record from that segment's start on, including
+    those before start_seq; do not open earlier segments. Capture segment names and
+    (if requested) the checkpoint once when iteration begins. With no valid
     checkpoint, durable_only yields nothing. End at the newest segment's empty slot
     or the requested boundary. A live append may be that empty slot; invoke again for
     later records. CorruptJournal is raised only after one retry of a failing segment
@@ -233,9 +236,13 @@ def read_journal(path, start_seq=None, end_seq=None, durable_only=False) -> Iter
     if not segments or limit == 0:
         return
     # Like the Rust reader, start at the oldest segment present: operators may archive or delete old segments.
+    if start_seq is not None:
+        if start_seq < segments[0][0]:
+            raise ValueError(f"sequence {start_seq} is before the first available record {segments[0][0]}")
+        # As Reader::seek chooses: the newest segment whose base is at or below the target.
+        segments = [entry for index, entry in enumerate(segments)
+                    if index + 1 == len(segments) or segments[index + 1][0] > start_seq]
     expected = segments[0][0]
-    if start_seq is not None and start_seq < expected:
-        raise ValueError(f"sequence {start_seq} is before the first available record {expected}")
     for index, (base, segment_path) in enumerate(segments):
         segment = _Segment(segment_path, base)
         offset = 64

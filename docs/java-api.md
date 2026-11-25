@@ -296,6 +296,8 @@ try (Reader reader = Reader.open(Path.of("/data/journal"))) {   // at the oldest
 }
 ```
 
+- `seekToEnd()` (from 1.1) places the reader at the end of the journal, so that it returns only records it did not find
+  committed yet. It reads at most the newest segment, from the checkpoint on.
 - `Reader.open` is the **safe reader**: it reads the files with `pread` into its own buffer and validates the copy, so
   it is memory-safe whatever other processes do to the files.
 - `Reader.openMappedUnsafe` is the **mapped reader**: payloads are read straight from a memory mapping, without a
