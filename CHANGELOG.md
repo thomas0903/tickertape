@@ -18,7 +18,7 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 - Changed (CLI, dependencies): `Cargo.lock` moves parquet from 59.3.2 to 59.3.3 for RUSTSEC-2026-0595 (bloom filters
   written in plaintext into encrypted Parquet files), which `cargo deny` started to report. The CLI builds parquet
   without its encryption feature and never wrote such files.
-- Docs: ADR 0048 (proposed, nothing built) settles the zero-copy reader's publication frontier (issue #62).
+- Docs: ADR 0048 (accepted, nothing built) settles the zero-copy reader's publication frontier (issue #62).
 
 ## [1.0.0] - 2026-11-23
 
