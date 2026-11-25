@@ -342,6 +342,75 @@ let _exposure = meter
     .build();
 ```
 
+### How old records are when they are read
+
+From 1.1 (ADR [0047](decisions/0047-latency-histograms.md)). `latency::RecordAge` in the process that reads, or
+`tickertape age` from the command line, measure the **age** of each record when a reader returns it: this machine's wall
+clock at that moment, minus the record's `local_ts_ns`.
+
+```sh
+tickertape age /data/journal --duration 60s            # one report, as text
+tickertape age /data/journal --interval 10s --json     # one JSON object every 10 s, until interrupted
+```
+
+**What age is not.**
+
+- **It is not the writer-to-reader latency.** It starts where the caller took `local_ts_ns`, which can be long before the
+  append (the receive time of a market-data packet is the usual choice), and the time of the commit is not recorded
+  anywhere. The two are equal only if the caller stamps right before `append`.
+- **It is not the delay of your reader, if you use the command.** `tickertape age` measures its own reader, on the CPU it
+  happens to run on and with the wait it was told to use (`--wait`, [`cli.md`](cli.md)). It says whether the writer, the
+  clock and the machine are healthy. Your reader's ages need `RecordAge` around your reader.
+- **It is not how long a replay takes.** Records read before the reader has caught up, or after a seek or discarded
+  history, are counted apart (`before_live`, `after_discontinuity`): their age says when they were recorded. With
+  `RecordAge` that rests on the application's own declaration (`set_live`); a forgotten `set_live(false)` before a seek
+  backwards puts a replay into the histogram. A backlog that builds up while the reader is live does count.
+- **It shows nothing about a record that has not been read**, such as one a stuck reader has not reached. `status` shows
+  that (reader lag, unread age).
+- **It is nothing at all** if records are appended again with their original timestamps, or stamped with something other
+  than nanoseconds since 1970 (uptime nanoseconds give ages of decades, and a `mean_ns` of null). The library can't tell.
+
+**Clocks.** Both times must come from the same clock, or from clocks that agree.
+
+- Two processes on one machine (also in different containers) that both use `CLOCK_REALTIME`
+  (`tickertape::clock::realtime_ns()`) share it. If it is stepped, the result moves by the step: a step forward shows as
+  a false maximum, a step backward as records ahead of the clock. Slew the clock (chrony and ntpd do by default, after
+  their start) rather than step it.
+- **Timestamps ahead of the observer's clock** (`ahead`, in JSON `ahead_of_clock`) have no age and are never counted as 0.
+  **When that count is not 0, the minimum and every percentile are biased upwards**, because the records left out are the
+  fastest ones. A few after a backward step are harmless; a steady share means that the stamping clock runs ahead: a
+  hardware timestamp (NIC, PHC), a clock on TAI (37 s ahead of UTC), or a clock a few microseconds fast.
+- A clock that runs behind by a constant adds that constant to every age, and nothing shows it.
+- On macOS the wall clock advances in steps of 1 µs: shorter ages are 0, and a finer timestamp can look ahead.
+- A tape copied from another machine has no live records unless something appends to it, so nothing counts there.
+
+**Exporting.** A `View` (or `RecordAgeView`) can be kept by a monitoring thread while the reading thread records. It
+copies about 30 KB per snapshot and takes no lock; once a second or slower is the intended use. The histograms only grow:
+subtract the previous snapshot for the values of an interval. With the `prometheus` crate, for example:
+
+```rust
+use prometheus::{Gauge, IntGauge, register_gauge, register_int_gauge};
+
+let p99 = register_gauge!("tickertape_record_age_p99_seconds", "Age of records when read, last interval")?;
+let max = register_gauge!("tickertape_record_age_max_seconds", "Age of records when read, last interval")?;
+let ahead = register_int_gauge!("tickertape_records_ahead_of_clock", "If it grows, the ages are biased upwards")?;
+let view = age.view(); // `age` is the reading thread's RecordAge
+let mut previous = view.snapshot();
+// On each scrape or timer tick, on another thread:
+let now = view.snapshot();
+let interval = now.age.since(&previous.age);
+// An interval without records has no quantiles.
+let seconds = |d: Option<std::time::Duration>| d.map_or(f64::NAN, |d| d.as_secs_f64());
+p99.set(seconds(interval.value_at_quantile(0.99)));
+max.set(seconds(interval.max()));
+ahead.set(now.ahead as i64);
+previous = now;
+```
+
+An application can time anything else with a `latency::Recorder` of its own, for example its `checkpoint()` calls, or an
+event's handling from when it was due (see the module's documentation for why that differs from the call's duration). The
+library records nothing by itself: no histogram of appends, rolls or checkpoints is kept in the writer.
+
 ### Making readers in other processes visible
 
 Readers leave no trace on disk by default, so an observer can't see their position. A reader that should be

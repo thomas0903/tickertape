@@ -1,6 +1,7 @@
 # 0047: Latency histograms in the library and the CLI
 
-- **Status:** accepted (2026-11-25; design only, nothing is built; issue #61)
+- **Status:** accepted (2026-11-25; issue #61). Steps 1 and 2 of the build order are built; step 3, the writer's
+  histograms, is not
 - **Date:** 2026-11-25
 - **Relates to:** [0032](0032-operational-metrics.md) (operational metrics; it added no work to `append`, and that
   stays true unless the option here is on), [0041](0041-batched-append.md), [0038](0038-background-checkpoints.md),

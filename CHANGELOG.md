@@ -20,6 +20,14 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   without its encryption feature and never wrote such files.
 - Docs: ADR 0047 (accepted, nothing built) designs opt-in latency histograms in the library and a `tickertape age`
   command (issue #61).
+- Added (core): the `latency` module (from 1.1, ADR 0047 steps 1 and 2, issue #61): `latency::Recorder`, a histogram of
+  durations that one thread records and any thread reads through a `View` without a lock, with exact extremes,
+  quantiles at most 1.6 % above the true value and interval views (`Snapshot::since`); and `latency::RecordAge`, the
+  age of records as a reader returns them, with separate counts for records that are not live, not stamped or stamped
+  ahead of the clock. Nothing is recorded unless the application does it; the writer, the readers, the on-disk format
+  and the bindings are unchanged.
+- Added (CLI): `tickertape age` follows a live journal from its end and reports record ages as text or JSON (from 1.1).
+  By default it polls, so that it never makes the watched writer's appends wake it (`--wait`).
 
 ## [1.0.0] - 2026-11-23
 

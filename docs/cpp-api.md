@@ -445,6 +445,10 @@ tickertape::WriterMetrics w = writer.metrics().value();  // in the writer's proc
 - `Writer::metrics()` makes no system call. Like every value type of the binding, these structs gain no members
   within a major version (ADR 0036 → Versioning); later values come as new types or functions.
 
+The latency histograms and record ages of the Rust crate (`tickertape::latency`, from 1.1, ADR
+[0047](decisions/0047-latency-histograms.md)) are not available from C++ yet; `tickertape age` (see [`cli.md`](cli.md))
+reports ages from the command line.
+
 ## Versioning
 
 The header defines `TICKERTAPE_HPP_VERSION_MAJOR`, `_MINOR`, `_PATCH`, `TICKERTAPE_HPP_VERSION_NUMBER` and
