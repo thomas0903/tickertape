@@ -336,7 +336,14 @@ fn steps(job: &Job, ctx: &Context, on: On) -> Result<CheckpointSlot> {
                 Arc::new(file)
             }
         };
-        mmap::sync_data(&file).map_err(|e| Error::io("sync segment", &seg.path, e))?;
+        // EXPERIMENT (never merged): the ranged `msync` alone for the active segment (its range includes page 0 the
+        // first time), so that pages prefaulted ahead of the writer are not written back and write-protected.
+        let ranged = std::env::var_os("TT_EXP_RANGED").is_some()
+            && std::ptr::eq(seg, last)
+            && seg.flush.is_some();
+        if !ranged {
+            mmap::sync_data(&file).map_err(|e| Error::io("sync segment", &seg.path, e))?;
+        }
         barrier = Some(file);
     }
     let Some(barrier) = barrier else {
