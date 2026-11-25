@@ -732,7 +732,7 @@ fn check_segment(
     }
     let index = match loaded.index() {
         Ok(index) => index,
-        Err(_) => return done((IndexState::Ignored, None)),
+        Err(why) => return done(because(IndexState::Ignored, why)),
     };
     let stat = |e| Error::io("read segment", path, e);
     if !lookup::sealed(&segment, &index).map_err(stat)? {

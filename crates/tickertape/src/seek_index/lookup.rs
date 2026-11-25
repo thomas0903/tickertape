@@ -29,7 +29,7 @@ impl From<io::Error> for Rejected {
     }
 }
 
-/// An index file's bytes and the segment's first 64 bytes they were checked against.
+/// An index file's bytes, and the segment's first 64 bytes to check them against ([`Loaded::index`]).
 #[derive(Debug)]
 pub(crate) struct Loaded {
     bytes: Vec<u8>,
@@ -39,12 +39,13 @@ pub(crate) struct Loaded {
 }
 
 impl Loaded {
-    pub(crate) fn index(&self) -> Result<Index<'_>, Rejected> {
-        codec::decode(&self.bytes, &self.segment_header).map_err(Rejected::Unusable)
+    /// The index, if it passes every check of step 4; otherwise what is wrong with it.
+    pub(crate) fn index(&self) -> Result<Index<'_>, &'static str> {
+        codec::decode(&self.bytes, &self.segment_header)
     }
 }
 
-/// Steps 3 and 4: opens, reads and checks the index of the segment open as `segment`, whose base is `base`. With
+/// Step 3 and the read of step 4: opens and reads the index of the segment open as `segment`, whose base is `base`. With
 /// `lenient`, a wrong owner or mode is noted in the result instead of refused.
 pub(crate) fn load(
     dir: &IndexDir,
@@ -78,13 +79,11 @@ pub(crate) fn load(
     file.read_exact_at(&mut bytes, 0)?;
     let mut segment_header = [0; SEGMENT_HEADER_LEN];
     segment.read_exact_at(&mut segment_header, 0)?;
-    let loaded = Loaded {
+    Ok(Loaded {
         bytes,
         segment_header,
         ignored,
-    };
-    loaded.index()?;
-    Ok(loaded)
+    })
 }
 
 /// Opens the index of segment `base`, telling a name that is not a file to be read apart from a failure.
