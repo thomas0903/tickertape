@@ -62,6 +62,7 @@ final class Native {
     private static final MethodHandle WRITER_OPTIONS_SET_NOTIFY = h("tickertape_writer_options_set_notify");
     private static final MethodHandle WRITER_OPTIONS_SET_PREFAULT = h("tickertape_writer_options_set_prefault");
     private static final MethodHandle WRITER_OPTIONS_SET_EARLY_WRITEBACK = h("tickertape_writer_options_set_early_writeback");
+    private static final MethodHandle WRITER_OPTIONS_SET_SPARE_SEGMENT = h("tickertape_writer_options_set_spare_segment");
     private static final MethodHandle WRITER_OPTIONS_SET_HELPER_CPUS = h("tickertape_writer_options_set_helper_cpus");
     private static final MethodHandle WRITER_OPTIONS_SET_RETENTION = h("tickertape_writer_options_set_retention");
     private static final MethodHandle READER_OPTIONS_NEW = h("tickertape_reader_options_new");
@@ -244,6 +245,14 @@ final class Native {
     static int writerOptionsSetEarlyWriteback(MemorySegment a0, int a1) {
         try {
             return (int) WRITER_OPTIONS_SET_EARLY_WRITEBACK.invokeExact(a0, a1);
+        } catch (Throwable t) {
+            throw rethrow(t);
+        }
+    }
+
+    static int writerOptionsSetSpareSegment(MemorySegment a0, int a1) {
+        try {
+            return (int) WRITER_OPTIONS_SET_SPARE_SEGMENT.invokeExact(a0, a1);
         } catch (Throwable t) {
             throw rethrow(t);
         }

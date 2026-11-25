@@ -263,13 +263,7 @@ pub fn reader(
     from: u64,
     cpu: Option<u64>,
 ) -> Result<()> {
-    let spec = ReaderSpec {
-        mapped: kind == ReaderKind::Mapped,
-        durable_only: false,
-        wait,
-        delay: None,
-        stall: None,
-    };
+    let spec = ReaderSpec::parse(kind.name(), wait)?;
     let stop = Arc::new(AtomicBool::new(false));
     let ended = Arc::clone(&stop);
     let end = std::thread::spawn(move || -> Option<u64> {

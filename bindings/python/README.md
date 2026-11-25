@@ -62,6 +62,8 @@ it. A background checkpoint that fails is raised once, by the next `request_chec
 raises it too, unless the block raised. On Linux, `Writer(early_writeback=True)` (the default) starts the kernel's
 write-back as the writer goes, so a checkpoint finds less to write, and `helper_cpus` (`"process"`, the default,
 `"inherited"` or a list of CPU numbers) places the writer's helper threads; both do nothing on macOS.
+`Writer(spare_segment=True)` (from 1.1; `None`, the default, is on on macOS and off on Linux) prepares the next segment
+in a background thread (ADR 0049); nothing reports the value in effect.
 
 A failed `checkpoint()` poisons the writer: later checkpoints raise `DurabilityLostError`, appends keep working. The
 failure is not undone by reopening: records appended before a failed checkpoint may not be durable even if a writer

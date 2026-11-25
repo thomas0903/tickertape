@@ -365,7 +365,9 @@ if any). A failure is thrown once (`JournalIOException`), by the next `requestCh
 `checkpoint()` or `close()`, then `DurabilityLostException`. `close()` waits for a checkpoint in flight and throws
 that failure (or `DurabilityLostException` for a poisoned writer) after releasing the journal; the `Cleaner` path
 waits too but reports nothing. `WriterOptions.earlyWriteback(boolean)` and `WriterOptions.helperCpus(HelperCpus)` set
-the Linux-only options of ADR 0038.
+the Linux-only options of ADR 0038. `WriterOptions.spareSegment(boolean)` (from 1.1) is the spare segment
+(ADR 0049): on by default on macOS, off on Linux. `WriterOptions.spareSegment()` returns what was set, empty for the
+default; nothing reports the value in effect.
 
 `close()` does not checkpoint. A failed checkpoint poisons the writer: later checkpoints throw
 `DurabilityLostException` while appends keep working; treat it as an incident. A durable-only reader returns only

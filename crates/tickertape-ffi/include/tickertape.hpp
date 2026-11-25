@@ -918,9 +918,8 @@ public:
     WriterOptions &notify(bool enabled) {
         return usable() ? record(tickertape_writer_options_set_notify(h_, enabled ? 1 : 0)) : *this;
     }
-    // Prefault pages (and on macOS prepare the next segment) in background threads (default on). Off gives a writer
-    // that starts no threads except the checkpoint thread of Writer::request_checkpoint(), and turns off early
-    // write-back.
+    // Prefault pages in background threads (default on). Off gives a writer that starts no threads except the
+    // checkpoint thread of Writer::request_checkpoint(), and turns off early write-back and the spare segment.
     WriterOptions &prefault(bool enabled) {
         return usable() ? record(tickertape_writer_options_set_prefault(h_, enabled ? 1 : 0)) : *this;
     }
@@ -930,6 +929,12 @@ public:
     // macOS. See tickertape_writer_options_set_early_writeback.
     WriterOptions &early_writeback(bool enabled) {
         return usable() ? record(tickertape_writer_options_set_early_writeback(h_, enabled ? 1 : 0)) : *this;
+    }
+    // Prepare the next segment in a background thread once the active one is half full (default on on macOS, off on
+    // Linux; needs prefault). It reserves one more segment's worth of disk space. Whether it helps depends on the load
+    // and the disk: measure first. From 1.1. See tickertape_writer_options_set_spare_segment.
+    WriterOptions &spare_segment(bool enabled) {
+        return usable() ? record(tickertape_writer_options_set_spare_segment(h_, enabled ? 1 : 0)) : *this;
     }
     // Where the writer's helper threads run (checkpoint, prefault, write-back and spare threads; Linux only).
     WriterOptions &helper_cpus(HelperCpus placement) {

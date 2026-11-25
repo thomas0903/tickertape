@@ -5,6 +5,22 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
+- Added: `WriterConfig::spare_segment` (C `tickertape_writer_options_set_spare_segment`, C++ and Python `spare_segment`,
+  Java `spareSegment`; `tt-sustained` and `tt-latency` `--spare-segment`): on Linux, prepare the next segment in a
+  background thread so that a roll does not create and preallocate a file (ADR 0049, issue #60). **Off by default on
+  Linux**, where the writer behaves as before; on by default on macOS, as today, and now separate from `prefault`. On
+  cloud VMs it made rolls cheaper away from the disk's limit, made the one saturated case worse and was not measured in others. The
+  file format and the crash contract's guarantees are unchanged.
+- Docs: the stalls of sustained runs on ext4 are attributed (issue #60): the write fault's modification-time update and
+  a roll's file operations wait for the ext4 journal; that the holder of `mmap_lock` in the unpaced rolls is the prefault
+  helper is inferred, and why the device queues on one machine shape is not explained. With the measured effect of
+  `lazytime` and the tracing overhead of the eBPF playbook's tools; `benches/diagnostics/stalls.bt` is new.
+- Docs: `docs/benchmarks.md` has profiles of both readers, the notification path and the serialization paths under
+  the sustained workloads (x86-64 and aarch64 cloud VMs) and lists the allocations, copies, system calls and
+  synchronization that remain, with whether each is necessary (issue #62; roadmap "Finish eliminating avoidable work").
+- Added (benchmarks): `benches/diagnostics/profile-sustained.sh` profiles the threads of a sustained run or counts their
+  system calls and heap allocations; `tt-sustained` has `--encode` (how payloads are made) and the reader option
+  `owned`. `tests/allocation.rs` checks that appending, following and replaying allocate nothing per record.
 - Added: seek indexes (ADR 0045, crash contract C15). `tickertape index <DIR>` (library: `seek_index::build`, `check`,
   `remove`) writes a small file per sealed segment into `seek-index/` of the journal, and a reader opened with
   `ReaderConfig::seek_index(true)` (C `tickertape_reader_options_set_seek_index`, C++ and Python `seek_index`, Java
@@ -13,6 +29,8 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   no longer stops the reader, and a forged index can mislead it. Segments of the recovery domain and the newest segment
   have no index. The on-disk format stays version 1, released versions ignore the files (except that 1.0.0's
   `export --output` fails if it cannot list the directory), and the C ABI stays at ABI version 1 (an added function).
+- Fixed (seek indexes, unreleased): `seek_index::build` also removes an index it has just published if it cannot check,
+  for another reason than "not found", that the segment is still in place; it reported `Failed` and left the index.
 - Added: `RecoveryReport::seek_indexes_removed` and `seek_index_errors`. When it opens, the writer removes the seek
   indexes of segments that recovery may change (`docs/format.md` → Recovery, step 2a), best effort; retention and
   `archive` remove a segment's index after the segment. Without a `seek-index/` directory this is one failed `open` each.

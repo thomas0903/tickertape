@@ -51,10 +51,15 @@ pub enum Point {
     /// run there then stops after the removal in progress), and is about to wait. Arm with [`run_at`] on the thread
     /// that calls them.
     CheckpointWait,
-    /// Preallocating the spare next segment on its background thread (arm with [`fail_next_background`]).
+    /// Preallocating the spare next segment on its background thread (arm with [`fail_next_background`],
+    /// or stop it there with [`hold_background`]).
     SparePreallocate,
-    /// Mapping the spare next segment on its background thread (arm with [`fail_next_background`]).
+    /// Mapping the spare next segment on its background thread, after its blocks are allocated (arm with
+    /// [`fail_next_background`], or stop it there with [`hold_background`]).
     SpareMap,
+    /// Panics the thread that prepares the spare next segment, after its blocks are allocated (arm with
+    /// [`fail_next_background`]; the error is not used).
+    SparePanic,
     /// Writing the spare's header when the writer publishes it at roll (arm with [`fail_next`]).
     SpareHeader,
     /// Recovery repairing a corrupt tail, after the tail was preserved in `quarantine/` and the repaired copy written,
@@ -490,6 +495,12 @@ pub enum Sync {
     All,
     /// The platform barrier (`F_FULLFSYNC` on macOS; on Linux it is a [`Sync::Data`] as well).
     Barrier,
+    /// Data through a mapping made for it (`msync`; a [`Sync::Msync`] as well).
+    MsyncFile,
+    /// The start of early write-back (`sync_file_range`).
+    Writeback,
+    /// Part of a mapping (`msync`). Its file is not known here: recorded with device and inode 0.
+    Msync,
 }
 
 #[cfg(feature = "fault-injection")]
@@ -535,3 +546,18 @@ pub(crate) fn note_sync(sync: Sync, file: &std::fs::File) {
 #[cfg(not(feature = "fault-injection"))]
 #[inline(always)]
 pub(crate) fn note_sync(_sync: Sync, _file: &std::fs::File) {}
+
+/// Called at each `msync`.
+#[cfg(feature = "fault-injection")]
+pub(crate) fn note_msync() {
+    syncs::LOG.with(|l| {
+        if let Some(log) = l.borrow_mut().as_mut() {
+            log.push((Sync::Msync, (0, 0)));
+        }
+    });
+}
+
+/// Called at each `msync` (no-op without the `fault-injection` feature).
+#[cfg(not(feature = "fault-injection"))]
+#[inline(always)]
+pub(crate) fn note_msync() {}

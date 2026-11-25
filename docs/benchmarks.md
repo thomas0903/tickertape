@@ -16,6 +16,8 @@ The sustained-workload, checkpoint, comparison, reader and scale results and the
 bare-metal sections. The scale cases that run left out (10,000 segments and more, archived history, damage, catch-up, the
 zero-copy reader, seek indexes) ran on 2026-11-25 on machines of the same types
 ([below](#2026-11-25-replay-and-recovery-at-scale-the-gaps-of-100-google-cloud-vms)).
+The profiles of v1.0.0's readers, notification and serialization paths (where the CPU time goes, and
+what remains per record) are [under 2026-11-25](#2026-11-25-where-the-cpu-time-goes-profiles-of-the-readers-notification-and-serialization-google-cloud-vms).
 
 **How Chronicle Queue and tickertape were configured in the comparisons below.** Open-source Chronicle Queue (2026.8,
 the version `compare/chronicle/pom.xml` pins) ran with its default queue options, except `SyncMode.SYNC` in the
@@ -1416,9 +1418,13 @@ commits stated above). Rates are of these machines and do not carry over to othe
 - **Remaining, measured:** a helper thread on the writer's CPU still delays it (up to 3.0 ms with
   `HelperCpus::Inherited`; the default places helpers elsewhere); at 90 % of the 64 B probe durability fell minutes
   behind at `279f59a` and, at `3fea1c0`, on aarch64 xfs; appends of 50–128 ms in 148–172 seconds of each 1,024 B
-  steady-90 run on aarch64 ext4 (`3fea1c0`), not rolls, not investigated; the single stalls of 0.10–0.67 s without
+  steady-90 run on aarch64 ext4 (`3fea1c0`), not rolls, since attributed (2026-11-25, below: the write fault's mtime
+  update waits for the ext4 journal's log writes, which the device completes late; `lazytime` removes them, but not
+  the rolls'); the single stalls of 0.10–0.67 s without
   checkpoints at `279f59a` did not recur at `3fea1c0` (at most 13.2 ms); the aarch64 mapped reader's 10 ms maximum in
-  the finish round (16-vCPU VMs), not investigated and not seen in the second session (8-vCPU VMs).
+  the finish round (16-vCPU VMs), not seen in the second session or in a repeat at that round's commit on 8-vCPU VMs
+  (2026-11-25, below), not explained. A spare segment on Linux is an option from 1.1, off by default (ADR 0049): it
+  makes rolls cheaper away from the disk's limit, not the stalls rarer.
 - **Remaining, open:** the record checksum mismatch that stopped a reader of the 1,024 B probe on both aarch64 VMs at
   `279f59a` was a reader's view lagging a correctly published record; readers now tolerate it, and the long verified
   runs at `3fea1c0` and the confirming runs at `fbe5785` showed no false corruption and no lost write (issue #43,
@@ -1444,6 +1450,568 @@ commits stated above). Rates are of these machines and do not carry over to othe
   (`Action::MoveTo`) can fall behind for as long as checkpoints stay queued (ADR 0044 → Amendment): not measured.
   Under sustained overload watch `tickertape status` (`segments.before_checkpoint`, `segments.total_bytes`, the
   checkpoint's age and the storage headroom thresholds).
+
+## 2026-11-25, where the CPU time goes: profiles of the readers, notification and serialization (Google Cloud VMs)
+
+Profiles of v1.0.0's library under the sustained workloads (`tt-sustained`, ADR 0026), for the roadmap item "Finish
+eliminating avoidable work" (issue #62). They show where CPU time goes and what work remains per record. **The machines
+have 4 vCPUs: the latencies, rates and CPU shares here are not comparable with the published tables above**, and nothing
+here is a throughput or latency result. The comparisons inside this section are between runs on the same machine in the
+same session. **Current `main` was not profiled; only v1.0.0's library was.** Since then #66 changed how a durable-only
+reader reads the checkpoint marker, and later merges changed other files of the library.
+
+### Environment and method
+
+| | x86-64 | aarch64 |
+|---|---|---|
+| Machine | `c4-standard-4-lssd` (us-east1-b): Intel Xeon 6985P-C, 2 cores with 2 threads each, 15 GB | `c4a-standard-4-lssd` (us-east1-b): Google Axion (Neoverse-V2), 4 cores, 16 GB |
+| Kernel, OS | 7.0.0-1017-gcp, Ubuntu 24.04.5 LTS | the same |
+| Filesystem | ext4 (`-E lazy_itable_init=0,lazy_journal_init=0`, mounted `noatime`) on a local NVMe SSD (375 GB), write-back sysctls at the defaults | the same |
+| Writer, reader CPU | 0, 1 (two cores); helper threads unpinned | 0, 1 (two cores); helper threads unpinned |
+| rustc, perf, bpftrace | 1.100.0, 7.0.14, 0.20.2 | the same |
+
+Commit `2a9b428`: v1.0.0's `crates/tickertape/src` (no difference) with the tools of this change in `benches/`. The
+candidate below is `751ee43`. Both commits are kept by the branch `core/safe-reader-tail-reads` (`2a9b428` is an
+ancestor of `751ee43`); do not delete it. **Virtual machines, not bare metal.** The guests expose no CPU cycles counter
+(`perf stat -e cycles` reports it as not supported), so the profiles are `cpu-clock` samples at 1999 Hz: an interrupt in
+a section with interrupts off is taken when they are turned on again, which blames short kernel sections on the
+instruction after them (on aarch64 `finish_task_switch`, where a thread switched in is sampled, holds most of the
+blocking zero-copy reader's samples below 1.5 million records/s). The profiled binaries are built with `RUSTFLAGS="-C
+force-frame-pointers=yes" CARGO_PROFILE_RELEASE_DEBUG=1`; the encoding and candidate comparisons below use the ordinary
+release build.
+
+The runs are `tt-sustained run --dir /data/j --warmup 5s --checkpoint-every 1s --checkpoint-mode background
+--retain-bytes 34359738368 --cpus 0,1` with `--rate` or `--unpaced`, `--payload` and `--readers` as in the tables, and
+`--duration 28s` for the CPU profiles (a 20 s sample, starting 8 s in), 36 s for the counts, 20 s for the encoding
+comparison and 25 s for the candidate; `/data` is the local SSD and `/data/j` is removed after each run. The replay
+benchmark ran as `TMPDIR=/data/tmp taskset -c 1 <replay benchmark binary> --bench records`.
+`benches/diagnostics/profile-sustained.sh DIR perf 20 -- <run>` records the CPU profiles of the writer's and the
+reader's measuring thread with frame-pointer call graphs and folds them (`fold-stacks.py`, which names inlined
+functions); `... counts 8 -- <run>` is a separate run that counts system calls and bytes read (`counts.bt`), heap
+allocations with their stacks (`allocs.bt`) and `perf trace -s`, each for 8 s, so that counting does not distort a
+profile. The kernel-side `bpftrace` counts slow the threads somewhat at high rates, so per-record counts of a reader
+that falls behind are those of the observed run. Each pass is a complete run of the list; two passes on both machines
+(on aarch64 one pass for the `default` wait mode, the `owned` readers and the no-reader runs). Cells show the range over
+the two passes, x86-64 first, then aarch64 after a slash. One value for a machine means that its passes are equal, and
+one value without a slash that both machines are. Rows marked † have one pass on aarch64. Counting runs whose window,
+measured from before `bpftrace` started, was longer than 9.5 s are left out: three, of 9.6, 17 and 41 s (the last on the
+candidate below), in which `bpftrace` ran past its 8 s. Windows of 8.5 to 9.3 s were kept; they include attaching the
+probes, and the counts in them can cover slightly more than 8 s, which is why a count of exactly one per record can read
+1.00 to 1.03. Raw output (folded stacks, count files, `result.json` and series) is kept outside the repository.
+
+### The readers
+
+Share of the reader thread's samples (%), and CPU of a core the thread used (%, from `getrusage`, not from the samples).
+"64 KiB reads" are the safe reader's fills of its buffer; the wait mode is that of `--readers` (`spin`: wake-ups off;
+`block`: blocks at once; `default`: spins and yields, then blocks). The rest of each row is the tool's latency
+recording, loop bookkeeping and registration as a waiter.
+
+| Reader, wait | Payload | Records/s | CPU of a core | Commit-word polls | 64 KiB reads: copy | 64 KiB reads: rest | Futex wait | Clock reads | CRC and decode | Checkpoint marker |
+|---|---|---|---|---|---|---|---|---|---|---|
+| safe spin | 64 B | 20,000 | 100 | 72 / 73 | 3 | 0 / 1 | 0 | 15 / 16 | 0 | 0 |
+| safe block | 64 B | 20,000 | 27–28 / 12 | 15–20 / 14–15 | 30–42 / 27–29 | 6–7 | 26–32 / 41 | 2 / 4 | 1 | 0 |
+| mapped spin | 64 B | 20,000 | 100 | 1 / 2 | 0 | 0 | 0 | 63 / 72 | 0 | 0 |
+| mapped block | 64 B | 20,000 | 21–22 / 5 | 0 | 0 | 0 | 73–85 / 99–100 | 2–4 / 0 | 1–2 / 0 | 0 |
+| safe spin | 64 B | 200,000 | 100 | 51 / 46–47 | 27 / 31–32 | 4 / 7 | 0 | 9–10 / 9 | 0 / 0–1 | 0 |
+| safe block | 64 B | 200,000 | 71 / 81 | 14–16 / 19 | 32–35 / 40–41 | 5–6 / 10 | 31–32 / 21–22 | 2 / 3 | 1–2 / 1 | 0 |
+| mapped spin | 64 B | 200,000 | 100 | 2–3 / 3 | 0 | 0 | 0 | 60 / 70 | 2 / 1 | 0 |
+| mapped block | 64 B | 200,000 | 42–43 / 50–51 | 2 / 0 | 0 | 0 | 58–64 / 97–98 | 5–7 / 1 | 4 / 0 | 0 |
+| safe spin | 64 B | 1,500,000 | 100 | 14 | 58–59 / 53–54 | 9–10 / 12 | 0 | 3 / 5 | 3–4 / 3 | 0 |
+| safe block | 64 B | 1,500,000 | 99 | 13 / 14 | 59 / 53 | 9 / 12 | 0 | 3 / 5 | 3 | 0 |
+| mapped spin | 64 B | 1,500,000 | 100 | 13 / 10 | 0 | 0 | 0 | 41 / 56 | 14–15 / 4 | 0 |
+| mapped block | 64 B | 1,500,000 | 84–87 / 95–97 | 2–3 / 2 | 0 | 0 | 43–44 / 44 | 11–12 / 19 | 10 / 5 | 0 |
+| safe spin | 1024 B | 20,000 | 100 | 72 / 73 | 3 | 0 / 1 | 0 | 14 / 16 | 0 | 0 |
+| safe block | 1024 B | 20,000 | 27 / 12 | 26 / 15–17 | 24 / 28–29 | 7–8 / 6–7 | 28–29 / 37–40 | 1 / 4 | 2 | 0 |
+| mapped spin | 1024 B | 20,000 | 100 | 1 / 2 | 0 | 0 | 0 | 63 / 72 | 1 / 0 | 0 |
+| mapped block | 1024 B | 20,000 | 21–22 / 5 | 0 | 0 | 0 | 78–81 / 99 | 3 / 0 | 3–5 / 0 | 0 |
+| safe spin | 1024 B | 200,000 | 100 | 46–48 / 45 | 31–32 / 32 | 5 / 7 | 0 | 8 / 9 | 2 | 0 |
+| safe block | 1024 B | 200,000 | 74 / 81 | 15 / 18 | 39 / 41–43 | 5 / 9 | 27 / 19–21 | 2 / 3 | 3 / 2–3 | 0 |
+| mapped spin | 1024 B | 200,000 | 100 | 4 | 0 | 0 | 0 | 56–57 / 68 | 6 / 2 | 0 |
+| mapped block | 1024 B | 200,000 | 46–47 / 48–49 | 1 / 0 | 0 | 0 | 69–70 / 97–98 | 4 / 1 | 8 / 1 | 0 |
+| safe default † | 64 B | 200,000 | 99 | 50 / 46 | 27–28 / 31 | 5 / 7 | 0 | 9 | 0 | 0 |
+| mapped default † | 64 B | 200,000 | 99 | 2 / 3 | 0 | 0 | 0 | 59 / 70 | 2 / 1 | 0 |
+| safe durable spin | 64 B | 200,000 | 100 | 0 | 0 | 0 | 0 | 1 | 0 | 97 |
+| mapped durable spin | 64 B | 200,000 | 100 | 0 | 0 | 0 | 0 | 1 | 1 | 97 |
+| mapped durable block | 64 B | 200,000 | 99 | 0 | 0 | 0 | 3 | 1 | 1 | 92 / 93 |
+
+System calls per record appended, and bytes read, over 8 s (`open` counts the wake-up record and the checkpoint marker;
+a value below 0.01 is shown as `<0.01`):
+
+| Reader, wait | Payload | Records/s | 4-byte `pread` | Larger `pread` | Bytes read | Futex wait | `open` |
+|---|---|---|---|---|---|---|---|
+| safe spin | 64 B | 20,000 | 106–107 / 73–74 | 1.01 | 66,700–66,900 / 66,600–67,100 | 0 | 0 |
+| safe block | 64 B | 20,000 | 3.02–3.03 / 3.02 | 1.01 | 66,400 / 66,100–66,200 | 1.00–1.01 / 1.00 | <0.01 |
+| mapped spin | 64 B | 20,000 | 0 | 0 | 0 | 0 | 0 |
+| mapped block | 64 B | 20,000 | 0 | 0 | 0.04 | 1.01 / 1.00–1.01 | <0.01 |
+| safe spin | 64 B | 200,000 | 6.16–6.63 / 4.16–4.23 | 1.00 / 1.01 | 66,000–66,200 / 66,100–66,700 | 0 | <0.01 |
+| safe block | 64 B | 200,000 | 2.00–2.02 / 2.18–2.29 | 0.99–1.00 / 0.95–0.97 | 65,100–65,600 / 62,700–63,500 | 0.50 / 0.55–0.57 | <0.01 |
+| mapped spin | 64 B | 200,000 | 0 | 0 | <0.01 | 0 | <0.01 |
+| mapped block | 64 B | 200,000 | 0 | 0 | <0.01 | 0.98–0.99 / 0.99–1.00 | <0.01 |
+| safe spin | 64 B | 1,500,000 | 0.22–0.23 / 0.19 | 0.22 / 0.19 | 14,500–14,700 / 12,400 | 0 | <0.01 |
+| safe block | 64 B | 1,500,000 | 0.22 / 0.19 | 0.22 / 0.19 | 14,600 / 12,400 | <0.01 | <0.01 |
+| mapped spin | 64 B | 1,500,000 | 0 | 0 | <0.01 | 0 | <0.01 |
+| mapped block | 64 B | 1,500,000 | 0 | 0 | <0.01 | 0.39–0.42 / 0.35–0.39 | <0.01 |
+| safe spin | 1024 B | 20,000 | 99–101 / 73–74 | 1.01 | 66,600–67,000 / 66,400–66,600 | 0 | <0.01 |
+| safe block | 1024 B | 20,000 | 3.02–3.03 / 3.02 | 1.01 | 66,100–66,500 / 66,000–66,100 | 1.00–1.01 / 1.00 | <0.01 |
+| mapped spin | 1024 B | 20,000 | 0 | 0 | <0.01 | 0 | <0.01 |
+| mapped block | 1024 B | 20,000 | 0 | 0 | 0.04 | 1.01 / 1.00–1.01 | <0.01 |
+| safe spin | 1024 B | 200,000 | 5.34–5.75 / 3.97 | 1.00 / 1.00–1.01 | 65,400–65,700 / 65,900–66,200 | 0 | <0.01 |
+| safe block | 1024 B | 200,000 | 1.73–1.88 / 2.12–2.22 | 0.84–0.91 / 0.95–0.97 | 55,100–59,800 / 62,800–64,100 | 0.42–0.47 / 0.51–0.53 | <0.01 |
+| mapped spin | 1024 B | 200,000 | 0 | 0 | <0.01 | 0 | <0.01 |
+| mapped block | 1024 B | 200,000 | 0 | 0 | <0.01 | 0.98 / 0.97 | <0.01 |
+| safe default † | 64 B | 200,000 | 6.45–6.60 / 4.15 | 1.01 | 66,200–66,400 / 66,600 | <0.01 | <0.01 |
+| mapped default † | 64 B | 200,000 | 0 | 0 | <0.01 | <0.01 | <0.01 |
+| safe durable spin | 64 B | 200,000 | <0.01 | <0.01 | 104 | 0 | 0.55–0.58 / 0.42–0.43 |
+| mapped durable spin | 64 B | 200,000 | 0 | 0 | <0.01 | 0 | 0.56–0.57 / 0.43 |
+| mapped durable block | 64 B | 200,000 | 0 | 0 | <0.01 | 0.26–0.28 / 0.20 | 0.52–0.55 / 0.41 |
+
+What the profiles show:
+
+- **The safe reader reads up to 64 KiB for each record it follows live.** At 20,000 and 200,000 records/s it has
+  0.84–1.01 buffer fills and reads 55–67 KB per record; spinning at 20,000 records/s that is 1.3 GB/s to follow 2 MB/s
+  of 104-byte records. The copy alone is 24–59 % of the reader's samples, except in the spin runs at 20,000 records/s,
+  where polling is most of them (3 %). At 1.5 million records/s the reader has caught up in batches: 0.2 fills and 12–15
+  KB per record. It also issues a 4-byte `pread` for every poll of an empty slot: 73–107 per record when spinning at
+  20,000 records/s, and three per record when blocking (the poll, the second check after registering as a waiter that
+  the wake-up protocol needs, and the poll after the wake-up).
+- **The zero-copy reader copies nothing** and makes no system call while it spins. Its spin loop is mostly clock reads:
+  two `Instant::now` calls per empty poll (the timeout of `next_timeout` and the 100 ms identity check) take 41–63 % of
+  the samples on x86-64 and 56–72 % on aarch64. Checking a record (CRC and decode) is 4–15 % at 1.5 million records/s of
+  64 B, and 0–8 % at 1,024 B.
+- **Blocking readers**: the futex wait and the wake-up are 19–41 % of the samples of the safe reader (none at 1.5
+  million records/s, where it hardly blocks) and 43–85 % of the zero-copy reader's on x86-64. On aarch64 they are 97–100
+  % of the zero-copy reader's samples up to 200,000 records/s and 44 % at 1.5 million; 70–73 % of the samples at 200,000
+  records/s are in `finish_task_switch`, where `cpu-clock` sampling lands when a thread is switched in, so those shares
+  do not measure what that function costs. At 200,000 records/s the safe reader makes about one futex wait per two
+  records, the zero-copy reader one per record.
+- **Durable-only readers** (64 B, 200,000 records/s, a checkpoint every second): 92–97 % of the samples are in reading
+  the checkpoint marker: while at the boundary, every poll opens the marker file and reads all 128 KiB of it in 13
+  `read` calls (0.4–0.6 opens per record appended), with about 16 allocator calls per poll on both machines (two
+  `malloc`, the rest `realloc`: mostly the read buffer growing, and two that build the path). These are counted in a
+  window of their own, in which the probes slowed the reader. A blocking durable-only reader is also woken by appends
+  although only a checkpoint can give it records. Since #66 a refresh reads only the marker's slots, not the whole file;
+  that has not been profiled again, and the open and close remain.
+
+Allocations: none per record on either reader. `tests/allocation.rs`, with a counting allocator, asserts zero for
+records already committed, with each wait mode configured, and for a spinning wait, and bounds a reader that blocks for
+every record by the re-read of the wake-up record (every 100 ms). On the live runs `allocs.bt` finds 128–385 allocator
+calls in 8 s in the reader thread (128–252 of them `malloc`): the tool's once-a-second JSON series, the re-read of the
+wake-up record by a blocking reader (`notify::read_record`, about 80 times, two calls each) and a few per segment
+change. `Record::to_owned` (the `owned` reader option) is one allocation per record. On aarch64 it counted 1.02–1.03 per
+record appended, above 1 because the count covers slightly more than 8 s; on x86-64 it counted 0.65–0.68, because in
+that window the reader read only 123,000–131,000 of the 200,000 records/s (its series), so about one per record read.
+
+### The writer, notification and serialization
+
+Share of the writer thread's samples (%); the rest is the tool (its schedule's busy wait, clocks and histograms), which
+is most of a paced run. Futex wakes include the helper thread's signals, about one per 64 KiB appended.
+
+| Run | CRC | Payload copy | Encoding | Publish: atomic | Publish: futex wake | Page faults | Checkpoint calls | Futex wakes per record |
+|---|---|---|---|---|---|---|---|---|
+| mapped-wait-block-64-20000 | 0.2 / 0.0–0.1 | 0.0 | 0.0 | 0.2 | 2.5–2.7 / 3.3–3.4 | 0.0 | 0.0 | 1.00–1.03 / 1.01 |
+| safe-wait-block-64-200000 | 1.4 / 0.2–0.4 | 0.1 / 0.0–0.1 | 0.0 | 0.4 / 1.6–1.8 | 10.2–10.6 / 13.8–14.4 | 0.1 / 0.0–0.1 | 0.0 | 0.51 / 0.63–0.68 |
+| mapped-wait-block-64-200000 | 1.6–1.7 / 0.2–0.3 | 0.0–0.1 / 0.0 | 0.0 | 0.4–0.5 / 1.8–1.9 | 8.9 / 32.8–32.9 | 0.1 | 0.0 | 1.00 |
+| mapped-wait-spin-64-1500000 | 12.1–12.3 / 1.6 | 0.3–0.4 / 0.2 | 0.0 | 2.8 / 12.3–12.4 | 0.1–0.2 / 0.2–0.4 | 0.2 / 0.4 | 0.0 | <0.01 |
+| mapped-wait-block-64-1500000 | 10.7–10.9 / 1.6–1.7 | 0.3 / 0.2–0.3 | 0.0 | 3.4–4.2 / 13.5–14.4 | 33.6–33.8 / 36.6 | 0.3–0.4 / 0.4–0.5 | 0.0 | 0.48–0.50 / 0.41–0.46 |
+| mapped-wait-block-1024-200000 | 5.7 / 2.3–2.4 | 0.4 / 1.4 | 0.0 | 0.9–1.2 / 1.0–1.4 | 11.1–11.2 / 32.2–32.8 | 0.1 / 0.5–0.6 | 0.0 | 1.01 |
+| none-64-200000 † | 0.3–0.4 / 0.2 | 0.0 | 0.0 | 0.1 / 1.0 | 0.0 / 0.1 | 0.1 | 0.0 | — |
+| none-1024-200000 † | 2.5–3.2 / 2.4 | 0.3–0.4 / 1.4 | 0.0 | 0.1 / 0.3 | 0.4 / 0.5 | 0.1 / 0.6 | 0.0 | — |
+| unpaced-prepared-64 | 7.8–8.0 / 4.2–4.6 | 0.6–0.7 / 0.5 | 0.0 | 2.8–2.9 / 28.2 | 0.6–1.0 / 0.8–0.9 | 0.0–2.6 / 0.3 | 3.1–3.3 / 0.4–0.5 | <0.01 |
+| unpaced-buffer-64 | 6.7–7.0 / 4.2–4.3 | 1.6–1.7 / 0.5 | 1.7–1.9 / 1.1–1.2 | 2.6–2.7 / 27.2–27.3 | 0.6 / 0.8–0.9 | 2.7–2.9 / 0.2–0.3 | 2.9–3.1 / 0.5–0.6 | <0.01 |
+| unpaced-in-place-64 | 7.3–7.6 / 4.2–4.3 | 0.4 / 0.1 | 0.8–0.9 / 1.1–1.2 | 2.7–2.9 / 25.5–26.1 | 0.6–0.7 / 0.9 | 2.3–3.3 / 0.2–0.3 | 3.2–3.6 / 0.5–0.6 | <0.01 |
+| unpaced-prepared-1024 | 21.3–21.7 / 19.0–19.3 | 2.7–2.8 / 8.2–8.5 | 0.0 | 1.3–1.4 / 2.9–3.0 | 0.4–0.6 / 2.2–2.3 | 25.1–25.4 / 12.6–12.9 | 4.8–4.9 / 2.2–2.3 | 0.01 |
+| unpaced-buffer-1024 | 19.1–19.4 / 17.0–17.2 | 3.8–4.2 / 7.1–7.3 | 11.6–12.0 / 12.9–13.2 | 1.4–1.5 / 3.0–3.1 | 0.5–0.7 / 2.1 | 21.0–21.7 / 11.1 | 3.8–4.1 / 1.7–1.9 | 0.01 |
+| unpaced-in-place-1024 | 15.8–17.2 / 16.1 | 0.2–0.3 / 0.1 | 14.5–15.1 / 19.1–19.3 | 1.2–1.6 / 2.6–2.9 | 0.9–1.0 / 1.9–2.1 | 21.6–23.1 / 10.1–11.0 | 4.3 / 2.0–2.2 | 0.01 |
+
+- **CRC and copy.** In the unpaced runs of 1,024 B the CRC is 16–22 %, the payload copy 3 % (x86-64) to 8 % (aarch64),
+  page faults 21–25 % on x86-64 and 10–13 % on aarch64, the tool 35–50 %. Encoding straight into the record
+  (`append_with`) removes the copy and encodes in mapped memory; see below.
+- **The wake-up's atomic increment.** `publish` is one sequentially consistent increment of the event counter and one
+  load per `append` (a `lock incl` on x86-64, the only locked instruction per record in the disassembly of the append
+  path: the commit word's release store is a plain store there, and the helpers' mutex is taken once per 64 KiB). It is
+  1–4 % of the writer's samples on x86-64 at 1.5 million records/s and unpaced, and at most 1.4 % at 200,000 records/s
+  and below. On aarch64 it is 11–14 % at 1.5 million records/s, 26–28 % unpaced at 64 B, and at most 2.0 % at 200,000
+  records/s and below. Almost all the aarch64 samples are at one address in the runtime's `__aarch64_ldadd4_acq_rel`
+  (called out of line because the default target selects LSE atomics at run time), which in the ordinary build's layout
+  is just after the `ldaddal`; the profiled binary's own disassembly was not kept. Samples at such an instruction also
+  include the time it waits for the thread's earlier stores, so these shares are not the cost of the instruction alone.
+- **Wake-ups of a blocked reader.** The writer makes one futex wake per record while a reader blocks between records
+  (20,000 records/s). It makes more wakes than the reader makes waits where the reader blocks often: 0.48–0.50 against
+  0.39–0.42 per record for the zero-copy reader at 1.5 million records/s on x86-64 (0.41–0.46 against 0.35–0.39 on
+  aarch64), and 0.63–0.68 against 0.55–0.57 for the safe reader at 200,000 records/s of 64 B on aarch64. With the
+  zero-copy reader blocking, the wake-ups take 9–11 % of the writer's samples on x86-64 and 33 % on aarch64 at 200,000
+  records/s, and 34 % and 37 % at 1.5 million. A reader that spins costs the writer none of this; `append_batch`
+  publishes one wake-up for a batch (ADR 0041).
+- **System calls on the steady path.** None per record without a blocked reader. `request_checkpoint` once a second, a
+  roll about every 1.3 million records of 104 B.
+
+Copies of the payload and allocations. Allocated once and not per record: the CRC's tables, by a process's first record
+long enough to use them (ADR 0024), and on macOS, once per writer, the mutex and condition variable shared with the
+helper thread:
+
+| Path | Copies of the payload | Allocations per record | System calls per record | Locks and atomics per record |
+|---|---|---|---|---|
+| `append`, prepared buffer | 1 (the caller's buffer into the mapping) | 0 | 0 (a futex wake only if a reader is registered) | release store of the commit word; sequentially consistent increment and load of the wake-up words |
+| `append` after encoding into a buffer | 2 (encode, then copy) | 0 | as above | as above |
+| `append_with` (encode in place) | 1 (encode) | 0 | as above | as above |
+| `append_batch` | 1 per record | 0 | one futex wake per batch at most | the commit word per record; the wake-up once per batch |
+| safe reader | 1 in the kernel (`pread` to the reader's buffer, at the tail 64 KiB for each record) | 0 | 2 or more `pread` at the tail, one per 64 KiB when behind | one acquire fence per poll that finds a record |
+| zero-copy reader | 0 | 0 | 0 | a relaxed load of the commit word and an acquire fence; relaxed loads of the record's words |
+| blocking wait, reader side | as the reader | 0, apart from the wake-up record's re-read every 100 ms (two allocator calls) | one futex wait per wait, plus 4 at each re-read | increment and compare-and-swap of the waiter count, load of the event counter and of the writer's flag |
+| clocks, reader side | – | 0 | 0 (vDSO) | one clock read when `next_timeout` is called with a finite timeout, one per empty poll for that timeout and one for the 100 ms identity check; per block, one in `refresh_if_due` and one in `block_on` with a timeout |
+| identity check, reader side | – | 0 | one `stat` per 100 ms at an empty slot | – |
+| helper signals (prefault, early write-back) | – | 0 | one futex wake per 64 KiB appended, if the helper waits | one mutex lock per 64 KiB |
+
+Where the writer's append time goes in the three ways of making a payload, unobserved release builds, three alternated
+runs each (median of each run's append p50 in ns, encoding included, range over the runs):
+
+| Payload, rate | Machine | Prepared, `append` | Encoded into a buffer, then `append` | `append_with` |
+|---|---|---|---|---|
+| 64 B, 200,000/s | x86-64 | 47 (47–50) | 51 (50–51) | 51 (51–53) |
+| 64 B, 200,000/s | aarch64 | 122 (122–123) | 126 (126–127) | 124 (124–124) |
+| 64 B, unpaced | x86-64 | 47 (47–49) | 50 (49–51) | 52 (51–52) |
+| 64 B, unpaced | aarch64 | 123 (122–123) | 126 (125–132) | 124 (123–124) |
+| 1,024 B, 200,000/s | x86-64 | 114 (114–116) | 171 (167–174) | 163 (160–163) |
+| 1,024 B, 200,000/s | aarch64 | 231 (231–232) | 316 (315–317) | 268 (265–268) |
+
+`prepared` does no encoding, so it is a floor, not a competitor; a field-by-field stand-in encoder (`--encode`) is what
+the other two run. At 64 B the difference in p50 between `append_with` and encoding into a buffer is −2 to +2 ns and
+changes sign between configurations (the run ranges are 0–7 ns wide). At 1,024 B `append_with` is faster by 8 ns on
+x86-64 (ranges 160–163 against 167–174) and 48 ns on aarch64, net; the copy alone was not isolated.
+
+### What remains, and whether it can go
+
+**Safe reader**
+
+| Work | Necessary? |
+|---|---|
+| A `pread` per empty poll, a second one of the slot after registering as a waiter | Necessary: the safe reader does not map files (ADR 0003), and the check after registering is the wake-up protocol's (ADR 0017). The first of the three polls of a blocking reader that blocks at once could be skipped |
+| A 64 KiB `pread` for every record at the tail | Avoidable: a smaller fill there. Tried below, mixed result, not changed |
+| Opening, reading (128 KiB in v1.0.0) and closing the marker file at every poll of a durable-only reader at the boundary | Avoidable: less of it since #66; the descriptor could be kept open (the marker file is only created or written in place; only something outside the library replaces it) |
+| Copying a record out (`Record::to_owned`) | Asked for by the caller |
+| The payload's copy into the reader's buffer | Necessary for the safe reader; the zero-copy reader does without it |
+
+**Zero-copy reader**
+
+| Work | Necessary? |
+|---|---|
+| A clock read per empty poll for the 100 ms identity check, and one for the timeout of `next_timeout` (which also reads the clock once per call with a finite timeout) | Avoidable in part: share one clock read between both. The spin loop burns the core anyway, so the gain is a shorter poll, not less CPU; not measured |
+| CRC of every record before it is handed out | Necessary: it is what validates a record before any reference to it exists (ADR 0027) |
+| Page faults (0.0008 per record of 104 B, 0.008 of 1,064 B) | Necessary: the first touch of the mapping; the kernel maps around a fault |
+
+**Notification**
+
+| Work | Necessary? |
+|---|---|
+| The sequentially consistent increment and load per `append` | The ordering of the commit before the waiter check is necessary while wake-ups are on. The unconditional increment is how ADR 0017 does it; a fence, with the increment only when a reader waits, is untested. `notify(false)` removes both. On aarch64 the increment is an outlined call (`-C target-feature=+lse` removes the call, for a build that does not need to run on ARMv8.0); not measured |
+| Futex wakes while a reader blocks between records | One wake per sleeping reader is necessary for a single `append`; `append_batch` sends one per batch (ADR 0041). Wakes sent while a reader is registered but presumably not asleep, up to about a fifth of them (more wakes than waits, above), are avoidable; not measured |
+| Wake-ups of a blocking durable-only reader by `append` | Avoidable: only a checkpoint (or a roll) can give it records; it needs its own event counter or waiter count, which changes the shared notify region's layout (ADR 0021) |
+| Four system calls and two small allocator calls every 100 ms per blocked reader (re-read of the `notify` record), and a `stat` per 100 ms at an empty slot (identity check) | Necessary to follow a restarted writer and to notice a replaced segment; bounded by the interval |
+
+**Serialization and append**
+
+| Work | Necessary? |
+|---|---|
+| The payload copy in `append` | Avoidable by the caller with `append_with`; the figures above give its size |
+| CRC of the frame | Necessary (the record's integrity check, `format.md`) |
+| Page faults of the writer at 1,024 B unpaced | Partly avoidable by a larger prefault window; Linux keeps it small on purpose (ADR 0025) |
+| A mutex and a futex wake per 64 KiB for the helpers | Necessary to hand them the position; about one wake per 600 records of 104 B in total |
+
+### Candidate measured and left out: a smaller read at the tail
+
+Branch `core/safe-reader-tail-reads` (`751ee43`) makes the safe reader read 4 KiB when it has caught up and grow back to
+64 KiB when a buffer is wholly consumed. Before/after of the release builds, three alternated runs each of 25 s after 5
+s of warm-up, latency in µs from the intended send time, medians over the three runs as base → new (safe reader; late
+sends are sends more than 1 µs late; CPU of the reader thread). Between the three runs of one configuration p50 varied
+by at most 4 %, p99 by up to 3.8 times and p99.9 by up to 2.3 times, so only large differences in the tails say
+anything.
+
+| Wait | Payload | Records/s | p50 | p99 | p99.9 | Late sends | CPU of a core |
+|---|---|---|---|---|---|---|---|
+| spin, x86-64 | 64 B | 20,000 | 2.07 → 0.761 | 2.58 → 1.25 | 5.3 → 4.56 | 0.02 → 0.03 % | 100 → 100 % |
+| spin, aarch64 | 64 B | 20,000 | 2.5 → 1.05 | 2.92 → 1.5 | 7.11 → 5.57 | 0.02 → 0.00 % | 100 → 100 % |
+| block, x86-64 | 64 B | 20,000 | 14.8 → 12.7 | 19.1 → 15.4 | 24.1 → 20.1 | 1.53 → 0.03 % | 23 → 22 % |
+| block, aarch64 | 64 B | 20,000 | 6.22 → 4.68 | 7.14 → 5.54 | 10.2 → 8.79 | 0.00 → 0.02 % | 11 → 8 % |
+| spin, x86-64 | 64 B | 200,000 | 2.06 → 0.753 | 4.22 → 2.17 | 9.97 → 7.94 | 0.68 → 0.59 % | 100 → 100 % |
+| spin, aarch64 | 64 B | 200,000 | 2.49 → 1.04 | 4.13 → 2.04 | 6.89 → 3.84 | 0.05 → 0.08 % | 100 → 100 % |
+| block, x86-64 | 64 B | 200,000 | 4.03 → 2.98 | 7.89 → 5.68 | 17.4 → 13.2 | 0.70 → 0.67 % | 72 → 56 % |
+| block, aarch64 | 64 B | 200,000 | 3.69 → 4.25 | 6.72 → 5.5 | 10.1 → 7.74 | 0.08 → 0.15 % | 80 → 56 % |
+| spin, x86-64 | 64 B | 1,500,000 | 3.15 → 0.801 | 14 → 22.3 | 46.2 → 64.6 | 4.02 → 4.33 % | 100 → 100 % |
+| spin, aarch64 | 64 B | 1,500,000 | 3.65 → 1.04 | 6.68 → 3.37 | 32.1 → 30 | 1.22 → 1.34 % | 100 → 100 % |
+| block, x86-64 | 64 B | 1,500,000 | 3.13 → 0.837 | 11 → 102 | 52.8 → 155 | 3.56 → 8.92 % | 99 → 99 % |
+| block, aarch64 | 64 B | 1,500,000 | 3.67 → 1.05 | 7.28 → 4.45 | 36 → 32.2 | 1.31 → 2.22 % | 99 → 99 % |
+| spin, x86-64 | 1,024 B | 20,000 | 2.6 → 1.3 | 5.95 → 3.31 | 15.7 → 15.1 | 0.09 → 0.14 % | 100 → 100 % |
+| spin, aarch64 | 1,024 B | 20,000 | 2.73 → 1.25 | 5.24 → 3.75 | 11.7 → 10.6 | 0.02 → 0.01 % | 100 → 100 % |
+| block, x86-64 | 1,024 B | 20,000 | 15.4 → 13.4 | 19.3 → 16.7 | 28.7 → 23.8 | 0.10 → 0.07 % | 24 → 21 % |
+| block, aarch64 | 1,024 B | 20,000 | 6.47 → 4.78 | 8.57 → 6.92 | 15 → 13.6 | 0.01 → 0.01 % | 11 → 8 % |
+| spin, x86-64 | 1,024 B | 200,000 | 2.59 → 1.3 | 7.47 → 4.44 | 21.1 → 19.8 | 1.35 → 1.74 % | 100 → 100 % |
+| spin, aarch64 | 1,024 B | 200,000 | 2.7 → 1.26 | 5.5 → 3.61 | 25.5 → 23.5 | 0.58 → 0.96 % | 100 → 100 % |
+| block, x86-64 | 1,024 B | 200,000 | 4.5 → 3.41 | 10.6 → 9.2 | 31.6 → 22.6 | 1.72 → 1.83 % | 74 → 59 % |
+| block, aarch64 | 1,024 B | 200,000 | 3.95 → 4.57 | 9.15 → 7.47 | 27.5 → 25.3 | 0.55 → 0.94 % | 82 → 56 % |
+
+It reads about 14–18 times fewer bytes per record at the tail (3.5–4.6 KB per record of 64 B at 20,000 and 200,000
+records/s, polls included, one counting pass) and lowers p50 to 25–87 % of the base, except for the blocking reader at
+200,000 records/s on aarch64, where it rises to 115–116 %; the CPU of the blocking reader falls at 200,000 records/s (72
+→ 56 % and 74 → 59 % of a core on x86-64, 80 → 56 % and 82 → 56 % on aarch64). The cost: on x86-64 at 1.5 million
+records/s the tails grow (blocking p99 11 → 102 µs and p99.9 53 → 155 µs, spinning p99.9 46 → 65 µs). On x86-64 at
+200,000 records/s of 64 B the blocking reader also costs about twice the futex wakes (0.51 → 0.98 per record, one counting pass;
+aarch64 falls from 0.63–0.68 to 0.52). At 1.5 million records/s the blocking reader blocked more often (2,700–3,200 →
+47,000–50,000 voluntary context switches a run on x86-64) and the writer made more futex wakes (0.002 → 0.011 per
+record) and more late sends (3.6 → 8.9 %). But aarch64 shows the same rise in blocking (2,400 → 30,000–39,000 switches,
+wakes 0.002 → 0.0075) and no tail growth, and the spinning tail on x86-64 grew too, so the extra wakes alone do not
+explain the tail; it is not explained. The replay benchmark (`cargo bench --bench replay`, filter `records`, three
+interleaved variants, 8 rounds, base, a second copy of the base binary, new; median of the rounds, ms per pass of
+1,000,000 records of 64 B or 100,000 of 1,024 B):
+
+| Machine | Case | Base | Second copy of base | New | New against base, paired by round |
+|---|---|---|---|---|---|
+| x86-64 | safe, 64 B | 37.7 (36.1–39.4) | 37.6 (35.9–39.1) | 38.1 (37.0–40.0) | +2.1 % median, slower in 6 of 8 rounds |
+| x86-64 | safe, 1,024 B | 13.9 (13.2–15.9) | 14.4 (13.2–17.6) | 15.1 (13.3–16.6) | +7.8 %, 7 of 8 |
+| x86-64 | mapped, 64 B | 50.9 (50.3–53.6) | 51.2 (49.9–56.2) | 52.1 (51.2–54.4) | +1.6 %, 7 of 8 |
+| x86-64 | mapped, 1,024 B | 11.0 (10.4–12.0) | 11.3 (10.4–12.1) | 11.7 (10.5–12.2) | +4.4 %, 6 of 8 |
+| aarch64 | safe, 64 B | 38.4 (38.2–38.6) | 38.2 (38.1–38.7) | 38.3 (38.1–45.6) | −0.3 % of medians |
+| aarch64 | safe, 1,024 B | 14.8 (14.7–15.0) | 14.9 (14.7–15.1) | 14.9 (14.7–15.6) | +0.6 % of medians |
+| aarch64 | mapped, 64 B | 36.4 (35.7–37.8) | 36.1 (35.9–36.5) | 36.3 (35.8–40.9) | −0.2 % of medians |
+| aarch64 | mapped, 1,024 B | 10.5 (10.4–10.6) | 10.6 (10.5–10.7) | 10.6 (10.3–11.1) | +0.5 % of medians |
+
+On x86-64 the second copy of the base differs from the base by −0.0 to +3.6 % (medians of the rounds; −0.3 to +2.0 %
+paired), so the replay is slightly slower there for both readers, also the zero-copy one, whose code the change does not
+touch, beyond what that floor explains in some cases; on aarch64 nothing differs beyond it. **Next step.** Worth
+pursuing, because the p50 and CPU gains are large and the 64 KiB read is confirmed by count, but not as a fixed 4 KiB
+read. Try hysteresis (shrink only after several empty polls, grow on the first fully consumed buffer) with the code of
+the per-record path unchanged, gated on x86-64 p99 at 1.5 million records/s and on replay (the view of the review of
+this change and of the maintainers' agent). Not changed here.
+
+## 2026-11-25, roll and journal stalls on Google Cloud VMs (Linux, x86-64 and aarch64)
+
+Where the stalls of the sustained runs come from (issue #60), the repeat of ADR 0023's spare-segment experiment now
+that rolls do not sync, and the before/after of the change that followed (ADR 0049; an option, off by default on
+Linux). All of it ran on **Google Cloud virtual machines, not bare metal**, in one day's sessions; it is not compared
+with earlier sections except where the text says so. The raw output (results, time series, traces, scripts) is kept
+outside the repository.
+
+### Environment and commands
+
+Ubuntu 24.04, kernel 7.0.0-1017-gcp (`CONFIG_HZ=1000`, `PREEMPT_LAZY`), rustc 1.100.0, ext4 on the first 375 GB local
+NVMe SSD (`mkfs.ext4 -E lazy_itable_init=0,lazy_journal_init=0`, 1 GiB journal, no fast commit; mounted `rw,noatime`),
+xfs with defaults on the second (`rw,noatime,inode64,logbufs=8,logbsize=32k`), I/O scheduler `none`, `wbt_lat_usec`
+2000, write-back sysctls at their defaults, 4 KiB pages. Journals on the SSD, results on the boot disk.
+
+| Machine | CPU, vCPUs, memory | Time (UTC) | Used for |
+|---|---|---|---|
+| `c4a-standard-8-lssd`, us-central1-b | Google Axion (Neoverse-V2), 8, 31 GiB | 12:17–17:22 | everything aarch64 |
+| `c4-standard-16-lssd`, us-east1-d | Xeon 6985P-C, 16 (8 cores), 58 GiB | 12:17–16:48 | everything x86-64 but the next row |
+| `c4-standard-16-lssd`, us-east1-d (a second VM) | the same | 16:50–17:39 | x86-64 without checkpoints; 10 more steady-50 pairs |
+
+Commits: `v1.0.0` (`1e8651d1`); `85726e34` (`main`, the "before" below); `03334481`, the "after": that `main` plus the
+spare segment with one thread for the writer's life, always on (later commits on the branch made it an option, added
+the storage-full fallback and tests; the code the measured runs took is otherwise the same). Builds: the "before" VMs
+checked out `85726e34` from the repository; the "after" binaries were built from a `git archive` of `03334481` sent
+over SSH. The runs record the sha256 of the line that names the archive (`3d123edb…`, in `binaries-v.txt`); `git
+archive --format=tar.gz 03334481` reproduces exactly that line (archive sha256 `2b49c851…`): the source archive's
+identity is verified; that the measured binary was built from it is not. What is recorded is that its `tt-sustained`
+hash differs from `main`'s on the same VM (aarch64 `d52317c4…` against `f230c344…`, x86-64 `c348e7c5…` against
+`83a87b49…`), that both later scripts recorded the same hash for it, and that its traced rolls do not create or
+preallocate a file on the writer. Two builds preceded that are **not** the after build and are kept for that reason:
+the directories named `INVALIDmainB` (a stale Cargo cache gave the binary of `main`; rerun), and the runs of the 18
+visibility-only cells per machine (`m7-vis-*`, `q2-vis-*`) stopped at once with "retention runs only after
+checkpoints" because the script passed `--retain-bytes` without checkpoints (`main` and the kept build were rerun as
+`v-vis-*`; the thread-per-spare build was not). Experiments used the branch `exp/roll-60` (`b22c8fe9`, `v1.0.0` with
+switches, never merged), the scripts are in its `exp60/` directory.
+
+```sh
+tt-sustained run --dir … --out … --json --payload 1024 --duration 60s --warmup 10s --retain-bytes 68719476736 \
+  --checkpoint-every 1s --checkpoint-mode background --readers mapped,safe:wait=default,safe:durable:wait=block \
+  --cpus 1,2,3,4,5,6 --rate <rate>      # 169,206 / 304,571 aarch64, 173,119 / 311,614 x86-64
+tt-latency run --dir … --rate 100000 --count 1100000 --warmup 100000 --payload 1024 --reader mapped --json
+```
+
+The rates are the published steady-50 and steady-90 rates of the second sustained session above (half and 90 % of the
+10-minute probe of these machine types). Runs of 60 s, so a 10-minute run has ten times the rolls and stalls. Every
+run started on a deleted journal after `sync`; configurations were interleaved. In every before/after pair the
+"before" build ran first (a future run should alternate); latencies in µs unless a cell says ms; "late" is sends more
+than 1 µs late; ranges are over the runs. Coordinated omission is handled as above.
+
+### Where the writer's thread waits
+
+From traced runs (`offcpu.bt`, `events.bt`, `stalls.bt`, block requests; bpftrace 0.20.2), each kept only if untraced
+runs showed the same stalls (below). Waits of the writer's thread of 3 ms or more:
+
+| Run | Arch | Wait | Count | Total | Max |
+|---|---|---|---|---|---|
+| steady-90 (v1.0.0) | aarch64 | write fault: mtime update, waiting for the ext4 journal | 56 | 5.3 s | 138 ms |
+| | | roll: `link`, the same wait | 2 | 0.13 s | 121 ms |
+| | | roll: `open(O_CREAT)`, the same wait | 2 | 0.04 s | 24 ms |
+| steady-90 (v1.0.0) | x86-64 | none | 0 | | |
+| steady-50 (v1.0.0) | both | none | 0 | | |
+| unpaced (v1.0.0) | aarch64 | write fault: write-back throttling (`balance_dirty_pages`) | 3,155 | 48.6 s | 27 ms |
+| | | write fault: mtime update, journal | 16 | 3.3 s | 389 ms |
+| | | roll: `mmap` waiting for `mmap_lock` | 79 | 1.1 s | 27 ms |
+| | | roll: `open(O_CREAT)`, journal or buffer lock | 14 | 0.79 s | 131 ms |
+| unpaced (v1.0.0) | x86-64 | write fault: write-back throttling | 2,854 | 43.5 s | 27 ms |
+| | | roll: `fallocate`, journal or buffer lock | 27 | 2.5 s | 329 ms |
+| | | roll: `mmap` waiting for `mmap_lock` | 71 | 0.90 s | 26 ms |
+| | | roll: `open(O_CREAT)`, journal or buffer lock | 11 | 0.74 s | 206 ms |
+| | | write fault: mtime update, journal | 1 | 0.18 s | 182 ms |
+
+- **Appends of 50–140 ms that are not rolls (aarch64 ext4, 90 % of the probe).** A store into a page that is not yet
+  writable takes a write fault; ext4 updates the file's modification time there (`file_update_time` →
+  `ext4_dirty_inode`), which needs to change the block holding the inode, and waits in `do_get_write_access` while the
+  committing journal transaction writes that block to the log. In the traced run all 49 writer faults of 20 ms or more
+  lay (at least 90 % of their length) inside the logging phase of a commit, which covered 10.1 of the 65 s. The
+  prefault helper's faults wait in the same place, so it cannot hide them. Logging is slow there because the device
+  is: commits logged for 4 ms (p50), 129 ms (p90), at most 304 ms on aarch64, and at most 1 ms on x86-64 at the same
+  share of its probe, where the same workload has no such stall; on aarch64 81 of the traced log writes took 20 ms or
+  more, on x86-64 none reached 1 ms. **Why that device queues at 92 % of its probe, on this shape only, is not
+  explained**; nothing traced inside the guest accounts for it.
+- **Test of that: `lazytime`.** With the filesystem remounted `lazytime`, which keeps modification times out of the
+  journal, the same workload has 3–10 seconds with a 50 ms append per run instead of 28–30 (three 60-second runs each,
+  interleaved, one VM shape), and every one of them is a roll. The roll appends get longer (max 114–130 ms, against
+  0.2–59 ms without `lazytime`): the waits that remain are the roll's own journalled calls. In an earlier session of
+  the day (the same machine type, a VM that has since been lost; three runs each) the figures were 2–7 against 32–39.
+- **Roll appends of 100–400 ms.** Seen unpaced, where the device is overloaded: 82–304 ms (aarch64) and 120–259 ms
+  (x86-64) at most per run. Each call of a roll (create, `fallocate`, `mmap`, `link`, `unlink`) is a journalled
+  operation or takes `mmap_lock`, and waits for the journal, for a buffer lock, or (for `mmap`) for a thread that
+  holds `mmap_lock`, most likely the prefault helper throttled in its `madvise` (not traced to the holder). Most of an
+  unpaced writer's lost time is throttling in page faults, by design of the kernel.
+- **Roll p50.** Without any stall a roll appends in 142–184 µs with checkpoints: creating the file, `fallocate` (about
+  65–100 µs) and the link. Without checkpoints 0.9–1.0 ms: not traced here; unmapping a 128 MiB segment took 0.4–0.65
+  ms where a trace caught it, which is the likely rest.
+- **Helper threads on the writer's CPU** (`--helper-cpus inherited`, steady-50): append maxima of 1.0–1.8 ms against
+  0.18–0.26 ms with the default placement (three runs per cell). The expected explanation, the scheduler's base slice
+  (2.8 ms), **does not fit**: 1.3–1.5, 1.1–1.6 and 1.7–1.8 ms (aarch64) and 1.2–1.5, 1.0–1.6 and 1.5–1.6 ms (x86-64)
+  for slices of 0.7, 2.8 and 8 ms. The 3.0 ms of the earlier session was not reached. Not explained further.
+- **The aarch64 mapped reader's 10 ms maximum.** Not reproduced: the finish round's command (180 s, 250,000 records/s,
+  4 CPUs, helpers on CPUs 5–7) at its own commit (`f194c42`) and at `v1.0.0` gave reader maxima of 1.07–1.12 and
+  1.10–1.31 ms (two runs each) on this 8-vCPU shape. It was seen on 16-vCPU VMs, which were not run; not explained.
+
+### Larger prefault window, ranged checkpoint sync: rejected
+
+Both were tried as remedies at steady-90 (`exp/roll-60`; three runs per cell). A larger window does not help: 8 MiB
+left 26–30 seconds with a 50 ms append and 48 MiB 21–24, against 32–39 (aarch64, the earlier session, warm-up seconds
+included). Dropping the checkpoint's whole-file `fdatasync` of the active segment (its ranged `msync` covers the same
+data) so that prefaulted pages are not written back changed nothing (28–37 against 28–30; with an 8 MiB window 19–28),
+and with the larger window x86-64 got worse (append max 1.4–5.9 ms, checkpoints durable after 190 ms). Neither is
+kept.
+
+### The spare segment, again (ADR 0023)
+
+ADR 0023's cell: `tt-latency`, 100,000 records/s, 1,024 B, mapped reader, 30 interleaved rounds of 11 s each per
+configuration and architecture on the freshly formatted ext4 (after one 12-second smoke run). In ADR 0023 one run in
+four had a p99.9 of 26 ms.
+
+| Arch | Configuration | p99.9 | p99.99 | max | Runs with p99.9 above 100 µs |
+|---|---|---|---|---|---|
+| aarch64 | no spare | 24–28 | 813–849 | 978–1,035 | 0 of 30 |
+| | spare, synced | 22–25 | 675–712 | 861–920 | 0 of 30 |
+| | spare, not synced | 22–25 | 675–700 | 865–905 | 0 of 30 |
+| x86-64 | no spare | 30–33 | 843–914 | 1,099–1,190 | 0 of 30 |
+| | spare, synced | 29–35 | 726–774 | 1,024–1,085 | 0 of 30 |
+| | spare, not synced | 29–31 | 719–795 | 1,028–1,106 | 0 of 30 |
+
+These 30 rounds used the build that starts a thread per spare, which was later rejected. They do **not** show that the
+failure of ADR 0023 is gone: that experiment ran on a `c6id.xlarge`, of which ADR 0025 says "The small VM cannot
+sustain about 106 MB/s for minutes: every configuration stalls there for hundreds of milliseconds. That is a disk
+limit", so its 100,000 records/s was near the device's limit, while it is about 30 % of the probe of the machines
+here. Only the 15 rounds below used the build that was kept. At steady-90 on x86-64 one of 8 runs with the synced
+spare had an append of 52 ms and a checkpoint that took 328 ms to become durable; of the 8 runs without a spare two
+had appends of 3.3 and 7.9 ms, and the 8 runs with an unsynced one at most 0.69 ms. One bad run proves nothing about
+the sync, but nothing needs it either, so the change does not sync.
+
+**Unpaced** (the same build with a thread per spare, unsynced; four 60-second runs per cell, interleaved, 1,024 B,
+readers mapped and safe, checkpoints every second), the mapped reader's p99.9 is worse with a spare and the rolls'
+median is better:
+
+| Arch | Configuration | Roll append p50 | Roll append max | Mapped reader p99.9 |
+|---|---|---|---|---|
+| aarch64 | no spare | 0.22, 2.7, 2.8, 6.6 ms | 82–304 ms | 596, 598, 599, 602 |
+| | spare | 49–51 | 0.11–298 ms | 649, 656, 658, 664 |
+| | no spare, `lazytime` | 0.21, 4.2, 4.2, 5.3 ms | 279–336 ms | 604, 605, 605, 606 |
+| | spare, `lazytime` | 56–58 | 158–329 ms | 653, 657, 660, 663 |
+| x86-64 | no spare | 0.18, 0.21, 1.4, 1.5 ms | 120–259 ms | 528, 543, 549, 762 |
+| | spare | 55–60 | 0.10–303 ms | 604, 626, 628, 814 |
+| | no spare, `lazytime` | 3.5, 4.0, 4.9, 9.3 ms | 240–447 ms | 540, 543, 548, 746 |
+| | spare, `lazytime` | 60–63 | 14–264 ms | 605, 615, 617, 622 |
+
+The kept build was not run unpaced.
+
+A spare prepared by a **new thread per segment** (as on macOS) cuts the roll append to about 50 µs but makes the
+writer's worst append worse at steady-50 in every run: append max 364–381 µs against 190–215 (aarch64), 571–698
+against 170–346 (x86-64), and the mapped reader's p99.9 184–194 against 112–127 and 209–228 against 74–148. Traced,
+starting the thread costs the writer 26–40 µs; on aarch64 the writer took 60 page faults of about 370 µs over 88
+rolls, which the kept variant does not have; their cause was not traced further. Rejected. The change keeps one thread
+for the writer's life.
+
+### Before and after (`85726e34` against `03334481`: without and with the spare segment)
+
+aarch64 (interleaved, 1,024 B; checkpoints every second unless stated):
+
+| Configuration | Runs | Late sends (%) | Append p99.9 | Append max | Roll append p50 | Roll append max | Mapped reader p99.9 | max |
+|---|---|---|---|---|---|---|---|---|
+| steady-50, ext4, before | 6 | 0.7–0.8 | 8.8–9.3 | 190–211 | 170–178 | 190–211 | 116–131 | 879 µs to 1.4 ms |
+| steady-50, ext4, after | 6 | 0.7–0.7 | 8.4–9.2 | 74–132 | 47–48 | 54–57 | 36–41 | 760–795 |
+| steady-90, ext4, before | 6 | 9.7–14.6 | 5.1–5.8 | 138–154 ms | 179–182 | 216 µs to 126.4 ms | 129–134 ms | 138–154 ms |
+| steady-90, ext4, after | 6 | 11.3–14.2 | 5.1–5.5 | 139–144 ms | 51–53 | 105 µs to 111.6 ms | 127–135 ms | 139–146 ms |
+| steady-50, xfs, before | 3 | 0.6–0.7 | 9.4–9.7 | 190–232 | 152–158 | 171–188 | 123–125 | 879–906 |
+| steady-50, xfs, after | 3 | 0.6–0.6 | 9.5–9.7 | 227–340 | 59 | 97–104 | 54–91 | 814–815 |
+| no checkpoints, half rate, ext4, before | 6 | 0.8–0.8 | 6.1–6.4 | 1.00–1.07 ms | 882–945 | 1.00–1.07 ms | 257–291 | 1.03–1.11 ms |
+| no checkpoints, half rate, ext4, after | 6 | 0.7–0.8 | 5.7–6.3 | 743–765 | 721–730 | 743–765 | 38–47 | 804–820 |
+
+x86-64 (the last four rows on the second VM):
+
+| Configuration | Runs | Late sends (%) | Append p99.9 | Append max | Roll append p50 | Roll append max | Mapped reader p99.9 | max |
+|---|---|---|---|---|---|---|---|---|
+| steady-50, ext4, before | 6 | 1.9–2.2 | 7.4–8.5 | 174–187 | 137–162 | 174–187 | 80–96 | 783–905 |
+| steady-50, ext4, after | 6 | 2.0–2.2 | 7.5–8.5 | 139 µs to 2.7 ms | 46–50 | 58–68 | 51–73 | 674 µs to 2.8 ms |
+| steady-90, ext4, before | 6 | 4.5–6.3 | 7.4–7.7 | 208 µs to 1.0 ms | 144–161 | 208–786 | 349–496 | 778 µs to 1.4 ms |
+| steady-90, ext4, after | 6 | 3.2–5.2 | 6.2–7.5 | 144–747 | 44–50 | 94–101 | 247–309 | 657–842 |
+| steady-50, xfs, before | 3 | 1.2–2.1 | 8.1–8.2 | 195–212 | 150–167 | 195–212 | 75–135 | 776–868 |
+| steady-50, xfs, after | 3 | 1.7–2.1 | 7.5–8.2 | 140–174 | 64–69 | 111–118 | 50–61 | 681–799 |
+| steady-50, ext4, before | 10 | 1.2–2.1 | 7.4–8.2 | 182–437 | 147–158 | 179–197 | 80–172 | 764 µs to 1.0 ms |
+| steady-50, ext4, after | 10 | 1.0–2.4 | 7.7–9.2 | 147–350 | 47–54 | 59–68 | 49–66 | 661–806 |
+| no checkpoints, half rate, ext4, before | 6 | 1.4–1.9 | 5.8–6.1 | 1.07–1.23 ms | 1.03–1.04 ms | 1.07–1.23 ms | 427–443 | 1.14–1.26 ms |
+| no checkpoints, half rate, ext4, after | 6 | 1.7–1.9 | 5.9–6.1 | 972 µs to 1.2 ms | 917–940 | 972 µs to 1.2 ms | 285–335 | 1.00–1.20 ms |
+
+ADR 0023's `tt-latency` cell (15 interleaved rounds each), p99.9 / p99.99 / max: aarch64 24–28 / 811–854 / 974–1,030
+before, 22–25 / 674–704 / 847–887 after; x86-64 32–34 / 888–933 / 1,126–1,191 before, 29–33 / 739–799 / 1,033–1,092
+after.
+
+- Away from saturation the roll append (p50) falls from 137–182 to 44–54 µs with checkpoints on ext4 (150–167 to 59–69
+  µs on xfs), and the mapped reader's p99.9 falls by roughly a quarter to 85 %, on both architectures and filesystems.
+  Without checkpoints the roll stays long (0.72–0.94 ms against 0.88–1.04).
+- **Costs and limits.** (1) At the saturated aarch64 steady-90 the kept build met a stall at rolls more often: 5 of 6
+  runs with a roll of 20 ms or more against 2 of 6 for `main`, 10 against 3 seconds with one. Pooling the session's
+  builds, spawned and kept threads alike: 16 of 22 against 12 of 32 (two-sided Fisher p = 0.014, a test chosen after
+  seeing the data). What the writer loses overall does not change: 30.5 against 29.5 seconds with an append of 20 ms
+  or more (medians, p = 0.87), append max 140 ms in both, late sends 12.4 against 12.3 %. (2) On aarch64 xfs the
+  append max is higher (227–340 against 190–232 µs, three runs). (3) One x86-64 steady-50 run of 16 had a 2.7 ms
+  append that was not a roll; it did not recur in the 10 later ones.
+- **Not measured with the kept build:** unpaced, xfs at steady-90, `HelperCpus::Inherited`, 4 vCPUs, bare metal. Not
+  measured at all: other filesystems, payloads other than 1,024 B, and (beyond the functional tests) a full disk. For
+  that reason the spare segment is off by default on Linux (ADR 0049).
+
+### Tracing overhead
+
+The same runs (v1.0.0) with `offcpu.bt` (waits of 3 ms or more listed), `events.bt`, `stalls.bt` (system calls and
+`handle_mm_fault` entry and return, jbd2 commits) and block issue and complete probes attached, and without,
+interleaved on the same VM: four pairs at steady-90, three unpaced pairs. bpftrace 0.20.2, kernel 7.0.0-1017-gcp, on
+ext4.
+
+| Run | Arch | Tracing | Achieved rate | Append p50 | Append p99.9 | Append max | Late sends (%) | Seconds with an append ≥ 50 ms |
+|---|---|---|---|---|---|---|---|---|
+| steady-90 | aarch64 | off | 304,571 | 0.35 | 4.2–4.5 | 137–142 ms | 12.3–14.1 | 28, 33, 35, 35 |
+| | | on | 304,571 | 0.35 | 4.7–5.2 | 141–143 ms | 11.0–12.7 | 31, 35, 35, 36 |
+| steady-90 | x86-64 | off | 311,614 | 0.56 | 5.2–6.3 | 610–752 µs | 2.3–3.8 | 0 |
+| | | on | 311,614 | 0.57–0.58 | 6.6–7.2 | 220–900 µs | 2.0–3.8 | 0 |
+| unpaced | aarch64 | off | 403,438–407,494 | 0.30–0.31 | 10.3–10.4 | 277–371 ms | – | – |
+| | | on | 402,928–406,386 | 0.30–0.31 | 11.4–11.5 | 339–347 ms | – | – |
+| unpaced | x86-64 | off | 472,194–475,924 | 0.50 | 8.9 | 258–357 ms | – | – |
+| | | on | 471,191–474,713 | 0.50 | 9.3–9.4 | 75–310 ms | – | – |
+
+Tracing costs the writer's p99.9 about 0.5 µs (median difference) at steady-90 and 0.5–1.1 µs unpaced; throughput,
+p50, maxima, late sends and the stalls are unchanged within the spread. The tracers' own processes used 3.4–3.5 s of
+CPU per 70-second aarch64 run, 1.4–1.5 s on x86-64. The conclusion it rests on is thereby confirmed untraced: the
+aarch64 stalls occur as often without any probe.
 
 ## 2026-11-02, v0.3.0 on Linux (AWS) and macOS
 

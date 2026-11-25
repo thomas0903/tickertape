@@ -351,7 +351,8 @@ any). A failure is returned once, by the next `request_checkpoint`, `checkpoint_
 then `Status::durability_lost`. `close()` waits for a checkpoint in flight and returns that failure (or
 `durability_lost` for a poisoned writer); the destructor waits too but cannot report, so call `close()` when you need
 to know. `WriterOptions::early_writeback(bool)` and `WriterOptions::helper_cpus(HelperCpus)` (or a list of CPUs) set
-the Linux-only options of ADR 0038.
+the Linux-only options of ADR 0038. `WriterOptions::spare_segment(bool)` (from 1.1) is the spare segment (ADR 0049):
+on by default on macOS, off on Linux; nothing reports the value in effect.
 
 Closing or destroying a writer does not checkpoint. A failed checkpoint poisons the writer: later checkpoints fail
 with `Status::durability_lost` while appends keep working; treat it as an incident. `ReaderOptions::durable_only(true)`

@@ -1,0 +1,12 @@
+#!/usr/bin/env bpftrace
+// System calls of one thread by number, and the calls and bytes of its pread64 calls by the size asked for.
+// Part of profile-sustained.sh.   sudo bpftrace counts.bt TID SECONDS
+// futex calls are split by operation (128 and 256 removed: 0 wait, 1 wake, 9 wait_bitset, 10 wake_bitset).
+// Every figure is a total over SECONDS.
+
+tracepoint:raw_syscalls:sys_enter /tid == $1/ { @calls[args.id] = count(); }
+tracepoint:syscalls:sys_enter_futex /tid == $1/ { @futex_op[args.op & 127] = count(); }
+tracepoint:syscalls:sys_enter_pread64 /tid == $1/ { @pread_calls[args.count] = count(); }
+tracepoint:syscalls:sys_exit_pread64 /tid == $1 && args.ret > 0/ { @pread_bytes = sum(args.ret); }
+software:page-faults:1 /tid == $1/ { @page_faults = count(); }
+interval:s:$2 { exit(); }

@@ -1146,6 +1146,10 @@ const CPP_WRAPPED: &[(&str, &str)] = &[
         "WriterOptions::early_writeback",
     ),
     (
+        "tickertape_writer_options_set_spare_segment",
+        "WriterOptions::spare_segment",
+    ),
+    (
         "tickertape_writer_options_set_helper_cpus",
         "WriterOptions::helper_cpus (both overloads)",
     ),

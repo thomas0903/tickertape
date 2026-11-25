@@ -226,6 +226,49 @@ fn build_check_and_remove() {
     }
 }
 
+/// One segment that cannot be read fails the command, not the other segments, in a build and a check; a check counts
+/// what killed builds left.
+#[test]
+fn a_failed_segment_and_unfinished_files() {
+    let (dir, mut writer) = journal();
+    writer.checkpoint().unwrap();
+    let built = run(dir.path(), &[], 0);
+    assert_eq!(built["unfinished"], Value::Null);
+    assert_eq!(run(dir.path(), &["--check"], 0)["unfinished"], 0);
+    let indexes = dir.path().join(seek_index::DIR_NAME);
+    fs::write(indexes.join(std::format!(".{:020}.77.1.idx-tmp", 0)), b"x").unwrap();
+    let segment = dir
+        .path()
+        .join(built["segments"][1]["file"].as_str().unwrap());
+    let mode = |m| fs::set_permissions(&segment, fs::Permissions::from_mode(m)).unwrap();
+    mode(0o000);
+    if fs::read(&segment).is_ok() {
+        return; // root
+    }
+    let built = run(dir.path(), &["--rebuild"], 1);
+    assert_eq!(states(&built), ["built", "failed", "built", "not_covered"]);
+    assert!(built["segments"][1]["reason"].is_string());
+    let checked = run(dir.path(), &["--check"], 1);
+    assert_eq!(
+        states(&checked),
+        ["valid", "failed", "valid", "not_covered"]
+    );
+    assert_eq!(checked["unfinished"], 1);
+    command()
+        .args(["index", "--check"])
+        .arg(dir.path())
+        .assert()
+        .code(1)
+        .stdout(predicate::str::contains("1 unfinished index file(s)"))
+        .stderr(predicate::str::contains("1 segment(s) failed"));
+    mode(0o644);
+    let removed = run(dir.path(), &["--remove"], 0);
+    assert_eq!(
+        (&removed["removed"], &removed["unfinished"]),
+        (&json!(4), &Value::Null)
+    );
+}
+
 /// `--seek-index` changes where a seek starts, not what is printed; with damage before the landing record it shows.
 #[test]
 fn seek_index_of_tail_export_and_stats() {

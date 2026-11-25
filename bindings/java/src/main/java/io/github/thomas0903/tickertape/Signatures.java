@@ -252,6 +252,7 @@ final class Signatures {
         f.put("tickertape_writer_options_set_notify", FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT));
         f.put("tickertape_writer_options_set_prefault", FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT));
         f.put("tickertape_writer_options_set_early_writeback", FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT));
+        f.put("tickertape_writer_options_set_spare_segment", FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT));
         f.put("tickertape_writer_options_set_helper_cpus",
                 FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT, ADDRESS, SIZE_T));
         f.put("tickertape_writer_options_set_retention", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS));

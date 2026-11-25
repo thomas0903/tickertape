@@ -182,6 +182,10 @@ tickertape_status tickertape_writer_options_set_early_writeback(struct tickertap
     stub_calls++;
     return TICKERTAPE_OK;
 }
+tickertape_status tickertape_writer_options_set_spare_segment(struct tickertape_writer_options *, int32_t) {
+    stub_calls++;
+    return TICKERTAPE_OK;
+}
 tickertape_status tickertape_writer_options_set_helper_cpus(struct tickertape_writer_options *, int32_t,
                                                             const uint32_t *, size_t) {
     stub_calls++;
@@ -418,7 +422,7 @@ static void builders_check_the_library_first() {
         tt::WriterOptions writer_options;
         writer_options.segment_size(65536).recovery_policy(tt::RecoveryPolicy::fail).notify(true).prefault(false);
         writer_options.retention(retention).no_retention();
-        writer_options.early_writeback(false).helper_cpus(tt::HelperCpus::inherited).helper_cpus({0, 1});
+        writer_options.early_writeback(false).spare_segment(true).helper_cpus(tt::HelperCpus::inherited).helper_cpus({0, 1});
         tt::ReaderOptions reader_options;
         reader_options.durable_only(true).seek_index(true).notify(false).backoff(1, 1, 1us, 2us).busy_spin();
         for (const std::optional<tt::Error> *error : {&retention.error(), &writer_options.error(), &reader_options.error()}) {

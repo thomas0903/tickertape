@@ -126,6 +126,7 @@ class Writer:
         early_writeback: bool = True,
         helper_cpus: Literal["process", "inherited"] | Iterable[SupportsIndex] = "process",
         retention: Retention | None = None,
+        spare_segment: bool | None = None,
     ) -> Writer: ...
     def append(self, payload: _Bytes, *, schema_id: int = 0, venue_ts_ns: int = 0, local_ts_ns: int = 0) -> int: ...
     def append_batch(

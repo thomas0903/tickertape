@@ -27,7 +27,7 @@ const HELP: &str = "tt-latency: cross-process writer-to-reader visible latency
 Usage: tt-latency run --dir <DIR> --rate <records/s> --count <N>
                      --payload <bytes> --reader safe|mapped
                      [--warmup <N>] [--segment-size <bytes>] [--json] [--cold]
-                     [--wait spin|default|block|sleep] [--no-prefault]
+                     [--wait spin|default|block|sleep] [--no-prefault] [--spare-segment]
                      [--writer-cpu N] [--reader-cpu N] [--helper-cpus LIST]
        tt-latency --help
 
@@ -42,6 +42,7 @@ releases a shared future start time.
   block    no spins or yields: block on the notify file at once (kernel wake-up only)
   sleep    Backoff::default() with notify off: spins, yields, then 10 us..1 ms sleeps
 --no-prefault starts the writer with WriterConfig::prefault(false) (no helper thread).
+--spare-segment starts it with WriterConfig::spare_segment(true) (ADR 0049; default: the platform's).
 --writer-cpu and --reader-cpu pin the measured threads (Linux; an error elsewhere), each after it has opened its
 endpoint and before it is ready. --helper-cpus places the writer's helper threads (HelperCpus::List), for example
 4,5; without it they may run on any CPU the cpuset allows, except isolated ones. The JSON result has the affinity in
@@ -79,6 +80,7 @@ struct Config {
     reader: String,
     wait: String,
     prefault: bool,
+    spare_segment: bool,
     warmup: u64,
     segment_size: u64,
     json: bool,
@@ -108,7 +110,11 @@ impl Config {
         if child {
             values.push("--control");
         }
-        let options = Options::parse(args, &values, &["--json", "--cold", "--no-prefault"])?;
+        let options = Options::parse(
+            args,
+            &values,
+            &["--json", "--cold", "--no-prefault", "--spare-segment"],
+        )?;
         let rate = options.number("--rate", None)?;
         let count = options.number("--count", None)?;
         let warmup = options.number("--warmup", Some(0))?;
@@ -153,6 +159,7 @@ impl Config {
             reader,
             wait,
             prefault: !options.flag("--no-prefault"),
+            spare_segment: options.flag("--spare-segment") || WriterConfig::default().spare_segment,
             warmup,
             segment_size,
             json: options.flag("--json"),
@@ -288,7 +295,7 @@ fn run(config: &Config, args: &[String]) -> Result<()> {
     };
     let mut result = json!({"mode": if config.cold { "cold_replay" } else { "visible_latency" },
         "count": config.count, "rate": config.rate, "payload": config.payload, "reader": config.reader,
-        "wait": config.wait, "prefault": config.prefault, "warmup": config.warmup, "segment_size": config.segment_size});
+        "wait": config.wait, "prefault": config.prefault, "spare_segment": config.spare_segment, "warmup": config.warmup, "segment_size": config.segment_size});
     result["affinity"] = json!({"reader": reader_result["affinity"].take()});
     if let Some(fields) = reader_result.as_object_mut() {
         fields.remove("affinity");
@@ -348,7 +355,8 @@ fn writer(config: &Config) -> Result<()> {
     let control = config.control.as_ref().ok_or("missing control directory")?;
     let mut writer_config = WriterConfig::default()
         .segment_size(config.segment_size)
-        .prefault(config.prefault);
+        .prefault(config.prefault)
+        .spare_segment(config.spare_segment);
     if let Some(cpus) = &config.helper_cpus {
         writer_config = writer_config.helper_cpus(HelperCpus::List(cpus.clone()));
     }
