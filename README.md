@@ -38,25 +38,55 @@ readers, retained and replayable files, rolling, and easy inspection. tickertape
 
 Measured against Chronicle Queue, Aeron, yaque, queue-file and plain files with the comparison suite in
 [`compare/`](compare/README.md). Full results, hardware and caveats are in [`docs/benchmarks.md`](docs/benchmarks.md).
+The numbers describe specific machines on specific days. They are not guarantees.
+
+tickertape has two readers: the safe one (`Reader::open`, which reads with `pread`) and the zero-copy one
+(`Reader::open_mapped`, which is `unsafe`).
+
+### Short runs on bare metal (v0.4.0)
+
 The machine was bare-metal Linux: an AWS `z1d.metal` (Xeon Platinum 8151), ext4 on local NVMe, every process bound to
-one socket. Results for v0.4.0:
+one socket. Each result is the range of two runs. They have not been repeated on bare metal since v0.4.0.
 
-- **Append:** 26.7 million 64-byte records/s, 5.6× Chronicle Queue; 2.2× at 1,024 bytes.
-- **Replay:** fastest of the tools at 64 bytes (23.1 million records/s). At 1,024 bytes it is close to Chronicle
-  Queue (4.8–5.0 against 5.0–5.3 million records/s), while validating a checksum on every record.
-- **Writer-to-reader latency, 100,000 records/s:**
-  - 64 bytes: the zero-copy reader's p99.9 was 0.5–1.8 µs, the lowest of all tools measured. Chronicle Queue's
-    was 36–37 µs and Aeron IPC's 92–133 µs.
-  - 1,024 bytes: tickertape's p99.9 was 7.4–9.2 µs, against Chronicle Queue's 48–55 µs. Aeron's in-memory IPC was
-    lower, at 0.8 µs.
+- **Append:** 26.7 million 64-byte records/s, 5.6× Chronicle Queue; 2.2× at 1,024 bytes. A run appends 1,000,000
+  records of 64 bytes or 100,000 of 1,024 bytes into the page cache, which takes tickertape 31–37 ms. The final
+  checkpoint is not timed, and the disk does not have to keep up in a run this short.
+- **Replay:** fastest of the tools at 64 bytes (23.1 million records/s with the zero-copy reader). At 1,024 bytes the
+  safe reader is close to Chronicle Queue (4.8–5.0 against 5.0–5.3 million records/s), while validating a checksum on
+  every record. The record counts are those of the append runs, read from a warm page cache.
+- **Writer-to-reader latency, 100,000 records/s for 11 seconds:**
+  - 64 bytes: the zero-copy reader's p99.9 was 0.5–1.8 µs, the lowest of all tools measured, and the safe reader's
+    was 4.3–6.3 µs. Chronicle Queue's was 36–37 µs and Aeron IPC's 92–133 µs.
+  - 1,024 bytes: the safe reader's p99.9 was 7.4–9.2 µs and the zero-copy reader's 36–76 µs, against Chronicle
+    Queue's 48–55 µs. Aeron's in-memory IPC was lower, at 0.8 µs.
 
-These are two runs of about 11 seconds on one machine, not guarantees. The tools also promise different things:
+### Ten-minute runs on cloud VMs (after v0.4.0)
+
+Four Google Cloud VMs with local NVMe SSD: x86-64 and aarch64, each with ext4 and with xfs. Every tool wrote for 10
+minutes with a reader following it, and tickertape used the zero-copy reader. The ranges cover the four VMs. The
+code is from development commits between v0.4.0 and v0.5.0. tickertape's rows were measured two days after the other
+tools', on other VMs of the same types and at a newer commit, so this comparison is weaker than the one above, and
+the two sets of results are not compared with each other.
+
+- **Append, unpaced:** 3.5 million 64-byte records/s, against Chronicle Queue's 2.8–3.3 million. At 1,024 bytes both
+  reached 0.34–0.35 million records/s (about 350 MB/s of payload), probably the limit of the disk. Aeron's in-memory
+  IPC was faster at both sizes (3.6–7.4 and 2.9–4.1 million records/s).
+- **Latency at half of each tool's unpaced rate:** tickertape's p99.9 was 0.19–0.54 ms and its maximum 1.2–3.6 ms.
+  Chronicle Queue's p99.9 ranged from 15 µs on xfs to 109 ms on ext4.
+- **The same with a sync every second:** a tickertape checkpoint took 1.3–2.6 ms (median) and its reader's p99.9 was
+  0.77–1.7 ms. Chronicle Queue's sync took 95–127 ms (median) and its reader's p99.9 was 169–187 ms.
+- **At 90 % of the unpaced rate with a checkpoint every second:** tickertape's reader was at most 171 ms behind on
+  three of the four VMs. On x86-64 xfs the writer fell up to 31 seconds behind.
+
+The tools also promise different things:
 - Aeron's IPC transport keeps nothing on disk;
 - yaque is a consuming single-reader queue;
 - the plain-file baseline has no validation or recovery.
 
-Under minutes of sustained high-rate writing, ext4 itself occasionally stalls writers for milliseconds
-([`docs/operations.md`](docs/operations.md)).
+Close to its limit the writer can stall. In tickertape's own 10-minute runs at 1,024 bytes and 90 % of the unpaced
+rate, appends of 50–128 ms recurred on aarch64 ext4. The limits measured so far are in
+[`docs/benchmarks.md`](docs/benchmarks.md#operating-envelope-and-remaining-bottlenecks), and what to plan for is in
+[`docs/operations.md`](docs/operations.md).
 
 ## Quickstart
 

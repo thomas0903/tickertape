@@ -12,6 +12,12 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   on PyPI for its five minutes of retries, although the upload had succeeded. It now installs without pip's cache
   and retries for ten minutes.
 - Added: the v1.0.0 compatibility fixtures (macOS and Linux aarch64), written by the released version (ADR 0033).
+- Docs: the README's Performance section now says that the bare-metal append and replay figures come from short runs
+  in the page cache (31–37 ms for tickertape's append), names the reader behind each latency figure, and adds the
+  10-minute comparison on cloud VMs from `docs/benchmarks.md`. No figure changed and nothing new was measured.
+- Changed (CLI, dependencies): `Cargo.lock` moves parquet from 59.3.2 to 59.3.3 for RUSTSEC-2026-0595 (bloom filters
+  written in plaintext into encrypted Parquet files), which `cargo deny` started to report. The CLI builds parquet
+  without its encryption feature and never wrote such files.
 
 ## [1.0.0] - 2026-11-23
 
