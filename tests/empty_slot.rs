@@ -1406,8 +1406,16 @@ fn killed_writer(rounds: u64) {
                 });
             }
         }
+        // Kills the writer also when this thread panics (it exits by itself if this process is killed).
+        struct Kill(std::process::Child);
+        impl Drop for Kill {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
         for round in 0..rounds {
-            let mut child = Command::new(env!("CARGO_BIN_EXE_tt-kill-writer"))
+            let child = Command::new(env!("CARGO_BIN_EXE_tt-kill-writer"))
                 .args([
                     dir.to_str().unwrap(),
                     &SMALL_SEGMENT.to_string(),
@@ -1416,6 +1424,7 @@ fn killed_writer(rounds: u64) {
                 .stdout(Stdio::null())
                 .spawn()
                 .unwrap();
+            let child = Kill(child);
             let until = Instant::now() + Duration::from_millis(20 + rng.below(250));
             while Instant::now() < until {
                 std::thread::sleep(Duration::from_millis(10));
@@ -1424,8 +1433,10 @@ fn killed_writer(rounds: u64) {
                     let _ = retention::apply(dir, &plan, &Action::Delete);
                 }
             }
-            child.kill().unwrap();
-            child.wait().unwrap();
+            drop(child);
+            // Retention keeps it to a few segments; a test that grows without bound must stop, not fill the disk.
+            let held = segments(dir).len();
+            assert!(held < 2_000, "{held} segments after round {round}");
             // Waiting readers check at 100 ms, and list the segments after 1 s.
             if round % 4 == 0 {
                 std::thread::sleep(Duration::from_millis(rng.below(1_300)));

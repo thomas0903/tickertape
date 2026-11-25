@@ -111,7 +111,10 @@ pub struct Reader {
     waiting_since: Option<Instant>,
     /// The last time [`Reader::check_head`] looked for later segments: `None` if it has not run since the reader was
     /// opened or moved by a seek, or if it ended in an error. It then runs at the next empty slot without waiting first.
-    segments_listed: Option<Listed>,
+    /// Boxed (allocated at the open, never again): a field this size moved the fields of the per-record path so that the
+    /// zero-copy reader replayed 64-byte records at half the speed on an Apple M4 Pro (padding of 40 or 48 bytes did the
+    /// same to the code before; 8 to 32 or 64 bytes did not).
+    segments_listed: Box<Option<Listed>>,
     /// The record [`Reader::advance`] found last (valid only after it returned `true`). The slot reads decode a
     /// record's header straight into it, so that the per-record path passes only small values around (see
     /// [`SlotOutcome`]).
@@ -333,7 +336,7 @@ impl Reader {
             buf_start: 0,
             waker,
             waiting_since: None,
-            segments_listed: None,
+            segments_listed: Box::new(None),
             found: Found {
                 header: RecordHeader {
                     seq: 0,
@@ -931,7 +934,7 @@ impl Reader {
         self.buf.clear();
         self.drop_copy();
         self.waiting_since = None;
-        self.segments_listed = None;
+        *self.segments_listed = None;
         self.superseded_checked = None;
     }
 
@@ -982,7 +985,7 @@ impl Reader {
             buf: std::mem::take(&mut self.buf),
             buf_start: self.buf_start,
             waiting_since: self.waiting_since,
-            segments_listed: self.segments_listed,
+            segments_listed: *self.segments_listed,
             found: self.found,
         };
         self.cursor_moved();
@@ -1011,7 +1014,7 @@ impl Reader {
             self.buf = before.buf;
             self.buf_start = before.buf_start;
             self.waiting_since = before.waiting_since;
-            self.segments_listed = before.segments_listed;
+            *self.segments_listed = before.segments_listed;
             self.found = before.found;
         }
         end
@@ -1292,15 +1295,14 @@ impl Reader {
                 self.set_limit(limit_of(marker.as_ref(), &self.seg));
             }
         }
-        let due = self
-            .segments_listed
-            .is_none_or(|l| now.duration_since(l.at) >= SEGMENT_LIST_INTERVAL);
+        let previous = *self.segments_listed;
+        let due = previous.is_none_or(|l| now.duration_since(l.at) >= SEGMENT_LIST_INTERVAL);
         // Before the listing.
         let directory = due.then(|| directory_stamp(&self.dir)).flatten();
-        let unchanged = self.segments_listed.and_then(|l| l.unchanged);
+        let unchanged = previous.and_then(|l| l.unchanged);
         let list = due && (unchanged.is_none() || unchanged != directory);
         let follows = self.history_after(marker.flatten().as_ref(), list);
-        let listed = match self.segments_listed {
+        let listed = match previous {
             Some(listed) if !list => Listed {
                 at: if due { now } else { listed.at },
                 ..listed
@@ -1312,10 +1314,10 @@ impl Reader {
         };
         if matches!(follows, After::Shown(_)) {
             // After an error the next call checks again at once, and so reports the slot again.
-            self.segments_listed = None;
+            *self.segments_listed = None;
             self.report_unless_head(list)?;
         }
-        self.segments_listed = Some(listed);
+        *self.segments_listed = Some(listed);
         Ok(())
     }
 
@@ -2343,7 +2345,7 @@ mod tests {
                 (r.durable_next_seq, r.durable_segment_base),
                 (r.durable_offset, r.bound),
                 (
-                    (r.waiting_since, r.segments_listed),
+                    (r.waiting_since, *r.segments_listed),
                     r.superseded_checked,
                     format!("{:?}", r.found),
                 ),
@@ -2360,7 +2362,7 @@ mod tests {
             reader.durable_offset = 9;
             reader.bound = 1 << 12;
             reader.waiting_since = Some(Instant::now());
-            reader.segments_listed = Some(super::Listed {
+            *reader.segments_listed = Some(super::Listed {
                 at: Instant::now(),
                 unchanged: None,
             });
@@ -2644,4 +2646,29 @@ mod tests {
         resize_buf(&mut buf, 8).unwrap();
         assert_eq!(buf, [7, 7, 7, 7, 0, 0, 0, 0]);
     }
+}
+#[cfg(test)]
+#[test]
+fn zz_offsets() {
+    use std::mem::offset_of;
+    eprintln!(
+        "size {} seg {} offset {} next_seq {} bound {} buf {} buf_start {} found {} waiting {} mapped {} config {} skip {}",
+        size_of::<Reader>(),
+        offset_of!(Reader, seg),
+        offset_of!(Reader, offset),
+        offset_of!(Reader, next_seq),
+        offset_of!(Reader, bound),
+        offset_of!(Reader, buf),
+        offset_of!(Reader, buf_start),
+        offset_of!(Reader, found),
+        offset_of!(Reader, waiting_since),
+        offset_of!(Reader, mapped),
+        offset_of!(Reader, config),
+        offset_of!(Reader, skip_until)
+    );
+    eprintln!(
+        "seg.map {} seg.size {}",
+        offset_of!(OpenSegment, map),
+        offset_of!(OpenSegment, size)
+    );
 }
