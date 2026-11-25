@@ -90,7 +90,7 @@ case "${1:-run}" in
 esac
 
 # Copying results to the watcher must not run on a measured CPU: every ssh session (tar, encryption) gets CPU 0, which
-# no configuration measures on; the drop-in keeps it so after the reboot. This script may itself come from such a
+# no pinned configuration measures on (unpinned ones can); the drop-in keeps it so after the reboot. This script may itself come from such a
 # session, so it takes the other CPUs back first (all but isolated ones, as a process started at boot has them).
 sudo mkdir -p /etc/systemd/system/ssh.service.d
 printf '[Service]\nCPUAffinity=0\n' | sudo tee /etc/systemd/system/ssh.service.d/rerun-cpu.conf > /dev/null

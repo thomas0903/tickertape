@@ -33,8 +33,8 @@ equivalent every second).
 | pinned, new settings, every tool | `short`, `sustained`, both machines, ext4 | The headline rows: what the corrected harness says, with every tool configured as its documentation recommends |
 | pinned, new settings, every tool, xfs | `short-pinned`, `sustained-journals` (tickertape, Chronicle) | Whether the filesystem changes the picture |
 | unpinned, new settings, every tool | `short` | Whether pinning alone moves the numbers of any tool (the old runs were unpinned) |
-| Chronicle Queue and Aeron, all six old settings, pinned | `short` (both), `sustained-jvm-old` (both) | The before row the owner promised. `--no-long-warmup --no-micro-touch --chronicle-block-size default --aeron-sparse-terms --no-aeron-pre-touch --no-jvm-logs`. Compared with the pinned new row, it shows what the new settings gave |
-| Chronicle Queue, `microTouch()` alone | `short`, both architectures | What `microTouch()` does on its own (the reviewers asked for it): Chronicle's own evidence is unclear, and its effect is expected to differ between aarch64 and x86-64 |
+| "Old settings, new harness" (`jvm-old`): Chronicle Queue and Aeron, all six old settings, pinned | `short` (both), `sustained-jvm-old` (both) | The before row the owner promised. `--no-long-warmup --no-micro-touch --chronicle-block-size default --aeron-sparse-terms --no-aeron-pre-touch --no-jvm-logs`. In the short mode the difference to the pinned new row is what the settings gave, with the limits under [Reading the rows](#reading-the-rows); in the sustained mode only the probe is comparable |
+| "Old settings plus `microTouch()`" (`microtouch-only`), Chronicle Queue | `short`, both architectures | What `microTouch()` does on its own: long warm-up off, 64 MiB `blockSize`, JVM logs off, so it is not `microTouch()` on top of the new settings. Chronicle's own evidence is unclear, and its effect is expected to differ between aarch64 and x86-64 |
 | 90 % of the probe with a checkpoint every second, tickertape and Chronicle | `sustained-90`, ext4 and xfs | The README sentence about the 90 % run and the x86-64 xfs backlog |
 | tuned: isolated CPUs, one thread per core, helpers on other cores, every tool | `tuned-short`, ext4; `tuned-sustained`: tickertape, Chronicle, Aeron | The upper bound of what the machine allows. A reader with a tuned host wants to know whether the ranking holds there |
 | yaque, queue-file, plain file, probe and SV at half of the probe | `sustained-others`, ext4 | Promised in #57 ("every tool"); they have no README sustained sentence, so one round and no SD |
@@ -60,24 +60,46 @@ below repeat it.
 ## Repeats, order and failures
 
 - **Repeats.** Short mode: each unit runs every cell twice. `short` has two rounds: pinned, `jvm-old` and
-  `microtouch-only` run in both, so those cells have four samples, taken at least an hour apart, and unpinned runs
-  once (two samples). Sustained: the headline tools (tickertape, Chronicle, Aeron) run `sustained` twice, each round
-  with its own probe, so the probe has two samples too and the paced rates of a round are those of its own probe.
-  Other sustained cells run once.
+  `microtouch-only` run in both, so those cells have four samples, and unpinned runs once (two samples). The gap between
+  the rounds differs per cell (some are under an hour): take it from the timestamps and state it. Sustained: the headline tools (tickertape, Chronicle, Aeron) run `sustained` twice, each round
+  with its own probe, so the probe has two samples. SV and SD do not: the paced rates of a round are those of its own
+  probe, so the two rounds are different loads and are published separately. All other sustained cells run once
+  (n = 1: the 90 % rows, the xfs rows, the other tools, the old settings, the tuned rows).
 - **Spread.** Report the range of the samples of every cell, separately for the repeats inside a unit (minutes apart)
   and for the rounds (hours apart). The playbook's rule of 10 % stays: state differences above it.
-- **Interleaving.** Within a round the units go tool by tool; the tool order is rotated from one round to the next,
-  and every second round reverses the order of the configurations within a tool. In a round each tool's configurations
-  run one after the other, so they share the machine's state. Across the session the order is fixed by `PARTS` in
-  `benches/rerun.py`, short part first, so a drift of the machine hits the tools alike. Filesystems and architectures
-  are separate, not interleaved.
+- **Order.** Within a round the units go tool by tool. The tool order is rotated between the rounds of `short` and
+  `sustained`, and the second round of `short` reverses the order of the configurations within a tool. Every other part
+  has one round and a fixed order with tickertape first: the xfs parts, `sustained-90`, `sustained-jvm-old`,
+  `sustained-others` and both tuned parts (in `sustained-others` yaque is first). In the xfs parts tickertape's first
+  large writes go to a freshly made filesystem on an SSD that nothing trims afterwards, and Chronicle follows on a
+  disk already written. Compare per tool the `sustained-journals` xfs probe with the later `sustained-90` xfs probe,
+  and on ext4 round 1, round 2 and `sustained-90`, and publish those comparisons.
 - **Failures.** Never change a setting because of a failure. A wall-clock step is discarded and repeated inside the
   run (`retries.jsonl`, at most three; existing harness behaviour). A unit that fails is run once more after its part,
   and fails for good the second time: then its cell is published as failed with the error from `children.log`. An
   unfinished short unit is set aside as `<unit>.incomplete-N`, and the driver starts it again; its incomplete data is
-  kept, not used. A sustained unit resumes where it stopped.
+  kept, not used. A sustained unit resumes where it stopped. A cell that failed and passed on the second attempt is
+  published as "failed once, then ..." with the error from `failures.jsonl`. A retried short unit measures all its
+  cells again: say which attempt is used.
 - **Resume.** The driver can be killed and started again with the same command: finished units are skipped
   (`rerun.json`). The same OUT must be one commit; other commits are refused.
+
+## Reading the rows
+
+- **Different loads.** Every sustained unit is paced at 50 % (or 90 %) of the probe of its own configuration and round.
+  The SV and SD figures of two configurations therefore mix the setting with another absolute rate. Print the absolute
+  rate beside every SV and SD figure, call it half of each tool's own rate in that configuration, and attribute only
+  probe differences to a setting. `sustained-jvm-old` also runs hours after `sustained`.
+- **Old settings are not the old harness.** What else differs is in `compare/README.md` ("The old settings are not the
+  old code"); repeat it with the row.
+- **Unpinned rows** can run on any CPU, CPU 0 included, which also runs the result pulls (nice 19, about every ten
+  minutes).
+- **Tuned rows.** CPU isolation is recorded. `irqaffinity` only sets the default, so the report says where interrupts
+  landed from `/proc/interrupts` and `/proc/irq/*/effective_affinity_list`, captured several times during the tuned
+  parts, or does not call the CPUs interrupt-free.
+- **Aggregation.** Use only units marked `done` in `rerun.json`, never a glob over the directories: a unit that failed
+  twice leaves partial results in its directory. Print n for every cell.
+- **Commit.** It is in `rerun.json` and in the environment files, not in each result line.
 
 ## Machines
 
@@ -176,7 +198,8 @@ total, on the boot disk (`~/results`).
   not), so the watcher copies everything and deletes the VM. If no watcher deleted it, the VM stops itself 60 minutes
   after DONE (`POWEROFF_AFTER_MIN`): the vCPUs stop costing money while the boot disk keeps the results.
 - `~/tmp/tt-gcp/rerun/start.sh watch <name> <zone> <minutes>` restarts the watcher after the Mac restarted. It copies
-  the results as one tar stream every 5 minutes: `scp --recurse` (`pull.sh`, `watch.sh`) takes minutes for the
+  what changed as one tar stream every 10 minutes (on CPU 0, at nice 19), and deletes the VM only when `DONE` is there
+  and every file has the same checksum here as on the VM: `scp --recurse` (`pull.sh`, `watch.sh`) takes minutes for the
   thousands of small result files of this run. In the dry run an `scp` of the eight quick-matrix directories had not
   finished after more than two minutes, and one `tar` over ssh took 8 seconds.
 - A lost VM: the results up to the last pull are on the Mac under `results/rerun-<name>/`. Start a new VM with
