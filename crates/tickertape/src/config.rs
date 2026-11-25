@@ -247,6 +247,9 @@ pub struct ReaderConfig {
     /// runs as another user (or, on Linux, in another pid namespace), or if the platform's wait call fails.
     /// Default: true.
     pub notify: bool,
+    /// Let [`Reader::seek`](crate::Reader::seek) start at a record named by a seek index, if there is one. Default:
+    /// false. See [`ReaderConfig::seek_index`]. Added in 1.1.
+    pub seek_index: bool,
 }
 
 impl Default for ReaderConfig {
@@ -255,6 +258,7 @@ impl Default for ReaderConfig {
             backoff: Backoff::default(),
             durable_only: false,
             notify: true,
+            seek_index: false,
         }
     }
 }
@@ -299,6 +303,29 @@ impl ReaderConfig {
     /// Sets the wait strategy.
     pub fn backoff(mut self, backoff: Backoff) -> Self {
         self.backoff = backoff;
+        self
+    }
+
+    /// Sets whether [`Reader::seek`](crate::Reader::seek) may start at a record named by a seek index (ADR 0045).
+    /// Default: false. Added in 1.1.
+    ///
+    /// Indexes are optional files that `tickertape index` ([`seek_index::build`](crate::seek_index::build)) writes
+    /// next to the journal, one per sealed segment. With one, a seek validates the record it lands on and every record
+    /// from there, less than 64 KiB of records before the target, instead of every record from the segment's start.
+    /// Without one, or if anything about it is in doubt, a seek does what it does without the option, and it never
+    /// fails because of an index. A durable-only reader, and a mapped one
+    /// ([`Reader::open_mapped`](crate::Reader::open_mapped)), uses an index only for a segment before the one the
+    /// checkpoint marker names, so in an archive without a marker only a safe, visible reader uses them.
+    ///
+    /// The option is off by default because it changes what a seek promises: **records before the landing record are
+    /// not read,** so damage there no longer stops the reader (`tickertape verify` and a reader without the option
+    /// still report it); and where `seek` otherwise lands on the current chain, a stale or forged index can lead it
+    /// elsewhere (`docs/crash-contract.md`, C15). A stale one can do so only if a payload holds, at the indexed offset,
+    /// a complete frame identical in sequence number, length and CRC to the record indexed there before. A forged one
+    /// can whenever a payload contains a suitable frame. `tickertape index --check` finds both. **Do not enable this
+    /// where someone who may not write the segments can write `seek-index/`.**
+    pub fn seek_index(mut self, on: bool) -> Self {
+        self.seek_index = on;
         self
     }
 }

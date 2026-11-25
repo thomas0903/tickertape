@@ -12,6 +12,7 @@ use crate::format::{self, RecordHeader};
 use crate::journal::{self, Identity};
 use crate::mmap::MapRo;
 use crate::record::{OwnedRecord, Record};
+use crate::seek_index::{self, codec::Entry, dir::IndexDir, lookup};
 
 /// How long a reader waits at an empty slot before checking that its segment wasn't replaced by recovery.
 const IDENTITY_CHECK_INTERVAL: Duration = Duration::from_millis(100);
@@ -80,8 +81,10 @@ pub struct Reader {
     /// The `next_seq` of a checkpoint marker read before the records the cursor has passed since the last seek that
     /// started at a segment's first record (or at the marker), from files confirmed current after it was read: while
     /// the cursor is at or below it, the cursor is a record boundary of the current chain (ADR 0046). Set only by
-    /// seeks, which drop the read buffer; 0 if none.
+    /// seeks, which drop the read buffer; 0 if none, and after a landing through a seek index (ADR 0045).
     seek_covered: u64,
+    /// Whether the last `seek` landed through a seek index ([`Reader::seek_used_index`]).
+    used_index: bool,
     /// `pread` buffer: bytes of `seg` starting at file offset `buf_start`.
     buf: Vec<u8>,
     buf_start: u64,
@@ -241,6 +244,7 @@ impl Reader {
             superseded_checked: None,
             skip_until: base,
             seek_covered: 0,
+            used_index: false,
             buf: Vec::new(),
             buf_start: 0,
             waker,
@@ -309,8 +313,12 @@ impl Reader {
             self.offset = format::SEGMENT_HEADER_LEN as u64;
             self.next_seq = base;
         }
-        // A seek that continues to a target the known marker covers needs no newer one.
-        if !continues || seq >= self.seek_covered {
+        self.used_index = self.config.seek_index && self.land_through_index(seq, continues);
+        if self.used_index {
+            // Nothing is claimed for a cursor that came from an index, so no later seek starts there (ADR 0045, step 9).
+            self.seek_covered = 0;
+        } else if !continues || seq >= self.seek_covered {
+            // A seek that continues to a target the known marker covers needs no newer one.
             self.seek_covered = self.covered_now();
         }
         self.skip_until = seq;
@@ -563,6 +571,114 @@ impl Reader {
             Ok(Some(marker)) if self.check_identity().is_ok() => marker.next_seq,
             _ => 0,
         }
+    }
+
+    /// Whether the last [`Reader::seek`] landed through a seek index. Hidden: for the workspace's tests and benchmarks.
+    #[doc(hidden)]
+    pub fn seek_used_index(&self) -> bool {
+        self.used_index
+    }
+
+    /// Tries to place the cursor at an indexed record at or before `target`, in the reader's segment (ADR 0045, "What
+    /// a reader does"; the step numbers are those there). Returns whether it did. Otherwise the cursor is where it was,
+    /// whatever the reason: nothing about an index is an error.
+    ///
+    /// `continues`: the seek may start at the cursor, which is then a place to beat. Nothing the caller of `seek` can
+    /// see depends on an index except where the seek lands, and no seek does anything here without the option.
+    #[inline(never)]
+    fn land_through_index(&mut self, target: u64, continues: bool) -> bool {
+        self.indexed_place(target, continues).is_some_and(|entry| {
+            self.offset = entry.offset;
+            self.next_seq = entry.seq;
+            true
+        })
+    }
+
+    /// Steps 1 to 8 of [`Reader::land_through_index`]: the entry to land on, its record read and validated. Leaves the
+    /// cursor alone; the read buffer is dropped.
+    fn indexed_place(&mut self, target: u64, continues: bool) -> Option<Entry> {
+        // Step 1.
+        let base = self.seg.base;
+        if target <= base || self.seg.size <= format::SEGMENT_SIZE_UNIT {
+            return None;
+        }
+        if continues && !seek_index::far(target, base, self.next_seq, self.offset) {
+            return None;
+        }
+        // Step 2: with a marker that names a later segment, no writer stores to this one and no recovery changes it.
+        if self.config.durable_only || self.mapped {
+            let marker = crate::inspect::read_checkpoint(&self.dir).ok()??;
+            if marker.segment_base_seq <= base {
+                return None;
+            }
+        }
+        crate::fault::hook(crate::fault::Point::ReaderSeekIndexMarker);
+        // Steps 3 and 4.
+        let dir = IndexDir::open(&self.dir).ok()??;
+        let loaded = lookup::load(&dir, &self.seg.file, base, false).ok()?;
+        let index = loaded.index().ok()?;
+        crate::fault::hook(crate::fault::Point::ReaderSeekIndexLoaded);
+        // Step 5, after the index and the marker were read.
+        self.check_identity().ok()?;
+        // Steps 6 and 7.
+        if !lookup::sealed(&self.seg.file, &index).ok()? {
+            return None;
+        }
+        let entry = index.floor(target)?;
+        if continues && entry.seq <= self.next_seq {
+            return None;
+        }
+        // Step 8.
+        if !lookup::in_place(&self.seg.file, &entry).ok()? {
+            return None;
+        }
+        crate::fault::hook(crate::fault::Point::ReaderSeekIndexLanding);
+        self.buf.clear();
+        let valid = self.holds_record(&entry).unwrap_or(false);
+        // What was read is not kept: every seek leaves the buffer empty.
+        self.buf.clear();
+        valid.then_some(entry)
+    }
+
+    /// Step 8b: whether the slot holds exactly the record `entry` names, as one fresh slot read sees it. Unlike
+    /// [`Reader::read_slot`], whose signature is pinned, it is given the commit word to expect, and allocates and reads
+    /// nothing unless the slot holds it: the buffer is never sized by a word that was not compared.
+    fn holds_record(&mut self, entry: &Entry) -> std::io::Result<bool> {
+        let Entry {
+            seq,
+            offset,
+            len,
+            crc,
+        } = *entry;
+        if !matches!(classify(len, offset, self.seg.size), Pending::Record { .. }) {
+            return Ok(false);
+        }
+        if let Some(map) = &self.seg.map {
+            if map.commit_word(offset) != Some(len) {
+                return Ok(false);
+            }
+            let stored = offset.checked_add(4).and_then(|at| map.load_u32(at));
+            let words = offset
+                .checked_add(8)
+                .and_then(|at| map.words(at, (format::align8(u64::from(len)) - 8) / 8));
+            return Ok(stored == Some(crc)
+                && words.is_some_and(|words| {
+                    format::decode_record_words(len, crc, words, seq).is_ok()
+                }));
+        }
+        let mut word = [0; format::COMMIT_WORD_LEN];
+        self.seg.file.read_exact_at(&mut word, offset)?;
+        if u32::from_le_bytes(word) != len {
+            return Ok(false);
+        }
+        fence(Ordering::Acquire);
+        let body = u64::from(len) - format::COMMIT_WORD_LEN as u64;
+        resize_buf(&mut self.buf, body)?;
+        self.seg
+            .file
+            .read_exact_at(&mut self.buf, offset + format::COMMIT_WORD_LEN as u64)?;
+        Ok(self.buf.starts_with(&crc.to_le_bytes())
+            && format::decode_record_body(len, &self.buf, seq).is_ok())
     }
 
     /// Whether the file holds, right before the cursor, a valid record with the sequence number before the cursor's
