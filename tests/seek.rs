@@ -37,6 +37,14 @@ fn open(dir: &Path, (mapped, durable): (bool, bool)) -> Reader {
     }
 }
 
+/// A reader that has sought to the oldest record, and so knows what the checkpoint covers now.
+fn open_sought(dir: &Path, kind: (bool, bool)) -> Reader {
+    let mut reader = open(dir, kind);
+    reader.seek(segments(dir)[0].0).unwrap();
+    assert_eq!(offset(&reader), FIRST_SLOT);
+    reader
+}
+
 /// The offset the reader is at.
 fn offset(reader: &Reader) -> u64 {
     reader.cursor().position.offset
@@ -86,7 +94,7 @@ fn a_covered_forward_seek_continues_from_the_cursor() {
     writer.checkpoint().unwrap();
     assert_eq!(segments(dir.path()).len(), 1);
     for kind in KINDS {
-        let mut reader = open(dir.path(), kind);
+        let mut reader = open_sought(dir.path(), kind);
         expect(&mut reader, 0, 10);
         let at = offset(&reader);
         assert!(at > FIRST_SLOT);
@@ -136,7 +144,7 @@ fn seeks_across_segments_start_at_the_segment() {
     let bases: Vec<u64> = segments(dir.path()).iter().map(|s| s.0).collect();
     assert!(bases.len() > 3);
     for kind in KINDS {
-        let mut reader = open(dir.path(), kind);
+        let mut reader = open_sought(dir.path(), kind);
         // In a sealed segment, up to its last record and then at its seal: the next record is in the successor.
         expect(&mut reader, 0, 3);
         reader.seek(bases[1] - 1).unwrap();
@@ -157,7 +165,7 @@ fn seeks_across_segments_start_at_the_segment() {
 }
 
 /// Only a checkpoint makes the records behind the cursor ones that recovery never removes: without coverage of the
-/// cursor, a seek scans the segment from its start, as it always did.
+/// cursor, established before the reader read them, a seek scans the segment from its start, as it always did.
 #[test]
 fn an_uncovered_forward_seek_scans_from_the_segments_start() {
     let dir = tempfile::tempdir().unwrap();
@@ -165,7 +173,7 @@ fn an_uncovered_forward_seek_scans_from_the_segments_start() {
     append_n(&mut writer, 100);
     let marker = dir.path().join("checkpoint");
     for mapped in [false, true] {
-        let mut reader = open(dir.path(), (mapped, false));
+        let mut reader = open_sought(dir.path(), (mapped, false));
         expect(&mut reader, 0, 10);
         reader.seek(40).unwrap();
         assert_eq!(offset(&reader), FIRST_SLOT, "no checkpoint");
@@ -173,8 +181,24 @@ fn an_uncovered_forward_seek_scans_from_the_segments_start() {
     }
     writer.checkpoint().unwrap();
     append_n(&mut writer, 100);
+    for kind in KINDS {
+        // The first seek scans: what the reader read before it knew a marker is not trusted, covered or not.
+        let mut reader = open(dir.path(), kind);
+        expect(&mut reader, 0, 10);
+        reader.seek(20).unwrap();
+        assert_eq!(offset(&reader), FIRST_SLOT, "{kind:?}: first seek");
+        expect(&mut reader, 20, 1);
+        let at = offset(&reader);
+        reader.seek(30).unwrap();
+        assert_eq!(offset(&reader), at, "{kind:?}: second seek");
+    }
     for mapped in [false, true] {
-        let mut reader = open(dir.path(), (mapped, false));
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = Writer::open(dir.path(), small_config()).unwrap();
+        append_n(&mut writer, 100);
+        writer.checkpoint().unwrap();
+        append_n(&mut writer, 100);
+        let mut reader = open_sought(dir.path(), (mapped, false));
         expect(&mut reader, 0, 100);
         let at = offset(&reader);
         reader.seek(100).unwrap();
@@ -183,18 +207,91 @@ fn an_uncovered_forward_seek_scans_from_the_segments_start() {
         reader.seek(110).unwrap();
         assert_eq!(offset(&reader), FIRST_SLOT, "one past the checkpoint");
         expect(&mut reader, 110, 1);
+        // A checkpoint made after the reader passed records does not make it trust them.
+        writer.checkpoint().unwrap();
+        reader.seek(120).unwrap();
+        assert_eq!(offset(&reader), FIRST_SLOT, "read before the checkpoint");
+        expect(&mut reader, 120, 1);
+        reader.seek(130).unwrap();
+        assert!(offset(&reader) > FIRST_SLOT, "read after it");
+        // A seek past the known coverage reads the marker again, so that later ones continue past it too.
+        let next = writer.next_seq();
+        append_n(&mut writer, 20);
+        writer.checkpoint().unwrap();
+        reader.seek(next).unwrap();
+        expect(&mut reader, next, 5);
+        let at = offset(&reader);
+        reader.seek(next + 10).unwrap();
+        assert_eq!(offset(&reader), at, "the coverage is extended");
+        expect(&mut reader, next + 10, 1);
     }
     // An unreadable or missing marker covers nothing, and the seek still succeeds.
     for action in [0, 1, 2] {
-        let mut reader = open(dir.path(), (false, false));
-        expect(&mut reader, 0, 10);
         match action {
             0 => std::fs::write(&marker, b"invalid marker").unwrap(),
             1 => std::fs::remove_file(&marker).unwrap(),
             _ => std::fs::create_dir(&marker).unwrap(),
         }
+        let mut reader = open_sought(dir.path(), (false, false));
+        expect(&mut reader, 0, 10);
         reader.seek(40).unwrap();
         assert_eq!(offset(&reader), FIRST_SLOT, "{action}");
+        expect(&mut reader, 40, 1);
+    }
+}
+
+/// Every seek that scans reads the marker again: what an earlier one knew is not carried to another file. Here another
+/// journal, without a checkpoint, takes the place of the one the reader knew the coverage of.
+#[test]
+fn coverage_is_not_carried_to_another_file() {
+    let (dir, other) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let mut writer = Writer::open(dir.path(), small_config()).unwrap();
+    append_n(&mut writer, 100);
+    writer.checkpoint().unwrap();
+    drop(writer);
+    append_n(
+        &mut Writer::open(other.path(), small_config()).unwrap(),
+        100,
+    );
+    let mut reader = open_sought(dir.path(), (false, false));
+    expect(&mut reader, 0, 10);
+    for name in [format::segment_file_name(0).as_str(), "checkpoint"] {
+        std::fs::rename(other.path().join(name), dir.path().join(name)).unwrap();
+    }
+    reader.seek(20).unwrap();
+    assert_eq!(offset(&reader), FIRST_SLOT, "another file");
+    expect(&mut reader, 20, 1);
+    reader.seek(30).unwrap();
+    assert_eq!(offset(&reader), FIRST_SLOT, "nothing is covered in it");
+    expect(&mut reader, 30, 1);
+}
+
+/// The segment is replaced between the open of a seek that scans and its check that the segment is still in place:
+/// the marker it read then says nothing about the file it holds, so the next seek scans again.
+#[test]
+fn coverage_is_not_applied_to_a_file_that_is_no_longer_in_place() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut writer = Writer::open(dir.path(), small_config()).unwrap();
+    append_n(&mut writer, 100);
+    writer.checkpoint().unwrap();
+    for mapped in [false, true] {
+        let mut reader = open(dir.path(), (mapped, false));
+        let path = segments(dir.path())[0].1.clone();
+        let hidden = dir.path().join("hidden");
+        // The file the reader opens is not at the path when it checks; it is again afterwards.
+        let copy = dir.path().join("copy");
+        std::fs::copy(&path, &copy).unwrap();
+        tickertape::fault::clear();
+        let (p, h) = (path.clone(), hidden.clone());
+        tickertape::fault::run_at(Point::ReaderSeekCoverage, 0, move || {
+            std::fs::rename(&p, &h).unwrap();
+            std::fs::rename(&copy, &p).unwrap();
+        });
+        reader.seek(0).unwrap();
+        std::fs::rename(&hidden, &path).unwrap();
+        expect(&mut reader, 0, 10);
+        reader.seek(40).unwrap();
+        assert_eq!(offset(&reader), FIRST_SLOT);
         expect(&mut reader, 40, 1);
     }
 }
@@ -202,21 +299,36 @@ fn an_uncovered_forward_seek_scans_from_the_segments_start() {
 /// Recovery repairs a segment in place (the file keeps its identity) and a new history is appended and checkpointed
 /// past the reader's cursor: the marker covers the cursor's sequence number, but records of the new history start at
 /// other offsets. `seek` to the reader's position puts it back on the current chain (crash contract C11, "Readers
-/// after a repair"), so it must not trust the cursor.
+/// after a repair"), so it must not trust the cursor. With `embed`, the new history's first record holds, in its
+/// payload, the old records' bytes at their old offsets, so that the bytes before the cursor still form the record
+/// the reader passed last.
 #[test]
 fn a_seek_after_an_in_place_repair_lands_on_the_current_chain() {
     for kind in KINDS {
-        // Same lengths: the new record before the cursor is where the old one was, so the cursor is a boundary.
-        for (len, continues) in [(64, true), (60, true), (200, false), (32, false)] {
+        for (len, embed, sought) in [
+            (64, false, true),
+            (200, false, true),
+            (32, false, true),
+            (64, true, true),
+            (64, true, false),
+        ] {
+            let case = format!("{kind:?}, {len}, embed {embed}, sought {sought}");
             let dir = tempfile::tempdir().unwrap();
             let mut writer = Writer::open(dir.path(), small_config()).unwrap();
             append_tagged(&mut writer, 10, 1, 64);
             writer.checkpoint().unwrap();
-            append_tagged(&mut writer, 10, 1, 64);
+            append_tagged(&mut writer, 8, 1, 64);
             drop(writer);
-            let mut reader = open(dir.path(), kind);
+            let mut reader = if sought {
+                open_sought(dir.path(), kind)
+            } else {
+                open(dir.path(), kind)
+            };
             let visible = read_up_to(&mut reader, 18).0.len() as u64;
             assert_eq!(visible, if kind.1 { 10 } else { 18 });
+            let (path, at) = locate_record(dir.path(), 13);
+            let image = std::fs::read(path).unwrap();
+            let end = at as usize + 5 * format::align8(40 + 64) as usize;
 
             zero_commit_words_from(dir.path(), 13);
             let mut writer = Writer::open(dir.path(), small_config()).unwrap();
@@ -224,20 +336,85 @@ fn a_seek_after_an_in_place_repair_lands_on_the_current_chain() {
                 writer.recovery_report().actions[..],
                 [RecoveryAction::ZeroedUncommitted { .. }]
             ));
-            append_tagged(&mut writer, 20, 2, len);
+            if embed {
+                let mut payload = image[at as usize + format::RECORD_HEADER_LEN..end].to_vec();
+                payload.extend_from_slice(&[0; 100]);
+                writer
+                    .append(&NewRecord {
+                        schema_id: 2,
+                        venue_ts_ns: 0,
+                        local_ts_ns: 0,
+                        payload: &payload,
+                    })
+                    .unwrap();
+            }
+            while writer.next_seq() < 33 {
+                append_tagged(&mut writer, 1, 2, len);
+            }
             writer.checkpoint().unwrap();
 
             let at = offset(&reader);
             reader.seek(visible).unwrap();
-            let expected_offset = if continues || kind.1 { at } else { FIRST_SLOT };
-            assert_eq!(offset(&reader), expected_offset, "{kind:?}, {len}");
-            let (records, end) = read_up_to(&mut reader, 100);
-            assert_eq!(end.as_deref(), Some("end"), "{kind:?}, {len}");
-            let got: Vec<(u64, u32)> = records.iter().map(|r| (r.seq, r.schema_id)).collect();
-            let want: Vec<(u64, u32)> = (visible..33)
-                .map(|seq| (seq, if seq < 13 { 1 } else { 2 }))
-                .collect();
-            assert_eq!(got, want, "{kind:?}, {len}");
+            // A durable-only reader's cursor was covered when it got there; a visible one's was not.
+            let continues = kind.1 && sought;
+            assert_eq!(
+                offset(&reader),
+                if continues { at } else { FIRST_SLOT },
+                "{case}"
+            );
+            expect_histories(&mut reader, visible, 33, &case);
+        }
+    }
+}
+
+/// The rest of the records are `from..to`, of history 1 before record 13 and of history 2 from there on.
+fn expect_histories(reader: &mut Reader, from: u64, to: u64, case: &str) {
+    let (records, end) = read_up_to(reader, 100);
+    assert_eq!(end.as_deref(), Some("end"), "{case}");
+    let got: Vec<(u64, u32)> = records.iter().map(|r| (r.seq, r.schema_id)).collect();
+    let want: Vec<(u64, u32)> = (from..to)
+        .map(|seq| (seq, if seq < 13 { 1 } else { 2 }))
+        .collect();
+    assert_eq!(got, want, "{case}");
+}
+
+/// Damage that also destroys the checkpoint marker lets recovery remove *covered* records in place. The seek still
+/// notices, because the record before the cursor is not there any more, unless the new history put one there.
+#[test]
+fn a_seek_after_covered_records_were_removed_in_place_lands_on_the_current_chain() {
+    for kind in KINDS {
+        // `last`: the length of the new record before the cursor, which starts where the old one did if `len` fits.
+        for (len, last, continues) in [
+            (64, 64, true),
+            (60, 60, true),
+            (200, 200, false),
+            (32, 32, false),
+            (64, 200, false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut writer = Writer::open(dir.path(), small_config()).unwrap();
+            append_tagged(&mut writer, 20, 1, 64);
+            writer.checkpoint().unwrap();
+            drop(writer);
+            let mut reader = open_sought(dir.path(), kind);
+            assert_eq!(read_up_to(&mut reader, 18).0.len(), 18);
+
+            std::fs::remove_file(dir.path().join("checkpoint")).unwrap();
+            zero_commit_words_from(dir.path(), 13);
+            let mut writer = Writer::open(dir.path(), small_config()).unwrap();
+            assert_eq!(writer.next_seq(), 13);
+            append_tagged(&mut writer, 4, 2, len);
+            append_tagged(&mut writer, 16, 2, last);
+            writer.checkpoint().unwrap();
+            let at = offset(&reader);
+            reader.seek(18).unwrap();
+            let case = format!("{kind:?}, {len}, {last}");
+            assert_eq!(
+                offset(&reader),
+                if continues { at } else { FIRST_SLOT },
+                "{case}"
+            );
+            expect_histories(&mut reader, 18, 33, &case);
         }
     }
 }
@@ -253,8 +430,9 @@ fn a_seek_after_a_replacement_reads_the_new_file() {
         writer.checkpoint().unwrap();
         append_tagged(&mut writer, 10, 1, 64);
         drop(writer);
-        let mut reader = open(dir.path(), kind);
-        let visible = read_up_to(&mut reader, 18).0.len() as u64;
+        let mut reader = open_sought(dir.path(), kind);
+        // Every reader stops where it is covered, so that only the file's identity keeps it from continuing.
+        let visible = read_up_to(&mut reader, 10).0.len() as u64;
         corrupt_by_replacement(dir.path(), 13);
         let mut writer = Writer::open(dir.path(), small_config()).unwrap();
         append_tagged(&mut writer, 20, 2, 64);
@@ -283,7 +461,7 @@ fn a_continued_seek_reports_damage_like_a_full_scan() {
         append_n(&mut writer, 100);
         writer.checkpoint().unwrap();
         drop(writer);
-        let mut reader = open(dir.path(), (false, false));
+        let mut reader = open_sought(dir.path(), (false, false));
         expect(&mut reader, 0, 10);
         let at = offset(&reader);
         let (path, slot) = locate_record(dir.path(), damaged);
@@ -311,8 +489,9 @@ fn a_forward_seek_that_fails_changes_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let mut writer = Writer::open(dir.path(), small_config()).unwrap();
     append_n(&mut writer, 100);
+    writer.checkpoint().unwrap();
     writer.close().unwrap();
-    let mut reader = open(dir.path(), (false, false));
+    let mut reader = open_sought(dir.path(), (false, false));
     expect(&mut reader, 0, 10);
     let path = segments(dir.path())[0].1.clone();
     let raw = open_raw(&path);
@@ -334,6 +513,9 @@ fn a_forward_seek_that_fails_changes_nothing() {
     assert!(matches!(reader.seek_to_end(), Err(Error::Io { .. })));
     std::fs::rename(&moved, dir.path()).unwrap();
     expect(&mut reader, 11, 1);
+    let at = offset(&reader);
+    reader.seek(13).unwrap();
+    assert_eq!(offset(&reader), at);
     reader.seek(40).unwrap();
     expect(&mut reader, 40, 60);
 }
@@ -767,4 +949,168 @@ fn the_end_under_a_live_writer() {
         }
         stop.store(true, Ordering::SeqCst);
     });
+}
+
+/// A durable-only reader that had applied a marker which is gone: nothing is covered now, so its end is the first
+/// record of the oldest segment, as for a new reader, not where the old marker was.
+#[test]
+fn a_durable_only_readers_end_without_a_marker_is_the_oldest_record() {
+    for mapped in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = Writer::open(dir.path(), small_config()).unwrap();
+        append_n(&mut writer, 2_000);
+        writer.checkpoint().unwrap();
+        let mut reader = open(dir.path(), (mapped, true));
+        expect(&mut reader, 0, 5);
+        std::fs::remove_file(dir.path().join("checkpoint")).unwrap();
+        reader.seek_to_end().unwrap();
+        assert_eq!(reader.position(), 0);
+        assert!(reader.try_next().unwrap().is_none());
+        // The marker can't be read: an error, and the reader stays where it was.
+        std::fs::create_dir(dir.path().join("checkpoint")).unwrap();
+        assert!(matches!(reader.seek_to_end(), Err(Error::Io { .. })));
+        let mut visible = open(dir.path(), (mapped, false));
+        visible.seek_to_end().unwrap();
+        assert_eq!(visible.position(), 2_000);
+    }
+}
+
+/// A lower marker than the one the reader had applied: the end is where the marker is now.
+#[test]
+fn a_durable_only_readers_end_is_the_marker_as_it_is_now() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut writer = Writer::open(dir.path(), small_config()).unwrap();
+    append_n(&mut writer, 100);
+    writer.checkpoint().unwrap();
+    let old = std::fs::read(dir.path().join("checkpoint")).unwrap();
+    append_n(&mut writer, 50);
+    writer.checkpoint().unwrap();
+    let mut reader = open(dir.path(), (false, true));
+    expect(&mut reader, 0, 5);
+    std::fs::write(dir.path().join("checkpoint"), old).unwrap();
+    reader.seek_to_end().unwrap();
+    assert_eq!(reader.position(), 100);
+    assert!(reader.try_next().unwrap().is_none());
+}
+
+/// The marker is missing when the call reads it and back right after: the call must not read the journal from its
+/// oldest segment (which is damaged here, so it would fail).
+#[test]
+fn a_marker_that_reappears_does_not_make_seek_to_end_read_old_segments() {
+    for mapped in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = Writer::open(dir.path(), small_config()).unwrap();
+        append_n(&mut writer, 2_000);
+        writer.checkpoint().unwrap();
+        let mut reader = open(dir.path(), (mapped, true));
+        expect(&mut reader, 0, 5);
+        let (path, slot) = locate_record(dir.path(), segments(dir.path())[1].0 + 3);
+        std::os::unix::fs::FileExt::write_all_at(&open_raw(&path), &[0xEE; 8], slot + 9).unwrap();
+        let (marker, hidden) = (dir.path().join("checkpoint"), dir.path().join("hidden"));
+        std::fs::rename(&marker, &hidden).unwrap();
+        tickertape::fault::clear();
+        tickertape::fault::run_at(Point::ReaderOpen, 0, move || {
+            std::fs::rename(&hidden, &marker).unwrap();
+        });
+        reader.seek_to_end().unwrap();
+        assert_eq!(reader.position(), 0);
+        reader.seek_to_end().unwrap();
+        assert_eq!(reader.position(), 2_000);
+    }
+}
+
+/// Crash contract C13: a failed `seek_to_end` that had applied a newer marker to the current file forgets it again, so
+/// that a durable-only reader in a replaced file does not take the removed records there for covered ones.
+#[test]
+fn a_failed_seek_to_end_restores_the_durable_boundary() {
+    for mapped in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = Writer::open(dir.path(), small_config()).unwrap();
+        append_n(&mut writer, 10);
+        writer.checkpoint().unwrap();
+        append_n(&mut writer, 10);
+        drop(writer);
+        let mut reader = open(dir.path(), (mapped, true));
+        expect(&mut reader, 0, 10);
+        assert!(reader.next_owned().unwrap().is_none());
+        corrupt_by_replacement(dir.path(), 13);
+        let mut writer = Writer::open(dir.path(), small_config()).unwrap();
+        append_n(&mut writer, 20);
+        writer.checkpoint().unwrap();
+        tickertape::fault::clear();
+        let path = dir.path().to_path_buf();
+        tickertape::fault::run_at(Point::ReaderCheckpoint, 0, move || {
+            let first = writer.next_seq();
+            append_n(&mut writer, 10);
+            writer.checkpoint().unwrap();
+            let (p, slot) = locate_record(&path, first + 2);
+            std::os::unix::fs::FileExt::write_all_at(&open_raw(&p), &[0xEE; 8], slot + 9).unwrap();
+        });
+        assert!(matches!(reader.seek_to_end(), Err(Error::Corrupt { .. })));
+        assert_eq!(reader.position(), 10);
+        match reader.next_owned() {
+            Err(Error::Discarded { seq: 10, .. }) => {}
+            other => panic!("mapped {mapped}: {other:?}"),
+        }
+    }
+}
+
+/// A failed `seek_to_end` leaves the reader exactly as it was, its read buffer included: it goes on returning the same
+/// records as a reader that did not make the call.
+#[test]
+fn a_failed_seek_to_end_keeps_the_read_buffer_and_the_seek_coverage() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut writer = Writer::open(dir.path(), small_config()).unwrap();
+    append_n(&mut writer, 30);
+    writer.checkpoint().unwrap();
+    drop(writer);
+    let mut readers = [0, 1].map(|_| {
+        let mut reader = open_sought(dir.path(), (false, false));
+        expect(&mut reader, 0, 5);
+        reader
+    });
+    // Damage the buffered records 20 to 29 in the file, and what `seek_to_end` reads first.
+    let end = {
+        let mut reader = open(dir.path(), (false, false));
+        reader.seek_to_end().unwrap();
+        offset(&reader)
+    };
+    zero_commit_words_from(dir.path(), 20);
+    let path = segments(dir.path())[0].1.clone();
+    std::os::unix::fs::FileExt::write_all_at(&open_raw(&path), &[0xEE; 4], end).unwrap();
+    assert!(matches!(
+        readers[1].seek_to_end(),
+        Err(Error::Corrupt { .. })
+    ));
+    let at = offset(&readers[1]);
+    let [a, b] = readers.each_mut().map(|r| read_up_to(r, 100));
+    assert_eq!(a, b);
+    assert_eq!(a.0.len(), 25);
+    // The coverage too: a seek continues from where the reader was.
+    let mut reader = open_sought(dir.path(), (false, false));
+    expect(&mut reader, 0, 5);
+    assert!(reader.seek_to_end().is_err());
+    reader.seek(10).unwrap();
+    assert_eq!(offset(&reader), at);
+}
+
+/// A failed `seek_to_end` that had read a newer marker does not leave its coverage behind: the reader passed its
+/// records before that marker.
+#[test]
+fn a_failed_seek_to_end_restores_the_seek_coverage() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut writer = Writer::open(dir.path(), small_config()).unwrap();
+    append_n(&mut writer, 10);
+    writer.checkpoint().unwrap();
+    append_n(&mut writer, 20);
+    let mut reader = open_sought(dir.path(), (false, false));
+    expect(&mut reader, 0, 18);
+    writer.checkpoint().unwrap();
+    append_n(&mut writer, 3);
+    let (path, slot) = locate_record(dir.path(), 31);
+    std::os::unix::fs::FileExt::write_all_at(&open_raw(&path), &[0xEE; 8], slot + 9).unwrap();
+    assert!(matches!(reader.seek_to_end(), Err(Error::Corrupt { .. })));
+    reader.seek(20).unwrap();
+    assert_eq!(offset(&reader), FIRST_SLOT);
+    expect(&mut reader, 20, 1);
 }

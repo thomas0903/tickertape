@@ -118,7 +118,7 @@ fn list_once(dir: &Path, last: bool) -> Result<Option<Vec<SegmentInfo>>> {
 ///
 /// [`Error::Io`] if the marker cannot be opened or read for a reason other than a missing file.
 pub fn read_checkpoint(dir: impl AsRef<Path>) -> Result<Option<format::CheckpointSlot>> {
-    use std::io::Read;
+    use std::os::unix::fs::FileExt;
 
     let path = dir.as_ref().join(journal::CHECKPOINT_FILE);
     let file = match File::open(&path) {
@@ -126,11 +126,23 @@ pub fn read_checkpoint(dir: impl AsRef<Path>) -> Result<Option<format::Checkpoin
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(Error::io("open checkpoint", &path, e)),
     };
-    let mut bytes = Vec::new();
-    file.take(format::CHECKPOINT_FILE_LEN as u64)
-        .read_to_end(&mut bytes)
-        .map_err(|e| Error::io("read checkpoint", &path, e))?;
-    Ok(format::decode_checkpoint(&bytes))
+    // Only the two slots, not the 128 KiB file around them: seeks and durable-only readers read the marker often.
+    let mut current: Option<format::CheckpointSlot> = None;
+    for offset in format::CHECKPOINT_SLOT_OFFSETS {
+        let mut slot = [0; format::CHECKPOINT_SLOT_LEN];
+        match file.read_exact_at(&mut slot, offset as u64) {
+            Ok(()) => {}
+            // A truncated marker: this slot isn't (completely) there.
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => continue,
+            Err(e) => return Err(Error::io("read checkpoint", &path, e)),
+        }
+        // The higher generation; on a tie the later slot, as in `format::decode_checkpoint`.
+        current = match (current, format::decode_checkpoint_slot(&slot)) {
+            (Some(a), Some(b)) if a.generation > b.generation => Some(a),
+            (a, b) => b.or(a),
+        };
+    }
+    Ok(current)
 }
 
 /// How a segment ends.
@@ -513,6 +525,52 @@ mod tests {
     thread_local! {
         /// Runs at each of [`pause`]'s pauses on this thread, standing in for a live writer.
         pub(super) static WAIT_HOOK: RefCell<Option<Box<dyn FnMut()>>> = RefCell::new(None);
+    }
+
+    /// Reading only the two slots gives what decoding the whole file gives: which slot is current, ties, invalid
+    /// slots, and a marker truncated anywhere.
+    #[test]
+    fn read_checkpoint_agrees_with_decoding_the_whole_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(journal::CHECKPOINT_FILE);
+        assert_eq!(read_checkpoint(dir.path()).unwrap(), None);
+        let slot = |generation: u64, next_seq: u64| {
+            format::encode_checkpoint_slot(&format::CheckpointSlot {
+                generation,
+                next_seq,
+                segment_base_seq: 0,
+                offset: 64,
+            })
+        };
+        let invalid = [0x5a; format::CHECKPOINT_SLOT_LEN];
+        let second = format::CHECKPOINT_SLOT_OFFSETS[1];
+        for (a, b, expected) in [
+            (slot(3, 10), slot(4, 20), Some(20)),
+            (slot(5, 30), slot(4, 20), Some(30)),
+            (slot(4, 10), slot(4, 20), Some(20)),
+            (slot(3, 10), invalid, Some(10)),
+            (invalid, slot(4, 20), Some(20)),
+            (invalid, invalid, None),
+        ] {
+            let mut file = vec![0; format::CHECKPOINT_FILE_LEN];
+            file[..a.len()].copy_from_slice(&a);
+            file[second..second + b.len()].copy_from_slice(&b);
+            for len in [0, 63, 64, second, second + 63, second + 64, file.len()] {
+                std::fs::write(&path, &file[..len]).unwrap();
+                let read = read_checkpoint(dir.path()).unwrap();
+                assert_eq!(
+                    read,
+                    format::decode_checkpoint(&file[..len]),
+                    "length {len}"
+                );
+                if len == file.len() {
+                    assert_eq!(read.map(|c| c.next_seq), expected);
+                }
+            }
+        }
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(matches!(read_checkpoint(dir.path()), Err(Error::Io { .. })));
     }
 
     #[test]

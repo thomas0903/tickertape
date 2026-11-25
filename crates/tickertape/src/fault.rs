@@ -80,6 +80,9 @@ pub enum Point {
     /// slot at the cursor again from the file (the seal may have come from bytes an in-place repair has since
     /// zeroed). Arm with [`run_at`].
     ReaderSealReread,
+    /// In `Reader::seek`, after it has read the checkpoint marker that later seeks may rely on, before it checks that
+    /// its segment is still in place. Arm with [`run_at`].
+    ReaderSeekCoverage,
     /// Before a durable-only reader reads the checkpoint marker. Arm with [`run_at`].
     ReaderCheckpoint,
     /// After a durable-only reader has read a checkpoint marker that moved past its cursor, before it checks that its

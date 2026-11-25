@@ -226,7 +226,11 @@ journal; the durability and restart guarantees below apply to retained history.
   the file keeps its identity. A visible reader may then return the removed records it had already read or buffered
   and continue in the new history without `Error::Discarded`;
   if its position falls inside a record of the new history it waits there (`Ok(None)`) or reports
-  `Error::Corrupt` for bytes that aren't corrupt, until the application seeks to its position. It returns a record
+  `Error::Corrupt` for bytes that aren't corrupt, until the application seeks to its position. (If damage also
+  destroyed the checkpoint marker, recovery can remove *covered* records in place, and a seek forward in the reader's
+  segment, or to its position, may then go on from that position when the new history holds, right before it, bytes
+  that form a record with the sequence number expected there. A seek to an earlier position, or a new reader, scans
+  the segment: ADR [0046](decisions/0046-seeks-that-need-no-index.md).) It returns a record
   that isn't in the journal only if the new history holds, at that position, bytes forming a frame with a valid
   checksum and the expected sequence number. Durable-only readers are unaffected (ADR
   [0034](decisions/0034-durable-only-reads-check-segment-identity.md) → In-place repairs).
