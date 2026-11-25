@@ -667,21 +667,29 @@ impl Reader {
             len,
             crc,
         } = *entry;
-        if !matches!(classify(len, offset, self.seg.size), Pending::Record { .. }) {
+        if !(format::RECORD_HEADER_LEN as u32..=format::MAX_FRAME_LEN).contains(&len)
+            || !format::record_fits(self.seg.size, offset, len)
+        {
             return Ok(false);
         }
+        let body_len = u64::from(len) - format::COMMIT_WORD_LEN as u64;
         if let Some(map) = &self.seg.map {
-            if map.commit_word(offset) != Some(len) {
+            if map.commit_word(offset) != Some(len) || map.load_u32(offset + 4) != Some(crc) {
                 return Ok(false);
             }
-            let stored = offset.checked_add(4).and_then(|at| map.load_u32(at));
-            let words = offset
-                .checked_add(8)
-                .and_then(|at| map.words(at, (format::align8(u64::from(len)) - 8) / 8));
-            return Ok(stored == Some(crc)
-                && words.is_some_and(|words| {
-                    format::decode_record_words(len, crc, words, seq).is_ok()
-                }));
+            let count = (format::align8(u64::from(len)) - 8) / 8;
+            let Some(words) = map.words(offset + 8, count) else {
+                return Ok(false);
+            };
+            // Copied, each word loaded once, rather than decoded in place as the reads after it are: with a second
+            // caller of `decode_record_words` the compiler built the first, the per-record path, about 4 % slower.
+            resize_buf(&mut self.buf, 4 + count * 8)?;
+            self.buf[..4].copy_from_slice(&crc.to_le_bytes());
+            for (to, word) in self.buf[4..].chunks_exact_mut(8).zip(words.iter()) {
+                to.copy_from_slice(&word.to_le_bytes());
+            }
+            let body = self.buf.get(..body_len as usize);
+            return Ok(body.is_some_and(|b| format::decode_record_body(len, b, seq).is_ok()));
         }
         let mut word = [0; format::COMMIT_WORD_LEN];
         self.seg.file.read_exact_at(&mut word, offset)?;
@@ -689,8 +697,7 @@ impl Reader {
             return Ok(false);
         }
         fence(Ordering::Acquire);
-        let body = u64::from(len) - format::COMMIT_WORD_LEN as u64;
-        resize_buf(&mut self.buf, body)?;
+        resize_buf(&mut self.buf, body_len)?;
         self.seg
             .file
             .read_exact_at(&mut self.buf, offset + format::COMMIT_WORD_LEN as u64)?;
