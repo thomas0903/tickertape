@@ -80,10 +80,10 @@ recorded from the run of pull request #33), including a journal larger than the 
 dropped before each operation: opening a reader did not grow with the journal's size in bytes, and a seek cost at most
 one scan of the segment holding its target, proportional to the segment size the user chooses and paid once when a
 reader starts or seeks. (Clarified 2026-11-25: the newest segment of those journals was half full, so the recorded
-seeks to the last record, 90–93 ms cold with 128 MiB segments, read about 64 MiB; the largest share
-of a 128 MiB segment a cold seek crossed was 75 %, in 137–142 ms. A seek across a full segment was not measured.) That bound does not justify a new
-file kind and a new crash-contract case before 1.0. `docs/operations.md` (Choosing a segment size → Seek time, Segment
-count) documents the cost so users can size segments for it. The sparse index (option 2), skipping the unwritten part
+seeks to the last record, 90–93 ms cold with 128 MiB segments, read about 64 MiB; the largest share of a 128 MiB
+segment a cold seek crossed was 75 %, in 137–142 ms. A seek across a full segment was not measured.) That bound does
+not justify a new file kind and a new crash-contract case before 1.0. `docs/operations.md` (Choosing a segment size →
+Seek time, Segment count) documents the cost so users can size segments for it. The sparse index (option 2), skipping the unwritten part
 of the newest segment at writer open (option 3) and fewer file opens per retention run and writer open (option 4) stay
 possible later work, each with its own review; none of them changes format version 1.
 

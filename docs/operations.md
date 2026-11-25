@@ -196,8 +196,10 @@ Never truncate or edit a segment in place while anything uses the journal: proce
 ## Moving a tape to another machine
 
 A journal is its `*.tape` files and `checkpoint`; nothing in them depends on the machine they were written on
-(`format.md`). Copy those files. The other entries of the directory (`format.md` → Journal directory) are not needed:
-`writer.lock` and `notify` describe a writer on the old machine, and a new writer creates its own. The commands below
+(`format.md`). Copy those files. The other entries of the directory (`format.md` → Journal directory) are not needed
+to read or continue the journal: `writer.lock` and `notify` describe a writer on the old machine, and a new writer
+creates its own. `quarantine/`, if present, holds bytes that recovery removed; keep it if they matter to you. The
+commands below
 were run with tickertape 1.0.0 from macOS (aarch64, APFS) to Linux (aarch64, btrfs, a local VM) over SSH, with 1 MiB
 segments; the first recipe's copy, checksum and `verify` steps also in the other direction.
 
@@ -214,7 +216,8 @@ segments; the first recipe's copy, checksum and `verify` steps also in the other
 
 2. Copy. `sync` makes the new machine write the copy to its disk: the marker came along with the copy, so it calls
    records durable there before they are. This was run with a Linux destination; on macOS plain sync calls do not
-   flush the drive's write cache (crash contract → What `checkpoint()` does).
+   flush the drive's write cache (crash contract → What `checkpoint()` does), so with a macOS destination keep the
+   source until the copy has been made durable some other way.
 
    ```sh
    ssh newhost 'mkdir journal'
@@ -243,7 +246,7 @@ sequence numbers, and the copies can't be joined again.
 ### Old segments, with the writer running
 
 `tickertape archive` moves sealed segments that are strictly older than the checkpoint segment out of the journal. They
-no longer change, so copy them from the archive directory (it must exist):
+no longer change, so copy them from the archive directory (it must exist; the commands below are for a first run):
 
 ```sh
 mkdir archive
@@ -270,16 +273,19 @@ original journal already uses.
 
 ### Limits
 
-- **Do not copy a journal a writer is using as a whole.** The files change between and during the reads, so the copy is
-  no snapshot. Copying the segments before `checkpoint` gave a marker naming a segment the copy lacked: the writer
-  refuses that journal and `status` reports it as corrupt, although `verify` passed in five of six tries. Copying
-  `checkpoint` first gave a usable journal in six tries of six, with more records than the marker covers, but nothing
-  guarantees that the records after the marker are complete, no checksum list can be made for a file that is changing,
-  and retention was off.
+- **Do not copy a journal a writer is using as a whole.** The files change during the copy, so it is no snapshot.
+  Copying the segments before `checkpoint` is dangerous: the marker can cover records the copied segments lack. If the
+  marker names a segment the copy lacks, the writer refuses the copy. If it points into a segment that was copied
+  earlier, `verify` and `status` can both exit with 0 and the writer opens, continues at the marker's sequence number
+  and leaves a hole that readers cannot pass. A sign of this is a `verify` `last_seq` + 1 lower than the checkpoint's
+  `next seq` in `status`. Copying `checkpoint` first avoids that, but the records after the marker may be incomplete,
+  `verify` can fail because the next segment is missing, and retention may remove segments during the copy. Stop the
+  writer, or use the archive recipe above.
 - A copy that lacks a segment in the middle, or the newest one after a sealed one, fails `verify`; one that lacks only
   its oldest segments passes, like a journal after retention. The writer refuses a copy whose marker's segment is
   missing, but accepts one that lacks only older segments, and one that lacks only a newest segment after the
-  marker's: in the last case it creates that segment again, empty. So run the checks before you open a writer.
+  marker's: in the last case it creates that segment again, empty. So run the checks before you open a writer, and do
+  not rely on them for a copy of a live journal.
 - A writer preallocates the segments it creates, not one it finds. Do not copy with options that make sparse files
   (`tar -S`, `rsync --sparse`) if a writer will continue on the copy: the newest segment may then have no disk
   space reserved (crash contract C10). Not tested.

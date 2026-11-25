@@ -45,7 +45,9 @@ tickertape has two readers: the safe one (`Reader::open`, which reads with `prea
 
 In all these runs Chronicle Queue used its default queue options (plus `SyncMode.SYNC` where a sync every second is
 measured): no page pre-touching (its pretoucher is Enterprise-only since Chronicle Queue 5.24, and the harness did not
-call the open-source `microTouch()`), the default 64 MiB `blockSize`, and a JIT warm-up that did not cover every path.
+call the open-source `microTouch()`), the default 64 MiB `blockSize`, and a warm-up that left some code paths cold.
+tickertape ran with its default prefaulting on. In its own benchmark on the same machine as the short runs below,
+turning it off raised the zero-copy reader's 64-byte p99.9 from 1.7–2.0 µs to 31–34 µs, close to Chronicle Queue's.
 The harness is to be corrected ([#56](https://github.com/thomas0903/tickertape/issues/56)) and the comparison rerun
 ([#57](https://github.com/thomas0903/tickertape/issues/57)).
 
@@ -65,9 +67,10 @@ one socket. Each result is the range of two runs. They have not been repeated on
 - **Writer-to-reader latency, 100,000 records/s for 11 seconds:**
   - 64 bytes: the zero-copy reader's p99.9 was 0.5–1.8 µs, the lowest of all tools measured, and the safe reader's
     was 4.3–6.3 µs. Chronicle Queue's was 36–37 µs and Aeron IPC's 92–133 µs.
-  - 1,024 bytes: the two readers differ. The zero-copy reader's p99.9 was 36–76 µs, around Chronicle Queue's 48–55 µs
-    (and 110–243 µs in tickertape's own runs of the same configuration). The safe reader's was 7.4–9.2 µs.
-    Aeron's in-memory IPC was lower, at 0.8 µs.
+  - 1,024 bytes: the zero-copy reader's p99.9 was 36–76 µs, around Chronicle Queue's 48–55 µs. It is not stable:
+    tickertape's own benchmark program (`tt-latency`), on the same machine and filesystem with the same rate and
+    record size, measured 110–243 µs. Chronicle Queue was not run in that program. The safe reader's p99.9 was
+    7.4–9.2 µs. Aeron's in-memory IPC was lower, at 0.8 µs.
 
 ### Ten-minute runs on cloud VMs (after v0.4.0)
 

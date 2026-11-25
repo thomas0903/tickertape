@@ -18,7 +18,8 @@ bare-metal sections.
 **How Chronicle Queue was configured in every comparison below.** Its queue options were the defaults, except
 `SyncMode.SYNC` in the sustained SD runs (`compare/chronicle/src/main/java/compare/Main.java`):
 - no page pre-touching: the pretoucher has been Enterprise-only since Chronicle Queue 5.24 (the open-source version
-  has only the interface), and the harness did not call the open-source `microTouch()`;
+  has only the interface), and the harness did not call the open-source `microTouch()`; tickertape's default
+  prefaulting (256 KiB ahead, from v0.4.0 on Linux) was on;
 - the default `blockSize` of 64 MiB, where Chronicle's README says that in production a larger one may reduce the
   jitter of creating chunks;
 - a JIT warm-up that did not cover every path (`compare/java/compare/Harness.java`): W1 and W3 warm up with 100,000
@@ -129,7 +130,7 @@ At 1,024 B, Aeron IPC (which persists nothing) has the lowest tails: p99.9 0.8�
 - at 10,000 records/s, tickertape's p99.9 is 16–26 µs (`safe` reader) and 20–21 µs (zero-copy reader), against
   47–48 µs; the plain file's is lower, at 8.2–8.3 µs;
 - at 100,000 records/s, the `safe` reader's is 7.4–9.2 µs against 48–55 µs, but the zero-copy reader's is 36–76 µs,
-  around Chronicle Queue's. In tickertape's own runs of the same configuration (below) it was 110–243 µs.
+  around Chronicle Queue's. In `tt-latency` (below), a different program with the same settings, it was 110–243 µs.
 
 Late sends at 1,024 B and 100,000 records/s fell from about 28,000 to about 700 for the zero-copy reader.
 
@@ -153,8 +154,9 @@ What these rows show:
 - **Prefaulting helps at 64 B on both filesystems**, cutting the zero-copy reader's p99.9 by more than 15×.
 - **At 1,024 B it cuts p99 from 23–31 µs to 1.2–2.2 µs.** The zero-copy reader's p99.9 at 1,024 B is the exception
   on ext4: 110–243 µs with prefaulting against 97–122 µs without. On xfs prefaulting helps there too. **Open:** why
-  it is worse with prefaulting on ext4 has not been explained. The two runs of a configuration differ by more than 2×, and
-  the same configuration with prefaulting measured 36–76 µs in the comparison above.
+  it is worse with prefaulting on ext4 has not been explained. With prefaulting on, the two runs differ by more than
+  2× (110 and 243 µs), against 97 and 122 µs with it off, and the comparison above measured 36–76 µs with the same
+  settings.
 - **With prefaulting off, the zero-copy reader's p99.9 on ext4 is close to Chronicle Queue's only at 64 B**: 31–34 µs
   against 36–37 µs. At 1,024 B it is 97–122 µs against 48–55 µs. (Chronicle Queue's figures are the comparison's above,
   on ext4; it was not run on xfs on this machine.)
@@ -1852,5 +1854,5 @@ checkpoints the journal, the tool drops the page cache, then a fresh reader proc
 In this v0.1.0 recording: bare-metal Linux; Intel/AMD x86-64; ext4 or xfs on real disks; core pinning or isolated
 CPUs; checkpoint durability on real Linux hardware; power-loss behaviour. Since then bare-metal x86-64 Linux, ext4 and
 xfs on local NVMe, and runs bound to a NUMA node or pinned to cores have been recorded (the sections above). Isolated
-CPUs, checkpoint durability on real Linux hardware and power loss still have not. CI runners only run smoke versions
+CPUs and whether checkpointed data survives a power loss still have not. CI runners only run smoke versions
 of these tools, and their numbers are never recorded.

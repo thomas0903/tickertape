@@ -17,8 +17,9 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   10-minute comparison on cloud VMs from `docs/benchmarks.md`. No figure changed and nothing new was measured.
 - Docs: corrections to benchmark notes, with no new measurement (issue #58). The README and `docs/benchmarks.md` say
   how Chronicle Queue was configured (defaults, no page pre-touching) and that tickertape's first segment is
-  preallocated before the append timer starts; that at 1,024 bytes the zero-copy reader's p99.9 is around Chronicle
-  Queue's, not below it, and above it with prefaulting off; and that the recorded seeks to the last record cross about
+  preallocated before the append timer starts, and that tickertape's prefaulting was on; that at 1,024 bytes and
+  100,000 records/s the zero-copy reader's p99.9 is around Chronicle Queue's, not below it, and on ext4 above it with
+  prefaulting off; and that the recorded seeks to the last record cross about
   half a segment. The "Not measured" list of v0.1.0 says what was measured later. ADRs 0025 and 0042 have notes.
 - Docs: `docs/operations.md` describes how to move a tape to another machine.
 - Changed (CLI, dependencies): `Cargo.lock` moves parquet from 59.3.2 to 59.3.3 for RUSTSEC-2026-0595 (bloom filters
