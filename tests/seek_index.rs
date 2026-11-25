@@ -1089,6 +1089,11 @@ fn a_clean_open_syncs_the_index_directory_and_no_segment() {
             let of_segment: Vec<_> = syncs.iter().filter(|s| s.1 == identity(&path)).collect();
             assert!(of_segment.is_empty(), "case {case}: {of_segment:?}");
         }
+        // Nor through a mapping, whose file the log does not know: segments are the only files the writer maps writable.
+        assert!(
+            !syncs.iter().any(|s| s.0 == Sync::Msync),
+            "case {case}: {syncs:?}"
+        );
         if indexes.exists() {
             let id = identity(&indexes);
             let opened = case != 3 || syncs.iter().any(|s| s.1 == id);
@@ -1100,7 +1105,11 @@ fn a_clean_open_syncs_the_index_directory_and_no_segment() {
             let at = |kind| syncs.iter().position(|s| *s == (kind, id));
             assert!(at(Sync::All) <= at(Sync::Barrier));
         }
+        // The log does see what a checkpoint does to the segment.
+        fault::record_syncs();
         writer.checkpoint().unwrap();
+        let active = identity(&segments(dir.path()).last().unwrap().1);
+        assert!(fault::take_syncs().iter().any(|s| s.1 == active));
         drop(writer);
         if case == 2 {
             // Both are best effort, and counted.
@@ -2460,13 +2469,14 @@ fn a_marker_that_moves_on_is_not_dangling() {
     let segs = segments(dir.path());
     let hidden = dir.path().join("hidden");
     std::fs::create_dir(&hidden).unwrap();
-    let run = |what: &dyn Fn()| {
-        // The older marker, which names segment 1; as it is about to be opened, retention has run and the marker moved.
+    let run = |read: usize, what: &dyn Fn()| {
+        // The older marker, which names segment 1; as it is about to be opened (at this read of the marker, after others
+        // that met no change), retention has run and the marker moved.
         std::fs::write(&marker, &older).unwrap();
         let (marker, newer, hide) = (marker.clone(), newer.clone(), hidden.clone());
         let gone = segs[..2].to_vec();
         fault::clear();
-        fault::run_at(Point::MarkerRead, 0, move || {
+        fault::run_at(Point::MarkerRead, read, move || {
             std::fs::write(&marker, &newer).unwrap();
             for (_, path) in &gone {
                 std::fs::rename(path, hide.join(path.file_name().unwrap())).unwrap();
@@ -2477,12 +2487,20 @@ fn a_marker_that_moves_on_is_not_dangling() {
             std::fs::rename(hidden.join(path.file_name().unwrap()), path).unwrap();
         }
     };
-    run(&|| {
+    run(0, &|| {
         let built = build(dir.path());
         assert_eq!(built[..2], [IndexState::Vanished; 2]);
         assert_eq!(built[2..4], [IndexState::Built; 2]);
     });
-    run(&|| assert_eq!(check(dir.path())[2..4], [IndexState::Valid; 2]));
+    // The read behind the fence: the first one had left only segment 0 to index.
+    run(1, &|| {
+        let built = build(dir.path());
+        assert_eq!(built[0], IndexState::Vanished);
+        assert_eq!(built[1..], [IndexState::NotCovered; 4]);
+    });
+    run(0, &|| {
+        assert_eq!(check(dir.path())[2..4], [IndexState::Valid; 2])
+    });
     // A marker that stays and names a segment that is gone is one.
     std::fs::write(&marker, &older).unwrap();
     std::fs::remove_file(&segs[1].1).unwrap();
@@ -2490,6 +2508,35 @@ fn a_marker_that_moves_on_is_not_dangling() {
         seek_index::build(dir.path(), false),
         Err(Error::Corrupt { .. })
     ));
+}
+
+/// Where it cannot be told, after the rename, whether the segment is still in place, the index does not stay.
+#[test]
+fn an_index_whose_segment_cannot_be_checked_is_removed() {
+    let (dir, _writer) = indexed(64, 2);
+    let index = index_path(dir.path(), 0);
+    let mode = |path: &Path, m| std::fs::set_permissions(path, Permissions::from_mode(m)).unwrap();
+    let root = dir.path().to_path_buf();
+    fault::clear();
+    let (path, seen) = (root.clone(), Rc::new(Cell::new(false)));
+    let published = Rc::clone(&seen);
+    fault::run_at(Point::SeekIndexAfterRename, 0, move || {
+        published.set(index_path(&path, 0).exists());
+        mode(&path, 0o000);
+    });
+    let result = seek_index::build(dir.path(), true);
+    mode(&root, 0o755);
+    assert!(seen.get());
+    // SAFETY: no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        return; // Nothing fails.
+    }
+    let report = result.unwrap();
+    assert_eq!(states(&report.segments)[..2], [IndexState::Failed; 2]);
+    assert!(!index.exists());
+    // The second segment could not be opened: its index, of an earlier build, stays, and nothing unfinished.
+    let second = segments(dir.path())[1].0;
+    assert_eq!(index_names(dir.path()), [format!("{second:020}.idx")]);
 }
 
 /// The descriptor of the walked segment stays open until the identity check, so that no other file can have its inode.

@@ -436,7 +436,7 @@ segment), which serves the more common seek.
   (Corrected 2026-11-26: that barrier is applied to the descriptor of `seek-index/`, never to a segment's. A best-effort
   sync of the active segment would consume a write-back error that the first checkpoint must report, crash contract C7
   and "Errors are sticky", since Linux reports one once per open file description. If `seek-index/` cannot be opened there
-  is no barrier: nothing was removed.)
+  is no barrier: nothing was removed by this open; what an earlier open removed without a sync is left to T5.)
   (If a power loss before the barrier brings the index back, the segment holds no new history yet: step 6, 8a or 8b
   rejects the entry, or it points at a record recovery kept.)
 - **Retention and `archive`** unlink `{base}.idx` (a later kind's file is left to the next writer open) after the
@@ -591,13 +591,14 @@ Additive (ADR 0043); C ABI version 1.
   `::seek_index_errors` (`u64`). Module `seek_index`: `DIR_NAME`; `build(dir, rebuild: bool) -> Result<BuildReport>`;
   `check(dir) -> Result<CheckReport>`; `remove(dir) -> Result<u64>`. Reports hold, per segment, `base_seq`, a state
   (`Built`, `Valid`, `Missing`, `Ignored`, `Wrong`, `NotNeeded`, `NotSealed`, `NotCovered`, `NotPermitted`,
-  `Vanished`) and a reason. `#[doc(hidden)]`, for the workspace's tests and fuzz target: `Reader::seek_used_index()`
+  `Vanished`) and a reason. (Corrected 2026-11-26: also `Failed`, for what fails for one segment, which does not end the
+  run, and `CheckReport::unfinished`, the number of temporary files that killed builds left.) `#[doc(hidden)]`, for the workspace's tests and fuzz target: `Reader::seek_used_index()`
   and the byte codec.
 - **CLI.** `tickertape index DIR [--rebuild | --check | --remove] [--json]`. `--check` scans each segment, changes
   nothing, and compares every entry with the chain, whoever runs it: ownership and mode do not decide the state; a
   file valid in content that readers ignore because of them is flagged (`ignored_by_readers`, with the reason).
   `Ignored`: a reader would not use the content. `Wrong`: it would, but an entry is not on the chain; exit 2. I/O
-  errors and `NotPermitted` exit 1; otherwise 0. `--remove` deletes recognised names and leaves the directory. `tail`,
+  errors (`Failed`) and `NotPermitted` exit 1; otherwise 0. `--remove` deletes recognised names and leaves the directory. `tail`,
   `export` and `stats` gain `--seek-index`, for their `--from`. `export --output` no longer descends into
   `seek-index/` in its alias walk: it holds no journal data.
 - **Bindings.** C `tickertape_reader_options_set_seek_index`, C++ the same on its reader options, Python
