@@ -15,8 +15,12 @@ use crate::record::{OwnedRecord, Record};
 
 /// How long a reader waits at an empty slot before checking that its segment wasn't replaced by recovery.
 const IDENTITY_CHECK_INTERVAL: Duration = Duration::from_millis(100);
-/// Bytes the `pread` reader fetches at a time (more if a record is larger).
+/// Most bytes the `pread` reader fetches at a time (more if a record is larger).
 const CHUNK: usize = 64 * 1024;
+/// Bytes the `pread` reader fetches at a time when it has caught up with the writer: the bytes after the newest record
+/// are zeros, which it would copy for nothing, once for every record it follows live. A buffer whose records it all
+/// consumes doubles the next one, up to [`CHUNK`].
+const TAIL_CHUNK: usize = 4 * 1024;
 /// Longest single block on the wake-up region when the writer maintains it (bounded so that a writer that died, or a
 /// missed wake-up, costs at most this much latency; the identity check also runs at least this often).
 const NOTIFY_MAX_WAIT: Duration = Duration::from_millis(100);
@@ -80,6 +84,8 @@ pub struct Reader {
     /// `pread` buffer: bytes of `seg` starting at file offset `buf_start`.
     buf: Vec<u8>,
     buf_start: u64,
+    /// Bytes the next fill of `buf` asks for (or the frame at the cursor, if larger).
+    chunk: usize,
     /// The journal's wake-up region, if wake-ups are enabled (ADRs 0017 and 0021).
     waker: Option<crate::notify::Waker>,
     /// When the reader started waiting at an empty slot.
@@ -221,6 +227,7 @@ impl Reader {
             skip_until: base,
             buf: Vec::new(),
             buf_start: 0,
+            chunk: CHUNK,
             waker,
             waiting_since: None,
             found: Found {
@@ -768,9 +775,16 @@ impl Reader {
                 .map_err(|e| Error::io("read segment", &self.seg.path, e))?;
             word = u32::from_le_bytes(w);
             if word == 0 {
+                self.chunk = TAIL_CHUNK;
                 return Ok(SlotOutcome::Empty);
             }
             fence(Ordering::Acquire);
+            if buffered {
+                // The buffer reached past the newest record when it was filled.
+                self.chunk = TAIL_CHUNK;
+            } else {
+                self.grow_chunk();
+            }
             self.fill_buf(offset, word)?;
         } else if fresh {
             fence(Ordering::Acquire);
@@ -782,6 +796,7 @@ impl Reader {
             offset.saturating_add(u64::from(word))
         };
         if frame_end > self.buf_start + self.buf.len() as u64 && frame_end <= size {
+            self.grow_chunk();
             self.fill_buf(offset, word)?;
         }
         // Validate in place in the pread buffer (no copy, no allocation).
@@ -800,7 +815,12 @@ impl Reader {
         ))
     }
 
-    /// Fills the `pread` buffer from `offset`: at least the frame of commit word `word`, normally a whole chunk,
+    /// The reader consumed the whole `pread` buffer: the next fill may fetch more.
+    fn grow_chunk(&mut self) {
+        self.chunk = (self.chunk * 2).min(CHUNK);
+    }
+
+    /// Fills the `pread` buffer from `offset`: at least the frame of commit word `word`, normally `self.chunk` bytes,
     /// but never past the end of the segment.
     fn fill_buf(&mut self, offset: u64, word: u32) -> Result<()> {
         let want = if word == format::SEAL_MARKER {
@@ -809,7 +829,7 @@ impl Reader {
             u64::from(word)
         };
         let len = want
-            .max(CHUNK as u64)
+            .max(self.chunk as u64)
             .min(self.seg.size.saturating_sub(offset));
         resize_buf(&mut self.buf, len)
             .map_err(|e| Error::io("allocate read buffer", &self.seg.path, e))?;
@@ -1236,7 +1256,9 @@ mod wake_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{Reader, SlotOutcome, VALIDATION_RETRIES, VALIDATION_WINDOW, resize_buf};
+    use super::{
+        CHUNK, Reader, SlotOutcome, TAIL_CHUNK, VALIDATION_RETRIES, VALIDATION_WINDOW, resize_buf,
+    };
     use crate::mmap::MAPPED_READS;
     use crate::{CorruptReason, Error, NewRecord, ReaderConfig, Writer, WriterConfig};
     use std::cell::Cell;
@@ -1257,6 +1279,62 @@ mod tests {
                 SlotOutcome::Invalid(CorruptReason::BadChecksum)
             }
         })
+    }
+
+    /// The `pread` reader fetches little when it follows the writer live (issue #62: it read 64 KiB for every record
+    /// it followed), and whole chunks when it has a backlog to read.
+    #[test]
+    fn a_reader_at_the_tail_reads_little_and_one_with_a_backlog_reads_chunks() {
+        fn append(writer: &mut Writer, count: usize, len: usize) {
+            let payload = vec![7; len];
+            for _ in 0..count {
+                writer
+                    .append(&NewRecord {
+                        schema_id: 0,
+                        venue_ts_ns: 0,
+                        local_ts_ns: 0,
+                        payload: &payload,
+                    })
+                    .unwrap();
+            }
+        }
+        /// Reads `count` records and returns the largest buffer it filled on the way.
+        fn read(reader: &mut Reader, count: usize, len: usize) -> usize {
+            let mut largest = 0;
+            for _ in 0..count {
+                let record = reader.try_next().unwrap().expect("record missing");
+                assert_eq!(record.payload, vec![7; len]);
+                largest = largest.max(reader.buf.len());
+            }
+            largest
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer =
+            Writer::open(dir.path(), WriterConfig::default().segment_size(1 << 20)).unwrap();
+        append(&mut writer, 1000, 64);
+        let mut reader = Reader::open(dir.path(), ReaderConfig::default()).unwrap();
+        // Replay: whole chunks from the first read on.
+        assert_eq!(read(&mut reader, 1, 64), CHUNK);
+        assert_eq!(read(&mut reader, 999, 64), CHUNK);
+        assert!(reader.try_next().unwrap().is_none());
+        // Following live, polled or not in between: little per record.
+        for polls in [1, 0, 1, 3] {
+            append(&mut writer, 1, 64);
+            assert_eq!(read(&mut reader, 1, 64), TAIL_CHUNK);
+            for _ in 0..polls {
+                assert!(reader.try_next().unwrap().is_none());
+            }
+        }
+        // Records larger than the tail read are read whole.
+        append(&mut writer, 2, 10_000);
+        assert_eq!(read(&mut reader, 2, 10_000), 10_040);
+        assert!(reader.try_next().unwrap().is_none());
+        // A backlog: the reads grow back to whole chunks.
+        append(&mut writer, 3000, 64);
+        assert_eq!(read(&mut reader, 3000, 64), CHUNK);
+        assert!(reader.try_next().unwrap().is_none());
+        append(&mut writer, 1, 64);
+        assert_eq!(read(&mut reader, 1, 64), TAIL_CHUNK);
     }
 
     fn journal_of(count: usize) -> tempfile::TempDir {
