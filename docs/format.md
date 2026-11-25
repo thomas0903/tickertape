@@ -300,7 +300,11 @@ segment's path still names the file it has open (same device and inode) when it 
 waited at an empty slot for 100 ms or more, and before it follows a seal into the next segment. If the path names a
 different file or no file, the reader returns `Error::Discarded` and doesn't advance; it never continues at its old
 offset in the new file, because offsets after the repair point don't line up. The application calls `seek` to
-continue: `seek` scans the current chain from the start of a segment, so it only lands on validated positions.
+continue: `seek` scans the current chain from the start of a segment, so it only lands on validated positions. (A
+forward seek in the reader's own segment may scan from the reader's position instead, but only when that is known to
+be a record boundary of the current chain: the marker covers it, the path still names the file the reader has open
+after the marker was read, and the record before it is still there. ADR
+[0046](decisions/0046-seeks-that-need-no-index.md).)
 
 A durable-only reader also checks when a checkpoint marker it has just read moves past its cursor, after reading the
 marker and before it reads any record the marker newly covers. The order matters: recovery replaces files before the

@@ -18,7 +18,10 @@ draws conclusions from those two.
 - **Open time.** When the writer opens, it reads the part of the newest segment after the last record to clean up
   after a crash, so very large segments make opening slower.
 - **Seek time.** `Reader::seek` opens the segment holding the target and reads every record before it in that
-  segment, validating each, so larger segments make a seek slower (ADR 0042).
+  segment, validating each, so larger segments make a seek slower (ADR 0042). A forward seek within the reader's
+  segment reads only from the reader's position on, when a checkpoint covers that position (ADR 0046), so seeking
+  forward through a checkpointed segment does not read it again for each seek. `Reader::seek_to_end` reads at most
+  the newest segment, from the checkpoint on.
 - **Segment count.** Opening a reader or a writer and each seek read the whole journal directory; `list_segments`,
   `verify` and each retention run (when retention is configured, at writer open and after checkpoints) open every
   segment's file; replay opens each segment it enters. These costs grow with the number of segments, so very small
