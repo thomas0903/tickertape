@@ -77,8 +77,9 @@ fn rolls_under_a_low_limit(request_every: u64) {
     ]);
     let (next_seq, fds, maps) = (out[0] as u64, out[1], out[2]);
     assert!(segments(&journal).len() as u64 > ROLLS);
-    // From the first roll to the last, the descriptors and mappings held stay within a few segments.
-    assert!(fds <= 8, "descriptors grew by {fds} over {ROLLS} rolls");
+    // From the first roll to the last, the descriptors and mappings held stay within a few segments: what the dirty
+    // lists and the write-back helper hold, and one segment file being prepared or ready (the spare, ADR 0022).
+    assert!(fds <= 9, "descriptors grew by {fds} over {ROLLS} rolls");
     assert!(maps <= 16, "mappings grew by {maps} over {ROLLS} rolls");
     check_durable(&journal, next_seq);
 }
