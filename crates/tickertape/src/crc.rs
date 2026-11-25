@@ -69,6 +69,12 @@ pub(crate) fn x8n(mut n: u64) -> u32 {
 
 /// Continues `crc` over `head`, then the bytes of `words` (word `i` is bytes `[8i, 8i + 8)`, little-endian), then
 /// `tail`: the same value as [`crc32c_append`] over the concatenation. Each word is loaded exactly once.
+///
+/// The inlining of this function (never) and of the hardware path below it (into this one) is fixed by attributes.
+/// Without them it depended on how the crate is split into codegen units: adding the seek index, which does not call
+/// it, moved the boundary between this function and the mapped reader's record decoder, and replaying 64-byte
+/// records became 3 to 4 % slower on an M4 Pro, with the rest of the per-record path unchanged instruction by instruction.
+#[inline(never)]
 pub(crate) fn crc32c_append_parts(
     crc: u32,
     head: &[u8],
@@ -265,6 +271,7 @@ macro_rules! three_lane_crc {
         /// As `update`, over words loaded one at a time from shared memory: each load feeds the CRC instruction
         /// directly, with the same three-lane blocks (in words) and the same serial tail.
         #[target_feature(enable = $feature)]
+        #[inline]
         #[allow(unused_unsafe)]
         unsafe fn update_words(
             mut crc: u32,
@@ -307,6 +314,7 @@ macro_rules! three_lane_crc {
         /// `update` over `head`, then `update_words` over `words`, then `update` over `tail`, in one function
         /// compiled with the feature.
         #[target_feature(enable = $feature)]
+        #[inline]
         #[allow(unused_unsafe)]
         unsafe fn update_parts(
             crc: u32,
@@ -324,6 +332,7 @@ macro_rules! three_lane_crc {
         }
 
         /// `None` if the CPU lacks the feature; otherwise [`super::crc32c_append_parts`].
+        #[inline]
         pub(super) fn append_parts(
             crc: u32,
             head: &[u8],

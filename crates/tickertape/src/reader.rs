@@ -681,8 +681,8 @@ impl Reader {
             let Some(words) = map.words(offset + 8, count) else {
                 return Ok(false);
             };
-            // Copied, each word loaded once, rather than decoded in place as the reads after it are: with a second
-            // caller of `decode_record_words` the compiler built the first, the per-record path, about 4 % slower.
+            // Copied, each word loaded once, rather than decoded in place as the reads after it are: `decode_record_words`
+            // keeps its one caller, so that how the compiler builds the per-record path does not depend on this one.
             resize_buf(&mut self.buf, 4 + count * 8)?;
             self.buf[..4].copy_from_slice(&crc.to_le_bytes());
             for (to, word) in self.buf[4..].chunks_exact_mut(8).zip(words.iter()) {
