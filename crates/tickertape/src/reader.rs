@@ -1894,6 +1894,17 @@ mod tests {
                     assert!(!reader.used_index);
                     assert_eq!((reader.offset, reader.buf.capacity()), (64, 0));
                     write(entry.len);
+                    // Another record of the same length: 8a sees its checksum, before the frame is read.
+                    let crc = |crc: u32| {
+                        file.write_all_at(&crc.to_le_bytes(), entry.offset + 4)
+                            .unwrap();
+                    };
+                    crc(entry.crc ^ 1);
+                    let mut reader = open_indexed(dir.path(), mapped);
+                    reader.seek(900).unwrap();
+                    assert!(!reader.used_index);
+                    assert_eq!((reader.offset, reader.buf.capacity()), (64, 0));
+                    crc(entry.crc);
                     // Changed after 8a.
                     let mut reader = open_indexed(dir.path(), mapped);
                     let other = file.try_clone().unwrap();
