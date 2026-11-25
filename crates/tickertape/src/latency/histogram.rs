@@ -117,7 +117,8 @@ fn total(buckets: &[u64]) -> u64 {
 /// snapshot was taken, then
 ///
 /// - the maximum is never below, and the minimum never above, any value that is counted;
-/// - the sum (hence the mean) and the extremes can already include a value that is not counted yet;
+/// - the sum (hence the mean) and the extremes can already include any number of values that are not counted: of those
+///   that were recorded while the snapshot was taken. The sum is never below that of the values counted;
 /// - the counted values are not a prefix of the recorded ones: the n-th can be missing and the one after it counted.
 ///
 /// With a count of 0, everything is reported as empty. Counts of later snapshots are never smaller.
@@ -141,6 +142,10 @@ impl Snapshot {
 
     /// The sum of the values; zero when empty. `None` once it has reached `u64::MAX` nanoseconds (it saturates there),
     /// also for an interval that ends after that.
+    ///
+    /// Exact if nothing was recorded while the snapshot was taken. Otherwise it is too large by at most the values
+    /// recorded meanwhile, any number of them, as [`Snapshot`] says. For an interval it can be off either way: too large
+    /// by those of its end, too small by those of its start.
     pub fn sum(&self) -> Option<Duration> {
         match (self.count, self.sum) {
             (0, _) => Some(Duration::ZERO),
@@ -150,7 +155,12 @@ impl Snapshot {
     }
 
     /// The mean of the values, rounded down to a nanosecond. `None` when empty, and when [`Snapshot::sum`] is `None`.
-    /// Exact but for a value that was being recorded while the snapshot was taken.
+    ///
+    /// It is [`Snapshot::sum`] divided by [`Snapshot::count`], so it is exact if nothing was recorded while the snapshot
+    /// was taken. Otherwise the sum can include values that the count does not, and the mean is too large; for an
+    /// interval it can be off **either way**. It can lie outside `[min, max]`. The error is that of a fixed number of
+    /// values, those recorded during one snapshot (two for an interval), so it shrinks as the count grows: a short
+    /// interval of a busy recorder can be far off, a long one hardly is. The quantiles do not have it.
     pub fn mean(&self) -> Option<Duration> {
         let sum = self.sum()?.as_nanos().checked_div(self.count.into())?;
         Some(Duration::from_nanos(u64::try_from(sum).unwrap_or(u64::MAX)))
@@ -190,8 +200,9 @@ impl Snapshot {
     ///
     /// The maximum of an interval is exact if the histogram's maximum rose in it; otherwise it is the upper bound of the
     /// interval's highest bucket, capped at the histogram's maximum. It is never too small, and at most 1/64 too large
-    /// (the minimum likewise, never too large), except that it can be the maximum of a value that was being recorded
-    /// while this snapshot was taken and that the interval does not count yet.
+    /// (the minimum likewise, never too large), except that it can be that of values that were recorded while this
+    /// snapshot was taken and that the interval does not count. The sum and the mean can be off either way, as
+    /// [`Snapshot::mean`] says.
     ///
     /// The subtraction saturates: with the two snapshots swapped, or of different histograms, nothing panics and the
     /// result means nothing.
@@ -556,6 +567,73 @@ mod tests {
             assert_eq!(ns(last.max()), Some(value(VALUES - 1)));
             assert_eq!(ns(last.sum()), Some((0..VALUES).map(value).sum()));
         });
+    }
+
+    /// The documented bound on the sum, with the recorder never idle: it is at least that of the values counted, and
+    /// exceeds it by at most the values recorded while the snapshot was taken; for an interval, by those of its two
+    /// snapshots either way. All values are equal, so what the sum misses or has too much is a number of values.
+    #[test]
+    #[cfg_attr(miri, ignore = "minutes; loom and the test above check the orderings")]
+    fn sums_are_off_by_at_most_what_was_recorded_during_the_snapshot() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering, fence};
+        struct StopOnDrop<'a>(&'a AtomicBool);
+        impl Drop for StopOnDrop<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+        const VALUE: u64 = 100;
+        let snapshots = 2_000;
+        let mut recorder = Recorder::new();
+        let view = recorder.view();
+        let (started, finished, stop) =
+            (AtomicU64::new(0), AtomicU64::new(0), AtomicBool::new(false));
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let mut n = 0;
+                while !stop.load(Ordering::Relaxed) {
+                    n += 1;
+                    started.store(n, Ordering::Relaxed);
+                    // Whoever sees the sum that includes this value also sees that it was started.
+                    fence(Ordering::Release);
+                    recorder.record_ns(VALUE);
+                    finished.store(n, Ordering::Release);
+                }
+            });
+            // Also when an assertion fails, or the scope would wait for the thread above for ever.
+            let _stop = StopOnDrop(&stop);
+            // The snapshot, and how many values were being recorded while it was taken, at most.
+            let take = || {
+                let before = finished.load(Ordering::Acquire);
+                let s = view.snapshot();
+                fence(Ordering::Acquire);
+                (s, started.load(Ordering::Relaxed) - before)
+            };
+            let (mut previous, mut during_previous) = take();
+            let mut outside = 0;
+            for _ in 0..snapshots {
+                let (s, during) = take();
+                let counted = s.count * VALUE;
+                assert!(s.sum >= counted, "{s:?}");
+                assert!(s.sum - counted <= during * VALUE, "{s:?}, {during}");
+                let interval = s.since(&previous);
+                let counted = interval.count * VALUE;
+                assert!(
+                    interval.sum <= counted + during * VALUE
+                        && interval.sum + during_previous * VALUE >= counted,
+                    "{interval:?}, {during_previous} and {during}"
+                );
+                outside +=
+                    u32::from(interval.mean() > interval.max() || interval.mean() < interval.min());
+                (previous, during_previous) = (s, during);
+            }
+            // Not a requirement: what the documentation warns of.
+            println!("{outside} of {snapshots} interval means were outside [min, max]");
+        });
+        // Nothing is recorded any more: exact.
+        let s = view.snapshot();
+        assert_eq!(s.sum, s.count * VALUE);
+        assert_eq!(ns(s.mean()), Some(VALUE));
     }
 
     #[cfg(not(miri))]
