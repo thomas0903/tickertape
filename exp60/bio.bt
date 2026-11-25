@@ -1,0 +1,11 @@
+#!/usr/bin/env bpftrace
+/* Block I/O latency by operation and submitter, whole system; requests of 20 ms or more listed. bio.bt <seconds> */
+tracepoint:block:block_rq_issue { @s[args.dev, args.sector] = nsecs; @c[args.dev, args.sector] = comm; }
+tracepoint:block:block_rq_complete /@s[args.dev, args.sector]/ {
+  $us = (uint64)(nsecs - @s[args.dev, args.sector]) / 1000;
+  @us[args.rwbs, @c[args.dev, args.sector]] = hist($us);
+  if ($us >= 20000) { printf("%s bio dev=%d rwbs=%s by=%s sectors=%d us=%d\n", strftime("%s.%f", @s[args.dev, args.sector]), args.dev, args.rwbs, @c[args.dev, args.sector], args.nr_sector, $us); }
+  $d = delete(@s, (args.dev, args.sector)); $e = delete(@c, (args.dev, args.sector));
+}
+interval:s:$1 { exit(); }
+END { clear(@s); clear(@c); }
