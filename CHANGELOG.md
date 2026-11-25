@@ -5,6 +5,14 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
+- Added (comparison harness): writer and reader threads are pinned on Linux, the same way for every tool, and every
+  other thread is kept off their CPUs (`--writer-cpu`, `--reader-cpu`, `--helper-cpus`, automatic choice from the
+  topology, `--no-pin` for the old behaviour). Every result records the affinity read back from `/proc`, and a pinned
+  run with a thread in the wrong place fails. `tt-latency` has the same options, and `benches/session.py` passes them
+  on with `--compare-affinity`. Nothing was measured for publication (#56).
+- Changed (comparison harness): the W1 burst test is now two figures per tool, `W1-cold` (the timer starts before open,
+  in an empty directory) and `W1-steady` (files ready and 1,000 records written before the timer). The old W1 left
+  tickertape's preallocation outside the timer and Chronicle's first cycle file inside (#56).
 - Fixed (release tooling): `release.py github-release` asked the release listing for its new draft once, immediately
   after creating it, and the v1.0.0 run failed there because the listing did not show the draft yet (after the
   crates were published; rerunning the job completed the release). It now asks for up to a minute.

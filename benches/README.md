@@ -70,7 +70,8 @@ suffixes on statistics and mode `visible_latency`.
 This is **visibility**, not checkpoint durability or network latency. Processes
 share one host's realtime clock; wall-clock adjustments can distort observations
 and negative latencies fail the run. Nanosecond units do not imply nanosecond
-accuracy. Busy polling consumes CPU; no core pinning is performed. Payload creation
+accuracy. Busy polling consumes CPU. Threads are not pinned unless `--writer-cpu`, `--reader-cpu` and
+`--helper-cpus` ask for it (Linux); the JSON result's `affinity` is what `/proc` said at the end of the run. Payload creation
 and process startup are outside measured latency, while page faults, writer rolls,
 scheduling delays and reader validation contribute. No checkpoint runs during live
 latency. Parent deadlines and child cleanup bound failed runs.

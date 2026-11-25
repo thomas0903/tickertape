@@ -19,6 +19,13 @@ def params(**overrides):
 
 
 class PlanTests(unittest.TestCase):
+    def test_pinning_options_reach_the_comparison(self):
+        from pathlib import Path
+        chosen = params(argv=["--compare-affinity=--writer-cpu 2 --reader-cpu 3"])
+        command = session.compare_command(Path("/nonexistent"), chosen, "yaque", False)
+        self.assertEqual(command[-4:], ["--writer-cpu", "2", "--reader-cpu", "3"])
+        self.assertNotIn("compare_affinity", params())
+
     def test_probes_come_first_and_labels_are_unique(self):
         runs = session.tt_plan(params())
         self.assertEqual([r.label for r in runs[:2]], ["tt-probe-64-r1", "tt-probe-1024-r1"])

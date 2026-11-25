@@ -27,6 +27,8 @@ public final class Harness {
     public interface Factory { Endpoint open(String role, Path dir) throws Exception; }
     static final ObjectMapper JSON = new ObjectMapper();
     static final long TIMEOUT = 120_000_000_000L;
+    /** Records append_steady writes before its timer starts (compare/src/lib.rs has the same value). */
+    static final long PRIMING_RECORDS = 1_000;
     /** Set before endpoints open when the run requests periodic durability (--sync-every-ms). */
     public static volatile boolean periodicSyncRequested = false;
     public static long now() {
@@ -64,7 +66,7 @@ public final class Harness {
         String role = args[0];
         Map<String,String> opts = new HashMap<>();
         Set<String> allowed = Set.of("--dir","--control","--count","--payload","--rate","--warmup","--reader","--mode","--jit-warmup",
-            "--duration-ms","--sync-every-ms");
+            "--duration-ms","--sync-every-ms","--cpu");
         for (int i=1;i<args.length;i+=2) {
             if (!allowed.contains(args[i]) || i+1>=args.length || opts.put(args[i],args[i+1])!=null)
                 throw new IllegalArgumentException("bad option " + args[i]);
@@ -112,8 +114,14 @@ public final class Harness {
                 }
             }
         }
+        // Pinning (README, Thread pinning): after open in the live modes, so that threads the tool starts inherit the
+        // process's helper CPUs; before open in the others, where open can be inside the timer.
+        if (!live) Affinity.pin(opts.get("--cpu"),control,role);
+        boolean cold=opts.get("--mode").equals("append_cold");
+        long priming=opts.get("--mode").equals("append_steady") ? PRIMING_RECORDS : 0;
         long replayStart = System.nanoTime();
         try (Endpoint endpoint = factory.open(role,dir)) {
+            if (live) Affinity.pin(opts.get("--cpu"),control,role);
             if (role.equals("writer")) {
                 byte[] data = new byte[payload+16];
                 Arrays.fill(data,(byte)0x5a);
@@ -125,6 +133,7 @@ public final class Harness {
                 Histogram syncHist=new Histogram(3);
                 if (probe) while (now()<t0) Thread.onSpinWait();
                 long nextSync=System.nanoTime()+syncEveryNs;
+                for (long i=0;i<priming;i++) { buffer.putLong(0,i); endpoint.send(data); }
                 for (long i=0;i<count;i++) {
                     long intended;
                     if (probe) {
@@ -138,8 +147,8 @@ public final class Harness {
                         if (delay>1000) late++;
                         maxLate=Math.max(maxLate,delay);
                     } else intended=0;
-                    if (i==0) start=System.nanoTime();
-                    buffer.putLong(0,i); buffer.putLong(8,intended);
+                    if (i==0) start=cold?replayStart:System.nanoTime();
+                    buffer.putLong(0,priming+i); buffer.putLong(8,intended);
                     endpoint.send(data);
                     sent++;
                     if (syncEveryNs>0) {
@@ -180,6 +189,9 @@ public final class Harness {
                 } else result.put("periodic_sync",null);
                 result.put("flush_operation",sync);
                 result.put("flush_seconds",flushSeconds);
+                result.put("timer_starts",cold?"before open, in an empty directory":priming>0
+                    ?"at the first record after open and the priming records":"at the first record after open");
+                result.put("priming_records",priming); result.put("affinity",Affinity.report());
                 resultOut.println(JSON.writeValueAsString(result));
                 if (live) {
                     long deadline=System.nanoTime()+TIMEOUT;
@@ -219,13 +231,14 @@ public final class Harness {
                 }
                 if (expected[0]!=target) throw new IllegalStateException("incomplete read");
                 double seconds=(System.nanoTime()-replayStart)/1e9;
-                Object result;
+                Map<String,Object> result;
                 if (probe) {
                     Map<String,Object> m=new LinkedHashMap<>();
                     m.put("count",target); m.put("latency_from","send start"); m.put("latency",histogram(hist));
                     result=m;
-                } else result=live?histogram(hist):Map.of("count",count,"seconds",seconds,
-                    "records_per_s",count/seconds,"payload_mb_per_s",count*payload/seconds/1e6);
+                } else result=live?histogram(hist):new LinkedHashMap<>(Map.of("count",count,"seconds",seconds,
+                    "records_per_s",count/seconds,"payload_mb_per_s",count*payload/seconds/1e6));
+                result.put("affinity",Affinity.report());
                 resultOut.println(JSON.writeValueAsString(result));
                 if (live) Files.write(control.resolve("reader.done"),new byte[0]);
             } else throw new IllegalArgumentException("expected writer/reader");
