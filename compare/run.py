@@ -17,6 +17,8 @@ import sys
 import tempfile
 import time
 
+import javaopts
+
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 TOOLS = ("tickertape", "chronicle", "aeron", "yaque", "queue-file", "plain-file")
@@ -44,6 +46,10 @@ GUARANTEES = {
     "plain-file": {"kind": "length-prefixed file", "process_crash": "completed writes remain in OS cache; incomplete tail not recovered",
                    "persistent_file": True, "arbitrary_replay": "sequential scan only", "independent_readers": True},
 }
+
+
+# Settings of the JVM tools in this session (see javaopts.py); main() replaces them with the command line's.
+JAVA = dict(javaopts.DEFAULTS)
 
 
 def execute(command, *, timeout=180, **kwargs):
@@ -74,6 +80,7 @@ def environment(out, env, quick, name="environment.txt"):
         f.write(f"date_utc: {datetime.datetime.now(datetime.timezone.utc).isoformat()}\n")
         f.write(f"quick: {quick}\nTMPDIR: {tempfile.gettempdir()}\nJAVA_HOME: {env['JAVA_HOME']}\n")
         f.write("versions: " + json.dumps(VERSIONS) + "\n")
+        f.write("JVM tool settings: " + json.dumps(JAVA) + "\n")
         f.write("command: " + shlex.join(sys.argv) + "\n")
         f.write("JVM flags (exact shared array):\n" + (HERE / "java-flags.sh").read_text() + "\n")
         for command in commands:
@@ -83,12 +90,12 @@ def environment(out, env, quick, name="environment.txt"):
         f.write("affinity: none; power/load: record manually for publication\n")
 
 
-def command(tool, role, data, control, count, payload, rate, warmup, reader, mode, quick):
+def command(tool, role, data, control, count, payload, rate, warmup, reader, mode, quick, out, name):
     cmd = [str(HERE / tool / "run.sh"), role, "--dir", str(data), "--control", str(control),
            "--count", str(count), "--payload", str(payload), "--rate", str(rate),
            "--warmup", str(warmup), "--reader", reader, "--mode", mode]
-    if tool in ("chronicle", "aeron"):
-        cmd += ["--jit-warmup", "1000" if quick else "100000"]
+    if tool in javaopts.JAVA_TOOLS:
+        cmd = javaopts.wrap(cmd, tool, JAVA, quick, False, out, name)
     return cmd
 
 
@@ -149,11 +156,12 @@ def run_attempt(tool, workload, payload, reader, rate, repeat, out, env, quick, 
         children = []
         handles = []
         outputs = []
+        java = None
         deadline = time.monotonic() + count / max(rate, 1) + 120
 
         def spawn(role, mode_override=None):
             cmd = command(tool, role, data, control, count, payload, rate, warmup,
-                          reader, mode_override or mode, quick)
+                          reader, mode_override or mode, quick, out, f"{label}-{role}-{len(children)}")
             commands.write(shlex.join(cmd) + "\n")
             commands.flush()
             output = base / f"{role}-{len(children)}.json"
@@ -200,11 +208,13 @@ def run_attempt(tool, workload, payload, reader, rate, repeat, out, env, quick, 
                     wait(writer)
                     result = {"latency": parse_result(read_path), "writer": parse_result(writer_path),
                               "coordinated_omission": "intended timestamps; no skipped sends or rebasing"}
+                    java = javaopts.collect(tool, JAVA, {"writer": result["writer"], "reader": result["latency"]})
                 else:
                     writer, writer_path = spawn("writer", "append")
                     wait(writer)
                     if workload == "W1":
                         result = {"append": parse_result(writer_path)}
+                        java = javaopts.collect(tool, JAVA, {"writer": result["append"]})
                     else:
                         # Full untimed read warms the page cache. QueueIter and
                         # queue-file iteration leave the fixture unconsumed.
@@ -213,6 +223,7 @@ def run_attempt(tool, workload, payload, reader, rate, repeat, out, env, quick, 
                         read, read_path = spawn("reader")
                         wait(read)
                         result = {"replay": parse_result(read_path)}
+                        java = javaopts.collect(tool, JAVA, {"reader": result["replay"]})
             finally:
                 for proc in children:
                     if proc.poll() is None:
@@ -232,7 +243,7 @@ def run_attempt(tool, workload, payload, reader, rate, repeat, out, env, quick, 
     result.update(tool=tool, tool_version=VERSIONS[tool], guarantees=guarantees,
                   mode=mode, workload=workload, payload=payload, count=count, warmup=warmup,
                   rate=rate if workload == "W2" else None, reader=reader, segment_size=134_217_728 if tool in ("tickertape", "yaque") else None,
-                  repeat=repeat, quick=quick)
+                  repeat=repeat, quick=quick, java=java)
     validate_result(result)
     with (out / f"{tool}-{workload}.jsonl").open("a") as f:
         f.write(json.dumps(result, allow_nan=False, separators=(",", ":")) + "\n")
@@ -310,7 +321,9 @@ def main():
                                 help="paced rates as fractions of each probe's achieved rate (default 0.5,0.9)")
     sustained_args.add_argument("--sync-every-ms", type=int, default=1000, help="SD sync interval (default 1000)")
     sustained_args.add_argument("--tt-readers", help="tickertape readers: safe,mapped (default mapped)")
+    javaopts.add_arguments(parser)
     args = parser.parse_args()
+    JAVA.update(javaopts.settings(args))
     if args.sustained:
         import sustained
         env = dict(os.environ)

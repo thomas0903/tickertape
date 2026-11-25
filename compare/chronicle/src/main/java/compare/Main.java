@@ -5,19 +5,33 @@ import net.openhft.chronicle.queue.impl.single.SingleChronicleQueueBuilder;
 import net.openhft.chronicle.bytes.Bytes;
 import net.openhft.chronicle.bytes.SyncMode;
 import net.openhft.chronicle.wire.DocumentContext;
+import net.openhft.chronicle.queue.util.MicroTouched;
 import java.nio.file.Path;
+import java.util.*;
 
 public final class Main {
     static final class QueueEndpoint implements Harness.Endpoint {
         final ChronicleQueue queue;
         final ExcerptAppender appender;
         final ExcerptTailer tailer;
+        /** The open-source appender's substitute for the Enterprise pretoucher; null when switched off. */
+        final MicroTouched microTouch;
+        final long blockSize;
+        long touched;
         QueueEndpoint(String role, Path dir) {
             // Periodic durability (SD) uses msync(MS_SYNC) through SyncMode.SYNC; otherwise the default.
             SingleChronicleQueueBuilder builder = SingleChronicleQueueBuilder.binary(dir.toFile());
             if (Harness.periodicSyncRequested) builder.syncMode(SyncMode.SYNC);
+            // The warm-up has to cross chunks, whatever the measured queue uses: its full rounds keep Chronicle's
+            // default of 64 MiB and its fresh rounds use chunks small enough for their few records.
+            String block = Harness.options.getOrDefault("--block-size","default");
+            if (Harness.phase==Harness.Phase.FRESH_WARMUP) builder.blockSize(256L<<10);
+            else if (Harness.phase==Harness.Phase.MEASURED && !block.equals("default")) builder.blockSize(Long.parseLong(block));
+            blockSize = builder.blockSize();
             queue = builder.build();
             appender = role.equals("writer") ? queue.createAppender() : null;
+            microTouch = appender!=null && Harness.options.getOrDefault("--micro-touch","off").equals("on")
+                ? (MicroTouched)appender : null;
             tailer = role.equals("reader") ? queue.createTailer().toStart() : null;
         }
         public void send(byte[] bytes) {
@@ -34,6 +48,13 @@ public final class Main {
                 observer.record(seq,ts,length-16);
                 return true;
             }
+        }
+        public void idle() { if (microTouch!=null && microTouch.microTouch()) touched++; }
+        public Map<String,Object> settings() {
+            Map<String,Object> m=new LinkedHashMap<>();
+            m.put("block_size",blockSize);
+            if (appender!=null) { m.put("micro_touch",microTouch!=null); m.put("micro_touched_pages",touched); }
+            return m;
         }
         public String syncOperation() { return "ExcerptAppender.sync (MS_ASYNC submission)"; }
         public void sync() { appender.sync(); }

@@ -15,6 +15,12 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 - Docs: the README's Performance section now says that the bare-metal append and replay figures come from short runs
   in the page cache (31–37 ms for tickertape's append), names the reader behind each latency figure, and adds the
   10-minute comparison on cloud VMs from `docs/benchmarks.md`. No figure changed and nothing new was measured.
+- Changed (comparison harness): the Chronicle side of `compare/` follows Chronicle's own documentation (issue #56,
+  ADR 0018 amendment). `blockSize` is 1 GiB, the writer calls `microTouch()` in its busy-wait (the pretoucher is
+  Enterprise-only), and the JVM tools warm up across index arrays, chunks, terms and the histogram branch in every
+  workload, on scratch data. Every Java process logs GC, safepoints, compilations, deoptimisations and late sends
+  beside the results (`compare/attribute.py` joins them). Each can be switched off and is recorded in the result
+  under `java`. No published figure changed and nothing new was measured.
 - Changed (CLI, dependencies): `Cargo.lock` moves parquet from 59.3.2 to 59.3.3 for RUSTSEC-2026-0595 (bloom filters
   written in plaintext into encrypted Parquet files), which `cargo deny` started to report. The CLI builds parquet
   without its encryption feature and never wrote such files.

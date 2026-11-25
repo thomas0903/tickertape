@@ -27,6 +27,8 @@ import sys
 import tempfile
 import time
 
+import javaopts
+
 HERE = Path(__file__).resolve().parent
 
 WORKLOADS = ("probe", "SV", "SD")
@@ -42,9 +44,9 @@ SUPPORT = {
                    "reader_reason": "upstream forbids concurrent process access: writer-only runs"},
     "plain-file": {"reader": True, "SD": "File::sync_data (fdatasync)"},
 }
-JAVA_TOOLS = ("chronicle", "aeron")
+JAVA_TOOLS = javaopts.JAVA_TOOLS
 # Seconds a run takes beyond its scheduled time (process and JVM start, drain, sync); used for estimates only.
-OVERHEAD_S = {"chronicle": 10, "aeron": 10}
+OVERHEAD_S = {"chronicle": 25, "aeron": 25}
 DEFAULT_OVERHEAD_S = 4
 SYNC_S = 5  # os.sync() after a long run; quick runs write little
 QUICK_SYNC_S = 1
@@ -216,7 +218,7 @@ def validate_sustained(result):
     validate_histogram(latency, "latency")
 
 
-def adapter_command(run, role, data, control, count, warmup, rate, params):
+def adapter_command(run, role, data, control, count, warmup, rate, params, out):
     cmd = [str(HERE / run.tool / "run.sh"), role, "--dir", str(data), "--control", str(control),
            "--count", str(count), "--payload", str(run.payload), "--rate", str(rate or 1),
            "--warmup", str(warmup), "--reader", run.reader,
@@ -226,7 +228,7 @@ def adapter_command(run, role, data, control, count, warmup, rate, params):
     if run.workload == "SD":
         cmd += ["--sync-every-ms", str(params["sync_every_ms"])]
     if run.tool in JAVA_TOOLS:
-        cmd += ["--jit-warmup", "1000"]
+        cmd = javaopts.wrap(cmd, run.tool, params["java"], params["quick"], True, out, f"{run.label}-{role}")
     return cmd
 
 
@@ -272,7 +274,7 @@ def run_attempt(run, params, out, env, commands):
         deadline = time.monotonic() + timeout
 
         def spawn(role):
-            cmd = adapter_command(run, role, data, control, count, warmup, rate, params)
+            cmd = adapter_command(run, role, data, control, count, warmup, rate, params, out)
             commands.write(f"{run.label}: {shlex.join(cmd)}\n")
             commands.flush()
             path = base / f"{role}.json"
@@ -313,6 +315,8 @@ def run_attempt(run, params, out, env, commands):
             wait(writer)
             result = {"writer": parse_one(outputs["writer"]),
                       "reader_result": parse_one(outputs["reader"]) if reader is not None else None}
+            result["java"] = javaopts.collect(run.tool, params["java"],
+                                              {"writer": result["writer"], "reader": result["reader_result"]})
         finally:
             for proc in children:
                 if proc.poll() is None:
@@ -445,7 +449,7 @@ def parameters(args):
     return {"tools": tools, "workloads": workloads, "payloads": payloads, "tt_readers": tt_readers,
             "duration_s": duration, "warmup_s": warmup, "repeats": repeats, "rates": rates,
             "fractions": [] if rates else fractions, "sync_every_ms": args.sync_every_ms, "quick": quick,
-            "needs_probe": "probe" in workloads}
+            "needs_probe": "probe" in workloads, "java": javaopts.settings(args)}
 
 
 def prepare_output(out, params, resume):
@@ -492,6 +496,7 @@ def main(args, env, build):
     scratch = reset_scratch(out)
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     environment = out / ("environment.txt" if first else f"environment-resume-{stamp}.txt")
+    short.JAVA.update(params["java"])  # `run` was started as __main__, so this is a second copy of the module.
     short.environment(out, env, params["quick"], environment.name)
     (out / "skipped").mkdir(exist_ok=True)
     (out / "runs").mkdir(exist_ok=True)
