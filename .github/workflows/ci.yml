@@ -314,7 +314,7 @@ jobs:
       - run: cargo +nightly miri setup
       # The format code, the CRC over shared words that the zero-copy reader validates with, and that reader's loads
       # over an anonymous mapping (ADR 0027). The latency histogram (ADR 0047), which has no unsafe code.
-      - run: cargo +nightly miri test -p tickertape --lib -- format crc map_ro latency
+      - run: cargo +nightly miri test -p tickertape --lib -- format crc map_ro latency decode_boundaries floor_finds
       # The C ABI's argument handling, error mapping and option builders (the tests that touch no files).
       - run: cargo +nightly miri test -p tickertape-ffi --lib pure_
 

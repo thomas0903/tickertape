@@ -10,8 +10,8 @@ use std::time::Instant;
 
 use serde_json::{Value, json};
 use tickertape::inspect;
-use tickertape::retention;
 use tickertape::{NewRecord, Reader, ReaderConfig, Writer, WriterConfig};
+use tickertape::{retention, seek_index};
 
 use crate::{Result, fresh_directory, segment_capacity};
 
@@ -19,19 +19,23 @@ use crate::{Result, fresh_directory, segment_capacity};
 pub const SAVED_MARKER: &str = "checkpoint.tt-scale-saved";
 
 /// Every operation, in the order `measure` runs them. Writer operations come last because they change the journal:
-/// `writer-open-after-kill` appends a tail first, and every writer operation leaves a checkpoint at the end.
+/// `writer-open-after-kill` appends a tail first, and every writer operation leaves a checkpoint at the end. The seek
+/// index operations (ADR 0045) come after them, so that every other operation runs without indexes.
 pub const OPS: &[&str] = &[
     "list-segments",
     "reader-open",
     "seek-first",
     "seek-middle",
     "seek-last",
+    "seek-sealed",
     "replay",
     "verify",
     "retention-plan",
     "writer-open-clean",
     "writer-open-after-kill",
     "writer-open-without-marker",
+    "index-build",
+    "seek-sealed-indexed",
 ];
 
 /// Process resource usage at one instant (`getrusage(RUSAGE_SELF)`).
@@ -205,12 +209,17 @@ impl Journal {
         })
     }
 
-    /// The sequence number a seek operation targets: the first, middle or last record.
+    /// The sequence number a seek operation targets: the first, middle or last record, or the last one of the newest
+    /// sealed segment (of the newest segment, if it is the only one).
     pub fn seek_target(&self, op: &str) -> Option<u64> {
         match op {
             "seek-first" => Some(self.first_seq),
             "seek-middle" => Some(self.first_seq + (self.next_seq - self.first_seq) / 2),
             "seek-last" => Some(self.next_seq - 1),
+            "seek-sealed" | "seek-sealed-indexed" => Some(match self.bases[..] {
+                [.., newest] if self.bases.len() > 1 => newest - 1,
+                _ => self.next_seq - 1,
+            }),
             _ => None,
         }
     }
@@ -242,10 +251,11 @@ pub fn run_op(dir: &Path, op: &str, seq: Option<u64>, segment_size: u64) -> Resu
             let reader = Reader::open(dir, ReaderConfig::default())?;
             Ok(json!({"position": reader.position()}))
         })?,
-        "seek-first" | "seek-middle" | "seek-last" => {
+        "seek-first" | "seek-middle" | "seek-last" | "seek-sealed" | "seek-sealed-indexed" => {
             let seq = seq.ok_or("a seek operation needs --seq")?;
             let open = Instant::now();
-            let mut reader = Reader::open(dir, ReaderConfig::default())?;
+            let indexed = op == "seek-sealed-indexed";
+            let mut reader = Reader::open(dir, ReaderConfig::default().seek_index(indexed))?;
             let open_s = open.elapsed().as_secs_f64();
             // The seek itself opens the segment; the records before `seq` in it are read by the first `try_next`.
             let mut out = timed(|| {
@@ -260,6 +270,7 @@ pub fn run_op(dir: &Path, op: &str, seq: Option<u64>, segment_size: u64) -> Resu
                 Ok(json!({"seq": seq}))
             })?;
             out["reader_open_s"] = json!(open_s);
+            out["used_index"] = json!(reader.seek_used_index());
             out
         }
         "replay" => timed(|| {
@@ -287,6 +298,19 @@ pub fn run_op(dir: &Path, op: &str, seq: Option<u64>, segment_size: u64) -> Resu
                 json!({"records": report.records, "segments": report.segments.len(),
                 "problems": report.problems.len()}),
             )
+        })?,
+        "index-build" => timed(|| {
+            let report = seek_index::build(dir, true)?;
+            let built = report.segments.iter();
+            let built = built.filter(|s| s.state == seek_index::IndexState::Built);
+            let mut bytes = 0;
+            for entry in std::fs::read_dir(dir.join(seek_index::DIR_NAME))
+                .into_iter()
+                .flatten()
+            {
+                bytes += entry?.metadata()?.len();
+            }
+            Ok(json!({"built": built.count(), "index_bytes": bytes}))
         })?,
         "retention-plan" => timed(|| {
             // A plan only, under a limit no journal reaches: what every retention run pays before it removes
@@ -407,10 +431,19 @@ mod tests {
             built["records_per_segment"].as_u64().unwrap()
         );
         assert_eq!(payload_size(&dir).unwrap(), 100);
-        for op in ["seek-first", "seek-middle", "seek-last"] {
+        let indexes = run_op(&dir, "index-build", None, SIZE).unwrap();
+        for op in [
+            "seek-first",
+            "seek-middle",
+            "seek-last",
+            "seek-sealed",
+            "seek-sealed-indexed",
+        ] {
             let seq = journal.seek_target(op).unwrap();
             let out = run_op(&dir, op, Some(seq), SIZE).unwrap();
             assert_eq!(out["seq"], seq);
+            let indexed = op == "seek-sealed-indexed" && indexes["built"] != 0;
+            assert_eq!(out["used_index"], indexed, "{op}");
             assert!(out["wall_s"].as_f64().unwrap() >= 0.0);
             assert!(out["peak_rss_bytes"].as_i64().unwrap() > 0);
         }

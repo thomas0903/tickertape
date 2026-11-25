@@ -302,7 +302,8 @@ while (!stop_requested()) {
 ```
 
 `seek_to_end()` (from 1.1) places the reader at the end of the journal instead, reading at most the newest segment
-(`tickertape_reader_seek_to_end` in [`c-api.md`](c-api.md#reading)).
+(`tickertape_reader_seek_to_end` in [`c-api.md`](c-api.md#reading)). `ReaderOptions::seek_index(true)` (from 1.1) lets
+`seek` start at a record named by a seek index (`tickertape_reader_options_set_seek_index` there has what that gives up).
 
 There are two readers, as in C:
 

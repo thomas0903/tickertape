@@ -45,6 +45,7 @@ wildcard arm. Methods are on docs.rs.
 | `inspect` | `list_segments`, `read_checkpoint`, `verify`, `SegmentInfo` (NE), `SegmentReport` (NE), `SegmentEnd` (NE), `VerifyReport` (NE), `Problem` (NE) |
 | `latency` (from 1.1) | `Recorder`, `View`, `Snapshot`, `Bucket` (NE), `RecordAge`, `RecordAgeView`, `RecordAgeSnapshot` (NE) |
 | `retention` | `plan`, `apply`, `Policy` (NE), `Plan`, `PlannedSegment` (NE), `Action` (NE), `Reason` (NE), `Report` (NE) |
+| `seek_index` | `build`, `check`, `remove`, `DIR_NAME`, `BuildReport` (NE), `CheckReport` (NE), `SegmentIndex` (NE), `IndexState` (NE) |
 | `status` | `status`, `Sampler`, `ReaderBeacon`, `READERS_DIR`, `DEFAULT_BEACON_INTERVAL`, and the sample's types, all NE: `Status`, `Head`, `HeadEnd`, `Position`, `Cursor`, `Segments`, `CheckpointStatus`, `CheckpointProblem`, `AgeUnknown`, `Exposure`, `Storage`, `Rates`, `WriterProcess`, `BeaconState`, `BeaconDirState`, `BeaconReport`, `ReaderStatus`, `Lag`, `LagUnknown`, `WriterMetrics`, `Thresholds`, `Breach` |
 | `format` | constants (`MAGIC`, `CHECKPOINT_MAGIC`, `FORMAT_VERSION`, the `*_LEN` lengths, `SEAL_MARKER`, `MAX_FRAME_LEN`, `RECORD_ALIGN`, `SEGMENT_SIZE_UNIT`, `MAX_SEGMENT_SIZE`, `SEGMENT_EXTENSION`, `CHECKPOINT_FILE_LEN`, `CHECKPOINT_SLOT_OFFSETS`); header and slot types `SegmentHeader`, `RecordHeader`, `CheckpointSlot`; encoders and decoders (`encode_segment_header`, `decode_segment_header`, `encode_record_body`, `finish_record_body`, `write_record_fields`, `decode_record_body`, `seal_crc`, `encode_checkpoint_slot`, `decode_checkpoint`, `frame_len`, `align8`, `max_payload_len`, `record_fits`, `validate_segment_size`, `segment_file_name`, `parse_segment_file_name`) |
 
@@ -57,7 +58,8 @@ public fields and are not NE: they hold exactly what a format-version-1 record h
 **Not covered:** the `fault` module and everything behind the `fault-injection` feature (test-only; `Cargo.toml` says
 never to enable it in production), items compiled only under `cfg(fuzzing)` or `cfg(loom)`, `#[doc(hidden)]` items
 (the segment scanning helpers `format::SegmentView`, `read_slot`, `Slot`, `scan_segment`, `ScanResult` and `ScanEnd`,
-public for the workspace's tests and fuzz targets; the `samples` module and `Error::io` and `Error::corrupt`, for the
+public for the workspace's tests and fuzz targets; the byte codec `seek_index::codec` and `Reader::seek_used_index`, for
+the same; the `samples` module and `Error::io` and `Error::corrupt`, for the
 tests of the C ABI and the Python bindings), the wording of `Display` and error messages, and `Debug` output. Error
 *variants* and `CorruptReason` values are covered; the strings are not. The other workspace crates (`tickertape-ffi`
 is `publish = false`; tests, benches, examples) and the library half of `tickertape-cli` (`market_demo`, the decoder
@@ -124,7 +126,7 @@ in the changelog.
 Machine-readable and covered, as specified in [`cli.md`](cli.md#machine-readable-contracts):
 
 - record JSONL (`tail --format json`, `export --format jsonl`), with its fixed key order;
-- `verify --json`, `inspect --json`, `stats --json`, `archive --json`, `age --json` (from 1.1), `status --json`
+- `verify --json`, `inspect --json`, `stats --json`, `archive --json`, `index --json` (from 1.1), `age --json` (from 1.1), `status --json`
   (including the `--watch` error line) and `status --format prometheus` (metric names, labels and meanings);
 - the Parquet schema of `export --format parquet` and the columns `--decode market-demo` adds;
 - exit statuses: 0 success, 1 usage, I/O or missing journal, 2 corruption or unsupported format (for `status`, also
@@ -133,7 +135,7 @@ Machine-readable and covered, as specified in [`cli.md`](cli.md#machine-readable
 From 1.0, JSON outputs may gain fields (consumers must ignore fields they do not know, and read objects by name,
 except record JSONL, whose key order is fixed) and enumerated string values where `cli.md` says a set may grow (such
 as `inspect`'s `end_state` `"unknown"`); no field is removed or changes meaning in 1.x. Every `--json` output
-(`verify`, `inspect`, `stats`, `archive`, `status`, `age`) starts with `"schema_version":1` and keeps it throughout
+(`verify`, `inspect`, `stats`, `archive`, `index`, `status`, `age`) starts with `"schema_version":1` and keeps it throughout
 1.x. Prometheus metrics may be added, not renamed or removed. A new exit status may appear only with a new command or
 option.
 
@@ -157,7 +159,12 @@ From 1.0: every 1.x release reads, recovers and continues every format-version-1
 writes format version 1, so 1.0's readers can read what a later 1.x writer wrote. Every release adds its fixtures
 (release checklist). Not promised, as ADR 0033 says: an older *writer* continuing a newer writer's journal, and
 journals from other platforms or segment sizes than the fixtures'. The beacon files in `readers/` (ADR 0032) are not
-part of format version 1 and have their own version byte.
+part of format version 1 and have their own version byte; nor are the seek indexes in `seek-index/` (ADR 0045), which
+have a version of their own, can be deleted at any time, and are ignored by 1.0.0
+(`tests/compat/v1.0.0-ignores-seek-index.sh`; the one exception is that 1.0.0's `export --output` fails with exit 1, and
+must be run again, if it cannot list `seek-index/` or the directory vanishes while it runs). A 1.0.0 writer does not
+remove indexes before it repairs a journal: readers that use them then rely on the checks by value alone (crash contract
+C15).
 
 **Upgrading and downgrading.**
 

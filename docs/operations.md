@@ -21,7 +21,8 @@ draws conclusions from those two.
   segment, validating each, so larger segments make a seek slower (ADR 0042). A forward seek within the reader's
   segment reads only from the reader's position on, when an earlier seek of that reader found that position covered by
   the checkpoint (ADR 0046), so seeking forward through a checkpointed segment reads it once, not once for each seek. `Reader::seek_to_end` reads at most
-  the newest segment, from the checkpoint on.
+  the newest segment, from the checkpoint on. For seeks into sealed segments, seek indexes make the cost independent of
+  the segment size ("Seek indexes" below); they do nothing for the newest segment.
 - **Segment count.** Opening a reader or a writer and each seek read the whole journal directory; `list_segments`,
   `verify` and each retention run (when retention is configured, at writer open and after checkpoints) open every
   segment's file; replay opens each segment it enters. These costs grow with the number of segments, so very small
@@ -198,12 +199,55 @@ removal.
 Never truncate or edit a segment in place while anything uses the journal: processes that map it can receive
 `SIGBUS`.
 
+## Seek indexes
+
+A seek reads and validates its segment from the first record to the target. With a seek index it starts less than 64 KiB
+of records before the target, in any sealed segment (ADR [0045](decisions/0045-sparse-seek-index.md)). The index files
+are optional and derived; building them and using them are separate decisions.
+
+**Building.** Run `tickertape index` from a timer, as the user that owns the journal:
+
+```sh
+# every few minutes, beside the running writer; segments that already have an index cost a few small reads
+tickertape index /data/journal
+# in an archive, after each `tickertape archive --to`
+tickertape index /data/archive
+tickertape index /data/journal --check     # reads every segment and compares every entry
+tickertape index /data/journal --remove    # deletes them
+```
+
+- It indexes the sealed segments before the checkpoint marker's segment, so a writer that never checkpoints gets none
+  while it runs. Newly sealed segments have none until the next run, and the newest segment never has one: a consumer that
+  restarts near the head gains nothing (`seek_to_end` starts at the marker).
+- The size is 24 bytes per 64 KiB of segment (0.04 %); a build reads each new segment once. Nothing is added to the writer
+  while it runs; its open lists `seek-index/` and removes what recovery could invalidate.
+- The directory `seek-index/` is created with the journal directory's group and mode. If the command refuses to create it
+  (the journal directory belongs to another user, is writable by everyone, or its group is not one of this user's, as for
+  a directory made under `/tmp` on macOS), create it yourself with the journal directory's owner, group and mode.
+- A build that is killed leaves a temporary file. The next open of a writer removes it; in an archive, where no writer
+  opens, `tickertape index --check` reports it and `--remove` clears it (with the indexes: run `index` again).
+- Delete the files whenever you like. Do not delete the directory while a 1.0.0 `export --output` runs: that fails with
+  exit 1 and must be run again. A separate mount at `seek-index/` is not supported.
+- Retention and `archive` remove a segment's index with the segment. `archive --to` does not move it: run `index` there.
+- A 1.0.0 writer that repairs the journal does not remove outdated indexes. Readers check every index by value all the
+  same, and the next `tickertape index` replaces an outdated one.
+
+**Using.** Readers use them only with `ReaderConfig::seek_index(true)` (`--seek-index` in the CLI, and the same option in
+each binding). It is off by default because it gives something up: records between the segment's start and the place the
+seek lands are not read, so damage there no longer stops the reader. Run `tickertape verify` as before to find it. Do not
+enable it where someone who may not write the segments can write `seek-index/` (crash contract C15). A seek never fails
+because of an index: without one, or with one that fails a check, it scans. Mapped and durable-only readers use one only
+before the checkpoint marker's segment, so in an archive, which has no marker, only the safe visible reader does.
+
 ## Moving a tape to another machine
 
 A journal is its `*.tape` files and `checkpoint`; nothing in them depends on the machine they were written on
 (`format.md`). Copy those files. The other entries of the directory (`format.md` → Journal directory) are not needed
 to read or continue the journal: `writer.lock` and `notify` describe a writer on the old machine, and a new writer
-creates its own. `quarantine/`, if present, holds bytes that recovery removed; keep it if they matter to you. The
+creates its own. `quarantine/`, if present, holds bytes that recovery removed; keep it if they matter to you. Seek
+indexes (`seek-index/`) keep working in a copy that preserves owner and mode; readers ignore one that a umask of 0002 made
+group-writable, or that belongs to another user than the segments, without saying so (`tickertape index --check` does).
+Or leave them behind and run `tickertape index` on the copy. The
 commands below
 were run with tickertape 1.0.0 from macOS (aarch64, APFS) to Linux (aarch64, btrfs, a local VM) over SSH, with 1 MiB
 segments; the first recipe's copy, checksum and `verify` steps also in the other direction.

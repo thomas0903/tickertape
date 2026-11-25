@@ -7,7 +7,9 @@ use crate::{Result, TailArgs, TailFormat, output};
 pub(crate) fn run(args: TailArgs, out: &mut dyn Write) -> Result<()> {
     let mut reader = Reader::open(
         &args.dir,
-        ReaderConfig::default().durable_only(args.durable_only),
+        ReaderConfig::default()
+            .durable_only(args.durable_only)
+            .seek_index(args.seek_index),
     )?;
     if let Some(seq) = args.from {
         reader.seek(seq)?;
@@ -137,6 +139,7 @@ mod tests {
                 count: None,
                 no_follow: true,
                 durable_only: true,
+                seek_index: false,
                 format: TailFormat::Json,
                 decode: None,
                 timeout_secs: None,
