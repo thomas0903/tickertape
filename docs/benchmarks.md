@@ -1617,7 +1617,8 @@ is most of a paced run. Futex wakes include the helper thread's signals, about o
 - **System calls on the steady path.** None per record without a blocked reader. `request_checkpoint` once a second, a
   roll about every 1.3 million records of 104 B.
 
-Copies of the payload and allocations:
+Copies of the payload and allocations (a process allocates once for the CRC's tables, at its first record long enough
+to use them, ADR 0024):
 
 | Path | Copies of the payload | Allocations per record | System calls per record | Locks and atomics per record |
 |---|---|---|---|---|

@@ -71,11 +71,13 @@ fn record(payload: &[u8]) -> NewRecord<'_> {
 }
 
 /// A fresh journal in the default 128 MiB segments, which no test here fills (nor half fills: on macOS the writer then
-/// starts a thread that prepares the next segment, ADR 0022), with one record.
+/// starts a thread that prepares the next segment, ADR 0022), with two records: a short one, and one long enough for
+/// the CRC's tables, which the first long record of the process builds in one allocation (ADR 0024).
 fn journal() -> (tempfile::TempDir, Writer) {
     let dir = tempfile::tempdir().unwrap();
     let mut writer = Writer::open(dir.path(), WriterConfig::default()).unwrap();
     writer.append(&record(&[0; 64])).unwrap();
+    writer.append(&record(&[0; 1024])).unwrap();
     (dir, writer)
 }
 
@@ -128,7 +130,9 @@ fn reading_allocates_nothing() {
                 Reader::open(dir.path(), config).unwrap()
             };
             // The first read allocates the safe reader's buffer.
-            assert!(reader.try_next().unwrap().is_some());
+            for _ in 0..2 {
+                assert!(reader.try_next().unwrap().is_some());
+            }
             let mut followed = 0;
             for _ in 0..RECORDS {
                 writer.append(&record(&[7; 64])).unwrap();
@@ -165,7 +169,9 @@ fn waiting_allocates_only_to_refresh_the_wake_up_record() {
     .unwrap();
     let mut block = Reader::open(dir.path(), ReaderConfig::default()).unwrap();
     for reader in [&mut spin, &mut block] {
-        assert!(reader.try_next().unwrap().is_some());
+        for _ in 0..2 {
+            assert!(reader.try_next().unwrap().is_some());
+        }
         // The first wait can initialise state that lives as long as the process (the macOS wake-up functions).
         assert!(
             reader
@@ -199,7 +205,9 @@ fn an_owned_record_is_one_allocation() {
         writer.append(&record(&[7; 64])).unwrap();
     }
     let mut reader = Reader::open(dir.path(), ReaderConfig::default()).unwrap();
-    assert!(reader.try_next().unwrap().is_some());
+    for _ in 0..2 {
+        assert!(reader.try_next().unwrap().is_some());
+    }
     let owned = allocations(|| {
         for _ in 0..RECORDS {
             assert!(black_box(reader.next_owned().unwrap()).is_some());
