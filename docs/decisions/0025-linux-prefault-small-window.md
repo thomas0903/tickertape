@@ -90,3 +90,10 @@ thread no longer waited there, and roll appends without checkpoints stayed short
 in `docs/benchmarks.md` → "2026-11-19 to 2026-11-22, sustained workloads on Google Cloud VMs" → Checkpoints. Those runs
 were on cloud VMs; the bare-metal experiments above were not repeated. Checkpoints still call `fdatasync`, which on ext4
 can wait for the journal to commit; with early write-back the measured blocking checkpoints were short.
+
+## Note (2026-11-25): the recorded runs at 1,024 B on ext4
+
+"Never worse than prefaulting off" above describes the experiments of this ADR. In the runs recorded afterwards for
+v0.4.0 (`docs/benchmarks.md` → "2026-11-02, v0.4.0 on bare-metal Linux"), the zero-copy reader's p99.9 at 1,024 B on
+ext4 was worse with prefaulting on (110–243 µs) than off (97–122 µs), while p99 was better (2.1–2.2 µs against 31 µs).
+This is open and unexplained.

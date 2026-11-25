@@ -303,6 +303,7 @@ def compare_command(out, params, compare_tools, dry_run):
                "--keep-going", *params["compare_args"]]
     if compare_tools:
         command += ["--tools", compare_tools]
+    command += shlex.split(params.get("compare_affinity", ""))
     if (out / "compare" / "matrix.json").exists() and not dry_run:
         command.append("--resume")
     if dry_run:
@@ -385,6 +386,9 @@ def parse_args(argv=None):
     parser.add_argument("--repeats", type=int, help="repeats of every tickertape scenario (default from the matrix)")
     parser.add_argument("--max-run", type=int, default=7200, help="longest beyond-ram run in seconds (default 7200)")
     parser.add_argument("--cpus", help="passed to tt-sustained --cpus (writer, then readers; Linux only)")
+    parser.add_argument("--compare-affinity", metavar="OPTIONS",
+                        help='pinning options passed to compare/run.py, for example --compare-affinity=--no-pin or '
+                             '"--compare-affinity=--writer-cpu 2 --reader-cpu 3" (default: its automatic choice)')
     parser.add_argument("--checkpoint-mode", choices=("blocking", "background"), default="blocking",
                         help="passed to tt-sustained --checkpoint-mode in every run that checkpoints (default "
                              "blocking); compare the modes with one session per mode, each with its own --out")
@@ -414,6 +418,8 @@ def parameters(args):
     if args.checkpoint_mode != "blocking":
         # Only when not the default, so sessions started before the option existed still resume.
         matrix["checkpoint_mode"] = args.checkpoint_mode
+    if args.compare_affinity:
+        matrix["compare_affinity"] = args.compare_affinity  # Likewise.
     matrix["only"] = args.only
     matrix["compare_tools"] = args.compare_tools
     return matrix

@@ -23,7 +23,7 @@ TMPDIR=/path/to/local-disk compare/run-all.sh /path/to/results
 OUTDIR must be new or empty. The runner builds release binaries and Java projects
 once, then executes every implemented tool × workload × payload × reader × rate
 **twice**, sequentially. W1 has one tickertape writer, not one duplicate per reader.
-It emits **92 result lines in 15 JSONL files**, `environment.txt`, `commands.txt`,
+It emits **112 result lines in 20 JSONL files**, `environment.txt`, `commands.txt`,
 `build.log`, `children.log`, `retries.jsonl` (latency runs discarded and repeated because the wall clock stepped
 backwards, at most three per run), Java dependency inventories, and a machine-readable
 `skipped.json`. Any build, child,
@@ -32,8 +32,8 @@ are never substituted with zero. Results already completed remain available.
 After every measurement the runner calls `sync`, so pending write-back never carries over into the next one.
 Each measurement owns a new directory under `$TMPDIR` (Python's normal temp-dir
 fallback otherwise), including fixtures and control files; only those owned
-scratch directories are removed afterward. No privileged cache purge or affinity
-changes are made. Failed child groups are terminated and reaped.
+scratch directories are removed afterward. No privileged cache purge is made. On Linux
+the threads are pinned (below). Failed child groups are terminated and reaped.
 
 `--quick` uses 2,000 records for W1/W3, and 100 warmup + 1,000 measured for W2.
 It covers the full matrix and is a functional smoke check, **not publication data**.
@@ -71,7 +71,59 @@ compare/plain-file/run.sh writer --dir /tmp/file-fixture --mode append --count 1
 compare/plain-file/run.sh reader --dir /tmp/file-fixture --mode warm_replay --count 1000000 --payload 64
 # Tickertape replay selects --reader safe or --reader mapped.
 # W2 roles require --control, --rate, --warmup; use run-all.sh for the barrier.
+# Both roles take --cpu N (pin the measured thread) and --helper-cpus LIST (Rust adapters).
 ```
+
+## Thread pinning
+
+Both modes pin the threads on Linux, the same way for every tool:
+
+| Thread | Where it runs |
+|---|---|
+| measured writer thread | `--writer-cpu`, alone |
+| measured reader thread | `--reader-cpu`, alone |
+| everything else | `--helper-cpus` |
+
+"Everything else" is tickertape's prefault, write-back and checkpoint helpers, the JVM's GC, JIT and service threads,
+Chronicle's background threads, Aeron's media driver (conductor, sender, receiver) and client conductors, yaque's file
+watchers, and the runner itself.
+
+- **How.** After the build the runner moves itself to the helper CPUs, so every process and thread it starts inherits
+  them; tickertape also gets them as `WriterConfig::helper_cpus`, since its default would use every CPU of the cpuset.
+  The measured thread then pins itself (`sched_setaffinity`; from Java with `taskset` on its thread id, so no tool needs
+  an extra native library): after opening its endpoint, except in `W1-cold` and in W3's reader, where opening is inside
+  the timer. There it pins itself first, so threads that the tool starts in the timed open begin on the measured CPU.
+- **Threads that start on a measured CPU.** A thread begins on the CPUs of the thread that starts it. Every 2 ms the
+  runner moves such threads to the helper CPUs and counts them in `moved_threads`, until the measured thread has read
+  back the affinity. Known ones are yaque's reader (one file watcher per segment) and, in `W1-cold`, tickertape's
+  helpers, which also place themselves. Until it is moved, such a thread competes with the measured one: in functional
+  VM runs yaque's reader waited for a CPU for up to a few milliseconds per run, at 1 ms as at 10 ms, because the kernel
+  runs the new thread first. That can be in yaque's tail latency; no other tool's
+  thread was moved outside a timed open in those runs. `moved_threads` is `null`
+  where nothing was watched: in unpinned runs, and in tickertape's W2, where `tt-latency` starts its own processes (its
+  read-back is checked like the others).
+- **Which CPUs.** Without options, two physical cores in one L3 cache, not CPU 0's core if others are free, not isolated
+  CPUs; the helpers get every other allowed, non-isolated CPU outside those two cores, so no hyperthread sibling of a
+  measured core. The topology comes from `/sys/devices/system/cpu`. A machine without a third physical core needs
+  explicit options or `--no-pin`.
+- **Named CPUs** are used exactly, for example isolated ones (`isolcpus`):
+  `--writer-cpu 2 --reader-cpu 3 --helper-cpus 0-1,4-7`. Helper CPUs should not be isolated (the kernel does not balance
+  threads between isolated CPUs) and, for Aeron, at least four: its driver alone busy-spins on three, as its
+  documentation recommends with a core for each. With fewer, Aeron's latency is that of threads sharing CPUs: the runner
+  prints a warning and records it in `affinity.warnings`. **Do not publish Aeron figures from such a machine**; the
+  automatic choice on four cores without hyperthreads is one.
+  `measured_cpus_sharing_a_physical_core` lists measured CPUs whose hyperthread sibling a named choice uses too.
+- **What is recorded.** `affinity` in every result has the plan and, under `writer` and `reader`, what `/proc` said after
+  the last measured record, with the tool still open: `cpus_allowed` and `last_cpu` of the measured thread and
+  `cpus_allowed` of every other thread of its process. The runner fails a pinned run if a measured thread was not on
+  exactly its CPU, if another thread may run on a measured CPU, or if the part of the runner that moves threads did not
+  work. `environment.txt` has the plan, and the sustained mode resumes only with the same one.
+- **`--no-pin`** leaves scheduling to the kernel, as in all results recorded before this option existed. On macOS, which
+  has no hard affinity, nothing is pinned and results say `affinity: unsupported on macOS`.
+- The JVM sizes its GC and JIT thread pools from the CPUs it may use, so in pinned runs from the helper CPUs. Pinning
+  does not isolate a CPU: the kernel and other processes can still run there unless the machine is set up for it.
+
+`benches/session.py` passes `--compare-affinity="OPTIONS"` on to this runner.
 
 ## Sustained mode
 
@@ -168,11 +220,37 @@ default matrix has 92 runs: 12 probes and, per repeat and payload, 12 SV and 8 S
 ## Workloads and schema
 
 **W1: append.** One process appends 1,000,000 × 64 B or 100,000 × 1,024 B as fast
-as possible. Endpoint open, payload allocation and Java JIT warmup are outside the
-timer. Record encoding, copies, publication, growth/rollover and first-touch faults
-are inside it. No harness checkpoint/fsync occurs inside the loop. Tools can do
-internal metadata/growth I/O; tickertape specifically syncs newly created segment
-files on rollover. The timer stops before one final sync/flush, whose operation
+as possible. There are **two figures per tool**, from separate runs (`W1-cold`,
+`W1-steady`), because the tools prepare their files at different moments:
+
+| Before the first timed append | tickertape | Chronicle | yaque | queue-file | plain file |
+|---|---|---|---|---|---|
+| by open | 128 MiB segment preallocated, synced and mapped; helper prefaults the first 256 KiB (Linux) | `metadata.cq4t` only | empty segment file | 8 KiB file, not synced | empty file |
+| by the first append | nothing | cycle file, index and first mapping created | nothing | file doubled and synced | nothing |
+| by later appends | first-touch faults beyond the prefault window; a new segment at each roll | first-touch faults; next mapped chunk | file growth | file doubled **and synced** each time it is full | file growth |
+
+- **`W1-cold`, cold start:** the timer starts before open, in an empty directory, and stops after the last append.
+  Everything above is inside it, for every tool. Process start is outside, and so is the Java JIT warmup, on a scratch
+  queue in the same JVM: files are cold, code is not. The record buffer and an empty histogram are created inside it.
+- **`W1-steady`, steady burst:** the tool is opened and 1,000 priming records are appended before the timer starts, for
+  every tool, so files, first mappings and first pages exist. queue-file is opened with 128 MiB capacity (as large as a
+  tickertape or yaque segment); as `QueueFile::open` creates it, it would double and sync its file inside the timer. Beyond
+  that the tools keep their settings (Chronicle's mapped chunk is `blockSize`, at its default here), so growth, rolls,
+  chunk mappings and first-touch page faults beyond the priming records stay inside the timer, except where the tool
+  itself prefaults. This is a short burst into ready files, not a long-run rate (see the sustained mode).
+
+W1 is short. At the rates recorded with the old W1 (`docs/benchmarks.md`, v0.4.0 on bare metal) tickertape's 100,000 ×
+1,024 B take 31–32 ms, and a faster machine takes less, so one scheduler delay, page-fault stall or helper thread that
+starts late is a visible share of the figure. W1 shows what a burst costs, with that noise in it; it cannot show a
+steady rate, and differences of a few percent between tools or versions mean nothing here.
+
+Results recorded before this split (`W1` without a suffix) opened the endpoint before the timer and primed nothing:
+tickertape's preallocation was outside the timer and Chronicle's cycle file inside. They are comparable with neither
+figure. W3's fixture writer still works that way (`--mode append`); it is not timed in any result.
+
+In both, record encoding, copies, publication and growth are inside the timer. No harness checkpoint/fsync occurs
+inside the loop. Tools can do internal metadata/growth I/O.
+The timer stops before one final sync/flush, whose operation
 and separate time are reported (`null` when the API has none). W1 is visible
 append throughput, not durable-record throughput. Tool-specific flush operations
 are not equivalent durability barriers (see table).
@@ -200,7 +278,8 @@ Late means send starts **more than 1 µs** after intended, including warmup.
 Achieved writer rate covers first send start to last completion including pacing,
 encoding and backpressure; it includes warmup. Short quick runs make this noisy.
 Every result additionally has `tool`, `tool_version`, structured `guarantees`,
-`workload`, `repeat`, and `quick`. W1 has `append`; W3 has `replay`; each contains
+`workload`, `repeat`, `quick` and `affinity`. W1 has `append` (with `timer_starts` and `priming_records`); W3 has
+`replay`; each contains
 `count`, `seconds`, `records_per_s`, `payload_mb_per_s`. Throughput `rate` is null
 because W1/W3 are unpaced. W1 adds `flush_operation` and `flush_seconds`.
 The runner rejects truncated counts, invalid histogram ordering, and inconsistent
@@ -304,23 +383,22 @@ Chronicle article includes it and `jdk.internal.util`. Parallel GC and equal fix
 heaps are explicit suite choices; no claim is made that these optimize all hosts.
 Environment capture includes JVM version, this exact flags file, CPU, RAM, OS,
 filesystem of the temporary data path, Rust/Maven versions, git SHA/dirty state,
-command, and data filesystem selection. `commands.txt` records each exact child
-command including temporary paths. Record host load, power, thermal conditions and
-external affinity manually before publication. Keep both repeats and flag >10%
+command, data filesystem selection and the pinning plan. `commands.txt` records each exact child
+command including temporary paths. Record host load, power and thermal conditions
+manually before publication. Keep both repeats and flag >10%
 variation under the existing playbook. Do not publish quick-run rankings.
 
 Other limits to retain with any comparison:
 
-- No core affinity, isolation, power control, prefaulting, privileged cache eviction,
+- Threads are pinned on Linux only, and to CPUs that other work may share. No isolation, power control, prefaulting, privileged cache eviction,
   replication, compression, or network transport. Busy polling and driver threads
   consume different CPU budgets. OS scheduling/thermal/load/clock effects remain.
 - W1 includes tool-specific record copies, CRC, syscall counts, indexing, metadata,
   sparse/preallocated growth, and allocation. The plain baseline adds no CRC or
   crash recovery. These differing guarantees are part of the results, not erased.
-- Tickertape creates its initial segment during writer open (outside W1), while
-  Chronicle can create its first cycle/data mapping in the first timed append.
-  Subsequent rolls/growth are timed in both. W3 includes reader opening/traversal
-  and each tool's native validation, which is not the same amount of work.
+- What happens before and inside W1's timer differs per tool (table above); the two figures bracket it. W3 includes
+  reader opening/traversal and each tool's native validation, which is not the same amount of work. In W2 and the
+  sustained mode Chronicle creates its first cycle file at the first scheduled send, in the warmup.
 - Fixed payload patterns avoid generation in the timer. Envelope encoding remains
   in the timer for tools without native fields. MB/s counts application data, not
   total bytes written. Native field/index layouts have different overhead.
