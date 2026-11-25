@@ -14,7 +14,7 @@ pub(crate) const HELP: &str = "Remove a sealed prefix strictly before the checkp
 #[command(group(ArgGroup::new("action").required(true).args(["to", "delete"])))]
 #[command(group(ArgGroup::new("limits").required(true).multiple(true).args(["keep_segments", "max_bytes", "older_than"])))]
 pub(crate) struct ArchiveArgs {
-    /// Journal directory (only this command changes a journal; no writer lock)
+    /// Journal directory (only this command and index change a journal; no writer lock)
     dir: PathBuf,
     /// Move segments to this existing directory, never replacing files
     #[arg(long, value_name = "DEST")]

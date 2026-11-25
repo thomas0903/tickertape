@@ -100,6 +100,7 @@ pub(crate) fn run(args: ExportArgs, stdout: &mut dyn Write) -> Result<()> {
 fn config(args: &ExportArgs) -> ReaderConfig {
     ReaderConfig::default()
         .durable_only(args.durable_only)
+        .seek_index(args.seek_index)
         .notify(false)
 }
 
@@ -386,9 +387,12 @@ fn destination(dir: &Path, path: &Path) -> Result<File> {
 /// unless the inode number in its directory entry is the output's: a segment that archiving moves out of the directory
 /// during the walk may be the output's other name. The device can't be compared for an entry that is gone (its
 /// directory's device is not always its own: overlayfs), so an unrelated output on another filesystem that happens to
-/// have a vanished entry's inode number is refused too; running the export again succeeds.
+/// have a vanished entry's inode number is refused too; running the export again succeeds. The seek index directory
+/// `seek-index/` is not descended into: it holds no journal data (ADR 0045), so one that is unreadable or changing does
+/// not fail an export, as it can in 1.0.0.
 fn reject_alias(dir: &Path, dev: u64, ino: u64) -> Result<()> {
     let readers = dir.join(tickertape::status::READERS_DIR);
+    let indexes = dir.join(tickertape::seek_index::DIR_NAME);
     let mut pending = vec![dir.to_path_buf()];
     while let Some(dir) = pending.pop() {
         let tolerant = dir.starts_with(&readers);
@@ -420,7 +424,8 @@ fn reject_alias(dir: &Path, dev: u64, ino: u64) -> Result<()> {
             if metadata.dev() == dev && metadata.ino() == ino {
                 return Err(Failure::usage("export output aliases a journal file"));
             }
-            if metadata.is_dir() {
+            // Seek indexes can be rebuilt, and come and go while the writer and `tickertape index` run.
+            if metadata.is_dir() && entry.path() != indexes {
                 pending.push(entry.path());
             }
         }
@@ -570,6 +575,7 @@ pub(crate) mod tests {
                 from: None,
                 to: None,
                 durable_only: false,
+                seek_index: false,
             },
             &mut sink,
         )
@@ -672,6 +678,7 @@ pub(crate) mod tests {
             from: None,
             to: None,
             durable_only: false,
+            seek_index: false,
         }
     }
 
@@ -822,6 +829,7 @@ pub(crate) mod tests {
             output: output.into(),
             format,
             durable_only: true,
+            seek_index: false,
             ..export_args(dir)
         }
     }
@@ -976,6 +984,7 @@ pub(crate) mod tests {
             ExportArgs {
                 to: Some(0),
                 durable_only: true,
+                seek_index: false,
                 ..export_args(dir.path())
             },
             &mut out,
