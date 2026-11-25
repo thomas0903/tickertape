@@ -253,8 +253,16 @@ released with seven items open, accepted by the owner as known gaps
     than RAM is recorded in [`benchmarks.md`](benchmarks.md) with dataset sizes and resource usage; ADR 0042 is accepted
     with no sparse index for 1.0, since a seek costs at most one segment's scan (`docs/operations.md` → Choosing a
     segment size). The defect the run found, one open file per segment between checkpoints, is fixed (#38).
-  - Missing: archived history, missing or corrupt segments, catch-up under a live writer, the zero-copy reader and the
-    10,000- and 20,000-segment journals (they failed before #38 and are reported as failed) are not measured.
+  - Measured on 2026-11-25 ([`benchmarks.md`](benchmarks.md) → Replay and recovery at scale: the gaps of 1.0.0): the
+    10,000- and 20,000-segment journals (and 100,000), archived history, missing and corrupt segments, catch-up under a
+    live writer, the zero-copy reader, and seeks with the seek index (issue #62). The rule that recovery does not silently
+    discard committed history held in the 21 measured cases, for records still in a segment when the writer opened. Damage
+    that recovery cannot tell from a torn append (C11 (3)) is not among them: it is zeroed without a copy under either
+    policy.
+  - Still missing: the limits those runs found are not changed (issue #80): every seek reads the whole directory, every
+    checkpoint with retention opens every segment's header, and `retention::apply` reads the directory before every
+    removal, so a journal of more than a few thousand segments pays for them. The readers stop silently at a zeroed
+    commit word in older history (issue #79).
   - Implemented after 1.0 (issue #59, #72): the sparse, rebuildable seek index per sealed segment of
     [ADR 0045](decisions/0045-sparse-seek-index.md), built by `tickertape index` and used by readers that opt in. Every
     record from the landing record on is validated; the records before it are not read, which is why it is opt-in. Deferred
@@ -306,10 +314,13 @@ where a line says it is closed:
   reader has not been profiled since #66.
 - **ARM servers:** one of the two latency observations on aarch64 (the 10 ms reader maximum) and the platform mechanism
   behind issue #43 are not explained; the appends of 50–128 ms are (issue #60, 2026-11-25).
-- **Replay and recovery at scale:** archived history, missing or corrupt segments, catch-up under a live writer, the
-  zero-copy reader and journals of 10,000 segments or more are not measured. The sparse seek index is implemented (ADR
-  0045, for sealed segments; opt-in). Not built: building it from the writer, the checkpoint marker as a jump point in the
-  newest segment, a cursor the caller saves.
+- **Replay and recovery at scale:** measured on 2026-11-25: archived history, missing and corrupt segments, catch-up
+  under a live writer, the zero-copy reader and journals of 10,000 to 100,000 segments ([`benchmarks.md`](benchmarks.md)).
+  Not measured: archiving under a live writer at this scale, the 128 MiB archive on aarch64, catch-up of a durable-only
+  reader, the seek index on a journal being written, xfs (and other filesystems than ext4), and anything with #74 to #77
+  (#76 changes the zero-copy reader).
+  The sparse seek index is implemented (ADR 0045, for sealed segments; opt-in) and measured. Not built: building it from
+  the writer, the checkpoint marker as a jump point in the newest segment, a cursor the caller saves.
 
 ## Later (explicitly out of scope for v0.1)
 

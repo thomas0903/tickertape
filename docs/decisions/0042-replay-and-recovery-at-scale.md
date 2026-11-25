@@ -1,6 +1,6 @@
 # 0042: Replay and recovery at scale: what grows with segments and bytes
 
-- **Status:** accepted on 2026-11-20 by the maintainers under the owner's delegation, after the cloud run: no sparse
+- **Status:** accepted on 2026-11-20 (amended 2026-11-25 with measurements, "Amendment" below) by the maintainers under the owner's delegation, after the cloud run: no sparse
   index for 1.0. The measurement tool and the reader listing change are in place; the sparse index and options 3
   and 4 are possible later work, not built
 - **Date:** 2026-11-20
@@ -31,6 +31,12 @@ use. What the code does, and what the runs showed about how each cost grows:
 | `inspect::verify` | bytes, plus one file open per segment | a report per segment |
 | `inspect::list_segments`, `retention::plan` | segments: one open, `fstat` and header read per segment (the largest per-segment cost measured) | a list of every segment |
 | Removing a segment by retention | the bytes of each removed segment (the plan scans each candidate for its seal) | constant |
+| Reading the directory (also part of every seek) | entries in the journal directory: 2.5 ms at 10,000, 5 ms at 20,000, 25 ms at 100,000 (cached) | constant |
+| A blocking checkpoint with a retention policy | segments: a plan (open and header read of each): 29 ms at 10,000, 67 ms at 20,000, 0.34 s at 100,000 (cached); without one it does not depend on the count | a list of every segment |
+| `retention::apply` | segments removed × segments left: the directory is read before each removal (about 8 ms each at 20,000 segments) | a list of every segment |
+| The first checkpoint after a recovery without a marker | segments: each is opened again | constant |
+
+(The last four rows were added on 2026-11-25, measured on x86-64; `benchmarks.md`.)
 
 Apart from recovery without a valid marker (crash contract C8, ADR 0007, by design) and retention removing segments,
 open, seek and recovery read no segment's records other than those of the segments they enter. The costs that grow
@@ -101,3 +107,13 @@ Bounded open segments; crash contract → Segments the writer no longer holds).
 - Follow-up work, each needing its own review: options 2 to 4, the cases in option 5, and measuring the journals
   with 10,000 and 20,000 segments that the cloud run could not open before #38 (`docs/benchmarks.md` reports them as
   failed).
+
+## Amendment (2026-11-25): the cases not measured at first
+
+Option 5's cases are measured (`docs/benchmarks.md` → "2026-11-25, replay and recovery at scale: the gaps of 1.0.0"): archived
+history, missing and corrupt segments, catch-up under a live writer, the zero-copy reader, and the journals of 10,000 and
+20,000 segments (and 100,000), which work since #38 with a bounded number of open files. Nothing here changes the
+decision on the sparse index, which was built later as a separate design (ADR 0045). The rows added to the table above are
+the costs that grow with the segment count and have no remedy yet (issue #80); options 3 and 4 remain possible later work, and a
+removal that does not read the directory again for each segment (`retention::apply`) and a seek that does not list it
+belong to the same list.

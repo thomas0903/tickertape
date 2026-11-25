@@ -7,6 +7,11 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+default = ["core-1-1"]
+# Uses API the core crate has had since 1.1. Without it, `tt-scale` builds against the 1.0 core (benches/README.md).
+core-1-1 = []
+
 [dependencies]
 tickertape.workspace = true
 hdrhistogram = { version = "7.5", default-features = false }

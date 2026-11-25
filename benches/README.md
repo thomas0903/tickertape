@@ -127,19 +127,64 @@ cargo run -p tickertape-bench --release --bin tt-scale -- run --dir /tmp/tt-scal
 
 `tt-scale build` generates a journal of exactly the requested number of segments (all full but the newest, which is
 `--fill-last` percent full) with fixed-size records and leaves a checkpoint at its end; `measure` times, each in a
-process of its own: `list-segments`, `reader-open`, `seek-first`/`seek-middle`/`seek-last` (the seek and the first
-record after it), `replay` (safe reader), `verify`, `retention-plan` (a plan under a limit no journal reaches),
-`writer-open-clean`, `writer-open-after-kill` (after a child writer appended `--tail-records` records without a
-checkpoint and was killed with `SIGKILL`) and `writer-open-without-marker` (the marker moved aside). `run` is both.
-`measure` changes the journal (writer operations append and checkpoint), so repeated measurements see a few more
-records. ADR 0042 lists what each operation's cost grows with.
+process of its own: `list-directory`, `list-segments`, `reader-open`, the seeks, `replay`, `status` (one sample),
+`verify`, `retention-plan` (a plan under a limit no journal reaches), `writer-open-clean`, `writer-open-after-kill`
+(after a child writer appended `--tail-records` records without a checkpoint and was killed with `SIGKILL`),
+`writer-open-without-marker` (the marker moved aside), and `checkpoint-loop` and `checkpoint-loop-retention` (100
+blocking checkpoints after one record each, without and with a retention plan after each). `run` is both. `measure`
+changes the journal (writer operations append and checkpoint), so repeated measurements see a few more records. ADR
+0042 lists what each operation's cost grows with.
 
-Each run reports `wall_s`, `user_cpu_s`, `system_cpu_s`, `minor_faults`, `major_faults` (reads from storage),
+The seeks, each timed with the first record after it: `seek-first`, `seek-middle`, `seek-last`, `seek-segment-end` (the
+last record of a full segment in the middle: the longest scan a seek costs), `seek-forward` (a seek to that segment's
+first record and 16 equal forward steps through it; `steps_total_s` is the 16 steps) and `seek-to-end`. `--ops seeks`
+stands for `reader-open` and all of them, and `--seek-index` lets the reader of every seek use seek indexes (`used_index`
+says whether its last seek did). Seek indexes (ADR 0045): `seek-sealed` (the last record of the newest sealed segment),
+`index-build` (every index anew; `states`, `index_files`, `index_bytes`) and `seek-sealed-indexed`, the last two after
+everything else so that the other operations run without indexes (`--ops unindexed`: all but them), and on request
+`index-refresh` (a build with nothing left to do) and `index-check`. Reader operations run once per reader in
+`--readers safe,mapped` (default safe). Optional operations: `retention-delete` (deletes the `--count` oldest segments), `cli-verify`, `cli-export` and
+`cli-stats` (the program given by `--cli`). `--end <seq>` measures a directory without a checkpoint marker, such as an
+archive, up to that sequence number.
+
+Each run reports `wall_s`, `user_cpu_s`, `system_cpu_s`, `minor_faults`, `major_faults` (faults that waited for
+storage), on Linux `storage_read_bytes` and `storage_write_bytes` (`/proc/self/io`, read-ahead included),
 `peak_rss_bytes` (the operation's own peak: on Linux `VmHWM` after a reset, which includes mapped journal pages;
-on macOS `ru_maxrss`) and `cache_dropped`. Seeks add `seq` and `skipped_records` (records read before the target in
-its segment), replay `records_per_s` and `payload_bytes_per_s`, writer operations `scanned_from_seq`, `next_seq` and
-`recovery_actions`. The top level states `journal` (segments, bytes, records), `ram_bytes`,
-`cgroup_memory_max_bytes` (Linux), `cold_requested` and `cold_unavailable`.
+on macOS `ru_maxrss`), `open_files_before`, `open_files_limit` and `cache_dropped`; with `--sample-open-files` also
+`open_files_most` (counted about every millisecond, so such runs are not for timings). `--max-open-files` lowers the
+soft limit for each operation. Seeks add `seq` and `skipped_records` (records read before the target in its segment),
+replay `records_per_s` and `payload_bytes_per_s`, writer operations `scanned_from_seq`, `next_seq`, `recovery_actions`
+and `open_files_held`. An operation that fails is reported with `error` and its cost, the others still run, and the
+exit status is 1 unless `--allow-errors` is given. The top level states `journal` (segments, bytes, records),
+`ram_bytes`, `cgroup_memory_max_bytes` (Linux), `cold_requested`, `cold_unavailable`, `errors` and `label` (free text
+from `--label`, to tell runs of the same journal apart).
+
+**Archived history.** `tt-scale archive --dir J --to A` moves all but the newest `--keep-segments` segments of a journal
+to an archive directory as `tickertape archive --to` does, with a reader of each kind open in the oldest segment, and
+reports the cost of the move and what the readers then return, what a seek to an archived record does, reading the
+archive and then the rest of the journal, `verify` on both, and the rejoined directory. Measure the archive itself with
+`measure --dir A --end <boundary_seq>`.
+
+**Missing and corrupt segments.** `tt-scale damage --dir D --segments N` builds two intact journals (the checkpoint
+marker in the newest segment, and two segments before it) and, for every case, a damaged copy per probe. It reports
+what both readers do at open, replay, four seeks and `seek_to_end`, what `verify` and `status` say, and what
+`Writer::open` does under each recovery policy, with the time of each, and what building and checking seek indexes and
+seeks with them do. After each writer probe it compares every record of the intact journal, byte for byte, with the
+journal and `quarantine/`: `census` says how many are in a segment, only in quarantine, or in neither, and `gone` counts
+those that were in a segment before the writer opened and are in neither afterwards (it must be 0; the unit test checks
+every case). The internal probes that change a journal run only inside a directory `damage` made.
+
+**Catch-up.** `tt-scale catch-up` opens a writer on a journal `build` left and appends records at `--rate` with a
+background checkpoint every `--checkpoint-every`. After `--warmup` and `--baseline` it starts a reader process
+`--backlog` records behind the journal's head. The reader checks every sequence number; it has caught up at the first
+`try_next` that finds nothing, and then follows for `--live`. The writer's `append` latency is recorded for each phase
+(`baseline`, `catch_up`, `live`), as the duration of the call and from the intended time of the record, which counts a
+delayed schedule (coordinated omission). Each phase's percentiles are over that phase's appends only.
+
+**Another core.** The tool builds against the 1.0 core too, for before and after on the same journals: check out the
+commit to measure in another worktree, replace its `crates/tickertape` with the other version's
+(`git checkout v1.0.0 -- crates/tickertape`), and build with `--no-default-features`, which leaves out what needs the
+1.1 core (`seek_to_end`).
 
 `--cold` drops the page cache before every run with `sudo -n` (Linux `drop_caches`, macOS `purge`); without
 password-less sudo the runs continue warm and say so. In a VM, dropping the guest's cache leaves the host's cache
@@ -150,33 +195,24 @@ a recorded run uses a machine whose RAM is smaller than the journal.
 
 ### Cloud run (larger than RAM, local SSD)
 
-On a cloud VM with local SSD (the playbook's machine rules apply), with less RAM than the largest journal below and
-at least 100 GiB free on the SSD, for example a 4-vCPU, 16 GB machine with one local SSD:
+On a cloud VM with local SSD (the playbook's machine rules apply), with less RAM than the largest journal (64 GiB) and
+at least 250 GiB free on the SSD, for example a 4-vCPU, 16 GB machine with one local SSD:
 
 ```sh
 sudo mkfs.ext4 -F -E lazy_itable_init=0,lazy_journal_init=0 /dev/nvme0n1   # the local SSD's device
-sudo mkdir -p /mnt/ssd && sudo mount /dev/nvme0n1 /mnt/ssd && sudo chown "$USER" /mnt/ssd
+sudo mkdir -p /mnt/ssd && sudo mount -o noatime /dev/nvme0n1 /mnt/ssd && sudo chown "$USER" /mnt/ssd
 sudo -n true                                   # cold runs need password-less sudo
 cargo build --release -p tickertape-bench --bin tt-scale
-T=target/release/tt-scale; OUT=~/tt-scale-out; mkdir -p "$OUT"
-# Segment count at a fixed segment size (1 MiB): 10 to 20,000 segments.
-for n in 10 1000 10000 20000; do
-  $T run --dir /mnt/ssd/seg-$n --segments $n --segment-size 1048576 --repeats 2 --json > "$OUT/seg-$n-warm.json"
-  $T measure --dir /mnt/ssd/seg-$n --cold --repeats 2 --json > "$OUT/seg-$n-cold.json"
-  rm -rf /mnt/ssd/seg-$n
-done
-# Segment size at a fixed count: 1 MiB to 1 GiB segments.
-for size in 1048576 16777216 134217728 1073741824; do
-  $T run --dir /mnt/ssd/size-$size --segments 10 --segment-size $size --repeats 2 --json > "$OUT/size-$size-warm.json"
-  $T measure --dir /mnt/ssd/size-$size --cold --repeats 2 --json > "$OUT/size-$size-cold.json"
-  rm -rf /mnt/ssd/size-$size
-done
-# Larger than RAM: 64 GiB at the default segment size (512 x 128 MiB).
-$T build --dir /mnt/ssd/big --segments 512 --segment-size 134217728 --json > "$OUT/big-build.json"
-$T measure --dir /mnt/ssd/big --cold --repeats 2 --json > "$OUT/big-cold.json"
-$T measure --dir /mnt/ssd/big --repeats 2 --json > "$OUT/big-warm.json"
-rm -rf /mnt/ssd/big
+cargo build --release -p tickertape-cli
+benches/scale-session.sh /mnt/ssd/journals ~/tt-scale-out            # every stage: 3.5 hours or so
+benches/scale-session.sh /mnt/ssd/journals ~/tt-scale-out seeks      # one stage: the seeks alone
 ```
+
+`scale-session.sh` runs these stages, and with `TT_SCALE_BASE` set to a second build of the tool ("Another core")
+measures the same journals with it too: `counts` (10 to 20,000 segments of 1 MiB, an archive of 5,000 of them, retention,
+open files), `many` (100,000 segments of 64 KiB), `sizes` (10 segments of 1 MiB to 1 GiB), `seeks` (the seeks
+without and with seek indexes, and the cost of the indexes), `damage` and `big` (64 GiB in 512 segments of 128 MiB:
+operations, catch-up, an archive of 32 GiB). It writes one JSON file per command, `environment.txt` and `progress.txt`.
 
 Check first that `cold_unavailable` is `false`, every cold run has `cache_dropped: true`, and `journal.bytes` of the
 big journal exceeds `ram_bytes`. Then read, per operation and segment count or size: `wall_s` and CPU time (how
