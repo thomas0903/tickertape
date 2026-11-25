@@ -418,11 +418,13 @@ also printed to standard error.
 - Option builders follow the same rule as handles. The free-standing functions (`tickertape_verify`,
   `tickertape_list_segments`, `tickertape_read_checkpoint`, `tickertape_retention_apply`, and the version and error
   functions) can be called from any thread.
-- With the default options, a writer starts background helper threads (prefaulting, on Linux early write-back, and
-  on macOS preparing the next segment), and the first `tickertape_writer_request_checkpoint` starts its checkpoint
-  thread. On Linux each sets its CPU affinity when it starts, as `tickertape_writer_options_set_helper_cpus` says (by
-  default the process's CPUs except isolated ones, ADR 0038). `tickertape_writer_options_set_prefault(options, 0)`
-  gives a writer that starts no threads other than the checkpoint thread.
+- With the default options, a writer starts background helper threads (prefaulting, on Linux early write-back, and on
+  macOS preparing the next segment; on Linux that is off by default, `tickertape_writer_options_set_spare_segment`,
+  from 1.1, ADR 0049: the default depends on the platform, and no function reports the value in effect), and the first
+  `tickertape_writer_request_checkpoint` starts its checkpoint thread. On Linux each sets its CPU affinity when it
+  starts, as `tickertape_writer_options_set_helper_cpus` says (by default the process's CPUs except isolated ones, ADR
+  0038). `tickertape_writer_options_set_prefault(options, 0)` gives a writer that starts no threads other than the
+  checkpoint thread.
 - These threads belong to the library: the program never calls into them, and every call on the writer handle is
   still made by one thread at a time. While a background checkpoint runs, that thread may call any writer function:
   appends continue, `tickertape_writer_request_checkpoint` queues or joins a request,

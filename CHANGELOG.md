@@ -5,6 +5,16 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
+- Added: `WriterConfig::spare_segment` (C `tickertape_writer_options_set_spare_segment`, C++ and Python `spare_segment`,
+  Java `spareSegment`; `tt-sustained` and `tt-latency` `--spare-segment`): on Linux, prepare the next segment in a
+  background thread so that a roll does not create and preallocate a file (ADR 0049, issue #60). **Off by default on
+  Linux**, where the writer behaves as before; on by default on macOS, as today, and now separate from `prefault`. On
+  cloud VMs it made rolls cheaper away from the disk's limit, made the one saturated case worse and was not measured in others. The
+  file format and the crash contract's guarantees are unchanged.
+- Docs: the stalls of sustained runs on ext4 are attributed (issue #60): the write fault's modification-time update and
+  a roll's file operations wait for the ext4 journal; that the holder of `mmap_lock` in the unpaced rolls is the prefault
+  helper is inferred, and why the device queues on one machine shape is not explained. With the measured effect of
+  `lazytime` and the tracing overhead of the eBPF playbook's tools; `benches/diagnostics/stalls.bt` is new.
 - Docs: `docs/benchmarks.md` has profiles of both readers, the notification path and the serialization paths under
   the sustained workloads (x86-64 and aarch64 cloud VMs) and lists the allocations, copies, system calls and
   synchronization that remain, with whether each is necessary (issue #62; roadmap "Finish eliminating avoidable work").

@@ -42,17 +42,36 @@ With `WriterConfig::prefault(true)` (the default), the writer moves segment work
     use).
   - **macOS:** the next 8 MiB, with `MADV_WILLNEED` (ADR 0020). On APFS, writing into a preallocated segment otherwise
     faults once per 16 KiB page, slowly.
-- **The next segment (macOS only).** Once the active segment is half full, a short-lived thread, `tickertape-spare`,
-  creates, preallocates and syncs `next-segment.tmp` (ADR 0022). The roll then only writes the header and links the
-  file into place; preallocating and syncing a whole segment on APFS takes about 50 ms. The spare
-  reserves one more segment's worth of disk space from that point on. On Linux a synchronous roll costs about a
-  millisecond on ext4, and the spare occasionally stalled the writer, so Linux doesn't use it (ADR 0023).
-
+- **The next segment** (`WriterConfig::spare_segment`; on by default on macOS, **off on Linux**, from 1.1). Once the
+  active segment is half full, a thread, `tickertape-spare`, creates and preallocates `next-segment.tmp` (ADRs 0022
+  and 0049), and the roll then only writes the header and links the file into place. Off, a roll creates its file
+  itself.
+  - **What it costs:** one more segment's worth of disk space from the time the active segment is half full ("Disk
+    space" below), one more file descriptor and one more segment mapping. Dropping the `Writer` waits for a spare
+    being prepared.
+  - **Linux:** one thread for the writer's life. The spare is not synced; the checkpoint that first covers the segment
+    syncs it, as it does a segment a roll creates itself (ADR 0038). A roll that finds its spare not ready creates the
+    segment itself, without waiting, and the spare is used by the next roll; only if that fails for lack of space does
+    it wait for the spare (with no time limit, as long as the preallocation takes) and use it, or try once more. Away
+    from the disk's limit it made rolls cheaper in the recorded runs; near the limit it made them stall more often,
+    and unpaced the mapped reader's p99.9 was worse with an earlier build of it (`docs/benchmarks.md` → "2026-11-25,
+    roll and journal stalls"). Measure on your machine before turning it on.
+  - **macOS:** a thread is started for each spare; it also syncs the file (preallocating and syncing a whole segment
+    on APFS takes about 50 ms), and a roll waits for a spare that is still being prepared.
 - **Early write-back (Linux).** A helper thread, `tickertape-writeback`, asks the kernel to start writing back the
   pages behind the write position (`sync_file_range(SYNC_FILE_RANGE_WRITE)`, every 1 MiB, and the rest of a segment
   when the writer rolls past it), so that a checkpoint, blocking or background, finds little dirty data left
   (`WriterConfig::early_writeback`, default on; ADR 0038). It makes nothing durable: only checkpoints do. An I/O
   error from it makes the next checkpoint fail, as a failed sync would. On macOS the option does nothing.
+
+**ext4 under a load near what the disk takes.** A store into a page of a mapped file updates the file's modification
+time through the ext4 journal and can wait while the journal commits, for as long as the disk takes to write the log
+(50–140 ms appends in the recorded runs, `docs/benchmarks.md` → "2026-11-25, roll and journal stalls"). The mount
+option `lazytime`, which keeps modification times in memory, removed those waits there, but the roll's own file
+operations still waited and waited longer: the longest roll appends went from 0.2–59 to 114–130 ms. That is one
+VM shape with three 60-second runs per setting, so it is an option to measure, not a recommendation. After a power
+loss a file's modification time can then be older than its last write, and `tickertape status` takes the marker's
+modification time as the checkpoint's time.
 
 None of these threads ever writes records. Set `prefault(false)` if you want a writer that starts none (it also turns
 off early write-back); `Writer::request_checkpoint` still starts the checkpoint thread.
@@ -108,7 +127,7 @@ with the same rules: in C `tickertape_writer_request_checkpoint` and `tickertape
 Python `Writer.request_checkpoint` and `Writer.checkpoint_progress`, in Java `Writer.requestCheckpoint` and
 `Writer.checkpointProgress`; each binding's close reports a failure as `Writer::close` does. Early write-back and
 the helper placement are writer options in each (`early_writeback` / `earlyWriteback`, `helper_cpus` /
-`helperCpus`).
+`helperCpus`), and so is the spare segment (`spare_segment` / `spareSegment`, from 1.1).
 
 If `checkpoint()` returns an error, the writer refuses all later checkpoints (`Error::DurabilityLost`) while appends
 keep working. Treat it as an incident: see "Errors are sticky" in the crash contract.
@@ -123,6 +142,11 @@ checkpoints never frees space, and the checkpoint segment and newer segments alw
   `Error::is_storage_full()` is true; the journal stays consistent and the append can be retried once space is back.
 - **btrfs:** on a full btrfs volume, writes into an already preallocated segment can end the writer process with
   `SIGBUS` (or block it, with copy-on-write disabled), measured in crash contract C10. Keep clear headroom there.
+- **The spare segment** (`WriterConfig::spare_segment`, on by default on macOS, off on Linux) takes one more segment's
+  worth of space as soon as the active segment is half full. Leave room for it: where retention keeps N segments,
+  plan for N + 1 (a spare that does not fit is given up, and the roll creates its segment as usual). `storage.estimated_rolls_left` and `--min-headroom-segments` count free space, so their thresholds are
+  reached one segment earlier from half full on (a prepared spare with allocated blocks shows as
+  `storage.spare_segment`). A roll that lacks space for its own segment uses the spare instead of failing.
 - **APFS:** a `checkpoint()` on a completely full volume fails with `ENOSPC`, which poisons the writer (C9).
 
 ## Archiving and deleting old segments

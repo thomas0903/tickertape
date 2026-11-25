@@ -2,7 +2,8 @@
 //! checkpoints, or a writer whose recovery scans many segments, must not run out of descriptors.
 //!
 //! Usage:
-//! - `tt-open-segments roll <dir> <rolls> <request_every>`: appends until the writer has rolled `rolls` times, with a
+//! - `tt-open-segments roll <dir> <rolls> <request_every> <spare>`: with `WriterConfig::spare_segment` set to `<spare>`
+//!   (`on`, `off` or `default`), appends until the writer has rolled `rolls` times, with a
 //!   background checkpoint requested every `request_every` rolls (0: none), then checkpoints. Prints the next sequence
 //!   number, then the change in open descriptors and (on Linux) in mappings from the first roll to the end.
 //! - `tt-open-segments open <dir> <fail|quarantine>`: opens a writer (recovery), appends one record, checkpoints, and
@@ -36,7 +37,12 @@ fn main() {
         "roll" => {
             let rolls: u64 = args[3].parse().expect("rolls");
             let every: u64 = args[4].parse().expect("request_every");
-            let mut writer = Writer::open(dir, small_config()).unwrap_or_else(|e| fail("open", e));
+            let config = match args[5].as_str() {
+                "on" => small_config().spare_segment(true),
+                "off" => small_config().spare_segment(false),
+                _ => small_config(),
+            };
+            let mut writer = Writer::open(dir, config).unwrap_or_else(|e| fail("open", e));
             let mut base = writer.metrics().head.segment_base_seq;
             let mut rolled = 0;
             let mut first = None;

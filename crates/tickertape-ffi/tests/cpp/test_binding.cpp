@@ -1154,7 +1154,7 @@ static void metrics(const std::string &root) {
 static void background_checkpoints(const std::string &root) {
     const std::string dir = root + "/background";
     tt::WriterOptions options = small_segments();
-    options.early_writeback(true).helper_cpus(tt::HelperCpus::process);
+    options.early_writeback(true).spare_segment(true).helper_cpus(tt::HelperCpus::process);
     tt::Writer writer = MUST(tt::Writer::open(dir, options));
     const tt::CheckpointProgress fresh = MUST(writer.checkpoint_progress());
     CHECK(!fresh.durable && !fresh.pending);

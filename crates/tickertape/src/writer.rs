@@ -19,7 +19,7 @@ use crate::error::{CorruptReason, Error, Result};
 use crate::format::{self, CheckpointSlot, RecordHeader, ScanEnd, SegmentHeader, SegmentView};
 use crate::journal::{self, CHECKPOINT_FILE, LOCK_FILE, QUARANTINE_DIR};
 use crate::mmap::{self, MapRw};
-use crate::prefault::{Prefaulter, Spare};
+use crate::prefault::{Prefaulter, Spare, Spares, Waited};
 use crate::record::NewRecord;
 use crate::seek_index;
 use crate::writeback::WriteBack;
@@ -83,10 +83,8 @@ pub struct Writer {
     prefault: Option<Prefaulter>,
     /// The early write-back thread, if enabled and started (Linux; ADR 0038).
     writeback: Option<WriteBack>,
-    /// The next segment being prepared in the background, if requested (ADR 0022).
-    spare: Option<std::thread::JoinHandle<io::Result<Spare>>>,
-    /// Whether a spare has been requested for the current active segment.
-    spare_requested: bool,
+    /// Prepares the next segment in the background, if enabled and started (ADR 0022).
+    spares: Option<Spares>,
     /// The generation of the newest checkpoint this writer started (or of the marker read at open).
     generation: u64,
     poisoned: bool,
@@ -222,6 +220,11 @@ impl Writer {
                 )
             })
             .flatten();
+        let spares = (config.prefault
+            && config.spare_segment
+            && cfg!(any(target_vendor = "apple", target_os = "linux")))
+        .then(|| Spares::start(&root, config.segment_size, config.helper_cpus.clone()))
+        .flatten();
         let ctx = Arc::new(Context {
             dir: root.clone(),
             marker: Mutex::new(Marker {
@@ -262,8 +265,7 @@ impl Writer {
             notify,
             prefault,
             writeback,
-            spare: None,
-            spare_requested: false,
+            spares,
             generation: checkpoint.map_or(0, |c| c.generation),
             poisoned: false,
             failed_bytes: 0,
@@ -558,20 +560,12 @@ impl Writer {
         if let Some(writeback) = &mut self.writeback {
             writeback.advanced(self.offset);
         }
-        // Once the active segment is half full, prepare the next one off the writer's thread (ADR 0022). macOS only: on
-        // ext4 a synchronous roll costs about 1 ms, and the spare's preallocation sync occasionally stalled the writer
-        // for tens of milliseconds (ADR 0023).
-        if self.config.prefault
-            && cfg!(target_vendor = "apple")
-            && !self.spare_requested
-            && self.offset >= self.active.size / 2
-        {
-            self.spare_requested = true;
-            self.spare = crate::prefault::prepare_spare(
-                &self.root,
-                self.config.segment_size,
-                self.config.helper_cpus.clone(),
-            );
+        // Once the active segment is half full, prepare the next one off the writer's thread (ADR 0022; on Linux
+        // without a sync and only with `WriterConfig::spare_segment`, ADR 0049).
+        if let Some(spares) = &mut self.spares {
+            if self.offset >= self.active.size / 2 && !spares.requested() {
+                spares.request();
+            }
         }
         self.next_seq = seq + 1;
         Ok(Ok(seq))
@@ -984,7 +978,9 @@ impl Writer {
     ///   writer has gone, and on macOS the wake-up region's shared-memory name stays until the next writer opens the
     ///   journal. Another writer could then open the journal while those threads still run.
     pub fn release_after_fork(mut self) {
-        std::mem::forget(self.spare.take());
+        if let Some(spares) = self.spares.take() {
+            spares.release_after_fork();
+        }
         std::mem::forget(self.prefault.take());
         // In a child, dropping the write-back helper's handle neither stops nor joins it: it only drops the child's
         // references to the segment files the helper follows, if the helper's lock was free at the fork.
@@ -1082,12 +1078,31 @@ impl Writer {
         // No sync here: the new segment's header and size become durable at the next checkpoint, which syncs every
         // segment linked before its request before it writes a marker; recovery restores a header that a crash kept
         // from reaching the disk (ADR 0038 → Rolls without a sync; crash contract C8).
+        let size = self.config.segment_size;
         let new = match self.take_spare() {
-            Some(spare) => publish_spare(&self.root, next_base, self.config.segment_size, spare)?,
-            None => create_segment(&self.root, next_base, self.config.segment_size, false)?,
+            Some(spare) => publish_spare(&self.root, next_base, size, spare)?,
+            None => {
+                // Whether a spare may hold space while this one is created. Asked before: a preparation that has ended
+                // by now has given its blocks back or is ready.
+                let preparing = self.spares.as_ref().is_some_and(Spares::preparing);
+                match create_segment(&self.root, next_base, size, false) {
+                    // Only now is the spare worth waiting for: it may hold the space this needed, or, when both
+                    // preallocate at the same time, have run out of it and given it back (ADR 0049).
+                    Err(full) if full.is_storage_full() => match self.wait_for_spare() {
+                        Waited::Ready(spare) => publish_spare(&self.root, next_base, size, spare)?,
+                        Waited::Nothing if !preparing => return Err(full),
+                        Waited::Freed | Waited::Nothing => {
+                            create_segment(&self.root, next_base, size, false)?
+                        }
+                    },
+                    created => created?,
+                }
+            }
         };
         crate::fault::hook(crate::fault::Point::RollAfterLink);
-        self.spare_requested = false;
+        if let Some(spares) = &mut self.spares {
+            spares.rolled();
+        }
         self.dirty_dirs.insert(self.root.clone());
         // After the link, the roll always completes: seal the old segment, then switch.
         let seal_at = self.offset;
@@ -1130,17 +1145,40 @@ impl Writer {
 }
 
 impl Writer {
-    /// Waits for the spare being prepared, if any, and returns it if it is usable for this journal's segment size.
+    /// Returns the prepared spare, if any, if it is usable for this journal's segment size. On macOS it waits for one
+    /// still being prepared; on Linux never ([`Spares::take`]).
     fn take_spare(&mut self) -> Option<Spare> {
-        match self.spare.take()?.join() {
-            Ok(Ok(spare)) if spare.size == self.config.segment_size => Some(spare),
-            Ok(Ok(_)) => {
-                let _ = fs::remove_file(self.root.join(journal::SPARE_FILE));
-                None
-            }
-            // Preparing failed (it removed its own file) or the thread panicked: create the segment synchronously.
-            _ => None,
+        let spare = self.spares.as_mut()?.take()?;
+        self.usable(spare)
+    }
+
+    /// As [`Writer::take_spare`], but waits for a spare being prepared ([`Spares::wait`]).
+    fn wait_for_spare(&mut self) -> Waited {
+        let Some(spares) = &mut self.spares else {
+            return Waited::Nothing;
+        };
+        match spares.wait() {
+            // Discarding one of another size frees its space.
+            Waited::Ready(spare) => self.usable(spare).map_or(Waited::Freed, Waited::Ready),
+            other => other,
         }
+    }
+
+    /// The spare, if it has this journal's segment size; otherwise it is discarded.
+    fn usable(&self, spare: Spare) -> Option<Spare> {
+        if spare.size == self.config.segment_size {
+            return Some(spare);
+        }
+        drop(spare);
+        let _ = fs::remove_file(self.root.join(journal::SPARE_FILE));
+        None
+    }
+
+    /// Test support: whether no spare segment is being prepared.
+    #[cfg(feature = "fault-injection")]
+    #[doc(hidden)]
+    pub fn spare_settled(&self) -> bool {
+        self.spares.as_ref().is_none_or(Spares::settled)
     }
 }
 
@@ -1163,10 +1201,7 @@ impl Drop for Writer {
             // Finish the requested background checkpoints and join their thread first: the last marker must be
             // written while the lock is held, and before readers are told that this writer has gone.
             drop(self.background.take());
-            if let Some(Ok(Ok(spare))) = self.spare.take().map(|h| h.join()) {
-                drop(spare);
-                let _ = fs::remove_file(self.root.join(journal::SPARE_FILE));
-            }
+            drop(self.spares.take());
             drop(self.prefault.take());
             drop(self.writeback.take());
             drop(self.notify.take());
@@ -1203,8 +1238,8 @@ impl Drop for JournalLock {
 
 /// Publishes a prepared spare as segment `base` (ADR 0022): write its header, then link it into place, as
 /// [`create_segment`] does at a roll. The header is not synced here: the next checkpoint syncs it before its marker
-/// (the spare's size was synced when it was prepared). If the header can't be written, the spare is discarded and the
-/// segment is created synchronously instead; a failed link is reported like [`create_segment`]'s.
+/// (and the file's size, which only macOS syncs when it prepares the spare). If the header can't be written, the spare
+/// is discarded and the segment is created synchronously instead; a failed link is reported like [`create_segment`]'s.
 fn publish_spare(dir: &Path, base: u64, size: u64, spare: Spare) -> Result<Segment> {
     let spare_path = dir.join(journal::SPARE_FILE);
     let path = journal::segment_path(dir, base);
@@ -2839,6 +2874,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let config = WriterConfig::default()
                 .segment_size(format::SEGMENT_SIZE_UNIT)
+                .spare_segment(true)
                 .helper_cpus(cpus.clone());
             // In a forked child, whose only threads are the writer's thread and the helpers it starts (other tests
             // in this process run writers of their own).
@@ -2853,9 +2889,14 @@ mod tests {
                 let seen = loop {
                     let seen = helpers();
                     let names: Vec<&str> = seen.iter().map(|(n, _)| n.as_str()).collect();
-                    let started = ["tickertape-chec", "tickertape-pref", "tickertape-writ"]
-                        .iter()
-                        .all(|n| names.contains(n));
+                    let started = [
+                        "tickertape-chec",
+                        "tickertape-pref",
+                        "tickertape-spar",
+                        "tickertape-writ",
+                    ]
+                    .iter()
+                    .all(|n| names.contains(n));
                     let settled = matches!(cpus, HelperCpus::Inherited)
                         || seen.iter().all(|(_, l)| l != &vec![pinned]);
                     if started && settled {
