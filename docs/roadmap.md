@@ -167,7 +167,7 @@ released with seven items open, accepted by the owner as known gaps
     rewrite published records in place under a live reader.
   - The follow-up is decided in [ADR 0048](decisions/0048-publication-frontier.md) (accepted, nothing built): the
     shared word is deferred in 1.x; the checkpoint marker bounds the loads instead, which helps replay and catch-up, not
-    a reader tailing the head. Building that is later work at low priority, after #64 and #66.
+    a reader tailing the head. Building that is later work at low priority.
   - The copy is gone (ADR 0027, #9); replay results for both
     readers on x86-64 and aarch64 and the live latency of both readers on both architectures (the sustained session) are
     recorded in `docs/benchmarks.md` (2026-11-19 to 2026-11-22).
@@ -248,6 +248,8 @@ released with seven items open, accepted by the owner as known gaps
     segment size). The defect the run found, one open file per segment between checkpoints, is fixed (#38).
   - Missing: archived history, missing or corrupt segments, catch-up under a live writer, the zero-copy reader and the
     10,000- and 20,000-segment journals (they failed before #38 and are reported as failed) are not measured.
+  - Accepted after 1.0 (issue #59): a sparse seek index per sealed segment,
+    [ADR 0045](decisions/0045-sparse-seek-index.md) (accepted design, not built).
 
 ### v1.0 readiness
 

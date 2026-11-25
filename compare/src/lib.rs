@@ -7,10 +7,15 @@ use std::time::{Duration, Instant};
 
 use hdrhistogram::Histogram;
 use serde_json::{Value, json};
-use tickertape::{NewRecord, Reader, ReaderConfig, Writer, WriterConfig, clock};
+use tickertape::{HelperCpus, NewRecord, Reader, ReaderConfig, Writer, WriterConfig, clock};
+use tickertape_bench::affinity::{pin_or_fail, report, thread_id};
+use tickertape_bench::sustained::parse_cpu_list;
 use tickertape_bench::{Options, Result, histogram_json, intended_ns};
 
 const SEGMENT_SIZE: u64 = 134_217_728;
+
+/// Records `append_steady` writes before its timer starts, the same for every tool (Harness.java has the same value).
+const PRIMING_RECORDS: u64 = 1_000;
 
 fn wait_start(control: &Path, role: &str) -> Result<u64> {
     fs::write(control.join(format!("{role}.ready")), [])?;
@@ -67,9 +72,17 @@ enum Sink {
     Queue(queue_file::QueueFile),
 }
 impl Sink {
-    fn open(tool: &str, dir: &Path) -> Result<Self> {
+    /// `helper_cpus`: where the tool's own threads go. Only tickertape has any in the writer, and its default would
+    /// leave the CPUs this process inherited; `steady`: prepare files before the timer where the tool can.
+    fn open(tool: &str, dir: &Path, helper_cpus: Option<Vec<usize>>, steady: bool) -> Result<Self> {
         Ok(match tool {
-            "tickertape" => Self::Tape(Writer::open(dir, WriterConfig::default())?),
+            "tickertape" => {
+                let mut config = WriterConfig::default();
+                if let Some(cpus) = helper_cpus {
+                    config = config.helper_cpus(HelperCpus::List(cpus));
+                }
+                Self::Tape(Writer::open(dir, config)?)
+            }
             "plain-file" => Self::File(
                 OpenOptions::new()
                     .create_new(true)
@@ -82,7 +95,13 @@ impl Sink {
                     .open(dir)?,
             ),
             "queue-file" => {
-                let mut q = queue_file::QueueFile::open(dir.join("data"))?;
+                // From its default size (8 KiB) the file doubles, with an fsync each time, inside the timer.
+                let path = dir.join("data");
+                let mut q = if steady {
+                    queue_file::QueueFile::with_capacity(path, SEGMENT_SIZE)?
+                } else {
+                    queue_file::QueueFile::open(path)?
+                };
                 q.set_sync_writes(false);
                 // Keep header publication per add: disabling this would make a
                 // faster buffered mode with weaker process-crash semantics.
@@ -199,6 +218,8 @@ fn run(tool: &str) -> Result<()> {
             "--mode",
             "--duration-ms",
             "--sync-every-ms",
+            "--cpu",
+            "--helper-cpus",
         ],
         &[],
     )?;
@@ -224,8 +245,51 @@ fn run(tool: &str) -> Result<()> {
         return Err("invalid count/rate/warmup/payload".into());
     }
     let control = opts.path("--control");
+    let helper_cpus = opts
+        .optional("--helper-cpus")
+        .map(parse_cpu_list)
+        .transpose()?;
+    // Pinning (README, Thread pinning): after open, so that threads the tool starts inherit the process's helper CPUs,
+    // except where open is inside the timer (the cold append and W3's reader).
+    let cpu = match opts.optional("--cpu") {
+        Some(_) => Some(opts.number("--cpu", None)?),
+        None => None,
+    };
+    // Tells the runner's Keeper about this thread: <role>.tid before it is pinned, <role>.measured after the read-back.
+    let announce = |event: &str| -> Result<()> {
+        if let (Some(_), Some(control)) = (cpu, control.as_deref()) {
+            let tmp = control.join(format!("{role}.{event}.tmp"));
+            fs::write(&tmp, thread_id()?.to_string())?;
+            fs::rename(tmp, control.join(format!("{role}.{event}")))?;
+        }
+        Ok(())
+    };
+    let pin = || -> Result<()> {
+        announce("tid")?;
+        pin_or_fail(cpu)
+    };
+    // While the endpoint is open: closing it ends the tool's threads, and the read-back could not judge them.
+    let read_back = || -> Result<Value> {
+        let affinity = report()?;
+        announce("measured")?;
+        Ok(affinity)
+    };
+    let cold = mode == "append_cold";
+    let open_is_timed = cold || (role == "reader" && !live);
+    if open_is_timed {
+        pin()?;
+    }
     if role == "writer" {
-        let mut sink = Sink::open(tool, &dir)?;
+        let priming = if mode == "append_steady" {
+            PRIMING_RECORDS
+        } else {
+            0
+        };
+        let mut start = cold.then(Instant::now);
+        let mut sink = Sink::open(tool, &dir, helper_cpus, priming > 0)?;
+        if !open_is_timed {
+            pin()?;
+        }
         let mut bytes = vec![0x5a; payload + 16 + usize::from(tool == "plain-file") * 4];
         let offset = if tool == "plain-file" { 4 } else { 0 };
         if offset == 4 {
@@ -238,7 +302,6 @@ fn run(tool: &str) -> Result<()> {
         };
         let mut late = 0;
         let mut max_late = 0;
-        let mut start = None;
         let mut sync_hist = Histogram::<u64>::new(3)?;
         let mut sync_operation = None;
         let mut sync_overruns = 0u64;
@@ -249,6 +312,10 @@ fn run(tool: &str) -> Result<()> {
             while clock::realtime_ns() < t0 {
                 std::hint::spin_loop();
             }
+        }
+        for i in 0..priming {
+            bytes[offset..offset + 8].copy_from_slice(&i.to_le_bytes());
+            sink.send(0, &bytes)?;
         }
         for i in 0..count {
             let intended = if probe {
@@ -274,7 +341,7 @@ fn run(tool: &str) -> Result<()> {
                 0
             };
             start.get_or_insert_with(Instant::now);
-            bytes[offset..offset + 8].copy_from_slice(&i.to_le_bytes());
+            bytes[offset..offset + 8].copy_from_slice(&(priming + i).to_le_bytes());
             bytes[offset + 8..offset + 16].copy_from_slice(&intended.to_le_bytes());
             // Plain file's prefix is passed only to write(2), not other tools.
             sink.send(intended, &bytes)?;
@@ -313,7 +380,8 @@ fn run(tool: &str) -> Result<()> {
             "late_records": if probe { Value::Null } else { json!(late) },
             "max_late_us": if probe || !live { Value::Null } else { json!(max_late as f64 / 1e3) },
             "stopped_by": stopped_by, "periodic_sync": periodic,
-            "flush_seconds": flush_seconds, "flush_operation": sync})
+            "flush_seconds": flush_seconds, "flush_operation": sync,
+            "timer_starts": timer_starts(mode), "priming_records": priming, "affinity": read_back()?})
         );
         return Ok(());
     }
@@ -350,6 +418,7 @@ fn run(tool: &str) -> Result<()> {
     };
     let ready = || -> Result<()> {
         if live {
+            pin()?;
             wait_start(control.as_deref().ok_or("missing control")?, "reader")?;
         }
         Ok(())
@@ -364,7 +433,7 @@ fn run(tool: &str) -> Result<()> {
     };
     // `received` mirrors `expected` (which `observe` borrows) for the loop conditions.
     let mut received = 0u64;
-    let seconds = match tool {
+    let (seconds, affinity) = match tool {
         "tickertape" => {
             let cfg = ReaderConfig::default();
             let mut r = if opts.required("--reader")? == "mapped" {
@@ -383,7 +452,7 @@ fn run(tool: &str) -> Result<()> {
                     idle(&mut target)?;
                 }
             }
-            start.elapsed().as_secs_f64()
+            (start.elapsed().as_secs_f64(), read_back()?)
         }
         "plain-file" => {
             let mut r = FileReader {
@@ -404,7 +473,7 @@ fn run(tool: &str) -> Result<()> {
                     idle(&mut target)?;
                 }
             }
-            start.elapsed().as_secs_f64()
+            (start.elapsed().as_secs_f64(), read_back()?)
         }
         "yaque" if live => {
             let mut r = yaque::ReceiverBuilder::new()
@@ -427,7 +496,7 @@ fn run(tool: &str) -> Result<()> {
                     Err(e) => return Err(e.unwrap_io().into()),
                 }
             }
-            start.elapsed().as_secs_f64()
+            (start.elapsed().as_secs_f64(), read_back()?)
         }
         "yaque" => {
             let r = yaque::QueueIter::open(&dir)?;
@@ -441,7 +510,7 @@ fn run(tool: &str) -> Result<()> {
                 )?;
                 received += 1;
             }
-            start.elapsed().as_secs_f64()
+            (start.elapsed().as_secs_f64(), read_back()?)
         }
         "queue-file" => {
             if live {
@@ -454,7 +523,7 @@ fn run(tool: &str) -> Result<()> {
                 observe(i, validate(bytes, i, payload)?, bytes.len() - 16)?;
                 received += 1;
             }
-            start.elapsed().as_secs_f64()
+            (start.elapsed().as_secs_f64(), read_back()?)
         }
         _ => return Err("unknown tool".into()),
     };
@@ -462,18 +531,26 @@ fn run(tool: &str) -> Result<()> {
         return Err("incomplete replay".into());
     }
     let read = target.count;
-    println!(
-        "{}",
-        if probe {
-            json!({"count": read, "latency_from": "send start", "latency": histogram_json(&hist)})
-        } else if live {
-            histogram_json(&hist)
-        } else {
-            json!({"count": count, "seconds": seconds,
+    let mut result = if probe {
+        json!({"count": read, "latency_from": "send start", "latency": histogram_json(&hist)})
+    } else if live {
+        histogram_json(&hist)
+    } else {
+        json!({"count": count, "seconds": seconds,
         "records_per_s": count as f64 / seconds, "payload_mb_per_s": count as f64 * payload as f64 / seconds / 1e6})
-        }
-    );
+    };
+    result["affinity"] = affinity;
+    println!("{result}");
     Ok(())
+}
+
+/// Where the writer's timer starts, for the result.
+fn timer_starts(mode: &str) -> &'static str {
+    match mode {
+        "append_cold" => "before open, in an empty directory",
+        "append_steady" => "at the first record after open and the priming records",
+        _ => "at the first record after open",
+    }
 }
 
 pub fn main_for(tool: &str) {

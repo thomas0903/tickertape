@@ -37,7 +37,7 @@ The cases below need a commit word whose value no writer stored there:
      reader then replayed into it under a live writer.
    - *An uncovered record's length, enlarged.* Recovery validates the record and repairs it (one action). So this needs
      damage that appears **while a writer runs**: a clean page evicted and read back damaged, or a memory error. The
-     contract says "while no writer runs", which is narrower than what can happen.
+     contract of 1.0.0 said "while no writer runs", which is narrower than what can happen.
    - *The empty slot at the head,* damaged into a length or a seal marker under a live writer. With 1,920 written
      there, visible readers of both kinds report a checksum mismatch (with a seal marker, an invalid seal), and the
      next append fills those bytes. Durable-only readers do not touch the slot.
@@ -135,7 +135,7 @@ real in the sense that a caller cannot rule it out.
 ## Decision
 
 **Build no shared word in 1.x. Bound the zero-copy reader's loads by the checkpoint marker**, visible and durable-only
-readers alike, in a separate change, at low priority, after pull requests #64 and #66, if it meets the cost bar below.
+readers alike, in a separate change, at low priority (after #64 and #66, both merged), if it meets the cost bar below.
 If it does not, take option 1.
 
 **The bound.** For its open segment the reader keeps `limit`:
@@ -161,9 +161,9 @@ re-read in the 50 ms retry loop is the same `pread`s again.
 
 **Which marker.**
 
-- *Visible reader.* It reads the two 64-byte slots with `pread` (not the 128 KiB `read_checkpoint` reads now) before
-  it opens a segment by path, which proves that the file was current after the marker was written (ADR 0034). It reads
-  them again, and then checks the identity, once when the cursor reaches `limit` and at the 100 ms check at an empty
+- *Visible reader.* It reads the marker (`read_checkpoint`: two 64-byte `pread`s, once more if neither slot was valid)
+  before it opens a segment by path, which proves that the file was current after the marker was written (ADR 0034). It
+  reads it again, and then checks the identity, once when the cursor reaches `limit` and at the 100 ms check at an empty
   slot. **If the marker cannot be read, or that identity check finds another file, none, or fails, the old `limit`
   stays and nothing is reported on that account.** A reader overtaken by retention thus still reads its segment to the
   end (C14); the identity checks that exist today keep their results.
@@ -190,11 +190,12 @@ stored there. The bound it holds is
 - *current*, with the uncovered tail and the empty slot after it (the whole segment, if there is no valid marker or it
   names an earlier segment). Case 1 then needs damage under a running writer, since a reopen validates the rest.
 
-**The condition on the marker.** The narrowing holds while the journal's `checkpoint` file holds the markers the writer
-wrote and no earlier one becomes current. That is a condition of the narrowing, **not a new obligation on the caller of
-`open_mapped`**: without it the reader has today's limitation and, as above, no wrong result. Damage to both slots, or
-to the newer one, breaks it. So does a marker sync that fails: the slot can be readable for a while and later revert.
-C13's exception names only damage that also destroys the marker, so this is wider than C13's text.
+**The condition on the marker.** The narrowing holds while the journal's `checkpoint` file holds the markers the
+writer wrote and no earlier one becomes current. That is a condition of the narrowing, **not a new obligation on the
+caller of `open_mapped`**: without it the reader has today's limitation and, as above, the bound gives no wrong
+result. Damage to both slots, or to the newer one, breaks it. So does a marker sync that fails: the slot can be
+readable for a while and later revert. C13's exception names only damage that also destroys the marker, so this is
+wider than C13's text ("Readers after a repair" also names a marker set back to an older one).
 
 **Scope.** A durable-only zero-copy reader is outside the limitation *for damaged commit words*; for case 2 that is
 true of 1.0.0 already. No marker helps against storage that returns different bytes for a page read again (evicted and
@@ -249,9 +250,9 @@ difference above is 0.3 ns); against a p99.9 of 500 ns it is nothing. If no mach
 
 ## Contract changes
 
-### Corrections, independent of the bound (a separate small text change)
+### Corrections, independent of the bound (made with this record)
 
-The existing texts state the case too narrowly. Stating it correctly names more damage than they do, so it needs the
+The texts of 1.0.0 stated the case too narrowly. Stating it correctly names more damage than they did, so it needs the
 rule in `compatibility.md` ("weakening a guarantee, or turning an untested claim into a weaker one, is a breaking
 change"): **this is a correction, not a weakening.** The guarantee is already conditioned on an intact chain, "where
 every commit word the reader follows is one a writer published", and every damage added below breaks that condition.
@@ -267,13 +268,14 @@ No state in which the guarantee held loses it; the list of examples was incomple
   empty slot at the head, so that the claimed frame reaches bytes a writer stores, validating that slot makes the reader
   load bytes the writer is storing at that moment. The damage can appear whether or not a writer runs." And the sentence
   from "A separately synchronised publication frontier, a planned protocol change," to the end of its paragraph becomes:
-  "ADR 0048 (accepted, not built) bounds the loads in the first case by the checkpoint marker, for the records it
-  covers. The second case stays open for visible readers, where the bytes change because recovery rewrites them (ADR
+  "ADR 0048 (accepted, not built) would bound the loads in the first case by the checkpoint marker, for the records it
+  covers; it does not close the second for visible readers, where the bytes change because recovery rewrites them (ADR
   0027 → "Which loads can race")."
 - **`compatibility.md`** → Crash contract, from "a zeroed commit word lets recovery rewrite" to "with its own ADR."
   becomes: "a commit word with a value that no writer stored there can make the reader load bytes a writer is storing
-  or, if it is zero, let recovery rewrite published records in place under a live reader. ADR 0048 (accepted, not built)
-  narrows the first by the checkpoint marker in a 1.x release."
+  or, if it is zero, let recovery rewrite published records in place under a live reader. (The text of 1.0.0 named less
+  of this damage. Naming it is a correction, not a weakening: all of it breaks the intact chain on which the guarantee
+  depends.) ADR 0048 (accepted, not built) would narrow the first, by the checkpoint marker, in a 1.x release."
 
 ### With the bound
 
@@ -283,20 +285,20 @@ These narrow the limitation. No item, error value, precondition or on-disk byte 
   the journal's `checkpoint` file holds the markers the writer wrote and no earlier one becomes current, neither case
   concerns a reader with `durable_only(true)`, and the first does not concern a slot below the checkpoint position the
   reader last took (at a segment's open, on reaching that position, and while it waits). Without that, the limitation is
-  as stated." The paragraph on ADR 0048 above drops "not built". `open_mapped`'s first paragraph gains: "A record whose
-  frame crosses that position is copied into the reader's buffer instead."
+  as stated." The sentence on ADR 0048 above becomes "ADR 0048 bounds …". `open_mapped`'s first
+  paragraph gains: "A record whose frame crosses that position is copied into the reader's buffer instead."
 - **`crash-contract.md`,** C13: "No tickertape process changes a payload a durable-only zero-copy reader returned,
   unless the marker was lost or an earlier one became current. Storage that returns different bytes for a page read
   again can." "Known risks and limits" needs no change: the limitation is in the section before it.
-- **`compatibility.md`:** "ADR 0048 (accepted, not built) narrows" becomes "ADR 0048 narrows"; "in a 1.x release" goes.
+- **`compatibility.md`:** "(accepted, not built) would narrow" becomes "narrows"; "in a 1.x release" goes.
 - **`format.md`** → Checkpoint marker: "Readers ignore this file unless `ReaderConfig::durable_only(true)` is enabled"
-  gains "(a visible zero-copy reader uses it only to bound its loads; it returns the same records and errors whatever
-  the file holds)".
+  does not mention the seeks of ADR 0046 either. It gains, for the bound: "(a visible zero-copy reader also bounds its
+  loads by it, which changes no record or error it returns)".
 - **`c-api.md`, `cpp-api.md`, `java-api.md`, `tickertape.h`, the Java and C++ reader docs** say only that a writer never
   changes committed bytes, without the limitation. They gain one sentence pointing to it. Text only, so the ABI
   baseline is untouched. ADR 0027 and the `mmap.rs` comments gain a pointer.
 
-## Work in flight
+## ADRs 0045 and 0046
 
 - **ADR 0045 (sparse seek index, #64).** Its step 2 lets zero-copy and durable-only readers use an index only for
   segments before the marker's. That is the second row of the `limit` table, so the two can share one read of the
@@ -304,14 +306,16 @@ These narrow the limitation. No item, error value, precondition or on-disk byte 
   not cover, the remaining hazard is recovery changing it in place, which no frontier sees. In covered segments a wrong
   index can meet no store, with or without the bound.
 - **ADR 0046 (forward seeks, `seek_to_end`, #66).** A seek that scans from the segment's start is the replay of covered
-  records in which case 1 arises, so it benefits most. `seek` opens the candidate segment before
-  `continues_from_cursor` reads the marker. The candidate takes its `limit` from the read that its own open makes first
-  (above); to take it from `continues_from_cursor`'s later read instead, the candidate's identity would have to be
-  checked again after that read. A seek that continues keeps the segment it has open: a visible reader may take `limit`
-  from that marker, since the identity check follows it; a durable-only reader does not apply that marker, so it keeps
-  the `limit` of the one it has applied. `last_record_in_place` uses `pread` and needs nothing. `seek_to_end` starts at
-  the marker's position: a visible reader then reads only uncovered records and gains nothing, while a durable-only
-  reader can refresh to a newer marker on the way and reads records that one covers, inside its bound. The saved
+  records in which case 1 arises, so it benefits most. The candidate segment takes its `limit` from the read that its
+  open makes first (above). A seek that continues keeps the segment it has open, and its `limit`:
+  `continues_from_cursor` reads no marker. `covered_now` does (after a scan's open, or when a continued seek's target is
+  at or past `seek_covered`) and checks the identity after it, so a visible reader may take `limit` from that read when
+  the check passes. A durable-only reader does not apply that marker, so it keeps the `limit` of the one it has applied.
+  `seek_covered` itself is not a bound on loads: it is a sequence number, and it may be older than `limit`.
+  `last_record_in_place` uses `pread` and needs nothing. `seek_to_end` reads the marker before it opens the segment and
+  starts at its position: a visible reader then reads only uncovered records and gains nothing, while a durable-only
+  reader, which forgets the marker it had applied and with it the `limit`, can refresh to a newer marker on the way and
+  reads records that one covers, inside its bound. A failed `seek_to_end` restores the reader exactly, so the saved
   `Place` must include `limit`.
 
 ## Tests
@@ -326,8 +330,8 @@ These narrow the limitation. No item, error value, precondition or on-disk byte 
    just below and above `limit`; no mapped load after the commit word for a crossing frame.
 4. **Same results:** for every such length, zero-copy and safe reader agree on the error (extends
    `tests/mapped_reader.rs`, whose corruption classes get a marker at each position). With a CRC-valid marker at every
-   aligned offset of an intact journal, both visible readers return every record and the payload of a crossing one is right
-   while it is borrowed.
+   aligned offset of an intact journal, both visible readers return every record, and the payload of a crossing one is
+   right while it is borrowed.
 5. **Live:** a covered length damaged and the writer reopened, with no recovery action; an uncovered one, which the
    reopen repairs; and a length and a seal marker in the empty head slot under a live writer, which the next append
    overwrites. Appends from a thread and from another process, all four kinds of reader.

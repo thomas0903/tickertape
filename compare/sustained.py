@@ -27,6 +27,9 @@ import sys
 import tempfile
 import time
 
+import affinity
+import javaopts
+
 HERE = Path(__file__).resolve().parent
 
 WORKLOADS = ("probe", "SV", "SD")
@@ -42,9 +45,9 @@ SUPPORT = {
                    "reader_reason": "upstream forbids concurrent process access: writer-only runs"},
     "plain-file": {"reader": True, "SD": "File::sync_data (fdatasync)"},
 }
-JAVA_TOOLS = ("chronicle", "aeron")
+JAVA_TOOLS = javaopts.JAVA_TOOLS
 # Seconds a run takes beyond its scheduled time (process and JVM start, drain, sync); used for estimates only.
-OVERHEAD_S = {"chronicle": 10, "aeron": 10}
+OVERHEAD_S = {"chronicle": 25, "aeron": 25}
 DEFAULT_OVERHEAD_S = 4
 SYNC_S = 5  # os.sync() after a long run; quick runs write little
 QUICK_SYNC_S = 1
@@ -216,7 +219,7 @@ def validate_sustained(result):
     validate_histogram(latency, "latency")
 
 
-def adapter_command(run, role, data, control, count, warmup, rate, params):
+def adapter_command(run, role, data, control, count, warmup, rate, params, out=None):
     cmd = [str(HERE / run.tool / "run.sh"), role, "--dir", str(data), "--control", str(control),
            "--count", str(count), "--payload", str(run.payload), "--rate", str(rate or 1),
            "--warmup", str(warmup), "--reader", run.reader,
@@ -226,8 +229,8 @@ def adapter_command(run, role, data, control, count, warmup, rate, params):
     if run.workload == "SD":
         cmd += ["--sync-every-ms", str(params["sync_every_ms"])]
     if run.tool in JAVA_TOOLS:
-        cmd += ["--jit-warmup", "1000"]
-    return cmd
+        cmd = javaopts.wrap(cmd, run.tool, params["java"], params["quick"], True, out, f"{run.label}-{role}")
+    return cmd + affinity.adapter_options(params.get("affinity"), run.tool, role)
 
 
 def parse_one(path):
@@ -259,9 +262,12 @@ def run_attempt(run, params, out, env, commands):
             return {"skipped": f"predicted {predicted} B of data exceeds 80 % of the {free} B free on {tmp_root} "
                                f"minus 1 GiB; use a larger disk or a shorter duration"}
     timeout = params["duration_s"] + params["warmup_s"] + 300
+    if run.tool in JAVA_TOOLS:
+        timeout += javaopts.WARMUP_ALLOWANCE_S
     started = datetime.datetime.now(datetime.timezone.utc).isoformat()
     with tempfile.TemporaryDirectory(prefix="run-", dir=tmp_root) as tmp, \
-            (out / "children.log").open("a") as error_log:
+            (out / "children.log").open("a") as error_log, \
+            affinity.Keeper(params["affinity"], Path(tmp) / "control") as keeper:
         base = Path(tmp)
         data, control = base / "data", base / "control"
         data.mkdir()
@@ -272,7 +278,7 @@ def run_attempt(run, params, out, env, commands):
         deadline = time.monotonic() + timeout
 
         def spawn(role):
-            cmd = adapter_command(run, role, data, control, count, warmup, rate, params)
+            cmd = adapter_command(run, role, data, control, count, warmup, rate, params, out)
             commands.write(f"{run.label}: {shlex.join(cmd)}\n")
             commands.flush()
             path = base / f"{role}.json"
@@ -281,6 +287,7 @@ def run_attempt(run, params, out, env, commands):
             outputs[role] = path
             proc = subprocess.Popen(cmd, stdout=handle, stderr=error_log, env=env, start_new_session=True)
             children.append(proc)
+            keeper.watch(proc.pid, role)
             return proc
 
         def ready(role):
@@ -299,10 +306,12 @@ def run_attempt(run, params, out, env, commands):
 
         try:
             writer = spawn("writer")
-            ready("writer")
+            if not javaopts.warms_up_before_open(run.tool, params["java"]):
+                ready("writer")
             reader = None
             if SUPPORT[run.tool]["reader"]:
                 reader = spawn("reader")
+                ready("writer")
                 ready("reader")
             elif run.tool in JAVA_TOOLS:
                 raise RuntimeError("Java adapters need a reader")
@@ -313,6 +322,11 @@ def run_attempt(run, params, out, env, commands):
             wait(writer)
             result = {"writer": parse_one(outputs["writer"]),
                       "reader_result": parse_one(outputs["reader"]) if reader is not None else None}
+            result["java"] = javaopts.collect(run.tool, params["java"],
+                                              {"writer": result["writer"], "reader": result["reader_result"]},
+                                              params["quick"], True, True)
+            result["affinity"] = affinity.record(params["affinity"], run.tool, result["writer"], result["reader_result"],
+                                                 keeper)
         finally:
             for proc in children:
                 if proc.poll() is None:
@@ -445,7 +459,7 @@ def parameters(args):
     return {"tools": tools, "workloads": workloads, "payloads": payloads, "tt_readers": tt_readers,
             "duration_s": duration, "warmup_s": warmup, "repeats": repeats, "rates": rates,
             "fractions": [] if rates else fractions, "sync_every_ms": args.sync_every_ms, "quick": quick,
-            "needs_probe": "probe" in workloads}
+            "needs_probe": "probe" in workloads, "java": javaopts.settings(args)}
 
 
 def prepare_output(out, params, resume):
@@ -458,6 +472,9 @@ def prepare_output(out, params, resume):
         if not matrix.exists():
             raise ValueError("OUTDIR has no matrix.json; it was not started by the sustained mode")
         previous = json.loads(matrix.read_text())["parameters"]
+        if "affinity" in params:
+            # Matrices started before pinning existed were unpinned.
+            previous.setdefault("affinity", {"mode": "none", "summary": "affinity: none (--no-pin)"})
         if previous != params:
             raise ValueError(f"OUTDIR was started with different parameters:\n  {previous}\n  now {params}")
         return False
@@ -471,6 +488,7 @@ def main(args, env, build):
     """Entry point from run.py --sustained."""
     import run as short
     params = parameters(args)
+    params["affinity"] = args.affinity
     out = args.outdir.resolve()
     runs = plan(params)
     pending = [r for r in runs if not (out.exists() and finished(r, out))]
@@ -478,6 +496,7 @@ def main(args, env, build):
     print(f"sustained matrix: {len(runs)} runs, {len(runs) - len(pending)} already finished; "
           f"estimated remaining {format_seconds(estimate)}")
     print(f"estimated_seconds={int(estimate)}")
+    print(params["affinity"]["summary"])
     for case, reason in unsupported(params).items():
         print(f"  unsupported: {case}: {reason}")
     if args.dry_run:
@@ -492,10 +511,12 @@ def main(args, env, build):
     scratch = reset_scratch(out)
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     environment = out / ("environment.txt" if first else f"environment-resume-{stamp}.txt")
-    short.environment(out, env, params["quick"], environment.name)
+    short.JAVA.update(params["java"])  # `run` was started as __main__, so this is a second copy of the module.
+    short.environment(out, env, params["quick"], environment.name, params["affinity"])
     (out / "skipped").mkdir(exist_ok=True)
     (out / "runs").mkdir(exist_ok=True)
     build(out, env, [t for t in params["tools"] if t in JAVA_TOOLS])
+    affinity.place_runner(params["affinity"])
     suite_start = time.monotonic()
     counts = execute(runs, params, out, env, args.keep_going)
     total = collect(out)

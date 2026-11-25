@@ -485,6 +485,9 @@ static void surface(const std::string &root) {
     CHECK(!MUST(reader.next(2ms)).has_value());
     CHECK(std::chrono::steady_clock::now() - before < 30s);
     CHECK(MUST(reader.position()) == 19);
+    MUST(reader.seek(3));
+    MUST(reader.seek_to_end());
+    CHECK(MUST(reader.position()) == 19 && !MUST(reader.next()).has_value());
 
     // Durable-only, on the mapped reader: stops at the checkpoint.
     {
@@ -854,6 +857,7 @@ static void move_semantics(const std::string &root) {
     CHECK(!reader.is_open() && other.is_open());
     CHECK_FAILS(reader.next(), tt::Status::invalid_argument);
     CHECK_FAILS(reader.seek(0), tt::Status::invalid_argument);
+    CHECK_FAILS(reader.seek_to_end(), tt::Status::invalid_argument);
     CHECK_FAILS(reader.position(), tt::Status::invalid_argument);
     tt::RecordBatch batch(2, 64);
     CHECK_FAILS(reader.read_batch(batch), tt::Status::invalid_argument);
