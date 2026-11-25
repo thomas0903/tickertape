@@ -183,6 +183,29 @@ single-maintainer repository. Administrators are subject to the checks; force pu
    version (a test fails otherwise); the C++ binding has the release's version (ADR 0036). Dry-running both packages together requires Cargo 1.90+. The release scripts require Python 3.11+; CI
    selects Python 3.12.
 
+### Append path against the previous release (minor and major releases)
+
+Issue #82: a change to how a reader checks the marker made appends slower when a durable-only reader blocks, and no
+check showed it. The micro-benchmark and `tt-latency` with one reader do not exercise that path. Before a minor or major
+release, on one quiet cloud VM with local SSD (`docs/playbooks/run-benchmark.md`, machine rules), build three binaries
+of `tt-sustained` from the previous tag's harness, so that only the library differs: the previous tag as it is, a
+second copy of that binary (the noise floor), and the previous tag with the candidate's `crates/tickertape` copied over
+it (a 1.x library only adds API, so the older harness builds against it). Run them interleaved, at least 10 rounds in rotating order:
+
+```sh
+tt-sustained run --dir <ssd>/tt --out <out> --json --payload 1024 --duration 15s --warmup 3s --cpus 1,2,3,4,5,6 \
+  --rate 100000 --checkpoint-every 1s --checkpoint-mode background --retain-bytes 68719476736 \
+  --readers mapped,safe:wait=default,safe:durable:wait=block
+```
+
+Compare, as medians of the rounds with the range: the writer's `append_latency` p50, p99 and p99.9; each reader's CPU
+fraction and voluntary context switches (`readers[i].cpu`); and the writer's `hot_thread_cpu.system_cpu_s`. A
+difference larger than between the two copies of the previous release, in the same direction in most rounds, needs
+an explanation before the release: a fix, or an entry in the changelog that says what got slower and why. The context
+switches move by orders of magnitude when a reader starts or stops sleeping, so they show such a change even where the
+latency difference is small. Keep the raw output with the other release notes; record numbers in
+`docs/benchmarks.md` only as the playbook says.
+
 ### C ABI at 1.0 (ADR 0028 → Versioning)
 
 For the 1.0 release, and checked again for every later release that ships the C library:
