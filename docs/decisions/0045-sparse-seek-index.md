@@ -1,9 +1,9 @@
 # 0045: A sparse, rebuildable seek index next to sealed segments
 
-- **Status:** proposed (design only, nothing is built; issue #59)
+- **Status:** accepted on 2026-11-25 (design only, nothing is built; issue #59)
 - **Date:** 2026-11-25
-- **Follows up:** [0042](0042-replay-and-recovery-at-scale.md), option 2 (deferred there for 1.0; its decision stands
-  until this record is accepted)
+- **Follows up:** [0042](0042-replay-and-recovery-at-scale.md), option 2 (deferred there for 1.0; that decision
+  stands, this record takes the option up for 1.x)
 
 ## Context
 
@@ -28,7 +28,9 @@ and the type's says that readers never write. Both bind this design.
   which no recovery from that marker changes; also every sealed segment of a directory that has no marker and no
   running writer.
 - A reader uses it only with `ReaderConfig::seek_index(true)` (**off by default** in 1.x). It validates the record it
-  lands on and every record from there, and falls back to today's scan on any doubt. An index never causes an error.
+  lands on and every record from there, and falls back to today's scan on any doubt. No seek fails because of an
+  index. Mapped and durable-only readers use one only for segments the current marker covers, so mapped readers use
+  none in an archive (the safe reader serves those).
 - The writer's open removes the index files of every segment recovery may change, before recovery changes anything,
   best effort: what it cannot remove is still checked by value.
 - The active segment gets nothing.
@@ -82,8 +84,8 @@ segment's bytes alone, so two builders of one version write the same file.
 segment at 1 MiB. With byte blocks, the records skipped between the landing record and the target start in one block
 and end before the target, so a jump **validates less than 64 KiB of skipped records** (at most 1,638 of the smallest,
 40 bytes) at any record size; records above 64 KiB each have an entry. 64 KiB is also the safe reader's chunk, so a
-walk normally needs one or two reads. Finer is slower, not faster, because the whole file is read and checked (Cost
-and benefit).
+walk normally needs one or two reads. Finer is no faster, because the whole file is read and checked (Cost and
+benefit).
 
 **Why `len` and `crc` per entry.** They tie an entry to one record, not to any record with that number: a changed
 history that reuses the number at that offset differs in these 8 bytes unless the frame is the same. They need no
@@ -122,8 +124,9 @@ accepts this segment):
 With `seek_index(true)`, `seek(target)` does this after it has chosen and opened segment `F` as today (header read and
 validated), or kept the one it has open where a forward seek continues from the cursor (ADR 0046, PR #66). Any failure
 below, of any kind (missing file, I/O error, failed check, no memory), means **what the seek does without an index**:
-scan from offset 64, or continue from the cursor where that is the rule, with the cursor and buffer put back. It is
-never returned as an error.
+scan from offset 64, or continue from the cursor where that is the rule, with the cursor put back where it was and the
+read buffer empty (as every seek leaves it: an old buffer can hold records that an in-place repair has since removed).
+It is never returned as an error.
 
 1. **Choose whether to look.** Not for `target == base`, nor in a segment of at most 64 KiB. Where a forward seek may
    start at the cursor (`continues_from_cursor`, ADR 0046, PR #66), only when the estimated distance
@@ -148,15 +151,18 @@ never returned as an error.
    arithmetic is checked.
 5. **Identity, after the index was read** (and after the marker, where step 2 read it): the segment's path names `F`'s
    device and inode.
-6. **Seal.** The 8 bytes of `F` at `seal_offset` are `FF FF FF FF` and `seal_crc(next_seq)`.
+6. **Seal.** The 8 bytes of `F` at `seal_offset` are `FF FF FF FF` and `seal_crc(next_seq)`. Then an `Acquire` fence,
+   as after any `pread` that observes a commit word (ADR 0003): what the writer stored before the seal happens before
+   what follows, also at a position that is no boundary.
 7. **Choose** the entry with the greatest `seq <= target`. If there is none, that is a failure as above.
 8. **Land.**
    - **8a.** Read exactly 8 bytes of `F` at `offset`. They must equal the entry's `len` and `crc`. Nothing has been
      allocated or read for the frame yet.
    - **8b.** Set the cursor to `(offset, seq)`, drop the read buffer, and read that slot once, fresh, through the
      reader's normal slot read, given the expected commit word: the word it observes must equal `len` **before** it
-     allocates or reads a body. It must be a valid record as `format.md` defines (length, bounds, CRC32C over the
-     whole frame, `seq`, `flags`), and its stored CRC must equal `crc`. An empty word fails.
+     allocates or reads a body (a function of its own: `reader.rs` pins `read_slot`'s signature with a compile-time
+     check). It must be a valid record as `format.md` defines (length, bounds, CRC32C over the whole frame, `seq`,
+     `flags`), and its stored CRC must equal `crc`. An empty word fails.
 9. Keep the cursor; set `skip_until = target`. From here nothing is new: the next read validates the landing record
    again and every record after it, and follows seals with the identity checks of today.
 
@@ -302,11 +308,14 @@ The default is off because this changes what `seek` documents. When this is buil
   tickertape writer or index builder modifies them). Such a reader uses an index only for segments before the
   marker's, to which no writer stores; if the marker is damaged later and a recovery changes such a segment in place,
   the existing known limitation applies. With the option off nothing changes.
-- `crash-contract.md`, **C15** (index missing, stale, torn, damaged): T1 to T6, with the tests below; C11's list of
+- `crash-contract.md`, **C15** (index missing, stale, torn, damaged): T1 to T7, with the tests below; C11's list of
   what an open may change before it refuses gains the removal of index files; C14 gains the removal after a segment.
 - `format.md`: a row for `seek-index/` ("Not part of format version 1", as for `readers/`), and the removal as
-  recovery step 2a; the file format above moves to a section outside the version 1 text. `compatibility.md`: next to
-  the `readers/` sentence, and the new items.
+  recovery step 2a; "Readers ignore this file unless `durable_only`" (Checkpoint marker) and "`seek` scans the current
+  chain from the start of a segment, so it only lands on validated positions" (What readers do about repairs) gain the
+  option's exceptions (steps 2 and 8, T7); the file format above moves to a section outside the version 1 text.
+  `compatibility.md`: next to the `readers/` sentence, and the new items.
+- `crash-contract.md`, "Readers after a repair", and `try_next`'s rustdoc: T7's exception.
 - rustdoc of `seek`; `operations.md` (Seek time, running `tickertape index`, archive); `cli.md`; `c-api.md` and the
   binding docs.
 
@@ -318,16 +327,17 @@ readers, retention and the writer, so a symlink there can never lead to another 
 
 **Who may build.** The builder uses `seek-index/` only if, after opening it (new or existing), `fstat` shows that its
 owner is the builder's effective user and that it is not world-writable. It creates it only if its effective user owns
-the journal directory and the journal directory's group is one of its groups: `mkdirat` with the journal directory's
-mode `& 0o777`, then group and the same mode through the descriptor. Set-user-ID, set-group-ID and sticky bits are not
-copied (each index file's group is set explicitly). If that fails it removes the directory it just made (`unlinkat`
-with `AT_REMOVEDIR`), the only case in which tickertape removes it. Otherwise it refuses, with a message saying to
-create the directory with the journal directory's **owner, group and mode** (a directory made by the owner alone can
-have another group, and then 1.0.0's `export --output` fails for the journal's group). If the name exists and is not a
-directory, it refuses and says so. It builds a segment's index only if its effective user owns the segment and the
-file can be given the segment's group; otherwise the segment is `NotPermitted`. Root gets no exception (`sudo -u` the
-owner): changing ownership as root inside a directory another user controls invites races. A group-writable directory
-is accepted, like a group-writable journal.
+the journal directory, the journal directory is not world-writable, and the journal directory's group is one of its
+groups (all checked before creating anything): `mkdirat` with the journal directory's mode `& 0o777`, then group and
+the same mode through the descriptor. Set-user-ID, set-group-ID and sticky bits are not copied (each index file's
+group is set explicitly). If that fails it removes the directory it just made (`unlinkat` with `AT_REMOVEDIR`), the
+only case in which tickertape removes it. Otherwise it refuses, with a message saying to create the directory with the
+journal directory's **owner, group and mode** (a directory made by the owner alone can have another group, and then
+1.0.0's `export --output` fails for the journal's group). If the name exists and is not a directory, it refuses and
+says so. It builds a segment's index only if its effective user owns the segment and the file can be given the
+segment's group; otherwise the segment is `NotPermitted`. Root gets no exception (`sudo -u` the owner): changing
+ownership as root inside a directory another user controls invites races. A group-writable directory is accepted, like
+a group-writable journal.
 
 **One segment:**
 
@@ -341,9 +351,10 @@ is accepted, like a group-writable journal.
      `retention::durable_checkpoint` (one marker sync per slot, `F_FULLFSYNC` on macOS). Eligible:
      `base < marker.segment_base_seq`. No lock; runs beside a live writer.
    - *None* (an archive, a journal never checkpointed): open `writer.lock` without creating it
-     (`O_NONBLOCK | O_NOFOLLOW`); if it exists, take a **shared** `flock` without blocking (so two builders do not
-     refuse each other) and **release it at once**, writing nothing. Busy: exit 1. Eligible: every segment that ends
-     in a valid seal.
+     (`O_NONBLOCK | O_NOFOLLOW`); take a **shared** `flock` without blocking (so two builders do not refuse each
+     other) and **release it at once** with `LOCK_UN` (a forked child may hold a copy of the descriptor), writing
+     nothing. Only `ENOENT` counts as no `writer.lock`; a busy lock, `EACCES`, `ELOOP` (the writer would follow a
+     symlink) or any other error is exit 1. Eligible: every segment that ends in a valid seal.
 4. **Walk.** Open the segment read-only and **keep the descriptor until step 6**, so its inode cannot be reused.
    Validate its header, then every record from offset 64 with `pread` in windows of at most 1 MiB. It must end in a
    valid seal. Any other end: no index for this segment.
@@ -374,7 +385,11 @@ assuming its unlinks work:
   recovery has finished, and the walk reads the result.
 - *No marker.* The probe shows that no writer is open after the fence exists, so any later open lists after it and the
   first case applies. An open that ended before the probe has finished with `S`; one killed in the middle left `S` as
-  the next open finds it, and that open removes the index. Without `writer.lock`, a writer creates it before it lists.
+  the next open finds it, and that open removes the index. Without `writer.lock` (`ENOENT`), a writer creates it
+  before it lists.
+
+- *Two builders.* No builder renames over `{base}.idx` of a segment in the domain during pass 2. Its fence would have
+  existed through pass 1 and been removed, or been created after pass 1 began, and then `S` is not eligible.
 
 No later marker check is needed, and one could not replace the fence: a marker can be damaged, recovered from and
 valid again past `S` between two looks, with `S` repaired in place and its inode unchanged. The argument holds for
@@ -388,18 +403,9 @@ read-only media, and a slow reader must not create files in a journal it only re
 
 A writer option (`WriterConfig::seek_index`), its helper thread, metrics and binding options are **not** in the first
 release: the thread carries most of the performance and shutdown risk and nothing about it is measured yet. A timer
-running `tickertape index` gives the same files, later. **It comes after the checkpoint marker as a jump point** (The
-active segment), which serves the more common seek.
-
-For when it comes: no list of sealed bases and no work at a roll. On each checkpoint wake the helper lists the
-segments in `[watermark, marker base)` itself, builds them and moves the watermark (initially the marker base at
-open). That removes the lock per roll, the drop counter and the push from recovery. It must use the same build steps,
-get the marker base only after the marker barrier, be joined on drop before the lock is released, be left alone in a
-forked child, never report an error to an append or checkpoint, and first show with `tt-sustained` (both payloads,
-ext4 and xfs) that append latency and throughput are within noise. Not at the seal: until a marker passes a segment, a
-crash may replace it or zero it in place. Not on the checkpoint thread: a build (tens of milliseconds warm) would
-delay the next marker (ADR 0044). Not from `append`: the hot path gains a branch and state, and the index would vouch
-for what the writer remembers rather than for the file's bytes.
+running `tickertape index` gives the same files, later. (When it comes: a watermark the helper moves from marker base
+to marker base, not a list of sealed bases.) **It comes after the checkpoint marker as a jump point** (The active
+segment), which serves the more common seek.
 
 ## Life cycle
 
@@ -464,27 +470,12 @@ the writer. (`seek_to_end`, ADR 0046, already starts at the marker.)
 | C, C++ and Java bindings, Python wheel | Call the Rust core; no listing of their own in their sources |
 | `python/tickertape_reader.py` | `iterdir()`, then requires 25 characters, `.tape`, 20 digits; others are skipped without opening |
 
-**By test.** Built from the `v1.0.0` tag (`git archive`), plus the published `tickertape==1.0.0` and
-`tickertape-cli==1.0.0` wheels from PyPI and a C program against the 1.0.0 library. For each operation the same
-journal (13 segments of 64 KiB, records of 0 to 1,499 bytes, a checkpoint before the head) was run with and without
-planted files, and exit status, output, recovery report, segment list, quarantine, archive destination and every
-record read afterwards were compared; the planted files' hashes and modification times were compared before and after.
-Only clocks, free space and timestamps in quarantine names were masked. Two layouts: `seek-index/` (an index per
-segment, an orphan, a temporary file, segment-like names `….tape` and `….tape.tmp` inside it, a subdirectory, a
-dangling symlink, a FIFO), and, to learn whether it would also be safe, files beside the segments (`….tape.idx`,
-`….idx`, `….tape.idx.tmp`, hidden temporaries).
-
-- Reads: `tail` (four forms), `inspect`, `verify`, `stats`, `export`, `status` (JSON and Prometheus),
-  `archive --dry-run`; safe, mapped and durable-only library readers with five seeks each; the Python decoder; the
-  PyPI wheel, PyPI CLI and C library (macOS).
-- Writes: open, append, roll and checkpoint; `SIGKILL` then recovery; a damaged tail under `Quarantine` and `Fail`;
-  the marker deleted; zeroed; deleted with a damaged middle segment (seven files quarantined; `Fail` refuses); a
-  missing middle segment; retention by deletion and by move; `archive --delete` and `--to`.
-- A live 1.0.0 writer with background checkpoints and four followers while a thread created, renamed and removed files
-  in both places, then 22 opens and seeks.
-- Output files: `export --output` (JSONL, Parquet) and `status --output` (JSON, Prometheus), to a new, an empty and an
-  earlier output file, in both layouts; then 150 runs of each of two while a thread renamed and removed index files,
-  and 150 while one removed and recreated `seek-index/`; then with the directory and with an index file at mode 000.
+**By test.** Built from the `v1.0.0` tag, plus the published PyPI wheels `tickertape==1.0.0` and
+`tickertape-cli==1.0.0` and a C program against the 1.0.0 library. Each operation (reads, writes, recovery, retention,
+archive, output files; listed in pull request #64) ran on the same journal with and without planted files, in two
+layouts (`seek-index/`, and files beside the segments). Exit status, output, recovery report, segment list,
+quarantine, archive destination and every record read afterwards were compared, and the planted files' hashes and
+modification times before and after. Only clocks, free space and timestamps in quarantine names were masked.
 
 Result with files that are present, readable and at most created, renamed and removed: **macOS 27 (APFS, arm64): 62 +
 24 comparisons, 0 differences. Linux 7.2 (OrbStack VM, btrfs, aarch64): 56 + 24 comparisons, 0 differences** (without
@@ -530,11 +521,8 @@ table above with many).
 
 | Payload | Spacing | Index size | 1.0.0: last record, Mac / VM | Index, median (p99), Mac | Index, median (p99), VM | Build, Mac / VM |
 |---|---|---|---|---|---|---|
-| 64 B | 4 KiB | 786 KB (0.59 %) | 25.8 / 23.7 ms | 69 (134) µs | 88 (108) µs | 23 / 32 ms |
-| 64 B | 16 KiB | 197 KB (0.15 %) | | 29 (36) µs | 27 (37) µs | 22 / 32 ms |
+| 64 B | 16 KiB | 197 KB (0.15 %) | 25.8 / 23.7 ms | 29 (36) µs | 27 (37) µs | 22 / 32 ms |
 | 64 B | **64 KiB** | **49 KB (0.04 %)** | | **29 (43) µs** | **17 (25) µs** | **21 / 31 ms** |
-| 64 B | 256 KiB | 12 KB | | 48 (329) µs | 37 (69) µs | 21 / 32 ms |
-| 64 B | 1 MiB | 3 KB | | 113 (398) µs | 127 (247) µs | 27 / 31 ms |
 | 1 KiB | 64 KiB | 49 KB | 14.0 / 11.3 ms | 22 (39) µs | 13 (20) µs | 15 / 18 ms |
 | 16 KiB | 64 KiB | 49 KB | 13.6 / 11.5 ms | 22 (31) µs | 13 (21) µs | 12 / 16 ms |
 | 1 MiB | any | 3 KB | 11.9 / 9.6 ms | 106 (127) µs | 117 (155) µs | 12 / 16 ms |
@@ -555,9 +543,7 @@ table above with many).
 1. **This design.**
 2. **Nothing.** Smaller segments already bound the cost (`operations.md`), at more files and rolls. Rejected: the
    owner wants cheap seeks at the default size, and the index is opt-in.
-3. **An in-memory index built on a reader's first scan of a segment.** No file, no trust question. Every process still
-   pays the full first scan of each segment it enters, which is the cost complained about. Rejected as the answer;
-   compatible with this one if repeated seeks by one reader ever matter.
+3. **An in-memory index from a reader's first scan.** Every process still pays the first scan. Rejected.
 4. **An index in the segment's footer.** Travels with the segment and is retained, moved and copied with it. But the
    trailer is 8 bytes and "every byte that holds no record or seal is zero": recovery, `nonzero_end`, retention's
    `seal_at_end` and every released reader rely on that, so it is format version 2. Rejected.
@@ -565,15 +551,14 @@ table above with many).
    listing for every version. Rejected.
 6. **One index for the journal.** Needs rewriting or compaction at retention and locking between builders, and one
    damaged byte loses all of it. Rejected.
-7. **Entry every N records** (256, as Chronicle). Unbounded bytes per seek at large records. Rejected.
-8. **Skip over commit words without CRC** (no file). Still touches every record's cache line or page (all of a cold
-   segment) and gives up the same validation. Rejected.
+7. **Entry every N records** (256, as Chronicle). Unbounded bytes per seek. Rejected.
+8. **Skip over commit words without CRC.** Still touches every record. Rejected.
 9. **On by default, or used without opting in.** Changes `seek`'s documented meaning in 1.x. Rejected.
 10. **Readers build lazily.** Rejected ("Building").
-11. **Synced index files.** A sync per segment for data that can be rebuilt; a torn file is detected. Rejected.
+11. **Synced index files.** A sync for data that can be rebuilt. Rejected.
 12. **A marker required of visible readers too.** Would need no trust in T4 for them, but makes the index useless in
     archives, which have no marker. Rejected.
-13. **Mapped index.** `SIGBUS` on truncation for 49 KB of I/O. Rejected.
+13. **Mapped index.** `SIGBUS` for 49 KB of I/O. Rejected.
 14. **A cursor the caller saves.** `Reader` hands out a token (segment header, offset, `seq`, `len`, `crc`) that a
     later process gives back, revalidated as in steps 6 to 9. No file, no builder, and it serves the restart near the
     head. But it reaches only positions a reader has already been at, not any sequence number, and needs a public
@@ -587,33 +572,31 @@ table above with many).
 
 ## Public surface
 
-All additive (ADR 0043); C ABI version 1 and the existing baseline unchanged.
+Additive (ADR 0043); C ABI version 1.
 
-- **Rust.** `ReaderConfig::seek_index(bool)`, public field, default `false`. No public way to see whether a seek used
-  an index (a `#[doc(hidden)]` `Reader::seek_used_index()` for the workspace's tests).
-  `RecoveryReport::seek_indexes_removed` and `::seek_index_errors` (`u64`). Module `seek_index`: `DIR_NAME`;
-  `build(dir, rebuild: bool) -> Result<BuildReport>`; `check(dir) -> Result<CheckReport>`;
-  `remove(dir) -> Result<u64>`. Reports are NE; per segment: `base_seq` and an NE state (`Built`, `Valid`, `Missing`,
-  `Ignored`, `Wrong`, `NotNeeded`, `NotSealed`, `NotCovered`, `NotPermitted`, `Vanished`) with a reason string. The
-  byte codec stays crate-private (`#[doc(hidden)]` for the fuzz target).
-- **CLI.** `tickertape index DIR [--rebuild | --check | --remove] [--json]` (`schema_version` 1). `--check` scans each
-  segment, changes nothing, and compares every entry with the chain, whoever runs it: ownership and mode do not decide
-  the state; a file valid in content that readers ignore because of them is flagged (`ignored_by_readers`, with the
-  reason). `Ignored`: a reader would not use the content (reason given). `Wrong`: it would, but an entry is not on the
-  chain; exit 2. I/O errors and `NotPermitted` exit 1; otherwise 0. `--remove` deletes recognised names and leaves the
-  directory. `tail`, `export` and `stats` gain `--seek-index`, for their `--from`. `export --output` no longer
-  descends into `seek-index/` in its alias walk: it holds no journal data. No other command changes.
-- **C:** `tickertape_reader_options_set_seek_index`, shaped like `…_set_durable_only`. **C++:** the same on its reader
-  options. **Python:** keyword `seek_index=False` on `Reader`. **Java:** `seekIndex(boolean)` on the reader options.
-  Building and the two report fields stay in Rust and the CLI for now. The pure-Python decoder does not use the index.
-- **Metrics, `WriterConfig`:** nothing in the first release.
+- **Rust.** `ReaderConfig::seek_index(bool)`, default `false`. `RecoveryReport::seek_indexes_removed` and
+  `::seek_index_errors` (`u64`). Module `seek_index`: `DIR_NAME`; `build(dir, rebuild: bool) -> Result<BuildReport>`;
+  `check(dir) -> Result<CheckReport>`; `remove(dir) -> Result<u64>`. Reports hold, per segment, `base_seq`, a state
+  (`Built`, `Valid`, `Missing`, `Ignored`, `Wrong`, `NotNeeded`, `NotSealed`, `NotCovered`, `NotPermitted`,
+  `Vanished`) and a reason. `#[doc(hidden)]`, for the workspace's tests and fuzz target: `Reader::seek_used_index()`
+  and the byte codec.
+- **CLI.** `tickertape index DIR [--rebuild | --check | --remove] [--json]`. `--check` scans each segment, changes
+  nothing, and compares every entry with the chain, whoever runs it: ownership and mode do not decide the state; a
+  file valid in content that readers ignore because of them is flagged (`ignored_by_readers`, with the reason).
+  `Ignored`: a reader would not use the content. `Wrong`: it would, but an entry is not on the chain; exit 2. I/O
+  errors and `NotPermitted` exit 1; otherwise 0. `--remove` deletes recognised names and leaves the directory. `tail`,
+  `export` and `stats` gain `--seek-index`, for their `--from`. `export --output` no longer descends into
+  `seek-index/` in its alias walk: it holds no journal data.
+- **Bindings.** C `tickertape_reader_options_set_seek_index`, C++ the same on its reader options, Python
+  `seek_index=False` on `Reader`, Java `seekIndex(boolean)` on the reader options. Nothing else; the pure-Python
+  decoder does not use the index.
 
 ## Test plan
 
 Names are suggestions; `tests/seek_index.rs` unless stated. New fault points: `SeekIndexFence` (after step 2),
-`SeekIndexBeforeRename`, `SeekIndexAfterRename` (builder), `SeekIndexListed` (writer open, after each pass of 2a),
-`SeekIndexRemoved` (after 2a), `ReaderSeekIndexLoaded` (after the reader's step 4), `ReaderSeekIndexMarker` (after its
-step 2).
+`SeekIndexEligible` (between steps 3 and 4), `SeekIndexBeforeRename`, `SeekIndexAfterRename` (builder),
+`SeekIndexListed` (writer open, after each pass of 2a), `SeekIndexRemoved` (after 2a), `ReaderSeekIndexLoaded` (after
+the reader's step 4), `ReaderSeekIndexMarker` (after its step 2).
 
 1. **Codec:** the test vector, both ways; every boundary of step 4; `spacing(Z)` at 64 KiB, 4 GiB, 4 GiB + 64 KiB,
    2^40; property test that the entries are exactly the first record of each block for random record sizes, and that
@@ -623,8 +606,8 @@ step 2).
    returns exactly the records, positions and errors of one without, for every target (block edges, first, last, past
    the end, next segment), {safe, mapped} × {visible, durable-only}, and **for arbitrary bytes as the index file**,
    including valid files with each field mutated and the CRC recomputed.
-3. **Bound:** with a counting view, a jump reads less than one spacing plus the target's frame, at 0 B, 64 B, 1 KiB,
-   100 KiB and maximal records.
+3. **Bound:** with a counting view, a jump validates less than one spacing plus the target's frame, at 0 B, 64 B, 1
+   KiB, 100 KiB and maximal records.
 4. **8a before 8b, and `pread`:** no load through the mapping before 8b; a mapped reader uses no index without a
    covering marker, with an in-process writer appending to the segment a wrong index names (Miri or loom model of the
    two). Then: a resealed segment with the same seal offset and `next_seq`, an indexed offset inside a payload whose
@@ -640,7 +623,9 @@ step 2).
    current one: tail replaced, zeroed in place, quarantined and created anew, header restored; then a new history with
    equal and with different record sizes, sealed at the same and at another offset. Never a removed record; every
    result equals a scan's. The same with a reader that keeps the old `F` open while an index is built from the
-   repaired file.
+   repaired file. **Fallback:** a failure at each reader step, a missing file included, for a forward seek from a
+   cursor the marker covers with a stale buffer across an in-place repair (cursor 100, marker 150, record 200
+   buffered, removed in place and appended anew, `seek(180)`): the new record 200 is returned.
 7. **Removal (T4):** marker lost, older slot current, both with damage below the old marker; `Quarantine` and `Fail`;
    kill after 2a, during the repair, before the barrier; a reader paused at `ReaderSeekIndexLoaded` across each
    repair; `{base}.idx2` is removed too, `foo.idx-tmp` and a user's own names are not; a dangling marker leaves every
@@ -653,23 +638,25 @@ step 2).
 9. **Forged (documents T6):** a payload embedding a frame for its own sequence number and an index pointing at it:
    returned with the option on, never with it off; `verify` clean; `--check` reports `Wrong`.
 10. **T7:** each of its cases, for safe, mapped, visible and durable-only readers, against a reader that scanned to
-    the same place before the damage.
+    the same place before the damage; durable-only and mapped readers must be stopped by step 2.
 11. **Damage:** a damaged record and a zeroed commit word before the landing record: found without the option, by
     `verify` and by replay; not by the jump. Damaged landing or target record: same result as the scan.
-12. **Builder and fence:** for every order of {fence, marker read, walk, rename, identity check} against {marker read,
-    pass 1, pass 2, repair, append, roll, checkpoint} at the fault points, with the marker damaged, recovered and
-    valid again past the segment (in place and by replacement): no index of the old history survives, and at most
-    three restarts; a rename inside a listing (a listing stub that returns neither name); an exhaustive model of the
-    two parties; `n` taken (`EEXIST`); step 6 does not unlink another builder's file. Marker read before its barrier,
-    then the older slot current (the sync is asked for before the walk, `RetentionMarkerSync` pattern). Inode reuse
-    after the segment is removed during a walk. Two commands at once; kill at each fault point; `ENOSPC`; read-only
-    directory; retention between walk and rename.
-13. **No marker:** with and without `writer.lock`, and a FIFO or symlink of that name; two builders at once; a live
-    writer (exit 1, lock file unchanged); a writer restart during a long run succeeds.
+12. **Builder and fence:** for every order of {fence, marker read, start of the walk, walk, rename, identity check}
+    against {marker read, pass 1, pass 2, repair, append, roll, checkpoint} at the fault points, with the marker
+    damaged, recovered and valid again past the segment (in place and by replacement): no index of the old history
+    survives, and at most three restarts; a rename inside a listing (a listing stub that returns neither name); an
+    exhaustive model of the two parties; `n` taken (`EEXIST`); step 6 does not unlink another builder's file. Marker
+    read before its barrier, then the older slot current (the sync is asked for before the walk, `RetentionMarkerSync`
+    pattern). Inode reuse after the segment is removed during a walk. Two commands at once; kill at each fault point;
+    `ENOSPC`; read-only directory; retention between walk and rename.
+13. **No marker:** with and without `writer.lock`, and a FIFO, a symlink or an unreadable file of that name (exit 1);
+    a child forked during the probe; two builders at once; a live writer (exit 1, lock file unchanged); a writer
+    restart during a long run succeeds.
 14. **Permissions:** umask 077 and 002; 0750 journal with a group that is not the builder's primary group, with and
     without setgid; builder that is not the owner, and root: refused, nothing created; an existing `seek-index/` that
-    is another user's or world-writable: refused; set-group-ID and sticky journal directories; index files made
-    group-writable: ignored, flagged by `--check`, rebuilt; readers of the same group can use the result.
+    is another user's or world-writable: refused; a world-writable journal directory: refused, nothing created;
+    set-group-ID and sticky journal directories; index files made group-writable: ignored, flagged by `--check`,
+    rebuilt; readers of the same group can use the result.
 15. **Retention and archive:** index gone after the segment; unlink failure not reported; orphans swept; `index DEST`
     on an archive; `reader_retention_stress` and `soak` with the option on, `tickertape index` in a loop, half the
     readers without, results compared.
@@ -689,11 +676,6 @@ exists.
 
 ## Open decisions
 
-Settled after two reviews (Claude, Gemini): the reader default (off in 1.x), T6 with the contract wording, best-effort
-removal, no marker needed for safe visible readers, no backfill at open, no index in `MoveTo`, the subdirectory, no
-building as root, and the last-entry check of the default run. Still open:
-
-1. **Mapped readers need a covering marker** (step 2), so they use no index in an archive. Recommended: yes. While
-   the marker stands, it removes every case in which a wrong index could steer mapped loads onto bytes a writer stores;
-   the safe reader serves archives.
-2. **`seek-index` is not reserved as a beacon name.** Recommended: leave it (compatibility).
+None remain after the council review (recorded in pull request #64). The last two settled: mapped readers need a
+covering marker, which while it stands removes every case in which a wrong index could steer mapped loads onto bytes a
+writer stores; and `seek-index` is not reserved as a reader-beacon name (compatibility with 1.0).
