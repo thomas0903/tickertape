@@ -106,6 +106,9 @@ pub struct WriterConfig {
     /// write-back helpers (`tickertape-prefault`, `tickertape-writeback`) and the spare-segment thread
     /// (`tickertape-spare`). See [`HelperCpus`]. Default: [`HelperCpus::Process`].
     pub helper_cpus: HelperCpus,
+    /// Which latency histograms the writer keeps of its own calls ([`Writer::latency`](crate::Writer::latency), ADR
+    /// 0047). See [`LatencyMode`]. From 1.1. Default: [`LatencyMode::Off`].
+    pub latency: LatencyMode,
     /// Optional retention policy and action, run after open and successful checkpoints. Default: none.
     pub retention: Option<(crate::retention::Policy, crate::retention::Action)>,
 }
@@ -167,6 +170,41 @@ impl WriterConfig {
         self.helper_cpus = cpus;
         self
     }
+
+    /// Sets which latency histograms the writer keeps (see [`LatencyMode`]; from 1.1).
+    pub fn latency(mut self, mode: LatencyMode) -> Self {
+        self.latency = mode;
+        self
+    }
+}
+
+/// Which latency histograms a writer keeps of its own calls ([`WriterConfig::latency`], ADR 0047). From 1.1.
+///
+/// The histograms are read through [`Writer::latency`](crate::Writer::latency), in the writer's process only.
+/// [`latency::WriterLatency`](crate::latency::WriterLatency) says what each one measures and what it is not.
+///
+/// Each histogram takes about 30 KB, allocated and written by [`Writer::open`](crate::Writer::open). Recording does not
+/// allocate, lock or fail, has no effect on what is committed or durable, and writes nothing to the journal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum LatencyMode {
+    /// None. [`Writer::latency`](crate::Writer::latency) is `None`, and nothing reads a clock for it. The default.
+    #[default]
+    Off,
+    /// Rolls and checkpoints ([`roll`](crate::latency::WriterLatency::roll),
+    /// [`time_to_durable`](crate::latency::WriterLatency::time_to_durable)). An append that does not roll does the same
+    /// work as with [`LatencyMode::Off`].
+    RollsAndCheckpoints,
+    /// Also every append and every batch ([`append`](crate::latency::WriterLatency::append),
+    /// [`batch`](crate::latency::WriterLatency::batch)), without sampling: two reads of the monotonic clock and one
+    /// histogram update per call, which can cost as much as a small append itself (`docs/operations.md` has the measured
+    /// cost).
+    ///
+    /// **Linux:** do not use this where the clock source is not one the vDSO reads: each clock read is then a system
+    /// call. `/sys/devices/system/clocksource/clocksource0/current_clocksource` names it; `tsc`, `kvm-clock`,
+    /// `hyperv_clocksource_tsc_page` and `arch_sys_counter` are read without one, `hpet` and `acpi_pm` are not. The
+    /// library does not check it. macOS reads the clock without a system call.
+    All,
 }
 
 /// Where the writer's helper threads run ([`WriterConfig::helper_cpus`]).
@@ -209,6 +247,7 @@ impl Default for WriterConfig {
             early_writeback: true,
             spare_segment: cfg!(target_vendor = "apple"),
             helper_cpus: HelperCpus::default(),
+            latency: LatencyMode::default(),
             retention: None,
         }
     }

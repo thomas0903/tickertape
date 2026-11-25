@@ -60,3 +60,29 @@ fn snapshots_cover_what_they_count() {
     // The model explored snapshots of nothing, of one and two values, and of all three.
     assert_eq!(partial.load(std::sync::atomic::Ordering::Relaxed), 0b1111);
 }
+
+/// Two threads record into one histogram ([`Histogram::record_shared`]), one of which takes a snapshot in between: no
+/// value is lost, and the snapshot covers what it counts. Values of one bucket, so that the updates of every counter
+/// collide.
+#[test]
+fn shared_recording_loses_nothing() {
+    let counts = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let seen = counts.clone();
+    loom::model(move || {
+        let histogram = Arc::new(Histogram::with_buckets(2));
+        let other = {
+            let histogram = histogram.clone();
+            thread::spawn(move || histogram.record_shared(1))
+        };
+        histogram.record_shared(1);
+        let counted = check(&histogram.snapshot());
+        seen.fetch_or(1 << counted, std::sync::atomic::Ordering::Relaxed);
+        other.join().unwrap();
+        let last = histogram.snapshot();
+        assert_eq!(check(&last), 2);
+        assert_eq!(last.sum(), Some(Duration::from_nanos(2)));
+        assert_eq!(last.min(), Some(Duration::from_nanos(1)));
+        assert_eq!(last.max(), Some(Duration::from_nanos(1)));
+    });
+    assert_eq!(counts.load(std::sync::atomic::Ordering::Relaxed), 0b110);
+}

@@ -34,8 +34,9 @@ fn bounds(i: usize) -> (u64, u64) {
     (low, low | ((1 << shift) - 1))
 }
 
-/// The counters. One thread calls [`Histogram::record`] (the caller's exclusive borrow of the recorder sees to it);
-/// any thread calls [`Histogram::snapshot`].
+/// The counters. Either one thread calls [`Histogram::record`] (the caller's exclusive borrow of the recorder sees to
+/// it), or any number call [`Histogram::record_shared`], never both on one histogram; any thread calls
+/// [`Histogram::snapshot`].
 pub(super) struct Histogram {
     /// `u64::MAX` until the first value.
     min: AtomicU64,
@@ -88,6 +89,27 @@ impl Histogram {
         self.sum.store(sum, Ordering::Relaxed);
         let count = bucket.load(Ordering::Relaxed).wrapping_add(1);
         bucket.store(count, Ordering::Release);
+    }
+
+    /// As [`Histogram::record`], for a histogram that several threads record into: every update is one atomic operation,
+    /// in the same order, so a snapshot sees what `record` promises it.
+    pub(super) fn record_shared(&self, value: u64) {
+        let Some(bucket) = self.buckets.get(index(value)) else {
+            return; // `index` is below `BUCKETS`.
+        };
+        self.min.fetch_min(value, Ordering::Relaxed);
+        self.max.fetch_max(value, Ordering::Relaxed);
+        // Not `fetch_add`, which wraps: the sum saturates.
+        let mut sum = self.sum.load(Ordering::Relaxed);
+        while let Err(now) = self.sum.compare_exchange_weak(
+            sum,
+            sum.saturating_add(value),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            sum = now;
+        }
+        bucket.fetch_add(1, Ordering::Release);
     }
 
     /// Copies every bucket, then the sum and the extremes.

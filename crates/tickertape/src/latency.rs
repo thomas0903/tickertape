@@ -1,8 +1,9 @@
-//! Latency histograms: a [`Recorder`] for durations, and [`RecordAge`] for the age of the records a reader returns
-//! (ADR 0047). From version 1.1.
+//! Latency histograms: a [`Recorder`] for durations, [`RecordAge`] for the age of the records a reader returns, and
+//! [`WriterLatency`] for what a writer records about its own calls (ADR 0047). From version 1.1.
 //!
-//! Nothing here runs unless the application creates it: the writer and the readers record nothing by themselves. There
-//! is no thread, no global state and nothing is written to the journal.
+//! Nothing here runs unless the application creates it or turns it on
+//! ([`WriterConfig::latency`](crate::WriterConfig::latency), off by default): the readers record nothing by themselves.
+//! There is no thread, no global state and nothing is written to the journal.
 //!
 //! **One thread records, any thread reads.** [`Recorder::record`] takes `&mut self`; [`Recorder::view`] gives a
 //! [`View`] that any thread of the process can keep and take a [`Snapshot`] from, without a lock and without the
@@ -45,9 +46,12 @@ mod age;
 mod histogram;
 #[cfg(all(test, loom))]
 mod protocol_model;
+mod writer;
 
 pub use age::{RecordAge, RecordAgeSnapshot, RecordAgeView};
 pub use histogram::{Bucket, Snapshot};
+pub use writer::WriterLatency;
+pub(crate) use writer::{Durable, WriterRecorders};
 
 use histogram::Histogram;
 use std::fmt;
@@ -73,7 +77,7 @@ impl Recorder {
     /// Records one duration. More than `u64::MAX` nanoseconds (about 584 years) counts as `u64::MAX`.
     #[inline]
     pub fn record(&mut self, value: Duration) {
-        self.record_ns(u64::try_from(value.as_nanos()).unwrap_or(u64::MAX));
+        self.record_ns(nanos(value));
     }
 
     /// Records one duration in nanoseconds.
@@ -95,6 +99,12 @@ impl fmt::Debug for Recorder {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Recorder").finish_non_exhaustive()
     }
+}
+
+/// A duration as the histograms count it.
+#[inline]
+fn nanos(value: Duration) -> u64 {
+    u64::try_from(value.as_nanos()).unwrap_or(u64::MAX)
 }
 
 /// A handle to read a [`Recorder`]'s histogram while it is being recorded, from any thread of the process.

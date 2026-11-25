@@ -18,6 +18,7 @@ use crate::config::{RecoveryPolicy, WriterConfig};
 use crate::error::{CorruptReason, Error, Result};
 use crate::format::{self, CheckpointSlot, RecordHeader, ScanEnd, SegmentHeader, SegmentView};
 use crate::journal::{self, CHECKPOINT_FILE, LOCK_FILE, QUARANTINE_DIR};
+use crate::latency::{Recorder, WriterLatency, WriterRecorders};
 use crate::mmap::{self, MapRw};
 use crate::prefault::{Prefaulter, Spare, Spares, Waited};
 use crate::record::NewRecord;
@@ -101,6 +102,10 @@ pub struct Writer {
     checkpointed: Option<CheckpointSlot>,
     /// When this writer's last successful checkpoint finished.
     last_checkpoint_at: Option<std::time::Instant>,
+    /// Records appends, with `LatencyMode::All` (ADR 0047). The one thing of the histograms that the append path looks at.
+    append_latency: Option<Recorder>,
+    /// The other histograms, and the views of all of them, unless `LatencyMode::Off`.
+    latency: Option<Box<WriterRecorders>>,
 }
 
 /// An open, mapped segment.
@@ -225,6 +230,7 @@ impl Writer {
             && cfg!(any(target_vendor = "apple", target_os = "linux")))
         .then(|| Spares::start(&root, config.segment_size, config.helper_cpus.clone()))
         .flatten();
+        let (append_latency, latency) = WriterRecorders::new(config.latency);
         let ctx = Arc::new(Context {
             dir: root.clone(),
             marker: Mutex::new(Marker {
@@ -236,6 +242,7 @@ impl Writer {
             writeback_failed: std::sync::atomic::AtomicBool::new(false),
             notify: notify.as_ref().map(mmap::Notify::publisher),
             retention_sizes: Mutex::default(),
+            durable: latency.as_ref().map(|latency| latency.durable()),
         });
         // Linux only (`WriteBack::start` returns `None` elsewhere); `prefault(false)` means no helper threads.
         let writeback = (config.early_writeback && config.prefault)
@@ -277,6 +284,8 @@ impl Writer {
             retention_failures: 0,
             checkpointed: checkpoint,
             last_checkpoint_at: None,
+            append_latency,
+            latency,
         };
         writer.run_retention();
         Ok(writer)
@@ -393,8 +402,31 @@ impl Writer {
     where
         F: FnOnce(&mut [u8]) -> std::result::Result<(), E>,
     {
+        if self.append_latency.is_some() {
+            return self.try_append_timed(record, payload_len, fill);
+        }
         // `write_record` publishes the wake-up right after the commit, before its helper work.
         self.write_record::<_, _, true>(record, payload_len, fill)
+    }
+
+    /// [`Writer::try_append_with`] with `LatencyMode::All`: times the call if it appends the record. Out of line, so that
+    /// the append path without it stays as it is, but for the test that leads here.
+    #[inline(never)]
+    fn try_append_timed<F, E>(
+        &mut self,
+        record: &NewRecord<'_>,
+        payload_len: usize,
+        fill: F,
+    ) -> Result<std::result::Result<u64, E>>
+    where
+        F: FnOnce(&mut [u8]) -> std::result::Result<(), E>,
+    {
+        let started = Instant::now();
+        let appended = self.write_record::<_, _, true>(record, payload_len, fill);
+        if let (Ok(Ok(_)), Some(recorder)) = (&appended, &mut self.append_latency) {
+            recorder.record(started.elapsed());
+        }
+        appended
     }
 
     /// Appends `records` in order, as consecutive calls to [`Writer::append`] would, and returns the range of
@@ -426,6 +458,36 @@ impl Writer {
     /// next one) and the records after it are not, and the iterator is not advanced past the failing record. Blocked
     /// readers are woken for the records that were appended.
     pub fn append_batch<'a, I>(&mut self, records: I) -> std::result::Result<Range<u64>, BatchError>
+    where
+        I: IntoIterator<Item = NewRecord<'a>>,
+    {
+        if self.append_latency.is_some() {
+            return self.append_batch_timed(records);
+        }
+        self.write_batch(records)
+    }
+
+    /// [`Writer::append_batch`] with `LatencyMode::All`: times the call if it appends at least one record and succeeds.
+    #[inline(never)]
+    fn append_batch_timed<'a, I>(
+        &mut self,
+        records: I,
+    ) -> std::result::Result<Range<u64>, BatchError>
+    where
+        I: IntoIterator<Item = NewRecord<'a>>,
+    {
+        let started = Instant::now();
+        let appended = self.write_batch(records);
+        if let (Ok(seqs), Some(latency)) = (&appended, &mut self.latency) {
+            if !seqs.is_empty() {
+                latency.batch(started);
+            }
+        }
+        appended
+    }
+
+    #[inline(always)]
+    fn write_batch<'a, I>(&mut self, records: I) -> std::result::Result<Range<u64>, BatchError>
     where
         I: IntoIterator<Item = NewRecord<'a>>,
     {
@@ -508,7 +570,7 @@ impl Writer {
                     max: max.min(format::max_payload_len(self.active.size)) as usize,
                 });
             }
-            self.roll()?;
+            self.roll_measured()?;
         }
 
         let seq = self.next_seq;
@@ -640,11 +702,12 @@ impl Writer {
     /// [`WriterConfig::early_writeback`](crate::WriterConfig::early_writeback)) failed and no call has returned its
     /// error yet, this returns that error (and the writer is poisoned).
     pub fn checkpoint(&mut self) -> Result<()> {
+        let requested_at = self.request_time();
         self.finish_background()?;
         if self.poisoned {
             return Err(Error::DurabilityLost);
         }
-        let result = self.checkpoint_inner();
+        let result = self.checkpoint_inner(requested_at);
         if result.is_err() {
             self.poisoned = true;
         } else {
@@ -653,16 +716,23 @@ impl Writer {
         result
     }
 
-    fn checkpoint_inner(&mut self) -> Result<()> {
+    /// Now, if checkpoints are timed.
+    fn request_time(&self) -> Option<Instant> {
+        self.latency.as_ref().map(|_| Instant::now())
+    }
+
+    fn checkpoint_inner(&mut self, requested_at: Option<Instant>) -> Result<()> {
         if self.generation >= u64::MAX - 1 {
             return Err(Error::SequenceExhausted);
         }
         self.generation += 1;
-        let job = self.take_job(self.generation);
+        let job = self.take_job(self.generation, requested_at);
         match checkpoint::run(&job, &self.ctx, On::Writer) {
             Ok(slot) => {
                 self.checkpointed = Some(slot);
-                self.last_checkpoint_at = Some(Instant::now());
+                let finished = Instant::now();
+                self.last_checkpoint_at = Some(finished);
+                self.ctx.record_durable(requested_at, finished);
                 Ok(())
             }
             Err(e) => {
@@ -674,7 +744,7 @@ impl Writer {
 
     /// Hands what is dirty now to a checkpoint with `generation` whose marker names the current position, and starts
     /// a new dirty list.
-    fn take_job(&mut self, generation: u64) -> Job {
+    fn take_job(&mut self, generation: u64, requested_at: Option<Instant>) -> Job {
         let mut segments = std::mem::take(&mut self.dirty);
         segments.push(DirtySegment::written(
             Arc::clone(&self.active.file),
@@ -693,6 +763,7 @@ impl Writer {
             },
             segments,
             dirs: std::mem::take(&mut self.dirty_dirs),
+            requested_at,
         }
     }
 
@@ -741,6 +812,7 @@ impl Writer {
     ///   poisoned.
     /// - [`Error::SequenceExhausted`] if checkpoint generations are exhausted.
     pub fn request_checkpoint(&mut self) -> Result<u64> {
+        let requested_at = self.request_time();
         self.collect()?;
         if self.poisoned {
             return Err(Error::DurabilityLost);
@@ -769,7 +841,7 @@ impl Writer {
         let next_seq = self.next_seq;
         let generation = match state.queued.as_ref().map(|queued| queued.slot.generation) {
             Some(generation) => {
-                let job = self.take_job(generation);
+                let job = self.take_job(generation, requested_at);
                 if let Some(queued) = state.queued.as_mut() {
                     queued.absorb(job);
                 }
@@ -780,7 +852,7 @@ impl Writer {
                     return Err(Error::SequenceExhausted);
                 }
                 self.generation += 1;
-                state.queued = Some(self.take_job(self.generation));
+                state.queued = Some(self.take_job(self.generation, requested_at));
                 self.generation
             }
         };
@@ -1044,6 +1116,44 @@ impl Writer {
         }
     }
 
+    /// The writer's latency histograms ([`WriterConfig::latency`](crate::WriterConfig::latency), ADR 0047), or `None` with
+    /// [`LatencyMode::Off`](crate::LatencyMode::Off). From 1.1.
+    ///
+    /// Clone the result, or one of its views, to read it from another thread while this one appends. Calling this costs
+    /// nothing on the append path; recording does ([`LatencyMode`](crate::LatencyMode)).
+    ///
+    /// ```
+    /// use tickertape::{LatencyMode, NewRecord, Writer, WriterConfig};
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let dir = tempfile::tempdir()?;
+    /// # let dir = dir.path().join("journal");
+    /// let mut writer = Writer::open(&dir, WriterConfig::default().latency(LatencyMode::All))?;
+    /// let Some(latency) = writer.latency().cloned() else {
+    ///     return Ok(()); // LatencyMode::Off
+    /// };
+    /// # let record = NewRecord { schema_id: 1, venue_ts_ns: 0, local_ts_ns: 0, payload: b"hello" };
+    /// writer.append(&record)?;
+    /// writer.checkpoint()?;
+    ///
+    /// // On any thread, whenever it is scraped:
+    /// for (name, view) in [
+    ///     ("append_service_seconds", latency.append()),
+    ///     ("roll_seconds", latency.roll()),
+    ///     ("time_to_durable_seconds", latency.time_to_durable()),
+    /// ] {
+    ///     if let Some(view) = view {
+    ///         let s = view.snapshot();
+    ///         println!("{name}: {} values, p99.9 {:?}, max {:?}", s.count(), s.value_at_quantile(0.999), s.max());
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn latency(&self) -> Option<&WriterLatency> {
+        self.latency.as_ref().map(|latency| latency.views())
+    }
+
     fn run_retention(&mut self) {
         let Some((policy, action)) = &self.config.retention else {
             return;
@@ -1069,6 +1179,21 @@ impl Writer {
 
     fn fits(&self, len: u32) -> bool {
         format::record_fits(self.active.size, self.offset, len)
+    }
+
+    /// [`Writer::roll`], timed if the latency mode asks for it.
+    #[cold]
+    #[inline(never)]
+    fn roll_measured(&mut self) -> Result<()> {
+        if self.latency.is_none() {
+            return self.roll();
+        }
+        let started = Instant::now();
+        self.roll()?;
+        if let Some(latency) = &mut self.latency {
+            latency.roll(started);
+        }
+        Ok(())
     }
 
     /// Rolls to a new segment (`docs/format.md` → Rolling).
