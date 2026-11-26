@@ -17,8 +17,8 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   marker covers, and the pure-Python decoder, with `durable_only`, an empty slot below the marker. Not detected: a zeroed
   word that nothing covers, such as in the newest segment at or after the marker (`docs/crash-contract.md`, C11). A waiting
   reader now reads the marker ten times a second and lists the segments when the directory has changed, at most once a
-  second; the record path, the C
-  ABI's declarations and the on-disk format are unchanged, and any writer works, 1.0.0 included.
+  second; the record path, the C ABI's declarations and the on-disk format are unchanged, and any writer works, 1.0.0
+  included.
 - Changed: retention reads only what its policy needs and lists the journal directory once per run (ADR 0051, issue #80).
   A checkpoint with a policy used to open every segment; now `max_segments` needs the file names, `max_age` the headers of
   the oldest segments, and `max_bytes` the file sizes (which a writer keeps between its runs) and the headers of the files

@@ -41,8 +41,8 @@ worse than the defect.
 - **(B) a later segment proves it:** a segment with a base above `S` exists **and has a valid header** (for the base in its
   name and its own size), or the newest segment has base `S`, is not `X` and holds a valid record in its first slot. A
   writer links a segment's name only after it wrote the header (`create_segment`, the spare's publication), so a file with
-  such a name and no valid header (a stray file, one whose header never reached the disk) is no evidence. Every later name
-  is tried, the newest first. A segment with a valid header copied in from **another journal** counts: nothing in a header
+  such a name and no valid header (a stray file, one whose header never reached the disk) is no evidence, and hides none: every later name
+  is tried, the newest first, and the segment at `S` is still looked at. A segment with a valid header copied in from **another journal** counts: nothing in a header
   ties it to a journal (its base matches the name, its size its file, and the sizes of a journal's segments may differ),
   and recovery and `verify` treat it the same way (a segment with a higher base is evidence of history, or disconnected).
   The files then no longer form one chain, and the report is what the operator needs: `verify` names the foreign file.

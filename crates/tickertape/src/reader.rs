@@ -1354,15 +1354,17 @@ impl Reader {
         if let Some(&base) = later.iter().find(|&&base| is_segment(&self.dir, base)) {
             return After::Shown(base);
         }
-        if !later.is_empty() {
-            // Names that are not segments (yet: a header that never reached the disk can be restored in place).
-            return After::Unknown;
-        }
-        match next {
+        let at_next = match next {
             false => After::Nothing,
             true if self.next_seq == self.seg.base => After::Nothing,
             true if holds_a_record(&self.dir, self.next_seq) => After::Shown(self.next_seq),
             true => After::Unknown,
+        };
+        match at_next {
+            // Names that are not segments (yet: a header that never reached the disk can be restored in place) leave
+            // the question open, but hide no evidence.
+            After::Nothing if !later.is_empty() => After::Unknown,
+            found => found,
         }
     }
 

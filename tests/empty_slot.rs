@@ -624,6 +624,102 @@ fn a_file_that_is_not_a_segment_is_no_evidence() {
     }
 }
 
+/// A file of zeros named like a later segment, left until the directory has settled (2 s) and the readers have looked
+/// again after that: a header then written in place makes it a segment, which they see. A reader that took "no valid later
+/// segment" for good while the directory is unchanged would miss it.
+#[test]
+fn a_header_written_in_place_after_the_directory_settled_is_seen() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut writer = journal(dir.path(), 2);
+    writer.checkpoint().unwrap();
+    let mut readers = at_the_end(dir.path(), &VISIBLE);
+    let stray = dir.path().join(format::segment_file_name(1_000_000));
+    std::fs::write(&stray, vec![0; SMALL_SEGMENT as usize]).unwrap();
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_millis(4_600) {
+        for reader in &mut readers {
+            assert!(reader.try_next().unwrap().is_none());
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let header = format::encode_segment_header(&format::SegmentHeader {
+        segment_size: SMALL_SEGMENT,
+        base_seq: 1_000_000,
+        created_unix_ns: 1,
+    });
+    open_raw(&stray).write_all_at(&header, 0).unwrap();
+    let path = segments(dir.path()).into_iter().rev().nth(1).unwrap().1;
+    let at = end_of_records(&path).0;
+    for reader in &mut readers {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let end: Result<(), Error> = loop {
+            match reader.try_next() {
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(5))
+                }
+                Ok(r) => panic!("{}", r.is_some()),
+                Err(e) => break Err(e),
+            }
+        };
+        assert!(is_report(&end, &path, at), "{end:?}");
+    }
+    drop(writer);
+}
+
+/// A name that is no segment, above a later segment that is one: the segment is the evidence.
+#[test]
+fn an_invalid_newest_name_does_not_hide_a_valid_later_segment() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut writer = journal(dir.path(), 2);
+    writer.checkpoint().unwrap();
+    let mut readers = at_the_end(dir.path(), &VISIBLE);
+    create_raw_segment(dir.path(), 1_000_000, SMALL_SEGMENT);
+    std::fs::write(dir.path().join(format::segment_file_name(2_000_000)), b"").unwrap();
+    let path = segments(dir.path()).into_iter().rev().nth(2).unwrap().1;
+    let at = end_of_records(&path).0;
+    for reader in &mut readers {
+        reader.seek(reader.position()).unwrap();
+        let (_, end) = drain(reader);
+        assert!(
+            matches!(&end, Err(Error::Corrupt { offset, reason: CorruptReason::EmptyCommitWord(1_000_000), .. })
+                if *offset == at),
+            "{end:?}"
+        );
+    }
+    drop(writer);
+}
+
+/// A name that is no segment does not hide the evidence of the segment at the cursor's own sequence number: its seal is
+/// gone, and that segment holds a record.
+#[test]
+fn an_invalid_later_name_does_not_hide_a_successor_with_a_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut writer = journal(dir.path(), 2);
+    append_n(&mut writer, 3);
+    drop(writer);
+    std::fs::remove_file(dir.path().join("checkpoint")).unwrap();
+    let listed = segments(dir.path());
+    let (base, _) = listed[1];
+    let path = listed[0].1.clone();
+    let (at, end) = end_of_records(&path);
+    assert_eq!(end, base);
+    zero(&path, at, 8);
+    std::fs::write(
+        dir.path().join(format::segment_file_name(base + 1_000_000)),
+        b"",
+    )
+    .unwrap();
+    for kind in VISIBLE {
+        expect_report(
+            &mut open(dir.path(), kind),
+            &path,
+            at,
+            base,
+            &format!("{kind:?}"),
+        );
+    }
+}
+
 /// A segment from another journal, with a valid header and a later base: the files no longer form one chain, and visible
 /// readers report the head as `verify` and the writer's recovery would treat it (ADR 0050).
 #[test]
