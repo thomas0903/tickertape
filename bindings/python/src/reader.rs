@@ -1158,7 +1158,9 @@ impl Reader {
         })
     }
 
-    /// Returns the next committed record, or `None` if there is none yet. Never waits.
+    /// Returns the next committed record, or `None` if there is none yet. Never waits (except about 50 ms before an
+    /// error). From 1.1 an empty slot that the checkpoint or a later segment shows to have been filled raises
+    /// `CorruptJournalError` instead of returning `None`.
     fn try_next(&self, py: Python<'_>) -> PyResult<Option<Py<Record>>> {
         self.settle(py, || self.read_one(py, Timeout::ZERO))
     }

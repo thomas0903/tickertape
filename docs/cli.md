@@ -44,7 +44,8 @@ Errors and recovery warnings go to stderr. JSON results go to stdout (or the sel
   segment's records end at an empty commit word (the newest segment, or an older one that is damaged or whose roll
   was interrupted, which it first scans again with the same pauses in case a rolling writer is about to seal it),
   it searches the rest of the segment for committed records hidden behind that word (`EmptyCommitWord`, or
-  `UncheckedTail`, ADR 0035; an older segment with nothing found there is reported as `BrokenChain`): it reads
+  `UncheckedTail`, ADR 0035; an older segment with nothing found there is reported as `BrokenChain`, and, from 1.1, a
+  newest segment that ends before what the checkpoint marker covers as `EmptyCommitWord`, ADR 0050): it reads
   backward from the segment's end to find the last non-zero byte, then checks the candidates up to it, and can stop
   early at the first evidence or at its work budget. It used to stop at the end of the records. On an empty 128 MiB segment this took
   21 ms instead of 9 ms (warm page cache, Apple M4 Pro); with a cold cache or slow storage it costs reading the
@@ -78,7 +79,9 @@ Errors and recovery warnings go to stderr. JSON results go to stdout (or the sel
   second pass reads its first record before opening it. A failure found after that leaves the records written before
   it in the output, finalizes a Parquet file as a readable file, and exits 1 (2 for corruption or an unsupported
   journal format, as below).
-  Corruption encountered in the selected startup scan is reported after the valid prefix has been written. An empty
+  Corruption encountered in the selected startup scan is reported after the valid prefix has been written. That includes
+  (from 1.1, as for `tail`, `stats` and `age`) an empty slot that cannot be the end of the journal, because the checkpoint
+  marker covers it or a later segment follows it (crash contract C11): 1.0.0 ended there with exit 0. An empty
   journal or an empty selection exports no records, with exit 0. Parquet requires a file destination (missing
   `--output` or `-` returns 1). Parquet uses Snappy compression
   and row groups of at most 100,000 records. On corruption the valid prefix is finalized as a readable file

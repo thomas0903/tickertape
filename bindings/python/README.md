@@ -190,7 +190,9 @@ raises `ValueError` and consumes nothing, or returns its records if it delivered
 ## Errors
 
 All errors derive from `tt.TickertapeError`: `JournalIOError` (also an `OSError`) and `StorageFullError`,
-`LockedError` (another writer has the journal), `CorruptJournalError` (`path`, `offset`, `reason` code, `details`),
+`LockedError` (another writer has the journal), `CorruptJournalError` (`path`, `offset`, `reason` code, `details`; from
+1.1 a read also raises it, with the reason `empty_commit_word`, at an empty slot that the checkpoint or a later segment
+shows to have been filled, where it returned no record before),
 `UnsupportedVersionError`, `JournalNotFoundError`, `SeqUnavailableError` (also a `LookupError`),
 `RecordTooLargeError` and `InvalidConfigError` (also `ValueError`), `DurabilityLostError`, `SequenceExhaustedError`,
 `DiscardedError` (call `seek` to continue), `BatchAppendError` and `UsedAfterForkError`. Using a closed object raises

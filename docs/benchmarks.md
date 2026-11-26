@@ -868,7 +868,8 @@ had reported no problem. What the table also shows:
   and a reader can pass it with a seek to a record in a later segment.
 - **A zeroed commit word in an older segment makes a reader stop without an error** (`Ok(None)`, the sign of the end of
   the journal), here at half of the journal, while the writer continues beyond it; `verify` finds it. No document says
-  this yet: C11 and `try_next` describe an empty slot only as "no new record yet". It is a defect, issue #79.
+  this yet: C11 and `try_next` describe an empty slot only as "no new record yet". It is a defect, issue #79
+  (fixed after these runs: readers report it, ADR 0050).
 - **A damaged header of the oldest segment** makes `Reader::open` fail, and with it every seek and `seek_to_end` of a
   new reader, although no other segment is damaged. The writer opens. By the code (not run), retention cannot remove
   that segment either: `retention::plan` reads every header and fails.

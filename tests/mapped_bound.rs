@@ -16,7 +16,7 @@ use tickertape::{
 };
 use tickertape_tests::{
     append_n, bounded_len, check_record, corrupt_by_replacement, end_of_records, locate_record,
-    open_raw, payload, segments, small_config, zero_commit_words_from,
+    open_raw, payload, segments, small_config, try_locate_record, zero_commit_words_from,
 };
 
 /// The kinds of reader: (mapped, durable-only).
@@ -612,7 +612,12 @@ fn run_ops(ops: &[Op], compared: &AtomicU64) {
                 if read_up_to(&mut open(dir, (false, false)), usize::MAX).1 != "end" {
                     return;
                 }
-                let (path, at) = locate_record(dir, seq);
+                // Earlier operations can leave a hole that a reader of this build may not report at once (a stale
+                // marker lets the writer reopen over a damaged chain). Such a journal is no subject for this
+                // operation.
+                let Some((path, at)) = try_locate_record(dir, seq) else {
+                    return;
+                };
                 let mut word = [0; 4];
                 open_raw(&path).read_exact_at(&mut word, at).unwrap();
                 let damaged = i64::from(u32::from_le_bytes(word)) + by;

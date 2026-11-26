@@ -114,7 +114,9 @@ pub enum Error {
 
     /// Writer recovery replaced or removed the segment, or retention removed it, at the reader's position,
     /// so records from this sequence number on may belong to a discarded history. Call
-    /// [`Reader::seek`](crate::Reader::seek) to continue on the current chain.
+    /// [`Reader::seek`](crate::Reader::seek) to continue on the current chain. Also returned (from 1.1) to a reader at an
+    /// empty slot that cannot be the head of the journal when the record it passed last is no longer in the file before
+    /// that slot (after a repair in place, or more damage: `docs/crash-contract.md` → Readers after a repair).
     #[error("the segment at sequence {seq} was replaced or removed by recovery or retention")]
     #[non_exhaustive]
     Discarded {
@@ -242,11 +244,13 @@ pub enum CorruptReason {
     /// The checkpoint marker points to a segment that doesn't exist, or to an impossible offset.
     #[error("checkpoint marker points to missing segment {0} or an invalid offset")]
     DanglingCheckpoint(u64),
-    /// A commit word reads 0 (no record), and recovery or `verify` found evidence of committed history after it
-    /// (`docs/crash-contract.md`, C11 (2); ADR 0035). The number is the sequence number the evidence carries: a later
-    /// valid record's, a final seal's next sequence number, or (writer recovery only; `verify` does not weigh other
-    /// segments) the base of a later segment. Usually storage damage, power loss or outside modification; a torn
-    /// payload left by a writer process crash can also cause it (`docs/crash-contract.md`, C1).
+    /// A commit word reads 0 (no record), and recovery, `verify` or a reader found evidence of committed history after
+    /// it (`docs/crash-contract.md`, C11; ADRs 0035 and 0050). The number is the sequence number the evidence carries: a
+    /// later valid record's, a final seal's next sequence number, (writer recovery and readers; `verify` does not weigh
+    /// other segments) the base of a later segment, or (readers and `verify`, from 1.1) the `next_seq` of the checkpoint
+    /// marker, which covers the slot. Usually storage damage, power loss or outside modification; a torn payload left by a
+    /// writer process crash can also make recovery and `verify` report it (`docs/crash-contract.md`, C1), but not a
+    /// reader.
     #[error("commit word is 0 but committed history follows it (sequence {0})")]
     EmptyCommitWord(u64),
     /// A commit word reads 0, and the search for committed history after it stopped at its work bound before it could
