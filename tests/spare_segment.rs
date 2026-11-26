@@ -13,6 +13,9 @@ use tickertape_tests::small_config;
 
 const SPARE: &str = "next-segment.tmp";
 
+/// How long a test waits for the spare thread: only a hang lasts this long (a busy CI runner can stall it for seconds).
+const LONG: Duration = Duration::from_secs(60);
+
 /// Background failure points are process-wide: tests in this file run one at a time.
 static SERIAL: Mutex<()> = Mutex::new(());
 
@@ -96,7 +99,7 @@ fn segments(dir: &Path) -> usize {
 }
 
 fn wait_for(cond: impl Fn() -> bool, what: &str) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + LONG;
     while !cond() {
         assert!(Instant::now() < deadline, "timed out waiting for {what}");
         std::thread::sleep(Duration::from_millis(2));
@@ -276,7 +279,7 @@ fn roll_does_not_wait_for_an_unfinished_spare() {
     for _ in 0..40 {
         append(&mut w, 1024);
     }
-    assert!(hold.wait_reached(Duration::from_secs(10)));
+    assert!(hold.wait_reached(LONG));
     let prepared = identity(&dir.path().join(SPARE));
     // Two rolls pass it by; no second preparation starts, which would remove the first one's file.
     fill_until_roll(&mut w, dir.path(), 2);
@@ -381,7 +384,7 @@ fn a_roll_without_space_uses_the_spare_that_took_it() {
     for _ in 0..40 {
         append(&mut w, 1024);
     }
-    assert!(hold.wait_reached(Duration::from_secs(10)));
+    assert!(hold.wait_reached(LONG));
     let prepared = identity(&dir.path().join(SPARE));
     fault::fail_next(Point::Preallocate, ENOSPC); // the roll's own segment finds no space
     let releaser = std::thread::spawn(move || {
@@ -414,7 +417,7 @@ fn a_roll_tries_again_when_the_spare_gave_its_space_back() {
     for _ in 0..40 {
         append(&mut w, 1024);
     }
-    assert!(hold.wait_reached(Duration::from_secs(10)));
+    assert!(hold.wait_reached(LONG));
     fault::fail_next(Point::Preallocate, ENOSPC); // the first try only
     let releaser = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(100));
@@ -426,6 +429,45 @@ fn a_roll_tries_again_when_the_spare_gave_its_space_back() {
     assert!(!dir.path().join(SPARE).exists());
     // The next segment gets a spare again.
     wait_for_ready_spare(&mut w, dir.path());
+    let total = w.next_seq();
+    drop(w);
+    assert_eq!(read_count(dir.path()), total);
+}
+
+/// Both platforms: a spare whose preparation fails after its blocks were allocated gives them back even while another
+/// descriptor of its file is open: here the test's, in an application the copy that a child process forked at that
+/// moment holds until its `exec`. A roll that ran out of space meanwhile tries again as soon as the preparation has
+/// ended (ADR 0049), and found the space still taken when unlinking and closing the file were all that gave it back
+/// (`tests/disk_full.rs::a_roll_does_not_fail_when_the_spare_gives_the_last_space_back`, issue #73).
+#[test]
+fn a_failed_spare_gives_its_blocks_back_while_its_file_is_open_elsewhere() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let mut w = Writer::open(dir.path(), config()).unwrap();
+    fault::fail_next_background(Point::SpareMap, 12 /* ENOMEM */);
+    let hold = fault::hold_background(Point::SpareMap); // its blocks are allocated
+    for _ in 0..40 {
+        append(&mut w, 1024); // past half: the spare is requested
+    }
+    assert!(
+        hold.wait_reached(LONG),
+        "the spare thread did not reach SpareMap: writer at seq {}, spare settled {}",
+        w.next_seq(),
+        w.spare_settled()
+    );
+    let elsewhere = std::fs::File::open(dir.path().join(SPARE)).unwrap();
+    let size = small_config().segment_size;
+    assert!(elsewhere.metadata().unwrap().blocks() * 512 >= size);
+    hold.release(); // the preparation now fails
+    wait_for(|| w.spare_settled(), "the spare's preparation to end");
+    assert!(!dir.path().join(SPARE).exists());
+    let left = elsewhere.metadata().unwrap();
+    assert_eq!(
+        (left.len(), left.blocks()),
+        (0, 0),
+        "the failed spare's blocks stay taken while its file is open elsewhere"
+    );
+    fill_until_roll(&mut w, dir.path(), 1);
     let total = w.next_seq();
     drop(w);
     assert_eq!(read_count(dir.path()), total);
@@ -535,7 +577,7 @@ fn a_panicked_spare_thread_neither_blocks_rolls_nor_keeps_its_space() {
         done.send(()).unwrap();
     });
     finished
-        .recv_timeout(Duration::from_secs(60))
+        .recv_timeout(LONG * 5) // longer than any wait inside, which then says what it waited for
         .expect("a roll, or the drop, waits for a spare thread that has panicked");
 }
 
@@ -560,7 +602,7 @@ fn a_roll_without_space_or_spare_reports_storage_full() {
             append(&mut w, 1024);
         }
         if let Some(hold) = &hold {
-            assert!(hold.wait_reached(Duration::from_secs(10)));
+            assert!(hold.wait_reached(LONG));
         }
         // With a spare that was pending, the roll tries once more when the spare came to nothing.
         fault::fail_next(Point::Preallocate, ENOSPC);
@@ -607,7 +649,7 @@ fn dropping_the_writer_waits_for_the_spare_and_removes_it() {
     for _ in 0..40 {
         append(&mut w, 1024);
     }
-    assert!(hold.wait_reached(Duration::from_secs(10)));
+    assert!(hold.wait_reached(LONG));
     let dropping = std::thread::spawn(move || drop(w));
     std::thread::sleep(Duration::from_millis(50));
     assert!(!dropping.is_finished(), "drop left the spare thread behind");

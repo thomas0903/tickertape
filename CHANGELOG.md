@@ -5,6 +5,12 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
+- Fixed: a spare segment that came to nothing (its preparation failed after its blocks were allocated) gives its
+  blocks back even while another descriptor of its file is open, such as the copy a child process forked at that moment
+  holds until its `exec`. It is truncated before its name is removed; so are a spare the roll discards and the
+  temporary file of a segment a roll failed to create. Before, a roll that had run out of space while the spare held it
+  could fail with "no space" when it tried again (Linux with `WriterConfig::spare_segment`; the same code on macOS).
+  ADR 0049 amendment of 2026-11-27; issue #73.
 - Changed (Linux): early write-back stops at the 128 KiB boundary below the writer instead of at the page that holds its
   position (ADR 0058, change 1; issue #60), so that it no longer writes back, and write-protects, the page-cache folio
   the writer is still filling (128 KiB on recent ext4 and xfs with the default `read_ahead_kb`), which the device then

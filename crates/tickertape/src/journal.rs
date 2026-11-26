@@ -35,6 +35,16 @@ pub(crate) fn tmp_path(dir: &Path, base_seq: u64) -> PathBuf {
     ))
 }
 
+/// Gives the blocks of an unpublished segment file (a temporary segment or the spare, `file` opened at `path`) back to
+/// the filesystem and removes its name. Truncated first: unlinking and closing free nothing while another descriptor
+/// of the file is open, such as the copy a child process forked at that moment holds until its `exec`, and the roll
+/// that has just run out of space tries again right after (ADR 0049 → amendment of 2026-11-27). Errors are ignored:
+/// the name is a leftover the next open removes.
+pub(crate) fn discard_unpublished(file: &File, path: &Path) {
+    let _ = file.set_len(0);
+    let _ = fs::remove_file(path);
+}
+
 /// Lists the segments in `dir` as `(base_seq, path)`, sorted by `base_seq`.
 pub(crate) fn list_segments(dir: &Path) -> Result<Vec<(u64, PathBuf)>> {
     let mut out = Vec::new();

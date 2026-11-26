@@ -78,3 +78,24 @@ configuration, the build that runs first in a pair alternating, and the statisti
   `::a_roll_racing_the_spare_for_the_last_space_does_not_fail` and
   `::a_roll_does_not_fail_when_the_spare_gives_the_last_space_back`,
   `tests/open_segments.rs::many_rolls_with_the_spare_segment_under_a_low_descriptor_limit`.
+
+## Amendment (2026-11-27): the blocks a spare gives back
+
+"The preparation then gives its blocks back" was not always true. A spare that came to nothing was unlinked and closed,
+and that frees nothing while another descriptor of the file is open: a child process forked at that moment holds a copy
+of every descriptor until its `exec` (with `O_CLOEXEC`), or for good if it does not `exec`. The roll that had run out of
+space and waited for the spare then tried again into space that was still taken, and failed with "no space". The long
+test `tests/disk_full.rs::a_roll_does_not_fail_when_the_spare_gives_the_last_space_back` failed this way now and then in
+CI (issue #73), beside tests that start `sudo` and writer processes.
+
+Rule from now on: a file of an unpublished segment whose blocks are given back is truncated to zero length before its
+name is removed (`journal::discard_unpublished`). This covers a spare whose preparation failed, a spare that a roll
+discards (wrong size, failed header write or link), the file a panicked spare thread left, and the temporary file of a
+segment a roll failed to create (whose partial preallocation ext4 keeps). It is the same code on macOS (ADR 0022). No
+API, format or crash-contract change.
+
+Tests: `tests/spare_segment.rs::a_failed_spare_gives_its_blocks_back_while_its_file_is_open_elsewhere` (both
+platforms, no small filesystem needed; fails without the rule), and the long test above, which now keeps a descriptor of
+the spare open while its preparation fails (fails on every run without the rule). The three long tests of the spare on a
+small filesystem now run one at a time: background holds and failure points are process-wide, and run in parallel one
+test's spare thread took another test's hold or failure.

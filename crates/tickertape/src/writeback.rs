@@ -138,6 +138,10 @@ struct State {
     seen: u64,
     #[cfg(test)]
     issued: Vec<Issued>,
+    /// For tests: the OS error that this writer's helper's next call fails with, instead of making it. Per writer,
+    /// unlike `fault::fail_next_background`, which any test's helper in the process may take.
+    #[cfg(test)]
+    fail_next: Option<i32>,
 }
 
 fn folio_setting() -> bool {
@@ -202,6 +206,8 @@ impl WriteBack {
                 seen: 0,
                 #[cfg(test)]
                 issued: Vec::new(),
+                #[cfg(test)]
+                fail_next: None,
             }),
             wake: Condvar::new(),
             folio: folio_setting(),
@@ -304,6 +310,11 @@ pub(crate) struct TestHandle(Arc<Shared>);
 
 #[cfg(test)]
 impl TestHandle {
+    /// Makes this writer's helper's next call fail with OS error `errno`.
+    pub(crate) fn fail_next(&self, errno: i32) {
+        lock(&self.0).fail_next = Some(errno);
+    }
+
     /// Waits until the helper waits to be woken, and returns its lock, which the caller then holds.
     pub(crate) fn idle(&self) -> MutexGuard<'_, impl Sized + use<'_>> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -435,7 +446,14 @@ fn follow(shared: &Shared, ctx: &Context) {
         note_issued(&mut lock(shared), &file, from, to, known);
         #[cfg(not(test))]
         let _ = known;
-        if let Err(e) = start(&file, from, to - from) {
+        #[cfg(test)]
+        let started = match lock(shared).fail_next.take() {
+            Some(errno) => Err(std::io::Error::from_raw_os_error(errno)),
+            None => start(&file, from, to - from),
+        };
+        #[cfg(not(test))]
+        let started = start(&file, from, to - from);
+        if let Err(e) = started {
             if unsupported(&e) {
                 // The filesystem or kernel does not support it: the kernel's own flusher writes back as before.
                 return;

@@ -17,6 +17,45 @@ fn big_record(seq: u64) -> Vec<u8> {
     tickertape_tests::payload(seq, 2000)
 }
 
+/// Background holds and failure points are process-wide ([`fault::hold_background`]): the tests here that arm them, or
+/// whose writer prepares spares in this process, run one at a time. Run in parallel, one test's spare thread took
+/// another's hold or failure (issue #73): the other's hold then went unreached, or its roll found a failure it had not
+/// armed.
+#[cfg(target_os = "linux")]
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(target_os = "linux")]
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    let guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    fault::clear();
+    guard
+}
+
+/// How long a test waits for a background thread to reach a hold: only a hang lasts this long.
+#[cfg(target_os = "linux")]
+const LONG: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Waits until the spare thread has reached the hold at `point`; on a timeout, says what the writer was doing.
+#[cfg(target_os = "linux")]
+fn wait_for_spare_at(hold: &fault::Hold, point: Point, w: &Writer, journal: &std::path::Path) {
+    if !hold.wait_reached(LONG) {
+        let mut names: Vec<_> = std::fs::read_dir(journal)
+            .map(|d| {
+                d.map(|e| e.map(|e| e.file_name()).unwrap_or_default())
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        panic!(
+            "the spare thread did not reach {point:?} within {LONG:?}: writer at seq {}, active segment from seq {}, \
+             spare settled {}, files {names:?}",
+            w.next_seq(),
+            w.metrics().head.segment_base_seq,
+            w.spare_settled()
+        );
+    }
+}
+
 #[test]
 fn injected_enospc_on_roll_is_reported_and_retried() {
     let dir = tempfile::tempdir().unwrap();
@@ -314,7 +353,7 @@ impl Drop for SmallVolume {
 #[test]
 #[ignore = "needs passwordless sudo (Linux); run with -- --ignored"]
 fn a_roll_does_not_fail_because_the_spare_took_the_last_space() {
-    use tickertape::fault::{self, Point};
+    let _serial = serial();
     let Some(vol) = SmallVolume::create(3) else {
         eprintln!("skipped, no small filesystem available");
         return;
@@ -322,7 +361,8 @@ fn a_roll_does_not_fail_because_the_spare_took_the_last_space() {
     let config = tickertape::WriterConfig::default()
         .segment_size(1 << 20)
         .spare_segment(true);
-    let mut w = tickertape::Writer::open(vol.path.join("journal"), config).unwrap();
+    let journal = vol.path.join("journal");
+    let mut w = tickertape::Writer::open(&journal, config).unwrap();
     let hold = fault::hold_background(Point::SpareMap); // its blocks are allocated
     let record = tickertape::NewRecord {
         schema_id: 1,
@@ -333,7 +373,9 @@ fn a_roll_does_not_fail_because_the_spare_took_the_last_space() {
     for _ in 0..200 {
         w.append(&record).unwrap(); // past half of the first of 1 MiB
     }
-    assert!(hold.wait_reached(std::time::Duration::from_secs(10)));
+    wait_for_spare_at(&hold, Point::SpareMap, &w, &journal);
+    // The roll usually comes within the next 100 ms and waits for the spare; on a slow machine the release may come
+    // first and the roll takes the ready spare. Either order must pass.
     let releaser = std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_millis(100));
         hold.release();
@@ -355,7 +397,7 @@ fn a_roll_does_not_fail_because_the_spare_took_the_last_space() {
 #[test]
 #[ignore = "needs passwordless sudo (Linux); run with -- --ignored"]
 fn a_roll_racing_the_spare_for_the_last_space_does_not_fail() {
-    use tickertape::fault::{self, Point};
+    let _serial = serial();
     let payload = vec![7u8; 1 << 20];
     let record = tickertape::NewRecord {
         schema_id: 1,
@@ -371,12 +413,13 @@ fn a_roll_racing_the_spare_for_the_last_space_does_not_fail() {
         let config = tickertape::WriterConfig::default()
             .segment_size(64 << 20)
             .spare_segment(true);
-        let mut w = tickertape::Writer::open(vol.path.join("journal"), config).unwrap();
+        let journal = vol.path.join("journal");
+        let mut w = tickertape::Writer::open(&journal, config).unwrap();
         let hold = fault::hold_background(Point::SparePreallocate);
         for _ in 0..63 {
             w.append(&record).unwrap();
         }
-        assert!(hold.wait_reached(std::time::Duration::from_secs(10)));
+        wait_for_spare_at(&hold, Point::SparePreallocate, &w, &journal);
         hold.release();
         w.append(&record)
             .unwrap_or_else(|e| panic!("round {round}: {e}"));
@@ -384,12 +427,15 @@ fn a_roll_racing_the_spare_for_the_last_space_does_not_fail() {
 }
 
 /// ADR 0049, on a real small filesystem (Linux): the spare holds the last free segment, and the preparation then fails
-/// and gives it back. The roll, which found no space meanwhile, tries again: no append fails.
+/// and gives it back. The roll, which found no space meanwhile, tries again: no append fails. Another descriptor of
+/// the spare's file stays open meanwhile, as the copy a child process forked at that moment holds until its `exec`
+/// (the other tests here start `sudo` and writer processes): unlinking and closing the file then gave nothing back,
+/// and the roll failed with "no space" (issue #73, ADR 0049 → amendment of 2026-11-27).
 #[cfg(target_os = "linux")]
 #[test]
 #[ignore = "needs passwordless sudo (Linux); run with -- --ignored"]
 fn a_roll_does_not_fail_when_the_spare_gives_the_last_space_back() {
-    use tickertape::fault::{self, Point};
+    let _serial = serial();
     let Some(vol) = SmallVolume::create(3) else {
         eprintln!("skipped, no small filesystem available");
         return;
@@ -397,7 +443,8 @@ fn a_roll_does_not_fail_when_the_spare_gives_the_last_space_back() {
     let config = tickertape::WriterConfig::default()
         .segment_size(1 << 20)
         .spare_segment(true);
-    let mut w = tickertape::Writer::open(vol.path.join("journal"), config).unwrap();
+    let journal = vol.path.join("journal");
+    let mut w = tickertape::Writer::open(&journal, config).unwrap();
     fault::fail_next_background(Point::SpareMap, 12 /* ENOMEM */);
     let hold = fault::hold_background(Point::SpareMap);
     let record = tickertape::NewRecord {
@@ -409,7 +456,11 @@ fn a_roll_does_not_fail_when_the_spare_gives_the_last_space_back() {
     for _ in 0..200 {
         w.append(&record).unwrap(); // past half of the first of 1 MiB
     }
-    assert!(hold.wait_reached(std::time::Duration::from_secs(10)));
+    wait_for_spare_at(&hold, Point::SpareMap, &w, &journal);
+    let _elsewhere = std::fs::File::open(journal.join("next-segment.tmp")).unwrap();
+    // The roll usually comes within the next 100 ms, finds no space and waits for the spare, whose preparation then
+    // fails; on a slow machine the release may come first and the roll finds the space already given back. Either
+    // order must pass.
     let releaser = std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_millis(100));
         hold.release();
