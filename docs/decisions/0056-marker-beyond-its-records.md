@@ -40,8 +40,9 @@ outside modification.
 ## Options considered
 
 1. **Keep opening (1.0.0).** Cheap, but it turns a detectable contradiction into permanent history: the writer
-   continues at `next_seq`, so records the marker vouched for are missing for ever, and the open reports nothing. Recovery already refuses the same contradiction when it is visible from the directory listing (a missing
-   segment), "because the history the marker vouches for is missing".
+   continues at `next_seq`, so records the marker vouched for are missing for ever, and the open reports nothing.
+   Recovery already refuses the same contradiction when it is visible from the directory listing (a missing segment),
+   "because the history the marker vouches for is missing".
 2. **Refuse under every policy, checking only the record right before the marker** (chosen).
 3. **Fall back to the other slot when it is consistent, or under `Quarantine` continue after the segment's real end.**
    Rejected: the newer slot's existence shows that its records were once durable, and durable-only readers may have
@@ -80,7 +81,7 @@ walks the segment forward from offset 64 instead and accepts if that walk lands 
 **Cost on a healthy open.** The backward probe reads the commit words from the marker's offset back to the start of
 the last record, and the CRC32C covers that record once: work proportional to that record's length, independent of
 the journal's and the segment's size. For records up to a few KiB the bytes are in the page recovery reads at `offset`
-anyway, or the one before it, so a cold open reads at most one more page. Measured on an Apple M4 Pro (APFS, warm page
+anyway, or the one before it, so a cold open reads a page or two more at most. Measured on an Apple M4 Pro (APFS, warm page
 cache, 128 MiB segments, median of 21 opens, two runs each): with the marker at the end of a segment of 1,040-byte
 records, 0.6 and 0.9 ms with the check against 1.3 and 1.6 ms without (run-to-run noise exceeds the effect); with a
 64 MiB last record, 25 and 26 ms against 14 and 17 ms (the CRC32C of that record). A cold open with such a record reads
@@ -100,8 +101,8 @@ knowingly, move `checkpoint` out of the directory: the writer then opens without
 segment, continuing where restored records simply end and treating a damaged record with records after it like any
 corrupt position (`Quarantine` preserves the bytes from it on and the later segments in `quarantine/`, `Fail`
 refuses); the sequence numbers the old marker covered beyond the last valid record go to new records, durable-only
-readers see nothing and retention removes nothing until the next checkpoint. No command sets the marker back, and this change adds
-none.
+readers see nothing and retention removes nothing until the next checkpoint. No command sets the marker back, and
+this change adds none.
 
 ## Consequences
 
@@ -111,11 +112,16 @@ none.
   order) that readers check. No journal a correctly working tickertape writer leaves on honest storage is refused.
 - Tests: the issue's restore; the damaged last covered record (zeroed, bad CRC); `next_seq` disagreeing with the
   record before `offset`; a marker at offset 64 with the wrong `next_seq`; both policies; both slots; and every
-  legitimate state above, plus a sweep that cuts or zeroes the journal at every slot after the marker in every segment
-  of the recovery domain and checks that each still opens. The fuzz target `recover_dir` keeps its invariants (a refusal
-  is an allowed outcome).
-- Docs: `format.md` (Recovery, step 2; work), `crash-contract.md` (C11, Missing segments), `operations.md` (Moving a
-  tape: restore the marker with the segments; After a crash: a refused open), `CorruptReason::DanglingCheckpoint` and
+  legitimate state above (`tests/marker_position.rs`). Two sweeps, sampled in the normal run and complete with
+  `--ignored` in release: a marker forged at every position a writer can give one (755 record boundaries, seals and
+  first slots of a five-segment journal, 1,510 opens, all succeed with no recovery action), and 1,161 crash and damage
+  states after the marker (cut at a slot, cut with the later segments kept, a commit word zeroed; at every slot of the
+  four segments after the older of two markers, with the newer slot current and torn): `Quarantine` opens all of them,
+  and `Fail` refuses 678 opens, each for the damage it refused before, none as a dangling marker. The fuzz target
+  `recover_dir` keeps its invariants (a refusal is an allowed outcome).
+- Docs: `format.md` (Recovery, step 2; work), `crash-contract.md` (C11, storage assumptions, Missing segments),
+  `operations.md` (Moving a tape → Restoring from a backup: restore the marker with the segments; Limits; Checking a
+  journal; After a crash: a refused open), `cli.md` (what `status` does not check), `CorruptReason::DanglingCheckpoint` and
   the bindings' descriptions of code 13, the CHANGELOG.
 - Left open: `status` does not predict this refusal (its `checkpoint.problem` set is not declared extensible in
   `cli.md`); retention and `tickertape archive` still accept such a marker (they remove only segments before its
