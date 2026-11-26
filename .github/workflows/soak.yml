@@ -78,3 +78,4 @@ jobs:
       - run: rustup show active-toolchain || rustup toolchain install
       - run: tests/compat/generate.sh --check-old-readers
       - run: EXPORTS=30 tests/compat/v1.0.0-ignores-seek-index.sh
+      - run: tests/compat/v1.0.0-ignores-removing.sh

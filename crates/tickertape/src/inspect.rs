@@ -124,7 +124,15 @@ pub fn read_checkpoint(dir: impl AsRef<Path>) -> Result<Option<format::Checkpoin
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(Error::io("open checkpoint", &path, e)),
     };
-    let read = || read_checkpoint_slots(&file).map_err(|e| Error::io("read checkpoint", &path, e));
+    read_checkpoint_from(&file, &path)
+}
+
+/// [`read_checkpoint`] from the marker file open as `file` (at `path`, for errors).
+pub(crate) fn read_checkpoint_from(
+    file: &File,
+    path: &Path,
+) -> Result<Option<format::CheckpointSlot>> {
+    let read = || read_checkpoint_slots(file).map_err(|e| Error::io("read checkpoint", path, e));
     if let Some(slot) = read()? {
         return Ok(Some(slot));
     }

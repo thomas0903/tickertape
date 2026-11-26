@@ -32,6 +32,7 @@ fn reference(
     let mut plan = Plan {
         segments: Vec::new(),
         directory,
+        leftovers: Vec::new(),
     };
     if policy == &Policy::default() {
         return Ok(plan);
