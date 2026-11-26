@@ -5,6 +5,14 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
+- Fixed: a reader replayed 15 to 30 % slower, on Linux x86-64 and aarch64, when it happened to sit in memory so that a
+  page boundary fell inside the record it decodes into: the record path stores and loads that record 16 bytes at a
+  time, and such an access split across two pages is slow (ADR 0057, issue #86; present since 1.0.0). About one process
+  in 200 of the benchmarks hit it by chance. `Reader` now has a fixed layout, `#[repr(C, align(16))]` in the order rustc
+  had chosen, so that no such access can straddle a page and the record path compiles as before; a test pins the
+  layout, and the release checklist runs the replay benchmark against the previous release on both architectures. No
+  API or ABI change (`size_of::<Reader>()` is 464 bytes instead of 456). The slowdown seen on an Apple M4 Pro in #85 was
+  not measured again.
 - Docs: what the Linux prefault window adds to a checkpoint is measured (issue #62): `docs/benchmarks.md` → "2026-11-26,
   what prefaulted, unwritten pages add to a checkpoint" (x86-64 and aarch64, ext4 and xfs). `MADV_POPULATE_WRITE` leaves
   the 256 KiB window dirty, so every checkpoint that covers appends writes it as zeros in the active segment's whole-file
