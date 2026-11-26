@@ -27,12 +27,15 @@ tickertape = { path = "crates/tickertape", version = "1.0.0" }
 unsafe_op_in_unsafe_fn = "deny"
 # `tickertape_test_panic_abort` is private to one test of the C ABI crate (crates/tickertape-ffi/src/lib.rs).
 # `tickertape_latency_check_out` compiles out the latency test of the append path, to measure its cost (ADR 0047).
+# `tickertape_pf_exp` and `tickertape_pf_touch_append` compile in the prefault experiments of ADR 0057 (never by default).
 unexpected_cfgs = { level = "warn", check-cfg = [
     "cfg(loom)",
     "cfg(fuzzing)",
     "cfg(tickertape_force_soft_crc)",
     "cfg(tickertape_test_panic_abort)",
     "cfg(tickertape_latency_check_out)",
+    "cfg(tickertape_pf_exp)",
+    "cfg(tickertape_pf_touch_append)",
 ] }
 missing_debug_implementations = "warn"
 rust_2018_idioms = { level = "warn", priority = -1 }

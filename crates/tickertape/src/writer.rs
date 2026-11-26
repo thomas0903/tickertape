@@ -82,6 +82,10 @@ pub struct Writer {
     notify: Option<mmap::Notify>,
     /// The background prefault thread, if enabled and started (ADR 0020).
     prefault: Option<Prefaulter>,
+    /// EXPERIMENT (ADR 0057; `--cfg tickertape_pf_touch_append` only): the offset from which the next append touches
+    /// the following page on this thread, as Chronicle Queue's `microTouch()` does.
+    #[cfg(tickertape_pf_touch_append)]
+    touch_next: u64,
     /// The early write-back thread, if enabled and started (Linux; ADR 0038).
     writeback: Option<WriteBack>,
     /// Prepares the next segment in the background, if enabled and started (ADR 0022).
@@ -272,6 +276,8 @@ impl Writer {
             ctx,
             notify,
             prefault,
+            #[cfg(tickertape_pf_touch_append)]
+            touch_next: 0,
             writeback,
             spares,
             generation: checkpoint.map_or(0, |c| c.generation),
@@ -626,6 +632,10 @@ impl Writer {
         if let Some(prefault) = &mut self.prefault {
             prefault.advanced(self.offset);
         }
+        #[cfg(tickertape_pf_touch_append)]
+        if self.offset >= self.touch_next {
+            self.touch_following_page();
+        }
         if let Some(writeback) = &mut self.writeback {
             writeback.advanced(self.offset);
         }
@@ -638,6 +648,30 @@ impl Writer {
         }
         self.next_seq = seq + 1;
         Ok(Ok(seq))
+    }
+
+    /// EXPERIMENT (ADR 0057; `--cfg tickertape_pf_touch_append` only): the writer entered a new page; touch the next
+    /// one now, once.
+    #[cfg(tickertape_pf_touch_append)]
+    #[cold]
+    #[inline(never)]
+    fn touch_following_page(&mut self) {
+        let next = (self.offset / 4096 + 1) * 4096;
+        self.touch_next = next;
+        self.active.map.exp_touch(next);
+    }
+
+    /// EXPERIMENT (ADR 0057; compiled only with `--cfg tickertape_pf_exp`, never in a default build): what a
+    /// `Writer::idle()` could do while the application waits between appends. Takes the write fault, if any, of the
+    /// page that holds the write position and of the next page now, on this thread, with an atomic `fetch_or(0)` on
+    /// a word of each that readers only load atomically. Chronicle Queue's `microTouch()` touches the next page only,
+    /// once; this also covers a page that a write-back has write-protected again since.
+    #[cfg(tickertape_pf_exp)]
+    #[doc(hidden)]
+    pub fn exp_touch(&mut self) {
+        let next = (self.offset / 4096 + 1) * 4096;
+        self.active.map.exp_touch(self.offset);
+        self.active.map.exp_touch(next);
     }
 
     /// Abandons the uncommitted record of frame length `len` at `offset` (its fill closure declined or panicked):
@@ -1268,6 +1302,10 @@ impl Writer {
         self.active_dirty_from = self.offset;
         if let Some(prefault) = &mut self.prefault {
             prefault.switch(self.active.map.advice(), self.offset);
+        }
+        #[cfg(tickertape_pf_touch_append)]
+        {
+            self.touch_next = 0;
         }
         self.publish();
         Ok(())
