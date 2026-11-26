@@ -33,6 +33,7 @@ fn reference(
         segments: Vec::new(),
         directory,
         leftovers: Vec::new(),
+        listed: Vec::new(),
     };
     if policy == &Policy::default() {
         return Ok(plan);

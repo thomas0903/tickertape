@@ -548,7 +548,7 @@ fn an_orphaned_segment_stays_until_retention_removes_the_segment_after_it() {
         let orphan = age(&names[0]);
         let record_0 = fs::read(&orphan).unwrap();
         assert_eq!(
-            record_0[RECORD as usize + format::RECORD_HEADER_LEN as usize],
+            record_0[RECORD as usize + format::RECORD_HEADER_LEN],
             7,
             "{case}"
         );
@@ -556,7 +556,7 @@ fn an_orphaned_segment_stays_until_retention_removes_the_segment_after_it() {
         // writer's own.
         assert_eq!(
             archive_down_to(dir.path(), 5).leftovers,
-            [orphan.clone()],
+            std::slice::from_ref(&orphan),
             "{case}"
         );
         append(&mut writer, 9);
@@ -568,7 +568,7 @@ fn an_orphaned_segment_stays_until_retention_removes_the_segment_after_it() {
         assert!(writer.last_retention_error().is_none(), "{case}");
         assert_eq!(
             writer.retention_report().leftovers,
-            [orphan.clone()],
+            std::slice::from_ref(&orphan),
             "{case}"
         );
         drop(writer);
@@ -609,10 +609,7 @@ fn a_segment_written_to_after_it_was_copied_goes_back() {
     let error = result.unwrap_err().to_string();
     assert!(error.contains("changed while it was copied"), "{error}");
     let segment = fs::read(dir.path().join(segment_file_name(0))).unwrap();
-    assert_eq!(
-        segment[RECORD as usize + format::RECORD_HEADER_LEN as usize],
-        7
-    );
+    assert_eq!(segment[RECORD as usize + format::RECORD_HEADER_LEN], 7);
     assert!(leftovers(dir.path()).is_empty());
     drop(writer.borrow_mut().take());
     assert!(inspect::verify(dir.path()).unwrap().problems.is_empty());
