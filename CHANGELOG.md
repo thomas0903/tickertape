@@ -37,6 +37,13 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   - Do not put segment files back into a journal while retention runs on it.
 - Changed (tests): `retention_kill_loop_50` kills the archiver inside runs of several removals, at delays scaled to how
   long a move takes on the machine, instead of within 5 ms (issue #73).
+- Docs: `docs/operations.md` → Open files states how many files a writer can hold open (ADR 0054, issue #73). The
+  guarantee in 1.x is that the count is bounded, whatever the number of segments and however far its background
+  checkpoints fall behind; in this release it is at most 18, 19 on Linux by default and 20 on Linux with the spare
+  segment, and a later 1.x release that raises it says so here. A checkpoint now closes each segment it reopens before it opens the
+  next, which lowered that number by one. The descriptor tests of `tests/open_segments.rs` reach the worst case with hold
+  points (new: `fault::Point::CheckpointReopen`, and `fault::Point::EarlyWriteback` as a hold point) instead of
+  depending on machine load, and the spare-segment one is no longer ignored.
 - Changed: the zero-copy reader (`Reader::open_mapped`, and the mapped readers of the C, C++ and Java bindings) bounds its
   loads by the checkpoint marker (ADR 0048, issue #62). A damaged length in a record that the marker covers no longer
   makes it load bytes past the marker's position, where a writer may be storing: such a frame is read with `pread` into a
