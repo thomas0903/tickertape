@@ -261,7 +261,8 @@ enum tickertape_corrupt_reason
    */
   TICKERTAPE_CORRUPT_BROKEN_CHAIN = 12,
   /**
-   * The checkpoint marker points to a missing segment or an impossible offset.
+   * The checkpoint marker points to a missing segment, an impossible offset, or (from 1.1) a position its segment's
+   * records do not reach (`docs/format.md` → Recovery, step 2; ADR 0056).
    */
   TICKERTAPE_CORRUPT_DANGLING_CHECKPOINT = 13,
   /**
