@@ -293,12 +293,14 @@ tickertape index /data/journal --remove    # deletes them
 - It indexes the sealed segments before the checkpoint marker's segment, so a writer that never checkpoints gets none
   while it runs. Newly sealed segments have none until the next run, and the newest segment never has one: a consumer that
   restarts near the head gains nothing (`seek_to_end` starts at the marker).
-- The size is 24 bytes per 64 KiB of segment (0.04 %); a build reads each new segment once. Nothing is added to the writer
-  while it runs; its open lists `seek-index/` and removes what recovery could invalidate.
+- The size is 24 bytes per 64 KiB of segment (0.04 %); a build reads each new segment once (128 MiB: 19 to 60 ms from the
+  page cache, 0.2 s from local SSD; `benchmarks.md`, 2026-11-26). Nothing is added to the writer while it runs; its open
+  lists `seek-index/` and removes what recovery could invalidate.
 - In a journal of 10,000 to 20,000 segments a run with nothing new to index opens every segment and index: 0.1 to
   0.2 s with a warm cache, 3 to 12 s when it is cold (`benchmarks.md`, 2026-11-25). The index shortens a seek that
-  crosses much of a segment (128 MiB: from 0.18 s to about 1 ms, cold), not the directory read that every seek starts
-  with, so it does not help where segments are small and many.
+  crosses much of a segment (128 MiB, cold: 0.18 to 0.19 s without, 0.5 to 1.8 ms with; warm: 12 to 57 ms without,
+  about 0.1 ms with; 2026-11-25 and 2026-11-26), not the directory read that every seek starts with, so it does not help
+  where segments are small and many.
 - The directory `seek-index/` is created with the journal directory's group and mode. If the command refuses to create it
   (the journal directory belongs to another user, is writable by everyone, or its group is not one of this user's, as for
   a directory made under `/tmp` on macOS), create it yourself with the journal directory's owner, group and mode.

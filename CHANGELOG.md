@@ -37,6 +37,10 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   - Do not put segment files back into a journal while retention runs on it.
 - Changed (tests): `retention_kill_loop_50` kills the archiver inside runs of several removals, at delays scaled to how
   long a move takes on the machine, instead of within 5 ms (issue #73).
+- Docs: `docs/benchmarks.md` has seeks with and without the seek index on `main` (issue #59): both readers, 64 B and
+  1,024 B, targets at the start, middle and end of a sealed 128 MiB segment and of the newest one, warm and cold,
+  forward seeks, the cost of `tickertape index` and of the writer's open with index files (x86-64 and aarch64 cloud
+  VMs). `docs/operations.md` quotes them.
 - Docs: `docs/operations.md` → Open files states how many files a writer can hold open (ADR 0054, issue #73). The
   guarantee in 1.x is that the count is bounded, whatever the number of segments and however far its background
   checkpoints fall behind; in this release it is at most 18, 19 on Linux by default and 20 on Linux with the spare
