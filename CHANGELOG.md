@@ -219,6 +219,11 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   (`tt-scale catch-up`); `benches/scale-session.sh` runs the recorded session. No library change.
 - Docs: the 1.0.0 gap "replay and recovery at scale" is measured (issue #62): results of 2026-11-25 in
   `docs/benchmarks.md`, with the limits the segment count sets in `docs/operations.md`, ADR 0042 and the roadmap.
+- Docs: `docs/benchmarks.md` records the investigation of the two aarch64 observations left open by 1.0.0 (issues #60
+  and #62): the zero-copy reader's 10 ms maximum of the checkpoint runs did not reproduce on new Axion VMs and is not
+  explained; the lagging view of issue #43 still occurs on `main` under memory pressure, is cleared by the first
+  re-read after a pause, and coincides in part with reclaim removing the frame's pages (not confirmed). Added
+  (benchmarks): `benches/diagnostics/reader-pauses.bt` and `benches/diagnostics/frontier-evictions.bt`.
 
 ## [1.0.0] - 2026-11-23
 
