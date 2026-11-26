@@ -2759,7 +2759,9 @@ aarch64 stalls occur as often without any probe.
 
 Before and after ADR [0052](decisions/0052-safe-reader-tail-reads.md): the safe reader (`Reader::open`) reads 4 KiB
 instead of 64 KiB per fill while it keeps showing that it waits for every record (issue #62; the profiles of
-2026-11-25 above found it copying 64 KiB per record it followed). **Google Cloud virtual machines, not bare metal**;
+2026-11-25 above found it copying 64 KiB per record it followed). The tables up to
+["Readers that block"](#readers-that-block-the-rule-added-after-review-x86-64) measure the change without its rule for
+readers that block; that section measures the change as merged, on x86-64. **Google Cloud virtual machines, not bare metal**;
 nothing here is compared with earlier sections.
 
 ### Environment and method
@@ -2774,9 +2776,8 @@ nothing here is compared with earlier sections.
 | rustc | 1.100.0 | the same |
 
 Commits: base `e08c364e` (`main` then), new `c7bec958` (the change on that base). Both are kept by the branch
-`core/safe-reader-adaptive-read-measured`; do not delete it. The merged change is the same code rebased onto a later
-`main` (ADRs 0050, 0051 and 0054 merged in between), not measured again; its record path compiles to the same instructions
-as that `main`'s. Each machine built both from the public repository; the base binaries were copied to a second path to
+`core/safe-reader-adaptive-read-measured`; do not delete it. The merged change adds the rule for readers that block,
+measured [below](#readers-that-block-the-rule-added-after-review-x86-64) against a later `main`. Each machine built both from the public repository; the base binaries were copied to a second path to
 give a second copy of the base, the noise floor (identical files, sha256 recorded). Release builds, no frame pointers.
 
 - **Replay**: `taskset -c 1 <replay benchmark binary> --bench records --warm-up-time 0.5 --measurement-time 1` with
@@ -2898,11 +2899,65 @@ aarch64:
   or better (x86-64 0.76 instead of 2.05–2.07 µs at 64 B) and lower p99. Blocking readers at 20,000 records/s: p50 and
   CPU 11–14 % lower on x86-64, 23–26 % lower on aarch64, the same number of waits and wakes.
 - Blocking readers at 200,000 records/s, where a reader that copies 64 KiB per record finds about half the records
-  without waiting: on aarch64 nothing changes (64 B: p50 3.63 → 3.61 µs). On x86-64 the reader reaches small reads part
-  of the time: p50 25–28 % and CPU 12–14 % lower, p99, p99.9 and late sends unchanged, and the reader blocked 38–59 %
-  more often, so the writer woke it more often. The counting runs of the same cells, a few seconds later in their runs,
-  were on whole chunks almost throughout (0.02 and 0.001 small reads per record) with waits of 0.50 → 0.50 and 0.38 →
-  0.45 per record. What decides when a run reaches small reads there was not measured.
+  without waiting: on aarch64 the 64 B cell does not change (p50 3.63 → 3.61 µs; p99 +5.6 % against a floor of
+  −3.3 %, with overlapping per-round ranges); the 1,024 B cell could not be compared (storage stalls). On x86-64 the
+  reader reaches small reads part of the time: p50 25–28 % and CPU 12–14 % lower, p99, p99.9 and late sends unchanged,
+  and the reader blocked 38–59 % more often, so the writer woke it more often. **The writer paid for it:** its `append`
+  p50 in the 1,024 B cell went from 0.96 to 1.05 µs (+8.9 % in the median of the per-round ratios, slower in all 10
+  rounds, +5.5 to +16.7 %, against −4.5 to +6.6 % for the second copy of the base), p90 +4.2 %; in the 64 B cell +0.3 %
+  (noise). One wake-up costs the writer about 1.3 µs: its `append` p50 is 1.43 µs beside a blocking reader at 20,000
+  records/s and 0.108 µs beside a spinning one. The late sends, measured against 1 µs, did not show it. The counting
+  runs of the same cells, a few seconds later in their runs, were on whole chunks almost throughout (0.02 and 0.001 small
+  reads per record) with waits of 0.50 → 0.50 and 0.38 → 0.45 per record. What decides when a run reaches small reads
+  there was not measured. This is why the merged change has a rule for readers that block (next section).
+
+### Readers that block: the rule added after review (x86-64)
+
+The merged change: a reader that registered as a waiter for a record counts that record's fill towards small reads only
+if it waited at the slot for at least 20 µs (ADR 0052, decided after the measurements above). Measured against the
+simpler rule kept ready, under which a reader that blocked for a record never counts it.
+
+`c4-standard-4-lssd` (us-east1-b, Xeon 6985P-C, 2 cores with 2 threads each), 2026-11-26 05:43–07:21 UTC, otherwise as
+in the environment above. Commits: base `43deb9f3` (`main` then), with the rule `51ad6777` (the merged reader code; the
+commits after it on the branch change documents and merge `main`), and the simpler rule: the same code with the 20 µs
+replaced by no limit (a temporary commit, `823d4650`, not kept). Four variants per round in a rotating order (base, a
+second copy of base as the floor, the rule, the simpler rule), 10 rounds, `--warmup 3s --duration 9s` (1.5 million
+records/s: `--warmup 4s --duration 20s`), otherwise the `tt-sustained run` command above; then one counting run per
+variant and cell, as above. The writer's `append` latency is that of `result.json` (time of the `append` call).
+
+Base → with the rule; in brackets the median of the per-round ratios, and the same for the second copy of the base:
+
+| Wait | Payload | Records/s | p50 (µs) | p99 (µs) | Reader CPU | Blocks per record | Writer `append` p50 (µs) | Writer `append` p90 (µs) |
+|---|---|---|---|---|---|---|---|---|
+| block | 64 B | 20,000 | 14.1 → 12.4 (-12.4 %; floor +0.1 %) | 16.7 → 16.3 (-2.4 %; floor +15.0 %) | 23 % → 20 % (-12.8 %; floor +1.7 %) | 1.00 → 1.00 (+0.0 %; floor +0.0 %) | 1.5 → 1.54 (+2.5 %; floor +0.9 %) | 1.67 → 1.74 (+3.5 %; floor +1.1 %) |
+| block | 1,024 B | 20,000 | 14.8 → 13.2 (-11.0 %; floor +0.1 %) | 19.6 → 19.5 (-7.0 %; floor +4.5 %) | 23 % → 20 % (-11.1 %; floor -0.9 %) | 1.00 → 1.00 (+0.0 %; floor +0.0 %) | 2.03 → 2.08 (+2.8 %; floor +0.4 %) | 2.35 → 2.39 (+2.0 %; floor +0.9 %) |
+| block | 64 B | 50,000 | 10.4 → 10.4 (+1.6 %; floor -0.2 %) | 23 → 24 (+2.6 %; floor +3.1 %) | 51 % → 51 % (+0.1 %; floor -0.2 %) | 0.92 → 0.92 (-1.2 %; floor -0.1 %) | 1.28 → 1.23 (-3.8 %; floor -0.8 %) | 1.8 → 1.77 (-0.2 %; floor -1.1 %) |
+| block | 1,024 B | 50,000 | 9.7 → 9.84 (+1.9 %; floor -0.2 %) | 23.7 → 24.8 (+4.5 %; floor +8.6 %) | 50 % → 51 % (+1.0 %; floor +0.5 %) | 0.92 → 0.91 (-0.5 %; floor +0.3 %) | 1.67 → 1.63 (-2.0 %; floor +0.1 %) | 2.35 → 2.39 (+1.2 %; floor +0.0 %) |
+| block | 64 B | 200,000 | 4.06 → 4.06 (+0.1 %; floor +0.0 %) | 7.84 → 7.86 (-0.1 %; floor +3.6 %) | 71 % → 72 % (+1.1 %; floor +0.4 %) | 0.51 → 0.50 (-0.7 %; floor -0.2 %) | 0.772 → 0.772 (+1.7 %; floor -1.5 %) | 1.03 → 1.03 (-2.0 %; floor -1.5 %) |
+| block | 1,024 B | 200,000 | 4.44 → 4.49 (+0.7 %; floor +0.1 %) | 9.84 → 10.2 (+0.6 %; floor +3.9 %) | 73 % → 74 % (+0.4 %; floor -0.0 %) | 0.49 → 0.48 (-0.7 %; floor -0.2 %) | 0.968 → 0.97 (-0.5 %; floor -0.6 %) | 1.38 → 1.37 (-1.0 %; floor +0.4 %) |
+| block | 64 B | 1,500,000 | 3.17 → 3.16 (-0.3 %; floor -0.4 %) | 14.2 → 14.4 (+0.0 %; floor -2.3 %) | 99 % → 99 % (+0.0 %; floor +0.0 %) | 0.00 → 0.00 (-9.6 %; floor -7.3 %) | 0.115 → 0.114 (-0.4 %; floor +0.0 %) | 0.133 → 0.133 (+0.0 %; floor +0.0 %) |
+| spin | 64 B | 20,000 | 2.11 → 0.781 (-62.9 %; floor -0.1 %) | 2.89 → 1.45 (-47.2 %; floor -6.4 %) | 100 % → 100 % (-0.0 %; floor -0.0 %) | 0 | 0.117 → 0.117 (-0.4 %; floor +0.0 %) | 0.173 → 0.169 (-3.2 %; floor -3.6 %) |
+| spin | 64 B | 200,000 | 2.06 → 0.772 (-62.6 %; floor -0.0 %) | 4.61 → 3.75 (-23.7 %; floor -2.9 %) | 100 % → 100 % (+0.0 %; floor -0.0 %) | 0.00 → 0.00 (+0.0 %; floor +0.0 %) | 0.116 → 0.116 (+0.0 %; floor -0.4 %) | 0.145 → 0.143 (+2.0 %; floor -0.7 %) |
+
+Bytes read per record (one counting run each), base → with the rule: blocking at 20,000 records/s 67,390 → 4,524 (64 B)
+and 67,019 → 4,762 (1,024 B); at 50,000 and 200,000 records/s 51,000–67,000 in all three variants, no small reads.
+Reader waits and writer futex wakes per record at 50,000 and 200,000 records/s: 0.39–0.91 and 0.46–0.91 in all three
+variants, with run-to-run differences of up to 0.11 in the single counting runs (1,024 B at 200,000: wakes 0.459 base,
+0.525 with the rule, 0.570 with the simpler rule, which reads only whole chunks there).
+
+- At 50,000 and 200,000 records/s the blocking reader behaves as the base: blocks per record −0.5 to −1.2 % against a
+  floor of −0.2 to +0.3 %, the writer's `append` p50 −3.8 to +1.7 % and p90 −2.0 to +1.2 %, within the floor's per-round
+  ranges or lower (64 B at 50,000 records/s: p50 −3.8 %, lower in all 10 rounds). In one round of the 50,000 records/s cells (round 6) every variant at 64 B, and the rule's run at 1,024 B, ran
+  with a p50 of 5.4–7.1 µs instead of about 10 µs; the other nine rounds agree, so this is the machine at that time, not
+  the threshold.
+- At 20,000 records/s the blocking reader keeps its gain (p50 11–12 % and CPU 11–13 % lower, 4.5–4.8 KB read per record
+  instead of 67 KB, blocks per record unchanged). **The writer's `append` p50 there is 2.5 % (64 B, slower in 9 of 10
+  rounds, −1.4 to +10.2 %) and 2.8 % (1,024 B, 6 of 10) higher, p90 3.5 % and 2.0 %,** against a floor of +0.9 % and
+  +0.4 %; with the simpler rule +1.3 % and −0.3 %. The first measurement showed the same at 64 B (+1.6 %, slower in all
+  10 rounds, floor +0.3 %). That is about 40 ns per `append`, with the same number of wake-up calls; why was not measured.
+- At 1.5 million records/s, p99 +0.0 % against a floor of −2.3 % (per-round ranges −23 to +31 % and −29 to +28 %), and
+  nothing else differs.
+- Spinning readers are unchanged by the rule: p50 63 % lower at 20,000 and 200,000 records/s with either rule.
 
 ### Earlier versions of the change, on the same kind of x86-64 machine
 
