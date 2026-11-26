@@ -216,6 +216,28 @@ latency difference is small. Expected once, for the first release after 1.0.0 (A
 context switches and CPU fall by orders of magnitude, because it no longer wakes for every append. Keep the raw
 output with the other release notes; record numbers in `docs/benchmarks.md` only as the playbook says.
 
+### Replay against the previous release (every release)
+
+Issue #86 (ADR 0057): replay speed changed with the layout of `Reader`, and CI measures no timings. Before every
+release, on one quiet cloud VM of each architecture (x86-64 and aarch64, local SSD; `docs/playbooks/run-benchmark.md`,
+machine rules), build three `replay` benchmark binaries (`cargo bench -p tickertape-bench --bench replay --no-run`;
+the binary is `target/release/deps/replay-*`), from the same workspaces as for the append path above: the previous
+tag's workspace (the baseline), a second copy of that binary (the noise floor), and the previous tag's workspace with
+the candidate's `crates/tickertape` copied over it (or the fallback described there). Run them interleaved, at least 10
+rounds in rotating order, each in a new process, with `TMPDIR` on the SSD:
+
+```sh
+TMPDIR=<ssd>/tmp <replay binary> --bench 'replay/records/' --warm-up-time 1 --measurement-time 2 --noplot
+```
+
+Compare, per case (`safe` and `mapped`, 64 and 1,024 B), the median of the per-round ratios against the baseline,
+beside the same ratio for the second copy. A difference larger than the second copy's, in the same direction in most
+rounds, needs an explanation before the release: a fix, or a changelog entry that says what got slower and why. A
+reader on the stack lands at a different address in each process on Linux, so look at the spread too: a build that is
+slower in a few rounds by 15 % or more, and normal in the others, may again have a hot access that straddles a page
+(ADR 0057). The test `reader::tests::reader_layout` must pass unchanged, or the ADR must say why the layout changed.
+Keep the raw output with the other release notes; record numbers in `docs/benchmarks.md` only as the playbook says.
+
 ### C ABI at 1.0 (ADR 0028 → Versioning)
 
 For the 1.0 release, and checked again for every later release that ships the C library:
