@@ -5,6 +5,24 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
+- Fixed: `Writer::open` refuses a checkpoint marker whose position the records of its segment do not reach (ADR 0056,
+  issue #87). The record right before the marker's offset must be there, valid, end exactly at that offset and carry
+  the sequence number below the marker's `next_seq` (at offset 64, `next_seq` must be the segment's base). Otherwise the
+  open fails under every recovery policy with `Error::Corrupt`, reason `DanglingCheckpoint` (C ABI code 13, Python
+  `dangling_checkpoint`), reported at the segment and the marker's offset, before anything is changed. **Behaviour
+  change:** 1.0.0 opened such a journal, continued at the marker's position and made the gap below it permanent. Two
+  kinds of journal are refused now: segments restored from a backup while a newer `checkpoint` file was kept (restore
+  the backup's marker with them: `docs/operations.md` → Restoring from a backup), and a journal whose last record before
+  the marker's offset, in the marker's segment, is zeroed or damaged (`verify` already reported it). Damage to any earlier
+  covered record is not looked at, as before. No journal that a working writer and a crash leave on storage that honours
+  its syncs is refused. What to do after a refusal: `docs/operations.md` → After a crash. The check reads only the record
+  before the marker: on a healthy journal it adds work proportional to that record's length.
+- Fixed (macOS): a repair by replacement makes its copy of the segment durable on the drive (`F_FULLFSYNC`) before it
+  renames the copy over the segment, and so does a segment recovery creates (a new journal's first segment, a
+  successor after a lost roll) before its link. A power loss right after the rename could keep the new name without
+  the copied records before the checkpoint marker (lost silently in 1.0.0; with the check above, the next open would
+  refuse), and a new journal's first segment without its header made every later open fail. One more `F_FULLFSYNC`
+  per repair and per created segment; Linux was not affected (`fdatasync` flushes the device cache).
 - Changed: a durable-only reader that blocks at the checkpoint boundary is woken by checkpoints only, not by every append
   (ADR 0053, issue #82). Checkpoints bump an event count of their own in the wake-up region, and a capability word says
   which writers do. Since #66 made the reader's marker check fast, such a reader slept between appends and the writer
@@ -13,7 +31,7 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   on aarch64, 0.44 against 0.56 µs on x86-64; `docs/benchmarks.md`, 2026-11-26). Beside a 1.0.0 writer, which does not bump those words, a durable-only
   reader polls the marker every `Backoff::max_sleep` (1 ms by default) instead of registering, so that writer pays
   nothing for it either; a 1.0.0 durable-only reader beside a new writer waits as before. The last records of a large
-  backlog can reach a durable-only reader up to about 2 ms after the checkpoint when the writer's helper threads share its
+  backlog can reach a durable-only reader up to about 2 ms later than a reader that polls the marker when the writer's helper threads share its
   CPU (`WriterConfig::helper_cpus` avoids it). The `notify` record, the on-disk format, the API and the ABI do not
   change; every pairing of 1.0.0 and new processes works (`tests/compat/v1.0.0-wake-ups.sh`).
 - Docs: the release checklist compares the append path with the previous release in `tt-sustained` with a durable-only
