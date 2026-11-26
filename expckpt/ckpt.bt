@@ -1,0 +1,32 @@
+// Checkpoint I/O of a tt-sustained writer (issue #62). $1: the journal device as the block tracepoints print it
+// (MKDEV(major, minor) = major << 20 | minor).
+// One line per msync/fdatasync/fsync of a thread named tt-sustained (blocking checkpoints run on the writer's thread):
+//   S <mono_ns_at_exit> <tid> <call> <fd> <len> <dur_ns> <bio_bytes_by_thread> <dev_write_bytes> <dev_write_reqs> <dev_flushes>
+// bio_bytes_by_thread: bytes of bios this thread queued on the device during the call (its own write-back);
+// dev_*: every write request and flush issued to the device during the call, by anyone (jbd2/xfs log included).
+// At exit: pages dirtied (clean -> dirty) per thread name and backing device, and device totals.
+BEGIN { @devw = (uint64)0; @devn = (uint64)0; @flush = (uint64)0; }
+tracepoint:block:block_rq_issue /args.dev == $1/ {
+  if (args.rwbs[0] == 87 || args.rwbs[1] == 87) { @devw = @devw + (uint64)args.bytes; @devn = @devn + 1; }
+  if (args.rwbs[0] == 70) { @flush = @flush + 1; }
+}
+tracepoint:block:block_bio_queue /args.dev == $1 && @insync[tid] == 1/ { @biob[tid] = @biob[tid] + (uint64)args.nr_sector * 512; }
+tracepoint:syscalls:sys_enter_fdatasync, tracepoint:syscalls:sys_enter_fsync /comm == "tt-sustained"/ {
+  @t[tid] = nsecs; @fd[tid] = (int64)args.fd; @len[tid] = (uint64)0;
+  @d0[tid] = @devw; @n0[tid] = @devn; @f0[tid] = @flush; @biob[tid] = (uint64)0; @insync[tid] = 1;
+}
+tracepoint:syscalls:sys_enter_msync /comm == "tt-sustained"/ {
+  @t[tid] = nsecs; @fd[tid] = (int64)-1; @len[tid] = (uint64)args.len;
+  @d0[tid] = @devw; @n0[tid] = @devn; @f0[tid] = @flush; @biob[tid] = (uint64)0; @insync[tid] = 1;
+}
+tracepoint:syscalls:sys_exit_fdatasync, tracepoint:syscalls:sys_exit_fsync, tracepoint:syscalls:sys_exit_msync /@insync[tid] == 1/ {
+  printf("S %llu %d %s %d %llu %llu %llu %llu %llu %llu\n", nsecs, tid, probe, @fd[tid], @len[tid], nsecs - @t[tid],
+    @biob[tid], @devw - @d0[tid], @devn - @n0[tid], @flush - @f0[tid]);
+  @insync[tid] = 0;
+}
+tracepoint:writeback:writeback_dirty_folio { @dirtied[comm, str(args.name)] = count(); }
+END {
+  printf("T dev_write_bytes %llu dev_write_reqs %llu dev_flushes %llu\n", @devw, @devn, @flush);
+  clear(@t); clear(@fd); clear(@len); clear(@d0); clear(@n0); clear(@f0); clear(@biob); clear(@insync);
+  clear(@devw); clear(@devn); clear(@flush);
+}

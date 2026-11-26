@@ -20,6 +20,17 @@ pub(crate) const WINDOW: u64 = if cfg!(target_vendor = "apple") {
 } else {
     256 << 10
 };
+/// EXPERIMENT (issue #62, never merged): the window from `TT_EXP_WINDOW_KIB`, else [`WINDOW`].
+pub(crate) fn window() -> u64 {
+    static W: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *W.get_or_init(|| {
+        std::env::var("TT_EXP_WINDOW_KIB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map_or(WINDOW, |k| k << 10)
+    })
+}
+
 /// How far the write position moves between wake-ups of the helper.
 const STEP: u64 = if cfg!(target_vendor = "apple") {
     1 << 20
@@ -68,7 +79,7 @@ impl Prefaulter {
                 advice,
                 epoch: 0,
                 start: offset,
-                target: offset.saturating_add(WINDOW),
+                target: offset.saturating_add(window()),
                 stop: false,
             }),
             wake: Condvar::new(),
@@ -96,7 +107,7 @@ impl Prefaulter {
         if offset >= self.next_wake {
             self.next_wake = offset.saturating_add(STEP);
             let mut state = lock(&self.shared);
-            state.target = offset.saturating_add(WINDOW);
+            state.target = offset.saturating_add(window());
             drop(state);
             self.shared.wake.notify_one();
         }
@@ -109,7 +120,7 @@ impl Prefaulter {
         state.advice = advice;
         state.epoch = state.epoch.wrapping_add(1);
         state.start = offset;
-        state.target = offset.saturating_add(WINDOW);
+        state.target = offset.saturating_add(window());
         drop(state);
         self.shared.wake.notify_one();
     }

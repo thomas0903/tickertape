@@ -289,6 +289,16 @@ pub(crate) fn run(job: &Job, ctx: &Context, on: On) -> Result<CheckpointSlot> {
     result
 }
 
+/// EXPERIMENT (issue #62, never merged): whether `seg` is the active segment `last`, held with its mapping, on Linux,
+/// with `TT_EXP_RANGED` set.
+fn exp_ranged(seg: &DirtySegment, last: &DirtySegment) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    cfg!(target_os = "linux")
+        && *ON.get_or_init(|| std::env::var_os("TT_EXP_RANGED").is_some())
+        && std::ptr::eq(seg, last)
+        && seg.flush.is_some()
+}
+
 fn steps(job: &Job, ctx: &Context, on: On) -> Result<CheckpointSlot> {
     let Some(last) = job.segments.last() else {
         return Err(Error::io(
@@ -344,7 +354,13 @@ fn steps(job: &Job, ctx: &Context, on: On) -> Result<CheckpointSlot> {
                 Arc::new(file)
             }
         };
-        mmap::sync_data(&file).map_err(|e| Error::io("sync segment", &seg.path, e))?;
+        // EXPERIMENT (issue #62, never merged): `TT_EXP_RANGED` syncs the active segment with its ranged `msync` alone
+        // (on Linux `vfs_fsync_range` with datasync, which also commits the metadata needed to read the range and
+        // flushes the device cache), and skips both whole-file `fdatasync` calls of it (this one and the barrier), so
+        // that the pages prefaulted ahead of the writer are not written back by the checkpoint.
+        if !exp_ranged(seg, last) {
+            mmap::sync_data(&file).map_err(|e| Error::io("sync segment", &seg.path, e))?;
+        }
         barrier = Some(file);
     }
     let Some(barrier) = barrier else {
@@ -359,7 +375,9 @@ fn steps(job: &Job, ctx: &Context, on: On) -> Result<CheckpointSlot> {
         journal::sync_dir(dir)?;
     }
     // 3. Barrier (macOS: F_FULLFSYNC flushes the drive cache, covering all of the above).
-    mmap::full_barrier(&barrier).map_err(|e| Error::io("full sync segment", &last.path, e))?;
+    if !exp_ranged(last, last) {
+        mmap::full_barrier(&barrier).map_err(|e| Error::io("full sync segment", &last.path, e))?;
+    }
     // 4. Marker.
     let marker_path = ctx.dir.join(CHECKPOINT_FILE);
     if on == On::Background {

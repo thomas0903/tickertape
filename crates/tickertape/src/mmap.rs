@@ -286,6 +286,15 @@ impl Advice {
             let advice = libc::MADV_WILLNEED;
             #[cfg(target_os = "linux")]
             let advice = libc::MADV_POPULATE_WRITE;
+            // EXPERIMENT (issue #62, never merged): `TT_EXP_NO_POPULATE` keeps the helper thread (and so early
+            // write-back) but advises nothing, which `prefault(false)` cannot do (it also stops early write-back).
+            #[cfg(target_os = "linux")]
+            {
+                static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                if *OFF.get_or_init(|| std::env::var_os("TT_EXP_NO_POPULATE").is_some()) {
+                    return Ok(());
+                }
+            }
             let ptr = self.region.ptr.as_ptr();
             // SAFETY: `[start, end)` lies within the live mapping (clamped above; `start` is page-aligned, as is the
             // mapping), which `self.region` keeps mapped for the duration of the call. MADV_WILLNEED only reads pages
