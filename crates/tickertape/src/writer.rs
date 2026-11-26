@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::checkpoint::{
-    self, Background, Context, DirtySegment, DirtySegments, FileId, Job, Marker, On,
+    self, Background, Context, DirtySegment, DirtySegments, FileId, Job, Marker, On, Released,
 };
 use crate::config::{RecoveryPolicy, WriterConfig};
 use crate::error::{CorruptReason, Error, Result};
@@ -107,6 +107,11 @@ pub struct Writer {
     /// The other histograms, and the views of all of them, unless `LatencyMode::Off`.
     latency: Option<Box<WriterRecorders>>,
 }
+
+/// Whether the writer hands the segments its dirty lists release to the prefault helper (ADR 0059): Linux only. On
+/// macOS the one measurement (8 MiB segments, a busy laptop) looked worse with it, and was not repeated, so the writer
+/// still unmaps and closes them itself there.
+const HAND_OFF: bool = cfg!(target_os = "linux");
 
 /// An open, mapped segment.
 #[derive(Debug)]
@@ -752,13 +757,15 @@ impl Writer {
     /// a new dirty list.
     fn take_job(&mut self, generation: u64, requested_at: Option<Instant>) -> Job {
         let mut segments = std::mem::take(&mut self.dirty);
-        segments.push(DirtySegment::written(
+        if let Some(released) = segments.push(DirtySegment::written(
             Arc::clone(&self.active.file),
             self.active.map.flush_handle(),
             self.active_dirty_from,
             self.offset,
             self.active.path.clone(),
-        ));
+        )) {
+            self.release(released);
+        }
         self.active_dirty_from = self.offset;
         Job {
             slot: CheckpointSlot {
@@ -805,8 +812,10 @@ impl Writer {
     /// Cost on the calling thread: one lock of the state shared with the checkpoint thread and a few small moves; no
     /// system call, except for starting the thread at the first call, and when the request leaves a checkpoint's list
     /// of dirty segments longer than four (many rolls since the last request, or requests that join one waiting behind
-    /// a slow checkpoint): then it reads the identity (`fstat`) of each segment it lets go of, and, if it dropped the
-    /// last reference to that segment's file or mapping, closes or unmaps it; the checkpoint later reopens it.
+    /// a slow checkpoint): then it reads the identity (`fstat`) of each segment it lets go of and, on Linux, hands the
+    /// segment to the prefault helper, which closes and unmaps it (ADR 0059); without that helper, when two segments
+    /// wait for it already, or on macOS, the request closes or unmaps the segment itself if it held the last reference. The checkpoint later
+    /// reopens it.
     ///
     /// # Errors
     ///
@@ -849,7 +858,7 @@ impl Writer {
             Some(generation) => {
                 let job = self.take_job(generation, requested_at);
                 if let Some(queued) = state.queued.as_mut() {
-                    queued.absorb(job);
+                    queued.absorb(job, |released| self.release(released));
                 }
                 generation
             }
@@ -1034,7 +1043,9 @@ impl Writer {
     ///
     /// Until the child exits: the helper threads' handles and the state they share with the writer, including the
     /// prefault thread's reference to the active segment's mapping (so with prefaulting enabled that mapping stays
-    /// mapped in the child, although its file descriptor is closed), the checkpoint thread's reference to the
+    /// mapped in the child, although its file descriptor is closed) and a segment it was closing and unmapping at the
+    /// moment of the fork, as well as the segments waiting for it to do so (at most two) if the fork came while it held
+    /// its lock (otherwise they are closed and unmapped here), the checkpoint thread's reference to the
     /// checkpoint marker (after [`Writer::request_checkpoint`]: that descriptor stays open in the child), a spare
     /// segment prepared in the background (its file descriptor and mapping, which the spare thread's result owns),
     /// and on Linux, if the fork came while the early write-back helper held its lock or was starting a write-back,
@@ -1060,7 +1071,9 @@ impl Writer {
         if let Some(spares) = self.spares.take() {
             spares.release_after_fork();
         }
-        std::mem::forget(self.prefault.take());
+        if let Some(prefault) = self.prefault.take() {
+            prefault.release_after_fork();
+        }
         // In a child, dropping the write-back helper's handle neither stops nor joins it: it only drops the child's
         // references to the segment files the helper follows, if the helper's lock was free at the fork.
         drop(self.writeback.take());
@@ -1256,8 +1269,11 @@ impl Writer {
             );
         }
         // The list keeps only the newest few segments open: pushing this one releases the file and mapping of the one
-        // that leaves its window (`checkpoint::OPEN_SEGMENTS`), and the checkpoint that covers that one reopens it.
-        self.dirty.push(DirtySegment::written(
+        // that leaves its window (`checkpoint::OPEN_SEGMENTS`; its identity is read here, while it is open), and the
+        // checkpoint that covers that one reopens it. That segment was sealed, handed to the write-back helper and
+        // listed rolls ago; on Linux what it held goes to the prefault helper with the switch, which unmaps and closes
+        // it off this thread (ADR 0059; not on macOS, see `HAND_OFF`).
+        let released = self.dirty.push(DirtySegment::written(
             old.file,
             old.map.flush_handle(),
             self.active_dirty_from,
@@ -1266,11 +1282,31 @@ impl Writer {
         ));
         self.offset = format::SEGMENT_HEADER_LEN as u64;
         self.active_dirty_from = self.offset;
-        if let Some(prefault) = &mut self.prefault {
-            prefault.switch(self.active.map.advice(), self.offset);
-        }
+        let refused = match &mut self.prefault {
+            Some(prefault) if HAND_OFF => {
+                prefault.switch(self.active.map.advice(), self.offset, released)
+            }
+            Some(prefault) => {
+                drop(prefault.switch(self.active.map.advice(), self.offset, None));
+                released
+            }
+            None => released,
+        };
         self.publish();
+        // Without the helper, when it has not caught up (`prefault::RELEASE_QUEUE` wait for it), or on macOS: here, as
+        // before.
+        drop(refused);
         Ok(())
+    }
+
+    /// Lets go of a segment a dirty list released: on Linux hands it to the prefault helper to unmap and close, or
+    /// drops it here when there is no helper, it has not caught up, or on macOS (ADR 0059).
+    fn release(&self, released: Released) {
+        let refused = match &self.prefault {
+            Some(prefault) if HAND_OFF => prefault.release(released),
+            _ => Some(released),
+        };
+        drop(refused);
     }
 }
 
@@ -1301,6 +1337,16 @@ impl Writer {
         }
         spare.discard(&self.root.join(journal::SPARE_FILE));
         None
+    }
+
+    /// Test support: how many segments the writer released wait for the prefault helper to unmap and close them, the
+    /// one it is releasing included (ADR 0059).
+    #[cfg(feature = "fault-injection")]
+    #[doc(hidden)]
+    pub fn segments_awaiting_release(&self) -> usize {
+        self.prefault
+            .as_ref()
+            .map_or(0, Prefaulter::releases_waiting)
     }
 
     /// Test support: whether no spare segment is being prepared.
@@ -1836,7 +1882,9 @@ impl Recovery<'_> {
                             self.report.actions.push(RecoveryAction::Sealed {
                                 segment: seg.path.clone(),
                             });
-                            dirty.push(inherited(seg, seg_from, offset));
+                            // Recovery runs before the helper threads start: a segment this releases is
+                            // closed and unmapped here, on the opening thread.
+                            drop(dirty.push(inherited(seg, seg_from, offset)));
                             seg = next;
                             offset = format::SEGMENT_HEADER_LEN as u64;
                             seg_from = offset;
@@ -1893,7 +1941,9 @@ impl Recovery<'_> {
                     if bases.contains(&seq) {
                         match self.open_successor(seq) {
                             Ok(next) => {
-                                dirty.push(inherited(seg, seg_from, offset));
+                                // Recovery runs before the helper threads start: a segment this releases is
+                                // closed and unmapped here, on the opening thread.
+                                drop(dirty.push(inherited(seg, seg_from, offset)));
                                 seg = next;
                                 offset = format::SEGMENT_HEADER_LEN as u64;
                                 seg_from = offset;
@@ -1936,7 +1986,9 @@ impl Recovery<'_> {
                     self.report.actions.push(RecoveryAction::CompletedRoll {
                         segment: next.path.clone(),
                     });
-                    dirty.push(inherited(seg, seg_from, offset));
+                    // Recovery runs before the helper threads start: a segment this releases is
+                    // closed and unmapped here, on the opening thread.
+                    drop(dirty.push(inherited(seg, seg_from, offset)));
                     seg = next;
                     visited.insert(seq);
                     offset = format::SEGMENT_HEADER_LEN as u64;

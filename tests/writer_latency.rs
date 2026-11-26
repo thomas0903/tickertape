@@ -686,13 +686,19 @@ fn appends_that_do_not_roll_make_no_system_call() {
         .arg(std::env::current_exe().unwrap())
         .args(["--exact", "child_that_appends"])
         .env("TT_WRITER_LATENCY_CHILD", dir.path())
-        .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .status();
-    match strace {
-        Ok(status) if status.success() => {}
-        other => return skip(format!("strace: {other:?}")),
+        .output();
+    // Skipped only when `strace` cannot run: it cannot be spawned, or the child test never reported a result (no
+    // ptrace permission, say). A child that ran and failed fails this test.
+    let out = match strace {
+        Err(e) => return skip(format!("strace: {e}")),
+        Ok(out) => out,
+    };
+    let child = String::from_utf8_lossy(&out.stdout);
+    if !child.contains("test result:") {
+        return skip(format!("strace ran no test: {:?}", out.status));
     }
+    assert!(out.status.success(), "the traced child failed:\n{child}");
     let trace = std::fs::read_to_string(&trace).unwrap();
     for mode in MODES {
         let mark = |what: &str| {

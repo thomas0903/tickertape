@@ -9,8 +9,10 @@
 //! - `tt-open-segments worst <dir> <rolls> <request_every> <spare>`: drives the writer, with the hold points of
 //!   `tickertape::fault`, into the state where it holds the most descriptors (`docs/operations.md` → Open files): the
 //!   write-back helper (Linux) held with a segment it was handed, a background checkpoint held with a segment it
-//!   reopened, a second one queued behind it, the writer's own list full, a spare being prepared (Linux, if on), and a
-//!   roll in progress. Prints the change in the writer's descriptors and in mappings of journal files (Linux) from just
+//!   reopened, a second one queued behind it, the writer's own list full, the prefault helper held while it releases a
+//!   segment that list let go of with a second one waiting for it (Linux; ADR 0059), a spare being prepared (Linux, if
+//!   on), and a roll in progress. After that roll, which releases one more segment, it also prints how many wait for
+//!   the prefault helper: that roll's segment must have been given back to the writer (the queue's bound). Prints the change in the writer's descriptors and in mappings of journal files (Linux) from just
 //!   after the open to that state; then
 //!   releases the holds, rolls until `rolls` with a background checkpoint requested every `request_every` rolls,
 //!   samples after each roll, checkpoints, and prints the next sequence number and the largest sampled changes. On
@@ -162,9 +164,24 @@ fn worst(dir: &str, rolls: u64, every: u64, spare: &str) {
     writer
         .request_checkpoint()
         .unwrap_or_else(|e| fail("request checkpoint", e));
-    // The writer's own list holding four segments; then one more roll, counted after it has created and linked the
-    // new segment and before the old one joins the list.
-    roll(&mut writer, 6);
+    // The writer's own list holding four segments, of which it has released two that no other list holds to the
+    // prefault helper (Linux; on macOS the writer closes them itself and nothing waits), held while it releases the first, with the second waiting (ADR 0059; `prefault::RELEASE_QUEUE`
+    // is 2). The first segment this list releases is the one active at the second request, which the queued job
+    // holds too: it is released, and the helper has let go of it, before the hold is armed. So: segments 12 to 16
+    // rolled past (12 released), then 17 and 18 (13 and 14 released, to the held helper).
+    roll(&mut writer, 5);
+    settle(&writer);
+    let release = fault::hold_background(Point::SegmentRelease);
+    roll(&mut writer, 2);
+    if writer.segments_awaiting_release() > 0 {
+        assert!(
+            release.wait_reached(LONG),
+            "the prefault helper took no segment"
+        );
+    }
+    let waiting = writer.segments_awaiting_release();
+    // Then one more roll, counted after it has created and linked the new segment and before the old one joins the
+    // list.
     let at_roll = std::rc::Rc::new(std::cell::Cell::new(None));
     let seen = std::rc::Rc::clone(&at_roll);
     let dir_owned = dir.to_owned();
@@ -174,9 +191,12 @@ fn worst(dir: &str, rolls: u64, every: u64, spare: &str) {
     });
     roll(&mut writer, 1);
     let held = at_roll.get().expect("the roll did not reach its hook");
+    // That roll released one more segment while two waited: the writer must have kept it.
+    let waiting_after = writer.segments_awaiting_release();
     drop(running);
     drop(writeback);
     drop(spare_hold);
+    drop(release);
     // From here the background threads run freely: whatever the timing, no sample may exceed the bound.
     let mut most = held;
     let mut base = writer.metrics().head.segment_base_seq;
@@ -204,6 +224,20 @@ fn worst(dir: &str, rolls: u64, every: u64, spare: &str) {
     println!("{}", held.1);
     println!("{}", most.0);
     println!("{}", most.1);
+    println!("{waiting}");
+    println!("{waiting_after}");
+}
+
+/// Waits until the prefault helper has released everything it was handed.
+fn settle(writer: &Writer) {
+    let deadline = std::time::Instant::now() + LONG;
+    while writer.segments_awaiting_release() > 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the prefault helper did not release what it was handed"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
 }
 
 fn fail(what: &str, e: tickertape::Error) -> ! {
