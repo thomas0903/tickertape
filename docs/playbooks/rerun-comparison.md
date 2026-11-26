@@ -77,7 +77,8 @@ below repeat it.
 - **Failures.** Never change a setting because of a failure. A wall-clock step is discarded and repeated inside the
   run (`retries.jsonl`, at most three; existing harness behaviour). A unit that fails is run once more after its part,
   and fails for good the second time: then its cell is published as failed with the error from `children.log`. An
-  unfinished short unit is set aside as `<unit>.incomplete-N`, and the driver starts it again; its incomplete data is
+  unfinished short unit is set aside as `<unit>.incomplete-N` (by `compare/run.py` itself since the run, or by the
+  driver when it starts the unit again), and the driver starts it again; its incomplete data is
   kept, not used. A sustained unit resumes where it stopped. A cell that failed and passed on the second attempt is
   published as "failed once, then ..." with the error from `failures.jsonl`. A retried short unit measures all its
   cells again: say which attempt is used.
@@ -282,3 +283,8 @@ Machine `c4-standard-16-lssd` (us-central1-b), 2026-11-25, Ubuntu 24.04, kernel 
 - **Sampler.** The sampler used for the placement checks is not part of the repository.
 
 Defects found, with reproduction, in the PR description: one in the short mode's signal handling, one missing option.
+Both are fixed since the run, without a change to what is measured: the short mode ends its children on every way out
+and marks an unfinished run `.incomplete-N`, a guard process covers SIGKILL of the runner and of the driver, and
+`run.py` has `--tools` in the short mode, which the driver now uses for its short units (the old
+`rerun.py --short-tools TOOL -- ...` form of the recorded commands still runs the same thing). See "Signals, failures
+and leftover processes" in `compare/README.md`.

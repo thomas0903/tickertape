@@ -17,7 +17,6 @@ import os
 from pathlib import Path
 import shlex
 import shutil
-import signal
 import subprocess
 import sys
 
@@ -25,6 +24,8 @@ import session
 
 ROOT = Path(__file__).resolve().parent.parent
 COMPARE = ROOT / "compare"
+sys.path.insert(0, str(COMPARE))
+import reaper  # noqa: E402  (compare/reaper.py: process groups, signals and the guard, shared with the harness)
 TOOLS = ("tickertape", "chronicle", "aeron", "yaque", "queue-file", "plain-file")
 JAVA = ("chronicle", "aeron")
 # The library that the rerun is about. The harness may be newer, the library may not.
@@ -66,6 +67,8 @@ class Unit:
         options = list(CONFIGS[self.config])
         if self.config == "tuned":
             options = list(tuned_options)
+        if self.mode == "short":
+            options += ["--tools", self.tool]
         if self.mode == "sustained":
             options += ["--sustained", "--keep-going", "--tools", self.tool, "--workloads", ",".join(self.workloads),
                         "--rate-fractions", ",".join(str(f) for f in self.fractions), "--repeats", "1"]
@@ -147,26 +150,13 @@ def part_estimate(part, quick=False):
 
 
 def short_mode(tools, argv):
-    """compare/run.py's short mode for a subset of tools: it has no --tools of its own."""
-    sys.path.insert(0, str(COMPARE))
-    import run
-    bad = set(tools) - set(run.TOOLS)
-    if bad:
-        raise SystemExit(f"rerun: unknown tools {sorted(bad)}")
-    run.TOOLS = tuple(tools)
-    # Short mode has no signal handling, and its children are process groups of their own: without this they would
-    # outlive an interrupted unit. SystemExit runs its cleanup.
-    for sig in (signal.SIGTERM, signal.SIGHUP):
-        signal.signal(sig, lambda signum, frame: sys.exit(128 + signum))
-    sys.argv = [f"benches/rerun.py --short-tools {','.join(tools)} --", *argv]
-    run.main()
+    """The form of a short unit's command before compare/run.py had --tools (the commands recorded by the v1.0.0
+    rerun): the same run as `run.py ARGV --tools TOOLS`, in this process."""
+    os.execv(sys.executable, [sys.executable, str(COMPARE / "run.py"), *argv, "--tools", ",".join(tools)])
 
 
 def command(unit, directory, tuned_options, quick, resume):
     options = unit.options(tuned_options, quick)
-    if unit.mode == "short":
-        return [sys.executable, str(Path(__file__).resolve()), "--short-tools", unit.tool, "--", str(directory),
-                *options]
     return [sys.executable, str(COMPARE / "run.py"), str(directory), *options, *(["--resume"] if resume else [])]
 
 
@@ -226,23 +216,20 @@ def capture_environment(path, data):
             f.write("\n$ " + shlex.join(cmd) + "\n" + session.capture(cmd, cwd=ROOT) + "\n")
 
 
-class Interrupted(Exception):
-    pass
+UNIT_GRACE_S = 20  # run.py needs a few seconds to end and reap its own children (reaper.GRACE_S each).
 
 
 def run_child(cmd, log, env):
-    """Runs one unit in its own process group; a signal to this driver ends the group and keeps the unit pending."""
-    proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, env=env, start_new_session=True, cwd=ROOT)
+    """Runs one unit in its own process group; a signal to this driver ends the group and keeps the unit pending.
+    A guard process ends the unit if this driver is killed with SIGKILL."""
+    guard = reaper.Guard(grace=UNIT_GRACE_S)
+    group = reaper.Group(guard)
     try:
-        return proc.wait()
+        proc = group.popen(cmd, stdout=log, stderr=subprocess.STDOUT, env=env, cwd=ROOT)
+        return group.wait(proc)
     finally:
-        if proc.poll() is None:
-            os.killpg(proc.pid, signal.SIGTERM)  # run.py reaps its own children on SIGTERM in sustained mode.
-            try:
-                proc.wait(timeout=20)
-            except subprocess.TimeoutExpired:
-                os.killpg(proc.pid, signal.SIGKILL)
-                proc.wait()
+        group.stop(grace=UNIT_GRACE_S)  # run.py ends its children on SIGTERM and marks a short unit incomplete.
+        guard.close()
 
 
 def set_aside(directory):
@@ -406,17 +393,14 @@ def main(argv=None):
                                  "parts": {n: str(d) for n, d in data_dirs.items()}, "estimated_seconds": total})
     save()
 
-    def stop(signum, frame):
-        raise Interrupted(signal.Signals(signum).name)
-    for sig in (signal.SIGTERM, signal.SIGHUP):
-        signal.signal(sig, stop)
+    reaper.install()  # SIGTERM, SIGINT, SIGHUP: end the running unit, keep it pending.
     open_units = []
     try:
         for name, data in data_dirs.items():
             # The scratch directory is this driver's own; leftovers of a killed session must not fill the disk.
             open_units += execute([e for e in plan if e[0] == name], out, data / "tt-rerun", args, manifest, save)
-    except (Interrupted, KeyboardInterrupt) as error:
-        print(f"rerun: interrupted ({error or 'SIGINT'}); run the same command to continue", file=sys.stderr)
+    except reaper.Terminated as error:
+        print(f"rerun: interrupted ({error}); run the same command to continue", file=sys.stderr)
         return 130
     print(f"rerun done: {out}; not done: {open_units or 'none'}")
     return 1 if open_units else 0
