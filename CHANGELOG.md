@@ -5,6 +5,14 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
+- Changed: a safe reader (`Reader::open`) that keeps showing that it waits for every record reads 4 KiB per fill of its
+  buffer instead of 64 KiB, so following a live journal no longer copies 64 KiB per record (ADR 0052, issue #62). It
+  shrinks after 16 fills in a row that each waited for one record, reads a whole chunk once in 256 fills, and grows back
+  at the first fill that does not wait or brings more than one record; replay, catch-up, seeks, the first fill of a
+  segment and durable-only readers read whole chunks as before. No record, error or API changes. Measured on cloud VMs
+  (`docs/benchmarks.md`, 2026-11-26): spinning readers at 20,000 and 200,000 records/s read 4.4–11.7 KB per record
+  instead of 66–68 KB with p50 halved or better; replay and 1.5 million records/s unchanged; on x86-64 a blocking reader
+  at 200,000 records/s has lower p50 and CPU but blocks, and is woken, 38–59 % more often.
 - Fixed: a reader no longer stops silently at a zeroed commit word in older history (issue #79, ADR 0050). An empty slot
   that the checkpoint marker covers, or that a later segment (with a valid header) shows to have been filled, is `Error::Corrupt` with
   `CorruptReason::EmptyCommitWord` at its offset; before, `try_next` returned `Ok(None)` there for ever, and a replay ended
