@@ -273,11 +273,12 @@ Machine `c4-standard-16-lssd` (us-central1-b), 2026-11-25, Ubuntu 24.04, kernel 
   `.incomplete-1`, ran the unit again and skipped the finished ones. The untuned parts ended, the VM rebooted itself,
   mounted its disks, continued on the isolated boot and wrote `DONE`. This was with `--quick` units; after SIGTERM of
   one tickertape unit no harness process was left (the check did not cover `tt-latency`).
-- **Not checked.** aarch64 (no machine was booked; only its kernel configuration was read from the package); full-size
-  short runs of tickertape, yaque and the plain file; the launch wrapper `start.sh` with its watcher (syntax check only,
-  including the tar pull, the deletion after `DONE`), the power-off after `DONE`, the deadline and the retry of a failed
-  unit on a real machine (unit tests only); a full-length tuned run; a tickertape and Chronicle run near their
-  saturation, where earlier sessions had failures. Start the watcher's first pull by hand and check it.
+- **aarch64 check** (`c4a-standard-8-lssd`, 19 minutes, at the session commit): quick units of `short` round 1,
+  `sustained`, `sustained-others` and `tuned-short`. All 27 units finished, all 398 results read back writer 1, reader
+  2 and helpers `0,3-7` (automatic choice), the sampler agreed, the tuned boot worked (`smt/control` is `notsupported`
+  there, so `nosmt` does nothing), and `start.sh` pulled, compared the checksums and deleted the VM after `DONE`.
+- **Not checked before the run.** Full-size short runs of tickertape, yaque and the plain file; a full-length tuned
+  run; runs near saturation.
 - **Sampler.** The sampler used for the placement checks is not part of the repository.
 
 Defects found, with reproduction, in the PR description: one in the short mode's signal handling, one missing option.
