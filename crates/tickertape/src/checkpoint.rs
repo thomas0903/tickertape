@@ -39,7 +39,9 @@ use crate::retention::{Action, Policy, Report};
 /// ones are remembered by path, file identity and range only, and the checkpoint that covers them reopens them. A
 /// segment is released by the push that makes its list longer than four: usually a roll, but also a request that adds
 /// the active segment to a list already holding four, or that joins a job queued behind a slow checkpoint
-/// ([`Job::absorb`]); that request may then close or unmap the segment. Four, because a writer that checkpoints at
+/// ([`Job::absorb`]). On Linux the writer hands what it releases to the prefault helper to close and unmap, or does
+/// so itself when that helper is absent or has not caught up; on macOS it does so itself ([`Released`], ADR 0059). A
+/// job the checkpoint thread drops closes and unmaps its segments there. Four, because a writer that checkpoints at
 /// least once per roll then does not reopen a segment unless its requests pile up behind a slow checkpoint (a list
 /// holds the segments rolled past since the last request and the job adds the active one), the early write-back
 /// helper has usually finished a segment within a roll or two of leaving it, and a background checkpoint queued
@@ -120,14 +122,29 @@ impl DirtySegment {
         }
     }
 
-    /// Lets go of the file and the mapping handle: the segment is remembered by path, file identity and range only.
-    fn release(&mut self) {
+    /// Lets go of the file and the mapping handle: the segment is remembered by path, file identity (read here, while
+    /// the file is still open) and range only. Returns them, for the caller to drop.
+    fn release(&mut self) -> Released {
         if let Some(file) = &self.file {
             self.id = FileId::of(file).ok();
         }
-        self.file = None;
-        self.flush = None;
+        Released {
+            file: self.file.take(),
+            flush: self.flush.take(),
+        }
     }
+}
+
+/// The file and mapping handle a dirty list let go of ([`DirtySegments::push`]). Dropping it closes the file and
+/// unmaps the segment, unless something else still holds them (the early write-back helper the file, the prefault
+/// helper the mapping). On Linux the writer hands it to its prefault helper to drop, so that neither `munmap` nor
+/// `close` runs on the writer's thread, or drops it itself when the helper has not caught up; on macOS it drops it
+/// itself (ADR 0059).
+#[derive(Debug)]
+#[must_use = "dropping it closes and unmaps the segment: hand it to the prefault helper or drop it on purpose"]
+pub(crate) struct Released {
+    pub(crate) file: Option<Arc<File>>,
+    pub(crate) flush: Option<Flush>,
 }
 
 /// The dirty segments of a writer or a checkpoint job, oldest first. Only the newest [`OPEN_SEGMENTS`] keep their
@@ -141,23 +158,31 @@ pub(crate) struct DirtySegments {
 }
 
 impl DirtySegments {
-    /// Appends `seg` as the newest segment, releasing the segment that leaves the open window.
-    pub(crate) fn push(&mut self, seg: DirtySegment) {
+    /// Appends `seg` as the newest segment, releasing the segment that leaves the open window: its file and mapping
+    /// handle are returned, for the caller to drop or hand over (`None` if it held neither: a segment that came from a
+    /// list that had released it already). A push releases at most one segment, since every push leaves at most
+    /// [`OPEN_SEGMENTS`] in the window.
+    pub(crate) fn push(&mut self, seg: DirtySegment) -> Option<Released> {
         self.list.push(seg);
-        while self.list.len() - self.released > OPEN_SEGMENTS {
-            self.list[self.released].release();
+        if self.list.len() - self.released > OPEN_SEGMENTS {
+            let released = self.list[self.released].release();
             self.released += 1;
+            if released.file.is_some() || released.flush.is_some() {
+                return Some(released);
+            }
         }
+        None
     }
 
     /// Appends `seg`, or extends the newest segment by it when `seg` continues it (same file, adjacent range, written
     /// the same way).
-    fn push_or_extend(&mut self, seg: DirtySegment) {
+    fn push_or_extend(&mut self, seg: DirtySegment) -> Option<Released> {
         match self.list.last_mut() {
             Some(last)
                 if last.path == seg.path && last.to == seg.from && last.mapped == seg.mapped =>
             {
                 last.to = seg.to;
+                None
             }
             _ => self.push(seg),
         }
@@ -208,10 +233,13 @@ impl Job {
     }
 
     /// Extends this job, which has not started, by a later request's job: one checkpoint then covers both, with this
-    /// job's generation and the later job's frontier (and counts from this one's request).
-    pub(crate) fn absorb(&mut self, later: Job) {
+    /// job's generation and the later job's frontier (and counts from this one's request). Each segment this releases
+    /// goes to `release`.
+    pub(crate) fn absorb(&mut self, later: Job, mut release: impl FnMut(Released)) {
         for seg in later.segments.list {
-            self.segments.push_or_extend(seg);
+            if let Some(released) = self.segments.push_or_extend(seg) {
+                release(released);
+            }
         }
         self.dirs.extend(later.dirs);
         self.requested_at = self.requested_at.or(later.requested_at);
@@ -718,7 +746,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut list = DirtySegments::default();
         for i in 0..10 {
-            list.push(segment(dir.path(), i));
+            let released = list.push(segment(dir.path(), i));
+            assert_eq!(released.is_some(), i as usize >= OPEN_SEGMENTS);
+            if let Some(released) = released {
+                assert!(
+                    released.file.is_some(),
+                    "a released segment gives back its file"
+                );
+            }
             assert_eq!(list.open(), (i as usize + 1).min(OPEN_SEGMENTS));
         }
         // The newest ones are the open ones, and every segment is still listed with its range.
@@ -731,18 +766,26 @@ mod tests {
         // A queued job that absorbs a later one stays within the bound, and adjacent ranges of one file merge.
         let mut first = DirtySegments::default();
         for i in 0..3 {
-            first.push(segment(dir.path(), 100 + i));
+            assert!(first.push(segment(dir.path(), 100 + i)).is_none());
         }
         let mut later = DirtySegments::default();
         let mut cont = segment(dir.path(), 102);
         cont.from = 8;
         cont.to = 16;
-        later.push(cont);
+        drop(later.push(cont));
         for i in 3..9 {
-            later.push(segment(dir.path(), 100 + i));
+            drop(later.push(segment(dir.path(), 100 + i)));
         }
         let mut queued = job(first, 1);
-        queued.absorb(job(later, 2));
+        let mut released = 0;
+        queued.absorb(job(later, 2), |r| {
+            drop(r);
+            released += 1;
+        });
+        // The queued job's three segments, then the continuation merges and six more come, of which `later` had
+        // released three itself: the absorb lets go of the queued job's three files, and hands over nothing for the
+        // segments that held none already.
+        assert_eq!(released, 3);
         assert_eq!(queued.segments.iter().count(), 9);
         assert_eq!(queued.segments.open(), OPEN_SEGMENTS);
         assert_eq!(queued.bytes(), 9 * 8 + 8);

@@ -155,6 +155,12 @@ pub enum Point {
     /// [`hold_background`]).
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     EarlyWriteback,
+    /// The prefault helper has taken a segment the writer released (ADR 0059) and is about to drop its file and mapping
+    /// handles (`close` and `munmap`): hold it there, with the segment in hand, with [`hold_background`].
+    SegmentRelease,
+    /// Panics the prefault helper there, with the segment in hand (arm with [`fail_next_background`]; the error is not
+    /// used).
+    SegmentReleasePanic,
     /// A seek index builder has created its temporary file (the fence), before it reads the marker. The points of the
     /// seek index (ADR 0045) are hooks ([`run_at`]) unless they say otherwise.
     SeekIndexFence,

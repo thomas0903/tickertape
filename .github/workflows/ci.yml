@@ -58,13 +58,14 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - run: cargo test --workspace --all-features --locked
-      # An append that does not roll makes no system call, with any latency mode (ADR 0047). Skipped without strace above.
+      # An append that does not roll makes no system call, with any latency mode (ADR 0047), and a roll makes no
+      # munmap or close of a finished segment on the writer's thread (ADR 0059). Skipped without strace above.
       - name: No system call in an append
         if: matrix.os == 'ubuntu-latest'
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q --no-install-recommends strace
-          cargo test --workspace --all-features --locked --test writer_latency
+          cargo test --workspace --all-features --locked --test writer_latency --test segment_release
         env:
           TICKERTAPE_REQUIRE_STRACE: '1'
       # Compile the optional recorder; never connect to an external feed in CI.
@@ -109,12 +110,13 @@ jobs:
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       # Includes the format-v1 compatibility fixtures, the CLI and the Python decoder on them (ADR 0033).
       - run: cargo test --workspace --all-features --locked
-      # An append that does not roll makes no system call, with any latency mode (ADR 0047), on aarch64 too.
+      # An append that does not roll makes no system call, with any latency mode (ADR 0047), and a roll releases no
+      # finished segment on the writer's thread (ADR 0059), on aarch64 too.
       - name: No system call in an append
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q --no-install-recommends strace
-          cargo test --workspace --all-features --locked --test writer_latency
+          cargo test --workspace --all-features --locked --test writer_latency --test segment_release
         env:
           TICKERTAPE_REQUIRE_STRACE: '1'
 
