@@ -33,6 +33,9 @@ tmpfs, one storage setting at a time, a payload sweep, the two local SSDs stripe
 [under 2026-11-26](#2026-11-26-how-much-of-the-limit-is-the-disk-fio-tmpfs-and-one-change-at-a-time-google-cloud-vms).
 Why replay speed changed with the layout of `Reader`, and the before and after of its fixed layout (ADR 0057), are
 [under 2026-11-26](#2026-11-26-the-layout-of-reader-adr-0057-issue-86-google-cloud-vms).
+What a roll without checkpoints spends its time on (the `munmap` of the segment the writer lets go of), and the before
+and after of releasing that segment on the prefault helper (ADR 0059), are
+[under 2026-11-26](#2026-11-26-finished-segments-released-off-the-writers-thread-adr-0059-issue-60-google-cloud-vms-and-macos).
 What the Linux prefault window adds to a checkpoint (bytes, sync time, append and reader latency) is
 [under 2026-11-26](#2026-11-26-what-prefaulted-unwritten-pages-add-to-a-checkpoint-google-cloud-vms-linux).
 Which page faults the writer still takes with prefaulting on, how much latency they explain, and what a writer-thread
@@ -1328,6 +1331,133 @@ Other results, ext4 / xfs:
   - replay: 23.1 / 23.1 million records/s at 64 B (safe reader), 3.08 / 3.09 at 1,024 B.
 - **Cold-cache replay** (page cache dropped): 8.9–9.0 million records/s at 64 B; 1.66–1.67 million records/s at
   1,024 B, which is 1.70–1.71 GB/s of payload from the NVMe disk.
+
+## 2026-11-26, finished segments released off the writer's thread (ADR 0059, issue #60; Google Cloud VMs and macOS)
+
+What a roll without checkpoints spends its time on, and the before and after of handing the segment a dirty list lets
+go of to the prefault helper (ADR [0059](decisions/0059-release-finished-segments-off-the-writers-thread.md)). Linux on
+**Google Cloud virtual machines, not bare metal**, one machine per architecture, one session each; macOS one short pair
+on the owner's laptop. Raw results (JSON, time series, per-roll CSVs, logs, the scripts) are kept outside the
+repository.
+
+### Environment and commands
+
+| Machine | CPU, vCPUs | Time (UTC) |
+|---|---|---|
+| `c4-standard-8-lssd`, us-east1-b | Xeon 6985P-C, 8 (4 cores) | 17:39–18:16 |
+| `c4a-standard-8-lssd`, us-east1-b | Google Axion (Neoverse-V2), 8 | 18:17–18:59 |
+
+Ubuntu 24.04, kernel 7.0.0-1017-gcp, ext4 on the first local NVMe SSD (`mkfs.ext4 -E
+lazy_itable_init=0,lazy_journal_init=0`, mounted `noatime`), 4 KiB pages, journals on that SSD. Builds, each in its own
+empty target directory: **base** `e8e4cb16` (`main`), checked out from the repository; **change** `56ad12e5` (this
+branch; later commits change comments and documents only), from a `git archive` sent over SSH (sha256 `968efcf2…`); an
+**instrumented base**: base with timers around each part of `Writer::roll` and of the release (an `Instant` before and
+after each part, one row per roll written when the writer drops; never committed). The three `tt-sustained` binaries
+differ (checked by hash before the runs).
+
+```sh
+tt-sustained run --dir … --out … --json --duration 60s --warmup 5s --readers mapped,safe:wait=default --cpus 1,2,3,4,5,6 \
+  --payload <1024|64> --rate <rate> [--checkpoint-every 1s --checkpoint-mode background --retain-bytes 68719476736] \
+  [--spare-segment]
+# rates: steady-50 of the second sustained session, 1,024 B 173,119 (x86-64) and 169,206 (aarch64), 64 B 1,446,707 and
+# 1,451,258 records/s; default 128 MiB segments, so a roll about every 0.8 s (1,024 B) and 0.9 s (64 B)
+```
+
+Each of the 8 configurations ran base, change and base again (every other configuration starting with the change), one
+60-second run each, so **n = 1 run per build and configuration** (89 and 72 rolls on x86-64, 87 and 73 on aarch64); the
+two base runs are the noise floor. On aarch64 the two 1,024 B cells without checkpoints have a second change run and a
+third base run. Then one unpaced run per build (1,024 B, checkpoints every second). Latencies in µs unless a cell says
+ms; cells are base, base / **change**.
+
+### What a roll without checkpoints is made of (instrumented base, 1,024 B, steady-50)
+
+Medians over the rolls that released a segment (85 of 89 on x86-64, 83 of 87 on aarch64; the first four rolls fill the
+list), in µs:
+
+| Arch | Spare | Roll | Create or publish the new segment | `munmap` of the released segment | `close` | `fstat` | Seal, hand-overs, publication |
+|---|---|---|---|---|---|---|---|
+| x86-64 | off | 991 | 158 | **812** | 4.3 | 3.9 | 9 |
+| x86-64 | on | 889 | 38 | **840** | 4.1 | 2.0 | 8 |
+| aarch64 | off | 847 | 166 | **664** | 3.9 | 2.0 | 10 |
+| aarch64 | on | 718 | 43 | **657** | 4.0 | 2.7 | 10 |
+
+With checkpoints every second no roll released anything, and the roll took 171 (x86-64) and 172 µs (aarch64), 162 of
+them creating the segment. So the extra 0.7–0.8 ms of a roll without checkpoints is the `munmap` of the 128 MiB segment
+the list lets go of (78–94 % of the roll); the `close` and the `fstat` are a few µs. What remains after the change is the
+creation of the next segment (about 160 µs without the spare segment, about 40–50 µs with it).
+
+### Before and after: x86-64
+
+| Payload | Checkpoints | Spare | Rolls | Roll append p50: base, base / change | Roll append p99 | Roll append max | Append p99.9 | Append p99.99 | Append max |
+|---|---|---|---|---|---|---|---|---|---|
+| 1024 B | none | off | 89 | 1,061 / 1,032 / **170** | 1,119 / 1,138 / **195** | 1,119 / 1,138 / **195** | 6.5 / 6.6 / **6.8** | 21.2 / 21.6 / **23.3** | 1,119 / 1,138 / **195** |
+| 1024 B | none | on | 89 | 926 / 926 / **59.4** | 977 / 985 / **109** | 977 / 985 / **109** | 6.0 / 5.8 / **7.3** | 16.7 / 17.2 / **25.5** | 977 / 985 / **111** |
+| 1024 B | every 1 s | off | 89 | 167 / 156 / **163** | 186 / 193 / **209** | 186 / 193 / **209** | 6.0 / 5.9 / **6.0** | 20.6 / 19.0 / **18.6** | 186 / 193 / **209** |
+| 1024 B | every 1 s | on | 89 | 51.9 / 42.8 / **51.6** | 73.9 / 61.2 / **68.5** | 73.9 / 61.2 / **68.5** | 5.9 / 5.9 / **6.1** | 19.3 / 18.8 / **20.4** | 175 / 191 / **166** |
+| 64 B | none | off | 72 | 999 / 991 / **169** | 1,064 / 1,093 / **194** | 1,064 / 1,093 / **194** | 1.8 / 1.9 / **1.8** | 6.4 / 7.0 / **7.3** | 1,064 / 1,093 / **194** |
+| 64 B | none | on | 72 | 944 / 927 / **59.6** | 984 / 972 / **90.6** | 984 / 972 / **90.6** | 1.7 / 1.7 / **1.6** | 7.1 / 7.0 / **6.9** | 984 / 972 / **126** |
+| 64 B | every 1 s | off | 72 | 168 / 151 / **171** | 199 / 183 / **209** | 199 / 183 / **209** | 1.9 / 1.7 / **1.7** | 7.3 / 6.9 / **7.1** | 199 / 183 / **209** |
+| 64 B | every 1 s | on | 72 | 39.2 / 49.2 / **35.5** | 56.5 / 62.2 / **52.4** | 56.5 / 62.2 / **52.4** | 1.8 / 1.7 / **1.7** | 6.9 / 6.9 / **6.5** | 164 / 131 / **149** |
+
+### Before and after: aarch64
+
+| Payload | Checkpoints | Spare | Rolls | Roll append p50: base, base / change | Roll append p99 | Roll append max | Append p99.9 | Append p99.99 | Append max |
+|---|---|---|---|---|---|---|---|---|---|
+| 1024 B | none | off | 87 | 841 / 851 / 848 / **178 / 179** | 871 / 872 / 873 / **211 / 202** | 871 / 872 / 873 / **211 / 202** | 6.1 / 6.3 / 6.3 / **6.1 / 6.0** | 31.9 / 32.7 / 32.8 / **32.6 / 32.9** | 871 / 872 / 873 / **211 / 202** |
+| 1024 B | none | on | 87 | 717 / 716 / 713 / **52.6 / 50.1** | 739 / 733 / 735 / **63.8 / 60.0** | 739 / 733 / 735 / **63.8 / 60.0** | 5.8 / 5.6 / 5.7 / **5.9 / 5.7** | 32.6 / 32.3 / 31.8 / **33.0 / 32.2** | 739 / 733 / 735 / **81.7 / 67.2** |
+| 1024 B | every 1 s | off | 87 | 175 / 177 / **177** | 211 / 197 / **200** | 211 / 197 / **200** | 7.2 / 7.1 / **7.0** | 33.3 / 33.4 / **33.7** | 211 / 197 / **200** |
+| 1024 B | every 1 s | on | 87 | 45.2 / 47.3 / **45.8** | 54.9 / 53.4 / **54.5** | 54.9 / 53.4 / **54.5** | 6.3 / 6.9 / **6.4** | 32.8 / 33.6 / **33.5** | 122 / 118 / **106** |
+| 64 B | none | off | 73 | 838 / 834 / **179** | 904 / 889 / **203** | 904 / 889 / **203** | 2.0 / 2.0 / **2.0** | 3.5 / 3.6 / **3.6** | 904 / 889 / **203** |
+| 64 B | none | on | 73 | 714 / 714 / **49.1** | 788 / 794 / **124** | 788 / 794 / **124** | 2.0 / 2.0 / **2.0** | 3.7 / 3.5 / **3.5** | 788 / 794 / **1,027** |
+| 64 B | every 1 s | off | 73 | 172 / 172 / **174** | 204 / 205 / **205** | 204 / 205 / **205** | 2.0 / 2.0 / **2.0** | 3.6 / 3.9 / **3.7** | 204 / 205 / **205** |
+| 64 B | every 1 s | on | 73 | 42.8 / 42.9 / **43.2** | 49.3 / 51.5 / **50.0** | 49.3 / 51.5 / **50.0** | 2.0 / 2.0 / **2.0** | 3.7 / 3.6 / **3.7** | 97.3 / 140 / **102** |
+
+- **Rolls without checkpoints:** the roll's append falls from 0.83–1.06 ms to 169–179 µs at the median without the
+  spare segment and from 0.71–0.94 ms to 49–60 µs with it, on both architectures and payloads; its maximum from
+  0.73–1.14 ms to 60–211 µs, and with it the maximum of all appends, which was a roll (but see the one exception
+below). The change takes the `munmap` out
+  of the roll and nothing else: what is left is the roll's own file work, as with checkpoints.
+- **With checkpoints every second** nothing changes beyond the base-to-base spread: such a writer's list holds one
+  segment at a roll and releases nothing there (the segments go with the job, which the checkpoint thread drops).
+- **The rest of the distribution.** 64 B on both architectures and 1,024 B on aarch64: p99.9 and p99.99 of the change
+  lie within or next to the two (three) base runs. 1,024 B on x86-64 without checkpoints: the change's p99.99 is 23.3
+  against 21.2 and 21.6 (spare off) and **25.5 against 16.7 and 17.2** (spare on), p99.9 7.3 against 6.0 and 5.8 (spare
+  on); with one run per build this is not separable from run-to-run variation, and it was not rerun on x86-64. On
+  aarch64, where the same cells were repeated, the change's p99.99 is 32.6 and 32.9 against 31.9–32.8, and 33.0 and
+  32.2 against 31.8–32.6. One explanation was checked and does not hold: the helper's `munmap` interrupting the writer
+  with TLB shootdowns. Sampled from `/proc/interrupts` every 5 s on x86-64 during the 64 B runs, the writer's CPU took
+  37,368–37,903 TLB shootdowns a second in every run, base and change alike (those come from write-back write-protecting
+  the pages behind the writer, about one per 4 KiB page written, before and after the change). **One aarch64 change run
+  (64 B, no checkpoints, spare on) has one append of 1.03 ms that is not a roll** (the roll maximum of that run is 124
+  µs); in the other 9 change runs without checkpoints no append took more than 211 µs. Not traced; one occurrence in 10
+  runs.
+- **Unpaced** (one run each, 1,024 B, checkpoints every second; the device is the limit there): rate 403,596 against
+  404,055 records/s (x86-64) and 408,629 against 412,383 (aarch64); roll append p50 795 → 196 µs and 1.84 ms → 198 µs;
+  roll append max 155 → 229 ms (x86-64) and 170 → 100 ms (aarch64), append max 316 → 278 ms and 351 → 335 ms, p99.99
+  12.1 → 12.8 ms and 13.0 → 14.8 ms. These runs are dominated by journal and write-back stalls (the 2026-11-25 section);
+  one run each cannot tell a difference there.
+- **Instructions per append** (ADR 0047's gate 1, `tt-append-cost append` under callgrind, 200,000 against 400,000
+  appends of 64 B, one segment, no helper threads): 384.000 for base and change on x86-64, 368.000 for both on aarch64
+  (the same on the OrbStack VM, aarch64). The append path is unchanged; the change is in the roll only.
+
+### macOS (owner's laptop, one short pair)
+
+Apple M4 Pro laptop, APFS, shared with other work at the time (not idle). To keep the writes to its SSD under 2 GB, one
+run per build of `tt-sustained` at 50,000 records/s, 1,024 B, **8 MiB segments** (not the default 128 MiB), no
+checkpoints, the macOS defaults (spare segment on), the mapped reader only: base (instrumented) 17 s, 114 rolls; change
+15 s, 101 rolls (a first change run stopped after 2 s on a wall-clock step, which the tool reports as an invalid
+latency run; its 0.12 GB is counted). 1.94 GB written in all. In the instrumented base the release took 150 µs of a
+418 µs roll at the median (`munmap` 46, `close` 103: on APFS the `close` is the larger part), the spare's publication
+275 µs. The change's roll append p50 was 371 µs against 421, but its p99 and maximum were 4.2 ms against 0.69 and
+1.6 ms, and the maximum of all appends 5.8 against 1.6 ms. With one run each on a busy machine, and segments a sixteenth
+of the default size, **this does not show the effect on macOS either way**; the 1.7–16 ms per roll reported for
+128 MiB segments on 2026-11-26 was not measured again.
+
+### Not measured
+
+xfs; `--helper-cpus inherited` (the helper on the writer's CPU, where its `munmap` would compete with the writer
+directly); 4-vCPU machines; bare metal; steady-90; more than one run per build on x86-64; macOS with 128 MiB segments or
+sustained; the time a `request_checkpoint` that lets go of segments saves (it hands them over the same way).
 
 ## 2026-11-26, what prefaulted, unwritten pages add to a checkpoint (Google Cloud VMs, Linux)
 

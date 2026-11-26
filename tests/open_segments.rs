@@ -69,8 +69,9 @@ fn roll(writer: &mut Writer, rolls: u64, checkpoint_every: u64) {
 }
 
 /// Rolls [`ROLLS`] times without a checkpoint (`request_every` 0); measured from the first roll to the last. The writer
-/// then holds its list's four newest segments, the active one, at most one more with the write-back helper (Linux) and
-/// one spare: at most five more than at the first roll, whatever the timing, so 8 fails only if the list stops releasing.
+/// then holds its list's four newest segments, the active one, at most one more with the write-back helper (Linux), at
+/// most two waiting for the prefault helper to release them (ADR 0059) and one spare: at most seven more than at the
+/// first roll, whatever the timing, so 8 fails only if the list stops releasing.
 fn rolls_under_a_low_limit(request_every: u64, spare: &str, descriptors: i64) {
     let dir = tempfile::tempdir().unwrap();
     let journal = dir.path().join("j");
@@ -99,15 +100,20 @@ fn many_rolls_without_a_checkpoint_under_a_low_descriptor_limit() {
 
 /// Segments in a list that keep their file and mapping open (`checkpoint::OPEN_SEGMENTS`).
 const OPEN_SEGMENTS: i64 = 4;
+/// Released segments that may wait for the prefault helper to unmap and close them, the one it is releasing included
+/// (`prefault::RELEASE_QUEUE`, ADR 0059).
+const RELEASE_QUEUE: i64 = 2;
 
 /// The most segment files a writer holds open beyond those it holds right after its open (`docs/operations.md` → Open
 /// files; ADR 0038 → Bounded open segments): three lists of [`OPEN_SEGMENTS`] (its own, a running background checkpoint's
-/// and a queued one's), the one a running checkpoint has reopened, the new segment of a roll in progress, and on Linux
-/// the segment the early write-back helper is writing back and, with the spare segment on, the spare being prepared (on
-/// macOS a roll waits for the spare, which becomes its new segment).
+/// and a queued one's), the one a running checkpoint has reopened, the new segment of a roll in progress, the
+/// [`RELEASE_QUEUE`] segments the lists released that wait for the prefault helper (from ADR 0059: before, the writer
+/// closed them at once, and the bound was 2 lower), and on Linux the segment the early write-back helper is writing
+/// back and, with the spare segment on, the spare being prepared (on macOS a roll waits for the spare, which becomes its
+/// new segment).
 fn most_extra_descriptors(spare: &str) -> i64 {
     let linux = cfg!(target_os = "linux");
-    3 * OPEN_SEGMENTS + 1 + 1 + i64::from(linux) + i64::from(linux && spare == "on")
+    3 * OPEN_SEGMENTS + 1 + 1 + RELEASE_QUEUE + i64::from(linux) + i64::from(linux && spare == "on")
 }
 
 /// Drives the writer with hold points into the state where it holds the most descriptors (the helper's `worst` mode),
@@ -124,8 +130,12 @@ fn most_descriptors_under_a_low_limit(spare: &str) {
         "25",
         spare,
     ]);
-    let (next_seq, held, held_maps, most, most_maps) =
-        (out[0] as u64, out[1], out[2], out[3], out[4]);
+    let (next_seq, held, held_maps, most, most_maps, waiting) =
+        (out[0] as u64, out[1], out[2], out[3], out[4], out[5]);
+    assert_eq!(
+        waiting, RELEASE_QUEUE,
+        "segments waiting for the prefault helper in the worst state"
+    );
     let bound = most_extra_descriptors(spare);
     assert_eq!(
         held, bound,
@@ -136,17 +146,19 @@ fn most_descriptors_under_a_low_limit(spare: &str) {
         "descriptors grew by {most}, more than {bound} (spare: {spare})"
     );
     if cfg!(target_os = "linux") {
-        // The lists' segments, the active one and a roll's new one are mapped (not the reopened one or the write-back
-        // helper's), plus at most one the prefault helper may still have in hand after every list let go of it (it is
-        // not held, so this is a bound, not exact) and a spare once it is ready (the held one is not mapped yet).
-        let maps = 3 * OPEN_SEGMENTS + 2 + i64::from(spare == "on");
+        // Beyond the active segment, which was mapped at the open: the lists' segments, a roll's new one and the
+        // released ones waiting for the prefault helper are mapped (not the reopened one or the write-back helper's),
+        // plus at most one the prefault helper may still advise after every list let go of it (in the free run; in the
+        // worst state it advises the newest segment of the writer's list, so this is a bound, not exact) and a spare
+        // once it is ready (the held one is not mapped yet).
+        let maps = 3 * OPEN_SEGMENTS + 2 + RELEASE_QUEUE + i64::from(spare == "on");
         assert!(
             held_maps <= maps && most_maps <= maps,
             "journal mappings grew by {held_maps} in the worst state and {most_maps} at most, more than {maps}; open \
              files in the worst state:\n{open_files}"
         );
         assert!(
-            held_maps > 3 * OPEN_SEGMENTS,
+            held_maps >= 3 * OPEN_SEGMENTS + 1 + RELEASE_QUEUE,
             "journal mappings in the worst state: {held_maps}"
         );
     }

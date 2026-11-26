@@ -29,7 +29,7 @@ draws conclusions from those two.
   long-lived journal make them add up (ADR 0042). Measured on local SSD (`benchmarks.md`, 2026-11-25):
   journals of 10,000, 20,000 and 100,000 segments open, recover, replay and checkpoint, and no operation held more
   than 12 open files at 10 to 20,000 segments (not sampled at 100,000). What a writer can hold is bounded whatever the number
-  of segments (20 files at most in this release, "Open files" below), so the limit on open files (`ulimit -n`) is not
+  of segments (22 files at most in this release, "Open files" below), so the limit on open files (`ulimit -n`) is not
   a constraint on the number of segments. The directory read is: each seek costs about 3 ms at 10,000 segments, 6 ms at
   20,000 and 29 ms at 100,000, also with a seek index, and so does each retention run (from 1.1, ADR 0051; x86-64, warm: a
   checkpoint with a policy that removes nothing 3 ms, 6 ms and 31 ms, against 0.3 ms without one; up to 1.0 every run
@@ -51,9 +51,9 @@ With `WriterConfig::prefault(true)` (the default), the writer moves segment work
 
 - **Page faults (Linux and macOS).** A helper thread, `tickertape-prefault`, keeps the pages just ahead of the write
   position faulted in, so `append` rarely waits for a page fault.
-  - **Linux:** the next 256 KiB, with `MADV_POPULATE_WRITE` (ADR 0025; kernels before 5.14 stop the helper on first
-    use). The advice leaves those pages dirty, so every checkpoint that covers appends also writes the 256 KiB of
-    zeros ahead of the writer: 0.16–0.43 ms more per checkpoint in the recorded runs, and about 35 page faults for the
+  - **Linux:** the next 256 KiB, with `MADV_POPULATE_WRITE` (ADR 0025; kernels before 5.14 reject it, and the helper
+    stops prefaulting on first use). The advice leaves those pages dirty, so every checkpoint that covers appends also
+    writes the 256 KiB of zeros ahead of the writer: 0.16–0.43 ms more per checkpoint in the recorded runs, and about 35 page faults for the
     writer afterwards, because writing the pages back write-protects them (`docs/benchmarks.md` → "2026-11-26, what
     prefaulted, unwritten pages add to a checkpoint"). An idle writer pays it once.
   - **macOS:** the next 8 MiB, with `MADV_WILLNEED` (ADR 0020). On APFS, writing into a preallocated segment otherwise
@@ -74,6 +74,12 @@ With `WriterConfig::prefault(true)` (the default), the writer moves segment work
     roll and journal stalls"). Measure on your machine before turning it on.
   - **macOS:** a thread is started for each spare; it also syncs the file (preallocating and syncing a whole segment
     on APFS takes about 50 ms), and a roll waits for a spare that is still being prepared.
+- **Closing finished segments (Linux and macOS, from 1.1).** A writer that rolls without checkpoints, or faster
+  than its checkpoints take segments off its hands, lets go of the oldest of the segments it holds at each roll
+  ("Open files" below). The same helper, `tickertape-prefault`, unmaps and closes it, after prefaulting the new
+  segment's first pages, instead of the writer doing it inside the roll's `append` (ADR 0059). At most 2 such segments
+  wait for the helper; if it has not caught up, the writer closes the next one itself, as before. Unmapping and
+  closing writes nothing: the data stays in the page cache, and the next checkpoint syncs it as before.
 - **Early write-back (Linux).** A helper thread, `tickertape-writeback`, asks the kernel to start writing back the
   pages behind the write position (`sync_file_range(SYNC_FILE_RANGE_WRITE)`, every 1 MiB, and the rest of a segment
   when the writer rolls past it), so that a checkpoint, blocking or background, finds little dirty data left
@@ -140,9 +146,10 @@ tmpfs three to four times as much at 1,024 B.
 
 **What 1.x guarantees:** the number of files a writer holds open is bounded, whatever the number of segments and
 however far its background checkpoints fall behind (ADR 0054; ADR 0038 → Bounded open segments). **The counts of this
-release:** at most 18 files, 19 on Linux by default, 20 on Linux with the spare segment. A later 1.x release that
-raises them says so in its changelog. So set the limit on open files (`ulimit -n`, `LimitNOFILE=` in systemd) with
-headroom above the count for your platform, plus your readers and the rest of your process, and read this section
+release:** at most 20 files, 21 on Linux by default, 22 on Linux with the spare segment (18 with
+`WriterConfig::prefault(false)`, which starts no helper threads). A later 1.x release that raises them says so in its
+changelog (this one raised them by two, ADR 0059). So set the limit on open files (`ulimit -n`, `LimitNOFILE=` in
+systemd) with headroom above the count for your platform, plus your readers and the rest of your process, and read this section
 again when you upgrade. The files of this release:
 
 - **4 always:** `writer.lock`, the marker `checkpoint`, the wake-up region and the active segment.
@@ -151,19 +158,25 @@ again when you upgrade. The files of this release:
   behind it (later requests join that one). The older segments of a list are closed, and the checkpoint that covers
   them opens them again, one at a time: **1** more.
 - **1 during a roll:** the new segment, before the old one joins the writer's list.
+- **Up to 2 waiting to be closed** (from 1.1, ADR 0059): a segment a list lets go of is closed and unmapped by the
+  prefault helper, not on the thread that let go of it (the writer's, at a roll or a request). At most 2 wait for the
+  helper, the one it is closing included; when 2 wait, or the helper has ended, the writer closes the next one itself.
+  None with `prefault(false)`.
 - **Linux, early write-back on (the default):** **1**, the segment the helper is writing back, which can be one that
   every list has closed when the helper falls behind.
 - **Linux, spare segment on:** **1**, the spare being prepared or ready. On macOS a roll waits for the spare and makes
   it its new segment, so the spare adds nothing to the roll's.
 
 The most is reached only while a background checkpoint runs, another waits behind it, each covers five segments or
-more, and the writer has rolled five times since the last request (the segment active at the request is shared with
-the waiting checkpoint's list). Otherwise a writer holds far fewer: in the
+more, the writer has rolled seven times since the last request (the segment active at the request is shared with
+the waiting checkpoint's list), and the prefault helper is still closing the first segment the writer let go of
+since then when it lets go of the second. Otherwise a writer holds far fewer: in the
 `tt-scale` runs above, 8 counting the process's own 3, and 12 while it opened a journal without a marker. A retention
 run on the checkpoint thread runs between checkpoints and opens a few files at a time, fewer than a checkpoint. Your
 process's own descriptors (standard input, output and error) and your readers come on top. The writer maps the same
-segments, except the write-back helper's and (on Linux) the reopened one, plus at most one that the prefault helper
-may still have in hand; on macOS the checkpoint maps the reopened segment for a moment, to `msync` it. That is address
+segments, the 2 waiting to be closed included, except the write-back helper's and (on Linux) the reopened one, plus at
+most one that the prefault helper may still have in hand; on macOS the checkpoint maps the reopened segment for a
+moment, to `msync` it. That is address
 space, not memory, and no descriptors. `tests/open_segments.rs` drives a writer into that state with hold points and
 checks the number exactly, on both platforms.
 

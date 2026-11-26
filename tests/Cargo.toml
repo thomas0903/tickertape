@@ -137,6 +137,10 @@ name = "writer_latency"
 path = "writer_latency.rs"
 
 [[test]]
+name = "segment_release"
+path = "segment_release.rs"
+
+[[test]]
 name = "seek"
 path = "seek.rs"
 

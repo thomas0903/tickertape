@@ -65,10 +65,14 @@ pub struct WriterConfig {
     /// Do segment work in a background thread, off the writer's thread. That thread never writes records.
     /// - **Linux:** a helper thread (`tickertape-prefault`) faults in the 256 KiB ahead of the write position with
     ///   `MADV_POPULATE_WRITE`, so `append` rarely takes a page fault (ADR 0025). On kernels before 5.14 the helper
-    ///   stops on first use. The advice makes those pages dirty: each checkpoint that covers appends writes them back
+    ///   stops prefaulting on first use. The advice makes those pages dirty: each checkpoint that covers appends writes them back
     ///   (256 KiB of zeros) and write-protects them, so the writer faults them in again afterwards; the cost is
     ///   measured in `docs/benchmarks.md` (2026-11-26).
     /// - **macOS:** the helper keeps 8 MiB ahead with `madvise(MADV_WILLNEED)` (ADR 0020).
+    /// - **Both, from 1.1:** the same helper unmaps and closes the segments the writer lets go of between checkpoints
+    ///   (the oldest of those it keeps open, at a roll or a request), so that the roll's `append` does not; at most 2
+    ///   wait for it, and if it has not caught up the writer does it itself (ADR 0059; `docs/operations.md` → Open
+    ///   files). That writes nothing: what is durable when is unchanged.
     ///
     /// It is also the switch for [`WriterConfig::early_writeback`] and [`WriterConfig::spare_segment`], which have no
     /// effect without it.

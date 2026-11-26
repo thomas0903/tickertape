@@ -305,7 +305,10 @@ only; pushing a fifth releases the oldest held one, which stays in the list by a
 and inode, from an `fstat` before it lets go) and range. Rolls usually do the release; so does a request that leaves a
 list longer than four, after many rolls since the previous request or when requests join a checkpoint queued behind a
 slow one: that request may then drop the last reference to the released segment's file and mapping (a `close` and a
-`munmap` on the calling thread), and the job reopens the segment later. Nothing is added to an append, and recovery's
+`munmap` on the calling thread), and the job reopens the segment later. (Amended 2026-11-27 by ADR
+[0059](0059-release-finished-segments-off-the-writers-thread.md): the writer hands a segment it releases, at a roll or
+a request, to the prefault helper, which does the `close` and `munmap`; at most two wait for it, and beyond that, or
+without the helper, the writer does them itself as described here.) Nothing is added to an append, and recovery's
 inherited segments go into the same list. The background checkpoint's
 job is such a list too (a queued job that absorbs later requests merges them through it), and the write-back helper
 keeps at most four rolled segments, skipping the oldest one's early write-back if it falls that far behind (it is
@@ -313,7 +316,8 @@ only a head start). **Four** because a writer that checkpoints at least once per
 requests pile up behind a slow background checkpoint, above),
 and because three lists of four (the writer's, a running and a queued job's) stay far below the usual descriptor
 limits, whatever the segment count. The write-back helper's queue of four adds at most one segment no list holds (ADR
-[0054](0054-stated-bound-on-a-writers-open-files.md), which also states the total of the release that made it, 18 to 20 files; see
+[0054](0054-stated-bound-on-a-writers-open-files.md), which also states the total of the release that made it, 18 to 20 files,
+and of the release after ADR 0059, 20 to 22; see
 `docs/operations.md` → Open files).
 
 A checkpoint opens each released segment again by path, checks that it is the same file (device and inode), and
