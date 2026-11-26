@@ -110,6 +110,29 @@ choices.
 itself occasionally stalls the writer for milliseconds, with or without prefaulting (ADR 0025). Plan disk
 throughput with headroom: a small cloud VM stalled for hundreds of milliseconds at about 100 MB/s sustained.
 
+**Is the disk the limit?** The journal writes records/s × (payload + 40 bytes, rounded up to a multiple of 8). Compare
+that with what the device writes by itself on the same file system: a `fio` job of buffered sequential writes into a
+preallocated file with an `fdatasync` every second, for a minute or more (the job file is in `docs/benchmarks.md` →
+"2026-11-26, how much of the limit is the disk"). If an unpaced writer's rate, less what piles up in the page cache
+(`Dirty` and `Writeback` in `/proc/meminfo`), is about `fio`'s, the disk is the limit; the writer's thread then spends
+most of its time off the CPU, throttled by the kernel's write-back. In the recorded cloud runs the local SSD wrote at
+most 351 MB/s by itself, tickertape on it the same 351 MB/s plus what the page cache took in, and with the journal on
+tmpfs three to four times as much at 1,024 B.
+
+- **Headroom at a steady rate.** There, a steady rate of 89 % (64 B) or 94 % (x86-64) of the device's rate did not
+  stall, and 92 % (1,024 B, aarch64) did, with appends of 10–144 ms. The point at which it starts depends on the
+  device and on more than the rate (with its defaults the writer made that device write 7 % more than it appended), so
+  measure it.
+- **Settings that moved the tail.** In those aarch64 runs, early write-back off
+  (`WriterConfig::early_writeback(false)`) removed the stalls in 5 of 5 runs. The cost: a checkpoint became durable 0.93
+  s after its request (what the device needs for a second of data) instead of 0.05–0.39 s. On x86-64, where there were
+  no stalls, it only made checkpoints that late instead of 2 ms. `lazytime` and xfs left one or three seconds with a
+  long append (one run each). The spare segment and either dirty limit did not help. Small limits
+  (`vm.dirty_bytes` 256 MiB) made an overloaded writer's longest appends longer, and large ones only let more pile up
+  before the throttling starts.
+- **tmpfs** has no durability (syncs do nothing). There, a roll zeroes the whole new segment on the writer's thread
+  (`fallocate`; 19–30 ms per 128 MiB roll in the recorded runs) unless the spare segment is on.
+
 ## Open files
 
 **What 1.x guarantees:** the number of files a writer holds open is bounded, whatever the number of segments and
