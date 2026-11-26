@@ -1,6 +1,7 @@
 # 0021: Keep the notify words in shared memory that cannot shrink
 
-- **Status:** accepted (amends [0017](0017-reader-wake-ups.md))
+- **Status:** accepted (amends [0017](0017-reader-wake-ups.md)); three words added by
+  [0053](0053-durable-only-readers-wake-on-checkpoints.md)
 - **Date:** 2026-11-01
 
 ## Context
@@ -41,6 +42,7 @@ The review also found two smaller problems:
 | 64 | waiter count |
 | 128 | writer flag |
 | 192, 200 | 64-bit nonce, low half then high half |
+| 256, 320, 384 | from 1.1: marker event count, marker waiter count, capabilities ([0053](0053-durable-only-readers-wake-on-checkpoints.md)) |
 
 How it is created:
 - **Linux:** `memfd_create` with `MFD_ALLOW_SEALING`, size 4,096, then the three seals. The writer keeps the

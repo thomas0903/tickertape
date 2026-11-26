@@ -77,7 +77,8 @@ struct TailArgs {
     /// Stop at the current committed end instead of waiting for new records
     #[arg(long)]
     no_follow: bool,
-    /// Return only checkpointed records; wait for coverage (no valid checkpoint means no records)
+    /// Return only checkpointed records; wait for coverage (no valid checkpoint means no records). Woken by checkpoints,
+    /// not by appends (ADR 0053)
     #[arg(long)]
     durable_only: bool,
     /// Let seeks (--from) start at a record named by a seek index (docs/operations.md: damage before it goes unnoticed)

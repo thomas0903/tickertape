@@ -539,6 +539,13 @@ const NOTIFY_WAITERS: u64 = 64;
 const NOTIFY_WRITER_FLAG: u64 = 128;
 const NOTIFY_NONCE_LO: u64 = 192;
 const NOTIFY_NONCE_HI: u64 = 200;
+// Bumped by checkpoints only, so that a durable-only reader waiting for the marker is not woken by appends. Only a
+// writer that sets `CAPABILITY_MARKER` in the capabilities word bumps them: in a region of 1.0.0 all of it is zero.
+const NOTIFY_MARKER_EVENT: u64 = 256;
+const NOTIFY_MARKER_WAITERS: u64 = 320;
+const NOTIFY_CAPABILITIES: u64 = 384;
+/// Bit 0 of the capabilities word: the writer bumps the marker words at each checkpoint.
+const CAPABILITY_MARKER: u32 = 1;
 /// Length of a macOS shared-memory object name, `/tickertape.` plus 16 hex digits.
 pub(crate) const NOTIFY_NAME_LEN: usize = 28;
 
@@ -614,6 +621,17 @@ impl Notify {
         notify
             .word(NOTIFY_NONCE_HI)
             .store((nonce >> 32) as u32, Ordering::SeqCst);
+        #[cfg(test)]
+        let capabilities = if test_hooks::NO_CAPABILITIES.load(Ordering::SeqCst) {
+            0
+        } else {
+            CAPABILITY_MARKER
+        };
+        #[cfg(not(test))]
+        let capabilities = CAPABILITY_MARKER;
+        notify
+            .word(NOTIFY_CAPABILITIES)
+            .store(capabilities, Ordering::SeqCst);
         notify.word(NOTIFY_WRITER_FLAG).store(1, Ordering::SeqCst);
         Ok((notify, location))
     }
@@ -676,13 +694,20 @@ impl Notify {
     }
 
     /// Reader, before its final check: register as a waiter and return the current event count.
-    pub(crate) fn begin_wait(&self) -> u32 {
-        self.word(NOTIFY_WAITERS).fetch_add(1, Ordering::SeqCst);
-        self.word(NOTIFY_EVENT).load(Ordering::SeqCst)
+    pub(crate) fn begin_wait(&self, on: WaitOn) -> u32 {
+        #[cfg(test)]
+        test_hooks::BEGINS[on as usize].fetch_add(1, Ordering::SeqCst);
+        self.word(on.waiters()).fetch_add(1, Ordering::SeqCst);
+        self.word(on.event()).load(Ordering::SeqCst)
+    }
+
+    /// Reader: whether the writer bumps the marker words (a writer before 1.1 does not).
+    pub(crate) fn writer_bumps_marker(&self) -> bool {
+        self.word(NOTIFY_CAPABILITIES).load(Ordering::SeqCst) & CAPABILITY_MARKER != 0
     }
 
     /// Reader: block until the event count differs from `seen`, a wake-up arrives, or `timeout` passes.
-    pub(crate) fn wait(&self, seen: u32, timeout: Duration) -> WaitOutcome {
+    pub(crate) fn wait(&self, on: WaitOn, seen: u32, timeout: Duration) -> WaitOutcome {
         #[cfg(test)]
         {
             test_hooks::WAITS.fetch_add(1, Ordering::SeqCst);
@@ -690,12 +715,12 @@ impl Notify {
                 return WaitOutcome::Unsupported;
             }
         }
-        wait_on(self.word(NOTIFY_EVENT), seen, timeout)
+        wait_on(self.word(on.event()), seen, timeout)
     }
 
     /// Reader: unregister as a waiter (never below zero, in case the count was reset).
-    pub(crate) fn end_wait(&self) {
-        let waiters = self.word(NOTIFY_WAITERS);
+    pub(crate) fn end_wait(&self, on: WaitOn) {
+        let waiters = self.word(on.waiters());
         let mut current = waiters.load(Ordering::SeqCst);
         while current != 0 {
             match waiters.compare_exchange_weak(
@@ -707,6 +732,31 @@ impl Notify {
                 Ok(_) => break,
                 Err(actual) => current = actual,
             }
+        }
+    }
+}
+
+/// What a blocked reader waits for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WaitOn {
+    /// A record, seal or checkpoint.
+    Record,
+    /// A checkpoint (a durable-only reader at the marker).
+    Marker,
+}
+
+impl WaitOn {
+    fn event(self) -> u64 {
+        match self {
+            WaitOn::Record => NOTIFY_EVENT,
+            WaitOn::Marker => NOTIFY_MARKER_EVENT,
+        }
+    }
+
+    fn waiters(self) -> u64 {
+        match self {
+            WaitOn::Record => NOTIFY_WAITERS,
+            WaitOn::Marker => NOTIFY_MARKER_WAITERS,
         }
     }
 }
@@ -738,6 +788,16 @@ impl NotifyPublisher {
         }
     }
 
+    /// After a checkpoint: wakes the durable-only readers waiting for the marker, and the others.
+    pub(crate) fn publish_marker(&self) {
+        let event = self.word(NOTIFY_MARKER_EVENT);
+        event.fetch_add(1, Ordering::SeqCst);
+        if self.word(NOTIFY_MARKER_WAITERS).load(Ordering::SeqCst) != 0 {
+            wake_all(event);
+        }
+        self.publish();
+    }
+
     /// The event counter, for tests that check when a wake-up was published.
     #[cfg(test)]
     pub(crate) fn event(&self) -> u32 {
@@ -758,7 +818,7 @@ impl Drop for Notify {
         let Some(owner) = &self.owner else { return };
         // Tell waiting readers that nobody maintains the counter any more, and wake them so they notice.
         self.word(NOTIFY_WRITER_FLAG).store(0, Ordering::SeqCst);
-        self.publish();
+        self.publisher().publish_marker();
         if let Some(name) = &owner.name {
             unlink_region(name);
         }
@@ -775,6 +835,10 @@ pub(crate) mod test_hooks {
     pub(crate) static WAITS: AtomicU64 = AtomicU64::new(0);
     /// Makes every wait report `WaitOutcome::Unsupported`.
     pub(crate) static FORCE_UNSUPPORTED: AtomicBool = AtomicBool::new(false);
+    /// Registrations as a waiter, by `WaitOn` (record words, marker words).
+    pub(crate) static BEGINS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+    /// Makes `Notify::create` leave the capabilities word 0, as a writer before 1.1 does.
+    pub(crate) static NO_CAPABILITIES: AtomicBool = AtomicBool::new(false);
     /// Serialises the tests that use these hooks.
     pub(crate) static LOCK: Mutex<()> = Mutex::new(());
 
@@ -1996,17 +2060,17 @@ mod tests {
         assert!(Notify::attach(&location, 1).is_err(), "wrong nonce");
         let reader = Notify::attach(&location, 0x1234_5678_9abc_def0).unwrap();
         assert!(reader.writer_notifies());
-        let seen = reader.begin_wait();
+        let seen = reader.begin_wait(WaitOn::Record);
         owner.publish();
         // The counter moved, so the wait returns at once instead of after 10 s.
         let started = std::time::Instant::now();
         assert_eq!(
-            reader.wait(seen, Duration::from_secs(10)),
+            reader.wait(WaitOn::Record, seen, Duration::from_secs(10)),
             WaitOutcome::Returned
         );
         assert!(started.elapsed() < Duration::from_secs(5));
-        reader.end_wait();
-        reader.end_wait(); // never below zero
+        reader.end_wait(WaitOn::Record);
+        reader.end_wait(WaitOn::Record); // never below zero
         drop(owner);
         assert!(
             !reader.writer_notifies(),

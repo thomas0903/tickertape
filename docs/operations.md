@@ -151,7 +151,16 @@ writer process crashing, but not a power loss (crash contract C1, C7, C8).
 - **Exposure.** After a power loss, everything since the last successful checkpoint may be gone, and its sequence
   numbers will be reused for new records.
 - **Durable-only readers** (`ReaderConfig::durable_only`, `--durable-only`) see records only once a checkpoint
-  covers them, so they lag the writer by up to one checkpoint interval.
+  covers them, so they lag the writer by up to one checkpoint interval. A blocking one is woken by the checkpoint, not
+  by appends (ADR 0053, from 1.1), where a reader polling the marker on a full core starts at once. With the writer's
+  helper threads free to run on the reader's CPU, the **first** record after each checkpoint arrived a median of 15–145
+  µs after the checkpoint completed (worst 1.2–1.5 ms), and the last record of a 1-second interval at about 170,000
+  records/s up to 2 ms later than with such a polling reader (cloud VMs, `benchmarks.md`, 2026-11-26). With the helpers
+  on other CPUs (**Pinned writers** above, `WriterConfig::helper_cpus`): 11–33 µs (worst 0.2 ms) for the first record,
+  0–0.6 ms for the last. A consumer that acts on the first durable record (fills, risk, replication) should pin the
+  helpers. A shorter interval means a smaller backlog and less delay on the last record. Beside a 1.0.0 writer, a 1.1
+  durable-only reader polls the marker every `Backoff::max_sleep` (1 ms by default) instead of registering, so that
+  the old writer's appends make no wake-up call for it; with a `max_sleep` of zero it registers as 1.0.0 does.
 - **Recovery time.** When the writer opens, it validates everything written since the last checkpoint; a journal
   that is never checkpointed is validated from the start every time.
 
@@ -246,6 +255,26 @@ The same rules apply to the library and CLI, without taking the writer lock:
   it (their headers are read to confirm their sizes).
 - Do not put segment files back into a journal while retention or `archive` runs on it: a run lists the directory once
   and does not notice every file that appears in front of the oldest segment (crash contract C14).
+- An archiver (`archive`, `retention::apply`; not a writer's own retention) takes each segment out of the journal by a
+  rename before it lets it go, and checks that it is still the file it checked and that the marker still names a later
+  segment, so that a writer's recovery in between cannot make it remove the marker's segment (ADR 0055). A deletion, and
+  a cross-filesystem move once its copy is durable, rename the segment to `{base:020}.tape.{pid}.{unix_ns}.removing` in
+  the journal directory and then unlink it. If the archiver is killed in between, that name stays. Readers, writers and
+  `verify` ignore it; `tickertape status` (a `leftovers` line, `removal_leftovers` in JSON) and `tickertape archive`
+  (`leftovers`) report it. **It may hold records the journal no longer has** (a writer that already held the segment can
+  have filled it and moved on, in the race the check is for), so do not delete it because its `base_seq` is below the
+  checkpoint segment's. A later `archive` or writer retention run unlinks it once retention has removed the segment
+  after it (its seal names a segment that is gone, below the oldest), its name is an hour old and its process is gone.
+  To deal with one yourself:
+  - To keep its records, move it to an archive directory under its segment name (`mv -n NAME
+    ARCHIVE/{base_seq:020}.tape`).
+  - To return it to the journal, stop every writer and archiver of the journal, then rename it to `{base_seq:020}.tape`
+    without replacing anything: `mv -n NAME DIR/{base_seq:020}.tape` (check that `NAME` is gone afterwards), or `ln NAME
+    DIR/{base_seq:020}.tape && rm NAME`. Run `tickertape verify`: a broken chain at that segment means the segment after
+    it is gone; take it out again as above. Put two consecutive leftovers (the older one's seal names the newer one's
+    segment) back newest first and the older one last, so that the chain is whole after each rename. If a writer refuses to open with a dangling checkpoint naming that
+    `base_seq` (the archiver was killed while putting back a segment that a recovery had just restarted), this is the
+    fix; for a move by rename, the file is in the destination under its segment name.
 - Moves preserve the segment basename and require an existing destination directory. Same-filesystem moves use
   an atomic no-replace rename. `EXDEV` selects copy, sync the copy, sync the destination directory, remove the
   source, sync the journal directory. Existing files (including symlinks and identical copies) are errors.
@@ -293,12 +322,14 @@ tickertape index /data/journal --remove    # deletes them
 - It indexes the sealed segments before the checkpoint marker's segment, so a writer that never checkpoints gets none
   while it runs. Newly sealed segments have none until the next run, and the newest segment never has one: a consumer that
   restarts near the head gains nothing (`seek_to_end` starts at the marker).
-- The size is 24 bytes per 64 KiB of segment (0.04 %); a build reads each new segment once. Nothing is added to the writer
-  while it runs; its open lists `seek-index/` and removes what recovery could invalidate.
+- The size is 24 bytes per 64 KiB of segment (0.04 %); a build reads each new segment once (128 MiB: 19 to 60 ms from the
+  page cache, 0.2 s from local SSD; `benchmarks.md`, 2026-11-26). Nothing is added to the writer while it runs; its open
+  lists `seek-index/` and removes what recovery could invalidate.
 - In a journal of 10,000 to 20,000 segments a run with nothing new to index opens every segment and index: 0.1 to
   0.2 s with a warm cache, 3 to 12 s when it is cold (`benchmarks.md`, 2026-11-25). The index shortens a seek that
-  crosses much of a segment (128 MiB: from 0.18 s to about 1 ms, cold), not the directory read that every seek starts
-  with, so it does not help where segments are small and many.
+  crosses much of a segment (128 MiB, cold: 0.18 to 0.19 s without, 0.5 to 1.8 ms with; warm: 12 to 57 ms without,
+  about 0.1 ms with; 2026-11-25 and 2026-11-26), not the directory read that every seek starts with, so it does not help
+  where segments are small and many.
 - The directory `seek-index/` is created with the journal directory's group and mode. If the command refuses to create it
   (the journal directory belongs to another user, is writable by everyone, or its group is not one of this user's, as for
   a directory made under `/tmp` on macOS), create it yourself with the journal directory's owner, group and mode.
@@ -648,8 +679,74 @@ previous = now;
 ```
 
 An application can time anything else with a `latency::Recorder` of its own, for example its `checkpoint()` calls, or an
-event's handling from when it was due (see the module's documentation for why that differs from the call's duration). The
-library records nothing by itself: no histogram of appends, rolls or checkpoints is kept in the writer.
+event's handling from when it was due (see the module's documentation for why that differs from the call's duration).
+
+### How long the writer's calls take
+
+From 1.1 (ADR [0047](decisions/0047-latency-histograms.md)), **off by default**. `WriterConfig::latency` makes the writer
+keep histograms of its own calls, which any thread of **its process** can read through `Writer::latency()`. They cannot be
+read from another process: `tickertape status` does not show them, and the bindings do not have them yet.
+
+| `LatencyMode` | Records | Work added to an append that does not roll |
+|---|---|---|
+| `Off` (default) | Nothing; `Writer::latency()` is `None` | One test |
+| `RollsAndCheckpoints` | Rolls, and checkpoints from request to durable marker | None over `Off` |
+| `All` | Also every append and every batch, without sampling | Two monotonic clock reads and one histogram update |
+
+```rust
+let mut writer = Writer::open("/data/journal", WriterConfig::default().latency(LatencyMode::RollsAndCheckpoints))?;
+let latency = writer.latency().cloned(); // for the monitoring thread
+```
+
+| Suggested metric | Accessor | What one value is |
+|---|---|---|
+| `append_service_seconds` | `append()` | One successful `append`, `append_with` or `try_append_with`, from its entry to its return |
+| `append_batch_service_seconds` | `batch()` | One successful `append_batch` that appended at least one record, whatever its size |
+| `roll_seconds` | `roll()` | The time the appending thread spent on one roll (also inside a batch); the append's or batch's value includes it |
+| `checkpoint_time_to_durable_seconds` | `time_to_durable()` | One checkpoint that wrote its marker, from the entry of `checkpoint()`, or of the earliest `request_checkpoint()` it covers, until the marker is durable |
+
+**What these numbers are not.**
+
+- **`append_service_seconds` is a service time, not a response time.** If one append stalls for 5 ms, the events queued
+  behind it are late too, but there is one 5 ms value (coordinated omission), so the histogram can look better than what a
+  queue behind the writer experienced. A program that knows when each event was due records `now - due` in a
+  `latency::Recorder` of its own.
+- **A call or a checkpoint that is still stuck has no value yet.** `tickertape status` shows that: a head that stands
+  still, a growing exposure age. Calls that fail, declined records and empty batches are not recorded at all.
+- **Short values are distorted by the clock, both ways.** Parts of both clock reads fall inside an append's value, and
+  the clock ticks: 41.7 ns on Apple silicon, the period of `cntfrq_el0` on other aarch64 machines. With a coarse clock a
+  short append often shows as 0 or one tick (on an M4 Pro, 1,000,000 appends of 8 bytes gave about 40 % zeros and 60 %
+  at 41–42 ns); with a fine one even an empty interval measures some nanoseconds (its median, in
+  [`benchmarks.md`](benchmarks.md) 2026-11-26: 20 ns on x86-64 and 33 ns on aarch64 cloud VMs). Nothing is subtracted.
+- **They include being descheduled**, page faults, the wake-up of blocked readers and the hand-off to the helper threads.
+  Timing also changes the code that is timed: it limits how far consecutive appends overlap in the CPU, and the end read
+  does not wait for the store buffer, so part of an append's cost can fall outside its value.
+- **`checkpoint_time_to_durable_seconds` is not a record's time to durability**, which adds the wait for the next request
+  (`RecordAge` in a durable-only reader shows that). It includes waiting behind a running checkpoint and excludes the
+  retention run that follows it (a blocking `checkpoint()` called while a background checkpoint's retention runs still
+  waits for the removal in progress, and that wait is in its value). Requests that join a waiting checkpoint give one
+  value, from the earliest of them.
+- **They are not the numbers of the published `tt-sustained` tables.** `tt-sustained` counts to-durable once per request,
+  so joined requests count several times there and once here, and up to when its loop sees the checkpoint finished. Its
+  "roll" is the whole append that rolled; `roll_seconds` is only the roll, so it is smaller. Its "Pause" (the time a
+  caller spends in `request_checkpoint` or `checkpoint`) is not measured here: time your own calls.
+
+**Cost.** Measured on 4-vCPU cloud VMs ([`benchmarks.md`](benchmarks.md), 2026-11-26): with `Off` and
+`RollsAndCheckpoints` an append that does not roll ran within 1 ns of the code without the option at 64 B (within the
+noise on x86-64, 0.8 ns faster on aarch64) and within the noise floor and the 2 % bound at 1,024 B. **`All` added 57 ns to a 64-byte append on x86-64
+(38 → 95 ns, about 10.5 million appends/s on one thread) and 83 ns on aarch64 (42 → 125 ns, about 8 million/s)**, and
+54 to 58 ns to a 1,024-byte one: more than the append itself at 64 B. Almost all of it is the two clock reads; the
+histogram update is about 2 ns. Turn `All` on where that is affordable, or for a period of diagnosis.
+
+**Linux:** the clock reads of `All` are calls into the vDSO, without entering the kernel, only with a clock source the
+vDSO can read: `tsc`, `kvm-clock`, `hyperv_clocksource_tsc_page` and `arch_sys_counter`. With others (`hpet`, `acpi_pm`,
+some Xen guests) each read is a system call: **do not use `LatencyMode::All` there.** The library does not test for it;
+`cat /sys/devices/system/clocksource/clocksource0/current_clocksource` says which one is in use. macOS reads the clock
+without a system call.
+
+Each histogram takes about 30 KB, allocated when the writer opens. Nothing else is needed for it: no thread, no lock, no
+file, and no effect on what is committed or durable. Export it as shown above for `RecordAge`, with a snapshot per scrape
+and `since` for the values of an interval.
 
 ### Making readers in other processes visible
 

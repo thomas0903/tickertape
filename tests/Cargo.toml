@@ -89,6 +89,10 @@ name = "retention_at_scale"
 path = "retention_at_scale.rs"
 
 [[test]]
+name = "retention_recovery_race"
+path = "retention_recovery_race.rs"
+
+[[test]]
 name = "status"
 path = "status.rs"
 
@@ -127,6 +131,10 @@ path = "allocation.rs"
 [[test]]
 name = "record_age"
 path = "record_age.rs"
+
+[[test]]
+name = "writer_latency"
+path = "writer_latency.rs"
 
 [[test]]
 name = "seek"

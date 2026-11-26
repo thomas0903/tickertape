@@ -51,7 +51,7 @@ public final class ReaderOptions {
      * Whether the reader returns only <b>durable</b> records: those covered by a checkpoint (ADR 0010, crash contract
      * C13). By default it returns every <b>visible</b> record, including records a power loss can still erase. A
      * durable-only reader treats records after the checkpoint as not written yet, and returns nothing without a
-     * valid checkpoint marker.
+     * valid checkpoint marker. While it waits for a checkpoint it is woken by checkpoints, not by appends (ADR 0053).
      */
     public ReaderOptions durableOnly(boolean enabled) {
         return new ReaderOptions(enabled, seekIndex, notify, busySpin, spins, yields, minSleepNs, maxSleepNs,

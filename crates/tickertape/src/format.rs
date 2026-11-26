@@ -199,6 +199,10 @@ pub fn encode_record_body(header: &RecordHeader, payload: &[u8], body: &mut [u8]
 /// Fills in the CRC of a body whose header fields and payload are already in place (used after
 /// [`write_record_fields`] and an in-place payload fill). `len` must be a valid frame length and
 /// `body` must contain exactly `len - 4` bytes (`[P+4, P+len)`).
+// Always inlined, with `record_crc` and `crc::crc32c`: the append path is compiled twice, with and without timing
+// (`Writer::try_append_with`, ADR 0047), and otherwise whether the compiler inlines these into `Writer::append` changes
+// with unrelated code elsewhere in the crate, by up to 20 instructions per append either way.
+#[inline(always)]
 pub fn finish_record_body(len: u32, body: &mut [u8]) {
     debug_assert!((RECORD_HEADER_LEN as u32..=MAX_FRAME_LEN).contains(&len));
     debug_assert_eq!(body.len() as u64, u64::from(len).saturating_sub(4));
@@ -1162,6 +1166,7 @@ fn put(buf: &mut [u8], offset: u64, bytes: &[u8]) {
     }
 }
 
+#[inline(always)] // see `finish_record_body`
 fn record_crc(len: u32, fields_and_payload: &[u8]) -> u32 {
     crate::crc::crc32c_append(crate::crc::crc32c(&len.to_le_bytes()), fields_and_payload)
 }

@@ -70,14 +70,20 @@ pub(crate) struct Listed {
 /// the listing on the supported file systems; where a file system reports none, `file_type` asks with an `lstat` per
 /// entry.)
 pub(crate) fn list_bases(dir: &Path) -> Result<Vec<Listed>> {
+    list_bases_and(dir, |_| {})
+}
+
+/// [`list_bases`], which also passes every other name that is valid UTF-8 to `other`, from the same listing.
+pub(crate) fn list_bases_and(dir: &Path, mut other: impl FnMut(&str)) -> Result<Vec<Listed>> {
     let mut out = Vec::new();
     for entry in list_entries(dir)? {
         let entry = entry.map_err(|e| Error::io("list journal directory", dir, e))?;
-        let Some(base) = entry
-            .file_name()
-            .to_str()
-            .and_then(format::parse_segment_file_name)
-        else {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(base) = format::parse_segment_file_name(name) else {
+            other(name);
             continue;
         };
         let inode = entry

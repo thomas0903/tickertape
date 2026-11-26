@@ -43,6 +43,10 @@ fn mappings() -> usize {
 /// Open descriptors of this process, except (Linux) those under `/sys/devices/system/cpu/`: a helper thread reads
 /// `/sys/devices/system/cpu/isolated` once when it starts, to place itself, which may still be open just after the
 /// writer's open. Everything else counts, also a descriptor the writer leaked outside the journal directory.
+///
+/// A descriptor that was closed between the listing and the look at what it names is not open, and is not counted:
+/// counting it made the count just after the open one too high when a helper closed that file in between (issue #73:
+/// the worst state then came out one below the bound, 15 against 16 on a loaded aarch64 runner).
 fn writer_descriptors() -> usize {
     if !cfg!(target_os = "linux") {
         return descriptors();
@@ -50,8 +54,8 @@ fn writer_descriptors() -> usize {
     std::fs::read_dir("/proc/self/fd").map_or(0, |fds| {
         fds.flatten()
             .filter(|fd| {
-                !std::fs::read_link(fd.path())
-                    .is_ok_and(|target| target.starts_with("/sys/devices/system/cpu/"))
+                std::fs::read_link(fd.path())
+                    .is_ok_and(|target| !target.starts_with("/sys/devices/system/cpu/"))
             })
             .count()
     })

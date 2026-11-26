@@ -400,6 +400,9 @@ pub unsafe extern "C" fn tickertape_reader_options_free(options: *mut tickertape
 /// Records it returns survive a power loss only under the crash contract's conditions: storage that honours the sync
 /// calls, and no failed checkpoint earlier in the same boot (`docs/crash-contract.md`).
 ///
+/// While it waits for a checkpoint it is woken by checkpoints, not by appends (ADR 0053; beside a 1.0.0 writer it polls
+/// the marker at the maximum sleep instead).
+///
 /// # Safety
 ///
 /// `options` must be NULL or live reader options, not used by another thread during the call.

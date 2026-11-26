@@ -60,6 +60,8 @@ mod journal;
 pub mod latency;
 mod mmap;
 mod notify;
+#[cfg(all(test, loom))]
+mod notify_model;
 mod prefault;
 #[cfg(all(test, loom))]
 mod protocol_model;
@@ -75,7 +77,7 @@ pub mod status;
 mod writeback;
 mod writer;
 
-pub use config::{Backoff, HelperCpus, ReaderConfig, RecoveryPolicy, WriterConfig};
+pub use config::{Backoff, HelperCpus, LatencyMode, ReaderConfig, RecoveryPolicy, WriterConfig};
 pub use error::{CorruptReason, Error, Result};
 pub use reader::{Reader, Records};
 pub use record::{NewRecord, OwnedRecord, Record};
