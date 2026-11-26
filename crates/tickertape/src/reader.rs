@@ -1,6 +1,6 @@
 //! Readers: replay and live tailing.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::fs::File;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
@@ -194,8 +194,16 @@ enum After {
 }
 
 /// What a reader keeps about its waits at empty slots ([`Reader::wait`]).
+///
+/// `#[repr(C)]`, in the order rustc chose before `strays` was added (`tail_wait` at 0, `listed` at 24, `tail_fills` at
+/// 64), so that the fill path of the `pread` reader ([`Reader::fill_size`], [`Reader::blocked_for`]) compiles as it
+/// did; `tests::waits_layout` pins it. Add new fields at the end.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[repr(C)]
 struct Waits {
+    /// The wait at the slot the reader last found empty, for [`Reader::fill_size`]. Written only at empty slots
+    /// ([`Reader::at_empty_slot`]), never on the record path.
+    tail_wait: Option<SlotWait>,
     /// The last time [`Reader::check_head`] looked for later segments: `None` if it has not run since the reader was
     /// opened or moved by a seek, or if it ended in an error. It then runs at the next empty slot without waiting first.
     listed: Option<Listed>,
@@ -203,9 +211,6 @@ struct Waits {
     /// `TAIL_FILLS + TAIL_PROBE - 1` and then from `TAIL_FILLS` again ([`Reader::fill_size`], ADR 0052). Written only by
     /// fills of the `pread` buffer, and by a `seek_to_end` that fails.
     tail_fills: u16,
-    /// The wait at the slot the reader last found empty, for [`Reader::fill_size`]. Written only at empty slots
-    /// ([`Reader::at_empty_slot`]), never on the record path.
-    tail_wait: Option<SlotWait>,
     /// The later names that listings found not to be segments, for [`Reader::history_after`]. Forgotten when a seek
     /// moves the cursor.
     strays: Strays,
@@ -217,11 +222,13 @@ struct Waits {
 ///
 /// Such a name is no evidence that the journal continues (ADR 0050), and hides none, but a header written into the file
 /// in place would make it some, so it can't be dismissed for good; reading every one again at every listing cost an
-/// idle reader of a directory with 10,000 of them up to half a second, once a second. So a listing reads the names it
-/// has not read before (or whose inode number changed: another file at the name) all, and of the others at most
+/// idle reader of a directory with 10,000 of them 0.1 s or more, once a second. So a listing reads the names it has not
+/// read before (or whose inode number changed: another file at the name) all, and of the others at most
 /// [`STRAY_READS`], in turn. While there are at most that many, each is read at every listing, as before; with `M` of
-/// them, each is read at least once in every `ceil(M / STRAY_READS)` listings. A new name, a segment linked or renamed
-/// into place, is read at the first listing that shows it.
+/// them, each is read at least once in every `ceil(M / STRAY_READS)` listings. A new name is read at the first listing
+/// that shows it, and so is a file renamed over a stray if its inode number differs from the stray's (otherwise it is
+/// read in its turn). A listing holds 17 bytes per later name (the names with their inode numbers, and a flag), and the
+/// queue 16 bytes per stray name.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct Strays {
     /// `(base, inode number)`.
@@ -582,8 +589,11 @@ impl Reader {
     /// later listing every new one (or one that another file has replaced, by its inode number) and at most 256 of the
     /// others, the ones read longest ago (issue #89). With `M` such names a header written into one in place is seen
     /// within `ceil(M / 256)` listings (at the next one while `M` is at most 256), that is within about `ceil(M / 256)` ×
-    /// 1.1 s plus the spacing of the calls and the 50 ms below; a segment linked or renamed into place, at the next
-    /// listing. No reader gets past such a slot: the records between it and the end of its segment can't be found, and
+    /// 1.1 s plus the spacing of the calls and the 50 ms below (`docs/crash-contract.md`, C11); a segment linked or
+    /// renamed into place, at the next listing if its file has another inode number than the stray it replaced (a
+    /// file system can reuse a freed number, and some FUSE file systems give every entry the same one), otherwise in
+    /// its turn.
+    /// No reader gets past such a slot: the records between it and the end of its segment can't be found, and
     /// every call returns the error again. `inspect::verify` reports it too; records after the checkpoint marker can be
     /// repaired by the writer's recovery, covered ones only from a copy of the segment. A slot that was emptied where
     /// nothing above covers it (in the newest segment at or after the marker, for example) can't be told from the head.
@@ -1100,6 +1110,8 @@ impl Reader {
             .map_or((base, format::SEGMENT_HEADER_LEN as u64), |m| {
                 (m.next_seq, m.offset)
             });
+        // Taken, not copied: the cursor's move forgets it anyway, and a failure puts it back.
+        let strays = std::mem::take(&mut self.wait.strays);
         let before = Place {
             seg: std::mem::replace(&mut self.seg, seg),
             offset: std::mem::replace(&mut self.offset, offset),
@@ -1118,7 +1130,10 @@ impl Reader {
             buf: std::mem::take(&mut self.buf),
             buf_start: self.buf_start,
             waiting_since: self.waiting_since,
-            wait: (*self.wait).clone(),
+            wait: Waits {
+                strays,
+                ..(*self.wait).clone()
+            },
             found: self.found,
         };
         self.cursor_moved();
@@ -2061,13 +2076,19 @@ impl Strays {
             self.names.clear();
             return None;
         }
-        if !self.names.is_empty() {
-            let listed: HashSet<(u64, u64)> = later.iter().copied().collect();
-            self.names.retain(|name| listed.contains(name));
-        }
-        let known: HashSet<(u64, u64)> = self.names.iter().copied().collect();
+        // Which listed names are remembered, by their place in `later` (sorted, the newest first): one byte a name.
+        let mut known = vec![false; later.len()];
+        self.names.retain(
+            |name| match later.binary_search_by(|probe| name.cmp(probe)) {
+                Ok(i) => {
+                    known[i] = true;
+                    true
+                }
+                Err(_) => false,
+            },
+        );
         let remembered = self.names.len();
-        for &name in later.iter().filter(|name| !known.contains(name)) {
+        for (&name, _) in later.iter().zip(&known).filter(|(_, known)| !**known) {
             if is_segment(dir, name.0) {
                 return Some(name.0);
             }
@@ -2783,6 +2804,22 @@ mod tests {
         );
     }
 
+    /// The layout of [`super::Waits`]: the fields the `pread` reader's fill path reads stay where rustc put them before
+    /// the stray names were added (issue #89), so that path compiles as it did. 64-bit Linux and macOS only.
+    #[test]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    fn waits_layout() {
+        use super::Waits;
+        use std::mem::offset_of;
+        assert_eq!(offset_of!(Waits, tail_wait), 0);
+        assert_eq!(offset_of!(Waits, listed), 24);
+        assert_eq!(offset_of!(Waits, tail_fills), 64);
+        assert_eq!(offset_of!(Waits, strays), 72);
+    }
+
     thread_local! {
         /// How many of this thread's next non-empty slot reads [`scripted`] turns into a validation failure.
         static FAIL_READS: Cell<u32> = const { Cell::new(0) };
@@ -3409,6 +3446,8 @@ mod tests {
             reader.durable_offset = 9;
             reader.bound = 1 << 12;
             reader.wait.tail_fills = 5;
+            // Taken into the saved state, not copied, and put back (issue #89).
+            reader.wait.strays.names = [(1_000_000, 7), (1_000_001, 8)].into();
             reader.wait.tail_wait = Some(super::SlotWait {
                 base: 1,
                 offset: 2,

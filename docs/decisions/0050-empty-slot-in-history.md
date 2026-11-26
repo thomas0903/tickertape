@@ -195,19 +195,28 @@ listings; a segment linked or renamed into place (a new name, or another inode a
 waiting visible reader lists at most once a second, so (B) now reports within about `ceil(M / 256)` × 1.1 s plus the
 spacing of the calls, plus the 50 ms window, where it reported within 1.1 s (unchanged for `M` up to 256). A file
 removed and created again at a name, between two listings, can get the old inode number on some file systems: it is
-then read in its turn, within the same bound. A durable-only reader lists only at an empty slot below a marker that no
-longer covers it, and does the same. `try_next`'s rustdoc states the bound.
+then read in its turn, within the same bound, and so is a file renamed over a stray on a file system whose listing gives
+every entry the same inode number (some FUSE file systems). A durable-only reader never makes this check while it
+waits at the marker (it lists only at an empty slot below a marker that no longer covers it, besides the listing of its
+open and its seeks), and does the same there. `try_next`'s rustdoc and crash contract C11 state the bound.
 
-**Cost.** Per listing: the listing, two hash sets of the later names, and at most 256 header reads besides the new
-names. With 10,000 empty stray names, informal: an idle visible reader's calls that list took 9–22 ms on the M4 Pro
-(before: 105–168 ms) and 4–9 ms in the Linux VM (before: up to 32 ms); the first check after an open still reads them
-all.
-The memory is 16 bytes per stray name. The record path is unchanged: `try_next`, `advance`, `read_slot` and
+**Cost.** Per listing: the listing, sorted, a binary search in it for each remembered name, and at most 256 header reads
+besides the new names. With 10,000 empty stray names, informal: an idle visible reader's calls that list took 7.8–20 ms
+on the M4 Pro (before: 105–168 ms) and 1.3–7.7 ms in the Linux VM (before: up to 32 ms); the first check after an open
+still reads them all. Memory: during a listing 17 bytes per later name (base and inode number, and one flag; the
+vector's spare capacity can add up to as much again), where the code before held 8 (the bases); between listings 16
+bytes per remembered stray name (at 1,000,000 stray names: about 17 to 33 MB during a listing and 16 to 32 MB kept,
+against 8 to 16 MB during a listing before). The record path is unchanged: `try_next`, `advance`, `read_slot` and
 `next_timeout` compile to the same instructions on aarch64 macOS and x86-64 Linux (apart from label numbers), and
-`Reader`'s layout is unchanged (`reader_layout`).
+`Reader`'s layout is unchanged (`reader_layout`). `Waits` is `#[repr(C)]` with the new state last, so that the fill
+path's fields keep their offsets: `fill_buf` and `at_empty_slot` compile as before too (`tests::waits_layout`).
+`seek_to_end` moves the remembered names into the state it restores on failure instead of copying them.
 
-**Tests.** `reader_stray_tests.rs` counts header reads: the pathological directory (all at the first check, then 256
-per listing; a new name at once; a seek reads all again), a stray file given a header in place after each number of
-listings (found within the bound), a stray replaced by rename (found at the next listing), and a durable-only reader.
-Each fails if a listing reads every remembered name again; the header and durable-only tests fail if the turn does not
-advance, the rename test if inode numbers are ignored, the first if a seek keeps what was remembered.
+**Tests.** `reader_stray_tests.rs` counts header reads: the pathological directory (all at the first check, then 256 per
+listing; a new name at once; a seek reads all again), a stray file given a header in place after each number of listings
+(found within the bound), the same in a directory whose modification time counts as settled, a stray replaced by rename
+(found at the next listing), a durable-only reader, and `seek_to_end` forgetting the names (and restoring them when it
+fails). Each fails if a listing reads every remembered name again; the header, settled-directory and durable-only tests
+fail if the turn does not advance, the settled-directory test if strays alone count as "nothing", the rename test if
+inode numbers are ignored, the first if a seek keeps what was remembered, and the `seek_to_end` restore test if the
+names are not put back.

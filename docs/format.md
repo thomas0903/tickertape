@@ -209,7 +209,8 @@ that covers it. So a slot expecting sequence number `S` in segment `X` **cannot 
 in between. The slot must be read again after 1, because the 0 read first may be older than the record.) A reader
 reports such a slot as corruption at its offset, `EmptyCommitWord`, after reading it again for 50 ms and then making sure
 of 1 to 3 once more. It looks at the first empty slot after it was opened or moved by a seek, and then after each 100 ms
-at an empty slot (for a later segment at most once a second). Any other empty slot is "no record yet".
+at an empty slot (for a later segment at most once a second; a later name without a valid header is read again in turn,
+at most 256 such names per listing: ADR 0050, amendment of 2026-11-27). Any other empty slot is "no record yet".
 
 A visible reader that a repair in place has left at an offset that starts no record ("What readers do about repairs") is
 not told that bytes are corrupt: if 1 to 3 hold but the record it passed last is not in the file right before its

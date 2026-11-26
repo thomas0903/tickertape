@@ -206,18 +206,19 @@ The figures are from `benchmarks.md`, 2026-11-25, **one cloud machine shape** (G
 Xeon Platinum 8481C, ext4 on a local NVMe SSD, Linux x86-64), warm cache unless said; other machines and file systems
 differ, and none of this was measured on macOS.
 
-| Operation | 10,000 segments | 20,000 | 100,000 | What grows |
-|---|---|---|---|---|
-| Reading the directory, warm / cold | 2.5 / 18 ms | 5.0 / 35 ms | 25 / 215 ms | about 0.25 to 0.29 µs per segment when cached |
-| `Reader::seek`, before it reads a record | about 3 ms | 6 ms | 29 ms | one listing per seek, also with a seek index (ADR 0046) |
-| `checkpoint()` with a retention policy that removes nothing (p50, from 1.1) | 3.2 ms | 6.4 ms | 31 ms | one listing per retention run (ADR 0051); 0.3 ms without a policy |
-| Removing segments with `retention::apply`, 100 in one run, per segment | 0.37 ms | 0.37 ms | 0.59 ms | one listing per run, spread over its removals |
-| "Cold" `Writer::open` (the directory cached), no policy / `max_segments` / `max_bytes` | 8.3 / 11.5 / 53 ms | 16 / 22 / 111 ms | 73 / 108 / 575 ms | listings; with `max_bytes`, a `stat` of every file |
-| `inspect::list_segments`, warm / cold | 30 ms / 2.1 s | 60 ms / 4.0 s | 0.29 s / 21 s | opens every segment (`verify` too, and reads every record) |
+| Operation | 1,000 segments | 10,000 | 20,000 | 100,000 | What grows |
+|---|---|---|---|---|---|
+| Reading the directory, warm / cold | 0.28–0.30 / 1.7–1.9 ms | 2.5 / 18 ms | 5.0 / 35 ms | 25 / 215 ms | about 0.25 to 0.29 µs per segment when cached |
+| `Reader::seek`, before it reads a record | 0.35–0.38 ms (the whole seek) | about 3 ms | 6 ms | 29 ms | one listing per seek, also with a seek index (ADR 0046) |
+| `checkpoint()` with a retention policy that removes nothing (p50, from 1.1) | – | 3.2 ms | 6.4 ms | 31 ms | one listing per retention run (ADR 0051); 0.3 ms without a policy |
+| Removing segments with `retention::apply`, 100 in one run, per segment | – | 0.37 ms | 0.37 ms | 0.59 ms | one listing per run, spread over its removals |
+| "Cold" `Writer::open` (the directory cached), no policy / `max_segments` / `max_bytes` | – | 8.3 / 11.5 / 53 ms | 16 / 22 / 111 ms | 73 / 108 / 575 ms | listings; with `max_bytes`, a `stat` of every file |
+| `inspect::list_segments`, warm / cold | 2.7–3.0 / 194–199 ms | 30 ms / 2.1 s | 60 ms / 4.0 s | 0.29 s / 21 s | opens every segment (`verify` too, and reads every record) |
 
 The 100,000-segment journal had 64 KiB segments, the others 1 MiB. The checkpoint, removal and open rows are from the
-section "retention on journals of many segments", the others from "replay and recovery at scale" (cold there means the
-page cache dropped before the operation).
+section "retention on journals of many segments", which has no journal of 1,000 segments ("–"); the others from
+"replay and recovery at scale" (cold there means the page cache dropped before the operation). At 1,000 segments the
+seek row is the whole seek to a segment's first record, warm, with the safe reader.
 
 **What a run still reads per file.** A retention run reads the directory once and then only what its policy needs
 (ADR 0051): with `max_segments` nothing more while the count is within the limit; with `max_age` the headers of the
@@ -246,7 +247,10 @@ is left as it is.
 - **Seek less often in large journals:** each seek costs a listing, whatever its distance; reading forward costs none.
 - **Keep stray files out of the journal directory**, above all files named like segments (`{N:020}.tape`) that are not:
   a waiting reader reads up to 256 of their headers per listing (at most once a second, ADR 0050, issue #89), all of
-  them at its first check after an open or a seek, and `verify` reports them.
+  them at its first check after an open or a seek, and `verify` reports them. With `M` of them, a header written into
+  one in place is seen only after about ⌈M/256⌉ × 1.1 s (1,000 strays: about 4.4 s), so a damaged slot that such a file
+  would show is reported that much later (crash contract C11). The reader keeps 16 bytes per stray name, and a listing
+  17 bytes per later name.
 
 There is no cached listing (ADR 0046, amended 2026-11-27): retention, archivers in other processes and recovery change
 the directory at any time, and a stale listing would send a reader to a segment that is gone.

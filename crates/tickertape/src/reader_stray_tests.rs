@@ -10,7 +10,7 @@ use crate::{CorruptReason, Error, NewRecord, ReaderConfig, Result, Writer, Write
 use std::fs::OpenOptions;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 const SEGMENT: u64 = 65_536;
 /// Far more than one listing reads again.
@@ -60,15 +60,32 @@ fn header(base: u64) -> [u8; format::SEGMENT_HEADER_LEN] {
     })
 }
 
+/// A reader of the kind given: the zero-copy one if `mapped`.
+fn open(dir: &Path, mapped: bool, durable: bool) -> Reader {
+    let config = ReaderConfig::default().durable_only(durable).notify(false);
+    if mapped {
+        // SAFETY: only the tickertape writer of `journal` modifies the segment files (the strays are other files), and
+        // no payload is held while it appends.
+        unsafe { Reader::open_mapped(dir, config) }.unwrap()
+    } else {
+        Reader::open(dir, config).unwrap()
+    }
+}
+
 /// A reader at the head, after its first check (which read every later name).
 fn at_head(dir: &Path, durable: bool) -> Reader {
-    let mut reader = Reader::open(
-        dir,
-        ReaderConfig::default().durable_only(durable).notify(false),
-    )
-    .unwrap();
+    let mut reader = open(dir, false, durable);
     while reader.try_next().unwrap().is_some() {}
     reader
+}
+
+/// Writes the header of a segment into the stray at [`MIDDLE`], in place.
+fn header_in_place(dir: &Path) {
+    let file = OpenOptions::new()
+        .write(true)
+        .open(stray_path(dir, MIDDLE))
+        .unwrap();
+    file.write_all_at(&header(MIDDLE), 0).unwrap();
 }
 
 /// One call to `try_next` that makes the check with a listing (as if the reader had waited at the slot for over a
@@ -108,16 +125,23 @@ fn checks_until_reported(reader: &mut Reader, base: u64) -> u64 {
     panic!("not reported within {} checks", BOUND + 2);
 }
 
-/// The issue's directory: a waiting reader reads every stray at its first check, and then at most `STRAY_READS` of them
-/// per listing (before: all of them, at every listing). A seek makes it read them all again, once.
+/// The issue's directory: a waiting reader of either kind reads every stray at its first check, and then at most
+/// `STRAY_READS` of them per listing (before: all of them, at every listing). A seek makes it read them all again,
+/// once.
 #[test]
 fn a_waiting_reader_reads_at_most_stray_reads_known_names_per_listing() {
+    for mapped in [false, true] {
+        waiting_reader_of_kind(mapped);
+    }
+}
+
+fn waiting_reader_of_kind(mapped: bool) {
     let dir = tempfile::tempdir().unwrap();
     let writer = journal(dir.path());
     let mut reader = at_head(dir.path(), false);
     assert_eq!(check(&mut reader).0, 0, "no later names, no reads");
     strays(dir.path(), false);
-    let mut reader = Reader::open(dir.path(), ReaderConfig::default().notify(false)).unwrap();
+    let mut reader = open(dir.path(), mapped, false);
     let before = header_reads();
     while reader.try_next().unwrap().is_some() {}
     assert_eq!(
@@ -150,6 +174,45 @@ fn a_waiting_reader_reads_at_most_stray_reads_known_names_per_listing() {
     drop(writer);
 }
 
+/// `seek_to_end` forgets the remembered names when it succeeds, as a seek does, and moves them into the state it puts
+/// back when it fails (`tests::a_failed_seek_to_end_restores_every_field`), without copying them. (It can't run beside
+/// the strays above: it opens the newest name, as it did before, and fails on a file that is no segment.)
+#[test]
+fn seek_to_end_forgets_the_remembered_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let writer = journal(dir.path());
+    for mapped in [false, true] {
+        let mut reader = open(dir.path(), mapped, false);
+        reader.wait.strays.names = [(FIRST_STRAY, 7), (FIRST_STRAY + 1, 8)].into();
+        reader.seek_to_end().unwrap();
+        assert!(reader.wait.strays.names.is_empty(), "mapped: {mapped}");
+    }
+    drop(writer);
+}
+
+/// The listing goes on while there are strays, also in a directory whose modification time counts as settled (ADR 0050:
+/// a listing that finds nothing in such a directory is not made again until it changes). A header written in place does
+/// not change the directory, so a reader that took strays for nothing there would never see it.
+#[test]
+fn a_header_written_in_place_is_found_in_a_settled_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let writer = journal(dir.path());
+    strays(dir.path(), true);
+    std::fs::File::open(dir.path())
+        .unwrap()
+        .set_modified(SystemTime::now() - Duration::from_secs(10))
+        .unwrap();
+    let mut reader = at_head(dir.path(), false);
+    for _ in 0..2 {
+        let (reads, result) = check(&mut reader);
+        result.unwrap();
+        assert_eq!(reads, STRAY_READS as u64);
+    }
+    header_in_place(dir.path());
+    assert!(checks_until_reported(&mut reader, MIDDLE) <= BOUND);
+    drop(writer);
+}
+
 /// A stray that a header written in place makes a segment, after the reader has read it and found none: found within
 /// `ceil(STRAYS / STRAY_READS)` listings, whatever its place in the turn.
 #[test]
@@ -164,11 +227,7 @@ fn a_stray_that_gets_a_header_in_place_is_found_within_the_bound() {
             result.unwrap();
             assert_eq!(reads, STRAY_READS as u64);
         }
-        let file = OpenOptions::new()
-            .write(true)
-            .open(stray_path(dir.path(), MIDDLE))
-            .unwrap();
-        file.write_all_at(&header(MIDDLE), 0).unwrap();
+        header_in_place(dir.path());
         let n = checks_until_reported(&mut reader, MIDDLE);
         assert!(n <= BOUND, "{wait}: {n} checks");
         drop(writer);
@@ -215,11 +274,7 @@ fn a_durable_only_reader_reads_at_most_stray_reads_known_names_per_listing() {
         result.unwrap();
         assert_eq!(reads, STRAY_READS as u64);
     }
-    let file = OpenOptions::new()
-        .write(true)
-        .open(stray_path(dir.path(), MIDDLE))
-        .unwrap();
-    file.write_all_at(&header(MIDDLE), 0).unwrap();
+    header_in_place(dir.path());
     assert!(checks_until_reported(&mut reader, MIDDLE) <= BOUND);
     drop(writer);
 }
