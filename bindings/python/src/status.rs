@@ -36,6 +36,7 @@ pub const STATUS_ENUMS: &[(&str, &[(&str, &str)])] = &[
             ("MissingSegment", "missing_segment"),
             ("InvalidSegmentHeader", "invalid_segment_header"),
             ("InvalidOffset", "invalid_offset"),
+            ("Dangling", "dangling"),
         ],
     ),
     (
@@ -373,6 +374,7 @@ mod tests {
                     CheckpointProblem::InvalidSegmentHeader.code(),
                 ),
                 ("InvalidOffset", CheckpointProblem::InvalidOffset.code()),
+                ("Dangling", CheckpointProblem::Dangling.code()),
             ],
         );
         check(

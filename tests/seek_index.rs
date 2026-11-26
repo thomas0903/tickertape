@@ -111,6 +111,15 @@ fn index_path(dir: &Path, base: u64) -> PathBuf {
     index_dir(dir).join(format!("{base:020}.idx"))
 }
 
+/// Writes `bytes` as the index file at `path` with mode 0644, whatever the umask. Readers ignore an index that its group
+/// or others can write (ADR 0045), and under a umask of 0002 (Ubuntu's for a login whose group has its name) a file
+/// that `std::fs::write` creates is mode 0664: an index the test means to be used would not be, and one it means to be
+/// refused for its content would be refused for its mode.
+fn write_index(path: &Path, bytes: &[u8]) {
+    std::fs::write(path, bytes).unwrap();
+    std::fs::set_permissions(path, Permissions::from_mode(0o644)).unwrap();
+}
+
 /// The names in `seek-index/`, sorted.
 fn index_names(dir: &Path) -> Vec<String> {
     let mut names: Vec<String> = std::fs::read_dir(index_dir(dir))
@@ -336,7 +345,7 @@ fn forward_seeks_use_an_index_only_for_a_distance() {
         let seal = (seal, records.last().unwrap().seq + 1);
         for (entry, used) in [(1_000, false), (1_500, false), (1_501, true)] {
             let forged = forge(&segments(dir.path())[0].1, &[records[entry]], seal);
-            std::fs::write(&path, forged).unwrap();
+            write_index(&path, &forged);
             let mut reader = open(dir.path(), kind);
             reader.seek(0).unwrap();
             assert_eq!(read_up_to(&mut reader, 1_500).0.len(), 1_500);
@@ -349,7 +358,7 @@ fn forward_seeks_use_an_index_only_for_a_distance() {
             );
             assert_eq!(read_up_to(&mut reader, 1).0[0].seq, seal.1 - 1);
         }
-        std::fs::write(&path, std::mem::take(&mut bytes)).unwrap();
+        write_index(&path, &std::mem::take(&mut bytes));
     }
 }
 
@@ -371,7 +380,7 @@ fn a_file_that_is_not_the_index_is_not_used() {
     };
     let put = |bytes: &[u8]| {
         let _ = std::fs::remove_file(&path);
-        std::fs::write(&path, bytes).unwrap();
+        write_index(&path, bytes);
     };
     std::fs::remove_file(&path).unwrap();
     unused("missing");
@@ -472,7 +481,7 @@ fn an_entry_that_does_not_name_a_record_is_not_used() {
     let target = 2_000;
     let right = records[1_900];
     let put = |entry: Entry| {
-        std::fs::write(index_path(dir.path(), 0), forge(&path, &[entry], seal)).unwrap();
+        write_index(&index_path(dir.path(), 0), &forge(&path, &[entry], seal));
     };
     put(right);
     assert_eq!(all_agree(dir.path(), &[target], 5), 4, "a right one");
@@ -543,7 +552,7 @@ fn an_entry_that_does_not_name_a_record_is_not_used() {
         (seal.0 + 8, seal.1),
         (seal.0, seal.1 + 1),
     ] {
-        std::fs::write(index_path(dir.path(), 0), forge(&path, &[right], wrong)).unwrap();
+        write_index(&index_path(dir.path(), 0), &forge(&path, &[right], wrong));
         assert_eq!(all_agree(dir.path(), &[target], 5), 0, "seal {wrong:?}");
     }
     // 11. The record it names is damaged (the header, the payload): the result is the scan's, an error.
@@ -655,7 +664,7 @@ fn any_index_file_gives_the_same_results() {
     ];
     runner
         .run(&(bytes, 0..=last, 0_usize..4), |(bytes, target, kind)| {
-            std::fs::write(index_path(dir.path(), 0), &bytes).unwrap();
+            write_index(&index_path(dir.path(), 0), &bytes);
             let kind = KINDS[kind];
             if agrees(dir.path(), &mut open(dir.path(), kind), kind, target, 4) {
                 used.fetch_add(1, Ordering::Relaxed);
@@ -946,11 +955,11 @@ fn a_failed_index_leaves_the_cursor_and_an_empty_buffer() {
         let seal = (seal, records.last().unwrap().seq + 1);
         let entry = records[200];
         let put = |entry: Entry, seal| {
-            std::fs::write(index_path(dir.path(), 0), forge(&path, &[entry], seal)).unwrap();
+            write_index(&index_path(dir.path(), 0), &forge(&path, &[entry], seal));
         };
         match failure {
             0 => std::fs::remove_file(index_path(dir.path(), 0)).unwrap(),
-            1 => std::fs::write(index_path(dir.path(), 0), b"junk").unwrap(),
+            1 => write_index(&index_path(dir.path(), 0), b"junk"),
             2 => put(entry, (seal.0, seal.1 + 1)),
             // 8a, then 8b, then one that works.
             3 => put(
@@ -1584,7 +1593,7 @@ fn a_forged_index_can_return_a_frame_from_a_payload() {
         records[1_001].offset
     );
     let index = forge(&path, &[embedded], (seal, records.last().unwrap().seq + 1));
-    std::fs::write(index_path(dir.path(), 0), index).unwrap();
+    write_index(&index_path(dir.path(), 0), &index);
     for kind in KINDS {
         let mut reader = open(dir.path(), kind);
         reader.seek(1_000).unwrap();
@@ -1638,7 +1647,7 @@ fn an_index_that_names_seal_bytes_in_a_payload_is_wrong() {
     let path = segments(dir.path())[0].1.clone();
     let (records, _) = chain(&path);
     let index = forge(&path, &[records[700]], (records[1_000].offset + 40, 1_000));
-    std::fs::write(index_path(dir.path(), 0), index).unwrap();
+    write_index(&index_path(dir.path(), 0), &index);
     // A reader cannot tell; the place it lands on is right all the same.
     assert_eq!(all_agree(dir.path(), &[900, 2_000], 3), 8);
     assert_eq!(check(dir.path())[0], IndexState::Wrong);
@@ -2617,7 +2626,7 @@ fn an_entry_whose_bytes_start_no_frame_is_not_wrong() {
         crc: 0x1234_5678,
     };
     let index = forge(&path, &[entry], (seal, records.last().unwrap().seq + 1));
-    std::fs::write(index_path(dir.path(), 0), index).unwrap();
+    write_index(&index_path(dir.path(), 0), &index);
     assert_eq!(all_agree(dir.path(), &[1_000, 2_000], 3), 0);
     assert_eq!(check(dir.path())[0], IndexState::Ignored);
 }
@@ -2946,6 +2955,30 @@ fn permissions_of_what_a_build_creates() {
             .unwrap();
         assert!(status.success(), "umask {umask}");
     }
+}
+
+/// The tests that create index files for readers to use give them a mode readers use, whatever the umask. Under 0002
+/// (Ubuntu's for a login whose group has its name) a file `std::fs::write` creates is group-writable, which readers
+/// ignore: these two tests failed on a cloud machine and passed in CI, whose runner has 0022.
+#[test]
+fn index_tests_pass_under_a_group_writable_umask() {
+    let tests = [
+        "forward_seeks_use_an_index_only_for_a_distance",
+        "a_file_that_is_not_the_index_is_not_used",
+    ];
+    let out = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(r#"umask 002; exec "$0" --exact "$@""#)
+        .arg(std::env::current_exe().unwrap())
+        .args(tests)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && stdout.contains(&format!("{} passed", tests.len())),
+        "{stdout}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]

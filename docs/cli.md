@@ -113,7 +113,11 @@ Errors and recovery warnings go to stderr. JSON results go to stdout (or the sel
 - `archive <DIR> (--to <DEST> | --delete) [--keep-segments N] [--max-bytes B] [--older-than DUR]
   [--dry-run] [--json]`: requires at least one limit and exactly one action. Removes only a contiguous sealed
   prefix strictly before the checkpoint segment, stopping at the first ineligible segment or error. Without a
-  valid checkpoint nothing is eligible. Limits combine with OR; counts and bytes include every segment, including
+  valid checkpoint nothing is eligible. A checkpoint marker the writer would refuse removes nothing and exits 2 with
+  the writer's error, `--dry-run` included: from 1.1 that includes a marker whose position the records of its segment
+  do not reach (`DanglingCheckpoint` at that segment and the marker's offset, ADR 0056; it reads the record right
+  before the marker's offset for that), since restoring the matching marker or the segment needs the segments it would
+  remove. Limits combine with OR; counts and bytes include every segment, including
   the active one, so checkpoint eligibility can prevent reaching the limit. Age uses the successor header's
   creation time as seal time. `DUR` is a nonnegative integer followed by `d`, `h`, `m` or `s` (for example `30d`,
   `12h`, `90m`, `3600s`). `B` is a nonnegative integer with an optional uppercase `K`, `M`, `G` or `T` suffix
@@ -141,7 +145,8 @@ Errors and recovery warnings go to stderr. JSON results go to stdout (or the sel
   `verify` checks everything. When they are false, a healthy verdict (exit 0, `health ok (unverified)`) does not mean
   that the writer would open the journal: a segment the sample didn't read may be missing.
   Cost: one `stat` per segment, a `pread` scan of the newest segment from the checkpoint position (or from its
-  start if the checkpoint is in an older segment), a few headers, `statvfs`, and a few small reads per beacon; with
+  start if the checkpoint is in an older segment), a few headers, the record right before the checkpoint marker's
+  position (one 4 KiB `pread` for small records; from 1.1), `statvfs`, and a few small reads per beacon; with
   `--watch`, each sample after the first scans only what was appended since the previous one.
   `--watch` samples every `INTERVAL` (an integer followed by `ms`, `s`, `m` or `h`) until interrupted, or `--samples`
   times; from the second sample on it reports append rates and an estimated time until the volume is full. A sample
@@ -412,7 +417,7 @@ may grow:
  "segments":{"count":u64,"first_seq":u64,"total_bytes":u64,"oldest_created_unix_ns":u64|null,
              "before_checkpoint":u64},
  "checkpoint":{"generation":u64,"next_seq":u64,"segment_base_seq":u64,"offset":u64,
-               "problem":"missing_segment"|"invalid_segment_header"|"invalid_offset"|null,
+               "problem":"missing_segment"|"invalid_segment_header"|"invalid_offset"|"dangling"|null,
                "modified_unix_ns":u64|null,"estimated_age_s":number|null,
                "age_unknown_reason":"no_modification_time"|"modification_time_in_future"|
                                     "modification_time_before_segment"|"marker_resized"|"marker_changing"|
@@ -442,6 +447,9 @@ With `--watch`, a sample that fails is the line
 `{"schema_version":1,"journal":string,"sampled_unix_ns":u64,"error":{"code":"not_found"|"corrupt"|"unsupported_version"|"io","message":string}}`.
 
 `schema_version` is 1. Fields may be added without changing it; removing a field or changing its meaning bumps it.
+From 1.1 the sets of `checkpoint.problem` values and of breach `code`s may grow in a minor release (1.1 added
+`dangling`): a consumer must treat a `problem` it does not know as a problem (the writer refuses the journal)
+and a breach `code` it does not know as a breach (`health.corrupt` says whether it is corruption).
 With `--watch`, each sample is one line. `journal` is the canonical absolute path of the journal directory (if the
 directory doesn't exist when the command starts, the absolute path as given: the samples fail with `not_found`, a
 one-shot `--output` file gets `tickertape_up 0`, and a watch goes on sampling). Times
@@ -465,10 +473,14 @@ not be established.
   longer has; see `operations.md`. It is not a breach and has no code of its own; the text output lists the names on a
   `leftovers` line.
 - `checkpoint`: the marker's current slot, or null if no slot is valid. `problem` is set when the writer would refuse
-  the marker (its segment missing or with an invalid header, or an offset outside the record area); then `exposure`
-  is unknown and `health.corrupt` is true. A sample does not read the record before the marker's position, which the
-  writer also requires (from 1.1, ADR 0056: a marker its segment's records do not reach is refused); `verify` reports
-  where such records end. `modified_unix_ns` is the marker file's modification time and
+  the marker: `missing_segment`, `invalid_segment_header` (its segment missing or with an invalid header),
+  `invalid_offset` (an offset outside the record area), or, from 1.1, `dangling`: the records of its segment
+  do not reach its position (the record right before the marker's offset is missing, damaged, ends elsewhere or has
+  another sequence number, or at offset 64 `next_seq` is not the segment's base: segments restored from a backup older
+  than the marker, the last covered record damaged, or a marker that does not belong to these segments; ADR 0056; the
+  writer reports it as `DanglingCheckpoint`). The sample runs the writer's own check on the same
+  record, so it reports exactly the markers the writer refuses; 1.0 reported most of them as healthy. Then `exposure`
+  is unknown and `health.corrupt` is true; `verify` reports where the records end or the damaged record. `modified_unix_ns` is the marker file's modification time and
   `estimated_age_s` the time since then, by the observer's clock at the end of the sample; null with
   `age_unknown_reason` when the time is detectably unreliable (`marker_resized`: the marker is not at its full
   length, because something cut it; a writer leaves it so until its next checkpoint succeeds, then extends it;

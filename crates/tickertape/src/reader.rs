@@ -74,16 +74,44 @@ const LISTING_ATTEMPTS: u32 = 8;
 /// # }
 /// ```
 #[derive(Debug)]
+#[repr(C, align(16))]
 pub struct Reader {
+    // The layout is fixed (`#[repr(C, align(16))]`, ADR 0057, issue #86), and `tests::reader_layout` pins the offsets of
+    // the fields that the per-record path of either reader reads or writes (marked "Hot"). The order is the one rustc
+    // chose before the layout was fixed (`42b2307e`), so that the path compiles as it did then. The record path stores
+    // and loads `found` 16 bytes at a time: at a multiple of 16 in a 16-byte aligned struct, none of these accesses can
+    // straddle a page boundary, wherever the reader is; one that did made replay 15 to 30 % slower on Linux x86-64 and
+    // aarch64. Add new fields at the end (after `used_index`), where they move nothing, and put large state behind a
+    // pointer. Moving a hot field needs the replay benchmark on x86-64 and aarch64: grouping the hot fields at the start
+    // made the zero-copy reader 2 to 3 % slower on x86-64, for a reason not established.
     dir: PathBuf,
-    config: ReaderConfig,
-    mapped: bool,
+    /// Hot (ADR 0057): the record path uses `size` (at +32) and `map` (at +56).
     seg: OpenSegment,
+    /// `pread` buffer: bytes of `seg` starting at file offset `buf_start`. A zero-copy reader uses it only for a record
+    /// whose frame crosses `bound` ([`Reader::read_crossing`]), while that record is the current one.
+    /// Hot (ADR 0057).
+    buf: Vec<u8>,
+    /// The journal's wake-up region, if wake-ups are enabled (ADRs 0017 and 0021).
+    waker: Option<crate::notify::Waker>,
+    /// Hot (ADR 0057): the record path reads `durable_only`.
+    config: ReaderConfig,
+    /// When a durable-only reader waiting at the checkpoint last checked a segment that the marker has moved past.
+    superseded_checked: Option<Instant>,
+    /// When the reader started waiting at an empty slot.
+    /// Hot (ADR 0057).
+    waiting_since: Option<Instant>,
+    /// What the reader keeps about its waits at empty slots, for [`Reader::check_head`] and [`Reader::fill_size`].
+    /// Boxed (allocated at the open, never again). Before the hot part had a fixed layout, this state as a field moved the
+    /// reader so that the zero-copy reader replayed 64-byte records at half the speed on an Apple M4 Pro (ADR 0057).
+    wait: Box<Waits>,
     /// Offset of the next slot in `seg`.
+    /// Hot (ADR 0057).
     offset: u64,
     /// Sequence number expected at `offset`.
+    /// Hot (ADR 0057).
     next_seq: u64,
     /// Exclusive checkpoint boundary, refreshed only when durable-only reads reach it.
+    /// Hot (ADR 0057).
     durable_next_seq: u64,
     /// The segment the marker that set `durable_next_seq` names (0 if there was no valid marker).
     durable_segment_base: u64,
@@ -96,51 +124,47 @@ pub struct Reader {
     /// marker was read again there (a durable-only reader then has no mapping of `seg`). Checking a frame against this instead of `seg`'s size costs the per-record
     /// path no comparison. Set only by [`Reader::set_limit`], and where a failed `seek_to_end` is undone. The `pread`
     /// reader does not use it.
+    /// Hot (ADR 0057).
     bound: u64,
-    /// When a durable-only reader waiting at the checkpoint last checked a segment that the marker has moved past.
-    superseded_checked: Option<Instant>,
     /// Records before this are skipped (set by `seek`).
+    /// Hot (ADR 0057).
     skip_until: u64,
     /// The `next_seq` of a checkpoint marker read before the records the cursor has passed since the last seek that
     /// started at a segment's first record (or at the marker), from files confirmed current after it was read: while
     /// the cursor is at or below it, the cursor is a record boundary of the current chain (ADR 0046). Set only by
     /// seeks, which drop the read buffer; 0 if none, and after a landing through a seek index (ADR 0045).
     seek_covered: u64,
-    /// Whether the last `seek` landed through a seek index ([`Reader::seek_used_index`]).
-    used_index: bool,
-    /// `pread` buffer: bytes of `seg` starting at file offset `buf_start`. A zero-copy reader uses it only for a record
-    /// whose frame crosses `bound` ([`Reader::read_crossing`]), while that record is the current one.
-    buf: Vec<u8>,
+    /// Hot (ADR 0057).
     buf_start: u64,
-    /// The journal's wake-up region, if wake-ups are enabled (ADRs 0017 and 0021).
-    waker: Option<crate::notify::Waker>,
-    /// When the reader started waiting at an empty slot.
-    waiting_since: Option<Instant>,
-    /// What the reader keeps about its waits at empty slots, for [`Reader::check_head`] and [`Reader::fill_size`].
-    /// Boxed (allocated at the open, never again): as a field this size it made the zero-copy reader replay 64-byte records
-    /// at half the speed on an Apple M4 Pro, and so did 40 or 48 bytes of padding added to the code before (8 to 32 or 64
-    /// did not). The slowdown follows the size of `Reader`; its mechanism is not established (issue #86).
-    wait: Box<Waits>,
     /// The record [`Reader::advance`] found last (valid only after it returned `true`). The slot reads decode a
     /// record's header straight into it, so that the per-record path passes only small values around (see
     /// [`SlotOutcome`]).
+    /// Hot (ADR 0057).
     found: Found,
+    mapped: bool,
+    /// Whether the last `seek` landed through a seek index ([`Reader::seek_used_index`]).
+    used_index: bool,
 }
 
+/// `#[repr(C)]`, in the order rustc chose before it was fixed: `size` at +32 (the `pread` reader) and `map` at +56 (the
+/// zero-copy reader) are hot fields of [`Reader`] (ADR 0057).
 #[derive(Debug)]
+#[repr(C)]
 struct OpenSegment {
-    base: u64,
     path: PathBuf,
+    base: u64,
     size: u64,
-    file: File,
     identity: Identity,
     /// `None` for the `pread` reader, and for a durable-only zero-copy reader that gave it up
     /// ([`Reader::give_up_mapping`]).
     map: Option<MapRo>,
+    file: File,
 }
 
-/// A record found by [`Reader::advance`]: its header and where its payload is.
+/// A record found by [`Reader::advance`]: its header and where its payload is. `#[repr(C)]`, a hot field of [`Reader`]
+/// (ADR 0057).
 #[derive(Debug, Clone, Copy)]
+#[repr(C)]
 struct Found {
     header: RecordHeader,
     /// Offset of the payload in the segment file, plus [`COPIED`] if it is to be handed out from the zero-copy reader's
@@ -2263,7 +2287,7 @@ mod wake_tests {
         pub(super) static BEFORE_REGISTER: std::cell::Cell<Option<Box<dyn FnOnce()>>> =
             const { std::cell::Cell::new(None) };
     }
-    use crate::mmap::test_hooks::{BEGINS, FORCE_UNSUPPORTED, LOCK, NO_CAPABILITIES, WAITS};
+    use crate::mmap::test_hooks::{FORCE_UNSUPPORTED, LOCK, NO_CAPABILITIES, begins, waits};
     use crate::{Writer, WriterConfig};
 
     fn blocking(sleep: Duration) -> Backoff {
@@ -2279,7 +2303,7 @@ mod wake_tests {
     struct Unforce;
     impl Drop for Unforce {
         fn drop(&mut self) {
-            FORCE_UNSUPPORTED.store(false, Ordering::SeqCst);
+            FORCE_UNSUPPORTED.set(false);
         }
     }
 
@@ -2287,7 +2311,7 @@ mod wake_tests {
     struct Capable;
     impl Drop for Capable {
         fn drop(&mut self) {
-            NO_CAPABILITIES.store(false, Ordering::SeqCst);
+            NO_CAPABILITIES.set(false);
         }
     }
 
@@ -2321,7 +2345,7 @@ mod wake_tests {
         for seq in 0..5 {
             assert_eq!(r.try_next().unwrap().unwrap().seq, seq);
         }
-        let before = [0, 1].map(|i| BEGINS[i].load(Ordering::SeqCst));
+        let before = begins();
         let writer = std::thread::spawn(move || {
             for _ in 0..30 {
                 record(&mut w);
@@ -2334,7 +2358,8 @@ mod wake_tests {
         let received = Instant::now();
         assert_eq!(got.map(|record| record.seq), Some(5));
         let (_w, checkpointed) = writer.join().unwrap();
-        let begins = [0, 1].map(|i| BEGINS[i].load(Ordering::SeqCst) - before[i]);
+        let after = begins();
+        let begins = [0, 1].map(|i| after[i] - before[i]);
         (
             begins[0],
             begins[1],
@@ -2363,7 +2388,7 @@ mod wake_tests {
     fn a_durable_only_reader_sleeps_unregistered_beside_a_writer_without_marker_words() {
         let _serial = LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _capable = Capable;
-        NO_CAPABILITIES.store(true, Ordering::SeqCst);
+        NO_CAPABILITIES.set(true);
         let (record, marker, after) = durable_reader_under_appends(Duration::from_millis(5));
         assert_eq!((record, marker), (0, 0), "registered as a waiter");
         assert!(
@@ -2479,7 +2504,7 @@ mod wake_tests {
     fn a_reader_with_no_sleep_beside_a_writer_without_marker_words_does_not_spin() {
         let _serial = LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _capable = Capable;
-        NO_CAPABILITIES.store(true, Ordering::SeqCst);
+        NO_CAPABILITIES.set(true);
         let dir = tempfile::tempdir().unwrap();
         let mut w =
             Writer::open(dir.path(), WriterConfig::default().segment_size(1 << 20)).unwrap();
@@ -2493,8 +2518,7 @@ mod wake_tests {
         )
         .unwrap();
         assert_eq!(r.try_next().unwrap().unwrap().seq, 0);
-        let begins = BEGINS[0].load(Ordering::SeqCst);
-        let waits = WAITS.load(Ordering::SeqCst);
+        let (begun, waited) = (begins()[0], waits());
         assert!(
             r.next_timeout(Some(Duration::from_millis(500)))
                 .unwrap()
@@ -2502,8 +2526,8 @@ mod wake_tests {
         );
         // Registered on the record words and blocked, up to the 100 ms cap each time: a handful of waits, not a loop
         // that never registers (the unregistered branch with a sleep of zero).
-        let begins = BEGINS[0].load(Ordering::SeqCst) - begins;
-        let waits = WAITS.load(Ordering::SeqCst) - waits;
+        let begins = begins()[0] - begun;
+        let waits = waits() - waited;
         assert!(
             (2..=20).contains(&begins),
             "{begins} registrations in 500 ms"
@@ -2521,7 +2545,7 @@ mod wake_tests {
             ReaderConfig::default().backoff(blocking(Duration::from_secs(10))),
         )
         .unwrap();
-        let before = WAITS.load(Ordering::SeqCst);
+        let before = waits();
         let started = Instant::now();
         assert!(
             r.next_timeout(Some(Duration::from_millis(350)))
@@ -2530,7 +2554,7 @@ mod wake_tests {
         );
         assert!(started.elapsed() >= Duration::from_millis(350));
         // Each wait lasts up to the 100 ms cap (and the 100 ms record refresh): a handful, not a busy loop.
-        let waits = WAITS.load(Ordering::SeqCst) - before;
+        let waits = waits() - before;
         assert!((2..=20).contains(&waits), "{waits} waits in 350 ms");
     }
 
@@ -2546,8 +2570,8 @@ mod wake_tests {
         .unwrap();
         assert!(r.waker.is_some());
         let _unforce = Unforce;
-        FORCE_UNSUPPORTED.store(true, Ordering::SeqCst);
-        let before = WAITS.load(Ordering::SeqCst);
+        FORCE_UNSUPPORTED.set(true);
+        let before = waits();
         let started = Instant::now();
         assert!(
             r.next_timeout(Some(Duration::from_millis(300)))
@@ -2556,7 +2580,7 @@ mod wake_tests {
         );
         assert!(started.elapsed() >= Duration::from_millis(300));
         // One failed wait turns wake-ups off; the rest of the time the reader sleeps in 20 ms steps.
-        assert_eq!(WAITS.load(Ordering::SeqCst) - before, 1);
+        assert_eq!(waits() - before, 1);
         assert!(
             r.waker.is_none(),
             "wake-ups still on after an unsupported wait"
@@ -2601,6 +2625,83 @@ mod tests {
     use std::cell::Cell;
     use std::os::unix::fs::FileExt;
     use std::time::{Duration, Instant};
+
+    /// The layout of [`Reader`] (ADR 0057, issue #86): the alignment, and the offsets of the fields the per-record path
+    /// of either reader reads or writes. 64-bit Linux and macOS only: the offsets depend on the sizes of `PathBuf`, `Vec`
+    /// and `Instant`.
+    #[test]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    fn reader_layout() {
+        use super::{Found, OpenSegment};
+        use std::mem::{align_of, offset_of, size_of};
+        const WHY: &str = "the per-record path of both readers reads and writes these fields, and the layout of `Reader` \
+            is fixed on purpose (ADR 0057, issue #86): a 16-byte access to `found` that straddles a page boundary made \
+            replay 15 to 30 % slower on Linux, and moving the hot fields cost 2 to 3 % on x86-64. Add new fields at the \
+            end of the struct, or behind a pointer. If a hot field really must move, keep `found` at a multiple of 16, \
+            run the replay benchmark before and after on x86-64 and aarch64 (ADR 0057 says how), and update this test \
+            and the ADR";
+        let seg = offset_of!(Reader, seg);
+        let found = offset_of!(Reader, found);
+        let hot = [
+            ("seg.size", seg + offset_of!(OpenSegment, size), 56),
+            ("seg.map", seg + offset_of!(OpenSegment, map), 80),
+            ("buf", offset_of!(Reader, buf), 104),
+            (
+                "config.durable_only",
+                offset_of!(Reader, config) + offset_of!(ReaderConfig, durable_only),
+                280,
+            ),
+            ("waiting_since", offset_of!(Reader, waiting_since), 304),
+            ("offset", offset_of!(Reader, offset), 328),
+            ("next_seq", offset_of!(Reader, next_seq), 336),
+            (
+                "durable_next_seq",
+                offset_of!(Reader, durable_next_seq),
+                344,
+            ),
+            ("bound", offset_of!(Reader, bound), 368),
+            ("skip_until", offset_of!(Reader, skip_until), 376),
+            ("buf_start", offset_of!(Reader, buf_start), 392),
+            ("found.header", found + offset_of!(Found, header), 400),
+            (
+                "found.payload_at",
+                found + offset_of!(Found, payload_at),
+                432,
+            ),
+            (
+                "found.payload_len",
+                found + offset_of!(Found, payload_len),
+                440,
+            ),
+        ];
+        for (field, at, expected) in hot {
+            assert_eq!(
+                at, expected,
+                "`Reader::{field}` is at offset {at}, not {expected}: {WHY}"
+            );
+        }
+        // With `found` at a multiple of 16 in a 16-byte aligned struct, the record path's 16-byte accesses to it (at +0,
+        // +16 and +32) cannot straddle a page boundary, wherever the reader is.
+        assert_eq!(
+            align_of::<Reader>(),
+            16,
+            "`Reader` is no longer 16-byte aligned: {WHY}"
+        );
+        assert_eq!(
+            found % 16,
+            0,
+            "`Reader::found` is not at a multiple of 16: {WHY}"
+        );
+        assert_eq!(size_of::<Found>(), 48, "`Found` changed size: {WHY}");
+        assert_eq!(
+            size_of::<OpenSegment>(),
+            80,
+            "`OpenSegment` changed size: {WHY}"
+        );
+    }
 
     thread_local! {
         /// How many of this thread's next non-empty slot reads [`scripted`] turns into a validation failure.
@@ -3279,7 +3380,14 @@ mod tests {
         let index = encoder.finish(&header, at, 1_000).unwrap();
         let indexes = dir.path().join(crate::seek_index::DIR_NAME);
         std::fs::create_dir(&indexes).unwrap();
-        std::fs::write(indexes.join("00000000000000000000.idx"), index).unwrap();
+        let index_path = indexes.join("00000000000000000000.idx");
+        std::fs::write(&index_path, index).unwrap();
+        // Readers ignore an index its group can write, which a umask of 0002 would give it.
+        std::fs::set_permissions(
+            &index_path,
+            std::os::unix::fs::PermissionsExt::from_mode(0o644),
+        )
+        .unwrap();
         // A successor and a marker in it, for mapped and durable-only readers.
         std::fs::write(
             crate::journal::segment_path(dir.path(), 1_000),
