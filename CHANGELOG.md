@@ -229,6 +229,9 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 - Changed (comparison harness): the W1 burst test is now two figures per tool, `W1-cold` (the timer starts before open,
   in an empty directory) and `W1-steady` (files ready and 1,000 records written before the timer). The old W1 left
   tickertape's preallocation outside the timer and Chronicle's first cycle file inside (#56).
+- Added (benchmarks): `benches/rerun.py` and `benches/rerun-vm.sh` run the parts of the comparison rerun at v1.0.0
+  (issue #57) on one machine, interleaved, resumable and restarted after a reboot into isolated CPUs;
+  `docs/playbooks/rerun-comparison.md` is the plan. No benchmark results.
 - Fixed (release tooling): `release.py github-release` asked the release listing for its new draft once, immediately
   after creating it, and the v1.0.0 run failed there because the listing did not show the draft yet (after the
   crates were published; rerunning the job completed the release). It now asks for up to a minute.
