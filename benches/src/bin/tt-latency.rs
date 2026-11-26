@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use hdrhistogram::Histogram;
 use serde_json::{Value, json};
 use tickertape::{
-    Backoff, HelperCpus, NewRecord, Reader, ReaderConfig, Writer, WriterConfig, clock,
+    Backoff, HelperCpus, LatencyMode, NewRecord, Reader, ReaderConfig, Writer, WriterConfig, clock,
 };
 use tickertape_bench::affinity::{pin_or_fail, report};
 use tickertape_bench::sustained::parse_cpu_list;
@@ -29,6 +29,7 @@ Usage: tt-latency run --dir <DIR> --rate <records/s> --count <N>
                      [--warmup <N>] [--segment-size <bytes>] [--json] [--cold]
                      [--wait spin|default|block|sleep] [--no-prefault] [--spare-segment]
                      [--writer-cpu N] [--reader-cpu N] [--helper-cpus LIST]
+                     [--writer-latency off|rolls-and-checkpoints|all] [--snapshot-ms N]
        tt-latency --help
 
 --dir must be new or empty; data is retained. --count includes --warmup (default 0),
@@ -43,6 +44,9 @@ releases a shared future start time.
   sleep    Backoff::default() with notify off: spins, yields, then 10 us..1 ms sleeps
 --no-prefault starts the writer with WriterConfig::prefault(false) (no helper thread).
 --spare-segment starts it with WriterConfig::spare_segment(true) (ADR 0049; default: the platform's).
+--writer-latency sets WriterConfig::latency (ADR 0047; default off); with all, the JSON result has the writer's own
+append histogram (service times). --snapshot-ms makes a thread of the writer's process take a snapshot of it at that
+interval, as a monitoring thread would (needs all; default: none).
 --writer-cpu and --reader-cpu pin the measured threads (Linux; an error elsewhere), each after it has opened its
 endpoint and before it is ready. --helper-cpus places the writer's helper threads (HelperCpus::List), for example
 4,5; without it they may run on any CPU the cpuset allows, except isolated ones. The JSON result has the affinity in
@@ -88,6 +92,8 @@ struct Config {
     writer_cpu: Option<u64>,
     reader_cpu: Option<u64>,
     helper_cpus: Option<Vec<usize>>,
+    writer_latency: String,
+    snapshot_ms: Option<u64>,
     control: Option<PathBuf>,
     timeout: Duration,
 }
@@ -106,6 +112,8 @@ impl Config {
             "--writer-cpu",
             "--reader-cpu",
             "--helper-cpus",
+            "--writer-latency",
+            "--snapshot-ms",
         ];
         if child {
             values.push("--control");
@@ -147,6 +155,20 @@ impl Config {
                 .map(|_| options.number(key, None))
                 .transpose()
         };
+        let writer_latency = options
+            .optional("--writer-latency")
+            .unwrap_or("off")
+            .to_owned();
+        if !["off", "rolls-and-checkpoints", "all"].contains(&writer_latency.as_str()) {
+            return Err("writer-latency must be off, rolls-and-checkpoints or all".into());
+        }
+        let snapshot_ms = options
+            .optional("--snapshot-ms")
+            .map(|_| options.number("--snapshot-ms", None))
+            .transpose()?;
+        if snapshot_ms.is_some_and(|ms| ms == 0 || writer_latency != "all") {
+            return Err("snapshot-ms must be positive and needs --writer-latency all".into());
+        }
         let control = options.path("--control");
         if child && control.is_none() {
             return Err("internal child needs --control".into());
@@ -170,6 +192,8 @@ impl Config {
                 .optional("--helper-cpus")
                 .map(parse_cpu_list)
                 .transpose()?,
+            writer_latency,
+            snapshot_ms,
             control,
             timeout,
         })
@@ -295,7 +319,8 @@ fn run(config: &Config, args: &[String]) -> Result<()> {
     };
     let mut result = json!({"mode": if config.cold { "cold_replay" } else { "visible_latency" },
         "count": config.count, "rate": config.rate, "payload": config.payload, "reader": config.reader,
-        "wait": config.wait, "prefault": config.prefault, "spare_segment": config.spare_segment, "warmup": config.warmup, "segment_size": config.segment_size});
+        "wait": config.wait, "prefault": config.prefault, "spare_segment": config.spare_segment, "warmup": config.warmup, "segment_size": config.segment_size,
+        "writer_latency": config.writer_latency, "snapshot_ms": config.snapshot_ms});
     result["affinity"] = json!({"reader": reader_result["affinity"].take()});
     if let Some(fields) = reader_result.as_object_mut() {
         fields.remove("affinity");
@@ -356,12 +381,27 @@ fn writer(config: &Config) -> Result<()> {
     let mut writer_config = WriterConfig::default()
         .segment_size(config.segment_size)
         .prefault(config.prefault)
-        .spare_segment(config.spare_segment);
+        .spare_segment(config.spare_segment)
+        .latency(match config.writer_latency.as_str() {
+            "all" => LatencyMode::All,
+            "rolls-and-checkpoints" => LatencyMode::RollsAndCheckpoints,
+            _ => LatencyMode::Off,
+        });
     if let Some(cpus) = &config.helper_cpus {
         writer_config = writer_config.helper_cpus(HelperCpus::List(cpus.clone()));
     }
     let mut writer = Writer::open(&config.dir, writer_config)?;
     pin_or_fail(config.writer_cpu)?;
+    let append_latency = writer.latency().and_then(|l| l.append()).cloned();
+    if let (Some(view), Some(ms)) = (append_latency.clone(), config.snapshot_ms) {
+        // Not joined: it ends with the process.
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(Duration::from_millis(ms));
+                std::hint::black_box(view.snapshot());
+            }
+        });
+    }
     let payload = vec![0x5a; config.payload];
     let deadline = Instant::now() + config.timeout;
     let t0 = if config.cold {
@@ -403,7 +443,13 @@ fn writer(config: &Config) -> Result<()> {
     fs::write(
         control.join("writer.json"),
         json!({"achieved_records_per_s": config.count as f64 / elapsed,
-        "late_records": late, "count": config.count, "affinity": report()?})
+        "late_records": late, "count": config.count, "append_service": append_latency.map(|view| {
+            let s = view.snapshot();
+            let us = |d: Option<Duration>| d.map(|d| d.as_nanos() as f64 / 1000.0);
+            json!({"count": s.count(), "min_us": us(s.min()), "p50_us": us(s.value_at_quantile(0.5)),
+                "p99_us": us(s.value_at_quantile(0.99)), "p99_9_us": us(s.value_at_quantile(0.999)),
+                "max_us": us(s.max())})
+        }), "affinity": report()?})
         .to_string(),
     )?;
     Ok(())

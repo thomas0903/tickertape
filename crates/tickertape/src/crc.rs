@@ -22,6 +22,7 @@
 use crate::mmap::SharedWords;
 
 /// The CRC32C of `data`.
+#[inline(always)] // see `format::finish_record_body`
 pub(crate) fn crc32c(data: &[u8]) -> u32 {
     crc32c_append(0, data)
 }

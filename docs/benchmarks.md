@@ -16,8 +16,12 @@ The sustained-workload, checkpoint, comparison, reader and scale results and the
 bare-metal sections. The scale cases that run left out (10,000 segments and more, archived history, damage, catch-up, the
 zero-copy reader, seek indexes) ran on 2026-11-25 on machines of the same types
 ([below](#2026-11-25-replay-and-recovery-at-scale-the-gaps-of-100-google-cloud-vms)).
+What the writer's latency histograms cost (ADR 0047) is
+[under 2026-11-26](#2026-11-26-what-the-writers-latency-histograms-cost-adr-0047-google-cloud-vms).
 The profiles of v1.0.0's readers, notification and serialization paths (where the CPU time goes, and
 what remains per record) are [under 2026-11-25](#2026-11-25-where-the-cpu-time-goes-profiles-of-the-readers-notification-and-serialization-google-cloud-vms).
+Seeks with and without the seek index, at both payloads and with both readers, on `main` after #74, are
+[under 2026-11-26](#2026-11-26-seeks-with-and-without-the-seek-index-google-cloud-vms).
 
 **How Chronicle Queue and tickertape were configured in the comparisons below.** Open-source Chronicle Queue (2026.8,
 the version `compare/chronicle/pom.xml` pins) ran with its default queue options, except `SyncMode.SYNC` in the
@@ -322,6 +326,240 @@ Other results, ext4 / xfs:
   - replay: 23.1 / 23.1 million records/s at 64 B (safe reader), 3.08 / 3.09 at 1,024 B.
 - **Cold-cache replay** (page cache dropped): 8.9–9.0 million records/s at 64 B; 1.66–1.67 million records/s at
   1,024 B, which is 1.70–1.71 GB/s of payload from the NVMe disk.
+
+## 2026-11-26, seeks with and without the seek index (Google Cloud VMs)
+
+What a seek costs in a journal of 128 MiB segments (the default) with the seek index of ADR
+[0045](decisions/0045-sparse-seek-index.md) and without it, for both readers, at 64 B and 1,024 B, and what building the
+indexes costs (issue #59). **Cloud virtual machines with local NVMe SSD, not bare metal.** The 2026-11-25 section
+([below](#seek-index-adr-0045)) measured the index at 1,024 B only, at `d2074c1` (before #74), on other machine types
+and with other targets; this one measures `main` after #74.
+
+| | x86-64 | aarch64 |
+|---|---|---|
+| Machine type, zone | `c4-standard-4-lssd`, us-central1-c | `c4a-standard-4-lssd`, us-east1-b |
+| CPU, memory | Intel Xeon 6985P-C, 4 vCPUs (2 cores), 15.7 GB | Google Axion (Neoverse-V2), 4 vCPUs (4 cores), 16.7 GB |
+| Date (UTC) | 2026-11-26, 05:12 to 05:16 (a first session on another VM of the type: 04:55 to 04:59, below) | 2026-11-26, 05:04 to 05:08 |
+
+Both: Ubuntu 24.04, kernel 7.0.0-1017-gcp, rustc 1.100.0; one local NVMe SSD (375 GB), ext4 formatted with `-E
+lazy_itable_init=0,lazy_journal_init=0`, mounted `rw,noatime`, I/O scheduler `none`; `vm.dirty_ratio` 20,
+`vm.dirty_background_ratio` 10. Commit `8912012` (`main`, clean tree), `cargo build --release --locked -p
+tickertape-bench --bin tt-scale` and `-p tickertape-cli --bin tickertape`. The result files were written to the same
+filesystem. The runs started right after the build, on a VM that ran nothing else.
+
+**Journals.** One per payload: `tt-scale build --dir <dir> --segments 9 --segment-size 134217728 --payload <64|1024>`,
+eight full sealed segments (1 GiB) and a ninth, the newest, half full, with the checkpoint marker in it; then
+`tickertape index <dir>`, which built an index for each of the eight sealed segments (a full segment holds 1,290,554
+records of 64 B or 126,144 of 1,024 B). Each index file is 49,256 bytes (2,047 entries; 0.037 % of the segment) at both
+payloads.
+
+**Targets.** In the fifth segment (full, sealed, indexed): the record 1/64 of the way in (about 2 MiB in), the middle
+record, and the last record. In the newest segment (unsealed, never indexed): the same fractions of the records it holds
+(it is half full, so its last record is about 64 MiB in).
+
+**Commands.** Every value is one process, `taskset -c 3 tt-scale op --dir <dir> --op seek-segment-end --reader
+<safe|mapped> --seq <target> --segment-size 134217728 [--seek-index]`, the internal command that `tt-scale measure` runs
+for each operation, given the target directly. It opens a reader (not timed) and times `Reader::seek` and the first
+`try_next`, which returns the target. It reports `used_index` (`Reader::seek_used_index`) and the bytes the process read
+from storage (`/proc/self/io`). The forward seeks are `--op seek-forward --seq <first record> --span-end <end>`: a seek
+to the segment's first record and one record, then 16 equal forward steps, each a seek and one record, timed one by one.
+The driver, a Python script kept with the raw output outside the repository, ran pinned to CPU 0; CPU 3 shares its core
+with CPU 1 on x86-64 and has a core of its own on aarch64. "Cold" ran `sudo -n sh -c 'sync && echo 3 >
+/proc/sys/vm/drop_caches'` before the process; the reader's open (not timed) then brings the directory and the oldest
+segment's header back into the cache, but nothing of the target's segment or of `seek-index/`. "Warm": every file of
+both journals was read before each round. Two rounds; in each, 25 warm repetitions of every configuration, then 8 cold,
+for both payloads and readers in turn, the runs without and with `--seek-index` of one configuration back to back and
+their order swapped at every repetition. So each warm cell is 50 values and each cold cell 16. The cells are the median
+and, in brackets, the smallest and largest value. Every run returned the target, and `used_index` was true in every run
+with the option in a sealed segment and false in every other run.
+
+**Reproducibility.** The medians of the two rounds of a cell differ by at most 13 % on both machines, much less than
+any difference between the index columns this section draws a conclusion from. The first x86-64 session, on another VM
+of the same type with the same commit, ran each configuration's runs without the option before those with it: its warm
+values in the newest segment, where the index plays no part, were 2 to 31 % lower with the option, and
+alternating runs on that VM afterwards (20 pairs per case, each order 10 times) gave equal medians without and with the
+option; whichever came first was up to 9 % slower with the zero-copy reader. That is why the order alternates here. Its
+other values were within 12 % of the second session's, except the cold seeks with the index: 0.50 to 0.72 ms there
+against 0.60 to 0.81 ms here.
+
+### Seeks into a sealed segment
+
+"1/64 in", "middle" and "last record" are the targets in the fifth segment. "Read from storage" is the median of the
+cold runs' bytes read, readahead included.
+
+| Machine | Payload | Reader | Target | warm, without index | warm, with index | cold, without index | cold, with index | read from storage, cold, KiB (without / with) |
+|---|---|---|---|---|---|---|---|---|
+| x86-64 | 64 B | safe | 1/64 in | 659 µs (633 µs–854 µs) | 99 µs (91 µs–121 µs) | 1.96 ms (1.90 ms–2.27 ms) | 789 µs (755 µs–892 µs) | 2,312 / 212 |
+| x86-64 | 64 B | safe | middle | 18.9 ms (18.2 ms–28.2 ms) | 83 µs (76 µs–104 µs) | 93.2 ms (93.0 ms–96.5 ms) | 744 µs (697 µs–813 µs) | 65,800 / 212 |
+| x86-64 | 64 B | safe | last record | 37.6 ms (36.4 ms–46.0 ms) | 95 µs (88 µs–114 µs) | 191 ms (191 ms–192 ms) | 755 µs (737 µs–884 µs) | 131,080 / 140 |
+| x86-64 | 64 B | zero-copy | 1/64 in | 928 µs (834 µs–1.09 ms) | 112 µs (102 µs–144 µs) | 1.94 ms (1.83 ms–2.35 ms) | 813 µs (742 µs–978 µs) | 2,308 / 332 |
+| x86-64 | 64 B | zero-copy | middle | 29.2 ms (26.2 ms–32.0 ms) | 78 µs (73 µs–111 µs) | 93.1 ms (92.9 ms–93.3 ms) | 604 µs (555 µs–724 µs) | 65,796 / 84 |
+| x86-64 | 64 B | zero-copy | last record | 56.7 ms (52.0 ms–63.7 ms) | 108 µs (97 µs–137 µs) | 191 ms (191 ms–192 ms) | 786 µs (745 µs–963 µs) | 131,076 / 200 |
+| x86-64 | 1,024 B | safe | 1/64 in | 398 µs (372 µs–439 µs) | 91 µs (82 µs–118 µs) | 1.74 ms (1.68 ms–2.36 ms) | 787 µs (717 µs–866 µs) | 2,312 / 212 |
+| x86-64 | 1,024 B | safe | middle | 10.2 ms (9.84 ms–12.2 ms) | 94 µs (88 µs–116 µs) | 93.1 ms (93.0 ms–93.4 ms) | 803 µs (743 µs–880 µs) | 65,800 / 336 |
+| x86-64 | 1,024 B | safe | last record | 20.3 ms (19.5 ms–21.8 ms) | 87 µs (81 µs–110 µs) | 192 ms (191 ms–192 ms) | 745 µs (633 µs–882 µs) | 131,080 / 140 |
+| x86-64 | 1,024 B | zero-copy | 1/64 in | 277 µs (250 µs–322 µs) | 79 µs (72 µs–101 µs) | 1.64 ms (1.59 ms–2.35 ms) | 614 µs (562 µs–763 µs) | 2,308 / 84 |
+| x86-64 | 1,024 B | zero-copy | middle | 7.15 ms (6.88 ms–7.48 ms) | 86 µs (77 µs–126 µs) | 93.0 ms (92.9 ms–93.1 ms) | 800 µs (733 µs–1.13 ms) | 65,796 / 332 |
+| x86-64 | 1,024 B | zero-copy | last record | 14.7 ms (13.9 ms–15.7 ms) | 82 µs (76 µs–106 µs) | 191 ms (191 ms–192 ms) | 771 µs (658 µs–808 µs) | 131,076 / 200 |
+| aarch64 | 64 B | safe | 1/64 in | 711 µs (668 µs–761 µs) | 109 µs (98 µs–154 µs) | 1.65 ms (1.60 ms–2.62 ms) | 622 µs (590 µs–1.46 ms) | 2,308 / 208 |
+| aarch64 | 64 B | safe | middle | 20.2 ms (19.4 ms–24.9 ms) | 87 µs (80 µs–109 µs) | 93.0 ms (92.9 ms–93.7 ms) | 593 µs (566 µs–862 µs) | 65,796 / 208 |
+| aarch64 | 64 B | safe | last record | 40.6 ms (38.8 ms–41.7 ms) | 107 µs (96 µs–126 µs) | 191 ms (191 ms–192 ms) | 570 µs (555 µs–711 µs) | 131,076 / 136 |
+| aarch64 | 64 B | zero-copy | 1/64 in | 610 µs (581 µs–626 µs) | 111 µs (103 µs–131 µs) | 1.56 ms (1.50 ms–2.20 ms) | 628 µs (610 µs–758 µs) | 2,304 / 328 |
+| aarch64 | 64 B | zero-copy | middle | 17.0 ms (16.8 ms–19.4 ms) | 87 µs (81 µs–116 µs) | 92.9 ms (92.8 ms–93.1 ms) | 464 µs (448 µs–498 µs) | 65,792 / 80 |
+| aarch64 | 64 B | zero-copy | last record | 33.9 ms (33.4 ms–38.8 ms) | 109 µs (97 µs–128 µs) | 191 ms (191 ms–192 ms) | 595 µs (575 µs–741 µs) | 131,072 / 196 |
+| aarch64 | 1,024 B | safe | 1/64 in | 404 µs (371 µs–439 µs) | 95 µs (85 µs–113 µs) | 1.35 ms (1.29 ms–2.63 ms) | 618 µs (601 µs–684 µs) | 2,308 / 208 |
+| aarch64 | 1,024 B | safe | middle | 9.91 ms (9.27 ms–10.4 ms) | 98 µs (92 µs–138 µs) | 93.0 ms (92.9 ms–93.2 ms) | 647 µs (632 µs–1.13 ms) | 65,796 / 332 |
+| aarch64 | 1,024 B | safe | last record | 20.1 ms (19.0 ms–20.4 ms) | 95 µs (87 µs–133 µs) | 192 ms (191 ms–192 ms) | 626 µs (604 µs–655 µs) | 131,076 / 136 |
+| aarch64 | 1,024 B | zero-copy | 1/64 in | 256 µs (248 µs–283 µs) | 92 µs (85 µs–106 µs) | 1.25 ms (1.19 ms–2.14 ms) | 507 µs (488 µs–582 µs) | 2,304 / 80 |
+| aarch64 | 1,024 B | zero-copy | middle | 5.88 ms (5.84 ms–6.14 ms) | 94 µs (89 µs–109 µs) | 92.9 ms (92.7 ms–93.6 ms) | 637 µs (627 µs–685 µs) | 65,792 / 328 |
+| aarch64 | 1,024 B | zero-copy | last record | 11.6 ms (11.4 ms–11.7 ms) | 97 µs (88 µs–145 µs) | 191 ms (191 ms–192 ms) | 650 µs (629 µs–870 µs) | 131,072 / 196 |
+
+- **Without an index** the time grows with the distance from the segment's first record, since every record before the
+  target is read and validated: warm, 11.6 to 56.7 ms to the last record, depending on payload, reader and machine.
+  Cold, the whole 128 MiB is read from storage: 191 to 192 ms in every case, the same on both machines and with both
+  readers and payloads (about 0.7 GB/s from the local SSD, which is what these values measure).
+- **With the index** every median was between 78 and 112 µs warm and between 0.46 and 0.81 ms cold, at all three
+  targets, both payloads, both readers and both machines; a cold seek read 80 to 336 KiB (the index file, the seal and
+  the place it landed, with readahead). The seek validates the landing record and the less than 64 KiB of records from
+  there to the target.
+- Each value is the first seek of a new process: its code, its allocations and, for the zero-copy reader, its mapping
+  are new. A process that seeks repeatedly was not measured.
+
+### Seeks into the newest segment
+
+The newest segment is never indexed (it is not sealed, and `tickertape index` indexes only segments before the marker's
+one). A seek there reads and validates every record from the segment's first one to the target, with or without the
+option. A safe reader with the option first opens `seek-index/` and looks for the segment's file, which is not there; a
+zero-copy (or durable-only) reader first reads the checkpoint marker, finds that it names this segment, and does not
+look (ADR 0045, steps 2 and 3).
+
+| Machine | Payload | Reader | Target | warm, without index | warm, with index | cold, without index | cold, with index | read from storage, cold, KiB (without / with) |
+|---|---|---|---|---|---|---|---|---|
+| x86-64 | 64 B | safe | 1/64 in | 351 µs (321 µs–379 µs) | 349 µs (328 µs–389 µs) | 1.27 ms (1.22 ms–1.52 ms) | 1.34 ms (1.30 ms–1.69 ms) | 1,288 / 1,292 |
+| x86-64 | 64 B | safe | middle | 9.42 ms (9.18 ms–14.0 ms) | 9.39 ms (9.18 ms–9.69 ms) | 44.0 ms (43.8 ms–44.2 ms) | 44.1 ms (43.9 ms–44.3 ms) | 33,032 / 33,036 |
+| x86-64 | 64 B | safe | last record | 17.8 ms (16.5 ms–18.7 ms) | 17.8 ms (16.7 ms–25.1 ms) | 93.2 ms (93.1 ms–93.4 ms) | 93.3 ms (93.2 ms–95.9 ms) | 65,800 / 65,804 |
+| x86-64 | 64 B | zero-copy | 1/64 in | 472 µs (409 µs–550 µs) | 476 µs (431 µs–584 µs) | 1.15 ms (1.13 ms–1.46 ms) | 1.15 ms (1.11 ms–1.28 ms) | 1,284 / 1,284 |
+| x86-64 | 64 B | zero-copy | middle | 14.4 ms (12.7 ms–15.7 ms) | 14.0 ms (12.9 ms–15.6 ms) | 43.8 ms (43.7 ms–44.1 ms) | 43.9 ms (43.7 ms–44.1 ms) | 33,028 / 33,028 |
+| x86-64 | 64 B | zero-copy | last record | 26.4 ms (23.0 ms–31.1 ms) | 26.5 ms (23.7 ms–31.6 ms) | 93.1 ms (92.9 ms–94.5 ms) | 93.1 ms (92.9 ms–93.2 ms) | 65,796 / 65,796 |
+| x86-64 | 1,024 B | safe | 1/64 in | 222 µs (199 µs–259 µs) | 225 µs (206 µs–254 µs) | 1.22 ms (1.13 ms–1.63 ms) | 1.30 ms (1.15 ms–1.51 ms) | 1,288 / 1,292 |
+| x86-64 | 1,024 B | safe | middle | 5.11 ms (4.96 ms–5.39 ms) | 5.09 ms (4.94 ms–5.47 ms) | 44.0 ms (43.8 ms–44.2 ms) | 44.0 ms (43.8 ms–44.3 ms) | 33,032 / 33,036 |
+| x86-64 | 1,024 B | safe | last record | 8.84 ms (8.12 ms–9.67 ms) | 8.81 ms (8.24 ms–9.77 ms) | 93.1 ms (93.1 ms–95.4 ms) | 93.3 ms (93.1 ms–94.1 ms) | 65,800 / 65,804 |
+| x86-64 | 1,024 B | zero-copy | 1/64 in | 151 µs (140 µs–177 µs) | 155 µs (138 µs–196 µs) | 1.09 ms (1.01 ms–1.62 ms) | 1.13 ms (984 µs–1.48 ms) | 1,284 / 1,284 |
+| x86-64 | 1,024 B | zero-copy | middle | 3.53 ms (3.15 ms–3.72 ms) | 3.54 ms (3.13 ms–3.79 ms) | 43.8 ms (43.7 ms–45.2 ms) | 43.9 ms (43.7 ms–44.2 ms) | 33,028 / 33,028 |
+| x86-64 | 1,024 B | zero-copy | last record | 6.47 ms (6.05 ms–7.29 ms) | 6.51 ms (6.07 ms–7.13 ms) | 92.9 ms (92.7 ms–93.0 ms) | 92.9 ms (92.7 ms–93.8 ms) | 65,668 / 65,668 |
+| aarch64 | 64 B | safe | 1/64 in | 385 µs (349 µs–427 µs) | 399 µs (365 µs–427 µs) | 1.01 ms (966 µs–2.02 ms) | 1.08 ms (1.01 ms–1.55 ms) | 1,284 / 1,288 |
+| aarch64 | 64 B | safe | middle | 10.1 ms (9.80 ms–10.5 ms) | 10.1 ms (9.77 ms–10.4 ms) | 43.9 ms (43.6 ms–44.1 ms) | 43.9 ms (43.8 ms–44.7 ms) | 33,028 / 33,032 |
+| aarch64 | 64 B | safe | last record | 18.9 ms (18.5 ms–20.2 ms) | 18.9 ms (18.5 ms–20.3 ms) | 93.0 ms (92.9 ms–93.1 ms) | 93.0 ms (92.8 ms–93.8 ms) | 65,796 / 65,800 |
+| aarch64 | 64 B | zero-copy | 1/64 in | 313 µs (302 µs–350 µs) | 317 µs (303 µs–365 µs) | 907 µs (868 µs–1.02 ms) | 921 µs (879 µs–1.35 ms) | 1,280 / 1,280 |
+| aarch64 | 64 B | zero-copy | middle | 8.52 ms (8.34 ms–9.71 ms) | 8.53 ms (8.34 ms–9.48 ms) | 43.9 ms (43.7 ms–44.0 ms) | 43.8 ms (43.6 ms–44.1 ms) | 33,024 / 33,024 |
+| aarch64 | 64 B | zero-copy | last record | 16.8 ms (16.5 ms–19.3 ms) | 16.8 ms (16.6 ms–19.3 ms) | 92.9 ms (92.8 ms–93.0 ms) | 92.9 ms (92.8 ms–93.1 ms) | 65,792 / 65,792 |
+| aarch64 | 1,024 B | safe | 1/64 in | 231 µs (203 µs–261 µs) | 238 µs (216 µs–659 µs) | 1.01 ms (982 µs–2.19 ms) | 1.08 ms (1.04 ms–1.97 ms) | 1,284 / 1,288 |
+| aarch64 | 1,024 B | safe | middle | 5.05 ms (4.88 ms–5.22 ms) | 5.05 ms (4.73 ms–5.39 ms) | 43.9 ms (43.6 ms–44.6 ms) | 43.9 ms (43.8 ms–44.1 ms) | 33,028 / 33,032 |
+| aarch64 | 1,024 B | safe | last record | 8.73 ms (8.42 ms–9.27 ms) | 8.73 ms (8.26 ms–9.36 ms) | 93.1 ms (92.8 ms–93.9 ms) | 93.0 ms (92.9 ms–94.2 ms) | 65,796 / 65,800 |
+| aarch64 | 1,024 B | zero-copy | 1/64 in | 161 µs (145 µs–183 µs) | 158 µs (145 µs–225 µs) | 892 µs (878 µs–918 µs) | 912 µs (885 µs–2.21 ms) | 1,280 / 1,280 |
+| aarch64 | 1,024 B | zero-copy | middle | 3.00 ms (2.91 ms–3.11 ms) | 2.98 ms (2.88 ms–3.09 ms) | 43.8 ms (43.6 ms–43.9 ms) | 43.8 ms (43.6 ms–44.0 ms) | 33,024 / 33,024 |
+| aarch64 | 1,024 B | zero-copy | last record | 5.57 ms (5.47 ms–5.85 ms) | 5.57 ms (5.45 ms–5.76 ms) | 92.9 ms (92.7 ms–93.1 ms) | 92.8 ms (92.7 ms–93.1 ms) | 65,664 / 65,664 |
+
+The columns without and with the option are the same within their spread, except one small cost: cold, at "1/64 in",
+the safe reader's medians were 0.07 to 0.08 ms higher with the option on both machines, which is the look for an index
+file in a `seek-index/` that is not cached; the zero-copy reader's differed by 0 to 0.04 ms. A seek to the last record
+of this half-full segment costs half of a full segment's scan (5.6 to 26.5 ms warm, 93 ms cold).
+
+### Forward seeks within a segment
+
+`seek-forward` after a seek to the segment's first record: 16 equal steps through the fifth segment (8 MiB each), 16
+steps of about 64 KiB from its first record (630 records of 64 B or 61 of 1,024 B each), and 16 steps through the
+records of the newest segment (4 MiB each). Warm; 50 runs, so each "one step" cell is 800 values.
+
+| Machine | Payload | Reader | Steps | one step, without index | one step, with index | 16 steps, without / with (median) |
+|---|---|---|---|---|---|---|
+| x86-64 | 64 B | safe | sealed, 1/16 of the segment | 2.36 ms (2.26 ms–2.99 ms) | 37 µs (24 µs–107 µs) | 37.9 ms / 647 µs |
+| x86-64 | 64 B | safe | sealed, about 64 KiB | 25 µs (22 µs–42 µs) | 25 µs (23 µs–60 µs) | 406 µs / 407 µs |
+| x86-64 | 64 B | safe | newest, 1/16 of its records | 1.19 ms (1.13 ms–1.71 ms) | 1.19 ms (1.13 ms–1.75 ms) | 19.0 ms / 19.1 ms |
+| x86-64 | 64 B | zero-copy | sealed, 1/16 of the segment | 3.50 ms (3.03 ms–4.09 ms) | 54 µs (27 µs–106 µs) | 55.7 ms / 882 µs |
+| x86-64 | 64 B | zero-copy | sealed, about 64 KiB | 34 µs (26 µs–56 µs) | 34 µs (26 µs–66 µs) | 547 µs / 554 µs |
+| x86-64 | 64 B | zero-copy | newest, 1/16 of its records | 1.75 ms (1.46 ms–2.08 ms) | 1.74 ms (1.45 ms–2.02 ms) | 27.6 ms / 27.8 ms |
+| x86-64 | 1,024 B | safe | sealed, 1/16 of the segment | 1.28 ms (1.21 ms–1.49 ms) | 29 µs (26 µs–82 µs) | 20.6 ms / 510 µs |
+| x86-64 | 1,024 B | safe | sealed, about 64 KiB | 16 µs (14 µs–37 µs) | 17 µs (15 µs–38 µs) | 269 µs / 270 µs |
+| x86-64 | 1,024 B | safe | newest, 1/16 of its records | 650 µs (599 µs–758 µs) | 651 µs (597 µs–829 µs) | 10.4 ms / 10.4 ms |
+| x86-64 | 1,024 B | zero-copy | sealed, 1/16 of the segment | 920 µs (825 µs–1.13 ms) | 32 µs (29 µs–79 µs) | 15.1 ms / 558 µs |
+| x86-64 | 1,024 B | zero-copy | sealed, about 64 KiB | 16 µs (13 µs–36 µs) | 16 µs (13 µs–34 µs) | 255 µs / 254 µs |
+| x86-64 | 1,024 B | zero-copy | newest, 1/16 of its records | 461 µs (394 µs–589 µs) | 462 µs (391 µs–549 µs) | 7.35 ms / 7.43 ms |
+| aarch64 | 64 B | safe | sealed, 1/16 of the segment | 2.45 ms (2.37 ms–2.67 ms) | 45 µs (31 µs–118 µs) | 39.2 ms / 771 µs |
+| aarch64 | 64 B | safe | sealed, about 64 KiB | 29 µs (26 µs–62 µs) | 29 µs (26 µs–65 µs) | 480 µs / 479 µs |
+| aarch64 | 64 B | safe | newest, 1/16 of its records | 1.26 ms (1.19 ms–1.38 ms) | 1.26 ms (1.19 ms–1.37 ms) | 20.1 ms / 20.2 ms |
+| aarch64 | 64 B | zero-copy | sealed, 1/16 of the segment | 2.13 ms (2.08 ms–2.49 ms) | 51 µs (40 µs–106 µs) | 34.2 ms / 864 µs |
+| aarch64 | 64 B | zero-copy | sealed, about 64 KiB | 30 µs (28 µs–73 µs) | 30 µs (28 µs–75 µs) | 489 µs / 489 µs |
+| aarch64 | 64 B | zero-copy | newest, 1/16 of its records | 1.08 ms (1.05 ms–1.16 ms) | 1.08 ms (1.05 ms–1.23 ms) | 17.3 ms / 17.3 ms |
+| aarch64 | 1,024 B | safe | sealed, 1/16 of the segment | 1.19 ms (1.12 ms–1.81 ms) | 35 µs (32 µs–88 µs) | 19.0 ms / 603 µs |
+| aarch64 | 1,024 B | safe | sealed, about 64 KiB | 19 µs (16 µs–37 µs) | 19 µs (16 µs–56 µs) | 320 µs / 318 µs |
+| aarch64 | 1,024 B | safe | newest, 1/16 of its records | 635 µs (559 µs–711 µs) | 641 µs (578 µs–710 µs) | 10.1 ms / 10.3 ms |
+| aarch64 | 1,024 B | zero-copy | sealed, 1/16 of the segment | 741 µs (720 µs–801 µs) | 41 µs (38 µs–86 µs) | 11.9 ms / 698 µs |
+| aarch64 | 1,024 B | zero-copy | sealed, about 64 KiB | 19 µs (17 µs–37 µs) | 19 µs (17 µs–52 µs) | 318 µs / 318 µs |
+| aarch64 | 1,024 B | zero-copy | newest, 1/16 of its records | 373 µs (346 µs–458 µs) | 375 µs (352 µs–463 µs) | 6.02 ms / 6.04 ms |
+
+A forward seek in the reader's segment continues from the cursor when the checkpoint marker covers it (ADR 0046), so a
+step without the index reads only the records between the two targets: 8 MiB of them cost 0.74 to 3.5 ms. With the
+option, a forward seek uses the index only when the estimated distance is at least 256 KiB (ADR 0045, step 1): at every
+8 MiB step it did (29 to 54 µs a step), and after a landing through the index the next forward seek does not continue
+from the cursor, so each step looked the index up again. The short steps never used it and cost the same with and
+without the option. In the newest segment, which has no index, the steps continue from the cursor with or without the
+option.
+
+### Building, and the writer's open
+
+`seek_index::build` with `rebuild` (what `tickertape index --rebuild` calls), in its own pinned process (`tt-scale op
+--op index-build`), writing the eight indexes of the 1 GiB of sealed segments anew: 10 warm runs, 5 cold. The command
+itself, `taskset -c 3 tickertape index <dir> --rebuild --json`, timed from outside, process start included: 5 warm, 3
+cold; and `tickertape index <dir>` with every index current (it opens each segment's index, header and seal and finds
+nothing to do): 5 warm.
+
+| Machine | Payload | build, 1 GiB, warm | per segment | build, 1 GiB, cold | per segment | `tickertape index --rebuild`, warm | cold | `tickertape index`, nothing to do |
+|---|---|---|---|---|---|---|---|---|
+| x86-64 | 64 B | 368 ms (364 ms–436 ms) | 46.0 ms | 1.57 s (1.57 s–1.58 s) | 197 ms | 375 ms (373 ms–377 ms) | 1.59 s (1.59 s–1.60 s) | 2.31 ms (2.15 ms–2.35 ms) |
+| x86-64 | 1,024 B | 179 ms (175 ms–181 ms) | 22.3 ms | 1.57 s (1.57 s–1.57 s) | 197 ms | 184 ms (183 ms–186 ms) | 1.59 s (1.59 s–1.60 s) | 2.15 ms (2.13 ms–2.30 ms) |
+| aarch64 | 64 B | 483 ms (477 ms–487 ms) | 60.4 ms | 1.57 s (1.57 s–1.57 s) | 197 ms | 489 ms (485 ms–491 ms) | 1.59 s (1.59 s–1.59 s) | 1.82 ms (1.81 ms–1.86 ms) |
+| aarch64 | 1,024 B | 152 ms (150 ms–153 ms) | 19.0 ms | 1.57 s (1.57 s–1.57 s) | 196 ms | 157 ms (156 ms–158 ms) | 1.59 s (1.59 s–1.59 s) | 1.78 ms (1.77 ms–1.82 ms) |
+
+A build reads each segment once and checks every record, so warm it costs about what a seek without an index to the
+segment's last record costs (37.6 and 20.3 ms against 46.0 and 22.3 ms per segment on x86-64 with the safe reader).
+Cold, it is bound by reading from the local SSD: 1.57 s per GiB on both machines at both payloads, the same rate as the
+cold seeks without an index. The index files take 49,256 bytes per 128 MiB segment at both payloads (394,048 bytes for
+the eight).
+
+`Writer::open` after a clean close, warm, with `tt-scale op --op writer-open-clean` (the open alone; a checkpoint and the
+close follow, untimed), in three states of `seek-index/`: absent (moved out of the journal directory), with the eight
+current indexes only (nothing to remove: the open lists the directory and syncs it), and with one more file named like
+the index of the newest segment, the marker's (a copy of another index), which the open removed in every run (9 files
+before, 8 after). The table is from a script run after the session on the same VMs, 30 rounds, the order of the three
+states rotated each round. In the session itself they ran in a fixed order (absent, current, one out-of-date), and the
+third had the lowest median in three of the four cases, by up to 0.3 ms (by 1.2 to 1.5 ms in the first x86-64
+session); those runs are not reported.
+
+| Machine | Payload | no `seek-index/` | current indexes only | one out-of-date index, removed |
+|---|---|---|---|---|
+| x86-64 | 64 B | 6.37 ms (5.97 ms–7.38 ms) | 6.66 ms (6.16 ms–7.29 ms) | 6.55 ms (6.26 ms–7.37 ms) |
+| x86-64 | 1,024 B | 6.97 ms (6.63 ms–7.43 ms) | 7.14 ms (6.81 ms–7.55 ms) | 7.08 ms (6.74 ms–7.45 ms) |
+| aarch64 | 64 B | 5.11 ms (4.60 ms–5.29 ms) | 5.19 ms (4.65 ms–5.53 ms) | 5.23 ms (4.81 ms–5.49 ms) |
+| aarch64 | 1,024 B | 5.11 ms (4.67 ms–5.41 ms) | 5.20 ms (4.70 ms–5.53 ms) | 5.23 ms (4.82 ms–5.79 ms) |
+
+The three states are 0.1 to 0.3 ms apart in their medians, with ranges that overlap; the position in the rotation
+moved the medians by up to 0.5 ms (x86-64) and 0.4 ms (aarch64). The cost of listing and syncing a `seek-index/` of
+eight files, and of removing one out-of-date index, is not resolved here beyond that. With 10,000 index files a writer's
+open took 6.1 ms longer (2026-11-25, below).
+
+### What these figures do not show
+
+- **What the index gives up.** With `ReaderConfig::seek_index(true)` the records between the segment's first record and
+  the record a seek lands on are not read, so damage there, at which a seek without the option stops, goes unnoticed;
+  and a stale or forged index can lead a seek off the current chain where a payload holds suitable bytes
+  (`Reader::seek`, crash contract C15). It is off by default.
+- **Where it applies.** Only sealed segments before the checkpoint marker's segment have indexes, and only after
+  `tickertape index` ran; the newest segment never has one. Mapped and durable-only readers use an index only for a
+  segment before the marker's, so in an archive, which has no marker, only the safe visible reader does.
+- Not measured: segment sizes other than 128 MiB; journals of many segments, where the directory listing that every seek
+  starts with dominates (2026-11-25, below); a writer running and sealing segments meanwhile; repeated seeks in one
+  process; the durable-only reader; archives; xfs or other filesystems; bare metal; machines other than these two types.
 
 ## 2026-11-25, replay and recovery at scale: the gaps of 1.0.0 (Google Cloud VMs)
 
@@ -643,6 +881,9 @@ aarch64 (`d2074c1`):
 | 10 × 1 GiB | – | retention plan | 74.6 µs (74.4–79.8 µs) | 145 µs (140–165 µs) | 75.6 µs (73.5–78.6 µs) |
 
 ### Seek index (ADR 0045)
+
+(Measured again on `main` after #74, at 64 B and 1,024 B, with targets inside one segment:
+[above](#2026-11-26-seeks-with-and-without-the-seek-index-google-cloud-vms).)
 
 | Machine | Journal | Indexes built | Size of the index files | Build all, cold | warm | Refresh (nothing to do), cold | warm | Check, warm |
 |---|---|---|---|---|---|---|---|---|
@@ -2213,6 +2454,193 @@ commits stated above). Rates are of these machines and do not carry over to othe
   (`Action::MoveTo`) can fall behind for as long as checkpoints stay queued (ADR 0044 → Amendment): not measured.
   Under sustained overload watch `tickertape status` (`segments.before_checkpoint`, `segments.total_bytes`, the
   checkpoint's age and the storage headroom thresholds).
+
+## 2026-11-26, what the writer's latency histograms cost (ADR 0047, Google Cloud VMs)
+
+The measurements that ADR [0047](decisions/0047-latency-histograms.md) requires before the writer's histograms
+(`WriterConfig::latency`) may be described by their cost: the instructions and time an append gains with the option
+off, what `LatencyMode::All` adds, the tail of the visible latency, and the replay benchmark (issue #61). **4 vCPUs,
+virtual machines: these are comparisons between builds on one machine in one session, not throughput or latency
+results.** Base is `main` at `12e76d8`, with a second build of it ("base 2"); v1.0.0 is the released code; the change
+is `9ff23da`.
+
+### Environment and method
+
+| | x86-64 | aarch64 |
+|---|---|---|
+| Machine | `c4-standard-4-lssd` (us-central1-c): Intel Xeon 6985P-C, 2 cores with 2 threads each, 15 GB | `c4a-standard-4-lssd` (us-east1-b): Google Axion (Neoverse-V2), 4 cores, 16 GB |
+| Kernel, OS | 7.0.0-1017-gcp, Ubuntu 24.04 | the same |
+| Clock source | `tsc` | `arch_sys_counter` |
+| Filesystem | ext4 (`-E lazy_itable_init=0,lazy_journal_init=0`, `noatime`) on a local NVMe SSD; `TMPDIR` on it | the same |
+| CPUs | benchmarks on CPU 1, whose SMT sibling (CPU 3) was offline for the append and replay runs; helper threads on the others | benchmarks on CPU 1 |
+| rustc, Valgrind | 1.100.0, 3.22.0 | the same |
+
+- **Instructions** (gate 1): `tt-append-cost append --payload 64 --count N` (and 1,024 B), no helper threads
+  (`prefault(false)`), in one 128 MiB segment, under `valgrind --tool=callgrind`; the difference of the totals for
+  N = 200,000 and 400,000 (50,000 and 100,000 at 1,024 B) divided by the difference of the counts. Exact to a fraction
+  of an instruction and the same in every session.
+- **Time** (gate 2, and the cost of `All`): the `append` benchmark, `append/records/prefault/{64,1024}` and
+  `append/latency/{RollsAndCheckpoints,All}/{64,1024}`, each in a process of its own,
+  `taskset -c 1 <bench> --bench --warm-up-time 1 --measurement-time 1 '^<id>$'`, as 40 rounds of pairs: in each round
+  every build once, in an order that alternates direction and starts at a different build each round. The figure per run
+  is Criterion's mean for a batch of 16,384 appends, divided by 16,384. The tables give the mean of the paired
+  differences against base with its 95 % confidence interval (Student's t). A run is valid only if base 2 against base
+  lies within the bound (1 ns at 64 B, 2 % at 1,024 B).
+- **Parts:** `tt-append-cost parts`, three times (each the smallest of nine rounds of 5 million calls).
+- **Tail:** `tt-latency run --rate 100000 --count 3100000 --warmup 100000 --payload 64 --reader mapped --json`, with
+  `--writer-latency` and `--snapshot-ms` as in the tables, the writer's main thread pinned to CPU 1 and the reader's to
+  CPU 0 from outside (`taskset -p`, since v1.0.0's tool has no pinning options), helpers unpinned, 3 runs per build,
+  interleaved; on x86-64 with all four CPUs online.
+- **Replay:** `taskset -c 1 <replay bench> --bench --warm-up-time 1 --measurement-time 2 records`, 8 rounds, interleaved.
+
+Raw output (JSON lines per run, environment, scripts) is kept outside the repository.
+
+### Off: gate 1, instructions per append
+
+Gate 1 as amended on 2026-11-26 (ADR 0047): the change with the option off against **the same commit with the latency
+test compiled out** (`RUSTFLAGS="--cfg tickertape_latency_check_out"`, `benches/README.md`), at most 3 more. The
+difference to the base commit is reported as drift and not gated. Counted on the change as merged with `main` at
+`3d82592` (the code of `9ff23da` and the review fixes, which do not touch the append path).
+
+| | x86-64, 64 B | x86-64, 1,024 B | aarch64, 64 B | aarch64, 1,024 B |
+|---|---|---|---|---|
+| change, `Off` | **384** | 899.9 | **369** | 997.0 |
+| change, latency test compiled out | 393 | 908.9 | 370 | 998.0 |
+| **gate 1: `Off` − compiled out** | **−9** | −9 | **−1** | −1 |
+| change, `RollsAndCheckpoints` | 384 | 899.9 | 369 | 997.0 |
+| change, `All` | 600 (+216 over `Off`) | 1,115.9 | 576 (+207) | 1,204.0 |
+| *drift:* base (`3d82592`; `12e76d8` and `8912012` the same) | 383 | 898.9 | 366 | 994.0 |
+| *drift:* v1.0.0 | 381 | 896.9 | 363 | 991.0 |
+
+x86-64 on the cloud machine; aarch64 in the OrbStack VM on an M4 Pro with the same rustc (1.100.0), which gave the cloud
+machine's counts exactly for `e08c364` and, for the base and the change, the same counts as the cloud machine had on
+`12e76d8`.
+
+**Gate 1 is met on both.** The test itself costs nothing measurable in instructions: compiling it out made the append
+*longer*, by 9 on x86-64 and 1 on aarch64. What the counts measure is mostly how the compiler lays out and inlines the
+append path, which changes whenever that path is compiled differently. The append path exists twice in the change (the
+timed copy calls the same code), and the CRC helpers' inlining into `Writer::append` (`format::finish_record_body`,
+`format::record_crc`, `crc::crc32c`, `crc::crc32c_append`, the hardware `append`) moved with unrelated code:
+
+| The same change without its three forced inlines, on | x86-64, 64 B (base) | aarch64, 64 B (base) |
+|---|---|---|
+| `a80f912` | 390 (383) | 366 (366)³ |
+| `e08c364` | 363 (383) | 355 (366) |
+| `12e76d8` | 390 (383) | 366 (366)² |
+
+² The OrbStack VM, rustc 1.100.0. ³ The OrbStack VM, rustc 1.99.1.
+
+With `finish_record_body`, `record_crc` and `crc32c` forced inline the drift was +1 on x86-64 and +3 on aarch64 on each of
+`e08c364`, `12e76d8` and `8912012`, which is why the change keeps them: they reduced the movement in these builds. They
+do not make the count independent of the rest of the crate. Variants counted on aarch64 (OrbStack, rustc 1.100.0; the
+first four by the independent review of the pull request, against the base `8912012` at 366 and the change at 369):
+
+| Variant | aarch64, 64 B |
+|---|---|
+| the change with the latency tests removed | 370 |
+| the change without `#[cold]` on the roll's timing wrapper (`roll_measured`) | 370 |
+| the base with the same three helpers forced inline | 356 |
+| the change with `crc32c_append` forced inline too | 380 |
+| the change with `crc32c` calling the hardware `append` directly (`#[inline]`): `Off` / test compiled out | 372 / 359 |
+| the change without the three forced inlines: `Off` / test compiled out | 366 / 369 |
+
+The change calls `crc32c_append` twice per append out of line (for the length and for the fields); the base with the
+helpers forced inline calls it once. The one simple way tried to remove the second call (the fifth row) made the off path
+13 instructions longer than with the test compiled out, so it was left out. The time gate below decides.
+
+### Off: gate 2, time per append (ns)
+
+| | x86-64, 64 B | x86-64, 1,024 B | aarch64, 64 B | aarch64, 1,024 B |
+|---|---|---|---|---|
+| base, mean of its 40 runs | 37.84 | 298.1 | 42.07 | 399.2 |
+| **base 2 − base (the noise floor)** | −0.23 [−0.76, +0.31] | −0.43 % [−1.24, +0.37] | −0.24 [−0.51, +0.02] | +0.25 % [−0.35, +0.86] |
+| v1.0.0 − base | −0.21 [−0.86, +0.44] | −0.44 % [−1.17, +0.30] | −0.19 [−0.58, +0.20] | −0.16 % [−1.15, +0.83] |
+| **`Off` − base** | +0.23 [−0.33, +0.78] | +0.53 % [−0.32, +1.39] | −0.80 [−1.09, −0.51] | +0.09 % [−0.84, +1.02] |
+| **`RollsAndCheckpoints` − base** | +0.20 [−0.32, +0.73] | +0.62 % [−0.60, +1.84] | −0.98 [−1.21, −0.76] | +0.07 % [−0.79, +0.94] |
+| Bound | 1 ns | 2 % | 1 ns | 2 % |
+| Run valid; gate met | yes; yes | yes; yes | yes; yes | yes; yes |
+
+**Gate 2 is met on both, in valid runs, in both modes.** On aarch64 the change is faster at 64 B by 0.8 to 1 ns, with 3
+more instructions: code layout rather than work. v1.0.0 and the base are within the noise floor of each other here.
+
+Earlier runs, of code that was not merged (the change on older bases, or with other inlining), all on the same machine
+types: on `a80f912`, with the writer's SMT sibling online, 40 pairs on x86-64 gave an **invalid** run at 1,024 B (base 2
+− base [−0.49, +2.43] %; the change +3.13 % [+1.02, +5.25]), which is why the sibling was taken offline afterwards, and
+that made base 2 − base about three times tighter there. Every valid run met both gates: without forced inlining on
+`e08c364` (x86-64, 125 pairs at 64 B: `Off` +0.37 ns [+0.01, +0.74], `RollsAndCheckpoints` +0.22 [−0.09, +0.52]; 26 at
+1,024 B; aarch64, 36 pairs: −0.70 and −0.78 ns, +0.13 % and −0.16 %), and with two of the three helpers forced inline
+(x86-64, 70 pairs; aarch64, 50 pairs).
+
+### `All`: the cost per append
+
+| | x86-64 | aarch64 |
+|---|---|---|
+| Added to a 64-byte append (40 pairs, 95 % interval) | **+57.4 ns** [+56.8, +57.9] (37.8 → 95.2 ns) | **+83.0 ns** [+82.6, +83.5] (42.1 → 125.1 ns) |
+| Added to a 1,024-byte append | +53.5 ns [+50.0, +57.0] (+18 %) | +58.4 ns [+53.3, +63.5] (+15 %) |
+| Clock pair alone (`Instant::now()` and `elapsed()`) | 44.3–44.4 ns | 71.9–72.3 ns |
+| Histogram update alone (the update with its value, less the value alone) | about 1.8 ns (2.04–2.05 less 0.27–0.31) | about 2.1 ns (2.54 less 0.42) |
+| Median of an empty timed interval (not a floor: individual values can be lower) | 20–21 ns | 33 ns |
+| Appends/s with `All` (from the paired means, 64 B, one thread) | 10.5 million | 8.0 million |
+
+**The published budget (60 ns added to a 64-byte append, of which at most 5 ns for the histogram) is met on x86-64
+(57.4 ns) and missed on aarch64 (83.0 ns).** Earlier sessions on x86-64 measured 58.7 to 60.5 ns for slightly different
+code. The histogram's part (about 2 ns) is within its share on both. Almost all of the cost is the two clock reads,
+through the vDSO: about 22 ns a read on x86-64 and 36 ns on aarch64 here. Since the budget is not met everywhere, the
+documentation gives these figures and does not call the option cheap. With `All` an append can cost more than the
+append itself.
+
+### Tail of the visible latency (µs), not gated
+
+Median of the runs per build [lowest..highest]. "Service" is the writer's own `append` histogram with `All`
+(`WriterLatency::append`), recorded in the same runs.
+
+| x86-64 (3 runs each) | p50 | p99 | p99.9 | max | service p50 | service p99.9 | service max |
+|---|---|---|---|---|---|---|---|
+| base | 0.31 | 0.49 [0.48..3.66] | 2.21 [2.18..5.19] | 871 [865..905] | | | |
+| base 2 | 0.31 | 4.07 [0.47..4.91] | 5.59 [2.11..6.65] | 859 [850..901] | | | |
+| v1.0.0 | 0.31 | 0.91 [0.48..2.35] | 2.50 [2.18..4.16] | 891 [772..909] | | | |
+| `Off` | 0.31 | 0.54 [0.54..3.67] | 2.33 [2.19..5.29] | 854 [851..884] | | | |
+| `RollsAndCheckpoints` | 0.31 | 4.19 [1.33..4.35] | 5.54 [2.73..5.92] | 868 [767..922] | | | |
+| `All` | 0.33 | 0.63 [0.57..1.91] | 2.26 [2.19..3.50] | 870 [831..913] | 0.107 | 1.18 | 180 [180..250] |
+| `All`, snapshot every 1 s | 0.33 | 1.86 [0.59..3.63] | 3.58 [2.30..5.37] | 921 [878..934] | 0.107 | 1.25 | 179 [172..234] |
+| `All`, snapshot every 10 ms | 0.33 | 2.69 [2.62..3.45] | 5.09 [4.37..6.49] | 876 [862..909] | 0.107 | 1.31 | 188 [172..225] |
+
+| aarch64 (3 runs each) | p50 | p99 | p99.9 | max | service p50 | service p99.9 | service max |
+|---|---|---|---|---|---|---|---|
+| base | 0.26 | 2.12 [1.38..2.41] | 3.10 [2.48..3.48] | 927 [905..931] | | | |
+| base 2 | 0.26 | 0.36 [0.35..1.66] | 1.91 [1.87..2.27] | 935 [882..953] | | | |
+| v1.0.0 | 0.26 | 0.35 [0.35..0.36] | 1.91 [1.87..2.15] | 926 [924..943] | | | |
+| `Off` | 0.26 | 2.07 [0.36..2.12] | 2.98 [2.10..3.20] | 942 [913..958] | | | |
+| `RollsAndCheckpoints` | 0.26 | 0.37 [0.36..2.01] | 2.41 [2.25..3.08] | 942 [924..947] | | | |
+| `All` | 0.29 | 2.07 [0.40..2.52] | 2.95 [1.91..3.58] | 927 [882..951] | 0.121 | 2.03 | 195 [190..302] |
+| `All`, snapshot every 1 s | 0.29 | 0.58 [0.40..1.17] | 2.34 [2.02..2.34] | 931 [916..956] | 0.121 | 2.02 | 188 [178..193] |
+| `All`, snapshot every 10 ms | 0.29 | 0.99 [0.42..1.17] | 2.36 [2.29..2.72] | 918 [898..919] | 0.122 | 2.02 | 186 [174..786] |
+
+The maximum is about 0.9 ms in every build on both machines, with the option and without it, so it is not the option's.
+p99 and p99.9 are bimodal from run to run (base 2 against base, two builds of the same code, differ as much as any two
+builds), so three runs show no effect of the option on the tail; earlier sessions with five runs per build (of the
+change on older bases) did not either. `All` raises p50 by 0.02 to 0.03 µs, about half of what a clock pair costs alone; snapshots,
+even every 10 ms, did not visibly change the writer's own service times (one run's service maximum of 786 µs on aarch64
+is a single run). The service maximum, about 0.2 ms, is far below the visible maximum: most of the stall behind the
+visible maximum is outside the `append` calls, which is what `WriterLatency::append` warns of.
+
+### Replay (the reader side did not move)
+
+`replay/records/{safe,mapped}/{64,1024}`, mean time per run against base in % with the 95 % interval, 8 rounds, in the
+same sessions (x86-64 with the SMT sibling offline):
+
+| | x86-64: base 2 | x86-64: change | aarch64: base 2 | aarch64: change |
+|---|---|---|---|---|
+| safe, 64 B | −3.36 [−10.95, +4.23] | −2.42 [−10.56, +5.72] | −0.37 [−3.12, +2.38] | −0.35 [−2.51, +1.82] |
+| safe, 1,024 B | +0.36 [−3.11, +3.84] | +1.95 [−2.22, +6.11] | +0.34 [−0.87, +1.55] | +0.18 [−0.81, +1.17] |
+| mapped, 64 B | −1.88 [−8.37, +4.62] | −1.82 [−9.89, +6.25] | −0.42 [−2.67, +1.83] | −2.24 [−4.08, −0.40] |
+| mapped, 1,024 B | −0.88 [−4.60, +2.84] | −0.57 [−4.83, +3.68] | −0.35 [−1.55, +0.85] | −0.72 [−1.75, +0.31] |
+
+Every interval of the change includes 0 or lies on the faster side, and each is within what base 2 shows on its
+machine. The change touches the readers' code only through `format::record_crc` and `crc::crc32c`, which the safe reader
+also calls, now always inlined. The x86-64 intervals are wide (this machine's replay varies by several percent from run
+to run): they rule out a large slowdown there, not one of 2 %; aarch64's rule out more than about 1 % for the safe
+reader.
 
 ## 2026-11-25, where the CPU time goes: profiles of the readers, notification and serialization (Google Cloud VMs)
 

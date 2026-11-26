@@ -94,6 +94,10 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   - Do not put segment files back into a journal while retention runs on it.
 - Changed (tests): `retention_kill_loop_50` kills the archiver inside runs of several removals, at delays scaled to how
   long a move takes on the machine, instead of within 5 ms (issue #73).
+- Docs: `docs/benchmarks.md` has seeks with and without the seek index on `main` (issue #59): both readers, 64 B and
+  1,024 B, targets at the start, middle and end of a sealed 128 MiB segment and of the newest one, warm and cold,
+  forward seeks, the cost of `tickertape index` and of the writer's open with index files (x86-64 and aarch64 cloud
+  VMs). `docs/operations.md` quotes them.
 - Docs: `docs/operations.md` → Open files states how many files a writer can hold open (ADR 0054, issue #73). The
   guarantee in 1.x is that the count is bounded, whatever the number of segments and however far its background
   checkpoints fall behind; in this release it is at most 18, 19 on Linux by default and 20 on Linux with the spare
@@ -200,11 +204,19 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 - Docs: ADR 0045 (accepted) designs a sparse, rebuildable seek index next to sealed segments (issue #59), built as above.
 - Added (core): the `latency` module (from 1.1, issue #61), the first two steps of the new ADR 0047, which designs
   opt-in latency histograms in the library and a `tickertape age` command (the third step, histograms in the writer, is
-  not built): `latency::Recorder`, a histogram of durations that one thread records and any thread reads through a `View` without a lock, with exact extremes,
+  the next entry): `latency::Recorder`, a histogram of durations that one thread records and any thread reads through a `View` without a lock, with exact extremes,
   quantiles at most 1.6 % above the true value and interval views (`Snapshot::since`); and `latency::RecordAge`, the
   age of records as a reader returns them, with separate counts for records that are not live, not stamped or stamped
-  ahead of the clock. Nothing is recorded unless the application does it; the writer, the readers, the on-disk format
-  and the bindings are unchanged.
+  ahead of the clock. Nothing is recorded unless the application does it; the readers, the on-disk format and the
+  bindings are unchanged.
+- Added (core): `WriterConfig::latency` with `LatencyMode` (from 1.1, issue #61, the third step of ADR 0047), **off by
+  default**, and `Writer::latency`, which returns `latency::WriterLatency`: histograms of the writer's own calls, readable
+  from any thread of its process. `LatencyMode::RollsAndCheckpoints` records rolls and the time from a checkpoint request
+  to its durable marker and leaves an append that does not roll alone; `LatencyMode::All` also times every append and
+  every batch, without sampling. These are service times, not response times. Off, an append gains one test; what the
+  modes cost is in `docs/benchmarks.md` (2026-11-26). The file format, the crash contract and the bindings are unchanged.
+- Added (benchmarks): `tt-append-cost` (instructions per append, and the parts of a timed append), the `append/latency`
+  group of the `append` benchmark, and `tt-latency --writer-latency` and `--snapshot-ms`.
 - Added (CLI): `tickertape age` follows a live journal from its end and reports record ages as text or JSON (from 1.1).
   By default it polls, so that it never makes the watched writer's appends wake it (`--wait`). `live` in each report
   tells an idle journal from a reader that is not at the end of the journal yet and measured nothing.

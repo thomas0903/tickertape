@@ -504,7 +504,7 @@ WriterMetrics w = writer.metrics();                       // in the writer's pro
 - `JournalStatus`, `WriterMetrics`, `ReaderMetrics` and `BeaconStatus` are final classes, because their C structs can
   grow; `Position` and `Lag` are records.
 
-The latency histograms and record ages of the Rust crate (`tickertape::latency`, from 1.1, ADR
+The latency histograms (the writer's, too) and record ages of the Rust crate (`tickertape::latency`, from 1.1, ADR
 [0047](decisions/0047-latency-histograms.md)) are not available from Java yet; `tickertape age` (see [`cli.md`](cli.md))
 reports ages from the command line.
 
