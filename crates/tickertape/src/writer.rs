@@ -1335,8 +1335,7 @@ impl Writer {
         if spare.size == self.config.segment_size {
             return Some(spare);
         }
-        drop(spare);
-        let _ = fs::remove_file(self.root.join(journal::SPARE_FILE));
+        spare.discard(&self.root.join(journal::SPARE_FILE));
         None
     }
 
@@ -1427,15 +1426,13 @@ fn publish_spare(dir: &Path, base: u64, size: u64, spare: Spare) -> Result<Segme
     let prepared = crate::fault::inject(crate::fault::Point::SpareHeader)
         .and_then(|()| spare.file.write_all_at(&header, 0));
     if prepared.is_err() {
-        drop(spare);
-        let _ = fs::remove_file(&spare_path);
+        spare.discard(&spare_path);
         return create_segment(dir, base, size, false);
     }
     if let Err(e) = crate::fault::inject(crate::fault::Point::Link)
         .and_then(|()| fs::hard_link(&spare_path, &path))
     {
-        drop(spare);
-        let _ = fs::remove_file(&spare_path);
+        spare.discard(&spare_path);
         return Err(Error::io("publish segment", &path, e));
     }
     // Publication happened; a leftover spare name is harmless and removed at the next open.
@@ -1575,6 +1572,7 @@ fn create_segment(dir: &Path, base: u64, size: u64, sync: bool) -> Result<Segmen
         // Map before publishing, so that nothing fallible is left after the link (the publication point).
         let len = usize::try_from(size)
             .map_err(|_| Error::io("map segment", &tmp, io::Error::other("segment too large")))?;
+        crate::fault::hook(crate::fault::Point::MapSegment);
         let map = crate::fault::inject(crate::fault::Point::MapSegment)
             .and_then(|()| MapRw::new(&file, len))
             .map_err(|e| Error::io("map segment", &tmp, e))?;
@@ -1586,7 +1584,8 @@ fn create_segment(dir: &Path, base: u64, size: u64, sync: bool) -> Result<Segmen
     let map = match prepared {
         Ok(map) => map,
         Err(e) => {
-            let _ = fs::remove_file(&tmp);
+            // A partial preallocation keeps its blocks on some filesystems (ext4): they go back before a retry.
+            let _ = journal::discard_unpublished(&file, &tmp);
             return Err(e);
         }
     };
@@ -3064,7 +3063,7 @@ mod tests {
     /// An early write-back helper that stopped on its own (here as for an unsupported call) is handed nothing more:
     /// after many rolls, with retention deleting the segments rolled past, no rolled segment waits for it and it holds
     /// no segment file, so no descriptor or deleted segment's space is kept (Linux; ADR 0038 → Early write-back).
-    #[cfg(all(target_os = "linux", feature = "fault-injection"))]
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_stopped_writeback_helper_is_handed_no_files() {
         let dir = tempfile::tempdir().unwrap();
@@ -3075,7 +3074,13 @@ mod tests {
                 crate::retention::Action::Delete,
             );
         let mut w = Writer::open(dir.path(), config).unwrap();
-        crate::fault::fail_next_background(crate::fault::Point::EarlyWriteback, libc::EINVAL);
+        // This writer's helper only: a process-wide `fault::fail_next_background` may be taken by the helper of any
+        // other test running at the same time, and this one's then never stops (issue #73).
+        w.writeback
+            .as_ref()
+            .unwrap()
+            .test_handle()
+            .fail_next(libc::EINVAL);
         let deadline = Instant::now() + std::time::Duration::from_secs(30);
         let first = w.active.base;
         while w.active.base == first {

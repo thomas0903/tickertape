@@ -5,6 +5,13 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
+- Fixed: a spare segment that came to nothing (its preparation failed after its blocks were allocated) gives its
+  blocks back even while another descriptor of its file is open, such as the copy a child process forked at that moment
+  holds until it executes its new program. It is truncated before its name is removed, if it has no other name; so are
+  a spare the roll discards, the file a panicked spare thread left, and the temporary file of a segment a roll failed
+  to create. Before, a roll that had run out of space while the spare held it could fail with "no space" when it tried
+  again (Linux with `WriterConfig::spare_segment`), and on macOS the roll's own create that follows a failed spare
+  could. ADR 0049 amendment of 2026-11-27; issue #73.
 - Docs: the rustdoc of `Reader::seek_to_end` (new in 1.1) states that a file named like a segment without a valid
   header where the call starts (for a visible reader the newest name, even an empty or foreign file) is
   `Error::Corrupt` naming that file, as at `Reader::open`, and that a durable-only reader opens no name later than the

@@ -325,6 +325,15 @@ pub(crate) struct Spare {
     pub(crate) size: u64,
 }
 
+impl Spare {
+    /// Unmaps the spare and gives its blocks back ([`crate::journal::discard_unpublished`]); `path` is its name.
+    pub(crate) fn discard(self, path: &Path) {
+        let Spare { file, map, .. } = self;
+        drop(map);
+        let _ = crate::journal::discard_unpublished(&file, path);
+    }
+}
+
 /// The writer's side of preparing the next segment in the background (ADR 0022).
 ///
 /// - **macOS:** a short-lived thread per spare, and [`Spares::take`] waits for it.
@@ -510,7 +519,9 @@ impl Spares {
                     Some(spare) => Waited::Ready(spare),
                     // A thread that panicked leaves its file, and the blocks it took: they are freed here.
                     None if ended => {
-                        let removed = fs::remove_file(self.dir.join(crate::journal::SPARE_FILE));
+                        let path = self.dir.join(crate::journal::SPARE_FILE);
+                        // Truncated first, as a failed preparation's file is.
+                        let removed = crate::journal::discard_unpublished_at(&path);
                         if removed.is_ok() {
                             Waited::Freed
                         } else {
@@ -640,7 +651,9 @@ fn make_spare(dir: &Path, size: u64) -> io::Result<Spare> {
     match made {
         Ok(map) => Ok(Spare { file, map, size }),
         Err(e) => {
-            let _ = fs::remove_file(&path);
+            // Its blocks go back even while another descriptor of the file is open: a roll that ran out of space
+            // meanwhile tries again as soon as this preparation has ended (ADR 0049).
+            let _ = crate::journal::discard_unpublished(&file, &path);
             Err(e)
         }
     }
