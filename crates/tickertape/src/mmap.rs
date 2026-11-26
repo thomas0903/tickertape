@@ -181,6 +181,17 @@ impl MapRw {
         Some(self.word(offset)?.load(Ordering::Acquire))
     }
 
+    /// EXPERIMENT (ADR 0058; `--cfg tickertape_pf_exp` only): takes the write fault of the page holding `offset` now,
+    /// with an atomic `fetch_or(0)` on the (8-aligned) word there, which changes no byte. Called for the commit word
+    /// slot at the write position and for the first word of the next page: words that readers only ever load
+    /// atomically, and that the writer stores into only later, on this thread. Nothing if out of bounds.
+    #[cfg(any(tickertape_pf_exp, tickertape_pf_touch_append))]
+    pub(crate) fn exp_touch(&self, offset: u64) {
+        if let Some(word) = self.word(offset) {
+            word.fetch_or(0, Ordering::Relaxed);
+        }
+    }
+
     /// Stores the commit word at `offset` with `Release`, publishing every byte written before it.
     pub(crate) fn store_commit_word(&self, offset: u64, value: u32) -> Option<()> {
         self.word(offset)?.store(value, Ordering::Release);

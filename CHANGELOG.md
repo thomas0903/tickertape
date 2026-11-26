@@ -5,6 +5,11 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
+- Added (benchmarks): `tt-faults` counts the page faults of the writer's thread append by append, with paced appends,
+  background checkpoints and a zero-copy reader, and `benches/diagnostics/writer-faults.bt` classifies them (ADR 0058,
+  issue #60, proposed). Experiment switches for the prefault helper, early write-back and the active segment's sync
+  compile only with `--cfg tickertape_pf_exp` or `--cfg tickertape_pf_touch_append`; no default build has them, and the
+  library's behaviour does not change.
 - Fixed: a reader replayed 15 to 30 % slower, on Linux x86-64 and aarch64, when it happened to sit in memory so that a
   page boundary fell inside the record it decodes into: the record path stores and loads that record 16 bytes at a
   time, and such an access split across two pages is slow (ADR 0057, issue #86; present since 1.0.0). About one process

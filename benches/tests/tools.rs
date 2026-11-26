@@ -228,6 +228,51 @@ fn cold_replay_with_mock_purge_and_unavailable_purge() {
     }
 }
 
+/// `tt-faults` (ADR 0058): every measured append is counted as faulted or not, and the counts add up.
+#[cfg(target_os = "linux")]
+#[test]
+fn faults_counts_every_append_once() {
+    let root = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_tt-faults"))
+        .arg("--dir")
+        .arg(root.path().join("journal"))
+        .args([
+            "--rate",
+            "2000",
+            "--payload",
+            "1024",
+            "--seconds",
+            "1",
+            "--warmup-seconds",
+            "1",
+            "--checkpoint-ms",
+            "200",
+            "--segment-size",
+            "1048576",
+            "--log",
+        ])
+        .arg(root.path().join("appends.txt"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["appends_measured"], 2000);
+    let all = result["append_latency"]["count"].as_u64().unwrap();
+    let faulted = result["append_latency_faulted"]["count"].as_u64().unwrap();
+    let clean = result["append_latency_clean"]["count"].as_u64().unwrap();
+    assert_eq!(all, 2000);
+    assert_eq!(faulted + clean, all);
+    assert_eq!(
+        result["faults"]["faulted_appends"].as_u64().unwrap(),
+        faulted
+    );
+    assert!(result["checkpoints_requested"].as_u64().unwrap() >= 5);
+}
+
 #[test]
 fn checkpoint_separates_rolls_and_empty_checkpoint() {
     let root = tempfile::tempdir().unwrap();
