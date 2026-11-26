@@ -1772,9 +1772,11 @@ impl Reader {
     /// in [`TAIL_PROBE`] of them reads a whole chunk anyway. The first one that does not follow is a whole chunk again, and
     /// the count starts over: the reader found the next record without waiting, or more than one record in the last fill.
     /// So the reader takes tail reads only where it has shown that it waits for the writer even when it reads whole
-    /// chunks, and keeps showing it: a blocking reader that waits for every record only because its tail reads are fast
-    /// would not, after a whole chunk, wait for the next one, and goes back to whole chunks. A fill always reads a whole
-    /// chunk if it is
+    /// chunks, and keeps showing it: a reader that waits for every record only because its tail reads are fast would
+    /// not, after a whole chunk, wait for the next one, and goes back to whole chunks. A fill always reads a whole chunk
+    /// if it is
+    ///
+    /// - for a record the reader blocked for;
     ///
     /// - on replay or catch-up, where no slot is empty before its fill;
     /// - the first one after a seek and in a segment, and one of a durable-only reader, which comes to no empty slot
