@@ -385,6 +385,11 @@ are profiles, not throughput or latency figures.
 **Where a stall comes from.** To find what the writer or a reader waits on during a run (scheduler, page faults,
 filesystem and write-back, block I/O), trace it with
 [the eBPF diagnostics playbook](../docs/playbooks/diagnose-latency-with-ebpf.md) and the scripts in `diagnostics/`.
+Two of them were written for the aarch64 observations of `docs/benchmarks.md` (2026-11-26):
+`diagnostics/reader-pauses.bt` tells what a pinned, spinning reader does while it falls behind (off its CPU, in a page
+fault or a system call, interrupt work, or its vCPU not running at all), and `diagnostics/frontier-evictions.bt` lists
+the page-cache pages the kernel removes or migrates at the write frontier of the active segment, to line up with the
+moments a zero-copy reader re-reads a slot.
 
 ## Recorded sustained session
 

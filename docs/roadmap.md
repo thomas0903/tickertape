@@ -205,15 +205,22 @@ released with seven items open, accepted by the owner as known gaps
     item named bare-metal Graviton, `c7gd.metal`.)
   - Record CPU, kernel, filesystem, storage, affinity, CRC implementation and commands; resolve architecture-specific
     correctness failures and explain material performance differences before claiming cross-architecture results.
-  - Missing: an explanation of the aarch64 mapped reader's constant maximum in the checkpoint runs (not reproduced on
-    8 vCPUs, 2026-11-25) and confirmation of the platform
-    mechanism behind the lagging view of issue #43. (The appends of 50–128 ms in the 1,024 B steady-90 runs on aarch64
-    ext4 are attributed since 2026-11-25: `docs/benchmarks.md` → "roll and journal stalls".) That view no longer
-    stops a reader (readers tolerate it; `crash-contract.md` → Known risks and limits), and the long verified runs under forced compaction (`3fea1c0`, on
-    aarch64 and x86-64) showed no false corruption and no lost write (issue #43, closed). Correctness, crash and soak
-    checks run on aarch64 Linux in CI (#12); the sustained sessions and comparison on Axion are recorded in
-    `docs/benchmarks.md` (2026-11-19 to 2026-11-22) with CPU, kernel, filesystem, storage, affinity, CRC path and
-    commands.
+  - Missing: an explanation of the aarch64 mapped reader's constant maximum in the checkpoint runs, and confirmation of
+    the platform mechanism behind the lagging view of issue #43. Investigated on 2026-11-26 (`docs/benchmarks.md` → "the
+    two aarch64 observations left open by 1.0.0"): the 10 ms maximum did not reproduce on a new `c4a-standard-16-lssd`
+    at `main` or at its own commit (nor on 8 vCPUs, 2026-11-25); in the old data only the spinning reader's CPU had it,
+    never the writer's or the safe reader's; it is not explained, and the trace to run if it returns is
+    `benches/diagnostics/reader-pauses.bt`. The lagging view still occurs on `main` on aarch64 under memory pressure
+    (about one event in 5 minutes, each cleared by the first paused re-read, within 69 µs) and not in 900 s on x86-64; 3
+    of 10 traced events coincide with kswapd removing the frame's pages from the page cache at the write frontier
+    (consistent with reclaim's deferred TLB invalidation), 6 have no such removal near them and are not explained; with
+    the journal within RAM there was no reclaim and no event in 1,000 s, too short to confirm. (The appends of 50–128 ms
+    in the 1,024 B steady-90 runs on aarch64 ext4 are attributed since 2026-11-25: `docs/benchmarks.md` → "roll and
+    journal stalls".) That view no longer stops a reader (readers tolerate it; `crash-contract.md` → Known risks and
+    limits), and the long verified runs under forced compaction (`3fea1c0`, on aarch64 and x86-64) showed no false
+    corruption and no lost write (issue #43, closed). Correctness, crash and soak checks run on aarch64 Linux in CI
+    (#12); the sustained sessions and comparison on Axion are recorded in `docs/benchmarks.md` (2026-11-19 to
+    2026-11-22) with CPU, kernel, filesystem, storage, affinity, CRC path and commands.
 
 ### Following milestones: adoption and scale
 
@@ -317,7 +324,10 @@ where a line says it is closed:
   since for v1.0.0 ([above](#next-release-sustained-performance), `docs/benchmarks.md` 2026-11-25); the durable-only
   reader has not been profiled since #66.
 - **ARM servers:** one of the two latency observations on aarch64 (the 10 ms reader maximum) and the platform mechanism
-  behind issue #43 are not explained; the appends of 50–128 ms are (issue #60, 2026-11-25).
+  behind issue #43 are not explained; the appends of 50–128 ms are (issue #60, 2026-11-25). On 2026-11-26 the 10 ms
+  maximum did not reproduce (it belonged to one VM); part of the lagging view is consistent with reclaim removing the
+  frame's pages under the readers, the rest is not explained, and neither is confirmed (`docs/benchmarks.md`,
+  2026-11-26).
 - **Replay and recovery at scale:** measured on 2026-11-25: archived history, missing and corrupt segments, catch-up
   under a live writer, the zero-copy reader and journals of 10,000 to 100,000 segments ([`benchmarks.md`](benchmarks.md)).
   Not measured: archiving under a live writer at this scale, the 128 MiB archive on aarch64, catch-up of a durable-only

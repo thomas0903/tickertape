@@ -234,10 +234,17 @@ journal; the durability and restart guarantees below apply to retained history.
   reclaims or moves, so a reader can keep reading the old copy of a page for a moment while the writer already writes to
   the new one; Linux does this on x86-64 too. It was not seen on x86-64 in the session where it was found, but that run
   ended in a time-out there (issue #45), so its absence is weak evidence; nor on the Apple M4 Linux VMs tried, nor with
-  a writer and a reader both written without tickertape code on the same Axion VM. A view that stays wrong for longer
-  than the window is still reported as corruption. What holds either way: a record is returned only after its bytes have
-  validated (`reader.rs`: `a_view_that_catches_up_after_the_back_to_back_re_reads_is_not_reported`). What is known about
-  the file: every slot examined held the record intact, and two 600 s runs with the fix validated every record. In long
+  a writer and a reader both written without tickertape code on the same Axion VM. On 2026-11-26 (`benchmarks.md` →
+  the two aarch64 observations left open by 1.0.0) the view still lagged on `main`, on an Axion VM with the journal
+  larger than RAM: about once in 5 minutes, each time caught up at the first re-read after a pause (within 69 µs; no
+  reader of `main` reported corruption), and not in 900 s on an x86-64 VM. At 3 of 10 traced events the kernel's
+  reclaim (kswapd) had just removed the frame's pages from the page cache, which fits the deferred invalidation above
+  for pages it reclaims (migration waits for the invalidation before it copies); at 6 nothing was removed near the
+  write position. With the journal within RAM there was no reclaim and no lag in 1,000 s. Neither account is
+  confirmed. A view that stays wrong for longer than the window is still reported as corruption. What holds either
+  way: a record is returned only after its bytes have validated (`reader.rs`:
+  `a_view_that_catches_up_after_the_back_to_back_re_reads_is_not_reported`). What is known about the file: every slot
+  examined held the record intact, and two 600 s runs with the fix validated every record. In long
   runs at `3fea1c0` under forced compaction (an unpaced 1,024 B writer with background checkpoints, a zero-copy and a
   copying reader, 1,075–1,304 s on two Axion and two x86-64 VMs, ext4 and xfs, about 1.5 TB of payload in all), no
   reader reported corruption, both readers reached the writer's last position, and `tickertape verify` of each journal
