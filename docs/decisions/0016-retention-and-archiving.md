@@ -56,8 +56,10 @@ each removal durable; where that sync does nothing (tmpfs), a removal took about
 open, the run removed each segment a new listing named, and a reader opening while one run caught up dozens of segments
 lost all 8 tries (`tests/empty_slot.rs::live_readers_of_a_killed_writer_see_no_false_error` on tmpfs; deterministic in
 `tests/retention.rs::reader_open_keeps_up_with_a_retention_run_as_fast_as_its_listings`). Nothing older than a listed
-segment appears later while a valid marker is in place (crash contract C14), so the next listed segment that opens is the
-oldest that remains. `seek` keeps listing again: when its segment was the oldest one, the answer is
+segment appears later (crash contract C14), except a segment an archiver puts back (ADR
+[0055](0055-an-archiver-takes-a-segment-out-before-it-lets-it-go.md)); C14 already lets a reader that opens while it is
+out start after it. So the next listed segment that opens is the oldest that remains. The bound is up to 64 failed opens
+(8 listings, each trying up to its 8 oldest segments) before the I/O "not found" error. `seek` keeps listing again: when its segment was the oldest one, the answer is
 `Error::SeqUnavailable` from a new listing.
 
 ## Consequences

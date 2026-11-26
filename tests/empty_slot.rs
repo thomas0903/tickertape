@@ -1647,7 +1647,9 @@ fn killed_writer(rounds: u64) {
     let problems = inspect::verify(&dir).unwrap().problems;
     let torn_or_linked: BTreeSet<_> = problems.iter().map(|p| format!("{:?}", p.reason)).collect();
     eprintln!(
-        "{rounds} rounds: {} records read, {} reads to an end, {} discards; verify at the end: {torn_or_linked:?}",
+        "{rounds} rounds: {} records read, {} reads to an end, {} discards; verify at the end (the journal as the last \
+         kill left it, before any recovery; a BrokenChain there is a writer killed between linking the successor and \
+         sealing, which the next writer's recovery seals; not a reader's error): {torn_or_linked:?}",
         records.into_inner(),
         ends.into_inner(),
         discards.into_inner()

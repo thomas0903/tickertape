@@ -327,7 +327,8 @@ impl Reader {
     /// [`Error::NotFound`] if `dir` has no segments (for example, the writer hasn't started),
     /// [`Error::Corrupt`], [`Error::UnsupportedVersion`] if
     /// the oldest segment's header is invalid, [`Error::Io`]. An I/O "not found" error for a segment the reader listed
-    /// is returned only if the segments it tried disappeared on each of 8 listings in a row.
+    /// is returned only if the segments it tried disappeared on each of 8 listings in a row: each listing tries up to
+    /// its 8 oldest segments, so up to 64 opens fail before that error.
     pub fn open(dir: impl AsRef<Path>, config: ReaderConfig) -> Result<Reader> {
         Reader::open_inner(dir.as_ref(), config, false)
     }
@@ -2025,8 +2026,9 @@ fn open_listed(
         loop {
             match open_segment(dir, base, mapped) {
                 Err(e) if e.is_not_found() => {
-                    // Nothing older than a listed segment appears later (C14): the next one listed is the oldest that
-                    // can remain.
+                    // Nothing older than a listed segment appears later (C14), except a segment an archiver puts back
+                    // (ADR 0055); C14 already lets a reader that opens while it is out start after it. So the next one
+                    // listed is the oldest that can remain.
                     let next = (bases.oldest == Some(base))
                         .then(|| bases.without_oldest())
                         .flatten()

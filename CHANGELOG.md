@@ -11,8 +11,9 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   catching up dozens of segments; present since 1.0.0). Each try chose the oldest segment of a new listing, which the
   run then removed, so all 8 tries were lost to one run. A reader whose oldest listed segment is gone now opens the
   next segment of the same listing (it keeps the 8 oldest bases), and lists again only after those. A durable-only
-  reader's `seek_to_end` that starts at the oldest segment (no valid checkpoint marker) does the same; `seek` is
-  unchanged. ADR 0016 (note of 2026-11-27).
+  reader's `seek_to_end` that starts at the oldest segment (no valid checkpoint marker, or one naming the oldest
+  segment) does the same; `seek` is unchanged. At most 64 opens fail (8 listings of up to 8 segments each) before the
+  I/O "not found" error. ADR 0016 (note of 2026-11-27).
 - Changed (Linux): early write-back stops at the 128 KiB boundary below the writer instead of at the page that holds its
   position (ADR 0058, change 1; issue #60), so that it no longer writes back, and write-protects, the page-cache folio
   the writer is still filling (128 KiB on recent ext4 and xfs with the default `read_ahead_kb`), which the device then

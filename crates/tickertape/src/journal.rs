@@ -137,6 +137,8 @@ impl Bases {
                 self.oldest = Some(base);
                 oldest
             }
+            // Most bases of a long listing are newer than every one kept.
+            Some(_) if self.later[LATER_BASES - 1].is_some_and(|newest| base > newest) => return,
             Some(_) => base,
         };
         for slot in &mut self.later {
