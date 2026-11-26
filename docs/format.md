@@ -231,11 +231,18 @@ Readers never modify a journal. Only the writer repairs it, on open, after takin
 
 1. **Remove stale temporary files** (`*.tape.tmp` and `next-segment.tmp`). They are never segments (at most a
    second name for a published one).
-2. **Find the scan start.** With a current checkpoint (see "Checkpoint marker"): its segment must exist and
-   its `offset` must be a multiple of 8 in `[64, segment_size - 8]`; otherwise the journal is **refused** with a
-   corruption error under every policy, because the history the marker vouches for is missing and recreating that
-   segment could make the stale marker look valid again. Recovery then starts there, expecting `next_seq`, and
-   trusts everything before. Without a current checkpoint, it starts at offset 64 of the oldest segment, expecting
+2. **Find the scan start.** With a current checkpoint (see "Checkpoint marker"): its segment must exist,
+   its `offset` must be a multiple of 8 in `[64, segment_size - 8]`, and the segment's records must reach that
+   position: at `offset` 64, `next_seq` must be the segment's `base_seq`; at any other offset, the segment must hold a
+   valid record (see "Record") with sequence number `next_seq - 1` that ends, with its padding, exactly at `offset`.
+   Otherwise the marker is **dangling** and the journal is **refused** with a corruption error
+   (`DanglingCheckpoint`) under every policy, before anything below changes the journal: the history the marker
+   vouches for is missing (a segment restored from a backup older than the marker, or the last record it covers
+   damaged), and recreating that segment, or appending at the marker's position, would make the stale marker look
+   valid and the gap below it part of the journal. A missing segment or an invalid offset is reported at the
+   `checkpoint` file, offset 0; records that do not reach the position at the segment's path and the marker's
+   `offset` (ADR [0056](decisions/0056-marker-beyond-its-records.md), which also says what an operator does then).
+   Recovery then starts there, expecting `next_seq`, and trusts everything before the record it checked. Without a current checkpoint, it starts at offset 64 of the oldest segment, expecting
    that segment's `base_seq`. The **recovery domain** is the start segment and every segment with a larger
    `base_seq`.
 
@@ -305,7 +312,9 @@ any step fails (bytes zeroed in place are not preserved: crash contract C8):
 An interrupted recovery leaves either the original or the preserved copy (or both); the next open redoes the
 repair. Leftover `.partial` files are kept as evidence. Records before `P` are never modified.
 
-Every action is reported in the writer's `RecoveryReport`. Recovery work is: listing the directory; reading every
+Every action is reported in the writer's `RecoveryReport`. Recovery work is: listing the directory; finding and
+validating the record right before the marker's position (a backward probe of the commit words from the position to
+that record's start, and its CRC32C; work proportional to that record's length, ADR 0056); reading every
 record after the scan start (the data written since the last checkpoint); reading `[P, Z)` of the last segment to find
 non-zero bytes and, up to the last of them, checking each 8-byte position for committed history (step 4); and, only
 for repairs, copying the affected segment or tail.

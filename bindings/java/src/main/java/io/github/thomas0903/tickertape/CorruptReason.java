@@ -38,7 +38,10 @@ public enum CorruptReason {
     BAD_SEAL(11),
     /** A sealed segment's successor is missing while later segments exist, or does not start where the seal says. */
     BROKEN_CHAIN(12),
-    /** The checkpoint marker points to a missing segment or an impossible offset. */
+    /**
+     * The checkpoint marker points to a missing segment, an impossible offset, or (from 1.1) a position its segment's
+     * records do not reach ({@code docs/format.md}, Recovery, step 2).
+     */
     DANGLING_CHECKPOINT(13),
     /**
      * A commit word reads 0, and recovery or verify found evidence of committed records after it (usually storage

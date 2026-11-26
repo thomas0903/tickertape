@@ -454,7 +454,9 @@ not be established.
 - `segments.before_checkpoint`: segments older than the checkpoint segment, which retention may remove.
 - `checkpoint`: the marker's current slot, or null if no slot is valid. `problem` is set when the writer would refuse
   the marker (its segment missing or with an invalid header, or an offset outside the record area); then `exposure`
-  is unknown and `health.corrupt` is true. `modified_unix_ns` is the marker file's modification time and
+  is unknown and `health.corrupt` is true. A sample does not read the record before the marker's position, which the
+  writer also requires (from 1.1, ADR 0056: a marker its segment's records do not reach is refused); `verify` reports
+  where such records end. `modified_unix_ns` is the marker file's modification time and
   `estimated_age_s` the time since then, by the observer's clock at the end of the sample; null with
   `age_unknown_reason` when the time is detectably unreliable (`marker_resized`: the marker is not at its full
   length, because something cut it; a writer leaves it so until its next checkpoint succeeds, then extends it;

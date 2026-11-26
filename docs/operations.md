@@ -399,14 +399,23 @@ What a reader on the new machine sees:
 Do not open a writer on an archive copy: it creates the missing next segment and continues with sequence numbers the
 original journal already uses.
 
+### Restoring from a backup
+
+Restore a backup's `checkpoint` together with its segments, and remove the segments the backup does not have. The
+marker vouches for every record below its `next_seq`, so a marker newer than the segments covers records they lack.
+From 1.1 a writer refuses such a journal under every recovery policy, before it changes anything
+(`DanglingCheckpoint`, reported at the marker's segment and offset; ADR 0056); readers and `verify` stop where the
+restored records end. If the backup's marker is lost, see "After a crash" → Refused to open.
+
 ### Limits
 
 - **Do not copy a journal a writer is using as a whole.** The files change during the copy, so it is no snapshot.
   Copying the segments before `checkpoint` is dangerous: the marker can cover records the copied segments lack. If the
   marker names a segment the copy lacks, the writer refuses the copy. If it points into a segment that was copied
-  earlier, `verify` and `status` can both exit with 0 and the writer opens, continues at the marker's sequence number
-  and leaves a hole that readers cannot pass. A sign of this is a `verify` `last_seq` + 1 lower than the checkpoint's
-  `next seq` in `status`. Copying `checkpoint` first avoids that, but the records after the marker may be incomplete,
+  earlier, `status` can exit with 0, and the writer refuses the copy too (from 1.1, ADR 0056: `DanglingCheckpoint` at
+  that segment and the marker's offset; 1.0.0 opened it, continued at the marker's sequence number and left a hole
+  that readers cannot pass). A sign of this is a `verify` `last_seq` + 1 lower than the checkpoint's `next seq` in
+  `status`. Copying `checkpoint` first avoids that, but the records after the marker may be incomplete,
   `verify` can fail because the next segment is missing, and retention may remove segments during the copy. Stop the
   writer, or use the archive recipe above.
 - A copy that lacks a segment in the middle, or the newest one after a sealed one, fails `verify`; one that lacks only
@@ -756,5 +765,18 @@ the writer or retention.
   earlier in the scan, including bytes zeroed in place. Crash contract C11 lists them.
 - **Refused to open** (missing checkpoint segment or a gap in the chain): restore the missing segments from a copy,
   or move the affected segments aside knowingly. tickertape won't discard history on its own.
+- **Refused to open with `DanglingCheckpoint` at a segment and an offset** (from 1.1, under every policy; ADR 0056):
+  the checkpoint marker's position lies beyond the records that segment holds, or the record right before it is
+  damaged, so the marker vouches for records the journal lacks. Nothing was changed. Run `tickertape verify` (it names
+  where the records end, or the damaged record) and `tickertape inspect` or `status` (the marker's segment, offset and
+  next sequence number). If the segments were restored from a backup, restore that backup's `checkpoint` with them. If
+  storage damaged the record, restore its segment from a copy. Otherwise, knowingly, move `checkpoint` out of the
+  directory and keep it: the writer then opens without a marker and validates the whole journal from the oldest
+  segment (an open that takes longer the larger the journal). Where the restored records simply end, it continues
+  there; a damaged record with records or segments after it is handled like any corrupt position (with `Quarantine`
+  the bytes from it on, and the later segments, go to `quarantine/`; `Fail` refuses). Either way the writer gives the
+  sequence numbers the old marker covered beyond the last valid record to new records. A durable-only reader that had returned records beyond that point would then read different records
+  under the same numbers: start it again from a position you choose. Durable-only readers return nothing, and
+  retention removes nothing, until the next checkpoint. No command sets the marker back.
 
 The `quarantine/` directory is never cleaned up by tickertape; inspect it and delete it yourself when you're done.

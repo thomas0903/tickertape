@@ -1613,6 +1613,17 @@ impl Recovery<'_> {
             if !aligned || offset < format::SEGMENT_HEADER_LEN as u64 || offset > seg.size - 8 {
                 return Err(self.dangling(c));
             }
+            // The record before the marker's position must be there and end exactly at it (ADR 0056): otherwise the
+            // marker vouches for records the segment does not hold (segments restored from a backup older than the
+            // marker, or the last covered record damaged), and appending at the marker would make that gap part of
+            // the journal. Refused under every policy, before anything is changed.
+            if !format::record_ends_at(&RwView(&seg.map), seg.base, offset, seq) {
+                return Err(Error::corrupt(
+                    &seg.path,
+                    offset,
+                    CorruptReason::DanglingCheckpoint(c.segment_base_seq),
+                ));
+            }
         }
         // Step 2a: the seek indexes of every segment recovery may change go before it changes anything (ADR 0045, T4).
         let mut swept = seek_index::dir::sweep(

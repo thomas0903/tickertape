@@ -115,7 +115,8 @@ pub enum tickertape_corrupt_reason {
     /// segment that does not open (writer recovery then preserves the non-zero bytes after that word, or refuses:
     /// `docs/crash-contract.md` C11 (3)), or a segment is disconnected from the chain.
     TICKERTAPE_CORRUPT_BROKEN_CHAIN = 12,
-    /// The checkpoint marker points to a missing segment or an impossible offset.
+    /// The checkpoint marker points to a missing segment, an impossible offset, or (from 1.1) a position its segment's
+    /// records do not reach (`docs/format.md` → Recovery, step 2; ADR 0056).
     TICKERTAPE_CORRUPT_DANGLING_CHECKPOINT = 13,
     /// A commit word reads 0, and recovery or verify found evidence of committed records after it (usually storage
     /// damage; a torn payload can also cause it: `docs/crash-contract.md` C1, C11; ADR 0035). The error message

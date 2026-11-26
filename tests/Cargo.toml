@@ -26,6 +26,10 @@ name = "recovery"
 path = "recovery.rs"
 
 [[test]]
+name = "marker_position"
+path = "marker_position.rs"
+
+[[test]]
 name = "batch"
 path = "batch.rs"
 

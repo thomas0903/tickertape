@@ -239,8 +239,12 @@ pub enum CorruptReason {
     /// newest end at an empty commit word with no committed history found after it.
     #[error("next segment {0} missing or inconsistent")]
     BrokenChain(u64),
-    /// The checkpoint marker points to a segment that doesn't exist, or to an impossible offset.
-    #[error("checkpoint marker points to missing segment {0} or an invalid offset")]
+    /// The checkpoint marker points to a segment that doesn't exist, to an impossible offset, or (from 1.1) to a
+    /// position the segment's records do not reach: the record before it is missing, invalid, or not the one the
+    /// marker's next sequence number implies (`docs/format.md` → Recovery, step 2; ADR 0056). The number is the
+    /// marker's segment. Writer recovery refuses the open with it under every policy, reported at the `checkpoint`
+    /// file (offset 0) for the first two, and at the segment and the marker's offset for the last.
+    #[error("checkpoint marker names segment {0}, which is missing, at an invalid offset, or past its records")]
     DanglingCheckpoint(u64),
     /// A commit word reads 0 (no record), and recovery or `verify` found evidence of committed history after it
     /// (`docs/crash-contract.md`, C11 (2); ADR 0035). The number is the sequence number the evidence carries: a later
