@@ -2287,7 +2287,7 @@ mod wake_tests {
         pub(super) static BEFORE_REGISTER: std::cell::Cell<Option<Box<dyn FnOnce()>>> =
             const { std::cell::Cell::new(None) };
     }
-    use crate::mmap::test_hooks::{BEGINS, FORCE_UNSUPPORTED, LOCK, NO_CAPABILITIES, WAITS};
+    use crate::mmap::test_hooks::{FORCE_UNSUPPORTED, LOCK, NO_CAPABILITIES, begins, waits};
     use crate::{Writer, WriterConfig};
 
     fn blocking(sleep: Duration) -> Backoff {
@@ -2303,7 +2303,7 @@ mod wake_tests {
     struct Unforce;
     impl Drop for Unforce {
         fn drop(&mut self) {
-            FORCE_UNSUPPORTED.store(false, Ordering::SeqCst);
+            FORCE_UNSUPPORTED.set(false);
         }
     }
 
@@ -2311,7 +2311,7 @@ mod wake_tests {
     struct Capable;
     impl Drop for Capable {
         fn drop(&mut self) {
-            NO_CAPABILITIES.store(false, Ordering::SeqCst);
+            NO_CAPABILITIES.set(false);
         }
     }
 
@@ -2345,7 +2345,7 @@ mod wake_tests {
         for seq in 0..5 {
             assert_eq!(r.try_next().unwrap().unwrap().seq, seq);
         }
-        let before = [0, 1].map(|i| BEGINS[i].load(Ordering::SeqCst));
+        let before = begins();
         let writer = std::thread::spawn(move || {
             for _ in 0..30 {
                 record(&mut w);
@@ -2358,7 +2358,8 @@ mod wake_tests {
         let received = Instant::now();
         assert_eq!(got.map(|record| record.seq), Some(5));
         let (_w, checkpointed) = writer.join().unwrap();
-        let begins = [0, 1].map(|i| BEGINS[i].load(Ordering::SeqCst) - before[i]);
+        let after = begins();
+        let begins = [0, 1].map(|i| after[i] - before[i]);
         (
             begins[0],
             begins[1],
@@ -2387,7 +2388,7 @@ mod wake_tests {
     fn a_durable_only_reader_sleeps_unregistered_beside_a_writer_without_marker_words() {
         let _serial = LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _capable = Capable;
-        NO_CAPABILITIES.store(true, Ordering::SeqCst);
+        NO_CAPABILITIES.set(true);
         let (record, marker, after) = durable_reader_under_appends(Duration::from_millis(5));
         assert_eq!((record, marker), (0, 0), "registered as a waiter");
         assert!(
@@ -2503,7 +2504,7 @@ mod wake_tests {
     fn a_reader_with_no_sleep_beside_a_writer_without_marker_words_does_not_spin() {
         let _serial = LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _capable = Capable;
-        NO_CAPABILITIES.store(true, Ordering::SeqCst);
+        NO_CAPABILITIES.set(true);
         let dir = tempfile::tempdir().unwrap();
         let mut w =
             Writer::open(dir.path(), WriterConfig::default().segment_size(1 << 20)).unwrap();
@@ -2517,8 +2518,7 @@ mod wake_tests {
         )
         .unwrap();
         assert_eq!(r.try_next().unwrap().unwrap().seq, 0);
-        let begins = BEGINS[0].load(Ordering::SeqCst);
-        let waits = WAITS.load(Ordering::SeqCst);
+        let (begun, waited) = (begins()[0], waits());
         assert!(
             r.next_timeout(Some(Duration::from_millis(500)))
                 .unwrap()
@@ -2526,8 +2526,8 @@ mod wake_tests {
         );
         // Registered on the record words and blocked, up to the 100 ms cap each time: a handful of waits, not a loop
         // that never registers (the unregistered branch with a sleep of zero).
-        let begins = BEGINS[0].load(Ordering::SeqCst) - begins;
-        let waits = WAITS.load(Ordering::SeqCst) - waits;
+        let begins = begins()[0] - begun;
+        let waits = waits() - waited;
         assert!(
             (2..=20).contains(&begins),
             "{begins} registrations in 500 ms"
@@ -2545,7 +2545,7 @@ mod wake_tests {
             ReaderConfig::default().backoff(blocking(Duration::from_secs(10))),
         )
         .unwrap();
-        let before = WAITS.load(Ordering::SeqCst);
+        let before = waits();
         let started = Instant::now();
         assert!(
             r.next_timeout(Some(Duration::from_millis(350)))
@@ -2554,7 +2554,7 @@ mod wake_tests {
         );
         assert!(started.elapsed() >= Duration::from_millis(350));
         // Each wait lasts up to the 100 ms cap (and the 100 ms record refresh): a handful, not a busy loop.
-        let waits = WAITS.load(Ordering::SeqCst) - before;
+        let waits = waits() - before;
         assert!((2..=20).contains(&waits), "{waits} waits in 350 ms");
     }
 
@@ -2570,8 +2570,8 @@ mod wake_tests {
         .unwrap();
         assert!(r.waker.is_some());
         let _unforce = Unforce;
-        FORCE_UNSUPPORTED.store(true, Ordering::SeqCst);
-        let before = WAITS.load(Ordering::SeqCst);
+        FORCE_UNSUPPORTED.set(true);
+        let before = waits();
         let started = Instant::now();
         assert!(
             r.next_timeout(Some(Duration::from_millis(300)))
@@ -2580,7 +2580,7 @@ mod wake_tests {
         );
         assert!(started.elapsed() >= Duration::from_millis(300));
         // One failed wait turns wake-ups off; the rest of the time the reader sleeps in 20 ms steps.
-        assert_eq!(WAITS.load(Ordering::SeqCst) - before, 1);
+        assert_eq!(waits() - before, 1);
         assert!(
             r.waker.is_none(),
             "wake-ups still on after an unsupported wait"
@@ -3380,7 +3380,14 @@ mod tests {
         let index = encoder.finish(&header, at, 1_000).unwrap();
         let indexes = dir.path().join(crate::seek_index::DIR_NAME);
         std::fs::create_dir(&indexes).unwrap();
-        std::fs::write(indexes.join("00000000000000000000.idx"), index).unwrap();
+        let index_path = indexes.join("00000000000000000000.idx");
+        std::fs::write(&index_path, index).unwrap();
+        // Readers ignore an index its group can write, which a umask of 0002 would give it.
+        std::fs::set_permissions(
+            &index_path,
+            std::os::unix::fs::PermissionsExt::from_mode(0o644),
+        )
+        .unwrap();
         // A successor and a marker in it, for mapped and durable-only readers.
         std::fs::write(
             crate::journal::segment_path(dir.path(), 1_000),
