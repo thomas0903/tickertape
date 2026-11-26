@@ -1,0 +1,56 @@
+#!/usr/bin/env bpftrace
+/*
+ * Every page fault of the thread named tt-faults* (the writer of benches' tt-faults, ADR 0058), what kind it was and
+ * what it waited for, with the write-back calls of the writer's helper threads and of the checkpoint thread around it.
+ * Wall-clock times (Unix seconds), to line up with tt-faults --log.
+ *
+ *   sudo bpftrace benches/diagnostics/writer-faults.bt <print-each-fault: 0|1>
+ *
+ * Threads are matched by name (tt-faults*, tickertape-*), so start it before the run and stop it with SIGINT after.
+ *
+ * Lines (with print-each-fault 1):
+ *   <t> F ns=<duration> addr=<hex> file=<file-backed mapping> w=<write> np=<filemap_fault ran: the page was not mapped> js=<jbd2 handles started>
+ *       xt=<xfs transactions allocated> wb=<waits for write-back> lk=<waits for a folio lock>
+ *     np=0 on a write fault means the page was mapped but write-protected: a write-back had cleaned it since it was
+ *     last made writable (by the prefault helper's MADV_POPULATE_WRITE or by an earlier store).
+ *   <t> <call> tid= comm= us= off= len=    fdatasync, msync, sync_file_range (each), madvise of 200 µs or more
+ * At exit: fault counts and duration histograms by kind (file, write, np); folios added to the page cache by size (order) and thread;
+ * folios cleaned for write-back (folio_mkclean) by thread.
+ */
+kprobe:handle_mm_fault /strncmp(comm, "tt-faults", 9) == 0/ {
+  @s[tid] = nsecs; @a[tid] = arg1; @w[tid] = arg2 & 1; @fb[tid] = ((struct vm_area_struct *)arg0)->vm_file != 0; @np[tid] = 0; @js[tid] = 0; @xt[tid] = 0; @wb[tid] = 0; @lk[tid] = 0;
+}
+kprobe:filemap_fault /@s[tid]/ { @np[tid] = 1; }
+kprobe:jbd2__journal_start /@s[tid]/ { @js[tid] = @js[tid] + 1; }
+// On xfs, also count its transactions (the probe exists only with xfs loaded; the runs of ADR 0058 added it there):
+// kprobe:xfs_trans_alloc /@s[tid]/ { @xt[tid] = @xt[tid] + 1; }
+kprobe:folio_wait_writeback /@s[tid]/ { @wb[tid] = @wb[tid] + 1; }
+kprobe:__folio_lock /@s[tid]/ { @lk[tid] = @lk[tid] + 1; }
+kretprobe:handle_mm_fault /@s[tid]/ {
+  $d = nsecs - @s[tid];
+  if ($1) {
+    printf("%s F ns=%llu addr=%lx file=%d w=%d np=%d js=%d xt=%d wb=%d lk=%d\n", strftime("%s.%f", @s[tid]), $d, @a[tid], @fb[tid], @w[tid],
+      @np[tid], @js[tid], @xt[tid], @wb[tid], @lk[tid]);
+  }
+  @faults[@fb[tid], @w[tid], @np[tid]] = count();
+  @fault_us[@fb[tid], @w[tid], @np[tid]] = hist($d / 1000);
+  @with_journal[@np[tid], @js[tid] + @xt[tid] > 0] = count();
+  delete(@s[tid]); delete(@a[tid]); delete(@fb[tid]); delete(@w[tid]); delete(@np[tid]); delete(@js[tid]); delete(@xt[tid]); delete(@wb[tid]); delete(@lk[tid]);
+}
+tracepoint:syscalls:sys_enter_fdatasync /strncmp(comm, "tt-faults", 9) == 0 || strncmp(comm, "tickertape", 10) == 0/ { @t[tid] = nsecs; @o[tid] = 0; @l[tid] = 0; }
+tracepoint:syscalls:sys_enter_msync /strncmp(comm, "tt-faults", 9) == 0 || strncmp(comm, "tickertape", 10) == 0/ { @t[tid] = nsecs; @o[tid] = args.start; @l[tid] = args.len; }
+tracepoint:syscalls:sys_enter_sync_file_range /strncmp(comm, "tt-faults", 9) == 0 || strncmp(comm, "tickertape", 10) == 0/ { @t[tid] = nsecs; @o[tid] = args.offset; @l[tid] = args.nbytes; }
+tracepoint:syscalls:sys_enter_madvise /strncmp(comm, "tt-faults", 9) == 0 || strncmp(comm, "tickertape", 10) == 0/ { @t[tid] = nsecs; @o[tid] = args.start; @l[tid] = args.len_in; }
+tracepoint:syscalls:sys_exit_fdatasync, tracepoint:syscalls:sys_exit_msync, tracepoint:syscalls:sys_exit_sync_file_range /@t[tid]/ {
+  printf("%s %s tid=%d comm=%s us=%llu off=%lx len=%llu\n", strftime("%s.%f", @t[tid]), probe, tid, comm, (nsecs - @t[tid]) / 1000, @o[tid], @l[tid]);
+  delete(@t[tid]); delete(@o[tid]); delete(@l[tid]);
+}
+tracepoint:syscalls:sys_exit_madvise /@t[tid]/ {
+  $us = (nsecs - @t[tid]) / 1000;
+  if ($us >= 200) { printf("%s madvise tid=%d comm=%s us=%llu off=%lx len=%llu\n", strftime("%s.%f", @t[tid]), tid, comm, $us, @o[tid], @l[tid]); }
+  @madvise_us[comm] = hist($us);
+  delete(@t[tid]); delete(@o[tid]); delete(@l[tid]);
+}
+tracepoint:filemap:mm_filemap_add_to_page_cache /strncmp(comm, "tt-faults", 9) == 0 || strncmp(comm, "tickertape", 10) == 0/ { @folio_order[comm, args.order] = count(); }
+kprobe:folio_mkclean /strncmp(comm, "tt-faults", 9) == 0 || strncmp(comm, "tickertape", 10) == 0/ { @mkclean[comm] = count(); }
+END { clear(@s); clear(@a); clear(@fb); clear(@w); clear(@np); clear(@js); clear(@xt); clear(@wb); clear(@lk); clear(@t); clear(@o); clear(@l); }

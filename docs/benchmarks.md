@@ -32,6 +32,10 @@ Why replay speed changed with the layout of `Reader`, and the before and after o
 [under 2026-11-26](#2026-11-26-the-layout-of-reader-adr-0057-issue-86-google-cloud-vms).
 What the Linux prefault window adds to a checkpoint (bytes, sync time, append and reader latency) is
 [under 2026-11-26](#2026-11-26-what-prefaulted-unwritten-pages-add-to-a-checkpoint-google-cloud-vms-linux).
+Which page faults the writer still takes with prefaulting on, how much latency they explain, and what a writer-thread
+touch (as Chronicle Queue's `microTouch()`), a larger window, re-touching, early write-back further behind and the
+ranged sync do to them (ADR 0058), are
+[under 2026-11-26](#2026-11-26-the-writers-remaining-page-faults-with-prefaulting-on-google-cloud-vms-linux).
 The macOS results of 2026-11-26 (the sustained session on a shared Apple M4 Pro laptop, how often a roll waits for the
 spare segment, and what prefaulted data adds to a checkpoint) are
 [after the Linux sections](#2026-11-26-sustained-load-roll-waits-and-checkpoint-cost-on-macos-apple-m4-pro-apfs).
@@ -648,6 +652,720 @@ per checkpoint, and kept prefaulting's shorter appends. It changes what a checkp
 of `crash-contract.md`), so it needs a decision and review of its own before it is built; on a drive with a volatile
 write cache it would also have to be shown to flush as the barrier does. The barrier `fdatasync` itself costs almost
 nothing (0.7–1.3 µs median).
+
+## 2026-11-26, the writer's remaining page faults with prefaulting on (Google Cloud VMs, Linux)
+
+The owner's question after the comparison's notes on Chronicle Queue's `microTouch()` (`compare/README.md` → "No
+Chronicle pretoucher"): can tickertape's own prefaulting be made better? This measures which page faults the writer's
+thread still takes with the defaults, where they come from, how much latency they explain, and what each alternative
+does to them. Issue #60; the decision record is ADR [0058](decisions/0058-prefault-residual-faults.md) (proposed).
+**Cloud virtual machines with local NVMe SSD, not bare metal**; Linux only. The raw output (results, traces, scripts) is
+kept outside the repository.
+
+**Answer.** With the helper on, the writer's thread took 8.3–10.0 page faults per MiB written on x86-64 (12.3–18.6 on
+aarch64) at 64 B × 1,000,000/s and at 1,024 B × 100,000/s, fewer at higher rates (9.6–23 with prefaulting off). Almost
+none of them were pages the helper had not reached: they were pages it had made writable that a **write-back had made
+read-only again**. Early write-back writes back whole page-cache folios (128 KiB here), including the one the writer is
+filling: 89–95 % of the faults at the lower rates. Checkpoints, which also write back the 256 KiB window (PR
+#102), caused most of the rest, and the first pages of each new segment 1–2 %. They cost 1–3 µs each, but enough take
+20–100 µs to set the writer's p99.9: with early write-back stopped at the 128 KiB boundary below the writer, the p99.9
+fell from 15–34 to 2.7–3.2 µs on aarch64 (64 B and 1,024 B, ext4 and xfs) and from 26 to 4.5–7.5 µs on x86-64 at 1,024 B
+× 100,000/s, with p99.99, maxima, the reader and the checkpoint's durable time unchanged or lower. The tail beyond that
+is rolls and checkpoints. A touch on the writer's thread, the way `microTouch()` does it, changed nothing: while the
+writer waits it either finds nothing to do or waits as long as the fault would. A larger window, re-touching after
+write-back and early write-back further behind made things worse or no better. The ranged sync of the active segment (PR
+#102's experiment) saves the checkpoint's 256 KiB write; on its own it moved the writer's latency little. The same
+rewrite of the writer's folio is the 7 % of extra device bytes PR #105 found at steady-90 on aarch64: with the boundary
+the device wrote 0.3 % more than appended instead of 8.6 %, and the 140 ms stalls there were gone, with checkpoints
+durable after 1 ms. ADR 0058 proposes the boundary and the ranged sync, both off by default until the measurements it
+lists.
+
+### Environment and commands
+
+| Machine | CPU, vCPUs, memory | Zone | Time (UTC) | Used for |
+|---|---|---|---|---|
+| `c4-standard-8-lssd` | Intel Xeon 6985P-C, 8 (4 cores), 31.5 GB | us-east1-b | 09:26–11:41 | x86-64: everything |
+| `c4a-standard-8-lssd` | Google Axion (Neoverse-V2), 8, 31 GB | us-east1-b | 11:41–13:12 | aarch64 |
+| `c4a-standard-8-lssd` (a second VM) | the same | us-east1-b | 13:14–13:45 | aarch64: the extra bytes at steady-90 |
+| `c4-standard-8-lssd` (a second VM) | the same as the first | us-east1-b | 13:46–14:04 | x86-64: the extra bytes at steady-90 |
+
+Ubuntu 24.04, kernel 7.0.0-1017-gcp, rustc 1.100.0, bpftrace 0.20.2, 4 KiB pages, transparent huge pages `madvise`. One
+local NVMe SSD (375 GB), formatted for each filesystem in turn: ext4 (`mkfs.ext4 -E
+lazy_itable_init=0,lazy_journal_init=0`, 1 GiB journal), then xfs with defaults, both mounted `noatime`; scheduler
+`none`; `write_cache` "write through" on every disk of both VMs. Write-back sysctls at their defaults. Results on the
+boot disk.
+
+Source: the branch `exp/prefault-residual` (never merged; ADR 0058 → "Where the experiment code is" has the build
+commands). The library switches are not in `main`; there they are compiled only with `--cfg tickertape_pf_exp`, or with
+`--cfg tickertape_pf_exp --cfg tickertape_pf_touch_append` for the touch in `append`. The x86-64 matrix was built from
+commit `8e691d3b` (`42b2307e` plus the switches), the aarch64 VMs, the x86-64 supplement, the W2 check and the steady-90
+byte counts from `7acd8f86` (two switches more: `TT_PF_WB_ALIGN_KIB`, `TT_PF_RANGED`), each sent to the VMs as a source
+archive whose `git diff 42b2307e` hash was recorded there. The default configuration ran a build without either `--cfg`,
+which compiles none of the switches. The `tt-faults` in `main` is the same tool without its `--touch idle` option, which
+needs one of the switches. Binaries' sha256 (x86-64): `tt-faults` `79f769e9…` (default), `559b4974…` (switches),
+`6cfe3337…` (switches, with the last two), `f80156ad…` (touch in `append`); aarch64: `e4e36bca…` (default), `3c83f66b…`
+(switches, all of them), `7a309a14…` (touch in `append`).
+
+```sh
+# TT_PF_… and --touch need a build of the branch exp/prefault-residual (above); the rest runs on main.
+[env TT_PF_…] tt-faults --dir … --rate <rate> --payload <64|1024> --seconds 20 --warmup-seconds 3 \
+  --checkpoint-ms 1000 --writer-cpu <w> --reader-cpu <r> --helper-cpus <h> --log appends.txt \
+  [--no-prefault | --no-early-writeback | --spare-segment | --touch idle]
+```
+
+- **The tool.** `tt-faults` (new, `benches/src/bin/tt-faults.rs`) appends on its main thread at a fixed rate, scheduled
+  on the wall clock as `tt-latency` does; an append's latency runs from its scheduled send to `Writer::append`
+  returning, so a stall also counts in the appends it delays. It reads the thread's minor and major fault counts
+  (`getrusage(RUSAGE_THREAD)`) before the wait and after the append (outside the timed part unless the append is late),
+  requests a background checkpoint every second, runs a zero-copy reader that busy-polls on a CPU of its own and
+  measures the visible latency, and logs every append that faulted or took 20 µs or more, with its offset in the
+  segment. "Late sends" are sends that started more than 1 µs after their time.
+- **Cells.** 64 B at 1,000,000 records/s (about 100 MB/s with headers); 1,024 B at 100,000 (the README's latency rate),
+  170,000 (half of these machine types' probe, the steady-50 rate of "roll and journal stalls" above) and 300,000/s
+  (about 90 % of it, near what the device sustains). 128 MiB segments: 13–45 rolls per run.
+- **Configurations.** The default (prefault on, early write-back on, no spare), twice per round as the noise floor
+  ("default" in the tables pools both). `prefault(false)`; `early_writeback(false)`; `spare_segment(true)`. Switches
+  (branch `exp/prefault-residual`, `--cfg tickertape_pf_exp`): `TT_PF_WINDOW_KIB` (window of 1, 4 or 16 MiB);
+  `TT_PF_RETOUCH` (re-touch: at every wake-up the helper prefaults again from the writer's page, so pages written back
+  ahead of the writer are made writable again); `TT_PF_WB_LAG_KIB` and `TT_PF_WB_ALIGN_KIB` (early write-back stops that
+  far behind the writer, rounded down to that alignment: "2–4 MiB behind" is 2,048 KiB rounded to 2 MiB, "to the 128 KiB
+  boundary" is 1 KiB rounded to 128 KiB, so that it never reaches the 128 KiB block the writer is in); `TT_PF_RANGED`
+  (ranged sync: the active segment is synced by its ranged `msync` alone, without the whole-file `fdatasync` and the
+  barrier, as PR #102's `TT_EXP_RANGED`); `Writer::exp_touch` called once per wait (writer touch while waiting: an
+  atomic `fetch_or(0)` on the commit word slot at the write position and on the first word of the next page, so what a
+  `Writer::idle()` could do; `tt-faults --touch idle` on the branch). `--cfg tickertape_pf_touch_append`, also on the
+  branch: the writer, when it enters a new page, touches the next one at the end of `append` (writer touch in `append`,
+  as `microTouch()` but without waiting).
+- **Rounds.** Configurations and cells rotated from round to round; every journal deleted and `sync`ed before the next
+  run. x86-64: three rounds on ext4 and two on xfs, the last of each traced; the latency tables use the untraced rounds
+  only. A supplement on x86-64 ext4 ran six configurations three times, untraced. aarch64: three rounds on ext4 and two
+  on xfs (five configurations), the last of each traced.
+- **Tracing.** `benches/diagnostics/writer-faults.bt` (new) prints every fault of the writer's thread with its time and
+  duration, whether `filemap_fault` ran (the page was not in the page tables: "not present") or not (the page was mapped
+  but not writable: "write-protected"), whether it started a journal handle (`jbd2__journal_start`) or an xfs
+  transaction, and the start and duration of every `msync`, `fdatasync` and `sync_file_range` of the checkpoint and
+  early write-back threads; at the end, the size of the folios the run added to the page cache and who cleaned folios
+  for write-back. A write-protected fault counts as "after a checkpoint" when a checkpoint's `msync` or `fdatasync` had
+  started before it and ended less than 5 ms before it, otherwise "after early write-back". Tracing raised the default's
+  p99.9 by 1.2–2.6 times (157 against 60–100 µs at 64 B, 31–38 against 26–27 at 1,024 B × 100,000/s): the traced runs
+  are used for counts and kinds, not for latencies.
+- One untraced x86-64 run (ext4, round 1, 1,024 B × 100,000/s, prefault off) had a test trace attached for 8 s; its
+  p99.9 is the higher of the two in its row.
+
+### Where the writer's faults are
+
+The traced default runs (two per cell): faults of the writer's thread on the segment mappings per MiB written, by kind,
+with the median and the 99th percentile of their duration in µs; then the appends of 20 µs or more and of 100 µs or
+more, by the first writer fault of their episode (the run of appends one stall delays back to back). "New segment"
+episodes are rolls: their first fault is in the first 256 KiB of a segment, and they include the roll's own system
+calls.
+
+x86-64, ext4:
+
+| Cell | Run | All | After early write-back | After a checkpoint | New segment (not present) | Other not present | All, prefault off (untraced) |
+|---|---|---|---|---|---|---|---|
+| 64 B, 1,000,000/s | 1 | 7.97 | 7.14 (1.1 / 39.5) | 0.74 (1.1 / 76.0) | 0.09 (2.7 / 82.1) | 0.00 (45.8 / 50.5) | 22.1–23.1 |
+| 64 B, 1,000,000/s | 2 | 8.11 | 7.21 (1.1 / 38.9) | 0.79 (1.0 / 84.3) | 0.09 (2.5 / 82.6) | 0.01 (19.7 / 90.1) | 22.1–23.1 |
+| 1,024 B, 100,000/s | 1 | 9.28 | 8.35 (1.1 / 31.4) | 0.77 (1.1 / 86.4) | 0.15 (2.4 / 73.8) | 0.00 (44.8 / 3.00 ms) | 9.7 |
+| 1,024 B, 100,000/s | 2 | 9.33 | 8.40 (1.1 / 31.8) | 0.77 (1.1 / 102.4) | 0.16 (2.4 / 74.8) | 0.00 (31.5 / 46.8) | 9.7 |
+| 1,024 B, 170,000/s | 1 | 1.88 | 1.13 (1.3 / 18.4) | 0.50 (1.0 / 99.5) | 0.25 (2.2 / 74.4) | 0.00 (32.3 / 140.6) | 9.7 |
+| 1,024 B, 170,000/s | 2 | 1.92 | 1.17 (1.3 / 17.3) | 0.50 (1.1 / 90.8) | 0.25 (2.3 / 77.7) | 0.00 (15.2 / 27.7) | 9.7 |
+| 1,024 B, 300,000/s | 1 | 0.55 | 0.01 (0.8 / 5.0) | 0.27 (1.1 / 97.0) | 0.27 (2.3 / 77.6) | 0.01 (18.0 / 178.7) | 9.6 |
+| 1,024 B, 300,000/s | 2 | 0.57 | 0.01 (0.8 / 2.6) | 0.28 (1.1 / 94.4) | 0.27 (2.3 / 78.6) | 0.02 (18.6 / 50.1) | 9.6 |
+
+Appends of at least 20 µs / at least 100 µs, by the first writer fault of their episode:
+
+| Cell | Run | After early write-back | After a checkpoint | New segment | Other not present | No writer fault |
+|---|---|---|---|---|---|---|
+| 64 B, 1,000,000/s | 1 | 73,744 / 4,956 | 17,543 / 9,276 | 16,920 / 14,306 | 702 / 0 | 5,980 / 3,559 |
+| 64 B, 1,000,000/s | 2 | 80,571 / 9,882 | 18,235 / 9,454 | 16,018 / 13,509 | 1,466 / 30 | 14,487 / 2,808 |
+| 1,024 B, 100,000/s | 1 | 2,213 / 28 | 513 / 103 | 575 / 377 | 859 / 800 | 3 / 0 |
+| 1,024 B, 100,000/s | 2 | 2,193 / 33 | 808 / 380 | 565 / 374 | 17 / 0 | 20 / 0 |
+| 1,024 B, 170,000/s | 1 | 232 / 0 | 1,573 / 516 | 2,618 / 1,482 | 39 / 11 | 35 / 0 |
+| 1,024 B, 170,000/s | 2 | 151 / 0 | 1,387 / 413 | 2,517 / 1,381 | 33 / 0 | 18 / 0 |
+| 1,024 B, 300,000/s | 1 | 0 / 0 | 4,217 / 1,985 | 10,903 / 9,417 | 353 / 61 | 195 / 0 |
+| 1,024 B, 300,000/s | 2 | 0 / 0 | 4,450 / 1,985 | 10,636 / 9,136 | 464 / 0 | 485 / 0 |
+
+x86-64, xfs:
+
+| Cell | Run | All | After early write-back | After a checkpoint | New segment (not present) | Other not present | All, prefault off (untraced) |
+|---|---|---|---|---|---|---|---|
+| 64 B, 1,000,000/s | 1 | 8.27 | 7.49 (0.8 / 36.7) | 0.70 (0.8 / 72.6) | 0.08 (2.2 / 86.3) | 0.00 (51.4 / 54.7) | 22.9–23.2 |
+| 64 B, 1,000,000/s | 2 | 8.27 | 7.48 (0.8 / 36.7) | 0.71 (0.8 / 72.0) | 0.08 (2.2 / 85.8) | 0.00 (49.5 / 52.5) | 22.9–23.2 |
+| 1,024 B, 100,000/s | 1 | 9.71 | 8.81 (0.9 / 31.0) | 0.74 (0.8 / 74.5) | 0.15 (2.2 / 82.0) | 0.00 (33.5 / 33.5) | 9.7 |
+| 1,024 B, 100,000/s | 2 | 9.53 | 8.65 (0.9 / 31.3) | 0.73 (0.8 / 68.0) | 0.15 (2.1 / 83.9) | 0.00 (27.9 / 47.8) | 9.7 |
+| 1,024 B, 170,000/s | 1 | 2.22 | 1.49 (1.1 / 14.0) | 0.49 (0.8 / 88.0) | 0.24 (2.1 / 84.9) | 0.00 (16.6 / 16.6) | 9.7 |
+| 1,024 B, 170,000/s | 2 | 2.30 | 1.57 (1.0 / 14.3) | 0.49 (0.8 / 90.5) | 0.24 (2.1 / 79.0) | 0.00 (12.2 / 41.1) | 9.7 |
+| 1,024 B, 300,000/s | 1 | 0.59 | 0.00 (0.9 / 1.2) | 0.26 (0.8 / 87.0) | 0.27 (2.1 / 76.4) | 0.05 (9.4 / 44.6) | 9.6–9.7 |
+| 1,024 B, 300,000/s | 2 | 0.54 | 0.01 (0.8 / 2.0) | 0.26 (0.8 / 91.7) | 0.27 (2.1 / 77.9) | 0.01 (11.8 / 26.6) | 9.6–9.7 |
+
+Appends of at least 20 µs / at least 100 µs, by the first writer fault of their episode:
+
+| Cell | Run | After early write-back | After a checkpoint | New segment | Other not present | No writer fault |
+|---|---|---|---|---|---|---|
+| 64 B, 1,000,000/s | 1 | 58,822 / 2,421 | 14,014 / 6,850 | 16,578 / 14,077 | 558 / 0 | 386 / 0 |
+| 64 B, 1,000,000/s | 2 | 56,659 / 2,472 | 13,150 / 6,155 | 16,859 / 14,336 | 676 / 0 | 777 / 0 |
+| 1,024 B, 100,000/s | 1 | 2,011 / 0 | 505 / 120 | 545 / 351 | 49 / 37 | 9 / 0 |
+| 1,024 B, 100,000/s | 2 | 1,968 / 0 | 547 / 164 | 541 / 348 | 43 / 0 | 11 / 0 |
+| 1,024 B, 170,000/s | 1 | 104 / 0 | 1,231 / 461 | 2,422 / 1,305 | 8 / 0 | 13 / 0 |
+| 1,024 B, 170,000/s | 2 | 104 / 0 | 1,257 / 430 | 2,429 / 1,328 | 27 / 0 | 7 / 0 |
+| 1,024 B, 300,000/s | 1 | 0 / 0 | 3,717 / 1,493 | 9,742 / 8,275 | 620 / 7 | 58 / 0 |
+| 1,024 B, 300,000/s | 2 | 0 / 0 | 3,720 / 1,560 | 9,769 / 8,276 | 77 / 0 | 55 / 0 |
+
+aarch64, ext4 (the same 128 KiB folios; the writer faults on more of the pages of each):
+
+| Cell | Run | All | After early write-back | After a checkpoint | New segment (not present) | Other not present | All, prefault off (untraced) |
+|---|---|---|---|---|---|---|---|
+| 64 B, 1,000,000/s | 1 | 12.36 | 11.57 (2.4 / 24.5) | 0.72 (2.4 / 25.7) | 0.07 (2.7 / 50.2) | 0.00 (33.1 / 34.0) | 22.6–23.1 |
+| 64 B, 1,000,000/s | 2 | 12.31 | 11.52 (3.0 / 25.1) | 0.72 (2.8 / 27.8) | 0.06 (3.1 / 50.0) | 0.00 (31.5 / 70.1) | 22.6–23.1 |
+| 1,024 B, 100,000/s | 1 | 18.00 | 17.10 (2.4 / 20.1) | 0.73 (2.3 / 26.0) | 0.11 (2.4 / 48.6) | 0.06 (20.7 / 29.1) | 9.7 |
+| 1,024 B, 100,000/s | 2 | 18.07 | 17.17 (2.4 / 20.0) | 0.74 (2.4 / 30.1) | 0.11 (2.4 / 42.9) | 0.05 (19.1 / 33.5) | 9.7 |
+| 1,024 B, 170,000/s | 1 | 14.01 | 13.24 (2.5 / 19.6) | 0.54 (2.5 / 29.4) | 0.16 (2.7 / 42.0) | 0.05 (12.6 / 26.5) | 9.7 |
+| 1,024 B, 170,000/s | 2 | 14.16 | 13.38 (2.4 / 19.5) | 0.55 (2.4 / 28.4) | 0.17 (2.2 / 48.1) | 0.06 (11.7 / 28.0) | 9.7 |
+| 1,024 B, 300,000/s | 1 | 6.48 | 5.90 (2.7 / 13.4) | 0.32 (2.6 / 25.4) | 0.17 (2.7 / 46.8) | 0.08 (11.4 / 804.8) | 9.7 |
+| 1,024 B, 300,000/s | 2 | 7.14 | 2.96 (2.5 / 13.1) | 3.88 (2.5 / 13.9) | 0.18 (2.5 / 45.2) | 0.11 (12.0 / 639.6) | 9.7 |
+
+Appends of at least 20 µs / at least 100 µs, by the first writer fault of their episode:
+
+| Cell | Run | After early write-back | After a checkpoint | New segment | Other not present | No writer fault |
+|---|---|---|---|---|---|---|
+| 64 B, 1,000,000/s | 1 | 237,046 / 16,998 | 17,486 / 1,430 | 12,482 / 9,039 | 803 / 0 | 0 / 0 |
+| 64 B, 1,000,000/s | 2 | 443,682 / 25,267 | 34,349 / 8,291 | 13,315 / 9,809 | 3,345 / 0 | 0 / 0 |
+| 1,024 B, 100,000/s | 1 | 2,516 / 17 | 169 / 15 | 507 / 335 | 353 / 0 | 0 / 0 |
+| 1,024 B, 100,000/s | 2 | 2,484 / 18 | 196 / 17 | 491 / 323 | 272 / 0 | 0 / 0 |
+| 1,024 B, 170,000/s | 1 | 7,936 / 46 | 772 / 101 | 2,049 / 1,357 | 832 / 0 | 33 / 0 |
+| 1,024 B, 170,000/s | 2 | 7,470 / 33 | 699 / 108 | 1,770 / 1,143 | 829 / 0 | 15 / 0 |
+| 1,024 B, 300,000/s | 1 | 36,284 / 262 | 5,522 / 3,061 | 7,850 / 6,235 | 11,617 / 5,233 | 1 / 0 |
+| 1,024 B, 300,000/s | 2 | 17,610 / 165 | 24,147 / 2,200 | 7,792 / 6,179 | 11,203 / 4,452 | 0 / 0 |
+
+aarch64, xfs (prefault off was not run on xfs there):
+
+| Cell | Run | All | After early write-back | After a checkpoint | New segment (not present) | Other not present | All, prefault off (untraced) |
+|---|---|---|---|---|---|---|---|
+| 64 B, 1,000,000/s | 1 | 12.38 | 11.61 (2.5 / 25.4) | 0.71 (2.5 / 25.9) | 0.06 (3.0 / 54.1) | 0.00 (28.4 / 40.7) | – |
+| 64 B, 1,000,000/s | 2 | 12.43 | 11.66 (2.1 / 24.3) | 0.70 (2.1 / 28.6) | 0.06 (2.6 / 53.5) | 0.00 (32.6 / 36.5) | – |
+| 1,024 B, 100,000/s | 1 | 18.06 | 17.19 (2.2 / 18.6) | 0.72 (2.2 / 24.3) | 0.10 (2.5 / 51.2) | 0.05 (21.0 / 33.9) | – |
+| 1,024 B, 100,000/s | 2 | 18.22 | 17.35 (2.1 / 18.0) | 0.72 (2.0 / 27.7) | 0.10 (2.2 / 48.9) | 0.05 (19.4 / 29.0) | – |
+| 1,024 B, 170,000/s | 1 | 14.69 | 13.99 (2.1 / 17.6) | 0.49 (2.0 / 25.2) | 0.15 (2.1 / 50.0) | 0.06 (17.8 / 27.5) | – |
+| 1,024 B, 170,000/s | 2 | 14.37 | 13.66 (2.2 / 18.0) | 0.51 (2.1 / 31.7) | 0.15 (2.2 / 48.0) | 0.06 (11.3 / 32.0) | – |
+| 1,024 B, 300,000/s | 1 | 7.85 | 4.40 (2.2 / 13.8) | 3.19 (2.2 / 14.1) | 0.20 (2.0 / 46.9) | 0.07 (7.3 / 23.0) | – |
+| 1,024 B, 300,000/s | 2 | 8.05 | 3.79 (2.1 / 14.1) | 3.99 (2.1 / 13.7) | 0.19 (2.0 / 48.6) | 0.07 (7.4 / 24.3) | – |
+
+Appends of at least 20 µs / at least 100 µs, by the first writer fault of their episode:
+
+| Cell | Run | After early write-back | After a checkpoint | New segment | Other not present | No writer fault |
+|---|---|---|---|---|---|---|
+| 64 B, 1,000,000/s | 1 | 261,130 / 18,714 | 18,593 / 604 | 11,310 / 7,784 | 4,088 / 177 | 0 / 0 |
+| 64 B, 1,000,000/s | 2 | 219,478 / 15,163 | 15,337 / 18 | 11,661 / 8,105 | 2,036 / 0 | 161 / 0 |
+| 1,024 B, 100,000/s | 1 | 2,301 / 19 | 162 / 13 | 455 / 275 | 285 / 0 | 0 / 0 |
+| 1,024 B, 100,000/s | 2 | 1,961 / 21 | 156 / 13 | 424 / 253 | 184 / 0 | 13 / 0 |
+| 1,024 B, 170,000/s | 1 | 6,180 / 79 | 444 / 90 | 1,432 / 839 | 742 / 0 | 0 / 0 |
+| 1,024 B, 170,000/s | 2 | 6,517 / 103 | 662 / 163 | 1,487 / 865 | 660 / 0 | 0 / 0 |
+| 1,024 B, 300,000/s | 1 | 13,337 / 88 | 10,195 / 76 | 6,318 / 4,673 | 1,834 / 0 | 0 / 0 |
+| 1,024 B, 300,000/s | 2 | 11,672 / 91 | 11,156 / 137 | 6,220 / 4,575 | 1,893 / 0 | 0 / 0 |
+
+- **Large folios.** The page cache built the segments almost entirely from 128 KiB folios (order 5: 18,617 of 19,422
+  folios added in a 1,024 B × 100,000/s run), and write-back cleans whole folios. The early write-back thread asks for
+  the pages before the one that holds the writer's position, and so also writes back, and write-protects, the rest of
+  the folio the writer is in, together with the pages the helper has prefaulted in it. The writer then takes a
+  write-protect fault on each page of it that it writes to. In the same run the early write-back thread cleaned 21,464
+  folios and the checkpoint thread 253.
+- **Rate.** On x86-64 at 300,000/s the early write-back faults vanish: by the time a write-back of 1 MiB has been
+  submitted (about 0.6 ms per call there), the writer has left the folio. At the lower rates it has not, and on aarch64
+  it has not at 300,000/s either (3.0–5.9 such faults per MiB).
+- **The helper kept ahead.** Not-present faults outside the first 256 KiB of a segment were 0.00–0.05 per MiB in every
+  cell, also near the device's limit: the window did not run short.
+- **Cost.** One write-protected fault in eight after early write-back started a journal handle (ext4 updating the file's
+  modification time; xfs allocating a transaction for the same); that is where the slow ones wait (issue #60 has the
+  mechanism). At 1,024 B × 100,000/s the early write-back faults began 53–61 % of the appends of 20 µs or more (that
+  p99.9 is 26 µs) and 2–4 % of those of 100 µs or more; the rest are checkpoints and rolls. At 300,000/s, 82 % of the
+  appends of 100 µs or more were in roll episodes. On aarch64 the early write-back faults began 68–90 % of the appends
+  of 20 µs or more at the three lower rates, on both filesystems.
+
+### The alternatives
+
+Untraced runs. µs unless a cell says ms; ranges over the runs; the default's range is the noise floor. Where two runs of
+one configuration differ by more than the difference to the default, the configuration did not change that figure.
+
+x86-64, ext4:
+
+64 B, 1,000,000/s:
+
+| Configuration | Runs | Faults/MiB | p99 | p99.9 | p99.99 | max | Reader p99.9 | Late sends (%) |
+|---|---|---|---|---|---|---|---|---|
+| default | 4 | 8.25–8.43 | 3.33–4.17 | 59.5–100 | 246–332 | 435–685 | 87.6–133 | 1.8–2.1 |
+| `prefault(false)` | 2 | 22.1–22.9 | 2.4–2.7 ms | 3.7–4.0 ms | 4.6 ms | 4.7 ms | 3.7–4.0 ms | 10.5 |
+| `early_writeback(false)` | 2 | 0.21–0.22 | 1.2 ms | 2.0–2.8 ms | 2.7–3.4 ms | 2.8–3.5 ms | 2.3–2.8 ms | 4.9 |
+| re-touch | 2 | 1.36–1.38 | 3.81–3.92 | 98.0–130 | 289–626 | 714 µs to 1.6 ms | 124–187 | 2.0–2.1 |
+| 4 MiB window | 2 | 19.6–19.8 | 28.7–40.5 | 622–906 | 1.3–1.6 ms | 1.7–1.9 ms | 710–933 | 2.7–2.9 |
+| writer touch while waiting | 2 | 8.31–8.44 | 3.38–4.92 | 78.4 µs to 1.7 ms | 255 µs to 5.5 ms | 367 µs to 5.9 ms | 111 µs to 1.7 ms | 2.0–2.4 |
+| write-back 2–4 MiB behind | 2 | 1.34–1.36 | 3.24–3.25 | 485–514 | 970 µs to 1.1 ms | 1.2–1.6 ms | 1.0 ms | 1.8 |
+| `spare_segment(true)` | 2 | 8.17–8.30 | 3.10–3.89 | 41.1–47.5 | 170–186 | 354–473 | 94.3–112 | 1.9–2.1 |
+
+1,024 B, 100,000/s:
+
+| Configuration | Runs | Faults/MiB | p99 | p99.9 | p99.99 | max | Reader p99.9 | Late sends (%) |
+|---|---|---|---|---|---|---|---|---|
+| default | 4 | 9.31–9.59 | 2.18–4.52 | 25.7–27.4 | 122–156 | 260–326 | 40.1–51.8 | 0.7–1.7 |
+| `prefault(false)` | 2 | 9.75 | 24.0–25.6 | 140–237 | 921–999 | 1.4–1.5 ms | 321–412 | 2.8–3.4 |
+| `early_writeback(false)` | 2 | 0.09–0.10 | 4.21–5.60 | 6.54–8.15 | 87.2–89.5 | 211–220 | 1.2 ms | 1.5–1.6 |
+| re-touch | 2 | 3.13–3.17 | 3.27–6.25 | 28.4–29.7 | 133–161 | 281–984 | 50.3–74.0 | 0.8–1.8 |
+| 4 MiB window | 2 | 20.4 | 3.98–6.58 | 368–397 | 1.1–1.3 ms | 1.4–1.8 ms | 537–590 | 1.1 |
+| writer touch while waiting | 2 | 9.32–9.39 | 2.36–3.38 | 25.4–26.7 | 130–168 | 317–324 | 38.6–49.1 | 0.8–1.7 |
+| write-back 2–4 MiB behind | 2 | 1.31 | 2.15–2.43 | 82.4–84.9 | 783–930 | 1.2–1.3 ms | 774 µs to 1.1 ms | 0.6–1.6 |
+| `spare_segment(true)` | 2 | 8.95–9.29 | 2.33–5.75 | 23.7–25.8 | 86.9 µs to 1.6 ms | 277 µs to 3.3 ms | 40.8–75.6 | 1.6–1.7 |
+
+1,024 B, 170,000/s:
+
+| Configuration | Runs | Faults/MiB | p99 | p99.9 | p99.99 | max | Reader p99.9 | Late sends (%) |
+|---|---|---|---|---|---|---|---|---|
+| default | 4 | 2.02–2.19 | 2.21–2.48 | 16.6–47.3 | 151 µs to 1.6 ms | 228 µs to 3.3 ms | 197–416 | 1.2–1.5 |
+| `prefault(false)` | 2 | 9.67–9.68 | 26.1–26.5 | 429–455 | 1.1–1.7 ms | 1.5–3.2 ms | 697–718 | 5.2–5.5 |
+| `early_writeback(false)` | 2 | 0.16–0.17 | 2.31 | 26.5–37.4 | 152–922 | 493 µs to 2.5 ms | 167–411 | 1.5 |
+| re-touch | 2 | 1.24–1.25 | 2.42–2.49 | 16.3–18.1 | 141–157 | 428–560 | 186–226 | 1.5 |
+| 1 MiB window | 2 | 3.23–3.25 | 2.09–2.13 | 56.5–63.7 | 321–337 | 453–474 | 267–282 | 1.1–1.2 |
+| 4 MiB window | 2 | 9.79–10.2 | 2.73–5.42 | 605–635 | 1.4–1.5 ms | 1.9–2.0 ms | 739 | 1.9–2.1 |
+| 16 MiB window | 2 | 34.0–35.3 | 13.8–43.8 | 695–858 | 1.3–1.6 ms | 1.7–2.1 ms | 786–890 | 2.2–2.4 |
+| writer touch while waiting | 2 | 2.08–2.11 | 2.44–2.46 | 14.9–21.1 | 150 µs to 1.0 ms | 236 µs to 2.7 ms | 201–339 | 1.5 |
+| writer touch in `append` | 2 | 2.07–2.14 | 2.17–2.49 | 14.8–30.7 | 151–921 | 246 µs to 2.3 ms | 209–372 | 1.4–1.5 |
+| write-back 2–4 MiB behind | 2 | 0.77–0.78 | 2.14–2.27 | 32.5–37.3 | 481 µs to 2.4 ms | 1.3–3.4 ms | 1.4–1.5 ms | 1.1–1.5 |
+| `spare_segment(true)` | 2 | 1.88 | 2.38–2.63 | 9.37–509 | 93.7 µs to 8.8 ms | 188 µs to 11 ms | 124–846 | 1.5 |
+
+1,024 B, 300,000/s:
+
+| Configuration | Runs | Faults/MiB | p99 | p99.9 | p99.99 | max | Reader p99.9 | Late sends (%) |
+|---|---|---|---|---|---|---|---|---|
+| default | 4 | 0.58–0.62 | 2.31–3.63 | 86.4–172 | 176 µs to 5.3 ms | 240 µs to 6.7 ms | 509–785 | 2.0–2.6 |
+| `prefault(false)` | 2 | 9.60–9.64 | 43.8–44.6 | 530–590 | 977 µs to 1.1 ms | 1.3 ms | 765–778 | 11.9–12.3 |
+| `early_writeback(false)` | 2 | 0.84–0.85 | 22.8–24.4 | 91.5–118 | 499–886 | 910 µs to 1.9 ms | 537–542 | 3.3–3.6 |
+| re-touch | 2 | 0.37–0.38 | 2.53–2.81 | 88.4–128 | 185–233 | 281–282 | 554–601 | 2.2–2.3 |
+| 4 MiB window | 2 | 5.81–5.98 | 4.12–4.28 | 440–560 | 811 µs to 1.2 ms | 929 µs to 2.1 ms | 701–723 | 2.5–2.6 |
+| writer touch while waiting | 2 | 0.61–0.62 | 2.73–3.94 | 136 µs to 3.0 ms | 225 µs to 7.9 ms | 276 µs to 9.0 ms | 598 µs to 3.0 ms | 2.5 |
+| write-back 2–4 MiB behind | 2 | 0.96–0.97 | 30.8–30.9 | 100–104 | 447–478 | 693 µs to 1.2 ms | 1.8–1.9 ms | 3.8 |
+| `spare_segment(true)` | 2 | 0.30–0.32 | 2.22–2.58 | 8.13–9.21 | 116–135 | 197–198 | 442–450 | 1.9–2.3 |
+
+x86-64, xfs (one untraced run per configuration, two of the default):
+
+64 B, 1,000,000/s:
+
+| Configuration | Runs | Faults/MiB | p99 | p99.9 | p99.99 | max | Reader p99.9 | Late sends (%) |
+|---|---|---|---|---|---|---|---|---|
+| default | 2 | 8.43–8.45 | 2.77–3.17 | 72.6–73.5 | 236–254 | 374–472 | 107–109 | 1.7–1.8 |
+| `prefault(false)` | 1 | 22.9 | 3.3 ms | 5.2 ms | 5.9 ms | 6.2 ms | 5.2 ms | 9.2 |
+| `early_writeback(false)` | 1 | 0.19 | 2.2 ms | 4.2 ms | 5.2 ms | 5.4 ms | 4.2 ms | 5.2 |
+| re-touch | 1 | 1.19 | 2.60 | 73.8 | 236 | 388 | 107 | 1.7 |
+| 4 MiB window | 1 | 19.8 | 6.10 | 531 | 1.5 ms | 2.2 ms | 599 | 2.3 |
+| writer touch while waiting | 1 | 8.44 | 3.24 | 70.5 | 275 | 699 | 101 | 1.9 |
+| write-back 2–4 MiB behind | 1 | 1.39 | 1.89 | 273 | 608 | 1.1 ms | 790 | 1.5 |
+| `spare_segment(true)` | 1 | 8.34 | 2.63 | 38.8 | 146 | 367 | 87.4 | 1.7 |
+
+1,024 B, 100,000/s:
+
+| Configuration | Runs | Faults/MiB | p99 | p99.9 | p99.99 | max | Reader p99.9 | Late sends (%) |
+|---|---|---|---|---|---|---|---|---|
+| default | 2 | 9.89–9.97 | 2.33–4.22 | 21.6–22.2 | 127–128 | 328–333 | 35.1–35.4 | 0.6–1.6 |
+| `prefault(false)` | 1 | 9.75 | 14.6 | 30.7 | 92.7 | 364 | 42.1 | 2.0 |
+| `early_writeback(false)` | 1 | 0.09 | 2.02 | 3.92 | 85.4 | 198 | 9.74 | 0.5 |
+| re-touch | 1 | 2.86 | 2.29 | 24.8 | 137 | 256 | 44.3 | 0.7 |
+| 4 MiB window | 1 | 20.9 | 3.92 | 235 | 1.6 ms | 2.6 ms | 410 | 1.9 |
+| writer touch while waiting | 1 | 9.79 | 2.25 | 22.3 | 130 | 309 | 36.4 | 0.7 |
+| write-back 2–4 MiB behind | 1 | 1.32 | 5.08 | 7.43 | 133 | 218 | 882 | 1.5 |
+| `spare_segment(true)` | 1 | 9.76 | 2.36 | 19.7 | 75.5 | 317 | 33.3 | 1.2 |
+
+1,024 B, 170,000/s:
+
+| Configuration | Runs | Faults/MiB | p99 | p99.9 | p99.99 | max | Reader p99.9 | Late sends (%) |
+|---|---|---|---|---|---|---|---|---|
+| default | 2 | 2.30–2.36 | 2.19–2.47 | 12.6–13.4 | 153–165 | 248–282 | 190–227 | 1.4–1.5 |
+| `prefault(false)` | 1 | 9.68 | 19.8 | 38.0 | 137 | 362 | 405 | 4.2 |
+| `early_writeback(false)` | 1 | 0.14 | 2.30 | 15.9 | 208 | 1.0 ms | 243 | 1.4 |
+| re-touch | 1 | 1.29 | 2.37 | 12.5 | 160 | 421 | 211 | 1.5 |
+| 1 MiB window | 1 | 3.53 | 2.59 | 58.3 | 354 | 491 | 304 | 1.6 |
+| 4 MiB window | 1 | 10.1 | 4.66 | 265 | 633 | 873 | 436 | 1.8 |
+| 16 MiB window | 1 | 35.3 | 4.63 | 337 | 1.6 ms | 2.7 ms | 505 | 2.1 |
+| writer touch while waiting | 1 | 2.34 | 2.47 | 11.9 | 148 | 219 | 184 | 1.5 |
+| writer touch in `append` | 1 | 2.33 | 2.47 | 11.7 | 146 | 213 | 193 | 1.5 |
+| write-back 2–4 MiB behind | 1 | 0.75 | 2.39 | 12.5 | 157 | 289 | 1.4 ms | 1.4 |
+| `spare_segment(true)` | 1 | 2.04 | 2.38 | 7.79 | 146 | 1.6 ms | 207 | 1.4 |
+
+1,024 B, 300,000/s:
+
+| Configuration | Runs | Faults/MiB | p99 | p99.9 | p99.99 | max | Reader p99.9 | Late sends (%) |
+|---|---|---|---|---|---|---|---|---|
+| default | 2 | 0.57–0.59 | 2.62–2.85 | 79.2–86.3 | 179–183 | 236–268 | 523–538 | 2.0–2.3 |
+| `prefault(false)` | 1 | 9.62 | 30.0 | 134 | 596 | 765 | 505 | 9.0 |
+| `early_writeback(false)` | 1 | 0.93 | 8.72 | 57.4 | 780 | 1.0 ms | 451 | 2.9 |
+| re-touch | 1 | 0.37 | 2.59 | 79.1 | 173 | 267 | 503 | 2.1 |
+| 4 MiB window | 1 | 5.93 | 3.33 | 525 | 892 | 1.2 ms | 693 | 2.2 |
+| writer touch while waiting | 1 | 0.58 | 2.43 | 78.6 | 170 | 219 | 500 | 1.9 |
+| write-back 2–4 MiB behind | 1 | 0.87 | 14.1 | 76.4 | 209 | 754 | 1.7 ms | 2.9 |
+| `spare_segment(true)` | 1 | 0.30 | 2.27 | 8.62 | 135 | 905 | 498 | 1.9 |
+
+aarch64, ext4:
+
+64 B, 1,000,000/s:
+
+| Configuration | Runs | Faults/MiB | p99 | p99.9 | p99.99 | max | Reader p99.9 | Late sends (%) |
+|---|---|---|---|---|---|---|---|---|
+| default | 4 | 12.5–12.6 | 1.65–1.84 | 32.5–34.0 | 175–182 | 249–285 | 38.6–41.1 | 1.2–1.4 |
+| `prefault(false)` | 2 | 22.6–22.8 | 13.0–13.2 | 666–712 | 1.3–1.4 ms | 1.5–1.8 ms | 806–822 | 3.5–3.8 |
+| `early_writeback(false)` | 2 | 0.30–0.31 | 1.18–1.33 | 5.69–6.65 | 155–159 | 196–199 | 188–241 | 0.8–0.9 |
+| ranged sync | 2 | 11.4–12.0 | 1.72–2.13 | 32.1 µs to 12 ms | 182 µs to 18 ms | 409 µs to 19 ms | 37.3 µs to 12 ms | 1.3–1.6 |
+| write-back to the 128 KiB boundary | 2 | 0.85 | 0.98–1.05 | 3.17–3.22 | 169–173 | 224–229 | 10.1–11.1 | 0.7 |
+| ranged sync + write-back to 128 KiB boundary | 2 | 0.27–0.28 | 1.07–1.10 | 3.00–3.23 | 175–178 | 228–229 | 4.49–5.17 | 0.8 |
+| re-touch | 2 | 2.91–3.00 | 1.83–2.02 | 32.3–35.2 | 173–188 | 248–433 | 38.6–41.4 | 1.3–1.5 |
+| writer touch while waiting | 2 | 1.56–1.64 | 1.76–1.88 | 34.6–35.4 | 179–183 | 264–354 | 40.2–41.7 | 1.3–1.4 |
+| `spare_segment(true)` | 2 | 12.4 | 1.70–1.77 | 29.6–29.7 | 78.0–87.2 | 279–304 | 37.4–37.8 | 1.2–1.3 |
+
+1,024 B, 100,000/s:
+
+| Configuration | Runs | Faults/MiB | p99 | p99.9 | p99.99 | max | Reader p99.9 | Late sends (%) |
+|---|---|---|---|---|---|---|---|---|
+| default | 4 | 18.3–18.5 | 2.37–2.39 | 18.1–18.7 | 122–133 | 219–234 | 24.8–25.9 | 0.2–1.0 |
+| `prefault(false)` | 2 | 9.75 | 12.2–13.2 | 262–276 | 1.1 ms | 1.7–1.8 ms | 453–468 | 1.1–2.0 |
+| `early_writeback(false)` | 2 | 0.22 | 2.22–2.30 | 2.62–2.79 | 105–110 | 205–208 | 192–210 | 0.0–1.0 |
+| ranged sync | 2 | 17.8–17.9 | 2.37–2.39 | 17.8–18.2 | 122–125 | 217–218 | 24.6–24.7 | 0.2–1.2 |
+| write-back to the 128 KiB boundary | 2 | 0.78–0.79 | 2.18–2.22 | 2.65–2.83 | 115–116 | 208–218 | 3.54–4.32 | 0.0 |
+| ranged sync + write-back to 128 KiB boundary | 2 | 0.23 | 2.25 | 2.65–2.81 | 118–119 | 209–216 | 3.23–3.50 | 0.0 |
+| re-touch | 2 | 5.52–5.56 | 2.25–2.36 | 19.4–19.5 | 121–152 | 221–702 | 26.5–27.4 | 0.2 |
+| writer touch while waiting | 2 | 2.05–2.07 | 2.33–2.36 | 18.8–19.0 | 120–126 | 213–217 | 25.9–26.0 | 0.2 |
+| `spare_segment(true)` | 2 | 18.3 | 2.25 | 16.8–17.0 | 34.0–34.4 | 207–237 | 23.5–23.8 | 0.2 |
+
+1,024 B, 170,000/s:
+
+| Configuration | Runs | Faults/MiB | p99 | p99.9 | p99.99 | max | Reader p99.9 | Late sends (%) |
+|---|---|---|---|---|---|---|---|---|
+| default | 4 | 14.5–14.7 | 2.40–2.79 | 21.8–22.3 | 165–171 | 224–258 | 124–137 | 0.4–0.9 |
+| `prefault(false)` | 2 | 9.68 | 13.1–13.9 | 294–425 | 1.0–1.1 ms | 1.3–1.4 ms | 577–626 | 2.2–2.5 |
+| `early_writeback(false)` | 2 | 0.11–0.12 | 2.10 | 2.67–3.16 | 159–166 | 233–237 | 80.5–93.9 | 0.1 |
+| ranged sync | 2 | 14.2–14.3 | 2.35–2.36 | 21.0–22.0 | 164–173 | 227–242 | 120–131 | 0.5–0.8 |
+| write-back to the 128 KiB boundary | 2 | 0.65–0.66 | 2.14–2.31 | 2.77–2.81 | 171 | 236–242 | 124–131 | 0.1 |
+| ranged sync + write-back to 128 KiB boundary | 2 | 0.26 | 2.17–2.55 | 3.17–4.38 | 163–164 | 228–231 | 116–123 | 0.6–0.9 |
+| re-touch | 2 | 4.17–4.25 | 2.29–2.49 | 24.9–27.9 | 161–162 | 222–264 | 113–115 | 0.6–1.7 |
+| writer touch while waiting | 2 | 2.66–2.72 | 2.33–2.68 | 22.3–24.0 | 160–174 | 220–239 | 112–132 | 0.5 |
+| writer touch in `append` | 2 | 14.6–14.7 | 2.36–2.47 | 23.2–24.2 | 182 | 246–261 | 140 | 0.5–0.6 |
+| `spare_segment(true)` | 2 | 13.7–14.4 | 2.28–2.29 | 19.5–21.0 | 41.0–41.3 | 228–239 | 44.8–45.2 | 0.4 |
+
+1,024 B, 300,000/s:
+
+| Configuration | Runs | Faults/MiB | p99 | p99.9 | p99.99 | max | Reader p99.9 | Late sends (%) |
+|---|---|---|---|---|---|---|---|---|
+| default | 4 | 0.52–7.67 | 2.40–3.95 | 250 µs to 18 ms | 997 µs to 31 ms | 1.3–33 ms | 613 µs to 18 ms | 0.9–1.6 |
+| `prefault(false)` | 2 | 9.65–9.66 | 13.4–13.6 | 411–512 | 1.1–1.2 ms | 1.7–1.8 ms | 657–689 | 4.0–4.3 |
+| `early_writeback(false)` | 2 | 0.30–0.32 | 2.10–2.43 | 23.6–27.3 | 199–211 | 421–433 | 397–417 | 0.6–0.7 |
+| ranged sync | 2 | 7.40–7.73 | 2.53–2.91 | 171–178 | 803 µs to 1.1 ms | 1.2–1.9 ms | 552–594 | 1.2–1.3 |
+| write-back to the 128 KiB boundary | 2 | 0.55 | 2.18–2.19 | 12.5–12.6 | 190–196 | 239–242 | 454–465 | 0.3–0.5 |
+| ranged sync + write-back to 128 KiB boundary | 2 | 0.29 | 2.19–2.20 | 5.28–6.25 | 191–192 | 244–254 | 452–455 | 0.2–0.3 |
+| re-touch | 2 | 3.55–3.71 | 8.90–10.2 | 184–361 | 901 µs to 1.0 ms | 1.2–1.6 ms | 588–624 | 1.4–1.5 |
+| writer touch while waiting | 2 | 3.06–3.15 | 3.65–4.59 | 298–386 | 987 µs to 1.0 ms | 1.3–1.8 ms | 614–639 | 1.2–1.5 |
+| `spare_segment(true)` | 2 | 1.38–7.34 | 2.34–4.14 | 374 µs to 3.9 ms | 1.1–9.8 ms | 1.7–11 ms | 575 µs to 3.9 ms | 1.1–1.4 |
+
+aarch64, xfs (five configurations; one untraced run each, two of the default):
+
+64 B, 1,000,000/s:
+
+| Configuration | Runs | Faults/MiB | p99 | p99.9 | p99.99 | max | Reader p99.9 | Late sends (%) |
+|---|---|---|---|---|---|---|---|---|
+| default | 2 | 12.6–12.7 | 1.59–1.61 | 29.0–30.5 | 149–156 | 284–419 | 35.4–35.8 | 1.2 |
+| ranged sync | 1 | 12.2 | 1.56 | 28.6 | 148 | 235 | 34.0 | 1.1 |
+| write-back to the 128 KiB boundary | 1 | 0.83 | 1.10 | 3.08 | 140 | 203 | 13.9 | 0.7 |
+| ranged sync + write-back to 128 KiB boundary | 1 | 0.27 | 0.96 | 2.68 | 141 | 213 | 4.73 | 0.7 |
+
+1,024 B, 100,000/s:
+
+| Configuration | Runs | Faults/MiB | p99 | p99.9 | p99.99 | max | Reader p99.9 | Late sends (%) |
+|---|---|---|---|---|---|---|---|---|
+| default | 2 | 18.4–18.6 | 2.35–2.36 | 15.1–16.0 | 94.7 | 211–235 | 22.0–23.2 | 0.4–1.0 |
+| ranged sync | 1 | 18.1 | 2.31 | 15.3 | 96.6 | 227 | 22.2 | 0.2 |
+| write-back to the 128 KiB boundary | 1 | 0.76 | 2.29 | 3.06 | 86.5 | 192 | 3.79 | 1.0 |
+| ranged sync + write-back to 128 KiB boundary | 1 | 0.22 | 2.17 | 2.47 | 89.2 | 214 | 3.49 | 0.1 |
+
+1,024 B, 170,000/s:
+
+| Configuration | Runs | Faults/MiB | p99 | p99.9 | p99.99 | max | Reader p99.9 | Late sends (%) |
+|---|---|---|---|---|---|---|---|---|
+| default | 2 | 14.9–15.1 | 2.44–2.83 | 19.1–19.8 | 139 | 246–300 | 96.1–98.1 | 0.3–0.4 |
+| ranged sync | 1 | 14.3 | 2.43 | 19.0 | 136 | 243 | 97.0 | 1.5 |
+| write-back to the 128 KiB boundary | 1 | 0.60 | 2.20 | 3.08 | 126 | 193 | 73.3 | 1.2 |
+| ranged sync + write-back to 128 KiB boundary | 1 | 0.25 | 2.25 | 2.61 | 133 | 196 | 76.3 | 0.1 |
+
+1,024 B, 300,000/s:
+
+| Configuration | Runs | Faults/MiB | p99 | p99.9 | p99.99 | max | Reader p99.9 | Late sends (%) |
+|---|---|---|---|---|---|---|---|---|
+| default | 2 | 8.42–8.78 | 2.45–3.00 | 22.0–22.2 | 161–167 | 257–607 | 403–413 | 0.8–1.0 |
+| ranged sync | 1 | 6.93 | 2.29 | 22.1 | 158 | 236 | 400 | 0.9 |
+| write-back to the 128 KiB boundary | 1 | 0.53 | 2.22 | 4.80 | 159 | 206 | 421 | 0.2 |
+| ranged sync + write-back to 128 KiB boundary | 1 | 0.28 | 2.19 | 3.65 | 160 | 215 | 421 | 0.3 |
+
+The supplement (x86-64, ext4, three untraced rounds of six configurations; its default runs are its own):
+
+64 B, 1,000,000/s:
+
+| Configuration | Runs | Faults/MiB | p99 | p99.9 | p99.99 | max | Reader p99.9 | Late sends (%) |
+|---|---|---|---|---|---|---|---|---|
+| default | 3 | 8.37–8.43 | 3.26–3.47 | 63.2–71.6 | 241–273 | 342–736 | 101–107 | 1.9 |
+| ranged sync | 3 | 7.71–7.75 | 2.94–3.66 | 40.6–56.6 | 230–274 | 680–742 | 43.6–75.8 | 1.8–1.9 |
+| write-back to the 128 KiB boundary | 3 | 0.94–1.03 | 1.64–1.83 | 66.5–95.4 | 255–257 | 348–462 | 92.5–132 | 1.4 |
+| write-back to the 2 MiB boundary | 3 | 1.09–1.13 | 1.73–2.50 | 195–213 | 383–462 | 762–939 | 279–311 | 1.5–1.8 |
+| ranged sync + write-back to 2 MiB boundary | 3 | 0.36 | 1.53–1.97 | 148–201 | 298–319 | 465–832 | 169–249 | 1.4–1.6 |
+| write-back 2–4 MiB behind | 3 | 1.33–1.36 | 2.96–3.29 | 402–521 | 856 µs to 1.5 ms | 1.1–2.1 ms | 857 µs to 1.1 ms | 1.7–1.8 |
+
+1,024 B, 100,000/s:
+
+| Configuration | Runs | Faults/MiB | p99 | p99.9 | p99.99 | max | Reader p99.9 | Late sends (%) |
+|---|---|---|---|---|---|---|---|---|
+| default | 3 | 9.62–9.68 | 2.23–6.01 | 25.5–25.8 | 128–149 | 307–325 | 39.6–41.8 | 0.7–0.9 |
+| ranged sync | 3 | 8.87–8.99 | 2.17–2.25 | 22.0–23.0 | 121–132 | 242–277 | 33.4–34.0 | 0.7–0.9 |
+| write-back to the 128 KiB boundary | 3 | 0.90–0.95 | 2.09–5.05 | 4.50–7.50 | 127 µs to 1.6 ms | 219 µs to 3.3 ms | 38.6–126 | 0.5–1.5 |
+| write-back to the 2 MiB boundary | 3 | 0.98–1.05 | 2.31–3.95 | 4.63–6.36 | 124–133 | 221–226 | 121–134 | 1.5 |
+| ranged sync + write-back to 2 MiB boundary | 3 | 0.28–0.29 | 2.04–3.29 | 3.20–5.53 | 121–132 | 228–249 | 111–127 | 0.5–1.5 |
+| write-back 2–4 MiB behind | 3 | 1.30–1.31 | 2.10–2.18 | 95.6–107 | 826–963 | 1.4–1.5 ms | 910 µs to 1.0 ms | 0.7–1.4 |
+
+1,024 B, 170,000/s:
+
+| Configuration | Runs | Faults/MiB | p99 | p99.9 | p99.99 | max | Reader p99.9 | Late sends (%) |
+|---|---|---|---|---|---|---|---|---|
+| default | 3 | 2.14–2.21 | 2.09–2.55 | 16.6–18.5 | 160–165 | 244–377 | 215–239 | 1.2 |
+| ranged sync | 3 | 1.54–1.65 | 2.42–2.62 | 9.95–10.7 | 154–157 | 247–275 | 215–231 | 1.2–1.4 |
+| write-back to the 128 KiB boundary | 3 | 0.71–0.77 | 2.17–2.40 | 6.92–9.00 | 145–165 | 210–268 | 242–265 | 1.0–1.4 |
+| write-back to the 2 MiB boundary | 3 | 0.81–0.84 | 2.15–2.44 | 23.9–31.9 | 219–337 | 575–963 | 560–592 | 1.2–1.4 |
+| ranged sync + write-back to 2 MiB boundary | 3 | 0.32–0.33 | 2.27–2.34 | 6.13–7.42 | 134–146 | 213–234 | 551–569 | 1.4–1.5 |
+| write-back 2–4 MiB behind | 3 | 0.76–0.78 | 2.15–2.41 | 20.8–66.8 | 167 µs to 1.4 ms | 551 µs to 1.7 ms | 1.3–1.4 ms | 1.2–1.6 |
+
+- **Writer touch, while waiting or in `append`.** Within the default's range in every cell, apart from single stalls of
+  1.7 ms (64 B) and 3.0 ms (300,000/s) in one run each of the touch while waiting; the default's runs have such stalls
+  too (up to 5.3 ms at 300,000/s). While waiting, it found a page to take in few waits (193 and 53 faults per run at
+  1,024 B × 100,000 and 170,000/s, against 18,400 and 6,900 faulted appends): the pages that fault were write-protected
+  after the writer last waited, or lie further on in the folio. On aarch64 it took most of the faults off the appends
+  (1.6–3.1 per MiB left in them, against 12.5–18.5) and the latency did not move either: a touch waits as long as the
+  fault would, and the send after it then starts late. In `append` it only moves a fault from one append to the one
+  before. Its cost is below.
+- **Larger window.** Worse in every cell and on both filesystems: each checkpoint writes the whole window back and
+  write-protects it (PR #102), so the writer re-faults all of it (10–20 faults per MiB with 4 MiB, 34–35 with 16 MiB)
+  and its p99.9 rises to 56–64 µs with 1 MiB and 0.2–0.9 ms with 4 and 16 MiB. A rate-adaptive window would choose among
+  these rows.
+- **Re-touch.** A third (1,024 B) to a sixth (64 B) of the faults, but the faults left collide with the helper on the
+  same folio (median 3.6–31.5 µs instead of 1.1 in the traced runs), and the writer's p99.9 is no better (slightly above
+  the default's range at 64 B and at 1,024 B × 100,000/s on ext4, within it elsewhere).
+- **Early write-back.** Off, as known, checkpoints take hundreds of milliseconds (below) and the writer stalls behind
+  them at 64 B. 2–4 MiB behind: the checkpoint then writes those megabytes and the writer's first fault after it waits
+  for its journal commit (appends of 1.3–1.8 ms on ext4 in `tt-sustained`, below), and the zero-copy reader's p99.9
+  rises to about 1 ms (why the reader waits that long was not traced). To the 2 MiB boundary: the same, smaller. **To
+  the 128 KiB boundary:** on x86-64 ext4, faults 0.7–1.0 per MiB, writer p99.9 at 1,024 B 4.5–7.5 against 25.5–25.8 µs
+  (100,000/s) and 6.9–9.0 against 16.6–18.5 µs (170,000/s), p99 at 64 B 1.6–1.8 against 3.3–3.5 µs (its p99.9 there did
+  not move); p99.99, maxima and the reader within the default's range but for one run at 100,000/s with a single 3.3 ms
+  append 2.7 ms after a checkpoint request (the default's runs have such outliers too: up to 2.0 ms in the main matrix).
+  On aarch64, in every cell and on both filesystems: faults 0.5–0.9 per MiB against 6.5–18.6, writer p99.9 2.7–3.2 µs
+  against 15–34 at the three lower rates and 4.8–12.6 against 22 µs to 18 ms at 300,000/s, the reader's p99.9 at 64 B
+  10–14 against 35–41 µs and at 1,024 B × 100,000/s 3.5–4.3 against 22–26 µs; p99.99 and maxima within or below the
+  default's range.
+- **Ranged sync.** 7–28 % fewer faults (the window is no longer written back), writer p99.9 41–57 against 63–72 µs (64
+  B), 22–23 against 25.5–25.8 and 10–11 against 16.6–18.5 (1,024 B), the reader's p99.9 at 64 B 44–76 against 101–107
+  µs; p99.99 and maxima unchanged. With early write-back to the 2 MiB boundary as well, the two lower faults further but
+  the reader's p99.99 rose to 1.2 ms, as with the 2 MiB boundary alone. On aarch64, alone, it stayed within the
+  default's range (one run at 64 B had a 12 ms stall; one default run at 300,000/s had an 18 ms one); with the 128 KiB
+  boundary it left 0.22–0.29 faults per MiB, the reader's p99.9 at 64 B 4.5–5.2 µs against 10–14 with the boundary
+  alone, and the writer's p99.9 at 300,000/s 3.7–6.3 against 4.8–12.6.
+- **Spare segment.** Removes the faults at rolls and the roll's own work: at 300,000/s the writer's p99.9 fell from
+  86–172 to 8.1–9.2 µs (ext4) and from 79–86 to 8.6 µs (xfs). At 170,000/s on ext4 one of its runs had an 8.8 ms stall
+  (p99.9 509 µs). On aarch64 ext4 it lowered the writer's p99.99 at 1,024 B × 100,000 and 170,000/s (34 and 41 against
+  122–133 and 165–171 µs) and the reader's p99.9 at 170,000/s (45 against 124–137 µs), and at 300,000/s one of its two
+  runs stalled (p99.9 3.9 ms). It is an option since ADR 0049, which says what to measure before it becomes the default.
+
+### `tt-sustained` at 170,000/s, 1,024 B
+
+The library's own sustained tool (`--duration 30s --warmup 5s --checkpoint-every 1s --checkpoint-mode background
+--readers mapped`), three interleaved runs per configuration. Its append latency is the time of one `Writer::append`
+(not from the schedule). µs unless a cell says ms.
+
+| Arch, filesystem | Configuration | Append p99.9 | Append p99.99 | Append max | Durable p50 | Durable max | Reader p99.9 | Reader p99.99 |
+|---|---|---|---|---|---|---|---|---|
+| x86-64, ext4 | default | 4.8–5.6 | 22.5–23.3 | 183–452 | 2.4–2.8 ms | 2.9–3.2 ms | 61–72 | 620–653 |
+| | write-back 2–4 MiB behind | 3.2–4.2 | 7.1–9.6 | 1.3–1.8 ms | 12.3–13.0 ms | 14.7–16.8 ms | 1.2 ms | 2.0 ms |
+| | `early_writeback(false)` | 2.7–4.4 | 11.8–17.3 | 348–420 | 439–441 ms | 763–782 ms | 93–186 | 0.8–2.3 ms |
+| x86-64, xfs | default | 4.6–6.5 | 17.8–18.7 | 211–223 | 1.15–1.19 ms | 1.46–1.52 ms | 44–52 | 613–617 |
+| | write-back 2–4 MiB behind | 2.7–2.9 | 5.3–9.8 | 176–186 | 11.6–11.7 ms | 16.9–17.0 ms | 0.85–1.25 ms | 1.9 ms |
+| | `early_writeback(false)` | 2.4–2.6 | 5.7–7.2 | 297–542 | 462 ms | 863 ms | 377–462 | 4.3–4.9 ms |
+| aarch64, ext4 | default | 6.7–7.4 | 29.5–30.1 | 249–254 | 0.89–0.91 ms | 1.13–1.25 ms | 144–156 | 769–779 |
+| | write-back to the 128 KiB boundary | 2.5–3.7 | 4.4–6.2 | 191–197 | 0.88–0.92 ms | 1.08–1.12 ms | 142–149 | 775–782 |
+| | ranged sync | 5.3–6.1 | 28.7–29.4 | 239–242 | 0.50–0.51 ms | 0.73–0.91 ms | 143–158 | 766–782 |
+
+Late sends: aarch64 0.36–0.40 % (default), 0.06 % (128 KiB boundary), 0.35–0.93 % (ranged sync); x86-64 0.9–1.7 % in
+every configuration. The 128 KiB boundary left the checkpoint's durable time as it was; the ranged sync shortened it by
+0.4 ms (the 256 KiB it no longer writes, PR #102). The zero-copy reader's tail in this tool did not move with either.
+Neither was run with `tt-sustained` on x86-64.
+
+### The comparison's W2 cells with the 128 KiB boundary (aarch64)
+
+`tt-latency run --rate <rate> --count <n> --warmup <w> --payload <64|1024> --reader mapped --writer-cpu 1 --reader-cpu 2
+--helper-cpus 3` (the latency tool of the comparison's W2, zero-copy reader, from the scheduled send to the read; no
+checkpoints, so the ranged sync does not apply), 11 s at 100,000/s and 31 s at 10,000/s with the first second left out,
+ext4, three interleaved rounds, on the aarch64 VM after its matrix. Reader p99.9 / p99.99 in µs:
+
+| Payload, rate | Default | Write-back to the 128 KiB boundary | Rerun (above): tickertape / Chronicle with `microTouch()` alone / all on |
+|---|---|---|---|
+| 64 B, 10,000/s | 0.49–2.45 / 4.2–4.6 | 0.48–2.34 / 3.2–4.9 | 2.87–3.46 / 1.59–3.89 / 0.73–0.78 |
+| 64 B, 100,000/s | 1.98–2.19 / 10.0–10.8 | 0.45–1.47 / 3.8–4.2 | 1.88–2.08 / 12.7–18.1 / 7.8–13.3 |
+| 1,024 B, 10,000/s | 8.76–9.41 / 28–30 | 2.31–2.76 / 4.2–6.0 | 8.73–9.10 / 2.71–2.94 / 2.77–3.46 |
+| 1,024 B, 100,000/s | 25.2–26.7 / 795–804 | 3.21–4.64 / 803–812 | 24.8–28.5 / 18.7–29.2 / 14.5–16.3 |
+
+The default reproduces the rerun's tickertape rows at 1,024 B on the same machine type. With early write-back stopped at
+the 128 KiB boundary, the 1,024 B p99.9 falls below Chronicle Queue's with `microTouch()`. The p99.99 at 1,024 B ×
+100,000/s (about 0.8 ms in both) is the roll without checkpoints (issue #60: rolls without checkpoints still take
+0.7–0.9 ms), which this does not touch. Not run on x86-64.
+
+### What writes the extra bytes at steady-90 (PR #105's question)
+
+PR #105 ([2026-11-26, how much of the limit is the
+disk](#2026-11-26-how-much-of-the-limit-is-the-disk-fio-tmpfs-and-one-change-at-a-time-google-cloud-vms)) found the
+device writing 7 % more than tickertape appended at steady-90 (1,024 B, aarch64) with the defaults, and exactly the
+appended bytes with early write-back off, and the stalls of 50–144 ms gone with it. The same command (`tt-sustained run
+… --payload 1024 --duration 60s --warmup 10s --cpus 1,2,3,4,5,6 --checkpoint-every 1s --checkpoint-mode background
+--retain-bytes 4294967296 --readers mapped,safe:wait=default,safe:durable:wait=block --rate 304571`, `fstrim` and 3 s
+before each run), on a new `c4a-standard-8-lssd` (us-east1-b, 13:14–13:45), ext4 on the first local SSD, four
+interleaved runs per configuration, the last under `bytes.bt` (block `bio_queue` bytes by the thread that queued them,
+and folios starting write-back). Device bytes from `/proc/diskstats` (sectors written) over the whole run, warm-up
+included; appended bytes are the records sent × 1,064. "Seconds" counts the 71 seconds of each run, warm-up included.
+
+| Configuration | Runs | Device GB per run | Device / appended | Append p99.9 (µs) | p99.99 (µs) | max (ms) | Seconds with an append ≥ 10 ms | Durable p50 (ms) | Durable max (ms) | Late sends (%) | Mapped reader p99.9 (ms) |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| default | 4 | 24.62–24.68 | 1.085–1.088 | 3.8–3.9 | 28.1–28.6 | 140–142 | 25–30 | 319–423 | 665–835 | 5.64–7.84 | 117–131 |
+| `early_writeback(false)` | 4 | 22.70 | 1.001 | 2.3–2.4 | 3.9–4.3 | 0.97–3.72 | 0 | 924–930 | 1145 | 0.41–0.47 | 0.45–0.60 |
+| ranged sync | 4 | 24.61–24.67 | 1.085–1.087 | 3.9–4.1 | 28.0–29.1 | 140–142 | 26–29 | 175–279 | 630–790 | 5.97–9.14 | 122–136 |
+| write-back to the 128 KiB boundary | 4 | 22.75 | 1.003 | 2.5–2.6 | 4.5–5.0 | 0.20–1.77 | 0 | 0.98–1.04 | 1–2 | 0.40–0.49 | 0.47–0.58 |
+| ranged sync + 128 KiB boundary | 4 | 22.70 | 1.001 | 2.4–2.6 | 4.1–4.2 | 0.21–10 | 0–1 | 0.58–0.60 | 1 | 0.35–0.44 | 0.48–0.60 |
+
+- **What writes them.** Early write-back asks for the whole pages behind the writer every 1 MiB
+  (`sync_file_range(SYNC_FILE_RANGE_WRITE)` from the end of the last range to the start of the page that holds the
+  position; nothing is rounded up in `writeback.rs`). The kernel writes back whole folios, and the folio that holds the
+  position (128 KiB here) is then written while the writer is still filling it: once now, partly empty (records up to
+  the position, zeros and prefaulted zeros after it), and again when it is full. One such folio per 1 MiB, half full on
+  average, is about 6 % more bytes; the checkpoints, which also write the writer's folio and the 256 KiB window (PR
+  #102), the rest. In the traced default run, the early write-back thread queued 23.05 GB and the checkpoint thread 1.38
+  GB for 22.7 GB appended (with the boundary: 22.49 and 0.10 GB; with early write-back off the checkpoint thread wrote
+  22.41 GB and the writer's own thread 0.27 GB, in write-back throttling). Counting folios per inode and index did not
+  work here: retention deletes segments during the run and ext4 reuses their inode numbers, so the counts mix files
+  (x86-64, below, kept every segment).
+- **The stalls.** With early write-back stopped at the 128 KiB boundary, the device wrote 0.3 % more than appended
+  (mostly the window at checkpoints: 0.1 % with the ranged sync as well), no second had an append of 10 ms or more
+  (25–30 of 71 with the defaults), the maximum was 0.2–1.8 ms, late sends 0.4–0.5 % (5.6–7.8 %), and checkpoints were
+  durable after 1 ms, where early write-back off gives the same tail at 0.9 s per checkpoint. With the ranged sync as
+  well, 0.0 % more and durable after 0.6 ms (one run had one append of 10 ms). The ranged sync alone left the bytes and
+  the stalls as they were: the window it saves is small next to the rewritten folios.
+- **One story with the ranged sync.** Both write pages the writer has not finished: early write-back the rest of the
+  folio it is filling, every 1 MiB; the checkpoint's whole-file `fdatasync` the prefaulted window, every checkpoint.
+  Both pages are written again once they hold records, and writing them write-protects them, which is where the writer's
+  faults come from. The boundary removes the first, the ranged sync the second. At steady-90 on aarch64 the first is
+  what pushes the device from 324 MB/s of appends to about 350 MB/s, its limit, and the stalls follow.
+
+x86-64 (a new `c4-standard-8-lssd`, us-east1-b, 13:46–14:04; 311,614 records/s, the x86-64 steady-90 rate of the 16-vCPU
+type, 331 MB/s; `--retain-bytes 68719476736` so that no segment is deleted and folios can be counted per file; three
+runs each, the last traced):
+
+| Configuration | Runs | Device GB per run | Device / appended | Append p99.9 (µs) | p99.99 (µs) | max (ms) | Seconds with an append ≥ 10 ms | Durable p50 (ms) | Durable max (ms) | Late sends (%) | Mapped reader p99.9 (ms) |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| default | 3 | 23.26–23.29 | 1.002–1.004 | 3.9–5.1 | 9.1–9.6 | 0.45–128 | 0–3 | 2.16–3.43 | 25–434 | 1.98–3.23 | 0.38–87 |
+| `early_writeback(false)` | 3 | 23.22 | 1.000 | 4.4–5.8 | 8.1–8.6 | 1.53–4.74 | 0 | 913–925 | 1149–1179 | 2.47–2.73 | 0.48–0.50 |
+| write-back to the 128 KiB boundary | 3 | 23.26 | 1.002 | 4.5–5.2 | 8.8–9.5 | 0.84–12.23 | 0–1 | 1.94–3.11 | 3–495 | 2.48–2.71 | 0.44–0.72 |
+
+On x86-64 the defaults wrote only 0.2–0.4 % more than appended, and in the traced run 416 of 183,790 folios were written
+back more than once (0.06 GB): 146 by early write-back and then a checkpoint, 117 twice by early write-back, 103 twice
+by checkpoints. At this rate the x86-64 writer has left the folio by the time early write-back reaches it (as with
+`tt-faults` at 300,000/s above), so there is little to remove: the boundary changed neither the bytes nor the latency
+beyond the spread. One default run of three had a 128 ms append (and a checkpoint durable after 434 ms), one run with
+the boundary a 12 ms one; PR #105's x86-64 maxima were 0.25–0.64 ms.
+
+### A touch on the writer's thread: what it costs `append`
+
+`tt-append-cost append --count <500,000 | 1,000,000> --payload 64 --prefault` under `perf stat -e instructions:u`, the
+writer pinned; the difference of the two counts divided by 500,000. Five pairs on x86-64, three on aarch64, interleaved.
+
+| Arch | Instructions per append, default | With the touch in `append` | ns per append, default | With the touch |
+|---|---|---|---|---|
+| x86-64 | 407.4 | 423.8 (+16.4) | 35.1–48.9 | 36.7–51.4 (slower in all 5 pairs) |
+| aarch64 | 383.8 | 396.5 (+12.7) | 82.6–88.8 | 91.8–93.5 (slower in all 3 pairs) |
+
+ADR 0047's gate for the append path is 3 instructions and no time difference outside the noise floor. The check itself
+is a compare and a branch; the rest is code layout around it. A `Writer::idle()` would cost nothing in `append`, but it
+found little to do (above).
+
+### Does the ranged sync still flush a volatile write cache?
+
+The VMs' disks report "write through", so the kernel sends them no cache flushes at all, and writing "write back" to the
+local SSD's queue did not take effect. A loop device does report a write-back cache (it turns a flush into an `fsync` of
+its backing file): ext4 and xfs on a loop device backed by a file on the local SSD, 20,000 records/s of 1,024 B, a
+background checkpoint every second, 11 checkpoints per run, two runs each, flush requests issued to the loop device
+counted (block `rq_issue` tracepoint):
+
+| Filesystem | Configuration | Flush requests per checkpoint | Checkpoint thread's `blkdev_issue_flush` per run | Its `msync` / `fdatasync` calls per run |
+|---|---|---|---|---|
+| ext4 | default | 7.5–7.8 | 12–14 | 11 / 31 |
+| ext4 | ranged sync | 4.1–4.3 | 9 | 11 / 11 |
+| xfs | default | 7.1 | 14 | 11 / 31 |
+| xfs | ranged sync | 3.9 | 9 | 11 / 11 |
+
+So the ranged checkpoint still sends flushes; the order (the flush that follows the active segment's data comes before
+the marker's write) follows from the kernel sources (ADR 0058 → Is the ranged sync safe?), and was not traced per call.
+
+### Chronicle's `microTouch()` on the same machine types
+
+The comparison rerun at v1.0.0 (issue #57; still running when this was written, its short part finished on 2026-11-25;
+branch `rerun/v1.0.0-session`) has Chronicle Queue with every tool setting off (`jvm-old`: the old JVM warm-up, no
+`microTouch()`, the default 64 MiB `blockSize`), with `microTouch()` alone, and with every setting on, and tickertape
+with its defaults (prefault on, early write-back on, no checkpoints), in its W2 latency runs (from the scheduled send to
+the read, 11 s, the first second left out; four runs per row: two rounds of two). ext4 on the first local SSD, x86-64
+`c4-standard-16-lssd` (16 vCPUs, the same CPU as above) and aarch64 `c4a-standard-8-lssd` (the type above). Reader p99.9
+in µs; tickertape with its zero-copy reader:
+
+| Arch | Payload, rate | Chronicle, all off | `microTouch()` alone | Chronicle, all on | tickertape |
+|---|---|---|---|---|---|
+| x86-64 | 64 B, 10,000/s | 2.45–3.51 | 1.90–1.99 | 1.68–1.83 | 2.17–2.35 |
+| | 64 B, 100,000/s | 28.6–29.2 | 17.8–18.2 | 11.8–15.3 | 2.27–5.96 |
+| | 1,024 B, 10,000/s | 34.8–36.8 | 2.35–2.51 | 2.36–2.82 (and one run of 15.8 ms) | 4.60–6.84 |
+| | 1,024 B, 100,000/s | 35.4–37.4 | 25.2–26.2 | 23.9–24.6 | 28.6–29.8 |
+| aarch64 | 64 B, 10,000/s | 2.13–2.24 | 1.59–3.89 | 0.73–0.78 | 2.87–3.46 |
+| | 64 B, 100,000/s | 25.1–27.1 | 12.7–18.1 | 7.8–13.3 | 1.88–2.08 |
+| | 1,024 B, 10,000/s | 36.4–37.6 | 2.71–2.94 | 2.77–3.46 | 8.73–9.10 |
+| | 1,024 B, 100,000/s | 33.7–35.2 | 18.7–29.2 | 14.5–16.3 | 24.8–28.5 |
+
+- **What `microTouch()` does for Chronicle** on these machines: against nothing, it takes the p99.9 at 1,024 B ×
+  10,000/s from 35–38 to 2.4–2.9 µs, and lowers it by up to about half in the other cells (not clearly at aarch64 64 B ×
+  10,000/s, where its runs spread from 1.6 to 3.9 µs); the rest of "all on" adds less. That is the gain tickertape's
+  helper already has against no prefaulting: in this section, prefault off against on is 3.7–4.0 ms against 60–100 µs at
+  64 B × 1,000,000/s and 140–237 against 26–27 µs at 1,024 B × 100,000/s (writer p99.9, x86-64 ext4). The two are not
+  the same comparison: Chronicle's gain is against no pre-touching at all, and tickertape already has a helper.
+- **Where tickertape is above Chronicle with `microTouch()`:** at 1,024 B, by 2–6 µs at 10,000/s and by 2–14 µs at
+  100,000/s (and at 64 B × 10,000/s, by 0.3–2.7 µs against "all on"; what sets that p99.9 was not measured here). Those
+  are the cells where, in this section, early write-back's write-protect faults set tickertape's p99.9 (1,024 B ×
+  100,000/s: 26–27 µs, with the 128 KiB boundary 4.5–7.5 µs, measured with `tt-faults`). Chronicle has no early
+  write-back. With `tt-latency` in the W2 cells on aarch64 (above) the boundary closed that gap: 2.3–2.8 µs at 1,024 B ×
+  10,000/s and 3.2–4.6 µs at 100,000/s. x86-64 was not run with `tt-latency`.
+
+### A README sentence these figures update
+
+`README.md` (Performance) says: "In separate tickertape-only runs on the bare-metal machine (ext4, 100,000 records/s),
+turning prefaulting off raised the zero-copy reader's p99.9 from 1.7–2.0 µs to 31–34 µs at 64 bytes, close to Chronicle
+Queue's 36–37 µs. At 1,024 bytes it did not raise it: 110–243 µs with prefaulting and 97–122 µs without, both above
+Chronicle Queue's 48–55 µs." That was v0.4.0 on bare metal, before early write-back (ADR 0038, 2026-11-20), without
+checkpoints. Proposed addition (the owner decides; this PR does not change the README): "With 1.0's defaults on cloud
+VMs (ext4, 100,000 records/s of 1,024 bytes, a checkpoint every second; `docs/benchmarks.md`, 2026-11-26), prefaulting
+off raised the writer's p99.9 from 26–27 µs to 140–237 µs and the zero-copy reader's from 40–52 µs to 321–412 µs."
+
+And: "Close to its limit the writer can stall. In tickertape's own 10-minute runs at 1,024 bytes and 90 % of the unpaced
+rate, appends of 50–128 ms recurred on aarch64 ext4." Proposed addition, once ADR 0058's change is decided: "There,
+early write-back made the device write 8 % more than was appended, by writing back the 128 KiB the writer was filling;
+stopping it at the boundary below the writer removed the extra bytes and these stalls in an experiment (not the
+default)." Neither sentence is changed by this PR.
+
+### What these figures do not show
+
+Bare metal; other VM shapes and disks; macOS (where the helper advises `MADV_WILLNEED` 8 MiB ahead, which makes no page
+writable, and there is no early write-back); kernels other than 7.0, and so other folio sizes (with smaller folios the
+early write-back faults should not occur; with larger ones, the 128 KiB boundary would not prevent them); `lazytime`;
+unpaced writers and bursts; `HelperCpus::Inherited`; runs longer than 20 s (30 s in `tt-sustained`); the comparison
+harness with any switch, and `tt-latency` with it on x86-64; the ranged sync and the 128 KiB boundary together on
+x86-64; a drive with a volatile write cache, and power loss.
 
 ## 2026-11-26, seeks with and without the seek index (Google Cloud VMs)
 
@@ -4206,7 +4924,9 @@ after each (`ENGINE=sync BS=4k SYNC=1`, 20 s), the latency of an ext4 commit on 
   On a second aarch64 VM tickertape with its defaults made the device write **7 % more bytes** than it appended (24.4
   GB against 22.7 GB per run; with early write-back off exactly the appended bytes; fio with the same pattern wrote only
   its data). At steady-90 that is about 348 MB/s for a device that takes 351. What writes the extra bytes was not
-  traced; it is the first thing to look at (below).
+  traced here; it is the first thing to look at (below). (Traced since, in [2026-11-26, the writer's remaining page faults → What writes the extra bytes](#what-writes-the-extra-bytes-at-steady-90-pr-105s-question): early write-back writes back
+  the 128 KiB folio the writer is still filling, and it is written again once full; stopping early write-back at the
+  128 KiB boundary below the writer removed the extra bytes and these stalls in an experiment.)
 
 ### The device by itself (fio)
 
@@ -4426,7 +5146,7 @@ unwritten pages add to a checkpoint", above); that section also found more devic
 
 Ranked by what it would tell against what it costs (cloud prices of this session):
 
-1. **Find the extra 7 % of device writes** (`blktrace` or a `block_rq_issue` probe by sector and file offset, default
+1. **Find the extra 7 % of device writes** (done: [2026-11-26, the writer's remaining page faults → What writes the extra bytes](#what-writes-the-extra-bytes-at-steady-90-pr-105s-question)) (`blktrace` or a `block_rq_issue` probe by sector and file offset, default
    against early write-back off, on aarch64 and x86-64, steady-90 and steady-50): whether pages are written twice and
    why (ext4's conversion of unwritten extents, the journal; the prefaulted window that every checkpoint writes as
    zeros is only about 268 KiB a second, 2026-11-26 "what prefaulted, unwritten pages add to a checkpoint", above, which
