@@ -18,6 +18,24 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   later retention run unlinks it only once retention has removed the segment its seal names (and its name is an hour
   old and its process gone); `docs/operations.md` says how to keep it or put it back. An archiver's removal costs a
   rename, a `stat` and a read of the marker more than before.
+- Fixed: `Writer::open` refuses a checkpoint marker whose position the records of its segment do not reach (ADR 0056,
+  issue #87). The record right before the marker's offset must be there, valid, end exactly at that offset and carry
+  the sequence number below the marker's `next_seq` (at offset 64, `next_seq` must be the segment's base). Otherwise the
+  open fails under every recovery policy with `Error::Corrupt`, reason `DanglingCheckpoint` (C ABI code 13, Python
+  `dangling_checkpoint`), reported at the segment and the marker's offset, before anything is changed. **Behaviour
+  change:** 1.0.0 opened such a journal, continued at the marker's position and made the gap below it permanent. Two
+  kinds of journal are refused now: segments restored from a backup while a newer `checkpoint` file was kept (restore
+  the backup's marker with them: `docs/operations.md` → Restoring from a backup), and a journal whose last record before
+  the marker's offset, in the marker's segment, is zeroed or damaged (`verify` already reported it). Damage to any earlier
+  covered record is not looked at, as before. No journal that a working writer and a crash leave on storage that honours
+  its syncs is refused. What to do after a refusal: `docs/operations.md` → After a crash. The check reads only the record
+  before the marker: on a healthy journal it adds work proportional to that record's length.
+- Fixed (macOS): a repair by replacement makes its copy of the segment durable on the drive (`F_FULLFSYNC`) before it
+  renames the copy over the segment, and so does a segment recovery creates (a new journal's first segment, a
+  successor after a lost roll) before its link. A power loss right after the rename could keep the new name without
+  the copied records before the checkpoint marker (lost silently in 1.0.0; with the check above, the next open would
+  refuse), and a new journal's first segment without its header made every later open fail. One more `F_FULLFSYNC`
+  per repair and per created segment; Linux was not affected (`fdatasync` flushes the device cache).
 - Fixed: a reader no longer stops silently at a zeroed commit word in older history (issue #79, ADR 0050). An empty slot
   that the checkpoint marker covers, or that a later segment (with a valid header) shows to have been filled, is `Error::Corrupt` with
   `CorruptReason::EmptyCommitWord` at its offset; before, `try_next` returned `Ok(None)` there for ever, and a replay ended
