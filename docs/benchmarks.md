@@ -2244,7 +2244,8 @@ Raw output (JSON lines per run, environment, scripts) is kept outside the reposi
 | change, `RollsAndCheckpoints` | 384 | 899.9 | 369 | 997.0 |
 | change, `All` | 600 (+217) | 1,115.9 | 576 (+210) | 1,204.0 |
 
-**Gate 1 (at most 3 more) is met on both, at its limit on aarch64.** The change forces three CRC helpers inline
+**Gate 1 (at most 3 more) is met on both, at its limit on aarch64.** Counted again after the change was rebased on
+`8912012` (the same code): 384 against 383 on x86-64, 369 against 366 on aarch64 (in the OrbStack VM, footnote ² below). The change forces three CRC helpers inline
 (`format::finish_record_body`, `format::record_crc`, `crc::crc32c`). Without that, how many instructions an append has
 depended on unrelated code elsewhere in the crate, because the append path is compiled twice (with and without timing)
 and the compiler's inlining of these helpers into `Writer::append` changed with it:
