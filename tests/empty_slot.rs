@@ -1511,6 +1511,20 @@ fn live_readers_of_a_killed_writer_see_no_false_error_long() {
     killed_writer(rounds(250));
 }
 
+/// Seeks to `target`, or to the oldest record there is once retention has removed it, and returns where the reader
+/// is then. The oldest record named by a failed seek can be gone before the next one, so it is sought until one
+/// succeeds: a reader left where it was would report its old position, not the one the caller expects.
+fn seek_to_available(reader: &mut Reader, mut target: u64, kind: (bool, bool), style: u32) -> u64 {
+    while let Err(e) = reader.seek(target) {
+        match e {
+            Error::SeqUnavailable { first, .. } => target = first,
+            e => panic!("{kind:?}, {style}: {e:?}"),
+        }
+    }
+    assert_eq!(reader.position(), target, "{kind:?}, {style}");
+    target
+}
+
 fn killed_writer(rounds: u64) {
     let root = tempfile::tempdir().unwrap();
     let dir: PathBuf = root.path().join("j");
@@ -1566,29 +1580,15 @@ fn killed_writer(rounds: u64) {
                                             expected = reader.position();
                                         }
                                     }
-                                    match reader.seek(expected) {
-                                        Ok(()) => {}
-                                        Err(Error::SeqUnavailable { first, .. }) => {
-                                            expected = first;
-                                            // It can be gone by now, and is sought again then.
-                                            let _ = reader.seek(first);
-                                        }
-                                        Err(e) => panic!("{kind:?}, {style}: {e:?}"),
-                                    }
+                                    expected =
+                                        seek_to_available(&mut reader, expected, kind, style);
                                 }
                             }
                             // Only retention removes anything.
                             Err(Error::Discarded { seq, .. }) => {
-                                assert_eq!(seq, expected);
+                                assert_eq!(seq, expected, "{kind:?}, {style}");
                                 discards.fetch_add(1, Ordering::Relaxed);
-                                let mut target = seq;
-                                while let Err(e) = reader.seek(target) {
-                                    match e {
-                                        Error::SeqUnavailable { first, .. } => target = first,
-                                        e => panic!("{kind:?}, {style}: {e:?}"),
-                                    }
-                                }
-                                expected = target;
+                                expected = seek_to_available(&mut reader, seq, kind, style);
                             }
                             Err(e) => panic!("{kind:?}, {style}, at {expected}: {e:?}"),
                         }
