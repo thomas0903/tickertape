@@ -106,6 +106,20 @@ fn frames(dir: &Path, base: u64) -> Vec<(u64, u32)> {
     out
 }
 
+/// The reader is at an empty slot that the marker covers (ADR 0050): it reports it, on every call.
+fn expect_covered_empty(reader: &mut Reader, at: u64, covered: u64) {
+    for _ in 0..2 {
+        match reader.try_next() {
+            Err(Error::Corrupt {
+                offset,
+                reason: CorruptReason::EmptyCommitWord(n),
+                ..
+            }) => assert_eq!((offset, n), (at, covered)),
+            other => panic!("{other:?}"),
+        }
+    }
+}
+
 /// Every record from the cursor on, and how reading ended.
 fn drain(reader: &mut Reader) -> (Vec<OwnedRecord>, String) {
     let mut records = Vec::new();
@@ -251,7 +265,8 @@ fn a_crossing_frame_that_validates_is_returned_from_the_buffer() {
         assert_eq!(is_copied(&reader), !durable);
         assert_eq!(reader.seg.map.is_none(), durable);
         assert_eq!(reader.buf.len(), len as usize, "only the claimed frame");
-        assert!(reader.try_next().unwrap().is_none());
+        // That frame took the place of records 6 to 8, of which the marker covers 6 and 7.
+        expect_covered_empty(&mut reader, limit + 144, 8);
         assert!(durable || reader.buf.capacity() == 0);
         // The cursor is past the bound (a durable-only reader's too: it counts records, and this one was not one).
         assert_eq!(limit_now(&reader), NO_LIMIT);
@@ -518,10 +533,27 @@ proptest! {
         }
         let mut fresh = open(dir.path(), true, false);
         let mut fresh_seen = 0;
+        // A marker that says more than the files hold: the end is not the head it vouches for (ADR 0050).
+        let newest = crate::journal::list_segments(dir.path()).unwrap().last().unwrap().0;
+        let ahead = damage == 5 || (damage == 6 && newest == 0);
         for (reader, seen) in [(&mut readers[1], &mut seen[1]), (&mut fresh, &mut fresh_seen)] {
-            while let Some(record) = reader.try_next().unwrap() {
-                prop_assert_eq!(record.seq, *seen);
-                prop_assert_eq!(record.payload, &payload(*seen, lens[*seen as usize])[..]);
+            // The live reader's first check was before the marker was replaced.
+            idle(reader);
+            loop {
+                match reader.try_next() {
+                    Ok(Some(record)) => {
+                        prop_assert_eq!(record.seq, *seen);
+                        prop_assert_eq!(record.payload, &payload(*seen, lens[*seen as usize])[..]);
+                    }
+                    Ok(None) if !ahead => break,
+                    Ok(None) => {
+                        // It arrived at this slot just now.
+                        idle(reader);
+                        continue;
+                    }
+                    Err(Error::Corrupt { reason: CorruptReason::EmptyCommitWord(_), .. }) if ahead => break,
+                    other => panic!("damage {damage}: {other:?}"),
+                }
                 prop_assert!(!is_copied(reader));
                 *seen += 1;
             }
@@ -593,7 +625,7 @@ fn the_limit_follows_the_marker() {
     assert!(reader.try_next().unwrap().is_none());
     assert_eq!(limit_now(&reader), NO_LIMIT, "not before 100 ms");
     idle(&mut reader);
-    assert!(reader.try_next().unwrap().is_none());
+    expect_covered_empty(&mut reader, after(25), 30);
     assert_eq!(limit_now(&reader), after(30));
     // It can't be read: the old bound stays, and nothing is reported. No valid marker: none.
     let path = dir.path().join(crate::journal::CHECKPOINT_FILE);
@@ -1034,11 +1066,10 @@ fn a_repair_around_the_marker_read() {
                     assert_eq!((record.seq, record.payload), (seq, &payload(seq, 100)[..]));
                 }
                 assert_eq!(limit_now(&reader), NO_LIMIT, "{case}: not for this file");
-                assert!(reader.try_next().unwrap().is_none());
-                idle(&mut reader);
+                // At the first empty slot: the new marker covers it, and the file is not in place (ADR 0050).
                 assert!(matches!(
                     reader.try_next(),
-                    Err(Error::Discarded { seq: 10 | 12, .. })
+                    Err(Error::Discarded { seq: 12, .. })
                 ));
                 assert_eq!(
                     limit_now(&reader),

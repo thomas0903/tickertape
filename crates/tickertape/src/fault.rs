@@ -35,6 +35,9 @@ pub enum Point {
     /// [`hold_background`]. A background checkpoint also stops at [`Point::CheckpointSync`] (before it syncs anything)
     /// and [`Point::CheckpointMarkerSync`], on its own thread.
     CheckpointBeforeMarker,
+    /// A background checkpoint has opened a segment its list had released again (ADR 0038 → Bounded open segments),
+    /// before it syncs it: hold it there with [`hold_background`].
+    CheckpointReopen,
     /// Renaming a retention segment (inject EXDEV to exercise the copy path).
     RetentionRename,
     /// Syncing the checkpoint marker in `retention::apply` (an archiver other than the writer), after reading the slot
@@ -118,6 +121,17 @@ pub enum Point {
     /// After a visible zero-copy reader that has reached its bound has read the marker again, before it checks that its
     /// segment is still in place. Arm with [`run_at`], or with [`fail_next`] to make that check fail.
     ReaderLimitIdentity,
+    /// A reader has read an empty slot, before it checks whether that slot can be the head of the journal (ADR 0050), that
+    /// is before it reads the checkpoint marker for it. Arm with [`run_at`].
+    ReaderEmptySlotCheck,
+    /// A reader at an empty slot is about to list the segments. Arm with [`run_at`].
+    ReaderEmptySlotList,
+    /// A reader at an empty slot has found that the journal continues after it (ADR 0050), before it reads the slot again.
+    /// Arm with [`run_at`].
+    ReaderEmptySlot,
+    /// A reader at an empty slot has found that again, after it read the slot again for the validation window and before
+    /// it checks that its segment is still in place and reads the slot for the last time. Arm with [`run_at`].
+    ReaderEmptySlotConfirm,
     /// After inspection (`inspect::list_segments`, `inspect::verify`) lists the segments, before it opens each one.
     /// Arm with [`run_at`].
     InspectOpen,
@@ -132,7 +146,8 @@ pub enum Point {
     /// Syncing the zeroing of an abandoned write (a fill closure that panicked or declined).
     AbandonedWriteSync,
     /// Starting the early write-back of segment data on the write-back helper thread (Linux; arm with
-    /// [`fail_next_background`]).
+    /// [`fail_next_background`], or hold the helper there, with the segment file it is about to write back, with
+    /// [`hold_background`]).
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     EarlyWriteback,
     /// A seek index builder has created its temporary file (the fence), before it reads the marker. The points of the

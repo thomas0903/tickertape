@@ -155,6 +155,8 @@ fn reading_allocates_nothing() {
             let config = ReaderConfig::default().backoff(backoff);
             let mut reader = open(dir.path(), mapped, config);
             skip_warm_up(&mut reader);
+            // At its first empty slot a reader reads the marker and lists the segments (ADR 0050).
+            assert!(reader.try_next().unwrap().is_none());
             let mut followed = 0;
             for _ in 0..RECORDS {
                 writer.append(&record(&[7; 64])).unwrap();

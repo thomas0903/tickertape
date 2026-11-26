@@ -387,7 +387,7 @@ Every error from the library is a `TickertapeException` (unchecked), with one su
 | `JournalIOException` | `IO` | A system call failed; `osErrorCode()` is its `errno` |
 | `StorageFullException` (a `JournalIOException`) | `STORAGE_FULL` | `ENOSPC` or `EDQUOT`; a failed append can be retried later |
 | `LockedException` | `LOCKED` | Another writer has the journal open |
-| `CorruptJournalException` | `CORRUPT` | Journal bytes failed validation; `reason()` says why. A reader's position does not move |
+| `CorruptJournalException` | `CORRUPT` | Journal bytes failed validation, or (from 1.1) a reader is at an empty slot that the checkpoint marker or a later segment shows to have been filled (`EMPTY_COMMIT_WORD`); `reason()` says why. A reader's position does not move |
 | `UnsupportedVersionException` | `UNSUPPORTED_VERSION` | A segment has an unsupported format version |
 | `JournalNotFoundException` | `NOT_FOUND` | The directory has no segments yet (a missing directory is `JournalIOException` with `ENOENT`) |
 | `SeqUnavailableException` | `SEQ_UNAVAILABLE` | The sequence number is older than the oldest segment |

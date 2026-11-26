@@ -1197,7 +1197,15 @@ fn a_seek_to_the_last_record_passed_gets_out_of_a_forged_cursor() {
         for target in [18, 40, 30] {
             reader.seek(target).unwrap();
             assert_eq!(offset(&reader), cursor, "{kind:?}: {target}");
-            assert!(reader.try_next().unwrap().is_none(), "{kind:?}: {target}");
+            // In the zeros of that payload, at what the marker covers (ADR 0050).
+            match reader.try_next() {
+                Err(Error::Corrupt {
+                    offset,
+                    reason: CorruptReason::EmptyCommitWord(44),
+                    ..
+                }) => assert_eq!(offset, cursor),
+                other => panic!("{kind:?}: {target}: {other:?}"),
+            }
         }
         reader.seek(17).unwrap();
         assert_eq!(offset(&reader), FIRST_SLOT, "{kind:?}");

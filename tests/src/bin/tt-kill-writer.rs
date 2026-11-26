@@ -7,6 +7,9 @@
 //! With `mixed`, payload lengths follow `mixed_len` (up to 3,199 bytes) instead of `kill_len` (up to 512 bytes).
 //! With `slow-fill`, payloads are written by `append_with` in 8-byte steps with a pause in between, so that most
 //! kills land inside the fill closure: after the header fields and before the CRC and the commit word.
+//!
+//! It exits on its own when the process that started it is gone (checked every 16 appends), so that a test that is
+//! itself killed (a time-out, an interrupt) does not leave it appending until the disk is full.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -27,6 +30,7 @@ fn main() {
         kill_len
     };
 
+    let parent = std::os::unix::process::parent_id();
     let mut writer = Writer::open(&dir, WriterConfig::default().segment_size(segment_size))
         .expect("open writer");
     let mut out = std::io::stdout().lock();
@@ -53,6 +57,11 @@ fn main() {
             writer.append(&record).expect("append");
         }
         if seq % 16 == 0 {
+            // Reparented: to init (or a subreaper) once the parent is gone.
+            let now = std::os::unix::process::parent_id();
+            if now != parent || now == 1 {
+                return;
+            }
             writeln!(out, "{seq}").expect("stdout");
             out.flush().expect("stdout");
         }

@@ -311,8 +311,10 @@ job is such a list too (a queued job that absorbs later requests merges them thr
 keeps at most four rolled segments, skipping the oldest one's early write-back if it falls that far behind (it is
 only a head start). **Four** because a writer that checkpoints at least once per roll then does not reopen a segment (unless its
 requests pile up behind a slow background checkpoint, above),
-and because a few lists of four (the writer's, a running and a queued job's, the helper's) stay far below the usual
-descriptor limits, whatever the segment count.
+and because three lists of four (the writer's, a running and a queued job's) stay far below the usual descriptor
+limits, whatever the segment count. The write-back helper's queue of four adds at most one segment no list holds (ADR
+[0054](0054-stated-bound-on-a-writers-open-files.md), which also states the total of the release that made it, 18 to 20 files; see
+`docs/operations.md` → Open files).
 
 A checkpoint opens each released segment again by path, checks that it is the same file (device and inode), and
 syncs it there; on macOS it also maps it again and calls `msync` on the range first. The journal directory is made

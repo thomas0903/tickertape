@@ -289,3 +289,37 @@ fn live_mapped_reader_short() {
 fn live_mapped_reader_120() {
     live_mapped_reader(120);
 }
+
+/// A writer whose test is killed (a time-out, an interrupt) must not go on appending until the disk is full: it exits
+/// once the process that started it is gone.
+#[test]
+fn an_orphaned_writer_exits() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let journal = dir.path().join("j");
+    let script = format!(
+        "\"{KILL_WRITER}\" \"{}\" 65536 1 > /dev/null 2>&1 & echo $!; sleep 1",
+        journal.display()
+    );
+    let output = Command::new("sh")
+        .args(["-c", &script])
+        .output()
+        .expect("sh");
+    let pid = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    assert!(pid.parse::<u32>().is_ok(), "{pid:?}");
+    let alive = || {
+        Command::new("kill")
+            .args(["-0", &pid])
+            .stderr(Stdio::null())
+            .status()
+            .expect("kill -0")
+            .success()
+    };
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while alive() {
+        if Instant::now() > deadline {
+            let _ = Command::new("kill").args(["-9", &pid]).status();
+            panic!("the orphaned writer {pid} was still running after 20 s");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}

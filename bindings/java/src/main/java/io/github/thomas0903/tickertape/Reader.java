@@ -180,8 +180,10 @@ public final class Reader implements AutoCloseable {
      * waiting; otherwise {@code null}. Follows seals into the next segment transparently.
      *
      * @return the reader's view of the record, valid until the next call on this reader, or {@code null}
-     * @throws CorruptJournalException if the bytes at the position fail validation (the position does not move, so
-     *     calling again retries it, which may succeed after a writer recovery)
+     * @throws CorruptJournalException if the bytes at the position fail validation, or (from 1.1) if the slot there is
+     *     empty although the checkpoint marker or a later segment shows that it was filled
+     *     ({@link CorruptReason#EMPTY_COMMIT_WORD}); the position does not move, so calling again retries it, which may
+     *     succeed after a writer recovery
      * @throws DiscardedException if writer recovery or retention replaced or removed the segment at the
      *     position; call {@link #seek} to continue
      * @throws JournalIOException if reading the files fails
