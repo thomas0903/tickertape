@@ -622,7 +622,7 @@ impl Notify {
             .word(NOTIFY_NONCE_HI)
             .store((nonce >> 32) as u32, Ordering::SeqCst);
         #[cfg(test)]
-        let capabilities = if test_hooks::NO_CAPABILITIES.load(Ordering::SeqCst) {
+        let capabilities = if test_hooks::NO_CAPABILITIES.with(std::cell::Cell::get) {
             0
         } else {
             CAPABILITY_MARKER
@@ -696,7 +696,7 @@ impl Notify {
     /// Reader, before its final check: register as a waiter and return the current event count.
     pub(crate) fn begin_wait(&self, on: WaitOn) -> u32 {
         #[cfg(test)]
-        test_hooks::BEGINS[on as usize].fetch_add(1, Ordering::SeqCst);
+        test_hooks::BEGINS.with(|b| b[on as usize].set(b[on as usize].get() + 1));
         self.word(on.waiters()).fetch_add(1, Ordering::SeqCst);
         self.word(on.event()).load(Ordering::SeqCst)
     }
@@ -710,8 +710,8 @@ impl Notify {
     pub(crate) fn wait(&self, on: WaitOn, seen: u32, timeout: Duration) -> WaitOutcome {
         #[cfg(test)]
         {
-            test_hooks::WAITS.fetch_add(1, Ordering::SeqCst);
-            if test_hooks::FORCE_UNSUPPORTED.load(Ordering::SeqCst) {
+            test_hooks::WAITS.with(|w| w.set(w.get() + 1));
+            if test_hooks::FORCE_UNSUPPORTED.with(std::cell::Cell::get) {
                 return WaitOutcome::Unsupported;
             }
         }
@@ -826,21 +826,38 @@ impl Drop for Notify {
 }
 
 /// Test-only instrumentation of [`Notify::wait`].
+///
+/// The counters and switches are per thread: a test that uses them opens its writer and blocks its reader on its own
+/// thread, and the tests that run beside it in the same process neither add to its counts nor see its switches. (As
+/// process-wide statics, a reader of any other test that blocked meanwhile was counted too.)
 #[cfg(test)]
 pub(crate) mod test_hooks {
+    use std::cell::Cell;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, AtomicU64};
 
-    /// Calls to `Notify::wait`.
-    pub(crate) static WAITS: AtomicU64 = AtomicU64::new(0);
-    /// Makes every wait report `WaitOutcome::Unsupported`.
-    pub(crate) static FORCE_UNSUPPORTED: AtomicBool = AtomicBool::new(false);
-    /// Registrations as a waiter, by `WaitOn` (record words, marker words).
-    pub(crate) static BEGINS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
-    /// Makes `Notify::create` leave the capabilities word 0, as a writer before 1.1 does.
-    pub(crate) static NO_CAPABILITIES: AtomicBool = AtomicBool::new(false);
-    /// Serialises the tests that use these hooks.
+    /// Serialises the tests that use these hooks, which also measure times.
     pub(crate) static LOCK: Mutex<()> = Mutex::new(());
+
+    thread_local! {
+        /// Calls to `Notify::wait` on this thread.
+        pub(crate) static WAITS: Cell<u64> = const { Cell::new(0) };
+        /// Makes every wait on this thread report `WaitOutcome::Unsupported`.
+        pub(crate) static FORCE_UNSUPPORTED: Cell<bool> = const { Cell::new(false) };
+        /// Registrations as a waiter on this thread, by `WaitOn` (record words, marker words).
+        pub(crate) static BEGINS: [Cell<u64>; 2] = const { [Cell::new(0), Cell::new(0)] };
+        /// Makes `Notify::create` on this thread leave the capabilities word 0, as a writer before 1.1 does.
+        pub(crate) static NO_CAPABILITIES: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// `WAITS` of this thread.
+    pub(crate) fn waits() -> u64 {
+        WAITS.with(Cell::get)
+    }
+
+    /// `BEGINS` of this thread: registrations on the record words, and on the marker words.
+    pub(crate) fn begins() -> [u64; 2] {
+        BEGINS.with(|b| [b[0].get(), b[1].get()])
+    }
 
     thread_local! {
         /// The ranges this thread has loaded, or got a view of, through a `MapRo`, while a test records them.

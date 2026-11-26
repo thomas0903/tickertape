@@ -13,6 +13,11 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   layout, and the release checklist runs the replay benchmark against the previous release on both architectures. No
   API or ABI change (`size_of::<Reader>()` is 464 bytes instead of 456). The slowdown seen on an Apple M4 Pro in #85 was
   not measured again.
+- Changed (tests): the seek index tests that create index files for readers give them mode 0644 whatever the umask.
+  Under a umask of 0002 (Ubuntu's for a login whose group has its name, as on the cloud machines of the benchmarks) the
+  files were group-writable, which readers rightly ignore (ADR 0045, step 3), so five tests failed there and passed in
+  CI. A new test runs two of them under umask 0002. The wake-up test hooks (`mmap::test_hooks`) count per thread, so a
+  reader of another test that blocks meanwhile no longer counts as the tested reader's registration. No library change.
 - Docs: what the Linux prefault window adds to a checkpoint is measured (issue #62): `docs/benchmarks.md` → "2026-11-26,
   what prefaulted, unwritten pages add to a checkpoint" (x86-64 and aarch64, ext4 and xfs). `MADV_POPULATE_WRITE` leaves
   the 256 KiB window dirty, so every checkpoint that covers appends writes it as zeros in the active segment's whole-file
