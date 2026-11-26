@@ -70,6 +70,11 @@ lets the reader of every seek use seek indexes):
   seek-sealed-indexed         seek-sealed by a reader that may use a seek index (used_index says whether it did)
 Optional operations:
   retention-delete            plans and deletes the --count oldest segments (shrinks the journal)
+  checkpoint-loop-age|bytes   checkpoint-loop-retention with a limit on age or bytes instead of the count
+  checkpoint-loop-remove-count|age
+                              --count checkpoints that each find one segment to delete: a roll before each, or
+                              the oldest segment's age (its header and the next ones are rewritten for that; one
+                              checkpoint every 0.5 s, and the --count oldest segments are gone afterwards)
   index-refresh               seek_index::build of what is missing or outdated (a run with nothing new to index)
   index-check                 seek_index::check, which reads every segment
   cli-verify|export|stats     the tickertape program given by --cli, as a process: verify, export --format jsonl

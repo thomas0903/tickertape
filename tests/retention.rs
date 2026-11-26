@@ -315,8 +315,45 @@ fn retention_kill_loop_50() {
     let mut rng = Rng::from_env("retention_kill_loop_50");
     let parent = tempfile::tempdir().unwrap();
     let cross_device = second_filesystem(parent.path());
-    let mut removed_total = 0;
+    // How long the first move of a run takes here, renamed and copied: the kills land in four times that after the
+    // archiver is ready, so that they fall before, between and after its removals however loaded the machine is (issue
+    // #73). The slowest of three, in microseconds.
+    let first_move = |copy: bool| {
+        (0..3)
+            .map(|_| {
+                let dir = tempfile::tempdir_in(parent.path()).unwrap();
+                let mut writer = Writer::open(dir.path(), small_config()).unwrap();
+                for _ in 0..12 {
+                    append(&mut writer);
+                }
+                writer.checkpoint().unwrap();
+                drop(writer);
+                let archive =
+                    tempfile::tempdir_in(cross_device.as_ref().map_or(parent.path(), |d| d.path()))
+                        .unwrap();
+                let start = std::time::Instant::now();
+                let plan =
+                    retention::plan(dir.path(), &Policy::default().max_segments(11)).unwrap();
+                if copy {
+                    tickertape::fault::fail_next(tickertape::fault::Point::RetentionRename, 18);
+                }
+                let action = Action::MoveTo(archive.path().into());
+                assert_eq!(
+                    retention::apply(dir.path(), &plan, &action)
+                        .unwrap()
+                        .removed_segments,
+                    1
+                );
+                start.elapsed().as_micros() as u64
+            })
+            .max()
+            .unwrap()
+            .max(100)
+    };
+    let (renamed, copied) = (first_move(false), first_move(true));
+    let (mut removed_total, mut between) = (0, 0);
     for iteration in 0..50 {
+        let removed_before = removed_total;
         let dir = tempfile::tempdir_in(parent.path()).unwrap();
         let mut writer = Writer::open(dir.path(), small_config()).unwrap();
         for _ in 0..12 {
@@ -341,7 +378,8 @@ fn retention_kill_loop_50() {
             .arg(dir.path())
             .arg(archive.path())
             .stdout(Stdio::piped());
-        if cross_device.is_none() && iteration % 2 == 1 {
+        let copy = cross_device.is_some() || iteration % 2 == 1;
+        if cross_device.is_none() && copy {
             command.arg("force-copy");
         }
         let mut child = command.spawn().unwrap();
@@ -349,7 +387,8 @@ fn retention_kill_loop_50() {
         let mut ready = String::new();
         stdout.read_line(&mut ready).unwrap();
         assert_eq!(ready.trim(), "ready");
-        std::thread::sleep(Duration::from_micros(rng.below(5000)));
+        let first = if copy { copied } else { renamed };
+        std::thread::sleep(Duration::from_micros(rng.below(4 * first)));
         child.kill().unwrap();
         child.wait().unwrap();
         for (name, original) in before {
@@ -370,6 +409,10 @@ fn retention_kill_loop_50() {
                 );
             }
         }
+        // A run moves 4, 4 and then 3 of the 12: any other count means the kill came between two removals of one run.
+        if ![0, 4, 8, 11].contains(&(removed_total - removed_before)) {
+            between += 1;
+        }
         assert_eq!(
             Writer::open(dir.path(), small_config()).unwrap().next_seq(),
             12
@@ -382,7 +425,9 @@ fn retention_kill_loop_50() {
         );
     }
     assert!(removed_total > 0, "kills never overlapped a completed move");
-    eprintln!("retention_kill_loop_50: 50 kills, {removed_total} preserved removals");
+    eprintln!(
+        "retention_kill_loop_50: 50 kills, {removed_total} preserved removals, {between} kills inside a run; first move {renamed} µs renamed, {copied} µs copied"
+    );
 }
 
 #[test]

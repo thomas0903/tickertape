@@ -143,7 +143,9 @@ says whether its last seek did). Seek indexes (ADR 0045): `seek-sealed` (the las
 `index-build` (every index anew; `states`, `index_files`, `index_bytes`) and `seek-sealed-indexed`, the last two after
 everything else so that the other operations run without indexes (`--ops unindexed`: all but them), and on request
 `index-refresh` (a build with nothing left to do) and `index-check`. Reader operations run once per reader in
-`--readers safe,mapped` (default safe). Optional operations: `retention-delete` (deletes the `--count` oldest segments), `cli-verify`, `cli-export` and
+`--readers safe,mapped` (default safe). Optional operations: `retention-delete` (deletes the `--count` oldest segments),
+`checkpoint-loop-age` and `checkpoint-loop-bytes` (the checkpoint loop with another limit that removes nothing),
+`checkpoint-loop-remove-count` and `checkpoint-loop-remove-age` (every checkpoint finds one segment to delete), `cli-verify`, `cli-export` and
 `cli-stats` (the program given by `--cli`). `--end <seq>` measures a directory without a checkpoint marker, such as an
 archive, up to that sequence number.
 
@@ -212,7 +214,8 @@ benches/scale-session.sh /mnt/ssd/journals ~/tt-scale-out seeks      # one stage
 measures the same journals with it too: `counts` (10 to 20,000 segments of 1 MiB, an archive of 5,000 of them, retention,
 open files), `many` (100,000 segments of 64 KiB), `sizes` (10 segments of 1 MiB to 1 GiB), `seeks` (the seeks
 without and with seek indexes, and the cost of the indexes), `damage` and `big` (64 GiB in 512 segments of 128 MiB:
-operations, catch-up, an archive of 32 GiB). It writes one JSON file per command, `environment.txt` and `progress.txt`.
+operations, catch-up, an archive of 32 GiB), and, only when named, `retention` (both cores in turn, 25 minutes:
+checkpoints and writer opens with each retention limit, removals). It writes one JSON file per command, `environment.txt` and `progress.txt`.
 
 Check first that `cold_unavailable` is `false`, every cold run has `cache_dropped: true`, and `journal.bytes` of the
 big journal exceeds `ram_bytes`. Then read, per operation and segment count or size: `wall_s` and CPU time (how

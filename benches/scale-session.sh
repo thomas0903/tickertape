@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The recorded tt-scale session (benches/README.md -> "Replay and recovery at scale"): every stage, or the named ones.
 #
-#   benches/scale-session.sh <journal-root> <out-dir> [counts|many|sizes|seeks|damage|big ...]
+#   benches/scale-session.sh <journal-root> <out-dir> [counts|many|sizes|seeks|damage|big|retention ...]
 #
 # <journal-root> is an empty directory on the filesystem under test (about 250 GB free for `big`); <out-dir> receives
 # one JSON file per command, progress.txt and environment.txt. Environment:
@@ -134,6 +134,39 @@ seeks() {
     done
     step "$name-writer-on" "$T" measure --dir "$dir" --ops writer-open-clean,checkpoint-loop-retention --repeats 5 --allow-errors --json
     [ "$1" -ge 1000 ] && step "$name-retention" "$T" measure --dir "$dir" --ops retention-delete --count $(($1 / 10)) --repeats 2 --cold --allow-errors --json
+    rm -rf "${dir:?}"
+  done
+}
+
+# Checkpoints with retention, a writer's open with it, and removing segments (ADR 0051): both cores in turn on one journal
+# per shape, five rounds, the first of the two alternating. Not a default stage; needs TT_SCALE_BASE.
+retention() {
+  local shape name dir round side tool sides
+  for shape in "10000 $MIB" "20000 $MIB" "100000 65536"; do
+    set -- $shape
+    name="retention-$1x$2"; dir="$ROOT/$name"
+    step "$name-build" "$T" build --dir "$dir" --segments "$1" --segment-size "$2" --json
+    step "$name-warmup" "$BASE" measure --dir "$dir" --ops list-segments --json
+    for round in 1 2 3 4 5; do
+      sides="base new"; [ $((round % 2)) = 0 ] && sides="new base"
+      for side in $sides; do
+        tool="$T"; [ "$side" = base ] && tool="$BASE"
+        step "$name-idle-$side-$round" "$tool" measure --dir "$dir" --label "$side" --count 20 --allow-errors --json \
+          --ops retention-plan,checkpoint-loop,checkpoint-loop-retention,checkpoint-loop-age,checkpoint-loop-bytes
+        step "$name-remove-$side-$round" "$tool" measure --dir "$dir" --label "$side" --count 20 --allow-errors --json \
+          --ops checkpoint-loop-remove-count,checkpoint-loop-remove-age
+        step "$name-delete-$side-$round" "$tool" measure --dir "$dir" --label "$side" --count 100 --allow-errors --json \
+          --ops retention-delete
+      done
+    done
+    for round in 1 2 3 4 5; do
+      sides="base new"; [ $((round % 2)) = 0 ] && sides="new base"
+      for side in $sides; do
+        tool="$T"; [ "$side" = base ] && tool="$BASE"
+        step "$name-cold-$side-$round" "$tool" measure --dir "$dir" --label "$side" --count 1 --cold --allow-errors --json \
+          --ops checkpoint-loop,checkpoint-loop-retention,checkpoint-loop-age,checkpoint-loop-bytes
+      done
+    done
     rm -rf "${dir:?}"
   done
 }

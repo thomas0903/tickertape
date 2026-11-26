@@ -5,11 +5,15 @@
 //! A move never replaces a destination file, even an identical copy left by an interrupted move. Resolve that
 //! conflict before retrying, or use a fresh destination. Destination directories must already exist.
 //!
+//! What planning reads of a journal depends on the policy (ADR 0051, [`plan`]): the names of the segments, and the
+//! headers of those the policy has to consider, never every header. A run lists the directory once.
+//!
 //! What is read of a segment before it goes (ADR 0044, crash contract C14): a deletion, and [`plan`], check its header
 //! and its successor's, and that its last non-zero bytes are a valid seal naming the successor, without reading its
 //! records; a move reads the whole segment and validates every record and the seal first, as the copy it leaves must be
 //! a valid segment.
 
+use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::unix::fs::{FileExt, MetadataExt};
@@ -17,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::format::{self, CheckpointSlot, ScanEnd};
+use crate::journal::Listed;
 use crate::{CorruptReason, Error, Result, inspect, journal, mmap};
 
 /// Any configured limit may request removal. No limits means no removal.
@@ -137,37 +142,172 @@ impl Report {
 /// Only a contiguous sealed prefix strictly before a valid checkpoint segment qualifies. Age uses wall clock
 /// time at planning; a nonmonotonic creation clock never allows skipping an ineligible oldest segment.
 ///
-/// Reads every segment's header, and of each candidate the end of the file back to its seal (the bytes after the
-/// seal are zeros): a candidate is sealed when its last non-zero eight bytes are a valid seal naming the next segment.
-/// Its records are not read, so a damaged record inside a sealed candidate does not stop the plan; a move
-/// ([`Action::MoveTo`]) reads and validates the whole segment before moving it. When the end of a candidate is not
-/// such a seal, the whole segment is scanned as before, and the error names what the scan found.
+/// What it reads, besides one listing of the directory, the checkpoint marker and the header of the segment the marker
+/// names (nothing but the listing when the policy has no limit):
+///
+/// - [`Policy::max_segments`]: nothing more while the number of names is within the limit.
+/// - [`Policy::max_bytes`]: the size of every segment file (its metadata), and the header of each file whose size is
+///   not confirmed otherwise: the marker's segment and those after it, and a file whose size is not a segment size or
+///   differs from the size of the one before it. In a journal of one segment size, that is only the newest segments.
+/// - [`Policy::max_age`]: the headers of the oldest segments, up to the first one that is young enough and its
+///   successor, whose creation time says so.
+/// - A combination of limits: what each of them needs.
+///
+/// It considers the segments from the oldest on, stopping at the first that no limit asks to remove (or that is not
+/// before the marker's segment, or is the newest). Of each candidate, a segment it will list, it reads the header, the
+/// successor's header, and the end of the file back to its seal (the bytes after the seal are zeros): a candidate is
+/// sealed when its last non-zero eight bytes are a valid seal naming the next segment. Its records are not read, so a
+/// damaged record inside a sealed candidate does not stop the plan; a move ([`Action::MoveTo`]) reads and validates the
+/// whole segment before moving it. When the end of a candidate is not such a seal, the whole segment is scanned as
+/// before, and the error names what the scan found.
+///
+/// So an invalid header, or a file that cannot be opened, is an error when it belongs to a candidate, to a candidate's
+/// successor, to the marker's segment, (with `max_age`) to the first segment that is young enough or its successor, or
+/// (with `max_bytes`) to a file whose header it reads as above, or whose metadata cannot be read. Other segments are not
+/// opened, and damage in them does not stop retention (ADR 0051; up to 1.0 this read every header and failed for any
+/// invalid one): run [`inspect::verify`] to find it. Where there is more than one such error, it is the one of the
+/// oldest segment among those read.
 ///
 /// # Errors
 ///
 /// [`Error::NotFound`] for an empty journal; [`Error::Corrupt`] or [`Error::UnsupportedVersion`] for an invalid
-/// header, checkpoint position, or candidate seal or chain; [`Error::Io`] for filesystem errors, including concurrent
+/// header of a segment it reads (above), an invalid checkpoint position, or a candidate's invalid seal or chain; [`Error::Io`] for filesystem errors, including concurrent
 /// changes while observing the directory. An absent/invalid checkpoint slot yields an empty plan.
 pub fn plan(dir: impl AsRef<Path>, policy: &Policy) -> Result<Plan> {
-    plan_at(dir.as_ref(), policy, crate::clock::realtime_ns(), &|_| {
-        false
-    })
+    plan_at(
+        dir.as_ref(),
+        policy,
+        crate::clock::realtime_ns(),
+        &|_| false,
+        &mut Sizes::default(),
+    )
 }
 
-/// [`plan`] for the writer's retention run on its checkpoint thread: once at least one segment is planned, planning
-/// stops as soon as `stop(planned)` returns true for the number of segments planned so far (ADR 0044).
-pub(crate) fn plan_until(
+/// The sizes of the segment files a writer's last retention run saw, kept for [`Policy::max_bytes`] so that each run asks
+/// only for the files it has not seen (ADR 0051).
+///
+/// A size is used only while the run's own listing shows the same name with the same inode number, as a regular file.
+/// A file the listing no longer shows is forgotten, whoever removed it, so another process's retention or archive cannot
+/// make a size stale, and a recovery, the only thing that replaces a segment, needs the lock the writer holds. A segment
+/// file is never resized (`docs/format.md` → Segment file). **The exception:** a file changed without a new inode number
+/// (written over in place, or removed and created again where the file system gives the new file the old number, as ext4
+/// and xfs do) keeps its old size here until the segment is removed or the writer opens again. That is outside what a
+/// journal allows (`docs/operations.md`: segment files are not edited); the sum is then off by the difference in size,
+/// which only shifts which segments the limit asks to remove (nothing that protects a segment from removal uses a size),
+/// and the segment's header is checked when the plan reaches it.
+#[derive(Debug, Default)]
+pub(crate) struct Sizes {
+    /// (base, inode, size, header checked against that size), by base.
+    known: Vec<(u64, u64, u64, bool)>,
+}
+
+impl Sizes {
+    /// The size of each listed segment file, its metadata asked for once.
+    ///
+    /// So that a file whose length is not its header's size cannot make the limit remove more than the headers allow,
+    /// the header of a file is read and checked against its length, once, when the file is the marker's segment or after
+    /// it (`marker`), when its length is not a valid segment size, or when its length differs from the one before it.
+    /// Every length summed is then one a header confirms, or equals the length before it: in a journal of one segment
+    /// size, only the newest segments are read.
+    ///
+    /// On an error, the place of the segment and the error: the error opening the segment gives, where its metadata
+    /// cannot be read (the same as when every header was read).
+    fn of(
+        &mut self,
+        dir: &Path,
+        listed: &[Listed],
+        marker: u64,
+    ) -> std::result::Result<Vec<u64>, (usize, Error)> {
+        let mut known = self.known.iter().peekable();
+        let mut sizes: Vec<u64> = Vec::with_capacity(listed.len());
+        let mut keep = Vec::with_capacity(listed.len());
+        for (i, segment) in listed.iter().enumerate() {
+            while known.next_if(|(base, ..)| *base < segment.base).is_some() {}
+            let seen = known
+                .next_if(|(base, ..)| *base == segment.base)
+                .filter(|(_, inode, ..)| Some(*inode) == segment.inode);
+            let (size, mut checked) = match seen {
+                Some((_, _, size, checked)) => (*size, *checked),
+                None => {
+                    let path = journal::segment_path(dir, segment.base);
+                    crate::fault::note_access(crate::fault::Access::StatSegment);
+                    match fs::metadata(&path) {
+                        Ok(meta) => (meta.len(), false),
+                        Err(e) => {
+                            let error = match open_header(dir, segment.base) {
+                                Err(opening) => opening,
+                                Ok(_) => Error::io("stat segment", &path, e),
+                            };
+                            return Err((i, error));
+                        }
+                    }
+                }
+            };
+            let differs = i.checked_sub(1).is_some_and(|before| sizes[before] != size);
+            if !checked
+                && (segment.base >= marker
+                    || format::validate_segment_size(size).is_err()
+                    || differs)
+            {
+                open_header(dir, segment.base).map_err(|e| (i, e))?;
+                checked = true;
+            }
+            sizes.push(size);
+            if let Some(inode) = segment.inode {
+                keep.push((segment.base, inode, size, checked));
+            }
+        }
+        self.known = keep;
+        Ok(sizes)
+    }
+}
+
+/// Plans and applies one retention run of the writer itself. With `stop` (the checkpoint thread), once at least one
+/// segment is planned, planning and removing stop as soon as `stop(segments)` returns true for the number planned or
+/// handled so far (ADR 0044).
+///
+/// The writer runs retention only after its own marker is durable, so the marker is not synced again here. The plan's
+/// own listing serves the removals ([`Known`]): a run lists the directory once.
+pub(crate) fn run(
     dir: &Path,
     policy: &Policy,
-    stop: &dyn Fn(usize) -> bool,
-) -> Result<Plan> {
-    plan_at(dir, policy, crate::clock::realtime_ns(), stop)
+    action: &Action,
+    report: &mut Report,
+    sizes: &mut Sizes,
+    stop: Option<&dyn Fn(usize) -> bool>,
+) -> Result<()> {
+    let now = crate::clock::realtime_ns();
+    let plan = plan_at(dir, policy, now, stop.unwrap_or(&|_| false), sizes)?;
+    let known = Known::from_plan(&plan);
+    apply_into(dir, &plan, action, report, known, false, stop)
 }
 
-fn plan_at(dir: &Path, policy: &Policy, now: u64, stop: &dyn Fn(usize) -> bool) -> Result<Plan> {
+/// The segment at `base`, opened and its header validated, with the identity of the file.
+fn open_header(dir: &Path, base: u64) -> Result<(format::SegmentHeader, journal::Identity)> {
+    let path = journal::segment_path(dir, base);
+    let file = open_segment("open segment", &path)?;
+    Ok((
+        journal::read_header(&file, &path, base)?,
+        journal::file_identity(&file, &path)?,
+    ))
+}
+
+fn open_segment(op: &'static str, path: &Path) -> Result<File> {
+    crate::fault::note_access(crate::fault::Access::OpenSegment);
+    File::open(path).map_err(|e| Error::io(op, path, e))
+}
+
+/// [`plan`] at the time `now`. Each step reads only what the limits need to decide it.
+fn plan_at(
+    dir: &Path,
+    policy: &Policy,
+    now: u64,
+    stop: &dyn Fn(usize) -> bool,
+    sizes: &mut Sizes,
+) -> Result<Plan> {
     let directory = directory_identity(dir)?;
-    let paths = journal::list_segments(dir)?;
-    if paths.is_empty() {
+    let listed = journal::list_bases(dir)?;
+    if listed.is_empty() {
         return Err(Error::NotFound { dir: dir.into() });
     }
     let mut plan = Plan {
@@ -180,44 +320,69 @@ fn plan_at(dir: &Path, policy: &Policy, now: u64, stop: &dyn Fn(usize) -> bool) 
     let Some(checkpoint) = checkpoint(dir)? else {
         return Ok(plan);
     };
-    let headers = paths
-        .iter()
-        .map(|(base, path)| {
-            let file = File::open(path).map_err(|e| Error::io("open segment", path, e))?;
-            Ok((
-                journal::read_header(&file, path, *base)?,
-                journal::file_identity(&file, path)?,
-            ))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let mut count = paths.len();
-    let mut bytes: u128 = headers
-        .iter()
-        .map(|(h, _)| u128::from(h.segment_size))
-        .sum();
-    for (i, (base, path)) in paths.iter().enumerate() {
-        if *base >= checkpoint.segment_base_seq || i + 1 == paths.len() {
+    let mut count = listed.len();
+    let sizes = match policy.max_bytes {
+        Some(_) => match sizes.of(dir, &listed, checkpoint.segment_base_seq) {
+            Ok(sizes) => sizes,
+            // The error of the oldest invalid header before it, if there is one, as when every header was read.
+            Err((place, error)) => {
+                for segment in &listed[..place] {
+                    open_header(dir, segment.base)?;
+                }
+                return Err(error);
+            }
+        },
+        None => Vec::new(),
+    };
+    let mut bytes: u128 = sizes.iter().map(|s| u128::from(*s)).sum();
+    // 1. The candidates and their headers. A header is read only if a limit asks to remove the segment, or may do so by
+    // age. Headers come before seals, so that a damaged header is reported before a damaged seal.
+    let mut header = None;
+    for (i, pair) in listed.windows(2).enumerate() {
+        let (base, successor) = (pair[0].base, pair[1].base);
+        if base >= checkpoint.segment_base_seq
+            || (policy.max_age.is_none() && reasons(policy, count, bytes, now, now).is_empty())
+        {
             break;
         }
-        let (header, identity) = headers[i];
-        let sealed = headers[i + 1].0.created_unix_ns;
+        let (head, identity) = match header.take() {
+            Some(read) => read,
+            None => open_header(dir, base)?,
+        };
+        let next = open_header(dir, successor)?;
+        let sealed = next.0.created_unix_ns;
         let reasons = reasons(policy, count, bytes, now, sealed);
         if reasons.is_empty() || (!plan.segments.is_empty() && stop(plan.segments.len())) {
             break;
         }
-        let file = File::open(path).map_err(|e| Error::io("open segment", path, e))?;
-        check_seal(&file, path, header.segment_size, *base, paths[i + 1].0)?;
         plan.segments.push(PlannedSegment {
-            path: path.clone(),
-            base_seq: *base,
-            size_bytes: header.segment_size,
+            path: journal::segment_path(dir, base),
+            base_seq: base,
+            size_bytes: head.segment_size,
             sealed_unix_ns: sealed,
             reasons,
             identity,
-            successor: paths[i + 1].0,
+            successor,
         });
+        header = Some(next);
         count -= 1;
-        bytes -= u128::from(header.segment_size);
+        bytes -= u128::from(sizes.get(i).copied().unwrap_or(0));
+    }
+    // 2. Their seals.
+    for i in 0..plan.segments.len() {
+        if i > 0 && stop(i) {
+            plan.segments.truncate(i);
+            break;
+        }
+        let segment = &plan.segments[i];
+        let file = open_segment("open segment", &segment.path)?;
+        check_seal(
+            &file,
+            &segment.path,
+            segment.size_bytes,
+            segment.base_seq,
+            segment.successor,
+        )?;
     }
     Ok(plan)
 }
@@ -243,7 +408,10 @@ fn reasons(policy: &Policy, count: usize, bytes: u128, now: u64, sealed: u64) ->
 ///
 /// Before each removal: the segment is the oldest in the journal and still the file planned (same identity), its
 /// header and its successor's are valid, the successor is the next segment in the journal, and the segment is
-/// strictly older than the checkpoint segment. [`Action::Delete`] then checks the seal as [`plan`] does, without
+/// strictly older than the checkpoint segment. Which segment is the oldest, and which is next, comes from a listing taken
+/// when this starts and kept up to date with its own removals (ADR 0051 says why that is enough). The directory is listed
+/// again, before anything else is removed, when a segment is missing, when a check fails, or when a segment removed
+/// before is back (ADR 0051). Do not put segment files back into the journal while this runs. [`Action::Delete`] then checks the seal as [`plan`] does, without
 /// reading the records it discards; [`Action::MoveTo`] reads the whole segment and validates every record and the seal
 /// naming the successor, so that only a valid segment is moved.
 ///
@@ -263,8 +431,63 @@ fn reasons(policy: &Policy, count: usize, bytes: u128, now: u64, sealed: u64) ->
 /// A missing source counts as already removed only when no older segment remains.
 pub fn apply(dir: impl AsRef<Path>, plan: &Plan, action: &Action) -> Result<Report> {
     let mut report = Report::default();
-    apply_into(dir.as_ref(), plan, action, &mut report, true, None)?;
+    apply_into(
+        dir.as_ref(),
+        plan,
+        action,
+        &mut report,
+        Known::default(),
+        true,
+        None,
+    )?;
     Ok(report)
+}
+
+/// What a run knows of the oldest segments: their bases in order, from its last listing, without those it has removed
+/// since. Empty: it has to list the directory.
+///
+/// Why this replaces a listing before each removal (ADR 0051). While a valid marker is in place, the bases before its
+/// segment only disappear: a writer creates segments only after the newest one, a recovery from that marker only from
+/// the marker's segment on, and archivers only remove. So a segment that was the oldest in a listing, or became it
+/// because every older one is gone, is the oldest for as long as it exists, and no segment appears between it and the
+/// one listed next. A recovery without a valid marker starts at the oldest segment and can replace and create segments
+/// before the old marker's segment, but: no removal happens while the marker is invalid (it is read before each one); a
+/// segment it replaced fails the identity check; and a segment it creates is the successor that a seal names, so it is
+/// never in front of the oldest segment, and never between a segment and the successor that segment's seal names, which
+/// every removal requires to be the planned one. Whether the segment and its successor still exist is checked by opening
+/// both before each removal.
+#[derive(Debug, Default)]
+struct Known(VecDeque<u64>);
+
+impl Known {
+    /// What the listing the plan was made from shows of its segments.
+    fn from_plan(plan: &Plan) -> Known {
+        let bases = plan.segments.iter().map(|s| s.base_seq);
+        Known(
+            bases
+                .chain(plan.segments.last().map(|s| s.successor))
+                .collect(),
+        )
+    }
+
+    fn list(dir: &Path) -> Result<Known> {
+        Ok(Known(
+            journal::list_bases(dir)?.iter().map(|s| s.base).collect(),
+        ))
+    }
+
+    /// `base` is gone, and everything older.
+    fn already_removed(&self, base: u64) -> bool {
+        self.0.front().is_some_and(|oldest| base < *oldest)
+    }
+
+    fn is_oldest(&self, base: u64) -> bool {
+        self.0.front() == Some(&base)
+    }
+
+    fn is_next(&self, successor: u64) -> bool {
+        self.0.get(1) == Some(&successor)
+    }
 }
 
 /// `external` is true for a caller other than the writer itself (which runs retention only after its own marker is
@@ -274,11 +497,14 @@ pub fn apply(dir: impl AsRef<Path>, plan: &Plan, action: &Action) -> Result<Repo
 /// ends before the next one once `stop(handled)` returns true for the number of planned segments handled so far (a
 /// checkpoint is waiting and the run has removed what the checkpoint before it covered, or the writer is closing;
 /// ADR 0044). The rest of the plan is left for the next run, which plans again.
-pub(crate) fn apply_into(
+///
+/// `known` is what the caller already knows of the oldest segments, empty to list them first.
+fn apply_into(
     dir: &Path,
     plan: &Plan,
     action: &Action,
     report: &mut Report,
+    mut known: Known,
     external: bool,
     stop: Option<&dyn Fn(usize) -> bool>,
 ) -> Result<()> {
@@ -295,96 +521,51 @@ pub(crate) fn apply_into(
             }
             crate::fault::hold_point(crate::fault::Point::RetentionRemove);
         }
-        let paths = journal::list_segments(dir)?;
+        crate::fault::hook(crate::fault::Point::RetentionRemove);
         // A missing file is harmless only if the entire older prefix has also gone.
-        if already_removed(&paths, segment.base_seq) {
+        let mut listed = false;
+        if !known.already_removed(segment.base_seq)
+            && (!known.is_oldest(segment.base_seq)
+                || !known.is_next(segment.successor)
+                || (i > 0 && is_back(&plan.segments[i - 1].path)))
+        {
+            known = Known::list(dir)?;
+            listed = true;
+        }
+        let mut checked = check(dir, segment, action, external, &mut synced, &known);
+        // What a check found is judged by a listing taken after it, unless one was taken just before it (but a missing
+        // file is judged again even then: a concurrent archiver may have removed the segment in between). A marker that
+        // could not be synced is reported as it is and nothing is tried after it: a later sync could succeed without
+        // having written anything.
+        if let Err(failed) = checked {
+            checked = if failed.marker_io || (listed && !failed.is_missing()) {
+                Err(failed)
+            } else {
+                known = Known::list(dir)?;
+                failed.judged_by(&known, dir, segment)
+            };
+        }
+        let Some(file) = checked.map_err(|failed| failed.error)? else {
             report.already_removed_segments = report.already_removed_segments.saturating_add(1);
             continue;
-        }
-        if paths.first().map(|(base, _)| *base) != Some(segment.base_seq) {
-            return Err(Error::corrupt(
-                journal::segment_path(dir, segment.base_seq),
-                0,
-                CorruptReason::BrokenChain(segment.base_seq),
-            ));
-        }
-        let marker = if external {
-            durable_checkpoint(dir, &mut synced)?
-        } else {
-            checkpoint(dir)?
         };
-        let Some(marker) = marker else {
-            return Err(Error::InvalidConfig(
-                "retention requires a valid checkpoint".into(),
-            ));
-        };
-        if segment.base_seq >= marker.segment_base_seq {
-            return Err(Error::InvalidConfig(
-                "planned segment is no longer older than the checkpoint".into(),
-            ));
-        }
-        let path = journal::segment_path(dir, segment.base_seq);
+        crate::fault::hook(crate::fault::Point::RetentionChecked);
         let mut removed = false;
-        let result = (|| {
-            let file =
-                File::open(&path).map_err(|e| Error::io("open retention segment", &path, e))?;
-            if journal::file_identity(&file, &path)? != segment.identity {
-                return Err(Error::InvalidConfig(
-                    "planned segment has been replaced".into(),
-                ));
-            }
-            let header = journal::read_header(&file, &path, segment.base_seq)?;
-            // Check the expected successor before any destructive operation; a missing middle is never tolerated.
-            let successor = journal::segment_path(dir, segment.successor);
-            if paths.get(1).map(|(base, _)| *base) != Some(segment.successor) {
-                return Err(Error::corrupt(
-                    &path,
-                    0,
-                    CorruptReason::BrokenChain(segment.successor),
-                ));
-            }
-            let next = File::open(&successor)
-                .map_err(|e| Error::io("open retention successor", &successor, e))?;
-            journal::read_header(&next, &successor, segment.successor)?;
-            match action {
-                Action::Delete => check_seal(
-                    &file,
-                    &path,
-                    header.segment_size,
-                    segment.base_seq,
-                    segment.successor,
-                )?,
-                Action::MoveTo(_) => {
-                    check_records(&file, &path, segment.base_seq, segment.successor)?
-                }
-            }
-            match action {
-                Action::Delete => {
-                    fs::remove_file(&path)
-                        .map_err(|e| Error::io("delete retention segment", &path, e))?;
-                    removed = true;
-                }
-                Action::MoveTo(dest) => move_segment(&path, dest, &file, &mut removed)?,
-            }
-            journal::sync_dir(dir)?;
-            mmap::full_barrier(&file)
-                .map_err(|e| Error::io("full sync retention segment", &path, e))?;
-            // Its seek index, best effort (ADR 0045): a leftover is harmless, and the writer's next open removes it.
-            crate::seek_index::dir::remove_index(dir, segment.base_seq);
-            Ok(())
-        })();
+        let result = remove(dir, &file, segment, action, &mut removed);
         // Count the unlink/rename even if a subsequent sync fails.
         if removed {
             report.removed_segments = report.removed_segments.saturating_add(1);
             report.removed_bytes = report.removed_bytes.saturating_add(segment.size_bytes);
+            known.0.pop_front();
         }
         if let Err(error) = result {
-            if !removed
-                && matches!(&error, Error::Io { source, .. } if source.kind() == io::ErrorKind::NotFound)
-                && already_removed(&journal::list_segments(dir)?, segment.base_seq)
-            {
-                report.already_removed_segments = report.already_removed_segments.saturating_add(1);
-                continue;
+            if !removed && is_missing(&error) {
+                known = Known::list(dir)?;
+                if known.already_removed(segment.base_seq) {
+                    report.already_removed_segments =
+                        report.already_removed_segments.saturating_add(1);
+                    continue;
+                }
             }
             return Err(error);
         }
@@ -392,8 +573,174 @@ pub(crate) fn apply_into(
     Ok(())
 }
 
-fn already_removed(paths: &[(u64, PathBuf)], base: u64) -> bool {
-    paths.first().is_some_and(|(oldest, _)| base < *oldest)
+/// Whether a segment removed earlier in the run is there again (or whether it is cannot be told).
+fn is_back(path: &Path) -> bool {
+    crate::fault::note_access(crate::fault::Access::StatSegment);
+    !matches!(fs::symlink_metadata(path), Err(e) if e.kind() == io::ErrorKind::NotFound)
+}
+
+fn is_missing(error: &Error) -> bool {
+    matches!(error, Error::Io { source, .. } if source.kind() == io::ErrorKind::NotFound)
+}
+
+/// Whether `segment` is still there and the oldest one: false if it and everything older is gone (removed by a
+/// concurrent archiver), an error if an older segment is there.
+fn check_oldest(dir: &Path, known: &Known, segment: &PlannedSegment) -> Result<bool> {
+    if known.already_removed(segment.base_seq) {
+        return Ok(false);
+    }
+    if !known.is_oldest(segment.base_seq) {
+        return Err(Error::corrupt(
+            journal::segment_path(dir, segment.base_seq),
+            0,
+            CorruptReason::BrokenChain(segment.base_seq),
+        ));
+    }
+    Ok(true)
+}
+
+/// A check that failed before a removal.
+struct Failed {
+    error: Error,
+    /// The check of the successor's place or a later one.
+    at_successor: bool,
+    /// The marker could not be read or made durable.
+    marker_io: bool,
+}
+
+/// What [`check`] found: the open file of the segment to remove, or `None` if it and everything older is gone.
+type Checked = std::result::Result<Option<File>, Failed>;
+
+impl Failed {
+    fn new(error: Error) -> Failed {
+        Failed {
+            error,
+            at_successor: false,
+            marker_io: false,
+        }
+    }
+
+    fn at_successor(error: Error) -> Failed {
+        Failed {
+            at_successor: true,
+            ..Failed::new(error)
+        }
+    }
+
+    fn is_missing(&self) -> bool {
+        is_missing(&self.error)
+    }
+
+    /// The same failure in the light of a listing taken after it.
+    fn judged_by(self, known: &Known, dir: &Path, segment: &PlannedSegment) -> Checked {
+        if !check_oldest(dir, known, segment).map_err(Failed::new)? {
+            return Ok(None);
+        }
+        if self.at_successor {
+            check_next(dir, known, segment)?;
+        }
+        Err(self)
+    }
+}
+
+/// Whether the successor is the next segment after this one.
+fn check_next(
+    dir: &Path,
+    known: &Known,
+    segment: &PlannedSegment,
+) -> std::result::Result<(), Failed> {
+    if known.is_next(segment.successor) {
+        return Ok(());
+    }
+    Err(Failed::at_successor(Error::corrupt(
+        journal::segment_path(dir, segment.base_seq),
+        0,
+        CorruptReason::BrokenChain(segment.successor),
+    )))
+}
+
+/// Every check of a removal (crash contract C14): the segment is the oldest, the marker is valid and names a later one,
+/// the file is the one planned, its header and the successor's are valid, the successor is next, and the seal or (for a
+/// move) every record is valid. Removes nothing.
+fn check(
+    dir: &Path,
+    segment: &PlannedSegment,
+    action: &Action,
+    external: bool,
+    synced: &mut Option<CheckpointSlot>,
+    known: &Known,
+) -> Checked {
+    if !check_oldest(dir, known, segment).map_err(Failed::new)? {
+        return Ok(None);
+    }
+    let marker = if external {
+        durable_checkpoint(dir, synced).map_err(|error| Failed {
+            marker_io: matches!(error, Error::Io { .. }),
+            ..Failed::new(error)
+        })?
+    } else {
+        checkpoint(dir).map_err(Failed::new)?
+    };
+    let Some(marker) = marker else {
+        return Err(Failed::new(Error::InvalidConfig(
+            "retention requires a valid checkpoint".into(),
+        )));
+    };
+    if segment.base_seq >= marker.segment_base_seq {
+        return Err(Failed::new(Error::InvalidConfig(
+            "planned segment is no longer older than the checkpoint".into(),
+        )));
+    }
+    let path = journal::segment_path(dir, segment.base_seq);
+    let file = open_segment("open retention segment", &path).map_err(Failed::new)?;
+    if journal::file_identity(&file, &path).map_err(Failed::new)? != segment.identity {
+        return Err(Failed::new(Error::InvalidConfig(
+            "planned segment has been replaced".into(),
+        )));
+    }
+    let header = journal::read_header(&file, &path, segment.base_seq).map_err(Failed::new)?;
+    // Check the expected successor before any destructive operation; a missing middle is never tolerated.
+    check_next(dir, known, segment)?;
+    let successor = journal::segment_path(dir, segment.successor);
+    let next =
+        open_segment("open retention successor", &successor).map_err(Failed::at_successor)?;
+    journal::read_header(&next, &successor, segment.successor).map_err(Failed::at_successor)?;
+    match action {
+        Action::Delete => check_seal(
+            &file,
+            &path,
+            header.segment_size,
+            segment.base_seq,
+            segment.successor,
+        ),
+        Action::MoveTo(_) => check_records(&file, &path, segment.base_seq, segment.successor),
+    }
+    .map_err(Failed::at_successor)?;
+    Ok(Some(file))
+}
+
+/// Removes a segment that passed every check, and makes the removal durable. `removed` is set once its name is gone
+/// from the journal, also if a later step fails.
+fn remove(
+    dir: &Path,
+    file: &File,
+    segment: &PlannedSegment,
+    action: &Action,
+    removed: &mut bool,
+) -> Result<()> {
+    let path = journal::segment_path(dir, segment.base_seq);
+    match action {
+        Action::Delete => {
+            fs::remove_file(&path).map_err(|e| Error::io("delete retention segment", &path, e))?;
+            *removed = true;
+        }
+        Action::MoveTo(dest) => move_segment(&path, dest, file, removed)?,
+    }
+    journal::sync_dir(dir)?;
+    mmap::full_barrier(file).map_err(|e| Error::io("full sync retention segment", &path, e))?;
+    // Its seek index, best effort (ADR 0045): a leftover is harmless, and the writer's next open removes it.
+    crate::seek_index::dir::remove_index(dir, segment.base_seq);
+    Ok(())
 }
 
 fn directory_identity(dir: &Path) -> Result<journal::Identity> {
@@ -432,6 +779,7 @@ pub(crate) fn checkpoint(dir: &Path) -> Result<Option<CheckpointSlot>> {
     };
     crate::fault::hook(crate::fault::Point::MarkerRead);
     let path = journal::segment_path(dir, slot.segment_base_seq);
+    crate::fault::note_access(crate::fault::Access::OpenSegment);
     let file = match File::open(&path) {
         Ok(file) => file,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -583,6 +931,9 @@ fn sync_destination(dest: &Path) -> Result<()> {
         .map_err(|e| Error::io("sync archive directory", dest, e))?;
     journal::sync_dir(dest)
 }
+
+#[cfg(test)]
+mod planning_tests;
 
 #[cfg(test)]
 mod tests {
