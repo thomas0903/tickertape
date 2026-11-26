@@ -181,8 +181,15 @@ released with seven items open, accepted by the owner as known gaps
     a bounded number of open segments between checkpoints (#38), `RecoveryPolicy::Fail` holding back the changes from
     the first header it would restore until the open can no longer refuse (#35), and exposed through the C ABI, C++,
     Python, Java and the iceoryx2 recorder (#39).
-  - Missing: the measurement of how much prefaulted, unwritten data adds to a checkpoint, and any macOS result. The
-    Linux results of ADR 0038 and before/after checkpoint and durable-only reader latency are recorded in
+  - Linux measured on 2026-11-26 (issue #62; `docs/benchmarks.md` → "what prefaulted, unwritten pages add to a
+    checkpoint", x86-64 and aarch64, ext4 and xfs): the `MADV_POPULATE_WRITE` window is dirty, so every checkpoint
+    that covers appends writes its 256 KiB of zeros, in the whole-file `fdatasync` after the ranged `msync` (156–429
+    µs), and the blocking checkpoint's median rose from 0.35–0.52 to 0.50–0.73 ms on aarch64. It also write-protects
+    the window, so the writer faults it in again (33–36 faults per checkpoint). An idle writer pays once. Syncing the
+    active segment by its ranged `msync` alone removed both costs in an experiment; it changes the crash contract's
+    barrier step and is not built.
+  - Missing: any macOS result; a drive with a volatile write cache; background checkpoints with the window. The Linux
+    results of ADR 0038 and before/after checkpoint and durable-only reader latency are recorded in
     `docs/benchmarks.md` (2026-11-19 to 2026-11-22).
 - [x] **Finish eliminating avoidable work.** (done 2026-11-26: the profiles, issue #62)
   - Profile append, both readers, notification and serialization paths under the sustained workloads; document
@@ -318,8 +325,9 @@ where a line says it is closed:
 - **Mapped reader:** closed on 2026-11-25. The publication-frontier follow-up had no ADR; it has
   [0048](decisions/0048-publication-frontier.md) (the marker bound it decides is built). The limitation it narrows is part of
   the 1.0 contract ([`compatibility.md`](compatibility.md); `crash-contract.md` → Readers, the writer and memory safety).
-- **Cheaper checkpoints:** how much prefaulted, unwritten data adds to a checkpoint is not measured, and there is no
-  macOS result.
+- **Cheaper checkpoints:** how much prefaulted, unwritten data adds to a checkpoint is measured on Linux since
+  (2026-11-26, [`benchmarks.md`](benchmarks.md)): the 256 KiB window is written as zeros by every checkpoint that
+  covers appends, 0.16–0.43 ms of the checkpoint. There is still no macOS result.
 - **Avoidable work:** the profiles of the readers, notification and serialization paths were not documented; done
   since for v1.0.0 ([above](#next-release-sustained-performance), `docs/benchmarks.md` 2026-11-25); the durable-only
   reader has not been profiled since #66.

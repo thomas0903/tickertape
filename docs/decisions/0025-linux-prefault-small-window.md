@@ -97,3 +97,17 @@ can wait for the journal to commit; with early write-back the measured blocking 
 v0.4.0 (`docs/benchmarks.md` → "2026-11-02, v0.4.0 on bare-metal Linux"), the zero-copy reader's p99.9 at 1,024 B on
 ext4 was worse with prefaulting on (110–243 µs) than off (97–122 µs), while p99 was better (2.1–2.2 µs against 31 µs).
 This is open and unexplained.
+
+## Note (2026-11-26): what the window costs a checkpoint
+
+The decision does not say what a checkpoint pays for the window. Measured since (`docs/benchmarks.md` → "2026-11-26,
+what prefaulted, unwritten pages add to a checkpoint"; Google Cloud VMs, x86-64 and aarch64, ext4 and xfs, a blocking
+checkpoint every second): `MADV_POPULATE_WRITE` leaves the window's pages dirty, so every checkpoint that covers appends
+writes the 256 KiB of zeros to the device, in the whole-file `fdatasync` after the ranged `msync`. That call took
+156–429 µs (median per cell) instead of 2–4 µs, the checkpoint's median rose from 0.35–0.52 to 0.50–0.73 ms on aarch64,
+and writing the window back write-protected it, so the writer took 33–36 more page faults per checkpoint. At 20,000
+records/s of 64 B, with a checkpoint every 2 MB, the writer then took 1,307–1,358 faults against 1,435–1,491 with
+prefaulting off: frequent checkpoints undo most of what the window saves in faults, though appends stayed shorter with
+it. An idle writer pays once. The cost grows with the window: a 4 MiB window (an experiment-only switch) wrote 4.1 MiB and
+took 2.7–7.5 ms per checkpoint; the 8 MiB window measured above was not run for this. The decision stands; the
+measurement is recorded here.

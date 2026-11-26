@@ -52,7 +52,10 @@ With `WriterConfig::prefault(true)` (the default), the writer moves segment work
 - **Page faults (Linux and macOS).** A helper thread, `tickertape-prefault`, keeps the pages just ahead of the write
   position faulted in, so `append` rarely waits for a page fault.
   - **Linux:** the next 256 KiB, with `MADV_POPULATE_WRITE` (ADR 0025; kernels before 5.14 stop the helper on first
-    use).
+    use). The advice leaves those pages dirty, so every checkpoint that covers appends also writes the 256 KiB of
+    zeros ahead of the writer: 0.16–0.43 ms more per checkpoint in the recorded runs, and about 35 page faults for the
+    writer afterwards, because writing the pages back write-protects them (`docs/benchmarks.md` → "2026-11-26, what
+    prefaulted, unwritten pages add to a checkpoint"). An idle writer pays it once.
   - **macOS:** the next 8 MiB, with `MADV_WILLNEED` (ADR 0020). On APFS, writing into a preallocated segment otherwise
     faults once per 16 KiB page, slowly.
 - **The next segment** (`WriterConfig::spare_segment`; on by default on macOS, **off on Linux**, from 1.1). Once the
