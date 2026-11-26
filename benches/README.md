@@ -449,6 +449,13 @@ stops the current run and kills its processes. Matrices:
 Scenario definitions are in `python3 benches/session.py --help`. Rates derive from the tickertape probe of the same
 payload, so they adapt to the machine; the probe's rate and every derived argument are in each run's `result.json`.
 
+## Comparison rerun (issue #57)
+
+`benches/rerun.py` runs the parts of the planned comparison rerun on one machine (`python3 benches/rerun.py --list`
+prints them with estimates); `benches/rerun-vm.sh` drives it on the benchmark VM, including the boot with isolated
+CPUs. The plan, with the matrix, machines, cost and how to start it, is
+[docs/playbooks/rerun-comparison.md](../docs/playbooks/rerun-comparison.md).
+
 ## Recording a run
 
 Follow [the benchmark playbook](../docs/playbooks/run-benchmark.md). Build release
