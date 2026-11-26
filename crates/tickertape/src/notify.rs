@@ -197,6 +197,11 @@ impl Waker {
         }
     }
 
+    /// Whether a region is attached and not taken out (by [`Waker::take`]).
+    pub(crate) fn attached(&self) -> bool {
+        self.current.is_some()
+    }
+
     /// Takes the attached region out (to be put back with [`Waker::put`]), so the reader can borrow itself mutably.
     pub(crate) fn take(&mut self) -> Option<(u64, Notify)> {
         self.current.take()

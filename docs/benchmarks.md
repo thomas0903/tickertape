@@ -19,7 +19,8 @@ zero-copy reader, seek indexes) ran on 2026-11-25 on machines of the same types
 What the writer's latency histograms cost (ADR 0047) is
 [under 2026-11-26](#2026-11-26-what-the-writers-latency-histograms-cost-adr-0047-google-cloud-vms).
 The profiles of v1.0.0's readers, notification and serialization paths (where the CPU time goes, and
-what remains per record) are [under 2026-11-25](#2026-11-25-where-the-cpu-time-goes-profiles-of-the-readers-notification-and-serialization-google-cloud-vms).
+what remains per record) are [under 2026-11-25](#2026-11-25-where-the-cpu-time-goes-profiles-of-the-readers-notification-and-serialization-google-cloud-vms),
+and the before and after of the safe reader's smaller reads at the tail (ADR 0052) [under 2026-11-26](#2026-11-26-the-safe-readers-read-size-at-the-tail-google-cloud-vms-x86-64-and-aarch64).
 Seeks with and without the seek index, at both payloads and with both readers, on `main` after #74, are
 [under 2026-11-26](#2026-11-26-seeks-with-and-without-the-seek-index-google-cloud-vms).
 The investigation of the two aarch64 observations that 1.0.0 left open (the zero-copy reader's 10 ms maximum, the
@@ -2910,9 +2911,11 @@ x86-64 (ranges 160–163 against 167–174) and 48 ns on aarch64, net; the copy 
 | Page faults of the writer at 1,024 B unpaced | Partly avoidable by a larger prefault window; Linux keeps it small on purpose (ADR 0025) |
 | A mutex and a futex wake per 64 KiB for the helpers | Necessary to hand them the position; about one wake per 600 records of 104 B in total |
 
-### Candidate measured and left out: a smaller read at the tail
+### The first candidate for a smaller read at the tail (not merged)
 
-Branch `core/safe-reader-tail-reads` (`751ee43`) makes the safe reader read 4 KiB when it has caught up and grow back to
+What was merged instead, ADR [0052](decisions/0052-safe-reader-tail-reads.md), is measured
+[under 2026-11-26](#2026-11-26-the-safe-readers-read-size-at-the-tail-google-cloud-vms-x86-64-and-aarch64); the ADR
+explains this candidate's losses from its counts. Branch `core/safe-reader-tail-reads` (`751ee43`) makes the safe reader read 4 KiB when it has caught up and grow back to
 64 KiB when a buffer is wholly consumed. Before/after of the release builds, three alternated runs each of 25 s after 5
 s of warm-up, latency in µs from the intended send time, medians over the three runs as base → new (safe reader; late
 sends are sends more than 1 µs late; CPU of the reader thread). Between the three runs of one configuration p50 varied
@@ -2969,11 +2972,9 @@ interleaved variants, 8 rounds, base, a second copy of the base binary, new; med
 
 On x86-64 the second copy of the base differs from the base by −0.0 to +3.6 % (medians of the rounds; −0.3 to +2.0 %
 paired), so the replay is slightly slower there for both readers, also the zero-copy one, whose code the change does not
-touch, beyond what that floor explains in some cases; on aarch64 nothing differs beyond it. **Next step.** Worth
-pursuing, because the p50 and CPU gains are large and the 64 KiB read is confirmed by count, but not as a fixed 4 KiB
-read. Try hysteresis (shrink only after several empty polls, grow on the first fully consumed buffer) with the code of
-the per-record path unchanged, gated on x86-64 p99 at 1.5 million records/s and on replay (the view of the review of
-this change and of the maintainers' agent). Not changed here.
+touch, beyond what that floor explains in some cases; on aarch64 nothing differs beyond it. The view then: worth
+pursuing, but not as a fixed 4 KiB read; with hysteresis and with the code of the per-record path unchanged, gated on
+x86-64 p99 at 1.5 million records/s and on replay. That is ADR 0052.
 
 ## 2026-11-25, roll and journal stalls on Google Cloud VMs (Linux, x86-64 and aarch64)
 
@@ -3205,6 +3206,255 @@ Tracing costs the writer's p99.9 about 0.5 µs (median difference) at steady-90 
 p50, maxima, late sends and the stalls are unchanged within the spread. The tracers' own processes used 3.4–3.5 s of
 CPU per 70-second aarch64 run, 1.4–1.5 s on x86-64. The conclusion it rests on is thereby confirmed untraced: the
 aarch64 stalls occur as often without any probe.
+
+## 2026-11-26, the safe reader's read size at the tail (Google Cloud VMs, x86-64 and aarch64)
+
+Before and after ADR [0052](decisions/0052-safe-reader-tail-reads.md): the safe reader (`Reader::open`) reads 4 KiB
+instead of 64 KiB per fill while it keeps showing that it waits for every record (issue #62; the profiles of
+2026-11-25 above found it copying 64 KiB per record it followed). The tables up to
+["Readers that block"](#readers-that-block-the-rule-added-after-review-x86-64) measure the change without its rule for
+readers that block; that section measures the rule that merged, and an alternative that did not, on x86-64.
+**Google Cloud virtual machines, not bare metal**; nothing here is compared with earlier sections.
+
+### Environment and method
+
+| | x86-64 | aarch64 |
+|---|---|---|
+| Machine | `c4-standard-4-lssd` (us-east1-b): Intel Xeon 6985P-C, 2 cores with 2 threads each, 15 GB | `c4a-standard-4-lssd` (us-east1-b): Google Axion (Neoverse-V2), 4 cores, 16 GB |
+| Time (UTC) | 2026-11-26 00:56–02:52 | 2026-11-26 02:57–04:41 |
+| Kernel, OS | 7.0.0-1017-gcp, Ubuntu 24.04.5 LTS | the same |
+| Filesystem | ext4 (`mkfs.ext4 -E lazy_itable_init=0,lazy_journal_init=0`, mounted `rw,noatime`) on the local NVMe SSD (375 GB), I/O scheduler `none`, write-back sysctls at the defaults | the same |
+| Writer, reader CPU | 0, 1; helper threads unpinned | the same |
+| rustc | 1.100.0 | the same |
+
+Commits: base `e08c364e` (`main` then), new `c7bec958` (the change on that base). Both are kept by the branch
+`core/safe-reader-adaptive-read-measured`; do not delete it. The merged change adds the rule for readers that block,
+measured [below](#readers-that-block-the-rule-added-after-review-x86-64) against a later `main`. Each machine built both from the public repository; the base binaries were copied to a second path to
+give a second copy of the base, the noise floor (identical files, sha256 recorded). Release builds, no frame pointers.
+
+- **Replay**: `taskset -c 1 <replay benchmark binary> --bench records --warm-up-time 0.5 --measurement-time 1` with
+  `TMPDIR` on the SSD, 60 rounds, each round running base, the second copy and new in a rotating order; ms per pass of
+  1,000,000 records of 64 B or 100,000 of 1,024 B. The rounds of one variant differ by up to 40 % on x86-64 (by process
+  and over time, alike for all three), so the comparison is the median of the per-round ratios, beside the same for
+  the second copy of the base. A first session with 10 rounds of the default measurement (5 s) showed the new build
+  1.6–4.2 % slower in paired medians; a session of 60 short rounds of the same builds on the same machine then showed
+  −0.8 to +0.5 % (second copy −0.3 to +0.7 %). Those are an earlier version of this change (`e12a0022`).
+- **Live**: `tt-sustained run --dir /data/j --out … --warmup 3s --duration 9s --checkpoint-every 1s --checkpoint-mode
+  background --retain-bytes 34359738368 --cpus 0,1 --rate R --payload P --readers safe:wait=W` (`--warmup 4s --duration
+  20s` at 1.5 million records/s), 10 rounds, the three variants rotating within each round, `/data/j` removed and
+  `sync` before each run. Latency in µs from the intended send time (coordinated omission: intended timestamps, no
+  skipped sends). Cells: median over the rounds base → new, then the median of the per-round ratios, and the same ratio
+  of the second copy against the base (the floor). "Blocks per record": the reader thread's voluntary context switches
+  per record, each a futex wait. Late sends: sends more than 1 µs late.
+- **Counts**: `benches/diagnostics/profile-sustained.sh DIR counts 4 -- tt-sustained run … --duration 24s --warmup 4s`
+  (`SETTLE=7`, otherwise as above), base then new, one run each: system calls and bytes read of the reader thread
+  (`counts.bt`) and futex wakes of the writer thread over a 4 s window (4.5–4.9 s measured), per record appended.
+
+Raw output (results, series, count files, logs, the environment capture and the scripts) is kept outside the
+repository.
+
+### Replay
+
+x86-64:
+
+| Case | Base | Second copy of base | New | Second copy against base | New against base |
+|---|---|---|---|---|---|
+| safe, 64 B | 38.9 (32.3–50.8) | 38.8 (32.6–45.1) | 38.5 (32.6–48.3) | -0.6 % | -1.3 % (24 of 60 slower) |
+| safe, 1,024 B | 16.4 (11.1–20.5) | 15.2 (11–22.3) | 15.2 (11.1–21.1) | -1.7 % | -0.3 % (28 of 60 slower) |
+| mapped, 64 B | 53.1 (39.2–68.9) | 51.6 (39.9–69.2) | 50.5 (38.8–72.8) | -4.0 % | -4.2 % (17 of 60 slower) |
+| mapped, 1,024 B | 12.4 (9.36–18.4) | 11.8 (9.5–18.9) | 11.8 (9.39–18.8) | -4.1 % | -1.1 % (25 of 60 slower) |
+
+aarch64:
+
+| Case | Base | Second copy of base | New | Second copy against base | New against base |
+|---|---|---|---|---|---|
+| safe, 64 B | 39.3 (38.5–42.9) | 39.1 (38.4–45.3) | 38.9 (38.4–42.4) | -0.4 % | -0.6 % (20 of 60 slower) |
+| safe, 1,024 B | 15.2 (15–15.8) | 15.2 (14.9–15.9) | 15.2 (14.9–15.4) | +0.1 % | -0.2 % (23 of 60 slower) |
+| mapped, 64 B | 37.1 (36.2–40.3) | 37 (36.3–41.9) | 36.4 (36–39.9) | -0.1 % | -1.6 % (7 of 60 slower) |
+| mapped, 1,024 B | 10.5 (10.5–11) | 10.5 (10.5–10.9) | 10.5 (10.4–11) | -0.1 % | -0.2 % (19 of 60 slower) |
+
+Nothing differs beyond the floor on either machine.
+
+### Following live
+
+x86-64:
+
+| Wait | Payload | Records/s | p50 | p99 | p99.9 | CPU of a core | Blocks per record | Late sends |
+|---|---|---|---|---|---|---|---|---|
+| block | 64 B | 20,000 | 14 → 12.1 (-13.9 %; floor -0.1 %) | 19.5 → 15.4 (-17.4 %; floor +0.6 %) | 23 → 19.9 (-14.6 %; floor -0.2 %) | 22 % → 20 % (-10.8 %; floor +4.2 %) | 1.00 → 1.00 (+0.0 %; floor +0.0 %) | 0.02 % → 0.03 % (+15.6 %; floor -6.6 %) |
+| spin | 64 B | 20,000 | 2.07 → 0.759 (-63.3 %; floor +0.1 %) | 2.57 → 1.26 (-51.4 %; floor +0.2 %) | 5.17 → 4.63 (-7.4 %; floor +3.2 %) | 100 % → 100 % (-0.0 %; floor -0.0 %) | 0.00 → 0.00 | 0.03 % → 0.02 % (-21.5 %; floor -2.9 %) |
+| block | 1,024 B | 20,000 | 14.7 → 12.9 (-12.2 %; floor -0.2 %) | 19.7 → 16.6 (-14.8 %; floor -2.7 %) | 27.8 → 24.8 (-13.5 %; floor -3.7 %) | 22 % → 20 % (-12.2 %; floor +0.3 %) | 1.00 → 1.00 (+0.0 %; floor +0.0 %) | 0.09 % → 0.07 % (-12.3 %; floor -22.1 %) |
+| spin | 1,024 B | 20,000 | 2.6 → 1.29 (-50.1 %; floor +0.0 %) | 4.57 → 3.59 (-18.4 %; floor -1.7 %) | 10.5 → 12.3 (-2.5 %; floor +9.3 %) | 100 % → 100 % (-0.0 %; floor -0.0 %) | 0.00 → 0.00 (+0.0 %; floor +0.0 %) | 0.13 % → 0.10 % (-44.7 %; floor -47.2 %) |
+| block | 64 B | 200,000 | 4.02 → 2.93 (-28.0 %; floor -0.2 %) | 7.8 → 7.67 (-0.1 %; floor -0.4 %) | 16.7 → 17.1 (+2.0 %; floor +1.8 %) | 70 % → 62 % (-11.7 %; floor +0.2 %) | 0.56 → 0.76 (+38.5 %; floor +2.4 %) | 0.63 % → 0.64 % (-0.8 %; floor +5.3 %) |
+| spin | 64 B | 200,000 | 2.05 → 0.758 (-62.9 %; floor -0.1 %) | 3.94 → 3.46 (-12.8 %; floor +2.7 %) | 9.52 → 8.22 (-9.2 %; floor +5.6 %) | 100 % → 100 % (-0.0 %; floor +0.0 %) | 0.00 → 0.00 (+0.0 %; floor +0.0 %) | 0.64 % → 0.61 % (-0.6 %; floor +0.5 %) |
+| block | 1,024 B | 200,000 | 4.4 → 3.34 (-24.6 %; floor -0.2 %) | 10.2 → 10.3 (+0.8 %; floor +2.5 %) | 20.9 → 21.6 (+0.9 %; floor +2.2 %) | 75 % → 64 % (-14.1 %; floor -0.2 %) | 0.49 → 0.77 (+59.4 %; floor +0.2 %) | 1.45 % → 1.40 % (-2.2 %; floor -2.6 %) |
+| spin | 1,024 B | 200,000 | 2.57 → 1.3 (-49.9 %; floor +0.0 %) | 7.69 → 5.53 (-31.9 %; floor -4.0 %) | 21.6 → 19.1 (-5.5 %; floor -4.0 %) | 100 % → 100 % (+0.0 %; floor +0.0 %) | 0.00 → 0.00 (-7.9 %; floor -2.5 %) | 1.08 % → 1.06 % (+8.5 %; floor +6.4 %) |
+| block | 64 B | 1,500,000 | 3.1 → 3.11 (-0.0 %; floor +0.0 %) | 11.1 → 10.8 (-1.3 %; floor +0.5 %) | 45.5 → 49.7 (-0.3 %; floor +5.8 %) | 99 % → 99 % (+0.0 %; floor -0.0 %) | 0.00 → 0.00 (-2.5 %; floor +1.2 %) | 3.26 % → 3.16 % (-3.2 %; floor +0.5 %) |
+| spin | 64 B | 1,500,000 | 3.09 → 3.11 (+0.1 %; floor +0.1 %) | 11 → 11.8 (+5.4 %; floor +5.8 %) | 42 → 41.6 (-0.5 %; floor -2.8 %) | 100 % → 100 % (+0.0 %; floor +0.0 %) | 0.00 → 0.00 (+8.1 %; floor +0.2 %) | 3.56 % → 3.70 % (+2.2 %; floor +5.7 %) |
+
+aarch64 (at 1.5 million records/s only the blocking reader ran; † the runs of 1,024 B at 200,000 records/s were stalled
+by the storage in about half the rounds of every variant, with p99 of 0.1–0.3 s and up to 35 % late sends, so those
+cells compare nothing; for the blocking reader that includes p50 and CPU, whose medians and paired ratios disagree):
+
+| Wait | Payload | Records/s | p50 | p99 | p99.9 | CPU of a core | Blocks per record | Late sends |
+|---|---|---|---|---|---|---|---|---|
+| block | 64 B | 20,000 | 5.92 → 4.45 (-24.7 %; floor +0.5 %) | 7.1 → 5.81 (-20.1 %; floor +2.3 %) | 10.7 → 9.56 (-9.8 %; floor +2.9 %) | 11 % → 8 % (-26.4 %; floor +1.9 %) | 1.00 → 1.00 (-0.0 %; floor +0.0 %) | 0.02 % → 0.02 % (+3.6 %; floor +85.9 %) |
+| spin | 64 B | 20,000 | 2.49 → 1.03 (-58.4 %; floor +0.0 %) | 2.9 → 1.48 (-49.2 %; floor +0.1 %) | 6.62 → 5.1 (-25.4 %; floor -1.8 %) | 100 % → 100 % (+0.0 %; floor +0.0 %) | 0.00 → 0.00 | 0.01 % → 0.01 % (-11.1 %; floor -16.6 %) |
+| block | 1,024 B | 20,000 | 6.11 → 4.78 (-23.3 %; floor +0.4 %) | 8.3 → 7.14 (-13.8 %; floor +0.5 %) | 15.7 → 15 (-5.5 %; floor +1.8 %) | 11 % → 8 % (-26.2 %; floor +0.4 %) | 1.00 → 1.00 (-0.0 %; floor -0.0 %) | 0.02 % → 0.02 % (-4.1 %; floor -10.8 %) |
+| spin | 1,024 B | 20,000 | 2.72 → 1.27 (-53.4 %; floor +0.2 %) | 5.23 → 3.95 (-24.0 %; floor -0.5 %) | 12.7 → 11.4 (-10.3 %; floor +2.6 %) | 100 % → 100 % (+0.0 %; floor -0.0 %) | 0.00 → 0.00 (+0.0 %; floor +0.0 %) | 0.03 % → 0.03 % (+14.6 %; floor +5.1 %) |
+| block | 64 B | 200,000 | 3.63 → 3.61 (-0.4 %; floor -1.9 %) | 7.05 → 7.27 (+5.6 %; floor -3.3 %) | 10.5 → 11.5 (+2.3 %; floor +0.9 %) | 79 % → 79 % (-0.4 %; floor +0.3 %) | 0.43 → 0.45 (+2.5 %; floor +0.4 %) | 0.15 % → 0.33 % (-1.9 %; floor +5.2 %) |
+| spin | 64 B | 200,000 | 2.48 → 1.03 (-58.3 %; floor +0.0 %) | 4.35 → 3.34 (-31.2 %; floor -4.4 %) | 7.56 → 5.98 (-22.3 %; floor -0.9 %) | 100 % → 100 % (-0.0 %; floor -0.0 %) | 0.00 → 0.00 (+0.0 %; floor +0.0 %) | 0.11 % → 0.51 % (+144.9 %; floor +0.7 %) |
+| block | 1,024 B | 200,000 | † | † | † | † | 0.37 → 0.34 (-3.9 %; floor -2.2 %) | † |
+| spin | 1,024 B | 200,000 | 2.73 → 1.28 (-53.3 %; floor +0.3 %) | † | † | 100 % → 100 % (-0.0 %; floor -0.0 %) | 0.00 → 0.00 (+16.7 %; floor -7.1 %) | † |
+| block | 64 B | 1,500,000 | 3.66 → 3.67 (+0.1 %; floor -0.1 %) | 7.62 → 7.52 (-1.2 %; floor -1.9 %) | 40.6 → 40.7 (+1.1 %; floor -1.4 %) | 99 % → 99 % (-0.0 %; floor +0.0 %) | 0.00 → 0.00 (-0.1 %; floor -1.1 %) | 1.47 % → 1.58 % (+10.0 %; floor +2.0 %) |
+
+On aarch64 the late sends of the spinning reader at 200,000 records/s of 64 B are bimodal in all three variants (runs at
+0.05–0.2 % and at 0.4–0.9 %; rounds above 0.3 %: 2 of base, 5 of the second copy, 6 of new), which the paired ratio
+does not handle.
+
+### System calls per record (one run of each)
+
+x86-64:
+
+| Wait | Payload | Records/s | Bytes read per record | Reads larger than 4 bytes per record | Reader futex waits per record | Writer futex wakes per record |
+|---|---|---|---|---|---|---|
+| block | 64 B | 20,000 | 67,464 → 4,446 | 1.02 → 1.01 | 1.02 → 1.00 | 1.0069 → 1.0135 |
+| spin | 64 B | 20,000 | 67,106 → 4,942 | 1.01 → 1.02 | 0.00 → 0.00 | 0.0017 → 0.0018 |
+| block | 1,024 B | 20,000 | 67,063 → 4,574 | 1.02 → 1.02 | 1.01 → 1.02 | 1.0360 → 1.0212 |
+| spin | 1,024 B | 20,000 | 67,805 → 5,034 | 1.02 → 1.03 | 0.00 → 0.00 | 0.0173 → 0.0173 |
+| block | 64 B | 200,000 | 66,430 → 63,346 | 1.00 → 0.98 | 0.50 → 0.50 | 0.5101 → 0.5288 |
+| spin | 64 B | 200,000 | 66,497 → 9,406 | 1.01 → 1.01 | 0.00 → 0.00 | 0.0017 → 0.0017 |
+| block | 1,024 B | 200,000 | 54,501 → 59,810 | 0.82 → 0.91 | 0.38 → 0.45 | 0.4417 → 0.4958 |
+| spin | 1,024 B | 200,000 | 66,845 → 11,075 | 1.01 → 1.01 | 0.00 → 0.00 | 0.0172 → 0.0174 |
+| block | 64 B | 1,500,000 | 14,561 → 14,555 | 0.22 → 0.22 | 0.00 → 0.00 | 0.0023 → 0.0021 |
+| spin | 64 B | 1,500,000 | 14,572 → 14,777 | 0.22 → 0.22 | 0.00 → 0.00 | 0.0017 → 0.0017 |
+
+aarch64:
+
+| Wait | Payload | Records/s | Bytes read per record | Reads larger than 4 bytes per record | Reader futex waits per record | Writer futex wakes per record |
+|---|---|---|---|---|---|---|
+| block | 64 B | 20,000 | 66,677 → 4,499 | 1.00 → 1.02 | 1.00 → 1.02 | 1.0151 → 1.0065 |
+| spin | 64 B | 20,000 | 67,453 → 4,770 | 1.02 → 1.02 | 0.00 → 0.00 | 0.0017 → 0.0017 |
+| block | 1,024 B | 20,000 | 67,538 → 4,430 | 1.02 → 1.01 | 1.01 → 1.00 | 1.0217 → 1.0272 |
+| spin | 1,024 B | 20,000 | 67,356 → 4,744 | 1.01 → 1.01 | 0.00 → 0.00 | 0.0173 → 0.0174 |
+| block | 64 B | 200,000 | 66,507 → 64,936 | 1.01 → 1.00 | 0.64 → 0.60 | 0.7984 → 0.7496 |
+| spin | 64 B | 200,000 | 67,484 → 5,519 | 1.02 → 1.02 | 0.00 → 0.00 | 0.0017 → 0.0017 |
+| block | 1,024 B | 200,000 | 65,458 → 63,917 | 0.99 → 0.99 | 0.56 → 0.56 | 0.7393 → 0.7519 |
+| spin | 1,024 B | 200,000 | 66,676 → 11,739 | 1.01 → 0.98 | 0.00 → 0.00 | 0.0172 → 0.0169 |
+| block | 64 B | 1,500,000 | 12,484 → 12,412 | 0.19 → 0.19 | 0.00 → 0.00 | 0.0021 → 0.0023 |
+
+### What it shows
+
+- At 1.5 million records/s and on replay, no difference beyond the floor: the reader never reads less there (0.22 and
+  0.19 reads per record, as before).
+- Spinning readers at 20,000 and 200,000 records/s read 4.4–11.7 KB per record instead of 66–68 KB, with p50 halved
+  or better (x86-64 0.76 instead of 2.05–2.07 µs at 64 B) and lower p99. Blocking readers at 20,000 records/s, in this
+  version without the rule for readers that block (the merged code gives them whole chunks and no gain): p50 and
+  CPU 11–14 % lower on x86-64, 23–26 % lower on aarch64, the same number of waits and wakes.
+- Blocking readers at 200,000 records/s, where a reader that copies 64 KiB per record finds about half the records
+  without waiting: on aarch64 the 64 B cell does not change (p50 3.63 → 3.61 µs; p99 +5.6 % against a floor of
+  −3.3 %, with overlapping per-round ranges); the 1,024 B cell could not be compared (storage stalls). On x86-64 the
+  reader reaches small reads part of the time: p50 25–28 % and CPU 12–14 % lower, p99, p99.9 and late sends unchanged,
+  and the reader blocked 38–59 % more often, so the writer woke it more often. **The writer paid for it:** its `append`
+  p50 in the 1,024 B cell went from 0.96 to 1.05 µs (+8.9 % in the median of the per-round ratios, slower in all 10
+  rounds, +5.5 to +16.7 %, against −4.5 to +6.6 % for the second copy of the base), p90 +4.2 %; in the 64 B cell +0.3 %
+  (noise). One wake-up costs the writer about 1.3 µs: its `append` p50 is 1.43 µs beside a blocking reader at 20,000
+  records/s and 0.108 µs beside a spinning one. The late sends, measured against 1 µs, did not show it. The counting
+  runs of the same cells, a few seconds later in their runs, were on whole chunks almost throughout (0.02 and 0.001 small
+  reads per record) with waits of 0.50 → 0.50 and 0.38 → 0.45 per record. What decides when a run reaches small reads
+  there was not measured. This is why the merged change reads whole chunks for readers that block (next section).
+
+### Readers that block: the rule added after review (x86-64)
+
+The merged change reads whole chunks for every record the reader blocked for (registered as a waiter, so that the writer
+made a wake-up call): blocking readers always read whole chunks, and only readers that do not block read less (ADR 0052,
+decided after the measurements above). This session measured it beside the alternative that was measured and **not
+built**: a reader that blocked for a record counts it towards small reads if it waited at the slot for at least 20 µs.
+
+`c4-standard-4-lssd` (us-east1-b, Xeon 6985P-C, 2 cores with 2 threads each), 2026-11-26 05:43–07:21 UTC, otherwise as
+in the environment above. Commits: base `43deb9f3` (`main` then); the 20 µs threshold `51ad6777` (on the branch, not
+merged as code); the rule that merged, measured as `823d4650` (a temporary commit, not kept): `51ad6777` with the 20 µs
+replaced by no limit, so that a blocked fill never counts. The merged code differs from that only as stated after the
+tables. Four variants per round in a rotating order (base, a second copy of base as the floor, threshold, merged rule),
+10 rounds, `--warmup 3s --duration 9s` (1.5 million records/s: `--warmup 4s --duration 20s`), otherwise the
+`tt-sustained run` command above; then one counting run per variant and cell, as above. The writer's `append` latency is
+that of `result.json` (time of the `append` call). In brackets: the median of the per-round ratios, and the same for the
+second copy of the base.
+
+**The rule that merged** (base → merged rule):
+
+| Wait | Payload | Records/s | p50 (µs) | p99 (µs) | Reader CPU | Blocks per record | Writer `append` p50 (µs) | Writer `append` p90 (µs) |
+|---|---|---|---|---|---|---|---|---|
+| block | 64 B | 20,000 | 14.1 → 14.2 (+0.6 %; floor +0.1 %) | 16.7 → 16.8 (-0.1 %; floor +15.0 %) | 23 % → 22 % (-0.1 %; floor +1.7 %) | 1.00 → 1.00 (-0.0 %; floor +0.0 %) | 1.5 → 1.52 (+1.3 %; floor +0.9 %) | 1.67 → 1.72 (+1.3 %; floor +1.1 %) |
+| block | 1,024 B | 20,000 | 14.8 → 14.8 (+0.4 %; floor +0.1 %) | 19.6 → 21.6 (+10.1 %; floor +4.5 %) | 23 % → 23 % (+0.1 %; floor -0.9 %) | 1.00 → 1.00 (+0.0 %; floor +0.0 %) | 2.03 → 2.02 (-0.3 %; floor +0.4 %) | 2.35 → 2.36 (+0.6 %; floor +0.9 %) |
+| block | 64 B | 50,000 | 10.4 → 10.5 (+1.5 %; floor -0.2 %) | 23 → 22 (-4.5 %; floor +3.1 %) | 51 % → 51 % (+1.0 %; floor -0.2 %) | 0.92 → 0.91 (-1.5 %; floor -0.1 %) | 1.28 → 1.24 (-3.2 %; floor -0.8 %) | 1.8 → 1.78 (-0.5 %; floor -1.1 %) |
+| block | 1,024 B | 50,000 | 9.7 → 9.85 (+1.6 %; floor -0.2 %) | 23.7 → 24.3 (+2.0 %; floor +8.6 %) | 50 % → 51 % (+0.6 %; floor +0.5 %) | 0.92 → 0.91 (-0.9 %; floor +0.3 %) | 1.67 → 1.62 (-2.5 %; floor +0.1 %) | 2.35 → 2.39 (+0.6 %; floor +0.0 %) |
+| block | 64 B | 200,000 | 4.06 → 4.06 (+0.3 %; floor +0.0 %) | 7.84 → 7.74 (-0.7 %; floor +3.6 %) | 71 % → 72 % (+1.4 %; floor +0.4 %) | 0.51 → 0.50 (-2.1 %; floor -0.2 %) | 0.772 → 0.76 (-0.9 %; floor -1.5 %) | 1.03 → 1.02 (-1.4 %; floor -1.5 %) |
+| block | 1,024 B | 200,000 | 4.44 → 4.52 (+1.6 %; floor +0.1 %) | 9.84 → 10.2 (+1.6 %; floor +3.9 %) | 73 % → 74 % (-0.2 %; floor -0.0 %) | 0.49 → 0.48 (-1.0 %; floor -0.2 %) | 0.968 → 0.96 (-0.8 %; floor -0.6 %) | 1.38 → 1.37 (-1.2 %; floor +0.4 %) |
+| block | 64 B | 1,500,000 | 3.17 → 3.15 (-0.7 %; floor -0.4 %) | 14.2 → 13.5 (-6.2 %; floor -2.3 %) | 99 % → 99 % (+0.0 %; floor +0.0 %) | 0.00 → 0.00 (-10.4 %; floor -7.3 %) | 0.115 → 0.114 (+0.0 %; floor +0.0 %) | 0.133 → 0.133 (-0.4 %; floor +0.0 %) |
+| spin | 64 B | 20,000 | 2.11 → 0.778 (-63.0 %; floor -0.1 %) | 2.89 → 1.53 (-45.4 %; floor -6.4 %) | 100 % → 100 % (-0.0 %; floor -0.0 %) | 0 | 0.117 → 0.117 (-0.4 %; floor +0.0 %) | 0.173 → 0.17 (-3.0 %; floor -3.6 %) |
+| spin | 64 B | 200,000 | 2.06 → 0.776 (-62.5 %; floor -0.0 %) | 4.61 → 3.63 (-22.8 %; floor -2.9 %) | 100 % → 100 % (+0.0 %; floor -0.0 %) | 0.00 → 0.00 (+0.0 %; floor +0.0 %) | 0.116 → 0.115 (-0.9 %; floor -0.4 %) | 0.145 → 0.14 (-2.7 %; floor -0.7 %) |
+
+**The 20 µs threshold, measured and not built** (base → threshold):
+
+| Wait | Payload | Records/s | p50 (µs) | p99 (µs) | Reader CPU | Blocks per record | Writer `append` p50 (µs) | Writer `append` p90 (µs) |
+|---|---|---|---|---|---|---|---|---|
+| block | 64 B | 20,000 | 14.1 → 12.4 (-12.4 %; floor +0.1 %) | 16.7 → 16.3 (-2.4 %; floor +15.0 %) | 23 % → 20 % (-12.8 %; floor +1.7 %) | 1.00 → 1.00 (+0.0 %; floor +0.0 %) | 1.5 → 1.54 (+2.5 %; floor +0.9 %) | 1.67 → 1.74 (+3.5 %; floor +1.1 %) |
+| block | 1,024 B | 20,000 | 14.8 → 13.2 (-11.0 %; floor +0.1 %) | 19.6 → 19.5 (-7.0 %; floor +4.5 %) | 23 % → 20 % (-11.1 %; floor -0.9 %) | 1.00 → 1.00 (+0.0 %; floor +0.0 %) | 2.03 → 2.08 (+2.8 %; floor +0.4 %) | 2.35 → 2.39 (+2.0 %; floor +0.9 %) |
+| block | 64 B | 50,000 | 10.4 → 10.4 (+1.6 %; floor -0.2 %) | 23 → 24 (+2.6 %; floor +3.1 %) | 51 % → 51 % (+0.1 %; floor -0.2 %) | 0.92 → 0.92 (-1.2 %; floor -0.1 %) | 1.28 → 1.23 (-3.8 %; floor -0.8 %) | 1.8 → 1.77 (-0.2 %; floor -1.1 %) |
+| block | 1,024 B | 50,000 | 9.7 → 9.84 (+1.9 %; floor -0.2 %) | 23.7 → 24.8 (+4.5 %; floor +8.6 %) | 50 % → 51 % (+1.0 %; floor +0.5 %) | 0.92 → 0.91 (-0.5 %; floor +0.3 %) | 1.67 → 1.63 (-2.0 %; floor +0.1 %) | 2.35 → 2.39 (+1.2 %; floor +0.0 %) |
+| block | 64 B | 200,000 | 4.06 → 4.06 (+0.1 %; floor +0.0 %) | 7.84 → 7.86 (-0.1 %; floor +3.6 %) | 71 % → 72 % (+1.1 %; floor +0.4 %) | 0.51 → 0.50 (-0.7 %; floor -0.2 %) | 0.772 → 0.772 (+1.7 %; floor -1.5 %) | 1.03 → 1.03 (-2.0 %; floor -1.5 %) |
+| block | 1,024 B | 200,000 | 4.44 → 4.49 (+0.7 %; floor +0.1 %) | 9.84 → 10.2 (+0.6 %; floor +3.9 %) | 73 % → 74 % (+0.4 %; floor -0.0 %) | 0.49 → 0.48 (-0.7 %; floor -0.2 %) | 0.968 → 0.97 (-0.5 %; floor -0.6 %) | 1.38 → 1.37 (-1.0 %; floor +0.4 %) |
+| block | 64 B | 1,500,000 | 3.17 → 3.16 (-0.3 %; floor -0.4 %) | 14.2 → 14.4 (+0.0 %; floor -2.3 %) | 99 % → 99 % (+0.0 %; floor +0.0 %) | 0.00 → 0.00 (-9.6 %; floor -7.3 %) | 0.115 → 0.114 (-0.4 %; floor +0.0 %) | 0.133 → 0.133 (+0.0 %; floor +0.0 %) |
+| spin | 64 B | 20,000 | 2.11 → 0.781 (-62.9 %; floor -0.1 %) | 2.89 → 1.45 (-47.2 %; floor -6.4 %) | 100 % → 100 % (-0.0 %; floor -0.0 %) | 0 | 0.117 → 0.117 (-0.4 %; floor +0.0 %) | 0.173 → 0.169 (-3.2 %; floor -3.6 %) |
+| spin | 64 B | 200,000 | 2.06 → 0.772 (-62.6 %; floor -0.0 %) | 4.61 → 3.75 (-23.7 %; floor -2.9 %) | 100 % → 100 % (+0.0 %; floor -0.0 %) | 0.00 → 0.00 (+0.0 %; floor +0.0 %) | 0.116 → 0.116 (+0.0 %; floor -0.4 %) | 0.145 → 0.143 (+2.0 %; floor -0.7 %) |
+
+Bytes read per record (one counting run each): with the merged rule 51,000–67,000 in every blocking cell, as the base
+(no small reads); with the threshold, at 20,000 records/s 67,390 → 4,524 (64 B) and 67,019 → 4,762 (1,024 B). Reader waits
+and writer futex wakes per record at 50,000 and 200,000 records/s: 0.39–0.91 and 0.46–0.91 in all three variants, with
+run-to-run differences of up to 0.11 in the single counting runs (1,024 B at 200,000: wakes 0.459 base, 0.525 threshold,
+0.570 merged rule, which reads only whole chunks there, as the base does).
+
+- **The merged rule** matches the base in every blocking cell: blocks per record −2.1 to +0.0 % against a floor of −0.2
+  to +0.3 %; the writer's `append` p50 −3.2 to +1.3 % and p90 −1.4 to +1.3 % (20,000 records/s: +1.3 % and −0.3 %, p90
+  +1.3 % and +0.6 %, against a floor of +0.9 % and +0.4 %); p99 at 1.5 million records/s −6.2 % against a floor of
+  −2.3 %. Two medians lie above their floors with overlapping per-round ranges: p50 +1.5 % and +1.6 % at 50,000
+  records/s (floor −0.2 %; ranges −1.2 to +7.9 % and −3.0 to +9.6 %), and p99 +10.1 % at 20,000 records/s of 1,024 B
+  (floor +4.5 %; ranges −15.5 to +18.7 % and −3.2 to +18.9 %). Spinning readers: p50 63 % lower at 20,000 and 200,000
+  records/s.
+- **The threshold** matched the base at 50,000 and 200,000 records/s too, and at 20,000 records/s gave the blocking reader
+  a p50 11–12 % and CPU 11–13 % lower, with 4.5–4.8 KB read per record instead of 67 KB and the same number of blocks.
+  **But the writer's `append` p50 there was 2.5 % (64 B, slower in 9 of 10 rounds, −1.4 to +10.2 %) and 2.8 % (1,024 B,
+  6 of 10) higher, p90 3.5 % and 2.0 %**, against a floor of +0.9 % and +0.4 %. The first measurement showed the same at
+  64 B (+1.6 %, slower in all 10 rounds, floor +0.3 %). That is about 40 ns per `append`, with the same number of wake-up
+  calls; why was not measured. That is why it was not built.
+- In one round of the 50,000 records/s cells (round 6), every variant at 64 B, and the threshold's run at 1,024 B, ran
+  with a p50 of 5.4–7.1 µs instead of about 10 µs; the other nine rounds agree, so this is the machine at that time.
+
+**How the merged code differs from the measured rule.** The measured build kept the threshold's code with no limit: it
+stored when the reader first found a slot empty and read the clock at each fill of a record it had blocked for. The merged
+code has neither (the stored state is 16 bytes smaller, inside the boxed wait state). It also counts as blocked a record
+that the reader found in `block_on`'s own check after registering as a waiter, which the measured build did not see; in
+the measured blocking cells that case could only turn a fill that the build counted as following into one that does not,
+and those cells had no small reads anyway. And a fill of a reader that did not block now also checks whether the wake-up
+region is taken out of the waker (one load), which the spinning cells above did not run. All three are on the paths the
+cells exercised (blocking and spinning fills and empty polls); none was measured.
+
+### Earlier versions of the change, on the same kind of x86-64 machine
+
+Three sessions on x86-64 preceded the aarch64 one, each on a new VM of the same type and zone, with the commands above
+(the first used 10 rounds of the default replay measurement, then 60 short rounds).
+
+- `e12a0022`, without the probe (2026-11-25 20:31–22:52 UTC): blocking readers at 200,000 records/s blocked 85 % (64 B)
+  and 66 % (1,024 B) more often (second copy −0.2 %), p50 27 % and 22 % lower, CPU 22 % and 13 % lower; its counting
+  runs were on whole chunks (0.014 and 0.009 small reads per record). Small reads that had made such a reader fast
+  enough to wait for every record kept themselves in place.
+- `81012b2c`, a probe in every 128 fills and the rule "used at most 4 KiB" for a fill that follows (2026-11-25
+  22:53–00:52 UTC): blocking at 200,000 records/s 19 % (64 B) and 53 % (1,024 B) more blocks; the spinning reader at
+  20,000 records/s of 64 B had p99 2.49 → 3.11 µs (+21.7 %, slower in 8 of 10 rounds; floor −1.1 %), the probes' 0.8 %
+  of records at the latency of a whole read. Replay (60 short rounds) within the floor.
+- `c7bec958` (the tables above) counts a fill as following only if the last fill brought exactly one record, and probes
+  once in 256 fills.
 
 ## 2026-11-26, durable-only readers wake on checkpoints only (ADR 0053, issue #82; Google Cloud VMs)
 
