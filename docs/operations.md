@@ -401,9 +401,11 @@ original journal already uses.
 
 ### Restoring from a backup
 
-Restore a backup's `checkpoint` together with its segments, and remove the segments the backup does not have. The
-marker vouches for every record below its `next_seq`, so a marker newer than the segments covers records they lack.
-From 1.1 a writer refuses such a journal under every recovery policy, before it changes anything
+Stop the writer and any `tickertape archive` job or other process that applies a retention policy to the journal first:
+retention goes by the marker it finds, and the newer marker can make it remove restored segments that the backup's
+marker will name. Then restore the backup's `checkpoint` together with its segments, and remove the segments the backup
+does not have. The marker vouches for every record below its `next_seq`, so a marker newer than the segments covers
+records they lack. From 1.1 a writer refuses such a journal under every recovery policy, before it changes anything
 (`DanglingCheckpoint`, reported at the marker's segment and offset; ADR 0056); readers and `verify` stop where the
 restored records end. If the backup's marker is lost, see "After a crash" → Refused to open.
 
@@ -784,14 +786,20 @@ the writer or retention.
   the checkpoint marker's position lies beyond the records that segment holds, or the record right before it is
   damaged, so the marker vouches for records the journal lacks. Nothing was changed. Run `tickertape verify` (it names
   where the records end, or the damaged record) and `tickertape inspect` or `status` (the marker's segment, offset and
-  next sequence number). If the segments were restored from a backup, restore that backup's `checkpoint` with them. If
-  storage damaged the record, restore its segment from a copy. Otherwise, knowingly, move `checkpoint` out of the
-  directory and keep it: the writer then opens without a marker and validates the whole journal from the oldest
-  segment (an open that takes longer the larger the journal). Where the restored records simply end, it continues
-  there; a damaged record with records or segments after it is handled like any corrupt position (with `Quarantine`
-  the bytes from it on, and the later segments, go to `quarantine/`; `Fail` refuses). Either way the writer gives the
-  sequence numbers the old marker covered beyond the last valid record to new records. A durable-only reader that had returned records beyond that point would then read different records
-  under the same numbers: start it again from a position you choose. Durable-only readers return nothing, and
-  retention removes nothing, until the next checkpoint. No command sets the marker back.
+  next sequence number). Then, in order of what they lose:
+  1. Segments restored from a backup: restore that backup's `checkpoint` with them. Nothing is lost.
+  2. A damaged record: restore its segment from a copy or a replica. Nothing is lost.
+  3. Otherwise, knowingly, move `checkpoint` out of the directory and keep it. The writer then opens without a marker
+     and validates the whole journal from the oldest segment (an open that takes longer the larger the journal).
+     Where the restored records simply end, it continues there; a damaged record with records or segments after it is
+     handled like any corrupt position (with `Quarantine` the bytes from it on, and the later segments, go to
+     `quarantine/`, so the covered records after the damage leave the journal; `Fail` refuses). Either way the writer
+     gives the sequence numbers the old marker covered beyond the last valid record to new records. Anything that saw
+     the old records under those numbers then has a different record under the same number: readers of either kind,
+     exports, and downstream systems that store sequence numbers. Start readers again from a position you choose and
+     reconcile what was exported. Durable-only readers return nothing, and retention removes nothing, until the next
+     checkpoint.
+
+  No command sets the marker back or opens such a journal at the marker.
 
 The `quarantine/` directory is never cleaned up by tickertape; inspect it and delete it yourself when you're done.

@@ -238,7 +238,7 @@ When the next record doesn't fit in the current segment's record area, the write
    (Linux: `fallocate`; macOS: `fcntl(F_PREALLOCATE)` then `ftruncate`) and write the segment header with `pwrite`.
    The roll does not sync it: the next checkpoint syncs every segment linked before it is requested, before it writes
    its marker, and recovery restores a header that an OS crash kept from the disk (ADR 0038; crash contract C8). A
-   segment that recovery creates is synced before it is linked. A temporary file is never truncated or reopened, so a
+   segment that recovery creates is synced, with the platform barrier, before it is linked. A temporary file is never truncated or reopened, so a
    published inode can't be damaged through it.
 3. Publish it under its final name **without replacing anything**: `link` the temporary file to
    `{next_seq:020}.tape`, which fails if that name exists. **A successful `link` is the publication point.** Then
@@ -301,7 +301,7 @@ Readers never modify a journal. Only the writer repairs it, on open, after takin
    | Commit word `0`, neither of the above | Usually the clean end, or a body the previous writer never committed (no reader saw it); also damage that left no evidence, and then this removes published records in place (C11 (3); "What readers do about repairs") | Zero any non-zero bytes after `P` in place, without a copy, under either policy. This is the end of the chain; segments the scan did not reach are disconnected (step 5). In front of a segment named `{S:020}.tape` that exists, is not `X`, has not been scanned and does not open, nothing is zeroed: non-zero bytes after `P` are corruption, as in the last row, reported as `BrokenChain(S)` (C11 (3); ADR 0035 → Damage around a seal) |
    | Valid seal, successor missing, no segment with a larger `base_seq` | Crash or power loss during a roll | Create the successor (as in "Rolling"). This is the end of the chain |
    | Valid seal, successor missing, a segment with a larger `base_seq` exists | A segment in the middle of the chain is missing (deleted by someone, or lost) | **Refuse** under every policy: tickertape doesn't discard a large part of a journal on its own |
-   | Commit word non-zero, invalid record or seal | Not possible after a writer *process* crash. Power loss, storage corruption or outside modification | `Quarantine` (default): preserve the bytes from `P` to the last non-zero byte of `X` in `quarantine/`, then **repair by replacement**: write a copy of `X` with `[P, Z)` zeroed to `X.tmp`, sync it, and `rename` it over `X`. `Fail`: refuse (see below) |
+   | Commit word non-zero, invalid record or seal | Not possible after a writer *process* crash. Power loss, storage corruption or outside modification | `Quarantine` (default): preserve the bytes from `P` to the last non-zero byte of `X` in `quarantine/`, then **repair by replacement**: write a copy of `X` with `[P, Z)` zeroed to `X.tmp`, sync it with the platform barrier (the copy holds records the marker covers: ADR 0056), and `rename` it over `X`. `Fail`: refuse (see below) |
 
    Bytes are zeroed in place only after an empty commit word, in the second and third rows (crash contract C8). Some
    damage cannot be told from a torn append and is zeroed like one, destroying the records it covers without a copy

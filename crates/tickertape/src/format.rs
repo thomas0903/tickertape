@@ -909,8 +909,8 @@ pub(crate) fn find_history_before<V: SegmentView + ?Sized>(
 ///
 /// Work: the commit words from `offset` back to the start of the record found (all the way to the first slot when
 /// there is none), and CRC32C over the candidates, at most twice `offset - 64` bytes in all. Past that bound (only a
-/// payload holding many such headers gets there) it walks the segment's records forward from the first slot instead,
-/// and accepts if that walk lands exactly at `offset` with `next_seq`.
+/// payload holding many such headers gets there) it follows the records' lengths forward from the first slot instead,
+/// and accepts if the record that ends exactly at `offset` is valid with sequence number `next_seq - 1`.
 pub(crate) fn record_ends_at<V: SegmentView + ?Sized>(
     segment: &V,
     base: u64,
@@ -942,7 +942,7 @@ pub(crate) fn record_ends_at<V: SegmentView + ?Sized>(
             if fields == Some((last, 0)) {
                 spent = spent.saturating_add(u64::from(word));
                 if spent > budget {
-                    return walks_to(segment, base, offset, next_seq);
+                    return walks_to(segment, offset, next_seq);
                 }
                 if matches!(
                     read_slot(segment, q, last),
@@ -959,22 +959,34 @@ pub(crate) fn record_ends_at<V: SegmentView + ?Sized>(
     }
 }
 
-/// [`record_ends_at`]'s fallback: whether the records of the segment, from its first slot expecting `base`, reach
-/// exactly `offset` with `next_seq` next.
-fn walks_to<V: SegmentView + ?Sized>(segment: &V, base: u64, offset: u64, next_seq: u64) -> bool {
+/// [`record_ends_at`]'s fallback: follows the commit words of the segment's records from its first slot and validates
+/// in full only the record that ends exactly at `offset`, which must have sequence number `next_seq - 1`; the records
+/// before it are not checked (as the backward probe does not check them), only their lengths are followed, so a
+/// damaged length word before the last record stops the walk. One CRC32C, of the last record.
+fn walks_to<V: SegmentView + ?Sized>(segment: &V, offset: u64, next_seq: u64) -> bool {
+    let Some(last) = next_seq.checked_sub(1) else {
+        return false;
+    };
     let mut at = SEGMENT_HEADER_LEN as u64;
-    let mut seq = base;
     while at < offset {
-        match read_slot(segment, at, seq) {
-            Ok(Slot::Record { next_offset, .. }) => at = next_offset,
-            _ => return false,
-        }
-        let Some(next) = seq.checked_add(1) else {
+        let Some(word) = segment
+            .commit_word(at)
+            .filter(|w| (RECORD_HEADER_LEN as u32..=MAX_FRAME_LEN).contains(w))
+        else {
             return false;
         };
-        seq = next;
+        let Some(next) = at.checked_add(align8(u64::from(word))) else {
+            return false;
+        };
+        if next == offset {
+            return matches!(
+                read_slot(segment, at, last),
+                Ok(Slot::Record { next_offset, .. }) if next_offset == offset
+            );
+        }
+        at = next;
     }
-    at == offset && seq == next_seq
+    false
 }
 
 /// How many next sequence numbers the final-seal search tries after an empty commit word (ADR 0035): a final seal
@@ -2519,9 +2531,16 @@ mod tests {
         );
         assert!(record_ends_at(&crafted[..], 7, end as u64, 13));
         assert!(!record_ends_at(&crafted[..], 7, end as u64, 14));
-        // The fallback walk validates every record before the position: here it stops at a damaged one.
+        // The fallback walk validates only the last record: an earlier record's checksum is not read. A damaged
+        // length word before it stops the walk, though.
         let mut damaged = crafted.clone();
         damaged[offsets[2] + 4] ^= 1;
+        assert!(record_ends_at(&damaged[..], 7, end as u64, 13));
+        damaged[offsets[2]..offsets[2] + 4].fill(0);
         assert!(!record_ends_at(&damaged[..], 7, end as u64, 13));
+        // And the last record itself is validated.
+        let mut last = crafted.clone();
+        last[end - 1] ^= 1;
+        assert!(!record_ends_at(&last[..], 7, end as u64, 13));
     }
 }

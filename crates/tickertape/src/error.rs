@@ -247,7 +247,7 @@ pub enum CorruptReason {
     /// marker's segment. Writer recovery refuses the open with it under every policy, reported at the `checkpoint`
     /// file (offset 0) for the first two, and at the segment and the marker's offset for the last.
     #[error(
-        "checkpoint marker names segment {0}, which is missing, at an invalid offset, or past its records"
+        "checkpoint marker names segment {0}: the segment is missing, the offset invalid, or the record before that position missing or damaged"
     )]
     DanglingCheckpoint(u64),
     /// A commit word reads 0 (no record), and recovery, `verify` or a reader found evidence of committed history after

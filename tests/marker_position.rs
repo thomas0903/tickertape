@@ -8,9 +8,10 @@
 //! every position a writer can give a marker and for every cut or torn slot after the marker.
 
 use std::fs;
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 
+use tickertape::fault;
 use tickertape::format::{self, CheckpointSlot};
 use tickertape::{CorruptReason, Error, NewRecord, RecoveryAction, RecoveryPolicy, Writer};
 use tickertape_tests::{
@@ -474,6 +475,75 @@ fn markers_around_a_roll_open() {
     }
 }
 
+/// A repair by replacement copies the records before the marker into a new file and renames it over the segment. The
+/// copy is on the drive (the platform barrier: `F_FULLFSYNC` on macOS) before the rename: otherwise a power loss right
+/// after the rename could keep the new name and lose the copied bytes, and the next open would refuse the marker
+/// although nothing outside the contract happened. The open is stopped right before the rename, and the syncs it made
+/// until then must include a barrier on the copy.
+#[test]
+fn a_repair_by_replacement_is_on_the_drive_before_its_rename() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut w = Writer::open(dir.path(), small_config()).unwrap();
+    append_n(&mut w, 450);
+    w.checkpoint().unwrap();
+    append_n(&mut w, 20);
+    drop(w);
+    let c = marker(dir.path());
+    tickertape_tests::corrupt_by_replacement(dir.path(), 455);
+    assert_eq!(
+        locate_record(dir.path(), 454).0,
+        dir.path()
+            .join(format::segment_file_name(c.segment_base_seq))
+    );
+
+    fault::record_syncs();
+    fault::fail_next(fault::Point::RepairBeforeRename, 5 /* EIO */);
+    let refused = Writer::open(dir.path(), small_config());
+    let syncs = fault::take_syncs();
+    fault::clear();
+    assert!(matches!(refused, Err(Error::Io { .. })), "{refused:?}");
+    let copy = dir.path().join(format!(
+        "{}.tmp",
+        format::segment_file_name(c.segment_base_seq)
+    ));
+    let meta = fs::metadata(&copy).expect("the repaired copy, not yet renamed");
+    let id = (meta.dev(), meta.ino());
+    assert!(
+        syncs.contains(&(fault::Sync::Barrier, id)),
+        "no barrier on the copy before the rename: {syncs:?}"
+    );
+
+    // The next open removes the copy and repairs again, and the journal opens at the damage.
+    assert_eq!(
+        opens(dir.path(), RecoveryPolicy::Quarantine).next_seq(),
+        455
+    );
+}
+
+/// The same for a segment recovery creates (a new journal's first segment, or a successor after a lost roll): its
+/// header is on the drive before the link publishes it. A new journal's first segment whose header a power loss kept
+/// from the disk would make every later open fail (recovery never restores the header of the segment it starts in).
+#[test]
+fn a_segment_recovery_creates_is_on_the_drive_before_its_link() {
+    let dir = tempfile::tempdir().unwrap();
+    fault::record_syncs();
+    fault::fail_next(fault::Point::Link, 5 /* EIO */);
+    let refused = Writer::open(dir.path(), small_config());
+    let syncs = fault::take_syncs();
+    fault::clear();
+    assert!(matches!(refused, Err(Error::Io { .. })), "{refused:?}");
+    let meta = fs::metadata(dir.path().join("checkpoint")).unwrap();
+    let marker_id = (meta.dev(), meta.ino());
+    assert!(
+        syncs
+            .iter()
+            .any(|&(sync, id)| sync == fault::Sync::Barrier && id != marker_id && id.1 != 0),
+        "no barrier on the new segment before its link: {syncs:?}"
+    );
+    assert!(segments(dir.path()).is_empty());
+    assert_eq!(opens(dir.path(), RecoveryPolicy::Fail).next_seq(), 0);
+}
+
 /// The other states that look like a contradiction and are not: the marker's own segment cut short only after the
 /// marker, a repair in place and a repair by replacement after it (each reopened, checkpointed and reopened), a short
 /// marker file, and a long last covered record.
@@ -627,7 +697,10 @@ fn marker_positions(stride: usize) {
 
 /// Every position a writer can give a marker (each record boundary of every segment, a seal's place, and offset 64
 /// of each segment with its base) is accepted: a marker forged at each, as the current slot, opens under both
-/// policies at the end of the journal, and recovery does nothing. A sample here; every position in
+/// policies at the end of the journal, and recovery does nothing. The positions are the record boundaries of a finished
+/// journal, not markers a writer wrote; they cover what a writer can produce, because a checkpoint always writes the
+/// writer's current segment, offset and next sequence number, which is such a boundary (or offset 64 of a segment it
+/// has just created). `tests/kill_loop.rs` and `tests/soak.rs` reopen journals with markers the writer wrote itself. A sample here; every position in
 /// [`every_position_a_writer_can_give_a_marker_opens_all`].
 #[test]
 fn every_position_a_writer_can_give_a_marker_opens() {

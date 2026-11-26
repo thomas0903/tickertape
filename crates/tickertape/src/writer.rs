@@ -1357,8 +1357,9 @@ fn take_lock(dir: &Path) -> Result<JournalLock> {
 /// Creates and publishes a new segment (`docs/format.md` → Rolling, steps 2–3). Returns the open file (read-write)
 /// and its final path.
 ///
-/// With `sync`, the header and the preallocated size are made durable before the link, as recovery needs for a
-/// segment it creates (a new journal's first segment, a completed roll). A roll passes `false`: the writer's thread
+/// With `sync`, the header and the preallocated size are made durable, with the platform barrier, before the link, as
+/// recovery needs for a segment it creates (a new journal's first segment, a completed roll). A roll passes `false`:
+/// the writer's thread
 /// does not wait for the sync there, and the next checkpoint syncs the segment before its marker (ADR 0038 → Rolls
 /// without a sync).
 fn create_segment(dir: &Path, base: u64, size: u64, sync: bool) -> Result<Segment> {
@@ -1387,7 +1388,12 @@ fn create_segment(dir: &Path, base: u64, size: u64, sync: bool) -> Result<Segmen
         file.write_all_at(&header, 0)
             .map_err(|e| Error::io("write segment header", &tmp, e))?;
         if sync {
-            mmap::sync_data(&file).map_err(|e| Error::io("sync segment", &tmp, e))?;
+            // Durable on the drive before the link publishes it (macOS: `sync_data` leaves it in the drive's cache):
+            // a new journal's first segment whose header a power loss kept from the disk would make every later open
+            // fail, since recovery never restores the header of the segment it starts in.
+            mmap::sync_data(&file)
+                .and_then(|()| mmap::full_barrier(&file))
+                .map_err(|e| Error::io("sync segment", &tmp, e))?;
         }
         // Map before publishing, so that nothing fallible is left after the link (the publication point).
         let len = usize::try_from(size)
@@ -2222,6 +2228,10 @@ impl Recovery<'_> {
         file.write_all_at(prefix, 0)
             .map_err(|e| Error::io("write repaired segment", &tmp, e))?;
         mmap::sync_data(&file).map_err(|e| Error::io("sync repaired segment", &tmp, e))?;
+        // The copy holds the records before the marker. On macOS `sync_data` does not flush the drive's cache, so
+        // without this barrier a power loss after the rename could keep the new name and lose those bytes, and the next
+        // open would refuse the marker (ADR 0056). Linux's `fdatasync` already flushed them.
+        mmap::full_barrier(&file).map_err(|e| Error::io("full sync repaired segment", &tmp, e))?;
         crate::fault::inject(crate::fault::Point::RepairBeforeRename)
             .map_err(|e| Error::io("replace segment", &seg.path, e))?;
         fs::rename(&tmp, &seg.path).map_err(|e| Error::io("replace segment", &seg.path, e))?;
