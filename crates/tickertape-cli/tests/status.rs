@@ -173,6 +173,7 @@ fn json_schema_is_stable() {
             "writer",
             "readers_dir",
             "readers",
+            "removal_leftovers",
             "health",
         ])
     );
@@ -288,6 +289,7 @@ fn json_schema_is_stable() {
         v["health"],
         serde_json::json!({"ok": true, "corrupt": false, "verified": true, "breaches": []})
     );
+    assert_eq!(v["removal_leftovers"], serde_json::json!([]));
 }
 
 #[test]

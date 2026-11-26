@@ -13,9 +13,11 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   and only then lets it go; otherwise it renames it back and stops with the error. A writer's own retention run, which
   holds the writer lock, is unchanged. **Behaviour changes:** a deletion, and a move by copy, now go through a temporary
   name in the journal directory, `{base:020}.tape.{pid}.{unix_ns}.removing` (`docs/format.md`), which a crash can leave
-  behind: everything else ignores it (1.0.0 included), and a later retention run unlinks it once it is an hour old, its
-  process is gone and its segment is before the marker's (`docs/operations.md`). An archiver's removal costs a rename, a
-  `stat` and a read of the marker more than before.
+  behind. Readers, writers and `verify` ignore it (1.0.0 included); `status` (`removal_leftovers`) and `archive`
+  (`report.leftovers`; `retention::Report::leftovers`) report it. It may hold records the journal no longer has, so a
+  later retention run unlinks it only once retention has removed the segment its seal names (and its name is an hour
+  old and its process gone); `docs/operations.md` says how to keep it or put it back. An archiver's removal costs a
+  rename, a `stat` and a read of the marker more than before.
 - Fixed: a reader no longer stops silently at a zeroed commit word in older history (issue #79, ADR 0050). An empty slot
   that the checkpoint marker covers, or that a later segment (with a valid header) shows to have been filled, is `Error::Corrupt` with
   `CorruptReason::EmptyCommitWord` at its offset; before, `try_next` returned `Ok(None)` there for ever, and a replay ended

@@ -422,29 +422,60 @@ fn a_crash_after_taking_a_segment_out_leaves_a_name_that_is_cleaned_up() {
     }
 }
 
-/// What a later run leaves alone: a name that is new, one whose process could be running, one of the marker's segment
-/// or later (as a crash before putting a segment back leaves, see the next test), and names that are not temporary
-/// names of a removal; what it removes: one of a segment before the marker's, an hour old, whose process is gone. None
-/// of this stops its removals.
+/// Applies a retention run that removes the oldest segments down to `keep` (nothing if there are not more), as an
+/// archiver.
+fn archive_down_to(dir: &Path, keep: usize) -> Report {
+    let plan = retention::plan(dir, &Policy::default().max_segments(keep)).unwrap();
+    retention::apply(dir, &plan, &Action::Delete).unwrap()
+}
+
+/// A copy of `dir`'s segment `base` under a temporary name of process `pid` at `at`, optionally with its record and
+/// seal zeroed (unsealed).
+fn leftover_of(dir: &Path, base: u64, pid: u32, at: u64, unsealed: bool) -> PathBuf {
+    let mut bytes = fs::read(dir.join(segment_file_name(base))).unwrap();
+    if unsealed {
+        bytes[RECORD as usize..(SEAL + 8) as usize].fill(0);
+    }
+    let path = dir.join(format!("{}.{pid}.{at}.removing", segment_file_name(base)));
+    fs::write(&path, bytes).unwrap();
+    path
+}
+
+fn names(paths: &[PathBuf]) -> Vec<String> {
+    let mut out: Vec<String> = paths
+        .iter()
+        .map(|p| p.file_name().unwrap().to_str().unwrap().to_owned())
+        .collect();
+    out.sort();
+    out
+}
+
+/// What a later run unlinks: a temporary name an hour old, of a process that is gone, whose file is sealed and whose
+/// seal names a segment that is gone from the journal, below its oldest one (newer records have been removed on
+/// purpose). What it leaves, and reports (`Report::leftovers`, and `status`): a name that is new, one whose process
+/// could be running, one whose file is unsealed, one whose seal names a segment still in the journal, one whose seal
+/// names the oldest segment of the run's own listing (it goes in the next run), and a file that is no segment at all.
+/// Names that are not temporary names of a removal are neither touched nor reported. None of this stops a removal.
 #[test]
-fn a_later_run_removes_only_old_leftovers_of_gone_processes_before_the_marker() {
+fn a_later_run_removes_only_leftovers_whose_successor_retention_removed() {
     let dir = journal();
     let now = now_ns();
     let (dead, alive) = (dead_pid(), std::process::id());
-    let name = |base: u64, pid: u32, at: u64| {
-        let path = dir
-            .path()
-            .join(format!("{}.{pid}.{at}.removing", segment_file_name(base)));
-        fs::write(&path, b"leftover").unwrap();
-        path
-    };
-    let gone = name(0, dead, now - HOUR - 60_000_000_000);
+    let old = now - HOUR - 60_000_000_000;
+    // Segment 0's file names 1 in its seal, which this run removes: it goes in the next run.
+    let next_run = leftover_of(dir.path(), 0, dead, old, false);
     let kept = [
-        name(1, dead, now - 60_000_000_000),
-        name(1, alive, now - 2 * HOUR),
-        name(N - 1, dead, now - 2 * HOUR),
-        name(N + 3, dead, now - 2 * HOUR),
+        leftover_of(dir.path(), 0, dead, now - 60_000_000_000, false),
+        leftover_of(dir.path(), 0, alive, old, false),
+        leftover_of(dir.path(), 1, dead, old + 1, true),
+        // Names 4, which stays.
+        leftover_of(dir.path(), 3, dead, old, false),
     ];
+    let junk = dir.path().join(format!(
+        "{}.{dead}.{old}.removing",
+        segment_file_name(N + 3)
+    ));
+    fs::write(&junk, b"leftover").unwrap();
     let others = [
         dir.path()
             .join(format!("{}.removing", segment_file_name(0))),
@@ -456,13 +487,190 @@ fn a_later_run_removes_only_old_leftovers_of_gone_processes_before_the_marker() 
     for other in &others {
         fs::write(other, b"other").unwrap();
     }
+    let mut expected: Vec<PathBuf> = kept.to_vec();
+    expected.push(junk.clone());
     let report = retention::apply(dir.path(), &plan(dir.path()), &Action::Delete).unwrap();
     assert_eq!(report.removed_segments, REMOVED);
-    assert!(!gone.exists());
-    for path in kept.iter().chain(&others) {
+    // The run's listing still showed segment 1.
+    assert!(next_run.exists());
+    let mut with_next = expected.clone();
+    with_next.push(next_run.clone());
+    assert_eq!(names(&report.leftovers), names(&with_next));
+    let report = archive_down_to(dir.path(), N as usize);
+    assert_eq!(report.removed_segments, 0);
+    assert!(!next_run.exists());
+    assert_eq!(names(&report.leftovers), names(&expected));
+    for path in expected.iter().chain(&others) {
         assert!(path.exists(), "{path:?}");
     }
+    // `status` reports them too.
+    let status = tickertape::status::status(dir.path()).unwrap();
+    assert_eq!(status.removal_leftovers, names(&expected));
     assert!(inspect::verify(dir.path()).unwrap().problems.is_empty());
+}
+
+/// The review's sequence: an archiver checks segment 0; the marker is lost, segment 0 loses its record and seal, and
+/// a writer opens (recovery ends the chain in segment 0 in place), appends record 0 and checkpoints; the archiver takes
+/// segment 0 out and is killed. The writer, already open, refuses nothing: it fills segment 0 through its open file,
+/// rolls, and its marker moves on. `verify` reports nothing and a reader starts at record 1: record 0, which the marker
+/// covers, is only in the temporary file. Later runs, an hour later and with its process gone, keep that file, and
+/// report it, as long as the segment its seal names (1) is in the journal; once retention has removed segment 1, the
+/// next run unlinks it, as retention would have removed it.
+#[test]
+fn an_orphaned_segment_stays_until_retention_removes_the_segment_after_it() {
+    for crash in [Point::RetentionTakenOut, Point::RetentionPutBack] {
+        let case = format!("{crash:?}");
+        let dir = journal();
+        let plan = plan(dir.path());
+        let path = dir.path().to_path_buf();
+        let writer = Rc::new(RefCell::new(None));
+        let held = Rc::clone(&writer);
+        crash_at(crash, 0, || {
+            fault::run_at(Point::RetentionChecked, 0, move || {
+                *held.borrow_mut() = lose_damage_recover(&path, Damage::ZeroedTail);
+            });
+            retention::apply(dir.path(), &plan, &Action::Delete)
+        });
+        let mut writer = writer.borrow_mut().take().unwrap();
+        assert!(bases(dir.path()).is_empty(), "{case}");
+        // The writer rolls past segment 0 and checkpoints.
+        append(&mut writer, 9);
+        writer.checkpoint().unwrap();
+        assert_eq!(bases(dir.path()), [1], "{case}");
+        assert!(
+            inspect::verify(dir.path()).unwrap().problems.is_empty(),
+            "{case}"
+        );
+        let mut reader = Reader::open(dir.path(), ReaderConfig::default()).unwrap();
+        assert_eq!(reader.next_owned().unwrap().unwrap().seq, 1, "{case}");
+        let names = leftovers(dir.path());
+        assert_eq!(names.len(), 1, "{case}");
+        let orphan = age(&names[0]);
+        let record_0 = fs::read(&orphan).unwrap();
+        assert_eq!(
+            record_0[RECORD as usize + format::RECORD_HEADER_LEN as usize],
+            7,
+            "{case}"
+        );
+        // Runs while segment 1 is in the journal: an archiver's (nothing to remove, then one that keeps it), and the
+        // writer's own.
+        assert_eq!(
+            archive_down_to(dir.path(), 5).leftovers,
+            [orphan.clone()],
+            "{case}"
+        );
+        append(&mut writer, 9);
+        writer.checkpoint().unwrap();
+        drop(writer);
+        assert_eq!(bases(dir.path()), [1, 2], "{case}");
+        let config = small_config().retention(Policy::default().max_segments(5), Action::Delete);
+        let writer = Writer::open(dir.path(), config).unwrap();
+        assert!(writer.last_retention_error().is_none(), "{case}");
+        assert_eq!(
+            writer.retention_report().leftovers,
+            [orphan.clone()],
+            "{case}"
+        );
+        drop(writer);
+        assert_eq!(fs::read(&orphan).unwrap(), record_0, "{case}");
+        // Retention removes segment 1; the run after it removes the orphan.
+        let report = archive_down_to(dir.path(), 1);
+        assert_eq!(report.removed_segments, 1, "{case}");
+        assert!(orphan.exists(), "{case}");
+        assert!(
+            archive_down_to(dir.path(), 1).leftovers.is_empty(),
+            "{case}"
+        );
+        assert!(!orphan.exists(), "{case}");
+    }
+}
+
+/// A move by copy reads segment 0; before it takes the segment out, the marker is lost, the segment loses its record
+/// and seal, and a writer recovers it in place, fills it and rolls past it, so that the marker names a later segment.
+/// The file is then not what was copied: the segment goes back with an error, and the archive does not keep a stale
+/// copy while the segment is deleted.
+#[test]
+fn a_segment_written_to_after_it_was_copied_goes_back() {
+    let dir = journal();
+    let archive = tempfile::tempdir().unwrap();
+    let plan = plan(dir.path());
+    let path = dir.path().to_path_buf();
+    let writer = Rc::new(RefCell::new(None));
+    let held = Rc::clone(&writer);
+    fault::clear();
+    fault::run_at(Point::RetentionCopySync, 0, move || {
+        let mut writer = lose_damage_recover(&path, Damage::ZeroedTail).unwrap();
+        append(&mut writer, 9);
+        writer.checkpoint().unwrap();
+        *held.borrow_mut() = Some(writer);
+    });
+    let result = apply(dir.path(), &plan, How::Copy, archive.path());
+    fault::clear();
+    let error = result.unwrap_err().to_string();
+    assert!(error.contains("changed while it was copied"), "{error}");
+    let segment = fs::read(dir.path().join(segment_file_name(0))).unwrap();
+    assert_eq!(
+        segment[RECORD as usize + format::RECORD_HEADER_LEN as usize],
+        7
+    );
+    assert!(leftovers(dir.path()).is_empty());
+    drop(writer.borrow_mut().take());
+    assert!(inspect::verify(dir.path()).unwrap().problems.is_empty());
+}
+
+/// In the race, while the segment is out of the journal before it goes back, a reader that opens there finds what it
+/// finds once the segment is removed: here, where recovery left no other segment, an empty journal after the bounded
+/// retries (`Error::NotFound`, crash contract C14 says so); once it is back, a reader reads it.
+#[test]
+fn a_reader_while_a_segment_is_out_before_it_goes_back() {
+    let dir = journal();
+    let plan = plan(dir.path());
+    let path = dir.path().to_path_buf();
+    let writer = Rc::new(RefCell::new(None));
+    let held = Rc::clone(&writer);
+    let seen = Rc::new(RefCell::new(None));
+    let saw = Rc::clone(&seen);
+    let reader_dir = dir.path().to_path_buf();
+    fault::clear();
+    fault::run_at(Point::RetentionChecked, 0, move || {
+        *held.borrow_mut() = lose_damage_recover(&path, Damage::ZeroedTail);
+    });
+    fault::run_at(Point::RetentionPutBack, 0, move || {
+        *saw.borrow_mut() = Some(
+            Reader::open(&reader_dir, ReaderConfig::default())
+                .map(|_| ())
+                .map_err(|e| matches!(e, Error::NotFound { .. })),
+        );
+    });
+    assert!(retention::apply(dir.path(), &plan, &Action::Delete).is_err());
+    fault::clear();
+    assert_eq!(seen.borrow_mut().take(), Some(Err(true)));
+    let mut reader = Reader::open(dir.path(), ReaderConfig::default()).unwrap();
+    assert_eq!(reader.next_owned().unwrap().unwrap().seq, 0);
+    drop(writer.borrow_mut().take());
+}
+
+/// A temporary name that is taken (here by a file put there first) is skipped, never replaced.
+#[test]
+fn a_taken_temporary_name_is_skipped() {
+    for how in [How::Delete, How::Copy] {
+        let dir = journal();
+        let archive = tempfile::tempdir().unwrap();
+        let plan = plan(dir.path());
+        let at = now_ns();
+        let taken = dir.path().join(format!(
+            "{}.{}.{at}.removing",
+            segment_file_name(0),
+            std::process::id()
+        ));
+        fs::write(&taken, b"taken").unwrap();
+        fault::temporary_names_at(Some(at));
+        let report = apply(dir.path(), &plan, how, archive.path()).unwrap();
+        fault::clear();
+        assert_eq!(report.removed_segments, REMOVED, "{how:?}");
+        assert_eq!(fs::read(&taken).unwrap(), b"taken", "{how:?}");
+        assert_eq!(leftovers(dir.path()), [taken], "{how:?}");
+    }
 }
 
 /// A crash between a failed check and putting the segment back (in the race of the first test): the marker names the
@@ -554,6 +762,12 @@ fn putting_back_never_replaces_a_file_and_falls_back_to_link() {
                     assert_eq!(fs::read(&stranger).unwrap(), b"not a segment", "{case}");
                     assert!(out.exists(), "{case}");
                     assert!(error.contains(out.to_str().unwrap()), "{case}: {error}");
+                    // And why it was being put back.
+                    assert!(error.contains("the check that failed"), "{case}: {error}");
+                    assert!(
+                        error.contains("older than the checkpoint"),
+                        "{case}: {error}"
+                    );
                 } else {
                     assert!(!out.exists(), "{case}: {out:?}");
                     assert_marker_segment_exists(dir.path(), &case);
@@ -568,7 +782,39 @@ fn putting_back_never_replaces_a_file_and_falls_back_to_link() {
     }
 }
 
-/// On a file system without a no-replace rename (`EINVAL`), taking a segment out uses a plain rename to the new name,
+/// Putting back with `link` (no no-replace rename) when the unlink of the temporary name then fails: the segment is
+/// back, the temporary name stays a second link to it, and the error says so.
+#[test]
+fn a_second_link_left_by_putting_back_is_an_error() {
+    for how in [How::Delete, How::Copy] {
+        let dir = journal();
+        let archive = tempfile::tempdir().unwrap();
+        let plan = plan(dir.path());
+        let path = dir.path().to_path_buf();
+        let writer = Rc::new(RefCell::new(None));
+        let held = Rc::clone(&writer);
+        fault::clear();
+        fault::run_at(Point::RetentionChecked, 0, move || {
+            *held.borrow_mut() = lose_damage_recover(&path, Damage::ZeroedTail);
+        });
+        fault::fail_next(Point::RetentionPutBack, libc::EINVAL);
+        fault::fail_next(Point::RetentionPutBackUnlink, libc::EIO);
+        let error = apply(dir.path(), &plan, how, archive.path())
+            .unwrap_err()
+            .to_string();
+        fault::clear();
+        drop(writer.borrow_mut().take());
+        assert!(error.contains("second"), "{how:?}: {error}");
+        assert!(error.contains("the check that failed"), "{how:?}: {error}");
+        use std::os::unix::fs::MetadataExt;
+        let segment = fs::metadata(dir.path().join(segment_file_name(0))).unwrap();
+        assert_eq!(segment.nlink(), 2, "{how:?}");
+        assert_eq!(leftovers(dir.path()).len(), 1, "{how:?}");
+    }
+}
+
+/// On a file system without a no-replace rename (`EINVAL`) (only injected here: every supported file system has one),
+/// taking a segment out uses a plain rename to the new name,
 /// which is free: the removal goes ahead and leaves nothing behind.
 #[test]
 fn taking_out_falls_back_to_a_plain_rename() {

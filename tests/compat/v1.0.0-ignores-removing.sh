@@ -5,8 +5,8 @@
 # such a name (a crash after taking it out) where the other loses it (a removal that finished). Runs the same v1.0.0
 # commands on both (verify, inspect, tail, stats, export, status, archive, a writer that continues, one that recovers a
 # corrupt tail, one without a marker). Fails unless exit statuses, outputs and the segments left are the same and the
-# file under the temporary name is unchanged. Then this checkout's `archive` leaves a new name alone and unlinks one an
-# hour old whose process is gone.
+# file under the temporary name is unchanged. Then this checkout's `archive` leaves a new (and unsealed) name alone and
+# unlinks the old one: an hour old, its process gone, and the segment its seal names long removed.
 #
 # Usage: tests/compat/v1.0.0-ignores-removing.sh [work_dir]   (from the repository root; needs git and cargo)
 # Run weekly (.github/workflows/soak.yml). Builds into <work_dir>/target-v1.0.0 and <work_dir>/target; delete

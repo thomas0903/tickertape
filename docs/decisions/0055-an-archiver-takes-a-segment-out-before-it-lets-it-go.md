@@ -1,6 +1,7 @@
 # 0055: An archiver takes a segment out of the journal before it lets it go
 
-- **Status:** accepted on 2026-11-26 by the orchestrator under the owner's delegation (issue #83)
+- **Status:** accepted on 2026-11-26 by the orchestrator under the owner's delegation, after one independent review and
+  a re-check (issue #83)
 - **Date:** 2026-11-26
 - **Amends:** [0051](0051-retention-reads-what-it-needs.md) (point 3 of "Removals without a listing each"),
   [0044](0044-retention-without-a-backlog-wait.md); `format.md` → Journal directory (a new name)
@@ -47,10 +48,11 @@ A removal by an archiver other than the writer:
    has none, `link` and an unlink of the temporary name), syncs the directories, and returns the error.
 
 **Why this is sound.** Once the segment is out by name, no recovery can find it and no writer can start writing to it;
-only a writer that already holds it can go on. A valid marker naming a later segment, read after that, means no marker
-will name this segment again: a writer's markers only move forward, a later recovery starts from that marker or, without
-one, from a segment that is in the journal, and archivers only remove. If the marker names this segment or none, a
-writer may be writing to it, and it goes back. For a copy, a writer that filled the segment and moved its marker past it
+only a writer that already holds it can go on. A valid marker naming a later segment, read after that, means that the
+file is a sealed segment before the marker, as the policy asked to remove: a writer's markers only move forward, so one
+that held the segment has sealed it and moved past it, and a later recovery starts from that marker or, without one, from
+a segment that is in the journal. If the marker names this segment or none, a writer may be writing to it, and it goes
+back. (This holds for the removal that makes the check, not for a file a crash leaves behind: see "Leftovers".) For a copy, a writer that filled the segment and moved its marker past it
 before the check may have written to it after the copy was read, and the CRC sees that. Before the check, the archiver
 made the marker durable, so a power loss cannot bring back an earlier slot naming this segment.
 
@@ -59,12 +61,25 @@ as before.
 
 **Leftovers.** A crash between steps 1 and 3 leaves the segment in the destination (a move by rename: a completed move)
 or under its temporary name. The writer, its recovery, readers, `verify`, `status`, and 1.0.0's programs ignore the
-name: it does not parse as a segment (`{base:020}.tape`) nor as a writer's temporary file (`*.tape.tmp`). A later
-retention run (any archiver's, or a writer's own) unlinks it once it is an hour old by its name, its process is gone
-(`kill(pid, 0)`), and its segment is before a valid marker's segment (made durable first). The age and the process keep
-a removal in progress safe from another archiver that read the marker before a recovery; the marker condition makes the
-file one that nothing names or will. A name of the marker's own segment stays: a crash in the moment before putting a
-segment back, which a writer refuses as a dangling marker until the file is renamed back (`operations.md`).
+name: it does not parse as a segment (`{base:020}.tape`) nor as a writer's temporary file (`*.tape.tmp`). Such a file
+**may hold records the journal no longer has.** In the race, a crash after the take-out (before the checks, or before
+putting the segment back) leaves out of the journal a segment that a running writer already holds: the writer refuses
+nothing, fills the segment through its open file, rolls and moves its marker past it. The journal then verifies, a
+reader starts after that segment, and records the marker covers are only in the temporary file (found in the review).
+
+So a retention run (any archiver's, or a writer's own) unlinks a leftover only when its file is sealed and the segment
+its seal names is gone from the journal, below the oldest segment of the run's listing: retention has then removed newer
+records on purpose, and removing this file is what it would have done. Which segment a seal names is told from its CRC
+word, compared with the seals of the listed bases (the end of the file only); when none matches, the file is scanned
+and validated for the sequence number after its last record. An unsealed leftover, or one whose seal names a segment
+still in the journal, stays, and `tickertape archive` (`Report::leftovers`) and `status` (`removal_leftovers`) report
+it. As extra guards, a name counts only once it is an hour old by its name and its process is gone (`kill(pid, 0)`), so
+that a removal in progress is not touched; the decision itself depends on neither. Nothing is put back automatically:
+a segment put back in front of the oldest one can sit in front of a gap if another archiver removes that oldest segment
+from a listing taken before (the hazard C14 names). In the ordinary crash the clean-up waits one more segment's
+removal; an orphan stays until the segment after it is removed on purpose. A leftover of the marker's own segment (a
+crash before putting a segment back, with no writer running) makes a writer refuse the dangling marker until the file
+is renamed back (`operations.md`).
 
 ## Consequences
 
@@ -78,14 +93,21 @@ segment back, which a writer refuses as a dangling marker until the file is rena
   has been replaced", "no longer older than the checkpoint", "requires a valid checkpoint") and leaves the segment in
   place; a move by copy also leaves its copy, as any failed copy does. A reader that opens or seeks there meanwhile sees
   the segment gone (`SeqUnavailable`, or it starts at the next segment), as after a removal.
-- **What remains.** (1) A crash, or a power loss, between taking a segment out and putting it back: the dangling marker
-  above; nothing is lost, the file is renamed back by hand. (2) Putting back after another archiver, which found the
-  segment gone meanwhile, has removed its successor: the segment is back in front of a gap. Nothing is lost; readers
-  and retention stop there with a broken chain, and, without a valid marker, a writer's recovery refuses; remove the
-  segment by hand. Both need a recovery or a lost marker inside the archiver's few system calls. (3) An archiver in
-  another PID namespace stopped for over an hour in the middle of a removal: another archiver may take its temporary
-  name for a leftover. (4) A copy's check is a CRC32C, so a change that keeps the CRC is not seen.
+- **What remains.** (1) A crash, or a power loss, between taking a segment out and putting it back. With no writer
+  running, a writer then refuses the dangling marker until the file is renamed back by hand. With a writer running
+  that holds the segment, nothing refuses: the writer moves on and the segment is an orphan that `verify` does not
+  report, whose records the journal no longer has; it is reported as a leftover and kept until the segment after it
+  is removed on purpose, and an operator can put it back (`operations.md`). (2) Putting back after another archiver,
+  which found the segment gone meanwhile, has removed its successor: the segment is back in front of a gap. Its records
+  are kept; readers and retention stop there with a broken chain, and, without a valid marker, a writer's recovery
+  refuses; remove the segment by hand. Both need a recovery or a lost marker inside the archiver's few system calls.
+  (3) A reader that opens while a segment is out before it goes back starts after it, skipping records that then come
+  back, or, if it was the only segment, gets `Error::NotFound` after its bounded retries (crash contract C14). (4) A
+  copy's check is a CRC32C, so a change that keeps the CRC is not seen. (5) A leftover is unlinked by name once the
+  checks above pass; a removal in progress is protected by the age and the process test, which another PID namespace
+  or a clock step can defeat, but such a file would then have to be a sealed segment whose successor retention removed.
 - **Tests.** `tests/retention_recovery_race.rs` (the reproduction; the sweep, quick and `--ignored`; a crash at each new
-  step; leftovers and what removes them; putting back, with and without a no-replace rename, next to a file that has
+  step; leftovers and what removes them, the orphan of the review among them; a segment written to after it was
+  copied; putting back, with and without a no-replace rename, next to a file that has
   appeared; readers meanwhile), `tests/retention_at_scale.rs` (another archiver also at the new points), and
   `tests/compat/v1.0.0-ignores-removing.sh` (1.0.0's programs beside a leftover).

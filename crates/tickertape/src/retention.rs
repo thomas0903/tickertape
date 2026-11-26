@@ -109,6 +109,8 @@ pub struct Plan {
     directory: journal::Identity,
     /// Temporary names of segments that removals took out of the journal and left there ([`Leftover`]).
     leftovers: Vec<Leftover>,
+    /// The bases of the segments the plan's listing showed, kept only when there are leftovers.
+    listed: Vec<u64>,
 }
 
 impl Plan {
@@ -131,16 +133,22 @@ pub struct Report {
     pub removed_bytes: u64,
     /// Planned files already absent at the oldest end (a concurrent archiver).
     pub already_removed_segments: u64,
+    /// Temporary names of segments that interrupted removals left in the journal directory
+    /// (`{base:020}.tape.{pid}.{unix_ns}.removing`, ADR 0055) and that this run left there: their segments may hold
+    /// records the journal no longer has (`docs/operations.md` says what to do). In
+    /// [`crate::Writer::retention_report`], those of the writer's last run.
+    pub leftovers: Vec<PathBuf>,
 }
 
 impl Report {
-    /// Adds another report's counts to this one (saturating).
+    /// Adds another report's counts to this one (saturating), and takes its leftovers.
     pub(crate) fn absorb(&mut self, other: &Report) {
         self.removed_segments = self.removed_segments.saturating_add(other.removed_segments);
         self.removed_bytes = self.removed_bytes.saturating_add(other.removed_bytes);
         self.already_removed_segments = self
             .already_removed_segments
             .saturating_add(other.already_removed_segments);
+        self.leftovers.clone_from(&other.leftovers);
     }
 }
 
@@ -318,10 +326,16 @@ fn plan_at(
     if listed.is_empty() {
         return Err(Error::NotFound { dir: dir.into() });
     }
+    let listed_bases = if leftovers.is_empty() {
+        Vec::new()
+    } else {
+        listed.iter().map(|s| s.base).collect()
+    };
     let mut plan = Plan {
         segments: Vec::new(),
         directory,
         leftovers,
+        listed: listed_bases,
     };
     if policy == &Policy::default() {
         return Ok(plan);
@@ -436,8 +450,9 @@ fn reasons(policy: &Policy, count: usize, bytes: u128, now: u64, sealed: u64) ->
 /// unlinks. Before it lets the file go, it checks that it is the file checked before (same device and inode), that the
 /// marker, read again and made durable, still names a later segment, and for a copy that the file still holds what was
 /// copied. If not, it renames the file back, never replacing a file that has appeared under the segment's name, and
-/// returns the error. A temporary name left behind by a crash is ignored by everything else; a later run unlinks it once
-/// it is an hour old, its process is gone, and its segment is before a valid marker's (`docs/operations.md`).
+/// returns the error. A temporary name left behind by a crash is ignored by everything else, and reported in
+/// [`Report::leftovers`]; it may hold records the journal no longer has, so a later run unlinks it only once retention
+/// has removed the segment its seal names (see [`Report::leftovers`] and `docs/operations.md`).
 ///
 /// Before the first removal that relies on a checkpoint marker slot, the marker file is synced (once per slot), so
 /// that the slot is durable: a writer writes a slot before it syncs it, and a power loss in between must not bring back
@@ -592,7 +607,7 @@ fn apply_into(
             return Err(error);
         }
     }
-    remove_leftovers(dir, &plan.leftovers, &mut synced);
+    report.leftovers = remove_leftovers(dir, &plan.leftovers, &plan.listed);
     Ok(())
 }
 
@@ -908,6 +923,13 @@ fn check_seal(file: &File, path: &Path, size: u64, base: u64, successor: u64) ->
 /// and the seal (normally a single read): what was left free when the segment rolled, less than the frame that did
 /// not fit, plus the trailer.
 fn seal_at_end(file: &File, path: &Path, size: u64, successor: u64) -> Result<bool> {
+    Ok(seal_crc_at_end(file, path, size)? == Some(format::seal_crc(successor)))
+}
+
+/// The CRC word of the seal that is the last non-zero 8-byte word of the record area of a segment of `size` bytes (a
+/// multiple of 64 KiB), with room for at least one record before it, or `None` if that word is no seal. Reads as
+/// [`seal_at_end`] says.
+fn seal_crc_at_end(file: &File, path: &Path, size: u64) -> Result<Option<u32>> {
     let first_slot = format::SEGMENT_HEADER_LEN as u64;
     let mut end = size;
     let mut chunk = TAIL_READ;
@@ -924,14 +946,14 @@ fn seal_at_end(file: &File, path: &Path, size: u64, successor: u64) -> Result<bo
             let commit = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
             let crc = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
             // The earliest seal follows one record with an empty payload.
-            return Ok(at >= first_slot + format::RECORD_HEADER_LEN as u64
-                && commit == format::SEAL_MARKER
-                && crc == format::seal_crc(successor));
+            let sealed = at >= first_slot + format::RECORD_HEADER_LEN as u64
+                && commit == format::SEAL_MARKER;
+            return Ok(sealed.then_some(crc));
         }
         end = start;
         chunk = (chunk * 2).min(TAIL_READ_MAX);
     }
-    Ok(false)
+    Ok(None)
 }
 
 /// Reads segment `base` (open as `file`) from its first record and validates every record and the seal, which must
@@ -992,6 +1014,7 @@ fn move_segment(
                 copy.write_all(bytes)
                     .map_err(|e| Error::io("write archive copy", &target, e))
             })?;
+            crate::fault::hook(crate::fault::Point::RetentionCopySync);
             crate::fault::inject(crate::fault::Point::RetentionCopySync)
                 .map_err(|e| Error::io("sync archive copy", &target, e))?;
             mmap::sync_all(&copy).map_err(|e| Error::io("sync archive copy", &target, e))?;
@@ -1105,6 +1128,11 @@ impl Leftover {
     }
 }
 
+/// Whether `name` is the temporary name of a segment being removed ([`REMOVING`]).
+pub(crate) fn is_leftover_name(name: &str) -> bool {
+    Leftover::parse(name).is_some()
+}
+
 /// `rename(from, to)` that never replaces a file at `to`: `renameat2(RENAME_NOREPLACE)` on Linux, `renameatx_np`
 /// with `RENAME_EXCL` on macOS.
 fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
@@ -1127,7 +1155,8 @@ fn no_replace_unsupported(e: &io::Error) -> bool {
 /// Renames the segment at `path` to a new temporary name in `dir` ([`REMOVING`]) and returns that name. Nothing is
 /// replaced: a name that is taken is skipped. A missing segment is the error "not found", as for an unlink.
 fn take_out(dir: &Path, path: &Path, base: u64) -> Result<PathBuf> {
-    for unix_ns in (crate::clock::realtime_ns()..).take(64) {
+    let start = crate::fault::temporary_name_ns().unwrap_or_else(crate::clock::realtime_ns);
+    for unix_ns in (start..).take(64) {
         let temp = dir.join(Leftover::name(base, unix_ns));
         let renamed = crate::fault::inject(crate::fault::Point::RetentionTakeOut)
             .and_then(|()| rename_no_replace(path, &temp));
@@ -1157,8 +1186,8 @@ fn take_out(dir: &Path, path: &Path, base: u64) -> Result<PathBuf> {
 
 /// Renames a segment taken out of the journal (at `at`) back to `path` without replacing a file there, and syncs
 /// `dirs`. Without a no-replace rename it links `path` to the file (`link` never replaces either) and unlinks `at`, a
-/// name only this removal uses; if that unlink fails, the second name stays behind (a leftover, or a copy of the
-/// segment in the destination), harmlessly.
+/// name only this removal uses. If that unlink fails, the segment is back but `at` stays a second link to it (a
+/// writer writing to the segment writes through it too), and that is the error.
 fn put_back(at: &Path, path: &Path, dirs: &[&Path]) -> Result<()> {
     crate::fault::hook(crate::fault::Point::RetentionPutBack);
     let renamed = crate::fault::inject(crate::fault::Point::RetentionPutBack)
@@ -1167,7 +1196,15 @@ fn put_back(at: &Path, path: &Path, dirs: &[&Path]) -> Result<()> {
         Ok(()) => {}
         Err(e) if no_replace_unsupported(&e) => {
             fs::hard_link(at, path).map_err(|e| Error::io("put back retention segment", at, e))?;
-            let _ = fs::remove_file(at);
+            crate::fault::inject(crate::fault::Point::RetentionPutBackUnlink)
+                .and_then(|()| fs::remove_file(at))
+                .map_err(|e| {
+                    Error::io(
+                        "unlink a second link to a segment put back (it stays a second name of the segment)",
+                        at,
+                        e,
+                    )
+                })?;
         }
         Err(e) => return Err(Error::io("put back retention segment", at, e)),
     }
@@ -1229,13 +1266,19 @@ impl Out<'_> {
             crate::fault::hook(crate::fault::Point::RetentionVerified);
             return Ok(());
         };
-        put_back(
-            at,
-            &journal::segment_path(self.dir, self.segment.base_seq),
-            dirs,
-        )?;
+        let path = journal::segment_path(self.dir, self.segment.base_seq);
+        let put = put_back(at, &path, dirs);
+        // Not removed: put back, or, if that failed, still under `at`, out of the journal but not deleted or moved.
         *removed = false;
-        Err(failed)
+        match put {
+            Ok(()) => Err(failed),
+            // Both reasons. Never "not found", which a caller would take for another archiver's removal.
+            Err(error) => Err(Error::io(
+                "put back retention segment",
+                at,
+                io::Error::other(format!("{error}; the check that failed: {failed}")),
+            )),
+        }
     }
 
     fn marker_past(&mut self) -> Result<()> {
@@ -1253,28 +1296,72 @@ impl Out<'_> {
     }
 }
 
-/// Unlinks temporary names of segments that removals left behind ([`REMOVING`]: a crash, or a segment that could not
-/// be put back), best effort. Only names older than [`LEFTOVER_AGE_NS`] whose process is gone count, so that a removal
-/// in progress is never touched (its owner is alive, and its name is new), and of those only names of segments before
-/// a valid marker's segment, made durable first: such a file is out of the journal and before the marker, so nothing
-/// names it or will (see [`Out::verify`]), and nothing else gives a file that name. A name of the marker's own segment
-/// stays (a crash in the moment a segment was put back; `docs/operations.md` says what to do).
-fn remove_leftovers(dir: &Path, leftovers: &[Leftover], synced: &mut Option<CheckpointSlot>) {
-    if leftovers.is_empty() {
-        return;
-    }
-    let Ok(Some(marker)) = durable_checkpoint(dir, synced) else {
-        return;
-    };
+/// Unlinks the temporary names of segments that interrupted removals left behind ([`REMOVING`]), best effort, and
+/// returns those it leaves.
+///
+/// Such a file may hold records the journal no longer has: a crash between taking a segment out and putting it back,
+/// while a writer that already held the segment filled it and moved its marker past it, leaves the only copy of
+/// covered records there (ADR 0055), and nothing names that file. So a name goes only when the file is sealed and the
+/// segment its seal names is gone from the journal, below its oldest segment (`listed`, the plan's listing): newer
+/// records have then been removed on purpose, by retention, and removing this file is what retention would have done.
+/// An unsealed file, or one whose seal names a segment still listed (or one that is not, but above the oldest), stays
+/// and is reported. As an extra guard, a name counts only once it is [`LEFTOVER_AGE_NS`] old and its process is gone,
+/// so that a removal in progress is never touched. Nothing is ever put back: a segment put in front of the oldest one
+/// could sit in front of a gap (crash contract C14).
+///
+/// Which segment a seal names is told from its CRC word: compared with the seal of each listed base, which costs the
+/// end of the file only; when none matches, the whole file is scanned, and its records validated, for the sequence
+/// number after its last record.
+fn remove_leftovers(dir: &Path, leftovers: &[Leftover], listed: &[u64]) -> Vec<PathBuf> {
     let now = crate::clock::realtime_ns();
+    let mut left = Vec::new();
     for leftover in leftovers {
-        if leftover.base < marker.segment_base_seq
-            && now.saturating_sub(leftover.unix_ns) >= LEFTOVER_AGE_NS
+        let path = dir.join(&leftover.name);
+        let goes = now.saturating_sub(leftover.unix_ns) >= LEFTOVER_AGE_NS
             && !process_alive(leftover.pid)
-        {
-            let _ = fs::remove_file(dir.join(&leftover.name));
+            && successor_gone(&path, leftover.base, listed).unwrap_or(false);
+        if goes {
+            match fs::remove_file(&path) {
+                Ok(()) => continue,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(_) => {}
+            }
+        }
+        if path.exists() {
+            left.push(path);
         }
     }
+    left
+}
+
+/// Whether the file at `path`, a segment taken out of the journal with base `base`, is sealed and its seal names a
+/// segment below the oldest in `listed` (see [`remove_leftovers`]).
+fn successor_gone(path: &Path, base: u64, listed: &[u64]) -> Result<bool> {
+    let Some(&oldest) = listed.first() else {
+        return Ok(false);
+    };
+    let file = File::open(path).map_err(|e| Error::io("open removed segment", path, e))?;
+    let size = file
+        .metadata()
+        .map_err(|e| Error::io("stat removed segment", path, e))?
+        .len();
+    if format::validate_segment_size(size).is_err() {
+        return Ok(false);
+    }
+    let Some(crc) = seal_crc_at_end(&file, path, size)? else {
+        return Ok(false);
+    };
+    if listed
+        .iter()
+        .any(|b| *b > base && format::seal_crc(*b) == crc)
+    {
+        return Ok(false);
+    }
+    journal::read_header(&file, path, base)?;
+    let scan = journal::scan_open(&file, path, base)?;
+    Ok(matches!(scan.end, ScanEnd::Seal)
+        && format::seal_crc(scan.next_seq) == crc
+        && scan.next_seq < oldest)
 }
 
 /// Whether process `pid` may be running (`kill(pid, 0)`); true when it cannot be told.
