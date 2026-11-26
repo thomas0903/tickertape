@@ -1,0 +1,56 @@
+#!/usr/bin/env bpftrace
+/*
+ * What one pinned reader thread that spins (`wait=spin`) does when it falls behind, and whether its CPU ran at all.
+ * Written for the aarch64 mapped reader's 10 ms maximum (docs/benchmarks.md, 2026-11-26): a pause of a spinning
+ * thread is either time off its CPU (OFF), a long page fault or system call (FAULT, SYS), interrupt work on its CPU
+ * (IRQ, SOFTIRQ), or none of these while the thread is on its CPU. In the last case the GAP lines tell whether the
+ * CPU itself stopped: with CONFIG_HZ=1000 and no nohz_full, a busy CPU expires a timer every millisecond, so a GAP of
+ * 10 ms means the vCPU did not run (the hypervisor preempted it; Google Cloud guests report no steal time) or ran
+ * with interrupts off. A pause with none of the lines is the reader spinning on data it does not see.
+ *
+ *   sudo bpftrace benches/diagnostics/reader-pauses.bt <tid> <cpu> <min-us>
+ *
+ * <tid> is the reader's measuring thread (for tt-sustained, the pid of `tt-sustained reader ... --index N`), <cpu>
+ * the CPU it is pinned to. Lines, with wall-clock Unix seconds:
+ *   <t> OFF us= state= switches= <kernel stack>   the thread was off its CPU for at least <min-us>; then the tasks
+ *                                                  that ran on <cpu> meanwhile (@ran)
+ *   <t> FAULT us=        a page fault of the thread of at least <min-us>
+ *   <t> SYS id= us=      a system call of the thread of at least <min-us> (id: the architecture's syscall number)
+ *   <t> GAP us=          no hrtimer expired on <cpu> for at least 2 ms
+ *   <t> IRQ <n> us=, <t> SOFTIRQ <vec> us=   a handler on <cpu> of at least 100 us
+ * Histograms at the end: off-CPU, fault and per-syscall durations, gaps between timer expiries.
+ */
+tracepoint:sched:sched_switch /args.prev_pid == $1/ { @off = nsecs; @offstate = args.prev_state; @offstack = kstack(12); @others = 0; }
+tracepoint:sched:sched_switch /cpu == $2 && @off && args.next_pid != $1 && args.prev_pid != $1/ { @others = @others + 1; }
+tracepoint:sched:sched_switch /cpu == $2 && @off && args.next_pid != $1/ { @ran[args.next_comm] = count(); }
+tracepoint:sched:sched_switch /args.next_pid == $1 && @off/ {
+  $d = (nsecs - @off) / 1000;
+  @off_us = hist($d);
+  if ($d >= $3) {
+    printf("%s OFF us=%d state=%d switches=%d %s\n", strftime("%s.%f", @off), $d, @offstate, @others, @offstack);
+    print(@ran);
+  }
+  clear(@ran);
+  @off = 0;
+}
+kprobe:handle_mm_fault /tid == $1/ { @f = nsecs; }
+kretprobe:handle_mm_fault /tid == $1 && @f/ {
+  $d = (nsecs - @f) / 1000; @fault_us = hist($d);
+  if ($d >= $3) { printf("%s FAULT us=%d\n", strftime("%s.%f", @f), $d); }
+  @f = 0;
+}
+tracepoint:raw_syscalls:sys_enter /tid == $1/ { @s = nsecs; @sid = args.id; }
+tracepoint:raw_syscalls:sys_exit /tid == $1 && @s/ {
+  $d = (nsecs - @s) / 1000; @sys_us[@sid] = hist($d);
+  if ($d >= $3) { printf("%s SYS id=%d us=%d\n", strftime("%s.%f", @s), @sid, $d); }
+  @s = 0;
+}
+tracepoint:timer:hrtimer_expire_entry /cpu == $2/ {
+  if (@lt) { $g = (nsecs - @lt) / 1000; @tick_gap_us = hist($g); if ($g >= 2000) { printf("%s GAP us=%d\n", strftime("%s.%f", @lt), $g); } }
+  @lt = nsecs;
+}
+tracepoint:irq:irq_handler_entry /cpu == $2/ { @i = nsecs; @iv = args.irq; }
+tracepoint:irq:irq_handler_exit /cpu == $2 && @i/ { $d = (nsecs - @i) / 1000; if ($d >= 100) { printf("%s IRQ %d us=%d\n", strftime("%s.%f", @i), @iv, $d); } @i = 0; }
+tracepoint:irq:softirq_entry /cpu == $2/ { @si = nsecs; @sv = args.vec; }
+tracepoint:irq:softirq_exit /cpu == $2 && @si/ { $d = (nsecs - @si) / 1000; if ($d >= 100) { printf("%s SOFTIRQ %d us=%d\n", strftime("%s.%f", @si), @sv, $d); } @si = 0; }
+END { clear(@off); clear(@offstate); clear(@offstack); clear(@others); clear(@ran); clear(@f); clear(@s); clear(@sid); clear(@lt); clear(@i); clear(@iv); clear(@si); clear(@sv); }

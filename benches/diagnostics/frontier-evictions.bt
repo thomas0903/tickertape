@@ -1,0 +1,49 @@
+#!/usr/bin/env bpftrace
+/*
+ * Does the kernel take page-cache pages away at the write frontier of the file being written? Written for the lagging
+ * view of issue #43 (docs/benchmarks.md, 2026-11-26): a zero-copy reader that saw a record's commit word while the
+ * bytes in the frame's next page still read as zeros. Run it beside a sustained run and line its lines up, by wall
+ * clock, with the moments a reader re-read a slot that failed validation.
+ *
+ *   sudo bpftrace benches/diagnostics/frontier-evictions.bt
+ *
+ * For every inode it keeps the highest page index added to the page cache (the frontier: for an active segment, the
+ * prefault helper's position, 64 pages past the writer's by default) and when a page was last added. Lines, with
+ * wall-clock Unix seconds:
+ *   <t> DEL ino= idx= order= frontier= comm=   a folio within 128 pages of the frontier was removed from the page
+ *                                              cache (kswapd0: reclaim; a task name: direct reclaim or truncation)
+ *   <t> MIG ino= idx= frontier= comm=          such a folio was replaced by migration (compaction), which the removal
+ *                                              tracepoint does not report
+ * Only inodes that had a page added in the last 100 ms (the active segment) are reported, so removing old segments
+ * prints nothing. To map an inode to a segment, list the journal with `ls -i` while the run lasts. Every 10 s it
+ * prints counts. __folio_migrate_mapping is a kernel-internal function (Linux 6.12 to 7.0 at least); where it does not
+ * exist, delete that probe.
+ *
+ * Overhead: a map update per page added (hundreds of thousands a second under an unpaced writer).
+ */
+tracepoint:filemap:mm_filemap_add_to_page_cache {
+  $e = args.index + (1 << args.order);
+  if ($e > @max[args.i_ino]) { @max[args.i_ino] = $e; }
+  @last[args.i_ino] = nsecs;
+  @adds = count();
+}
+tracepoint:filemap:mm_filemap_delete_from_page_cache {
+  @dels = count();
+  $m = @max[args.i_ino];
+  if ($m > 0 && args.index + 128 >= $m && nsecs - @last[args.i_ino] < 100000000) {
+    printf("%s DEL ino=%d idx=%d order=%d frontier=%d comm=%s\n", strftime("%s.%f", nsecs), args.i_ino, args.index, args.order, $m, comm);
+    @near[comm] = count();
+  }
+}
+kprobe:__folio_migrate_mapping {
+  $m = (struct address_space *)arg0; $f = (struct folio *)arg2;
+  $ino = $m->host->i_ino; $idx = $f->index;
+  @migs = count();
+  $fr = @max[$ino];
+  if ($fr > 0 && $idx + 128 >= $fr && nsecs - @last[$ino] < 100000000) {
+    printf("%s MIG ino=%d idx=%d frontier=%d comm=%s\n", strftime("%s.%f", nsecs), $ino, $idx, $fr, comm);
+    @nearmig[comm] = count();
+  }
+}
+interval:s:10 { print(@near); print(@nearmig); print(@adds); print(@dels); print(@migs); }
+END { clear(@max); clear(@last); }

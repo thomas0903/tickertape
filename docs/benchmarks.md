@@ -22,6 +22,8 @@ The profiles of v1.0.0's readers, notification and serialization paths (where th
 what remains per record) are [under 2026-11-25](#2026-11-25-where-the-cpu-time-goes-profiles-of-the-readers-notification-and-serialization-google-cloud-vms).
 Seeks with and without the seek index, at both payloads and with both readers, on `main` after #74, are
 [under 2026-11-26](#2026-11-26-seeks-with-and-without-the-seek-index-google-cloud-vms).
+The investigation of the two aarch64 observations that 1.0.0 left open (the zero-copy reader's 10 ms maximum, the
+lagging view of issue #43) is [under 2026-11-26](#2026-11-26-the-two-aarch64-observations-left-open-by-100-google-cloud-vms).
 
 **How Chronicle Queue and tickertape were configured in the comparisons below.** Open-source Chronicle Queue (2026.8,
 the version `compare/chronicle/pom.xml` pins) ran with its default queue options, except `SyncMode.SYNC` in the
@@ -3330,6 +3332,188 @@ With one record per checkpoint (60 records, pauses of 23–63 ms), every pairing
 durable-only reader beside a 1.0.0 writer got them 0.65 ms (x86-64) and 0.63 ms (aarch64) after the append at the
 median (checkpoints took 0.29 and 0.05 ms), at most 2.2 and 1.1 ms. Readers of both versions attached while the writer
 changed from 1.0.0 to new and back got 120 of 120 records each.
+
+## 2026-11-26, the two aarch64 observations left open by 1.0.0 (Google Cloud VMs)
+
+Two things seen on Google Axion (`c4a`) and recorded without an explanation (issues #60 and #62, roadmap "ARM server
+measurements"): the zero-copy reader's maximum of about 10 ms in the checkpoint runs of 2026-11-20, and the platform
+mechanism behind the lagging view of issue #43. All of it ran on **Google Cloud virtual machines, not bare metal**, in
+one morning. The raw output (results, traces, counters, scripts, the reproducer) is kept outside the repository.
+
+### Environment and commands
+
+Ubuntu 24.04, kernel 7.0.0-1017-gcp on both architectures: `CONFIG_HZ=1000`, `PREEMPT_LAZY`, `NO_HZ_FULL` built but not
+enabled (no `nohz_full=` on the command line), `CONFIG_ARCH_WANT_BATCHED_UNMAP_TLB_FLUSH=y` (reclaim and migration batch
+their TLB invalidations), `CONFIG_ARM64_CONTPTE=y` on aarch64, multi-generational LRU enabled
+(`/sys/kernel/mm/lru_gen/enabled` 0x0003), transparent huge pages `madvise`, 4 KiB pages, `vm.compaction_proactiveness`
+20, write-back sysctls at their defaults. The guests report no steal time (`/proc/stat` column 8 stayed 0 on every
+CPU). Journals on ext4 on the first local NVMe SSD (`mkfs.ext4 -E lazy_itable_init=0,lazy_journal_init=0`, mounted
+`noatime`). rustc 1.100.0, bpftrace 0.20.2.
+
+| Machine (us-east1-b) | CPU, vCPUs, memory | Time (UTC) | Used for |
+|---|---|---|---|
+| `c4a-standard-16-lssd` | Google Axion (Neoverse-V2), 16, 62 GiB | 05:52–06:10 | the 10 ms maximum |
+| `c4a-standard-8-lssd` | Axion, 8, 31 GiB | 05:52–07:56 | the lagging view |
+| `c4-standard-4-lssd` | Xeon 6985P-C, 4, 14 GiB | 07:14–07:38 | the lagging view on x86-64 |
+
+Commits: `main` at `43deb9f3` with a local patch that is not in the repository: counters in the reader's two re-read
+paths (a slot that failed validation: how often its first read failed, how often the back-to-back re-reads cleared it,
+how often the 50 ms window was entered and after how long a re-read validated; and the empty-slot confirmation of ADR
+0050), printed by `tt-sustained` at the end of each reader; `f194c42`, the commit of the checkpoint finish round, and
+`279f59a`, the commit at which issue #43 was found, both built from `git archive`. `tt-lagreader` (local, not in the
+repository) is a zero-copy reader that follows a journal from its first record with `Backoff::busy_spin()` and prints
+the counters, with the time each one moved; built against `main` and against `279f59a`, the second counts the false
+corruption reports that version makes (it reported after three back-to-back re-reads) and carries on.
+
+### The zero-copy reader's 10 ms maximum
+
+What was recorded (2026-11-20, one `c4a-standard-16-lssd` in us-east1-b, `f194c42`): every run of the finish round in
+which the writer kept its schedule had a mapped-reader maximum of 10.04–10.17 ms, with and without checkpoints, with
+and without early write-back, on ext4 and on xfs (15 runs of 120–190 s, 1 to 11 seconds per run with such a maximum, 53
+in all). Read again from the raw series for this section: in those seconds the writer's appends took at most 0.2 ms and
+the safe reader's maximum was 0.2 ms; in all 3,322 seconds of those runs neither the writer (busy-waiting for its
+schedule on CPU 1) nor the safe reader (CPU 3) had a second with a delay of 9.5–10.5 ms. Only the reader on CPU 2, the
+spinning zero-copy reader, had them. The maximum showed up nowhere else: in all other aarch64 sessions of 8 and 16
+vCPUs, a second with a 10 ms mapped-reader maximum is rare and inside runs dominated by longer stalls.
+
+Reproduction, with the finish round's command without checkpoints (its visibility-only run), on a new VM of the same
+type in the same zone:
+
+```sh
+tt-sustained run --dir /data/tt/run --out … --duration 180s --warmup 10s --payload 1024 --rate 250000 \
+  --readers mapped,safe:wait=default --cpus 1,2,3,4 --helper-cpus 5,6,7 --json
+```
+
+| Run | Commit | Mapped reader max | p99.99 | p99.9 | Seconds with a max ≥ 9.5 ms |
+|---|---|---|---|---|---|
+| 2026-11-20, visibility-only, ext4 / xfs | `f194c42` | 10.05 ms / 10.15 ms | 4.6 ms / 7.9 ms | 482 / 590 | 3 / 8 of 191 |
+| 2026-11-26 | `main` + counters | 911 | 841 | 442 | 0 of 191 |
+| 2026-11-26 | `f194c42` | 4.18 ms | 807 | 380 | 0 of 191 |
+| 2026-11-26, traced (`reader-pauses.bt`) | `main` + counters | 925 | 852 | 458 | 0 of 191 |
+
+Latencies in µs unless a cell says ms. **Not reproduced:** no 10 ms maximum in 573 s on the new VM, at either commit. At
+the rate of 2026-11-20 (3.5 a run) three runs without one would happen by chance less than once in 10,000. Earlier, on 8
+vCPUs, the same command at `f194c42` and at `v1.0.0` did not reproduce it either (2026-11-25, roll and journal stalls).
+It belonged to that VM (or its host), not to the machine type or the commit.
+
+What the reader's maximum is where the 10 ms is absent (the traced run, `benches/diagnostics/reader-pauses.bt` on the
+reader's thread and CPU, events of 300 µs or more): at each roll the reader unmaps the segment it finished, and that
+`munmap` of 128 MiB took 0.61–0.76 ms (375 calls, p50 0.64 ms); that is the maximum. The thread was off its CPU 374
+times, for at most 64 µs (preempted by kernel threads); no page fault took 300 µs, no interrupt or softirq on its CPU
+100 µs, and the CPU's timer never stopped for more than 2.0 ms.
+
+What the 10 ms was not, from the recorded data and the code: the reader's own waiting (a `wait=spin` reader never sleeps
+or yields, and at `f194c42` the record path had no sleep at all: the 50 ms re-read window, whose pauses of 10 µs
+doubling up to 5 ms add up to about 10 ms by the tenth, came later with #44); the timer tick (`CONFIG_HZ=1000`);
+checkpoints, early write-back, the filesystem and the writer (it happened without checkpoints and without early
+write-back, on ext4 and xfs, while the writer kept its schedule); helper threads on the reader's CPU (they were on CPUs
+5–7). Not ruled out: a pause of vCPU 2 by the hypervisor, which the guest cannot see in its accounting, and
+`tt-sustained`'s lag sampler, an unpinned thread of the reader process that wakes every 10 ms (`--lag-interval`), the
+same value. **Not explained.** What would settle it if it comes back: `reader-pauses.bt` during the run (a 10 ms `OFF`
+line names what ran instead; a 10 ms `GAP` line on the reader's CPU with no `OFF` means the vCPU stopped; neither means
+the reader spun without seeing the data), a run with `--lag-interval 25ms` (the maximum moves to 25 ms if the sampler is
+the cause), and the zero-copy and safe readers' CPUs swapped.
+
+### The lagging view of issue #43
+
+Command: issue #43's, with memory compaction forced every second and the journal larger than RAM (64 GiB of retention on
+31 GiB). In the runs with `tt-lagreader`, `tt-sustained` ran only its copying reader, and the two `tt-lagreader`s
+(zero-copy, built against `main` and against `279f59a`) followed the same journal on CPUs 4 and 5, so that one run
+measures both reader versions on the same records.
+
+```sh
+( while true; do echo 1 | sudo tee /proc/sys/vm/compact_memory > /dev/null; sleep 1; done ) &
+tt-lagreader /data/q2/long <s> & tt-lagreader-279f59a /data/q2/long <s> &      # pinned with taskset -c 4, -c 5
+tt-sustained run --dir /data/q2/long --out … --unpaced --duration <s>s --payload 1024 --checkpoint-every 1s \
+  --retain-bytes 68719476736 --readers safe:wait=default --checkpoint-mode background --cpus 1,2,3,4,5,6 --json
+sudo bpftrace benches/diagnostics/frontier-evictions.bt      # the traced runs
+```
+
+A "lag event" is a slot whose first read failed validation in a zero-copy reader of `main` (the record's commit word
+was visible, its bytes did not validate yet); "window" means the back-to-back re-reads failed too and the reader entered
+its 50 ms window. "False reports" are the `279f59a` reader's corruption reports, each one a record the writer had
+published correctly. "Removals at the frontier" are page-cache folios of the active segment removed within 128 pages of
+the highest page added (the writer is 64 pages behind it), from the trace.
+
+| Run | Writer | Traced | Length | Records | Lag events (window; longest window) | False reports (`279f59a`) | Removals at the frontier | Events within 2 ms of a removal |
+|---|---|---|---|---|---|---|---|---|
+| aarch64 | `main`, its zero-copy reader in `tt-sustained` | no | 600 s | 157,259,192 | 0 | – | not traced | – |
+| aarch64 | `279f59a`, its zero-copy reader in `tt-sustained` | no | 227 s | – | – | 1 (the run stopped) | not traced | – |
+| aarch64 | `279f59a` | no | 600 s | 155,543,436 | 1 (0) | 1 | not traced | – |
+| aarch64 | `279f59a` | removals | 1,000 s | 245,710,404 | 1 (1; 69 µs) | 1 | 17,713 | 1 of 2 (the false report; the lag event in the same second as a burst) |
+| aarch64 | `main` | removals | 1,000 s | 294,238,395 | 5 (4; 69 µs) | 2 (two of the same five records) | 3,749 | 1 of 5 |
+| aarch64 | `main` | removals, migrations | 1,000 s | 290,063,082 | 3 (2; 69 µs) | 0 | 4,275 (and 173 migrations) | 1 of 3 |
+| aarch64, journal within RAM (8 GiB of retention) | `main` | removals, migrations | 1,000 s | 288,763,696 | 0 | 0 | none by reclaim (kswapd reclaimed no page in the run); 54 migrations | – |
+| x86-64 | `main` | removals | 900 s | 298,747,427 | 0 | – | 8,382 | – |
+
+The independent pair (`viewlag.c`, a writer and a reader written without tickertape code: payload words, then a
+sequence word, then the commit word with a release store, through `MAP_SHARED` mappings of 128 MiB files; the writer's
+helper populates 4 MiB ahead with `MADV_POPULATE_WRITE`, starts write-back of each written MiB and `fdatasync`s the
+active file every second; old files are unlinked; the reader checks every payload word after an acquire load of the
+commit word, and `pread`s the file when its view disagrees) ran 600 s on the aarch64 VM under the same pressure (64 GiB
+of files, compaction forced; 192,607,390 frames; 161 GiB reclaimed by kswapd, 911,158 pages migrated): **no lag, and no
+commit word that the file held and the mapping did not**. Like the independent pair of issue #43's investigation, it
+does not reproduce the effect: its rate is too low, or tickertape's writer does something to the page cache that it
+does not. Its reader also reports a lag of the commit word itself, which a zero-copy reader cannot tell from an empty
+slot; none occurred.
+
+What these runs show:
+
+- **The lagging view still happens on `main`, on aarch64, under memory pressure:** 9 lag events in 3,000 s of the three
+  traced aarch64 runs with the journal larger than RAM, about one every 5.5 minutes, as at `279f59a` (one false report
+  after 227 s, 600 s and 1,000 s). With `main`'s writer the `279f59a` reader made two false reports in 1,000 s: the
+  writer's changes since then do not avoid it. That the `main` run with `tt-sustained`'s own zero-copy reader had none
+  in 600 s is within chance at this rate.
+- **The 50 ms window is far longer than these events needed:** in every event that entered it, the first re-read after
+  a pause validated, 63–69 µs after the window began (about what one 10 µs sleep takes with the default 50 µs timer
+  slack). None ran out; no
+  reader of `main` reported corruption, and the copying readers never entered the window (their counters show only
+  ordinary back-to-back re-reads of a record copied while it was written).
+- **Some events coincide with reclaim removing the frame's pages under the readers.** At the two false reports whose
+  offsets are known and traced, kswapd had removed **both pages of that very frame** from the page cache 251 to 47 µs
+  before (`279f59a` writer: pages 10244 and 10245 of the active segment, seven removals in 204 µs, inside a burst of 350
+  removals around the writer's position) and 83 and 33 µs before (`main` writer: pages 28790 and 28791). A third event
+  fell inside such a burst, and a fourth in the same second as one. Bursts cover 196–259 milliseconds of each 1,000 s
+  run, so three of the ten distinct events (the nine of `main`'s reader and one that only the `279f59a` reader saw)
+  within 2 ms of one is not chance (about 0.06 % for each event).
+- **Others are not.** Six events had no removal of the active segment within 0.5 s; the two of them in the run that also
+  traced migrations had no migration there either.
+- **Without memory pressure it did not occur:** with the journal within RAM (8 GiB of retention), kswapd reclaimed
+  nothing, compaction still migrated 1,024,628 pages (54 of them at the frontier), and no reader saw a lag in 1,000 s.
+  At the rate with pressure, none in 1,000 s would happen by chance about 5 % of the time. This includes the six events
+  without a removal: they need memory pressure too, so they may be reclaim by a path the trace does not show, or
+  another effect of it; migration alone did not cause one.
+- **x86-64 did not show it:** no lag event in 900 s, with more removals at the frontier (8,382) than any aarch64 run.
+  At the aarch64 rate, none in 900 s would happen by chance about 7 % of the time. (The migration probe did not fire on
+  this x86-64 kernel, although compaction ran; migrations there are not counted.)
+- **The pages removed are ones the writer is about to write or is writing:** clean pages of the active segment, 1 to
+  128 pages below the prefault frontier, removed by kswapd in bursts and faulted back in by the writer (the
+  `279f59a` run refaulted 21.9 million file pages in 1,000 s, the `main` runs 106,000–113,000). Reclaim takes only
+  clean pages; what wrote these back was not traced. The likely candidate is the checkpoint's whole-file `fdatasync` of
+  the active segment, which writes back the prefaulted, still empty pages ahead of the writer (2026-11-25, roll and
+  journal stalls: "ranged checkpoint sync").
+
+The mechanism consistent with the first kind of event, in upstream Linux 7.0's code (Ubuntu's 7.0.0-1017-gcp builds
+on it): reclaim unmaps a clean, mapped page-cache
+folio from every process with the TLB invalidation deferred (`try_to_unmap` with `TTU_BATCH_FLUSH`), removes it from the
+page cache (`__remove_mapping`, `mm/vmscan.c` line 1525) and only then waits for the invalidation (`try_to_unmap_flush`,
+line 1609); migration, by contrast, waits before it copies (`mm/migrate.c` line 1968). In that window the writer faults
+the page back in as a new page and fills it, while a reader that still has a TLB entry for the old page reads its
+zeros. On arm64 the invalidation is broadcast when the page is unmapped and only its completion is deferred
+(`arch_tlbbatch_add_pending`, then a `DSB` in `arch_tlbbatch_flush`); on x86-64 the whole flush is deferred to the end
+of the batch, so this account alone would predict the effect on x86-64 too, where it was not seen. **Status:
+consistent with, not confirmed** for the events that coincide with a removal (turning reclaim at the frontier on and
+off was done only as a whole: one 1,000 s run without reclaim and without the effect, which tells at about 95 % and
+switches all of reclaim, not the deferred invalidation), and **not explained** for the others. What would settle
+it: the kernel's own view of the reader's translation at an event (a probe on the reader's page fault for that address
+right after the event, or on `arch_tlbbatch_flush` timing), runs with the multi-generational LRU off
+(`/sys/kernel/mm/lru_gen/enabled` 0) and with the checkpoint's whole-file `fdatasync` dropped (so the pages ahead of the
+writer stay dirty and cannot be reclaimed), each long enough to expect ten events, and the same on another arm64
+implementation.
+
+Not measured: xfs; other machine sizes; runs long enough to compare rates between writers or readers; tracing overhead
+on these runs (the untraced runs had events at a similar rate: 1 in 227 s and 1 in 600 s); the independent pair with the
+trace. The migration probe was attached in the last two aarch64 runs only.
 
 ## 2026-11-02, v0.3.0 on Linux (AWS) and macOS
 
