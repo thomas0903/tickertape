@@ -117,6 +117,41 @@ class UnitTests(unittest.TestCase):
             finally:
                 signal.signal(signal.SIGALRM, old)
 
+    def test_every_process_of_an_interrupted_unit_s_group_gets_the_grace_period(self):
+        # A unit (run.py with a build step, say) that leaves a process in its group which takes a second to end
+        # after SIGTERM, while the unit itself ends at once.
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryFile("w") as log:
+            noted, pidfile = Path(tmp) / "member.term", Path(tmp) / "member.pid"
+            member = (f"import os, pathlib, signal, time\n"
+                      f"def term(signum, frame):\n"
+                      f"    time.sleep(1); pathlib.Path({str(noted)!r}).write_text(''); os._exit(0)\n"
+                      f"signal.signal(signal.SIGTERM, term)\n"
+                      f"pathlib.Path({str(pidfile)!r}).write_text(str(os.getpid()))\n"
+                      f"time.sleep(300)\n")
+            unit = (f"import pathlib, subprocess, sys, time; subprocess.Popen([sys.executable, '-c', {member!r}]); "
+                    f"p = pathlib.Path({str(pidfile)!r})\n"
+                    f"while not p.exists() or not p.read_text(): time.sleep(0.01)\n"
+                    f"time.sleep(300)")
+
+            def interrupt(signum, frame):
+                if pidfile.exists() and pidfile.read_text():
+                    raise rerun.reaper.Terminated(signum)
+                signal.setitimer(signal.ITIMER_REAL, 0.1)  # The member is not set up yet.
+            old = signal.signal(signal.SIGALRM, interrupt)
+            signal.setitimer(signal.ITIMER_REAL, 0.2)
+            try:
+                with self.assertRaises(rerun.reaper.Terminated):
+                    rerun.run_child([sys.executable, "-c", unit], log, None)
+            finally:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+                signal.signal(signal.SIGALRM, old)
+                if pidfile.exists() and pidfile.read_text() and not noted.exists():
+                    try:
+                        os.kill(int(pidfile.read_text()), signal.SIGKILL)  # Only if this test failed.
+                    except ProcessLookupError:
+                        pass
+            self.assertTrue(noted.exists(), "the unit's member was killed without its grace period")
+
 
     def test_after_sigkill_of_the_driver_its_guard_ends_the_unit(self):
         with tempfile.TemporaryDirectory() as tmp:

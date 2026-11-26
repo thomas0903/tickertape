@@ -101,13 +101,31 @@ def same_leader(pgid, start):
     return now is None or now == start
 
 
+def _group_alive(pgid):
+    """True while any process is in the group. macOS answers EPERM for a group of zombies only (a zombie with a live
+    member is signalled normally), and a zombie member is reaped by init or launchd: neither keeps the group."""
+    try:
+        os.killpg(pgid, 0)
+    except (ProcessLookupError, PermissionError):
+        return False
+    return True
+
+
 class Group:
     """The children of one measurement. Each is the leader of its own process group (a JVM, or tt-latency with the
-    processes it starts)."""
+    processes it starts).
+
+    A group is ended as a whole, also when its leader has already exited: every group that may still have a member
+    gets SIGTERM, every member gets the grace period (not only the leader), and SIGKILL goes only to the groups that
+    are still there after it. A group is known to be empty ("settled") when the runner reaped its leader through
+    wait() or communicate() and no member was left at that moment; such a group is not signalled again, since its
+    number may by now belong to someone else. A group whose leader was reaped elsewhere (poll() while waiting for a
+    barrier, just before a failure stops the measurement) is signalled, as is one that still had members."""
 
     def __init__(self, guard=None):
         self.guard = guard if guard is not None else _guard
         self.procs = []
+        self.settled = set()
 
     def popen(self, cmd, new_session=True, **kwargs):
         """Starts a child as the leader of a new process group, and of a new session unless `new_session` is False
@@ -120,35 +138,46 @@ class Group:
                 self.guard.add(proc.pid)
         return proc
 
+    def _reaped(self, proc):
+        """Right after the runner reaped a leader: if nothing is left in its group, the group is done (also for the
+        guard); otherwise it stays to be ended by stop() or, if the runner is killed, by the guard."""
+        if not _group_alive(proc.pid):
+            self.settled.add(proc.pid)
+            if self.guard:
+                self.guard.remove(proc.pid)
+
     def wait(self, proc, timeout=None):
         status = proc.wait(timeout=timeout)
-        if self.guard:
-            self.guard.remove(proc.pid)
+        self._reaped(proc)
         return status
 
     def communicate(self, proc, timeout=None):
         """proc.communicate(): reads the child's pipes in a blocking wait until it exits. Returns (stdout, stderr)."""
         output = proc.communicate(timeout=timeout)
-        if self.guard:
-            self.guard.remove(proc.pid)
+        self._reaped(proc)
         return output
 
     def stop(self, grace=GRACE_S):
-        """Ends every child that is still running and what it started in its group, and reaps it."""
+        """Ends every child that is still running and every process left in a child's group, and reaps the
+        leaders."""
         with deferred():
-            live = [p for p in self.procs if p.poll() is None]
-            for proc in live:
+            groups = [p for p in self.procs if p.pid not in self.settled]
+            for proc in groups:
                 _signal_group(proc.pid, signal.SIGTERM)
             end = time.monotonic() + grace
-            for proc in live:
+            for proc in groups:
                 try:
                     proc.wait(timeout=max(0.0, end - time.monotonic()))
                 except subprocess.TimeoutExpired:
                     pass
-            for proc in live:
-                # The leader if it outlived the grace period, and anything it left in its group.
-                _signal_group(proc.pid, signal.SIGKILL)
+            # The leaders are reaped (or past the grace period); the other members get the rest of it.
+            while time.monotonic() < end and any(_group_alive(p.pid) for p in groups):
+                time.sleep(0.01)
+            for proc in groups:
+                if proc.poll() is None or _group_alive(proc.pid):
+                    _signal_group(proc.pid, signal.SIGKILL)
                 proc.wait()
+            self.settled.update(p.pid for p in groups)
             if self.guard:
                 for proc in self.procs:
                     self.guard.remove(proc.pid)
