@@ -967,6 +967,28 @@ and a seek index on a journal a writer is sealing segments of. Nothing here was 
 the zero-copy reader. Damage that recovery zeroes in place (C11 (3)) is not among the damage cases. Power loss is not
 tested (`crash-contract.md`). The costs that grow with the number of segments are issue #80.
 
+## 2026-11-26, an archiver's removal checks what it took (OrbStack VM and macOS, informal)
+
+What ADR 0055 (issue #83) adds to a removal by an archiver (`retention::apply`, `tickertape archive`); a writer's own
+retention run makes the same calls as before. **Informal: an OrbStack VM (Linux on macOS) and a loaded Mac, not bare
+metal.** Mac: Apple M4 Pro, Darwin 27.2, APFS. VM: OrbStack Ubuntu (aarch64, 13 vCPUs), the journal on ext4 in a
+1.5 GB loop image. Before: `main` at `9d74a89`; after: the branch of the pull request that adds this section.
+
+**System calls per removal** (a deletion; `strace -f -c` of `tt-scale measure --ops retention-delete` removing 100 and
+300 segments of a journal of 1,500 × 64 KiB, the difference divided by 200): 35 before, 40 after. Added: `renameat2`
+(the unlink stays, of the temporary name), `statx` (the identity of the file taken out), two `pread64` (the marker's
+slots, read again) and `getpid` (the temporary name). The `openat`/`close` count is the same: the marker read before
+the checks now opens the marker once instead of twice, and the one after the rename opens it once. Syncs: the same (the
+journal directory and the segment per removal, the marker once per slot).
+
+**Time.** Those calls alone, without the syncs, in a loop that runs the three variants in turn (800 removals each;
+`unlink` / `rename`+`unlink` / the whole addition): ext4 in the VM 1.3 / 4.1 / 5.6 µs; APFS 28 / 103 / 120 µs (a rename
+is costly on APFS). With the directory sync and the barrier after each, as a removal makes them, the medians were within
+each other's noise (ext4 about 2.4 ms, APFS about 5 ms). `tt-scale measure --ops retention-delete --count 500` on the
+VM's ext4, 30 rounds alternating which build goes first: median 1.169 ms per removal before and 1.207 ms after (+3 %;
+smallest 1.031 and 1.040 ms). On the Mac, the same comparison varied from 6 to 22 ms per removal between rounds (other
+work was syncing the same disk) and settles nothing.
+
 ## 2026-11-25, retention on journals of many segments (Google Cloud VM, Linux x86-64)
 
 Before and after ADR 0051 (issue #80) on one machine of the type and zone the costs were found on

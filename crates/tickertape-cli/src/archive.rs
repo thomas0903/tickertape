@@ -8,7 +8,7 @@ use tickertape::retention::{self, Action, Policy, Reason};
 
 use crate::{Result, output};
 
-pub(crate) const HELP: &str = "Remove a sealed prefix strictly before the checkpoint segment. Without a valid checkpoint nothing is eligible. Limits combine with OR; checkpoint and newer segments are always kept. No writer lock is taken. The destination directory must exist; existing files are never replaced.\n\nJSON schema (schema_version 1; fields may be added, see docs/cli.md): {\"schema_version\":1,\"dry_run\":bool,\"segments\":[{\"file\":string,\"base_seq\":u64,\"size_bytes\":u64,\"sealed_unix_ns\":u64,\"reasons\":[\"max_segments\"|\"max_bytes\"|\"max_age\"]}],\"report\":{\"removed_segments\":u64,\"removed_bytes\":u64,\"already_removed_segments\":u64}|null}. report is null for --dry-run.\n\nExit codes: 0 success (including nothing eligible or help); 1 usage or I/O error; 2 corruption or unsupported journal format. On failure earlier removals remain in effect; diagnostics go to stderr.";
+pub(crate) const HELP: &str = "Remove a sealed prefix strictly before the checkpoint segment. Without a valid checkpoint nothing is eligible. Limits combine with OR; checkpoint and newer segments are always kept. No writer lock is taken. The destination directory must exist; existing files are never replaced.\n\nJSON schema (schema_version 1; fields may be added, see docs/cli.md): {\"schema_version\":1,\"dry_run\":bool,\"segments\":[{\"file\":string,\"base_seq\":u64,\"size_bytes\":u64,\"sealed_unix_ns\":u64,\"reasons\":[\"max_segments\"|\"max_bytes\"|\"max_age\"]}],\"report\":{\"removed_segments\":u64,\"removed_bytes\":u64,\"already_removed_segments\":u64,\"leftovers\":[string]}|null}. report is null for --dry-run. leftovers: temporary names of interrupted removals left in the journal directory (docs/operations.md).\n\nExit codes: 0 success (including nothing eligible or help); 1 usage or I/O error; 2 corruption or unsupported journal format. On failure earlier removals remain in effect; diagnostics go to stderr.";
 
 #[derive(Debug, Args)]
 #[command(group(ArgGroup::new("action").required(true).args(["to", "delete"])))]
@@ -94,6 +94,7 @@ struct Report {
     removed_segments: u64,
     removed_bytes: u64,
     already_removed_segments: u64,
+    leftovers: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -143,6 +144,16 @@ pub(crate) fn run(args: ArchiveArgs, out: &mut impl Write) -> Result<()> {
             removed_segments: report.removed_segments,
             removed_bytes: report.removed_bytes,
             already_removed_segments: report.already_removed_segments,
+            leftovers: report
+                .leftovers
+                .iter()
+                .map(|p| {
+                    p.file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect(),
         })
     };
     let result = Archive {
@@ -170,6 +181,17 @@ pub(crate) fn run(args: ArchiveArgs, out: &mut impl Write) -> Result<()> {
                 report.removed_segments, report.removed_bytes, report.already_removed_segments
             )
             .map_err(|e| output::io_error("write archive output", e))?;
+            if !report.leftovers.is_empty() {
+                writeln!(
+                    out,
+                    "Left {} temporary {} of interrupted removals, which may hold records the journal no longer has \
+                     (docs/operations.md): {}",
+                    report.leftovers.len(),
+                    if report.leftovers.len() == 1 { "name" } else { "names" },
+                    report.leftovers.join(", ")
+                )
+                .map_err(|e| output::io_error("write archive output", e))?;
+            }
         }
     }
     Ok(())

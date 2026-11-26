@@ -255,6 +255,26 @@ The same rules apply to the library and CLI, without taking the writer lock:
   it (their headers are read to confirm their sizes).
 - Do not put segment files back into a journal while retention or `archive` runs on it: a run lists the directory once
   and does not notice every file that appears in front of the oldest segment (crash contract C14).
+- An archiver (`archive`, `retention::apply`; not a writer's own retention) takes each segment out of the journal by a
+  rename before it lets it go, and checks that it is still the file it checked and that the marker still names a later
+  segment, so that a writer's recovery in between cannot make it remove the marker's segment (ADR 0055). A deletion, and
+  a cross-filesystem move once its copy is durable, rename the segment to `{base:020}.tape.{pid}.{unix_ns}.removing` in
+  the journal directory and then unlink it. If the archiver is killed in between, that name stays. Readers, writers and
+  `verify` ignore it; `tickertape status` (a `leftovers` line, `removal_leftovers` in JSON) and `tickertape archive`
+  (`leftovers`) report it. **It may hold records the journal no longer has** (a writer that already held the segment can
+  have filled it and moved on, in the race the check is for), so do not delete it because its `base_seq` is below the
+  checkpoint segment's. A later `archive` or writer retention run unlinks it once retention has removed the segment
+  after it (its seal names a segment that is gone, below the oldest), its name is an hour old and its process is gone.
+  To deal with one yourself:
+  - To keep its records, move it to an archive directory under its segment name (`mv -n NAME
+    ARCHIVE/{base_seq:020}.tape`).
+  - To return it to the journal, stop every writer and archiver of the journal, then rename it to `{base_seq:020}.tape`
+    without replacing anything: `mv -n NAME DIR/{base_seq:020}.tape` (check that `NAME` is gone afterwards), or `ln NAME
+    DIR/{base_seq:020}.tape && rm NAME`. Run `tickertape verify`: a broken chain at that segment means the segment after
+    it is gone; take it out again as above. Put two consecutive leftovers (the older one's seal names the newer one's
+    segment) back newest first and the older one last, so that the chain is whole after each rename. If a writer refuses to open with a dangling checkpoint naming that
+    `base_seq` (the archiver was killed while putting back a segment that a recovery had just restarted), this is the
+    fix; for a move by rename, the file is in the destination under its segment name.
 - Moves preserve the segment basename and require an existing destination directory. Same-filesystem moves use
   an atomic no-replace rename. `EXDEV` selects copy, sync the copy, sync the destination directory, remove the
   source, sync the journal directory. Existing files (including symlinks and identical copies) are errors.
