@@ -74,24 +74,25 @@ With `WriterConfig::prefault(true)` (the default), the writer moves segment work
     roll and journal stalls"). Measure on your machine before turning it on.
   - **macOS:** a thread is started for each spare; it also syncs the file (preallocating and syncing a whole segment
     on APFS takes about 50 ms), and a roll waits for a spare that is still being prepared.
-- **Early write-back (Linux).** A helper thread, `tickertape-writeback`, asks the kernel to start writing back the
-  pages behind the write position (`sync_file_range(SYNC_FILE_RANGE_WRITE)`, every 1 MiB, and the rest of a segment
-  when the writer rolls past it), so that a checkpoint, blocking or background, finds little dirty data left
-  (`WriterConfig::early_writeback`, default on; ADR 0038). It makes nothing durable: only checkpoints do, and a
-  checkpoint syncs whatever early write-back has not reached. An I/O error from it makes the next checkpoint fail, as
-  a failed sync would. On macOS the option does nothing.
-  - **What it costs near the writer.** The kernel writes back whole page-cache folios, not pages, and makes their
-    pages read-only again; recent ext4 (Linux 6.16 and later) and xfs give a segment 128 KiB folios with the default
-    `read_ahead_kb`. Early write-back runs up to the page that holds the write position, so it also writes the folio
-    the writer is still filling: the writer then takes a page fault on each page of it that it has yet to fill (a few
-    of them wait 20–100 µs for the ext4 journal), and the device writes that folio twice. In the recorded 10-minute
-    runs (`docs/benchmarks.md` → "2026-11-26, early write-back to the folio boundary") that was 6–8 % more device
-    bytes than appended, and on aarch64 at 90 % of the device's rate it led to appends of 50–150 ms in more than a
-    fifth of the seconds. Stopping early write-back at the 128 KiB boundary below the writer removed both there, at
-    the cost of up to 128 KiB more for each checkpoint to write; it is measured but not the default (ADR 0058). If
-    your writer runs close to the device's rate on such a kernel and sees these stalls, early write-back off
-    (`WriterConfig::early_writeback(false)`) also removes them, with checkpoints then taking as long as the device
-    needs for their data ("Settings that moved the tail" below).
+- **Early write-back (Linux).** A helper thread, `tickertape-writeback`, asks the kernel to start writing back what
+  the writer has finished (`sync_file_range(SYNC_FILE_RANGE_WRITE)`, every 1 MiB, up to the 128 KiB boundary below the
+  write position, and the rest of a segment when the writer rolls past it), so that a checkpoint, blocking or
+  background, finds little dirty data left (`WriterConfig::early_writeback`, default on; ADR 0038). It makes nothing
+  durable: only checkpoints do, and a checkpoint syncs whatever early write-back has not reached. An I/O error from it
+  makes the next checkpoint fail, as a failed sync would. On macOS the option does nothing.
+  - **Why it stops at the 128 KiB boundary** (from 1.1; ADR 0058). The kernel writes back whole page-cache folios, not
+    pages, and makes their pages read-only again; recent ext4 (Linux 6.16 and later) and xfs give a segment 128 KiB
+    folios with the default `read_ahead_kb`. Up to 1.0 the helper wrote back to the page that holds the position, so
+    also the folio the writer was still filling: the writer then took a page fault on each page of it that it had yet
+    to fill (a few of them waiting 20–100 µs for the ext4 journal), and the device wrote that folio twice. In the
+    recorded 10-minute runs (`docs/benchmarks.md` → "2026-11-26, early write-back to the folio boundary") that was 6–8
+    % more device bytes than appended, and on aarch64 at 90 % of the device's rate appends of 50–150 ms in 138–151 of
+    610 seconds; with the boundary, 0.2–0.5 % and none, and the writer's p99.9 was lower in every paced run.
+  - **What it costs.** A checkpoint may find up to 128 KiB more to write: in those runs a background checkpoint at 64 B
+    on aarch64 became durable after 946–952 µs instead of 912–914 (median), and a roll's append took a few µs longer
+    (median 260–264 instead of 254–256 µs there). With smaller folios (ext4 before 6.16) the helper only lags further
+    than it needs to; with larger ones (2 MiB folios, 16 or 64 KiB pages) it behaves as in 1.0. None of that was
+    measured beyond the cells in `docs/benchmarks.md`.
 
 **ext4 under a load near what the disk takes.** A store into a page of a mapped file updates the file's modification
 time through the ext4 journal and can wait while the journal commits, for as long as the disk takes to write the log
@@ -137,15 +138,17 @@ tmpfs three to four times as much at 1,024 B.
 
 - **Headroom at a steady rate.** There, a steady rate of 89 % (64 B) or 94 % (x86-64) of the device's rate did not
   stall, and 92 % (1,024 B, aarch64) did, with appends of 10–144 ms. The point at which it starts depends on the
-  device and on more than the rate (with its defaults the writer made that device write 7 % more than it appended), so
-  measure it.
+  device and on more than the rate (with 1.0's defaults the writer made that device write 7 % more than it appended;
+  from 1.1 early write-back no longer does, see above), so measure it.
 - **Settings that moved the tail.** In those aarch64 runs, early write-back off
   (`WriterConfig::early_writeback(false)`) removed the stalls in 5 of 5 runs. The cost: a checkpoint became durable 0.93
   s after its request (what the device needs for a second of data) instead of 0.05–0.39 s. On x86-64, where there were
   no stalls, it only made checkpoints that late instead of 2 ms. `lazytime` and xfs left one or three seconds with a
   long append (one run each). The spare segment and either dirty limit did not help. Small limits
   (`vm.dirty_bytes` 256 MiB) made an overloaded writer's longest appends longer, and large ones only let more pile up
-  before the throttling starts.
+  before the throttling starts. These runs were of 1.0's early write-back; with 1.1's (the 128 KiB boundary) the
+  stalls of that aarch64 cell were gone in 10-minute runs with early write-back on and checkpoints durable after about
+  1 ms (`docs/benchmarks.md` → "2026-11-26, early write-back to the folio boundary").
 - **tmpfs** has no durability (syncs do nothing). There, a roll zeroes the whole new segment on the writer's thread
   (`fallocate`; 19–30 ms per 128 MiB roll in the recorded runs) unless the spare segment is on.
 

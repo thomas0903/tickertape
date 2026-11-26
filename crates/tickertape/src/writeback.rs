@@ -5,12 +5,12 @@
 //! (`sync_file_range(SYNC_FILE_RANGE_WRITE)` through [`mmap::start_writeback`]), so that a checkpoint finds little
 //! dirty data left and its syncs, and the write-back they force on the device, are short. The writer only compares
 //! its offset with the next step after each append and, once per [`STEP`], takes a lock and wakes the helper. The
-//! helper never touches the mapped bytes. It writes back up to the page that holds the writer's position, or, with
-//! [`STOP_AT_FOLIO_BOUNDARY`] (ADR 0058, change 1; off), up to the [`FOLIO`]-aligned boundary below it ([`limit`]):
-//! the kernel writes back, and write-protects, whole page-cache folios, so a range that ends inside the folio the
-//! writer is filling writes that folio now and again once it is full, and makes the writer take a write fault on each
-//! of its pages it has yet to fill. The rest of a segment is written back when the writer rolls past it
-//! ([`WriteBack::switch`]); the rest of the active segment is left to the checkpoints.
+//! helper never touches the mapped bytes. It writes back up to the [`FOLIO`]-aligned boundary below the writer's
+//! position ([`limit`], [`STOP_AT_FOLIO_BOUNDARY`]; ADR 0058, change 1): the kernel writes back, and write-protects,
+//! whole page-cache folios, so a range that ended inside the folio the writer is filling would write that folio now
+//! and again once it is full, and make the writer take a write fault on each of its pages it has yet to fill. The rest
+//! of a segment is written back when the writer rolls past it ([`WriteBack::switch`]); the rest of the active segment
+//! is left to the checkpoints, which sync every dirty page whatever this helper has reached.
 //!
 //! Nothing here makes anything durable or is needed for a guarantee: what is durable when is decided by checkpoints
 //! alone. An I/O error from the call marks the writer's data lost (`Context::lost`), as a failed sync does, so that no
@@ -37,25 +37,25 @@ use crate::error::Error;
 /// (it waits for `dirty_background_*` or `dirty_expire_centisecs`, 30 s by default).
 pub(crate) const STEP: u64 = 1 << 20;
 
-/// Whether the helper stops at the [`FOLIO`] boundary below the writer's position (ADR 0058, change 1) instead of at the
-/// page that holds it. **Off.** Its measurements (ADR 0058 → "As built: change 1") removed the extra device bytes, the
-/// aarch64 stalls near the device's limit and most of the writer's write-back faults, but did not meet every gate set
-/// for a default: in a few cells a checkpoint took slightly longer to become durable (it may find up to 128 KiB more to
-/// write) and one reader's p99.9 was slightly higher, beyond the base's own spread. Making it the default is this line;
-/// the tests run both settings.
-pub(crate) const STOP_AT_FOLIO_BOUNDARY: bool = false;
+/// Whether the helper stops at the [`FOLIO`] boundary below the writer's position (ADR 0058, change 1) instead of at
+/// the page that holds it, as up to 1.0. **On** since 1.1 (ADR 0058 → "As built: change 1"): in 10-minute runs it
+/// removed the 6–8 % of extra device bytes, the aarch64 stalls of 50–150 ms near the device's limit and most of the
+/// writer's write-back faults, at the cost of up to 128 KiB more for each checkpoint to write (a few per cent of its
+/// durable time in one cell) and slightly slower rolls. `false` restores the 1.0 behaviour; the tests run both
+/// settings.
+pub(crate) const STOP_AT_FOLIO_BOUNDARY: bool = true;
 
-/// The alignment of the end of the range the helper starts in the active segment with [`STOP_AT_FOLIO_BOUNDARY`]: 128
-/// KiB (ADR 0058, change 1). The helper then never starts the write-back of the 128 KiB-aligned block that holds the
-/// writer's position ([`limit`]).
+/// The alignment of the end of the range the helper starts in the active segment ([`STOP_AT_FOLIO_BOUNDARY`]): 128 KiB
+/// (ADR 0058, change 1). The helper never starts the write-back of the 128 KiB-aligned block that holds the writer's
+/// position ([`limit`]).
 ///
 /// Why: write-back works on page-cache folios, not pages. Starting the write-back of a range writes back every dirty
 /// folio that overlaps it, whole, and makes each of its pages read-only again in the writer's mapping, so that the
 /// next store into one of them takes a write fault to dirty it again (on ext4 sometimes through the file system's
-/// journal, to update the file's times: 20–100 µs). Ending the range at the page that holds the position writes back
-/// the folio the writer is still filling: the writer then takes a fault on each page of it that it has yet to fill
-/// (7–8 faults per MiB were measured), and the device receives that folio twice, partly empty and again once full
-/// (6–9 % more device bytes than appended; ADR 0058, `docs/benchmarks.md` 2026-11-26).
+/// journal, to update the file's times: 20–100 µs). Ending the range at the page that holds the position, as up to
+/// 1.0, wrote back the folio the writer was still filling: the writer then took a fault on each page of it that it had
+/// yet to fill (7–8 faults per MiB were measured), and the device received that folio twice, partly empty and again
+/// once full (6–9 % more device bytes than appended; ADR 0058, `docs/benchmarks.md` 2026-11-26).
 ///
 /// Why 128 KiB: with 4 KiB pages, ext4 (since Linux 6.16) and xfs (since 5.18) let the page cache use large folios for
 /// regular files. The folios of a segment are allocated when the prefault helper's `MADV_POPULATE_WRITE`, or the
@@ -75,11 +75,11 @@ pub(crate) const STOP_AT_FOLIO_BOUNDARY: bool = false;
 pub(crate) const FOLIO: u64 = 128 << 10;
 
 /// The end of the range the helper may start in the active segment for a writer at `position`, with pages of `page`
-/// bytes: the start of the page that holds `position`, or with `folio` ([`STOP_AT_FOLIO_BOUNDARY`]) the start of the
-/// [`FOLIO`]-aligned block that holds it (of the page, if a page is larger). Everything below it is finished; the block
-/// itself, and so the first block of a segment while the writer is in it, header included, is left alone until the
-/// writer has left it. The end of a segment is not limited here: at a roll the helper writes the segment back to the
-/// end of its seal ([`WriteBack::switch`]).
+/// bytes: with `folio` ([`STOP_AT_FOLIO_BOUNDARY`], the default) the start of the [`FOLIO`]-aligned block that holds
+/// `position` (of the page, if a page is larger), without it the start of the page that holds `position`. Everything
+/// below it is finished; the block itself, and so the first block of a segment while the writer is in it, header
+/// included, is left alone until the writer has left it. The end of a segment is not limited here: at a roll the
+/// helper writes the segment back to the end of its seal ([`WriteBack::switch`]).
 pub(crate) fn limit(position: u64, page: u64, folio: bool) -> u64 {
     let block = if folio { FOLIO.max(page) } else { page };
     position / block * block
@@ -409,7 +409,7 @@ fn follow(shared: &Shared, ctx: &Context) {
                     current = Some(Arc::downgrade(file));
                     done = 0;
                 }
-                // Up to the page that holds the position, or the folio boundary below it (ADR 0058).
+                // Up to the folio boundary below the position, never into the block the writer fills (ADR 0058).
                 let end = limit(state.position, page, shared.folio);
                 if done < end {
                     let to = end.min(done.saturating_add(STEP));
@@ -568,26 +568,39 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn with_the_folio_boundary_the_helper_leaves_the_writers_block_until_it_has_left_it() {
-        follows(true);
+        follows(Some(true));
     }
 
-    /// Without it (the default), the helper writes back to the page that holds the position, and at a roll the rest of
-    /// the segment to the end of its seal, as before ADR 0058 (Linux).
+    /// The default (`STOP_AT_FOLIO_BOUNDARY`, ADR 0058 change 1, from 1.1) is the folio boundary: a helper started
+    /// without a test override follows it (Linux). Fails if the default goes back to the page limit.
     #[cfg(target_os = "linux")]
     #[test]
-    fn by_default_the_helper_writes_back_to_the_writers_page() {
-        assert!(!folio_setting(), "update this test with the default");
-        follows(false);
+    fn by_default_the_helper_stops_at_the_folio_boundary() {
+        assert!(
+            folio_setting(),
+            "the default is the folio boundary (ADR 0058)"
+        );
+        follows(None);
+    }
+
+    /// With the page limit (the 1.0 behaviour, `STOP_AT_FOLIO_BOUNDARY = false`), the helper writes back to the page
+    /// that holds the position, and at a roll the rest of the segment to the end of its seal (Linux).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn with_the_page_limit_the_helper_writes_back_to_the_writers_page() {
+        follows(Some(false));
     }
 
     #[cfg(target_os = "linux")]
-    fn follows(folio: bool) {
+    /// `setting`: the test override for the helper, or `None` for the default.
+    fn follows(setting: Option<bool>) {
+        let folio = setting.unwrap_or(STOP_AT_FOLIO_BOUNDARY);
         let page = crate::mmap::page_size() as u64;
         let dir = tempfile::tempdir().unwrap();
         let (first, first_ino) = segment(dir.path(), "a");
         let (second, second_ino) = segment(dir.path(), "b");
         let header = crate::format::SEGMENT_HEADER_LEN as u64;
-        FOLIO_FOR_TESTS.with(|f| f.set(Some(folio)));
+        FOLIO_FOR_TESTS.with(|f| f.set(setting));
         let mut wb = WriteBack::start(
             Arc::clone(&first),
             header,

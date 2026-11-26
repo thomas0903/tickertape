@@ -40,7 +40,8 @@ touch (as Chronicle Queue's `microTouch()`), a larger window, re-touching, early
 ranged sync do to them (ADR 0058), are
 [under 2026-11-26](#2026-11-26-the-writers-remaining-page-faults-with-prefaulting-on-google-cloud-vms-linux).
 ADR 0058's first change (early write-back to the 128 KiB boundary below the writer) in 10-minute session cells, unpaced,
-in the comparison's W2 cells on x86-64 and on a kernel without large folios, with the gates for a default (not met), is
+in the comparison's W2 cells on x86-64 and on a kernel without large folios, with the gates for a default (the first
+narrowly missed; the change was accepted as 1.1's default), is
 [under 2026-11-26](#2026-11-26-early-write-back-to-the-folio-boundary-adr-0058-change-1-google-cloud-vms).
 The macOS results of 2026-11-26 (the sustained session on a shared Apple M4 Pro laptop, how often a roll waits for the
 spare segment, and what prefaulted data adds to a checkpoint) are
@@ -2376,7 +2377,8 @@ than the base beyond the noise floor"): at 64 B on aarch64, checkpoints became d
 time's p99 was 5.1–6.0 ms instead of 4.1–4.9 (its median within the base's range); unpaced on x86-64 the lower of the
 two runs was 0.1 % below the base's range. With the change a checkpoint finds up to 128 KiB more to write (the cost
 ADR 0058 expected), and a roll writes the old segment's last block back as it happens (not traced); both show here, at
-the size of the base's own spread or a little more. The default stays as it was.
+the size of the base's own spread or a little more. The orchestrator accepted that miss and made the change the
+default from 1.1 (ADR 0058 → "Decision for change 1"); the gate result stands as measured.
 
 ### Environment and commands
 
@@ -2511,7 +2513,8 @@ range; three runs do not tell whether that is the change.
 | 2. The 60-second runs' gain shows in 10-minute cells (writer p99.9, device bytes, aarch64 stalls at steady-90) | Yes | writer p99.9 lower in every paced cell (above); device / appended 1.084 → 1.002–1.003 (aarch64 steady-90), 1.059 → 1.005 (aarch64 64 B), 1.061–1.065 → 1.004 (x86-64); seconds ≥ 50 ms at aarch64 steady-90: 138–151 → 0 (ext4), 2–4 → 0 (xfs) |
 | 3. No harm on a kernel without large folios | Yes | kernel 6.8 VM 2, strictly alternating: every gate figure within the base's range (append p99.9 8.10–8.46 against 6.94–9.80 µs, zero-copy p99.9 1.45–1.52 against 1.38–1.73 ms, safe 0.68–0.82 against 0.66–1.39 ms, to durable p50 1.31–1.33 against 1.29–1.36 ms); 64 B on VM 1 within or better |
 
-So the change is not the default: `STOP_AT_FOLIO_BOUNDARY` is `false`, and early write-back behaves as in 1.0.
+Gate 1 was not met. The orchestrator, on the owner's delegation, made the change the default from 1.1 anyway (ADR 0058
+→ "Decision for change 1"): `STOP_AT_FOLIO_BOUNDARY` is `true`, and `false` restores 1.0's early write-back.
 
 - **What the costs are.** The durable time at 64 B grew by the time to write up to 128 KiB more per checkpoint (34–40
   µs here). The roll appends' median grew at 64 B on aarch64 (254–256 → 260–264 µs) and at steady-90 on ext4 (188 →

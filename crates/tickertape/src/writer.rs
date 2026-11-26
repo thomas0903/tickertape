@@ -2946,11 +2946,11 @@ mod tests {
         assert_eq!(reopened.next_seq(), 1);
     }
 
-    /// With the folio boundary (`writeback::STOP_AT_FOLIO_BOUNDARY`, off by default), a writer's early write-back
-    /// helper never starts a range that reaches into the 128 KiB block that holds the position it was given, and
-    /// every segment the writer rolled past is written back from its first byte to the end, without gaps (Linux; ADR
-    /// 0058). Fails with the old limit (the page that holds the position): records of about 50 KB put the position the
-    /// helper is given at a step anywhere in the first 50 KB of a block, not only in its first page.
+    /// By default (`writeback::STOP_AT_FOLIO_BOUNDARY`, from 1.1), a writer's early write-back helper never starts a
+    /// range that reaches into the 128 KiB block that holds the position it was given, and every segment the writer
+    /// rolled past is written back from its first byte to the end, without gaps (Linux; ADR 0058). Fails with the old
+    /// limit (the page that holds the position): records of about 50 KB put the position the helper is given at a step
+    /// anywhere in the first 50 KB of a block, not only in its first page.
     #[cfg(target_os = "linux")]
     #[test]
     fn early_writeback_stops_at_the_folio_boundary_and_finishes_rolled_segments() {
@@ -2959,10 +2959,7 @@ mod tests {
         let config = WriterConfig::default()
             .segment_size(4 << 20)
             .early_writeback(true);
-        crate::writeback::FOLIO_FOR_TESTS.with(|f| f.set(Some(true)));
-        let opened = Writer::open(dir.path(), config);
-        crate::writeback::FOLIO_FOR_TESTS.with(|f| f.set(None));
-        let mut w = opened.unwrap();
+        let mut w = Writer::open(dir.path(), config).unwrap();
         let payload = vec![7u8; 50_000];
         let first = w.active.base;
         let mut rolls = 0;

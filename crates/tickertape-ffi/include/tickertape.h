@@ -1667,10 +1667,11 @@ tickertape_status tickertape_writer_options_set_prefault(struct tickertape_write
  * checkpoint finds little left to write (ADR 0038 → Early write-back). Non-zero enables it. Default: on.
  *
  * **Linux:** applies only with prefault on (`tickertape_writer_options_set_prefault`), the switch for the writer's
- * helper threads. A helper thread (`tickertape-writeback`) calls `sync_file_range(SYNC_FILE_RANGE_WRITE)` over the
- * whole pages behind the write position each time it has moved 1 MiB, and over the rest of a segment when the writer
- * rolls past it. That call only starts writing: what is durable when is unchanged, and only a checkpoint promises it
- * (`docs/crash-contract.md`). If the call fails with an I/O error, no later checkpoint of this writer succeeds: the
+ * helper threads. A helper thread (`tickertape-writeback`) calls `sync_file_range(SYNC_FILE_RANGE_WRITE)` each time
+ * the write position has moved 1 MiB, up to the 128 KiB boundary below it (not into the page-cache folio the writer is
+ * still filling; ADR 0058, from 1.1), and over the rest of a segment when the writer rolls past it. A checkpoint may
+ * therefore find up to 128 KiB more to write. That call only starts writing: what is durable when is unchanged, and
+ * only a checkpoint promises it (`docs/crash-contract.md`). If the call fails with an I/O error, no later checkpoint of this writer succeeds: the
  * error is returned once, by the next checkpoint, `tickertape_writer_request_checkpoint`,
  * `tickertape_writer_checkpoint_progress` or `tickertape_writer_close`, and `TICKERTAPE_E_DURABILITY_LOST` after
  * that. If the filesystem does not support the call, the helper stops. **macOS:** no effect.
