@@ -92,6 +92,9 @@ Other:
   --cpus <LIST>           pin the writer thread, then reader 0, 1, ... to these CPUs (Linux only; elsewhere
                           prints that pinning is unsupported); helper and sampler threads stay unpinned
   --no-disk-check         start even if the estimated peak disk use exceeds 90 % of free space
+  --count-clock-backwards a reader whose wall clock reads earlier than a record's send time records a latency of 0
+                          and counts the sample (clock_backwards_samples, clock_backwards_max_ns) instead of failing
+                          the run; for macOS, where this was seen between processes (docs/benchmarks.md, 2026-11-26)
   --json                  print the result as one JSON object instead of text
 
 Coordinated omission: paced records carry their intended send time in local_ts_ns; the writer busy-waits for
@@ -203,6 +206,7 @@ struct Config {
     lag_interval: Duration,
     cpus: Vec<usize>,
     disk_check: bool,
+    count_clock_backwards: bool,
     json: bool,
     control: Option<PathBuf>,
     index: Option<usize>,
@@ -247,6 +251,7 @@ impl Config {
                 "--no-early-writeback",
                 "--spare-segment",
                 "--no-disk-check",
+                "--count-clock-backwards",
                 "--json",
             ],
         )?;
@@ -428,6 +433,7 @@ impl Config {
             lag_interval,
             cpus,
             disk_check: !options.flag("--no-disk-check"),
+            count_clock_backwards: options.flag("--count-clock-backwards"),
             json: options.flag("--json"),
             control,
             index,
@@ -524,7 +530,7 @@ impl Config {
             "readers": self.readers.iter().map(ReaderSpec::to_json).collect::<Vec<_>>(),
             "default_wait": self.default_wait.name(), "lag_interval_ms": self.lag_interval.as_secs_f64() * 1e3,
             "writer_position_publish_interval_ms": 1, "cpus": self.cpus,
-            "disk_check": self.disk_check})
+            "disk_check": self.disk_check, "count_clock_backwards": self.count_clock_backwards})
     }
 }
 
@@ -1442,6 +1448,7 @@ fn reader(config: &Config) -> Result<()> {
     let mut seconds = Seconds::new()?;
     let mut latency = hist()?;
     let (mut expected, mut read, mut skipped, mut discards) = (0u64, 0u64, 0u64, 0u64);
+    let mut backwards = Backwards::default();
     let mut drain_until: Option<Instant> = None;
     let mut next_stall = spec
         .stall
@@ -1476,9 +1483,12 @@ fn reader(config: &Config) -> Result<()> {
                 } else {
                     std::hint::black_box(record.payload);
                 }
-                let sample = now
-                    .checked_sub(record.local_ts_ns)
-                    .ok_or("wall clock moved backwards; invalid latency run")?;
+                let sample = latency_sample(
+                    now,
+                    record.local_ts_ns,
+                    config.count_clock_backwards,
+                    &mut backwards,
+                )?;
                 if record.local_ts_ns >= measure_from {
                     latency.record(sample)?;
                 }
@@ -1584,6 +1594,7 @@ fn reader(config: &Config) -> Result<()> {
     let mut result = spec.to_json();
     let fields = json!({"index": index, "records_read": read, "records_measured": latency.len(),
         "skipped_by_retention": skipped, "discard_events": discards, "writer_count": final_count,
+        "clock_backwards_samples": backwards.samples, "clock_backwards_max_ns": backwards.max_ns,
         "remaining_records": final_count.saturating_sub(expected), "drained": drained,
         "latency": quantiles_json(&latency, "us", 1e3), "lag": lag_json(&lag, config.record_bytes),
         "cpu": cpu_start.delta_json(&cpu_end),
@@ -1651,4 +1662,61 @@ fn page_cache_maxima(writer_lines: &[Value], from_second: u64) -> Value {
     };
     json!({"dirty_max_bytes": max("dirty_bytes"), "writeback_max_bytes": max("writeback_bytes"),
         "source": "/proc/meminfo Dirty and Writeback (whole system), sampled once per second by the writer process"})
+}
+
+/// Reader samples whose wall-clock reading was earlier than the record's send time (`--count-clock-backwards`).
+#[derive(Debug, Default, PartialEq)]
+struct Backwards {
+    samples: u64,
+    max_ns: u64,
+}
+
+/// The latency of a record sent at `stamp` and received at `now` (wall clock, ns). A `now` before `stamp` fails the
+/// run, unless `count` is set: then the sample is 0 and counted in `backwards`.
+fn latency_sample(
+    now: u64,
+    stamp: u64,
+    count: bool,
+    backwards: &mut Backwards,
+) -> std::result::Result<u64, String> {
+    match now.checked_sub(stamp) {
+        Some(sample) => Ok(sample),
+        None if count => {
+            backwards.samples += 1;
+            backwards.max_ns = backwards.max_ns.max(stamp - now);
+            Ok(0)
+        }
+        None => Err(format!(
+            "wall clock moved backwards; invalid latency run (received {} ns before the send time; \
+             --count-clock-backwards counts such samples instead)",
+            stamp - now
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_clock_that_reads_backwards_fails_the_run_unless_counted() {
+        let mut b = Backwards::default();
+        assert_eq!(latency_sample(1_500, 1_000, false, &mut b), Ok(500));
+        let err = latency_sample(1_000, 8_000, false, &mut b).unwrap_err();
+        assert!(
+            err.contains("wall clock moved backwards") && err.contains("7000 ns"),
+            "{err}"
+        );
+        assert_eq!(b, Backwards::default());
+        assert_eq!(latency_sample(1_000, 8_000, true, &mut b), Ok(0));
+        assert_eq!(latency_sample(1_000, 3_000, true, &mut b), Ok(0));
+        assert_eq!(latency_sample(4_000, 3_000, true, &mut b), Ok(1_000));
+        assert_eq!(
+            b,
+            Backwards {
+                samples: 2,
+                max_ns: 7_000
+            }
+        );
+    }
 }

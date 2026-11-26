@@ -140,10 +140,16 @@ released with seven items open, accepted by the owner as known gaps
     visibility-only workloads from periodic durability workloads and document unequal guarantees or unsupported cases.
   - Preserve raw results, environment, exact commands, achieved rates and late sends. Investigate the ext4 stalls
     observed in ADR 0025 and publish comparisons without coordinated omission or hidden dropped records.
-  - Missing: macOS results. The repeated 10-minute runs on Linux ext4 and xfs, x86-64 and aarch64, are recorded in
-    `docs/benchmarks.md` (2026-11-19 to 2026-11-22), with tickertape's rows from a second session at a newer commit (the
-    first session's failed on the open-files defect fixed in #38), and the ext4 stall investigation is published (ADR
-    0025 → Amendment).
+  - The repeated 10-minute runs on Linux ext4 and xfs, x86-64 and aarch64, are recorded in `docs/benchmarks.md`
+    (2026-11-19 to 2026-11-22), with tickertape's rows from a second session at a newer commit (the first session's
+    failed on the open-files defect fixed in #38), and the ext4 stall investigation is published (ADR 0025 →
+    Amendment).
+  - macOS, recorded 2026-11-26 on the owner's laptop (Apple M4 Pro, APFS; shared and not idle: `docs/benchmarks.md` →
+    "sustained load, roll waits and checkpoint cost on macOS"): tickertape's sustained session with repeated 10-minute
+    steady runs at 50 % and 90 % of the probe for both payloads, shorter bursty and visibility-only runs, and a
+    comparison with Chronicle Queue and Aeron at identical absolute rates in 120-second runs.
+  - Missing on macOS: the comparison at each tool's own probe rates and in 10-minute runs, and the lagging and
+    beyond-RAM scenarios. Both need more free disk than the shared laptop allowed (20 GB of data at any moment).
 - [x] **Performance diagnostics with eBPF.** (done 2026-11-25: the overhead and an untraced confirmation, issue #60)
   - Add a reproducible Linux diagnostic playbook using existing eBPF tools to investigate scheduler delays,
     page faults, filesystem/write-back stalls and block I/O during the sustained workloads.
@@ -188,9 +194,17 @@ released with seven items open, accepted by the owner as known gaps
     the window, so the writer faults it in again (33–36 faults per checkpoint). An idle writer pays once. Syncing the
     active segment by its ranged `msync` alone removed both costs in an experiment; it changes the crash contract's
     barrier step and is not built.
-  - Missing: any macOS result; a drive with a volatile write cache; background checkpoints with the window. The Linux
+  - Missing: a drive with a volatile write cache; background checkpoints with the window (on Linux). The Linux
     results of ADR 0038 and before/after checkpoint and durable-only reader latency are recorded in
     `docs/benchmarks.md` (2026-11-19 to 2026-11-22).
+  - macOS, measured 2026-11-26 (`docs/benchmarks.md` → "sustained load, roll waits and checkpoint cost on macOS"):
+    on APFS the prefault advice (`MADV_WILLNEED`) dirties the pages it advises, so each checkpoint's file-wide `fsync`
+    writes the zeros advised since the last one (up to the 8 MiB window: +2.5–3.3 ms on a 17 ms checkpoint at 21 MB/s
+    of records); without prefaulting the spare segment is off too and the first checkpoint after each roll writes about
+    half of the new 128 MiB file (32–36 ms instead of 16.5–18.5 ms at 21 MB/s). A checkpoint's floor is its two
+    `F_FULLFSYNC`, about 9 ms. With no early write-back on macOS a checkpoint writes everything appended since the last
+    one: about 0.2 s at 380–620 MB/s.
+  - Missing on macOS: an advice that does not dirty pages, measured.
 - [x] **Finish eliminating avoidable work.** (done 2026-11-26: the profiles, issue #62)
   - Profile append, both readers, notification and serialization paths under the sustained workloads; document
     allocations, copies and synchronization that remain on those paths.
@@ -319,7 +333,9 @@ passing, no known unresolved issue violating the published contract). None of th
 they are measurements, explanations and one design record. They stay open and continue in 1.x, except
 where a line says it is closed:
 
-- **Sustained-load comparison:** no macOS results.
+- **Sustained-load comparison:** macOS results recorded on 2026-11-26 (tickertape's sustained session; a reduced
+  comparison at identical low rates); still missing on macOS: the comparison at each tool's probe rates and 10-minute
+  comparison runs, the lagging and beyond-RAM scenarios (`docs/benchmarks.md`, 2026-11-26, macOS).
 - **eBPF diagnostics:** closed on 2026-11-25; the tracing overhead during the sustained workloads and a conclusion
   confirmed with tracing off are recorded (`docs/benchmarks.md` → "2026-11-25, roll and journal stalls").
 - **Mapped reader:** closed on 2026-11-25. The publication-frontier follow-up had no ADR; it has
@@ -327,7 +343,9 @@ where a line says it is closed:
   the 1.0 contract ([`compatibility.md`](compatibility.md); `crash-contract.md` → Readers, the writer and memory safety).
 - **Cheaper checkpoints:** how much prefaulted, unwritten data adds to a checkpoint is measured on Linux since
   (2026-11-26, [`benchmarks.md`](benchmarks.md)): the 256 KiB window is written as zeros by every checkpoint that
-  covers appends, 0.16–0.43 ms of the checkpoint. There is still no macOS result.
+  covers appends, 0.16–0.43 ms of the checkpoint. On macOS (2026-11-26, the same file) the 8 MiB `MADV_WILLNEED` window
+  is dirtied as well, and each checkpoint writes the zeros advised since the last one (about 2.5–3.3 ms of a 17 ms
+  checkpoint at 21 MB/s).
 - **Avoidable work:** the profiles of the readers, notification and serialization paths were not documented; done
   since for v1.0.0 ([above](#next-release-sustained-performance), `docs/benchmarks.md` 2026-11-25); the durable-only
   reader has not been profiled since #66.

@@ -32,6 +32,9 @@ Why replay speed changed with the layout of `Reader`, and the before and after o
 [under 2026-11-26](#2026-11-26-the-layout-of-reader-adr-0057-issue-86-google-cloud-vms).
 What the Linux prefault window adds to a checkpoint (bytes, sync time, append and reader latency) is
 [under 2026-11-26](#2026-11-26-what-prefaulted-unwritten-pages-add-to-a-checkpoint-google-cloud-vms-linux).
+The macOS results of 2026-11-26 (the sustained session on a shared Apple M4 Pro laptop, how often a roll waits for the
+spare segment, and what prefaulted data adds to a checkpoint) are
+[after the Linux sections](#2026-11-26-sustained-load-roll-waits-and-checkpoint-cost-on-macos-apple-m4-pro-apfs).
 
 **How Chronicle Queue and tickertape were configured in the comparisons below.** Open-source Chronicle Queue (2026.8,
 the version `compare/chronicle/pom.xml` pins) ran with its default queue options, except `SyncMode.SYNC` in the
@@ -4561,6 +4564,455 @@ zero-copy reader at 64 B in two sessions (+2.1 % with aligned code), the other c
 The Apple M4 Pro where #85 saw the effect (16 KiB pages; not measured, see ADR 0057); other microarchitectures; readers
 held by the bindings; 32-bit targets. Why the hot-fields-first orders and the 40-byte tail padding cost a few per cent on
 x86-64.
+
+## 2026-11-26, sustained load, roll waits and checkpoint cost on macOS (Apple M4 Pro, APFS)
+
+The macOS half of three open items: the sustained session on macOS (roadmap, sustained-load comparison: "Missing: macOS
+results"), how often and how long a roll waits for the spare segment (issue #60), and what prefaulted, unwritten data
+adds to a checkpoint (roadmap, cheaper checkpoints: "a macOS result"). **One laptop, shared and not idle**: other
+agents built and tested other branches during the runs, macOS background services (`mediaanalysisd` above one core for
+most of the evening, Spotlight, `fileproviderd`) came and went, and nothing was pinned. Read the figures as this Mac on
+this evening, secondary to the Linux results above. The raw output of every run (results, per-second series, traces,
+the load before, during and after each run, the scripts) is kept outside the repository.
+
+### Environment and method
+
+| | |
+|---|---|
+| Machine | MacBook Pro (`Mac16,8`), Apple M4 Pro: 10 performance and 4 efficiency cores, 24 GB; on AC power |
+| OS | macOS 27.2.1 (Darwin 27.2.0) |
+| Journal | APFS on the internal SSD (`APPLE SSD AP1024Z`, FileVault on), the Data volume, `$HOME/tmp/tt-macos` |
+| Build | `main` at `b88c6d5f`, rustc 1.99.1, release; plus `tt-sustained --count-clock-backwards` (this change) |
+| Comparison | Homebrew OpenJDK 21.0.13.0.3, Chronicle Queue 2026.8, Aeron 1.54.0 (`compare/` pins) |
+
+**What replaces CPU pinning: nothing.** macOS has no hard affinity (`tt-sustained --cpus` and `compare/` print that
+pinning is unsupported); every thread ran at the default QoS and the scheduler chose performance or efficiency cores.
+A paced writer and each spinning reader keep a core busy, so a run occupied two to four cores of fourteen.
+
+**Durability in each row.** Every run that checkpoints uses a background checkpoint (`Writer::request_checkpoint`)
+every second on a wall-clock grid, and a blocking one at the end. On macOS a checkpoint makes, on its own thread:
+`msync(MS_SYNC)` of the written range of each segment, `fsync` of each segment, `fsync` of the journal directory when
+a segment was created since the last one, `fcntl(F_FULLFSYNC)` on the newest segment (the drive's cache), then the
+marker's `pwrite` and a second `F_FULLFSYNC` (`checkpoint::steps`, `mmap::full_barrier`). There is no early write-back
+on macOS (`WriterConfig::early_writeback` has no effect there), so a checkpoint writes everything appended since the
+last one. Visibility-only rows checkpoint never. The spare thread (macOS default) runs `fsync` once per spare.
+
+**Shared machine rules.** Before each run the driver recorded `uptime` and the top CPU consumers; if another process
+used more than half a core it waited up to 10 minutes, then ran anyway and marked the run *disturbed*; a process that
+had already outlasted one full wait (`mediaanalysisd`, from 23:40 local time) was not waited for again, and runs that
+started or ran while it was busy are marked disturbed all the same. During each run it sampled the load every 10 s and
+the top consumers every 60 s. Journal data stayed below 20 GB at any moment (the driver would have killed the run),
+which caps retention and run lengths below. **Runs marked disturbed:** most of them (in the tables: the item 2 rows
+marked `*`; in item 1, every steady run but steady-90 at 1,024 B repeat 1, both 1,024 B visibility-only runs, the 1,024
+B probe and bursty at 1,024 B repeat 2; the 1-minute load average during item 1's runs was 2.5–12.4). Two repeats of one
+configuration differing more than the effect discussed are called out where it matters.
+
+**The wall clock is not monotonic across processes here.** `tt-sustained`'s readers subtract the writer's send time
+(wall clock) from their own receive time; on Linux that difference is never negative. Here three attempts of the 64 B
+probe failed in the first 12–63 s with `wall clock moved backwards` (the reader's clock 7 µs behind the writer's stamp,
+and still 3 µs behind when read again 4 µs later). Neither one thread (12.5 billion reads in 5 minutes), nor two
+threads, nor two forked processes, nor a stamping process moved to the efficiency cores showed a backward step in
+isolated tests of 20–300 s (`clock_gettime(CLOCK_REALTIME)` and `gettimeofday`; both have 1 µs resolution here), so the
+cause was not found. A run that cannot finish cannot be measured, so `tt-sustained` has a new option,
+`--count-clock-backwards`: such a sample is recorded as 0 µs and counted (`clock_backwards_samples`,
+`clock_backwards_max_ns` per reader); without it a run still fails as before. Every macOS run below used it. Over all
+of item 1 two samples were counted: one of 4.8 ms (steady-50, 1,024 B, repeat 2, the mapped reader) and one of 990 ms
+(steady-90, 64 B, repeat 1, the safe reader), so the wall clock also stepped back as a whole at least once; a step of
+990 ms also delays a paced writer (it waits for intended times that have moved away) and shifts the latency of the
+records in flight.
+
+### Sustained session (tickertape)
+
+The scenarios of the Linux sessions (above), with `tt-sustained` run directly rather than through `benches/session.py`,
+whose retention (40 % of free space, up to 64 GiB) does not fit the 20 GB limit. Arguments as `session.py` makes them,
+except retention (8 GiB; the 1,024 B probe ran with 12 GiB), no `--cpus`, and the lengths:
+
+| Scenario | Length | Repeats | Rate |
+|---|---|---|---|
+| probe (unpaced) | 300 s | 1 | – |
+| steady-50, steady-90 | **600 s plus 10 s warm-up, as on Linux** | 2 (interleaved: both payloads, then again) | 50 % and 90 % of the probe |
+| bursty | 120 s plus 10 s | 2 | 2 × probe for 200 ms of every second |
+| visibility-only | 60 s plus 10 s, no checkpoints, no retention | 2 | capped so that a run writes at most 12 GB: 1,648,351 (64 B) and 161,117 (1,024 B) records/s, against half the probe |
+
+for example steady-50 at 64 B:
+
+```sh
+tt-sustained run --dir $HOME/tmp/tt-macos/tt-steady-50-64-r1 --out <results>/tt-steady-50-64-r1 --rate 3686264 \
+  --duration 600s --warmup 10s --payload 64 --checkpoint-every 1s --checkpoint-mode background \
+  --retain-bytes 8589934592 --readers mapped,safe:wait=default,safe:durable:wait=block --count-clock-backwards --json
+```
+
+Not run: lagging, and beyond-RAM, which needs more than 1.5 × RAM (36 GB) retained. The whole item appended about 4 TB
+to the laptop's SSD. Every run finished; no reader reported corruption, `read + skipped + remaining = written` held for
+every reader and no reader lost a record to retention. Cells are the range over the two repeats (the probe ran once);
+units, late sends, "pause" and "to durable" as in the Linux sessions; µs unless marked.
+
+**Writer schedule and CPU (64 B):**
+
+| Scenario | Rate (records/s) | Achieved (records/s) | Late sends (%) | Max schedule delay | Unsent | Writer CPU (process) |
+|---|---|---|---|---|---|---|
+| probe | unpaced | 7,372,529 | – | – | – | 1.01 |
+| steady-50 | 3,686,264 | 3,686,278–3,686,280 | 4.7–4.9 | 1.3–1.5 s | 0 | 1.05–1.06 |
+| steady-90 | 6,635,275 | 6,634,952–6,635,180 | 66.1–69.1 | 2.0–2.8 s | 0 | 1.04–1.05 |
+| bursty | 2,949,011 | 2,962,705–2,962,731 | 100.0 | 536 ms to 1.0 s | 0 | 1.02 |
+| visibility-only | 1,648,351 | 1,648,359 | 4.1–16.7 | 117–509 ms | 0 | 0.91–1.00 |
+
+**Append latency (64 B, every append timed, µs):**
+
+| Scenario | p50 | p99 | p99.9 | p99.99 | max |
+|---|---|---|---|---|---|
+| probe | 0.04 | 0.12 | 0.17 | 1.25 | 1.9 s |
+| steady-50 | 0.04 | 0.12–0.17 | 0.21 | 3.42–3.54 | 184 ms to 1.1 s |
+| steady-90 | 0.04 | 0.12 | 0.21 | 1.58–2.00 | 1.6–1.8 s |
+| bursty | 0.04 | 0.12 | 0.21 | 2.33–3.17 | 113–370 ms |
+| visibility-only | 0.04 | 0.12–0.17 | 0.21–0.25 | 1.12–1.75 | 117–510 ms |
+
+**Checkpoints and rolls (64 B):**
+
+| Scenario | Pause p50 | Pause p99 | Pause max | To durable p50 | To durable p99 | To durable max | Rolls | Roll p50 | Roll p99 | Roll max |
+|---|---|---|---|---|---|---|---|---|---|---|
+| probe | 33.2 ms | 932 ms | 1.2 s | 277 ms | 1.3 s | 1.5 s | 1,713 | 358 | 145 ms | 1.9 s |
+| steady-50 | 686–718 | 104–126 ms | 184–385 ms | 188–189 ms | 290–303 ms | 401–559 ms | 1,742 | 329–335 | 95.7–103 ms | 184 ms to 1.1 s |
+| steady-90 | 16.9–18.9 ms | 243–283 ms | 781 ms to 1.5 s | 221–244 ms | 606–660 ms | 1.7–1.8 s | 3,136 | 351–354 | 163–167 ms | 1.6–1.8 s |
+| bursty | 5.05–7.07 ms | 91.0–370 ms | 113–370 ms | 165–166 ms | 547 ms to 1.6 s | 747 ms to 2.1 s | 297 | 344–357 | 86.6–139 ms | 113–370 ms |
+| visibility-only | – | – | – | – | – | – | 89 | 13.0–80.0 ms | 117–510 ms | 117–510 ms |
+
+**Readers (64 B):**
+
+| Scenario | Reader | p50 | p99 | p99.9 | p99.99 | max | Lag max (records) | CPU |
+|---|---|---|---|---|---|---|---|---|
+| probe | mapped, spin | 0.00 | 679 | 2.94 ms | 8.91 ms | 1.9 s | 85,759 | 0.96 |
+| probe | safe, default | 6.00 | 465 | 6.11 ms | 141 ms | 1.9 s | 236,927 | 0.86 |
+| steady-50 | mapped, spin | 0.62–0.63 | 57.7–64.1 ms | 949 ms to 1.0 s | 1.3 s | 1.3 s | 6,871–49,599 | 0.95 |
+| steady-50 | safe, default | 3.56–3.62 | 58.4–64.9 ms | 949 ms to 1.0 s | 1.3 s | 1.3 s | 75,583–80,255 | 0.98 |
+| steady-50 | safe, durable-only, block | 822–828 ms | 1.2 s | 1.9–2.0 s | 2.3 s | 2.4 s | 8,302,591–8,527,871 | 0.26 |
+| steady-90 | mapped, spin | 18.0–22.5 ms | 1.5–2.3 s | 1.9–2.7 s | 2.0–2.8 s | 2.0–2.8 s | 34,975–36,255 | 0.96 |
+| steady-90 | safe, default | 18.0–22.5 ms | 1.5–2.3 s | 1.9–2.7 s | 2.0–2.8 s | 2.0–2.8 s | 177,791–355,583 | 0.90 |
+| steady-90 | safe, durable-only, block | 1.1 s | 2.6–3.2 s | 3.1–3.9 s | 3.2–4.1 s | 3.2–4.1 s | 11,001,855–11,378,687 | 0.47–0.48 |
+| bursty | mapped, spin | 137 ms | 337–351 ms | 493–589 ms | 557 ms to 1.0 s | 557 ms to 1.0 s | 7,767–371,199 | 0.97–0.98 |
+| bursty | safe, default | 136–137 ms | 337–349 ms | 501–589 ms | 535 ms to 1.0 s | 536 ms to 1.0 s | 271,615–335,615 | 0.39 |
+| bursty | safe, durable-only, block | 1.2 s | 1.6–2.6 s | 1.8–3.1 s | 1.8–3.1 s | 1.8–3.1 s | 5,898,239–8,511,487 | 0.21 |
+| visibility-only | mapped, spin | 0.68–0.74 | 49.1–338 ms | 89.7–476 ms | 112–505 ms | 117–510 ms | 135–42,495 | 0.90–0.93 |
+| visibility-only | safe, default | 2.84–3.13 | 49.1–359 ms | 89.7–497 ms | 112–527 ms | 117–532 ms | 280–323,327 | 0.86–0.96 |
+
+
+**Writer schedule and CPU (1,024 B):**
+
+| Scenario | Rate (records/s) | Achieved (records/s) | Late sends (%) | Max schedule delay | Unsent | Writer CPU (process) |
+|---|---|---|---|---|---|---|
+| probe | unpaced | 1,161,895 | – | – | – | 0.52 |
+| steady-50 | 580,947 | 580,949–580,950 | 8.9–9.7 | 1.0–1.3 s | 0 | 1.05 |
+| steady-90 | 1,045,705 | 768,232–816,707 | 94.3–97.2 | 149–177 s | 91,506,438–123,086,385 | 0.35–0.38 |
+| bursty | 464,758 | 467,494–467,591 | 78.9–85.1 | 503 ms to 3.1 s | 0 | 0.79–0.86 |
+| visibility-only | 161,117 | 161,118 | 2.0–2.5 | 77.7–81.8 ms | 0 | 1.02 |
+
+**Append latency (1,024 B, every append timed, µs):**
+
+| Scenario | p50 | p99 | p99.9 | p99.99 | max |
+|---|---|---|---|---|---|
+| probe | 0.08 | 0.17 | 0.79 | 9.71 | 3.3 s |
+| steady-50 | 0.08 | 0.25 | 1.54 | 22.5–28.3 | 606 ms to 1.2 s |
+| steady-90 | 0.08 | 0.17 | 1.33–1.79 | 1.57–1.62 ms | 3.7–4.4 s |
+| bursty | 0.08 | 0.17–0.21 | 1.33–1.83 | 1.52–1.63 ms | 206–218 ms |
+| visibility-only | 0.12 | 0.21–0.25 | 1.21–1.25 | 5.21–5.42 | 77.8–81.8 ms |
+
+**Checkpoints and rolls (1,024 B):**
+
+| Scenario | Pause p50 | Pause p99 | Pause max | To durable p50 | To durable p99 | To durable max | Rolls | Roll p50 | Roll p99 | Roll max |
+|---|---|---|---|---|---|---|---|---|---|---|
+| probe | 266 ms | 4.0 s | 5.2 s | 1.1 s | 7.4 s | 8.4 s | 2,764 | 17.3 ms | 482 ms | 3.3 s |
+| steady-50 | 13.4–16.3 ms | 194–266 ms | 606 ms to 1.2 s | 212–249 ms | 558–763 ms | 1.3–1.8 s | 2,809 | 333–339 | 122–145 ms | 606 ms to 1.2 s |
+| steady-90 | 253–261 ms | 3.4–3.5 s | 4.1–4.9 s | 811–817 ms | 6.9 s | 7.8–9.0 s | 4,081–4,331 | 22.3–24.9 ms | 503–647 ms | 3.7–4.4 s |
+| bursty | 62.7–108 ms | 186–834 ms | 218 ms to 2.6 s | 237–412 ms | 330 ms to 4.3 s | 339 ms to 5.3 s | 478 | 10.5–20.2 ms | 163–168 ms | 206–218 ms |
+| visibility-only | – | – | – | – | – | – | 89 | 13.0–13.3 ms | 77.8–81.8 ms | 77.8–81.8 ms |
+
+**Readers (1,024 B):**
+
+| Scenario | Reader | p50 | p99 | p99.9 | p99.99 | max | Lag max (records) | CPU |
+|---|---|---|---|---|---|---|---|---|
+| probe | mapped, spin | 603 | 16.1 ms | 23.5 ms | 68.6 ms | 3.3 s | 126,207 | 0.93 |
+| probe | safe, default | 96.1 | 15.1 ms | 23.7 ms | 68.3 ms | 3.3 s | 126,207 | 0.23 |
+| steady-50 | mapped, spin | 1.75–5.31 | 105–133 ms | 789–946 ms | 984 ms to 1.2 s | 1.0–1.3 s | 16,399–24,527 | 0.77–0.80 |
+| steady-50 | safe, default | 3.21–3.26 | 105–134 ms | 787–946 ms | 984 ms to 1.2 s | 1.0–1.3 s | 20,111–69,631 | 0.91–0.92 |
+| steady-50 | safe, durable-only, block | 792–810 ms | 1.4–1.5 s | 2.0–2.5 s | 2.2–2.8 s | 2.3–2.8 s | 1,324,031–1,451,007 | 0.11 |
+| steady-90 | mapped, spin | 48–74 s | 148–175 s | 149–177 s | 149–178 s | 149–178 s | 80,127–126,207 | 0.93–0.94 |
+| steady-90 | safe, default | 48–74 s | 148–175 s | 149–177 s | 149–178 s | 149–178 s | 80,255–126,207 | 0.17–0.20 |
+| steady-90 | safe, durable-only, block | 51–76 s | 150–178 s | 153–181 s | 153–181 s | 153–181 s | 3,989,503–4,796,415 | 0.14–0.15 |
+| bursty | mapped, spin | 50.3–73.9 ms | 364 ms to 2.7 s | 471 ms to 3.1 s | 494 ms to 3.1 s | 503 ms to 3.1 s | 16,559–16,783 | 0.98 |
+| bursty | safe, default | 50.3–73.8 ms | 364 ms to 2.7 s | 471 ms to 3.1 s | 494 ms to 3.1 s | 503 ms to 3.1 s | 16,031–16,831 | 0.11 |
+| bursty | safe, durable-only, block | 1.2–1.4 s | 1.3–5.4 s | 1.3–6.3 s | 1.3–6.3 s | 1.3–6.3 s | 929,791–2,018,303 | 0.08 |
+| visibility-only | mapped, spin | 0.53 | 8.23–11.6 ms | 42.6–60.6 ms | 74.8–76.0 ms | 77.8–81.8 ms | 0–1 | 1.00 |
+| visibility-only | safe, default | 2.42 | 8.27–11.6 ms | 42.6–60.6 ms | 74.8–76.0 ms | 77.8–81.8 ms | 3–168 | 0.97–0.98 |
+
+
+What the session shows:
+- **The writer is fast and the device absorbs a lot.** The unpaced 5-minute probe reached 7.37 million records/s at
+  64 B (767 MB/s of payload) and 1.16 million at 1,024 B (1.19 GB/s) with a checkpoint requested every second, two to
+  three times the Linux VMs' probes; append p99.9 is 0.17–1.8 µs in every scenario.
+- **But the tail is set by rolls and checkpoints, not by the append.** At half the probe rate (64 B: 3.69 million
+  records/s, 384 MB/s; 1,024 B: 581,000, 618 MB/s) every scheduled record was sent and 4.7–9.7 % of sends were late,
+  yet the writer fell up to 1.0–1.5 s behind its schedule, roll appends had a p99 of 96–145 ms and a maximum of 0.18–1.2
+  s, and the visible readers' p99.9 was 0.79–1.0 s (Linux at half the probe: at most 24 ms behind, p99.9 below 0.4 ms).
+  In the 64 B steady-50 run of repeat 1, 91 of the 600 seconds had the writer more than 50 ms behind, and in each of
+  them the longest append was a roll append of 50–184 ms. Why the rolls take that long is item 2 below.
+- **Checkpoints take about 0.2 s, not milliseconds.** At half the probe rate a checkpoint became durable 188–249 ms
+  (p50) after its request (Linux with early write-back: 0.85–4.5 ms): with no early write-back on macOS each checkpoint
+  writes the whole second's data (380–620 MB) and then waits for two `F_FULLFSYNC` (item 3). The writer's pause per
+  checkpoint was 0.69–0.72 ms (p50) at 64 B and 13–16 ms at 1,024 B; durable-only readers trailed by 0.79–0.83 s (p50).
+- **90 % of the probe:** at 64 B (6.64 million records/s, 690 MB/s) every scheduled record was sent within 0.01 % of
+  the rate, 66–69 % late, up to 2.0–2.8 s behind; at 1,024 B (1.05 million, 1.11 GB/s) **the writer did not keep its
+  schedule**: it fell more than the 60 s overrun limit behind and stopped (`stopped_by: overrun_limit`) with 91 and 123
+  million of 638 million records unsent, readers 48–74 s behind at p50. The 5-minute probe overstates what the
+  writer sustains with periodic durability here, as it did on Linux.
+- **Bursts** at twice the probe rate: at 64 B every send of a burst is late (as on Linux) and readers' p50 is 137 ms;
+  at 1,024 B 79–85 % of sends are late and the backlog reached 0.5–3.1 s.
+- **Without checkpoints** (visibility-only, at capped rates) appends were *not* faster in the tail: roll appends took
+  13–80 ms (p50) and up to 0.51 s, because a writer that never checkpoints releases the oldest of its open dirty
+  segments on its own thread at every roll (item 2).
+- **Noise.** The two repeats agree within about 10 % on the medians, the late fractions and the checkpoint figures;
+  the maxima do not (64 B steady-50 roll maximum 184 ms against 1.1 s; 1,024 B bursty schedule delay 0.5 against 3.1
+  s; 64 B visibility-only late sends 4.1 against 16.7 %). Single maxima on this machine are not reproducible.
+
+**Comparison with other tools** (reduced).
+
+`compare/run.py --sustained` with Homebrew's JDK 21, for tickertape, Chronicle Queue and Aeron. The Linux comparison's
+matrix could not run within the 20 GB limit: its probe is sized to 80 % of free space (about 60 GB here) and keeps
+everything it writes, and paced runs at 50 % or 90 % of each tool's probe would write tens of GB within a minute. What
+ran instead: the same rate for every tool (`--rates`), 100,000 records/s at 64 B and 10,000 at 1,024 B, SV and SD, 120 s
+plus 10 s of warm-up, two repeats (Aeron has no SD run), the harness's default settings at `main` (`compare/README.md`
+→ "JVM warm-up, tool settings and JVM logs": Chronicle Queue with `microTouch()` and a 1 GiB `blockSize`, the long JVM
+warm-up, Aeron's term buffers not sparse and pre-touched), which are **not** the settings of the README's Linux
+comparison (Chronicle's defaults, issue #56). tickertape uses the mapped reader and, in SD, the blocking
+`Writer::checkpoint`, as in the Linux comparison. Every run finished (no failure, retry or skip); the 1,024 B half was
+interrupted after 7 of its 10 runs and resumed with `--resume`. tickertape's adapter was built from the working tree
+that also held item 2's instrumentation, inactive (no `TT_TRACE`): one check per roll and per checkpoint step, nothing
+on the append path. All runs were disturbed by other processes at some point.
+
+```sh
+JAVA_HOME=/opt/homebrew/opt/openjdk@21 TMPDIR=$HOME/tmp/tt-macos/compare-data python3 compare/run.py <out> \
+  --sustained --keep-going --tools tickertape,chronicle,aeron --workloads SV,SD --payloads 64 --rates 100000 \
+  --duration 120
+```
+
+Reader latency from the intended send time, µs unless marked; "0.00" is below the 1 µs resolution of the Mac's wall
+clock. Sync is each tool's SD operation, timed on the writer's thread.
+
+| Payload, rate | Tool | Workload | Achieved (records/s) | Late (%) | Max late | Reader p50 | p99 | p99.9 | p99.99 | max | Sync p50 | Sync max |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 64 B, 100,000/s | tickertape | SV | 100,000 | 0.15–0.16 | 1.08–1.23 ms | 0.00 | 0.00 | 7.00 | 339–426 | 1.82–2.36 ms | – | – |
+| 64 B, 100,000/s | tickertape | SD | 100,000 | 1.72–1.78 | 36.9–39.0 ms | 0.00 | 5.52–6.02 ms | 15.1–16.0 ms | 25.2–27.1 ms | 36.9–39.0 ms | 14.9–15.3 ms | 36.9–39.0 ms |
+| 64 B, 100,000/s | chronicle | SV | 100,000 | 0.20–0.24 | 11.9–18.8 ms | 0.00 | 0.00 | 8.00–12.0 | 4.20–9.31 ms | 11.9–18.8 ms | – | – |
+| 64 B, 100,000/s | chronicle | SD | 100,000 | 0.22–0.24 | 2.49–11.8 ms | 0.00 | 0.00 | 9.01–10.0 | 255 to 4.02 ms | 2.50–11.8 ms | 268–287 | 643–660 |
+| 64 B, 100,000/s | aeron | SV | 100,000 | 0.13–0.17 | 165 to 12.7 ms | 0.00 | 0.00 | 6.00–9.01 | 14.0 to 11.8 ms | 344 to 22.7 ms | – | – |
+| 1,024 B, 10,000/s | tickertape | SV | 10,000 | 0.14–0.17 | 1.16–10.1 ms | 0.00 | 3.00 | 7.00–13.0 | 328 to 11.6 ms | 1.90–20.6 ms | – | – |
+| 1,024 B, 10,000/s | tickertape | SD | 10,000 | 1.67–1.69 | 22.1–24.2 ms | 0.00 | 5.41–5.46 ms | 14.8–15.0 ms | 19.1–19.3 ms | 22.2–24.2 ms | 15.0–15.2 ms | 22.2–24.3 ms |
+| 1,024 B, 10,000/s | chronicle | SV | 10,000 | 0.14–0.17 | 5.76–14.8 ms | 0.00 | 2.00–3.00 | 8.00–14.0 | 2.30–7.17 ms | 5.77–14.9 ms | – | – |
+| 1,024 B, 10,000/s | chronicle | SD | 10,000 | 0.15–0.21 | 7.71–12.9 ms | 0.00 | 1.00–3.00 | 11.0–23.0 | 3.34–4.30 ms | 7.82–13.0 ms | 309–571 | 959–992 |
+| 1,024 B, 10,000/s | aeron | SV | 10,000 | 0.09–0.14 | 1.05–2.33 ms | 0.00 | 1.00–2.00 | 6.00–8.00 | 15.0–25.0 | 92.0 to 2.33 ms | – | – |
+
+At these rates the three tools keep the schedule (at most 1.8 % of sends late), and without a sync their readers'
+p99.9 is 6–14 µs; the tails differ. Without a sync (SV) tickertape's p99.99 was 0.34–0.43 ms at 64 B, Chronicle Queue's
+4.2–9.3 ms and Aeron's 14 µs to 11.8 ms; at 1,024 B the two repeats of tickertape (0.33 and 11.6 ms) and of Aeron
+differ by more than the tools do. **With a sync every second the guarantees are far apart on macOS**: tickertape's
+checkpoint ends with two `F_FULLFSYNC`, which flush the drive's cache, and took 15 ms (p50) on the writer's thread,
+so its reader's p99 rose to 5.4–6.0 ms (the records sent during the checkpoint wait for it); Chronicle Queue's
+`msync(MS_SYNC)` took 0.27–0.57 ms because on macOS `msync` and `fsync` do not flush the drive's cache, and its reader
+was not affected. The same sync with `F_FULLFSYNC` in Chronicle Queue was not measured. A comparison of the tools near
+their sustainable rates on macOS is not in this record.
+
+### The roll wait (issue #60)
+
+On macOS the spare segment is prepared by a thread started when the active segment is half full, and a roll joins
+that thread (`Spares::take`), so a roll waits for a spare still being prepared. The library has no metric for it
+(`Writer::metrics` has none; the latency histograms of ADR 0047 time the roll, not its parts), so this item ran a
+**local instrumented build** (a patch not in the repository): timestamps (monotonic clock, kept in memory, written by a
+helper thread) at the writer's request for a spare, at each step of the spare thread (start; removing the old name and
+creating the file; `F_PREALLOCATE` and `ftruncate`; `fsync`; `mmap`; `MADV_WILLNEED` of the first 8 MiB), at the start
+and end of the join (and whether the thread had already finished), at each step of publishing the spare (header
+`pwrite`, `link`, `unlink`), and at the start and end of the roll. The roll append times of `tt-sustained` are its own,
+as in the stock build (the instrumented build's roll p50 of 0.30–0.35 ms at the lower rates is that of the stock
+build's paced runs in item 1, 0.33–0.36 ms). `fs_usage`, `sample` and `dtrace` were not needed.
+
+Cells: 60-second runs plus 5 s of warm-up, one mapped reader, three rates per payload (the highest at 90 % of item 1's
+probe), the default 128 MiB segments and a smaller size chosen so that segments roll every 0.3–0.4 s (8 MiB, 32 MiB,
+64 MiB); at the highest rates 128 MiB segments already roll every 0.12–0.19 s and the smaller size is 32 MiB (rolls
+every 30–50 ms). Background checkpoints every second with 4 GiB of retention, or none (then no retention, and the
+highest-rate cells shorter, 8–9 s, so that a run writes at most 10 GB). Two passes over all cells, about an hour apart;
+cells are ranges over the two, and the counts are "first / second".
+
+```sh
+TT_TRACE=<trace file> tt-sustained run --dir … --out … --rate 6635275 --warmup 5s --duration 60s --payload 64 \
+  --segment-size 33554432 --readers mapped --checkpoint-every 1s --checkpoint-mode background \
+  --retain-bytes 4294967296 --count-clock-backwards --json
+```
+
+The last column classifies every roll of 1 ms or more by the part that took more than half of it: the wait for the
+spare, the `link` that publishes it, or what follows the link (sealing the old segment and pushing it to the list of
+dirty segments, which releases the oldest one's file and mapping when more than four are open,
+`checkpoint::OPEN_SEGMENTS`); counts per pass, "wait–link–release".
+
+| Payload | Rate (records/s) | Segment | Checkpoints | Achieved (records/s) | Late (%) | Max schedule delay | Rolls | Rolls that waited | Wait p50 | Wait max | Roll append p50 | p99 | max | Rolls ≥ 1 ms: mostly wait / link / release |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 64 B | 200,000 | 128 MiB | every 1 s | 199,987–200,001 | 0.2–0.3 | 1.26–9.40 ms | 10 | 0 / 0 | – | – | 314–350 | 365–382 | 365–382 | 0–0–0 / 0–0–0 |
+| 64 B | 200,000 | 128 MiB | none | 200,000–200,001 | 0.2–0.3 | 907 to 1.14 ms | 10 | 0 / 0 | – | – | 817–831 | 877 to 1.12 ms | 877 to 1.12 ms | 0–0–0 / 0–0–1 |
+| 64 B | 200,000 | 8 MiB | every 1 s | 200,001 | 0.3–0.4 | 3.26–6.92 ms | 161 | 0 / 0 | – | – | 317–330 | 2.76–3.71 ms | 3.26–6.93 ms | 0–3–0 / 0–3–0 |
+| 64 B | 200,000 | 8 MiB | none | 200,001 | 0.3 | 1.52–5.29 ms | 161 | 0 / 0 | – | – | 684–987 | 1.35–5.10 ms | 1.39–5.29 ms | 0–3–17 / 0–0–71* |
+| 64 B | 1,000,000 | 128 MiB | every 1 s | 1,000,003–1,000,005 | 0.2–0.3 | 10.6–11.3 ms | 50 | 0 / 0 | – | – | 304–333 | 10.6–11.3 ms | 10.6–11.3 ms | 0–3–0 / 0–1–0* |
+| 64 B | 1,000,000 | 128 MiB | none | 1,000,003–1,000,005 | 1.0–1.7 | 15.0–49.6 ms | 50 | 0 / 0 | – | – | 12.0–21.5 ms | 15.0–49.6 ms | 15.0–49.6 ms | 0–0–38 / 0–0–40* |
+| 64 B | 1,000,000 | 32 MiB | every 1 s | 1,000,003–1,000,005 | 0.3–0.4 | 12.5–16.3 ms | 201 | 0 / 0 | – | – | 311–323 | 8.47–12.6 ms | 12.5–16.3 ms | 0–10–0 / 0–7–0* |
+| 64 B | 1,000,000 | 32 MiB | none | 1,000,003–1,000,005 | 1.3–1.6 | 4.90–12.0 ms | 201 | 0 / 0 | – | – | 3.22–4.30 ms | 4.87–10.1 ms | 4.90–12.0 ms | 0–1–188 / 0–1–189* |
+| 64 B | 6,635,275 | 128 MiB | every 1 s | 6,632,363–6,632,465 | 38.4–39.4 | 104–217 ms | 334 | 3 / 4 | 23.9–31.9 ms | 34.3–45.7 ms | 332–334 | 50.1–139 ms | 59.5–176 ms | 3–34–37 / 4–31–34* |
+| 64 B | 6,635,275 | 128 MiB | none | 6,635,257–6,635,309 | 53.6–57.9 | 37.4–46.7 ms | 71 | 0 / 0 | – | – | 13.0–16.2 ms | 29.7–32.8 ms | 29.7–32.8 ms | 0–0–67 / 0–0–67* |
+| 64 B | 6,635,275 | 32 MiB | every 1 s | 6,617,561–6,634,641 | 70.4–97.3 | 151–487 ms | 1,336 | 522 / 378 | 1.28–1.33 ms | 99.6–172 ms | 2.22–3.74 ms | 81.3–108 ms | 147–176 ms | 221–66–945 / 115–108–983* |
+| 64 B | 6,635,275 | 32 MiB | none | 6,635,289–6,635,308 | 28.6–38.3 | 13.1–64.4 ms | 287 | 21 / 0 | 1.24 ms | 1.61 ms | 2.13–3.80 ms | 3.98–5.96 ms | 5.63–13.1 ms | 0–0–277 / 0–1–278* |
+| 1,024 B | 20,000 | 128 MiB | every 1 s | 20,000 | 0.1–0.2 | 1.06–1.43 ms | 10 | 0 / 0 | – | – | 333–338 | 366–390 | 366–390 | 0–0–0 / 0–0–0* |
+| 1,024 B | 20,000 | 128 MiB | none | 20,000 | 0.1 | 1.60–6.18 ms | 10 | 0 / 0 | – | – | 797–836 | 1.65–6.21 ms | 1.65–6.21 ms | 0–0–1 / 0–0–1* |
+| 1,024 B | 20,000 | 8 MiB | every 1 s | 20,000 | 0.2 | 4.91–7.06 ms | 164 | 0 / 0 | – | – | 305–310 | 637 to 2.69 ms | 4.93–7.09 ms | 0–2–0 / 0–1–0* |
+| 1,024 B | 20,000 | 8 MiB | none | 20,000 | 0.3 | 1.56 ms | 164 | 0 / 0 | – | – | 673–983 | 1.16–1.47 ms | 1.47–1.61 ms | 0–0–7 / 0–0–75* |
+| 1,024 B | 200,000 | 128 MiB | every 1 s | 200,000–200,001 | 0.3–0.4 | 34.3–35.9 ms | 103 | 0 / 0 | – | – | 314–319 | 34.3–35.9 ms | 34.3–35.9 ms | 0–6–0 / 0–6–0* |
+| 1,024 B | 200,000 | 128 MiB | none | 200,000–200,001 | 2.6–3.1 | 48.1–51.8 ms | 72 | 0 / 0 | – | – | 16.7–17.2 ms | 42.1–51.8 ms | 42.1–51.8 ms | 0–0–64 / 0–0–64* |
+| 1,024 B | 200,000 | 64 MiB | every 1 s | 200,000–200,001 | 0.7–0.8 | 54.6–57.3 ms | 206 | 0 / 0 | – | – | 311–319 | 45.7–48.0 ms | 54.6–57.3 ms | 0–14–0 / 0–15–0* |
+| 1,024 B | 200,000 | 64 MiB | none | 200,000–200,001 | 2.2–2.6 | 13.6–15.3 ms | 145 | 0 / 0 | – | – | 6.40–8.45 ms | 11.3–11.8 ms | 13.6–15.3 ms | 0–0–137 / 0–0–137 |
+| 1,024 B | 1,045,705 | 128 MiB | every 1 s | 1,045,707–1,045,710 | 35.5–35.6 | 174–248 ms | 538 | 42 / 30 | 10.6–11.8 ms | 124–241 ms | 3.57–5.09 ms | 107–122 ms | 174–248 ms | 29–49–209 / 23–51–208* |
+| 1,024 B | 1,045,705 | 128 MiB | none | 914,108–1,045,527 | 52.6–56.1 | 161 ms to 2.0 s | 107 | 0 / 1 | 8.71 ms | 8.71 ms | 13.1–18.0 ms | 139 ms to 1.9 s | 139 ms to 1.9 s | 0–0–100 / 0–0–99* |
+| 1,024 B | 1,045,705 | 32 MiB | every 1 s | 850,830–914,416 | 99.8 | 9.3–15 s | 2,155 | 1795 / 1617 | 5.43–8.11 ms | 172 ms to 1.4 s | 6.51–9.18 ms | 147–178 ms | 212 ms to 2.5 s | 901–46–969 / 896–42–887* |
+| 1,024 B | 1,045,705 | 32 MiB | none | 1,044,454–1,044,975 | 54.7–69.3 | 427–767 ms | 431 | 112 / 161 | 8.39–9.16 ms | 14.3–15.7 ms | 4.46–6.57 ms | 21.6–31.5 ms | 22.9–37.5 ms | 83–1–343 / 106–0–325* |
+
+`*` at least one of the two runs was disturbed.
+
+What bounds the wait, from the timestamps:
+- **A roll that finds the spare ready** costs 0.30–0.35 ms (p50), and most of it is the `link` (0.23–0.27 ms p50 on
+  APFS; the header `pwrite`, the join of a finished thread and the `unlink` take 10–40 µs each). The ready spare took
+  20–30 ms (p50) to prepare with 128 MiB segments (`fsync` 5–12 ms, the 8 MiB `MADV_WILLNEED` 16–17 ms, the rest
+  below 0.1 ms) and 8–20 ms with 8–32 MiB ones.
+- **No roll waited at 200,000 or 1 million records/s** (either payload, either segment size, with or without
+  checkpoints): the spare has half a segment's time (0.2 s to 3 s here) and needs 8–30 ms.
+- **Near the device's limit it waits** (64 B at 6.6 million records/s, 1,024 B at 1.05 million): with 128 MiB segments
+  3–4 of 334 rolls (64 B) and 30–42 of 538 (1,024 B) waited, 11–32 ms at p50 and up to 46 ms and 241 ms; with 32 MiB
+  segments 378–522 of 1,336 and 1,617–1,795 of 2,155, and at 1,024 B the writer fell 9–15 s behind its schedule.
+- **What was running when a roll began to wait** (`waits.py` in the raw data): most often the 8 MiB `MADV_WILLNEED`
+  (for example 1,020 and 1,117 of the 1,795 and 1,617 waits at 1,024 B with 32 MiB segments), which bounds those waits
+  to its own length (at most 22 ms). At 1.1 GB/s half of a 32 MiB segment lasts 15 ms, less than that prefault alone.
+  The **long** waits were the spare's `fsync` (up to 241 ms with 128 MiB segments and 1.37 s with 32 MiB) and the
+  removal of the old name and creation of the file (up to 202 ms), and only with background checkpoints: without
+  them the longest `fsync` that a roll waited for took 4.1 ms. The spare's sync and its directory operations queue
+  behind the checkpoint thread's `msync`, `fsync` and `F_FULLFSYNC` of the same volume. The single 1.37 s wait was in
+  one pass only (the other pass's longest in that cell was 166 ms).
+- **The wait is not the main cause of slow rolls.** Of the rolls of 1 ms or more, a wait for the spare dominated
+  only near the device's limit (at most about half of them, with 32 MiB segments). Two other parts did more:
+  - the **`link`**, with background checkpoints: up to 33–57 ms at 200,000 records/s of 1,024 B and up to 175–220 ms
+    near the limit, against at most 6.3 ms without checkpoints. Like the spare's sync, publishing the spare's name
+    waits for the checkpoint thread's syncs. These links, not waits, are the 34–57 ms roll maxima of the 1,024 B cells
+    at 200,000 records/s where no roll waited;
+  - the **release of the oldest open segment** when more than four dirty segments are open: every roll of a writer that
+    does not checkpoint (1.7–16 ms p50 after the link with 32–128 MiB segments; 0.36–0.50 ms with 8 MiB), and with
+    background checkpoints near the limit, when more than four segments roll between two checkpoints. It is the `munmap`
+    (and `close`) of a dirty mapping on the writer's thread; the same code with a clean list (with checkpoints at lower
+    rates) takes 2–3 µs after the link.
+
+What the figures do not show: the spare's thread start, `fsync` and prefault were not separated into CPU and I/O
+time; why APFS makes a `link` wait for another thread's syncs was inferred from the timing, not traced in the kernel;
+nothing here is Linux, where the spare is optional and a roll never waits (ADR 0049).
+
+**Cheap improvements the data suggest** (not built here; each needs its own measurement and, for the second, a look
+at the crash contract):
+1. Hand the spare over before its prefault, or skip the spare's own `MADV_WILLNEED` (the prefault helper advises the
+   new segment after the roll anyway, `Prefaulter::switch`): removes the most frequent wait (the 8 MiB advice, at
+   most 22 ms), and with it the 8 MiB of zeros each prefault adds to a checkpoint (item 3).
+2. Do not `fsync` the spare on macOS, as on Linux since ADR 0038: the checkpoint that first covers the segment syncs it
+   and the directory. The longest waits were this `fsync` behind a checkpoint. Its cost moves to that checkpoint (item
+   3: the first `fsync` of a preallocated APFS file writes about half of it).
+3. Request the spare earlier than at half a segment. It would help only the waits shorter than the extra lead: with
+   128 MiB segments near the limit half a segment is 60–100 ms, while the waits behind a checkpoint reached 241 ms.
+4. Release the oldest open segment off the writer's thread (or keep more open between checkpoints): the most common
+   slow roll near the limit and for writers that do not checkpoint.
+
+### Checkpoint cost of prefaulted, unwritten data
+
+The Linux half is recorded above ("what prefaulted, unwritten pages add to a checkpoint", merged while these runs went
+on; on Linux the 256 KiB `MADV_POPULATE_WRITE` window is written as zeros by every checkpoint). The cells here follow
+the roadmap entry: idle (one record a second), 20,000 and 200,000 records/s at 64 B and 20,000 at 1,024 B,
+`WriterConfig::prefault` on (the default) and off (`--no-prefault`), 128 MiB segments, a background checkpoint every
+second, 4 GiB of retention, one mapped reader; 120 s plus 5 s of warm-up (200 s at 64 B and 20,000 records/s, for three
+rolls), two passes with the order of on and off swapped in the second. The same instrumented build as item 2 timed each
+checkpoint's steps on the checkpoint thread (`msync` of each segment, `fsync` of each segment, the directory `fsync`,
+the first `F_FULLFSYNC`, the marker's `pwrite` and second `F_FULLFSYNC`) and read the process's bytes written to disk
+before the first step and after the last (`proc_pid_rusage`, `ri_diskio_byteswritten`).
+
+**How far the bytes can be trusted.** `ri_diskio_byteswritten` counts the I/O the process issues, so a background
+checkpoint's synchronous `msync` and `fsync` are in it, and so is anything else the process writes at the same moment
+(the spare thread's `fsync`, which item 2 shows writes, falls into a checkpoint's window only if the two overlap).
+Write-back that the kernel starts on its own would be missed; with checkpoints every second nothing was left for it,
+since in every cell the bytes a checkpoint wrote were never below the bytes it covered (21.33 MB written for 21.28 MB
+covered, and so on). It does not say what reached the flash, and it is not `iostat` (the whole disk) or `fs_usage`.
+Two direct checks with a 40-line C program on the same volume, outside the runs: the first `fsync` of a file just
+preallocated with `F_PREALLOCATE` and `ftruncate` writes 8.4 MB for 8 MiB, 34 MB for 32 MiB and 55–62 MB for 128 MiB
+(about half of it, then `F_FULLFSYNC` takes 7–26 ms); and after that first `fsync`, `MADV_WILLNEED` on 8 MiB of the
+file's shared mapping makes the next `fsync` write 8.3 MB, the same as storing into each page (8.4 MB), while reading
+the same pages makes it write nothing. **On this macOS and APFS the prefault advice dirties the pages it advises**,
+although the helper never stores into them.
+
+Cells are ranges over the two passes; per checkpoint, p50 except where marked; µs unless marked. The first checkpoint
+of each run and the final blocking one are left out; the first table leaves out the checkpoints that follow a roll,
+which the second table shows. `*` a run of the cell was disturbed.
+
+| Payload, rate | Prefault | Checkpoints | Covered (MB) | Written (MB) | `msync` | `fsync` | dir `fsync` | `F_FULLFSYNC` | marker + `F_FULLFSYNC` | Total p50 | Total p99 | Writer pause p50 / max | Append max |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 64 B, idle (1 record/s) | off | 123 × 2 | 0.00 | 0.03 | 108–312 | 6.54–8.42 | 1.33 | 4.71–4.78 ms | 3.94–3.95 ms | 8.78–9.03 ms | 12.3–13.7 ms | 6.21–7.38 / 13.0 | 12.3–12.4* |
+| 64 B, idle (1 record/s) | on | 123 × 2 | 0.00 | 0.03 | 101–298 | 6.58–7.12 | 1.17–1.38 | 4.85–4.87 ms | 4.01–4.02 ms | 9.10–9.18 ms | 13.0–27.5 ms | 6.50–7.58 / 12.3–71.7 | 11.8–71.4* |
+| 64 B, 20,000 records/s | off | 200 × 2 | 2.08 | 2.15 | 797–872 | 41.0–47.3 | 1.75 | 5.46–5.55 ms | 4.05–4.08 ms | 10.6 ms | 14.8–18.2 ms | 19.2–25.1 / 1.56–1.60 ms | 2.43–2.90 ms* |
+| 64 B, 20,000 records/s | on | 200 × 2 | 2.08 | 4.21 | 892–951 | 498–544 | 1.58–1.71 | 5.00–5.50 ms | 4.02–4.07 ms | 10.6–11.0 ms | 16.5–16.7 ms | 469–518 / 1.52–1.70 ms | 1.52–1.70 ms* |
+| 64 B, 200,000 records/s | off | 104 × 2 | 20.80 | 20.86 | 4.46–4.73 ms | 97.6–104 | 1.75–1.92 | 7.28–7.56 ms | 4.05–4.15 ms | 16.5–16.7 ms | 24.8 ms | 147–294 / 3.45–4.20 ms | 3.45–12.7 ms* |
+| 64 B, 200,000 records/s | on | 104 × 2 | 20.80 | 28.75–28.79 | 4.30–4.56 ms | 1.97–2.11 ms | 1.75–1.79 | 8.50–8.81 ms | 4.07–4.08 ms | 19.2–19.8 ms | 25.8–28.8 ms | 27.4–27.8 / 1.31–1.78 ms | 1.78 ms |
+| 1,024 B, 20,000 records/s | off | 104 × 2 | 21.28 | 21.33 | 4.73–4.90 ms | 99.0–128 | 1.58–1.83 | 7.18–8.00 ms | 4.09–4.58 ms | 16.6–18.5 ms | 25.0–145 ms | 192–391 / 4.44–32.6 ms | 4.44–32.6 ms |
+| 1,024 B, 20,000 records/s | on | 104 × 2 | 21.28 | 29.21 | 4.34–4.59 ms | 1.94–1.95 ms | 1.71–1.75 | 8.99–9.28 ms | 4.08–4.17 ms | 19.6 ms | 29.0–33.0 ms | 9.92–10.7 / 1.33–1.45 ms | 1.45–3.43 ms* |
+
+| Payload, rate | Prefault | Checkpoint | n (per pass) | Covered (MB) | Written (MB) | `fsync` | dir `fsync` | `F_FULLFSYNC` | Total p50 |
+|---|---|---|---|---|---|---|---|---|---|
+| 64 B, 20,000 records/s | off | first after a roll | 3 | 2.08 | 68.32–68.39 | 6.53–6.58 ms | 43.2–43.3 | 21.0–22.4 ms | 32.3–34.2 ms |
+| 64 B, 20,000 records/s | off | the others | 200 | 2.08 | 2.15 | 41.0–47.3 | 1.75 | 5.46–5.55 ms | 10.6 ms |
+| 64 B, 20,000 records/s | on | first after a roll | 3 | 2.08 | 2.24 | 398–401 | 24.4–35.0 | 5.15–6.32 ms | 10.3–11.5 ms |
+| 64 B, 20,000 records/s | on | the others | 200 | 2.08 | 4.21 | 498–544 | 1.58–1.71 | 5.00–5.50 ms | 10.6–11.0 ms |
+| 64 B, 200,000 records/s | off | first after a roll | 19 | 20.80 | 65.49–66.80 | 4.36–4.58 ms | 34.5–34.6 | 18.2–20.5 ms | 31.7–34.8 ms |
+| 64 B, 200,000 records/s | off | the others | 104 | 20.80 | 20.86 | 97.6–104 | 1.75–1.92 | 7.28–7.56 ms | 16.5–16.7 ms |
+| 64 B, 200,000 records/s | on | first after a roll | 19 | 20.80 | 28.15 | 1.61–1.62 ms | 27.9–32.7 | 9.13–9.17 ms | 18.2–18.6 ms |
+| 64 B, 200,000 records/s | on | the others | 104 | 20.80 | 28.75–28.79 | 1.97–2.11 ms | 1.75–1.79 | 8.50–8.81 ms | 19.2–19.8 ms |
+| 1,024 B, 20,000 records/s | off | first after a roll | 19 | 21.28 | 65.21–66.45 | 4.58–5.03 ms | 37.8–38.7 | 19.8–20.6 ms | 33.8–35.8 ms |
+| 1,024 B, 20,000 records/s | off | the others | 104 | 21.28 | 21.33 | 99.0–128 | 1.58–1.83 | 7.18–8.00 ms | 16.6–18.5 ms |
+| 1,024 B, 20,000 records/s | on | first after a roll | 19 | 21.28 | 28.69–28.87 | 1.59–1.70 ms | 32.3–33.3 | 8.59–9.33 ms | 18.6–18.7 ms |
+| 1,024 B, 20,000 records/s | on | the others | 104 | 21.28 | 29.21 | 1.94–1.95 ms | 1.71–1.75 | 8.99–9.28 ms | 19.6 ms |
+
+What the figures show:
+- **The floor is the two barriers.** With nothing to write (idle) a checkpoint takes 8.8–9.2 ms, of which the two
+  `F_FULLFSYNC` are 4.7–4.9 and 3.9–4.0 ms; `msync`, `fsync` and the directory `fsync` together stay below 0.4 ms.
+  Prefaulting changes nothing there (the window was advised once, at the open).
+- **With prefault on, each checkpoint writes the zeros the helper advised since the last one**: the bytes written
+  exceed the bytes covered by about the distance the writer moved in that second, up to the 8 MiB window: 2.1 MB at
+  20,000 records/s of 64 B (2.1 MB/s), 7.9 MB at 200,000 of 64 B and at 20,000 of 1,024 B (21 MB/s). The file-wide
+  `fsync`, not the ranged `msync`, writes them: 0.50–0.54 ms instead of 0.04–0.05 ms at 2 MB/s, 1.9–2.1 ms instead
+  of 0.10–0.13 ms at 21 MB/s. Those pages are written again, with records, at a later checkpoint.
+- **What that adds to a checkpoint**: at 200,000 records/s of 64 B the total went from 16.5–16.7 ms to 19.2–19.8 ms
+  (+2.5–3.3 ms: the `fsync` above and a longer first `F_FULLFSYNC`, 7.3–7.6 against 8.5–8.8 ms), in both passes. At
+  20,000 records/s of 64 B (10.6 against 10.6–11.0 ms) and of 1,024 B (16.6–18.5 against 19.6 ms) the two passes of
+  the same configuration differ by as much as on and off do, so no figure is given for those two.
+- **With prefault off the spare segment is off as well** (it applies only with prefault on), so the roll creates and
+  preallocates the segment on the writer's thread and the **first checkpoint after each roll** pays the first `fsync` of
+  the new file: 65–68 MB written for 2.1 or 21 MB covered, the `fsync` 4.4–6.6 ms and the first `F_FULLFSYNC` 18–22 ms,
+  32–36 ms in all against 10.6–18.5 ms for the others in the same runs. With prefault on, the spare thread has paid that
+  `fsync` before the roll, and the first checkpoint after a roll costs what the others cost (18–19 ms; 10–12 ms at
+  20,000 of 64 B). So on macOS prefaulting moves about 45–65 MB of zeros per segment off the checkpoint into the spare
+  thread, and adds up to 8 MiB of zeros to every checkpoint.
+- **Appends during the checkpoints**: the writer's longest stretch of work while a checkpoint was in flight (pause)
+  stayed at most 1.3–1.8 ms with prefault on in every cell; with it off, up to 4.2 ms at 200,000 records/s of 64 B and
+  32.6 ms (one pass) at 20,000 of 1,024 B, where the writer creates segments and faults pages itself. At 20,000
+  records/s of 64 B the pause's median was 0.47–0.52 ms with prefault on against 19–25 µs off, in both passes; a store
+  into a page that the checkpoint's `fsync` is writing back (one of the advised pages just ahead of the writer) would
+  explain it, but this was not traced.
+
+What they do not show: whether the zeros the advice dirties wear the SSD measurably (8 MiB a second at most, against
+the records themselves); whether an advice that does not dirty pages on APFS (reading the pages, which wrote nothing in
+the C check) prefaults as well for the writer's stores (not measured); and whether the advised pages are
+write-protected again after a checkpoint, as on Linux (the writer's page faults were not counted here).
 
 ## 2026-11-02, v0.3.0 on Linux (AWS) and macOS
 
