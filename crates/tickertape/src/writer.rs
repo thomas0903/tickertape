@@ -2946,6 +2946,69 @@ mod tests {
         assert_eq!(reopened.next_seq(), 1);
     }
 
+    /// By default (`writeback::STOP_AT_FOLIO_BOUNDARY`, from 1.1), a writer's early write-back helper never starts a
+    /// range that reaches into the 128 KiB block that holds the position it was given, and every segment the writer
+    /// rolled past is written back from its first byte to the end, without gaps (Linux; ADR 0058). Fails with the old
+    /// limit (the page that holds the position): records of about 50 KB put the position the helper is given at a step
+    /// anywhere in the first 50 KB of a block, not only in its first page.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn early_writeback_stops_at_the_folio_boundary_and_finishes_rolled_segments() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let config = WriterConfig::default()
+            .segment_size(4 << 20)
+            .early_writeback(true);
+        let mut w = Writer::open(dir.path(), config).unwrap();
+        let payload = vec![7u8; 50_000];
+        let first = w.active.base;
+        let mut rolls = 0;
+        while rolls < 3 || w.offset < 2 * crate::writeback::STEP + 70_000 {
+            let base = w.active.base;
+            w.append(&NewRecord {
+                schema_id: 1,
+                venue_ts_ns: 0,
+                local_ts_ns: 0,
+                payload: &payload,
+            })
+            .unwrap();
+            if w.active.base != base {
+                rolls += 1;
+            }
+        }
+        assert_ne!(w.active.base, first);
+        let issued = w.writeback.as_ref().unwrap().settled();
+        let active = w.active.file.metadata().unwrap().ino();
+        let mut files: Vec<u64> = Vec::new();
+        for range in &issued {
+            if let Some(position) = range.position {
+                assert!(
+                    range.to <= position / crate::writeback::FOLIO * crate::writeback::FOLIO,
+                    "{range:?} reaches into the writer's block"
+                );
+            }
+            if !files.contains(&range.ino) {
+                files.push(range.ino);
+            }
+        }
+        assert!(files.len() >= 4, "{files:?}");
+        for ino in files {
+            let ranges: Vec<_> = issued.iter().filter(|r| r.ino == ino).collect();
+            assert_eq!(ranges[0].from, 0);
+            for pair in ranges.windows(2) {
+                assert_eq!(pair[0].to, pair[1].from, "{ranges:?}");
+            }
+            let last = ranges.last().unwrap();
+            if ino == active {
+                assert!(last.position.is_some());
+            } else {
+                // Written to the end of its seal, past the last boundary below it.
+                assert!(last.position.is_none(), "{ranges:?}");
+                assert!(last.to % crate::writeback::FOLIO != 0, "{last:?}");
+            }
+        }
+    }
+
     /// An early write-back helper that stopped on its own (here as for an unsupported call) is handed nothing more:
     /// after many rolls, with retention deleting the segments rolled past, no rolled segment waits for it and it holds
     /// no segment file, so no descriptor or deleted segment's space is kept (Linux; ADR 0038 → Early write-back).

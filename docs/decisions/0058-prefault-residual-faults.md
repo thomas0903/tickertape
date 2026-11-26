@@ -1,6 +1,7 @@
 # 0058: The page faults the writer still takes with prefaulting on, and what to change for them
 
-- **Status:** proposed
+- **Status:** accepted for change 1 (2026-11-27, by the orchestrator on the owner's delegation; gate 1 narrowly missed
+  and accepted, see below); change 2 (ranged sync) proposed
 - **Date:** 2026-11-26
 - **Relates to:** issue #60; ADRs [0020](0020-background-prefault.md), [0025](0025-linux-prefault-small-window.md),
   [0038](0038-background-checkpoints.md) (early write-back), [0049](0049-linux-spare-segment-option.md); measured in
@@ -216,6 +217,9 @@ commit is per range would not be, and neither of the two read here is.
 
 ## Decision
 
+(As proposed on 2026-11-26. Option 4 was built, measured and made the default on 2026-11-27 with its first gate narrowly
+missed: "As built: change 1" and "Decision for change 1" below.)
+
 Proposed: options 4 and 5, each as a change of its own in a pull request of its own, built from the branch below and on
 by default only after the measurements below. Option 4 is to be built and measured next; option 5 stays proposed until a
 drive with a real volatile write cache has been tested. Neither touches the format, the API or the guarantees. They are
@@ -281,3 +285,115 @@ steady-90).
 - If option 4 or 5 is adopted, `docs/operations.md` (writer threads, early write-back) and, for 5, the crash contract
   change as described; the README's sentence on prefaulting at 1,024 bytes is out of date either way
   (`docs/benchmarks.md` has the proposed replacement).
+
+## As built: change 1 (2026-11-26; the default from 2026-11-27)
+
+**What is in `main`.** `crates/tickertape/src/writeback.rs`: with the private constant `STOP_AT_FOLIO_BOUNDARY`, the end
+of the range the early write-back helper starts in the active segment is `limit(position, page, true)`, the start of the
+128 KiB-aligned block (`FOLIO`; the page, if a page were larger) that holds the position the writer last handed it,
+instead of the start of the page that holds it (`limit(position, page, false)`, as in 1.0). Everything below that
+boundary is written back as before, in steps of at most 1 MiB, every 1 MiB the writer moves; the block the writer is in,
+and so a new segment's first block (its header included) while the writer is in it, is left alone. The constant's
+comment says why 128 KiB and what a wrong guess costs (option 4 above: smaller folios make the helper only lag, larger
+ones make it behave as before). **The constant is `true`** from 1.1 (the decision below), and `false` restores 1.0's
+early write-back: the revert is one line, and the tests run both settings. There is no public option. Nothing else
+moved: not the append path (`WriteBack::advanced`, the hook the writer calls after each append, is unchanged code
+outside tests apart from dropping the lock guard explicitly before `notify_one`; 384.0 instructions per append in both
+builds by ADR 0047's method, which runs with helper threads off and so does not run the hook), not the prefault helper,
+not the checkpoint, not macOS (no early write-back there). The experiment's switches (`--cfg tickertape_pf_exp`) are not
+in `main`.
+
+**The tail.** When the writer rolls, the helper writes the old segment back from where it stopped to the end of its seal
+(`WriteBack::switch`, unchanged): the part below the last boundary and the last partial block, so the helper still
+writes a sealed segment back whole. The active segment's block that holds the position is left to the next checkpoint,
+which syncs it with everything else it covers. `Writer::close` runs no checkpoint of its own (nor does dropping the
+writer): it waits for the background checkpoints already requested, then joins the helper, then collects. So at close
+or drop nothing more is synced: records after the last checkpoint were never promised, and the kernel's flusher writes
+the writer's last block, and any rolled segment's tail the helper had not reached (it checks `stop` before its list of
+rolled segments, so pending tails are abandoned), later. Up to 1.0 the same held for the last partial page.
+
+**Crash contract.** Unchanged, with the constant on or off. Early write-back makes nothing durable and nothing depends
+on how far it has written: no status field or metric reports written-back bytes, no roll or close waits for it,
+and a checkpoint does not ask it what it wrote. Step 1 of every checkpoint (`checkpoint.rs` → `steps`: the ranged
+`msync(MS_SYNC)` of `[from, to)` of each segment it still holds, then `fdatasync` of the whole file) writes back and
+waits for every dirty page of each segment it covers, whether early write-back started that page's write-back, finished
+it, or never reached it. With the constant on, a checkpoint may find up to 128 KiB more dirty data in the active segment
+(before, less than a page): the "to durable" figures below. The places this rests on: `checkpoint.rs` → `steps`, step
+1 (`flush.sync_range(seg.from, …)`, then `mmap::sync_data(&file)` for every segment of the job); the roll's hand-over
+is `WriteBack::switch` (the old segment to the end of its seal; nothing waits for it); close and drop only join the
+helper (`Writer::close`, `writer.rs`), after the background checkpoints already requested, and sync nothing more, which
+promises nothing about records after the last checkpoint. `docs/crash-contract.md` says so in one sentence; its steps
+and guarantees are unchanged.
+
+**Tests.** `writeback::tests::the_limit_is_the_page_or_the_folio_boundary_below_the_position` (both settings: the limit
+at, just below and just above a boundary, in a segment's first block, at a segment's end, with 4, 16, 64 and 256 KiB
+pages); `writeback::tests::by_default_the_helper_stops_at_the_folio_boundary` (pins the default: fails if it goes back
+to the page limit), `with_the_folio_boundary_the_helper_leaves_the_writers_block_until_it_has_left_it` and
+`with_the_page_limit_the_helper_writes_back_to_the_writers_page` (Linux: a test-only record of every range exactly as
+the helper hands it to `sync_file_range`, with the position it knew; with the boundary no range reaches into the
+writer's block; in both settings the ranges are contiguous from the segment's first byte and after a roll the old
+segment is written back from where the helper stopped to the end of its seal);
+`writer::tests::early_writeback_stops_at_the_folio_boundary_and_finishes_rolled_segments` (Linux: the same through a
+`Writer` with its default, over several rolls). A test-only thread-local sets the setting for the helper a test starts.
+The folio-boundary tests fail with the page limit, and the roll tests fail if a rolled segment's tail stops at its last
+folio boundary. No timing tests.
+
+**Measured** (`docs/benchmarks.md` → "2026-11-26, early write-back to the folio boundary"): 10-minute session cells,
+two runs per build interleaved, on `c4a-standard-8-lssd` (aarch64: steady-90 at 1,024 B on ext4 and xfs, steady-50 at
+64 B on ext4) and `c4-standard-16-lssd` (x86-64: steady-50 at 1,024 B on ext4), kernel 7.0, where the page cache gave
+the segments 128 KiB folios on ext4 and xfs (tracepoint `mm_filemap_add_to_page_cache`); 60-second unpaced runs at
+1,024 B on both; the comparison's W2 cells on x86-64 (`tt-latency`, three rounds); and steady-50 at both payloads on
+`c4-standard-4-lssd` with kernel 6.8 (Ubuntu 22.04), where ext4's folios were all single pages (ext4 has large folios
+for regular files from 6.16).
+
+| Gate | Met? | Figures (base → change, ranges over two runs) |
+|---|---|---|
+| 1. No cell worse than the base beyond the noise floor (the base's two runs) in append p99.9, reader p99.9, time to durable or throughput | **No** | aarch64 64 B: background checkpoint to durable p50 912–914 → 946–952 µs, zero-copy reader p99.9 312–316 → 325–335 µs; x86-64 1,024 B: background checkpoint to durable p99 4.08–4.87 → 5.06–5.98 ms (p50 1.63–2.93 → 1.83–2.67 ms); x86-64 unpaced: 492,855–492,976 → 492,358–492,936 records/s; W2 at 64 B (x86-64, three runs each, 11 s and 31 s): two change runs of three above every base run in each cell (zero-copy p99.9 at 10,000/s base 1.81–2.59, change 1.47, 3.64, 4.51 µs; at 100,000/s base 2.80–4.13, change 2.85, 6.17, 6.37 µs); in 10 strictly alternating pairs per cell on both architectures afterwards (both readers, the merged tree), noise: change / base median 0.65–1.01 for the p99.9, the change lower in most pairs, and the p99.99 at 100,000/s a third of the base's in every pair (`docs/benchmarks.md`, "Paired W2 runs at 64 B"). Every other figure better or within the base's range |
+| 2. The 60-second runs' gain in 10-minute cells | Yes | writer p99.9 (kernel 7.0): aarch64 steady-90 4.01–4.03 → 2.41–2.44 µs (ext4), 3.46–3.60 → 2.36–2.40 (xfs), 64 B 1.99–2.01 → 1.84–1.90; x86-64 6.25–6.36 → 5.75–5.82. Device / appended: 1.084 → 1.002–1.003, 1.059 → 1.005, 1.061–1.065 → 1.004. aarch64 steady-90, seconds with an append ≥ 50 ms (of 611): 138–151 → 0 (ext4), 2–4 → 0 (xfs); to durable p50 352–406 ms → 0.93–1.12 ms |
+| 3. No harm without large folios | Yes, for the gate figures | kernel 6.8, 1,024 B, strictly alternating (a second VM): append p99.9 6.94–9.80 → 8.10–8.46 µs, zero-copy p99.9 1.38–1.73 → 1.45–1.52 ms, safe 0.66–1.39 → 0.68–0.82 ms, background checkpoint to durable p50 1.29–1.36 → 1.31–1.33 ms, all within; 64 B within or better. Not a gate figure, but higher: the roll appends' median, 148–151 → 158–366 µs (VM 1) and 152–180 → 173–271 µs (VM 2) |
+
+The costs that failed gate 1 are the ones this ADR expected and one it did not: a checkpoint has up to 128 KiB more to
+write (32–39 µs more to durable at 64 B on aarch64; 33.8 and 37.9 µs paired by round), and at a roll the helper writes
+the old segment's last block, up to 128 KiB it used to write a step earlier, while the writer starts the new segment.
+The roll appends' median rose at 64 B on aarch64 (254–256 → 260–264 µs), by about 40 % at steady-90 on ext4 (188 →
+260–266 µs, with the maxima down from 61–111 ms to 0.6–1.0 ms), and on kernel 6.8 (148–151 → 158–366 µs and 152–180 →
+173–271 µs), and the zero-copy reader's p99.9 at 64 B, about one roll's wait, moved with it. The rise on 6.8 fits that
+explanation: with single-page folios the old code left at most a page to the roll's tail and the new one up to 124 KiB
+more. Not traced. The writer thread's major faults also rose at steady-90 on ext4 (477–496 → 573–638 per run) and at
+64 B (55–68 → 111–136), not on xfs (446–454 → 342–452); not traced either. Not measured: steady-50 at 1,024 B and
+steady-90 at 64 B on aarch64, steady-90 and 64 B on x86-64 with kernel 7.0, xfs on x86-64 and on 6.8, folios larger
+than 128 KiB, 16 KiB or 64 KiB pages, other file systems, bare metal, blocking checkpoints, checkpoint intervals other
+than 1 s, segment sizes other than 128 MiB, a `read_ahead_kb` other than the default (it was not recorded in the
+10-minute runs).
+
+## Decision for change 1 (2026-11-27)
+
+By the orchestrator, on the owner's delegation; the reasoning is the orchestrator's. **Change 1 is the default on Linux
+from 1.1** (`STOP_AT_FOLIO_BOUNDARY = true`), with gate 1 not met:
+
+- **Gate 1** as written ("no cell worse than the base's own spread") was **not met**: aarch64 64 B steady-50, background
+  checkpoint to durable p50 912–914 → 946–952 µs and zero-copy reader p99.9 312–316 → 325–335 µs; x86-64 1,024 B,
+  background checkpoint to-durable p99 4.1–4.9 → 5.1–6.0 ms (p50 within range); roll appends' median 254–256 →
+  260–264 µs at 64 B (not traced); x86-64 unpaced −0.1 % at the low end; in the W2 cells at 64 B on x86-64, two change
+  runs of three above every base run in each cell (three short runs each: at 10,000/s base 1.81–2.59 µs, change
+  1.47, 3.64, 4.51; at 100,000/s base 2.80–4.13, change 2.85, 6.17, 6.37), which 10 strictly alternating pairs per cell
+  on both architectures, both readers, then showed to be noise (the change lower in most pairs; its p99.99 at
+  100,000/s a third of the base's). Two runs per build per cell in the session cells,
+  so the spread these are judged against is narrow.
+- **Gates 2 and 3** were met: device bytes per appended byte 1.06–1.08 → 1.002–1.005; aarch64 steady-90, seconds with an
+  append of 50 ms or more 138–151 → 0 on ext4 and 2–4 → 0 on xfs in 10-minute runs; background checkpoints durable after
+  0.35–0.41 s → about 1 ms there; the writer's p99.9 lower in every paced cell on kernel 7.0; no gate figure differed
+  on kernel 6.8 (the roll appends' median there was higher: 148–151 → 158–366 µs and 152–180 → 173–271 µs).
+- **Why the miss is accepted.** The costs are a few per cent on a checkpoint's durable time and one reader cell, bounded
+  by construction (a checkpoint has at most 128 KiB more to write), while what the change removes is the worst behaviour
+  the library has on these machines (stalls of 50–140 ms in a quarter of the seconds at 90 % load on aarch64) and 6–8 %
+  of all device writes; and the writer's append tail, which this library ranks first, improved in every paced cell (on
+  kernel 7.0). The gate was written as "nothing gets worse" before the size of either side was known; a strict reading
+  would keep a large, repeatable defect to avoid a small, bounded cost. Reverting is one constant.
+- **Still open.** Not measured: steady-50 at 1,024 B and steady-90 at 64 B on aarch64; steady-90 and 64 B on x86-64 with
+  kernel 7.0; xfs on x86-64 and on 6.8; folios larger than 128 KiB; 16 KiB and 64 KiB pages; bare metal; why rolls got
+  slower; blocking checkpoints; checkpoint intervals other than 1 s; segment sizes other than 128 MiB; a `read_ahead_kb`
+  other than the default (not recorded in the 10-minute runs); n = 2 per build and cell. The owner can turn the default
+  back with one line (`STOP_AT_FOLIO_BOUNDARY = false`, and the test that pins it) if a workload shows otherwise.
+- Change 2 (the ranged sync of the active segment) stays proposed until a drive with a real volatile write cache has
+  been tested, as listed above.

@@ -59,9 +59,10 @@ has finished the requested checkpoints and before the lock is released.
 Every segment the writer has linked before a checkpoint's request is one of the dirty segments of step 1, whose
 `fdatasync`/`fsync` makes its header durable: a roll itself does not sync the new segment (ADR 0038 → Rolls without a
 sync; C8 has what recovery does when a crash kept such a header from the disk). On Linux the writer may also start
-write-back early (`WriterConfig::early_writeback`, `sync_file_range(SYNC_FILE_RANGE_WRITE)` behind the write
-position). That makes nothing durable and changes none of the steps above; an I/O error from it poisons the writer as
-a failed step 1 would, and is returned once, by the next checkpoint (which writes no marker) or the next
+write-back early (`WriterConfig::early_writeback`, `sync_file_range(SYNC_FILE_RANGE_WRITE)` behind the write position,
+up to the 128 KiB boundary below it from 1.1). That makes nothing durable and changes none of the steps above: step 1
+writes back and waits for every dirty page whether early write-back reached it or not; an I/O error from it poisons the
+writer as a failed step 1 would, and is returned once, by the next checkpoint (which writes no marker) or the next
 `request_checkpoint`, `checkpoint_progress` or `close`, also when no checkpoint is pending.
 
 **Segments the writer no longer holds.** Between checkpoints each dirty list (the writer's own, and that of each
