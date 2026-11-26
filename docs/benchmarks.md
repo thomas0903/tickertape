@@ -7,8 +7,11 @@ specific machines on specific days. What each benchmark measures, and what it do
 [`compare/README.md`](../compare/README.md). The methodology is in ADRs [0009](decisions/0009-benchmark-methodology.md)
 and [0018](decisions/0018-competitive-benchmarks.md).
 
-**Linux results come first** because that is where tickertape is meant to run, and **bare metal comes first** among
-them. The cloud-VM and macOS results are secondary.
+**Linux results come first** because that is where tickertape is meant to run. The
+[comparison rerun at v1.0.0](#2026-11-25-to-2026-11-26-comparison-rerun-at-v100-google-cloud-vms-linux-x86-64-and-aarch64)
+comes first of all: it is the current comparison with other tools, run with the corrected harness on two Google Cloud
+VMs, and it supersedes the earlier comparison sections, which stay as recorded. Among the older Linux results bare
+metal comes first; the cloud-VM and macOS results are secondary.
 
 The sustained-workload, checkpoint, comparison, reader and scale results and the long verified runs of 2026-11-19 to
 2026-11-22 ran on Google Cloud VMs
@@ -40,7 +43,8 @@ The macOS results of 2026-11-26 (the sustained session on a shared Apple M4 Pro 
 spare segment, and what prefaulted data adds to a checkpoint) are
 [after the Linux sections](#2026-11-26-sustained-load-roll-waits-and-checkpoint-cost-on-macos-apple-m4-pro-apfs).
 
-**How Chronicle Queue and tickertape were configured in the comparisons below.** Open-source Chronicle Queue (2026.8,
+**How Chronicle Queue and tickertape were configured in the comparisons before the rerun** (the rerun's
+configuration is in its own section). Open-source Chronicle Queue (2026.8,
 the version `compare/chronicle/pom.xml` pins) ran with its default queue options, except `SyncMode.SYNC` in the
 sustained SD runs (`compare/chronicle/src/main/java/compare/Main.java`):
 - no page pre-touching: the pretoucher has been Enterprise-only since Chronicle Queue 5.24 (upstream commit
@@ -60,8 +64,983 @@ on Linux in v0.3.0, ADR 0023), and early write-back in tickertape's rows of the 
 
 In W1, tickertape's `Writer::open` preallocates the first segment before the timer starts. That segment is 128 MiB and
 holds the whole run (about 104 MB of records at 64 B and 106 MB at 1,024 B). Chronicle Queue creates its first cycle
-file at the first append, inside the timed part. The harness is to be corrected (issue #56) and the comparison rerun
-(issue #57).
+file at the first append, inside the timed part. The harness was corrected (issue #56: W1-cold and W1-steady, the JVM
+warm-up, `microTouch()`, the 1 GiB `blockSize`, Aeron's low-latency settings, pinning) and the comparison rerun at
+v1.0.0 (issue #57, the first section below).
+
+## 2026-11-25 to 2026-11-26, comparison rerun at v1.0.0 (Google Cloud VMs, Linux x86-64 and aarch64)
+
+The whole comparison with Chronicle Queue, Aeron IPC, yaque, queue-file and a plain file, run again with the corrected
+harness (issue #57; the plan is `docs/playbooks/rerun-comparison.md`, the driver `benches/rerun.py`). A reader of the
+earlier comparison who knows Chronicle Queue pointed out that it handicapped Chronicle: a short JIT warm-up, no page
+pre-touching, the default 64 MiB `blockSize`, no thread pinning, and tools measured in different sessions on different
+machines. The harness now warms up the JVM tools through their measured loops, calls Chronicle's `microTouch()`, uses a
+1 GiB `blockSize`, configures Aeron as its low-latency driver does, and pins every measured thread
+([`compare/README.md`](../compare/README.md) → "Thread pinning" and "JVM warm-up, tool settings and JVM logs"). Every
+tool ran in one session per machine, on one x86-64 and one aarch64 machine, for 24 hours. **Google Cloud virtual
+machines, not bare metal.** The library is the one released as **v1.0.0**, not `main`. The rule of the plan applies:
+every cell is published whatever its result, the failed one as failed.
+
+**This section supersedes the earlier comparison sections** (v0.4.0 and v0.3.0 on bare metal, the sustained comparison
+of 2026-11-19 to 2026-11-22, v0.3.0 on AWS and macOS), which used the old harness and settings. They stay below as they
+were recorded, each with a note. The macOS comparison of 2026-11-26 (low identical rates) is not repeated here.
+
+**In short.** The result is mixed. tickertape led the 64 B append bursts on both machines and file systems (W1-cold
+19.11–30.84 against Chronicle Queue's 8.47–8.53 million records/s on x86-64). Chronicle Queue led warm replay in three
+of the four pinned ext4 cells (overlapping in the fourth), had the lower W2 reader p99.9 at 10,000 records/s (in three
+cells, and in three of four runs in the fourth) and at 1,024 B × 100,000 records/s, and appended 1,024 B records as fast
+as tickertape on x86-64 ext4 and faster on xfs in W1 steady; Aeron IPC had the lowest observed p99.9 at 100,000
+records/s; at 1,024 B × 100,000 records/s the plain file was lower than tickertape too. In the ten-minute runs at half
+of each tool's own rate on ext4, tickertape's reader p99.9 (323–697 µs) was below Chronicle Queue's (89.98–102.69 ms)
+and the plain file's at 1,024 B (87.43–96.93 ms), a tail that both tools without early write-back showed on ext4; on xfs
+Chronicle's was lower than tickertape's in three of four cells. A tickertape checkpoint (median 1.38–2.99 ms) and
+Chronicle's synchronous store flush (302.78–516.16 ms) are not the same work (below). At 90 % of its own rate with a
+checkpoint every second tickertape stalled at 64 B on both machines and at 1,024 B on aarch64; Chronicle's 64 B run
+there failed. The fairness fixes mattered: under the old settings Chronicle Queue's reader p99.9 at 1,024 B × 10,000
+records/s was 34.8–36.8 µs, with `microTouch()` alone 2.35–2.51 µs.
+
+### Environment and commands
+
+| | x86-64 | aarch64 |
+|---|---|---|
+| Machine (us-central1-b) | `c4-standard-16-lssd`: Intel Xeon 6985P-C, 8 cores with 2 threads each, 59 GiB | `c4a-standard-8-lssd`: Google Axion (Neoverse-V2), 8 cores, 31 GiB |
+| Storage | two local NVMe SSDs of 375 GB: ext4 on `/data` (`rw,noatime`), xfs on `/data2` (`rw,noatime,inode64,logbufs=8,logbsize=32k,noquota`); I/O scheduler `none`; results on the boot disk | the same |
+| Session (UTC) | 2026-11-25 14:52 to 2026-11-26 14:41 | 2026-11-25 14:52 to 2026-11-26 14:43 |
+
+Ubuntu 24.04, kernel `7.0.0-1017-gcp`, rustc 1.100.0, OpenJDK 21.0.13.1, Python 3.12.3, Maven 3.8.7. Chronicle Queue
+2026.8 (open source), Aeron 1.54.0, yaque 0.6.6, queue-file 2.0.0 (`compare/` pins). Each local SSD writes at most 351
+MB/s by itself ([how much of the limit is the
+disk](#2026-11-26-how-much-of-the-limit-is-the-disk-fio-tmpfs-and-one-change-at-a-time-google-cloud-vms)).
+
+**Commit.** `fb2d91b0` on the branch `rerun/v1.0.0-session`: `1e9846d` (the harness of #65 and #67) plus the driver of
+#71. `crates/tickertape` is identical to the tag `v1.0.0` (the driver refuses to start otherwise). `main` has changed
+the library since (durable-only readers wake on checkpoints, the safe reader's read size at the tail, the layout of
+`Reader`, and others); none of that is in these figures, and the later sections that measure those changes are not
+compared with this one.
+
+**Kernel command line, both boots** (`/proc/cmdline`):
+
+```text
+# untuned boot, both machines (the PARTUUID differs)
+BOOT_IMAGE=/vmlinuz-7.0.0-1017-gcp root=PARTUUID=… ro console=ttyS0,115200 panic=-1
+# tuned boot, both machines
+BOOT_IMAGE=/vmlinuz-7.0.0-1017-gcp root=PARTUUID=… ro isolcpus=managed_irq,domain,1,2 nohz_full=1,2 rcu_nocbs=1,2 irqaffinity=0,3,4,5,6,7 nosmt console=ttyS0,115200 panic=-1
+```
+
+On the tuned boot the kernel reported `isolated` 1-2, `nohz_full` 1-2 and CPUs 0-7 online on both machines;
+`smt/control` was `off` on x86-64 (the sibling threads 8-15 offline) and `notsupported` on aarch64, which has one thread
+per core anyway.
+
+**CPUs.** Untuned boot, automatic choice: writer CPU 1, reader CPU 2, helpers `0,3-8,11-15` on x86-64 (CPUs 9 and 10,
+the siblings of 1 and 2, unused) and `0,3-7` on aarch64. Tuned boot: writer 1, reader 2, helpers `0,3,4,5,6,7`, named.
+
+**Commands** (`benches/rerun.py`, one unit per tool and configuration, each in its own directory; OUT is the unit's
+directory, TMPDIR the file system under test):
+
+```sh
+# short mode, two repeats per unit
+rerun.py --short-tools <tool> -- OUT                                    # pinned
+rerun.py --short-tools <tool> -- OUT --no-pin                           # unpinned
+rerun.py --short-tools <tool> -- OUT --no-long-warmup --no-micro-touch --chronicle-block-size default \
+  --aeron-sparse-terms --no-aeron-pre-touch --no-jvm-logs               # jvm-old
+rerun.py --short-tools chronicle -- OUT --no-long-warmup --chronicle-block-size default \
+  --aeron-sparse-terms --no-aeron-pre-touch --no-jvm-logs               # microtouch-only
+rerun.py --short-tools <tool> -- OUT --writer-cpu 1 --reader-cpu 2 --helper-cpus 0,3,4,5,6,7   # tuned
+# sustained mode, ten-minute runs after a 10 s warm-up, one repeat per unit
+compare/run.py OUT --sustained --keep-going --tools <tool> --workloads probe,SV,SD --rate-fractions 0.5 --repeats 1
+compare/run.py OUT --sustained --keep-going --tools <tool> --workloads probe,SD --rate-fractions 0.9 --repeats 1   # 90 %
+compare/run.py OUT --sustained --keep-going --tools <tool> --workloads probe,SV --rate-fractions 0.5 --repeats 1   # yaque, queue-file, plain file
+# jvm-old and tuned add the same options as in the short mode
+```
+
+The raw output (every result line, `rerun.json`, both boots' environment files, `/proc/interrupts` captures, the JVM
+logs, `children.log`, the driver's log) is kept outside the repository. The tables below were computed from the result
+files of the units that `rerun.json` marks done, and from the completed runs of the two failed units; values are rounded
+half up to three significant digits (two decimals for million records/s).
+
+### What each row means
+
+| Row | What ran |
+|---|---|
+| `pinned` | The default configuration of the corrected harness: each measured thread alone on its CPU, everything else on the helper CPUs; the JVM tools with the long warm-up (3 × 1,200,000 and 8 × 20,000 records through the measured loops, in every process), Chronicle with a 1 GiB `blockSize` and `microTouch()` in the writer's busy-wait, Aeron with non-sparse, pre-touched term buffers and dedicated busy-spinning driver threads; every reader busy-polls; the JVMs with a 256 MiB heap and ParallelGC and asynchronous JVM logging on |
+| `unpinned` | The same with `--no-pin`: the kernel schedules every thread, CPU 0 included (which also runs the result pulls, at nice 19) |
+| `tuned` | `pinned` on the tuned boot above, with the CPUs named. **The tuned CPUs were isolated but not interrupt-free** ([below](#interrupts-on-the-tuned-cpus)) |
+| `jvm-old` | "Old settings, new harness": pinned, the new measured loops, but the old short warm-up (W1 and W3: 100,000 records; W2 and sustained: none), Chronicle's 64 MiB `blockSize`, no `microTouch()`, Aeron's sparse terms without pre-touch, no JVM logs. It is not the old harness: [`compare/README.md`](../compare/README.md) → "The old settings are not the old code" |
+| `microtouch-only` | "Old settings plus `microTouch()`", Chronicle Queue only: as `jvm-old` but with `microTouch()`. It is not `microTouch()` on top of the new settings |
+
+tickertape ran with v1.0.0's defaults (`WriterConfig::default()` with the helper CPUs: prefaulting 256 KiB ahead and
+early write-back on Linux, where a helper thread starts the kernel's write-back of the pages behind the writer with
+`sync_file_range(SYNC_FILE_RANGE_WRITE)` each time the writer has moved 1 MiB); in the sustained SD runs it calls the
+blocking `Writer::checkpoint` on the writer's thread, as the other tools' sync calls block. Its W2 rows run
+`tt-latency`; W3 and W2 have a row for each reader, the zero-copy `Reader::open_mapped` and the safe `Reader::open`; the
+sustained rows use the zero-copy reader.
+
+**What a sync is differs per tool** ([`compare/README.md`](../compare/README.md) → "Supported cases and unequal
+guarantees"). A tickertape checkpoint on Linux `msync`s the mapped ranges it still holds, `fdatasync`s the segment files
+and `fsync`s new directory entries, then writes the checkpoint marker and `fdatasync`s it; it publishes a durable
+position readers can use. Chronicle Queue's is `ExcerptAppender.sync` with `SyncMode.SYNC`, a synchronous
+`msync(MS_SYNC)` of its store (which index files it covers is Chronicle's choice); called "synchronous store flush"
+below. queue-file's is `sync_all` and the plain file's `sync_data`; Aeron IPC and yaque have none (no SD rows). None of
+them is tested for power loss here. The tools also promise different things: Aeron IPC writes no durable journal and
+this adapter has no Archive replay, but its term buffers are memory-mapped files in the data directory on the file
+system under test (not `/dev/shm`), so the kernel writes them back to that disk; yaque is a consuming single-reader
+queue (its W3 is a scan of the unconsumed queue); queue-file's upstream API forbids concurrent process access (no W2,
+writer-only sustained rows); and the plain-file adapter has no checksum or crash-recovery protocol.
+
+### The plan, the order and the gaps between rounds
+
+The short mode (W1-cold, W1-steady, W2 at 10,000 and 100,000 records/s, W3; 64 B and 1,024 B) ran every tool in
+`pinned`, `unpinned` and `tuned`, Chronicle Queue and Aeron in `jvm-old` and Chronicle in `microtouch-only`, on ext4,
+and every tool `pinned` on xfs. The sustained mode (ten-minute runs: the unpaced probe, SV paced at 50 % of the same
+unit's probe without syncs, SD the same with a sync every second) ran tickertape, Chronicle Queue and Aeron `pinned` on
+ext4 in two rounds, then: SD at 90 % of the probe (tickertape and Chronicle, ext4 and xfs), `jvm-old` (Chronicle and
+Aeron), tickertape and Chronicle `pinned` on xfs, yaque, queue-file and the plain file (probe and SV), and the `tuned`
+boot (tickertape, Chronicle, Aeron).
+
+**Samples.** Short mode: two repeats per unit, minutes apart. `pinned`, `jvm-old` and `microtouch-only` ran in two
+rounds on ext4 (n = 4); `unpinned`, `tuned` and the xfs rows in one (n = 2). Sustained mode: one run per cell and round
+(n = 1); the two rounds of `sustained` are separate rows, because each round is paced from its own probe. Ranges are
+min–max of the samples.
+
+**Different loads.** SV and SD run at 50 % (or 90 %) of each tool's own probe in that configuration and round, so they
+are **different absolute rates for different tools** (the target rate is beside every row). Only the probes answer the
+same question for every tool (how fast unpaced, with a reader following); SV and SD answer how each tool behaves at half
+(or 90 %) of its own rate.
+
+**Order.** Within a round, unit after unit. Round 1 of the short part went tool by tool (tickertape, Chronicle Queue,
+Aeron, yaque, queue-file, plain file); round 2 rotated the tools and reversed the configurations within a tool; the
+sustained rounds went tickertape, Chronicle, Aeron and then Chronicle, Aeron, tickertape. Every other part had one round
+in a fixed tool order: tickertape first, except `sustained-jvm-old` (Chronicle, then Aeron) and `sustained-others`
+(yaque first). On xfs tickertape's first large writes went to a freshly made file system, and Chronicle's to one already
+written.
+
+| Part (x86-64, UTC; aarch64 within 3 minutes) | From | To |
+|---|---|---|
+| short, ext4 (both rounds) | 11-25 14:52 | 19:11 |
+| sustained, ext4 (both rounds) | 19:11 | 11-26 00:40 |
+| sustained at 90 %, ext4 | 00:40 | 02:17 |
+| sustained `jvm-old`, ext4 | 02:17 | 03:58 |
+| short, xfs | 03:58 | 05:08 |
+| sustained, xfs (`sustained-journals`) | 05:08 | 07:12 |
+| sustained at 90 %, xfs | 07:12 | 08:49 |
+| sustained yaque, queue-file, plain file, ext4 | 08:49 | 10:47 |
+| (reboot into the tuned boot) | | |
+| tuned short, ext4 | 10:47 | 11:56 |
+| tuned sustained, ext4 | 11:56 | 14:41 |
+
+Gap between the two rounds of each short unit (end of round 1 to start of round 2), in minutes:
+
+| Unit | x86-64 | aarch64 |
+|---|---|---|
+| Aeron `jvm-old` | 33 | 34 |
+| plain file `pinned` | 43 | 43 |
+| queue-file `pinned` | 51 | 51 |
+| yaque `pinned` | 51 | 52 |
+| Aeron `pinned` | 68 | 68 |
+| Chronicle `microtouch-only` | 136 | 137 |
+| Chronicle `jvm-old` | 153 | 154 |
+| Chronicle `pinned` | 189 | 190 |
+| tickertape `pinned` | 190 | 192 |
+
+**Completion.** 54 of 56 units completed on each machine. The two failed units are the same on both machines and both
+file systems ([below](#the-failed-cell)). Nothing else failed, nothing failed once and then passed, no unit was set
+aside as incomplete, and no run was discarded for a wall-clock step (`retries.jsonl` empty everywhere).
+
+### Short mode: W1 and W3 (million records/s)
+
+W1 appends 1,000,000 records of 64 B or 100,000 of 1,024 B as fast as possible: W1-cold from an empty directory with the
+open inside the timer, W1-steady into files opened and primed with 1,000 records before it
+([`compare/README.md`](../compare/README.md) → "Workloads and schema"). For tickertape a W1 run takes 32–52 ms at 64 B
+on x86-64, so one stall is a visible share of it. Both timers stop before the final flush, so W1 is visible, not
+durable, append throughput. W3 writes the same records, warms the page cache with an untimed traversal, and times a
+fresh reader process from open to the last record. Higher is better.
+
+**W1-cold**
+
+| FS | Config | Tool | n | x86-64, 64 B | x86-64, 1,024 B | aarch64, 64 B | aarch64, 1,024 B |
+|---|---|---|---|---|---|---|---|
+| ext4 | pinned | tickertape | 4 | 19.11–30.84 | 2.61–3.08 | 10.46–10.56 | 4.02–4.20 |
+| ext4 | pinned | Chronicle Queue | 4 | 8.47–8.53 | 2.82–2.87 | 5.49–5.53 | 2.76–2.83 |
+| ext4 | pinned | yaque | 4 | 3.48–3.50 | 1.51–1.63 | 1.94–1.96 | 1.18–1.20 |
+| ext4 | pinned | queue-file | 4 | 0.94–0.95 | 0.34–0.35 | 0.58 | 0.28–0.29 |
+| ext4 | pinned | plain file | 4 | 3.66–3.71 | 1.65–1.67 | 2.09–2.13 | 1.24–1.27 |
+| ext4 | unpinned | tickertape | 2 | 19.58–21.99 | 2.87–2.89 | 10.19–10.32 | 3.75–3.82 |
+| ext4 | unpinned | Chronicle Queue | 2 | 8.51–8.66 | 2.84–2.89 | 5.47–5.50 | 2.78–2.85 |
+| ext4 | unpinned | yaque | 2 | 3.47–3.52 | 1.59–1.64 | 1.91–1.92 | 1.18 |
+| ext4 | unpinned | queue-file | 2 | 0.95 | 0.35 | 0.58 | 0.28 |
+| ext4 | unpinned | plain file | 2 | 3.66–3.69 | 1.68–1.69 | 2.07–2.10 | 1.26–1.27 |
+| ext4 | jvm-old | Chronicle Queue | 4 | 6.73–7.36 | 2.19–2.38 | 4.66–4.78 | 1.70–1.94 |
+| ext4 | microtouch-only | Chronicle Queue | 4 | 6.83–7.37 | 2.06–2.37 | 4.63–4.76 | 1.72–1.79 |
+| ext4 | tuned | tickertape | 2 | 17.53–29.38 | 2.58–2.64 | 10.51–10.62 | 4.14–4.15 |
+| ext4 | tuned | Chronicle Queue | 2 | 8.45–8.63 | 2.93–2.97 | 5.55–5.59 | 2.87–2.88 |
+| ext4 | tuned | yaque | 2 | 2.89–2.92 | 1.54–1.56 | 1.53 | 1.03–1.04 |
+| ext4 | tuned | queue-file | 2 | 0.61 | 0.16 | 0.45 | 0.25 |
+| ext4 | tuned | plain file | 2 | 3.03 | 1.59–1.60 | 1.63 | 1.09–1.10 |
+| xfs | pinned | tickertape | 2 | 19.30–29.61 | 2.61–2.73 | 10.47–10.51 | 3.90–3.91 |
+| xfs | pinned | Chronicle Queue | 2 | 8.76–8.79 | 3.48–3.53 | 5.73–5.75 | 3.70–3.72 |
+| xfs | pinned | yaque | 2 | 2.65–2.66 | 1.56–1.57 | 1.53–1.55 | 1.11 |
+| xfs | pinned | queue-file | 2 | 0.81 | 0.34 | 0.50 | 0.27 |
+| xfs | pinned | plain file | 2 | 2.78–2.80 | 1.57–1.65 | 1.61–1.63 | 1.15–1.16 |
+
+**W1-steady**
+
+| FS | Config | Tool | n | x86-64, 64 B | x86-64, 1,024 B | aarch64, 64 B | aarch64, 1,024 B |
+|---|---|---|---|---|---|---|---|
+| ext4 | pinned | tickertape | 4 | 19.44–24.93 | 2.92–3.06 | 10.21–10.55 | 3.77–4.02 |
+| ext4 | pinned | Chronicle Queue | 4 | 8.54–8.69 | 2.93–3.04 | 5.57–5.60 | 2.97–3.07 |
+| ext4 | pinned | yaque | 4 | 3.50–3.52 | 1.62–1.66 | 1.94–1.99 | 1.18–1.19 |
+| ext4 | pinned | queue-file | 4 | 1.14–1.15 | 0.85 | 0.64–0.65 | 0.52 |
+| ext4 | pinned | plain file | 4 | 3.68–3.75 | 1.51–1.76 | 2.04–2.07 | 1.24–1.26 |
+| ext4 | unpinned | tickertape | 2 | 19.68–20.10 | 3.03–3.18 | 10.25–10.37 | 3.87 |
+| ext4 | unpinned | Chronicle Queue | 2 | 8.68–8.84 | 3.01–3.04 | 5.57–5.59 | 3.07–3.10 |
+| ext4 | unpinned | yaque | 2 | 3.50–3.52 | 1.62–1.65 | 1.94–1.97 | 1.17–1.18 |
+| ext4 | unpinned | queue-file | 2 | 1.14–1.15 | 0.85 | 0.65 | 0.53 |
+| ext4 | unpinned | plain file | 2 | 3.69–3.74 | 1.70–1.75 | 2.10 | 1.29 |
+| ext4 | jvm-old | Chronicle Queue | 4 | 7.10–7.49 | 2.28–2.32 | 4.79–4.85 | 1.86–2.04 |
+| ext4 | microtouch-only | Chronicle Queue | 4 | 7.26–7.38 | 2.20–2.34 | 4.66–4.81 | 1.92–2.14 |
+| ext4 | tuned | tickertape | 2 | 18.92–19.13 | 2.65–2.67 | 10.19–10.50 | 3.79–4.01 |
+| ext4 | tuned | Chronicle Queue | 2 | 8.73–8.80 | 3.12–3.14 | 5.64–5.69 | 3.08 |
+| ext4 | tuned | yaque | 2 | 2.90–2.94 | 1.55–1.59 | 1.53 | 1.04 |
+| ext4 | tuned | queue-file | 2 | 0.89 | 0.70–0.71 | 0.50 | 0.42 |
+| ext4 | tuned | plain file | 2 | 3.01–3.02 | 1.63–1.65 | 1.60 | 1.07–1.08 |
+| xfs | pinned | tickertape | 2 | 20.01–29.30 | 2.71–2.90 | 10.22–10.50 | 3.99–4.04 |
+| xfs | pinned | Chronicle Queue | 2 | 9.03–9.05 | 3.73–3.76 | 5.79–5.80 | 4.08–4.11 |
+| xfs | pinned | yaque | 2 | 2.66–2.67 | 1.58–1.59 | 1.53–1.54 | 1.10–1.11 |
+| xfs | pinned | queue-file | 2 | 0.93–0.94 | 0.74–0.75 | 0.55 | 0.47 |
+| xfs | pinned | plain file | 2 | 2.79–2.81 | 1.63–1.65 | 1.63 | 1.16 |
+
+**W3, warm replay**
+
+| FS | Config | Tool | Reader | n | x86-64, 64 B | x86-64, 1,024 B | aarch64, 64 B | aarch64, 1,024 B |
+|---|---|---|---|---|---|---|---|---|
+| ext4 | pinned | tickertape | zero-copy | 4 | 20.85–26.41 | 9.11–9.47 | 27.22–31.59 | 10.05–10.36 |
+| ext4 | pinned | tickertape | safe | 4 | 31.01–32.77 | 6.40–6.57 | 28.12–28.48 | 6.26–6.53 |
+| ext4 | pinned | Chronicle Queue |  | 4 | 35.57–36.77 | 10.28–10.59 | 28.17–29.30 | 15.31–17.12 |
+| ext4 | pinned | yaque |  | 4 | 28.89–29.61 | 7.38–7.44 | 20.22–22.04 | 3.94–4.41 |
+| ext4 | pinned | queue-file |  | 4 | 1.65–1.66 | 1.38–1.39 | 1.04 | 0.89–0.90 |
+| ext4 | pinned | plain file |  | 4 | 5.57–5.58 | 3.46–3.57 | 3.23–3.31 | 2.30–2.44 |
+| ext4 | unpinned | tickertape | zero-copy | 2 | 24.42–25.40 | 9.23–9.55 | 31.42–31.58 | 10.23–10.31 |
+| ext4 | unpinned | tickertape | safe | 2 | 25.26–32.16 | 6.31–6.49 | 28.63–28.69 | 6.67–6.77 |
+| ext4 | unpinned | Chronicle Queue |  | 2 | 32.86–34.78 | 9.57–10.67 | 27.65–28.29 | 16.08–16.59 |
+| ext4 | unpinned | yaque |  | 2 | 29.17–29.52 | 7.52–7.67 | 21.23–21.34 | 4.37–4.40 |
+| ext4 | unpinned | queue-file |  | 2 | 1.64–1.66 | 1.40 | 1.04–1.05 | 0.89 |
+| ext4 | unpinned | plain file |  | 2 | 5.57–5.59 | 3.64–3.67 | 3.24–3.25 | 2.36–2.43 |
+| ext4 | jvm-old | Chronicle Queue |  | 4 | 30.15–31.88 | 6.52–8.53 | 19.44–24.95 | 4.02–6.61 |
+| ext4 | microtouch-only | Chronicle Queue |  | 4 | 28.72–32.75 | 5.88–7.32 | 19.68–23.94 | 4.41–7.55 |
+| ext4 | tuned | tickertape | zero-copy | 2 | 27.75–28.13 | 10.06–10.74 | 30.96–31.62 | 10.01–10.13 |
+| ext4 | tuned | tickertape | safe | 2 | 33.53–33.58 | 6.65–6.67 | 27.86–28.50 | 6.35–6.45 |
+| ext4 | tuned | Chronicle Queue |  | 2 | 34.72–34.92 | 11.13–11.25 | 28.36–29.52 | 16.09–16.19 |
+| ext4 | tuned | yaque |  | 2 | 27.19–28.78 | 6.90–6.92 | 21.10–21.52 | 3.93–4.01 |
+| ext4 | tuned | queue-file |  | 2 | 1.12–1.13 | 1.03–1.05 | 0.78 | 0.70 |
+| ext4 | tuned | plain file |  | 2 | 3.80 | 2.65–2.97 | 2.42 | 1.91–1.93 |
+| xfs | pinned | tickertape | zero-copy | 2 | 23.18–23.96 | 8.83–8.84 | 30.93–31.62 | 9.74–9.85 |
+| xfs | pinned | tickertape | safe | 2 | 32.90–33.27 | 6.32–6.33 | 26.69–26.75 | 5.88–5.91 |
+| xfs | pinned | Chronicle Queue |  | 2 | 32.41–32.77 | 10.49–10.50 | 27.44–28.18 | 15.89–16.05 |
+| xfs | pinned | yaque |  | 2 | 27.06–29.25 | 7.43–7.56 | 20.58–21.43 | 4.26–4.41 |
+| xfs | pinned | queue-file |  | 2 | 1.55 | 1.34 | 0.93 | 0.82 |
+| xfs | pinned | plain file |  | 2 | 5.18–5.22 | 3.22–3.59 | 2.90–2.96 | 2.20–2.22 |
+
+- **Append:** tickertape ahead of every other tool at 64 B on both machines and both file systems, and at 1,024 B on
+  aarch64 ext4. At 1,024 B on x86-64 ext4 its ranges overlap Chronicle Queue's (W1-cold 2.61–3.08 against 2.82–2.87,
+  W1-steady 2.92–3.06 against 2.93–3.04); on x86-64 xfs Chronicle is ahead at 1,024 B (W1-cold 3.48–3.53 against
+  2.61–2.73, W1-steady 3.73–3.76 against 2.71–2.90; n = 2), and on aarch64 xfs in W1-steady (4.08–4.11 against
+  3.99–4.04; tickertape ahead in W1-cold, 3.90–3.91 against 3.70–3.72); on the tuned x86-64 boot Chronicle is ahead at
+  1,024 B in both (2.93–2.97 against 2.58–2.64, 3.12–3.14 against 2.65–2.67). yaque, queue-file and the plain file are
+  below both journals in every W1 cell.
+- **Replay:** on x86-64 Chronicle Queue is faster than both of tickertape's readers at both payloads on ext4
+  (35.57–36.77 against 20.85–26.41 zero-copy and 31.01–32.77 safe at 64 B; 10.28–10.59 against 9.11–9.47 and 6.40–6.57
+  at 1,024 B), and yaque's queue scan is faster than tickertape's zero-copy reader at 64 B (28.89–29.61) and than its
+  safe reader at 1,024 B (7.38–7.44). On aarch64 at 64 B the ranges of Chronicle and both readers overlap (28.17–29.30
+  against 27.22–31.59 and 28.12–28.48); at 1,024 B Chronicle is faster (15.31–17.12 against 10.05–10.36 and 6.26–6.53).
+  On xfs (n = 2) tickertape's safe reader is ahead of Chronicle at 64 B on x86-64 (32.90–33.27 against 32.41–32.77) and
+  its zero-copy reader at 64 B on aarch64 (30.93–31.62 against 27.44–28.18); Chronicle is ahead in the other cells.
+- **Spread.** tickertape's W1 at 64 B on x86-64 spread from 19.11 to 30.84 (W1-cold) and its zero-copy W3 from 20.85 to
+  26.41; the repeats inside a unit differ as much as the rounds (for example W1-cold round 1: 30.84 and 19.11). Every
+  `pinned` cell whose range is wider than 10 % is listed [below](#sample-spread).
+
+### Short mode: W2, latency from the scheduled send to the read (µs)
+
+One writer process and one reader process; record `i` is due at `t0 + i / rate`. A send is never skipped: when it starts
+late it still runs, and its delay counts in the latency. The reader busy-polls and records `now - due` after validating
+the record. 1,100,000 records per run: the first 100,000 are left out of the histogram, the next 1,000,000 measured (110
+s at 10,000 records/s, 11 s at 100,000). Late sends: sends that started more than 1 µs after their time (warm-up
+included). µs unless marked; min–max of the runs. Lower is better. queue-file has no W2 (no concurrent reader).
+
+**64 B at 10,000 records/s**
+
+| FS | Config | Tool | Reader | n | x86-64 p50 | p99 | p99.9 | max | late sends | aarch64 p50 | p99 | p99.9 | max | late sends |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| ext4 | pinned | tickertape | zero-copy | 4 | 0.31 | 0.48–0.49 | 2.17–2.35 | 86.3–265 | 98–354 | 0.30–0.31 | 0.42 | 2.87–3.46 | 118–133 | 5–164 |
+| ext4 | pinned | tickertape | safe | 4 | 1.94–1.96 | 2.32–2.36 | 4.30–4.49 | 191–278 | 100–182 | 2.41–2.42 | 2.80–4.26 | 6.00–6.45 | 111–155 | 6–44,480 |
+| ext4 | pinned | Chronicle Queue |  | 4 | 0.52–0.55 | 0.68–0.69 | 1.68–1.83 | 83.1 µs to 1.01 ms | 200–251 | 0.49–0.51 | 0.62–0.65 | 0.73–0.78 | 25.3–67.6 | 22–36 |
+| ext4 | pinned | Aeron IPC |  | 4 | 0.26–0.27 | 2.11–2.17 | 2.56–5.65 | 114 µs to 71.30 ms | 218–1,003 | 0.39–0.43 | 4.11–4.65 | 5.56–7.34 | 36.8–152 | 12–41,142 |
+| ext4 | pinned | yaque |  | 4 | 0.94–0.96 | 3.14–3.25 | 6.21–6.34 | 10.47–15.29 ms | 363–473 | 1.51–1.55 | 3.47–3.66 | 9.08–9.50 | 2.57–14.31 ms | 228–10,118 |
+| ext4 | pinned | plain file |  | 4 | 0.85–0.86 | 2.72–3.13 | 5.62–6.08 | 13.90–15.96 ms | 565–782 | 1.29–1.37 | 3.42–4.02 | 9.04–9.41 | 13.74–15.33 ms | 267–45,282 |
+| ext4 | unpinned | tickertape | zero-copy | 2 | 0.32 | 0.49–0.50 | 2.16–2.19 | 102 | 118–132 | 0.30–0.31 | 0.40–0.42 | 3.07–3.49 | 100–106 | 11–504 |
+| ext4 | unpinned | tickertape | safe | 2 | 1.95 | 2.38–2.39 | 4.33–4.46 | 76.7–255 | 101–106 | 2.41–2.43 | 2.80–3.35 | 6.06–6.25 | 103–120 | 9–1,458 |
+| ext4 | unpinned | Chronicle Queue |  | 2 | 0.54–0.56 | 0.71–0.73 | 1.10–1.97 | 120–146 | 143–561 | 0.48–0.53 | 0.68–2.62 | 0.77–4.80 | 40.0–71.9 | 35–28,793 |
+| ext4 | unpinned | Aeron IPC |  | 2 | 0.28–0.29 | 2.09–6.01 | 2.56–7.39 | 38.6–166 | 237–279 | 0.39–0.43 | 3.87–4.09 | 5.26–5.31 | 39.3–85.8 | 21–142 |
+| ext4 | unpinned | yaque |  | 2 | 0.96–0.99 | 3.09–3.10 | 5.90–6.26 | 2.46–3.28 ms | 152–337 | 1.50–1.56 | 3.62–4.16 | 9.02–9.39 | 2.78–3.00 ms | 253–297 |
+| ext4 | unpinned | plain file |  | 2 | 0.81–0.82 | 2.99–3.01 | 5.97–6.24 | 14.98–16.06 ms | 580–847 | 1.32–1.36 | 3.37–3.61 | 8.70–8.94 | 14.29–14.78 ms | 284–405 |
+| ext4 | jvm-old | Chronicle Queue |  | 4 | 0.51–0.53 | 0.68–0.69 | 2.45–3.51 | 493–591 | 257–417 | 0.49 | 0.64–0.67 | 2.13–2.24 | 512–910 | 111–132 |
+| ext4 | jvm-old | Aeron IPC |  | 4 | 0.27 | 2.08–2.18 | 3.67–4.36 | 11.94–13.90 ms | 335–479 | 0.40–0.43 | 4.01–4.68 | 6.57–7.67 | 16.18–19.14 ms | 209–304 |
+| ext4 | microtouch-only | Chronicle Queue |  | 4 | 0.51–0.54 | 0.67–0.69 | 1.90–1.99 | 528 µs to 1.32 ms | 299–346 | 0.47–0.51 | 0.64–2.95 | 1.59–3.89 | 517–592 | 127–16,243 |
+| ext4 | tuned | tickertape | zero-copy | 2 | 0.30 | 0.46–0.72 | 2.00–2.03 | 215–250 | 188–199 | 0.30 | 0.40–0.41 | 2.67–2.78 | 117–136 | 6–13 |
+| ext4 | tuned | tickertape | safe | 2 | 2.09–2.10 | 2.48–2.49 | 4.14–4.20 | 230–252 | 119–225 | 2.63–2.64 | 3.06 | 5.57–5.90 | 119 µs to 3.51 ms | 18–42 |
+| ext4 | tuned | Chronicle Queue |  | 2 | 0.52 | 0.64–0.65 | 1.34–1.37 | 122–159 | 206–246 | 0.47–0.50 | 0.59–0.63 | 0.70–0.73 | 75.1–81.7 | 18–77 |
+| ext4 | tuned | Aeron IPC |  | 2 | 0.26 | 1.84–1.85 | 2.69–2.77 | 70.9–126 | 369–385 | 0.40–0.44 | 3.67–4.24 | 5.81–6.52 | 29.0–54.7 | 18–22 |
+| ext4 | tuned | yaque |  | 2 | 1.04–1.09 | 2.70–2.77 | 5.32–5.40 | 15.47–16.84 ms | 384–415 | 1.70–1.75 | 4.20–4.48 | 10.2–10.6 | 11.09–11.97 ms | 188–207 |
+| ext4 | tuned | plain file |  | 2 | 0.96–0.98 | 2.79–2.96 | 5.31–7.22 | 18.04–30.47 ms | 542–948 | 1.48–1.52 | 3.76–3.83 | 8.82–9.03 | 11.89–11.99 ms | 181–213 |
+| xfs | pinned | tickertape | zero-copy | 2 | 0.31 | 0.46–0.47 | 2.19–2.25 | 104–127 | 224–478 | 0.30–0.31 | 0.44–0.45 | 5.07–5.34 | 82.3–106 | 11–14 |
+| xfs | pinned | tickertape | safe | 2 | 1.98 | 2.36–2.37 | 4.16–4.18 | 100–136 | 113–157 | 2.55–2.56 | 3.00–3.05 | 7.58–7.94 | 94.8–124 | 14–21 |
+| xfs | pinned | Chronicle Queue |  | 2 | 0.52–0.53 | 0.68–0.69 | 1.74–1.98 | 109–342 | 216–309 | 0.47–0.48 | 0.62–0.66 | 0.75–0.81 | 64.4 µs to 1.41 ms | 42–44 |
+| xfs | pinned | Aeron IPC |  | 2 | 0.27–0.28 | 2.09–2.13 | 2.48–2.57 | 97.5–126 | 230–363 | 0.38–0.43 | 4.46–4.72 | 5.83–6.58 | 56.0 µs to 14.14 ms | 69–170 |
+| xfs | pinned | yaque |  | 2 | 3.89–3.93 | 5.15–5.16 | 6.45–6.62 | 225–269 | 57–64 | 4.59–4.74 | 6.43–6.84 | 8.21–8.74 | 252–254 | 30–34 |
+| xfs | pinned | plain file |  | 2 | 3.59–3.60 | 4.57–4.60 | 6.41–6.74 | 201–220 | 161–179 | 4.42–4.46 | 6.65–6.73 | 8.81–10.3 | 248–249 | 95–100 |
+
+**64 B at 100,000 records/s**
+
+| FS | Config | Tool | Reader | n | x86-64 p50 | p99 | p99.9 | max | late sends | aarch64 p50 | p99 | p99.9 | max | late sends |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| ext4 | pinned | tickertape | zero-copy | 4 | 0.30 | 0.47–0.49 | 2.27–5.96 | 70.1–80.0 | 817–1,110 | 0.28 | 0.38–0.39 | 1.88–2.08 | 93.4–98.2 | 113–148 |
+| ext4 | pinned | tickertape | safe | 4 | 1.93–1.94 | 2.35–6.91 | 3.83–8.35 | 76.5–105 | 890–11,854 | 2.39–2.41 | 2.80–4.94 | 4.95–6.07 | 100–143 | 122–1,443 |
+| ext4 | pinned | Chronicle Queue |  | 4 | 0.44–0.54 | 0.60–5.52 | 11.8–15.3 | 123–143 | 2,171–12,985 | 0.44–0.50 | 0.61–2.94 | 7.85–13.3 | 103–138 | 2,145–23,733 |
+| ext4 | pinned | Aeron IPC |  | 4 | 0.26 | 0.34–1.85 | 0.39–3.47 | 104–335 | 134–11,402 | 0.39–0.41 | 0.48–1.63 | 0.62–3.03 | 91.5–102 | 42–12,874 |
+| ext4 | pinned | yaque |  | 4 | 0.91–0.92 | 2.68–6.14 | 5.76–7.92 | 170–239 | 984–11,786 | 1.39–1.49 | 3.32–3.50 | 8.74–9.02 | 248–275 | 414–6,969 |
+| ext4 | pinned | plain file |  | 4 | 0.79–0.88 | 2.73–5.72 | 5.10–7.08 | 129–184 | 1,609–11,294 | 1.23–1.29 | 3.00–3.15 | 7.94–8.41 | 243–273 | 351–944 |
+| ext4 | unpinned | tickertape | zero-copy | 2 | 0.31–0.32 | 0.48–0.49 | 2.27–2.31 | 70.0–77.4 | 688–829 | 0.27–0.28 | 0.38–2.49 | 2.07–3.46 | 34.2–38.8 | 112–11,094 |
+| ext4 | unpinned | tickertape | safe | 2 | 1.94 | 3.33–7.01 | 4.74–8.26 | 65.3–76.5 | 747–8,954 | 2.40–2.41 | 2.79–4.22 | 4.60–5.18 | 43.4–103 | 135–3,538 |
+| ext4 | unpinned | Chronicle Queue |  | 2 | 0.45–0.47 | 0.60–0.65 | 13.0–15.0 | 115–122 | 2,201–2,248 | 0.44–0.46 | 0.55–0.56 | 6.67–7.78 | 129–139 | 1,671–1,747 |
+| ext4 | unpinned | Aeron IPC |  | 2 | 0.26 | 0.32–0.34 | 0.40–0.41 | 30.7–103 | 120–194 | 0.39 | 1.77–1.85 | 2.82–10.3 | 100 µs to 3.39 ms | 9,673–11,064 |
+| ext4 | unpinned | yaque |  | 2 | 0.93 | 2.71–2.78 | 6.11–6.16 | 187–247 | 904–1,134 | 1.46–1.47 | 4.10–4.38 | 9.01–9.09 | 249–277 | 471–590 |
+| ext4 | unpinned | plain file |  | 2 | 0.80–0.81 | 2.59–5.97 | 5.28–7.24 | 165–169 | 521–11,231 | 1.25–1.30 | 3.16–3.51 | 7.77–8.06 | 266–268 | 350–503 |
+| ext4 | jvm-old | Chronicle Queue |  | 4 | 0.43–0.50 | 0.60–1.00 | 28.6–29.2 | 513–700 | 4,578–6,917 | 0.42–0.50 | 0.57–0.72 | 25.1–27.1 | 605–626 | 4,874–5,489 |
+| ext4 | jvm-old | Aeron IPC |  | 4 | 0.25–0.26 | 0.34–3.25 | 0.83–4.99 | 119–169 | 711–11,548 | 0.39–0.41 | 0.55–2.47 | 3.07–5.92 | 128 µs to 1.16 ms | 908–18,875 |
+| ext4 | microtouch-only | Chronicle Queue |  | 4 | 0.44–0.45 | 0.61–3.33 | 17.8–18.2 | 594–627 | 4,509–15,420 | 0.40–0.50 | 0.54–3.49 | 12.7–18.1 | 577–622 | 4,676–26,999 |
+| ext4 | tuned | tickertape | zero-copy | 2 | 0.30 | 0.45–0.47 | 2.14–2.27 | 81.7–113 | 1,245–1,255 | 0.28 | 0.38 | 1.99–2.09 | 86.3–94.0 | 93–105 |
+| ext4 | tuned | tickertape | safe | 2 | 2.09 | 2.49–2.51 | 3.88–3.92 | 76.0–95.3 | 1,246–1,327 | 2.63 | 3.05–4.25 | 5.24–5.30 | 106–167 | 142–199 |
+| ext4 | tuned | Chronicle Queue |  | 2 | 0.45–0.50 | 0.61–0.64 | 10.9–11.0 | 108–114 | 1,908–1,940 | 0.44–0.49 | 0.55–0.60 | 9.01–9.72 | 126–137 | 1,719–1,737 |
+| ext4 | tuned | Aeron IPC |  | 2 | 0.26–0.27 | 0.37–0.38 | 0.46–0.97 | 96.4–103 | 107–109 | 0.39–0.40 | 0.55–0.58 | 0.72–1.23 | 90.9–106 | 29–406 |
+| ext4 | tuned | yaque |  | 2 | 1.03 | 2.64–2.68 | 5.20–5.40 | 86.7–97.5 | 407–560 | 1.61–1.63 | 3.62–3.98 | 9.18–9.40 | 227–250 | 427–8,506 |
+| ext4 | tuned | plain file |  | 2 | 0.95–0.96 | 2.55–2.66 | 4.51–4.78 | 117–123 | 271–283 | 1.41–1.48 | 3.26–3.43 | 8.08–8.18 | 238–266 | 249–271 |
+| xfs | pinned | tickertape | zero-copy | 2 | 0.30 | 0.46–5.09 | 2.21–6.62 | 65.5–68.7 | 806–10,839 | 0.28 | 0.47–1.84 | 2.64–2.78 | 111 | 297–528 |
+| xfs | pinned | tickertape | safe | 2 | 1.97 | 3.96–6.94 | 5.26–8.31 | 63.6–84.4 | 758–11,771 | 2.51 | 4.51–4.79 | 6.51–7.07 | 109–110 | 277–11,244 |
+| xfs | pinned | Chronicle Queue |  | 2 | 0.45–0.46 | 0.61–3.99 | 4.11–6.00 | 123–125 | 1,624–12,728 | 0.42–0.44 | 3.19–3.30 | 4.36–5.46 | 129–156 | 14,966–15,118 |
+| xfs | pinned | Aeron IPC |  | 2 | 0.26 | 0.35–2.32 | 0.39–3.62 | 34.5–39.5 | 94–11,084 | 0.37–0.40 | 0.45–1.04 | 0.62–2.18 | 93.8–548 | 137–8,979 |
+| xfs | pinned | yaque |  | 2 | 3.80–3.83 | 7.23–8.52 | 10.2–10.6 | 118–121 | 913–1,197 | 4.36–4.42 | 5.97–6.02 | 11.5–11.7 | 238–257 | 1,048–1,261 |
+| xfs | pinned | plain file |  | 2 | 3.59–3.65 | 7.96–8.43 | 10.1 | 116–256 | 418–11,204 | 4.21–4.28 | 5.57–6.72 | 7.57–11.4 | 124–247 | 285–474 |
+
+**1,024 B at 10,000 records/s**
+
+| FS | Config | Tool | Reader | n | x86-64 p50 | p99 | p99.9 | max | late sends | aarch64 p50 | p99 | p99.9 | max | late sends |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| ext4 | pinned | tickertape | zero-copy | 4 | 0.76–0.78 | 2.65–3.06 | 4.60–6.84 | 1.24–1.32 ms | 618–39,615 | 0.54–0.55 | 2.65–2.78 | 8.73–9.10 | 1.01–1.02 ms | 49–342 |
+| ext4 | pinned | tickertape | safe | 4 | 2.46–2.49 | 4.35–4.40 | 6.94–7.64 | 1.29–1.37 ms | 603–734 | 2.64–2.67 | 5.44–5.66 | 11.6–12.4 | 1.05–1.06 ms | 48–256 |
+| ext4 | pinned | Chronicle Queue |  | 4 | 0.61–0.62 | 1.41–1.78 | 2.36 µs to 15.75 ms | 180 µs to 111.61 ms | 840–2,252 | 0.52–0.53 | 0.71–0.72 | 2.77–3.46 | 424 µs to 35.06 ms | 40–493 |
+| ext4 | pinned | Aeron IPC |  | 4 | 0.39–0.45 | 2.38–2.40 | 3.26–3.64 | 75.3–345 | 223–274 | 0.48–0.51 | 2.85–3.45 | 4.57–5.96 | 68.1–101 | 12–6,549 |
+| ext4 | pinned | yaque |  | 4 | 1.31–1.33 | 5.62–6.04 | 144–888 | 12.55–14.04 ms | 133–150 | 1.77–1.82 | 8.79–9.00 | 6.73–6.97 ms | 19.28–19.53 ms | 246–647 |
+| ext4 | pinned | plain file |  | 4 | 1.20–1.21 | 4.38–4.60 | 5.89–6.02 | 356–639 | 103–284 | 1.49–1.51 | 4.49–4.92 | 8.39–8.79 | 260–750 | 56–504 |
+| ext4 | unpinned | tickertape | zero-copy | 2 | 0.80–0.81 | 2.55–2.73 | 4.76–6.70 | 1.15–1.28 ms | 650–733 | 0.54–0.57 | 2.62–2.74 | 8.28–8.93 | 1.02–1.03 ms | 51–53 |
+| ext4 | unpinned | tickertape | safe | 2 | 2.47–2.52 | 4.44–4.48 | 7.16–8.04 | 1.27–1.29 ms | 762–795 | 2.66–2.67 | 5.42–5.76 | 11.1–11.4 | 1.05–1.06 ms | 377–34,627 |
+| ext4 | unpinned | Chronicle Queue |  | 2 | 0.62–0.65 | 1.34–1.83 | 2.36 µs to 25.74 ms | 172 µs to 124.13 ms | 818–2,161 | 0.51–0.52 | 0.70–1.32 | 2.87–3.79 | 1.25–73.60 ms | 119–1,669 |
+| ext4 | unpinned | Aeron IPC |  | 2 | 0.39–0.40 | 2.37–2.38 | 3.05–3.12 | 201–349 | 177–239 | 0.49–0.50 | 3.07–3.19 | 4.72–5.02 | 40.9–62.3 | 17–154 |
+| ext4 | unpinned | yaque |  | 2 | 1.36–1.41 | 5.74–7.95 | 120–260 | 11.98–13.22 ms | 124–110,131 | 1.79–1.83 | 9.04–9.26 | 6.93–7.11 ms | 19.51–19.69 ms | 260–263 |
+| ext4 | unpinned | plain file |  | 2 | 1.23–1.24 | 4.22–4.61 | 5.66–6.20 | 446–617 | 87–566 | 1.55–1.56 | 4.70–4.96 | 8.50–8.82 | 515 µs to 1.92 ms | 78–85 |
+| ext4 | jvm-old | Chronicle Queue |  | 4 | 0.61–0.63 | 1.78–1.84 | 34.8–36.8 | 262 µs to 16.02 ms | 361–534 | 0.52–0.54 | 1.85–3.71 | 36.4–37.6 | 446 µs to 21.63 ms | 170–10,300 |
+| ext4 | jvm-old | Aeron IPC |  | 4 | 0.39–0.45 | 2.35–6.16 | 3.13–7.72 | 74.4 µs to 6.18 ms | 237–367 | 0.51–0.52 | 3.06–3.29 | 4.80–6.00 | 50.9 µs to 29.11 ms | 46–342 |
+| ext4 | microtouch-only | Chronicle Queue |  | 4 | 0.61–0.63 | 1.73–1.80 | 2.35–2.51 | 350–399 | 313–424 | 0.52–0.55 | 1.70–1.73 | 2.71–2.94 | 740 µs to 1.18 ms | 181–206 |
+| ext4 | tuned | tickertape | zero-copy | 2 | 0.76–0.77 | 2.35–2.66 | 4.98–5.18 | 1.06–1.07 ms | 1,103–1,172 | 0.53–0.54 | 2.94–2.95 | 9.06–10.5 | 940 µs to 1.51 ms | 60–141 |
+| ext4 | tuned | tickertape | safe | 2 | 2.67–2.68 | 4.35–4.37 | 8.34–8.76 | 1.04–1.14 ms | 1,109–1,172 | 2.90–2.92 | 5.72–5.78 | 10.6–11.9 | 972 µs to 1.00 ms | 56–66 |
+| ext4 | tuned | Chronicle Queue |  | 2 | 0.62–0.63 | 1.64–1.69 | 2.54–2.55 | 245 µs to 3.19 ms | 1,348–1,368 | 0.51 | 0.69–0.70 | 2.66–3.78 | 945 µs to 78.91 ms | 193–868 |
+| ext4 | tuned | Aeron IPC |  | 2 | 0.42–0.44 | 2.08 | 3.13–3.44 | 77.6–206 | 348–400 | 0.53–0.57 | 3.09–3.32 | 5.04–5.62 | 39.7–49.5 | 12–161 |
+| ext4 | tuned | yaque |  | 2 | 1.47 | 5.08–5.34 | 93.7–98.4 | 12.77–12.85 ms | 104–120 | 2.02 | 8.30–8.46 | 5.75–5.80 ms | 18.45–18.56 ms | 114–119 |
+| ext4 | tuned | plain file |  | 2 | 1.30–1.36 | 4.41–4.45 | 5.42–5.43 | 336 µs to 1.09 ms | 79–81 | 1.73–1.76 | 5.44–5.50 | 8.46–8.72 | 398–455 | 41–46 |
+| xfs | pinned | tickertape | zero-copy | 2 | 0.77–0.85 | 2.66–6.18 | 4.42–10.9 | 1.11–1.28 ms | 649–110,538 | 0.55 | 2.81–3.03 | 11.6–12.7 | 1.03–1.09 ms | 69–448 |
+| xfs | pinned | tickertape | safe | 2 | 2.50–2.53 | 3.95–3.98 | 6.68–6.80 | 1.23–1.26 ms | 611–798 | 2.77 | 5.46–5.51 | 12.6–14.4 | 1.07 ms | 59–62 |
+| xfs | pinned | Chronicle Queue |  | 2 | 0.61–0.62 | 1.49–1.55 | 2.39–2.53 | 164–194 | 582–852 | 0.53–0.54 | 0.75–2.79 | 2.98–4.27 | 191–197 | 55–75,918 |
+| xfs | pinned | Aeron IPC |  | 2 | 0.38–0.55 | 2.33–2.35 | 2.60–2.64 | 208–226 | 207–222 | 0.52 | 3.65–4.02 | 4.91–5.33 | 5.84–7.67 ms | 27–29 |
+| xfs | pinned | yaque |  | 2 | 4.18–4.19 | 6.42–6.44 | 9.64–10.0 | 7.31–7.52 ms | 101–137 | 4.94–5.02 | 8.94–10.5 | 188–208 | 12.34–12.35 ms | 132–141 |
+| xfs | pinned | plain file |  | 2 | 3.77–3.78 | 5.42–5.43 | 7.02–7.23 | 843 µs to 1.04 ms | 195–364 | 4.67–4.87 | 7.96–8.81 | 12.1–12.6 | 99.9–143 | 435–6,439 |
+
+**1,024 B at 100,000 records/s**
+
+| FS | Config | Tool | Reader | n | x86-64 p50 | p99 | p99.9 | max | late sends | aarch64 p50 | p99 | p99.9 | max | late sends |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| ext4 | pinned | tickertape | zero-copy | 4 | 0.76–0.77 | 2.74–5.57 | 28.6–29.8 | 1.08–1.10 ms | 9,090–20,099 | 0.52–0.53 | 2.02–2.22 | 24.8–28.5 | 993 µs to 1.01 ms | 2,115–2,552 |
+| ext4 | pinned | tickertape | safe | 4 | 2.49–2.51 | 4.12–7.12 | 29.0–30.2 | 1.14–1.18 ms | 12,659–20,206 | 2.63–2.66 | 5.04–5.46 | 24.3–31.1 | 1.02–1.08 ms | 2,182–13,376 |
+| ext4 | pinned | Chronicle Queue |  | 4 | 0.53–0.56 | 13.0–13.4 | 23.9–24.6 | 288–550 | 23,479–34,986 | 0.45–0.52 | 3.26–5.22 | 14.5–16.3 | 178–481 | 12,099–23,741 |
+| ext4 | pinned | Aeron IPC |  | 4 | 0.41–0.54 | 0.69–0.71 | 0.77–5.58 | 38.5–129 | 110–401 | 0.43–0.48 | 0.73–1.68 | 0.82–2.71 | 87.6–93.1 | 36–18,257 |
+| ext4 | pinned | yaque |  | 4 | 1.27–1.29 | 50.0–55.3 | 10.15–10.22 ms | 11.83–12.11 ms | 2,311–12,971 | 1.67–1.71 | 7.16–7.43 ms | 18.02–18.30 ms | 19.32–19.73 ms | 4,789–22,244 |
+| ext4 | pinned | plain file |  | 4 | 1.15–1.16 | 4.26–4.52 | 9.85–11.3 | 101–119 | 1,143–4,731 | 1.45–1.46 | 5.23–6.73 | 14.4–14.7 | 137–142 | 1,302–12,872 |
+| ext4 | unpinned | tickertape | zero-copy | 2 | 0.78–0.80 | 2.79–6.38 | 28.9–29.2 | 1.08–1.09 ms | 6,778–7,971 | 0.53 | 2.00–2.01 | 23.9–24.1 | 994 µs to 1.01 ms | 2,061–2,107 |
+| ext4 | unpinned | tickertape | safe | 2 | 2.48–2.50 | 4.74–5.21 | 28.0–29.4 | 1.14 ms | 15,546–19,815 | 2.64 | 4.83–4.93 | 23.9–25.2 | 1.02–1.07 ms | 2,248–5,378 |
+| ext4 | unpinned | Chronicle Queue |  | 2 | 0.57–0.63 | 13.3–13.4 | 24.1–24.4 | 337–339 | 24,203–34,649 | 0.46–0.49 | 2.43–5.37 | 13.2–15.7 | 182–188 | 11,137–25,129 |
+| ext4 | unpinned | Aeron IPC |  | 2 | 0.42–0.47 | 0.70–2.61 | 0.80–4.05 | 107–111 | 191–11,117 | 0.46–0.47 | 0.92–1.50 | 2.33–2.36 | 89.0 µs to 2.02 ms | 5,470–10,386 |
+| ext4 | unpinned | yaque |  | 2 | 1.32–1.35 | 42.4–42.5 | 9.99 ms | 11.75–11.93 ms | 2,177–12,851 | 1.69–1.70 | 7.28–7.47 ms | 18.15–18.35 ms | 19.50–19.82 ms | 5,495–5,670 |
+| ext4 | unpinned | plain file |  | 2 | 1.19–1.23 | 6.21–6.89 | 12.3–13.1 | 107–108 | 11,928–12,124 | 1.42–1.46 | 5.52–6.24 | 11.2–15.9 | 163–164 | 1,524–2,258 |
+| ext4 | jvm-old | Chronicle Queue |  | 4 | 0.53–0.60 | 26.0–26.5 | 35.4–37.4 | 319–378 | 27,002–38,148 | 0.45–0.46 | 21.5–22.2 | 33.7–35.2 | 455–514 | 24,207–33,293 |
+| ext4 | jvm-old | Aeron IPC |  | 4 | 0.40–0.42 | 0.69–3.58 | 0.77–4.96 | 117–159 | 1,218–12,168 | 0.48–0.57 | 0.72–1.89 | 0.81–2.90 | 129–173 | 1,095–9,993 |
+| ext4 | microtouch-only | Chronicle Queue |  | 4 | 0.54–0.59 | 13.7–13.9 | 25.2–26.2 | 327–644 | 26,674–32,671 | 0.44–0.52 | 3.88–8.07 | 18.7–29.2 | 451–488 | 15,346–38,923 |
+| ext4 | tuned | tickertape | zero-copy | 2 | 0.76–0.77 | 3.09–3.10 | 28.3–28.7 | 984 µs to 1.06 ms | 13,338–13,857 | 0.52 | 2.17–2.38 | 27.0–36.8 | 932–983 | 2,257–4,976 |
+| ext4 | tuned | tickertape | safe | 2 | 2.67–2.68 | 4.80–4.83 | 31.3 | 1.08–1.19 ms | 13,845–14,223 | 2.86–2.87 | 5.17–5.23 | 25.9–27.4 | 960–965 | 2,303–2,418 |
+| ext4 | tuned | Chronicle Queue |  | 2 | 0.60–0.61 | 12.6 | 23.1 | 175–225 | 22,327–22,406 | 0.49–0.50 | 2.95–4.90 | 14.0–15.9 | 180–197 | 13,426–17,374 |
+| ext4 | tuned | Aeron IPC |  | 2 | 0.38–0.45 | 0.70–0.71 | 0.79–1.36 | 21.6–43.8 | 91–103 | 0.50–0.51 | 0.73–0.77 | 0.84–1.27 | 97.2–102 | 30–94 |
+| ext4 | tuned | yaque |  | 2 | 1.42–1.43 | 8.51–8.87 | 9.34–9.40 ms | 10.98–11.16 ms | 1,389–1,479 | 1.87–1.89 | 6.00–6.04 ms | 16.86–16.91 ms | 18.27–18.38 ms | 3,012–3,907 |
+| ext4 | tuned | plain file |  | 2 | 1.27–1.29 | 4.32–4.34 | 6.55–6.65 | 84.7–89.7 | 739–936 | 1.62–1.65 | 5.56–7.02 | 9.25–9.54 | 103–108 | 1,008–7,740 |
+| xfs | pinned | tickertape | zero-copy | 2 | 0.77 | 2.69–3.97 | 25.5–26.4 | 1.07 ms | 8,813–19,795 | 0.51–0.52 | 2.06–2.82 | 38.8–40.8 | 1.03 ms | 2,881–13,728 |
+| xfs | pinned | tickertape | safe | 2 | 2.53 | 3.84–3.88 | 25.6–25.8 | 1.12–1.13 ms | 8,728–9,908 | 2.74–2.75 | 4.76–6.58 | 33.3–33.8 | 1.04–1.05 ms | 2,817–2,866 |
+| xfs | pinned | Chronicle Queue |  | 2 | 0.53 | 5.22–5.24 | 15.6–15.7 | 191–276 | 17,900–17,923 | 0.47–0.50 | 1.62–2.57 | 3.36–5.40 | 191–198 | 2,341–22,338 |
+| xfs | pinned | Aeron IPC |  | 2 | 0.42–0.54 | 0.71–1.90 | 1.33–3.33 | 43.9–100 | 549–11,185 | 0.48 | 0.82–2.33 | 1.46–3.67 | 97.9–102 | 67–11,189 |
+| xfs | pinned | yaque |  | 2 | 4.03–4.04 | 10.2–10.6 | 5.20–5.30 ms | 6.57–6.59 ms | 2,717–2,772 | 4.62–4.80 | 300–398 | 11.12–11.21 ms | 12.43–12.55 ms | 4,388–4,456 |
+| xfs | pinned | plain file |  | 2 | 3.64–3.65 | 5.53–8.46 | 17.6–17.9 | 107–109 | 3,088–12,293 | 4.58–4.66 | 9.48–9.94 | 23.2–23.6 | 118 | 1,742–12,667 |
+
+- **p99.9, `pinned`, ext4.** Chronicle Queue is the lowest at 10,000 records/s in three of the four payload and machine
+  cells, and in three of four runs in the fourth (x86-64, 1,024 B: 2.36–2.82 µs; its fourth run, 15.75 ms, is above both
+  tickertape readers; one of the two `unpinned` runs had 25.74 ms; neither sample is attributed to a setting). Aeron has
+  the lowest observed p99.9 at 100,000 records/s in all four cells: its whole range is below tickertape's at 1,024 B and
+  overlaps it at 64 B (0.39–3.47 against 2.27–5.96 on x86-64, 0.62–3.03 against 1.88–2.08 on aarch64); it is also lower
+  than the zero-copy reader at 1,024 B × 10,000 records/s (3.26–3.64 against 4.60–6.84; 4.57–5.96 against 8.73–9.10),
+  where the plain file's ranges overlap tickertape's (5.89–6.02; 8.39–8.79). tickertape's zero-copy reader is lower than
+  Chronicle's at 64 B × 100,000 records/s (2.27–5.96 against 11.8–15.3 on x86-64, 1.88–2.08 against 7.85–13.3 on
+  aarch64) and higher at 1,024 B × 100,000 records/s (28.6–29.8 against 23.9–24.6 on x86-64, 24.8–28.5 against 14.5–16.3
+  on aarch64), where the plain file is lower than tickertape too (9.85–11.3 and 14.4–14.7).
+- **p99.9, xfs** (`pinned`, n = 2). At 64 B × 100,000 records/s on x86-64 the zero-copy reader's range overlaps
+  Chronicle's (2.21–6.62 against 4.11–6.00) and the safe reader's is above it (5.26–8.31). Elsewhere the gaps to
+  Chronicle are larger than on ext4: aarch64 1,024 B × 100,000 records/s, tickertape 38.8–40.8 against 3.36–5.40 (the
+  plain file 23.2–23.6); aarch64 1,024 B × 10,000 records/s, 11.6–12.7 against 2.98–4.27; aarch64 64 B × 10,000
+  records/s, 5.07–5.34 against 0.75–0.81; x86-64 1,024 B × 100,000 records/s, 25.5–26.4 against 15.6–15.7.
+- **Maxima** (`pinned`, ext4). At 1,024 B tickertape's zero-copy reader had a maximum of 993 µs to 1.32 ms in every run
+  (both readers: 993 µs to 1.37 ms; the cause was not traced); at 100,000 records/s Chronicle Queue's maxima were
+  178–550 µs, Aeron's 38.5–129 µs and the plain file's 101–142 µs, and over both rates Chronicle's were 178 µs to 111.61
+  ms and Aeron's 38.5–345 µs. At 64 B tickertape's were 70.1–278 µs, Chronicle's 25.3 µs to 1.01 ms and Aeron's 36.8 µs
+  to 71.30 ms.
+- **Late sends** count the writer's sends that started late, not lost records; a late send's delay is in the latency.
+
+### Sustained mode (ten-minute runs)
+
+`compare/run.py --sustained` ([`compare/README.md`](../compare/README.md) → "Sustained mode"): 600 s measured after a 10
+s warm-up, one reader following. **Probe:** unpaced, the reader's latency from the actual send. **SV:** paced at 50 % of
+the same unit's probe, latency from the scheduled send, no sync. **SD:** SV plus the tool's sync every second on the
+writer's thread; "sync" is its duration. SV stands for sustained visibility, SD for sustained durability. tickertape
+runs its zero-copy reader (`Reader::open_mapped`) and, in SD, the blocking `Writer::checkpoint()`. Parts: `sustained`
+(pinned, two rounds), `sustained-jvm-old`, `sustained-others` (yaque, queue-file, plain file: probe and SV only),
+`tuned-sustained`, `sustained-90` (SD at 90 % of the probe), `sustained-journals` (xfs). n = 1 per row. µs unless
+marked. **The target rates differ per tool and round:** read every SV and SD figure with the rate beside it.
+
+**Probe, 64 B (unpaced; records/s and reader latency from the send)**
+
+| Machine | FS | Part | Config | Tool | Round | Target (records/s) | Achieved (records/s) | p50 | p99 | p99.9 | max |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| x86-64 | ext4 | sustained | pinned | tickertape | 1 | unpaced | 3,543,632 | 0.47 | 2.90 | 8.63 | 355.47 ms |
+| x86-64 | ext4 | sustained | pinned | tickertape | 2 | unpaced | 3,529,856 | 0.47 | 2.89 | 8.34 | 312.74 ms |
+| x86-64 | ext4 | sustained | pinned | Chronicle Queue | 1 | unpaced | 3,061,325 | 0.50 | 0.88 | 6.53 | 143.79 ms |
+| x86-64 | ext4 | sustained | pinned | Chronicle Queue | 2 | unpaced | 2,952,843 | 0.52 | 0.88 | 6.50 | 143.65 ms |
+| x86-64 | ext4 | sustained | pinned | Aeron IPC | 1 | unpaced | 7,206,880 | 0.30 | 0.78 | 0.95 | 69.99 ms |
+| x86-64 | ext4 | sustained | pinned | Aeron IPC | 2 | unpaced | 6,489,247 | 0.38 | 0.86 | 1.06 | 54.98 ms |
+| x86-64 | ext4 | sustained-jvm-old | jvm-old | Chronicle Queue | 1 | unpaced | 2,993,947 | 0.50 | 0.88 | 7.67 | 144.97 ms |
+| x86-64 | ext4 | sustained-jvm-old | jvm-old | Aeron IPC | 1 | unpaced | 6,849,910 | 0.37 | 0.83 | 0.95 | 47.09 ms |
+| x86-64 | ext4 | sustained-others | pinned | yaque | 1 | unpaced | 1,020,018 | 0.98 | 2.07 ms | 10.77 ms | 12.46 ms |
+| x86-64 | ext4 | sustained-others | pinned | queue-file | 1 | unpaced | 929,189 | writer only | writer only | writer only | writer only |
+| x86-64 | ext4 | sustained-others | pinned | plain file | 1 | unpaced | 1,716,506 | 1.26 | 2.68 | 6.76 | 141.95 ms |
+| x86-64 | ext4 | tuned-sustained | tuned | tickertape | 1 | unpaced | 2,387,955 | 0.50 | 2.97 | 6.76 | 497.81 ms |
+| x86-64 | ext4 | tuned-sustained | tuned | Chronicle Queue | 1 | unpaced | 3,056,715 | 0.49 | 0.92 | 2.48 | 143.65 ms |
+| x86-64 | ext4 | tuned-sustained | tuned | Aeron IPC | 1 | unpaced | 7,366,146 | 0.33 | 0.85 | 0.93 | 72.48 ms |
+| x86-64 | ext4 | sustained-90 | pinned | tickertape | 1 | unpaced | 3,542,443 | 0.46 | 2.62 | 7.92 | 118.82 ms |
+| x86-64 | ext4 | sustained-90 | pinned | Chronicle Queue | 1 | unpaced | 2,944,959 | 0.53 | 0.91 | 6.63 | 143.52 ms |
+| x86-64 | xfs | sustained-journals | pinned | tickertape | 1 | unpaced | 3,519,690 | 0.50 | 2.75 | 9.46 | 25.82 ms |
+| x86-64 | xfs | sustained-journals | pinned | Chronicle Queue | 1 | unpaced | 3,517,607 | 0.45 | 0.89 | 6.47 | 4.75 ms |
+| x86-64 | xfs | sustained-90 | pinned | tickertape | 1 | unpaced | 3,543,512 | 0.48 | 2.72 | 8.34 | 33.91 ms |
+| x86-64 | xfs | sustained-90 | pinned | Chronicle Queue | 1 | unpaced | 3,493,704 | 0.46 | 0.88 | 6.53 | 4.66 ms |
+| aarch64 | ext4 | sustained | pinned | tickertape | 1 | unpaced | 3,458,048 | 0.67 | 1.92 | 9.82 | 322.96 ms |
+| aarch64 | ext4 | sustained | pinned | tickertape | 2 | unpaced | 3,466,622 | 0.67 | 1.69 | 7.53 | 401.08 ms |
+| aarch64 | ext4 | sustained | pinned | Chronicle Queue | 1 | unpaced | 2,570,572 | 0.68 | 1.26 | 8.34 | 139.33 ms |
+| aarch64 | ext4 | sustained | pinned | Chronicle Queue | 2 | unpaced | 2,575,258 | 0.68 | 1.33 | 15.1 | 144.57 ms |
+| aarch64 | ext4 | sustained | pinned | Aeron IPC | 1 | unpaced | 3,246,052 | 0.65 | 1.16 | 4.64 | 82.58 ms |
+| aarch64 | ext4 | sustained | pinned | Aeron IPC | 2 | unpaced | 3,820,950 | 0.61 | 1.15 | 5.08 | 79.56 ms |
+| aarch64 | ext4 | sustained-jvm-old | jvm-old | Chronicle Queue | 1 | unpaced | 2,641,531 | 0.63 | 1.44 | 18.7 | 3.84 s |
+| aarch64 | ext4 | sustained-jvm-old | jvm-old | Aeron IPC | 1 | unpaced | 3,571,671 | 0.64 | 1.18 | 4.96 | 48.17 ms |
+| aarch64 | ext4 | sustained-others | pinned | yaque | 1 | unpaced | 749,494 | 1.48 | 1.87 ms | 15.56 ms | 16.89 ms |
+| aarch64 | ext4 | sustained-others | pinned | queue-file | 1 | unpaced | 562,648 | writer only | writer only | writer only | writer only |
+| aarch64 | ext4 | sustained-others | pinned | plain file | 1 | unpaced | 1,133,796 | 1.76 | 3.57 | 7.98 | 142.74 ms |
+| aarch64 | ext4 | tuned-sustained | tuned | tickertape | 1 | unpaced | 3,457,102 | 0.76 | 1.92 | 5.42 | 369.89 ms |
+| aarch64 | ext4 | tuned-sustained | tuned | Chronicle Queue | 1 | unpaced | 2,627,714 | 0.72 | 1.29 | 5.33 | 139.98 ms |
+| aarch64 | ext4 | tuned-sustained | tuned | Aeron IPC | 1 | unpaced | 3,372,575 | 0.70 | 1.20 | 4.23 | 83.23 ms |
+| aarch64 | ext4 | sustained-90 | pinned | tickertape | 1 | unpaced | 3,462,723 | 0.69 | 1.71 | 8.47 | 347.60 ms |
+| aarch64 | ext4 | sustained-90 | pinned | Chronicle Queue | 1 | unpaced | 2,582,124 | 0.65 | 1.25 | 10.8 | 140.90 ms |
+| aarch64 | xfs | sustained-journals | pinned | tickertape | 1 | unpaced | 3,465,454 | 0.68 | 1.98 | 8.02 | 82.25 ms |
+| aarch64 | xfs | sustained-journals | pinned | Chronicle Queue | 1 | unpaced | 2,772,747 | 0.70 | 1.36 | 9.21 | 1.37 ms |
+| aarch64 | xfs | sustained-90 | pinned | tickertape | 1 | unpaced | 3,464,276 | 0.69 | 1.82 | 8.08 | 47.02 ms |
+| aarch64 | xfs | sustained-90 | pinned | Chronicle Queue | 1 | unpaced | 3,002,149 | 0.69 | 1.50 | 9.22 | 5.36 ms |
+
+**Probe, 1,024 B**
+
+| Machine | FS | Part | Config | Tool | Round | Target (records/s) | Achieved (records/s) | p50 | p99 | p99.9 | max |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| x86-64 | ext4 | sustained | pinned | tickertape | 1 | unpaced | 346,382 | 0.94 | 9.16 | 29.1 | 331.87 ms |
+| x86-64 | ext4 | sustained | pinned | tickertape | 2 | unpaced | 345,534 | 0.98 | 10.4 | 28.9 | 386.14 ms |
+| x86-64 | ext4 | sustained | pinned | Chronicle Queue | 1 | unpaced | 350,374 | 0.45 | 5.58 | 33.5 | 170.66 ms |
+| x86-64 | ext4 | sustained | pinned | Chronicle Queue | 2 | unpaced | 349,231 | 0.56 | 6.16 | 33.9 | 176.55 ms |
+| x86-64 | ext4 | sustained | pinned | Aeron IPC | 1 | unpaced | 4,175,027 | 0.64 | 1.11 | 1.36 | 82.31 ms |
+| x86-64 | ext4 | sustained | pinned | Aeron IPC | 2 | unpaced | 4,036,635 | 0.66 | 1.12 | 1.89 | 83.56 ms |
+| x86-64 | ext4 | sustained-jvm-old | jvm-old | Chronicle Queue | 1 | unpaced | 350,249 | 0.61 | 6.71 | 33.7 | 170.92 ms |
+| x86-64 | ext4 | sustained-jvm-old | jvm-old | Aeron IPC | 1 | unpaced | 4,148,741 | 0.64 | 1.09 | 1.34 | 58.20 ms |
+| x86-64 | ext4 | sustained-others | pinned | yaque | 1 | unpaced | 685,628 | 1.62 | 10.04 ms | 10.72 ms | 11.89 ms |
+| x86-64 | ext4 | sustained-others | pinned | queue-file | 1 | unpaced | 314,733 | writer only | writer only | writer only | writer only |
+| x86-64 | ext4 | sustained-others | pinned | plain file | 1 | unpaced | 348,781 | 1.60 | 4.73 | 8.97 | 184.68 ms |
+| x86-64 | ext4 | tuned-sustained | tuned | tickertape | 1 | unpaced | 339,496 | 0.96 | 4.90 | 28.3 | 405.27 ms |
+| x86-64 | ext4 | tuned-sustained | tuned | Chronicle Queue | 1 | unpaced | 347,165 | 0.49 | 2.76 | 32.1 | 181.93 ms |
+| x86-64 | ext4 | tuned-sustained | tuned | Aeron IPC | 1 | unpaced | 4,199,806 | 0.67 | 1.13 | 2.17 | 156.89 ms |
+| x86-64 | ext4 | sustained-90 | pinned | tickertape | 1 | unpaced | 345,787 | 0.98 | 10.4 | 28.8 | 354.16 ms |
+| x86-64 | ext4 | sustained-90 | pinned | Chronicle Queue | 1 | unpaced | 350,361 | 0.55 | 5.65 | 33.6 | 171.70 ms |
+| x86-64 | xfs | sustained-journals | pinned | tickertape | 1 | unpaced | 346,525 | 1.02 | 9.95 | 23.9 | 304.61 ms |
+| x86-64 | xfs | sustained-journals | pinned | Chronicle Queue | 1 | unpaced | 350,929 | 0.62 | 6.10 | 25.3 | 20.68 ms |
+| x86-64 | xfs | sustained-90 | pinned | tickertape | 1 | unpaced | 345,749 | 1.04 | 10.3 | 23.3 | 249.17 ms |
+| x86-64 | xfs | sustained-90 | pinned | Chronicle Queue | 1 | unpaced | 351,012 | 0.60 | 6.22 | 25.4 | 20.97 ms |
+| aarch64 | ext4 | sustained | pinned | tickertape | 1 | unpaced | 338,179 | 0.91 | 2.77 | 18.4 | 374.87 ms |
+| aarch64 | ext4 | sustained | pinned | tickertape | 2 | unpaced | 337,424 | 0.92 | 3.06 | 18.7 | 347.60 ms |
+| aarch64 | ext4 | sustained | pinned | Chronicle Queue | 1 | unpaced | 343,736 | 0.71 | 4.52 | 25.2 | 171.84 ms |
+| aarch64 | ext4 | sustained | pinned | Chronicle Queue | 2 | unpaced | 341,297 | 0.70 | 4.32 | 24.2 | 375.65 ms |
+| aarch64 | ext4 | sustained | pinned | Aeron IPC | 1 | unpaced | 2,776,684 | 0.70 | 1.21 | 3.62 | 86.18 ms |
+| aarch64 | ext4 | sustained | pinned | Aeron IPC | 2 | unpaced | 2,796,872 | 0.69 | 1.20 | 3.73 | 65.21 ms |
+| aarch64 | ext4 | sustained-jvm-old | jvm-old | Chronicle Queue | 1 | unpaced | 343,855 | 0.66 | 7.30 | 42.1 | 174.59 ms |
+| aarch64 | ext4 | sustained-jvm-old | jvm-old | Aeron IPC | 1 | unpaced | 2,451,881 | 0.80 | 1.33 | 4.21 | 90.31 ms |
+| aarch64 | ext4 | sustained-others | pinned | yaque | 1 | unpaced | 496,821 | 2.29 | 15.78 ms | 16.83 ms | 17.47 ms |
+| aarch64 | ext4 | sustained-others | pinned | queue-file | 1 | unpaced | 309,778 | writer only | writer only | writer only | writer only |
+| aarch64 | ext4 | sustained-others | pinned | plain file | 1 | unpaced | 342,397 | 2.04 | 6.79 | 10.0 | 279.97 ms |
+| aarch64 | ext4 | tuned-sustained | tuned | tickertape | 1 | unpaced | 338,590 | 0.98 | 3.06 | 19.5 | 345.24 ms |
+| aarch64 | ext4 | tuned-sustained | tuned | Chronicle Queue | 1 | unpaced | 343,774 | 0.76 | 4.45 | 23.8 | 174.46 ms |
+| aarch64 | ext4 | tuned-sustained | tuned | Aeron IPC | 1 | unpaced | 2,789,097 | 0.75 | 1.31 | 2.78 | 86.38 ms |
+| aarch64 | ext4 | sustained-90 | pinned | tickertape | 1 | unpaced | 338,916 | 0.90 | 2.72 | 18.4 | 363.07 ms |
+| aarch64 | ext4 | sustained-90 | pinned | Chronicle Queue | 1 | unpaced | 343,739 | 0.70 | 4.54 | 23.9 | 173.41 ms |
+| aarch64 | xfs | sustained-journals | pinned | tickertape | 1 | unpaced | 338,555 | 0.93 | 3.32 | 11.9 | 28.25 ms |
+| aarch64 | xfs | sustained-journals | pinned | Chronicle Queue | 1 | unpaced | 340,696 | 0.69 | 4.33 | 13.1 | 20.14 ms |
+| aarch64 | xfs | sustained-90 | pinned | tickertape | 1 | unpaced | 338,426 | 0.92 | 2.88 | 11.3 | 117.05 ms |
+| aarch64 | xfs | sustained-90 | pinned | Chronicle Queue | 1 | unpaced | 341,594 | 0.73 | 4.56 | 14.5 | 21.02 ms |
+
+**SV, 64 B (paced at 50 % of the probe, no sync)**
+
+| Machine | FS | Part | Config | Tool | Round | Target (records/s) | Achieved (records/s) | p50 | p99 | p99.9 | max | Late sends |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| x86-64 | ext4 | sustained | pinned | tickertape | 1 | 1,771,815 | 1,771,814 | 0.32 | 3.93 | 642 | 1.69 ms | 37,205,017 (3.4 %) |
+| x86-64 | ext4 | sustained | pinned | tickertape | 2 | 1,764,927 | 1,764,926 | 0.32 | 3.86 | 654 | 1.56 ms | 36,245,831 (3.4 %) |
+| x86-64 | ext4 | sustained | pinned | Chronicle Queue | 1 | 1,530,662 | 1,530,662 | 0.43 | 20.14 ms | 102.69 ms | 135.53 ms | 121,529,112 (13.0 %) |
+| x86-64 | ext4 | sustained | pinned | Chronicle Queue | 2 | 1,476,421 | 1,476,421 | 0.44 | 20.19 ms | 100.01 ms | 136.05 ms | 113,607,776 (12.6 %) |
+| x86-64 | ext4 | sustained | pinned | Aeron IPC | 1 | 3,603,440 | 3,603,440 | 0.26 | 2.94 | 36.24 ms | 78.38 ms | 30,359,971 (1.4 %) |
+| x86-64 | ext4 | sustained | pinned | Aeron IPC | 2 | 3,244,623 | 3,244,623 | 0.25 | 1.86 | 34.96 ms | 80.41 ms | 22,103,894 (1.1 %) |
+| x86-64 | ext4 | sustained-jvm-old | jvm-old | Chronicle Queue | 1 | 1,496,973 | 1,496,973 | 0.43 | 17.81 ms | 97.39 ms | 138.02 ms | 92,957,728 (10.2 %) |
+| x86-64 | ext4 | sustained-jvm-old | jvm-old | Aeron IPC | 1 | 3,424,955 | 3,424,955 | 0.25 | 1.09 | 6.32 | 7.76 ms | 19,620,806 (0.9 %) |
+| x86-64 | ext4 | sustained-others | pinned | yaque | 1 | 510,008 | 510,008 | 0.93 | 5.68 | 8.81 ms | 12.87 ms | 8,129,867 (2.6 %) |
+| x86-64 | ext4 | sustained-others | pinned | queue-file | 1 | 464,594 | 464,594 | writer only | writer only | writer only | writer only | 27,391,684 (9.7 %) |
+| x86-64 | ext4 | sustained-others | pinned | plain file | 1 | 858,252 | 858,252 | 0.81 | 3.79 | 16.69 ms | 122.09 ms | 7,911,298 (1.5 %) |
+| x86-64 | ext4 | tuned-sustained | tuned | tickertape | 1 | 1,193,977 | 1,193,977 | 0.33 | 1.80 | 315 | 1.42 ms | 16,211,557 (2.2 %) |
+| x86-64 | ext4 | tuned-sustained | tuned | Chronicle Queue | 1 | 1,528,357 | 1,528,357 | 0.43 | 19.10 ms | 97.78 ms | 140.64 ms | 113,619,547 (12.2 %) |
+| x86-64 | ext4 | tuned-sustained | tuned | Aeron IPC | 1 | 3,683,073 | 3,683,073 | 0.27 | 1.86 ms | 161.61 ms | 239.73 ms | 27,063,341 (1.2 %) |
+| x86-64 | xfs | sustained-journals | pinned | tickertape | 1 | 1,759,845 | 1,759,845 | 0.32 | 3.64 | 432 | 2.47 ms | 33,867,581 (3.2 %) |
+| x86-64 | xfs | sustained-journals | pinned | Chronicle Queue | 1 | 1,758,803 | 1,758,803 | 0.44 | 17.07 ms | 33.31 ms | 38.04 ms | 101,006,375 (9.4 %) |
+| aarch64 | ext4 | sustained | pinned | tickertape | 1 | 1,729,024 | 1,729,024 | 0.32 | 1.91 | 501 | 1.47 ms | 14,918,964 (1.4 %) |
+| aarch64 | ext4 | sustained | pinned | tickertape | 2 | 1,733,310 | 1,733,310 | 0.32 | 2.14 | 697 | 23.81 ms | 15,786,491 (1.5 %) |
+| aarch64 | ext4 | sustained | pinned | Chronicle Queue | 1 | 1,285,285 | 1,285,285 | 0.46 | 16.08 ms | 91.82 ms | 134.09 ms | 79,810,518 (10.2 %) |
+| aarch64 | ext4 | sustained | pinned | Chronicle Queue | 2 | 1,287,628 | 1,287,628 | 0.44 | 15.25 ms | 89.98 ms | 133.37 ms | 72,099,671 (9.2 %) |
+| aarch64 | ext4 | sustained | pinned | Aeron IPC | 1 | 1,623,026 | 1,623,026 | 0.42 | 1.80 | 26.02 ms | 167.64 ms | 8,084,373 (0.8 %) |
+| aarch64 | ext4 | sustained | pinned | Aeron IPC | 2 | 1,910,474 | 1,910,474 | 0.36 | 1.38 | 14.72 ms | 78.77 ms | 9,450,923 (0.8 %) |
+| aarch64 | ext4 | sustained-jvm-old | jvm-old | Chronicle Queue | 1 | 1,320,765 | 1,320,761 | 0.41 | 14.29 ms | 98.63 ms | 141.30 ms | 54,712,623 (6.8 %) |
+| aarch64 | ext4 | sustained-jvm-old | jvm-old | Aeron IPC | 1 | 1,785,835 | 1,785,835 | 0.39 | 1.51 | 4.66 | 20.32 ms | 8,925,432 (0.8 %) |
+| aarch64 | ext4 | sustained-others | pinned | yaque | 1 | 374,747 | 374,747 | 1.45 | 5.54 | 12.75 ms | 16.96 ms | 6,616,541 (2.9 %) |
+| aarch64 | ext4 | sustained-others | pinned | queue-file | 1 | 281,324 | 281,324 | writer only | writer only | writer only | writer only | 17,067,118 (9.9 %) |
+| aarch64 | ext4 | sustained-others | pinned | plain file | 1 | 566,898 | 566,898 | 1.27 | 4.05 | 18.32 ms | 139.59 ms | 5,494,720 (1.6 %) |
+| aarch64 | ext4 | tuned-sustained | tuned | tickertape | 1 | 1,728,550 | 1,728,550 | 0.32 | 1.96 | 745 | 127.60 ms | 14,569,988 (1.4 %) |
+| aarch64 | ext4 | tuned-sustained | tuned | Chronicle Queue | 1 | 1,313,857 | 1,313,857 | 0.44 | 14.99 ms | 83.23 ms | 135.92 ms | 142,612,709 (17.8 %) |
+| aarch64 | ext4 | tuned-sustained | tuned | Aeron IPC | 1 | 1,686,287 | 1,686,287 | 0.40 | 0.56 | 13.68 ms | 83.82 ms | 3,704,881 (0.4 %) |
+| aarch64 | xfs | sustained-journals | pinned | tickertape | 1 | 1,732,727 | 1,732,727 | 0.32 | 2.02 | 382 | 1.19 ms | 14,991,537 (1.4 %) |
+| aarch64 | xfs | sustained-journals | pinned | Chronicle Queue | 1 | 1,386,373 | 1,386,373 | 0.43 | 5.26 | 10.6 | 4.84 ms | 32,787,002 (3.9 %) |
+
+**SV, 1,024 B**
+
+| Machine | FS | Part | Config | Tool | Round | Target (records/s) | Achieved (records/s) | p50 | p99 | p99.9 | max | Late sends |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| x86-64 | ext4 | sustained | pinned | tickertape | 1 | 173,190 | 173,190 | 0.77 | 3.14 | 504 | 1.40 ms | 2,288,005 (2.2 %) |
+| x86-64 | ext4 | sustained | pinned | tickertape | 2 | 172,766 | 172,766 | 0.79 | 3.16 | 508 | 1.38 ms | 2,303,396 (2.2 %) |
+| x86-64 | ext4 | sustained | pinned | Chronicle Queue | 1 | 175,186 | 175,186 | 0.57 | 36.14 ms | 100.27 ms | 135.40 ms | 10,087,029 (9.4 %) |
+| x86-64 | ext4 | sustained | pinned | Chronicle Queue | 2 | 174,615 | 174,615 | 0.54 | 18.09 ms | 98.44 ms | 139.59 ms | 8,620,182 (8.1 %) |
+| x86-64 | ext4 | sustained | pinned | Aeron IPC | 1 | 2,087,513 | 2,087,513 | 0.43 | 21.74 ms | 107.41 ms | 125.96 ms | 32,620,896 (2.6 %) |
+| x86-64 | ext4 | sustained | pinned | Aeron IPC | 2 | 2,018,317 | 2,018,317 | 0.43 | 6.08 | 99.16 ms | 119.14 ms | 26,027,403 (2.1 %) |
+| x86-64 | ext4 | sustained-jvm-old | jvm-old | Chronicle Queue | 1 | 175,124 | 175,124 | 0.55 | 16.38 ms | 93.72 ms | 138.02 ms | 8,002,266 (7.5 %) |
+| x86-64 | ext4 | sustained-jvm-old | jvm-old | Aeron IPC | 1 | 2,074,370 | 2,074,370 | 0.42 | 2.70 ms | 99.61 ms | 159.51 ms | 28,166,634 (2.2 %) |
+| x86-64 | ext4 | sustained-others | pinned | yaque | 1 | 342,814 | 342,814 | 1.35 | 7.45 ms | 10.50 ms | 12.48 ms | 6,970,001 (3.3 %) |
+| x86-64 | ext4 | sustained-others | pinned | queue-file | 1 | 157,366 | 157,366 | writer only | writer only | writer only | writer only | 10,091,869 (10.5 %) |
+| x86-64 | ext4 | sustained-others | pinned | plain file | 1 | 174,390 | 174,390 | 1.19 | 5.70 | 96.93 ms | 140.12 ms | 1,145,757 (1.1 %) |
+| x86-64 | ext4 | tuned-sustained | tuned | tickertape | 1 | 169,748 | 169,748 | 0.80 | 3.31 | 492 | 1.69 ms | 2,695,504 (2.6 %) |
+| x86-64 | ext4 | tuned-sustained | tuned | Chronicle Queue | 1 | 173,582 | 173,582 | 0.58 | 17.73 ms | 102.04 ms | 143.52 ms | 8,130,548 (7.7 %) |
+| x86-64 | ext4 | tuned-sustained | tuned | Aeron IPC | 1 | 2,099,903 | 2,099,903 | 0.43 | 175.24 ms | 297.01 ms | 356.25 ms | 51,708,088 (4.0 %) |
+| x86-64 | xfs | sustained-journals | pinned | tickertape | 1 | 173,262 | 173,262 | 0.78 | 3.11 | 284 | 1.78 ms | 2,244,854 (2.1 %) |
+| x86-64 | xfs | sustained-journals | pinned | Chronicle Queue | 1 | 175,464 | 175,464 | 0.54 | 14.7 | 25.1 | 5.41 ms | 4,255,662 (4.0 %) |
+| aarch64 | ext4 | sustained | pinned | tickertape | 1 | 169,089 | 169,089 | 0.57 | 2.33 | 323 | 1.14 ms | 762,115 (0.7 %) |
+| aarch64 | ext4 | sustained | pinned | tickertape | 2 | 168,712 | 168,712 | 0.57 | 2.37 | 401 | 7.83 ms | 768,451 (0.7 %) |
+| aarch64 | ext4 | sustained | pinned | Chronicle Queue | 1 | 171,867 | 171,867 | 0.47 | 34.50 ms | 91.42 ms | 162.92 ms | 8,014,347 (7.6 %) |
+| aarch64 | ext4 | sustained | pinned | Chronicle Queue | 2 | 170,648 | 170,648 | 0.45 | 35.49 ms | 99.48 ms | 135.53 ms | 7,858,392 (7.5 %) |
+| aarch64 | ext4 | sustained | pinned | Aeron IPC | 1 | 1,388,341 | 1,388,341 | 0.48 | 2.91 | 84.28 ms | 166.20 ms | 12,895,874 (1.5 %) |
+| aarch64 | ext4 | sustained | pinned | Aeron IPC | 2 | 1,398,435 | 1,398,435 | 0.43 | 2.56 | 80.61 ms | 159.65 ms | 11,349,375 (1.3 %) |
+| aarch64 | ext4 | sustained-jvm-old | jvm-old | Chronicle Queue | 1 | 171,927 | 171,927 | 0.45 | 34.83 ms | 88.08 ms | 135.92 ms | 8,334,880 (7.9 %) |
+| aarch64 | ext4 | sustained-jvm-old | jvm-old | Aeron IPC | 1 | 1,225,940 | 1,225,940 | 0.49 | 2.21 | 56.52 ms | 93.59 ms | 8,699,802 (1.2 %) |
+| aarch64 | ext4 | sustained-others | pinned | yaque | 1 | 248,410 | 248,410 | 1.74 | 12.05 ms | 16.34 ms | 17.30 ms | 5,776,478 (3.8 %) |
+| aarch64 | ext4 | sustained-others | pinned | queue-file | 1 | 154,889 | 154,870 | writer only | writer only | writer only | writer only | 8,395,311 (8.9 %) |
+| aarch64 | ext4 | sustained-others | pinned | plain file | 1 | 171,198 | 171,198 | 1.48 | 7.32 | 87.43 ms | 138.54 ms | 1,347,724 (1.3 %) |
+| aarch64 | ext4 | tuned-sustained | tuned | tickertape | 1 | 169,294 | 169,294 | 0.57 | 2.24 | 318 | 1.15 ms | 562,803 (0.5 %) |
+| aarch64 | ext4 | tuned-sustained | tuned | Chronicle Queue | 1 | 171,886 | 171,885 | 0.52 | 35.75 ms | 98.57 ms | 143.79 ms | 7,838,169 (7.5 %) |
+| aarch64 | ext4 | tuned-sustained | tuned | Aeron IPC | 1 | 1,394,548 | 1,394,548 | 0.47 | 1.15 ms | 91.36 ms | 172.75 ms | 10,590,173 (1.2 %) |
+| aarch64 | xfs | sustained-journals | pinned | tickertape | 1 | 169,277 | 169,277 | 0.56 | 2.15 | 201 | 1.40 ms | 717,943 (0.7 %) |
+| aarch64 | xfs | sustained-journals | pinned | Chronicle Queue | 1 | 170,348 | 170,347 | 0.50 | 4.21 | 11.1 | 6.34 ms | 2,036,095 (2.0 %) |
+
+**SD, 64 B (paced at 50 % or 90 % of the probe, a sync every second)**
+
+| Machine | FS | Part | Config | Tool | Round | Target (records/s) | Achieved (records/s) | p50 | p99 | p99.9 | max | Late sends | Sync p50 | Sync p99 | Sync max |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| x86-64 | ext4 | sustained | pinned | tickertape | 1 | 1,771,815 | 1,771,814 | 0.32 | 12.2 | 2.39 ms | 4.89 ms | 89,721,732 (8.3 %) | 2.95 ms | 3.87 ms | 4.21 ms |
+| x86-64 | ext4 | sustained | pinned | tickertape | 2 | 1,764,927 | 1,764,926 | 0.32 | 15.8 | 1.83 ms | 3.76 ms | 91,871,125 (8.5 %) | 2.34 ms | 3.63 ms | 3.80 ms |
+| x86-64 | ext4 | sustained | pinned | Chronicle Queue | 1 | 1,530,662 | 1,530,112 | 147.46 ms | 358.09 ms | 369.62 ms | 404.49 ms | 818,418,159 (87.7 %) | 361.50 ms | 382.73 ms | 404.49 ms |
+| x86-64 | ext4 | sustained | pinned | Chronicle Queue | 2 | 1,476,421 | 1,476,421 | 125.70 ms | 344.98 ms | 352.06 ms | 413.93 ms | 735,524,866 (81.7 %) | 348.65 ms | 366.22 ms | 413.66 ms |
+| x86-64 | ext4 | sustained-jvm-old | jvm-old | Chronicle Queue | 1 | 1,496,973 | 1,496,973 | 0.47 | 149.68 ms | 174.72 ms | 186.52 ms | 354,007,436 (38.8 %) | 102.56 ms | 184.55 ms | 186.38 ms |
+| x86-64 | ext4 | tuned-sustained | tuned | tickertape | 1 | 1,193,977 | 1,193,977 | 0.33 | 2.64 | 1.50 ms | 3.75 ms | 20,766,590 (2.9 %) | 2.20 ms | 3.51 ms | 3.74 ms |
+| x86-64 | ext4 | tuned-sustained | tuned | Chronicle Queue | 1 | 1,528,357 | 1,528,357 | 141.69 ms | 357.30 ms | 362.02 ms | 390.07 ms | 800,189,839 (85.8 %) | 362.02 ms | 367.26 ms | 390.07 ms |
+| x86-64 | ext4 | sustained-90 | pinned | tickertape | 1 | 3,188,198 | 3,188,133 | 0.34 | 42.66 ms | 49.64 ms | 54.20 ms | 755,766,930 (38.9 %) | 44.11 ms | 53.02 ms | 54.20 ms |
+| x86-64 | ext4 | sustained-90 | pinned | Chronicle Queue | 1 | 2,650,462 | **failed** | **failed twice: `IllegalStateException: reader timed out`** | | | | | | | |
+| x86-64 | xfs | sustained-journals | pinned | tickertape | 1 | 1,759,845 | 1,759,845 | 0.32 | 18.2 | 1.21 ms | 2.75 ms | 87,240,112 (8.1 %) | 1.76 ms | 2.61 ms | 2.75 ms |
+| x86-64 | xfs | sustained-journals | pinned | Chronicle Queue | 1 | 1,758,803 | 1,623,487 | 24.71 s | 50.33 s | 50.94 s | 51.07 s | 1,071,257,697 (99.8 %) | 381.16 ms | 603.98 ms | 614.47 ms |
+| x86-64 | xfs | sustained-90 | pinned | tickertape | 1 | 3,189,160 | 3,189,073 | 0.37 | 156.37 ms | 175.37 ms | 184.03 ms | 872,992,555 (44.9 %) | 46.92 ms | 181.27 ms | 184.03 ms |
+| x86-64 | xfs | sustained-90 | pinned | Chronicle Queue | 1 | 3,144,333 | **failed** | **failed twice: `IllegalStateException: reader timed out`** | | | | | | | |
+| aarch64 | ext4 | sustained | pinned | tickertape | 1 | 1,729,024 | 1,729,024 | 0.32 | 2.55 | 989 | 2.37 ms | 17,679,552 (1.7 %) | 1.38 ms | 2.18 ms | 2.36 ms |
+| aarch64 | ext4 | sustained | pinned | tickertape | 2 | 1,733,310 | 1,733,310 | 0.31 | 5.09 | 1.80 ms | 42.01 ms | 19,619,039 (1.9 %) | 1.49 ms | 14.75 ms | 41.94 ms |
+| aarch64 | ext4 | sustained | pinned | Chronicle Queue | 1 | 1,285,285 | 1,285,285 | 56.72 ms | 298.06 ms | 302.78 ms | 333.19 ms | 509,395,326 (65.0 %) | 302.78 ms | 307.23 ms | 325.84 ms |
+| aarch64 | ext4 | sustained | pinned | Chronicle Queue | 2 | 1,287,628 | 1,287,628 | 55.51 ms | 301.20 ms | 381.68 ms | 540.02 ms | 507,528,815 (64.6 %) | 303.82 ms | 366.74 ms | 540.02 ms |
+| aarch64 | ext4 | sustained-jvm-old | jvm-old | Chronicle Queue | 1 | 1,320,765 | 1,320,762 | 0.45 | 149.16 ms | 177.08 ms | 189.27 ms | 262,885,641 (32.6 %) | 97.98 ms | 187.17 ms | 188.87 ms |
+| aarch64 | ext4 | tuned-sustained | tuned | tickertape | 1 | 1,728,550 | 1,728,550 | 0.31 | 12.5 | 2.36 ms | 98.76 ms | 18,070,009 (1.7 %) | 1.76 ms | 15.40 ms | 98.76 ms |
+| aarch64 | ext4 | tuned-sustained | tuned | Chronicle Queue | 1 | 1,313,857 | 1,313,857 | 88.34 ms | 563.61 ms | 741.87 ms | 889.72 ms | 580,247,559 (72.4 %) | 310.12 ms | 579.86 ms | 638.06 ms |
+| aarch64 | ext4 | sustained-90 | pinned | tickertape | 1 | 3,116,450 | 3,116,450 | 0.32 | 114.03 ms | 267.12 ms | 326.89 ms | 161,699,921 (8.5 %) | 2.86 ms | 210.50 ms | 326.89 ms |
+| aarch64 | ext4 | sustained-90 | pinned | Chronicle Queue | 1 | 2,323,911 | **failed** | **failed twice: `IllegalStateException: reader timed out`** | | | | | | | |
+| aarch64 | xfs | sustained-journals | pinned | tickertape | 1 | 1,732,727 | 1,732,727 | 0.32 | 2.77 | 1.02 ms | 2.38 ms | 17,365,838 (1.6 %) | 1.39 ms | 2.27 ms | 2.37 ms |
+| aarch64 | xfs | sustained-journals | pinned | Chronicle Queue | 1 | 1,386,373 | 1,386,373 | 134.87 ms | 396.89 ms | 566.76 ms | 692.58 ms | 697,557,997 (82.5 %) | 352.32 ms | 468.98 ms | 573.05 ms |
+| aarch64 | xfs | sustained-90 | pinned | tickertape | 1 | 3,117,848 | 3,117,848 | 0.33 | 939.52 ms | 1.17 s | 1.26 s | 400,830,384 (21.1 %) | 4.75 ms | 418.12 ms | 784.86 ms |
+| aarch64 | xfs | sustained-90 | pinned | Chronicle Queue | 1 | 2,701,934 | **failed** | **failed twice: `IllegalStateException: reader timed out`** | | | | | | | |
+
+**SD, 1,024 B**
+
+| Machine | FS | Part | Config | Tool | Round | Target (records/s) | Achieved (records/s) | p50 | p99 | p99.9 | max | Late sends | Sync p50 | Sync p99 | Sync max |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| x86-64 | ext4 | sustained | pinned | tickertape | 1 | 173,190 | 173,190 | 0.78 | 3.93 | 2.11 ms | 4.12 ms | 2,526,439 (2.4 %) | 2.99 ms | 3.85 ms | 4.11 ms |
+| x86-64 | ext4 | sustained | pinned | tickertape | 2 | 172,766 | 172,766 | 0.79 | 3.67 | 1.55 ms | 3.82 ms | 2,446,300 (2.3 %) | 2.29 ms | 3.63 ms | 3.81 ms |
+| x86-64 | ext4 | sustained | pinned | Chronicle Queue | 1 | 175,186 | 175,186 | 34.83 ms | 505.94 ms | 515.64 ms | 592.97 ms | 60,368,500 (56.5 %) | 516.16 ms | 527.43 ms | 592.97 ms |
+| x86-64 | ext4 | sustained | pinned | Chronicle Queue | 2 | 174,615 | 174,615 | 36.41 ms | 504.10 ms | 513.80 ms | 528.22 ms | 60,249,930 (56.6 %) | 514.33 ms | 516.42 ms | 527.96 ms |
+| x86-64 | ext4 | sustained-jvm-old | jvm-old | Chronicle Queue | 1 | 175,124 | 175,124 | 0.56 | 133.37 ms | 168.95 ms | 186.38 ms | 23,062,100 (21.6 %) | 119.87 ms | 184.29 ms | 186.38 ms |
+| x86-64 | ext4 | tuned-sustained | tuned | tickertape | 1 | 169,748 | 169,748 | 0.78 | 3.35 | 1.54 ms | 4.10 ms | 2,893,947 (2.8 %) | 2.25 ms | 3.85 ms | 4.09 ms |
+| x86-64 | ext4 | tuned-sustained | tuned | Chronicle Queue | 1 | 173,582 | 173,582 | 30.06 ms | 501.74 ms | 511.71 ms | 604.50 ms | 59,042,308 (55.8 %) | 511.44 ms | 516.42 ms | 604.50 ms |
+| x86-64 | ext4 | sustained-90 | pinned | tickertape | 1 | 311,208 | 311,208 | 0.79 | 4.43 | 2.13 ms | 4.71 ms | 6,972,392 (3.7 %) | 2.78 ms | 4.11 ms | 4.70 ms |
+| x86-64 | ext4 | sustained-90 | pinned | Chronicle Queue | 1 | 315,324 | 307,301 | 10.58 s | 18.20 s | 18.71 s | 18.84 s | 191,305,437 (99.5 %) | 1.34 s | 5.16 s | 6.34 s |
+| x86-64 | xfs | sustained-journals | pinned | tickertape | 1 | 173,262 | 173,262 | 0.78 | 3.38 | 1.17 ms | 2.86 ms | 2,278,220 (2.2 %) | 1.98 ms | 2.65 ms | 2.86 ms |
+| x86-64 | xfs | sustained-journals | pinned | Chronicle Queue | 1 | 175,464 | 175,464 | 39.42 ms | 512.23 ms | 523.50 ms | 790.63 ms | 60,006,370 (56.1 %) | 521.67 ms | 524.55 ms | 730.86 ms |
+| x86-64 | xfs | sustained-90 | pinned | tickertape | 1 | 311,174 | 311,174 | 0.78 | 3.98 | 1.66 ms | 3.45 ms | 6,430,685 (3.4 %) | 2.40 ms | 3.25 ms | 3.45 ms |
+| x86-64 | xfs | sustained-90 | pinned | Chronicle Queue | 1 | 315,910 | 308,483 | 8.17 s | 15.89 s | 16.65 s | 16.93 s | 191,220,735 (99.2 %) | 1.82 s | 4.94 s | 5.37 s |
+| aarch64 | ext4 | sustained | pinned | tickertape | 1 | 169,089 | 169,089 | 0.56 | 2.62 | 837 | 2.52 ms | 857,749 (0.8 %) | 1.39 ms | 2.21 ms | 2.39 ms |
+| aarch64 | ext4 | sustained | pinned | tickertape | 2 | 168,712 | 168,712 | 0.56 | 2.73 | 1.60 ms | 76.55 ms | 915,175 (0.9 %) | 1.40 ms | 25.44 ms | 76.55 ms |
+| aarch64 | ext4 | sustained | pinned | Chronicle Queue | 1 | 171,867 | 171,867 | 21.92 ms | 500.17 ms | 621.28 ms | 845.15 ms | 56,911,350 (54.3 %) | 506.99 ms | 611.32 ms | 845.15 ms |
+| aarch64 | ext4 | sustained | pinned | Chronicle Queue | 2 | 170,648 | 170,648 | 19.91 ms | 492.31 ms | 502.27 ms | 514.33 ms | 56,265,494 (54.1 %) | 502.79 ms | 504.37 ms | 514.33 ms |
+| aarch64 | ext4 | sustained-jvm-old | jvm-old | Chronicle Queue | 1 | 171,927 | 171,927 | 0.47 | 133.76 ms | 170.92 ms | 189.53 ms | 22,452,728 (21.4 %) | 115.87 ms | 187.17 ms | 188.74 ms |
+| aarch64 | ext4 | tuned-sustained | tuned | tickertape | 1 | 169,294 | 169,294 | 0.56 | 2.39 | 1.13 ms | 15.48 ms | 681,433 (0.7 %) | 1.67 ms | 8.90 ms | 15.47 ms |
+| aarch64 | ext4 | tuned-sustained | tuned | Chronicle Queue | 1 | 171,886 | 171,886 | 18.97 ms | 496.76 ms | 506.46 ms | 732.43 ms | 56,325,652 (53.7 %) | 506.46 ms | 509.08 ms | 731.91 ms |
+| aarch64 | ext4 | sustained-90 | pinned | tickertape | 1 | 305,024 | 305,024 | 0.57 | 73.99 ms | 123.40 ms | 141.43 ms | 12,570,694 (6.8 %) | 36.21 ms | 138.02 ms | 141.43 ms |
+| aarch64 | ext4 | sustained-90 | pinned | Chronicle Queue | 1 | 309,364 | 309,050 | 1.05 s | 2.64 s | 3.07 s | 3.28 s | 175,511,729 (93.0 %) | 2.08 s | 3.06 s | 3.28 s |
+| aarch64 | xfs | sustained-journals | pinned | tickertape | 1 | 169,277 | 169,277 | 0.56 | 2.36 | 783 | 2.44 ms | 742,239 (0.7 %) | 1.38 ms | 2.25 ms | 2.43 ms |
+| aarch64 | xfs | sustained-journals | pinned | Chronicle Queue | 1 | 170,348 | 170,348 | 61.70 ms | 552.08 ms | 755.50 ms | 1.12 s | 59,887,739 (57.6 %) | 556.79 ms | 664.80 ms | 1.12 s |
+| aarch64 | xfs | sustained-90 | pinned | tickertape | 1 | 304,583 | 304,583 | 0.57 | 786.96 ms | 1.39 s | 1.69 s | 27,551,724 (14.8 %) | 100.66 ms | 1.19 s | 1.69 s |
+| aarch64 | xfs | sustained-90 | pinned | Chronicle Queue | 1 | 307,434 | 306,863 | 1.14 s | 2.92 s | 3.40 s | 3.61 s | 172,323,325 (91.9 %) | 2.13 s | 3.29 s | 3.52 s |
+
+- **Probes** (the one comparison at the same question). At 64 B tickertape's unpaced rate was above Chronicle Queue's on
+  ext4 (pinned: 3,529,856–3,543,632 against 2,952,843–3,061,325 on x86-64, 3,458,048–3,466,622 against
+  2,570,572–2,575,258 on aarch64) and on aarch64 xfs (3,464,276–3,465,454 against 2,772,747–3,002,149), level on x86-64
+  xfs (3,519,690–3,543,512 against 3,493,704–3,517,607), and below it on the tuned x86-64 boot (2,387,955 against
+  3,056,715). In the x86-64 64 B ext4 probes Chronicle's reader p99.9 was lower (6.50–6.53 against 8.34–8.63 µs).
+  tickertape's probe reader maximum was above Chronicle's in 18 of the 20 pinned probe pairs (x86-64 64 B ext4:
+  312.74–355.47 against 143.65–143.79 ms; x86-64 64 B xfs: 25.82–33.91 against 4.66–4.75 ms; the exceptions: x86-64 64 B
+  in `sustained-90` ext4 and aarch64 1,024 B in round 2), while its probe p99.9 at 1,024 B was lower in all ten 1,024 B
+  pairs (x86-64 ext4: 28.9–29.1 against 33.5–33.9 µs). Aeron IPC (pinned, ext4) was above both on x86-64
+  (6,489,247–7,206,880); on aarch64 it was below tickertape in round 1 (3,246,052 against 3,458,048) and above in round
+  2 (3,820,950 against 3,466,622). At 1,024 B Chronicle's rate was above tickertape's in all ten pinned pairs of probes
+  (both machines, ext4 and xfs, every part), by 0.6–1.6 %, and the plain file's single probes too (348,781 on x86-64,
+  342,397 on aarch64). yaque's 1,024 B probes (685,628 and 496,821) stopped at the record cap after 327 and 451 s, not
+  at the ten minutes. At 1,024 B the probe measures the disk, not the tool: tickertape and Chronicle reached
+  337,424–351,012 records/s in every part (345.5–359.4 MB/s of payload), and 337,424–350,374 in the pinned ext4 rounds
+  (345.5–358.8 MB/s), against a device that writes at most 351 MB/s by itself in raw `fio` jobs; payload accepted is not
+  bytes written to the device, and an unpaced run holds gigabytes of pages not yet written back in the page cache (the
+  disk section). Aeron (pinned, ext4) reached 2,776,684–4,175,027 at 1,024 B, eight to twelve times as many: it writes
+  no durable journal, though its file-backed term buffers are written back to the same disk.
+- **SV at half of each tool's own rate, `pinned`, ext4** (targets: tickertape 1,729,024–1,771,815 records/s at 64 B and
+  168,712–173,190 at 1,024 B; Chronicle 1,285,285–1,530,662 and 170,648–175,186; Aeron 1,623,026–3,603,440 and
+  1,388,341–2,087,513). tickertape's reader p99.9 was 323–697 µs and its maximum 1.14–23.81 ms (the 23.81 ms in aarch64
+  round 2); Chronicle Queue's p99.9 89.98–102.69 ms (maxima 133.37–162.92 ms; 88.08–98.63 ms with the old settings) and
+  Aeron's 14.72–107.41 ms (maxima 78.38–167.64 ms; at 64 B 4.66–6.32 µs with the old settings; cause not traced). The
+  plain file, which like Chronicle has no early write-back, showed a tail of the same size at 1,024 B (87.43–96.93 ms,
+  at 174,390 and 171,198 records/s; 16.69–18.32 ms at 64 B), and on xfs Chronicle's tail was 10.6–25.1 µs in three of
+  four cells (next item). That points at ext4 write-back as seen by tools without early write-back rather than at
+  Chronicle's reader, as an observation; it was not traced.
+- **SV on xfs** (`sustained-journals`, n = 1): **Chronicle Queue's reader p99.9 was lower than tickertape's in three of
+  the four cells** (x86-64 1,024 B: 25.1 against 284 µs; aarch64 64 B: 10.6 against 382 µs; aarch64 1,024 B: 11.1
+  against 201 µs) and higher in one (x86-64 64 B: 33.31 ms against 432 µs, at nearly the same targets, 1,758,803 and
+  1,759,845 records/s). tickertape's maxima were lower in all four (1.19–2.47 ms against 4.84–38.04 ms).
+- **SD at half of each tool's own rate** (`pinned`, ext4 and xfs; the same targets as SV). A tickertape checkpoint took
+  1.38–2.99 ms (median; maxima 2.36–76.55 ms per run), its reader's p99.9 783 µs to 2.39 ms; Chronicle Queue's
+  synchronous store flush took 302.78–556.79 ms (median; maxima 325.84 ms to 1.12 s), its reader's p99.9 302.78–755.50
+  ms, except on x86-64 xfs at 64 B, where Chronicle did not keep its schedule (1,623,487 of 1,758,803 records/s; reader
+  p99.9 50.94 s). This is not the same work. tickertape's early write-back starts writing each MiB as soon as the writer
+  has passed it, so when the checkpoint starts most of the second's data is already on its way to the device;
+  Chronicle's `msync` appears to write the second's data then, on the writer's thread (`bgMicroTouch()`, a background
+  `msync`, was not used): one second of Chronicle's 1,024 B records at its 175,186 records/s target is at least 182 MB
+  (payload and 16 B envelope), 0.52 s at 351 MB/s, consistent with its flush medians at 1,024 B on ext4 of 502.79–516.16
+  ms; not traced. With its old settings, at nearly the same rate (175,124 records/s on x86-64), the flush took
+  97.98–119.87 ms, which this does not explain. A tickertape checkpoint without early write-back became durable 0.93 s
+  after its request at about 90 % of the device's rate in later tickertape-only runs (the disk section). These machine
+  types' local SSDs report a write-through cache in the other sessions (the rerun's environment files do not record it),
+  and if that held here, no sync paid for a drive-cache flush.
+- **SD at 90 % of the probe.** tickertape stalled at 64 B on both machines (reader p99.9 49.64 ms on x86-64 ext4, 175.37
+  ms on x86-64 xfs, 267.12 ms on aarch64 ext4, 1.17 s on aarch64 xfs; on x86-64 38.9 % and 44.9 % of the sends were
+  late) and at 1,024 B on aarch64 (123.40 ms on ext4, 1.39 s on xfs), not at 1,024 B on x86-64 (2.13 ms and 1.66 ms).
+  Reader p99.9 is the delay from scheduled send to read; it does not say where the delay arose. Its checkpoints kept the
+  one-second grid in five of six runs (610 each); on aarch64 xfs at 1,024 B, 601 ran and 9 grid points were missed
+  (checkpoint median 100.66 ms, max 1.69 s). Chronicle Queue's 64 B cell failed (below); at 1,024 B it did not hold its
+  schedule either: 307,301 of 315,324 records/s on x86-64 ext4 (99.5 % of sends late, 293 flushes, 332 missed grid
+  points), 308,483 of 315,910 on x86-64 xfs, 309,050 of 309,364 on aarch64 ext4 and 306,863 of 307,434 on aarch64 xfs;
+  its reader's p99.9 was 3.07–18.71 s. The earlier sessions' 31 s backlog of tickertape on x86-64 xfs did not recur
+  (maximum 184.03 ms).
+- **Old settings in the sustained mode** (`sustained-jvm-old`, hours after `sustained`, single runs at each tool's own
+  old-settings rate). Both JVM tools' paced figures were worse with the new settings than in these later runs with the
+  old ones: Chronicle Queue's SD flush median 302.78–516.16 ms on ext4 against 97.98–119.87 ms, its SD reader p99.9
+  302.78–621.28 ms against 168.95–177.08 ms, and Aeron's 64 B SV reader p99.9 14.72–36.24 ms against 4.66–6.32 µs (6.32
+  on x86-64, 4.66 on aarch64). The two configurations differ in five settings and in JVM logging, and the runs differ in
+  time and rate; which difference does it was not measured (the plan has no single-setting sustained rows). The probes,
+  the rows the plan compares, moved less: Chronicle Queue's old-settings probes were within its two new-settings probes
+  or up to 2.6 % above their upper end (aarch64 64 B: 2,641,531 against 2,570,572–2,575,258), Aeron's within them except
+  at 1,024 B on aarch64 (2,451,881 against 2,776,684–2,796,872).
+
+### Chronicle Queue and Aeron under the old and the new settings
+
+Derived from the short-mode tables above (ext4, n = 4 each). `jvm-old` is "old settings, new harness", not the old
+harness.
+
+**Chronicle Queue**
+
+| Workload | Payload, rate | x86-64: old settings (`jvm-old`) | `microtouch-only` | new settings (`pinned`) | aarch64: `jvm-old` | `microtouch-only` | `pinned` |
+|---|---|---|---|---|---|---|---|
+| W1-cold, million records/s | 64 B | 6.73–7.36 | 6.83–7.37 | 8.47–8.53 | 4.66–4.78 | 4.63–4.76 | 5.49–5.53 |
+| W1-cold, million records/s | 1,024 B | 2.19–2.38 | 2.06–2.37 | 2.82–2.87 | 1.70–1.94 | 1.72–1.79 | 2.76–2.83 |
+| W1-steady, million records/s | 64 B | 7.10–7.49 | 7.26–7.38 | 8.54–8.69 | 4.79–4.85 | 4.66–4.81 | 5.57–5.60 |
+| W1-steady, million records/s | 1,024 B | 2.28–2.32 | 2.20–2.34 | 2.93–3.04 | 1.86–2.04 | 1.92–2.14 | 2.97–3.07 |
+| W3, million records/s | 64 B | 30.15–31.88 | 28.72–32.75 | 35.57–36.77 | 19.44–24.95 | 19.68–23.94 | 28.17–29.30 |
+| W3, million records/s | 1,024 B | 6.52–8.53 | 5.88–7.32 | 10.28–10.59 | 4.02–6.61 | 4.41–7.55 | 15.31–17.12 |
+| W2 reader p99.9, µs | 64 B, 10,000/s | 2.45–3.51 | 1.90–1.99 | 1.68–1.83 | 2.13–2.24 | 1.59–3.89 | 0.73–0.78 |
+| W2 reader p99.9, µs | 64 B, 100,000/s | 28.6–29.2 | 17.8–18.2 | 11.8–15.3 | 25.1–27.1 | 12.7–18.1 | 7.85–13.3 |
+| W2 reader p99.9, µs | 1,024 B, 10,000/s | 34.8–36.8 | 2.35–2.51 | 2.36 µs to 15.75 ms | 36.4–37.6 | 2.71–2.94 | 2.77–3.46 |
+| W2 reader p99.9, µs | 1,024 B, 100,000/s | 35.4–37.4 | 25.2–26.2 | 23.9–24.6 | 33.7–35.2 | 18.7–29.2 | 14.5–16.3 |
+
+**Aeron IPC, W2 reader p99.9 (µs)**
+
+| Payload, rate | x86-64: old settings (`jvm-old`) | new settings (`pinned`) | aarch64: `jvm-old` | `pinned` |
+|---|---|---|---|---|
+| 64 B, 10,000/s | 3.67–4.36 | 2.56–5.65 | 6.57–7.67 | 5.56–7.34 |
+| 64 B, 100,000/s | 0.83–4.99 | 0.39–3.47 | 3.07–5.92 | 0.62–3.03 |
+| 1,024 B, 10,000/s | 3.13–7.72 | 3.26–3.64 | 4.80–6.00 | 4.57–5.96 |
+| 1,024 B, 100,000/s | 0.77–4.96 | 0.77–5.58 | 0.81–2.90 | 0.82–2.71 |
+
+- **The reader of the earlier comparison was right that its settings handicapped Chronicle Queue.** With the new
+  settings Chronicle appended faster in every W1 cell (W1-cold 1,024 B on aarch64: 2.76–2.83 against 1.70–1.94),
+  replayed faster in every W3 cell (1,024 B on aarch64: 15.31–17.12 against 4.02–6.61), and its reader's p99.9 was lower
+  in every W2 run but one, most at 1,024 B × 10,000 records/s (34.8–36.8 µs before, 2.36–2.82 µs in three of four runs
+  on x86-64 after; the fourth had 15.75 ms). `microTouch()` alone brought none of the W1 and W3 gain (it only runs while
+  the writer waits) and most of the W2 gain at 1,024 B × 10,000 records/s on both machines and at 64 B × 10,000
+  records/s on x86-64 (on aarch64 its runs spread from 1.59 to 3.89 µs); the rest of the new settings (the long warm-up,
+  the 1 GiB `blockSize`, the JVM logs) brought the rest, and the rows do not separate them.
+- **Cells that changed sides** against tickertape's zero-copy reader (W2 p99.9, µs; tickertape's row is the same in both
+  comparisons): x86-64 64 B × 10,000/s, tickertape 2.17–2.35, Chronicle 2.45–3.51 old and 1.68–1.83 new; x86-64 1,024 B
+  × 10,000/s, 4.60–6.84 against 34.8–36.8 old and 2.36–2.82 new in three of four runs; x86-64 1,024 B × 100,000/s,
+  28.6–29.8 against 35.4–37.4 and 23.9–24.6; aarch64 1,024 B × 10,000/s, 8.73–9.10 against 36.4–37.6 and 2.77–3.46;
+  aarch64 1,024 B × 100,000/s, 24.8–28.5 against 33.7–35.2 and 14.5–16.3. Under the old settings tickertape was lower in
+  all five; under the new ones Chronicle is (at x86-64 1,024 B × 10,000/s in three of its four runs).
+- Aeron's W2 p99.9 did not change beyond the spread of its runs.
+
+### The failed cell
+
+Chronicle Queue's SD run at 90 % of its probe with 64 B records failed: in each of the four machine and file-system
+combinations both attempts failed (eight attempts; the unit was run once more after its part, as the plan says). The
+error, from `children.log`, the same in all eight:
+
+```text
+Exception in thread "main" java.lang.IllegalStateException: reader timed out
+	at compare.Harness$Poller.poll(Harness.java:205)
+	at compare.Harness.run(Harness.java:393)
+	at compare.Main.main(Main.java:64)
+```
+
+This is the harness's reader reaching its deadline (`Harness.TIMEOUT`, 120 s, line 35; the deadline is set at the start
+barrier to that plus the schedule's length, line 390) before it had seen every scheduled record, so the backlog at the
+end exceeded about two minutes. `children.log` has no other error (the writer's result is empty because the run was
+stopped); Chronicle Queue did not report a failure, and the cause was not established. No latency figure exists for the
+cell. The rates it would have run at are in the SD table (2,323,911–3,144,333 records/s). The other runs of those units
+completed and passed validation and are in the tables (the probes and SD at 1,024 B). This failure is what happened to
+Chronicle Queue in that cell; it says nothing about tickertape, whose run at its own 90 % rate is in the same table.
+
+### Probe drift between parts
+
+The pinned probes of one tool and file system, in the order they ran (records/s; later probe ÷ first probe):
+
+| Machine | FS | Tool | Payload | Probes in order | Ratios |
+|---|---|---|---|---|---|
+| x86-64 | ext4 | tickertape | 64 B | `sustained` r1 3,543,632; r2 3,529,856; `sustained-90` 3,542,443 | 0.996, 1.000 |
+| x86-64 | ext4 | tickertape | 1,024 B | 346,382; 345,534; 345,787 | 0.998, 0.998 |
+| x86-64 | ext4 | Chronicle Queue | 64 B | 3,061,325; 2,952,843; 2,944,959 | 0.965, 0.962 |
+| x86-64 | ext4 | Chronicle Queue | 1,024 B | 350,374; 349,231; 350,361 | 0.997, 1.000 |
+| x86-64 | ext4 | Aeron IPC | 64 B | 7,206,880; 6,489,247 | 0.900 |
+| x86-64 | ext4 | Aeron IPC | 1,024 B | 4,175,027; 4,036,635 | 0.967 |
+| x86-64 | xfs | tickertape | 64 B | `sustained-journals` 3,519,690; `sustained-90` 3,543,512 | 1.007 |
+| x86-64 | xfs | tickertape | 1,024 B | 346,525; 345,749 | 0.998 |
+| x86-64 | xfs | Chronicle Queue | 64 B | 3,517,607; 3,493,704 | 0.993 |
+| x86-64 | xfs | Chronicle Queue | 1,024 B | 350,929; 351,012 | 1.000 |
+| aarch64 | ext4 | tickertape | 64 B | 3,458,048; 3,466,622; 3,462,723 | 1.002, 1.001 |
+| aarch64 | ext4 | tickertape | 1,024 B | 338,179; 337,424; 338,916 | 0.998, 1.002 |
+| aarch64 | ext4 | Chronicle Queue | 64 B | 2,570,572; 2,575,258; 2,582,124 | 1.002, 1.004 |
+| aarch64 | ext4 | Chronicle Queue | 1,024 B | 343,736; 341,297; 343,739 | 0.993, 1.000 |
+| aarch64 | ext4 | Aeron IPC | 64 B | 3,246,052; 3,820,950 | 1.177 |
+| aarch64 | ext4 | Aeron IPC | 1,024 B | 2,776,684; 2,796,872 | 1.007 |
+| aarch64 | xfs | tickertape | 64 B | 3,465,454; 3,464,276 | 1.000 |
+| aarch64 | xfs | tickertape | 1,024 B | 338,555; 338,426 | 1.000 |
+| aarch64 | xfs | Chronicle Queue | 64 B | 2,772,747; 3,002,149 | 1.083 |
+| aarch64 | xfs | Chronicle Queue | 1,024 B | 340,696; 341,594 | 1.003 |
+
+- **Aeron's two rounds at 64 B differ at or beyond the playbook's 10 % threshold**: round 2 was 0.900 times round 1 on
+  x86-64 and 1.177 times on aarch64. Its SV and SD rows of the two rounds are therefore paced at rates that differ by as
+  much (3,603,440 and 3,244,623 records/s on x86-64; 1,623,026 and 1,910,474 on aarch64).
+- Chronicle Queue's aarch64 xfs probe at 64 B rose by 8.3 % from the first part to the second; its x86-64 ext4 probe at
+  64 B fell by 3.5–3.8 %. tickertape's probes moved by at most 0.7 %.
+- The xfs probes of tickertape (its writes to a fresh file system first) and Chronicle (on one already written) do not
+  show an order effect beyond these.
+
+### Interrupts on the tuned CPUs
+
+`/proc/interrupts` was captured five times during the tuned parts on each machine (x86-64 at 10:50, 11:00, 11:30, 12:30
+and 13:30 UTC; aarch64 at 11:00, 11:10, 11:40, 12:40 and 13:40), with `/proc/irq/*/effective_affinity_list`. The
+captures do not cover the last 70 minutes of the tuned sustained part (Aeron), and an interval covers several units, so
+the counts cannot be attributed to a tool. Interrupts on CPU 1 (the writer's) between captures:
+
+| Interval (UTC) | x86-64: TLB shootdowns | function calls | IRQ work | local timer | network queues (gVNIC) |
+|---|---|---|---|---|---|
+| 10:50–11:00 | 1,942,342 | 1,943,631 | 75 | 41 | 129 |
+| 11:00–11:30 | 1,442,594 | 1,443,393 | 285 | 184 | 251 |
+| 11:30–12:30 | 26,207,269 | 26,227,506 | 54,452 | 588 | 292 |
+| 12:30–13:30 | 74,360,910 | 74,481,299 | 62,956 | 790 | 295 |
+
+| Interval (UTC) | aarch64: function calls (IPI) | IRQ work | arch timer | NVMe queue `nvme0q2` (the data disk) | network queues (gVNIC) |
+|---|---|---|---|---|---|
+| 11:00–11:10 | 2,898 | 115 | 76 | 1,322 | 37 |
+| 11:10–11:40 | 536 | 275 | 179 | 0 | 3,592 |
+| 11:40–12:40 | 175,471 | 49,566 | 47,725 | 29,482 | 81 |
+| 12:40–13:40 | 267,328 | 83,525 | 82,554 | 449,779 | 858 |
+
+At the last capture eight interrupt lines on x86-64 (four gVNIC notification blocks each on CPU 1 and CPU 2) and nine on
+aarch64 (four gVNIC blocks and five NVMe queues of the two data disks) had an effective affinity of CPU 1 or 2:
+`irqaffinity` only sets the default, and managed and driver-placed lines stay where they are. The isolation itself held
+(the measured threads alone on their CPUs, read back from `/proc` in every result), but **the tuned CPUs were not
+interrupt-free**. These are observations over capture intervals that contain several units; they do not isolate one
+tool, and their source was not traced. The kernel sends TLB shootdowns to the CPUs that run a process whose mappings
+change, so they may be the tool's own: the x86-64 interval 10:50–11:00 lies inside tickertape's tuned short unit
+(10:47–11:03) and brought 1,942,342 TLB shootdowns to CPU 1, against 1,442,594 in the next 30 minutes (the end of that
+unit, then mostly Chronicle Queue and Aeron); the intervals with 26–74 million (11:30–13:30) contain tickertape's tuned
+sustained unit (11:56–12:57) and the first hour of Chronicle's (from 12:57). On aarch64 the first capture (11:00) came
+after most of tickertape's tuned short unit (10:49–11:06). The `tuned` rows are an isolated boot with these interrupts,
+not the upper bound of the machine.
+
+### Sample spread
+
+Every `pinned` short-mode cell whose largest sample is more than 10 % above its smallest (the playbook's threshold; W1
+and W3 throughput, W2 p99.9):
+
+| Machine | FS | Tool | Cell | Range | max ÷ min |
+|---|---|---|---|---|---|
+| x86-64 | ext4 | tickertape | W1-cold, 64 B | 19.11–30.84 | 1.61 |
+| x86-64 | ext4 | tickertape | W1-cold, 1,024 B | 2.61–3.08 | 1.18 |
+| x86-64 | ext4 | tickertape | W1-steady, 64 B | 19.44–24.93 | 1.28 |
+| x86-64 | ext4 | plain file | W1-steady, 1,024 B | 1.51–1.76 | 1.16 |
+| x86-64 | ext4 | tickertape (zero-copy) | W3, 64 B | 20.85–26.41 | 1.27 |
+| x86-64 | ext4 | Aeron IPC | W2, 64 B, 10,000/s, p99.9 | 2.56–5.65 | 2.20 |
+| x86-64 | ext4 | Aeron IPC | W2, 64 B, 100,000/s, p99.9 | 0.39–3.47 | 8.91 |
+| x86-64 | ext4 | Chronicle Queue | W2, 64 B, 100,000/s, p99.9 | 11.8–15.3 | 1.30 |
+| x86-64 | ext4 | plain file | W2, 64 B, 100,000/s, p99.9 | 5.10–7.08 | 1.39 |
+| x86-64 | ext4 | tickertape (zero-copy) | W2, 64 B, 100,000/s, p99.9 | 2.27–5.96 | 2.62 |
+| x86-64 | ext4 | tickertape (safe) | W2, 64 B, 100,000/s, p99.9 | 3.83–8.35 | 2.18 |
+| x86-64 | ext4 | yaque | W2, 64 B, 100,000/s, p99.9 | 5.76–7.92 | 1.37 |
+| x86-64 | ext4 | Aeron IPC | W2, 1,024 B, 10,000/s, p99.9 | 3.26–3.64 | 1.12 |
+| x86-64 | ext4 | Chronicle Queue | W2, 1,024 B, 10,000/s, p99.9 | 2.36 µs to 15.75 ms | 6677.92 |
+| x86-64 | ext4 | tickertape (zero-copy) | W2, 1,024 B, 10,000/s, p99.9 | 4.60–6.84 | 1.49 |
+| x86-64 | ext4 | tickertape (safe) | W2, 1,024 B, 10,000/s, p99.9 | 6.94–7.64 | 1.10 |
+| x86-64 | ext4 | yaque | W2, 1,024 B, 10,000/s, p99.9 | 144–888 | 6.18 |
+| x86-64 | ext4 | Aeron IPC | W2, 1,024 B, 100,000/s, p99.9 | 0.77–5.58 | 7.29 |
+| x86-64 | ext4 | plain file | W2, 1,024 B, 100,000/s, p99.9 | 9.85–11.3 | 1.14 |
+| x86-64 | xfs | tickertape | W1-cold, 64 B | 19.30–29.61 | 1.53 |
+| x86-64 | xfs | tickertape | W1-steady, 64 B | 20.01–29.30 | 1.46 |
+| x86-64 | xfs | plain file | W3, 1,024 B | 3.22–3.59 | 1.11 |
+| x86-64 | xfs | Chronicle Queue | W2, 64 B, 10,000/s, p99.9 | 1.74–1.98 | 1.13 |
+| x86-64 | xfs | Aeron IPC | W2, 64 B, 100,000/s, p99.9 | 0.39–3.62 | 9.24 |
+| x86-64 | xfs | Chronicle Queue | W2, 64 B, 100,000/s, p99.9 | 4.11–6.00 | 1.46 |
+| x86-64 | xfs | tickertape (zero-copy) | W2, 64 B, 100,000/s, p99.9 | 2.21–6.62 | 3.00 |
+| x86-64 | xfs | tickertape (safe) | W2, 64 B, 100,000/s, p99.9 | 5.26–8.31 | 1.58 |
+| x86-64 | xfs | tickertape (zero-copy) | W2, 1,024 B, 10,000/s, p99.9 | 4.42–10.9 | 2.47 |
+| x86-64 | xfs | Aeron IPC | W2, 1,024 B, 100,000/s, p99.9 | 1.33–3.33 | 2.50 |
+| aarch64 | ext4 | tickertape (zero-copy) | W3, 64 B | 27.22–31.59 | 1.16 |
+| aarch64 | ext4 | Chronicle Queue | W3, 1,024 B | 15.31–17.12 | 1.12 |
+| aarch64 | ext4 | yaque | W3, 1,024 B | 3.94–4.41 | 1.12 |
+| aarch64 | ext4 | Aeron IPC | W2, 64 B, 10,000/s, p99.9 | 5.56–7.34 | 1.32 |
+| aarch64 | ext4 | tickertape (zero-copy) | W2, 64 B, 10,000/s, p99.9 | 2.87–3.46 | 1.20 |
+| aarch64 | ext4 | Aeron IPC | W2, 64 B, 100,000/s, p99.9 | 0.62–3.03 | 4.89 |
+| aarch64 | ext4 | Chronicle Queue | W2, 64 B, 100,000/s, p99.9 | 7.85–13.3 | 1.69 |
+| aarch64 | ext4 | tickertape (zero-copy) | W2, 64 B, 100,000/s, p99.9 | 1.88–2.08 | 1.10 |
+| aarch64 | ext4 | tickertape (safe) | W2, 64 B, 100,000/s, p99.9 | 4.95–6.07 | 1.23 |
+| aarch64 | ext4 | Aeron IPC | W2, 1,024 B, 10,000/s, p99.9 | 4.57–5.96 | 1.30 |
+| aarch64 | ext4 | Chronicle Queue | W2, 1,024 B, 10,000/s, p99.9 | 2.77–3.46 | 1.25 |
+| aarch64 | ext4 | Aeron IPC | W2, 1,024 B, 100,000/s, p99.9 | 0.82–2.71 | 3.30 |
+| aarch64 | ext4 | Chronicle Queue | W2, 1,024 B, 100,000/s, p99.9 | 14.5–16.3 | 1.12 |
+| aarch64 | ext4 | tickertape (zero-copy) | W2, 1,024 B, 100,000/s, p99.9 | 24.8–28.5 | 1.15 |
+| aarch64 | ext4 | tickertape (safe) | W2, 1,024 B, 100,000/s, p99.9 | 24.3–31.1 | 1.28 |
+| aarch64 | xfs | Aeron IPC | W2, 64 B, 10,000/s, p99.9 | 5.83–6.58 | 1.13 |
+| aarch64 | xfs | plain file | W2, 64 B, 10,000/s, p99.9 | 8.81–10.3 | 1.17 |
+| aarch64 | xfs | Aeron IPC | W2, 64 B, 100,000/s, p99.9 | 0.62–2.18 | 3.50 |
+| aarch64 | xfs | Chronicle Queue | W2, 64 B, 100,000/s, p99.9 | 4.36–5.46 | 1.25 |
+| aarch64 | xfs | plain file | W2, 64 B, 100,000/s, p99.9 | 7.57–11.4 | 1.51 |
+| aarch64 | xfs | Chronicle Queue | W2, 1,024 B, 10,000/s, p99.9 | 2.98–4.27 | 1.44 |
+| aarch64 | xfs | tickertape (safe) | W2, 1,024 B, 10,000/s, p99.9 | 12.6–14.4 | 1.14 |
+| aarch64 | xfs | yaque | W2, 1,024 B, 10,000/s, p99.9 | 188–208 | 1.10 |
+| aarch64 | xfs | Aeron IPC | W2, 1,024 B, 100,000/s, p99.9 | 1.46–3.67 | 2.52 |
+| aarch64 | xfs | Chronicle Queue | W2, 1,024 B, 100,000/s, p99.9 | 3.36–5.40 | 1.61 |
+
+### What these figures show and do not show
+
+They show: two cloud machine types, one session each, at v1.0.0, with every tool configured as the corrected harness
+does it, the order and the gaps stated above.
+
+They do not show:
+
+- **Bare metal.** These are virtual machines with a hypervisor between the threads and the hardware, and local SSDs
+  behind the platform's 351 MB/s cap. The bare-metal results below (v0.4.0, v0.3.0) are older code with the old harness;
+  none of them was rerun.
+- **Other days and machines.** One session per machine: the variation between VMs of the same type, which the earlier
+  sessions saw, is not in these ranges. The single-round parts used a fixed tool order; on xfs tickertape ran first on a
+  freshly made file system and Chronicle followed on the same one.
+- **`main`.** The library is v1.0.0. Changes merged after it (durable-only readers woken by checkpoints, the safe
+  reader's read size at the tail, the layout of `Reader`, and the changes still being measured) can move tickertape's
+  rows; they are measured in their own sections, not in this comparison.
+- **Statistics.** min–max of n = 4, 2 or 1; no confidence intervals. A W1 burst lasts 32–52 ms (tickertape, 64 B,
+  x86-64), and on x86-64 the first repeat of every W1-cold round ran at 29.12–30.84 million records/s (21.99 in the
+  unpinned one) and the second at 17.53–20.07 (cause not traced; aarch64 shows no such split); an 11 s W2 run at 100,000
+  records/s can be moved by one stall.
+- **Equal loads in SV and SD.** Each tool ran at 50 % or 90 % of its own probe; the same percentage is a different rate.
+- **Equal durability.** The sync operations differ in what they cover and promise; none was tested for power loss.
+- **What the settings do one by one** in the sustained mode, or `microTouch()` on top of the new settings.
+- **An interrupt-free tuned host** ([above](#interrupts-on-the-tuned-cpus)), unpinned sustained runs, Aeron on xfs in
+  the sustained mode, Aeron Archive, macOS, Windows.
 
 ## 2026-11-02, v0.4.0 on bare-metal Linux (AWS `z1d.metal`)
 
@@ -73,6 +1052,9 @@ Two changes since v0.3.0 drive the differences:
 - Linux prefaults 256 KiB ahead of the writer with `MADV_POPULATE_WRITE` (ADR 0025).
 
 ### Comparison with other tools
+
+> **Superseded** by the [comparison rerun at v1.0.0](#2026-11-25-to-2026-11-26-comparison-rerun-at-v100-google-cloud-vms-linux-x86-64-and-aarch64),
+> which corrected the harness: Chronicle Queue ran here with a short JIT warm-up, the default 64 MiB `blockSize` and no `microTouch()`, no thread was pinned, and W1 started its timer after tickertape had preallocated its segment but before Chronicle created its first file. The rerun ran on cloud VMs, not bare metal, so it does not repeat these bare-metal figures; it replaces them as the comparison. These results stay as they were recorded.
 
 **W1, append throughput** (million records/s):
 
@@ -226,6 +1208,9 @@ With enough cores, Aeron runs as intended here: its media driver and busy-spinni
 hardware thread.
 
 ### Comparison with other tools
+
+> **Superseded** by the [comparison rerun at v1.0.0](#2026-11-25-to-2026-11-26-comparison-rerun-at-v100-google-cloud-vms-linux-x86-64-and-aarch64),
+> which corrected the harness: these runs had the old JVM settings and W1, no pinning, and v0.3.0's library. These results stay as they were recorded.
 
 The same suite, workloads and caveats as in the sections below (`compare/README.md`). Two runs each.
 
@@ -1311,7 +2296,8 @@ the marker's write) follows from the kernel sources (ADR 0058 → Is the ranged 
 ### Chronicle's `microTouch()` on the same machine types
 
 The comparison rerun at v1.0.0 (issue #57; still running when this was written, its short part finished on 2026-11-25;
-branch `rerun/v1.0.0-session`) has Chronicle Queue with every tool setting off (`jvm-old`: the old JVM warm-up, no
+branch `rerun/v1.0.0-session`; published since in
+[its own section](#2026-11-25-to-2026-11-26-comparison-rerun-at-v100-google-cloud-vms-linux-x86-64-and-aarch64)) has Chronicle Queue with every tool setting off (`jvm-old`: the old JVM warm-up, no
 `microTouch()`, the default 64 MiB `blockSize`), with `microTouch()` alone, and with every setting on, and tickertape
 with its defaults (prefault on, early write-back on, no checkpoints), in its W2 latency runs (from the scheduled send to
 the read, 11 s, the first second left out; four runs per row: two rounds of two). ext4 on the first local SSD, x86-64
@@ -3100,6 +4086,9 @@ sync); in the finish round's samples the writer thread waited at most 2.1 ms (aa
 checkpoints roll appends took at most 4.6 ms with early write-back (65 ms on x86-64 ext4 with it off).
 
 ### Comparison with other tools (sustained mode)
+
+> **Superseded** by the [comparison rerun at v1.0.0](#2026-11-25-to-2026-11-26-comparison-rerun-at-v100-google-cloud-vms-linux-x86-64-and-aarch64),
+> which corrected the harness: Chronicle Queue and Aeron ran here without a JVM warm-up and with their default settings, no thread was pinned, and tickertape's rows were measured two days after the other tools', on other VMs of the same types and at a newer commit. In the rerun every tool ran in one session per machine. These results stay as they were recorded.
 
 `compare/run.py --sustained` (`compare/README.md` → Sustained mode), 10-minute runs, both payloads: a probe (unpaced,
 with a concurrent reader where the tool allows one), SV (paced at 50 % and 90 % of the tool's own probe, no sync) and SD
@@ -5777,6 +6766,9 @@ measure from the **intended** send time (coordinated omission accounted for), as
 and `compare/README.md`.
 
 ### Comparison with other tools, Linux
+
+> **Superseded** by the [comparison rerun at v1.0.0](#2026-11-25-to-2026-11-26-comparison-rerun-at-v100-google-cloud-vms-linux-x86-64-and-aarch64),
+> which corrected the harness: these runs had the old JVM settings and W1, no pinning, and v0.3.0's library. These results stay as they were recorded.
 
 What each tool promises differs, so the comparison is about mechanisms, not equivalent products.
 `compare/README.md` has the full mapping. In short:

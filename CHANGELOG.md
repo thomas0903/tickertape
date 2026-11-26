@@ -5,6 +5,22 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
+- Docs: the comparison with Chronicle Queue, Aeron IPC, yaque, queue-file and a plain file is rerun at v1.0.0 with the
+  corrected harness (issue #57): one 24-hour session on each of two Google Cloud VMs (x86-64 and aarch64, ext4 and xfs),
+  session commit `fb2d91b0`, every tool pinned, the JVM tools warmed up through their measured loops, Chronicle with
+  `microTouch()` and a 1 GiB `blockSize`, plus rows with the old settings, `microTouch()` alone, unpinned and on an
+  isolated boot. `docs/benchmarks.md` → "comparison rerun at v1.0.0" has every table, the one failed cell (Chronicle's
+  sync-every-second run at 90 % of its rate with 64 B records: the harness's reader timed out in both attempts on each
+  machine and file system), the round gaps, the probe drift and the interrupts that still reached the isolated CPUs; the
+  earlier comparison sections are marked as superseded. README → Performance is rewritten from it, with the bare-metal
+  v0.4.0 section replaced. The result is mixed: tickertape leads the 64 B append bursts; Chronicle Queue leads warm
+  replay in three of four pinned ext4 cells and has the lower reader p99.9 at 10,000 records/s and at 1,024 B × 100,000
+  records/s; Aeron IPC has the lowest observed p99.9 at 100,000 records/s; in ten-minute runs at half of each tool's own
+  rate tickertape's reader tail is lower on ext4 and higher than Chronicle's on xfs in three of four cells. The README
+  also describes Aeron IPC correctly (file-backed term buffers, no durable journal, no Archive replay here), no longer
+  says that readers never slow the writer down (a blocking reader costs the writer a wake-up call when it publishes),
+  explains the disk's 351 MB/s limit and what removed the aarch64 stalls near it, and states what a checkpoint syncs on
+  Linux and macOS. No code change.
 - Fixed (benchmarks): the comparison harness's short mode left the Chronicle Queue and Aeron JVMs (and `tt-latency`'s
   processes) running when it was terminated. `compare/run.py` now ends every child's process group, waits for it and
   renames an unfinished short run `OUTDIR.incomplete-N` on every way out (failure, time limit, SIGTERM, SIGINT,
