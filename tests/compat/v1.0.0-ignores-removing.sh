@@ -88,8 +88,12 @@ diff <(cd "$J" && ls | grep -v '\.removing$') <(cd "$W/without/journal" && ls)
 # This checkout's archive: a new name (of this shell, alive) stays, the old one of a process that has exited goes.
 YOUNG="$OLDEST.$$.$NOW_NS.removing"
 echo young > "$J/$YOUNG"
+# The first run removes the segment the old name's seal names (it is the oldest of the run's own listing, so the name
+# stays until the next run); the second unlinks the old name.
+"$NEW" archive "$J" --delete --keep-segments 3 > /dev/null
+[ -e "$J/$LEFTOVER" ]
 "$NEW" archive "$J" --delete --keep-segments 3 > /dev/null
 [ -e "$J/$YOUNG" ]
 [ ! -e "$J/$LEFTOVER" ]
 "$NEW" verify "$J" > /dev/null
-echo "ok: v1.0.0 is unaffected by a leftover temporary name of a removal, and this checkout removes it when it is old"
+echo "ok: v1.0.0 is unaffected by a leftover temporary name of a removal, and this checkout removes it once retention has removed the segment after it"
