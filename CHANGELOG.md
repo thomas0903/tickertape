@@ -5,6 +5,13 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
+- Fixed: a spare segment that came to nothing (its preparation failed after its blocks were allocated) gives its
+  blocks back even while another descriptor of its file is open, such as the copy a child process forked at that moment
+  holds until it executes its new program. It is truncated before its name is removed, if it has no other name; so are
+  a spare the roll discards, the file a panicked spare thread left, and the temporary file of a segment a roll failed
+  to create. Before, a roll that had run out of space while the spare held it could fail with "no space" when it tried
+  again (Linux with `WriterConfig::spare_segment`), and on macOS the roll's own create that follows a failed spare
+  could. ADR 0049 amendment of 2026-11-27; issue #73.
 - Fixed: `Reader::open` and `Reader::open_mapped` could fail with an I/O "not found" error for a segment they had just
   listed while a retention run removed segments one after another, oldest first, about as fast as a reader lists the
   directory (seen on tmpfs, where syncing the directory after each removal does nothing: Linux, 64 KiB segments, a run

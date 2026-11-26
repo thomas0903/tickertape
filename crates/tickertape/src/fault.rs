@@ -19,7 +19,8 @@ use std::io;
 pub enum Point {
     /// Preallocating a new segment (as if the disk were full).
     Preallocate,
-    /// Mapping a new segment (before it is published).
+    /// Mapping a new segment (before it is published): arm with [`fail_next`], or with [`run_at`] on the writer's
+    /// thread to act after its blocks are preallocated, before it is mapped.
     MapSegment,
     /// Publishing a new segment with `link`.
     Link,
@@ -286,7 +287,7 @@ pub fn run_at(point: Point, skip: usize, action: impl FnOnce() + 'static) {
     armed::HOOKS.with(|h| h.borrow_mut().push((point, skip, Box::new(action))));
 }
 
-/// Called by readers and inspection at each hook point.
+/// Called by readers, inspection and the writer at each hook point.
 #[cfg(feature = "fault-injection")]
 pub(crate) fn hook(point: Point) {
     let action = armed::HOOKS.with(|h| {
