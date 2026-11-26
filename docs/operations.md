@@ -687,12 +687,12 @@ let latency = writer.latency().cloned(); // for the monitoring thread
   caller spends in `request_checkpoint` or `checkpoint`) is not measured here: time your own calls.
 
 **Cost.** Measured on 4-vCPU cloud VMs ([`benchmarks.md`](benchmarks.md), 2026-11-26): with `Off` and
-`RollsAndCheckpoints` an append that does not roll ran within 0.4 ns of the code without the option at 64 B (slower on
-x86-64, faster on aarch64) and within 1 % at 1,024 B. **`All` added 60.5 ns to a 64-byte append on x86-64 (40.5 → 101
-ns, about 9.9 million appends/s on one thread) and 83.4 ns on aarch64 (42.3 → 125.7 ns, about 8 million/s)**, and about
-45 ns to a 1,024-byte one: more than the append itself at 64 B. Almost all of it is the two clock reads; the histogram
-update is about 2 ns. Turn `All` on where that is affordable, or for a period of diagnosis; `RollsAndCheckpoints` can stay
-on. The empty interval measured 21 ns on x86-64 and 33 ns on aarch64 there, so no append value is below that.
+`RollsAndCheckpoints` an append that does not roll ran within 1 ns of the code without the option at 64 B (within the
+noise on x86-64, 0.8 ns faster on aarch64) and within 1 % at 1,024 B. **`All` added 57 ns to a 64-byte append on x86-64
+(38 → 95 ns, about 10.5 million appends/s on one thread) and 83 ns on aarch64 (42 → 125 ns, about 8 million/s)**, and
+54 to 58 ns to a 1,024-byte one: more than the append itself at 64 B. Almost all of it is the two clock reads; the
+histogram update is about 2 ns. Turn `All` on where that is affordable, or for a period of diagnosis. An empty interval
+measured 20 ns on x86-64 and 33 ns on aarch64 there, so no value is below that.
 
 **Linux:** the clock reads of `All` are calls into the vDSO, without entering the kernel, only with a clock source the
 vDSO can read: `tsc`, `kvm-clock`, `hyperv_clocksource_tsc_page` and `arch_sys_counter`. With others (`hpet`, `acpi_pm`,
