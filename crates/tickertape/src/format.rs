@@ -896,6 +896,99 @@ pub(crate) fn find_history_before<V: SegmentView + ?Sized>(
     None
 }
 
+/// Whether `offset` in a segment whose first record is `base` is a position a checkpoint marker for `next_seq` can
+/// name (`docs/format.md` → Recovery, step 2; ADR 0056): at the first record slot, `next_seq` is `base`; anywhere else,
+/// the segment holds a valid record with sequence number `next_seq - 1` that ends, with its padding, exactly at
+/// `offset`. `offset` is a multiple of 8 within the record area or a seal's place (the caller checked that).
+///
+/// Records do not store their predecessor's offset, so this probes the commit words backward from `offset - 40`, in
+/// steps of 8, for a length that reaches exactly `offset` with the header fields `seq == next_seq - 1` and `flags == 0`,
+/// and validates such a candidate in full. A candidate inside the last record's payload is a frame header for exactly
+/// that sequence number and length that the payload holds; one that validates is accepted, as a reader would accept
+/// it.
+///
+/// Work: the commit words from `offset` back to the start of the record found (all the way to the first slot when
+/// there is none), and CRC32C over the candidates, at most twice `offset - 64` bytes in all. Past that bound (only a
+/// payload holding many such headers gets there) it follows the records' lengths forward from the first slot instead,
+/// and accepts if the record that ends exactly at `offset` is valid with sequence number `next_seq - 1`.
+pub(crate) fn record_ends_at<V: SegmentView + ?Sized>(
+    segment: &V,
+    base: u64,
+    offset: u64,
+    next_seq: u64,
+) -> bool {
+    let first = SEGMENT_HEADER_LEN as u64;
+    if offset == first {
+        return next_seq == base;
+    }
+    let Some(last) = next_seq.checked_sub(1).filter(|&seq| seq >= base) else {
+        return false;
+    };
+    if offset % RECORD_ALIGN as u64 != 0 || offset < first + RECORD_HEADER_LEN as u64 {
+        return false;
+    }
+    let budget = (offset - first).saturating_mul(2);
+    let mut spent = 0_u64;
+    let mut q = offset - RECORD_HEADER_LEN as u64;
+    loop {
+        let reaches = segment.commit_word(q).filter(|&word| {
+            (RECORD_HEADER_LEN as u32..=MAX_FRAME_LEN).contains(&word)
+                && align8(u64::from(word)) == offset - q
+        });
+        if let Some(word) = reaches {
+            let fields = segment
+                .with_bytes(q + 8, 16, |b| (read_u64(b, 0), read_u32(b, 12)))
+                .and_then(|(seq, flags)| Some((seq?, flags?)));
+            if fields == Some((last, 0)) {
+                spent = spent.saturating_add(u64::from(word));
+                if spent > budget {
+                    return walks_to(segment, offset, next_seq);
+                }
+                if matches!(
+                    read_slot(segment, q, last),
+                    Ok(Slot::Record { next_offset, .. }) if next_offset == offset
+                ) {
+                    return true;
+                }
+            }
+        }
+        if q <= first {
+            return false;
+        }
+        q -= RECORD_ALIGN as u64;
+    }
+}
+
+/// [`record_ends_at`]'s fallback: follows the commit words of the segment's records from its first slot and validates
+/// in full only the record that ends exactly at `offset`, which must have sequence number `next_seq - 1`; the records
+/// before it are not checked (as the backward probe does not check them), only their lengths are followed, so a
+/// damaged length word before the last record stops the walk. One CRC32C, of the last record.
+fn walks_to<V: SegmentView + ?Sized>(segment: &V, offset: u64, next_seq: u64) -> bool {
+    let Some(last) = next_seq.checked_sub(1) else {
+        return false;
+    };
+    let mut at = SEGMENT_HEADER_LEN as u64;
+    while at < offset {
+        let Some(word) = segment
+            .commit_word(at)
+            .filter(|w| (RECORD_HEADER_LEN as u32..=MAX_FRAME_LEN).contains(w))
+        else {
+            return false;
+        };
+        let Some(next) = at.checked_add(align8(u64::from(word))) else {
+            return false;
+        };
+        if next == offset {
+            return matches!(
+                read_slot(segment, at, last),
+                Ok(Slot::Record { next_offset, .. }) if next_offset == offset
+            );
+        }
+        at = next;
+    }
+    false
+}
+
 /// How many next sequence numbers the final-seal search tries after an empty commit word (ADR 0035): a final seal
 /// counts as evidence only if it announces one of the `SEAL_SEARCH_RECORDS` sequence numbers after the expected one.
 /// It covers a zeroed 4 KiB block of minimal records (102) in front of the seal. A longer damaged run before a seal is
@@ -2361,5 +2454,93 @@ mod tests {
                 prop_assert_eq!(find_history_after_empty(&torn[..], end as u64, 7 + n), None);
             }
         }
+    }
+
+    /// ADR 0056: a marker's position is accepted only right after the record before it (or at the first slot, for the
+    /// segment's base), whatever the length of that record.
+    #[test]
+    fn record_ends_at_accepts_only_the_end_of_the_record_before() {
+        let (image, offsets) = records_image(20);
+        let v = &image[..];
+        assert!(record_ends_at(v, 7, 64, 7));
+        assert!(!record_ends_at(v, 7, 64, 8));
+        assert!(!record_ends_at(v, 7, 64, 6));
+        for (i, &end) in offsets.iter().enumerate().skip(1) {
+            let (end, next) = (end as u64, 7 + i as u64);
+            assert!(record_ends_at(v, 7, end, next), "after record {}", next - 1);
+            assert!(!record_ends_at(v, 7, end, next + 1));
+            assert!(!record_ends_at(v, 7, end, next - 1));
+            // A base above the record's sequence number: `next_seq - 1` is not in this segment.
+            assert!(!record_ends_at(v, next, end, next));
+        }
+        // Beyond the records: the zeros after the last one.
+        let last_end = offsets[20] as u64;
+        for beyond in [last_end + 8, last_end + 40, last_end + 4096, 65_536 - 8] {
+            assert!(!record_ends_at(v, 7, beyond, 27));
+            assert!(!record_ends_at(v, 7, beyond, 28));
+        }
+        // A position inside a record.
+        assert!(!record_ends_at(v, 7, offsets[19] as u64 + 8, 27));
+
+        // The last covered record zeroed, or its payload damaged.
+        let mut zeroed = image.clone();
+        zeroed[offsets[19]..offsets[19] + 4].fill(0);
+        assert!(!record_ends_at(&zeroed[..], 7, last_end, 27));
+        assert!(record_ends_at(&zeroed[..], 7, offsets[19] as u64, 26));
+        let mut flipped = image.clone();
+        flipped[offsets[20] - 9] ^= 1;
+        assert!(!record_ends_at(&flipped[..], 7, last_end, 27));
+        // Damage to an earlier record is not seen: only the record before the position is read.
+        let mut earlier = image.clone();
+        earlier[offsets[3]..offsets[3] + 4].fill(0);
+        assert!(record_ends_at(&earlier[..], 7, last_end, 27));
+
+        // A long last record.
+        let mut long = image.clone();
+        let end = append(&mut long, offsets[20], &record(27), &[0xA5; 30_000]) as u64;
+        assert!(record_ends_at(&long[..], 7, end, 28));
+        assert!(!record_ends_at(&long[..], 7, end, 29));
+    }
+
+    /// ADR 0056: a payload full of frame headers for the expected sequence number and length costs a bounded amount of
+    /// CRC32C, then the forward walk decides.
+    #[test]
+    fn record_ends_at_bounds_the_work_of_header_shaped_payloads() {
+        let (image, offsets) = records_image(5);
+        let start = offsets[5];
+        let payload_len = 20_000;
+        let end = start + 40 + payload_len;
+        let mut payload = vec![0u8; payload_len];
+        // Fake headers every 24 bytes, from the shortest candidate backward; each reaches `end` exactly, carries
+        // sequence number 12 and zero flags, and has a wrong CRC.
+        let mut q = end - 40;
+        let mut fakes = 0;
+        while q >= start + 40 {
+            let j = q - (start + 40);
+            payload[j..j + 4].copy_from_slice(&((end - q) as u32).to_le_bytes());
+            payload[j + 8..j + 16].copy_from_slice(&12u64.to_le_bytes());
+            q -= 24;
+            fakes += 1;
+        }
+        let mut crafted = image.clone();
+        assert_eq!(append(&mut crafted, start, &record(12), &payload), end);
+        let (spent, budget) = (24 * fakes * fakes / 2, 2 * (end - 64));
+        assert!(
+            spent > budget,
+            "the fakes exceed the CRC32C bound ({spent} > {budget})"
+        );
+        assert!(record_ends_at(&crafted[..], 7, end as u64, 13));
+        assert!(!record_ends_at(&crafted[..], 7, end as u64, 14));
+        // The fallback walk validates only the last record: an earlier record's checksum is not read. A damaged
+        // length word before it stops the walk, though.
+        let mut damaged = crafted.clone();
+        damaged[offsets[2] + 4] ^= 1;
+        assert!(record_ends_at(&damaged[..], 7, end as u64, 13));
+        damaged[offsets[2]..offsets[2] + 4].fill(0);
+        assert!(!record_ends_at(&damaged[..], 7, end as u64, 13));
+        // And the last record itself is validated.
+        let mut last = crafted.clone();
+        last[end - 1] ^= 1;
+        assert!(!record_ends_at(&last[..], 7, end as u64, 13));
     }
 }

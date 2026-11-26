@@ -399,14 +399,25 @@ What a reader on the new machine sees:
 Do not open a writer on an archive copy: it creates the missing next segment and continues with sequence numbers the
 original journal already uses.
 
+### Restoring from a backup
+
+Stop the writer and any `tickertape archive` job or other process that applies a retention policy to the journal first:
+retention goes by the marker it finds, and the newer marker can make it remove restored segments that the backup's
+marker will name. Then restore the backup's `checkpoint` together with its segments, and remove the segments the backup
+does not have. The marker vouches for every record below its `next_seq`, so a marker newer than the segments covers
+records they lack. From 1.1 a writer refuses such a journal under every recovery policy, before it changes anything
+(`DanglingCheckpoint`, reported at the marker's segment and offset; ADR 0056); readers and `verify` stop where the
+restored records end. If the backup's marker is lost, see "After a crash" → Refused to open.
+
 ### Limits
 
 - **Do not copy a journal a writer is using as a whole.** The files change during the copy, so it is no snapshot.
   Copying the segments before `checkpoint` is dangerous: the marker can cover records the copied segments lack. If the
   marker names a segment the copy lacks, the writer refuses the copy. If it points into a segment that was copied
-  earlier, `verify` and `status` can both exit with 0 and the writer opens, continues at the marker's sequence number
-  and leaves a hole that readers cannot pass. A sign of this is a `verify` `last_seq` + 1 lower than the checkpoint's
-  `next seq` in `status`. Copying `checkpoint` first avoids that, but the records after the marker may be incomplete,
+  earlier, `status` can exit with 0, `verify` reports `EmptyCommitWord` where the copied records end (from 1.1, ADR
+  0050), and the writer refuses the copy (from 1.1, ADR 0056: `DanglingCheckpoint` at that segment and the marker's
+  offset; 1.0.0 opened it, continued at the marker's sequence number and left a hole that readers cannot pass). A sign of this is a `verify` `last_seq` + 1 lower than the checkpoint's `next seq` in
+  `status`. Copying `checkpoint` first avoids that, but the records after the marker may be incomplete,
   `verify` can fail because the next segment is missing, and retention may remove segments during the copy. Stop the
   writer, or use the archive recipe above.
 - A copy that lacks a segment in the middle, or the newest one after a sealed one, fails `verify`; one that lacks only
@@ -711,10 +722,12 @@ the writer or retention.
   the newest segment at or after the marker, or in the last segment of a directory without a marker (crash contract C11).
   What to do: run `verify`, which names the position and what is behind it. If the position is at or after the
   checkpoint, opening the writer repairs it or refuses ("After a crash"). If it is before the checkpoint, recovery does
-  not look there: restore the segment from a copy. For archives and old segments, run `verify` after moving or restoring
+  not look there, except at the record right before the marker's position, where the writer refuses to open (from 1.1,
+  ADR 0056): restore the segment from a copy. For archives and old segments, run `verify` after moving or restoring
   them, and after storage errors. `EmptyCommitWord` does not always mean damaged bytes (ADR 0050): it also means that the
-  checkpoint marker is newer than the segments (segments restored from a backup while a newer marker was kept; the writer
-  opens such a journal and carries on, so the gap stays: issue #87; restore the marker with the segments); that after a
+  checkpoint marker is newer than the segments (segments restored from a backup while a newer marker was kept; from 1.1
+  the writer refuses such a journal, ADR 0056: restore the backup's marker with the segments, "Restoring from a
+  backup"); that after a
   power loss a later segment, or its first page, reached the disk and the records or the seal before it did not (reported
   until a writer opens the journal and repairs it; a reader started at boot before the writer fails until then); or that a
   segment with a valid header was copied in from another journal (`verify` names it; remove it). A file named like a
@@ -769,5 +782,24 @@ the writer or retention.
   earlier in the scan, including bytes zeroed in place. Crash contract C11 lists them.
 - **Refused to open** (missing checkpoint segment or a gap in the chain): restore the missing segments from a copy,
   or move the affected segments aside knowingly. tickertape won't discard history on its own.
+- **Refused to open with `DanglingCheckpoint` at a segment and an offset** (from 1.1, under every policy; ADR 0056):
+  the checkpoint marker's position lies beyond the records that segment holds, or the record right before it is
+  damaged, so the marker vouches for records the journal lacks. Nothing was changed. Run `tickertape verify` (it names
+  where the records end, or the damaged record) and `tickertape inspect` or `status` (the marker's segment, offset and
+  next sequence number). Then, in order of what they lose:
+  1. Segments restored from a backup: restore that backup's `checkpoint` with them. Nothing is lost.
+  2. A damaged record: restore its segment from a copy or a replica. Nothing is lost.
+  3. Otherwise, knowingly, move `checkpoint` out of the directory and keep it. The writer then opens without a marker
+     and validates the whole journal from the oldest segment (an open that takes longer the larger the journal).
+     Where the restored records simply end, it continues there; a damaged record with records or segments after it is
+     handled like any corrupt position (with `Quarantine` the bytes from it on, and the later segments, go to
+     `quarantine/`, so the covered records after the damage leave the journal; `Fail` refuses). Either way the writer
+     gives the sequence numbers the old marker covered beyond the last valid record to new records. Anything that saw
+     the old records under those numbers then has a different record under the same number: readers of either kind,
+     exports, and downstream systems that store sequence numbers. Start readers again from a position you choose and
+     reconcile what was exported. Durable-only readers return nothing, and retention removes nothing, until the next
+     checkpoint.
+
+  No command sets the marker back or opens such a journal at the marker.
 
 The `quarantine/` directory is never cleaned up by tickertape; inspect it and delete it yourself when you're done.
