@@ -1062,6 +1062,9 @@ impl Reader {
 impl Reader {
     /// Opens the journal in `path`, positioned at the first record of the oldest segment.
     ///
+    /// `durable_only=True` returns only records covered by a checkpoint; while it waits for one, it is woken by
+    /// checkpoints, not by appends (ADR 0053).
+    ///
     /// `seek_index=True` (from 1.1) lets `seek` start at a record named by a seek index, one of the files that
     /// `tickertape index` writes. Records before it are then not read, so damage there goes unnoticed. Not for journals
     /// where someone who may not write the segments can write `seek-index/` (crash contract C15).

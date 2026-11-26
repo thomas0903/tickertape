@@ -2446,7 +2446,7 @@ x86-64 (ranges 160–163 against 167–174) and 48 ns on aarch64, net; the copy 
 |---|---|
 | The sequentially consistent increment and load per `append` | The ordering of the commit before the waiter check is necessary while wake-ups are on. The unconditional increment is how ADR 0017 does it; a fence, with the increment only when a reader waits, is untested. `notify(false)` removes both. On aarch64 the increment is an outlined call (`-C target-feature=+lse` removes the call, for a build that does not need to run on ARMv8.0); not measured |
 | Futex wakes while a reader blocks between records | One wake per sleeping reader is necessary for a single `append`; `append_batch` sends one per batch (ADR 0041). Wakes sent while a reader is registered but presumably not asleep, up to about a fifth of them (more wakes than waits, above), are avoidable; not measured |
-| Wake-ups of a blocking durable-only reader by `append` | Avoidable: only a checkpoint (or a roll) can give it records; it needs its own event counter or waiter count, which changes the shared notify region's layout (ADR 0021) |
+| Wake-ups of a blocking durable-only reader by `append` | Avoidable: only a checkpoint can give it records. Removed from 1.1 by its own event and waiter counts in the region (ADR 0053, issue #82) |
 | Four system calls and two small allocator calls every 100 ms per blocked reader (re-read of the `notify` record), and a `stat` per 100 ms at an empty slot (identity check) | Necessary to follow a restarted writer and to notice a replaced segment; bounded by the interval |
 
 **Serialization and append**
@@ -2753,6 +2753,133 @@ Tracing costs the writer's p99.9 about 0.5 µs (median difference) at steady-90 
 p50, maxima, late sends and the stalls are unchanged within the spread. The tracers' own processes used 3.4–3.5 s of
 CPU per 70-second aarch64 run, 1.4–1.5 s on x86-64. The conclusion it rests on is thereby confirmed untraced: the
 aarch64 stalls occur as often without any probe.
+
+## 2026-11-26, durable-only readers wake on checkpoints only (ADR 0053, issue #82; Google Cloud VMs)
+
+The acceptance measurement of ADR 0053 against 1.0.0 and the `main` it fixes. All of it ran on **Google Cloud virtual
+machines, not bare metal**, on one day, and is not compared with other sections.
+
+### Environment and commands
+
+Ubuntu 24.04, kernel 7.0.0-1017-gcp (`CONFIG_PREEMPT_LAZY=y` without `PREEMPT_DYNAMIC`, `CONFIG_HZ=1000`), rustc
+1.100.0, journals on ext4 on the first local NVMe SSD (`mkfs.ext4 -E lazy_itable_init=0,lazy_journal_init=0`, `noatime`),
+results on the boot disk. `c4-standard-16-lssd` (Xeon 6985P-C, 16 vCPUs) and `c4a-standard-8-lssd` (Neoverse-V2, 8
+vCPUs) in us-east1-d, each shape on separate VMs as marked.
+
+Builds, all at the same path: **1.0.0** is the 1.0.0 library under the harness of `0fcdb9e5` (whose library is the tag's),
+**1.0.0 copy** the same binary copied (the noise floor), **`main`** is `f1ea454d`, **new** is this change
+(`core/marker-wake` at `d08ad0a1`, whose library code is that of this change as merged). Interleaved in rotating order, 10 rounds per VM (15 on the third x86-64 VM):
+
+```sh
+tt-sustained run --dir … --out … --json --payload 1024 --duration 15s --warmup 3s --cpus 1,2,3,4,5,6 \
+  --rate <rate> --checkpoint-every 1s --checkpoint-mode background --retain-bytes 68719476736 \
+  --readers mapped,safe:wait=default,safe:durable:wait=block      # without the last reader for "no durable-only reader"
+```
+
+Rates: 169,206/s (aarch64) and 173,119/s (x86-64), the published half rates of the sustained session, and 100,000/s.
+Latencies in µs, medians of the rounds with their range; coordinated omission is handled as in the sustained
+session (intended send times).
+
+### Append latency with a blocking durable-only reader
+
+| Machine, rate | Build | p50 | p99 | p99.9 | Durable-only reader: CPU, voluntary context switches | Writer system time (s) |
+|---|---|---|---|---|---|---|
+| x86-64, VM 1, 173,119/s | 1.0.0 | 0.56 (0.54–0.57) | 2.23 (2.05–2.29) | 6.25 (6.03–6.40) | 0.99, 3260 (2935–3390) | 0.46 (0.37–0.48) |
+| x86-64, VM 1, 173,119/s | 1.0.0 copy | 0.56 (0.55–0.57) | 2.23 (2.01–2.31) | 6.28 (5.96–6.42) | 0.99, 3226 (2794–3387) | 0.46 (0.40–0.50) |
+| x86-64, VM 1, 173,119/s | `main` | 1.18 (1.15–1.19) | 3.80 (3.62–3.86) | 7.79 (6.89–8.05) | 0.68 (0.67–0.69), 2741304 (2598737–2783731) | 2.37 (2.18–2.40) |
+| x86-64, VM 1, 173,119/s | new | 0.44 (0.42–0.45) | 2.04 (1.80–2.19) | 5.96 (3.98–7.10) | 0.04, 2516 (2513–2521) | 0.11 (0.07–0.15) |
+| x86-64, VM 1, 100,000/s | 1.0.0 | 0.62 (0.61–0.64) | 2.97 (2.54–5.85) | 9.86 (7.99–11.7) | 0.95 (0.94–0.96), 318554 (245868–349744) | 0.05 (0.04–1.69) |
+| x86-64, VM 1, 100,000/s | 1.0.0 copy | 0.62 (0.60–0.69) | 3.13 (2.29–3.54) | 10.1 (8.47–11.2) | 0.94 (0.93–0.95), 323020 (250585–404956) | 0.17 (0.04–0.49) |
+| x86-64, VM 1, 100,000/s | `main` | 1.16 (1.13–1.18) | 3.79 (3.75–6.32) | 11.4 (10.7–12.1) | 0.49 (0.47–0.50), 1530676 (1504705–1605423) | 0.81 (0.04–14.9) |
+| x86-64, VM 1, 100,000/s | new | 0.44 (0.43–0.46) | 2.12 (2.05–2.15) | 8.65 (7.85–10.9) | 0.02 (0.02–0.03), 2510 (2501–2522) | 0.06 (0.04–0.71) |
+| aarch64, VM 1, 169,206/s | 1.0.0 | 0.51 (0.51–0.52) | 2.64 (2.56–2.67) | 7.19 (6.82–7.43) | 0.99, 4320 (4265–4366) | 0.67 (0.63–0.70) |
+| aarch64, VM 1, 169,206/s | 1.0.0 copy | 0.51 (0.51–0.52) | 2.64 (2.58–2.69) | 7.20 (6.96–7.46) | 0.99, 4323 (4267–4392) | 0.68 (0.64–0.74) |
+| aarch64, VM 1, 169,206/s | `main` | 0.73 (0.71–0.76) | 3.89 (3.84–3.93) | 8.88 (8.50–9.54) | 0.83 (0.83–0.84), 980648 (945046–1072035) | 2.46 (1.95–3.38) |
+| aarch64, VM 1, 169,206/s | new | 0.30 | 2.31 (2.27–2.37) | 6.91 (6.63–7.32) | 0.04, 2517 (2506–2528) | 0.21 (0.20–0.22) |
+| aarch64, VM 1, 100,000/s | 1.0.0 | 0.60 (0.59–0.61) | 2.80 (2.74–2.93) | 8.46 (7.64–9.97) | 0.99, 7919 (5590–10169) | 0.04 (0.03–0.15) |
+| aarch64, VM 1, 100,000/s | 1.0.0 copy | 0.60 (0.59–0.61) | 2.79 (2.76–2.84) | 8.74 (7.73–10.2) | 0.99, 7586 (6111–9249) | 0.09 (0.04–0.95) |
+| aarch64, VM 1, 100,000/s | `main` | 2.01 (1.98–2.04) | 4.11 (4.05–4.47) | 10.5 (8.94–11.5) | 0.61 (0.60–0.63), 1715633 (1699216–1728304) | 0.05 (0.04–17.6) |
+| aarch64, VM 1, 100,000/s | new | 0.30 (0.30–0.32) | 2.39 (2.33–2.48) | 7.72 (6.73–9.16) | 0.03, 2513 (2495–2522) | 0.04 (0.02–0.93) |
+
+`main` slows appends by 0.2–1.4 µs at p50 against 1.0.0 in every round; the change makes them faster than 1.0.0 in every
+round (p50 0.12–0.29 µs lower), and the durable-only reader spends 2–4 % of a core instead of 99 %, with one voluntary
+context switch per checkpoint plus its 100 ms timeouts (about 2,500 in 18 s) instead of one or more per append.
+
+### Without a durable-only reader (must be unchanged)
+
+Readers `mapped,safe:wait=default`, the same VMs and rounds:
+
+| Machine, rate | Build | p50 | p99 | p99.9 | max |
+|---|---|---|---|---|---|
+| x86-64, VM 1, 173,119/s | 1.0.0 | 0.43 (0.42–0.43) | 2.02 (1.89–2.13) | 5.97 (5.71–7.05) | 151 (135–185) |
+| x86-64, VM 1, 173,119/s | 1.0.0 copy | 0.43 (0.41–0.43) | 2.05 (1.96–2.15) | 5.99 (5.05–7.01) | 171 (140–216) |
+| x86-64, VM 1, 173,119/s | new | 0.44 (0.41–0.45) | 2.01 (1.78–2.08) | 5.94 (3.81–6.05) | 157 (149–484) |
+| x86-64, VM 1, 100,000/s | 1.0.0 | 0.42 (0.41–0.43) | 2.14 (2.09–3.31) | 8.25 (7.04–10.1) | 172 (145–273) |
+| x86-64, VM 1, 100,000/s | 1.0.0 copy | 0.42 (0.41–0.43) | 2.11 (1.88–2.23) | 7.98 (6.73–9.83) | 246 (147–393) |
+| x86-64, VM 1, 100,000/s | new | 0.43 (0.41–0.44) | 2.13 (2.08–2.14) | 7.92 (7.07–10.0) | 214 (145–450) |
+| aarch64, VM 1, 169,206/s | 1.0.0 | 0.30 | 2.36 (2.31–2.42) | 6.90 (6.74–7.11) | 184 (174–195) |
+| aarch64, VM 1, 169,206/s | 1.0.0 copy | 0.30 (0.29–0.30) | 2.36 (2.29–2.41) | 6.88 (6.66–7.32) | 178 (168–195) |
+| aarch64, VM 1, 169,206/s | new | 0.30 (0.29–0.30) | 2.29 (2.26–2.33) | 6.88 (6.50–7.06) | 183 (175–192) |
+| aarch64, VM 1, 100,000/s | 1.0.0 | 0.30 (0.30–0.31) | 2.45 (2.40–2.73) | 7.85 (7.32–10.8) | 183 (175–247) |
+| aarch64, VM 1, 100,000/s | 1.0.0 copy | 0.30 (0.30–0.31) | 2.43 (2.37–2.91) | 8.11 (6.94–9.41) | 181 (175–257) |
+| aarch64, VM 1, 100,000/s | new | 0.30 (0.29–0.31) | 2.40 (2.37–2.46) | 8.04 (6.83–8.84) | 185 (176–250) |
+
+### The maximum: runs (of 10, 15 on the third x86-64 VM) with an append of 200 µs or more
+
+Rule (ADR 0053): no more runs for the new build than for 1.0.0 plus the difference between the two 1.0.0 copies, on each
+VM.
+
+| VM | Runs | 1.0.0 | 1.0.0 copy | `main` | new | max median: 1.0.0 / copy / new | Rule met |
+|---|---|---|---|---|---|---|---|
+| x86-64, VM 1 | 10 | 0 | 0 | 0 | 2 | 151 / 149 / 162 | **no** |
+| x86-64, VM 2 | 10 | 2 | 1 | 1 | 2 | 155 / 155 / 165 | yes |
+| x86-64, VM 3 | 15 | 5 | 2 | 2 | 2 | 156 / 152 / 153 | yes |
+| aarch64, VM 1 | 10 | 0 | 1 | 0 | 0 | 183 / 186 / 182 | yes |
+| aarch64, VM 2 | 10 | 1 | 1 | 0 | 0 | 189 / 190 / 186 | yes |
+
+Not met on the first x86-64 VM (2 runs against 0 and 0), met on the other four. Pooled over the three x86-64 VMs: 6 of 35
+runs for the new build, 7 and 3 of 35 for the two 1.0.0 copies, 3 of 35 for `main`. On the first VM the cell without a
+durable-only reader, where the change runs no different code on the writer's side, had 3 runs for the new build against
+0 and 2; the slow non-roll appends fall at the start of a checkpoint in every build (ADR 0053).
+
+### Delivery to the durable-only reader
+
+From "checkpoint complete" (the checkpoint thread starts its wake-ups, once the marker is durable) to the reader
+returning the first record the new marker covers, and the last; five rounds, logged by an instrumented build (one line
+per checkpoint on each side; append latencies of these builds shown for reference):
+
+| Machine | Helper threads | Build | First record after "checkpoint complete": median of the runs' medians (largest), µs | Last record (ms) | Append p50 |
+|---|---|---|---|---|---|
+| x86-64, VM 1 | any (default) | 1.0.0 | before the wake-ups (polls the marker: −111 µs) | 41.2 (40.5–41.8) | 0.56 (0.55–0.56) |
+| x86-64, VM 1 | any (default) | new | 145 (1200) | 41.5 (40.5–41.7) | 0.42 (0.41–0.43) |
+| x86-64, VM 1 | CPU 7 | 1.0.0 | before the wake-ups (polls the marker: −29.4 µs) | 40.8 (40.4–41.4) | 0.56 (0.56–0.57) |
+| x86-64, VM 1 | CPU 7 | new | 33.1 (233) | 40.8 (40.3–41.4) | 0.43 (0.42–0.49) |
+| aarch64, VM 1 | any (default) | 1.0.0 | before the wake-ups (polls the marker: −10.4 µs) | 41.6 (41.3–41.7) | 0.52 |
+| aarch64, VM 1 | any (default) | new | 14.7 (1455) | 43.4 (42.8–44.4) | 0.30 (0.29–0.30) |
+| aarch64, VM 1 | CPU 7 | 1.0.0 | before the wake-ups (polls the marker: −10.4 µs) | 41.5 (41.3–41.8) | 0.52 |
+| aarch64, VM 1 | CPU 7 | new | 10.7 (17.6) | 42.1 (41.7–43.3) | 0.30 |
+
+1.0.0's reader polls the marker on a full core, so it starts reading as soon as the marker is written. The new reader
+is woken: with the writer's helper threads free to run on its CPU it starts 15–145 µs later at the median and up to
+1.2–1.5 ms later in the worst checkpoint, and the last record of the 1-second backlog arrives 0.3 ms (x86-64) and 1.8 ms
+(aarch64) later; with the helpers on CPU 7, 11–33 µs (at most 0.23 ms) and 0.0–0.6 ms. ADR 0053 has the mechanism.
+
+### Mixed versions (`wakemix`, one process per role, x86-64 VM 1 and aarch64 VM 1)
+
+Writer appends 500,000 records of 1,024 B at 100,000/s with a background checkpoint every second; one durable-only
+reader that blocks at once. Writer append p50, and the reader's voluntary context switches:
+
+| Writer, durable-only reader | x86-64: writer p50 (µs), reader switches | aarch64: writer p50 (µs), reader switches |
+|---|---|---|
+| 1.0.0, 1.0.0 | 0.45, 141,059 | 0.59, 13,936 |
+| 1.0.0, new | 0.14, 5,257 | 0.27, 5,306 |
+| new, 1.0.0 | 0.45, 147,208 | 0.62, 15,037 |
+| new, new | 0.14, 61 | 0.27, 60 |
+
+With one record per checkpoint (60 records, pauses of 23–63 ms), every pairing delivered every record; a new
+durable-only reader beside a 1.0.0 writer got them 0.65 ms (x86-64) and 0.63 ms (aarch64) after the append at the
+median (checkpoints took 0.29 and 0.05 ms), at most 2.2 and 1.1 ms. Readers of both versions attached while the writer
+changed from 1.0.0 to new and back got 120 of 120 records each.
 
 ## 2026-11-02, v0.3.0 on Linux (AWS) and macOS
 

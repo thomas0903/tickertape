@@ -23,6 +23,20 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   the copied records before the checkpoint marker (lost silently in 1.0.0; with the check above, the next open would
   refuse), and a new journal's first segment without its header made every later open fail. One more `F_FULLFSYNC`
   per repair and per created segment; Linux was not affected (`fdatasync` flushes the device cache).
+- Changed: a durable-only reader that blocks at the checkpoint boundary is woken by checkpoints only, not by every append
+  (ADR 0053, issue #82). Checkpoints bump an event count of their own in the wake-up region, and a capability word says
+  which writers do. Since #66 made the reader's marker check fast, such a reader slept between appends and the writer
+  made a wake-up system call for almost every record (append p50 0.54 → 0.75 µs on aarch64, 0.56 → 1.20 µs on x86-64,
+  against 1.0.0); now appends make none for it, and are faster than 1.0.0's with such a reader (p50 0.30 against 0.51 µs
+  on aarch64, 0.44 against 0.56 µs on x86-64; `docs/benchmarks.md`, 2026-11-26). Beside a 1.0.0 writer, which does not bump those words, a durable-only
+  reader polls the marker every `Backoff::max_sleep` (1 ms by default) instead of registering, so that writer pays
+  nothing for it either; a 1.0.0 durable-only reader beside a new writer waits as before. The last records of a large
+  backlog can reach a durable-only reader up to about 2 ms later than a reader that polls the marker when the writer's helper threads share its
+  CPU (`WriterConfig::helper_cpus` avoids it). The `notify` record, the on-disk format, the API and the ABI do not
+  change; every pairing of 1.0.0 and new processes works (`tests/compat/v1.0.0-wake-ups.sh`).
+- Docs: the release checklist compares the append path with the previous release in `tt-sustained` with a durable-only
+  blocking reader, the case that the micro-benchmark and `tt-latency` miss (issue #82).
+
 - Fixed: a reader no longer stops silently at a zeroed commit word in older history (issue #79, ADR 0050). An empty slot
   that the checkpoint marker covers, or that a later segment (with a valid header) shows to have been filled, is `Error::Corrupt` with
   `CorruptReason::EmptyCommitWord` at its offset; before, `try_next` returned `Ok(None)` there for ever, and a replay ended
