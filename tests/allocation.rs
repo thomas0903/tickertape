@@ -9,7 +9,7 @@ use std::hint::black_box;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use tickertape::{Backoff, NewRecord, Reader, ReaderConfig, Writer, WriterConfig};
+use tickertape::{Backoff, LatencyMode, NewRecord, Reader, ReaderConfig, Writer, WriterConfig};
 
 thread_local! {
     static ALLOCATIONS: Cell<u64> = const { Cell::new(0) };
@@ -81,8 +81,12 @@ const WARM_UP: u64 = 1_200;
 /// boxed when they are first used, by whichever thread comes first, and the writer uses them when it has appended
 /// 1 MiB (`prefault::STEP`; 64 KiB on Linux), so the warm-up goes past that.
 fn journal() -> (tempfile::TempDir, Writer) {
+    journal_with(LatencyMode::Off)
+}
+
+fn journal_with(mode: LatencyMode) -> (tempfile::TempDir, Writer) {
     let dir = tempfile::tempdir().unwrap();
-    let mut writer = Writer::open(dir.path(), WriterConfig::default()).unwrap();
+    let mut writer = Writer::open(dir.path(), WriterConfig::default().latency(mode)).unwrap();
     let payload = [0; 1024];
     for _ in 0..WARM_UP {
         writer.append(&record(&payload)).unwrap();
@@ -118,10 +122,21 @@ fn counting_sees_an_allocation() {
     assert_eq!(allocations(|| drop(black_box(vec![0u8; 100]))), 1);
 }
 
+/// With every latency mode (ADR 0047): the histograms are allocated when the writer opens.
 #[test]
 fn appending_allocates_nothing() {
+    for mode in [
+        LatencyMode::Off,
+        LatencyMode::RollsAndCheckpoints,
+        LatencyMode::All,
+    ] {
+        appending_allocates_nothing_with(mode);
+    }
+}
+
+fn appending_allocates_nothing_with(mode: LatencyMode) {
     for len in [64, 1024] {
-        let (_dir, mut writer) = journal();
+        let (_dir, mut writer) = journal_with(mode);
         let payload = vec![7; len];
         let batch = vec![record(&payload); 16];
         let append = allocations(|| {
@@ -141,7 +156,10 @@ fn appending_allocates_nothing() {
                 writer.append_batch(batch.iter().copied()).unwrap();
             }
         });
-        assert_eq!((append, in_place, batched), (0, 0, 0), "{len} B");
+        assert_eq!((append, in_place, batched), (0, 0, 0), "{len} B, {mode:?}");
+        if let Some(append) = writer.latency().and_then(|latency| latency.append()) {
+            assert_eq!(append.snapshot().count(), WARM_UP + 2 * RECORDS);
+        }
     }
 }
 

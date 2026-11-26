@@ -43,7 +43,8 @@ pub enum Point {
     /// Syncing the checkpoint marker in `retention::apply` (an archiver other than the writer), after reading the slot
     /// that decides a removal and before removing anything.
     RetentionMarkerSync,
-    /// Syncing an archive copy before removing its source.
+    /// Syncing an archive copy before removing its source: arm with [`fail_next`], or with [`run_at`] to act after the
+    /// copy is written and before it is synced.
     RetentionCopySync,
     /// Syncing the destination directory after an archive rename or copy.
     RetentionDestinationSync,
@@ -53,6 +54,22 @@ pub enum Point {
     RetentionRemove,
     /// Between the checks of a planned segment and its removal, in any retention run. Arm with [`run_at`].
     RetentionChecked,
+    /// The rename that takes a segment out of the journal under a temporary name, in a removal by an archiver other
+    /// than the writer (issue #83): arm with [`fail_next`] (`EINVAL` exercises the fallback for a file system without
+    /// a no-replace rename).
+    RetentionTakeOut,
+    /// An archiver other than the writer has taken a segment out of the journal (renamed it to its temporary name, or
+    /// into the destination), before it checks that the file is the one it checked and that the marker still names a
+    /// later segment. Arm with [`run_at`].
+    RetentionTakenOut,
+    /// Those checks passed, before the temporary name is unlinked (or the move made durable). Arm with [`run_at`].
+    RetentionVerified,
+    /// Those checks failed, before the segment is renamed back into the journal: arm with [`run_at`], or with
+    /// [`fail_next`] to make the no-replace rename fail (`EINVAL` exercises the fallback with `link`).
+    RetentionPutBack,
+    /// Unlinking the temporary name after putting a segment back with `link` (no no-replace rename): arm with
+    /// [`fail_next`].
+    RetentionPutBackUnlink,
     /// `Writer::checkpoint` or `Writer::close` has told the checkpoint thread that it is waiting for it (a retention
     /// run there then stops after the removal in progress), and is about to wait. Arm with [`run_at`] on the thread
     /// that calls them.
@@ -285,6 +302,35 @@ pub(crate) fn hook(point: Point) {
 #[inline(always)]
 pub(crate) fn hook(_point: Point) {}
 
+#[cfg(feature = "fault-injection")]
+mod naming {
+    use std::cell::Cell;
+
+    thread_local! {
+        pub(super) static NS: Cell<Option<u64>> = const { Cell::new(None) };
+    }
+}
+
+/// Makes this thread's retention removals name their temporary files with this time instead of the clock's (`None`:
+/// the clock again), so that a test can put a file at that name first.
+#[cfg(feature = "fault-injection")]
+pub fn temporary_names_at(unix_ns: Option<u64>) {
+    naming::NS.with(|n| n.set(unix_ns));
+}
+
+/// The time [`temporary_names_at`] set on this thread.
+#[cfg(feature = "fault-injection")]
+pub(crate) fn temporary_name_ns() -> Option<u64> {
+    naming::NS.with(|n| n.get())
+}
+
+/// The time [`temporary_names_at`] set (always `None` without the `fault-injection` feature).
+#[cfg(not(feature = "fault-injection"))]
+#[inline(always)]
+pub(crate) fn temporary_name_ns() -> Option<u64> {
+    None
+}
+
 /// Makes the next operation at `point` on this thread fail with OS error `errno`.
 #[cfg(feature = "fault-injection")]
 pub fn fail_next(point: Point, errno: i32) {
@@ -303,6 +349,7 @@ pub fn clear() {
         .clear();
     publish::HOOK.with(|h| *h.borrow_mut() = None);
     listing::OMIT.with(|o| o.borrow_mut().clear());
+    naming::NS.with(|n| n.set(None));
 }
 
 /// Makes the next operation at `point` on any of the writer's background threads fail with OS error `errno`.

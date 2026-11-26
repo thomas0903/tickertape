@@ -359,7 +359,7 @@ on by default on macOS, off on Linux; nothing reports the value in effect.
 Closing or destroying a writer does not checkpoint. A failed checkpoint poisons the writer: later checkpoints fail
 with `Status::durability_lost` while appends keep working; treat it as an incident. `ReaderOptions::durable_only(true)`
 gives a reader that returns only durable records (crash contract C13): it treats later records as not written yet
-and returns nothing without a valid checkpoint marker. See [`c-api.md` → Durability](c-api.md#durability) and
+and returns nothing without a valid checkpoint marker. A blocking durable-only reader is woken by checkpoints, not by appends (ADR 0053, from 1.1; beside a 1.0.0 writer it polls the marker at the maximum sleep); when the writer's helper threads share its CPU, the first record after a checkpoint can arrive up to about 1.5 ms after it (a median of 15–145 µs on cloud VMs) and the last record of a large backlog up to about 2 ms later than with a reader that polls the marker, so keep them on other CPUs (`WriterOptions::helper_cpus`, [`operations.md`](operations.md) → Pinned writers). See [`c-api.md` → Durability](c-api.md#durability) and
 [`crash-contract.md`](crash-contract.md) for the conditions.
 
 ## Errors
@@ -452,7 +452,7 @@ tickertape::WriterMetrics w = writer.metrics().value();  // in the writer's proc
 - `Writer::metrics()` makes no system call. Like every value type of the binding, these structs gain no members
   within a major version (ADR 0036 → Versioning); later values come as new types or functions.
 
-The latency histograms and record ages of the Rust crate (`tickertape::latency`, from 1.1, ADR
+The latency histograms (the writer's, too) and record ages of the Rust crate (`tickertape::latency`, from 1.1, ADR
 [0047](decisions/0047-latency-histograms.md)) are not available from C++ yet; `tickertape age` (see [`cli.md`](cli.md))
 reports ages from the command line.
 

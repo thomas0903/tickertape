@@ -5,6 +5,51 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
+- Fixed: an archiver (`retention::apply`, `tickertape archive`) could remove the checkpoint marker's segment, leaving a
+  dangling marker that a writer refuses, when the marker was lost, the oldest segment damaged and a writer recovered
+  between the archiver's checks of that segment and its removal (issue #83, ADR 0055; present since 1.0.0). An archiver
+  now takes the segment out of the journal with a no-replace rename, checks that it took the file it checked and that
+  the marker, read again, names a later segment (for a move by copy, also that the file still holds what was copied),
+  and only then lets it go; otherwise it renames it back and stops with the error. A writer's own retention run, which
+  holds the writer lock, is unchanged. **Behaviour changes:** a deletion, and a move by copy, now go through a temporary
+  name in the journal directory, `{base:020}.tape.{pid}.{unix_ns}.removing` (`docs/format.md`), which a crash can leave
+  behind. Readers, writers and `verify` ignore it (1.0.0 included); `status` (`removal_leftovers`) and `archive`
+  (`report.leftovers`; `retention::Report::leftovers`) report it. It may hold records the journal no longer has, so a
+  later retention run unlinks it only once retention has removed the segment its seal names (and its name is an hour
+  old and its process gone); `docs/operations.md` says how to keep it or put it back. An archiver's removal costs a
+  rename, a `stat` and a read of the marker more than before.
+- Fixed: `Writer::open` refuses a checkpoint marker whose position the records of its segment do not reach (ADR 0056,
+  issue #87). The record right before the marker's offset must be there, valid, end exactly at that offset and carry
+  the sequence number below the marker's `next_seq` (at offset 64, `next_seq` must be the segment's base). Otherwise the
+  open fails under every recovery policy with `Error::Corrupt`, reason `DanglingCheckpoint` (C ABI code 13, Python
+  `dangling_checkpoint`), reported at the segment and the marker's offset, before anything is changed. **Behaviour
+  change:** 1.0.0 opened such a journal, continued at the marker's position and made the gap below it permanent. Two
+  kinds of journal are refused now: segments restored from a backup while a newer `checkpoint` file was kept (restore
+  the backup's marker with them: `docs/operations.md` → Restoring from a backup), and a journal whose last record before
+  the marker's offset, in the marker's segment, is zeroed or damaged (`verify` already reported it). Damage to any earlier
+  covered record is not looked at, as before. No journal that a working writer and a crash leave on storage that honours
+  its syncs is refused. What to do after a refusal: `docs/operations.md` → After a crash. The check reads only the record
+  before the marker: on a healthy journal it adds work proportional to that record's length.
+- Fixed (macOS): a repair by replacement makes its copy of the segment durable on the drive (`F_FULLFSYNC`) before it
+  renames the copy over the segment, and so does a segment recovery creates (a new journal's first segment, a
+  successor after a lost roll) before its link. A power loss right after the rename could keep the new name without
+  the copied records before the checkpoint marker (lost silently in 1.0.0; with the check above, the next open would
+  refuse), and a new journal's first segment without its header made every later open fail. One more `F_FULLFSYNC`
+  per repair and per created segment; Linux was not affected (`fdatasync` flushes the device cache).
+- Changed: a durable-only reader that blocks at the checkpoint boundary is woken by checkpoints only, not by every append
+  (ADR 0053, issue #82). Checkpoints bump an event count of their own in the wake-up region, and a capability word says
+  which writers do. Since #66 made the reader's marker check fast, such a reader slept between appends and the writer
+  made a wake-up system call for almost every record (append p50 0.54 → 0.75 µs on aarch64, 0.56 → 1.20 µs on x86-64,
+  against 1.0.0); now appends make none for it, and are faster than 1.0.0's with such a reader (p50 0.30 against 0.51 µs
+  on aarch64, 0.44 against 0.56 µs on x86-64; `docs/benchmarks.md`, 2026-11-26). Beside a 1.0.0 writer, which does not bump those words, a durable-only
+  reader polls the marker every `Backoff::max_sleep` (1 ms by default) instead of registering, so that writer pays
+  nothing for it either; a 1.0.0 durable-only reader beside a new writer waits as before. The last records of a large
+  backlog can reach a durable-only reader up to about 2 ms later than a reader that polls the marker when the writer's helper threads share its
+  CPU (`WriterConfig::helper_cpus` avoids it). The `notify` record, the on-disk format, the API and the ABI do not
+  change; every pairing of 1.0.0 and new processes works (`tests/compat/v1.0.0-wake-ups.sh`).
+- Docs: the release checklist compares the append path with the previous release in `tt-sustained` with a durable-only
+  blocking reader, the case that the micro-benchmark and `tt-latency` miss (issue #82).
+
 - Fixed: a reader no longer stops silently at a zeroed commit word in older history (issue #79, ADR 0050). An empty slot
   that the checkpoint marker covers, or that a later segment (with a valid header) shows to have been filled, is `Error::Corrupt` with
   `CorruptReason::EmptyCommitWord` at its offset; before, `try_next` returned `Ok(None)` there for ever, and a replay ended
@@ -147,11 +192,19 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 - Docs: ADR 0045 (accepted) designs a sparse, rebuildable seek index next to sealed segments (issue #59), built as above.
 - Added (core): the `latency` module (from 1.1, issue #61), the first two steps of the new ADR 0047, which designs
   opt-in latency histograms in the library and a `tickertape age` command (the third step, histograms in the writer, is
-  not built): `latency::Recorder`, a histogram of durations that one thread records and any thread reads through a `View` without a lock, with exact extremes,
+  the next entry): `latency::Recorder`, a histogram of durations that one thread records and any thread reads through a `View` without a lock, with exact extremes,
   quantiles at most 1.6 % above the true value and interval views (`Snapshot::since`); and `latency::RecordAge`, the
   age of records as a reader returns them, with separate counts for records that are not live, not stamped or stamped
-  ahead of the clock. Nothing is recorded unless the application does it; the writer, the readers, the on-disk format
-  and the bindings are unchanged.
+  ahead of the clock. Nothing is recorded unless the application does it; the readers, the on-disk format and the
+  bindings are unchanged.
+- Added (core): `WriterConfig::latency` with `LatencyMode` (from 1.1, issue #61, the third step of ADR 0047), **off by
+  default**, and `Writer::latency`, which returns `latency::WriterLatency`: histograms of the writer's own calls, readable
+  from any thread of its process. `LatencyMode::RollsAndCheckpoints` records rolls and the time from a checkpoint request
+  to its durable marker and leaves an append that does not roll alone; `LatencyMode::All` also times every append and
+  every batch, without sampling. These are service times, not response times. Off, an append gains one test; what the
+  modes cost is in `docs/benchmarks.md` (2026-11-26). The file format, the crash contract and the bindings are unchanged.
+- Added (benchmarks): `tt-append-cost` (instructions per append, and the parts of a timed append), the `append/latency`
+  group of the `append` benchmark, and `tt-latency --writer-latency` and `--snapshot-ms`.
 - Added (CLI): `tickertape age` follows a live journal from its end and reports record ages as text or JSON (from 1.1).
   By default it polls, so that it never makes the watched writer's appends wake it (`--wait`). `live` in each report
   tells an idle journal from a reader that is not at the end of the journal yet and measured nothing.

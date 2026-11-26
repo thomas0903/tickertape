@@ -622,6 +622,7 @@ struct JsonStatus {
     writer: JsonWriter,
     readers_dir: JsonReadersDir,
     readers: Vec<JsonReader>,
+    removal_leftovers: Vec<String>,
     health: JsonHealth,
 }
 
@@ -817,6 +818,7 @@ impl JsonStatus {
                     update_age_s: r.update_age.map(secs),
                 })
                 .collect(),
+            removal_leftovers: s.removal_leftovers.clone(),
             health: JsonHealth {
                 ok: breaches.is_empty(),
                 corrupt: breaches.iter().any(Breach::is_corruption),
@@ -997,6 +999,14 @@ fn render_text(out: &mut String, journal: &Path, s: &Status, breaches: &[Breach]
             r.bytes_per_sec
                 .map_or_else(|| "?".into(), |b| human_bytes(b as u64)),
             human_duration(r.interval)
+        );
+    }
+    if !s.removal_leftovers.is_empty() {
+        let _ = writeln!(
+            out,
+            "leftovers   {} of interrupted removals (may hold records the journal no longer has; docs/operations.md): {}",
+            s.removal_leftovers.len(),
+            s.removal_leftovers.join(", ")
         );
     }
     let _ = writeln!(

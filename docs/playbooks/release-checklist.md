@@ -183,6 +183,39 @@ single-maintainer repository. Administrators are subject to the checks; force pu
    version (a test fails otherwise); the C++ binding has the release's version (ADR 0036). Dry-running both packages together requires Cargo 1.90+. The release scripts require Python 3.11+; CI
    selects Python 3.12.
 
+### Append path against the previous release (minor and major releases)
+
+Issue #82: a change to how a reader checks the marker made appends slower when a durable-only reader blocks, and no
+check showed it. The micro-benchmark and `tt-latency` with one reader do not exercise that path. Before a minor or major
+release, on one quiet cloud VM with local SSD (`docs/playbooks/run-benchmark.md`, machine rules), build three binaries
+of `tt-sustained` that differ only in the library:
+
+1. **Preferred:** the previous tag's workspace, built as it is (the baseline), a second copy of that binary (the noise
+   floor), and the previous tag's workspace with the candidate's `crates/tickertape` copied over it. The copied crate
+   inherits `version`, `rust-version` and the lints from the old workspace root, so every binary reports the old
+   version: label the runs by binary, never by what they report.
+2. **If that does not build** (a new dependency of the library, a raised MSRV, `--locked` refusing the lockfile): the
+   candidate's workspace for all three, with the previous tag's `crates/tickertape` copied over it for the baseline and
+   its copy. This is how issue #82 was measured (the 1.0.0 library under the harness of `0fcdb9e5`).
+
+Run them interleaved, at least 10 rounds in rotating order, each run with a new, empty `--dir` and `--out` (the tool
+refuses non-empty ones), deleting the journal after each run:
+
+```sh
+tt-sustained run --dir <ssd>/tt-<build>-<round> --out <out>/<build>-<round> --json --payload 1024 --duration 15s \
+  --warmup 3s --cpus 1,2,3,4,5,6 --rate 100000 --checkpoint-every 1s --checkpoint-mode background \
+  --retain-bytes 68719476736 --readers mapped,safe:wait=default,safe:durable:wait=block
+```
+
+Compare, as medians of the rounds with the range: the writer's `append_latency` p50, p99, p99.9 and maximum; each
+reader's CPU fraction and voluntary context switches (`readers[i].cpu`); and the writer's `hot_thread_cpu.system_cpu_s`.
+A difference larger than between the two copies of the previous release, in the same direction in most rounds, needs
+an explanation before the release: a fix, or an entry in the changelog that says what got slower and why. The context
+switches move by orders of magnitude when a reader starts or stops sleeping, so they show such a change even where the
+latency difference is small. Expected once, for the first release after 1.0.0 (ADR 0053): the durable-only reader's
+context switches and CPU fall by orders of magnitude, because it no longer wakes for every append. Keep the raw
+output with the other release notes; record numbers in `docs/benchmarks.md` only as the playbook says.
+
 ### C ABI at 1.0 (ADR 0028 → Versioning)
 
 For the 1.0 release, and checked again for every later release that ships the C library:

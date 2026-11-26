@@ -129,7 +129,8 @@ fn a_checkpoint_that_removes_one_segment_lists_once() {
     }
 }
 
-/// An archiver's run lists the directory once, whatever it removes, and opens three segments per removal.
+/// An archiver's run lists the directory once, whatever it removes, opens three segments per removal, and asks for the
+/// identity of each segment once it is out of the journal.
 #[test]
 fn an_archiver_lists_once_per_run() {
     for (n, keep) in [(10, 9), (10, 2), (60, 2)] {
@@ -146,18 +147,23 @@ fn an_archiver_lists_once_per_run() {
             let report = retention::apply(dir.path(), &plan, &Action::Delete).unwrap();
             assert_eq!(report.removed_segments, k as u64);
         });
-        // The stats: that the segment removed before is still gone.
-        assert_eq!(applying, (1, 3 * k, k - 1));
+        // The stats: that the segment removed before is still gone, and that the file taken out of the journal is the
+        // one checked (issue #83).
+        assert_eq!(applying, (1, 3 * k, (k - 1) + k));
         assert_eq!(bases(dir.path()).len(), keep);
     }
 }
 
 // The window between a run's listing and its removals: other archivers, at every point of it.
 
-const POINTS: [Point; 3] = [
+const POINTS: [Point; 5] = [
     Point::RetentionRemove,
     Point::MarkerRead,
     Point::RetentionChecked,
+    // An archiver's own (issue #83): the segment out of the journal, before and after it is checked again. A writer's
+    // run does not reach them.
+    Point::RetentionTakenOut,
+    Point::RetentionVerified,
 ];
 
 /// Segments in the journals of the tests below, and how many a run removes.
@@ -320,6 +326,10 @@ fn another_archiver_at_every_point_of_a_run() {
 fn a_missing_middle_at_every_point_of_a_run_stops_it() {
     for by_writer in [false, true] {
         for point in POINTS {
+            let taken_out = [Point::RetentionTakenOut, Point::RetentionVerified].contains(&point);
+            if by_writer && taken_out {
+                continue;
+            }
             for at in 0..REMOVED {
                 for gone in at + 1..N - 1 {
                     let case = format!("{by_writer} {point:?} {at} {gone}");
@@ -339,9 +349,10 @@ fn a_missing_middle_at_every_point_of_a_run_stops_it() {
                         retention::apply(dir.path(), &plan, &Action::Delete)
                     };
                     fault::clear();
-                    if point == Point::RetentionChecked && gone == at + 1 {
-                        // The successor had been checked, and goes before its predecessor does: by the time the run
-                        // gets to it, it is the oldest end that is gone, as after another archiver.
+                    if (point == Point::RetentionChecked || taken_out) && gone == at + 1 {
+                        // The successor had been checked, and goes before its predecessor does (or while its
+                        // predecessor is out of the journal): by the time the run gets to it, it is the oldest end
+                        // that is gone, as after another archiver.
                         let report = result.unwrap();
                         let planned = u64::from(gone < REMOVED);
                         assert_eq!(report.already_removed_segments, planned, "{case}");

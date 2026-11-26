@@ -31,7 +31,7 @@ Errors and recovery warnings go to stderr. JSON results go to stdout (or the sel
   price=… qty=…` (plus ` trade_id=…` or ` action=…`) to each text line, or ` decoded=-` when the record isn't a
   market-demo event; with `--format json` it adds the same `decoded` object as `export --decode` (see below).
   `--durable-only` returns only records below the current checkpoint marker's `next_seq` and waits for later
-  checkpoints using the usual idle timeout. With no valid checkpoint, it returns nothing until one appears;
+  checkpoints using the usual idle timeout; while it waits, checkpoints wake it, appends do not (ADR 0053). With no valid checkpoint, it returns nothing until one appears;
   `--no-follow` stops at that boundary and `--from-end` starts at the checkpoint observed at startup.
 - `inspect <DIR> [--json]`: checksum scan with per-segment metadata, totals, checkpoint and problems. Text
   displays creation time as RFC 3339 UTC, used bytes and percent. An invalid header has unavailable metadata.
@@ -221,6 +221,8 @@ Errors and recovery warnings go to stderr. JSON results go to stdout (or the sel
   validates. Records without a `local_ts_ns`, and records whose `local_ts_ns` is later than this machine's clock, are
   counted apart and have no age.
   `--durable-only` gives the age at which a durable-only reader gets records (it includes the wait for the checkpoint).
+  With `--wait block` it then waits for checkpoints, and only a checkpoint makes a wake-up system call for it (ADR 0053;
+  beside a 1.0.0 writer it polls every 1 ms instead).
   **When it ends.** `--duration` after its start, whether or not the reader is at the end by then, or after `--count`
   records returned while live, whichever comes first, with a final report. `--count 0` reports as soon as the reader is at
   the end. `--interval` prints a report each interval before that; an interval report is skipped while earlier ones are
@@ -361,14 +363,16 @@ A field with no set timestamps likewise has null time summaries and zero counts/
 {"schema_version":1,"dry_run":bool,
  "segments":[{"file":string,"base_seq":u64,"size_bytes":u64,"sealed_unix_ns":u64,
               "reasons":["max_segments"|"max_bytes"|"max_age", ...]}, ...],
- "report":{"removed_segments":u64,"removed_bytes":u64,"already_removed_segments":u64}|null}
+ "report":{"removed_segments":u64,"removed_bytes":u64,"already_removed_segments":u64,"leftovers":[string]}|null}
 ```
 
 `segments` is the plan in removal order (oldest first). `file` is a basename. `size_bytes` is the full segment
 size; `sealed_unix_ns` is the successor's creation timestamp. `reasons` lists all limits requesting each removal
 in count, bytes, age order, evaluated after preceding planned removals. `report` is null for a dry run; otherwise
 it counts files and full bytes removed by this run, and planned files already absent at the oldest end due to a
-concurrent archiver. A successful empty plan yields an empty `segments` array and zero report counts (or null in
+concurrent archiver. `leftovers` lists the temporary names of interrupted removals
+(`{base:020}.tape.{pid}.{unix_ns}.removing`, ADR 0055) that the run left in the journal directory, basenames; such a
+file may hold records the journal no longer has (`operations.md`). A successful empty plan yields an empty `segments` array and zero report counts (or null in
 a dry run). JSON numbers preserve their u64 interpretation; consumers should use field names.
 
 ### `index --json`
@@ -428,6 +432,7 @@ may grow:
                                    "ahead_of_sample"|null,
              "unread_age_s":number|null,"oldest_unread_local_ts_ns":u64|null,
              "updated_unix_ns":u64|null,"update_age_s":number|null}, ...],
+ "removal_leftovers":[string, ...],
  "health":{"ok":bool,"corrupt":bool,"verified":bool,
            "breaches":[{"code":"head_invalid"|"checkpoint_invalid"|"chain_broken"|"checkpoint_age"|
                                 "headroom_bytes"|"headroom_segments"|"reader_lag","reader":string|null}, ...]}}
@@ -455,9 +460,15 @@ not be established.
   writer refuses such a journal, `exposure` is unknown and `health.corrupt` is true. Other missing segments leave
   `verified` false.
 - `segments.before_checkpoint`: segments older than the checkpoint segment, which retention may remove.
+- `removal_leftovers`: temporary names of segments that an interrupted removal by an archiver left in the journal
+  directory (`{base:020}.tape.{pid}.{unix_ns}.removing`, ADR 0055), sorted. Such a file may hold records the journal no
+  longer has; see `operations.md`. It is not a breach and has no code of its own; the text output lists the names on a
+  `leftovers` line.
 - `checkpoint`: the marker's current slot, or null if no slot is valid. `problem` is set when the writer would refuse
   the marker (its segment missing or with an invalid header, or an offset outside the record area); then `exposure`
-  is unknown and `health.corrupt` is true. `modified_unix_ns` is the marker file's modification time and
+  is unknown and `health.corrupt` is true. A sample does not read the record before the marker's position, which the
+  writer also requires (from 1.1, ADR 0056: a marker its segment's records do not reach is refused); `verify` reports
+  where such records end. `modified_unix_ns` is the marker file's modification time and
   `estimated_age_s` the time since then, by the observer's clock at the end of the sample; null with
   `age_unknown_reason` when the time is detectably unreliable (`marker_resized`: the marker is not at its full
   length, because something cut it; a writer leaves it so until its next checkpoint succeeds, then extends it;

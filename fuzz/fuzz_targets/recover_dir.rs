@@ -12,10 +12,11 @@
 //! 5. With `RecoveryPolicy::Fail`, a refused `open` leaves every committed byte alone (it may have zeroed
 //!    never-committed bytes, sealed a segment and created a missing successor, as every policy does), and a successful one never quarantines.
 //!
-//! Records before a checkpoint marker are trusted, not re-read (format.md, step 2). So when a marker is present,
-//! problems that `verify` finds inside that trusted region are not findings, and a marker whose segment does not
-//! hold valid records up to the position it names (forged, or damaged by the generator afterwards) only gets the
-//! checks that do not depend on the marker.
+//! Records before a checkpoint marker are trusted, not re-read (format.md, step 2), except the one right before the
+//! marker's position: when it is missing or invalid, the open is refused (ADR 0056), which is an allowed outcome. So
+//! when a marker is present, problems that `verify` finds inside that trusted region are not findings, and a marker
+//! whose segment does not hold valid records up to the position it names (forged, or damaged by the generator
+//! afterwards) only gets the checks that do not depend on the marker.
 //!
 //! # Input grammar
 //!

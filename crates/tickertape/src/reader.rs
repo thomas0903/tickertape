@@ -599,10 +599,39 @@ impl Reader {
         notify: &crate::mmap::Notify,
         deadline: Option<Instant>,
     ) -> (Result<bool>, bool) {
-        let seen = notify.begin_wait();
+        // At the checkpoint boundary only a checkpoint helps a durable-only reader (ADR 0053). It waits on the marker
+        // words if the writer bumps them. With a writer that does not (1.0.0), it sleeps instead of registering, so that
+        // this writer's appends make no wake-up call for it; `next_timeout` looked just before this call, and looks again
+        // after it. With a `max_sleep` of zero that would be a busy loop: it then registers on the record words, as 1.0.0
+        // does. The capability word is read only for a durable-only reader at the boundary.
+        let on = if !self.waits_for_marker() {
+            crate::mmap::WaitOn::Record
+        } else if notify.writer_bumps_marker() {
+            crate::mmap::WaitOn::Marker
+        } else if !self.config.backoff.max_sleep.is_zero() {
+            let nap = deadline.map_or(self.config.backoff.max_sleep, |d| {
+                self.config
+                    .backoff
+                    .max_sleep
+                    .min(d.saturating_duration_since(Instant::now()))
+            });
+            if !nap.is_zero() {
+                std::thread::sleep(nap);
+            }
+            return (Ok(false), true);
+        } else {
+            crate::mmap::WaitOn::Record
+        };
+        #[cfg(test)]
+        if let Some(hook) = wake_tests::BEFORE_REGISTER.with(std::cell::Cell::take) {
+            hook();
+        }
+        let seen = notify.begin_wait(on);
         let found = self.advance();
-        if !matches!(found, Ok(false)) {
-            notify.end_wait();
+        if !matches!(found, Ok(false))
+            || (on == crate::mmap::WaitOn::Marker && !self.waits_for_marker())
+        {
+            notify.end_wait(on);
             return (found, true);
         }
         let cap = if notify.writer_notifies() {
@@ -614,12 +643,18 @@ impl Reader {
             cap.min(d.saturating_duration_since(Instant::now()))
         });
         let mut supported = true;
-        if !wait.is_zero() && notify.wait(seen, wait) == crate::mmap::WaitOutcome::Unsupported {
+        if !wait.is_zero() && notify.wait(on, seen, wait) == crate::mmap::WaitOutcome::Unsupported {
             supported = false;
             std::thread::sleep(wait.min(self.config.backoff.max_sleep));
         }
-        notify.end_wait();
+        notify.end_wait(on);
         (Ok(false), supported)
+    }
+
+    /// Whether the cursor is at the checkpoint boundary a durable-only reader knows: then only a checkpoint can give it a
+    /// record (ADR 0053).
+    fn waits_for_marker(&self) -> bool {
+        self.config.durable_only && self.next_seq >= self.durable_next_seq
     }
 
     /// Like [`Reader::try_next`], but copies the record out of the reader.
@@ -2094,7 +2129,13 @@ mod bound_tests;
 #[cfg(test)]
 mod wake_tests {
     use super::*;
-    use crate::mmap::test_hooks::{FORCE_UNSUPPORTED, LOCK, WAITS};
+
+    thread_local! {
+        /// Runs once in `block_on`, after the reader chose which words to wait on and before it registers.
+        pub(super) static BEFORE_REGISTER: std::cell::Cell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::Cell::new(None) };
+    }
+    use crate::mmap::test_hooks::{BEGINS, FORCE_UNSUPPORTED, LOCK, NO_CAPABILITIES, WAITS};
     use crate::{Writer, WriterConfig};
 
     fn blocking(sleep: Duration) -> Backoff {
@@ -2112,6 +2153,234 @@ mod wake_tests {
         fn drop(&mut self) {
             FORCE_UNSUPPORTED.store(false, Ordering::SeqCst);
         }
+    }
+
+    /// Resets `NO_CAPABILITIES` even if the test panics.
+    struct Capable;
+    impl Drop for Capable {
+        fn drop(&mut self) {
+            NO_CAPABILITIES.store(false, Ordering::SeqCst);
+        }
+    }
+
+    /// A writer that appends 30 records 10 ms apart, none of them checkpointed, then checkpoints, while a durable-only
+    /// reader that has read everything checkpointed before blocks. Returns the reader's registrations as a waiter on
+    /// the record words and on the marker words, and how long after the checkpoint it got the next record.
+    fn durable_reader_under_appends(sleep: Duration) -> (u64, u64, Duration) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w =
+            Writer::open(dir.path(), WriterConfig::default().segment_size(1 << 20)).unwrap();
+        let record = |w: &mut Writer| {
+            w.append(&crate::NewRecord {
+                schema_id: 1,
+                venue_ts_ns: 0,
+                local_ts_ns: 0,
+                payload: b"x",
+            })
+            .unwrap()
+        };
+        for _ in 0..5 {
+            record(&mut w);
+        }
+        w.checkpoint().unwrap();
+        let mut r = Reader::open(
+            dir.path(),
+            ReaderConfig::default()
+                .durable_only(true)
+                .backoff(blocking(sleep)),
+        )
+        .unwrap();
+        for seq in 0..5 {
+            assert_eq!(r.try_next().unwrap().unwrap().seq, seq);
+        }
+        let before = [0, 1].map(|i| BEGINS[i].load(Ordering::SeqCst));
+        let writer = std::thread::spawn(move || {
+            for _ in 0..30 {
+                record(&mut w);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            w.checkpoint().unwrap();
+            (w, Instant::now())
+        });
+        let got = r.next_timeout(Some(Duration::from_secs(10))).unwrap();
+        let received = Instant::now();
+        assert_eq!(got.map(|record| record.seq), Some(5));
+        let (_w, checkpointed) = writer.join().unwrap();
+        let begins = [0, 1].map(|i| BEGINS[i].load(Ordering::SeqCst) - before[i]);
+        (
+            begins[0],
+            begins[1],
+            received.saturating_duration_since(checkpointed),
+        )
+    }
+
+    /// ADR 0053: at the checkpoint boundary a durable-only reader waits on the marker words, so the appends never find
+    /// it registered on theirs, and the checkpoint wakes it.
+    #[test]
+    fn a_durable_only_reader_at_the_boundary_waits_on_the_marker_words() {
+        let _serial = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (record, marker, after) = durable_reader_under_appends(Duration::from_secs(10));
+        assert_eq!(record, 0, "registered on the record words");
+        assert!(marker >= 1, "never registered on the marker words");
+        // A lost wake-up costs the 100 ms cap; the poll interval is 10 s.
+        assert!(
+            after < Duration::from_millis(90),
+            "woken {after:?} after the checkpoint"
+        );
+    }
+
+    /// ADR 0053: with a writer that does not bump the marker words (capabilities 0, as 1.0.0), a durable-only reader at
+    /// the boundary sleeps `max_sleep` at a time without registering, so that writer makes no wake-up call for it.
+    #[test]
+    fn a_durable_only_reader_sleeps_unregistered_beside_a_writer_without_marker_words() {
+        let _serial = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _capable = Capable;
+        NO_CAPABILITIES.store(true, Ordering::SeqCst);
+        let (record, marker, after) = durable_reader_under_appends(Duration::from_millis(5));
+        assert_eq!((record, marker), (0, 0), "registered as a waiter");
+        assert!(
+            after < Duration::from_millis(90),
+            "{after:?} after the checkpoint"
+        );
+    }
+
+    /// A durable-only reader at the boundary of 5 checkpointed records, which it has read, and the region it would block
+    /// on (taken out of its waker, so that a test can call `block_on` with a deadline of its own).
+    fn reader_at_the_boundary(dir: &std::path::Path) -> (Writer, Reader, crate::mmap::Notify) {
+        let mut w = Writer::open(dir, WriterConfig::default().segment_size(1 << 20)).unwrap();
+        for _ in 0..5 {
+            append_one(&mut w);
+        }
+        w.checkpoint().unwrap();
+        let mut r = Reader::open(
+            dir,
+            ReaderConfig::default()
+                .durable_only(true)
+                .backoff(blocking(Duration::from_secs(10))),
+        )
+        .unwrap();
+        for seq in 0..5 {
+            assert_eq!(r.try_next().unwrap().unwrap().seq, seq);
+        }
+        let (_, notify) = r.waker.as_mut().unwrap().take().unwrap();
+        (w, r, notify)
+    }
+
+    fn append_one(w: &mut Writer) -> u64 {
+        w.append(&crate::NewRecord {
+            schema_id: 1,
+            venue_ts_ns: 0,
+            local_ts_ns: 0,
+            payload: &[7; 8],
+        })
+        .unwrap()
+    }
+
+    /// A checkpoint between the reader's choice of the marker words and its registration bumps the count before the
+    /// reader reads it, so no wake-up will come: its look after registering must find the record. Without that look it
+    /// sleeps out the 100 ms cap (the deadline here is 10 s).
+    #[test]
+    fn a_checkpoint_between_the_choice_and_the_registration_is_not_lost() {
+        let _serial = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let (w, mut r, notify) = reader_at_the_boundary(dir.path());
+        let w = std::rc::Rc::new(std::cell::RefCell::new(w));
+        let hooked = std::rc::Rc::new(std::cell::Cell::new(None));
+        let (writer, at) = (w.clone(), hooked.clone());
+        BEFORE_REGISTER.set(Some(Box::new(move || {
+            let mut w = writer.borrow_mut();
+            append_one(&mut w);
+            w.checkpoint().unwrap();
+            at.set(Some(Instant::now()));
+        })));
+        let (found, _) = r.block_on(&notify, Some(Instant::now() + Duration::from_secs(10)));
+        let after = hooked.get().expect("the hook did not run").elapsed();
+        assert!(found.unwrap(), "no record after the checkpoint");
+        assert!(
+            after < Duration::from_millis(50),
+            "returned {after:?} after the checkpoint"
+        );
+        assert_eq!(r.found.header.seq, 5);
+    }
+
+    /// The reader chose the marker words at its old boundary; its look then applies a new marker that covers a slot whose
+    /// commit word storage damage emptied. A reader that has already waited at an empty slot checks such a slot against
+    /// the marker only after 100 ms there (ADR 0050), so the look returns nothing although it moved the boundary. It must
+    /// return to choose again (the record words, which appends bump), not sleep on the marker words, which nothing bumps
+    /// here until the 100 ms cap.
+    #[test]
+    fn a_look_that_moves_the_boundary_without_a_record_chooses_again() {
+        use std::os::unix::fs::FileExt;
+        let _serial = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let (w, mut r, notify) = reader_at_the_boundary(dir.path());
+        // It has waited at the empty slot after the checkpointed records once already, and (whatever the checkpoint in
+        // the hook takes on a loaded machine) for less than the 100 ms after which it would check the slot against the
+        // marker: a start of waiting in the future reads as no time waited.
+        r.at_empty_slot().unwrap();
+        r.waiting_since = Some(Instant::now() + Duration::from_secs(3600));
+        let w = std::rc::Rc::new(std::cell::RefCell::new(w));
+        let hooked = std::rc::Rc::new(std::cell::Cell::new(None));
+        let (writer, at, path) = (w.clone(), hooked.clone(), dir.path().to_path_buf());
+        BEFORE_REGISTER.set(Some(Box::new(move || {
+            let mut w = writer.borrow_mut();
+            assert_eq!(append_one(&mut w), 5);
+            let frame = format::align8(u64::from(format::frame_len(8).unwrap()));
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(path.join(format::segment_file_name(0)))
+                .unwrap()
+                .write_all_at(&[0; 4], format::SEGMENT_HEADER_LEN as u64 + 5 * frame)
+                .unwrap();
+            w.checkpoint().unwrap();
+            at.set(Some(Instant::now()));
+        })));
+        let (found, _) = r.block_on(&notify, Some(Instant::now() + Duration::from_secs(10)));
+        let after = hooked.get().expect("the hook did not run").elapsed();
+        assert!(!found.unwrap(), "a record in an emptied slot");
+        assert!(!r.waits_for_marker(), "the look did not move the boundary");
+        assert!(
+            after < Duration::from_millis(50),
+            "returned {after:?} after the checkpoint: it slept on the marker words"
+        );
+    }
+
+    /// With `max_sleep` zero, a durable-only reader beside a writer without the marker words must not loop without
+    /// sleeping: it registers on the record words, as 1.0.0 does, and blocks up to the 100 ms cap per wait.
+    #[test]
+    fn a_reader_with_no_sleep_beside_a_writer_without_marker_words_does_not_spin() {
+        let _serial = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _capable = Capable;
+        NO_CAPABILITIES.store(true, Ordering::SeqCst);
+        let dir = tempfile::tempdir().unwrap();
+        let mut w =
+            Writer::open(dir.path(), WriterConfig::default().segment_size(1 << 20)).unwrap();
+        append_one(&mut w);
+        w.checkpoint().unwrap();
+        let mut r = Reader::open(
+            dir.path(),
+            ReaderConfig::default()
+                .durable_only(true)
+                .backoff(blocking(Duration::ZERO)),
+        )
+        .unwrap();
+        assert_eq!(r.try_next().unwrap().unwrap().seq, 0);
+        let begins = BEGINS[0].load(Ordering::SeqCst);
+        let waits = WAITS.load(Ordering::SeqCst);
+        assert!(
+            r.next_timeout(Some(Duration::from_millis(500)))
+                .unwrap()
+                .is_none()
+        );
+        // Registered on the record words and blocked, up to the 100 ms cap each time: a handful of waits, not a loop
+        // that never registers (the unregistered branch with a sleep of zero).
+        let begins = BEGINS[0].load(Ordering::SeqCst) - begins;
+        let waits = WAITS.load(Ordering::SeqCst) - waits;
+        assert!(
+            (2..=20).contains(&begins),
+            "{begins} registrations in 500 ms"
+        );
+        assert!((2..=20).contains(&waits), "{waits} waits in 500 ms");
     }
 
     #[test]

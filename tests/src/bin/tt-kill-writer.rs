@@ -5,6 +5,7 @@
 //! Usage: `tt-kill-writer <dir> <segment_size> <seed> [mixed] [slow-fill]`
 //!
 //! With `mixed`, payload lengths follow `mixed_len` (up to 3,199 bytes) instead of `kill_len` (up to 512 bytes).
+//! With an even seed the writer keeps latency histograms (`LatencyMode::All`).
 //! With `slow-fill`, payloads are written by `append_with` in 8-byte steps with a pause in between, so that most
 //! kills land inside the fill closure: after the header fields and before the CRC and the commit word.
 //!
@@ -14,14 +15,15 @@
 use std::io::Write;
 use std::path::PathBuf;
 
-use tickertape::{NewRecord, Writer, WriterConfig};
+use tickertape::{LatencyMode, NewRecord, Writer, WriterConfig};
 use tickertape_tests::{Rng, kill_len, mixed_len, payload};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let dir = PathBuf::from(&args[1]);
     let segment_size: u64 = args[2].parse().expect("segment_size");
-    let mut rng = Rng::new(args[3].parse().expect("seed"));
+    let seed: u64 = args[3].parse().expect("seed");
+    let mut rng = Rng::new(seed);
     let options = &args[4.min(args.len())..];
     let slow_fill = options.iter().any(|a| a == "slow-fill");
     let len_of: fn(u64) -> usize = if options.iter().any(|a| a == "mixed") {
@@ -31,8 +33,16 @@ fn main() {
     };
 
     let parent = std::os::unix::process::parent_id();
-    let mut writer = Writer::open(&dir, WriterConfig::default().segment_size(segment_size))
-        .expect("open writer");
+    // Timed calls must not change what a kill leaves behind (ADR 0047).
+    let latency = if seed % 2 == 0 {
+        LatencyMode::All
+    } else {
+        LatencyMode::Off
+    };
+    let config = WriterConfig::default()
+        .segment_size(segment_size)
+        .latency(latency);
+    let mut writer = Writer::open(&dir, config).expect("open writer");
     let mut out = std::io::stdout().lock();
     let mut next_checkpoint = rng.below(2000);
     loop {

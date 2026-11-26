@@ -151,7 +151,16 @@ writer process crashing, but not a power loss (crash contract C1, C7, C8).
 - **Exposure.** After a power loss, everything since the last successful checkpoint may be gone, and its sequence
   numbers will be reused for new records.
 - **Durable-only readers** (`ReaderConfig::durable_only`, `--durable-only`) see records only once a checkpoint
-  covers them, so they lag the writer by up to one checkpoint interval.
+  covers them, so they lag the writer by up to one checkpoint interval. A blocking one is woken by the checkpoint, not
+  by appends (ADR 0053, from 1.1), where a reader polling the marker on a full core starts at once. With the writer's
+  helper threads free to run on the reader's CPU, the **first** record after each checkpoint arrived a median of 15–145
+  µs after the checkpoint completed (worst 1.2–1.5 ms), and the last record of a 1-second interval at about 170,000
+  records/s up to 2 ms later than with such a polling reader (cloud VMs, `benchmarks.md`, 2026-11-26). With the helpers
+  on other CPUs (**Pinned writers** above, `WriterConfig::helper_cpus`): 11–33 µs (worst 0.2 ms) for the first record,
+  0–0.6 ms for the last. A consumer that acts on the first durable record (fills, risk, replication) should pin the
+  helpers. A shorter interval means a smaller backlog and less delay on the last record. Beside a 1.0.0 writer, a 1.1
+  durable-only reader polls the marker every `Backoff::max_sleep` (1 ms by default) instead of registering, so that
+  the old writer's appends make no wake-up call for it; with a `max_sleep` of zero it registers as 1.0.0 does.
 - **Recovery time.** When the writer opens, it validates everything written since the last checkpoint; a journal
   that is never checkpointed is validated from the start every time.
 
@@ -246,6 +255,26 @@ The same rules apply to the library and CLI, without taking the writer lock:
   it (their headers are read to confirm their sizes).
 - Do not put segment files back into a journal while retention or `archive` runs on it: a run lists the directory once
   and does not notice every file that appears in front of the oldest segment (crash contract C14).
+- An archiver (`archive`, `retention::apply`; not a writer's own retention) takes each segment out of the journal by a
+  rename before it lets it go, and checks that it is still the file it checked and that the marker still names a later
+  segment, so that a writer's recovery in between cannot make it remove the marker's segment (ADR 0055). A deletion, and
+  a cross-filesystem move once its copy is durable, rename the segment to `{base:020}.tape.{pid}.{unix_ns}.removing` in
+  the journal directory and then unlink it. If the archiver is killed in between, that name stays. Readers, writers and
+  `verify` ignore it; `tickertape status` (a `leftovers` line, `removal_leftovers` in JSON) and `tickertape archive`
+  (`leftovers`) report it. **It may hold records the journal no longer has** (a writer that already held the segment can
+  have filled it and moved on, in the race the check is for), so do not delete it because its `base_seq` is below the
+  checkpoint segment's. A later `archive` or writer retention run unlinks it once retention has removed the segment
+  after it (its seal names a segment that is gone, below the oldest), its name is an hour old and its process is gone.
+  To deal with one yourself:
+  - To keep its records, move it to an archive directory under its segment name (`mv -n NAME
+    ARCHIVE/{base_seq:020}.tape`).
+  - To return it to the journal, stop every writer and archiver of the journal, then rename it to `{base_seq:020}.tape`
+    without replacing anything: `mv -n NAME DIR/{base_seq:020}.tape` (check that `NAME` is gone afterwards), or `ln NAME
+    DIR/{base_seq:020}.tape && rm NAME`. Run `tickertape verify`: a broken chain at that segment means the segment after
+    it is gone; take it out again as above. Put two consecutive leftovers (the older one's seal names the newer one's
+    segment) back newest first and the older one last, so that the chain is whole after each rename. If a writer refuses to open with a dangling checkpoint naming that
+    `base_seq` (the archiver was killed while putting back a segment that a recovery had just restarted), this is the
+    fix; for a move by rename, the file is in the destination under its segment name.
 - Moves preserve the segment basename and require an existing destination directory. Same-filesystem moves use
   an atomic no-replace rename. `EXDEV` selects copy, sync the copy, sync the destination directory, remove the
   source, sync the journal directory. Existing files (including symlinks and identical copies) are errors.
@@ -401,14 +430,25 @@ What a reader on the new machine sees:
 Do not open a writer on an archive copy: it creates the missing next segment and continues with sequence numbers the
 original journal already uses.
 
+### Restoring from a backup
+
+Stop the writer and any `tickertape archive` job or other process that applies a retention policy to the journal first:
+retention goes by the marker it finds, and the newer marker can make it remove restored segments that the backup's
+marker will name. Then restore the backup's `checkpoint` together with its segments, and remove the segments the backup
+does not have. The marker vouches for every record below its `next_seq`, so a marker newer than the segments covers
+records they lack. From 1.1 a writer refuses such a journal under every recovery policy, before it changes anything
+(`DanglingCheckpoint`, reported at the marker's segment and offset; ADR 0056); readers and `verify` stop where the
+restored records end. If the backup's marker is lost, see "After a crash" → Refused to open.
+
 ### Limits
 
 - **Do not copy a journal a writer is using as a whole.** The files change during the copy, so it is no snapshot.
   Copying the segments before `checkpoint` is dangerous: the marker can cover records the copied segments lack. If the
   marker names a segment the copy lacks, the writer refuses the copy. If it points into a segment that was copied
-  earlier, `verify` and `status` can both exit with 0 and the writer opens, continues at the marker's sequence number
-  and leaves a hole that readers cannot pass. A sign of this is a `verify` `last_seq` + 1 lower than the checkpoint's
-  `next seq` in `status`. Copying `checkpoint` first avoids that, but the records after the marker may be incomplete,
+  earlier, `status` can exit with 0, `verify` reports `EmptyCommitWord` where the copied records end (from 1.1, ADR
+  0050), and the writer refuses the copy (from 1.1, ADR 0056: `DanglingCheckpoint` at that segment and the marker's
+  offset; 1.0.0 opened it, continued at the marker's sequence number and left a hole that readers cannot pass). A sign of this is a `verify` `last_seq` + 1 lower than the checkpoint's `next seq` in
+  `status`. Copying `checkpoint` first avoids that, but the records after the marker may be incomplete,
   `verify` can fail because the next segment is missing, and retention may remove segments during the copy. Stop the
   writer, or use the archive recipe above.
 - A copy that lacks a segment in the middle, or the newest one after a sealed one, fails `verify`; one that lacks only
@@ -639,8 +679,74 @@ previous = now;
 ```
 
 An application can time anything else with a `latency::Recorder` of its own, for example its `checkpoint()` calls, or an
-event's handling from when it was due (see the module's documentation for why that differs from the call's duration). The
-library records nothing by itself: no histogram of appends, rolls or checkpoints is kept in the writer.
+event's handling from when it was due (see the module's documentation for why that differs from the call's duration).
+
+### How long the writer's calls take
+
+From 1.1 (ADR [0047](decisions/0047-latency-histograms.md)), **off by default**. `WriterConfig::latency` makes the writer
+keep histograms of its own calls, which any thread of **its process** can read through `Writer::latency()`. They cannot be
+read from another process: `tickertape status` does not show them, and the bindings do not have them yet.
+
+| `LatencyMode` | Records | Work added to an append that does not roll |
+|---|---|---|
+| `Off` (default) | Nothing; `Writer::latency()` is `None` | One test |
+| `RollsAndCheckpoints` | Rolls, and checkpoints from request to durable marker | None over `Off` |
+| `All` | Also every append and every batch, without sampling | Two monotonic clock reads and one histogram update |
+
+```rust
+let mut writer = Writer::open("/data/journal", WriterConfig::default().latency(LatencyMode::RollsAndCheckpoints))?;
+let latency = writer.latency().cloned(); // for the monitoring thread
+```
+
+| Suggested metric | Accessor | What one value is |
+|---|---|---|
+| `append_service_seconds` | `append()` | One successful `append`, `append_with` or `try_append_with`, from its entry to its return |
+| `append_batch_service_seconds` | `batch()` | One successful `append_batch` that appended at least one record, whatever its size |
+| `roll_seconds` | `roll()` | The time the appending thread spent on one roll (also inside a batch); the append's or batch's value includes it |
+| `checkpoint_time_to_durable_seconds` | `time_to_durable()` | One checkpoint that wrote its marker, from the entry of `checkpoint()`, or of the earliest `request_checkpoint()` it covers, until the marker is durable |
+
+**What these numbers are not.**
+
+- **`append_service_seconds` is a service time, not a response time.** If one append stalls for 5 ms, the events queued
+  behind it are late too, but there is one 5 ms value (coordinated omission), so the histogram can look better than what a
+  queue behind the writer experienced. A program that knows when each event was due records `now - due` in a
+  `latency::Recorder` of its own.
+- **A call or a checkpoint that is still stuck has no value yet.** `tickertape status` shows that: a head that stands
+  still, a growing exposure age. Calls that fail, declined records and empty batches are not recorded at all.
+- **Short values are distorted by the clock, both ways.** Parts of both clock reads fall inside an append's value, and
+  the clock ticks: 41.7 ns on Apple silicon, the period of `cntfrq_el0` on other aarch64 machines. With a coarse clock a
+  short append often shows as 0 or one tick (on an M4 Pro, 1,000,000 appends of 8 bytes gave about 40 % zeros and 60 %
+  at 41–42 ns); with a fine one even an empty interval measures some nanoseconds (its median, in
+  [`benchmarks.md`](benchmarks.md) 2026-11-26: 20 ns on x86-64 and 33 ns on aarch64 cloud VMs). Nothing is subtracted.
+- **They include being descheduled**, page faults, the wake-up of blocked readers and the hand-off to the helper threads.
+  Timing also changes the code that is timed: it limits how far consecutive appends overlap in the CPU, and the end read
+  does not wait for the store buffer, so part of an append's cost can fall outside its value.
+- **`checkpoint_time_to_durable_seconds` is not a record's time to durability**, which adds the wait for the next request
+  (`RecordAge` in a durable-only reader shows that). It includes waiting behind a running checkpoint and excludes the
+  retention run that follows it (a blocking `checkpoint()` called while a background checkpoint's retention runs still
+  waits for the removal in progress, and that wait is in its value). Requests that join a waiting checkpoint give one
+  value, from the earliest of them.
+- **They are not the numbers of the published `tt-sustained` tables.** `tt-sustained` counts to-durable once per request,
+  so joined requests count several times there and once here, and up to when its loop sees the checkpoint finished. Its
+  "roll" is the whole append that rolled; `roll_seconds` is only the roll, so it is smaller. Its "Pause" (the time a
+  caller spends in `request_checkpoint` or `checkpoint`) is not measured here: time your own calls.
+
+**Cost.** Measured on 4-vCPU cloud VMs ([`benchmarks.md`](benchmarks.md), 2026-11-26): with `Off` and
+`RollsAndCheckpoints` an append that does not roll ran within 1 ns of the code without the option at 64 B (within the
+noise on x86-64, 0.8 ns faster on aarch64) and within the noise floor and the 2 % bound at 1,024 B. **`All` added 57 ns to a 64-byte append on x86-64
+(38 → 95 ns, about 10.5 million appends/s on one thread) and 83 ns on aarch64 (42 → 125 ns, about 8 million/s)**, and
+54 to 58 ns to a 1,024-byte one: more than the append itself at 64 B. Almost all of it is the two clock reads; the
+histogram update is about 2 ns. Turn `All` on where that is affordable, or for a period of diagnosis.
+
+**Linux:** the clock reads of `All` are calls into the vDSO, without entering the kernel, only with a clock source the
+vDSO can read: `tsc`, `kvm-clock`, `hyperv_clocksource_tsc_page` and `arch_sys_counter`. With others (`hpet`, `acpi_pm`,
+some Xen guests) each read is a system call: **do not use `LatencyMode::All` there.** The library does not test for it;
+`cat /sys/devices/system/clocksource/clocksource0/current_clocksource` says which one is in use. macOS reads the clock
+without a system call.
+
+Each histogram takes about 30 KB, allocated when the writer opens. Nothing else is needed for it: no thread, no lock, no
+file, and no effect on what is committed or durable. Export it as shown above for `RecordAge`, with a snapshot per scrape
+and `since` for the values of an interval.
 
 ### Making readers in other processes visible
 
@@ -713,10 +819,12 @@ the writer or retention.
   the newest segment at or after the marker, or in the last segment of a directory without a marker (crash contract C11).
   What to do: run `verify`, which names the position and what is behind it. If the position is at or after the
   checkpoint, opening the writer repairs it or refuses ("After a crash"). If it is before the checkpoint, recovery does
-  not look there: restore the segment from a copy. For archives and old segments, run `verify` after moving or restoring
+  not look there, except at the record right before the marker's position, where the writer refuses to open (from 1.1,
+  ADR 0056): restore the segment from a copy. For archives and old segments, run `verify` after moving or restoring
   them, and after storage errors. `EmptyCommitWord` does not always mean damaged bytes (ADR 0050): it also means that the
-  checkpoint marker is newer than the segments (segments restored from a backup while a newer marker was kept; the writer
-  opens such a journal and carries on, so the gap stays: issue #87; restore the marker with the segments); that after a
+  checkpoint marker is newer than the segments (segments restored from a backup while a newer marker was kept; from 1.1
+  the writer refuses such a journal, ADR 0056: restore the backup's marker with the segments, "Restoring from a
+  backup"); that after a
   power loss a later segment, or its first page, reached the disk and the records or the seal before it did not (reported
   until a writer opens the journal and repairs it; a reader started at boot before the writer fails until then); or that a
   segment with a valid header was copied in from another journal (`verify` names it; remove it). A file named like a
@@ -771,5 +879,24 @@ the writer or retention.
   earlier in the scan, including bytes zeroed in place. Crash contract C11 lists them.
 - **Refused to open** (missing checkpoint segment or a gap in the chain): restore the missing segments from a copy,
   or move the affected segments aside knowingly. tickertape won't discard history on its own.
+- **Refused to open with `DanglingCheckpoint` at a segment and an offset** (from 1.1, under every policy; ADR 0056):
+  the checkpoint marker's position lies beyond the records that segment holds, or the record right before it is
+  damaged, so the marker vouches for records the journal lacks. Nothing was changed. Run `tickertape verify` (it names
+  where the records end, or the damaged record) and `tickertape inspect` or `status` (the marker's segment, offset and
+  next sequence number). Then, in order of what they lose:
+  1. Segments restored from a backup: restore that backup's `checkpoint` with them. Nothing is lost.
+  2. A damaged record: restore its segment from a copy or a replica. Nothing is lost.
+  3. Otherwise, knowingly, move `checkpoint` out of the directory and keep it. The writer then opens without a marker
+     and validates the whole journal from the oldest segment (an open that takes longer the larger the journal).
+     Where the restored records simply end, it continues there; a damaged record with records or segments after it is
+     handled like any corrupt position (with `Quarantine` the bytes from it on, and the later segments, go to
+     `quarantine/`, so the covered records after the damage leave the journal; `Fail` refuses). Either way the writer
+     gives the sequence numbers the old marker covered beyond the last valid record to new records. Anything that saw
+     the old records under those numbers then has a different record under the same number: readers of either kind,
+     exports, and downstream systems that store sequence numbers. Start readers again from a position you choose and
+     reconcile what was exported. Durable-only readers return nothing, and retention removes nothing, until the next
+     checkpoint.
+
+  No command sets the marker back or opens such a journal at the marker.
 
 The `quarantine/` directory is never cleaned up by tickertape; inspect it and delete it yourself when you're done.
