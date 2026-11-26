@@ -200,7 +200,7 @@ the first record of its successor, then the link of the segment after that; and 
 that covers it. So a slot expecting sequence number `S` in segment `X` **cannot be the head** if, read in this order,
 
 1. the current checkpoint's `next_seq` is above `S`, or it names a segment after `X`; or a segment with a `base_seq` above
-   `S` exists; or the newest segment has `base_seq` `S`, is not `X`, and holds a valid record in its first slot;
+   `S` exists, with a valid header (a writer links the name only after the header is written); or the newest segment has `base_seq` `S`, is not `X`, and holds a valid record in its first slot;
 2. the path of `X` still names the file the reader has open; and
 3. the commit word is still 0, read from the file again.
 

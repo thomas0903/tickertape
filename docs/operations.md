@@ -680,7 +680,13 @@ the writer or retention.
   What to do: run `verify`, which names the position and what is behind it. If the position is at or after the
   checkpoint, opening the writer repairs it or refuses ("After a crash"). If it is before the checkpoint, recovery does
   not look there: restore the segment from a copy. For archives and old segments, run `verify` after moving or restoring
-  them, and after storage errors.
+  them, and after storage errors. `EmptyCommitWord` does not always mean damaged bytes (ADR 0050): it also means that the
+  checkpoint marker is newer than the segments (segments restored from a backup while a newer marker was kept; the writer
+  opens such a journal and carries on, so the gap stays: issue #87; restore the marker with the segments); that after a
+  power loss a later segment, or its first page, reached the disk and the records or the seal before it did not (reported
+  until a writer opens the journal and repairs it; a reader started at boot before the writer fails until then); or that a
+  segment with a valid header was copied in from another journal (`verify` names it; remove it). A file named like a
+  segment without a valid header is ignored by readers.
 - A damaged header of the oldest segment makes `Reader::open` fail, and with it every seek of a new reader, although no
   other segment is damaged; retention cannot remove that segment either (it reads its header; by the code, not run).
 - `tickertape inspect <dir>` lists segments, their sequence ranges and fill level, and the checkpoint marker.

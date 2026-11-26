@@ -6,7 +6,7 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 ## [Unreleased]
 
 - Fixed: a reader no longer stops silently at a zeroed commit word in older history (issue #79, ADR 0050). An empty slot
-  that the checkpoint marker covers, or that a later segment shows to have been filled, is `Error::Corrupt` with
+  that the checkpoint marker covers, or that a later segment (with a valid header) shows to have been filled, is `Error::Corrupt` with
   `CorruptReason::EmptyCommitWord` at its offset; before, `try_next` returned `Ok(None)` there for ever, and a replay ended
   without an error. **What callers see changes:** an error where a wait was. It comes in the call that meets the first
   empty slot after opening or seeking, otherwise after at most 100 ms at the slot (1.1 s if only a later segment shows

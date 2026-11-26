@@ -1,6 +1,7 @@
 # 0050: An empty slot that cannot be the head is corruption
 
-- **Status:** proposed
+- **Status:** accepted (2026-11-26, by the orchestrator on the owner's delegation, after one independent review and a
+  re-check)
 - **Date:** 2026-11-26
 - **Relates to:** [0034](0034-durable-only-reads-check-segment-identity.md) (its facts F1 to F5 are used here),
   [0035](0035-recovery-preserves-a-committed-tail.md) (what recovery does at an empty commit word),
@@ -37,8 +38,14 @@ worse than the defect.
 
 - **(A) the marker covers it:** the current marker's `next_seq` is above `S`, or it names a segment after `X` (this
   includes a missing seal when the marker is at the first slot of the next segment);
-- **(B) a later segment proves it:** a segment with a base above `S` exists, or the newest segment has base `S`, is not
-  `X` and holds a valid record in its first slot.
+- **(B) a later segment proves it:** a segment with a base above `S` exists **and has a valid header** (for the base in its
+  name and its own size), or the newest segment has base `S`, is not `X` and holds a valid record in its first slot. A
+  writer links a segment's name only after it wrote the header (`create_segment`, the spare's publication), so a file with
+  such a name and no valid header (a stray file, one whose header never reached the disk) is no evidence. Every later name
+  is tried, the newest first. A segment with a valid header copied in from **another journal** counts: nothing in a header
+  ties it to a journal (its base matches the name, its size its file, and the sizes of a journal's segments may differ),
+  and recovery and `verify` treat it the same way (a segment with a higher base is evidence of history, or disconnected).
+  The files then no longer form one chain, and the report is what the operator needs: `verify` names the foreign file.
 
 The error is `Error::Corrupt` with the segment, the slot's offset and `CorruptReason::EmptyCommitWord(n)`, `n` being the
 marker's `next_seq` (A) or the segment's base (B). No new error, variant or code in any binding. `verify` reports a problem
@@ -54,9 +61,13 @@ first and the file that was then in place still shows 0, the word was emptied. A
 after the evidence**: the 0 it saw first may be older than the record. It reads it from the file with `pread`, also if it
 is the zero-copy reader, whose mapping can lag (`crash-contract.md` → Known risks and limits).
 
-On top of that argument the reader reads the slot again for the 50 ms of every reported slot, and then establishes the
-evidence, the identity and the empty slot a second time. This costs nothing unless the evidence is there, and keeps
-transient states of a recovery in progress from being reported.
+**The 50 ms window.** The argument does not need it. Before reporting, the reader reads the slot again for 50 ms, as it does
+for every slot it reports, and then establishes the evidence, the identity and the empty slot a second time. That is
+defence in depth, kept at a cost of 50 ms per report and nothing otherwise: it covers a violation of the argument's one
+assumption about the platform, that a store a writer made before the evidence is visible to a `pread` made after the
+reader saw the evidence. Issue #43 showed that a mapped view of a page can lag a writer's stores for microseconds; a `pread`
+has not been seen to, but if one did, the window would turn that lag into a delay rather than a false report. The only test
+that notices its removal is the one of the delay.
 
 **The cases where an empty slot is legitimate:**
 
@@ -83,10 +94,18 @@ more, and it returns **`Error::Discarded`**, whose documented answer, `seek`, is
 puts the reader on the current chain, or, if the record before the cursor was damaged too, makes it report that damage.
 Until now it waited until the application sought on its own.
 
-**States that are reported although no byte was damaged.** After a power loss, files can hold a later segment's name and
-not the records before it (C8). Until a writer opens the journal and repairs it, (B) reports that, as `verify` does; a
-marker (A) is never in that state under the storage assumptions. The same holds for a copy of a journal whose marker, or
-later segment, is newer than its earlier segments. In each of them the files do not hold the history they claim.
+**States that are reported although no byte was damaged.** In each of them the files do not hold the history they claim,
+and `verify` reports the same position.
+
+- *After a power loss*, files can hold a later segment and not the records before it (C8); or the successor's first page
+  reached the disk and the old segment's seal did not. Until a writer opens the journal and repairs it (it seals, or
+  quarantines the disconnected segments), (B) reports that; a reader started at boot before the writer fails until then. A
+  marker (A) is never in that state under the storage assumptions.
+- *A restore that keeps a newer marker*: segments restored from a backup, with the marker of the running journal kept. (A)
+  reports the end of the restored records, which the marker covers. `Writer::open` accepts such a marker today and carries
+  on, which makes the gap below it permanent (issue #87, not changed here).
+- *A copy of a journal* whose marker or later segment is newer than its earlier segments, and a segment with a valid header
+  copied in from another journal (above).
 
 **Where the check runs.** In `at_empty_slot`, never on the record path:
 
@@ -101,10 +120,13 @@ later segment, is newer than its earlier segments. In each of them the files do 
 A visible reader that keeps up with a writer and never waits 100 ms makes no check after its first. One comparison
 (`Option::is_none`) is added to an empty poll. Measured on a busy Apple M4 Pro (informal): an empty poll of the zero-copy
 reader 21.1 to 21.3 ns before, 21.3 to 21.6 ns after; of the safe reader about 285 ns either way; the first empty poll after opening
-0.4 µs before, 21 µs after with 2 segments and 2 ms with 5,000 (the listing). The record path compiles to the same
-instructions on x86-64 and aarch64, but the state is boxed: as a field of `Reader`, its 40 bytes moved the fields of the
-record path so that the zero-copy reader replayed 64-byte records in twice the time on that machine, and padding of the
-same size did the same to the code before this change.
+0.4 µs before, 21 µs after with 2 segments and 2 ms with 5,000 (the listing). With 10,000 segments a listing takes about
+5 ms on that machine, and each later name whose header is read one `open`, `fstat` and 64-byte read (about 14 µs); a reader
+at the head of a journal has no later names, and lists only after the directory changed, at most once a second. The record
+path compiles to the same instructions on x86-64 (on aarch64 `try_next` is one instruction shorter, an offset that now fits
+an instruction), but the state is boxed: as a 40-byte field of `Reader` it made the zero-copy reader replay 64-byte
+records in twice the time on that machine, and 40 or 48 bytes of padding did the same to the code before this change (8 to
+32 or 64 did not). The slowdown follows the size of the struct; its mechanism is not established (issue #86).
 
 **The delay.** The first empty slot after opening or seeking is reported in the call that meets it, which takes 50 ms or
 a little more. Later ones: by (A) at the first call at least 100 ms after the reader arrived there, by (B) at the first

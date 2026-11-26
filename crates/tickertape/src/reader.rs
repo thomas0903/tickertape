@@ -9,7 +9,7 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::config::{Backoff, ReaderConfig};
 use crate::error::{CorruptReason, Error, Result};
 use crate::format::{self, CheckpointSlot, RecordHeader};
-use crate::journal::{self, Bases, Identity};
+use crate::journal::{self, Identity};
 use crate::mmap::MapRo;
 use crate::record::{OwnedRecord, Record};
 use crate::seek_index::{self, codec::Entry, dir::IndexDir, lookup};
@@ -111,9 +111,9 @@ pub struct Reader {
     waiting_since: Option<Instant>,
     /// The last time [`Reader::check_head`] looked for later segments: `None` if it has not run since the reader was
     /// opened or moved by a seek, or if it ended in an error. It then runs at the next empty slot without waiting first.
-    /// Boxed (allocated at the open, never again): a field this size moved the fields of the per-record path so that the
-    /// zero-copy reader replayed 64-byte records at half the speed on an Apple M4 Pro (padding of 40 or 48 bytes did the
-    /// same to the code before; 8 to 32 or 64 bytes did not).
+    /// Boxed (allocated at the open, never again): as a field this size it made the zero-copy reader replay 64-byte records
+    /// at half the speed on an Apple M4 Pro, and so did 40 or 48 bytes of padding added to the code before (8 to 32 or 64
+    /// did not). The slowdown follows the size of `Reader`; its mechanism is not established (issue #86).
     segments_listed: Box<Option<Listed>>,
     /// The record [`Reader::advance`] found last (valid only after it returned `true`). The slot reads decode a
     /// record's header straight into it, so that the per-record path passes only small values around (see
@@ -487,7 +487,8 @@ impl Reader {
     /// covers it, or a later segment exists that a writer creates only after the slot is filled. The reader looks for that
     /// at the first empty slot after it was opened or moved by a seek, in that call, so that a replay up to the first
     /// `Ok(None)` is told; and at later ones after it has waited there for 100 ms (by the segments alone: at most once a
-    /// second). No reader gets past such a slot: the records between it and the end of its segment can't be found, and
+    /// second, and only if the directory changed since a listing showed nothing; a later segment counts only with a valid
+    /// header). No reader gets past such a slot: the records between it and the end of its segment can't be found, and
     /// every call returns the error again. `inspect::verify` reports it too; records after the checkpoint marker can be
     /// repaired by the writer's recovery, covered ones only from a copy of the segment. A slot that was emptied where
     /// nothing above covers it (in the newest segment at or after the marker, for example) can't be told from the head.
@@ -1327,10 +1328,12 @@ impl Reader {
     /// - The marker covers the slot, or names a later segment. A writer stores a record, and the seal in front of a
     ///   segment it rolls to, before it writes a marker that covers them, and no recovery from that marker changes them
     ///   (ADR 0034, F2).
-    /// - If `list`: a segment with a base above the cursor exists, which a writer links only after it committed every
-    ///   record below it; or one with the cursor's sequence number, not the reader's own, that holds a record, which a
-    ///   writer appends only after it sealed the segment before. (One without a record does not count: a writer links it
-    ///   before it stores the seal, and may die in between.)
+    /// - If `list`: a segment with a base above the cursor exists, with a valid header (a writer links a segment's name
+    ///   only after it wrote the header, and only after it committed every record below its base); or one with the
+    ///   cursor's sequence number, not the reader's own, that holds a record, which a writer appends only after it sealed
+    ///   the segment before. (One without a record does not count: a writer links it before it stores the seal, and may
+    ///   die in between. A file with such a name and no valid header does not count either: it is no segment of a writer.
+    ///   One with a valid header from another journal does, as it does for recovery and `verify`: ADR 0050.)
     ///
     /// What can't be read, the marker or a segment, shows nothing.
     fn history_after(&self, marker: Option<&CheckpointSlot>, list: bool) -> After {
@@ -1343,22 +1346,23 @@ impl Reader {
             return After::Nothing;
         }
         crate::fault::hook(crate::fault::Point::ReaderEmptySlotList);
-        match journal::find_bases(&self.dir, u64::MAX) {
-            Ok(Bases {
-                floor: Some(newest),
-                ..
-            }) => {
-                if newest > self.next_seq {
-                    After::Shown(newest)
-                } else if newest < self.next_seq || newest == self.seg.base {
-                    After::Nothing
-                } else if holds_a_record(&self.dir, newest) {
-                    After::Shown(newest)
-                } else {
-                    After::Unknown
-                }
-            }
-            _ => After::Unknown,
+        let Ok((mut later, next)) = journal::bases_from(&self.dir, self.next_seq) else {
+            return After::Unknown;
+        };
+        // The newest first: on a journal that continues, the first one opened decides.
+        later.sort_unstable_by(|a, b| b.cmp(a));
+        if let Some(&base) = later.iter().find(|&&base| is_segment(&self.dir, base)) {
+            return After::Shown(base);
+        }
+        if !later.is_empty() {
+            // Names that are not segments (yet: a header that never reached the disk can be restored in place).
+            return After::Unknown;
+        }
+        match next {
+            false => After::Nothing,
+            true if self.next_seq == self.seg.base => After::Nothing,
+            true if holds_a_record(&self.dir, self.next_seq) => After::Shown(self.next_seq),
+            true => After::Unknown,
         }
     }
 
@@ -1815,6 +1819,15 @@ fn read_marker(dir: &Path) -> Option<Option<CheckpointSlot>> {
     let marker = crate::inspect::read_checkpoint(dir).ok()?;
     fence(Ordering::Acquire);
     Some(marker)
+}
+
+/// Whether the file named for the segment with base `base` has a valid segment header (for that base and its own size).
+fn is_segment(dir: &Path, base: u64) -> bool {
+    let path = journal::segment_path(dir, base);
+    let valid =
+        File::open(&path).is_ok_and(|file| journal::read_header(&file, &path, base).is_ok());
+    fence(Ordering::Acquire);
+    valid
 }
 
 /// Whether the segment with base `base` has a valid record in its first slot. Anything that can't be read is a no.
@@ -2646,29 +2659,4 @@ mod tests {
         resize_buf(&mut buf, 8).unwrap();
         assert_eq!(buf, [7, 7, 7, 7, 0, 0, 0, 0]);
     }
-}
-#[cfg(test)]
-#[test]
-fn zz_offsets() {
-    use std::mem::offset_of;
-    eprintln!(
-        "size {} seg {} offset {} next_seq {} bound {} buf {} buf_start {} found {} waiting {} mapped {} config {} skip {}",
-        size_of::<Reader>(),
-        offset_of!(Reader, seg),
-        offset_of!(Reader, offset),
-        offset_of!(Reader, next_seq),
-        offset_of!(Reader, bound),
-        offset_of!(Reader, buf),
-        offset_of!(Reader, buf_start),
-        offset_of!(Reader, found),
-        offset_of!(Reader, waiting_since),
-        offset_of!(Reader, mapped),
-        offset_of!(Reader, config),
-        offset_of!(Reader, skip_until)
-    );
-    eprintln!(
-        "seg.map {} seg.size {}",
-        offset_of!(OpenSegment, map),
-        offset_of!(OpenSegment, size)
-    );
 }

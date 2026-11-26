@@ -119,6 +119,28 @@ pub(crate) fn find_bases(dir: &Path, seq: u64) -> Result<Bases> {
     Ok(out)
 }
 
+/// From one listing of `dir`: the bases above `seq`, and whether a segment with base `seq` exists. Memory for the bases
+/// above only (none, on a journal whose reader is at the head).
+pub(crate) fn bases_from(dir: &Path, seq: u64) -> Result<(Vec<u64>, bool)> {
+    let entries = fs::read_dir(dir).map_err(|e| Error::io("list journal directory", dir, e))?;
+    let (mut above, mut at) = (Vec::new(), false);
+    for entry in entries {
+        let entry = entry.map_err(|e| Error::io("list journal directory", dir, e))?;
+        if let Some(base) = entry
+            .file_name()
+            .to_str()
+            .and_then(format::parse_segment_file_name)
+        {
+            match base.cmp(&seq) {
+                std::cmp::Ordering::Greater => above.push(base),
+                std::cmp::Ordering::Equal => at = true,
+                std::cmp::Ordering::Less => {}
+            }
+        }
+    }
+    Ok((above, at))
+}
+
 /// Lists stale temporary segment files (`*.tape.tmp`) in `dir`.
 pub(crate) fn list_tmp_files(dir: &Path) -> Result<Vec<PathBuf>> {
     let mut out = Vec::new();

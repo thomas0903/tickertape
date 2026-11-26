@@ -570,6 +570,97 @@ fn evidence_that_goes_away_is_not_reported() {
     }
 }
 
+/// A file named like a later segment that is no segment: empty (`touch`), all zeros (a header that never reached the
+/// disk), or with a damaged header. None of them shows that the journal continues, under a live writer, for every kind of
+/// reader. A header that is then written in place (as recovery restores one) makes it a segment: the directory does not
+/// change, and it is seen all the same.
+#[test]
+fn a_file_that_is_not_a_segment_is_no_evidence() {
+    for how in ["empty", "zeros", "damaged header"] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = journal(dir.path(), 2);
+        writer.checkpoint().unwrap();
+        let mut readers = at_the_end(dir.path(), &KINDS);
+        let stray = dir.path().join(format::segment_file_name(1_000_000));
+        match how {
+            "empty" => std::fs::write(&stray, b"").unwrap(),
+            "zeros" => std::fs::write(&stray, vec![0; SMALL_SEGMENT as usize]).unwrap(),
+            _ => {
+                create_raw_segment(dir.path(), 1_000_000, SMALL_SEGMENT);
+                open_raw(&stray).write_all_at(&[0xff], 40).unwrap();
+            }
+        }
+        expect_wait(&mut readers, how);
+        expect_wait(&mut at_the_end(dir.path(), &KINDS), how);
+        // The writer goes on, and the readers with it.
+        append_n(&mut writer, 30);
+        writer.checkpoint().unwrap();
+        for reader in &mut readers {
+            let (records, end) = drain(reader);
+            assert!(end.is_ok() && records.len() == 30, "{how}: {end:?}");
+        }
+        if how == "zeros" {
+            let header = format::encode_segment_header(&format::SegmentHeader {
+                segment_size: SMALL_SEGMENT,
+                base_seq: 1_000_000,
+                created_unix_ns: 1,
+            });
+            open_raw(&stray).write_all_at(&header, 0).unwrap();
+            let start = Instant::now();
+            let path = segments(dir.path()).into_iter().rev().nth(1).unwrap().1;
+            let at = end_of_records(&path).0;
+            for reader in &mut readers[..2] {
+                let end = loop {
+                    match reader.try_next() {
+                        Ok(None) => std::thread::sleep(Duration::from_millis(5)),
+                        Ok(Some(r)) => panic!("{}", r.seq),
+                        Err(e) => break Err(e),
+                    }
+                    assert!(start.elapsed() < Duration::from_secs(5));
+                };
+                assert!(is_report(&end, &path, at), "{end:?}");
+            }
+        }
+    }
+}
+
+/// A segment from another journal, with a valid header and a later base: the files no longer form one chain, and visible
+/// readers report the head as `verify` and the writer's recovery would treat it (ADR 0050).
+#[test]
+fn a_foreign_segment_with_a_later_base_is_reported() {
+    let other = tempfile::tempdir().unwrap();
+    drop(journal(other.path(), 3));
+    let dir = tempfile::tempdir().unwrap();
+    let mut writer = journal(dir.path(), 1);
+    writer.checkpoint().unwrap();
+    assert!(writer.next_seq() < 100);
+    let mut readers = at_the_end(dir.path(), &KINDS);
+    let (base, from) = segments(other.path()).pop().unwrap();
+    assert!(base > writer.next_seq());
+    std::fs::copy(&from, dir.path().join(format::segment_file_name(base))).unwrap();
+    let path = segments(dir.path())[0].1.clone();
+    let at = end_of_records(&path).0;
+    std::thread::sleep(CHECK);
+    for reader in &mut readers[..2] {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let end: Result<(), Error> = loop {
+            match reader.try_next() {
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(5))
+                }
+                Ok(r) => panic!("{}", r.is_some()),
+                Err(e) => break Err(e),
+            }
+        };
+        assert!(
+            matches!(&end, Err(Error::Corrupt { offset, reason: CorruptReason::EmptyCommitWord(n), .. })
+                if *offset == at && *n == base),
+            "{end:?}"
+        );
+    }
+    expect_wait(&mut readers[2..], "durable-only");
+}
+
 /// What a power loss can leave: a later segment, and not the records before it. Reported, as `verify` does, until a writer
 /// has opened the journal; then the reader goes on.
 #[test]
@@ -1342,7 +1433,8 @@ fn killed_writer(rounds: u64) {
         }
         let _stop = Stop(stop);
         for kind in KINDS {
-            for style in 0..3 {
+            // Spinning, waiting with the back-off, reopening and seeking, and slow (retention overtakes it).
+            for style in 0..4 {
                 s.spawn(move || {
                     let mut reader = open(dir, kind);
                     let mut expected = reader.position();
@@ -1363,6 +1455,9 @@ fn killed_writer(rounds: u64) {
                                 );
                                 expected += 1;
                                 n += 1;
+                                if style == 3 && n % 64 == 0 {
+                                    std::thread::sleep(Duration::from_millis(2));
+                                }
                             }
                             Ok(None) => {
                                 ends.fetch_add(1, Ordering::Relaxed);
@@ -1428,7 +1523,7 @@ fn killed_writer(rounds: u64) {
             let until = Instant::now() + Duration::from_millis(20 + rng.below(250));
             while Instant::now() < until {
                 std::thread::sleep(Duration::from_millis(10));
-                let policy = Policy::default().max_segments(6);
+                let policy = Policy::default().max_segments(2);
                 if let Ok(plan) = retention::plan(dir, &policy) {
                     let _ = retention::apply(dir, &plan, &Action::Delete);
                 }
@@ -1440,7 +1535,7 @@ fn killed_writer(rounds: u64) {
                 if segments(dir).len() <= 16 {
                     break;
                 }
-                let policy = Policy::default().max_segments(6);
+                let policy = Policy::default().max_segments(2);
                 if let Ok(plan) = retention::plan(dir, &policy) {
                     let _ = retention::apply(dir, &plan, &Action::Delete);
                 }
