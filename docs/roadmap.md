@@ -144,6 +144,10 @@ released with seven items open, accepted by the owner as known gaps
     (2026-11-19 to 2026-11-22), with tickertape's rows from a second session at a newer commit (the first session's
     failed on the open-files defect fixed in #38), and the ext4 stall investigation is published (ADR 0025 →
     Amendment).
+  - Rerun of the whole comparison at v1.0.0 with the corrected harness (issue #57; JVM warm-up, `microTouch()`, 1 GiB
+    `blockSize`, pinning; every tool in one session per machine): `docs/benchmarks.md` → "comparison rerun at v1.0.0"
+    (2026-11-25 to 2026-11-26), Linux x86-64 and aarch64, ext4 and xfs, Google Cloud VMs. It supersedes the earlier
+    Linux comparisons and their single-session caveat. Not run: bare metal, unpinned sustained runs.
   - macOS, recorded 2026-11-26 on the owner's laptop (Apple M4 Pro, APFS; shared and not idle: `docs/benchmarks.md` →
     "sustained load, roll waits and checkpoint cost on macOS"): tickertape's sustained session with repeated 10-minute
     steady runs at 50 % and 90 % of the probe for both payloads, shorter bursty and visibility-only runs, and a
