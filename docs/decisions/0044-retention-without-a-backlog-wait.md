@@ -5,6 +5,9 @@
 - **Amends:** [0016](0016-retention-and-archiving.md) (what is validated before a removal) and
   [0038](0038-background-checkpoints.md) (retention on the checkpoint thread)
 
+(Amended 2026-11-26 by ADR [0051](0051-retention-reads-what-it-needs.md): `plan` reads only the headers its policy needs,
+and a run lists the directory once instead of before each removal.)
+
 ## Context
 
 Issue #45. Before retention deleted or moved a segment, it read the whole segment and validated every record and the

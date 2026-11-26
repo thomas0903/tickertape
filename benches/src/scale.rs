@@ -57,9 +57,14 @@ pub const OPS: &[&str] = &[
 /// The operations of [`OPS`] that write or use a seek index.
 pub const INDEX_OPS: &[&str] = &["index-build", "seek-sealed-indexed"];
 
-/// Operations `measure` runs only when asked: `retention-delete` shrinks the journal, the `cli-` ones need `--cli`.
+/// Operations `measure` runs only when asked: `retention-delete` and the loops with `remove` in their names shrink the
+/// journal, the `cli-` ones need `--cli`.
 pub const OPTIONAL_OPS: &[&str] = &[
     "retention-delete",
+    "checkpoint-loop-age",
+    "checkpoint-loop-bytes",
+    "checkpoint-loop-remove-count",
+    "checkpoint-loop-remove-age",
     "index-refresh",
     "index-check",
     "cli-verify",
@@ -575,7 +580,11 @@ fn dispatch(op: &Op) -> Result<Value> {
         "writer-open-clean" | "writer-open-after-kill" | "writer-open-without-marker" => {
             writer_open(op)
         }
-        "checkpoint-loop" | "checkpoint-loop-retention" => checkpoint_loop(op),
+        "checkpoint-loop"
+        | "checkpoint-loop-retention"
+        | "checkpoint-loop-age"
+        | "checkpoint-loop-bytes" => checkpoint_loop(op),
+        "checkpoint-loop-remove-count" | "checkpoint-loop-remove-age" => checkpoint_loop_remove(op),
         "index-build" | "index-refresh" | "index-check" => timed(|| index(dir, &op.name)),
         "cli-verify" | "cli-export" | "cli-stats" => cli(op),
         other => Err(format!("unknown operation {other}").into()),
@@ -780,15 +789,19 @@ fn writer_open(op: &Op) -> Result<Value> {
 
 /// Opens a writer (not timed) and takes `op.count` blocking checkpoints, each after one record of the journal's
 /// payload size, without rolling on purpose: what a checkpoint costs in a directory this large. With retention
-/// configured (a limit no journal reaches), every checkpoint also makes a retention plan.
+/// configured (by count, age or bytes, a limit no journal reaches), every checkpoint also makes a retention plan.
 fn checkpoint_loop(op: &Op) -> Result<Value> {
     let payload = vec![0x5a; payload_size(&op.dir)?];
     let mut config = WriterConfig::default().segment_size(op.segment_size);
-    if op.name == "checkpoint-loop-retention" {
-        config = config.retention(
-            retention::Policy::default().max_segments(usize::MAX),
-            retention::Action::Delete,
-        );
+    let none = retention::Policy::default();
+    let policy = match op.name.as_str() {
+        "checkpoint-loop-retention" => Some(none.max_segments(usize::MAX)),
+        "checkpoint-loop-age" => Some(none.max_age(LONG)),
+        "checkpoint-loop-bytes" => Some(none.max_bytes(u64::MAX)),
+        _ => None,
+    };
+    if let Some(policy) = policy {
+        config = config.retention(policy, retention::Action::Delete);
     }
     let open = Instant::now();
     let mut writer = Writer::open(&op.dir, config)?;
@@ -810,6 +823,86 @@ fn checkpoint_loop(op: &Op) -> Result<Value> {
     out["open_files_held"] = json!(open_files());
     writer.close()?;
     Ok(out)
+}
+
+/// An age no segment of a measured journal has.
+const LONG: Duration = Duration::from_secs(30 * 86_400);
+
+/// How far apart `checkpoint-loop-remove-age` lets segments expire, and how long after the headers are written the first
+/// one does (the writer opens in between).
+const EXPIRY_STEP: Duration = Duration::from_millis(500);
+const EXPIRY_DELAY: Duration = Duration::from_secs(5);
+
+/// Opens a writer (not timed) and takes `op.count` blocking checkpoints, each of which finds one segment to remove: by
+/// count, because the records appended before it filled a segment, or by age, because the oldest segment has just become
+/// too old (the headers of the oldest segments are rewritten for that before the writer opens). Reports the time of the
+/// checkpoints alone, and what they removed.
+fn checkpoint_loop_remove(op: &Op) -> Result<Value> {
+    let payload = vec![0x5a; payload_size(&op.dir)?];
+    let by_age = op.name == "checkpoint-loop-remove-age";
+    let segments = inspect::list_segments(&op.dir)?.len();
+    let none = retention::Policy::default();
+    let start = Instant::now();
+    let policy = if by_age {
+        expire_one_by_one(&op.dir, op.count)?;
+        none.max_age(LONG)
+    } else {
+        none.max_segments(segments)
+    };
+    let config = WriterConfig::default()
+        .segment_size(op.segment_size)
+        .retention(policy, retention::Action::Delete);
+    let mut writer = Writer::open(&op.dir, config)?;
+    let at_open = writer.retention_report().removed_segments;
+    let per_segment = segment_capacity(op.segment_size, payload.len())?;
+    let mut latency = histogram()?;
+    let mut out = timed(|| {
+        for i in 1..=op.count {
+            if by_age {
+                let due = EXPIRY_DELAY + EXPIRY_STEP * u32::try_from(i)? + EXPIRY_STEP / 5;
+                std::thread::sleep(due.saturating_sub(start.elapsed()));
+            }
+            for _ in 0..if by_age { 1 } else { per_segment } {
+                let index = writer.next_seq();
+                writer.append(&record(&payload, index))?;
+            }
+            let start = Instant::now();
+            writer.checkpoint()?;
+            latency.saturating_record(elapsed_ns(start.elapsed())?);
+        }
+        Ok(json!({"checkpoints": op.count}))
+    })?;
+    out["checkpoint_latency"] = histogram_json(&latency);
+    out["segments_before"] = json!(segments);
+    out["removed_at_open"] = json!(at_open);
+    out["removed_segments"] = json!(writer.retention_report().removed_segments - at_open);
+    out["retention_error"] = json!(writer.last_retention_error().map(ToString::to_string));
+    writer.close()?;
+    Ok(out)
+}
+
+/// Rewrites the creation times of the oldest segments so that the oldest becomes older than [`LONG`] after
+/// [`EXPIRY_DELAY`] and one [`EXPIRY_STEP`], the next one a step later, and so on for `count` segments.
+fn expire_one_by_one(dir: &Path, count: u64) -> Result<()> {
+    use std::os::unix::fs::FileExt;
+    use tickertape::format;
+    let now = tickertape::clock::realtime_ns();
+    let listed = inspect::list_segments(dir)?;
+    for (i, info) in (0..=count).zip(&listed) {
+        // A segment's age counts from its successor's creation.
+        let after = EXPIRY_DELAY + EXPIRY_STEP * u32::try_from(i)?;
+        let header = format::SegmentHeader {
+            segment_size: info.segment_size,
+            base_seq: info.base_seq,
+            created_unix_ns: now - u64::try_from(LONG.as_nanos())?
+                + u64::try_from(after.as_nanos())?,
+        };
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(dir.join(format::segment_file_name(info.base_seq)))?
+            .write_all_at(&format::encode_segment_header(&header), 0)?;
+    }
+    Ok(())
 }
 
 /// Runs the `tickertape` program on the journal and reports its cost (wall time here, CPU time, faults and peak RSS
@@ -975,6 +1068,27 @@ mod tests {
             Journal::describe(&dir, None).unwrap().next_seq,
             journal.next_seq
         );
+    }
+
+    #[test]
+    fn removing_loops_remove_one_segment_per_checkpoint() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("journal");
+        build(&dir, 12, SIZE, 1000, 50, 4).unwrap();
+        for name in ["checkpoint-loop-remove-count", "checkpoint-loop-remove-age"] {
+            let mut op = Op::new(&dir, name, None, SIZE);
+            op.count = 3;
+            let out = run_op(&op).unwrap();
+            assert_eq!(out["removed_segments"], 3, "{name}: {out}");
+            assert_eq!(out["removed_at_open"], 0, "{name}: {out}");
+            assert!(out["retention_error"].is_null(), "{name}: {out}");
+        }
+        for name in ["checkpoint-loop-age", "checkpoint-loop-bytes"] {
+            let out = run_op(&Op::new(&dir, name, None, SIZE)).unwrap();
+            assert!(out["retention_error"].is_null(), "{name}: {out}");
+        }
+        // 12, three more by the first loop, which removed as many as it added, and three removed by age.
+        assert_eq!(inspect::list_segments(&dir).unwrap().len(), 9);
     }
 
     #[test]

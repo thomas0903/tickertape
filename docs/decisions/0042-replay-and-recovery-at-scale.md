@@ -117,3 +117,11 @@ decision on the sparse index, which was built later as a separate design (ADR 00
 the costs that grow with the segment count and have no remedy yet (issue #80); options 3 and 4 remain possible later work, and a
 removal that does not read the directory again for each segment (`retention::apply`) and a seek that does not list it
 belong to the same list.
+
+## Amendment (2026-11-26): retention reads what its policy needs
+
+ADR [0051](0051-retention-reads-what-it-needs.md) does the part of option 4 about retention in another way: a plan no
+longer opens every segment, and `retention::apply` no longer reads the directory before each removal. Their rows in the
+table above, and the one of a checkpoint with a retention policy, hold up to 1.0: from 1.1 a plan and a checkpoint with a
+policy cost one directory read (with `max_bytes`, `retention::plan` also reads each file's metadata, a writer once per
+file), and a removal does not depend on the segments left. (Removing a segment has not read its bytes since ADR 0044.)
