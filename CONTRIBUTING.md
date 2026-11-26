@@ -89,6 +89,16 @@ markedly slower to replay without touching the per-record code. The size and sig
 catches a slowdown, and CI records no timings. These figures are informal and belong in the pull request, not in
 the docs (`docs/playbooks/run-benchmark.md` describes recorded runs).
 
+**The layout of `Reader` (ADR 0057).** `Reader` is `#[repr(C, align(16))]` with a fixed field order. The test
+`reader::tests::reader_layout` pins the alignment and the offsets of the fields the per-record path of either reader
+reads or writes (marked "Hot" in `reader.rs`). Add new reader state at the end of the struct, where it moves nothing, or
+behind a pointer (as `Waits` is); the size of `Reader` may change. Moving a hot field, or adding one that the record
+path touches, changes the test, needs the `replay` benchmark before and after on x86-64 and aarch64, and an update of
+the ADR. The reasons: the record path stores and loads `found` 16 bytes at a time, and an access of this kind that
+straddles a page boundary made replay 15 to 30 % slower on Linux, depending only on where the reader happened to be in
+memory; and moving the hot fields to the start of the struct made the zero-copy reader 2 to 3 % slower on x86-64, for a
+reason not established.
+
 On macOS, run the Linux checks in a VM or container too (`docs/playbooks/test-on-linux.md`), and keep test journals
 on a local filesystem (not tmpfs or a shared folder) when you test durability behaviour.
 

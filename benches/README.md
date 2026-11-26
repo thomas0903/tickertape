@@ -146,6 +146,26 @@ records/s includes appends, per-call instrumentation and dirty checkpoints, excl
 writer opening and the final empty checkpoint. Durations use a monotonic clock.
 The filesystem and storage determine what sync costs; this is not a power-loss test.
 
+## Page faults on the writer's thread (`tt-faults`, Linux)
+
+```sh
+cargo build -p tickertape-bench --release --bin tt-faults
+target/release/tt-faults --dir /tmp/tt-pf --rate 100000 --payload 1024 --seconds 20 --warmup-seconds 3 \
+  --checkpoint-ms 1000 --writer-cpu 1 --reader-cpu 2 --helper-cpus 3 --log /tmp/appends.txt
+sudo bpftrace benches/diagnostics/writer-faults.bt 1 > trace.txt   # before the run; SIGINT after it
+```
+
+Paced appends on the main thread, timed from the scheduled send as in `tt-latency`, with a background checkpoint at the
+interval given and, with `--reader-cpu`, a zero-copy reader that busy-polls. The writer thread's minor and major fault
+counts (`getrusage(RUSAGE_THREAD)`) are read before each wait and after each append, so every append is counted as
+faulted or not; the JSON result has the latency of both kinds, faults per append and per MiB, and `--log` writes each
+faulted or slow append with its segment offset. `writer-faults.bt` classifies each fault of the thread as not present or
+write-protected (on xfs, uncomment its `xfs_trans_alloc` probe) and times the write-back calls of the helper and
+checkpoint threads. It measures the library as built. The experiment switches it was run with for ADR 0058 (prefault
+window, re-touch, early write-back lag and alignment, the ranged sync, a writer-thread touch) are not in `main`: they
+are on the branch `exp/prefault-residual` (never merged), which `docs/benchmarks.md` (2026-11-26, the writer's remaining
+page faults with prefaulting on) describes.
+
 ## Replay and recovery at scale (`tt-scale`)
 
 ```sh
@@ -277,12 +297,15 @@ duration, down to a few seconds for smoke tests). `--dir` (the journal, on the f
 
 **Traffic.** `--rate N` schedules record *i* at `t0 + floor(i * 1e9 / N)`. `--burst-rate P` sends bursts at *P*
 records/s during the first `--burst-duty` percent (default 10) of every `--burst-period` (default 100 ms), nothing in
-the rest: the mean rate is `floor(P * period * duty / 100) / period`. Both store the **intended** time in
-`local_ts_ns`; the writer busy-waits for it and sends every record even when late, with no skipping or rebasing,
-and readers measure `now - intended`, so a backlog counts as latency (coordinated omission handled as in
-`tt-latency`). `--unpaced` sends as fast as it can until the duration ends; its records carry their actual send
-start, so its reader latency is measured from the send, not from a schedule. A paced writer that falls more than
-`--overrun-limit` (default 60 s) behind the end of its schedule stops and reports `unsent_records`; nothing is
+the rest: the mean rate is `floor(P * period * duty / 100) / period`. Both store the **intended** time in `local_ts_ns`;
+the writer busy-waits for it and sends every record even when late, with no skipping or rebasing, and readers measure
+`now - intended`, so a backlog counts as latency (coordinated omission handled as in `tt-latency`). A reader whose wall
+clock reads earlier than a record's stamp fails the run (`wall clock moved backwards`); with `--count-clock-backwards`
+it records 0 for that sample instead and counts it (`clock_backwards_samples`, `clock_backwards_max_ns` per reader). On
+macOS this happened between processes within a minute at 64 B, where readers see records within a microsecond
+(`docs/benchmarks.md`, 2026-11-26). `--unpaced` sends as fast as it can until the duration ends; its records carry their
+actual send start, so its reader latency is measured from the send, not from a schedule. A paced writer that falls more
+than `--overrun-limit` (default 60 s) behind the end of its schedule stops and reports `unsent_records`; nothing is
 dropped silently.
 
 **Checkpoints, rolls and retention.** `--checkpoint-every 1s` checkpoints on a fixed wall-clock grid (grid points
@@ -385,11 +408,16 @@ are profiles, not throughput or latency figures.
 **Where a stall comes from.** To find what the writer or a reader waits on during a run (scheduler, page faults,
 filesystem and write-back, block I/O), trace it with
 [the eBPF diagnostics playbook](../docs/playbooks/diagnose-latency-with-ebpf.md) and the scripts in `diagnostics/`.
+Two of them were written for the aarch64 observations of `docs/benchmarks.md` (2026-11-26):
+`diagnostics/reader-pauses.bt` tells what a pinned, spinning reader does while it falls behind (off its CPU, in a page
+fault or a system call, interrupt work, or its vCPU not running at all), and `diagnostics/frontier-evictions.bt` lists
+the page-cache pages the kernel removes or migrates at the write frontier of the active segment, to line up with the
+moments a zero-copy reader re-reads a slot.
 
 ## Recorded sustained session
 
 `benches/session.py` runs a whole session on the filesystem under test: the tickertape scenarios with `tt-sustained`,
-then the sustained comparison matrix (`compare/README.md`). It needs Python 3.9+, Rust, and for the comparison Java 21
+then the sustained comparison matrix (`compare/README.md`). It needs Python 3.11+, Rust, and for the comparison Java 21
 and Maven (`JAVA_HOME`), or `--compare-tools` without `chronicle,aeron`.
 
 ```sh
@@ -420,6 +448,13 @@ stops the current run and kills its processes. Matrices:
 
 Scenario definitions are in `python3 benches/session.py --help`. Rates derive from the tickertape probe of the same
 payload, so they adapt to the machine; the probe's rate and every derived argument are in each run's `result.json`.
+
+## Comparison rerun (issue #57)
+
+`benches/rerun.py` runs the parts of the planned comparison rerun on one machine (`python3 benches/rerun.py --list`
+prints them with estimates); `benches/rerun-vm.sh` drives it on the benchmark VM, including the boot with isolated
+CPUs. The plan, with the matrix, machines, cost and how to start it, is
+[docs/playbooks/rerun-comparison.md](../docs/playbooks/rerun-comparison.md).
 
 ## Recording a run
 

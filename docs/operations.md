@@ -23,23 +23,9 @@ draws conclusions from those two.
   the checkpoint (ADR 0046), so seeking forward through a checkpointed segment reads it once, not once for each seek. `Reader::seek_to_end` reads at most
   the newest segment, from the checkpoint on. For seeks into sealed segments, seek indexes make the cost independent of
   the segment size ("Seek indexes" below); they do nothing for the newest segment.
-- **Segment count.** Opening a reader or a writer, each seek and each retention run (when retention is configured, at
-  writer open and after checkpoints) read the whole journal directory; `list_segments` and `verify` open every segment's
-  file; replay opens each segment it enters. These costs grow with the number of segments, so very small segments in a
-  long-lived journal make them add up (ADR 0042). Measured on local SSD (`benchmarks.md`, 2026-11-25):
-  journals of 10,000, 20,000 and 100,000 segments open, recover, replay and checkpoint, and no operation held more
-  than 12 open files at 10 to 20,000 segments (not sampled at 100,000). What a writer can hold is bounded whatever the number
-  of segments (20 files at most in this release, "Open files" below), so the limit on open files (`ulimit -n`) is not
-  a constraint on the number of segments. The directory read is: each seek costs about 3 ms at 10,000 segments, 6 ms at
-  20,000 and 29 ms at 100,000, also with a seek index, and so does each retention run (from 1.1, ADR 0051; x86-64, warm: a
-  checkpoint with a policy that removes nothing 3 ms, 6 ms and 31 ms, against 0.3 ms without one; up to 1.0 every run
-  opened every segment, about ten times as much, and seconds with a cold cache). With `max_bytes` a writer's open also asks for
-  every file's size (cold: 0.05 s, 0.11 s and 0.58 s in all). Removing a segment costs 0.4 ms at 10,000 and 20,000
-  segments and 0.6 ms at 100,000 (64 KiB segments), one listing per 100 removals included. The appending thread
-  pays for retention in `checkpoint()` and in the open; a background checkpoint (`request_checkpoint`) runs it on the
-  checkpoint thread. So with blocking checkpoints and retention, plan for a number of segments whose directory read you
-  accept per checkpoint (a larger segment, or fewer kept). Larger segments make a seek without a seek index slower (up to
-  a whole segment is read), so use an index with large segments.
+- **Segment count.** Opening a reader or a writer, each seek and each retention run read the whole journal directory,
+  so these costs grow with the number of segments, and very small segments in a long-lived journal make them add up.
+  "How many segments to keep" below has the figures and what to do about them.
 - **Granularity of archiving.** You archive or delete whole segments (below).
 
 For most uses the default is a reasonable start. Pick smaller segments (a few MiB) for low-volume journals you
@@ -52,7 +38,10 @@ With `WriterConfig::prefault(true)` (the default), the writer moves segment work
 - **Page faults (Linux and macOS).** A helper thread, `tickertape-prefault`, keeps the pages just ahead of the write
   position faulted in, so `append` rarely waits for a page fault.
   - **Linux:** the next 256 KiB, with `MADV_POPULATE_WRITE` (ADR 0025; kernels before 5.14 stop the helper on first
-    use).
+    use). The advice leaves those pages dirty, so every checkpoint that covers appends also writes the 256 KiB of
+    zeros ahead of the writer: 0.16–0.43 ms more per checkpoint in the recorded runs, and about 35 page faults for the
+    writer afterwards, because writing the pages back write-protects them (`docs/benchmarks.md` → "2026-11-26, what
+    prefaulted, unwritten pages add to a checkpoint"). An idle writer pays it once.
   - **macOS:** the next 8 MiB, with `MADV_WILLNEED` (ADR 0020). On APFS, writing into a preallocated segment otherwise
     faults once per 16 KiB page, slowly.
 - **The next segment** (`WriterConfig::spare_segment`; on by default on macOS, **off on Linux**, from 1.1). Once the
@@ -71,11 +60,33 @@ With `WriterConfig::prefault(true)` (the default), the writer moves segment work
     roll and journal stalls"). Measure on your machine before turning it on.
   - **macOS:** a thread is started for each spare; it also syncs the file (preallocating and syncing a whole segment
     on APFS takes about 50 ms), and a roll waits for a spare that is still being prepared.
-- **Early write-back (Linux).** A helper thread, `tickertape-writeback`, asks the kernel to start writing back the
-  pages behind the write position (`sync_file_range(SYNC_FILE_RANGE_WRITE)`, every 1 MiB, and the rest of a segment
-  when the writer rolls past it), so that a checkpoint, blocking or background, finds little dirty data left
-  (`WriterConfig::early_writeback`, default on; ADR 0038). It makes nothing durable: only checkpoints do. An I/O
-  error from it makes the next checkpoint fail, as a failed sync would. On macOS the option does nothing.
+- **Early write-back (Linux).** A helper thread, `tickertape-writeback`, asks the kernel to start writing back what
+  the writer has finished (`sync_file_range(SYNC_FILE_RANGE_WRITE)`, every 1 MiB, up to the 128 KiB boundary below the
+  write position, and the rest of a segment when the writer rolls past it), so that a checkpoint, blocking or
+  background, finds little dirty data left (`WriterConfig::early_writeback`, default on; ADR 0038). It makes nothing
+  durable: only checkpoints do, and a checkpoint syncs whatever early write-back has not reached. An I/O error from it
+  makes the next checkpoint fail, as a failed sync would. On macOS the option does nothing.
+  - **Why it stops at the 128 KiB boundary** (from 1.1; ADR 0058). The kernel writes back whole page-cache folios, not
+    pages, and makes their pages read-only again; recent ext4 (Linux 6.16 and later) and xfs give a segment 128 KiB
+    folios with the default `read_ahead_kb`. Up to 1.0 the helper wrote back to the page that holds the position, so
+    also the folio the writer was still filling: the writer then took a page fault on each page of it that it had yet
+    to fill (a few of them waiting 20–100 µs for the ext4 journal), and the device wrote that folio twice. In the
+    recorded 10-minute runs (`docs/benchmarks.md` → "2026-11-26, early write-back to the folio boundary") that was 6–8
+    % more device bytes than appended, and on aarch64 at 90 % of the device's rate appends of 50–150 ms in 138–151 of
+    611 seconds; with the boundary, 0.2–0.5 % and none, and on that kernel (7.0) the writer's p99.9 was lower in every
+    paced run.
+  - **What it costs.** A checkpoint may find up to 128 KiB more to write, and so may a roll's write-back of the old
+    segment's tail: in those runs a background checkpoint at 64 B on aarch64 became durable after 946–952 µs instead of
+    912–914 (median), and the median roll append went from 254–256 to 260–264 µs there, from 188 to 260–266 µs at 90 %
+    of the device's rate on ext4 (while the longest fell from 61–111 to 0.6–1.0 ms), and from 148–180 to 158–366 µs on
+    a 6.8 kernel. With smaller folios (ext4 before 6.16) nothing is written twice either, but each checkpoint and each
+    roll's tail still gets up to 124 KiB more than with the old limit, for no gain.
+  - **What sets the folio size.** It follows the file's readahead window, `read_ahead_kb` of the device
+    (`/sys/block/<dev>/queue/read_ahead_kb`, 128 by default): the page cache's read-around for mapped files ramps its
+    folios up to that size. Where it is larger (md RAID, some LVM set-ups, a tuned profile that sets 4 MiB), folios
+    can reach 2 MiB, and early write-back then writes back the writer's folio as in 1.0, with its faults and double
+    writes. With 16 KiB or 64 KiB pages a folio is at least one page and can be larger. None of these was measured
+    beyond the cells in `docs/benchmarks.md`.
 
 **ext4 under a load near what the disk takes.** A store into a page of a mapped file updates the file's modification
 time through the ext4 journal and can wait while the journal commits, for as long as the disk takes to write the log
@@ -109,6 +120,31 @@ choices.
 **Sustained high byte rates on Linux.** Under steady write-back (minutes of writing, gigabytes of dirty pages), ext4
 itself occasionally stalls the writer for milliseconds, with or without prefaulting (ADR 0025). Plan disk
 throughput with headroom: a small cloud VM stalled for hundreds of milliseconds at about 100 MB/s sustained.
+
+**Is the disk the limit?** The journal writes records/s × (payload + 40 bytes, rounded up to a multiple of 8). Compare
+that with what the device writes by itself on the same file system: a `fio` job of buffered sequential writes into a
+preallocated file with an `fdatasync` every second, for a minute or more (the job file is in `docs/benchmarks.md` →
+"2026-11-26, how much of the limit is the disk"). If an unpaced writer's rate, less what piles up in the page cache
+(`Dirty` and `Writeback` in `/proc/meminfo`), is about `fio`'s, the disk is the limit; the writer's thread then spends
+most of its time off the CPU, throttled by the kernel's write-back. In the recorded cloud runs the local SSD wrote at
+most 351 MB/s by itself, tickertape on it the same 351 MB/s plus what the page cache took in, and with the journal on
+tmpfs three to four times as much at 1,024 B.
+
+- **Headroom at a steady rate.** There, a steady rate of 89 % (64 B) or 94 % (x86-64) of the device's rate did not
+  stall, and 92 % (1,024 B, aarch64) did, with appends of 10–144 ms. The point at which it starts depends on the
+  device and on more than the rate (with 1.0's defaults the writer made that device write 7 % more than it appended;
+  from 1.1 early write-back no longer does, see above), so measure it.
+- **Settings that moved the tail.** In those aarch64 runs, early write-back off
+  (`WriterConfig::early_writeback(false)`) removed the stalls in 5 of 5 runs. The cost: a checkpoint became durable 0.93
+  s after its request (what the device needs for a second of data) instead of 0.05–0.39 s. On x86-64, where there were
+  no stalls, it only made checkpoints that late instead of 2 ms. `lazytime` and xfs left one or three seconds with a
+  long append (one run each). The spare segment and either dirty limit did not help. Small limits
+  (`vm.dirty_bytes` 256 MiB) made an overloaded writer's longest appends longer, and large ones only let more pile up
+  before the throttling starts. These runs were of 1.0's early write-back; with 1.1's (the 128 KiB boundary) the
+  stalls of that aarch64 cell were gone in 10-minute runs with early write-back on and checkpoints durable after about
+  1 ms (`docs/benchmarks.md` → "2026-11-26, early write-back to the folio boundary").
+- **tmpfs** has no durability (syncs do nothing). There, a roll zeroes the whole new segment on the writer's thread
+  (`fallocate`; 19–30 ms per 128 MiB roll in the recorded runs) unless the spare segment is on.
 
 ## Open files
 
@@ -184,6 +220,64 @@ the helper placement are writer options in each (`early_writeback` / `earlyWrite
 
 If `checkpoint()` returns an error, the writer refuses all later checkpoints (`Error::DurabilityLost`) while appends
 keep working. Treat it as an incident: see "Errors are sticky" in the crash contract.
+
+## How many segments to keep
+
+The number of segments in the journal's directory, not their size, sets the cost of several operations: each reads the
+whole directory, and a few open every segment's file. Journals of 10,000, 20,000 and 100,000 segments work (ADR 0042),
+and what a writer holds open is bounded whatever their number ("Open files" above), so nothing fails; things get slower.
+The figures are from `benchmarks.md`, 2026-11-25, **one cloud machine shape** (Google Cloud `c3-standard-4-lssd`, Intel
+Xeon Platinum 8481C, ext4 on a local NVMe SSD, Linux x86-64), warm cache unless said; other machines and file systems
+differ, and none of this was measured on macOS.
+
+| Operation | 1,000 segments | 10,000 | 20,000 | 100,000 | What grows |
+|---|---|---|---|---|---|
+| Reading the directory, warm / cold | 0.28–0.30 / 1.7–1.9 ms | 2.5 / 18 ms | 5.0 / 35 ms | 25 / 215 ms | about 0.25 to 0.29 µs per segment when cached |
+| `Reader::seek`, before it reads a record | 0.35–0.38 ms (the whole seek) | about 3 ms | 6 ms | 29 ms | one listing per seek, also with a seek index (ADR 0046) |
+| `checkpoint()` with a retention policy that removes nothing (p50, from 1.1) | – | 3.2 ms | 6.4 ms | 31 ms | one listing per retention run (ADR 0051); 0.3 ms without a policy |
+| Removing segments with `retention::apply`, 100 in one run, per segment | – | 0.37 ms | 0.37 ms | 0.59 ms | one listing per run, spread over its removals |
+| "Cold" `Writer::open` (the directory cached), no policy / `max_segments` / `max_bytes` | – | 8.3 / 11.5 / 53 ms | 16 / 22 / 111 ms | 73 / 108 / 575 ms | listings; with `max_bytes`, a `stat` of every file |
+| `inspect::list_segments`, warm / cold | 2.7–3.0 / 194–199 ms | 30 ms / 2.1 s | 60 ms / 4.0 s | 0.29 s / 21 s | opens every segment (`verify` too, and reads every record) |
+
+The 100,000-segment journal had 64 KiB segments, the others 1 MiB. The checkpoint, removal and open rows are from the
+section "retention on journals of many segments", which has no journal of 1,000 segments ("–"); the others from
+"replay and recovery at scale" (cold there means the page cache dropped before the operation). At 1,000 segments the
+seek row is the whole seek to a segment's first record, warm, with the safe reader.
+
+**What a run still reads per file.** A retention run reads the directory once and then only what its policy needs
+(ADR 0051): with `max_segments` nothing more while the count is within the limit; with `max_age` the headers of the
+oldest segments up to the first young enough one. With `max_bytes` it asks for the size of every segment file (one
+`stat` each) and reads the header of the marker's segment and those after it, and of any file whose size is not a
+segment size or differs from the one before it. A writer remembers the sizes between its runs, so only its first run
+after `Writer::open` (which runs retention once) asks for every file's size, and later runs only for new files; a
+stand-alone `retention::plan` or `tickertape archive --max-bytes` asks for all of them every time. Apart from that run,
+`Writer::open` lists the directory and opens only the segments from the checkpoint marker on (without a marker, every
+segment, and recovery reads every byte). Nothing reads every header any more. A stand-alone `max_bytes` plan was not
+measured on its own; the difference between the `max_bytes` and `max_segments` opens above (41 ms cold, 11 ms warm at
+10,000 segments) is about what its `stat`s cost. There is no cheaper way to learn a file's size than a `stat`, so this
+is left as it is.
+
+**What to do about it:**
+
+- **Choose the segment size from the history you keep.** Segments kept = bytes kept / segment size: 1 TiB at the
+  default 128 MiB is 8,192 segments, at 1 MiB about a million. Keep the count in the low thousands where checkpoints,
+  seeks or opens are on a latency path; what larger segments cost instead is in "Choosing a segment size" above (use a
+  seek index with large segments).
+- **Bound it with retention:** `max_segments` states the count directly and reads the least; `max_bytes` and
+  `max_age` bound it through the segment size.
+- **Archive the rest elsewhere.** `tickertape archive --to` (or `Action::MoveTo`) moves old segments to another
+  directory, where they cost the live journal's listings nothing; a reader can be opened on the archive.
+- **Keep retention off the appending thread:** with `request_checkpoint` the listing runs on the checkpoint thread.
+- **Seek less often in large journals:** each seek costs a listing, whatever its distance; reading forward costs none.
+- **Keep stray files out of the journal directory**, above all files named like segments (`{N:020}.tape`) that are not:
+  a waiting reader reads up to 256 of their headers per listing (at most once a second, ADR 0050, issue #89), all of
+  them at its first check after an open or a seek, and `verify` reports them. With `M` of them, a header written into
+  one in place is seen only after about ⌈M/256⌉ × 1.1 s (1,000 strays: about 4.4 s), so a damaged slot that such a file
+  would show is reported that much later (crash contract C11). The reader keeps 16 bytes per stray name, and a listing
+  17 bytes per later name.
+
+There is no cached listing (ADR 0046, amended 2026-11-27): retention, archivers in other processes and recovery change
+the directory at any time, and a stale listing would send a reader to a segment that is gone.
 
 ## Disk space
 
@@ -323,12 +417,14 @@ tickertape index /data/journal --remove    # deletes them
 - It indexes the sealed segments before the checkpoint marker's segment, so a writer that never checkpoints gets none
   while it runs. Newly sealed segments have none until the next run, and the newest segment never has one: a consumer that
   restarts near the head gains nothing (`seek_to_end` starts at the marker).
-- The size is 24 bytes per 64 KiB of segment (0.04 %); a build reads each new segment once. Nothing is added to the writer
-  while it runs; its open lists `seek-index/` and removes what recovery could invalidate.
+- The size is 24 bytes per 64 KiB of segment (0.04 %); a build reads each new segment once (128 MiB: 19 to 60 ms from the
+  page cache, 0.2 s from local SSD; `benchmarks.md`, 2026-11-26). Nothing is added to the writer while it runs; its open
+  lists `seek-index/` and removes what recovery could invalidate.
 - In a journal of 10,000 to 20,000 segments a run with nothing new to index opens every segment and index: 0.1 to
   0.2 s with a warm cache, 3 to 12 s when it is cold (`benchmarks.md`, 2026-11-25). The index shortens a seek that
-  crosses much of a segment (128 MiB: from 0.18 s to about 1 ms, cold), not the directory read that every seek starts
-  with, so it does not help where segments are small and many.
+  crosses much of a segment (128 MiB, cold: 0.18 to 0.19 s without, 0.5 to 1.8 ms with; warm: 12 to 57 ms without,
+  about 0.1 ms with; 2026-11-25 and 2026-11-26), not the directory read that every seek starts with, so it does not help
+  where segments are small and many.
 - The directory `seek-index/` is created with the journal directory's group and mode. If the command refuses to create it
   (the journal directory belongs to another user, is writable by everyone, or its group is not one of this user's, as for
   a directory made under `/tmp` on macOS), create it yourself with the journal directory's owner, group and mode.
@@ -436,15 +532,18 @@ retention goes by the marker it finds, and the newer marker can make it remove r
 marker will name. Then restore the backup's `checkpoint` together with its segments, and remove the segments the backup
 does not have. The marker vouches for every record below its `next_seq`, so a marker newer than the segments covers
 records they lack. From 1.1 a writer refuses such a journal under every recovery policy, before it changes anything
-(`DanglingCheckpoint`, reported at the marker's segment and offset; ADR 0056); readers and `verify` stop where the
-restored records end. If the backup's marker is lost, see "After a crash" → Refused to open.
+(`DanglingCheckpoint`, reported at the marker's segment and offset; ADR 0056); `status` reports it beforehand
+(`checkpoint.problem` `dangling`, exit 2), retention and `tickertape archive` remove nothing from it and fail
+with the writer's error, and readers and `verify` stop where the restored records end. (A marker at offset 64 of its
+segment whose predecessor lacks records is not detected by any of them except `verify` and readers: ADR 0056,
+amendment.) If the backup's marker is lost, see "After a crash" → Refused to open.
 
 ### Limits
 
 - **Do not copy a journal a writer is using as a whole.** The files change during the copy, so it is no snapshot.
   Copying the segments before `checkpoint` is dangerous: the marker can cover records the copied segments lack. If the
   marker names a segment the copy lacks, the writer refuses the copy. If it points into a segment that was copied
-  earlier, `status` can exit with 0, `verify` reports `EmptyCommitWord` where the copied records end (from 1.1, ADR
+  earlier, `status` exits with 2 (from 1.1, `checkpoint.problem` `dangling`; 1.0 could exit with 0), `verify` reports `EmptyCommitWord` where the copied records end (from 1.1, ADR
   0050), and the writer refuses the copy (from 1.1, ADR 0056: `DanglingCheckpoint` at that segment and the marker's
   offset; 1.0.0 opened it, continued at the marker's sequence number and left a hole that readers cannot pass). A sign of this is a `verify` `last_seq` + 1 lower than the checkpoint's `next seq` in
   `status`. Copying `checkpoint` first avoids that, but the records after the marker may be incomplete,
@@ -481,7 +580,7 @@ reported as corruption. `tickertape verify` checks everything.
 
 | Signal | Why it matters | Suggested alert |
 |---|---|---|
-| **Corruption** (`tickertape_corrupt`; exit code 2) | The head is at bytes that fail validation (seen after a power loss or storage corruption, until the next writer repairs them; C8, C11), the checkpoint marker points to a missing segment or an impossible offset, or the segment listing proves a segment missing between the checkpoint and the head, so the writer refuses to open the journal | Page |
+| **Corruption** (`tickertape_corrupt`; exit code 2) | The head is at bytes that fail validation (seen after a power loss or storage corruption, until the next writer repairs them; C8, C11), the checkpoint marker points to a missing segment, an impossible offset or (from 1.1) a position its segment's records do not reach, or the segment listing proves a segment missing between the checkpoint and the head, so the writer refuses to open the journal | Page |
 | **Exposure age** (`exposure.estimated_age`, `tickertape_exposure_estimated_age_seconds`; CLI `--max-checkpoint-age`) | Everything after the last successful checkpoint may be lost in a power loss, and its sequence numbers reused (crash contract C7, C8). The exposure age is an upper bound on how far back that loss reaches: zero when every record is covered, otherwise the checkpoint's estimated age. It is unknown (and `--max-checkpoint-age` is breached) when records are uncovered and there is no checkpoint or its time is unreliable | Warn above 3× your checkpoint interval, page above 10×; alert on `absent(tickertape_exposure_estimated_age_seconds)` too |
 | **Checkpoint errors** (`Writer::metrics().poisoned`, or `checkpoint()` returning an error) | After a failed checkpoint, durability can't be guaranteed for this writer, and later checkpoints fail (C12, "Errors are sticky"). The marker then stops moving, so the exposure age grows too | Page on the first error. Only the writer process can see this directly |
 | **Storage headroom** (`storage.available_bytes`, `estimated_rolls_left`; `--min-headroom`, `--min-headroom-segments`) | Writes into the active segment need no new space, but the next roll needs a whole segment; when it can't get one, `append` fails with a storage-full error (C9). **On btrfs** a full volume can kill the writer with `SIGBUS` even inside the active segment (C10), so the rolls estimate is optimistic there; on APFS a checkpoint on a full volume fails and poisons the writer. A prepared spare segment is reported (`spare_segment`) but not counted, since publishing it can still fail | Warn below a day's worth of segments at your peak rate (or use `predict_linear` on `tickertape_storage_available_bytes`), page below 2 rolls. Keep a larger margin on btrfs |
@@ -880,9 +979,12 @@ the writer or retention.
   or move the affected segments aside knowingly. tickertape won't discard history on its own.
 - **Refused to open with `DanglingCheckpoint` at a segment and an offset** (from 1.1, under every policy; ADR 0056):
   the checkpoint marker's position lies beyond the records that segment holds, or the record right before it is
-  damaged, so the marker vouches for records the journal lacks. Nothing was changed. Run `tickertape verify` (it names
-  where the records end, or the damaged record) and `tickertape inspect` or `status` (the marker's segment, offset and
-  next sequence number). Then, in order of what they lose:
+  damaged, so the marker vouches for records the journal lacks. Nothing was changed. `tickertape status` predicts this
+  refusal (`checkpoint.problem` `dangling`, `tickertape_checkpoint_invalid` 1, exit 2), and retention, the
+  writer's and `tickertape archive`'s, removes nothing from such a journal (it fails with the same error), so the
+  segments the remedies below need stay. Run `tickertape verify` (it names where the records end, or the damaged
+  record) and `tickertape inspect` or `status` (the marker's segment, offset and next sequence number). Then, in order
+  of what they lose:
   1. Segments restored from a backup: restore that backup's `checkpoint` with them. Nothing is lost.
   2. A damaged record: restore its segment from a copy or a replica. Nothing is lost.
   3. Otherwise, knowingly, move `checkpoint` out of the directory and keep it. The writer then opens without a marker

@@ -140,10 +140,20 @@ released with seven items open, accepted by the owner as known gaps
     visibility-only workloads from periodic durability workloads and document unequal guarantees or unsupported cases.
   - Preserve raw results, environment, exact commands, achieved rates and late sends. Investigate the ext4 stalls
     observed in ADR 0025 and publish comparisons without coordinated omission or hidden dropped records.
-  - Missing: macOS results. The repeated 10-minute runs on Linux ext4 and xfs, x86-64 and aarch64, are recorded in
-    `docs/benchmarks.md` (2026-11-19 to 2026-11-22), with tickertape's rows from a second session at a newer commit (the
-    first session's failed on the open-files defect fixed in #38), and the ext4 stall investigation is published (ADR
-    0025 → Amendment).
+  - The repeated 10-minute runs on Linux ext4 and xfs, x86-64 and aarch64, are recorded in `docs/benchmarks.md`
+    (2026-11-19 to 2026-11-22), with tickertape's rows from a second session at a newer commit (the first session's
+    failed on the open-files defect fixed in #38), and the ext4 stall investigation is published (ADR 0025 →
+    Amendment).
+  - Rerun of the whole comparison at v1.0.0 with the corrected harness (issue #57; JVM warm-up, `microTouch()`, 1 GiB
+    `blockSize`, pinning; every tool in one session per machine): `docs/benchmarks.md` → "comparison rerun at v1.0.0"
+    (2026-11-25 to 2026-11-26), Linux x86-64 and aarch64, ext4 and xfs, Google Cloud VMs. It supersedes the earlier
+    Linux comparisons and their single-session caveat. Not run: bare metal, unpinned sustained runs.
+  - macOS, recorded 2026-11-26 on the owner's laptop (Apple M4 Pro, APFS; shared and not idle: `docs/benchmarks.md` →
+    "sustained load, roll waits and checkpoint cost on macOS"): tickertape's sustained session with repeated 10-minute
+    steady runs at 50 % and 90 % of the probe for both payloads, shorter bursty and visibility-only runs, and a
+    comparison with Chronicle Queue and Aeron at identical absolute rates in 120-second runs.
+  - Missing on macOS: the comparison at each tool's own probe rates and in 10-minute runs, and the lagging and
+    beyond-RAM scenarios. Both need more free disk than the shared laptop allowed (20 GB of data at any moment).
 - [x] **Performance diagnostics with eBPF.** (done 2026-11-25: the overhead and an untraced confirmation, issue #60)
   - Add a reproducible Linux diagnostic playbook using existing eBPF tools to investigate scheduler delays,
     page faults, filesystem/write-back stalls and block I/O during the sustained workloads.
@@ -181,9 +191,24 @@ released with seven items open, accepted by the owner as known gaps
     a bounded number of open segments between checkpoints (#38), `RecoveryPolicy::Fail` holding back the changes from
     the first header it would restore until the open can no longer refuse (#35), and exposed through the C ABI, C++,
     Python, Java and the iceoryx2 recorder (#39).
-  - Missing: the measurement of how much prefaulted, unwritten data adds to a checkpoint, and any macOS result. The
-    Linux results of ADR 0038 and before/after checkpoint and durable-only reader latency are recorded in
+  - Linux measured on 2026-11-26 (issue #62; `docs/benchmarks.md` → "what prefaulted, unwritten pages add to a
+    checkpoint", x86-64 and aarch64, ext4 and xfs): the `MADV_POPULATE_WRITE` window is dirty, so every checkpoint
+    that covers appends writes its 256 KiB of zeros, in the whole-file `fdatasync` after the ranged `msync` (156–429
+    µs), and the blocking checkpoint's median rose from 0.35–0.52 to 0.50–0.73 ms on aarch64. It also write-protects
+    the window, so the writer faults it in again (33–36 faults per checkpoint). An idle writer pays once. Syncing the
+    active segment by its ranged `msync` alone removed both costs in an experiment; it changes the crash contract's
+    barrier step and is not built.
+  - Missing: a drive with a volatile write cache; background checkpoints with the window (on Linux). The Linux
+    results of ADR 0038 and before/after checkpoint and durable-only reader latency are recorded in
     `docs/benchmarks.md` (2026-11-19 to 2026-11-22).
+  - macOS, measured 2026-11-26 (`docs/benchmarks.md` → "sustained load, roll waits and checkpoint cost on macOS"):
+    on APFS the prefault advice (`MADV_WILLNEED`) dirties the pages it advises, so each checkpoint's file-wide `fsync`
+    writes the zeros advised since the last one (up to the 8 MiB window: +2.5–3.3 ms on a 17 ms checkpoint at 21 MB/s
+    of records); without prefaulting the spare segment is off too and the first checkpoint after each roll writes about
+    half of the new 128 MiB file (32–36 ms instead of 16.5–18.5 ms at 21 MB/s). A checkpoint's floor is its two
+    `F_FULLFSYNC`, about 9 ms. With no early write-back on macOS a checkpoint writes everything appended since the last
+    one: about 0.2 s at 380–620 MB/s.
+  - Missing on macOS: an advice that does not dirty pages, measured.
 - [x] **Finish eliminating avoidable work.** (done 2026-11-26: the profiles, issue #62)
   - Profile append, both readers, notification and serialization paths under the sustained workloads; document
     allocations, copies and synchronization that remain on those paths.
@@ -205,15 +230,22 @@ released with seven items open, accepted by the owner as known gaps
     item named bare-metal Graviton, `c7gd.metal`.)
   - Record CPU, kernel, filesystem, storage, affinity, CRC implementation and commands; resolve architecture-specific
     correctness failures and explain material performance differences before claiming cross-architecture results.
-  - Missing: an explanation of the aarch64 mapped reader's constant maximum in the checkpoint runs (not reproduced on
-    8 vCPUs, 2026-11-25) and confirmation of the platform
-    mechanism behind the lagging view of issue #43. (The appends of 50–128 ms in the 1,024 B steady-90 runs on aarch64
-    ext4 are attributed since 2026-11-25: `docs/benchmarks.md` → "roll and journal stalls".) That view no longer
-    stops a reader (readers tolerate it; `crash-contract.md` → Known risks and limits), and the long verified runs under forced compaction (`3fea1c0`, on
-    aarch64 and x86-64) showed no false corruption and no lost write (issue #43, closed). Correctness, crash and soak
-    checks run on aarch64 Linux in CI (#12); the sustained sessions and comparison on Axion are recorded in
-    `docs/benchmarks.md` (2026-11-19 to 2026-11-22) with CPU, kernel, filesystem, storage, affinity, CRC path and
-    commands.
+  - Missing: an explanation of the aarch64 mapped reader's constant maximum in the checkpoint runs, and confirmation of
+    the platform mechanism behind the lagging view of issue #43. Investigated on 2026-11-26 (`docs/benchmarks.md` → "the
+    two aarch64 observations left open by 1.0.0"): the 10 ms maximum did not reproduce on a new `c4a-standard-16-lssd`
+    at `main` or at its own commit (nor on 8 vCPUs, 2026-11-25); in the old data only the spinning reader's CPU had it,
+    never the writer's or the safe reader's; it is not explained, and the trace to run if it returns is
+    `benches/diagnostics/reader-pauses.bt`. The lagging view still occurs on `main` on aarch64 under memory pressure
+    (about one event in 5 minutes, each cleared by the first paused re-read, within 69 µs) and not in 900 s on x86-64; 3
+    of 10 traced events coincide with kswapd removing the frame's pages from the page cache at the write frontier
+    (consistent with reclaim's deferred TLB invalidation), 6 have no such removal near them and are not explained; with
+    the journal within RAM there was no reclaim and no event in 1,000 s, too short to confirm. (The appends of 50–128 ms
+    in the 1,024 B steady-90 runs on aarch64 ext4 are attributed since 2026-11-25: `docs/benchmarks.md` → "roll and
+    journal stalls".) That view no longer stops a reader (readers tolerate it; `crash-contract.md` → Known risks and
+    limits), and the long verified runs under forced compaction (`3fea1c0`, on aarch64 and x86-64) showed no false
+    corruption and no lost write (issue #43, closed). Correctness, crash and soak checks run on aarch64 Linux in CI
+    (#12); the sustained sessions and comparison on Axion are recorded in `docs/benchmarks.md` (2026-11-19 to
+    2026-11-22) with CPU, kernel, filesystem, storage, affinity, CRC path and commands.
 
 ### Following milestones: adoption and scale
 
@@ -305,19 +337,27 @@ passing, no known unresolved issue violating the published contract). None of th
 they are measurements, explanations and one design record. They stay open and continue in 1.x, except
 where a line says it is closed:
 
-- **Sustained-load comparison:** no macOS results.
+- **Sustained-load comparison:** macOS results recorded on 2026-11-26 (tickertape's sustained session; a reduced
+  comparison at identical low rates); still missing on macOS: the comparison at each tool's probe rates and 10-minute
+  comparison runs, the lagging and beyond-RAM scenarios (`docs/benchmarks.md`, 2026-11-26, macOS).
 - **eBPF diagnostics:** closed on 2026-11-25; the tracing overhead during the sustained workloads and a conclusion
   confirmed with tracing off are recorded (`docs/benchmarks.md` → "2026-11-25, roll and journal stalls").
 - **Mapped reader:** closed on 2026-11-25. The publication-frontier follow-up had no ADR; it has
   [0048](decisions/0048-publication-frontier.md) (the marker bound it decides is built). The limitation it narrows is part of
   the 1.0 contract ([`compatibility.md`](compatibility.md); `crash-contract.md` → Readers, the writer and memory safety).
-- **Cheaper checkpoints:** how much prefaulted, unwritten data adds to a checkpoint is not measured, and there is no
-  macOS result.
+- **Cheaper checkpoints:** how much prefaulted, unwritten data adds to a checkpoint is measured on Linux since
+  (2026-11-26, [`benchmarks.md`](benchmarks.md)): the 256 KiB window is written as zeros by every checkpoint that
+  covers appends, 0.16–0.43 ms of the checkpoint. On macOS (2026-11-26, the same file) the 8 MiB `MADV_WILLNEED` window
+  is dirtied as well, and each checkpoint writes the zeros advised since the last one (about 2.5–3.3 ms of a 17 ms
+  checkpoint at 21 MB/s).
 - **Avoidable work:** the profiles of the readers, notification and serialization paths were not documented; done
   since for v1.0.0 ([above](#next-release-sustained-performance), `docs/benchmarks.md` 2026-11-25); the durable-only
   reader has not been profiled since #66.
 - **ARM servers:** one of the two latency observations on aarch64 (the 10 ms reader maximum) and the platform mechanism
-  behind issue #43 are not explained; the appends of 50–128 ms are (issue #60, 2026-11-25).
+  behind issue #43 are not explained; the appends of 50–128 ms are (issue #60, 2026-11-25). On 2026-11-26 the 10 ms
+  maximum did not reproduce (it belonged to one VM); part of the lagging view is consistent with reclaim removing the
+  frame's pages under the readers, the rest is not explained, and neither is confirmed (`docs/benchmarks.md`,
+  2026-11-26).
 - **Replay and recovery at scale:** measured on 2026-11-25: archived history, missing and corrupt segments, catch-up
   under a live writer, the zero-copy reader and journals of 10,000 to 100,000 segments ([`benchmarks.md`](benchmarks.md)).
   Not measured: archiving under a live writer at this scale, the 128 MiB archive on aarch64, catch-up of a durable-only

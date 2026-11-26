@@ -67,8 +67,9 @@ class CheckpointStatus(NamedTuple):
     segment_base_seq: int
     offset: int
     problem: Optional[str]
-    """Why a writer would refuse the marker (corruption): ``"missing_segment"``, ``"invalid_segment_header"`` or
-    ``"invalid_offset"``; ``None`` if it is usable."""
+    """Why a writer would refuse the marker (corruption): ``"missing_segment"``, ``"invalid_segment_header"``,
+    ``"invalid_offset"`` or (from 1.1) ``"dangling"``; ``None`` if it is usable. Treat any other string as a
+    problem too: the list may grow in a minor release."""
     modified_unix_ns: Optional[int]
     estimated_age_ns: Optional[int]
     age_unknown: Optional[str]

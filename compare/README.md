@@ -7,8 +7,8 @@ in `docs/benchmarks.md` with the benchmark playbook's provenance and both repeat
 
 ## Run
 
-Requires Rust/Cargo, Python 3.9+, Java **21**, and Maven. Initial dependency downloads
-need network access; the benchmark processes do not. Chronicle analytics is disabled.
+Requires Rust/Cargo, Python 3.11+ (for `tt-latency`'s process group, see "Signals, failures and leftover
+processes"), Java **21**, and Maven. Initial dependency downloads need network access; the benchmark processes do not. Chronicle analytics is disabled.
 On the owner's Apple Silicon Mac the wrappers select the Homebrew JDK below instead
 of `/usr/bin/java`. On other hosts set `JAVA_HOME` to a working JDK 21.
 
@@ -29,12 +29,32 @@ backwards, at most three per run), Java dependency inventories, `jvm-logs/` (JVM
 Java process, see "JVM warm-up, tool settings and JVM logs"), and a machine-readable
 `skipped.json`. Any build, child,
 validation, timeout, or missing-tool failure fails the suite; missing measurements
-are never substituted with zero. Results already completed remain available.
+are never substituted with zero. Results already completed remain available, in `OUTDIR.incomplete-N` (see
+"Signals, failures and leftover processes").
 After every measurement the runner calls `sync`, so pending write-back never carries over into the next one.
 Each measurement owns a new directory under `$TMPDIR` (Python's normal temp-dir
 fallback otherwise), including fixtures and control files; only those owned
 scratch directories are removed afterward. No privileged cache purge is made. On Linux
 the threads are pinned (below). Failed child groups are terminated and reaped.
+
+Options of the short mode (the sustained mode has its own, below):
+
+| Option | Default | Effect |
+|---|---|---|
+| `--quick` | off | the smoke counts below; never results |
+| `--tools LIST` | all six | comma-separated subset of `tickertape,chronicle,aeron,yaque,queue-file,plain-file`, with the sustained mode's syntax and checks (an unknown or repeated name stops before anything is created) |
+| `--writer-cpu`, `--reader-cpu`, `--helper-cpus`, `--no-pin` | automatic on Linux | see "Thread pinning" |
+| `--no-long-warmup`, `--no-micro-touch`, `--chronicle-block-size`, `--aeron-sparse-terms`, `--no-aeron-pre-touch`, `--no-jvm-logs`, `--java-experiment` | new settings | see "JVM warm-up, tool settings and JVM logs" |
+
+With `--tools` the run is the full run's cells of those tools and nothing else: the same file names, the same result
+fields, and the tools in the full run's order whatever the order given (`--tools aeron,chronicle` runs Chronicle
+first within each payload, as a full run does). `skipped.json` lists only the selected tools; only their Java projects
+are built (and `tt-latency` only with tickertape), and a JDK is needed only if Chronicle or Aeron is selected. Every
+result line has `selected_tools` (all six in a full run) and `environment.txt` a `selected_tools:` line, so a partial
+run is never taken for a full one. `benches/rerun.py` runs each short unit as `run.py OUTDIR ... --tools TOOL`.
+Against the v1.0.0 rerun's short units (which built both Java projects and wrote the full `skipped.json`) the file set
+differs in two ways: a unit without a JVM has no `*-dependencies.txt`, and `skipped.json` lists only the unit's tool
+(`{}` for a tool with nothing skipped).
 
 `--quick` uses 2,000 records for W1/W3, and 100 warmup + 1,000 measured for W2.
 It covers the full matrix and is a functional smoke check, **not publication data**.
@@ -54,7 +74,7 @@ cargo build --locked --release --manifest-path compare/Cargo.toml
 cargo fmt --manifest-path compare/Cargo.toml --check
 cargo clippy --manifest-path compare/Cargo.toml --all-targets -- -D warnings
 cargo test --manifest-path compare/Cargo.toml
-python3 -m unittest discover -s compare -p 'test_*.py'   # short and sustained mode, JVM settings
+python3 -m unittest discover -s compare -p 'test_*.py'   # short and sustained mode, JVM settings, signals, --tools
 # Java builds, if invoking an adapter directly:
 JAVA_HOME=/path/to/jdk21 mvn -B -q -f compare/chronicle/pom.xml package dependency:build-classpath -Dmdep.outputFile=target/classpath.txt
 JAVA_HOME=/path/to/jdk21 mvn -B -q -f compare/aeron/pom.xml package dependency:build-classpath -Dmdep.outputFile=target/classpath.txt
@@ -205,8 +225,9 @@ finite and ordered, and an SD run synced at least once. A tool that cannot keep 
 and, for the probe, a lower rate.
 
 **Resume and interruptions.** Runs execute sequentially in a fixed order (probes first, then repeats with tools
-interleaved). A finished or skipped run is never repeated; a failed run is retried by the next `--resume`. SIGTERM
-and SIGHUP stop the current run and kill its process groups. Each measurement's data lives under a scratch directory
+interleaved; the tools in the order `--tools` gives). A finished or skipped run is never repeated; a failed run is
+retried by the next `--resume`. SIGTERM, SIGINT and SIGHUP stop the current run and end its process groups (see
+"Signals, failures and leftover processes"); the OUTDIR keeps its name, since it resumes. Each measurement's data lives under a scratch directory
 owned by this OUTDIR (`$TMPDIR/tt-compare-sustained-<hash>`), which the next session removes, so a killed session
 leaves nothing behind that fills the disk. The runner calls `sync` after every run.
 
@@ -218,6 +239,53 @@ the reason in `skipped/` if it exceeds 80 % of free space minus 1 GiB; the probe
 **Estimated duration.** The runner prints `estimated_seconds` before starting and the remaining estimate before every
 run (schedule time plus a fixed allowance per run for process start, drain and `sync`). With all six tools, the
 default matrix has 92 runs: 12 probes and, per repeat and payload, 12 SV and 8 SD runs.
+
+## Signals, failures and leftover processes
+
+What each process runs in is what it ran in at v1.0.0, with one addition. The adapters (the Chronicle Queue and Aeron
+JVMs, whose writer embeds Aeron's media driver, and the Rust adapters) each lead a session and process group of their
+own, as before, so a terminal's Ctrl-C or hang-up reaches only the runner. `tt-latency` (tickertape's W2), with the
+writer and reader processes it starts, stays in the runner's session, with its output read from a pipe in a blocking
+wait, as before; it now leads a process group of its own within that session, so that it can be ended as a group
+(Python 3.11's `process_group`). On Linux `environment.txt` records what decides the scheduling groups:
+`kernel.sched_autogroup_enabled` (autogroup gives each session a group), the runner's cgroup and its controllers.
+
+However a measurement ends — finished, a tool's failure, the runner's time limit (its records at the intended rate
+plus 120 s, plus the JVM warm-up allowance), SIGTERM, SIGINT, or SIGHUP when an ssh session drops — the runner ends
+each child's group that is still there, also when its leader has already exited (a failed tool that left a
+process behind): SIGTERM to the whole group, up to 3 s for every process in it (not only the leader) to end, then
+SIGKILL to the groups that are still there, and it reaps the leaders, so no zombie and no late writer stays behind. A
+group is not signalled again once the runner reaped its leader and found it empty, since its number may by then
+belong to another process; one that still had a member stays registered with the guard until it is ended. A signal that arrives while a child is being started
+or while the children are being stopped takes effect right after that. Further SIGTERM, SIGINT or SIGHUP are then
+ignored for the rest of the runner's life, so nothing cuts the cleanup short; to stop the runner at once, `kill -QUIT`
+or `kill -KILL` it, and the guard (below) still ends the children. The runner exits with 128 + the signal (143 for
+SIGTERM), also when its terminal or output pipe is gone. A signal that was ignored when the runner started (`nohup`)
+stays ignored. In both modes nothing is added to a measured loop: the handling happens in the runner, outside the
+tools.
+
+An unfinished short-mode run (interrupted or failed) is renamed `OUTDIR.incomplete-N`, the convention of
+`benches/rerun.py`, so it never sits where a finished run would; a finished run has `skipped.json`, written last. A
+sustained OUTDIR is not renamed: it resumes.
+
+SIGKILL of the runner cannot be handled in the runner. For it the runner starts one guard process per session
+(`reaper.py`, in a session of its own, on the runner's helper CPUs when pinned). It blocks on a pipe from the runner
+and wakes only when a child starts or ends (to record its group) and when the pipe closes. If the pipe closes
+without the runner having released it, the runner is gone: the guard ends every group it still had (SIGTERM, 3 s,
+SIGKILL) and renames a short-mode OUTDIR `.incomplete-N`. It renames only the directory it was started for (same
+device and inode), not a new one the driver made at the same path to run the unit again. On Linux it signals a group
+only while the PID is free or still belongs to the leader it recorded (start time in `/proc/<pid>/stat`); on macOS a
+leader reaped just before the runner was killed, whose number another process got within those seconds, would be
+signalled. It adds no thread to any tool. Only SIGKILL of the runner
+and of the guard together (a `kill -9` of both, or of a whole cgroup) leaves children running; then end their
+process groups by PID. `PR_SET_PDEATHSIG` was not used: it is Linux-only, needs code in the child before `exec`, and
+would not reach `tt-latency`'s children. Tools exiting when their stdin closes would need a reader thread in each
+tool. `benches/rerun.py` runs each unit the same way, with a 20 s grace period and a guard of its own, so SIGKILL of
+the driver ends the unit, whose runner then cleans up as above.
+
+`test_signals.py` covers every way out with stand-in children (`standin.py`: no build, no JDK) and, where a JDK 21
+and the built Java adapters exist, with real Chronicle Queue and Aeron JVMs (`JvmTests`; skipped otherwise, and in
+CI, unless `TT_COMPARE_REQUIRE_JVM=1`). `test_tools.py` compares `--tools` runs with a full run.
 
 ## Workloads and schema
 
@@ -280,8 +348,10 @@ Late means send starts **more than 1 µs** after intended, including warmup.
 Achieved writer rate covers first send start to last completion including pacing,
 encoding and backpressure; it includes warmup. Short quick runs make this noisy.
 Every result additionally has `tool`, `tool_version`, structured `guarantees`,
-`workload`, `repeat`, `quick`, `affinity`, and `java` (`null` for tools without a JVM: the requested settings and what
-each Java process ran with). W1 has `append` (with `timer_starts` and `priming_records`); W3 has `replay`; each contains
+`workload`, `repeat`, `quick`, `affinity`, `java` (`null` for tools without a JVM: the requested settings and what
+each Java process ran with), and `selected_tools` (the run's `--tools`, all six in a full run; results written before
+the option existed lack it and were full runs, except the v1.0.0 rerun's short units, one tool each: the
+`command:` line of their `environment.txt` names the tool). W1 has `append` (with `timer_starts` and `priming_records`); W3 has `replay`; each contains
 `count`, `seconds`, `records_per_s`, `payload_mb_per_s`. Throughput `rate` is null
 because W1/W3 are unpaced. W1 adds `flush_operation` and `flush_seconds`.
 The runner rejects truncated counts, invalid histogram ordering, and inconsistent
@@ -320,8 +390,9 @@ runner fails a run whose process reports something else.
 | Aeron clients' `preTouchMappedMemory` | on | `--no-aeron-pre-touch`: off, Aeron's default |
 | JVM logs and late-send events | on | `--no-jvm-logs` |
 
-The old settings, with which the results in `docs/benchmarks.md` up to v1.0.0 were recorded, are all six switches
-together. One of them alone isolates its effect; for `microTouch()` alone, between all off and all on, leave out
+The old settings, with which the comparison results in `docs/benchmarks.md` before the rerun at v1.0.0 were recorded,
+are all six switches together. The rerun (`docs/benchmarks.md` → "comparison rerun at v1.0.0") ran with these
+defaults, with all six switches (its `jvm-old` rows) and with `microTouch()` alone (`microtouch-only`). One of them alone isolates its effect; for `microTouch()` alone, between all off and all on, leave out
 `--no-micro-touch` and pass the others:
 
 ```sh
@@ -397,7 +468,8 @@ Chronicle's own evidence is `bench/results.txt` in its tests, whose sections hav
 its first group the 99.9th percentile of ten runs is 15.2–16.5 without anything, 1.3–1.5 under "microtouch",
 15.2–16.3 under "pretouch" and 15.2–16.4 under "bgMicroTouch" (so no gain from the last two). A later group of five
 runs does not repeat it: 16.4–19.7 without anything, and 11.6–424,149 under "micro", with two runs above 20,000. The
-rerun therefore also publishes `microTouch()` alone, on both architectures.
+rerun therefore also publishes `microTouch()` alone, on both architectures (`docs/benchmarks.md` → "comparison rerun
+at v1.0.0" → "Chronicle Queue and Aeron under the old and the new settings").
 
 **`blockSize`.** Chronicle's README says about the default of 64 MB: "in production you may want this to be high to
 reduce jitter from creating new chunks". It also says "You should avoid changing `blockSize` unnecessarily". Its

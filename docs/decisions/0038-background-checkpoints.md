@@ -257,7 +257,9 @@ writer's helper threads):
   (`writer::tests::a_forked_child_releasing_its_copy_closes_the_writeback_helpers_files`,
   `::a_forked_child_releasing_its_copy_leaves_a_writeback_lock_held_at_the_fork_alone`).
 - Pages behind the writer are never stored into again, so starting their write-back does not make the writer take a
-  write fault on them.
+  write fault on them. (Note, 2026-11-27: not so for the rest of the page-cache folio that holds the position, which a
+  range ending at the writer's page also wrote back and write-protected, 128 KiB on recent ext4 and xfs; from 1.1 the
+  helper stops at the 128 KiB boundary below the writer: ADR 0058.)
 - **macOS:** not built. macOS has no call that starts write-back of a file range without waiting for it, and its
   checkpoint has a floor of two `F_FULLFSYNC` calls that early write-back would not remove. The option has no effect
   there.

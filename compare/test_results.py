@@ -59,6 +59,22 @@ class PinningCommandTests(unittest.TestCase):
             self.assertNotIn("--cpu", options("chronicle", "reader", pinning))
 
 
+class EnvironmentTests(unittest.TestCase):
+    def test_linux_records_the_scheduling_groups_and_macos_does_not(self):
+        import run
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+        scheduling = ["$ sysctl kernel.sched_autogroup_enabled", "$ cat /proc/self/cgroup", "cgroup.controllers"]
+        for system, expected in (("Linux", True), ("Darwin", False)):
+            with self.subTest(system=system), tempfile.TemporaryDirectory() as tmp, \
+                    mock.patch.object(run.platform, "system", return_value=system), \
+                    mock.patch.object(run, "capture", return_value="x"):
+                run.environment(Path(tmp), {"JAVA_HOME": "/jdk"}, True)
+                text = (Path(tmp) / "environment.txt").read_text()
+                self.assertEqual([line in text for line in scheduling], [expected] * 3)
+
+
 if __name__ == "__main__":
     unittest.main()
 
