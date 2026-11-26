@@ -51,7 +51,8 @@ const VALIDATION_WINDOW: Duration = Duration::from_millis(50);
 const VALIDATION_PAUSE_MIN: Duration = Duration::from_micros(10);
 /// The longest pause between the re-reads of [`VALIDATION_WINDOW`].
 const VALIDATION_PAUSE_MAX: Duration = Duration::from_millis(5);
-/// Listings `open` and `seek` make when the segment they chose disappears before they can open it.
+/// Listings `open` and `seek` make when the segment they chose disappears before they can open it (and, for `open`,
+/// the later ones the listing kept, [`journal::LATER_BASES`]).
 const LISTING_ATTEMPTS: u32 = 8;
 
 /// An independent cursor over a journal, in this or another process.
@@ -315,7 +316,9 @@ impl Reader {
     /// Opens the journal in `dir`, positioned at the first record of the oldest segment.
     ///
     /// If retention removes the oldest segment while the reader opens it, the reader opens the oldest segment that
-    /// remains; it doesn't report the removed file. A directory listing that comes back empty while retention runs
+    /// remains; it doesn't report the removed file. (It tries the next segments of the same listing, up to the 8
+    /// oldest, before it lists the directory again: a retention run removes one segment after another, and on tmpfs a
+    /// removal takes no longer than a listing.) A directory listing that comes back empty while retention runs
     /// (on btrfs a listing omits segments created after it started, so it can miss every segment) is listed again
     /// rather than reported as [`Error::NotFound`].
     ///
@@ -323,7 +326,9 @@ impl Reader {
     ///
     /// [`Error::NotFound`] if `dir` has no segments (for example, the writer hasn't started),
     /// [`Error::Corrupt`], [`Error::UnsupportedVersion`] if
-    /// the oldest segment's header is invalid, [`Error::Io`].
+    /// the oldest segment's header is invalid, [`Error::Io`]. An I/O "not found" error for a segment the reader listed
+    /// is returned only if the segments it tried disappeared on each of 8 listings in a row: each listing tries up to
+    /// its 8 oldest segments, so up to 64 opens fail before that error.
     pub fn open(dir: impl AsRef<Path>, config: ReaderConfig) -> Result<Reader> {
         Reader::open_inner(dir.as_ref(), config, false)
     }
@@ -1987,12 +1992,19 @@ impl Reader {
     }
 }
 
-/// Lists the segments, keeping only the oldest base and the newest base `<= seq` ([`journal::find_bases`]), lets
+/// Lists the segments, keeping only the oldest bases and the newest base `<= seq` ([`journal::find_bases`]), lets
 /// `choose` pick one, and opens it. If the chosen segment has disappeared by the time it is opened (retention or
 /// archiving removed it, or writer recovery quarantined it), lists again, so that `choose` sees the journal as it is
 /// now (and likewise if the listing was empty). Retention removes the oldest segments first, so
 /// the second listing already reflects a removal; after [`LISTING_ATTEMPTS`] listings in a row whose chosen segment
 /// vanished, the last "not found" error is returned.
+///
+/// When the segment that vanished was the oldest one listed, `choose` is first asked again with the listing as it
+/// would be without it ([`journal::Bases::without_oldest`]), as often as the listing kept bases after it, and the
+/// segment it picks then is opened without listing again (when it picks one: a seek whose segment was the oldest gets
+/// its error from a new listing). A retention run removes one segment after another, oldest first; where a removal
+/// takes no longer than a listing (on tmpfs a directory sync does nothing), listing again before each try lets the run
+/// remove each segment chosen, and a reader opening at the oldest segment lost all its attempts while one run went on.
 fn open_listed(
     dir: &Path,
     mapped: bool,
@@ -2001,7 +2013,7 @@ fn open_listed(
 ) -> Result<(u64, OpenSegment)> {
     let mut attempts = 1;
     loop {
-        let bases = journal::find_bases(dir, seq)?;
+        let mut bases = journal::find_bases(dir, seq)?;
         // On a live journal a directory read can come back empty: btrfs returns only entries that existed when the
         // directory was opened and still exist when it is read, so retention removing them all while new segments
         // are created leaves none. List again.
@@ -2009,11 +2021,29 @@ fn open_listed(
             attempts += 1;
             continue;
         }
-        let base = choose(bases)?;
+        let mut base = choose(bases)?;
         crate::fault::hook(crate::fault::Point::ReaderOpen);
-        match open_segment(dir, base, mapped) {
-            Err(e) if e.is_not_found() && attempts < LISTING_ATTEMPTS => attempts += 1,
-            result => return result.map(|seg| (base, seg)),
+        loop {
+            match open_segment(dir, base, mapped) {
+                Err(e) if e.is_not_found() => {
+                    // Nothing older than a listed segment appears later (C14), except a segment an archiver puts back
+                    // (ADR 0055); C14 already lets a reader that opens while it is out start after it. So the next one
+                    // listed is the oldest that can remain.
+                    let next = (bases.oldest == Some(base))
+                        .then(|| bases.without_oldest())
+                        .flatten()
+                        .and_then(|without| Some((without, choose(without).ok()?)));
+                    if let Some((without, chosen)) = next {
+                        (bases, base) = (without, chosen);
+                    } else if attempts < LISTING_ATTEMPTS {
+                        attempts += 1;
+                        break;
+                    } else {
+                        return Err(e);
+                    }
+                }
+                result => return result.map(|seg| (base, seg)),
+            }
         }
     }
 }
