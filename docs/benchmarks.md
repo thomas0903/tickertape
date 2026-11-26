@@ -25,6 +25,8 @@ Seeks with and without the seek index, at both payloads and with both readers, o
 [under 2026-11-26](#2026-11-26-seeks-with-and-without-the-seek-index-google-cloud-vms).
 The investigation of the two aarch64 observations that 1.0.0 left open (the zero-copy reader's 10 ms maximum, the
 lagging view of issue #43) is [under 2026-11-26](#2026-11-26-the-two-aarch64-observations-left-open-by-100-google-cloud-vms).
+Why replay speed changed with the layout of `Reader`, and the before and after of its fixed layout (ADR 0057), are
+[under 2026-11-26](#2026-11-26-the-layout-of-reader-adr-0057-issue-86-google-cloud-vms).
 What the Linux prefault window adds to a checkpoint (bytes, sync time, append and reader latency) is
 [under 2026-11-26](#2026-11-26-what-prefaulted-unwritten-pages-add-to-a-checkpoint-google-cloud-vms-linux).
 
@@ -4083,6 +4085,106 @@ implementation.
 Not measured: xfs; other machine sizes; runs long enough to compare rates between writers or readers; tracing overhead
 on these runs (the untraced runs had events at a similar rate: 1 in 227 s and 1 in 600 s); the independent pair with the
 trace. The migration probe was attached in the last two aarch64 runs only.
+
+## 2026-11-26, the layout of `Reader` (ADR 0057, issue #86; Google Cloud VMs)
+
+Why replay speed changed with the layout of `Reader` (PR #85 saw twice the time for the zero-copy reader at 64 B after
+a 40-byte change, on an Apple M4 Pro), and the before and after of the fixed layout of ADR
+[0057](decisions/0057-reader-layout.md). **Google Cloud virtual machines, not bare metal**; nothing here is compared
+with earlier sections. The Mac was not measured. Raw output (results, layouts, disassembly, counters, the probe and the
+scripts) is kept outside the repository.
+
+### Environment and method
+
+| | x86-64 | aarch64 |
+|---|---|---|
+| Machine | `c4-standard-4-lssd` (us-east1-b): Intel Xeon 6985P-C, 2 cores with 2 threads each, 15 GB | `c4a-standard-4-lssd` (us-east1-b): Google Axion (Neoverse-V2), 4 cores, 16 GB; the final comparison on a second VM of the same type |
+| Time (UTC) | 2026-11-26 09:04–11:10 | 09:04–10:17 and 10:35–10:53 |
+| Kernel, OS | 7.0.0-1017-gcp, Ubuntu 24.04 LTS, `randomize_va_space` 2 | the same |
+| Counters | the VM's PMU (`--performance-monitoring-unit=standard`), `perf stat` | the same |
+| rustc | 1.100.0, release profile as in the repository | the same |
+
+Journals of 1,000,000 records of 64 B and 100,000 of 1,024 B (written once, page cache warm) on ext4 on the local SSD.
+Two harnesses: the repository's `replay` benchmark (criterion, `--bench 'replay/records/' --warm-up-time 1
+--measurement-time 2 or 3`), and a probe (not in the repository) that replays the same journals with the `Reader`
+either on the stack of the replay function, as the benchmark has it (Linux puts it at a new offset within a page in
+each process), or at a chosen address modulo 4096, and prints the median ns per record of 9 passes (5 in the sweeps)
+after one untimed pass. Builds of one comparison ran interleaved in a rotating order; the noise floor is the same
+binary under a second name. Ratios are medians of the per-round ratios against the reference build. Layouts were
+read from `std::mem::offset_of!` in each build.
+
+### The padding of PR #85 does not reproduce on Linux
+
+Builds of `main` (`b88c6d5f`, where rustc puts `found` at offset 400): padding of 8, 16, 24, 32, 40, 48 and 64 bytes
+left to rustc (it puts it after `found`), the same as `[u64; n]`, `#[repr(C)]` with rustc's order (`cmain`) and 8 to 64
+bytes before every field or after every field, `segments_listed` unboxed as in PR #85, PR #85's own commits
+(`07a0ac09c2`, field unboxed; `47b7d8a1c0`, boxed), and four builds with every function and block aligned (`-C
+llvm-args=-align-all-functions=6 -C llvm-args=-align-all-nofallthru-blocks=5`). Reader on the stack, 8 rounds,
+ratio of the median ns per record against `main`:
+
+| Case | x86-64: 26 builds | x86-64: `cmain` | aarch64: 26 builds | aarch64: `cmain` |
+|---|---|---|---|---|
+| mapped, 64 B | 0.981–1.017 | 1.005 | 0.979–1.014 | 1.001 |
+| safe, 64 B | 0.979–1.001 | 0.989 | 0.991–1.010 | 1.005 |
+| mapped, 1,024 B | 0.991–1.005 | 0.991 | 0.997–1.009 | 1.001 |
+| safe, 1,024 B | 0.981–1.023 | 0.983 | 0.996–1.026 | 1.002 |
+
+PR #85's commits, mapped 64 B: 36.91 ns (boxed) and 37.09 ns (unboxed) per record on aarch64, 45.50 and 44.79 ns on
+x86-64 (whose rounds were noisy in that hour, 40 to 51 ns for `main`). The criterion benchmark of the main padding
+builds stayed within 2 % of `main` on both machines.
+
+### What it depends on: a page boundary inside `found`
+
+The reader at 80 addresses (every 8 bytes of a cache line, every 64 bytes of a page) showed one reproducible outlier,
+on both machines: 40 bytes before every field, at 3648 modulo 4096 (x86-64 50.0 / 49.4 ns against a median of 41.1;
+aarch64 41.2 / 41.5 against 36.5). There the page boundary falls 8 bytes into `found`. The **page sweep** then put the
+boundary at every offset `j` of the struct (reader at `4096 − j`, steps of the struct's alignment), one timed round and
+one under `perf stat`, both 64-byte cases. Offsets more than 5 % above the median of all offsets, in both rounds where
+there were two:
+
+| Build (`found` at) | x86-64 | aarch64 |
+|---|---|---|
+| `main` `b88c6d5f` (400) | `j` 408: +16 % mapped, +28 % safe; 424: +9 % / +15 % | 408: +16 % / +15 %; 440: +16 % / +16 % |
+| 40 bytes before every field (440) | 448: +19 % / +23 %; 464: +10 % / +6 % | 448: +15 % / +14 %; 480: +16 % / +17 % |
+| `main` `42b2307e` (400), three sessions | 408: +14 to +24 % / +26 to +30 %; 424: +8 to +17 % / +11 to +16 % | 408: +15 to +16 % / +14 to +21 %; 440: +15 to +16 % / +16 % |
+| ADR 0057's layout (400, aligned to 16), two sessions | none | none |
+| the first candidate (`found` at 0) without its alignment | 8: +16 % / +27 %; 24: +10 % / +14 % | 8: +16 % / +17 %; 40: +7 % / +9 % |
+
+Single offsets were sometimes slow in one round and not in the other (noise; more often on x86-64); none of those is
+listed. Counters per record at the slow offsets against all others:
+
+| | x86-64 | aarch64 |
+|---|---|---|
+| `found` + 8 | `ld_blocks.store_forward` 8.98 against 7.94 (mapped), 5.01 against 4.02 (safe); `mem_inst_retired.split_loads`/`split_stores` unchanged | `st_align_lat` 1.0 against 0.00; `ld_align_lat` +1 to +2 |
+| `found` + 24 (x86-64), + 40 (aarch64) | none of the measured counters moves (`ld_blocks.store_forward` 7.97–8.17) | `st_align_lat` 1.0 against 0.00 |
+
+The record path writes `found.header` with two 16-byte stores and reads it with 16-byte loads (aarch64 also stores
+`payload_at` and `payload_len` as one pair). A store that straddles two pages is slow on aarch64; on x86-64 the load after
+it at `found` + 8 is not forwarded, and what makes `found` + 24 slow was not identified by these counters. Of 1,802 ordinary probe processes with `main`'s layout (reader on the stack), 9 had a
+boundary at a hot offset of `found`; those at `found` + 8 replayed 64-byte records 14 to 21 % slower than the median of
+their build, 1,024-byte records 3 to 16 %.
+
+**Ruled out on these machines**: 4K aliasing (x86-64 `ld_blocks.address_alias` reaches 7.3 per record at some of 64 addresses,
+with no change in time);
+cache-line splits (`found` + 8 at a line boundary inside a page: within 1 %); the size of the struct (padding after every
+field); code alignment (the aligned builds, and the slowdown follows the address with identical code); the stack against
+a boxed reader.
+
+### Before and after (`42b2307e` against ADR 0057's layout)
+
+See ADR 0057 → "Before and after" for the tables: probe, 30 rounds, median of per-round ratios to `main` 0.978–0.993
+on x86-64 (noise floor 0.994–1.003) and 0.972–0.997 on aarch64 (0.999–1.007); criterion, 6 rounds, within the noise on
+both. Two other orders were measured on x86-64 and rejected: the hot fields first with `found` at 0 (mapped 64 B 1.013
+to 1.021 in three sessions, 1.019 without the alignment, 1.031 with aligned code) and the scalar fields first with
+`found` at 224 (1.030); the other cases level. On aarch64 the first was 0.977. Padding at the end of ADR 0057's layout:
+64 bytes −0.3 to +1.3 % on both machines; 40 bytes −0.4 to +0.2 % on aarch64, and on x86-64 +3.9 % and +1.9 % for the
+zero-copy reader at 64 B in two sessions (+2.1 % with aligned code), the other cases within noise.
+
+### What these figures do not show
+
+The Apple M4 Pro where #85 saw the effect (16 KiB pages; not measured, see ADR 0057); other microarchitectures; readers
+held by the bindings; 32-bit targets. Why the hot-fields-first orders and the 40-byte tail padding cost a few per cent on
+x86-64.
 
 ## 2026-11-02, v0.3.0 on Linux (AWS) and macOS
 

@@ -2630,7 +2630,10 @@ mod tests {
     /// of either reader reads or writes. 64-bit Linux and macOS only: the offsets depend on the sizes of `PathBuf`, `Vec`
     /// and `Instant`.
     #[test]
-    #[cfg(all(target_pointer_width = "64", any(target_os = "linux", target_os = "macos")))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_os = "linux", target_os = "macos")
+    ))]
     fn reader_layout() {
         use super::{Found, OpenSegment};
         use std::mem::{align_of, offset_of, size_of};
@@ -2654,13 +2657,25 @@ mod tests {
             ("waiting_since", offset_of!(Reader, waiting_since), 304),
             ("offset", offset_of!(Reader, offset), 328),
             ("next_seq", offset_of!(Reader, next_seq), 336),
-            ("durable_next_seq", offset_of!(Reader, durable_next_seq), 344),
+            (
+                "durable_next_seq",
+                offset_of!(Reader, durable_next_seq),
+                344,
+            ),
             ("bound", offset_of!(Reader, bound), 368),
             ("skip_until", offset_of!(Reader, skip_until), 376),
             ("buf_start", offset_of!(Reader, buf_start), 392),
             ("found.header", found + offset_of!(Found, header), 400),
-            ("found.payload_at", found + offset_of!(Found, payload_at), 432),
-            ("found.payload_len", found + offset_of!(Found, payload_len), 440),
+            (
+                "found.payload_at",
+                found + offset_of!(Found, payload_at),
+                432,
+            ),
+            (
+                "found.payload_len",
+                found + offset_of!(Found, payload_len),
+                440,
+            ),
         ];
         for (field, at, expected) in hot {
             assert_eq!(at, expected, "`Reader::{field}` is at offset {at}, not {expected}: {WHY}");

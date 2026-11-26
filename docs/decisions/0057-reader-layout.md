@@ -64,9 +64,9 @@ all figures are in `docs/benchmarks.md`.
    not with the address or the size of the struct. A cache-line split costs nothing measurable (`found` + 8 at a line
    boundary inside a page, and `found` + 24 on aarch64, are not slow).
 3. **The counters name the access.** On aarch64, `st_align_lat` (stores that pay for crossing a boundary) is 0.00 per
-   record at every other offset and 1.0 at the slow ones, and `ld_align_lat` rises by 1. On x86-64 the slow offsets add
-   exactly one blocked store-to-load forward per record (`ld_blocks.store_forward` 7.94 → 8.98 at `found` + 8); the
-   line-split counters (`mem_inst_retired.split_*`) do not change. The disassembly shows why: the record path writes
+   record at every other offset and 1.0 at the slow ones, and `ld_align_lat` rises by 1. On x86-64 a boundary at `found` + 8 adds
+   exactly one blocked store-to-load forward per record (`ld_blocks.store_forward` 7.94 → 8.98); at `found` + 24 none of
+   the measured counters moves, and the line-split counters (`mem_inst_retired.split_*`) do not change at either. The disassembly shows why: the record path writes
    `found.header` with two 16-byte stores (`movups`/`stp q`), aarch64 also writes `payload_at` and `payload_len` as one
    16-byte pair, and `try_next` reads the header back with 16-byte loads.
 4. **The decisive experiment.** Same binary, reader moved by 8 bytes (boundary at `found` + 0 → `found` + 8): fast →
@@ -142,32 +142,49 @@ can catch a slowdown the test cannot. No timing test runs in CI.
 
 ### Before and after
 
-`main` (`42b2307e`) against the branch on the same base, 10 interleaved rounds of the probe (reader on the stack, 2
-processes per round for the 64 B cases) and 5 of the criterion benchmark (pristine builds), median of the per-round
-ratios against `main`; the second copy of `main` is the noise floor. Details in `docs/benchmarks.md`.
+`main` (`42b2307e`) against this layout on the same base, on the machines above (aarch64 on a second VM of the same
+type). Probe: 30 interleaved rounds, reader on the stack, two processes per round for the 64-byte cases; the figure is
+the median of the per-round ratios against `main`, and the second copy of `main` (the same binary) is the noise floor.
+Criterion: 6 interleaved rounds of the `replay` benchmark, builds without the probe.
 
-| | aarch64: branch | aarch64: copy of `main` | x86-64: branch | x86-64: copy of `main` |
+| Probe, ratio to `main` | x86-64: this layout | x86-64: copy of `main` | aarch64: this layout | aarch64: copy of `main` |
 |---|---|---|---|---|
-| probe, mapped 64 B | 0.974 | 1.001 | see `docs/benchmarks.md` | |
-| probe, safe 64 B | 0.995 | 0.999 | | |
-| probe, mapped 1,024 B | 0.993 | 1.000 | | |
-| probe, safe 1,024 B | 1.000 | 0.993 | | |
+| mapped, 64 B | 0.993 | 0.998 | 0.972 | 0.999 |
+| safe, 64 B | 0.992 | 0.994 | 0.995 | 1.003 |
+| mapped, 1,024 B | 0.978 | 1.001 | 0.993 | 1.001 |
+| safe, 1,024 B | 0.993 | 1.003 | 0.997 | 1.007 |
 
-Padding of 8, 40, 48 or 64 bytes added to the cold part, or a 40-byte 8-aligned field there, stays within 1.5 % of the
-branch on aarch64 (and within the noise of the x86-64 runs). On aarch64 the record path compiles to the same number of
-instructions as on `main` (641 in `try_next`, `advance` and `read_slot`); a few loads are paired differently and the
-offsets changed.
+| Criterion, median ms (`main` / its copy / this layout) | x86-64 | aarch64 |
+|---|---|---|
+| `replay/records/mapped/64` | 49.44 / 47.48 / 47.27 | 36.53 / 36.55 / 36.32 |
+| `replay/records/safe/64` | 36.17 / 37.31 / 36.97 | 38.52 / 38.66 / 38.78 |
+| `replay/records/mapped/1024` | 10.41 / 10.05 / 10.23 | 10.56 / 10.63 / 10.61 |
+| `replay/records/safe/1024` | 13.01 / 12.71 / 12.55 | 15.04 / 15.13 / 14.98 |
+
+The page sweep of this layout (a boundary at every 16th offset) has no slow position on either machine, and
+`st_align_lat` is 0 at all of them; `main`, swept again in the same sessions, is slow at `found` + 8 and + 24 (x86-64)
+and + 8 and + 40 (aarch64) as before. The record path compiles to the same instructions as on `main`: on aarch64 the
+three functions are identical apart from addresses, on x86-64 three unaligned 16-byte moves of `found` became aligned
+ones (`movups` → `movaps`).
+
+**Padding at the end of the struct** (where new fields go): 64 bytes changes nothing on either machine (−0.3 to
++1.3 %); 40 bytes changes nothing on aarch64 (−0.4 to +0.2 %), but on x86-64 makes the zero-copy reader replay 64-byte
+records 1.9 to 3.9 % slower than this layout (slower in 23 and 28 of 30 rounds in two sessions; also with every function
+and block aligned, 2.1 %), while the other three cases stay within the noise. No hot offset moves there, the record
+path is the same code, and why the size does this was not found. So adding a field at the end is not free of risk on
+x86-64 at the scale of a few per cent; the release checklist's benchmark is what catches that.
 
 ## Consequences
 
-- No process is slow by the accident of its address any more, on Linux x86-64 and aarch64, for these accesses. Other
-  wide accesses the compiler may add later to hot fields are covered while they stay within a 16-byte block of the
-  struct; the test cannot see instructions, which is why the checklist keeps the benchmark.
-- The size of `Reader` is free again: cold state can grow without the old rule, and `Waits` need not be boxed for
-  speed (it stays boxed; moving it back is not part of this change).
+- No reader is 15 to 30 % slower by the accident of its address any more, on Linux x86-64 and aarch64. Wider accesses
+  the compiler may emit later to hot fields are covered while they stay within a 16-byte block of the struct; the test
+  cannot see instructions, which is why the checklist keeps the benchmark.
+- The old rule "do not change `size_of::<Reader>()`" becomes "add at the end, or behind a pointer, and run the
+  benchmark". `Waits` stays boxed.
 - **Not measured:** the Apple M4 Pro (above); other x86-64 and Arm microarchitectures; readers held by the bindings
-  (their `Reader` is boxed or inside a Python object, with the same odds as any heap address); 32-bit targets (the test
-  does not run there); `try_next` called through the C ABI. An unrelated finding: on x86-64 every layout has about 8
-  blocked store-to-load forwards per record in the zero-copy reader's path (4 in the safe reader's), from values the
-  record path copies through the stack; that is the kind of cost issue #16 removed once, and is left for another
-  change.
+  (their `Reader` is boxed or inside a Python object, with the same odds as any heap address, and now 16-byte aligned
+  there); 32-bit targets (the test does not run there); `try_next` called through the C ABI. Not explained: why the
+  hot-fields-first orders are slower on x86-64 (option 2), and why 40 bytes at the end are. An unrelated finding: on
+  x86-64 every layout has about 8 blocked store-to-load forwards per record in the zero-copy reader's path (4 in the
+  safe reader's), from values the record path copies through the stack; that is the kind of cost issue #16 removed
+  once, and is left for another change.
