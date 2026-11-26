@@ -2906,6 +2906,28 @@ aarch64 (`d2074c1`):
 | 10 × 1 GiB | zero-copy | replay | 962 ms (960–982 ms) | 969 ms (955–986 ms) | 961 ms (956–964 ms) |
 | 10 × 1 GiB | – | retention plan | 74.6 µs (74.4–79.8 µs) | 145 µs (140–165 µs) | 75.6 µs (73.5–78.6 µs) |
 
+**2026-11-27, informal local measurement: a waiting reader beside 10,000 stray later names (issue #89).** Not on the
+machines above. Issue #89 reported that with 10,000 empty files named like later segments an idle visible reader's
+`try_next` took up to 0.47–0.50 s once a second (a durable-only reader 24–33 ms). Measured again on a busy Apple M4 Pro
+(macOS, APFS) and in an OrbStack Linux VM on it (aarch64, btrfs), with `main` at `e8e4cb16` and with the branch of the
+pull request that adds this note (ADR 0050 amendment of 2026-11-27): a journal of one 64 KiB segment with 200 records,
+checkpointed, its writer open; 10,000 empty files named for bases 1,000,000 to 1,009,999; each kind of reader opened,
+read to the end, then `try_next` every millisecond for 5 s. A throwaway program, not in the repository; three runs of
+each build, alternating. Values are the calls that listed the segments (4 or 5 per run, about one a second; every other
+call took under 0.5 ms; on `main` in the VM, 2 of the 24 such calls took under 10 ms, the others 23–32 ms):
+
+| | `main`, macOS | branch, macOS | `main`, Linux VM | branch, Linux VM |
+|---|---|---|---|---|
+| visible safe reader, a call that lists | 116–157 ms | 12–22 ms | 8.8–32 ms | 5.5–9.3 ms |
+| visible zero-copy reader, a call that lists | 105–168 ms | 9.0–21 ms | 9.2–32 ms | 4.1–8.9 ms |
+| first empty slot after the open (reads every name, both builds) | 94–156 ms | 101–148 ms | 7.2–28 ms | 7.1–30 ms |
+| durable-only readers, longest call | 0.65 ms | 0.46 ms | 0.20 ms | 0.37 ms |
+
+The 0.47–0.50 s of the issue came from another, unrecorded run and was not reproduced here, nor were the 24–33 ms of a
+durable-only reader: here a durable-only reader at the marker lists nothing in either build (it lists only at an empty
+slot below a marker that no longer covers it). What remains per listing on the branch is the listing of 10,000 names,
+two hash sets of them and 256 header reads.
+
 ### Seek index (ADR 0045)
 
 (Measured again on `main` after #74, at 64 B and 1,024 B, with targets inside one segment:

@@ -5,6 +5,20 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
+- Changed: a reader waiting at an empty slot no longer reads every later file name without a valid segment header
+  again at each listing (issue #89, ADR 0050 amendment of 2026-11-27). Such names (stray files named like segments) are
+  no evidence; with 10,000 of them an idle visible reader's `try_next` took up to 0.47–0.50 s once a second. A listing
+  now reads every new name (or another file at a known name, by its inode number) and at most 256 of the others, the
+  ones read longest ago; the first check after an open or a seek still reads them all. A header written into such a file
+  in place is seen within `ceil(M / 256)` listings (`M` such names; at the next one up to 256, as before), a segment
+  linked or renamed into place at the next one. Informal, 10,000 empty stray names, a call that lists: 105–168 ms →
+  9–22 ms on an Apple M4 Pro, up to 32 ms → up to 9.3 ms in a Linux VM (`docs/benchmarks.md`, 2026-11-27). The record path and `Reader`'s layout are unchanged. No API change.
+- Docs: `docs/operations.md` → "How many segments to keep" (issue #80): what grows with the number of segments (each
+  seek's listing, a checkpoint with retention, removals, a writer's open, `max_bytes` planning, `list_segments`), with
+  the figures of `docs/benchmarks.md` (2026-11-25, one x86-64 cloud machine), what a run still reads per file, and what
+  to do about it. ADR 0046 is amended: there is no cached listing for seeks, and `Reader::seek`'s rustdoc says what a
+  seek costs and why.
+
 - Docs: the comparison with Chronicle Queue, Aeron IPC, yaque, queue-file and a plain file is rerun at v1.0.0 with the
   corrected harness (issue #57): one 24-hour session on each of two Google Cloud VMs (x86-64 and aarch64, ext4 and xfs),
   session commit `fb2d91b0`, every tool pinned, the JVM tools warmed up through their measured loops, Chronicle with
