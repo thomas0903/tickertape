@@ -58,4 +58,5 @@ Sustained runs last 10 minutes each and a full session about a day, so they run 
 ## Comparison rerun (issue #57)
 
 The planned comparison rerun at v1.0.0 has its own plan: [`rerun-comparison.md`](rerun-comparison.md) (matrix, driver,
-machines, cost, what gets published).
+machines, cost, what gets published). Its results are in [`benchmarks.md`](../benchmarks.md#2026-11-25-to-2026-11-26-comparison-rerun-at-v100-google-cloud-vms-linux-x86-64-and-aarch64)
+(2026-11-25 to 2026-11-26).

@@ -320,8 +320,9 @@ runner fails a run whose process reports something else.
 | Aeron clients' `preTouchMappedMemory` | on | `--no-aeron-pre-touch`: off, Aeron's default |
 | JVM logs and late-send events | on | `--no-jvm-logs` |
 
-The old settings, with which the results in `docs/benchmarks.md` up to v1.0.0 were recorded, are all six switches
-together. One of them alone isolates its effect; for `microTouch()` alone, between all off and all on, leave out
+The old settings, with which the comparison results in `docs/benchmarks.md` before the rerun at v1.0.0 were recorded,
+are all six switches together. The rerun (`docs/benchmarks.md` → "comparison rerun at v1.0.0") ran with these
+defaults, with all six switches (its `jvm-old` rows) and with `microTouch()` alone (`microtouch-only`). One of them alone isolates its effect; for `microTouch()` alone, between all off and all on, leave out
 `--no-micro-touch` and pass the others:
 
 ```sh
@@ -397,7 +398,8 @@ Chronicle's own evidence is `bench/results.txt` in its tests, whose sections hav
 its first group the 99.9th percentile of ten runs is 15.2–16.5 without anything, 1.3–1.5 under "microtouch",
 15.2–16.3 under "pretouch" and 15.2–16.4 under "bgMicroTouch" (so no gain from the last two). A later group of five
 runs does not repeat it: 16.4–19.7 without anything, and 11.6–424,149 under "micro", with two runs above 20,000. The
-rerun therefore also publishes `microTouch()` alone, on both architectures.
+rerun therefore also publishes `microTouch()` alone, on both architectures (`docs/benchmarks.md` → "comparison rerun
+at v1.0.0" → "Chronicle Queue and Aeron under the old and the new settings").
 
 **`blockSize`.** Chronicle's README says about the default of 64 MB: "in production you may want this to be high to
 reduce jitter from creating new chunks". It also says "You should avoid changing `blockSize` unnecessarily". Its
