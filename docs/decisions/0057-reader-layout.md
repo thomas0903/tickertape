@@ -1,6 +1,7 @@
 # 0057: The layout of `Reader`
 
-- **Status:** proposed
+- **Status:** accepted (2026-11-26, by the orchestrator on the owner's delegation, after reading the change and the
+  measurements; the Apple M4 Pro part of issue #86 stays open, see below)
 - **Date:** 2026-11-26
 - **Relates to:** issue #86; found in PR #85 (ADR [0050](0050-empty-slot-in-history.md)); the per-record path's
   return values (`SlotOutcome` in `reader.rs`, issue #16); measured in `docs/benchmarks.md` (2026-11-26, the layout of
