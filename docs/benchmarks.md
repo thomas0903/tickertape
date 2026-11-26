@@ -1428,24 +1428,13 @@ below). The change takes the `munmap` out
   against 21.2 and 21.6 (spare off) and **25.5 against 16.7 and 17.2** (spare on), p99.9 7.3 against 6.0 and 5.8 (spare
   on); with one run per build this is not separable from run-to-run variation, and it was not rerun on x86-64. On
   aarch64, where the same cells were repeated, the change's p99.99 is 32.6 and 32.9 against 31.9–32.8, and 33.0 and
-  32.2 against 31.8–32.6. **This stays open.** One explanation fits and was **not tested**: after the change the
-  `munmap` runs on another CPU of the writer's process, so the TLB flushes it needs now interrupt the writer's CPU,
-  where before the writer flushed its own TLB locally; x86-64 sends such flushes as interrupts (and that VM has two
-  threads per core), aarch64 broadcasts them in hardware, so an effect on x86-64 only is what it would produce. The
-  `/proc/interrupts` samples taken during the run (every 5 s, per CPU) do not test it: they cover the 64 B runs, not
-  the 1,024 B ones, and against the 37,368–37,903 shootdowns a second that the writer's CPU took in every run, base and
-  change alike (write-back write-protecting the pages behind the writer), a few flushes per roll do not show in a
-  5-second total. What would settle it: repeated runs of the 1,024 B cells without checkpoints on x86-64, with
-  `tlb:tlb_flush` and `irq_vectors:call_function_entry` traced on the writer's CPU around each roll.
-- **The writer thread's page faults** (its own, `getrusage(RUSAGE_THREAD)`, the results' `hot_thread_cpu`): on aarch64
-  the same for both builds in every cell (for example 130,405–135,524 against 128,237–134,929, 1,024 B without
-  checkpoints, spare on). On x86-64 they vary from run to run, and in the two cells without checkpoints with the spare
-  segment the change's count is well above both base runs: 65,214 against 12,002 and 11,960 (1,024 B) and 75,312
-  against 40,647 and 44,175 (64 B); without the spare 48,160 against 28,056 and 36,266, and 47,793 against 44,442 and
-  69,076. That fits the x86-64 tail above, but even in a cell where nothing is released at a roll (64 B, checkpoints,
-  spare off) the change's count lies outside the base pair (64,518 against 45,719 and 47,487), so one run each does not
-  separate it from noise. **Not explained**; what would settle it is the same repeated run, with the writer's faults
-  counted by address around each roll. **One aarch64 change run
+  32.2 against 31.8–32.6. **Answered in round 2** (below): against the current `main`, with 6 strictly alternating
+  pairs, the change's p99.99 in this cell is lower in 4 of 6 pairs; the round-1 difference is not reproduced.
+- **The writer thread's page faults** (its own, `getrusage(RUSAGE_THREAD)`, the results' `hot_thread_cpu`): in round 1
+  the change's count was far above both base runs on x86-64 in the cells without checkpoints with the spare segment
+  (65,214 against 12,002 and 11,960 at 1,024 B; 75,312 against 40,647 and 44,175 at 64 B), and the same for both builds
+  on aarch64. **Answered in round 2** (below): against the current `main` the change takes fewer faults in 20 of 24
+  pairs without checkpoints. **One aarch64 change run
   (64 B, no checkpoints, spare on) has one append of 1.03 ms that is not a roll** (the roll maximum of that run is 124
   µs); in the other 9 change runs without checkpoints no append took more than 211 µs. Not traced; one occurrence in 10
   runs.
@@ -1457,6 +1446,44 @@ below). The change takes the `munmap` out
 - **Instructions per append** (ADR 0047's gate 1, `tt-append-cost append` under callgrind, 200,000 against 400,000
   appends of 64 B, one segment, no helper threads): 384.000 for base and change on x86-64, 368.000 for both on aarch64
   (the same on the OrbStack VM, aarch64). The append path is unchanged; the change is in the roll only.
+
+### Round 2: the writer thread's faults and the tail on x86-64 (6 pairs per cell)
+
+To settle the two open x86-64 results above, a second session on one more `c4-standard-8-lssd` (us-east1-b, 20:25–21:39
+UTC, the same image, kernel and file system): **base** `d27cec9c` (`main` after ADR 0058's change 1, #111, which stops
+early write-back below the folio the writer is filling), **change** `8438667c` (this branch merged with that `main`;
+source archive sha256 `8f95dd07…`), each built in its own empty target directory (the binaries differ). Five cells, 6
+pairs each, strictly alternating base and change within each pair and the cells interleaved (pair 1 of every cell,
+then pair 2, …), 60 s each with the same command and readers as above. Ratios are change / base within a pair; the
+base/base column is the ratio of consecutive base runs of the cell (5 per cell): its median and its largest
+deviation, the floor a difference has to clear.
+
+| Cell (payload, checkpoints, spare) | Writer-thread faults per run: base → change | Median ratio, pairs higher / lower | Append p99.99 (µs): base → change | Median ratio, pairs higher / lower | Base/base: median, largest | Roll append p50 (µs): base → change |
+|---|---|---|---|---|---|---|
+| 1,024 B, none, on | 73–79 → 67–134 | ×0.94, 2 / 4 | 7.7–10.7 → 7.3–9.0 | ×0.88, 2 / 4 | ×1.15, ×1.37 | 907–930 → 53–58 |
+| 1,024 B, none, off | 483–667 → 237–313 | ×0.49, 0 / 6 | 7.8–12.8 → 8.5–11.8 | ×1.06, 5 / 1 | ×1.17, ×1.63 | 996–1,055 → 163–174 |
+| 64 B, none, on | 71–87 → 51–94 | ×0.88, 2 / 4 | 6.1–6.9 → 6.0–6.8 | ×0.98, 3 / 3 | ×1.06, ×1.11 | 877–950 → 47–59 |
+| 64 B, none, off | 227–241 → 149–193 | ×0.74, 0 / 6 | 6.0–6.6 → 6.6–7.0 | ×1.09, 6 / 0 | ×1.03, ×1.06 | 983–1,060 → 134–176 |
+| 1,024 B, every 1 s, off (control) | 5,081–6,044 → 5,119–5,623 | ×0.98, 1 / 5 | 8.5–11.9 → 8.2–11.5 | ×0.98, 2 / 4 | ×1.09, ×1.39 | 161–171 → 161–171 |
+
+- **The writer thread's faults are not higher with the change**: lower in 20 of 24 pairs without checkpoints, and
+  hardly different in the control. With #111 in both builds the writer takes 50–670 faults a minute in these cells
+  instead of 12,000–75,000 in round 1, whose base predates #111: most of round 1's faults were write-back
+  write-protecting the folio the writer was filling, which #111 removed, and the round-1 difference came with them. It
+  was not traced in round 1 and cannot be now; against the `main` this would merge into, there is nothing left to
+  attribute, so the attribution step (`tt-faults` by class) was not needed. `tt-faults` (1,024 B, steady-50, no
+  checkpoints, spare on, writer on CPU 1, 30 s, two runs each) agrees: 116 and 118 faulting appends for base, 104–107
+  of them in the first 256 KiB of a segment (just after a roll), against 16 and 16 for the change (10 there). Its
+  latency counts from each append's scheduled time, so it also shows what the roll's stall did to the appends queued
+  behind it: p99.9 341 µs and p99.99 907 µs for base, 6.9 and 36 µs for the change. (Its fault tracer,
+  `writer-faults.bt`, matched no thread: it selects the thread by the name `tt-faults`, and the copies of the binary
+  had other names. The counts above are from `getrusage`.)
+- **The tail.** 1,024 B with the spare segment, the round-1 worry: p99.99 lower in 4 of 6 pairs. 1,024 B without it and
+  64 B with it: both ways, within the base/base floor. **64 B without the spare segment: p99.99 higher in all 6 pairs,
+  by about 0.5 µs (×1.09, above the largest base/base deviation of ×1.06)**: a small, consistent cost there, not
+  explained. p99.9 and the maximum of all appends: both ways; the maxima of 3.5–8.4 ms seen in some later runs are not
+  rolls and came in both builds (base 3.5–8.1 ms in 8 runs, change 4.9–8.4 ms in 5).
+- **The roll's append** falls in every pair: 0.88–1.06 ms → 47–176 µs at the median.
 
 ### macOS (owner's laptop, one short pair)
 
@@ -1480,7 +1507,7 @@ reported for 128 MiB segments on 2026-11-26 was not measured again).
 ### Not measured
 
 xfs; `--helper-cpus inherited` (the helper on the writer's CPU, where its `munmap` would compete with the writer
-directly); where the writer thread's page faults come from (below); kernels before about 6.6, where a fault on a
+directly); the cause of the 0.5 µs p99.99 cost at 64 B without the spare segment (round 2); kernels before about 6.6, where a fault on a
 shared file page takes `mmap_lock` for reading and can queue behind the helper's `munmap` (on the measured 7.0 kernel
 `munmap` downgrades that lock before it clears the page tables, and such faults take the per-VMA lock); a writer above
 about 310–390 MB/s, which overtakes the 256 KiB prefault window while the helper unmaps (it advises nothing meanwhile),

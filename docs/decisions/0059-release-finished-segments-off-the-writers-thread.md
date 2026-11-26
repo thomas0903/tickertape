@@ -109,19 +109,19 @@ checkpoints twice for the change and three times for the base); one unpaced run 
 - **The whole distribution:** p99.9 and p99.99 within or next to the base runs, except x86-64, 1,024 B without
   checkpoints, where the change's p99.99 was 23.3 against 21.2 and 21.6 (spare off) and 25.5 against 16.7 and 17.2
   (spare on), from one run each; on aarch64, where those cells were repeated, no difference. One aarch64 change run had
-  one 1.03 ms append that was not a roll; no other change run without checkpoints had an append above 211 µs. **Open.**
-  One explanation fits the x86-64 result and was **not tested**: the `munmap` now runs on another CPU of the writer's
-  process, so its TLB flushes interrupt the writer's CPU, where before the writer flushed its own TLB locally; x86-64
-  sends them as interrupts (that VM has two threads per core), aarch64 broadcasts them in hardware. The
-  `/proc/interrupts` samples of the session cannot test it (they cover the 64 B runs, and their 5-second totals per CPU
-  hide a few flushes per roll among the 37,000 a second that write-back causes in every run). What would settle it:
-  repeated x86-64 runs of the 1,024 B cells without checkpoints with `tlb:tlb_flush` and
-  `irq_vectors:call_function_entry` traced on the writer's CPU around each roll.
-- **The writer thread's page faults** (`getrusage(RUSAGE_THREAD)`): the same for both builds on aarch64; on x86-64 they
-  vary from run to run, and without checkpoints with the spare segment the change's count was well above both base runs
-  (65,214 against 12,002 and 11,960 at 1,024 B; 75,312 against 40,647 and 44,175 at 64 B), but one change count is
-  outside its base pair even where nothing is released at a roll (64,518 against 45,719 and 47,487, 64 B with
-  checkpoints). Not explained; one run each.
+  one 1.03 ms append that was not a roll; no other change run without checkpoints had an append above 211 µs. Round 1
+  also had the writer thread's own faults (`getrusage(RUSAGE_THREAD)`) far above both base runs on x86-64 without
+  checkpoints with the spare segment (65,214 against 12,002 and 11,960 at 1,024 B), one run each.
+- **Round 2 (x86-64, 6 strictly alternating pairs per cell, against `main` after ADR 0058's change 1, #111):** the
+  writer thread's faults are lower with the change in 20 of 24 pairs without checkpoints (median ratio ×0.49–×0.94) and
+  about the same in the control with checkpoints; with #111 in both builds the writer takes 50–670 faults a minute
+  there, not 12,000–75,000, so round 1's difference went with the write-back faults #111 removed (the round-1 base
+  predates it), and there was nothing left to attribute. `tt-faults` agrees (16 faulting appends per run for the change
+  against 116–118, most of base's just after a roll). p99.99: 1,024 B with the spare segment lower in 4 of 6 pairs (the
+  round-1 result is not reproduced); 1,024 B without it and 64 B with it both ways within the base/base floor; **64 B
+  without the spare segment higher in all 6 pairs, by about 0.5 µs (6.0–6.6 → 6.6–7.0 µs, ×1.09 against a largest
+  base/base deviation of ×1.06)**, a small consistent cost, not explained (the TLB flushes of the helper's `munmap`
+  reaching the writer's CPU would fit; not tested). The roll's append fell in every pair (0.88–1.06 ms → 47–176 µs).
 - **Unpaced:** the same rate (403,596 against 404,055 and 408,629 against 412,383 records/s); the tails there are device
   stalls, which one run per build cannot compare.
 - **Instructions per append** (ADR 0047's gate 1): 384.000 on x86-64 and 368.000 on aarch64, the same for both builds.
@@ -146,10 +146,10 @@ checkpoints twice for the change and three times for the base); one unpaced run 
 - `tests/open_segments.rs::most_extra_descriptors` and `docs/operations.md` → Open files carry the new numbers; a change
   of `prefault::RELEASE_QUEUE` must change them.
 - **Not measured:** xfs, steady-90, `HelperCpus::Inherited` (the helper sharing the writer's CPU), small machines, bare
-  metal, macOS with default segments, more than one run per build on x86-64, and whether the x86-64 p99.99 difference at
-  1,024 B without checkpoints is real (it needs repeated runs there); where the writer thread's extra faults on x86-64
-  come from, if they are real; kernels before about 6.6, where a fault on a shared file page takes `mmap_lock` for
-  reading and can queue behind a writer of that lock while the helper clears page tables (on the measured 7.0 kernel
-  `munmap` downgrades the lock before it clears them, and such faults take the per-VMA lock); and a writer above about
-  310–390 MB/s, which overtakes the 256 KiB prefault window while the helper unmaps (it advises nothing meanwhile), as
-  in the unpaced runs.
+  metal, macOS with default segments, more than one run per build on aarch64; the cause of the 0.5 µs p99.99 cost at 64
+  B without the spare segment on x86-64 (round 2; tracing `tlb:tlb_flush` and `irq_vectors:call_function_entry` on the
+  writer's CPU around rolls would test the TLB explanation); kernels before about 6.6, where a fault on a shared file
+  page takes `mmap_lock` for reading and can queue behind a writer of that lock while the helper clears page tables (on
+  the measured 7.0 kernel `munmap` downgrades the lock before it clears them, and such faults take the per-VMA lock);
+  and a writer above about 310–390 MB/s, which overtakes the 256 KiB prefault window while the helper unmaps (it advises
+  nothing meanwhile), as in the unpaced runs.

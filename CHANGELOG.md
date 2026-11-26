@@ -27,10 +27,13 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   build and configuration): without checkpoints the `munmap` of the released segment was 78–94 % of a roll, and the
   roll's append fell from 0.83–1.06 ms to 169–179 µs at the median (0.71–0.94 ms to 49–60 µs with the spare segment),
   its maximum from 0.73–1.14 ms to 60–211 µs; with checkpoints every second nothing changed; instructions per append are
-  unchanged. Open: a higher p99.99 in two x86-64 runs at 1,024 B without checkpoints (23.3 against 21.2–21.6 µs, and
-  25.5 against 16.7–17.2 with the spare segment; not seen on aarch64, where those cells were repeated; the helper's TLB
-  flushes reaching the writer's CPU would fit and were not tested) and one aarch64 run with a 1.03 ms append that was
-  not a roll (`docs/benchmarks.md` → "2026-11-26, finished segments released off the writer's thread").
+  unchanged. A second x86-64 session (6 strictly alternating pairs per cell, against `main` with ADR 0058's change 1)
+  settled round 1's open results: the writer thread takes fewer page faults with the change (lower in 20 of 24 pairs
+  without checkpoints), and p99.99 is within the base-to-base spread in three of four cells without checkpoints (lower
+  in 4 of 6 pairs at 1,024 B with the spare segment, the cell that looked worse in round 1); at 64 B without the spare
+  segment it is about 0.5 µs higher in all 6 pairs (6.0–6.6 → 6.6–7.0 µs), a small cost that is not explained. One
+  aarch64 round-1 run had a 1.03 ms append that was not a roll (`docs/benchmarks.md` → "2026-11-26, finished segments
+  released off the writer's thread").
 - Changed (Linux): early write-back stops at the 128 KiB boundary below the writer instead of at the page that holds its
   position (ADR 0058, change 1; issue #60), so that it no longer writes back, and write-protects, the page-cache folio
   the writer is still filling (128 KiB on recent ext4 and xfs with the default `read_ahead_kb`), which the device then
