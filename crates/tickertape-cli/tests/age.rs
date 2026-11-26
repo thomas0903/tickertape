@@ -116,7 +116,6 @@ impl Age {
         for pair in self.reports.windows(2) {
             for key in [
                 "records",
-                "before_live",
                 "after_discontinuity",
                 "unset_timestamp",
                 "ahead_of_clock",
@@ -171,7 +170,6 @@ fn check(r: &Value) {
             "records",
             "first_seq",
             "last_seq",
-            "before_live",
             "after_discontinuity",
             "unset_timestamp",
             "ahead_of_clock",
@@ -298,7 +296,6 @@ fn ages_of_a_live_writer_with_every_wait() {
         );
         assert_eq!((u(r, "records"), u(&r["age"], "count")), (20, 20));
         // The records found at the start are neither read nor measured; the rest is without a gap.
-        assert_eq!(u(r, "before_live"), 0, "{r}");
         assert!(u(r, "first_seq") >= 5, "{r}");
         assert_eq!(u(r, "last_seq") - u(r, "first_seq"), 19);
         assert!(r["interval_age"].is_null());
@@ -383,7 +380,6 @@ fn a_tape_without_a_writer_counts_nothing() {
         assert_eq!(reports.len(), 1);
         let r = &reports[0];
         assert_eq!((u(r, "records"), u(&r["age"], "count")), (0, 0));
-        assert_eq!(u(r, "before_live"), 0);
         assert!(live(r), "an idle journal is live: {r}");
         assert!(r["elapsed_s"].as_f64().unwrap() >= 0.2);
         assert_eq!(r["durable_only"], args.contains(&"--durable-only"));
@@ -690,7 +686,7 @@ fn text_output() {
         .stdout(
             predicate::str::contains("journal     /")
                 .and(predicate::str::contains("wait=poll"))
-                .and(predicate::str::contains("before_live=0"))
+                .and(predicate::str::contains("after_discontinuity=0"))
                 .and(predicate::str::contains("interval    count=0"))
                 .and(predicate::str::contains("  final")),
         );

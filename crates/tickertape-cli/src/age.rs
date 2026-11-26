@@ -22,7 +22,7 @@ const DEFAULT_INTERVAL: Duration = Duration::from_secs(10);
 /// Reports that may wait for a slow standard output before interval reports are skipped.
 const PENDING_REPORTS: usize = 4;
 
-pub(crate) const HELP: &str = "Follows the journal from its end with the safe reader and reports record ages: this machine's wall clock when the command's reader returned a record, minus the record's local_ts_ns, which whoever appended it supplied. It prints no records. It measures THIS COMMAND'S READER on the CPU it happens to run on, not your application's reader: it says whether the writer, the clock and the machine are healthy. An application measures its own reader with tickertape::latency::RecordAge. Age is not the writer-to-reader latency, unless the writer stamps local_ts_ns right before it appends.\n\nIt starts at the end of the journal, as tail --from-end (Reader::seek_to_end: reads the newest segment from the checkpoint on), and every record from there on counts (live), except after discarded history, until it has caught up again. A report with live false and records 0 measured nothing: the reader was not at the end of the journal yet. Records without a local_ts_ns, or with one later than this machine's clock, are counted apart; if any were ahead of the clock, the minimum and the percentiles are biased upwards.\n\n--wait poll (default) and spin make no system call in the writer's appends: they never register as a waiter. poll sleeps 10 us, doubling to 1 ms while idle, and those sleeps are in the ages; spin has no such floor and uses one core. block waits in the kernel on the writer's wake-up region: an append that finds it waiting makes a wake-up system call before it returns; with --durable-only it waits for checkpoints instead, and only a checkpoint makes that call (from 1.1; beside a 1.0.0 writer it polls every 1 ms).\n\nEnds --duration after its start or after --count records returned while live, whichever comes first, with a final report; --interval prints reports before that. With none of the three it reports every 10s until interrupted; an interrupt ends it without a final report.\n\nJSON schema (schema_version 1; fields may be added; one object per report and line): {\"schema_version\":1,\"journal\":string,\"sampled_unix_ns\":u64,\"elapsed_s\":number,\"final\":bool,\"live\":bool,\"durable_only\":bool,\"wait\":\"poll\"|\"spin\"|\"block\",\"records\":u64,\"first_seq\":u64|null,\"last_seq\":u64|null,\"before_live\":u64,\"after_discontinuity\":u64,\"unset_timestamp\":u64,\"ahead_of_clock\":u64,\"discontinuities\":u64,\"age\":HIST,\"interval_age\":HIST|null} with HIST = {\"count\":u64,\"min_ns\":u64|null,\"mean_ns\":number|null,\"p50_ns\":u64|null,\"p90_ns\":u64|null,\"p99_ns\":u64|null,\"p99_9_ns\":u64|null,\"p99_99_ns\":u64|null,\"max_ns\":u64|null}; see docs/cli.md.\n\nExit codes: 0 success; 1 usage, I/O or missing journal; 2 corruption or unsupported journal format (an error while following comes after the report of what was measured; a journal that can't be opened, or whose end can't be reached, gets no final report).";
+pub(crate) const HELP: &str = "Follows the journal from its end with the safe reader and reports record ages: this machine's wall clock when the command's reader returned a record, minus the record's local_ts_ns, which whoever appended it supplied. It prints no records. It measures THIS COMMAND'S READER on the CPU it happens to run on, not your application's reader: it says whether the writer, the clock and the machine are healthy. An application measures its own reader with tickertape::latency::RecordAge. Age is not the writer-to-reader latency, unless the writer stamps local_ts_ns right before it appends.\n\nIt starts at the end of the journal, as tail --from-end (Reader::seek_to_end: reads the newest segment from the checkpoint on), and every record from there on counts (live), except after discarded history, until it has caught up again. A report with live false and records 0 measured nothing: the reader was not at the end of the journal yet. Records without a local_ts_ns, or with one later than this machine's clock, are counted apart; if any were ahead of the clock, the minimum and the percentiles are biased upwards.\n\n--wait poll (default) and spin make no system call in the writer's appends: they never register as a waiter. poll sleeps 10 us, doubling to 1 ms while idle, and those sleeps are in the ages; spin has no such floor and uses one core. block waits in the kernel on the writer's wake-up region: an append that finds it waiting makes a wake-up system call before it returns; with --durable-only it waits for checkpoints instead, and only a checkpoint makes that call (from 1.1; beside a 1.0.0 writer it polls every 1 ms).\n\nEnds --duration after its start or after --count records returned while live, whichever comes first, with a final report; --interval prints reports before that. With none of the three it reports every 10s until interrupted; an interrupt ends it without a final report.\n\nJSON schema (schema_version 1; fields may be added; one object per report and line): {\"schema_version\":1,\"journal\":string,\"sampled_unix_ns\":u64,\"elapsed_s\":number,\"final\":bool,\"live\":bool,\"durable_only\":bool,\"wait\":\"poll\"|\"spin\"|\"block\",\"records\":u64,\"first_seq\":u64|null,\"last_seq\":u64|null,\"after_discontinuity\":u64,\"unset_timestamp\":u64,\"ahead_of_clock\":u64,\"discontinuities\":u64,\"age\":HIST,\"interval_age\":HIST|null} with HIST = {\"count\":u64,\"min_ns\":u64|null,\"mean_ns\":number|null,\"p50_ns\":u64|null,\"p90_ns\":u64|null,\"p99_ns\":u64|null,\"p99_9_ns\":u64|null,\"p99_99_ns\":u64|null,\"max_ns\":u64|null}; see docs/cli.md.\n\nExit codes: 0 success; 1 usage, I/O or missing journal; 2 corruption or unsupported journal format (an error while following comes after the report of what was measured; a journal that can't be opened, or whose end can't be reached, gets no final report).";
 
 #[derive(Debug, Args)]
 pub(crate) struct AgeArgs {
@@ -387,7 +387,6 @@ impl Printer<'_> {
             records: report.records,
             first_seq: report.seqs.map(|(first, _)| first),
             last_seq: report.seqs.map(|(_, last)| last),
-            before_live: report.ages.before_live,
             after_discontinuity: report.ages.after_discontinuity,
             unset_timestamp: report.ages.unset,
             ahead_of_clock: report.ages.ahead,
@@ -427,7 +426,6 @@ struct JsonReport {
     records: u64,
     first_seq: Option<u64>,
     last_seq: Option<u64>,
-    before_live: u64,
     after_discontinuity: u64,
     unset_timestamp: u64,
     ahead_of_clock: u64,
@@ -491,12 +489,8 @@ fn render_text(text: &mut String, r: &JsonReport) {
     let _ = writeln!(text, "records     {}{seqs}", r.records);
     let _ = writeln!(
         text,
-        "not counted unset_timestamp={} ahead_of_clock={} before_live={} after_discontinuity={} discontinuities={}",
-        r.unset_timestamp,
-        r.ahead_of_clock,
-        r.before_live,
-        r.after_discontinuity,
-        r.discontinuities
+        "not counted unset_timestamp={} ahead_of_clock={} after_discontinuity={} discontinuities={}",
+        r.unset_timestamp, r.ahead_of_clock, r.after_discontinuity, r.discontinuities
     );
     render_hist(text, "age", &r.age);
     if let Some(interval) = &r.interval_age {
@@ -729,7 +723,8 @@ mod tests {
         let json: serde_json::Value =
             serde_json::from_str(&run_args(dir.path(), true, set)).unwrap();
         assert_eq!((&json["live"], &json["records"]), (&true.into(), &0.into()));
-        assert_eq!(json["before_live"], 0);
+        // The command starts at the end, so no record is read before it is live, and its output has no count of them.
+        assert!(json.get("before_live").is_none());
         let text = run_args(dir.path(), false, set);
         assert!(!text.contains("not live"), "{text}");
     }

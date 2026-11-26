@@ -528,6 +528,10 @@ Found in the review of the implementation (PR #70). The decision does not change
   under exactly this load.
 - **`tickertape age` starts with `seek_to_end`** (ADR 0046), so it is live at once, as this record foresaw, and
   `before_live` in its output is 0.
+  **2026-11-26, before 1.1 is released:** the field is removed from the command's JSON and text output. It was always 0
+  there, and a released field cannot be removed within 1.x, while adding it later (with an option that starts before the
+  end) is an additive change. `RecordAgeSnapshot::before_live` in the library stays: an application that follows from
+  an earlier position gets a count there. (Decided by the orchestrator on the owner's delegation; issue #61.)
 - **`live` in its output** (JSON, `"live":bool` after `final`, and text). `seek_to_end` has no deadline and lasts for as
   long as a writer commits as fast as the reader validates, so it runs on a thread of its own: `--duration` and
   `--interval` hold meanwhile, and the reports then say that nothing was measured, which zero records and exit 0 alone
