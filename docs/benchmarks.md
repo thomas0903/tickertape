@@ -2773,8 +2773,10 @@ nothing here is compared with earlier sections.
 | Writer, reader CPU | 0, 1; helper threads unpinned | the same |
 | rustc | 1.100.0 | the same |
 
-Commits: base `e08c364e` (`main`), new `c7bec958` (this change; later commits on its branch change only documentation
-and comments). Each machine built both from the public repository; the base binaries were copied to a second path to
+Commits: base `e08c364e` (`main` then), new `c7bec958` (the change on that base). Both are kept by the branch
+`core/safe-reader-adaptive-read-measured`; do not delete it. The merged change is the same code rebased onto a later
+`main` (ADRs 0050, 0051 and 0054 merged in between), not measured again; its record path compiles to the same instructions
+as that `main`'s. Each machine built both from the public repository; the base binaries were copied to a second path to
 give a second copy of the base, the noise floor (identical files, sha256 recorded). Release builds, no frame pointers.
 
 - **Replay**: `taskset -c 1 <replay benchmark binary> --bench records --warm-up-time 0.5 --measurement-time 1` with
