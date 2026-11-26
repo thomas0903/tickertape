@@ -337,7 +337,8 @@ fn checkpoint_in_an_older_segment() {
     assert!(s.head.verified);
 }
 
-/// Finding 10: a marker that points to a missing segment or an impossible offset is corruption, never healthy.
+/// Finding 10: a marker that points to a missing segment, an impossible offset or a position its segment's records do not
+/// reach is corruption, never healthy.
 #[test]
 fn dangling_checkpoint_is_corruption() {
     let per = records_per_segment(1000);
@@ -394,6 +395,25 @@ fn dangling_checkpoint_is_corruption() {
         .write_all_at(&[0], 0)
         .unwrap();
     check(dir.path(), CheckpointProblem::InvalidSegmentHeader);
+
+    // The last record the marker covers zeroed (ADR 0056): in the newest segment, and with the marker in an older one.
+    for later in [0, per] {
+        let dir = setup();
+        let mut writer = Writer::open(dir.path(), config()).unwrap();
+        append(&mut writer, later, 1000, 0);
+        drop(writer);
+        let c = crate::inspect::read_checkpoint(dir.path())
+            .unwrap()
+            .unwrap();
+        let record = c.offset - format::align8((format::RECORD_HEADER_LEN + 1000) as u64);
+        File::options()
+            .write(true)
+            .open(journal::segment_path(dir.path(), c.segment_base_seq))
+            .unwrap()
+            .write_all_at(&[0; 4], record)
+            .unwrap();
+        check(dir.path(), CheckpointProblem::RecordsMissing);
+    }
 }
 
 /// Finding 10: with the checkpoint in an older segment and a middle segment removed, the head and exposure are
@@ -876,9 +896,14 @@ fn sampler_checks_a_marker_that_moved_behind_its_head() {
     );
     let s = sampler.sample().unwrap();
     assert_eq!(s.head, fresh.head);
+    // The writer refuses that marker too: no record ends at its offset (ADR 0056).
     assert_eq!(
         s.breaches(&Thresholds::default()),
-        vec![Breach::HeadInvalid]
+        vec![Breach::HeadInvalid, Breach::CheckpointInvalid]
+    );
+    assert_eq!(
+        s.checkpoint.unwrap().problem,
+        Some(CheckpointProblem::RecordsMissing)
     );
 
     // A marker that moved to a real record boundary behind the head is accepted, and the sampler resumes.

@@ -2,6 +2,7 @@
 
 - **Status:** accepted on 2026-11-26 by the orchestrator on the owner's delegation, after one independent review
 - **Date:** 2026-11-26
+- **Amended:** 2026-11-26 (below: `status` predicts the refusal, retention removes nothing, the marker at offset 64)
 
 ## Context
 
@@ -154,7 +155,103 @@ covers an explicit operator tool or option for that).
   Limits; Checking a journal; After a crash: a refused open), `cli.md` (what `status` does not check),
   `compatibility.md` (Upgrading), `CorruptReason::DanglingCheckpoint` and
   the bindings' descriptions of code 13, the CHANGELOG.
-- Left open (a separate issue covers the first two): an explicit way to open such a journal at the marker; `status`
+- Left open (a separate issue covers the first two; the amendment below settles the second, the third and the
+  fourth): an explicit way to open such a journal at the marker; `status`
   does not predict this refusal (its `checkpoint.problem` set is not declared extensible in `cli.md`); retention and `tickertape archive` still accept such a marker (they remove only segments before its
   segment, which this contradiction does not make unsafe); a marker at offset 64 whose previous segment lacks records is
   not detected; and there is no tool that sets the marker back.
+
+## Amendment (2026-11-26): `status` predicts the refusal, retention removes nothing, the marker at offset 64
+
+- **Status:** accepted on 2026-11-26 by the orchestrator on the owner's delegation (issue #93, its second, third and
+  fourth items; the first, a way to open such a journal at the marker anyway, stays the owner's decision and open).
+
+### `status` reports every journal this rule refuses
+
+**Before.** `status` checked the marker's segment, its header and the offset, not the records, so it called most of
+these journals healthy. Measured on each refused journal of `tests/marker_position.rs` with the check removed:
+
+| Refused journal | `status` before | `status` now |
+|---|---|---|
+| Segments restored from an older backup; the last covered record zeroed or with a bad CRC; marker in the newest segment | healthy, `head.verified` true, exit 0 | `records_missing`, exit 2 |
+| `next_seq` one too high or too low, an offset inside a record, a record's start with a later `next_seq`, offset 64 with `next_seq` not the base; marker in the newest segment | `head_invalid` (the head scan from the marker failed: `BadSequence`, `BadChecksum`), exit 2, `problem` null | `records_missing` and `head_invalid`, exit 2 |
+| Any of these with the marker in an older segment | healthy but unverified, exit 0 | `records_missing`, exit 2 |
+
+**Now.** After the existing checks, in the writer's order, the sample runs the writer's own check on the marker's
+segment: one function, `format::marker_reached` (the rule above, over any segment view), which `Writer::open` calls over
+its mapping and `status`, retention and `tickertape archive` over `pread` (`journal::marker_reached`). It reads what the
+writer's open reads and no more: the record right before the marker's offset, one 4 KiB `pread` for records that fit in
+it (the `pread` view lays its windows out backward from the offset, so the backward probe and the record's CRC32C need
+one read), or that record's length; back to the segment's first slot only when the records do not reach the position.
+No re-read is needed, unlike at the head: while a slot is current nothing changes a byte before its position (the
+writer appends after it, recovery never changes a byte before it and a repair by replacement copies them, retention never
+removes its segment, and a segment removed after the marker moved on is still read through the open descriptor, or the
+sample retries). Every refused journal in `tests/marker_position.rs` is sampled before the open and must be reported;
+every journal that opens there, the two sweeps included, is sampled too and must not be: the two agree both ways.
+
+**The value.** None of the existing values states the case: `missing_segment` says the file is gone,
+`invalid_segment_header` that its header is bad, `invalid_offset` that no segment could have a record there. The new
+value is `records_missing` (`CheckpointProblem::RecordsMissing`, C ABI `TICKERTAPE_CHECKPOINT_RECORDS_MISSING` = 4, C++
+`records_missing`, Java `RECORDS_MISSING`, Python `"records_missing"`): the records the marker vouches for are missing or
+damaged, which is what the operator has to restore. Health, exit code 2, the text output (`UNUSABLE (records_missing)`)
+and the Prometheus output (`tickertape_checkpoint_invalid` 1, `tickertape_corrupt` 1, `tickertape_healthy` 0) follow
+from `problem` being set, as for the other values. `CheckpointProblem` has been `#[non_exhaustive]` since 1.0
+(`compatibility.md` lists it so), so the variant is not a breaking change for Rust; the C enumerator is an addition
+(ADR 0028 allows those, and the C documentation already says any value but `TICKERTAPE_CHECKPOINT_USABLE` means a refused
+journal); Java maps a code it does not know to `OTHER_PROBLEM`. Since 1.0's `cli.md` did not say the set of `problem`
+values could grow, it now says (decision, on the owner's delegation): from 1.1 the sets of `checkpoint.problem` values and
+of breach codes may grow in a minor release, and a consumer must treat a code it does not know as a problem.
+
+### Retention and `tickertape archive` remove nothing from such a journal
+
+**Before.** Retention's marker check (`retention::validate`, used by the plan and before every removal) refused, as
+`DanglingCheckpoint` at the `checkpoint` file, the cases visible without reading a record: the marker's segment missing,
+its header invalid, the offset outside the record area. It accepted every case of this ADR and removed the segments
+before the marker's segment (the probe above: every plan had its candidates). The ADR's first version argued that was not
+unsafe, since it removes only segments before the marker's; but the operator's remedies need them: restoring the matching
+`checkpoint` is useless once the segments it names are gone, and so is restoring the segment while the older ones were
+deleted.
+
+**Now.** A retention run, the writer's own and an archiver's (`retention::plan`, `apply`, `tickertape archive`,
+`--dry-run` included), that finds the marker dangling by this check removes nothing and returns the error the writer's
+open returns: `DanglingCheckpoint` at the marker's segment and offset. It checks while planning (whatever the policy
+asks to remove, as for the other marker checks: `archive` with a marker naming a missing segment already failed with
+nothing to remove) and in the checks before each removal, so a plan made before the damage stops before its first
+removal. **What it adds to ADR 0051's reads:** one record per marker slot a run uses, through the descriptor of the
+marker's segment that the existing check already opens (no new `open`): a writer's run reads it while planning and
+carries the slot into its removals; an archiver's `apply` reads it at its first removal, and again only if the marker
+moved. So one record per run, two for `archive` (its plan and its apply). Nothing else of ADR 0051 or ADR 0055 changes:
+the listing, the sizes, the headers and seals read, the take-out, the put-back and the leftovers are as before (the
+check is part of the checks that precede the take-out). The seek index builder's use of the marker
+(`retention::checkpoint`) is unchanged.
+
+### A marker at offset 64 whose previous segment lacks records: not detected, by decision
+
+What "the previous segment lacks records" can be, for a marker at offset 64 of segment `B` (so `next_seq` is `B`):
+
+1. **No previous segment** (`B` is the oldest): exactly what retention leaves, since it removes every segment before the
+   marker's. No check can tell a lost predecessor from a removed one.
+2. **The previous listed segment is not `B`'s predecessor** (a gap, `Z` then `B`): no archiver leaves it (archivers
+   remove only the oldest segment); only `Z`'s seal shows it.
+3. **The predecessor `A` unsealed, or sealed for another successor** (cut short, or restored from a backup older than
+   the marker while `B` and the newer marker were kept).
+
+No working writer and crash leave 2 or 3 on storage that honours its syncs: a roll stores `A`'s seal before the
+writer's position moves to `B` (the old segment goes into the dirty set with the seal in its range), a checkpoint makes
+every dirty segment durable before it writes the slot that names `B`, recovery from that slot never reads or changes
+`A`, recovery from an earlier slot persists what it repaired in `A` before it returns, and an archiver removes `A` only
+as the oldest segment after checking its seal. So a check would not refuse a healthy journal in principle.
+
+It is not built, for three reasons. **It reads what this ADR excludes:** the segment before the marker's, below the
+recovery domain, which archivers remove without the writer lock (the open would have to pass a predecessor that
+vanishes or is taken out meanwhile, ADR 0055). **Its cost has no bound like the one above:** finding `A`'s seal means
+reading `A` backward from its end through the space left free at the roll, which is less than the frame that did not
+fit, so up to the largest record the segment size allows, whatever the last covered record's length. **And the harm
+that justified refusing does not arise:** this ADR refuses because the writer would append `next_seq` at the hole's
+position, so every new record is behind a gap that no reader passes. At offset 64 the writer appends in `B`, after the
+gap; a reader that seeks to `B` or later reads the new records. The gap is damage to covered history before the
+boundary, like damage to `next_seq - 2`, which this ADR leaves to `verify`, and it is reported: `verify` names where
+`A`'s records end, a reader from the oldest record stops there with `EmptyCommitWord` (ADR 0050: a later segment exists),
+and retention stops at `A`'s seal check, removing nothing, so the evidence stays. `status` does not report it (it reads no
+segment before the marker's either). `tests/marker_position.rs::a_marker_at_offset_64_after_a_predecessor_that_lacks_records_opens`
+pins this behaviour. The fourth item of issue #93 stays open.

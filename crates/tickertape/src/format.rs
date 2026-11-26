@@ -896,6 +896,16 @@ pub(crate) fn find_history_before<V: SegmentView + ?Sized>(
     None
 }
 
+/// Whether the records of a checkpoint slot's segment (`segment`) reach the slot's position: the rule recovery applies
+/// to the current slot before it uses it (`docs/format.md` → Recovery, step 2; ADR 0056), [`record_ends_at`] for the
+/// slot's segment, offset and `next_seq`. The one copy of the rule: [`Writer::open`](crate::Writer::open) checks it over
+/// its mapping, and `status`, retention and `tickertape archive` over `pread` (`journal::marker_reached`), so that they
+/// predict the writer's refusal exactly. The caller has checked that the segment exists, that its header is valid and
+/// that the offset is a multiple of 8 in the record area or a seal's place.
+pub(crate) fn marker_reached<V: SegmentView + ?Sized>(segment: &V, slot: &CheckpointSlot) -> bool {
+    record_ends_at(segment, slot.segment_base_seq, slot.offset, slot.next_seq)
+}
+
 /// Whether `offset` in a segment whose first record is `base` is a position a checkpoint marker for `next_seq` can
 /// name (`docs/format.md` → Recovery, step 2; ADR 0056): at the first record slot, `next_seq` is `base`; anywhere else,
 /// the segment holds a valid record with sequence number `next_seq - 1` that ends, with its padding, exactly at

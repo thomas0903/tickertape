@@ -451,6 +451,12 @@ enum tickertape_checkpoint_problem
    */
   TICKERTAPE_CHECKPOINT_INVALID_OFFSET = 3,
   /**
+   * The records of the marker's segment do not reach the marker's position: the record right before its offset is
+   * missing, damaged, ends elsewhere or has another sequence number (or, at offset 64, `next_seq` is not the
+   * segment's base). Added in 1.1 (ADR 0056).
+   */
+  TICKERTAPE_CHECKPOINT_RECORDS_MISSING = 4,
+  /**
    * A problem this version of the C ABI does not name (not returned by a library built from one source tree).
    */
   TICKERTAPE_CHECKPOINT_OTHER_PROBLEM = 255,

@@ -214,6 +214,12 @@ pub enum CheckpointProblem {
     InvalidSegmentHeader,
     /// The marker's offset is misaligned or outside its segment's record area.
     InvalidOffset,
+    /// The records of the marker's segment don't reach the marker's position: the segment doesn't hold, right before
+    /// the marker's offset, a valid record with sequence number `next_seq - 1` that ends exactly there (or, at offset
+    /// 64, `next_seq` isn't the segment's base). The records the marker vouches for are missing or damaged: segments
+    /// restored from a backup older than the marker, or the last covered record damaged (ADR 0056; the writer reports
+    /// it as [`CorruptReason::DanglingCheckpoint`] at the segment's path and the marker's offset). Added in 1.1.
+    RecordsMissing,
 }
 
 impl CheckpointProblem {
@@ -223,6 +229,7 @@ impl CheckpointProblem {
             CheckpointProblem::MissingSegment => "missing_segment",
             CheckpointProblem::InvalidSegmentHeader => "invalid_segment_header",
             CheckpointProblem::InvalidOffset => "invalid_offset",
+            CheckpointProblem::RecordsMissing => "records_missing",
         }
     }
 }
@@ -827,6 +834,10 @@ impl Status {
 ///   the directory is listed and the marker read again and the new newest segment scanned instead, up to 16 times;
 /// - the checkpoint's segment and the oldest segment, if they are not the newest: `open`, three `fstat`s and a
 ///   header `pread` each;
+/// - in the checkpoint's segment, the record right before the marker's position, checked as
+///   [`Writer::open`](crate::Writer::open) checks it (ADR 0056): one `pread` of 4 KiB, or more for a longer record
+///   (from that record's start to the marker's offset); back to the segment's first slot when the records don't reach
+///   the position ([`CheckpointProblem::RecordsMissing`]);
 /// - with uncovered records whose first one wasn't passed by the scan: one record lookup in the checkpoint's
 ///   segment (one `pread` of 4 KiB, or of the whole record if it is larger, since it is validated; following one
 ///   seal costs an `open`, three `fstat`s, a header `pread` and another lookup);
@@ -959,7 +970,7 @@ impl Sampler {
     /// scanned, it is scanned only from the previous sample's head (or from the checkpoint, if that is further on),
     /// so a steady-state sample reads only the bytes appended since the previous one, plus one 4 KiB `pread` to
     /// re-read the last record the previous scans passed (and another of the slot at the checkpoint marker, if it
-    /// moved to a position those scans passed); and that when the head moved to another segment, the previous head's
+    /// moved to a position those scans passed), and the record right before the marker's position, as [`status`] does; and that when the head moved to another segment, the previous head's
     /// segment header is read (one `open`, two `fstat`s, `pread`, `fstat`) to check that the history continued before
     /// rates are reported.
     ///
@@ -1622,7 +1633,9 @@ fn read_marker(dir: &Path) -> Result<Option<Marker>> {
     }))
 }
 
-/// Validates the marker `c` as [`Writer::open`](crate::Writer::open) does, and estimates its age.
+/// Validates the marker `c` as [`Writer::open`](crate::Writer::open) does, in the writer's order (its segment, its
+/// header, its offset, the record before its offset: the writer's own check, [`journal::marker_reached`]), and estimates
+/// its age.
 fn checkpoint_status(
     dir: &Path,
     files: &[SegFile],
@@ -1639,7 +1652,14 @@ fn checkpoint_status(
         match open.get(dir, c.segment_base_seq) {
             Ok(seg) => {
                 created = Some(seg.id.created_unix_ns);
-                (!valid_offset(c.offset, seg.id.size)).then_some(CheckpointProblem::InvalidOffset)
+                if !valid_offset(c.offset, seg.id.size) {
+                    Some(CheckpointProblem::InvalidOffset)
+                } else if !journal::marker_reached(&seg.file, &seg.path, seg.id.size, &c)? {
+                    // The writer's own check (ADR 0056), over the same bytes: the record right before the offset.
+                    Some(CheckpointProblem::RecordsMissing)
+                } else {
+                    None
+                }
             }
             Err(Error::Corrupt { .. } | Error::UnsupportedVersion { .. }) => {
                 Some(CheckpointProblem::InvalidSegmentHeader)

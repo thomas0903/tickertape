@@ -970,6 +970,65 @@ fn dangling_checkpoint_exits_2() {
         .stdout(predicate::str::contains("CORRUPT: checkpoint_invalid"));
 }
 
+/// A marker whose position the records of its segment don't reach (ADR 0056): the last record it covers damaged. The
+/// writer refuses it, so `status` reports `records_missing`, a corruption (exit 2), in every format.
+#[test]
+fn records_missing_checkpoint_exits_2() {
+    let _serial = serial();
+    let (dir, writer) = journal(130, true);
+    drop(writer);
+    let path = dir.path().to_str().unwrap();
+    assert_eq!(status_json(&[path]).1, 0);
+    // 1,040-byte frames, 62 to a 64 KiB segment: records 124 to 129 are in the newest segment, the marker after 129.
+    let marker = tickertape::inspect::read_checkpoint(dir.path())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (marker.segment_base_seq, marker.offset, marker.next_seq),
+        (124, 64 + 6 * 1040, 130)
+    );
+    let segment = dir.path().join("00000000000000000124.tape");
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&segment)
+        .unwrap()
+        .write_all_at(&[0; 4], marker.offset - 1040)
+        .unwrap();
+    // The writer refuses it.
+    assert!(matches!(
+        Writer::open(dir.path(), WriterConfig::default().segment_size(65536)),
+        Err(tickertape::Error::Corrupt {
+            reason: tickertape::CorruptReason::DanglingCheckpoint(124),
+            ..
+        })
+    ));
+    let (v, code) = status_json(&[path]);
+    assert_eq!(code, 2);
+    assert_eq!(v["checkpoint"]["problem"], "records_missing");
+    assert_eq!(v["exposure"]["records"], Value::Null);
+    assert_eq!(v["health"]["ok"], false);
+    assert_eq!(v["health"]["corrupt"], true);
+    assert_eq!(
+        v["health"]["breaches"],
+        serde_json::json!([{"code": "checkpoint_invalid", "reader": null}])
+    );
+    command().args(["status", path]).assert().code(2).stdout(
+        predicate::str::contains("UNUSABLE (records_missing): the writer refuses this journal")
+            .and(predicate::str::contains("CORRUPT: checkpoint_invalid")),
+    );
+    let out = command()
+        .args(["status", path, "--format", "prometheus"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let prom = String::from_utf8(out.stdout).unwrap();
+    let samples = check_exposition(&prom);
+    let value = |name: &str| samples.iter().find(|(n, _, _)| n == name).map(|s| s.2);
+    assert_eq!(value("tickertape_healthy"), Some(0.0), "{prom}");
+    assert_eq!(value("tickertape_corrupt"), Some(1.0), "{prom}");
+    assert_eq!(value("tickertape_checkpoint_invalid"), Some(1.0), "{prom}");
+}
+
 /// Findings 12 and 18: a modification time in the future is an unknown age (named as such, not "no checkpoint"),
 /// which breaches --max-checkpoint-age when records are uncovered.
 #[test]

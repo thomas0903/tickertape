@@ -187,7 +187,11 @@ impl Report {
 ///
 /// [`Error::NotFound`] for an empty journal; [`Error::Corrupt`] or [`Error::UnsupportedVersion`] for an invalid
 /// header of a segment it reads (above), an invalid checkpoint position, or a candidate's invalid seal or chain; [`Error::Io`] for filesystem errors, including concurrent
-/// changes while observing the directory. An absent/invalid checkpoint slot yields an empty plan.
+/// changes while observing the directory. An absent/invalid checkpoint slot yields an empty plan. A marker the writer
+/// refuses is an error, whatever the policy asks to remove: from 1.1 that includes one whose position the records of
+/// its segment do not reach ([`CorruptReason::DanglingCheckpoint`] at that segment and the marker's offset, as
+/// [`Writer::open`](crate::Writer::open) reports it; ADR 0056), for which it reads the record right before the
+/// marker's offset.
 pub fn plan(dir: impl AsRef<Path>, policy: &Policy) -> Result<Plan> {
     plan_at(
         dir.as_ref(),
@@ -292,9 +296,17 @@ pub(crate) fn run(
     stop: Option<&dyn Fn(usize) -> bool>,
 ) -> Result<()> {
     let now = crate::clock::realtime_ns();
-    let plan = plan_at(dir, policy, now, stop.unwrap_or(&|_| false), sizes)?;
+    let mut reached = None;
+    let plan = plan_with(
+        dir,
+        policy,
+        now,
+        stop.unwrap_or(&|_| false),
+        sizes,
+        &mut reached,
+    )?;
     let known = Known::from_plan(&plan);
-    apply_into(dir, &plan, action, report, known, false, stop)
+    apply_into(dir, &plan, action, report, known, false, stop, reached)
 }
 
 /// The segment at `base`, opened and its header validated, with the identity of the file.
@@ -320,6 +332,19 @@ fn plan_at(
     stop: &dyn Fn(usize) -> bool,
     sizes: &mut Sizes,
 ) -> Result<Plan> {
+    plan_with(dir, policy, now, stop, sizes, &mut None)
+}
+
+/// [`plan_at`], setting `reached` to the marker slot whose records it found reaching its position ([`reached_marker`]),
+/// so that a writer's run does not read that record again before its removals.
+fn plan_with(
+    dir: &Path,
+    policy: &Policy,
+    now: u64,
+    stop: &dyn Fn(usize) -> bool,
+    sizes: &mut Sizes,
+    reached: &mut Option<CheckpointSlot>,
+) -> Result<Plan> {
     let directory = directory_identity(dir)?;
     let mut leftovers = Vec::new();
     let listed = journal::list_bases_and(dir, |name| leftovers.extend(Leftover::parse(name)))?;
@@ -340,7 +365,8 @@ fn plan_at(
     if policy == &Policy::default() {
         return Ok(plan);
     }
-    let Some(checkpoint) = checkpoint(dir)? else {
+    // A marker the writer would refuse removes nothing, whatever the policy (ADR 0056 amendment).
+    let Some(checkpoint) = reached_marker(dir, inspect::read_checkpoint(dir)?, reached)? else {
         return Ok(plan);
     };
     let mut count = listed.len();
@@ -461,7 +487,8 @@ fn reasons(policy: &Policy, count: usize, bytes: u128, now: u64, sealed: u64) ->
 /// # Errors
 ///
 /// [`Error::InvalidConfig`] for a plan used on a different/replaced journal, or lost eligibility;
-/// [`Error::Corrupt`] / [`Error::UnsupportedVersion`] for invalid candidate data or checkpoint positions;
+/// [`Error::Corrupt`] / [`Error::UnsupportedVersion`] for invalid candidate data or checkpoint positions, including,
+/// before the first removal, a marker whose position the records of its segment do not reach (as for [`plan`]);
 /// [`Error::Io`] for I/O errors (including destination conflicts). Stops immediately, retaining earlier effects.
 /// A missing source counts as already removed only when no older segment remains.
 pub fn apply(dir: impl AsRef<Path>, plan: &Plan, action: &Action) -> Result<Report> {
@@ -473,6 +500,7 @@ pub fn apply(dir: impl AsRef<Path>, plan: &Plan, action: &Action) -> Result<Repo
         &mut report,
         Known::default(),
         true,
+        None,
         None,
     )?;
     Ok(report)
@@ -534,7 +562,9 @@ impl Known {
 /// checkpoint is waiting and the run has removed what the checkpoint before it covered, or the writer is closing;
 /// ADR 0044). The rest of the plan is left for the next run, which plans again.
 ///
-/// `known` is what the caller already knows of the oldest segments, empty to list them first.
+/// `known` is what the caller already knows of the oldest segments, empty to list them first. `reached` is the marker
+/// slot whose records the caller found reaching its position ([`reached_marker`]), if any.
+#[allow(clippy::too_many_arguments)]
 fn apply_into(
     dir: &Path,
     plan: &Plan,
@@ -543,6 +573,7 @@ fn apply_into(
     mut known: Known,
     external: bool,
     stop: Option<&dyn Fn(usize) -> bool>,
+    mut reached: Option<CheckpointSlot>,
 ) -> Result<()> {
     if directory_identity(dir)? != plan.directory {
         return Err(Error::InvalidConfig(
@@ -568,7 +599,14 @@ fn apply_into(
             known = Known::list(dir)?;
             listed = true;
         }
-        let mut checked = check(dir, segment, action, external, &mut synced, &known);
+        let mut checked = check(
+            dir,
+            segment,
+            action,
+            external,
+            (&mut synced, &mut reached),
+            &known,
+        );
         // What a check found is judged by a listing taken after it, unless one was taken just before it (but a missing
         // file is judged again even then: a concurrent archiver may have removed the segment in between). A marker that
         // could not be synced is reported as it is and nothing is tried after it: a later sync could succeed without
@@ -697,27 +735,35 @@ fn check_next(
     )))
 }
 
-/// Every check of a removal (crash contract C14): the segment is the oldest, the marker is valid and names a later one,
-/// the file is the one planned, its header and the successor's are valid, the successor is next, and the seal or (for a
-/// move) every record is valid. Removes nothing.
+/// Every check of a removal (crash contract C14): the segment is the oldest, the marker is valid, its segment's records
+/// reach its position (ADR 0056; read once per slot, `reached`) and it names a later segment, the file is the one
+/// planned, its header and the successor's are valid, the successor is next, and the seal or (for a move) every record
+/// is valid. Removes nothing. `markers` are the slot last made durable ([`durable_checkpoint`]) and the slot last found
+/// reaching its position.
 fn check(
     dir: &Path,
     segment: &PlannedSegment,
     action: &Action,
     external: bool,
-    synced: &mut Option<CheckpointSlot>,
+    markers: (&mut Option<CheckpointSlot>, &mut Option<CheckpointSlot>),
     known: &Known,
 ) -> Checked {
     if !check_oldest(dir, known, segment).map_err(Failed::new)? {
         return Ok(None);
     }
+    let (synced, reached) = markers;
     let marker = if external {
-        durable_checkpoint(dir, synced).map_err(|error| Failed {
+        durable_reached_marker(dir, synced, reached).map_err(|error| Failed {
             marker_io: matches!(error, Error::Io { .. }),
             ..Failed::new(error)
         })?
     } else {
-        checkpoint(dir).map_err(Failed::new)?
+        reached_marker(
+            dir,
+            inspect::read_checkpoint(dir).map_err(Failed::new)?,
+            reached,
+        )
+        .map_err(Failed::new)?
     };
     let Some(marker) = marker else {
         return Err(Failed::new(Error::InvalidConfig(
@@ -819,6 +865,20 @@ pub(crate) fn durable_checkpoint(
     Ok(slot)
 }
 
+/// [`durable_checkpoint`] for a removal: the slot also passes [`reached_marker`] before it is made durable.
+fn durable_reached_marker(
+    dir: &Path,
+    synced: &mut Option<CheckpointSlot>,
+    reached: &mut Option<CheckpointSlot>,
+) -> Result<Option<CheckpointSlot>> {
+    let Some((file, slot)) = read_marker(dir)? else {
+        return Ok(None);
+    };
+    let slot = reached_marker(dir, slot, reached)?;
+    make_durable(dir, &file, slot, synced)?;
+    Ok(slot)
+}
+
 /// The current slot of the marker, made durable as in [`durable_checkpoint`], without checking its segment.
 fn durable_slot(dir: &Path, synced: &mut Option<CheckpointSlot>) -> Result<Option<CheckpointSlot>> {
     let Some((file, slot)) = read_marker(dir)? else {
@@ -869,6 +929,42 @@ pub(crate) fn checkpoint(dir: &Path) -> Result<Option<CheckpointSlot>> {
 
 /// [`checkpoint`] for a slot already read.
 fn validate(dir: &Path, slot: Option<CheckpointSlot>) -> Result<Option<CheckpointSlot>> {
+    Ok(open_marker_segment(dir, slot)?.map(|(slot, ..)| slot))
+}
+
+/// [`validate`] for retention and archiving: the slot also passes the writer's check that the records of its segment
+/// reach its position (`format.md` → Recovery, step 2; ADR 0056), or the run fails with the error
+/// [`Writer::open`](crate::Writer::open) gives for it, `DanglingCheckpoint` at the segment and the marker's offset, and
+/// removes nothing: the remedies after such a refusal (restore the matching marker, or the segment, from a copy;
+/// `docs/operations.md` → After a crash) need the segments retention would remove. The check reads the record right
+/// before the marker's offset (`journal::marker_reached`), once per slot: not again while `reached` is that slot.
+fn reached_marker(
+    dir: &Path,
+    slot: Option<CheckpointSlot>,
+    reached: &mut Option<CheckpointSlot>,
+) -> Result<Option<CheckpointSlot>> {
+    let Some((slot, file, size)) = open_marker_segment(dir, slot)? else {
+        return Ok(None);
+    };
+    if *reached != Some(slot) {
+        let path = journal::segment_path(dir, slot.segment_base_seq);
+        if !journal::marker_reached(&file, &path, size, &slot)? {
+            return Err(Error::corrupt(
+                path,
+                slot.offset,
+                CorruptReason::DanglingCheckpoint(slot.segment_base_seq),
+            ));
+        }
+        *reached = Some(slot);
+    }
+    Ok(Some(slot))
+}
+
+/// [`validate`], with the marker's segment open and its size from its header.
+fn open_marker_segment(
+    dir: &Path,
+    slot: Option<CheckpointSlot>,
+) -> Result<Option<(CheckpointSlot, File, u64)>> {
     let Some(slot) = slot else {
         return Ok(None);
     };
@@ -897,7 +993,7 @@ fn validate(dir: &Path, slot: Option<CheckpointSlot>) -> Result<Option<Checkpoin
             CorruptReason::DanglingCheckpoint(slot.segment_base_seq),
         ));
     }
-    Ok(Some(slot))
+    Ok(Some((slot, file, header.segment_size)))
 }
 
 /// The first read of [`seal_at_end`], in bytes; each further read doubles, up to [`TAIL_READ_MAX`].

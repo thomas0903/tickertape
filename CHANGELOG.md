@@ -30,6 +30,18 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   covered record is not looked at, as before. No journal that a working writer and a crash leave on storage that honours
   its syncs is refused. What to do after a refusal: `docs/operations.md` → After a crash. The check reads only the record
   before the marker: on a healthy journal it adds work proportional to that record's length.
+- Fixed: `tickertape status` (`status::status`, `Sampler`) predicts that refusal, and retention removes nothing from
+  such a journal (ADR 0056, amendment; issue #93). The sample runs the writer's own check on the record before the
+  marker's offset and reports the new `checkpoint.problem` value `records_missing` (`CheckpointProblem::RecordsMissing`,
+  C ABI `TICKERTAPE_CHECKPOINT_RECORDS_MISSING` = 4, C++ `records_missing`, Java `RECORDS_MISSING`, Python
+  `"records_missing"`): exit 2, `checkpoint_invalid`, `tickertape_healthy` 0, as for the other values. 1.0 reported most
+  of these journals as healthy. A retention run (the writer's own, `retention::plan` and `apply`, `tickertape archive`,
+  `--dry-run` included) fails with the writer's error, `DanglingCheckpoint` at the segment and the marker's offset, and
+  removes nothing, so the segments that restoring the matching marker needs stay; 1.0 removed the segments before the
+  marker's. Each costs one more read, of that record (normally one 4 KiB `pread`; for retention once per run).
+  **Behaviour change:** from 1.1 the sets of `status` `checkpoint.problem` values and of breach codes may grow in a minor
+  release (`docs/cli.md`): treat a code you do not know as a problem. Not detected, by decision: a marker at offset 64
+  whose previous segment lacks records (the ADR's amendment says why; `verify` and readers report it).
 - Fixed (macOS): a repair by replacement makes its copy of the segment durable on the drive (`F_FULLFSYNC`) before it
   renames the copy over the segment, and so does a segment recovery creates (a new journal's first segment, a
   successor after a lost roll) before its link. A power loss right after the rename could keep the new name without

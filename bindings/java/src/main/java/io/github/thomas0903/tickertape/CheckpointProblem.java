@@ -13,6 +13,11 @@ public enum CheckpointProblem {
     INVALID_SEGMENT_HEADER(2),
     /** The marker's offset is misaligned or outside its segment's record area. */
     INVALID_OFFSET(3),
+    /**
+     * The records of the marker's segment do not reach the marker's position (the record right before it is missing,
+     * damaged or another one). Since 1.1.
+     */
+    RECORDS_MISSING(4),
     /** A problem the C ABI does not name. */
     OTHER_PROBLEM(255);
 

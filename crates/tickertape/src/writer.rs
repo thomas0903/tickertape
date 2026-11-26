@@ -1623,7 +1623,7 @@ impl Recovery<'_> {
             // marker vouches for records the segment does not hold (segments restored from a backup older than the
             // marker, or the last covered record damaged), and appending at the marker would make that gap part of
             // the journal. Refused under every policy, before anything is changed.
-            if !format::record_ends_at(&RwView(&seg.map), seg.base, offset, seq) {
+            if !format::marker_reached(&RwView(&seg.map), &c) {
                 return Err(Error::corrupt(
                     &seg.path,
                     offset,

@@ -250,6 +250,32 @@ pub(crate) fn sync_dir(dir: &Path) -> Result<()> {
     crate::mmap::sync_all(&f).map_err(|e| Error::io("sync directory", dir, e))
 }
 
+/// The window of [`marker_reached`]: the record right before a marker's position usually ends in the page before it.
+const MARKER_WINDOW: usize = 4096;
+
+/// [`format::marker_reached`] for the segment open as `file` (`size` bytes, its header validated, `path` in errors),
+/// read with `pread`: whether its records reach the position of the checkpoint slot `slot`, exactly as
+/// [`Writer::open`](crate::Writer::open) decides it (ADR 0056). Reads only the record right before the slot's offset
+/// (the backward probe from the offset to that record's start, and the record): one `pread` of 4 KiB, or more for a
+/// longer record; when the records do not reach the position, the probe reads back to the segment's first slot.
+///
+/// # Errors
+///
+/// [`Error::Io`] if a read fails (the answer is then unknown, not `false`).
+pub(crate) fn marker_reached(
+    file: &File,
+    path: &Path,
+    size: u64,
+    slot: &format::CheckpointSlot,
+) -> Result<bool> {
+    let view = PreadView::new(file, size, MARKER_WINDOW).ending_at(slot.offset);
+    let reached = format::marker_reached(&view, slot);
+    match view.take_error() {
+        Some(e) => Err(Error::io("read checkpoint segment", path, e)),
+        None => Ok(reached),
+    }
+}
+
 /// Window size for [`scan_open`].
 pub(crate) const SCAN_WINDOW: usize = 1 << 20;
 
@@ -265,6 +291,9 @@ pub(crate) struct PreadView<'f> {
     /// The bytes at `[window.0, window.0 + window.1.len())`.
     window: std::cell::RefCell<(u64, Vec<u8>)>,
     error: std::cell::RefCell<Option<std::io::Error>>,
+    /// Set by [`PreadView::ending_at`]: a read that ends at or before this offset fetches the window that ends there,
+    /// or a whole number of windows before it, instead of the window that starts at the read.
+    end: Option<u64>,
 }
 
 impl<'f> PreadView<'f> {
@@ -276,7 +305,16 @@ impl<'f> PreadView<'f> {
             window_len: window_len as u64,
             window: std::cell::RefCell::new((0, Vec::new())),
             error: std::cell::RefCell::new(None),
+            end: None,
         }
+    }
+
+    /// The same view for reading backward from `end`: the windows are laid out to end at `end`, so that a probe that
+    /// walks back from `end` (as [`format::record_ends_at`] does) and then validates the record it finds reads each
+    /// byte before `end` once, one window per `pread`. Reads after `end` are fetched as by [`PreadView::new`].
+    pub(crate) fn ending_at(mut self, end: u64) -> PreadView<'f> {
+        self.end = Some(end);
+        self
     }
 
     /// Forgets the cached window, so that the next access reads the file again.
@@ -299,11 +337,22 @@ impl<'f> PreadView<'f> {
         // Every caller reads in pieces of at most `max_piece`: the window never grows past it, whatever length a
         // damaged slot claims (validation streams longer bodies, `format::read_slot`).
         debug_assert!(len <= SCAN_WINDOW as u64, "pread window of {len} bytes");
-        let want = len.max(self.window_len).min(self.len - offset);
+        // With `end`, the window that ends at `end` or a whole number of windows before it and holds the read, or
+        // (where the read straddles two of them) one that starts at the read.
+        let from = match self.end {
+            Some(end) if offset + len <= end && self.window_len > 0 => {
+                let tile_end = end - (end - (offset + len)) / self.window_len * self.window_len;
+                tile_end.saturating_sub(self.window_len).min(offset)
+            }
+            _ => offset,
+        };
+        let want = (offset + len - from)
+            .max(self.window_len)
+            .min(self.len - from);
         buf.resize(want as usize, 0);
-        match self.file.read_exact_at(buf, offset) {
+        match self.file.read_exact_at(buf, from) {
             Ok(()) => {
-                *start = offset;
+                *start = from;
                 true
             }
             Err(e) => {

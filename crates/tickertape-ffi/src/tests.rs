@@ -2571,9 +2571,13 @@ fn pure_every_status_enum_variant_has_a_code() {
             "InvalidOffset",
             checkpoint_problem_of(Some(CheckpointProblem::InvalidOffset)) as i32,
         ),
+        (
+            "RecordsMissing",
+            checkpoint_problem_of(Some(CheckpointProblem::RecordsMissing)) as i32,
+        ),
     ];
     assert_eq!(names(&problems), status_variants("CheckpointProblem"));
-    assert_eq!(problems.map(|(_, c)| c), [1, 2, 3]);
+    assert_eq!(problems.map(|(_, c)| c), [1, 2, 3, 4]);
     assert_eq!(checkpoint_problem_of(None) as i32, 0);
     let ages = [
         (
