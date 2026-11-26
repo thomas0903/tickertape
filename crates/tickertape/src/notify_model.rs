@@ -16,6 +16,9 @@
 //! records it covers and read before them, which the model writes as a release store and an acquire load; the stale
 //! choice is also checked with a relaxed load, weaker than the real file reads, so that a look can see a marker
 //! without the records it covers and must choose again.
+//!
+//! This is a model of `Reader::block_on`'s steps, not the function: the real sequence is checked by `reader.rs`'s
+//! `wake_tests`, which stop a reader between its choice and its registration and change the journal there.
 
 use loom::sync::atomic::{AtomicU32, Ordering, fence};
 use loom::sync::{Arc, Condvar, Mutex};
@@ -29,6 +32,7 @@ std::thread_local! {
     static CHOSE_AGAIN: Cell<bool> = const { Cell::new(false) };
     static WAITED_ON_RECORD_AT_BOUNDARY: Cell<bool> = const { Cell::new(false) };
     static SLEPT_UNREGISTERED: Cell<bool> = const { Cell::new(false) };
+    static WAITED_ON_MARKER: Cell<bool> = const { Cell::new(false) };
 }
 
 fn reached(path: &'static LocalKey<Cell<bool>>) -> bool {
@@ -203,6 +207,9 @@ impl Reader {
             count.end_wait();
             return Step::Gone;
         }
+        if on_marker {
+            WAITED_ON_MARKER.with(|c| c.set(true));
+        }
         if !on_marker && self.at_boundary() {
             WAITED_ON_RECORD_AT_BOUNDARY.with(|c| c.set(true));
         }
@@ -262,6 +269,7 @@ fn appends_never_see_a_durable_only_reader(fenced: bool) {
         assert_eq!(me.follow_to(&r, 1), Step::Found);
         writer.join().unwrap();
     });
+    assert!(reached(&WAITED_ON_MARKER));
 }
 
 #[test]
@@ -396,4 +404,5 @@ fn a_visible_and_a_durable_only_reader_each_get_their_wake_up() {
         visible.join().unwrap();
         durable.join().unwrap();
     });
+    assert!(reached(&WAITED_ON_MARKER));
 }

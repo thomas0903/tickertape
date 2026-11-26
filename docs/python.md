@@ -35,7 +35,7 @@ The design decisions are in [ADR 0029](decisions/0029-python-bindings.md). In br
   Linux-only writer options of ADR 0038, and `Writer(spare_segment=...)` (from 1.1) the spare segment (ADR 0049; `None`,
   the default, is on on macOS and off on Linux, and nothing reports the value in effect).
   `Reader(durable_only=True)` returns only checkpointed
-  records. A blocking durable-only reader is woken by checkpoints, not by appends (ADR 0053, from 1.1; beside a 1.0.0 writer it polls the marker every `max_sleep`); when the writer's helper threads share its CPU, the last records of a large backlog can arrive up to about 2 ms after the checkpoint, so keep them on other CPUs (`Writer(helper_cpus=...)`, [`operations.md`](operations.md) → Pinned writers). After a failed checkpoint, records appended before it may not be durable even if a writer opened later in
+  records. A blocking durable-only reader is woken by checkpoints, not by appends (ADR 0053, from 1.1; beside a 1.0.0 writer it polls the marker every `max_sleep`); when the writer's helper threads share its CPU, the first record after a checkpoint can arrive up to about 1.5 ms after it (a median of 15–145 µs on cloud VMs) and the last records of a large backlog up to about 2 ms, so keep them on other CPUs (`Writer(helper_cpus=...)`, [`operations.md`](operations.md) → Pinned writers). After a failed checkpoint, records appended before it may not be durable even if a writer opened later in
   the same boot checkpoints successfully.
 - **Copies.** Payloads are `bytes` or buffers of unsigned bytes (uint8 only). Every record returned to Python owns its
   payload as `bytes`. Batch columns are `bytes` objects that NumPy and pyarrow wrap without another copy. There is no

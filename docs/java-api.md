@@ -318,7 +318,7 @@ try (Reader reader = Reader.open(Path.of("/data/journal"))) {   // at the oldest
   error. A record too large for a `ReadBatch`'s buffer throws `BufferTooSmallException` with the size it needs and
   stays next.
 - `ReaderOptions.defaults().durableOnly(true)` gives a reader that returns only records covered by a checkpoint (see
-  [Durability](#durability)). A blocking durable-only reader is woken by checkpoints, not by appends (ADR 0053, from 1.1; beside a 1.0.0 writer it polls the marker every `max_sleep`); when the writer's helper threads share its CPU, the last records of a large backlog can arrive up to about 2 ms after the checkpoint, so keep them on other CPUs (`WriterOptions.helperCpus`, [`operations.md`](operations.md) → Pinned writers).
+  [Durability](#durability)). A blocking durable-only reader is woken by checkpoints, not by appends (ADR 0053, from 1.1; beside a 1.0.0 writer it polls the marker every `max_sleep`); when the writer's helper threads share its CPU, the first record after a checkpoint can arrive up to about 1.5 ms after it (a median of 15–145 µs on cloud VMs) and the last records of a large backlog up to about 2 ms, so keep them on other CPUs (`WriterOptions.helperCpus`, [`operations.md`](operations.md) → Pinned writers).
 - **Starting before the writer.** Opening a journal whose writer has not started throws `JournalIOException` with
   `osErrorCode()` 2 (`ENOENT`); while the writer creates the first segment, `JournalNotFoundException`. A loop that
   waits for the writer retries on exactly these two (the example does).

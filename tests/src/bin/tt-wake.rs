@@ -3,8 +3,9 @@
 //! journal.
 //!
 //! Usage:
-//! - `tt-wake writer <dir> <records> <start_ms> <log>`: opens the journal, waits `start_ms`, then appends one record
-//!   at a time, checkpoints it and pauses 23–63 ms; writes `<seq> <checkpoint done, Unix ns>` per record to `<log>`.
+//! - `tt-wake writer <dir> <checkpoints> <start_ms> <log> [per_checkpoint]`: opens the journal, waits `start_ms`, then
+//!   `checkpoints` times appends `per_checkpoint` records (default 1; more than one are 100 µs apart), checkpoints them
+//!   and pauses 23–63 ms; writes `<seq> <checkpoint done, Unix ns>` per record to `<log>`.
 //! - `tt-wake reader <dir> durable|visible <records> <log>...`: a reader that blocks on the wake-up region at once
 //!   (no spins, no yields, 1 ms polls without it), until it has `<records>` records or 60 s pass. Checks that the
 //!   records come gap-free, then prints how many it got and, for every record, the delay from the writer's moment of
@@ -21,22 +22,36 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let dir = &args[2];
     if args[1] == "writer" {
-        let records: u64 = args[3].parse().expect("records");
+        let checkpoints: u64 = args[3].parse().expect("checkpoints");
         let start: u64 = args[4].parse().expect("start_ms");
         let mut log = std::fs::File::create(&args[5]).expect("log");
+        let per: u64 = args
+            .get(6)
+            .map_or(1, |n| n.parse().expect("per_checkpoint"));
         let mut w = Writer::open(dir, WriterConfig::default()).expect("open writer");
         std::thread::sleep(Duration::from_millis(start));
-        for i in 0..records {
-            let seq = w
-                .append(&NewRecord {
-                    schema_id: 1,
-                    venue_ts_ns: 0,
-                    local_ts_ns: clock::realtime_ns(),
-                    payload: &[0x5a; 64],
-                })
-                .expect("append");
+        for i in 0..checkpoints {
+            let mut seqs = Vec::new();
+            for k in 0..per {
+                if k > 0 {
+                    std::thread::sleep(Duration::from_micros(100));
+                }
+                seqs.push(
+                    w.append(&NewRecord {
+                        schema_id: 1,
+                        venue_ts_ns: 0,
+                        local_ts_ns: clock::realtime_ns(),
+                        payload: &[0x5a; 64],
+                    })
+                    .expect("append"),
+                );
+            }
             w.checkpoint().expect("checkpoint");
-            writeln!(log, "{seq} {}", clock::realtime_ns()).expect("log");
+            let done = clock::realtime_ns();
+            for seq in seqs {
+                writeln!(log, "{seq} {done}").expect("log");
+            }
+            log.flush().expect("log");
             std::thread::sleep(Duration::from_millis(23 + i * 7 % 41));
         }
         return;
@@ -63,16 +78,16 @@ fn main() {
             got.push((record.seq, record.local_ts_ns, clock::realtime_ns()));
         }
     }
+    // The writer may still be writing its last lines: read the logs until they name the last record (at most 5 s).
+    let last = got.last().map(|g| g.0);
     let mut done = HashMap::new();
-    for log in &args[5..] {
-        for line in std::fs::read_to_string(log).unwrap_or_default().lines() {
-            // The writer may still be writing its last line: skip what does not parse (that record then counts from
-            // its append, which only makes its delay longer).
-            let mut f = line.split(' ').map(|x| x.parse::<u64>().ok());
-            if let (Some(Some(seq)), Some(Some(at))) = (f.next(), f.next()) {
-                done.insert(seq, at);
-            }
+    let wait_for_logs = Instant::now() + Duration::from_secs(5);
+    loop {
+        read_logs(&args[5..], &mut done);
+        if last.is_none_or(|seq| done.contains_key(&seq)) || Instant::now() >= wait_for_logs {
+            break;
         }
+        std::thread::sleep(Duration::from_millis(10));
     }
     let delays: Vec<u64> = got
         .iter()
@@ -100,4 +115,18 @@ fn main() {
         got.len(),
         max / 1000
     );
+}
+
+/// Adds `<seq> <done>` lines of the writers' logs to `done`.
+fn read_logs(logs: &[String], done: &mut HashMap<u64, u64>) {
+    for log in logs {
+        for line in std::fs::read_to_string(log).unwrap_or_default().lines() {
+            // The writer may still be writing its last line: skip what does not parse (that record then counts from
+            // its append, which only makes its delay longer).
+            let mut f = line.split(' ').map(|x| x.parse::<u64>().ok());
+            if let (Some(Some(seq)), Some(Some(at))) = (f.next(), f.next()) {
+                done.insert(seq, at);
+            }
+        }
+    }
 }

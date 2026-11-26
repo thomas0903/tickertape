@@ -152,12 +152,15 @@ writer process crashing, but not a power loss (crash contract C1, C7, C8).
   numbers will be reused for new records.
 - **Durable-only readers** (`ReaderConfig::durable_only`, `--durable-only`) see records only once a checkpoint
   covers them, so they lag the writer by up to one checkpoint interval. A blocking one is woken by the checkpoint, not
-  by appends (ADR 0053, from 1.1), and then reads the interval's backlog: when the writer's helper threads share its
-  CPU, the last record of a 1-second interval at about 170,000 records/s arrived up to 2 ms later than with a reader
-  that has its CPU to itself (measured on cloud VMs); keep the helpers elsewhere (**Pinned writers** above,
-  `WriterConfig::helper_cpus`). A shorter interval means a smaller backlog and less of this delay. Beside a 1.0.0
-  writer, a 1.1 durable-only reader polls the marker every `Backoff::max_sleep` (1 ms by default) instead of
-  registering, so that the old writer's appends make no wake-up call for it.
+  by appends (ADR 0053, from 1.1), where a reader polling the marker on a full core starts at once. With the writer's
+  helper threads free to run on the reader's CPU, the **first** record after each checkpoint arrived a median of 15–145
+  µs after the checkpoint completed (worst 1.2–1.5 ms), and the last record of a 1-second interval at about 170,000
+  records/s up to 2 ms later than with such a polling reader (cloud VMs, `benchmarks.md`, 2026-11-26). With the helpers
+  on other CPUs (**Pinned writers** above, `WriterConfig::helper_cpus`): 11–33 µs (worst 0.2 ms) for the first record,
+  0–0.6 ms for the last. A consumer that acts on the first durable record (fills, risk, replication) should pin the
+  helpers. A shorter interval means a smaller backlog and less delay on the last record. Beside a 1.0.0 writer, a 1.1
+  durable-only reader polls the marker every `Backoff::max_sleep` (1 ms by default) instead of registering, so that
+  the old writer's appends make no wake-up call for it; with a `max_sleep` of zero it registers as 1.0.0 does.
 - **Recovery time.** When the writer opens, it validates everything written since the last checkpoint; a journal
   that is never checkpointed is validated from the start every time.
 

@@ -271,9 +271,15 @@ pub struct ReaderConfig {
     /// A durable-only reader that blocks on the wake-up region at the checkpoint boundary waits for checkpoints only: a
     /// writer from 1.1 on bumps separate words for it, so appends make no wake-up call for it (ADR 0053). Beside a
     /// writer without those words (1.0.0) it does not register at all and polls the marker every
-    /// [`Backoff::max_sleep`] (1 ms by default) instead. Its records arrive after the checkpoint, plus up to about 2 ms
-    /// on the last record of a large backlog when the writer's helper threads share its CPU: keep them elsewhere with
-    /// [`WriterConfig::helper_cpus`](crate::WriterConfig::helper_cpus) (`docs/operations.md` → Pinned writers).
+    /// [`Backoff::max_sleep`] (1 ms by default) instead; with a `max_sleep` of zero it registers on the writer's
+    /// general words, as 1.0.0 does, and that writer then pays a wake-up call per append for it, as with a 1.0.0 reader.
+    ///
+    /// It is woken after the checkpoint, where a reader that polls the marker on a full core starts at once. Measured on
+    /// cloud VMs (`docs/benchmarks.md`, 2026-11-26), with the writer's helper threads free to run on the reader's CPU:
+    /// the first record after a checkpoint arrived a median of 15–145 µs later (worst 1.2–1.5 ms), and the last record of
+    /// a 1-second backlog at about 170,000 records/s up to about 2 ms later. With the helpers on other CPUs
+    /// ([`WriterConfig::helper_cpus`](crate::WriterConfig::helper_cpus); `docs/operations.md` → Pinned writers): 11–33
+    /// µs (worst 0.2 ms), and the last record 0–0.6 ms later.
     pub durable_only: bool,
     /// After the spin and yield phases of [`Backoff`], block on the writer's shared-memory wake-up region instead of
     /// sleeping, so a new record wakes the reader immediately (ADRs 0017 and 0021). The region is found through the
