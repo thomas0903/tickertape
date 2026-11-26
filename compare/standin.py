@@ -5,10 +5,15 @@ no JDK, nothing measured. The adapters get their real command lines, so the runn
 tool's. Environment:
 
   STANDIN_PIDS       directory where every stand-in process (and the runner's guard) leaves a file named by its PID
-  STANDIN_HANG       an adapter --mode (or "latency" for tt-latency): such processes get ready, then sleep
+  STANDIN_HANG       an adapter --mode (or "latency" for tt-latency), or MODE:ROLE: such processes get ready, then
+                     sleep
   STANDIN_FAIL       MODE:ROLE: such a process exits 3 after it got ready (before STANDIN_HANG applies)
-  STANDIN_GRANDCHILD 1: a hanging process starts a process of its own first (tt-latency's children, a helper)
+  STANDIN_GRANDCHILD 1: a hanging process starts a process of its own first (tt-latency's children, a helper).
+                     MODE:ROLE: that process starts one, waits until it is set up, then goes on (finishes, fails or
+                     hangs), so the member can outlive its leader
   STANDIN_IGNORE_TERM 1: hanging processes ignore SIGTERM
+  STANDIN_TERM_DELAY_S seconds a group member takes after SIGTERM before it notes it and exits (default 0): it needs
+                     the grace period, not only its leader
   STANDIN_SLACK_S    the runner's time limit beyond a measurement's records (run.TIMEOUT_SLACK_S)
   STANDIN_REAL       comma-separated tools whose adapters are already built and run for real (the JVM test)
 """
@@ -60,12 +65,19 @@ def options(argv):
     return values, jvm
 
 
+def grandchild(kind, wait=False):
+    """A process in this one's group, not waited for: what a tool leaves behind if only its leader is ended."""
+    proc = subprocess.Popen([sys.executable, "-I", "-S", str(Path(__file__).resolve()), "sleeper", kind])
+    end = time.monotonic() + 60
+    while wait and not (Path(os.environ["STANDIN_PIDS"]) / str(proc.pid)).exists() and time.monotonic() < end:
+        time.sleep(0.01)  # It records itself once its SIGTERM handler is in place.
+
+
 def hang(kind):
     if os.environ.get("STANDIN_IGNORE_TERM") == "1":
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
     if os.environ.get("STANDIN_GRANDCHILD") == "1":
-        # Same process group, not waited for: what a tool leaves behind if only its leader is ended.
-        subprocess.Popen([sys.executable, "-I", "-S", str(Path(__file__).resolve()), "sleeper", kind])
+        grandchild(kind)
     (Path(os.environ["STANDIN_PIDS"]) / f"{os.getpid()}.alive").write_text(kind)
     time.sleep(SLEEP_S)
     sys.exit(4)
@@ -78,6 +90,7 @@ def sleeper(kind):
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
     else:
         def terminated(signum, frame):
+            time.sleep(float(os.environ.get("STANDIN_TERM_DELAY_S", "0")))
             (Path(os.environ["STANDIN_PIDS"]) / f"{os.getpid()}.term").write_text("")
             os._exit(0)
         signal.signal(signal.SIGTERM, terminated)
@@ -100,10 +113,12 @@ def adapter(tool, role, argv):
     record(f"{tool} {role}")
     values, jvm = options(argv)
     mode, count, payload = values["mode"], int(values["count"]), int(values["payload"])
+    if os.environ.get("STANDIN_GRANDCHILD") == f"{mode}:{role}":
+        grandchild(f"{tool} {role} {mode}", wait=True)
     (Path(values["control"]) / f"{role}.ready").write_text("")
     if os.environ.get("STANDIN_FAIL") == f"{mode}:{role}":
         sys.exit(3)
-    if os.environ.get("STANDIN_HANG") == mode:
+    if os.environ.get("STANDIN_HANG") in (mode, f"{mode}:{role}"):
         hang(f"{tool} {role} {mode}")
     if mode == "visible_latency":  # Both processes wait for the runner's start, as the adapters do.
         end = time.monotonic() + 60

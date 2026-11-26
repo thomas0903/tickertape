@@ -60,6 +60,12 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   says that readers never slow the writer down (a blocking reader costs the writer a wake-up call when it publishes),
   explains the disk's 351 MB/s limit and what removed the aarch64 stalls near it, and states what a checkpoint syncs on
   Linux and macOS. No code change.
+- Fixed (benchmarks): the comparison harness's cleanup gave the 3 s grace period after SIGTERM only to each child's
+  leader: once the leaders had exited, SIGKILL went to their groups at once, so another process in a group (as
+  `tt-latency` has) could be killed before it had ended, and a group whose leader had already exited was not
+  signalled at all. Every process of every group now gets SIGTERM and the grace period, in the runner and in
+  `benches/rerun.py`, and the guard keeps a group until it is empty. Seen as a flaky test on the macOS CI leg. Nothing
+  measured changes.
 - Fixed (benchmarks): the comparison harness's short mode left the Chronicle Queue and Aeron JVMs (and `tt-latency`'s
   processes) running when it was terminated. `compare/run.py` now ends every child's process group, waits for it and
   renames an unfinished short run `OUTDIR.incomplete-N` on every way out (failure, time limit, SIGTERM, SIGINT,
