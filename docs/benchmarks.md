@@ -3348,7 +3348,8 @@ aarch64:
 - At 1.5 million records/s and on replay, no difference beyond the floor: the reader never reads less there (0.22 and
   0.19 reads per record, as before).
 - Spinning readers at 20,000 and 200,000 records/s read 4.4–11.7 KB per record instead of 66–68 KB, with p50 halved
-  or better (x86-64 0.76 instead of 2.05–2.07 µs at 64 B) and lower p99. Blocking readers at 20,000 records/s: p50 and
+  or better (x86-64 0.76 instead of 2.05–2.07 µs at 64 B) and lower p99. Blocking readers at 20,000 records/s, in this
+  version without the rule for readers that block (the merged code gives them whole chunks and no gain): p50 and
   CPU 11–14 % lower on x86-64, 23–26 % lower on aarch64, the same number of waits and wakes.
 - Blocking readers at 200,000 records/s, where a reader that copies 64 KiB per record finds about half the records
   without waiting: on aarch64 the 64 B cell does not change (p50 3.63 → 3.61 µs; p99 +5.6 % against a floor of

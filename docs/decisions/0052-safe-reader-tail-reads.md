@@ -1,6 +1,7 @@
 # 0052: How much the safe reader reads at the tail
 
-- **Status:** proposed
+- **Status:** accepted (2026-11-26, by the orchestrator on the owner's delegation, after one independent review, two
+  fix rounds and a re-check of the final code)
 - **Date:** 2026-11-26
 - **Relates to:** [0006](0006-reader-api.md) (the two readers), [0017](0017-reader-wake-ups.md) (blocking readers);
   issue #62; measured in `docs/benchmarks.md` (2026-11-26, the safe reader's read size)
@@ -129,6 +130,10 @@ Measured on cloud VMs (`docs/benchmarks.md`, 2026-11-26):
   overlapping per-round ranges: p50 +1.5 % at 50,000 records/s, p99 +10.1 % at 20,000 records/s of 1,024 B.
 - **Given up:** blocking readers do not read less. One at 20,000 records/s keeps 14.1 µs p50 and about 67 KB read per
   record (the threshold gave 12.4 µs and 4.5 KB, at a cost to the writer).
+- **Known gap (found by the re-check, 2026-11-26):** a reader that finds a slot empty while it has no wake-up region,
+  then attaches one (a writer started or restarted) and blocks at that same slot, has that one fill counted as following
+  although it registered. It is one fill per attached region, and the next blocked fill resets the count, so it cannot
+  lead to small reads by itself. No test covers that upgrade of the note.
 - **Not measured:** the merged code itself (only the build described above); records larger than 4 KiB, which are
   followed with reads of their own size once the reads are small; the rule for blocking readers on aarch64; readers with
   the default backoff (spinning, yielding, then blocking), which read whole chunks for the records they block for and

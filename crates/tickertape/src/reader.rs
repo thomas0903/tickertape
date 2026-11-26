@@ -3065,7 +3065,8 @@ mod tests {
     }
 
     /// A reader that blocks on the wake-up region is noted as blocked at the slot (the check inside `block_on` reads it
-    /// with the region taken out), however the wait ends.
+    /// with the region taken out), however the wait ends. The timeout is long against anything the first poll does
+    /// before the reader blocks (a marker read and a directory listing), so that a slow machine still reaches the block.
     #[test]
     fn blocking_on_the_region_is_noted() {
         let mut f = Follow::new(1 << 20);
@@ -3079,7 +3080,7 @@ mod tests {
         assert!(reader.try_next().unwrap().is_some());
         assert!(
             reader
-                .next_timeout(Some(Duration::from_millis(2)))
+                .next_timeout(Some(Duration::from_millis(100)))
                 .unwrap()
                 .is_none()
         );
