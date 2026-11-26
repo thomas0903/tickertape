@@ -5,6 +5,13 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
+- Docs: what the Linux prefault window adds to a checkpoint is measured (issue #62): `docs/benchmarks.md` → "2026-11-26,
+  what prefaulted, unwritten pages add to a checkpoint" (x86-64 and aarch64, ext4 and xfs). `MADV_POPULATE_WRITE` leaves
+  the 256 KiB window dirty, so every checkpoint that covers appends writes it as zeros in the active segment's whole-file
+  `fdatasync` (0.16–0.43 ms) and write-protects it again (about 35 more page faults for the writer per checkpoint); an
+  idle writer pays once. The roadmap, ADR 0025 (a dated note), `docs/operations.md` and `WriterConfig::prefault` say so,
+  and a note corrects the 2026-11-25 "ranged checkpoint sync" experiment, which still wrote the window back. macOS is
+  not measured. No behaviour change (one rustdoc paragraph).
 - Changed: a safe reader (`Reader::open`) that does not block and keeps showing that it waits for every record reads
   4 KiB per fill of its buffer instead of 64 KiB, so following a live journal by spinning no longer copies 64 KiB per
   record (ADR 0052, issue #62). It shrinks after 16 fills in a row that each waited for one record, reads a whole chunk
