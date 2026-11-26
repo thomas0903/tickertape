@@ -52,7 +52,10 @@ With `WriterConfig::prefault(true)` (the default), the writer moves segment work
 - **Page faults (Linux and macOS).** A helper thread, `tickertape-prefault`, keeps the pages just ahead of the write
   position faulted in, so `append` rarely waits for a page fault.
   - **Linux:** the next 256 KiB, with `MADV_POPULATE_WRITE` (ADR 0025; kernels before 5.14 stop the helper on first
-    use).
+    use). The advice leaves those pages dirty, so every checkpoint that covers appends also writes the 256 KiB of
+    zeros ahead of the writer: 0.16–0.43 ms more per checkpoint in the recorded runs, and about 35 page faults for the
+    writer afterwards, because writing the pages back write-protects them (`docs/benchmarks.md` → "2026-11-26, what
+    prefaulted, unwritten pages add to a checkpoint"). An idle writer pays it once.
   - **macOS:** the next 8 MiB, with `MADV_WILLNEED` (ADR 0020). On APFS, writing into a preallocated segment otherwise
     faults once per 16 KiB page, slowly.
 - **The next segment** (`WriterConfig::spare_segment`; on by default on macOS, **off on Linux**, from 1.1). Once the
@@ -109,6 +112,29 @@ choices.
 **Sustained high byte rates on Linux.** Under steady write-back (minutes of writing, gigabytes of dirty pages), ext4
 itself occasionally stalls the writer for milliseconds, with or without prefaulting (ADR 0025). Plan disk
 throughput with headroom: a small cloud VM stalled for hundreds of milliseconds at about 100 MB/s sustained.
+
+**Is the disk the limit?** The journal writes records/s × (payload + 40 bytes, rounded up to a multiple of 8). Compare
+that with what the device writes by itself on the same file system: a `fio` job of buffered sequential writes into a
+preallocated file with an `fdatasync` every second, for a minute or more (the job file is in `docs/benchmarks.md` →
+"2026-11-26, how much of the limit is the disk"). If an unpaced writer's rate, less what piles up in the page cache
+(`Dirty` and `Writeback` in `/proc/meminfo`), is about `fio`'s, the disk is the limit; the writer's thread then spends
+most of its time off the CPU, throttled by the kernel's write-back. In the recorded cloud runs the local SSD wrote at
+most 351 MB/s by itself, tickertape on it the same 351 MB/s plus what the page cache took in, and with the journal on
+tmpfs three to four times as much at 1,024 B.
+
+- **Headroom at a steady rate.** There, a steady rate of 89 % (64 B) or 94 % (x86-64) of the device's rate did not
+  stall, and 92 % (1,024 B, aarch64) did, with appends of 10–144 ms. The point at which it starts depends on the
+  device and on more than the rate (with its defaults the writer made that device write 7 % more than it appended), so
+  measure it.
+- **Settings that moved the tail.** In those aarch64 runs, early write-back off
+  (`WriterConfig::early_writeback(false)`) removed the stalls in 5 of 5 runs. The cost: a checkpoint became durable 0.93
+  s after its request (what the device needs for a second of data) instead of 0.05–0.39 s. On x86-64, where there were
+  no stalls, it only made checkpoints that late instead of 2 ms. `lazytime` and xfs left one or three seconds with a
+  long append (one run each). The spare segment and either dirty limit did not help. Small limits
+  (`vm.dirty_bytes` 256 MiB) made an overloaded writer's longest appends longer, and large ones only let more pile up
+  before the throttling starts.
+- **tmpfs** has no durability (syncs do nothing). There, a roll zeroes the whole new segment on the writer's thread
+  (`fallocate`; 19–30 ms per 128 MiB roll in the recorded runs) unless the spare segment is on.
 
 ## Open files
 
@@ -437,15 +463,18 @@ retention goes by the marker it finds, and the newer marker can make it remove r
 marker will name. Then restore the backup's `checkpoint` together with its segments, and remove the segments the backup
 does not have. The marker vouches for every record below its `next_seq`, so a marker newer than the segments covers
 records they lack. From 1.1 a writer refuses such a journal under every recovery policy, before it changes anything
-(`DanglingCheckpoint`, reported at the marker's segment and offset; ADR 0056); readers and `verify` stop where the
-restored records end. If the backup's marker is lost, see "After a crash" → Refused to open.
+(`DanglingCheckpoint`, reported at the marker's segment and offset; ADR 0056); `status` reports it beforehand
+(`checkpoint.problem` `dangling`, exit 2), retention and `tickertape archive` remove nothing from it and fail
+with the writer's error, and readers and `verify` stop where the restored records end. (A marker at offset 64 of its
+segment whose predecessor lacks records is not detected by any of them except `verify` and readers: ADR 0056,
+amendment.) If the backup's marker is lost, see "After a crash" → Refused to open.
 
 ### Limits
 
 - **Do not copy a journal a writer is using as a whole.** The files change during the copy, so it is no snapshot.
   Copying the segments before `checkpoint` is dangerous: the marker can cover records the copied segments lack. If the
   marker names a segment the copy lacks, the writer refuses the copy. If it points into a segment that was copied
-  earlier, `status` can exit with 0, `verify` reports `EmptyCommitWord` where the copied records end (from 1.1, ADR
+  earlier, `status` exits with 2 (from 1.1, `checkpoint.problem` `dangling`; 1.0 could exit with 0), `verify` reports `EmptyCommitWord` where the copied records end (from 1.1, ADR
   0050), and the writer refuses the copy (from 1.1, ADR 0056: `DanglingCheckpoint` at that segment and the marker's
   offset; 1.0.0 opened it, continued at the marker's sequence number and left a hole that readers cannot pass). A sign of this is a `verify` `last_seq` + 1 lower than the checkpoint's `next seq` in
   `status`. Copying `checkpoint` first avoids that, but the records after the marker may be incomplete,
@@ -482,7 +511,7 @@ reported as corruption. `tickertape verify` checks everything.
 
 | Signal | Why it matters | Suggested alert |
 |---|---|---|
-| **Corruption** (`tickertape_corrupt`; exit code 2) | The head is at bytes that fail validation (seen after a power loss or storage corruption, until the next writer repairs them; C8, C11), the checkpoint marker points to a missing segment or an impossible offset, or the segment listing proves a segment missing between the checkpoint and the head, so the writer refuses to open the journal | Page |
+| **Corruption** (`tickertape_corrupt`; exit code 2) | The head is at bytes that fail validation (seen after a power loss or storage corruption, until the next writer repairs them; C8, C11), the checkpoint marker points to a missing segment, an impossible offset or (from 1.1) a position its segment's records do not reach, or the segment listing proves a segment missing between the checkpoint and the head, so the writer refuses to open the journal | Page |
 | **Exposure age** (`exposure.estimated_age`, `tickertape_exposure_estimated_age_seconds`; CLI `--max-checkpoint-age`) | Everything after the last successful checkpoint may be lost in a power loss, and its sequence numbers reused (crash contract C7, C8). The exposure age is an upper bound on how far back that loss reaches: zero when every record is covered, otherwise the checkpoint's estimated age. It is unknown (and `--max-checkpoint-age` is breached) when records are uncovered and there is no checkpoint or its time is unreliable | Warn above 3× your checkpoint interval, page above 10×; alert on `absent(tickertape_exposure_estimated_age_seconds)` too |
 | **Checkpoint errors** (`Writer::metrics().poisoned`, or `checkpoint()` returning an error) | After a failed checkpoint, durability can't be guaranteed for this writer, and later checkpoints fail (C12, "Errors are sticky"). The marker then stops moving, so the exposure age grows too | Page on the first error. Only the writer process can see this directly |
 | **Storage headroom** (`storage.available_bytes`, `estimated_rolls_left`; `--min-headroom`, `--min-headroom-segments`) | Writes into the active segment need no new space, but the next roll needs a whole segment; when it can't get one, `append` fails with a storage-full error (C9). **On btrfs** a full volume can kill the writer with `SIGBUS` even inside the active segment (C10), so the rolls estimate is optimistic there; on APFS a checkpoint on a full volume fails and poisons the writer. A prepared spare segment is reported (`spare_segment`) but not counted, since publishing it can still fail | Warn below a day's worth of segments at your peak rate (or use `predict_linear` on `tickertape_storage_available_bytes`), page below 2 rolls. Keep a larger margin on btrfs |
@@ -881,9 +910,12 @@ the writer or retention.
   or move the affected segments aside knowingly. tickertape won't discard history on its own.
 - **Refused to open with `DanglingCheckpoint` at a segment and an offset** (from 1.1, under every policy; ADR 0056):
   the checkpoint marker's position lies beyond the records that segment holds, or the record right before it is
-  damaged, so the marker vouches for records the journal lacks. Nothing was changed. Run `tickertape verify` (it names
-  where the records end, or the damaged record) and `tickertape inspect` or `status` (the marker's segment, offset and
-  next sequence number). Then, in order of what they lose:
+  damaged, so the marker vouches for records the journal lacks. Nothing was changed. `tickertape status` predicts this
+  refusal (`checkpoint.problem` `dangling`, `tickertape_checkpoint_invalid` 1, exit 2), and retention, the
+  writer's and `tickertape archive`'s, removes nothing from such a journal (it fails with the same error), so the
+  segments the remedies below need stay. Run `tickertape verify` (it names where the records end, or the damaged
+  record) and `tickertape inspect` or `status` (the marker's segment, offset and next sequence number). Then, in order
+  of what they lose:
   1. Segments restored from a backup: restore that backup's `checkpoint` with them. Nothing is lost.
   2. A damaged record: restore its segment from a copy or a replica. Nothing is lost.
   3. Otherwise, knowingly, move `checkpoint` out of the directory and keep it. The writer then opens without a marker

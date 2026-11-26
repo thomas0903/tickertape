@@ -274,7 +274,7 @@ fn follow(shared: &Shared, ctx: &Context) {
                 // Whole pages before the one that holds the position.
                 #[cfg(not(tickertape_pf_exp))]
                 let limit = state.position / page * page;
-                // EXPERIMENT (ADR 0057; `--cfg tickertape_pf_exp` only): `TT_PF_WB_LAG_KIB`.
+                // EXPERIMENT (ADR 0058; `--cfg tickertape_pf_exp` only): `TT_PF_WB_LAG_KIB`.
                 #[cfg(tickertape_pf_exp)]
                 let limit = crate::prefault::exp::writeback_limit(state.position, page);
                 if done < limit {

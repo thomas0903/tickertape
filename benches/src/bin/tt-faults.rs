@@ -1,4 +1,4 @@
-//! Page faults on the writer's thread, append by append (ADR 0057): which appends take a fault, how long they take
+//! Page faults on the writer's thread, append by append (ADR 0058): which appends take a fault, how long they take
 //! against the appends that do not, and where in the segment they are. Linux only (it reads the thread's fault counts
 //! with `getrusage(RUSAGE_THREAD)`).
 
@@ -10,7 +10,9 @@ use std::time::{Duration, Instant};
 
 use hdrhistogram::Histogram;
 use serde_json::json;
-use tickertape::{Backoff, HelperCpus, NewRecord, Reader, ReaderConfig, Writer, WriterConfig, clock};
+use tickertape::{
+    Backoff, HelperCpus, NewRecord, Reader, ReaderConfig, Writer, WriterConfig, clock,
+};
 use tickertape_bench::sustained::{parse_cpu_list, pin_current_thread};
 use tickertape_bench::{Options, Result, fresh_directory, histogram_json};
 
@@ -128,9 +130,8 @@ fn run(args: &[String]) -> Result<()> {
             let dir = dir.clone();
             let measure_from = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
             let from = Arc::clone(&measure_from);
-            let handle = std::thread::Builder::new()
-                .name("tt-reader".into())
-                .spawn(move || -> std::result::Result<Histogram<u64>, String> {
+            let handle = std::thread::Builder::new().name("tt-reader".into()).spawn(
+                move || -> std::result::Result<Histogram<u64>, String> {
                     let read = || -> Result<Histogram<u64>> {
                         pin_current_thread(cpu)?;
                         let config = ReaderConfig::default()
@@ -140,7 +141,9 @@ fn run(args: &[String]) -> Result<()> {
                         let mut reader = unsafe { Reader::open_mapped(&dir, config)? };
                         let mut h = hist()?;
                         while !stop.load(Ordering::Relaxed) {
-                            if let Some(record) = reader.next_timeout(Some(Duration::from_millis(50)))? {
+                            if let Some(record) =
+                                reader.next_timeout(Some(Duration::from_millis(50)))?
+                            {
                                 let now = clock::realtime_ns();
                                 if record.local_ts_ns >= from.load(Ordering::Relaxed) {
                                     h.record(now.saturating_sub(record.local_ts_ns).max(1))?;
@@ -150,7 +153,8 @@ fn run(args: &[String]) -> Result<()> {
                         Ok(h)
                     };
                     read().map_err(|e| e.to_string())
-                })?;
+                },
+            )?;
             Some((handle, measure_from))
         }
     };
@@ -246,8 +250,7 @@ fn run(args: &[String]) -> Result<()> {
                     writeln!(
                         log,
                         "{intended} {latency} {minor} {major} {} {} {since_ckpt_ms:.3}",
-                        head.segment_base_seq,
-                        head.offset
+                        head.segment_base_seq, head.offset
                     )?;
                 }
             }

@@ -25,6 +25,17 @@ Seeks with and without the seek index, at both payloads and with both readers, o
 [under 2026-11-26](#2026-11-26-seeks-with-and-without-the-seek-index-google-cloud-vms).
 The investigation of the two aarch64 observations that 1.0.0 left open (the zero-copy reader's 10 ms maximum, the
 lagging view of issue #43) is [under 2026-11-26](#2026-11-26-the-two-aarch64-observations-left-open-by-100-google-cloud-vms).
+How much of the throughput ceiling and of the latency tail is the storage device (fio on the same SSDs, the journal on
+tmpfs, one storage setting at a time, a payload sweep, the two local SSDs striped) is
+[under 2026-11-26](#2026-11-26-how-much-of-the-limit-is-the-disk-fio-tmpfs-and-one-change-at-a-time-google-cloud-vms).
+Why replay speed changed with the layout of `Reader`, and the before and after of its fixed layout (ADR 0057), are
+[under 2026-11-26](#2026-11-26-the-layout-of-reader-adr-0057-issue-86-google-cloud-vms).
+What the Linux prefault window adds to a checkpoint (bytes, sync time, append and reader latency) is
+[under 2026-11-26](#2026-11-26-what-prefaulted-unwritten-pages-add-to-a-checkpoint-google-cloud-vms-linux).
+Which page faults the writer still takes with prefaulting on, how much latency they explain, and what a writer-thread
+touch (as Chronicle Queue's `microTouch()`), a larger window, re-touching, early write-back further behind and the
+ranged sync do to them (ADR 0058), are
+[under 2026-11-26](#2026-11-26-the-writers-remaining-page-faults-with-prefaulting-on-google-cloud-vms-linux).
 
 **How Chronicle Queue and tickertape were configured in the comparisons below.** Open-source Chronicle Queue (2026.8,
 the version `compare/chronicle/pom.xml` pins) ran with its default queue options, except `SyncMode.SYNC` in the
@@ -329,6 +340,1023 @@ Other results, ext4 / xfs:
   - replay: 23.1 / 23.1 million records/s at 64 B (safe reader), 3.08 / 3.09 at 1,024 B.
 - **Cold-cache replay** (page cache dropped): 8.9–9.0 million records/s at 64 B; 1.66–1.67 million records/s at
   1,024 B, which is 1.70–1.71 GB/s of payload from the NVMe disk.
+
+## 2026-11-26, what prefaulted, unwritten pages add to a checkpoint (Google Cloud VMs, Linux)
+
+The 1.0.0 gap "how much prefaulted, unwritten data adds to a checkpoint" (issue #62), on Linux. **Cloud virtual machines
+with local NVMe SSD, not bare metal**; macOS was not measured. The raw output (results, traces, scripts) is kept outside
+the repository.
+
+**Answer.** On Linux the prefault helper's `MADV_POPULATE_WRITE` does not only fault the 256 KiB ahead of the writer in:
+it makes those pages dirty, and every checkpoint writes them to the device as zeros. In every checkpoint that covered
+appends, at every rate measured, on both architectures and both filesystems, the active segment's whole-file `fdatasync`
+(after the ranged `msync` has written the records) wrote 268 KiB on ext4 (256 KiB of data, 12 KiB of journal) and 260
+KiB on xfs, and took 156–429 µs (medians per cell, early write-back on); without the advice it wrote nothing and took
+2–4 µs. That moved the blocking checkpoint's median from 0.35–0.52 ms to 0.50–0.73 ms on aarch64 and from 0.36–0.44 ms
+to 0.53–0.99 ms on x86-64 in the cells where its runs are steady enough to tell (200,000/s, and 1,024 B on ext4; below).
+The checkpoint also write-protects those pages again, so the writer takes 33–36 more page faults after each checkpoint.
+An idle writer pays once: its first checkpoint wrote 332–360 KiB instead of 16–44 KiB; from the third on, every
+checkpoint wrote 8 KiB, with or without prefaulting. The bytes scale with the window: with a 4 MiB window (x86-64 only)
+that `fdatasync` wrote 4.1 MiB and took 2.7–7.5 ms.
+
+### Environment and commands
+
+| Machine | CPU, vCPUs, memory | Zone | Time (UTC) | Runs |
+|---|---|---|---|---|
+| `c4-standard-8-lssd` | Intel Xeon 6985P-C, 8 (4 cores), 31.5 GB | us-east1-b | 05:35–06:49 | 150 and 25 (the ext4 traced round again, below) |
+| `c4a-standard-4-lssd` | Google Axion (Neoverse-V2), 4, 16.7 GB | us-east1-b | 09:17–10:00 | 102 (configurations A, C, D, E and G) |
+
+Ubuntu 24.04, kernel 7.0.0-1017-gcp, rustc 1.100.0, bpftrace 0.20.2, 4 KiB pages. One local NVMe SSD (375 GB), formatted
+for each filesystem in turn: ext4 (`mkfs.ext4 -E lazy_itable_init=0,lazy_journal_init=0`), then xfs with defaults, both
+mounted `noatime`; I/O scheduler `none`; the device reports `write_cache` "write through" (read on the x86-64 VM), so
+the kernel sends it no cache flushes: `/sys/block/*/stat` counted none in any run on either VM. Write-back sysctls at
+their defaults. Results on the boot disk.
+
+Commit: `3d82592c` (`main` on 2026-11-26), for configurations A, B, C and G. Configurations D, E and F need switches
+that the library does not have; they ran a build of the branch `exp/ckpt-prefault` (`5c558bc3`, `3d82592c` plus three
+environment switches, never merged; the scripts as run are in its `expckpt/` directory since `3b10f049`). The
+checkpoint's sync steps are the same at `3d82592c` and at the `main` this section was merged into. Binaries' sha256:
+x86-64 `4aa97b7d…` (main), `31fc109d…` (exp); aarch64 `48ad1e3e…`, `a56182a3…` (the same on both aarch64 VMs).
+
+```sh
+[env TT_EXP_…=1] tt-sustained run --dir … --out … --rate <1|20000|200000> --payload <64|1024> --duration 20s \
+  --warmup 3s --checkpoint-every 1s --readers mapped --cpus <writer>,<reader> --helper-cpus <helpers> --json \
+  [--no-prefault | --no-early-writeback]
+```
+
+- **Configurations.** A: the defaults (prefault on, early write-back on). B: `--no-early-writeback`. C: `--no-prefault`
+  (`WriterConfig::prefault(false)`, which also turns off early write-back). D: prefault off with early write-back on
+  (`TT_EXP_NO_POPULATE`: the helper runs and advises nothing), the comparison that changes only the advice. E: prefault
+  on, and the active segment synced by its ranged `msync` alone (`TT_EXP_RANGED`: no whole-file `fdatasync` of it,
+  neither the per-segment one nor the barrier). F: a 4 MiB window (`TT_EXP_WINDOW_KIB=4096`). G: the defaults without
+  checkpoints.
+- **Cells.** Idle (one 64 B record per second), 20,000 and 200,000 records/s of 64 B, 20,000 records/s of 1,024 B (21
+  MB/s, like 200,000 of 64 B). A checkpoint every second (the interval `operations.md` gives as the common pattern),
+  blocking, on the writer's thread; 128 MiB segments, so 200,000/s and 1,024 B rolled three or four times per run. One
+  zero-copy reader. The writer thread, the reader and the helper threads each on a CPU of their own core (`--cpus 1,2
+  --helper-cpus 3` on both machines; core 0 for everything else).
+- **Rounds.** Three rounds per filesystem, cells and configurations rotated from round to round; every journal deleted
+  and `sync`ed before the next run. Rounds 1 and 2 are untraced: their two runs per cell are the noise floor, and every
+  duration and latency below comes from them. Round 3 ran under `ckpt.bt` (branch `exp/ckpt-prefault`), which prints
+  every `msync`, `fdatasync` and `fsync` of the writer's thread with its time and the bytes written to the device during
+  it (block `rq_issue` tracepoint, every issuer, so journal and log writes are included), and counts the folios each
+  thread made dirty (`writeback_dirty_folio`). Its first version matched the thread name `tt-sustained` exactly, while
+  the binaries ran as `tt-sustained-main` and `-exp`: on x86-64 ext4 it recorded no calls, and that round was run again
+  after the others with the filter fixed (xfs, and aarch64, used the fixed version).
+- **Device bytes per checkpoint** in the second table are the device's written sectors over the whole run
+  (`/sys/block/*/stat`), early write-back and the final checkpoint included, divided by the checkpoints plus one.
+- **Tracing check.** Against the untraced runs of the same cell, the traced checkpoint's median was 11–21 µs longer at
+  idle and otherwise within, below or up to 0.06 ms above their range on aarch64; on x86-64 it was 1.5–2.1 times as long
+  in five cells (ext4 at 20,000/s D and E, 1,024 B D on both filesystems, xfs at 200,000/s A). The traced runs are used
+  for bytes and for which call pays, not for durations.
+- A first aarch64 VM ran the whole matrix of 150 runs, but its results were lost except 27 ext4 runs (the copy timed out
+  and the VM was deleted); those agree with the figures below and are not used. The second VM ran four of the six
+  configurations.
+
+### Which call writes what
+
+A checkpoint on Linux (`checkpoint.rs` → `steps`) syncs each dirty segment with `msync(MS_SYNC)` over its written range,
+then `fdatasync` of the whole file; then `fsync` of the directories whose entries changed; then `fdatasync` of the
+active segment again as the barrier; then writes and `fdatasync`s the marker. Medians over the checkpoints that cover
+one segment, from the traced runs: KiB written to the device during the call / the call's time (ext4 ; xfs). The barrier
+`fdatasync` is left out: in all 1,456 traced calls (910 on x86-64, 546 on aarch64) it took 0.7 and 1.3 µs (medians), at
+most 172 µs, and wrote at most 4 KiB.
+
+x86-64:
+
+| Rate | Configuration | Ranged `msync` | Segment `fdatasync` | Marker `fdatasync` | Whole checkpoint | Checkpoints with a roll: KiB |
+|---|---|---|---|---|---|---|
+| 20,000/s, 64 B | default: prefault on, write-back on | 908 / 483 ; 900 / 384 | 268 / 235 ; 260 / 168 | 4 / 35 ; 4 / 33 | 1,180 / 715 ; 1,164 / 591 | – / – |
+| 20,000/s, 64 B | prefault off, write-back on (exp) | 908 / 760 ; 900 / 370 | 0 / 2.1 ; 0 / 1.5 | 4 / 36 ; 4 / 33 | 912 / 812 ; 904 / 418 | – / – |
+| 20,000/s, 64 B | `prefault(false)` (write-back off too) | 2,188 / 798 ; 2,180 / 581 | 0 / 2.3 ; 0 / 1.5 | 4 / 34 ; 4 / 33 | 2,192 / 854 ; 2,184 / 628 | – / – |
+| 20,000/s, 64 B | prefault on, write-back off | 2,188 / 885 ; 2,180 / 712 | 268 / 427 ; 260 / 449 | 4 / 34 ; 4 / 34 | 2,460 / 1.35 ms ; 2,444 / 1.21 ms | – / – |
+| 20,000/s, 64 B | prefault on, ranged sync (exp) | 908 / 757 ; 900 / 591 | – ; – | 4 / 37 ; 4 / 166 | 912 / 809 ; 904 / 784 | – / – |
+| 20,000/s, 64 B | 4 MiB window (exp) | 896 / 281 ; 896 / 274 | 2,188 / 2.66 ms ; 2,180 / 2.8 ms | 4 / 42 ; 4 / 41 | 3,088 / 2.98 ms ; 3,080 / 3.12 ms | – / – |
+| 200,000/s, 64 B | default: prefault on, write-back on | 524 / 397 ; 516 / 494 | 268 / 262 ; 260 / 429 | 4 / 119 ; 4 / 160 | 732 / 844 ; 716 / 1.1 ms | 1,084–1,212 / 1,040–1,168 |
+| 200,000/s, 64 B | prefault off, write-back on (exp) | 474 / 378 ; 466 / 307 | 0 / 2.8 ; 0 / 2.2 | 4 / 36 ; 4 / 34 | 478 / 434 ; 470 / 359 | 816–944 / 780–908 |
+| 200,000/s, 64 B | `prefault(false)` (write-back off too) | 20,460 / 54.4 ms ; 20,452 / 53.9 ms | 0 / 4.1 ; 0 / 2.5 | 4 / 112 ; 4 / 41 | 20,470 / 54.6 ms ; 20,458 / 53.9 ms | 20,384–20,400 / 20,348–20,364 |
+| 200,000/s, 64 B | prefault on, write-back off | 20,492 / 54.1 ms ; 20,484 / 53.8 ms | 268 / 946 ; 260 / 490 | 4 / 44 ; 4 / 41 | 20,706 / 54.7 ms ; 20,686 / 54.3 ms | 20,668 / 20,624 |
+| 200,000/s, 64 B | prefault on, ranged sync (exp) | 524 / 384 ; 516 / 320 | – ; – | 4 / 39 ; 4 / 34 | 528 / 436 ; 520 / 373 | 816–944 / 780–908 |
+| 200,000/s, 64 B | 4 MiB window (exp) | 524 / 387 ; 516 / 328 | 4,108 / 7.25 ms ; 4,100 / 7.3 ms | 4 / 48 ; 4 / 46 | 4,572 / 7.95 ms ; 4,556 / 7.66 ms | 4,924–5,052 / 4,880–5,008 |
+| 20,000/s, 1,024 B | default: prefault on, write-back on | 588 / 394 ; 580 / 319 | 268 / 237 ; 260 / 177 | 4 / 36 ; 4 / 33 | 860 / 695 ; 844 / 548 | 432–1,212 / 396–1,168 |
+| 20,000/s, 1,024 B | prefault off, write-back on (exp) | 588 / 531 ; 580 / 481 | 0 / 3.0 ; 0 / 2.0 | 4 / 35 ; 4 / 159 | 592 / 612 ; 584 / 673 | 168–948 / 136–908 |
+| 20,000/s, 1,024 B | `prefault(false)` (write-back off too) | 20,876 / 55.7 ms ; 20,868 / 55.4 ms | 0 / 3.4 ; 0 / 2.5 | 4 / 44 ; 4 / 34 | 20,880 / 55.8 ms ; 20,872 / 55.4 ms | 20,912 / 20,876 |
+| 20,000/s, 1,024 B | prefault on, write-back off | 20,876 / 55.2 ms ; 20,868 / 55.0 ms | 268 / 826 ; 260 / 981 | 4 / 44 ; 4 / 42 | 21,148 / 56.1 ms ; 21,132 / 56.1 ms | 21,180 / 21,136 |
+| 20,000/s, 1,024 B | prefault on, ranged sync (exp) | 588 / 421 ; 580 / 323 | – ; – | 4 / 36 ; 4 / 35 | 592 / 470 ; 584 / 379 | 164–948 / 136–908 |
+| 20,000/s, 1,024 B | 4 MiB window (exp) | 588 / 391 ; 580 / 325 | 4,108 / 7.46 ms ; 4,100 / 7.37 ms | 4 / 49 ; 4 / 44 | 4,700 / 8.1 ms ; 4,684 / 7.79 ms | 4,272–5,052 / 4,236–5,008 |
+
+aarch64:
+
+| Rate | Configuration | Ranged `msync` | Segment `fdatasync` | Marker `fdatasync` | Whole checkpoint | Checkpoints with a roll: KiB |
+|---|---|---|---|---|---|---|
+| 20,000/s, 64 B | default: prefault on, write-back on | 908 / 482 ; 900 / 434 | 268 / 193 ; 260 / 156 | 4 / 24 ; 4 / 22 | 1,180 / 728 ; 1,164 / 649 | – / – |
+| 20,000/s, 64 B | prefault off, write-back on (exp) | 908 / 474 ; 900 / 468 | 0 / 3.0 ; 0 / 2.2 | 4 / 25 ; 4 / 22 | 912 / 519 ; 904 / 513 | – / – |
+| 20,000/s, 64 B | `prefault(false)` (write-back off too) | 2,188 / 1.03 ms ; 2,180 / 913 | 0 / 2.9 ; 0 / 2.5 | 4 / 22 ; 4 / 22 | 2,192 / 1.07 ms ; 2,184 / 971 | – / – |
+| 20,000/s, 64 B | prefault on, ranged sync (exp) | 908 / 534 ; 900 / 464 | – ; – | 4 / 25 ; 4 / 23 | 912 / 574 ; 904 / 505 | – / – |
+| 200,000/s, 64 B | default: prefault on, write-back on | 524 / 340 ; 516 / 322 | 268 / 195 ; 260 / 157 | 4 / 23 ; 4 / 22 | 732 / 570 ; 716 / 506 | 1,088–1,216 / 1,040–1,168 |
+| 200,000/s, 64 B | prefault off, write-back on (exp) | 474 / 331 ; 466 / 288 | 0 / 3.1 ; 0 / 2.6 | 4 / 24 ; 4 / 22 | 478 / 382 ; 470 / 336 | 820–948 / 780–908 |
+| 200,000/s, 64 B | `prefault(false)` (write-back off too) | 20,460 / 55.5 ms ; 20,452 / 56.9 ms | 0 / 3.2 ; 0 / 2.7 | 4 / 23 ; 4 / 22 | 20,470 / 55.5 ms ; 20,458 / 57.0 ms | 20,384–20,404 / 20,348–20,364 |
+| 200,000/s, 64 B | prefault on, ranged sync (exp) | 524 / 335 ; 516 / 308 | – ; – | 4 / 25 ; 4 / 23 | 528 / 378 ; 520 / 350 | 820–948 / 780–908 |
+| 20,000/s, 1,024 B | default: prefault on, write-back on | 588 / 369 ; 580 / 309 | 268 / 191 ; 260 / 159 | 4 / 23 ; 4 / 22 | 860 / 620 ; 844 / 527 | 432–1,216 / 396–1,168 |
+| 20,000/s, 1,024 B | prefault off, write-back on (exp) | 588 / 348 ; 580 / 315 | 0 / 3.2 ; 0 / 2.6 | 4 / 23 ; 4 / 22 | 592 / 413 ; 584 / 362 | 164–948 / 136–908 |
+| 20,000/s, 1,024 B | `prefault(false)` (write-back off too) | 20,876 / 56.8 ms ; 20,868 / 58.6 ms | 0 / 3.4 ; 0 / 2.9 | 4 / 24 ; 4 / 22 | 20,880 / 56.9 ms ; 20,872 / 58.7 ms | 20,912–20,916 / 20,876 |
+| 20,000/s, 1,024 B | prefault on, ranged sync (exp) | 588 / 360 ; 580 / 339 | – ; – | 4 / 24 ; 4 / 23 | 592 / 400 ; 584 / 381 | 164–948 / 136–908 |
+
+- With the advice (A, B, F), the whole-file `fdatasync` after the ranged `msync` writes exactly the window, as zeros:
+  256 KiB (4 MiB with F) plus 12 KiB of ext4 journal or 4 KiB of xfs log, in every checkpoint, whatever the rate and
+  record size. The `msync` writes the records early write-back has not yet written (about 0.5–0.9 MiB at these rates),
+  or all of them without early write-back; the same with and without the advice, except 50 KiB more with it at
+  200,000/s.
+- The traced runs count who made the folios of the journal device dirty: the `tickertape-prefault` thread 41 at idle,
+  406–458 per run at 20,000/s of 64 B and 3,796–3,932 at 21 MB/s, the writer's thread then 59–526 (A, B, E); without the
+  advice (C, D) the helper none and the writer 1,138–10,766 at 20,000/s and above (x86-64). They are folios, not pages
+  (the page cache uses large folios on this kernel), so they show who dirties, not how many bytes.
+- **Rolls.** Checkpoints that cover a roll (two segments) wrote 1,040–1,216 KiB with the advice and 780–948 KiB without:
+  the same 260–268 KiB more.
+- **Idle.** The window moves only when the writer does, so an idle writer's window is written once. KiB written by each
+  checkpoint in turn (the same on both architectures):
+
+- ext4 default: prefault on, write-back on: 360, 20, 8, 8, 8, 8 …
+- xfs default: prefault on, write-back on: 332, 12, 8, 8, 8, 8 …
+- ext4 prefault off, write-back on (exp): 44, 20, 8, 8, 8, 8 …
+- xfs prefault off, write-back on (exp): 16, 12, 8, 8, 8, 8 …
+- ext4 `prefault(false)` (write-back off too): 44, 20, 8, 8, 8, 8 …
+- xfs `prefault(false)` (write-back off too): 16, 12, 8, 8, 8, 8 …
+- ext4 prefault on, ranged sync (exp): 44, 20, 8, 8, 8, 8 …
+- xfs prefault on, ranged sync (exp): 16, 12, 8, 8, 8, 8 …
+
+### Checkpoint duration and bytes
+
+x86-64 (two untraced runs per cell; ranges over the runs; ext4 / xfs; µs unless a cell says ms):
+
+| Rate | Configuration | Checkpoint p50 | Checkpoint max | Device KiB per checkpoint | Appended KiB per checkpoint |
+|---|---|---|---|---|---|
+| idle (1/s), 64 B | default: prefault on, write-back on | 89–321 / 103–372 | 121–388 / 135–505 | 29 / 27–29 | 0 / 0 |
+| idle (1/s), 64 B | prefault off, write-back on (exp) | 81–95 / 96–195 | 113–120 / 115–373 | 15 / 9 | 0 / 0 |
+| idle (1/s), 64 B | `prefault(false)` (write-back off too) | 86–88 / 86–89 | 215–265 / 97–111 | 15 / 14 | 0 / 0 |
+| idle (1/s), 64 B | prefault on, write-back off | 84–100 / 88–97 | 113–121 / 104 | 29 / 27 | 0 / 0 |
+| idle (1/s), 64 B | prefault on, ranged sync (exp) | 87–89 / 103–345 | 112–134 / 136–499 | 15 / 14 | 0 / 0 |
+| idle (1/s), 64 B | 4 MiB window (exp) | 90–310 / 97–368 | 128–445 / 166–467 | 199 / 193 | 0 / 0 |
+| 20,000/s, 64 B | default: prefault on, write-back on | 625–898 / 741–1.2 ms | 988–1.92 ms / 1.16 ms–1.45 ms | 2,410 / 2,389–2,394 | 2,031 / 2,031 |
+| 20,000/s, 64 B | prefault off, write-back on (exp) | 433–435 / 426–733 | 485–537 / 594–956 | 2,157 / 2,148–2,149 | 2,031 / 2,031 |
+| 20,000/s, 64 B | `prefault(false)` (write-back off too) | 729–767 / 619–1 ms | 799–1.04 ms / 658–3.77 ms | 2,157 / 2,149–2,150 | 2,031 / 2,031 |
+| 20,000/s, 64 B | prefault on, write-back off | 1.47 ms–1.59 ms / 1.26 ms–1.53 ms | 1.66 ms–2.11 ms / 1.69 ms–1.74 ms | 2,410 / 2,389–2,394 | 2,031 / 2,031 |
+| 20,000/s, 64 B | prefault on, ranged sync (exp) | 408–468 / 425–751 | 477–612 / 551–944 | 2,175 / 2,163–2,167 | 2,031 / 2,031 |
+| 20,000/s, 64 B | 4 MiB window (exp) | 2.74 ms–3.09 ms / 2.97 ms–3.12 ms | 3.66 ms–3.79 ms / 3.59 ms–4.24 ms | 4,419 / 4,406–4,409 | 2,031 / 2,031 |
+| 200,000/s, 64 B | default: prefault on, write-back on | 705–989 / 526–553 | 1.56 ms–1.97 ms / 1.5 ms–1.58 ms | 21,636 / 21,612 | 20,312 / 20,312 |
+| 200,000/s, 64 B | prefault off, write-back on (exp) | 377–388 / 362–370 | 1.75 ms–1.77 ms / 1.63 ms–2.08 ms | 21,195–21,197 / 21,185–21,190 | 20,312 / 20,312 |
+| 200,000/s, 64 B | `prefault(false)` (write-back off too) | 54.5 ms–54.6 ms / 53.9 ms–54.1 ms | 55.2 ms–55.3 ms / 55.0 ms–55.1 ms | 20,437–20,438 / 20,427 | 20,312 / 20,312 |
+| 200,000/s, 64 B | prefault on, write-back off | 54.7 ms–54.9 ms / 54.3 ms–54.4 ms | 55.1 ms–55.5 ms / 55.1 ms–73.1 ms | 20,696 / 20,677–20,678 | 20,312 / 20,312 |
+| 200,000/s, 64 B | prefault on, ranged sync (exp) | 427–446 / 369–404 | 1.33 ms–1.35 ms / 1.32 ms–1.34 ms | 21,402 / 21,389–21,390 | 20,312 / 20,312 |
+| 200,000/s, 64 B | 4 MiB window (exp) | 7.78 ms–8.1 ms / 7.36 ms–7.66 ms | 9.88 ms–9.91 ms / 10.1 ms–16.7 ms | 25,476 / 25,455–25,457 | 20,312 / 20,312 |
+| 20,000/s, 1,024 B | default: prefault on, write-back on | 664–674 / 552–1.09 ms | 1.47 ms–1.5 ms / 1.39 ms–1.85 ms | 23,589 / 23,570–23,571 | 20,781 / 20,781 |
+| 20,000/s, 1,024 B | prefault off, write-back on (exp) | 434–435 / 362–371 | 1.34 ms–1.35 ms / 1.17 ms–8.16 ms | 23,300 / 23,287–23,289 | 20,781 / 20,781 |
+| 20,000/s, 1,024 B | `prefault(false)` (write-back off too) | 55.5 ms–55.7 ms / 55.3 ms–55.4 ms | 56.2 ms–56.7 ms / 56.0 ms–56.4 ms | 20,930 / 20,919 | 20,781 / 20,781 |
+| 20,000/s, 1,024 B | prefault on, write-back off | 55.9 ms–56.2 ms / 55.9 ms–56.1 ms | 56.5 ms–56.9 ms / 56.6 ms–57.2 ms | 21,169 / 21,148–21,150 | 20,781 / 20,781 |
+| 20,000/s, 1,024 B | prefault on, ranged sync (exp) | 424–461 / 387–406 | 1.22 ms–1.37 ms / 1.32 ms–1.42 ms | 23,355 / 23,343 | 20,781 / 20,781 |
+| 20,000/s, 1,024 B | 4 MiB window (exp) | 8.06 ms–8.16 ms / 7.78 ms–7.79 ms | 9.74 ms–9.88 ms / 9.9 ms–9.95 ms | 27,429 / 27,405 | 20,781 / 20,781 |
+
+aarch64:
+
+| Rate | Configuration | Checkpoint p50 | Checkpoint max | Device KiB per checkpoint | Appended KiB per checkpoint |
+|---|---|---|---|---|---|
+| idle (1/s), 64 B | default: prefault on, write-back on | 55–57 / 55 | 63–69 / 71–72 | 29–30 / 27 | 0 / 0 |
+| idle (1/s), 64 B | prefault off, write-back on (exp) | 55–56 / 56–57 | 67–72 / 63–68 | 16 / 9–12 | 0 / 0 |
+| idle (1/s), 64 B | `prefault(false)` (write-back off too) | 56–59 / 56–59 | 67–70 / 66–68 | 16 / 9–14 | 0 / 0 |
+| idle (1/s), 64 B | prefault on, ranged sync (exp) | 55 / 57–59 | 67–71 / 63–73 | 16 / 9–12 | 0 / 0 |
+| 20,000/s, 64 B | default: prefault on, write-back on | 708–727 / 648 | 850–983 / 797–828 | 2,410 / 2,394 | 2,031 / 2,031 |
+| 20,000/s, 64 B | prefault off, write-back on (exp) | 511–521 / 455–468 | 668–714 / 546–579 | 2,157–2,158 / 2,149–2,150 | 2,031 / 2,031 |
+| 20,000/s, 64 B | `prefault(false)` (write-back off too) | 1.05 ms / 924–944 | 1.19 ms–1.31 ms / 1.02 ms–1.24 ms | 2,158 / 2,145–2,151 | 2,031 / 2,031 |
+| 20,000/s, 64 B | prefault on, ranged sync (exp) | 507–520 / 467–482 | 611–624 / 579–586 | 2,175–2,176 / 2,166–2,167 | 2,031 / 2,031 |
+| 200,000/s, 64 B | default: prefault on, write-back on | 535–550 / 495–521 | 1.59 ms–1.69 ms / 1.49 ms–1.53 ms | 21,637 / 21,612–21,618 | 20,312 / 20,312 |
+| 200,000/s, 64 B | prefault off, write-back on (exp) | 348–364 / 372–386 | 1.82 ms–1.85 ms / 1.76 ms–1.79 ms | 21,200 / 21,187 | 20,312 / 20,312 |
+| 200,000/s, 64 B | `prefault(false)` (write-back off too) | 55.5 ms–55.6 ms / 56.1 ms–56.3 ms | 56.8 ms–56.9 ms / 57.1 ms–57.4 ms | 20,437 / 20,425–20,426 | 20,312 / 20,312 |
+| 200,000/s, 64 B | prefault on, ranged sync (exp) | 366–372 / 339–346 | 1.4 ms / 1.3 ms–1.34 ms | 21,402 / 21,386–21,390 | 20,312 / 20,312 |
+| 20,000/s, 1,024 B | default: prefault on, write-back on | 602–615 / 505–517 | 1.51 ms / 1.41 ms–1.43 ms | 23,589–23,590 / 23,565–23,570 | 20,781 / 20,781 |
+| 20,000/s, 1,024 B | prefault off, write-back on (exp) | 385–403 / 384–391 | 1.4 ms–1.5 ms / 1.38 ms–1.4 ms | 23,301–23,302 / 23,285–23,289 | 20,781 / 20,781 |
+| 20,000/s, 1,024 B | `prefault(false)` (write-back off too) | 56.9 ms / 58.6 ms | 57.8 ms–57.9 ms / 59.9 ms | 20,930–20,931 / 20,914–20,920 | 20,781 / 20,781 |
+| 20,000/s, 1,024 B | prefault on, ranged sync (exp) | 396–443 / 353–375 | 1.42 ms–1.48 ms / 1.27 ms–1.29 ms | 23,355 / 23,343 | 20,781 / 20,781 |
+
+- **The window's cost against the noise.** On aarch64 every non-idle cell separates: A 0.50–0.73 ms against D 0.35–0.52
+  ms (median per run), runs of one configuration within 0.04 ms of each other. On x86-64 the separation is clear at
+  200,000/s (ext4 0.71–0.99 against 0.38–0.39 ms, xfs 0.53–0.55 against 0.36–0.37 ms) and at 1,024 B on ext4 (0.66–0.67
+  against 0.43 ms); at 20,000/s of 64 B (both filesystems) and at 1,024 B on xfs the two runs of A differ by 0.27–0.54
+  ms, as much as the difference to D, so no figure is given for those cells beyond the call's own time above.
+- At idle the steady checkpoints write the same 8 KiB with or without the advice; A's first checkpoint is the difference
+  in the device total (27–30 against 9–16 KiB per checkpoint). With the window written in every checkpoint, the whole
+  run wrote 241–440 KiB more per checkpoint with A than with D.
+- **Without early write-back** (B, C) a checkpoint writes the whole second of records: 54–59 ms at 21 MB/s, 0.6–1.6 ms
+  at 20,000/s of 64 B. The window adds the same 260–268 KiB, in 0.4–1.0 ms (B, x86-64; B was not run on aarch64).
+- **The ranged sync (E)** wrote what D wrote in the checkpoint's calls and took as long as D. Over the whole run E still
+  wrote 17–206 KiB per checkpoint more than D (most at 200,000/s), outside the checkpoint's calls; where those writes
+  come from was not traced.
+- With early write-back on, the whole run wrote 0.7–2.3 MiB per checkpoint more than without it at 21 MB/s (D against
+  C), with or without prefaulting; that is not about prefaulting and was not investigated.
+
+### Latency during the checkpoints
+
+The zero-copy reader's latency is measured from each record's scheduled send, as `tt-sustained` always does, so a
+blocking checkpoint that stops the writer shows as the reader's maximum. Append is the time of one `append` call;
+writer-thread faults are the minor faults of the writer's thread over the run (`RUSAGE_THREAD`); "late" is sends more
+than 1 µs after their scheduled time. ext4 / xfs.
+
+x86-64:
+
+| Rate | Configuration | Reader p50 | p99 | p99.9 | max | Append p99.9 | Append max | Writer-thread faults | Late sends (%) |
+|---|---|---|---|---|---|---|---|---|---|
+| idle (1/s), 64 B | default: prefault on, write-back on | 4.8–7.8 / 10–11 | 6.0–15 / 21–38 | 6.0–15 / 21–38 | 6.0–15 / 21–38 | 5.3–14 / 19–27 | 5.3–14 / 19–27 | 85–103 / 117–132 | 4.35 / 4.35 |
+| idle (1/s), 64 B | prefault off, write-back on (exp) | 4.8–13 / 9.6–12 | 18–27 / 16–29 | 18–27 / 16–29 | 18–27 / 16–29 | 10–23 / 14–26 | 10–23 / 14–26 | 94–99 / 94–141 | 4.35 / 4.35 |
+| idle (1/s), 64 B | `prefault(false)` (write-back off too) | 4.9–5.1 / 8.7–9.4 | 11–17 / 17–33 | 11–17 / 17–33 | 11–17 / 17–33 | 9.4–11 / 15–19 | 9.4–11 / 15–19 | 131–137 / 94–107 | 4.35 / 4.35 |
+| idle (1/s), 64 B | prefault on, write-back off | 5.0–6.1 / 10–11 | 10–14 / 18–21 | 10–14 / 18–21 | 10–14 / 18–21 | 9.6–10 / 17–19 | 9.6–10 / 17–19 | 90–97 / 94–105 | 4.35 / 4.35 |
+| idle (1/s), 64 B | prefault on, ranged sync (exp) | 5.0–9.9 / 11–12 | 9.5–20 / 28–33 | 9.5–20 / 28–33 | 9.5–20 / 28–33 | 8.6–19 / 20–25 | 8.6–19 / 20–25 | 98–132 / 132–135 | 4.35 / 4.35 |
+| idle (1/s), 64 B | 4 MiB window (exp) | 5.9–7.7 / 9.8–13 | 14–24 / 19–40 | 14–24 / 19–40 | 14–24 / 19–40 | 11–22 / 17–30 | 11–22 / 17–30 | 98–136 / 117–132 | 4.35 / 4.35 |
+| 20,000/s, 64 B | default: prefault on, write-back on | 0.3–0.4 / 0.4 | 0.5–0.6 / 0.7–4.7 | 2.6–86 / 7.8–99 | 943–1.88 ms / 1.24 ms–1.57 ms | 2.1–2.2 / 4.4–5.5 | 7.5–8.8 / 12–23 | 1,307–1,358 / 1,329–1,369 | 0.08–0.15 / 0.09–5.12 |
+| 20,000/s, 64 B | prefault off, write-back on (exp) | 0.3–0.4 / 0.4 | 0.5 / 0.7–0.8 | 27–28 / 31–43 | 548–595 / 673–1.08 ms | 4.9–6.2 / 7.5–9.4 | 39–42 / 50–80 | 1,435–1,481 / 1,440–1,445 | 0.07 / 0.07–0.14 |
+| 20,000/s, 64 B | `prefault(false)` (write-back off too) | 0.3–0.4 / 0.4 | 0.5–0.6 / 0.7–0.8 | 30–33 / 36–111 | 826–1.08 ms / 733–3.74 ms | 5.0–5.9 / 9.8–10 | 43–50 / 43–93 | 1,441–1,442 / 1,440–1,498 | 0.10–0.26 / 0.08–0.16 |
+| 20,000/s, 64 B | prefault on, write-back off | 0.3–0.4 / 0.4 | 0.5–0.6 / 0.7–2.7 | 352–530 / 246–399 | 1.62 ms–2.19 ms / 1.65 ms–1.7 ms | 2.0–2.1 / 4.3–5.1 | 7.2–8.4 / 12–20 | 1,311–1,368 / 1,327–1,329 | 0.14–0.16 / 0.14–0.75 |
+| 20,000/s, 64 B | prefault on, ranged sync (exp) | 0.4 / 0.4 | 0.5–0.6 / 0.7–4.4 | 2.5–3.7 / 7.7–9.9 | 502–682 / 612–912 | 1.4–2.0 / 3.2–3.7 | 7.8–9.2 / 17 | 435–502 / 458–498 | 0.06–0.07 / 0.09–5.05 |
+| 20,000/s, 64 B | 4 MiB window (exp) | 0.4 / 0.4 | 2.3–3.5 / 5.1–5.4 | 1.93 ms–2.19 ms / 2.01 ms–2.08 ms | 3.71 ms–3.75 ms / 3.68 ms–4.34 ms | 3.0–7.0 / 7.6–9.4 | 8.3–15 / 14–20 | 11,294 / 11,294–11,356 | 0.33–0.35 / 0.36–2.10 |
+| 200,000/s, 64 B | default: prefault on, write-back on | 0.3–0.4 / 0.4 | 1.6–1.7 / 1.6–2.2 | 58–244 / 39–46 | 1.57 ms–2.16 ms / 1.53 ms–1.73 ms | 1.8–2.4 / 2.2–2.4 | 178–196 / 241–245 | 6,094–6,105 / 6,107–6,130 | 0.82–0.89 / 0.86–1.17 |
+| 200,000/s, 64 B | prefault off, write-back on (exp) | 0.3–0.4 / 0.4 | 4.6–5.1 / 3.0–6.4 | 37–46 / 37–39 | 1.77 ms–1.8 ms / 1.77 ms–2.24 ms | 6.5–12 / 7.3–7.5 | 174–198 / 220–222 | 14,437–14,523 / 14,466–14,480 | 1.18–1.40 / 1.15–1.63 |
+| 200,000/s, 64 B | `prefault(false)` (write-back off too) | 0.4 / 0.4 | 45.0 ms / 44.5 ms–44.6 ms | 53.5 ms–53.6 ms / 53.1 ms–53.2 ms | 55.2 ms–55.3 ms / 55.0 ms–55.1 ms | 4.8–9.5 / 5.0–5.3 | 182–189 / 217–218 | 10,292–10,408 / 10,375–10,421 | 6.33–6.80 / 6.30–6.45 |
+| 200,000/s, 64 B | prefault on, write-back off | 0.3–0.4 / 0.4 | 45.2 ms–45.3 ms / 45.0 ms–45.9 ms | 53.8 ms / 53.6 ms–54.8 ms | 55.1 ms–55.5 ms / 55.2 ms–73.2 ms | 1.4–1.9 / 2.0–2.1 | 161–207 / 223–240 | 1,371 / 1,370–1,376 | 5.95–5.99 / 6.08–6.38 |
+| 200,000/s, 64 B | prefault on, ranged sync (exp) | 0.3–0.4 / 0.4 | 1.4–1.5 / 1.5–1.8 | 28–32 / 27–29 | 1.35 ms–1.38 ms / 1.36 ms–1.37 ms | 1.6–2.1 / 2.3 | 168–178 / 231–253 | 5,297–5,334 / 5,311–5,313 | 0.70–0.81 / 0.76–1.05 |
+| 200,000/s, 64 B | 4 MiB window (exp) | 0.3–0.4 / 0.4 | 5.6–8.3 / 8.1–8.2 | 7.32 ms–7.47 ms / 7.04 ms–7.63 ms | 9.92 ms / 10.1 ms–16.7 ms | 2.2–3.8 / 2.8–2.9 | 179–187 / 217–226 | 26,371–26,396 / 26,387–26,392 | 1.51–1.67 / 1.65–1.90 |
+| 200,000/s, 64 B | default, no checkpoints | 0.3–0.4 / 0.4 | 1.3–2.4 / 2.5 | 3.9–9.4 / 9.2–10 | 834–982 / 940–953 | 1.5–7.6 / 2.3–6.9 | 155–177 / 231–245 | 4,893–4,949 / 4,920–4,923 | 0.61–0.68 / 0.71–1.18 |
+| 20,000/s, 1,024 B | default: prefault on, write-back on | 0.8–0.9 / 0.9 | 2.9–3.9 / 4.0–4.9 | 38–41 / 44–289 | 1.43 ms–1.46 ms / 1.36 ms–1.82 ms | 6.9–9.3 / 10–11 | 152–189 / 225–234 | 10,808–10,890 / 10,837–10,849 | 0.22–0.25 / 0.25–0.29 |
+| 20,000/s, 1,024 B | prefault off, write-back on (exp) | 0.8–0.9 / 0.9 | 7.6–9.8 / 7.5–9.8 | 36–49 / 40–73 | 1.3 ms–1.32 ms / 1.14 ms–8.14 ms | 30–42 / 34–36 | 160–197 / 217–238 | 14,271–14,334 / 14,320–14,338 | 0.22 / 0.26–0.29 |
+| 20,000/s, 1,024 B | `prefault(false)` (write-back off too) | 0.9 / 0.9 | 45.8 ms / 45.5 ms–45.6 ms | 54.7 ms / 54.4 ms–54.5 ms | 56.2 ms–56.6 ms / 56.1 ms–56.3 ms | 29–33 / 30 | 157–161 / 208–213 | 4,984–4,987 / 4,984 | 5.41–5.42 / 5.39 |
+| 20,000/s, 1,024 B | prefault on, write-back off | 0.9 / 0.9 | 46.2 ms–46.4 ms / 46.2 ms–46.3 ms | 55.0 ms–55.2 ms / 55.0 ms–55.1 ms | 56.5 ms–56.9 ms / 56.6 ms–57.1 ms | 2.8–3.0 / 3.0–3.1 | 203–204 / 223–225 | 1,415–1,426 / 1,462–1,485 | 5.44–5.49 / 5.45–5.47 |
+| 20,000/s, 1,024 B | prefault on, ranged sync (exp) | 0.9 / 0.9 | 3.1–4.0 / 4.2–5.4 | 23–30 / 36–39 | 1.19 ms–1.34 ms / 1.28 ms–1.39 ms | 7.3–8.6 / 10–12 | 184–201 / 246–247 | 10,000–10,048 / 10,036–10,056 | 0.18–0.22 / 0.22–0.23 |
+| 20,000/s, 1,024 B | 4 MiB window (exp) | 0.8–0.9 / 0.8–0.9 | 7.3–11 / 7.5–8.2 | 7.19 ms–7.29 ms / 7 ms–7.09 ms | 9.71 ms–9.84 ms / 9.86 ms–9.9 ms | 7.4–12 / 11 | 179–200 / 216–228 | 30,238–30,271 / 30,256–30,317 | 0.94–0.99 / 0.95 |
+
+aarch64:
+
+| Rate | Configuration | Reader p50 | p99 | p99.9 | max | Append p99.9 | Append max | Writer-thread faults | Late sends (%) |
+|---|---|---|---|---|---|---|---|---|---|
+| idle (1/s), 64 B | default: prefault on, write-back on | 6.6 / 7.7–7.9 | 8.8–18 / 12 | 8.8–18 / 12 | 8.8–18 / 12 | 7.9–11 / 11–12 | 7.9–11 / 11–12 | 94–117 / 119 | 4.35 / 4.35 |
+| idle (1/s), 64 B | prefault off, write-back on (exp) | 6.3–7.2 / 7.2–7.5 | 9.6–12 / 10–11 | 9.6–12 / 10–11 | 9.6–12 / 10–11 | 9.1–11 / 9.9 | 9.1–11 / 9.9 | 127 / 86–129 | 4.35 / 4.35 |
+| idle (1/s), 64 B | `prefault(false)` (write-back off too) | 6.9–7.3 / 7.8–7.9 | 10–12 / 10–11 | 10–12 / 10–11 | 10–12 / 10–11 | 9.5–11 / 9.8–10 | 9.5–11 / 9.8–10 | 127 / 120 | 4.35 / 4.35 |
+| idle (1/s), 64 B | prefault on, ranged sync (exp) | 6.6–7.1 / 7.7–8.4 | 9.8–11 / 11 | 9.8–11 / 11 | 9.8–11 / 11 | 9.1–9.6 / 10–11 | 9.1–9.6 / 10–11 | 128 / 85–119 | 4.35 / 4.35 |
+| 20,000/s, 64 B | default: prefault on, write-back on | 0.3 / 0.3 | 0.4–0.5 / 0.4–2.0 | 4.2–4.3 / 4.3–5.2 | 833–1.02 ms / 755–793 | 3.4–3.5 / 3.7–3.8 | 10–11 / 9.3–10 | 1,308–1,319 / 1,319–1,327 | 0.07 / 0.06–5.06 |
+| 20,000/s, 64 B | prefault off, write-back on (exp) | 0.3 / 0.3 | 0.4 / 0.4–0.9 | 22–23 / 14 | 627–673 / 574–588 | 7.3–7.6 / 4.9–5.0 | 33–39 / 35–37 | 1,441 / 1,481 | 0.05–0.06 / 0.05–0.20 |
+| 20,000/s, 64 B | `prefault(false)` (write-back off too) | 0.3 / 0.3 | 0.4 / 0.4 | 60–78 / 24–28 | 1.15 ms–1.27 ms / 974–1.2 ms | 7.7–7.8 / 4.7–4.8 | 35–40 / 33–34 | 1,447–1,491 / 1,441–1,447 | 0.11 / 0.09–0.10 |
+| 20,000/s, 64 B | prefault on, ranged sync (exp) | 0.3 / 0.3 | 0.5–1.9 / 0.4–0.5 | 3.3 / 3.7–3.9 | 584 / 568–594 | 2.4–2.6 / 2.5–2.7 | 10–15 / 8.8–9.2 | 454 / 454–483 | 0.05–0.25 / 0.05 |
+| 200,000/s, 64 B | default: prefault on, write-back on | 0.3 / 0.3 | 0.5–1.7 / 0.5–0.8 | 17–19 / 12 | 1.68 ms–1.79 ms / 1.57 ms–1.62 ms | 2.1 / 2.0–2.1 | 189–199 / 186–192 | 6,513–6,527 / 6,512–6,532 | 0.10–1.04 / 0.24–0.61 |
+| 200,000/s, 64 B | prefault off, write-back on (exp) | 0.3 / 0.3 | 1.6–2.0 / 0.5–0.8 | 23–25 / 20 | 1.91 ms–1.94 ms / 1.85 ms–1.88 ms | 7.5–7.6 / 4.4–4.5 | 185–191 / 193–207 | 14,832–14,853 / 14,874–14,904 | 0.35–0.87 / 0.28–0.32 |
+| 200,000/s, 64 B | `prefault(false)` (write-back off too) | 0.3 / 0.3 | 46.2 ms–46.3 ms / 46.8 ms–46.9 ms | 54.7 ms–54.8 ms / 55.3 ms–55.5 ms | 56.8 ms–56.9 ms / 57.1 ms–57.4 ms | 4.4–4.6 / 3.6–3.9 | 182–189 / 181–189 | 10,407–10,430 / 10,407–10,419 | 5.87–5.90 / 6.08–6.74 |
+| 200,000/s, 64 B | prefault on, ranged sync (exp) | 0.3 / 0.3 | 0.5–1.2 / 0.4–0.5 | 4.4–4.7 / 3.8–4.2 | 1.48 ms–1.49 ms / 1.39 ms–1.42 ms | 2.1 / 2.0 | 193–201 / 201–202 | 5,719 / 5,718–5,730 | 0.09–0.50 / 0.08–0.10 |
+| 200,000/s, 64 B | default, no checkpoints | 0.3 / 0.3 | 0.5–1.6 / 1.2–1.8 | 2.6–2.9 / 2.8–3.2 | 1.03 ms–1.04 ms / 957–973 | 2.2–2.8 / 2.1–2.4 | 187–189 / 192–201 | 5,293–5,309 / 5,319–5,327 | 0.25 / 0.52–0.53 |
+| 20,000/s, 1,024 B | default: prefault on, write-back on | 0.6 / 0.6 | 2.3–2.4 / 2.2–2.3 | 21 / 12–14 | 1.47 ms / 1.37 ms–1.39 ms | 6.7 / 5.7–6.1 | 191–192 / 193–196 | 11,487–11,495 / 11,496–11,503 | 0.08 / 0.06–0.07 |
+| 20,000/s, 1,024 B | prefault off, write-back on (exp) | 0.6 / 0.6 | 5.9–7.1 / 5.2 | 27–28 / 18–20 | 1.36 ms–1.47 ms / 1.35 ms–1.37 ms | 23–24 / 14–15 | 183–190 / 182 | 14,931–14,935 / 14,981–14,985 | 0.07–1.72 / 0.05 |
+| 20,000/s, 1,024 B | `prefault(false)` (write-back off too) | 0.6 / 0.6 | 47.0 ms / 48.7 ms | 55.8 ms–55.9 ms / 57.6 ms–57.7 ms | 57.7 ms–57.9 ms / 59.8 ms–59.9 ms | 23 / 12–13 | 188 / 205–206 | 4,970 / 4,984 | 5.50 / 5.66–5.67 |
+| 20,000/s, 1,024 B | prefault on, ranged sync (exp) | 0.6 / 0.6 | 2.3 / 2.2–3.0 | 13–14 / 10.0–12 | 1.47 ms–1.52 ms / 1.24 ms–1.33 ms | 6.7–7.0 / 6.2–6.4 | 185–199 / 192 | 10,676–10,677 / 10,699–10,701 | 0.06 / 0.05–5.04 |
+
+- The reader's maximum follows the checkpoint's longest stop: 0.76–2.2 ms with A, 0.50–1.9 ms with D or E, apart from
+  one run with a checkpoint of 8.1 ms (x86-64 xfs, 1,024 B, D). At 20,000/s a blocking checkpoint of about 0.7 ms delays
+  about 14 records per second, so it reaches p99.9 only in some runs: x86-64 ext4 A had a p99.9 of 2.6 µs in one run and
+  86 µs in the other.
+- **Page faults.** Writing the window back write-protects it, and the helper does not advise it again, so the writer
+  takes those faults itself: A against E, 33–36 more faults per checkpoint on the writer's thread at every rate (for
+  example 6,513–6,527 against 5,718–5,730 at 200,000/s on aarch64, and 4,893–5,309 without checkpoints, G). At 20,000/s
+  of 64 B, where a checkpoint comes every 2 MB, the default writer took 1,307–1,358 faults against 1,435–1,491 with
+  prefaulting off and 435–502 with the ranged sync: those checkpoints undo most of what prefaulting saves there. The
+  append itself stays short: append p99.9 at 64 B was 1.8–5.5 µs with A, 4.4–12 µs with D and 1.4–3.7 µs with E; at
+  1,024 B 5.7–11, 14–42 and 6.2–12 µs.
+- A 4 MiB window (F, x86-64) made every checkpoint 2.7–8.2 ms (median) and the reader's p99.9 1.9–7.6 ms, and the writer
+  took 11,294–30,317 faults.
+
+### What these figures do not show
+
+- **Background checkpoints** (`request_checkpoint`) were not run. The same `fdatasync` runs there on the checkpoint
+  thread, so the window's time would move from the writer's stop to the time until the checkpoint is durable; not
+  measured.
+- **A device with a volatile write cache.** This SSD takes no cache flushes; on a drive that does, each extra journal
+  commit also waits for a flush. Bare metal, other filesystems and other kernels were not run; macOS not at all.
+- Runs of 20 seconds, two untraced per cell; the per-call figures come from one traced run per cell.
+- Where E's extra bytes outside the checkpoint come from (above), and why the x86-64 checkpoints vary so much from run
+  to run at 20,000/s.
+
+### A cheaper sync, measured and not built
+
+On Linux `msync(MS_SYNC)` is `vfs_fsync_range` over the range with `datasync` set: ext4 and xfs write and wait for the
+range's dirty pages, commit the metadata needed to read it, and flush the device cache, so the whole-file `fdatasync`
+that follows writes nothing for the records, only what lies outside the range: the prefaulted window. Syncing the active
+segment with its ranged `msync` alone (configuration E: neither the per-segment `fdatasync` nor the barrier `fdatasync`
+of that segment) wrote 256 KiB less per checkpoint, brought the checkpoint back to the time it takes without the advice
+(median per run: aarch64 0.34–0.52 against 0.50–0.73 ms; x86-64 0.37–0.75 against 0.53–1.2 ms), removed the 33–36 faults
+per checkpoint, and kept prefaulting's shorter appends. It changes what a checkpoint promises (C3 and the barrier step
+of `crash-contract.md`), so it needs a decision and review of its own before it is built; on a drive with a volatile
+write cache it would also have to be shown to flush as the barrier does. The barrier `fdatasync` itself costs almost
+nothing (0.7–1.3 µs median).
+
+## 2026-11-26, the writer's remaining page faults with prefaulting on (Google Cloud VMs, Linux)
+
+The owner's question after the comparison's notes on Chronicle Queue's `microTouch()` (`compare/README.md` → "No
+Chronicle pretoucher"): can tickertape's own prefaulting be made better? This measures which page faults the writer's
+thread still takes with the defaults, where they come from, how much latency they explain, and what each alternative
+does to them. Issue #60; the decision record is ADR [0058](decisions/0058-prefault-residual-faults.md) (proposed).
+**Cloud virtual machines with local NVMe SSD, not bare metal**; Linux only. The raw output (results, traces, scripts) is
+kept outside the repository.
+
+**Answer.** With the helper on, the writer's thread took 8.3–10.0 page faults per MiB written on x86-64 (12.3–18.6 on
+aarch64) at 64 B × 1,000,000/s and at 1,024 B × 100,000/s, fewer at higher rates (9.6–23 with prefaulting off). Almost
+none of them were pages the helper had not reached: they were pages it had made writable that a **write-back had made
+read-only again**. Early write-back writes back whole page-cache folios (128 KiB here), including the one the writer is
+filling: 89–95 % of the faults at the lower rates. Checkpoints, which also write back the 256 KiB window (PR
+#102), caused most of the rest, and the first pages of each new segment 1–2 %. They cost 1–3 µs each, but enough take
+20–100 µs to set the writer's p99.9: with early write-back stopped at the 128 KiB boundary below the writer, the p99.9
+fell from 15–34 to 2.7–3.2 µs on aarch64 (64 B and 1,024 B, ext4 and xfs) and from 26 to 4.5–7.5 µs on x86-64 at 1,024 B
+× 100,000/s, with p99.99, maxima, the reader and the checkpoint's durable time unchanged or lower. The tail beyond that
+is rolls and checkpoints. A touch on the writer's thread, the way `microTouch()` does it, changed nothing: while the
+writer waits it either finds nothing to do or waits as long as the fault would. A larger window, re-touching after
+write-back and early write-back further behind made things worse or no better. The ranged sync of the active segment (PR
+#102's experiment) saves the checkpoint's 256 KiB write; on its own it moved the writer's latency little. The same
+rewrite of the writer's folio is the 7 % of extra device bytes PR #105 found at steady-90 on aarch64: with the boundary
+the device wrote 0.3 % more than appended instead of 8.6 %, and the 140 ms stalls there were gone, with checkpoints
+durable after 1 ms. ADR 0058 proposes the boundary and the ranged sync, both off by default until the measurements it
+lists.
+
+### Environment and commands
+
+| Machine | CPU, vCPUs, memory | Zone | Time (UTC) | Used for |
+|---|---|---|---|---|
+| `c4-standard-8-lssd` | Intel Xeon 6985P-C, 8 (4 cores), 31.5 GB | us-east1-b | 09:26–11:41 | x86-64: everything |
+| `c4a-standard-8-lssd` | Google Axion (Neoverse-V2), 8, 31 GB | us-east1-b | 11:41–13:12 | aarch64 |
+| `c4a-standard-8-lssd` (a second VM) | the same | us-east1-b | 13:14–13:45 | aarch64: the extra bytes at steady-90 |
+| `c4-standard-8-lssd` (a second VM) | the same as the first | us-east1-b | 13:46–14:04 | x86-64: the extra bytes at steady-90 |
+
+Ubuntu 24.04, kernel 7.0.0-1017-gcp, rustc 1.100.0, bpftrace 0.20.2, 4 KiB pages, transparent huge pages `madvise`. One
+local NVMe SSD (375 GB), formatted for each filesystem in turn: ext4 (`mkfs.ext4 -E
+lazy_itable_init=0,lazy_journal_init=0`, 1 GiB journal), then xfs with defaults, both mounted `noatime`; scheduler
+`none`; `write_cache` "write through" on every disk of both VMs. Write-back sysctls at their defaults. Results on the
+boot disk.
+
+Source: `main` at `42b2307e` plus the experiment switches of this branch (`tt-faults`, `writer-faults.bt`, and library
+switches compiled only with `--cfg tickertape_pf_exp` or `--cfg tickertape_pf_touch_append`), sent to the VMs as a
+source archive; the aarch64 VM and the x86-64 supplement had the two switches added last (`TT_PF_WB_ALIGN_KIB`,
+`TT_PF_RANGED`). The default configuration ran a build without either `--cfg` (there the switches are not compiled).
+Binaries' sha256 (x86-64): `tt-faults` `79f769e9…` (default), `559b4974…` (switches), `6cfe3337…` (switches, with the
+last two), `f80156ad…` (touch in `append`); aarch64: `e4e36bca…` (default), `3c83f66b…` (switches, all of them),
+`7a309a14…` (touch in `append`).
+
+```sh
+[env TT_PF_…] tt-faults --dir … --rate <rate> --payload <64|1024> --seconds 20 --warmup-seconds 3 \
+  --checkpoint-ms 1000 --writer-cpu <w> --reader-cpu <r> --helper-cpus <h> --log appends.txt \
+  [--no-prefault | --no-early-writeback | --spare-segment | --touch idle]
+```
+
+- **The tool.** `tt-faults` (new, `benches/src/bin/tt-faults.rs`) appends on its main thread at a fixed rate, scheduled
+  on the wall clock as `tt-latency` does; an append's latency runs from its scheduled send to `Writer::append`
+  returning, so a stall also counts in the appends it delays. It reads the thread's minor and major fault counts
+  (`getrusage(RUSAGE_THREAD)`) before the wait and after the append (outside the timed part unless the append is late),
+  requests a background checkpoint every second, runs a zero-copy reader that busy-polls on a CPU of its own and
+  measures the visible latency, and logs every append that faulted or took 20 µs or more, with its offset in the
+  segment. "Late sends" are sends that started more than 1 µs after their time.
+- **Cells.** 64 B at 1,000,000 records/s (about 100 MB/s with headers); 1,024 B at 100,000 (the README's latency rate),
+  170,000 (half of these machine types' probe, the steady-50 rate of "roll and journal stalls" above) and 300,000/s
+  (about 90 % of it, near what the device sustains). 128 MiB segments: 13–45 rolls per run.
+- **Configurations.** The default (prefault on, early write-back on, no spare), twice per round as the noise floor
+  ("default" in the tables pools both). `prefault(false)`; `early_writeback(false)`; `spare_segment(true)`. Switches
+  (`--cfg tickertape_pf_exp`): `TT_PF_WINDOW_KIB` (window of 1, 4 or 16 MiB); `TT_PF_RETOUCH` (re-touch: at every
+  wake-up the helper prefaults again from the writer's page, so pages written back ahead of the writer are made writable
+  again); `TT_PF_WB_LAG_KIB` and `TT_PF_WB_ALIGN_KIB` (early write-back stops that far behind the writer, rounded down
+  to that alignment: "2–4 MiB behind" is 2,048 KiB rounded to 2 MiB, "to the 128 KiB boundary" is 1 KiB rounded to 128
+  KiB, so that it never reaches the 128 KiB block the writer is in); `TT_PF_RANGED` (ranged sync: the active segment is
+  synced by its ranged `msync` alone, without the whole-file `fdatasync` and the barrier, as PR #102's `TT_EXP_RANGED`);
+  `Writer::exp_touch` called once per wait (writer touch while waiting: an atomic `fetch_or(0)` on the commit word slot
+  at the write position and on the first word of the next page, so what a `Writer::idle()` could do). `--cfg
+  tickertape_pf_touch_append`: the writer, when it enters a new page, touches the next one at the end of `append`
+  (writer touch in `append`, as `microTouch()` but without waiting).
+- **Rounds.** Configurations and cells rotated from round to round; every journal deleted and `sync`ed before the next
+  run. x86-64: three rounds on ext4 and two on xfs, the last of each traced; the latency tables use the untraced rounds
+  only. A supplement on x86-64 ext4 ran six configurations three times, untraced. aarch64: three rounds on ext4 and two
+  on xfs (five configurations), the last of each traced.
+- **Tracing.** `benches/diagnostics/writer-faults.bt` (new) prints every fault of the writer's thread with its time and
+  duration, whether `filemap_fault` ran (the page was not in the page tables: "not present") or not (the page was mapped
+  but not writable: "write-protected"), whether it started a journal handle (`jbd2__journal_start`) or an xfs
+  transaction, and the start and duration of every `msync`, `fdatasync` and `sync_file_range` of the checkpoint and
+  early write-back threads; at the end, the size of the folios the run added to the page cache and who cleaned folios
+  for write-back. A write-protected fault counts as "after a checkpoint" when a checkpoint's `msync` or `fdatasync` had
+  started before it and ended less than 5 ms before it, otherwise "after early write-back". Tracing raised the default's
+  p99.9 by 1.2–2.6 times (157 against 60–100 µs at 64 B, 31–38 against 26–27 at 1,024 B × 100,000/s): the traced runs
+  are used for counts and kinds, not for latencies.
+- One untraced x86-64 run (ext4, round 1, 1,024 B × 100,000/s, prefault off) had a test trace attached for 8 s; its
+  p99.9 is the higher of the two in its row.
+
+### Where the writer's faults are
+
+The traced default runs (two per cell): faults of the writer's thread on the segment mappings per MiB written, by kind,
+with the median and the 99th percentile of their duration in µs; then the appends of 20 µs or more and of 100 µs or
+more, by the first writer fault of their episode (the run of appends one stall delays back to back). "New segment"
+episodes are rolls: their first fault is in the first 256 KiB of a segment, and they include the roll's own system
+calls.
+
+x86-64, ext4:
+
+| Cell | Run | All | After early write-back | After a checkpoint | New segment (not present) | Other not present | All, prefault off (untraced) |
+|---|---|---|---|---|---|---|---|
+| 64 B, 1,000,000/s | 1 | 7.97 | 7.14 (1.1 / 39.5) | 0.74 (1.1 / 76.0) | 0.09 (2.7 / 82.1) | 0.00 (45.8 / 50.5) | 22.1–23.1 |
+| 64 B, 1,000,000/s | 2 | 8.11 | 7.21 (1.1 / 38.9) | 0.79 (1.0 / 84.3) | 0.09 (2.5 / 82.6) | 0.01 (19.7 / 90.1) | 22.1–23.1 |
+| 1,024 B, 100,000/s | 1 | 9.28 | 8.35 (1.1 / 31.4) | 0.77 (1.1 / 86.4) | 0.15 (2.4 / 73.8) | 0.00 (44.8 / 3.00 ms) | 9.7 |
+| 1,024 B, 100,000/s | 2 | 9.33 | 8.40 (1.1 / 31.8) | 0.77 (1.1 / 102.4) | 0.16 (2.4 / 74.8) | 0.00 (31.5 / 46.8) | 9.7 |
+| 1,024 B, 170,000/s | 1 | 1.88 | 1.13 (1.3 / 18.4) | 0.50 (1.0 / 99.5) | 0.25 (2.2 / 74.4) | 0.00 (32.3 / 140.6) | 9.7 |
+| 1,024 B, 170,000/s | 2 | 1.92 | 1.17 (1.3 / 17.3) | 0.50 (1.1 / 90.8) | 0.25 (2.3 / 77.7) | 0.00 (15.2 / 27.7) | 9.7 |
+| 1,024 B, 300,000/s | 1 | 0.55 | 0.01 (0.8 / 5.0) | 0.27 (1.1 / 97.0) | 0.27 (2.3 / 77.6) | 0.01 (18.0 / 178.7) | 9.6 |
+| 1,024 B, 300,000/s | 2 | 0.57 | 0.01 (0.8 / 2.6) | 0.28 (1.1 / 94.4) | 0.27 (2.3 / 78.6) | 0.02 (18.6 / 50.1) | 9.6 |
+
+Appends of at least 20 µs / at least 100 µs, by the first writer fault of their episode:
+
+| Cell | Run | After early write-back | After a checkpoint | New segment | Other not present | No writer fault |
+|---|---|---|---|---|---|---|
+| 64 B, 1,000,000/s | 1 | 73,744 / 4,956 | 17,543 / 9,276 | 16,920 / 14,306 | 702 / 0 | 5,980 / 3,559 |
+| 64 B, 1,000,000/s | 2 | 80,571 / 9,882 | 18,235 / 9,454 | 16,018 / 13,509 | 1,466 / 30 | 14,487 / 2,808 |
+| 1,024 B, 100,000/s | 1 | 2,213 / 28 | 513 / 103 | 575 / 377 | 859 / 800 | 3 / 0 |
+| 1,024 B, 100,000/s | 2 | 2,193 / 33 | 808 / 380 | 565 / 374 | 17 / 0 | 20 / 0 |
+| 1,024 B, 170,000/s | 1 | 232 / 0 | 1,573 / 516 | 2,618 / 1,482 | 39 / 11 | 35 / 0 |
+| 1,024 B, 170,000/s | 2 | 151 / 0 | 1,387 / 413 | 2,517 / 1,381 | 33 / 0 | 18 / 0 |
+| 1,024 B, 300,000/s | 1 | 0 / 0 | 4,217 / 1,985 | 10,903 / 9,417 | 353 / 61 | 195 / 0 |
+| 1,024 B, 300,000/s | 2 | 0 / 0 | 4,450 / 1,985 | 10,636 / 9,136 | 464 / 0 | 485 / 0 |
+
+x86-64, xfs:
+
+| Cell | Run | All | After early write-back | After a checkpoint | New segment (not present) | Other not present | All, prefault off (untraced) |
+|---|---|---|---|---|---|---|---|
+| 64 B, 1,000,000/s | 1 | 8.27 | 7.49 (0.8 / 36.7) | 0.70 (0.8 / 72.6) | 0.08 (2.2 / 86.3) | 0.00 (51.4 / 54.7) | 22.9–23.2 |
+| 64 B, 1,000,000/s | 2 | 8.27 | 7.48 (0.8 / 36.7) | 0.71 (0.8 / 72.0) | 0.08 (2.2 / 85.8) | 0.00 (49.5 / 52.5) | 22.9–23.2 |
+| 1,024 B, 100,000/s | 1 | 9.71 | 8.81 (0.9 / 31.0) | 0.74 (0.8 / 74.5) | 0.15 (2.2 / 82.0) | 0.00 (33.5 / 33.5) | 9.7 |
+| 1,024 B, 100,000/s | 2 | 9.53 | 8.65 (0.9 / 31.3) | 0.73 (0.8 / 68.0) | 0.15 (2.1 / 83.9) | 0.00 (27.9 / 47.8) | 9.7 |
+| 1,024 B, 170,000/s | 1 | 2.22 | 1.49 (1.1 / 14.0) | 0.49 (0.8 / 88.0) | 0.24 (2.1 / 84.9) | 0.00 (16.6 / 16.6) | 9.7 |
+| 1,024 B, 170,000/s | 2 | 2.30 | 1.57 (1.0 / 14.3) | 0.49 (0.8 / 90.5) | 0.24 (2.1 / 79.0) | 0.00 (12.2 / 41.1) | 9.7 |
+| 1,024 B, 300,000/s | 1 | 0.59 | 0.00 (0.9 / 1.2) | 0.26 (0.8 / 87.0) | 0.27 (2.1 / 76.4) | 0.05 (9.4 / 44.6) | 9.6–9.7 |
+| 1,024 B, 300,000/s | 2 | 0.54 | 0.01 (0.8 / 2.0) | 0.26 (0.8 / 91.7) | 0.27 (2.1 / 77.9) | 0.01 (11.8 / 26.6) | 9.6–9.7 |
+
+Appends of at least 20 µs / at least 100 µs, by the first writer fault of their episode:
+
+| Cell | Run | After early write-back | After a checkpoint | New segment | Other not present | No writer fault |
+|---|---|---|---|---|---|---|
+| 64 B, 1,000,000/s | 1 | 58,822 / 2,421 | 14,014 / 6,850 | 16,578 / 14,077 | 558 / 0 | 386 / 0 |
+| 64 B, 1,000,000/s | 2 | 56,659 / 2,472 | 13,150 / 6,155 | 16,859 / 14,336 | 676 / 0 | 777 / 0 |
+| 1,024 B, 100,000/s | 1 | 2,011 / 0 | 505 / 120 | 545 / 351 | 49 / 37 | 9 / 0 |
+| 1,024 B, 100,000/s | 2 | 1,968 / 0 | 547 / 164 | 541 / 348 | 43 / 0 | 11 / 0 |
+| 1,024 B, 170,000/s | 1 | 104 / 0 | 1,231 / 461 | 2,422 / 1,305 | 8 / 0 | 13 / 0 |
+| 1,024 B, 170,000/s | 2 | 104 / 0 | 1,257 / 430 | 2,429 / 1,328 | 27 / 0 | 7 / 0 |
+| 1,024 B, 300,000/s | 1 | 0 / 0 | 3,717 / 1,493 | 9,742 / 8,275 | 620 / 7 | 58 / 0 |
+| 1,024 B, 300,000/s | 2 | 0 / 0 | 3,720 / 1,560 | 9,769 / 8,276 | 77 / 0 | 55 / 0 |
+
+aarch64, ext4 (the same 128 KiB folios; the writer faults on more of the pages of each):
+
+| Cell | Run | All | After early write-back | After a checkpoint | New segment (not present) | Other not present | All, prefault off (untraced) |
+|---|---|---|---|---|---|---|---|
+| 64 B, 1,000,000/s | 1 | 12.36 | 11.57 (2.4 / 24.5) | 0.72 (2.4 / 25.7) | 0.07 (2.7 / 50.2) | 0.00 (33.1 / 34.0) | 22.6–23.1 |
+| 64 B, 1,000,000/s | 2 | 12.31 | 11.52 (3.0 / 25.1) | 0.72 (2.8 / 27.8) | 0.06 (3.1 / 50.0) | 0.00 (31.5 / 70.1) | 22.6–23.1 |
+| 1,024 B, 100,000/s | 1 | 18.00 | 17.10 (2.4 / 20.1) | 0.73 (2.3 / 26.0) | 0.11 (2.4 / 48.6) | 0.06 (20.7 / 29.1) | 9.7 |
+| 1,024 B, 100,000/s | 2 | 18.07 | 17.17 (2.4 / 20.0) | 0.74 (2.4 / 30.1) | 0.11 (2.4 / 42.9) | 0.05 (19.1 / 33.5) | 9.7 |
+| 1,024 B, 170,000/s | 1 | 14.01 | 13.24 (2.5 / 19.6) | 0.54 (2.5 / 29.4) | 0.16 (2.7 / 42.0) | 0.05 (12.6 / 26.5) | 9.7 |
+| 1,024 B, 170,000/s | 2 | 14.16 | 13.38 (2.4 / 19.5) | 0.55 (2.4 / 28.4) | 0.17 (2.2 / 48.1) | 0.06 (11.7 / 28.0) | 9.7 |
+| 1,024 B, 300,000/s | 1 | 6.48 | 5.90 (2.7 / 13.4) | 0.32 (2.6 / 25.4) | 0.17 (2.7 / 46.8) | 0.08 (11.4 / 804.8) | 9.7 |
+| 1,024 B, 300,000/s | 2 | 7.14 | 2.96 (2.5 / 13.1) | 3.88 (2.5 / 13.9) | 0.18 (2.5 / 45.2) | 0.11 (12.0 / 639.6) | 9.7 |
+
+Appends of at least 20 µs / at least 100 µs, by the first writer fault of their episode:
+
+| Cell | Run | After early write-back | After a checkpoint | New segment | Other not present | No writer fault |
+|---|---|---|---|---|---|---|
+| 64 B, 1,000,000/s | 1 | 237,046 / 16,998 | 17,486 / 1,430 | 12,482 / 9,039 | 803 / 0 | 0 / 0 |
+| 64 B, 1,000,000/s | 2 | 443,682 / 25,267 | 34,349 / 8,291 | 13,315 / 9,809 | 3,345 / 0 | 0 / 0 |
+| 1,024 B, 100,000/s | 1 | 2,516 / 17 | 169 / 15 | 507 / 335 | 353 / 0 | 0 / 0 |
+| 1,024 B, 100,000/s | 2 | 2,484 / 18 | 196 / 17 | 491 / 323 | 272 / 0 | 0 / 0 |
+| 1,024 B, 170,000/s | 1 | 7,936 / 46 | 772 / 101 | 2,049 / 1,357 | 832 / 0 | 33 / 0 |
+| 1,024 B, 170,000/s | 2 | 7,470 / 33 | 699 / 108 | 1,770 / 1,143 | 829 / 0 | 15 / 0 |
+| 1,024 B, 300,000/s | 1 | 36,284 / 262 | 5,522 / 3,061 | 7,850 / 6,235 | 11,617 / 5,233 | 1 / 0 |
+| 1,024 B, 300,000/s | 2 | 17,610 / 165 | 24,147 / 2,200 | 7,792 / 6,179 | 11,203 / 4,452 | 0 / 0 |
+
+aarch64, xfs (prefault off was not run on xfs there):
+
+| Cell | Run | All | After early write-back | After a checkpoint | New segment (not present) | Other not present | All, prefault off (untraced) |
+|---|---|---|---|---|---|---|---|
+| 64 B, 1,000,000/s | 1 | 12.38 | 11.61 (2.5 / 25.4) | 0.71 (2.5 / 25.9) | 0.06 (3.0 / 54.1) | 0.00 (28.4 / 40.7) | – |
+| 64 B, 1,000,000/s | 2 | 12.43 | 11.66 (2.1 / 24.3) | 0.70 (2.1 / 28.6) | 0.06 (2.6 / 53.5) | 0.00 (32.6 / 36.5) | – |
+| 1,024 B, 100,000/s | 1 | 18.06 | 17.19 (2.2 / 18.6) | 0.72 (2.2 / 24.3) | 0.10 (2.5 / 51.2) | 0.05 (21.0 / 33.9) | – |
+| 1,024 B, 100,000/s | 2 | 18.22 | 17.35 (2.1 / 18.0) | 0.72 (2.0 / 27.7) | 0.10 (2.2 / 48.9) | 0.05 (19.4 / 29.0) | – |
+| 1,024 B, 170,000/s | 1 | 14.69 | 13.99 (2.1 / 17.6) | 0.49 (2.0 / 25.2) | 0.15 (2.1 / 50.0) | 0.06 (17.8 / 27.5) | – |
+| 1,024 B, 170,000/s | 2 | 14.37 | 13.66 (2.2 / 18.0) | 0.51 (2.1 / 31.7) | 0.15 (2.2 / 48.0) | 0.06 (11.3 / 32.0) | – |
+| 1,024 B, 300,000/s | 1 | 7.85 | 4.40 (2.2 / 13.8) | 3.19 (2.2 / 14.1) | 0.20 (2.0 / 46.9) | 0.07 (7.3 / 23.0) | – |
+| 1,024 B, 300,000/s | 2 | 8.05 | 3.79 (2.1 / 14.1) | 3.99 (2.1 / 13.7) | 0.19 (2.0 / 48.6) | 0.07 (7.4 / 24.3) | – |
+
+Appends of at least 20 µs / at least 100 µs, by the first writer fault of their episode:
+
+| Cell | Run | After early write-back | After a checkpoint | New segment | Other not present | No writer fault |
+|---|---|---|---|---|---|---|
+| 64 B, 1,000,000/s | 1 | 261,130 / 18,714 | 18,593 / 604 | 11,310 / 7,784 | 4,088 / 177 | 0 / 0 |
+| 64 B, 1,000,000/s | 2 | 219,478 / 15,163 | 15,337 / 18 | 11,661 / 8,105 | 2,036 / 0 | 161 / 0 |
+| 1,024 B, 100,000/s | 1 | 2,301 / 19 | 162 / 13 | 455 / 275 | 285 / 0 | 0 / 0 |
+| 1,024 B, 100,000/s | 2 | 1,961 / 21 | 156 / 13 | 424 / 253 | 184 / 0 | 13 / 0 |
+| 1,024 B, 170,000/s | 1 | 6,180 / 79 | 444 / 90 | 1,432 / 839 | 742 / 0 | 0 / 0 |
+| 1,024 B, 170,000/s | 2 | 6,517 / 103 | 662 / 163 | 1,487 / 865 | 660 / 0 | 0 / 0 |
+| 1,024 B, 300,000/s | 1 | 13,337 / 88 | 10,195 / 76 | 6,318 / 4,673 | 1,834 / 0 | 0 / 0 |
+| 1,024 B, 300,000/s | 2 | 11,672 / 91 | 11,156 / 137 | 6,220 / 4,575 | 1,893 / 0 | 0 / 0 |
+
+- **Large folios.** The page cache built the segments almost entirely from 128 KiB folios (order 5: 18,617 of 19,422
+  folios added in a 1,024 B × 100,000/s run), and write-back cleans whole folios. The early write-back thread asks for
+  the pages before the one that holds the writer's position, and so also writes back, and write-protects, the rest of
+  the folio the writer is in, together with the pages the helper has prefaulted in it. The writer then takes a
+  write-protect fault on each page of it that it writes to. In the same run the early write-back thread cleaned 21,464
+  folios and the checkpoint thread 253.
+- **Rate.** On x86-64 at 300,000/s the early write-back faults vanish: by the time a write-back of 1 MiB has been
+  submitted (about 0.6 ms per call there), the writer has left the folio. At the lower rates it has not, and on aarch64
+  it has not at 300,000/s either (3.0–5.9 such faults per MiB).
+- **The helper kept ahead.** Not-present faults outside the first 256 KiB of a segment were 0.00–0.05 per MiB in every
+  cell, also near the device's limit: the window did not run short.
+- **Cost.** One write-protected fault in eight after early write-back started a journal handle (ext4 updating the file's
+  modification time; xfs allocating a transaction for the same); that is where the slow ones wait (issue #60 has the
+  mechanism). At 1,024 B × 100,000/s the early write-back faults began 53–61 % of the appends of 20 µs or more (that
+  p99.9 is 26 µs) and 2–4 % of those of 100 µs or more; the rest are checkpoints and rolls. At 300,000/s, 82 % of the
+  appends of 100 µs or more were in roll episodes. On aarch64 the early write-back faults began 68–90 % of the appends
+  of 20 µs or more at the three lower rates, on both filesystems.
+
+### The alternatives
+
+Untraced runs. µs unless a cell says ms; ranges over the runs; the default's range is the noise floor. Where two runs of
+one configuration differ by more than the difference to the default, the configuration did not change that figure.
+
+x86-64, ext4:
+
+64 B, 1,000,000/s:
+
+| Configuration | Runs | Faults/MiB | p99 | p99.9 | p99.99 | max | Reader p99.9 | Late sends (%) |
+|---|---|---|---|---|---|---|---|---|
+| default | 4 | 8.25–8.43 | 3.33–4.17 | 59.5–100 | 246–332 | 435–685 | 87.6–133 | 1.8–2.1 |
+| `prefault(false)` | 2 | 22.1–22.9 | 2.4–2.7 ms | 3.7–4.0 ms | 4.6 ms | 4.7 ms | 3.7–4.0 ms | 10.5 |
+| `early_writeback(false)` | 2 | 0.21–0.22 | 1.2 ms | 2.0–2.8 ms | 2.7–3.4 ms | 2.8–3.5 ms | 2.3–2.8 ms | 4.9 |
+| re-touch | 2 | 1.36–1.38 | 3.81–3.92 | 98.0–130 | 289–626 | 714 µs to 1.6 ms | 124–187 | 2.0–2.1 |
+| 4 MiB window | 2 | 19.6–19.8 | 28.7–40.5 | 622–906 | 1.3–1.6 ms | 1.7–1.9 ms | 710–933 | 2.7–2.9 |
+| writer touch while waiting | 2 | 8.31–8.44 | 3.38–4.92 | 78.4 µs to 1.7 ms | 255 µs to 5.5 ms | 367 µs to 5.9 ms | 111 µs to 1.7 ms | 2.0–2.4 |
+| write-back 2–4 MiB behind | 2 | 1.34–1.36 | 3.24–3.25 | 485–514 | 970 µs to 1.1 ms | 1.2–1.6 ms | 1.0 ms | 1.8 |
+| `spare_segment(true)` | 2 | 8.17–8.30 | 3.10–3.89 | 41.1–47.5 | 170–186 | 354–473 | 94.3–112 | 1.9–2.1 |
+
+1,024 B, 100,000/s:
+
+| Configuration | Runs | Faults/MiB | p99 | p99.9 | p99.99 | max | Reader p99.9 | Late sends (%) |
+|---|---|---|---|---|---|---|---|---|
+| default | 4 | 9.31–9.59 | 2.18–4.52 | 25.7–27.4 | 122–156 | 260–326 | 40.1–51.8 | 0.7–1.7 |
+| `prefault(false)` | 2 | 9.75 | 24.0–25.6 | 140–237 | 921–999 | 1.4–1.5 ms | 321–412 | 2.8–3.4 |
+| `early_writeback(false)` | 2 | 0.09–0.10 | 4.21–5.60 | 6.54–8.15 | 87.2–89.5 | 211–220 | 1.2 ms | 1.5–1.6 |
+| re-touch | 2 | 3.13–3.17 | 3.27–6.25 | 28.4–29.7 | 133–161 | 281–984 | 50.3–74.0 | 0.8–1.8 |
+| 4 MiB window | 2 | 20.4 | 3.98–6.58 | 368–397 | 1.1–1.3 ms | 1.4–1.8 ms | 537–590 | 1.1 |
+| writer touch while waiting | 2 | 9.32–9.39 | 2.36–3.38 | 25.4–26.7 | 130–168 | 317–324 | 38.6–49.1 | 0.8–1.7 |
+| write-back 2–4 MiB behind | 2 | 1.31 | 2.15–2.43 | 82.4–84.9 | 783–930 | 1.2–1.3 ms | 774 µs to 1.1 ms | 0.6–1.6 |
+| `spare_segment(true)` | 2 | 8.95–9.29 | 2.33–5.75 | 23.7–25.8 | 86.9 µs to 1.6 ms | 277 µs to 3.3 ms | 40.8–75.6 | 1.6–1.7 |
+
+1,024 B, 170,000/s:
+
+| Configuration | Runs | Faults/MiB | p99 | p99.9 | p99.99 | max | Reader p99.9 | Late sends (%) |
+|---|---|---|---|---|---|---|---|---|
+| default | 4 | 2.02–2.19 | 2.21–2.48 | 16.6–47.3 | 151 µs to 1.6 ms | 228 µs to 3.3 ms | 197–416 | 1.2–1.5 |
+| `prefault(false)` | 2 | 9.67–9.68 | 26.1–26.5 | 429–455 | 1.1–1.7 ms | 1.5–3.2 ms | 697–718 | 5.2–5.5 |
+| `early_writeback(false)` | 2 | 0.16–0.17 | 2.31 | 26.5–37.4 | 152–922 | 493 µs to 2.5 ms | 167–411 | 1.5 |
+| re-touch | 2 | 1.24–1.25 | 2.42–2.49 | 16.3–18.1 | 141–157 | 428–560 | 186–226 | 1.5 |
+| 1 MiB window | 2 | 3.23–3.25 | 2.09–2.13 | 56.5–63.7 | 321–337 | 453–474 | 267–282 | 1.1–1.2 |
+| 4 MiB window | 2 | 9.79–10.2 | 2.73–5.42 | 605–635 | 1.4–1.5 ms | 1.9–2.0 ms | 739 | 1.9–2.1 |
+| 16 MiB window | 2 | 34.0–35.3 | 13.8–43.8 | 695–858 | 1.3–1.6 ms | 1.7–2.1 ms | 786–890 | 2.2–2.4 |
+| writer touch while waiting | 2 | 2.08–2.11 | 2.44–2.46 | 14.9–21.1 | 150 µs to 1.0 ms | 236 µs to 2.7 ms | 201–339 | 1.5 |
+| writer touch in `append` | 2 | 2.07–2.14 | 2.17–2.49 | 14.8–30.7 | 151–921 | 246 µs to 2.3 ms | 209–372 | 1.4–1.5 |
+| write-back 2–4 MiB behind | 2 | 0.77–0.78 | 2.14–2.27 | 32.5–37.3 | 481 µs to 2.4 ms | 1.3–3.4 ms | 1.4–1.5 ms | 1.1–1.5 |
+| `spare_segment(true)` | 2 | 1.88 | 2.38–2.63 | 9.37–509 | 93.7 µs to 8.8 ms | 188 µs to 11 ms | 124–846 | 1.5 |
+
+1,024 B, 300,000/s:
+
+| Configuration | Runs | Faults/MiB | p99 | p99.9 | p99.99 | max | Reader p99.9 | Late sends (%) |
+|---|---|---|---|---|---|---|---|---|
+| default | 4 | 0.58–0.62 | 2.31–3.63 | 86.4–172 | 176 µs to 5.3 ms | 240 µs to 6.7 ms | 509–785 | 2.0–2.6 |
+| `prefault(false)` | 2 | 9.60–9.64 | 43.8–44.6 | 530–590 | 977 µs to 1.1 ms | 1.3 ms | 765–778 | 11.9–12.3 |
+| `early_writeback(false)` | 2 | 0.84–0.85 | 22.8–24.4 | 91.5–118 | 499–886 | 910 µs to 1.9 ms | 537–542 | 3.3–3.6 |
+| re-touch | 2 | 0.37–0.38 | 2.53–2.81 | 88.4–128 | 185–233 | 281–282 | 554–601 | 2.2–2.3 |
+| 4 MiB window | 2 | 5.81–5.98 | 4.12–4.28 | 440–560 | 811 µs to 1.2 ms | 929 µs to 2.1 ms | 701–723 | 2.5–2.6 |
+| writer touch while waiting | 2 | 0.61–0.62 | 2.73–3.94 | 136 µs to 3.0 ms | 225 µs to 7.9 ms | 276 µs to 9.0 ms | 598 µs to 3.0 ms | 2.5 |
+| write-back 2–4 MiB behind | 2 | 0.96–0.97 | 30.8–30.9 | 100–104 | 447–478 | 693 µs to 1.2 ms | 1.8–1.9 ms | 3.8 |
+| `spare_segment(true)` | 2 | 0.30–0.32 | 2.22–2.58 | 8.13–9.21 | 116–135 | 197–198 | 442–450 | 1.9–2.3 |
+
+x86-64, xfs (one untraced run per configuration, two of the default):
+
+64 B, 1,000,000/s:
+
+| Configuration | Runs | Faults/MiB | p99 | p99.9 | p99.99 | max | Reader p99.9 | Late sends (%) |
+|---|---|---|---|---|---|---|---|---|
+| default | 2 | 8.43–8.45 | 2.77–3.17 | 72.6–73.5 | 236–254 | 374–472 | 107–109 | 1.7–1.8 |
+| `prefault(false)` | 1 | 22.9 | 3.3 ms | 5.2 ms | 5.9 ms | 6.2 ms | 5.2 ms | 9.2 |
+| `early_writeback(false)` | 1 | 0.19 | 2.2 ms | 4.2 ms | 5.2 ms | 5.4 ms | 4.2 ms | 5.2 |
+| re-touch | 1 | 1.19 | 2.60 | 73.8 | 236 | 388 | 107 | 1.7 |
+| 4 MiB window | 1 | 19.8 | 6.10 | 531 | 1.5 ms | 2.2 ms | 599 | 2.3 |
+| writer touch while waiting | 1 | 8.44 | 3.24 | 70.5 | 275 | 699 | 101 | 1.9 |
+| write-back 2–4 MiB behind | 1 | 1.39 | 1.89 | 273 | 608 | 1.1 ms | 790 | 1.5 |
+| `spare_segment(true)` | 1 | 8.34 | 2.63 | 38.8 | 146 | 367 | 87.4 | 1.7 |
+
+1,024 B, 100,000/s:
+
+| Configuration | Runs | Faults/MiB | p99 | p99.9 | p99.99 | max | Reader p99.9 | Late sends (%) |
+|---|---|---|---|---|---|---|---|---|
+| default | 2 | 9.89–9.97 | 2.33–4.22 | 21.6–22.2 | 127–128 | 328–333 | 35.1–35.4 | 0.6–1.6 |
+| `prefault(false)` | 1 | 9.75 | 14.6 | 30.7 | 92.7 | 364 | 42.1 | 2.0 |
+| `early_writeback(false)` | 1 | 0.09 | 2.02 | 3.92 | 85.4 | 198 | 9.74 | 0.5 |
+| re-touch | 1 | 2.86 | 2.29 | 24.8 | 137 | 256 | 44.3 | 0.7 |
+| 4 MiB window | 1 | 20.9 | 3.92 | 235 | 1.6 ms | 2.6 ms | 410 | 1.9 |
+| writer touch while waiting | 1 | 9.79 | 2.25 | 22.3 | 130 | 309 | 36.4 | 0.7 |
+| write-back 2–4 MiB behind | 1 | 1.32 | 5.08 | 7.43 | 133 | 218 | 882 | 1.5 |
+| `spare_segment(true)` | 1 | 9.76 | 2.36 | 19.7 | 75.5 | 317 | 33.3 | 1.2 |
+
+1,024 B, 170,000/s:
+
+| Configuration | Runs | Faults/MiB | p99 | p99.9 | p99.99 | max | Reader p99.9 | Late sends (%) |
+|---|---|---|---|---|---|---|---|---|
+| default | 2 | 2.30–2.36 | 2.19–2.47 | 12.6–13.4 | 153–165 | 248–282 | 190–227 | 1.4–1.5 |
+| `prefault(false)` | 1 | 9.68 | 19.8 | 38.0 | 137 | 362 | 405 | 4.2 |
+| `early_writeback(false)` | 1 | 0.14 | 2.30 | 15.9 | 208 | 1.0 ms | 243 | 1.4 |
+| re-touch | 1 | 1.29 | 2.37 | 12.5 | 160 | 421 | 211 | 1.5 |
+| 1 MiB window | 1 | 3.53 | 2.59 | 58.3 | 354 | 491 | 304 | 1.6 |
+| 4 MiB window | 1 | 10.1 | 4.66 | 265 | 633 | 873 | 436 | 1.8 |
+| 16 MiB window | 1 | 35.3 | 4.63 | 337 | 1.6 ms | 2.7 ms | 505 | 2.1 |
+| writer touch while waiting | 1 | 2.34 | 2.47 | 11.9 | 148 | 219 | 184 | 1.5 |
+| writer touch in `append` | 1 | 2.33 | 2.47 | 11.7 | 146 | 213 | 193 | 1.5 |
+| write-back 2–4 MiB behind | 1 | 0.75 | 2.39 | 12.5 | 157 | 289 | 1.4 ms | 1.4 |
+| `spare_segment(true)` | 1 | 2.04 | 2.38 | 7.79 | 146 | 1.6 ms | 207 | 1.4 |
+
+1,024 B, 300,000/s:
+
+| Configuration | Runs | Faults/MiB | p99 | p99.9 | p99.99 | max | Reader p99.9 | Late sends (%) |
+|---|---|---|---|---|---|---|---|---|
+| default | 2 | 0.57–0.59 | 2.62–2.85 | 79.2–86.3 | 179–183 | 236–268 | 523–538 | 2.0–2.3 |
+| `prefault(false)` | 1 | 9.62 | 30.0 | 134 | 596 | 765 | 505 | 9.0 |
+| `early_writeback(false)` | 1 | 0.93 | 8.72 | 57.4 | 780 | 1.0 ms | 451 | 2.9 |
+| re-touch | 1 | 0.37 | 2.59 | 79.1 | 173 | 267 | 503 | 2.1 |
+| 4 MiB window | 1 | 5.93 | 3.33 | 525 | 892 | 1.2 ms | 693 | 2.2 |
+| writer touch while waiting | 1 | 0.58 | 2.43 | 78.6 | 170 | 219 | 500 | 1.9 |
+| write-back 2–4 MiB behind | 1 | 0.87 | 14.1 | 76.4 | 209 | 754 | 1.7 ms | 2.9 |
+| `spare_segment(true)` | 1 | 0.30 | 2.27 | 8.62 | 135 | 905 | 498 | 1.9 |
+
+aarch64, ext4:
+
+64 B, 1,000,000/s:
+
+| Configuration | Runs | Faults/MiB | p99 | p99.9 | p99.99 | max | Reader p99.9 | Late sends (%) |
+|---|---|---|---|---|---|---|---|---|
+| default | 4 | 12.5–12.6 | 1.65–1.84 | 32.5–34.0 | 175–182 | 249–285 | 38.6–41.1 | 1.2–1.4 |
+| `prefault(false)` | 2 | 22.6–22.8 | 13.0–13.2 | 666–712 | 1.3–1.4 ms | 1.5–1.8 ms | 806–822 | 3.5–3.8 |
+| `early_writeback(false)` | 2 | 0.30–0.31 | 1.18–1.33 | 5.69–6.65 | 155–159 | 196–199 | 188–241 | 0.8–0.9 |
+| ranged sync | 2 | 11.4–12.0 | 1.72–2.13 | 32.1 µs to 12 ms | 182 µs to 18 ms | 409 µs to 19 ms | 37.3 µs to 12 ms | 1.3–1.6 |
+| write-back to the 128 KiB boundary | 2 | 0.85 | 0.98–1.05 | 3.17–3.22 | 169–173 | 224–229 | 10.1–11.1 | 0.7 |
+| ranged sync + write-back to 128 KiB boundary | 2 | 0.27–0.28 | 1.07–1.10 | 3.00–3.23 | 175–178 | 228–229 | 4.49–5.17 | 0.8 |
+| re-touch | 2 | 2.91–3.00 | 1.83–2.02 | 32.3–35.2 | 173–188 | 248–433 | 38.6–41.4 | 1.3–1.5 |
+| writer touch while waiting | 2 | 1.56–1.64 | 1.76–1.88 | 34.6–35.4 | 179–183 | 264–354 | 40.2–41.7 | 1.3–1.4 |
+| `spare_segment(true)` | 2 | 12.4 | 1.70–1.77 | 29.6–29.7 | 78.0–87.2 | 279–304 | 37.4–37.8 | 1.2–1.3 |
+
+1,024 B, 100,000/s:
+
+| Configuration | Runs | Faults/MiB | p99 | p99.9 | p99.99 | max | Reader p99.9 | Late sends (%) |
+|---|---|---|---|---|---|---|---|---|
+| default | 4 | 18.3–18.5 | 2.37–2.39 | 18.1–18.7 | 122–133 | 219–234 | 24.8–25.9 | 0.2–1.0 |
+| `prefault(false)` | 2 | 9.75 | 12.2–13.2 | 262–276 | 1.1 ms | 1.7–1.8 ms | 453–468 | 1.1–2.0 |
+| `early_writeback(false)` | 2 | 0.22 | 2.22–2.30 | 2.62–2.79 | 105–110 | 205–208 | 192–210 | 0.0–1.0 |
+| ranged sync | 2 | 17.8–17.9 | 2.37–2.39 | 17.8–18.2 | 122–125 | 217–218 | 24.6–24.7 | 0.2–1.2 |
+| write-back to the 128 KiB boundary | 2 | 0.78–0.79 | 2.18–2.22 | 2.65–2.83 | 115–116 | 208–218 | 3.54–4.32 | 0.0 |
+| ranged sync + write-back to 128 KiB boundary | 2 | 0.23 | 2.25 | 2.65–2.81 | 118–119 | 209–216 | 3.23–3.50 | 0.0 |
+| re-touch | 2 | 5.52–5.56 | 2.25–2.36 | 19.4–19.5 | 121–152 | 221–702 | 26.5–27.4 | 0.2 |
+| writer touch while waiting | 2 | 2.05–2.07 | 2.33–2.36 | 18.8–19.0 | 120–126 | 213–217 | 25.9–26.0 | 0.2 |
+| `spare_segment(true)` | 2 | 18.3 | 2.25 | 16.8–17.0 | 34.0–34.4 | 207–237 | 23.5–23.8 | 0.2 |
+
+1,024 B, 170,000/s:
+
+| Configuration | Runs | Faults/MiB | p99 | p99.9 | p99.99 | max | Reader p99.9 | Late sends (%) |
+|---|---|---|---|---|---|---|---|---|
+| default | 4 | 14.5–14.7 | 2.40–2.79 | 21.8–22.3 | 165–171 | 224–258 | 124–137 | 0.4–0.9 |
+| `prefault(false)` | 2 | 9.68 | 13.1–13.9 | 294–425 | 1.0–1.1 ms | 1.3–1.4 ms | 577–626 | 2.2–2.5 |
+| `early_writeback(false)` | 2 | 0.11–0.12 | 2.10 | 2.67–3.16 | 159–166 | 233–237 | 80.5–93.9 | 0.1 |
+| ranged sync | 2 | 14.2–14.3 | 2.35–2.36 | 21.0–22.0 | 164–173 | 227–242 | 120–131 | 0.5–0.8 |
+| write-back to the 128 KiB boundary | 2 | 0.65–0.66 | 2.14–2.31 | 2.77–2.81 | 171 | 236–242 | 124–131 | 0.1 |
+| ranged sync + write-back to 128 KiB boundary | 2 | 0.26 | 2.17–2.55 | 3.17–4.38 | 163–164 | 228–231 | 116–123 | 0.6–0.9 |
+| re-touch | 2 | 4.17–4.25 | 2.29–2.49 | 24.9–27.9 | 161–162 | 222–264 | 113–115 | 0.6–1.7 |
+| writer touch while waiting | 2 | 2.66–2.72 | 2.33–2.68 | 22.3–24.0 | 160–174 | 220–239 | 112–132 | 0.5 |
+| writer touch in `append` | 2 | 14.6–14.7 | 2.36–2.47 | 23.2–24.2 | 182 | 246–261 | 140 | 0.5–0.6 |
+| `spare_segment(true)` | 2 | 13.7–14.4 | 2.28–2.29 | 19.5–21.0 | 41.0–41.3 | 228–239 | 44.8–45.2 | 0.4 |
+
+1,024 B, 300,000/s:
+
+| Configuration | Runs | Faults/MiB | p99 | p99.9 | p99.99 | max | Reader p99.9 | Late sends (%) |
+|---|---|---|---|---|---|---|---|---|
+| default | 4 | 0.52–7.67 | 2.40–3.95 | 250 µs to 18 ms | 997 µs to 31 ms | 1.3–33 ms | 613 µs to 18 ms | 0.9–1.6 |
+| `prefault(false)` | 2 | 9.65–9.66 | 13.4–13.6 | 411–512 | 1.1–1.2 ms | 1.7–1.8 ms | 657–689 | 4.0–4.3 |
+| `early_writeback(false)` | 2 | 0.30–0.32 | 2.10–2.43 | 23.6–27.3 | 199–211 | 421–433 | 397–417 | 0.6–0.7 |
+| ranged sync | 2 | 7.40–7.73 | 2.53–2.91 | 171–178 | 803 µs to 1.1 ms | 1.2–1.9 ms | 552–594 | 1.2–1.3 |
+| write-back to the 128 KiB boundary | 2 | 0.55 | 2.18–2.19 | 12.5–12.6 | 190–196 | 239–242 | 454–465 | 0.3–0.5 |
+| ranged sync + write-back to 128 KiB boundary | 2 | 0.29 | 2.19–2.20 | 5.28–6.25 | 191–192 | 244–254 | 452–455 | 0.2–0.3 |
+| re-touch | 2 | 3.55–3.71 | 8.90–10.2 | 184–361 | 901 µs to 1.0 ms | 1.2–1.6 ms | 588–624 | 1.4–1.5 |
+| writer touch while waiting | 2 | 3.06–3.15 | 3.65–4.59 | 298–386 | 987 µs to 1.0 ms | 1.3–1.8 ms | 614–639 | 1.2–1.5 |
+| `spare_segment(true)` | 2 | 1.38–7.34 | 2.34–4.14 | 374 µs to 3.9 ms | 1.1–9.8 ms | 1.7–11 ms | 575 µs to 3.9 ms | 1.1–1.4 |
+
+aarch64, xfs (five configurations; one untraced run each, two of the default):
+
+64 B, 1,000,000/s:
+
+| Configuration | Runs | Faults/MiB | p99 | p99.9 | p99.99 | max | Reader p99.9 | Late sends (%) |
+|---|---|---|---|---|---|---|---|---|
+| default | 2 | 12.6–12.7 | 1.59–1.61 | 29.0–30.5 | 149–156 | 284–419 | 35.4–35.8 | 1.2 |
+| ranged sync | 1 | 12.2 | 1.56 | 28.6 | 148 | 235 | 34.0 | 1.1 |
+| write-back to the 128 KiB boundary | 1 | 0.83 | 1.10 | 3.08 | 140 | 203 | 13.9 | 0.7 |
+| ranged sync + write-back to 128 KiB boundary | 1 | 0.27 | 0.96 | 2.68 | 141 | 213 | 4.73 | 0.7 |
+
+1,024 B, 100,000/s:
+
+| Configuration | Runs | Faults/MiB | p99 | p99.9 | p99.99 | max | Reader p99.9 | Late sends (%) |
+|---|---|---|---|---|---|---|---|---|
+| default | 2 | 18.4–18.6 | 2.35–2.36 | 15.1–16.0 | 94.7 | 211–235 | 22.0–23.2 | 0.4–1.0 |
+| ranged sync | 1 | 18.1 | 2.31 | 15.3 | 96.6 | 227 | 22.2 | 0.2 |
+| write-back to the 128 KiB boundary | 1 | 0.76 | 2.29 | 3.06 | 86.5 | 192 | 3.79 | 1.0 |
+| ranged sync + write-back to 128 KiB boundary | 1 | 0.22 | 2.17 | 2.47 | 89.2 | 214 | 3.49 | 0.1 |
+
+1,024 B, 170,000/s:
+
+| Configuration | Runs | Faults/MiB | p99 | p99.9 | p99.99 | max | Reader p99.9 | Late sends (%) |
+|---|---|---|---|---|---|---|---|---|
+| default | 2 | 14.9–15.1 | 2.44–2.83 | 19.1–19.8 | 139 | 246–300 | 96.1–98.1 | 0.3–0.4 |
+| ranged sync | 1 | 14.3 | 2.43 | 19.0 | 136 | 243 | 97.0 | 1.5 |
+| write-back to the 128 KiB boundary | 1 | 0.60 | 2.20 | 3.08 | 126 | 193 | 73.3 | 1.2 |
+| ranged sync + write-back to 128 KiB boundary | 1 | 0.25 | 2.25 | 2.61 | 133 | 196 | 76.3 | 0.1 |
+
+1,024 B, 300,000/s:
+
+| Configuration | Runs | Faults/MiB | p99 | p99.9 | p99.99 | max | Reader p99.9 | Late sends (%) |
+|---|---|---|---|---|---|---|---|---|
+| default | 2 | 8.42–8.78 | 2.45–3.00 | 22.0–22.2 | 161–167 | 257–607 | 403–413 | 0.8–1.0 |
+| ranged sync | 1 | 6.93 | 2.29 | 22.1 | 158 | 236 | 400 | 0.9 |
+| write-back to the 128 KiB boundary | 1 | 0.53 | 2.22 | 4.80 | 159 | 206 | 421 | 0.2 |
+| ranged sync + write-back to 128 KiB boundary | 1 | 0.28 | 2.19 | 3.65 | 160 | 215 | 421 | 0.3 |
+
+The supplement (x86-64, ext4, three untraced rounds of six configurations; its default runs are its own):
+
+64 B, 1,000,000/s:
+
+| Configuration | Runs | Faults/MiB | p99 | p99.9 | p99.99 | max | Reader p99.9 | Late sends (%) |
+|---|---|---|---|---|---|---|---|---|
+| default | 3 | 8.37–8.43 | 3.26–3.47 | 63.2–71.6 | 241–273 | 342–736 | 101–107 | 1.9 |
+| ranged sync | 3 | 7.71–7.75 | 2.94–3.66 | 40.6–56.6 | 230–274 | 680–742 | 43.6–75.8 | 1.8–1.9 |
+| write-back to the 128 KiB boundary | 3 | 0.94–1.03 | 1.64–1.83 | 66.5–95.4 | 255–257 | 348–462 | 92.5–132 | 1.4 |
+| write-back to the 2 MiB boundary | 3 | 1.09–1.13 | 1.73–2.50 | 195–213 | 383–462 | 762–939 | 279–311 | 1.5–1.8 |
+| ranged sync + write-back to 2 MiB boundary | 3 | 0.36 | 1.53–1.97 | 148–201 | 298–319 | 465–832 | 169–249 | 1.4–1.6 |
+| write-back 2–4 MiB behind | 3 | 1.33–1.36 | 2.96–3.29 | 402–521 | 856 µs to 1.5 ms | 1.1–2.1 ms | 857 µs to 1.1 ms | 1.7–1.8 |
+
+1,024 B, 100,000/s:
+
+| Configuration | Runs | Faults/MiB | p99 | p99.9 | p99.99 | max | Reader p99.9 | Late sends (%) |
+|---|---|---|---|---|---|---|---|---|
+| default | 3 | 9.62–9.68 | 2.23–6.01 | 25.5–25.8 | 128–149 | 307–325 | 39.6–41.8 | 0.7–0.9 |
+| ranged sync | 3 | 8.87–8.99 | 2.17–2.25 | 22.0–23.0 | 121–132 | 242–277 | 33.4–34.0 | 0.7–0.9 |
+| write-back to the 128 KiB boundary | 3 | 0.90–0.95 | 2.09–5.05 | 4.50–7.50 | 127 µs to 1.6 ms | 219 µs to 3.3 ms | 38.6–126 | 0.5–1.5 |
+| write-back to the 2 MiB boundary | 3 | 0.98–1.05 | 2.31–3.95 | 4.63–6.36 | 124–133 | 221–226 | 121–134 | 1.5 |
+| ranged sync + write-back to 2 MiB boundary | 3 | 0.28–0.29 | 2.04–3.29 | 3.20–5.53 | 121–132 | 228–249 | 111–127 | 0.5–1.5 |
+| write-back 2–4 MiB behind | 3 | 1.30–1.31 | 2.10–2.18 | 95.6–107 | 826–963 | 1.4–1.5 ms | 910 µs to 1.0 ms | 0.7–1.4 |
+
+1,024 B, 170,000/s:
+
+| Configuration | Runs | Faults/MiB | p99 | p99.9 | p99.99 | max | Reader p99.9 | Late sends (%) |
+|---|---|---|---|---|---|---|---|---|
+| default | 3 | 2.14–2.21 | 2.09–2.55 | 16.6–18.5 | 160–165 | 244–377 | 215–239 | 1.2 |
+| ranged sync | 3 | 1.54–1.65 | 2.42–2.62 | 9.95–10.7 | 154–157 | 247–275 | 215–231 | 1.2–1.4 |
+| write-back to the 128 KiB boundary | 3 | 0.71–0.77 | 2.17–2.40 | 6.92–9.00 | 145–165 | 210–268 | 242–265 | 1.0–1.4 |
+| write-back to the 2 MiB boundary | 3 | 0.81–0.84 | 2.15–2.44 | 23.9–31.9 | 219–337 | 575–963 | 560–592 | 1.2–1.4 |
+| ranged sync + write-back to 2 MiB boundary | 3 | 0.32–0.33 | 2.27–2.34 | 6.13–7.42 | 134–146 | 213–234 | 551–569 | 1.4–1.5 |
+| write-back 2–4 MiB behind | 3 | 0.76–0.78 | 2.15–2.41 | 20.8–66.8 | 167 µs to 1.4 ms | 551 µs to 1.7 ms | 1.3–1.4 ms | 1.2–1.6 |
+
+- **Writer touch, while waiting or in `append`.** Within the default's range in every cell, apart from single stalls of
+  1.7 ms (64 B) and 3.0 ms (300,000/s) in one run each of the touch while waiting; the default's runs have such stalls
+  too (up to 5.3 ms at 300,000/s). While waiting, it found a page to take in few waits (193 and 53 faults per run at
+  1,024 B × 100,000 and 170,000/s, against 18,400 and 6,900 faulted appends): the pages that fault were write-protected
+  after the writer last waited, or lie further on in the folio. On aarch64 it took most of the faults off the appends
+  (1.6–3.1 per MiB left in them, against 12.5–18.5) and the latency did not move either: a touch waits as long as the
+  fault would, and the send after it then starts late. In `append` it only moves a fault from one append to the one
+  before. Its cost is below.
+- **Larger window.** Worse in every cell and on both filesystems: each checkpoint writes the whole window back and
+  write-protects it (PR #102), so the writer re-faults all of it (10–20 faults per MiB with 4 MiB, 34–35 with 16 MiB)
+  and its p99.9 rises to 56–64 µs with 1 MiB and 0.2–0.9 ms with 4 and 16 MiB. A rate-adaptive window would choose among
+  these rows.
+- **Re-touch.** A third (1,024 B) to a sixth (64 B) of the faults, but the faults left collide with the helper on the
+  same folio (median 3.6–31.5 µs instead of 1.1 in the traced runs), and the writer's p99.9 is no better (slightly above
+  the default's range at 64 B and at 1,024 B × 100,000/s on ext4, within it elsewhere).
+- **Early write-back.** Off, as known, checkpoints take hundreds of milliseconds (below) and the writer stalls behind
+  them at 64 B. 2–4 MiB behind: the checkpoint then writes those megabytes and the writer's first fault after it waits
+  for its journal commit (appends of 1.3–1.8 ms on ext4 in `tt-sustained`, below), and the zero-copy reader's p99.9
+  rises to about 1 ms (why the reader waits that long was not traced). To the 2 MiB boundary: the same, smaller. **To
+  the 128 KiB boundary:** on x86-64 ext4, faults 0.7–1.0 per MiB, writer p99.9 at 1,024 B 4.5–7.5 against 25.5–25.8 µs
+  (100,000/s) and 6.9–9.0 against 16.6–18.5 µs (170,000/s), p99 at 64 B 1.6–1.8 against 3.3–3.5 µs (its p99.9 there did
+  not move); p99.99, maxima and the reader within the default's range but for one run at 100,000/s with a single 3.3 ms
+  append 2.7 ms after a checkpoint request (the default's runs have such outliers too: up to 2.0 ms in the main matrix).
+  On aarch64, in every cell and on both filesystems: faults 0.5–0.9 per MiB against 6.5–18.6, writer p99.9 2.7–3.2 µs
+  against 15–34 at the three lower rates and 4.8–12.6 against 22 µs to 18 ms at 300,000/s, the reader's p99.9 at 64 B
+  10–14 against 35–41 µs and at 1,024 B × 100,000/s 3.5–4.3 against 22–26 µs; p99.99 and maxima within or below the
+  default's range.
+- **Ranged sync.** 7–28 % fewer faults (the window is no longer written back), writer p99.9 41–57 against 63–72 µs (64
+  B), 22–23 against 25.5–25.8 and 10–11 against 16.6–18.5 (1,024 B), the reader's p99.9 at 64 B 44–76 against 101–107
+  µs; p99.99 and maxima unchanged. With early write-back to the 2 MiB boundary as well, the two lower faults further but
+  the reader's p99.99 rose to 1.2 ms, as with the 2 MiB boundary alone. On aarch64, alone, it stayed within the
+  default's range (one run at 64 B had a 12 ms stall; one default run at 300,000/s had an 18 ms one); with the 128 KiB
+  boundary it left 0.22–0.29 faults per MiB, the reader's p99.9 at 64 B 4.5–5.2 µs against 10–14 with the boundary
+  alone, and the writer's p99.9 at 300,000/s 3.7–6.3 against 4.8–12.6.
+- **Spare segment.** Removes the faults at rolls and the roll's own work: at 300,000/s the writer's p99.9 fell from
+  86–172 to 8.1–9.2 µs (ext4) and from 79–86 to 8.6 µs (xfs). At 170,000/s on ext4 one of its runs had an 8.8 ms stall
+  (p99.9 509 µs). On aarch64 ext4 it lowered the writer's p99.99 at 1,024 B × 100,000 and 170,000/s (34 and 41 against
+  122–133 and 165–171 µs) and the reader's p99.9 at 170,000/s (45 against 124–137 µs), and at 300,000/s one of its two
+  runs stalled (p99.9 3.9 ms). It is an option since ADR 0049, which says what to measure before it becomes the default.
+
+### `tt-sustained` at 170,000/s, 1,024 B
+
+The library's own sustained tool (`--duration 30s --warmup 5s --checkpoint-every 1s --checkpoint-mode background
+--readers mapped`), three interleaved runs per configuration. Its append latency is the time of one `Writer::append`
+(not from the schedule). µs unless a cell says ms.
+
+| Arch, filesystem | Configuration | Append p99.9 | Append p99.99 | Append max | Durable p50 | Durable max | Reader p99.9 | Reader p99.99 |
+|---|---|---|---|---|---|---|---|---|
+| x86-64, ext4 | default | 4.8–5.6 | 22.5–23.3 | 183–452 | 2.4–2.8 ms | 2.9–3.2 ms | 61–72 | 620–653 |
+| | write-back 2–4 MiB behind | 3.2–4.2 | 7.1–9.6 | 1.3–1.8 ms | 12.3–13.0 ms | 14.7–16.8 ms | 1.2 ms | 2.0 ms |
+| | `early_writeback(false)` | 2.7–4.4 | 11.8–17.3 | 348–420 | 439–441 ms | 763–782 ms | 93–186 | 0.8–2.3 ms |
+| x86-64, xfs | default | 4.6–6.5 | 17.8–18.7 | 211–223 | 1.15–1.19 ms | 1.46–1.52 ms | 44–52 | 613–617 |
+| | write-back 2–4 MiB behind | 2.7–2.9 | 5.3–9.8 | 176–186 | 11.6–11.7 ms | 16.9–17.0 ms | 0.85–1.25 ms | 1.9 ms |
+| | `early_writeback(false)` | 2.4–2.6 | 5.7–7.2 | 297–542 | 462 ms | 863 ms | 377–462 | 4.3–4.9 ms |
+| aarch64, ext4 | default | 6.7–7.4 | 29.5–30.1 | 249–254 | 0.89–0.91 ms | 1.13–1.25 ms | 144–156 | 769–779 |
+| | write-back to the 128 KiB boundary | 2.5–3.7 | 4.4–6.2 | 191–197 | 0.88–0.92 ms | 1.08–1.12 ms | 142–149 | 775–782 |
+| | ranged sync | 5.3–6.1 | 28.7–29.4 | 239–242 | 0.50–0.51 ms | 0.73–0.91 ms | 143–158 | 766–782 |
+
+Late sends: aarch64 0.36–0.40 % (default), 0.06 % (128 KiB boundary), 0.35–0.93 % (ranged sync); x86-64 0.9–1.7 % in
+every configuration. The 128 KiB boundary left the checkpoint's durable time as it was; the ranged sync shortened it by
+0.4 ms (the 256 KiB it no longer writes, PR #102). The zero-copy reader's tail in this tool did not move with either.
+Neither was run with `tt-sustained` on x86-64.
+
+### The comparison's W2 cells with the 128 KiB boundary (aarch64)
+
+`tt-latency run --rate <rate> --count <n> --warmup <w> --payload <64|1024> --reader mapped --writer-cpu 1 --reader-cpu 2
+--helper-cpus 3` (the latency tool of the comparison's W2, zero-copy reader, from the scheduled send to the read; no
+checkpoints, so the ranged sync does not apply), 11 s at 100,000/s and 31 s at 10,000/s with the first second left out,
+ext4, three interleaved rounds, on the aarch64 VM after its matrix. Reader p99.9 / p99.99 in µs:
+
+| Payload, rate | Default | Write-back to the 128 KiB boundary | Rerun (above): tickertape / Chronicle with `microTouch()` alone / all on |
+|---|---|---|---|
+| 64 B, 10,000/s | 0.49–2.45 / 4.2–4.6 | 0.48–2.34 / 3.2–4.9 | 2.87–3.46 / 1.59–3.89 / 0.73–0.78 |
+| 64 B, 100,000/s | 1.98–2.19 / 10.0–10.8 | 0.45–1.47 / 3.8–4.2 | 1.88–2.08 / 12.7–18.1 / 7.8–13.3 |
+| 1,024 B, 10,000/s | 8.76–9.41 / 28–30 | 2.31–2.76 / 4.2–6.0 | 8.73–9.10 / 2.71–2.94 / 2.77–3.46 |
+| 1,024 B, 100,000/s | 25.2–26.7 / 795–804 | 3.21–4.64 / 803–812 | 24.8–28.5 / 18.7–29.2 / 14.5–16.3 |
+
+The default reproduces the rerun's tickertape rows at 1,024 B on the same machine type. With early write-back stopped at
+the 128 KiB boundary, the 1,024 B p99.9 falls below Chronicle Queue's with `microTouch()`. The p99.99 at 1,024 B ×
+100,000/s (about 0.8 ms in both) is the roll without checkpoints (issue #60: rolls without checkpoints still take
+0.7–0.9 ms), which this does not touch. Not run on x86-64.
+
+### What writes the extra bytes at steady-90 (PR #105's question)
+
+PR #105 found the device writing 7 % more than tickertape appended at steady-90 (1,024 B, aarch64) with the defaults,
+and exactly the appended bytes with early write-back off, and the stalls of 50–144 ms gone with it. The same command
+(`tt-sustained run … --payload 1024 --duration 60s --warmup 10s --cpus 1,2,3,4,5,6 --checkpoint-every 1s
+--checkpoint-mode background --retain-bytes 4294967296 --readers mapped,safe:wait=default,safe:durable:wait=block --rate
+304571`, `fstrim` and 3 s before each run), on a new `c4a-standard-8-lssd` (us-east1-b, 13:14–13:45), ext4 on the first
+local SSD, four interleaved runs per configuration, the last under `bytes.bt` (block `bio_queue` bytes by the thread
+that queued them, and folios starting write-back). Device bytes from `/proc/diskstats` (sectors written) over the whole
+run, warm-up included; appended bytes are the records sent × 1,064. "Seconds" counts the 71 seconds of each run, warm-up
+included.
+
+| Configuration | Runs | Device GB per run | Device / appended | Append p99.9 (µs) | p99.99 (µs) | max (ms) | Seconds with an append ≥ 10 ms | Durable p50 (ms) | Durable max (ms) | Late sends (%) | Mapped reader p99.9 (ms) |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| default | 4 | 24.62–24.68 | 1.085–1.088 | 3.8–3.9 | 28.1–28.6 | 140–142 | 25–30 | 319–423 | 665–835 | 5.64–7.84 | 117–131 |
+| `early_writeback(false)` | 4 | 22.70 | 1.001 | 2.3–2.4 | 3.9–4.3 | 0.97–3.72 | 0 | 924–930 | 1145 | 0.41–0.47 | 0.45–0.60 |
+| ranged sync | 4 | 24.61–24.67 | 1.085–1.087 | 3.9–4.1 | 28.0–29.1 | 140–142 | 26–29 | 175–279 | 630–790 | 5.97–9.14 | 122–136 |
+| write-back to the 128 KiB boundary | 4 | 22.75 | 1.003 | 2.5–2.6 | 4.5–5.0 | 0.20–1.77 | 0 | 0.98–1.04 | 1–2 | 0.40–0.49 | 0.47–0.58 |
+| ranged sync + 128 KiB boundary | 4 | 22.70 | 1.001 | 2.4–2.6 | 4.1–4.2 | 0.21–10 | 0–1 | 0.58–0.60 | 1 | 0.35–0.44 | 0.48–0.60 |
+
+- **What writes them.** Early write-back asks for the whole pages behind the writer every 1 MiB
+  (`sync_file_range(SYNC_FILE_RANGE_WRITE)` from the end of the last range to the start of the page that holds the
+  position; nothing is rounded up in `writeback.rs`). The kernel writes back whole folios, and the folio that holds the
+  position (128 KiB here) is then written while the writer is still filling it: once now, partly empty (records up to
+  the position, zeros and prefaulted zeros after it), and again when it is full. One such folio per 1 MiB, half full on
+  average, is about 6 % more bytes; the checkpoints, which also write the writer's folio and the 256 KiB window (PR
+  #102), the rest. In the traced default run, the early write-back thread queued 23.05 GB and the checkpoint thread 1.38
+  GB for 22.7 GB appended (with the boundary: 22.49 and 0.10 GB; with early write-back off the checkpoint thread wrote
+  22.41 GB and the writer's own thread 0.27 GB, in write-back throttling). Counting folios per inode and index did not
+  work here: retention deletes segments during the run and ext4 reuses their inode numbers, so the counts mix files
+  (x86-64, below, kept every segment).
+- **The stalls.** With early write-back stopped at the 128 KiB boundary, the device wrote 0.3 % more than appended
+  (mostly the window at checkpoints: 0.1 % with the ranged sync as well), no second had an append of 10 ms or more
+  (25–30 of 71 with the defaults), the maximum was 0.2–1.8 ms, late sends 0.4–0.5 % (5.6–7.8 %), and checkpoints were
+  durable after 1 ms, where early write-back off gives the same tail at 0.9 s per checkpoint. With the ranged sync as
+  well, 0.0 % more and durable after 0.6 ms (one run had one append of 10 ms). The ranged sync alone left the bytes and
+  the stalls as they were: the window it saves is small next to the rewritten folios.
+- **One story with the ranged sync.** Both write pages the writer has not finished: early write-back the rest of the
+  folio it is filling, every 1 MiB; the checkpoint's whole-file `fdatasync` the prefaulted window, every checkpoint.
+  Both pages are written again once they hold records, and writing them write-protects them, which is where the writer's
+  faults come from. The boundary removes the first, the ranged sync the second. At steady-90 on aarch64 the first is
+  what pushes the device from 324 MB/s of appends to about 350 MB/s, its limit, and the stalls follow.
+
+x86-64 (a new `c4-standard-8-lssd`, us-east1-b, 13:46–14:04; 311,614 records/s, the x86-64 steady-90 rate of the 16-vCPU
+type, 331 MB/s; `--retain-bytes 68719476736` so that no segment is deleted and folios can be counted per file; three
+runs each, the last traced):
+
+| Configuration | Runs | Device GB per run | Device / appended | Append p99.9 (µs) | p99.99 (µs) | max (ms) | Seconds with an append ≥ 10 ms | Durable p50 (ms) | Durable max (ms) | Late sends (%) | Mapped reader p99.9 (ms) |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| default | 3 | 23.26–23.29 | 1.002–1.004 | 3.9–5.1 | 9.1–9.6 | 0.45–128 | 0–3 | 2.16–3.43 | 25–434 | 1.98–3.23 | 0.38–87 |
+| `early_writeback(false)` | 3 | 23.22 | 1.000 | 4.4–5.8 | 8.1–8.6 | 1.53–4.74 | 0 | 913–925 | 1149–1179 | 2.47–2.73 | 0.48–0.50 |
+| write-back to the 128 KiB boundary | 3 | 23.26 | 1.002 | 4.5–5.2 | 8.8–9.5 | 0.84–12.23 | 0–1 | 1.94–3.11 | 3–495 | 2.48–2.71 | 0.44–0.72 |
+
+On x86-64 the defaults wrote only 0.2–0.4 % more than appended, and in the traced run 416 of 183,790 folios were written
+back more than once (0.06 GB): 146 by early write-back and then a checkpoint, 117 twice by early write-back, 103 twice
+by checkpoints. At this rate the x86-64 writer has left the folio by the time early write-back reaches it (as with
+`tt-faults` at 300,000/s above), so there is little to remove: the boundary changed neither the bytes nor the latency
+beyond the spread. One default run of three had a 128 ms append (and a checkpoint durable after 434 ms), one run with
+the boundary a 12 ms one; PR #105's x86-64 maxima were 0.25–0.64 ms.
+
+### A touch on the writer's thread: what it costs `append`
+
+`tt-append-cost append --count <500,000 | 1,000,000> --payload 64 --prefault` under `perf stat -e instructions:u`, the
+writer pinned; the difference of the two counts divided by 500,000. Five pairs on x86-64, three on aarch64, interleaved.
+
+| Arch | Instructions per append, default | With the touch in `append` | ns per append, default | With the touch |
+|---|---|---|---|---|
+| x86-64 | 407.4 | 423.8 (+16.4) | 35.1–48.9 | 36.7–51.4 (slower in all 5 pairs) |
+| aarch64 | 383.8 | 396.5 (+12.7) | 82.6–88.8 | 91.8–93.5 (slower in all 3 pairs) |
+
+ADR 0047's gate for the append path is 3 instructions and no time difference outside the noise floor. The check itself
+is a compare and a branch; the rest is code layout around it. A `Writer::idle()` would cost nothing in `append`, but it
+found little to do (above).
+
+### Does the ranged sync still flush a volatile write cache?
+
+The VMs' disks report "write through", so the kernel sends them no cache flushes at all, and writing "write back" to the
+local SSD's queue did not take effect. A loop device does report a write-back cache (it turns a flush into an `fsync` of
+its backing file): ext4 and xfs on a loop device backed by a file on the local SSD, 20,000 records/s of 1,024 B, a
+background checkpoint every second, 11 checkpoints per run, two runs each, flush requests issued to the loop device
+counted (block `rq_issue` tracepoint):
+
+| Filesystem | Configuration | Flush requests per checkpoint | Checkpoint thread's `blkdev_issue_flush` per run | Its `msync` / `fdatasync` calls per run |
+|---|---|---|---|---|
+| ext4 | default | 7.5–7.8 | 12–14 | 11 / 31 |
+| ext4 | ranged sync | 4.1–4.3 | 9 | 11 / 11 |
+| xfs | default | 7.1 | 14 | 11 / 31 |
+| xfs | ranged sync | 3.9 | 9 | 11 / 11 |
+
+So the ranged checkpoint still sends flushes; the order (the flush that follows the active segment's data comes before
+the marker's write) follows from the kernel sources (ADR 0058 → Is the ranged sync safe?), and was not traced per call.
+
+### Chronicle's `microTouch()` on the same machine types
+
+The comparison rerun at v1.0.0 (issue #57; still running when this was written, its short part finished on 2026-11-25;
+branch `rerun/v1.0.0-session`) has Chronicle Queue with every tool setting off (`jvm-old`: the old JVM warm-up, no
+`microTouch()`, the default 64 MiB `blockSize`), with `microTouch()` alone, and with every setting on, and tickertape
+with its defaults (prefault on, early write-back on, no checkpoints), in its W2 latency runs (from the scheduled send to
+the read, 11 s, the first second left out; four runs per row: two rounds of two). ext4 on the first local SSD, x86-64
+`c4-standard-16-lssd` (16 vCPUs, the same CPU as above) and aarch64 `c4a-standard-8-lssd` (the type above). Reader p99.9
+in µs; tickertape with its zero-copy reader:
+
+| Arch | Payload, rate | Chronicle, all off | `microTouch()` alone | Chronicle, all on | tickertape |
+|---|---|---|---|---|---|
+| x86-64 | 64 B, 10,000/s | 2.45–3.51 | 1.90–1.99 | 1.68–1.83 | 2.17–2.35 |
+| | 64 B, 100,000/s | 28.6–29.2 | 17.8–18.2 | 11.8–15.3 | 2.27–5.96 |
+| | 1,024 B, 10,000/s | 34.8–36.8 | 2.35–2.51 | 2.36–2.82 (and one run of 15.8 ms) | 4.60–6.84 |
+| | 1,024 B, 100,000/s | 35.4–37.4 | 25.2–26.2 | 23.9–24.6 | 28.6–29.8 |
+| aarch64 | 64 B, 10,000/s | 2.13–2.24 | 1.59–3.89 | 0.73–0.78 | 2.87–3.46 |
+| | 64 B, 100,000/s | 25.1–27.1 | 12.7–18.1 | 7.8–13.3 | 1.88–2.08 |
+| | 1,024 B, 10,000/s | 36.4–37.6 | 2.71–2.94 | 2.77–3.46 | 8.73–9.10 |
+| | 1,024 B, 100,000/s | 33.7–35.2 | 18.7–29.2 | 14.5–16.3 | 24.8–28.5 |
+
+- **What `microTouch()` does for Chronicle** on these machines: against nothing, it takes the p99.9 at 1,024 B ×
+  10,000/s from 35–38 to 2.4–2.9 µs, and lowers it by up to about half in the other cells (not clearly at aarch64 64 B ×
+  10,000/s, where its runs spread from 1.6 to 3.9 µs); the rest of "all on" adds less. That is the gain tickertape's
+  helper already has against no prefaulting: in this section, prefault off against on is 3.7–4.0 ms against 60–100 µs at
+  64 B × 1,000,000/s and 140–237 against 26–27 µs at 1,024 B × 100,000/s (writer p99.9, x86-64 ext4). The two are not
+  the same comparison: Chronicle's gain is against no pre-touching at all, and tickertape already has a helper.
+- **Where tickertape is above Chronicle with `microTouch()`:** at 1,024 B, by 2–6 µs at 10,000/s and by 2–14 µs at
+  100,000/s (and at 64 B × 10,000/s, by 0.3–2.7 µs against "all on"; what sets that p99.9 was not measured here). Those
+  are the cells where, in this section, early write-back's write-protect faults set tickertape's p99.9 (1,024 B ×
+  100,000/s: 26–27 µs, with the 128 KiB boundary 4.5–7.5 µs, measured with `tt-faults`). Chronicle has no early
+  write-back. With `tt-latency` in the W2 cells on aarch64 (above) the boundary closed that gap: 2.3–2.8 µs at 1,024 B ×
+  10,000/s and 3.2–4.6 µs at 100,000/s. x86-64 was not run with `tt-latency`.
+
+### A README sentence these figures update
+
+`README.md` (Performance) says: "In separate tickertape-only runs on the bare-metal machine (ext4, 100,000 records/s),
+turning prefaulting off raised the zero-copy reader's p99.9 from 1.7–2.0 µs to 31–34 µs at 64 bytes, close to Chronicle
+Queue's 36–37 µs. At 1,024 bytes it did not raise it: 110–243 µs with prefaulting and 97–122 µs without, both above
+Chronicle Queue's 48–55 µs." That was v0.4.0 on bare metal, before early write-back (ADR 0038, 2026-11-20), without
+checkpoints. Proposed addition (the owner decides; this PR does not change the README): "With 1.0's defaults on cloud
+VMs (ext4, 100,000 records/s of 1,024 bytes, a checkpoint every second; `docs/benchmarks.md`, 2026-11-26), prefaulting
+off raised the writer's p99.9 from 26–27 µs to 140–237 µs and the zero-copy reader's from 40–52 µs to 321–412 µs."
+
+And: "Close to its limit the writer can stall. In tickertape's own 10-minute runs at 1,024 bytes and 90 % of the unpaced
+rate, appends of 50–128 ms recurred on aarch64 ext4." Proposed addition, once ADR 0058's change is decided: "There,
+early write-back made the device write 8 % more than was appended, by writing back the 128 KiB the writer was filling;
+stopping it at the boundary below the writer removed the extra bytes and these stalls in an experiment (not the
+default)." Neither sentence is changed by this PR.
+
+### What these figures do not show
+
+Bare metal; other VM shapes and disks; macOS (where the helper advises `MADV_WILLNEED` 8 MiB ahead, which makes no page
+writable, and there is no early write-back); kernels other than 7.0, and so other folio sizes (with smaller folios the
+early write-back faults should not occur; with larger ones, the 128 KiB boundary would not prevent them); `lazytime`;
+unpaced writers and bursts; `HelperCpus::Inherited`; runs longer than 20 s (30 s in `tt-sustained`); the comparison
+harness with any switch, and `tt-latency` with it on x86-64; the ranged sync and the 128 KiB boundary together on
+x86-64; a drive with a volatile write cache, and power loss.
 
 ## 2026-11-26, seeks with and without the seek index (Google Cloud VMs)
 
@@ -3057,7 +4085,9 @@ runs showed the same stalls (below). Waits of the writer's thread of 3 ms or mor
   is: commits logged for 4 ms (p50), 129 ms (p90), at most 304 ms on aarch64, and at most 1 ms on x86-64 at the same
   share of its probe, where the same workload has no such stall; on aarch64 81 of the traced log writes took 20 ms or
   more, on x86-64 none reached 1 ms. **Why that device queues at 92 % of its probe, on this shape only, is not
-  explained**; nothing traced inside the guest accounts for it.
+  explained**; nothing traced inside the guest accounts for it. (Measured since: both shapes' local SSDs are capped at
+  351 MB/s, and with its defaults tickertape made the aarch64 device write 7 % more than it appended; 2026-11-26, "how
+  much of the limit is the disk", below.)
 - **Test of that: `lazytime`.** With the filesystem remounted `lazytime`, which keeps modification times out of the
   journal, the same workload has 3–10 seconds with a 50 ms append per run instead of 28–30 (three 60-second runs each,
   interleaved, one VM shape), and every one of them is a roll. The roll appends get longer (max 114–130 ms, against
@@ -3087,6 +4117,14 @@ included). Dropping the checkpoint's whole-file `fdatasync` of the active segmen
 data) so that prefaulted pages are not written back changed nothing (28–37 against 28–30; with an 8 MiB window 19–28),
 and with the larger window x86-64 got worse (append max 1.4–5.9 ms, checkpoints durable after 190 ms). Neither is
 kept.
+
+**Note (2026-11-26).** The ranged-sync switch of that experiment (`TT_EXP_RANGED` on `exp/roll-60`) skipped only the
+per-segment `fdatasync` of the active segment and kept the barrier step, which on Linux is another `fdatasync` of the
+same file. That call writes the prefaulted pages back, so the experiment did not do what this paragraph says: it did not
+keep prefaulted pages from being written back. Measured with both calls skipped, the checkpoint wrote 256 KiB less and
+was 0.15–0.6 ms shorter
+([2026-11-26](#2026-11-26-what-prefaulted-unwritten-pages-add-to-a-checkpoint-google-cloud-vms-linux)); whether that
+changes the stalls of steady-90 was not measured.
 
 ### The spare segment, again (ADR 0023)
 
@@ -3764,6 +4802,477 @@ implementation.
 Not measured: xfs; other machine sizes; runs long enough to compare rates between writers or readers; tracing overhead
 on these runs (the untraced runs had events at a similar rate: 1 in 227 s and 1 in 600 s); the independent pair with the
 trace. The migration probe was attached in the last two aarch64 runs only.
+
+## 2026-11-26, how much of the limit is the disk: fio, tmpfs and one change at a time (Google Cloud VMs)
+
+The owner's question after the stall findings above: "we are kind of limited by disk speed, right? How can we test
+further?" (issue #60). This section measures the storage device by itself with `fio`, runs the sustained scenarios
+with the journal on `tmpfs` (no disk at all) and on the local SSD, changes one storage setting at a time on the SSD, and
+sweeps the payload size unpaced. All of it ran on **Google Cloud virtual machines, not bare metal**, one VM per
+architecture, one after the other, on one day. The raw output (fio JSON and bandwidth logs, `tt-sustained` results and
+series, traces, the scripts) is kept outside the repository.
+
+### Environment and commands
+
+| Machine (us-east1-b) | CPU, vCPUs, memory | Time (UTC) |
+|---|---|---|
+| `c4a-standard-8-lssd` | Google Axion (Neoverse-V2), 8, 31 GiB | 09:29–11:15 |
+| `c4-standard-16-lssd` | Xeon 6985P-C, 16 (8 cores), 59 GiB | 11:18–12:43 |
+| `c4a-standard-8-lssd` (a second VM) | Axion, 8, 31 GiB | 12:44–13:00: device bytes, fio with range syncs |
+
+Ubuntu 24.04, kernel 7.0.0-1017-gcp, rustc 1.100.0, fio 3.36, bpftrace 0.20.2. `main` at `42b2307e` on both
+(`tt-sustained` built on each VM). Each VM has two local NVMe SSDs of 375 GB (`nvme_card0`, `nvme_card1`): the first
+with ext4 (`mkfs.ext4 -E lazy_itable_init=0,lazy_journal_init=0`, mounted `rw,noatime`), the second with xfs (defaults,
+`rw,noatime,inode64,logbufs=8,logbsize=32k`) after the raw-device jobs below had run on it. The local SSDs report
+`write_cache` "write through" (the kernel sends them no cache flushes), I/O scheduler `none`, `max_sectors_kb` 128,
+`nr_requests` 1023, `wbt_lat_usec` 2000. Write-back sysctls at their defaults (`dirty_background_ratio` 10,
+`dirty_ratio` 20, `dirty_expire_centisecs` 3000, `dirty_writeback_centisecs` 500) except in the rows that change them.
+`tmpfs` was a dedicated mount (`mount -t tmpfs -o size=16g tmpfs /mnt/tmpfs`, default `huge=never`). Results on the
+boot disk. Before every run: the journal deleted, `sync`, `fstrim` of the SSD's file system (close to 1 TB was written
+to each device during the session), 3 s pause.
+
+**tickertape** (`tt-sustained`; 60 s measured after 10 s of warm-up, as in the roll section above):
+
+```sh
+tt-sustained run --dir <journal> --out … --json --payload <64|256|1024|4096> --duration 60s --warmup 10s \
+  --cpus 1,2,3,4,5,6 --checkpoint-every 1s --checkpoint-mode background --retain-bytes 4294967296 \
+  --readers mapped,safe:wait=default,safe:durable:wait=block (--unpaced | --rate <rate>) [--no-disk-check on tmpfs]
+```
+
+The rates are the published steady-50 and steady-90 rates of these machine types (second sustained session above):
+x86-64 173,119 / 311,614 records/s at 1,024 B and 1,603,530 / 2,886,355 at 64 B; aarch64 169,206 / 304,571 and
+1,672,614 / 3,010,706. A record of payload P takes P + 40 bytes rounded up to 8 in the journal (1,064 B at 1,024 B, 104
+B at 64 B); "MB/s" below is records/s × that size, the bytes the journal writes. Retention is 4 GiB (not the sessions'
+64 GiB) so that the tmpfs runs never fill memory; on the SSD it deletes segments only after the data is written back.
+"Unpaced" is the probe's command for 60 s instead of 10 minutes. Changes from the default: `--no-early-writeback`,
+`--spare-segment`; without checkpoints the run has no retention and no durable-only reader
+(`--readers mapped,safe:wait=default`); `lazytime` by `mount -o remount,noatime,lazytime`; the dirty limits by
+`sysctl vm.dirty_background_bytes=… vm.dirty_bytes=…` (small: 64 MiB / 256 MiB on both; large: 8 / 16 GiB on aarch64,
+16 / 32 GiB on x86-64), with `dirty_background_ratio=10 dirty_ratio=20` restored after each run. "Writer off-CPU" is
+the run's length minus the CPU time of the writer's measuring thread: time it waited (throttling, journal, I/O).
+"Seconds ≥ 10 ms" counts the measured seconds whose longest append took 10 ms or more.
+
+**fio, the file system** (`journal.fio`, one job file, parameters from the environment):
+
+```ini
+; Sequential buffered writes into one preallocated file, the way a journal segment is written.
+[global]
+directory=${DIR}
+filename=${NAME}
+ioengine=${ENGINE}          ; mmap: stores into a shared mapping; sync: write(2)
+rw=write
+bs=${BS}                    ; 4k or 128k
+size=${SIZE}                ; 64g unthrottled, 24g rate-limited
+fallocate=native
+rate=${RATE}                ; bytes/s: 0, or the 1,024 B steady-50 / steady-90 rate x 1,064
+fdatasync=${SYNC}           ; writes between two syncs (msync(MS_SYNC) for the mmap engine): 1 s of the rate, or 256 MiB unthrottled
+time_based=1
+runtime=45
+unlink=1
+percentile_list=50:99:99.9:99.99
+write_bw_log=${LOG}
+log_avg_msec=1000
+[journal]
+```
+
+The file was made with `fallocate -l <size>` before each job, so fio writes into unwritten extents as the journal does
+(without it fio's mmap engine first writes the whole file; two jobs that did were discarded and rerun). fio syncs on the
+thread that writes, so it never writes while a sync runs; to compare with tickertape, whose checkpoint thread syncs
+beside the writer, three more jobs ran the mmap engine without its own syncs while a separate process called
+`sync -d <file>` (`fdatasync`) once a second (`ext4x-…` below). One more job: 4 KiB buffered writes with an `fdatasync`
+after each (`ENGINE=sync BS=4k SYNC=1`, 20 s), the latency of an ext4 commit on this device.
+
+**fio, the raw device** (`raw.fio`, on the second SSD before its xfs was made): `filename=/dev/disk/by-id/google-local-nvme-ssd-1`,
+`direct=1`, `ioengine=libaio`, `rw=write`, 30 s, with `bs`/`iodepth` 128k/1, 128k/32, 1m/32, 4k/1, and 4k/1 with an
+`fdatasync` after every write.
+
+### The answer in short
+
+- **Throughput: yes, the disk is the limit on these VMs.** Each local SSD writes at most **351 MB/s**, a flat cap
+  that does not move with block size or queue depth (every second of every raw job between 351 and 354 MB/s, on both
+  machine types). Unpaced, tickertape on the SSD gets the device's 351 MB/s plus whatever the page cache takes in before
+  write-back throttling starts (428–434 MB/s over 70 s on aarch64 with 5.1–5.4 GiB left dirty, 506–507 MB/s on x86-64
+  with about 10 GiB); its writer thread spends 54 (aarch64) and 44–45 (x86-64) of the 70 seconds off the CPU, waiting.
+  With the journal on tmpfs the same command writes 1,795–1,808 MB/s (aarch64) and 1,407–1,764 MB/s (x86-64) at 1,024
+  B, three to four times as much. With the two local SSDs striped (RAID 0, 703 MB/s raw) the x86-64 writer reached 850–851 MB/s:
+  it follows the device.
+- **Payload.** From 256 B up the SSD rate is the same in MB/s (430–434 and 506–507) while tmpfs keeps growing (853
+  MB/s at 256 B to 1,972–2,299 at 4,096 B): the device is the limit. At 64 B the two limits nearly meet: on tmpfs the
+  writer does 3.8–4.0 million records/s (394–420 MB/s), on the SSD 3.34–3.37 million (348–351 MB/s) while staying on
+  the CPU (off-CPU 0.1 s on x86-64, 4–6 s on aarch64) and the page cache stays small, with checkpoints durable 0.44–0.61
+  s after the request: CPU-bound, with the device nearly saturated.
+- **Latency: most of the tail at steady-90 on aarch64 is the storage stack, and on that VM most of it went away with
+  early write-back off.** Without a disk (tmpfs with the spare segment, so that rolls do not zero 128 MiB on the writer's
+  thread) the writer's append at steady-90 has p99.9 2.4–2.7 µs, p99.99 4.3–7.0 µs and a maximum of 48 µs (aarch64) and
+  100 µs (x86-64), one run each. On the SSD, x86-64 has p99.99 9.3–11.2 µs and a maximum of 0.25–0.64 ms; aarch64 has
+  p99.99 27–29 µs and maxima of 83–144 ms, with 19–36 seconds per minute containing an append of 10 ms or more (first
+  VM). On aarch64, turning early write-back off brought p99.99 down to 4.1–4.4 µs (tmpfs's level) and the maximum to
+  1.0–2.3 ms in 5 of 5 runs on two VMs, at the price of checkpoints becoming durable 0.93 s after the request instead
+  of 0.05–0.39 s. On x86-64 it changed nothing in the tail and made checkpoints 0.93 s late instead of 2 ms.
+- **The yardstick.** `fio` writing at steady-90's byte rate with a sync every second, and also with tickertape's
+  write-back pattern, did not stall the way tickertape's default did on aarch64 (its writes took at most 0.07–1.7 ms,
+  except one write of 122 ms in a `write` job without range syncs).
+  On a second aarch64 VM tickertape with its defaults made the device write **7 % more bytes** than it appended (24.4
+  GB against 22.7 GB per run; with early write-back off exactly the appended bytes; fio with the same pattern wrote only
+  its data). At steady-90 that is about 348 MB/s for a device that takes 351. What writes the extra bytes was not
+  traced; it is the first thing to look at (below).
+
+### The device by itself (fio)
+
+Selected jobs; MB/s is fio's mean over the job, latencies in µs unless stated, sync latency over all syncs of the job.
+
+| Job | aarch64: MB/s | write p99.9 / max | syncs: n, p50, max | x86-64: MB/s | write p99.9 / max | syncs: n, p50, max |
+|---|---|---|---|---|---|---|
+| raw device, 128 KiB, QD 1 | 351 | 506 / 574 | – | 351 | 586 / 718 | – |
+| raw device, 128 KiB, QD 32 | 351 | 13 ms / 23 ms | – | 351 | 19 ms / 24 ms | – |
+| raw device, 1 MiB, QD 32 | 351 | 154 ms / 185 ms | – | 351 | 156 ms / 185 ms | – |
+| raw device, 4 KiB, QD 1 | 235 | 24.4 / 122 | – | 128 | 255 / 462 | – |
+| raw device, 4 KiB, QD 1, `fdatasync` after each | 233 | 26.2 / 112 | 1,703,331, 16.3, 113 | 125 | 272 / 513 | 918,935, 29.8, 518 |
+| ext4, 4 KiB write + `fdatasync` after each | 53 | 8.5 / 101 | 257,887, 73.2, 10 ms | 27 | 16.3 / 175 | 132,638, 140, 1.2 ms |
+| ext4 mmap 4 KiB, unthrottled, sync every 256 MiB | 334 | 27.0 / 72 | 56, 759 ms, 768 ms | 328 | 54.5 / 154 | 55, 759 ms, 765 ms |
+| ext4 write 128 KiB, unthrottled, sync every 256 MiB | 342 | 29.8 / 96 | 58, 759 ms, 765 ms | 334 | 46.8 / 79 | 56, 759 ms, 765 ms |
+| ext4 mmap 4 KiB at steady-50's rate, sync every 1 s | 178 | 27.8 / 68 | 45, 510 ms, 510 ms | 182 | 52.5 / 119 | 45, 518 ms, 520 ms |
+| ext4 mmap 4 KiB at steady-90's rate, sync every 1 s | 318 | 27.3 / 68 | 45, 919 ms, 920 ms | 320 | 54.0 / 91 | 44, 935 ms, 942 ms |
+| ext4 write 128 KiB at steady-90's rate, sync every 1 s | 318 | 27.0 / 100 | 45, 919 ms, 919 ms | 325 | 45.8 / 70 | 45, 935 ms, 941 ms |
+| ext4 mmap 4 KiB at steady-90's rate, `fdatasync` every 1 s from another process | 324 | 30.1 / 1.7 ms | 5, 4.0 s, 5.2 s | 332 | 105 / 792 | 6, 4.9 s, 10.9 s |
+| ext4 mmap 4 KiB at steady-50's rate, the same | 180 | 29.3 / 927 | 13, 1.08 s, 1.42 s | 184 | 102 / 1.2 ms | 20, 1.13 s, 1.92 s |
+| ext4 mmap 4 KiB unthrottled, the same | 528 | 31.6 / 21 ms | 0 finished in 30 s | 576 | 94.7 / 21 ms | 0 finished in 45 s |
+| xfs mmap 4 KiB at steady-90's rate, sync every 1 s | 315 | 11.3 / 78 | 44, 969 ms, 986 ms | 322 | 40.2 / 165 | 44, 944 ms, 947 ms |
+| xfs write 128 KiB, unthrottled, sync every 256 MiB | 346 | 22.7 / 83 | 59, 759 ms, 761 ms | 337 | 41.7 / 68 | 57, 759 ms, 760 ms |
+| RAID 0 of both SSDs, raw, 128 KiB / 1 MiB, QD 32 | | | | 703 / 703 | 8.3 ms / 63 ms (p99.9) | – |
+| RAID 0, ext4 write 128 KiB, unthrottled, sync every 256 MiB | | | | 636 | 45.3 / 141 | 107, 375 ms, 383 ms |
+| RAID 0, ext4 mmap 4 KiB at steady-90's rate, sync every 1 s | | | | 328 | 106 / 1.5 ms | 45, 468 ms, 473 ms |
+
+On the second aarch64 VM (below), at steady-90's byte rate (324 MB/s), 45 s, `fdatasync` every second from another
+process: `write` 128 KiB with `sync_file_range(SYNC_FILE_RANGE_WRITE)` every 1 MiB (tickertape's write-back step)
+wrote with p99.99 68 µs and a maximum of 104 µs, its 42 syncs took 9.8 ms (p50) and at most 15 ms; mmap 4 KiB with the
+same (fio's mmap engine turns the range sync into an `msync`, 0.5 ms each) at most 136 µs, syncs 10 ms and at most 16
+ms; `write` 128 KiB without the range syncs had one write of 122 ms and 6 syncs of 4.6–10.3 s.
+
+- The cap is the platform's, not the flash's: a flat 351 MB/s whatever the request size and depth, on both machine
+  types; queueing deeper only adds latency (12–96 ms at QD 32). 4 KiB writes at QD 1 took 16 µs on aarch64 and 29 µs
+  on x86-64. The devices report a write-through cache, so `fdatasync` sends no flush and costs nothing beyond the
+  writes (16 and 30 µs); a drive with a volatile cache would add a flush to every checkpoint (further tests, below).
+- Buffered writers get the cap too: unthrottled fio in the page cache wrote 310–346 MB/s, and one second of
+  steady-90's data took 0.92–0.94 s to sync (one second of steady-50's 0.51–0.52 s), the time the device needs for it
+  at 351 MB/s. That is also what a tickertape checkpoint costs without early write-back (0.93 s, below).
+- fio's own writes waited at most 0.07–0.14 ms at steady-90's rate when it synced on its writing thread (where it
+  never writes while a sync runs) or used tickertape's write-back pattern, and at most 0.8–1.7 ms with an `fdatasync`
+  from another process and no range syncs, except the one 122 ms write above. An `fdatasync` from another process while the writer keeps going takes much longer than one second's
+  data (4–11 s at steady-90; none finished unthrottled), unlike tickertape's checkpoint, which syncs up to a recorded
+  position with a ranged `msync` before its whole-file `fdatasync`.
+
+### Without a disk (tmpfs) against the SSD
+
+On tmpfs `fdatasync` and `msync` return at once and `sync_file_range` does nothing: **this row has no durability at
+all; it is a ceiling, not a mode to recommend.** What remains on tmpfs is the library's and the kernel's own cost:
+appends, rolls, unmapping, scheduling, the helper threads.
+
+| Payload | Arch | tmpfs: runs, records/s | MB/s | SSD (ext4): runs, records/s | MB/s | Writer off-CPU on the SSD (s of 70) | Page cache dirty at most (GiB) |
+|---|---|---|---|---|---|---|---|
+| 64 | aarch64 | 2: 4,003,436–4,021,481 | 416–418 | 2: 3,341,813–3,349,920 | 348 | 4.4–6.1 | 0.1–0.2 |
+| 64 | x86-64 | 2: 3,787,930–4,035,725 | 394–420 | 2: 3,362,791–3,372,591 | 350–351 | 0.1 | 0.0–0.1 |
+| 256 | aarch64 | 1: 3,249,920 | 962 | 1: 1,453,768 | 430 | 32.6 | 5.1 |
+| 256 | x86-64 | 1: 2,883,171 | 853 | 1: 1,712,425 | 507 | 26.7 | 10.6 |
+| 1,024 | aarch64 | 2: 1,686,719–1,699,041 | 1,795–1,808 | 3: 402,668–407,959 | 428–434 | 53.9–54.1 | 5.1–5.4 |
+| 1,024 | x86-64 | 2: 1,322,402–1,657,601 | 1,407–1,764 | 3: 475,943–476,579 | 506–507 | 43.8–45.1 | 10.1–10.2 |
+| 4,096 | aarch64 | 1: 555,930 | 2,299 | 1: 105,009 | 434 | 62.8 | 5.4 |
+| 4,096 | x86-64 | 1: 476,872 | 1,972 | 1: 122,381 | 506 | 58.8 | 10.1 |
+| 1,024 | x86-64, RAID 0 of both SSDs | | | 2: 798,645–799,730 | 850–851 | 24.5–25.2 | 9.7 |
+
+The two x86-64 tmpfs runs at 1,024 B differ by 25 % (1,407 and 1,764 MB/s; append p50 0.47 and 0.12 µs), more than
+some effects in this section; the x86-64 tmpfs figures are a range, not a rate. Subtracting what was still dirty at the
+end, about 347 MB/s (aarch64) and 350 MB/s (x86-64) reached the device in the 1,024 B SSD runs: its cap.
+
+At the same rate (unpaced rows above; "Seconds ≥ 10 ms" lists each run):
+
+| Scenario | Payload | Arch | Storage | Runs | Late (%) | Append p99.9 | p99.99 | max | Roll append p50 | Seconds ≥ 10 ms | Mapped reader p99.9 | Safe reader p99.9 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| steady-50 | 64 | aarch64 | SSD (ext4) | 1 | 1.5 | 2.02 | 3.54 | 211 | 175 | 0 | 266 | 39.8 |
+| steady-50 | 64 | aarch64 | tmpfs | 1 | 4.7 | 1.90 | 2.60 | 20 ms | 19 ms | 59 | 19 ms | 18 ms |
+| steady-50 | 64 | x86-64 | SSD (ext4) | 1 | 8.5 | 2.07 | 6.72 | 381 | 133 | 0 | 114 | 83.8 |
+| steady-50 | 64 | x86-64 | tmpfs | 1 | 5.5 | 1.80 | 6.07 | 31 ms | 27 ms | 59 | 28 ms | 27 ms |
+| steady-50 | 1,024 | aarch64 | SSD (ext4) | 1 | 0.8 | 7.59 | 32.0 | 203 | 175 | 0 | 269 | 27.8 |
+| steady-50 | 1,024 | aarch64 | tmpfs | 1 | 2.9 | 2.46 | 4.05 | 20 ms | 19 ms | 60 | 19 ms | 18 ms |
+| steady-50 | 1,024 | x86-64 | SSD (ext4) | 1 | 1.4 | 5.97 | 18.6 | 205 | 149 | 0 | 76.0 | 24.0 |
+| steady-50 | 1,024 | x86-64 | tmpfs | 1 | 4.4 | 2.83 | 6.56 | 29 ms | 27 ms | 60 | 28 ms | 27 ms |
+| steady-90 | 64 | aarch64 | SSD (ext4) | 2 | 5.1–5.2 | 1.90–1.94 | 3.19–3.27 | 1.0–10 ms | 171–249 | 1, 0 | 744 to 1.5 ms | 263 to 1.5 ms |
+| steady-90 | 64 | aarch64 | tmpfs | 2 | 17.9 | 1.83 | 2.66–2.91 | 20–21 ms | 19 ms | 60, 60 | 20 ms | 19 ms |
+| steady-90 | 64 | x86-64 | SSD (ext4) | 1 | 33.7 | 1.90 | 6.85 | 176 | 119 | 0 | 548 | 503 |
+| steady-90 | 64 | x86-64 | tmpfs | 1 | 18.9 | 1.81 | 6.00 | 29 ms | 28 ms | 60 | 29 ms | 27 ms |
+| steady-90 | 1,024 | aarch64 | SSD (ext4) | 4 | 3.8–9.9 | 3.78–4.09 | 27.1–28.6 | 83–144 ms | 175–912 | 36, 19, 32, 25 | 48–129 ms | 48–129 ms |
+| steady-90 | 1,024 | aarch64 | tmpfs | 2 | 5.3–5.4 | 2.39–2.41 | 3.89–4.16 | 20–21 ms | 19 ms | 60, 60 | 20 ms | 18 ms |
+| steady-90 | 1,024 | aarch64 | tmpfs, spare segment | 1 | 0.4 | 2.43 | 4.27 | 48.2 | 38.2 | 0 | 1.2 ms | 11.4 |
+| steady-90 | 1,024 | x86-64 | SSD (ext4) | 3 | 2.5–3.5 | 5.46–6.55 | 9.32–11.2 | 245–638 | 147–154 | 0, 0, 0 | 342–368 | 43.3–53.7 |
+| steady-90 | 1,024 | x86-64 | tmpfs | 2 | 7.9 | 2.85–2.87 | 6.99–7.04 | 31–33 ms | 27–28 ms | 59, 59 | 28–29 ms | 27 ms |
+| steady-90 | 1,024 | x86-64 | tmpfs, spare segment | 1 | 0.6 | 2.67 | 6.95 | 100 | 25.6 | 0 | 968 | 10.9 |
+
+- **tmpfs has a cost of its own at every roll.** A roll appends in 19 ms (aarch64) and 27–30 ms (x86-64) on tmpfs
+  against 0.12–0.25 ms on ext4: `fallocate` on tmpfs allocates and zeroes the whole 128 MiB segment, on the writer's
+  thread. The traced runs (`offcpu.bt`, waits of 1 ms or more; unpaced and steady-90 at 1,024 B on each machine) show
+  no wait of the writer's thread of 1 ms or more during the measured minute (only preemptions of 2–3 ms one second
+  after the start, in the warm-up, and one sleep of 10 ms after the aarch64 steady-90 run ended): those roll appends are CPU time in
+  the kernel (the writer's system time is 22.6 s for 801 rolls on aarch64, 22–32 s for 631–803 rolls on x86-64). The
+  same cost makes the readers' p99.9 on tmpfs 18–29 ms. With the spare segment the zeroing moves to the spare's thread:
+  rolls append in 26–38 µs and the writer's maximum at steady-90 is 48 µs (aarch64) and 100 µs (x86-64). Unpaced at
+  2.1–2.4 GB/s a spare is sometimes not ready (roll maxima 4.5 ms on aarch64 and 33 ms on x86-64).
+- **What the storage stack costs per append** (steady-90, 1,024 B, against tmpfs with a spare): p99.9 1.4–1.7 µs
+  (aarch64) and 2.8–3.9 µs (x86-64) more, p99.99 23–24 µs (aarch64) and 2.4–4.3 µs (x86-64) more; at 64 B the p99.9
+  and p99.99 of SSD and tmpfs are within 0.1–1 µs of each other (roll appends aside). These are the store faults on a
+  file-backed mapping (ext4's `page_mkwrite`) and, on aarch64, the waits below.
+- **What stays without a disk:** in every paced tmpfs run p99 of 0.2–0.4 µs (64 B) and 2.0–2.2 µs (1,024 B), p99.9
+  1.8–2.9 µs and p99.99 2.6–7.0 µs, and the readers' wake-ups: the mapped reader's p99.9 on tmpfs with a spare was 1.2 ms (aarch64)
+  and 0.97 ms (x86-64), not better than on x86-64's SSD (0.34–0.37 ms); one run each, not looked into.
+
+### One change at a time on the SSD (1,024 B)
+
+Rows in the order run, the base interleaved (two base runs in the first pass of the payload sweep and the change
+block, the others after it; the aarch64 base runs `-r2` and the extra early-write-back-off runs after the session's
+end, interleaved). Large dirty limits: 8 / 16 GiB on aarch64, 16 / 32 GiB on x86-64.
+
+aarch64, steady-90 (304,571 records/s, 324 MB/s, 92 % of the device):
+
+| Configuration | Runs | Late sends (%) | Seconds with an append ≥ 10 ms | ≥ 50 ms | Append p99.99 | Append max | Roll append p50 | Roll append max | Mapped reader p99.9 | To durable p50 | To durable max |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| ext4, defaults (base) | 4 | 3.8–9.9 | 36, 19, 32, 25 | 26, 5, 28, 2 | 27.1–28.6 | 83–144 ms | 175–912 | 3.3–92 ms | 48–129 ms | 273–391 ms | 496–836 ms |
+| no checkpoints (and no durable-only reader) | 1 | 1.2 | 0 | 0 | 26.7 | 1.3 ms | 887 | 1.1 ms | 714 | – | – |
+| early write-back off | 3 | 0.4–0.7 | 0, 0, 0 | 0, 0, 0 | 4.20–4.42 | 1.1–2.3 ms | 177 to 1.1 ms | 358 to 2.3 ms | 537 to 1.5 ms | 926 ms | 1.15 s |
+| ext4 `lazytime` | 1 | 1.3 | 3 | 2 | 27.5 | 82 ms | 186 | 82 ms | 52 ms | 332 ms | 674 ms |
+| spare segment on | 1 | 6.1 | 23 | 21 | 27.1 | 138 ms | 48.7 | 59.0 | 125 ms | 379 ms | 721 ms |
+| dirty limits 64 / 256 MiB | 1 | 10.0 | 29 | 22 | 28.3 | 142 ms | 176 | 1.6 ms | 132 ms | 360 ms | 963 ms |
+| dirty limits large (below) | 1 | 5.5 | 20 | 19 | 28.1 | 141 ms | 175 | 201 | 126 ms | 409 ms | 722 ms |
+| xfs (second local SSD) | 1 | 0.9 | 1 | 1 | 21.6 | 123 ms | 145 | 123 ms | 71 ms | 409 ms | 827 ms |
+| tmpfs | 2 | 5.3–5.4 | 60, 60 | 0, 0 | 3.89–4.16 | 20–21 ms | 19 ms | 20–21 ms | 20 ms | 41.6–43.0 | 50.4–53.3 |
+| tmpfs, spare segment on | 1 | 0.4 | 0 | 0 | 4.27 | 48.2 | 38.2 | 48.2 | 1.2 ms | 39.3 | 52.6 |
+
+aarch64, unpaced:
+
+| Configuration | Runs | MB/s | Writer off-CPU (s of 70) | Seconds with an append ≥ 50 ms | Append p99.99 | Append max | Roll append p50 | Roll append max | Mapped reader p99.9 | Dirty max (GiB) | To durable p50 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| ext4, defaults (base) | 3 | 428–434 | 53.9–54.1 | 29, 36, 30 | 13–15 ms | 303–376 ms | 195 to 3.9 ms | 101–224 ms | 607–631 | 5.1–5.4 | 31.37–33.00 s |
+| no checkpoints (and no durable-only reader) | 1 | 430 | 56.8 | 5 | 14 ms | 363 ms | 1.4 ms | 101 ms | 12.3 | 5.1 | – |
+| early write-back off | 1 | 426 | 54.0 | 10 | 14 ms | 271 ms | 184 | 25 ms | 622 | 5.2 | 23.12 s |
+| ext4 `lazytime` | 1 | 434 | 53.9 | 19 | 15 ms | 305 ms | 7.8 ms | 305 ms | 618 | 5.4 | 33.64 s |
+| spare segment on | 1 | 433 | 53.8 | 25 | 15 ms | 347 ms | 48.4 | 99 ms | 667 | 5.5 | 34.12 s |
+| dirty limits 64 / 256 MiB | 1 | 352 | 57.3 | 51 | 8.5 ms | 517 ms | 187 | 339 ms | 55 ms | 0.2 | 1.16 s |
+| dirty limits large (below) | 1 | 569 | 48.3 | 25 | 15 ms | 337 ms | 3.3 ms | 188 ms | 630 | 14.4 | 70.73 s |
+| xfs (second local SSD) | 1 | 430 | 54.8 | 0 | 14 ms | 26 ms | 161 | 25 ms | 642 | 5.1 | 32.40 s |
+| tmpfs | 2 | 1,795–1,808 | 0.0 | 0, 0 | 4.68–4.82 | 22–23 ms | 21 ms | 22–23 ms | 1.6–2.3 ms | 0.0 | 2.5 ms |
+| tmpfs, spare segment on | 1 | 2,375 | 0.0 | 0 | 4.85 | 10 ms | 2.5 ms | 4.5 ms | 2.2 ms | 0.0 | 2.5 ms |
+
+x86-64, steady-90 (311,614 records/s, 332 MB/s, 94 % of the device):
+
+| Configuration | Runs | Late sends (%) | Seconds with an append ≥ 10 ms | ≥ 50 ms | Append p99.99 | Append max | Roll append p50 | Roll append max | Mapped reader p99.9 | To durable p50 | To durable max |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| ext4, defaults (base) | 3 | 2.5–3.5 | 0, 0, 0 | 0, 0, 0 | 9.32–11.2 | 245–638 | 147–154 | 183–638 | 342–368 | 1.7–2.3 ms | 3.6–5.1 ms |
+| no checkpoints (and no durable-only reader) | 1 | 2.8 | 0 | 0 | 8.77 | 1.1 ms | 999 | 1.1 ms | 711 | – | – |
+| early write-back off | 1 | 1.5 | 0 | 0 | 9.03 | 557 | 180 | 557 | 437 | 933 ms | 1.15 s |
+| ext4 `lazytime` | 1 | 3.2 | 0 | 0 | 11.4 | 691 | 155 | 691 | 366 | 2.0 ms | 4.5 ms |
+| spare segment on | 1 | 2.8 | 0 | 0 | 9.92 | 293 | 46.9 | 66.2 | 247 | 1.6 ms | 3.7 ms |
+| dirty limits 64 / 256 MiB | 1 | 3.0 | 0 | 0 | 11.1 | 353 | 149 | 196 | 347 | 1.8 ms | 4.0 ms |
+| dirty limits large (below) | 1 | 2.6 | 0 | 0 | 9.53 | 865 | 147 | 865 | 344 | 1.7 ms | 3.7 ms |
+| xfs (second local SSD) | 1 | 2.5 | 0 | 0 | 8.92 | 576 | 140 | 576 | 296 | 1.4 ms | 1.9 ms |
+| two local SSDs in RAID 0, ext4 | 2 | 3.2–3.4 | 0, 0 | 0, 0 | 89.3–90.9 | 2.4–2.6 ms | 139–142 | 161–172 | 620–635 | 116–190 ms | 288–312 ms |
+| tmpfs | 2 | 7.9 | 59, 59 | 0, 0 | 6.99–7.04 | 31–33 ms | 27–28 ms | 31–33 ms | 28–29 ms | 49.2–170 | 245–256 |
+| tmpfs, spare segment on | 1 | 0.6 | 0 | 0 | 6.95 | 100 | 25.6 | 43.3 | 968 | 38.4 | 55.1 |
+
+x86-64, unpaced:
+
+| Configuration | Runs | MB/s | Writer off-CPU (s of 70) | Seconds with an append ≥ 50 ms | Append p99.99 | Append max | Roll append p50 | Roll append max | Mapped reader p99.9 | Dirty max (GiB) | To durable p50 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| ext4, defaults (base) | 3 | 506–507 | 43.8–45.1 | 29, 15, 1 | 13–14 ms | 273–437 ms | 173 to 11 ms | 273–437 ms | 481–793 | 10.1–10.2 | 51.98–52.41 s |
+| no checkpoints (and no durable-only reader) | 1 | 506 | 47.6 | 4 | 14 ms | 73 ms | 2.5 ms | 73 ms | 12.3 | 10.1 | – |
+| early write-back off | 1 | 502 | 45.1 | 18 | 13 ms | 351 ms | 8.2 ms | 351 ms | 567 | 10.2 | 44.33 s |
+| ext4 `lazytime` | 1 | 507 | 44.2 | 25 | 13 ms | 253 ms | 8.7 ms | 253 ms | 532 | 10.2 | 51.61 s |
+| spare segment on | 1 | 507 | 44.6 | 0 | 13 ms | 27 ms | 39.6 | 10 ms | 575 | 10.1 | 52.04 s |
+| dirty limits 64 / 256 MiB | 1 | 354 | 52.1 | 33 | 7.5 ms | 358 ms | 339 | 220 ms | 879 | 0.2 | 1.11 s |
+| dirty limits large (below) | 1 | 783 | 30.4 | 13 | 17.1 | 348 ms | 2.3 ms | 348 ms | 456 | 28.5 | 106.43 s |
+| xfs (second local SSD) | 1 | 503 | 45.5 | 1 | 13 ms | 56 ms | 168 | 56 ms | 540 | 9.8 | 50.33 s |
+| two local SSDs in RAID 0, ext4 | 2 | 850–851 | 24.5–25.2 | 4, 13 | 102–105 | 212–227 ms | 144–149 | 125–155 ms | 8.46–8.54 | 9.7 | 28.12–28.92 s |
+| tmpfs | 2 | 1,407–1,764 | 0.0–1.2 | 0, 0 | 7.18–13.9 | 32–35 ms | 29–30 ms | 32–35 ms | 1.7–3.6 ms | 0.0 | 1.8–2.0 ms |
+| tmpfs, spare segment on | 1 | 2,073 | 0.0 | 0 | 7.55 | 33 ms | 1.7 ms | 33 ms | 2.1 ms | 0.0 | 1.9 ms |
+
+The second aarch64 VM (`c4a-standard-8-lssd`, us-east1-b, 12:44–13:00, the same build; steady-90, 1,024 B, two runs
+each, interleaved; device sectors written from `/proc/diskstats` around each run):
+
+| Configuration | Runs | Seconds with an append ≥ 10 ms | Append p99.99 | Append max | Mapped reader p99.9 | To durable p50 | Device writes per run |
+|---|---|---|---|---|---|---|---|
+| ext4, defaults | 2 | 2, 1 | 28.8–29.3 | 10–16 ms | 3.3–6.4 ms | 46–73 ms | 24.36–24.39 GB |
+| early write-back off | 2 | 0, 0 | 4.10–4.28 | 1.0–1.1 ms | 453–465 | 928–929 ms | 22.70 GB |
+
+The records of a run (70 s at 324 MB/s) are 22.68 GB; fio's jobs at the same rate wrote 14.58 GB (`write` with range
+syncs, its data exactly) and 14.82 GB (mmap) in 45 s. The extra 1.7 GB per run (about 24 MB/s) is far more than the
+prefaulted window that each checkpoint writes as zeros (about 268 KiB a second, 2026-11-26, "what prefaulted,
+unwritten pages add to a checkpoint", above); that section also found more device writes with early write-back on
+(0.7–2.3 MiB per checkpoint at 21 MB/s), not investigated there either.
+
+- **Noise.** The base at aarch64 steady-90 drifted during the first session: 26 and 28 seconds with an append of 50
+  ms or more in the first two runs, 2 and 5 in the last two; on the second VM 0 and 0 (maxima 10–16 ms). From 10:52
+  on, every SSD run on that VM had a roll append p50 of 0.8–1.3 ms instead of 171–195 µs, with the same command; not
+  explained. On x86-64 the unpaced base had 29, 15 and 1 seconds with an append of 50 ms or more: no unpaced change
+  can be told from the base by that count. Every other row is one run.
+- **Early write-back off is the only change that removed the aarch64 stalls in every run** (5 of 5 on two VMs, against
+  every base run having appends of 10 ms or more, 10–144 ms at most), and with them the extra 7 % of device writes; its
+  p99.99 (4.1–4.4 µs) is tmpfs's. Its cost is the checkpoint: durable 0.93 s after the request (p50; at most 1.15 s)
+  instead of 0.05–0.39 s on aarch64 and 1.7–2.3 ms on x86-64, where the tail did not change (no stall either way). The
+  mechanism consistent with these figures, not traced here: with the device near its cap the queue holds write-back
+  that the ext4 journal's commit must wait behind (2026-11-25, "Where the writer's thread waits"), and the default
+  configuration both keeps that queue full and adds 7 % to it.
+- No checkpoints (one run): no stall either, at the cost of having no durability point. `lazytime` (one run): 3
+  seconds with an append of 10 ms or more, the longest a roll (82 ms), as in the 2026-11-25 runs. xfs (one run): one
+  roll of 123 ms, nothing else above 10 ms. The spare segment and either dirty limit: no change at steady-90.
+- **Unpaced**, nothing changed the rate except the dirty limits, which only change how much the page cache takes in
+  before the writer is throttled: small limits give the device's rate (352–354 MB/s) with checkpoints durable in about
+  1.1 s but the longest appends (358–517 ms, 33–51 seconds with 50 ms or more); large ones give 569–783 MB/s over 70 s
+  by holding 14–29 GiB dirty, with checkpoints a minute or more behind. xfs (aarch64 26 ms, x86-64 56 ms) and, on
+  x86-64, the spare segment (27 ms) had far lower append maxima than every base run on their machine (303–376 and
+  273–437 ms); one run each.
+- **RAID 0** (x86-64, two runs each): unpaced, 850–851 MB/s, the writer off-CPU 25 s instead of 44–45. At steady-90 it
+  made the tail worse: p99.99 89–91 µs against 9.3–11.2, maximum 2.4–2.6 ms against 0.25–0.64, checkpoints durable
+  after 116–190 ms against 2 ms. md's RAID 0 with 512 KiB chunks was not tuned or traced.
+
+### What would test it further
+
+Ranked by what it would tell against what it costs (cloud prices of this session):
+
+1. **Find the extra 7 % of device writes** (`blktrace` or a `block_rq_issue` probe by sector and file offset, default
+   against early write-back off, on aarch64 and x86-64, steady-90 and steady-50): whether pages are written twice and
+   why (ext4's conversion of unwritten extents, the journal; the prefaulted window that every checkpoint writes as
+   zeros is only about 268 KiB a second, 2026-11-26 "what prefaulted, unwritten pages add to a checkpoint", above, which
+   also saw 0.7–2.3 MiB more per checkpoint with early write-back on at 21 MB/s and did not look further). It is the only finding here that may be the library's to fix, and it may also explain why aarch64 falls
+   behind at 92 % of the cap while x86-64 keeps up at 94 % (x86-64's device bytes were not counted). About 30 minutes
+   on each shape: under A$1.
+2. **Map the knee:** steady rates at 80, 85, 90 and 95 % of the device's 351 MB/s, both payloads, 10-minute runs, with
+   and without early write-back, on the aarch64 shape (64 B at 89 % did not stall, 1,024 B at 92 % did). It would turn
+   "keep headroom" into a number for these devices. About 1.5 hours of `c4a-standard-8-lssd`: about A$1.1.
+3. **Network block storage**, which many users have instead of local NVMe: Hyperdisk Balanced or Extreme with
+   provisioned throughput (for example 500 MB/s) and IOPS, the same fio yardstick and scenarios. Higher per-request
+   latency (hundreds of µs), a different queue and possibly flushes. A session like this one on a `c4-standard-8` with
+   a provisioned 1 TB volume: about A$3–5 (the volume's provisioned throughput and IOPS cost by the hour).
+4. **Faster local storage**: the same shape family with four local SSDs striped (`c4a-standard-16-lssd`, about A$1.5
+   an hour) or a Z3 shape: shows whether tickertape keeps following the device past 1 GB/s and where the CPU limit
+   (tmpfs: 1.4–2.3 GB/s at 1–4 KiB on these CPUs) takes over, and whether md RAID 0 always costs this much latency at
+   paced rates.
+5. **One short bare-metal session with a known NVMe drive** (not run; the owner has skipped bare metal for now, and the
+   AWS credits could pay for it: `i4i.metal` or `z1d.metal` for one to two hours, about US$5–25 of credits). What it
+   would add that these VMs cannot: a real drive without the platform's flat rate cap, so its own behaviour shows
+   (write cache exhaustion, garbage collection, sustained rate after minutes, latency spikes that no limiter smooths);
+   real flush cost if the drive reports a volatile cache; no hypervisor in the I/O path; the fio yardstick against a
+   datasheet. The comparison: the same fio jobs and tickertape scenarios as here, 10-minute runs.
+6. **A drive with power-loss protection against one without**, for the checkpoint's sync: these cloud SSDs report a
+   write-through cache, so `fdatasync` sent no flush and checkpoints paid only for the writes. A consumer NVMe drive
+   with a volatile cache adds a FLUSH to every `fdatasync` (often milliseconds, more under load); a drive with
+   power-loss protection acknowledges it at once. Needs physical hardware (or a bare-metal instance whose drive model
+   is known); the fio job `4k, QD 1, fdatasync after each` above is the measure.
+
+### What these figures do not show
+
+One VM per architecture for the main session (and a second aarch64 VM for 16 minutes); runs of 60 s, so a 10-minute
+run has ten times the rolls and stalls, and an unpaced 60 s run is still filling the page cache (70 s runs flatter it
+by about 80 MB/s on aarch64 and 155 MB/s on x86-64). Most changes ran once. One device type (Google's local NVMe behind its
+rate cap), no network storage, no bare metal. The `fio` jobs approximate a journal: one thread, no readers, no prefault
+helper, no checkpoint thread except the `sync -d` loop, which syncs the whole file. Device bytes were counted only on
+the second aarch64 VM. Retention was 4 GiB, not the sessions' 64 GiB. The traced runs were the tmpfs runs only.
+
+## 2026-11-26, the layout of `Reader` (ADR 0057, issue #86; Google Cloud VMs)
+
+Why replay speed changed with the layout of `Reader` (PR #85 saw twice the time for the zero-copy reader at 64 B after
+a 40-byte change, on an Apple M4 Pro), and the before and after of the fixed layout of ADR
+[0057](decisions/0057-reader-layout.md). **Google Cloud virtual machines, not bare metal**; nothing here is compared
+with earlier sections. The Mac was not measured. Raw output (results, layouts, disassembly, counters, the probe and the
+scripts) is kept outside the repository.
+
+### Environment and method
+
+| | x86-64 | aarch64 |
+|---|---|---|
+| Machine | `c4-standard-4-lssd` (us-east1-b): Intel Xeon 6985P-C, 2 cores with 2 threads each, 15 GB | `c4a-standard-4-lssd` (us-east1-b): Google Axion (Neoverse-V2), 4 cores, 16 GB; the final comparison on a second VM of the same type |
+| Time (UTC) | 2026-11-26 09:04–11:05 | 09:04–10:17 and 10:35–10:53 |
+| Kernel, OS | 7.0.0-1017-gcp, Ubuntu 24.04 LTS, `randomize_va_space` 2 | the same |
+| Counters | the VM's PMU (`--performance-monitoring-unit=standard`), `perf stat` | the same |
+| rustc | 1.100.0, release profile as in the repository | the same |
+
+Journals of 1,000,000 records of 64 B and 100,000 of 1,024 B (written once, page cache warm) on ext4 on the local SSD.
+Two harnesses: the repository's `replay` benchmark (criterion, `--bench 'replay/records/' --warm-up-time 1
+--measurement-time 2 or 3`), and a probe (not in the repository) that replays the same journals with the `Reader`
+either on the stack of the replay function, as the benchmark has it (Linux puts it at a new offset within a page in
+each process), or at a chosen address modulo 4096, and prints the median ns per record of 9 passes (5 in the sweeps)
+after one untimed pass. Builds of one comparison ran interleaved in a rotating order; the noise floor is the same
+binary under a second name. Ratios are medians of the per-round ratios against the reference build. Layouts were
+read from `std::mem::offset_of!` in each build.
+
+### The padding of PR #85 does not reproduce on Linux
+
+Builds of `main` (`b88c6d5f`, where rustc puts `found` at offset 400): padding of 8, 16, 24, 32, 40, 48 and 64 bytes
+left to rustc (it puts it after `found`), the same as `[u64; n]`, `#[repr(C)]` with rustc's order (`cmain`) and 8 to 64
+bytes before every field or after every field, `segments_listed` unboxed as in PR #85, PR #85's own commits
+(`07a0ac09c2`, field unboxed; `47b7d8a1c0`, boxed), and four builds with every function and block aligned (`-C
+llvm-args=-align-all-functions=6 -C llvm-args=-align-all-nofallthru-blocks=5`). Reader on the stack, 8 rounds,
+ratio of the median ns per record against `main`:
+
+| Case | x86-64: 26 builds | x86-64: `cmain` | aarch64: 26 builds | aarch64: `cmain` |
+|---|---|---|---|---|
+| mapped, 64 B | 0.981–1.017 | 1.005 | 0.979–1.014 | 1.001 |
+| safe, 64 B | 0.979–1.001 | 0.989 | 0.991–1.010 | 1.005 |
+| mapped, 1,024 B | 0.991–1.005 | 0.991 | 0.997–1.009 | 1.001 |
+| safe, 1,024 B | 0.981–1.023 | 0.983 | 0.996–1.026 | 1.002 |
+
+PR #85's commits, mapped 64 B: 36.91 ns (boxed) and 37.09 ns (unboxed) per record on aarch64, 45.50 and 44.79 ns on
+x86-64 (whose rounds were noisy in that hour, 40 to 51 ns for `main`). The criterion benchmark of the main padding
+builds stayed within 2 % of `main` on both machines.
+
+### What it depends on: a page boundary inside `found`
+
+The reader at 80 addresses (every 8 bytes of a cache line, every 64 bytes of a page) showed one reproducible outlier,
+on both machines: 40 bytes before every field, at 3648 modulo 4096 (x86-64 50.0 / 49.4 ns against a median of 41.1;
+aarch64 41.2 / 41.5 against 36.5). There the page boundary falls 8 bytes into `found`. The **page sweep** then put the
+boundary at every offset `j` of the struct (reader at `4096 − j`, steps of the struct's alignment), one timed round and
+one under `perf stat`, both 64-byte cases. Offsets more than 5 % above the median of all offsets, in both rounds where
+there were two:
+
+| Build (`found` at) | x86-64 | aarch64 |
+|---|---|---|
+| `main` `b88c6d5f` (400) | `j` 408: +16 % mapped, +28 % safe; 424: +9 % / +15 % | 408: +16 % / +15 %; 440: +16 % / +16 % |
+| 40 bytes before every field (440) | 448: +19 % / +23 %; 464: +10 % / +6 % | 448: +15 % / +14 %; 480: +16 % / +17 % |
+| `main` `42b2307e` (400), three sessions | 408: +14 to +24 % / +26 to +30 %; 424: +8 to +17 % / +11 to +16 % | 408: +15 to +16 % / +14 to +21 %; 440: +15 to +16 % / +16 % |
+| ADR 0057's layout (400, aligned to 16), two sessions | none | none |
+| the first candidate (`found` at 0) without its alignment | 8: +16 % / +27 %; 24: +10 % / +14 % | 8: +16 % / +17 %; 40: +7 % / +9 % |
+
+Single offsets were sometimes slow in one round and not in the other (noise; more often on x86-64); none of those is
+listed. Counters per record at the slow offsets against all others:
+
+| | x86-64 | aarch64 |
+|---|---|---|
+| `found` + 8 | `ld_blocks.store_forward` 8.98 against 7.94 (mapped), 5.01 against 4.02 (safe); `mem_inst_retired.split_loads`/`split_stores` unchanged | `st_align_lat` 1.0 against 0.00; `ld_align_lat` +1 to +2 |
+| `found` + 24 (x86-64), + 40 (aarch64) | none of the measured counters moves (`ld_blocks.store_forward` 7.97–8.17) | `st_align_lat` 1.0 against 0.00 |
+
+The record path writes `found.header` with two 16-byte stores and reads it with 16-byte loads (aarch64 also stores
+`payload_at` and `payload_len` as one pair). A store that straddles two pages is slow on aarch64; on x86-64 the load
+after it at `found` + 8 is not forwarded, and what makes `found` + 24 slow was not identified by these counters. Of
+1,802 ordinary probe processes with `main`'s layout (reader on the stack), 9 had a boundary at a hot offset of `found`;
+those at `found` + 8 replayed 64-byte records 14 to 21 % slower than the median of their build, 1,024-byte records 3 to
+16 %.
+
+**Ruled out on these machines**: 4K aliasing (x86-64 `ld_blocks.address_alias` reaches 7.3 per record at some of 64
+addresses, with no change in time); cache-line splits (`found` + 8 at a line boundary inside a page: within 1 %); the
+size of the struct as the cause (padding after every field; but see the 40-byte tail padding below); code alignment (the
+aligned builds, and the slowdown follows the address with identical code); the stack against a boxed reader.
+
+### Before and after (`42b2307e` against ADR 0057's layout)
+
+See ADR 0057 → "Before and after" for the tables: probe, 30 rounds, median of per-round ratios to `main` 0.978–0.993
+on x86-64 (noise floor 0.994–1.003) and 0.972–0.997 on aarch64 (0.999–1.007); criterion, 6 rounds, within the noise on
+both. Two other orders were measured on x86-64 and rejected: the hot fields first with `found` at 0 (mapped 64 B 1.013
+to 1.021 in three sessions, 1.019 without the alignment, 1.031 with aligned code) and the scalar fields first with
+`found` at 224 (1.030); the other cases level. On aarch64 the first was 0.977. Padding at the end of ADR 0057's layout:
+64 bytes −0.3 to +1.3 % on both machines; 40 bytes −0.4 to +0.2 % on aarch64, and on x86-64 +3.9 % and +1.9 % for the
+zero-copy reader at 64 B in two sessions (+2.1 % with aligned code), the other cases within noise.
+
+### What these figures do not show
+
+The Apple M4 Pro where #85 saw the effect (16 KiB pages; not measured, see ADR 0057); other microarchitectures; readers
+held by the bindings; 32-bit targets. Why the hot-fields-first orders and the 40-byte tail padding cost a few per cent on
+x86-64.
 
 ## 2026-11-02, v0.3.0 on Linux (AWS) and macOS
 

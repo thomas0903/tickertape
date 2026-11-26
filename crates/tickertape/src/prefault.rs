@@ -21,7 +21,7 @@ pub(crate) const WINDOW: u64 = if cfg!(target_vendor = "apple") {
     256 << 10
 };
 /// The window the helper keeps prefaulted: [`WINDOW`], or with `--cfg tickertape_pf_exp` the experiment's
-/// (`TT_PF_WINDOW_KIB`, ADR 0057; never in a default build).
+/// (`TT_PF_WINDOW_KIB`, ADR 0058; never in a default build).
 #[inline]
 fn window() -> u64 {
     #[cfg(tickertape_pf_exp)]
@@ -30,7 +30,7 @@ fn window() -> u64 {
     WINDOW
 }
 
-/// EXPERIMENT (ADR 0057, compiled only with `--cfg tickertape_pf_exp`; no default build has it): switches read once
+/// EXPERIMENT (ADR 0058, compiled only with `--cfg tickertape_pf_exp`; no default build has it): switches read once
 /// from the environment.
 /// - `TT_PF_WINDOW_KIB`: the prefault window in KiB instead of [`WINDOW`].
 /// - `TT_PF_RETOUCH`: at each wake-up the helper prefaults again from the writer's page, so that pages a write-back
@@ -43,7 +43,11 @@ pub(crate) mod exp {
     use std::sync::OnceLock;
 
     fn kib(name: &str) -> Option<u64> {
-        std::env::var(name).ok()?.parse::<u64>().ok().map(|k| k << 10)
+        std::env::var(name)
+            .ok()?
+            .parse::<u64>()
+            .ok()
+            .map(|k| k << 10)
     }
 
     pub(crate) fn window() -> u64 {

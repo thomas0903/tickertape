@@ -304,7 +304,7 @@ pub(crate) fn run(job: &Job, ctx: &Context, on: On) -> Result<CheckpointSlot> {
     result
 }
 
-/// EXPERIMENT (ADR 0057; `--cfg tickertape_pf_exp` only): whether `seg` is the active segment `last`, held with its
+/// EXPERIMENT (ADR 0058; `--cfg tickertape_pf_exp` only): whether `seg` is the active segment `last`, held with its
 /// mapping, on Linux, with `TT_PF_RANGED` set.
 #[cfg(tickertape_pf_exp)]
 fn exp_ranged(seg: &DirtySegment, last: &DirtySegment) -> bool {
@@ -370,7 +370,7 @@ fn steps(job: &Job, ctx: &Context, on: On) -> Result<CheckpointSlot> {
                 Arc::new(file)
             }
         };
-        // EXPERIMENT (ADR 0057; `--cfg tickertape_pf_exp` only, as the never-merged `TT_EXP_RANGED` of issue #62):
+        // EXPERIMENT (ADR 0058; `--cfg tickertape_pf_exp` only, as the never-merged `TT_EXP_RANGED` of issue #62):
         // `TT_PF_RANGED` syncs the active segment with its ranged `msync` alone, without this whole-file `fdatasync`
         // and without the barrier below, so that the pages prefaulted ahead of the writer are not written back.
         #[cfg(tickertape_pf_exp)]

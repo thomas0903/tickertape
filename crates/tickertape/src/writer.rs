@@ -82,7 +82,7 @@ pub struct Writer {
     notify: Option<mmap::Notify>,
     /// The background prefault thread, if enabled and started (ADR 0020).
     prefault: Option<Prefaulter>,
-    /// EXPERIMENT (ADR 0057; `--cfg tickertape_pf_touch_append` only): the offset from which the next append touches
+    /// EXPERIMENT (ADR 0058; `--cfg tickertape_pf_touch_append` only): the offset from which the next append touches
     /// the following page on this thread, as Chronicle Queue's `microTouch()` does.
     #[cfg(tickertape_pf_touch_append)]
     touch_next: u64,
@@ -650,7 +650,7 @@ impl Writer {
         Ok(Ok(seq))
     }
 
-    /// EXPERIMENT (ADR 0057; `--cfg tickertape_pf_touch_append` only): the writer entered a new page; touch the next
+    /// EXPERIMENT (ADR 0058; `--cfg tickertape_pf_touch_append` only): the writer entered a new page; touch the next
     /// one now, once.
     #[cfg(tickertape_pf_touch_append)]
     #[cold]
@@ -661,7 +661,7 @@ impl Writer {
         self.active.map.exp_touch(next);
     }
 
-    /// EXPERIMENT (ADR 0057; compiled only with `--cfg tickertape_pf_exp`, never in a default build): what a
+    /// EXPERIMENT (ADR 0058; compiled only with `--cfg tickertape_pf_exp`, never in a default build): what a
     /// `Writer::idle()` could do while the application waits between appends. Takes the write fault, if any, of the
     /// page that holds the write position and of the next page now, on this thread, with an atomic `fetch_or(0)` on
     /// a word of each that readers only load atomically. Chronicle Queue's `microTouch()` touches the next page only,
@@ -1792,7 +1792,7 @@ impl Recovery<'_> {
             // marker vouches for records the segment does not hold (segments restored from a backup older than the
             // marker, or the last covered record damaged), and appending at the marker would make that gap part of
             // the journal. Refused under every policy, before anything is changed.
-            if !format::record_ends_at(&RwView(&seg.map), seg.base, offset, seq) {
+            if !format::marker_reached(&RwView(&seg.map), &c) {
                 return Err(Error::corrupt(
                     &seg.path,
                     offset,

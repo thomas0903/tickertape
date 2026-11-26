@@ -1,6 +1,6 @@
 #!/usr/bin/env bpftrace
 /*
- * Every page fault of the thread named tt-faults* (the writer of benches' tt-faults, ADR 0057), what kind it was and
+ * Every page fault of the thread named tt-faults* (the writer of benches' tt-faults, ADR 0058), what kind it was and
  * what it waited for, with the write-back calls of the writer's helper threads and of the checkpoint thread around it.
  * Wall-clock times (Unix seconds), to line up with tt-faults --log.
  *
@@ -22,7 +22,8 @@ kprobe:handle_mm_fault /strncmp(comm, "tt-faults", 9) == 0/ {
 }
 kprobe:filemap_fault /@s[tid]/ { @np[tid] = 1; }
 kprobe:jbd2__journal_start /@s[tid]/ { @js[tid] = @js[tid] + 1; }
-@XFSPROBE@
+// On xfs, also count its transactions (the probe exists only with xfs loaded; the runs of ADR 0058 added it there):
+// kprobe:xfs_trans_alloc /@s[tid]/ { @xt[tid] = @xt[tid] + 1; }
 kprobe:folio_wait_writeback /@s[tid]/ { @wb[tid] = @wb[tid] + 1; }
 kprobe:__folio_lock /@s[tid]/ { @lk[tid] = @lk[tid] + 1; }
 kretprobe:handle_mm_fault /@s[tid]/ {

@@ -172,6 +172,48 @@ fn move_with_age_and_conflict() {
 
 /// A damaged record in a candidate stops a move (exit 2), which validates every record; a deletion checks the seal
 /// and not the records it discards, so it removes the segment (ADR 0044). A damaged seal stops a deletion too.
+/// A marker the writer refuses because the last record it covers is damaged (ADR 0056): `archive` removes nothing and
+/// exits 2 with the writer's error, with `--dry-run` too.
+#[test]
+fn refused_marker_removes_nothing_exit_two() {
+    let (dir, writer) = journal();
+    drop(writer);
+    // One 40,040-byte frame per segment: record 4 at offset 64 of the newest segment, the marker after it.
+    let marker = inspect::read_checkpoint(dir.path()).unwrap().unwrap();
+    assert_eq!((marker.segment_base_seq, marker.next_seq), (4, 5));
+    let segment = dir.path().join("00000000000000000004.tape");
+    let mut data = fs::read(&segment).unwrap();
+    data[64..68].fill(0);
+    fs::write(&segment, data).unwrap();
+    let dest = tempfile::tempdir().unwrap();
+    let message = format!("{}", segment.display());
+    for args in [
+        vec!["--delete", "--keep-segments", "0", "--dry-run"],
+        vec!["--delete", "--keep-segments", "0"],
+        vec![
+            "--to",
+            dest.path().to_str().unwrap(),
+            "--keep-segments",
+            "0",
+        ],
+    ] {
+        command()
+            .arg("archive")
+            .arg(dir.path())
+            .args(&args)
+            .assert()
+            .code(2)
+            .stdout(predicate::str::is_empty())
+            .stderr(predicate::str::contains(message.as_str()));
+        assert_eq!(
+            inspect::list_segments(dir.path()).unwrap().len(),
+            5,
+            "{args:?}"
+        );
+    }
+    assert_eq!(fs::read_dir(dest.path()).unwrap().count(), 0);
+}
+
 #[test]
 fn corrupt_candidate_exit_two_missing_journal_exit_one() {
     let (dir, _writer) = journal();
