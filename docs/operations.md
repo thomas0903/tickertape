@@ -23,21 +23,23 @@ draws conclusions from those two.
   the checkpoint (ADR 0046), so seeking forward through a checkpointed segment reads it once, not once for each seek. `Reader::seek_to_end` reads at most
   the newest segment, from the checkpoint on. For seeks into sealed segments, seek indexes make the cost independent of
   the segment size ("Seek indexes" below); they do nothing for the newest segment.
-- **Segment count.** Opening a reader or a writer and each seek read the whole journal directory; `list_segments`,
-  `verify` and each retention run (when retention is configured, at writer open and after checkpoints) open every
-  segment's file; replay opens each segment it enters. These costs grow with the number of segments, so very small
-  segments in a long-lived journal make them add up (ADR 0042). Measured on local SSD (`benchmarks.md`, 2026-11-25):
+- **Segment count.** Opening a reader or a writer, each seek and each retention run (when retention is configured, at
+  writer open and after checkpoints) read the whole journal directory; `list_segments` and `verify` open every segment's
+  file; replay opens each segment it enters. These costs grow with the number of segments, so very small segments in a
+  long-lived journal make them add up (ADR 0042). Measured on local SSD (`benchmarks.md`, 2026-11-25):
   journals of 10,000, 20,000 and 100,000 segments open, recover, replay and checkpoint, and no operation held more
   than 12 open files at 10 to 20,000 segments (not sampled at 100,000). What a writer can hold at most does not depend
   on the number of segments either (at most 20 files, "Open files" below), so the limit on open files (`ulimit -n`) is
-  not a constraint on the number of segments. The directory read is: each seek costs about 3 ms at 10,000 segments, 6 ms at 20,000 and 29 ms at 100,000,
-  also with a seek index, and each retention run opens every header (x86-64: 29 ms at 10,000 segments, 67 ms at 20,000,
-  0.34 s at 100,000 with a warm cache; seconds when it is cold, as at the open of a writer after a reboot). The appending
-  thread pays for that in `checkpoint()` and in the open; a background checkpoint (`request_checkpoint`) runs retention
-  on the checkpoint thread. Deleting a segment reads the directory again, about 8 ms each at 20,000 segments (x86-64).
-  So plan for at most a few thousand segments in a journal with retention (a larger segment, or fewer kept). The costs
-  are issue #80. Fewer, larger segments make checkpoints with retention cheaper. They make a seek without a seek index
-  slower (up to a whole segment is read). So use an index with large segments.
+  not a constraint on the number of segments. The directory read is: each seek costs about 3 ms at 10,000 segments, 6 ms at
+  20,000 and 29 ms at 100,000, also with a seek index, and so does each retention run (from 1.1, ADR 0051; x86-64, warm: a
+  checkpoint with a policy that removes nothing 3 ms, 6 ms and 31 ms, against 0.3 ms without one; up to 1.0 every run
+  opened every segment, about ten times as much, and seconds with a cold cache). With `max_bytes` a writer's open also asks for
+  every file's size (cold: 0.05 s, 0.11 s and 0.58 s in all). Removing a segment costs 0.4 ms at 10,000 and 20,000
+  segments and 0.6 ms at 100,000 (64 KiB segments), one listing per 100 removals included. The appending thread
+  pays for retention in `checkpoint()` and in the open; a background checkpoint (`request_checkpoint`) runs it on the
+  checkpoint thread. So with blocking checkpoints and retention, plan for a number of segments whose directory read you
+  accept per checkpoint (a larger segment, or fewer kept). Larger segments make a seek without a seek index slower (up to
+  a whole segment is read), so use an index with large segments.
 - **Granularity of archiving.** You archive or delete whole segments (below).
 
 For most uses the default is a reasonable start. Pick smaller segments (a few MiB) for low-volume journals you
@@ -230,6 +232,13 @@ The same rules apply to the library and CLI, without taking the writer lock:
   sealed longer ago than D. Seal time is the successor header's creation time, not file modification time.
   Counts and bytes include the active segment. Checkpoint eligibility can prevent reaching the requested limit.
   The cost of a run grows with the number of segments left in the journal ("Segment count" above).
+- A run reads only what the limits need (ADR 0051). Damage in a segment they do not need does not stop it and is not
+  reported by it: run `tickertape verify` regularly. Damage in a segment to remove, in the one after it or in the marker's
+  stops it, as does, with an age limit, damage in the first segment that is young enough or its successor, and with a
+  size limit, damage in the marker's segment and those after it, and in a file whose length differs from the one before
+  it (their headers are read to confirm their sizes).
+- Do not put segment files back into a journal while retention or `archive` runs on it: a run lists the directory once
+  and does not notice every file that appears in front of the oldest segment (crash contract C14).
 - Moves preserve the segment basename and require an existing destination directory. Same-filesystem moves use
   an atomic no-replace rename. `EXDEV` selects copy, sync the copy, sync the destination directory, remove the
   source, sync the journal directory. Existing files (including symlinks and identical copies) are errors.

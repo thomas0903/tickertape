@@ -81,6 +81,10 @@ name = "retention"
 path = "retention.rs"
 
 [[test]]
+name = "retention_at_scale"
+path = "retention_at_scale.rs"
+
+[[test]]
 name = "status"
 path = "status.rs"
 

@@ -247,6 +247,8 @@ pub(crate) struct Context {
     pub(crate) writeback_failed: std::sync::atomic::AtomicBool,
     /// Wakes durable-only readers once a marker is durable (ADR 0017).
     pub(crate) notify: Option<NotifyPublisher>,
+    /// Segment sizes kept between this writer's retention runs (ADR 0051). Only a retention run takes it.
+    pub(crate) retention_sizes: Mutex<crate::retention::Sizes>,
 }
 
 /// Which thread runs a job: the fault-injection points differ (thread-local on the writer's thread).
@@ -407,17 +409,14 @@ pub(crate) struct RetentionOutcome {
 /// segment once `stop(handled)` returns true for the number of planned segments handled so far (never before the
 /// first); the error, if any.
 pub(crate) fn retention_pass(
-    dir: &std::path::Path,
+    ctx: &Context,
     policy: &Policy,
     action: &Action,
     report: &mut Report,
     stop: &dyn Fn(usize) -> bool,
 ) -> Option<Error> {
-    crate::retention::plan_until(dir, policy, stop)
-        .and_then(|plan| {
-            crate::retention::apply_into(dir, &plan, action, report, false, Some(stop))
-        })
-        .err()
+    let mut sizes = lock(&ctx.retention_sizes);
+    crate::retention::run(&ctx.dir, policy, action, report, &mut sizes, Some(stop)).err()
 }
 
 /// The writer's handle on its checkpoint thread.
@@ -631,7 +630,7 @@ fn run_thread(shared: &Shared, ctx: &Context, retention: Option<&(Policy, Action
                         lock(&shared.state).retention_should_stop(handled, covered, out_of_time)
                     };
                     let error = panic::catch_unwind(AssertUnwindSafe(|| {
-                        retention_pass(&ctx.dir, policy, action, &mut report, &stop)
+                        retention_pass(ctx, policy, action, &mut report, &stop)
                     }))
                     .unwrap_or_else(|_| {
                         Some(Error::io(

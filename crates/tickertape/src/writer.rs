@@ -235,6 +235,7 @@ impl Writer {
             writeback_failure: Mutex::new(None),
             writeback_failed: std::sync::atomic::AtomicBool::new(false),
             notify: notify.as_ref().map(mmap::Notify::publisher),
+            retention_sizes: Mutex::default(),
         });
         // Linux only (`WriteBack::start` returns `None` elsewhere); `prefault(false)` means no helper threads.
         let writeback = (config.early_writeback && config.prefault)
@@ -1047,16 +1048,14 @@ impl Writer {
         let Some((policy, action)) = &self.config.retention else {
             return;
         };
-        let result = crate::retention::plan(&self.root, policy).and_then(|plan| {
-            crate::retention::apply_into(
-                &self.root,
-                &plan,
-                action,
-                &mut self.retention_report,
-                false,
-                None,
-            )
-        });
+        let result = crate::retention::run(
+            &self.root,
+            policy,
+            action,
+            &mut self.retention_report,
+            &mut checkpoint::lock(&self.ctx.retention_sizes),
+            None,
+        );
         if let Err(error) = result {
             self.last_retention_error = Some(error);
             self.retention_failures = self.retention_failures.saturating_add(1);
