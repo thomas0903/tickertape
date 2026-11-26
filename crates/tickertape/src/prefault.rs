@@ -35,8 +35,9 @@ fn window() -> u64 {
 /// - `TT_PF_WINDOW_KIB`: the prefault window in KiB instead of [`WINDOW`].
 /// - `TT_PF_RETOUCH`: at each wake-up the helper prefaults again from the writer's page, so that pages a write-back
 ///   cleaned (and write-protected) ahead of the writer are made writable again before the writer reaches them.
-/// - `TT_PF_WB_LAG_KIB`: early write-back stops this far behind the writer, rounded down to 2 MiB (the largest folio
-///   of the page cache with 4 KiB pages), so that it never writes back the folio that holds the writer's position.
+/// - `TT_PF_WB_LAG_KIB`: early write-back stops this far behind the writer, rounded down to `TT_PF_WB_ALIGN_KIB`
+///   (default 2 MiB, the largest folio of the page cache with 4 KiB pages), so that it never writes back the folio
+///   that holds the writer's position.
 #[cfg(tickertape_pf_exp)]
 pub(crate) mod exp {
     use std::sync::OnceLock;
@@ -55,13 +56,19 @@ pub(crate) mod exp {
         *R.get_or_init(|| std::env::var_os("TT_PF_RETOUCH").is_some())
     }
 
-    /// The end of the range early write-back may start for a writer at `position`.
+    /// The end of the range early write-back may start for a writer at `position`: with `TT_PF_WB_LAG_KIB` set,
+    /// `position` less the lag, rounded down to `TT_PF_WB_ALIGN_KIB` (default 2 MiB).
     pub(crate) fn writeback_limit(position: u64, page: u64) -> u64 {
-        static L: OnceLock<u64> = OnceLock::new();
-        const ALIGN: u64 = 2 << 20;
-        match *L.get_or_init(|| kib("TT_PF_WB_LAG_KIB").unwrap_or(0)) {
+        static L: OnceLock<(u64, u64)> = OnceLock::new();
+        let (lag, align) = *L.get_or_init(|| {
+            (
+                kib("TT_PF_WB_LAG_KIB").unwrap_or(0),
+                kib("TT_PF_WB_ALIGN_KIB").unwrap_or(2 << 20).max(4096),
+            )
+        });
+        match lag {
             0 => position / page * page,
-            lag => position.saturating_sub(lag) / ALIGN * ALIGN,
+            lag => position.saturating_sub(lag) / align * align,
         }
     }
 }
