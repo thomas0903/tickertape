@@ -22,9 +22,9 @@ const CHUNK: usize = 64 * 1024;
 /// spare: the bytes after the newest record are zeros, which it would otherwise copy for nothing, once for every record.
 const TAIL_CHUNK: usize = 4 * 1024;
 /// How many fills in a row must show that the reader has time to spare before it reads [`TAIL_CHUNK`] ([`Reader::fill_size`]).
-const TAIL_FILLS: u8 = 16;
+const TAIL_FILLS: u16 = 16;
 /// While the reads are tail reads, one fill in this many reads a whole chunk anyway ([`Reader::fill_size`]).
-const TAIL_PROBE: u8 = 128;
+const TAIL_PROBE: u16 = 256;
 /// Longest single block on the wake-up region when the writer maintains it (bounded so that a writer that died, or a
 /// missed wake-up, costs at most this much latency; the identity check also runs at least this often).
 const NOTIFY_MAX_WAIT: Duration = Duration::from_millis(100);
@@ -108,7 +108,7 @@ pub struct Reader {
     buf_start: u64,
     /// How many fills in a row found the reader following the writer with time to spare, counted from 1 up to
     /// `TAIL_FILLS + TAIL_PROBE - 1` and then from `TAIL_FILLS` again ([`Reader::fill_size`], ADR 0052). Read and written only by fills of the `pread` buffer, and by a `seek_to_end` that fails.
-    tail_fills: u8,
+    tail_fills: u16,
     /// The journal's wake-up region, if wake-ups are enabled (ADRs 0017 and 0021).
     waker: Option<crate::notify::Waker>,
     /// When the reader started waiting at an empty slot.
@@ -160,7 +160,7 @@ struct Place {
     superseded_checked: Option<Instant>,
     buf: Vec<u8>,
     buf_start: u64,
-    tail_fills: u8,
+    tail_fills: u16,
     waiting_since: Option<Instant>,
     found: Found,
 }
@@ -1464,11 +1464,11 @@ impl Reader {
     /// when it is [`TAIL_CHUNK`]. Not observable except through timing and system calls (ADR 0052).
     ///
     /// A fill *follows* if the slot at the cursor was found empty before it (so the reader was waiting for this record)
-    /// and what the reader used of the last fill, at least one record, would have fitted in a tail read. After
-    /// [`TAIL_FILLS`] such fills in a row, that one included, the reads are tail reads, for as long as every fill follows,
-    /// except that one in [`TAIL_PROBE`] of them reads a whole chunk anyway. The first one that does not follow is a whole
-    /// chunk again, and the count starts over: the reader found the next record without waiting, or used more than a tail
-    /// read. So the reader takes tail reads only where it has shown that it waits for the writer even when it reads whole
+    /// and the reader used exactly one record of the last fill (so it was waiting for that one too). After [`TAIL_FILLS`]
+    /// such fills in a row, that one included, the reads are tail reads, for as long as every fill follows, except that one
+    /// in [`TAIL_PROBE`] of them reads a whole chunk anyway. The first one that does not follow is a whole chunk again, and
+    /// the count starts over: the reader found the next record without waiting, or more than one record in the last fill.
+    /// So the reader takes tail reads only where it has shown that it waits for the writer even when it reads whole
     /// chunks, and keeps showing it: a blocking reader that waits for every record only because its tail reads are fast
     /// would not, after a whole chunk, wait for the next one, and goes back to whole chunks. A fill always reads a whole
     /// chunk if it is
@@ -1478,10 +1478,14 @@ impl Reader {
     ///   on an intact journal (a seek, a seal and each record passed end the wait at a slot);
     /// - a repeated one of the same slot, when its record failed validation.
     fn fill_size(&mut self, offset: u64) -> u64 {
-        // `waiting_since` is set at an empty slot and cleared when the cursor moves; the first slot of a segment lies at
-        // or before the start of the last fill, in the segment before.
+        // `waiting_since` is set at an empty slot and cleared when the cursor moves. The last fill began at a slot, so the
+        // buffer starts with that slot's commit word, unless it was emptied since (by a seek, a seal, a marker refresh or a
+        // failed read); the first slot of a segment lies at or before the start of the last fill, in the segment before.
         let used = offset.saturating_sub(self.buf_start);
-        let follows = self.waiting_since.is_some() && (1..=TAIL_CHUNK as u64).contains(&used);
+        let first = self.buf.first_chunk::<4>().map(|w| u32::from_le_bytes(*w));
+        let follows = self.waiting_since.is_some()
+            && first
+                .is_some_and(|w| w != format::SEAL_MARKER && format::align8(u64::from(w)) == used);
         // The fill counted `probe` reads a whole chunk; the count then goes on as from the first tail read.
         let probe = TAIL_FILLS + TAIL_PROBE - 1;
         self.tail_fills = match self.tail_fills {
@@ -2250,7 +2254,7 @@ mod tests {
         // reads as long as the reader still waits after it.
         for cycle in 0..3 {
             // The first cycle's first tail read was the last fill of `shrink`.
-            for _ in u8::from(cycle == 0) + 1..TAIL_PROBE {
+            for _ in u16::from(cycle == 0) + 1..TAIL_PROBE {
                 assert_eq!(f.follow(64), TAIL_CHUNK as u64);
             }
             assert_eq!(f.follow(64), CHUNK as u64);
@@ -2258,11 +2262,13 @@ mod tests {
         for _ in 0..50 {
             assert_eq!(f.follow(64), TAIL_CHUNK as u64);
         }
-        // Several records at once, that a tail read holds.
+        // Several records at once, that a tail read holds: the reader did not wait for each, so the next fill is a whole
+        // chunk, and the count starts over.
         f.poll_empty();
         f.append(39, 64);
         assert_eq!(f.read(39, 64), [TAIL_CHUNK as u64]);
-        assert_eq!(f.follow(64), TAIL_CHUNK as u64);
+        assert_eq!(f.follow(64), CHUNK as u64);
+        f.shrink();
         // A record that was there at once (after a whole chunk, as when a probe found that the reader no longer waits):
         // whole chunks again, and the count starts over.
         f.at_once(64);
@@ -2281,36 +2287,38 @@ mod tests {
             assert_eq!(f.follow(64), CHUNK as u64);
             f.at_once(64);
         }
-        // Batches larger than a tail read: never tail reads, though each is waited for.
+        // Batches: never tail reads, though each is waited for.
         for _ in 0..4 * TAIL_FILLS {
             f.poll_empty();
-            f.append(40, 64);
-            assert_eq!(f.read(40, 64), [CHUNK as u64]);
+            f.append(2, 64);
+            assert_eq!(f.read(2, 64), [CHUNK as u64]);
         }
     }
 
-    /// A record larger than a tail read is read whole, and is the last tail read: the reader used more than one holds.
+    /// A record larger than a tail read is read whole, and the reads stay tail reads.
     #[test]
     fn a_record_larger_than_a_tail_read_is_read_whole() {
         let mut f = Follow::new(1 << 20);
         f.shrink();
-        assert_eq!(f.follow(10_000), 10_040);
-        assert_eq!(f.follow(10_000), CHUNK as u64);
         for _ in 0..4 * TAIL_FILLS {
-            assert_eq!(f.follow(10_000), CHUNK as u64);
+            assert_eq!(f.follow(10_000), 10_040);
         }
-        assert_eq!(f.follow(64), CHUNK as u64);
-        f.shrink();
+        assert_eq!(f.follow(64), TAIL_CHUNK as u64);
         // Larger than a whole chunk.
         assert_eq!(f.follow(100_000), 100_040);
-        assert_eq!(f.follow(64), CHUNK as u64);
-        f.shrink();
-        // The second record crosses the end of the tail read that began with the first one.
+        assert_eq!(f.follow(64), TAIL_CHUNK as u64);
+        // The second record crosses the end of the tail read that began with the first one, and is there when the reader
+        // looks for it.
         f.poll_empty();
         f.append(1, 4_000);
         f.append(1, 200);
         assert_eq!(f.read(1, 4_000), [TAIL_CHUNK as u64]);
         assert_eq!(f.read(1, 200), [CHUNK as u64]);
+        // Records larger than a tail read are followed with whole chunks until the reads have shrunk.
+        for _ in 1..TAIL_FILLS {
+            assert_eq!(f.follow(10_000), CHUNK as u64);
+        }
+        assert_eq!(f.follow(10_000), 10_040);
     }
 
     /// The first fill in a segment is a whole chunk, and reads never reach past a segment.
