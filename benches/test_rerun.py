@@ -1,10 +1,13 @@
 """Rerun driver: parts, unit order, resume, retries, deadline. Run: python3 -m unittest discover -s benches"""
 import datetime
 import json
+import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -37,8 +40,9 @@ class PlanTests(unittest.TestCase):
         unit = rerun.PARTS["sustained-90"][0]
         self.assertEqual(unit.options([], False)[-6:],
                          ["--workloads", "probe,SD", "--rate-fractions", "0.9", "--repeats", "1"])
-        self.assertEqual(rerun.PARTS["tuned-short"][0].options(["--writer-cpu", "1"], True),
-                         ["--writer-cpu", "1", "--quick"])
+        unit = rerun.PARTS["tuned-short"][0]
+        self.assertEqual(unit.options(["--writer-cpu", "1"], True),
+                         ["--writer-cpu", "1", "--tools", unit.tool, "--quick"])
 
     def test_sustained_run_counts(self):
         unit = {u.tool: u for u in rerun.PARTS["sustained"]}
@@ -103,24 +107,65 @@ class UnitTests(unittest.TestCase):
 
     def test_interrupted_child_group_ends(self):
         def interrupt(signum, frame):
-            raise rerun.Interrupted("SIGALRM")
+            raise rerun.reaper.Terminated(signum)
         with tempfile.TemporaryFile("w") as log:
-            old = rerun.signal.signal(rerun.signal.SIGALRM, interrupt)
-            rerun.signal.setitimer(rerun.signal.ITIMER_REAL, 0.5)
+            old = signal.signal(signal.SIGALRM, interrupt)
+            signal.setitimer(signal.ITIMER_REAL, 0.5)
             try:
-                with self.assertRaises(rerun.Interrupted):
+                with self.assertRaises(rerun.reaper.Terminated):
                     rerun.run_child([sys.executable, "-c", "import time; time.sleep(60)"], log, None)
             finally:
-                rerun.signal.signal(rerun.signal.SIGALRM, old)
+                signal.signal(signal.SIGALRM, old)
+
+
+    def test_after_sigkill_of_the_driver_its_guard_ends_the_unit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pidfile = Path(tmp) / "unit.pid"
+            unit = (f"import os, pathlib, time; pathlib.Path({str(pidfile)!r}).write_text(str(os.getpid())); "
+                    "time.sleep(300)")
+            driver = (f"import sys; sys.path.insert(0, {str(Path(rerun.__file__).parent)!r}); import rerun; "
+                      f"rerun.run_child([sys.executable, '-c', {unit!r}], sys.stderr, None)")
+            proc = subprocess.Popen([sys.executable, "-c", driver], start_new_session=True)
+            try:
+                end = time.monotonic() + 30
+                while not pidfile.exists() or not pidfile.read_text():
+                    self.assertLess(time.monotonic(), end, "the unit did not start")
+                    time.sleep(0.02)
+                pid = int(pidfile.read_text())
+                os.kill(proc.pid, signal.SIGKILL)
+                proc.wait()
+                end = time.monotonic() + 60  # The guard waits up to rerun.UNIT_GRACE_S after SIGTERM.
+                while True:
+                    try:
+                        os.kill(pid, 0)
+                    except ProcessLookupError:
+                        break
+                    self.assertLess(time.monotonic(), end, "the unit outlived its driver")
+                    time.sleep(0.05)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
+                # A unit left running (this test failed) would hold the test runner's stderr for 300 s.
+                if pidfile.exists() and pidfile.read_text():
+                    try:
+                        os.kill(int(pidfile.read_text()), signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
 
 
 class ShortToolsTests(unittest.TestCase):
-    def test_short_mode_is_restricted_to_the_named_tools(self):
-        code = ("import sys; sys.path.insert(0, %r); import rerun, types; m = types.ModuleType('run');"
-                "m.TOOLS = rerun.TOOLS; m.main = lambda: print(m.TOOLS, sys.argv[1:]); sys.modules['run'] = m;"
-                "rerun.main(['--short-tools', 'yaque', '--', '/o', '--quick'])" % str(Path(rerun.__file__).parent))
-        done = subprocess.run([sys.executable, "-c", code], text=True, stdout=subprocess.PIPE, check=True)
-        self.assertEqual(done.stdout.strip(), "('yaque',) ['/o', '--quick']")
+    def test_a_short_unit_runs_one_tool_with_run_py_tools(self):
+        unit = rerun.PARTS["short"][0]
+        cmd = rerun.command(unit, Path("/o/u"), [], True, False)
+        self.assertEqual(cmd[1:], [str(rerun.COMPARE / "run.py"), "/o/u", "--tools", unit.tool, "--quick"])
+
+    def test_the_old_short_tools_form_still_runs_the_same_command(self):
+        # The commands recorded by the v1.0.0 rerun: `rerun.py --short-tools TOOL -- OUTDIR OPTIONS`.
+        with mock.patch.object(rerun.os, "execv") as execv:
+            rerun.main(["--short-tools", "yaque", "--", "/o", "--quick"])
+        self.assertEqual(execv.call_args.args[1][1:],
+                         [str(rerun.COMPARE / "run.py"), "/o", "--quick", "--tools", "yaque"])
 
 
 if __name__ == "__main__":

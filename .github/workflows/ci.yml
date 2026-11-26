@@ -26,8 +26,14 @@ jobs:
       - run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
 
   bench-tooling:
-    name: bench tooling (python)
-    runs-on: ubuntu-latest
+    name: bench tooling (python, ${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # macOS too: the harness's process groups and signals behave differently there (EPERM from killpg for a
+        # group of zombies, kqueue waits). No JDK, no Rust build: the tests use stand-in children.
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0

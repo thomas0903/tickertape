@@ -21,7 +21,6 @@ import os
 from pathlib import Path
 import shlex
 import shutil
-import signal
 import subprocess
 import sys
 import tempfile
@@ -29,6 +28,7 @@ import time
 
 import affinity
 import javaopts
+import reaper
 
 HERE = Path(__file__).resolve().parent
 
@@ -274,7 +274,8 @@ def run_attempt(run, params, out, env, commands):
         control.mkdir()
         error_log.write(f"\n{run.label}\n")
         error_log.flush()
-        children, handles, outputs = [], [], {}
+        group = reaper.Group()
+        handles, outputs = [], {}
         deadline = time.monotonic() + timeout
 
         def spawn(role):
@@ -285,14 +286,13 @@ def run_attempt(run, params, out, env, commands):
             handle = path.open("w")
             handles.append(handle)
             outputs[role] = path
-            proc = subprocess.Popen(cmd, stdout=handle, stderr=error_log, env=env, start_new_session=True)
-            children.append(proc)
+            proc = group.popen(cmd, stdout=handle, stderr=error_log, env=env)
             keeper.watch(proc.pid, role)
             return proc
 
         def ready(role):
             while not (control / f"{role}.ready").exists():
-                for proc in children:
+                for proc in group.procs:
                     if proc.poll() is not None:
                         raise RuntimeError(f"{run.label}: child exited before barrier; see children.log")
                 if time.monotonic() > deadline:
@@ -300,7 +300,7 @@ def run_attempt(run, params, out, env, commands):
                 time.sleep(0.005)
 
         def wait(proc):
-            status = proc.wait(timeout=max(0.1, deadline - time.monotonic()))
+            status = group.wait(proc, timeout=max(0.1, deadline - time.monotonic()))
             if status:
                 raise RuntimeError(f"{run.label}: child exited {status}; see children.log")
 
@@ -328,15 +328,7 @@ def run_attempt(run, params, out, env, commands):
             result["affinity"] = affinity.record(params["affinity"], run.tool, result["writer"], result["reader_result"],
                                                  keeper)
         finally:
-            for proc in children:
-                if proc.poll() is None:
-                    os.killpg(proc.pid, signal.SIGTERM)
-            for proc in children:
-                try:
-                    proc.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                    proc.wait()
+            group.stop()
             for handle in handles:
                 handle.close()
             for path in outputs.values():
@@ -486,7 +478,6 @@ def prepare_output(out, params, resume):
 
 def main(args, env, build):
     """Entry point from run.py --sustained."""
-    import run as short
     params = parameters(args)
     params["affinity"] = args.affinity
     out = args.outdir.resolve()
@@ -504,10 +495,18 @@ def main(args, env, build):
             print(f"  {run.label}")
         return
     first = prepare_output(out, params, args.resume)
-    # A terminated session (SIGTERM, or SIGHUP when the terminal goes away) unwinds so that every child process
-    # group is killed and reaped; finished results are already on disk.
-    for sig in (signal.SIGTERM, signal.SIGHUP):
-        signal.signal(sig, lambda signum, frame: sys.exit(128 + signum))
+    # run.main handles SIGTERM, SIGINT and SIGHUP (reaper.install): the session unwinds so that every child process
+    # group is ended and reaped; finished results are already on disk, and the matrix resumes. The guard covers
+    # SIGKILL of the runner; a resumable OUTDIR is not marked incomplete.
+    reaper.start_guard()
+    try:
+        session(args, params, runs, out, env, build, first)
+    finally:
+        reaper.stop_guard()
+
+
+def session(args, params, runs, out, env, build, first):
+    import run as short
     scratch = reset_scratch(out)
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     environment = out / ("environment.txt" if first else f"environment-resume-{stamp}.txt")
@@ -516,7 +515,7 @@ def main(args, env, build):
     (out / "skipped").mkdir(exist_ok=True)
     (out / "runs").mkdir(exist_ok=True)
     build(out, env, [t for t in params["tools"] if t in JAVA_TOOLS])
-    affinity.place_runner(params["affinity"])
+    affinity.place_runner(params["affinity"], *reaper.guard_pids())
     suite_start = time.monotonic()
     counts = execute(runs, params, out, env, args.keep_going)
     total = collect(out)

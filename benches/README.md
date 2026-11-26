@@ -417,7 +417,7 @@ moments a zero-copy reader re-reads a slot.
 ## Recorded sustained session
 
 `benches/session.py` runs a whole session on the filesystem under test: the tickertape scenarios with `tt-sustained`,
-then the sustained comparison matrix (`compare/README.md`). It needs Python 3.9+, Rust, and for the comparison Java 21
+then the sustained comparison matrix (`compare/README.md`). It needs Python 3.11+, Rust, and for the comparison Java 21
 and Maven (`JAVA_HOME`), or `--compare-tools` without `chronicle,aeron`.
 
 ```sh

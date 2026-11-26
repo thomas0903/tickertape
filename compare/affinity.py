@@ -162,10 +162,12 @@ def check(plan, tools):
         os.sched_setaffinity(0, before)
 
 
-def place_runner(plan):
-    """Moves the runner, and with it every process started from here on, to the helper CPUs."""
+def place_runner(plan, *others):
+    """Moves the runner, and with it every process started from here on, to the helper CPUs; `others` are processes
+    the runner started before (its guard)."""
     if plan["mode"] == "pinned":
-        os.sched_setaffinity(0, plan["helper_cpus"])
+        for pid in (0, *others):
+            os.sched_setaffinity(pid, plan["helper_cpus"])
 
 
 class Keeper:

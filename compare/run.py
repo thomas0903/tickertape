@@ -11,7 +11,6 @@ import os
 from pathlib import Path
 import platform
 import shlex
-import signal
 import subprocess
 import sys
 import tempfile
@@ -19,6 +18,7 @@ import time
 
 import affinity
 import javaopts
+import reaper
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
@@ -66,7 +66,7 @@ def capture(command):
         return f"unavailable: {e}"
 
 
-def environment(out, env, quick, name="environment.txt", pinning=None):
+def environment(out, env, quick, name="environment.txt", pinning=None, tools=None):
     commands = [["git", "rev-parse", "HEAD"], ["git", "status", "--short"],
                 ["uname", "-a"], ["rustc", "--version"], ["cargo", "--version"],
                 [str(Path(env["JAVA_HOME"]) / "bin/java"), "-version"], ["mvn", "-version"]]
@@ -76,11 +76,17 @@ def environment(out, env, quick, name="environment.txt", pinning=None):
                      ["diskutil", "info", mount], ["df", "-h", tempfile.gettempdir()]]
     else:
         commands += [["lscpu"], ["free", "-h"], ["df", "-T", tempfile.gettempdir()],
-                     ["findmnt", "-T", tempfile.gettempdir()], ["lsblk", "-o", "NAME,MODEL,SIZE,ROTA,TYPE,MOUNTPOINT"]]
+                     ["findmnt", "-T", tempfile.gettempdir()], ["lsblk", "-o", "NAME,MODEL,SIZE,ROTA,TYPE,MOUNTPOINT"],
+                     # Scheduling groups: autogroup puts each session in a group of its own, and the runner's
+                     # cgroup (the children's, as they inherit it) decides which controllers apply.
+                     ["sysctl", "kernel.sched_autogroup_enabled"], ["cat", "/proc/self/cgroup"],
+                     ["sh", "-c", "cat \"/sys/fs/cgroup$(sed -n 's/^0:://p' /proc/self/cgroup)/cgroup.controllers\""]]
     with (out / name).open("w") as f:
         f.write(f"date_utc: {datetime.datetime.now(datetime.timezone.utc).isoformat()}\n")
         f.write(f"quick: {quick}\nTMPDIR: {tempfile.gettempdir()}\nJAVA_HOME: {env['JAVA_HOME']}\n")
         f.write("versions: " + json.dumps(VERSIONS) + "\n")
+        if tools is not None:
+            f.write("selected_tools: " + json.dumps(list(tools)) + "\n")
         f.write("JVM tool settings: " + json.dumps(JAVA) + "\n")
         f.write("command: " + shlex.join(sys.argv) + "\n")
         f.write("JVM flags (exact shared array):\n" + (HERE / "java-flags.sh").read_text() + "\n")
@@ -101,6 +107,23 @@ def command(tool, role, data, control, count, payload, rate, warmup, reader, mod
     return cmd + affinity.adapter_options(pinning, tool, role)
 
 
+def latency_command(data, rate, count, warmup, payload, reader, pinning):
+    """tt-latency, which starts tickertape's writer and reader processes itself (W2 of tickertape)."""
+    return [str(HERE / "target/release/tt-latency"), "run", "--dir", str(data), "--rate", str(rate), "--count",
+            str(count), "--warmup", str(warmup), "--payload", str(payload), "--reader", reader, "--json",
+            *affinity.latency_options(pinning)]
+
+
+def select_tools(text):
+    """The tools of a --tools list in the matrix's own order (the order of tools in a run is fixed), or ValueError.
+    The same syntax and checks as the sustained mode's --tools."""
+    tools = text.split(",") if text else list(TOOLS)
+    bad = [t for t in tools if t not in TOOLS]
+    if bad or len(set(tools)) != len(tools):
+        raise ValueError(f"invalid or repeated tool: {bad or tools}")
+    return [t for t in TOOLS if t in tools]
+
+
 def parse_result(path):
     lines = path.read_text().splitlines()
     if len(lines) != 1:
@@ -108,11 +131,12 @@ def parse_result(path):
     return json.loads(lines[0])
 
 
+TIMEOUT_SLACK_S = 120  # A measurement's time limit: its records at the intended rate plus this (JVM: plus warm-up).
 CLOCK_STEP = "wall clock moved backwards"
 CLOCK_RETRIES = 3
 
 
-def run_one(tool, workload, payload, reader, rate, repeat, out, env, quick, commands, pinning=None):
+def run_one(tool, workload, payload, reader, rate, repeat, out, env, quick, commands, pinning=None, selected=TOOLS):
     """Runs one measurement. A latency run that saw the wall clock step backwards (an NTP adjustment; latency is
     measured against intended wall-clock send times) is invalid: it is discarded and measured again, at most
     CLOCK_RETRIES times, and each discarded attempt is recorded in retries.jsonl. Any other failure stops the suite."""
@@ -121,7 +145,8 @@ def run_one(tool, workload, payload, reader, rate, repeat, out, env, quick, comm
         start = log.stat().st_size if log.exists() else 0
         try:
             try:
-                return run_attempt(tool, workload, payload, reader, rate, repeat, out, env, quick, commands, pinning)
+                return run_attempt(tool, workload, payload, reader, rate, repeat, out, env, quick, commands, pinning,
+                                   selected)
             finally:
                 # The measurement's scratch directory is gone by now; wait until the kernel has written back what it
                 # wrote, so the next measurement (often another tool) doesn't pay for it.
@@ -139,7 +164,8 @@ def run_one(tool, workload, payload, reader, rate, repeat, out, env, quick, comm
             print(f"{label}: discarded attempt {attempt} ({CLOCK_STEP}); retrying", file=sys.stderr, flush=True)
 
 
-def run_attempt(tool, workload, payload, reader, rate, repeat, out, env, quick, commands, pinning=None):
+def run_attempt(tool, workload, payload, reader, rate, repeat, out, env, quick, commands, pinning=None,
+                selected=TOOLS):
     pinning = pinning or {"mode": "none", "summary": "affinity: none"}
     mode = {"W1-cold": "append_cold", "W1-steady": "append_steady", "W2": "visible_latency", "W3": "warm_replay"}[workload]
     count = (1_000_000 if payload == 64 else 100_000)
@@ -156,11 +182,12 @@ def run_attempt(tool, workload, payload, reader, rate, repeat, out, env, quick, 
         data, control = base / "data", base / "control"
         data.mkdir()
         control.mkdir()
-        children = []
+        group = reaper.Group()
+        children = group.procs
         handles = []
         outputs = []
         java = None
-        deadline = time.monotonic() + count / max(rate, 1) + 120
+        deadline = time.monotonic() + count / max(rate, 1) + TIMEOUT_SLACK_S
         if tool in javaopts.JAVA_TOOLS:
             deadline += javaopts.WARMUP_ALLOWANCE_S
 
@@ -173,13 +200,12 @@ def run_attempt(tool, workload, payload, reader, rate, repeat, out, env, quick, 
             outputs.append(output)
             handle = output.open("w")
             handles.append(handle)
-            proc = subprocess.Popen(cmd, stdout=handle, stderr=error_log, env=env, start_new_session=True)
-            children.append(proc)
+            proc = group.popen(cmd, stdout=handle, stderr=error_log, env=env)
             keeper.watch(proc.pid, role)
             return proc, output
 
         def wait(proc):
-            status = proc.wait(timeout=max(0.1, deadline - time.monotonic()))
+            status = group.wait(proc, timeout=max(0.1, deadline - time.monotonic()))
             if status:
                 raise RuntimeError(f"{label}: child exited {status}; see children.log")
 
@@ -197,12 +223,16 @@ def run_attempt(tool, workload, payload, reader, rate, repeat, out, env, quick, 
             error_log.flush()
             try:
                 if tool == "tickertape" and workload == "W2":
-                    cmd = [str(HERE / "target/release/tt-latency"), "run", "--dir", str(data),
-                           "--rate", str(rate), "--count", str(count), "--warmup", str(warmup),
-                           "--payload", str(payload), "--reader", reader, "--json", *affinity.latency_options(pinning)]
+                    cmd = latency_command(data, rate, count, warmup, payload, reader, pinning)
                     commands.write(shlex.join(cmd) + "\n")
-                    result = json.loads(execute(cmd, stdout=subprocess.PIPE, stderr=error_log, env=env,
-                                                timeout=count/rate+120, text=True).stdout)
+                    # As at v1.0.0: in the runner's session, its output read from a pipe in a blocking wait. Only a
+                    # process group of its own is new, so that it ends with its writer and reader on every way out.
+                    latency = group.popen(cmd, new_session=False, stdout=subprocess.PIPE, stderr=error_log, env=env,
+                                          text=True)
+                    stdout, _ = group.communicate(latency, timeout=count/rate+TIMEOUT_SLACK_S)
+                    if latency.returncode:
+                        raise subprocess.CalledProcessError(latency.returncode, cmd, stdout)
+                    result = json.loads(stdout)
                     # Not watched by the keeper: tt-latency starts its own processes (moved_threads is null).
                     result["affinity"] = affinity.record(pinning, tool, *[{"affinity": result["affinity"][role]}
                                                                           for role in ("writer", "reader")])
@@ -240,15 +270,7 @@ def run_attempt(tool, workload, payload, reader, rate, repeat, out, env, quick, 
                         java = javaopts.collect(tool, JAVA, {"reader": received}, quick, False, False)
                         result = {"affinity": affinity.record(pinning, tool, sent, received, keeper), "replay": received}
             finally:
-                for proc in children:
-                    if proc.poll() is None:
-                        os.killpg(proc.pid, signal.SIGTERM)
-                for proc in children:
-                    try:
-                        proc.wait(timeout=3)
-                    except subprocess.TimeoutExpired:
-                        os.killpg(proc.pid, signal.SIGKILL)
-                        proc.wait()
+                group.stop()
                 for handle in handles:
                     handle.close()
                 for output in outputs:
@@ -258,7 +280,7 @@ def run_attempt(tool, workload, payload, reader, rate, repeat, out, env, quick, 
     result.update(tool=tool, tool_version=VERSIONS[tool], guarantees=guarantees,
                   mode=mode, workload=workload, payload=payload, count=count, warmup=warmup,
                   rate=rate if workload == "W2" else None, reader=reader, segment_size=134_217_728 if tool in ("tickertape", "yaque") else None,
-                  repeat=repeat, quick=quick, java=java)
+                  repeat=repeat, quick=quick, java=java, selected_tools=list(selected))
     validate_result(result)
     with (out / f"{tool}-{workload}.jsonl").open("a") as f:
         f.write(json.dumps(result, allow_nan=False, separators=(",", ":")) + "\n")
@@ -313,13 +335,60 @@ def java_environment(env, needed, parser):
     os.environ.update({"JAVA_HOME": jdk, "PATH": env["PATH"]})
 
 
+SKIPPED = {"aeron": {**{w: "Archive not implemented; IPC has no persistent append workload"
+                        for w in ("W1-cold", "W1-steady")},
+                     "W3": "Archive not implemented; IPC cannot replay"},
+           "queue-file": {"W2": "upstream forbids concurrent process access"}}
+
+
+def short_matrix(out, env, quick, pinning, tools):
+    """Every cell of the short mode for `tools` (in TOOLS order), twice. Results of a tool are the same whether it
+    runs alone or with the others, apart from `selected_tools`."""
+    environment(out, env, quick, pinning=pinning, tools=tools)
+    build(out, env, [t for t in javaopts.JAVA_TOOLS if t in tools], tt_latency="tickertape" in tools)
+    affinity.place_runner(pinning, *reaper.guard_pids())
+    with (out / "commands.txt").open("w") as commands:
+        for repeat in (1, 2):
+            for payload in (64, 1024):
+                for tool in tools:
+                    if tool != "aeron":
+                        for workload in ("W1-cold", "W1-steady"):
+                            run_one(tool, workload, payload, "default", 100_000, repeat, out, env, quick, commands,
+                                    pinning, tools)
+                        for reader in (("safe", "mapped") if tool == "tickertape" else ("default",)):
+                            run_one(tool, "W3", payload, reader, 100_000, repeat, out, env, quick, commands,
+                                    pinning, tools)
+                    if tool != "queue-file":
+                        for reader in (("safe", "mapped") if tool == "tickertape" else ("default",)):
+                            for rate in (100_000, 10_000):
+                                run_one(tool, "W2", payload, reader, rate, repeat, out, env, quick, commands,
+                                        pinning, tools)
+    skipped = {tool: cases for tool, cases in SKIPPED.items() if tool in tools}
+    (out / "skipped.json").write_text(json.dumps(skipped, indent=2) + "\n")
+
+
+def report(text):
+    """A message on stderr that cannot fail: with the terminal gone (SIGHUP) or a closed pipe, the runner still
+    finishes its cleanup and exits with its own status, and nothing is left to flush at exit."""
+    try:
+        print(text, file=sys.stderr, flush=True)
+    except OSError:
+        sys.stdout = sys.stderr = open(os.devnull, "w")
+
+
 def main():
     suite_start = time.monotonic()
+    if sys.version_info < (3, 11):
+        sys.exit("compare: needs Python 3.11 or later (tt-latency runs in a process group of its own in the "
+                 "runner's session)")
+    reaper.install()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("outdir", type=Path)
     parser.add_argument("--quick", action="store_true",
                         help="short mode: 100 warmup + 1000 measured latency; 2000 throughput records. "
                              "Sustained mode: 5 s runs, 1 s warmup, one repeat")
+    parser.add_argument("--tools", help="comma-separated subset of " + ",".join(TOOLS) + " (default all). The "
+                        "short mode runs them in this order whatever the order given; its results record the selection")
     sustained_args = parser.add_argument_group("sustained mode (ADR 0026; see compare/README.md)")
     sustained_args.add_argument("--sustained", action="store_true", help="run the resumable sustained matrix")
     sustained_args.add_argument("--resume", action="store_true", help="continue the matrix started in OUTDIR")
@@ -328,7 +397,6 @@ def main():
     sustained_args.add_argument("--duration", type=float, help="seconds per run (default 600; quick 5)")
     sustained_args.add_argument("--warmup", type=float, help="paced seconds before the measured part (default 10; quick 1)")
     sustained_args.add_argument("--repeats", type=int, help="repeats of every paced run (default 2; quick 1)")
-    sustained_args.add_argument("--tools", help="comma-separated subset of " + ",".join(TOOLS))
     sustained_args.add_argument("--workloads", help="comma-separated subset of probe,SV,SD (default all)")
     sustained_args.add_argument("--payloads", help="comma-separated subset of 64,1024 (default both)")
     sustained_args.add_argument("--rates", help="explicit paced rates in records/s, the same for every tool")
@@ -341,6 +409,11 @@ def main():
     args = parser.parse_args()
     JAVA.update(javaopts.settings(args))
     tools = args.tools.split(",") if args.tools else TOOLS
+    if not args.sustained:
+        try:
+            tools = select_tools(args.tools)
+        except ValueError as error:
+            parser.error(str(error))
     try:
         args.affinity = affinity.resolve(args)
         if not args.dry_run:
@@ -355,8 +428,8 @@ def main():
         java_environment(env, any(t in ("chronicle", "aeron") for t in tools) and not args.dry_run, parser)
         sustained.main(args, env, build)
         return
-    if any([args.resume, args.dry_run, args.keep_going, args.duration, args.warmup, args.repeats, args.tools,
-            args.workloads, args.payloads, args.rates, args.fractions, args.tt_readers]):
+    if any([args.resume, args.dry_run, args.keep_going, args.duration, args.warmup, args.repeats, args.workloads,
+            args.payloads, args.rates, args.fractions, args.tt_readers]):
         parser.error("these options need --sustained")
     # Exclusive output creation prevents accidentally mixing runs with old results.
     out = args.outdir.resolve()
@@ -364,39 +437,43 @@ def main():
     if any(out.iterdir()):
         parser.error("OUTDIR must be new or empty")
     env = dict(os.environ)
-    java_environment(env, True, parser)
+    java_environment(env, any(t in javaopts.JAVA_TOOLS for t in tools), parser)
     pinning = args.affinity
     print(pinning["summary"], file=sys.stderr)
-    environment(out, env, args.quick, pinning=pinning)
-    build(out, env, ("chronicle", "aeron"), tt_latency=True)
-    affinity.place_runner(pinning)
-    with (out / "commands.txt").open("w") as commands:
-        for repeat in (1, 2):
-            for payload in (64, 1024):
-                for tool in TOOLS:
-                    if tool != "aeron":
-                        for workload in ("W1-cold", "W1-steady"):
-                            run_one(tool, workload, payload, "default", 100_000, repeat, out, env, args.quick, commands,
-                                    pinning)
-                        for reader in (("safe", "mapped") if tool == "tickertape" else ("default",)):
-                            run_one(tool, "W3", payload, reader, 100_000, repeat, out, env, args.quick, commands,
-                                    pinning)
-                    if tool != "queue-file":
-                        for reader in (("safe", "mapped") if tool == "tickertape" else ("default",)):
-                            for rate in (100_000, 10_000):
-                                run_one(tool, "W2", payload, reader, rate, repeat, out, env, args.quick, commands,
-                                        pinning)
-    (out / "skipped.json").write_text(json.dumps({"aeron": {**{w: "Archive not implemented; IPC has no persistent append workload" for w in ("W1-cold", "W1-steady")},
-        "W3": "Archive not implemented; IPC cannot replay"}, "queue-file": {"W2": "upstream forbids concurrent process access"}}, indent=2) + "\n")
+    reaper.start_guard(mark=out)
+    complete = False
+    try:
+        short_matrix(out, env, args.quick, pinning, tools)
+        complete = True
+    finally:
+        try:
+            if not complete:
+                # Children are stopped by now. An unfinished matrix is never left where a finished one would be.
+                try:
+                    target = reaper.mark_incomplete(out)
+                except OSError as error:
+                    target = None
+                    report(f"compare: could not mark {out} as incomplete: {error}")
+                if target:
+                    report(f"compare: incomplete; the results so far are in {target}")
+        finally:
+            reaper.stop_guard()
     elapsed = time.monotonic() - suite_start
     with (out / "environment.txt").open("a") as f:
         f.write(f"suite_elapsed_seconds: {elapsed:.3f}\n")
     print(f"done: {out} ({elapsed:.1f}s)")
 
 
-if __name__ == "__main__":
+def cli():
     try:
         main()
+    except reaper.Terminated as stop:
+        report(f"compare: {stop}")
+        raise
     except (OSError, ValueError, RuntimeError, AssertionError, subprocess.SubprocessError) as error:
-        print(f"compare: {error}", file=sys.stderr)
+        report(f"compare: {error}")
         sys.exit(1)
+
+
+if __name__ == "__main__":
+    cli()
