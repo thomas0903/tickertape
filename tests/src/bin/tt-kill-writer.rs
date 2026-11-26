@@ -4,7 +4,8 @@
 //!
 //! Usage: `tt-kill-writer <dir> <segment_size> <seed> [mixed] [slow-fill]`
 //!
-//! With an even seed the writer keeps latency histograms (`LatencyMode::All`). With `mixed`, payload lengths follow `mixed_len` (up to 3,199 bytes) instead of `kill_len` (up to 512 bytes).
+//! With `mixed`, payload lengths follow `mixed_len` (up to 3,199 bytes) instead of `kill_len` (up to 512 bytes).
+//! With an even seed the writer keeps latency histograms (`LatencyMode::All`).
 //! With `slow-fill`, payloads are written by `append_with` in 8-byte steps with a pause in between, so that most
 //! kills land inside the fill closure: after the header fields and before the CRC and the commit word.
 //!
