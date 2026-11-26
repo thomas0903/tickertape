@@ -28,7 +28,8 @@ draws conclusions from those two.
   file; replay opens each segment it enters. These costs grow with the number of segments, so very small segments in a
   long-lived journal make them add up (ADR 0042). Measured on local SSD (`benchmarks.md`, 2026-11-25):
   journals of 10,000, 20,000 and 100,000 segments open, recover, replay and checkpoint, and no operation held more
-  than 12 open files at 10 to 20,000 segments (not sampled at 100,000), so the limit on open files (`ulimit -n`) is not
+  than 12 open files at 10 to 20,000 segments (not sampled at 100,000). What a writer can hold is bounded whatever the number
+  of segments (20 files at most in this release, "Open files" below), so the limit on open files (`ulimit -n`) is not
   a constraint on the number of segments. The directory read is: each seek costs about 3 ms at 10,000 segments, 6 ms at
   20,000 and 29 ms at 100,000, also with a seek index, and so does each retention run (from 1.1, ADR 0051; x86-64, warm: a
   checkpoint with a policy that removes nothing 3 ms, 6 ms and 31 ms, against 0.3 ms without one; up to 1.0 every run
@@ -108,6 +109,37 @@ choices.
 **Sustained high byte rates on Linux.** Under steady write-back (minutes of writing, gigabytes of dirty pages), ext4
 itself occasionally stalls the writer for milliseconds, with or without prefaulting (ADR 0025). Plan disk
 throughput with headroom: a small cloud VM stalled for hundreds of milliseconds at about 100 MB/s sustained.
+
+## Open files
+
+**What 1.x guarantees:** the number of files a writer holds open is bounded, whatever the number of segments and
+however far its background checkpoints fall behind (ADR 0054; ADR 0038 → Bounded open segments). **The counts of this
+release:** at most 18 files, 19 on Linux by default, 20 on Linux with the spare segment. A later 1.x release that
+raises them says so in its changelog. So set the limit on open files (`ulimit -n`, `LimitNOFILE=` in systemd) with
+headroom above the count for your platform, plus your readers and the rest of your process, and read this section
+again when you upgrade. The files of this release:
+
+- **4 always:** `writer.lock`, the marker `checkpoint`, the wake-up region and the active segment.
+- **Up to 12 sealed segments not yet checkpointed:** the 4 newest of each of three lists, the writer's own (segments
+  rolled past since the last `request_checkpoint`), the background checkpoint's that is running, and the one waiting
+  behind it (later requests join that one). The older segments of a list are closed, and the checkpoint that covers
+  them opens them again, one at a time: **1** more.
+- **1 during a roll:** the new segment, before the old one joins the writer's list.
+- **Linux, early write-back on (the default):** **1**, the segment the helper is writing back, which can be one that
+  every list has closed when the helper falls behind.
+- **Linux, spare segment on:** **1**, the spare being prepared or ready. On macOS a roll waits for the spare and makes
+  it its new segment, so the spare adds nothing to the roll's.
+
+The most is reached only while a background checkpoint runs, another waits behind it, each covers five segments or
+more, and the writer has rolled five times since the last request (the segment active at the request is shared with
+the waiting checkpoint's list). Otherwise a writer holds far fewer: in the
+`tt-scale` runs above, 8 counting the process's own 3, and 12 while it opened a journal without a marker. A retention
+run on the checkpoint thread runs between checkpoints and opens a few files at a time, fewer than a checkpoint. Your
+process's own descriptors (standard input, output and error) and your readers come on top. The writer maps the same
+segments, except the write-back helper's and (on Linux) the reopened one, plus at most one that the prefault helper
+may still have in hand; on macOS the checkpoint maps the reopened segment for a moment, to `msync` it. That is address
+space, not memory, and no descriptors. `tests/open_segments.rs` drives a writer into that state with hold points and
+checks the number exactly, on both platforms.
 
 ## Choosing a checkpoint interval
 

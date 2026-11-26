@@ -2,7 +2,8 @@
 //! writer that rolls many times without a checkpoint, with background checkpoints, or whose recovery scans many
 //! segments, runs with a descriptor limit far below the number of segments it covers; a checkpoint reopens the
 //! segments it released, by the journal directory's absolute path and checking that each is still the file the writer
-//! held, and fails (poisoning the writer) if one of them is gone or replaced.
+//! held, and fails (poisoning the writer) if one of them is gone or replaced. The most descriptors a writer holds
+//! (`docs/operations.md` → Open files) is reached exactly with hold points, not left to the machine's load (issue #73).
 
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
@@ -16,8 +17,8 @@ const HELPER: &str = env!("CARGO_BIN_EXE_tt-open-segments");
 const LIMIT: u32 = 64;
 const ROLLS: u64 = 300;
 
-/// Runs the helper with `RLIMIT_NOFILE` lowered to [`LIMIT`]; returns the numbers it printed.
-fn run_limited(args: &[&str]) -> Vec<i64> {
+/// Runs the helper with `RLIMIT_NOFILE` lowered to [`LIMIT`]; returns the numbers it printed, and its standard error.
+fn run_limited(args: &[&str]) -> (Vec<i64>, String) {
     let out = Command::new("/bin/sh")
         .arg("-c")
         .arg(format!("ulimit -n {LIMIT} && exec \"$0\" \"$@\""))
@@ -30,11 +31,12 @@ fn run_limited(args: &[&str]) -> Vec<i64> {
         "helper {args:?} failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    String::from_utf8(out.stdout)
+    let numbers = String::from_utf8(out.stdout)
         .unwrap()
         .lines()
         .map(|l| l.parse().unwrap())
-        .collect()
+        .collect();
+    (numbers, String::from_utf8_lossy(&out.stderr).into_owned())
 }
 
 /// Reads the journal with a durable-only reader and checks it holds exactly records `0..next_seq`.
@@ -66,12 +68,13 @@ fn roll(writer: &mut Writer, rolls: u64, checkpoint_every: u64) {
     }
 }
 
-/// The bounds are what the writer held in these tests when they were written, not documented limits; under load they can
-/// be exceeded (issue #73).
+/// Rolls [`ROLLS`] times without a checkpoint (`request_every` 0); measured from the first roll to the last. The writer
+/// then holds its list's four newest segments, the active one, at most one more with the write-back helper (Linux) and
+/// one spare: at most five more than at the first roll, whatever the timing, so 8 fails only if the list stops releasing.
 fn rolls_under_a_low_limit(request_every: u64, spare: &str, descriptors: i64) {
     let dir = tempfile::tempdir().unwrap();
     let journal = dir.path().join("j");
-    let out = run_limited(&[
+    let (out, _) = run_limited(&[
         "roll",
         journal.to_str().unwrap(),
         &ROLLS.to_string(),
@@ -94,17 +97,72 @@ fn many_rolls_without_a_checkpoint_under_a_low_descriptor_limit() {
     rolls_under_a_low_limit(0, "default", 8);
 }
 
-#[test]
-fn many_rolls_with_background_checkpoints_under_a_low_descriptor_limit() {
-    rolls_under_a_low_limit(25, "default", 8);
+/// Segments in a list that keep their file and mapping open (`checkpoint::OPEN_SEGMENTS`).
+const OPEN_SEGMENTS: i64 = 4;
+
+/// The most segment files a writer holds open beyond those it holds right after its open (`docs/operations.md` → Open
+/// files; ADR 0038 → Bounded open segments): three lists of [`OPEN_SEGMENTS`] (its own, a running background checkpoint's
+/// and a queued one's), the one a running checkpoint has reopened, the new segment of a roll in progress, and on Linux
+/// the segment the early write-back helper is writing back and, with the spare segment on, the spare being prepared (on
+/// macOS a roll waits for the spare, which becomes its new segment).
+fn most_extra_descriptors(spare: &str) -> i64 {
+    let linux = cfg!(target_os = "linux");
+    3 * OPEN_SEGMENTS + 1 + 1 + i64::from(linux) + i64::from(linux && spare == "on")
 }
 
-/// With the spare segment on (off by default on Linux), one more descriptor: the spare being prepared or ready. Ignored
-/// (it runs with the long tests): the bound can be exceeded under load, as the one of the test above (issue #73).
+/// Drives the writer with hold points into the state where it holds the most descriptors (the helper's `worst` mode),
+/// checks that it holds exactly [`most_extra_descriptors`] more than after its open there, and bounds the journal's
+/// mappings (Linux), then lets it roll [`ROLLS`] times with background checkpoints every 25 rolls and checks that no
+/// sample exceeds either. Machine load changes only which states the free run passes through, never the bound.
+fn most_descriptors_under_a_low_limit(spare: &str) {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = dir.path().join("j");
+    let (out, open_files) = run_limited(&[
+        "worst",
+        journal.to_str().unwrap(),
+        &ROLLS.to_string(),
+        "25",
+        spare,
+    ]);
+    let (next_seq, held, held_maps, most, most_maps) =
+        (out[0] as u64, out[1], out[2], out[3], out[4]);
+    let bound = most_extra_descriptors(spare);
+    assert_eq!(
+        held, bound,
+        "descriptors in the worst state (spare: {spare}); open files there:\n{open_files}"
+    );
+    assert!(
+        most <= bound,
+        "descriptors grew by {most}, more than {bound} (spare: {spare})"
+    );
+    if cfg!(target_os = "linux") {
+        // The lists' segments, the active one and a roll's new one are mapped (not the reopened one or the write-back
+        // helper's), plus at most one the prefault helper may still have in hand after every list let go of it (it is
+        // not held, so this is a bound, not exact) and a spare once it is ready (the held one is not mapped yet).
+        let maps = 3 * OPEN_SEGMENTS + 2 + i64::from(spare == "on");
+        assert!(
+            held_maps <= maps && most_maps <= maps,
+            "journal mappings grew by {held_maps} in the worst state and {most_maps} at most, more than {maps}; open \
+             files in the worst state:\n{open_files}"
+        );
+        assert!(
+            held_maps > 3 * OPEN_SEGMENTS,
+            "journal mappings in the worst state: {held_maps}"
+        );
+    }
+    assert!(segments(&journal).len() as u64 > ROLLS);
+    check_durable(&journal, next_seq);
+}
+
 #[test]
-#[ignore = "fails under load (issue #73); run with -- --ignored"]
+fn many_rolls_with_background_checkpoints_under_a_low_descriptor_limit() {
+    most_descriptors_under_a_low_limit("default");
+}
+
+/// With the spare segment on (off by default on Linux, where the spare being prepared adds a descriptor).
+#[test]
 fn many_rolls_with_the_spare_segment_under_a_low_descriptor_limit() {
-    rolls_under_a_low_limit(25, "on", 9);
+    most_descriptors_under_a_low_limit("on");
 }
 
 /// Builds a journal of more than [`ROLLS`] segments (checkpointing every 50 rolls, so that building it holds few
@@ -123,7 +181,7 @@ fn open_without_marker_under_a_low_limit(policy: &str) {
     let dir = tempfile::tempdir().unwrap();
     let journal = dir.path().join("j");
     let before = journal_without_marker(&journal);
-    let out = run_limited(&["open", journal.to_str().unwrap(), policy]);
+    let (out, _) = run_limited(&["open", journal.to_str().unwrap(), policy]);
     assert_eq!(out[0] as u64, before + 1);
     check_durable(&journal, before + 1);
 }
@@ -161,7 +219,7 @@ fn open_under_fail_restores_more_headers_than_the_limit() {
             file.write_all_at(&word, scan.end_offset).unwrap();
         }
     }
-    let out = run_limited(&["open", journal.to_str().unwrap(), "fail"]);
+    let (out, _) = run_limited(&["open", journal.to_str().unwrap(), "fail"]);
     assert_eq!(out[0] as u64, before + 1);
     check_durable(&journal, before + 1);
 }
@@ -201,7 +259,7 @@ fn a_checkpoint_after_a_change_of_directory_uses_the_writers_own_segments() {
         std::fs::set_permissions(&path, perms).unwrap();
     }
     let before = snapshot(&other.join("j"));
-    let out = run_limited(&["chdir", mine.to_str().unwrap(), other.to_str().unwrap()]);
+    let (out, _) = run_limited(&["chdir", mine.to_str().unwrap(), other.to_str().unwrap()]);
     assert_eq!(
         snapshot(&other.join("j")),
         before,
