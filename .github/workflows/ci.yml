@@ -123,6 +123,14 @@ jobs:
       - run: cargo test -p tickertape-tests --release --locked -- --ignored
         env:
           TICKERTAPE_SOAK_ARTIFACTS: ${{ runner.temp }}/soak-failures
+      # The killed writer and its live readers again with the journal on tmpfs, where a retention run removes segments
+      # about as fast as a reader lists them (ADR 0016, note of 2026-11-27).
+      - name: Killed writer and live readers on tmpfs
+        run: |
+          mkdir -p /dev/shm/tt-tmpdir
+          cargo test -p tickertape-tests --release --locked --test empty_slot -- --include-ignored live_readers_of_a_killed_writer
+        env:
+          TMPDIR: /dev/shm/tt-tmpdir
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: failure()
         with:

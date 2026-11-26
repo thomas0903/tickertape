@@ -609,6 +609,46 @@ fn reader_open_races_retention() {
     }
 }
 
+/// A retention run removes the segments one after another, oldest first, and on tmpfs (where syncing the directory
+/// does nothing) a removal takes about as long as a reader's listing and open. Each removal here comes right after
+/// the reader's listing: had the reader listed again for each try, the run would have removed every segment it chose,
+/// and it would have returned an I/O "not found" error after its eighth listing. It opens the next segment of its
+/// listing instead.
+#[test]
+fn reader_open_keeps_up_with_a_retention_run_as_fast_as_its_listings() {
+    use tickertape::fault::Point;
+    /// Removes the oldest segment at each of this thread's next `left` listings by a reader.
+    fn remove_oldest_after_each_listing(dir: std::path::PathBuf, left: usize) {
+        if left > 0 {
+            tickertape::fault::run_at(Point::ReaderOpen, 0, move || {
+                retain(&dir, segments(&dir).len() - 1);
+                remove_oldest_after_each_listing(dir, left - 1);
+            });
+        }
+    }
+    for mapped in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = Writer::open(dir.path(), small_config()).unwrap();
+        for _ in 0..12 {
+            append(&mut writer);
+        }
+        writer.checkpoint().unwrap();
+        let held = segments(dir.path()).len();
+        tickertape::fault::clear();
+        remove_oldest_after_each_listing(dir.path().to_path_buf(), 10);
+        let opened = open_reader(dir.path(), mapped);
+        tickertape::fault::clear();
+        let mut reader = opened.unwrap_or_else(|e| panic!("mapped {mapped}: {e:?}"));
+        // One listing, so one removal; the reader starts at the segment after the removed one.
+        assert_eq!(segments(dir.path()).len(), held - 1, "mapped {mapped}");
+        assert_eq!(
+            reader.next_owned().unwrap().unwrap().seq,
+            1,
+            "mapped {mapped}"
+        );
+    }
+}
+
 #[test]
 fn seek_races_retention() {
     use tickertape::fault::Point;

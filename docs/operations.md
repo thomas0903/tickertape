@@ -295,7 +295,8 @@ number it reports. `tickertape tail` does both automatically, and warns on stand
 it skipped. Readers positioned before the oldest remaining segment get `Error::SeqUnavailable` from `seek`, also when
 the removal happens while `seek` runs. `Reader::open` starts at the oldest segment that exists. A removal never shows
 up as a corruption error in readers, `tickertape inspect` or `tickertape verify`, and shows up as an I/O "not found"
-error only if the segment a reader chose vanished on each of 8 listings in a row (crash contract C14).
+error only if the segment a reader chose vanished on each of 8 listings in a row (crash contract C14; `Reader::open`
+tries the 8 oldest segments of each listing before it lists again).
 A `stat` that fails other than with "not found" (`EACCES`, `EIO`) is reported as an I/O error, never taken for a
 removal.
 

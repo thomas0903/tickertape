@@ -5,6 +5,14 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
+- Fixed: `Reader::open` and `Reader::open_mapped` could fail with an I/O "not found" error for a segment they had just
+  listed while a retention run removed segments one after another, oldest first, about as fast as a reader lists the
+  directory (seen on tmpfs, where syncing the directory after each removal does nothing: Linux, 64 KiB segments, a run
+  catching up dozens of segments; present since 1.0.0). Each try chose the oldest segment of a new listing, which the
+  run then removed, so all 8 tries were lost to one run. A reader whose oldest listed segment is gone now opens the
+  next segment of the same listing (it keeps the 8 oldest bases), and lists again only after those. A durable-only
+  reader's `seek_to_end` that starts at the oldest segment (no valid checkpoint marker) does the same; `seek` is
+  unchanged. ADR 0016 (note of 2026-11-27).
 - Fixed: an archiver (`retention::apply`, `tickertape archive`) could remove the checkpoint marker's segment, leaving a
   dangling marker that a writer refuses, when the marker was lost, the oldest segment damaged and a writer recovered
   between the archiver's checks of that segment and its removal (issue #83, ADR 0055; present since 1.0.0). An archiver
