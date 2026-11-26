@@ -40,9 +40,9 @@ pub(crate) const STEP: u64 = 1 << 20;
 /// Whether the helper stops at the [`FOLIO`] boundary below the writer's position (ADR 0058, change 1) instead of at
 /// the page that holds it, as up to 1.0. **On** since 1.1 (ADR 0058 → "As built: change 1"): in 10-minute runs it
 /// removed the 6–8 % of extra device bytes, the aarch64 stalls of 50–150 ms near the device's limit and most of the
-/// writer's write-back faults, at the cost of up to 128 KiB more for each checkpoint to write (a few per cent of its
-/// durable time in one cell) and slightly slower rolls. `false` restores the 1.0 behaviour; the tests run both
-/// settings.
+/// writer's write-back faults, at the cost of up to 128 KiB more for each checkpoint to write (a background
+/// checkpoint's durable time a few per cent longer in one cell) and slower rolls (median roll append up to about 40 %
+/// longer). `false` restores the 1.0 behaviour; the tests run both settings.
 pub(crate) const STOP_AT_FOLIO_BOUNDARY: bool = true;
 
 /// The alignment of the end of the range the helper starts in the active segment ([`STOP_AT_FOLIO_BOUNDARY`]): 128 KiB
@@ -60,18 +60,20 @@ pub(crate) const STOP_AT_FOLIO_BOUNDARY: bool = true;
 /// Why 128 KiB: with 4 KiB pages, ext4 (since Linux 6.16) and xfs (since 5.18) let the page cache use large folios for
 /// regular files. The folios of a segment are allocated when the prefault helper's `MADV_POPULATE_WRITE`, or the
 /// writer, faults on a page that is not cached; that fault goes through the page cache's read-around for mappings,
-/// which sizes folios from the readahead window, at most the device's `read_ahead_kb` (128 KiB by default). On the
-/// measured kernel (7.0) every folio of a segment was 128 KiB (order 5), on both file systems, and folios are
+/// which ramps its folios up to the file's readahead window, the device's `read_ahead_kb`
+/// (`/sys/block/<dev>/queue/read_ahead_kb`, 128 KiB by default). On the measured kernel (7.0) nearly every folio of a
+/// segment was 128 KiB (order 5; a few smaller at a segment's start, the ramp), on both file systems, and folios are
 /// naturally aligned in the file, so a boundary at a multiple of 128 KiB is a folio boundary.
 ///
 /// If the folios are smaller (kernels or file systems without large folios for regular files, such as ext4 before
-/// 6.16, or a smaller `read_ahead_kb`): the helper only lags further than it needs to, and a checkpoint finds up to
-/// 128 KiB more to write; nothing is written twice and the writer takes no fault for it. If they are larger (2 MiB
-/// folios with a larger `read_ahead_kb` or huge pages in the page cache; with 16 KiB or 64 KiB base pages on aarch64
-/// kernels built that way, a folio is at least one such page and read-around folios can be larger): the boundary is
-/// then inside the writer's folio, which is written back as before. Being wrong about the folio size therefore costs
-/// at most what ending the range at the writer's page cost, never more. A 2 MiB alignment, which would cover every
-/// folio size, was measured and left a checkpoint too much to write (ADR 0058).
+/// 6.16, or a smaller `read_ahead_kb`): nothing is written twice and the writer takes no fault for it, but the helper
+/// lags further than it needs to, so each checkpoint and each roll's tail gets up to 124 KiB more to write than with
+/// the old limit, for no gain. If they are larger (a larger `read_ahead_kb`, as md RAID, some LVM set-ups or a tuned
+/// profile that sets 4 MiB give, makes folios of up to 2 MiB; with 16 KiB or 64 KiB base pages on aarch64 kernels built
+/// that way, a folio is at least one such page and read-around folios can be larger): the boundary is then inside the
+/// writer's folio, which is written back, and faulted on, as before. So a wrong guess never costs more faults or double
+/// writes than the old limit did; with smaller folios it costs the extra bytes left to checkpoints and rolls. A 2 MiB
+/// alignment, which would cover every folio size, was measured and left a checkpoint too much to write (ADR 0058).
 pub(crate) const FOLIO: u64 = 128 << 10;
 
 /// The end of the range the helper may start in the active segment for a writer at `position`, with pages of `page`
@@ -275,14 +277,15 @@ impl WriteBack {
         TestHandle(Arc::clone(&self.shared))
     }
 
-    /// For tests: waits until the helper has seen everything handed to it and waits to be woken, then returns the
-    /// ranges it has started so far.
+    /// For tests: waits until the helper has seen everything handed to it and waits to be woken, or has stopped, then
+    /// returns the ranges it has started so far.
     #[cfg(test)]
     pub(crate) fn settled(&self) -> Vec<Issued> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
             let state = lock(&self.shared);
-            if state.waiting && state.seen == state.handed {
+            // A helper that has stopped (an unsupported or failed call) will not settle: what it started is all.
+            if (state.waiting && state.seen == state.handed) || state.stopped {
                 return state.issued.clone();
             }
             drop(state);
@@ -351,8 +354,9 @@ impl Drop for WriteBack {
 
 /// What the helper does next.
 enum Work {
-    /// Write back `[from, to)` of a file.
-    Range(Arc<File>, u64, u64),
+    /// Write back `[from, to)` of a file; with the writer's position the helper knew, or `None` for a segment the
+    /// writer rolled past.
+    Range(Arc<File>, u64, u64, Option<u64>),
     Stop,
 }
 
@@ -394,9 +398,7 @@ fn follow(shared: &Shared, ctx: &Context) {
                     };
                     current = None;
                     if from < end {
-                        #[cfg(test)]
-                        note_issued(&mut state, &file, from, end, None);
-                        break Work::Range(file, from, end);
+                        break Work::Range(file, from, end, None);
                     }
                     continue;
                 }
@@ -414,13 +416,7 @@ fn follow(shared: &Shared, ctx: &Context) {
                 if done < end {
                     let to = end.min(done.saturating_add(STEP));
                     let from = std::mem::replace(&mut done, to);
-                    let file = Arc::clone(file);
-                    #[cfg(test)]
-                    {
-                        let position = state.position;
-                        note_issued(&mut state, &file, from, to, Some(position));
-                    }
-                    break Work::Range(file, from, to);
+                    break Work::Range(Arc::clone(file), from, to, Some(state.position));
                 }
                 #[cfg(test)]
                 {
@@ -431,9 +427,14 @@ fn follow(shared: &Shared, ctx: &Context) {
                 state.waiting = false;
             }
         };
-        let Work::Range(file, from, to) = work else {
+        let Work::Range(file, from, to, known) = work else {
             return;
         };
+        // For tests: the range exactly as it is handed to the call below.
+        #[cfg(test)]
+        note_issued(&mut lock(shared), &file, from, to, known);
+        #[cfg(not(test))]
+        let _ = known;
         if let Err(e) = start(&file, from, to - from) {
             if unsupported(&e) {
                 // The filesystem or kernel does not support it: the kernel's own flusher writes back as before.

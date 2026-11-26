@@ -5,21 +5,27 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
-- Changed (Linux): early write-back stops at the 128 KiB boundary below the writer instead of at the page that holds
-  its position (ADR 0058, change 1; issue #60), so that it no longer writes back, and write-protects, the page-cache
-  folio the writer is still filling (128 KiB on recent ext4 and xfs), which the device then wrote twice and the writer
-  faulted on again. A checkpoint may find up to 128 KiB more to write; a sealed segment is still written back whole when
-  the writer rolls past it. No API, format or crash-contract change; the append path is the same (384.0 instructions
-  per append before and after). Measured in 10-minute session cells on cloud VMs (`docs/benchmarks.md` → "2026-11-26,
-  early write-back to the folio boundary"; two runs per build and cell). Better: device bytes 1.06–1.08 → 1.002–1.005
-  times the appended bytes; aarch64 at 90 % of the device's rate, seconds with an append of 50 ms or more 138–151 → 0 of
-  610 on ext4 and 2–4 → 0 on xfs, background checkpoints durable after 0.35–0.41 s → about 1 ms; the writer's p99.9
-  lower in every paced cell (aarch64 4.0 → 2.4 µs, x86-64 6.3 → 5.8 µs). Worse, beyond the base's own spread: aarch64
-  64 B at 50 %, checkpoints durable after 946–952 instead of 912–914 µs (median) and the zero-copy reader's p99.9
-  325–335 instead of 312–316 µs; x86-64 1,024 B, the durable time's p99 5.1–6.0 instead of 4.1–4.9 ms; rolls a few µs
-  slower (median 260–264 instead of 254–256 µs at 64 B). No difference on kernel 6.8, whose ext4 has no large folios.
-  The first gate set for this default ("no cell worse") was narrowly missed and the orchestrator accepted it (ADR 0058 →
-  "Decision for change 1"); a private constant, `writeback::STOP_AT_FOLIO_BOUNDARY`, restores the old behaviour.
+- Changed (Linux): early write-back stops at the 128 KiB boundary below the writer instead of at the page that holds its
+  position (ADR 0058, change 1; issue #60), so that it no longer writes back, and write-protects, the page-cache folio
+  the writer is still filling (128 KiB on recent ext4 and xfs with the default `read_ahead_kb`), which the device then
+  wrote twice and the writer faulted on again. A checkpoint may find up to 128 KiB more to write, and so may a roll's
+  write-back of the old segment's tail; a sealed segment is still written back whole when the writer rolls past it. No
+  API, format or crash-contract change; the append path is the same code (384.0 instructions per append before and
+  after, measured with helper threads off). Measured in 10-minute session cells on cloud VMs (`docs/benchmarks.md` →
+  "2026-11-26, early write-back to the folio boundary"; two runs per build and cell; background checkpoints every
+  second). Better: device bytes 1.06–1.08 → 1.002–1.005 times the appended bytes; aarch64 at 90 % of the device's rate,
+  seconds with an append of 50 ms or more 138–151 → 0 of 611 on ext4 and 2–4 → 0 on xfs, background checkpoints durable
+  after 0.35–0.41 s → about 1 ms; the writer's p99.9 lower in every paced cell on kernel 7.0 (aarch64 4.0 → 2.4 µs,
+  x86-64 6.3 → 5.8 µs). Worse, beyond the base's own spread: aarch64 64 B at 50 %, background checkpoints durable after
+  946–952 instead of 912–914 µs (median) and the zero-copy reader's p99.9 325–335 instead of 312–316 µs; x86-64 1,024 B,
+  the background checkpoints' durable time p99 5.1–6.0 instead of 4.1–4.9 ms. In three short W2 runs per build at 64 B
+  on x86-64, two change runs had a higher reader p99.9 than every base run; 10 strictly alternating pairs per cell on
+  both architectures showed that to be noise (change / base median 0.65–1.01, the p99.99 at 100,000 records/s a third of
+  the base's). Slower rolls (median append): 254–256 → 260–264 µs at 64 B and 188 → 260–266 µs at steady-90 on aarch64
+  ext4 (its maxima down from 61–111 ms to 0.6–1.0 ms), 148–180 → 158–366 µs on kernel 6.8. On kernel 6.8, whose ext4 has
+  no large folios, no gate figure differed. The first gate set for this default ("no cell worse") was narrowly missed
+  and the orchestrator accepted it (ADR 0058 → "Decision for change 1"); a private constant,
+  `writeback::STOP_AT_FOLIO_BOUNDARY`, restores the old behaviour.
 - Changed: a reader waiting at an empty slot no longer reads every later file name without a valid segment header
   again at each listing (issue #89, ADR 0050 amendment of 2026-11-27). Such names (stray files named like segments) are
   no evidence, but with 10,000 of them an idle visible reader's `try_next` spent 105–168 ms (macOS) or up to 32 ms

@@ -1671,10 +1671,10 @@ tickertape_status tickertape_writer_options_set_prefault(struct tickertape_write
  * the write position has moved 1 MiB, up to the 128 KiB boundary below it (not into the page-cache folio the writer is
  * still filling; ADR 0058, from 1.1), and over the rest of a segment when the writer rolls past it. A checkpoint may
  * therefore find up to 128 KiB more to write. That call only starts writing: what is durable when is unchanged, and
- * only a checkpoint promises it (`docs/crash-contract.md`). If the call fails with an I/O error, no later checkpoint of this writer succeeds: the
- * error is returned once, by the next checkpoint, `tickertape_writer_request_checkpoint`,
- * `tickertape_writer_checkpoint_progress` or `tickertape_writer_close`, and `TICKERTAPE_E_DURABILITY_LOST` after
- * that. If the filesystem does not support the call, the helper stops. **macOS:** no effect.
+ * only a checkpoint promises it (`docs/crash-contract.md`). If the call fails with an I/O error, no later checkpoint
+ * of this writer succeeds: the error is returned once, by the next checkpoint, `tickertape_writer_request_checkpoint`,
+ * `tickertape_writer_checkpoint_progress` or `tickertape_writer_close`, and `TICKERTAPE_E_DURABILITY_LOST` after that.
+ * If the filesystem does not support the call, the helper stops. **macOS:** no effect.
  *
  * # Safety
  *

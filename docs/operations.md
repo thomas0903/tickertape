@@ -73,12 +73,20 @@ With `WriterConfig::prefault(true)` (the default), the writer moves segment work
     to fill (a few of them waiting 20–100 µs for the ext4 journal), and the device wrote that folio twice. In the
     recorded 10-minute runs (`docs/benchmarks.md` → "2026-11-26, early write-back to the folio boundary") that was 6–8
     % more device bytes than appended, and on aarch64 at 90 % of the device's rate appends of 50–150 ms in 138–151 of
-    610 seconds; with the boundary, 0.2–0.5 % and none, and the writer's p99.9 was lower in every paced run.
-  - **What it costs.** A checkpoint may find up to 128 KiB more to write: in those runs a background checkpoint at 64 B
-    on aarch64 became durable after 946–952 µs instead of 912–914 (median), and a roll's append took a few µs longer
-    (median 260–264 instead of 254–256 µs there). With smaller folios (ext4 before 6.16) the helper only lags further
-    than it needs to; with larger ones (2 MiB folios, 16 or 64 KiB pages) it behaves as in 1.0. None of that was
-    measured beyond the cells in `docs/benchmarks.md`.
+    611 seconds; with the boundary, 0.2–0.5 % and none, and on that kernel (7.0) the writer's p99.9 was lower in every
+    paced run.
+  - **What it costs.** A checkpoint may find up to 128 KiB more to write, and so may a roll's write-back of the old
+    segment's tail: in those runs a background checkpoint at 64 B on aarch64 became durable after 946–952 µs instead of
+    912–914 (median), and the median roll append went from 254–256 to 260–264 µs there, from 188 to 260–266 µs at 90 %
+    of the device's rate on ext4 (while the longest fell from 61–111 to 0.6–1.0 ms), and from 148–180 to 158–366 µs on
+    a 6.8 kernel. With smaller folios (ext4 before 6.16) nothing is written twice either, but each checkpoint and each
+    roll's tail still gets up to 124 KiB more than with the old limit, for no gain.
+  - **What sets the folio size.** It follows the file's readahead window, `read_ahead_kb` of the device
+    (`/sys/block/<dev>/queue/read_ahead_kb`, 128 by default): the page cache's read-around for mapped files ramps its
+    folios up to that size. Where it is larger (md RAID, some LVM set-ups, a tuned profile that sets 4 MiB), folios
+    can reach 2 MiB, and early write-back then writes back the writer's folio as in 1.0, with its faults and double
+    writes. With 16 KiB or 64 KiB pages a folio is at least one page and can be larger. None of these was measured
+    beyond the cells in `docs/benchmarks.md`.
 
 **ext4 under a load near what the disk takes.** A store into a page of a mapped file updates the file's modification
 time through the ext4 journal and can wait while the journal commits, for as long as the disk takes to write the log

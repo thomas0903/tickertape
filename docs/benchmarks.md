@@ -2365,20 +2365,23 @@ private constant `STOP_AT_FOLIO_BOUNDARY`). 10-minute session cells, unpaced run
 and a kernel whose page cache gives ext4 no large folios. **Cloud virtual machines with local NVMe SSD, not bare
 metal.** The raw output (results, series, environment, scripts) is kept outside the repository.
 
-**Answer.** Where the folio the writer fills is 128 KiB (kernel 7.0, ext4 and xfs), the change took the device's
-bytes from 1.06–1.08 times the appended bytes to 1.002–1.005 in every paced cell; on aarch64 at 90 % of the device's
-rate it removed the long appends (138–151 of 610 seconds with an append of 50 ms or more on ext4, 2–4 on xfs, against
-none) and made background checkpoints durable 0.9–1.1 ms after their request instead of 0.35–0.41 s; and it lowered
-the writer's p99.9 in every paced cell (aarch64 4.0 → 2.4 µs at steady-90, 2.0 → 1.9 µs at 64 B; x86-64 6.3 → 5.8 µs
+**Answer.** Where the folio the writer fills is 128 KiB (kernel 7.0, ext4 and xfs), the change took the device's bytes
+from 1.06–1.08 times the appended bytes to 1.002–1.005 in every paced cell; on aarch64 at 90 % of the device's rate it
+removed the long appends (138–151 of 611 seconds with an append of 50 ms or more on ext4, 2–4 on xfs, against none) and
+made background checkpoints durable 0.9–1.1 ms after their request instead of 0.35–0.41 s; and it lowered the writer's
+p99.9 in every paced cell on that kernel (aarch64 4.0 → 2.4 µs at steady-90, 2.0 → 1.9 µs at 64 B; x86-64 6.3 → 5.8 µs
 at 1,024 B steady-50) and its p99.99, by two to six times at 1,024 B. On kernel 6.8, where ext4's folios are single
-pages, it made no difference the runs could tell. **It did not meet the first gate for a default** ("no cell worse
-than the base beyond the noise floor"): at 64 B on aarch64, checkpoints became durable after 946–952 µs instead of
-912–914 (median) and the zero-copy reader's p99.9 was 325–335 µs instead of 312–316; at 1,024 B on x86-64 the durable
-time's p99 was 5.1–6.0 ms instead of 4.1–4.9 (its median within the base's range); unpaced on x86-64 the lower of the
-two runs was 0.1 % below the base's range. With the change a checkpoint finds up to 128 KiB more to write (the cost
-ADR 0058 expected), and a roll writes the old segment's last block back as it happens (not traced); both show here, at
-the size of the base's own spread or a little more. The orchestrator accepted that miss and made the change the
-default from 1.1 (ADR 0058 → "Decision for change 1"); the gate result stands as measured.
+pages, no gate figure differed, but the roll appends' median rose (148–151 → 158–366 µs and 152–180 → 173–271 µs on two
+VMs). **It did not meet the first gate for a default** ("no cell worse than the base beyond the noise floor"): at 64 B
+on aarch64, background checkpoints became durable after 946–952 µs instead of 912–914 (median) and the zero-copy
+reader's p99.9 was 325–335 µs instead of 312–316; at 1,024 B on x86-64 the background checkpoints' durable time had a
+p99 of 5.1–6.0 ms instead of 4.1–4.9 (its median within the base's range); unpaced on x86-64 the lower of the two runs
+was 0.1 % below the base's range; and in the W2 cells at 64 B on x86-64, two change runs of three had a higher reader
+p99.9 than every base run, which 10 strictly alternating pairs per cell on both architectures then showed to be noise
+(below). With the change a checkpoint finds up to 128 KiB more to write (the cost ADR 0058 expected), which shows at
+about the base's own spread, and a roll writes the old segment's last block back as it happens (not traced), which made
+the median roll append up to about 40 % longer. The orchestrator accepted that miss and made the change the default from
+1.1 (ADR 0058 → "Decision for change 1"); the gate result stands as measured.
 
 ### Environment and commands
 
@@ -2395,7 +2398,9 @@ at their defaults. Results on the boot disk. Before every run: the journal delet
 3 s pause; device sectors written from `/proc/diskstats` around the run (warm-up, final checkpoint and drain included),
 against the appended bytes (records × 1,064 or × 104).
 
-Builds: base `8a70d7ba` (`main` before this change; the library is the same at the `main` this was merged into) and
+Builds: base `8a70d7ba` (`main` before this change; the library is the same at `e8e4cb16`; #110, merged later as
+`5df57cc2`, changed the reader's wait path and is not in these runs, except the paired W2 runs below, which ran on the
+merged tree) and
 change, the same commit with this section's change to `writeback.rs` and the early write-back to the folio boundary on
 (at the time of the runs it was not yet behind `STOP_AT_FOLIO_BOUNDARY`; the constant set to `true` gives the same
 code path). Each built on each VM in a target directory of its own. Binaries' sha256 (`tt-sustained`, base / change):
@@ -2428,10 +2433,12 @@ tt-sustained-<build> run … --unpaced --payload 1024 --duration 60s --readers m
   run, filtered by device: kernel 7.0, ext4 and xfs on both architectures, 3,246–3,250 of 3,372–3,376 folios of order 5
   (128 KiB; the rest of order 0, 2 and 4, at segment starts); kernel 6.8, ext4: 104,160–104,192 folios, all order 0 (4
   KiB). Ext4 has large folios for regular files from Linux 6.16; xfs has had them since 5.18 (xfs on 6.8 not run).
-- **Instructions per append** (ADR 0047's method, Callgrind, 64 B, one segment, no helper threads; x86-64, two
+- **Instructions per append** (ADR 0047's method, Callgrind, 64 B, one segment, helper threads off; x86-64, two
   repetitions): 384.0 in both builds (differences of totals 76,800,039 and 76,799,961 base, 76,800,045 and 76,800,000
-  change, over 200,000 appends). The change is in the helper thread only.
-- "Seconds ≥ 50 ms" and "≥ 10 ms" count the seconds of the writer's series (610 per paced run, warm-up included)
+  change, over 200,000 appends). With helper threads off the writer does not call the early write-back hook
+  (`WriteBack::advanced`); that hook is unchanged code outside tests (it only drops its lock guard explicitly before
+  waking the helper), and the change is in the helper thread.
+- "Seconds ≥ 50 ms" and "≥ 10 ms" count the seconds of the writer's series (611 per paced run, warm-up included)
   whose longest append took that long. Latencies in µs unless marked.
 
 ### Writer and device
@@ -2460,7 +2467,8 @@ tt-sustained-<build> run … --unpaced --payload 1024 --duration 60s --readers m
 ### Readers, checkpoints and rolls
 
 Zero-copy is `Reader::open_mapped` spinning, safe is `Reader::open` with its default wait, durable-only blocks; "to
-durable" is the time from a background checkpoint's request to its durable marker.
+durable" is the time from a background checkpoint's request to its durable marker (every run used `--checkpoint-mode
+background`; blocking checkpoints were not measured).
 
 | Machine | Cell | Build | Zero-copy p99.9 | Zero-copy max | Safe p99.9 | Safe max | Durable-only p50 | To durable p50 | To durable p99 | To durable max | Roll append p50 | Roll append max |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
@@ -2501,27 +2509,64 @@ interleaved rounds; latency from the scheduled send to the read, µs):
 
 At 1,024 B × 100,000/s the p99.9 fell three to five times (30.5–33.6 → 5.6–12.5 µs), as on aarch64, and at 10,000/s it
 was lower in each run but the ranges overlap (5.7–11.4 against 8.6–15.3 µs); the p99.99 at
-100,000/s, about 0.9–1.1 ms, is the roll without checkpoints and did not move. At 64 B one change run in each cell had
-a higher p99.9 than every base run (4.5 µs at 10,000/s, 6.4 µs at 100,000/s), with the other two inside the base's
-range; three runs do not tell whether that is the change.
+100,000/s, about 0.9–1.1 ms, is the roll without checkpoints and did not move. At 64 B two change runs of three in each
+cell had a higher p99.9 than every base run: at 10,000/s (310,000 sends, 31 s) base 2.59, 2.39 and 1.81 µs, change
+3.64, 4.51 and 1.47 µs; at 100,000/s (1,100,000 sends, 11 s) base 4.13, 2.80 and 3.61 µs, change 6.37, 6.17 and 2.85
+µs. Runs this short and this few do not tell; the paired runs below were made for it.
+
+### Paired W2 runs at 64 B (review round, both architectures)
+
+The three runs above could not tell whether the change hurts the reader at 64 B, a cell the comparison's README counts
+for tickertape. So, after review, both 64 B cells ran again with both readers, as strictly alternating pairs: base,
+change, base, change, …, 10 pairs per cell and reader, the four cell and reader combinations in turn within each step.
+`c4-standard-16-lssd` (x86-64, us-east1-b, 18:34–19:09 UTC) and `c4a-standard-8-lssd` (aarch64, us-east1-d: us-east1-b
+had no capacity; 18:38–19:11), kernel 7.0.0-1017-gcp, ext4 on the first local SSD, `read_ahead_kb` 128 on every device.
+Both builds from the merged tree of this change (which includes #110; after these runs only comments changed): change
+with `STOP_AT_FOLIO_BOUNDARY = true`, base the same tree with `false`, each in a target directory of its own
+(`tt-latency` sha256 base / change: x86-64 `ab79d6c2…` / `cddb6687…`, aarch64 `6d2bb45d…` / `e8e5ef2f…`). `tt-latency
+run … --rate <10000|100000> --count <310000|1100000> --warmup <10000|100000> --payload 64 --reader <mapped|safe>
+--writer-cpu <w> --reader-cpu <r> --helper-cpus <h>` (one CPU of its own core each), as above; the comparison itself
+sends 1,100,000 records at both rates, so its 10,000/s runs last 110 s, not 31. A pair is a change run and the base run
+just before it; the floor compares each base run with the next one (9 per cell). Latency from the scheduled send to the
+read, µs:
+
+| Machine | Cell | Reader | p99.9 base: median (range) | p99.9 change | change / base, median of 10 pairs; pairs higher / lower | base / base (floor), median; range | p99.99 change / base, median; pairs higher / lower |
+|---|---|---|---|---|---|---|---|
+| x86-64 | 64 B × 100,000/s | zero-copy | 4.09 (2.88–7.08) | 2.35 (1.80–5.68) | 0.66; 2 / 8 | 1.07; 0.41–2.04 | 0.29; 0 / 10 |
+| x86-64 | 64 B × 100,000/s | safe | 9.21 (9.13–9.48) | 9.16 (9.11–9.44) | 1.00; 3 / 6 | 1.00; 0.98–1.03 | 0.36; 0 / 10 |
+| x86-64 | 64 B × 10,000/s | zero-copy | 2.28 (1.84–9.93) | 2.10 (1.55–10.61) | 0.82; 3 / 7 | 1.08; 0.59–5.38 | 1.06; 5 / 5 |
+| x86-64 | 64 B × 10,000/s | safe | 5.09 (4.83–10.60) | 5.07 (4.96–6.89) | 0.99; 4 / 6 | 1.00; 0.48–2.08 | 0.88; 3 / 7 |
+| aarch64 | 64 B × 100,000/s | zero-copy | 2.35 (1.94–4.97) | 1.66 (0.46–2.93) | 0.65; 2 / 8 | 1.00; 0.44–1.39 | 0.33; 0 / 10 |
+| aarch64 | 64 B × 100,000/s | safe | 3.83 (3.75–5.78) | 3.60 (3.54–3.98) | 0.94; 1 / 9 | 1.00; 0.66–1.18 | 0.33; 0 / 10 |
+| aarch64 | 64 B × 10,000/s | zero-copy | 0.46 (0.45–2.16) | 0.47 (0.45–3.01) | 1.01; 6 / 4 | 1.00; 0.21–4.56 | 0.98; 5 / 5 |
+| aarch64 | 64 B × 10,000/s | safe | 3.98 (3.93–4.03) | 3.93 (3.90–6.36) | 0.99; 2 / 8 | 1.01; 0.98–1.02 | 0.97; 2 / 8 |
+
+**Noise, not a regression.** The change's p99.9 was lower than its paired base in most pairs of every cell but one
+(aarch64, zero-copy at 10,000/s: 6 higher, 4 lower, median ratio 1.01, inside a floor of 0.21–4.56), and its p99.99 at
+100,000/s was a third of the base's in all 10 pairs on both machines, both readers. The two high change runs of the
+three-run table were within what the base itself did here (x86-64, zero-copy at 100,000/s: base 2.88–7.08 µs).
 
 ### Gates
 
 | Gate | Met? | Figures |
 |---|---|---|
-| 1. No cell worse than the base beyond the noise floor (the base's two runs) in append p99.9, reader p99.9, time to durable or throughput | **No** | aarch64 64 B: to durable p50 946–952 against 912–914 µs, zero-copy p99.9 325–335 against 312–316 µs; x86-64 1,024 B: to durable p99 5.06–5.98 against 4.08–4.87 ms (p50 1.83–2.67 against 1.63–2.93); x86-64 unpaced: 492,358–492,936 against 492,855–492,976 records/s; W2 64 B: see above. Every other figure was better or within the base's range |
-| 2. The 60-second runs' gain shows in 10-minute cells (writer p99.9, device bytes, aarch64 stalls at steady-90) | Yes | writer p99.9 lower in every paced cell (above); device / appended 1.084 → 1.002–1.003 (aarch64 steady-90), 1.059 → 1.005 (aarch64 64 B), 1.061–1.065 → 1.004 (x86-64); seconds ≥ 50 ms at aarch64 steady-90: 138–151 → 0 (ext4), 2–4 → 0 (xfs) |
-| 3. No harm on a kernel without large folios | Yes | kernel 6.8 VM 2, strictly alternating: every gate figure within the base's range (append p99.9 8.10–8.46 against 6.94–9.80 µs, zero-copy p99.9 1.45–1.52 against 1.38–1.73 ms, safe 0.68–0.82 against 0.66–1.39 ms, to durable p50 1.31–1.33 against 1.29–1.36 ms); 64 B on VM 1 within or better |
+| 1. No cell worse than the base beyond the noise floor (the base's two runs) in append p99.9, reader p99.9, time to durable or throughput | **No** | aarch64 64 B: background checkpoint to durable p50 946–952 against 912–914 µs, zero-copy p99.9 325–335 against 312–316 µs; x86-64 1,024 B: background checkpoint to durable p99 5.06–5.98 against 4.08–4.87 ms (p50 1.83–2.67 against 1.63–2.93); x86-64 unpaced: 492,358–492,936 against 492,855–492,976 records/s; W2 64 B (three runs): two change runs of three above every base run in each cell (above); in 10 alternating pairs per cell on both machines, noise: change / base median 0.65–1.01, the change lower in most pairs, p99.99 at 100,000/s a third of the base's. Every other figure was better or within the base's range |
+| 2. The 60-second runs' gain shows in 10-minute cells (writer p99.9, device bytes, aarch64 stalls at steady-90) | Yes | writer p99.9 lower in every paced cell on kernel 7.0 (above); device / appended 1.084 → 1.002–1.003 (aarch64 steady-90), 1.059 → 1.005 (aarch64 64 B), 1.061–1.065 → 1.004 (x86-64); seconds ≥ 50 ms at aarch64 steady-90: 138–151 → 0 (ext4), 2–4 → 0 (xfs) |
+| 3. No harm on a kernel without large folios | Yes, for the gate figures | kernel 6.8 VM 2, strictly alternating: every gate figure within the base's range (append p99.9 8.10–8.46 against 6.94–9.80 µs, zero-copy p99.9 1.45–1.52 against 1.38–1.73 ms, safe 0.68–0.82 against 0.66–1.39 ms, to durable p50 1.31–1.33 against 1.29–1.36 ms); 64 B on VM 1 within or better. Not a gate figure: the roll appends' median rose, 148–151 → 158–366 µs (VM 1) and 152–180 → 173–271 µs (VM 2) |
 
 Gate 1 was not met. The orchestrator, on the owner's delegation, made the change the default from 1.1 anyway (ADR 0058
 → "Decision for change 1"): `STOP_AT_FOLIO_BOUNDARY` is `true`, and `false` restores 1.0's early write-back.
 
-- **What the costs are.** The durable time at 64 B grew by the time to write up to 128 KiB more per checkpoint (34–40
-  µs here). The roll appends' median grew at 64 B on aarch64 (254–256 → 260–264 µs) and at steady-90 on ext4 (188 →
-  260–266 µs, while their maxima fell from 61–111 ms to 0.6–1.0 ms), and the zero-copy reader's p99.9 at 64 B, about
-  the length of one roll's wait at 1.3 rolls per second, moved with it. At a
-  roll the helper now writes back the old segment's last block, up to 128 KiB that it used to write a step earlier,
-  while the writer starts the new segment; that was not traced.
+- **What the costs are.** The background checkpoints' durable time at 64 B grew by about the time to write up to 128
+  KiB more per checkpoint (32–39 µs here; 33.8 and 37.9 µs paired by round). The roll appends' median grew at 64 B on
+  aarch64 (254–256 → 260–264 µs), by about 40 % at steady-90 on ext4 (188 → 260–266 µs, while their maxima fell from
+  61–111 ms to 0.6–1.0 ms) and on kernel 6.8 (148–151 → 158–366 µs on VM 1, both change runs above the base's range;
+  152–180 → 173–271 µs on VM 2); the zero-copy reader's p99.9 at 64 B, about the length of one roll's wait at 1.3 rolls
+  per second, moved with it. At a roll the helper now writes back the old segment's last block, up to 128 KiB that it
+  used to write a step earlier, while the writer starts the new segment; on 6.8, with single-page folios, the old code
+  left at most a page to that tail and the new one up to 124 KiB more, which fits the rise there. Not traced.
+- **Major faults of the writer's thread** (from `getrusage`, per 10-minute run) rose at steady-90 on ext4 (477–496 →
+  573–638) and at 64 B (55–68 → 111–136), not on xfs (446–454 → 342–452) or on x86-64 (830–883 → 827–836); not traced.
 - **Unpaced** (60 s, as PR #105's): throughput the same within 0.1 % on both machines; the seconds with an append of
   50 ms or more 29 against 19–29 (aarch64) and 0 against 0–1 (x86-64); the longest append 376–382 against 324–348 ms on
   aarch64 and 25.9 against 44–137 ms on x86-64. Unpaced, the writer is throttled by the kernel's write-back either way;
@@ -2529,12 +2574,14 @@ Gate 1 was not met. The orchestrator, on the owner's delegation, made the change
 
 ### What these figures do not show
 
-Two runs per build and cell, one VM per machine type (two for kernel 6.8), one day; the gate's noise floor is the
-spread of two base runs, which is narrow for some figures. Not run: steady-50 at 1,024 B and steady-90 at 64 B on
-aarch64, steady-90 and 64 B on x86-64 with kernel 7.0, xfs on x86-64 and on kernel 6.8, a kernel with folios larger
-than 128 KiB, 16 KiB or 64 KiB pages, other file systems, bare metal, macOS (no early write-back there), and the ranged
-sync of ADR 0058's change 2 (not part of this). The base binaries were built from `8a70d7ba`, the published comparison
-from v1.0.0: the two are not mixed here.
+Two runs per build and cell, one VM per machine type (two for kernel 6.8), one day; the gate's noise floor is the spread
+of two base runs, which is narrow for some figures. Only background checkpoints, every second, and 128 MiB segments;
+blocking checkpoints, other intervals and other segment sizes were not run, and `read_ahead_kb` (which bounds the folio
+size: `docs/operations.md`) was the default and not recorded in the 10-minute runs. Not run: steady-50 at 1,024 B and
+steady-90 at 64 B on aarch64, steady-90 and 64 B on x86-64 with kernel 7.0, xfs on x86-64 and on kernel 6.8, a kernel
+with folios larger than 128 KiB, 16 KiB or 64 KiB pages, other file systems, bare metal, macOS (no early write-back
+there), and the ranged sync of ADR 0058's change 2 (not part of this). The base binaries were built from `8a70d7ba`, the
+published comparison from v1.0.0: the two are not mixed here.
 
 ## 2026-11-26, seeks with and without the seek index (Google Cloud VMs)
 
