@@ -5,6 +5,18 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
+- Measured, not yet the default (ADR 0058, change 1; issue #60): early write-back on Linux can stop at the 128 KiB
+  boundary below the writer instead of at the page that holds its position, so that it no longer writes back, and
+  write-protects, the page-cache folio the writer is still filling. The code is in `writeback.rs` behind a private
+  constant, `STOP_AT_FOLIO_BOUNDARY`, which is off: the default behaviour, the API and the append path are unchanged
+  (384.0 instructions per append in both builds). In 10-minute session cells on cloud VMs (`docs/benchmarks.md` →
+  "2026-11-26, early write-back to the folio boundary") it took the device's bytes from 1.06–1.08 to 1.00 times the
+  appended bytes, removed the 50–150 ms appends of aarch64 at 90 % of the device's rate (138–151 seconds of 610 with
+  one, ext4; 2–4 on xfs) and made checkpoints durable after about 1 ms instead of 0.35–0.41 s there, and lowered the
+  writer's and the readers' p99.9 in most cells; on a kernel without large folios for ext4 (6.8) it made no difference
+  that the runs could tell. It did not meet one gate set for a default: in a few cells a figure was slightly worse than
+  the base's own spread (aarch64, 64 B at 50 %: checkpoints durable after 946–952 µs instead of 912–914, the zero-copy
+  reader's p99.9 325–335 µs instead of 312–316). The tests cover both settings.
 - Docs: the comparison with Chronicle Queue, Aeron IPC, yaque, queue-file and a plain file is rerun at v1.0.0 with the
   corrected harness (issue #57): one 24-hour session on each of two Google Cloud VMs (x86-64 and aarch64, ext4 and xfs),
   session commit `fb2d91b0`, every tool pinned, the JVM tools warmed up through their measured loops, Chronicle with

@@ -77,8 +77,21 @@ With `WriterConfig::prefault(true)` (the default), the writer moves segment work
 - **Early write-back (Linux).** A helper thread, `tickertape-writeback`, asks the kernel to start writing back the
   pages behind the write position (`sync_file_range(SYNC_FILE_RANGE_WRITE)`, every 1 MiB, and the rest of a segment
   when the writer rolls past it), so that a checkpoint, blocking or background, finds little dirty data left
-  (`WriterConfig::early_writeback`, default on; ADR 0038). It makes nothing durable: only checkpoints do. An I/O
-  error from it makes the next checkpoint fail, as a failed sync would. On macOS the option does nothing.
+  (`WriterConfig::early_writeback`, default on; ADR 0038). It makes nothing durable: only checkpoints do, and a
+  checkpoint syncs whatever early write-back has not reached. An I/O error from it makes the next checkpoint fail, as
+  a failed sync would. On macOS the option does nothing.
+  - **What it costs near the writer.** The kernel writes back whole page-cache folios, not pages, and makes their
+    pages read-only again; recent ext4 (Linux 6.16 and later) and xfs give a segment 128 KiB folios with the default
+    `read_ahead_kb`. Early write-back runs up to the page that holds the write position, so it also writes the folio
+    the writer is still filling: the writer then takes a page fault on each page of it that it has yet to fill (a few
+    of them wait 20–100 µs for the ext4 journal), and the device writes that folio twice. In the recorded 10-minute
+    runs (`docs/benchmarks.md` → "2026-11-26, early write-back to the folio boundary") that was 6–8 % more device
+    bytes than appended, and on aarch64 at 90 % of the device's rate it led to appends of 50–150 ms in more than a
+    fifth of the seconds. Stopping early write-back at the 128 KiB boundary below the writer removed both there, at
+    the cost of up to 128 KiB more for each checkpoint to write; it is measured but not the default (ADR 0058). If
+    your writer runs close to the device's rate on such a kernel and sees these stalls, early write-back off
+    (`WriterConfig::early_writeback(false)`) also removes them, with checkpoints then taking as long as the device
+    needs for their data ("Settings that moved the tail" below).
 
 **ext4 under a load near what the disk takes.** A store into a page of a mapped file updates the file's modification
 time through the ext4 journal and can wait while the journal commits, for as long as the disk takes to write the log
