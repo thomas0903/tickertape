@@ -125,9 +125,10 @@ pub(crate) fn find_bases(dir: &Path, seq: u64) -> Result<Bases> {
     Ok(out)
 }
 
-/// From one listing of `dir`: the bases above `seq`, and whether a segment with base `seq` exists. Memory for the bases
-/// above only (none, on a journal whose reader is at the head).
-pub(crate) fn bases_from(dir: &Path, seq: u64) -> Result<(Vec<u64>, bool)> {
+/// From one listing of `dir`: the bases above `seq`, each with the inode number the listing gives for its name
+/// (`d_ino`, no `stat`), and whether a segment with base `seq` exists. Memory for the bases above only (none, on a
+/// journal whose reader is at the head).
+pub(crate) fn bases_from(dir: &Path, seq: u64) -> Result<(Vec<(u64, u64)>, bool)> {
     let entries = fs::read_dir(dir).map_err(|e| Error::io("list journal directory", dir, e))?;
     let (mut above, mut at) = (Vec::new(), false);
     for entry in entries {
@@ -138,7 +139,7 @@ pub(crate) fn bases_from(dir: &Path, seq: u64) -> Result<(Vec<u64>, bool)> {
             .and_then(format::parse_segment_file_name)
         {
             match base.cmp(&seq) {
-                std::cmp::Ordering::Greater => above.push(base),
+                std::cmp::Ordering::Greater => above.push((base, entry.ino())),
                 std::cmp::Ordering::Equal => at = true,
                 std::cmp::Ordering::Less => {}
             }
