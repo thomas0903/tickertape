@@ -278,6 +278,18 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   explained; the lagging view of issue #43 still occurs on `main` under memory pressure, is cleared by the first
   re-read after a pause, and coincides in part with reclaim removing the frame's pages (not confirmed). Added
   (benchmarks): `benches/diagnostics/reader-pauses.bt` and `benches/diagnostics/frontier-evictions.bt`.
+- Docs: `docs/benchmarks.md` has macOS results for three open items (issues #62 and #60; Apple M4 Pro, APFS, a shared
+  laptop): the sustained session with 10-minute steady runs at both payloads (the writer keeps half the probe rate but
+  falls up to 1.5 s behind at rolls; at 90 % of the 1,024 B probe it stops at the overrun limit) and a comparison with
+  Chronicle Queue and Aeron at identical low rates; how often a roll waits for the spare segment (only near the device's
+  limit; mostly for the spare's 8 MiB prefault, longest for its `fsync` behind a checkpoint) and the two other causes of
+  slow rolls found on the way (the spare's `link` behind a checkpoint's syncs, and the release of the oldest of four
+  open dirty segments on the writer's thread); and what prefaulted, unwritten data adds to a checkpoint (on APFS
+  `MADV_WILLNEED` dirties the advised pages, so each checkpoint writes up to 8 MiB of zeros more). The roadmap's gaps
+  are updated. No library change.
+- Added (benchmarks): `tt-sustained --count-clock-backwards`: a reader sample whose wall clock reads earlier than the
+  record's send time is recorded as 0 and counted (`clock_backwards_samples`, `clock_backwards_max_ns`) instead of
+  failing the run, which on macOS happened within a minute at 64 B. Without the option a run fails as before.
 
 ## [1.0.0] - 2026-11-23
 

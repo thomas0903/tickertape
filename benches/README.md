@@ -297,12 +297,15 @@ duration, down to a few seconds for smoke tests). `--dir` (the journal, on the f
 
 **Traffic.** `--rate N` schedules record *i* at `t0 + floor(i * 1e9 / N)`. `--burst-rate P` sends bursts at *P*
 records/s during the first `--burst-duty` percent (default 10) of every `--burst-period` (default 100 ms), nothing in
-the rest: the mean rate is `floor(P * period * duty / 100) / period`. Both store the **intended** time in
-`local_ts_ns`; the writer busy-waits for it and sends every record even when late, with no skipping or rebasing,
-and readers measure `now - intended`, so a backlog counts as latency (coordinated omission handled as in
-`tt-latency`). `--unpaced` sends as fast as it can until the duration ends; its records carry their actual send
-start, so its reader latency is measured from the send, not from a schedule. A paced writer that falls more than
-`--overrun-limit` (default 60 s) behind the end of its schedule stops and reports `unsent_records`; nothing is
+the rest: the mean rate is `floor(P * period * duty / 100) / period`. Both store the **intended** time in `local_ts_ns`;
+the writer busy-waits for it and sends every record even when late, with no skipping or rebasing, and readers measure
+`now - intended`, so a backlog counts as latency (coordinated omission handled as in `tt-latency`). A reader whose wall
+clock reads earlier than a record's stamp fails the run (`wall clock moved backwards`); with `--count-clock-backwards`
+it records 0 for that sample instead and counts it (`clock_backwards_samples`, `clock_backwards_max_ns` per reader). On
+macOS this happened between processes within a minute at 64 B, where readers see records within a microsecond
+(`docs/benchmarks.md`, 2026-11-26). `--unpaced` sends as fast as it can until the duration ends; its records carry their
+actual send start, so its reader latency is measured from the send, not from a schedule. A paced writer that falls more
+than `--overrun-limit` (default 60 s) behind the end of its schedule stops and reports `unsent_records`; nothing is
 dropped silently.
 
 **Checkpoints, rolls and retention.** `--checkpoint-every 1s` checkpoints on a fixed wall-clock grid (grid points
