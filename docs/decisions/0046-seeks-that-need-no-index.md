@@ -97,3 +97,18 @@ archiving or recovery, and the listing costs little against the scan; not change
   of its own, after the marker was read, otherwise to 0.
 - `tests/seek.rs` checks the results against a fresh reader's, which always scans, over random appends, rolls,
   checkpoints, repairs of both kinds and removals, for the four kinds of reader, and each condition on its own.
+
+## Amendment (2026-11-27): no cached listing (issue #80)
+
+Decided by the orchestrator on the owner's delegation. Measured since (`benchmarks.md`, 2026-11-25, one x86-64 cloud
+machine, ext4 on local SSD): the listing is about 0.29 µs per segment with a warm cache, so a seek costs about 3 ms at
+10,000 segments, 6 ms at 20,000 and 29 ms at 100,000 before it reads anything, and 16 forward seeks cost 16 listings;
+the seek index does not change that. With nothing cached, reading the directory took 18, 35 and 215 ms there.
+
+**There is still no cached listing.** A cache of bases would have to be invalidated by retention (the writer's and
+`retention::apply` in any process), by archivers in other processes, which take segments out of the journal at any
+time (ADR 0055), and by recovery, which replaces segments. A process can't learn of the others' changes without asking
+the file system, and a stale entry would send a reader to a segment that was removed or replaced, which the reader then
+has to detect and report as a removal (`Error::Discarded`) or an unavailable sequence number where a fresh listing finds
+the record. The supported answer is a moderate number of segments: `docs/operations.md` → How many segments to keep.
+The rustdoc of `Reader::seek` says what a seek costs.
