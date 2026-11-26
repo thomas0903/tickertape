@@ -8,9 +8,11 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 - Fixed (benchmarks): the comparison harness's short mode left the Chronicle Queue and Aeron JVMs (and `tt-latency`'s
   processes) running when it was terminated. `compare/run.py` now ends every child's process group, waits for it and
   renames an unfinished short run `OUTDIR.incomplete-N` on every way out (failure, time limit, SIGTERM, SIGINT,
-  SIGHUP), and a guard process does the same if the runner or `benches/rerun.py` is killed with SIGKILL. The short
-  mode has `--tools`, with the same output as a full run for the selected tools and a new `selected_tools` field in
-  every result; `benches/rerun.py` uses it. Nothing measured changes. No library change.
+  SIGHUP), and a guard process does the same if the runner or `benches/rerun.py` is killed with SIGKILL. The adapters
+  keep the sessions of their own they had; `tt-latency` stays in the runner's session with its output on a pipe, as at
+  v1.0.0, and only gains a process group of its own, so no measured process runs differently. The harness now needs
+  Python 3.11. The short mode has `--tools`, with the same output as a full run for the selected tools and a new
+  `selected_tools` field in every result; `benches/rerun.py` uses it. No library change.
 - Added (benchmarks): `tt-faults` counts the page faults of the writer's thread append by append, with paced appends,
   background checkpoints and a zero-copy reader, and `benches/diagnostics/writer-faults.bt` classifies them (ADR 0058,
   issue #60, proposed). The library does not change; the experiment switches the measurements used are on the branch

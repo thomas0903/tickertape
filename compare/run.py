@@ -76,7 +76,11 @@ def environment(out, env, quick, name="environment.txt", pinning=None, tools=Non
                      ["diskutil", "info", mount], ["df", "-h", tempfile.gettempdir()]]
     else:
         commands += [["lscpu"], ["free", "-h"], ["df", "-T", tempfile.gettempdir()],
-                     ["findmnt", "-T", tempfile.gettempdir()], ["lsblk", "-o", "NAME,MODEL,SIZE,ROTA,TYPE,MOUNTPOINT"]]
+                     ["findmnt", "-T", tempfile.gettempdir()], ["lsblk", "-o", "NAME,MODEL,SIZE,ROTA,TYPE,MOUNTPOINT"],
+                     # Scheduling groups: autogroup puts each session in a group of its own, and the runner's
+                     # cgroup (the children's, as they inherit it) decides which controllers apply.
+                     ["sysctl", "kernel.sched_autogroup_enabled"], ["cat", "/proc/self/cgroup"],
+                     ["sh", "-c", "cat \"/sys/fs/cgroup$(sed -n 's/^0:://p' /proc/self/cgroup)/cgroup.controllers\""]]
     with (out / name).open("w") as f:
         f.write(f"date_utc: {datetime.datetime.now(datetime.timezone.utc).isoformat()}\n")
         f.write(f"quick: {quick}\nTMPDIR: {tempfile.gettempdir()}\nJAVA_HOME: {env['JAVA_HOME']}\n")
@@ -221,14 +225,14 @@ def run_attempt(tool, workload, payload, reader, rate, repeat, out, env, quick, 
                 if tool == "tickertape" and workload == "W2":
                     cmd = latency_command(data, rate, count, warmup, payload, reader, pinning)
                     commands.write(shlex.join(cmd) + "\n")
-                    # A process group of its own like the other children: its processes end with it.
-                    latency_path = base / "latency.json"
-                    with latency_path.open("w") as handle:
-                        latency = group.popen(cmd, stdout=handle, stderr=error_log, env=env)
-                    status = group.wait(latency, timeout=count/rate+TIMEOUT_SLACK_S)
-                    if status:
-                        raise subprocess.CalledProcessError(status, cmd)
-                    result = json.loads(latency_path.read_text())
+                    # As at v1.0.0: in the runner's session, its output read from a pipe in a blocking wait. Only a
+                    # process group of its own is new, so that it ends with its writer and reader on every way out.
+                    latency = group.popen(cmd, new_session=False, stdout=subprocess.PIPE, stderr=error_log, env=env,
+                                          text=True)
+                    stdout, _ = group.communicate(latency, timeout=count/rate+TIMEOUT_SLACK_S)
+                    if latency.returncode:
+                        raise subprocess.CalledProcessError(latency.returncode, cmd, stdout)
+                    result = json.loads(stdout)
                     # Not watched by the keeper: tt-latency starts its own processes (moved_threads is null).
                     result["affinity"] = affinity.record(pinning, tool, *[{"affinity": result["affinity"][role]}
                                                                           for role in ("writer", "reader")])
@@ -363,8 +367,20 @@ def short_matrix(out, env, quick, pinning, tools):
     (out / "skipped.json").write_text(json.dumps(skipped, indent=2) + "\n")
 
 
+def report(text):
+    """A message on stderr that cannot fail: with the terminal gone (SIGHUP) or a closed pipe, the runner still
+    finishes its cleanup and exits with its own status, and nothing is left to flush at exit."""
+    try:
+        print(text, file=sys.stderr, flush=True)
+    except OSError:
+        sys.stdout = sys.stderr = open(os.devnull, "w")
+
+
 def main():
     suite_start = time.monotonic()
+    if sys.version_info < (3, 11):
+        sys.exit("compare: needs Python 3.11 or later (tt-latency runs in a process group of its own in the "
+                 "runner's session)")
     reaper.install()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("outdir", type=Path)
@@ -430,16 +446,18 @@ def main():
         short_matrix(out, env, args.quick, pinning, tools)
         complete = True
     finally:
-        if not complete:
-            # Children are stopped by now. An unfinished matrix is never left where a finished one would be.
-            try:
-                target = reaper.mark_incomplete(out)
-            except OSError as error:
-                target = None
-                print(f"compare: could not mark {out} as incomplete: {error}", file=sys.stderr)
-            if target:
-                print(f"compare: incomplete; the results so far are in {target}", file=sys.stderr)
-        reaper.stop_guard()
+        try:
+            if not complete:
+                # Children are stopped by now. An unfinished matrix is never left where a finished one would be.
+                try:
+                    target = reaper.mark_incomplete(out)
+                except OSError as error:
+                    target = None
+                    report(f"compare: could not mark {out} as incomplete: {error}")
+                if target:
+                    report(f"compare: incomplete; the results so far are in {target}")
+        finally:
+            reaper.stop_guard()
     elapsed = time.monotonic() - suite_start
     with (out / "environment.txt").open("a") as f:
         f.write(f"suite_elapsed_seconds: {elapsed:.3f}\n")
@@ -450,13 +468,10 @@ def cli():
     try:
         main()
     except reaper.Terminated as stop:
-        try:
-            print(f"compare: {stop}", file=sys.stderr)
-        except OSError:
-            pass  # The terminal is gone (SIGHUP).
+        report(f"compare: {stop}")
         raise
     except (OSError, ValueError, RuntimeError, AssertionError, subprocess.SubprocessError) as error:
-        print(f"compare: {error}", file=sys.stderr)
+        report(f"compare: {error}")
         sys.exit(1)
 
 

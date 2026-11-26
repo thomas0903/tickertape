@@ -7,8 +7,8 @@ in `docs/benchmarks.md` with the benchmark playbook's provenance and both repeat
 
 ## Run
 
-Requires Rust/Cargo, Python 3.9+, Java **21**, and Maven. Initial dependency downloads
-need network access; the benchmark processes do not. Chronicle analytics is disabled.
+Requires Rust/Cargo, Python 3.11+ (for `tt-latency`'s process group, see "Signals, failures and leftover
+processes"), Java **21**, and Maven. Initial dependency downloads need network access; the benchmark processes do not. Chronicle analytics is disabled.
 On the owner's Apple Silicon Mac the wrappers select the Homebrew JDK below instead
 of `/usr/bin/java`. On other hosts set `JAVA_HOME` to a working JDK 21.
 
@@ -52,6 +52,9 @@ first within each payload, as a full run does). `skipped.json` lists only the se
 are built (and `tt-latency` only with tickertape), and a JDK is needed only if Chronicle or Aeron is selected. Every
 result line has `selected_tools` (all six in a full run) and `environment.txt` a `selected_tools:` line, so a partial
 run is never taken for a full one. `benches/rerun.py` runs each short unit as `run.py OUTDIR ... --tools TOOL`.
+Against the v1.0.0 rerun's short units (which built both Java projects and wrote the full `skipped.json`) the file set
+differs in two ways: a unit without a JVM has no `*-dependencies.txt`, and `skipped.json` lists only the unit's tool
+(`{}` for a tool with nothing skipped).
 
 `--quick` uses 2,000 records for W1/W3, and 100 warmup + 1,000 measured for W2.
 It covers the full matrix and is a functional smoke check, **not publication data**.
@@ -239,16 +242,24 @@ default matrix has 92 runs: 12 probes and, per repeat and payload, 12 SV and 8 S
 
 ## Signals, failures and leftover processes
 
-Every tool process (a JVM, a Rust adapter, or `tt-latency` with the writer and reader processes it starts; Aeron's
-media driver runs inside its writer's JVM) is the leader of a session and process group of its own, so a terminal's
-Ctrl-C or hang-up reaches only the runner. However a measurement ends — finished, a tool's failure, the runner's
-time limit (its records at the intended rate plus 120 s, plus the JVM warm-up allowance), SIGTERM, SIGINT, or SIGHUP
-when an ssh session drops — the runner ends each group that is still there: SIGTERM, up to 3 s, then SIGKILL to the
-whole group, and it reaps the leader, so no zombie and no late writer stays behind. A signal that arrives while a
-child is being started or while the children are being stopped takes effect right after that, and a second signal
-does not cut the cleanup short. The runner then exits with 128 + the signal (143 for SIGTERM). A signal that was
-ignored when the runner started (`nohup`) stays ignored. In both modes, nothing is added to a measured loop: the
-handling happens in the runner, outside the tools.
+What each process runs in is what it ran in at v1.0.0, with one addition. The adapters (the Chronicle Queue and Aeron
+JVMs, whose writer embeds Aeron's media driver, and the Rust adapters) each lead a session and process group of their
+own, as before, so a terminal's Ctrl-C or hang-up reaches only the runner. `tt-latency` (tickertape's W2), with the
+writer and reader processes it starts, stays in the runner's session, with its output read from a pipe in a blocking
+wait, as before; it now leads a process group of its own within that session, so that it can be ended as a group
+(Python 3.11's `process_group`). On Linux `environment.txt` records what decides the scheduling groups:
+`kernel.sched_autogroup_enabled` (autogroup gives each session a group), the runner's cgroup and its controllers.
+
+However a measurement ends — finished, a tool's failure, the runner's time limit (its records at the intended rate
+plus 120 s, plus the JVM warm-up allowance), SIGTERM, SIGINT, or SIGHUP when an ssh session drops — the runner ends
+each child's group that is still there: SIGTERM to the whole group, up to 3 s, then SIGKILL to the whole group, and it
+reaps the leader, so no zombie and no late writer stays behind. A signal that arrives while a child is being started
+or while the children are being stopped takes effect right after that. Further SIGTERM, SIGINT or SIGHUP are then
+ignored for the rest of the runner's life, so nothing cuts the cleanup short; to stop the runner at once, `kill -QUIT`
+or `kill -KILL` it, and the guard (below) still ends the children. The runner exits with 128 + the signal (143 for
+SIGTERM), also when its terminal or output pipe is gone. A signal that was ignored when the runner started (`nohup`)
+stays ignored. In both modes nothing is added to a measured loop: the handling happens in the runner, outside the
+tools.
 
 An unfinished short-mode run (interrupted or failed) is renamed `OUTDIR.incomplete-N`, the convention of
 `benches/rerun.py`, so it never sits where a finished run would; a finished run has `skipped.json`, written last. A
@@ -258,7 +269,11 @@ SIGKILL of the runner cannot be handled in the runner. For it the runner starts 
 (`reaper.py`, in a session of its own, on the runner's helper CPUs when pinned). It blocks on a pipe from the runner
 and wakes only when a child starts or ends (to record its group) and when the pipe closes. If the pipe closes
 without the runner having released it, the runner is gone: the guard ends every group it still had (SIGTERM, 3 s,
-SIGKILL) and renames a short-mode OUTDIR `.incomplete-N`. It adds no thread to any tool. Only SIGKILL of the runner
+SIGKILL) and renames a short-mode OUTDIR `.incomplete-N`. It renames only the directory it was started for (same
+device and inode), not a new one the driver made at the same path to run the unit again. On Linux it signals a group
+only while the PID is free or still belongs to the leader it recorded (start time in `/proc/<pid>/stat`); on macOS a
+leader reaped just before the runner was killed, whose number another process got within those seconds, would be
+signalled. It adds no thread to any tool. Only SIGKILL of the runner
 and of the guard together (a `kill -9` of both, or of a whole cgroup) leaves children running; then end their
 process groups by PID. `PR_SET_PDEATHSIG` was not used: it is Linux-only, needs code in the child before `exec`, and
 would not reach `tt-latency`'s children. Tools exiting when their stdin closes would need a reader thread in each

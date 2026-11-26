@@ -16,6 +16,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -29,9 +30,16 @@ def record(kind):
 
 
 def record_pid(pid, kind):
+    """<pid>: what the process is. For a stand-in also <pid>.ids: its session, process group and kind of stdout."""
     directory = os.environ.get("STANDIN_PIDS")
     if directory:
         path = Path(directory) / str(pid)
+        if pid == os.getpid():
+            mode = os.fstat(1).st_mode
+            ids = {"sid": os.getsid(0), "pgid": os.getpgid(0),
+                   "stdout": "pipe" if stat.S_ISFIFO(mode) else "file" if stat.S_ISREG(mode) else "other"}
+            path.with_suffix(".tmp").write_text(json.dumps(ids))
+            path.with_suffix(".tmp").rename(path.with_suffix(".ids"))
         path.with_suffix(".tmp").write_text(kind)
         path.with_suffix(".tmp").rename(path)
 
@@ -64,9 +72,16 @@ def hang(kind):
 
 
 def sleeper(kind):
-    record(f"grandchild of {kind}")
+    """A member of another stand-in's process group. It notes a SIGTERM (<pid>.term) before it exits, so a test can
+    tell that the whole group got one, not only its leader."""
     if os.environ.get("STANDIN_IGNORE_TERM") == "1":
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    else:
+        def terminated(signum, frame):
+            (Path(os.environ["STANDIN_PIDS"]) / f"{os.getpid()}.term").write_text("")
+            os._exit(0)
+        signal.signal(signal.SIGTERM, terminated)
+    record(f"grandchild of {kind}")
     time.sleep(SLEEP_S)
 
 

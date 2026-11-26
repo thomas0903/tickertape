@@ -3,6 +3,7 @@ SIGHUP, and SIGKILL (the guard). The children are stand-ins (standin.py): no bui
 
 The only time bound is BOUND_S, far above the runner's grace period (reaper.GRACE_S).
 """
+import json
 import os
 from pathlib import Path
 import signal
@@ -11,8 +12,10 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 import reaper
+import run
 
 HERE = Path(__file__).resolve().parent
 BOUND_S = 30
@@ -31,16 +34,30 @@ def alive(pid):
 class Harness:
     """compare/run.py's short mode with stand-in children, in a process group of its own."""
 
-    def __init__(self, case, tools, **env):
+    def __init__(self, case, tools, pinning=("--no-pin",), pipe=False, **env):
         self.tmp = Path(tempfile.mkdtemp(prefix="tt-signals-"))
         self.pids, self.out = self.tmp / "pids", self.tmp / "out"
         self.pids.mkdir()
         self.log = (self.tmp / "harness.log").open("w+")
         env = dict(os.environ, STANDIN_PIDS=str(self.pids), TMPDIR=str(self.tmp), **env)
+        # pipe: stdout and stderr go to a pipe the test can close (a terminal that went away).
         self.proc = subprocess.Popen([sys.executable, str(HERE / "standin.py"), "harness", str(self.out), "--quick",
-                                      "--no-pin", "--tools", tools], env=env, stdout=self.log,
-                                     stderr=subprocess.STDOUT, start_new_session=True)
+                                      *pinning, "--tools", tools], env=env,
+                                     stdout=subprocess.PIPE if pipe else self.log, stderr=subprocess.STDOUT,
+                                     start_new_session=True)
         case.addCleanup(self.cleanup)
+
+    def ids(self, kind):
+        """Session, process group and stdout of each stand-in of this kind."""
+        return [json.loads((self.pids / f"{pid}.ids").read_text())
+                for pid, k in self.recorded().items() if k == kind]
+
+    def pid_of(self, kind):
+        return next(pid for pid, k in self.recorded().items() if k == kind)
+
+    def got_sigterm(self):
+        """The group members (grandchildren) that noted a SIGTERM before they ended."""
+        return sorted(k for pid, k in self.recorded().items() if (self.pids / f"{pid}.term").exists())
 
     def output(self):
         self.log.flush()
@@ -81,12 +98,17 @@ class Harness:
             time.sleep(0.05)
 
     def cleanup(self):
-        # Only the processes this test started and recorded, never by name.
+        # Only the processes this test started and recorded, never by name, and only while the PID still runs one of
+        # them: a stand-in that ended long ago may have left its number to an unrelated process.
         if self.proc.poll() is None:
             os.killpg(self.proc.pid, signal.SIGKILL)
             self.proc.wait()
+        if self.proc.stdout:
+            self.proc.stdout.close()
         for pid in self.recorded():
-            if alive(pid):
+            command = subprocess.run(["ps", "-o", "command=", "-p", str(pid)], text=True,
+                                     stdout=subprocess.PIPE).stdout
+            if str(HERE / "standin.py") in command or str(HERE / "reaper.py") in command:
                 os.kill(pid, signal.SIGKILL)
         self.log.close()
         subprocess.run(["rm", "-rf", str(self.tmp)], check=False)
@@ -130,8 +152,32 @@ class EndingTests(unittest.TestCase):
         harness.wait_alive(1)
         self.assertEqual(harness.running(4), ["grandchild of tt-latency reader", "grandchild of tt-latency writer",
                                               "guard", "tt-latency"])
+        # As at v1.0.0, tt-latency and its processes are in the runner's session; they are a group of their own.
+        latency = harness.pid_of("tt-latency")
+        for kind in ("tt-latency", "grandchild of tt-latency writer", "grandchild of tt-latency reader"):
+            self.assertEqual([(i["sid"], i["pgid"]) for i in harness.ids(kind)], [(harness.proc.pid, latency)], kind)
         os.kill(harness.proc.pid, signal.SIGTERM)
         self.assertEqual(harness.wait(), 128 + signal.SIGTERM, harness.output())
+        self.assertEqual(harness.survivors(), {})
+        self.assertEqual(harness.got_sigterm(), ["grandchild of tt-latency reader", "grandchild of tt-latency writer"])
+        self.assert_marked_incomplete(harness)
+
+    def test_sigterm_reaches_every_process_of_a_child_s_group(self):
+        harness = Harness(self, "yaque", STANDIN_HANG="visible_latency", STANDIN_GRANDCHILD="1")
+        harness.wait_alive(2)
+        self.assertEqual(len(harness.running(5)), 5)
+        os.kill(harness.proc.pid, signal.SIGTERM)
+        self.assertEqual(harness.wait(), 128 + signal.SIGTERM, harness.output())
+        self.assertEqual(harness.survivors(), {})
+        self.assertEqual(harness.got_sigterm(), ["grandchild of yaque reader visible_latency",
+                                                 "grandchild of yaque writer visible_latency"])
+
+    def test_with_its_output_gone_the_runner_still_cleans_up_and_exits_with_the_signal(self):
+        harness = Harness(self, "yaque", pipe=True, STANDIN_HANG="visible_latency")
+        harness.wait_alive(2)
+        harness.proc.stdout.close()  # The terminal went away; every write fails from now on.
+        os.kill(harness.proc.pid, signal.SIGTERM)
+        self.assertEqual(harness.wait(), 128 + signal.SIGTERM)
         self.assertEqual(harness.survivors(), {})
         self.assert_marked_incomplete(harness)
 
@@ -156,7 +202,55 @@ class EndingTests(unittest.TestCase):
         os.kill(harness.proc.pid, signal.SIGKILL)
         self.assertEqual(harness.wait(), -signal.SIGKILL)
         self.assertEqual(harness.survivors(), {})  # The guard has ended too.
+        self.assertEqual(harness.got_sigterm(), ["grandchild of yaque reader visible_latency",
+                                                 "grandchild of yaque writer visible_latency"])
         self.assert_marked_incomplete(harness)
+
+    def test_the_guard_leaves_alone_a_directory_the_driver_started_again(self):
+        # The driver's retry: run.py is killed, the driver sets the unit's directory aside and makes a new one at
+        # once, while the old guard still waits for children that ignore SIGTERM.
+        harness = Harness(self, "yaque", STANDIN_HANG="visible_latency", STANDIN_IGNORE_TERM="1")
+        harness.wait_alive(2)
+        guard = harness.pid_of("guard")
+        os.kill(harness.proc.pid, signal.SIGKILL)
+        harness.wait()
+        harness.out.rename(harness.out.with_name("out.incomplete-1"))
+        harness.out.mkdir()
+        (harness.out / "environment.txt").write_text("the new run\n")
+        end = time.monotonic() + BOUND_S
+        while alive(guard):
+            self.assertLess(time.monotonic(), end)
+            time.sleep(0.05)
+        self.assertEqual((harness.out / "environment.txt").read_text(), "the new run\n")
+        self.assertFalse(harness.out.with_name("out.incomplete-2").exists())
+        self.assertEqual(harness.survivors(), {})
+
+    @unittest.skipUnless(hasattr(os, "sched_getaffinity") and len(os.sched_getaffinity(0)) >= 4
+                         and {0, 1, 2, 3} <= os.sched_getaffinity(0), "Linux with CPUs 0-3")
+    def test_in_a_pinned_run_the_guard_runs_on_the_helper_cpus(self):
+        harness = Harness(self, "yaque", ("--writer-cpu", "1", "--reader-cpu", "2", "--helper-cpus", "0,3"),
+                          STANDIN_HANG="append_cold")
+        harness.wait_alive(1)
+        self.assertEqual(os.sched_getaffinity(harness.pid_of("guard")), {0, 3})
+        self.assertEqual(os.sched_getaffinity(harness.proc.pid), {0, 3})
+        os.kill(harness.proc.pid, signal.SIGTERM)
+        self.assertEqual(harness.wait(), 128 + signal.SIGTERM, harness.output())
+        self.assertEqual(harness.survivors(), {})
+
+    def test_tt_latency_runs_in_the_runner_s_session_and_reports_through_a_pipe(self):
+        harness = Harness(self, "tickertape")
+        self.assertEqual(harness.wait(), 0, harness.output())
+        latency = [(pid, json.loads((harness.pids / f"{pid}.ids").read_text()))
+                   for pid, kind in harness.recorded().items() if kind == "tt-latency"]
+        self.assertEqual(len(latency), 16)  # Two readers, two rates, two payloads, two repeats.
+        for pid, ids in latency:
+            self.assertEqual(ids, {"sid": harness.proc.pid, "pgid": pid, "stdout": "pipe"})
+        # The adapters lead a session of their own, as they did at v1.0.0.
+        for pid, kind in harness.recorded().items():
+            if kind.startswith("tickertape "):
+                ids = json.loads((harness.pids / f"{pid}.ids").read_text())
+                self.assertEqual((ids["sid"], ids["pgid"], ids["stdout"]), (pid, pid, "file"), kind)
+        self.assertEqual(len((harness.out / "tickertape-W2.jsonl").read_text().splitlines()), 16)
 
     def test_a_finished_run_leaves_nothing_running_and_is_not_marked(self):
         harness = Harness(self, "yaque,plain-file")
@@ -243,6 +337,39 @@ class ReaperTests(unittest.TestCase):
         self.assertEqual(signal.getsignal(signal.SIGHUP), signal.SIG_IGN)
         self.assertIsNot(signal.getsignal(signal.SIGTERM), signal.SIG_DFL)
 
+    @unittest.skipUnless(Path("/proc/self/stat").exists(), "Linux: start times from /proc")
+    def test_the_guard_does_not_signal_a_group_whose_number_another_process_got(self):
+        self.assertTrue(reaper.same_leader(os.getpid(), reaper.start_time(os.getpid())))
+        self.assertFalse(reaper.same_leader(os.getpid(), reaper.start_time(os.getpid()) + 1))
+        stranger = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)"], start_new_session=True)
+        try:
+            guard = reaper.Guard(grace=1)
+            guard._send(f"add {stranger.pid} {reaper.start_time(stranger.pid) - 1}")  # The leader it recorded.
+            guard.pipe.close()  # The runner dies without a release.
+            guard.proc.wait(timeout=BOUND_S)
+            self.assertIsNone(stranger.poll())
+            guard = reaper.Guard(grace=1)
+            guard.add(stranger.pid)  # The same number with the right start time is signalled.
+            guard.pipe.close()
+            guard.proc.wait(timeout=BOUND_S)
+            self.assertEqual(stranger.wait(timeout=BOUND_S), -signal.SIGTERM)
+        finally:
+            if stranger.poll() is None:
+                stranger.kill()
+                stranger.wait()
+
+    def test_the_guard_marks_only_the_directory_it_was_given(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "unit"
+            out.mkdir()
+            (out / "environment.txt").write_text("")
+            old = reaper.identity(out)
+            out.rename(Path(tmp) / "unit.incomplete-1")
+            out.mkdir()
+            (out / "environment.txt").write_text("")
+            self.assertIsNone(reaper.mark_incomplete(out, old))
+            self.assertEqual(reaper.mark_incomplete(out, reaper.identity(out)), Path(tmp) / "unit.incomplete-2")
+
     def test_incomplete_directories_are_numbered_like_the_rerun_driver_s(self):
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp) / "unit"
@@ -253,6 +380,16 @@ class ReaperTests(unittest.TestCase):
                 out.mkdir(exist_ok=True)
                 (out / "environment.txt").write_text("")
                 self.assertEqual(reaper.mark_incomplete(out), Path(tmp) / f"unit.incomplete-{n}")
+
+
+class RunnerTests(unittest.TestCase):
+    def test_python_older_than_3_11_is_refused_before_anything_runs(self):
+        with mock.patch.object(run.sys, "version_info", (3, 10, 14)), \
+                mock.patch.object(run.sys, "argv", ["run.py", "/nonexistent/out"]), \
+                mock.patch.object(run.reaper, "install") as install:
+            with self.assertRaisesRegex(SystemExit, "Python 3.11"):
+                run.main()
+        install.assert_not_called()
 
 
 if __name__ == "__main__":

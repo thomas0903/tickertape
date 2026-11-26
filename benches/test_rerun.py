@@ -146,6 +146,12 @@ class UnitTests(unittest.TestCase):
                 if proc.poll() is None:
                     proc.kill()
                     proc.wait()
+                # A unit left running (this test failed) would hold the test runner's stderr for 300 s.
+                if pidfile.exists() and pidfile.read_text():
+                    try:
+                        os.kill(int(pidfile.read_text()), signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
 
 
 class ShortToolsTests(unittest.TestCase):
