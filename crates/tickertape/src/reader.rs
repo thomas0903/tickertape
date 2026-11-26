@@ -2061,8 +2061,10 @@ impl Strays {
             self.names.clear();
             return None;
         }
-        let listed: HashSet<(u64, u64)> = later.iter().copied().collect();
-        self.names.retain(|name| listed.contains(name));
+        if !self.names.is_empty() {
+            let listed: HashSet<(u64, u64)> = later.iter().copied().collect();
+            self.names.retain(|name| listed.contains(name));
+        }
         let known: HashSet<(u64, u64)> = self.names.iter().copied().collect();
         let remembered = self.names.len();
         for &name in later.iter().filter(|name| !known.contains(name)) {
