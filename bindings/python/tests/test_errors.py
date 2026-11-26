@@ -163,7 +163,9 @@ def test_emptied_commit_word_raises_instead_of_returning_none(journal: Path) -> 
     for durable_only in (False, True):
         with tt.Reader(journal, durable_only=durable_only) as r:
             for seq in range(10):
-                assert r.try_next().seq == seq
+                record = r.try_next()
+                assert record is not None
+                assert record.seq == seq
             for read in (r.try_next, lambda: r.next(timeout=0.2), lambda: r.read_batch(10)):
                 with pytest.raises(tt.CorruptJournalError) as raised:
                     read()
