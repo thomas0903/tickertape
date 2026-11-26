@@ -134,7 +134,8 @@ Machine-readable and covered, as specified in [`cli.md`](cli.md#machine-readable
 
 From 1.0, JSON outputs may gain fields (consumers must ignore fields they do not know, and read objects by name,
 except record JSONL, whose key order is fixed) and enumerated string values where `cli.md` says a set may grow (such
-as `inspect`'s `end_state` `"unknown"`); no field is removed or changes meaning in 1.x. Every `--json` output
+as `inspect`'s `end_state` `"unknown"`, and from 1.1 `status`'s `checkpoint.problem` values and breach codes, which a
+consumer must treat as a problem when it does not know them); no field is removed or changes meaning in 1.x. Every `--json` output
 (`verify`, `inspect`, `stats`, `archive`, `index`, `status`, `age`) starts with `"schema_version":1` and keeps it throughout
 1.x. Prometheus metrics may be added, not renamed or removed. A new exit status may appear only with a new command or
 option.

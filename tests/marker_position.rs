@@ -6,13 +6,19 @@
 //! damaged, or `next_seq` disagrees with that record, the writer refuses to open under every policy and changes
 //! nothing. Every state that a working writer and a crash leave must still open; the sweeps at the end check that for
 //! every position a writer can give a marker and for every cut or torn slot after the marker.
+//!
+//! `status` predicts the refusal (`CheckpointProblem::Dangling`) and retention removes nothing from such a journal,
+//! failing with the writer's error (the ADR 0056 amendment of 2026-11-26, issue #93): every refused journal here is also
+//! sampled and planned before the open, and every journal that opens is sampled too, so that the two agree both ways.
 
 use std::fs;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 
-use tickertape::fault;
+use tickertape::fault::{self, Point};
 use tickertape::format::{self, CheckpointSlot};
+use tickertape::retention::{self, Action, Policy};
+use tickertape::status::{Breach, CheckpointProblem, Thresholds};
 use tickertape::{CorruptReason, Error, NewRecord, RecoveryAction, RecoveryPolicy, Writer};
 use tickertape_tests::{
     SMALL_SEGMENT, append_n, check_record, locate_record, open_raw, read_all, segments,
@@ -99,10 +105,62 @@ fn tear_current_slot(dir: &Path) {
     file.write_all_at(&[byte[0] ^ 1], at).unwrap();
 }
 
+/// What a `status` sample of `dir` says of its marker: the problem, if any, or the sample's error. A problem is always a
+/// corruption breach (exit code 2 in the CLI), and the breach is reported only with a problem.
+fn status_problem(dir: &Path) -> tickertape::Result<Option<CheckpointProblem>> {
+    let sample = tickertape::status::status(dir)?;
+    let problem = sample.checkpoint.and_then(|c| c.problem);
+    let breaches = sample.breaches(&Thresholds::default());
+    assert_eq!(
+        problem.is_some(),
+        breaches.contains(&Breach::CheckpointInvalid),
+        "{problem:?}, {breaches:?}"
+    );
+    Ok(problem)
+}
+
+/// The policy of the retention runs here: remove every segment before the marker's.
+fn remove_all() -> Policy {
+    Policy::default().max_segments(1)
+}
+
+/// Whether `result` is the ADR 0056 refusal: `DanglingCheckpoint(base)` at `segment` and `offset`.
+fn is_refusal<T>(result: &tickertape::Result<T>, segment: &Path, offset: u64, base: u64) -> bool {
+    result
+        .as_ref()
+        .err()
+        .is_some_and(|e| is_refusal_error(e, segment, offset, base))
+}
+
+fn is_refusal_error(error: &Error, segment: &Path, offset: u64, base: u64) -> bool {
+    matches!(error, Error::Corrupt {
+        path,
+        offset: at,
+        reason: CorruptReason::DanglingCheckpoint(b),
+        ..
+    } if path == segment && *at == offset && *b == base)
+}
+
 /// Opens `dir` under each policy, expects the ADR 0056 refusal at `segment` and `offset`, and checks that the open
-/// changed neither a segment nor the marker.
+/// changed neither a segment nor the marker. Before that, `status` must report the marker as `dangling`, and a
+/// retention plan must fail with the same error as the writer (and change nothing).
 fn assert_refused(dir: &Path, segment: &Path, offset: u64, base: u64) {
     let before = journal_files(dir);
+    assert_eq!(
+        status_problem(dir).unwrap(),
+        Some(CheckpointProblem::Dangling),
+        "status does not predict the refusal"
+    );
+    let planned = retention::plan(dir, &remove_all());
+    assert!(
+        is_refusal(&planned, segment, offset, base),
+        "retention: {planned:?}"
+    );
+    assert_eq!(
+        journal_files(dir),
+        before,
+        "status or retention changed the journal"
+    );
     for policy in POLICIES {
         match Writer::open(dir, small_config().recovery(policy)) {
             Err(Error::Corrupt {
@@ -128,10 +186,35 @@ fn assert_refused(dir: &Path, segment: &Path, offset: u64, base: u64) {
     }
 }
 
-/// Opens `dir` under `policy` and returns the writer, or panics with the error.
+/// Opens `dir` under `policy` and returns the writer, or panics with the error. A `status` sample taken before must not
+/// report a problem with the marker (it may fail for another reason, such as a newest segment whose header never reached
+/// the disk, which the open restores).
 fn opens(dir: &Path, policy: RecoveryPolicy) -> Writer {
-    Writer::open(dir, small_config().recovery(policy))
-        .unwrap_or_else(|e| panic!("{policy:?}: the open was refused: {e}"))
+    let predicted = status_problem(dir);
+    let w = Writer::open(dir, small_config().recovery(policy))
+        .unwrap_or_else(|e| panic!("{policy:?}: the open was refused: {e}"));
+    assert_accepted_by_status(predicted, &format!("{policy:?}"));
+    w
+}
+
+/// A sample of a journal the writer opens: no problem with its marker.
+fn assert_accepted_by_status(predicted: tickertape::Result<Option<CheckpointProblem>>, what: &str) {
+    match predicted {
+        Ok(problem) => assert_eq!(
+            problem, None,
+            "{what}: status reports a marker the writer accepts"
+        ),
+        Err(e) => assert!(
+            !matches!(
+                e,
+                Error::Corrupt {
+                    reason: CorruptReason::DanglingCheckpoint(_),
+                    ..
+                }
+            ),
+            "{what}: {e}"
+        ),
+    }
 }
 
 fn assert_records(dir: &Path, n: u64) {
@@ -371,6 +454,219 @@ fn both_slots() {
         let w = opens(other.path(), policy);
         assert_eq!(w.recovery_report().scanned_from_seq, 120);
         assert_eq!(w.next_seq(), 150);
+    }
+}
+
+/// Zeroes the commit word of the record right before the marker's offset in `dir`: damage to the last covered record.
+fn damage_last_covered(dir: &Path) {
+    let c = marker(dir);
+    let (path, at) = locate_record(dir, c.next_seq - 1);
+    open_raw(&path).write_all_at(&[0; 4], at).unwrap();
+}
+
+/// Retention and `tickertape archive` remove nothing from a journal whose marker the writer refuses (ADR 0056
+/// amendment, issue #93), because the remedies (restore the matching marker, or the segment) need the segments it would
+/// remove: planning fails with the writer's error; a plan made before the damage and applied after it (deleting, or
+/// moving to another directory) fails with that error before its first removal; and a writer's own run, after a
+/// checkpoint whose last covered record is damaged before retention reads it, removes nothing and keeps the error.
+#[test]
+fn retention_removes_nothing_from_a_journal_the_writer_refuses() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut w = Writer::open(dir.path(), small_config()).unwrap();
+    append_n(&mut w, 1200);
+    w.checkpoint().unwrap();
+    append_n(&mut w, 20);
+    drop(w);
+    let c = marker(dir.path());
+    let older = segments(dir.path())
+        .iter()
+        .filter(|(b, _)| *b < c.segment_base_seq)
+        .count();
+    assert!(older >= 2, "{older} segments before the marker's");
+    let refusal = |copy: &Path| {
+        let segment = copy.join(format::segment_file_name(c.segment_base_seq));
+        (segment, c.offset, c.segment_base_seq)
+    };
+
+    // Planning, as `archive --dry-run` does.
+    let copy = copy_journal(dir.path());
+    damage_last_covered(copy.path());
+    let (segment, offset, base) = refusal(copy.path());
+    let before = journal_files(copy.path());
+    let planned = retention::plan(copy.path(), &remove_all());
+    assert!(is_refusal(&planned, &segment, offset, base), "{planned:?}");
+    let opened = Writer::open(copy.path(), small_config());
+    assert!(
+        is_refusal(&opened, &segment, offset, base),
+        "the writer: {:?}",
+        opened.err()
+    );
+    assert_eq!(journal_files(copy.path()), before);
+
+    // A plan made before the damage, applied after it.
+    let dest = tempfile::tempdir().unwrap();
+    for action in [Action::Delete, Action::MoveTo(dest.path().to_path_buf())] {
+        let copy = copy_journal(dir.path());
+        let plan = retention::plan(copy.path(), &remove_all()).unwrap();
+        assert_eq!(plan.segments().len(), older);
+        damage_last_covered(copy.path());
+        let before = journal_files(copy.path());
+        let applied = retention::apply(copy.path(), &plan, &action);
+        let (segment, offset, base) = refusal(copy.path());
+        assert!(
+            is_refusal(&applied, &segment, offset, base),
+            "{action:?}: {applied:?}"
+        );
+        assert_eq!(journal_files(copy.path()), before, "{action:?}");
+        assert_eq!(fs::read_dir(dest.path()).unwrap().count(), 0);
+    }
+
+    // The writer's own run. The policy keeps every segment at open; after one more segment, the checkpoint asks to
+    // remove the oldest, and the record before its new marker is damaged as retention reads the marker.
+    let copy = copy_journal(dir.path());
+    let keep = segments(copy.path()).len();
+    let config = small_config().retention(Policy::default().max_segments(keep), Action::Delete);
+    let mut w = Writer::open(copy.path(), config).unwrap();
+    let first = segments(copy.path())[0].0;
+    while segments(copy.path()).len() == keep {
+        append_n(&mut w, 10);
+    }
+    let path = copy.path().to_path_buf();
+    fault::clear();
+    fault::run_at(Point::MarkerRead, 0, move || damage_last_covered(&path));
+    w.checkpoint().unwrap();
+    fault::clear();
+    let now = marker(copy.path());
+    assert_eq!(
+        segments(copy.path())[0].0,
+        first,
+        "retention removed a segment"
+    );
+    assert_eq!(w.retention_report().removed_segments, 0);
+    let segment = copy
+        .path()
+        .join(format::segment_file_name(now.segment_base_seq));
+    let kept = w.last_retention_error();
+    assert!(
+        kept.is_some_and(|e| is_refusal_error(e, &segment, now.offset, now.segment_base_seq)),
+        "{kept:?}"
+    );
+}
+
+/// A writer's own retention run checks the record before a marker that moved between its plan and its removals: a slot
+/// forged while the plan reads the marker (after it has read its slot) names a position the records do not reach, so
+/// the removal check reads that newer slot, removes nothing and keeps the writer's error.
+#[test]
+fn a_writers_retention_run_checks_a_marker_that_moved_after_its_plan() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut w = Writer::open(dir.path(), small_config()).unwrap();
+    append_n(&mut w, 1200);
+    w.checkpoint().unwrap();
+    drop(w);
+    let keep = segments(dir.path()).len();
+    let config = small_config().retention(Policy::default().max_segments(keep), Action::Delete);
+    let mut w = Writer::open(dir.path(), config).unwrap();
+    let first = segments(dir.path())[0].0;
+    while segments(dir.path()).len() == keep {
+        append_n(&mut w, 10);
+    }
+    let path = dir.path().to_path_buf();
+    fault::clear();
+    // Skip 0: the plan's read of the marker. A later one lands after the removal check has read the slot.
+    fault::run_at(Point::MarkerRead, 0, move || {
+        let c = marker(&path);
+        forge(&path, c.segment_base_seq, c.offset, c.next_seq + 1);
+    });
+    w.checkpoint().unwrap();
+    fault::clear();
+    assert_eq!(
+        segments(dir.path())[0].0,
+        first,
+        "retention removed a segment"
+    );
+    assert_eq!(w.retention_report().removed_segments, 0);
+    let now = marker(dir.path());
+    let segment = dir
+        .path()
+        .join(format::segment_file_name(now.segment_base_seq));
+    let kept = w.last_retention_error();
+    assert!(
+        kept.is_some_and(|e| is_refusal_error(e, &segment, now.offset, now.segment_base_seq)),
+        "{kept:?}"
+    );
+}
+
+/// Not detected, by decision (ADR 0056, amendment; the fourth item of issue #93): a marker at offset 64 of its segment
+/// whose previous segment lacks records it covers (here cut short: unsealed, its last records gone). Recovery does not
+/// read the previous segment, so the writer opens, under both policies, and appends in the marker's segment; `status`
+/// reports no problem. What does report it, and keeps the evidence: `verify`, a reader from the oldest record (it stops
+/// at the cut), and retention, which stops at the previous segment's seal and removes nothing. Unlike the refused
+/// cases, the new records are not behind the gap: a reader that seeks to the marker's segment reads them.
+#[test]
+fn a_marker_at_offset_64_after_a_predecessor_that_lacks_records_opens() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut w = Writer::open(dir.path(), small_config()).unwrap();
+    append_n(&mut w, 1200);
+    drop(w);
+    let segs = segments(dir.path());
+    assert!(segs.len() >= 4);
+    let ((_, previous), (base, _)) = (segs[1].clone(), segs[2].clone());
+    let end = 1200;
+    forge(dir.path(), base, 64, base);
+    // The previous segment cut 10 records before its end: those records and its seal zeroed.
+    let (_, cut) = locate_record(dir.path(), base - 10);
+    open_raw(&previous)
+        .write_all_at(&vec![0; (SMALL_SEGMENT - cut) as usize], cut)
+        .unwrap();
+
+    assert_eq!(status_problem(dir.path()).unwrap(), None);
+    let before = journal_files(dir.path());
+    match retention::plan(dir.path(), &remove_all()) {
+        Err(Error::Corrupt { path, .. }) => assert_eq!(path, previous),
+        other => panic!("retention: {other:?}"),
+    }
+    assert_eq!(journal_files(dir.path()), before);
+    let report = tickertape::inspect::verify(dir.path()).unwrap();
+    assert!(
+        report
+            .problems
+            .iter()
+            .any(|p| p.path == previous && p.offset == cut),
+        "{:?}",
+        report.problems
+    );
+
+    for policy in POLICIES {
+        let copy = copy_journal(dir.path());
+        let mut w = opens(copy.path(), policy);
+        assert_eq!(w.next_seq(), end);
+        assert_eq!(w.recovery_report().scanned_from_seq, base);
+        append_n(&mut w, 5);
+        w.checkpoint().unwrap();
+        drop(w);
+        let mut reader =
+            tickertape::Reader::open(copy.path(), tickertape::ReaderConfig::default()).unwrap();
+        reader.seek(base).unwrap();
+        let mut seq = base;
+        while let Some(r) = reader.next_owned().unwrap() {
+            assert_eq!(r.seq, seq);
+            seq += 1;
+        }
+        assert_eq!(seq, end + 5, "{policy:?}");
+        let mut oldest =
+            tickertape::Reader::open(copy.path(), tickertape::ReaderConfig::default()).unwrap();
+        let stopped = loop {
+            match oldest.next_owned() {
+                Ok(Some(r)) => assert!(r.seq < base - 10),
+                Ok(None) => panic!("{policy:?}: a reader from the oldest record waits at the cut"),
+                Err(e) => break e,
+            }
+        };
+        assert!(
+            matches!(stopped, Error::Corrupt { ref path, offset, .. }
+                if path.file_name() == previous.file_name() && offset == cut),
+            "{policy:?}: {stopped}"
+        );
     }
 }
 
@@ -676,6 +972,15 @@ fn marker_positions(stride: usize) {
         }
         let copy = copy_journal(dir.path());
         forge(copy.path(), base, offset, next_seq);
+        // Retention plans as before (the oldest segments up to the marker's), without refusing the marker.
+        let plan = retention::plan(copy.path(), &remove_all()).unwrap();
+        assert_eq!(
+            plan.segments().len(),
+            segments(copy.path())
+                .iter()
+                .filter(|(b, _)| *b < base)
+                .count()
+        );
         for policy in POLICIES {
             let w = opens(copy.path(), policy);
             assert_eq!(
@@ -765,6 +1070,19 @@ fn crash_states(stride: usize) {
                 states += 1;
                 let what =
                     format!("{state} at {base}/{offset} (seq {seq}), newer slot torn: {torn}");
+                // Neither `status` nor retention refuses the marker (a sample may report the damage at the head).
+                assert_accepted_by_status(status_problem(copy.path()), &what);
+                let planned = retention::plan(copy.path(), &remove_all());
+                assert!(
+                    !matches!(
+                        planned,
+                        Err(Error::Corrupt {
+                            reason: CorruptReason::DanglingCheckpoint(_),
+                            ..
+                        })
+                    ),
+                    "{what}: retention {planned:?}"
+                );
                 for policy in POLICIES {
                     let run = copy_journal(copy.path());
                     match Writer::open(run.path(), small_config().recovery(policy)) {

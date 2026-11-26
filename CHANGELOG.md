@@ -5,6 +5,13 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
+- Docs: what the Linux prefault window adds to a checkpoint is measured (issue #62): `docs/benchmarks.md` → "2026-11-26,
+  what prefaulted, unwritten pages add to a checkpoint" (x86-64 and aarch64, ext4 and xfs). `MADV_POPULATE_WRITE` leaves
+  the 256 KiB window dirty, so every checkpoint that covers appends writes it as zeros in the active segment's whole-file
+  `fdatasync` (0.16–0.43 ms) and write-protects it again (about 35 more page faults for the writer per checkpoint); an
+  idle writer pays once. The roadmap, ADR 0025 (a dated note), `docs/operations.md` and `WriterConfig::prefault` say so,
+  and a note corrects the 2026-11-25 "ranged checkpoint sync" experiment, which still wrote the window back. macOS is
+  not measured. No behaviour change (one rustdoc paragraph).
 - Changed: a safe reader (`Reader::open`) that does not block and keeps showing that it waits for every record reads
   4 KiB per fill of its buffer instead of 64 KiB, so following a live journal by spinning no longer copies 64 KiB per
   record (ADR 0052, issue #62). It shrinks after 16 fills in a row that each waited for one record, reads a whole chunk
@@ -41,6 +48,20 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   covered record is not looked at, as before. No journal that a working writer and a crash leave on storage that honours
   its syncs is refused. What to do after a refusal: `docs/operations.md` → After a crash. The check reads only the record
   before the marker: on a healthy journal it adds work proportional to that record's length.
+- Fixed: `tickertape status` (`status::status`, `Sampler`) predicts that refusal, and retention removes nothing from
+  such a journal (ADR 0056, amendment; issue #93). The sample runs the writer's own check on the record before the
+  marker's offset and reports the new `checkpoint.problem` value `dangling` (`CheckpointProblem::Dangling`,
+  C ABI `TICKERTAPE_CHECKPOINT_DANGLING` = 4, C++ `dangling`, Java `DANGLING`, Python
+  `"dangling"`): exit 2, `checkpoint_invalid`, `tickertape_healthy` 0, as for the other values. 1.0 reported most
+  of these journals as healthy. Those that 1.0 already reported as corrupt, through `head_invalid` with `problem` null
+  (a marker in the newest segment whose `next_seq` or offset disagrees with the records there), keep exit code 2 and now
+  also report `checkpoint_invalid` and `problem` `dangling` (`tickertape_checkpoint_invalid` 0 → 1). A retention run (the writer's own, `retention::plan` and `apply`, `tickertape archive`,
+  `--dry-run` included) fails with the writer's error, `DanglingCheckpoint` at the segment and the marker's offset, and
+  removes nothing, so the segments that restoring the matching marker needs stay; 1.0 removed the segments before the
+  marker's. Each costs one more read, of that record (normally one 4 KiB `pread`; for retention once per run).
+  **Behaviour change:** from 1.1 the sets of `status` `checkpoint.problem` values and of breach codes may grow in a minor
+  release (`docs/cli.md`): treat a code you do not know as a problem. Not detected, by decision: a marker at offset 64
+  whose previous segment lacks records (the ADR's amendment says why; `verify` and readers report it).
 - Fixed (macOS): a repair by replacement makes its copy of the segment durable on the drive (`F_FULLFSYNC`) before it
   renames the copy over the segment, and so does a segment recovery creates (a new journal's first segment, a
   successor after a lost roll) before its link. A power loss right after the rename could keep the new name without
