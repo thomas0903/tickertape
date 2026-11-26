@@ -599,10 +599,34 @@ impl Reader {
         notify: &crate::mmap::Notify,
         deadline: Option<Instant>,
     ) -> (Result<bool>, bool) {
-        let seen = notify.begin_wait();
+        // At the checkpoint boundary only a checkpoint helps a durable-only reader (ADR 0053). It waits on the marker
+        // words if the writer bumps them; with a writer that does not (1.0.0), it looks once more and sleeps instead of
+        // registering, so that this writer's appends make no wake-up call for it.
+        let on = match (self.waits_for_marker(), notify.writer_bumps_marker()) {
+            (true, true) => crate::mmap::WaitOn::Marker,
+            (true, false) => {
+                let found = self.advance();
+                if matches!(found, Ok(false)) {
+                    let nap = deadline.map_or(self.config.backoff.max_sleep, |d| {
+                        self.config
+                            .backoff
+                            .max_sleep
+                            .min(d.saturating_duration_since(Instant::now()))
+                    });
+                    if !nap.is_zero() {
+                        std::thread::sleep(nap);
+                    }
+                }
+                return (found, true);
+            }
+            (false, _) => crate::mmap::WaitOn::Record,
+        };
+        let seen = notify.begin_wait(on);
         let found = self.advance();
-        if !matches!(found, Ok(false)) {
-            notify.end_wait();
+        if !matches!(found, Ok(false))
+            || (on == crate::mmap::WaitOn::Marker && !self.waits_for_marker())
+        {
+            notify.end_wait(on);
             return (found, true);
         }
         let cap = if notify.writer_notifies() {
@@ -614,12 +638,18 @@ impl Reader {
             cap.min(d.saturating_duration_since(Instant::now()))
         });
         let mut supported = true;
-        if !wait.is_zero() && notify.wait(seen, wait) == crate::mmap::WaitOutcome::Unsupported {
+        if !wait.is_zero() && notify.wait(on, seen, wait) == crate::mmap::WaitOutcome::Unsupported {
             supported = false;
             std::thread::sleep(wait.min(self.config.backoff.max_sleep));
         }
-        notify.end_wait();
+        notify.end_wait(on);
         (Ok(false), supported)
+    }
+
+    /// Whether the cursor is at the checkpoint boundary a durable-only reader knows: then only a checkpoint can give it a
+    /// record (ADR 0053).
+    fn waits_for_marker(&self) -> bool {
+        self.config.durable_only && self.next_seq >= self.durable_next_seq
     }
 
     /// Like [`Reader::try_next`], but copies the record out of the reader.
@@ -2094,7 +2124,7 @@ mod bound_tests;
 #[cfg(test)]
 mod wake_tests {
     use super::*;
-    use crate::mmap::test_hooks::{FORCE_UNSUPPORTED, LOCK, WAITS};
+    use crate::mmap::test_hooks::{BEGINS, FORCE_UNSUPPORTED, LOCK, NO_CAPABILITIES, WAITS};
     use crate::{Writer, WriterConfig};
 
     fn blocking(sleep: Duration) -> Backoff {
@@ -2112,6 +2142,95 @@ mod wake_tests {
         fn drop(&mut self) {
             FORCE_UNSUPPORTED.store(false, Ordering::SeqCst);
         }
+    }
+
+    /// Resets `NO_CAPABILITIES` even if the test panics.
+    struct Capable;
+    impl Drop for Capable {
+        fn drop(&mut self) {
+            NO_CAPABILITIES.store(false, Ordering::SeqCst);
+        }
+    }
+
+    /// A writer that appends 30 records 10 ms apart, none of them checkpointed, then checkpoints, while a durable-only
+    /// reader that has read everything checkpointed before blocks. Returns the reader's registrations as a waiter on
+    /// the record words and on the marker words, and how long after the checkpoint it got the next record.
+    fn durable_reader_under_appends(sleep: Duration) -> (u64, u64, Duration) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w =
+            Writer::open(dir.path(), WriterConfig::default().segment_size(1 << 20)).unwrap();
+        let record = |w: &mut Writer| {
+            w.append(&crate::NewRecord {
+                schema_id: 1,
+                venue_ts_ns: 0,
+                local_ts_ns: 0,
+                payload: b"x",
+            })
+            .unwrap()
+        };
+        for _ in 0..5 {
+            record(&mut w);
+        }
+        w.checkpoint().unwrap();
+        let mut r = Reader::open(
+            dir.path(),
+            ReaderConfig::default()
+                .durable_only(true)
+                .backoff(blocking(sleep)),
+        )
+        .unwrap();
+        for seq in 0..5 {
+            assert_eq!(r.try_next().unwrap().unwrap().seq, seq);
+        }
+        let before = [0, 1].map(|i| BEGINS[i].load(Ordering::SeqCst));
+        let writer = std::thread::spawn(move || {
+            for _ in 0..30 {
+                record(&mut w);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            w.checkpoint().unwrap();
+            (w, Instant::now())
+        });
+        let got = r.next_timeout(Some(Duration::from_secs(10))).unwrap();
+        let received = Instant::now();
+        assert_eq!(got.map(|record| record.seq), Some(5));
+        let (_w, checkpointed) = writer.join().unwrap();
+        let begins = [0, 1].map(|i| BEGINS[i].load(Ordering::SeqCst) - before[i]);
+        (
+            begins[0],
+            begins[1],
+            received.saturating_duration_since(checkpointed),
+        )
+    }
+
+    /// ADR 0053: at the checkpoint boundary a durable-only reader waits on the marker words, so the appends never find
+    /// it registered on theirs, and the checkpoint wakes it.
+    #[test]
+    fn a_durable_only_reader_at_the_boundary_waits_on_the_marker_words() {
+        let _serial = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (record, marker, after) = durable_reader_under_appends(Duration::from_secs(10));
+        assert_eq!(record, 0, "registered on the record words");
+        assert!(marker >= 1, "never registered on the marker words");
+        // A lost wake-up costs the 100 ms cap; the poll interval is 10 s.
+        assert!(
+            after < Duration::from_millis(90),
+            "woken {after:?} after the checkpoint"
+        );
+    }
+
+    /// ADR 0053: with a writer that does not bump the marker words (capabilities 0, as 1.0.0), a durable-only reader at
+    /// the boundary sleeps `max_sleep` at a time without registering, so that writer makes no wake-up call for it.
+    #[test]
+    fn a_durable_only_reader_sleeps_unregistered_beside_a_writer_without_marker_words() {
+        let _serial = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _capable = Capable;
+        NO_CAPABILITIES.store(true, Ordering::SeqCst);
+        let (record, marker, after) = durable_reader_under_appends(Duration::from_millis(5));
+        assert_eq!((record, marker), (0, 0), "registered as a waiter");
+        assert!(
+            after < Duration::from_millis(90),
+            "{after:?} after the checkpoint"
+        );
     }
 
     #[test]

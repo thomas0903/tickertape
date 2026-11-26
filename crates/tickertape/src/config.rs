@@ -57,7 +57,9 @@ pub struct WriterConfig {
     /// [`Writer::append_batch`](crate::Writer::append_batch), once the batch's last record is, plus at each roll inside
     /// the batch (ADR 0041).
     /// Costs one atomic increment and one load per append (per batch for `append_batch`), plus a wake-up system call
-    /// when readers are blocked.
+    /// when readers are blocked. A durable-only reader blocked at the checkpoint boundary costs a wake-up call per
+    /// checkpoint instead: checkpoints bump separate words for it (ADR 0053, from 1.1; a 1.0.0 durable-only reader still
+    /// costs one per append).
     /// Default: true.
     pub notify: bool,
     /// Do segment work in a background thread, off the writer's thread. That thread never writes records.
@@ -265,12 +267,20 @@ pub struct ReaderConfig {
     ///
     /// Without a valid marker, no records are returned. See ADR 0010 (`docs/decisions/0010-durable-only-reads.md` in the
     /// repository) and crash contract C13 (`docs/crash-contract.md`) for the durability guarantee and storage assumptions.
+    ///
+    /// A durable-only reader that blocks on the wake-up region at the checkpoint boundary waits for checkpoints only: a
+    /// writer from 1.1 on bumps separate words for it, so appends make no wake-up call for it (ADR 0053). Beside a
+    /// writer without those words (1.0.0) it does not register at all and polls the marker every
+    /// [`Backoff::max_sleep`] (1 ms by default) instead. Its records arrive after the checkpoint, plus up to about 2 ms
+    /// on the last record of a large backlog when the writer's helper threads share its CPU: keep them elsewhere with
+    /// [`WriterConfig::helper_cpus`](crate::WriterConfig::helper_cpus) (`docs/operations.md` → Pinned writers).
     pub durable_only: bool,
     /// After the spin and yield phases of [`Backoff`], block on the writer's shared-memory wake-up region instead of
     /// sleeping, so a new record wakes the reader immediately (ADRs 0017 and 0021). The region is found through the
     /// journal's `notify` record, which the reader only reads. It can't shrink, so this never exposes a safe reader to
     /// `SIGBUS`. Readers fall back to sleeping when there is no running writer, on macOS before 14.4, when the writer
-    /// runs as another user (or, on Linux, in another pid namespace), or if the platform's wait call fails.
+    /// runs as another user (or, on Linux, in another pid namespace), or if the platform's wait call fails. A
+    /// durable-only reader at the checkpoint boundary waits for checkpoints only; see [`ReaderConfig::durable_only`].
     /// Default: true.
     pub notify: bool,
     /// Let [`Reader::seek`](crate::Reader::seek) start at a record named by a seek index, if there is one. Default:

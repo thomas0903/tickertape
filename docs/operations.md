@@ -151,7 +151,13 @@ writer process crashing, but not a power loss (crash contract C1, C7, C8).
 - **Exposure.** After a power loss, everything since the last successful checkpoint may be gone, and its sequence
   numbers will be reused for new records.
 - **Durable-only readers** (`ReaderConfig::durable_only`, `--durable-only`) see records only once a checkpoint
-  covers them, so they lag the writer by up to one checkpoint interval.
+  covers them, so they lag the writer by up to one checkpoint interval. A blocking one is woken by the checkpoint, not
+  by appends (ADR 0053, from 1.1), and then reads the interval's backlog: when the writer's helper threads share its
+  CPU, the last record of a 1-second interval at about 170,000 records/s arrived up to 2 ms later than with a reader
+  that has its CPU to itself (measured on cloud VMs); keep the helpers elsewhere (**Pinned writers** above,
+  `WriterConfig::helper_cpus`). A shorter interval means a smaller backlog and less of this delay. Beside a 1.0.0
+  writer, a 1.1 durable-only reader polls the marker every `Backoff::max_sleep` (1 ms by default) instead of
+  registering, so that the old writer's appends make no wake-up call for it.
 - **Recovery time.** When the writer opens, it validates everything written since the last checkpoint; a journal
   that is never checkpointed is validated from the start every time.
 

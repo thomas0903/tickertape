@@ -31,7 +31,7 @@ Errors and recovery warnings go to stderr. JSON results go to stdout (or the sel
   price=… qty=…` (plus ` trade_id=…` or ` action=…`) to each text line, or ` decoded=-` when the record isn't a
   market-demo event; with `--format json` it adds the same `decoded` object as `export --decode` (see below).
   `--durable-only` returns only records below the current checkpoint marker's `next_seq` and waits for later
-  checkpoints using the usual idle timeout. With no valid checkpoint, it returns nothing until one appears;
+  checkpoints using the usual idle timeout; while it waits, checkpoints wake it, appends do not (ADR 0053). With no valid checkpoint, it returns nothing until one appears;
   `--no-follow` stops at that boundary and `--from-end` starts at the checkpoint observed at startup.
 - `inspect <DIR> [--json]`: checksum scan with per-segment metadata, totals, checkpoint and problems. Text
   displays creation time as RFC 3339 UTC, used bytes and percent. An invalid header has unavailable metadata.
@@ -221,6 +221,8 @@ Errors and recovery warnings go to stderr. JSON results go to stdout (or the sel
   validates. Records without a `local_ts_ns`, and records whose `local_ts_ns` is later than this machine's clock, are
   counted apart and have no age.
   `--durable-only` gives the age at which a durable-only reader gets records (it includes the wait for the checkpoint).
+  With `--wait block` it then waits for checkpoints, and only a checkpoint makes a wake-up system call for it (ADR 0053;
+  beside a 1.0.0 writer it polls every 1 ms instead).
   **When it ends.** `--duration` after its start, whether or not the reader is at the end by then, or after `--count`
   records returned while live, whichever comes first, with a final report. `--count 0` reports as soon as the reader is at
   the end. `--interval` prints a report each interval before that; an interval report is skipped while earlier ones are
