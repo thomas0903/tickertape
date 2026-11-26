@@ -101,14 +101,14 @@ fn many_rolls_without_a_checkpoint_under_a_low_descriptor_limit() {
 /// Segments in a list that keep their file and mapping open (`checkpoint::OPEN_SEGMENTS`).
 const OPEN_SEGMENTS: i64 = 4;
 /// Released segments that may wait for the prefault helper to unmap and close them, the one it is releasing included
-/// (`prefault::RELEASE_QUEUE`, ADR 0059).
-const RELEASE_QUEUE: i64 = 2;
+/// (`prefault::RELEASE_QUEUE`, ADR 0059): Linux only; on macOS the writer releases them itself.
+const RELEASE_QUEUE: i64 = if cfg!(target_os = "linux") { 2 } else { 0 };
 
 /// The most segment files a writer holds open beyond those it holds right after its open (`docs/operations.md` → Open
 /// files; ADR 0038 → Bounded open segments): three lists of [`OPEN_SEGMENTS`] (its own, a running background checkpoint's
 /// and a queued one's), the one a running checkpoint has reopened, the new segment of a roll in progress, the
-/// [`RELEASE_QUEUE`] segments the lists released that wait for the prefault helper (from ADR 0059: before, the writer
-/// closed them at once, and the bound was 2 lower), and on Linux the segment the early write-back helper is writing
+/// [`RELEASE_QUEUE`] segments the lists released that wait for the prefault helper (Linux, from ADR 0059: before, the
+/// writer closed them at once, and the bound was 2 lower; on macOS it still does), and on Linux the segment the early write-back helper is writing
 /// back and, with the spare segment on, the spare being prepared (on macOS a roll waits for the spare, which becomes its
 /// new segment).
 fn most_extra_descriptors(spare: &str) -> i64 {
@@ -130,11 +130,24 @@ fn most_descriptors_under_a_low_limit(spare: &str) {
         "25",
         spare,
     ]);
-    let (next_seq, held, held_maps, most, most_maps, waiting) =
-        (out[0] as u64, out[1], out[2], out[3], out[4], out[5]);
+    let (next_seq, held, held_maps, most, most_maps, waiting, waiting_after) = (
+        out[0] as u64,
+        out[1],
+        out[2],
+        out[3],
+        out[4],
+        out[5],
+        out[6],
+    );
     assert_eq!(
         waiting, RELEASE_QUEUE,
         "segments waiting for the prefault helper in the worst state"
+    );
+    // The measured roll released one more segment: with the queue full, the writer kept it. A larger queue would take
+    // it (and raise the bound), and this fails.
+    assert_eq!(
+        waiting_after, RELEASE_QUEUE,
+        "segments waiting for the prefault helper after one more release"
     );
     let bound = most_extra_descriptors(spare);
     assert_eq!(

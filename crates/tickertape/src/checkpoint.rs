@@ -39,9 +39,9 @@ use crate::retention::{Action, Policy, Report};
 /// ones are remembered by path, file identity and range only, and the checkpoint that covers them reopens them. A
 /// segment is released by the push that makes its list longer than four: usually a roll, but also a request that adds
 /// the active segment to a list already holding four, or that joins a job queued behind a slow checkpoint
-/// ([`Job::absorb`]). The writer hands what it releases to the prefault helper to close and unmap, or does so itself
-/// when that helper is absent or has not caught up ([`Released`], ADR 0059); a job the checkpoint thread drops closes
-/// and unmaps its segments there. Four, because a writer that checkpoints at
+/// ([`Job::absorb`]). On Linux the writer hands what it releases to the prefault helper to close and unmap, or does
+/// so itself when that helper is absent or has not caught up; on macOS it does so itself ([`Released`], ADR 0059). A
+/// job the checkpoint thread drops closes and unmaps its segments there. Four, because a writer that checkpoints at
 /// least once per roll then does not reopen a segment unless its requests pile up behind a slow checkpoint (a list
 /// holds the segments rolled past since the last request and the job adds the active one), the early write-back
 /// helper has usually finished a segment within a roll or two of leaving it, and a background checkpoint queued
@@ -137,8 +137,9 @@ impl DirtySegment {
 
 /// The file and mapping handle a dirty list let go of ([`DirtySegments::push`]). Dropping it closes the file and
 /// unmaps the segment, unless something else still holds them (the early write-back helper the file, the prefault
-/// helper the mapping). The writer hands it to its prefault helper to drop, so that neither `munmap` nor `close` runs
-/// on the writer's thread, or drops it itself when the helper has not caught up (ADR 0059).
+/// helper the mapping). On Linux the writer hands it to its prefault helper to drop, so that neither `munmap` nor
+/// `close` runs on the writer's thread, or drops it itself when the helper has not caught up; on macOS it drops it
+/// itself (ADR 0059).
 #[derive(Debug)]
 #[must_use = "dropping it closes and unmaps the segment: hand it to the prefault helper or drop it on purpose"]
 pub(crate) struct Released {

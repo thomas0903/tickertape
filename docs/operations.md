@@ -60,17 +60,44 @@ With `WriterConfig::prefault(true)` (the default), the writer moves segment work
     roll and journal stalls"). Measure on your machine before turning it on.
   - **macOS:** a thread is started for each spare; it also syncs the file (preallocating and syncing a whole segment
     on APFS takes about 50 ms), and a roll waits for a spare that is still being prepared.
-- **Closing finished segments (Linux and macOS, from 1.1).** A writer that rolls without checkpoints, or faster
-  than its checkpoints take segments off its hands, lets go of the oldest of the segments it holds at each roll
-  ("Open files" below). The same helper, `tickertape-prefault`, unmaps and closes it, after prefaulting the new
-  segment's first pages, instead of the writer doing it inside the roll's `append` (ADR 0059). At most 2 such segments
-  wait for the helper; if it has not caught up, the writer closes the next one itself, as before. Unmapping and
-  closing writes nothing: the data stays in the page cache, and the next checkpoint syncs it as before.
-- **Early write-back (Linux).** A helper thread, `tickertape-writeback`, asks the kernel to start writing back the
-  pages behind the write position (`sync_file_range(SYNC_FILE_RANGE_WRITE)`, every 1 MiB, and the rest of a segment
-  when the writer rolls past it), so that a checkpoint, blocking or background, finds little dirty data left
-  (`WriterConfig::early_writeback`, default on; ADR 0038). It makes nothing durable: only checkpoints do. An I/O
-  error from it makes the next checkpoint fail, as a failed sync would. On macOS the option does nothing.
+- **Closing finished segments (Linux, from 1.1).** A writer that rolls without checkpoints, or faster than its
+  checkpoints take segments off its hands, lets go of the oldest of the segments it holds at each roll ("Open files"
+  below). On Linux the same helper, `tickertape-prefault`, unmaps and closes it, once it has caught up with
+  prefaulting, instead of the writer doing it inside the roll's `append` (ADR 0059: that `munmap` was 0.66–0.84 ms of a
+  roll with 128 MiB segments). At most 2 such segments wait for the helper; if it has not caught up, the writer closes
+  the next one itself, as before. Unmapping and closing writes nothing: the data stays in the page cache, and the next
+  checkpoint syncs it as before. **Where it runs:** the helper's `munmap` runs on the helper's CPU, so if that can be the
+  writer's (`HelperCpus::Inherited` from a pinned writer thread, or a `helper_cpus` list or the default set that
+  includes the writer's CPU), it can delay an ordinary append by that long; keep the helpers off the writer's CPU with
+  `WriterConfig::helper_cpus` ("Pinned writers" below). On macOS the writer still closes the segment itself (a short
+  measurement there looked worse with the hand-off and was not repeated).
+- **Early write-back (Linux).** A helper thread, `tickertape-writeback`, asks the kernel to start writing back what
+  the writer has finished (`sync_file_range(SYNC_FILE_RANGE_WRITE)`, every 1 MiB, up to the 128 KiB boundary below the
+  write position, and the rest of a segment when the writer rolls past it), so that a checkpoint, blocking or
+  background, finds little dirty data left (`WriterConfig::early_writeback`, default on; ADR 0038). It makes nothing
+  durable: only checkpoints do, and a checkpoint syncs whatever early write-back has not reached. An I/O error from it
+  makes the next checkpoint fail, as a failed sync would. On macOS the option does nothing.
+  - **Why it stops at the 128 KiB boundary** (from 1.1; ADR 0058). The kernel writes back whole page-cache folios, not
+    pages, and makes their pages read-only again; recent ext4 (Linux 6.16 and later) and xfs give a segment 128 KiB
+    folios with the default `read_ahead_kb`. Up to 1.0 the helper wrote back to the page that holds the position, so
+    also the folio the writer was still filling: the writer then took a page fault on each page of it that it had yet
+    to fill (a few of them waiting 20–100 µs for the ext4 journal), and the device wrote that folio twice. In the
+    recorded 10-minute runs (`docs/benchmarks.md` → "2026-11-26, early write-back to the folio boundary") that was 6–8
+    % more device bytes than appended, and on aarch64 at 90 % of the device's rate appends of 50–150 ms in 138–151 of
+    611 seconds; with the boundary, 0.2–0.5 % and none, and on that kernel (7.0) the writer's p99.9 was lower in every
+    paced run.
+  - **What it costs.** A checkpoint may find up to 128 KiB more to write, and so may a roll's write-back of the old
+    segment's tail: in those runs a background checkpoint at 64 B on aarch64 became durable after 946–952 µs instead of
+    912–914 (median), and the median roll append went from 254–256 to 260–264 µs there, from 188 to 260–266 µs at 90 %
+    of the device's rate on ext4 (while the longest fell from 61–111 to 0.6–1.0 ms), and from 148–180 to 158–366 µs on
+    a 6.8 kernel. With smaller folios (ext4 before 6.16) nothing is written twice either, but each checkpoint and each
+    roll's tail still gets up to 124 KiB more than with the old limit, for no gain.
+  - **What sets the folio size.** It follows the file's readahead window, `read_ahead_kb` of the device
+    (`/sys/block/<dev>/queue/read_ahead_kb`, 128 by default): the page cache's read-around for mapped files ramps its
+    folios up to that size. Where it is larger (md RAID, some LVM set-ups, a tuned profile that sets 4 MiB), folios
+    can reach 2 MiB, and early write-back then writes back the writer's folio as in 1.0, with its faults and double
+    writes. With 16 KiB or 64 KiB pages a folio is at least one page and can be larger. None of these was measured
+    beyond the cells in `docs/benchmarks.md`.
 
 **ext4 under a load near what the disk takes.** A store into a page of a mapped file updates the file's modification
 time through the ext4 journal and can wait while the journal commits, for as long as the disk takes to write the log
@@ -116,15 +143,17 @@ tmpfs three to four times as much at 1,024 B.
 
 - **Headroom at a steady rate.** There, a steady rate of 89 % (64 B) or 94 % (x86-64) of the device's rate did not
   stall, and 92 % (1,024 B, aarch64) did, with appends of 10–144 ms. The point at which it starts depends on the
-  device and on more than the rate (with its defaults the writer made that device write 7 % more than it appended), so
-  measure it.
+  device and on more than the rate (with 1.0's defaults the writer made that device write 7 % more than it appended;
+  from 1.1 early write-back no longer does, see above), so measure it.
 - **Settings that moved the tail.** In those aarch64 runs, early write-back off
   (`WriterConfig::early_writeback(false)`) removed the stalls in 5 of 5 runs. The cost: a checkpoint became durable 0.93
   s after its request (what the device needs for a second of data) instead of 0.05–0.39 s. On x86-64, where there were
   no stalls, it only made checkpoints that late instead of 2 ms. `lazytime` and xfs left one or three seconds with a
   long append (one run each). The spare segment and either dirty limit did not help. Small limits
   (`vm.dirty_bytes` 256 MiB) made an overloaded writer's longest appends longer, and large ones only let more pile up
-  before the throttling starts.
+  before the throttling starts. These runs were of 1.0's early write-back; with 1.1's (the 128 KiB boundary) the
+  stalls of that aarch64 cell were gone in 10-minute runs with early write-back on and checkpoints durable after about
+  1 ms (`docs/benchmarks.md` → "2026-11-26, early write-back to the folio boundary").
 - **tmpfs** has no durability (syncs do nothing). There, a roll zeroes the whole new segment on the writer's thread
   (`fallocate`; 19–30 ms per 128 MiB roll in the recorded runs) unless the spare segment is on.
 
@@ -132,11 +161,11 @@ tmpfs three to four times as much at 1,024 B.
 
 **What 1.x guarantees:** the number of files a writer holds open is bounded, whatever the number of segments and
 however far its background checkpoints fall behind (ADR 0054; ADR 0038 → Bounded open segments). **The counts of this
-release:** at most 20 files, 21 on Linux by default, 22 on Linux with the spare segment (18 with
-`WriterConfig::prefault(false)`, which starts no helper threads). A later 1.x release that raises them says so in its
-changelog (this one raised them by two, ADR 0059). So set the limit on open files (`ulimit -n`, `LimitNOFILE=` in
-systemd) with headroom above the count for your platform, plus your readers and the rest of your process, and read this section
-again when you upgrade. The files of this release:
+release:** at most 18 files on macOS, 21 on Linux by default, 22 on Linux with the spare segment, 20 on Linux with
+early write-back off, and 18 on every platform with `WriterConfig::prefault(false)`, which starts no helper threads. A
+later 1.x release that raises them says so in its changelog (this one raised the Linux counts by two, ADR 0059). So set
+the limit on open files (`ulimit -n`, `LimitNOFILE=` in systemd) with headroom above the count for your platform, plus
+your readers and the rest of your process, and read this section again when you upgrade. The files of this release:
 
 - **4 always:** `writer.lock`, the marker `checkpoint`, the wake-up region and the active segment.
 - **Up to 12 sealed segments not yet checkpointed:** the 4 newest of each of three lists, the writer's own (segments
@@ -144,26 +173,27 @@ again when you upgrade. The files of this release:
   behind it (later requests join that one). The older segments of a list are closed, and the checkpoint that covers
   them opens them again, one at a time: **1** more.
 - **1 during a roll:** the new segment, before the old one joins the writer's list.
-- **Up to 2 waiting to be closed** (from 1.1, ADR 0059): a segment a list lets go of is closed and unmapped by the
-  prefault helper, not on the thread that let go of it (the writer's, at a roll or a request). At most 2 wait for the
-  helper, the one it is closing included; when 2 wait, or the helper has ended, the writer closes the next one itself.
-  None with `prefault(false)`.
+- **Linux: up to 2 waiting to be closed** (from 1.1, ADR 0059): a segment a list lets go of is closed and unmapped by
+  the prefault helper, not on the thread that let go of it (the writer's, at a roll or a request). At most 2 wait for
+  the helper, the one it is closing included; when 2 wait, or the helper has ended, the writer closes the next one
+  itself. None with `prefault(false)`, and none on macOS, where the writer closes them itself.
 - **Linux, early write-back on (the default):** **1**, the segment the helper is writing back, which can be one that
   every list has closed when the helper falls behind.
 - **Linux, spare segment on:** **1**, the spare being prepared or ready. On macOS a roll waits for the spare and makes
   it its new segment, so the spare adds nothing to the roll's.
 
 The most is reached only while a background checkpoint runs, another waits behind it, each covers five segments or
-more, the writer has rolled seven times since the last request (the segment active at the request is shared with
-the waiting checkpoint's list), and the prefault helper is still closing the first segment the writer let go of
-since then when it lets go of the second. Otherwise a writer holds far fewer: in the
+more, and the writer has rolled at least five times since the last request (the segment active at the request is
+shared with the waiting checkpoint's list), with a roll in progress; on Linux also only while the prefault helper is
+still closing the second segment the writer's list let go of since that request and the third waits for it (the first
+is the segment that was active at the request, which the waiting checkpoint still holds, so closing it frees nothing).
+That takes seven rolls since the request. Otherwise a writer holds far fewer: in the
 `tt-scale` runs above, 8 counting the process's own 3, and 12 while it opened a journal without a marker. A retention
 run on the checkpoint thread runs between checkpoints and opens a few files at a time, fewer than a checkpoint. Your
 process's own descriptors (standard input, output and error) and your readers come on top. The writer maps the same
-segments, the 2 waiting to be closed included, except the write-back helper's and (on Linux) the reopened one, plus at
-most one that the prefault helper may still have in hand; on macOS the checkpoint maps the reopened segment for a
-moment, to `msync` it. That is address
-space, not memory, and no descriptors. `tests/open_segments.rs` drives a writer into that state with hold points and
+segments, the 2 waiting to be closed included (Linux), except the write-back helper's and (on Linux) the reopened one,
+plus at most one that the prefault helper may still have in hand; on macOS the checkpoint maps the reopened segment
+for a moment, to `msync` it. That is address space, not memory, and no descriptors. `tests/open_segments.rs` drives a writer into that state with hold points and
 checks the number exactly, on both platforms.
 
 ## Choosing a checkpoint interval

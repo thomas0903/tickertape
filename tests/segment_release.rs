@@ -3,6 +3,9 @@
 //! is releasing included; beyond that, or once the helper has ended, the writer releases them itself, as without the
 //! helper. Nothing here measures time: the helper is held at its release point, or made to panic there.
 //!
+//! Linux only: on macOS the writer releases the segments itself (ADR 0059), so the tests of the hand-off are skipped
+//! there with a message, and one test checks that nothing is handed over.
+//!
 //! The holds and background failure points are process-wide, so the tests run one at a time.
 
 use std::path::Path;
@@ -47,6 +50,20 @@ fn roll(writer: &mut Writer, rolls: u64) {
             rolled += 1;
         }
     }
+}
+
+/// Whether this platform hands released segments to the prefault helper; if not, says that the test is skipped.
+fn hands_off(test: &str) -> bool {
+    if cfg!(target_os = "linux") {
+        return true;
+    }
+    use std::io::Write;
+    // Not `eprintln!`, which the test harness captures: a skip must be seen.
+    let _ = writeln!(
+        std::io::stderr(),
+        "skipped {test}: the writer releases segments on its own thread on this platform (ADR 0059)"
+    );
+    false
 }
 
 /// Waits until `done(writer)`.
@@ -105,6 +122,9 @@ fn within<T: Send + 'static>(
 /// helper goes on, it releases the two it had, and nothing else is left open.
 #[test]
 fn a_held_helper_bounds_what_waits_and_the_writer_releases_the_rest() {
+    if !hands_off("a_held_helper_bounds_what_waits_and_the_writer_releases_the_rest") {
+        return;
+    }
     let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
     let journal = dir.path().join("j");
@@ -170,6 +190,9 @@ fn a_held_helper_bounds_what_waits_and_the_writer_releases_the_rest() {
 /// open, so nothing was closed twice.
 #[test]
 fn dropping_the_writer_with_segments_waiting_releases_them_once() {
+    if !hands_off("dropping_the_writer_with_segments_waiting_releases_them_once") {
+        return;
+    }
     let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
     let journal = dir.path().join("j");
@@ -202,6 +225,9 @@ fn dropping_the_writer_with_segments_waiting_releases_them_once() {
 /// segment itself (none waits for the helper any more), and its drop returns. Nothing is left open.
 #[test]
 fn a_panicked_helper_is_not_waited_for() {
+    if !hands_off("a_panicked_helper_is_not_waited_for") {
+        return;
+    }
     let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
     let journal = dir.path().join("j");
@@ -239,19 +265,26 @@ fn a_panicked_helper_is_not_waited_for() {
     );
 }
 
-/// Without helper threads (`prefault(false)`), nothing is handed over: the writer releases segments itself, as before.
+/// Without helper threads (`prefault(false)`), and on macOS with them, nothing is handed over: the writer releases
+/// segments itself, as before.
 #[test]
-fn without_helpers_the_writer_releases_segments_itself() {
+fn without_a_hand_off_the_writer_releases_segments_itself() {
     let _serial = serial();
-    let dir = tempfile::tempdir().unwrap();
-    let journal = dir.path().join("j");
-    let mut writer = Writer::open(&journal, config().prefault(false)).unwrap();
-    roll(&mut writer, OPEN_SEGMENTS);
-    let fds = descriptors();
-    for _ in 0..10 {
-        roll(&mut writer, 1);
-        assert_eq!(writer.segments_awaiting_release(), 0);
-        assert_eq!(descriptors(), fds);
+    let mut configs = vec![config().prefault(false)];
+    if !cfg!(target_os = "linux") {
+        configs.push(config());
+    }
+    for config in configs {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("j");
+        let mut writer = Writer::open(&journal, config).unwrap();
+        roll(&mut writer, OPEN_SEGMENTS);
+        let fds = descriptors();
+        for _ in 0..10 {
+            roll(&mut writer, 1);
+            assert_eq!(writer.segments_awaiting_release(), 0);
+            assert_eq!(descriptors(), fds);
+        }
     }
 }
 
@@ -307,13 +340,19 @@ fn rolls_release_segments_off_the_writers_thread() {
         .arg(std::env::current_exe().unwrap())
         .args(["--exact", "child_that_rolls", "--test-threads", "1"])
         .env("TT_SEGMENT_RELEASE_CHILD", dir.path())
-        .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .status();
-    match strace {
-        Ok(status) if status.success() => {}
-        other => return skip(format!("strace: {other:?}")),
+        .output();
+    // Skipped only when `strace` cannot run: it cannot be spawned, or the child test never reported a result (no
+    // ptrace permission, say). A child that ran and failed fails this test.
+    let out = match strace {
+        Err(e) => return skip(format!("strace: {e}")),
+        Ok(out) => out,
+    };
+    let child = String::from_utf8_lossy(&out.stdout);
+    if !child.contains("test result:") {
+        return skip(format!("strace ran no test: {:?}", out.status));
     }
+    assert!(out.status.success(), "the traced child failed:\n{child}");
     let trace = std::fs::read_to_string(&trace).unwrap();
     let segment = format!(", {}) ", small_config().segment_size);
     for helpers in ["on", "off"] {

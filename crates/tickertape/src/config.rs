@@ -69,10 +69,10 @@ pub struct WriterConfig {
     ///   (256 KiB of zeros) and write-protects them, so the writer faults them in again afterwards; the cost is
     ///   measured in `docs/benchmarks.md` (2026-11-26).
     /// - **macOS:** the helper keeps 8 MiB ahead with `madvise(MADV_WILLNEED)` (ADR 0020).
-    /// - **Both, from 1.1:** the same helper unmaps and closes the segments the writer lets go of between checkpoints
+    /// - **Linux, from 1.1:** the same helper unmaps and closes the segments the writer lets go of between checkpoints
     ///   (the oldest of those it keeps open, at a roll or a request), so that the roll's `append` does not; at most 2
     ///   wait for it, and if it has not caught up the writer does it itself (ADR 0059; `docs/operations.md` → Open
-    ///   files). That writes nothing: what is durable when is unchanged.
+    ///   files). That writes nothing: what is durable when is unchanged. On macOS the writer still does it itself.
     ///
     /// It is also the switch for [`WriterConfig::early_writeback`] and [`WriterConfig::spare_segment`], which have no
     /// effect without it.
@@ -85,9 +85,11 @@ pub struct WriterConfig {
     /// checkpoint finds little left to write (ADR 0038 → Early write-back). Applies only with
     /// [`WriterConfig::prefault`] on, which is the switch for the writer's helper threads. A helper thread
     /// (`tickertape-writeback`)
-    /// calls `sync_file_range(SYNC_FILE_RANGE_WRITE)` over the whole pages behind the write position each time it
-    /// has moved 1 MiB, and over the rest of a segment when the writer rolls past it. That call only starts writing;
-    /// it makes nothing durable: what is durable when is unchanged, and only a checkpoint promises it
+    /// calls `sync_file_range(SYNC_FILE_RANGE_WRITE)` each time the write position has moved 1 MiB, up to the 128 KiB
+    /// boundary below the position (not into the page-cache folio the writer is still filling, which writing back
+    /// would write twice and make the writer fault on again; ADR 0058, from 1.1), and over the rest of a segment when
+    /// the writer rolls past it. A checkpoint therefore finds up to 128 KiB more to write. That call only starts
+    /// writing; it makes nothing durable: what is durable when is unchanged, and only a checkpoint promises it
     /// (`docs/crash-contract.md`). If the call fails with an I/O error, no later checkpoint of this writer succeeds
     /// (the error is returned by the next checkpoint, as a failed sync would be); if the filesystem does not support
     /// it, the helper stops. **macOS:** no effect (it has no call that starts write-back of a range without waiting

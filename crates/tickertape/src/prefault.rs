@@ -6,8 +6,9 @@
 //! Everything here is a hint: if the thread can't start, falls behind or stops, the writer faults pages itself, as it
 //! would without prefaulting.
 //!
-//! The same thread drops the file and mapping handles of the segments the writer's dirty lists release
-//! ([`Released`]), so that the `munmap` and `close` they come to happen off the writer's thread. At most
+//! On Linux the same thread drops the file and mapping handles of the segments the writer's dirty lists release
+//! ([`Released`]), so that the `munmap` and `close` they come to happen off the writer's thread (the writer does not
+//! hand them over on macOS, ADR 0059). At most
 //! [`RELEASE_QUEUE`] wait for it (the one it is dropping included); when that many wait, or the thread has ended, the
 //! writer drops the next one itself, as without the helper, so the files and mappings a writer holds stay bounded.
 

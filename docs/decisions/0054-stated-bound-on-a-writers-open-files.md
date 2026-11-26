@@ -74,13 +74,15 @@ running checkpoint held at its second reopen, so that one that kept the first op
 
 ## Amendment: segments waiting for the prefault helper (2026-11-27, ADR [0059](0059-release-finished-segments-off-the-writers-thread.md))
 
-The guarantee is unchanged: the count is bounded. The numbers of this release go up by two. A segment a dirty list
-releases is no longer closed and unmapped by the thread that released it (the writer's, at a roll or a request): it is
-handed to the prefault helper, and up to two (`prefault::RELEASE_QUEUE`, the one the helper is releasing included) can
-wait for it; when two wait, or the helper has ended, the writer closes and unmaps the next one itself, as before. Those
-two can be segments no list holds, so they add two descriptors and two mappings. The counts of this release:
-**20** on macOS and on Linux without the helpers' early write-back, **21** on Linux by default, **22** on Linux with
-the spare segment. With `WriterConfig::prefault(false)` there are no helper threads (no prefault helper, write-back
-or spare) and nothing waits: the count stays 18 on every platform. Measured in the held state (`tt-open-segments worst`, which now also holds the prefault
-helper while it releases one segment with a second one waiting): macOS 16, Linux 17, Linux with the spare segment 18
-beyond the 4 files the writer always holds, and the journal's mappings of that state include the two waiting segments.
+The guarantee is unchanged: the count is bounded. On Linux the numbers of this release go up by two; on macOS they do
+not change. On Linux a segment a dirty list releases is no longer closed and unmapped by the thread that released it
+(the writer's, at a roll or a request): it is handed to the prefault helper, and up to two (`prefault::RELEASE_QUEUE`,
+the one the helper is releasing included) can wait for it; when two wait, or the helper has ended, the writer closes
+and unmaps the next one itself, as before. Those two can be segments no list holds, so they add two descriptors and
+two mappings. The counts of this release: **21** on Linux by default, **22** with the spare segment, **20** on Linux
+with early write-back off; **18** on macOS (the writer still releases segments itself there: ADR 0059) and with
+`WriterConfig::prefault(false)` on every platform (no helper threads). Measured in the held state (`tt-open-segments
+worst`, which on Linux now also holds the prefault helper while it releases one segment with a second one waiting, and
+checks that the next released segment is given back to the writer): Linux 17, Linux with the spare segment 18, macOS
+14 (as before) beyond the 4 files the writer always holds; on Linux the journal's mappings of that state include the
+two waiting segments.

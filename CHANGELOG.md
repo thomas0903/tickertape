@@ -5,28 +5,53 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
-- Changed: a writer that rolls without checkpoints, or faster than its checkpoints take segments off its hands, no
-  longer unmaps and closes the oldest segment it keeps open inside the roll's `append`: the prefault helper
-  (`tickertape-prefault`) does it, after prefaulting the new segment's first pages (ADR 0059, proposed; part of issue
-  #60). At most two such segments wait for the helper, the one it is closing included; when two wait, or the helper
-  has ended (it panicked), the writer closes the next one itself, as before, and it never waits for the helper. The same
-  goes for a `request_checkpoint` that lets go of segments. Unmapping and closing writes nothing, so durability and
-  readers are unchanged: the next checkpoint syncs the data, as before. With `WriterConfig::prefault(false)` nothing
-  changes. **The number of files a writer can hold open goes up by two** (the two waiting segments, which are also two
-  more segment mappings): at most 20, 21 on Linux by default and 22 on Linux with the spare segment, against 18, 19 and
-  20 (ADR 0054, amended; `docs/operations.md` → Open files); still 18 with `prefault(false)`. On Linux kernels before
-  5.14, which reject the prefault advice, the helper now keeps running after its first advice, only to release
-  segments. New: `tests/segment_release.rs` (with an `strace` test that CI requires on Linux), the hold point
-  `fault::Point::SegmentRelease` and the failure point `fault::Point::SegmentReleasePanic`, and the hidden
-  test accessor `Writer::segments_awaiting_release` (feature `fault-injection`).
+- Changed (Linux): a writer that rolls without checkpoints, or faster than its checkpoints take segments off its
+  hands, no longer unmaps and closes the oldest segment it keeps open inside the roll's `append`: the prefault helper
+  (`tickertape-prefault`) does it, once it has caught up with prefaulting (ADR 0059, proposed; part of issue #60). At
+  most two such segments wait for the helper, the one it is closing included; when two wait, or the helper has ended
+  (it panicked), the writer closes the next one itself, as before, and it never waits for the helper. The same goes for
+  a `request_checkpoint` that lets go of segments. Unmapping and closing writes nothing, so durability and readers are
+  unchanged: the next checkpoint syncs the data, as before. With `WriterConfig::prefault(false)`, and on macOS, nothing
+  changes (the one macOS measurement looked worse with the hand-off and was not repeated). The helper's `munmap` runs
+  where the helpers run: keep them off the writer's CPU (`WriterConfig::helper_cpus`), or it can delay an ordinary
+  append by as long as the roll used to. **On Linux the number of files a writer can hold open goes up by two** (the two
+  waiting segments, which are also two more segment mappings): at most 21 by default, 22 with the spare segment and 20
+  with early write-back off, against 19, 20 and 18 (ADR 0054, amended; `docs/operations.md` → Open files); macOS stays
+  at 18, and every platform with `prefault(false)`. On Linux kernels before 5.14, which reject the prefault advice, the
+  helper now keeps running after its first advice, only to release segments. New: `tests/segment_release.rs` (with an
+  `strace` test that CI requires on Linux), the hold point `fault::Point::SegmentRelease` and the failure point
+  `fault::Point::SegmentReleasePanic`, and the hidden test accessor `Writer::segments_awaiting_release` (feature
+  `fault-injection`). The `strace` tests (also `tests/writer_latency.rs`) now skip only when `strace` cannot run; a
+  traced child that fails fails them.
   Measured on one x86-64 and one aarch64 Google Cloud VM (ext4, 128 MiB segments, steady-50, one 60-second run per
   build and configuration): without checkpoints the `munmap` of the released segment was 78–94 % of a roll, and the
   roll's append fell from 0.83–1.06 ms to 169–179 µs at the median (0.71–0.94 ms to 49–60 µs with the spare segment),
   its maximum from 0.73–1.14 ms to 60–211 µs; with checkpoints every second nothing changed; instructions per append are
-  unchanged. Not settled: a higher p99.99 in two x86-64 runs at 1,024 B without checkpoints (23.3 against 21.2–21.6 µs,
-  and 25.5 against 16.7–17.2 with the spare segment; not seen on aarch64, where those cells were repeated) and one
-  aarch64 run with a 1.03 ms append that was not a roll. macOS was not measured conclusively (`docs/benchmarks.md` →
-  "2026-11-26, finished segments released off the writer's thread").
+  unchanged. Open: a higher p99.99 in two x86-64 runs at 1,024 B without checkpoints (23.3 against 21.2–21.6 µs, and
+  25.5 against 16.7–17.2 with the spare segment; not seen on aarch64, where those cells were repeated; the helper's TLB
+  flushes reaching the writer's CPU would fit and were not tested) and one aarch64 run with a 1.03 ms append that was
+  not a roll (`docs/benchmarks.md` → "2026-11-26, finished segments released off the writer's thread").
+- Changed (Linux): early write-back stops at the 128 KiB boundary below the writer instead of at the page that holds its
+  position (ADR 0058, change 1; issue #60), so that it no longer writes back, and write-protects, the page-cache folio
+  the writer is still filling (128 KiB on recent ext4 and xfs with the default `read_ahead_kb`), which the device then
+  wrote twice and the writer faulted on again. A checkpoint may find up to 128 KiB more to write, and so may a roll's
+  write-back of the old segment's tail; a sealed segment is still written back whole when the writer rolls past it. No
+  API, format or crash-contract change; the append path is the same code (384.0 instructions per append before and
+  after, measured with helper threads off). Measured in 10-minute session cells on cloud VMs (`docs/benchmarks.md` →
+  "2026-11-26, early write-back to the folio boundary"; two runs per build and cell; background checkpoints every
+  second). Better: device bytes 1.06–1.08 → 1.002–1.005 times the appended bytes; aarch64 at 90 % of the device's rate,
+  seconds with an append of 50 ms or more 138–151 → 0 of 611 on ext4 and 2–4 → 0 on xfs, background checkpoints durable
+  after 0.35–0.41 s → about 1 ms; the writer's p99.9 lower in every paced cell on kernel 7.0 (aarch64 4.0 → 2.4 µs,
+  x86-64 6.3 → 5.8 µs). Worse, beyond the base's own spread: aarch64 64 B at 50 %, background checkpoints durable after
+  946–952 instead of 912–914 µs (median) and the zero-copy reader's p99.9 325–335 instead of 312–316 µs; x86-64 1,024 B,
+  the background checkpoints' durable time p99 5.1–6.0 instead of 4.1–4.9 ms. In three short W2 runs per build at 64 B
+  on x86-64, two change runs had a higher reader p99.9 than every base run; 10 strictly alternating pairs per cell on
+  both architectures showed that to be noise (change / base median 0.65–1.01, the p99.99 at 100,000 records/s a third of
+  the base's). Slower rolls (median append): 254–256 → 260–264 µs at 64 B and 188 → 260–266 µs at steady-90 on aarch64
+  ext4 (its maxima down from 61–111 ms to 0.6–1.0 ms), 148–180 → 158–366 µs on kernel 6.8. On kernel 6.8, whose ext4 has
+  no large folios, no gate figure differed. The first gate set for this default ("no cell worse") was narrowly missed
+  and the orchestrator accepted it (ADR 0058 → "Decision for change 1"); a private constant,
+  `writeback::STOP_AT_FOLIO_BOUNDARY`, restores the old behaviour.
 - Changed: a reader waiting at an empty slot no longer reads every later file name without a valid segment header
   again at each listing (issue #89, ADR 0050 amendment of 2026-11-27). Such names (stray files named like segments) are
   no evidence, but with 10,000 of them an idle visible reader's `try_next` spent 105–168 ms (macOS) or up to 32 ms
@@ -208,7 +233,7 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 - Docs: `docs/operations.md` → Open files states how many files a writer can hold open (ADR 0054, issue #73). The
   guarantee in 1.x is that the count is bounded, whatever the number of segments and however far its background
   checkpoints fall behind; in this release it is at most 18, 19 on Linux by default and 20 on Linux with the spare
-  segment (raised by two by ADR 0059, above), and a later 1.x release that raises it says so here. A checkpoint now closes each segment it reopens before it opens the
+  segment (raised by two on Linux by ADR 0059, above), and a later 1.x release that raises it says so here. A checkpoint now closes each segment it reopens before it opens the
   next, which lowered that number by one. The descriptor tests of `tests/open_segments.rs` reach the worst case with hold
   points (new: `fault::Point::CheckpointReopen`, and `fault::Point::EarlyWriteback` as a hold point) instead of
   depending on machine load, and the spare-segment one is no longer ignored.

@@ -257,7 +257,9 @@ writer's helper threads):
   (`writer::tests::a_forked_child_releasing_its_copy_closes_the_writeback_helpers_files`,
   `::a_forked_child_releasing_its_copy_leaves_a_writeback_lock_held_at_the_fork_alone`).
 - Pages behind the writer are never stored into again, so starting their write-back does not make the writer take a
-  write fault on them.
+  write fault on them. (Note, 2026-11-27: not so for the rest of the page-cache folio that holds the position, which a
+  range ending at the writer's page also wrote back and write-protected, 128 KiB on recent ext4 and xfs; from 1.1 the
+  helper stops at the 128 KiB boundary below the writer: ADR 0058.)
 - **macOS:** not built. macOS has no call that starts write-back of a file range without waiting for it, and its
   checkpoint has a floor of two `F_FULLFSYNC` calls that early write-back would not remove. The option has no effect
   there.
@@ -306,9 +308,9 @@ and inode, from an `fstat` before it lets go) and range. Rolls usually do the re
 list longer than four, after many rolls since the previous request or when requests join a checkpoint queued behind a
 slow one: that request may then drop the last reference to the released segment's file and mapping (a `close` and a
 `munmap` on the calling thread), and the job reopens the segment later. (Amended 2026-11-27 by ADR
-[0059](0059-release-finished-segments-off-the-writers-thread.md): the writer hands a segment it releases, at a roll or
-a request, to the prefault helper, which does the `close` and `munmap`; at most two wait for it, and beyond that, or
-without the helper, the writer does them itself as described here.) Nothing is added to an append, and recovery's
+[0059](0059-release-finished-segments-off-the-writers-thread.md): on Linux the writer hands a segment it releases, at a
+roll or a request, to the prefault helper, which does the `close` and `munmap`; at most two wait for it, and beyond
+that, without the helper, or on macOS, the writer does them itself as described here.) Nothing is added to an append, and recovery's
 inherited segments go into the same list. The background checkpoint's
 job is such a list too (a queued job that absorbs later requests merges them through it), and the write-back helper
 keeps at most four rolled segments, skipping the oldest one's early write-back if it falls that far behind (it is
@@ -317,7 +319,7 @@ requests pile up behind a slow background checkpoint, above),
 and because three lists of four (the writer's, a running and a queued job's) stay far below the usual descriptor
 limits, whatever the segment count. The write-back helper's queue of four adds at most one segment no list holds (ADR
 [0054](0054-stated-bound-on-a-writers-open-files.md), which also states the total of the release that made it, 18 to 20 files,
-and of the release after ADR 0059, 20 to 22; see
+and of the release after ADR 0059, 18 on macOS and 20 to 22 on Linux; see
 `docs/operations.md` → Open files).
 
 A checkpoint opens each released segment again by path, checks that it is the same file (device and inode), and
