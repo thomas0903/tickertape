@@ -4099,7 +4099,7 @@ scripts) is kept outside the repository.
 | | x86-64 | aarch64 |
 |---|---|---|
 | Machine | `c4-standard-4-lssd` (us-east1-b): Intel Xeon 6985P-C, 2 cores with 2 threads each, 15 GB | `c4a-standard-4-lssd` (us-east1-b): Google Axion (Neoverse-V2), 4 cores, 16 GB; the final comparison on a second VM of the same type |
-| Time (UTC) | 2026-11-26 09:04–11:10 | 09:04–10:17 and 10:35–10:53 |
+| Time (UTC) | 2026-11-26 09:04–11:05 | 09:04–10:17 and 10:35–10:53 |
 | Kernel, OS | 7.0.0-1017-gcp, Ubuntu 24.04 LTS, `randomize_va_space` 2 | the same |
 | Counters | the VM's PMU (`--performance-monitoring-unit=standard`), `perf stat` | the same |
 | rustc | 1.100.0, release profile as in the repository | the same |
@@ -4159,16 +4159,16 @@ listed. Counters per record at the slow offsets against all others:
 | `found` + 24 (x86-64), + 40 (aarch64) | none of the measured counters moves (`ld_blocks.store_forward` 7.97–8.17) | `st_align_lat` 1.0 against 0.00 |
 
 The record path writes `found.header` with two 16-byte stores and reads it with 16-byte loads (aarch64 also stores
-`payload_at` and `payload_len` as one pair). A store that straddles two pages is slow on aarch64; on x86-64 the load after
-it at `found` + 8 is not forwarded, and what makes `found` + 24 slow was not identified by these counters. Of 1,802 ordinary probe processes with `main`'s layout (reader on the stack), 9 had a
-boundary at a hot offset of `found`; those at `found` + 8 replayed 64-byte records 14 to 21 % slower than the median of
-their build, 1,024-byte records 3 to 16 %.
+`payload_at` and `payload_len` as one pair). A store that straddles two pages is slow on aarch64; on x86-64 the load
+after it at `found` + 8 is not forwarded, and what makes `found` + 24 slow was not identified by these counters. Of
+1,802 ordinary probe processes with `main`'s layout (reader on the stack), 9 had a boundary at a hot offset of `found`;
+those at `found` + 8 replayed 64-byte records 14 to 21 % slower than the median of their build, 1,024-byte records 3 to
+16 %.
 
-**Ruled out on these machines**: 4K aliasing (x86-64 `ld_blocks.address_alias` reaches 7.3 per record at some of 64 addresses,
-with no change in time);
-cache-line splits (`found` + 8 at a line boundary inside a page: within 1 %); the size of the struct (padding after every
-field); code alignment (the aligned builds, and the slowdown follows the address with identical code); the stack against
-a boxed reader.
+**Ruled out on these machines**: 4K aliasing (x86-64 `ld_blocks.address_alias` reaches 7.3 per record at some of 64
+addresses, with no change in time); cache-line splits (`found` + 8 at a line boundary inside a page: within 1 %); the
+size of the struct as the cause (padding after every field; but see the 40-byte tail padding below); code alignment (the
+aligned builds, and the slowdown follows the address with identical code); the stack against a boxed reader.
 
 ### Before and after (`42b2307e` against ADR 0057's layout)
 

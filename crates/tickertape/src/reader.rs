@@ -2678,14 +2678,29 @@ mod tests {
             ),
         ];
         for (field, at, expected) in hot {
-            assert_eq!(at, expected, "`Reader::{field}` is at offset {at}, not {expected}: {WHY}");
+            assert_eq!(
+                at, expected,
+                "`Reader::{field}` is at offset {at}, not {expected}: {WHY}"
+            );
         }
         // With `found` at a multiple of 16 in a 16-byte aligned struct, the record path's 16-byte accesses to it (at +0,
         // +16 and +32) cannot straddle a page boundary, wherever the reader is.
-        assert_eq!(align_of::<Reader>(), 16, "`Reader` is no longer 16-byte aligned: {WHY}");
-        assert_eq!(found % 16, 0, "`Reader::found` is not at a multiple of 16: {WHY}");
+        assert_eq!(
+            align_of::<Reader>(),
+            16,
+            "`Reader` is no longer 16-byte aligned: {WHY}"
+        );
+        assert_eq!(
+            found % 16,
+            0,
+            "`Reader::found` is not at a multiple of 16: {WHY}"
+        );
         assert_eq!(size_of::<Found>(), 48, "`Found` changed size: {WHY}");
-        assert_eq!(size_of::<OpenSegment>(), 80, "`OpenSegment` changed size: {WHY}");
+        assert_eq!(
+            size_of::<OpenSegment>(),
+            80,
+            "`OpenSegment` changed size: {WHY}"
+        );
     }
 
     thread_local! {

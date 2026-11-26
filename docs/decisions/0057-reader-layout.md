@@ -41,12 +41,14 @@ Builds interleaved in rotating order; the noise floor is the same binary under a
 all figures are in `docs/benchmarks.md`.
 
 1. **The #85 experiment does not reproduce on Linux.** 26 builds of `main` (`b88c6d5f`): padding of 8 to 64 bytes left
-   to rustc (it puts it at the end), the same at 8-byte alignment, `#[repr(C)]` with rustc's order and 8 to 64 bytes
-   before every field or after every field, PR #85's own two commits, and four of them with every function and block
-   aligned (`-C llvm-args=-align-all-functions=6 -C llvm-args=-align-all-nofallthru-blocks=5`). With the reader on the
-   stack, every build replays within −2.1 to +2.3 % of `main` on x86-64 and −2.1 to +2.6 % on aarch64, for both readers
-   and both sizes (the build with rustc's order under `#[repr(C)]`, the same layout, at −1.7 to +0.5 %): no step, no
-   period, nothing that follows the code. The criterion benchmark agrees (within 2 %).
+   to rustc (it puts it at the end), `#[repr(C)]` with rustc's order and 8 to 64 bytes before every field or after every
+   field, and four of them with every function and block aligned (`-C llvm-args=-align-all-functions=6 -C
+   llvm-args=-align-all-nofallthru-blocks=5`). With the reader on the stack, every build replays within −2.1 to +2.3 %
+   of `main` on x86-64 and −2.1 to +2.6 % on aarch64, for both readers and both sizes (the build with rustc's order
+   under `#[repr(C)]`, the same layout, at −1.7 to +0.5 %): no step, no period, nothing that follows the code. The
+   criterion benchmark agrees (within 2 %). In a second run, PR #85's own commits (the field unboxed and boxed), the
+   field unboxed on `main` and padding as `[u64; n]` were level too (aarch64 within 3.3 %, PR #85's two commits 0.5 %
+   apart).
 2. **It depends on the address, and only at a page boundary.** With the reader at 80 addresses (every 8 bytes in a
    cache line, every 64 bytes in a page), one build was reproducibly slower at one address on both machines: 40 bytes
    before every field, at 3648 modulo 4096 (x86-64 +22 %, aarch64 +13 %). There the 4 KiB boundary falls 8 bytes into
@@ -64,15 +66,17 @@ all figures are in `docs/benchmarks.md`.
    not with the address or the size of the struct. A cache-line split costs nothing measurable (`found` + 8 at a line
    boundary inside a page, and `found` + 24 on aarch64, are not slow).
 3. **The counters name the access.** On aarch64, `st_align_lat` (stores that pay for crossing a boundary) is 0.00 per
-   record at every other offset and 1.0 at the slow ones, and `ld_align_lat` rises by 1. On x86-64 a boundary at `found` + 8 adds
-   exactly one blocked store-to-load forward per record (`ld_blocks.store_forward` 7.94 → 8.98); at `found` + 24 none of
-   the measured counters moves, and the line-split counters (`mem_inst_retired.split_*`) do not change at either. The disassembly shows why: the record path writes
-   `found.header` with two 16-byte stores (`movups`/`stp q`), aarch64 also writes `payload_at` and `payload_len` as one
-   16-byte pair, and `try_next` reads the header back with 16-byte loads.
+   record at every other offset and 1.0 at the slow ones, and `ld_align_lat` rises by 1. On x86-64 a boundary at `found`
+   + 8 adds exactly one blocked store-to-load forward per record (`ld_blocks.store_forward` 7.94 → 8.98); at `found` +
+   24 none of the measured counters moves, and the line-split counters (`mem_inst_retired.split_*`) change at neither.
+   The disassembly shows the accesses: the record path writes `found.header` with two 16-byte stores (`movups`/`stp q`),
+   aarch64 also writes `payload_at` and `payload_len` as one 16-byte pair, and `try_next` reads the header back with
+   16-byte loads.
 4. **The decisive experiment.** Same binary, reader moved by 8 bytes (boundary at `found` + 0 → `found` + 8): fast →
    slow, on both machines. Same layout, alignment 16 → 8: no slow offset → slow at `found` + 8 again (x86-64 +16 % /
-   +27 %, aarch64 +16 % / +17 %), with the counters back. The branch's layout (`found` at 0, `align(16)`) has no offset
-   that is slow in both rounds, and `st_align_lat` is 0 at all of them.
+   +27 %, aarch64 +16 % / +17 %), with the counters back. Both 16-byte aligned layouts measured (`found` at 0, and the
+   one chosen below, `found` at 400) have no offset that is slow in both rounds, and `st_align_lat` is 0 at all of
+   them.
 5. **In practice.** On Linux the initial stack pointer is randomised within a page, so a reader on the stack lands at a
    new offset in each process. Of 1,802 processes of the runs above with `main`'s layout, 9 had a boundary at a hot
    offset of `found`; those at `found` + 8 replayed 64-byte records 14 to 21 % slower than the median of their build
@@ -82,16 +86,17 @@ all figures are in `docs/benchmarks.md`.
 **Also ruled out on these machines:** 4K aliasing (on x86-64, `ld_blocks.address_alias` reaches 7.3 per record at some
 addresses with no change in time); the field offset as such (moving `found` by 8 to 64 bytes changes nothing unless a
 boundary falls into it); code and loop alignment (the aligned builds are within noise, and the slowdown follows the
-address with identical code); the struct's size (padding after every field changes nothing); a stack against a boxed
+address with identical code); the struct's size as the cause of the large effect (padding after every field changes
+nothing here; a smaller effect of the size on x86-64 is described under "Before and after"); a stack against a boxed
 reader (the same at the same address offset).
 
 ### Not shown: the Apple M4 Pro
 
-The Mac was not measured (another agent was taking timings on it). If the M4's stack offset within a page is the same
-in each run of a binary, which the steady figures of #85 suggest, a change of `Reader`'s size moves the reader in the
+The Mac was not measured (another agent was taking timings on it). If the M4's stack offset within a page is the same in
+each run of a binary, which the steady figures of #85 suggest, a change of `Reader`'s size moves the reader in the
 benchmark's frame by the same amount every time, and its 16 KiB pages put a boundary at one of the slow offsets for some
-sizes and not for others. Padding of 40 and 48 bytes moving the reader to the same 16-byte slot, and 32 and 64 not, would
-fit. The size of the effect (twice the time, against 15 to 30 % here) does not follow from anything measured here.
+sizes and not for others. Padding of 40 and 48 bytes moving the reader to the same 16-byte slot, and 32 and 64 not,
+would fit. The size of the effect (twice the time, against 15 to 30 % here) does not follow from anything measured here.
 What would settle it: on an idle M4, the probe's page sweep with 16 KiB placements (`16384 - j`) for `main` and for this
 layout, and the #85 commits under the `replay` benchmark with the reader's address printed.
 
@@ -101,11 +106,11 @@ layout, and the #85 commits under the `replay` benchmark with the reader's addre
    addresses exist at every size, and the rule only kept the M4's one benchmark binary where it was.
 2. **A hot part first: `#[repr(C)]` with the record path's fields at the start and `found` at offset 0**, as issue #86
    proposed, with or without `align(16)`. Measured on x86-64 against `main`, 30 to 40 interleaved rounds: the zero-copy
-   reader replays 64-byte records 1.3 to 3.2 % slower (slower in 19 of 30 to 37 of 40 rounds; the copy of `main`: 0.3 % faster), with `found` at 0 and also with the
-   scalar fields first and `found` at 224, with and without the alignment, and with every function and block aligned
-   (so it is not where the code landed). The other three cases are level. The record path's instructions are the same
-   apart from offsets (several fit a one-byte displacement now). Why this order is slower was not found. On aarch64 the
-   first of these orders was 2.3 % faster.
+   reader replays 64-byte records 1.3 to 3.2 % slower (slower in 19 of 30 to 37 of 40 rounds; the copy of `main`: 0.3 %
+   faster), with `found` at 0 and also with the scalar fields first and `found` at 224, with and without the alignment,
+   and with every function and block aligned (so it is not where the code landed). The other three cases are level. The
+   record path's instructions are the same apart from offsets (several fit a one-byte displacement now). Why this order
+   is slower was not found. On aarch64 the first of these orders was 2.3 % faster.
 3. **rustc's order, written out, with `#[repr(C, align(16))]`.** A page boundary is a multiple of 16, so a 16-byte
    access at a multiple of 16 from a 16-byte aligned struct never straddles one, wherever the reader is; `found` is at
    400 already. Every offset stays as it is, so the record path compiles as on `main`, and `main`'s page sweep showed
