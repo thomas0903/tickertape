@@ -277,7 +277,8 @@ pub struct ReaderConfig {
     /// It is woken after the checkpoint, where a reader that polls the marker on a full core starts at once. Measured on
     /// cloud VMs (`docs/benchmarks.md`, 2026-11-26), with the writer's helper threads free to run on the reader's CPU:
     /// the first record after a checkpoint arrived a median of 15–145 µs later (worst 1.2–1.5 ms), and the last record of
-    /// a 1-second backlog at about 170,000 records/s up to about 2 ms later. With the helpers on other CPUs
+    /// a 1-second backlog at about 170,000 records/s up to about 2 ms later than with such a polling reader. With the
+    /// helpers on other CPUs
     /// ([`WriterConfig::helper_cpus`](crate::WriterConfig::helper_cpus); `docs/operations.md` → Pinned writers): 11–33
     /// µs (worst 0.2 ms), and the last record 0–0.6 ms later.
     pub durable_only: bool,

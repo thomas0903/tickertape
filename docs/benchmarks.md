@@ -2862,7 +2862,7 @@ per checkpoint on each side; append latencies of these builds shown for referenc
 1.0.0's reader polls the marker on a full core, so it starts reading as soon as the marker is written. The new reader
 is woken: with the writer's helper threads free to run on its CPU it starts 15–145 µs later at the median and up to
 1.2–1.5 ms later in the worst checkpoint, and the last record of the 1-second backlog arrives 0.3 ms (x86-64) and 1.8 ms
-(aarch64) later; with the helpers on CPU 7, 11–33 µs (at most 0.2 ms) and 0.0–0.6 ms. ADR 0053 has the mechanism.
+(aarch64) later; with the helpers on CPU 7, 11–33 µs (at most 0.23 ms) and 0.0–0.6 ms. ADR 0053 has the mechanism.
 
 ### Mixed versions (`wakemix`, one process per role, x86-64 VM 1 and aarch64 VM 1)
 
