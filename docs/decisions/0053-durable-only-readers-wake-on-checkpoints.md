@@ -227,7 +227,7 @@ ms at p50 and up to 2.9 ms.
 | Writer, reader | What happens | Measured |
 |---|---|---|
 | 1.0.0, 1.0.0 durable-only | As today: the reader waits on the event count. | ping 60/60, p50 0.50 ms, max 2.1 ms; steady: writer p50 0.43 µs, reader 136,249 sleeps |
-| 1.0.0, new durable-only | Capability bit 0: the reader registers nowhere and sleeps `max_sleep` (1 ms) at a time. The writer makes no wake-up call for it. | MATRIX_ROW |
+| 1.0.0, new durable-only | Capability bit 0: the reader registers nowhere and sleeps `max_sleep` (1 ms) at a time. The writer makes no wake-up call for it. | ping 60/60, p50 0.65 ms, max 2.2 ms (checkpoints 0.29 ms at p50); steady: writer p50 0.14 µs (all 1.0.0 in the same session: 0.45 µs), reader 5,257 sleeps (one per `max_sleep`), 0.16 s of CPU in 5 s |
 | new, 1.0.0 durable-only | The 1.0.0 reader waits on the event count, which checkpoints still bump. As 1.0.0. | ping 60/60, p50 0.50 ms, max 1.9 ms; steady: writer p50 0.43 µs, 150,244 sleeps |
 | new, new durable-only | The marker count. The appends make no wake call for it. | ping 60/60, p50 0.48 ms, max 2.4 ms; steady: writer p50 0.14 µs, 61 sleeps, 0.13 s of CPU in 5 s |
 | either, a new durable-only reader beside a 1.0.0 visible one | Independent pairs: each is woken by what it needs. The visible reader costs what it costs today. | 60/60 each; steady: writer p50 1.61 µs (1.0.0 writer) and 1.14 µs (new), durable reader 432,406 and 60 sleeps |
@@ -238,7 +238,7 @@ ms at p50 and up to 2.9 ms.
 | A durable-only reader killed while asleep | A 1.0.0 one leaves the event waiter count raised: a wake call per append (ADR 0017's documented cost). A new one leaves the marker waiter count raised: a wake call per checkpoint. | writer p50 0.28 against 0.14 µs |
 
 The same matrix on a `c4a-standard-8-lssd` (aarch64) gave the same results: every ping and restart run complete, steady
-writer p50 0.59 µs (both 1.0.0), 0.59 µs (new writer, 1.0.0 reader) and 0.26 µs (both new, 60 sleeps)MATRIX_ARM; a
+writer p50 0.59 µs (both 1.0.0), 0.59 µs (new writer, 1.0.0 reader) and 0.26 µs (both new, 60 sleeps), 0.27 µs (1.0.0 writer, new durable-only reader: 5,306 sleeps; ping p50 0.63 ms, max 1.1 ms); a
 killed 1.0.0 durable-only reader 0.51 µs, a killed new one 0.27 µs.
 
 No pairing loses a wake-up or leaves a reader spinning, and none costs the writer more than 1.0.0 with 1.0.0 readers;
@@ -298,10 +298,12 @@ reader polls the marker, so its clock starts when the marker is written, 11–33
 So the delay is not the wake-up: a sleeping reader leaves its CPU idle, the scheduler puts the writer's helper threads
 (checkpoint, prefault, write-back) there (1.0.0's reader never sleeps, so its CPU is never free), and when the
 checkpoint wakes the reader it waits until that thread gives the CPU up, then shares it while it reads the backlog. With
-the helpers elsewhere the delay is gone. The VMs' kernel is built with `PREEMPT_LAZY` and a 1,000 Hz tick, under which a
-woken thread can wait for the next tick, up to 1 ms, before it preempts another ordinary thread; that fits the maxima
-(an idle-priority spinner on the reader's CPU, which the woken reader should preempt at once, gave a first look after
-788 µs, at most 1.0 ms), but the preemption mode was not recorded, so this part is inferred. On x86-64, with 16 vCPUs
+the helpers elsewhere the delay is gone. The VMs' kernel (7.0.0-1017-gcp) has lazy preemption as its only model
+(`CONFIG_PREEMPT_LAZY=y`, no `CONFIG_PREEMPT_DYNAMIC`; read from its configuration on the acceptance VMs) and a 1,000 Hz
+tick, under which a woken thread can wait for the next tick, up to 1 ms, before it preempts another ordinary thread;
+that fits the maxima (an idle-priority spinner on the reader's CPU, which the woken reader should preempt at once, gave
+a first look after 788 µs, at most 1.0 ms), but that the wait is this tick and not something else was not traced, so
+this part is inferred. On x86-64, with 16 vCPUs
 and more of them idle, the first look comes after 20 µs, and the 0.4 ms on the last record is mostly a slower read of
 the backlog (41.9 against 41.7 ms); that a CPU coming out of idle runs slowly at first is plausible but not measured,
 so this part is inferred too. No checkpoint in any run was noticed more than 1.0 ms after its wake-up, so none waited
