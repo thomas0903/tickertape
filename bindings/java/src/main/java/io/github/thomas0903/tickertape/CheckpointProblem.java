@@ -14,10 +14,10 @@ public enum CheckpointProblem {
     /** The marker's offset is misaligned or outside its segment's record area. */
     INVALID_OFFSET(3),
     /**
-     * The records of the marker's segment do not reach the marker's position (the record right before it is missing,
-     * damaged or another one). Since 1.1.
+     * The records of the marker's segment do not reach the marker's position: the record right before it is missing,
+     * damaged, ends elsewhere or has another sequence number. Since 1.1.
      */
-    RECORDS_MISSING(4),
+    DANGLING(4),
     /** A problem the C ABI does not name. */
     OTHER_PROBLEM(255);
 

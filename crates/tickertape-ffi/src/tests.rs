@@ -2572,8 +2572,8 @@ fn pure_every_status_enum_variant_has_a_code() {
             checkpoint_problem_of(Some(CheckpointProblem::InvalidOffset)) as i32,
         ),
         (
-            "RecordsMissing",
-            checkpoint_problem_of(Some(CheckpointProblem::RecordsMissing)) as i32,
+            "Dangling",
+            checkpoint_problem_of(Some(CheckpointProblem::Dangling)) as i32,
         ),
     ];
     assert_eq!(names(&problems), status_variants("CheckpointProblem"));

@@ -412,7 +412,7 @@ fn dangling_checkpoint_is_corruption() {
             .unwrap()
             .write_all_at(&[0; 4], record)
             .unwrap();
-        check(dir.path(), CheckpointProblem::RecordsMissing);
+        check(dir.path(), CheckpointProblem::Dangling);
     }
 }
 
@@ -903,7 +903,7 @@ fn sampler_checks_a_marker_that_moved_behind_its_head() {
     );
     assert_eq!(
         s.checkpoint.unwrap().problem,
-        Some(CheckpointProblem::RecordsMissing)
+        Some(CheckpointProblem::Dangling)
     );
 
     // A marker that moved to a real record boundary behind the head is accepted, and the sampler resumes.

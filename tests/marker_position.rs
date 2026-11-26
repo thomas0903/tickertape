@@ -7,7 +7,7 @@
 //! nothing. Every state that a working writer and a crash leave must still open; the sweeps at the end check that for
 //! every position a writer can give a marker and for every cut or torn slot after the marker.
 //!
-//! `status` predicts the refusal (`CheckpointProblem::RecordsMissing`) and retention removes nothing from such a journal,
+//! `status` predicts the refusal (`CheckpointProblem::Dangling`) and retention removes nothing from such a journal,
 //! failing with the writer's error (the ADR 0056 amendment of 2026-11-26, issue #93): every refused journal here is also
 //! sampled and planned before the open, and every journal that opens is sampled too, so that the two agree both ways.
 
@@ -142,13 +142,13 @@ fn is_refusal_error(error: &Error, segment: &Path, offset: u64, base: u64) -> bo
 }
 
 /// Opens `dir` under each policy, expects the ADR 0056 refusal at `segment` and `offset`, and checks that the open
-/// changed neither a segment nor the marker. Before that, `status` must report the marker as `records_missing`, and a
+/// changed neither a segment nor the marker. Before that, `status` must report the marker as `dangling`, and a
 /// retention plan must fail with the same error as the writer (and change nothing).
 fn assert_refused(dir: &Path, segment: &Path, offset: u64, base: u64) {
     let before = journal_files(dir);
     assert_eq!(
         status_problem(dir).unwrap(),
-        Some(CheckpointProblem::RecordsMissing),
+        Some(CheckpointProblem::Dangling),
         "status does not predict the refusal"
     );
     let planned = retention::plan(dir, &remove_all());
@@ -544,6 +544,49 @@ fn retention_removes_nothing_from_a_journal_the_writer_refuses() {
     );
     assert_eq!(w.retention_report().removed_segments, 0);
     let segment = copy
+        .path()
+        .join(format::segment_file_name(now.segment_base_seq));
+    let kept = w.last_retention_error();
+    assert!(
+        kept.is_some_and(|e| is_refusal_error(e, &segment, now.offset, now.segment_base_seq)),
+        "{kept:?}"
+    );
+}
+
+/// A writer's own retention run checks the record before a marker that moved between its plan and its removals: a slot
+/// forged while the plan reads the marker (after it has read its slot) names a position the records do not reach, so
+/// the removal check reads that newer slot, removes nothing and keeps the writer's error.
+#[test]
+fn a_writers_retention_run_checks_a_marker_that_moved_after_its_plan() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut w = Writer::open(dir.path(), small_config()).unwrap();
+    append_n(&mut w, 1200);
+    w.checkpoint().unwrap();
+    drop(w);
+    let keep = segments(dir.path()).len();
+    let config = small_config().retention(Policy::default().max_segments(keep), Action::Delete);
+    let mut w = Writer::open(dir.path(), config).unwrap();
+    let first = segments(dir.path())[0].0;
+    while segments(dir.path()).len() == keep {
+        append_n(&mut w, 10);
+    }
+    let path = dir.path().to_path_buf();
+    fault::clear();
+    // Skip 0: the plan's read of the marker. A later one lands after the removal check has read the slot.
+    fault::run_at(Point::MarkerRead, 0, move || {
+        let c = marker(&path);
+        forge(&path, c.segment_base_seq, c.offset, c.next_seq + 1);
+    });
+    w.checkpoint().unwrap();
+    fault::clear();
+    assert_eq!(
+        segments(dir.path())[0].0,
+        first,
+        "retention removed a segment"
+    );
+    assert_eq!(w.retention_report().removed_segments, 0);
+    let now = marker(dir.path());
+    let segment = dir
         .path()
         .join(format::segment_file_name(now.segment_base_seq));
     let kept = w.last_retention_error();

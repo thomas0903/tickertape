@@ -173,9 +173,9 @@ these journals healthy. Measured on each refused journal of `tests/marker_positi
 
 | Refused journal | `status` before | `status` now |
 |---|---|---|
-| Segments restored from an older backup; the last covered record zeroed or with a bad CRC; marker in the newest segment | healthy, `head.verified` true, exit 0 | `records_missing`, exit 2 |
-| `next_seq` one too high or too low, an offset inside a record, a record's start with a later `next_seq`, offset 64 with `next_seq` not the base; marker in the newest segment | `head_invalid` (the head scan from the marker failed: `BadSequence`, `BadChecksum`), exit 2, `problem` null | `records_missing` and `head_invalid`, exit 2 |
-| Any of these with the marker in an older segment | healthy but unverified, exit 0 | `records_missing`, exit 2 |
+| Segments restored from an older backup; the last covered record zeroed or with a bad CRC; marker in the newest segment | healthy, `head.verified` true, exit 0 | `dangling`, exit 2 |
+| `next_seq` one too high or too low, an offset inside a record, a record's start with a later `next_seq`, offset 64 with `next_seq` not the base; marker in the newest segment | `head_invalid` (the head scan from the marker failed: `BadSequence`, `BadChecksum`), exit 2, `problem` null | `dangling` and `head_invalid`, exit 2 |
+| Any of these with the marker in an older segment | healthy but unverified, exit 0 | `dangling`, exit 2 |
 
 **Now.** After the existing checks, in the writer's order, the sample runs the writer's own check on the marker's
 segment: one function, `format::marker_reached` (the rule above, over any segment view), which `Writer::open` calls over
@@ -191,9 +191,13 @@ every journal that opens there, the two sweeps included, is sampled too and must
 
 **The value.** None of the existing values states the case: `missing_segment` says the file is gone,
 `invalid_segment_header` that its header is bad, `invalid_offset` that no segment could have a record there. The new
-value is `records_missing` (`CheckpointProblem::RecordsMissing`, C ABI `TICKERTAPE_CHECKPOINT_RECORDS_MISSING` = 4, C++
-`records_missing`, Java `RECORDS_MISSING`, Python `"records_missing"`): the records the marker vouches for are missing or
-damaged, which is what the operator has to restore. Health, exit code 2, the text output (`UNUSABLE (records_missing)`)
+value is `dangling` (`CheckpointProblem::Dangling`, C ABI `TICKERTAPE_CHECKPOINT_DANGLING` = 4, C++ `dangling`, Java
+`DANGLING`, Python `"dangling"`): the record right before the marker's position is missing, damaged, ends elsewhere or
+has another sequence number. The name (decided by the orchestrator on the owner's delegation, replacing a first
+proposal, `records_missing`): several refused journals have every record present (`next_seq` one too low or too high,
+an offset inside a record, a foreign or hand-edited marker), where "records missing" would send an operator looking for
+segments to restore; and the writer's refusal is already public as `CorruptReason::DanglingCheckpoint` (C ABI code 13,
+Python `dangling_checkpoint`), so `status` and the writer's error use one word for one condition. Health, exit code 2, the text output (`UNUSABLE (dangling)`)
 and the Prometheus output (`tickertape_checkpoint_invalid` 1, `tickertape_corrupt` 1, `tickertape_healthy` 0) follow
 from `problem` being set, as for the other values. `CheckpointProblem` has been `#[non_exhaustive]` since 1.0
 (`compatibility.md` lists it so), so the variant is not a breaking change for Rust; the C enumerator is an addition
@@ -223,7 +227,10 @@ carries the slot into its removals; an archiver's `apply` reads it at its first 
 moved. So one record per run, two for `archive` (its plan and its apply). Nothing else of ADR 0051 or ADR 0055 changes:
 the listing, the sizes, the headers and seals read, the take-out, the put-back and the leftovers are as before (the
 check is part of the checks that precede the take-out). The seek index builder's use of the marker
-(`retention::checkpoint`) is unchanged.
+(`retention::checkpoint`) is unchanged, so it still succeeds on a journal `status` calls corrupt. That is harmless and
+left as it is: it indexes only sealed segments strictly before the marker's, which do not change, every reader that
+uses an index checks it against its segment (crash contract C15), and the remedy that changes those segments' history,
+an open without the marker, removes every index first (`format.md` → Recovery, step 2a).
 
 ### A marker at offset 64 whose previous segment lacks records: not detected, by decision
 
@@ -242,11 +249,14 @@ every dirty segment durable before it writes the slot that names `B`, recovery f
 `A`, recovery from an earlier slot persists what it repaired in `A` before it returns, and an archiver removes `A` only
 as the oldest segment after checking its seal. So a check would not refuse a healthy journal in principle.
 
-It is not built, for three reasons. **It reads what this ADR excludes:** the segment before the marker's, below the
+It is not built, for three reasons. (Not building it has a visible cost: the writer's own retention then fails at that
+segment's seal on every run until someone deals with it, and `status` shows nothing of it: only the writer's
+`metrics().retention_failures` and `last_retention_error()` do.) **It reads what this ADR excludes:** the segment before the marker's, below the
 recovery domain, which archivers remove without the writer lock (the open would have to pass a predecessor that
-vanishes or is taken out meanwhile, ADR 0055). **Its cost has no bound like the one above:** finding `A`'s seal means
+vanishes or is taken out meanwhile, ADR 0055). **Its cost would be new for the writer's open:** finding `A`'s seal means
 reading `A` backward from its end through the space left free at the roll, which is less than the frame that did not
-fit, so up to the largest record the segment size allows, whatever the last covered record's length. **And the harm
+fit, so up to the largest record the segment size allows, whatever the last covered record's length. The library already
+pays that bound elsewhere (retention's `seal_at_end` reads a segment's tail backward to it), but the open never has. **And the harm
 that justified refusing does not arise:** this ADR refuses because the writer would append `next_seq` at the hole's
 position, so every new record is behind a gap that no reader passes. At offset 64 the writer appends in `B`, after the
 gap; a reader that seeks to `B` or later reads the new records. The gap is damage to covered history before the

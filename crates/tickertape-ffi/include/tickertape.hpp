@@ -1130,7 +1130,7 @@ enum class CheckpointProblem : std::int32_t {
     missing_segment = TICKERTAPE_CHECKPOINT_MISSING_SEGMENT,
     invalid_segment_header = TICKERTAPE_CHECKPOINT_INVALID_SEGMENT_HEADER,
     invalid_offset = TICKERTAPE_CHECKPOINT_INVALID_OFFSET,
-    records_missing = TICKERTAPE_CHECKPOINT_RECORDS_MISSING,  // since 1.1
+    dangling = TICKERTAPE_CHECKPOINT_DANGLING,  // since 1.1
     other = TICKERTAPE_CHECKPOINT_OTHER_PROBLEM,
 };
 

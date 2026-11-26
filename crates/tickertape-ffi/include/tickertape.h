@@ -455,7 +455,7 @@ enum tickertape_checkpoint_problem
    * missing, damaged, ends elsewhere or has another sequence number (or, at offset 64, `next_seq` is not the
    * segment's base). Added in 1.1 (ADR 0056).
    */
-  TICKERTAPE_CHECKPOINT_RECORDS_MISSING = 4,
+  TICKERTAPE_CHECKPOINT_DANGLING = 4,
   /**
    * A problem this version of the C ABI does not name (not returned by a library built from one source tree).
    */

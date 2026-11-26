@@ -32,10 +32,12 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   before the marker: on a healthy journal it adds work proportional to that record's length.
 - Fixed: `tickertape status` (`status::status`, `Sampler`) predicts that refusal, and retention removes nothing from
   such a journal (ADR 0056, amendment; issue #93). The sample runs the writer's own check on the record before the
-  marker's offset and reports the new `checkpoint.problem` value `records_missing` (`CheckpointProblem::RecordsMissing`,
-  C ABI `TICKERTAPE_CHECKPOINT_RECORDS_MISSING` = 4, C++ `records_missing`, Java `RECORDS_MISSING`, Python
-  `"records_missing"`): exit 2, `checkpoint_invalid`, `tickertape_healthy` 0, as for the other values. 1.0 reported most
-  of these journals as healthy. A retention run (the writer's own, `retention::plan` and `apply`, `tickertape archive`,
+  marker's offset and reports the new `checkpoint.problem` value `dangling` (`CheckpointProblem::Dangling`,
+  C ABI `TICKERTAPE_CHECKPOINT_DANGLING` = 4, C++ `dangling`, Java `DANGLING`, Python
+  `"dangling"`): exit 2, `checkpoint_invalid`, `tickertape_healthy` 0, as for the other values. 1.0 reported most
+  of these journals as healthy. Those that 1.0 already reported as corrupt, through `head_invalid` with `problem` null
+  (a marker in the newest segment whose `next_seq` or offset disagrees with the records there), keep exit code 2 and now
+  also report `checkpoint_invalid` and `problem` `dangling` (`tickertape_checkpoint_invalid` 0 → 1). A retention run (the writer's own, `retention::plan` and `apply`, `tickertape archive`,
   `--dry-run` included) fails with the writer's error, `DanglingCheckpoint` at the segment and the marker's offset, and
   removes nothing, so the segments that restoring the matching marker needs stay; 1.0 removed the segments before the
   marker's. Each costs one more read, of that record (normally one 4 KiB `pread`; for retention once per run).

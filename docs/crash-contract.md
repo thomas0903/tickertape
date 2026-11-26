@@ -278,7 +278,7 @@ journal; the durability and restart guarantees below apply to retained history.
   the writer refuses to open (under every recovery policy) rather than discard history on its own. So it does when the
   marker's segment is there but its records do not reach the marker's position (segments restored from an older
   backup than the marker, or the last covered record damaged; C11, ADR 0056); `status` reports that case as
-  `records_missing` and retention removes nothing then (C14). When the marker is at the first slot of
+  `dangling` and retention removes nothing then (C14). When the marker is at the first slot of
   its segment, the segment before it is not read: a predecessor that lacks records the marker covers is not detected
   at open, nor by `status` (`verify` and readers report it, and retention stops at its seal; the writer appends only
   after it, in the marker's segment, where a reader that seeks there reads the new records; ADR 0056, amendment:

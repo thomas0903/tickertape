@@ -971,9 +971,10 @@ fn dangling_checkpoint_exits_2() {
 }
 
 /// A marker whose position the records of its segment don't reach (ADR 0056): the last record it covers damaged. The
-/// writer refuses it, so `status` reports `records_missing`, a corruption (exit 2), in every format.
+/// writer refuses it (`DanglingCheckpoint` at the segment), so `status` reports `dangling`, a corruption (exit 2), in
+/// every format.
 #[test]
-fn records_missing_checkpoint_exits_2() {
+fn marker_beyond_its_records_exits_2() {
     let _serial = serial();
     let (dir, writer) = journal(130, true);
     drop(writer);
@@ -1004,7 +1005,7 @@ fn records_missing_checkpoint_exits_2() {
     ));
     let (v, code) = status_json(&[path]);
     assert_eq!(code, 2);
-    assert_eq!(v["checkpoint"]["problem"], "records_missing");
+    assert_eq!(v["checkpoint"]["problem"], "dangling");
     assert_eq!(v["exposure"]["records"], Value::Null);
     assert_eq!(v["health"]["ok"], false);
     assert_eq!(v["health"]["corrupt"], true);
@@ -1013,7 +1014,7 @@ fn records_missing_checkpoint_exits_2() {
         serde_json::json!([{"code": "checkpoint_invalid", "reader": null}])
     );
     command().args(["status", path]).assert().code(2).stdout(
-        predicate::str::contains("UNUSABLE (records_missing): the writer refuses this journal")
+        predicate::str::contains("UNUSABLE (dangling): the writer refuses this journal")
             .and(predicate::str::contains("CORRUPT: checkpoint_invalid")),
     );
     let out = command()

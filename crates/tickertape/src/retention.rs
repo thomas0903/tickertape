@@ -187,8 +187,8 @@ impl Report {
 ///
 /// [`Error::NotFound`] for an empty journal; [`Error::Corrupt`] or [`Error::UnsupportedVersion`] for an invalid
 /// header of a segment it reads (above), an invalid checkpoint position, or a candidate's invalid seal or chain; [`Error::Io`] for filesystem errors, including concurrent
-/// changes while observing the directory. An absent/invalid checkpoint slot yields an empty plan. A marker the writer
-/// refuses is an error, whatever the policy asks to remove: from 1.1 that includes one whose position the records of
+/// changes while observing the directory. An absent/invalid checkpoint slot yields an empty plan. With any limit set, a
+/// marker the writer refuses is an error, whatever the policy asks to remove: from 1.1 that includes one whose position the records of
 /// its segment do not reach ([`CorruptReason::DanglingCheckpoint`] at that segment and the marker's offset, as
 /// [`Writer::open`](crate::Writer::open) reports it; ADR 0056), for which it reads the record right before the
 /// marker's offset.

@@ -438,7 +438,7 @@ marker will name. Then restore the backup's `checkpoint` together with its segme
 does not have. The marker vouches for every record below its `next_seq`, so a marker newer than the segments covers
 records they lack. From 1.1 a writer refuses such a journal under every recovery policy, before it changes anything
 (`DanglingCheckpoint`, reported at the marker's segment and offset; ADR 0056); `status` reports it beforehand
-(`checkpoint.problem` `records_missing`, exit 2), retention and `tickertape archive` remove nothing from it and fail
+(`checkpoint.problem` `dangling`, exit 2), retention and `tickertape archive` remove nothing from it and fail
 with the writer's error, and readers and `verify` stop where the restored records end. (A marker at offset 64 of its
 segment whose predecessor lacks records is not detected by any of them except `verify` and readers: ADR 0056,
 amendment.) If the backup's marker is lost, see "After a crash" → Refused to open.
@@ -448,7 +448,7 @@ amendment.) If the backup's marker is lost, see "After a crash" → Refused to o
 - **Do not copy a journal a writer is using as a whole.** The files change during the copy, so it is no snapshot.
   Copying the segments before `checkpoint` is dangerous: the marker can cover records the copied segments lack. If the
   marker names a segment the copy lacks, the writer refuses the copy. If it points into a segment that was copied
-  earlier, `status` exits with 2 (from 1.1, `checkpoint.problem` `records_missing`; 1.0 could exit with 0), `verify` reports `EmptyCommitWord` where the copied records end (from 1.1, ADR
+  earlier, `status` exits with 2 (from 1.1, `checkpoint.problem` `dangling`; 1.0 could exit with 0), `verify` reports `EmptyCommitWord` where the copied records end (from 1.1, ADR
   0050), and the writer refuses the copy (from 1.1, ADR 0056: `DanglingCheckpoint` at that segment and the marker's
   offset; 1.0.0 opened it, continued at the marker's sequence number and left a hole that readers cannot pass). A sign of this is a `verify` `last_seq` + 1 lower than the checkpoint's `next seq` in
   `status`. Copying `checkpoint` first avoids that, but the records after the marker may be incomplete,
@@ -885,7 +885,7 @@ the writer or retention.
 - **Refused to open with `DanglingCheckpoint` at a segment and an offset** (from 1.1, under every policy; ADR 0056):
   the checkpoint marker's position lies beyond the records that segment holds, or the record right before it is
   damaged, so the marker vouches for records the journal lacks. Nothing was changed. `tickertape status` predicts this
-  refusal (`checkpoint.problem` `records_missing`, `tickertape_checkpoint_invalid` 1, exit 2), and retention, the
+  refusal (`checkpoint.problem` `dangling`, `tickertape_checkpoint_invalid` 1, exit 2), and retention, the
   writer's and `tickertape archive`'s, removes nothing from such a journal (it fails with the same error), so the
   segments the remedies below need stay. Run `tickertape verify` (it names where the records end, or the damaged
   record) and `tickertape inspect` or `status` (the marker's segment, offset and next sequence number). Then, in order

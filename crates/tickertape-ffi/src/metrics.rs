@@ -58,7 +58,7 @@ pub enum tickertape_checkpoint_problem {
     /// The records of the marker's segment do not reach the marker's position: the record right before its offset is
     /// missing, damaged, ends elsewhere or has another sequence number (or, at offset 64, `next_seq` is not the
     /// segment's base). Added in 1.1 (ADR 0056).
-    TICKERTAPE_CHECKPOINT_RECORDS_MISSING = 4,
+    TICKERTAPE_CHECKPOINT_DANGLING = 4,
     /// A problem this version of the C ABI does not name (not returned by a library built from one source tree).
     TICKERTAPE_CHECKPOINT_OTHER_PROBLEM = 255,
 }
@@ -525,7 +525,7 @@ pub(crate) fn checkpoint_problem_of(
             P::TICKERTAPE_CHECKPOINT_INVALID_SEGMENT_HEADER
         }
         Some(CheckpointProblem::InvalidOffset) => P::TICKERTAPE_CHECKPOINT_INVALID_OFFSET,
-        Some(CheckpointProblem::RecordsMissing) => P::TICKERTAPE_CHECKPOINT_RECORDS_MISSING,
+        Some(CheckpointProblem::Dangling) => P::TICKERTAPE_CHECKPOINT_DANGLING,
         // Added to the core after this mapping: never reported as usable.
         Some(_) => P::TICKERTAPE_CHECKPOINT_OTHER_PROBLEM,
     }

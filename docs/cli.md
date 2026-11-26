@@ -417,7 +417,7 @@ may grow:
  "segments":{"count":u64,"first_seq":u64,"total_bytes":u64,"oldest_created_unix_ns":u64|null,
              "before_checkpoint":u64},
  "checkpoint":{"generation":u64,"next_seq":u64,"segment_base_seq":u64,"offset":u64,
-               "problem":"missing_segment"|"invalid_segment_header"|"invalid_offset"|"records_missing"|null,
+               "problem":"missing_segment"|"invalid_segment_header"|"invalid_offset"|"dangling"|null,
                "modified_unix_ns":u64|null,"estimated_age_s":number|null,
                "age_unknown_reason":"no_modification_time"|"modification_time_in_future"|
                                     "modification_time_before_segment"|"marker_resized"|"marker_changing"|
@@ -448,7 +448,7 @@ With `--watch`, a sample that fails is the line
 
 `schema_version` is 1. Fields may be added without changing it; removing a field or changing its meaning bumps it.
 From 1.1 the sets of `checkpoint.problem` values and of breach `code`s may grow in a minor release (1.1 added
-`records_missing`): a consumer must treat a `problem` it does not know as a problem (the writer refuses the journal)
+`dangling`): a consumer must treat a `problem` it does not know as a problem (the writer refuses the journal)
 and a breach `code` it does not know as a breach (`health.corrupt` says whether it is corruption).
 With `--watch`, each sample is one line. `journal` is the canonical absolute path of the journal directory (if the
 directory doesn't exist when the command starts, the absolute path as given: the samples fail with `not_found`, a
@@ -474,10 +474,11 @@ not be established.
   `leftovers` line.
 - `checkpoint`: the marker's current slot, or null if no slot is valid. `problem` is set when the writer would refuse
   the marker: `missing_segment`, `invalid_segment_header` (its segment missing or with an invalid header),
-  `invalid_offset` (an offset outside the record area), or, from 1.1, `records_missing`: the records of its segment
+  `invalid_offset` (an offset outside the record area), or, from 1.1, `dangling`: the records of its segment
   do not reach its position (the record right before the marker's offset is missing, damaged, ends elsewhere or has
   another sequence number, or at offset 64 `next_seq` is not the segment's base: segments restored from a backup older
-  than the marker, or the last covered record damaged; ADR 0056). The sample runs the writer's own check on the same
+  than the marker, the last covered record damaged, or a marker that does not belong to these segments; ADR 0056; the
+  writer reports it as `DanglingCheckpoint`). The sample runs the writer's own check on the same
   record, so it reports exactly the markers the writer refuses; 1.0 reported most of them as healthy. Then `exposure`
   is unknown and `health.corrupt` is true; `verify` reports where the records end or the damaged record. `modified_unix_ns` is the marker file's modification time and
   `estimated_age_s` the time since then, by the observer's clock at the end of the sample; null with
