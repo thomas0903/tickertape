@@ -287,6 +287,10 @@ released with seven items open, accepted by the owner as known gaps
     since `fbe5785`. The 1.0.0 fixtures were added after the release, written by the released version. Measured operating limits are published for 64 B and 1,024 B
     ([`benchmarks.md`](benchmarks.md) → Operating envelope and remaining bottlenecks); known issues are in
     [`crash-contract.md`](crash-contract.md) → Known risks and limits.
+  - Since 1.0 (issue #61, [ADR 0047](decisions/0047-latency-histograms.md)): latency histograms in the library, the age
+    of records as a reader returns them, `tickertape age`, and opt-in histograms of the writer's appends, batches, rolls
+    and checkpoints, readable in the writer's process. Open: the bindings, and reading the writer's histograms from
+    another process and in `tickertape status`.
 
 **v1.0 release gate:** all milestones above are complete under their stated criteria, CI is green on Linux and
 macOS, the aarch64 checks pass, and no known unresolved issue violates the published safety, corruption-detection,

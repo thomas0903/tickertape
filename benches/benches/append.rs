@@ -13,7 +13,7 @@ use std::hint::black_box;
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
-use tickertape::{NewRecord, Reader, ReaderConfig, Writer, WriterConfig};
+use tickertape::{LatencyMode, NewRecord, Reader, ReaderConfig, Writer, WriterConfig};
 
 const BATCH: u64 = 16_384;
 
@@ -66,6 +66,46 @@ fn append(c: &mut Criterion) {
         group.finish();
     }
 }
+
+/// The same with the writer's latency histograms on (ADR 0047); `append/records/prefault` has them off.
+fn latency(c: &mut Criterion) {
+    let mut group = c.benchmark_group("append/latency");
+    group.sample_size(10);
+    group.throughput(Throughput::Elements(BATCH));
+    for mode in [LatencyMode::RollsAndCheckpoints, LatencyMode::All] {
+        for size in [64, 1024] {
+            let payload = vec![0x5a; size];
+            let record = NewRecord {
+                schema_id: 1,
+                venue_ts_ns: 0,
+                local_ts_ns: 0,
+                payload: &payload,
+            };
+            group.bench_with_input(
+                BenchmarkId::new(format!("{mode:?}"), size),
+                &record,
+                |b, record| {
+                    b.iter_batched_ref(
+                        || {
+                            let dir = tempfile::tempdir().expect("temp journal");
+                            let config = WriterConfig::default().latency(mode);
+                            let writer = Writer::open(dir.path(), config).expect("open writer");
+                            (writer, dir)
+                        },
+                        |(writer, _dir)| {
+                            for _ in 0..BATCH {
+                                black_box(writer.append(black_box(record)).expect("append"));
+                            }
+                        },
+                        BatchSize::PerIteration,
+                    );
+                },
+            );
+        }
+    }
+    group.finish();
+}
+
 /// Records per `append_batch` call in the `append/batch` group.
 const CHUNK: usize = 64;
 
@@ -142,5 +182,5 @@ fn spawn_reader(dir: &std::path::Path) -> thread::JoinHandle<()> {
     handle
 }
 
-criterion_group!(benches, append, batch);
+criterion_group!(benches, append, latency, batch);
 criterion_main!(benches);

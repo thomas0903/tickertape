@@ -40,10 +40,10 @@ wildcard arm. Methods are on docs.rs.
 
 | Module | Items |
 |---|---|
-| crate root | `Writer`, `Reader`, `Records`, `Record`, `OwnedRecord`, `NewRecord`, `Error` (NE), `CorruptReason` (NE), `Result`, `WriterConfig` (NE), `ReaderConfig` (NE), `Backoff` (NE), `RecoveryPolicy` (NE), `HelperCpus` (NE), `BatchError` (NE), `CheckpointProgress` (NE), `RecoveryAction` (NE), `RecoveryReport` (NE), `VERSION` |
+| crate root | `Writer`, `Reader`, `Records`, `Record`, `OwnedRecord`, `NewRecord`, `Error` (NE), `CorruptReason` (NE), `Result`, `WriterConfig` (NE), `ReaderConfig` (NE), `Backoff` (NE), `RecoveryPolicy` (NE), `HelperCpus` (NE), `LatencyMode` (NE, from 1.1), `BatchError` (NE), `CheckpointProgress` (NE), `RecoveryAction` (NE), `RecoveryReport` (NE), `VERSION` |
 | `clock` | `realtime_ns` |
 | `inspect` | `list_segments`, `read_checkpoint`, `verify`, `SegmentInfo` (NE), `SegmentReport` (NE), `SegmentEnd` (NE), `VerifyReport` (NE), `Problem` (NE) |
-| `latency` (from 1.1) | `Recorder`, `View`, `Snapshot`, `Bucket` (NE), `RecordAge`, `RecordAgeView`, `RecordAgeSnapshot` (NE) |
+| `latency` (from 1.1) | `Recorder`, `View`, `Snapshot`, `Bucket` (NE), `RecordAge`, `RecordAgeView`, `RecordAgeSnapshot` (NE), `WriterLatency` |
 | `retention` | `plan`, `apply`, `Policy` (NE), `Plan`, `PlannedSegment` (NE), `Action` (NE), `Reason` (NE), `Report` (NE) |
 | `seek_index` | `build`, `check`, `remove`, `DIR_NAME`, `BuildReport` (NE), `CheckReport` (NE), `SegmentIndex` (NE), `IndexState` (NE) |
 | `status` | `status`, `Sampler`, `ReaderBeacon`, `READERS_DIR`, `DEFAULT_BEACON_INTERVAL`, and the sample's types, all NE: `Status`, `Head`, `HeadEnd`, `Position`, `Cursor`, `Segments`, `CheckpointStatus`, `CheckpointProblem`, `AgeUnknown`, `Exposure`, `Storage`, `Rates`, `WriterProcess`, `BeaconState`, `BeaconDirState`, `BeaconReport`, `ReaderStatus`, `Lag`, `LagUnknown`, `WriterMetrics`, `Thresholds`, `Breach` |

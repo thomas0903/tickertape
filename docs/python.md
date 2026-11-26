@@ -95,7 +95,7 @@ w = writer.metrics()                 # in the writer's process: no system calls
   and the beacons, and calls `statvfs`; the metrics calls make no system calls. The Python bindings call the core crate
   directly (ADR 0029), not the C ABI.
 
-The latency histograms and record ages of the Rust crate (`tickertape::latency`, from 1.1, ADR
+The latency histograms (the writer's, too) and record ages of the Rust crate (`tickertape::latency`, from 1.1, ADR
 [0047](decisions/0047-latency-histograms.md)) are not available from Python yet; `tickertape age` (see [`cli.md`](cli.md))
 reports ages from the command line.
 

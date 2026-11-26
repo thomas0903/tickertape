@@ -31,6 +31,7 @@ use std::time::Instant;
 use crate::error::{Error, Result};
 use crate::format::{self, CheckpointSlot};
 use crate::journal::{self, CHECKPOINT_FILE};
+use crate::latency::Durable;
 use crate::mmap::{self, Flush, NotifyPublisher};
 use crate::retention::{Action, Policy, Report};
 
@@ -194,6 +195,8 @@ pub(crate) struct Job {
     pub(crate) segments: DirtySegments,
     /// Directories whose entries changed before the request.
     pub(crate) dirs: BTreeSet<PathBuf>,
+    /// When the earliest request this job covers was made, if the writer measures it ([`Context::durable`]).
+    pub(crate) requested_at: Option<Instant>,
 }
 
 impl Job {
@@ -205,12 +208,13 @@ impl Job {
     }
 
     /// Extends this job, which has not started, by a later request's job: one checkpoint then covers both, with this
-    /// job's generation and the later job's frontier.
+    /// job's generation and the later job's frontier (and counts from this one's request).
     pub(crate) fn absorb(&mut self, later: Job) {
         for seg in later.segments.list {
             self.segments.push_or_extend(seg);
         }
         self.dirs.extend(later.dirs);
+        self.requested_at = self.requested_at.or(later.requested_at);
         self.slot = CheckpointSlot {
             generation: self.slot.generation,
             ..later.slot
@@ -249,6 +253,17 @@ pub(crate) struct Context {
     pub(crate) notify: Option<NotifyPublisher>,
     /// Segment sizes kept between this writer's retention runs (ADR 0051). Only a retention run takes it.
     pub(crate) retention_sizes: Mutex<crate::retention::Sizes>,
+    /// Records the time from a checkpoint's request to its durable marker, if the writer measures it (ADR 0047).
+    pub(crate) durable: Option<Durable>,
+}
+
+impl Context {
+    /// Records that a checkpoint requested at `requested_at` was durable at `finished`.
+    pub(crate) fn record_durable(&self, requested_at: Option<Instant>, finished: Instant) {
+        if let (Some(durable), Some(requested_at)) = (&self.durable, requested_at) {
+            durable.record(finished.saturating_duration_since(requested_at));
+        }
+    }
 }
 
 /// Which thread runs a job: the fault-injection points differ (thread-local on the writer's thread).
@@ -614,9 +629,12 @@ fn run_thread(shared: &Shared, ctx: &Context, retention: Option<&(Policy, Action
         let finished = Instant::now();
         let bytes = job.bytes();
         let covered = job.segments.iter().count();
+        let requested_at = job.requested_at;
         drop(job);
         match outcome {
             Ok(slot) => {
+                // Before the result is posted: who sees the checkpoint finished also finds the sample.
+                ctx.record_durable(requested_at, finished);
                 post(shared, &mut lock(&shared.state), |s| {
                     s.done = Some((slot, finished));
                     s.running = Some(0);
@@ -691,6 +709,7 @@ mod tests {
             },
             segments,
             dirs: BTreeSet::new(),
+            requested_at: None,
         }
     }
 

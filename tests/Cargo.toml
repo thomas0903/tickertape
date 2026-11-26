@@ -133,6 +133,10 @@ name = "record_age"
 path = "record_age.rs"
 
 [[test]]
+name = "writer_latency"
+path = "writer_latency.rs"
+
+[[test]]
 name = "seek"
 path = "seek.rs"
 
