@@ -543,7 +543,8 @@ impl Reader {
     /// The call reads at most the newest segment (from the checkpoint marker's position if the marker points into
     /// it, otherwise from its start) and any segments the writer rolls to meanwhile, validating every record it
     /// reads; records before that are not read, so damage in them is not noticed. A durable-only reader starts at
-    /// the marker's position. If the writer keeps committing as fast as the reader validates, the call runs until it
+    /// the marker's position, in the newest segment whose base is at or below the marker's `next_seq`, and opens no
+    /// later name. If the writer keeps committing as fast as the reader validates, the call runs until it
     /// catches up. If there is no valid marker when the call reads it, no record is covered, and a durable-only reader
     /// is placed at the first record of the oldest segment.
     ///
@@ -556,7 +557,11 @@ impl Reader {
     /// [`Error::Io`] as for [`Reader::open`] and [`Reader::try_next`]; [`Error::Discarded`] if the segment was
     /// replaced or removed on each of 8 attempts in a row. Its `seq` is where the call was reading, not the reader's
     /// position, which is [`Reader::position`] as before the call. A durable-only reader also returns [`Error::Io`] if
-    /// the marker can't be read.
+    /// the marker can't be read. A file named like a segment without a valid header where the call starts (for a
+    /// visible reader the newest name, even an empty or foreign file: a "stray") is [`Error::Corrupt`] naming that
+    /// file, as at [`Reader::open`], not skipped: a healthy journal has no such file, and it is what damage to the newest
+    /// segment's header looks like ([`inspect::verify`](crate::inspect::verify) reports it; a writer's recovery or
+    /// removing the file clears it; ADR 0046, note of 2026-11-27).
     ///
     /// ```no_run
     /// # use tickertape::{Reader, ReaderConfig};
