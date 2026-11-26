@@ -13,9 +13,11 @@ Think of it as a flight recorder for a trading system or any other latency-sensi
 - Any number of **readers**, in other processes, follow the journal live or **replay** it from any sequence number.
   Readers take no lock and write nothing the writer waits for. A reader can spin, poll or block. A blocking reader
   sleeps in the kernel and the writer wakes it (futex on Linux, `os_sync_wait_on_address` on macOS 14.4+; elsewhere it
-  polls), which costs the writer a wake-up system call for each record the reader blocked for: on `main` after 1.0.0,
-  an `append` p50 of 1.5 µs beside a blocking reader against 0.117 µs beside a spinning one (64 B at 20,000 records/s
-  on an x86-64 cloud VM; [`docs/benchmarks.md` → readers that block](docs/benchmarks.md#readers-that-block-the-rule-added-after-review-x86-64)).
+  polls): the writer makes one wake-up system call when it publishes (an append, or a whole batch) while a reader is
+  registered to wait, and several waiters share the call. Measured after 1.0.0 on an x86-64 cloud VM with one blocking
+  safe reader at 20,000 records/s of 64 B, the writer's `append` p50 was about 1.5 µs (1.5 and 1.52 in the two builds
+  measured) against 0.117 µs beside a spinning reader
+  ([`docs/benchmarks.md` → readers that block](docs/benchmarks.md#readers-that-block-the-rule-added-after-review-x86-64)).
   A spinning or polling reader costs the writer no system call.
 - Data lives in fixed-size **segment files** that roll over. Segments are never deleted automatically unless
   you configure a retention policy; `tickertape archive` can move or delete old, checkpoint-covered segments.
@@ -43,40 +45,53 @@ readers, retained and replayable files, rolling, and easy inspection. tickertape
 tickertape was measured against Chronicle Queue, Aeron IPC, yaque, queue-file and a plain file with the comparison suite
 in [`compare/`](compare/README.md), in one 24-hour session per machine on two **Google Cloud virtual machines, not bare
 metal** (2026-11-25 and 26): x86-64 `c4-standard-16-lssd` (Xeon 6985P-C) and aarch64 `c4a-standard-8-lssd`
-(Neoverse-V2), Ubuntu 24.04, ext4 and xfs on local NVMe SSDs. The library is the **v1.0.0** release; changes merged
-since are not in these figures. Every table (with the xfs, unpinned and tuned rows), the failed cell and the caveats are
-in [`docs/benchmarks.md` → comparison rerun at
+(Neoverse-V2), Ubuntu 24.04, ext4 and xfs on local NVMe SSDs. The session commit is `fb2d91b0`, whose library is
+identical to the **v1.0.0** release; changes merged since are not in these figures. Every table (with the xfs, unpinned
+and tuned rows), the failed cell and the caveats are in [`docs/benchmarks.md` → comparison rerun at
 v1.0.0](docs/benchmarks.md#2026-11-25-to-2026-11-26-comparison-rerun-at-v100-google-cloud-vms-linux-x86-64-and-aarch64).
-The figures describe these machines in that session; they are not guarantees. The older bare-metal figures (v0.4.0 and
-v0.3.0, measured with the earlier harness) are in
+Ranges are min–max of the runs; values are rounded half up to three significant digits (two decimals for million
+records/s). The figures describe these machines in that session; they are not guarantees. The older bare-metal figures
+(v0.4.0 and v0.3.0, measured with the earlier harness) are in
 [`docs/benchmarks.md`](docs/benchmarks.md#2026-11-02-v040-on-bare-metal-linux-aws-z1dmetal), superseded by this rerun.
 
+**The result is mixed.** tickertape led the 64 B append bursts on both machines and file systems; Chronicle Queue led
+warm replay in three of four pinned ext4 cells and had the lower reader latency at 10,000 records/s; Aeron IPC had the
+lowest observed latency at 100,000 records/s; and the ten-minute ranking changed with the file system.
+
 **Configuration.** Each measured writer and reader thread was pinned to a CPU of its own, and every other thread of the
-tools to the remaining CPUs. Chronicle Queue 2026.8 (open source) and Aeron 1.54.0 ran on OpenJDK 21 with a warm-up
-through their measured loops in every process (3 × 1,200,000 and 8 × 20,000 records); Chronicle with a 1 GiB `blockSize`
-and `microTouch()` in its writer's busy-wait (its pretoucher is Enterprise-only); Aeron IPC with non-sparse, pre-touched
-term buffers and busy-spinning driver threads. tickertape ran with its defaults (on Linux, prefaulting 256 KiB ahead and
-early write-back). It has two readers: the zero-copy `Reader::open_mapped` (`unsafe`) and the safe `Reader::open`
+tools to the remaining CPUs; every reader busy-polls. Chronicle Queue 2026.8 (open source) and Aeron 1.54.0 ran on
+OpenJDK 21 with a 256 MiB heap and ParallelGC, asynchronous JVM logging on, and a warm-up through their measured loops
+in every process (3 × 1,200,000 and 8 × 20,000 records). Chronicle used a 1 GiB `blockSize` and `microTouch()`, which
+touches the next mapped data page while a paced writer waits, so W1 and the unpaced probe get nothing from it (its
+pretoucher is Enterprise-only). Aeron IPC used non-sparse, pre-touched term buffers and dedicated busy-spinning driver
+threads, a larger CPU budget than the file-based tools'. tickertape ran with its defaults: on Linux, prefaulting 256 KiB
+ahead and early write-back (a helper thread starts the kernel's write-back of filled pages with `sync_file_range` as the
+writer moves on). It has two readers: the zero-copy `Reader::open_mapped` (`unsafe`) and the safe `Reader::open`
 (`pread`). [`compare/README.md`](compare/README.md) says what each setting does and why. The tools promise different
-things: Aeron IPC keeps nothing on disk and cannot replay, yaque is a consuming single-reader queue, queue-file allows
-no concurrent reader, and the plain file has no checksum or recovery.
+things: Aeron IPC writes no durable journal and this adapter has no Archive replay (its term buffers were memory-mapped
+files on the file system under test, so the kernel wrote them back to that disk); yaque is a consuming single-reader
+queue; queue-file's upstream API forbids concurrent process access; and the plain-file adapter has no checksum or
+crash-recovery protocol.
 
 **The earlier comparison handicapped Chronicle Queue**, as a reader who knows it pointed out: a short warm-up, the
 default 64 MiB `blockSize`, no `microTouch()`, no pinning, and, in the ten-minute runs, tools measured in different
 sessions. The rerun also ran Chronicle with those old settings (pinned, in the new harness). On x86-64 its reader's
 p99.9 at 1,024 B × 10,000 records/s was 34.8–36.8 µs with them, 2.35–2.51 µs with only `microTouch()` added, and
 2.36–2.82 µs with the new settings in three of four runs (15.75 ms in the fourth); it appended and replayed faster with
-the new settings in every cell. Against the old settings tickertape's zero-copy reader had the lower p99.9 at 1,024 B on
-both machines; against the new ones Chronicle's is lower (at x86-64 1,024 B × 10,000 records/s in three of its four
-runs).
+the new settings in every cell. In five reader-latency cells the order against tickertape's zero-copy reader changed:
+tickertape was lower than Chronicle's old-settings p99.9 in all five and is higher than the new one in all five (at
+x86-64 1,024 B × 10,000 records/s in three of Chronicle's four runs). One of them: x86-64, 64 B × 10,000 records/s,
+tickertape 2.17–2.35 µs, Chronicle 2.45–3.51 µs old and 1.68–1.83 µs new.
 
 ### Short runs (ext4, pinned)
 
-n = 4 per cell (two rounds of two runs, the rounds 33 to 192 minutes apart depending on the tool); min–max.
+n = 4 per cell: two rounds of two runs, the rounds 43 to 192 minutes apart depending on the tool.
 
-**Throughput**, million records/s, higher is better. W1 appends 1,000,000 records of 64 B or 100,000 of 1,024 B, from an
-empty directory (cold) or into files opened before the timer (steady); W3 replays them from a warm page cache in a new
-process.
+**Throughput**, million records/s, higher is better. W1 appends 1,000,000 records of 64 B or 100,000 of 1,024 B as fast
+as possible: cold from an empty directory, with the open inside the timer; steady into files opened before the timer and
+primed with 1,000 records. Both timers stop before the final flush, so W1 is visible, not durable, append throughput,
+and a 64 B burst lasts tens of milliseconds, so one stall widens a range (tickertape's 19.11–30.84). W3 replays the
+records from a warm page cache in a new process.
 
 | | x86-64, 64 B | x86-64, 1,024 B | aarch64, 64 B | aarch64, 1,024 B |
 |---|---|---|---|---|
@@ -91,8 +106,9 @@ process.
 
 yaque, queue-file and the plain file appended more slowly than both journals in every W1 cell.
 
-**Reader latency, p99.9 in µs** from each record's scheduled send to its read, lower is better: 1,000,000 records
-measured after 100,000 unmeasured ones, sent on schedule and never skipped.
+**Reader latency, p99.9 in µs**, lower is better: the time from each record's scheduled send to the reader's validated
+read, over 1,000,000 records measured after 100,000 unmeasured ones. A send that starts late (more than 1 µs after its
+scheduled time) still runs, and its delay counts in the latency.
 
 | | tickertape, zero-copy | tickertape, safe | Chronicle Queue | Aeron IPC | plain file |
 |---|---|---|---|---|---|
@@ -109,98 +125,149 @@ yaque's p99.9 was 5.76 µs to 18.30 ms in these cells; p50, p99, maxima and late
 
 ### Ten-minute runs (ext4, pinned)
 
-n = 1 per round; each cell shows round 1; round 2. The probe is unpaced, with a reader following: it is the only row in
-which every tool answers the same question. SV and SD are paced at **half of each tool's own probe in the same round**
-(SV without syncs, SD with the tool's sync every second), so each tool runs at a different rate: read them as "at half
-of its own maximum", not as the same load. Aeron IPC has no sync, so no SD row.
+n = 1 per round; each cell shows round 1; round 2. The **probe** is unpaced, with a reader following: it is the only row
+in which every tool answers the same question, and at 1,024 B it measures the disk rather than the tool (below). **SV**
+(sustained visibility: paced, no syncs) and **SD** (sustained durability: the same with the tool's sync every second, on
+the writer's thread) are paced at **half of each tool's own probe in the same round**, so each tool runs at its own
+target rate, printed in the table: read them as "at half of its own maximum", not as the same load. tickertape ran its
+zero-copy reader and, in SD, the blocking `Writer::checkpoint()`. Aeron IPC has no sync, so no SD row.
 
 | | x86-64, 64 B | x86-64, 1,024 B | aarch64, 64 B | aarch64, 1,024 B |
 |---|---|---|---|---|
 | Probe, records/s: tickertape | 3,543,632; 3,529,856 | 346,382; 345,534 | 3,458,048; 3,466,622 | 338,179; 337,424 |
 | Probe: Chronicle Queue | 3,061,325; 2,952,843 | 350,374; 349,231 | 2,570,572; 2,575,258 | 343,736; 341,297 |
-| Probe: Aeron IPC (no journal) | 7,206,880; 6,489,247 | 4,175,027; 4,036,635 | 3,246,052; 3,820,950 | 2,776,684; 2,796,872 |
+| Probe: Aeron IPC | 7,206,880; 6,489,247 | 4,175,027; 4,036,635 | 3,246,052; 3,820,950 | 2,776,684; 2,796,872 |
+| SV and SD target, records/s: tickertape | 1,771,815; 1,764,927 | 173,190; 172,766 | 1,729,024; 1,733,310 | 169,089; 168,712 |
+| Target: Chronicle Queue | 1,530,662; 1,476,421 | 175,186; 174,615 | 1,285,285; 1,287,628 | 171,867; 170,648 |
+| SV target: Aeron IPC | 3,603,440; 3,244,623 | 2,087,513; 2,018,317 | 1,623,026; 1,910,474 | 1,388,341; 1,398,435 |
 | SV reader p99.9 (max): tickertape | 642 µs (1.69 ms); 654 µs (1.56 ms) | 504 µs (1.40 ms); 508 µs (1.38 ms) | 501 µs (1.47 ms); 697 µs (23.81 ms) | 323 µs (1.14 ms); 401 µs (7.83 ms) |
 | SV: Chronicle Queue | 102.69 ms (135.53 ms); 100.01 ms (136.05 ms) | 100.27 ms (135.40 ms); 98.44 ms (139.59 ms) | 91.82 ms (134.09 ms); 89.98 ms (133.37 ms) | 91.42 ms (162.92 ms); 99.48 ms (135.53 ms) |
 | SV: Aeron IPC | 36.24 ms (78.38 ms); 34.96 ms (80.41 ms) | 107.41 ms (125.96 ms); 99.16 ms (119.14 ms) | 26.02 ms (167.64 ms); 14.72 ms (78.77 ms) | 84.28 ms (166.20 ms); 80.61 ms (159.65 ms) |
-| SD sync, median (max): tickertape | 2.95 ms (4.21 ms); 2.34 ms (3.80 ms) | 2.99 ms (4.11 ms); 2.29 ms (3.81 ms) | 1.38 ms (2.36 ms); 1.49 ms (41.94 ms) | 1.39 ms (2.39 ms); 1.40 ms (76.55 ms) |
-| SD sync: Chronicle Queue | 361.50 ms (404.49 ms); 348.65 ms (413.66 ms) | 516.16 ms (592.97 ms); 514.33 ms (527.96 ms) | 302.78 ms (325.84 ms); 303.82 ms (540.02 ms) | 506.99 ms (845.15 ms); 502.79 ms (514.33 ms) |
+| SD, tickertape checkpoint, median (max) | 2.95 ms (4.21 ms); 2.34 ms (3.80 ms) | 2.99 ms (4.11 ms); 2.29 ms (3.81 ms) | 1.38 ms (2.36 ms); 1.49 ms (41.94 ms) | 1.39 ms (2.39 ms); 1.40 ms (76.55 ms) |
+| SD, Chronicle Queue synchronous store flush, median (max) | 361.50 ms (404.49 ms); 348.65 ms (413.66 ms) | 516.16 ms (592.97 ms); 514.33 ms (527.96 ms) | 302.78 ms (325.84 ms); 303.82 ms (540.02 ms) | 506.99 ms (845.15 ms); 502.79 ms (514.33 ms) |
 | SD reader p99.9: tickertape | 2.39 ms; 1.83 ms | 2.11 ms; 1.55 ms | 989 µs; 1.80 ms | 837 µs; 1.60 ms |
 | SD reader p99.9: Chronicle Queue | 369.62 ms; 352.06 ms | 515.64 ms; 513.80 ms | 302.78 ms; 381.68 ms | 621.28 ms; 502.27 ms |
 
-**Durability is not the same operation in every tool's SD row.** tickertape's checkpoint is `msync` and `fdatasync` of
-the written data, then the checkpoint marker and its own `fdatasync`, and it gives readers a durable position; Chronicle
-Queue's sync is `ExcerptAppender.sync` with `SyncMode.SYNC` (`msync(MS_SYNC)` of its store). Neither was tested for
-power loss here.
+**Durability is not the same operation in every tool's SD row.** A tickertape checkpoint on Linux `msync`s the mapped
+ranges it still holds, `fdatasync`s the segment files and `fsync`s new directory entries, then writes the checkpoint
+marker and `fdatasync`s it; it gives readers a durable position. Chronicle Queue's is `ExcerptAppender.sync` with
+`SyncMode.SYNC`, a synchronous `msync(MS_SYNC)` of its store. Neither was tested for power loss here.
 
 ### Where tickertape is ahead, and where it is behind
 
 **Ahead in these runs:**
 
-- Appending 64 B records, on both machines and both file systems (W1 cold: 19.11–30.84 against Chronicle Queue's
+- **Appending 64 B records**, on both machines and both file systems (W1 cold: 19.11–30.84 against Chronicle Queue's
   8.47–8.53 million records/s on x86-64, 10.46–10.56 against 5.49–5.53 on aarch64), and 1,024 B records on aarch64 ext4
   (4.02–4.20 against 2.76–2.83).
-- Reader p99.9 at 64 B × 100,000 records/s against Chronicle Queue (2.27–5.96 against 11.8–15.3 µs on x86-64, 1.88–2.08
-  against 7.85–13.3 µs on aarch64); Aeron's range overlaps tickertape's there (0.39–3.47 and 0.62–3.03 µs).
-- Unpaced 64 B on ext4 (3,529,856–3,543,632 against Chronicle's 2,952,843–3,061,325 records/s on x86-64,
-  3,458,048–3,466,622 against 2,570,572–2,575,258 on aarch64).
-- At half of each tool's own rate on ext4: reader p99.9 of 323–697 µs against Chronicle Queue's 89.98–102.69 ms and
-  Aeron's 14.72–107.41 ms; with a sync every second, a checkpoint median of 1.38–2.99 ms against Chronicle's sync median
-  of 302.78–516.16 ms. These are different absolute rates for each tool (the table above).
+- **Reader p99.9 at 64 B × 100,000 records/s** (pinned, ext4, zero-copy reader) against Chronicle Queue: 2.27–5.96
+  against 11.8–15.3 µs on x86-64, 1.88–2.08 against 7.85–13.3 µs on aarch64. Aeron's range overlaps tickertape's there
+  (0.39–3.47 and 0.62–3.03 µs). On x86-64 xfs (n = 2) the ranges overlap Chronicle's (2.21–6.62 against 4.11–6.00), and
+  the safe reader is above it (5.26–8.31).
+- **Unpaced 64 B on ext4**: 3,529,856–3,543,632 against Chronicle's 2,952,843–3,061,325 records/s on x86-64,
+  3,458,048–3,466,622 against 2,570,572–2,575,258 on aarch64.
+- **Ten-minute runs on ext4, each tool at half of its own rate** (the targets in the table). tickertape's reader p99.9
+  was 323–697 µs in SV, against Chronicle Queue's 89.98–102.69 ms (88.08–98.63 ms with its old settings). Read this as
+  an observation about ext4 rather than about Chronicle's reader (it was not traced): the plain file, which also has no
+  early write-back, showed a tail of the same size at 1,024 B (87.43–96.93 ms), and on xfs Chronicle's tail was
+  10.6–25.1 µs in three of four cells (below). In SD a tickertape checkpoint took 1.38–2.99 ms (median; maxima
+  2.36–76.55 ms) and Chronicle's synchronous store flush 302.78–516.16 ms (median; 97.98–119.87 ms with its old
+  settings). That is not the same work: tickertape's early write-back starts writing each MiB as soon as the writer has
+  passed it, so when the checkpoint starts most of the second's data is already on its way to the device, while
+  Chronicle's `msync` writes it then, on the writer's thread (its `bgMicroTouch()` was not used); one second of
+  Chronicle's 1,024 B records at its target is at least 182 MB (payload and envelope), about 0.52 s at the disk's 351
+  MB/s. A tickertape checkpoint without early write-back became durable 0.93 s after its request at about 90 % of the
+  device's rate, in later tickertape-only runs (the disk section cited below). The local SSDs of these machine types
+  reported a write-through cache in other sessions (this one did not record it); if that held here, no sync paid for a
+  drive-cache flush. Aeron's SV figures are in the paragraph on settings below.
 
 **Behind or level in these runs:**
 
-- **Replay.** Chronicle Queue replayed faster than both of tickertape's readers on x86-64 at both sizes (64 B:
+- **Replay.** On ext4 Chronicle Queue replayed faster than both of tickertape's readers on x86-64 at both sizes (64 B:
   35.57–36.77 against 20.85–26.41 zero-copy and 31.01–32.77 safe) and on aarch64 at 1,024 B (15.31–17.12 against
   10.05–10.36 and 6.26–6.53); at 64 B on aarch64 the ranges overlap. yaque's scan of its queue was faster than
   tickertape's zero-copy reader at 64 B on x86-64 (28.89–29.61) and than its safe reader at 1,024 B on x86-64
   (7.38–7.44).
-- **Appending 1,024 B on x86-64**: the ranges overlap Chronicle's on ext4 (cold 2.61–3.08 against 2.82–2.87, steady
-  2.92–3.06 against 2.93–3.04); on xfs Chronicle was ahead (cold 3.48–3.53 against 2.61–2.73, n = 2).
-- **Reader p99.9 at 10,000 records/s**: Chronicle Queue lower in all four cells (at x86-64 1,024 B in three of its four
-  runs; aarch64, 64 B: 0.73–0.78 against 2.87–3.46 µs). **At 1,024 B × 100,000 records/s** Chronicle lower (23.9–24.6
+- **Appending 1,024 B.** On x86-64 ext4 the ranges overlap Chronicle's (cold 2.61–3.08 against 2.82–2.87, steady
+  2.92–3.06 against 2.93–3.04). On xfs (n = 2) Chronicle was ahead in W1 steady on both machines (x86-64 3.73–3.76
+  against 2.71–2.90, aarch64 4.08–4.11 against 3.99–4.04) and in W1 cold on x86-64 (3.48–3.53 against 2.61–2.73);
+  tickertape was ahead in W1 cold on aarch64 xfs (3.90–3.91 against 3.70–3.72). On the tuned x86-64 boot (ext4, n = 2)
+  Chronicle was ahead cold (2.93–2.97 against 2.58–2.64) and steady (3.12–3.14 against 2.65–2.67).
+- **Reader p99.9 at 10,000 records/s.** Chronicle Queue was lower in three of the four cells, and in three of four runs
+  in the fourth (x86-64, 1,024 B; its fourth run, 15.75 ms, was above both tickertape readers; an `unpinned` run had
+  25.74 ms). Aeron was lower than the zero-copy reader at 1,024 B on both machines (3.26–3.64 against 4.60–6.84 µs;
+  4.57–5.96 against 8.73–9.10), and the plain file's ranges overlapped it there (5.89–6.02; 8.39–8.79).
+- **Reader p99.9 at 100,000 records/s.** Aeron had the lowest observed p99.9 in all four cells; its whole range was
+  below tickertape's at 1,024 B and overlapped it at 64 B. At 1,024 B Chronicle was lower than tickertape (23.9–24.6
   against 28.6–29.8 µs on x86-64, 14.5–16.3 against 24.8–28.5 on aarch64), and the plain file too (9.85–11.3 and
-  14.4–14.7). Aeron's ranges are the lowest at 100,000 records/s.
-- **xfs, ten-minute runs** (n = 1): Chronicle Queue's reader p99.9 at half its rate was lower than tickertape's in three
-  of four cells (aarch64, 64 B: 10.6 against 382 µs; x86-64, 1,024 B: 25.1 against 284 µs; aarch64, 1,024 B: 11.1
-  against 201 µs); tickertape's maxima were lower in all four (1.19–2.47 ms against 4.84–38.04 ms).
-- **Aeron IPC**, which writes no journal, ran 6,489,247–7,206,880 records/s of 64 B unpaced on x86-64 and
-  2,776,684–4,175,027 of 1,024 B on both machines: eight to twelve times tickertape's 1,024 B rate, which is the disk's.
-- **At 90 % of its own rate with a checkpoint every second** (n = 1 per machine and file system) tickertape stalls: its
-  reader's p99.9 was 49.64 ms to 1.17 s at 64 B and 1.66 ms to 1.39 s at 1,024 B. Chronicle Queue's 64 B run failed
-  (below); at 1,024 B its reader's p99.9 was 3.07–18.71 s.
-- **On the tuned x86-64 boot** (isolated CPUs, but not interrupt-free: tens of millions of TLB-shootdown interrupts per
-  hour reached the writer's CPU), tickertape's unpaced 64 B rate was 2,387,955 records/s against Chronicle's 3,056,715
-  (n = 1).
+  14.4–14.7).
+- **Reader latency on xfs** (n = 2), with larger gaps: aarch64 1,024 B × 100,000/s, tickertape 38.8–40.8 µs against
+  Chronicle 3.36–5.40 and the plain file 23.2–23.6; aarch64 1,024 B × 10,000/s, 11.6–12.7 against 2.98–4.27; aarch64 64
+  B × 10,000/s, 5.07–5.34 against 0.75–0.81; x86-64 1,024 B × 100,000/s, 25.5–26.4 against 15.6–15.7.
+- **Maximum latency at 1,024 B** (ext4): tickertape's zero-copy reader had a maximum of 993 µs to 1.32 ms in every run;
+  at 100,000/s Chronicle's maxima were 178–550 µs, Aeron's 38.5–129 µs and the plain file's 101–142 µs.
+- **Unpaced at 1,024 B**: Chronicle's rate was above tickertape's in all ten pinned pairs of probes (both machines and
+  file systems, every part), by 0.6–1.6 %, and the plain file's later single probes too (348,781 and 342,397 records/s).
+  At 64 B on x86-64 xfs the two were level (3,519,690 and 3,543,512 against 3,493,704 and 3,517,607); Aeron's 64 B rate
+  beat tickertape's on aarch64 in round 2 (3,820,950 against 3,466,622); and in the x86-64 64 B ext4 probes Chronicle's
+  reader p99.9 was lower (6.50–6.53 against 8.34–8.63 µs). yaque's 1,024 B probes (685,628 and 496,821) stopped at their
+  record cap after 327 and 451 s.
+- **Ten-minute runs on xfs** (n = 1): Chronicle Queue's reader p99.9 at half its rate was lower than tickertape's in
+  three of four cells (aarch64, 64 B: 10.6 against 382 µs; x86-64, 1,024 B: 25.1 against 284 µs; aarch64, 1,024 B: 11.1
+  against 201 µs); in the fourth (x86-64, 64 B, targets 1,759,845 and 1,758,803) tickertape's was 432 µs against 33.31
+  ms. tickertape's maxima were lower in all four (1.19–2.47 ms against 4.84–38.04 ms).
+- **At 90 % of its own rate with a checkpoint every second** (n = 1 per machine and file system), tickertape stalled at
+  64 B on both machines (reader p99.9 49.64 ms on x86-64 ext4, 175.37 ms on x86-64 xfs, 267.12 ms on aarch64 ext4, 1.17
+  s on aarch64 xfs) and at 1,024 B on aarch64 (123.40 ms on ext4, 1.39 s on xfs), but not at 1,024 B on x86-64 (2.13 and
+  1.66 ms). Reader p99.9 is the delay from scheduled send to read and does not say where the delay arose. Chronicle
+  Queue's 64 B run failed (below); at 1,024 B it did not hold its schedule either (x86-64 ext4: 307,301 of 315,324
+  records/s, 99.5 % of sends late, 293 syncs and 332 missed sync grid points), and its reader's p99.9 was 3.07–18.71 s.
+- **On the tuned x86-64 boot** (n = 1), tickertape's unpaced 64 B rate was 2,387,955 records/s, against Chronicle's
+  3,056,715 and its own pinned 3,529,856–3,543,632. The isolated CPUs were not interrupt-free: in the ten minutes
+  captured inside tickertape's tuned short unit, the writer's CPU received 1,942,342 TLB-shootdown interrupts; their
+  source was not traced and may be the tool's own write-back.
+- **Aeron IPC** reached 6,489,247–7,206,880 records/s of 64 B unpaced on x86-64 and 2,776,684–4,175,027 of 1,024 B on
+  both machines, eight to twelve times tickertape's 1,024 B rate.
 
-**The new settings did not help the JVM tools in every sustained row.** With the old settings (one run per machine,
-hours later, at their own old-settings rates) Chronicle Queue's sync median was 97.98–119.87 ms (302.78–516.16 ms with
-the new ones) and Aeron's SV reader p99.9 at 64 B was 4.66–6.32 µs (14.72–36.24 ms). Which setting does it was not
-measured. Their unpaced probes, the rows that can be compared, moved less: Aeron's 1,024 B probe on aarch64 was
-2,451,881 records/s with the old settings against 2,776,684–2,796,872, Chronicle's within the new-settings rounds or up
-to 2.6 % above them.
+**The JVM tools' sustained figures were worse with the new settings.** Aeron IPC's SV reader p99.9 on ext4 was
+14.72–107.41 ms at half its own rate (the targets in the table). In the sustained rows both JVM tools' figures were
+worse with the new settings than in the later single runs with the old ones: Chronicle Queue's SD flush median
+302.78–516.16 ms against 97.98–119.87 ms, its SD reader p99.9 302.78–621.28 ms against 168.95–177.08 ms, Aeron's 64 B SV
+reader p99.9 14.72–36.24 ms against 4.66–6.32 µs. The two configurations differ in five settings and in JVM logging, and
+the old-settings runs were hours later, single, and at their own rates; which difference does it was not measured. Their
+unpaced probes moved less: Chronicle's old-settings probes were within its two new-settings probes or up to 2.6 % above
+their upper end, Aeron's within them except at 1,024 B on aarch64 (2,451,881 against 2,776,684–2,796,872).
 
-**The failed cell.** Chronicle Queue's run at 90 % of its probe with 64 B records and a sync every second failed twice
-on both machines and both file systems: its reader had not received every record about 120 s after the end of the
-schedule (`IllegalStateException: reader timed out`). It is published as failed; there is no latency figure for it.
+**The failed cell.** Chronicle Queue's SD run at 90 % of its probe with 64 B records: in each of the four machine and
+file-system combinations both attempts failed (eight attempts). The harness's reader reached its deadline, about 120 s
+after the end of the schedule, before it had seen every scheduled record (`IllegalStateException: reader timed out`);
+`children.log` has no other error (the writer's result is empty because the run was stopped), and the cause was not
+established. It is published as failed; there is no latency figure for it.
 
 **Standing caveats.** Cloud VMs with a hypervisor and rate-capped local SSDs (351 MB/s each), not bare metal; one
 session per machine; the v1.0.0 library, not `main`; min–max of n = 4, 2 or 1; SV and SD at a different absolute rate
-for each tool; the parts with one round ran in a fixed order with tickertape first.
+for each tool; the single-round parts used a fixed tool order, and on xfs tickertape ran first on a freshly made file
+system and Chronicle followed on the same one.
 
 ### Near the disk's limit
 
-At 1,024 B the unpaced rates of tickertape and Chronicle Queue (337,424–351,012 records/s, 345.5–359.4 MB/s of payload)
-are about the limit of the disk: each of these local SSDs writes at most 351 MB/s by itself (`fio`;
-[`docs/benchmarks.md` → how much of the limit is the
+At 1,024 B the unpaced rates of tickertape and Chronicle Queue in the table (337,424–350,374 records/s, 345.5–358.8 MB/s
+of payload) are about the limit of the disk. Payload accepted and bytes written to the device are different things: each
+of these local SSDs writes at most 351 MB/s by itself (the average of separate raw-device `fio` jobs), and an unpaced
+run holds gigabytes of written but not yet written-back pages in the page cache (up to 5.1–5.4 GiB on aarch64 and
+10.1–10.2 GiB on x86-64 during 70 s unpaced runs; [`docs/benchmarks.md` → how much of the limit is the
 disk](docs/benchmarks.md#2026-11-26-how-much-of-the-limit-is-the-disk-fio-tmpfs-and-one-change-at-a-time-google-cloud-vms)).
 
-Close to that limit the writer can stall. In tickertape's own 10-minute runs before 1.0.0 at 1,024 bytes and 90 % of the
-unpaced rate, appends of 50–128 ms recurred on aarch64 ext4 ([operating
-envelope](docs/benchmarks.md#operating-envelope-and-remaining-bottlenecks)); that rate is 92 % of what the device
-writes. In later 60-second runs on `main` after 1.0.0, turning early write-back off
-(`WriterConfig::early_writeback(false)`) removed those stalls in 5 of 5 runs on two aarch64 VMs, at the price of
-checkpoints becoming durable 0.93 s (median) after the request instead of 0.05–0.39 s (the disk section above). What to
-plan for is in [`docs/operations.md`](docs/operations.md).
+Close to that limit the writer can stall. In tickertape's own 10-minute runs before 1.0.0, at 1,024 bytes and 90 % of
+the unpaced rate with a background checkpoint (`Writer::request_checkpoint`, which syncs on its own thread) every
+second, appends of 50–128 ms recurred on aarch64 ext4 ([operating
+envelope](docs/benchmarks.md#operating-envelope-and-remaining-bottlenecks)); that rate is about 324 MB/s of journal
+bytes, 92 % of the separately measured device rate. In later 60-second runs on `main` after 1.0.0 (the disk section),
+the default's longest appends there were 83–144 ms on the first aarch64 VM and 10–16 ms on a second one; turning early
+write-back off (`WriterConfig::early_writeback(false)`) brought them to 1.0–2.3 ms in 5 of 5 runs, at the price of a
+background checkpoint becoming durable 0.93 s (median) after its request instead of 0.05–0.39 s. On x86-64 there were no
+such stalls either way (longest appends 0.25–0.64 ms), and turning it off only made checkpoints that late (0.93 s
+against 1.7–2.3 ms). What to plan for is in [`docs/operations.md`](docs/operations.md).
 
 ## Quickstart
 
@@ -312,8 +379,11 @@ README. Why iceoryx2: [ADR 0030](docs/decisions/0030-iceoryx2-integration.md).
 The full statement, per platform and with the test for each claim, is [`docs/crash-contract.md`](docs/crash-contract.md).
 
 - **Visible is not durable.** A record is visible to readers, and survives the writer process dying, as soon as
-  `append` returns. It is durable only after a later `checkpoint()` (`msync` and `fdatasync` on Linux; on macOS
-  `msync`, `fsync` and two `F_FULLFSYNC`, one for the data and one for the checkpoint marker).
+  `append` returns. It is durable only after a later `checkpoint()`. On Linux a checkpoint `msync`s the mapped ranges
+  it still holds, `fdatasync`s the segment files and `fsync`s new directory entries, then writes the checkpoint marker
+  and `fdatasync`s it. On macOS it syncs the mapped data with `msync(MS_SYNC)`, the segment files and new directory
+  entries with `fsync`, then issues `F_FULLFSYNC` on the newest segment before writing the checkpoint marker and again
+  on the marker file.
 - **Process crashes.** After the writer is killed at any point, every committed record is intact and the next
   writer continues with no gap and no duplicate. Tested with 250 `SIGKILL`s at random points per run, on Linux
   and macOS, with live readers (safe and zero-copy) across all of them.

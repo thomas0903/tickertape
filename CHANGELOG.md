@@ -7,19 +7,20 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 - Docs: the comparison with Chronicle Queue, Aeron IPC, yaque, queue-file and a plain file is rerun at v1.0.0 with the
   corrected harness (issue #57): one 24-hour session on each of two Google Cloud VMs (x86-64 and aarch64, ext4 and xfs),
-  every tool pinned, the JVM tools warmed up through their measured loops, Chronicle with `microTouch()` and a 1 GiB
-  `blockSize`, plus rows with the old settings, `microTouch()` alone, unpinned and on an isolated boot.
-  `docs/benchmarks.md` → "comparison rerun at v1.0.0" has every table, the one failed cell (Chronicle's sync-every-second
-  run at 90 % of its rate with 64 B records: reader timed out, twice on both machines and file systems), the round gaps,
-  the probe drift and the interrupts that still reached the isolated CPUs; the earlier comparison sections are marked as
-  superseded. README → Performance is rewritten from it, with the bare-metal v0.4.0 section replaced: tickertape appends
-  64 B records faster and, at half of each tool's own rate on ext4, has a reader p99.9 of 323–697 µs against Chronicle
-  Queue's 89.98–102.69 ms and checkpoints of 1.38–2.99 ms (median) against 302.78–516.16 ms, while Chronicle Queue replays
-  faster, has a lower reader p99.9 at 10,000 records/s and at 1,024 B × 100,000 records/s, and has a lower sustained
-  p99.9 on xfs in three of four cells; Aeron IPC is lowest at 100,000 records/s. The README also no longer says that
-  readers never slow the writer down (a blocking reader costs it a wake-up call per record it blocked for), states the
-  disk's 351 MB/s limit and what removed the aarch64 stalls near it, and lists the macOS checkpoint's calls (`msync`,
-  `fsync`, two `F_FULLFSYNC`). No code change.
+  session commit `fb2d91b0`, every tool pinned, the JVM tools warmed up through their measured loops, Chronicle with
+  `microTouch()` and a 1 GiB `blockSize`, plus rows with the old settings, `microTouch()` alone, unpinned and on an
+  isolated boot. `docs/benchmarks.md` → "comparison rerun at v1.0.0" has every table, the one failed cell (Chronicle's
+  sync-every-second run at 90 % of its rate with 64 B records: the harness's reader timed out in both attempts on each
+  machine and file system), the round gaps, the probe drift and the interrupts that still reached the isolated CPUs; the
+  earlier comparison sections are marked as superseded. README → Performance is rewritten from it, with the bare-metal
+  v0.4.0 section replaced. The result is mixed: tickertape leads the 64 B append bursts; Chronicle Queue leads warm
+  replay in three of four pinned ext4 cells and has the lower reader p99.9 at 10,000 records/s and at 1,024 B × 100,000
+  records/s; Aeron IPC has the lowest observed p99.9 at 100,000 records/s; in ten-minute runs at half of each tool's own
+  rate tickertape's reader tail is lower on ext4 and higher than Chronicle's on xfs in three of four cells. The README
+  also describes Aeron IPC correctly (file-backed term buffers, no durable journal, no Archive replay here), no longer
+  says that readers never slow the writer down (a blocking reader costs the writer a wake-up call when it publishes),
+  explains the disk's 351 MB/s limit and what removed the aarch64 stalls near it, and states what a checkpoint syncs on
+  Linux and macOS. No code change.
 - Added (benchmarks): `tt-faults` counts the page faults of the writer's thread append by append, with paced appends,
   background checkpoints and a zero-copy reader, and `benches/diagnostics/writer-faults.bt` classifies them (ADR 0058,
   issue #60, proposed). The library does not change; the experiment switches the measurements used are on the branch
