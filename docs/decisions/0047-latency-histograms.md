@@ -546,12 +546,12 @@ The writer's histograms, as this record describes them, with these differences. 
 
 - **Three CRC helpers are always inlined** (`format::finish_record_body`, `format::record_crc`, `crc::crc32c`). The
   timed path calls `write_record` too, so the crate has two copies of the append path, and the compiler's inlining of
-  these helpers into `Writer::append` then changed with unrelated code: without the attributes the off path had 7
+  these helpers into `Writer::append` changed with unrelated code: without the attributes the off path had 7
   instructions more than its base on x86-64 on two bases (`a80f912`, `12e76d8`) and 20 fewer on a third (`e08c364`), and
-  on aarch64 between 11 fewer and as many. Forcing them inline makes the decision independent of the rest of the crate:
-  +1 on x86-64 and +3 on aarch64 against `12e76d8`. Gate 1 is met for that code; the base's own count can still move with
-  later changes. The fallback of "Where it lives" was not needed. `record_crc` and `crc32c` are the safe reader's too;
-  replay was measured.
+  on aarch64 between 11 fewer and as many. With them it had +1 on x86-64 and +3 on aarch64 on each of `e08c364`,
+  `12e76d8` and `8912012`: they reduced the movement in these builds. They do not make the count independent of the rest
+  of the crate (the independent review found single attributes elsewhere moving it by one; see the next amendment). The
+  fallback of "Where it lives" was not needed. `record_crc` and `crc32c` are the safe reader's too; replay was measured.
 - **The time-to-durable histogram is recorded with atomic read-modify-write operations** (`fetch_min`, `fetch_max`, a
   saturating compare-and-swap loop for the sum, `fetch_add` with `Release` for the bucket), as decided; its loom model
   has two recording threads. In practice the writer's thread and the checkpoint thread never record at the same time:
@@ -575,3 +575,20 @@ The writer's histograms, as this record describes them, with these differences. 
   57.4 ns to a 64-byte append on x86-64 and 83.0 ns on aarch64, almost all of it the two clock reads (the histogram
   about 2 ns). **The budget of 60 ns is met on x86-64 and missed on aarch64**, so the documentation gives the figures
   and does not call the option cheap; a cheaper clock stays deferred, as above.
+
+## Amendment (2026-11-26): what gate 1 compares
+
+Decided by the orchestrator of the work on the owner's delegation, after the independent review of the pull request
+for step 3. The decision does not change; measurement 1 does.
+
+- **Gate 1 is the feature's own cost:** instructions per 64-byte append of the change with `LatencyMode::Off` against
+  **the same commit with the latency test compiled out** (`--cfg tickertape_latency_check_out`, a private `cfg` for
+  this measurement only; appends are then never timed). At most 3 more. Method otherwise as in measurement 1.
+- **The difference to the base commit is reported as drift, not gated.** The review's counts show why: on aarch64, with
+  the base at 366 and the change at 369, removing the test gave 370, removing `#[cold]` from the roll's timing wrapper
+  gave 370, the base with the three forced inlines above gave 356, and forcing `crc32c_append` inline as well gave 380.
+  The inlining of `crc32c_append` and of the hardware `append` into `Writer::append` moves with unrelated code, so the
+  comparison with the base measures layout, not the test.
+- **Gate 2, the time, is unchanged and is the gate that decides.**
+- Measured for step 3 (`benchmarks.md`, 2026-11-26): `Off` against the test compiled out, 384 against 393 on x86-64
+  and 369 against 370 on aarch64 (64 B); drift against the base 383 and 366.

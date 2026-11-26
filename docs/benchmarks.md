@@ -2236,30 +2236,56 @@ Raw output (JSON lines per run, environment, scripts) is kept outside the reposi
 
 ### Off: gate 1, instructions per append
 
+Gate 1 as amended on 2026-11-26 (ADR 0047): the change with the option off against **the same commit with the latency
+test compiled out** (`RUSTFLAGS="--cfg tickertape_latency_check_out"`, `benches/README.md`), at most 3 more. The
+difference to the base commit is reported as drift and not gated. Counted on the change as merged with `main` at
+`3d82592` (the code of `9ff23da` and the review fixes, which do not touch the append path).
+
 | | x86-64, 64 B | x86-64, 1,024 B | aarch64, 64 B | aarch64, 1,024 B |
 |---|---|---|---|---|
-| base (`12e76d8`), base 2 | 383 | 898.9 | 366 | 994.0 |
-| v1.0.0 | 381 | 896.9 | 363 | 991.0 |
-| change, `Off` | **384** (+1) | 899.9 | **369** (+3) | 997.0 |
+| change, `Off` | **384** | 899.9 | **369** | 997.0 |
+| change, latency test compiled out | 393 | 908.9 | 370 | 998.0 |
+| **gate 1: `Off` − compiled out** | **−9** | −9 | **−1** | −1 |
 | change, `RollsAndCheckpoints` | 384 | 899.9 | 369 | 997.0 |
-| change, `All` | 600 (+217) | 1,115.9 | 576 (+210) | 1,204.0 |
+| change, `All` | 600 (+216 over `Off`) | 1,115.9 | 576 (+207) | 1,204.0 |
+| *drift:* base (`3d82592`; `12e76d8` and `8912012` the same) | 383 | 898.9 | 366 | 994.0 |
+| *drift:* v1.0.0 | 381 | 896.9 | 363 | 991.0 |
 
-**Gate 1 (at most 3 more) is met on both, at its limit on aarch64.** Counted again after the change was rebased on
-`8912012` (the same code): 384 against 383 on x86-64, 369 against 366 on aarch64 (in the OrbStack VM, footnote ² below). The change forces three CRC helpers inline
-(`format::finish_record_body`, `format::record_crc`, `crc::crc32c`). Without that, how many instructions an append has
-depended on unrelated code elsewhere in the crate, because the append path is compiled twice (with and without timing)
-and the compiler's inlining of these helpers into `Writer::append` changed with it:
+x86-64 on the cloud machine; aarch64 in the OrbStack VM on an M4 Pro with the same rustc (1.100.0), which gave the cloud
+machine's counts exactly for `e08c364` and, for the base and the change, the same counts as the cloud machine had on
+`12e76d8`.
 
-| The same change without forced inlining, on | x86-64, 64 B (base) | aarch64, 64 B (base) |
+**Gate 1 is met on both.** The test itself costs nothing measurable in instructions: compiling it out made the append
+*longer*, by 9 on x86-64 and 1 on aarch64. What the counts measure is mostly how the compiler lays out and inlines the
+append path, which changes whenever that path is compiled differently. The append path exists twice in the change (the
+timed copy calls the same code), and the CRC helpers' inlining into `Writer::append` (`format::finish_record_body`,
+`format::record_crc`, `crc::crc32c`, `crc::crc32c_append`, the hardware `append`) moved with unrelated code:
+
+| The same change without its three forced inlines, on | x86-64, 64 B (base) | aarch64, 64 B (base) |
 |---|---|---|
 | `a80f912` | 390 (383) | 366 (366)³ |
 | `e08c364` | 363 (383) | 355 (366) |
 | `12e76d8` | 390 (383) | 366 (366)² |
 
-² Counted in the OrbStack VM on an M4 Pro with the same rustc (1.100.0); it gives the cloud machine's counts for
-`e08c364` exactly. With `finish_record_body` and `record_crc` forced inline but not `crc32c`, `e08c364` gave 380 on
-x86-64 and 372 on aarch64. ³ The OrbStack VM with rustc 1.99.1. So gate 1 is met for this code and this compiler; the next unrelated change can move the
-count either way.
+² The OrbStack VM, rustc 1.100.0. ³ The OrbStack VM, rustc 1.99.1.
+
+With `finish_record_body`, `record_crc` and `crc32c` forced inline the drift was +1 on x86-64 and +3 on aarch64 on each of
+`e08c364`, `12e76d8` and `8912012`, which is why the change keeps them: they reduced the movement in these builds. They
+do not make the count independent of the rest of the crate. Variants counted on aarch64 (OrbStack, rustc 1.100.0; the
+first four by the independent review of the pull request, against the base `8912012` at 366 and the change at 369):
+
+| Variant | aarch64, 64 B |
+|---|---|
+| the change with the latency tests removed | 370 |
+| the change without `#[cold]` on the roll's timing wrapper (`roll_measured`) | 370 |
+| the base with the same three helpers forced inline | 356 |
+| the change with `crc32c_append` forced inline too | 380 |
+| the change with `crc32c` calling the hardware `append` directly (`#[inline]`): `Off` / test compiled out | 372 / 359 |
+| the change without the three forced inlines: `Off` / test compiled out | 366 / 369 |
+
+The change calls `crc32c_append` twice per append out of line (for the length and for the fields); the base with the
+helpers forced inline calls it once. The one simple way tried to remove the second call (the fifth row) made the off path
+13 instructions longer than with the test compiled out, so it was left out. The time gate below decides.
 
 ### Off: gate 2, time per append (ns)
 
@@ -2292,7 +2318,7 @@ that made base 2 − base about three times tighter there. Every valid run met b
 | Added to a 1,024-byte append | +53.5 ns [+50.0, +57.0] (+18 %) | +58.4 ns [+53.3, +63.5] (+15 %) |
 | Clock pair alone (`Instant::now()` and `elapsed()`) | 44.3–44.4 ns | 71.9–72.3 ns |
 | Histogram update alone (the update with its value, less the value alone) | about 1.8 ns (2.04–2.05 less 0.27–0.31) | about 2.1 ns (2.54 less 0.42) |
-| p50 of an empty timed interval (the floor of every sample) | 20–21 ns | 33 ns |
+| Median of an empty timed interval (not a floor: individual values can be lower) | 20–21 ns | 33 ns |
 | Appends/s with `All` (from the paired means, 64 B, one thread) | 10.5 million | 8.0 million |
 
 **The published budget (60 ns added to a 64-byte append, of which at most 5 ns for the histogram) is met on x86-64
@@ -2332,7 +2358,7 @@ Median of the runs per build [lowest..highest]. "Service" is the writer's own `a
 The maximum is about 0.9 ms in every build on both machines, with the option and without it, so it is not the option's.
 p99 and p99.9 are bimodal from run to run (base 2 against base, two builds of the same code, differ as much as any two
 builds), so three runs show no effect of the option on the tail; earlier sessions with five runs per build (of the
-change on older bases) did not either. `All` raises p50 by 0.02 to 0.03 µs, about what a clock pair costs; snapshots,
+change on older bases) did not either. `All` raises p50 by 0.02 to 0.03 µs, about half of what a clock pair costs alone; snapshots,
 even every 10 ms, did not visibly change the writer's own service times (one run's service maximum of 786 µs on aarch64
 is a single run). The service maximum, about 0.2 ms, is far below the visible maximum: most of the stall behind the
 visible maximum is outside the `append` calls, which is what `WriterLatency::append` warns of.

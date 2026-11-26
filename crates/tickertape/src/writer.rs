@@ -402,6 +402,9 @@ impl Writer {
     where
         F: FnOnce(&mut [u8]) -> std::result::Result<(), E>,
     {
+        // `--cfg tickertape_latency_check_out` compiles this test out, for measuring what it costs (ADR 0047, gate 1);
+        // appends are then never timed.
+        #[cfg(not(tickertape_latency_check_out))]
         if self.append_latency.is_some() {
             return self.try_append_timed(record, payload_len, fill);
         }
@@ -411,6 +414,7 @@ impl Writer {
 
     /// [`Writer::try_append_with`] with `LatencyMode::All`: times the call if it appends the record. Out of line, so that
     /// the append path without it stays as it is, but for the test that leads here.
+    #[cfg_attr(tickertape_latency_check_out, allow(dead_code))]
     #[inline(never)]
     fn try_append_timed<F, E>(
         &mut self,
@@ -461,6 +465,7 @@ impl Writer {
     where
         I: IntoIterator<Item = NewRecord<'a>>,
     {
+        #[cfg(not(tickertape_latency_check_out))] // as in `try_append_with`
         if self.append_latency.is_some() {
             return self.append_batch_timed(records);
         }
@@ -468,6 +473,7 @@ impl Writer {
     }
 
     /// [`Writer::append_batch`] with `LatencyMode::All`: times the call if it appends at least one record and succeeds.
+    #[cfg_attr(tickertape_latency_check_out, allow(dead_code))]
     #[inline(never)]
     fn append_batch_timed<'a, I>(
         &mut self,

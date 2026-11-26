@@ -103,6 +103,14 @@ jobs:
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       # Includes the format-v1 compatibility fixtures, the CLI and the Python decoder on them (ADR 0033).
       - run: cargo test --workspace --all-features --locked
+      # An append that does not roll makes no system call, with any latency mode (ADR 0047), on aarch64 too.
+      - name: No system call in an append
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends strace
+          cargo test --workspace --all-features --locked --test writer_latency
+        env:
+          TICKERTAPE_REQUIRE_STRACE: '1'
 
   long-tests-linux-arm64:
     name: long tests (ubuntu-24.04-arm)

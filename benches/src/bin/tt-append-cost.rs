@@ -20,7 +20,7 @@ append: opens a writer in a new or empty directory and appends N records into on
 not fit), without helper threads unless --prefault. Run it under `perf stat -e instructions:u` or Callgrind with two
 counts: the difference of the two totals, divided by the difference of the counts, is the cost of one append.
 parts: nanoseconds per call of a clock pair, a histogram update (with the cost of making the values beside it) and the
-50th percentile of an empty timed interval (the floor of every append sample).";
+median and the minimum of an empty timed interval (what the clock alone gives a timed append).";
 
 fn append(args: &[String]) -> Result<()> {
     let options = Options::parse(
@@ -96,7 +96,8 @@ fn parts() {
     let mut floor = Recorder::new(); // [not in the base]
     (0..5_000_000).for_each(|_| floor.record(Instant::now().elapsed())); // [not in the base]
     let floor = floor.view().snapshot(); // [not in the base]
-    println!("empty interval: p50 {:?}", floor.value_at_quantile(0.5)); // [not in the base]
+    let (p50, min) = (floor.value_at_quantile(0.5), floor.min()); // [not in the base]
+    println!("empty interval: p50 {p50:?}, min {min:?}"); // [not in the base]
 }
 
 fn main() {

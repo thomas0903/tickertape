@@ -6,14 +6,16 @@
 use std::cell::Cell;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use tickertape::fault::{self, Point};
 use tickertape::latency::{Snapshot, View, WriterLatency};
 use tickertape::retention::{Action, Policy};
-use tickertape::{Error, LatencyMode, NewRecord, Writer, WriterConfig};
+use tickertape::{
+    Backoff, Error, LatencyMode, NewRecord, Reader, ReaderConfig, Writer, WriterConfig,
+};
 use tickertape_tests::{Rng, append_n, mixed_len, payload, read_all, segments, small_config};
 
 const EIO: i32 = 5;
@@ -463,6 +465,14 @@ fn snapshots_while_the_writer_appends() {
     .unwrap();
     let latency = w.latency().unwrap().clone();
     let done = AtomicBool::new(false);
+    let taken = AtomicU64::new(0);
+    /// Ends the reading loop also when the writing side panics, which would otherwise wait for it for ever.
+    struct Done<'a>(&'a AtomicBool);
+    impl Drop for Done<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
     std::thread::scope(|scope| {
         let reading = scope.spawn(|| {
             let views = [
@@ -472,7 +482,6 @@ fn snapshots_while_the_writer_appends() {
                 latency.time_to_durable().unwrap(),
             ];
             let mut last: Vec<Snapshot> = views.iter().map(|view| view.snapshot()).collect();
-            let mut taken = 0u64;
             while !done.load(Ordering::Acquire) {
                 for (view, last) in views.iter().zip(&mut last) {
                     let now = view.snapshot();
@@ -484,10 +493,10 @@ fn snapshots_while_the_writer_appends() {
                     }
                     *last = now;
                 }
-                taken += 1;
+                taken.fetch_add(1, Ordering::Release);
             }
-            taken
         });
+        let _done = Done(&done);
         for i in 0..APPENDS {
             w.append(&record(&[7; 64])).unwrap();
             if i % 10 == 0 {
@@ -498,8 +507,15 @@ fn snapshots_while_the_writer_appends() {
             }
         }
         wait_finished(&mut w);
-        done.store(true, Ordering::Release);
-        assert!(reading.join().unwrap() > 0);
+        // At least one round of snapshots overlaps the appends or follows them, however the threads were scheduled.
+        let deadline = Instant::now() + LONG;
+        while taken.load(Ordering::Acquire) == 0 && !reading.is_finished() {
+            assert!(Instant::now() < deadline, "no snapshot was taken");
+            std::thread::yield_now();
+        }
+        drop(_done);
+        reading.join().unwrap();
+        assert!(taken.load(Ordering::Acquire) > 0);
     });
     let rolls = segments(dir.path()).len() as u64 - 1;
     let [append, batch, roll, durable] = counts(&latency);
@@ -509,6 +525,63 @@ fn snapshots_while_the_writer_appends() {
     );
     // Requests join each other, so there are at most as many checkpoints as requests.
     assert!((1..=APPENDS / 5_000).contains(&durable.unwrap()));
+}
+
+/// A reader that blocks for each record is woken by the writer in every mode, for `append` and for `append_batch`:
+/// each of its waits is capped at 100 ms and its poll interval is 10 s, so a missing wake-up shows as a delivery that
+/// takes about 100 ms.
+#[test]
+fn blocked_readers_are_woken_in_every_mode() {
+    const ROUNDS: u64 = 40;
+    let mut blocking = Backoff::default();
+    blocking.spins = 0;
+    blocking.yields = 0;
+    blocking.min_sleep = Duration::from_secs(10);
+    blocking.max_sleep = Duration::from_secs(10);
+    for mode in MODES {
+        for batched in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut w = Writer::open(dir.path(), small_config().latency(mode)).unwrap();
+            let path = dir.path().to_path_buf();
+            let (sent_tx, sent_rx) = std::sync::mpsc::channel::<Instant>();
+            let (ack_tx, ack_rx) = std::sync::mpsc::channel::<()>();
+            let config = ReaderConfig::default().backoff(blocking);
+            let reader = std::thread::spawn(move || {
+                let mut r = Reader::open(&path, config).unwrap();
+                let mut slow = 0;
+                for expected in 0..ROUNDS {
+                    let record = r.next_timeout(Some(LONG)).unwrap();
+                    let got = Instant::now();
+                    assert_eq!(record.map(|r| r.seq), Some(expected));
+                    let sent = sent_rx.recv().unwrap();
+                    slow += usize::from(
+                        got.saturating_duration_since(sent) >= Duration::from_millis(90),
+                    );
+                    ack_tx.send(()).unwrap();
+                }
+                slow
+            });
+            let mut rng = Rng::new(ROUNDS);
+            for _ in 0..ROUNDS {
+                // Usually long enough for the reader to block again.
+                std::thread::sleep(Duration::from_micros(rng.below(2_000)));
+                let sent = Instant::now();
+                if batched {
+                    w.append_batch([record(b"woken")]).unwrap();
+                } else {
+                    w.append(&record(b"woken")).unwrap();
+                }
+                sent_tx.send(sent).unwrap();
+                ack_rx.recv().unwrap();
+            }
+            let slow = reader.join().unwrap();
+            // A broken wake-up makes nearly every delivery slow; allow two scheduling hiccups.
+            assert!(
+                slow <= 2,
+                "{mode:?}, batch {batched}: {slow} of {ROUNDS} took >= 90 ms"
+            );
+        }
+    }
 }
 
 /// The same appends give the same bytes whatever the mode, except for the segments' creation time (and so their header's
@@ -585,6 +658,7 @@ fn child_that_appends() {
 #[cfg(target_os = "linux")]
 #[test]
 fn appends_that_do_not_roll_make_no_system_call() {
+    use std::io::Write;
     const VDSO: [&str; 4] = [
         "tsc",
         "kvm-clock",
@@ -596,7 +670,8 @@ fn appends_that_do_not_roll_make_no_system_call() {
             std::env::var_os("TICKERTAPE_REQUIRE_STRACE").is_none(),
             "{why}"
         );
-        eprintln!("skipped: {why}");
+        // Not `eprintln!`, which the test harness captures: a skip must be seen.
+        let _ = writeln!(std::io::stderr(), "skipped: {why}");
     };
     let source = "/sys/devices/system/clocksource/clocksource0/current_clocksource";
     let source = std::fs::read_to_string(source).unwrap_or_default();

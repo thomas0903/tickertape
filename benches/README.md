@@ -52,7 +52,14 @@ valgrind --tool=callgrind --callgrind-out-file=/dev/null target/release/tt-appen
 target/release/tt-append-cost parts
 ```
 
-For a base commit that does not have the histograms, build the same file there without the lines marked
+Gate 1 of ADR 0047 compares the change with the same commit with the latency test compiled out:
+
+```sh
+RUSTFLAGS="--cfg tickertape_latency_check_out" CARGO_TARGET_DIR=target/check-out \
+    cargo build -p tickertape-bench --release --bin tt-append-cost
+```
+
+(a private `cfg` for this measurement: appends are then never timed). For a base commit that does not have the histograms, build the same file there without the lines marked
 `[not in the base]`: `grep -v '// \[not in the base\]'`. The time of an append is compared with the `append` benchmark,
 as interleaved pairs in alternating order of the two builds, and of the base with a second build of the base: a run says
 nothing about a difference that is smaller than base against base. `tt-latency --writer-latency` and `--snapshot-ms` give

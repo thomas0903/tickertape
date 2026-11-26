@@ -671,16 +671,19 @@ let latency = writer.latency().cloned(); // for the monitoring thread
   `latency::Recorder` of its own.
 - **A call or a checkpoint that is still stuck has no value yet.** `tickertape status` shows that: a head that stands
   still, a growing exposure age. Calls that fail, declined records and empty batches are not recorded at all.
-- **They do not start at zero.** Parts of both clock reads fall inside an append's value, together about one read, and
-  the clock ticks: 41.7 ns on Apple silicon, the period of `cntfrq_el0` on other aarch64 machines, where short appends show
-  as a few multiples of it (and an empty interval as 0 or one tick). The measured floor per machine is in
-  [`benchmarks.md`](benchmarks.md) (2026-11-26). Nothing is subtracted.
+- **Short values are distorted by the clock, both ways.** Parts of both clock reads fall inside an append's value, and
+  the clock ticks: 41.7 ns on Apple silicon, the period of `cntfrq_el0` on other aarch64 machines. With a coarse clock a
+  short append often shows as 0 or one tick (on an M4 Pro, 1,000,000 appends of 8 bytes gave about 40 % zeros and 60 %
+  at 41–42 ns); with a fine one even an empty interval measures some nanoseconds (its median, in
+  [`benchmarks.md`](benchmarks.md) 2026-11-26: 20 ns on x86-64 and 33 ns on aarch64 cloud VMs). Nothing is subtracted.
 - **They include being descheduled**, page faults, the wake-up of blocked readers and the hand-off to the helper threads.
   Timing also changes the code that is timed: it limits how far consecutive appends overlap in the CPU, and the end read
   does not wait for the store buffer, so part of an append's cost can fall outside its value.
 - **`checkpoint_time_to_durable_seconds` is not a record's time to durability**, which adds the wait for the next request
   (`RecordAge` in a durable-only reader shows that). It includes waiting behind a running checkpoint and excludes the
-  retention run. Requests that join a waiting checkpoint give one value, from the earliest of them.
+  retention run that follows it (a blocking `checkpoint()` called while a background checkpoint's retention runs still
+  waits for the removal in progress, and that wait is in its value). Requests that join a waiting checkpoint give one
+  value, from the earliest of them.
 - **They are not the numbers of the published `tt-sustained` tables.** `tt-sustained` counts to-durable once per request,
   so joined requests count several times there and once here, and up to when its loop sees the checkpoint finished. Its
   "roll" is the whole append that rolled; `roll_seconds` is only the roll, so it is smaller. Its "Pause" (the time a
@@ -688,11 +691,10 @@ let latency = writer.latency().cloned(); // for the monitoring thread
 
 **Cost.** Measured on 4-vCPU cloud VMs ([`benchmarks.md`](benchmarks.md), 2026-11-26): with `Off` and
 `RollsAndCheckpoints` an append that does not roll ran within 1 ns of the code without the option at 64 B (within the
-noise on x86-64, 0.8 ns faster on aarch64) and within 1 % at 1,024 B. **`All` added 57 ns to a 64-byte append on x86-64
+noise on x86-64, 0.8 ns faster on aarch64) and within the noise floor and the 2 % bound at 1,024 B. **`All` added 57 ns to a 64-byte append on x86-64
 (38 → 95 ns, about 10.5 million appends/s on one thread) and 83 ns on aarch64 (42 → 125 ns, about 8 million/s)**, and
 54 to 58 ns to a 1,024-byte one: more than the append itself at 64 B. Almost all of it is the two clock reads; the
-histogram update is about 2 ns. Turn `All` on where that is affordable, or for a period of diagnosis. An empty interval
-measured 20 ns on x86-64 and 33 ns on aarch64 there, so no value is below that.
+histogram update is about 2 ns. Turn `All` on where that is affordable, or for a period of diagnosis.
 
 **Linux:** the clock reads of `All` are calls into the vDSO, without entering the kernel, only with a clock source the
 vDSO can read: `tsc`, `kvm-clock`, `hyperv_clocksource_tsc_page` and `arch_sys_counter`. With others (`hpet`, `acpi_pm`,

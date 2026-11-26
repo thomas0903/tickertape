@@ -43,8 +43,9 @@ impl WriterLatency {
     /// It does not include building the record before the call, or recording the value itself. A `fill` that declines or
     /// panics is not recorded, although its clean-up is slow.
     ///
-    /// Parts of both clock reads fall inside the interval, so a call that did nothing would not show 0, and clocks tick
-    /// (every 41.7 ns on Apple silicon, for example): short appends show as a few multiples of the tick. Reading the
+    /// Parts of both clock reads fall inside the interval, and the clock ticks: with a coarse clock (41.7 ns per tick on
+    /// Apple silicon) a short append often shows as 0 or one tick, and longer ones as multiples of the tick; with a fine
+    /// one even an empty interval measures some nanoseconds. Nothing is subtracted for either. Reading the
     /// clock also changes what it measures: it limits how far consecutive appends overlap in the CPU, and it does not
     /// wait for the store buffer to drain, so part of an append's cost can fall outside its interval.
     pub fn append(&self) -> Option<&View> {
@@ -76,7 +77,9 @@ impl WriterLatency {
     /// It runs from the entry of [`Writer::checkpoint`](crate::Writer::checkpoint), or of the earliest
     /// [`Writer::request_checkpoint`](crate::Writer::request_checkpoint) that the checkpoint covers, until the marker is
     /// durable (and its best-effort extension is done and waiting readers are woken). It includes waiting behind a
-    /// checkpoint that is already running and excludes the retention run that follows. Requests that join a waiting
+    /// checkpoint that is already running and excludes the retention run that follows that checkpoint (a blocking
+    /// checkpoint requested while a background one's retention runs still waits for the removal in progress, and that
+    /// wait is in its value). Requests that join a waiting
     /// checkpoint give one value, timed from the earliest of them, so the number is never too small.
     ///
     /// It is not the time from a record's append to its durability, which adds the wait for the next request; the age of

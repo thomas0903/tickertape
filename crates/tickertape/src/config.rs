@@ -197,7 +197,7 @@ pub enum LatencyMode {
     RollsAndCheckpoints,
     /// Also every append and every batch ([`append`](crate::latency::WriterLatency::append),
     /// [`batch`](crate::latency::WriterLatency::batch)), without sampling: two reads of the monotonic clock and one
-    /// histogram update per call, which can cost as much as a small append itself (`docs/operations.md` has the measured
+    /// histogram update per call, which can cost more than a small append itself (`docs/operations.md` has the measured
     /// cost).
     ///
     /// **Linux:** do not use this where the clock source is not one the vDSO reads: each clock read is then a system
