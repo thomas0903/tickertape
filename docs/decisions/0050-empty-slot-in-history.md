@@ -160,3 +160,63 @@ C ABI is unchanged. The on-disk format is unchanged and any writer works. 1.0.0 
 - `tests/empty_slot.rs` holds the reproduction, each row of the table, and a randomised test with live readers of four
   kinds that must see no false error, and must see every injected one; `protocol_model.rs` (loom) has the order of the
   stores, with the variant that does not read the slot again as an expected failure.
+
+## Amendment (2026-11-27): later names that are not segments are read in turn (issue #89)
+
+A name above the cursor without a valid header is no evidence (above), and it is not dismissed for good either: a header
+written into the file in place would make it some. Until now every listing read every such name again, so an idle
+visible reader of a directory with thousands of them read thousands of headers once a second (10,000 empty stray files:
+up to 0.47–0.50 s per such call in the issue; 0.1–0.17 s on an Apple M4 Pro and up to 32 ms in a Linux VM, informal,
+`benchmarks.md`, 2026-11-27). A healthy journal has no such names.
+
+**Not chosen: remembering a name by what identifies its content** (device and inode, size, modification and change
+time) and reading it again only when that changes. An in-place write keeps the inode and, inside the file, the size, so
+only the times could show it, and they need not: a write through a shared mapping to a page that is already dirty and
+writable updates neither time on Linux until the page has been written back and is written again (which periodic
+write-back may delay for tens of seconds, or indefinitely when it is off); file systems with coarse timestamps give a
+write in the same tick as the change before it the same times (a rule that trusts only times some seconds old, as the
+directory check does, covers that, but not the mapping); NFS clients cache attributes. A file renamed over the name has
+another inode number, and that is used below, but only to read it sooner, never to skip a read.
+
+**Chosen: bounded work per listing, every name still read.** The reader keeps, behind its boxed wait state, the later
+names it found not to be segments, each with the inode number the listing gave for it (`d_ino`, no `stat`), the one
+read longest ago first. A listing reads:
+
+- every listed name that it does not remember with that inode number: a new name, or another file at a known one;
+- then at most **256** of the remembered ones, from the front, each going to the back when read.
+
+It stops at the first segment, as before (the newest first among the new names). The first check after an open or a
+seek forgets what was remembered and so reads every later name, as before: a replay that polls an empty slot once still
+learns there what the directory shows. Names that are no longer listed are forgotten.
+
+**The bound.** With `M` remembered names, each is read at least once in every `ceil(M / 256)` listings, and at every
+listing while `M` is at most 256. So a header written in place into a stray file is seen within `ceil(M / 256)`
+listings; a segment linked or renamed into place (a new name, or another inode at a known one) at the next listing. A
+waiting visible reader lists at most once a second, so (B) now reports within about `ceil(M / 256)` × 1.1 s plus the
+spacing of the calls, plus the 50 ms window, where it reported within 1.1 s (unchanged for `M` up to 256). A file
+removed and created again at a name, between two listings, can get the old inode number on some file systems: it is
+then read in its turn, within the same bound, and so is a file renamed over a stray on a file system whose listing gives
+every entry the same inode number (some FUSE file systems). A durable-only reader never makes this check while it
+waits at the marker (it lists only at an empty slot below a marker that no longer covers it, besides the listing of its
+open and its seeks), and does the same there. `try_next`'s rustdoc and crash contract C11 state the bound.
+
+**Cost.** Per listing: the listing, sorted, a binary search in it for each remembered name, and at most 256 header reads
+besides the new names. With 10,000 empty stray names, informal: an idle visible reader's calls that list took 7.8–20 ms
+on the M4 Pro (before: 105–168 ms) and 1.3–7.7 ms in the Linux VM (before: up to 32 ms); the first check after an open
+still reads them all. Memory: during a listing 17 bytes per later name (base and inode number, and one flag; the
+vector's spare capacity can add up to as much again), where the code before held 8 (the bases); between listings 16
+bytes per remembered stray name (at 1,000,000 stray names: about 17 to 33 MB during a listing and 16 to 32 MB kept,
+against 8 to 16 MB during a listing before). The record path is unchanged: `try_next`, `advance`, `read_slot` and
+`next_timeout` compile to the same instructions on aarch64 macOS and x86-64 Linux (apart from label numbers), and
+`Reader`'s layout is unchanged (`reader_layout`). `Waits` is `#[repr(C)]` with the new state last, so that the fill
+path's fields keep their offsets: `fill_buf` and `at_empty_slot` compile as before too (`tests::waits_layout`).
+`seek_to_end` moves the remembered names into the state it restores on failure instead of copying them.
+
+**Tests.** `reader_stray_tests.rs` counts header reads: the pathological directory (all at the first check, then 256 per
+listing; a new name at once; a seek reads all again), a stray file given a header in place after each number of listings
+(found within the bound), the same in a directory whose modification time counts as settled, a stray replaced by rename
+(found at the next listing), a durable-only reader, and `seek_to_end` forgetting the names (and restoring them when it
+fails). Each fails if a listing reads every remembered name again; the header, settled-directory and durable-only tests
+fail if the turn does not advance, the settled-directory test if strays alone count as "nothing", the rename test if
+inode numbers are ignored, the first if a seek keeps what was remembered, and the `seek_to_end` restore test if the
+names are not put back.

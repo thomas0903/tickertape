@@ -23,23 +23,9 @@ draws conclusions from those two.
   the checkpoint (ADR 0046), so seeking forward through a checkpointed segment reads it once, not once for each seek. `Reader::seek_to_end` reads at most
   the newest segment, from the checkpoint on. For seeks into sealed segments, seek indexes make the cost independent of
   the segment size ("Seek indexes" below); they do nothing for the newest segment.
-- **Segment count.** Opening a reader or a writer, each seek and each retention run (when retention is configured, at
-  writer open and after checkpoints) read the whole journal directory; `list_segments` and `verify` open every segment's
-  file; replay opens each segment it enters. These costs grow with the number of segments, so very small segments in a
-  long-lived journal make them add up (ADR 0042). Measured on local SSD (`benchmarks.md`, 2026-11-25):
-  journals of 10,000, 20,000 and 100,000 segments open, recover, replay and checkpoint, and no operation held more
-  than 12 open files at 10 to 20,000 segments (not sampled at 100,000). What a writer can hold is bounded whatever the number
-  of segments (20 files at most in this release, "Open files" below), so the limit on open files (`ulimit -n`) is not
-  a constraint on the number of segments. The directory read is: each seek costs about 3 ms at 10,000 segments, 6 ms at
-  20,000 and 29 ms at 100,000, also with a seek index, and so does each retention run (from 1.1, ADR 0051; x86-64, warm: a
-  checkpoint with a policy that removes nothing 3 ms, 6 ms and 31 ms, against 0.3 ms without one; up to 1.0 every run
-  opened every segment, about ten times as much, and seconds with a cold cache). With `max_bytes` a writer's open also asks for
-  every file's size (cold: 0.05 s, 0.11 s and 0.58 s in all). Removing a segment costs 0.4 ms at 10,000 and 20,000
-  segments and 0.6 ms at 100,000 (64 KiB segments), one listing per 100 removals included. The appending thread
-  pays for retention in `checkpoint()` and in the open; a background checkpoint (`request_checkpoint`) runs it on the
-  checkpoint thread. So with blocking checkpoints and retention, plan for a number of segments whose directory read you
-  accept per checkpoint (a larger segment, or fewer kept). Larger segments make a seek without a seek index slower (up to
-  a whole segment is read), so use an index with large segments.
+- **Segment count.** Opening a reader or a writer, each seek and each retention run read the whole journal directory,
+  so these costs grow with the number of segments, and very small segments in a long-lived journal make them add up.
+  "How many segments to keep" below has the figures and what to do about them.
 - **Granularity of archiving.** You archive or delete whole segments (below).
 
 For most uses the default is a reasonable start. Pick smaller segments (a few MiB) for low-volume journals you
@@ -210,6 +196,64 @@ the helper placement are writer options in each (`early_writeback` / `earlyWrite
 
 If `checkpoint()` returns an error, the writer refuses all later checkpoints (`Error::DurabilityLost`) while appends
 keep working. Treat it as an incident: see "Errors are sticky" in the crash contract.
+
+## How many segments to keep
+
+The number of segments in the journal's directory, not their size, sets the cost of several operations: each reads the
+whole directory, and a few open every segment's file. Journals of 10,000, 20,000 and 100,000 segments work (ADR 0042),
+and what a writer holds open is bounded whatever their number ("Open files" above), so nothing fails; things get slower.
+The figures are from `benchmarks.md`, 2026-11-25, **one cloud machine shape** (Google Cloud `c3-standard-4-lssd`, Intel
+Xeon Platinum 8481C, ext4 on a local NVMe SSD, Linux x86-64), warm cache unless said; other machines and file systems
+differ, and none of this was measured on macOS.
+
+| Operation | 1,000 segments | 10,000 | 20,000 | 100,000 | What grows |
+|---|---|---|---|---|---|
+| Reading the directory, warm / cold | 0.28–0.30 / 1.7–1.9 ms | 2.5 / 18 ms | 5.0 / 35 ms | 25 / 215 ms | about 0.25 to 0.29 µs per segment when cached |
+| `Reader::seek`, before it reads a record | 0.35–0.38 ms (the whole seek) | about 3 ms | 6 ms | 29 ms | one listing per seek, also with a seek index (ADR 0046) |
+| `checkpoint()` with a retention policy that removes nothing (p50, from 1.1) | – | 3.2 ms | 6.4 ms | 31 ms | one listing per retention run (ADR 0051); 0.3 ms without a policy |
+| Removing segments with `retention::apply`, 100 in one run, per segment | – | 0.37 ms | 0.37 ms | 0.59 ms | one listing per run, spread over its removals |
+| "Cold" `Writer::open` (the directory cached), no policy / `max_segments` / `max_bytes` | – | 8.3 / 11.5 / 53 ms | 16 / 22 / 111 ms | 73 / 108 / 575 ms | listings; with `max_bytes`, a `stat` of every file |
+| `inspect::list_segments`, warm / cold | 2.7–3.0 / 194–199 ms | 30 ms / 2.1 s | 60 ms / 4.0 s | 0.29 s / 21 s | opens every segment (`verify` too, and reads every record) |
+
+The 100,000-segment journal had 64 KiB segments, the others 1 MiB. The checkpoint, removal and open rows are from the
+section "retention on journals of many segments", which has no journal of 1,000 segments ("–"); the others from
+"replay and recovery at scale" (cold there means the page cache dropped before the operation). At 1,000 segments the
+seek row is the whole seek to a segment's first record, warm, with the safe reader.
+
+**What a run still reads per file.** A retention run reads the directory once and then only what its policy needs
+(ADR 0051): with `max_segments` nothing more while the count is within the limit; with `max_age` the headers of the
+oldest segments up to the first young enough one. With `max_bytes` it asks for the size of every segment file (one
+`stat` each) and reads the header of the marker's segment and those after it, and of any file whose size is not a
+segment size or differs from the one before it. A writer remembers the sizes between its runs, so only its first run
+after `Writer::open` (which runs retention once) asks for every file's size, and later runs only for new files; a
+stand-alone `retention::plan` or `tickertape archive --max-bytes` asks for all of them every time. Apart from that run,
+`Writer::open` lists the directory and opens only the segments from the checkpoint marker on (without a marker, every
+segment, and recovery reads every byte). Nothing reads every header any more. A stand-alone `max_bytes` plan was not
+measured on its own; the difference between the `max_bytes` and `max_segments` opens above (41 ms cold, 11 ms warm at
+10,000 segments) is about what its `stat`s cost. There is no cheaper way to learn a file's size than a `stat`, so this
+is left as it is.
+
+**What to do about it:**
+
+- **Choose the segment size from the history you keep.** Segments kept = bytes kept / segment size: 1 TiB at the
+  default 128 MiB is 8,192 segments, at 1 MiB about a million. Keep the count in the low thousands where checkpoints,
+  seeks or opens are on a latency path; what larger segments cost instead is in "Choosing a segment size" above (use a
+  seek index with large segments).
+- **Bound it with retention:** `max_segments` states the count directly and reads the least; `max_bytes` and
+  `max_age` bound it through the segment size.
+- **Archive the rest elsewhere.** `tickertape archive --to` (or `Action::MoveTo`) moves old segments to another
+  directory, where they cost the live journal's listings nothing; a reader can be opened on the archive.
+- **Keep retention off the appending thread:** with `request_checkpoint` the listing runs on the checkpoint thread.
+- **Seek less often in large journals:** each seek costs a listing, whatever its distance; reading forward costs none.
+- **Keep stray files out of the journal directory**, above all files named like segments (`{N:020}.tape`) that are not:
+  a waiting reader reads up to 256 of their headers per listing (at most once a second, ADR 0050, issue #89), all of
+  them at its first check after an open or a seek, and `verify` reports them. With `M` of them, a header written into
+  one in place is seen only after about ⌈M/256⌉ × 1.1 s (1,000 strays: about 4.4 s), so a damaged slot that such a file
+  would show is reported that much later (crash contract C11). The reader keeps 16 bytes per stray name, and a listing
+  17 bytes per later name.
+
+There is no cached listing (ADR 0046, amended 2026-11-27): retention, archivers in other processes and recovery change
+the directory at any time, and a stale listing would send a reader to a segment that is gone.
 
 ## Disk space
 
