@@ -35,6 +35,9 @@ pub enum Point {
     /// [`hold_background`]. A background checkpoint also stops at [`Point::CheckpointSync`] (before it syncs anything)
     /// and [`Point::CheckpointMarkerSync`], on its own thread.
     CheckpointBeforeMarker,
+    /// A background checkpoint has opened a segment its list had released again (ADR 0038 → Bounded open segments),
+    /// before it syncs it: hold it there with [`hold_background`].
+    CheckpointReopen,
     /// Renaming a retention segment (inject EXDEV to exercise the copy path).
     RetentionRename,
     /// Syncing the checkpoint marker in `retention::apply` (an archiver other than the writer), after reading the slot
@@ -116,7 +119,8 @@ pub enum Point {
     /// Syncing the zeroing of an abandoned write (a fill closure that panicked or declined).
     AbandonedWriteSync,
     /// Starting the early write-back of segment data on the write-back helper thread (Linux; arm with
-    /// [`fail_next_background`]).
+    /// [`fail_next_background`], or hold the helper there, with the segment file it is about to write back, with
+    /// [`hold_background`]).
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     EarlyWriteback,
     /// A seek index builder has created its temporary file (the fence), before it reads the marker. The points of the

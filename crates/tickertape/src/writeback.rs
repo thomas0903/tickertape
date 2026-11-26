@@ -316,6 +316,7 @@ fn same(current: &Weak<File>, file: &Arc<File>) -> bool {
 
 #[cfg(target_os = "linux")]
 fn start(file: &File, from: u64, len: u64) -> std::io::Result<()> {
+    crate::fault::hold_point(crate::fault::Point::EarlyWriteback);
     crate::fault::inject_background(crate::fault::Point::EarlyWriteback)?;
     crate::mmap::start_writeback(file, from, len)
 }

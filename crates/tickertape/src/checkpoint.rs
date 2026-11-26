@@ -324,11 +324,17 @@ fn steps(job: &Job, ctx: &Context, on: On) -> Result<CheckpointSlot> {
                 Arc::clone(file)
             }
             None => {
+                // One reopened segment at a time: the previous one is closed first (the barrier is the last segment,
+                // which a list always holds), so a checkpoint holds at most one descriptor more than its list's.
+                drop(barrier.take());
                 let file = seg
                     .id
                     .ok_or_else(|| io::Error::other("the segment's file identity is unknown"))
                     .and_then(|id| reopen(&seg.path, id))
                     .map_err(|e| Error::io("reopen segment", &seg.path, e))?;
+                if on == On::Background {
+                    crate::fault::hold_point(crate::fault::Point::CheckpointReopen);
+                }
                 if cfg!(target_vendor = "apple") && seg.mapped {
                     mmap::msync_file(&file, seg.from, seg.to - seg.from)
                         .map_err(|e| Error::io("msync segment", &seg.path, e))?;

@@ -28,8 +28,9 @@ draws conclusions from those two.
   segment's file; replay opens each segment it enters. These costs grow with the number of segments, so very small
   segments in a long-lived journal make them add up (ADR 0042). Measured on local SSD (`benchmarks.md`, 2026-11-25):
   journals of 10,000, 20,000 and 100,000 segments open, recover, replay and checkpoint, and no operation held more
-  than 12 open files at 10 to 20,000 segments (not sampled at 100,000), so the limit on open files (`ulimit -n`) is not
-  a constraint on the number of segments. The directory read is: each seek costs about 3 ms at 10,000 segments, 6 ms at 20,000 and 29 ms at 100,000,
+  than 12 open files at 10 to 20,000 segments (not sampled at 100,000). What a writer can hold at most does not depend
+  on the number of segments either (at most 20 files, "Open files" below), so the limit on open files (`ulimit -n`) is
+  not a constraint on the number of segments. The directory read is: each seek costs about 3 ms at 10,000 segments, 6 ms at 20,000 and 29 ms at 100,000,
   also with a seek index, and each retention run opens every header (x86-64: 29 ms at 10,000 segments, 67 ms at 20,000,
   0.34 s at 100,000 with a warm cache; seconds when it is cold, as at the open of a writer after a reboot). The appending
   thread pays for that in `checkpoint()` and in the open; a background checkpoint (`request_checkpoint`) runs retention
@@ -106,6 +107,30 @@ choices.
 **Sustained high byte rates on Linux.** Under steady write-back (minutes of writing, gigabytes of dirty pages), ext4
 itself occasionally stalls the writer for milliseconds, with or without prefaulting (ADR 0025). Plan disk
 throughput with headroom: a small cloud VM stalled for hundreds of milliseconds at about 100 MB/s sustained.
+
+## Open files
+
+A writer holds at most 18 files open (19 on Linux by default, 20 on Linux with the spare segment), whatever the
+number of segments and however far its background checkpoints fall behind (ADR 0054; ADR 0038 → Bounded open
+segments):
+
+- **4 always:** `writer.lock`, the marker `checkpoint`, the wake-up region and the active segment.
+- **Up to 12 sealed segments not yet checkpointed:** the 4 newest of each of three lists, the writer's own (segments
+  rolled past since the last `request_checkpoint`), the background checkpoint's that is running, and the one waiting
+  behind it (later requests join that one). The older segments of a list are closed, and the checkpoint that covers
+  them opens them again, one at a time: **1** more.
+- **1 during a roll:** the new segment, before the old one joins the writer's list.
+- **Linux, early write-back on (the default):** **1**, the segment the helper is writing back, which can be one that
+  every list has closed when the helper falls behind.
+- **Linux, spare segment on:** **1**, the spare being prepared or ready. On macOS a roll waits for the spare and makes
+  it its new segment, so the spare adds nothing to the roll's.
+
+The most is reached only while a background checkpoint runs, another waits behind it, and each covers at least five
+segments. A writer whose background checkpoints keep up holds far fewer: 8 in the `tt-scale` runs above, counting the
+process's own 3, and 12 while it opened a journal without a marker. A retention run on the checkpoint thread runs
+between checkpoints and opens a few files at a time, fewer than the checkpoint's list. Your process's own descriptors
+(standard input, output and error) and your readers come on top. `tests/open_segments.rs` drives a writer into that
+state with hold points and checks the number exactly, on both platforms.
 
 ## Choosing a checkpoint interval
 

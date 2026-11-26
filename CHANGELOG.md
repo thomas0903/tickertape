@@ -5,6 +5,12 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
+- Docs: `docs/operations.md` → Open files states how many files a writer can hold open: at most 18, 19 on Linux by
+  default and 20 on Linux with the spare segment, whatever the number of segments and however far its background
+  checkpoints fall behind (ADR 0054, issue #73). A checkpoint now closes each segment it reopens before it opens the
+  next, which lowered that number by one. The descriptor tests of `tests/open_segments.rs` reach the worst case with hold
+  points (new: `fault::Point::CheckpointReopen`, and `fault::Point::EarlyWriteback` as a hold point) instead of
+  depending on machine load, and the spare-segment one is no longer ignored.
 - Changed: the zero-copy reader (`Reader::open_mapped`, and the mapped readers of the C, C++ and Java bindings) bounds its
   loads by the checkpoint marker (ADR 0048, issue #62). A damaged length in a record that the marker covers no longer
   makes it load bytes past the marker's position, where a writer may be storing: such a frame is read with `pread` into a

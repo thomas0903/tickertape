@@ -312,7 +312,8 @@ keeps at most four rolled segments, skipping the oldest one's early write-back i
 only a head start). **Four** because a writer that checkpoints at least once per roll then does not reopen a segment (unless its
 requests pile up behind a slow background checkpoint, above),
 and because a few lists of four (the writer's, a running and a queued job's, the helper's) stay far below the usual
-descriptor limits, whatever the segment count.
+descriptor limits, whatever the segment count (the total, 18 to 20 files, is stated in ADR
+[0054](0054-stated-bound-on-a-writers-open-files.md) and `docs/operations.md` → Open files).
 
 A checkpoint opens each released segment again by path, checks that it is the same file (device and inode), and
 syncs it there; on macOS it also maps it again and calls `msync` on the range first. The journal directory is made
