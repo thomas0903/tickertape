@@ -100,7 +100,7 @@ later segment, is newer than its earlier segments. In each of them the files do 
 
 A visible reader that keeps up with a writer and never waits 100 ms makes no check after its first. One comparison
 (`Option::is_none`) is added to an empty poll. Measured on a busy Apple M4 Pro (informal): an empty poll of the zero-copy
-reader 21.4 ns before, 22.6 ns after; of the safe reader about 290 ns either way; the first empty poll after opening
+reader 21.1 to 21.3 ns before, 21.3 to 21.6 ns after; of the safe reader about 285 ns either way; the first empty poll after opening
 0.4 µs before, 21 µs after with 2 segments and 2 ms with 5,000 (the listing). The record path compiles to the same
 instructions on x86-64 and aarch64, but the state is boxed: as a field of `Reader`, its 40 bytes moved the fields of the
 record path so that the zero-copy reader replayed 64-byte records in twice the time on that machine, and padding of the
