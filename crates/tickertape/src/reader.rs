@@ -31,10 +31,6 @@ const TAIL_CHUNK: usize = 4 * 1024;
 const TAIL_FILLS: u16 = 16;
 /// While the reads are tail reads, one fill in this many reads a whole chunk anyway ([`Reader::fill_size`]).
 const TAIL_PROBE: u16 = 256;
-/// How long a reader that blocked for a record must have waited at its slot for the record's fill to count towards tail
-/// reads ([`Reader::fill_size`]): a blocking reader that reads less blocks more often, and each wait costs the writer a
-/// wake-up call.
-const TAIL_BLOCKED_WAIT: Duration = Duration::from_micros(20);
 /// Longest single block on the wake-up region when the writer maintains it (bounded so that a writer that died, or a
 /// missed wake-up, costs at most this much latency; the identity check also runs at least this often).
 const NOTIFY_MAX_WAIT: Duration = Duration::from_millis(100);
@@ -190,12 +186,11 @@ struct SlotWait {
     /// The segment and offset of the slot.
     base: u64,
     offset: u64,
-    /// When the reader first found it empty.
-    since: Instant,
     /// Whether the reader found the slot empty with the wake-up region attached.
     attached: bool,
     /// Whether it later found the slot empty while the region was taken out, that is, from inside [`Reader::block_on`],
-    /// registered as a waiter (the writer then makes a wake-up call for the record).
+    /// registered as a waiter (the writer then makes a wake-up call for the record). [`Reader::blocked_for`] also counts
+    /// a fill made from inside `block_on`, when its check finds the record.
     blocked: bool,
 }
 
@@ -1345,18 +1340,18 @@ impl Reader {
         let now = Instant::now();
         let since = *self.waiting_since.get_or_insert(now);
         let waited = now.duration_since(since) >= IDENTITY_CHECK_INTERVAL;
-        self.note_wait(now);
+        self.note_wait();
         if waited || self.wait.listed.is_none() {
             self.check_head(now, waited)?;
         }
         Ok(())
     }
 
-    /// Keeps, for [`Reader::fill_size`], when the reader first found the slot at the cursor empty, and whether it found it
-    /// empty again while registered as a waiter: [`Reader::block`] takes the wake-up region out of the waker for the
-    /// whole of [`Reader::block_on`], whose check of the slot comes here. A reader without a region never counts as
-    /// blocked; the writer makes no wake-up calls for it.
-    fn note_wait(&mut self, now: Instant) {
+    /// Keeps, for [`Reader::fill_size`], that the reader found the slot at the cursor empty, with or without the wake-up
+    /// region attached, and whether it found it empty again while registered as a waiter: [`Reader::block`] takes the
+    /// region out of the waker for the whole of [`Reader::block_on`], whose check of the slot comes here. A reader
+    /// without a region never counts as blocked; the writer makes no wake-up calls for it.
+    fn note_wait(&mut self) {
         let attached = self
             .waker
             .as_ref()
@@ -1374,7 +1369,6 @@ impl Reader {
                 *other = Some(SlotWait {
                     base: slot.0,
                     offset: slot.1,
-                    since: now,
                     attached,
                     blocked: false,
                 });
@@ -1770,10 +1764,10 @@ impl Reader {
     /// when it is [`TAIL_CHUNK`]. Not observable except through timing and system calls (ADR 0052).
     ///
     /// A fill *follows* if the slot at the cursor was found empty before it (so the reader was waiting for this record),
-    /// the reader used exactly one record of the last fill (so it was waiting for that one too), and, if the reader
-    /// blocked for this record (registered as a waiter, so that the writer made a wake-up call), it had waited at the
-    /// slot for at least [`TAIL_BLOCKED_WAIT`]: a blocking reader that reads less blocks for more records, and the writer
-    /// pays for each. After [`TAIL_FILLS`]
+    /// the reader used exactly one record of the last fill (so it was waiting for that one too), and the reader did not
+    /// block for this record ([`Reader::blocked_for`]). A blocking reader that reads less blocks for more records, and the
+    /// writer pays a wake-up call for each, so a reader that blocks reads whole chunks, however long it waited; one that
+    /// stops blocking counts again from its first fill that follows. After [`TAIL_FILLS`]
     /// such fills in a row, that one included, the reads are tail reads, for as long as every fill follows, except that one
     /// in [`TAIL_PROBE`] of them reads a whole chunk anyway. The first one that does not follow is a whole chunk again, and
     /// the count starts over: the reader found the next record without waiting, or more than one record in the last fill.
@@ -1796,7 +1790,7 @@ impl Reader {
         let follows = self.waiting_since.is_some()
             && first
                 .is_some_and(|w| w != format::SEAL_MARKER && format::align8(u64::from(w)) == used)
-            && !self.blocked_briefly(offset);
+            && !self.blocked_for(offset);
         // The fill counted `probe` reads a whole chunk; the count then goes on as from the first tail read.
         let probe = TAIL_FILLS + TAIL_PROBE - 1;
         self.wait.tail_fills = match self.wait.tail_fills {
@@ -1811,13 +1805,17 @@ impl Reader {
         }
     }
 
-    /// Whether the reader blocked for the record at `offset` and found it within [`TAIL_BLOCKED_WAIT`] of first finding its
-    /// slot empty. Reads the clock only for a reader that blocked.
-    fn blocked_briefly(&self, offset: u64) -> bool {
+    /// Whether the reader registered as a waiter for the record at `offset`: it found the slot empty again from inside
+    /// [`Reader::block_on`], or it is filling from inside `block_on` now (its check found the record), which shows as the
+    /// wake-up region taken out of the waker after it was attached when the slot was first found empty.
+    fn blocked_for(&self, offset: u64) -> bool {
+        let taken = || {
+            self.waker
+                .as_ref()
+                .is_some_and(|w| !crate::notify::Waker::attached(w))
+        };
         self.wait.tail_wait.is_some_and(|w| {
-            w.blocked
-                && (w.base, w.offset) == (self.seg.base, offset)
-                && w.since.elapsed() < TAIL_BLOCKED_WAIT
+            (w.base, w.offset) == (self.seg.base, offset) && (w.blocked || (w.attached && taken()))
         })
     }
 
@@ -2593,8 +2591,8 @@ mod wake_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        CHUNK, Reader, SlotOutcome, TAIL_BLOCKED_WAIT, TAIL_CHUNK, TAIL_FILLS, TAIL_PROBE,
-        VALIDATION_RETRIES, VALIDATION_WINDOW, resize_buf,
+        CHUNK, Reader, SlotOutcome, TAIL_CHUNK, TAIL_FILLS, TAIL_PROBE, VALIDATION_RETRIES,
+        VALIDATION_WINDOW, resize_buf,
     };
     use crate::mmap::MAPPED_READS;
     use crate::{CorruptReason, Error, NewRecord, ReaderConfig, Writer, WriterConfig};
@@ -3014,47 +3012,49 @@ mod tests {
     }
 
     /// A reader that blocked for its records (registered as a waiter, so that the writer made a wake-up call for each)
-    /// counts a fill towards tail reads only if it waited at the slot for at least `TAIL_BLOCKED_WAIT`. The block is
-    /// simulated as `block` does it: the wake-up region is taken out of the waker while the slot is read again.
+    /// reads whole chunks, however long it waited: the rule has no time in it. Blocks are simulated as `block` makes them:
+    /// the wake-up region is taken out of the waker while `block_on` reads the slot again, and that read either finds the
+    /// slot still empty or finds the record. A reader that stops blocking counts again from its first fill that follows.
     #[test]
-    fn a_reader_that_blocked_briefly_reads_whole_chunks() {
-        fn blocked(f: &mut Follow, waited: Duration) -> u64 {
+    fn a_reader_that_blocked_reads_whole_chunks() {
+        /// One record that the reader blocked for: `in_check` if `block_on`'s own check found it, otherwise after the slot
+        /// was found empty there too. Returns the size of its fill.
+        fn blocked(f: &mut Follow, in_check: bool) -> u64 {
             f.poll_empty();
-            let waker = f.reader.waker.as_mut().expect("wake-ups are on");
-            let region = waker.take().expect("the writer created a region");
-            f.poll_empty();
-            f.reader.waker.as_mut().unwrap().put(region);
-            let wait = f.reader.wait.tail_wait.as_mut().unwrap();
-            assert!(wait.attached && wait.blocked);
-            // The clock as if the wait had begun `waited` ago.
-            wait.since = Instant::now() - waited;
+            let mut region = f.reader.waker.as_mut().unwrap().take();
+            if !in_check {
+                // Still empty in `block_on`'s check: the reader waits, wakes, and reads with the region put back.
+                f.poll_empty();
+                let wait = f.reader.wait.tail_wait.unwrap();
+                assert!(wait.attached && wait.blocked);
+                f.reader.waker.as_mut().unwrap().put(region.take().unwrap());
+            }
             f.append(1, 64);
             let fills = f.read(1, 64);
+            if let Some(region) = region {
+                f.reader.waker.as_mut().unwrap().put(region);
+            }
             assert_eq!(fills.len(), 1);
             fills[0]
         }
-        let short = TAIL_BLOCKED_WAIT / 2;
-        let long = TAIL_BLOCKED_WAIT + Duration::from_millis(10);
         let mut f = Follow::new(1 << 20);
-        // Blocked, and not for long: never tail reads.
-        for _ in 0..4 * TAIL_FILLS {
-            assert_eq!(blocked(&mut f, short), CHUNK as u64);
+        let waker = f.reader.waker.as_ref();
+        assert!(waker.is_some_and(crate::notify::Waker::attached));
+        // Blocked, whichever way the wait ended: never tail reads.
+        for i in 0..8 * TAIL_FILLS {
+            assert_eq!(blocked(&mut f, i % 3 == 0), CHUNK as u64);
         }
-        // Blocked for long: tail reads after `TAIL_FILLS` fills.
+        // A reader that stops blocking counts from its first fill that follows.
         for _ in 1..TAIL_FILLS {
-            assert_eq!(blocked(&mut f, long), CHUNK as u64);
+            assert_eq!(f.follow(64), CHUNK as u64);
         }
-        for _ in 0..TAIL_FILLS {
-            assert_eq!(blocked(&mut f, long), TAIL_CHUNK as u64);
-        }
-        // One brief block ends them, and the count starts over.
-        assert_eq!(blocked(&mut f, short), CHUNK as u64);
-        assert_eq!(blocked(&mut f, long), CHUNK as u64);
-        // Waits without blocking (a spinning reader, or one whose writer keeps no region) count however short they are.
-        f.at_once(64);
-        f.shrink();
         assert_eq!(f.follow(64), TAIL_CHUNK as u64);
-        // Without a region, a reader found the slot empty only "unattached": that is not a block.
+        // One block ends the tail reads, in either way, and the count starts over.
+        assert_eq!(blocked(&mut f, false), CHUNK as u64);
+        f.shrink();
+        assert_eq!(blocked(&mut f, true), CHUNK as u64);
+        f.shrink();
+        // Without a region, a reader finds slots empty only "unattached": that is not a block.
         f.reader.waker = None;
         for _ in 0..4 {
             assert_eq!(f.follow(64), TAIL_CHUNK as u64);
@@ -3213,7 +3213,6 @@ mod tests {
             reader.wait.tail_wait = Some(super::SlotWait {
                 base: 1,
                 offset: 2,
-                since: Instant::now(),
                 attached: true,
                 blocked: true,
             });
