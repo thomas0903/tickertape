@@ -37,6 +37,27 @@ headers, alignment, segment metadata and filesystem traffic. The two groups are
 separate runs, so their reported rates can vary. Criterion stores reports under
 `target/criterion/`. Plotting is disabled to keep dependencies and MSRV checks small.
 
+The `append/latency` group repeats `append/records/prefault` with the writer's latency histograms on (ADR 0047), in both
+modes that record something.
+
+### What the writer's latency histograms cost (ADR 0047)
+
+`tt-append-cost` gives the instructions of one append and the parts of a timed one:
+
+```sh
+cargo build -p tickertape-bench --release --bin tt-append-cost
+# Twice, with two counts; the difference of the totals / the difference of the counts. In one segment, no helper threads.
+valgrind --tool=callgrind --callgrind-out-file=/dev/null target/release/tt-append-cost append --dir /tmp/a --count 200000 --payload 64
+valgrind --tool=callgrind --callgrind-out-file=/dev/null target/release/tt-append-cost append --dir /tmp/b --count 400000 --payload 64
+target/release/tt-append-cost parts
+```
+
+For a base commit that does not have the histograms, build the same file there without the lines marked
+`[not in the base]`: `grep -v '// \[not in the base\]'`. The time of an append is compared with the `append` benchmark,
+as interleaved pairs in alternating order of the two builds, and of the base with a second build of the base: a run says
+nothing about a difference that is smaller than base against base. `tt-latency --writer-latency` and `--snapshot-ms` give
+the tail of the visible latency with the histograms on.
+
 ## Cross-process visible latency
 
 ```sh

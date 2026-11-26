@@ -16,6 +16,8 @@ The sustained-workload, checkpoint, comparison, reader and scale results and the
 bare-metal sections. The scale cases that run left out (10,000 segments and more, archived history, damage, catch-up, the
 zero-copy reader, seek indexes) ran on 2026-11-25 on machines of the same types
 ([below](#2026-11-25-replay-and-recovery-at-scale-the-gaps-of-100-google-cloud-vms)).
+What the writer's latency histograms cost (ADR 0047) is
+[under 2026-11-26](#2026-11-26-what-the-writers-latency-histograms-cost-adr-0047-google-cloud-vms).
 The profiles of v1.0.0's readers, notification and serialization paths (where the CPU time goes, and
 what remains per record) are [under 2026-11-25](#2026-11-25-where-the-cpu-time-goes-profiles-of-the-readers-notification-and-serialization-google-cloud-vms).
 
@@ -2191,6 +2193,156 @@ commits stated above). Rates are of these machines and do not carry over to othe
   (`Action::MoveTo`) can fall behind for as long as checkpoints stay queued (ADR 0044 → Amendment): not measured.
   Under sustained overload watch `tickertape status` (`segments.before_checkpoint`, `segments.total_bytes`, the
   checkpoint's age and the storage headroom thresholds).
+
+## 2026-11-26, what the writer's latency histograms cost (ADR 0047, Google Cloud VMs)
+
+The measurements that ADR [0047](decisions/0047-latency-histograms.md) requires before the writer's histograms
+(`WriterConfig::latency`) may be described by their cost: the instructions and time an append gains with the option
+off, what `LatencyMode::All` adds, the tail of the visible latency, and the replay benchmark (issue #61). **4 vCPUs,
+virtual machines: these are comparisons between builds on one machine in one session, not throughput or latency
+results.** Base is `main` at `e08c364` (with a second build of it, "base 2"); v1.0.0 is the released code; the change is
+`966ad05`.
+
+### Environment and method
+
+| | x86-64 | aarch64 |
+|---|---|---|
+| Machine | `c4-standard-4-lssd` (us-central1-c): Intel Xeon 6985P-C, 2 cores with 2 threads each, 15 GB | `c4a-standard-4-lssd` (us-east1-b): Google Axion (Neoverse-V2), 4 cores, 16 GB |
+| Kernel, OS | 7.0.0-1017-gcp, Ubuntu 24.04 | the same |
+| Clock source | `tsc` | `arch_sys_counter` |
+| Filesystem | ext4 (`-E lazy_itable_init=0,lazy_journal_init=0`, `noatime`) on a local NVMe SSD; `TMPDIR` on it | the same |
+| CPUs | the benchmark on CPU 1, whose SMT sibling (CPU 3) was offline; helper threads on the others | the benchmark on CPU 1 |
+| rustc, Valgrind | 1.100.0, 3.22.0 | the same |
+
+- **Instructions** (gate 1): `tt-append-cost append --payload 64 --count N` (and 1,024 B), no helper threads
+  (`prefault(false)`), in one 128 MiB segment, under `valgrind --tool=callgrind`; the difference of the totals for
+  N = 200,000 and 400,000 (50,000 and 100,000 at 1,024 B) divided by the difference of the counts. Exact to a fraction
+  of an instruction, and the same in every session.
+- **Time** (gate 2 and the cost of `All`): the `append` benchmark, `append/records/prefault/{64,1024}` and
+  `append/latency/{RollsAndCheckpoints,All}/{64,1024}`, each run a separate process,
+  `taskset -c 1 <bench> --bench --warm-up-time 1 --measurement-time 1 '^<id>$'`, as pairs: in each round every build
+  once, in an order that alternates direction and starts at a different build each round. The figure per run is
+  Criterion's mean per batch of 16,384 appends, divided by 16,384. The table gives the mean of the paired differences
+  against base with its 95 % confidence interval (Student's t). A run is valid only if base 2 against base lies
+  within the bound (1 ns at 64 B, 2 % at 1,024 B).
+- **Parts:** `tt-append-cost parts`, three times (smallest of nine rounds of 5 million calls each).
+- **Tail:** `tt-latency run --rate 100000 --count 3100000 --warmup 100000 --payload 64 --reader mapped --json`, with
+  `--writer-latency` and `--snapshot-ms` as in the table, the writer's main thread pinned to CPU 1 and the reader's to
+  CPU 0 from outside (`taskset -p`, since v1.0.0's tool has no pinning options), helpers unpinned, 3 runs per build,
+  interleaved; on x86-64 with all four CPUs online.
+- **Replay:** `taskset -c 1 <replay bench> --bench --warm-up-time 1 --measurement-time 2 records`, 8 rounds, interleaved.
+
+Raw output (JSON lines per run, environment, scripts) is kept outside the repository.
+
+### Off: gate 1, instructions per append
+
+| | x86-64, 64 B | x86-64, 1,024 B | aarch64, 64 B | aarch64, 1,024 B |
+|---|---|---|---|---|
+| base (`e08c364`), base 2 | 383 | 898.9 | 366 | 994.0 |
+| v1.0.0 | 381 | 896.9 | 363 | 991.0 |
+| change, `Off` | **363** (−20) | 878.9 | **355** (−11) | 983.0 |
+| change, `RollsAndCheckpoints` | 363 | 878.9 | 355 | 983.0 |
+| change, `All` | 578 (+195) | 1,093.9 | 562 (+196) | 1,190.0 |
+
+**Gate 1 is met on both:** the change has fewer instructions per append than its base. That is luck of the compiler's
+inlining more than a property of the change, and can move by tens of instructions with unrelated code:
+the same change on top of `a80f912`, the base a day earlier, had 7 more than its base on x86-64 (390 against 383),
+because the compiler no longer inlined the record's CRC helpers into `Writer::append`; forcing them inline brought
+x86-64 to 380 and put aarch64 at 369. The amendment of ADR 0047 has the details.
+
+### Off: gate 2, time per append (ns)
+
+| | x86-64, 64 B | x86-64, 1,024 B | aarch64, 64 B | aarch64, 1,024 B |
+|---|---|---|---|---|
+| Pairs | 125 | 26 | 36 | 36 |
+| base, mean of its runs | 40.68 | 330.4 | 42.25 | 392.5 |
+| **base 2 − base (the noise floor)** | −0.33 [−0.61, −0.06] | −0.46 % [−1.56, +0.64] | +0.22 [−0.06, +0.51] | −0.35 % [−0.80, +0.10] |
+| v1.0.0 − base | −0.56 [−0.97, −0.14]¹ | −0.06 % [−0.98, +0.85]¹ | −0.31 [−0.55, −0.07] | −0.43 % [−1.08, +0.22] |
+| **`Off` − base** | +0.37 [+0.01, +0.74] | −0.61 % [−1.67, +0.45] | −0.70 [−0.84, −0.55] | +0.13 % [−0.54, +0.80] |
+| **`RollsAndCheckpoints` − base** | +0.22 [−0.09, +0.52] | −0.10 % [−1.49, +1.29] | −0.78 [−0.92, −0.65] | −0.16 % [−0.74, +0.42] |
+| Bound | 1 ns | 2 % | 1 ns | 2 % |
+| Run valid, gate met | yes, yes | yes, yes | yes, yes | yes, yes |
+
+¹ From an earlier session on the same machine type with the same base and v1.0.0 binaries (70 pairs); the session of
+this column did not build v1.0.0.
+
+**Gate 2 is met on both, in valid runs.** On x86-64 the change is slower at 64 B by about 0.4 ns (the interval excludes
+0, by a hair) although it has 20 fewer instructions; on aarch64 it is 0.7 ns faster. Code layout, not work, is the
+likely cause in both directions. Earlier runs of code that was not merged: on top of `a80f912`, with the writer's SMT
+sibling online, 40 pairs on x86-64 gave a 1,024 B run that was **invalid** (base 2 − base [−0.49, +2.43] %; the change
++3.13 % [+1.02, +5.25]), which is why the sibling was taken offline for the runs above, where base 2 − base at 1,024 B
+is three times tighter; and a build with the CRC helpers forced inline was valid and met both gates on both
+architectures (x86-64, 70 pairs: `Off` +0.05 ns [−0.40, +0.50] and +0.29 % [−0.58, +1.17]).
+
+### `All`: the cost per append
+
+| | x86-64 | aarch64 |
+|---|---|---|
+| Added to a 64-byte append (paired, 95 % interval) | **+60.5 ns** [+60.0, +61.0] (26 pairs; 40.5 → 101.0 ns) | **+83.4 ns** [+83.2, +83.6] (36 pairs; 42.3 → 125.7 ns) |
+| Added to a 1,024-byte append | +47.3 ns [+43.2, +51.5] (+14 %) | +44.3 ns [+41.8, +46.7] (+11 %) |
+| Clock pair alone (`Instant::now()` and `elapsed()`) | 45.5–46.0 ns | 71.8–71.9 ns |
+| Histogram update alone (the update with its value, less the value alone) | about 2.0 ns (2.44–2.46 less 0.31–0.51) | about 2.1 ns (2.56 less 0.42) |
+| p50 of an empty timed interval (the floor of every sample) | 21–22 ns | 33 ns |
+| Appends/s with `All` (from the paired means, 64 B, one thread) | 9.9 million | 8.0 million |
+
+**The published budget (60 ns added to a 64-byte append, of which 5 ns for the histogram) is not met:** x86-64 adds
+60.5 ns and aarch64 83.4 ns; the histogram's share (about 2 ns) is within its part. The docs therefore give the
+figures and do not call the option cheap. Almost all of it is the two clock reads: through the vDSO, a read takes about
+23 ns on x86-64 here and 36 ns on aarch64. With `All`, an append can cost more than the append itself.
+
+### Tail of the visible latency (µs), not gated
+
+Median of the runs per build [lowest..highest]. "Service" is the writer's own `append` histogram with `All`
+(`WriterLatency::append`), recorded in the same runs.
+
+| aarch64 (3 runs each) | p50 | p99 | p99.9 | max | service p50 | service p99.9 | service max |
+|---|---|---|---|---|---|---|---|
+| base | 0.26 | 0.35 [0.34..1.23] | 1.87 [1.86..2.23] | 928 [926..946] | | | |
+| base 2 | 0.26 | 0.35 [0.35..0.38] | 1.97 [1.87..2.37] | 926 [913..931] | | | |
+| v1.0.0 | 0.26 | 0.96 [0.87..2.31] | 2.41 [2.31..3.15] | 948 [898..960] | | | |
+| `Off` | 0.26 | 1.84 [1.07..1.89] | 2.81 [2.24..2.92] | 943 [940..944] | | | |
+| `RollsAndCheckpoints` | 0.26 | 0.35 [0.34..0.39] | 1.97 [1.91..2.11] | 946 [940..954] | | | |
+| `All` | 0.29 | 0.44 [0.40..1.67] | 2.07 [1.89..2.66] | 930 [907..934] | 0.121 | 2.08 | 192 [185..195] |
+| `All`, snapshot every 1 s | 0.29 | 1.36 [0.40..2.09] | 2.36 [1.86..2.99] | 922 [913..967] | 0.121 | 2.05 | 194 [184..209] |
+| `All`, snapshot every 10 ms | 0.29 | 0.40 [0.40..0.86] | 1.97 [1.95..2.85] | 942 [928..950] | 0.121 | 2.08 | 195 [190..205] |
+
+| x86-64 (3 runs each) | p50 | p99 | p99.9 | max | service p50 | service p99.9 | service max |
+|---|---|---|---|---|---|---|---|
+| base | 0.34 | 0.53 [0.53..2.09] | 2.74 [2.61..4.57] | 928 [757..979] | | | |
+| base 2 | 0.34 | 0.55 [0.53..0.58] | 5.96 [2.62..7.22] | 931 [906..935] | | | |
+| v1.0.0 | 0.33 | 3.25 [2.38..3.40] | 5.67 [4.82..5.83] | 956 [913..961] | | | |
+| `Off` | 0.33 | 2.99 [1.44..3.90] | 5.53 [3.62..6.74] | 1,010 [974..1,013] | | | |
+| `RollsAndCheckpoints` | 0.33 | 1.62 [1.15..2.94] | 3.74 [3.25..5.45] | 1,015 [912..1,035] | | | |
+| `All` | 0.36 | 1.74 [0.55..3.78] | 4.07 [2.42..6.10] | 966 [914..999] | 0.112 | 1.46 | 187 [181..189] |
+| `All`, snapshot every 1 s | 0.36 | 5.26 [5.08..5.34] | 7.63 [7.62..7.72] | 971 [947..984] | 0.113 | 1.57 | 186 [182..251] |
+| `All`, snapshot every 10 ms | 0.36 | 1.81 [0.59..2.03] | 3.90 [2.71..4.36] | 935 [850..1,020] | 0.113 | 1.41 | 178 [178..243] |
+
+In an earlier x86-64 session (5 runs each, the change on `a80f912` with the CRC helpers forced inline, SMT sibling
+online) the maxima were 903 (base), 904 (base 2), 898 (v1.0.0), 898 (`Off`), 882 (`RollsAndCheckpoints`), 909
+(`All`), 887 and 887 µs (with snapshots), and p99.9 ranged from 2.4 to 4.8 µs without an order between the builds.
+
+The maximum is about 0.9 ms in every build on both machines, with the option and without it, so it is not the option's. p99 and p99.9 move between runs of one build by more than between builds (on aarch64 `Off` against base 2, which
+runs the same instructions for an append that does not roll, is the largest gap), so three to five runs show no effect
+of the option on the tail. `All` raises p50 by 0.03 µs, about what a clock pair costs; snapshots, even every 10 ms, did
+not visibly change the writer's own service times. The service maximum (about 0.2 ms) is far below the visible
+maximum: most of the stall behind the visible maximum is outside the `append` calls, which is what
+`WriterLatency::append` warns of.
+
+### Replay (the reader side did not move)
+
+`replay/records/{safe,mapped}/{64,1024}`, mean time per run, change against base in % with the 95 % interval, 8 rounds,
+the same sessions as the tail on each machine (x86-64 with the SMT sibling offline):
+
+| | x86-64: base 2 | x86-64: change | aarch64: base 2 | aarch64: change |
+|---|---|---|---|---|
+| safe, 64 B | +0.36 [−1.48, +2.20] | +1.85 [−7.41, +11.12] | −1.09 [−6.06, +3.89] | +1.88 [−3.34, +7.11] |
+| safe, 1,024 B | −0.36 [−1.38, +0.66] | −1.40 [−3.14, +0.33] | −0.59 [−2.02, +0.85] | +0.15 [−1.51, +1.80] |
+| mapped, 64 B | +0.67 [−1.45, +2.79] | +0.44 [−5.82, +6.69] | −1.51 [−5.90, +2.89] | −4.27 [−8.67, +0.13] |
+| mapped, 1,024 B | +0.92 [−0.29, +2.12] | +1.18 [−2.07, +4.44] | −0.57 [−1.96, +0.82] | −1.65 [−3.02, −0.27] |
+
+Every interval of the change includes 0 or lies on the faster side, within what base 2 shows; the readers' code is not
+changed (`reader.rs`, `format.rs`, `mmap.rs`, `crc.rs` and `error.rs` are untouched). Eight rounds leave wide intervals
+at 64 B: they rule out a slowdown of several percent, not of one.
 
 ## 2026-11-25, where the CPU time goes: profiles of the readers, notification and serialization (Google Cloud VMs)
 

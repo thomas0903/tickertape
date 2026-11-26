@@ -1,7 +1,7 @@
 # 0047: Latency histograms in the library and the CLI
 
-- **Status:** accepted (2026-11-25; issue #61). Steps 1 and 2 of the build order are built; step 3, the writer's
-  histograms, is not
+- **Status:** accepted (2026-11-25; issue #61). All three steps of the build order are built (step 3, the writer's
+  histograms, on 2026-11-26; see the second amendment). The deferred list stands
 - **Date:** 2026-11-25
 - **Relates to:** [0032](0032-operational-metrics.md) (operational metrics; it added no work to `append`, and that
   stays true unless the option here is on), [0041](0041-batched-append.md), [0038](0038-background-checkpoints.md),
@@ -539,3 +539,38 @@ Found in the review of the implementation (PR #70). The decision does not change
 - **`poll` and `spin` "cost the writer nothing"** claimed more than is known. They make no system call in its appends and
   never register as a waiter; what a spinning reader costs through shared cache lines is not measured.
 - `sum()` of an interval without samples is zero also after saturation. `Debug` is written by hand.
+
+## Amendment (2026-11-26): step 3 as built
+
+The writer's histograms, as this record describes them, with these differences. The decision does not change.
+
+- **Instruction counts move with unrelated code.** The timed path calls `write_record` too, so the crate has two copies
+  of the append path, and the compiler's inlining of the CRC helpers into `Writer::append` (`finish_record_body`,
+  `record_crc`, `crc::crc32c`) changes with that and with unrelated changes elsewhere in the crate. On top of `a80f912`
+  the off path had 7 instructions per append more than the base on x86-64 (390 against 383); rebased on `e08c364` the
+  same code has 20 fewer (363) on x86-64 and 11 fewer (355 against 366) on aarch64, with `format.rs` and `crc.rs`
+  untouched. Forcing those helpers inline was tried: it fixed one base on one architecture and cost up to 6 instructions
+  on the other, so it was left out. Gate 1 holds for the merged code; it says little about the next unrelated change. The
+  fallback of "Where it lives" was not needed.
+- **The time-to-durable histogram is recorded with atomic read-modify-write operations** (`fetch_min`, `fetch_max`, a
+  saturating compare-and-swap loop for the sum, `fetch_add` with `Release` for the bucket), as decided; its loom model
+  has two recording threads. In practice the writer's thread and the checkpoint thread never record at the same time:
+  a blocking checkpoint first waits for the background ones.
+- **The "no system call" test is stronger than `strace -c`.** A child process makes two marker system calls around
+  20,000 appends and 2,000 batches without helper threads, in each mode, and the test fails on any system call of the
+  appending thread between them, not only `clock_gettime`. It is skipped without `strace` or without a vDSO clock source;
+  CI's Linux job installs `strace` and makes it required. The allocation test is `tests/allocation.rs`, per thread, with
+  every mode, rather than Valgrind's totals.
+- **"The compatibility fixtures and crash tests pass with it on"** was checked by running the workspace's tests once
+  with `LatencyMode::All` as the default (all passed but the test that the default is `Off`), and the kill loop's writer
+  now uses `All` for even seeds. That run is not repeated by CI.
+- **Measurement 2, the off time:** the first x86-64 run (of the change on `a80f912`) was invalid at 1,024 B by this
+  record's rule (base against base [-0.49, +2.43] %). The runs that decide the gate took the writer's SMT sibling
+  offline, which made base against base about three times tighter there. The invalid run is reported too.
+- **Measurement 4, the tail, pins the writer's and the reader's main thread from outside** (`taskset -p` on each child
+  process once it exists), because v1.0.0's `tt-latency` has no pinning options; the helper threads are not pinned. The
+  same is done for every build.
+- **The figures** are in `benchmarks.md` (2026-11-26). Off, both gates are met on x86-64 and aarch64. `All` adds
+  60.5 ns to a 64-byte append on x86-64 and 83.4 ns on aarch64, almost all of it the two clock reads (the histogram
+  about 2 ns). **The budget of 60 ns is missed on both** (narrowly on x86-64), so the documentation gives the figures and
+  does not call the option cheap; a cheaper clock stays deferred, as above.

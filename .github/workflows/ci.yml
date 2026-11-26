@@ -52,6 +52,15 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - run: cargo test --workspace --all-features --locked
+      # An append that does not roll makes no system call, with any latency mode (ADR 0047). Skipped without strace above.
+      - name: No system call in an append
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends strace
+          cargo test --workspace --all-features --locked --test writer_latency
+        env:
+          TICKERTAPE_REQUIRE_STRACE: '1'
       # Compile the optional recorder; never connect to an external feed in CI.
       - run: cargo build -p tickertape-examples --features live --locked
         if: matrix.os == 'ubuntu-latest'
