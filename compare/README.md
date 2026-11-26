@@ -252,8 +252,11 @@ wait, as before; it now leads a process group of its own within that session, so
 
 However a measurement ends — finished, a tool's failure, the runner's time limit (its records at the intended rate
 plus 120 s, plus the JVM warm-up allowance), SIGTERM, SIGINT, or SIGHUP when an ssh session drops — the runner ends
-each child's group that is still there: SIGTERM to the whole group, up to 3 s, then SIGKILL to the whole group, and it
-reaps the leader, so no zombie and no late writer stays behind. A signal that arrives while a child is being started
+each child's group that is still there, also when its leader has already exited (a failed tool that left a
+process behind): SIGTERM to the whole group, up to 3 s for every process in it (not only the leader) to end, then
+SIGKILL to the groups that are still there, and it reaps the leaders, so no zombie and no late writer stays behind. A
+group is not signalled again once the runner reaped its leader and found it empty, since its number may by then
+belong to another process; one that still had a member stays registered with the guard until it is ended. A signal that arrives while a child is being started
 or while the children are being stopped takes effect right after that. Further SIGTERM, SIGINT or SIGHUP are then
 ignored for the rest of the runner's life, so nothing cuts the cleanup short; to stop the runner at once, `kill -QUIT`
 or `kill -KILL` it, and the guard (below) still ends the children. The runner exits with 128 + the signal (143 for

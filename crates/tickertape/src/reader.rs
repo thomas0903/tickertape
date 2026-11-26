@@ -1,5 +1,6 @@
 //! Readers: replay and live tailing.
 
+use std::collections::VecDeque;
 use std::fs::File;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
@@ -22,6 +23,9 @@ const SEGMENT_LIST_INTERVAL: Duration = Duration::from_secs(1);
 /// How long a directory must have gone unmodified before it is listed for its modification time to tell a later change:
 /// well above the granularity of file systems' clocks.
 const DIRECTORY_SETTLED: Duration = Duration::from_secs(2);
+/// How many of the later names that it found not to be segments a reader at an empty slot reads again per listing, the
+/// ones it read longest ago (issue #89, [`Strays`]). Names it has not read before are all read.
+const STRAY_READS: usize = 256;
 /// Bytes the `pread` reader fetches at a time (more if a record is larger), except at the tail ([`Reader::fill_size`]).
 const CHUNK: usize = 64 * 1024;
 /// Bytes the `pread` reader fetches at a time (more if a record is larger) while it follows the writer with time to
@@ -190,8 +194,16 @@ enum After {
 }
 
 /// What a reader keeps about its waits at empty slots ([`Reader::wait`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// `#[repr(C)]`, in the order rustc chose before `strays` was added (`tail_wait` at 0, `listed` at 24, `tail_fills` at
+/// 64), so that the fill path of the `pread` reader ([`Reader::fill_size`], [`Reader::blocked_for`]) compiles as it
+/// did; `tests::waits_layout` pins it. Add new fields at the end.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[repr(C)]
 struct Waits {
+    /// The wait at the slot the reader last found empty, for [`Reader::fill_size`]. Written only at empty slots
+    /// ([`Reader::at_empty_slot`]), never on the record path.
+    tail_wait: Option<SlotWait>,
     /// The last time [`Reader::check_head`] looked for later segments: `None` if it has not run since the reader was
     /// opened or moved by a seek, or if it ended in an error. It then runs at the next empty slot without waiting first.
     listed: Option<Listed>,
@@ -199,9 +211,28 @@ struct Waits {
     /// `TAIL_FILLS + TAIL_PROBE - 1` and then from `TAIL_FILLS` again ([`Reader::fill_size`], ADR 0052). Written only by
     /// fills of the `pread` buffer, and by a `seek_to_end` that fails.
     tail_fills: u16,
-    /// The wait at the slot the reader last found empty, for [`Reader::fill_size`]. Written only at empty slots
-    /// ([`Reader::at_empty_slot`]), never on the record path.
-    tail_wait: Option<SlotWait>,
+    /// The later names that listings found not to be segments, for [`Reader::history_after`]. Forgotten when a seek
+    /// moves the cursor.
+    strays: Strays,
+}
+
+/// Names above the cursor that look like segments' names and have no valid header (stray files, or segments whose
+/// header never reached the disk), each with the inode number the listing gave for it, the one read longest ago first
+/// (issue #89).
+///
+/// Such a name is no evidence that the journal continues (ADR 0050), and hides none, but a header written into the file
+/// in place would make it some, so it can't be dismissed for good; reading every one again at every listing cost an
+/// idle reader of a directory with 10,000 of them 0.1 s or more, once a second. So a listing reads the names it has not
+/// read before (or whose inode number changed: another file at the name) all, and of the others at most
+/// [`STRAY_READS`], in turn. While there are at most that many, each is read at every listing, as before; with `M` of
+/// them, each is read at least once in every `ceil(M / STRAY_READS)` listings. A new name is read at the first listing
+/// that shows it, and so is a file renamed over a stray if its inode number differs from the stray's (otherwise it is
+/// read in its turn). A listing holds 17 bytes per later name (the names with their inode numbers, and a flag), and the
+/// queue 16 bytes per stray name.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct Strays {
+    /// `(base, inode number)`.
+    names: VecDeque<(u64, u64)>,
 }
 
 /// A wait at an empty slot, as [`Reader::fill_size`] needs it (ADR 0052).
@@ -439,6 +470,12 @@ impl Reader {
     /// a forged index coincides with suitable bytes in a payload (`docs/crash-contract.md`, C15). A reader that landed
     /// this way is not at a place a later seek starts from. No seek fails because of an index.
     ///
+    /// Every seek lists the journal's directory to choose the segment (ADR 0046): about 0.3 µs per segment with a warm
+    /// cache, 3 ms with 10,000 segments on the machine measured (`docs/benchmarks.md`), whatever the distance. There is
+    /// no cached listing, since retention, archivers in other processes and recovery change the files at any time and a
+    /// stale one would send the reader to a segment that is gone; keep the number of segments moderate
+    /// (`docs/operations.md` → How many segments to keep).
+    ///
     /// Retention may remove the segment holding `seq` while `seek` runs (between listing the segments and opening
     /// the chosen one). `seek` then lists the segments again, so it returns [`Error::SeqUnavailable`] with the new
     /// oldest sequence number, never an I/O error for the removed file. A segment removed just after `seek`
@@ -547,7 +584,16 @@ impl Reader {
     /// at the first empty slot after it was opened or moved by a seek, in that call, so that a replay up to the first
     /// `Ok(None)` is told; and at later ones after it has waited there for 100 ms (by the segments alone: at most once a
     /// second, and only if the directory changed since a listing showed nothing; a later segment counts only with a valid
-    /// header). No reader gets past such a slot: the records between it and the end of its segment can't be found, and
+    /// header). A later name without a valid header (a stray file) is no evidence, but it is read again, since a header
+    /// could be written into it in place: from 1.1, the first check after an open or a seek reads every such name, a
+    /// later listing every new one (or one that another file has replaced, by its inode number) and at most 256 of the
+    /// others, the ones read longest ago (issue #89). With `M` such names a header written into one in place is seen
+    /// within `ceil(M / 256)` listings (at the next one while `M` is at most 256), that is within about `ceil(M / 256)` ×
+    /// 1.1 s plus the spacing of the calls and the 50 ms below (`docs/crash-contract.md`, C11); a segment linked or
+    /// renamed into place, at the next listing if its file has another inode number than the stray it replaced (a
+    /// file system can reuse a freed number, and some FUSE file systems give every entry the same one), otherwise in
+    /// its turn.
+    /// No reader gets past such a slot: the records between it and the end of its segment can't be found, and
     /// every call returns the error again. `inspect::verify` reports it too; records after the checkpoint marker can be
     /// repaired by the writer's recovery, covered ones only from a copy of the segment. A slot that was emptied where
     /// nothing above covers it (in the newest segment at or after the marker, for example) can't be told from the head.
@@ -1030,6 +1076,8 @@ impl Reader {
         self.drop_copy();
         self.waiting_since = None;
         self.wait.listed = None;
+        // So that the first check after a seek reads every later name, as at the open.
+        self.wait.strays = Strays::default();
         self.superseded_checked = None;
     }
 
@@ -1062,6 +1110,8 @@ impl Reader {
             .map_or((base, format::SEGMENT_HEADER_LEN as u64), |m| {
                 (m.next_seq, m.offset)
             });
+        // Taken, not copied: the cursor's move forgets it anyway, and a failure puts it back.
+        let strays = std::mem::take(&mut self.wait.strays);
         let before = Place {
             seg: std::mem::replace(&mut self.seg, seg),
             offset: std::mem::replace(&mut self.offset, offset),
@@ -1080,7 +1130,10 @@ impl Reader {
             buf: std::mem::take(&mut self.buf),
             buf_start: self.buf_start,
             waiting_since: self.waiting_since,
-            wait: *self.wait,
+            wait: Waits {
+                strays,
+                ..(*self.wait).clone()
+            },
             found: self.found,
         };
         self.cursor_moved();
@@ -1457,10 +1510,12 @@ impl Reader {
     ///   cursor's sequence number, not the reader's own, that holds a record, which a writer appends only after it sealed
     ///   the segment before. (One without a record does not count: a writer links it before it stores the seal, and may
     ///   die in between. A file with such a name and no valid header does not count either: it is no segment of a writer.
-    ///   One with a valid header from another journal does, as it does for recovery and `verify`: ADR 0050.)
+    ///   One with a valid header from another journal does, as it does for recovery and `verify`: ADR 0050.) The later
+    ///   names that an earlier listing found not to be segments are read again in turn, not all at each listing
+    ///   ([`Strays`]).
     ///
     /// What can't be read, the marker or a segment, shows nothing.
-    fn history_after(&self, marker: Option<&CheckpointSlot>, list: bool) -> After {
+    fn history_after(&mut self, marker: Option<&CheckpointSlot>, list: bool) -> After {
         if let Some(m) = marker {
             if m.next_seq > self.next_seq || m.segment_base_seq > self.seg.base {
                 return After::Shown(m.next_seq);
@@ -1475,7 +1530,7 @@ impl Reader {
         };
         // The newest first: on a journal that continues, the first one opened decides.
         later.sort_unstable_by(|a, b| b.cmp(a));
-        if let Some(&base) = later.iter().find(|&&base| is_segment(&self.dir, base)) {
+        if let Some(base) = self.wait.strays.find_segment(&self.dir, &later) {
             return After::Shown(base);
         }
         let at_next = match next {
@@ -2010,8 +2065,50 @@ fn read_marker(dir: &Path) -> Option<Option<CheckpointSlot>> {
     Some(marker)
 }
 
+// After `impl Reader`, so that this impl block does not change the mangled names of `Reader`'s methods.
+impl Strays {
+    /// The base of a segment with a valid header among `later` (the names above the cursor with their inode numbers,
+    /// the newest first) that this listing reads, if any: every name not remembered with the same inode number, the
+    /// newest first, then at most [`STRAY_READS`] of the remembered ones, the one read longest ago first. Stops at the
+    /// first segment. A name read and found to be none is remembered at the back; names no longer listed are forgotten.
+    fn find_segment(&mut self, dir: &Path, later: &[(u64, u64)]) -> Option<u64> {
+        if later.is_empty() {
+            self.names.clear();
+            return None;
+        }
+        // Which listed names are remembered, by their place in `later` (sorted, the newest first): one byte a name.
+        let mut known = vec![false; later.len()];
+        self.names.retain(
+            |name| match later.binary_search_by(|probe| name.cmp(probe)) {
+                Ok(i) => {
+                    known[i] = true;
+                    true
+                }
+                Err(_) => false,
+            },
+        );
+        let remembered = self.names.len();
+        for (&name, _) in later.iter().zip(&known).filter(|(_, known)| !**known) {
+            if is_segment(dir, name.0) {
+                return Some(name.0);
+            }
+            self.names.push_back(name);
+        }
+        for _ in 0..remembered.min(STRAY_READS) {
+            let name = self.names.pop_front()?;
+            if is_segment(dir, name.0) {
+                return Some(name.0);
+            }
+            self.names.push_back(name);
+        }
+        None
+    }
+}
+
 /// Whether the file named for the segment with base `base` has a valid segment header (for that base and its own size).
 fn is_segment(dir: &Path, base: u64) -> bool {
+    #[cfg(test)]
+    tests::note_header_read();
     let path = journal::segment_path(dir, base);
     let valid =
         File::open(&path).is_ok_and(|file| journal::read_header(&file, &path, base).is_ok());
@@ -2277,6 +2374,10 @@ fn earliest(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
 #[cfg(test)]
 #[path = "reader_bound_tests.rs"]
 mod bound_tests;
+
+#[cfg(test)]
+#[path = "reader_stray_tests.rs"]
+mod stray_tests;
 
 #[cfg(test)]
 mod wake_tests {
@@ -2703,6 +2804,22 @@ mod tests {
         );
     }
 
+    /// The layout of [`super::Waits`]: the fields the `pread` reader's fill path reads stay where rustc put them before
+    /// the stray names were added (issue #89), so that path compiles as it did. 64-bit Linux and macOS only.
+    #[test]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    fn waits_layout() {
+        use super::Waits;
+        use std::mem::offset_of;
+        assert_eq!(offset_of!(Waits, tail_wait), 0);
+        assert_eq!(offset_of!(Waits, listed), 24);
+        assert_eq!(offset_of!(Waits, tail_fills), 64);
+        assert_eq!(offset_of!(Waits, strays), 72);
+    }
+
     thread_local! {
         /// How many of this thread's next non-empty slot reads [`scripted`] turns into a validation failure.
         static FAIL_READS: Cell<u32> = const { Cell::new(0) };
@@ -2711,6 +2828,21 @@ mod tests {
     thread_local! {
         /// The size of each fill of a `pread` buffer by this thread ([`note_fill`]).
         static FILLS: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    thread_local! {
+        /// How many later segments' headers this thread's readers have read ([`note_header_read`]).
+        static HEADER_READS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// Test builds only: a reader at an empty slot is about to read a later segment's header ([`super::is_segment`]).
+    pub(super) fn note_header_read() {
+        HEADER_READS.with(|n| n.set(n.get() + 1));
+    }
+
+    /// How many later segments' headers this thread's readers have read so far.
+    pub(super) fn header_reads() -> u64 {
+        HEADER_READS.with(Cell::get)
     }
 
     /// Test builds only: a `pread` buffer is about to be filled with `len` bytes.
@@ -3297,7 +3429,7 @@ mod tests {
                 (r.durable_next_seq, r.durable_segment_base),
                 (r.durable_offset, r.bound),
                 (
-                    (r.waiting_since, *r.wait),
+                    (r.waiting_since, (*r.wait).clone()),
                     r.superseded_checked,
                     format!("{:?}", r.found),
                 ),
@@ -3314,6 +3446,8 @@ mod tests {
             reader.durable_offset = 9;
             reader.bound = 1 << 12;
             reader.wait.tail_fills = 5;
+            // Taken into the saved state, not copied, and put back (issue #89).
+            reader.wait.strays.names = [(1_000_000, 7), (1_000_001, 8)].into();
             reader.wait.tail_wait = Some(super::SlotWait {
                 base: 1,
                 offset: 2,

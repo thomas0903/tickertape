@@ -27,6 +27,24 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   and 25.5 against 16.7–17.2 with the spare segment; not seen on aarch64, where those cells were repeated) and one
   aarch64 run with a 1.03 ms append that was not a roll. macOS was not measured conclusively (`docs/benchmarks.md` →
   "2026-11-26, finished segments released off the writer's thread").
+- Changed: a reader waiting at an empty slot no longer reads every later file name without a valid segment header
+  again at each listing (issue #89, ADR 0050 amendment of 2026-11-27). Such names (stray files named like segments) are
+  no evidence, but with 10,000 of them an idle visible reader's `try_next` spent 105–168 ms (macOS) or up to 32 ms
+  (Linux VM) once a second reading them (the issue reported 0.47–0.50 s, which was not reproduced). A listing now reads
+  every new name (or another file at a known name, by its inode number) and at most 256 of the others, the ones read
+  longest ago; the first check after an open or a seek still reads them all. A header written into such a file in place
+  is seen within `ceil(M / 256)` listings (`M` such names; at the next one up to 256, as before; crash contract C11), a
+  segment linked or renamed into place at the next one if its file has another inode number than the stray it replaced,
+  otherwise in its turn. A durable-only reader never makes this check while it waits at the marker. Informal, 10,000
+  empty stray names, a call that lists: 105–168 ms → 7.8–20 ms on an Apple M4 Pro, up to 32 ms → up to 7.7 ms in a
+  Linux VM (`docs/benchmarks.md`, 2026-11-27). The record path, `Reader`'s layout and the fill path are unchanged. No
+  API change.
+- Docs: `docs/operations.md` → "How many segments to keep" (issue #80): what grows with the number of segments (each
+  seek's listing, a checkpoint with retention, removals, a writer's open, `max_bytes` planning, `list_segments`), with
+  the figures of `docs/benchmarks.md` (2026-11-25, one x86-64 cloud machine), what a run still reads per file, and what
+  to do about it. ADR 0046 is amended: there is no cached listing for seeks, and `Reader::seek`'s rustdoc says what a
+  seek costs and why.
+
 - Docs: the comparison with Chronicle Queue, Aeron IPC, yaque, queue-file and a plain file is rerun at v1.0.0 with the
   corrected harness (issue #57): one 24-hour session on each of two Google Cloud VMs (x86-64 and aarch64, ext4 and xfs),
   session commit `fb2d91b0`, every tool pinned, the JVM tools warmed up through their measured loops, Chronicle with
@@ -43,6 +61,12 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   says that readers never slow the writer down (a blocking reader costs the writer a wake-up call when it publishes),
   explains the disk's 351 MB/s limit and what removed the aarch64 stalls near it, and states what a checkpoint syncs on
   Linux and macOS. No code change.
+- Fixed (benchmarks): the comparison harness's cleanup gave the 3 s grace period after SIGTERM only to each child's
+  leader: once the leaders had exited, SIGKILL went to their groups at once, so another process in a group (as
+  `tt-latency` has) could be killed before it had ended, and a group whose leader had already exited was not
+  signalled at all. Every process of every group now gets SIGTERM and the grace period, in the runner and in
+  `benches/rerun.py`, and the guard keeps a group until it is empty. Seen as a flaky test on the macOS CI leg. Nothing
+  measured changes.
 - Fixed (benchmarks): the comparison harness's short mode left the Chronicle Queue and Aeron JVMs (and `tt-latency`'s
   processes) running when it was terminated. `compare/run.py` now ends every child's process group, waits for it and
   renames an unfinished short run `OUTDIR.incomplete-N` on every way out (failure, time limit, SIGTERM, SIGINT,

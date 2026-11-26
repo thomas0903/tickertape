@@ -19,6 +19,9 @@ import run
 
 HERE = Path(__file__).resolve().parent
 BOUND_S = 30
+# How long a group member takes to end after SIGTERM: well inside the grace period, far longer than the moment between
+# a leader's end and its reaping, so a member that gets only its leader's grace is killed before it can note SIGTERM.
+TERM_DELAY_S = "1"
 
 
 def alive(pid):
@@ -53,7 +56,15 @@ class Harness:
                 for pid, k in self.recorded().items() if k == kind]
 
     def pid_of(self, kind):
-        return next(pid for pid, k in self.recorded().items() if k == kind)
+        """The PID of the stand-in of this kind, once it has recorded itself."""
+        end = time.monotonic() + BOUND_S
+        while True:
+            pids = [pid for pid, k in self.recorded().items() if k == kind]
+            if pids:
+                return pids[0]
+            if time.monotonic() > end:
+                raise AssertionError(f"no {kind}:\n{self.output()}")
+            time.sleep(0.02)
 
     def got_sigterm(self):
         """The group members (grandchildren) that noted a SIGTERM before they ended."""
@@ -148,7 +159,7 @@ class EndingTests(unittest.TestCase):
         self.assert_marked_incomplete(harness)
 
     def test_tt_latency_and_the_processes_it_started_end_with_the_run(self):
-        harness = Harness(self, "tickertape", STANDIN_HANG="latency")
+        harness = Harness(self, "tickertape", STANDIN_HANG="latency", STANDIN_TERM_DELAY_S=TERM_DELAY_S)
         harness.wait_alive(1)
         self.assertEqual(harness.running(4), ["grandchild of tt-latency reader", "grandchild of tt-latency writer",
                                               "guard", "tt-latency"])
@@ -163,7 +174,8 @@ class EndingTests(unittest.TestCase):
         self.assert_marked_incomplete(harness)
 
     def test_sigterm_reaches_every_process_of_a_child_s_group(self):
-        harness = Harness(self, "yaque", STANDIN_HANG="visible_latency", STANDIN_GRANDCHILD="1")
+        harness = Harness(self, "yaque", STANDIN_HANG="visible_latency", STANDIN_GRANDCHILD="1",
+                          STANDIN_TERM_DELAY_S=TERM_DELAY_S)
         harness.wait_alive(2)
         self.assertEqual(len(harness.running(5)), 5)
         os.kill(harness.proc.pid, signal.SIGTERM)
@@ -171,6 +183,31 @@ class EndingTests(unittest.TestCase):
         self.assertEqual(harness.survivors(), {})
         self.assertEqual(harness.got_sigterm(), ["grandchild of yaque reader visible_latency",
                                                  "grandchild of yaque writer visible_latency"])
+
+    def test_a_group_whose_leader_already_failed_is_still_ended(self):
+        # The reader leaves a process in its group and exits 3; the runner reaps it and stops the measurement.
+        harness = Harness(self, "yaque", STANDIN_HANG="visible_latency:writer", STANDIN_FAIL="visible_latency:reader",
+                          STANDIN_GRANDCHILD="visible_latency:reader", STANDIN_TERM_DELAY_S=TERM_DELAY_S)
+        self.assertEqual(harness.wait(), 1, harness.output())
+        self.assertEqual(harness.survivors(), {})
+        self.assertEqual(harness.got_sigterm(), ["grandchild of yaque reader visible_latency"])
+        self.assert_marked_incomplete(harness)
+
+    def test_after_sigkill_the_guard_ends_a_group_whose_leader_had_finished(self):
+        # The reader leaves a process in its group and finishes; the runner reaps it, then waits for the writer.
+        harness = Harness(self, "yaque", STANDIN_HANG="visible_latency:writer",
+                          STANDIN_GRANDCHILD="visible_latency:reader", STANDIN_TERM_DELAY_S=TERM_DELAY_S)
+        harness.wait_alive(1)
+        member = harness.pid_of("grandchild of yaque reader visible_latency")
+        end = time.monotonic() + BOUND_S
+        while any(k == "yaque reader" and alive(p) for p, k in harness.recorded().items()):
+            self.assertLess(time.monotonic(), end, harness.output())  # Until the runner has reaped the reader.
+            time.sleep(0.02)
+        self.assertTrue(alive(member))
+        os.kill(harness.proc.pid, signal.SIGKILL)
+        harness.wait()
+        self.assertEqual(harness.survivors(), {})
+        self.assertEqual(harness.got_sigterm(), ["grandchild of yaque reader visible_latency"])
 
     def test_with_its_output_gone_the_runner_still_cleans_up_and_exits_with_the_signal(self):
         harness = Harness(self, "yaque", pipe=True, STANDIN_HANG="visible_latency")
@@ -196,7 +233,8 @@ class EndingTests(unittest.TestCase):
         self.assert_marked_incomplete(harness)
 
     def test_after_sigkill_of_the_runner_the_guard_ends_the_children_and_marks_the_run(self):
-        harness = Harness(self, "yaque", STANDIN_HANG="visible_latency", STANDIN_GRANDCHILD="1")
+        harness = Harness(self, "yaque", STANDIN_HANG="visible_latency", STANDIN_GRANDCHILD="1",
+                          STANDIN_TERM_DELAY_S=TERM_DELAY_S)
         harness.wait_alive(2)
         self.assertEqual(len(harness.running(5)), 5)
         os.kill(harness.proc.pid, signal.SIGKILL)
