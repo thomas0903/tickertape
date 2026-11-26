@@ -96,6 +96,9 @@ pub(crate) fn list_bases_and(dir: &Path, mut other: impl FnMut(&str)) -> Result<
     Ok(out)
 }
 
+/// How many bases after the oldest one [`Bases::later`] keeps.
+pub(crate) const LATER_BASES: usize = 7;
+
 /// The base sequence numbers [`find_bases`] picks out of a listing.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct Bases {
@@ -103,9 +106,58 @@ pub(crate) struct Bases {
     pub(crate) oldest: Option<u64>,
     /// The newest segment's base that is `<= seq` (`None` if there is none).
     pub(crate) floor: Option<u64>,
+    /// The next [`LATER_BASES`] bases after `oldest`, ascending (`None` past the last one listed).
+    pub(crate) later: [Option<u64>; LATER_BASES],
 }
 
-/// Picks the oldest base and the newest base `<= seq` out of one listing of `dir`, as [`list_segments`] would list
+impl Bases {
+    /// What the listing would have been without its oldest segment, if it holds another one: the next base becomes
+    /// the oldest, and a floor that was the oldest base is gone (no other listed base was `<= seq`). `None` if the
+    /// listing holds no base after the oldest, or none that [`Bases::later`] kept.
+    pub(crate) fn without_oldest(self) -> Option<Bases> {
+        let removed = self.oldest?;
+        let next = self.later[0]?;
+        let mut later = [None; LATER_BASES];
+        later[..LATER_BASES - 1].copy_from_slice(&self.later[1..]);
+        Some(Bases {
+            oldest: Some(next),
+            floor: self.floor.filter(|f| *f != removed),
+            later,
+        })
+    }
+
+    /// Takes `base` into the oldest bases kept, in order.
+    fn keep_if_old(&mut self, base: u64) {
+        let mut carry = match self.oldest {
+            None => {
+                self.oldest = Some(base);
+                return;
+            }
+            Some(oldest) if base < oldest => {
+                self.oldest = Some(base);
+                oldest
+            }
+            // Most bases of a long listing are newer than every one kept.
+            Some(_) if self.later[LATER_BASES - 1].is_some_and(|newest| base > newest) => return,
+            Some(_) => base,
+        };
+        for slot in &mut self.later {
+            match *slot {
+                None => {
+                    *slot = Some(carry);
+                    return;
+                }
+                Some(kept) if carry < kept => {
+                    *slot = Some(carry);
+                    carry = kept;
+                }
+                Some(_) => {}
+            }
+        }
+    }
+}
+
+/// Picks the oldest bases and the newest base `<= seq` out of one listing of `dir`, as [`list_segments`] would list
 /// it, without collecting or sorting the names: time proportional to the directory's entries, memory constant.
 pub(crate) fn find_bases(dir: &Path, seq: u64) -> Result<Bases> {
     let mut out = Bases::default();
@@ -116,7 +168,7 @@ pub(crate) fn find_bases(dir: &Path, seq: u64) -> Result<Bases> {
             .to_str()
             .and_then(format::parse_segment_file_name)
         {
-            out.oldest = Some(out.oldest.map_or(base, |o| o.min(base)));
+            out.keep_if_old(base);
             if base <= seq {
                 out.floor = Some(out.floor.map_or(base, |f| f.max(base)));
             }
@@ -509,20 +561,59 @@ mod scan_tests {
             123_456_789,
             u64::MAX,
         ] {
+            let mut later = [None; LATER_BASES];
+            for (slot, base) in later.iter_mut().zip(listed.iter().skip(1)) {
+                *slot = Some(*base);
+            }
             let expected = Bases {
                 oldest: listed.first().copied(),
                 floor: listed.iter().rev().find(|b| **b <= seq).copied(),
+                later,
             };
             assert_eq!(find_bases(dir.path(), seq).unwrap(), expected, "seq {seq}");
+            // Without the oldest segment, as a listing taken after its removal would show it.
+            let without = expected.without_oldest().unwrap();
+            assert_eq!(without.oldest, Some(7), "seq {seq}");
+            assert_eq!(
+                without.later[..4],
+                [Some(40), Some(41), Some(1000), Some(123_456_789)]
+            );
+            assert_eq!(without.later[4..], [None; LATER_BASES - 4]);
+            let floor = listed.iter().rev().find(|b| **b <= seq && **b > 0).copied();
+            assert_eq!(without.floor, floor, "seq {seq}");
         }
         fs::remove_file(segment_path(dir.path(), 0)).unwrap();
+        let mut later = [None; LATER_BASES];
+        later[..4].copy_from_slice(&[Some(40), Some(41), Some(1000), Some(123_456_789)]);
         assert_eq!(
             find_bases(dir.path(), 3).unwrap(),
             Bases {
                 oldest: Some(7),
-                floor: None
+                floor: None,
+                later,
             }
         );
+        // Only the oldest bases are kept: one listing of more segments than that, in any order.
+        for base in (2_000..2_020).rev() {
+            fs::write(segment_path(dir.path(), base), b"").unwrap();
+        }
+        let bases = find_bases(dir.path(), u64::MAX).unwrap();
+        assert_eq!(bases.oldest, Some(7));
+        assert_eq!(bases.floor, Some(123_456_789));
+        assert_eq!(
+            bases.later,
+            [40, 41, 1000, 2_000, 2_001, 2_002, 2_003].map(Some)
+        );
+        assert_eq!(bases.without_oldest().unwrap().later[6], None);
+        let mut last = bases;
+        for _ in 0..LATER_BASES {
+            last = last.without_oldest().unwrap();
+        }
+        assert_eq!(
+            (last.oldest, last.later),
+            (Some(2_003), [None; LATER_BASES])
+        );
+        assert_eq!(last.without_oldest(), None);
     }
 
     #[test]

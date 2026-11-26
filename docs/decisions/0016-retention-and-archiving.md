@@ -48,6 +48,20 @@ destination (they fail instead).
 `Error::SeqUnavailable`. (Amended 2026-11-19 by ADR [0034](0034-durable-only-reads-check-segment-identity.md): a
 durable-only reader may get `Error::Discarded` earlier, when the checkpoint moves past its cursor.)
 
+*Note, 2026-11-27.* `Reader::open` starts at the oldest segment that remains. When the oldest segment of its listing is
+gone before it opens it, it opens the next one of the same listing (it keeps the 8 oldest bases of each listing), and
+lists again only once those are gone too; after 8 listings it returns the last I/O "not found" error, as before. Until
+then it listed again after each lost try. A retention run removes segments one after another, oldest first, and makes
+each removal durable; where that sync does nothing (tmpfs), a removal took about as long as the reader's listing and
+open, the run removed each segment a new listing named, and a reader opening while one run caught up dozens of segments
+lost all 8 tries (`tests/empty_slot.rs::live_readers_of_a_killed_writer_see_no_false_error` on tmpfs; deterministic in
+`tests/retention.rs::reader_open_keeps_up_with_a_retention_run_as_fast_as_its_listings`). Nothing older than a listed
+segment appears later (crash contract C14), except a segment an archiver puts back (ADR
+[0055](0055-an-archiver-takes-a-segment-out-before-it-lets-it-go.md)); C14 already lets a reader that opens while it is
+out start after it. So the next listed segment that opens is the oldest that remains. The bound is up to 64 failed opens
+(8 listings, each trying up to its 8 oldest segments) before the I/O "not found" error. `seek` keeps listing again: when its segment was the oldest one, the answer is
+`Error::SeqUnavailable` from a new listing.
+
 ## Consequences
 
 - "Segments are never deleted automatically" becomes "never deleted unless a retention policy is configured". The

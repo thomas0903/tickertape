@@ -609,6 +609,179 @@ fn reader_open_races_retention() {
     }
 }
 
+/// Removes the oldest segment at each of this thread's next `left` listings by a reader, as a retention run whose
+/// removals take as long as a reader's listing would.
+fn remove_oldest_after_each_listing(dir: std::path::PathBuf, left: usize) {
+    if left > 0 {
+        tickertape::fault::run_at(tickertape::fault::Point::ReaderOpen, 0, move || {
+            retain(&dir, segments(&dir).len() - 1);
+            remove_oldest_after_each_listing(dir, left - 1);
+        });
+    }
+}
+
+/// A journal of 12 segments of one record each, checkpointed, with its writer.
+fn twelve_segments() -> (tempfile::TempDir, Writer) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut writer = Writer::open(dir.path(), small_config()).unwrap();
+    for _ in 0..12 {
+        append(&mut writer);
+    }
+    writer.checkpoint().unwrap();
+    assert_eq!(segments(dir.path()).len(), 12);
+    (dir, writer)
+}
+
+/// A retention run removes the segments one after another, oldest first, and on tmpfs (where syncing the directory
+/// does nothing) a removal takes about as long as a reader's listing and open. Each removal here comes right after
+/// the reader's listing: had the reader listed again for each try, the run would have removed every segment it chose,
+/// and it would have returned an I/O "not found" error after its eighth listing. It opens the next segment of its
+/// listing instead.
+#[test]
+fn reader_open_keeps_up_with_a_retention_run_as_fast_as_its_listings() {
+    for mapped in [false, true] {
+        let (dir, _writer) = twelve_segments();
+        let held = segments(dir.path()).len();
+        tickertape::fault::clear();
+        remove_oldest_after_each_listing(dir.path().to_path_buf(), 10);
+        let opened = open_reader(dir.path(), mapped);
+        tickertape::fault::clear();
+        let mut reader = opened.unwrap_or_else(|e| panic!("mapped {mapped}: {e:?}"));
+        // One listing, so one removal; the reader starts at the segment after the removed one.
+        assert_eq!(segments(dir.path()).len(), held - 1, "mapped {mapped}");
+        assert_eq!(
+            reader.next_owned().unwrap().unwrap().seq,
+            1,
+            "mapped {mapped}"
+        );
+    }
+}
+
+/// A listing keeps its 8 oldest segments. When all of them are gone before the reader opens one, it lists again and
+/// starts at the oldest segment that remains.
+#[test]
+fn reader_open_lists_again_once_the_oldest_segments_it_listed_are_gone() {
+    use tickertape::fault::Point;
+    for mapped in [false, true] {
+        let (dir, _writer) = twelve_segments();
+        let path = dir.path().to_path_buf();
+        at(Point::ReaderOpen, 0, move || retain(&path, 3));
+        let opened = open_reader(dir.path(), mapped);
+        tickertape::fault::clear();
+        let mut reader = opened.unwrap_or_else(|e| panic!("mapped {mapped}: {e:?}"));
+        assert_eq!(segments(dir.path()).len(), 3, "mapped {mapped}");
+        assert_eq!(
+            reader.next_owned().unwrap().unwrap().seq,
+            9,
+            "mapped {mapped}"
+        );
+    }
+}
+
+/// A durable-only reader's `seek_to_end` starts at the oldest segment when there is no valid marker, or when the marker
+/// it read names the oldest segment (read just before the writer moved on and retention removed that segment). It keeps
+/// up with a retention run as `Reader::open` does.
+#[test]
+fn durable_only_seek_to_end_at_the_oldest_segment_keeps_up_with_a_retention_run() {
+    use tickertape::fault::Point;
+    for stale in [false, true] {
+        for mapped in [false, true] {
+            let case = format!("stale marker {stale}, mapped {mapped}");
+            let dir = tempfile::tempdir().unwrap();
+            let marker = dir.path().join("checkpoint");
+            let mut writer = Writer::open(dir.path(), small_config()).unwrap();
+            for _ in 0..3 {
+                append(&mut writer);
+            }
+            writer.checkpoint().unwrap();
+            // Names segment 2 at its end: next_seq 3, the base of the next segment.
+            let old_marker = fs::read(&marker).unwrap();
+            for _ in 0..9 {
+                append(&mut writer);
+            }
+            writer.checkpoint().unwrap();
+            let current = fs::read(&marker).unwrap();
+            let config = ReaderConfig::default().durable_only(true);
+            let mut reader = if mapped {
+                // SAFETY: only this process's tickertape writer modifies the journal while the reader exists.
+                unsafe { Reader::open_mapped(dir.path(), config) }.unwrap()
+            } else {
+                Reader::open(dir.path(), config).unwrap()
+            };
+            let set_aside = dir.path().join("checkpoint.aside");
+            if stale {
+                // Segments 0 to 2 are gone, and the reader reads the old marker: segment 3 is the oldest and the one
+                // whose base is the marker's next_seq.
+                retain(dir.path(), 9);
+                fs::write(&marker, &old_marker).unwrap();
+            } else {
+                // No marker: the reader starts at the oldest segment, here segment 0.
+                fs::rename(&marker, &set_aside).unwrap();
+            }
+            let held = segments(dir.path()).len();
+            let path = dir.path().to_path_buf();
+            let (marker_at, aside) = (marker.clone(), set_aside.clone());
+            // After the reader's listing: the current marker is back (retention needs it), and the oldest segment goes.
+            at(Point::ReaderOpen, 0, move || {
+                if stale {
+                    fs::write(&marker_at, &current).unwrap();
+                } else {
+                    fs::rename(&aside, &marker_at).unwrap();
+                }
+                retain(&path, segments(&path).len() - 1);
+                remove_oldest_after_each_listing(path, 9);
+            });
+            let sought = reader.seek_to_end();
+            tickertape::fault::clear();
+            sought.unwrap_or_else(|e| panic!("{case}: {e:?}"));
+            assert_eq!(segments(dir.path()).len(), held - 1, "{case}");
+            // With a marker, it started at segment 4 and read on to the marker now in place; without one, it is at
+            // the start of segment 1.
+            assert_eq!(reader.position(), if stale { 12 } else { 1 }, "{case}");
+            drop(writer);
+        }
+    }
+}
+
+/// An archiver other than the writer takes a segment out of the journal under a temporary name before it lets it go,
+/// and puts it back if a check after that fails (ADR 0055). A reader that lists the segment and opens it while it is
+/// out starts at the next segment of its listing, skipping the records of the segment that goes back, as crash
+/// contract C14 allows.
+#[test]
+fn reader_opening_while_a_segment_is_out_starts_after_it() {
+    use tickertape::fault::Point;
+    for mapped in [false, true] {
+        let (dir, _writer) = journal(true);
+        let oldest = segments(dir.path())[0].1.clone();
+        let out = std::path::PathBuf::from(format!(
+            "{}.{}.{}.removing",
+            oldest.display(),
+            std::process::id(),
+            tickertape::clock::realtime_ns()
+        ));
+        let (from, to) = (oldest.clone(), out.clone());
+        at(Point::ReaderOpen, 0, move || {
+            fs::rename(&from, &to).unwrap()
+        });
+        let opened = open_reader(dir.path(), mapped);
+        tickertape::fault::clear();
+        let mut reader = opened.unwrap_or_else(|e| panic!("mapped {mapped}: {e:?}"));
+        // Put back.
+        fs::rename(&out, &oldest).unwrap();
+        assert_eq!(
+            reader.next_owned().unwrap().unwrap().seq,
+            1,
+            "mapped {mapped}"
+        );
+        let mut again = open_reader(dir.path(), mapped).unwrap();
+        assert_eq!(
+            again.next_owned().unwrap().unwrap().seq,
+            0,
+            "mapped {mapped}"
+        );
+    }
+}
+
 #[test]
 fn seek_races_retention() {
     use tickertape::fault::Point;

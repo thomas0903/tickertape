@@ -99,7 +99,8 @@ pub enum Point {
     /// (crash contract C11), after one of them and before the next (stands in for a crash there).
     BetweenHeldChanges,
     /// After a reader lists the segments and before it opens the one it chose (`Reader::open`,
-    /// `Reader::open_mapped`, `Reader::seek`, `Reader::seek_to_end`). Arm with [`run_at`].
+    /// `Reader::open_mapped`, `Reader::seek`, `Reader::seek_to_end`), once per listing: not before the later segments
+    /// of the same listing that it tries when its choice is gone. Arm with [`run_at`].
     ReaderOpen,
     /// After a reader at a seal has checked that its segment is still in place and before it opens the successor.
     /// Arm with [`run_at`].
