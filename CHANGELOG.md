@@ -5,6 +5,11 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
+- Docs: the rustdoc of `Reader::seek_to_end` (new in 1.1) states that a file named like a segment without a valid
+  header where the call starts (for a visible reader the newest name, even an empty or foreign file) is
+  `Error::Corrupt` naming that file, as at `Reader::open`, and that a durable-only reader opens no name later than the
+  one that holds the marker's position (issue #112, ADR 0046, note of 2026-11-27). Behaviour unchanged; new tests for
+  both readers and a durable-only reader.
 - Fixed: `Reader::open` and `Reader::open_mapped` could fail with an I/O "not found" error for a segment they had just
   listed while a retention run removed segments one after another, oldest first, about as fast as a reader lists the
   directory (seen on tmpfs, where syncing the directory after each removal does nothing: Linux, 64 KiB segments, a run

@@ -112,3 +112,21 @@ the file system, and a stale entry would send a reader to a segment that was rem
 has to detect and report as a removal (`Error::Discarded`) or an unavailable sequence number where a fresh listing finds
 the record. The supported answer is a moderate number of segments: `docs/operations.md` → How many segments to keep.
 The rustdoc of `Reader::seek` says what a seek costs.
+
+## Note (2026-11-27): a stray newest name (issue #112)
+
+Decided by the orchestrator on the owner's delegation. `Reader::seek_to_end` opens the newest file in the directory
+that is named like a segment (a durable-only reader: the newest name at or below the marker's `next_seq`, or the oldest
+without a valid marker). If that file has no valid header (a "stray": an empty or foreign file with a later base in its
+name), the call fails with `Error::Corrupt` naming it, and the reader is left as it was.
+
+**The error stays; such a name is not skipped.** `Reader::open` reports the same corruption when the segment it has to
+start at, the oldest name, has no valid header, so the two agree. A file named like the journal's newest segment with a
+damaged header is exactly what storage damage to the first block of the newest segment looks like; a `seek_to_end`
+that silently landed at the end of the previous segment would hide it: the reader would follow that segment's seal into
+the damaged file later, or, if the previous segment is not sealed, wait at a position that is not the journal's end.
+Skipping would also need the care of ADR 0050's rule that a later name counts only with a valid header, for a case a
+healthy journal does not have: a segment gets its header before it is linked to its name, and a writer's recovery
+removes or repairs what a crash leaves. The error names the file; the caller runs `verify`, lets a writer recover, or
+removes the stray. The rustdoc of `Reader::seek_to_end` says so; `reader_stray_tests.rs` covers both readers and a
+durable-only reader with and without a marker.

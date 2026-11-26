@@ -278,3 +278,157 @@ fn a_durable_only_reader_reads_at_most_stray_reads_known_names_per_listing() {
     assert!(checks_until_reported(&mut reader, MIDDLE) <= BOUND);
     drop(writer);
 }
+
+/// The strays of issue #112, by what is where a header would be: nothing (an empty file), too little (10 bytes), and
+/// garbage over a segment's size.
+fn stray_kinds() -> [(&'static str, Vec<u8>); 3] {
+    [
+        ("empty", Vec::new()),
+        ("too short", vec![0xA5; 10]),
+        ("garbage", vec![0xA5; SEGMENT as usize]),
+    ]
+}
+
+/// The checkpointed journal of [`journal`] with a stray named `base`, and a reader of the kind given that has returned
+/// the records the checkpoint covers up to 5 (a durable-only reader without a marker returns none).
+fn reader_beside_a_stray(dir: &Path, bytes: &[u8], base: u64, kind: (bool, bool)) -> Reader {
+    std::fs::write(stray_path(dir, base), bytes).unwrap();
+    let (mapped, durable) = kind;
+    let mut reader = open(dir, mapped, durable);
+    let covered = crate::inspect::read_checkpoint(dir).unwrap().is_some();
+    for seq in 0..if durable && !covered { 0 } else { 5 } {
+        assert_eq!(reader.try_next().unwrap().unwrap().seq, seq);
+    }
+    reader
+}
+
+/// `seek_to_end` fails with the error on the stray's header, leaves the reader where it was (its position, and the
+/// record that comes next), and succeeds once the stray is removed.
+fn fails_on_the_stray(dir: &Path, reader: &mut Reader, base: u64, what: &str) {
+    let position = reader.position();
+    match reader.seek_to_end() {
+        Err(Error::Corrupt { path, offset, .. }) => {
+            assert_eq!((path, offset), (stray_path(dir, base), 0), "{what}");
+        }
+        other => panic!("{what}: {other:?}"),
+    }
+    assert_eq!(reader.position(), position, "{what}");
+    assert_eq!(
+        reader.try_next().unwrap().map(|r| r.seq),
+        Some(position),
+        "{what}"
+    );
+    std::fs::remove_file(stray_path(dir, base)).unwrap();
+    reader.seek_to_end().unwrap();
+    assert_eq!(reader.position(), 20, "{what}");
+    assert!(reader.try_next().unwrap().is_none(), "{what}");
+}
+
+/// Issue #112: a file named like a later segment that has no valid header (empty, too short, or garbage) makes a visible
+/// reader's `seek_to_end` fail with [`Error::Corrupt`] naming that file: it opens the newest name, and doesn't skip one
+/// without a valid header (ADR 0046, note of 2026-11-27). The reader is left where it was.
+#[test]
+fn seek_to_end_reports_a_stray_newest_name() {
+    for mapped in [false, true] {
+        for (name, bytes) in stray_kinds() {
+            let dir = tempfile::tempdir().unwrap();
+            let writer = journal(dir.path());
+            let mut reader =
+                reader_beside_a_stray(dir.path(), &bytes, FIRST_STRAY, (mapped, false));
+            let what = format!("mapped: {mapped}, {name}");
+            fails_on_the_stray(dir.path(), &mut reader, FIRST_STRAY, &what);
+            drop(writer);
+        }
+    }
+}
+
+/// A durable-only reader's `seek_to_end` opens the newest name at or below the marker's `next_seq` (the segment that
+/// holds the marker's position), or without a valid marker the oldest name: a stray above that is not opened, and the
+/// call succeeds. A stray at the name it opens fails it as for a visible reader.
+#[test]
+fn a_durable_only_seek_to_end_opens_the_markers_segment() {
+    for mapped in [false, true] {
+        for (name, bytes) in stray_kinds() {
+            // With the marker of `journal`, at 20 in segment 0: a later stray is not opened.
+            let dir = tempfile::tempdir().unwrap();
+            let writer = journal(dir.path());
+            let mut reader = reader_beside_a_stray(dir.path(), &bytes, FIRST_STRAY, (mapped, true));
+            reader.seek_to_end().unwrap();
+            assert_eq!(reader.position(), 20, "mapped: {mapped}, {name}");
+            assert!(reader.try_next().unwrap().is_none());
+            drop(writer);
+
+            // A stray named 20, the marker's `next_seq`, is the name that holds its position.
+            let dir = tempfile::tempdir().unwrap();
+            let writer = journal(dir.path());
+            let mut reader = reader_beside_a_stray(dir.path(), &bytes, 20, (mapped, true));
+            let what = format!("mapped: {mapped}, {name}, named at the marker");
+            fails_on_the_stray(dir.path(), &mut reader, 20, &what);
+            drop(writer);
+
+            // Without a marker, the reader goes to the oldest segment and opens no later name, wherever the stray is.
+            for base in [20, FIRST_STRAY] {
+                let dir = tempfile::tempdir().unwrap();
+                let writer = journal(dir.path());
+                std::fs::remove_file(dir.path().join(crate::journal::CHECKPOINT_FILE)).unwrap();
+                let mut reader = reader_beside_a_stray(dir.path(), &bytes, base, (mapped, true));
+                assert!(reader.try_next().unwrap().is_none());
+                reader.seek_to_end().unwrap();
+                assert_eq!(reader.position(), 0, "mapped: {mapped}, {name}, {base}");
+                assert!(reader.try_next().unwrap().is_none());
+                drop(writer);
+            }
+        }
+    }
+}
+
+/// `Reader::open` agrees: the segment it starts at, the oldest name, without a valid header is [`Error::Corrupt`] naming
+/// that file. It does not go on to the next segment.
+#[test]
+fn open_reports_an_oldest_name_without_a_valid_header() {
+    for (name, bytes) in stray_kinds() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer =
+            Writer::open(dir.path(), WriterConfig::default().segment_size(SEGMENT)).unwrap();
+        // About 6 records a segment.
+        for _ in 0..20 {
+            writer
+                .append(&NewRecord {
+                    schema_id: 0,
+                    venue_ts_ns: 0,
+                    local_ts_ns: 0,
+                    payload: &[0; 10_000],
+                })
+                .unwrap();
+        }
+        drop(writer);
+        assert!(
+            std::fs::read_dir(dir.path()).unwrap().count() > 2,
+            "it rolled"
+        );
+        let oldest = stray_path(dir.path(), 0);
+        std::fs::write(&oldest, &bytes).unwrap();
+        for mapped in [false, true] {
+            let config = ReaderConfig::default().notify(false);
+            let result = if mapped {
+                // SAFETY: nothing modifies the files while the reader exists.
+                unsafe { Reader::open_mapped(dir.path(), config) }
+            } else {
+                Reader::open(dir.path(), config)
+            };
+            match result {
+                Err(Error::Corrupt { path, offset, .. }) => {
+                    assert_eq!(
+                        (path, offset),
+                        (oldest.clone(), 0),
+                        "{name}, mapped: {mapped}"
+                    );
+                }
+                other => panic!(
+                    "{name}, mapped: {mapped}: {:?}",
+                    other.map(|r| r.position())
+                ),
+            }
+        }
+    }
+}
