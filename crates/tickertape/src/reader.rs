@@ -31,6 +31,10 @@ const TAIL_CHUNK: usize = 4 * 1024;
 const TAIL_FILLS: u16 = 16;
 /// While the reads are tail reads, one fill in this many reads a whole chunk anyway ([`Reader::fill_size`]).
 const TAIL_PROBE: u16 = 256;
+/// How long a reader that blocked for a record must have waited at its slot for the record's fill to count towards tail
+/// reads ([`Reader::fill_size`]): a blocking reader that reads less blocks more often, and each wait costs the writer a
+/// wake-up call.
+const TAIL_BLOCKED_WAIT: Duration = Duration::from_micros(20);
 /// Longest single block on the wake-up region when the writer maintains it (bounded so that a writer that died, or a
 /// missed wake-up, costs at most this much latency; the identity check also runs at least this often).
 const NOTIFY_MAX_WAIT: Duration = Duration::from_millis(100);
@@ -112,19 +116,15 @@ pub struct Reader {
     /// whose frame crosses `bound` ([`Reader::read_crossing`]), while that record is the current one.
     buf: Vec<u8>,
     buf_start: u64,
-    /// How many fills in a row found the reader following the writer with time to spare, counted from 1 up to
-    /// `TAIL_FILLS + TAIL_PROBE - 1` and then from `TAIL_FILLS` again ([`Reader::fill_size`], ADR 0052). Read and written only by fills of the `pread` buffer, and by a `seek_to_end` that fails.
-    tail_fills: u16,
     /// The journal's wake-up region, if wake-ups are enabled (ADRs 0017 and 0021).
     waker: Option<crate::notify::Waker>,
     /// When the reader started waiting at an empty slot.
     waiting_since: Option<Instant>,
-    /// The last time [`Reader::check_head`] looked for later segments: `None` if it has not run since the reader was
-    /// opened or moved by a seek, or if it ended in an error. It then runs at the next empty slot without waiting first.
+    /// What the reader keeps about its waits at empty slots, for [`Reader::check_head`] and [`Reader::fill_size`].
     /// Boxed (allocated at the open, never again): as a field this size it made the zero-copy reader replay 64-byte records
     /// at half the speed on an Apple M4 Pro, and so did 40 or 48 bytes of padding added to the code before (8 to 32 or 64
     /// did not). The slowdown follows the size of `Reader`; its mechanism is not established (issue #86).
-    segments_listed: Box<Option<Listed>>,
+    wait: Box<Waits>,
     /// The record [`Reader::advance`] found last (valid only after it returned `true`). The slot reads decode a
     /// record's header straight into it, so that the per-record path passes only small values around (see
     /// [`SlotOutcome`]).
@@ -169,6 +169,36 @@ enum After {
     Unknown,
 }
 
+/// What a reader keeps about its waits at empty slots ([`Reader::wait`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct Waits {
+    /// The last time [`Reader::check_head`] looked for later segments: `None` if it has not run since the reader was
+    /// opened or moved by a seek, or if it ended in an error. It then runs at the next empty slot without waiting first.
+    listed: Option<Listed>,
+    /// How many fills in a row found the reader following the writer with time to spare, counted from 1 up to
+    /// `TAIL_FILLS + TAIL_PROBE - 1` and then from `TAIL_FILLS` again ([`Reader::fill_size`], ADR 0052). Written only by
+    /// fills of the `pread` buffer, and by a `seek_to_end` that fails.
+    tail_fills: u16,
+    /// The wait at the slot the reader last found empty, for [`Reader::fill_size`]. Written only at empty slots
+    /// ([`Reader::at_empty_slot`]), never on the record path.
+    tail_wait: Option<SlotWait>,
+}
+
+/// A wait at an empty slot, as [`Reader::fill_size`] needs it (ADR 0052).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SlotWait {
+    /// The segment and offset of the slot.
+    base: u64,
+    offset: u64,
+    /// When the reader first found it empty.
+    since: Instant,
+    /// Whether the reader found the slot empty with the wake-up region attached.
+    attached: bool,
+    /// Whether it later found the slot empty while the region was taken out, that is, from inside [`Reader::block_on`],
+    /// registered as a waiter (the writer then makes a wake-up call for the record).
+    blocked: bool,
+}
+
 /// When a reader at an empty slot looked for later segments.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Listed {
@@ -193,9 +223,8 @@ struct Place {
     superseded_checked: Option<Instant>,
     buf: Vec<u8>,
     buf_start: u64,
-    tail_fills: u16,
     waiting_since: Option<Instant>,
-    segments_listed: Option<Listed>,
+    wait: Waits,
     found: Found,
 }
 
@@ -345,10 +374,9 @@ impl Reader {
             used_index: false,
             buf: Vec::new(),
             buf_start: 0,
-            tail_fills: 0,
             waker,
             waiting_since: None,
-            segments_listed: Box::new(None),
+            wait: Box::default(),
             found: Found {
                 header: RecordHeader {
                     seq: 0,
@@ -947,7 +975,7 @@ impl Reader {
         self.buf.clear();
         self.drop_copy();
         self.waiting_since = None;
-        *self.segments_listed = None;
+        self.wait.listed = None;
         self.superseded_checked = None;
     }
 
@@ -997,9 +1025,8 @@ impl Reader {
             superseded_checked: self.superseded_checked,
             buf: std::mem::take(&mut self.buf),
             buf_start: self.buf_start,
-            tail_fills: self.tail_fills,
             waiting_since: self.waiting_since,
-            segments_listed: *self.segments_listed,
+            wait: *self.wait,
             found: self.found,
         };
         self.cursor_moved();
@@ -1027,9 +1054,8 @@ impl Reader {
             self.superseded_checked = before.superseded_checked;
             self.buf = before.buf;
             self.buf_start = before.buf_start;
-            self.tail_fills = before.tail_fills;
             self.waiting_since = before.waiting_since;
-            *self.segments_listed = before.segments_listed;
+            *self.wait = before.wait;
             self.found = before.found;
         }
         end
@@ -1284,10 +1310,41 @@ impl Reader {
         let now = Instant::now();
         let since = *self.waiting_since.get_or_insert(now);
         let waited = now.duration_since(since) >= IDENTITY_CHECK_INTERVAL;
-        if waited || self.segments_listed.is_none() {
+        self.note_wait(now);
+        if waited || self.wait.listed.is_none() {
             self.check_head(now, waited)?;
         }
         Ok(())
+    }
+
+    /// Keeps, for [`Reader::fill_size`], when the reader first found the slot at the cursor empty, and whether it found it
+    /// empty again while registered as a waiter: [`Reader::block`] takes the wake-up region out of the waker for the
+    /// whole of [`Reader::block_on`], whose check of the slot comes here. A reader without a region never counts as
+    /// blocked; the writer makes no wake-up calls for it.
+    fn note_wait(&mut self, now: Instant) {
+        let attached = self
+            .waker
+            .as_ref()
+            .is_some_and(crate::notify::Waker::attached);
+        let slot = (self.seg.base, self.offset);
+        match &mut self.wait.tail_wait {
+            Some(wait) if (wait.base, wait.offset) == slot => {
+                if attached {
+                    wait.attached = true;
+                } else if wait.attached {
+                    wait.blocked = true;
+                }
+            }
+            other => {
+                *other = Some(SlotWait {
+                    base: slot.0,
+                    offset: slot.1,
+                    since: now,
+                    attached,
+                    blocked: false,
+                });
+            }
+        }
     }
 
     /// Whether the empty slot at the cursor can be the head of the journal (ADR 0050): an error if the checkpoint marker
@@ -1310,7 +1367,7 @@ impl Reader {
                 self.set_limit(limit_of(marker.as_ref(), &self.seg));
             }
         }
-        let previous = *self.segments_listed;
+        let previous = self.wait.listed;
         let due = previous.is_none_or(|l| now.duration_since(l.at) >= SEGMENT_LIST_INTERVAL);
         // Before the listing.
         let directory = due.then(|| directory_stamp(&self.dir)).flatten();
@@ -1329,10 +1386,10 @@ impl Reader {
         };
         if matches!(follows, After::Shown(_)) {
             // After an error the next call checks again at once, and so reports the slot again.
-            *self.segments_listed = None;
+            self.wait.listed = None;
             self.report_unless_head(list)?;
         }
-        *self.segments_listed = Some(listed);
+        self.wait.listed = Some(listed);
         Ok(())
     }
 
@@ -1677,8 +1734,11 @@ impl Reader {
     /// How many bytes the fill at `offset` asks for: [`CHUNK`], unless the reader follows the writer with time to spare,
     /// when it is [`TAIL_CHUNK`]. Not observable except through timing and system calls (ADR 0052).
     ///
-    /// A fill *follows* if the slot at the cursor was found empty before it (so the reader was waiting for this record)
-    /// and the reader used exactly one record of the last fill (so it was waiting for that one too). After [`TAIL_FILLS`]
+    /// A fill *follows* if the slot at the cursor was found empty before it (so the reader was waiting for this record),
+    /// the reader used exactly one record of the last fill (so it was waiting for that one too), and, if the reader
+    /// blocked for this record (registered as a waiter, so that the writer made a wake-up call), it had waited at the
+    /// slot for at least [`TAIL_BLOCKED_WAIT`]: a blocking reader that reads less blocks for more records, and the writer
+    /// pays for each. After [`TAIL_FILLS`]
     /// such fills in a row, that one included, the reads are tail reads, for as long as every fill follows, except that one
     /// in [`TAIL_PROBE`] of them reads a whole chunk anyway. The first one that does not follow is a whole chunk again, and
     /// the count starts over: the reader found the next record without waiting, or more than one record in the last fill.
@@ -1697,21 +1757,33 @@ impl Reader {
         // failed read); the first slot of a segment lies at or before the start of the last fill, in the segment before.
         let used = offset.saturating_sub(self.buf_start);
         let first = self.buf.first_chunk::<4>().map(|w| u32::from_le_bytes(*w));
+        // (A seal is never at the start of the buffer: following one empties it. The check is a guard.)
         let follows = self.waiting_since.is_some()
             && first
-                .is_some_and(|w| w != format::SEAL_MARKER && format::align8(u64::from(w)) == used);
+                .is_some_and(|w| w != format::SEAL_MARKER && format::align8(u64::from(w)) == used)
+            && !self.blocked_briefly(offset);
         // The fill counted `probe` reads a whole chunk; the count then goes on as from the first tail read.
         let probe = TAIL_FILLS + TAIL_PROBE - 1;
-        self.tail_fills = match self.tail_fills {
+        self.wait.tail_fills = match self.wait.tail_fills {
             _ if !follows => 0,
             n if n == probe => TAIL_FILLS,
             n => n + 1,
         };
-        if (TAIL_FILLS..probe).contains(&self.tail_fills) {
+        if (TAIL_FILLS..probe).contains(&self.wait.tail_fills) {
             TAIL_CHUNK as u64
         } else {
             CHUNK as u64
         }
+    }
+
+    /// Whether the reader blocked for the record at `offset` and found it within [`TAIL_BLOCKED_WAIT`] of first finding its
+    /// slot empty. Reads the clock only for a reader that blocked.
+    fn blocked_briefly(&self, offset: u64) -> bool {
+        self.wait.tail_wait.is_some_and(|w| {
+            w.blocked
+                && (w.base, w.offset) == (self.seg.base, offset)
+                && w.since.elapsed() < TAIL_BLOCKED_WAIT
+        })
     }
 
     /// Fills the `pread` buffer from `offset`: at least the frame of commit word `word`, normally as much as
@@ -2252,14 +2324,14 @@ mod wake_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        CHUNK, Reader, SlotOutcome, TAIL_CHUNK, TAIL_FILLS, TAIL_PROBE, VALIDATION_RETRIES,
-        VALIDATION_WINDOW, resize_buf,
+        CHUNK, Reader, SlotOutcome, TAIL_BLOCKED_WAIT, TAIL_CHUNK, TAIL_FILLS, TAIL_PROBE,
+        VALIDATION_RETRIES, VALIDATION_WINDOW, resize_buf,
     };
     use crate::mmap::MAPPED_READS;
     use crate::{CorruptReason, Error, NewRecord, ReaderConfig, Writer, WriterConfig};
     use std::cell::Cell;
     use std::os::unix::fs::FileExt;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     thread_local! {
         /// How many of this thread's next non-empty slot reads [`scripted`] turns into a validation failure.
@@ -2651,6 +2723,100 @@ mod tests {
             f.at_once(64);
             f.shrink();
         }
+        // A wait right after a seek is still no reason for a tail read (the seek emptied the buffer). To the end, with the marker at the end:
+        f.writer.checkpoint().unwrap();
+        f.reader.seek_to_end().unwrap();
+        f.mapped.seek_to_end().unwrap();
+        f.read(0, 64);
+        f.poll_empty();
+        f.append(1, 64);
+        assert_eq!(f.read(1, 64), [CHUNK as u64]);
+        f.at_once(64);
+        f.shrink();
+        // To the record that comes next, which the marker covers the way to:
+        let at = f.reader.position();
+        f.writer.checkpoint().unwrap();
+        f.reader.seek(at).unwrap();
+        f.mapped.seek(at).unwrap();
+        f.poll_empty();
+        f.read(0, 64);
+        f.append(1, 64);
+        assert_eq!(f.read(1, 64), [CHUNK as u64]);
+    }
+
+    /// A reader that blocked for its records (registered as a waiter, so that the writer made a wake-up call for each)
+    /// counts a fill towards tail reads only if it waited at the slot for at least `TAIL_BLOCKED_WAIT`. The block is
+    /// simulated as `block` does it: the wake-up region is taken out of the waker while the slot is read again.
+    #[test]
+    fn a_reader_that_blocked_briefly_reads_whole_chunks() {
+        fn blocked(f: &mut Follow, waited: Duration) -> u64 {
+            f.poll_empty();
+            let waker = f.reader.waker.as_mut().expect("wake-ups are on");
+            let region = waker.take().expect("the writer created a region");
+            f.poll_empty();
+            f.reader.waker.as_mut().unwrap().put(region);
+            let wait = f.reader.wait.tail_wait.as_mut().unwrap();
+            assert!(wait.attached && wait.blocked);
+            // The clock as if the wait had begun `waited` ago.
+            wait.since = Instant::now() - waited;
+            f.append(1, 64);
+            let fills = f.read(1, 64);
+            assert_eq!(fills.len(), 1);
+            fills[0]
+        }
+        let short = TAIL_BLOCKED_WAIT / 2;
+        let long = TAIL_BLOCKED_WAIT + Duration::from_millis(10);
+        let mut f = Follow::new(1 << 20);
+        // Blocked, and not for long: never tail reads.
+        for _ in 0..4 * TAIL_FILLS {
+            assert_eq!(blocked(&mut f, short), CHUNK as u64);
+        }
+        // Blocked for long: tail reads after `TAIL_FILLS` fills.
+        for _ in 1..TAIL_FILLS {
+            assert_eq!(blocked(&mut f, long), CHUNK as u64);
+        }
+        for _ in 0..TAIL_FILLS {
+            assert_eq!(blocked(&mut f, long), TAIL_CHUNK as u64);
+        }
+        // One brief block ends them, and the count starts over.
+        assert_eq!(blocked(&mut f, short), CHUNK as u64);
+        assert_eq!(blocked(&mut f, long), CHUNK as u64);
+        // Waits without blocking (a spinning reader, or one whose writer keeps no region) count however short they are.
+        f.at_once(64);
+        f.shrink();
+        assert_eq!(f.follow(64), TAIL_CHUNK as u64);
+        // Without a region, a reader found the slot empty only "unattached": that is not a block.
+        f.reader.waker = None;
+        for _ in 0..4 {
+            assert_eq!(f.follow(64), TAIL_CHUNK as u64);
+        }
+        assert!(!f.reader.wait.tail_wait.unwrap().blocked);
+    }
+
+    /// A reader that blocks on the wake-up region is noted as blocked at the slot (the check inside `block_on` reads it
+    /// with the region taken out), however the wait ends.
+    #[test]
+    fn blocking_on_the_region_is_noted() {
+        let mut f = Follow::new(1 << 20);
+        let config = ReaderConfig::default().backoff(crate::config::Backoff {
+            spins: 0,
+            yields: 0,
+            min_sleep: Duration::from_millis(1),
+            max_sleep: Duration::from_millis(1),
+        });
+        let mut reader = Reader::open(f.dir.path(), config).unwrap();
+        assert!(reader.try_next().unwrap().is_some());
+        assert!(
+            reader
+                .next_timeout(Some(Duration::from_millis(2)))
+                .unwrap()
+                .is_none()
+        );
+        let wait = reader.wait.tail_wait.expect("the slot was found empty");
+        assert_eq!((wait.base, wait.offset), (reader.seg.base, reader.offset));
+        assert!(wait.attached && wait.blocked, "{wait:?}");
+        f.append(1, 64);
+        assert!(reader.try_next().unwrap().is_some());
     }
 
     /// A durable-only reader reads whole chunks, also when it waits at the checkpoint for every record: each marker
@@ -2755,11 +2921,10 @@ mod tests {
             (
                 (r.seg.path.clone(), r.seg.identity, r.offset, r.next_seq),
                 (r.skip_until, r.seek_covered, r.buf.clone(), r.buf_start),
-                r.tail_fills,
                 (r.durable_next_seq, r.durable_segment_base),
                 (r.durable_offset, r.bound),
                 (
-                    (r.waiting_since, *r.segments_listed),
+                    (r.waiting_since, *r.wait),
                     r.superseded_checked,
                     format!("{:?}", r.found),
                 ),
@@ -2775,9 +2940,16 @@ mod tests {
             reader.durable_segment_base = 8;
             reader.durable_offset = 9;
             reader.bound = 1 << 12;
-            reader.tail_fills = 5;
+            reader.wait.tail_fills = 5;
+            reader.wait.tail_wait = Some(super::SlotWait {
+                base: 1,
+                offset: 2,
+                since: Instant::now(),
+                attached: true,
+                blocked: true,
+            });
             reader.waiting_since = Some(Instant::now());
-            *reader.segments_listed = Some(super::Listed {
+            reader.wait.listed = Some(super::Listed {
                 at: Instant::now(),
                 unchanged: None,
             });
