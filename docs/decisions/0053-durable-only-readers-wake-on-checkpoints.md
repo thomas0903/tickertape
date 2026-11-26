@@ -168,10 +168,11 @@ record's version must stay 1 for 1.0.0 readers:
 - **A reader** that is about to block chooses before it registers:
   - durable-only, its cursor at the checkpoint boundary it knows (`next_seq >= durable_next_seq`), capability bit set:
     the marker pair;
-  - durable-only, at the boundary, capability bit clear (a 1.0.0 writer): it registers nowhere. It looks once more
-    and, if there is still nothing, sleeps `min(Backoff::max_sleep, deadline, next record re-read)`, as it already does
-    when the writer flag is 0. That writer's appends find no waiter and make no wake-up call for it; its records arrive
-    at most about `max_sleep` (1 ms by default) after the checkpoint;
+  - durable-only, at the boundary, capability bit clear (a 1.0.0 writer), `Backoff::max_sleep` not zero: it registers
+    nowhere and sleeps `min(Backoff::max_sleep, deadline, next record re-read)`, as it already does when the writer
+    flag is 0 (`next_timeout` looks before and after each such sleep). That writer's appends find no waiter and make no
+    wake-up call for it; its records arrive at most about `max_sleep` (1 ms by default) after the checkpoint;
+  - the same with a `max_sleep` of zero: the event pair, as 1.0.0 does (see the correction below);
   - otherwise (a visible reader, or a durable-only one behind its boundary): the event pair, as now.
 
   It registers, loads that pair's event count, and looks once more, as now. If it chose the marker pair and the look
@@ -319,6 +320,15 @@ spinning durable-only reader (`Backoff::busy_spin`) is not affected by this chan
 full core spent reading the marker in a loop (two `pread` calls and an `open` per poll), so it is a last resort, not
 a recommendation.
 
+**Correction of 2026-11-26 (review of the implementation).** As first written, the fallback beside a writer without the
+capability slept `max_sleep` without registering whatever its value. With `max_sleep` zero, which every API accepts,
+that is a loop that reads the marker without ever sleeping: 0.47 s of CPU in a 500 ms `next_timeout` beside an idle
+writer, where 1.0.0 blocks up to 100 ms per wait. Such a reader now registers on the event pair, exactly as 1.0.0 does.
+That is the one configuration in which a new durable-only reader beside a 1.0.0 writer keeps 1.0.0's cost: the old
+writer makes a wake-up call per append for it. The first version also looked at the marker once more before each sleep,
+after `next_timeout` had just looked: about 2,000 marker reads a second instead of the 1,000 stated; the extra look is
+gone.
+
 ## Test plan
 
 - **Model.** `notify_model.rs`, a `loom` model of both event counts with the reader's choice itself (futexes modelled
@@ -334,12 +344,19 @@ a recommendation.
 - **Unit and process tests.** The existing notify tests (ping-pong, deadlines, a reader started before the writer,
   truncated record) unchanged; a durable-only reader blocking at the boundary under appends registers only on the
   marker words, and the checkpoint wakes it within the 100 ms cap's margin; with the capability word 0 it registers
-  nowhere and still gets the record soon after the checkpoint.
+  nowhere and still gets the record soon after the checkpoint, and with `max_sleep` zero as well it does not spin. The
+  model is a copy of `block_on`'s steps, so two tests stop the real function between its choice and its registration
+  (a test-only hook) and change the journal there: a checkpoint at that moment must be found by the look after
+  registering, and a look that moves the boundary without a record (an emptied commit word under the new marker) must
+  choose again rather than sleep on the marker words. Each of four mutations of `block_on` (no look after registering,
+  never choosing again, the unregistered sleep with `max_sleep` zero, the record words at the boundary) fails a test.
 - **Mixed versions.** `tests/compat/v1.0.0-wake-ups.sh`, weekly in the soak workflow on Linux and macOS: builds a
   helper from the `v1.0.0` tag and from the tree, runs every pairing of writer and reader versions, durable-only and
   visible, one record per checkpoint, and readers of both versions while the writer changes version both ways. It fails
   on a missed or repeated record or on more than two deliveries of 50 ms or more (a lost wake-up costs the 100 ms
-  cap), and on Linux if a new durable-only reader beside a new writer wakes per record.
+  cap). On Linux it also runs 200 records per checkpoint and fails if a new durable-only reader beside a new writer
+  wakes per record, or if a 1.0.0 one beside a 1.0.0 writer does not (so that the check can fail); and it kills
+  durable-only readers of both versions while they wait and checks that the others still get every record.
 - **Acceptance measurement.** The table at the top again with the implementation, on the same shapes, 10 interleaved
   rounds against 1.0.0, a copy of it and current `main`: append p50 / p99 / p99.9 / maximum at both rates and both
   architectures with the durable-only reader blocking; the same load without it; the mixed pairings; the durable-only
@@ -350,6 +367,22 @@ a recommendation.
   10) with an append maximum of 200 µs or more is no larger for the implementation than for 1.0.0 plus the difference
   between the two 1.0.0 copies.
 
+**Note of 2026-11-26 on the acceptance measurement** (`docs/benchmarks.md`, 2026-11-26; decided by the orchestrating
+agent on the owner's delegation after an independent review):
+
+- **The maximum rule was not met on one of three x86-64 VMs.** There the change had 2 of 10 runs with an append of
+  200 µs or more (217 and 220 µs) against 0 and 0 for the two 1.0.0 copies; on the other two x86-64 VMs and both
+  aarch64 VMs it was met, and pooled over the three x86-64 VMs the counts are 6 of 35 for the change against 7 and 3 of
+  35. On that VM the cell without a durable-only reader, where the writer runs no different code, showed the same
+  pattern (3 runs against 0 and 2). The appending thread runs byte-identical code, does nothing new at a checkpoint, and
+  is pinned; the one extra wake-up call is on the checkpoint thread, on cache lines the append never touches. Read as
+  noise, and **accepted** for those reasons.
+- **Without a durable-only reader, x86-64 p50 is 0.01 µs higher** (0.44 against 0.43 µs at 173,119/s, 0.43 against
+  0.42 µs at 100,000/s), slower in 8 and 9 of 10 paired rounds where the byte-identical copy of 1.0.0 is slower in 4–6:
+  probably real. It does not come from this change's logic: the append path's instructions are identical, and only
+  their placement differs (the hot loop moves from offset 0 to 16 within its 64-byte line). It is measured against
+  1.0.0 only, so it also contains everything `main` changed since 1.0.0. Issue #86 (speed that depends on layout).
+
 ## Consequences
 
 - Appends do not wake durable-only readers once the writer has this change, whichever version the reader is from
@@ -358,7 +391,8 @@ a recommendation.
   instead of 99 %.
 - Beside a 1.0.0 writer a new durable-only reader polls the marker once per `max_sleep` (1 ms by default) at the
   boundary: up to that much later delivery, and about 1,000 marker reads a second while it waits, instead of the
-  writer paying for every append.
+  writer paying for every append. With a `max_sleep` of zero it registers as 1.0.0 does, and that writer pays as it
+  does for a 1.0.0 reader.
 - The last record of a checkpoint reaches a durable-only reader up to 0.4–2 ms later when the reader's CPU is shared
   with the writer's helper threads (above); documented with `ReaderConfig::durable_only` and the operations guide.
 - `mmap.rs` changes (new words, a second wait target): it needs the cross-provider review its `unsafe` code requires.
